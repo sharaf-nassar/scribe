@@ -1,0 +1,32 @@
+#!/bin/bash
+case "$1" in
+    remove|purge)
+        TARGET_UID="${SUDO_UID:-$(id -u)}"
+        XDG_DIR="/run/user/${TARGET_UID}"
+
+        # Try systemctl with proper environment (use UID-based sudo to
+        # prevent spoofed SUDO_USER from targeting a different user).
+        if [ -n "$SUDO_UID" ] && [ -d "$XDG_DIR" ]; then
+            sudo -u "#${SUDO_UID}" \
+                XDG_RUNTIME_DIR="$XDG_DIR" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
+                systemctl --user stop scribe-server 2>/dev/null || true
+            sudo -u "#${SUDO_UID}" \
+                XDG_RUNTIME_DIR="$XDG_DIR" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
+                systemctl --user disable scribe-server 2>/dev/null || true
+        elif [ -z "$SUDO_UID" ]; then
+            systemctl --user stop scribe-server 2>/dev/null || true
+            systemctl --user disable scribe-server 2>/dev/null || true
+        fi
+
+        # Fallback: kill any remaining scribe-server processes for this user
+        pkill -u "$TARGET_UID" -x scribe-server 2>/dev/null || true
+
+        # Clean up socket
+        rm -f "${XDG_DIR}/scribe/server.sock" 2>/dev/null || true
+        rm -f "${XDG_DIR}/scribe/handoff.sock" 2>/dev/null || true
+        ;;
+esac
+
+exit 0

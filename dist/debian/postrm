@@ -1,0 +1,12 @@
+#!/bin/bash
+case "$1" in
+    purge)
+        # Clean up config directory. Guard against symlink substitution:
+        # only remove if it is a real directory, not a symlink.
+        if [ -d /etc/scribe ] && [ ! -L /etc/scribe ]; then
+            rm -rf /etc/scribe 2>/dev/null || true
+        fi
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,37 @@
+cognitive-complexity-threshold = 15
+too-many-arguments-threshold = 5
+too-many-lines-threshold = 80
+type-complexity-threshold = 200
+excessive-nesting-threshold = 4
+single-char-binding-names-threshold = 3
+
+max-fn-params-bools = 1
+max-struct-bools = 2
+
+too-large-for-stack = 128
+large-error-threshold = 64
+future-size-threshold = 8192
+
+avoid-breaking-exported-api = false
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = false
+allow-print-in-tests = false
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+disallowed-methods = [
+  { path = "std::env::set_var", reason = "Not thread-safe. Use a config struct." },
+  { path = "std::env::remove_var", reason = "Not thread-safe. Use a config struct." },
+  { path = "std::process::exit", reason = "Use proper error propagation instead." },
+  { path = "std::mem::forget", reason = "Leaks resources. Use ManuallyDrop if truly needed." },
+]
+
+disallowed-macros = [
+  { path = "std::todo", reason = "No TODOs in production code." },
+  { path = "std::unimplemented", reason = "No unimplemented!() in production code." },
+  { path = "std::dbg", reason = "Use tracing crate instead." },
+  { path = "std::println", reason = "Use tracing crate instead." },
+  { path = "std::eprintln", reason = "Use tracing crate instead." },
+]

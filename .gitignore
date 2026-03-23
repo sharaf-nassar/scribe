@@ -1,0 +1,25 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Scribe
+.superpowers/
+
+# Secrets / environment
+.env
+.env.local
+.env.*.local
+
+# Runtime artifacts
+*.log
+*.pid

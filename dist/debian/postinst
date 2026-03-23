@@ -1,0 +1,134 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    configure)
+        TARGET_UID="${SUDO_UID:-$(id -u)}"
+        SOCK="/run/user/${TARGET_UID}/scribe/server.sock"
+        XDG_DIR="/run/user/${TARGET_UID}"
+
+        # Check for a running server process, not just a stale socket file
+        SERVER_RUNNING=0
+        if [ -S "$SOCK" ] && pgrep -u "$TARGET_UID" -x scribe-server >/dev/null 2>&1; then
+            SERVER_RUNNING=1
+        fi
+
+        if [ "$SERVER_RUNNING" = "1" ]; then
+            # Upgrade: server is running — launch hot-reload in background.
+            # The --upgrade process takes over from the old server (receives
+            # PTY fds, starts serving). We run it in the background because
+            # it continues running as the new server after handoff.
+            echo ""
+            echo "Scribe server is running. Starting hot-reload..."
+
+            UPGRADE_CMD="/usr/bin/scribe-server --upgrade"
+            # Use mktemp instead of predictable /tmp paths to prevent
+            # TOCTOU symlink attacks from other local users.
+            UPGRADE_LOG=$(mktemp /run/user/"${TARGET_UID}"/scribe/upgrade-log.XXXXXX) || \
+                UPGRADE_LOG=$(mktemp)
+
+            if [ -n "$SUDO_UID" ]; then
+                sudo -u "#${SUDO_UID}" "${UPGRADE_CMD}" >"${UPGRADE_LOG}" 2>&1 &
+            else
+                "${UPGRADE_CMD}" >"${UPGRADE_LOG}" 2>&1 &
+            fi
+            UPGRADE_PID=$!
+
+            # Wait briefly for the handoff to complete (the new server logs
+            # "session restoration complete" once it has the fds).
+            UPGRADE_OK=0
+            for i in 1 2 3 4 5; do
+                sleep 1
+                if grep -q "session restoration complete\|starting IPC server" "${UPGRADE_LOG}" 2>/dev/null; then
+                    UPGRADE_OK=1
+                    break
+                fi
+                # Check if the upgrade process died
+                if ! kill -0 "$UPGRADE_PID" 2>/dev/null; then
+                    break
+                fi
+            done
+
+            if [ "$UPGRADE_OK" = "1" ]; then
+                echo "  ✓ Scribe server hot-reloaded successfully."
+                echo "    All terminal sessions have been preserved."
+
+                # Relaunch clients if any were running before the upgrade
+                # (recorded by preinst before the old binary was replaced)
+                STATE_FILE="/run/user/${TARGET_UID}/scribe/upgrade-state"
+                PREV_CLIENTS=$(cat "${STATE_FILE}" 2>/dev/null || echo "0")
+                rm -f "${STATE_FILE}" 2>/dev/null || true
+
+                if [ "$PREV_CLIENTS" -gt 0 ] 2>/dev/null; then
+                    echo "  Relaunching client..."
+                    if [ -n "$SUDO_UID" ]; then
+                        sudo -u "#${SUDO_UID}" nohup /usr/bin/scribe-client >/dev/null 2>&1 &
+                    else
+                        nohup /usr/bin/scribe-client >/dev/null 2>&1 &
+                    fi
+                fi
+            else
+                # Kill the stuck upgrade process
+                kill "$UPGRADE_PID" 2>/dev/null || true
+                echo ""
+                echo "╔══════════════════════════════════════════════════════════════╗"
+                echo "║                                                              ║"
+                echo "║   ⚠  SCRIBE SERVER HOT-RELOAD FAILED                        ║"
+                echo "║                                                              ║"
+                echo "║   Your terminals are still running on the OLD server.        ║"
+                echo "║   To complete the upgrade, restart the server manually:      ║"
+                echo "║                                                              ║"
+                echo "║     systemctl --user restart scribe-server                   ║"
+                echo "║                                                              ║"
+                echo "║   ⚠  WARNING: Restarting will CLOSE all terminal sessions.   ║"
+                echo "║                                                              ║"
+                echo "╚══════════════════════════════════════════════════════════════╝"
+                echo ""
+                if [ -f "${UPGRADE_LOG}" ]; then
+                    echo "  Error details:"
+                    tail -5 "${UPGRADE_LOG}" 2>/dev/null | sed 's/^/    /'
+                fi
+            fi
+            rm -f "${UPGRADE_LOG}" 2>/dev/null || true
+            echo ""
+        else
+            # Fresh install: clean up any stale socket and start the service
+            rm -f "$SOCK" 2>/dev/null || true
+
+            STARTED=0
+
+            if [ -n "$SUDO_UID" ] && [ -d "$XDG_DIR" ]; then
+                sudo -u "#${SUDO_UID}" \
+                    XDG_RUNTIME_DIR="$XDG_DIR" \
+                    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
+                    systemctl --user enable scribe-server 2>/dev/null && \
+                sudo -u "#${SUDO_UID}" \
+                    XDG_RUNTIME_DIR="$XDG_DIR" \
+                    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
+                    systemctl --user start scribe-server 2>/dev/null && \
+                STARTED=1
+            elif [ -z "$SUDO_UID" ]; then
+                systemctl --user enable scribe-server 2>/dev/null && \
+                systemctl --user start scribe-server 2>/dev/null && \
+                STARTED=1
+            fi
+
+            if [ "$STARTED" = "1" ]; then
+                echo "  ✓ Scribe server enabled and started."
+                echo "    Run 'scribe-client' to open a terminal."
+            else
+                echo ""
+                echo "  Scribe installed successfully."
+                echo ""
+                echo "  To start the server, run:"
+                echo "    systemctl --user enable --now scribe-server"
+                echo ""
+                echo "  Then launch the terminal:"
+                echo "    scribe-client"
+            fi
+            echo ""
+        fi
+        ;;
+esac
+
+exit 0

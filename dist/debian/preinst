@@ -1,0 +1,22 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    upgrade|install)
+        TARGET_UID="${SUDO_UID:-$(id -u)}"
+        # Use /run/user (mode 0700, owned by user) instead of world-writable /tmp
+        # to prevent symlink attacks from other local users.
+        STATE_DIR="/run/user/${TARGET_UID}/scribe"
+        STATE_FILE="${STATE_DIR}/upgrade-state"
+
+        # Ensure state directory exists (may not if server hasn't run yet).
+        mkdir -p "${STATE_DIR}" 2>/dev/null || true
+        chmod 0700 "${STATE_DIR}" 2>/dev/null || true
+
+        # Record how many client instances are running BEFORE the upgrade
+        CLIENT_COUNT=$(pgrep -u "$TARGET_UID" -cx scribe-client 2>/dev/null || echo "0")
+        echo "$CLIENT_COUNT" > "${STATE_FILE}"
+        ;;
+esac
+
+exit 0

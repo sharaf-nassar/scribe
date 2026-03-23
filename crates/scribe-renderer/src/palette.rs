@@ -1,0 +1,170 @@
+use alacritty_terminal::vte::ansi::{Color, NamedColor};
+
+/// xterm-256 RGBA colour palette.
+///
+/// Entries 0-7 are standard ANSI, 8-15 are bright ANSI, 16-231 form the
+/// 6×6×6 colour cube, and 232-255 are a 24-step greyscale ramp.
+pub struct ColorPalette {
+    entries: [[f32; 4]; 256],
+}
+
+/// Convert an 8-bit sRGB component to a linear f32 in \[0, 1\].
+#[inline]
+fn u8_to_f32(v: u8) -> f32 {
+    f32::from(v) / 255.0
+}
+
+/// Build an opaque RGBA entry from three u8 components.
+#[inline]
+const fn rgba(r: u8, g: u8, b: u8) -> [f32; 4] {
+    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+}
+
+/// Standard ANSI colours (indices 0-15).
+const ANSI_COLORS: [[f32; 4]; 16] = [
+    // 0-7: standard
+    rgba(0x00, 0x00, 0x00), // 0 black
+    rgba(0xaa, 0x00, 0x00), // 1 red
+    rgba(0x00, 0xaa, 0x00), // 2 green
+    rgba(0xaa, 0x55, 0x00), // 3 yellow
+    rgba(0x00, 0x00, 0xaa), // 4 blue
+    rgba(0xaa, 0x00, 0xaa), // 5 magenta
+    rgba(0x00, 0xaa, 0xaa), // 6 cyan
+    rgba(0xaa, 0xaa, 0xaa), // 7 white
+    // 8-15: bright
+    rgba(0x55, 0x55, 0x55), // 8  bright black
+    rgba(0xff, 0x55, 0x55), // 9  bright red
+    rgba(0x55, 0xff, 0x55), // 10 bright green
+    rgba(0xff, 0xff, 0x55), // 11 bright yellow
+    rgba(0x55, 0x55, 0xff), // 12 bright blue
+    rgba(0xff, 0x55, 0xff), // 13 bright magenta
+    rgba(0x55, 0xff, 0xff), // 14 bright cyan
+    rgba(0xff, 0xff, 0xff), // 15 bright white
+];
+
+/// Component intensities used in the 6×6×6 colour cube (indices 16-231).
+const CUBE_INTENSITIES: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// Build the colour cube entry for the given r, g, b cube coordinates (0-5).
+fn cube_entry(r: usize, g: usize, b: usize) -> [f32; 4] {
+    let rv = CUBE_INTENSITIES.get(r).copied().unwrap_or(0);
+    let gv = CUBE_INTENSITIES.get(g).copied().unwrap_or(0);
+    let bv = CUBE_INTENSITIES.get(b).copied().unwrap_or(0);
+    rgba(rv, gv, bv)
+}
+
+/// Populate the 6×6×6 colour-cube region (entries 16-231) of `table`.
+fn fill_cube(table: &mut [[f32; 4]; 256]) {
+    let mut idx: usize = 16;
+    for r in 0_usize..6 {
+        for g in 0_usize..6 {
+            fill_cube_row(table, &mut idx, r, g);
+        }
+    }
+}
+
+/// Populate one row of the colour cube (one r,g pair, all 6 b values).
+fn fill_cube_row(table: &mut [[f32; 4]; 256], idx: &mut usize, r: usize, g: usize) {
+    for b in 0_usize..6 {
+        if let Some(slot) = table.get_mut(*idx) {
+            *slot = cube_entry(r, g, b);
+        }
+        *idx += 1;
+    }
+}
+
+/// Populate the greyscale ramp region (entries 232-255) of `table`.
+fn fill_greyscale(table: &mut [[f32; 4]; 256]) {
+    for i in 0_usize..24 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "i ≤ 23, so 8 + i*10 ≤ 238, which fits in u8"
+        )]
+        let v: u8 = 8 + (i as u8) * 10;
+        if let Some(slot) = table.get_mut(232 + i) {
+            *slot = rgba(v, v, v);
+        }
+    }
+}
+
+impl ColorPalette {
+    /// Build the default xterm-256 palette.
+    pub fn new() -> Self {
+        let mut entries = [[0.0_f32; 4]; 256];
+
+        // Entries 0-15: standard + bright ANSI
+        for (i, color) in ANSI_COLORS.iter().enumerate() {
+            if let Some(slot) = entries.get_mut(i) {
+                *slot = *color;
+            }
+        }
+
+        // Entries 16-231: 6×6×6 colour cube
+        fill_cube(&mut entries);
+
+        // Entries 232-255: greyscale ramp
+        fill_greyscale(&mut entries);
+
+        Self { entries }
+    }
+
+    /// Resolve an alacritty `Color` to RGBA floats `[r, g, b, a]`.
+    ///
+    /// Named colours that map outside the 256-entry table (e.g. `Foreground`,
+    /// `Background`) fall back to opaque magenta so they remain visible.
+    pub fn resolve(&self, color: Color) -> [f32; 4] {
+        match color {
+            Color::Named(named) => self.resolve_named(named),
+            Color::Indexed(idx) => self.entry(usize::from(idx)),
+            Color::Spec(rgb) => [u8_to_f32(rgb.r), u8_to_f32(rgb.g), u8_to_f32(rgb.b), 1.0],
+        }
+    }
+
+    /// Resolve a `NamedColor` to the corresponding palette entry.
+    fn resolve_named(&self, named: NamedColor) -> [f32; 4] {
+        // Dim variants share the same palette index as their non-dim counterparts;
+        // callers may reduce brightness separately.
+        let idx: Option<usize> = match named {
+            NamedColor::Black | NamedColor::DimBlack => Some(0),
+            NamedColor::Red | NamedColor::DimRed => Some(1),
+            NamedColor::Green | NamedColor::DimGreen => Some(2),
+            NamedColor::Yellow | NamedColor::DimYellow => Some(3),
+            NamedColor::Blue | NamedColor::DimBlue => Some(4),
+            NamedColor::Magenta | NamedColor::DimMagenta => Some(5),
+            NamedColor::Cyan | NamedColor::DimCyan => Some(6),
+            NamedColor::White | NamedColor::DimWhite => Some(7),
+            NamedColor::BrightBlack => Some(8),
+            NamedColor::BrightRed => Some(9),
+            NamedColor::BrightGreen => Some(10),
+            NamedColor::BrightYellow => Some(11),
+            NamedColor::BrightBlue => Some(12),
+            NamedColor::BrightMagenta => Some(13),
+            NamedColor::BrightCyan => Some(14),
+            NamedColor::BrightWhite => Some(15),
+            // These live outside the 256-entry indexed palette.
+            NamedColor::Foreground
+            | NamedColor::Background
+            | NamedColor::Cursor
+            | NamedColor::BrightForeground
+            | NamedColor::DimForeground => None,
+        };
+
+        idx.map_or(Self::fallback(), |i| self.entry(i))
+    }
+
+    /// Look up a palette entry by index (0-255).
+    fn entry(&self, idx: usize) -> [f32; 4] {
+        self.entries.get(idx).copied().unwrap_or_else(Self::fallback)
+    }
+
+    /// Opaque magenta — used as an unmistakeable "missing colour" sentinel.
+    fn fallback() -> [f32; 4] {
+        [1.0, 0.0, 1.0, 1.0]
+    }
+}
+
+impl Default for ColorPalette {
+    fn default() -> Self {
+        Self::new()
+    }
+}

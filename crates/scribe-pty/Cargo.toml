@@ -1,0 +1,17 @@
+[package]
+name = "scribe-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+scribe-common.workspace = true
+alacritty_terminal.workspace = true
+tokio.workspace = true
+vte.workspace = true
+tracing.workspace = true
+libc.workspace = true

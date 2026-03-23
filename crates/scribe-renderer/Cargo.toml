@@ -1,0 +1,16 @@
+[package]
+name = "scribe-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+wgpu.workspace = true
+cosmic-text.workspace = true
+bytemuck.workspace = true
+alacritty_terminal.workspace = true
+tracing.workspace = true
