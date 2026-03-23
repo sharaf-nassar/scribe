@@ -40,6 +40,10 @@ toml = "0.8"
 dirs = "6"
 notify = "8"
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+
 # Utilities
 uuid = { version = "1.22", features = ["v4", "serde"] }
 thiserror = "2.0"

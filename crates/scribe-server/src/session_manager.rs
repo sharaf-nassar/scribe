@@ -210,7 +210,7 @@ impl SessionManager {
     ///
     /// Locks the `Term`, reads the grid contents, and converts `alacritty_terminal`
     /// types to our `ScreenSnapshot` wire format.
-    #[allow(dead_code, reason = "snapshot_session will be used in Subscribe/reconnect flow")]
+    #[allow(dead_code, reason = "used by SessionManager for sessions not yet taken by a client")]
     pub async fn snapshot_session(
         &self,
         session_id: SessionId,
@@ -223,6 +223,7 @@ impl SessionManager {
     }
 
     /// Remove a session. The PTY is closed when the `ManagedSession` is dropped.
+    #[allow(dead_code, reason = "retained for handoff/hot-reload session cleanup")]
     pub async fn close_session(&self, session_id: SessionId) {
         if self.sessions.write().await.remove(&session_id).is_some() {
             info!(%session_id, "closed PTY session");
@@ -365,8 +366,7 @@ impl SessionManager {
 ///
 /// Iterates the visible grid (`screen_lines` x columns) and converts each
 /// `alacritty_terminal` cell into our `ScreenCell` wire type.
-#[allow(dead_code, reason = "called from snapshot_session, used in Subscribe/reconnect flow")]
-fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
+pub fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
     let grid = term.grid();
     let cols = grid.columns();
     let rows = grid.screen_lines();
@@ -408,8 +408,7 @@ fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
 }
 
 /// Convert an `alacritty_terminal` `Cell` to our `ScreenCell` wire type.
-#[allow(dead_code, reason = "called from snapshot_term, used in Subscribe/reconnect flow")]
-fn convert_cell(cell: &alacritty_terminal::term::cell::Cell) -> ScreenCell {
+pub fn convert_cell(cell: &alacritty_terminal::term::cell::Cell) -> ScreenCell {
     ScreenCell {
         c: cell.c,
         fg: convert_color(cell.fg),
@@ -419,16 +418,15 @@ fn convert_cell(cell: &alacritty_terminal::term::cell::Cell) -> ScreenCell {
 }
 
 /// Convert an `alacritty_terminal` `Color` to our `ScreenColor`.
-#[allow(dead_code, reason = "called from convert_cell, used in Subscribe/reconnect flow")]
-fn convert_color(color: alacritty_terminal::vte::ansi::Color) -> ScreenColor {
+pub fn convert_color(color: alacritty_terminal::vte::ansi::Color) -> ScreenColor {
     match color {
         alacritty_terminal::vte::ansi::Color::Named(named) =>
         {
             #[allow(
                 clippy::cast_possible_truncation,
-                reason = "NamedColor has 22 variants; all fit in u8"
+                reason = "NamedColor max variant (DimCyan = 266) fits in u16"
             )]
-            ScreenColor::Named(named as u8)
+            ScreenColor::Named(named as u16)
         }
         alacritty_terminal::vte::ansi::Color::Indexed(idx) => ScreenColor::Indexed(idx),
         alacritty_terminal::vte::ansi::Color::Spec(rgb) => {
@@ -438,8 +436,7 @@ fn convert_color(color: alacritty_terminal::vte::ansi::Color) -> ScreenColor {
 }
 
 /// Convert `alacritty_terminal` cell `Flags` to our `CellFlags`.
-#[allow(dead_code, reason = "called from convert_cell, used in Subscribe/reconnect flow")]
-fn convert_flags(flags: CellFlags) -> ScreenCellFlags {
+pub fn convert_flags(flags: CellFlags) -> ScreenCellFlags {
     ScreenCellFlags {
         bold: flags.contains(CellFlags::BOLD),
         italic: flags.contains(CellFlags::ITALIC),
@@ -453,8 +450,9 @@ fn convert_flags(flags: CellFlags) -> ScreenCellFlags {
 }
 
 /// Convert `alacritty_terminal` `CursorStyle` to our `CursorStyle`.
-#[allow(dead_code, reason = "called from snapshot_term, used in Subscribe/reconnect flow")]
-fn convert_cursor_style(style: alacritty_terminal::vte::ansi::CursorStyle) -> ScreenCursorStyle {
+pub fn convert_cursor_style(
+    style: alacritty_terminal::vte::ansi::CursorStyle,
+) -> ScreenCursorStyle {
     match style.shape {
         alacritty_terminal::vte::ansi::CursorShape::Underline => ScreenCursorStyle::Underline,
         alacritty_terminal::vte::ansi::CursorShape::Beam => ScreenCursorStyle::Beam,

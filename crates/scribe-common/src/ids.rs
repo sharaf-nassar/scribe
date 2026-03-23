@@ -1,4 +1,5 @@
 use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -16,6 +17,12 @@ impl SessionId {
     pub fn as_uuid(&self) -> Uuid {
         self.0
     }
+
+    /// Returns the full UUID string (for CLI serialization).
+    #[must_use]
+    pub fn to_full_string(self) -> String {
+        self.0.to_string()
+    }
 }
 
 impl Default for SessionId {
@@ -32,6 +39,15 @@ impl fmt::Display for SessionId {
     }
 }
 
+impl FromStr for SessionId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let uuid = Uuid::parse_str(s)?;
+        Ok(Self(uuid))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkspaceId(Uuid);
 
@@ -44,6 +60,12 @@ impl WorkspaceId {
     #[must_use]
     pub fn as_uuid(&self) -> Uuid {
         self.0
+    }
+
+    /// Returns the full UUID string (for CLI serialization).
+    #[must_use]
+    pub fn to_full_string(self) -> String {
+        self.0.to_string()
     }
 }
 
@@ -58,5 +80,14 @@ impl fmt::Display for WorkspaceId {
         let s = self.0.to_string();
         let prefix = s.get(..8).unwrap_or("unknown");
         write!(f, "ws-{prefix}")
+    }
+}
+
+impl FromStr for WorkspaceId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let uuid = Uuid::parse_str(s)?;
+        Ok(Self(uuid))
     }
 }

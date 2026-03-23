@@ -246,7 +246,6 @@ function loadConfig(config) {
 
   // Terminal
   setStepperValue("terminal.scrollback_lines", config.terminal?.scrollback_lines);
-  setTextValue("terminal.shell", config.terminal?.shell);
 
   // Theme
   setThemePreset(config.theme?.preset);

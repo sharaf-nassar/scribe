@@ -21,6 +21,7 @@ use scribe_common::config::{ScribeConfig, resolve_theme};
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::theme::Theme;
 use scribe_renderer::TerminalRenderer;
+use scribe_renderer::types::GridSize;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
@@ -162,6 +163,9 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::PtyOutput { session_id, data } => {
                 self.handle_pty_output(session_id, &data);
             }
+            UiEvent::ScreenSnapshot { session_id, snapshot } => {
+                self.handle_screen_snapshot(session_id, &snapshot);
+            }
             UiEvent::SessionCreated { session_id, .. } => {
                 self.handle_session_created(session_id);
             }
@@ -182,6 +186,9 @@ impl ApplicationHandler<UiEvent> for App {
             }
             UiEvent::WorkspaceInfo { workspace_id, name, accent_color } => {
                 self.handle_workspace_info(workspace_id, name, &accent_color);
+            }
+            UiEvent::SessionList { sessions } => {
+                self.handle_session_list(&sessions);
             }
             UiEvent::WorkspaceNamed { workspace_id, name } => {
                 self.handle_workspace_named(workspace_id, &name);
@@ -263,40 +270,14 @@ impl App {
 
         renderer.set_theme(&self.theme);
 
-        let cell = renderer.cell_size();
-
         // Start IPC thread (proxy was created before run_app).
         let proxy = self.proxy.take().ok_or(InitError::ProxyConsumed)?;
         let cmd_tx = ipc_client::start_ipc_thread(proxy);
 
-        // Create the initial pane within the initial workspace.
-        let workspace_id = self.window_layout.focused_workspace_id();
-        let session_id = SessionId::new();
-        let initial_id = LayoutTree::initial_pane_id();
-        let viewport_rect =
-            Rect { x: 0.0, y: 0.0, width: size.width as f32, height: size.height as f32 };
-
-        // Add a tab to the workspace and get its pane layout rect.
-        self.window_layout.add_tab(workspace_id, session_id);
-
-        let ws_rects = self.window_layout.compute_workspace_rects(viewport_rect);
-        let ws_rect = ws_rects.first().map_or(viewport_rect, |(_wid, r)| *r);
-
-        if let Some(tab) = self.window_layout.active_tab() {
-            let pane_rects = tab.pane_layout.compute_rects(ws_rect);
-
-            if let Some((_pane_id, pane_rect)) = pane_rects.first() {
-                let grid = pane::compute_pane_grid(*pane_rect, cell.width, cell.height);
-                let pane = Pane::new(*pane_rect, grid, session_id, workspace_id, initial_id);
-
-                send_command(&cmd_tx, ClientCommand::CreateSession { workspace_id });
-
-                self.panes.insert(initial_id, pane);
-                self.session_to_pane.insert(session_id, initial_id);
-
-                send_resize(&cmd_tx, session_id, grid.cols, grid.rows);
-            }
-        }
+        // Ask the server for existing sessions before creating anything.
+        // Pane creation is deferred to `handle_session_list` which runs
+        // when the `SessionList` response arrives.
+        send_command(&cmd_tx, ClientCommand::ListSessions);
 
         let splash = match splash::SplashRenderer::new(
             &device,
@@ -328,6 +309,22 @@ impl App {
 
 impl App {
     /// Feed PTY output bytes into the correct pane, then request a redraw.
+    /// Apply a screen snapshot to a pane by converting it to ANSI escape
+    /// sequences and feeding them through the normal VTE pipeline.
+    /// This restores visible terminal content on reconnect.
+    fn handle_screen_snapshot(
+        &mut self,
+        session_id: SessionId,
+        snapshot: &scribe_common::screen::ScreenSnapshot,
+    ) {
+        let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
+        let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+
+        let ansi = snapshot_to_ansi(snapshot);
+        pane.feed_output(&ansi);
+        self.request_redraw();
+    }
+
     fn handle_pty_output(&mut self, session_id: SessionId, bytes: &[u8]) {
         let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
@@ -343,6 +340,91 @@ impl App {
         }
 
         self.request_redraw();
+    }
+
+    /// Handle `SessionList` response from the server.
+    ///
+    /// If the server has existing sessions, reattach to them (restoring one
+    /// tab per session). Otherwise fall back to creating a fresh session.
+    fn handle_session_list(&mut self, sessions: &[scribe_common::protocol::SessionInfo]) {
+        let Some(tx) = &self.cmd_tx else { return };
+
+        if sessions.is_empty() {
+            self.create_initial_session();
+            return;
+        }
+
+        tracing::info!(count = sessions.len(), "reattaching to existing sessions");
+
+        let session_ids: Vec<SessionId> = sessions.iter().map(|s| s.session_id).collect();
+        send_command(tx, ClientCommand::AttachSessions { session_ids: session_ids.clone() });
+
+        let workspace_id = self.window_layout.focused_workspace_id();
+        for info in sessions {
+            self.window_layout.add_tab(workspace_id, info.session_id);
+        }
+
+        let Some((pane_id, pane_rect, grid)) = self.first_pane_geometry() else { return };
+        let active_session = sessions.last().map_or(SessionId::new(), |s| s.session_id);
+        let pane = Pane::new(pane_rect, grid, active_session, workspace_id, pane_id);
+        self.panes.insert(pane_id, pane);
+        self.session_to_pane.insert(active_session, pane_id);
+
+        // Subscribe and send resize to trigger shell redraw via SIGWINCH.
+        send_command(tx, ClientCommand::Subscribe { session_ids });
+        for info in sessions {
+            send_resize(tx, info.session_id, grid.cols, grid.rows);
+        }
+
+        // Dismiss splash — we're reconnecting, not waiting for first output.
+        self.splash_active = false;
+        if let Some(gpu) = &mut self.gpu {
+            gpu.splash = None;
+        }
+        self.request_redraw();
+    }
+
+    /// Create the initial session + pane for a fresh start (no existing sessions).
+    fn create_initial_session(&mut self) {
+        let Some(tx) = &self.cmd_tx else { return };
+
+        let workspace_id = self.window_layout.focused_workspace_id();
+        let session_id = SessionId::new();
+        let initial_id = LayoutTree::initial_pane_id();
+
+        self.window_layout.add_tab(workspace_id, session_id);
+
+        let Some((_pane_id, pane_rect, grid)) = self.first_pane_geometry() else { return };
+        let pane = Pane::new(pane_rect, grid, session_id, workspace_id, initial_id);
+
+        send_command(tx, ClientCommand::CreateSession { workspace_id });
+        self.panes.insert(initial_id, pane);
+        self.session_to_pane.insert(session_id, initial_id);
+        send_resize(tx, session_id, grid.cols, grid.rows);
+    }
+
+    /// Compute the pane ID, rect, and grid size for the first pane of the
+    /// active tab. Returns `None` if GPU or layout state is unavailable.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "viewport dimensions are small enough to fit in f32"
+    )]
+    fn first_pane_geometry(&self) -> Option<(PaneId, Rect, GridSize)> {
+        let gpu = self.gpu.as_ref()?;
+        let window = self.window.as_ref()?;
+        let size = window.inner_size();
+        let viewport =
+            Rect { x: 0.0, y: 0.0, width: size.width as f32, height: size.height as f32 };
+        let cell = gpu.renderer.cell_size();
+
+        let ws_rects = self.window_layout.compute_workspace_rects(viewport);
+        let ws_rect = ws_rects.first().map_or(viewport, |(_wid, r)| *r);
+
+        let tab = self.window_layout.active_tab()?;
+        let pane_rects = tab.pane_layout.compute_rects(ws_rect);
+        let &(pane_id, pane_rect) = pane_rects.first()?;
+        let grid = pane::compute_pane_grid(pane_rect, cell.width, cell.height);
+        Some((pane_id, pane_rect, grid))
     }
 
     /// Handle server confirming session creation.
@@ -534,20 +616,18 @@ impl App {
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // While the splash is active, render the logo instead of the terminal.
+        // Splash renderer unavailable (decode failed): fall through to normal
+        // rendering, which will produce a black frame via its own clear colour.
         if self.splash_active {
             if let Some(splash) = &gpu.splash {
-                let mut encoder =
-                    gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("splash encoder"),
-                    });
-                splash.render(&mut encoder, &view);
-                gpu.queue.submit(std::iter::once(encoder.finish()));
+                let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("splash encoder"),
+                });
+                splash.render(&mut enc, &view);
+                gpu.queue.submit(std::iter::once(enc.finish()));
                 frame.present();
                 return;
             }
-            // Splash renderer unavailable (decode failed): fall through to
-            // normal rendering, which will produce a black frame via its own
-            // clear colour.
         }
 
         let viewport = viewport_rect(&gpu.surface_config);
@@ -1183,6 +1263,134 @@ fn viewport_rect(config: &wgpu::SurfaceConfiguration) -> Rect {
     Rect { x: 0.0, y: 0.0, width: config.width as f32, height: config.height as f32 }
 }
 
+/// Convert a `ScreenSnapshot` to ANSI escape sequences that reproduce the
+/// visible screen content when fed through a VTE parser.
+///
+/// Used to restore terminal content on reconnect: the server's `Term` has
+/// the full state, and this converts it to bytes the client's `Term` can
+/// process through the normal `pane.feed_output()` path.
+fn snapshot_to_ansi(snapshot: &scribe_common::screen::ScreenSnapshot) -> Vec<u8> {
+    use std::fmt::Write as _;
+
+    let mut buf =
+        String::with_capacity(usize::from(snapshot.cols) * usize::from(snapshot.rows) * 4);
+
+    // Hide cursor, move home, clear screen, reset attributes.
+    buf.push_str("\x1b[?25l\x1b[H\x1b[2J\x1b[0m");
+
+    let cols = usize::from(snapshot.cols);
+
+    for row in 0..usize::from(snapshot.rows) {
+        if row > 0 {
+            buf.push_str("\r\n");
+        }
+        for col in 0..cols {
+            let idx = row * cols + col;
+            let Some(cell) = snapshot.cells.get(idx) else { break };
+
+            // Skip spacer cells for wide characters.
+            let is_wide_spacer =
+                col > 0 && snapshot.cells.get(row * cols + col - 1).is_some_and(|c| c.flags.wide);
+            if is_wide_spacer {
+                continue;
+            }
+
+            // Build SGR (Select Graphic Rendition) sequence.
+            write_sgr(&mut buf, cell);
+
+            // Write the character (space for null/empty cells).
+            if cell.c == '\0' || cell.c == ' ' {
+                buf.push(' ');
+            } else {
+                buf.push(cell.c);
+            }
+        }
+    }
+
+    // Reset attributes, position cursor, show cursor if visible.
+    buf.push_str("\x1b[0m");
+    #[allow(clippy::let_underscore_must_use, reason = "write! to String is infallible")]
+    let _ = write!(
+        buf,
+        "\x1b[{};{}H",
+        u32::from(snapshot.cursor_row) + 1,
+        u32::from(snapshot.cursor_col) + 1,
+    );
+    if snapshot.cursor_visible {
+        buf.push_str("\x1b[?25h");
+    }
+
+    buf.into_bytes()
+}
+
+/// Write SGR escape sequences for a cell's foreground, background, and flags.
+fn write_sgr(buf: &mut String, cell: &scribe_common::screen::ScreenCell) {
+    buf.push_str("\x1b[0"); // reset, then append attributes
+
+    let f = &cell.flags;
+    if f.bold {
+        buf.push_str(";1");
+    }
+    if f.dim {
+        buf.push_str(";2");
+    }
+    if f.italic {
+        buf.push_str(";3");
+    }
+    if f.underline {
+        buf.push_str(";4");
+    }
+    if f.inverse {
+        buf.push_str(";7");
+    }
+    if f.hidden {
+        buf.push_str(";8");
+    }
+    if f.strikethrough {
+        buf.push_str(";9");
+    }
+
+    write_color_sgr(buf, cell.fg, true);
+    write_color_sgr(buf, cell.bg, false);
+
+    buf.push('m');
+}
+
+/// Append the SGR parameters for a single color (foreground or background).
+///
+/// `NamedColor` values: 0–7 = normal ANSI, 8–15 = bright ANSI,
+/// 256 = Foreground, 257 = Background, 258 = Cursor, 259–266 = dim variants.
+/// Values >= 16 use the terminal default colour (SGR 39/49).
+#[allow(clippy::let_underscore_must_use, reason = "write! to String is infallible")]
+fn write_color_sgr(buf: &mut String, color: scribe_common::screen::ScreenColor, foreground: bool) {
+    use scribe_common::screen::ScreenColor;
+    use std::fmt::Write as _;
+
+    match color {
+        ScreenColor::Named(n) if n < 8 => {
+            let base: u32 = if foreground { 30 } else { 40 };
+            let _ = write!(buf, ";{}", base + u32::from(n));
+        }
+        ScreenColor::Named(n) if n < 16 => {
+            let base: u32 = if foreground { 90 } else { 100 };
+            let _ = write!(buf, ";{}", base + u32::from(n - 8));
+        }
+        ScreenColor::Named(_) => {
+            // Foreground (256), Background (257), Cursor (258), Dim* (259+)
+            // — use the terminal's default colour.
+            buf.push_str(if foreground { ";39" } else { ";49" });
+        }
+        ScreenColor::Indexed(idx) => {
+            let prefix = if foreground { "38" } else { "48" };
+            let _ = write!(buf, ";{prefix};5;{idx}");
+        }
+        ScreenColor::Rgb { r, g, b } => {
+            let prefix = if foreground { "38" } else { "48" };
+            let _ = write!(buf, ";{prefix};2;{r};{g};{b}");
+        }
+    }
+}
+
 /// Parse a `#RRGGBB` hex colour string into an `[f32; 4]` RGBA array.
 ///
 /// Returns `None` if the string is not a valid 6-digit hex colour.
@@ -1326,9 +1534,6 @@ fn apply_config_key(
             )]
             let v = value.as_f64().ok_or("scrollback_lines must be a number")? as u32;
             config.terminal.scrollback_lines = v;
-        }
-        "terminal.shell" => {
-            value.as_str().ok_or("shell must be a string")?.clone_into(&mut config.terminal.shell);
         }
         // -- Workspaces -------------------------------------------------------
         "workspaces.add_root" => {

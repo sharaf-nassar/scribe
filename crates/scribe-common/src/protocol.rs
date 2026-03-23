@@ -40,6 +40,15 @@ pub enum ClientMessage {
     Subscribe {
         session_ids: Vec<SessionId>,
     },
+    RequestSnapshot {
+        session_id: SessionId,
+    },
+    /// Request a list of all live sessions on the server.
+    ListSessions,
+    /// Attach to existing (detached) sessions, taking ownership.
+    AttachSessions {
+        session_ids: Vec<SessionId>,
+    },
     /// Notify server that config file has been updated.
     ConfigReloaded,
 }
@@ -96,6 +105,10 @@ pub enum ServerMessage {
         session_id: SessionId,
         branch: Option<String>,
     },
+    /// List of all live sessions, sent in response to `ListSessions`.
+    SessionList {
+        sessions: Vec<SessionInfo>,
+    },
     /// Full workspace state sent to client on creation or reconnect.
     WorkspaceInfo {
         workspace_id: WorkspaceId,
@@ -103,4 +116,13 @@ pub enum ServerMessage {
         /// Hex color string (e.g. "#a78bfa") from the rotating accent palette.
         accent_color: String,
     },
+}
+
+// ── Shared types ─────────────────────────────────────────────────
+
+/// Summary of a live session, sent in `SessionList` responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session_id: SessionId,
+    pub workspace_id: WorkspaceId,
 }

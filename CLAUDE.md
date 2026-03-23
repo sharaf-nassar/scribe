@@ -34,7 +34,123 @@ cargo run --bin scribe-client
 
 # Run the CLI test tool (raw stdin/stdout passthrough)
 cargo run --bin scribe-cli
+
+# E2E Testing — build containers (after cargo build --release)
+docker build -f docker/Dockerfile.func -t scribe-test-func .
+docker build -f docker/Dockerfile.visual -t scribe-test-visual .
+
+# Run functional E2E test
+docker run --rm -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-func /tests/smoke.sh
+
+# Run visual E2E test (software GPU)
+docker run --rm -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/smoke.sh
+
+# Inspect results: check exit code, read test-output/result.log, view PNG screenshots
 ```
+
+## E2E Testing
+
+Two Docker containers for end-to-end testing. Use them to validate changes before committing.
+
+### When to use which container
+
+**Functional container (`scribe-test-func`)** — use for most changes:
+- Server/protocol changes (`scribe-common`, `scribe-server`)
+- IPC message handling, session management, workspace logic
+- PTY I/O behavior, OSC parsing, metadata events
+- Any change that doesn't touch the GPU renderer
+- Fast: runs in ~3 seconds
+
+**Visual container (`scribe-test-visual`)** — use when touching rendering:
+- Renderer changes (`scribe-renderer` — wgpu pipeline, shaders, instance buffers)
+- Glyph atlas / font rendering (`cosmic-text` integration)
+- Color palette / theme changes
+- Pane layout / split visual behavior
+- Client input handling (`scribe-client`)
+- Slower: ~5 seconds startup (Xvfb + Mesa software GL)
+
+### How to run
+
+```bash
+# 1. Build release binaries (required after code changes)
+cargo build --release
+
+# 2. Rebuild the container (only needed when binaries change)
+docker build -f docker/Dockerfile.func -t scribe-test-func .
+
+# 3. Run a test script
+docker run --rm -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-func /tests/smoke.sh
+
+# 4. Inspect results
+# - Exit code: 0 = pass, 1 = test failure, 2 = infra error
+# - Read test-output/result.log for stdout/stderr
+# - Read test-output/*.png to visually verify terminal screenshots
+```
+
+### Writing test scripts
+
+Test scripts are bash scripts that use `scribe-test` subcommands. The entrypoint pre-creates a session and exports `$SESSION`.
+
+```bash
+#!/bin/bash
+set -e
+
+# Send keystrokes (escapes parsed by scribe-test, not shell — use single quotes)
+scribe-test send "$SESSION" 'echo hello\n'
+
+# Wait for output matching a regex (5s default timeout)
+scribe-test wait-output "$SESSION" "hello"
+
+# Take a CPU-rendered PNG screenshot
+scribe-test screenshot "$SESSION" /output/result.png
+
+# Wait for no output for N ms (prompt detection heuristic)
+scribe-test wait-idle "$SESSION" --ms 300
+
+# Resize the PTY
+scribe-test resize "$SESSION" 120 40
+
+# Assert grid cell content (0-indexed row, col)
+scribe-test assert-cell "$SESSION" 0 0 '$'
+
+# Assert cursor position (0-indexed)
+scribe-test assert-cursor "$SESSION" 1 0
+
+# Dump raw grid state as JSON
+scribe-test snapshot "$SESSION" /output/state.json
+```
+
+### Testing reconnection / session persistence
+
+The daemon supports disconnect/reconnect testing via `session attach`:
+
+```bash
+SAVED_SESSION="$SESSION"
+scribe-test daemon stop                      # disconnect from server
+scribe-test daemon start                     # new connection
+scribe-test session attach "$SAVED_SESSION"  # reattach to existing session
+scribe-test send "$SAVED_SESSION" 'echo test\n'
+scribe-test wait-output "$SAVED_SESSION" "test"
+```
+
+The reconnect test (`tests/e2e/reconnect.sh`) validates session survival across client disconnects.
+
+### When to test
+
+**MANDATORY**: After ANY code change that touches server, client, or protocol code, you MUST:
+1. `cargo build --release`
+2. Rebuild the relevant Docker container (`docker build -f docker/Dockerfile.func -t scribe-test-func .`)
+3. Run ALL E2E tests: `smoke.sh` and `reconnect.sh`
+4. Verify both pass before considering the change complete
+
+Do NOT rely on `cargo test` alone — unit tests do not cover IPC, session lifecycle, reconnection, or screen content restoration. The E2E container tests are the source of truth for end-to-end correctness.
+
+- After implementing a new feature: write a test script that exercises it
+- After fixing a bug: write a test script that reproduces the scenario
+- Before committing renderer changes: use the visual container and inspect pixel screenshots
+- **After changing IPC, session lifecycle, or client startup**: run `reconnect.sh` to verify sessions survive disconnect/reconnect and screen content is restored
+- The smoke test (`tests/e2e/smoke.sh`) validates basic server→session→I/O→screenshot flow
+- The reconnect test (`tests/e2e/reconnect.sh`) validates session persistence and reattachment
 
 ## Architecture
 
@@ -97,6 +213,7 @@ Workspaces are never tabbed — they always occupy visible screen real estate si
 
 - **`alacritty_terminal`** is used for terminal emulation state (grid, scrollback, cursor) — not Alacritty's rendering
 - **Dual VTE parsers**: `alacritty_terminal` ignores custom OSC 1337 `AiState`, so a separate `OscInterceptor` runs in parallel on the same byte stream
+- **Session persistence across UI restarts**: sessions live in a server-wide `LiveSessionRegistry` with detachable `ClientWriter`. When the UI disconnects, sessions keep running (PTY reader task continues feeding `Term`). On reconnect: client sends `ListSessions` → `AttachSessions`, server re-sets the writer and sends a `ScreenSnapshot` (converted to ANSI by the client to restore visible content). The `Term` state is always up-to-date because the reader task never stops.
 - **Hot-reload handoff** (`handoff.rs`): zero-downtime upgrades via `SCM_RIGHTS` — old server sends PTY master fds + serialised state to new server on `--upgrade`. Handoff socket: `/run/user/{uid}/scribe/handoff.sock`
 - **Workspace auto-naming**: `WorkspaceManager` matches session CWD against configured `workspace_roots` to auto-name workspaces from the first path component after the root
 - **Multi-pane layout**: binary tree (`LayoutTree`) with split/close/focus-cycle, divider drag resizing

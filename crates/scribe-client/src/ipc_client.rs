@@ -28,6 +28,10 @@ pub enum ClientCommand {
     CloseSession { session_id: SessionId },
     /// Subscribe to output from additional sessions.
     Subscribe { session_ids: Vec<SessionId> },
+    /// Request a list of all live sessions on the server.
+    ListSessions,
+    /// Attach to existing (detached) sessions on the server.
+    AttachSessions { session_ids: Vec<SessionId> },
     /// Notify server that config file has been updated.
     #[allow(dead_code, reason = "will be triggered by config hot-reload file watcher")]
     ConfigReloaded,
@@ -38,6 +42,8 @@ pub enum ClientCommand {
 pub enum UiEvent {
     /// Raw PTY output bytes for a specific session.
     PtyOutput { session_id: SessionId, data: Vec<u8> },
+    /// Full screen snapshot for restoring visible content on reconnect.
+    ScreenSnapshot { session_id: SessionId, snapshot: scribe_common::screen::ScreenSnapshot },
     /// The server has acknowledged session creation.
     SessionCreated {
         session_id: SessionId,
@@ -71,6 +77,8 @@ pub enum UiEvent {
         #[allow(dead_code, reason = "accent_color preserved for future workspace layout")]
         accent_color: String,
     },
+    /// List of all live sessions, received in response to `ListSessions`.
+    SessionList { sessions: Vec<scribe_common::protocol::SessionInfo> },
     /// A workspace has been auto-named.
     WorkspaceNamed { workspace_id: WorkspaceId, name: String },
     /// Server configuration has been reloaded.
@@ -129,6 +137,9 @@ async fn run_read_task(
                 tracing::info!(session = %session_id, ?exit_code, "session exited");
                 send_event(&proxy, UiEvent::SessionExited { session_id, exit_code });
             }
+            Ok(ServerMessage::ScreenSnapshot { session_id, snapshot }) => {
+                send_event(&proxy, UiEvent::ScreenSnapshot { session_id, snapshot });
+            }
             Ok(ServerMessage::SessionCreated { session_id, workspace_id, .. }) => {
                 tracing::debug!(session = %session_id, "session created via server response");
                 send_event(&proxy, UiEvent::SessionCreated { session_id, workspace_id });
@@ -147,6 +158,9 @@ async fn run_read_task(
             }
             Ok(ServerMessage::WorkspaceInfo { workspace_id, name, accent_color }) => {
                 send_event(&proxy, UiEvent::WorkspaceInfo { workspace_id, name, accent_color });
+            }
+            Ok(ServerMessage::SessionList { sessions }) => {
+                send_event(&proxy, UiEvent::SessionList { sessions });
             }
             Ok(ServerMessage::WorkspaceNamed { workspace_id, name }) => {
                 send_event(&proxy, UiEvent::WorkspaceNamed { workspace_id, name });
@@ -212,6 +226,10 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         }
         ClientCommand::CloseSession { session_id } => ClientMessage::CloseSession { session_id },
         ClientCommand::Subscribe { session_ids } => ClientMessage::Subscribe { session_ids },
+        ClientCommand::ListSessions => ClientMessage::ListSessions,
+        ClientCommand::AttachSessions { session_ids } => {
+            ClientMessage::AttachSessions { session_ids }
+        }
         ClientCommand::ConfigReloaded => ClientMessage::ConfigReloaded,
     }
 }

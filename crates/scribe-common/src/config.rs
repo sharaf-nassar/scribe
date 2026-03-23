@@ -138,13 +138,11 @@ pub struct ThemeConfig {
 pub struct TerminalConfig {
     #[serde(default = "default_scrollback_lines")]
     pub scrollback_lines: u32,
-    #[serde(default)]
-    pub shell: String,
 }
 
 impl Default for TerminalConfig {
     fn default() -> Self {
-        Self { scrollback_lines: default_scrollback_lines(), shell: String::new() }
+        Self { scrollback_lines: default_scrollback_lines() }
     }
 }
 

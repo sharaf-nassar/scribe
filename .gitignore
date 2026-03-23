@@ -23,3 +23,6 @@ Thumbs.db
 # Runtime artifacts
 *.log
 *.pid
+
+# Test output
+test-output/

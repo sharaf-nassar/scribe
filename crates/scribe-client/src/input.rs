@@ -110,6 +110,7 @@ fn translate_layout_shortcut(event: &KeyEvent, modifiers: ModifiersState) -> Opt
 /// Translate a named key to its VT100 / ANSI byte sequence.
 fn translate_named_key(named: NamedKey) -> Option<Vec<u8>> {
     let seq: &[u8] = match named {
+        NamedKey::Space => b" ",
         NamedKey::Enter => b"\r",
         NamedKey::Backspace => b"\x7f",
         NamedKey::Tab => b"\t",
@@ -136,6 +137,14 @@ fn translate_named_key(named: NamedKey) -> Option<Vec<u8>> {
         NamedKey::F10 => b"\x1b[21~",
         NamedKey::F11 => b"\x1b[23~",
         NamedKey::F12 => b"\x1b[24~",
+        NamedKey::F13 => b"\x1b[25~",
+        NamedKey::F14 => b"\x1b[26~",
+        NamedKey::F15 => b"\x1b[28~",
+        NamedKey::F16 => b"\x1b[29~",
+        NamedKey::F17 => b"\x1b[31~",
+        NamedKey::F18 => b"\x1b[32~",
+        NamedKey::F19 => b"\x1b[33~",
+        NamedKey::F20 => b"\x1b[34~",
         _ => return None,
     };
     Some(seq.to_vec())
@@ -162,6 +171,8 @@ fn translate_ctrl_key(event: &KeyEvent) -> Option<Vec<u8>> {
                 None
             }
         }
+        // Ctrl+Space sends NUL (used as tmux prefix, emacs set-mark, etc.).
+        Key::Named(NamedKey::Space) => Some(vec![0]),
         _ => None,
     }
 }

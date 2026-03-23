@@ -10,9 +10,13 @@ pub struct ScreenCell {
 }
 
 /// Terminal color representation.
+///
+/// `Named` uses `u16` because `alacritty_terminal::NamedColor` has variants
+/// above 255 (e.g. `Foreground = 256`, `Background = 257`, `Cursor = 258`,
+/// `DimBlack = 259`, …). A `u8` would silently truncate these to 0–15.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ScreenColor {
-    Named(u8),
+    Named(u16),
     Indexed(u8),
     Rgb { r: u8, g: u8, b: u8 },
 }
