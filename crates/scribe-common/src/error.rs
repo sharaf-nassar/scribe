@@ -20,6 +20,9 @@ pub enum ScribeError {
     #[error("config error: {reason}")]
     ConfigError { reason: String },
 
+    #[error("theme parse error: {reason}")]
+    ThemeParse { reason: String },
+
     #[error("IO error: {source}")]
     Io {
         #[from]

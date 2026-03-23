@@ -21,16 +21,16 @@ case "$1" in
             echo ""
             echo "Scribe server is running. Starting hot-reload..."
 
-            UPGRADE_CMD="/usr/bin/scribe-server --upgrade"
+            UPGRADE_BIN="/usr/bin/scribe-server"
             # Use mktemp instead of predictable /tmp paths to prevent
             # TOCTOU symlink attacks from other local users.
             UPGRADE_LOG=$(mktemp /run/user/"${TARGET_UID}"/scribe/upgrade-log.XXXXXX) || \
                 UPGRADE_LOG=$(mktemp)
 
             if [ -n "$SUDO_UID" ]; then
-                sudo -u "#${SUDO_UID}" "${UPGRADE_CMD}" >"${UPGRADE_LOG}" 2>&1 &
+                sudo -u "#${SUDO_UID}" "${UPGRADE_BIN}" --upgrade >"${UPGRADE_LOG}" 2>&1 &
             else
-                "${UPGRADE_CMD}" >"${UPGRADE_LOG}" 2>&1 &
+                "${UPGRADE_BIN}" --upgrade >"${UPGRADE_LOG}" 2>&1 &
             fi
             UPGRADE_PID=$!
 

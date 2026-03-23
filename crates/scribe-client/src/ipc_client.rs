@@ -3,6 +3,7 @@
 //! Supports multiple concurrent sessions: each pane can create its own
 //! session and route keyboard input independently by session ID.
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -12,7 +13,6 @@ use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::{ClientMessage, ServerMessage};
 use scribe_common::socket::server_socket_path;
 use tokio::io::AsyncWriteExt as _;
-use tokio::net::UnixStream;
 use winit::event_loop::EventLoopProxy;
 
 /// Commands sent from the winit main thread to the IPC background thread.
@@ -28,6 +28,9 @@ pub enum ClientCommand {
     CloseSession { session_id: SessionId },
     /// Subscribe to output from additional sessions.
     Subscribe { session_ids: Vec<SessionId> },
+    /// Notify server that config file has been updated.
+    #[allow(dead_code, reason = "will be triggered by config hot-reload file watcher")]
+    ConfigReloaded,
 }
 
 /// Events forwarded from the IPC background thread to the winit event loop.
@@ -49,6 +52,29 @@ pub enum UiEvent {
     },
     /// The AI state for a session has changed.
     AiStateChanged { session_id: SessionId, ai_state: AiProcessState },
+    /// The working directory for a session has changed.
+    CwdChanged { session_id: SessionId, cwd: PathBuf },
+    /// The terminal title for a session has changed.
+    TitleChanged { session_id: SessionId, title: String },
+    /// Git branch for a session's CWD (None if not in a git repo).
+    GitBranch {
+        session_id: SessionId,
+        #[allow(dead_code, reason = "branch preserved for future status bar display")]
+        branch: Option<String>,
+    },
+    /// Full workspace state sent from the server.
+    WorkspaceInfo {
+        #[allow(dead_code, reason = "workspace_id preserved for future workspace layout")]
+        workspace_id: WorkspaceId,
+        #[allow(dead_code, reason = "name preserved for future workspace layout")]
+        name: Option<String>,
+        #[allow(dead_code, reason = "accent_color preserved for future workspace layout")]
+        accent_color: String,
+    },
+    /// A workspace has been auto-named.
+    WorkspaceNamed { workspace_id: WorkspaceId, name: String },
+    /// Server configuration has been reloaded.
+    ConfigChanged,
     /// The connection to the server was lost.
     ServerDisconnected,
     /// Animation timer tick -- sent by the animation thread to drive redraws.
@@ -103,12 +129,27 @@ async fn run_read_task(
                 tracing::info!(session = %session_id, ?exit_code, "session exited");
                 send_event(&proxy, UiEvent::SessionExited { session_id, exit_code });
             }
-            Ok(ServerMessage::SessionCreated { session_id, workspace_id }) => {
+            Ok(ServerMessage::SessionCreated { session_id, workspace_id, .. }) => {
                 tracing::debug!(session = %session_id, "session created via server response");
                 send_event(&proxy, UiEvent::SessionCreated { session_id, workspace_id });
             }
             Ok(ServerMessage::AiStateChanged { session_id, ai_state }) => {
                 send_event(&proxy, UiEvent::AiStateChanged { session_id, ai_state });
+            }
+            Ok(ServerMessage::CwdChanged { session_id, cwd }) => {
+                send_event(&proxy, UiEvent::CwdChanged { session_id, cwd });
+            }
+            Ok(ServerMessage::TitleChanged { session_id, title }) => {
+                send_event(&proxy, UiEvent::TitleChanged { session_id, title });
+            }
+            Ok(ServerMessage::GitBranch { session_id, branch }) => {
+                send_event(&proxy, UiEvent::GitBranch { session_id, branch });
+            }
+            Ok(ServerMessage::WorkspaceInfo { workspace_id, name, accent_color }) => {
+                send_event(&proxy, UiEvent::WorkspaceInfo { workspace_id, name, accent_color });
+            }
+            Ok(ServerMessage::WorkspaceNamed { workspace_id, name }) => {
+                send_event(&proxy, UiEvent::WorkspaceNamed { workspace_id, name });
             }
             Ok(other) => {
                 tracing::debug!(?other, "unhandled server message");
@@ -171,6 +212,7 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         }
         ClientCommand::CloseSession { session_id } => ClientMessage::CloseSession { session_id },
         ClientCommand::Subscribe { session_ids } => ClientMessage::Subscribe { session_ids },
+        ClientCommand::ConfigReloaded => ClientMessage::ConfigReloaded,
     }
 }
 
@@ -181,16 +223,60 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
 ///
 /// Session creation is initiated by the UI thread via `ClientCommand::CreateSession`
 /// rather than during the IPC handshake, ensuring exactly one session per pane.
+/// Maximum time to wait for the server to become ready after starting the service.
+const SERVER_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Interval between connection retry attempts while waiting for the service.
+const SERVER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Try to connect to the server socket. If the server isn't running, start the
+/// systemd user service and retry until it's ready or the timeout expires.
+async fn connect_or_start_server(
+    socket_path: &Path,
+) -> Result<tokio::net::UnixStream, Box<dyn std::error::Error + Send + Sync>> {
+    // First attempt — server may already be running.
+    if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
+        return Ok(stream);
+    }
+
+    // Server not running — start the systemd user service.
+    tracing::info!("server not running, starting scribe-server.service");
+
+    let status =
+        std::process::Command::new("systemctl").args(["--user", "start", "scribe-server"]).status();
+
+    match status {
+        Ok(s) if s.success() => tracing::info!("scribe-server.service started"),
+        Ok(s) => return Err(format!("systemctl start exited with {s}").into()),
+        Err(e) => return Err(format!("failed to run systemctl: {e}").into()),
+    }
+
+    // Wait for the socket to appear.
+    let deadline = tokio::time::Instant::now() + SERVER_STARTUP_TIMEOUT;
+    loop {
+        tokio::time::sleep(SERVER_RETRY_INTERVAL).await;
+
+        if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
+            tracing::info!("connected to scribe-server");
+            return Ok(stream);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err("scribe-server did not become ready within 5s".into());
+        }
+    }
+}
+
 async fn ipc_main(
     proxy: EventLoopProxy<UiEvent>,
     cmd_rx: Arc<Mutex<mpsc::Receiver<ClientCommand>>>,
 ) {
     let socket_path = server_socket_path();
 
-    let stream = match UnixStream::connect(&socket_path).await {
+    let stream = match connect_or_start_server(&socket_path).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(?socket_path, error = %e, "failed to connect to scribe server");
+            tracing::error!(error = %e, "failed to connect to scribe server");
             send_event(&proxy, UiEvent::ServerDisconnected);
             return;
         }

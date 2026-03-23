@@ -13,23 +13,8 @@ use crate::palette::ColorPalette;
 use crate::pipeline::{PipelineConfig, TerminalPipeline};
 use crate::types::{CellInstance, CellSize, GridSize};
 
-/// Foreground colour used when the palette returns a semantic colour
-/// (Foreground, Cursor, etc.) that has no indexed mapping.
-const DEFAULT_FG: [f32; 4] = [0.8, 0.8, 0.8, 1.0];
-
-/// Background colour matching the render-pass clear colour.
-const DEFAULT_BG: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
-
 /// Dimming factor applied to foreground when the DIM flag is set.
 const DIM_FACTOR: f32 = 0.67;
-
-/// Pre-computed dimmed foreground (avoids computing per-cell).
-const DEFAULT_FG_DIM: [f32; 4] = [
-    DEFAULT_FG[0] * DIM_FACTOR,
-    DEFAULT_FG[1] * DIM_FACTOR,
-    DEFAULT_FG[2] * DIM_FACTOR,
-    DEFAULT_FG[3],
-];
 
 /// GPU-accelerated terminal renderer.
 ///
@@ -42,6 +27,9 @@ pub struct TerminalRenderer {
     cell_size: CellSize,
     grid_size: GridSize,
     viewport_size: (u32, u32),
+    default_fg: [f32; 4],
+    default_bg: [f32; 4],
+    default_fg_dim: [f32; 4],
 }
 
 impl TerminalRenderer {
@@ -71,7 +59,25 @@ impl TerminalRenderer {
             cell_size: (cell_size.width, cell_size.height),
         });
 
-        Self { atlas, pipeline, palette, cell_size, grid_size, viewport_size }
+        Self {
+            atlas,
+            pipeline,
+            palette,
+            cell_size,
+            grid_size,
+            viewport_size,
+            default_fg: srgb_to_linear_rgba([0.8, 0.8, 0.8, 1.0]),
+            default_bg: srgb_to_linear_rgba([0.0, 0.0, 0.0, 1.0]),
+            default_fg_dim: {
+                let fg = srgb_to_linear_rgba([0.8, 0.8, 0.8, 1.0]);
+                [
+                    fg.first().copied().unwrap_or(0.0) * DIM_FACTOR,
+                    fg.get(1).copied().unwrap_or(0.0) * DIM_FACTOR,
+                    fg.get(2).copied().unwrap_or(0.0) * DIM_FACTOR,
+                    fg.get(3).copied().unwrap_or(1.0),
+                ]
+            },
+        }
     }
 
     /// Return the current grid dimensions (columns x rows).
@@ -128,6 +134,60 @@ impl TerminalRenderer {
     /// Return a mutable reference to the pipeline.
     pub fn pipeline_mut(&mut self) -> &mut TerminalPipeline {
         &mut self.pipeline
+    }
+
+    /// Return the current default background color (for use as clear color).
+    pub const fn default_bg(&self) -> [f32; 4] {
+        self.default_bg
+    }
+
+    /// Apply a theme, updating the palette and default colors.
+    ///
+    /// Theme colors are sRGB; we convert to linear for the GPU pipeline
+    /// (the sRGB framebuffer applies the inverse transform on output).
+    pub fn set_theme(&mut self, theme: &scribe_common::theme::Theme) {
+        self.default_fg = srgb_to_linear_rgba(theme.foreground);
+        self.default_bg = srgb_to_linear_rgba(theme.background);
+        let linear_fg = self.default_fg;
+        self.default_fg_dim = [
+            linear_fg.first().copied().unwrap_or(0.0) * DIM_FACTOR,
+            linear_fg.get(1).copied().unwrap_or(0.0) * DIM_FACTOR,
+            linear_fg.get(2).copied().unwrap_or(0.0) * DIM_FACTOR,
+            linear_fg.get(3).copied().unwrap_or(1.0),
+        ];
+        let mut linear_ansi = [[0.0_f32; 4]; 16];
+        for (i, color) in theme.ansi_colors.iter().enumerate() {
+            if let Some(dest) = linear_ansi.get_mut(i) {
+                *dest = srgb_to_linear_rgba(*color);
+            }
+        }
+        self.palette.override_ansi(&linear_ansi);
+    }
+
+    /// Resolve a single character to atlas UV coordinates.
+    ///
+    /// Returns `(uv_min, uv_max)`. Blank characters (space, NUL) return
+    /// zeroed UVs.  The glyph is rasterised and cached on first use.
+    pub fn resolve_glyph(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        ch: char,
+    ) -> ([f32; 2], [f32; 2]) {
+        if ch == ' ' || ch == '\u{0}' {
+            return ([0.0, 0.0], [0.0, 0.0]);
+        }
+        let key = GlyphKey { c: ch, bold: false, italic: false };
+        let entry = self.atlas.get_or_insert(device, queue, key);
+        (entry.uv_min, entry.uv_max)
+    }
+
+    /// Rebuild the glyph atlas with a new font size.
+    /// This is synchronous and may cause a frame skip.
+    pub fn rebuild_atlas(&mut self, device: &Device, queue: &Queue, font_size: f32) {
+        self.atlas = GlyphAtlas::new(device, queue, font_size);
+        self.cell_size = self.atlas.cell_size();
+        self.grid_size = compute_grid_size(self.viewport_size, self.cell_size);
     }
 
     /// Build the per-cell instance buffer with a pixel offset applied to
@@ -237,9 +297,9 @@ impl TerminalRenderer {
         match color {
             Color::Named(
                 NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::Cursor,
-            ) => DEFAULT_FG,
-            Color::Named(NamedColor::Background) => DEFAULT_BG,
-            Color::Named(NamedColor::DimForeground) => DEFAULT_FG_DIM,
+            ) => self.default_fg,
+            Color::Named(NamedColor::Background) => self.default_bg,
+            Color::Named(NamedColor::DimForeground) => self.default_fg_dim,
             other => self.palette.resolve(other),
         }
     }
@@ -272,4 +332,26 @@ fn apply_dim(color: &mut [f32; 4]) {
     if let Some(b) = color.get_mut(2) {
         *b *= DIM_FACTOR;
     }
+}
+
+/// Convert a single sRGB channel to linear space.
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "clarity over micro-optimisation for the standard sRGB transfer function"
+)]
+fn srgb_channel_to_linear(s: f32) -> f32 {
+    if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+}
+
+/// Convert an sRGB `[f32; 4]` colour to linear space (alpha unchanged).
+///
+/// Use this for any sRGB colors (e.g. theme colors) that will be passed
+/// to the GPU pipeline, which expects linear colors.
+pub fn srgb_to_linear_rgba(c: [f32; 4]) -> [f32; 4] {
+    [
+        srgb_channel_to_linear(c.first().copied().unwrap_or(0.0)),
+        srgb_channel_to_linear(c.get(1).copied().unwrap_or(0.0)),
+        srgb_channel_to_linear(c.get(2).copied().unwrap_or(0.0)),
+        c.get(3).copied().unwrap_or(1.0),
+    ]
 }

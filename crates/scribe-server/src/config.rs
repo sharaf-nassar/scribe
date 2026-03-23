@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use serde::Deserialize;
 use tracing::{info, warn};
 
 use scribe_common::error::ScribeError;
@@ -19,55 +18,14 @@ impl Default for ScribeConfig {
     }
 }
 
-/// Raw TOML top-level structure.
-#[derive(Deserialize)]
-struct RawConfig {
-    workspaces: Option<WorkspacesConfig>,
-    terminal: Option<TerminalConfig>,
-}
-
-#[derive(Deserialize)]
-struct WorkspacesConfig {
-    roots: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-struct TerminalConfig {
-    scrollback_lines: Option<u32>,
-}
-
 pub fn load_config() -> Result<ScribeConfig, ScribeError> {
-    let Some(config_dir) = dirs::config_dir() else {
-        info!("no config directory found, using defaults");
-        return Ok(ScribeConfig::default());
-    };
+    let full = scribe_common::config::load_config()?;
 
-    let config_path = config_dir.join("scribe").join("config.toml");
-
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            info!(?config_path, "no config file found, using defaults");
-            return Ok(ScribeConfig::default());
-        }
-        Err(e) => {
-            return Err(ScribeError::ConfigError {
-                reason: format!("failed to read {}: {e}", config_path.display()),
-            });
-        }
-    };
-
-    info!(?config_path, "loading config");
-
-    let raw: RawConfig = toml::from_str(&content)
-        .map_err(|e| ScribeError::ConfigError { reason: format!("config parse error: {e}") })?;
-
-    let workspace_roots: Vec<PathBuf> = raw
+    let workspace_roots: Vec<PathBuf> = full
         .workspaces
-        .and_then(|w| w.roots)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| expand_tilde(&s))
+        .roots
+        .iter()
+        .map(|s| expand_tilde(s))
         .filter(|p| {
             if p.is_absolute() {
                 true
@@ -78,7 +36,7 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
         })
         .collect();
 
-    let raw_scrollback = raw.terminal.and_then(|t| t.scrollback_lines).unwrap_or(10_000);
+    let raw_scrollback = full.terminal.scrollback_lines;
     if raw_scrollback > MAX_SCROLLBACK_LINES {
         warn!(
             requested = raw_scrollback,
@@ -87,6 +45,8 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
         );
     }
     let scrollback_lines = raw_scrollback.min(MAX_SCROLLBACK_LINES);
+
+    info!(roots = workspace_roots.len(), scrollback_lines, "server config loaded");
 
     Ok(ScribeConfig { workspace_roots, scrollback_lines })
 }

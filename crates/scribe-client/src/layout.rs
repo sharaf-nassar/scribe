@@ -145,6 +145,13 @@ impl LayoutTree {
         collect_leaves(&self.root)
     }
 
+    /// Find the direction of the nearest parent split that contains `pane_id`.
+    ///
+    /// Returns `None` when the pane is the sole root leaf (no split exists).
+    pub fn parent_split_direction(&self, pane_id: PaneId) -> Option<SplitDirection> {
+        parent_split_direction_inner(&self.root, pane_id)
+    }
+
     /// Find the split containing `pane_id` and adjust its ratio.
     ///
     /// Returns `true` if the pane was found and the ratio was adjusted.
@@ -295,6 +302,39 @@ fn cycle_pane(leaves: &[PaneId], current: PaneId) -> PaneId {
             leaves.get(next_idx).copied().unwrap_or(current)
         },
     )
+}
+
+/// Recursively find the nearest parent split that contains `target` as
+/// a descendant and return its direction.
+fn parent_split_direction_inner(node: &LayoutNode, target: PaneId) -> Option<SplitDirection> {
+    let LayoutNode::Split { direction, first, second, .. } = node else {
+        return None;
+    };
+
+    // Check whether the target lives somewhere in either subtree.
+    if contains_pane(first, target) || contains_pane(second, target) {
+        // Prefer a deeper match first (the nearest ancestor).
+        if let Some(dir) = parent_split_direction_inner(first, target) {
+            return Some(dir);
+        }
+        if let Some(dir) = parent_split_direction_inner(second, target) {
+            return Some(dir);
+        }
+        // No deeper split contains the target — this node is the nearest.
+        return Some(*direction);
+    }
+
+    None
+}
+
+/// Check whether `node` contains a leaf with `target`.
+fn contains_pane(node: &LayoutNode, target: PaneId) -> bool {
+    match node {
+        LayoutNode::Leaf(id) => *id == target,
+        LayoutNode::Split { first, second, .. } => {
+            contains_pane(first, target) || contains_pane(second, target)
+        }
+    }
 }
 
 /// Recursively find the split containing `target` (as a direct child)

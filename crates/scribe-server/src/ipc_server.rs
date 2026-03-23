@@ -216,6 +216,9 @@ async fn dispatch_message(
             let ids = session_ids.get(..cap).unwrap_or(&session_ids);
             handle_subscribe(ids, workspace_manager, writer, session_handles).await;
         }
+        ClientMessage::ConfigReloaded => {
+            handle_config_reloaded();
+        }
         other => {
             debug!(?other, "unhandled client message");
         }
@@ -250,8 +253,21 @@ async fn handle_create_session(
     };
 
     // Notify client of session creation.
-    let creation_msg = ServerMessage::SessionCreated { session_id, workspace_id };
+    let creation_msg = ServerMessage::SessionCreated {
+        session_id,
+        workspace_id,
+        shell_name: String::from("shell"),
+    };
     send_message(writer, &creation_msg).await;
+
+    // Send workspace info so the client knows the accent color and name.
+    {
+        let wm = workspace_manager.read().await;
+        if let Some((name, accent_color)) = wm.workspace_info(workspace_id) {
+            let info_msg = ServerMessage::WorkspaceInfo { workspace_id, name, accent_color };
+            send_message(writer, &info_msg).await;
+        }
+    }
 
     start_session(session_id, session, writer, workspace_manager, session_handles);
 }
@@ -443,6 +459,18 @@ async fn handle_subscribe(
     }
 }
 
+/// Handle `ConfigReloaded` — reload the config file and log the result.
+fn handle_config_reloaded() {
+    match crate::config::load_config() {
+        Ok(_cfg) => {
+            info!("config reloaded successfully via client request");
+        }
+        Err(e) => {
+            warn!("config reload failed: {e}");
+        }
+    }
+}
+
 /// Send a `ServerMessage` to the client, logging errors.
 async fn send_message(writer: &SharedWriter, msg: &ServerMessage) {
     let mut w = writer.lock().await;
@@ -580,8 +608,28 @@ async fn drain_metadata_events(
     }
 }
 
+/// Detect the current git branch by walking up from `cwd` looking for `.git/HEAD`.
+///
+/// Returns `Some(branch_name)` if on a named branch, `Some(short_sha)` if in
+/// detached HEAD state, or `None` if not inside a git repository.
+fn detect_git_branch(cwd: &Path) -> Option<String> {
+    let mut dir = cwd.to_path_buf();
+    loop {
+        let head = dir.join(".git/HEAD");
+        if let Ok(content) = std::fs::read_to_string(&head) {
+            return content
+                .strip_prefix("ref: refs/heads/")
+                .map(|b| b.trim().to_owned())
+                .or_else(|| Some(content.trim().chars().take(8).collect()));
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 /// Convert a `MetadataEvent` to a `ServerMessage` and send it.
-/// For `CwdChanged`, also notifies the workspace manager.
+/// For `CwdChanged`, also notifies the workspace manager and sends git branch.
 async fn send_metadata_event(
     event: MetadataEvent,
     session_id: SessionId,
@@ -593,6 +641,11 @@ async fn send_metadata_event(
     send_message(writer, &server_msg).await;
 
     if let Some(cwd) = cwd_for_workspace {
+        // Send git branch information for the new CWD.
+        let branch = detect_git_branch(&cwd);
+        let git_msg = ServerMessage::GitBranch { session_id, branch };
+        send_message(writer, &git_msg).await;
+
         let named_msg = {
             let mut wm = workspace_manager.write().await;
             wm.on_cwd_changed(session_id, &cwd)

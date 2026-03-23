@@ -105,8 +105,19 @@ impl TerminalPipeline {
         write_uniforms(queue, &self.uniform_buffer, viewport, cell_size);
     }
 
-    /// Record a render pass that draws all terminal cells.
+    /// Record a render pass that draws all terminal cells with a black clear color.
     pub fn render(&self, encoder: &mut CommandEncoder, target: &TextureView) {
+        self.render_with_clear(encoder, target, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// Record a render pass that draws all terminal cells with the given clear color.
+    pub fn render_with_clear(
+        &self,
+        encoder: &mut CommandEncoder,
+        target: &TextureView,
+        clear_color: [f32; 4],
+    ) {
+        let clear = rgba_to_wgpu_color(clear_color);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("terminal render pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -114,7 +125,7 @@ impl TerminalPipeline {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                    load: wgpu::LoadOp::Clear(clear),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -292,4 +303,14 @@ fn create_bind_group(
             BindGroupEntry { binding: 2, resource: BindingResource::Sampler(atlas_sampler) },
         ],
     })
+}
+
+/// Convert `[f32; 4]` (already in linear space) to `wgpu::Color`.
+fn rgba_to_wgpu_color(color: [f32; 4]) -> wgpu::Color {
+    wgpu::Color {
+        r: f64::from(color.first().copied().unwrap_or(0.0)),
+        g: f64::from(color.get(1).copied().unwrap_or(0.0)),
+        b: f64::from(color.get(2).copied().unwrap_or(0.0)),
+        a: f64::from(color.get(3).copied().unwrap_or(1.0)),
+    }
 }

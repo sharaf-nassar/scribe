@@ -151,6 +151,14 @@ impl WorkspaceManager {
         self.session_to_workspace.get(&session_id).copied()
     }
 
+    /// Return the name and accent color of a workspace.
+    ///
+    /// Returns `Some((name, accent_color))` if the workspace exists, `None`
+    /// otherwise.
+    pub fn workspace_info(&self, id: WorkspaceId) -> Option<(Option<String>, String)> {
+        self.workspaces.get(&id).map(|ws| (ws.name.clone(), ws.accent_color.clone()))
+    }
+
     /// Extract the workspace name from a CWD path by matching against the
     /// configured roots and taking the first component after the root prefix.
     #[allow(dead_code, reason = "called from extract_workspace_name_pub in tests")]

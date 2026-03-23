@@ -49,6 +49,7 @@ crates/
 ├── scribe-server     # PTY server: session/workspace management, IPC, hot-reload handoff
 ├── scribe-client     # GPU client: winit + wgpu, multi-pane layout, input, splash screen
 ├── scribe-renderer   # GPU pipeline: glyph atlas (cosmic-text), colour palette, wgpu pipeline
+├── scribe-settings   # Settings webview: wry window, HTML/CSS/JS assets, IPC handlers
 └── scribe-cli        # Headless test CLI: raw stdin/stdout over IPC
 ```
 
@@ -60,6 +61,37 @@ crates/
    - **Fast path**: raw bytes forwarded to client as `PtyOutput`
    - **State path**: bytes fed into `alacritty_terminal::Term` via VTE ANSI processor
    - **Metadata path**: bytes parsed by `OscInterceptor` for OSC 7 (CWD), OSC 0/2 (title), OSC 1337 (AI state), BEL
+
+### UI Hierarchy
+
+```
+Window
+├── Workspace A (screen region — workspaces split the window)
+│   ├── Tab Bar
+│   │   ├── [Workspace Badge] (only when 2+ workspaces open)
+│   │   ├── [gap]
+│   │   ├── Tab 1 (session)
+│   │   └── Tab 2 (session, active)
+│   ├── Content Area
+│   │   ├── Pane 1 (split within the active tab)
+│   │   └── Pane 2 (split within the active tab)
+│   └── Status Bar
+└── Workspace B (another screen region)
+    ├── Tab Bar
+    │   ├── [Workspace Badge]
+    │   ├── [gap]
+    │   └── Tab 1 (session)
+    ├── Content Area
+    │   └── Pane 1
+    └── Status Bar
+```
+
+- **Workspace**: A region of the window. Creating a new workspace splits the window. Each workspace has its own tab bar, sessions, pane layout, and status bar.
+- **Tab (Session)**: A shell session within a workspace, shown in that workspace's tab bar.
+- **Pane**: A split within a tab's content area. Panes divide the active tab, not the workspace.
+- **Workspace Badge**: Colored dot + workspace name shown in the tab bar. Only visible when 2+ workspaces are open. Separated from tabs by a gap.
+
+Workspaces are never tabbed — they always occupy visible screen real estate side by side.
 
 ### Key Design Decisions
 
@@ -78,14 +110,27 @@ Thresholds in `clippy.toml`: cognitive complexity 15, function params 5, lines 8
 
 ### Config
 
-Server reads `~/.config/scribe/config.toml`:
+Unified config read by both server and client — `~/.config/scribe/config.toml`:
 ```toml
-[workspaces]
-roots = ["~/work", "~/projects"]
+[appearance]
+font = "JetBrains Mono"
+font_size = 14.0
+theme = "minimal-dark"   # or "tokyo-night", "catppuccin-mocha", "dracula", "solarized-dark", "custom"
 
 [terminal]
 scrollback_lines = 10000  # max 100_000
+
+[workspaces]
+roots = ["~/work", "~/projects"]
 ```
+
+### Keyboard Shortcuts
+
+- `Ctrl+Shift+\` — split vertical (side-by-side)
+- `Ctrl+Shift+-` — split horizontal (top/bottom)
+- `Ctrl+Shift+W` — close pane
+- `Ctrl+Tab` — cycle focus to next pane
+- `Ctrl+,` — open settings
 
 ### IPC Security
 

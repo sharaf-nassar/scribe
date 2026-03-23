@@ -10,15 +10,38 @@ use crate::ids::{SessionId, WorkspaceId};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    KeyInput { session_id: SessionId, data: Vec<u8> },
-    Resize { session_id: SessionId, cols: u16, rows: u16 },
-    CreateSession { workspace_id: WorkspaceId },
-    CloseSession { session_id: SessionId },
+    KeyInput {
+        session_id: SessionId,
+        data: Vec<u8>,
+    },
+    Resize {
+        session_id: SessionId,
+        cols: u16,
+        rows: u16,
+    },
+    CreateSession {
+        workspace_id: WorkspaceId,
+    },
+    CloseSession {
+        session_id: SessionId,
+    },
     CreateWorkspace,
-    CloseWorkspace { workspace_id: WorkspaceId },
-    MoveSession { session_id: SessionId, target_workspace: WorkspaceId },
-    ScrollRequest { session_id: SessionId, offset: i32 },
-    Subscribe { session_ids: Vec<SessionId> },
+    CloseWorkspace {
+        workspace_id: WorkspaceId,
+    },
+    MoveSession {
+        session_id: SessionId,
+        target_workspace: WorkspaceId,
+    },
+    ScrollRequest {
+        session_id: SessionId,
+        offset: i32,
+    },
+    Subscribe {
+        session_ids: Vec<SessionId>,
+    },
+    /// Notify server that config file has been updated.
+    ConfigReloaded,
 }
 
 // ── Server → UI ──────────────────────────────────────────────────
@@ -55,6 +78,8 @@ pub enum ServerMessage {
     SessionCreated {
         session_id: SessionId,
         workspace_id: WorkspaceId,
+        /// Basename of the shell binary (e.g. "zsh", "bash").
+        shell_name: String,
     },
     SessionExited {
         session_id: SessionId,
@@ -65,5 +90,17 @@ pub enum ServerMessage {
     },
     Error {
         message: String,
+    },
+    /// Git branch for the session's CWD (None if not in a git repo).
+    GitBranch {
+        session_id: SessionId,
+        branch: Option<String>,
+    },
+    /// Full workspace state sent to client on creation or reconnect.
+    WorkspaceInfo {
+        workspace_id: WorkspaceId,
+        name: Option<String>,
+        /// Hex color string (e.g. "#a78bfa") from the rotating accent palette.
+        accent_color: String,
     },
 }

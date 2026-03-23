@@ -1,5 +1,5 @@
 [package]
-name = "scribe-renderer"
+name = "scribe-settings"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,9 +9,10 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-wgpu.workspace = true
-cosmic-text.workspace = true
-bytemuck.workspace = true
-alacritty_terminal.workspace = true
-tracing.workspace = true
 scribe-common.workspace = true
+wry.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rust-embed.workspace = true
+tracing.workspace = true
+gtk.workspace = true

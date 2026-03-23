@@ -3,6 +3,8 @@
 //! Each pane owns a [`Term`] and a VTE [`Processor`]. Rendering is
 //! performed by the shared [`TerminalRenderer`] in `GpuContext`.
 
+use std::path::PathBuf;
+
 use alacritty_terminal::Term;
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions as _;
@@ -10,9 +12,10 @@ use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_renderer::types::GridSize;
 
 use crate::layout::{PaneId, Rect};
+use crate::status_bar::STATUS_BAR_HEIGHT;
 
 /// Height of the tab bar in pixels (reserved at the top of each pane).
-pub const TAB_BAR_HEIGHT: f32 = 24.0;
+pub const TAB_BAR_HEIGHT: f32 = 32.0;
 
 /// State for a single terminal pane.
 pub struct Pane {
@@ -24,6 +27,11 @@ pub struct Pane {
     pub workspace_name: Option<String>,
     #[allow(dead_code, reason = "used by tab bar text rendering")]
     pub title: String,
+    /// Current working directory reported by the shell via OSC 7.
+    #[allow(dead_code, reason = "set by CWD change handler, used by future workspace features")]
+    pub cwd: Option<PathBuf>,
+    /// Current git branch name (or short SHA in detached HEAD).
+    pub git_branch: Option<String>,
     pub term: Term<VoidListener>,
     pub ansi_processor: vte::ansi::Processor,
     /// The most recently assigned pixel rect from the layout engine.
@@ -71,6 +79,8 @@ impl Pane {
             workspace_id,
             workspace_name: None,
             title: String::from("shell"),
+            cwd: None,
+            git_branch: None,
             term,
             ansi_processor: vte::ansi::Processor::new(),
             rect,
@@ -111,7 +121,7 @@ impl Pane {
         reason = "pane rect dimensions are small non-negative pixel values that fit in u32"
     )]
     pub fn content_viewport(&self) -> (u32, u32) {
-        let h = (self.rect.height - TAB_BAR_HEIGHT).max(1.0);
+        let h = (self.rect.height - TAB_BAR_HEIGHT - STATUS_BAR_HEIGHT).max(1.0);
         (self.rect.width.max(1.0) as u32, h as u32)
     }
 }
@@ -119,7 +129,7 @@ impl Pane {
 /// Compute the grid size for a pane's content area.
 pub fn compute_pane_grid(rect: Rect, cell_width: f32, cell_height: f32) -> GridSize {
     let content_w = rect.width;
-    let content_h = (rect.height - TAB_BAR_HEIGHT).max(1.0);
+    let content_h = (rect.height - TAB_BAR_HEIGHT - STATUS_BAR_HEIGHT).max(1.0);
     grid_from_pixels(content_w, content_h, cell_width, cell_height)
 }
 

@@ -23,6 +23,8 @@ pub enum KeyAction {
     Terminal(Vec<u8>),
     /// Layout command (split, close, focus).
     Layout(LayoutAction),
+    /// Open the settings window.
+    OpenSettings,
 }
 
 /// Translate a winit key event into either terminal bytes or a layout command.
@@ -37,6 +39,15 @@ pub fn translate_key_action(event: &KeyEvent, modifiers: ModifiersState) -> Opti
     // Check for layout shortcuts first (Ctrl+Shift combos).
     if let Some(action) = translate_layout_shortcut(event, modifiers) {
         return Some(KeyAction::Layout(action));
+    }
+
+    // Ctrl+, opens settings.
+    if modifiers.control_key() && !modifiers.shift_key() {
+        if let Key::Character(c) = &event.logical_key {
+            if c.as_str() == "," {
+                return Some(KeyAction::OpenSettings);
+            }
+        }
     }
 
     // Fall through to normal terminal key translation.

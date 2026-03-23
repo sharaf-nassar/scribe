@@ -1,7 +1,9 @@
 pub mod ai_state;
+pub mod config;
 pub mod error;
 pub mod framing;
 pub mod ids;
 pub mod protocol;
 pub mod screen;
 pub mod socket;
+pub mod theme;

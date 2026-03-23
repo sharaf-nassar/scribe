@@ -1,6 +1,6 @@
 //! Pane divider rendering and drag handling.
 //!
-//! Dividers are 2px lines between adjacent panes, rendered as solid-colour
+//! Dividers are 1px lines between adjacent panes, rendered as solid-colour
 //! quads (no glyph atlas — `uv_min == uv_max == [0,0]`).
 
 use scribe_renderer::types::CellInstance;
@@ -8,14 +8,14 @@ use scribe_renderer::types::CellInstance;
 use crate::layout::{LayoutNode, PaneId, Rect, SplitDirection};
 
 /// Divider line thickness in pixels.
-const DIVIDER_THICKNESS: f32 = 2.0;
+const DIVIDER_THICKNESS: f32 = 1.0;
 
 /// Hit-test tolerance: mouse within this many pixels of a divider counts
 /// as "on the divider" for drag purposes.
 const HIT_TOLERANCE: f32 = 4.0;
 
-/// Divider colour (medium grey).
-const DIVIDER_COLOR: [f32; 4] = [0.3, 0.3, 0.35, 1.0];
+/// Focus border thickness in pixels.
+const FOCUS_BORDER_THICKNESS: f32 = 2.0;
 
 /// A divider between two pane groups, positioned in pixel coordinates.
 #[derive(Debug, Clone, Copy)]
@@ -61,15 +61,56 @@ pub fn hit_test_divider(dividers: &[Divider], mouse_x: f32, mouse_y: f32) -> Opt
 /// Build cell instances for all dividers.
 ///
 /// Pushes solid-colour quads for each divider into `out`. `cell_size` is
-/// `(width, height)` from the font. Pushing directly into the caller's `Vec`
-/// avoids a per-call heap allocation.
+/// `(width, height)` from the font. `color` is the theme-derived divider
+/// colour. Pushing directly into the caller's `Vec` avoids a per-call heap
+/// allocation.
 pub fn build_divider_instances(
     out: &mut Vec<CellInstance>,
     dividers: &[Divider],
     cell_size: (f32, f32),
+    color: [f32; 4],
 ) {
     for divider in dividers {
-        build_single_divider(out, divider, cell_size);
+        build_single_divider(out, divider, cell_size, color);
+    }
+}
+
+/// Build a 2px accent-coloured border on the focused pane's leading edge.
+///
+/// For vertical splits the border appears on the left edge; for horizontal
+/// splits it appears on the top edge. If `split_direction` is `None` (the
+/// pane is the sole root), no border is emitted.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "step index is a small positive integer fitting in f32"
+)]
+pub fn build_focus_border(
+    out: &mut Vec<CellInstance>,
+    pane_rect: Rect,
+    split_direction: Option<SplitDirection>,
+    accent_color: [f32; 4],
+    cell_size: (f32, f32),
+) {
+    let Some(dir) = split_direction else { return };
+    let (cell_w, cell_h) = cell_size;
+
+    match dir {
+        SplitDirection::Horizontal => {
+            // Left edge: vertical stripe, FOCUS_BORDER_THICKNESS wide.
+            let steps = steps_for(pane_rect.height, cell_h);
+            for i in 0..steps {
+                let y = pane_rect.y + i as f32 * cell_h;
+                out.push(solid_quad(pane_rect.x, y, FOCUS_BORDER_THICKNESS, cell_h, accent_color));
+            }
+        }
+        SplitDirection::Vertical => {
+            // Top edge: horizontal stripe, FOCUS_BORDER_THICKNESS tall.
+            let steps = steps_for(pane_rect.width, cell_w);
+            for i in 0..steps {
+                let x = pane_rect.x + i as f32 * cell_w;
+                out.push(solid_quad(x, pane_rect.y, cell_w, FOCUS_BORDER_THICKNESS, accent_color));
+            }
+        }
     }
 }
 
@@ -200,6 +241,7 @@ fn build_single_divider(
     instances: &mut Vec<CellInstance>,
     divider: &Divider,
     cell_size: (f32, f32),
+    color: [f32; 4],
 ) {
     let (cell_w, cell_h) = cell_size;
     let r = &divider.rect;
@@ -212,7 +254,7 @@ fn build_single_divider(
             let steps = steps_for(r.height, cell_h);
             for i in 0..steps {
                 let y = r.y + i as f32 * cell_h;
-                instances.push(solid_quad(r.x, y, cell_w, cell_h));
+                instances.push(solid_quad(r.x, y, cell_w, cell_h, color));
             }
         }
         SplitDirection::Vertical => {
@@ -220,20 +262,20 @@ fn build_single_divider(
             let steps = steps_for(r.width, cell_w);
             for i in 0..steps {
                 let x = r.x + i as f32 * cell_w;
-                instances.push(solid_quad(x, r.y, cell_w, cell_h));
+                instances.push(solid_quad(x, r.y, cell_w, cell_h, color));
             }
         }
     }
 }
 
 /// Create a solid-colour quad (no glyph).
-fn solid_quad(x: f32, y: f32, _cell_w: f32, _cell_h: f32) -> CellInstance {
+fn solid_quad(x: f32, y: f32, _w: f32, _h: f32, color: [f32; 4]) -> CellInstance {
     CellInstance {
         pos: [x, y],
         uv_min: [0.0, 0.0],
         uv_max: [0.0, 0.0],
-        fg_color: DIVIDER_COLOR,
-        bg_color: DIVIDER_COLOR,
+        fg_color: color,
+        bg_color: color,
     }
 }
 

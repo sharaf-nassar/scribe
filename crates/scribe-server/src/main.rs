@@ -106,9 +106,10 @@ async fn run_server_loop(
 ) -> Result<(), ScribeError> {
     let path = server_socket_path();
 
-    tokio::select! {
+    let handoff_triggered = tokio::select! {
         result = ipc_server::start_ipc_server(&path, Arc::clone(&session_manager), Arc::clone(&workspace_manager)) => {
             result?;
+            false
         }
         result = handoff::run_handoff_listener(Arc::clone(&session_manager), Arc::clone(&workspace_manager)) => {
             match result {
@@ -119,14 +120,21 @@ async fn run_server_loop(
                     warn!("handoff listener error: {e}");
                 }
             }
+            true
         }
         result = tokio::signal::ctrl_c() => {
             result.map_err(|e| ScribeError::Io { source: e })?;
             info!("received shutdown signal");
+            false
         }
-    }
+    };
 
-    cleanup_socket(&path);
+    // Only clean up the IPC socket if we're NOT handing off. During a handoff
+    // the new server has already bound to the same socket path — removing it
+    // would make the new server unreachable for new client connections.
+    if !handoff_triggered {
+        cleanup_socket(&path);
+    }
 
     info!("scribe-server stopped");
     Ok(())

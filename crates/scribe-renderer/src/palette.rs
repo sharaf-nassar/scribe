@@ -9,15 +9,38 @@ pub struct ColorPalette {
 }
 
 /// Convert an 8-bit sRGB component to a linear f32 in \[0, 1\].
+#[allow(clippy::suboptimal_flops, reason = "clarity: standard sRGB transfer function")]
 #[inline]
-fn u8_to_f32(v: u8) -> f32 {
-    f32::from(v) / 255.0
+fn u8_to_linear(v: u8) -> f32 {
+    let s = f32::from(v) / 255.0;
+    if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
 }
 
-/// Build an opaque RGBA entry from three u8 components.
+/// Build an opaque RGBA entry from three sRGB u8 components (kept in sRGB
+/// space — the palette constructor linearises all entries after population).
 #[inline]
 const fn rgba(r: u8, g: u8, b: u8) -> [f32; 4] {
     [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+}
+
+/// Convert a single sRGB channel to linear space.
+#[allow(clippy::suboptimal_flops, reason = "clarity: standard sRGB transfer function")]
+#[inline]
+fn srgb_to_linear(s: f32) -> f32 {
+    if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+}
+
+/// Linearise an RGBA colour from sRGB (alpha unchanged).
+fn linearise(c: &mut [f32; 4]) {
+    if let Some(r) = c.get_mut(0) {
+        *r = srgb_to_linear(*r);
+    }
+    if let Some(g) = c.get_mut(1) {
+        *g = srgb_to_linear(*g);
+    }
+    if let Some(b) = c.get_mut(2) {
+        *b = srgb_to_linear(*b);
+    }
 }
 
 /// Standard ANSI colours (indices 0-15).
@@ -105,6 +128,12 @@ impl ColorPalette {
         // Entries 232-255: greyscale ramp
         fill_greyscale(&mut entries);
 
+        // Convert all entries from sRGB to linear for the GPU pipeline.
+        // The sRGB framebuffer applies the inverse transform on output.
+        for entry in &mut entries {
+            linearise(entry);
+        }
+
         Self { entries }
     }
 
@@ -116,7 +145,9 @@ impl ColorPalette {
         match color {
             Color::Named(named) => self.resolve_named(named),
             Color::Indexed(idx) => self.entry(usize::from(idx)),
-            Color::Spec(rgb) => [u8_to_f32(rgb.r), u8_to_f32(rgb.g), u8_to_f32(rgb.b), 1.0],
+            Color::Spec(rgb) => {
+                [u8_to_linear(rgb.r), u8_to_linear(rgb.g), u8_to_linear(rgb.b), 1.0]
+            }
         }
     }
 
@@ -155,6 +186,15 @@ impl ColorPalette {
     /// Look up a palette entry by index (0-255).
     fn entry(&self, idx: usize) -> [f32; 4] {
         self.entries.get(idx).copied().unwrap_or_else(Self::fallback)
+    }
+
+    /// Override ANSI colors 0-15 with theme values.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "entries is [_; 256] and colors is [_; 16], so [..16] is always valid"
+    )]
+    pub fn override_ansi(&mut self, colors: &[[f32; 4]; 16]) {
+        self.entries[..16].copy_from_slice(colors);
     }
 
     /// Opaque magenta — used as an unmistakeable "missing colour" sentinel.

@@ -82,44 +82,69 @@ impl AiStateTracker {
 
     /// Compute the animated border colour for a session.
     ///
-    /// Returns `None` when there is no active AI state or the state has
-    /// fully decayed.
-    pub fn border_color(&self, session_id: SessionId) -> Option<[f32; 4]> {
+    /// `ansi_colors` is the theme's 16-colour ANSI palette and `accent` is the
+    /// chrome accent colour.  Returns `None` when there is no active AI state
+    /// or the state has fully decayed.
+    pub fn border_color(
+        &self,
+        session_id: SessionId,
+        ansi_colors: &[[f32; 4]; 16],
+        accent: [f32; 4],
+    ) -> Option<[f32; 4]> {
         let state = self.states.get(&session_id)?;
-        Some(self.state_to_border_color(session_id, state))
+        Some(self.state_to_border_color(session_id, state, ansi_colors, accent))
     }
 
     /// Compute the badge colour for a session (no alpha animation).
     ///
-    /// Returns `None` when there is no active AI state.
+    /// `ansi_colors` is the theme's 16-colour ANSI palette and `accent` is the
+    /// chrome accent colour.  Returns `None` when there is no active AI state.
     #[allow(dead_code, reason = "used by tab_bar badge rendering in future integration")]
-    pub fn badge_color(&self, session_id: SessionId) -> Option<[f32; 4]> {
+    pub fn badge_color(
+        &self,
+        session_id: SessionId,
+        ansi_colors: &[[f32; 4]; 16],
+        accent: [f32; 4],
+    ) -> Option<[f32; 4]> {
         let state = self.states.get(&session_id)?;
-        Some(base_color_full_alpha(&state.state))
+        Some(base_color_full_alpha(&state.state, ansi_colors, accent))
     }
 
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------
 
-    fn state_to_border_color(&self, session_id: SessionId, state: &AiProcessState) -> [f32; 4] {
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "fixed-size [f32; 4] arrays, indices 0-2 always valid"
+    )]
+    fn state_to_border_color(
+        &self,
+        session_id: SessionId,
+        state: &AiProcessState,
+        ansi_colors: &[[f32; 4]; 16],
+        accent: [f32; 4],
+    ) -> [f32; 4] {
         match &state.state {
             AiState::IdlePrompt => {
                 let alpha = pulse_alpha(self.animation_time, PULSE_HZ);
-                [0.4, 0.9, 0.5, alpha]
+                let base = ansi_green(ansi_colors);
+                [base[0], base[1], base[2], alpha]
             }
             AiState::PermissionPrompt => {
                 let alpha = pulse_alpha(self.animation_time, PULSE_HZ);
-                [1.0, 0.75, 0.2, alpha]
+                let base = ansi_yellow(ansi_colors);
+                [base[0], base[1], base[2], alpha]
             }
-            AiState::Processing => [0.2, 0.5, 1.0, 0.4],
+            AiState::Processing => [accent[0], accent[1], accent[2], 0.4],
             AiState::Error => {
                 let alpha = self.error_times.get(&session_id).map_or(0.0, |&t| {
                     let elapsed = self.animation_time - t;
                     let remaining = (ERROR_DECAY_SECS - elapsed) / ERROR_DECAY_SECS;
                     (remaining * 0.8).clamp(0.0, 0.8)
                 });
-                [1.0, 0.2, 0.2, alpha]
+                let base = ansi_red(ansi_colors);
+                [base[0], base[1], base[2], alpha]
             }
         }
     }
@@ -144,14 +169,56 @@ fn pulse_alpha(t: f32, hz: f32) -> f32 {
     mid + amp * (t * std::f32::consts::TAU * hz).sin()
 }
 
+// ---------------------------------------------------------------------------
+// ANSI palette helpers — safe `.get()` with sensible fallbacks
+// ---------------------------------------------------------------------------
+
+/// Fallback green if the palette is somehow missing index 2.
+const FALLBACK_GREEN: [f32; 4] = [0.4, 0.9, 0.5, 1.0];
+/// Fallback yellow if the palette is somehow missing index 3.
+const FALLBACK_YELLOW: [f32; 4] = [1.0, 0.75, 0.2, 1.0];
+/// Fallback red if the palette is somehow missing index 1.
+const FALLBACK_RED: [f32; 4] = [1.0, 0.2, 0.2, 1.0];
+
+/// ANSI red (index 1) with fallback.
+fn ansi_red(ansi_colors: &[[f32; 4]; 16]) -> [f32; 4] {
+    ansi_colors.get(1).copied().unwrap_or(FALLBACK_RED)
+}
+
+/// ANSI green (index 2) with fallback.
+fn ansi_green(ansi_colors: &[[f32; 4]; 16]) -> [f32; 4] {
+    ansi_colors.get(2).copied().unwrap_or(FALLBACK_GREEN)
+}
+
+/// ANSI yellow (index 3) with fallback.
+fn ansi_yellow(ansi_colors: &[[f32; 4]; 16]) -> [f32; 4] {
+    ansi_colors.get(3).copied().unwrap_or(FALLBACK_YELLOW)
+}
+
 /// Return the base colour for an AI state at full opacity (for badges).
+///
+/// Uses the theme's ANSI palette and chrome accent colour.
 #[allow(dead_code, reason = "called by badge_color which is API for tab_bar badge rendering")]
-fn base_color_full_alpha(state: &AiState) -> [f32; 4] {
+#[allow(clippy::indexing_slicing, reason = "fixed-size [f32; 4] arrays, indices 0-2 always valid")]
+fn base_color_full_alpha(
+    state: &AiState,
+    ansi_colors: &[[f32; 4]; 16],
+    accent: [f32; 4],
+) -> [f32; 4] {
     match state {
-        AiState::IdlePrompt => [0.4, 0.9, 0.5, 1.0],
-        AiState::PermissionPrompt => [1.0, 0.75, 0.2, 1.0],
-        AiState::Processing => [0.2, 0.5, 1.0, 1.0],
-        AiState::Error => [1.0, 0.2, 0.2, 1.0],
+        AiState::IdlePrompt => {
+            let c = ansi_green(ansi_colors);
+            [c[0], c[1], c[2], 1.0]
+        }
+        AiState::PermissionPrompt => {
+            let c = ansi_yellow(ansi_colors);
+            [c[0], c[1], c[2], 1.0]
+        }
+        AiState::Processing => [accent[0], accent[1], accent[2], 1.0],
+        AiState::Error => {
+            let c = ansi_red(ansi_colors);
+            [c[0], c[1], c[2], 1.0]
+        }
     }
 }
 

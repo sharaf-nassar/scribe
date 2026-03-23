@@ -1,0 +1,675 @@
+/* Scribe Settings UI — Dark Theme */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: #09090b;
+  color: #e4e4e7;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* ───────── Layout ───────── */
+
+.settings-window {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* ───────── Sidebar ───────── */
+
+.sidebar {
+  width: 210px;
+  background: #0e0e10;
+  padding: 20px 0;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.sidebar-title {
+  padding: 0 20px 20px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #e4e4e7;
+  letter-spacing: -0.01em;
+}
+
+.sidebar-section {
+  padding: 0 12px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: #71717a;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s;
+  margin-bottom: 2px;
+  user-select: none;
+}
+
+.nav-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: #a1a1aa;
+}
+
+.nav-item.active {
+  background: rgba(59, 130, 246, 0.08);
+  color: #60a5fa;
+}
+
+.nav-icon {
+  width: 16px;
+  height: 16px;
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+
+.nav-item.active .nav-icon {
+  opacity: 1;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding: 12px 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+  color: #3f3f46;
+  font-size: 11px;
+}
+
+/* ───────── Content Area ───────── */
+
+.content {
+  flex: 1;
+  padding: 28px 36px;
+  overflow-y: auto;
+  background: #141416;
+}
+
+.content::-webkit-scrollbar {
+  width: 6px;
+}
+
+.content::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.content::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 3px;
+}
+
+.content::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}
+
+.content-page {
+  display: none;
+}
+
+.content-page.active {
+  display: block;
+}
+
+.page-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: #fafafa;
+  margin-bottom: 4px;
+  letter-spacing: -0.02em;
+}
+
+.page-subtitle {
+  font-size: 12px;
+  color: #52525b;
+  margin-bottom: 28px;
+}
+
+/* ───────── Section Groups ───────── */
+
+.section-group {
+  margin-bottom: 28px;
+}
+
+.section-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: #52525b;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 12px;
+}
+
+.section-card {
+  background: #1c1c1f;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+/* ───────── Setting Rows ───────── */
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.setting-row:last-child {
+  border-bottom: none;
+}
+
+.setting-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.setting-label {
+  font-size: 13px;
+  color: #d4d4d8;
+  font-weight: 400;
+}
+
+.setting-desc {
+  font-size: 11px;
+  color: #52525b;
+  margin-top: 2px;
+}
+
+/* ───────── Select / Dropdown ───────── */
+
+.select-wrapper {
+  position: relative;
+}
+
+.select-control {
+  background: #27272a;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 6px 28px 6px 10px;
+  color: #e4e4e7;
+  font-size: 12px;
+  min-width: 160px;
+  cursor: pointer;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  appearance: none;
+  outline: none;
+}
+
+.select-control option {
+  background: #27272a;
+  color: #e4e4e7;
+}
+
+.select-arrow {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #52525b;
+  font-size: 10px;
+  pointer-events: none;
+}
+
+/* ───────── Number Stepper ───────── */
+
+.number-control {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  background: #27272a;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.number-btn {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #71717a;
+  cursor: pointer;
+  font-size: 14px;
+  border: none;
+  background: transparent;
+  transition: all 0.15s;
+  user-select: none;
+  line-height: 1;
+}
+
+.number-btn:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: #a1a1aa;
+}
+
+.number-btn:active {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.number-value {
+  min-width: 40px;
+  text-align: center;
+  font-size: 12px;
+  color: #e4e4e7;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  padding: 0 4px;
+  border-left: 1px solid rgba(255, 255, 255, 0.06);
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* ───────── Toggle Switch ───────── */
+
+.toggle {
+  width: 36px;
+  height: 20px;
+  border-radius: 10px;
+  position: relative;
+  cursor: pointer;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+
+.toggle.off {
+  background: #27272a;
+}
+
+.toggle.on {
+  background: #2563eb;
+}
+
+.toggle-knob {
+  position: absolute;
+  top: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fafafa;
+  transition: left 0.2s;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+.toggle.off .toggle-knob {
+  left: 2px;
+}
+
+.toggle.on .toggle-knob {
+  left: 18px;
+}
+
+/* ───────── Segmented Control (Cursor Shape) ───────── */
+
+.segmented-control {
+  display: flex;
+  gap: 4px;
+  background: #27272a;
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.segment-opt {
+  padding: 5px 12px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #71717a;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  transition: all 0.15s;
+  user-select: none;
+}
+
+.segment-opt:hover {
+  color: #a1a1aa;
+}
+
+.segment-opt.active {
+  background: #1c1c1f;
+  color: #e4e4e7;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+
+.cursor-icon {
+  display: inline-block;
+  border-radius: 1px;
+}
+
+/* ───────── Slider ───────── */
+
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 180px;
+  height: 4px;
+  background: #27272a;
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  background: #fafafa;
+  border-radius: 50%;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+}
+
+.slider-val {
+  font-size: 12px;
+  color: #a1a1aa;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  min-width: 32px;
+  text-align: right;
+}
+
+/* ───────── Theme Grid ───────── */
+
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 24px;
+}
+
+.theme-card {
+  border: 2px solid transparent;
+  border-radius: 10px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: all 0.2s;
+  background: #1c1c1f;
+}
+
+.theme-card:hover {
+  border-color: rgba(255, 255, 255, 0.1);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+.theme-card.selected {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.3), 0 4px 12px rgba(37, 99, 235, 0.1);
+}
+
+.theme-preview {
+  padding: 12px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 9px;
+  line-height: 1.6;
+  height: 80px;
+  overflow: hidden;
+}
+
+.theme-name {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 500;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #a1a1aa;
+}
+
+.theme-check {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #2563eb;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: #fff;
+}
+
+.theme-card-custom {
+  border: 2px dashed rgba(255, 255, 255, 0.08);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 112px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.2s;
+  color: #3f3f46;
+}
+
+.theme-card-custom:hover {
+  border-color: rgba(255, 255, 255, 0.15);
+  color: #52525b;
+}
+
+/* ───────── Color Swatches ───────── */
+
+.color-row {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+
+.color-swatch-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.color-swatch {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s;
+  position: relative;
+  border: 1.5px solid rgba(255, 255, 255, 0.08);
+}
+
+.color-swatch:hover {
+  transform: scale(1.1);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.color-swatch input[type="color"] {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  border: none;
+}
+
+.color-swatch-label {
+  font-size: 10px;
+  color: #52525b;
+  font-weight: 500;
+}
+
+/* ───────── ANSI Color Grid ───────── */
+
+.ansi-row-label {
+  font-size: 10px;
+  color: #3f3f46;
+  margin-bottom: 4px;
+}
+
+.ansi-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.ansi-swatch {
+  height: 30px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s;
+  position: relative;
+}
+
+.ansi-swatch:hover {
+  transform: scale(1.08);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+  z-index: 1;
+}
+
+.ansi-swatch input[type="color"] {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  border: none;
+}
+
+/* ───────── Text Input ───────── */
+
+.text-input {
+  background: #27272a;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: #e4e4e7;
+  font-size: 12px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  min-width: 220px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.text-input:focus {
+  border-color: rgba(37, 99, 235, 0.5);
+}
+
+/* ───────── Keybinding Row ───────── */
+
+.keybinding-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  background: #27272a;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  font-size: 11px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  color: #a1a1aa;
+  cursor: pointer;
+  transition: all 0.15s;
+  user-select: none;
+}
+
+.keybinding-key:hover {
+  border-color: rgba(37, 99, 235, 0.4);
+  color: #e4e4e7;
+}
+
+.keybinding-key.recording {
+  border-color: #2563eb;
+  background: rgba(37, 99, 235, 0.1);
+  color: #60a5fa;
+}
+
+/* ───────── Workspace Roots List ───────── */
+
+.workspace-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.workspace-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.workspace-item:last-child {
+  border-bottom: none;
+}
+
+.workspace-path {
+  font-size: 12px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  color: #a1a1aa;
+}
+
+.workspace-remove {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  color: #52525b;
+  cursor: pointer;
+  transition: all 0.15s;
+  border: none;
+  background: transparent;
+}
+
+.workspace-remove:hover {
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
+}
+
+.workspace-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  color: #52525b;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  border: none;
+  background: transparent;
+  width: 100%;
+  text-align: left;
+}
+
+.workspace-add:hover {
+  color: #a1a1aa;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.workspace-add svg {
+  width: 16px;
+  height: 16px;
+}
