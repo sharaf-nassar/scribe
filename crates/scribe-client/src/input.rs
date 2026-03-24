@@ -1,8 +1,16 @@
 //! Winit key event translation for terminal input and layout commands.
 
-use scribe_common::config::KeybindingsConfig;
+use scribe_common::config::{KeyComboList, KeybindingsConfig};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+/// A set of parsed keybindings for a single action (one or more combos).
+pub type BindingSet = Vec<Keybinding>;
+
+/// Returns `true` if any binding in `set` matches the event and modifiers.
+pub fn any_matches(set: &BindingSet, event: &KeyEvent, modifiers: ModifiersState) -> bool {
+    set.iter().any(|b| b.matches(event, modifiers))
+}
 
 /// A parsed key match target: either a single character or a named key.
 #[derive(Debug, Clone)]
@@ -34,56 +42,65 @@ pub struct Keybinding {
 #[derive(Debug, Clone)]
 pub struct Bindings {
     // Panes
-    pub split_vertical: Keybinding,
-    pub split_horizontal: Keybinding,
-    pub close_pane: Keybinding,
-    pub cycle_pane: Keybinding,
-    pub focus_left: Keybinding,
-    pub focus_right: Keybinding,
-    pub focus_up: Keybinding,
-    pub focus_down: Keybinding,
+    pub split_vertical: BindingSet,
+    pub split_horizontal: BindingSet,
+    pub close_pane: BindingSet,
+    pub cycle_pane: BindingSet,
+    pub focus_left: BindingSet,
+    pub focus_right: BindingSet,
+    pub focus_up: BindingSet,
+    pub focus_down: BindingSet,
 
     // Workspaces
-    pub workspace_split_vertical: Keybinding,
-    pub workspace_split_horizontal: Keybinding,
-    pub cycle_workspace: Keybinding,
+    pub workspace_split_vertical: BindingSet,
+    pub workspace_split_horizontal: BindingSet,
+    pub cycle_workspace: BindingSet,
 
     // Tabs
-    pub new_tab: Keybinding,
-    pub close_tab: Keybinding,
-    pub next_tab: Keybinding,
-    pub prev_tab: Keybinding,
-    pub select_tab_1: Keybinding,
-    pub select_tab_2: Keybinding,
-    pub select_tab_3: Keybinding,
-    pub select_tab_4: Keybinding,
-    pub select_tab_5: Keybinding,
-    pub select_tab_6: Keybinding,
-    pub select_tab_7: Keybinding,
-    pub select_tab_8: Keybinding,
-    pub select_tab_9: Keybinding,
+    pub new_tab: BindingSet,
+    pub close_tab: BindingSet,
+    pub next_tab: BindingSet,
+    pub prev_tab: BindingSet,
+    pub select_tab_1: BindingSet,
+    pub select_tab_2: BindingSet,
+    pub select_tab_3: BindingSet,
+    pub select_tab_4: BindingSet,
+    pub select_tab_5: BindingSet,
+    pub select_tab_6: BindingSet,
+    pub select_tab_7: BindingSet,
+    pub select_tab_8: BindingSet,
+    pub select_tab_9: BindingSet,
 
     // Clipboard
-    pub copy: Keybinding,
-    pub paste: Keybinding,
+    pub copy: BindingSet,
+    pub paste: BindingSet,
 
     // Navigation
-    pub scroll_up: Keybinding,
-    pub scroll_down: Keybinding,
-    pub scroll_top: Keybinding,
-    pub scroll_bottom: Keybinding,
-    pub find: Keybinding,
+    pub scroll_up: BindingSet,
+    pub scroll_down: BindingSet,
+    pub scroll_top: BindingSet,
+    pub scroll_bottom: BindingSet,
+    pub find: BindingSet,
 
     // View
-    pub zoom_in: Keybinding,
-    pub zoom_out: Keybinding,
-    pub zoom_reset: Keybinding,
+    pub zoom_in: BindingSet,
+    pub zoom_out: BindingSet,
+    pub zoom_reset: BindingSet,
 
     // Window
-    pub new_window: Keybinding,
+    pub new_window: BindingSet,
 
     // General
-    pub settings: Keybinding,
+    pub settings: BindingSet,
+
+    // Terminal shortcuts (send escape sequences to PTY)
+    pub word_left: BindingSet,
+    pub word_right: BindingSet,
+    pub delete_word_backward: BindingSet,
+    pub delete_word_backward_ctrl: BindingSet,
+    pub delete_word_forward: BindingSet,
+    pub line_start: BindingSet,
+    pub line_end: BindingSet,
 }
 
 impl Keybinding {
@@ -159,76 +176,96 @@ impl Bindings {
     pub fn parse(config: &KeybindingsConfig) -> Self {
         Self {
             // Panes
-            split_vertical: parse_or_default(&config.split_vertical, "ctrl+shift+\\"),
-            split_horizontal: parse_or_default(&config.split_horizontal, "ctrl+shift+-"),
-            close_pane: parse_or_default(&config.close_pane, "ctrl+shift+w"),
-            cycle_pane: parse_or_default(&config.cycle_pane, "ctrl+tab"),
-            focus_left: parse_or_default(&config.focus_left, "alt+left"),
-            focus_right: parse_or_default(&config.focus_right, "alt+right"),
-            focus_up: parse_or_default(&config.focus_up, "alt+up"),
-            focus_down: parse_or_default(&config.focus_down, "alt+down"),
+            split_vertical: parse_set(&config.split_vertical, "ctrl+shift+\\"),
+            split_horizontal: parse_set(&config.split_horizontal, "ctrl+shift+-"),
+            close_pane: parse_set(&config.close_pane, "ctrl+shift+w"),
+            cycle_pane: parse_set(&config.cycle_pane, "ctrl+tab"),
+            focus_left: parse_set(&config.focus_left, "ctrl+alt+left"),
+            focus_right: parse_set(&config.focus_right, "ctrl+alt+right"),
+            focus_up: parse_set(&config.focus_up, "ctrl+alt+up"),
+            focus_down: parse_set(&config.focus_down, "ctrl+alt+down"),
 
             // Workspaces
-            workspace_split_vertical: parse_or_default(
-                &config.workspace_split_vertical,
-                "ctrl+alt+\\",
-            ),
-            workspace_split_horizontal: parse_or_default(
-                &config.workspace_split_horizontal,
-                "ctrl+alt+-",
-            ),
-            cycle_workspace: parse_or_default(&config.cycle_workspace, "ctrl+alt+tab"),
+            workspace_split_vertical: parse_set(&config.workspace_split_vertical, "ctrl+alt+\\"),
+            workspace_split_horizontal: parse_set(&config.workspace_split_horizontal, "ctrl+alt+-"),
+            cycle_workspace: parse_set(&config.cycle_workspace, "ctrl+alt+tab"),
 
             // Tabs
-            new_tab: parse_or_default(&config.new_tab, "ctrl+shift+t"),
-            close_tab: parse_or_default(&config.close_tab, "ctrl+shift+q"),
-            next_tab: parse_or_default(&config.next_tab, "ctrl+pagedown"),
-            prev_tab: parse_or_default(&config.prev_tab, "ctrl+pageup"),
-            select_tab_1: parse_or_default(&config.select_tab_1, "ctrl+1"),
-            select_tab_2: parse_or_default(&config.select_tab_2, "ctrl+2"),
-            select_tab_3: parse_or_default(&config.select_tab_3, "ctrl+3"),
-            select_tab_4: parse_or_default(&config.select_tab_4, "ctrl+4"),
-            select_tab_5: parse_or_default(&config.select_tab_5, "ctrl+5"),
-            select_tab_6: parse_or_default(&config.select_tab_6, "ctrl+6"),
-            select_tab_7: parse_or_default(&config.select_tab_7, "ctrl+7"),
-            select_tab_8: parse_or_default(&config.select_tab_8, "ctrl+8"),
-            select_tab_9: parse_or_default(&config.select_tab_9, "ctrl+9"),
+            new_tab: parse_set(&config.new_tab, "ctrl+shift+t"),
+            close_tab: parse_set(&config.close_tab, "ctrl+shift+q"),
+            next_tab: parse_set(&config.next_tab, "ctrl+pagedown"),
+            prev_tab: parse_set(&config.prev_tab, "ctrl+pageup"),
+            select_tab_1: parse_set(&config.select_tab_1, "ctrl+1"),
+            select_tab_2: parse_set(&config.select_tab_2, "ctrl+2"),
+            select_tab_3: parse_set(&config.select_tab_3, "ctrl+3"),
+            select_tab_4: parse_set(&config.select_tab_4, "ctrl+4"),
+            select_tab_5: parse_set(&config.select_tab_5, "ctrl+5"),
+            select_tab_6: parse_set(&config.select_tab_6, "ctrl+6"),
+            select_tab_7: parse_set(&config.select_tab_7, "ctrl+7"),
+            select_tab_8: parse_set(&config.select_tab_8, "ctrl+8"),
+            select_tab_9: parse_set(&config.select_tab_9, "ctrl+9"),
 
             // Clipboard
-            copy: parse_or_default(&config.copy, "ctrl+shift+c"),
-            paste: parse_or_default(&config.paste, "ctrl+shift+v"),
+            copy: parse_set(&config.copy, "ctrl+shift+c"),
+            paste: parse_set(&config.paste, "ctrl+shift+v"),
 
             // Navigation
-            scroll_up: parse_or_default(&config.scroll_up, "shift+pageup"),
-            scroll_down: parse_or_default(&config.scroll_down, "shift+pagedown"),
-            scroll_top: parse_or_default(&config.scroll_top, "shift+home"),
-            scroll_bottom: parse_or_default(&config.scroll_bottom, "shift+end"),
-            find: parse_or_default(&config.find, "ctrl+shift+f"),
+            scroll_up: parse_set(&config.scroll_up, "shift+pageup"),
+            scroll_down: parse_set(&config.scroll_down, "shift+pagedown"),
+            scroll_top: parse_set(&config.scroll_top, "shift+home"),
+            scroll_bottom: parse_set(&config.scroll_bottom, "shift+end"),
+            find: parse_set(&config.find, "ctrl+shift+f"),
 
             // View
-            zoom_in: parse_or_default(&config.zoom_in, "ctrl+="),
-            zoom_out: parse_or_default(&config.zoom_out, "ctrl+-"),
-            zoom_reset: parse_or_default(&config.zoom_reset, "ctrl+0"),
+            zoom_in: parse_set(&config.zoom_in, "ctrl+="),
+            zoom_out: parse_set(&config.zoom_out, "ctrl+-"),
+            zoom_reset: parse_set(&config.zoom_reset, "ctrl+0"),
 
             // Window
-            new_window: parse_or_default(&config.new_window, "ctrl+shift+n"),
+            new_window: parse_set(&config.new_window, "ctrl+shift+n"),
 
             // General
-            settings: parse_or_default(&config.settings, "ctrl+,"),
+            settings: parse_set(&config.settings, "ctrl+,"),
+
+            // Terminal shortcuts
+            word_left: parse_set(&config.word_left, "ctrl+left"),
+            word_right: parse_set(&config.word_right, "ctrl+right"),
+            delete_word_backward: parse_set(&config.delete_word_backward, "alt+backspace"),
+            delete_word_backward_ctrl: parse_set(
+                &config.delete_word_backward_ctrl,
+                "ctrl+backspace",
+            ),
+            delete_word_forward: parse_set(&config.delete_word_forward, "ctrl+delete"),
+            line_start: parse_set(&config.line_start, "ctrl+home"),
+            line_end: parse_set(&config.line_end, "ctrl+end"),
         }
     }
 }
 
-/// Parse a keybinding string, falling back to `default` with a warning if invalid.
-fn parse_or_default(value: &str, default: &str) -> Keybinding {
-    Keybinding::parse(value).unwrap_or_else(|| {
-        tracing::warn!(binding = value, default, "invalid keybinding, using default");
-        #[allow(
-            clippy::expect_used,
-            reason = "hardcoded default keybinding strings are guaranteed valid"
-        )]
-        Keybinding::parse(default).expect("default keybinding must parse")
-    })
+/// Parse a combo list into a [`BindingSet`], skipping invalid entries.
+///
+/// If the list is empty or all entries fail to parse, falls back to a single
+/// binding parsed from `default`.
+fn parse_set(list: &KeyComboList, default: &str) -> BindingSet {
+    let parsed: BindingSet = list
+        .as_slice()
+        .iter()
+        .filter_map(|s| {
+            let kb = Keybinding::parse(s);
+            if kb.is_none() {
+                tracing::warn!(binding = s.as_str(), "invalid keybinding string, skipping");
+            }
+            kb
+        })
+        .collect();
+
+    if parsed.is_empty() { vec![parse_default(default)] } else { parsed }
+}
+
+/// Parse a hardcoded default keybinding string that is guaranteed to be valid.
+#[allow(clippy::expect_used, reason = "hardcoded default keybinding strings are guaranteed valid")]
+fn parse_default(default: &str) -> Keybinding {
+    Keybinding::parse(default).expect("default keybinding must parse")
 }
 
 /// Layout commands intercepted before normal key translation.
@@ -316,7 +353,7 @@ pub enum KeyAction {
 
 /// Translate a winit key event into either terminal bytes or a layout command.
 ///
-/// Layout shortcuts are intercepted first using the provided `bindings`.
+/// Priority: layout shortcuts → settings/find → terminal shortcuts → generic key translation.
 /// Returns `None` if the key should be ignored.
 pub fn translate_key_action(
     event: &KeyEvent,
@@ -332,19 +369,30 @@ pub fn translate_key_action(
         return Some(KeyAction::Layout(action));
     }
 
-    if bindings.settings.matches(event, modifiers) {
+    if any_matches(&bindings.settings, event, modifiers) {
         return Some(KeyAction::OpenSettings);
     }
 
-    if bindings.find.matches(event, modifiers) {
+    if any_matches(&bindings.find, event, modifiers) {
         return Some(KeyAction::OpenFind);
     }
 
-    // Fall through to normal terminal key translation.
+    // Check configurable terminal shortcuts (specific escape sequences).
+    if let Some(bytes) = translate_terminal_shortcut(event, modifiers, bindings) {
+        return Some(KeyAction::Terminal(bytes));
+    }
+
+    // Fall through to generic terminal key translation with modifier encoding.
     translate_key(event, modifiers).map(KeyAction::Terminal)
 }
 
 /// Translate a winit key event into terminal byte sequences.
+///
+/// Handles modifier encoding for all key combinations:
+/// - Ctrl+character → control byte (0x01–0x1a)
+/// - Ctrl+Alt+character → ESC + control byte
+/// - Alt+character → ESC + character
+/// - Modifier+named-key → xterm modifier-encoded escape sequence
 ///
 /// Returns `None` if the key should be ignored (key-up events,
 /// unrecognised keys, or modifier-only keys).
@@ -353,14 +401,9 @@ pub fn translate_key(event: &KeyEvent, modifiers: ModifiersState) -> Option<Vec<
         return None;
     }
 
-    // Ctrl+key takes priority over normal character output.
-    if modifiers.control_key() {
-        return translate_ctrl_key(event);
-    }
-
     match &event.logical_key {
-        Key::Character(c) => Some(c.as_bytes().to_vec()),
-        Key::Named(named) => translate_named_key(*named),
+        Key::Character(c) => translate_character_with_modifiers(c, modifiers),
+        Key::Named(named) => translate_named_with_modifiers(*named, modifiers),
         _ => None,
     }
 }
@@ -377,190 +420,389 @@ fn translate_layout_shortcut(
     bindings: &Bindings,
 ) -> Option<LayoutAction> {
     // Panes
-    if bindings.split_vertical.matches(event, modifiers) {
+    if any_matches(&bindings.split_vertical, event, modifiers) {
         return Some(LayoutAction::SplitVertical);
     }
-    if bindings.split_horizontal.matches(event, modifiers) {
+    if any_matches(&bindings.split_horizontal, event, modifiers) {
         return Some(LayoutAction::SplitHorizontal);
     }
-    if bindings.close_pane.matches(event, modifiers) {
+    if any_matches(&bindings.close_pane, event, modifiers) {
         return Some(LayoutAction::ClosePane);
     }
-    if bindings.cycle_pane.matches(event, modifiers) {
+    if any_matches(&bindings.cycle_pane, event, modifiers) {
         return Some(LayoutAction::FocusNext);
     }
-    if bindings.focus_left.matches(event, modifiers) {
+    if any_matches(&bindings.focus_left, event, modifiers) {
         return Some(LayoutAction::FocusLeft);
     }
-    if bindings.focus_right.matches(event, modifiers) {
+    if any_matches(&bindings.focus_right, event, modifiers) {
         return Some(LayoutAction::FocusRight);
     }
-    if bindings.focus_up.matches(event, modifiers) {
+    if any_matches(&bindings.focus_up, event, modifiers) {
         return Some(LayoutAction::FocusUp);
     }
-    if bindings.focus_down.matches(event, modifiers) {
+    if any_matches(&bindings.focus_down, event, modifiers) {
         return Some(LayoutAction::FocusDown);
     }
 
     // Workspaces
-    if bindings.workspace_split_vertical.matches(event, modifiers) {
+    if any_matches(&bindings.workspace_split_vertical, event, modifiers) {
         return Some(LayoutAction::WorkspaceSplitVertical);
     }
-    if bindings.workspace_split_horizontal.matches(event, modifiers) {
+    if any_matches(&bindings.workspace_split_horizontal, event, modifiers) {
         return Some(LayoutAction::WorkspaceSplitHorizontal);
     }
-    if bindings.cycle_workspace.matches(event, modifiers) {
+    if any_matches(&bindings.cycle_workspace, event, modifiers) {
         return Some(LayoutAction::CycleWorkspaceFocus);
     }
 
     // Window
-    if bindings.new_window.matches(event, modifiers) {
+    if any_matches(&bindings.new_window, event, modifiers) {
         return Some(LayoutAction::NewWindow);
     }
 
     // Tabs
-    if bindings.new_tab.matches(event, modifiers) {
+    if any_matches(&bindings.new_tab, event, modifiers) {
         return Some(LayoutAction::NewTab);
     }
-    if bindings.close_tab.matches(event, modifiers) {
+    if any_matches(&bindings.close_tab, event, modifiers) {
         return Some(LayoutAction::CloseTab);
     }
-    if bindings.next_tab.matches(event, modifiers) {
+    if any_matches(&bindings.next_tab, event, modifiers) {
         return Some(LayoutAction::NextTab);
     }
-    if bindings.prev_tab.matches(event, modifiers) {
+    if any_matches(&bindings.prev_tab, event, modifiers) {
         return Some(LayoutAction::PrevTab);
     }
-    if bindings.select_tab_1.matches(event, modifiers) {
+    if any_matches(&bindings.select_tab_1, event, modifiers) {
         return Some(LayoutAction::SelectTab(0));
     }
-    if bindings.select_tab_2.matches(event, modifiers) {
+    if any_matches(&bindings.select_tab_2, event, modifiers) {
         return Some(LayoutAction::SelectTab(1));
     }
-    if bindings.select_tab_3.matches(event, modifiers) {
+    if any_matches(&bindings.select_tab_3, event, modifiers) {
         return Some(LayoutAction::SelectTab(2));
     }
-    if bindings.select_tab_4.matches(event, modifiers) {
+    if any_matches(&bindings.select_tab_4, event, modifiers) {
         return Some(LayoutAction::SelectTab(3));
     }
-    if bindings.select_tab_5.matches(event, modifiers) {
+    if any_matches(&bindings.select_tab_5, event, modifiers) {
         return Some(LayoutAction::SelectTab(4));
     }
-    if bindings.select_tab_6.matches(event, modifiers) {
+    if any_matches(&bindings.select_tab_6, event, modifiers) {
         return Some(LayoutAction::SelectTab(5));
     }
-    if bindings.select_tab_7.matches(event, modifiers) {
+    if any_matches(&bindings.select_tab_7, event, modifiers) {
         return Some(LayoutAction::SelectTab(6));
     }
-    if bindings.select_tab_8.matches(event, modifiers) {
+    if any_matches(&bindings.select_tab_8, event, modifiers) {
         return Some(LayoutAction::SelectTab(7));
     }
-    if bindings.select_tab_9.matches(event, modifiers) {
+    if any_matches(&bindings.select_tab_9, event, modifiers) {
         return Some(LayoutAction::SelectTab(8));
     }
 
     // Clipboard
-    if bindings.copy.matches(event, modifiers) {
+    if any_matches(&bindings.copy, event, modifiers) {
         return Some(LayoutAction::CopySelection);
     }
-    if bindings.paste.matches(event, modifiers) {
+    if any_matches(&bindings.paste, event, modifiers) {
         return Some(LayoutAction::PasteClipboard);
     }
 
     // Navigation
-    if bindings.scroll_up.matches(event, modifiers) {
+    if any_matches(&bindings.scroll_up, event, modifiers) {
         return Some(LayoutAction::ScrollUp);
     }
-    if bindings.scroll_down.matches(event, modifiers) {
+    if any_matches(&bindings.scroll_down, event, modifiers) {
         return Some(LayoutAction::ScrollDown);
     }
-    if bindings.scroll_top.matches(event, modifiers) {
+    if any_matches(&bindings.scroll_top, event, modifiers) {
         return Some(LayoutAction::ScrollTop);
     }
-    if bindings.scroll_bottom.matches(event, modifiers) {
+    if any_matches(&bindings.scroll_bottom, event, modifiers) {
         return Some(LayoutAction::ScrollBottom);
     }
 
     // View
-    if bindings.zoom_in.matches(event, modifiers) {
+    if any_matches(&bindings.zoom_in, event, modifiers) {
         return Some(LayoutAction::ZoomIn);
     }
-    if bindings.zoom_out.matches(event, modifiers) {
+    if any_matches(&bindings.zoom_out, event, modifiers) {
         return Some(LayoutAction::ZoomOut);
     }
-    if bindings.zoom_reset.matches(event, modifiers) {
+    if any_matches(&bindings.zoom_reset, event, modifiers) {
         return Some(LayoutAction::ZoomReset);
     }
 
     None
 }
 
-/// Translate a named key to its VT100 / ANSI byte sequence.
-fn translate_named_key(named: NamedKey) -> Option<Vec<u8>> {
-    let seq: &[u8] = match named {
-        NamedKey::Space => b" ",
-        NamedKey::Enter => b"\r",
-        NamedKey::Backspace => b"\x7f",
-        NamedKey::Tab => b"\t",
-        NamedKey::Escape => b"\x1b",
-        NamedKey::ArrowUp => b"\x1b[A",
-        NamedKey::ArrowDown => b"\x1b[B",
-        NamedKey::ArrowRight => b"\x1b[C",
-        NamedKey::ArrowLeft => b"\x1b[D",
-        NamedKey::Home => b"\x1b[H",
-        NamedKey::End => b"\x1b[F",
-        NamedKey::PageUp => b"\x1b[5~",
-        NamedKey::PageDown => b"\x1b[6~",
-        NamedKey::Delete => b"\x1b[3~",
-        NamedKey::Insert => b"\x1b[2~",
-        NamedKey::F1 => b"\x1bOP",
-        NamedKey::F2 => b"\x1bOQ",
-        NamedKey::F3 => b"\x1bOR",
-        NamedKey::F4 => b"\x1bOS",
-        NamedKey::F5 => b"\x1b[15~",
-        NamedKey::F6 => b"\x1b[17~",
-        NamedKey::F7 => b"\x1b[18~",
-        NamedKey::F8 => b"\x1b[19~",
-        NamedKey::F9 => b"\x1b[20~",
-        NamedKey::F10 => b"\x1b[21~",
-        NamedKey::F11 => b"\x1b[23~",
-        NamedKey::F12 => b"\x1b[24~",
-        NamedKey::F13 => b"\x1b[25~",
-        NamedKey::F14 => b"\x1b[26~",
-        NamedKey::F15 => b"\x1b[28~",
-        NamedKey::F16 => b"\x1b[29~",
-        NamedKey::F17 => b"\x1b[31~",
-        NamedKey::F18 => b"\x1b[32~",
-        NamedKey::F19 => b"\x1b[33~",
-        NamedKey::F20 => b"\x1b[34~",
-        _ => return None,
-    };
-    Some(seq.to_vec())
+/// Check configurable terminal shortcut bindings.
+///
+/// Each binding maps a key combination to a fixed escape sequence sent to the PTY.
+fn translate_terminal_shortcut(
+    event: &KeyEvent,
+    modifiers: ModifiersState,
+    bindings: &Bindings,
+) -> Option<Vec<u8>> {
+    if any_matches(&bindings.word_left, event, modifiers) {
+        return Some(b"\x1b[1;5D".to_vec());
+    }
+    if any_matches(&bindings.word_right, event, modifiers) {
+        return Some(b"\x1b[1;5C".to_vec());
+    }
+    if any_matches(&bindings.delete_word_backward, event, modifiers) {
+        return Some(vec![0x1b, 0x7f]);
+    }
+    if any_matches(&bindings.delete_word_backward_ctrl, event, modifiers) {
+        return Some(vec![0x08]);
+    }
+    if any_matches(&bindings.delete_word_forward, event, modifiers) {
+        return Some(b"\x1b[3;5~".to_vec());
+    }
+    if any_matches(&bindings.line_start, event, modifiers) {
+        return Some(b"\x1b[1;5H".to_vec());
+    }
+    if any_matches(&bindings.line_end, event, modifiers) {
+        return Some(b"\x1b[1;5F".to_vec());
+    }
+    None
 }
 
-/// Translate a Ctrl+key combination to a control byte (0x01-0x1a).
-fn translate_ctrl_key(event: &KeyEvent) -> Option<Vec<u8>> {
-    match &event.logical_key {
-        Key::Character(c) => {
-            let ch = c.chars().next()?;
-            if ch.is_ascii_lowercase() {
-                #[allow(
-                    clippy::as_conversions,
-                    reason = "ASCII lowercase char is guaranteed to fit in u8"
-                )]
-                Some(vec![ch as u8 - b'a' + 1])
-            } else if ch.is_ascii_uppercase() {
-                #[allow(
-                    clippy::as_conversions,
-                    reason = "ASCII uppercase char is guaranteed to fit in u8"
-                )]
-                Some(vec![ch as u8 - b'A' + 1])
-            } else {
-                None
-            }
+// ---------------------------------------------------------------------------
+// Generic terminal key translation with modifier encoding
+// ---------------------------------------------------------------------------
+
+/// Translate a character key with modifier encoding.
+///
+/// - Ctrl+char → control byte (0x01–0x1a)
+/// - Ctrl+Alt+char → ESC + control byte
+/// - Alt+char → ESC + character bytes
+/// - No relevant modifiers → raw character bytes
+fn translate_character_with_modifiers(c: &str, modifiers: ModifiersState) -> Option<Vec<u8>> {
+    let ctrl = modifiers.control_key();
+    let alt = modifiers.alt_key();
+
+    if ctrl {
+        let control_byte = char_to_control_byte(c)?;
+        if alt {
+            // Ctrl+Alt+char → ESC + control byte
+            Some(vec![0x1b, control_byte])
+        } else {
+            // Ctrl+char → control byte
+            Some(vec![control_byte])
         }
-        // Ctrl+Space sends NUL (used as tmux prefix, emacs set-mark, etc.).
-        Key::Named(NamedKey::Space) => Some(vec![0]),
+    } else if alt {
+        // Alt+char → ESC + character bytes
+        let mut bytes = vec![0x1b];
+        bytes.extend_from_slice(c.as_bytes());
+        Some(bytes)
+    } else {
+        // No relevant modifiers → raw character bytes
+        Some(c.as_bytes().to_vec())
+    }
+}
+
+/// Convert a character to its Ctrl control byte.
+///
+/// Maps a–z / A–Z to 0x01–0x1a. Space is handled separately via `NamedKey::Space`.
+fn char_to_control_byte(c: &str) -> Option<u8> {
+    let ch = c.chars().next()?;
+    #[allow(
+        clippy::as_conversions,
+        reason = "ASCII char is guaranteed to fit in u8 for control byte computation"
+    )]
+    if ch.is_ascii_lowercase() {
+        Some(ch as u8 - b'a' + 1)
+    } else if ch.is_ascii_uppercase() {
+        Some(ch as u8 - b'A' + 1)
+    } else {
+        None
+    }
+}
+
+/// Translate a named key with xterm modifier encoding.
+///
+/// When modifiers are held, encodes them using the standard xterm parameter:
+/// `param = 1 + shift(1) + alt(2) + ctrl(4)`.
+///
+/// Special cases (Backspace, Space, Enter, Tab, Escape) are handled separately
+/// since they don't follow the standard CSI modifier encoding.
+#[allow(
+    clippy::too_many_lines,
+    reason = "comprehensive named key table is inherently long but each arm is trivial"
+)]
+fn translate_named_with_modifiers(named: NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
+    // Special keys that don't use standard xterm modifier encoding.
+    match named {
+        NamedKey::Backspace => {
+            return if modifiers.control_key() && modifiers.alt_key() {
+                Some(vec![0x1b, 0x08]) // Ctrl+Alt+Backspace → ESC BS
+            } else if modifiers.alt_key() {
+                Some(vec![0x1b, 0x7f]) // Alt+Backspace → ESC DEL
+            } else if modifiers.control_key() {
+                Some(vec![0x08]) // Ctrl+Backspace → BS
+            } else {
+                Some(vec![0x7f]) // Plain Backspace → DEL
+            };
+        }
+        NamedKey::Space => {
+            return if modifiers.control_key() {
+                Some(vec![0]) // Ctrl+Space → NUL
+            } else if modifiers.alt_key() {
+                Some(vec![0x1b, b' ']) // Alt+Space → ESC SP
+            } else {
+                Some(b" ".to_vec())
+            };
+        }
+        NamedKey::Enter => {
+            return if modifiers.alt_key() {
+                Some(vec![0x1b, b'\r']) // Alt+Enter → ESC CR
+            } else {
+                Some(b"\r".to_vec())
+            };
+        }
+        NamedKey::Tab => {
+            return if modifiers.shift_key() {
+                Some(b"\x1b[Z".to_vec()) // Shift+Tab → backtab
+            } else {
+                Some(b"\t".to_vec())
+            };
+        }
+        NamedKey::Escape => return Some(b"\x1b".to_vec()),
+        _ => {}
+    }
+
+    // Compute xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4).
+    let modifier_param = xterm_modifier_param(modifiers);
+
+    // Keys using CSI letter format: \x1b[1;{mod}{letter} or \x1b[{letter}
+    if let Some(letter) = csi_letter_for_named(named) {
+        return Some(build_csi_letter_seq(letter, modifier_param));
+    }
+
+    // Keys using CSI tilde format: \x1b[{code};{mod}~ or \x1b[{code}~
+    if let Some(code) = csi_tilde_code_for_named(named) {
+        return Some(build_csi_tilde_seq(code, modifier_param));
+    }
+
+    // F1–F4 use SS3 format normally but CSI with modifiers.
+    if let Some(letter) = ss3_letter_for_fkey(named) {
+        return if modifier_param.is_some() {
+            Some(build_csi_letter_seq(letter, modifier_param))
+        } else {
+            Some(vec![0x1b, b'O', letter])
+        };
+    }
+
+    // F5+ use CSI tilde format with specific codes.
+    if let Some(code) = fkey_tilde_code(named) {
+        return Some(build_csi_tilde_seq(code, modifier_param));
+    }
+
+    None
+}
+
+/// Compute the xterm modifier parameter.
+///
+/// Returns `None` when no modifiers are held (parameter is omitted),
+/// or `Some(param)` where `param = 1 + shift(1) + alt(2) + ctrl(4)`.
+fn xterm_modifier_param(modifiers: ModifiersState) -> Option<u8> {
+    let mut param: u8 = 1;
+    if modifiers.shift_key() {
+        param += 1;
+    }
+    if modifiers.alt_key() {
+        param += 2;
+    }
+    if modifiers.control_key() {
+        param += 4;
+    }
+    if param > 1 { Some(param) } else { None }
+}
+
+/// Map arrow/home/end keys to their CSI letter.
+fn csi_letter_for_named(named: NamedKey) -> Option<u8> {
+    match named {
+        NamedKey::ArrowUp => Some(b'A'),
+        NamedKey::ArrowDown => Some(b'B'),
+        NamedKey::ArrowRight => Some(b'C'),
+        NamedKey::ArrowLeft => Some(b'D'),
+        NamedKey::Home => Some(b'H'),
+        NamedKey::End => Some(b'F'),
         _ => None,
     }
+}
+
+/// Map keys to their CSI tilde code number.
+fn csi_tilde_code_for_named(named: NamedKey) -> Option<u8> {
+    match named {
+        NamedKey::Insert => Some(2),
+        NamedKey::Delete => Some(3),
+        NamedKey::PageUp => Some(5),
+        NamedKey::PageDown => Some(6),
+        _ => None,
+    }
+}
+
+/// Map F1–F4 to their SS3 letter (P, Q, R, S).
+fn ss3_letter_for_fkey(named: NamedKey) -> Option<u8> {
+    match named {
+        NamedKey::F1 => Some(b'P'),
+        NamedKey::F2 => Some(b'Q'),
+        NamedKey::F3 => Some(b'R'),
+        NamedKey::F4 => Some(b'S'),
+        _ => None,
+    }
+}
+
+/// Map F5–F20 to their CSI tilde code.
+fn fkey_tilde_code(named: NamedKey) -> Option<u8> {
+    match named {
+        NamedKey::F5 => Some(15),
+        NamedKey::F6 => Some(17),
+        NamedKey::F7 => Some(18),
+        NamedKey::F8 => Some(19),
+        NamedKey::F9 => Some(20),
+        NamedKey::F10 => Some(21),
+        NamedKey::F11 => Some(23),
+        NamedKey::F12 => Some(24),
+        NamedKey::F13 => Some(25),
+        NamedKey::F14 => Some(26),
+        NamedKey::F15 => Some(28),
+        NamedKey::F16 => Some(29),
+        NamedKey::F17 => Some(31),
+        NamedKey::F18 => Some(32),
+        NamedKey::F19 => Some(33),
+        NamedKey::F20 => Some(34),
+        _ => None,
+    }
+}
+
+/// Build a CSI letter sequence: `\x1b[1;{param}{letter}` or `\x1b[{letter}`.
+fn build_csi_letter_seq(letter: u8, modifier_param: Option<u8>) -> Vec<u8> {
+    modifier_param.map_or_else(
+        || vec![0x1b, b'[', letter],
+        |param| {
+            let mut seq = Vec::with_capacity(8);
+            seq.extend_from_slice(b"\x1b[1;");
+            seq.extend_from_slice(param.to_string().as_bytes());
+            seq.push(letter);
+            seq
+        },
+    )
+}
+
+/// Build a CSI tilde sequence: `\x1b[{code};{param}~` or `\x1b[{code}~`.
+fn build_csi_tilde_seq(code: u8, modifier_param: Option<u8>) -> Vec<u8> {
+    let mut seq = Vec::with_capacity(10);
+    seq.extend_from_slice(b"\x1b[");
+    seq.extend_from_slice(code.to_string().as_bytes());
+    if let Some(param) = modifier_param {
+        seq.push(b';');
+        seq.extend_from_slice(param.to_string().as_bytes());
+    }
+    seq.push(b'~');
+    seq
 }

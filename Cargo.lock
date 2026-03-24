@@ -3694,9 +3694,7 @@ dependencies = [
  "rfd",
  "scribe-common",
  "scribe-renderer",
- "scribe-settings",
  "serde",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "toml",
@@ -3771,13 +3769,18 @@ dependencies = [
 name = "scribe-settings"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "fontdb",
  "gtk",
+ "libc",
+ "nix",
  "rust-embed",
  "scribe-common",
  "serde",
  "serde_json",
+ "toml",
  "tracing",
+ "tracing-subscriber",
  "wry",
 ]
 

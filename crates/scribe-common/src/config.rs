@@ -4,6 +4,75 @@ use crate::error::ScribeError;
 use crate::theme::{self, Theme, ThemeColors, hex_to_rgba};
 
 // ---------------------------------------------------------------------------
+// KeyComboList — a keybinding field that holds one or more key combos
+// ---------------------------------------------------------------------------
+
+/// Maximum number of key combos allowed per action.
+pub const MAX_BINDINGS: usize = 5;
+
+/// A list of key combo strings for a single keybinding action.
+///
+/// Deserializes from either a bare TOML string (`"ctrl+shift+w"`) for backward
+/// compatibility, or a TOML array (`["ctrl+shift+w", "ctrl+w"]`).  Always
+/// serializes as an array.
+#[derive(Debug, Clone)]
+pub struct KeyComboList(pub Vec<String>);
+
+impl KeyComboList {
+    /// Create a list containing a single combo.
+    pub fn single(s: &str) -> Self {
+        Self(vec![String::from(s)])
+    }
+
+    /// Create from a vec, clamping to [`MAX_BINDINGS`].
+    pub fn from_vec(mut v: Vec<String>) -> Self {
+        v.truncate(MAX_BINDINGS);
+        Self(v)
+    }
+
+    /// Borrow the underlying combo strings.
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl Serialize for KeyComboList {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+/// Visitor for deserializing a [`KeyComboList`] from either a string or array.
+struct KeyComboVisitor;
+
+impl<'de> serde::de::Visitor<'de> for KeyComboVisitor {
+    type Value = KeyComboList;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a string or array of strings")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(KeyComboList(vec![v.to_owned()]))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut v = Vec::with_capacity(seq.size_hint().unwrap_or(1));
+        while let Some(s) = seq.next_element::<String>()? {
+            v.push(s);
+        }
+        v.truncate(MAX_BINDINGS);
+        Ok(KeyComboList(v))
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyComboList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(KeyComboVisitor)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Top-level config
 // ---------------------------------------------------------------------------
 
@@ -180,98 +249,110 @@ fn default_scrollback_lines() -> u32 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "keybinding config is a flat struct of string fields, not booleans"
-)]
 pub struct KeybindingsConfig {
     // Panes
     #[serde(default = "default_split_vertical")]
-    pub split_vertical: String,
+    pub split_vertical: KeyComboList,
     #[serde(default = "default_split_horizontal")]
-    pub split_horizontal: String,
+    pub split_horizontal: KeyComboList,
     #[serde(default = "default_close_pane")]
-    pub close_pane: String,
+    pub close_pane: KeyComboList,
     #[serde(default = "default_cycle_pane")]
-    pub cycle_pane: String,
+    pub cycle_pane: KeyComboList,
     #[serde(default = "default_focus_left")]
-    pub focus_left: String,
+    pub focus_left: KeyComboList,
     #[serde(default = "default_focus_right")]
-    pub focus_right: String,
+    pub focus_right: KeyComboList,
     #[serde(default = "default_focus_up")]
-    pub focus_up: String,
+    pub focus_up: KeyComboList,
     #[serde(default = "default_focus_down")]
-    pub focus_down: String,
+    pub focus_down: KeyComboList,
 
     // Workspaces
     #[serde(default = "default_workspace_split_vertical")]
-    pub workspace_split_vertical: String,
+    pub workspace_split_vertical: KeyComboList,
     #[serde(default = "default_workspace_split_horizontal")]
-    pub workspace_split_horizontal: String,
+    pub workspace_split_horizontal: KeyComboList,
     #[serde(default = "default_cycle_workspace")]
-    pub cycle_workspace: String,
+    pub cycle_workspace: KeyComboList,
 
     // Tabs
     #[serde(default = "default_new_tab")]
-    pub new_tab: String,
+    pub new_tab: KeyComboList,
     #[serde(default = "default_close_tab")]
-    pub close_tab: String,
+    pub close_tab: KeyComboList,
     #[serde(default = "default_next_tab")]
-    pub next_tab: String,
+    pub next_tab: KeyComboList,
     #[serde(default = "default_prev_tab")]
-    pub prev_tab: String,
+    pub prev_tab: KeyComboList,
     #[serde(default = "default_select_tab_1")]
-    pub select_tab_1: String,
+    pub select_tab_1: KeyComboList,
     #[serde(default = "default_select_tab_2")]
-    pub select_tab_2: String,
+    pub select_tab_2: KeyComboList,
     #[serde(default = "default_select_tab_3")]
-    pub select_tab_3: String,
+    pub select_tab_3: KeyComboList,
     #[serde(default = "default_select_tab_4")]
-    pub select_tab_4: String,
+    pub select_tab_4: KeyComboList,
     #[serde(default = "default_select_tab_5")]
-    pub select_tab_5: String,
+    pub select_tab_5: KeyComboList,
     #[serde(default = "default_select_tab_6")]
-    pub select_tab_6: String,
+    pub select_tab_6: KeyComboList,
     #[serde(default = "default_select_tab_7")]
-    pub select_tab_7: String,
+    pub select_tab_7: KeyComboList,
     #[serde(default = "default_select_tab_8")]
-    pub select_tab_8: String,
+    pub select_tab_8: KeyComboList,
     #[serde(default = "default_select_tab_9")]
-    pub select_tab_9: String,
+    pub select_tab_9: KeyComboList,
 
     // Clipboard
     #[serde(default = "default_copy")]
-    pub copy: String,
+    pub copy: KeyComboList,
     #[serde(default = "default_paste")]
-    pub paste: String,
+    pub paste: KeyComboList,
 
     // Navigation
     #[serde(default = "default_scroll_up")]
-    pub scroll_up: String,
+    pub scroll_up: KeyComboList,
     #[serde(default = "default_scroll_down")]
-    pub scroll_down: String,
+    pub scroll_down: KeyComboList,
     #[serde(default = "default_scroll_top")]
-    pub scroll_top: String,
+    pub scroll_top: KeyComboList,
     #[serde(default = "default_scroll_bottom")]
-    pub scroll_bottom: String,
+    pub scroll_bottom: KeyComboList,
     #[serde(default = "default_find")]
-    pub find: String,
+    pub find: KeyComboList,
 
     // View
     #[serde(default = "default_zoom_in")]
-    pub zoom_in: String,
+    pub zoom_in: KeyComboList,
     #[serde(default = "default_zoom_out")]
-    pub zoom_out: String,
+    pub zoom_out: KeyComboList,
     #[serde(default = "default_zoom_reset")]
-    pub zoom_reset: String,
+    pub zoom_reset: KeyComboList,
 
     // Window
     #[serde(default = "default_new_window")]
-    pub new_window: String,
+    pub new_window: KeyComboList,
 
     // General
     #[serde(default = "default_settings")]
-    pub settings: String,
+    pub settings: KeyComboList,
+
+    // Terminal shortcuts (send escape sequences to PTY)
+    #[serde(default = "default_word_left")]
+    pub word_left: KeyComboList,
+    #[serde(default = "default_word_right")]
+    pub word_right: KeyComboList,
+    #[serde(default = "default_delete_word_backward")]
+    pub delete_word_backward: KeyComboList,
+    #[serde(default = "default_delete_word_backward_ctrl")]
+    pub delete_word_backward_ctrl: KeyComboList,
+    #[serde(default = "default_delete_word_forward")]
+    pub delete_word_forward: KeyComboList,
+    #[serde(default = "default_line_start")]
+    pub line_start: KeyComboList,
+    #[serde(default = "default_line_end")]
+    pub line_end: KeyComboList,
 }
 
 impl Default for KeybindingsConfig {
@@ -313,152 +394,187 @@ impl Default for KeybindingsConfig {
             zoom_reset: default_zoom_reset(),
             new_window: default_new_window(),
             settings: default_settings(),
+            word_left: default_word_left(),
+            word_right: default_word_right(),
+            delete_word_backward: default_delete_word_backward(),
+            delete_word_backward_ctrl: default_delete_word_backward_ctrl(),
+            delete_word_forward: default_delete_word_forward(),
+            line_start: default_line_start(),
+            line_end: default_line_end(),
         }
     }
 }
 
-fn default_split_vertical() -> String {
-    String::from("ctrl+shift+\\")
+fn default_split_vertical() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+\\")
 }
 
-fn default_split_horizontal() -> String {
-    String::from("ctrl+shift+-")
+fn default_split_horizontal() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+-")
 }
 
-fn default_close_pane() -> String {
-    String::from("ctrl+shift+w")
+fn default_close_pane() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+w")
 }
 
-fn default_cycle_pane() -> String {
-    String::from("ctrl+tab")
+fn default_cycle_pane() -> KeyComboList {
+    KeyComboList::single("ctrl+tab")
 }
 
-fn default_focus_left() -> String {
-    String::from("alt+left")
+fn default_focus_left() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+left")
 }
 
-fn default_focus_right() -> String {
-    String::from("alt+right")
+fn default_focus_right() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+right")
 }
 
-fn default_focus_up() -> String {
-    String::from("alt+up")
+fn default_focus_up() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+up")
 }
 
-fn default_focus_down() -> String {
-    String::from("alt+down")
+fn default_focus_down() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+down")
 }
 
-fn default_workspace_split_vertical() -> String {
-    String::from("ctrl+alt+\\")
+fn default_workspace_split_vertical() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+\\")
 }
 
-fn default_workspace_split_horizontal() -> String {
-    String::from("ctrl+alt+-")
+fn default_workspace_split_horizontal() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+-")
 }
 
-fn default_cycle_workspace() -> String {
-    String::from("ctrl+alt+tab")
+fn default_cycle_workspace() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+tab")
 }
 
-fn default_new_tab() -> String {
-    String::from("ctrl+shift+t")
+fn default_new_tab() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+t")
 }
 
-fn default_close_tab() -> String {
-    String::from("ctrl+shift+q")
+fn default_close_tab() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+q")
 }
 
-fn default_next_tab() -> String {
-    String::from("ctrl+pagedown")
+fn default_next_tab() -> KeyComboList {
+    KeyComboList::single("ctrl+pagedown")
 }
 
-fn default_prev_tab() -> String {
-    String::from("ctrl+pageup")
+fn default_prev_tab() -> KeyComboList {
+    KeyComboList::single("ctrl+pageup")
 }
 
-fn default_select_tab_1() -> String {
-    String::from("ctrl+1")
+fn default_select_tab_1() -> KeyComboList {
+    KeyComboList::single("ctrl+1")
 }
 
-fn default_select_tab_2() -> String {
-    String::from("ctrl+2")
+fn default_select_tab_2() -> KeyComboList {
+    KeyComboList::single("ctrl+2")
 }
 
-fn default_select_tab_3() -> String {
-    String::from("ctrl+3")
+fn default_select_tab_3() -> KeyComboList {
+    KeyComboList::single("ctrl+3")
 }
 
-fn default_select_tab_4() -> String {
-    String::from("ctrl+4")
+fn default_select_tab_4() -> KeyComboList {
+    KeyComboList::single("ctrl+4")
 }
 
-fn default_select_tab_5() -> String {
-    String::from("ctrl+5")
+fn default_select_tab_5() -> KeyComboList {
+    KeyComboList::single("ctrl+5")
 }
 
-fn default_select_tab_6() -> String {
-    String::from("ctrl+6")
+fn default_select_tab_6() -> KeyComboList {
+    KeyComboList::single("ctrl+6")
 }
 
-fn default_select_tab_7() -> String {
-    String::from("ctrl+7")
+fn default_select_tab_7() -> KeyComboList {
+    KeyComboList::single("ctrl+7")
 }
 
-fn default_select_tab_8() -> String {
-    String::from("ctrl+8")
+fn default_select_tab_8() -> KeyComboList {
+    KeyComboList::single("ctrl+8")
 }
 
-fn default_select_tab_9() -> String {
-    String::from("ctrl+9")
+fn default_select_tab_9() -> KeyComboList {
+    KeyComboList::single("ctrl+9")
 }
 
-fn default_copy() -> String {
-    String::from("ctrl+shift+c")
+fn default_copy() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+c")
 }
 
-fn default_paste() -> String {
-    String::from("ctrl+shift+v")
+fn default_paste() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+v")
 }
 
-fn default_scroll_up() -> String {
-    String::from("shift+pageup")
+fn default_scroll_up() -> KeyComboList {
+    KeyComboList::single("shift+pageup")
 }
 
-fn default_scroll_down() -> String {
-    String::from("shift+pagedown")
+fn default_scroll_down() -> KeyComboList {
+    KeyComboList::single("shift+pagedown")
 }
 
-fn default_scroll_top() -> String {
-    String::from("shift+home")
+fn default_scroll_top() -> KeyComboList {
+    KeyComboList::single("shift+home")
 }
 
-fn default_scroll_bottom() -> String {
-    String::from("shift+end")
+fn default_scroll_bottom() -> KeyComboList {
+    KeyComboList::single("shift+end")
 }
 
-fn default_find() -> String {
-    String::from("ctrl+shift+f")
+fn default_find() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+f")
 }
 
-fn default_zoom_in() -> String {
-    String::from("ctrl+=")
+fn default_zoom_in() -> KeyComboList {
+    KeyComboList::single("ctrl+=")
 }
 
-fn default_zoom_out() -> String {
-    String::from("ctrl+-")
+fn default_zoom_out() -> KeyComboList {
+    KeyComboList::single("ctrl+-")
 }
 
-fn default_zoom_reset() -> String {
-    String::from("ctrl+0")
+fn default_zoom_reset() -> KeyComboList {
+    KeyComboList::single("ctrl+0")
 }
 
-fn default_new_window() -> String {
-    String::from("ctrl+shift+n")
+fn default_new_window() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+n")
 }
 
-fn default_settings() -> String {
-    String::from("ctrl+,")
+fn default_settings() -> KeyComboList {
+    KeyComboList::single("ctrl+,")
+}
+
+fn default_word_left() -> KeyComboList {
+    KeyComboList::single("ctrl+left")
+}
+
+fn default_word_right() -> KeyComboList {
+    KeyComboList::single("ctrl+right")
+}
+
+fn default_delete_word_backward() -> KeyComboList {
+    KeyComboList::single("alt+backspace")
+}
+
+fn default_delete_word_backward_ctrl() -> KeyComboList {
+    KeyComboList::single("ctrl+backspace")
+}
+
+fn default_delete_word_forward() -> KeyComboList {
+    KeyComboList::single("ctrl+delete")
+}
+
+fn default_line_start() -> KeyComboList {
+    KeyComboList::single("ctrl+home")
+}
+
+fn default_line_end() -> KeyComboList {
+    KeyComboList::single("ctrl+end")
 }
 
 // ---------------------------------------------------------------------------

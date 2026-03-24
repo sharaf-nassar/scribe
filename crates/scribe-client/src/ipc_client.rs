@@ -100,8 +100,6 @@ pub enum UiEvent {
     ServerDisconnected,
     /// Animation timer tick -- sent by the animation thread to drive redraws.
     AnimationTick,
-    /// Settings window was closed -- carries final window geometry.
-    SettingsClosed { geometry: scribe_settings::SettingsWindowGeometry },
     /// Server confirmed our window identity and listed other windows to spawn.
     Welcome { window_id: WindowId, other_windows: Vec<WindowId> },
     /// Server requested us to save state and quit (another client sent `QuitAll`).

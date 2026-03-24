@@ -1,9 +1,12 @@
 #![allow(unsafe_code, reason = "wry webview FFI bindings require unsafe")]
 
+pub mod apply;
+pub mod singleton;
+pub mod state;
+
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
-use std::sync::mpsc;
 
 use rust_embed::Embed;
 
@@ -21,75 +24,10 @@ pub struct SettingsWindowGeometry {
     pub height: i32,
 }
 
-/// Request payload sent to the persistent GTK thread.
-struct OpenRequest {
-    html: String,
-    config_json: String,
-    on_change: Box<dyn Fn(String) + Send>,
-    geometry: Option<SettingsWindowGeometry>,
-    on_close: Box<dyn FnOnce(SettingsWindowGeometry) + Send>,
-}
-
-/// Handle to the persistent GTK thread.
-///
-/// GTK must always be used from the same thread that called `gtk::init()`.
-/// This struct owns a long-lived thread and sends "open window" requests
-/// to it via a channel, allowing the settings window to be reopened
-/// after closing.
-pub struct SettingsThread {
-    tx: mpsc::Sender<OpenRequest>,
-}
-
-impl SettingsThread {
-    /// Spawn the persistent GTK thread.
-    ///
-    /// Call this once at startup. The returned handle is used to open
-    /// settings windows via [`SettingsThread::open`].
-    pub fn spawn() -> Self {
-        let (tx, rx) = mpsc::channel::<OpenRequest>();
-
-        std::thread::spawn(move || {
-            gtk_thread_main(rx);
-        });
-
-        Self { tx }
-    }
-
-    /// Open the settings window (or re-open it after a previous close).
-    ///
-    /// `config_json` is the current config serialized as JSON.
-    /// `on_change` is called on each individual setting change.
-    /// `geometry` optionally restores a saved window position and size.
-    /// `on_close` is called with the final window geometry when closed.
-    ///
-    /// Returns `Err` if assets could not be loaded.
-    pub fn open(
-        &self,
-        config_json: String,
-        on_change: impl Fn(String) + Send + 'static,
-        geometry: Option<SettingsWindowGeometry>,
-        on_close: impl FnOnce(SettingsWindowGeometry) + Send + 'static,
-    ) -> Result<(), String> {
-        let html = build_html()?;
-
-        // If the GTK thread has exited (channel closed), this silently fails.
-        // That's acceptable — the user would need to restart the app.
-        let _sent = self.tx.send(OpenRequest {
-            html,
-            config_json,
-            on_change: Box::new(on_change),
-            geometry,
-            on_close: Box::new(on_close),
-        });
-
-        Ok(())
-    }
-}
-
 /// Build a self-contained HTML document by inlining the CSS and JS assets.
 ///
 /// The resulting HTML can be loaded directly via `wry::WebViewBuilder::with_html`.
-fn build_html() -> Result<String, String> {
+pub fn build_html() -> Result<String, String> {
     let html_bytes = Assets::get("settings.html")
         .ok_or_else(|| String::from("embedded asset settings.html not found"))?;
     let css_bytes = Assets::get("settings.css")
@@ -117,40 +55,47 @@ fn build_html() -> Result<String, String> {
     Ok(html)
 }
 
-/// Main loop for the persistent GTK thread.
+/// Run the settings window (blocking until closed).
 ///
-/// Calls `gtk::init()` once, then blocks on the channel waiting for
-/// `OpenRequest` messages. Each request creates a window, runs
-/// `gtk::main()`, and loops back after the window is closed.
+/// Initialises GTK, creates the window, registers the singleton socket fd
+/// watcher, installs signal handlers, and enters `gtk::main()`.
+///
+/// `on_change` is called for each setting change from the webview.
+/// `on_close` is called with the final geometry when the window closes.
 #[allow(
-    clippy::needless_pass_by_value,
-    reason = "Receiver is moved into this thread and must be owned for its lifetime"
+    clippy::too_many_lines,
+    reason = "GTK window setup + webview + socket watcher in one function"
 )]
-fn gtk_thread_main(rx: mpsc::Receiver<OpenRequest>) {
-    if let Err(e) = gtk::init() {
-        tracing::error!("GTK init failed (is WebKitGTK installed?): {e}");
-        return;
-    }
-
-    while let Ok(req) = rx.recv() {
-        if let Err(e) = run_settings_window(req) {
-            tracing::warn!("settings window failed: {e}");
-        }
-    }
-}
-
-/// Run the settings window on the GTK thread (blocking until closed).
-///
-/// Uses GTK + wry `WebViewBuilderExtUnix::build_gtk` for Wayland + X11 support.
-fn run_settings_window(req: OpenRequest) -> Result<(), String> {
+pub fn run_settings_window(
+    geometry: Option<SettingsWindowGeometry>,
+    on_change: impl Fn(String) + 'static,
+    on_close: impl FnOnce(SettingsWindowGeometry) + 'static,
+    listener: std::os::unix::net::UnixListener,
+    _socket_path: std::path::PathBuf,
+) -> Result<(), String> {
     use gtk::prelude::*;
     use wry::WebViewBuilderExtUnix;
+
+    if let Err(e) = gtk::init() {
+        return Err(format!("GTK init failed: {e}"));
+    }
+
+    let config = scribe_common::config::load_config().unwrap_or_else(|e| {
+        tracing::warn!("failed to load config: {e}, using defaults");
+        scribe_common::config::ScribeConfig::default()
+    });
+    let config_json = serde_json::to_string(&config).unwrap_or_else(|e| {
+        tracing::warn!("failed to serialize config: {e}");
+        String::from("{}")
+    });
+
+    let html = build_html()?;
 
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title("Scribe Settings");
 
     // Restore saved size, or use defaults.
-    if let Some(geom) = req.geometry {
+    if let Some(geom) = geometry {
         window.set_default_size(geom.width, geom.height);
     } else {
         window.set_default_size(880, 680);
@@ -166,7 +111,7 @@ fn run_settings_window(req: OpenRequest) -> Result<(), String> {
     // that most window managers ignore position requests for unmapped
     // windows but honour move() once the window is visible. On Wayland,
     // move() is a no-op and position() always returns (0, 0), so skip.
-    if let Some(geom) = req.geometry {
+    if let Some(geom) = geometry {
         if !is_wayland_backend() {
             window.move_(geom.x, geom.y);
         }
@@ -177,9 +122,8 @@ fn run_settings_window(req: OpenRequest) -> Result<(), String> {
     let webview_ref: Rc<RefCell<Option<wry::WebView>>> = Rc::new(RefCell::new(None));
     let webview_for_ipc = Rc::clone(&webview_ref);
 
-    let on_change = req.on_change;
     let webview = wry::WebViewBuilder::new()
-        .with_html(&req.html)
+        .with_html(&html)
         .with_ipc_handler(move |request| {
             let body = request.body();
             if body.contains("\"type\":\"request_fonts\"") {
@@ -195,7 +139,7 @@ fn run_settings_window(req: OpenRequest) -> Result<(), String> {
 
     // Inject current config into the webview after it loads.
     let init_script =
-        format!("if (typeof loadConfig === 'function') {{ loadConfig({}); }}", req.config_json);
+        format!("if (typeof loadConfig === 'function') {{ loadConfig({config_json}); }}");
     if let Err(e) = webview.evaluate_script(&init_script) {
         tracing::warn!("failed to inject config into settings webview: {e}");
     }
@@ -209,8 +153,25 @@ fn run_settings_window(req: OpenRequest) -> Result<(), String> {
     // Store webview in the shared ref so the IPC handler can use it for refresh.
     *webview_ref.borrow_mut() = Some(webview);
 
-    // Capture geometry and close the GTK main loop when the window is closed.
-    let on_close = RefCell::new(Some(req.on_close));
+    // Watch the singleton socket for incoming focus commands.
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&listener);
+    let window_for_focus = window.clone();
+    gtk::glib::unix_fd_add_local(fd, gtk::glib::IOCondition::IN, move |_, _| {
+        handle_singleton_connection(&listener, &window_for_focus);
+        gtk::glib::ControlFlow::Continue
+    });
+
+    // SIGTERM/SIGINT handlers via glib (signal-safe, runs in GTK main loop).
+    gtk::glib::unix_signal_add_local(libc::SIGTERM, || {
+        gtk::main_quit();
+        gtk::glib::ControlFlow::Break
+    });
+    gtk::glib::unix_signal_add_local(libc::SIGINT, || {
+        gtk::main_quit();
+        gtk::glib::ControlFlow::Break
+    });
+
+    let on_close = RefCell::new(Some(on_close));
     window.connect_delete_event(move |win, _| {
         let (x, y) = win.position();
         let (width, height) = win.size();
@@ -224,6 +185,24 @@ fn run_settings_window(req: OpenRequest) -> Result<(), String> {
     gtk::main();
 
     Ok(())
+}
+
+/// Handle one incoming connection on the singleton socket.
+///
+/// Accepts a connection, verifies peer UID, reads the command, and
+/// presents the window if the command is `"focus"`.
+fn handle_singleton_connection(listener: &std::os::unix::net::UnixListener, window: &gtk::Window) {
+    use gtk::prelude::GtkWindowExt;
+
+    let Ok((stream, _)) = listener.accept() else {
+        return;
+    };
+    if !singleton::verify_peer_uid(&stream) {
+        return;
+    }
+    if singleton::read_command(&stream).as_deref() == Some("focus") {
+        window.present();
+    }
 }
 
 /// Query the system for installed monospace font families.

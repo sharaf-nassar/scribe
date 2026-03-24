@@ -53,19 +53,6 @@ struct GpuContext {
     splash: Option<splash::SplashRenderer>,
 }
 
-/// Persisted settings-window position and size.
-///
-/// Wraps `SettingsWindowGeometry` in an `Option` so that an absent file
-/// (first launch) produces `None` and the default "centred" placement is
-/// used instead of restoring stale coordinates.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct SettingsGeometryFile {
-    geometry: Option<scribe_settings::SettingsWindowGeometry>,
-    /// Whether the settings window was open when the app last exited.
-    #[serde(default)]
-    open: bool,
-}
-
 /// Intermediate result from read-only scrollbar hit-testing, used to
 /// split the borrow of `self.panes` into immutable then mutable phases.
 enum ScrollbarAction {
@@ -178,15 +165,6 @@ struct App {
     /// suppressing the legacy `split_direction` fallback in
     /// `handle_workspace_info`.
     received_workspace_tree: bool,
-    /// Persistent GTK thread for the settings window.
-    settings_thread: scribe_settings::SettingsThread,
-    /// Saved settings window geometry (persisted across opens).
-    settings_geometry: Option<scribe_settings::SettingsWindowGeometry>,
-    /// Persistent store for settings window geometry.
-    settings_state_store: window_state::StateStore<SettingsGeometryFile>,
-    /// Whether to reopen the settings window after init (consumed once).
-    settings_reopen_pending: bool,
-
     /// Clickable rect for the status bar gear icon (updated each frame).
     status_bar_gear_rect: Option<layout::Rect>,
 
@@ -225,8 +203,6 @@ impl App {
         let bindings = input::Bindings::parse(&config.keybindings);
         let window_registry = window_state::WindowRegistry::new();
         let saved_geometry = window_id.map(|wid| window_registry.load(wid));
-        let (settings_state_store, settings_state) =
-            window_state::StateStore::<SettingsGeometryFile>::load("settings_state.toml");
 
         Self {
             window_id,
@@ -270,10 +246,6 @@ impl App {
             saved_geometry,
             geometry_save_pending: None,
             received_workspace_tree: false,
-            settings_thread: scribe_settings::SettingsThread::spawn(),
-            settings_geometry: settings_state.geometry,
-            settings_state_store,
-            settings_reopen_pending: settings_state.open,
             status_bar_gear_rect: None,
             hostname: read_hostname(),
             _config_watcher: config_watcher,
@@ -298,9 +270,10 @@ impl ApplicationHandler<UiEvent> for App {
             return;
         }
 
-        // Re-open the settings window if it was open when the app last exited.
-        if std::mem::take(&mut self.settings_reopen_pending) {
-            self.open_settings();
+        // Restore the settings window if it was open when the app last exited.
+        // Only for fresh launches (no --window-id), not spawned child windows.
+        if self.window_id.is_none() {
+            restore_settings_if_open();
         }
     }
 
@@ -350,13 +323,6 @@ impl ApplicationHandler<UiEvent> for App {
             }
             UiEvent::AnimationTick => {
                 self.handle_animation_tick();
-            }
-            UiEvent::SettingsClosed { geometry } => {
-                self.settings_geometry = Some(geometry);
-                let state = SettingsGeometryFile { geometry: Some(geometry), open: false };
-                if let Err(e) = self.settings_state_store.save(&state) {
-                    tracing::warn!("failed to persist settings window geometry: {e}");
-                }
             }
             UiEvent::Welcome { window_id, other_windows } => {
                 self.handle_welcome(event_loop, window_id, &other_windows);
@@ -1941,44 +1907,13 @@ impl App {
         }
     }
 
-    /// Serializes the current config as JSON and passes it to the settings UI.
-    /// Changes made in the settings UI trigger a config file write, which the
-    /// file watcher picks up and sends `ConfigChanged` back to the main loop.
-    /// On close, the settings window geometry is sent back via `UiEvent`.
+    /// Open the settings window or focus it if already running.
+    #[allow(
+        clippy::unused_self,
+        reason = "called as self.open_settings() from input handlers that hold &mut self"
+    )]
     fn open_settings(&mut self) {
-        let config_json = serde_json::to_string(&self.config).unwrap_or_else(|e| {
-            tracing::warn!("failed to serialize config for settings: {e}");
-            String::from("{}")
-        });
-
-        let proxy = self.animation_proxy.clone();
-        if let Err(e) = self.settings_thread.open(
-            config_json,
-            |change_json| {
-                tracing::debug!("settings change: {change_json}");
-
-                // Parse the change and apply it to the config file.
-                // The file watcher will pick up the change and trigger a reload.
-                if let Err(apply_err) = apply_settings_change(&change_json) {
-                    tracing::warn!("failed to apply settings change: {apply_err}");
-                }
-            },
-            self.settings_geometry,
-            move |geometry| {
-                if let Some(p) = &proxy {
-                    let _sent = p.send_event(UiEvent::SettingsClosed { geometry });
-                }
-            },
-        ) {
-            tracing::warn!("failed to open settings window: {e}");
-            return;
-        }
-
-        // Persist "open" so the settings window re-appears on next launch.
-        let state = SettingsGeometryFile { geometry: self.settings_geometry, open: true };
-        if let Err(e) = self.settings_state_store.save(&state) {
-            tracing::warn!("failed to persist settings open state: {e}");
-        }
+        open_or_focus_settings();
     }
 
     // -----------------------------------------------------------------------
@@ -3056,216 +2991,6 @@ fn parse_hex_color(hex_str: &str) -> Option<[f32; 4]> {
 }
 
 // ---------------------------------------------------------------------------
-// Settings change application
-// ---------------------------------------------------------------------------
-
-/// Apply a single settings change from the webview to the config file.
-///
-/// Parses the JSON change message, loads the current config, applies the
-/// change, and writes the updated config back. The file watcher will detect
-/// the change and trigger a `ConfigChanged` event.
-fn apply_settings_change(change_json: &str) -> Result<(), String> {
-    let msg: serde_json::Value =
-        serde_json::from_str(change_json).map_err(|e| format!("invalid JSON: {e}"))?;
-
-    let key = msg
-        .get("key")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| String::from("missing 'key' field"))?;
-
-    let value = msg.get("value").ok_or_else(|| String::from("missing 'value' field"))?;
-
-    let mut config =
-        scribe_common::config::load_config().map_err(|e| format!("failed to load config: {e}"))?;
-
-    apply_config_key(&mut config, key, value)?;
-
-    scribe_common::config::save_config(&config).map_err(|e| format!("failed to save config: {e}"))
-}
-
-/// Apply a single dotted key + value to the config struct.
-#[allow(clippy::too_many_lines, reason = "exhaustive key matching requires one arm per setting")]
-fn apply_config_key(
-    config: &mut scribe_common::config::ScribeConfig,
-    key: &str,
-    value: &serde_json::Value,
-) -> Result<(), String> {
-    match key {
-        // -- Appearance -------------------------------------------------------
-        "appearance.font_family" => {
-            value
-                .as_str()
-                .ok_or("font_family must be a string")?
-                .clone_into(&mut config.appearance.font);
-        }
-        "appearance.font_size" => {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "font_size is a small positive float"
-            )]
-            let v = value.as_f64().ok_or("font_size must be a number")? as f32;
-            config.appearance.font_size = v;
-        }
-        "appearance.font_weight" => {
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "font weight is a small positive integer (100-900)"
-            )]
-            let v = value.as_f64().ok_or("font_weight must be a number")? as u16;
-            config.appearance.font_weight = v;
-        }
-        "appearance.bold_weight" => {
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "bold weight is a small positive integer (100-900)"
-            )]
-            let v = value.as_f64().ok_or("bold_weight must be a number")? as u16;
-            config.appearance.font_weight_bold = v;
-        }
-        "appearance.ligatures" => {
-            config.appearance.ligatures = value.as_bool().ok_or("ligatures must be a boolean")?;
-        }
-        "appearance.line_padding" => {
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "line padding is a small non-negative integer"
-            )]
-            let v = value.as_f64().ok_or("line_padding must be a number")? as u16;
-            config.appearance.line_padding = v;
-        }
-        "appearance.cursor_shape" => {
-            let shape_str = value.as_str().ok_or("cursor_shape must be a string")?;
-            let shape: scribe_common::config::CursorShape =
-                serde_json::from_value(serde_json::Value::String(shape_str.to_owned()))
-                    .map_err(|e| format!("invalid cursor shape: {e}"))?;
-            config.appearance.cursor_shape = shape;
-        }
-        "appearance.cursor_blink" => {
-            config.appearance.cursor_blink =
-                value.as_bool().ok_or("cursor_blink must be a boolean")?;
-        }
-        "appearance.opacity" => {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "opacity is a float between 0.0 and 1.0"
-            )]
-            let v = value.as_f64().ok_or("opacity must be a number")? as f32;
-            config.appearance.opacity = v;
-        }
-        "appearance.scrollbar_width" => {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "scrollbar width is a small positive float"
-            )]
-            let v = value.as_f64().ok_or("scrollbar_width must be a number")? as f32;
-            config.appearance.scrollbar_width = v.clamp(2.0, 20.0);
-        }
-        // -- Theme preset -----------------------------------------------------
-        "theme.preset" => {
-            let preset = value.as_str().ok_or("theme preset must be a string")?;
-            // Convert preset name: "minimal_dark" -> "minimal-dark"
-            config.appearance.theme = preset.replace('_', "-");
-        }
-        // -- Terminal ---------------------------------------------------------
-        "terminal.scrollback_lines" => {
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "scrollback is a non-negative integer within u32 range"
-            )]
-            let v = value.as_f64().ok_or("scrollback_lines must be a number")? as u32;
-            config.terminal.scrollback_lines = v;
-        }
-        "terminal.copy_on_select" => {
-            config.terminal.copy_on_select =
-                value.as_bool().ok_or("copy_on_select must be a boolean")?;
-        }
-        "terminal.claude_copy_cleanup" => {
-            config.terminal.claude_copy_cleanup =
-                value.as_bool().ok_or("claude_copy_cleanup must be a boolean")?;
-        }
-        "terminal.claude_code_integration" => {
-            config.terminal.claude_code_integration =
-                value.as_bool().ok_or("claude_code_integration must be a boolean")?;
-        }
-        // -- Keybindings ----------------------------------------------------
-        key if key.starts_with("keybindings.") => {
-            let action = key.trim_start_matches("keybindings.");
-            let combo = value.as_str().ok_or("keybinding value must be a string")?;
-            apply_keybinding_field(&mut config.keybindings, action, combo);
-        }
-        // -- Workspaces -------------------------------------------------------
-        "workspaces.add_root" => {
-            // The webview sends an empty string as a placeholder; in a real
-            // implementation a file picker dialog would provide the path.
-            tracing::debug!("workspace add_root requested (file picker not yet implemented)");
-        }
-        "workspaces.remove_root" => {
-            let path = value.as_str().ok_or("remove_root value must be a string")?;
-            config.workspaces.roots.retain(|r| r != path);
-        }
-        _ => {
-            tracing::debug!(key, "unhandled settings key");
-        }
-    }
-
-    Ok(())
-}
-
-/// Route a keybinding action name + combo string to the correct config field.
-#[allow(
-    clippy::too_many_lines,
-    reason = "exhaustive keybinding action routing requires one arm per action"
-)]
-fn apply_keybinding_field(
-    kb: &mut scribe_common::config::KeybindingsConfig,
-    action: &str,
-    combo: &str,
-) {
-    match action {
-        "split_vertical" => combo.clone_into(&mut kb.split_vertical),
-        "split_horizontal" => combo.clone_into(&mut kb.split_horizontal),
-        "close_pane" => combo.clone_into(&mut kb.close_pane),
-        "cycle_pane" => combo.clone_into(&mut kb.cycle_pane),
-        "focus_left" => combo.clone_into(&mut kb.focus_left),
-        "focus_right" => combo.clone_into(&mut kb.focus_right),
-        "focus_up" => combo.clone_into(&mut kb.focus_up),
-        "focus_down" => combo.clone_into(&mut kb.focus_down),
-        "workspace_split_vertical" => combo.clone_into(&mut kb.workspace_split_vertical),
-        "workspace_split_horizontal" => combo.clone_into(&mut kb.workspace_split_horizontal),
-        "cycle_workspace" => combo.clone_into(&mut kb.cycle_workspace),
-        "new_tab" => combo.clone_into(&mut kb.new_tab),
-        "close_tab" => combo.clone_into(&mut kb.close_tab),
-        "next_tab" => combo.clone_into(&mut kb.next_tab),
-        "prev_tab" => combo.clone_into(&mut kb.prev_tab),
-        "select_tab_1" => combo.clone_into(&mut kb.select_tab_1),
-        "select_tab_2" => combo.clone_into(&mut kb.select_tab_2),
-        "select_tab_3" => combo.clone_into(&mut kb.select_tab_3),
-        "select_tab_4" => combo.clone_into(&mut kb.select_tab_4),
-        "select_tab_5" => combo.clone_into(&mut kb.select_tab_5),
-        "select_tab_6" => combo.clone_into(&mut kb.select_tab_6),
-        "select_tab_7" => combo.clone_into(&mut kb.select_tab_7),
-        "select_tab_8" => combo.clone_into(&mut kb.select_tab_8),
-        "select_tab_9" => combo.clone_into(&mut kb.select_tab_9),
-        "copy" => combo.clone_into(&mut kb.copy),
-        "paste" => combo.clone_into(&mut kb.paste),
-        "scroll_up" => combo.clone_into(&mut kb.scroll_up),
-        "scroll_down" => combo.clone_into(&mut kb.scroll_down),
-        "scroll_top" => combo.clone_into(&mut kb.scroll_top),
-        "scroll_bottom" => combo.clone_into(&mut kb.scroll_bottom),
-        "find" => combo.clone_into(&mut kb.find),
-        "zoom_in" => combo.clone_into(&mut kb.zoom_in),
-        "zoom_out" => combo.clone_into(&mut kb.zoom_out),
-        "zoom_reset" => combo.clone_into(&mut kb.zoom_reset),
-        "settings" => combo.clone_into(&mut kb.settings),
-        _ => tracing::warn!(action, "unhandled keybinding action"),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // main()
 // ---------------------------------------------------------------------------
 
@@ -3308,6 +3033,66 @@ fn show_close_dialog(window: &Window, session_count: usize) -> CloseAction {
         rfd::MessageDialogResult::Custom(ref s) if s == "Quit Scribe" => CloseAction::QuitAll,
         rfd::MessageDialogResult::Custom(ref s) if s == "Kill Window" => CloseAction::CloseWindow,
         _ => CloseAction::Cancel,
+    }
+}
+
+/// Open the settings window or focus it if already running.
+///
+/// Tries to connect to the settings socket. If connected, sends a focus
+/// command. If not, spawns the `scribe-settings` binary.
+fn open_or_focus_settings() {
+    let socket_path = scribe_common::socket::settings_socket_path();
+
+    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
+        use std::io::Write as _;
+        if let Err(e) = stream.write_all(b"{\"cmd\":\"focus\"}\n") {
+            tracing::warn!("failed to send focus command to settings: {e}");
+        } else {
+            tracing::debug!("sent focus to existing settings process");
+        }
+    } else {
+        spawn_settings_process();
+    }
+}
+
+/// Spawn the `scribe-settings` binary as a detached process.
+fn spawn_settings_process() {
+    let exe =
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("scribe-settings"));
+    let settings_exe = exe.with_file_name("scribe-settings");
+
+    match std::process::Command::new(&settings_exe).spawn() {
+        Ok(child) => {
+            tracing::info!(pid = child.id(), "spawned settings process");
+        }
+        Err(e) => {
+            tracing::warn!(exe = %settings_exe.display(), "failed to spawn settings: {e}");
+        }
+    }
+}
+
+/// Check if settings was open at last exit and restore it.
+///
+/// Reads the state file directly (read-only, no `StateStore` retained).
+fn restore_settings_if_open() {
+    #[derive(serde::Deserialize)]
+    struct SettingsOpenCheck {
+        #[serde(default)]
+        open: bool,
+    }
+
+    let Some(state_dir) = dirs::state_dir() else {
+        return;
+    };
+    let path = state_dir.join("scribe").join("settings_state.toml");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+
+    if let Ok(state) = toml::from_str::<SettingsOpenCheck>(&content) {
+        if state.open {
+            open_or_focus_settings();
+        }
     }
 }
 

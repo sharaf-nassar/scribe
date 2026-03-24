@@ -41,11 +41,13 @@ pub enum StateError {
 ///
 /// Resolves `$XDG_STATE_HOME/scribe/<filename>` once at construction and
 /// provides `load`/`save` with graceful degradation on errors.
+#[allow(dead_code, reason = "generic state store retained for future client-side state")]
 pub struct StateStore<T> {
     path: Option<PathBuf>,
     _marker: PhantomData<T>,
 }
 
+#[allow(dead_code, reason = "generic state store retained for future client-side state")]
 impl<T: Serialize + DeserializeOwned + Default> StateStore<T> {
     /// Load state from `$XDG_STATE_HOME/scribe/<filename>`.
     ///
