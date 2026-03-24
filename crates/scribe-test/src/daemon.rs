@@ -573,6 +573,12 @@ async fn handle_create_session(
     };
 
     // Step 2: Create a session in that workspace.
+    // Clear stale session ID so wait_for_session_created doesn't return
+    // the previous session's ID immediately.
+    {
+        let mut guard = state.lock().await;
+        guard.last_session_created = None;
+    }
     let msg = ClientMessage::CreateSession { workspace_id, split_direction: None };
     if let Err(e) = send_to_server(server_writer, &msg).await {
         return DaemonResponse::Error { message: format!("failed to send CreateSession: {e}") };

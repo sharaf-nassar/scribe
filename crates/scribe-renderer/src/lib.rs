@@ -259,6 +259,11 @@ impl TerminalRenderer {
         self.cell_size = self.atlas.cell_size();
         self.grid_size = compute_grid_size(self.viewport_size, self.cell_size);
         self.pipeline.rebuild_bind_group(device, self.atlas.texture_view(), self.atlas.sampler());
+        self.pipeline.update_viewport(
+            queue,
+            self.viewport_size,
+            (self.cell_size.width, self.cell_size.height),
+        );
     }
 
     /// Build the per-cell instance buffer with a pixel offset applied to

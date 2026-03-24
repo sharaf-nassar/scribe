@@ -2,6 +2,7 @@
 
 mod ai_indicator;
 mod clipboard_cleanup;
+mod close_dialog;
 mod config;
 mod divider;
 mod input;
@@ -123,9 +124,27 @@ struct App {
     // Search
     search_overlay: search_overlay::SearchOverlay,
 
+    // Close dialog overlay (shown on window close request)
+    close_dialog: Option<close_dialog::CloseDialog>,
+
     /// Whether the splash screen is still showing.
-    /// Set to `true` on init; cleared when the first `PtyOutput` arrives.
+    /// Set to `true` on init; cleared after the splash has been visible for
+    /// [`MIN_SPLASH_DURATION`] and content is ready to display.
     splash_active: bool,
+
+    /// Set during init; cleared after the first rendered splash frame
+    /// triggers `ListSessions` so that session discovery happens while the
+    /// splash is visible rather than before it renders.
+    splash_needs_list_sessions: bool,
+
+    /// Instant when the splash first rendered, used to enforce a minimum
+    /// display duration so the compositor has time to present it.
+    splash_first_rendered: Option<Instant>,
+
+    /// Content (snapshot or PTY output) has arrived while the splash is
+    /// still active.  Dismissal is deferred until [`MIN_SPLASH_DURATION`]
+    /// has elapsed since [`splash_first_rendered`].
+    splash_content_ready: bool,
 
     // Pre-created wgpu instance (created before event loop)
     wgpu_instance: wgpu::Instance,
@@ -231,7 +250,11 @@ impl App {
                 .ok(),
             zoom_level: 0,
             search_overlay: search_overlay::SearchOverlay::new(),
+            close_dialog: None,
             splash_active: true,
+            splash_needs_list_sessions: true,
+            splash_first_rendered: None,
+            splash_content_ready: false,
             wgpu_instance,
             proxy: Some(proxy),
             animation_proxy: Some(animation_proxy),
@@ -330,7 +353,7 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::QuitRequested => {
                 self.handle_quit_requested(event_loop);
             } // QuitAllFromDialog / CloseWindow / CancelClose were removed —
-              // the close dialog now runs synchronously in handle_close_requested.
+              // the close dialog is now an in-app GPU overlay (close_dialog module).
         }
     }
 
@@ -357,6 +380,45 @@ impl ApplicationHandler<UiEvent> for App {
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        // When the close dialog is active, intercept input events and route
+        // them to the dialog instead of the terminal / layout handlers.
+        if self.close_dialog.is_some() {
+            match event {
+                WindowEvent::CloseRequested => {
+                    self.handle_close_requested(event_loop);
+                }
+                WindowEvent::RedrawRequested => self.handle_redraw(),
+                WindowEvent::Resized(size) => {
+                    self.handle_resize(size);
+                    self.mark_geometry_dirty();
+                }
+                WindowEvent::Moved(_) => self.mark_geometry_dirty(),
+                WindowEvent::ModifiersChanged(new_mods) => {
+                    self.modifiers = new_mods.state();
+                }
+                WindowEvent::KeyboardInput { event: ref key_event, .. } => {
+                    self.handle_dialog_keyboard(key_event, event_loop);
+                }
+                WindowEvent::MouseInput {
+                    state: winit::event::ElementState::Pressed,
+                    button: winit::event::MouseButton::Left,
+                    ..
+                } => {
+                    self.handle_dialog_click(event_loop);
+                }
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "cursor position from winit is f64 but fits in f32"
+                )]
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.last_cursor_pos = Some((position.x as f32, position.y as f32));
+                    self.handle_dialog_hover();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 self.handle_close_requested(event_loop);
@@ -449,10 +511,9 @@ impl App {
         let proxy = self.proxy.take().ok_or(InitError::ProxyConsumed)?;
         let cmd_tx = ipc_client::start_ipc_thread(proxy, self.window_id);
 
-        // Ask the server for existing sessions before creating anything.
-        // Pane creation is deferred to `handle_session_list` which runs
-        // when the `SessionList` response arrives.
-        send_command(&cmd_tx, ClientCommand::ListSessions);
+        // `ListSessions` is deferred to the first splash frame — see
+        // `handle_redraw`.  This guarantees the splash is visible before
+        // session content arrives, avoiding a flash of restored content.
 
         let splash = match splash::SplashRenderer::new(
             &device,
@@ -461,7 +522,7 @@ impl App {
             (size.width, size.height),
         ) {
             Ok(s) => {
-                tracing::debug!("splash screen initialised");
+                tracing::warn!("SPLASH DIAG: splash renderer created OK");
                 Some(s)
             }
             Err(e) => {
@@ -541,12 +602,13 @@ impl App {
             pane.resize_term_only(pane_grid.cols, pane_grid.rows);
         }
 
-        // A snapshot means we have content to display — dismiss splash.
+        // Mark content as ready so the splash can be dismissed once it has
+        // been visible for MIN_SPLASH_DURATION.  The actual dismissal happens
+        // in `handle_redraw` to avoid submitting the terminal-content frame
+        // before the compositor has presented the splash frame.
         if self.splash_active {
-            self.splash_active = false;
-            if let Some(gpu) = &mut self.gpu {
-                gpu.splash = None;
-            }
+            tracing::warn!("SPLASH DIAG: screen snapshot arrived, marking content ready");
+            self.splash_content_ready = true;
         }
 
         self.request_redraw();
@@ -557,16 +619,29 @@ impl App {
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
         pane.feed_output(bytes);
 
-        // First PTY output dismisses the splash screen and drops the GPU
-        // resources that were only needed for it.
+        // Mark content as ready (same deferred-dismiss as screen snapshots).
         if self.splash_active {
-            self.splash_active = false;
-            if let Some(gpu) = &mut self.gpu {
-                gpu.splash = None;
-            }
+            self.splash_content_ready = true;
         }
 
         self.request_redraw();
+    }
+
+    /// Send `ListSessions` once after the first splash frame renders.
+    ///
+    /// On a local Unix socket, the full IPC round-trip (`ListSessions` →
+    /// `SessionList` → `AttachSessions` → `ScreenSnapshot`) completes in under
+    /// 1 ms, while the compositor's first frame callback takes ~16 ms.
+    /// Deferring this send until after the splash is on-screen prevents the
+    /// session content from arriving before the splash has been displayed.
+    fn send_deferred_list_sessions(&mut self) {
+        if !self.splash_needs_list_sessions {
+            return;
+        }
+        self.splash_needs_list_sessions = false;
+        if let Some(tx) = &self.cmd_tx {
+            send_command(tx, ClientCommand::ListSessions);
+        }
     }
 
     /// Handle `SessionList` response from the server.
@@ -1051,6 +1126,10 @@ impl App {
         clippy::too_many_lines,
         reason = "render loop collects chrome + content + dividers + AI borders sequentially"
     )]
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "temporary diagnostic tracing for splash bug — remove after fix"
+    )]
     fn handle_redraw(&mut self) {
         let Some(gpu) = &mut self.gpu else { return };
 
@@ -1065,10 +1144,24 @@ impl App {
 
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // While the splash is active, render the logo instead of the terminal.
-        // Splash renderer unavailable (decode failed): fall through to normal
-        // rendering, which will produce a black frame via its own clear colour.
+        // -- Splash dismiss check ------------------------------------------------
+        if self.splash_active && self.splash_content_ready {
+            let elapsed_ok =
+                self.splash_first_rendered.is_some_and(|t| t.elapsed() >= MIN_SPLASH_DURATION);
+            if elapsed_ok {
+                tracing::warn!("SPLASH DIAG: dismissing splash (timer expired)");
+                self.splash_active = false;
+                gpu.splash = None;
+            }
+        }
+
+        // -- Splash render -------------------------------------------------------
         if self.splash_active {
+            tracing::warn!(
+                renderer = gpu.splash.is_some(),
+                content_ready = self.splash_content_ready,
+                "SPLASH DIAG: rendering splash frame"
+            );
             if let Some(splash) = &gpu.splash {
                 let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("splash encoder"),
@@ -1076,9 +1169,22 @@ impl App {
                 splash.render(&mut enc, &view);
                 gpu.queue.submit(std::iter::once(enc.finish()));
                 frame.present();
-                return;
             }
+
+            if self.splash_first_rendered.is_none() {
+                self.splash_first_rendered = Some(Instant::now());
+            }
+
+            self.send_deferred_list_sessions();
+
+            if self.splash_content_ready {
+                self.request_redraw();
+            }
+
+            return;
         }
+
+        tracing::warn!(panes = self.panes.len(), "SPLASH DIAG: rendering terminal content");
 
         let full_viewport = viewport_rect(&gpu.surface_config);
         let ws_viewport = workspace_viewport(&gpu.surface_config);
@@ -1243,6 +1349,19 @@ impl App {
                 &mut resolve_glyph,
             );
             self.status_bar_gear_rect = sb_hits.gear_rect;
+        }
+
+        // Close dialog overlay (rendered on top of everything).
+        if let Some(dialog) = &mut self.close_dialog {
+            let mut resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            dialog.build_instances(
+                &mut all_instances,
+                full_viewport,
+                cell_size,
+                &self.theme.chrome,
+                &mut resolve_glyph,
+            );
         }
 
         if self.opacity < 1.0 {
@@ -2383,26 +2502,105 @@ impl App {
         tracing::info!(%new_id, "spawning new window");
     }
 
-    /// Handle the close button. Shows a modal dialog with two choices:
-    /// close this window only, or quit Scribe (all windows).
+    /// Handle the close button. Opens the in-app close dialog overlay
+    /// with choices: cancel, quit Scribe (all windows), or kill this window.
     ///
-    /// The dialog blocks the event loop, which is intentional — the user
-    /// cannot interact with the terminal while the dialog is open, and
-    /// showing it on the main thread lets the compositor center it on the
-    /// parent window (background threads break XDG portal parenting).
+    /// The dialog renders as a GPU overlay and intercepts all input events
+    /// until the user makes a selection or presses Escape.
     fn handle_close_requested(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(window) = self.window.clone() else {
+        if self.window.is_none() {
             self.flush_geometry_now();
             event_loop.exit();
             return;
-        };
+        }
+
+        // If the dialog is already open, treat another close request as cancel.
+        if self.close_dialog.is_some() {
+            return;
+        }
 
         let session_count = self.panes.len();
-        match show_close_dialog(&window, session_count) {
-            CloseAction::QuitAll => self.handle_quit_all(event_loop),
-            CloseAction::CloseWindow => self.handle_close_window(event_loop),
-            CloseAction::Cancel => {}
+        self.close_dialog = Some(close_dialog::CloseDialog::new(session_count));
+        self.request_redraw();
+    }
+
+    /// Process a [`close_dialog::CloseAction`] from the in-app close dialog.
+    fn handle_close_action(
+        &mut self,
+        action: close_dialog::CloseAction,
+        event_loop: &ActiveEventLoop,
+    ) {
+        self.close_dialog = None;
+        match action {
+            close_dialog::CloseAction::QuitAll => self.handle_quit_all(event_loop),
+            close_dialog::CloseAction::CloseWindow => self.handle_close_window(event_loop),
+            close_dialog::CloseAction::Cancel => self.request_redraw(),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Close dialog input handlers
+    // -------------------------------------------------------------------
+
+    /// Handle keyboard input while the close dialog is active.
+    fn handle_dialog_keyboard(
+        &mut self,
+        event: &winit::event::KeyEvent,
+        event_loop: &ActiveEventLoop,
+    ) {
+        use winit::keyboard::{Key, NamedKey};
+
+        if event.state != winit::event::ElementState::Pressed {
+            return;
+        }
+
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                let action = close_dialog::CloseAction::Cancel;
+                self.handle_close_action(action, event_loop);
+            }
+            Key::Named(NamedKey::Enter) => {
+                let action = self
+                    .close_dialog
+                    .as_ref()
+                    .map_or(close_dialog::CloseAction::Cancel, close_dialog::CloseDialog::confirm);
+                self.handle_close_action(action, event_loop);
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.cycle_dialog_focus();
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle mouse click while the close dialog is active.
+    fn handle_dialog_click(&mut self, event_loop: &ActiveEventLoop) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        let action = self.close_dialog.as_ref().and_then(|d| d.click(x, y));
+        if let Some(action) = action {
+            self.handle_close_action(action, event_loop);
+        }
+    }
+
+    /// Handle mouse hover while the close dialog is active.
+    fn handle_dialog_hover(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        if let Some(dialog) = &mut self.close_dialog {
+            if dialog.update_hover(x, y) {
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Cycle dialog button focus (Tab / Shift+Tab).
+    fn cycle_dialog_focus(&mut self) {
+        let Some(dialog) = &mut self.close_dialog else { return };
+        if self.modifiers.shift_key() {
+            dialog.focus_prev();
+        } else {
+            dialog.focus_next();
+        }
+        self.request_redraw();
     }
 
     /// Handle `QuitRequested` from the server — save state and close.
@@ -2484,6 +2682,13 @@ fn run_animation_loop(proxy: EventLoopProxy<UiEvent>) {
 // Instance compositing
 // ---------------------------------------------------------------------------
 
+/// Minimum time the splash screen stays visible, ensuring the compositor
+/// presents it before the terminal content frame overwrites it.  On X11,
+/// `request_redraw` does not respect vsync pacing, so without a floor the
+/// splash and content frames can both land in the same vsync window and
+/// only the content frame is ever displayed.
+const MIN_SPLASH_DURATION: Duration = Duration::from_millis(50);
+
 /// Cursor blink interval (530ms matches xterm/VTE).
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
@@ -2527,9 +2732,10 @@ fn build_all_instances(
     let estimated_per_pane = 80 * 24 + 80 + 4;
     let mut all_instances = Vec::with_capacity(pane_rects.len() * estimated_per_pane);
 
-    // Tab bar backgrounds.
+    // Tab bar backgrounds + bottom separator.
     for (_pane_id, pane_rect) in pane_rects {
         tab_bar::build_tab_bar_bg(&mut all_instances, *pane_rect, cell_size, tab_colors);
+        tab_bar::build_tab_bar_separator(&mut all_instances, *pane_rect, cell_size, divider_color);
     }
 
     // Tab bar text — rendered once per workspace, spanning the full workspace width.
@@ -2993,48 +3199,6 @@ fn parse_hex_color(hex_str: &str) -> Option<[f32; 4]> {
 // ---------------------------------------------------------------------------
 // main()
 // ---------------------------------------------------------------------------
-
-/// What the user chose in the close dialog.
-enum CloseAction {
-    QuitAll,
-    CloseWindow,
-    Cancel,
-}
-
-/// Show a native dialog asking whether to quit Scribe, kill this window, or cancel.
-///
-/// Blocks until the user responds. Must be called on the main thread so
-/// the XDG portal can center the dialog on the parent window.
-fn show_close_dialog(window: &Window, session_count: usize) -> CloseAction {
-    let session_warning = if session_count > 0 {
-        format!("\n\nThis window has {session_count} active session(s) that will be terminated.")
-    } else {
-        String::new()
-    };
-
-    let description = format!(
-        "Quit Scribe: all windows close, sessions preserved\n\
-         Kill Window: close this window only, sessions terminated{session_warning}"
-    );
-
-    let result = rfd::MessageDialog::new()
-        .set_title("Close Scribe")
-        .set_description(&description)
-        .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
-            String::from("Quit Scribe"),
-            String::from("Kill Window"),
-            String::from("Cancel"),
-        ))
-        .set_level(rfd::MessageLevel::Warning)
-        .set_parent(window)
-        .show();
-
-    match result {
-        rfd::MessageDialogResult::Custom(ref s) if s == "Quit Scribe" => CloseAction::QuitAll,
-        rfd::MessageDialogResult::Custom(ref s) if s == "Kill Window" => CloseAction::CloseWindow,
-        _ => CloseAction::Cancel,
-    }
-}
 
 /// Open the settings window or focus it if already running.
 ///

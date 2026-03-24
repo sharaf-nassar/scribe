@@ -88,9 +88,6 @@ cosmic-text = { version = "0.17", features = [
 bytemuck = { version = "1", features = ["derive"] }
 png = "0.17"
 
-# Dialogs
-rfd = "0.15"
-
 # Webview / settings
 wry = "0.51"
 rust-embed = "8"

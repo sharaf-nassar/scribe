@@ -79,11 +79,48 @@ pub fn build_tab_bar_bg(
         let x = rect.x + col_idx as f32 * cell_w;
         out.push(CellInstance {
             pos: [x, rect.y],
-            size: [0.0, 0.0],
+            size: [cell_w, TAB_BAR_HEIGHT],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
             fg_color: bg,
             bg_color: bg,
+        });
+    }
+}
+
+/// Height of the bottom separator line in pixels.
+const SEPARATOR_HEIGHT: f32 = 1.0;
+
+/// Build a 1px separator line at the bottom of a pane's tab bar area.
+///
+/// Gives a clear visual boundary between the tab bar and terminal content.
+pub fn build_tab_bar_separator(
+    out: &mut Vec<CellInstance>,
+    rect: Rect,
+    cell_size: (f32, f32),
+    color: [f32; 4],
+) {
+    let (cell_w, _) = cell_size;
+    if cell_w <= 0.0 {
+        return;
+    }
+
+    let separator_y = rect.y + TAB_BAR_HEIGHT - SEPARATOR_HEIGHT;
+    let cols = columns_in_width(rect.width, cell_w);
+
+    for col_idx in 0..cols {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "column index is a small positive integer fitting in f32"
+        )]
+        let x = rect.x + col_idx as f32 * cell_w;
+        out.push(CellInstance {
+            pos: [x, separator_y],
+            size: [cell_w, SEPARATOR_HEIGHT],
+            uv_min: [0.0, 0.0],
+            uv_max: [0.0, 0.0],
+            fg_color: color,
+            bg_color: color,
         });
     }
 }

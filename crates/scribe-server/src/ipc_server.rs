@@ -202,14 +202,12 @@ async fn handle_client(
             let wm = workspace_manager.read().await;
             let all_windows = wm.window_ids_with_sessions();
 
-            let assigned = window_id.unwrap_or_else(WindowId::new);
-
-            // Other windows that have sessions but no connected client.
+            // Read connected clients first so we can reuse an unconnected
+            // window on fresh-launch restarts (no --window-id).
             let connected = connected_clients.read().await;
-            let other_windows: Vec<WindowId> = all_windows
-                .into_iter()
-                .filter(|&wid| wid != assigned && !connected.contains_key(&wid))
-                .collect();
+
+            let (assigned, other_windows) =
+                resolve_window_assignment(window_id, &all_windows, &connected);
             drop(connected);
             drop(wm);
 
@@ -1258,5 +1256,146 @@ pub async fn defuse_for_handoff(live_sessions: &LiveSessionRegistry) {
             let _defused = std::mem::ManuallyDrop::new(pty);
             info!(%session_id, "defused Pty to prevent SIGHUP on exit");
         }
+    }
+}
+
+/// Decide which `WindowId` to assign to a connecting client, and which
+/// other unconnected windows should be spawned as separate processes.
+///
+/// When `hello_window_id` is `Some`, the client already knows its ID
+/// (e.g. it was launched with `--window-id`). When `None`, this is a
+/// fresh launch — if there are unconnected windows with sessions
+/// (restart scenario), the client adopts one instead of creating a new ID.
+fn resolve_window_assignment<V>(
+    hello_window_id: Option<WindowId>,
+    windows_with_sessions: &HashSet<WindowId>,
+    connected: &HashMap<WindowId, V>,
+) -> (WindowId, Vec<WindowId>) {
+    let assigned = hello_window_id.unwrap_or_else(|| {
+        windows_with_sessions
+            .iter()
+            .find(|wid| !connected.contains_key(wid))
+            .copied()
+            .unwrap_or_else(WindowId::new)
+    });
+
+    let other_windows: Vec<WindowId> = windows_with_sessions
+        .iter()
+        .filter(|wid| **wid != assigned && !connected.contains_key(wid))
+        .copied()
+        .collect();
+
+    (assigned, other_windows)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::zero_sized_map_values,
+    reason = "tests use HashMap<WindowId, ()> to match the production connected_clients type"
+)]
+mod tests {
+    use super::*;
+
+    /// Fresh first launch — no prior sessions exist.
+    /// Should create a new window ID and no other windows.
+    #[test]
+    fn fresh_launch_no_sessions_creates_new_window() {
+        let sessions: HashSet<WindowId> = HashSet::new();
+        let connected: HashMap<WindowId, ()> = HashMap::new();
+
+        let (assigned, others) = resolve_window_assignment(None, &sessions, &connected);
+
+        // Should get a new (unique) window ID, and no windows to spawn.
+        assert!(!sessions.contains(&assigned), "should be a brand-new ID");
+        assert!(others.is_empty());
+    }
+
+    /// Restart with 1 window — one unconnected window has sessions.
+    /// The connecting client should adopt that window, not create a new one.
+    #[test]
+    fn restart_single_window_reuses_existing() {
+        let w1 = WindowId::new();
+        let sessions: HashSet<WindowId> = [w1].into_iter().collect();
+        let connected: HashMap<WindowId, ()> = HashMap::new();
+
+        let (assigned, others) = resolve_window_assignment(None, &sessions, &connected);
+
+        assert_eq!(assigned, w1, "should reuse the existing window");
+        assert!(others.is_empty(), "no other windows to spawn");
+    }
+
+    /// Restart with multiple windows — client adopts one, rest in `other_windows`.
+    #[test]
+    fn restart_multi_window_adopts_one_spawns_rest() {
+        let w1 = WindowId::new();
+        let w2 = WindowId::new();
+        let w3 = WindowId::new();
+        let sessions: HashSet<WindowId> = [w1, w2, w3].into_iter().collect();
+        let connected: HashMap<WindowId, ()> = HashMap::new();
+
+        let (assigned, others) = resolve_window_assignment(None, &sessions, &connected);
+
+        assert!(sessions.contains(&assigned), "should adopt an existing window");
+        assert_eq!(others.len(), 2, "should spawn the other 2 windows");
+        assert!(!others.contains(&assigned), "assigned must not appear in others");
+        for o in &others {
+            assert!(sessions.contains(o), "other_windows must be known windows");
+        }
+    }
+
+    /// Explicit --window-id always used, even if it doesn't match any session.
+    #[test]
+    fn explicit_window_id_used_as_is() {
+        let w1 = WindowId::new();
+        let w_explicit = WindowId::new();
+        let sessions: HashSet<WindowId> = [w1].into_iter().collect();
+        let connected: HashMap<WindowId, ()> = HashMap::new();
+
+        let (assigned, others) = resolve_window_assignment(Some(w_explicit), &sessions, &connected);
+
+        assert_eq!(assigned, w_explicit, "should use the explicit ID");
+        assert_eq!(others, vec![w1], "unconnected session window should be in others");
+    }
+
+    /// New window spawned while another is already connected — should not
+    /// steal the connected window's ID.
+    #[test]
+    fn does_not_steal_connected_window() {
+        let w1 = WindowId::new();
+        let sessions: HashSet<WindowId> = [w1].into_iter().collect();
+        let connected: HashMap<WindowId, ()> = [(w1, ())].into_iter().collect();
+
+        let (assigned, others) = resolve_window_assignment(None, &sessions, &connected);
+
+        assert_ne!(assigned, w1, "must not steal connected window");
+        assert!(others.is_empty(), "w1 is connected so not in others");
+    }
+
+    /// Mix of connected and unconnected windows — only adopts an unconnected one.
+    #[test]
+    fn adopts_unconnected_skips_connected() {
+        let w1 = WindowId::new();
+        let w2 = WindowId::new();
+        let sessions: HashSet<WindowId> = [w1, w2].into_iter().collect();
+        let connected: HashMap<WindowId, ()> = [(w1, ())].into_iter().collect();
+
+        let (assigned, others) = resolve_window_assignment(None, &sessions, &connected);
+
+        assert_eq!(assigned, w2, "should adopt the unconnected window");
+        assert!(others.is_empty(), "w1 is connected, w2 is assigned — nothing left");
+    }
+
+    /// Explicit window-id that matches a session — no duplication in others.
+    #[test]
+    fn explicit_id_matching_session_not_in_others() {
+        let w1 = WindowId::new();
+        let w2 = WindowId::new();
+        let sessions: HashSet<WindowId> = [w1, w2].into_iter().collect();
+        let connected: HashMap<WindowId, ()> = HashMap::new();
+
+        let (assigned, others) = resolve_window_assignment(Some(w1), &sessions, &connected);
+
+        assert_eq!(assigned, w1);
+        assert_eq!(others, vec![w2], "only the other unconnected window");
     }
 }

@@ -81,7 +81,7 @@ impl Theme {
         background: [f32; 4],
         ansi_colors: &[[f32; 4]; 16],
     ) -> ChromeColors {
-        let tab_bar_bg = lighten(background, 0.025);
+        let tab_bar_bg = lighten(background, 0.06);
         let tab_bar_active_bg = background;
         let tab_text = with_alpha(foreground, 0.65);
         let tab_text_active = foreground;

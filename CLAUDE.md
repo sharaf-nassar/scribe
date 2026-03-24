@@ -4,48 +4,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Development Commands
 
+A `justfile` provides the standard workflows. Run `just` to list all recipes.
+
 ```bash
-# Build all crates (debug)
-cargo build
+# Common workflows
+just build            # Debug build (all crates)
+just build-release    # Release build (all crates)
+just check            # Type-check without building
+just clippy           # Lint (strict clippy config)
+just fmt              # Format (edition 2024, max_width=100)
+just test             # Run all tests
+just ready            # Pre-commit gate: fmt + clippy + test
 
-# Build release (thin LTO, stripped)
-cargo build --release
+# Run
+just server           # Run the server
+just client           # Run the GPU client
 
-# Check without building (faster feedback)
-cargo check
+# Package & install
+just deb              # Build release .deb (builds full workspace)
+just install          # Build, package, and install .deb (sudo)
 
-# Lint — extremely strict clippy config, see Cargo.toml workspace lints + clippy.toml
-cargo clippy --workspace
+# E2E testing
+just e2e              # Full functional E2E suite (build + containerise + run all)
+just e2e-func func/smoke.sh        # Run a single functional test
+just e2e-visual visual/reconnect.sh # Run a single visual test (requires GPU)
+just docker-func      # Rebuild functional test container
+just docker-visual    # Rebuild visual test container
+```
 
-# Format (edition 2024, max_width=100)
-cargo fmt --all
+Raw cargo commands still work for one-off needs:
 
-# Run tests
-cargo test --workspace
-
+```bash
 # Run a single test by name
 cargo test --package scribe-server -- tests::workspace_name_is_sticky
-
-# Run the server
-cargo run --bin scribe-server
-
-# Run the GPU client
-cargo run --bin scribe-client
 
 # Run the CLI test tool (raw stdin/stdout passthrough)
 cargo run --bin scribe-cli
 
-# E2E Testing — build containers (after cargo build --release)
-docker build -f docker/Dockerfile.func -t scribe-test-func .
-docker build -f docker/Dockerfile.visual -t scribe-test-visual .
-
-# Run functional E2E test
-docker run --rm -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-func /tests/smoke.sh
-
-# Run visual E2E test (requires GPU passthrough)
-docker run --rm --gpus all -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/smoke.sh
-
-# Inspect results: check exit code, read test-output/result.log, view PNG screenshots
+# Inspect E2E results: check exit code, read test-output/result.log, view PNG screenshots
 ```
 
 ## E2E Testing
@@ -87,20 +83,19 @@ tests/e2e/
 ### How to run
 
 ```bash
-# 1. Build release binaries (required after code changes)
-cargo build --release
+# Fastest: run the full functional E2E suite (build + containerise + run all)
+just e2e
 
-# 2. Rebuild the container (only needed when binaries change)
-docker build -f docker/Dockerfile.func -t scribe-test-func .
+# Or step by step:
+just build-release                        # 1. Build release binaries
+just docker-func                          # 2. Rebuild functional container
+just e2e-func func/smoke.sh               # 3. Run a single test
 
-# 3. Run a functional test (no GPU needed)
-docker run --rm -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-func /tests/func/smoke.sh
+# Visual tests (requires --gpus all):
+just docker-visual
+just e2e-visual visual/workspace-split.sh
 
-# 3b. Run a visual test (requires --gpus all)
-# docker build -f docker/Dockerfile.visual -t scribe-test-visual .
-# docker run --rm --gpus all -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/workspace-split.sh
-
-# 4. Inspect results
+# Inspect results:
 # - Exit code: 0 = pass, 1 = test failure, 2 = infra error
 # - Read test-output/result.log for stdout/stderr
 # - Read test-output/*.png to visually verify terminal screenshots
@@ -157,10 +152,8 @@ The reconnect test (`tests/e2e/func/reconnect.sh`) validates session survival ac
 ### When to test
 
 **MANDATORY**: After ANY code change that touches server, client, or protocol code, you MUST:
-1. `cargo build --release`
-2. Rebuild the relevant Docker container (`docker build -f docker/Dockerfile.func -t scribe-test-func .`)
-3. Run ALL functional E2E tests: `func/smoke.sh`, `func/reconnect.sh`, `func/workspace-split.sh`
-4. Verify all pass before considering the change complete
+1. Run `just e2e` (builds release, rebuilds container, runs all functional tests)
+2. Verify all pass before considering the change complete
 
 Do NOT rely on `cargo test` alone — unit tests do not cover IPC, session lifecycle, reconnection, or screen content restoration. The E2E container tests are the source of truth for end-to-end correctness.
 
@@ -264,12 +257,29 @@ roots = ["~/work", "~/projects"]
 
 ### Keyboard Shortcuts
 
+**Panes**
 - `Ctrl+Shift+\` — split pane vertical (side-by-side)
 - `Ctrl+Shift+-` — split pane horizontal (top/bottom)
 - `Ctrl+Shift+W` — close pane
 - `Ctrl+Tab` — cycle focus to next pane
+- `Ctrl+Alt+Left/Right/Up/Down` — focus pane in direction
+
+**Workspaces**
 - `Ctrl+Alt+\` — split workspace vertical (side-by-side)
 - `Ctrl+Alt+-` — split workspace horizontal (top/bottom)
+
+**Terminal Shortcuts** (configurable, send escape sequences to PTY)
+- `Ctrl+Left/Right` — word left/right
+- `Alt+Backspace` — delete word backward
+- `Ctrl+Backspace` — delete word backward (ctrl)
+- `Ctrl+Delete` — delete word forward
+- `Ctrl+Home/End` — jump to line start/end
+- `Alt+<char>` — sends ESC + char (readline: Alt+B/D/F/. etc.)
+- `Shift+Arrow` — xterm modifier-encoded selection
+- `Ctrl+Shift+Arrow` — xterm modifier-encoded selection by word
+- `Shift+Tab` — backtab
+
+**General**
 - `Ctrl+Shift+N` — open new window
 - `Ctrl+,` — open settings
 

@@ -161,7 +161,12 @@ impl SessionManager {
             cell_height: 1,
         };
         let pty_options = PtyOptions {
-            env: HashMap::from([("TERM".to_owned(), "xterm-256color".to_owned())]),
+            env: HashMap::from([
+                ("TERM".to_owned(), "xterm-256color".to_owned()),
+                ("COLORTERM".to_owned(), "truecolor".to_owned()),
+                ("TERM_PROGRAM".to_owned(), "Scribe".to_owned()),
+                ("TERM_PROGRAM_VERSION".to_owned(), env!("CARGO_PKG_VERSION").to_owned()),
+            ]),
             working_directory: dirs::home_dir(),
             ..PtyOptions::default()
         };

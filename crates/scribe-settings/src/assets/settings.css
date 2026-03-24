@@ -635,7 +635,6 @@ input[type="range"]::-webkit-slider-thumb {
   background: rgba(234, 179, 8, 0.25);
   color: #fbbf24;
   border-radius: 2px;
-  padding: 0 1px;
 }
 
 /* ───────── Keybinding Row ───────── */
@@ -654,6 +653,8 @@ input[type="range"]::-webkit-slider-thumb {
   cursor: pointer;
   transition: all 0.15s;
   user-select: none;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .keybinding-key:hover {
@@ -673,12 +674,62 @@ input[type="range"]::-webkit-slider-thumb {
   50% { border-color: #60a5fa; }
 }
 
-/* ───────── Keybinding Cell (badge + reset) ───────── */
+/* ───────── Keybinding Cell (badges + add + reset) ───────── */
 
 .keybinding-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  white-space: nowrap;
+  scrollbar-width: thin;
+  max-width: 340px;
+}
+
+.kb-remove-btn {
+  background: none;
+  border: none;
+  color: #52525b;
+  font-size: 10px;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+  flex-shrink: 0;
+}
+
+.keybinding-key:hover + .kb-remove-btn,
+.kb-remove-btn:hover {
+  opacity: 1;
+}
+
+.kb-remove-btn:hover {
+  color: #ef4444;
+}
+
+.kb-add-btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px dashed rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  background: none;
+  color: #52525b;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.15s;
+  flex-shrink: 0;
+  padding: 0;
+  line-height: 1;
+}
+
+.kb-add-btn:hover {
+  border-color: rgba(37, 99, 235, 0.4);
+  color: #60a5fa;
+  background: rgba(37, 99, 235, 0.05);
 }
 
 .kb-reset-btn {
@@ -692,6 +743,7 @@ input[type="range"]::-webkit-slider-thumb {
   transition: color 0.15s;
   line-height: 1;
   visibility: hidden;
+  flex-shrink: 0;
 }
 
 .setting-row:hover .kb-reset-btn {
