@@ -8,6 +8,7 @@ mod input;
 mod ipc_client;
 mod layout;
 mod pane;
+mod scrollbar;
 mod search_overlay;
 mod selection;
 mod splash;
@@ -65,6 +66,13 @@ struct SettingsGeometryFile {
     open: bool,
 }
 
+/// Intermediate result from read-only scrollbar hit-testing, used to
+/// split the borrow of `self.panes` into immutable then mutable phases.
+enum ScrollbarAction {
+    StartDrag { display_offset: usize },
+    JumpTo { delta: i32 },
+}
+
 /// Application state for the winit event loop.
 #[allow(
     clippy::struct_excessive_bools,
@@ -95,6 +103,9 @@ struct App {
 
     // Divider drag
     divider_drag: Option<DividerDrag>,
+
+    /// Active scrollbar drag state (pane ID being dragged).
+    scrollbar_drag_pane: Option<layout::PaneId>,
 
     // Text selection
     /// Active text selection, set on mouse press and extended on move.
@@ -176,6 +187,9 @@ struct App {
     /// Whether to reopen the settings window after init (consumed once).
     settings_reopen_pending: bool,
 
+    /// Clickable rect for the status bar gear icon (updated each frame).
+    status_bar_gear_rect: Option<layout::Rect>,
+
     /// System hostname for the window-level status bar (fetched once at startup).
     hostname: String,
 
@@ -226,6 +240,7 @@ impl App {
             session_to_pane: HashMap::new(),
             pending_sessions: VecDeque::new(),
             divider_drag: None,
+            scrollbar_drag_pane: None,
             active_selection: None,
             mouse_selecting: false,
             server_connected: false,
@@ -259,6 +274,7 @@ impl App {
             settings_geometry: settings_state.geometry,
             settings_state_store,
             settings_reopen_pending: settings_state.open,
+            status_bar_gear_rect: None,
             hostname: read_hostname(),
             _config_watcher: config_watcher,
         }
@@ -343,18 +359,12 @@ impl ApplicationHandler<UiEvent> for App {
                 }
             }
             UiEvent::Welcome { window_id, other_windows } => {
-                self.handle_welcome(window_id, &other_windows);
+                self.handle_welcome(event_loop, window_id, &other_windows);
             }
             UiEvent::QuitRequested => {
                 self.handle_quit_requested(event_loop);
-            }
-            UiEvent::QuitAllFromDialog => {
-                self.handle_quit_all(event_loop);
-            }
-            UiEvent::CloseWindow => {
-                self.handle_close_window(event_loop);
-            }
-            UiEvent::CancelClose => {}
+            } // QuitAllFromDialog / CloseWindow / CancelClose were removed —
+              // the close dialog now runs synchronously in handle_close_requested.
         }
     }
 
@@ -397,6 +407,9 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => self.handle_keyboard(&event),
             WindowEvent::MouseInput { state, button, .. } => {
                 self.handle_mouse_input(state, button);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.handle_mouse_wheel(delta);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 #[allow(
@@ -534,9 +547,42 @@ impl App {
             return;
         };
 
+        // The snapshot was captured with the server's (old) term dimensions
+        // which may differ from this pane's current grid.  If the snapshot
+        // has more columns than the pane, the ANSI output would wrap lines
+        // and misalign all content.  Fix: temporarily resize the pane's term
+        // to match the snapshot, feed the ANSI, then resize back so
+        // alacritty_terminal reflows to the actual pane dimensions.
+        let pane_grid = pane.grid;
+        let dims_match = pane_grid.cols == snapshot.cols && pane_grid.rows == snapshot.rows;
+
+        if !dims_match {
+            tracing::info!(
+                snap_cols = snapshot.cols,
+                snap_rows = snapshot.rows,
+                pane_cols = pane_grid.cols,
+                pane_rows = pane_grid.rows,
+                "snapshot dimensions differ from pane — resizing term temporarily"
+            );
+            pane.resize_term_only(snapshot.cols, snapshot.rows);
+        }
+
         let ansi = snapshot_to_ansi(snapshot);
         tracing::info!(ansi_len = ansi.len(), "feeding snapshot ANSI to pane");
         pane.feed_output(&ansi);
+
+        if !dims_match {
+            pane.resize_term_only(pane_grid.cols, pane_grid.rows);
+        }
+
+        // A snapshot means we have content to display — dismiss splash.
+        if self.splash_active {
+            self.splash_active = false;
+            if let Some(gpu) = &mut self.gpu {
+                gpu.splash = None;
+            }
+        }
+
         self.request_redraw();
     }
 
@@ -648,11 +694,8 @@ impl App {
         // grid dimensions to the server.
         self.resize_all_workspace_panes();
 
-        // Dismiss splash — we're reconnecting, not waiting for first output.
-        self.splash_active = false;
-        if let Some(gpu) = &mut self.gpu {
-            gpu.splash = None;
-        }
+        // Splash stays active until the first ScreenSnapshot or PtyOutput
+        // arrives, giving a brief visual transition even on reconnect.
         self.request_redraw();
     }
 
@@ -866,7 +909,16 @@ impl App {
         self.last_tick = now;
         self.ai_tracker.tick(dt);
 
-        if !self.ai_tracker.needs_animation() {
+        // Tick scrollbar fade for all panes.
+        let mut scrollbar_animating = false;
+        for pane in self.panes.values_mut() {
+            let display_offset = pane.term.grid().display_offset();
+            if pane.scrollbar_state.tick_fade(display_offset) {
+                scrollbar_animating = true;
+            }
+        }
+
+        if !self.ai_tracker.needs_animation() && !scrollbar_animating {
             self.animation_running = false;
             // Timer thread will see the flag and stop.
         }
@@ -1168,6 +1220,20 @@ impl App {
         }
         let cursor_visible = self.cursor_visible;
 
+        let scrollbar_width = self.config.appearance.scrollbar_width.clamp(2.0, 20.0);
+        let scrollbar_color = self.config.appearance.scrollbar_color.as_ref().map_or(
+            self.theme.chrome.scrollbar,
+            |hex| {
+                scribe_common::theme::hex_to_rgba(hex).map_or(
+                    self.theme.chrome.scrollbar,
+                    |mut c| {
+                        c[3] = 0.4;
+                        c
+                    },
+                )
+            },
+        );
+
         let mut all_instances = build_all_instances(
             &mut gpu.renderer,
             &gpu.device,
@@ -1182,6 +1248,8 @@ impl App {
             &ws_tab_bar_data,
             divider_color,
             accent_color,
+            scrollbar_width,
+            scrollbar_color,
             focus_split_direction,
             cursor_visible,
         );
@@ -1200,7 +1268,7 @@ impl App {
             };
             let mut resolve_glyph =
                 |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
-            status_bar::build_status_bar(
+            let sb_hits = status_bar::build_status_bar(
                 &mut all_instances,
                 full_viewport,
                 cell_size,
@@ -1208,6 +1276,7 @@ impl App {
                 &sb_data,
                 &mut resolve_glyph,
             );
+            self.status_bar_gear_rect = sb_hits.gear_rect;
         }
 
         if self.opacity < 1.0 {
@@ -1737,24 +1806,84 @@ impl App {
     // Scrollback
     // -----------------------------------------------------------------------
 
-    #[allow(clippy::unused_self, reason = "scroll viewport will use self once implemented")]
-    fn handle_scroll_up(&self) {
-        tracing::debug!("scroll up: scrollback viewport not yet implemented");
+    fn handle_scroll_up(&mut self) {
+        let Some(tab) = self.window_layout.active_tab() else { return };
+        let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
+        pane.term.scroll_display(alacritty_terminal::grid::Scroll::PageUp);
+        pane.scrollbar_state.on_scroll_action();
+        self.ensure_animation_running();
+        self.request_redraw();
     }
 
-    #[allow(clippy::unused_self, reason = "scroll viewport will use self once implemented")]
-    fn handle_scroll_down(&self) {
-        tracing::debug!("scroll down: scrollback viewport not yet implemented");
+    fn handle_scroll_down(&mut self) {
+        let Some(tab) = self.window_layout.active_tab() else { return };
+        let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
+        pane.term.scroll_display(alacritty_terminal::grid::Scroll::PageDown);
+        pane.scrollbar_state.on_scroll_action();
+        self.ensure_animation_running();
+        self.request_redraw();
     }
 
-    #[allow(clippy::unused_self, reason = "scroll viewport will use self once implemented")]
-    fn handle_scroll_top(&self) {
-        tracing::debug!("scroll to top: scrollback viewport not yet implemented");
+    fn handle_scroll_top(&mut self) {
+        let Some(tab) = self.window_layout.active_tab() else { return };
+        let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
+        pane.term.scroll_display(alacritty_terminal::grid::Scroll::Top);
+        pane.scrollbar_state.on_scroll_action();
+        self.ensure_animation_running();
+        self.request_redraw();
     }
 
-    #[allow(clippy::unused_self, reason = "scroll viewport will use self once implemented")]
-    fn handle_scroll_bottom(&self) {
-        tracing::debug!("scroll to bottom: scrollback viewport not yet implemented");
+    fn handle_scroll_bottom(&mut self) {
+        let Some(tab) = self.window_layout.active_tab() else { return };
+        let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
+        pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+        pane.scrollbar_state.on_scroll_action();
+        self.ensure_animation_running();
+        self.request_redraw();
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "scroll delta is a small float value that fits in i32"
+    )]
+    fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
+        let lines = match delta {
+            winit::event::MouseScrollDelta::LineDelta(_, y) => {
+                // 3 terminal lines per scroll tick.
+                -(y * 3.0) as i32
+            }
+            winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                let Some(gpu) = &self.gpu else { return };
+                let cell_h = gpu.renderer.cell_size().height;
+                if cell_h <= 0.0 {
+                    return;
+                }
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "pixel delta from winit is f64 but fits in f32"
+                )]
+                let y = pos.y as f32;
+                -(y / cell_h).round() as i32
+            }
+        };
+
+        if lines == 0 {
+            return;
+        }
+
+        let Some(tab) = self.window_layout.active_tab() else { return };
+        let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
+        pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+        pane.scrollbar_state.on_scroll_action();
+        self.ensure_animation_running();
+        self.request_redraw();
+    }
+
+    /// Start the animation timer if not already running (needed for scrollbar fade).
+    fn ensure_animation_running(&mut self) {
+        if !self.animation_running {
+            self.start_animation_timer();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1869,6 +1998,7 @@ impl App {
             winit::event::ElementState::Pressed => self.handle_mouse_press(),
             winit::event::ElementState::Released => {
                 self.divider_drag = None;
+                self.end_scrollbar_drag();
                 self.handle_mouse_release();
             }
         }
@@ -1885,6 +2015,19 @@ impl App {
         let Some(gpu) = &self.gpu else { return };
         let ws_viewport = workspace_viewport(&gpu.surface_config);
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+
+        // Check for status-bar gear icon click (opens settings).
+        if let Some(gear) = self.status_bar_gear_rect {
+            if gear.contains(x, y) {
+                self.open_settings();
+                return;
+            }
+        }
+
+        // Check for scrollbar click (before divider, before selection).
+        if self.try_start_scrollbar_interaction(x, y) {
+            return;
+        }
 
         // Check for divider drag first (within the focused workspace).
         if self.try_start_divider_drag(x, y, &ws_rects) {
@@ -1916,6 +2059,125 @@ impl App {
         false
     }
 
+    /// Finalize a scrollbar drag on mouse-release.
+    fn end_scrollbar_drag(&mut self) {
+        let Some(pane_id) = self.scrollbar_drag_pane.take() else { return };
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            pane.scrollbar_state.on_drag_end();
+        }
+        self.request_redraw();
+    }
+
+    /// Try to start a scrollbar click or drag. Returns `true` if the
+    /// scrollbar was hit.
+    fn try_start_scrollbar_interaction(&mut self, x: f32, y: f32) -> bool {
+        let tab = self.window_layout.active_tab();
+        let Some(tab) = tab else { return false };
+        let focused_pane_id = tab.focused_pane;
+        let scrollbar_width = self.config.appearance.scrollbar_width.clamp(2.0, 20.0);
+
+        // Phase 1: read-only queries (immutable borrow of self.panes).
+        let action = {
+            let Some(pane) = self.panes.get(&focused_pane_id) else { return false };
+            if !scrollbar::hit_test_scrollbar(pane, x, y, scrollbar_width) {
+                return false;
+            }
+
+            let display_offset = pane.term.grid().display_offset();
+
+            if scrollbar::hit_test_thumb(pane, x, y, scrollbar_width) {
+                ScrollbarAction::StartDrag { display_offset }
+            } else {
+                let target = scrollbar::offset_from_track_click(pane, y, scrollbar_width);
+                #[allow(
+                    clippy::cast_possible_wrap,
+                    clippy::cast_possible_truncation,
+                    reason = "display offsets are small positive values that fit in i32"
+                )]
+                let delta = target as i32 - display_offset as i32;
+                ScrollbarAction::JumpTo { delta }
+            }
+        };
+        // Immutable borrow dropped here.
+
+        // Phase 2: mutate (mutable borrow of self.panes).
+        let Some(pane) = self.panes.get_mut(&focused_pane_id) else { return false };
+        match action {
+            ScrollbarAction::StartDrag { display_offset } => {
+                pane.scrollbar_state.drag = Some(scrollbar::ScrollbarDrag {
+                    start_mouse_y: y,
+                    start_display_offset: display_offset,
+                });
+                pane.scrollbar_state.opacity = 1.0;
+                pane.scrollbar_state.fade_start = None;
+                self.scrollbar_drag_pane = Some(focused_pane_id);
+            }
+            ScrollbarAction::JumpTo { delta } => {
+                pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
+                pane.scrollbar_state.on_scroll_action();
+            }
+        }
+
+        self.ensure_animation_running();
+        self.request_redraw();
+        true
+    }
+
+    /// Handle scrollbar drag movement.
+    fn handle_scrollbar_drag(&mut self, pane_id: layout::PaneId) {
+        let Some((_, y)) = self.last_cursor_pos else { return };
+        let scrollbar_width = self.config.appearance.scrollbar_width.clamp(2.0, 20.0);
+
+        // Phase 1: read-only — compute the scroll delta.
+        let delta = {
+            let Some(pane) = self.panes.get(&pane_id) else { return };
+            let Some(drag) = pane.scrollbar_state.drag.as_ref() else {
+                self.scrollbar_drag_pane = None;
+                return;
+            };
+            let target_offset = scrollbar::offset_from_drag(pane, drag, y, scrollbar_width);
+            let current_offset = pane.term.grid().display_offset();
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation,
+                reason = "display offsets are small positive values that fit in i32"
+            )]
+            {
+                target_offset as i32 - current_offset as i32
+            }
+        };
+
+        // Phase 2: mutate.
+        if delta != 0 {
+            let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+            pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
+        }
+        self.request_redraw();
+    }
+
+    /// Update scrollbar hover state for the focused pane.
+    fn update_scrollbar_hover(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        let tab = self.window_layout.active_tab();
+        let Some(tab) = tab else { return };
+        let focused_pane_id = tab.focused_pane;
+        let scrollbar_width = self.config.appearance.scrollbar_width.clamp(2.0, 20.0);
+
+        let Some(pane) = self.panes.get_mut(&focused_pane_id) else { return };
+        let in_zone = scrollbar::hit_test_scrollbar(pane, x, y, scrollbar_width);
+
+        let was_hovering = pane.scrollbar_state.hover;
+        if in_zone && !was_hovering {
+            pane.scrollbar_state.on_hover_enter();
+            self.ensure_animation_running();
+            self.request_redraw();
+        } else if !in_zone && was_hovering {
+            pane.scrollbar_state.on_hover_leave();
+            self.ensure_animation_running();
+            self.request_redraw();
+        }
+    }
+
     /// Switch focus to whichever pane contains the point `(x, y)`.
     fn focus_pane_at(&mut self, x: f32, y: f32, ws_rects: &[(WorkspaceId, Rect)]) {
         for (ws_id, ws_rect) in ws_rects {
@@ -1942,9 +2204,19 @@ impl App {
     }
 
     fn handle_cursor_moved(&mut self) {
+        // Scrollbar drag takes highest priority.
+        if let Some(pane_id) = self.scrollbar_drag_pane {
+            self.handle_scrollbar_drag(pane_id);
+            return;
+        }
+
         // Extend active text selection while mouse is held.
         self.extend_selection();
 
+        // Update scrollbar hover state for the focused pane.
+        self.update_scrollbar_hover();
+
+        // Divider drag.
         let Some(drag) = self.divider_drag else { return };
         let Some((x, y)) = self.last_cursor_pos else { return };
 
@@ -2120,27 +2392,51 @@ impl App {
 
     /// Handle `Welcome` from the server — store our window ID, apply saved
     /// geometry, and spawn other windows that need to be restored.
-    fn handle_welcome(&mut self, window_id: WindowId, other_windows: &[WindowId]) {
+    fn handle_welcome(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        other_windows: &[WindowId],
+    ) {
         self.window_id = Some(window_id);
         tracing::info!(%window_id, others = other_windows.len(), "assigned window ID");
 
         // If we didn't have a window_id at startup (fresh launch), load
-        // geometry now that the server has assigned one.
+        // geometry now that the server has assigned one. Uses the full
+        // restore path (position + size + maximized) so that a restart
+        // without --window-id still places the window correctly.
         if self.saved_geometry.is_none() {
-            let loaded = self.window_registry.load(window_id);
-            let has_saved = loaded.x.is_some() || loaded.maximized;
-            let resolved = if has_saved {
-                Some(loaded)
-            } else {
-                self.window_registry.migrate_legacy(window_id)
-            };
-            if let Some(restored) = resolved {
-                apply_geometry_to_window(self.window.as_deref(), &restored);
-            }
+            self.restore_geometry_from_registry(event_loop, window_id);
         }
 
         for &other_wid in other_windows {
             spawn_client_process(other_wid);
+        }
+    }
+
+    /// Load saved geometry from the per-window registry and apply it.
+    ///
+    /// Called when the server assigns a window ID that wasn't known at
+    /// startup (fresh launch / restart without `--window-id`).
+    ///
+    /// Only size and maximized state are restored — position is left to
+    /// the OS.  Position restoration is reserved for explicit `--window-id`
+    /// launches (handled in `resumed()` via `saved_geometry`), where the
+    /// user intentionally resumes a specific window.
+    fn restore_geometry_from_registry(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+    ) {
+        let loaded = self.window_registry.load(window_id);
+        let has_saved = loaded.x.is_some() || loaded.maximized;
+        let geom =
+            if has_saved { Some(loaded) } else { self.window_registry.migrate_legacy(window_id) };
+        if let (Some(mut geom), Some(window)) = (geom, &self.window) {
+            // Clear position so the OS decides placement.
+            geom.x = None;
+            geom.y = None;
+            window_state::apply_window_geometry(event_loop, window, &geom);
         }
     }
 
@@ -2152,16 +2448,14 @@ impl App {
         tracing::info!(%new_id, "spawning new window");
     }
 
-    /// Handle the close button. Shows a dialog with two choices:
+    /// Handle the close button. Shows a modal dialog with two choices:
     /// close this window only, or quit Scribe (all windows).
+    ///
+    /// The dialog blocks the event loop, which is intentional — the user
+    /// cannot interact with the terminal while the dialog is open, and
+    /// showing it on the main thread lets the compositor center it on the
+    /// parent window (background threads break XDG portal parenting).
     fn handle_close_requested(&mut self, event_loop: &ActiveEventLoop) {
-        // Spawn dialog on a separate thread to avoid blocking the event loop.
-        let Some(proxy) = self.animation_proxy.clone() else {
-            // No proxy — fall back to immediate close.
-            self.flush_geometry_now();
-            event_loop.exit();
-            return;
-        };
         let Some(window) = self.window.clone() else {
             self.flush_geometry_now();
             event_loop.exit();
@@ -2169,9 +2463,11 @@ impl App {
         };
 
         let session_count = self.panes.len();
-        std::thread::spawn(move || {
-            show_close_dialog(proxy, window, session_count);
-        });
+        match show_close_dialog(&window, session_count) {
+            CloseAction::QuitAll => self.handle_quit_all(event_loop),
+            CloseAction::CloseWindow => self.handle_close_window(event_loop),
+            CloseAction::Cancel => {}
+        }
     }
 
     /// Handle `QuitRequested` from the server — save state and close.
@@ -2286,6 +2582,8 @@ fn build_all_instances(
     ws_tab_bar_data: &[tab_bar::WorkspaceTabBarData],
     divider_color: [f32; 4],
     accent_color: [f32; 4],
+    scrollbar_width: f32,
+    scrollbar_color: [f32; 4],
     focus_split_direction: Option<layout::SplitDirection>,
     cursor_visible: bool,
 ) -> Vec<scribe_renderer::types::CellInstance> {
@@ -2314,7 +2612,7 @@ fn build_all_instances(
             cell_size,
             tabs: &ws_data.tabs,
             badge,
-            show_gear: true,
+            show_gear: false,
             colors: tab_colors,
             resolve_glyph: &mut resolve_glyph,
         };
@@ -2345,6 +2643,18 @@ fn build_all_instances(
 
     // Dividers.
     divider::build_divider_instances(&mut all_instances, dividers, cell_size, divider_color);
+
+    // Scrollbar overlays.
+    for (pane_id, _) in pane_rects {
+        if let Some(pane) = panes.get(pane_id) {
+            scrollbar::build_scrollbar_instances(
+                &mut all_instances,
+                pane,
+                scrollbar_width,
+                scrollbar_color,
+            );
+        }
+    }
 
     // Focus border on the focused pane's leading edge.
     if has_multiple_panes {
@@ -2845,6 +3155,14 @@ fn apply_config_key(
             let v = value.as_f64().ok_or("opacity must be a number")? as f32;
             config.appearance.opacity = v;
         }
+        "appearance.scrollbar_width" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "scrollbar width is a small positive float"
+            )]
+            let v = value.as_f64().ok_or("scrollbar_width must be a number")? as f32;
+            config.appearance.scrollbar_width = v.clamp(2.0, 20.0);
+        }
         // -- Theme preset -----------------------------------------------------
         "theme.preset" => {
             let preset = value.as_str().ok_or("theme preset must be a string")?;
@@ -2951,28 +3269,18 @@ fn apply_keybinding_field(
 // main()
 // ---------------------------------------------------------------------------
 
-/// Apply geometry to a window (used when the window already exists but we
-/// don't have access to the event loop).
-fn apply_geometry_to_window(window: Option<&Window>, geom: &window_state::WindowGeometry) {
-    let Some(window) = window else { return };
-    if !geom.maximized {
-        let _applied =
-            window.request_inner_size(winit::dpi::PhysicalSize::new(geom.width, geom.height));
-    }
-    if geom.maximized {
-        window.set_maximized(true);
-    }
+/// What the user chose in the close dialog.
+enum CloseAction {
+    QuitAll,
+    CloseWindow,
+    Cancel,
 }
 
 /// Show a native dialog asking whether to quit Scribe, kill this window, or cancel.
 ///
-/// Runs on a background thread. Sends the result back to the event loop
-/// via the proxy.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "proxy and window arc are moved into a background thread"
-)]
-fn show_close_dialog(proxy: EventLoopProxy<UiEvent>, window: Arc<Window>, session_count: usize) {
+/// Blocks until the user responds. Must be called on the main thread so
+/// the XDG portal can center the dialog on the parent window.
+fn show_close_dialog(window: &Window, session_count: usize) -> CloseAction {
     let session_warning = if session_count > 0 {
         format!("\n\nThis window has {session_count} active session(s) that will be terminated.")
     } else {
@@ -2993,17 +3301,13 @@ fn show_close_dialog(proxy: EventLoopProxy<UiEvent>, window: Arc<Window>, sessio
             String::from("Cancel"),
         ))
         .set_level(rfd::MessageLevel::Warning)
-        .set_parent(&*window)
+        .set_parent(window)
         .show();
 
-    let event = match result {
-        rfd::MessageDialogResult::Custom(ref s) if s == "Quit Scribe" => UiEvent::QuitAllFromDialog,
-        rfd::MessageDialogResult::Custom(ref s) if s == "Kill Window" => UiEvent::CloseWindow,
-        _ => UiEvent::CancelClose,
-    };
-
-    if proxy.send_event(event).is_err() {
-        tracing::warn!("event loop closed before close dialog result");
+    match result {
+        rfd::MessageDialogResult::Custom(ref s) if s == "Quit Scribe" => CloseAction::QuitAll,
+        rfd::MessageDialogResult::Custom(ref s) if s == "Kill Window" => CloseAction::CloseWindow,
+        _ => CloseAction::Cancel,
     }
 }
 

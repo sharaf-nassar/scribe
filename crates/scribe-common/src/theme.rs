@@ -1,8 +1,20 @@
 use crate::error::ScribeError;
 
-/// Available built-in theme preset names.
-pub const PRESET_NAMES: &[&str] =
+#[path = "theme_community_presets.rs"]
+mod community_presets;
+
+/// Curated built-in theme preset names.
+const CURATED_NAMES: &[&str] =
     &["minimal-dark", "tokyo-night", "catppuccin-mocha", "dracula", "solarized-dark"];
+
+/// Return the full list of available preset names (curated + community).
+#[must_use]
+pub fn all_preset_names() -> Vec<&'static str> {
+    let mut names = Vec::with_capacity(CURATED_NAMES.len() + community_presets::NAMES.len());
+    names.extend_from_slice(CURATED_NAMES);
+    names.extend_from_slice(community_presets::NAMES);
+    names
+}
 
 /// Chrome (non-terminal UI) colors derived from a terminal theme.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -15,6 +27,7 @@ pub struct ChromeColors {
     pub status_bar_text: [f32; 4],
     pub divider: [f32; 4],
     pub accent: [f32; 4],
+    pub scrollbar: [f32; 4],
 }
 
 /// A complete terminal color theme including chrome (UI) colors.
@@ -77,6 +90,7 @@ impl Theme {
         let divider = with_alpha(foreground, 0.08);
         // ANSI blue is index 4
         let accent = ansi_colors.get(4).copied().unwrap_or(foreground);
+        let scrollbar = with_alpha(foreground, 0.4);
 
         ChromeColors {
             tab_bar_bg,
@@ -87,6 +101,7 @@ impl Theme {
             status_bar_text,
             divider,
             accent,
+            scrollbar,
         }
     }
 }
@@ -100,7 +115,7 @@ pub fn resolve_preset(name: &str) -> Option<Theme> {
         "catppuccin-mocha" => Some(catppuccin_mocha()),
         "dracula" => Some(dracula()),
         "solarized-dark" => Some(solarized_dark()),
-        _ => None,
+        _ => community_presets::lookup(&lower),
     }
 }
 
@@ -236,20 +251,20 @@ pub fn solarized_dark() -> Theme {
 // ---------------------------------------------------------------------------
 
 /// Compact specification for building a `Theme` from hex strings.
-struct ThemeSpec {
-    name: &'static str,
-    fg: &'static str,
-    bg: &'static str,
-    cursor: &'static str,
-    cursor_accent: &'static str,
-    selection: &'static str,
-    selection_fg: &'static str,
-    ansi: [&'static str; 16],
+pub(super) struct ThemeSpec {
+    pub(super) name: &'static str,
+    pub(super) fg: &'static str,
+    pub(super) bg: &'static str,
+    pub(super) cursor: &'static str,
+    pub(super) cursor_accent: &'static str,
+    pub(super) selection: &'static str,
+    pub(super) selection_fg: &'static str,
+    pub(super) ansi: [&'static str; 16],
 }
 
 impl ThemeSpec {
-    /// Convert the hex-based specification into a fully resolved `Theme`.
-    fn build(self) -> Theme {
+    /// Build a `Theme` from a borrowed spec (used by community presets).
+    pub(super) fn build_ref(&self) -> Theme {
         let foreground = hex_or_fallback(self.fg);
         let background = hex_or_fallback(self.bg);
         let cursor = hex_or_fallback(self.cursor);
@@ -277,6 +292,11 @@ impl ThemeSpec {
             ansi_colors,
             chrome,
         }
+    }
+
+    /// Convert the hex-based specification into a fully resolved `Theme`.
+    fn build(self) -> Theme {
+        self.build_ref()
     }
 }
 

@@ -12,6 +12,7 @@ use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_renderer::types::GridSize;
 
 use crate::layout::Rect;
+use crate::scrollbar::ScrollbarState;
 
 /// Height of the tab bar in pixels (reserved at the top of each pane).
 pub const TAB_BAR_HEIGHT: f32 = 32.0;
@@ -36,6 +37,11 @@ pub struct Pane {
     pub rect: Rect,
     /// Grid size (cols, rows) for this pane's content area.
     pub grid: GridSize,
+    #[allow(
+        dead_code,
+        reason = "read by scrollbar rendering and hit-testing, wired in later tasks"
+    )]
+    pub scrollbar_state: ScrollbarState,
 }
 
 /// Simple adapter implementing `alacritty_terminal::grid::Dimensions`.
@@ -81,12 +87,26 @@ impl Pane {
             ansi_processor: vte::ansi::Processor::new(),
             rect,
             grid,
+            scrollbar_state: ScrollbarState::new(),
         }
     }
 
     /// Feed raw PTY output bytes into the ANSI processor / terminal.
     pub fn feed_output(&mut self, bytes: &[u8]) {
         self.ansi_processor.advance(&mut self.term, bytes);
+    }
+
+    /// Resize just the underlying terminal emulator without changing the
+    /// pane's stored `rect` or `grid`.
+    ///
+    /// Used during snapshot restoration: the ANSI content must be processed
+    /// in a term whose dimensions match the snapshot, then resized back to
+    /// the pane's actual grid so `alacritty_terminal` reflows correctly.
+    pub fn resize_term_only(&mut self, cols: u16, rows: u16) {
+        let dims = TermDims { cols: usize::from(cols), lines: usize::from(rows) };
+        if self.term.columns() != dims.cols || self.term.screen_lines() != dims.lines {
+            self.term.resize(dims);
+        }
     }
 
     /// Resize this pane to a new pixel rect.

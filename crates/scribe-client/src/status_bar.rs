@@ -15,6 +15,12 @@ use crate::layout::Rect;
 /// Height of the status bar in pixels.
 pub const STATUS_BAR_HEIGHT: f32 = 24.0;
 
+/// Clickable regions produced by [`build_status_bar`].
+pub struct StatusBarHitTargets {
+    /// Clickable rect for the settings gear icon.
+    pub gear_rect: Option<Rect>,
+}
+
 /// Data needed to render the window-level status bar.
 pub struct StatusBarData<'a> {
     pub connected: bool,
@@ -83,10 +89,10 @@ pub fn build_status_bar(
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
+) -> StatusBarHitTargets {
     let (cell_w, _cell_h) = cell_size;
     if cell_w <= 0.0 {
-        return;
+        return StatusBarHitTargets { gear_rect: None };
     }
 
     let bar_y = window_rect.y + window_rect.height - STATUS_BAR_HEIGHT;
@@ -98,7 +104,9 @@ pub fn build_status_bar(
     let col = render_left_side(&mut w, colors, data, resolve_glyph);
     w.col = col;
 
-    render_right_side(&mut w, colors, data, resolve_glyph);
+    let gear_rect = render_right_side(&mut w, colors, data, resolve_glyph);
+
+    StatusBarHitTargets { gear_rect }
 }
 
 /// Mutable writer state for emitting status bar characters.
@@ -193,15 +201,20 @@ fn render_left_side(
     w.col
 }
 
-/// Render the right side: git branch | session count | hostname | time.
+/// Render the right side: git branch | session count | hostname | time | gear.
+///
+/// Returns the clickable rect for the gear icon, if rendered.
 fn render_right_side(
     w: &mut BarWriter<'_>,
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
+) -> Option<Rect> {
+    // +3 for the gear segment: " ⚙ " (space, gear, space)
+    let gear_cols: usize = 3;
     let segments = build_right_segments(data, colors);
-    let right_cols: usize = segments.iter().map(|s| s.text.chars().count()).sum();
+    let right_cols: usize =
+        segments.iter().map(|s| s.text.chars().count()).sum::<usize>() + gear_cols;
     let right_start = w.max_cols.saturating_sub(right_cols + 1);
 
     w.pad_to(right_start, colors.text, colors.bg, resolve_glyph);
@@ -210,7 +223,34 @@ fn render_right_side(
         w.put_str(&seg.text, seg.color, colors.bg, resolve_glyph);
     }
 
+    // Gear icon: " ⚙ " at the far right.
+    let gear_rect = render_gear(w, colors, resolve_glyph);
+
     w.pad_to(w.max_cols, colors.text, colors.bg, resolve_glyph);
+
+    gear_rect
+}
+
+/// Render the gear icon and return its clickable rect.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "column index is a small positive integer fitting in f32"
+)]
+fn render_gear(
+    w: &mut BarWriter<'_>,
+    colors: &StatusBarColors,
+    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+) -> Option<Rect> {
+    if w.col >= w.max_cols {
+        return None;
+    }
+    w.put(' ', colors.text, colors.bg, resolve_glyph);
+    let gear_col = w.col;
+    w.put('\u{2699}', colors.text, colors.bg, resolve_glyph);
+    w.put(' ', colors.text, colors.bg, resolve_glyph);
+    let gear_x = w.x_origin + gear_col as f32 * w.cell_w;
+    let gear_width = (w.col - gear_col) as f32 * w.cell_w;
+    Some(Rect { x: gear_x, y: w.y, width: gear_width, height: STATUS_BAR_HEIGHT })
 }
 
 /// A styled text segment for the right side of the status bar.

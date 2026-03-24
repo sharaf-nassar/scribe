@@ -50,6 +50,10 @@ pub struct AppearanceConfig {
     pub opacity: f32,
     #[serde(default = "default_theme_name")]
     pub theme: String,
+    #[serde(default = "default_scrollbar_width")]
+    pub scrollbar_width: f32,
+    #[serde(default)]
+    pub scrollbar_color: Option<String>,
 }
 
 impl Default for AppearanceConfig {
@@ -65,6 +69,8 @@ impl Default for AppearanceConfig {
             cursor_blink: true,
             opacity: default_opacity(),
             theme: default_theme_name(),
+            scrollbar_width: default_scrollbar_width(),
+            scrollbar_color: None,
         }
     }
 }
@@ -95,6 +101,10 @@ fn default_opacity() -> f32 {
 
 fn default_theme_name() -> String {
     String::from("minimal-dark")
+}
+
+fn default_scrollbar_width() -> f32 {
+    6.0
 }
 
 // ---------------------------------------------------------------------------

@@ -106,12 +106,6 @@ pub enum UiEvent {
     Welcome { window_id: WindowId, other_windows: Vec<WindowId> },
     /// Server requested us to save state and quit (another client sent `QuitAll`).
     QuitRequested,
-    /// User chose "Quit Scribe" from the close dialog (this window originated it).
-    QuitAllFromDialog,
-    /// User chose "Kill Window" from the close dialog.
-    CloseWindow,
-    /// User chose "Cancel" from the close dialog — do nothing.
-    CancelClose,
 }
 
 /// Start the IPC client on a background thread.
