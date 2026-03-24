@@ -1,25 +1,43 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info};
 
-use scribe_common::ids::{SessionId, WorkspaceId};
-use scribe_common::protocol::ServerMessage;
+use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
+use scribe_common::protocol::{LayoutDirection, ServerMessage, WorkspaceTreeNode};
+
+use serde::{Deserialize, Serialize};
 
 use crate::handoff::HandoffWorkspace;
+
+/// Per-window state transferred during handoff.
+#[derive(Serialize, Deserialize)]
+pub struct HandoffWindowState {
+    pub window_id: WindowId,
+    pub session_ids: Vec<SessionId>,
+    pub workspace_tree: Option<WorkspaceTreeNode>,
+}
 
 #[allow(dead_code, reason = "used by create_workspace, called from CreateWorkspace handler")]
 const ACCENT_COLORS: &[&str] =
     &["#a78bfa", "#38bdf8", "#6ee7b7", "#fb7185", "#fbbf24", "#a3e635", "#f472b6", "#22d3ee"];
 
-/// Manages workspace ↔ session relationships and auto-names workspaces
-/// based on configured root directories.
+/// Manages workspace ↔ session relationships, window ↔ session ownership,
+/// and auto-names workspaces based on configured root directories.
 pub struct WorkspaceManager {
     roots: Vec<PathBuf>,
     workspaces: HashMap<WorkspaceId, Workspace>,
     session_to_workspace: HashMap<SessionId, WorkspaceId>,
     #[allow(dead_code, reason = "used by create_workspace, called from CreateWorkspace handler")]
     color_index: usize,
+    /// Legacy single workspace tree — used as fallback when no per-window
+    /// trees exist (backwards compatibility with pre-multi-window handoffs).
+    workspace_tree: Option<WorkspaceTreeNode>,
+    /// Per-window workspace split trees.  Each client window reports its own
+    /// tree via `ReportWorkspaceTree`; the server stores them keyed by window.
+    window_trees: HashMap<WindowId, WorkspaceTreeNode>,
+    /// Maps each session to the window that owns it.
+    session_to_window: HashMap<SessionId, WindowId>,
 }
 
 struct Workspace {
@@ -29,6 +47,9 @@ struct Workspace {
     sessions: Vec<SessionId>,
     #[allow(dead_code, reason = "sent to UI in future WorkspaceInfo messages")]
     accent_color: String,
+    /// Direction of the split that created this workspace (`None` for the
+    /// initial workspace which was not created by splitting).
+    split_direction: Option<LayoutDirection>,
 }
 
 impl WorkspaceManager {
@@ -40,6 +61,9 @@ impl WorkspaceManager {
             workspaces: HashMap::new(),
             session_to_workspace: HashMap::new(),
             color_index: 0,
+            workspace_tree: None,
+            window_trees: HashMap::new(),
+            session_to_window: HashMap::new(),
         }
     }
 
@@ -56,15 +80,48 @@ impl WorkspaceManager {
 
         info!(%id, color = %accent_color, "created workspace");
 
-        let workspace = Workspace { id, name: None, sessions: Vec::new(), accent_color };
+        let workspace =
+            Workspace { id, name: None, sessions: Vec::new(), accent_color, split_direction: None };
         self.workspaces.insert(id, workspace);
 
         id
     }
 
     /// Add a session to a workspace.
-    pub fn add_session(&mut self, workspace_id: WorkspaceId, session_id: SessionId) {
+    ///
+    /// When `split_direction` is `Some` and the workspace does not yet exist
+    /// it is created automatically (this happens when the client creates a
+    /// workspace split — it sends `CreateSession` with a brand-new workspace
+    /// ID and the direction of the split).
+    pub fn add_session(
+        &mut self,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        split_direction: Option<LayoutDirection>,
+    ) {
         self.session_to_workspace.insert(session_id, workspace_id);
+
+        // Auto-create the workspace for split-created workspaces.
+        if !self.workspaces.contains_key(&workspace_id) {
+            let color_count = ACCENT_COLORS.len();
+            let idx = self.color_index % color_count;
+            let accent_color = ACCENT_COLORS.get(idx).copied().unwrap_or("#a78bfa").to_owned();
+            self.color_index = self.color_index.wrapping_add(1);
+
+            info!(%workspace_id, color = %accent_color, ?split_direction, "auto-created workspace");
+
+            self.workspaces.insert(
+                workspace_id,
+                Workspace {
+                    id: workspace_id,
+                    name: None,
+                    sessions: Vec::new(),
+                    accent_color,
+                    split_direction,
+                },
+            );
+        }
+
         if let Some(ws) = self.workspaces.get_mut(&workspace_id) {
             ws.sessions.push(session_id);
             debug!(%session_id, %workspace_id, "added session to workspace");
@@ -84,29 +141,25 @@ impl WorkspaceManager {
 
     /// Called when the CWD of a session changes.
     ///
-    /// If the workspace containing this session is still unnamed, the CWD is
-    /// matched against configured roots. When a match is found the first path
-    /// component after the root prefix becomes the workspace name (sticky —
-    /// once named, stays named).
+    /// Matches the CWD against configured roots. When a match is found the
+    /// first path component after the root prefix becomes the workspace name.
+    /// The name updates whenever the user moves to a different project root.
     ///
-    /// Returns `Some(ServerMessage::WorkspaceNamed { … })` when a name is
-    /// newly assigned, `None` otherwise.
+    /// Returns `Some(ServerMessage::WorkspaceNamed { … })` when the name
+    /// changes, `None` otherwise.
     pub fn on_cwd_changed(&mut self, session_id: SessionId, cwd: &Path) -> Option<ServerMessage> {
         let workspace_id = *self.session_to_workspace.get(&session_id)?;
-
-        // Check if already named before extracting the name.
-        let is_named = self.workspaces.get(&workspace_id).is_some_and(|ws| ws.name.is_some());
-        if is_named {
-            return None;
-        }
 
         // Extract name from roots. Clone to avoid borrowing self while
         // the mutable borrow of workspaces is needed below.
         let roots = self.roots.clone();
         let name = Self::extract_workspace_name_with_roots(cwd, &roots)?;
 
-        // Now mutably borrow the workspace to set the name.
+        // Only send a message when the name actually changes.
         let ws = self.workspaces.get_mut(&workspace_id)?;
+        if ws.name.as_ref() == Some(&name) {
+            return None;
+        }
         ws.name = Some(name.clone());
         info!(%workspace_id, %name, "workspace auto-named from CWD");
 
@@ -151,12 +204,90 @@ impl WorkspaceManager {
         self.session_to_workspace.get(&session_id).copied()
     }
 
-    /// Return the name and accent color of a workspace.
+    /// Return the name, accent color, and split direction of a workspace.
     ///
-    /// Returns `Some((name, accent_color))` if the workspace exists, `None`
-    /// otherwise.
-    pub fn workspace_info(&self, id: WorkspaceId) -> Option<(Option<String>, String)> {
-        self.workspaces.get(&id).map(|ws| (ws.name.clone(), ws.accent_color.clone()))
+    /// Returns `Some(…)` if the workspace exists, `None` otherwise.
+    pub fn workspace_info(
+        &self,
+        id: WorkspaceId,
+    ) -> Option<(Option<String>, String, Option<LayoutDirection>)> {
+        self.workspaces
+            .get(&id)
+            .map(|ws| (ws.name.clone(), ws.accent_color.clone(), ws.split_direction))
+    }
+
+    /// Return the legacy single workspace split tree (used by handoff serialisation).
+    #[allow(dead_code, reason = "used in handoff serialization and tests")]
+    pub fn workspace_tree(&self) -> Option<&WorkspaceTreeNode> {
+        self.workspace_tree.as_ref()
+    }
+
+    /// Return the workspace tree for a specific window.
+    ///
+    /// Falls back to the legacy single tree only when no per-window trees
+    /// have been stored yet (backwards compatibility with pre-multi-window
+    /// servers). Once any window has reported a tree, each window gets
+    /// only its own.
+    pub fn window_tree(&self, window_id: WindowId) -> Option<&WorkspaceTreeNode> {
+        if self.window_trees.is_empty() {
+            // Legacy mode — no per-window trees exist, use the global one.
+            self.workspace_tree.as_ref()
+        } else {
+            self.window_trees.get(&window_id)
+        }
+    }
+
+    /// Replace the stored workspace split tree with a new one reported by
+    /// the client.
+    pub fn set_workspace_tree(&mut self, tree: WorkspaceTreeNode) {
+        self.workspace_tree = Some(tree);
+    }
+
+    /// Store a per-window workspace tree reported by a client.
+    pub fn set_window_tree(&mut self, window_id: WindowId, tree: WorkspaceTreeNode) {
+        self.window_trees.insert(window_id, tree);
+    }
+
+    // ── Window tracking ──────────────────────────────────────────────
+
+    /// Assign a session to a window.
+    pub fn assign_session_to_window(&mut self, window_id: WindowId, session_id: SessionId) {
+        self.session_to_window.insert(session_id, window_id);
+        debug!(%session_id, %window_id, "assigned session to window");
+    }
+
+    /// Return all session IDs belonging to a window.
+    pub fn sessions_for_window(&self, window_id: WindowId) -> Vec<SessionId> {
+        self.session_to_window
+            .iter()
+            .filter(|&(_, &wid)| wid == window_id)
+            .map(|(&sid, _)| sid)
+            .collect()
+    }
+
+    /// Return the window that owns a session, if any.
+    pub fn window_for_session(&self, session_id: SessionId) -> Option<WindowId> {
+        self.session_to_window.get(&session_id).copied()
+    }
+
+    /// Return all window IDs that have at least one session.
+    pub fn window_ids_with_sessions(&self) -> HashSet<WindowId> {
+        self.session_to_window.values().copied().collect()
+    }
+
+    /// Remove a window and all its session→window mappings.
+    #[allow(dead_code, reason = "called when CloseWindow is implemented")]
+    pub fn remove_window(&mut self, window_id: WindowId) {
+        self.session_to_window.retain(|_, wid| *wid != window_id);
+        self.window_trees.remove(&window_id);
+        info!(%window_id, "removed window from registry");
+    }
+
+    /// Remove a session's window association (called when a session is closed).
+    pub fn remove_session_from_window(&mut self, session_id: SessionId) {
+        if let Some(window_id) = self.session_to_window.remove(&session_id) {
+            debug!(%session_id, %window_id, "removed session from window");
+        }
     }
 
     /// Extract the workspace name from a CWD path by matching against the
@@ -177,20 +308,45 @@ impl WorkspaceManager {
     }
 
     /// Serialise all workspaces for a hot-reload handoff.
-    pub fn serialize_for_handoff(&self) -> Vec<HandoffWorkspace> {
-        self.workspaces
+    pub fn serialize_for_handoff(
+        &self,
+    ) -> (Vec<HandoffWorkspace>, Option<WorkspaceTreeNode>, Vec<HandoffWindowState>) {
+        let flat = self
+            .workspaces
             .values()
             .map(|ws| HandoffWorkspace {
                 id: ws.id,
                 name: ws.name.clone(),
                 accent_color: ws.accent_color.clone(),
                 session_ids: ws.sessions.clone(),
+                split_direction: ws.split_direction,
             })
-            .collect()
+            .collect();
+
+        // Include all windows that have sessions OR trees (a window whose
+        // last session was closed still needs its tree preserved).
+        let mut all_window_ids = self.window_ids_with_sessions();
+        all_window_ids.extend(self.window_trees.keys());
+
+        let windows: Vec<HandoffWindowState> = all_window_ids
+            .into_iter()
+            .map(|wid| {
+                let session_ids = self.sessions_for_window(wid);
+                let tree = self.window_trees.get(&wid).cloned();
+                HandoffWindowState { window_id: wid, session_ids, workspace_tree: tree }
+            })
+            .collect();
+
+        (flat, self.workspace_tree.clone(), windows)
     }
 
     /// Reconstruct a `WorkspaceManager` from handoff state.
-    pub fn restore_from_handoff(roots: Vec<PathBuf>, workspaces: &[HandoffWorkspace]) -> Self {
+    pub fn restore_from_handoff(
+        roots: Vec<PathBuf>,
+        workspaces: &[HandoffWorkspace],
+        workspace_tree: Option<WorkspaceTreeNode>,
+        windows: &[HandoffWindowState],
+    ) -> Self {
         let mut ws_map = HashMap::new();
         let mut session_to_workspace = HashMap::new();
 
@@ -206,6 +362,7 @@ impl WorkspaceManager {
                     name: hw.name.clone(),
                     sessions: hw.session_ids.clone(),
                     accent_color: hw.accent_color.clone(),
+                    split_direction: hw.split_direction,
                 },
             );
 
@@ -217,7 +374,31 @@ impl WorkspaceManager {
             );
         }
 
-        Self { roots, workspaces: ws_map, session_to_workspace, color_index: workspaces.len() }
+        let mut session_to_window = HashMap::new();
+        let mut window_trees = HashMap::new();
+        for hw in windows {
+            for &session_id in &hw.session_ids {
+                session_to_window.insert(session_id, hw.window_id);
+            }
+            if let Some(tree) = &hw.workspace_tree {
+                window_trees.insert(hw.window_id, tree.clone());
+            }
+            info!(
+                window_id = %hw.window_id,
+                sessions = hw.session_ids.len(),
+                "restored window from handoff"
+            );
+        }
+
+        Self {
+            roots,
+            workspaces: ws_map,
+            session_to_workspace,
+            color_index: workspaces.len(),
+            workspace_tree,
+            window_trees,
+            session_to_window,
+        }
     }
 }
 
@@ -264,7 +445,7 @@ mod tests {
         let mut mgr = manager_with_roots(vec!["/work"]);
         let ws_id = mgr.create_workspace();
         let sess_id = SessionId::new();
-        mgr.add_session(ws_id, sess_id);
+        mgr.add_session(ws_id, sess_id, None);
 
         let msg = mgr.on_cwd_changed(sess_id, Path::new("/work/myapp/src"));
         assert!(matches!(
@@ -274,15 +455,31 @@ mod tests {
     }
 
     #[test]
-    fn workspace_name_is_sticky() {
+    fn workspace_name_updates_on_new_root() {
         let mut mgr = manager_with_roots(vec!["/work"]);
         let ws_id = mgr.create_workspace();
         let sess_id = SessionId::new();
-        mgr.add_session(ws_id, sess_id);
+        mgr.add_session(ws_id, sess_id, None);
 
         mgr.on_cwd_changed(sess_id, Path::new("/work/first/src"));
-        // Second CWD change should not rename.
+        // CWD change to a different project root should rename.
         let msg = mgr.on_cwd_changed(sess_id, Path::new("/work/second/src"));
+        assert!(matches!(
+            msg,
+            Some(ServerMessage::WorkspaceNamed { name, .. }) if name == "second"
+        ));
+    }
+
+    #[test]
+    fn workspace_name_stable_within_same_root() {
+        let mut mgr = manager_with_roots(vec!["/work"]);
+        let ws_id = mgr.create_workspace();
+        let sess_id = SessionId::new();
+        mgr.add_session(ws_id, sess_id, None);
+
+        mgr.on_cwd_changed(sess_id, Path::new("/work/myapp/src"));
+        // Deeper navigation within the same project should not re-send.
+        let msg = mgr.on_cwd_changed(sess_id, Path::new("/work/myapp/tests"));
         assert!(msg.is_none());
     }
 
@@ -300,9 +497,59 @@ mod tests {
         let mut mgr = manager_with_roots(vec![]);
         let ws_id = mgr.create_workspace();
         let sess_id = SessionId::new();
-        mgr.add_session(ws_id, sess_id);
+        mgr.add_session(ws_id, sess_id, None);
         assert_eq!(mgr.workspace_for_session(sess_id), Some(ws_id));
         mgr.remove_session(sess_id);
         assert_eq!(mgr.workspace_for_session(sess_id), None);
+    }
+
+    #[test]
+    fn workspace_tree_survives_handoff_roundtrip() {
+        let mut mgr = manager_with_roots(vec![]);
+        let ws_a = mgr.create_workspace();
+        let ws_b = mgr.create_workspace();
+        let sess_a = SessionId::new();
+        let sess_b = SessionId::new();
+        mgr.add_session(ws_a, sess_a, None);
+        mgr.add_session(ws_b, sess_b, Some(LayoutDirection::Horizontal));
+
+        // Simulate a client reporting a split tree.
+        let tree = WorkspaceTreeNode::Split {
+            direction: LayoutDirection::Vertical,
+            ratio: 0.4,
+            first: Box::new(WorkspaceTreeNode::Leaf { workspace_id: ws_a }),
+            second: Box::new(WorkspaceTreeNode::Leaf { workspace_id: ws_b }),
+        };
+        mgr.set_workspace_tree(tree);
+
+        // Serialize for handoff.
+        let (workspaces, tree_out, _) = mgr.serialize_for_handoff();
+        assert!(tree_out.is_some(), "tree should be present in handoff");
+
+        // Restore from handoff.
+        let restored = WorkspaceManager::restore_from_handoff(vec![], &workspaces, tree_out, &[]);
+
+        // Verify sessions survived.
+        assert_eq!(restored.workspace_for_session(sess_a), Some(ws_a));
+        assert_eq!(restored.workspace_for_session(sess_b), Some(ws_b));
+
+        // Verify the tree survived.
+        let restored_tree = restored.workspace_tree().expect("tree should survive handoff");
+        match restored_tree {
+            WorkspaceTreeNode::Split { direction, ratio, .. } => {
+                assert_eq!(*direction, LayoutDirection::Vertical);
+                assert!((*ratio - 0.4).abs() < f32::EPSILON);
+            }
+            WorkspaceTreeNode::Leaf { .. } => panic!("expected Split, got Leaf"),
+        }
+    }
+
+    #[test]
+    fn workspace_tree_none_when_not_set() {
+        let mgr = manager_with_roots(vec![]);
+        assert!(mgr.workspace_tree().is_none());
+
+        let (_, tree, _) = mgr.serialize_for_handoff();
+        assert!(tree.is_none());
     }
 }

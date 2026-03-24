@@ -174,6 +174,13 @@ enum Command {
         /// Expected cursor column (0-indexed).
         col: u16,
     },
+    /// Assert that the current screen matches a reference snapshot (JSON file).
+    AssertSnapshotMatch {
+        /// Target session ID.
+        session_id: String,
+        /// Path to a reference snapshot JSON file (from `snapshot` command).
+        reference: PathBuf,
+    },
     /// Assert that a session exits with a specific exit code.
     AssertExit {
         /// Target session ID.
@@ -192,6 +199,8 @@ enum ServerAction {
     Start,
     /// Stop the scribe-server process.
     Stop,
+    /// Trigger a hot-reload upgrade (launch new server with --upgrade).
+    Upgrade,
 }
 
 #[derive(Subcommand)]
@@ -245,6 +254,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
                 ServerAction::Stop => {
                     rt.block_on(server::stop()).map_err(|e| TestError::InfraError(e.to_string()))
                 }
+                ServerAction::Upgrade => {
+                    rt.block_on(server::upgrade()).map_err(|e| TestError::InfraError(e.to_string()))
+                }
             }
         }
         Command::Daemon { action } => {
@@ -285,6 +297,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::AssertCursor { session_id, row, col } => {
             assert::assert_cursor(&session_id, row, col)
+        }
+        Command::AssertSnapshotMatch { session_id, reference } => {
+            assert::assert_snapshot_match(&session_id, &reference)
         }
         Command::AssertExit { session_id, code, timeout } => {
             assert::assert_exit(&session_id, code, timeout)

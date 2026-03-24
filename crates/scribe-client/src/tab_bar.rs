@@ -14,16 +14,16 @@ use crate::layout::Rect;
 #[allow(dead_code, reason = "exported constant for pane content area calculation")]
 pub const TAB_BAR_HEIGHT: f32 = 32.0;
 
+/// Height of the AI state indicator bar underneath each tab label.
+const INDICATOR_BAR_HEIGHT: f32 = 2.0;
+
 /// Colors for the tab bar, derived from the theme's [`ChromeColors`].
 pub struct TabBarColors {
     pub bg: [f32; 4],
-    #[allow(dead_code, reason = "used by build_tab_bar_text for active tab background")]
     pub active_bg: [f32; 4],
-    #[allow(dead_code, reason = "used by build_tab_bar_text for inactive tab text")]
     pub text: [f32; 4],
-    #[allow(dead_code, reason = "used by build_tab_bar_text for active tab text")]
     pub active_text: [f32; 4],
-    #[allow(dead_code, reason = "used by future bottom border rendering")]
+    #[allow(dead_code, reason = "reserved for future bottom border rendering")]
     pub border: [f32; 4],
 }
 
@@ -37,6 +37,16 @@ impl From<&ChromeColors> for TabBarColors {
             border: srgb_to_linear_rgba(chrome.divider),
         }
     }
+}
+
+/// Per-tab data for rendering.
+pub struct TabData {
+    /// Tab title (e.g. shell name, process title).
+    pub title: String,
+    /// Whether this tab is the active/focused tab in its workspace.
+    pub is_active: bool,
+    /// AI state indicator colour. `None` when no active AI state.
+    pub ai_indicator: Option<[f32; 4]>,
 }
 
 /// Build cell instances for a pane's tab bar background.
@@ -69,6 +79,7 @@ pub fn build_tab_bar_bg(
         let x = rect.x + col_idx as f32 * cell_w;
         out.push(CellInstance {
             pos: [x, rect.y],
+            size: [0.0, 0.0],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
             fg_color: bg,
@@ -77,25 +88,37 @@ pub fn build_tab_bar_bg(
     }
 }
 
+/// Pre-collected workspace-level data for tab bar text rendering.
+///
+/// Gathered at the call site (where workspace metadata is accessible) and
+/// passed into `build_all_instances` to avoid borrow conflicts.
+pub struct WorkspaceTabBarData {
+    /// Full workspace rect (the tab bar spans its entire width).
+    pub ws_rect: Rect,
+    /// Tab data for each tab in the workspace.
+    pub tabs: Vec<TabData>,
+    /// Workspace badge: `(workspace_name, accent_color)`. `None` when single workspace.
+    pub badge: Option<(String, [f32; 4])>,
+}
+
 /// Parameters for building tab bar text instances.
-#[allow(dead_code, reason = "public API for tab bar text rendering, used by workspace layout")]
 pub struct TabBarTextParams<'a> {
     pub rect: Rect,
     pub cell_size: (f32, f32),
-    /// Tab labels as `(title, is_active)` pairs.
-    pub tabs: &'a [(String, bool)],
+    /// Tab data for each tab in the workspace.
+    pub tabs: &'a [TabData],
     /// Workspace badge: `(workspace_name, accent_color)`. `None` when single workspace.
     pub badge: Option<(&'a str, [f32; 4])>,
     /// Whether to render the gear icon on the far right.
     pub show_gear: bool,
     pub colors: &'a TabBarColors,
     /// Closure that resolves a character to atlas UV coordinates.
-    /// Returns `(uv_min, uv_max)`.
-    pub resolve_glyph: &'a dyn Fn(char) -> ([f32; 2], [f32; 2]),
+    /// Returns `(uv_min, uv_max)`. `FnMut` because atlas rasterization
+    /// may occur for uncached glyphs.
+    pub resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
 }
 
 /// Clickable regions produced by [`build_tab_bar_text`].
-#[allow(dead_code, reason = "public API for tab bar click handling, used by workspace layout")]
 pub struct TabBarHitTargets {
     /// `(tab_index, clickable_rect)` for each rendered tab.
     pub tab_rects: Vec<(usize, Rect)>,
@@ -106,8 +129,9 @@ pub struct TabBarHitTargets {
 /// Build cell instances for the tab bar text overlay.
 ///
 /// Returns the rendered instances and hit-test targets for click handling.
-#[allow(dead_code, reason = "public API for tab bar text rendering, used by workspace layout")]
-pub fn build_tab_bar_text(params: &TabBarTextParams<'_>) -> (Vec<CellInstance>, TabBarHitTargets) {
+pub fn build_tab_bar_text(
+    params: &mut TabBarTextParams<'_>,
+) -> (Vec<CellInstance>, TabBarHitTargets) {
     let (cell_w, _cell_h) = params.cell_size;
     if cell_w <= 0.0 {
         return (Vec::new(), TabBarHitTargets { tab_rects: Vec::new(), gear_rect: None });
@@ -128,7 +152,7 @@ pub fn build_tab_bar_text(params: &TabBarTextParams<'_>) -> (Vec<CellInstance>, 
             render_badge(&mut instances, col, content_cols, cell_w, params, ws_name, accent_color);
     }
 
-    // Render tab labels.
+    // Render tab labels (and indicator bars for tabs with active AI state).
     col = render_tabs(&mut instances, &mut hit_targets, col, content_cols, cell_w, params);
 
     // Render gear icon on the far right if requested.
@@ -140,7 +164,6 @@ pub fn build_tab_bar_text(params: &TabBarTextParams<'_>) -> (Vec<CellInstance>, 
 }
 
 /// Render the workspace badge: colored dot + space + name + 16px gap.
-#[allow(dead_code, reason = "called by build_tab_bar_text")]
 #[allow(
     clippy::too_many_arguments,
     reason = "helper function that needs all render context from build_tab_bar_text"
@@ -150,7 +173,7 @@ fn render_badge(
     mut col: usize,
     max_cols: usize,
     cell_w: f32,
-    params: &TabBarTextParams<'_>,
+    params: &mut TabBarTextParams<'_>,
     ws_name: &str,
     accent_color: [f32; 4],
 ) -> usize {
@@ -176,8 +199,8 @@ fn render_badge(
     col
 }
 
-/// Render tab labels with hit targets for click handling.
-#[allow(dead_code, reason = "called by build_tab_bar_text")]
+/// Render tab labels with hit targets for click handling, plus AI indicator
+/// bars underneath tabs that have an active AI state.
 #[allow(
     clippy::too_many_arguments,
     reason = "helper function that needs all render context from build_tab_bar_text"
@@ -188,46 +211,92 @@ fn render_tabs(
     mut col: usize,
     max_cols: usize,
     cell_w: f32,
-    params: &TabBarTextParams<'_>,
+    params: &mut TabBarTextParams<'_>,
 ) -> usize {
     let bg = params.colors.bg;
 
-    for (tab_idx, (title, is_active)) in params.tabs.iter().enumerate() {
-        let fg = if *is_active { params.colors.active_text } else { params.colors.text };
-        let tab_bg = if *is_active { params.colors.active_bg } else { bg };
+    for (tab_idx, tab) in params.tabs.iter().enumerate() {
+        let fg = if tab.is_active { params.colors.active_text } else { params.colors.text };
+        let tab_bg = if tab.is_active { params.colors.active_bg } else { bg };
         let tab_start_col = col;
 
         col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
-        for ch in title.chars() {
+        for ch in tab.title.chars() {
             col = emit_char(instances, ch, col, max_cols, params, fg, tab_bg);
         }
         col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
+
+        let tab_width_cols = col - tab_start_col;
 
         #[allow(
             clippy::cast_precision_loss,
             reason = "column indices are small positive integers fitting in f32"
         )]
-        {
-            let tab_x = params.rect.x + tab_start_col as f32 * cell_w;
-            let tab_width = (col - tab_start_col) as f32 * cell_w;
-            hit_targets.tab_rects.push((
-                tab_idx,
-                Rect { x: tab_x, y: params.rect.y, width: tab_width, height: TAB_BAR_HEIGHT },
-            ));
+        let tab_x = params.rect.x + tab_start_col as f32 * cell_w;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "column indices are small positive integers fitting in f32"
+        )]
+        let tab_width = tab_width_cols as f32 * cell_w;
+
+        hit_targets.tab_rects.push((
+            tab_idx,
+            Rect { x: tab_x, y: params.rect.y, width: tab_width, height: TAB_BAR_HEIGHT },
+        ));
+
+        // Render AI indicator bar underneath this tab if active.
+        if let Some(indicator_color) = tab.ai_indicator {
+            render_indicator_bar(
+                instances,
+                params.rect.y,
+                indicator_color,
+                tab_x,
+                tab_width_cols,
+                cell_w,
+            );
         }
     }
 
     col
 }
 
+/// Render a thin coloured indicator bar under a tab.
+#[allow(clippy::too_many_arguments, reason = "render helper needs tab geometry and colour context")]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "column indices are small positive integers fitting in f32"
+)]
+fn render_indicator_bar(
+    instances: &mut Vec<CellInstance>,
+    rect_y: f32,
+    color: [f32; 4],
+    tab_x: f32,
+    tab_width_cols: usize,
+    cell_w: f32,
+) {
+    let bar_y = rect_y + TAB_BAR_HEIGHT - INDICATOR_BAR_HEIGHT;
+
+    // Solid colour bar spanning the full tab width.
+    for bar_col in 0..tab_width_cols {
+        let bx = tab_x + bar_col as f32 * cell_w;
+        instances.push(CellInstance {
+            pos: [bx, bar_y],
+            size: [0.0, 0.0],
+            uv_min: [0.0, 0.0],
+            uv_max: [0.0, 0.0],
+            fg_color: color,
+            bg_color: color,
+        });
+    }
+}
+
 /// Render the gear icon on the far right of the tab bar.
-#[allow(dead_code, reason = "called by build_tab_bar_text")]
 fn render_gear(
     instances: &mut Vec<CellInstance>,
     hit_targets: &mut TabBarHitTargets,
     mut col: usize,
     max_cols: usize,
-    params: &TabBarTextParams<'_>,
+    params: &mut TabBarTextParams<'_>,
 ) {
     if max_cols < 2 {
         return;
@@ -261,7 +330,6 @@ fn render_gear(
 
 /// Emit a single character instance at the given column, returning the next
 /// column index.
-#[allow(dead_code, reason = "called by build_tab_bar_text helpers")]
 #[allow(
     clippy::too_many_arguments,
     reason = "helper function that needs all render context parameters"
@@ -275,7 +343,7 @@ fn emit_char(
     ch: char,
     col: usize,
     max_cols: usize,
-    params: &TabBarTextParams<'_>,
+    params: &mut TabBarTextParams<'_>,
     fg: [f32; 4],
     bg: [f32; 4],
 ) -> usize {
@@ -289,6 +357,7 @@ fn emit_char(
 
     instances.push(CellInstance {
         pos: [x, params.rect.y],
+        size: [0.0, 0.0],
         uv_min,
         uv_max,
         fg_color: fg,
@@ -309,7 +378,6 @@ fn columns_in_width(width: f32, cell_w: f32) -> usize {
 }
 
 /// Calculate how many columns a pixel gap requires.
-#[allow(dead_code, reason = "called by render_badge for badge gap spacing")]
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,

@@ -272,6 +272,7 @@ fn build_single_divider(
 fn solid_quad(x: f32, y: f32, _w: f32, _h: f32, color: [f32; 4]) -> CellInstance {
     CellInstance {
         pos: [x, y],
+        size: [0.0, 0.0],
         uv_min: [0.0, 0.0],
         uv_max: [0.0, 0.0],
         fg_color: color,

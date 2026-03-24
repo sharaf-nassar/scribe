@@ -7,10 +7,14 @@ RUN apt-get update && \
         xvfb \
         mesa-utils \
         libgl1-mesa-dri \
-        scrot \
-        xdotool \
+        libegl1 \
+        libgles2 \
+        libgbm1 \
         libvulkan1 \
-        libegl-mesa0 \
+        scrot \
+        imagemagick \
+        xdotool \
+        libwebkit2gtk-4.1-0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY target/release/scribe-server /usr/local/bin/scribe-server

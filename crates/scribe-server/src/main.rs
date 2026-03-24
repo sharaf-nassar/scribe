@@ -14,6 +14,9 @@ mod ipc_server;
 mod session_manager;
 mod workspace_manager;
 
+#[cfg(test)]
+mod handoff_tests;
+
 /// Entry point. Calls `setup_env()` before spawning the tokio runtime so that
 /// `env::set_var("TERM", …)` runs while the process is still single-threaded.
 /// `env::set_var` is unsound in multi-threaded contexts (Rust 1.81+).
@@ -89,6 +92,8 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
         Arc::new(RwLock::new(workspace_manager::WorkspaceManager::restore_from_handoff(
             cfg.workspace_roots,
             &state.workspaces,
+            state.workspace_tree,
+            &state.windows,
         )));
 
     info!("session restoration complete — starting IPC server");
@@ -105,13 +110,30 @@ async fn run_server_loop(
     workspace_manager: Arc<RwLock<workspace_manager::WorkspaceManager>>,
 ) -> Result<(), ScribeError> {
     let path = server_socket_path();
+    let live_sessions = ipc_server::new_live_session_registry();
+    let connected_clients = ipc_server::new_connected_clients();
+
+    // Activate sessions restored from a hot-reload handoff. Moves them from
+    // SessionManager into the live registry and starts their PTY reader tasks
+    // in detached mode. No-op for normal (non-upgrade) startup.
+    ipc_server::activate_pending_sessions(&session_manager, &workspace_manager, &live_sessions)
+        .await;
 
     let handoff_triggered = tokio::select! {
-        result = ipc_server::start_ipc_server(&path, Arc::clone(&session_manager), Arc::clone(&workspace_manager)) => {
+        result = ipc_server::start_ipc_server(
+            &path,
+            Arc::clone(&session_manager),
+            Arc::clone(&workspace_manager),
+            Arc::clone(&live_sessions),
+            Arc::clone(&connected_clients),
+        ) => {
             result?;
             false
         }
-        result = handoff::run_handoff_listener(Arc::clone(&session_manager), Arc::clone(&workspace_manager)) => {
+        result = handoff::run_handoff_listener(
+            Arc::clone(&workspace_manager),
+            Arc::clone(&live_sessions),
+        ) => {
             match result {
                 Ok(()) => {
                     info!("handoff complete — shutting down old server");
@@ -129,10 +151,15 @@ async fn run_server_loop(
         }
     };
 
-    // Only clean up the IPC socket if we're NOT handing off. During a handoff
-    // the new server has already bound to the same socket path — removing it
-    // would make the new server unreachable for new client connections.
-    if !handoff_triggered {
+    if handoff_triggered {
+        // Defuse Pty objects so the old server's exit doesn't send SIGHUP to
+        // child processes. alacritty_terminal::Pty::drop() explicitly calls
+        // kill(child_pid, SIGHUP) — the new server already has the master fds.
+        ipc_server::defuse_for_handoff(&live_sessions).await;
+    } else {
+        // Only clean up the IPC socket if we're NOT handing off. During a
+        // handoff the new server has already bound to the same socket path —
+        // removing it would make the new server unreachable.
         cleanup_socket(&path);
     }
 

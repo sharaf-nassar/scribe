@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::str::FromStr as _;
 
 use scribe_common::ids::SessionId;
@@ -28,6 +29,30 @@ pub fn assert_cursor(session_id: &str, row: u16, col: u16) -> Result<(), TestErr
         .map_err(|e| TestError::InfraError(format!("invalid session id: {e}")))?;
 
     let request = DaemonRequest::AssertCursor { session_id: id, row, col };
+
+    let response = send_request(&request).map_err(|e| TestError::InfraError(e.to_string()))?;
+
+    match response {
+        DaemonResponse::Ok => Ok(()),
+        DaemonResponse::AssertFailed { message } => Err(TestError::TestFailure(message)),
+        DaemonResponse::Error { message } => Err(TestError::InfraError(message)),
+        other => Err(TestError::InfraError(format!("unexpected response: {other:?}"))),
+    }
+}
+
+/// Assert that the current screen matches a reference snapshot file.
+pub fn assert_snapshot_match(session_id: &str, reference_path: &Path) -> Result<(), TestError> {
+    let id = SessionId::from_str(session_id)
+        .map_err(|e| TestError::InfraError(format!("invalid session id: {e}")))?;
+
+    let json = std::fs::read_to_string(reference_path)
+        .map_err(|e| TestError::InfraError(format!("failed to read reference snapshot: {e}")))?;
+
+    let reference: scribe_common::screen::ScreenSnapshot = serde_json::from_str(&json)
+        .map_err(|e| TestError::InfraError(format!("failed to parse reference snapshot: {e}")))?;
+
+    let request =
+        DaemonRequest::AssertSnapshotMatch { session_id: id, reference: Box::new(reference) };
 
     let response = send_request(&request).map_err(|e| TestError::InfraError(e.to_string()))?;
 

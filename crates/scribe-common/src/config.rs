@@ -38,7 +38,7 @@ pub struct AppearanceConfig {
     pub font_weight: u16,
     #[serde(default = "default_font_weight_bold")]
     pub font_weight_bold: u16,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub ligatures: bool,
     #[serde(default)]
     pub line_padding: u16,
@@ -59,7 +59,7 @@ impl Default for AppearanceConfig {
             font_size: default_font_size(),
             font_weight: default_font_weight(),
             font_weight_bold: default_font_weight_bold(),
-            ligatures: false,
+            ligatures: true,
             line_padding: 0,
             cursor_shape: CursorShape::default(),
             cursor_blink: true,
@@ -135,14 +135,29 @@ pub struct ThemeConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "terminal config has independent boolean feature flags, not a state machine"
+)]
 pub struct TerminalConfig {
     #[serde(default = "default_scrollback_lines")]
     pub scrollback_lines: u32,
+    #[serde(default = "default_true")]
+    pub copy_on_select: bool,
+    #[serde(default = "default_true")]
+    pub claude_copy_cleanup: bool,
+    #[serde(default = "default_true")]
+    pub claude_code_integration: bool,
 }
 
 impl Default for TerminalConfig {
     fn default() -> Self {
-        Self { scrollback_lines: default_scrollback_lines() }
+        Self {
+            scrollback_lines: default_scrollback_lines(),
+            copy_on_select: true,
+            claude_copy_cleanup: true,
+            claude_code_integration: true,
+        }
     }
 }
 
@@ -155,7 +170,12 @@ fn default_scrollback_lines() -> u32 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "keybinding config is a flat struct of string fields, not booleans"
+)]
 pub struct KeybindingsConfig {
+    // Panes
     #[serde(default = "default_split_vertical")]
     pub split_vertical: String,
     #[serde(default = "default_split_horizontal")]
@@ -164,6 +184,82 @@ pub struct KeybindingsConfig {
     pub close_pane: String,
     #[serde(default = "default_cycle_pane")]
     pub cycle_pane: String,
+    #[serde(default = "default_focus_left")]
+    pub focus_left: String,
+    #[serde(default = "default_focus_right")]
+    pub focus_right: String,
+    #[serde(default = "default_focus_up")]
+    pub focus_up: String,
+    #[serde(default = "default_focus_down")]
+    pub focus_down: String,
+
+    // Workspaces
+    #[serde(default = "default_workspace_split_vertical")]
+    pub workspace_split_vertical: String,
+    #[serde(default = "default_workspace_split_horizontal")]
+    pub workspace_split_horizontal: String,
+    #[serde(default = "default_cycle_workspace")]
+    pub cycle_workspace: String,
+
+    // Tabs
+    #[serde(default = "default_new_tab")]
+    pub new_tab: String,
+    #[serde(default = "default_close_tab")]
+    pub close_tab: String,
+    #[serde(default = "default_next_tab")]
+    pub next_tab: String,
+    #[serde(default = "default_prev_tab")]
+    pub prev_tab: String,
+    #[serde(default = "default_select_tab_1")]
+    pub select_tab_1: String,
+    #[serde(default = "default_select_tab_2")]
+    pub select_tab_2: String,
+    #[serde(default = "default_select_tab_3")]
+    pub select_tab_3: String,
+    #[serde(default = "default_select_tab_4")]
+    pub select_tab_4: String,
+    #[serde(default = "default_select_tab_5")]
+    pub select_tab_5: String,
+    #[serde(default = "default_select_tab_6")]
+    pub select_tab_6: String,
+    #[serde(default = "default_select_tab_7")]
+    pub select_tab_7: String,
+    #[serde(default = "default_select_tab_8")]
+    pub select_tab_8: String,
+    #[serde(default = "default_select_tab_9")]
+    pub select_tab_9: String,
+
+    // Clipboard
+    #[serde(default = "default_copy")]
+    pub copy: String,
+    #[serde(default = "default_paste")]
+    pub paste: String,
+
+    // Navigation
+    #[serde(default = "default_scroll_up")]
+    pub scroll_up: String,
+    #[serde(default = "default_scroll_down")]
+    pub scroll_down: String,
+    #[serde(default = "default_scroll_top")]
+    pub scroll_top: String,
+    #[serde(default = "default_scroll_bottom")]
+    pub scroll_bottom: String,
+    #[serde(default = "default_find")]
+    pub find: String,
+
+    // View
+    #[serde(default = "default_zoom_in")]
+    pub zoom_in: String,
+    #[serde(default = "default_zoom_out")]
+    pub zoom_out: String,
+    #[serde(default = "default_zoom_reset")]
+    pub zoom_reset: String,
+
+    // Window
+    #[serde(default = "default_new_window")]
+    pub new_window: String,
+
+    // General
     #[serde(default = "default_settings")]
     pub settings: String,
 }
@@ -175,6 +271,37 @@ impl Default for KeybindingsConfig {
             split_horizontal: default_split_horizontal(),
             close_pane: default_close_pane(),
             cycle_pane: default_cycle_pane(),
+            focus_left: default_focus_left(),
+            focus_right: default_focus_right(),
+            focus_up: default_focus_up(),
+            focus_down: default_focus_down(),
+            workspace_split_vertical: default_workspace_split_vertical(),
+            workspace_split_horizontal: default_workspace_split_horizontal(),
+            cycle_workspace: default_cycle_workspace(),
+            new_tab: default_new_tab(),
+            close_tab: default_close_tab(),
+            next_tab: default_next_tab(),
+            prev_tab: default_prev_tab(),
+            select_tab_1: default_select_tab_1(),
+            select_tab_2: default_select_tab_2(),
+            select_tab_3: default_select_tab_3(),
+            select_tab_4: default_select_tab_4(),
+            select_tab_5: default_select_tab_5(),
+            select_tab_6: default_select_tab_6(),
+            select_tab_7: default_select_tab_7(),
+            select_tab_8: default_select_tab_8(),
+            select_tab_9: default_select_tab_9(),
+            copy: default_copy(),
+            paste: default_paste(),
+            scroll_up: default_scroll_up(),
+            scroll_down: default_scroll_down(),
+            scroll_top: default_scroll_top(),
+            scroll_bottom: default_scroll_bottom(),
+            find: default_find(),
+            zoom_in: default_zoom_in(),
+            zoom_out: default_zoom_out(),
+            zoom_reset: default_zoom_reset(),
+            new_window: default_new_window(),
             settings: default_settings(),
         }
     }
@@ -194,6 +321,130 @@ fn default_close_pane() -> String {
 
 fn default_cycle_pane() -> String {
     String::from("ctrl+tab")
+}
+
+fn default_focus_left() -> String {
+    String::from("alt+left")
+}
+
+fn default_focus_right() -> String {
+    String::from("alt+right")
+}
+
+fn default_focus_up() -> String {
+    String::from("alt+up")
+}
+
+fn default_focus_down() -> String {
+    String::from("alt+down")
+}
+
+fn default_workspace_split_vertical() -> String {
+    String::from("ctrl+alt+\\")
+}
+
+fn default_workspace_split_horizontal() -> String {
+    String::from("ctrl+alt+-")
+}
+
+fn default_cycle_workspace() -> String {
+    String::from("ctrl+alt+tab")
+}
+
+fn default_new_tab() -> String {
+    String::from("ctrl+shift+t")
+}
+
+fn default_close_tab() -> String {
+    String::from("ctrl+shift+q")
+}
+
+fn default_next_tab() -> String {
+    String::from("ctrl+pagedown")
+}
+
+fn default_prev_tab() -> String {
+    String::from("ctrl+pageup")
+}
+
+fn default_select_tab_1() -> String {
+    String::from("ctrl+1")
+}
+
+fn default_select_tab_2() -> String {
+    String::from("ctrl+2")
+}
+
+fn default_select_tab_3() -> String {
+    String::from("ctrl+3")
+}
+
+fn default_select_tab_4() -> String {
+    String::from("ctrl+4")
+}
+
+fn default_select_tab_5() -> String {
+    String::from("ctrl+5")
+}
+
+fn default_select_tab_6() -> String {
+    String::from("ctrl+6")
+}
+
+fn default_select_tab_7() -> String {
+    String::from("ctrl+7")
+}
+
+fn default_select_tab_8() -> String {
+    String::from("ctrl+8")
+}
+
+fn default_select_tab_9() -> String {
+    String::from("ctrl+9")
+}
+
+fn default_copy() -> String {
+    String::from("ctrl+shift+c")
+}
+
+fn default_paste() -> String {
+    String::from("ctrl+shift+v")
+}
+
+fn default_scroll_up() -> String {
+    String::from("shift+pageup")
+}
+
+fn default_scroll_down() -> String {
+    String::from("shift+pagedown")
+}
+
+fn default_scroll_top() -> String {
+    String::from("shift+home")
+}
+
+fn default_scroll_bottom() -> String {
+    String::from("shift+end")
+}
+
+fn default_find() -> String {
+    String::from("ctrl+shift+f")
+}
+
+fn default_zoom_in() -> String {
+    String::from("ctrl+=")
+}
+
+fn default_zoom_out() -> String {
+    String::from("ctrl+-")
+}
+
+fn default_zoom_reset() -> String {
+    String::from("ctrl+0")
+}
+
+fn default_new_window() -> String {
+    String::from("ctrl+shift+n")
 }
 
 fn default_settings() -> String {

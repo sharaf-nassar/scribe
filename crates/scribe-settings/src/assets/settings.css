@@ -194,6 +194,35 @@ body {
 
 /* ───────── Select / Dropdown ───────── */
 
+.font-select-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.refresh-btn {
+  background: #27272a;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  color: #a1a1aa;
+  font-size: 16px;
+  width: 32px;
+  height: 32px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s, background 0.15s;
+  flex-shrink: 0;
+  padding: 0;
+  line-height: 1;
+}
+
+.refresh-btn:hover {
+  color: #e4e4e7;
+  background: #3f3f46;
+}
+
 .select-wrapper {
   position: relative;
 }
@@ -575,6 +604,40 @@ input[type="range"]::-webkit-slider-thumb {
   border-color: rgba(37, 99, 235, 0.5);
 }
 
+/* ───────── Keybinding Search ───────── */
+
+.kb-search-row {
+  margin-bottom: 20px;
+}
+
+.kb-search-input {
+  width: 100%;
+  background: #1c1c1f;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  padding: 10px 14px;
+  color: #e4e4e7;
+  font-size: 13px;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.kb-search-input::placeholder {
+  color: #3f3f46;
+}
+
+.kb-search-input:focus {
+  border-color: rgba(59, 130, 246, 0.4);
+}
+
+.kb-highlight {
+  background: rgba(234, 179, 8, 0.25);
+  color: #fbbf24;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
 /* ───────── Keybinding Row ───────── */
 
 .keybinding-key {
@@ -602,6 +665,56 @@ input[type="range"]::-webkit-slider-thumb {
   border-color: #2563eb;
   background: rgba(37, 99, 235, 0.1);
   color: #60a5fa;
+  animation: pulse-recording 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-recording {
+  0%, 100% { border-color: #2563eb; }
+  50% { border-color: #60a5fa; }
+}
+
+/* ───────── Keybinding Cell (badge + reset) ───────── */
+
+.keybinding-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.kb-reset-btn {
+  background: none;
+  border: none;
+  color: #3f3f46;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: color 0.15s;
+  line-height: 1;
+  visibility: hidden;
+}
+
+.setting-row:hover .kb-reset-btn {
+  visibility: visible;
+}
+
+.kb-reset-btn:hover {
+  color: #60a5fa;
+}
+
+/* ───────── Keybinding Conflict Banner ───────── */
+
+.kb-conflict-banner {
+  background: rgba(234, 179, 8, 0.08);
+  border: 1px solid rgba(234, 179, 8, 0.3);
+  border-radius: 6px;
+  color: #fbbf24;
+  font-size: 12px;
+  padding: 8px 14px;
+  margin-bottom: 16px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
 }
 
 /* ───────── Workspace Roots List ───────── */

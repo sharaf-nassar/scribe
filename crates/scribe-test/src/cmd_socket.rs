@@ -16,18 +16,64 @@ use tokio::net::UnixStream;
 #[serde(tag = "type")]
 pub enum DaemonRequest {
     CreateSession,
-    AttachSession { session_id: SessionId },
-    CloseSession { session_id: SessionId },
-    Send { session_id: SessionId, data: Vec<u8> },
-    Resize { session_id: SessionId, cols: u16, rows: u16 },
-    RequestScreenshot { session_id: SessionId },
-    RequestSnapshot { session_id: SessionId },
-    WaitOutput { session_id: SessionId, pattern: String, timeout_ms: u64 },
-    WaitCwd { session_id: SessionId, path: String, timeout_ms: u64 },
-    WaitIdle { session_id: SessionId, quiet_ms: u64, timeout_ms: u64 },
-    AssertCell { session_id: SessionId, row: u16, col: u16, expected: char },
-    AssertCursor { session_id: SessionId, row: u16, col: u16 },
-    AssertExit { session_id: SessionId, expected_code: i32, timeout_ms: u64 },
+    AttachSession {
+        session_id: SessionId,
+    },
+    CloseSession {
+        session_id: SessionId,
+    },
+    Send {
+        session_id: SessionId,
+        data: Vec<u8>,
+    },
+    Resize {
+        session_id: SessionId,
+        cols: u16,
+        rows: u16,
+    },
+    RequestScreenshot {
+        session_id: SessionId,
+    },
+    RequestSnapshot {
+        session_id: SessionId,
+    },
+    WaitOutput {
+        session_id: SessionId,
+        pattern: String,
+        timeout_ms: u64,
+    },
+    WaitCwd {
+        session_id: SessionId,
+        path: String,
+        timeout_ms: u64,
+    },
+    WaitIdle {
+        session_id: SessionId,
+        quiet_ms: u64,
+        timeout_ms: u64,
+    },
+    AssertCell {
+        session_id: SessionId,
+        row: u16,
+        col: u16,
+        expected: char,
+    },
+    AssertCursor {
+        session_id: SessionId,
+        row: u16,
+        col: u16,
+    },
+    AssertExit {
+        session_id: SessionId,
+        expected_code: i32,
+        timeout_ms: u64,
+    },
+    /// Compare the current screen against a reference snapshot (cell content,
+    /// cursor position, cursor visibility).
+    AssertSnapshotMatch {
+        session_id: SessionId,
+        reference: Box<ScreenSnapshot>,
+    },
     Shutdown,
 }
 

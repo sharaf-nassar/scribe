@@ -19,24 +19,51 @@ extended-description = """GPU-accelerated terminal emulator with a PTY server ar
 path-aware workspaces, and first-class AI process awareness. \
 Supports zero-downtime server upgrades via fd handoff."""
 assets = [
-    ["target/release/scribe-server", "usr/bin/", "755"],
-    ["target/release/scribe-client", "usr/bin/", "755"],
-    ["../../dist/scribe-server.service", "usr/lib/systemd/user/", "644"],
-    ["../../dist/scribe.desktop", "usr/share/applications/", "644"],
-    ["../../dist/scribe-icon-48.png", "usr/share/icons/hicolor/48x48/apps/scribe.png", "644"],
-    ["../../dist/scribe-icon-128.png", "usr/share/icons/hicolor/128x128/apps/scribe.png", "644"],
-    ["../../dist/scribe-icon-256.png", "usr/share/icons/hicolor/256x256/apps/scribe.png", "644"],
-    ["../../dist/scribe-icon-512.png", "usr/share/icons/hicolor/512x512/apps/scribe.png", "644"],
+  [
+    "target/release/scribe-server",
+    "usr/bin/",
+    "755",
+  ],
+  [
+    "target/release/scribe-client",
+    "usr/bin/",
+    "755",
+  ],
+  [
+    "../../dist/scribe-server.service",
+    "usr/lib/systemd/user/",
+    "644",
+  ],
+  [
+    "../../dist/scribe.desktop",
+    "usr/share/applications/",
+    "644",
+  ],
+  [
+    "../../dist/scribe-icon-48.png",
+    "usr/share/icons/hicolor/48x48/apps/scribe.png",
+    "644",
+  ],
+  [
+    "../../dist/scribe-icon-128.png",
+    "usr/share/icons/hicolor/128x128/apps/scribe.png",
+    "644",
+  ],
+  [
+    "../../dist/scribe-icon-256.png",
+    "usr/share/icons/hicolor/256x256/apps/scribe.png",
+    "644",
+  ],
+  [
+    "../../dist/scribe-icon-512.png",
+    "usr/share/icons/hicolor/512x512/apps/scribe.png",
+    "644",
+  ],
 ]
 maintainer-scripts = "../../dist/debian/"
 
 [package.metadata.cargo-machete]
-ignored = [
-  "rmp-serde",
-  "serde",
-  "thiserror",
-  "uuid",
-]
+ignored = ["rmp-serde", "serde", "thiserror", "uuid"]
 
 [dependencies]
 scribe-common.workspace = true
@@ -53,3 +80,9 @@ tracing-subscriber.workspace = true
 vte.workspace = true
 libc.workspace = true
 nix.workspace = true
+
+[dev-dependencies]
+# test-util: provides #[tokio::test] macro for async tests.
+tokio = { workspace = true, features = ["test-util"] }
+# nix::pty::openpty() is available via the existing "term" feature — no extra
+# dev-dependency needed for nix.

@@ -28,13 +28,18 @@ use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::screen::ScreenSnapshot;
 use scribe_common::socket::current_uid;
 
-use crate::session_manager::SessionManager;
+pub use crate::workspace_manager::HandoffWindowState;
+
+use crate::ipc_server::LiveSessionRegistry;
 use crate::workspace_manager::WorkspaceManager;
 
 // ── Wire types ──────────────────────────────────────────────────────
 
 /// Current handoff protocol version. Bump when the serialised format changes.
-const HANDOFF_VERSION: u32 = 1;
+///
+/// A version mismatch causes the new server to abort the handoff and perform
+/// a full restart instead, so all live sessions are terminated.
+const HANDOFF_VERSION: u32 = 2;
 
 /// Magic bytes the receiver sends to request an upgrade.
 const UPGRADE_REQUEST: &[u8] = b"SCRIBE_UPGRADE";
@@ -55,6 +60,13 @@ pub struct HandoffState {
     pub version: u32,
     pub sessions: Vec<HandoffSession>,
     pub workspaces: Vec<HandoffWorkspace>,
+    /// Legacy single workspace tree — used as fallback when no per-window
+    /// trees exist.
+    pub workspace_tree: Option<scribe_common::protocol::WorkspaceTreeNode>,
+    /// Per-window state: which sessions belong to which window, and each
+    /// window's workspace tree.
+    #[serde(default)]
+    pub windows: Vec<HandoffWindowState>,
 }
 
 /// Per-session state transferred during handoff.
@@ -75,6 +87,8 @@ pub struct HandoffWorkspace {
     pub name: Option<String>,
     pub accent_color: String,
     pub session_ids: Vec<SessionId>,
+    /// Direction of the split that created this workspace.
+    pub split_direction: Option<scribe_common::protocol::LayoutDirection>,
 }
 
 // ── Socket path ─────────────────────────────────────────────────────
@@ -92,8 +106,8 @@ fn handoff_socket_path() -> PathBuf {
 /// This function blocks (async) until a new server connects and the handoff
 /// completes. On success the caller should exit so the new server takes over.
 pub async fn run_handoff_listener(
-    session_manager: Arc<SessionManager>,
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
+    live_sessions: LiveSessionRegistry,
 ) -> Result<(), ScribeError> {
     let path = handoff_socket_path();
 
@@ -157,7 +171,7 @@ pub async fn run_handoff_listener(
     info!("received upgrade request from new server");
 
     // Serialise state.
-    let (state, fds) = serialize_state(&session_manager, &workspace_manager).await;
+    let (state, fds) = serialize_state(&live_sessions, &workspace_manager).await;
     let state_bytes = rmp_serde::to_vec(&state).map_err(ScribeError::from)?;
 
     // Send state (length-prefixed).
@@ -244,15 +258,17 @@ fn read_upgrade_request(fd: RawFd) -> Result<(), ScribeError> {
     Ok(())
 }
 
-/// Collect serialisable state from the session and workspace managers.
+/// Collect serialisable state from the live session registry and workspace manager.
 async fn serialize_state(
-    session_manager: &SessionManager,
+    live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
 ) -> (HandoffState, Vec<RawFd>) {
-    let (sessions, fds) = session_manager.serialize_for_handoff().await;
-    let workspaces = workspace_manager.read().await.serialize_for_handoff();
+    let (sessions, fds) = crate::ipc_server::serialize_live_for_handoff(live_sessions).await;
+    let (workspaces, workspace_tree, windows) =
+        workspace_manager.read().await.serialize_for_handoff();
 
-    let state = HandoffState { version: HANDOFF_VERSION, sessions, workspaces };
+    let state =
+        HandoffState { version: HANDOFF_VERSION, sessions, workspaces, workspace_tree, windows };
 
     (state, fds)
 }
@@ -339,8 +355,22 @@ pub fn receive_handoff() -> Result<(HandoffState, Vec<OwnedFd>), ScribeError> {
     // Send upgrade request.
     send_upgrade_request(fd)?;
 
-    // Read state (length-prefixed).
-    let state = read_state(fd)?;
+    // Read state (length-prefixed).  A deserialization failure most likely
+    // means the old server uses a different HandoffState layout (field
+    // count changed between versions).  Surface this as a version mismatch
+    // so the postinst script can offer a cold restart.
+    let state = match read_state(fd) {
+        Ok(s) => s,
+        Err(ScribeError::Deserialization { .. }) => {
+            return Err(ScribeError::IpcError {
+                reason: format!(
+                    "handoff version mismatch: incompatible state format \
+                     (expected version {HANDOFF_VERSION})"
+                ),
+            });
+        }
+        Err(e) => return Err(e),
+    };
 
     if state.version != HANDOFF_VERSION {
         return Err(ScribeError::IpcError {

@@ -11,6 +11,9 @@ UID_DIR="/run/user/$(id -u)/scribe"
 mkdir -p "$UID_DIR"
 chmod 700 "$UID_DIR"
 
+# Ensure config directory exists so the file watcher can be initialised.
+mkdir -p "${HOME}/.config/scribe"
+
 scribe-test server start
 scribe-test daemon start
 

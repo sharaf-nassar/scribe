@@ -70,23 +70,47 @@ case "$1" in
             else
                 # Kill the stuck upgrade process
                 kill "$UPGRADE_PID" 2>/dev/null || true
+
                 echo ""
-                echo "╔══════════════════════════════════════════════════════════════╗"
-                echo "║                                                              ║"
-                echo "║   ⚠  SCRIBE SERVER HOT-RELOAD FAILED                        ║"
-                echo "║                                                              ║"
-                echo "║   Your terminals are still running on the OLD server.        ║"
-                echo "║   To complete the upgrade, restart the server manually:      ║"
-                echo "║                                                              ║"
-                echo "║     systemctl --user restart scribe-server                   ║"
-                echo "║                                                              ║"
-                echo "║   ⚠  WARNING: Restarting will CLOSE all terminal sessions.   ║"
-                echo "║                                                              ║"
-                echo "╚══════════════════════════════════════════════════════════════╝"
+                echo "  ⚠  Hot-reload failed. A cold restart is needed to"
+                echo "     complete the upgrade."
                 echo ""
+                echo "     This will CLOSE all open terminal sessions."
+                echo ""
+
                 if [ -f "${UPGRADE_LOG}" ]; then
                     echo "  Error details:"
-                    tail -5 "${UPGRADE_LOG}" 2>/dev/null | sed 's/^/    /'
+                    tail -3 "${UPGRADE_LOG}" 2>/dev/null | sed 's/^/    /'
+                    echo ""
+                fi
+
+                # Prompt for cold restart. Read from /dev/tty since stdin
+                # may be piped through apt/dpkg.
+                RESTART_CONFIRMED=0
+                if [ -e /dev/tty ]; then
+                    printf "  Restart now? (this will kill all running terminals) [y/N] "
+                    read -r REPLY < /dev/tty 2>/dev/null || REPLY=""
+                    case "$REPLY" in
+                        y|Y|yes|YES) RESTART_CONFIRMED=1 ;;
+                    esac
+                fi
+
+                if [ "$RESTART_CONFIRMED" = "1" ]; then
+                    if [ -n "$SUDO_UID" ]; then
+                        sudo -u "#${SUDO_UID}" \
+                            XDG_RUNTIME_DIR="$XDG_DIR" \
+                            DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
+                            systemctl --user restart scribe-server 2>/dev/null
+                    else
+                        systemctl --user restart scribe-server 2>/dev/null
+                    fi
+                    echo ""
+                    echo "  ✓ Scribe server restarted with new version."
+                else
+                    echo ""
+                    echo "  Skipped. To complete the upgrade later, run:"
+                    echo ""
+                    echo "    systemctl --user restart scribe-server"
                 fi
             fi
             rm -f "${UPGRADE_LOG}" 2>/dev/null || true

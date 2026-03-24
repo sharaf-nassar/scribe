@@ -70,18 +70,14 @@
               <div class="setting-label">Font Family</div>
               <div class="setting-desc">Monospace font used for terminal text</div>
             </div>
-            <div class="select-wrapper">
-              <select class="select-control" data-key="appearance.font_family">
-                <option value="JetBrains Mono">JetBrains Mono</option>
-                <option value="Fira Code">Fira Code</option>
-                <option value="Cascadia Code">Cascadia Code</option>
-                <option value="Source Code Pro">Source Code Pro</option>
-                <option value="IBM Plex Mono">IBM Plex Mono</option>
-                <option value="Iosevka">Iosevka</option>
-                <option value="Hack">Hack</option>
-                <option value="monospace">System Monospace</option>
-              </select>
-              <span class="select-arrow">&#9662;</span>
+            <div class="font-select-row">
+              <div class="select-wrapper">
+                <select class="select-control" data-key="appearance.font_family">
+                  <option value="monospace">Loading fonts...</option>
+                </select>
+                <span class="select-arrow">&#9662;</span>
+              </div>
+              <button class="refresh-btn" id="refresh-fonts" title="Rescan system fonts (e.g. after installing a new font)">&#8635;</button>
             </div>
           </div>
           <div class="setting-row">
@@ -395,6 +391,33 @@
               <div class="number-btn">+</div>
             </div>
           </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Copy on Select</div>
+              <div class="setting-desc">Automatically copy selected text to clipboard</div>
+            </div>
+            <div class="toggle on" data-key="terminal.copy_on_select">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Claude Code Clipboard Cleanup</div>
+              <div class="setting-desc">Dedent and unwrap copied text when Claude Code is running</div>
+            </div>
+            <div class="toggle on" data-key="terminal.claude_copy_cleanup">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Claude Code Integration</div>
+              <div class="setting-desc">Show AI state indicators in tab bars and pane borders</div>
+            </div>
+            <div class="toggle on" data-key="terminal.claude_code_integration">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -402,70 +425,284 @@
     <!-- ═══════ Keybindings Page ═══════ -->
     <div id="page-keybindings" class="content-page">
       <div class="page-title">Keybindings</div>
-      <div class="page-subtitle">Keyboard shortcuts for common actions</div>
+      <div class="page-subtitle">Click a shortcut to reassign it</div>
 
-      <div class="section-group">
-        <div class="section-label">Session</div>
-        <div class="section-card">
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">New Session</div>
-            </div>
-            <span class="keybinding-key" data-action="new_session">Ctrl+Shift+T</span>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Close Session</div>
-            </div>
-            <span class="keybinding-key" data-action="close_session">Ctrl+Shift+W</span>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Next Session</div>
-            </div>
-            <span class="keybinding-key" data-action="next_session">Ctrl+Tab</span>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Previous Session</div>
-            </div>
-            <span class="keybinding-key" data-action="prev_session">Ctrl+Shift+Tab</span>
-          </div>
-        </div>
+      <div class="kb-search-row">
+        <input type="text" id="kb-search" class="kb-search-input" placeholder="Search keybindings...">
       </div>
+
+      <div id="kb-conflict-banner" class="kb-conflict-banner" style="display:none;"></div>
 
       <div class="section-group">
         <div class="section-label">Panes</div>
         <div class="section-card">
           <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Split Horizontal</div>
+            <div class="setting-info"><div class="setting-label">Split Vertical</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="split_vertical" data-current="">Ctrl+Shift+\</span>
+              <button class="kb-reset-btn" data-action="split_vertical" title="Reset to default">&#8635;</button>
             </div>
-            <span class="keybinding-key" data-action="split_horizontal">Ctrl+Shift+H</span>
           </div>
           <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Split Vertical</div>
+            <div class="setting-info"><div class="setting-label">Split Horizontal</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="split_horizontal" data-current="">Ctrl+Shift+-</span>
+              <button class="kb-reset-btn" data-action="split_horizontal" title="Reset to default">&#8635;</button>
             </div>
-            <span class="keybinding-key" data-action="split_vertical">Ctrl+Shift+V</span>
           </div>
           <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Close Pane</div>
+            <div class="setting-info"><div class="setting-label">Close Pane</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="close_pane" data-current="">Ctrl+Shift+W</span>
+              <button class="kb-reset-btn" data-action="close_pane" title="Reset to default">&#8635;</button>
             </div>
-            <span class="keybinding-key" data-action="close_pane">Ctrl+Shift+X</span>
           </div>
           <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Focus Next Pane</div>
+            <div class="setting-info"><div class="setting-label">Cycle Pane Focus</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="cycle_pane" data-current="">Ctrl+Tab</span>
+              <button class="kb-reset-btn" data-action="cycle_pane" title="Reset to default">&#8635;</button>
             </div>
-            <span class="keybinding-key" data-action="focus_next_pane">Ctrl+Shift+]</span>
           </div>
           <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Focus Previous Pane</div>
+            <div class="setting-info"><div class="setting-label">Focus Left</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="focus_left" data-current="">Alt+Left</span>
+              <button class="kb-reset-btn" data-action="focus_left" title="Reset to default">&#8635;</button>
             </div>
-            <span class="keybinding-key" data-action="focus_prev_pane">Ctrl+Shift+[</span>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Focus Right</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="focus_right" data-current="">Alt+Right</span>
+              <button class="kb-reset-btn" data-action="focus_right" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Focus Up</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="focus_up" data-current="">Alt+Up</span>
+              <button class="kb-reset-btn" data-action="focus_up" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Focus Down</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="focus_down" data-current="">Alt+Down</span>
+              <button class="kb-reset-btn" data-action="focus_down" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Workspaces</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Split Vertical</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="workspace_split_vertical" data-current="">Ctrl+Alt+\</span>
+              <button class="kb-reset-btn" data-action="workspace_split_vertical" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Split Horizontal</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="workspace_split_horizontal" data-current="">Ctrl+Alt+-</span>
+              <button class="kb-reset-btn" data-action="workspace_split_horizontal" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Cycle Workspace Focus</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="cycle_workspace" data-current="">Ctrl+Alt+Tab</span>
+              <button class="kb-reset-btn" data-action="cycle_workspace" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Tabs</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">New Tab</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="new_tab" data-current="">Ctrl+Shift+T</span>
+              <button class="kb-reset-btn" data-action="new_tab" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Close Tab</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="close_tab" data-current="">Ctrl+Shift+Q</span>
+              <button class="kb-reset-btn" data-action="close_tab" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Next Tab</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="next_tab" data-current="">Ctrl+PageDown</span>
+              <button class="kb-reset-btn" data-action="next_tab" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Previous Tab</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="prev_tab" data-current="">Ctrl+PageUp</span>
+              <button class="kb-reset-btn" data-action="prev_tab" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Select Tab 1</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="select_tab_1" data-current="">Ctrl+1</span>
+              <button class="kb-reset-btn" data-action="select_tab_1" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Select Tab 2</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="select_tab_2" data-current="">Ctrl+2</span>
+              <button class="kb-reset-btn" data-action="select_tab_2" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Select Tab 3</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="select_tab_3" data-current="">Ctrl+3</span>
+              <button class="kb-reset-btn" data-action="select_tab_3" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Select Tab 4</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="select_tab_4" data-current="">Ctrl+4</span>
+              <button class="kb-reset-btn" data-action="select_tab_4" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Select Tab 5</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="select_tab_5" data-current="">Ctrl+5</span>
+              <button class="kb-reset-btn" data-action="select_tab_5" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Select Tab 6</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="select_tab_6" data-current="">Ctrl+6</span>
+              <button class="kb-reset-btn" data-action="select_tab_6" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Select Tab 7</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="select_tab_7" data-current="">Ctrl+7</span>
+              <button class="kb-reset-btn" data-action="select_tab_7" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Select Tab 8</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="select_tab_8" data-current="">Ctrl+8</span>
+              <button class="kb-reset-btn" data-action="select_tab_8" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Select Tab 9</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="select_tab_9" data-current="">Ctrl+9</span>
+              <button class="kb-reset-btn" data-action="select_tab_9" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Clipboard</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Copy</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="copy" data-current="">Ctrl+Shift+C</span>
+              <button class="kb-reset-btn" data-action="copy" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Paste</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="paste" data-current="">Ctrl+Shift+V</span>
+              <button class="kb-reset-btn" data-action="paste" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Navigation</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Scroll Up</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="scroll_up" data-current="">Shift+PageUp</span>
+              <button class="kb-reset-btn" data-action="scroll_up" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Scroll Down</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="scroll_down" data-current="">Shift+PageDown</span>
+              <button class="kb-reset-btn" data-action="scroll_down" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Scroll to Top</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="scroll_top" data-current="">Shift+Home</span>
+              <button class="kb-reset-btn" data-action="scroll_top" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Scroll to Bottom</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="scroll_bottom" data-current="">Shift+End</span>
+              <button class="kb-reset-btn" data-action="scroll_bottom" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Find in Terminal</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="find" data-current="">Ctrl+Shift+F</span>
+              <button class="kb-reset-btn" data-action="find" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">View</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Zoom In</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="zoom_in" data-current="">Ctrl+=</span>
+              <button class="kb-reset-btn" data-action="zoom_in" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Zoom Out</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="zoom_out" data-current="">Ctrl+-</span>
+              <button class="kb-reset-btn" data-action="zoom_out" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Zoom Reset</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="zoom_reset" data-current="">Ctrl+0</span>
+              <button class="kb-reset-btn" data-action="zoom_reset" title="Reset to default">&#8635;</button>
+            </div>
           </div>
         </div>
       </div>
@@ -474,22 +711,11 @@
         <div class="section-label">General</div>
         <div class="section-card">
           <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Copy</div>
+            <div class="setting-info"><div class="setting-label">Settings</div></div>
+            <div class="keybinding-cell">
+              <span class="keybinding-key" data-action="settings" data-current="">Ctrl+,</span>
+              <button class="kb-reset-btn" data-action="settings" title="Reset to default">&#8635;</button>
             </div>
-            <span class="keybinding-key" data-action="copy">Ctrl+Shift+C</span>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Paste</div>
-            </div>
-            <span class="keybinding-key" data-action="paste">Ctrl+Shift+V</span>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Settings</div>
-            </div>
-            <span class="keybinding-key" data-action="settings">Ctrl+,</span>
           </div>
         </div>
       </div>

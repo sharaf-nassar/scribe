@@ -12,14 +12,16 @@ use tracing::{debug, error, info, warn};
 use vte::Parser as VteParser;
 use vte::ansi::Processor as AnsiProcessor;
 
+use alacritty_terminal::grid::Dimensions as _;
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
-use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{ClientMessage, ServerMessage, SessionInfo};
 use scribe_common::socket::current_uid;
 use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
 
+use crate::handoff::HandoffSession;
 use crate::session_manager::{ManagedSession, SessionManager, snapshot_term};
 use crate::workspace_manager::WorkspaceManager;
 
@@ -48,12 +50,17 @@ type SharedWriter = Arc<Mutex<WriteHalf<tokio::net::UnixStream>>>;
 type ClientWriter = Arc<Mutex<Option<SharedWriter>>>;
 
 /// Server-wide registry of all running sessions. Shared across client
-/// handlers — sessions survive client disconnects.
-type LiveSessionRegistry = Arc<RwLock<HashMap<SessionId, LiveSession>>>;
+/// handlers and the handoff listener — sessions survive client disconnects.
+pub type LiveSessionRegistry = Arc<RwLock<HashMap<SessionId, LiveSession>>>;
+
+/// Registry of connected client windows, keyed by `WindowId`.
+/// Used to broadcast `QuitRequested` to all connected clients.
+pub type ConnectedClients = Arc<RwLock<HashMap<WindowId, SharedWriter>>>;
 
 /// State needed by the PTY reader task, extracted from `ManagedSession`.
 struct PtyReaderState {
     session_id: SessionId,
+    child_pid: u32,
     pty_read: ReadHalf<scribe_pty::async_fd::AsyncPtyFd>,
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     ansi_processor: AnsiProcessor,
@@ -66,22 +73,28 @@ struct PtyReaderState {
     /// Reusable buffer for OSC events — cleared between iterations to avoid
     /// allocating a new `Vec` on every PTY read.
     osc_events: Vec<MetadataEvent>,
+    /// Last known CWD from `/proc/pid/cwd`, used to detect changes triggered
+    /// by title-change events (for shells that emit OSC 0 but not OSC 7).
+    last_proc_cwd: Option<std::path::PathBuf>,
 }
 
 /// A running session in the server-wide registry. Lives independently of
 /// any client connection — the `client_writer` is set/cleared as clients
 /// attach and detach.
-struct LiveSession {
+pub struct LiveSession {
     pty_write: Arc<Mutex<WriteHalf<scribe_pty::async_fd::AsyncPtyFd>>>,
     pty_raw_fd: RawFd,
-    term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    pub term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     child_pid: u32,
     client_writer: ClientWriter,
     workspace_id: WorkspaceId,
     /// Keep the Pty alive so the child process isn't killed by SIGHUP on Drop.
-    /// `None` for sessions restored from a hot-reload handoff.
-    #[allow(dead_code, reason = "must stay alive to prevent child SIGHUP")]
-    _pty: Option<alacritty_terminal::tty::Pty>,
+    /// `None` for sessions restored from a hot-reload handoff. Taken and leaked
+    /// by `defuse_for_handoff` during hot-reload to prevent SIGHUP.
+    pty: Option<alacritty_terminal::tty::Pty>,
+    /// Screen snapshot from a hot-reload handoff, sent to the first client
+    /// that attaches. Taken (cleared) after first use.
+    pub handoff_snapshot: Option<scribe_common::screen::ScreenSnapshot>,
 }
 
 /// Start the IPC server on the given Unix socket path.
@@ -89,12 +102,13 @@ pub async fn start_ipc_server(
     socket_path: &Path,
     session_manager: Arc<SessionManager>,
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
+    live_sessions: LiveSessionRegistry,
+    connected_clients: ConnectedClients,
 ) -> Result<(), ScribeError> {
     prepare_socket(socket_path)?;
 
     let listener = UnixListener::bind(socket_path).map_err(|e| ScribeError::Io { source: e })?;
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
-    let live_sessions: LiveSessionRegistry = Arc::new(RwLock::new(HashMap::new()));
 
     info!(?socket_path, "IPC server listening");
 
@@ -114,8 +128,9 @@ pub async fn start_ipc_server(
                 let sm = Arc::clone(&session_manager);
                 let wm = Arc::clone(&workspace_manager);
                 let ls = Arc::clone(&live_sessions);
+                let cc = Arc::clone(&connected_clients);
                 tokio::spawn(async move {
-                    handle_client(stream, sm, wm, ls).await;
+                    handle_client(stream, sm, wm, ls, cc).await;
                     drop(permit);
                 });
             }
@@ -161,12 +176,18 @@ fn verify_peer_uid(stream: &tokio::net::UnixStream) -> bool {
     true
 }
 
-/// Per-client connection handler. Reads `ClientMessage`s and dispatches them.
+/// Per-client connection handler. Performs `Hello`/`Welcome` handshake, then
+/// reads `ClientMessage`s and dispatches them.
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "connection handler with handshake + message loop is inherently complex"
+)]
 async fn handle_client(
     stream: tokio::net::UnixStream,
     session_manager: Arc<SessionManager>,
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     live_sessions: LiveSessionRegistry,
+    connected_clients: ConnectedClients,
 ) {
     let (reader, writer) = tokio::io::split(stream);
     let writer: SharedWriter = Arc::new(Mutex::new(writer));
@@ -175,15 +196,71 @@ async fn handle_client(
     // Track which sessions this client has attached to, for detach on disconnect.
     let mut attached_ids: HashSet<SessionId> = HashSet::new();
 
+    // Perform Hello/Welcome handshake — wait for the first message.
+    let window_id = match read_message::<ClientMessage, _>(&mut reader).await {
+        Ok(ClientMessage::Hello { window_id }) => {
+            let wm = workspace_manager.read().await;
+            let all_windows = wm.window_ids_with_sessions();
+
+            let assigned = window_id.unwrap_or_else(WindowId::new);
+
+            // Other windows that have sessions but no connected client.
+            let connected = connected_clients.read().await;
+            let other_windows: Vec<WindowId> = all_windows
+                .into_iter()
+                .filter(|&wid| wid != assigned && !connected.contains_key(&wid))
+                .collect();
+            drop(connected);
+            drop(wm);
+
+            // Register this client in the connected clients map.
+            connected_clients.write().await.insert(assigned, Arc::clone(&writer));
+
+            let welcome = ServerMessage::Welcome { window_id: assigned, other_windows };
+            send_message(&writer, &welcome).await;
+
+            info!(%assigned, "client identified via Hello");
+            assigned
+        }
+        Ok(msg) => {
+            // Legacy client — no Hello. Assign a new window and process the
+            // message inline.
+            let window_id = WindowId::new();
+            connected_clients.write().await.insert(window_id, Arc::clone(&writer));
+            info!(%window_id, "legacy client (no Hello), assigned window");
+
+            dispatch_message(
+                msg,
+                &session_manager,
+                &workspace_manager,
+                &writer,
+                &live_sessions,
+                &mut attached_ids,
+                window_id,
+                &connected_clients,
+            )
+            .await;
+            window_id
+        }
+        Err(ScribeError::Io { .. }) => {
+            debug!("client disconnected before Hello");
+            return;
+        }
+        Err(e) => {
+            warn!("failed to read Hello message: {e}");
+            return;
+        }
+    };
+
     loop {
         let msg: ClientMessage = match read_message(&mut reader).await {
             Ok(msg) => msg,
             Err(ScribeError::Io { .. }) => {
-                debug!("client disconnected");
+                debug!(%window_id, "client disconnected");
                 break;
             }
             Err(e) => {
-                warn!("failed to read client message: {e}");
+                warn!(%window_id, "failed to read client message: {e}");
                 break;
             }
         };
@@ -195,6 +272,8 @@ async fn handle_client(
             &writer,
             &live_sessions,
             &mut attached_ids,
+            window_id,
+            &connected_clients,
         )
         .await;
     }
@@ -202,6 +281,8 @@ async fn handle_client(
     // Detach all sessions — clear the writer so the reader task stops
     // forwarding output, but keep the session alive for reconnection.
     detach_sessions(&live_sessions, &attached_ids).await;
+    connected_clients.write().await.remove(&window_id);
+    info!(%window_id, "client removed from connected clients");
 }
 
 /// Clear the client writer for each session so output stops being forwarded.
@@ -219,6 +300,7 @@ async fn detach_sessions(live_sessions: &LiveSessionRegistry, ids: &HashSet<Sess
 /// Dispatch a single `ClientMessage` to the appropriate handler.
 #[allow(
     clippy::too_many_arguments,
+    clippy::cognitive_complexity,
     reason = "dispatch hub — all handler dependencies are passed through"
 )]
 async fn dispatch_message(
@@ -228,16 +310,20 @@ async fn dispatch_message(
     writer: &SharedWriter,
     live_sessions: &LiveSessionRegistry,
     attached_ids: &mut HashSet<SessionId>,
+    window_id: WindowId,
+    connected_clients: &ConnectedClients,
 ) {
     match msg {
-        ClientMessage::CreateSession { workspace_id } => {
+        ClientMessage::CreateSession { workspace_id, split_direction } => {
             handle_create_session(
                 workspace_id,
+                split_direction,
                 session_manager,
                 workspace_manager,
                 writer,
                 live_sessions,
                 attached_ids,
+                window_id,
             )
             .await;
         }
@@ -246,6 +332,7 @@ async fn dispatch_message(
         }
         ClientMessage::CloseSession { session_id } => {
             handle_close_session(session_id, workspace_manager, live_sessions, attached_ids).await;
+            workspace_manager.write().await.remove_session_from_window(session_id);
         }
         ClientMessage::Resize { session_id, cols, rows } => {
             handle_resize(session_id, cols, rows, live_sessions).await;
@@ -262,7 +349,7 @@ async fn dispatch_message(
             handle_create_workspace(workspace_manager, writer).await;
         }
         ClientMessage::ListSessions => {
-            handle_list_sessions(live_sessions, workspace_manager, writer).await;
+            handle_list_sessions(live_sessions, workspace_manager, writer, window_id).await;
         }
         ClientMessage::AttachSessions { session_ids } => {
             handle_attach_sessions(
@@ -277,6 +364,19 @@ async fn dispatch_message(
         ClientMessage::ConfigReloaded => {
             handle_config_reloaded();
         }
+        ClientMessage::ReportWorkspaceTree { tree } => {
+            debug!(%window_id, "received workspace tree from client");
+            let mut wm = workspace_manager.write().await;
+            wm.set_workspace_tree(tree.clone());
+            wm.set_window_tree(window_id, tree);
+        }
+        ClientMessage::Hello { .. } => {
+            // Hello is handled during the handshake phase, not here.
+            debug!("unexpected Hello after handshake, ignoring");
+        }
+        ClientMessage::QuitAll => {
+            handle_quit_all(window_id, connected_clients).await;
+        }
         other => {
             debug!(?other, "unhandled client message");
         }
@@ -290,11 +390,13 @@ async fn dispatch_message(
 )]
 async fn handle_create_session(
     workspace_id: WorkspaceId,
+    split_direction: Option<scribe_common::protocol::LayoutDirection>,
     session_manager: &Arc<SessionManager>,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     writer: &SharedWriter,
     live_sessions: &LiveSessionRegistry,
     attached_ids: &mut HashSet<SessionId>,
+    window_id: WindowId,
 ) {
     let session_id = match session_manager.create_session(workspace_id).await {
         Ok(id) => id,
@@ -304,10 +406,12 @@ async fn handle_create_session(
         }
     };
 
-    // Register session with workspace manager.
+    // Register session with workspace manager.  When `split_direction` is
+    // `Some` the workspace is auto-created (client just split the window).
     {
         let mut wm = workspace_manager.write().await;
-        wm.add_session(workspace_id, session_id);
+        wm.add_session(workspace_id, session_id, split_direction);
+        wm.assign_session_to_window(window_id, session_id);
     }
 
     let Some(session) = session_manager.take_session(session_id).await else {
@@ -326,18 +430,32 @@ async fn handle_create_session(
     // Send workspace info so the client knows the accent color and name.
     {
         let wm = workspace_manager.read().await;
-        if let Some((name, accent_color)) = wm.workspace_info(workspace_id) {
-            let info_msg = ServerMessage::WorkspaceInfo { workspace_id, name, accent_color };
+        if let Some((name, accent_color, ws_split_dir)) = wm.workspace_info(workspace_id) {
+            let info_msg = ServerMessage::WorkspaceInfo {
+                workspace_id,
+                name,
+                accent_color,
+                split_direction: ws_split_dir,
+            };
             send_message(writer, &info_msg).await;
         }
     }
 
-    start_session(session_id, workspace_id, session, writer, workspace_manager, live_sessions);
+    start_session(
+        session_id,
+        workspace_id,
+        session,
+        Some(writer),
+        workspace_manager,
+        live_sessions,
+    );
     attached_ids.insert(session_id);
 }
 
 /// Split a `ManagedSession`, register in the live registry, and start
-/// the PTY reader task.
+/// the PTY reader task. When `writer` is `None` the session starts in
+/// detached mode (PTY reader runs but output is silently discarded until
+/// a client attaches).
 #[allow(
     clippy::too_many_arguments,
     reason = "session startup wires together all subsystem references"
@@ -346,7 +464,7 @@ fn start_session(
     session_id: SessionId,
     workspace_id: WorkspaceId,
     session: ManagedSession,
-    writer: &SharedWriter,
+    writer: Option<&SharedWriter>,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     live_sessions: &LiveSessionRegistry,
 ) {
@@ -355,6 +473,7 @@ fn start_session(
     let term = session.term;
     let child_pid = session.child_pid;
     let pty = session.pty;
+    let handoff_snapshot = session.handoff_snapshot;
     let ansi_processor = session.ansi_processor;
     let osc_parser = session.osc_parser;
     let metadata_parser = session.metadata_parser;
@@ -365,7 +484,7 @@ fn start_session(
 
     // Wrap the client writer in an optional so the reader task can
     // continue running when the client disconnects.
-    let client_writer: ClientWriter = Arc::new(Mutex::new(Some(Arc::clone(writer))));
+    let client_writer: ClientWriter = Arc::new(Mutex::new(writer.map(Arc::clone)));
 
     let live = LiveSession {
         pty_write: Arc::clone(&pty_write),
@@ -374,7 +493,8 @@ fn start_session(
         child_pid,
         client_writer: Arc::clone(&client_writer),
         workspace_id,
-        _pty: pty,
+        pty,
+        handoff_snapshot,
     };
 
     // Insert into registry synchronously (called from an async context
@@ -386,6 +506,7 @@ fn start_session(
 
     let state = PtyReaderState {
         session_id,
+        child_pid,
         pty_read,
         term,
         ansi_processor,
@@ -396,6 +517,7 @@ fn start_session(
         workspace_manager: Arc::clone(workspace_manager),
         live_sessions: Arc::clone(live_sessions),
         osc_events: Vec::new(),
+        last_proc_cwd: None,
     };
 
     tokio::spawn(pty_reader_task(state));
@@ -575,11 +697,11 @@ async fn handle_create_workspace(
 ) {
     let mut wm = workspace_manager.write().await;
     let workspace_id = wm.create_workspace();
-    let (name, accent_color) =
-        wm.workspace_info(workspace_id).unwrap_or_else(|| (None, String::from("#a78bfa")));
+    let (name, accent_color, split_direction) =
+        wm.workspace_info(workspace_id).unwrap_or_else(|| (None, String::from("#a78bfa"), None));
     drop(wm);
 
-    let msg = ServerMessage::WorkspaceInfo { workspace_id, name, accent_color };
+    let msg = ServerMessage::WorkspaceInfo { workspace_id, name, accent_color, split_direction };
     send_message(writer, &msg).await;
 }
 
@@ -588,29 +710,82 @@ async fn handle_list_sessions(
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     writer: &SharedWriter,
+    window_id: WindowId,
 ) {
     let sessions = live_sessions.read().await;
-    let infos: Vec<SessionInfo> = sessions
-        .iter()
-        .map(|(&id, s)| SessionInfo { session_id: id, workspace_id: s.workspace_id })
-        .collect();
-    let workspace_ids: Vec<WorkspaceId> = sessions.values().map(|s| s.workspace_id).collect();
+    let wm = workspace_manager.read().await;
+
+    // Filter sessions to those belonging to this window.
+    let window_session_ids = wm.sessions_for_window(window_id);
+    let has_window_sessions = !window_session_ids.is_empty();
+
+    let infos: Vec<SessionInfo> = if has_window_sessions {
+        // Return only this window's sessions.
+        window_session_ids
+            .iter()
+            .filter_map(|&sid| {
+                sessions
+                    .get(&sid)
+                    .map(|s| SessionInfo { session_id: sid, workspace_id: s.workspace_id })
+            })
+            .collect()
+    } else {
+        // No window-specific sessions — return all unowned sessions (legacy
+        // fallback or first-time connect with existing sessions).
+        sessions
+            .iter()
+            .filter(|&(&sid, _)| wm.window_for_session(sid).is_none())
+            .map(|(&id, s)| SessionInfo { session_id: id, workspace_id: s.workspace_id })
+            .collect()
+    };
+
+    let workspace_ids: Vec<WorkspaceId> = infos.iter().map(|i| i.workspace_id).collect();
+    let workspace_tree = wm.window_tree(window_id).cloned();
+    drop(wm);
     drop(sessions);
 
-    let list_msg = ServerMessage::SessionList { sessions: infos };
+    let list_msg = ServerMessage::SessionList { sessions: infos, workspace_tree };
     send_message(writer, &list_msg).await;
 
     // Also send workspace info for each referenced workspace so the client
     // can reconstruct the layout (names, accent colours).
-    let wm = workspace_manager.read().await;
+    let wm_guard = workspace_manager.read().await;
     let mut seen = HashSet::new();
     for wid in workspace_ids {
         if seen.insert(wid) {
-            if let Some((name, accent_color)) = wm.workspace_info(wid) {
-                let msg = ServerMessage::WorkspaceInfo { workspace_id: wid, name, accent_color };
+            if let Some((name, accent_color, split_direction)) = wm_guard.workspace_info(wid) {
+                let msg = ServerMessage::WorkspaceInfo {
+                    workspace_id: wid,
+                    name,
+                    accent_color,
+                    split_direction,
+                };
                 send_message(writer, &msg).await;
             }
         }
+    }
+}
+
+/// Take the handoff snapshot if one exists, otherwise snapshot the live Term.
+///
+/// The handoff snapshot captures the exact pre-handoff screen (including cursor
+/// visibility). For just-restored sessions the live Term may be blank, so the
+/// handoff snapshot is strongly preferred.
+pub async fn take_session_snapshot(
+    session_id: SessionId,
+    term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    live_sessions: &LiveSessionRegistry,
+) -> scribe_common::screen::ScreenSnapshot {
+    let handoff_snap = {
+        let mut registry = live_sessions.write().await;
+        registry.get_mut(&session_id).and_then(|s| s.handoff_snapshot.take())
+    };
+
+    if let Some(snap) = handoff_snap {
+        snap
+    } else {
+        let term_guard = term.lock().await;
+        snapshot_term(&term_guard)
     }
 }
 
@@ -660,18 +835,18 @@ async fn handle_attach_sessions(
         // Send workspace info.
         {
             let wm = workspace_manager.read().await;
-            if let Some((name, accent_color)) = wm.workspace_info(workspace_id) {
-                let msg = ServerMessage::WorkspaceInfo { workspace_id, name, accent_color };
+            if let Some((name, accent_color, split_direction)) = wm.workspace_info(workspace_id) {
+                let msg = ServerMessage::WorkspaceInfo {
+                    workspace_id,
+                    name,
+                    accent_color,
+                    split_direction,
+                };
                 send_message(writer, &msg).await;
             }
         }
 
-        // Send a screen snapshot so the client can restore the visible content.
-        // The server's Term has been continuously updated even while detached.
-        let snapshot = {
-            let term_guard = term.lock().await;
-            snapshot_term(&term_guard)
-        };
+        let snapshot = take_session_snapshot(session_id, &term, live_sessions).await;
         let snap_msg = ServerMessage::ScreenSnapshot { session_id, snapshot };
         send_message(writer, &snap_msg).await;
 
@@ -687,6 +862,18 @@ fn handle_config_reloaded() {
         }
         Err(e) => {
             warn!("config reload failed: {e}");
+        }
+    }
+}
+
+/// Broadcast `QuitRequested` to all connected clients except the sender.
+async fn handle_quit_all(sender_window_id: WindowId, connected_clients: &ConnectedClients) {
+    info!(%sender_window_id, "QuitAll requested — broadcasting QuitRequested");
+    let clients = connected_clients.read().await;
+    let quit_msg = ServerMessage::QuitRequested;
+    for (&wid, writer) in &*clients {
+        if wid != sender_window_id {
+            send_message(writer, &quit_msg).await;
         }
     }
 }
@@ -745,33 +932,8 @@ async fn pty_reader_task(mut state: PtyReaderState) {
         // Step 2: State path — feed into Term via ANSI processor (always runs).
         feed_term(&state.term, &mut state.ansi_processor, bytes).await;
 
-        // Step 3: OSC interceptor for AI state metadata.
-        run_osc_interceptor(
-            &mut state.osc_parser,
-            &state.metadata_parser,
-            bytes,
-            &mut state.osc_events,
-        );
-        let mut events_this_iter = std::mem::take(&mut state.osc_events);
-        for event in events_this_iter.drain(..) {
-            send_metadata_event(
-                event,
-                state.session_id,
-                &state.client_writer,
-                &state.workspace_manager,
-            )
-            .await;
-        }
-        state.osc_events = events_this_iter;
-
-        // Step 4: Drain metadata events from ScribeEventListener channel.
-        drain_metadata_events(
-            &mut state.metadata_rx,
-            state.session_id,
-            &state.client_writer,
-            &state.workspace_manager,
-        )
-        .await;
+        // Steps 3–5: Extract, classify, and dispatch metadata events.
+        process_metadata_events(&mut state, bytes).await;
     }
 
     // Session EOF — notify client (if attached) and remove from registry.
@@ -834,17 +996,101 @@ fn run_osc_interceptor(
     osc_parser.advance(&mut interceptor, bytes);
 }
 
-/// Drain the metadata event channel from `ScribeEventListener` and send events.
-async fn drain_metadata_events(
-    metadata_rx: &mut tokio::sync::mpsc::UnboundedReceiver<MetadataEvent>,
-    session_id: SessionId,
-    client_writer: &ClientWriter,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-) {
-    while let Ok(event) = metadata_rx.try_recv() {
-        send_metadata_event(event, session_id, client_writer, workspace_manager).await;
+/// Run the OSC interceptor, drain the metadata channel, classify events,
+/// and — if a title changed but no OSC 7 arrived — fall back to
+/// `/proc/pid/cwd` for CWD detection.
+async fn process_metadata_events(state: &mut PtyReaderState, bytes: &[u8]) {
+    let mut saw_title_change = false;
+    let mut saw_cwd_change = false;
+
+    // OSC interceptor events.
+    run_osc_interceptor(
+        &mut state.osc_parser,
+        &state.metadata_parser,
+        bytes,
+        &mut state.osc_events,
+    );
+    let mut events_this_iter = std::mem::take(&mut state.osc_events);
+    for event in events_this_iter.drain(..) {
+        classify_event(
+            &event,
+            &mut saw_title_change,
+            &mut saw_cwd_change,
+            &mut state.last_proc_cwd,
+        );
+        send_metadata_event(
+            event,
+            state.session_id,
+            &state.client_writer,
+            &state.workspace_manager,
+        )
+        .await;
+    }
+    state.osc_events = events_this_iter;
+
+    // ScribeEventListener channel events.
+    while let Ok(event) = state.metadata_rx.try_recv() {
+        classify_event(
+            &event,
+            &mut saw_title_change,
+            &mut saw_cwd_change,
+            &mut state.last_proc_cwd,
+        );
+        send_metadata_event(
+            event,
+            state.session_id,
+            &state.client_writer,
+            &state.workspace_manager,
+        )
+        .await;
+    }
+
+    // Fallback: title changed but no OSC 7 → read /proc/pid/cwd.
+    if saw_title_change && !saw_cwd_change {
+        check_proc_cwd(state).await;
     }
 }
+
+/// Update the `saw_title_change` / `saw_cwd_change` flags and keep
+/// `last_proc_cwd` in sync with any OSC 7 events.
+fn classify_event(
+    event: &MetadataEvent,
+    saw_title: &mut bool,
+    saw_cwd: &mut bool,
+    last_cwd: &mut Option<std::path::PathBuf>,
+) {
+    match event {
+        MetadataEvent::TitleChanged(_) => *saw_title = true,
+        MetadataEvent::CwdChanged(cwd) => {
+            *saw_cwd = true;
+            *last_cwd = Some(cwd.clone());
+        }
+        _ => {}
+    }
+}
+
+/// Read `/proc/{pid}/cwd` and synthesise a `CwdChanged` event when the CWD
+/// has changed since the last check.  Called when the shell emits a title
+/// change (OSC 0) but no OSC 7, so workspace naming still works for shells
+/// that only set the window title in PS1.
+#[cfg(target_os = "linux")]
+async fn check_proc_cwd(state: &mut PtyReaderState) {
+    let proc_cwd = std::path::PathBuf::from(format!("/proc/{}/cwd", state.child_pid));
+    let Ok(cwd) = std::fs::read_link(&proc_cwd) else {
+        return;
+    };
+    if state.last_proc_cwd.as_ref() == Some(&cwd) {
+        return;
+    }
+    state.last_proc_cwd = Some(cwd.clone());
+    let event = MetadataEvent::CwdChanged(cwd);
+    send_metadata_event(event, state.session_id, &state.client_writer, &state.workspace_manager)
+        .await;
+}
+
+/// Non-Linux stub — no `/proc` fallback available.
+#[cfg(not(target_os = "linux"))]
+async fn check_proc_cwd(_state: &mut PtyReaderState) {}
 
 /// Detect the current git branch by walking up from `cwd` looking for `.git/HEAD`.
 ///
@@ -915,5 +1161,102 @@ fn convert_metadata_event(
             (ServerMessage::AiStateChanged { session_id, ai_state }, None)
         }
         MetadataEvent::Bell => (ServerMessage::Bell { session_id }, None),
+    }
+}
+
+// ── Handoff helpers ──────────────────────────────────────────────
+
+/// Create a new, empty live session registry.
+pub fn new_live_session_registry() -> LiveSessionRegistry {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+/// Create a new empty `ConnectedClients` registry.
+pub fn new_connected_clients() -> ConnectedClients {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+/// Serialise all live sessions for a hot-reload handoff.
+///
+/// Returns `(sessions, raw_fds)` where the fds are in the same order as the
+/// session vec. The caller must send these fds via `SCM_RIGHTS`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "terminal dimensions are always within u16 range"
+)]
+pub async fn serialize_live_for_handoff(
+    live_sessions: &LiveSessionRegistry,
+) -> (Vec<HandoffSession>, Vec<RawFd>) {
+    let sessions = live_sessions.read().await;
+    let mut handoff_sessions = Vec::with_capacity(sessions.len());
+    let mut fds = Vec::with_capacity(sessions.len());
+
+    for (&session_id, live) in sessions.iter() {
+        let term = live.term.lock().await;
+        let snapshot = Some(snapshot_term(&term));
+        let cols = term.grid().columns() as u16;
+        let rows = term.grid().screen_lines() as u16;
+        drop(term);
+
+        handoff_sessions.push(HandoffSession {
+            session_id,
+            workspace_id: live.workspace_id,
+            child_pid: live.child_pid,
+            cols,
+            rows,
+            snapshot,
+        });
+
+        fds.push(live.pty_raw_fd);
+    }
+
+    (handoff_sessions, fds)
+}
+
+/// Defuse all Pty objects so the old server's exit does not send `SIGHUP` to
+/// child processes. Call after a successful handoff, before shutdown.
+///
+/// `alacritty_terminal::tty::Pty::drop()` explicitly calls
+/// `kill(child_pid, SIGHUP)`. Since the new server already holds the PTY
+/// master fds (via `SCM_RIGHTS`), the children must stay alive.
+/// `std::mem::forget` prevents the `Drop` impl from running.
+/// Move all sessions from the `SessionManager` into the live registry and
+/// start their PTY reader tasks in detached mode (no client writer).
+///
+/// Called at the start of `run_server_loop` so that sessions restored from a
+/// hot-reload handoff are available for `ListSessions` / `AttachSessions`
+/// before any client connects. For a normal (non-upgrade) startup this is a
+/// no-op because the `SessionManager` starts empty.
+pub async fn activate_pending_sessions(
+    session_manager: &SessionManager,
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    live_sessions: &LiveSessionRegistry,
+) {
+    let pending = session_manager.pending_session_ids().await;
+
+    for (session_id, workspace_id) in pending {
+        if let Some(session) = session_manager.take_session(session_id).await {
+            start_session(
+                session_id,
+                workspace_id,
+                session,
+                None,
+                workspace_manager,
+                live_sessions,
+            );
+            info!(%session_id, "activated restored session (detached)");
+        }
+    }
+}
+
+pub async fn defuse_for_handoff(live_sessions: &LiveSessionRegistry) {
+    let mut sessions = live_sessions.write().await;
+    for (&session_id, session) in sessions.iter_mut() {
+        if let Some(pty) = session.pty.take() {
+            // Wrap in ManuallyDrop to prevent Pty::drop() from running.
+            // ManuallyDrop does not call the inner type's Drop on scope exit.
+            let _defused = std::mem::ManuallyDrop::new(pty);
+            info!(%session_id, "defused Pty to prevent SIGHUP on exit");
+        }
     }
 }

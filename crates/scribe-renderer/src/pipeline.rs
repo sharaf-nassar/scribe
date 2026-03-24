@@ -251,11 +251,12 @@ fn create_render_pipeline(
 /// Describe the per-instance vertex buffer layout for `CellInstance`.
 fn instance_buffer_layout() -> VertexBufferLayout<'static> {
     const ATTRS: &[VertexAttribute] = &[
-        VertexAttribute { format: VertexFormat::Float32x2, offset: 0, shader_location: 0 },
-        VertexAttribute { format: VertexFormat::Float32x2, offset: 8, shader_location: 1 },
-        VertexAttribute { format: VertexFormat::Float32x2, offset: 16, shader_location: 2 },
-        VertexAttribute { format: VertexFormat::Float32x4, offset: 24, shader_location: 3 },
-        VertexAttribute { format: VertexFormat::Float32x4, offset: 40, shader_location: 4 },
+        VertexAttribute { format: VertexFormat::Float32x2, offset: 0, shader_location: 0 }, // pos
+        VertexAttribute { format: VertexFormat::Float32x2, offset: 8, shader_location: 1 }, // size
+        VertexAttribute { format: VertexFormat::Float32x2, offset: 16, shader_location: 2 }, // uv_min
+        VertexAttribute { format: VertexFormat::Float32x2, offset: 24, shader_location: 3 }, // uv_max
+        VertexAttribute { format: VertexFormat::Float32x4, offset: 32, shader_location: 4 }, // fg_color
+        VertexAttribute { format: VertexFormat::Float32x4, offset: 48, shader_location: 5 }, // bg_color
     ];
 
     VertexBufferLayout {

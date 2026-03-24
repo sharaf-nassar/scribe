@@ -42,8 +42,8 @@ docker build -f docker/Dockerfile.visual -t scribe-test-visual .
 # Run functional E2E test
 docker run --rm -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-func /tests/smoke.sh
 
-# Run visual E2E test (software GPU)
-docker run --rm -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/smoke.sh
+# Run visual E2E test (requires GPU passthrough)
+docker run --rm --gpus all -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/smoke.sh
 
 # Inspect results: check exit code, read test-output/result.log, view PNG screenshots
 ```
@@ -67,7 +67,22 @@ Two Docker containers for end-to-end testing. Use them to validate changes befor
 - Color palette / theme changes
 - Pane layout / split visual behavior
 - Client input handling (`scribe-client`)
-- Slower: ~5 seconds startup (Xvfb + Mesa software GL)
+- Slower: ~5 seconds startup (Xvfb + GPU)
+- **Requires `--gpus all`** to expose the GPU to the container
+
+### Test directory layout
+
+```
+tests/e2e/
+├── func/            # Functional tests (no GPU, fast)
+│   ├── smoke.sh
+│   ├── reconnect.sh
+│   ├── keybindings-validation.sh
+│   └── workspace-split.sh
+└── visual/          # Visual tests (GPU + Xvfb + xdotool)
+    ├── reconnect.sh
+    └── workspace-split.sh
+```
 
 ### How to run
 
@@ -78,8 +93,12 @@ cargo build --release
 # 2. Rebuild the container (only needed when binaries change)
 docker build -f docker/Dockerfile.func -t scribe-test-func .
 
-# 3. Run a test script
-docker run --rm -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-func /tests/smoke.sh
+# 3. Run a functional test (no GPU needed)
+docker run --rm -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-func /tests/func/smoke.sh
+
+# 3b. Run a visual test (requires --gpus all)
+# docker build -f docker/Dockerfile.visual -t scribe-test-visual .
+# docker run --rm --gpus all -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/workspace-split.sh
 
 # 4. Inspect results
 # - Exit code: 0 = pass, 1 = test failure, 2 = infra error
@@ -133,24 +152,26 @@ scribe-test send "$SAVED_SESSION" 'echo test\n'
 scribe-test wait-output "$SAVED_SESSION" "test"
 ```
 
-The reconnect test (`tests/e2e/reconnect.sh`) validates session survival across client disconnects.
+The reconnect test (`tests/e2e/func/reconnect.sh`) validates session survival across client disconnects.
 
 ### When to test
 
 **MANDATORY**: After ANY code change that touches server, client, or protocol code, you MUST:
 1. `cargo build --release`
 2. Rebuild the relevant Docker container (`docker build -f docker/Dockerfile.func -t scribe-test-func .`)
-3. Run ALL E2E tests: `smoke.sh` and `reconnect.sh`
-4. Verify both pass before considering the change complete
+3. Run ALL functional E2E tests: `func/smoke.sh`, `func/reconnect.sh`, `func/workspace-split.sh`
+4. Verify all pass before considering the change complete
 
 Do NOT rely on `cargo test` alone — unit tests do not cover IPC, session lifecycle, reconnection, or screen content restoration. The E2E container tests are the source of truth for end-to-end correctness.
 
 - After implementing a new feature: write a test script that exercises it
 - After fixing a bug: write a test script that reproduces the scenario
 - Before committing renderer changes: use the visual container and inspect pixel screenshots
-- **After changing IPC, session lifecycle, or client startup**: run `reconnect.sh` to verify sessions survive disconnect/reconnect and screen content is restored
-- The smoke test (`tests/e2e/smoke.sh`) validates basic server→session→I/O→screenshot flow
-- The reconnect test (`tests/e2e/reconnect.sh`) validates session persistence and reattachment
+- **After changing IPC, session lifecycle, or client startup**: run `func/reconnect.sh` to verify sessions survive disconnect/reconnect and screen content is restored
+- **After changing client input, keybindings, or workspace layout**: run `visual/workspace-split.sh` to verify splits render correctly
+- The smoke test (`tests/e2e/func/smoke.sh`) validates basic server->session->I/O->screenshot flow
+- The reconnect test (`tests/e2e/func/reconnect.sh`) validates session persistence and reattachment
+- The workspace split test (`tests/e2e/visual/workspace-split.sh`) validates keybinding-triggered workspace splits through the real client
 
 ## Architecture
 
@@ -188,24 +209,24 @@ Window
 │   │   ├── [gap]
 │   │   ├── Tab 1 (session)
 │   │   └── Tab 2 (session, active)
-│   ├── Content Area
-│   │   ├── Pane 1 (split within the active tab)
-│   │   └── Pane 2 (split within the active tab)
-│   └── Status Bar
-└── Workspace B (another screen region)
-    ├── Tab Bar
-    │   ├── [Workspace Badge]
-    │   ├── [gap]
-    │   └── Tab 1 (session)
-    ├── Content Area
-    │   └── Pane 1
-    └── Status Bar
+│   └── Content Area
+│       ├── Pane 1 (split within the active tab)
+│       └── Pane 2 (split within the active tab)
+├── Workspace B (another screen region)
+│   ├── Tab Bar
+│   │   ├── [Workspace Badge]
+│   │   ├── [gap]
+│   │   └── Tab 1 (session)
+│   └── Content Area
+│       └── Pane 1
+└── Status Bar (single bar spanning full window width)
 ```
 
-- **Workspace**: A region of the window. Creating a new workspace splits the window. Each workspace has its own tab bar, sessions, pane layout, and status bar.
+- **Workspace**: A region of the window. Creating a new workspace splits the window. Each workspace has its own tab bar, sessions, and pane layout.
 - **Tab (Session)**: A shell session within a workspace, shown in that workspace's tab bar.
 - **Pane**: A split within a tab's content area. Panes divide the active tab, not the workspace.
 - **Workspace Badge**: Colored dot + workspace name shown in the tab bar. Only visible when 2+ workspaces are open. Separated from tabs by a gap.
+- **Status Bar**: A single bar at the bottom of the window (not per-workspace). Shows: connection dot, focused workspace name, CWD, git branch, session count, hostname, and time. The workspace viewport is shrunk by `STATUS_BAR_HEIGHT` (24px) before workspace rects are computed, so the bar occupies the gap below all workspaces.
 
 Workspaces are never tabbed — they always occupy visible screen real estate side by side.
 
@@ -243,10 +264,13 @@ roots = ["~/work", "~/projects"]
 
 ### Keyboard Shortcuts
 
-- `Ctrl+Shift+\` — split vertical (side-by-side)
-- `Ctrl+Shift+-` — split horizontal (top/bottom)
+- `Ctrl+Shift+\` — split pane vertical (side-by-side)
+- `Ctrl+Shift+-` — split pane horizontal (top/bottom)
 - `Ctrl+Shift+W` — close pane
 - `Ctrl+Tab` — cycle focus to next pane
+- `Ctrl+Alt+\` — split workspace vertical (side-by-side)
+- `Ctrl+Alt+-` — split workspace horizontal (top/bottom)
+- `Ctrl+Shift+N` — open new window
 - `Ctrl+,` — open settings
 
 ### IPC Security

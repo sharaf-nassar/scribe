@@ -1,8 +1,10 @@
-//! GPU-rendered status bar at the bottom of each pane.
+//! GPU-rendered window-level status bar.
 //!
-//! Generates [`CellInstance`] quads for the status bar background and text,
-//! using the same glyph atlas as the terminal grid. The instances are
-//! collected into the same buffer and drawn in a single render pass.
+//! Generates [`CellInstance`] quads for a single status bar spanning the full
+//! window width at the bottom. The instances are collected into the same
+//! buffer as the terminal grid and drawn in a single render pass.
+
+use std::path::Path;
 
 use scribe_common::theme::ChromeColors;
 use scribe_renderer::srgb_to_linear_rgba;
@@ -13,13 +15,21 @@ use crate::layout::Rect;
 /// Height of the status bar in pixels.
 pub const STATUS_BAR_HEIGHT: f32 = 24.0;
 
-/// Data needed to render the status bar.
+/// Data needed to render the window-level status bar.
 pub struct StatusBarData<'a> {
     pub connected: bool,
-    pub shell_name: &'a str,
-    pub pane_count: usize,
+    /// Name of the focused workspace (shown when multiple workspaces exist).
+    pub workspace_name: Option<&'a str>,
+    /// CWD of the focused pane, displayed as a shortened path.
+    pub cwd: Option<&'a Path>,
+    /// Git branch of the focused pane.
     pub git_branch: Option<&'a str>,
-    pub grid_size: (u16, u16),
+    /// Total number of active sessions in this window.
+    pub session_count: usize,
+    /// System hostname.
+    pub hostname: &'a str,
+    /// Current time string (e.g. "14:32").
+    pub time: &'a str,
 }
 
 /// Fallback green when ANSI index 2 is unavailable.
@@ -58,17 +68,17 @@ impl StatusBarColors {
     }
 }
 
-/// Build cell instances for the status bar at the bottom of a workspace rect.
+/// Build cell instances for the window-level status bar.
 ///
-/// Pushes background quads and text glyph instances into `out`.
-/// `resolve_glyph` maps a character to atlas UV coordinates `(uv_min, uv_max)`.
+/// The bar spans the full `window_rect` width and is anchored at
+/// `window_rect.y + window_rect.height - STATUS_BAR_HEIGHT`.
 #[allow(
     clippy::too_many_arguments,
     reason = "needs rect, cell size, colors, data, and glyph resolver for full status bar rendering"
 )]
 pub fn build_status_bar(
     out: &mut Vec<CellInstance>,
-    rect: Rect,
+    window_rect: Rect,
     cell_size: (f32, f32),
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
@@ -79,18 +89,15 @@ pub fn build_status_bar(
         return;
     }
 
-    let bar_y = rect.y + rect.height - STATUS_BAR_HEIGHT;
-    let max_cols = columns_in_width(rect.width, cell_w);
-    let mut w = BarWriter { out, x_origin: rect.x, y: bar_y, cell_w, max_cols, col: 0 };
+    let bar_y = window_rect.y + window_rect.height - STATUS_BAR_HEIGHT;
+    let max_cols = columns_in_width(window_rect.width, cell_w);
+    let mut w = BarWriter { out, x_origin: window_rect.x, y: bar_y, cell_w, max_cols, col: 0 };
 
-    // Background fill.
     build_background(w.out, w.x_origin, w.y, w.max_cols, w.cell_w, colors.bg);
 
-    // Left side: connection indicator + shell name.
     let col = render_left_side(&mut w, colors, data, resolve_glyph);
     w.col = col;
 
-    // Right side: pane count, git branch, grid size.
     render_right_side(&mut w, colors, data, resolve_glyph);
 }
 
@@ -124,6 +131,7 @@ impl BarWriter<'_> {
         let (uv_min, uv_max) = resolve_glyph(ch);
         self.out.push(CellInstance {
             pos: [x, self.y],
+            size: [0.0, 0.0],
             uv_min,
             uv_max,
             fg_color: fg,
@@ -159,7 +167,7 @@ impl BarWriter<'_> {
     }
 }
 
-/// Render the left side: space, connection dot, space, shell name.
+/// Render the left side: connection dot, workspace name (if multi), CWD.
 fn render_left_side(
     w: &mut BarWriter<'_>,
     colors: &StatusBarColors,
@@ -171,12 +179,21 @@ fn render_left_side(
     let dot_color = if data.connected { colors.connected_dot } else { colors.disconnected_dot };
     w.put('\u{25CF}', dot_color, colors.bg, resolve_glyph);
     w.put(' ', colors.text, colors.bg, resolve_glyph);
-    w.put_str(data.shell_name, colors.text, colors.bg, resolve_glyph);
+
+    if let Some(name) = data.workspace_name {
+        w.put_str(name, colors.accent, colors.bg, resolve_glyph);
+        w.put_str("  ", colors.text, colors.bg, resolve_glyph);
+    }
+
+    if let Some(cwd) = data.cwd {
+        let short = shorten_cwd(cwd);
+        w.put_str(&short, colors.text, colors.bg, resolve_glyph);
+    }
 
     w.col
 }
 
-/// Render the right side: pane count | git branch | grid size.
+/// Render the right side: git branch | session count | hostname | time.
 fn render_right_side(
     w: &mut BarWriter<'_>,
     colors: &StatusBarColors,
@@ -184,7 +201,7 @@ fn render_right_side(
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
 ) {
     let segments = build_right_segments(data, colors);
-    let right_cols: usize = segments.iter().map(|s| s.text.len()).sum();
+    let right_cols: usize = segments.iter().map(|s| s.text.chars().count()).sum();
     let right_start = w.max_cols.saturating_sub(right_cols + 1);
 
     w.pad_to(right_start, colors.text, colors.bg, resolve_glyph);
@@ -202,31 +219,60 @@ struct RightSegment {
     color: [f32; 4],
 }
 
-/// Build the right-side text segments: pane count, git branch, grid size.
+/// Build the right-side text segments: git branch, session count, hostname, time.
 fn build_right_segments(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<RightSegment> {
     let mut segs = Vec::new();
 
-    if data.pane_count > 1 {
-        segs.push(RightSegment { text: format!("{} panes", data.pane_count), color: colors.text });
-    }
-
     if let Some(branch) = data.git_branch {
-        if !segs.is_empty() {
-            segs.push(RightSegment { text: String::from(" | "), color: colors.separator });
-        }
         segs.push(RightSegment { text: String::from(branch), color: colors.accent });
     }
 
-    if !segs.is_empty() {
-        segs.push(RightSegment { text: String::from(" | "), color: colors.separator });
+    if data.session_count > 0 {
+        if !segs.is_empty() {
+            segs.push(RightSegment { text: String::from(" | "), color: colors.separator });
+        }
+        let label = if data.session_count == 1 {
+            String::from("1 session")
+        } else {
+            format!("{} sessions", data.session_count)
+        };
+        segs.push(RightSegment { text: label, color: colors.text });
     }
-    segs.push(RightSegment {
-        text: format!("{}x{}", data.grid_size.0, data.grid_size.1),
-        color: colors.text,
-    });
+
+    if !data.hostname.is_empty() {
+        if !segs.is_empty() {
+            segs.push(RightSegment { text: String::from(" | "), color: colors.separator });
+        }
+        segs.push(RightSegment { text: String::from(data.hostname), color: colors.text });
+    }
+
+    if !data.time.is_empty() {
+        if !segs.is_empty() {
+            segs.push(RightSegment { text: String::from(" | "), color: colors.separator });
+        }
+        segs.push(RightSegment { text: String::from(data.time), color: colors.text });
+    }
+
     segs.push(RightSegment { text: String::from(" "), color: colors.text });
 
     segs
+}
+
+/// Shorten a CWD path by replacing `$HOME` with `~`.
+fn shorten_cwd(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if let Some(home) = home_dir() {
+        let home_str = home.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(home_str.as_ref()) {
+            return format!("~{rest}");
+        }
+    }
+    s.into_owned()
+}
+
+/// Read the home directory from `$HOME`.
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
 /// Fill columns with background quads (no glyph).
@@ -250,6 +296,7 @@ fn build_background(
         let x = x_origin + col_idx as f32 * cell_w;
         out.push(CellInstance {
             pos: [x, y],
+            size: [0.0, 0.0],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
             fg_color: bg,

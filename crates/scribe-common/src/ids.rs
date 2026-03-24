@@ -4,90 +4,56 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(Uuid);
+/// Generate a UUID-based newtype ID with `new`, `as_uuid`, `to_full_string`,
+/// `Default`, `Display` (with a short prefix), and `FromStr`.
+macro_rules! define_id {
+    ($name:ident, $prefix:literal) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub struct $name(Uuid);
 
-impl SessionId {
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
+        impl $name {
+            #[must_use]
+            pub fn new() -> Self {
+                Self(Uuid::new_v4())
+            }
 
-    #[must_use]
-    pub fn as_uuid(&self) -> Uuid {
-        self.0
-    }
+            #[must_use]
+            pub fn as_uuid(&self) -> Uuid {
+                self.0
+            }
 
-    /// Returns the full UUID string (for CLI serialization).
-    #[must_use]
-    pub fn to_full_string(self) -> String {
-        self.0.to_string()
-    }
+            /// Returns the full UUID string (for CLI serialization).
+            #[must_use]
+            pub fn to_full_string(self) -> String {
+                self.0.to_string()
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let s = self.0.to_string();
+                let prefix = s.get(..8).unwrap_or("unknown");
+                write!(f, concat!($prefix, "-{}"), prefix)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                let uuid = Uuid::parse_str(s)?;
+                Ok(Self(uuid))
+            }
+        }
+    };
 }
 
-impl Default for SessionId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for SessionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = self.0.to_string();
-        let prefix = s.get(..8).unwrap_or("unknown");
-        write!(f, "session-{prefix}")
-    }
-}
-
-impl FromStr for SessionId {
-    type Err = uuid::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let uuid = Uuid::parse_str(s)?;
-        Ok(Self(uuid))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WorkspaceId(Uuid);
-
-impl WorkspaceId {
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    #[must_use]
-    pub fn as_uuid(&self) -> Uuid {
-        self.0
-    }
-
-    /// Returns the full UUID string (for CLI serialization).
-    #[must_use]
-    pub fn to_full_string(self) -> String {
-        self.0.to_string()
-    }
-}
-
-impl Default for WorkspaceId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for WorkspaceId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = self.0.to_string();
-        let prefix = s.get(..8).unwrap_or("unknown");
-        write!(f, "ws-{prefix}")
-    }
-}
-
-impl FromStr for WorkspaceId {
-    type Err = uuid::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let uuid = Uuid::parse_str(s)?;
-        Ok(Self(uuid))
-    }
-}
+define_id!(SessionId, "session");
+define_id!(WorkspaceId, "ws");
+define_id!(WindowId, "win");

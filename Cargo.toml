@@ -56,16 +56,40 @@ tracing-subscriber = { version = "0.3", features = [
 bytes = "1"
 
 # PTY / OS bindings
-nix = { version = "0.31", features = ["term", "process", "signal", "fs", "user", "socket", "uio"] }
+nix = { version = "0.31", features = [
+  "term",
+  "process",
+  "signal",
+  "fs",
+  "user",
+  "socket",
+  "uio",
+] }
 libc = "0.2"
 
+# Clipboard
+arboard = { version = "3", default-features = false, features = [
+  "wayland-data-control",
+] }
+
 # GPU / windowing
-wgpu = { version = "29.0", default-features = false, features = ["vulkan", "gles", "wgsl", "std"] }
+wgpu = { version = "29.0", default-features = false, features = [
+  "vulkan",
+  "gles",
+  "wgsl",
+  "std",
+] }
 winit = "0.30"
 pollster = "0.4"
-cosmic-text = { version = "0.17", features = ["shape-run-cache", "monospace_fallback"] }
+cosmic-text = { version = "0.17", features = [
+  "shape-run-cache",
+  "monospace_fallback",
+] }
 bytemuck = { version = "1", features = ["derive"] }
 png = "0.17"
+
+# Dialogs
+rfd = "0.15"
 
 # Webview / settings
 wry = "0.51"

@@ -20,10 +20,15 @@ UID_DIR="/run/user/$(id -u)/scribe"
 mkdir -p "$UID_DIR"
 chmod 700 "$UID_DIR"
 
+# Ensure config directory exists so the file watcher can be initialised.
+mkdir -p "${HOME}/.config/scribe"
+
 scribe-test server start
 scribe-test daemon start
 
-export WGPU_BACKEND=gl
+# Use Vulkan by default; fall back to GL if Vulkan device is unavailable.
+export WGPU_BACKEND=vulkan
+export LIBGL_ALWAYS_SOFTWARE=1
 scribe-client &
 CLIENT_PID=$!
 

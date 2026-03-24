@@ -9,10 +9,11 @@ struct Uniforms {
 
 struct CellInstance {
     @location(0) pos: vec2<f32>,
-    @location(1) uv_min: vec2<f32>,
-    @location(2) uv_max: vec2<f32>,
-    @location(3) fg_color: vec4<f32>,
-    @location(4) bg_color: vec4<f32>,
+    @location(1) size: vec2<f32>,
+    @location(2) uv_min: vec2<f32>,
+    @location(3) uv_max: vec2<f32>,
+    @location(4) fg_color: vec4<f32>,
+    @location(5) bg_color: vec4<f32>,
 };
 
 struct VertexOutput {
@@ -31,7 +32,8 @@ struct VertexOutput {
         vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0),
     );
     let corner = corners[vi];
-    let pixel_pos = instance.pos + corner * uniforms.cell_size;
+    let quad_size = select(uniforms.cell_size, instance.size, instance.size.x > 0.0);
+    let pixel_pos = instance.pos + corner * quad_size;
     let clip_pos = vec2(
         (pixel_pos.x / uniforms.viewport.x) * 2.0 - 1.0,
         1.0 - (pixel_pos.y / uniforms.viewport.y) * 2.0,

@@ -57,4 +57,9 @@ pub struct ScreenSnapshot {
     pub cursor_row: u16,
     pub cursor_style: CursorStyle,
     pub cursor_visible: bool,
+    /// Whether the terminal was in alternate screen mode when the snapshot
+    /// was taken.  The client must re-enter alt screen before feeding the
+    /// ANSI so that subsequent PTY output lands in the correct buffer.
+    #[serde(default)]
+    pub alt_screen: bool,
 }

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "E2E test harness for Scribe terminal emulator"
+publish = false
 
 [[bin]]
 name = "scribe-test"
@@ -14,13 +15,11 @@ scribe-common.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rmp-serde.workspace = true
 clap.workspace = true
 regex.workspace = true
 cosmic-text.workspace = true
 png.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 nix.workspace = true
 
 [lints]

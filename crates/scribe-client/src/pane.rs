@@ -11,15 +11,13 @@ use alacritty_terminal::grid::Dimensions as _;
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_renderer::types::GridSize;
 
-use crate::layout::{PaneId, Rect};
-use crate::status_bar::STATUS_BAR_HEIGHT;
+use crate::layout::Rect;
 
 /// Height of the tab bar in pixels (reserved at the top of each pane).
 pub const TAB_BAR_HEIGHT: f32 = 32.0;
 
 /// State for a single terminal pane.
 pub struct Pane {
-    pub id: PaneId,
     pub session_id: SessionId,
     #[allow(dead_code, reason = "used by tab bar rendering and workspace management")]
     pub workspace_id: WorkspaceId,
@@ -68,13 +66,11 @@ impl Pane {
         grid: GridSize,
         session_id: SessionId,
         workspace_id: WorkspaceId,
-        id: PaneId,
     ) -> Self {
         let dims = TermDims { cols: usize::from(grid.cols), lines: usize::from(grid.rows) };
         let term = Term::new(alacritty_terminal::term::Config::default(), &dims, VoidListener);
 
         Self {
-            id,
             session_id,
             workspace_id,
             workspace_name: None,
@@ -121,7 +117,7 @@ impl Pane {
         reason = "pane rect dimensions are small non-negative pixel values that fit in u32"
     )]
     pub fn content_viewport(&self) -> (u32, u32) {
-        let h = (self.rect.height - TAB_BAR_HEIGHT - STATUS_BAR_HEIGHT).max(1.0);
+        let h = (self.rect.height - TAB_BAR_HEIGHT).max(1.0);
         (self.rect.width.max(1.0) as u32, h as u32)
     }
 }
@@ -129,7 +125,7 @@ impl Pane {
 /// Compute the grid size for a pane's content area.
 pub fn compute_pane_grid(rect: Rect, cell_width: f32, cell_height: f32) -> GridSize {
     let content_w = rect.width;
-    let content_h = (rect.height - TAB_BAR_HEIGHT - STATUS_BAR_HEIGHT).max(1.0);
+    let content_h = (rect.height - TAB_BAR_HEIGHT).max(1.0);
     grid_from_pixels(content_w, content_h, cell_width, cell_height)
 }
 

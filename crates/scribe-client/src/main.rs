@@ -1,38 +1,42 @@
 //! Scribe terminal client -- multi-pane winit + wgpu terminal emulator.
 
 mod ai_indicator;
+mod clipboard_cleanup;
 mod config;
 mod divider;
 mod input;
 mod ipc_client;
 mod layout;
 mod pane;
+mod search_overlay;
+mod selection;
 mod splash;
 mod status_bar;
 mod tab_bar;
+mod window_state;
 mod workspace_layout;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use scribe_common::config::{ScribeConfig, resolve_theme};
-use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::theme::Theme;
 use scribe_renderer::TerminalRenderer;
 use scribe_renderer::types::GridSize;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{Window, WindowId};
+use winit::window::Window;
 
 use crate::ai_indicator::AiStateTracker;
 use crate::divider::DividerDrag;
 use crate::input::{KeyAction, LayoutAction};
 use crate::ipc_client::{ClientCommand, UiEvent};
-use crate::layout::{LayoutTree, PaneId, Rect};
+use crate::layout::{PaneId, Rect};
 use crate::pane::Pane;
 use crate::workspace_layout::WindowLayout;
 
@@ -48,8 +52,29 @@ struct GpuContext {
     splash: Option<splash::SplashRenderer>,
 }
 
+/// Persisted settings-window position and size.
+///
+/// Wraps `SettingsWindowGeometry` in an `Option` so that an absent file
+/// (first launch) produces `None` and the default "centred" placement is
+/// used instead of restoring stale coordinates.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct SettingsGeometryFile {
+    geometry: Option<scribe_settings::SettingsWindowGeometry>,
+    /// Whether the settings window was open when the app last exited.
+    #[serde(default)]
+    open: bool,
+}
+
 /// Application state for the winit event loop.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "App tracks independent boolean flags: animation, splash, cursor visibility, blink"
+)]
 struct App {
+    // Window identity
+    /// Window ID from CLI arg (if provided) or assigned by the server.
+    window_id: Option<WindowId>,
+
     // Config + Theme
     config: ScribeConfig,
     theme: Theme,
@@ -65,9 +90,21 @@ struct App {
     window_layout: WindowLayout,
     panes: HashMap<PaneId, Pane>,
     session_to_pane: HashMap<SessionId, PaneId>,
+    /// Temporary session IDs awaiting server confirmation, in creation order.
+    pending_sessions: VecDeque<SessionId>,
 
     // Divider drag
     divider_drag: Option<DividerDrag>,
+
+    // Text selection
+    /// Active text selection, set on mouse press and extended on move.
+    active_selection: Option<selection::SelectionRange>,
+    /// Whether the left mouse button is currently held (for drag detection).
+    mouse_selecting: bool,
+
+    // Connection state
+    /// Whether the IPC connection to the server is alive.
+    server_connected: bool,
 
     // AI state
     ai_tracker: AiStateTracker,
@@ -75,6 +112,18 @@ struct App {
 
     // Input state
     modifiers: ModifiersState,
+    /// Parsed keybindings (hot-reloaded with config).
+    bindings: input::Bindings,
+
+    // Clipboard
+    clipboard: Option<arboard::Clipboard>,
+
+    // Zoom
+    /// Runtime zoom delta in font-size points, clamped to [-7, +7].
+    zoom_level: i8,
+
+    // Search
+    search_overlay: search_overlay::SearchOverlay,
 
     /// Whether the splash screen is still showing.
     /// Set to `true` on init; cleared when the first `PtyOutput` arrives.
@@ -95,6 +144,41 @@ struct App {
     /// Last animation tick time.
     last_tick: Instant,
 
+    /// Whether the cursor is currently visible (toggled by blink timer).
+    cursor_visible: bool,
+    /// Whether cursor blinking is enabled (from config).
+    cursor_blink_enabled: bool,
+    /// Time of last blink toggle.
+    blink_timer: Instant,
+
+    /// Current opacity (0.0-1.0). Applied to clear color and cell backgrounds.
+    opacity: f32,
+    /// Whether the window was created with transparency support.
+    window_transparent: bool,
+
+    /// Per-window geometry registry (multi-window support).
+    window_registry: window_state::WindowRegistry,
+    /// Loaded geometry to apply during init (consumed once).
+    saved_geometry: Option<window_state::WindowGeometry>,
+    /// When set, a geometry save is pending (debounced).
+    geometry_save_pending: Option<Instant>,
+
+    /// `true` after a workspace tree has been received from the server,
+    /// suppressing the legacy `split_direction` fallback in
+    /// `handle_workspace_info`.
+    received_workspace_tree: bool,
+    /// Persistent GTK thread for the settings window.
+    settings_thread: scribe_settings::SettingsThread,
+    /// Saved settings window geometry (persisted across opens).
+    settings_geometry: Option<scribe_settings::SettingsWindowGeometry>,
+    /// Persistent store for settings window geometry.
+    settings_state_store: window_state::StateStore<SettingsGeometryFile>,
+    /// Whether to reopen the settings window after init (consumed once).
+    settings_reopen_pending: bool,
+
+    /// System hostname for the window-level status bar (fetched once at startup).
+    hostname: String,
+
     /// Config file watcher -- kept alive for its side-effect of sending
     /// `UiEvent::ConfigChanged` events.
     #[allow(dead_code, reason = "watcher must be stored to keep receiving file-system events")]
@@ -102,7 +186,11 @@ struct App {
 }
 
 impl App {
-    fn new(wgpu_instance: wgpu::Instance, proxy: EventLoopProxy<UiEvent>) -> Self {
+    fn new(
+        wgpu_instance: wgpu::Instance,
+        proxy: EventLoopProxy<UiEvent>,
+        window_id: Option<WindowId>,
+    ) -> Self {
         let animation_proxy = proxy.clone();
         let watcher_proxy = proxy.clone();
 
@@ -116,8 +204,18 @@ impl App {
 
         let initial_workspace_id = WorkspaceId::new();
         let initial_accent = theme.chrome.accent;
+        let cursor_blink_enabled = config.appearance.cursor_blink;
+
+        let opacity = config.appearance.opacity;
+        let window_transparent = config.appearance.opacity < 1.0;
+        let bindings = input::Bindings::parse(&config.keybindings);
+        let window_registry = window_state::WindowRegistry::new();
+        let saved_geometry = window_id.map(|wid| window_registry.load(wid));
+        let (settings_state_store, settings_state) =
+            window_state::StateStore::<SettingsGeometryFile>::load("settings_state.toml");
 
         Self {
+            window_id,
             config,
             theme,
             window: None,
@@ -126,16 +224,42 @@ impl App {
             window_layout: WindowLayout::new(initial_workspace_id, Some(initial_accent)),
             panes: HashMap::new(),
             session_to_pane: HashMap::new(),
+            pending_sessions: VecDeque::new(),
             divider_drag: None,
+            active_selection: None,
+            mouse_selecting: false,
+            server_connected: false,
             ai_tracker: AiStateTracker::new(),
             animation_running: false,
             modifiers: ModifiersState::default(),
+            bindings,
+            clipboard: arboard::Clipboard::new()
+                .map_err(|e| {
+                    tracing::warn!("clipboard unavailable: {e}");
+                })
+                .ok(),
+            zoom_level: 0,
+            search_overlay: search_overlay::SearchOverlay::new(),
             splash_active: true,
             wgpu_instance,
             proxy: Some(proxy),
             animation_proxy: Some(animation_proxy),
             last_cursor_pos: None,
             last_tick: Instant::now(),
+            cursor_visible: true,
+            cursor_blink_enabled,
+            blink_timer: Instant::now(),
+            opacity,
+            window_transparent,
+            window_registry,
+            saved_geometry,
+            geometry_save_pending: None,
+            received_workspace_tree: false,
+            settings_thread: scribe_settings::SettingsThread::spawn(),
+            settings_geometry: settings_state.geometry,
+            settings_state_store,
+            settings_reopen_pending: settings_state.open,
+            hostname: read_hostname(),
             _config_watcher: config_watcher,
         }
     }
@@ -155,6 +279,12 @@ impl ApplicationHandler<UiEvent> for App {
         if let Err(e) = self.init_gpu_and_terminal(event_loop) {
             tracing::error!(error = %e, "failed to initialise GPU / terminal");
             event_loop.exit();
+            return;
+        }
+
+        // Re-open the settings window if it was open when the app last exited.
+        if std::mem::take(&mut self.settings_reopen_pending) {
+            self.open_settings();
         }
     }
 
@@ -184,11 +314,11 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::GitBranch { session_id, branch } => {
                 self.handle_git_branch(session_id, branch);
             }
-            UiEvent::WorkspaceInfo { workspace_id, name, accent_color } => {
-                self.handle_workspace_info(workspace_id, name, &accent_color);
+            UiEvent::WorkspaceInfo { workspace_id, name, accent_color, split_direction } => {
+                self.handle_workspace_info(workspace_id, name, &accent_color, split_direction);
             }
-            UiEvent::SessionList { sessions } => {
-                self.handle_session_list(&sessions);
+            UiEvent::SessionList { sessions, workspace_tree } => {
+                self.handle_session_list(&sessions, workspace_tree.as_ref());
             }
             UiEvent::WorkspaceNamed { workspace_id, name } => {
                 self.handle_workspace_named(workspace_id, &name);
@@ -198,24 +328,69 @@ impl ApplicationHandler<UiEvent> for App {
             }
             UiEvent::ServerDisconnected => {
                 tracing::info!("server disconnected, exiting");
+                self.server_connected = false;
+                self.request_redraw();
                 event_loop.exit();
             }
             UiEvent::AnimationTick => {
                 self.handle_animation_tick();
             }
+            UiEvent::SettingsClosed { geometry } => {
+                self.settings_geometry = Some(geometry);
+                let state = SettingsGeometryFile { geometry: Some(geometry), open: false };
+                if let Err(e) = self.settings_state_store.save(&state) {
+                    tracing::warn!("failed to persist settings window geometry: {e}");
+                }
+            }
+            UiEvent::Welcome { window_id, other_windows } => {
+                self.handle_welcome(window_id, &other_windows);
+            }
+            UiEvent::QuitRequested => {
+                self.handle_quit_requested(event_loop);
+            }
+            UiEvent::QuitAllFromDialog => {
+                self.handle_quit_all(event_loop);
+            }
+            UiEvent::CloseWindow => {
+                self.handle_close_window(event_loop);
+            }
+            UiEvent::CancelClose => {}
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.cursor_blink_enabled {
+            let elapsed = self.blink_timer.elapsed();
+            if elapsed >= BLINK_INTERVAL {
+                // Blink interval elapsed — request a redraw so `handle_redraw`
+                // toggles `cursor_visible` and paints the new state.
+                self.request_redraw();
+            } else {
+                let remaining = BLINK_INTERVAL.saturating_sub(elapsed);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + remaining));
+            }
+        }
+        // When blink is disabled, don't set ControlFlow — let winit use its default (Wait).
+
+        self.flush_geometry_if_due();
     }
 
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.handle_close_requested(event_loop);
+            }
             WindowEvent::RedrawRequested => self.handle_redraw(),
-            WindowEvent::Resized(size) => self.handle_resize(size),
+            WindowEvent::Resized(size) => {
+                self.handle_resize(size);
+                self.mark_geometry_dirty();
+            }
+            WindowEvent::Moved(_) => self.mark_geometry_dirty(),
             WindowEvent::ModifiersChanged(new_mods) => {
                 self.modifiers = new_mods.state();
             }
@@ -250,21 +425,42 @@ impl App {
         reason = "viewport dimensions are small enough to fit in f32"
     )]
     fn init_gpu_and_terminal(&mut self, event_loop: &ActiveEventLoop) -> Result<(), InitError> {
-        let attrs = Window::default_attributes().with_title("Scribe");
+        let mut attrs = Window::default_attributes().with_title("Scribe");
+        if self.window_transparent {
+            attrs = attrs.with_transparent(true);
+            tracing::info!(opacity = self.opacity, "window transparency enabled");
+        }
         let window = Arc::new(event_loop.create_window(attrs).map_err(InitError::Window)?);
+
+        // Restore saved window geometry (position, size, maximized state).
+        if let Some(geom) = self.saved_geometry.take() {
+            window_state::apply_window_geometry(event_loop, &window, &geom);
+        }
 
         let surface =
             self.wgpu_instance.create_surface(Arc::clone(&window)).map_err(InitError::Surface)?;
 
-        let (device, queue, surface_config) =
-            configure_device_and_surface(&self.wgpu_instance, &surface, &window)?;
+        let (device, queue, surface_config) = configure_device_and_surface(
+            &self.wgpu_instance,
+            &surface,
+            &window,
+            self.window_transparent,
+        )?;
 
         let size = window.inner_size();
+        let font_params = scribe_renderer::atlas::FontParams {
+            family: self.config.appearance.font.clone(),
+            size: self.config.appearance.font_size,
+            weight: self.config.appearance.font_weight,
+            weight_bold: self.config.appearance.font_weight_bold,
+            ligatures: self.config.appearance.ligatures,
+            line_padding: self.config.appearance.line_padding,
+        };
         let mut renderer = TerminalRenderer::new(
             &device,
             &queue,
             surface_config.format,
-            self.config.appearance.font_size,
+            &font_params,
             (size.width, size.height),
         );
 
@@ -272,7 +468,7 @@ impl App {
 
         // Start IPC thread (proxy was created before run_app).
         let proxy = self.proxy.take().ok_or(InitError::ProxyConsumed)?;
-        let cmd_tx = ipc_client::start_ipc_thread(proxy);
+        let cmd_tx = ipc_client::start_ipc_thread(proxy, self.window_id);
 
         // Ask the server for existing sessions before creating anything.
         // Pane creation is deferred to `handle_session_list` which runs
@@ -317,10 +513,29 @@ impl App {
         session_id: SessionId,
         snapshot: &scribe_common::screen::ScreenSnapshot,
     ) {
-        let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
-        let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+        let non_empty = snapshot.cells.iter().filter(|c| c.c != ' ' && c.c != '\0').count();
+        let first_char = snapshot.cells.iter().find(|c| c.c != ' ' && c.c != '\0');
+        tracing::info!(
+            %session_id,
+            cols = snapshot.cols,
+            rows = snapshot.rows,
+            cells = snapshot.cells.len(),
+            non_empty,
+            first_char = ?first_char.map(|c| c.c),
+            "applying screen snapshot"
+        );
+
+        let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else {
+            tracing::warn!(%session_id, "snapshot: no pane for session");
+            return;
+        };
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            tracing::warn!(%session_id, "snapshot: pane not found");
+            return;
+        };
 
         let ansi = snapshot_to_ansi(snapshot);
+        tracing::info!(ansi_len = ansi.len(), "feeding snapshot ANSI to pane");
         pane.feed_output(&ansi);
         self.request_redraw();
     }
@@ -344,10 +559,22 @@ impl App {
 
     /// Handle `SessionList` response from the server.
     ///
-    /// If the server has existing sessions, reattach to them (restoring one
-    /// tab per session). Otherwise fall back to creating a fresh session.
-    fn handle_session_list(&mut self, sessions: &[scribe_common::protocol::SessionInfo]) {
-        let Some(tx) = &self.cmd_tx else { return };
+    /// If the server has existing sessions, reattach to them — restoring one
+    /// tab per session in the correct workspace.  Multiple server-side
+    /// workspaces are reconstructed by splitting the window layout.
+    /// If no sessions exist, fall back to creating a fresh session.
+    fn handle_session_list(
+        &mut self,
+        sessions: &[scribe_common::protocol::SessionInfo],
+        workspace_tree: Option<&scribe_common::protocol::WorkspaceTreeNode>,
+    ) {
+        let Some(tx) = self.cmd_tx.clone() else { return };
+
+        self.server_connected = true;
+
+        // Reset per-reconnect state so that a second reconnect (if ever
+        // supported in-process) does not carry stale flags.
+        self.received_workspace_tree = false;
 
         if sessions.is_empty() {
             self.create_initial_session();
@@ -357,24 +584,69 @@ impl App {
         tracing::info!(count = sessions.len(), "reattaching to existing sessions");
 
         let session_ids: Vec<SessionId> = sessions.iter().map(|s| s.session_id).collect();
-        send_command(tx, ClientCommand::AttachSessions { session_ids: session_ids.clone() });
+        send_command(&tx, ClientCommand::AttachSessions { session_ids: session_ids.clone() });
 
-        let workspace_id = self.window_layout.focused_workspace_id();
+        // -- Group sessions by workspace ------------------------------------
+        let mut groups: HashMap<WorkspaceId, Vec<SessionId>> = HashMap::new();
         for info in sessions {
-            self.window_layout.add_tab(workspace_id, info.session_id);
+            groups.entry(info.workspace_id).or_default().push(info.session_id);
+        }
+        // Workspaces that actually have live sessions.
+        let live_workspace_ids: HashSet<WorkspaceId> = groups.keys().copied().collect();
+
+        // -- Reconstruct workspaces -----------------------------------------
+        if let Some(tree) = workspace_tree {
+            self.reconstruct_from_tree(tree, &live_workspace_ids);
+        } else {
+            self.reconstruct_fallback(sessions);
         }
 
-        let Some((pane_id, pane_rect, grid)) = self.first_pane_geometry() else { return };
-        let active_session = sessions.last().map_or(SessionId::new(), |s| s.session_id);
-        let pane = Pane::new(pane_rect, grid, active_session, workspace_id, pane_id);
-        self.panes.insert(pane_id, pane);
-        self.session_to_pane.insert(active_session, pane_id);
+        // Use the layout's own leaf order to determine workspace iteration.
+        // When a tree was provided, this preserves the exact spatial order;
+        // when falling back, it matches the construction order.
+        let workspace_order = self.window_layout.workspace_ids_in_order();
 
-        // Subscribe and send resize to trigger shell redraw via SIGWINCH.
-        send_command(tx, ClientCommand::Subscribe { session_ids });
-        for info in sessions {
-            send_resize(tx, info.session_id, grid.cols, grid.rows);
+        // -- Add tabs and create panes --------------------------------------
+        let Some(&first_ws) = workspace_order.first() else { return };
+        let Some(first_sessions) = groups.get(&first_ws) else { return };
+        let Some(&first_sid) = first_sessions.first() else { return };
+
+        let Some(first_pane_id) = self.window_layout.add_tab(first_ws, first_sid) else {
+            return;
+        };
+        let Some((_geo_id, pane_rect, grid)) = self.first_pane_geometry() else { return };
+
+        let first_pane = Pane::new(pane_rect, grid, first_sid, first_ws);
+        self.panes.insert(first_pane_id, first_pane);
+        self.session_to_pane.insert(first_sid, first_pane_id);
+
+        // Collect remaining (workspace, session) pairs across all workspaces.
+        let remaining: Vec<(WorkspaceId, SessionId)> = workspace_order
+            .iter()
+            .flat_map(|&ws_id| {
+                let skip = usize::from(ws_id == first_ws);
+                groups
+                    .get(&ws_id)
+                    .into_iter()
+                    .flat_map(move |sids| sids.iter().skip(skip).map(move |&sid| (ws_id, sid)))
+            })
+            .collect();
+
+        for (ws_id, sid) in remaining {
+            let Some(pane_id) = self.window_layout.add_tab(ws_id, sid) else {
+                continue;
+            };
+            let pane = Pane::new(pane_rect, grid, sid, ws_id);
+            self.panes.insert(pane_id, pane);
+            self.session_to_pane.insert(sid, pane_id);
         }
+
+        // Subscribe to output from all restored sessions.
+        send_command(&tx, ClientCommand::Subscribe { session_ids });
+
+        // Recompute pane geometry for each workspace and send the correct
+        // grid dimensions to the server.
+        self.resize_all_workspace_panes();
 
         // Dismiss splash — we're reconnecting, not waiting for first output.
         self.splash_active = false;
@@ -384,23 +656,73 @@ impl App {
         self.request_redraw();
     }
 
+    /// Reconstruct the workspace layout from a server-provided tree.
+    ///
+    /// Prunes any tree leaves whose workspace has no live sessions (stale
+    /// entries from a previous client that closed workspaces after its last
+    /// tree report).
+    fn reconstruct_from_tree(
+        &mut self,
+        tree: &scribe_common::protocol::WorkspaceTreeNode,
+        live_ids: &HashSet<WorkspaceId>,
+    ) {
+        self.window_layout = workspace_layout::WindowLayout::from_tree(tree);
+        self.received_workspace_tree = true;
+
+        // Prune stale leaves.
+        let tree_ids = self.window_layout.workspace_ids_in_order();
+        for id in tree_ids {
+            if !live_ids.contains(&id) {
+                self.window_layout.remove_workspace(id);
+            }
+        }
+
+        tracing::info!("reconstructed workspace layout from server tree");
+    }
+
+    /// Fallback reconstruction for old servers that don't send a workspace
+    /// tree.  Builds a linear chain and relies on `WorkspaceInfo` direction
+    /// patches to fix what they can.
+    fn reconstruct_fallback(&mut self, sessions: &[scribe_common::protocol::SessionInfo]) {
+        let mut workspace_order: Vec<WorkspaceId> = Vec::new();
+        for info in sessions {
+            if !workspace_order.contains(&info.workspace_id) {
+                workspace_order.push(info.workspace_id);
+            }
+        }
+        let default_ws = self.window_layout.focused_workspace_id();
+        if let Some(&first_ws) = workspace_order.first() {
+            self.window_layout.set_workspace_id(default_ws, first_ws);
+        }
+        for &ws_id in workspace_order.get(1..).unwrap_or_default() {
+            self.window_layout.split_workspace_with_id(
+                layout::SplitDirection::Vertical,
+                None,
+                ws_id,
+            );
+        }
+    }
+
     /// Create the initial session + pane for a fresh start (no existing sessions).
     fn create_initial_session(&mut self) {
         let Some(tx) = &self.cmd_tx else { return };
 
         let workspace_id = self.window_layout.focused_workspace_id();
         let session_id = SessionId::new();
-        let initial_id = LayoutTree::initial_pane_id();
 
-        self.window_layout.add_tab(workspace_id, session_id);
+        let Some(pane_id) = self.window_layout.add_tab(workspace_id, session_id) else { return };
 
-        let Some((_pane_id, pane_rect, grid)) = self.first_pane_geometry() else { return };
-        let pane = Pane::new(pane_rect, grid, session_id, workspace_id, initial_id);
+        let Some((_first_id, pane_rect, grid)) = self.first_pane_geometry() else { return };
+        let pane = Pane::new(pane_rect, grid, session_id, workspace_id);
 
-        send_command(tx, ClientCommand::CreateSession { workspace_id });
-        self.panes.insert(initial_id, pane);
-        self.session_to_pane.insert(session_id, initial_id);
+        send_command(tx, ClientCommand::CreateSession { workspace_id, split_direction: None });
+        self.panes.insert(pane_id, pane);
+        self.session_to_pane.insert(session_id, pane_id);
+        self.pending_sessions.push_back(session_id);
         send_resize(tx, session_id, grid.cols, grid.rows);
+
+        // Seed the server with the initial (single-leaf) tree.
+        self.report_workspace_tree();
     }
 
     /// Compute the pane ID, rect, and grid size for the first pane of the
@@ -413,8 +735,16 @@ impl App {
         let gpu = self.gpu.as_ref()?;
         let window = self.window.as_ref()?;
         let size = window.inner_size();
-        let viewport =
-            Rect { x: 0.0, y: 0.0, width: size.width as f32, height: size.height as f32 };
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "viewport dimensions are small enough to fit in f32"
+        )]
+        let viewport = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: size.width as f32,
+            height: (size.height as f32 - status_bar::STATUS_BAR_HEIGHT).max(1.0),
+        };
         let cell = gpu.renderer.cell_size();
 
         let ws_rects = self.window_layout.compute_workspace_rects(viewport);
@@ -428,27 +758,38 @@ impl App {
     }
 
     /// Handle server confirming session creation.
+    ///
+    /// Pops the oldest pending (temporary) session ID, rebinds the pane and
+    /// tab state to the real server-assigned session ID, and subscribes for
+    /// PTY output.
     fn handle_session_created(&mut self, session_id: SessionId) {
         tracing::info!(session = %session_id, "session created");
 
-        let pane_to_bind = self.find_unconfirmed_pane();
+        let Some(old_session_id) = self.pending_sessions.pop_front() else {
+            tracing::warn!("SessionCreated with no pending session");
+            return;
+        };
 
-        if let Some((pane_id, old_session_id)) = pane_to_bind {
-            self.session_to_pane.remove(&old_session_id);
+        // Rebind the pane.
+        if let Some(pane_id) = self.session_to_pane.remove(&old_session_id) {
             self.session_to_pane.insert(session_id, pane_id);
             if let Some(pane) = self.panes.get_mut(&pane_id) {
                 pane.session_id = session_id;
             }
+        }
 
-            if let Some(tx) = &self.cmd_tx {
-                send_command(tx, ClientCommand::Subscribe { session_ids: vec![session_id] });
-            }
+        // Update the workspace tab state so it references the real session.
+        self.window_layout.update_tab_session(old_session_id, session_id);
+
+        if let Some(tx) = &self.cmd_tx {
+            send_command(tx, ClientCommand::Subscribe { session_ids: vec![session_id] });
         }
     }
 
     /// Handle session exit.
     fn handle_session_exited(&mut self, session_id: SessionId) {
         tracing::info!(session = %session_id, "session exited");
+        self.ai_tracker.remove(session_id);
 
         let Some(pane_id) = self.session_to_pane.remove(&session_id) else { return };
 
@@ -463,10 +804,9 @@ impl App {
 
         if !can_close {
             // Only one pane in the active tab; remove the tab from the workspace.
-            if let Some(wid) = ws_id {
-                self.window_layout.remove_tab(wid, session_id);
-            }
+            self.remove_tab_and_cleanup_workspace(ws_id, session_id);
             self.panes.remove(&pane_id);
+            self.request_redraw();
             return;
         }
 
@@ -482,12 +822,33 @@ impl App {
         self.request_redraw();
     }
 
+    /// Remove a session's tab and clean up the workspace if it becomes empty.
+    fn remove_tab_and_cleanup_workspace(
+        &mut self,
+        ws_id: Option<WorkspaceId>,
+        session_id: SessionId,
+    ) {
+        let Some(wid) = ws_id else { return };
+        self.window_layout.remove_tab(wid, session_id);
+
+        // If the workspace is now empty, remove it from the layout tree
+        // so it doesn't linger as a blank region.
+        let empty = self.window_layout.is_workspace_empty(wid);
+        if empty && self.window_layout.remove_workspace(wid) {
+            self.resize_all_workspace_panes();
+            self.report_workspace_tree();
+        }
+    }
+
     /// Handle AI state change from server.
     fn handle_ai_state_changed(
         &mut self,
         session_id: SessionId,
         ai_state: scribe_common::ai_state::AiProcessState,
     ) {
+        if !self.config.terminal.claude_code_integration {
+            return;
+        }
         self.ai_tracker.update(session_id, ai_state);
         tracing::debug!(session = %session_id, "AI state updated");
 
@@ -537,18 +898,31 @@ impl App {
         pane.git_branch = branch;
     }
 
-    /// Handle full workspace info from server — update name and accent color.
+    /// Handle full workspace info from server — update name, accent color,
+    /// and (on reconnect) the split direction of the parent split node.
     fn handle_workspace_info(
         &mut self,
         workspace_id: WorkspaceId,
         name: Option<String>,
         accent_color: &str,
+        split_direction: Option<scribe_common::protocol::LayoutDirection>,
     ) {
-        tracing::debug!(%workspace_id, ?name, %accent_color, "workspace info received");
+        tracing::debug!(%workspace_id, ?name, %accent_color, ?split_direction, "workspace info received");
         if let Some(ws) = self.window_layout.find_workspace_mut(workspace_id) {
             ws.name = name;
             if let Some(color) = parse_hex_color(accent_color) {
                 ws.accent_color = color;
+            }
+        }
+
+        // Apply the persisted split direction so reconnected workspace
+        // layouts match the original arrangement.  Skip when a full
+        // workspace tree was received — the tree already has the correct
+        // directions and ratios.
+        if !self.received_workspace_tree {
+            if let Some(dir) = split_direction {
+                self.window_layout
+                    .update_split_direction_for(workspace_id, from_layout_direction(dir));
             }
         }
     }
@@ -569,7 +943,11 @@ impl App {
         }
     }
 
-    /// Reload config from disk and apply theme changes.
+    /// Reload config from disk and apply changed settings.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "sequential comparison of all hot-reloadable config fields in one method"
+    )]
     fn handle_config_changed(&mut self) {
         let new_config = match scribe_common::config::load_config() {
             Ok(c) => c,
@@ -579,13 +957,67 @@ impl App {
             }
         };
 
-        let new_theme = resolve_theme(&new_config);
+        // Keep a reference to the old config for comparisons before we move
+        // new_config into self.config at the end of the method.
+        let old = &self.config;
 
-        if let Some(gpu) = &mut self.gpu {
-            gpu.renderer.set_theme(&new_theme);
+        // -- Theme (conditional) --
+        if old.appearance.theme != new_config.appearance.theme {
+            let new_theme = resolve_theme(&new_config);
+            if let Some(gpu) = &mut self.gpu {
+                gpu.renderer.set_theme(&new_theme);
+            }
+            self.theme = new_theme;
         }
 
-        self.theme = new_theme;
+        // -- Font params --
+        let font_changed = old.appearance.font != new_config.appearance.font
+            || (old.appearance.font_size - new_config.appearance.font_size).abs() > f32::EPSILON
+            || old.appearance.font_weight != new_config.appearance.font_weight
+            || old.appearance.font_weight_bold != new_config.appearance.font_weight_bold
+            || old.appearance.ligatures != new_config.appearance.ligatures
+            || old.appearance.line_padding != new_config.appearance.line_padding;
+
+        if font_changed {
+            if let Some(gpu) = &mut self.gpu {
+                let params = scribe_renderer::atlas::FontParams {
+                    family: new_config.appearance.font.clone(),
+                    size: new_config.appearance.font_size,
+                    weight: new_config.appearance.font_weight,
+                    weight_bold: new_config.appearance.font_weight_bold,
+                    ligatures: new_config.appearance.ligatures,
+                    line_padding: new_config.appearance.line_padding,
+                };
+                gpu.renderer.rebuild_atlas(&gpu.device, &gpu.queue, &params);
+            }
+        }
+
+        // -- Cursor shape --
+        if let Some(gpu) = &mut self.gpu {
+            gpu.renderer.set_cursor_shape(new_config.appearance.cursor_shape);
+        }
+
+        // -- Cursor blink --
+        self.cursor_blink_enabled = new_config.appearance.cursor_blink;
+        if !self.cursor_blink_enabled {
+            self.cursor_visible = true;
+        }
+
+        // -- Opacity --
+        if (old.appearance.opacity - new_config.appearance.opacity).abs() > f32::EPSILON {
+            if !self.window_transparent && new_config.appearance.opacity < 1.0 {
+                tracing::warn!(
+                    "opacity < 1.0 requires restart to take effect \
+                     (window was created without transparency)"
+                );
+            } else {
+                self.opacity = new_config.appearance.opacity;
+            }
+        }
+
+        // -- Keybindings --
+        self.bindings = input::Bindings::parse(&new_config.keybindings);
+
         self.config = new_config;
 
         tracing::info!("config hot-reloaded");
@@ -630,48 +1062,113 @@ impl App {
             }
         }
 
-        let viewport = viewport_rect(&gpu.surface_config);
+        let full_viewport = viewport_rect(&gpu.surface_config);
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
         let cell_size = (gpu.renderer.cell_size().width, gpu.renderer.cell_size().height);
 
-        // Get pane rects and dividers from the active tab's layout tree.
-        let (pane_rects, dividers, focused_pane, focus_split_direction) =
-            if let Some(tab) = self.window_layout.active_tab() {
-                // Compute the workspace rect for the focused workspace.
-                let ws_rects = self.window_layout.compute_workspace_rects(viewport);
-                let ws_rect = ws_rects
-                    .iter()
-                    .find(|(wid, _)| *wid == self.window_layout.focused_workspace_id())
-                    .map_or(viewport, |(_, r)| *r);
+        // Get pane rects and dividers from ALL workspaces' active tabs.
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+        let focused_ws_id = self.window_layout.focused_workspace_id();
+        let multi_workspace = self.window_layout.workspace_count() > 1;
+        let mut pane_rects: Vec<(PaneId, Rect)> = Vec::new();
+        let mut dividers = Vec::new();
+        let mut focused_pane = PaneId::from_raw(u32::MAX);
+        let mut focus_split_direction = None;
+        let mut ws_tab_bar_data: Vec<tab_bar::WorkspaceTabBarData> = Vec::new();
 
-                let rects = tab.pane_layout.compute_rects(ws_rect);
-                let divs = divider::collect_dividers(tab.pane_layout.root(), ws_rect);
-                let fp = tab.focused_pane;
-                let fsd = tab.pane_layout.parent_split_direction(fp);
-                (rects, divs, fp, fsd)
-            } else {
-                (Vec::new(), Vec::new(), LayoutTree::initial_pane_id(), None)
-            };
-
+        // Linearise ANSI palette early — needed both for tab AI indicators and
+        // pane border colours computed during the workspace loop.
         let linear_ansi = linearise_ansi_colors(&self.theme.ansi_colors);
         let ansi_colors = &linear_ansi;
-        let ai_accent = scribe_renderer::srgb_to_linear_rgba(self.theme.chrome.accent);
-        let border_colors: HashMap<PaneId, [f32; 4]> = pane_rects
-            .iter()
-            .filter_map(|(pane_id, _)| {
-                let pane = self.panes.get(pane_id)?;
-                let color =
-                    self.ai_tracker.border_color(pane.session_id, ansi_colors, ai_accent)?;
-                Some((*pane_id, color))
-            })
-            .collect();
+        let ai_enabled = self.config.terminal.claude_code_integration;
+
+        for (ws_id, ws_rect) in &ws_rects {
+            let ws = self.window_layout.find_workspace(*ws_id);
+            let Some(ws) = ws else { continue };
+            let Some(tab) = ws.active_tab() else { continue };
+
+            pane_rects.extend(tab.pane_layout.compute_rects(*ws_rect));
+            dividers.extend(divider::collect_dividers(tab.pane_layout.root(), *ws_rect));
+            if *ws_id == focused_ws_id {
+                focused_pane = tab.focused_pane;
+                focus_split_direction = tab.pane_layout.parent_split_direction(tab.focused_pane);
+            }
+
+            // Collect tab data for this workspace's tab bar.
+            let tabs: Vec<tab_bar::TabData> = ws
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, ts)| {
+                    let title = self
+                        .session_to_pane
+                        .get(&ts.session_id)
+                        .and_then(|pid| self.panes.get(pid))
+                        .map_or_else(|| format!("tab {}", i + 1), |p| p.title.clone());
+                    let ai_indicator = ai_enabled
+                        .then(|| self.ai_tracker.tab_indicator_color(ts.session_id, ansi_colors))
+                        .flatten();
+                    tab_bar::TabData { title, is_active: i == ws.active_tab, ai_indicator }
+                })
+                .collect();
+
+            let badge = if multi_workspace {
+                let name = ws.name.clone().unwrap_or_else(|| String::from("workspace"));
+                Some((name, ws.accent_color))
+            } else {
+                None
+            };
+
+            ws_tab_bar_data.push(tab_bar::WorkspaceTabBarData { ws_rect: *ws_rect, tabs, badge });
+        }
+
+        // Workspace-aggregated AI border colours: for each pane, find the
+        // workspace it belongs to and pick the highest-priority AI state.
+        let border_colors: HashMap<PaneId, [f32; 4]> = if ai_enabled {
+            pane_rects
+                .iter()
+                .filter_map(|(pane_id, _)| {
+                    let pane = self.panes.get(pane_id)?;
+                    let ws_id = self.window_layout.workspace_for_session(pane.session_id)?;
+                    let ws = self.window_layout.find_workspace(ws_id)?;
+                    let session_ids: Vec<SessionId> =
+                        ws.tabs.iter().map(|t| t.session_id).collect();
+                    let color =
+                        self.ai_tracker.workspace_border_color(&session_ids, ansi_colors)?;
+                    Some((*pane_id, color))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
 
         let tab_colors = tab_bar::TabBarColors::from(&self.theme.chrome);
         let sb_colors = status_bar::StatusBarColors::from_theme(&self.theme.chrome, ansi_colors);
-        let pane_count = self.panes.len();
         let divider_color = scribe_renderer::srgb_to_linear_rgba(self.theme.chrome.divider);
         let accent_color = scribe_renderer::srgb_to_linear_rgba(self.theme.chrome.accent);
 
-        let all_instances = build_all_instances(
+        // Gather focused pane data for the window-level status bar.
+        let focused_pane_cwd = self
+            .window_layout
+            .active_tab()
+            .and_then(|t| self.panes.get(&t.focused_pane))
+            .and_then(|p| p.cwd.clone());
+        let focused_pane_git = self
+            .window_layout
+            .active_tab()
+            .and_then(|t| self.panes.get(&t.focused_pane))
+            .and_then(|p| p.git_branch.clone());
+        let focused_ws_name = self.window_layout.focused_workspace().and_then(|ws| ws.name.clone());
+        let session_count = self.panes.len();
+
+        // Toggle cursor blink state before building instances.
+        if self.cursor_blink_enabled && self.blink_timer.elapsed() >= BLINK_INTERVAL {
+            self.cursor_visible = !self.cursor_visible;
+            self.blink_timer = Instant::now();
+        }
+        let cursor_visible = self.cursor_visible;
+
+        let mut all_instances = build_all_instances(
             &mut gpu.renderer,
             &gpu.device,
             &gpu.queue,
@@ -682,12 +1179,40 @@ impl App {
             focused_pane,
             &border_colors,
             &tab_colors,
-            &sb_colors,
-            pane_count,
+            &ws_tab_bar_data,
             divider_color,
             accent_color,
             focus_split_direction,
+            cursor_visible,
         );
+
+        // Window-level status bar spanning the full window width.
+        {
+            let time_str = current_time_str();
+            let sb_data = status_bar::StatusBarData {
+                connected: self.server_connected,
+                workspace_name: focused_ws_name.as_deref(),
+                cwd: focused_pane_cwd.as_deref(),
+                git_branch: focused_pane_git.as_deref(),
+                session_count,
+                hostname: &self.hostname,
+                time: &time_str,
+            };
+            let mut resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            status_bar::build_status_bar(
+                &mut all_instances,
+                full_viewport,
+                cell_size,
+                &sb_colors,
+                &sb_data,
+                &mut resolve_glyph,
+            );
+        }
+
+        if self.opacity < 1.0 {
+            apply_opacity_to_instances(&mut all_instances, self.opacity);
+        }
 
         gpu.renderer.pipeline_mut().update_instances(&gpu.device, &gpu.queue, &all_instances);
 
@@ -695,7 +1220,15 @@ impl App {
             label: Some("multi-pane encoder"),
         });
 
-        let clear_color = gpu.renderer.default_bg();
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "fixed-size [f32; 4] array, index 3 always valid"
+        )]
+        let clear_color = {
+            let mut c = gpu.renderer.default_bg();
+            c[3] *= self.opacity;
+            c
+        };
         gpu.renderer.pipeline_mut().render_with_clear(&mut encoder, &view, clear_color);
         gpu.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
@@ -721,35 +1254,53 @@ impl App {
             splash.update_viewport(&gpu.queue, (size.width, size.height));
         }
 
-        self.resize_after_layout_change();
+        self.resize_all_workspace_panes();
         self.request_redraw();
     }
 
     /// Translate a keyboard event and forward it to the correct handler.
     fn handle_keyboard(&mut self, event: &winit::event::KeyEvent) {
-        let Some(action) = input::translate_key_action(event, self.modifiers) else {
+        let Some(action) = input::translate_key_action(event, self.modifiers, &self.bindings)
+        else {
             return;
         };
+
+        // Reset cursor to visible on any keypress so it doesn't stay hidden mid-blink.
+        self.cursor_visible = true;
+        self.blink_timer = Instant::now();
+        self.request_redraw();
 
         match action {
             KeyAction::Terminal(bytes) => self.handle_terminal_key(bytes),
             KeyAction::Layout(layout_action) => self.handle_layout_action(layout_action),
             KeyAction::OpenSettings => self.open_settings(),
+            KeyAction::OpenFind => self.handle_open_find(),
         }
     }
 
-    fn handle_terminal_key(&self, bytes: Vec<u8>) {
+    fn handle_terminal_key(&mut self, bytes: Vec<u8>) {
         let Some(tx) = &self.cmd_tx else { return };
         let Some(tab) = self.window_layout.active_tab() else { return };
         let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
+        let sid = pane.session_id;
 
-        if tx.send(ClientCommand::KeyInput { session_id: pane.session_id, data: bytes }).is_err() {
+        if tx.send(ClientCommand::KeyInput { session_id: sid, data: bytes }).is_err() {
             tracing::warn!("IPC channel closed; keyboard input dropped");
+        }
+
+        // Clear "waiting for input / permission" indicators on real keystrokes.
+        if self.config.terminal.claude_code_integration {
+            self.ai_tracker.clear_attention_states(sid);
         }
     }
 
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "flat match dispatch on LayoutAction variants; each arm is trivial"
+    )]
     fn handle_layout_action(&mut self, action: LayoutAction) {
         match action {
+            // Panes
             LayoutAction::SplitVertical => {
                 self.handle_split(layout::SplitDirection::Horizontal);
             }
@@ -758,6 +1309,54 @@ impl App {
             }
             LayoutAction::ClosePane => self.handle_close_pane(),
             LayoutAction::FocusNext => self.handle_focus_next(),
+            LayoutAction::FocusLeft => {
+                self.handle_focus_directional(layout::FocusDirection::Left);
+            }
+            LayoutAction::FocusRight => {
+                self.handle_focus_directional(layout::FocusDirection::Right);
+            }
+            LayoutAction::FocusUp => {
+                self.handle_focus_directional(layout::FocusDirection::Up);
+            }
+            LayoutAction::FocusDown => {
+                self.handle_focus_directional(layout::FocusDirection::Down);
+            }
+
+            // Workspaces
+            LayoutAction::WorkspaceSplitVertical => {
+                self.handle_workspace_split(layout::SplitDirection::Horizontal);
+            }
+            LayoutAction::WorkspaceSplitHorizontal => {
+                self.handle_workspace_split(layout::SplitDirection::Vertical);
+            }
+            LayoutAction::CycleWorkspaceFocus => {
+                if self.window_layout.cycle_workspace_focus() {
+                    self.request_redraw();
+                }
+            }
+            LayoutAction::NewWindow => self.handle_new_window(),
+
+            // Tabs
+            LayoutAction::NewTab => self.handle_new_tab(),
+            LayoutAction::CloseTab => self.handle_close_tab(),
+            LayoutAction::NextTab => self.handle_next_tab(),
+            LayoutAction::PrevTab => self.handle_prev_tab(),
+            LayoutAction::SelectTab(idx) => self.handle_select_tab(idx),
+
+            // Clipboard
+            LayoutAction::CopySelection => self.perform_copy(),
+            LayoutAction::PasteClipboard => self.perform_paste(),
+
+            // Navigation
+            LayoutAction::ScrollUp => self.handle_scroll_up(),
+            LayoutAction::ScrollDown => self.handle_scroll_down(),
+            LayoutAction::ScrollTop => self.handle_scroll_top(),
+            LayoutAction::ScrollBottom => self.handle_scroll_bottom(),
+
+            // View
+            LayoutAction::ZoomIn => self.zoom_step(1),
+            LayoutAction::ZoomOut => self.zoom_step(-1),
+            LayoutAction::ZoomReset => self.zoom_reset(),
         }
     }
 
@@ -783,14 +1382,14 @@ impl App {
         };
 
         let Some(gpu) = &self.gpu else { return };
-        let viewport = viewport_rect(&gpu.surface_config);
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
         let session_id = SessionId::new();
         let cell = gpu.renderer.cell_size();
 
         // Compute workspace rect.
-        let ws_rects = self.window_layout.compute_workspace_rects(viewport);
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
         let ws_rect =
-            ws_rects.iter().find(|(wid, _)| *wid == workspace_id).map_or(viewport, |(_, r)| *r);
+            ws_rects.iter().find(|(wid, _)| *wid == workspace_id).map_or(ws_viewport, |(_, r)| *r);
 
         // Compute pane rects from the updated layout (immutable borrow).
         let rects = match self.window_layout.active_tab() {
@@ -801,13 +1400,14 @@ impl App {
         let new_rect = rects.iter().find(|(id, _)| *id == new_pane_id).map_or(ws_rect, |(_, r)| *r);
 
         let grid = pane::compute_pane_grid(new_rect, cell.width, cell.height);
-        let pane = Pane::new(new_rect, grid, session_id, workspace_id, new_pane_id);
+        let pane = Pane::new(new_rect, grid, session_id, workspace_id);
 
         self.panes.insert(new_pane_id, pane);
         self.session_to_pane.insert(session_id, new_pane_id);
+        self.pending_sessions.push_back(session_id);
 
         if let Some(tx) = &self.cmd_tx {
-            send_command(tx, ClientCommand::CreateSession { workspace_id });
+            send_command(tx, ClientCommand::CreateSession { workspace_id, split_direction: None });
         }
 
         self.resize_all_panes_from_rects(&rects);
@@ -815,6 +1415,60 @@ impl App {
         if let Some(active) = self.window_layout.active_tab_mut() {
             active.focused_pane = new_pane_id;
         }
+        self.request_redraw();
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "viewport dimensions are small enough to fit in f32"
+    )]
+    fn handle_workspace_split(&mut self, direction: layout::SplitDirection) {
+        let Some(gpu) = &self.gpu else { return };
+        let accent = Some(self.theme.chrome.accent);
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let cell = gpu.renderer.cell_size();
+
+        // Split the window layout tree, creating a new workspace region.
+        let Some(new_workspace_id) = self.window_layout.split_workspace(direction, accent) else {
+            return;
+        };
+
+        // Add an initial tab+pane to the new workspace.
+        let session_id = SessionId::new();
+        let Some(pane_id) = self.window_layout.add_tab(new_workspace_id, session_id) else {
+            return;
+        };
+
+        // Compute workspace rects for the updated layout.
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+        let ws_rect = ws_rects
+            .iter()
+            .find(|(wid, _)| *wid == new_workspace_id)
+            .map_or(ws_viewport, |(_, r)| *r);
+
+        let grid = pane::compute_pane_grid(ws_rect, cell.width, cell.height);
+        let pane = Pane::new(ws_rect, grid, session_id, new_workspace_id);
+
+        self.panes.insert(pane_id, pane);
+        self.session_to_pane.insert(session_id, pane_id);
+        self.pending_sessions.push_back(session_id);
+
+        if let Some(tx) = &self.cmd_tx {
+            send_command(
+                tx,
+                ClientCommand::CreateSession {
+                    workspace_id: new_workspace_id,
+                    split_direction: Some(to_layout_direction(direction)),
+                },
+            );
+        }
+
+        // Resize panes in ALL workspaces since the window was re-divided.
+        self.resize_all_workspace_panes();
+
+        // Report the updated tree to the server for persistence.
+        self.report_workspace_tree();
+
         self.request_redraw();
     }
 
@@ -863,30 +1517,338 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // Directional pane focus
+    // -----------------------------------------------------------------------
+
+    fn handle_focus_directional(&mut self, direction: layout::FocusDirection) {
+        let Some(gpu) = &self.gpu else { return };
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_id = self.window_layout.focused_workspace_id();
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+        let ws_rect =
+            ws_rects.iter().find(|(wid, _)| *wid == ws_id).map_or(ws_viewport, |(_, r)| *r);
+
+        let Some(active) = self.window_layout.active_tab() else { return };
+        let current = active.focused_pane;
+        let rects = active.pane_layout.compute_rects(ws_rect);
+
+        if let Some(target) = active.pane_layout.find_pane_in_direction(current, direction, &rects)
+        {
+            if let Some(active_mut) = self.window_layout.active_tab_mut() {
+                active_mut.focused_pane = target;
+                self.request_redraw();
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tab management
+    // -----------------------------------------------------------------------
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "viewport dimensions are small enough to fit in f32"
+    )]
+    fn handle_new_tab(&mut self) {
+        let workspace_id = self.window_layout.focused_workspace_id();
+        let session_id = SessionId::new();
+
+        let Some(pane_id) = self.window_layout.add_tab(workspace_id, session_id) else { return };
+
+        let Some(gpu) = &self.gpu else { return };
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let cell = gpu.renderer.cell_size();
+
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+        let ws_rect =
+            ws_rects.iter().find(|(wid, _)| *wid == workspace_id).map_or(ws_viewport, |(_, r)| *r);
+
+        let grid = pane::compute_pane_grid(ws_rect, cell.width, cell.height);
+        let pane = Pane::new(ws_rect, grid, session_id, workspace_id);
+
+        self.panes.insert(pane_id, pane);
+        self.session_to_pane.insert(session_id, pane_id);
+        self.pending_sessions.push_back(session_id);
+
+        if let Some(tx) = &self.cmd_tx {
+            send_command(tx, ClientCommand::CreateSession { workspace_id, split_direction: None });
+        }
+
+        self.resize_all_workspace_panes();
+        self.request_redraw();
+    }
+
+    fn handle_close_tab(&mut self) {
+        let ws_id = self.window_layout.focused_workspace_id();
+
+        // Need at least 2 tabs to close one (don't close the last tab).
+        let Some(ws) = self.window_layout.focused_workspace() else { return };
+        if ws.tab_count() <= 1 {
+            return;
+        }
+
+        // Get the session ID for the active tab.
+        let Some(active) = self.window_layout.active_tab() else { return };
+        let session_id = active.session_id;
+
+        // Collect pane IDs and their session IDs for cleanup.
+        let pane_ids: Vec<PaneId> = match self.window_layout.active_tab() {
+            Some(t) => t.pane_layout.all_pane_ids(),
+            None => return,
+        };
+
+        // Collect sessions to close before mutating self.panes.
+        let sessions_to_close: Vec<SessionId> =
+            pane_ids.iter().filter_map(|pid| self.panes.get(pid).map(|p| p.session_id)).collect();
+
+        // Remove pane state.
+        for pid in &pane_ids {
+            if let Some(pane) = self.panes.remove(pid) {
+                self.session_to_pane.remove(&pane.session_id);
+            }
+        }
+
+        // Tell the server to close each session.
+        for sid in sessions_to_close {
+            if let Some(tx) = &self.cmd_tx {
+                send_command(tx, ClientCommand::CloseSession { session_id: sid });
+            }
+        }
+
+        // Remove the tab from the workspace.
+        self.window_layout.remove_tab(ws_id, session_id);
+
+        self.resize_all_workspace_panes();
+        self.request_redraw();
+    }
+
+    fn handle_next_tab(&mut self) {
+        let ws_id = self.window_layout.focused_workspace_id();
+        let Some(ws) = self.window_layout.focused_workspace() else { return };
+        let next_idx = ws.next_tab_index();
+        if self.window_layout.set_active_tab(ws_id, next_idx) {
+            self.request_redraw();
+        }
+    }
+
+    fn handle_prev_tab(&mut self) {
+        let ws_id = self.window_layout.focused_workspace_id();
+        let Some(ws) = self.window_layout.focused_workspace() else { return };
+        let prev_idx = ws.prev_tab_index();
+        if self.window_layout.set_active_tab(ws_id, prev_idx) {
+            self.request_redraw();
+        }
+    }
+
+    fn handle_select_tab(&mut self, index: usize) {
+        let ws_id = self.window_layout.focused_workspace_id();
+        if self.window_layout.set_active_tab(ws_id, index) {
+            self.request_redraw();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Clipboard
+    // -----------------------------------------------------------------------
+
+    fn perform_copy(&mut self) {
+        self.finalize_copy();
+    }
+
+    /// Extract selected text, apply cleanup if Claude Code is active, and
+    /// write the result to the system clipboard.
+    fn finalize_copy(&mut self) {
+        let Some(sel) = self.active_selection else { return };
+        if sel.is_empty() {
+            return;
+        }
+
+        // Extract text and determine AI state while panes/tracker are borrowed.
+        let (raw, claude_active) = {
+            let Some(tab) = self.window_layout.active_tab() else {
+                return;
+            };
+            let Some(pane) = self.panes.get(&tab.focused_pane) else {
+                return;
+            };
+            let text = selection::extract_text(&pane.term, &sel);
+            let ai = self.ai_tracker.get(pane.session_id).is_some();
+            (text, ai)
+        };
+
+        if raw.is_empty() {
+            return;
+        }
+
+        let text = clipboard_cleanup::prepare_copy_text(
+            &raw,
+            claude_active,
+            self.config.terminal.claude_copy_cleanup,
+        );
+
+        let Some(cb) = &mut self.clipboard else { return };
+        if let Err(e) = cb.set_text(text) {
+            tracing::warn!("clipboard write failed: {e}");
+        }
+    }
+
+    fn perform_paste(&mut self) {
+        let text = {
+            let Some(cb) = &mut self.clipboard else {
+                tracing::debug!("clipboard not available");
+                return;
+            };
+            match cb.get_text() {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!("clipboard read failed: {e}");
+                    return;
+                }
+            }
+        };
+
+        if text.is_empty() {
+            return;
+        }
+
+        let Some(tx) = &self.cmd_tx else { return };
+        let Some(tab) = self.window_layout.active_tab() else { return };
+        let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
+
+        // Wrap in bracketed paste sequences when the shell has enabled the mode.
+        // This prevents newlines in pasted text from executing commands prematurely.
+        let bracketed =
+            pane.term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+        let data = if bracketed {
+            let mut buf = b"\x1b[200~".to_vec();
+            buf.extend_from_slice(text.as_bytes());
+            buf.extend_from_slice(b"\x1b[201~");
+            buf
+        } else {
+            text.into_bytes()
+        };
+
+        if tx.send(ClientCommand::KeyInput { session_id: pane.session_id, data }).is_err() {
+            tracing::warn!("IPC channel closed; paste dropped");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Scrollback
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::unused_self, reason = "scroll viewport will use self once implemented")]
+    fn handle_scroll_up(&self) {
+        tracing::debug!("scroll up: scrollback viewport not yet implemented");
+    }
+
+    #[allow(clippy::unused_self, reason = "scroll viewport will use self once implemented")]
+    fn handle_scroll_down(&self) {
+        tracing::debug!("scroll down: scrollback viewport not yet implemented");
+    }
+
+    #[allow(clippy::unused_self, reason = "scroll viewport will use self once implemented")]
+    fn handle_scroll_top(&self) {
+        tracing::debug!("scroll to top: scrollback viewport not yet implemented");
+    }
+
+    #[allow(clippy::unused_self, reason = "scroll viewport will use self once implemented")]
+    fn handle_scroll_bottom(&self) {
+        tracing::debug!("scroll to bottom: scrollback viewport not yet implemented");
+    }
+
+    // -----------------------------------------------------------------------
+    // Zoom
+    // -----------------------------------------------------------------------
+
+    fn zoom_step(&mut self, delta: i8) {
+        self.zoom_level = self.zoom_level.saturating_add(delta).clamp(-7, 7);
+        self.apply_zoom();
+    }
+
+    fn zoom_reset(&mut self) {
+        self.zoom_level = 0;
+        self.apply_zoom();
+    }
+
+    fn apply_zoom(&mut self) {
+        let Some(gpu) = &mut self.gpu else { return };
+        let size = self.config.appearance.font_size + f32::from(self.zoom_level);
+        let params = scribe_renderer::atlas::FontParams {
+            family: self.config.appearance.font.clone(),
+            size: size.max(6.0),
+            weight: self.config.appearance.font_weight,
+            weight_bold: self.config.appearance.font_weight_bold,
+            ligatures: self.config.appearance.ligatures,
+            line_padding: self.config.appearance.line_padding,
+        };
+        gpu.renderer.rebuild_atlas(&gpu.device, &gpu.queue, &params);
+        self.resize_all_workspace_panes();
+        self.request_redraw();
+    }
+
+    // -----------------------------------------------------------------------
+    // Search
+    // -----------------------------------------------------------------------
+
+    fn handle_open_find(&mut self) {
+        self.search_overlay.open();
+        self.request_redraw();
+        tracing::debug!("find overlay opened (rendering not yet implemented)");
+    }
+
+    // -----------------------------------------------------------------------
     // Settings
     // -----------------------------------------------------------------------
 
-    /// Open the settings webview window on a background thread.
+    /// Open the settings webview window via the persistent GTK thread.
     ///
+    /// Send the current workspace split tree to the server so it can be
+    /// persisted for reconnect and handoff.
+    fn report_workspace_tree(&self) {
+        if let Some(tx) = &self.cmd_tx {
+            let tree = self.window_layout.to_tree();
+            send_command(tx, ClientCommand::ReportWorkspaceTree { tree });
+        }
+    }
+
     /// Serializes the current config as JSON and passes it to the settings UI.
     /// Changes made in the settings UI trigger a config file write, which the
     /// file watcher picks up and sends `ConfigChanged` back to the main loop.
-    fn open_settings(&self) {
+    /// On close, the settings window geometry is sent back via `UiEvent`.
+    fn open_settings(&mut self) {
         let config_json = serde_json::to_string(&self.config).unwrap_or_else(|e| {
             tracing::warn!("failed to serialize config for settings: {e}");
             String::from("{}")
         });
 
-        if let Err(e) = scribe_settings::open_settings_window(config_json, |change_json| {
-            tracing::debug!("settings change: {change_json}");
+        let proxy = self.animation_proxy.clone();
+        if let Err(e) = self.settings_thread.open(
+            config_json,
+            |change_json| {
+                tracing::debug!("settings change: {change_json}");
 
-            // Parse the change and apply it to the config file.
-            // The file watcher will pick up the change and trigger a reload.
-            if let Err(apply_err) = apply_settings_change(&change_json) {
-                tracing::warn!("failed to apply settings change: {apply_err}");
-            }
-        }) {
+                // Parse the change and apply it to the config file.
+                // The file watcher will pick up the change and trigger a reload.
+                if let Err(apply_err) = apply_settings_change(&change_json) {
+                    tracing::warn!("failed to apply settings change: {apply_err}");
+                }
+            },
+            self.settings_geometry,
+            move |geometry| {
+                if let Some(p) = &proxy {
+                    let _sent = p.send_event(UiEvent::SettingsClosed { geometry });
+                }
+            },
+        ) {
             tracing::warn!("failed to open settings window: {e}");
+            return;
+        }
+
+        // Persist "open" so the settings window re-appears on next launch.
+        let state = SettingsGeometryFile { geometry: self.settings_geometry, open: true };
+        if let Err(e) = self.settings_state_store.save(&state) {
+            tracing::warn!("failed to persist settings open state: {e}");
         }
     }
 
@@ -904,31 +1866,85 @@ impl App {
         }
 
         match state {
-            winit::event::ElementState::Pressed => {
-                let Some((x, y)) = self.last_cursor_pos else { return };
-                let Some(gpu) = &self.gpu else { return };
-                let viewport = viewport_rect(&gpu.surface_config);
-
-                let Some(tab) = self.window_layout.active_tab() else { return };
-                let ws_rects = self.window_layout.compute_workspace_rects(viewport);
-                let ws_rect = ws_rects
-                    .iter()
-                    .find(|(wid, _)| *wid == self.window_layout.focused_workspace_id())
-                    .map_or(viewport, |(_, r)| *r);
-
-                let dividers = divider::collect_dividers(tab.pane_layout.root(), ws_rect);
-
-                if let Some(hit) = divider::hit_test_divider(&dividers, x, y) {
-                    self.divider_drag = Some(divider::start_drag(hit, ws_rect));
-                }
-            }
+            winit::event::ElementState::Pressed => self.handle_mouse_press(),
             winit::event::ElementState::Released => {
                 self.divider_drag = None;
+                self.handle_mouse_release();
             }
         }
     }
 
+    /// Handle a left-button press: click-to-focus pane/workspace, or start a
+    /// divider drag.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "viewport dimensions are small enough to fit in f32"
+    )]
+    fn handle_mouse_press(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        let Some(gpu) = &self.gpu else { return };
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+
+        // Check for divider drag first (within the focused workspace).
+        if self.try_start_divider_drag(x, y, &ws_rects) {
+            return;
+        }
+
+        // Click-to-focus: find which pane the click landed in.
+        self.focus_pane_at(x, y, &ws_rects);
+
+        // Start a new text selection.
+        self.start_selection(x, y);
+    }
+
+    /// Try to start a divider drag in the focused workspace. Returns `true`
+    /// if a divider was hit.
+    fn try_start_divider_drag(&mut self, x: f32, y: f32, ws_rects: &[(WorkspaceId, Rect)]) -> bool {
+        let focused_ws_id = self.window_layout.focused_workspace_id();
+        let Some((_, ws_rect)) = ws_rects.iter().find(|(wid, _)| *wid == focused_ws_id) else {
+            return false;
+        };
+        let tab = self.window_layout.find_workspace(focused_ws_id).and_then(|ws| ws.active_tab());
+        let Some(tab) = tab else { return false };
+
+        let dividers = divider::collect_dividers(tab.pane_layout.root(), *ws_rect);
+        if let Some(hit) = divider::hit_test_divider(&dividers, x, y) {
+            self.divider_drag = Some(divider::start_drag(hit, *ws_rect));
+            return true;
+        }
+        false
+    }
+
+    /// Switch focus to whichever pane contains the point `(x, y)`.
+    fn focus_pane_at(&mut self, x: f32, y: f32, ws_rects: &[(WorkspaceId, Rect)]) {
+        for (ws_id, ws_rect) in ws_rects {
+            if !ws_rect.contains(x, y) {
+                continue;
+            }
+            let tab = self.window_layout.find_workspace(*ws_id).and_then(|ws| ws.active_tab());
+            let Some(tab) = tab else { continue };
+
+            let pane_rects = tab.pane_layout.compute_rects(*ws_rect);
+            let hit = pane_rects.iter().find(|(_, r)| r.contains(x, y));
+            let Some((clicked_pane, _)) = hit else { continue };
+
+            // Switch workspace focus if needed.
+            self.window_layout.set_focused_workspace(*ws_id);
+
+            // Switch pane focus within the workspace.
+            if let Some(active) = self.window_layout.active_tab_mut() {
+                active.focused_pane = *clicked_pane;
+            }
+            self.request_redraw();
+            return;
+        }
+    }
+
     fn handle_cursor_moved(&mut self) {
+        // Extend active text selection while mouse is held.
+        self.extend_selection();
+
         let Some(drag) = self.divider_drag else { return };
         let Some((x, y)) = self.last_cursor_pos else { return };
 
@@ -945,6 +1961,65 @@ impl App {
 
         self.resize_after_layout_change();
         self.request_redraw();
+    }
+
+    // -------------------------------------------------------------------
+    // Text selection helpers
+    // -------------------------------------------------------------------
+
+    /// Begin a new text selection at the given pixel position.
+    fn start_selection(&mut self, x: f32, y: f32) {
+        self.mouse_selecting = true;
+        self.active_selection = None;
+        let Some(point) = self.cursor_to_grid(x, y) else { return };
+        self.active_selection = Some(selection::SelectionRange { start: point, end: point });
+    }
+
+    /// Extend the in-progress selection to the current cursor position.
+    fn extend_selection(&mut self) {
+        if !self.mouse_selecting {
+            return;
+        }
+        let Some(sel) = self.active_selection else { return };
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        let Some(point) = self.cursor_to_grid(x, y) else { return };
+        self.active_selection = Some(selection::SelectionRange { start: sel.start, end: point });
+        self.request_redraw();
+    }
+
+    /// Finalize selection on mouse release and auto-copy if enabled.
+    fn handle_mouse_release(&mut self) {
+        self.mouse_selecting = false;
+        if !self.config.terminal.copy_on_select {
+            return;
+        }
+        self.finalize_copy();
+    }
+
+    /// Convert a pixel position to a grid cell in the focused pane.
+    fn cursor_to_grid(&self, x: f32, y: f32) -> Option<selection::SelectionPoint> {
+        let gpu = self.gpu.as_ref()?;
+        let cell = gpu.renderer.cell_size();
+        let pane_rect = self.focused_pane_rect()?;
+        selection::pixel_to_grid(x, y, pane_rect, cell.width, cell.height)
+    }
+
+    /// Compute the screen rect of the currently focused pane.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "viewport dimensions are small enough to fit in f32"
+    )]
+    fn focused_pane_rect(&self) -> Option<Rect> {
+        let gpu = self.gpu.as_ref()?;
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+        let focused_ws = self.window_layout.focused_workspace_id();
+        let ws_rect =
+            ws_rects.iter().find(|(wid, _)| *wid == focused_ws).map_or(ws_viewport, |(_, r)| *r);
+        let tab = self.window_layout.active_tab()?;
+        let pane_rects = tab.pane_layout.compute_rects(ws_rect);
+        let (_, rect) = pane_rects.iter().find(|(pid, _)| *pid == tab.focused_pane)?;
+        Some(*rect)
     }
 }
 
@@ -974,15 +2049,15 @@ impl App {
     )]
     fn resize_after_layout_change(&mut self) {
         let Some(gpu) = &self.gpu else { return };
-        let viewport = viewport_rect(&gpu.surface_config);
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
 
         let rects = if let Some(tab) = self.window_layout.active_tab() {
             // Compute workspace rect for the focused workspace.
-            let ws_rects = self.window_layout.compute_workspace_rects(viewport);
+            let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
             let ws_rect = ws_rects
                 .iter()
                 .find(|(wid, _)| *wid == self.window_layout.focused_workspace_id())
-                .map_or(viewport, |(_, r)| *r);
+                .map_or(ws_viewport, |(_, r)| *r);
             tab.pane_layout.compute_rects(ws_rect)
         } else {
             Vec::new()
@@ -993,12 +2068,29 @@ impl App {
         self.resize_all_panes_from_rects(&rects);
     }
 
-    /// Find a pane whose session has not been confirmed by the server yet.
-    fn find_unconfirmed_pane(&self) -> Option<(PaneId, SessionId)> {
-        self.panes
-            .values()
-            .find(|p| self.session_to_pane.get(&p.session_id).is_some_and(|pid| *pid == p.id))
-            .map(|p| (p.id, p.session_id))
+    /// Recompute rects and resize panes in all workspaces.
+    ///
+    /// Used after workspace splits where the window is re-divided and every
+    /// workspace region changes size.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "viewport dimensions are small enough to fit in f32"
+    )]
+    fn resize_all_workspace_panes(&mut self) {
+        let Some(gpu) = &self.gpu else { return };
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
+
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+        let all_pane_rects: Vec<_> = ws_rects
+            .iter()
+            .filter_map(|(ws_id, ws_rect)| {
+                let tab = self.window_layout.find_workspace(*ws_id)?.active_tab()?;
+                Some(tab.pane_layout.compute_rects(*ws_rect))
+            })
+            .flatten()
+            .collect();
+
+        self.resize_all_panes_from_rects(&all_pane_rects);
     }
 
     /// Request a redraw from winit.
@@ -1006,6 +2098,120 @@ impl App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    // -- Window geometry persistence ----------------------------------------
+
+    /// Mark that window geometry has changed and should be saved after debounce.
+    fn mark_geometry_dirty(&mut self) {
+        if self.geometry_save_pending.is_none() {
+            self.geometry_save_pending = Some(Instant::now());
+        }
+    }
+
+    /// Flush geometry to disk if the debounce interval has elapsed.
+    fn flush_geometry_if_due(&mut self) {
+        if self.geometry_save_pending.is_some_and(|t| t.elapsed() >= GEOMETRY_DEBOUNCE) {
+            self.flush_geometry_now();
+        }
+    }
+
+    // ── Multi-window ──────────────────────────────────────────────
+
+    /// Handle `Welcome` from the server — store our window ID, apply saved
+    /// geometry, and spawn other windows that need to be restored.
+    fn handle_welcome(&mut self, window_id: WindowId, other_windows: &[WindowId]) {
+        self.window_id = Some(window_id);
+        tracing::info!(%window_id, others = other_windows.len(), "assigned window ID");
+
+        // If we didn't have a window_id at startup (fresh launch), load
+        // geometry now that the server has assigned one.
+        if self.saved_geometry.is_none() {
+            let loaded = self.window_registry.load(window_id);
+            let has_saved = loaded.x.is_some() || loaded.maximized;
+            let resolved = if has_saved {
+                Some(loaded)
+            } else {
+                self.window_registry.migrate_legacy(window_id)
+            };
+            if let Some(restored) = resolved {
+                apply_geometry_to_window(self.window.as_deref(), &restored);
+            }
+        }
+
+        for &other_wid in other_windows {
+            spawn_client_process(other_wid);
+        }
+    }
+
+    /// Spawn a new window as a separate OS process.
+    #[allow(clippy::unused_self, reason = "method for consistency with other handle_* methods")]
+    fn handle_new_window(&mut self) {
+        let new_id = WindowId::new();
+        spawn_client_process(new_id);
+        tracing::info!(%new_id, "spawning new window");
+    }
+
+    /// Handle the close button. Shows a dialog with two choices:
+    /// close this window only, or quit Scribe (all windows).
+    fn handle_close_requested(&mut self, event_loop: &ActiveEventLoop) {
+        // Spawn dialog on a separate thread to avoid blocking the event loop.
+        let Some(proxy) = self.animation_proxy.clone() else {
+            // No proxy — fall back to immediate close.
+            self.flush_geometry_now();
+            event_loop.exit();
+            return;
+        };
+        let Some(window) = self.window.clone() else {
+            self.flush_geometry_now();
+            event_loop.exit();
+            return;
+        };
+
+        let session_count = self.panes.len();
+        std::thread::spawn(move || {
+            show_close_dialog(proxy, window, session_count);
+        });
+    }
+
+    /// Handle `QuitRequested` from the server — save state and close.
+    ///
+    /// Does NOT re-broadcast `QuitAll`: only the originating window
+    /// (via `handle_quit_all`) sends that.
+    fn handle_quit_requested(&mut self, event_loop: &ActiveEventLoop) {
+        tracing::info!("quit requested by another window — saving and exiting");
+        self.flush_geometry_now();
+        event_loop.exit();
+    }
+
+    /// User chose "Quit Scribe" — broadcast to all windows, then exit.
+    fn handle_quit_all(&mut self, event_loop: &ActiveEventLoop) {
+        tracing::info!("quit all — broadcasting to other windows");
+        if let Some(tx) = &self.cmd_tx {
+            send_command(tx, ClientCommand::QuitAll);
+        }
+        self.flush_geometry_now();
+        event_loop.exit();
+    }
+
+    /// User chose "Close this window only" — remove geometry file and exit.
+    fn handle_close_window(&mut self, event_loop: &ActiveEventLoop) {
+        tracing::info!("closing window permanently");
+        // Remove the per-window geometry file since this window is gone.
+        if let Some(wid) = self.window_id {
+            self.window_registry.remove(wid);
+        }
+        event_loop.exit();
+    }
+
+    fn flush_geometry_now(&mut self) {
+        let Some(window) = &self.window else { return };
+        let Some(wid) = self.window_id else { return };
+        let geom = window_state::capture_window_geometry(window);
+        if let Err(e) = self.window_registry.save(wid, &geom) {
+            tracing::warn!("failed to persist window geometry: {e}");
+        }
+        self.geometry_save_pending = None;
     }
 
     /// Start the animation timer thread for AI state pulsing.
@@ -1047,6 +2253,12 @@ fn run_animation_loop(proxy: EventLoopProxy<UiEvent>) {
 // Instance compositing
 // ---------------------------------------------------------------------------
 
+/// Cursor blink interval (530ms matches xterm/VTE).
+const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// Debounce interval for geometry saves (move/resize events fire rapidly).
+const GEOMETRY_DEBOUNCE: Duration = Duration::from_millis(500);
+
 /// Dimming factor applied to RGB channels of unfocused pane content.
 const UNFOCUSED_DIM: f32 = 0.85;
 
@@ -1055,6 +2267,10 @@ const UNFOCUSED_DIM: f32 = 0.85;
 #[allow(
     clippy::too_many_arguments,
     reason = "needs all render context: renderer, GPU resources, panes, layout data, AI state"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "single render-pass collector: tab bars, terminals, dividers, AI borders"
 )]
 fn build_all_instances(
     renderer: &mut TerminalRenderer,
@@ -1067,11 +2283,11 @@ fn build_all_instances(
     focused_pane: PaneId,
     border_colors: &HashMap<PaneId, [f32; 4]>,
     tab_colors: &tab_bar::TabBarColors,
-    sb_colors: &status_bar::StatusBarColors,
-    pane_count: usize,
+    ws_tab_bar_data: &[tab_bar::WorkspaceTabBarData],
     divider_color: [f32; 4],
     accent_color: [f32; 4],
     focus_split_direction: Option<layout::SplitDirection>,
+    cursor_visible: bool,
 ) -> Vec<scribe_renderer::types::CellInstance> {
     // Pre-allocate based on a typical 80x24 grid per pane plus tab bar and
     // border quads, to avoid repeated reallocations during the per-pane loops.
@@ -1083,12 +2299,43 @@ fn build_all_instances(
         tab_bar::build_tab_bar_bg(&mut all_instances, *pane_rect, cell_size, tab_colors);
     }
 
+    // Tab bar text — rendered once per workspace, spanning the full workspace width.
+    for ws_data in ws_tab_bar_data {
+        let tab_bar_rect = layout::Rect {
+            x: ws_data.ws_rect.x,
+            y: ws_data.ws_rect.y,
+            width: ws_data.ws_rect.width,
+            height: tab_bar::TAB_BAR_HEIGHT,
+        };
+        let badge = ws_data.badge.as_ref().map(|(name, color)| (name.as_str(), *color));
+        let mut resolve_glyph = |ch: char| renderer.resolve_glyph(device, queue, ch);
+        let mut params = tab_bar::TabBarTextParams {
+            rect: tab_bar_rect,
+            cell_size,
+            tabs: &ws_data.tabs,
+            badge,
+            show_gear: true,
+            colors: tab_colors,
+            resolve_glyph: &mut resolve_glyph,
+        };
+        let (text_instances, _hit_targets) = tab_bar::build_tab_bar_text(&mut params);
+        all_instances.extend(text_instances);
+    }
+
     // Terminal content — dim unfocused panes by multiplying RGB (not alpha).
     let has_multiple_panes = pane_rects.len() > 1;
     for (pane_id, _) in pane_rects {
         if let Some(pane) = panes.get_mut(pane_id) {
             let offset = pane.content_offset();
-            let mut instances = renderer.build_instances_at(device, queue, &mut pane.term, offset);
+            // Only the focused pane shows the blinking cursor; unfocused panes hide it.
+            let pane_cursor_visible = *pane_id == focused_pane && cursor_visible;
+            let mut instances = renderer.build_instances_at(
+                device,
+                queue,
+                &mut pane.term,
+                offset,
+                pane_cursor_visible,
+            );
             if has_multiple_panes && *pane_id != focused_pane {
                 dim_instances(&mut instances);
             }
@@ -1112,40 +2359,6 @@ fn build_all_instances(
         }
     }
 
-    // Status bars — collect owned data first to avoid borrow conflicts
-    // between pane references and the mutable renderer.
-    let sb_data: Vec<_> = pane_rects
-        .iter()
-        .filter_map(|(pane_id, pane_rect)| {
-            let pane = panes.get(pane_id)?;
-            Some((
-                *pane_rect,
-                pane.title.clone(),
-                pane.git_branch.clone(),
-                (pane.grid.cols, pane.grid.rows),
-            ))
-        })
-        .collect();
-
-    for (pane_rect, title, git_branch, grid_size) in &sb_data {
-        let data = status_bar::StatusBarData {
-            connected: true,
-            shell_name: title,
-            pane_count,
-            git_branch: git_branch.as_deref(),
-            grid_size: *grid_size,
-        };
-        let mut resolve_glyph = |ch: char| renderer.resolve_glyph(device, queue, ch);
-        status_bar::build_status_bar(
-            &mut all_instances,
-            *pane_rect,
-            cell_size,
-            sb_colors,
-            &data,
-            &mut resolve_glyph,
-        );
-    }
-
     // AI state border overlays (rendered last so they appear on top).
     for (pane_id, pane_rect) in pane_rects {
         if let Some(&color) = border_colors.get(pane_id) {
@@ -1155,6 +2368,19 @@ fn build_all_instances(
     }
 
     all_instances
+}
+
+/// Apply window opacity to cell background alpha values.
+///
+/// Foreground glyphs are left fully opaque so text remains readable.
+#[allow(clippy::indexing_slicing, reason = "fixed-size [f32; 4] array, index 3 always valid")]
+fn apply_opacity_to_instances(
+    instances: &mut [scribe_renderer::types::CellInstance],
+    opacity: f32,
+) {
+    for inst in instances {
+        inst.bg_color[3] *= opacity;
+    }
 }
 
 /// Dim cell instances for unfocused panes by scaling RGB channels.
@@ -1179,11 +2405,33 @@ fn dim_color(color: &mut [f32; 4]) {
 // wgpu device / surface configuration
 // ---------------------------------------------------------------------------
 
+/// Select the best `CompositeAlphaMode` for the given transparency requirement.
+///
+/// When transparency is needed, prefer `PreMultiplied` then `PostMultiplied`.
+/// Falls back to the first available mode (or `Auto`) when no preferred mode
+/// is available or transparency is not required.
+fn select_alpha_mode(
+    modes: &[wgpu::CompositeAlphaMode],
+    transparent: bool,
+) -> wgpu::CompositeAlphaMode {
+    if transparent {
+        if modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+            return wgpu::CompositeAlphaMode::PreMultiplied;
+        }
+        if modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+            return wgpu::CompositeAlphaMode::PostMultiplied;
+        }
+        tracing::warn!("no transparency-capable alpha mode available");
+    }
+    modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto)
+}
+
 /// Request adapter, create device + queue, and configure the surface.
 fn configure_device_and_surface(
     instance: &wgpu::Instance,
     surface: &wgpu::Surface<'_>,
     window: &Window,
+    transparent: bool,
 ) -> Result<(wgpu::Device, wgpu::Queue, wgpu::SurfaceConfiguration), InitError> {
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::default(),
@@ -1203,7 +2451,7 @@ fn configure_device_and_surface(
     let size = window.inner_size();
     let caps = surface.get_capabilities(&adapter);
     let format = caps.formats.first().copied().ok_or(InitError::NoSurfaceFormat)?;
-    let alpha_mode = caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto);
+    let alpha_mode = select_alpha_mode(&caps.alpha_modes, transparent);
 
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1257,10 +2505,80 @@ fn send_command(tx: &Sender<ClientCommand>, cmd: ClientCommand) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Direction conversion helpers
+// ---------------------------------------------------------------------------
+
+/// Convert client-side `SplitDirection` to the protocol `LayoutDirection`.
+fn to_layout_direction(d: layout::SplitDirection) -> scribe_common::protocol::LayoutDirection {
+    match d {
+        layout::SplitDirection::Horizontal => scribe_common::protocol::LayoutDirection::Horizontal,
+        layout::SplitDirection::Vertical => scribe_common::protocol::LayoutDirection::Vertical,
+    }
+}
+
+/// Convert protocol `LayoutDirection` back to client-side `SplitDirection`.
+fn from_layout_direction(d: scribe_common::protocol::LayoutDirection) -> layout::SplitDirection {
+    match d {
+        scribe_common::protocol::LayoutDirection::Horizontal => layout::SplitDirection::Horizontal,
+        scribe_common::protocol::LayoutDirection::Vertical => layout::SplitDirection::Vertical,
+    }
+}
+
 /// Build a viewport `Rect` from the surface configuration.
 #[allow(clippy::cast_precision_loss, reason = "viewport dimensions are small enough to fit in f32")]
 fn viewport_rect(config: &wgpu::SurfaceConfiguration) -> Rect {
     Rect { x: 0.0, y: 0.0, width: config.width as f32, height: config.height as f32 }
+}
+
+/// Return the viewport rect available to workspaces — full surface minus
+/// the window-level status bar at the bottom.
+#[allow(clippy::cast_precision_loss, reason = "viewport dimensions are small enough to fit in f32")]
+fn workspace_viewport(config: &wgpu::SurfaceConfiguration) -> Rect {
+    Rect {
+        x: 0.0,
+        y: 0.0,
+        width: config.width as f32,
+        height: (config.height as f32 - status_bar::STATUS_BAR_HEIGHT).max(1.0),
+    }
+}
+
+/// Read the system hostname via `gethostname(2)`, falling back to "localhost".
+#[allow(
+    unsafe_code,
+    reason = "gethostname writes into a caller-owned buffer with a known size limit"
+)]
+fn read_hostname() -> String {
+    let mut buf = [0u8; 256];
+    #[allow(clippy::cast_possible_wrap, reason = "buffer length fits in libc::c_int / size_t")]
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc == 0 {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        buf.get(..len).map_or_else(
+            || String::from("localhost"),
+            |slice| String::from_utf8_lossy(slice).into_owned(),
+        )
+    } else {
+        String::from("localhost")
+    }
+}
+
+/// Format the current local time as `HH:MM`.
+///
+/// Uses `libc::localtime_r` (the reentrant POSIX API) for timezone-aware
+/// local time. The two `unsafe` calls are sound because `localtime_r` writes
+/// into a caller-owned `tm` struct and does not share mutable state.
+#[allow(unsafe_code, reason = "localtime_r is the reentrant POSIX API; we own the tm struct")]
+fn current_time_str() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+
+    #[allow(clippy::cast_possible_wrap, reason = "current unix timestamp fits in i64 time_t")]
+    let time_t = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&raw const time_t, &raw mut tm) };
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
 /// Convert a `ScreenSnapshot` to ANSI escape sequences that reproduce the
@@ -1274,6 +2592,14 @@ fn snapshot_to_ansi(snapshot: &scribe_common::screen::ScreenSnapshot) -> Vec<u8>
 
     let mut buf =
         String::with_capacity(usize::from(snapshot.cols) * usize::from(snapshot.rows) * 4);
+
+    // If the server was in alternate screen mode, switch the client into it
+    // so that subsequent PTY output (which assumes alt screen) lands in the
+    // correct buffer.  Without this, apps like Claude Code that use alt screen
+    // produce ghost cursors and broken exit behaviour after reconnect.
+    if snapshot.alt_screen {
+        buf.push_str("\x1b[?1049h");
+    }
 
     // Hide cursor, move home, clear screen, reset attributes.
     buf.push_str("\x1b[?25l\x1b[H\x1b[2J\x1b[0m");
@@ -1535,6 +2861,24 @@ fn apply_config_key(
             let v = value.as_f64().ok_or("scrollback_lines must be a number")? as u32;
             config.terminal.scrollback_lines = v;
         }
+        "terminal.copy_on_select" => {
+            config.terminal.copy_on_select =
+                value.as_bool().ok_or("copy_on_select must be a boolean")?;
+        }
+        "terminal.claude_copy_cleanup" => {
+            config.terminal.claude_copy_cleanup =
+                value.as_bool().ok_or("claude_copy_cleanup must be a boolean")?;
+        }
+        "terminal.claude_code_integration" => {
+            config.terminal.claude_code_integration =
+                value.as_bool().ok_or("claude_code_integration must be a boolean")?;
+        }
+        // -- Keybindings ----------------------------------------------------
+        key if key.starts_with("keybindings.") => {
+            let action = key.trim_start_matches("keybindings.");
+            let combo = value.as_str().ok_or("keybinding value must be a string")?;
+            apply_keybinding_field(&mut config.keybindings, action, combo);
+        }
         // -- Workspaces -------------------------------------------------------
         "workspaces.add_root" => {
             // The webview sends an empty string as a placeholder; in a real
@@ -1553,9 +2897,145 @@ fn apply_config_key(
     Ok(())
 }
 
+/// Route a keybinding action name + combo string to the correct config field.
+#[allow(
+    clippy::too_many_lines,
+    reason = "exhaustive keybinding action routing requires one arm per action"
+)]
+fn apply_keybinding_field(
+    kb: &mut scribe_common::config::KeybindingsConfig,
+    action: &str,
+    combo: &str,
+) {
+    match action {
+        "split_vertical" => combo.clone_into(&mut kb.split_vertical),
+        "split_horizontal" => combo.clone_into(&mut kb.split_horizontal),
+        "close_pane" => combo.clone_into(&mut kb.close_pane),
+        "cycle_pane" => combo.clone_into(&mut kb.cycle_pane),
+        "focus_left" => combo.clone_into(&mut kb.focus_left),
+        "focus_right" => combo.clone_into(&mut kb.focus_right),
+        "focus_up" => combo.clone_into(&mut kb.focus_up),
+        "focus_down" => combo.clone_into(&mut kb.focus_down),
+        "workspace_split_vertical" => combo.clone_into(&mut kb.workspace_split_vertical),
+        "workspace_split_horizontal" => combo.clone_into(&mut kb.workspace_split_horizontal),
+        "cycle_workspace" => combo.clone_into(&mut kb.cycle_workspace),
+        "new_tab" => combo.clone_into(&mut kb.new_tab),
+        "close_tab" => combo.clone_into(&mut kb.close_tab),
+        "next_tab" => combo.clone_into(&mut kb.next_tab),
+        "prev_tab" => combo.clone_into(&mut kb.prev_tab),
+        "select_tab_1" => combo.clone_into(&mut kb.select_tab_1),
+        "select_tab_2" => combo.clone_into(&mut kb.select_tab_2),
+        "select_tab_3" => combo.clone_into(&mut kb.select_tab_3),
+        "select_tab_4" => combo.clone_into(&mut kb.select_tab_4),
+        "select_tab_5" => combo.clone_into(&mut kb.select_tab_5),
+        "select_tab_6" => combo.clone_into(&mut kb.select_tab_6),
+        "select_tab_7" => combo.clone_into(&mut kb.select_tab_7),
+        "select_tab_8" => combo.clone_into(&mut kb.select_tab_8),
+        "select_tab_9" => combo.clone_into(&mut kb.select_tab_9),
+        "copy" => combo.clone_into(&mut kb.copy),
+        "paste" => combo.clone_into(&mut kb.paste),
+        "scroll_up" => combo.clone_into(&mut kb.scroll_up),
+        "scroll_down" => combo.clone_into(&mut kb.scroll_down),
+        "scroll_top" => combo.clone_into(&mut kb.scroll_top),
+        "scroll_bottom" => combo.clone_into(&mut kb.scroll_bottom),
+        "find" => combo.clone_into(&mut kb.find),
+        "zoom_in" => combo.clone_into(&mut kb.zoom_in),
+        "zoom_out" => combo.clone_into(&mut kb.zoom_out),
+        "zoom_reset" => combo.clone_into(&mut kb.zoom_reset),
+        "settings" => combo.clone_into(&mut kb.settings),
+        _ => tracing::warn!(action, "unhandled keybinding action"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // main()
 // ---------------------------------------------------------------------------
+
+/// Apply geometry to a window (used when the window already exists but we
+/// don't have access to the event loop).
+fn apply_geometry_to_window(window: Option<&Window>, geom: &window_state::WindowGeometry) {
+    let Some(window) = window else { return };
+    if !geom.maximized {
+        let _applied =
+            window.request_inner_size(winit::dpi::PhysicalSize::new(geom.width, geom.height));
+    }
+    if geom.maximized {
+        window.set_maximized(true);
+    }
+}
+
+/// Show a native dialog asking whether to quit Scribe, kill this window, or cancel.
+///
+/// Runs on a background thread. Sends the result back to the event loop
+/// via the proxy.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "proxy and window arc are moved into a background thread"
+)]
+fn show_close_dialog(proxy: EventLoopProxy<UiEvent>, window: Arc<Window>, session_count: usize) {
+    let session_warning = if session_count > 0 {
+        format!("\n\nThis window has {session_count} active session(s) that will be terminated.")
+    } else {
+        String::new()
+    };
+
+    let description = format!(
+        "Quit Scribe: all windows close, sessions preserved\n\
+         Kill Window: close this window only, sessions terminated{session_warning}"
+    );
+
+    let result = rfd::MessageDialog::new()
+        .set_title("Close Scribe")
+        .set_description(&description)
+        .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+            String::from("Quit Scribe"),
+            String::from("Kill Window"),
+            String::from("Cancel"),
+        ))
+        .set_level(rfd::MessageLevel::Warning)
+        .set_parent(&*window)
+        .show();
+
+    let event = match result {
+        rfd::MessageDialogResult::Custom(ref s) if s == "Quit Scribe" => UiEvent::QuitAllFromDialog,
+        rfd::MessageDialogResult::Custom(ref s) if s == "Kill Window" => UiEvent::CloseWindow,
+        _ => UiEvent::CancelClose,
+    };
+
+    if proxy.send_event(event).is_err() {
+        tracing::warn!("event loop closed before close dialog result");
+    }
+}
+
+/// Spawn a new `scribe-client` process with the given window ID.
+fn spawn_client_process(window_id: WindowId) {
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("scribe-client"));
+    let id_str = window_id.to_full_string();
+
+    match std::process::Command::new(&exe).arg("--window-id").arg(&id_str).spawn() {
+        Ok(child) => {
+            tracing::info!(pid = child.id(), %window_id, "spawned new window process");
+        }
+        Err(e) => {
+            tracing::warn!(exe = %exe.display(), %window_id, "failed to spawn window: {e}");
+        }
+    }
+}
+
+/// Parse `--window-id <uuid>` from CLI arguments.
+fn parse_window_id() -> Option<WindowId> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args.get(i).map(String::as_str) == Some("--window-id") {
+            if let Some(val) = args.get(i + 1) {
+                return val.parse::<WindowId>().ok();
+            }
+        }
+        i += 1;
+    }
+    None
+}
 
 #[allow(clippy::expect_used, reason = "event loop and wgpu instance creation are process-fatal")]
 fn main() {
@@ -1576,7 +3056,8 @@ fn main() {
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
-    let mut app = App::new(wgpu_instance, proxy);
+    let window_id = parse_window_id();
+    let mut app = App::new(wgpu_instance, proxy, window_id);
 
     event_loop.run_app(&mut app).expect("event loop exited with error");
 }

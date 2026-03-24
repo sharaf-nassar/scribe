@@ -5,6 +5,16 @@
 //! vertical split with a configurable ratio.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Global monotonic counter ensuring every [`PaneId`] is unique across all
+/// layout trees (and therefore across all workspaces).
+static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Allocate a globally unique [`PaneId`].
+pub fn alloc_pane_id() -> PaneId {
+    PaneId(NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 /// Unique identifier for a pane within the layout tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,6 +40,19 @@ impl fmt::Display for PaneId {
     }
 }
 
+/// Direction for moving pane focus relative to the current pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusDirection {
+    /// Move focus to the pane on the left.
+    Left,
+    /// Move focus to the pane on the right.
+    Right,
+    /// Move focus to the pane above.
+    Up,
+    /// Move focus to the pane below.
+    Down,
+}
+
 /// Direction of a split within the layout tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitDirection {
@@ -46,6 +69,13 @@ pub struct Rect {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+}
+
+impl Rect {
+    /// Return `true` if the point `(px, py)` lies inside this rectangle.
+    pub fn contains(self, px: f32, py: f32) -> bool {
+        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
+    }
 }
 
 /// A node in the binary split tree.
@@ -72,16 +102,21 @@ const MAX_RATIO: f32 = 0.9;
 /// Default ratio for new splits.
 const DEFAULT_RATIO: f32 = 0.5;
 
-/// Manager for the layout tree plus a monotonic pane ID counter.
+/// Manager for the layout tree that uses globally unique pane IDs.
 pub struct LayoutTree {
     root: LayoutNode,
-    next_id: u32,
+    /// The pane ID assigned to the root leaf when this tree was created.
+    initial_pane: PaneId,
 }
 
 impl LayoutTree {
     /// Create a new layout tree with a single root pane.
+    ///
+    /// The root pane receives a globally unique [`PaneId`] allocated from
+    /// the module-level atomic counter.
     pub fn new() -> Self {
-        Self { root: LayoutNode::Leaf(PaneId(0)), next_id: 1 }
+        let id = alloc_pane_id();
+        Self { root: LayoutNode::Leaf(id), initial_pane: id }
     }
 
     /// Return a reference to the root node.
@@ -89,16 +124,10 @@ impl LayoutTree {
         &self.root
     }
 
-    /// Return the initial pane ID (always `PaneId(0)`).
-    pub const fn initial_pane_id() -> PaneId {
-        PaneId(0)
-    }
-
-    /// Allocate and return the next unique pane ID.
-    fn alloc_id(&mut self) -> PaneId {
-        let id = PaneId(self.next_id);
-        self.next_id = self.next_id.saturating_add(1);
-        id
+    /// Return the pane ID assigned to the root leaf when this tree was
+    /// created. Each tree has a unique initial pane ID.
+    pub const fn initial_pane_id(&self) -> PaneId {
+        self.initial_pane
     }
 
     /// Compute pixel rects for every leaf in the tree.
@@ -114,7 +143,7 @@ impl LayoutTree {
     /// second child. Returns the new pane's ID, or `None` if the pane was
     /// not found.
     pub fn split_pane(&mut self, pane_id: PaneId, direction: SplitDirection) -> Option<PaneId> {
-        let new_id = self.alloc_id();
+        let new_id = alloc_pane_id();
         if split_node(&mut self.root, pane_id, direction, new_id) { Some(new_id) } else { None }
     }
 
@@ -157,6 +186,25 @@ impl LayoutTree {
     /// Returns `true` if the pane was found and the ratio was adjusted.
     pub fn adjust_ratio(&mut self, pane_id: PaneId, delta: f32) -> bool {
         adjust_ratio_node(&mut self.root, pane_id, delta)
+    }
+
+    /// Find the nearest pane in the given direction from `current`.
+    ///
+    /// Uses the precomputed `rects` (as returned by [`Self::compute_rects`])
+    /// to determine spatial adjacency. Returns `None` when no pane exists in
+    /// the requested direction or `current` is not present in `rects`.
+    #[allow(
+        clippy::unused_self,
+        reason = "method semantically belongs to LayoutTree even though rects are pre-computed"
+    )]
+    pub fn find_pane_in_direction(
+        &self,
+        current: PaneId,
+        direction: FocusDirection,
+        rects: &[(PaneId, Rect)],
+    ) -> Option<PaneId> {
+        let current_rect = rects.iter().find(|(id, _)| *id == current).map(|(_, r)| r)?;
+        best_candidate_in_direction(*current_rect, current, direction, rects)
     }
 }
 
@@ -353,4 +401,84 @@ fn adjust_ratio_node(node: &mut LayoutNode, target: PaneId, delta: f32) -> bool 
     }
 
     adjust_ratio_node(first, target, delta) || adjust_ratio_node(second, target, delta)
+}
+
+// ---------------------------------------------------------------------------
+// Directional focus helpers
+// ---------------------------------------------------------------------------
+
+/// Return `true` when the closed interval `[a_start, a_end]` overlaps with
+/// `[b_start, b_end]` by a non-zero amount.
+fn ranges_overlap(a_start: f32, a_end: f32, b_start: f32, b_end: f32) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+/// Score a candidate pane for directional focus and return the movement-axis
+/// distance if the candidate satisfies the spatial constraints.
+fn candidate_distance(current: Rect, candidate: Rect, direction: FocusDirection) -> Option<f32> {
+    match direction {
+        FocusDirection::Right => {
+            let past_edge = candidate.x >= current.x + current.width - 1.0;
+            let y_overlap = ranges_overlap(
+                current.y,
+                current.y + current.height,
+                candidate.y,
+                candidate.y + candidate.height,
+            );
+            (past_edge && y_overlap).then_some(candidate.x - (current.x + current.width))
+        }
+        FocusDirection::Left => {
+            let past_edge = candidate.x + candidate.width <= current.x + 1.0;
+            let y_overlap = ranges_overlap(
+                current.y,
+                current.y + current.height,
+                candidate.y,
+                candidate.y + candidate.height,
+            );
+            (past_edge && y_overlap).then_some(current.x - (candidate.x + candidate.width))
+        }
+        FocusDirection::Down => {
+            let past_edge = candidate.y >= current.y + current.height - 1.0;
+            let x_overlap = ranges_overlap(
+                current.x,
+                current.x + current.width,
+                candidate.x,
+                candidate.x + candidate.width,
+            );
+            (past_edge && x_overlap).then_some(candidate.y - (current.y + current.height))
+        }
+        FocusDirection::Up => {
+            let past_edge = candidate.y + candidate.height <= current.y + 1.0;
+            let x_overlap = ranges_overlap(
+                current.x,
+                current.x + current.width,
+                candidate.x,
+                candidate.x + candidate.width,
+            );
+            (past_edge && x_overlap).then_some(current.y - (candidate.y + candidate.height))
+        }
+    }
+}
+
+/// Iterate over `rects`, skipping `current_id`, and return the closest pane
+/// in the given direction (lowest movement-axis distance).
+fn best_candidate_in_direction(
+    current_rect: Rect,
+    current_id: PaneId,
+    direction: FocusDirection,
+    rects: &[(PaneId, Rect)],
+) -> Option<PaneId> {
+    let mut best: Option<(PaneId, f32)> = None;
+    for &(id, rect) in rects {
+        if id == current_id {
+            continue;
+        }
+        if let Some(dist) = candidate_distance(current_rect, rect, direction) {
+            let dominated = best.is_some_and(|(_, d)| d <= dist);
+            if !dominated {
+                best = Some((id, dist));
+            }
+        }
+    }
+    best.map(|(id, _)| id)
 }

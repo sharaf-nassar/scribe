@@ -50,21 +50,22 @@ enum SessionStatus {
 struct SessionState {
     output_buffer: VecDeque<u8>,
     latest_snapshot: Option<ScreenSnapshot>,
+    /// When the latest snapshot was received, for cache freshness checks.
+    snapshot_time: Option<tokio::time::Instant>,
     cwd: Option<PathBuf>,
     title: Option<String>,
     status: SessionStatus,
-    workspace_id: WorkspaceId,
 }
 
 impl SessionState {
-    fn new(workspace_id: WorkspaceId) -> Self {
+    fn new() -> Self {
         Self {
             output_buffer: VecDeque::with_capacity(MAX_OUTPUT_BUFFER),
             latest_snapshot: None,
+            snapshot_time: None,
             cwd: None,
             title: None,
             status: SessionStatus::Running,
-            workspace_id,
         }
     }
 }
@@ -256,6 +257,10 @@ async fn server_reader_loop(
 }
 
 /// Dispatch a single `ServerMessage` to the appropriate session state.
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "flat match dispatch on server message variants; each arm is a one-line delegation"
+)]
 async fn dispatch_server_message(
     msg: ServerMessage,
     state: &SharedState,
@@ -301,6 +306,18 @@ async fn dispatch_server_message(
         ServerMessage::SessionList { .. } => {
             debug!("received session list (ignored by test daemon)");
         }
+        ServerMessage::ScrolledSnapshot { session_id, .. } => {
+            debug!(%session_id, "scrolled snapshot (ignored by test daemon)");
+        }
+        ServerMessage::SearchResults { session_id, .. } => {
+            debug!(%session_id, "search results (ignored by test daemon)");
+        }
+        ServerMessage::Welcome { window_id, .. } => {
+            debug!(%window_id, "welcome (ignored by test daemon)");
+        }
+        ServerMessage::QuitRequested => {
+            debug!("quit requested (ignored by test daemon)");
+        }
     }
 }
 
@@ -317,16 +334,24 @@ async fn handle_pty_output(
     let mut guard = state.lock().await;
     if let Some(session) = guard.sessions.get_mut(&session_id) {
         session.output_buffer.extend(data);
-        drain_output_buffer(&mut session.output_buffer);
+        drain_output_buffer(session_id, &mut session.output_buffer);
         drop(guard);
         notifiers.output.notify_waiters();
     }
 }
 
 /// Trim the front of the output buffer if it exceeds the capacity limit.
-fn drain_output_buffer(buf: &mut VecDeque<u8>) {
+///
+/// Logs a warning when bytes are discarded so that `wait-output` failures
+/// caused by buffer overflow are diagnosable.
+fn drain_output_buffer(session_id: SessionId, buf: &mut VecDeque<u8>) {
     if buf.len() > MAX_OUTPUT_BUFFER {
         let excess = buf.len() - MAX_OUTPUT_BUFFER;
+        warn!(
+            %session_id,
+            discarded_bytes = excess,
+            "output buffer overflow — oldest bytes discarded; wait-output may miss matches"
+        );
         buf.drain(..excess);
     }
 }
@@ -339,6 +364,7 @@ async fn handle_screen_snapshot(
     let mut guard = state.lock().await;
     if let Some(session) = guard.sessions.get_mut(&session_id) {
         session.latest_snapshot = Some(snapshot);
+        session.snapshot_time = Some(tokio::time::Instant::now());
     }
 }
 
@@ -372,7 +398,7 @@ async fn handle_session_created(
 ) {
     info!(%session_id, %workspace_id, %shell_name, "session created");
     let mut guard = state.lock().await;
-    guard.sessions.insert(session_id, SessionState::new(workspace_id));
+    guard.sessions.insert(session_id, SessionState::new());
     guard.last_session_created = Some(session_id);
     drop(guard);
     notifiers.session_created.notify_waiters();
@@ -515,6 +541,9 @@ async fn process_request(
         DaemonRequest::AssertExit { session_id, expected_code, timeout_ms } => {
             handle_assert_exit(session_id, expected_code, timeout_ms, state, notifiers).await
         }
+        DaemonRequest::AssertSnapshotMatch { session_id, reference } => {
+            handle_assert_snapshot_match(session_id, &reference, state, server_writer).await
+        }
         DaemonRequest::Shutdown => {
             handle_shutdown(shutdown);
             DaemonResponse::Ok
@@ -544,7 +573,7 @@ async fn handle_create_session(
     };
 
     // Step 2: Create a session in that workspace.
-    let msg = ClientMessage::CreateSession { workspace_id };
+    let msg = ClientMessage::CreateSession { workspace_id, split_direction: None };
     if let Err(e) = send_to_server(server_writer, &msg).await {
         return DaemonResponse::Error { message: format!("failed to send CreateSession: {e}") };
     }
@@ -839,17 +868,118 @@ async fn handle_assert_cell(
 }
 
 /// Compare a single cell in the snapshot against the expected character.
+/// On failure, includes a 3x3 neighborhood for context.
 fn check_cell_content(snap: &ScreenSnapshot, row: u16, col: u16, expected: char) -> DaemonResponse {
-    let index = usize::from(row) * usize::from(snap.cols) + usize::from(col);
+    let cols = usize::from(snap.cols);
+    let index = usize::from(row) * cols + usize::from(col);
     match snap.cells.get(index) {
         Some(cell) if cell.c == expected => DaemonResponse::Ok,
-        Some(cell) => DaemonResponse::AssertFailed {
-            message: format!("cell ({row},{col}): expected '{expected}' but found '{}'", cell.c),
-        },
+        Some(cell) => {
+            let context = cell_neighborhood(snap, row, col);
+            DaemonResponse::AssertFailed {
+                message: format!(
+                    "cell ({row},{col}): expected '{expected}' but found '{}'\n  context:\n{context}",
+                    cell.c,
+                ),
+            }
+        }
         None => {
             DaemonResponse::AssertFailed { message: format!("cell ({row},{col}): out of bounds") }
         }
     }
+}
+
+/// Replace control characters with a dot for display.
+fn printable_char(c: char) -> char {
+    if c.is_control() { '.' } else { c }
+}
+
+/// Build a 3-row context string around the target cell for debugging.
+fn cell_neighborhood(snap: &ScreenSnapshot, row: u16, col: u16) -> String {
+    let cols = usize::from(snap.cols);
+    let rows = usize::from(snap.rows);
+    let mut lines = Vec::new();
+
+    let r_start = row.saturating_sub(1);
+    let r_end = (usize::from(row) + 2).min(rows);
+    let c_start = col.saturating_sub(3);
+    let c_end = (usize::from(col) + 4).min(cols);
+
+    for r in usize::from(r_start)..r_end {
+        let mut line = format!("    row {r:3}: |");
+        for c in usize::from(c_start)..c_end {
+            let idx = r * cols + c;
+            let ch = snap.cells.get(idx).map_or(' ', |cell| printable_char(cell.c));
+            line.push(ch);
+        }
+        line.push('|');
+        if r == usize::from(row) {
+            line.push_str(" <--");
+        }
+        lines.push(line);
+    }
+
+    lines.join("\n")
+}
+
+/// Assert that the current screen matches a reference snapshot.
+///
+/// Compares non-space cell content, cursor position, and cursor visibility.
+/// Reports the first mismatch found.
+async fn handle_assert_snapshot_match(
+    session_id: SessionId,
+    reference: &ScreenSnapshot,
+    state: &SharedState,
+    server_writer: &Arc<Mutex<OwnedWriteHalf>>,
+) -> DaemonResponse {
+    let snap = get_or_request_snapshot(session_id, state, server_writer).await;
+    let Some(current) = snap else {
+        return DaemonResponse::Error { message: "failed to obtain snapshot".to_owned() };
+    };
+
+    // Dimension mismatch.
+    if current.cols != reference.cols || current.rows != reference.rows {
+        return DaemonResponse::AssertFailed {
+            message: format!(
+                "snapshot size mismatch: current {}x{}, reference {}x{}",
+                current.cols, current.rows, reference.cols, reference.rows,
+            ),
+        };
+    }
+
+    // Compare non-space cells (space cells are often padding and not meaningful).
+    for (i, (cur, refr)) in current.cells.iter().zip(reference.cells.iter()).enumerate() {
+        if refr.c != ' ' && cur.c != refr.c {
+            let cols = usize::from(current.cols);
+            let row = i / cols;
+            let col = i % cols;
+            return DaemonResponse::AssertFailed {
+                message: format!("cell ({row},{col}): expected '{}' but found '{}'", refr.c, cur.c,),
+            };
+        }
+    }
+
+    // Compare cursor position.
+    if current.cursor_row != reference.cursor_row || current.cursor_col != reference.cursor_col {
+        return DaemonResponse::AssertFailed {
+            message: format!(
+                "cursor position mismatch: current ({},{}), reference ({},{})",
+                current.cursor_row, current.cursor_col, reference.cursor_row, reference.cursor_col,
+            ),
+        };
+    }
+
+    // Compare cursor visibility.
+    if current.cursor_visible != reference.cursor_visible {
+        return DaemonResponse::AssertFailed {
+            message: format!(
+                "cursor visibility mismatch: current {}, reference {}",
+                current.cursor_visible, reference.cursor_visible,
+            ),
+        };
+    }
+
+    DaemonResponse::Ok
 }
 
 /// Assert that the cursor is at the expected position.
@@ -877,18 +1007,35 @@ async fn handle_assert_cursor(
     }
 }
 
-/// Get the latest snapshot, or request one if none exists.
+/// Maximum age for a cached snapshot to be considered fresh. Assertions that
+/// run in quick succession reuse the cached snapshot instead of round-tripping
+/// to the server for each one.
+const SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(100);
+
+/// Get a recent snapshot, or request a fresh one from the server.
+///
+/// Returns the cached snapshot if it is less than [`SNAPSHOT_CACHE_TTL`] old,
+/// avoiding redundant round-trips when multiple assertions run in sequence.
 async fn get_or_request_snapshot(
     session_id: SessionId,
     state: &SharedState,
     server_writer: &Arc<Mutex<OwnedWriteHalf>>,
 ) -> Option<ScreenSnapshot> {
-    // Check if we already have one.
-    if let Some(snap) = lookup_snapshot(session_id, state).await {
+    // Return the cached snapshot if fresh enough.
+    if let Some(snap) = lookup_fresh_snapshot(session_id, state).await {
         return Some(snap);
     }
 
     // Request one from the server.
+    // Clear the stale snapshot first so the poll loop waits for the fresh one.
+    {
+        let mut guard = state.lock().await;
+        if let Some(session) = guard.sessions.get_mut(&session_id) {
+            session.latest_snapshot = None;
+            session.snapshot_time = None;
+        }
+    }
+
     let msg = ClientMessage::RequestSnapshot { session_id };
     if send_to_server(server_writer, &msg).await.is_err() {
         return None;
@@ -905,6 +1052,17 @@ async fn get_or_request_snapshot(
             return None;
         }
     }
+}
+
+/// Return the cached snapshot only if it was received within the cache TTL.
+async fn lookup_fresh_snapshot(
+    session_id: SessionId,
+    state: &SharedState,
+) -> Option<ScreenSnapshot> {
+    let guard = state.lock().await;
+    let session = guard.sessions.get(&session_id)?;
+    let time = session.snapshot_time?;
+    if time.elapsed() < SNAPSHOT_CACHE_TTL { session.latest_snapshot.clone() } else { None }
 }
 
 /// Assert that a session exited with the expected code.

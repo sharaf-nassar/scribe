@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use alacritty_terminal::Term;
@@ -25,7 +25,7 @@ use scribe_pty::async_fd::AsyncPtyFd;
 use scribe_pty::event_listener::ScribeEventListener;
 use scribe_pty::metadata::{MetadataEvent, MetadataParser};
 
-use crate::handoff::{HandoffSession, HandoffState};
+use crate::handoff::HandoffState;
 
 /// Maximum number of active PTY sessions across all clients.
 const MAX_SESSIONS: usize = 256;
@@ -60,6 +60,10 @@ pub struct ManagedSession {
     /// `None` for sessions restored from a hot-reload handoff — the child stays
     /// alive because it holds the slave fd; we only need the master fd.
     pub pty: Option<alacritty_terminal::tty::Pty>,
+    /// Screen snapshot from a hot-reload handoff. Sent to the first client
+    /// that attaches (then cleared) so the pre-handoff screen content is
+    /// restored instead of a blank terminal.
+    pub handoff_snapshot: Option<ScreenSnapshot>,
 }
 
 /// Terminal dimensions implementing the `Dimensions` trait from `alacritty_terminal`.
@@ -156,7 +160,11 @@ impl SessionManager {
             cell_width: 1,
             cell_height: 1,
         };
-        let pty_options = PtyOptions::default();
+        let pty_options = PtyOptions {
+            env: HashMap::from([("TERM".to_owned(), "xterm-256color".to_owned())]),
+            working_directory: dirs::home_dir(),
+            ..PtyOptions::default()
+        };
 
         let pty = alacritty_terminal::tty::new(&pty_options, window_size, 0).map_err(|e| {
             ScribeError::PtySpawnFailed { reason: format!("alacritty tty::new failed: {e}") }
@@ -191,6 +199,7 @@ impl SessionManager {
             metadata_rx,
             workspace_id,
             pty: Some(pty),
+            handoff_snapshot: None,
         };
 
         self.sessions.write().await.insert(session_id, managed);
@@ -204,6 +213,14 @@ impl SessionManager {
     /// per-byte processing.
     pub async fn take_session(&self, session_id: SessionId) -> Option<ManagedSession> {
         self.sessions.write().await.remove(&session_id)
+    }
+
+    /// List all pending session IDs and their workspace IDs.
+    ///
+    /// "Pending" means the session exists in the manager but has not yet been
+    /// taken by the IPC server. Used to activate handoff-restored sessions.
+    pub async fn pending_session_ids(&self) -> Vec<(SessionId, WorkspaceId)> {
+        self.sessions.read().await.iter().map(|(&id, s)| (id, s.workspace_id)).collect()
     }
 
     /// Create a snapshot of the terminal screen for IPC transport.
@@ -236,48 +253,6 @@ impl SessionManager {
     #[allow(dead_code, reason = "used by upcoming workspace list and UI sync features")]
     pub async fn list_sessions(&self) -> Vec<SessionId> {
         self.sessions.read().await.keys().copied().collect()
-    }
-
-    /// Serialise all sessions for a hot-reload handoff.
-    ///
-    /// Returns `(sessions, raw_fds)` where the fds are in the same order as the
-    /// session vec. The caller must send these fds via `SCM_RIGHTS`.
-    pub async fn serialize_for_handoff(&self) -> (Vec<HandoffSession>, Vec<RawFd>) {
-        let sessions = self.sessions.read().await;
-        let mut handoff_sessions = Vec::with_capacity(sessions.len());
-        let mut fds = Vec::with_capacity(sessions.len());
-
-        for (session_id, managed) in sessions.iter() {
-            let term = managed.term.lock().await;
-            let snapshot = Some(snapshot_term(&term));
-            let grid = term.grid();
-
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "terminal dimensions are always within u16 range"
-            )]
-            let cols = grid.columns() as u16;
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "terminal dimensions are always within u16 range"
-            )]
-            let rows = grid.screen_lines() as u16;
-
-            drop(term);
-
-            handoff_sessions.push(HandoffSession {
-                session_id: *session_id,
-                workspace_id: managed.workspace_id,
-                child_pid: managed.child_pid,
-                cols,
-                rows,
-                snapshot,
-            });
-
-            fds.push(managed.pty_fd.raw_fd());
-        }
-
-        (handoff_sessions, fds)
     }
 
     /// Reconstruct a `SessionManager` from handoff state and received PTY fds.
@@ -350,6 +325,7 @@ impl SessionManager {
                 metadata_rx,
                 workspace_id: handoff_session.workspace_id,
                 pty: None,
+                handoff_snapshot: handoff_session.snapshot.clone(),
             };
 
             sessions_map.insert(handoff_session.session_id, managed);
@@ -389,7 +365,9 @@ pub fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
 
     let cursor_point = grid.cursor.point;
     let cursor_style = term.cursor_style();
-    let cursor_visible = term.mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
+    let mode = term.mode();
+    let cursor_visible = mode.contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
+    let alt_screen = mode.contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
 
     #[allow(
         clippy::cast_possible_truncation,
@@ -404,6 +382,7 @@ pub fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
         cursor_row: cursor_point.line.0.max(0) as u16,
         cursor_style: convert_cursor_style(cursor_style),
         cursor_visible,
+        alt_screen,
     }
 }
 

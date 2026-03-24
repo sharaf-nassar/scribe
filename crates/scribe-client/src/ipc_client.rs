@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use scribe_common::ai_state::AiProcessState;
 use scribe_common::framing::{read_message, write_message};
-use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{ClientMessage, ServerMessage};
 use scribe_common::socket::server_socket_path;
 use tokio::io::AsyncWriteExt as _;
@@ -23,7 +23,13 @@ pub enum ClientCommand {
     /// PTY resize notification for a specific session.
     Resize { session_id: SessionId, cols: u16, rows: u16 },
     /// Create a new session in the given workspace.
-    CreateSession { workspace_id: WorkspaceId },
+    ///
+    /// When `split_direction` is `Some`, the server records the layout
+    /// direction so it can be sent back on reconnect.
+    CreateSession {
+        workspace_id: WorkspaceId,
+        split_direction: Option<scribe_common::protocol::LayoutDirection>,
+    },
     /// Close a session.
     CloseSession { session_id: SessionId },
     /// Subscribe to output from additional sessions.
@@ -35,6 +41,12 @@ pub enum ClientCommand {
     /// Notify server that config file has been updated.
     #[allow(dead_code, reason = "will be triggered by config hot-reload file watcher")]
     ConfigReloaded,
+    /// Report the current workspace split tree to the server.
+    ReportWorkspaceTree { tree: scribe_common::protocol::WorkspaceTreeNode },
+    /// Identify this client window to the server (sent as first message).
+    Hello { window_id: Option<WindowId> },
+    /// Request all clients to save state and quit.
+    QuitAll,
 }
 
 /// Events forwarded from the IPC background thread to the winit event loop.
@@ -70,15 +82,16 @@ pub enum UiEvent {
     },
     /// Full workspace state sent from the server.
     WorkspaceInfo {
-        #[allow(dead_code, reason = "workspace_id preserved for future workspace layout")]
         workspace_id: WorkspaceId,
-        #[allow(dead_code, reason = "name preserved for future workspace layout")]
         name: Option<String>,
-        #[allow(dead_code, reason = "accent_color preserved for future workspace layout")]
         accent_color: String,
+        split_direction: Option<scribe_common::protocol::LayoutDirection>,
     },
     /// List of all live sessions, received in response to `ListSessions`.
-    SessionList { sessions: Vec<scribe_common::protocol::SessionInfo> },
+    SessionList {
+        sessions: Vec<scribe_common::protocol::SessionInfo>,
+        workspace_tree: Option<scribe_common::protocol::WorkspaceTreeNode>,
+    },
     /// A workspace has been auto-named.
     WorkspaceNamed { workspace_id: WorkspaceId, name: String },
     /// Server configuration has been reloaded.
@@ -87,6 +100,18 @@ pub enum UiEvent {
     ServerDisconnected,
     /// Animation timer tick -- sent by the animation thread to drive redraws.
     AnimationTick,
+    /// Settings window was closed -- carries final window geometry.
+    SettingsClosed { geometry: scribe_settings::SettingsWindowGeometry },
+    /// Server confirmed our window identity and listed other windows to spawn.
+    Welcome { window_id: WindowId, other_windows: Vec<WindowId> },
+    /// Server requested us to save state and quit (another client sent `QuitAll`).
+    QuitRequested,
+    /// User chose "Quit Scribe" from the close dialog (this window originated it).
+    QuitAllFromDialog,
+    /// User chose "Kill Window" from the close dialog.
+    CloseWindow,
+    /// User chose "Cancel" from the close dialog — do nothing.
+    CancelClose,
 }
 
 /// Start the IPC client on a background thread.
@@ -98,11 +123,19 @@ pub enum UiEvent {
 ///
 /// Returns an [`mpsc::Sender<ClientCommand>`] that the main thread can
 /// use to forward keyboard input, resize events, and session commands.
-pub fn start_ipc_thread(proxy: EventLoopProxy<UiEvent>) -> mpsc::Sender<ClientCommand> {
+pub fn start_ipc_thread(
+    proxy: EventLoopProxy<UiEvent>,
+    window_id: Option<WindowId>,
+) -> mpsc::Sender<ClientCommand> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCommand>();
     // Wrap cmd_rx in Arc<Mutex<_>> so it can be moved into spawn_blocking
     // closures which require 'static bounds.
     let cmd_rx = Arc::new(Mutex::new(cmd_rx));
+
+    // Send Hello as the first command so it's the first message on the wire.
+    if cmd_tx.send(ClientCommand::Hello { window_id }).is_err() {
+        tracing::warn!("IPC channel closed before Hello could be sent");
+    }
 
     std::thread::spawn(move || {
         #[allow(
@@ -156,14 +189,30 @@ async fn run_read_task(
             Ok(ServerMessage::GitBranch { session_id, branch }) => {
                 send_event(&proxy, UiEvent::GitBranch { session_id, branch });
             }
-            Ok(ServerMessage::WorkspaceInfo { workspace_id, name, accent_color }) => {
-                send_event(&proxy, UiEvent::WorkspaceInfo { workspace_id, name, accent_color });
+            Ok(ServerMessage::WorkspaceInfo {
+                workspace_id,
+                name,
+                accent_color,
+                split_direction,
+            }) => {
+                send_event(
+                    &proxy,
+                    UiEvent::WorkspaceInfo { workspace_id, name, accent_color, split_direction },
+                );
             }
-            Ok(ServerMessage::SessionList { sessions }) => {
-                send_event(&proxy, UiEvent::SessionList { sessions });
+            Ok(ServerMessage::SessionList { sessions, workspace_tree }) => {
+                send_event(&proxy, UiEvent::SessionList { sessions, workspace_tree });
             }
             Ok(ServerMessage::WorkspaceNamed { workspace_id, name }) => {
                 send_event(&proxy, UiEvent::WorkspaceNamed { workspace_id, name });
+            }
+            Ok(ServerMessage::Welcome { window_id, other_windows }) => {
+                tracing::info!(%window_id, others = other_windows.len(), "received Welcome");
+                send_event(&proxy, UiEvent::Welcome { window_id, other_windows });
+            }
+            Ok(ServerMessage::QuitRequested) => {
+                tracing::info!("received QuitRequested from server");
+                send_event(&proxy, UiEvent::QuitRequested);
             }
             Ok(other) => {
                 tracing::debug!(?other, "unhandled server message");
@@ -221,8 +270,8 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         ClientCommand::Resize { session_id, cols, rows } => {
             ClientMessage::Resize { session_id, cols, rows }
         }
-        ClientCommand::CreateSession { workspace_id } => {
-            ClientMessage::CreateSession { workspace_id }
+        ClientCommand::CreateSession { workspace_id, split_direction } => {
+            ClientMessage::CreateSession { workspace_id, split_direction }
         }
         ClientCommand::CloseSession { session_id } => ClientMessage::CloseSession { session_id },
         ClientCommand::Subscribe { session_ids } => ClientMessage::Subscribe { session_ids },
@@ -231,6 +280,9 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
             ClientMessage::AttachSessions { session_ids }
         }
         ClientCommand::ConfigReloaded => ClientMessage::ConfigReloaded,
+        ClientCommand::ReportWorkspaceTree { tree } => ClientMessage::ReportWorkspaceTree { tree },
+        ClientCommand::Hello { window_id } => ClientMessage::Hello { window_id },
+        ClientCommand::QuitAll => ClientMessage::QuitAll,
     }
 }
 
@@ -306,6 +358,18 @@ async fn ipc_main(
     let read_task = tokio::spawn(run_read_task(reader, read_proxy));
     let write_task = tokio::spawn(run_write_task(writer, cmd_rx));
 
-    // Drive both tasks to completion.
-    drop(tokio::join!(read_task, write_task));
+    // When either task finishes, abort the other so the process can exit.
+    // Typically the write task exits first (cmd_tx dropped when the UI
+    // closes), while the read task would block forever on a still-alive
+    // server socket.
+    let mut read_task = read_task;
+    let mut write_task = write_task;
+    tokio::select! {
+        _ = &mut read_task => {
+            write_task.abort();
+        }
+        _ = &mut write_task => {
+            read_task.abort();
+        }
+    }
 }

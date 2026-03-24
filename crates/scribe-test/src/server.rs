@@ -18,6 +18,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Maximum time to wait for the process to exit after SIGTERM.
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Maximum time to wait for the old server to exit during a hot-reload upgrade.
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Start the scribe-server process in the background.
 ///
 /// Spawns `scribe-server` as a detached child process, writes its PID to a
@@ -79,6 +82,61 @@ pub async fn stop() -> Result<(), ScribeError> {
     tokio::fs::remove_file(PID_FILE)
         .await
         .map_err(|e| ScribeError::IpcError { reason: format!("failed to remove PID file: {e}") })?;
+
+    Ok(())
+}
+
+/// Trigger a hot-reload upgrade.
+///
+/// Launches `scribe-server --upgrade` which connects to the running server's
+/// handoff socket, receives session state + PTY fds, and takes over as the
+/// new server. The old server exits after the handoff. The PID file is
+/// updated to point to the new process.
+pub async fn upgrade() -> Result<(), ScribeError> {
+    let old_pid_str = tokio::fs::read_to_string(PID_FILE)
+        .await
+        .map_err(|e| ScribeError::IpcError { reason: format!("failed to read PID file: {e}") })?;
+
+    let old_pid: i32 = old_pid_str
+        .trim()
+        .parse()
+        .map_err(|e| ScribeError::IpcError { reason: format!("invalid PID in file: {e}") })?;
+
+    // Launch the new server with --upgrade.
+    let child = std::process::Command::new("scribe-server")
+        .arg("--upgrade")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| ScribeError::IpcError {
+            reason: format!("failed to spawn scribe-server --upgrade: {e}"),
+        })?;
+
+    let new_pid = child.id();
+
+    // Wait for the old server to exit (it should exit after sending the handoff).
+    let old_nix_pid = Pid::from_raw(old_pid);
+    let deadline = tokio::time::Instant::now() + UPGRADE_TIMEOUT;
+
+    loop {
+        if kill(old_nix_pid, None).is_err() {
+            break; // Old server exited.
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ScribeError::IpcError {
+                reason: format!("old server (pid {old_pid}) did not exit within timeout"),
+            });
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    // Verify the new server's socket is available.
+    wait_for_socket().await?;
+
+    // Update PID file to point to the new process.
+    tokio::fs::write(PID_FILE, new_pid.to_string())
+        .await
+        .map_err(|e| ScribeError::IpcError { reason: format!("failed to write PID file: {e}") })?;
 
     Ok(())
 }

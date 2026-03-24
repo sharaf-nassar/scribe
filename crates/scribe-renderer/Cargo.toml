@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 wgpu.workspace = true
 cosmic-text.workspace = true
+fontdb = "0.23.0"
 bytemuck.workspace = true
 alacritty_terminal.workspace = true
 tracing.workspace = true

@@ -19,6 +19,7 @@ allow = [
   "Unicode-DFS-2016",
   "CC0-1.0",
   "MPL-2.0",
+  "BSL-1.0",
 ]
 
 [licenses.private]
@@ -28,6 +29,26 @@ ignore = true
 version = 2
 unmaintained = "all"
 unsound = "all"
+ignore = [
+  # GTK3 bindings unmaintained — transitive via wry (webview); no GTK4 wry yet
+  "RUSTSEC-2024-0412", # atk
+  "RUSTSEC-2024-0413", # atk-sys
+  "RUSTSEC-2024-0414", # gdk
+  "RUSTSEC-2024-0415", # gdk-sys
+  "RUSTSEC-2024-0416", # gdkx11
+  "RUSTSEC-2024-0417", # gdkx11-sys
+  "RUSTSEC-2024-0418", # gtk
+  "RUSTSEC-2024-0419", # gtk-sys
+  "RUSTSEC-2024-0420", # gtk3-macros
+  # fxhash unmaintained — transitive via selectors/kuchikiki/wry
+  "RUSTSEC-2024-0370",
+  # proc-macro-error unmaintained — transitive via gtk3-macros
+  "RUSTSEC-2024-0429",
+  # glib VariantStrIter unsoundness — transitive via GTK3 bindings
+  "RUSTSEC-2025-0057",
+  # time 0.3.x stack exhaustion DoS — transitive via various crates
+  "RUSTSEC-2026-0009",
+]
 
 [bans]
 multiple-versions = "warn"

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::ai_state::AiProcessState;
-use crate::ids::{SessionId, WorkspaceId};
+use crate::ids::{SessionId, WindowId, WorkspaceId};
 
 // ── UI → Server ──────────────────────────────────────────────────
 
@@ -21,6 +21,10 @@ pub enum ClientMessage {
     },
     CreateSession {
         workspace_id: WorkspaceId,
+        /// When this session creates a new workspace (via a split), the
+        /// direction of that split.  `None` when adding a tab to an
+        /// existing workspace.
+        split_direction: Option<LayoutDirection>,
     },
     CloseSession {
         session_id: SessionId,
@@ -51,6 +55,27 @@ pub enum ClientMessage {
     },
     /// Notify server that config file has been updated.
     ConfigReloaded,
+    /// Report the current workspace split tree so the server can persist it
+    /// for reconnect and handoff.  Sent by the client after every tree
+    /// mutation (split, close, divider drag).
+    ReportWorkspaceTree {
+        tree: WorkspaceTreeNode,
+    },
+    /// Search for text in the terminal scrollback/screen.
+    SearchRequest {
+        session_id: SessionId,
+        query: String,
+        /// Maximum number of matches to return.
+        limit: u32,
+    },
+    /// First message after connect — identifies this window to the server.
+    /// `None` means the client is starting fresh and the server should assign
+    /// or create a window.
+    Hello {
+        window_id: Option<WindowId>,
+    },
+    /// Request all connected clients to save state and close gracefully.
+    QuitAll,
 }
 
 // ── Server → UI ──────────────────────────────────────────────────
@@ -108,6 +133,10 @@ pub enum ServerMessage {
     /// List of all live sessions, sent in response to `ListSessions`.
     SessionList {
         sessions: Vec<SessionInfo>,
+        /// Full workspace split tree, if one has been reported by a client.
+        /// `None` when no client has connected yet or when upgrading from an
+        /// older server that did not persist the tree.
+        workspace_tree: Option<WorkspaceTreeNode>,
     },
     /// Full workspace state sent to client on creation or reconnect.
     WorkspaceInfo {
@@ -115,14 +144,81 @@ pub enum ServerMessage {
         name: Option<String>,
         /// Hex color string (e.g. "#a78bfa") from the rotating accent palette.
         accent_color: String,
+        /// Direction of the split that created this workspace.  `None` for
+        /// the initial (unsplit) workspace.
+        split_direction: Option<LayoutDirection>,
     },
+    /// Scrollback snapshot at a specific offset from the bottom.
+    ScrolledSnapshot {
+        session_id: SessionId,
+        snapshot: crate::screen::ScreenSnapshot,
+        /// The actual offset applied (clamped by available history).
+        applied_offset: u32,
+    },
+    /// Search results for a `SearchRequest`.
+    SearchResults {
+        session_id: SessionId,
+        query: String,
+        matches: Vec<SearchMatch>,
+    },
+    /// Response to `Hello` — confirms the assigned window ID and lists other
+    /// windows that need to be spawned (for session restoration on startup).
+    Welcome {
+        window_id: WindowId,
+        /// Window IDs that have detached sessions but no connected client.
+        /// The receiving client should spawn a new process for each.
+        other_windows: Vec<WindowId>,
+    },
+    /// Server requests this client to save state and close gracefully.
+    /// Sent in response to another client's `QuitAll`.
+    QuitRequested,
 }
 
 // ── Shared types ─────────────────────────────────────────────────
+
+/// Direction of a workspace split, persisted by the server so the client
+/// can reconstruct the window layout on reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LayoutDirection {
+    /// Side-by-side (left | right).
+    Horizontal,
+    /// Top-over-bottom (top / bottom).
+    Vertical,
+}
+
+/// Serialisable workspace split tree.
+///
+/// Contains only the structural information the server needs to store and
+/// relay so the client can reconstruct its `WindowNode` tree exactly on
+/// reconnect: split direction, split ratio, and workspace leaf IDs.
+///
+/// Tab/pane state, accent colours, and names are NOT part of this tree —
+/// those travel in `WorkspaceInfo` messages and the flat workspace map.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WorkspaceTreeNode {
+    /// A single workspace occupying its entire region.
+    Leaf { workspace_id: WorkspaceId },
+    /// A split dividing space between two sub-trees.
+    Split {
+        direction: LayoutDirection,
+        /// Fraction of space allocated to `first` (0.0–1.0).
+        ratio: f32,
+        first: Box<WorkspaceTreeNode>,
+        second: Box<WorkspaceTreeNode>,
+    },
+}
 
 /// Summary of a live session, sent in `SessionList` responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: SessionId,
     pub workspace_id: WorkspaceId,
+}
+
+/// A single search match location in the terminal grid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchMatch {
+    pub row: u16,
+    pub col_start: u16,
+    pub col_end: u16,
 }
