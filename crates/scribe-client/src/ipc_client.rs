@@ -29,6 +29,7 @@ pub enum ClientCommand {
     CreateSession {
         workspace_id: WorkspaceId,
         split_direction: Option<scribe_common::protocol::LayoutDirection>,
+        cwd: Option<std::path::PathBuf>,
     },
     /// Close a session.
     CloseSession { session_id: SessionId },
@@ -45,6 +46,8 @@ pub enum ClientCommand {
     ReportWorkspaceTree { tree: scribe_common::protocol::WorkspaceTreeNode },
     /// Identify this client window to the server (sent as first message).
     Hello { window_id: Option<WindowId> },
+    /// Close this window and destroy all its sessions on the server.
+    CloseWindow { window_id: WindowId },
     /// Request all clients to save state and quit.
     QuitAll,
 }
@@ -267,8 +270,8 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         ClientCommand::Resize { session_id, cols, rows } => {
             ClientMessage::Resize { session_id, cols, rows }
         }
-        ClientCommand::CreateSession { workspace_id, split_direction } => {
-            ClientMessage::CreateSession { workspace_id, split_direction }
+        ClientCommand::CreateSession { workspace_id, split_direction, cwd } => {
+            ClientMessage::CreateSession { workspace_id, split_direction, cwd }
         }
         ClientCommand::CloseSession { session_id } => ClientMessage::CloseSession { session_id },
         ClientCommand::Subscribe { session_ids } => ClientMessage::Subscribe { session_ids },
@@ -279,6 +282,7 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         ClientCommand::ConfigReloaded => ClientMessage::ConfigReloaded,
         ClientCommand::ReportWorkspaceTree { tree } => ClientMessage::ReportWorkspaceTree { tree },
         ClientCommand::Hello { window_id } => ClientMessage::Hello { window_id },
+        ClientCommand::CloseWindow { window_id } => ClientMessage::CloseWindow { window_id },
         ClientCommand::QuitAll => ClientMessage::QuitAll,
     }
 }

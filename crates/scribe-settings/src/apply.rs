@@ -107,6 +107,14 @@ fn apply_config_key(
             let v = value.as_f64().ok_or("scrollbar_width must be a number")? as f32;
             config.appearance.scrollbar_width = v.clamp(2.0, 20.0);
         }
+        "appearance.tab_bar_padding" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "tab bar padding is a small non-negative float"
+            )]
+            let v = value.as_f64().ok_or("tab_bar_padding must be a number")? as f32;
+            config.appearance.tab_bar_padding = v.clamp(0.0, 20.0);
+        }
         // -- Theme preset -----------------------------------------------------
         "theme.preset" => {
             let preset = value.as_str().ok_or("theme preset must be a string")?;
@@ -138,6 +146,14 @@ fn apply_config_key(
         "terminal.natural_scroll" => {
             config.terminal.natural_scroll =
                 value.as_bool().ok_or("natural_scroll must be a boolean")?;
+        }
+        "terminal.indicator_height" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "indicator height is a small positive float"
+            )]
+            let v = value.as_f64().ok_or("indicator_height must be a number")? as f32;
+            config.terminal.indicator_height = v.clamp(1.0, 10.0);
         }
         // -- Claude States ----------------------------------------------------
         key if key.starts_with("claude_states.") => {

@@ -292,7 +292,6 @@ impl WorkspaceManager {
     }
 
     /// Remove a window and all its session→window mappings.
-    #[allow(dead_code, reason = "called when CloseWindow is implemented")]
     pub fn remove_window(&mut self, window_id: WindowId) {
         self.session_to_window.retain(|_, wid| *wid != window_id);
         self.window_trees.remove(&window_id);

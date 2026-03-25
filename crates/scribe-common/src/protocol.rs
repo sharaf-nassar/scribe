@@ -25,6 +25,11 @@ pub enum ClientMessage {
         /// direction of that split.  `None` when adding a tab to an
         /// existing workspace.
         split_direction: Option<LayoutDirection>,
+        /// Working directory for the new shell.  When `Some`, the PTY is
+        /// spawned in this directory (used to inherit the active tab's CWD).
+        /// `None` falls back to `$HOME`.
+        #[serde(default)]
+        cwd: Option<PathBuf>,
     },
     CloseSession {
         session_id: SessionId,
@@ -73,6 +78,11 @@ pub enum ClientMessage {
     /// or create a window.
     Hello {
         window_id: Option<WindowId>,
+    },
+    /// Close this window and destroy all its sessions.  Sent when the user
+    /// chooses "Close this window only" from the close dialog.
+    CloseWindow {
+        window_id: WindowId,
     },
     /// Request all connected clients to save state and close gracefully.
     QuitAll,

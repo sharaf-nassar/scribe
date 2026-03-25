@@ -14,9 +14,6 @@ use scribe_renderer::types::GridSize;
 use crate::layout::Rect;
 use crate::scrollbar::ScrollbarState;
 
-/// Height of the tab bar in pixels (reserved at the top of each pane).
-pub const TAB_BAR_HEIGHT: f32 = 32.0;
-
 /// State for a single terminal pane.
 pub struct Pane {
     pub session_id: SessionId,
@@ -27,7 +24,6 @@ pub struct Pane {
     #[allow(dead_code, reason = "used by tab bar text rendering")]
     pub title: String,
     /// Current working directory reported by the shell via OSC 7.
-    #[allow(dead_code, reason = "set by CWD change handler, used by future workspace features")]
     pub cwd: Option<PathBuf>,
     /// Current git branch name (or short SHA in detached HEAD).
     pub git_branch: Option<String>,
@@ -125,8 +121,8 @@ impl Pane {
     }
 
     /// Return the pixel offset where terminal content starts (below tab bar).
-    pub fn content_offset(&self) -> (f32, f32) {
-        (self.rect.x, self.rect.y + TAB_BAR_HEIGHT)
+    pub fn content_offset(&self, tab_bar_height: f32) -> (f32, f32) {
+        (self.rect.x, self.rect.y + tab_bar_height)
     }
 
     /// Return the content area (below tab bar) as a viewport size tuple.
@@ -136,16 +132,21 @@ impl Pane {
         clippy::cast_possible_truncation,
         reason = "pane rect dimensions are small non-negative pixel values that fit in u32"
     )]
-    pub fn content_viewport(&self) -> (u32, u32) {
-        let h = (self.rect.height - TAB_BAR_HEIGHT).max(1.0);
+    pub fn content_viewport(&self, tab_bar_height: f32) -> (u32, u32) {
+        let h = (self.rect.height - tab_bar_height).max(1.0);
         (self.rect.width.max(1.0) as u32, h as u32)
     }
 }
 
 /// Compute the grid size for a pane's content area.
-pub fn compute_pane_grid(rect: Rect, cell_width: f32, cell_height: f32) -> GridSize {
+pub fn compute_pane_grid(
+    rect: Rect,
+    cell_width: f32,
+    cell_height: f32,
+    tab_bar_height: f32,
+) -> GridSize {
     let content_w = rect.width;
-    let content_h = (rect.height - TAB_BAR_HEIGHT).max(1.0);
+    let content_h = (rect.height - tab_bar_height).max(1.0);
     grid_from_pixels(content_w, content_h, cell_width, cell_height)
 }
 

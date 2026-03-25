@@ -66,6 +66,10 @@ dmg:
 dmg-quick:
     bash dist/macos/build-dmg.sh --skip-build
 
+# Set up Claude Code AI indicator hooks (run after installing Claude Code)
+setup-claude:
+    bash dist/setup-claude-hooks.sh --hook-source dist
+
 # ==================== E2E Testing ====================
 
 # Rebuild functional test container (after cargo build --release)

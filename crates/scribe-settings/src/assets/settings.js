@@ -604,6 +604,7 @@ function loadConfig(config) {
 
   // Appearance — Window
   setSliderValue("appearance.opacity", config.appearance?.opacity);
+  setStepperValue("appearance.tab_bar_padding", config.appearance?.tab_bar_padding);
 
   // Terminal
   setStepperValue("terminal.scrollback_lines", config.terminal?.scrollback_lines);
@@ -611,6 +612,7 @@ function loadConfig(config) {
   setToggleValue("terminal.copy_on_select", config.terminal?.copy_on_select);
   setToggleValue("terminal.claude_copy_cleanup", config.terminal?.claude_copy_cleanup);
   setToggleValue("terminal.claude_code_integration", config.terminal?.claude_code_integration);
+  setStepperValue("terminal.indicator_height", config.terminal?.indicator_height);
 
   // Claude Code States
   var states = config.terminal?.claude_states;

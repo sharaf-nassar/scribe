@@ -582,7 +582,7 @@ async fn handle_create_session(
         let mut guard = state.lock().await;
         guard.last_session_created = None;
     }
-    let msg = ClientMessage::CreateSession { workspace_id, split_direction: None };
+    let msg = ClientMessage::CreateSession { workspace_id, split_direction: None, cwd: None };
     if let Err(e) = send_to_server(server_writer, &msg).await {
         return DaemonResponse::Error { message: format!("failed to send CreateSession: {e}") };
     }

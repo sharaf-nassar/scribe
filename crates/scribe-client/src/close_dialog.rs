@@ -23,33 +23,33 @@ pub enum CloseAction {
 /// Index of the currently focused button.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ButtonIndex {
-    Cancel = 0,
-    QuitScribe = 1,
-    KillWindow = 2,
+    QuitScribe = 0,
+    KillWindow = 1,
+    Cancel = 2,
 }
 
 impl ButtonIndex {
     fn next(self) -> Self {
         match self {
-            Self::Cancel => Self::QuitScribe,
             Self::QuitScribe => Self::KillWindow,
             Self::KillWindow => Self::Cancel,
+            Self::Cancel => Self::QuitScribe,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            Self::Cancel => Self::KillWindow,
             Self::QuitScribe => Self::Cancel,
             Self::KillWindow => Self::QuitScribe,
+            Self::Cancel => Self::KillWindow,
         }
     }
 
     fn to_action(self) -> CloseAction {
         match self {
-            Self::Cancel => CloseAction::Cancel,
             Self::QuitScribe => CloseAction::QuitAll,
             Self::KillWindow => CloseAction::CloseWindow,
+            Self::Cancel => CloseAction::Cancel,
         }
     }
 }
@@ -57,7 +57,7 @@ impl ButtonIndex {
 const BUTTON_COUNT: usize = 3;
 
 /// Labels for each button, in order matching [`ButtonIndex`].
-const BUTTON_LABELS: [&str; BUTTON_COUNT] = ["Cancel", "Quit Scribe", "Kill Window"];
+const BUTTON_LABELS: [&str; BUTTON_COUNT] = ["Quit Scribe", "Kill Window", "Cancel"];
 
 /// Minimum number of columns the dialog can shrink to (ensures buttons fit).
 const MIN_DIALOG_COLS: usize = 36;
@@ -116,9 +116,9 @@ impl CloseDialog {
     pub fn click(&self, x: f32, y: f32) -> Option<CloseAction> {
         let idx = self.button_rects.iter().position(|r| r.contains(x, y))?;
         let button = match idx {
-            0 => ButtonIndex::Cancel,
-            1 => ButtonIndex::QuitScribe,
-            2 => ButtonIndex::KillWindow,
+            0 => ButtonIndex::QuitScribe,
+            1 => ButtonIndex::KillWindow,
+            2 => ButtonIndex::Cancel,
             _ => return None,
         };
         Some(button.to_action())
@@ -383,19 +383,19 @@ impl CloseDialog {
 
 /// Per-button color selection.
 ///
-/// - **Cancel** (idx 0): subtle — low-contrast background, normal text
-/// - **Quit Scribe** (idx 1): accent — themed accent color highlight
-/// - **Kill Window** (idx 2): destructive — ANSI red tint
+/// - **Quit Scribe** (idx 0): accent — themed accent color highlight
+/// - **Kill Window** (idx 1): destructive — ANSI red tint
+/// - **Cancel** (idx 2): subtle — low-contrast background, normal text
 fn button_colors(btn_idx: usize, active: bool, colors: &DialogColors) -> ([f32; 4], [f32; 4]) {
     if active {
         match btn_idx {
-            1 => (colors.button_active_fg, colors.button_accent_bg),
-            2 => (colors.button_active_fg, colors.button_danger_bg),
+            0 => (colors.button_active_fg, colors.button_accent_bg),
+            1 => (colors.button_active_fg, colors.button_danger_bg),
             _ => (colors.button_active_fg, colors.button_active_bg),
         }
     } else {
         match btn_idx {
-            2 => (colors.button_danger_fg, colors.button_bg),
+            1 => (colors.button_danger_fg, colors.button_bg),
             _ => (colors.button_fg, colors.button_bg),
         }
     }

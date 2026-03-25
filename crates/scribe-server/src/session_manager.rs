@@ -124,6 +124,7 @@ impl SessionManager {
     pub async fn create_session(
         &self,
         workspace_id: WorkspaceId,
+        cwd: Option<std::path::PathBuf>,
     ) -> Result<SessionId, ScribeError> {
         let scrollback_lines = self.scrollback_lines;
         {
@@ -166,7 +167,7 @@ impl SessionManager {
                 ("TERM_PROGRAM".to_owned(), "Scribe".to_owned()),
                 ("TERM_PROGRAM_VERSION".to_owned(), env!("CARGO_PKG_VERSION").to_owned()),
             ]),
-            working_directory: dirs::home_dir(),
+            working_directory: cwd.filter(|p| p.is_dir()).or_else(dirs::home_dir),
             ..PtyOptions::default()
         };
 

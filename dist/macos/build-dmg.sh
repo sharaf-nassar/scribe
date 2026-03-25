@@ -92,6 +92,10 @@ cp "${BUILD_DIR}/scribe-settings" "${MACOS_DIR}/"
 # Copy icon
 cp "${STAGING_DIR}/Scribe.icns" "${RESOURCES_DIR}/"
 
+# Copy Claude Code hook integration scripts
+cp "${DIST_DIR}/setup-claude-hooks.sh" "${RESOURCES_DIR}/"
+cp "${DIST_DIR}/detect-claude-question.sh" "${RESOURCES_DIR}/"
+
 echo "==> ${BUNDLE_NAME} assembled at ${APP_DIR}"
 
 # --- Step 4: Create DMG ---

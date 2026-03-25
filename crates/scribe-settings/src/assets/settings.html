@@ -181,6 +181,17 @@
               <span class="slider-val">1.00</span>
             </div>
           </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Tab Bar Padding</div>
+              <div class="setting-desc">Vertical padding around tab text (0 = no padding)</div>
+            </div>
+            <div class="number-control" data-key="appearance.tab_bar_padding" data-min="0" data-max="20" data-step="1">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">4</div>
+              <div class="number-btn">+</div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -434,6 +445,17 @@
               <div class="toggle-knob"></div>
             </div>
           </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Indicator Height</div>
+              <div class="setting-desc">Height of the AI state indicator bar in pixels</div>
+            </div>
+            <div class="number-control" data-key="terminal.indicator_height" data-min="1" data-max="10" data-step="1">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">2</div>
+              <div class="number-btn">+</div>
+            </div>
+          </div>
         </div>
 
         <div class="section-label">Claude Code States</div>
@@ -441,8 +463,8 @@
           <!-- Column headers -->
           <div class="setting-row" style="opacity:0.5;font-size:11px;">
             <div class="setting-info"><div class="setting-label"></div></div>
-            <div style="width:36px;text-align:center;">Tab</div>
-            <div style="width:36px;text-align:center;">Pane</div>
+            <div style="width:36px;text-align:center;" data-tooltip="Show indicator in the tab bar">Tab Bar</div>
+            <div style="width:36px;text-align:center;" data-tooltip="Show indicator as a pane border">Border</div>
             <div style="width:28px;text-align:center;">Color</div>
             <div style="width:90px;text-align:center;">Pulse (ms)</div>
             <div style="width:90px;text-align:center;">Timeout (s)</div>

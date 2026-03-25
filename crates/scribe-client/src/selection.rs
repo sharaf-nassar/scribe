@@ -10,7 +10,6 @@ use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::index::{Column, Line};
 
 use crate::layout::Rect;
-use crate::pane::TAB_BAR_HEIGHT;
 
 /// A position on the terminal grid, in row/column coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +39,6 @@ impl SelectionRange {
     }
 
     /// Return `true` if the given cell lies within this selection range.
-    #[allow(dead_code, reason = "will be used for selection highlight rendering")]
     pub fn contains_cell(&self, row: i32, col: usize) -> bool {
         let (lo, hi) = self.normalized();
 
@@ -81,17 +79,22 @@ impl SelectionRange {
     clippy::cast_sign_loss,
     reason = "pixel / cell_size yields a small positive value fitting in usize / i32"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "coordinate conversion needs pane geometry, cell size, and tab bar height"
+)]
 pub fn pixel_to_grid(
     x: f32,
     y: f32,
     pane_rect: Rect,
     cell_w: f32,
     cell_h: f32,
+    tab_bar_height: f32,
 ) -> Option<SelectionPoint> {
     let content_x = pane_rect.x;
-    let content_y = pane_rect.y + TAB_BAR_HEIGHT;
+    let content_y = pane_rect.y + tab_bar_height;
     let content_w = pane_rect.width;
-    let content_h = (pane_rect.height - TAB_BAR_HEIGHT).max(0.0);
+    let content_h = (pane_rect.height - tab_bar_height).max(0.0);
 
     // Pixel offset relative to the content area origin.
     let rel_x = x - content_x;

@@ -9,7 +9,7 @@ use std::time::Instant;
 use alacritty_terminal::grid::Dimensions as _;
 use scribe_renderer::types::CellInstance;
 
-use crate::pane::{Pane, TAB_BAR_HEIGHT};
+use crate::pane::Pane;
 
 /// Minimum scrollbar thumb height in physical pixels.
 const MIN_THUMB_HEIGHT: f32 = 20.0;
@@ -136,7 +136,7 @@ struct ThumbGeometry {
     clippy::cast_precision_loss,
     reason = "grid dimensions and display_offset are small positive integers fitting in f32"
 )]
-fn compute_thumb(pane: &Pane, scrollbar_width: f32) -> Option<ThumbGeometry> {
+fn compute_thumb(pane: &Pane, scrollbar_width: f32, tab_bar_height: f32) -> Option<ThumbGeometry> {
     let history_size = pane.term.grid().history_size();
     if history_size == 0 {
         return None;
@@ -145,8 +145,8 @@ fn compute_thumb(pane: &Pane, scrollbar_width: f32) -> Option<ThumbGeometry> {
     let screen_lines = pane.term.grid().screen_lines();
     let display_offset = pane.term.grid().display_offset();
 
-    let track_top = pane.rect.y + TAB_BAR_HEIGHT;
-    let track_height = (pane.rect.height - TAB_BAR_HEIGHT).max(1.0);
+    let track_top = pane.rect.y + tab_bar_height;
+    let track_height = (pane.rect.height - tab_bar_height).max(1.0);
 
     let total = (history_size + screen_lines) as f32;
     let thumb_height = (screen_lines as f32 / total * track_height).max(MIN_THUMB_HEIGHT);
@@ -175,12 +175,13 @@ pub fn build_scrollbar_instances(
     pane: &Pane,
     scrollbar_width: f32,
     scrollbar_color: [f32; 4],
+    tab_bar_height: f32,
 ) {
     if pane.scrollbar_state.opacity <= 0.0 {
         return;
     }
 
-    let Some(thumb) = compute_thumb(pane, scrollbar_width) else {
+    let Some(thumb) = compute_thumb(pane, scrollbar_width, tab_bar_height) else {
         return;
     };
 
@@ -207,13 +208,19 @@ pub fn build_scrollbar_instances(
 ///
 /// The hit zone is `scrollbar_width * 3` wide, anchored to the right edge.
 /// Returns `true` if the point is in the zone AND the pane has scrollback.
-pub fn hit_test_scrollbar(pane: &Pane, x: f32, y: f32, scrollbar_width: f32) -> bool {
+pub fn hit_test_scrollbar(
+    pane: &Pane,
+    x: f32,
+    y: f32,
+    scrollbar_width: f32,
+    tab_bar_height: f32,
+) -> bool {
     let history_size = pane.term.grid().history_size();
     if history_size == 0 {
         return false;
     }
 
-    let track_top = pane.rect.y + TAB_BAR_HEIGHT;
+    let track_top = pane.rect.y + tab_bar_height;
     let track_bottom = pane.rect.y + pane.rect.height;
     let hit_zone_width = scrollbar_width * 3.0;
     let hit_zone_left = pane.rect.x + pane.rect.width - hit_zone_width - RIGHT_INSET;
@@ -224,8 +231,14 @@ pub fn hit_test_scrollbar(pane: &Pane, x: f32, y: f32, scrollbar_width: f32) -> 
 /// Hit-test whether a point is on the scrollbar thumb itself.
 ///
 /// Returns `true` if the point is within the thumb rectangle.
-pub fn hit_test_thumb(pane: &Pane, x: f32, y: f32, scrollbar_width: f32) -> bool {
-    let Some(thumb) = compute_thumb(pane, scrollbar_width) else {
+pub fn hit_test_thumb(
+    pane: &Pane,
+    x: f32,
+    y: f32,
+    scrollbar_width: f32,
+    tab_bar_height: f32,
+) -> bool {
+    let Some(thumb) = compute_thumb(pane, scrollbar_width, tab_bar_height) else {
         return false;
     };
 
@@ -241,8 +254,13 @@ pub fn hit_test_thumb(pane: &Pane, x: f32, y: f32, scrollbar_width: f32) -> bool
     clippy::cast_sign_loss,
     reason = "grid dimensions are small positive integers; result is clamped to valid range"
 )]
-pub fn offset_from_track_click(pane: &Pane, click_y: f32, scrollbar_width: f32) -> usize {
-    let Some(thumb) = compute_thumb(pane, scrollbar_width) else {
+pub fn offset_from_track_click(
+    pane: &Pane,
+    click_y: f32,
+    scrollbar_width: f32,
+    tab_bar_height: f32,
+) -> usize {
+    let Some(thumb) = compute_thumb(pane, scrollbar_width, tab_bar_height) else {
         return 0;
     };
 
@@ -273,8 +291,9 @@ pub fn offset_from_drag(
     drag: &ScrollbarDrag,
     current_mouse_y: f32,
     scrollbar_width: f32,
+    tab_bar_height: f32,
 ) -> usize {
-    let Some(thumb) = compute_thumb(pane, scrollbar_width) else {
+    let Some(thumb) = compute_thumb(pane, scrollbar_width, tab_bar_height) else {
         return drag.start_display_offset;
     };
 

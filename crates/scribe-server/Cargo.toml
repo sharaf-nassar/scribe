@@ -64,6 +64,16 @@ assets = [
     "usr/share/icons/hicolor/512x512/apps/scribe.png",
     "644",
   ],
+  [
+    "../../dist/setup-claude-hooks.sh",
+    "usr/share/scribe/setup-claude-hooks.sh",
+    "755",
+  ],
+  [
+    "../../dist/detect-claude-question.sh",
+    "usr/share/scribe/detect-claude-question.sh",
+    "755",
+  ],
 ]
 maintainer-scripts = "../../dist/debian/"
 

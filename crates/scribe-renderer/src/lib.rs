@@ -65,6 +65,8 @@ pub struct TerminalRenderer {
     default_fg_dim: [f32; 4],
     cursor_shape: CursorShape,
     cursor_color: [f32; 4],
+    selection_bg: [f32; 4],
+    selection_fg: [f32; 4],
 }
 
 impl TerminalRenderer {
@@ -114,6 +116,8 @@ impl TerminalRenderer {
             },
             cursor_shape: CursorShape::Block,
             cursor_color: srgb_to_linear_rgba([0.8, 0.8, 0.8, 1.0]),
+            selection_bg: srgb_to_linear_rgba([0.25, 0.25, 0.28, 1.0]),
+            selection_fg: srgb_to_linear_rgba([1.0, 1.0, 1.0, 1.0]),
         }
     }
 
@@ -163,6 +167,24 @@ impl TerminalRenderer {
             content.cursor.shape != alacritty_terminal::vte::ansi::CursorShape::Hidden;
         let effective_cursor_visible = cursor_visible && term_cursor_shown;
 
+        // Honour the terminal's DECSCUSR cursor shape when a TUI app has
+        // explicitly changed it (e.g. Claude Code sets Beam for its input
+        // field).  Fall back to the user's config shape when the terminal
+        // reports the default (Block) — this lets `cursor_shape = "beam"`
+        // in config.toml work for normal shell usage.
+        let saved_shape = self.cursor_shape;
+        if effective_cursor_visible {
+            match content.cursor.shape {
+                alacritty_terminal::vte::ansi::CursorShape::Beam => {
+                    self.cursor_shape = CursorShape::Beam;
+                }
+                alacritty_terminal::vte::ansi::CursorShape::Underline => {
+                    self.cursor_shape = CursorShape::Underline;
+                }
+                _ => {}
+            }
+        }
+
         let instances = self.build_instances_offset(
             device,
             queue,
@@ -172,6 +194,7 @@ impl TerminalRenderer {
             effective_cursor_visible,
         );
 
+        self.cursor_shape = saved_shape;
         term.reset_damage();
         instances
     }
@@ -223,6 +246,18 @@ impl TerminalRenderer {
             }
         }
         self.palette.override_ansi(&linear_ansi);
+        self.selection_bg = srgb_to_linear_rgba(theme.selection);
+        self.selection_fg = srgb_to_linear_rgba(theme.selection_foreground);
+    }
+
+    /// Return the current selection background color (linear space).
+    pub const fn selection_bg(&self) -> [f32; 4] {
+        self.selection_bg
+    }
+
+    /// Return the current selection foreground color (linear space).
+    pub const fn selection_fg(&self) -> [f32; 4] {
+        self.selection_fg
     }
 
     /// Set the cursor shape used when rendering the terminal cursor.

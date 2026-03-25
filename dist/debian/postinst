@@ -178,6 +178,24 @@ case "$1" in
             fi
             echo ""
         fi
+
+        # ── Claude Code hook integration (both fresh and upgrade) ───────
+        SETUP_SCRIPT="/usr/share/scribe/setup-claude-hooks.sh"
+        if [ -x "$SETUP_SCRIPT" ]; then
+            TARGET_HOME=$(eval echo "~$(id -un "$TARGET_UID")" 2>/dev/null) || true
+            CLAUDE_DIR="${TARGET_HOME}/.claude"
+
+            if [ -d "$CLAUDE_DIR" ]; then
+                echo "  Setting up Claude Code AI indicator hooks..."
+                if [ -n "$SUDO_UID" ]; then
+                    sudo -u "#${SUDO_UID}" \
+                        HOME="$TARGET_HOME" \
+                        "$SETUP_SCRIPT" --hook-source /usr/share/scribe 2>&1 | sed 's/^/  /'
+                else
+                    "$SETUP_SCRIPT" --hook-source /usr/share/scribe 2>&1 | sed 's/^/  /'
+                fi
+            fi
+        fi
         ;;
 esac
 

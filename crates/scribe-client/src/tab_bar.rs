@@ -12,13 +12,6 @@ use scribe_common::ids::WorkspaceId;
 
 use crate::layout::Rect;
 
-/// Height of the tab bar in pixels.
-#[allow(dead_code, reason = "exported constant for pane content area calculation")]
-pub const TAB_BAR_HEIGHT: f32 = 32.0;
-
-/// Height of the AI state indicator bar underneath each tab label.
-const INDICATOR_BAR_HEIGHT: f32 = 2.0;
-
 /// Colors for the tab bar, derived from the theme's [`ChromeColors`].
 pub struct TabBarColors {
     pub bg: [f32; 4],
@@ -62,6 +55,7 @@ pub fn build_tab_bar_bg(
     rect: Rect,
     cell_size: (f32, f32),
     colors: &TabBarColors,
+    tab_bar_height: f32,
 ) {
     let (cell_w, _cell_h) = cell_size;
     if cell_w <= 0.0 {
@@ -81,7 +75,7 @@ pub fn build_tab_bar_bg(
         let x = rect.x + col_idx as f32 * cell_w;
         out.push(CellInstance {
             pos: [x, rect.y],
-            size: [cell_w, TAB_BAR_HEIGHT],
+            size: [cell_w, tab_bar_height],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
             fg_color: bg,
@@ -101,13 +95,14 @@ pub fn build_tab_bar_separator(
     rect: Rect,
     cell_size: (f32, f32),
     color: [f32; 4],
+    tab_bar_height: f32,
 ) {
     let (cell_w, _) = cell_size;
     if cell_w <= 0.0 {
         return;
     }
 
-    let separator_y = rect.y + TAB_BAR_HEIGHT - SEPARATOR_HEIGHT;
+    let separator_y = rect.y + tab_bar_height - SEPARATOR_HEIGHT;
     let cols = columns_in_width(rect.width, cell_w);
 
     for col_idx in 0..cols {
@@ -157,6 +152,10 @@ pub struct TabBarTextParams<'a> {
     /// Returns `(uv_min, uv_max)`. `FnMut` because atlas rasterization
     /// may occur for uncached glyphs.
     pub resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+    /// Tab bar height in pixels (from config).
+    pub tab_bar_height: f32,
+    /// AI indicator bar height in pixels (from config).
+    pub indicator_height: f32,
 }
 
 /// Clickable regions produced by [`build_tab_bar_text`].
@@ -282,10 +281,10 @@ fn render_tabs(
 
         hit_targets.tab_rects.push((
             tab_idx,
-            Rect { x: tab_x, y: params.rect.y, width: tab_width, height: TAB_BAR_HEIGHT },
+            Rect { x: tab_x, y: params.rect.y, width: tab_width, height: params.tab_bar_height },
         ));
 
-        // Render AI indicator bar underneath this tab if active.
+        // Render AI indicator bar above this tab if active.
         if let Some(indicator_color) = tab.ai_indicator {
             render_indicator_bar(
                 instances,
@@ -294,6 +293,7 @@ fn render_tabs(
                 tab_x,
                 tab_width_cols,
                 cell_w,
+                params.indicator_height,
             );
         }
     }
@@ -301,7 +301,7 @@ fn render_tabs(
     col
 }
 
-/// Render a thin coloured indicator bar under a tab.
+/// Render a thin coloured indicator bar above a tab (at the top of the tab bar).
 #[allow(clippy::too_many_arguments, reason = "render helper needs tab geometry and colour context")]
 #[allow(
     clippy::cast_precision_loss,
@@ -314,15 +314,17 @@ fn render_indicator_bar(
     tab_x: f32,
     tab_width_cols: usize,
     cell_w: f32,
+    indicator_height: f32,
 ) {
-    let bar_y = rect_y + TAB_BAR_HEIGHT - INDICATOR_BAR_HEIGHT;
+    // Position at the very top of the tab bar area.
+    let bar_y = rect_y;
 
     // Solid colour bar spanning the full tab width.
     for bar_col in 0..tab_width_cols {
         let bx = tab_x + bar_col as f32 * cell_w;
         instances.push(CellInstance {
             pos: [bx, bar_y],
-            size: [cell_w, INDICATOR_BAR_HEIGHT],
+            size: [cell_w, indicator_height],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
             fg_color: color,
@@ -364,8 +366,12 @@ fn render_gear(
         let (cell_w, _) = params.cell_size;
         let gear_x = params.rect.x + gear_start_col as f32 * cell_w;
         let gear_width = (col - gear_start_col) as f32 * cell_w;
-        hit_targets.gear_rect =
-            Some(Rect { x: gear_x, y: params.rect.y, width: gear_width, height: TAB_BAR_HEIGHT });
+        hit_targets.gear_rect = Some(Rect {
+            x: gear_x,
+            y: params.rect.y,
+            width: gear_width,
+            height: params.tab_bar_height,
+        });
     }
 }
 
@@ -392,12 +398,13 @@ fn emit_char(
         return col;
     }
 
-    let (cell_w, _cell_h) = params.cell_size;
+    let (cell_w, cell_h) = params.cell_size;
     let x = params.rect.x + col as f32 * cell_w;
+    let y = params.rect.y + ((params.tab_bar_height - cell_h) / 2.0).max(0.0);
     let (uv_min, uv_max) = (params.resolve_glyph)(ch);
 
     instances.push(CellInstance {
-        pos: [x, params.rect.y],
+        pos: [x, y],
         size: [0.0, 0.0],
         uv_min,
         uv_max,

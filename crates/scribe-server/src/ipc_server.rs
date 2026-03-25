@@ -377,10 +377,11 @@ async fn dispatch_message(
     connected_clients: &ConnectedClients,
 ) {
     match msg {
-        ClientMessage::CreateSession { workspace_id, split_direction } => {
+        ClientMessage::CreateSession { workspace_id, split_direction, cwd } => {
             handle_create_session(
                 workspace_id,
                 split_direction,
+                cwd,
                 session_manager,
                 workspace_manager,
                 writer,
@@ -437,6 +438,10 @@ async fn dispatch_message(
             // Hello is handled during the handshake phase, not here.
             debug!("unexpected Hello after handshake, ignoring");
         }
+        ClientMessage::CloseWindow { window_id: target_window } => {
+            handle_close_window(target_window, workspace_manager, live_sessions, attached_ids)
+                .await;
+        }
         ClientMessage::QuitAll => {
             handle_quit_all(window_id, connected_clients).await;
         }
@@ -454,6 +459,7 @@ async fn dispatch_message(
 async fn handle_create_session(
     workspace_id: WorkspaceId,
     split_direction: Option<scribe_common::protocol::LayoutDirection>,
+    cwd: Option<std::path::PathBuf>,
     session_manager: &Arc<SessionManager>,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     writer: &SharedWriter,
@@ -461,7 +467,7 @@ async fn handle_create_session(
     attached_ids: &mut HashSet<SessionId>,
     window_id: WindowId,
 ) {
-    let session_id = match session_manager.create_session(workspace_id).await {
+    let session_id = match session_manager.create_session(workspace_id, cwd).await {
         Ok(id) => id,
         Err(e) => {
             send_error(writer, &format!("failed to create session: {e}")).await;
@@ -622,6 +628,34 @@ async fn handle_close_session(
     workspace_manager.write().await.remove_session(session_id);
     attached_ids.remove(&session_id);
     info!(%session_id, "session closed by client");
+}
+
+/// Close a window: destroy every session it owns and remove the window from
+/// the workspace manager so it won't be resurrected on the next client launch.
+async fn handle_close_window(
+    window_id: WindowId,
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    live_sessions: &LiveSessionRegistry,
+    attached_ids: &mut HashSet<SessionId>,
+) {
+    let session_ids = workspace_manager.read().await.sessions_for_window(window_id);
+    info!(%window_id, count = session_ids.len(), "closing window — destroying sessions");
+
+    // Destroy each session (drops PTY fd → SIGHUP → child exit).
+    {
+        let mut sessions = live_sessions.write().await;
+        for &sid in &session_ids {
+            sessions.remove(&sid);
+            attached_ids.remove(&sid);
+        }
+    }
+
+    // Remove window and all session→window mappings.
+    let mut wm = workspace_manager.write().await;
+    for &sid in &session_ids {
+        wm.remove_session(sid);
+    }
+    wm.remove_window(window_id);
 }
 
 /// Resize the terminal and PTY.
@@ -883,8 +917,6 @@ async fn handle_attach_sessions(
     drop(sessions);
 
     for (session_id, workspace_id, client_writer, term) in attach_data {
-        // Set the writer so the PTY reader task starts forwarding output.
-        *client_writer.lock().await = Some(Arc::clone(writer));
         attached_ids.insert(session_id);
 
         // Send SessionCreated so the client can process it through the normal flow.
@@ -912,6 +944,15 @@ async fn handle_attach_sessions(
         let snapshot = take_session_snapshot(session_id, &term, live_sessions).await;
         let snap_msg = ServerMessage::ScreenSnapshot { session_id, snapshot };
         send_message(writer, &snap_msg).await;
+
+        // Set the writer AFTER the snapshot is sent.  The PTY reader task
+        // checks this writer on every read — while it is `None`, output
+        // is silently dropped (the Term state is still updated).  By
+        // deferring the set, we guarantee the client receives the
+        // ScreenSnapshot before any live PtyOutput, preventing stale
+        // terminal state (cursor position, alt-screen mode) from racing
+        // with the snapshot and producing ghost cursors on reconnect.
+        *client_writer.lock().await = Some(Arc::clone(writer));
 
         info!(%session_id, "session attached to new client");
     }

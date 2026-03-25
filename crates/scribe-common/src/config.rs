@@ -123,6 +123,10 @@ pub struct AppearanceConfig {
     pub scrollbar_width: f32,
     #[serde(default)]
     pub scrollbar_color: Option<String>,
+    /// Vertical padding around tab bar text in pixels. The effective tab bar
+    /// height is `cell_height + tab_bar_padding`. `0` means no padding.
+    #[serde(default = "default_tab_bar_padding")]
+    pub tab_bar_padding: f32,
 }
 
 impl Default for AppearanceConfig {
@@ -140,6 +144,7 @@ impl Default for AppearanceConfig {
             theme: default_theme_name(),
             scrollbar_width: default_scrollbar_width(),
             scrollbar_color: None,
+            tab_bar_padding: default_tab_bar_padding(),
         }
     }
 }
@@ -174,6 +179,10 @@ fn default_theme_name() -> String {
 
 fn default_scrollbar_width() -> f32 {
     6.0
+}
+
+fn default_tab_bar_padding() -> f32 {
+    4.0
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +399,9 @@ pub struct TerminalConfig {
     /// Per-state configuration for Claude Code AI indicators.
     #[serde(default)]
     pub claude_states: ClaudeStatesConfig,
+    /// Height of the AI state indicator bar in pixels.
+    #[serde(default = "default_indicator_height")]
+    pub indicator_height: f32,
 }
 
 impl Default for TerminalConfig {
@@ -401,12 +413,17 @@ impl Default for TerminalConfig {
             claude_code_integration: true,
             natural_scroll: false,
             claude_states: ClaudeStatesConfig::default(),
+            indicator_height: default_indicator_height(),
         }
     }
 }
 
 fn default_scrollback_lines() -> u32 {
     10_000
+}
+
+fn default_indicator_height() -> f32 {
+    2.0
 }
 
 // ---------------------------------------------------------------------------
