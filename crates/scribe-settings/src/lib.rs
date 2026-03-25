@@ -322,8 +322,7 @@ fn build_tao_window(
 ) -> Result<tao::window::Window, String> {
     use tao::dpi::{LogicalPosition, LogicalSize};
 
-    let mut builder = tao::window::WindowBuilder::new()
-        .with_title("Scribe Settings");
+    let mut builder = tao::window::WindowBuilder::new().with_title("Scribe Settings");
 
     if let Some(geom) = geometry {
         builder = builder
@@ -333,9 +332,7 @@ fn build_tao_window(
         builder = builder.with_inner_size(LogicalSize::new(880.0, 680.0));
     }
 
-    builder
-        .build(event_loop)
-        .map_err(|e| format!("failed to create window: {e}"))
+    builder.build(event_loop).map_err(|e| format!("failed to create window: {e}"))
 }
 
 /// Spawn a background thread to accept singleton socket connections.
@@ -351,8 +348,10 @@ fn spawn_singleton_listener(
             if !singleton::verify_peer_uid(&stream) {
                 continue;
             }
-            if singleton::read_command(&stream).as_deref() == Some("focus") {
-                drop(proxy.send_event(TaoUserEvent::FocusWindow));
+            match singleton::read_command(&stream).as_deref() {
+                Some("focus") => drop(proxy.send_event(TaoUserEvent::FocusWindow)),
+                Some("quit") => drop(proxy.send_event(TaoUserEvent::Terminate)),
+                _ => {}
             }
         }
     });
@@ -394,10 +393,7 @@ fn capture_geometry(window: &tao::window::Window) -> SettingsWindowGeometry {
 /// Uses `tao::EventLoop` for windowing and `wry::WebViewBuilder::build()`
 /// with the tao window (no GTK dependency).
 #[cfg(not(target_os = "linux"))]
-#[allow(
-    clippy::too_many_lines,
-    reason = "tao window setup + webview + event loop in one function"
-)]
+#[allow(clippy::too_many_lines, reason = "tao window setup + webview + event loop in one function")]
 pub fn run_settings_window(
     geometry: Option<SettingsWindowGeometry>,
     on_change: impl Fn(String) + 'static,
@@ -415,8 +411,8 @@ pub fn run_settings_window(
     let config_json = load_config_json();
     let html = build_html()?;
 
-    let mut event_loop = tao::event_loop::EventLoopBuilder::<TaoUserEvent>::with_user_event()
-        .build();
+    let mut event_loop =
+        tao::event_loop::EventLoopBuilder::<TaoUserEvent>::with_user_event().build();
     let window = build_tao_window(&event_loop, geometry)?;
 
     // Spawn singleton listener and signal handlers on background threads.
@@ -502,8 +498,10 @@ fn handle_singleton_connection(listener: &std::os::unix::net::UnixListener, wind
     if !singleton::verify_peer_uid(&stream) {
         return;
     }
-    if singleton::read_command(&stream).as_deref() == Some("focus") {
-        window.present();
+    match singleton::read_command(&stream).as_deref() {
+        Some("focus") => window.present(),
+        Some("quit") => gtk::main_quit(),
+        _ => {}
     }
 }
 

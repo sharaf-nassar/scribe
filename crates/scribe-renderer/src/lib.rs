@@ -288,6 +288,17 @@ impl TerminalRenderer {
         let cell_w = self.cell_size.width;
         let cell_h = self.cell_size.height;
 
+        // When the user scrolls into history, display_iter yields cells with
+        // negative line indices (e.g. Line(-5) for display_offset=5).  Add the
+        // offset back so screen row 0 maps to the top of the content area
+        // rather than bleeding above the pane.
+        #[allow(
+            clippy::cast_possible_wrap,
+            clippy::cast_possible_truncation,
+            reason = "display_offset is bounded by scrollback_lines (≤ 100_000), fits in i32"
+        )]
+        let line_offset = content.display_offset as i32;
+
         // Collect cells: display_iter is a one-shot iterator.
         let cells: Vec<CollectedCell> = content
             .display_iter
@@ -323,7 +334,7 @@ impl TerminalRenderer {
             }
 
             let col = cell.point.column.0 as f32;
-            let row = cell.point.line.0 as f32;
+            let row = (cell.point.line.0 + line_offset) as f32;
             let pos = [col * cell_w + offset.0, row * cell_h + offset.1];
 
             let (fg, bg) = self.resolve_cell_colors_raw(cell.fg, cell.bg, cell.flags);

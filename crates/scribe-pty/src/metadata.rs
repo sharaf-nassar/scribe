@@ -15,6 +15,8 @@ pub enum MetadataEvent {
     CwdChanged(PathBuf),
     TitleChanged(String),
     AiStateChanged(AiProcessState),
+    /// The AI state was explicitly cleared (OSC 1337 `ClaudeState=inactive`).
+    AiStateCleared,
     Bell,
 }
 
@@ -91,24 +93,62 @@ impl MetadataParser {
         let payload_bytes = params.get(1)?;
         let payload = String::from_utf8_lossy(payload_bytes);
 
-        payload.strip_prefix("AiState=").and_then(Self::parse_ai_state)
+        // Primary format: ESC ] 1337 ; ClaudeState=<state> [; key=value ...] ST
+        if let Some(state_value) = payload.strip_prefix("ClaudeState=") {
+            return Self::parse_claude_state(state_value, params);
+        }
+
+        // Legacy format: ESC ] 1337 ; AiState=state=<state>;key=val... ST
+        // Kept for backwards compatibility with older Claude Code versions.
+        if let Some(legacy_payload) = payload.strip_prefix("AiState=") {
+            return Self::parse_legacy_ai_state(legacy_payload);
+        }
+
+        None
     }
 
-    fn parse_ai_state(payload: &str) -> Option<MetadataEvent> {
+    /// Parse the legacy `AiState=state=X;key=val` single-payload format.
+    fn parse_legacy_ai_state(payload: &str) -> Option<MetadataEvent> {
         let mut builder = AiStateBuilder::default();
-
         for part in payload.split(';') {
-            let Some((key, value)) = part.split_once('=') else {
-                continue;
-            };
-            builder.apply(key, value);
+            if let Some((key, value)) = part.split_once('=') {
+                builder.apply(key, value);
+            }
+        }
+        builder.build()
+    }
+
+    fn parse_claude_state(state_value: &str, params: &[&[u8]]) -> Option<MetadataEvent> {
+        // "inactive" explicitly clears the AI state for this session.
+        if state_value == "inactive" {
+            return Some(MetadataEvent::AiStateCleared);
+        }
+
+        let state = match state_value {
+            "idle_prompt" => AiState::IdlePrompt,
+            "processing" => AiState::Processing,
+            "waiting_for_input" => AiState::WaitingForInput,
+            "permission_prompt" => AiState::PermissionPrompt,
+            "error" => AiState::Error,
+            _ => return None,
+        };
+
+        let mut builder = AiStateBuilder { state: Some(state), ..AiStateBuilder::default() };
+
+        // VTE splits OSC params on semicolons, so additional key=value
+        // metadata (tool, agent, model, context) arrives in params[2..].
+        for raw in params.get(2..).unwrap_or_default() {
+            let kv = String::from_utf8_lossy(raw);
+            if let Some((key, value)) = kv.split_once('=') {
+                builder.apply(key, value);
+            }
         }
 
         builder.build()
     }
 }
 
-/// Accumulates key=value pairs from the OSC 1337 `AiState` payload.
+/// Accumulates key=value fields from OSC 1337 `ClaudeState` params.
 #[derive(Default)]
 struct AiStateBuilder {
     state: Option<AiState>,
@@ -121,10 +161,13 @@ struct AiStateBuilder {
 impl AiStateBuilder {
     fn apply(&mut self, key: &str, value: &str) {
         match key {
+            // "state" is used by the legacy `AiState=state=X;…` format where
+            // all fields arrive in a single semicolon-delimited payload.
             "state" => {
                 self.state = match value {
                     "idle_prompt" => Some(AiState::IdlePrompt),
                     "processing" => Some(AiState::Processing),
+                    "waiting_for_input" => Some(AiState::WaitingForInput),
                     "permission_prompt" => Some(AiState::PermissionPrompt),
                     "error" => Some(AiState::Error),
                     _ => None,

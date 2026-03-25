@@ -8,6 +8,8 @@ use scribe_common::theme::ChromeColors;
 use scribe_renderer::srgb_to_linear_rgba;
 use scribe_renderer::types::CellInstance;
 
+use scribe_common::ids::WorkspaceId;
+
 use crate::layout::Rect;
 
 /// Height of the tab bar in pixels.
@@ -130,6 +132,8 @@ pub fn build_tab_bar_separator(
 /// Gathered at the call site (where workspace metadata is accessible) and
 /// passed into `build_all_instances` to avoid borrow conflicts.
 pub struct WorkspaceTabBarData {
+    /// Workspace identity (used to map tab clicks to the correct workspace).
+    pub ws_id: WorkspaceId,
     /// Full workspace rect (the tab bar spans its entire width).
     pub ws_rect: Rect,
     /// Tab data for each tab in the workspace.
@@ -318,7 +322,7 @@ fn render_indicator_bar(
         let bx = tab_x + bar_col as f32 * cell_w;
         instances.push(CellInstance {
             pos: [bx, bar_y],
-            size: [0.0, 0.0],
+            size: [cell_w, INDICATOR_BAR_HEIGHT],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
             fg_color: color,

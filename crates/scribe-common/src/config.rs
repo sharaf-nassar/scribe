@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::ScribeError;
-use crate::theme::{self, Theme, ThemeColors, hex_to_rgba};
+use crate::theme::{self, Theme, ThemeColors, hex_to_rgba, rgba_to_hex};
 
 // ---------------------------------------------------------------------------
 // KeyComboList — a keybinding field that holds one or more key combos
@@ -210,6 +210,161 @@ pub struct ThemeConfig {
 }
 
 // ---------------------------------------------------------------------------
+// AI State Colors
+// ---------------------------------------------------------------------------
+
+/// A color reference that can be either a fixed hex colour or an ANSI palette
+/// index (0–15) that adapts to the active theme.
+///
+/// TOML format: `"#rrggbb"` for hex, `"ansi:N"` for palette index.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AiColor {
+    /// Fixed sRGB colour parsed from `#rrggbb`.
+    /// Note: alpha is not preserved through serialization (hex is RGB only).
+    Hex([f32; 4]),
+    /// ANSI palette index (0–15), resolved at render time.
+    Ansi(u8),
+}
+
+impl AiColor {
+    /// Resolve to a concrete `[f32; 4]` colour given the current ANSI palette.
+    #[must_use]
+    pub fn resolve(&self, ansi_colors: &[[f32; 4]; 16]) -> [f32; 4] {
+        match self {
+            Self::Hex(c) => *c,
+            Self::Ansi(idx) => {
+                ansi_colors.get(usize::from(*idx)).copied().unwrap_or([1.0, 1.0, 1.0, 1.0])
+            }
+        }
+    }
+}
+
+impl Serialize for AiColor {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Hex(c) => serializer.serialize_str(&rgba_to_hex(*c)),
+            Self::Ansi(idx) => serializer.serialize_str(&format!("ansi:{idx}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AiColor {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        if let Some(rest) = s.strip_prefix("ansi:") {
+            let idx: u8 = rest.parse().map_err(serde::de::Error::custom)?;
+            if idx > 15 {
+                return Err(serde::de::Error::custom("ANSI index must be 0–15"));
+            }
+            Ok(Self::Ansi(idx))
+        } else {
+            hex_to_rgba(&s).map(Self::Hex).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+/// Per-state configuration for a single AI indicator state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiStateEntry {
+    /// Show a coloured bar under the tab label.
+    #[serde(default = "default_true")]
+    pub tab_indicator: bool,
+    /// Show a coloured border around the pane.
+    #[serde(default = "default_true")]
+    pub pane_border: bool,
+    /// Indicator colour (hex or ANSI palette index).
+    pub color: AiColor,
+    /// Pulse animation duration in milliseconds. `0` means no pulsing.
+    #[serde(default = "default_pulse_duration")]
+    pub pulse_ms: u32,
+    /// Auto-clear timeout in seconds. `0` means the state persists until
+    /// explicitly replaced by another state.
+    #[serde(default)]
+    pub timeout_secs: f32,
+}
+
+fn default_pulse_duration() -> u32 {
+    1000
+}
+
+/// Configuration for all five Claude Code AI indicator states.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeStatesConfig {
+    #[serde(default = "default_processing_entry")]
+    pub processing: AiStateEntry,
+    #[serde(default = "default_idle_prompt_entry")]
+    pub idle_prompt: AiStateEntry,
+    #[serde(default = "default_waiting_for_input_entry")]
+    pub waiting_for_input: AiStateEntry,
+    #[serde(default = "default_permission_prompt_entry")]
+    pub permission_prompt: AiStateEntry,
+    #[serde(default = "default_error_entry")]
+    pub error: AiStateEntry,
+}
+
+impl Default for ClaudeStatesConfig {
+    fn default() -> Self {
+        Self {
+            processing: default_processing_entry(),
+            idle_prompt: default_idle_prompt_entry(),
+            waiting_for_input: default_waiting_for_input_entry(),
+            permission_prompt: default_permission_prompt_entry(),
+            error: default_error_entry(),
+        }
+    }
+}
+
+fn default_processing_entry() -> AiStateEntry {
+    AiStateEntry {
+        tab_indicator: true,
+        pane_border: true,
+        color: AiColor::Ansi(2),
+        pulse_ms: 1400,
+        timeout_secs: 0.0,
+    }
+}
+
+fn default_idle_prompt_entry() -> AiStateEntry {
+    AiStateEntry {
+        tab_indicator: true,
+        pane_border: true,
+        color: AiColor::Hex([1.0, 0.65, 0.1, 1.0]),
+        pulse_ms: 2000,
+        timeout_secs: 10.0,
+    }
+}
+
+fn default_waiting_for_input_entry() -> AiStateEntry {
+    AiStateEntry {
+        tab_indicator: true,
+        pane_border: true,
+        color: AiColor::Hex([1.0, 0.55, 0.0, 1.0]),
+        pulse_ms: 2000,
+        timeout_secs: 0.0,
+    }
+}
+
+fn default_permission_prompt_entry() -> AiStateEntry {
+    AiStateEntry {
+        tab_indicator: true,
+        pane_border: true,
+        color: AiColor::Ansi(1),
+        pulse_ms: 1500,
+        timeout_secs: 0.0,
+    }
+}
+
+fn default_error_entry() -> AiStateEntry {
+    AiStateEntry {
+        tab_indicator: true,
+        pane_border: true,
+        color: AiColor::Hex([0.6, 0.2, 0.8, 1.0]),
+        pulse_ms: 0,
+        timeout_secs: 3.0,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Terminal
 // ---------------------------------------------------------------------------
 
@@ -227,6 +382,14 @@ pub struct TerminalConfig {
     pub claude_copy_cleanup: bool,
     #[serde(default = "default_true")]
     pub claude_code_integration: bool,
+    /// When `true`, the OS-reported scroll direction is used as-is (natural
+    /// scrolling).  When `false` (default), the scroll delta is inverted for
+    /// traditional terminal behaviour.
+    #[serde(default)]
+    pub natural_scroll: bool,
+    /// Per-state configuration for Claude Code AI indicators.
+    #[serde(default)]
+    pub claude_states: ClaudeStatesConfig,
 }
 
 impl Default for TerminalConfig {
@@ -236,6 +399,8 @@ impl Default for TerminalConfig {
             copy_on_select: true,
             claude_copy_cleanup: true,
             claude_code_integration: true,
+            natural_scroll: false,
+            claude_states: ClaudeStatesConfig::default(),
         }
     }
 }
@@ -466,39 +631,39 @@ fn default_prev_tab() -> KeyComboList {
 }
 
 fn default_select_tab_1() -> KeyComboList {
-    KeyComboList::single("ctrl+1")
+    KeyComboList::single("alt+1")
 }
 
 fn default_select_tab_2() -> KeyComboList {
-    KeyComboList::single("ctrl+2")
+    KeyComboList::single("alt+2")
 }
 
 fn default_select_tab_3() -> KeyComboList {
-    KeyComboList::single("ctrl+3")
+    KeyComboList::single("alt+3")
 }
 
 fn default_select_tab_4() -> KeyComboList {
-    KeyComboList::single("ctrl+4")
+    KeyComboList::single("alt+4")
 }
 
 fn default_select_tab_5() -> KeyComboList {
-    KeyComboList::single("ctrl+5")
+    KeyComboList::single("alt+5")
 }
 
 fn default_select_tab_6() -> KeyComboList {
-    KeyComboList::single("ctrl+6")
+    KeyComboList::single("alt+6")
 }
 
 fn default_select_tab_7() -> KeyComboList {
-    KeyComboList::single("ctrl+7")
+    KeyComboList::single("alt+7")
 }
 
 fn default_select_tab_8() -> KeyComboList {
-    KeyComboList::single("ctrl+8")
+    KeyComboList::single("alt+8")
 }
 
 fn default_select_tab_9() -> KeyComboList {
-    KeyComboList::single("ctrl+9")
+    KeyComboList::single("alt+9")
 }
 
 fn default_copy() -> KeyComboList {

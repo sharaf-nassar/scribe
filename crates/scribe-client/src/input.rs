@@ -172,83 +172,85 @@ impl Keybinding {
 }
 
 impl Bindings {
-    /// Parse all keybindings from config, falling back to defaults for invalid entries.
+    /// Parse all keybindings from config.
+    ///
+    /// Defaults are defined in [`KeybindingsConfig::default()`] (the single
+    /// source of truth).  Serde fills them in for any missing config fields,
+    /// so every list is non-empty by the time it reaches here.  Invalid
+    /// entries are skipped with a warning.
     pub fn parse(config: &KeybindingsConfig) -> Self {
         Self {
             // Panes
-            split_vertical: parse_set(&config.split_vertical, "ctrl+shift+\\"),
-            split_horizontal: parse_set(&config.split_horizontal, "ctrl+shift+-"),
-            close_pane: parse_set(&config.close_pane, "ctrl+shift+w"),
-            cycle_pane: parse_set(&config.cycle_pane, "ctrl+tab"),
-            focus_left: parse_set(&config.focus_left, "ctrl+alt+left"),
-            focus_right: parse_set(&config.focus_right, "ctrl+alt+right"),
-            focus_up: parse_set(&config.focus_up, "ctrl+alt+up"),
-            focus_down: parse_set(&config.focus_down, "ctrl+alt+down"),
+            split_vertical: parse_set(&config.split_vertical),
+            split_horizontal: parse_set(&config.split_horizontal),
+            close_pane: parse_set(&config.close_pane),
+            cycle_pane: parse_set(&config.cycle_pane),
+            focus_left: parse_set(&config.focus_left),
+            focus_right: parse_set(&config.focus_right),
+            focus_up: parse_set(&config.focus_up),
+            focus_down: parse_set(&config.focus_down),
 
             // Workspaces
-            workspace_split_vertical: parse_set(&config.workspace_split_vertical, "ctrl+alt+\\"),
-            workspace_split_horizontal: parse_set(&config.workspace_split_horizontal, "ctrl+alt+-"),
-            cycle_workspace: parse_set(&config.cycle_workspace, "ctrl+alt+tab"),
+            workspace_split_vertical: parse_set(&config.workspace_split_vertical),
+            workspace_split_horizontal: parse_set(&config.workspace_split_horizontal),
+            cycle_workspace: parse_set(&config.cycle_workspace),
 
             // Tabs
-            new_tab: parse_set(&config.new_tab, "ctrl+shift+t"),
-            close_tab: parse_set(&config.close_tab, "ctrl+shift+q"),
-            next_tab: parse_set(&config.next_tab, "ctrl+pagedown"),
-            prev_tab: parse_set(&config.prev_tab, "ctrl+pageup"),
-            select_tab_1: parse_set(&config.select_tab_1, "ctrl+1"),
-            select_tab_2: parse_set(&config.select_tab_2, "ctrl+2"),
-            select_tab_3: parse_set(&config.select_tab_3, "ctrl+3"),
-            select_tab_4: parse_set(&config.select_tab_4, "ctrl+4"),
-            select_tab_5: parse_set(&config.select_tab_5, "ctrl+5"),
-            select_tab_6: parse_set(&config.select_tab_6, "ctrl+6"),
-            select_tab_7: parse_set(&config.select_tab_7, "ctrl+7"),
-            select_tab_8: parse_set(&config.select_tab_8, "ctrl+8"),
-            select_tab_9: parse_set(&config.select_tab_9, "ctrl+9"),
+            new_tab: parse_set(&config.new_tab),
+            close_tab: parse_set(&config.close_tab),
+            next_tab: parse_set(&config.next_tab),
+            prev_tab: parse_set(&config.prev_tab),
+            select_tab_1: parse_set(&config.select_tab_1),
+            select_tab_2: parse_set(&config.select_tab_2),
+            select_tab_3: parse_set(&config.select_tab_3),
+            select_tab_4: parse_set(&config.select_tab_4),
+            select_tab_5: parse_set(&config.select_tab_5),
+            select_tab_6: parse_set(&config.select_tab_6),
+            select_tab_7: parse_set(&config.select_tab_7),
+            select_tab_8: parse_set(&config.select_tab_8),
+            select_tab_9: parse_set(&config.select_tab_9),
 
             // Clipboard
-            copy: parse_set(&config.copy, "ctrl+shift+c"),
-            paste: parse_set(&config.paste, "ctrl+shift+v"),
+            copy: parse_set(&config.copy),
+            paste: parse_set(&config.paste),
 
             // Navigation
-            scroll_up: parse_set(&config.scroll_up, "shift+pageup"),
-            scroll_down: parse_set(&config.scroll_down, "shift+pagedown"),
-            scroll_top: parse_set(&config.scroll_top, "shift+home"),
-            scroll_bottom: parse_set(&config.scroll_bottom, "shift+end"),
-            find: parse_set(&config.find, "ctrl+shift+f"),
+            scroll_up: parse_set(&config.scroll_up),
+            scroll_down: parse_set(&config.scroll_down),
+            scroll_top: parse_set(&config.scroll_top),
+            scroll_bottom: parse_set(&config.scroll_bottom),
+            find: parse_set(&config.find),
 
             // View
-            zoom_in: parse_set(&config.zoom_in, "ctrl+="),
-            zoom_out: parse_set(&config.zoom_out, "ctrl+-"),
-            zoom_reset: parse_set(&config.zoom_reset, "ctrl+0"),
+            zoom_in: parse_set(&config.zoom_in),
+            zoom_out: parse_set(&config.zoom_out),
+            zoom_reset: parse_set(&config.zoom_reset),
 
             // Window
-            new_window: parse_set(&config.new_window, "ctrl+shift+n"),
+            new_window: parse_set(&config.new_window),
 
             // General
-            settings: parse_set(&config.settings, "ctrl+,"),
+            settings: parse_set(&config.settings),
 
             // Terminal shortcuts
-            word_left: parse_set(&config.word_left, "ctrl+left"),
-            word_right: parse_set(&config.word_right, "ctrl+right"),
-            delete_word_backward: parse_set(&config.delete_word_backward, "alt+backspace"),
-            delete_word_backward_ctrl: parse_set(
-                &config.delete_word_backward_ctrl,
-                "ctrl+backspace",
-            ),
-            delete_word_forward: parse_set(&config.delete_word_forward, "ctrl+delete"),
-            line_start: parse_set(&config.line_start, "ctrl+home"),
-            line_end: parse_set(&config.line_end, "ctrl+end"),
+            word_left: parse_set(&config.word_left),
+            word_right: parse_set(&config.word_right),
+            delete_word_backward: parse_set(&config.delete_word_backward),
+            delete_word_backward_ctrl: parse_set(&config.delete_word_backward_ctrl),
+            delete_word_forward: parse_set(&config.delete_word_forward),
+            line_start: parse_set(&config.line_start),
+            line_end: parse_set(&config.line_end),
         }
     }
 }
 
 /// Parse a combo list into a [`BindingSet`], skipping invalid entries.
 ///
-/// If the list is empty or all entries fail to parse, falls back to a single
-/// binding parsed from `default`.
-fn parse_set(list: &KeyComboList, default: &str) -> BindingSet {
-    let parsed: BindingSet = list
-        .as_slice()
+/// Returns an empty set if the list is empty or all entries are invalid.
+/// Defaults are provided by [`KeybindingsConfig::default()`] via serde,
+/// so the list is always populated for well-formed configs.
+fn parse_set(list: &KeyComboList) -> BindingSet {
+    list.as_slice()
         .iter()
         .filter_map(|s| {
             let kb = Keybinding::parse(s);
@@ -257,15 +259,7 @@ fn parse_set(list: &KeyComboList, default: &str) -> BindingSet {
             }
             kb
         })
-        .collect();
-
-    if parsed.is_empty() { vec![parse_default(default)] } else { parsed }
-}
-
-/// Parse a hardcoded default keybinding string that is guaranteed to be valid.
-#[allow(clippy::expect_used, reason = "hardcoded default keybinding strings are guaranteed valid")]
-fn parse_default(default: &str) -> Keybinding {
-    Keybinding::parse(default).expect("default keybinding must parse")
+        .collect()
 }
 
 /// Layout commands intercepted before normal key translation.

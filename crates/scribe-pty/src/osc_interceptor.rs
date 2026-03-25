@@ -10,7 +10,7 @@ use crate::metadata::{MetadataEvent, MetadataParser};
 ///
 /// - OSC 7 — current working directory
 /// - OSC 0 / 2 — window title
-/// - OSC 1337 `AiState=…` — AI process state
+/// - OSC 1337 `ClaudeState=…` — AI process state
 /// - BEL (0x07) — terminal bell
 ///
 /// Create one per read-loop iteration, advance it with `vte::Parser::advance`,

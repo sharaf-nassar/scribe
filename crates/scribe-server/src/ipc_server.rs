@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::fd::RawFd;
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::io::AsRawFd as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -97,20 +98,17 @@ pub struct LiveSession {
     pub handoff_snapshot: Option<scribe_common::screen::ScreenSnapshot>,
 }
 
-/// Start the IPC server on the given Unix socket path.
+/// Start the IPC accept loop on an already-bound listener.
 pub async fn start_ipc_server(
-    socket_path: &Path,
+    listener: UnixListener,
     session_manager: Arc<SessionManager>,
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     live_sessions: LiveSessionRegistry,
     connected_clients: ConnectedClients,
 ) -> Result<(), ScribeError> {
-    prepare_socket(socket_path)?;
-
-    let listener = UnixListener::bind(socket_path).map_err(|e| ScribeError::Io { source: e })?;
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
-    info!(?socket_path, "IPC server listening");
+    info!("IPC server listening");
 
     loop {
         match listener.accept().await {
@@ -141,21 +139,88 @@ pub async fn start_ipc_server(
     }
 }
 
-/// Remove a stale socket file and set up the parent directory with 0700 permissions.
-fn prepare_socket(socket_path: &Path) -> Result<(), ScribeError> {
-    if let Err(e) = std::fs::remove_file(socket_path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(ScribeError::Io { source: e });
-        }
-    }
-
+/// Acquire the server socket with singleton enforcement.
+///
+/// In normal mode, uses an advisory flock on `server.lock` to serialise
+/// the bind-or-connect sequence.  If another server already holds the
+/// socket, returns `IpcError` ("already running").  In upgrade mode the
+/// lock and liveness check are skipped — the handoff protocol coordinates
+/// the two servers, and the old server still holds the lock.
+///
+/// Returns the lock file guard (must be kept alive) and the bound listener.
+pub fn acquire_server_socket(
+    socket_path: &Path,
+    upgrade_mode: bool,
+) -> Result<(Option<std::fs::File>, UnixListener), ScribeError> {
+    // Ensure the parent directory exists with 0700 permissions.
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ScribeError::Io { source: e })?;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| ScribeError::Io { source: e })?;
     }
 
-    Ok(())
+    if upgrade_mode {
+        // Upgrade mode: unconditionally replace the socket.  The handoff
+        // protocol has already coordinated with the old server.
+        drop(std::fs::remove_file(socket_path));
+        return Ok((None, try_bind(socket_path)?));
+    }
+
+    // Normal mode: acquire flock then bind-or-connect.
+    let lock_path = scribe_common::socket::server_lock_path();
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| ScribeError::Io { source: e })?;
+
+    #[allow(
+        deprecated,
+        reason = "nix::fcntl::Flock requires OwnedFd which conflicts with our File ownership"
+    )]
+    nix::fcntl::flock(lock_file.as_raw_fd(), nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(
+        |_| ScribeError::IpcError {
+            reason: "another scribe-server is already running (lock held)".into(),
+        },
+    )?;
+
+    // Try to bind the socket.  If it fails with EADDRINUSE the path
+    // already exists; any other error is a real failure.
+    match UnixListener::bind(socket_path) {
+        Ok(listener) => {
+            set_socket_permissions(socket_path);
+            Ok((Some(lock_file), listener))
+        }
+        Err(bind_err) if bind_err.kind() == std::io::ErrorKind::AddrInUse => {
+            // Socket file exists — check if another server is alive.
+            if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+                return Err(ScribeError::IpcError {
+                    reason: "another scribe-server is already running".into(),
+                });
+            }
+            // Stale socket from a crashed server — remove and retry.
+            info!("removing stale server socket");
+            drop(std::fs::remove_file(socket_path));
+            Ok((Some(lock_file), try_bind(socket_path)?))
+        }
+        Err(bind_err) => Err(ScribeError::Io { source: bind_err }),
+    }
+}
+
+/// Bind the Unix socket and set file permissions to 0o600 (defense-in-depth).
+fn try_bind(socket_path: &Path) -> Result<UnixListener, ScribeError> {
+    let listener = UnixListener::bind(socket_path).map_err(|e| ScribeError::Io { source: e })?;
+    set_socket_permissions(socket_path);
+    Ok(listener)
+}
+
+/// Set socket file permissions to owner-only (defense-in-depth alongside
+/// `SO_PEERCRED` UID verification and the 0o700 parent directory).
+fn set_socket_permissions(socket_path: &Path) {
+    if let Err(e) = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)) {
+        warn!(?socket_path, "failed to set socket permissions: {e}");
+    }
 }
 
 /// Verify the connecting peer has the same UID as this server process.
@@ -1236,6 +1301,7 @@ fn convert_metadata_event(
         MetadataEvent::AiStateChanged(ai_state) => {
             (ServerMessage::AiStateChanged { session_id, ai_state }, None)
         }
+        MetadataEvent::AiStateCleared => (ServerMessage::AiStateCleared { session_id }, None),
         MetadataEvent::Bell => (ServerMessage::Bell { session_id }, None),
     }
 }

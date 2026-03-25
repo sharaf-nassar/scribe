@@ -105,10 +105,8 @@ pub async fn run_handoff_listener(
     // Prepare the socket directory and clean stale socket.
     prepare_handoff_socket(&path)?;
 
-    let listen_fd =
-        socket::socket(AddressFamily::Unix, SockType::Stream, cloexec_flag(), None).map_err(
-            |e| ScribeError::IpcError { reason: format!("handoff socket() failed: {e}") },
-        )?;
+    let listen_fd = socket::socket(AddressFamily::Unix, SockType::Stream, cloexec_flag(), None)
+        .map_err(|e| ScribeError::IpcError { reason: format!("handoff socket() failed: {e}") })?;
     set_cloexec_if_needed(&listen_fd)?;
 
     let addr = UnixAddr::new(&path).map_err(|e| ScribeError::IpcError {
@@ -353,12 +351,10 @@ fn read_ack(fd: RawFd) -> Result<(), ScribeError> {
 pub fn receive_handoff() -> Result<(HandoffState, Vec<OwnedFd>), ScribeError> {
     let path = handoff_socket_path();
 
-    let sock_fd =
-        socket::socket(AddressFamily::Unix, SockType::Stream, cloexec_flag(), None).map_err(
-            |e| ScribeError::IpcError {
-                reason: format!("handoff receiver socket() failed: {e}"),
-            },
-        )?;
+    let sock_fd = socket::socket(AddressFamily::Unix, SockType::Stream, cloexec_flag(), None)
+        .map_err(|e| ScribeError::IpcError {
+            reason: format!("handoff receiver socket() failed: {e}"),
+        })?;
     set_cloexec_if_needed(&sock_fd)?;
 
     let addr = UnixAddr::new(&path).map_err(|e| ScribeError::IpcError {
@@ -515,10 +511,9 @@ fn receive_fds(fd: RawFd, expected_count: usize) -> Result<Vec<OwnedFd>, ScribeE
     // MSG_CMSG_CLOEXEC ensures received fds are close-on-exec, preventing
     // them from leaking to child processes forked before we wrap them in
     // AsyncPtyFd.
-    let msg = socket::recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_buf), recv_fds_flags())
-        .map_err(|e| ScribeError::IpcError {
-            reason: format!("handoff recvmsg (SCM_RIGHTS) failed: {e}"),
-        })?;
+    let msg = socket::recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_buf), recv_fds_flags()).map_err(
+        |e| ScribeError::IpcError { reason: format!("handoff recvmsg (SCM_RIGHTS) failed: {e}") },
+    )?;
 
     let mut received_fds = Vec::new();
     let cmsgs = msg.cmsgs().map_err(|e| ScribeError::IpcError {
@@ -575,6 +570,7 @@ fn cloexec_flag() -> SockFlag {
 
 /// No-op on Linux — `SOCK_CLOEXEC` was already set at socket creation.
 #[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps, reason = "signature must match the non-Linux variant")]
 fn set_cloexec_if_needed(_fd: &OwnedFd) -> Result<(), ScribeError> {
     Ok(())
 }
@@ -582,11 +578,10 @@ fn set_cloexec_if_needed(_fd: &OwnedFd) -> Result<(), ScribeError> {
 /// On non-Linux, set `FD_CLOEXEC` via `fcntl` after socket creation.
 #[cfg(not(target_os = "linux"))]
 fn set_cloexec_if_needed(fd: &OwnedFd) -> Result<(), ScribeError> {
-    use nix::fcntl::{FdFlag, fcntl, FcntlArg};
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 
-    let current = fcntl(fd, FcntlArg::F_GETFD).map_err(|e| ScribeError::IpcError {
-        reason: format!("fcntl(F_GETFD) failed: {e}"),
-    })?;
+    let current = fcntl(fd, FcntlArg::F_GETFD)
+        .map_err(|e| ScribeError::IpcError { reason: format!("fcntl(F_GETFD) failed: {e}") })?;
 
     let mut flags = FdFlag::from_bits_truncate(current);
     flags.insert(FdFlag::FD_CLOEXEC);

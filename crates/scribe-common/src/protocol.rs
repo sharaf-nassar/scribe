@@ -97,6 +97,9 @@ pub enum ServerMessage {
         session_id: SessionId,
         ai_state: AiProcessState,
     },
+    AiStateCleared {
+        session_id: SessionId,
+    },
     CwdChanged {
         session_id: SessionId,
         cwd: PathBuf,

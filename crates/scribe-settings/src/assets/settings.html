@@ -400,6 +400,15 @@
           </div>
           <div class="setting-row">
             <div class="setting-info">
+              <div class="setting-label">Natural Scrolling</div>
+              <div class="setting-desc">Use the OS scroll direction instead of traditional (inverted) terminal scrolling</div>
+            </div>
+            <div class="toggle off" data-key="terminal.natural_scroll">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
               <div class="setting-label">Copy on Select</div>
               <div class="setting-desc">Automatically copy selected text to clipboard</div>
             </div>
@@ -424,6 +433,64 @@
             <div class="toggle on" data-key="terminal.claude_code_integration">
               <div class="toggle-knob"></div>
             </div>
+          </div>
+        </div>
+
+        <div class="section-label">Claude Code States</div>
+        <div class="section-card">
+          <!-- Column headers -->
+          <div class="setting-row" style="opacity:0.5;font-size:11px;">
+            <div class="setting-info"><div class="setting-label"></div></div>
+            <div style="width:36px;text-align:center;">Tab</div>
+            <div style="width:36px;text-align:center;">Pane</div>
+            <div style="width:28px;text-align:center;">Color</div>
+            <div style="width:90px;text-align:center;">Pulse (ms)</div>
+            <div style="width:90px;text-align:center;">Timeout (s)</div>
+          </div>
+          <!-- Processing -->
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Processing</div><div class="setting-desc">Claude is thinking</div></div>
+            <div class="toggle on" data-key="claude_states.processing.tab_indicator"><div class="toggle-knob"></div></div>
+            <div class="toggle on" data-key="claude_states.processing.pane_border"><div class="toggle-knob"></div></div>
+            <div class="color-swatch" data-key="claude_states.processing.color" style="background:#22c55e;"><input type="color" value="#22c55e"></div>
+            <div class="number-control" data-key="claude_states.processing.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">1400</div><div class="number-btn">+</div></div>
+            <div class="number-control" data-key="claude_states.processing.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">0</div><div class="number-btn">+</div></div>
+          </div>
+          <!-- Idle Prompt -->
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Idle Prompt</div><div class="setting-desc">Claude finished, waiting for next prompt</div></div>
+            <div class="toggle on" data-key="claude_states.idle_prompt.tab_indicator"><div class="toggle-knob"></div></div>
+            <div class="toggle on" data-key="claude_states.idle_prompt.pane_border"><div class="toggle-knob"></div></div>
+            <div class="color-swatch" data-key="claude_states.idle_prompt.color" style="background:#ffa51a;"><input type="color" value="#ffa51a"></div>
+            <div class="number-control" data-key="claude_states.idle_prompt.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">2000</div><div class="number-btn">+</div></div>
+            <div class="number-control" data-key="claude_states.idle_prompt.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">10</div><div class="number-btn">+</div></div>
+          </div>
+          <!-- Waiting for Input -->
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Waiting for Input</div><div class="setting-desc">Claude asked you a question</div></div>
+            <div class="toggle on" data-key="claude_states.waiting_for_input.tab_indicator"><div class="toggle-knob"></div></div>
+            <div class="toggle on" data-key="claude_states.waiting_for_input.pane_border"><div class="toggle-knob"></div></div>
+            <div class="color-swatch" data-key="claude_states.waiting_for_input.color" style="background:#ff8c00;"><input type="color" value="#ff8c00"></div>
+            <div class="number-control" data-key="claude_states.waiting_for_input.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">2000</div><div class="number-btn">+</div></div>
+            <div class="number-control" data-key="claude_states.waiting_for_input.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">0</div><div class="number-btn">+</div></div>
+          </div>
+          <!-- Permission Prompt -->
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Permission Prompt</div><div class="setting-desc">Claude needs tool approval</div></div>
+            <div class="toggle on" data-key="claude_states.permission_prompt.tab_indicator"><div class="toggle-knob"></div></div>
+            <div class="toggle on" data-key="claude_states.permission_prompt.pane_border"><div class="toggle-knob"></div></div>
+            <div class="color-swatch" data-key="claude_states.permission_prompt.color" style="background:#ef4444;"><input type="color" value="#ef4444"></div>
+            <div class="number-control" data-key="claude_states.permission_prompt.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">1500</div><div class="number-btn">+</div></div>
+            <div class="number-control" data-key="claude_states.permission_prompt.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">0</div><div class="number-btn">+</div></div>
+          </div>
+          <!-- Error -->
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Error</div><div class="setting-desc">Something went wrong</div></div>
+            <div class="toggle on" data-key="claude_states.error.tab_indicator"><div class="toggle-knob"></div></div>
+            <div class="toggle on" data-key="claude_states.error.pane_border"><div class="toggle-knob"></div></div>
+            <div class="color-swatch" data-key="claude_states.error.color" style="background:#9933cc;"><input type="color" value="#9933cc"></div>
+            <div class="number-control" data-key="claude_states.error.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">0</div><div class="number-btn">+</div></div>
+            <div class="number-control" data-key="claude_states.error.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">3</div><div class="number-btn">+</div></div>
           </div>
         </div>
       </div>

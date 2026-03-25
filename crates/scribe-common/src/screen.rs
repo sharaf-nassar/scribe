@@ -62,4 +62,13 @@ pub struct ScreenSnapshot {
     /// ANSI so that subsequent PTY output lands in the correct buffer.
     #[serde(default)]
     pub alt_screen: bool,
+    /// Scrollback lines preceding the visible grid, ordered oldest-first.
+    /// Each row contains `cols` cells, same as the visible grid.
+    /// On reconnect the client feeds these before the visible content so
+    /// they flow into the client-side scrollback buffer naturally.
+    #[serde(default)]
+    pub scrollback: Vec<ScreenCell>,
+    /// Number of scrollback rows stored in `scrollback`.
+    #[serde(default)]
+    pub scrollback_rows: u32,
 }

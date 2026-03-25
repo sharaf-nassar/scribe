@@ -11,7 +11,7 @@ use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::tty::Options as PtyOptions;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::info;
 use vte::Parser as VteParser;
 use vte::ansi::Processor as AnsiProcessor;
 
@@ -50,7 +50,6 @@ pub struct ManagedSession {
     pub osc_parser: VteParser,
     pub metadata_parser: MetadataParser,
     pub metadata_rx: mpsc::UnboundedReceiver<MetadataEvent>,
-    #[allow(dead_code, reason = "used by workspace routing logic in future session queries")]
     pub workspace_id: WorkspaceId,
     /// Keep the Pty object alive so the child process is not killed by SIGHUP
     /// when Pty's Drop impl runs. The Pty owns the child process handle.
@@ -228,38 +227,6 @@ impl SessionManager {
         self.sessions.read().await.iter().map(|(&id, s)| (id, s.workspace_id)).collect()
     }
 
-    /// Create a snapshot of the terminal screen for IPC transport.
-    ///
-    /// Locks the `Term`, reads the grid contents, and converts `alacritty_terminal`
-    /// types to our `ScreenSnapshot` wire format.
-    #[allow(dead_code, reason = "used by SessionManager for sessions not yet taken by a client")]
-    pub async fn snapshot_session(
-        &self,
-        session_id: SessionId,
-    ) -> Result<ScreenSnapshot, ScribeError> {
-        let sessions = self.sessions.read().await;
-        let session = sessions.get(&session_id).ok_or(ScribeError::SessionNotFound(session_id))?;
-
-        let term = session.term.lock().await;
-        Ok(snapshot_term(&term))
-    }
-
-    /// Remove a session. The PTY is closed when the `ManagedSession` is dropped.
-    #[allow(dead_code, reason = "retained for handoff/hot-reload session cleanup")]
-    pub async fn close_session(&self, session_id: SessionId) {
-        if self.sessions.write().await.remove(&session_id).is_some() {
-            info!(%session_id, "closed PTY session");
-        } else {
-            warn!(%session_id, "attempted to close non-existent session");
-        }
-    }
-
-    /// List all active session IDs.
-    #[allow(dead_code, reason = "used by upcoming workspace list and UI sync features")]
-    pub async fn list_sessions(&self) -> Vec<SessionId> {
-        self.sessions.read().await.keys().copied().collect()
-    }
-
     /// Reconstruct a `SessionManager` from handoff state and received PTY fds.
     ///
     /// Each fd in `fds` corresponds to the session at the same index in
@@ -346,12 +313,14 @@ impl SessionManager {
 /// Create a `ScreenSnapshot` from a locked `Term`.
 ///
 /// Iterates the visible grid (`screen_lines` x columns) and converts each
-/// `alacritty_terminal` cell into our `ScreenCell` wire type.
+/// `alacritty_terminal` cell into our `ScreenCell` wire type.  Also captures
+/// scrollback history so the client can restore it on reconnect.
 pub fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
     let grid = term.grid();
     let cols = grid.columns();
     let rows = grid.screen_lines();
 
+    // --- visible grid ---
     let mut cells = Vec::with_capacity(cols * rows);
 
     for line_idx in 0..rows {
@@ -374,10 +343,42 @@ pub fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
     let cursor_visible = mode.contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
     let alt_screen = mode.contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
 
+    // --- scrollback history ---
+    // Skip scrollback for alt screen: the alt grid's history is not meaningful
+    // user content — it is a resize artifact from Grid::shrink_lines rotations
+    // that Term::resize does not clamp.  Alt screen apps (vim, Claude Code)
+    // redraw their own UI on reconnect anyway.
+    let (scrollback, history) = if alt_screen {
+        (Vec::new(), 0)
+    } else {
+        // Line(-1) is the most recent scrollback line (just above visible area),
+        // Line(-history_size) is the oldest.  We iterate oldest-first so the
+        // client can feed them in chronological order.
+        let history = grid.history_size();
+        let mut scrollback = Vec::with_capacity(cols * history);
+
+        for i in (1..=history).rev() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "scrollback index bounded by history_size (≤ 100_000), fits in i32"
+            )]
+            let line = Line(-(i as i32));
+            let row = &grid[line];
+            for col_idx in 0..cols {
+                let cell = &row[Column(col_idx)];
+                scrollback.push(convert_cell(cell));
+            }
+        }
+
+        (scrollback, history)
+    };
+
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "terminal dimensions and cursor position are always within u16 range"
+        reason = "terminal dimensions and cursor position are always within u16 range; \
+                  history bounded by scrollback_lines (≤ 100_000) fits u32"
     )]
     ScreenSnapshot {
         cells,
@@ -388,6 +389,8 @@ pub fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
         cursor_style: convert_cursor_style(cursor_style),
         cursor_visible,
         alt_screen,
+        scrollback,
+        scrollback_rows: history as u32,
     }
 }
 

@@ -315,6 +315,9 @@ async fn dispatch_server_message(
         ServerMessage::Welcome { window_id, .. } => {
             debug!(%window_id, "welcome (ignored by test daemon)");
         }
+        ServerMessage::AiStateCleared { session_id } => {
+            debug!(%session_id, "AI state cleared (ignored by test daemon)");
+        }
         ServerMessage::QuitRequested => {
             debug!("quit requested (ignored by test daemon)");
         }

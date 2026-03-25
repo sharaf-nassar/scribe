@@ -184,6 +184,8 @@ struct App {
     /// suppressing the legacy `split_direction` fallback in
     /// `handle_workspace_info`.
     received_workspace_tree: bool,
+    /// Clickable tab rects `(workspace_id, tab_index, rect)` (updated each frame).
+    tab_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)>,
     /// Clickable rect for the status bar gear icon (updated each frame).
     status_bar_gear_rect: Option<layout::Rect>,
 
@@ -222,6 +224,7 @@ impl App {
         let bindings = input::Bindings::parse(&config.keybindings);
         let window_registry = window_state::WindowRegistry::new();
         let saved_geometry = window_id.map(|wid| window_registry.load(wid));
+        let claude_states = config.terminal.claude_states.clone();
 
         Self {
             window_id,
@@ -239,7 +242,7 @@ impl App {
             active_selection: None,
             mouse_selecting: false,
             server_connected: false,
-            ai_tracker: AiStateTracker::new(),
+            ai_tracker: AiStateTracker::new(claude_states),
             animation_running: false,
             modifiers: ModifiersState::default(),
             bindings,
@@ -269,6 +272,7 @@ impl App {
             saved_geometry,
             geometry_save_pending: None,
             received_workspace_tree: false,
+            tab_hit_targets: Vec::new(),
             status_bar_gear_rect: None,
             hostname: read_hostname(),
             _config_watcher: config_watcher,
@@ -316,6 +320,10 @@ impl ApplicationHandler<UiEvent> for App {
             }
             UiEvent::AiStateChanged { session_id, ai_state } => {
                 self.handle_ai_state_changed(session_id, ai_state);
+            }
+            UiEvent::AiStateCleared { session_id } => {
+                self.ai_tracker.remove(session_id);
+                self.request_redraw();
             }
             UiEvent::CwdChanged { session_id, cwd } => {
                 self.handle_cwd_changed(session_id, cwd);
@@ -521,10 +529,7 @@ impl App {
             surface_config.format,
             (size.width, size.height),
         ) {
-            Ok(s) => {
-                tracing::warn!("SPLASH DIAG: splash renderer created OK");
-                Some(s)
-            }
+            Ok(s) => Some(s),
             Err(e) => {
                 tracing::warn!(error = %e, "splash screen unavailable; skipping");
                 None
@@ -562,6 +567,7 @@ impl App {
             cells = snapshot.cells.len(),
             non_empty,
             first_char = ?first_char.map(|c| c.c),
+            scrollback_rows = snapshot.scrollback_rows,
             "applying screen snapshot"
         );
 
@@ -607,7 +613,6 @@ impl App {
         // in `handle_redraw` to avoid submitting the terminal-content frame
         // before the compositor has presented the splash frame.
         if self.splash_active {
-            tracing::warn!("SPLASH DIAG: screen snapshot arrived, marking content ready");
             self.splash_content_ready = true;
         }
 
@@ -1111,6 +1116,7 @@ impl App {
         // -- Keybindings --
         self.bindings = input::Bindings::parse(&new_config.keybindings);
 
+        self.ai_tracker.reconfigure(new_config.terminal.claude_states.clone());
         self.config = new_config;
 
         tracing::info!("config hot-reloaded");
@@ -1149,7 +1155,6 @@ impl App {
             let elapsed_ok =
                 self.splash_first_rendered.is_some_and(|t| t.elapsed() >= MIN_SPLASH_DURATION);
             if elapsed_ok {
-                tracing::warn!("SPLASH DIAG: dismissing splash (timer expired)");
                 self.splash_active = false;
                 gpu.splash = None;
             }
@@ -1157,11 +1162,6 @@ impl App {
 
         // -- Splash render -------------------------------------------------------
         if self.splash_active {
-            tracing::warn!(
-                renderer = gpu.splash.is_some(),
-                content_ready = self.splash_content_ready,
-                "SPLASH DIAG: rendering splash frame"
-            );
             if let Some(splash) = &gpu.splash {
                 let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("splash encoder"),
@@ -1183,8 +1183,6 @@ impl App {
 
             return;
         }
-
-        tracing::warn!(panes = self.panes.len(), "SPLASH DIAG: rendering terminal content");
 
         let full_viewport = viewport_rect(&gpu.surface_config);
         let ws_viewport = workspace_viewport(&gpu.surface_config);
@@ -1243,7 +1241,12 @@ impl App {
                 None
             };
 
-            ws_tab_bar_data.push(tab_bar::WorkspaceTabBarData { ws_rect: *ws_rect, tabs, badge });
+            ws_tab_bar_data.push(tab_bar::WorkspaceTabBarData {
+                ws_id: *ws_id,
+                ws_rect: *ws_rect,
+                tabs,
+                badge,
+            });
         }
 
         // Workspace-aggregated AI border colours: for each pane, find the
@@ -1292,6 +1295,16 @@ impl App {
         }
         let cursor_visible = self.cursor_visible;
 
+        // Sync pane rects with the freshly-computed layout so that content,
+        // scrollbars, and hit-testing all use the same authoritative geometry.
+        // This prevents stale `pane.rect` values (from async window geometry
+        // changes) from placing content at the wrong offset.
+        for (pane_id, rect) in &pane_rects {
+            if let Some(pane) = self.panes.get_mut(pane_id) {
+                pane.rect = *rect;
+            }
+        }
+
         let scrollbar_width = self.config.appearance.scrollbar_width.clamp(2.0, 20.0);
         let scrollbar_color = self.config.appearance.scrollbar_color.as_ref().map_or(
             self.theme.chrome.scrollbar,
@@ -1306,7 +1319,7 @@ impl App {
             },
         );
 
-        let mut all_instances = build_all_instances(
+        let (mut all_instances, tab_hits) = build_all_instances(
             &mut gpu.renderer,
             &gpu.device,
             &gpu.queue,
@@ -1325,6 +1338,7 @@ impl App {
             focus_split_direction,
             cursor_visible,
         );
+        self.tab_hit_targets = tab_hits;
 
         // Window-level status bar spanning the full window width.
         {
@@ -1401,7 +1415,9 @@ impl App {
         gpu.surface.configure(&gpu.device, &gpu.surface_config);
 
         // Resize the shared renderer's viewport and pipeline uniforms.
-        let _grid = gpu.renderer.resize(&gpu.queue, (size.width, size.height));
+        // The returned grid size is not needed here — individual panes compute
+        // their own grid dimensions from their rects below.
+        let _ = gpu.renderer.resize(&gpu.queue, (size.width, size.height));
 
         // Keep the splash uniform in sync so the logo stays centred.
         if let Some(splash) = &mut gpu.splash {
@@ -1932,10 +1948,11 @@ impl App {
         reason = "scroll delta is a small float value that fits in i32"
     )]
     fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
-        let lines = match delta {
+        let natural = self.config.terminal.natural_scroll;
+        let raw_lines = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, y) => {
                 // 3 terminal lines per scroll tick.
-                -(y * 3.0) as i32
+                (y * 3.0) as i32
             }
             winit::event::MouseScrollDelta::PixelDelta(pos) => {
                 let Some(gpu) = &self.gpu else { return };
@@ -1948,20 +1965,48 @@ impl App {
                     reason = "pixel delta from winit is f64 but fits in f32"
                 )]
                 let y = pos.y as f32;
-                -(y / cell_h).round() as i32
+                (y / cell_h).round() as i32
             }
         };
+        // In natural mode, use the OS delta as-is. In traditional mode,
+        // invert so that scrolling the wheel "up" moves into history.
+        let lines = if natural { raw_lines } else { -raw_lines };
 
         if lines == 0 {
             return;
         }
 
-        let Some(tab) = self.window_layout.active_tab() else { return };
-        let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
+        // Scroll the pane under the mouse cursor, falling back to the focused pane.
+        let target = self
+            .pane_id_at_cursor()
+            .or_else(|| self.window_layout.active_tab().map(|tab| tab.focused_pane));
+        let Some(pane_id) = target else { return };
+        let Some(pane) = self.panes.get_mut(&pane_id) else { return };
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
         pane.scrollbar_state.on_scroll_action();
         self.ensure_animation_running();
         self.request_redraw();
+    }
+
+    /// Return the `PaneId` of the pane under the current mouse cursor, if any.
+    fn pane_id_at_cursor(&self) -> Option<PaneId> {
+        let (x, y) = self.last_cursor_pos?;
+        let gpu = self.gpu.as_ref()?;
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+
+        for (ws_id, ws_rect) in &ws_rects {
+            if !ws_rect.contains(x, y) {
+                continue;
+            }
+            let tab = self.window_layout.find_workspace(*ws_id).and_then(|ws| ws.active_tab());
+            let Some(tab) = tab else { continue };
+            let pane_rects = tab.pane_layout.compute_rects(*ws_rect);
+            if let Some((pane_id, _)) = pane_rects.iter().find(|(_, r)| r.contains(x, y)) {
+                return Some(*pane_id);
+            }
+        }
+        None
     }
 
     /// Start the animation timer if not already running (needed for scrollbar fade).
@@ -2076,6 +2121,18 @@ impl App {
                 self.open_settings();
                 return;
             }
+        }
+
+        // Check for tab bar click (switch active tab in that workspace).
+        if let Some((ws_id, tab_idx)) = self
+            .tab_hit_targets
+            .iter()
+            .find_map(|(ws_id, idx, rect)| rect.contains(x, y).then_some((*ws_id, *idx)))
+        {
+            if self.window_layout.set_active_tab(ws_id, tab_idx) {
+                self.request_redraw();
+            }
+            return;
         }
 
         // Check for scrollbar click (before divider, before selection).
@@ -2471,12 +2528,11 @@ impl App {
     /// Load saved geometry from the per-window registry and apply it.
     ///
     /// Called when the server assigns a window ID that wasn't known at
-    /// startup (fresh launch / restart without `--window-id`).
-    ///
-    /// Only size and maximized state are restored — position is left to
-    /// the OS.  Position restoration is reserved for explicit `--window-id`
-    /// launches (handled in `resumed()` via `saved_geometry`), where the
-    /// user intentionally resumes a specific window.
+    /// startup (fresh launch / restart without `--window-id`).  If the
+    /// server assigned an existing window ID (sessions are being restored),
+    /// this is a resume scenario and full geometry (position + size +
+    /// maximized) is restored.  For truly fresh installs the registry has
+    /// no entry, so no geometry is applied and the OS decides placement.
     fn restore_geometry_from_registry(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -2486,10 +2542,7 @@ impl App {
         let has_saved = loaded.x.is_some() || loaded.maximized;
         let geom =
             if has_saved { Some(loaded) } else { self.window_registry.migrate_legacy(window_id) };
-        if let (Some(mut geom), Some(window)) = (geom, &self.window) {
-            // Clear position so the OS decides placement.
-            geom.x = None;
-            geom.y = None;
+        if let (Some(geom), Some(window)) = (geom, &self.window) {
             window_state::apply_window_geometry(event_loop, window, &geom);
         }
     }
@@ -2700,6 +2753,9 @@ const UNFOCUSED_DIM: f32 = 0.85;
 
 /// Collect all cell instances (tab bars + terminals + dividers + AI borders)
 /// into one buffer.
+/// `(workspace_id, tab_index, clickable_rect)` for tab bar click handling.
+type TabHitTargets = Vec<(WorkspaceId, usize, layout::Rect)>;
+
 #[allow(
     clippy::too_many_arguments,
     reason = "needs all render context: renderer, GPU resources, panes, layout data, AI state"
@@ -2726,19 +2782,44 @@ fn build_all_instances(
     scrollbar_color: [f32; 4],
     focus_split_direction: Option<layout::SplitDirection>,
     cursor_visible: bool,
-) -> Vec<scribe_renderer::types::CellInstance> {
+) -> (Vec<scribe_renderer::types::CellInstance>, TabHitTargets) {
     // Pre-allocate based on a typical 80x24 grid per pane plus tab bar and
     // border quads, to avoid repeated reallocations during the per-pane loops.
     let estimated_per_pane = 80 * 24 + 80 + 4;
     let mut all_instances = Vec::with_capacity(pane_rects.len() * estimated_per_pane);
 
-    // Tab bar backgrounds + bottom separator.
+    // Terminal content first — tab bar is drawn on top afterwards so that any
+    // content that bleeds into the tab bar region (rounding, partial rows) is
+    // covered by the opaque tab bar background.
+    let has_multiple_panes = pane_rects.len() > 1;
+    for (pane_id, _) in pane_rects {
+        if let Some(pane) = panes.get_mut(pane_id) {
+            let offset = pane.content_offset();
+            // Only the focused pane shows the blinking cursor; unfocused panes hide it.
+            let pane_cursor_visible = *pane_id == focused_pane && cursor_visible;
+            let mut instances = renderer.build_instances_at(
+                device,
+                queue,
+                &mut pane.term,
+                offset,
+                pane_cursor_visible,
+            );
+            if has_multiple_panes && *pane_id != focused_pane {
+                dim_instances(&mut instances);
+            }
+            all_instances.extend(instances);
+        }
+    }
+
+    // Tab bar backgrounds + bottom separator (drawn after terminal content so
+    // the opaque bar always covers any stray cells that extend into its area).
     for (_pane_id, pane_rect) in pane_rects {
         tab_bar::build_tab_bar_bg(&mut all_instances, *pane_rect, cell_size, tab_colors);
         tab_bar::build_tab_bar_separator(&mut all_instances, *pane_rect, cell_size, divider_color);
     }
 
     // Tab bar text — rendered once per workspace, spanning the full workspace width.
+    let mut tab_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)> = Vec::new();
     for ws_data in ws_tab_bar_data {
         let tab_bar_rect = layout::Rect {
             x: ws_data.ws_rect.x,
@@ -2757,28 +2838,10 @@ fn build_all_instances(
             colors: tab_colors,
             resolve_glyph: &mut resolve_glyph,
         };
-        let (text_instances, _hit_targets) = tab_bar::build_tab_bar_text(&mut params);
+        let (text_instances, hit_targets) = tab_bar::build_tab_bar_text(&mut params);
         all_instances.extend(text_instances);
-    }
-
-    // Terminal content — dim unfocused panes by multiplying RGB (not alpha).
-    let has_multiple_panes = pane_rects.len() > 1;
-    for (pane_id, _) in pane_rects {
-        if let Some(pane) = panes.get_mut(pane_id) {
-            let offset = pane.content_offset();
-            // Only the focused pane shows the blinking cursor; unfocused panes hide it.
-            let pane_cursor_visible = *pane_id == focused_pane && cursor_visible;
-            let mut instances = renderer.build_instances_at(
-                device,
-                queue,
-                &mut pane.term,
-                offset,
-                pane_cursor_visible,
-            );
-            if has_multiple_panes && *pane_id != focused_pane {
-                dim_instances(&mut instances);
-            }
-            all_instances.extend(instances);
+        for (tab_idx, rect) in hit_targets.tab_rects {
+            tab_hit_targets.push((ws_data.ws_id, tab_idx, rect));
         }
     }
 
@@ -2818,7 +2881,7 @@ fn build_all_instances(
         }
     }
 
-    all_instances
+    (all_instances, tab_hit_targets)
 }
 
 /// Apply window opacity to cell background alpha values.
@@ -3041,8 +3104,11 @@ fn current_time_str() -> String {
 fn snapshot_to_ansi(snapshot: &scribe_common::screen::ScreenSnapshot) -> Vec<u8> {
     use std::fmt::Write as _;
 
-    let mut buf =
-        String::with_capacity(usize::from(snapshot.cols) * usize::from(snapshot.rows) * 4);
+    let cols = usize::from(snapshot.cols);
+    let scrollback_rows = snapshot.scrollback_rows as usize;
+    let visible_rows = usize::from(snapshot.rows);
+
+    let mut buf = String::with_capacity((scrollback_rows + visible_rows) * cols * 4);
 
     // If the server was in alternate screen mode, switch the client into it
     // so that subsequent PTY output (which assumes alt screen) lands in the
@@ -3055,33 +3121,26 @@ fn snapshot_to_ansi(snapshot: &scribe_common::screen::ScreenSnapshot) -> Vec<u8>
     // Hide cursor, move home, clear screen, reset attributes.
     buf.push_str("\x1b[?25l\x1b[H\x1b[2J\x1b[0m");
 
-    let cols = usize::from(snapshot.cols);
+    let mut is_first_row = true;
 
-    for row in 0..usize::from(snapshot.rows) {
-        if row > 0 {
+    // --- Scrollback lines (oldest first) ---
+    // As these overflow the visible area, they naturally flow into the
+    // client Term's scrollback buffer — the same mechanism as normal use.
+    for row in 0..scrollback_rows {
+        if !is_first_row {
             buf.push_str("\r\n");
         }
-        for col in 0..cols {
-            let idx = row * cols + col;
-            let Some(cell) = snapshot.cells.get(idx) else { break };
+        is_first_row = false;
+        write_snapshot_row(&mut buf, &snapshot.scrollback, row, cols);
+    }
 
-            // Skip spacer cells for wide characters.
-            let is_wide_spacer =
-                col > 0 && snapshot.cells.get(row * cols + col - 1).is_some_and(|c| c.flags.wide);
-            if is_wide_spacer {
-                continue;
-            }
-
-            // Build SGR (Select Graphic Rendition) sequence.
-            write_sgr(&mut buf, cell);
-
-            // Write the character (space for null/empty cells).
-            if cell.c == '\0' || cell.c == ' ' {
-                buf.push(' ');
-            } else {
-                buf.push(cell.c);
-            }
+    // --- Visible lines ---
+    for row in 0..visible_rows {
+        if !is_first_row {
+            buf.push_str("\r\n");
         }
+        is_first_row = false;
+        write_snapshot_row(&mut buf, &snapshot.cells, row, cols);
     }
 
     // Reset attributes, position cursor, show cursor if visible.
@@ -3093,11 +3152,45 @@ fn snapshot_to_ansi(snapshot: &scribe_common::screen::ScreenSnapshot) -> Vec<u8>
         u32::from(snapshot.cursor_row) + 1,
         u32::from(snapshot.cursor_col) + 1,
     );
-    if snapshot.cursor_visible {
+    // For alt screen snapshots, leave the cursor hidden — the alt screen app
+    // (e.g. Claude Code, vim) will control cursor visibility through its own
+    // live PTY output.  Showing it here causes a "double cursor": the terminal
+    // cursor overlaps with the app's own drawn cursor.
+    if snapshot.cursor_visible && !snapshot.alt_screen {
         buf.push_str("\x1b[?25h");
     }
 
     buf.into_bytes()
+}
+
+/// Write a single row of cells as ANSI escape sequences.
+fn write_snapshot_row(
+    buf: &mut String,
+    cells: &[scribe_common::screen::ScreenCell],
+    row: usize,
+    cols: usize,
+) {
+    for col in 0..cols {
+        let idx = row * cols + col;
+        let Some(cell) = cells.get(idx) else { break };
+
+        // Skip spacer cells for wide characters.
+        let is_wide_spacer =
+            col > 0 && cells.get(row * cols + col - 1).is_some_and(|c| c.flags.wide);
+        if is_wide_spacer {
+            continue;
+        }
+
+        // Build SGR (Select Graphic Rendition) sequence.
+        write_sgr(buf, cell);
+
+        // Write the character (space for null/empty cells).
+        if cell.c == '\0' || cell.c == ' ' {
+            buf.push(' ');
+        } else {
+            buf.push(cell.c);
+        }
+    }
 }
 
 /// Write SGR escape sequences for a cell's foreground, background, and flags.
@@ -3255,7 +3348,17 @@ fn restore_settings_if_open() {
 
     if let Ok(state) = toml::from_str::<SettingsOpenCheck>(&content) {
         if state.open {
-            open_or_focus_settings();
+            // Kill any stale settings process so the newly-installed binary
+            // is used (e.g. after dpkg upgrade + server handoff).
+            let socket_path = scribe_common::socket::settings_socket_path();
+            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
+                use std::io::Write as _;
+                drop(stream.write_all(b"{\"cmd\":\"quit\"}\n"));
+                drop(stream);
+                // Brief pause for the old process to exit and release the socket.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            spawn_settings_process();
         }
     }
 }

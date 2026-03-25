@@ -34,12 +34,14 @@ case "$1" in
             fi
             UPGRADE_PID=$!
 
-            # Wait briefly for the handoff to complete (the new server logs
-            # "session restoration complete" once it has the fds).
+            # Wait briefly for the new server to be fully ready. We check
+            # for "IPC server listening" (emitted after socket bind) rather
+            # than "session restoration complete" to ensure the new server is
+            # accepting connections before we kill the old one.
             UPGRADE_OK=0
             for i in 1 2 3 4 5; do
                 sleep 1
-                if grep -q "session restoration complete\|starting IPC server" "${UPGRADE_LOG}" 2>/dev/null; then
+                if grep -q "IPC server listening" "${UPGRADE_LOG}" 2>/dev/null; then
                     UPGRADE_OK=1
                     break
                 fi
@@ -53,6 +55,21 @@ case "$1" in
                 echo "  ✓ Scribe server hot-reloaded successfully."
                 echo "    All terminal sessions have been preserved."
 
+                # The old server exits on its own after handoff (clean exit
+                # code 0). With Restart=on-failure in the service file,
+                # systemd will not auto-restart it.  The singleton flock
+                # in acquire_server_socket prevents duplicate servers.
+                #
+                # We intentionally do NOT `systemctl stop` or kill server
+                # processes here:
+                #  - `systemctl stop` uses KillMode=control-group by default,
+                #    which sends SIGTERM to ALL processes in the cgroup —
+                #    including the user's shell sessions from the PTY.
+                #    This kills the very sessions we're trying to preserve
+                #    and causes a 90-second hang waiting for bash to exit.
+                #  - Killing via `kill` would cause systemd to see a
+                #    signal exit, triggering Restart=on-failure.
+
                 # Relaunch clients if any were running before the upgrade
                 # (recorded by preinst before the old binary was replaced)
                 STATE_FILE="/run/user/${TARGET_UID}/scribe/upgrade-state"
@@ -62,7 +79,16 @@ case "$1" in
                 if [ "$PREV_CLIENTS" -gt 0 ] 2>/dev/null; then
                     echo "  Relaunching client..."
                     if [ -n "$SUDO_UID" ]; then
-                        sudo -u "#${SUDO_UID}" nohup /usr/bin/scribe-client >/dev/null 2>&1 &
+                        # Forward display and session environment so the GPU
+                        # client can open a window under the user's session.
+                        # Each variable is passed as a separately quoted argument
+                        # to avoid word-splitting injection via $DISPLAY values.
+                        sudo -u "#${SUDO_UID}" \
+                            ${DISPLAY:+"DISPLAY=$DISPLAY"} \
+                            ${WAYLAND_DISPLAY:+"WAYLAND_DISPLAY=$WAYLAND_DISPLAY"} \
+                            XDG_RUNTIME_DIR="$XDG_DIR" \
+                            DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
+                            nohup /usr/bin/scribe-client >/dev/null 2>&1 &
                     else
                         nohup /usr/bin/scribe-client >/dev/null 2>&1 &
                     fi

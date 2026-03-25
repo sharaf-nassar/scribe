@@ -70,6 +70,8 @@ pub enum UiEvent {
     },
     /// The AI state for a session has changed.
     AiStateChanged { session_id: SessionId, ai_state: AiProcessState },
+    /// The AI state for a session was explicitly cleared.
+    AiStateCleared { session_id: SessionId },
     /// The working directory for a session has changed.
     CwdChanged { session_id: SessionId, cwd: PathBuf },
     /// The terminal title for a session has changed.
@@ -171,6 +173,9 @@ async fn run_read_task(
             }
             Ok(ServerMessage::AiStateChanged { session_id, ai_state }) => {
                 send_event(&proxy, UiEvent::AiStateChanged { session_id, ai_state });
+            }
+            Ok(ServerMessage::AiStateCleared { session_id }) => {
+                send_event(&proxy, UiEvent::AiStateCleared { session_id });
             }
             Ok(ServerMessage::CwdChanged { session_id, cwd }) => {
                 send_event(&proxy, UiEvent::CwdChanged { session_id, cwd });

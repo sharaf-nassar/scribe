@@ -85,7 +85,7 @@ bytemuck = { version = "1", features = ["derive"] }
 png = "0.17"
 
 # Webview / settings
-wry = "0.51"
+wry = "0.55"
 rust-embed = "8"
 tao = "0.33"
 signal-hook = "0.3"

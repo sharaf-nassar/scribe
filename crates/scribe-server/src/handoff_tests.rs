@@ -38,6 +38,8 @@ fn dummy_snapshot(cols: u16, rows: u16) -> ScreenSnapshot {
         cursor_style: CursorStyle::Block,
         cursor_visible: false,
         alt_screen: true,
+        scrollback: Vec::new(),
+        scrollback_rows: 0,
     }
 }
 

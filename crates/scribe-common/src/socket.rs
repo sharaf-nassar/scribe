@@ -80,6 +80,15 @@ pub fn settings_lock_path() -> PathBuf {
     runtime_dir().join("settings.lock")
 }
 
+/// Returns the lock file path for the server singleton.
+///
+/// - Linux: `/run/user/{uid}/scribe/server.lock`
+/// - macOS: `$TMPDIR/scribe-{uid}/server.lock`
+#[must_use]
+pub fn server_lock_path() -> PathBuf {
+    runtime_dir().join("server.lock")
+}
+
 /// Returns the handoff socket path for zero-downtime upgrades.
 ///
 /// - Linux: `/run/user/{uid}/scribe/handoff.sock`

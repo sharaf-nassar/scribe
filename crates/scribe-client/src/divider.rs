@@ -268,11 +268,15 @@ fn build_single_divider(
     }
 }
 
-/// Create a solid-colour quad (no glyph).
-fn solid_quad(x: f32, y: f32, _w: f32, _h: f32, color: [f32; 4]) -> CellInstance {
+/// Create a solid-colour quad (no glyph) with explicit pixel dimensions.
+#[allow(
+    clippy::many_single_char_names,
+    reason = "x/y/w/h are conventional 2-D geometry shorthands"
+)]
+fn solid_quad(x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> CellInstance {
     CellInstance {
         pos: [x, y],
-        size: [0.0, 0.0],
+        size: [w, h],
         uv_min: [0.0, 0.0],
         uv_max: [0.0, 0.0],
         fg_color: color,

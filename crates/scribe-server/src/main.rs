@@ -55,7 +55,7 @@ async fn run_normal_server() -> Result<(), ScribeError> {
     let workspace_manager =
         Arc::new(RwLock::new(workspace_manager::WorkspaceManager::new(cfg.workspace_roots)));
 
-    run_server_loop(session_manager, workspace_manager).await
+    run_server_loop(session_manager, workspace_manager, false).await
 }
 
 /// Upgrade receiver mode: connect to old server, receive handoff, then serve.
@@ -98,20 +98,26 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
 
     info!("session restoration complete — starting IPC server");
 
-    run_server_loop(session_manager, workspace_manager).await
+    run_server_loop(session_manager, workspace_manager, true).await
 }
 
 /// Run the IPC server, handoff listener, and signal handler concurrently.
 ///
 /// Shared between normal and upgrade startup paths. Cleans up the IPC socket
-/// on exit.
+/// on exit. `upgrade_mode` is forwarded to the socket acquisition logic so
+/// that upgrade receivers skip the singleton lock (the old server holds it).
 async fn run_server_loop(
     session_manager: Arc<session_manager::SessionManager>,
     workspace_manager: Arc<RwLock<workspace_manager::WorkspaceManager>>,
+    upgrade_mode: bool,
 ) -> Result<(), ScribeError> {
     let path = server_socket_path();
     let live_sessions = ipc_server::new_live_session_registry();
     let connected_clients = ipc_server::new_connected_clients();
+
+    // Acquire the server socket with singleton enforcement. The lock guard
+    // must live until the server shuts down to hold the advisory flock.
+    let (_lock_guard, listener) = ipc_server::acquire_server_socket(&path, upgrade_mode)?;
 
     // Activate sessions restored from a hot-reload handoff. Moves them from
     // SessionManager into the live registry and starts their PTY reader tasks
@@ -121,7 +127,7 @@ async fn run_server_loop(
 
     let handoff_triggered = tokio::select! {
         result = ipc_server::start_ipc_server(
-            &path,
+            listener,
             Arc::clone(&session_manager),
             Arc::clone(&workspace_manager),
             Arc::clone(&live_sessions),

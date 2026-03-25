@@ -1,17 +1,18 @@
 use serde::{Deserialize, Serialize};
 
-/// Core AI process states, matching Claude Code's OSC 1337 convention.
+/// Core AI process states emitted by Claude Code via OSC 1337 hooks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiState {
     IdlePrompt,
     Processing,
+    WaitingForInput,
     PermissionPrompt,
     Error,
 }
 
 /// Full AI process state with optional metadata keys.
-/// Parsed from: `ESC ] 1337 ; AiState= key=value [;key=value]... ST`
+/// Parsed from: `ESC ] 1337 ; ClaudeState=<state> [; key=value]... ST`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiProcessState {
     pub state: AiState,

@@ -135,6 +135,14 @@ fn apply_config_key(
             config.terminal.claude_code_integration =
                 value.as_bool().ok_or("claude_code_integration must be a boolean")?;
         }
+        "terminal.natural_scroll" => {
+            config.terminal.natural_scroll =
+                value.as_bool().ok_or("natural_scroll must be a boolean")?;
+        }
+        // -- Claude States ----------------------------------------------------
+        key if key.starts_with("claude_states.") => {
+            apply_claude_state_key(&mut config.terminal.claude_states, key, value)?;
+        }
         // -- Keybindings ----------------------------------------------------
         key if key.starts_with("keybindings.") => {
             let action = key.trim_start_matches("keybindings.");
@@ -160,6 +168,60 @@ fn apply_config_key(
         _ => {
             tracing::debug!(key, "unhandled settings key");
         }
+    }
+
+    Ok(())
+}
+
+/// Apply a `claude_states.<state>.<field>` settings change.
+fn apply_claude_state_key(
+    states: &mut scribe_common::config::ClaudeStatesConfig,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    // Key format: "claude_states.<state>.<field>"
+    let rest = key
+        .strip_prefix("claude_states.")
+        .ok_or_else(|| format!("invalid claude_states key: {key}"))?;
+    let (state_name, field) =
+        rest.split_once('.').ok_or_else(|| format!("invalid claude_states key: {key}"))?;
+
+    let entry = match state_name {
+        "processing" => &mut states.processing,
+        "idle_prompt" => &mut states.idle_prompt,
+        "waiting_for_input" => &mut states.waiting_for_input,
+        "permission_prompt" => &mut states.permission_prompt,
+        "error" => &mut states.error,
+        _ => return Err(format!("unknown claude state: {state_name}")),
+    };
+
+    match field {
+        "tab_indicator" => {
+            entry.tab_indicator = value.as_bool().ok_or("tab_indicator must be a boolean")?;
+        }
+        "pane_border" => {
+            entry.pane_border = value.as_bool().ok_or("pane_border must be a boolean")?;
+        }
+        "color" => {
+            let color_str = value.as_str().ok_or("color must be a string")?;
+            entry.color = serde_json::from_value(serde_json::Value::String(color_str.to_owned()))
+                .map_err(|e| format!("invalid color: {e}"))?;
+        }
+        "pulse_ms" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "pulse duration is a small non-negative integer"
+            )]
+            let v = value.as_f64().ok_or("pulse_ms must be a number")? as u32;
+            entry.pulse_ms = v;
+        }
+        "timeout_secs" => {
+            #[allow(clippy::cast_possible_truncation, reason = "timeout is a small positive float")]
+            let v = value.as_f64().ok_or("timeout_secs must be a number")? as f32;
+            entry.timeout_secs = v.max(0.0);
+        }
+        _ => return Err(format!("unknown claude state field: {field}")),
     }
 
     Ok(())

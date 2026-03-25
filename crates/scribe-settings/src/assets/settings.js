@@ -376,21 +376,50 @@ function initSteppers() {
     const step = parseFloat(ctrl.getAttribute("data-step") || "1");
     const min = parseFloat(ctrl.getAttribute("data-min") || "0");
     const max = parseFloat(ctrl.getAttribute("data-max") || "99999");
-    const valueEl = ctrl.querySelector(".number-value");
+
+    // Replace the static <div> with an <input> so users can type values.
+    const oldDiv = ctrl.querySelector(".number-value");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.inputMode = "numeric";
+    input.className = "number-value";
+    input.value = oldDiv.textContent.trim();
+    oldDiv.replaceWith(input);
+
+    const valueEl = input;
     const btns = ctrl.querySelectorAll(".number-btn");
 
+    function clamp(v) {
+      var n = parseFloat(v);
+      if (isNaN(n)) { n = min; }
+      n = Math.max(min, Math.min(max, n));
+      n = Math.round(n / step) * step;
+      return n;
+    }
+
     btns[0].addEventListener("click", function() {
-      let val = parseFloat(valueEl.textContent) - step;
-      if (val < min) { val = min; }
-      valueEl.textContent = String(val);
+      var val = clamp(parseFloat(valueEl.value) - step);
+      valueEl.value = String(val);
       sendChange(key, val);
     });
 
     btns[1].addEventListener("click", function() {
-      let val = parseFloat(valueEl.textContent) + step;
-      if (val > max) { val = max; }
-      valueEl.textContent = String(val);
+      var val = clamp(parseFloat(valueEl.value) + step);
+      valueEl.value = String(val);
       sendChange(key, val);
+    });
+
+    valueEl.addEventListener("blur", function() {
+      var val = clamp(valueEl.value);
+      valueEl.value = String(val);
+      sendChange(key, val);
+    });
+
+    valueEl.addEventListener("keydown", function(e) {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        valueEl.blur();
+      }
     });
   });
 }
@@ -578,9 +607,28 @@ function loadConfig(config) {
 
   // Terminal
   setStepperValue("terminal.scrollback_lines", config.terminal?.scrollback_lines);
+  setToggleValue("terminal.natural_scroll", config.terminal?.natural_scroll);
   setToggleValue("terminal.copy_on_select", config.terminal?.copy_on_select);
   setToggleValue("terminal.claude_copy_cleanup", config.terminal?.claude_copy_cleanup);
   setToggleValue("terminal.claude_code_integration", config.terminal?.claude_code_integration);
+
+  // Claude Code States
+  var states = config.terminal?.claude_states;
+  if (states) {
+    ["processing","idle_prompt","waiting_for_input","permission_prompt","error"]
+      .forEach(function(s) {
+        var e = states[s];
+        if (!e) { return; }
+        setToggleValue("claude_states." + s + ".tab_indicator", e.tab_indicator);
+        setToggleValue("claude_states." + s + ".pane_border", e.pane_border);
+        // Color swatches only accept hex; ansi:N values are left at default.
+        if (typeof e.color === "string" && e.color.charAt(0) === "#") {
+          setColorSwatch("claude_states." + s + ".color", e.color);
+        }
+        setStepperValue("claude_states." + s + ".pulse_ms", e.pulse_ms);
+        setStepperValue("claude_states." + s + ".timeout_secs", e.timeout_secs);
+      });
+  }
 
   // Theme — appearance.theme is kebab-case, data-theme attrs use underscores
   var presetId = config.appearance?.theme;
@@ -633,7 +681,7 @@ function setStepperValue(key, value) {
   var ctrl = document.querySelector(".number-control[data-key='" + key + "']");
   if (ctrl) {
     var valEl = ctrl.querySelector(".number-value");
-    if (valEl) { valEl.textContent = String(value); }
+    if (valEl) { valEl.value = String(value); }
   }
 }
 

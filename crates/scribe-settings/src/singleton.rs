@@ -115,9 +115,8 @@ pub fn verify_peer_uid(stream: &UnixStream) -> bool {
 /// Linux: use `SO_PEERCRED` via nix `getsockopt`.
 #[cfg(target_os = "linux")]
 fn get_peer_uid(stream: &UnixStream) -> Result<u32, String> {
-    let cred =
-        nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
-            .map_err(|e| format!("getsockopt(SO_PEERCRED) failed: {e}"))?;
+    let cred = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map_err(|e| format!("getsockopt(SO_PEERCRED) failed: {e}"))?;
     Ok(cred.uid())
 }
 

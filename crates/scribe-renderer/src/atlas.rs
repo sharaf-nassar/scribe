@@ -237,7 +237,20 @@ impl GlyphAtlas {
         };
 
         upload_glyph(queue, &self.texture, &UploadParams { px, py, width, height, rgba: &rgba });
-        compute_uvs(px, py, width, height, self.atlas_size)
+        // For normal glyphs the canvas is ceil(cell_w) × ceil(cell_h).
+        // Use the float cell dimensions for the UV so the shader's
+        // cell-sized quad maps 1:1 to texels (no Nearest-filter skipping).
+        //
+        // For overflow glyphs (canvas wider than ceil(cell_w), e.g. ⚙),
+        // keep the full canvas width so the shader scales the whole glyph
+        // into the cell quad.
+        let cell_w_ceil = self.cell_size.width.ceil();
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "canvas width is a small integer that fits exactly in f32"
+        )]
+        let uv_w = if (width as f32) > cell_w_ceil { width as f32 } else { self.cell_size.width };
+        compute_uvs(px, py, uv_w, self.cell_size.height, self.atlas_size)
     }
 
     /// Shape the character, rasterise it into a cell-sized RGBA canvas.
@@ -297,8 +310,6 @@ impl GlyphAtlas {
             return None;
         }
 
-        let mut canvas = vec![0u8; (cell_w * cell_h * 4) as usize];
-
         // Destination offset within the cell canvas:
         //   x: placement.left (horizontal bearing from cell origin)
         //   y: font_size acts as approximate ascent; top is distance above baseline
@@ -309,21 +320,28 @@ impl GlyphAtlas {
         )]
         let dest_y = (self.metrics.font_size - top as f32).max(0.0) as u32;
 
-        // Blit glyph pixels onto the canvas, clipping to cell bounds.
+        // Canvas width: expand beyond cell_w if the glyph overflows
+        // horizontally (e.g. ⚙ U+2699 is wider than one monospace cell
+        // in many fonts). The atlas stores the full glyph and the shader
+        // maps its UV onto the cell-sized quad, scaling it to fit.
+        let canvas_w = cell_w.max(dest_x.saturating_add(glyph_w));
+        let mut canvas = vec![0u8; (canvas_w * cell_h * 4) as usize];
+
+        // Blit glyph pixels onto the canvas.
         blit_glyph(
             &glyph_rgba,
             &mut canvas,
             &BlitParams {
                 src_w: glyph_w,
                 src_h: glyph_h,
-                dst_w: cell_w,
+                dst_w: canvas_w,
                 dst_h: cell_h,
                 dest_x,
                 dest_y,
             },
         );
 
-        Some((cell_w, cell_h, canvas))
+        Some((canvas_w, cell_h, canvas))
     }
 
     /// Shape the character, rasterise it into a multi-cell RGBA canvas.
@@ -438,7 +456,10 @@ impl GlyphAtlas {
         };
 
         upload_glyph(queue, &self.texture, &UploadParams { px, py, width, height, rgba: &rgba });
-        compute_uvs(px, py, width, height, self.atlas_size)
+        // UV spans the float cell dimensions × glyph_span, matching the
+        // GPU quad size for this multi-cell glyph.
+        let uv_w = self.cell_size.width * f32::from(glyph_span);
+        compute_uvs(px, py, uv_w, self.cell_size.height, self.atlas_size)
     }
 
     /// Shape a multi-character text run and return the resulting glyph list.
@@ -660,16 +681,21 @@ fn upload_glyph(queue: &Queue, texture: &wgpu::Texture, params: &UploadParams<'_
 
 /// Compute normalised UV coordinates for a packed glyph.
 ///
+/// `uv_width` / `uv_height` are the **float** cell dimensions (matching the
+/// GPU quad size), not the ceil'd canvas dimensions.  This ensures the UV
+/// window covers exactly the same number of texels as the shader quad has
+/// pixels, preventing texel skipping under Nearest-filter sampling.
+///
 /// Atlas coordinates fit comfortably within f32 precision (max 1023 < 2^23).
 #[allow(
     clippy::cast_precision_loss,
     reason = "atlas coordinates ≤ 1023 fit exactly in f32 mantissa"
 )]
-fn compute_uvs(px: u32, py: u32, width: u32, height: u32, atlas_size: u32) -> GlyphEntry {
+fn compute_uvs(px: u32, py: u32, uv_width: f32, uv_height: f32, atlas_size: u32) -> GlyphEntry {
     let s = atlas_size as f32;
     GlyphEntry {
         uv_min: [px as f32 / s, py as f32 / s],
-        uv_max: [(px + width) as f32 / s, (py + height) as f32 / s],
+        uv_max: [(px as f32 + uv_width) / s, (py as f32 + uv_height) / s],
     }
 }
 
