@@ -94,27 +94,51 @@ fn send_focus_to_existing(socket_path: &std::path::Path) -> bool {
 
 /// Check if an incoming connection is from the same UID.
 ///
-/// Uses `SO_PEERCRED` via nix. Returns `false` if credentials cannot be
-/// retrieved or the UID does not match.
+/// Linux: `SO_PEERCRED` via nix. macOS: `getpeereid()` via libc.
+/// Returns `false` if credentials cannot be retrieved or the UID does not match.
 pub fn verify_peer_uid(stream: &UnixStream) -> bool {
-    let cred =
-        match nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("failed to get peer credentials: {e}");
-                return false;
-            }
-        };
+    let peer_uid = match get_peer_uid(stream) {
+        Ok(uid) => uid,
+        Err(e) => {
+            tracing::warn!("failed to get peer credentials: {e}");
+            return false;
+        }
+    };
     let expected = scribe_common::socket::current_uid();
-    if cred.uid() != expected {
-        tracing::warn!(
-            peer_uid = cred.uid(),
-            expected,
-            "rejected settings connection from different UID"
-        );
+    if peer_uid != expected {
+        tracing::warn!(peer_uid, expected, "rejected settings connection from different UID");
         return false;
     }
     true
+}
+
+/// Linux: use `SO_PEERCRED` via nix `getsockopt`.
+#[cfg(target_os = "linux")]
+fn get_peer_uid(stream: &UnixStream) -> Result<u32, String> {
+    let cred =
+        nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+            .map_err(|e| format!("getsockopt(SO_PEERCRED) failed: {e}"))?;
+    Ok(cred.uid())
+}
+
+/// macOS: use `getpeereid()` via libc.
+#[cfg(not(target_os = "linux"))]
+fn get_peer_uid(stream: &UnixStream) -> Result<u32, String> {
+    use std::os::unix::io::AsRawFd as _;
+
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+
+    // SAFETY: `stream` is a valid, open Unix domain socket. `getpeereid`
+    // writes the peer's effective UID and GID into the provided pointers,
+    // which are stack-allocated and live for the duration of the call.
+    #[allow(unsafe_code, reason = "getpeereid requires unsafe libc FFI call")]
+    let ret = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
+
+    if ret != 0 {
+        return Err(format!("getpeereid failed: {}", std::io::Error::last_os_error()));
+    }
+    Ok(uid)
 }
 
 /// Parse a command from a connected client.

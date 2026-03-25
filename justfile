@@ -58,6 +58,14 @@ deb:
 install: deb
     sudo dpkg -i target/debian/scribe_0.1.0-1_amd64.deb
 
+# Build macOS .app bundle and .dmg installer
+dmg:
+    bash dist/macos/build-dmg.sh
+
+# Build macOS .dmg (skip cargo build, use existing release binaries)
+dmg-quick:
+    bash dist/macos/build-dmg.sh --skip-build
+
 # ==================== E2E Testing ====================
 
 # Rebuild functional test container (after cargo build --release)

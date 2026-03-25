@@ -4,10 +4,6 @@ pub mod apply;
 pub mod singleton;
 pub mod state;
 
-use std::cell::RefCell;
-use std::collections::BTreeSet;
-use std::rc::Rc;
-
 use rust_embed::Embed;
 
 /// Embedded web assets (HTML, CSS, JS) for the settings UI.
@@ -55,13 +51,115 @@ pub fn build_html() -> Result<String, String> {
     Ok(html)
 }
 
+/// Query the system for installed monospace font families.
+///
+/// Returns a sorted, deduplicated list of font family names.
+#[cfg(target_os = "linux")]
+fn list_monospace_fonts() -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+
+    let mut families = BTreeSet::new();
+    for info in db.faces() {
+        if info.monospaced {
+            for (name, _) in &info.families {
+                families.insert(name.clone());
+            }
+        }
+    }
+
+    families.into_iter().collect()
+}
+
+/// Query the system for installed monospace font families (macOS / other).
+///
+/// Returns a sorted, deduplicated list of font family names.
+#[cfg(not(target_os = "linux"))]
+fn list_monospace_fonts() -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+
+    let mut families = BTreeSet::new();
+    for info in db.faces() {
+        if info.monospaced {
+            for (name, _) in &info.families {
+                families.insert(name.clone());
+            }
+        }
+    }
+
+    families.into_iter().collect()
+}
+
+/// Inject keybinding defaults into the webview for reset-to-default support.
+#[cfg(target_os = "linux")]
+fn inject_keybinding_defaults(webview: &wry::WebView) {
+    let defaults = scribe_common::config::KeybindingsConfig::default();
+    let json = serde_json::to_string(&defaults).unwrap_or_else(|_| String::from("{}"));
+    let script = format!(
+        "if (typeof loadKeybindingDefaults === 'function') {{ loadKeybindingDefaults({json}); }}"
+    );
+    if let Err(e) = webview.evaluate_script(&script) {
+        tracing::warn!("failed to inject keybinding defaults into settings webview: {e}");
+    }
+}
+
+/// Inject the available font list into the webview.
+#[cfg(target_os = "linux")]
+fn inject_font_list(webview: &wry::WebView) {
+    let fonts = list_monospace_fonts();
+    let fonts_json = serde_json::to_string(&fonts).unwrap_or_else(|_| String::from("[]"));
+    let script =
+        format!("if (typeof loadFontList === 'function') {{ loadFontList({fonts_json}); }}");
+    if let Err(e) = webview.evaluate_script(&script) {
+        tracing::warn!("failed to inject font list into settings webview: {e}");
+    }
+}
+
+/// Inject keybinding defaults into the webview for reset-to-default support.
+#[cfg(not(target_os = "linux"))]
+fn inject_keybinding_defaults(webview: &wry::WebView) {
+    let defaults = scribe_common::config::KeybindingsConfig::default();
+    let json = serde_json::to_string(&defaults).unwrap_or_else(|_| String::from("{}"));
+    let script = format!(
+        "if (typeof loadKeybindingDefaults === 'function') {{ loadKeybindingDefaults({json}); }}"
+    );
+    if let Err(e) = webview.evaluate_script(&script) {
+        tracing::warn!("failed to inject keybinding defaults into settings webview: {e}");
+    }
+}
+
+/// Inject the available font list into the webview.
+#[cfg(not(target_os = "linux"))]
+fn inject_font_list(webview: &wry::WebView) {
+    let fonts = list_monospace_fonts();
+    let fonts_json = serde_json::to_string(&fonts).unwrap_or_else(|_| String::from("[]"));
+    let script =
+        format!("if (typeof loadFontList === 'function') {{ loadFontList({fonts_json}); }}");
+    if let Err(e) = webview.evaluate_script(&script) {
+        tracing::warn!("failed to inject font list into settings webview: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linux: GTK-based settings window
+// ---------------------------------------------------------------------------
+
 /// Run the settings window (blocking until closed).
 ///
-/// Initialises GTK, creates the window, registers the singleton socket fd
-/// watcher, installs signal handlers, and enters `gtk::main()`.
+/// On Linux, initialises GTK, creates the window, registers the singleton
+/// socket fd watcher, installs signal handlers, and enters `gtk::main()`.
+///
+/// On macOS, this is a stub — the cross-platform implementation is provided
+/// by a separate task.
 ///
 /// `on_change` is called for each setting change from the webview.
 /// `on_close` is called with the final geometry when the window closes.
+#[cfg(target_os = "linux")]
 #[allow(
     clippy::too_many_lines,
     reason = "GTK window setup + webview + socket watcher in one function"
@@ -73,6 +171,9 @@ pub fn run_settings_window(
     listener: std::os::unix::net::UnixListener,
     _socket_path: std::path::PathBuf,
 ) -> Result<(), String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use gtk::prelude::*;
     use wry::WebViewBuilderExtUnix;
 
@@ -187,10 +288,211 @@ pub fn run_settings_window(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// macOS: tao + wry settings window
+// ---------------------------------------------------------------------------
+
+/// Custom event for the tao event loop.
+#[cfg(not(target_os = "linux"))]
+enum TaoUserEvent {
+    /// Another instance sent a "focus" command via the singleton socket.
+    FocusWindow,
+    /// A termination signal (SIGTERM/SIGINT) was received.
+    Terminate,
+}
+
+/// Load configuration and serialise it to JSON for webview injection.
+#[cfg(not(target_os = "linux"))]
+fn load_config_json() -> String {
+    let config = scribe_common::config::load_config().unwrap_or_else(|e| {
+        tracing::warn!("failed to load config: {e}, using defaults");
+        scribe_common::config::ScribeConfig::default()
+    });
+    serde_json::to_string(&config).unwrap_or_else(|e| {
+        tracing::warn!("failed to serialize config: {e}");
+        String::from("{}")
+    })
+}
+
+/// Build the tao window with optional saved geometry.
+#[cfg(not(target_os = "linux"))]
+fn build_tao_window(
+    event_loop: &tao::event_loop::EventLoop<TaoUserEvent>,
+    geometry: Option<SettingsWindowGeometry>,
+) -> Result<tao::window::Window, String> {
+    use tao::dpi::{LogicalPosition, LogicalSize};
+
+    let mut builder = tao::window::WindowBuilder::new()
+        .with_title("Scribe Settings");
+
+    if let Some(geom) = geometry {
+        builder = builder
+            .with_inner_size(LogicalSize::new(f64::from(geom.width), f64::from(geom.height)))
+            .with_position(LogicalPosition::new(f64::from(geom.x), f64::from(geom.y)));
+    } else {
+        builder = builder.with_inner_size(LogicalSize::new(880.0, 680.0));
+    }
+
+    builder
+        .build(event_loop)
+        .map_err(|e| format!("failed to create window: {e}"))
+}
+
+/// Spawn a background thread to accept singleton socket connections.
+///
+/// When a valid "focus" command arrives, sends `FocusWindow` to the event loop.
+#[cfg(not(target_os = "linux"))]
+fn spawn_singleton_listener(
+    listener: std::os::unix::net::UnixListener,
+    proxy: tao::event_loop::EventLoopProxy<TaoUserEvent>,
+) {
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            if !singleton::verify_peer_uid(&stream) {
+                continue;
+            }
+            if singleton::read_command(&stream).as_deref() == Some("focus") {
+                drop(proxy.send_event(TaoUserEvent::FocusWindow));
+            }
+        }
+    });
+}
+
+/// Register SIGTERM/SIGINT handlers that send `Terminate` to the event loop.
+#[cfg(not(target_os = "linux"))]
+fn register_signal_handlers(proxy: tao::event_loop::EventLoopProxy<TaoUserEvent>) {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    let Ok(mut signals) = Signals::new([SIGTERM, SIGINT]) else {
+        tracing::warn!("failed to register signal handlers");
+        return;
+    };
+
+    std::thread::spawn(move || {
+        if signals.into_iter().next().is_some() {
+            drop(proxy.send_event(TaoUserEvent::Terminate));
+        }
+    });
+}
+
+/// Capture the current window geometry as a `SettingsWindowGeometry`.
+#[cfg(not(target_os = "linux"))]
+fn capture_geometry(window: &tao::window::Window) -> SettingsWindowGeometry {
+    let pos = window.outer_position().unwrap_or_default();
+    let size = window.inner_size();
+    SettingsWindowGeometry {
+        x: pos.x,
+        y: pos.y,
+        width: size.width.cast_signed(),
+        height: size.height.cast_signed(),
+    }
+}
+
+/// Run the settings window on macOS using tao + wry (blocking until closed).
+///
+/// Uses `tao::EventLoop` for windowing and `wry::WebViewBuilder::build()`
+/// with the tao window (no GTK dependency).
+#[cfg(not(target_os = "linux"))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "tao window setup + webview + event loop in one function"
+)]
+pub fn run_settings_window(
+    geometry: Option<SettingsWindowGeometry>,
+    on_change: impl Fn(String) + 'static,
+    on_close: impl FnOnce(SettingsWindowGeometry) + 'static,
+    listener: std::os::unix::net::UnixListener,
+    _socket_path: std::path::PathBuf,
+) -> Result<(), String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use tao::event::{Event, WindowEvent};
+    use tao::event_loop::ControlFlow;
+    use tao::platform::run_return::EventLoopExtRunReturn;
+
+    let config_json = load_config_json();
+    let html = build_html()?;
+
+    let mut event_loop = tao::event_loop::EventLoopBuilder::<TaoUserEvent>::with_user_event()
+        .build();
+    let window = build_tao_window(&event_loop, geometry)?;
+
+    // Spawn singleton listener and signal handlers on background threads.
+    spawn_singleton_listener(listener, event_loop.create_proxy());
+    register_signal_handlers(event_loop.create_proxy());
+
+    // Shared webview ref for IPC font-refresh requests.
+    let webview_ref: Rc<RefCell<Option<wry::WebView>>> = Rc::new(RefCell::new(None));
+    let webview_for_ipc = Rc::clone(&webview_ref);
+
+    let webview = wry::WebViewBuilder::new()
+        .with_html(&html)
+        .with_ipc_handler(move |request| {
+            let body = request.body();
+            if body.contains("\"type\":\"request_fonts\"") {
+                if let Some(wv) = webview_for_ipc.borrow().as_ref() {
+                    inject_font_list(wv);
+                }
+                return;
+            }
+            on_change(body.clone());
+        })
+        .build(&window)
+        .map_err(|e| format!("failed to create webview: {e}"))?;
+
+    // Inject config, keybinding defaults, and font list.
+    let init_script =
+        format!("if (typeof loadConfig === 'function') {{ loadConfig({config_json}); }}");
+    if let Err(e) = webview.evaluate_script(&init_script) {
+        tracing::warn!("failed to inject config into settings webview: {e}");
+    }
+    inject_keybinding_defaults(&webview);
+    inject_font_list(&webview);
+
+    *webview_ref.borrow_mut() = Some(webview);
+
+    let on_close = RefCell::new(Some(on_close));
+    let target_window_id = window.id();
+
+    event_loop.run_return(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+        match event {
+            Event::UserEvent(TaoUserEvent::FocusWindow) => window.set_focus(),
+            Event::WindowEvent { event: WindowEvent::CloseRequested, .. }
+            | Event::UserEvent(TaoUserEvent::Terminate) => {
+                fire_on_close(&window, &on_close);
+                *control_flow = ControlFlow::Exit;
+            }
+            Event::WindowEvent { event: WindowEvent::Destroyed, window_id: id, .. }
+                if id == target_window_id =>
+            {
+                *control_flow = ControlFlow::Exit;
+            }
+            _ => {}
+        }
+    });
+
+    Ok(())
+}
+
+/// Fire the `on_close` callback exactly once, capturing current geometry.
+#[cfg(not(target_os = "linux"))]
+fn fire_on_close(
+    window: &tao::window::Window,
+    on_close: &std::cell::RefCell<Option<impl FnOnce(SettingsWindowGeometry)>>,
+) {
+    if let Some(cb) = on_close.borrow_mut().take() {
+        cb(capture_geometry(window));
+    }
+}
+
 /// Handle one incoming connection on the singleton socket.
 ///
 /// Accepts a connection, verifies peer UID, reads the command, and
 /// presents the window if the command is `"focus"`.
+#[cfg(target_os = "linux")]
 fn handle_singleton_connection(listener: &std::os::unix::net::UnixListener, window: &gtk::Window) {
     use gtk::prelude::GtkWindowExt;
 
@@ -205,42 +507,12 @@ fn handle_singleton_connection(listener: &std::os::unix::net::UnixListener, wind
     }
 }
 
-/// Query the system for installed monospace font families.
-///
-/// Returns a sorted, deduplicated list of font family names.
-fn list_monospace_fonts() -> Vec<String> {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
-
-    let mut families = BTreeSet::new();
-    for info in db.faces() {
-        if info.monospaced {
-            for (name, _) in &info.families {
-                families.insert(name.clone());
-            }
-        }
-    }
-
-    families.into_iter().collect()
-}
-
-/// Inject keybinding defaults into the webview for reset-to-default support.
-fn inject_keybinding_defaults(webview: &wry::WebView) {
-    let defaults = scribe_common::config::KeybindingsConfig::default();
-    let json = serde_json::to_string(&defaults).unwrap_or_else(|_| String::from("{}"));
-    let script = format!(
-        "if (typeof loadKeybindingDefaults === 'function') {{ loadKeybindingDefaults({json}); }}"
-    );
-    if let Err(e) = webview.evaluate_script(&script) {
-        tracing::warn!("failed to inject keybinding defaults into settings webview: {e}");
-    }
-}
-
 /// Check whether GTK is using the Wayland backend.
 ///
 /// On Wayland, `gtk::Window::position()` always returns `(0, 0)` and
 /// `move_()` is a protocol-level no-op for toplevel windows — position
 /// save/restore is not possible.
+#[cfg(target_os = "linux")]
 fn is_wayland_backend() -> bool {
     // GDK_BACKEND=x11 forces X11 even on a Wayland session.
     match std::env::var("GDK_BACKEND").ok().as_deref() {
@@ -248,16 +520,5 @@ fn is_wayland_backend() -> bool {
         Some("wayland") => true,
         // GTK3 auto-selects Wayland when the compositor is running.
         _ => std::env::var_os("WAYLAND_DISPLAY").is_some(),
-    }
-}
-
-/// Inject the available font list into the webview.
-fn inject_font_list(webview: &wry::WebView) {
-    let fonts = list_monospace_fonts();
-    let fonts_json = serde_json::to_string(&fonts).unwrap_or_else(|_| String::from("[]"));
-    let script =
-        format!("if (typeof loadFontList === 'function') {{ loadFontList({fonts_json}); }}");
-    if let Err(e) = webview.evaluate_script(&script) {
-        tracing::warn!("failed to inject font list into settings webview: {e}");
     }
 }

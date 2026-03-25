@@ -7,7 +7,7 @@
 //! - **Receiver** (new server launched with `--upgrade`): connects to the
 //!   handoff socket, receives the state + fds, and reconstructs sessions.
 //!
-//! The handoff socket lives at `/run/user/{uid}/scribe/handoff.sock`.
+//! The handoff socket path is platform-specific (see `scribe_common::socket`).
 
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -18,7 +18,6 @@ use nix::sys::socket::{
     self, AddressFamily, Backlog, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag,
     SockType, UnixAddr,
 };
-use nix::unistd::geteuid;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -26,7 +25,7 @@ use tracing::{debug, info, warn};
 use scribe_common::error::ScribeError;
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::screen::ScreenSnapshot;
-use scribe_common::socket::current_uid;
+use scribe_common::socket::{current_uid, handoff_socket_path};
 
 pub use crate::workspace_manager::HandoffWindowState;
 
@@ -91,14 +90,6 @@ pub struct HandoffWorkspace {
     pub split_direction: Option<scribe_common::protocol::LayoutDirection>,
 }
 
-// ── Socket path ─────────────────────────────────────────────────────
-
-/// Return the handoff socket path: `/run/user/{uid}/scribe/handoff.sock`.
-fn handoff_socket_path() -> PathBuf {
-    let uid = geteuid();
-    PathBuf::from(format!("/run/user/{uid}/scribe/handoff.sock"))
-}
-
 // ── Sender (old server) ─────────────────────────────────────────────
 
 /// Listen for an incoming upgrade connection and perform the handoff.
@@ -115,10 +106,10 @@ pub async fn run_handoff_listener(
     prepare_handoff_socket(&path)?;
 
     let listen_fd =
-        socket::socket(AddressFamily::Unix, SockType::Stream, SockFlag::SOCK_CLOEXEC, None)
-            .map_err(|e| ScribeError::IpcError {
-                reason: format!("handoff socket() failed: {e}"),
-            })?;
+        socket::socket(AddressFamily::Unix, SockType::Stream, cloexec_flag(), None).map_err(
+            |e| ScribeError::IpcError { reason: format!("handoff socket() failed: {e}") },
+        )?;
+    set_cloexec_if_needed(&listen_fd)?;
 
     let addr = UnixAddr::new(&path).map_err(|e| ScribeError::IpcError {
         reason: format!("handoff UnixAddr::new failed: {e}"),
@@ -215,13 +206,12 @@ fn prepare_handoff_socket(path: &PathBuf) -> Result<(), ScribeError> {
     Ok(())
 }
 
-/// Verify the peer's UID matches our own via `SO_PEERCRED`.
+/// Verify the peer's UID matches our own.
+///
+/// Linux: `SO_PEERCRED` via `getsockopt`.
+/// macOS: `getpeereid()` via libc.
 fn verify_peer_uid(fd: &OwnedFd) -> Result<(), ScribeError> {
-    let cred = socket::getsockopt(fd, socket::sockopt::PeerCredentials).map_err(|e| {
-        ScribeError::IpcError { reason: format!("handoff getsockopt(SO_PEERCRED) failed: {e}") }
-    })?;
-
-    let peer_uid = cred.uid();
+    let peer_uid = get_peer_uid(fd)?;
     let expected = current_uid();
     if peer_uid != expected {
         return Err(ScribeError::IpcError {
@@ -231,6 +221,35 @@ fn verify_peer_uid(fd: &OwnedFd) -> Result<(), ScribeError> {
 
     debug!(uid = expected, "handoff peer UID verified");
     Ok(())
+}
+
+/// Linux: use `SO_PEERCRED` via nix `getsockopt`.
+#[cfg(target_os = "linux")]
+fn get_peer_uid(fd: &OwnedFd) -> Result<u32, ScribeError> {
+    let cred = socket::getsockopt(fd, socket::sockopt::PeerCredentials).map_err(|e| {
+        ScribeError::IpcError { reason: format!("handoff getsockopt(SO_PEERCRED) failed: {e}") }
+    })?;
+    Ok(cred.uid())
+}
+
+/// macOS: use `getpeereid()` via libc.
+#[cfg(not(target_os = "linux"))]
+fn get_peer_uid(fd: &OwnedFd) -> Result<u32, ScribeError> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+
+    // SAFETY: `fd` is a valid, open Unix domain socket. `getpeereid` writes
+    // the peer's effective UID and GID into the provided pointers, which are
+    // stack-allocated and live for the duration of the call.
+    #[allow(unsafe_code, reason = "getpeereid requires unsafe libc FFI call")]
+    let ret = unsafe { libc::getpeereid(fd.as_raw_fd(), &raw mut uid, &raw mut gid) };
+
+    if ret != 0 {
+        return Err(ScribeError::IpcError {
+            reason: format!("handoff getpeereid failed: {}", std::io::Error::last_os_error()),
+        });
+    }
+    Ok(uid)
 }
 
 /// Read the upgrade request magic bytes from the peer.
@@ -335,10 +354,12 @@ pub fn receive_handoff() -> Result<(HandoffState, Vec<OwnedFd>), ScribeError> {
     let path = handoff_socket_path();
 
     let sock_fd =
-        socket::socket(AddressFamily::Unix, SockType::Stream, SockFlag::SOCK_CLOEXEC, None)
-            .map_err(|e| ScribeError::IpcError {
+        socket::socket(AddressFamily::Unix, SockType::Stream, cloexec_flag(), None).map_err(
+            |e| ScribeError::IpcError {
                 reason: format!("handoff receiver socket() failed: {e}"),
-            })?;
+            },
+        )?;
+    set_cloexec_if_needed(&sock_fd)?;
 
     let addr = UnixAddr::new(&path).map_err(|e| ScribeError::IpcError {
         reason: format!("handoff receiver UnixAddr::new failed: {e}"),
@@ -494,7 +515,7 @@ fn receive_fds(fd: RawFd, expected_count: usize) -> Result<Vec<OwnedFd>, ScribeE
     // MSG_CMSG_CLOEXEC ensures received fds are close-on-exec, preventing
     // them from leaking to child processes forked before we wrap them in
     // AsyncPtyFd.
-    let msg = socket::recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_buf), MsgFlags::MSG_CMSG_CLOEXEC)
+    let msg = socket::recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_buf), recv_fds_flags())
         .map_err(|e| ScribeError::IpcError {
             reason: format!("handoff recvmsg (SCM_RIGHTS) failed: {e}"),
         })?;
@@ -522,6 +543,59 @@ fn receive_fds(fd: RawFd, expected_count: usize) -> Result<Vec<OwnedFd>, ScribeE
     }
 
     Ok(received_fds)
+}
+
+// ── CLOEXEC helpers ─────────────────────────────────────────────────
+
+/// On Linux, use `MSG_CMSG_CLOEXEC` so received fds are close-on-exec.
+#[cfg(target_os = "linux")]
+fn recv_fds_flags() -> MsgFlags {
+    MsgFlags::MSG_CMSG_CLOEXEC
+}
+
+/// On macOS, `MSG_CMSG_CLOEXEC` does not exist. Received fds get
+/// `FD_CLOEXEC` set by `wrap_raw_fd` after reception.
+#[cfg(not(target_os = "linux"))]
+fn recv_fds_flags() -> MsgFlags {
+    MsgFlags::empty()
+}
+
+/// On Linux, `SOCK_CLOEXEC` is available as a socket flag.
+#[cfg(target_os = "linux")]
+fn cloexec_flag() -> SockFlag {
+    SockFlag::SOCK_CLOEXEC
+}
+
+/// On macOS (and other non-Linux), `SOCK_CLOEXEC` does not exist.
+/// Return empty flags; the caller must use `set_cloexec_if_needed`.
+#[cfg(not(target_os = "linux"))]
+fn cloexec_flag() -> SockFlag {
+    SockFlag::empty()
+}
+
+/// No-op on Linux — `SOCK_CLOEXEC` was already set at socket creation.
+#[cfg(target_os = "linux")]
+fn set_cloexec_if_needed(_fd: &OwnedFd) -> Result<(), ScribeError> {
+    Ok(())
+}
+
+/// On non-Linux, set `FD_CLOEXEC` via `fcntl` after socket creation.
+#[cfg(not(target_os = "linux"))]
+fn set_cloexec_if_needed(fd: &OwnedFd) -> Result<(), ScribeError> {
+    use nix::fcntl::{FdFlag, fcntl, FcntlArg};
+
+    let current = fcntl(fd, FcntlArg::F_GETFD).map_err(|e| ScribeError::IpcError {
+        reason: format!("fcntl(F_GETFD) failed: {e}"),
+    })?;
+
+    let mut flags = FdFlag::from_bits_truncate(current);
+    flags.insert(FdFlag::FD_CLOEXEC);
+
+    fcntl(fd, FcntlArg::F_SETFD(flags)).map_err(|e| ScribeError::IpcError {
+        reason: format!("fcntl(F_SETFD, FD_CLOEXEC) failed: {e}"),
+    })?;
+
+    Ok(())
 }
 
 // ── Permissions helper ──────────────────────────────────────────────

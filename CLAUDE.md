@@ -20,9 +20,13 @@ just ready            # Pre-commit gate: fmt + clippy + test
 just server           # Run the server
 just client           # Run the GPU client
 
-# Package & install
+# Package & install (Linux)
 just deb              # Build release .deb (builds full workspace)
 just install          # Build, package, and install .deb (sudo)
+
+# Package (macOS)
+just dmg              # Build .app bundle and .dmg installer
+just dmg-quick        # Package only (use existing release binaries)
 
 # E2E testing
 just e2e              # Full functional E2E suite (build + containerise + run all)

@@ -188,8 +188,24 @@ impl WorkspaceManager {
         self.on_cwd_changed(session_id, &cwd)
     }
 
-    /// Non-Linux stub — always returns `None`.
-    #[cfg(not(target_os = "linux"))]
+    /// macOS fallback: use `proc_pidinfo` to read the child process CWD,
+    /// then delegate to `on_cwd_changed`.
+    #[cfg(target_os = "macos")]
+    pub fn check_cwd_fallback(
+        &mut self,
+        session_id: SessionId,
+        child_pid: u32,
+    ) -> Option<ServerMessage> {
+        if child_pid == 0 {
+            debug!(%session_id, "skipping proc CWD check: child_pid is 0");
+            return None;
+        }
+        let cwd = macos_proc_cwd(child_pid)?;
+        self.on_cwd_changed(session_id, &cwd)
+    }
+
+    /// Stub for platforms other than Linux and macOS — always returns `None`.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub fn check_cwd_fallback(
         &mut self,
         _session_id: SessionId,
@@ -399,6 +415,67 @@ impl WorkspaceManager {
             window_trees,
             session_to_window,
         }
+    }
+}
+
+/// Query the CWD of a process on macOS via `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
+#[cfg(target_os = "macos")]
+fn macos_proc_cwd(child_pid: u32) -> Option<PathBuf> {
+    use std::ffi::CStr;
+    use std::mem::MaybeUninit;
+    use std::os::raw::c_void;
+
+    const PROC_PIDVNODEPATHINFO: i32 = 9;
+
+    // `proc_vnodepathinfo` is 2 * `vnode_info_path` (each 1152 bytes) = 2304 bytes.
+    // `vnode_info_path` = `vnode_info` (128 bytes) + path `[c_char; 1024]`.
+    // `pvi_cdir` is the first `vnode_info_path` member; its path starts at byte 128.
+    const VIP_PATH_OFFSET: usize = 128;
+    const VNODE_INFO_PATH_SIZE: usize = 1152;
+    const PROC_VNODEPATHINFO_SIZE: usize = VNODE_INFO_PATH_SIZE * 2;
+
+    #[allow(unsafe_code, reason = "proc_pidinfo FFI is required for macOS CWD detection")]
+    {
+        unsafe extern "C" {
+            fn proc_pidinfo(
+                pid: i32,
+                flavor: i32,
+                arg: u64,
+                buffer: *mut c_void,
+                buffersize: i32,
+            ) -> i32;
+        }
+
+        let mut buf = MaybeUninit::<[u8; PROC_VNODEPATHINFO_SIZE]>::uninit();
+
+        let ret = unsafe {
+            proc_pidinfo(
+                i32::try_from(child_pid).ok()?,
+                PROC_PIDVNODEPATHINFO,
+                0,
+                buf.as_mut_ptr().cast::<c_void>(),
+                i32::try_from(PROC_VNODEPATHINFO_SIZE).ok()?,
+            )
+        };
+
+        if ret <= 0 {
+            return None;
+        }
+
+        let buf = unsafe { buf.assume_init() };
+
+        // `pvi_cdir.vip_path` starts at VIP_PATH_OFFSET within the first
+        // `vnode_info_path` member. Max path length is 1024 bytes (MAXPATHLEN).
+        let path_bytes = buf.get(VIP_PATH_OFFSET..VNODE_INFO_PATH_SIZE)?;
+
+        let c_str = CStr::from_bytes_until_nul(path_bytes).ok()?;
+        let path = PathBuf::from(c_str.to_str().ok()?);
+
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+
+        Some(path)
     }
 }
 

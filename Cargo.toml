@@ -67,15 +67,11 @@ nix = { version = "0.31", features = [
 ] }
 libc = "0.2"
 
-# Clipboard
-arboard = { version = "3", default-features = false, features = [
-  "wayland-data-control",
-] }
-
 # GPU / windowing
 wgpu = { version = "29.0", default-features = false, features = [
   "vulkan",
   "gles",
+  "metal",
   "wgsl",
   "std",
 ] }
@@ -91,7 +87,8 @@ png = "0.17"
 # Webview / settings
 wry = "0.51"
 rust-embed = "8"
-gtk = "0.18"
+tao = "0.33"
+signal-hook = "0.3"
 
 # Workspace crates
 scribe-common = { path = "crates/scribe-common" }

@@ -291,8 +291,60 @@ const SERVER_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Interval between connection retry attempts while waiting for the service.
 const SERVER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Try to connect to the server socket. If the server isn't running, start the
-/// systemd user service and retry until it's ready or the timeout expires.
+/// Start the scribe-server process.
+///
+/// On Linux, uses the systemd user service. On macOS, spawns the binary
+/// directly as a detached background process.
+fn start_server() -> Result<(), String> {
+    platform_start_server()
+}
+
+#[cfg(target_os = "linux")]
+fn platform_start_server() -> Result<(), String> {
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "start", "scribe-server"])
+        .status()
+        .map_err(|e| format!("failed to run systemctl: {e}"))?;
+    if status.success() {
+        tracing::info!("scribe-server.service started");
+        Ok(())
+    } else {
+        Err(format!("systemctl start exited with {status}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_start_server() -> Result<(), String> {
+    use std::process::Stdio;
+
+    // Resolve server binary relative to current executable.
+    // In a .app bundle: Contents/MacOS/scribe-server
+    // In dev: same directory as scribe-client
+    let exe = std::env::current_exe().map_err(|e| format!("failed to get current exe: {e}"))?;
+    let server_exe = exe.with_file_name("scribe-server");
+
+    if !server_exe.exists() {
+        return Err(format!("server binary not found at {}", server_exe.display()));
+    }
+
+    let child = std::process::Command::new(&server_exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn scribe-server: {e}"))?;
+
+    tracing::info!(pid = child.id(), exe = %server_exe.display(), "spawned scribe-server");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn platform_start_server() -> Result<(), String> {
+    Err(String::from("server auto-start not supported on this platform"))
+}
+
+/// Try to connect to the server socket. If the server isn't running, start it
+/// and retry until it's ready or the timeout expires.
 async fn connect_or_start_server(
     socket_path: &Path,
 ) -> Result<tokio::net::UnixStream, Box<dyn std::error::Error + Send + Sync>> {
@@ -301,17 +353,8 @@ async fn connect_or_start_server(
         return Ok(stream);
     }
 
-    // Server not running — start the systemd user service.
-    tracing::info!("server not running, starting scribe-server.service");
-
-    let status =
-        std::process::Command::new("systemctl").args(["--user", "start", "scribe-server"]).status();
-
-    match status {
-        Ok(s) if s.success() => tracing::info!("scribe-server.service started"),
-        Ok(s) => return Err(format!("systemctl start exited with {s}").into()),
-        Err(e) => return Err(format!("failed to run systemctl: {e}").into()),
-    }
+    tracing::info!("server not running, starting scribe-server");
+    start_server().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
     // Wait for the socket to appear.
     let deadline = tokio::time::Instant::now() + SERVER_STARTUP_TIMEOUT;
