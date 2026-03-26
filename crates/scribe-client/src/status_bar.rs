@@ -52,6 +52,11 @@ const FALLBACK_RED: [f32; 4] = [1.0, 0.2, 0.2, 1.0];
 /// Fallback yellow when ANSI index 3 is unavailable.
 const FALLBACK_YELLOW: [f32; 4] = [0.9, 0.8, 0.2, 1.0];
 
+/// Number of sparkline chars for CPU and GPU displays.
+const CPU_SPARK_WIDTH: usize = 8;
+/// Number of sparkline chars for network displays.
+const NET_SPARK_WIDTH: usize = 4;
+
 /// Colors for the status bar, derived from the theme's [`ChromeColors`]
 /// and ANSI palette.
 pub struct StatusBarColors {
@@ -67,6 +72,8 @@ pub struct StatusBarColors {
     pub warning: [f32; 4],
     /// Color for high usage (>85%) — ANSI red (index 1).
     pub critical: [f32; 4],
+    /// Dimmed color for stat labels — text at reduced alpha.
+    pub label: [f32; 4],
 }
 
 impl StatusBarColors {
@@ -85,6 +92,15 @@ impl StatusBarColors {
             ),
             warning: srgb_to_linear_rgba(ansi_colors.get(3).copied().unwrap_or(FALLBACK_YELLOW)),
             critical: srgb_to_linear_rgba(ansi_colors.get(1).copied().unwrap_or(FALLBACK_RED)),
+            label: {
+                let t = srgb_to_linear_rgba(chrome.status_bar_text);
+                [
+                    t.first().copied().unwrap_or(0.0),
+                    t.get(1).copied().unwrap_or(0.0),
+                    t.get(2).copied().unwrap_or(0.0),
+                    t.get(3).copied().unwrap_or(1.0) * 0.55,
+                ]
+            },
         }
     }
 }
@@ -319,20 +335,30 @@ fn usage_color(pct: f32, colors: &StatusBarColors) -> [f32; 4] {
     }
 }
 
-/// Format bytes/sec as a human-readable string (e.g., "1.2M", "340K", "0B").
+/// Format bytes/sec as a human-readable string of ≤4 chars (e.g., "1.2M", "340K", "0B").
 fn format_bytes_rate(bytes_per_sec: u64) -> String {
-    if bytes_per_sec >= 1_000_000 {
-        // cast is safe: bytes_per_sec fits in f64
+    if bytes_per_sec >= 1_000_000_000 {
+        String::from(">1G")
+    } else if bytes_per_sec >= 10_000_000 {
+        #[allow(clippy::cast_precision_loss, reason = "bytes_per_sec is a reasonable network rate")]
+        let mb = bytes_per_sec as f64 / 1_000_000.0;
+        if mb >= 999.5 { String::from(">1G") } else { format!("{mb:.0}M") }
+    } else if bytes_per_sec >= 1_000_000 {
         #[allow(clippy::cast_precision_loss, reason = "bytes_per_sec is a reasonable network rate")]
         let mb = bytes_per_sec as f64 / 1_000_000.0;
         format!("{mb:.1}M")
     } else if bytes_per_sec >= 1_000 {
         #[allow(clippy::cast_precision_loss, reason = "bytes_per_sec is a reasonable network rate")]
         let kb = bytes_per_sec as f64 / 1_000.0;
-        format!("{kb:.0}K")
+        if kb >= 999.5 { String::from("1.0M") } else { format!("{kb:.0}K") }
     } else {
         format!("{bytes_per_sec}B")
     }
+}
+
+/// Format bytes/sec right-aligned in exactly 4 characters.
+fn format_bytes_rate_fixed(bytes_per_sec: u64) -> String {
+    format!("{:>4}", format_bytes_rate(bytes_per_sec))
 }
 
 /// A styled text segment for the right side of the status bar.
@@ -344,7 +370,7 @@ struct RightSegment {
 /// Push a separator " | " segment if `segs` is non-empty.
 fn push_sep(segs: &mut Vec<RightSegment>, color: [f32; 4]) {
     if !segs.is_empty() {
-        segs.push(RightSegment { text: String::from(" | "), color });
+        segs.push(RightSegment { text: String::from(" \u{2502} "), color });
     }
 }
 
@@ -358,70 +384,126 @@ fn build_stats_segments(
 
     if config.cpu {
         push_sep(&mut segs, colors.separator);
-        segs.push(RightSegment { text: String::from("CPU "), color: colors.text });
-        for &v in &stats.cpu_history {
+        segs.extend(build_cpu_segments(stats, colors));
+    }
+
+    if config.memory {
+        push_sep(&mut segs, colors.separator);
+        segs.extend(build_mem_segments(stats, colors));
+    }
+
+    if config.network {
+        push_sep(&mut segs, colors.separator);
+        segs.extend(build_net_segments(stats, colors));
+    }
+
+    if config.gpu && stats.gpu_percent.is_some() {
+        push_sep(&mut segs, colors.separator);
+        segs.extend(build_gpu_segments(stats, colors));
+    }
+
+    segs
+}
+
+/// CPU stats: label + 8 sparkline bars (padded) + fixed-width percentage.
+fn build_cpu_segments(stats: &SystemStats, colors: &StatusBarColors) -> Vec<RightSegment> {
+    let mut segs = Vec::new();
+    segs.push(RightSegment { text: String::from("CPU "), color: colors.label });
+
+    let pad = CPU_SPARK_WIDTH.saturating_sub(stats.cpu_history.len());
+    for _ in 0..pad {
+        segs.push(RightSegment { text: String::from("\u{2581}"), color: colors.label });
+    }
+    for &v in &stats.cpu_history {
+        segs.push(RightSegment {
+            text: sparkline_char(v).to_string(),
+            color: usage_color(v, colors),
+        });
+    }
+
+    let pct = stats.cpu_percent;
+    segs.push(RightSegment { text: format!(" {pct:>3.0}%"), color: usage_color(pct, colors) });
+    segs
+}
+
+/// Memory stats: label + 1 sparkline bar + fixed-width percentage.
+fn build_mem_segments(stats: &SystemStats, colors: &StatusBarColors) -> Vec<RightSegment> {
+    let mut segs = Vec::new();
+    let mem_pct =
+        if stats.mem_total_gb > 0.0 { stats.mem_used_gb / stats.mem_total_gb * 100.0 } else { 0.0 };
+
+    segs.push(RightSegment { text: String::from("MEM "), color: colors.label });
+    segs.push(RightSegment {
+        text: sparkline_char(mem_pct).to_string(),
+        color: usage_color(mem_pct, colors),
+    });
+    segs.push(RightSegment {
+        text: format!(" {mem_pct:>3.0}%"),
+        color: usage_color(mem_pct, colors),
+    });
+    segs
+}
+
+/// Network stats: ↑ sparklines rate ↓ sparklines rate (all fixed-width).
+fn build_net_segments(stats: &SystemStats, colors: &StatusBarColors) -> Vec<RightSegment> {
+    let mut segs = Vec::new();
+
+    segs.push(RightSegment { text: String::from("\u{2191}"), color: colors.label });
+    let up_pad = NET_SPARK_WIDTH.saturating_sub(stats.net_up_history.len());
+    for _ in 0..up_pad {
+        segs.push(RightSegment { text: String::from("\u{2581}"), color: colors.label });
+    }
+    for &v in &stats.net_up_history {
+        #[allow(clippy::cast_precision_loss, reason = "network rate fits in f32 for sparkline")]
+        let pct = (v as f32 / 1_000_000.0).min(100.0);
+        segs.push(RightSegment { text: sparkline_char(pct).to_string(), color: colors.accent });
+    }
+    segs.push(RightSegment {
+        text: format!(" {}", format_bytes_rate_fixed(stats.net_up_bytes_sec)),
+        color: colors.text,
+    });
+
+    segs.push(RightSegment { text: String::from(" \u{2193}"), color: colors.label });
+    let down_pad = NET_SPARK_WIDTH.saturating_sub(stats.net_down_history.len());
+    for _ in 0..down_pad {
+        segs.push(RightSegment { text: String::from("\u{2581}"), color: colors.label });
+    }
+    for &v in &stats.net_down_history {
+        #[allow(clippy::cast_precision_loss, reason = "network rate fits in f32 for sparkline")]
+        let pct = (v as f32 / 1_000_000.0).min(100.0);
+        segs.push(RightSegment { text: sparkline_char(pct).to_string(), color: colors.accent });
+    }
+    segs.push(RightSegment {
+        text: format!(" {}", format_bytes_rate_fixed(stats.net_down_bytes_sec)),
+        color: colors.text,
+    });
+
+    segs
+}
+
+/// GPU stats: label + 8 sparkline bars (padded) + fixed-width percentage.
+fn build_gpu_segments(stats: &SystemStats, colors: &StatusBarColors) -> Vec<RightSegment> {
+    let mut segs = Vec::new();
+
+    if let Some(gpu_pct) = stats.gpu_percent {
+        segs.push(RightSegment { text: String::from("GPU "), color: colors.label });
+
+        let cap = CPU_SPARK_WIDTH;
+        let pad = cap.saturating_sub(stats.gpu_history.len());
+        for _ in 0..pad {
+            segs.push(RightSegment { text: String::from("\u{2581}"), color: colors.label });
+        }
+        for &v in &stats.gpu_history {
             segs.push(RightSegment {
                 text: sparkline_char(v).to_string(),
                 color: usage_color(v, colors),
             });
         }
-        let val_str = format!(" {:.0}%", stats.cpu_percent);
-        segs.push(RightSegment { text: val_str, color: usage_color(stats.cpu_percent, colors) });
-    }
 
-    if config.memory {
-        push_sep(&mut segs, colors.separator);
-        let mem_pct = if stats.mem_total_gb > 0.0 {
-            stats.mem_used_gb / stats.mem_total_gb * 100.0
-        } else {
-            0.0
-        };
-        segs.push(RightSegment { text: String::from("MEM "), color: colors.text });
         segs.push(RightSegment {
-            text: sparkline_char(mem_pct).to_string(),
-            color: usage_color(mem_pct, colors),
+            text: format!(" {gpu_pct:>3.0}%"),
+            color: usage_color(gpu_pct, colors),
         });
-        let mem_str = format!(" {:.1}G/{:.1}G", stats.mem_used_gb, stats.mem_total_gb);
-        segs.push(RightSegment { text: mem_str, color: usage_color(mem_pct, colors) });
-    }
-
-    if config.network {
-        push_sep(&mut segs, colors.separator);
-        segs.push(RightSegment { text: String::from("↑"), color: colors.text });
-        for &v in &stats.net_up_history {
-            #[allow(clippy::cast_precision_loss, reason = "network rate fits in f32 for sparkline")]
-            let pct = (v as f32 / 1_000_000.0).min(100.0);
-            segs.push(RightSegment { text: sparkline_char(pct).to_string(), color: colors.accent });
-        }
-        segs.push(RightSegment {
-            text: format!(" {}", format_bytes_rate(stats.net_up_bytes_sec)),
-            color: colors.text,
-        });
-        segs.push(RightSegment { text: String::from(" ↓"), color: colors.text });
-        for &v in &stats.net_down_history {
-            #[allow(clippy::cast_precision_loss, reason = "network rate fits in f32 for sparkline")]
-            let pct = (v as f32 / 1_000_000.0).min(100.0);
-            segs.push(RightSegment { text: sparkline_char(pct).to_string(), color: colors.accent });
-        }
-        segs.push(RightSegment {
-            text: format!(" {}", format_bytes_rate(stats.net_down_bytes_sec)),
-            color: colors.text,
-        });
-    }
-
-    if config.gpu {
-        if let Some(gpu_pct) = stats.gpu_percent {
-            push_sep(&mut segs, colors.separator);
-            segs.push(RightSegment { text: String::from("GPU "), color: colors.text });
-            for &v in &stats.gpu_history {
-                segs.push(RightSegment {
-                    text: sparkline_char(v).to_string(),
-                    color: usage_color(v, colors),
-                });
-            }
-            let val_str = format!(" {gpu_pct:.0}%");
-            segs.push(RightSegment { text: val_str, color: usage_color(gpu_pct, colors) });
-        }
     }
 
     segs

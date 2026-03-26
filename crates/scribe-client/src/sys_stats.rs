@@ -128,7 +128,7 @@ impl SystemStatsCollector {
         let gpu = read_gpu_percent();
         self.stats.gpu_percent = gpu;
         if let Some(g) = gpu {
-            push_capped(&mut self.stats.gpu_history, g, NET_HISTORY_CAP);
+            push_capped(&mut self.stats.gpu_history, g, CPU_HISTORY_CAP);
         }
     }
 }
