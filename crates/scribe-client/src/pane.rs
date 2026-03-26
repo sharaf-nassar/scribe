@@ -153,6 +153,11 @@ impl Pane {
         new_grid
     }
 
+    /// Return `true` when the running application has requested mouse events.
+    pub fn has_mouse_mode(&self) -> bool {
+        self.term.mode().contains(alacritty_terminal::term::TermMode::MOUSE_MODE)
+    }
+
     /// Return the pixel offset where terminal content starts (below tab bar).
     pub fn content_offset(&self, tab_bar_height: f32, padding: &ContentPadding) -> (f32, f32) {
         let eff = effective_padding(padding, self.edges);

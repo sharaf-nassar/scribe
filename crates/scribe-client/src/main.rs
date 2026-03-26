@@ -9,6 +9,7 @@ mod divider;
 mod input;
 mod ipc_client;
 mod layout;
+mod mouse_reporting;
 mod mouse_state;
 mod pane;
 mod scrollbar;
@@ -2628,6 +2629,7 @@ impl App {
         reason = "scroll delta is a small float value that fits in i32"
     )]
     fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
+        use alacritty_terminal::term::TermMode;
         let natural = self.config.terminal.natural_scroll;
         let raw_lines = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, y) => {
@@ -2661,6 +2663,34 @@ impl App {
             .pane_id_at_cursor()
             .or_else(|| self.window_layout.active_tab().map(|tab| tab.focused_pane));
         let Some(pane_id) = target else { return };
+
+        // Check focused-pane terminal modes before mutating.
+        let (mouse_mode, alt_screen, alt_scroll, sgr_mode) = {
+            let Some(pane) = self.panes.get(&pane_id) else { return };
+            (
+                pane.term.mode().contains(TermMode::MOUSE_MODE),
+                pane.term.mode().contains(TermMode::ALT_SCREEN),
+                pane.term.mode().contains(TermMode::ALTERNATE_SCROLL),
+                pane.term.mode().contains(TermMode::SGR_MOUSE),
+            )
+        };
+
+        // Priority 1: mouse mode — encode scroll as button 64/65 and send to PTY.
+        if mouse_mode {
+            self.send_scroll_to_pty(lines, sgr_mode);
+            return;
+        }
+
+        // Priority 2: alternate screen + alternate scroll — send arrow key sequences.
+        if alt_screen && alt_scroll {
+            let count = lines.unsigned_abs() as usize;
+            let seq: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+            let data: Vec<u8> = seq.iter().copied().cycle().take(seq.len() * count).collect();
+            self.send_bytes_to_focused_pane(data);
+            return;
+        }
+
+        // Priority 3: normal scrollback scroll.
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
         pane.scrollbar_state.on_scroll_action();
@@ -2778,15 +2808,92 @@ impl App {
                 self.divider_drag = None;
                 self.workspace_divider_drag = None;
                 self.end_scrollbar_drag();
-                self.handle_mouse_release();
+                if self.try_forward_mouse_release(MouseButton::Left) {
+                    // Mouse mode is active: send release to PTY but still
+                    // clear the selecting flag so selection drag ends cleanly.
+                    self.mouse_selecting = false;
+                } else {
+                    self.handle_mouse_release();
+                }
                 if had_ws_drag {
                     self.report_workspace_tree();
                 }
             }
-            (MouseButton::Middle, ElementState::Pressed) => self.perform_primary_paste(),
-            (MouseButton::Right, ElementState::Pressed) => self.open_context_menu(),
+            (MouseButton::Middle, ElementState::Pressed) => {
+                if !self.try_forward_mouse_press(MouseButton::Middle) {
+                    self.perform_primary_paste();
+                }
+            }
+            (MouseButton::Middle, ElementState::Released) => {
+                self.try_forward_mouse_release(MouseButton::Middle);
+            }
+            (MouseButton::Right, ElementState::Pressed) => {
+                if !self.try_forward_mouse_press(MouseButton::Right) {
+                    self.open_context_menu();
+                }
+            }
+            (MouseButton::Right, ElementState::Released) => {
+                self.try_forward_mouse_release(MouseButton::Right);
+            }
             _ => {}
         }
+    }
+
+    /// Try to send a mouse button press to the focused pane's PTY.
+    ///
+    /// Returns `true` and sends the event when the focused pane has mouse mode
+    /// enabled and Shift is not held. Returns `false` when the caller should
+    /// fall through to normal handling.
+    fn try_forward_mouse_press(&self, button: winit::event::MouseButton) -> bool {
+        let Some((x, y)) = self.last_cursor_pos else { return false };
+        let mouse_mode = self
+            .window_layout
+            .active_tab()
+            .and_then(|t| self.panes.get(&t.focused_pane))
+            .is_some_and(pane::Pane::has_mouse_mode);
+        if !mouse_mode || self.modifiers.shift_key() {
+            return false;
+        }
+        let Some((col, row)) = self.pixel_to_term_cell(x, y) else { return false };
+        let sgr = self
+            .window_layout
+            .active_tab()
+            .and_then(|t| self.panes.get(&t.focused_pane))
+            .is_some_and(|p| p.term.mode().contains(alacritty_terminal::term::TermMode::SGR_MOUSE));
+        let data = mouse_reporting::encode_mouse_press(button, col, row, self.modifiers, sgr);
+        if !data.is_empty() {
+            self.send_bytes_to_focused_pane(data);
+            return true;
+        }
+        false
+    }
+
+    /// Try to send a mouse button release to the focused pane's PTY.
+    ///
+    /// Returns `true` when the event was forwarded (mouse mode active, Shift
+    /// not held). Returns `false` when the caller should fall through.
+    fn try_forward_mouse_release(&self, button: winit::event::MouseButton) -> bool {
+        let Some((x, y)) = self.last_cursor_pos else { return false };
+        let mouse_mode = self
+            .window_layout
+            .active_tab()
+            .and_then(|t| self.panes.get(&t.focused_pane))
+            .is_some_and(pane::Pane::has_mouse_mode);
+        if !mouse_mode || self.modifiers.shift_key() {
+            return false;
+        }
+        let Some((col, row)) = self.pixel_to_term_cell(x, y) else { return false };
+        let sgr = self
+            .window_layout
+            .active_tab()
+            .and_then(|t| self.panes.get(&t.focused_pane))
+            .is_some_and(|p| p.term.mode().contains(alacritty_terminal::term::TermMode::SGR_MOUSE));
+        let data = mouse_reporting::encode_mouse_release(button, col, row, self.modifiers, sgr);
+        if !data.is_empty() {
+            self.send_bytes_to_focused_pane(data);
+            return true;
+        }
+        false
     }
 
     /// Handle left mouse button press, routing through context menu if open.
@@ -2918,6 +3025,12 @@ impl App {
 
         // Ctrl+click opens hovered URL in the system browser.
         if self.try_open_hovered_url() {
+            return;
+        }
+
+        // Forward left-button press to PTY when mouse mode is active.
+        // Shift bypass: held Shift falls through to normal selection.
+        if self.try_forward_mouse_press(winit::event::MouseButton::Left) {
             return;
         }
 
@@ -3192,6 +3305,9 @@ impl App {
             self.request_redraw();
         }
 
+        // Forward motion events to PTY when mouse motion reporting is active.
+        self.maybe_forward_mouse_motion(x, y);
+
         // No drag active — update cursor icon based on divider hover.
         self.update_hover_cursor(x, y);
 
@@ -3199,6 +3315,34 @@ impl App {
         if !self.mouse_selecting && self.refresh_hovered_url() {
             self.request_redraw();
         }
+    }
+
+    /// Forward a mouse motion event to the focused pane's PTY when the
+    /// terminal has enabled motion reporting.
+    ///
+    /// Sends when:
+    /// - `MOUSE_MOTION` (mode 1003) is set — all pointer movement is reported.
+    /// - `MOUSE_DRAG` (mode 1002) is set and a button is held (`mouse_selecting`).
+    fn maybe_forward_mouse_motion(&self, x: f32, y: f32) {
+        use alacritty_terminal::term::TermMode;
+        let params = {
+            let Some(tab) = self.window_layout.active_tab() else { return };
+            let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
+            let mode = pane.term.mode();
+            let all_motion = mode.contains(TermMode::MOUSE_MOTION);
+            let drag_motion = mode.contains(TermMode::MOUSE_DRAG) && self.mouse_selecting;
+            if !all_motion && !drag_motion {
+                return;
+            }
+            let sgr = mode.contains(TermMode::SGR_MOUSE);
+            let button_held =
+                if self.mouse_selecting { Some(winit::event::MouseButton::Left) } else { None };
+            (sgr, button_held)
+        };
+        let (sgr, button_held) = params;
+        let Some((col, row)) = self.pixel_to_term_cell(x, y) else { return };
+        let data = mouse_reporting::encode_mouse_motion(col, row, button_held, self.modifiers, sgr);
+        self.send_bytes_to_focused_pane(data);
     }
 
     /// Set the window cursor icon based on whether the pointer is hovering over
@@ -3766,6 +3910,61 @@ impl App {
         let pane_rects = tab.pane_layout.compute_rects(ws_rect);
         let (_, rect, _) = pane_rects.iter().find(|(pid, _, _)| *pid == tab.focused_pane)?;
         Some(*rect)
+    }
+
+    // -----------------------------------------------------------------------
+    // Mouse reporting helpers
+    // -----------------------------------------------------------------------
+
+    /// Encode a scroll event as a mouse button sequence and send it to the
+    /// focused pane's PTY.
+    ///
+    /// `lines` > 0 means scroll up (button 64), < 0 means scroll down (65).
+    fn send_scroll_to_pty(&self, lines: i32, sgr_mode: bool) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        let Some((col, row)) = self.pixel_to_term_cell(x, y) else { return };
+        let data =
+            mouse_reporting::encode_mouse_scroll(lines > 0, col, row, self.modifiers, sgr_mode);
+        self.send_bytes_to_focused_pane(data);
+    }
+
+    /// Convert pixel `(x, y)` to a 0-indexed `(col, row)` within the focused
+    /// pane's terminal viewport.
+    ///
+    /// Returns `None` when no GPU context is available, the cursor is outside
+    /// the content area, or cell dimensions are zero.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "pixel / cell_size yields a small positive value fitting in u16"
+    )]
+    fn pixel_to_term_cell(&self, x: f32, y: f32) -> Option<(u16, u16)> {
+        let gpu = self.gpu.as_ref()?;
+        let cell = gpu.renderer.cell_size();
+        if cell.width <= 0.0 || cell.height <= 0.0 {
+            return None;
+        }
+        let tab_bar_h = self.focused_workspace_tab_bar_height();
+        let tab = self.window_layout.active_tab()?;
+        let pane = self.panes.get(&tab.focused_pane)?;
+        let padding = pane::effective_padding(&self.config.appearance.content_padding, pane.edges);
+        let (content_x, content_y) = pane.content_offset(tab_bar_h, &padding);
+        let rel_x = x - content_x;
+        let rel_y = y - content_y;
+        if rel_x < 0.0 || rel_y < 0.0 {
+            return None;
+        }
+        let col = ((rel_x / cell.width) as u16).min(pane.grid.cols.saturating_sub(1));
+        let row = ((rel_y / cell.height) as u16).min(pane.grid.rows.saturating_sub(1));
+        Some((col, row))
+    }
+
+    /// Send raw bytes to the focused pane's PTY session.
+    fn send_bytes_to_focused_pane(&self, data: Vec<u8>) {
+        let Some(tx) = self.cmd_tx.clone() else { return };
+        let Some(tab) = self.window_layout.active_tab() else { return };
+        let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
+        send_command(&tx, ClientCommand::KeyInput { session_id: pane.session_id, data });
     }
 }
 
