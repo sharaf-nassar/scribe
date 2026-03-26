@@ -815,7 +815,7 @@ function renderBadges(cell, action, combos) {
   }
 
   // Re-apply search highlighting if a search query is active.
-  var searchInput = document.getElementById("kb-search");
+  var searchInput = document.getElementById("global-search");
   var query = searchInput ? searchInput.value.trim().toLowerCase() : "";
   if (query) {
     var badges = cell.querySelectorAll(".keybinding-key");
@@ -1142,20 +1142,10 @@ function initKeybindingRecorder() {
   }, true);
 }
 
-// ─────────── Keybinding Search ───────────
-
-function initKeybindingSearch() {
-  var input = document.getElementById("kb-search");
-  if (!input) { return; }
-
-  input.addEventListener("input", function() {
-    var query = input.value.trim().toLowerCase();
-    filterKeybindingRows(query);
-  });
-}
+// ─────────── Search ───────────
 
 function clearHighlights(container) {
-  var marks = container.querySelectorAll(".kb-highlight");
+  var marks = container.querySelectorAll(".search-highlight");
   for (var i = 0; i < marks.length; i++) {
     var mark = marks[i];
     var parent = mark.parentNode;
@@ -1173,7 +1163,7 @@ function highlightText(el, query) {
 
   var before = document.createTextNode(text.slice(0, idx));
   var mark = document.createElement("span");
-  mark.className = "kb-highlight";
+  mark.className = "search-highlight";
   mark.textContent = text.slice(idx, idx + query.length);
   var after = document.createTextNode(text.slice(idx + query.length));
 
@@ -1183,51 +1173,164 @@ function highlightText(el, query) {
   el.appendChild(after);
 }
 
-function filterKeybindingRows(query) {
-  var page = document.getElementById("page-keybindings");
-  if (page) { clearHighlights(page); }
+// ─────────── Global Search ───────────
 
-  var groups = document.querySelectorAll("#page-keybindings .section-group");
-  groups.forEach(function(group) {
-    var sectionLabel = group.querySelector(".section-label");
-    var sectionText = sectionLabel ? sectionLabel.textContent.toLowerCase() : "";
-    var sectionMatches = query && sectionText.indexOf(query) !== -1;
-    var rows = group.querySelectorAll(".setting-row");
-    var anyVisible = false;
+var activeTabBeforeSearch = null;
 
-    if (sectionMatches) {
-      // Section header matches — show all rows in this section.
-      rows.forEach(function(row) { row.style.display = ""; });
-      anyVisible = true;
-      if (query && sectionLabel) { highlightText(sectionLabel, query); }
-    } else {
-      rows.forEach(function(row) {
-        var labelEl = row.querySelector(".setting-label");
-        var keyEls = row.querySelectorAll(".keybinding-key");
-        var label = labelEl ? labelEl.textContent : "";
-        var keyText = "";
-        for (var k = 0; k < keyEls.length; k++) {
-          keyText += " " + keyEls[k].textContent;
-        }
-        var matches = !query ||
-          label.toLowerCase().indexOf(query) !== -1 ||
-          keyText.toLowerCase().indexOf(query) !== -1;
+function initGlobalSearch() {
+  var input = document.getElementById("global-search");
+  if (!input) { return; }
 
-        row.style.display = matches ? "" : "none";
-        if (matches && query) {
-          highlightText(labelEl, query);
-          for (var k2 = 0; k2 < keyEls.length; k2++) {
-            highlightText(keyEls[k2], query);
-          }
-          anyVisible = true;
-        } else if (matches) {
-          anyVisible = true;
-        }
-      });
-    }
-
-    group.style.display = anyVisible ? "" : "none";
+  input.addEventListener("input", function() {
+    var query = input.value.trim().toLowerCase();
+    filterAllSettings(query);
   });
+}
+
+function filterAllSettings(query) {
+  var pages = document.querySelectorAll(".content-page");
+  var navItems = document.querySelectorAll(".nav-item");
+
+  // Clear all highlights across all pages.
+  pages.forEach(function(page) { clearHighlights(page); });
+
+  if (!query) {
+    // Restore the page that was active before search began.
+    pages.forEach(function(page) { page.style.display = ""; });
+    navItems.forEach(function(n) { n.classList.remove("active"); });
+
+    var restoreTab = activeTabBeforeSearch || (navItems.length > 0 ? navItems[0].getAttribute("data-tab") : null);
+    activeTabBeforeSearch = null;
+
+    pages.forEach(function(page) {
+      if (page.id === "page-" + restoreTab) {
+        page.classList.add("active");
+      } else {
+        page.classList.remove("active");
+      }
+    });
+    navItems.forEach(function(n) {
+      if (n.getAttribute("data-tab") === restoreTab) {
+        n.classList.add("active");
+      }
+    });
+
+    // Restore all section-groups and setting-rows.
+    document.querySelectorAll(".section-group").forEach(function(g) { g.style.display = ""; });
+    document.querySelectorAll(".setting-row").forEach(function(r) { r.style.display = ""; });
+    return;
+  }
+
+  // Save the currently active tab before entering search mode.
+  if (activeTabBeforeSearch === null) {
+    var activeNav = document.querySelector(".nav-item.active");
+    activeTabBeforeSearch = activeNav ? activeNav.getAttribute("data-tab") : null;
+  }
+
+  var firstMatchingTab = null;
+
+  pages.forEach(function(page) {
+    var pageHasMatch = false;
+    var groups = page.querySelectorAll(".section-group");
+
+    groups.forEach(function(group) {
+      var sectionLabel = group.querySelector(".section-label");
+      var sectionText = sectionLabel ? sectionLabel.textContent.toLowerCase() : "";
+      var sectionMatches = sectionText.indexOf(query) !== -1;
+      var rows = group.querySelectorAll(".setting-row");
+      var anyRowVisible = false;
+
+      if (sectionMatches) {
+        // Whole section matches — show all rows.
+        rows.forEach(function(row) { row.style.display = ""; });
+        anyRowVisible = true;
+        if (sectionLabel) { highlightText(sectionLabel, query); }
+      } else {
+        rows.forEach(function(row) {
+          var labelEl = row.querySelector(".setting-label");
+          var descEl = row.querySelector(".setting-desc");
+          var keyEls = row.querySelectorAll(".keybinding-key");
+          var themeNameEl = row.querySelector(".theme-name span");
+          var workspacePathEl = row.querySelector(".workspace-path");
+          var colorSwatchLabelEls = row.querySelectorAll(".color-swatch-label");
+
+          var labelText = labelEl ? labelEl.textContent.toLowerCase() : "";
+          var descText = descEl ? descEl.textContent.toLowerCase() : "";
+          var themeText = themeNameEl ? themeNameEl.textContent.toLowerCase() : "";
+          var workspaceText = workspacePathEl ? workspacePathEl.textContent.toLowerCase() : "";
+          var keyText = "";
+          for (var k = 0; k < keyEls.length; k++) {
+            keyText += " " + keyEls[k].textContent.toLowerCase();
+          }
+          var swatchText = "";
+          for (var s = 0; s < colorSwatchLabelEls.length; s++) {
+            swatchText += " " + colorSwatchLabelEls[s].textContent.toLowerCase();
+          }
+
+          var matches =
+            labelText.indexOf(query) !== -1 ||
+            descText.indexOf(query) !== -1 ||
+            keyText.indexOf(query) !== -1 ||
+            themeText.indexOf(query) !== -1 ||
+            workspaceText.indexOf(query) !== -1 ||
+            swatchText.indexOf(query) !== -1;
+
+          row.style.display = matches ? "" : "none";
+
+          if (matches) {
+            anyRowVisible = true;
+            if (labelEl) { highlightText(labelEl, query); }
+            if (descEl) { highlightText(descEl, query); }
+            if (themeNameEl) { highlightText(themeNameEl, query); }
+            if (workspacePathEl) { highlightText(workspacePathEl, query); }
+            for (var k2 = 0; k2 < keyEls.length; k2++) { highlightText(keyEls[k2], query); }
+            for (var s2 = 0; s2 < colorSwatchLabelEls.length; s2++) { highlightText(colorSwatchLabelEls[s2], query); }
+          }
+        });
+
+        // Also check theme cards outside setting-rows (theme page preset grid).
+        if (!anyRowVisible) {
+          var themeCards = group.querySelectorAll(".theme-card");
+          var anyCardVisible = false;
+          themeCards.forEach(function(card) {
+            var nameEl = card.querySelector(".theme-name span");
+            if (nameEl && nameEl.textContent.toLowerCase().indexOf(query) !== -1) {
+              anyCardVisible = true;
+            }
+          });
+          if (anyCardVisible) { anyRowVisible = true; }
+        }
+      }
+
+      group.style.display = anyRowVisible ? "" : "none";
+      if (anyRowVisible) { pageHasMatch = true; }
+    });
+
+    // Show/hide the page based on whether it has matches.
+    if (pageHasMatch) {
+      page.style.display = "";
+      if (!firstMatchingTab) {
+        var tabId = page.id.replace("page-", "");
+        firstMatchingTab = tabId;
+      }
+    } else {
+      page.style.display = "none";
+    }
+  });
+
+  // Update sidebar to show the first matching page as active.
+  navItems.forEach(function(n) { n.classList.remove("active"); });
+  pages.forEach(function(p) { p.classList.remove("active"); });
+
+  if (firstMatchingTab) {
+    navItems.forEach(function(n) {
+      if (n.getAttribute("data-tab") === firstMatchingTab) {
+        n.classList.add("active");
+      }
+    });
+    var firstPage = document.getElementById("page-" + firstMatchingTab);
+    if (firstPage) { firstPage.classList.add("active"); }
+  }
 }
 
 // ─────────── Init ───────────
@@ -1244,7 +1347,7 @@ document.addEventListener("DOMContentLoaded", function() {
   initCommunityThemes();
   initColorSwatches();
   initWorkspaces();
-  initKeybindingSearch();
+  initGlobalSearch();
   initKeybindingRecorder();
 
   // Font refresh button.

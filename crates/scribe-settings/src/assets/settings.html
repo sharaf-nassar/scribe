@@ -11,6 +11,13 @@
   <!-- ───────── Sidebar ───────── -->
   <div class="sidebar">
     <div class="sidebar-title">Settings</div>
+    <div class="global-search-wrapper">
+      <svg class="global-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="8"/>
+        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+      <input type="text" id="global-search" class="global-search-input" placeholder="Search settings...">
+    </div>
     <div class="sidebar-section">
       <div class="nav-item active" data-tab="appearance">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -522,10 +529,6 @@
     <div id="page-keybindings" class="content-page">
       <div class="page-title">Keybindings</div>
       <div class="page-subtitle">Click a shortcut to reassign it</div>
-
-      <div class="kb-search-row">
-        <input type="text" id="kb-search" class="kb-search-input" placeholder="Search keybindings...">
-      </div>
 
       <div id="kb-conflict-banner" class="kb-conflict-banner" style="display:none;"></div>
 
