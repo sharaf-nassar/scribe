@@ -69,11 +69,17 @@ impl SelectionRange {
     }
 }
 
-/// Convert pixel coordinates to a grid position within a pane's content area.
+/// Convert pixel coordinates to an absolute grid position within a pane.
 ///
 /// The content area excludes the tab bar at the top and the status bar at the
 /// bottom.  Returns `None` when the pixel position falls outside the content
 /// area.
+///
+/// The returned `row` is an **absolute grid line** (matching
+/// `alacritty_terminal`'s `Line` index): 0 is the top of the current
+/// viewport, negative values point into scrollback history.  The
+/// `display_offset` parameter is subtracted from the screen row so that
+/// the selection tracks content rather than screen position.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -81,7 +87,7 @@ impl SelectionRange {
 )]
 #[allow(
     clippy::too_many_arguments,
-    reason = "coordinate conversion needs pane geometry, cell size, and tab bar height"
+    reason = "coordinate conversion needs pane geometry, cell size, tab bar height, and scroll offset"
 )]
 pub fn pixel_to_grid(
     x: f32,
@@ -90,6 +96,7 @@ pub fn pixel_to_grid(
     cell_w: f32,
     cell_h: f32,
     tab_bar_height: f32,
+    display_offset: usize,
 ) -> Option<SelectionPoint> {
     let content_x = pane_rect.x;
     let content_y = pane_rect.y + tab_bar_height;
@@ -115,27 +122,36 @@ pub fn pixel_to_grid(
     let max_col = (content_w / cell_w) as usize;
     let max_row = (content_h / cell_h) as i32;
     let col = ((rel_x / cell_w) as usize).min(max_col.saturating_sub(1));
-    let row = ((rel_y / cell_h) as i32).min(max_row.saturating_sub(1));
+    let screen_row = ((rel_y / cell_h) as i32).min(max_row.saturating_sub(1));
+
+    // Convert screen row to absolute grid line: subtract display_offset so
+    // that scrollback lines get negative indices matching alacritty_terminal.
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "display_offset is bounded by scrollback_lines (≤ 100_000), fits in i32"
+    )]
+    let row = screen_row - display_offset as i32;
 
     Some(SelectionPoint { row, col })
 }
 
 /// Extract the selected text from the terminal grid.
 ///
+/// Selection rows are **absolute grid lines** (0 = viewport top, negative =
+/// scrollback), matching the `Line` index used by `alacritty_terminal`.
 /// Walks rows from the normalised start to the normalised end, collecting
 /// cell characters.  Trailing spaces on each row are trimmed, and rows are
 /// joined with `'\n'`.
 pub fn extract_text(term: &Term<VoidListener>, range: &SelectionRange) -> String {
     let (lo, hi) = range.normalized();
 
-    let screen_lines = term.grid().screen_lines();
     let cols = term.grid().columns();
 
     let mut lines: Vec<String> = Vec::new();
 
     let mut row = lo.row;
     while row <= hi.row {
-        let line_obj = Line(row_to_alacritty_line(row, screen_lines));
+        let line_obj = Line(row);
 
         let col_start = if row == lo.row { lo.col } else { 0 };
         let col_end = if row == hi.row { hi.col } else { cols.saturating_sub(1) };
@@ -156,14 +172,6 @@ pub fn extract_text(term: &Term<VoidListener>, range: &SelectionRange) -> String
     }
 
     lines.join("\n")
-}
-
-/// Map a zero-based row index to the `alacritty_terminal` `Line` inner value.
-///
-/// `alacritty_terminal` uses 0 for the top visible line and positive values
-/// going down, which matches our zero-based row directly.
-const fn row_to_alacritty_line(row: i32, _screen_lines: usize) -> i32 {
-    row
 }
 
 /// Read a single cell character from the terminal grid.

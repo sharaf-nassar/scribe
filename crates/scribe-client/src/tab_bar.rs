@@ -135,6 +135,8 @@ pub struct WorkspaceTabBarData {
     pub tabs: Vec<TabData>,
     /// Workspace badge: `(workspace_name, accent_color)`. `None` when single workspace.
     pub badge: Option<(String, [f32; 4])>,
+    /// Whether the active tab in this workspace has multiple panes.
+    pub has_multiple_panes: bool,
 }
 
 /// Parameters for building tab bar text instances.
@@ -147,6 +149,8 @@ pub struct TabBarTextParams<'a> {
     pub badge: Option<(&'a str, [f32; 4])>,
     /// Whether to render the gear icon on the far right.
     pub show_gear: bool,
+    /// Whether to render the equalize icon left of the gear.
+    pub show_equalize: bool,
     pub colors: &'a TabBarColors,
     /// Closure that resolves a character to atlas UV coordinates.
     /// Returns `(uv_min, uv_max)`. `FnMut` because atlas rasterization
@@ -164,6 +168,8 @@ pub struct TabBarHitTargets {
     pub tab_rects: Vec<(usize, Rect)>,
     /// Clickable rect for the gear icon, if rendered.
     pub gear_rect: Option<Rect>,
+    /// Clickable rect for the equalize icon, if rendered.
+    pub equalize_rect: Option<Rect>,
 }
 
 /// Build cell instances for the tab bar text overlay.
@@ -174,17 +180,23 @@ pub fn build_tab_bar_text(
 ) -> (Vec<CellInstance>, TabBarHitTargets) {
     let (cell_w, _cell_h) = params.cell_size;
     if cell_w <= 0.0 {
-        return (Vec::new(), TabBarHitTargets { tab_rects: Vec::new(), gear_rect: None });
+        return (
+            Vec::new(),
+            TabBarHitTargets { tab_rects: Vec::new(), gear_rect: None, equalize_rect: None },
+        );
     }
 
     let max_cols = columns_in_width(params.rect.width, cell_w);
     let mut instances = Vec::new();
     let mut col: usize = 0;
-    let mut hit_targets = TabBarHitTargets { tab_rects: Vec::new(), gear_rect: None };
+    let mut hit_targets =
+        TabBarHitTargets { tab_rects: Vec::new(), gear_rect: None, equalize_rect: None };
 
     // Reserve columns for the gear icon on the far right (2 cols: space + gear).
     let gear_cols: usize = if params.show_gear { 2 } else { 0 };
-    let content_cols = max_cols.saturating_sub(gear_cols);
+    // Reserve columns for the equalize icon left of gear (2 cols: space + icon).
+    let equalize_cols: usize = if params.show_equalize { 2 } else { 0 };
+    let content_cols = max_cols.saturating_sub(gear_cols).saturating_sub(equalize_cols);
 
     // Render workspace badge if present.
     if let Some((ws_name, accent_color)) = params.badge {
@@ -194,6 +206,11 @@ pub fn build_tab_bar_text(
 
     // Render tab labels (and indicator bars for tabs with active AI state).
     col = render_tabs(&mut instances, &mut hit_targets, col, content_cols, cell_w, params);
+
+    // Render equalize icon left of gear if requested.
+    if params.show_equalize {
+        col = render_equalize(&mut instances, &mut hit_targets, col, max_cols, gear_cols, params);
+    }
 
     // Render gear icon on the far right if requested.
     if params.show_gear {
@@ -373,6 +390,56 @@ fn render_gear(
             height: params.tab_bar_height,
         });
     }
+}
+
+/// Render the equalize icon (⊞) just left of the gear icon's reserved space.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "helper function that needs all render context from build_tab_bar_text"
+)]
+fn render_equalize(
+    instances: &mut Vec<CellInstance>,
+    hit_targets: &mut TabBarHitTargets,
+    mut col: usize,
+    max_cols: usize,
+    gear_cols: usize,
+    params: &mut TabBarTextParams<'_>,
+) -> usize {
+    // Need at least 2 cols for equalize + gear reserved space.
+    if max_cols < 2 {
+        return col;
+    }
+
+    let bg = params.colors.bg;
+
+    // Equalize icon sits at the rightmost column before the gear's reserved space.
+    let equalize_col = max_cols.saturating_sub(gear_cols).saturating_sub(1);
+
+    // Fill gap between last tab and equalize icon with background.
+    while col < equalize_col {
+        col = emit_char(instances, ' ', col, max_cols, params, params.colors.text, bg);
+    }
+
+    let equalize_start_col = col;
+    col = emit_char(instances, '\u{229E}', col, max_cols, params, params.colors.text, bg);
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "column index is a small positive integer fitting in f32"
+    )]
+    {
+        let (cell_w, _) = params.cell_size;
+        let equalize_x = params.rect.x + equalize_start_col as f32 * cell_w;
+        let equalize_width = (col - equalize_start_col) as f32 * cell_w;
+        hit_targets.equalize_rect = Some(Rect {
+            x: equalize_x,
+            y: params.rect.y,
+            width: equalize_width,
+            height: params.tab_bar_height,
+        });
+    }
+
+    col
 }
 
 /// Emit a single character instance at the given column, returning the next

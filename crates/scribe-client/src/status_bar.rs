@@ -17,6 +17,8 @@ pub const STATUS_BAR_HEIGHT: f32 = 24.0;
 
 /// Clickable regions produced by [`build_status_bar`].
 pub struct StatusBarHitTargets {
+    /// Clickable rect for the equalize icon.
+    pub equalize_rect: Option<Rect>,
     /// Clickable rect for the settings gear icon.
     pub gear_rect: Option<Rect>,
 }
@@ -24,6 +26,8 @@ pub struct StatusBarHitTargets {
 /// Data needed to render the window-level status bar.
 pub struct StatusBarData<'a> {
     pub connected: bool,
+    /// Show the equalize button (only when multiple workspaces exist).
+    pub show_equalize: bool,
     /// Name of the focused workspace (shown when multiple workspaces exist).
     pub workspace_name: Option<&'a str>,
     /// CWD of the focused pane, displayed as a shortened path.
@@ -92,7 +96,7 @@ pub fn build_status_bar(
 ) -> StatusBarHitTargets {
     let (cell_w, _cell_h) = cell_size;
     if cell_w <= 0.0 {
-        return StatusBarHitTargets { gear_rect: None };
+        return StatusBarHitTargets { equalize_rect: None, gear_rect: None };
     }
 
     let bar_y = window_rect.y + window_rect.height - STATUS_BAR_HEIGHT;
@@ -104,9 +108,9 @@ pub fn build_status_bar(
     let col = render_left_side(&mut w, colors, data, resolve_glyph);
     w.col = col;
 
-    let gear_rect = render_right_side(&mut w, colors, data, resolve_glyph);
+    let (equalize_rect, gear_rect) = render_right_side(&mut w, colors, data, resolve_glyph);
 
-    StatusBarHitTargets { gear_rect }
+    StatusBarHitTargets { equalize_rect, gear_rect }
 }
 
 /// Mutable writer state for emitting status bar characters.
@@ -201,20 +205,22 @@ fn render_left_side(
     w.col
 }
 
-/// Render the right side: git branch | session count | hostname | time | gear.
+/// Render the right side: git branch | session count | hostname | time | equalize | gear.
 ///
-/// Returns the clickable rect for the gear icon, if rendered.
+/// Returns `(equalize_rect, gear_rect)` — clickable rects for the equalize and gear icons.
 fn render_right_side(
     w: &mut BarWriter<'_>,
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) -> Option<Rect> {
+) -> (Option<Rect>, Option<Rect>) {
     // +3 for the gear segment: " ⚙ " (space, gear, space)
     let gear_cols: usize = 3;
+    // +2 for the equalize segment: " ⊞" (space, icon) — gear provides the trailing space
+    let equalize_cols: usize = if data.show_equalize { 2 } else { 0 };
     let segments = build_right_segments(data, colors);
     let right_cols: usize =
-        segments.iter().map(|s| s.text.chars().count()).sum::<usize>() + gear_cols;
+        segments.iter().map(|s| s.text.chars().count()).sum::<usize>() + equalize_cols + gear_cols;
     let right_start = w.max_cols.saturating_sub(right_cols + 1);
 
     w.pad_to(right_start, colors.text, colors.bg, resolve_glyph);
@@ -223,12 +229,37 @@ fn render_right_side(
         w.put_str(&seg.text, seg.color, colors.bg, resolve_glyph);
     }
 
+    // Equalize icon: " ⊞" left of the gear, only when multiple workspaces exist.
+    let equalize_rect = render_equalize(w, colors, data, resolve_glyph);
+
     // Gear icon: " ⚙ " at the far right.
     let gear_rect = render_gear(w, colors, resolve_glyph);
 
     w.pad_to(w.max_cols, colors.text, colors.bg, resolve_glyph);
 
-    gear_rect
+    (equalize_rect, gear_rect)
+}
+
+/// Render the equalize icon and return its clickable rect, or `None` when hidden.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "column index is a small positive integer fitting in f32"
+)]
+fn render_equalize(
+    w: &mut BarWriter<'_>,
+    colors: &StatusBarColors,
+    data: &StatusBarData<'_>,
+    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+) -> Option<Rect> {
+    if !data.show_equalize || w.col >= w.max_cols {
+        return None;
+    }
+    w.put(' ', colors.text, colors.bg, resolve_glyph);
+    let eq_col = w.col;
+    w.put('\u{229E}', colors.text, colors.bg, resolve_glyph);
+    let eq_x = w.x_origin + eq_col as f32 * w.cell_w;
+    let eq_width = (w.col - eq_col) as f32 * w.cell_w;
+    Some(Rect { x: eq_x, y: w.y, width: eq_width, height: STATUS_BAR_HEIGHT })
 }
 
 /// Render the gear icon and return its clickable rect.

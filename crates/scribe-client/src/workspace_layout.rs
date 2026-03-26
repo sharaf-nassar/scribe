@@ -681,6 +681,213 @@ fn update_tab_session_in(node: &mut WindowNode, old_id: SessionId, new_id: Sessi
 }
 
 // ---------------------------------------------------------------------------
+// Workspace divider support
+// ---------------------------------------------------------------------------
+
+/// Divider line thickness in pixels (matches pane divider).
+#[allow(dead_code, reason = "used by workspace divider rendering pipeline")]
+const WORKSPACE_DIVIDER_THICKNESS: f32 = 1.0;
+
+/// Hit-test tolerance: mouse within this many pixels counts as on the divider.
+#[allow(dead_code, reason = "used by workspace divider hit-test pipeline")]
+const WORKSPACE_HIT_TOLERANCE: f32 = 4.0;
+
+/// A divider between two workspace regions, positioned in pixel coordinates.
+#[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
+pub struct WorkspaceDivider {
+    /// Pixel rect of the divider line.
+    pub rect: Rect,
+    /// The direction of the split that created this divider.
+    pub direction: SplitDirection,
+    /// First workspace leaf ID in the first subtree.
+    pub first_workspace: WorkspaceId,
+    /// First workspace leaf ID in the second subtree.
+    pub second_workspace: WorkspaceId,
+}
+
+/// State for an in-progress workspace divider drag.
+#[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
+#[derive(Clone, Copy)]
+pub struct WorkspaceDividerDrag {
+    /// First workspace adjacent to the divider being dragged.
+    pub first_workspace: WorkspaceId,
+    /// The direction of the split.
+    pub direction: SplitDirection,
+    /// The total extent (width or height) of the parent area.
+    pub parent_extent: f32,
+    /// Pixel position of the parent area origin (x or y).
+    pub parent_origin: f32,
+}
+
+/// Hit-test: check if a mouse position hits any workspace divider.
+///
+/// Returns a reference to the matching `WorkspaceDivider` if found.
+#[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
+pub fn hit_test_workspace_divider(
+    dividers: &[WorkspaceDivider],
+    mouse_x: f32,
+    mouse_y: f32,
+) -> Option<&WorkspaceDivider> {
+    dividers.iter().find(|d| is_within_workspace_divider(d, mouse_x, mouse_y))
+}
+
+/// Create a `WorkspaceDividerDrag` from a workspace divider and its parent viewport.
+#[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
+pub fn start_workspace_drag(divider: &WorkspaceDivider, viewport: Rect) -> WorkspaceDividerDrag {
+    let (parent_extent, parent_origin) = match divider.direction {
+        SplitDirection::Horizontal => (viewport.width, viewport.x),
+        SplitDirection::Vertical => (viewport.height, viewport.y),
+    };
+    WorkspaceDividerDrag {
+        first_workspace: divider.first_workspace,
+        direction: divider.direction,
+        parent_extent,
+        parent_origin,
+    }
+}
+
+/// Compute a new split ratio from a workspace drag position.
+///
+/// `mouse_pos` is the x or y coordinate depending on direction.
+#[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
+pub fn workspace_drag_ratio(drag: &WorkspaceDividerDrag, mouse_pos: f32) -> f32 {
+    if drag.parent_extent <= 0.0 {
+        return 0.5;
+    }
+    let relative = mouse_pos - drag.parent_origin;
+    (relative / drag.parent_extent).clamp(0.1, 0.9)
+}
+
+impl WindowLayout {
+    /// Collect all workspace divider rects given the full viewport.
+    #[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
+    pub fn collect_workspace_dividers(&self, viewport: Rect) -> Vec<WorkspaceDivider> {
+        let mut out = Vec::new();
+        collect_workspace_dividers_inner(&self.root, viewport, &mut out);
+        out
+    }
+
+    /// Find the split node whose direct child is the workspace with the given ID
+    /// and update its ratio to `new_ratio`, clamped to [0.1, 0.9].
+    ///
+    /// Returns `true` if the workspace was found and the ratio updated.
+    #[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
+    pub fn set_workspace_ratio(&mut self, workspace_id: WorkspaceId, new_ratio: f32) -> bool {
+        set_workspace_ratio_in(&mut self.root, workspace_id, new_ratio)
+    }
+
+    /// Set every split node's ratio to 0.5 recursively.
+    #[allow(dead_code, reason = "public API for workspace equalize interaction")]
+    pub fn equalize_all_workspace_ratios(&mut self) {
+        equalize_workspace_node(&mut self.root);
+    }
+}
+
+/// Recursively collect workspace dividers from the window node tree.
+#[allow(dead_code, reason = "called by collect_workspace_dividers public API")]
+fn collect_workspace_dividers_inner(
+    node: &WindowNode,
+    rect: Rect,
+    out: &mut Vec<WorkspaceDivider>,
+) {
+    let WindowNode::Split { direction, ratio, first, second } = node else {
+        return;
+    };
+
+    let (r1, r2) = split_rect(rect, *direction, *ratio);
+
+    let divider_rect = workspace_divider_rect_between(&r1, *direction);
+    let first_workspace = first_leaf_workspace_of(first);
+    let second_workspace = first_leaf_workspace_of(second);
+
+    out.push(WorkspaceDivider {
+        rect: divider_rect,
+        direction: *direction,
+        first_workspace,
+        second_workspace,
+    });
+
+    collect_workspace_dividers_inner(first, r1, out);
+    collect_workspace_dividers_inner(second, r2, out);
+}
+
+/// Compute the first leaf workspace ID in a subtree (depth-first).
+#[allow(dead_code, reason = "called by collect_workspace_dividers_inner")]
+fn first_leaf_workspace_of(node: &WindowNode) -> WorkspaceId {
+    match node {
+        WindowNode::Workspace(slot) => slot.workspace_id,
+        WindowNode::Split { first, .. } => first_leaf_workspace_of(first),
+    }
+}
+
+/// Compute the pixel rect of a workspace divider between two adjacent rects.
+#[allow(dead_code, reason = "called by collect_workspace_dividers_inner")]
+fn workspace_divider_rect_between(r1: &Rect, direction: SplitDirection) -> Rect {
+    let half = WORKSPACE_DIVIDER_THICKNESS / 2.0;
+    match direction {
+        SplitDirection::Horizontal => {
+            let x = r1.x + r1.width - half;
+            Rect { x, y: r1.y, width: WORKSPACE_DIVIDER_THICKNESS, height: r1.height }
+        }
+        SplitDirection::Vertical => {
+            let y = r1.y + r1.height - half;
+            Rect { x: r1.x, y, width: r1.width, height: WORKSPACE_DIVIDER_THICKNESS }
+        }
+    }
+}
+
+/// Check if a mouse position is within hit-test tolerance of a workspace divider.
+#[allow(dead_code, reason = "called by hit_test_workspace_divider public API")]
+fn is_within_workspace_divider(divider: &WorkspaceDivider, mouse_x: f32, mouse_y: f32) -> bool {
+    let r = &divider.rect;
+    let expanded = Rect {
+        x: r.x - WORKSPACE_HIT_TOLERANCE,
+        y: r.y - WORKSPACE_HIT_TOLERANCE,
+        width: r.width + WORKSPACE_HIT_TOLERANCE * 2.0,
+        height: r.height + WORKSPACE_HIT_TOLERANCE * 2.0,
+    };
+    mouse_x >= expanded.x
+        && mouse_x <= expanded.x + expanded.width
+        && mouse_y >= expanded.y
+        && mouse_y <= expanded.y + expanded.height
+}
+
+/// Find the split whose direct child is the given workspace and update its ratio.
+#[allow(dead_code, reason = "called by set_workspace_ratio public API")]
+fn set_workspace_ratio_in(
+    node: &mut WindowNode,
+    workspace_id: WorkspaceId,
+    new_ratio: f32,
+) -> bool {
+    let WindowNode::Split { ratio, first, second, .. } = node else {
+        return false;
+    };
+
+    let first_match =
+        matches!(first.as_ref(), WindowNode::Workspace(s) if s.workspace_id == workspace_id);
+    let second_match =
+        matches!(second.as_ref(), WindowNode::Workspace(s) if s.workspace_id == workspace_id);
+
+    if first_match || second_match {
+        *ratio = new_ratio.clamp(0.1, 0.9);
+        return true;
+    }
+
+    set_workspace_ratio_in(first, workspace_id, new_ratio)
+        || set_workspace_ratio_in(second, workspace_id, new_ratio)
+}
+
+/// Recursively set every split ratio to 0.5.
+#[allow(dead_code, reason = "called by equalize_all_workspace_ratios public API")]
+fn equalize_workspace_node(node: &mut WindowNode) {
+    if let WindowNode::Split { ratio, first, second, .. } = node {
+        *ratio = 0.5;
+        equalize_workspace_node(first);
+        equalize_workspace_node(second);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

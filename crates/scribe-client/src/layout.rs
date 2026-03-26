@@ -184,8 +184,24 @@ impl LayoutTree {
     /// Find the split containing `pane_id` and adjust its ratio.
     ///
     /// Returns `true` if the pane was found and the ratio was adjusted.
+    #[allow(dead_code, reason = "retained for API completeness; drag now uses set_ratio_for_pane")]
     pub fn adjust_ratio(&mut self, pane_id: PaneId, delta: f32) -> bool {
         adjust_ratio_node(&mut self.root, pane_id, delta)
+    }
+
+    /// Find the split containing `pane_id` and set its ratio to an absolute value.
+    ///
+    /// The ratio is clamped to `[MIN_RATIO, MAX_RATIO]`. Returns `true` if the
+    /// pane was found and the ratio was set, `false` otherwise.
+    #[allow(dead_code, reason = "public API for drag-resize integration")]
+    pub fn set_ratio_for_pane(&mut self, pane_id: PaneId, new_ratio: f32) -> bool {
+        set_ratio_node(&mut self.root, pane_id, new_ratio)
+    }
+
+    /// Set every split node's ratio to `DEFAULT_RATIO` (0.5).
+    #[allow(dead_code, reason = "public API for equalize-all-panes interaction")]
+    pub fn equalize_all_ratios(&mut self) {
+        equalize_node(&mut self.root);
     }
 
     /// Find the nearest pane in the given direction from `current`.
@@ -387,6 +403,7 @@ fn contains_pane(node: &LayoutNode, target: PaneId) -> bool {
 
 /// Recursively find the split containing `target` (as a direct child)
 /// and adjust its ratio by `delta`, clamping to `[MIN_RATIO, MAX_RATIO]`.
+#[allow(dead_code, reason = "called by adjust_ratio which is retained for API completeness")]
 fn adjust_ratio_node(node: &mut LayoutNode, target: PaneId, delta: f32) -> bool {
     let LayoutNode::Split { ratio, first, second, .. } = node else {
         return false;
@@ -401,6 +418,37 @@ fn adjust_ratio_node(node: &mut LayoutNode, target: PaneId, delta: f32) -> bool 
     }
 
     adjust_ratio_node(first, target, delta) || adjust_ratio_node(second, target, delta)
+}
+
+/// Recursively find the split containing `target` (as a direct child)
+/// and set its ratio to `new_ratio`, clamping to `[MIN_RATIO, MAX_RATIO]`.
+#[allow(dead_code, reason = "called by set_ratio_for_pane which is part of the public API")]
+fn set_ratio_node(node: &mut LayoutNode, target: PaneId, new_ratio: f32) -> bool {
+    let LayoutNode::Split { ratio, first, second, .. } = node else {
+        return false;
+    };
+
+    let first_is_target = matches!(first.as_ref(), LayoutNode::Leaf(id) if *id == target);
+    let second_is_target = matches!(second.as_ref(), LayoutNode::Leaf(id) if *id == target);
+
+    if first_is_target || second_is_target {
+        *ratio = new_ratio.clamp(MIN_RATIO, MAX_RATIO);
+        return true;
+    }
+
+    set_ratio_node(first, target, new_ratio) || set_ratio_node(second, target, new_ratio)
+}
+
+/// Recursively set every split node's ratio to `DEFAULT_RATIO`.
+#[allow(dead_code, reason = "called by equalize_all_ratios which is part of the public API")]
+fn equalize_node(node: &mut LayoutNode) {
+    let LayoutNode::Split { ratio, first, second, .. } = node else {
+        return;
+    };
+
+    *ratio = DEFAULT_RATIO;
+    equalize_node(first);
+    equalize_node(second);
 }
 
 // ---------------------------------------------------------------------------

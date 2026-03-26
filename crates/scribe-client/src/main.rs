@@ -91,6 +91,7 @@ struct App {
 
     // Divider drag
     divider_drag: Option<DividerDrag>,
+    workspace_divider_drag: Option<workspace_layout::WorkspaceDividerDrag>,
 
     /// Active scrollbar drag state (pane ID being dragged).
     scrollbar_drag_pane: Option<layout::PaneId>,
@@ -186,8 +187,12 @@ struct App {
     received_workspace_tree: bool,
     /// Clickable tab rects `(workspace_id, tab_index, rect)` (updated each frame).
     tab_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)>,
+    /// Clickable equalize rects from tab bars `(workspace_id, rect)` (updated each frame).
+    tab_bar_equalize_targets: Vec<(WorkspaceId, layout::Rect)>,
     /// Clickable rect for the status bar gear icon (updated each frame).
     status_bar_gear_rect: Option<layout::Rect>,
+    /// Clickable rect for the status bar equalize icon (updated each frame).
+    status_bar_equalize_rect: Option<layout::Rect>,
 
     /// System hostname for the window-level status bar (fetched once at startup).
     hostname: String,
@@ -238,6 +243,7 @@ impl App {
             session_to_pane: HashMap::new(),
             pending_sessions: VecDeque::new(),
             divider_drag: None,
+            workspace_divider_drag: None,
             scrollbar_drag_pane: None,
             active_selection: None,
             mouse_selecting: false,
@@ -273,7 +279,9 @@ impl App {
             geometry_save_pending: None,
             received_workspace_tree: false,
             tab_hit_targets: Vec::new(),
+            tab_bar_equalize_targets: Vec::new(),
             status_bar_gear_rect: None,
+            status_bar_equalize_rect: None,
             hostname: read_hostname(),
             _config_watcher: config_watcher,
         }
@@ -1341,11 +1349,26 @@ impl App {
                 None
             };
 
+            let has_multiple_panes = tab.pane_layout.all_pane_ids().len() > 1;
             ws_tab_bar_data.push(tab_bar::WorkspaceTabBarData {
                 ws_id: *ws_id,
                 ws_rect: *ws_rect,
                 tabs,
                 badge,
+                has_multiple_panes,
+            });
+        }
+
+        // Collect workspace dividers (needs the full viewport, not per-workspace).
+        let ws_dividers = self.window_layout.collect_workspace_dividers(ws_viewport);
+        // Render workspace dividers alongside pane dividers by converting them
+        // to the same Divider type (pane IDs are unused in rendering).
+        for ws_div in &ws_dividers {
+            dividers.push(divider::Divider {
+                rect: ws_div.rect,
+                direction: ws_div.direction,
+                first_pane: layout::PaneId::from_raw(0),
+                second_pane: layout::PaneId::from_raw(0),
             });
         }
 
@@ -1421,7 +1444,7 @@ impl App {
 
         let tab_bar_h = cell_size.1 + self.config.appearance.tab_bar_padding;
         let indicator_h = self.config.terminal.indicator_height.clamp(1.0, 10.0);
-        let (mut all_instances, tab_hits) = build_all_instances(
+        let (mut all_instances, tab_hits, tab_eq_hits) = build_all_instances(
             &mut gpu.renderer,
             &gpu.device,
             &gpu.queue,
@@ -1444,12 +1467,14 @@ impl App {
             self.active_selection.as_ref(),
         );
         self.tab_hit_targets = tab_hits;
+        self.tab_bar_equalize_targets = tab_eq_hits;
 
         // Window-level status bar spanning the full window width.
         {
             let time_str = current_time_str();
             let sb_data = status_bar::StatusBarData {
                 connected: self.server_connected,
+                show_equalize: multi_workspace,
                 workspace_name: focused_ws_name.as_deref(),
                 cwd: focused_pane_cwd.as_deref(),
                 git_branch: focused_pane_git.as_deref(),
@@ -1468,6 +1493,7 @@ impl App {
                 &mut resolve_glyph,
             );
             self.status_bar_gear_rect = sb_hits.gear_rect;
+            self.status_bar_equalize_rect = sb_hits.equalize_rect;
         }
 
         // Close dialog overlay (rendered on top of everything).
@@ -2228,6 +2254,7 @@ impl App {
             winit::event::ElementState::Pressed => self.handle_mouse_press(),
             winit::event::ElementState::Released => {
                 self.divider_drag = None;
+                self.workspace_divider_drag = None;
                 self.end_scrollbar_drag();
                 self.handle_mouse_release();
             }
@@ -2254,6 +2281,30 @@ impl App {
             }
         }
 
+        // Check for status-bar equalize click (equalize all workspace ratios).
+        if let Some(eq_rect) = self.status_bar_equalize_rect {
+            if eq_rect.contains(x, y) {
+                self.window_layout.equalize_all_workspace_ratios();
+                self.resize_all_workspace_panes();
+                self.request_redraw();
+                return;
+            }
+        }
+
+        // Check for tab bar equalize click (equalize pane ratios in that workspace).
+        if let Some((ws_id, _)) =
+            self.tab_bar_equalize_targets.iter().find(|(_, rect)| rect.contains(x, y)).copied()
+        {
+            let tab =
+                self.window_layout.find_workspace_mut(ws_id).and_then(|ws| ws.active_tab_mut());
+            if let Some(tab) = tab {
+                tab.pane_layout.equalize_all_ratios();
+            }
+            self.resize_after_layout_change();
+            self.request_redraw();
+            return;
+        }
+
         // Check for tab bar click (switch active tab in that workspace).
         if let Some((ws_id, tab_idx)) = self
             .tab_hit_targets
@@ -2268,6 +2319,11 @@ impl App {
 
         // Check for scrollbar click (before divider, before selection).
         if self.try_start_scrollbar_interaction(x, y) {
+            return;
+        }
+
+        // Check for workspace divider drag (before pane divider).
+        if self.try_start_workspace_divider_drag(x, y, ws_viewport) {
             return;
         }
 
@@ -2296,6 +2352,17 @@ impl App {
         let dividers = divider::collect_dividers(tab.pane_layout.root(), *ws_rect);
         if let Some(hit) = divider::hit_test_divider(&dividers, x, y) {
             self.divider_drag = Some(divider::start_drag(hit, *ws_rect));
+            return true;
+        }
+        false
+    }
+
+    /// Try to start a workspace divider drag. Returns `true` if a divider was hit.
+    fn try_start_workspace_divider_drag(&mut self, x: f32, y: f32, ws_viewport: Rect) -> bool {
+        let ws_dividers = self.window_layout.collect_workspace_dividers(ws_viewport);
+        if let Some(hit) = workspace_layout::hit_test_workspace_divider(&ws_dividers, x, y) {
+            self.workspace_divider_drag =
+                Some(workspace_layout::start_workspace_drag(hit, ws_viewport));
             return true;
         }
         false
@@ -2463,23 +2530,82 @@ impl App {
         // Update scrollbar hover state for the focused pane.
         self.update_scrollbar_hover();
 
-        // Divider drag.
-        let Some(drag) = self.divider_drag else { return };
         let Some((x, y)) = self.last_cursor_pos else { return };
 
-        let mouse_pos = match drag.direction {
-            layout::SplitDirection::Horizontal => x,
-            layout::SplitDirection::Vertical => y,
-        };
-
-        let new_ratio = divider::drag_ratio(&drag, mouse_pos);
-
-        if let Some(tab) = self.window_layout.active_tab_mut() {
-            let _ = tab.pane_layout.adjust_ratio(drag.first_pane, new_ratio - 0.5);
+        // Workspace divider drag (checked before pane divider drag).
+        if let Some(drag) = self.workspace_divider_drag {
+            let mouse_pos = match drag.direction {
+                layout::SplitDirection::Horizontal => x,
+                layout::SplitDirection::Vertical => y,
+            };
+            let new_ratio = workspace_layout::workspace_drag_ratio(&drag, mouse_pos);
+            let _ = self.window_layout.set_workspace_ratio(drag.first_workspace, new_ratio);
+            self.resize_all_workspace_panes();
+            self.request_redraw();
+            return;
         }
 
-        self.resize_after_layout_change();
-        self.request_redraw();
+        // Pane divider drag.
+        if let Some(drag) = self.divider_drag {
+            let mouse_pos = match drag.direction {
+                layout::SplitDirection::Horizontal => x,
+                layout::SplitDirection::Vertical => y,
+            };
+
+            let new_ratio = divider::drag_ratio(&drag, mouse_pos);
+
+            if let Some(tab) = self.window_layout.active_tab_mut() {
+                let _ = tab.pane_layout.set_ratio_for_pane(drag.first_pane, new_ratio);
+            }
+
+            self.resize_after_layout_change();
+            self.request_redraw();
+            return;
+        }
+
+        // No drag active — update cursor icon based on divider hover.
+        self.update_hover_cursor(x, y);
+    }
+
+    /// Set the window cursor icon based on whether the pointer is hovering over
+    /// a divider. Resets to the default arrow cursor when not over any divider.
+    fn update_hover_cursor(&self, x: f32, y: f32) {
+        let Some(gpu) = &self.gpu else { return };
+        let Some(window) = &self.window else { return };
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
+
+        // Check workspace dividers first.
+        let ws_dividers = self.window_layout.collect_workspace_dividers(ws_viewport);
+        if let Some(hit) = workspace_layout::hit_test_workspace_divider(&ws_dividers, x, y) {
+            let icon = match hit.direction {
+                layout::SplitDirection::Horizontal => winit::window::CursorIcon::ColResize,
+                layout::SplitDirection::Vertical => winit::window::CursorIcon::RowResize,
+            };
+            window.set_cursor(icon);
+            return;
+        }
+
+        // Check pane dividers in the focused workspace.
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+        let focused_ws_id = self.window_layout.focused_workspace_id();
+        let focused_ws_rect =
+            ws_rects.iter().find(|(wid, _)| *wid == focused_ws_id).map(|(_, r)| *r);
+        let focused_tab =
+            self.window_layout.find_workspace(focused_ws_id).and_then(|ws| ws.active_tab());
+        if let (Some(ws_rect), Some(tab)) = (focused_ws_rect, focused_tab) {
+            let dividers = divider::collect_dividers(tab.pane_layout.root(), ws_rect);
+            if let Some(hit) = divider::hit_test_divider(&dividers, x, y) {
+                let icon = match hit.direction {
+                    layout::SplitDirection::Horizontal => winit::window::CursorIcon::ColResize,
+                    layout::SplitDirection::Vertical => winit::window::CursorIcon::RowResize,
+                };
+                window.set_cursor(icon);
+                return;
+            }
+        }
+
+        // Not over any divider — reset to default.
+        window.set_cursor(winit::window::CursorIcon::Default);
     }
 
     // -------------------------------------------------------------------
@@ -2515,13 +2641,27 @@ impl App {
         self.finalize_copy();
     }
 
-    /// Convert a pixel position to a grid cell in the focused pane.
+    /// Convert a pixel position to an absolute grid cell in the focused pane.
+    ///
+    /// The returned row is an absolute grid line (negative = scrollback),
+    /// incorporating the pane's current `display_offset`.
     fn cursor_to_grid(&self, x: f32, y: f32) -> Option<selection::SelectionPoint> {
         let gpu = self.gpu.as_ref()?;
         let cell = gpu.renderer.cell_size();
         let pane_rect = self.focused_pane_rect()?;
         let tab_bar_h = self.effective_tab_bar_height();
-        selection::pixel_to_grid(x, y, pane_rect, cell.width, cell.height, tab_bar_h)
+        let tab = self.window_layout.active_tab()?;
+        let pane = self.panes.get(&tab.focused_pane)?;
+        let display_offset = pane.term.grid().display_offset();
+        selection::pixel_to_grid(
+            x,
+            y,
+            pane_rect,
+            cell.width,
+            cell.height,
+            tab_bar_h,
+            display_offset,
+        )
     }
 
     /// Compute the screen rect of the currently focused pane.
@@ -2900,6 +3040,9 @@ const UNFOCUSED_DIM: f32 = 0.85;
 /// `(workspace_id, tab_index, clickable_rect)` for tab bar click handling.
 type TabHitTargets = Vec<(WorkspaceId, usize, layout::Rect)>;
 
+/// `(workspace_id, equalize_rect)` for tab bar equalize button click handling.
+type TabEqualizeTargets = Vec<(WorkspaceId, layout::Rect)>;
+
 #[allow(
     clippy::too_many_arguments,
     reason = "needs all render context: renderer, GPU resources, panes, layout data, AI state"
@@ -2929,7 +3072,7 @@ fn build_all_instances(
     tab_bar_height: f32,
     indicator_height: f32,
     active_selection: Option<&selection::SelectionRange>,
-) -> (Vec<scribe_renderer::types::CellInstance>, TabHitTargets) {
+) -> (Vec<scribe_renderer::types::CellInstance>, TabHitTargets, TabEqualizeTargets) {
     // Pre-allocate based on a typical 80x24 grid per pane plus tab bar and
     // border quads, to avoid repeated reallocations during the per-pane loops.
     let estimated_per_pane = 80 * 24 + 80 + 4;
@@ -2955,7 +3098,15 @@ fn build_all_instances(
                 pane_cursor_visible,
             );
             if let Some(sel) = effective_selection.filter(|_| *pane_id == focused_pane) {
-                apply_selection_highlight(&mut instances, offset, cell_size, sel, selection_colors);
+                let disp_off = pane.term.grid().display_offset();
+                apply_selection_highlight(
+                    &mut instances,
+                    offset,
+                    cell_size,
+                    sel,
+                    selection_colors,
+                    disp_off,
+                );
             }
             if has_multiple_panes && *pane_id != focused_pane {
                 dim_instances(&mut instances);
@@ -2985,6 +3136,7 @@ fn build_all_instances(
 
     // Tab bar text — rendered once per workspace, spanning the full workspace width.
     let mut tab_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)> = Vec::new();
+    let mut tab_equalize_targets: TabEqualizeTargets = Vec::new();
     for ws_data in ws_tab_bar_data {
         let tab_bar_rect = layout::Rect {
             x: ws_data.ws_rect.x,
@@ -3000,6 +3152,7 @@ fn build_all_instances(
             tabs: &ws_data.tabs,
             badge,
             show_gear: false,
+            show_equalize: ws_data.has_multiple_panes,
             colors: tab_colors,
             resolve_glyph: &mut resolve_glyph,
             tab_bar_height,
@@ -3009,6 +3162,9 @@ fn build_all_instances(
         all_instances.extend(text_instances);
         for (tab_idx, rect) in hit_targets.tab_rects {
             tab_hit_targets.push((ws_data.ws_id, tab_idx, rect));
+        }
+        if let Some(eq_rect) = hit_targets.equalize_rect {
+            tab_equalize_targets.push((ws_data.ws_id, eq_rect));
         }
     }
 
@@ -3049,7 +3205,7 @@ fn build_all_instances(
         }
     }
 
-    (all_instances, tab_hit_targets)
+    (all_instances, tab_hit_targets, tab_equalize_targets)
 }
 
 /// Apply window opacity to cell background alpha values.
@@ -3083,27 +3239,24 @@ fn dim_color(color: &mut [f32; 4]) {
     color[2] *= UNFOCUSED_DIM;
 }
 
-/// Apply selection highlight to cell instances for the focused pane.
-///
-/// Reverse-maps each instance's pixel position to grid coordinates and checks
-/// whether it falls within the selection range. Selected cells get the
-/// selection background and foreground colors applied.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "grid coordinates are small positive values that fit in i32/usize"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "needs offset, cell size, selection, and both highlight colors"
-)]
 /// Selection highlight colors: `(background, foreground)`.
 type SelectionColors = ([f32; 4], [f32; 4]);
 
+/// Apply selection highlight to cell instances for the focused pane.
+///
+/// Reverse-maps each instance's pixel position to absolute grid coordinates
+/// and checks whether it falls within the selection range.  Selected cells
+/// get the selection background and foreground colors applied.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "needs offset, cell size, selection, colors, and scroll offset for absolute coordinate mapping"
+)]
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "grid coordinates derived from pixel / cell_size are small positive values"
+    clippy::cast_possible_wrap,
+    reason = "grid coordinates derived from pixel / cell_size are small positive values; \
+              display_offset bounded by scrollback_lines (≤ 100_000)"
 )]
 fn apply_selection_highlight(
     instances: &mut [scribe_renderer::types::CellInstance],
@@ -3111,19 +3264,23 @@ fn apply_selection_highlight(
     cell_size: (f32, f32),
     sel: &selection::SelectionRange,
     colors: SelectionColors,
+    display_offset: usize,
 ) {
     let (cell_w, cell_h) = cell_size;
     if cell_w <= 0.0 || cell_h <= 0.0 {
         return;
     }
+    let offset_i32 = display_offset as i32;
     for inst in instances {
         // Skip overlay quads (beam/underline cursor) — they have non-zero size.
         if inst.size[0] != 0.0 || inst.size[1] != 0.0 {
             continue;
         }
         let col = ((inst.pos[0] - offset.0) / cell_w + 0.5) as usize;
-        let row = ((inst.pos[1] - offset.1) / cell_h + 0.5) as i32;
-        if sel.contains_cell(row, col) {
+        let screen_row = ((inst.pos[1] - offset.1) / cell_h + 0.5) as i32;
+        // Convert screen row to absolute grid line to match selection coordinates.
+        let grid_row = screen_row - offset_i32;
+        if sel.contains_cell(grid_row, col) {
             inst.bg_color = colors.0;
             inst.fg_color = colors.1;
         }
