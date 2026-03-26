@@ -4678,7 +4678,7 @@ fn build_all_instances(
             // cell instances so cells draw on top.  Covers remainder pixels at
             // right/bottom edges left by floor-division of pixels by cell size.
             let dim = has_multiple_panes && !is_focused;
-            push_pane_bg_fill(&mut all_instances, pane, tbh, (default_bg, layout.padding, dim));
+            push_pane_bg_fill(&mut all_instances, pane, tbh, (default_bg, dim));
 
             // Skip rebuilding instances when the pane content and all
             // rendering context (cursor blink, focus, selection) are unchanged.
@@ -4896,7 +4896,7 @@ fn build_all_instances(
     )
 }
 
-/// Emit one solid-colour quad covering a pane's full content area.
+/// Emit one solid-colour quad covering the full pane area below the tab bar.
 ///
 /// Covers remainder pixels at right/bottom edges left by floor-dividing pixel
 /// dimensions by cell size.  Must be pushed before cell instances so cells
@@ -4906,15 +4906,14 @@ fn push_pane_bg_fill(
     out: &mut Vec<scribe_renderer::types::CellInstance>,
     pane: &Pane,
     tab_bar_height: f32,
-    bg_and_dim: ([f32; 4], &ContentPadding, bool),
+    bg_and_dim: ([f32; 4], bool),
 ) {
-    let (default_bg, padding, dim) = bg_and_dim;
-    let eff_pad = pane::effective_padding(padding, pane.edges);
-    let content_x = pane.rect.x + eff_pad.left;
-    let content_y = pane.rect.y + tab_bar_height + eff_pad.top;
-    let content_w = (pane.rect.width - eff_pad.left - eff_pad.right).max(0.0);
-    let content_h = (pane.rect.height - tab_bar_height - eff_pad.top - eff_pad.bottom).max(0.0);
-    if content_w <= 0.0 || content_h <= 0.0 {
+    let (default_bg, dim) = bg_and_dim;
+    let fill_x = pane.rect.x;
+    let fill_y = pane.rect.y + tab_bar_height;
+    let fill_w = pane.rect.width.max(0.0);
+    let fill_h = (pane.rect.height - tab_bar_height).max(0.0);
+    if fill_w <= 0.0 || fill_h <= 0.0 {
         return;
     }
     let mut bg = default_bg;
@@ -4924,8 +4923,8 @@ fn push_pane_bg_fill(
         bg[2] *= UNFOCUSED_DIM;
     }
     out.push(scribe_renderer::types::CellInstance {
-        pos: [content_x, content_y],
-        size: [content_w, content_h],
+        pos: [fill_x, fill_y],
+        size: [fill_w, fill_h],
         uv_min: [0.0, 0.0],
         uv_max: [0.0, 0.0],
         fg_color: bg,
