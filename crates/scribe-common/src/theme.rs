@@ -25,6 +25,7 @@ pub struct ChromeColors {
     pub tab_bar_active_bg: [f32; 4],
     pub tab_text: [f32; 4],
     pub tab_text_active: [f32; 4],
+    pub tab_separator: [f32; 4],
     pub status_bar_bg: [f32; 4],
     pub status_bar_text: [f32; 4],
     pub divider: [f32; 4],
@@ -85,8 +86,9 @@ impl Theme {
     ) -> ChromeColors {
         let tab_bar_bg = lighten(background, 0.06);
         let tab_bar_active_bg = background;
-        let tab_text = with_alpha(foreground, 0.65);
+        let tab_text = with_alpha(foreground, 0.45);
         let tab_text_active = foreground;
+        let tab_separator = with_alpha(foreground, 0.12);
         let status_bar_bg = tab_bar_bg;
         let status_bar_text = with_alpha(foreground, 0.5);
         let divider = with_alpha(foreground, 0.08);
@@ -99,6 +101,7 @@ impl Theme {
             tab_bar_active_bg,
             tab_text,
             tab_text_active,
+            tab_separator,
             status_bar_bg,
             status_bar_text,
             divider,

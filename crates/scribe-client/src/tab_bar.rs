@@ -19,6 +19,7 @@ pub struct TabBarColors {
     pub active_bg: [f32; 4],
     pub text: [f32; 4],
     pub active_text: [f32; 4],
+    pub separator: [f32; 4],
     #[allow(dead_code, reason = "reserved for future bottom border rendering")]
     pub border: [f32; 4],
 }
@@ -30,6 +31,7 @@ impl From<&ChromeColors> for TabBarColors {
             active_bg: srgb_to_linear_rgba(chrome.tab_bar_active_bg),
             text: srgb_to_linear_rgba(chrome.tab_text),
             active_text: srgb_to_linear_rgba(chrome.tab_text_active),
+            separator: srgb_to_linear_rgba(chrome.tab_separator),
             border: srgb_to_linear_rgba(chrome.divider),
         }
     }
@@ -51,19 +53,22 @@ pub struct TabData {
 /// that fill the tab bar area into `out`. `cell_size` is `(width, height)` from
 /// the font. Pushing directly into the caller's `Vec` avoids a per-call heap
 /// allocation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "all parameters are needed to fill the tab bar background with per-column color selection"
+)]
 pub fn build_tab_bar_bg(
     out: &mut Vec<CellInstance>,
     rect: Rect,
     cell_size: (f32, f32),
     colors: &TabBarColors,
     tab_bar_height: f32,
+    active_range: Option<(f32, f32)>,
 ) {
     let (cell_w, _cell_h) = cell_size;
     if cell_w <= 0.0 {
         return;
     }
-
-    let bg = colors.bg;
 
     // Fill the tab bar area with background quads, one per cell-width column.
     let cols = columns_in_width(rect.width, cell_w);
@@ -74,13 +79,17 @@ pub fn build_tab_bar_bg(
             reason = "column index is a small positive integer fitting in f32"
         )]
         let x = rect.x + col_idx as f32 * cell_w;
+        let bg_color = match active_range {
+            Some((xa, xb)) if x >= xa && x + cell_w <= xb => colors.active_bg,
+            _ => colors.bg,
+        };
         out.push(CellInstance {
             pos: [x, rect.y],
             size: [cell_w, tab_bar_height],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
-            fg_color: bg,
-            bg_color: bg,
+            fg_color: bg_color,
+            bg_color,
         });
     }
 
@@ -96,13 +105,17 @@ pub fn build_tab_bar_bg(
             reason = "column count is a small positive integer fitting in f32"
         )]
         let x = rect.x + cols as f32 * cell_w;
+        let bg_color = match active_range {
+            Some((xa, xb)) if x >= xa && x + remainder <= xb => colors.active_bg,
+            _ => colors.bg,
+        };
         out.push(CellInstance {
             pos: [x, rect.y],
             size: [remainder, tab_bar_height],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
-            fg_color: bg,
-            bg_color: bg,
+            fg_color: bg_color,
+            bg_color,
         });
     }
 }
@@ -110,15 +123,28 @@ pub fn build_tab_bar_bg(
 /// Height of the bottom separator line in pixels.
 const SEPARATOR_HEIGHT: f32 = 1.0;
 
+/// Columns reserved for the gear icon: one space + one glyph.
+const GEAR_RESERVED_COLS: usize = 2;
+
+/// Columns reserved for the equalize icon: one space + one glyph.
+const EQUALIZE_RESERVED_COLS: usize = 2;
+
 /// Build a 1px separator line at the bottom of a pane's tab bar area.
 ///
 /// Gives a clear visual boundary between the tab bar and terminal content.
+/// `skip_range` is an optional pixel X range to leave undrawn (used to omit the separator
+/// beneath the active tab so it appears raised).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "all parameters are needed to build the tab bar separator with active-tab skip logic"
+)]
 pub fn build_tab_bar_separator(
     out: &mut Vec<CellInstance>,
     rect: Rect,
     cell_size: (f32, f32),
     color: [f32; 4],
     tab_bar_height: f32,
+    skip_range: Option<(f32, f32)>,
 ) {
     let (cell_w, _) = cell_size;
     if cell_w <= 0.0 {
@@ -134,6 +160,11 @@ pub fn build_tab_bar_separator(
             reason = "column index is a small positive integer fitting in f32"
         )]
         let x = rect.x + col_idx as f32 * cell_w;
+        if let Some((xa, xb)) = skip_range {
+            if x + cell_w > xa && x < xb {
+                continue;
+            }
+        }
         out.push(CellInstance {
             pos: [x, separator_y],
             size: [cell_w, SEPARATOR_HEIGHT],
@@ -156,14 +187,17 @@ pub fn build_tab_bar_separator(
             reason = "column count is a small positive integer fitting in f32"
         )]
         let x = rect.x + cols as f32 * cell_w;
-        out.push(CellInstance {
-            pos: [x, separator_y],
-            size: [remainder, SEPARATOR_HEIGHT],
-            uv_min: [0.0, 0.0],
-            uv_max: [0.0, 0.0],
-            fg_color: color,
-            bg_color: color,
-        });
+        let skip = skip_range.is_some_and(|(xa, xb)| x + remainder > xa && x < xb);
+        if !skip {
+            out.push(CellInstance {
+                pos: [x, separator_y],
+                size: [remainder, SEPARATOR_HEIGHT],
+                uv_min: [0.0, 0.0],
+                uv_max: [0.0, 0.0],
+                fg_color: color,
+                bg_color: color,
+            });
+        }
     }
 }
 
@@ -189,7 +223,7 @@ pub fn compute_tab_bar_height(
     if cell_w <= 0.0 || row_height <= 0.0 {
         return row_height.max(1.0);
     }
-    let gear_cols: usize = 2;
+    let gear_cols: usize = GEAR_RESERVED_COLS;
     let total_cols = columns_in_width(ws_width, cell_w);
     let available = total_cols.saturating_sub(badge_cols).saturating_sub(gear_cols);
     let tab_w = usize::from(tab_width_chars).max(1);
@@ -197,6 +231,14 @@ pub fn compute_tab_bar_height(
     let effective_count = tab_count.max(1);
     let rows = effective_count.div_ceil(tabs_per_row);
     rows as f32 * row_height
+}
+
+/// Compute the number of columns occupied by the workspace badge.
+///
+/// Returns 0 when no badge is shown (single workspace).
+/// Badge layout: space + name + space + gap ≈ `name_len` + 4 columns.
+pub fn badge_columns(ws_name: Option<&str>, show_badge: bool) -> usize {
+    if show_badge { ws_name.map_or(9, |n| n.chars().count()) + 4 } else { 0 }
 }
 
 /// Pre-collected workspace-level data for tab bar text rendering.
@@ -216,6 +258,9 @@ pub struct WorkspaceTabBarData {
     pub has_multiple_panes: bool,
     /// Pre-computed tab bar height for this workspace (accounts for multi-row stacking).
     pub tab_bar_height: f32,
+    /// Pixel X range `(start, end)` of the active tab on row 0. `None` when no active tab is on
+    /// row 0 or the workspace has no tabs.
+    pub active_tab_pixel_range: Option<(f32, f32)>,
 }
 
 /// Parameters for building tab bar text instances.
@@ -271,6 +316,9 @@ pub struct TabBarHitTargets {
     pub close_rects: Vec<(usize, Rect)>,
     /// Clickable rect for the update button, if rendered.
     pub update_rect: Option<Rect>,
+    /// Column range `(start_col, end_col)` of the active tab on row 0. `None` when no active tab
+    /// is on row 0 (e.g. active tab is on row 1+ in a multi-row bar).
+    pub active_tab_col_range: Option<(usize, usize)>,
 }
 
 /// Build cell instances for the tab bar text overlay.
@@ -289,6 +337,7 @@ pub fn build_tab_bar_text(
                 equalize_rect: None,
                 close_rects: Vec::new(),
                 update_rect: None,
+                active_tab_col_range: None,
             },
         );
     }
@@ -302,12 +351,13 @@ pub fn build_tab_bar_text(
         equalize_rect: None,
         close_rects: Vec::new(),
         update_rect: None,
+        active_tab_col_range: None,
     };
 
     // Reserve columns for the gear icon on the far right (2 cols: space + gear).
-    let gear_cols: usize = if params.show_gear { 2 } else { 0 };
+    let gear_cols: usize = if params.show_gear { GEAR_RESERVED_COLS } else { 0 };
     // Reserve columns for the equalize icon left of gear (2 cols: space + icon).
-    let equalize_cols: usize = if params.show_equalize { 2 } else { 0 };
+    let equalize_cols: usize = if params.show_equalize { EQUALIZE_RESERVED_COLS } else { 0 };
     let content_cols = max_cols.saturating_sub(gear_cols).saturating_sub(equalize_cols);
 
     // Render workspace badge if present.
@@ -347,10 +397,15 @@ pub fn build_tab_bar_text(
     (instances, hit_targets)
 }
 
-/// Render the workspace badge: colored dot + space + name + 16px gap.
+/// Render the workspace badge: accent-coloured pill (leading space + name + trailing space)
+/// followed by a 16px gap.
 #[allow(
     clippy::too_many_arguments,
     reason = "helper function that needs all render context from build_tab_bar_text"
+)]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "pill character count is a small positive integer fitting in f32"
 )]
 fn render_badge(
     instances: &mut Vec<CellInstance>,
@@ -363,18 +418,30 @@ fn render_badge(
 ) -> usize {
     let bg = params.colors.bg;
 
-    // Colored dot character as badge indicator.
-    col = emit_char(instances, '\u{25CF}', col, max_cols, params, accent_color, bg);
+    // Pill background: leading space + name + trailing space.
+    let pill_start_col = col;
+    let pill_char_count = 1 + ws_name.chars().count() + 1;
+    let pill_bg = [accent_color[0], accent_color[1], accent_color[2], 0.25];
 
-    // Space after dot.
-    col = emit_char(instances, ' ', col, max_cols, params, params.colors.text, bg);
+    let pill_width = pill_char_count as f32 * cell_w;
+    let pill_x = params.rect.x + pill_start_col as f32 * cell_w;
+    instances.push(CellInstance {
+        pos: [pill_x, params.rect.y],
+        size: [pill_width, params.tab_bar_height],
+        uv_min: [0.0, 0.0],
+        uv_max: [0.0, 0.0],
+        fg_color: pill_bg,
+        bg_color: pill_bg,
+    });
 
-    // Workspace name in normal text color.
+    // Text on top of pill background.
+    col = emit_char(instances, ' ', col, max_cols, params, accent_color, pill_bg);
     for ch in ws_name.chars() {
-        col = emit_char(instances, ch, col, max_cols, params, params.colors.text, bg);
+        col = emit_char(instances, ch, col, max_cols, params, accent_color, pill_bg);
     }
+    col = emit_char(instances, ' ', col, max_cols, params, accent_color, pill_bg);
 
-    // 16px gap after badge (approximately 2 cell widths).
+    // 16px gap after badge (approximately 2 cell widths), reverting to normal bg.
     let gap = gap_columns(16.0, cell_w);
     for _ in 0..gap {
         col = emit_char(instances, ' ', col, max_cols, params, params.colors.text, bg);
@@ -519,6 +586,11 @@ fn render_tabs(
         let tab_start_col = col;
         let row_base_y = base_y + row as f32 * row_height;
 
+        // Record active tab column range on row 0 for the bg/separator pass.
+        if tab.is_active && row == 0 {
+            hit_targets.active_tab_col_range = Some((tab_start_col, tab_start_col + tab_w));
+        }
+
         // Set per-row context so emit_char positions glyphs correctly.
         params.rect.y = row_base_y;
         params.tab_bar_height = row_height;
@@ -574,6 +646,20 @@ fn render_tabs(
             col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
         }
         col = expected_end.min(max_cols);
+
+        // Emit a 1px vertical separator between adjacent inactive tabs.
+        let next_is_inactive = params.tabs.get(tab_idx + 1).is_some_and(|t| !t.is_active);
+        if !tab.is_active && next_is_inactive && params.dragging_tab != Some(tab_idx) {
+            let sep_x = params.rect.x + (tab_start_col + tab_w) as f32 * cell_w;
+            instances.push(CellInstance {
+                pos: [sep_x - 1.0, row_base_y],
+                size: [1.0, row_height],
+                uv_min: [0.0, 0.0],
+                uv_max: [0.0, 0.0],
+                fg_color: params.colors.separator,
+                bg_color: params.colors.separator,
+            });
+        }
 
         if row == 0 {
             row0_end_col = col;

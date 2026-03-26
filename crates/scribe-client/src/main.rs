@@ -1004,17 +1004,10 @@ impl App {
         let row_h = cell_h + self.config.appearance.tab_bar_padding;
         let tab_count =
             self.window_layout.find_workspace(workspace_id).map_or(1, |ws| ws.tabs.len().max(1));
-        let badge_cols = if self.window_layout.workspace_count() > 1 {
-            // badge = dot + space + name + gap (≈4 extra chars)
-            let name_len = self
-                .window_layout
-                .find_workspace(workspace_id)
-                .and_then(|ws| ws.name.as_ref())
-                .map_or(9, |n| n.chars().count()); // "workspace" default
-            name_len + 4
-        } else {
-            0
-        };
+        let badge_cols = tab_bar::badge_columns(
+            self.window_layout.find_workspace(workspace_id).and_then(|ws| ws.name.as_deref()),
+            self.window_layout.workspace_count() > 1,
+        );
         tab_bar::compute_tab_bar_height(
             tab_count,
             ws_rect.width,
@@ -1644,7 +1637,7 @@ impl App {
 
             let badge = if multi_workspace {
                 let name = ws.name.clone().unwrap_or_else(|| String::from("workspace"));
-                Some((name, ws.accent_color))
+                Some((name, scribe_renderer::srgb_to_linear_rgba(ws.accent_color)))
             } else {
                 None
             };
@@ -1653,12 +1646,7 @@ impl App {
 
             // Compute per-workspace tab bar height (may be multi-row).
             let row_h = cell_size.1 + self.config.appearance.tab_bar_padding;
-            let badge_cols_for_h = if multi_workspace {
-                let name_len = ws.name.as_ref().map_or(9, |n| n.chars().count());
-                name_len + 4
-            } else {
-                0
-            };
+            let badge_cols_for_h = tab_bar::badge_columns(ws.name.as_deref(), multi_workspace);
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "badge col count is a small positive integer fitting in f32"
@@ -1672,6 +1660,33 @@ impl App {
                 badge_cols_for_h,
             );
 
+            // Compute tabs_per_row to determine whether the active tab is on row 0.
+            let cell_w = cell_size.0;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "width / cell_w yields a small positive value fitting in usize"
+            )]
+            let total_cols = if cell_w > 0.0 { (ws_rect.width / cell_w) as usize } else { 0 };
+            // show_gear is always false in the render path, so gear_cols is 0.
+            // equalize_cols matches build_tab_bar_text: 2 when has_multiple_panes.
+            let gear_cols: usize = 0;
+            let equalize_cols: usize = if has_multiple_panes { 2 } else { 0 };
+            let tab_w = usize::from(self.config.appearance.tab_width).max(1);
+            let available_for_tabs = total_cols
+                .saturating_sub(badge_cols_for_h)
+                .saturating_sub(gear_cols)
+                .saturating_sub(equalize_cols);
+            let tabs_per_row = (available_for_tabs / tab_w).max(1);
+            let active_tab_pixel_range = compute_active_tab_pixel_range(
+                ws_rect.x,
+                ws.active_tab,
+                self.config.appearance.tab_width,
+                badge_cols_for_h,
+                tabs_per_row,
+                cell_w,
+            );
+
             ws_tab_bar_data.push(tab_bar::WorkspaceTabBarData {
                 ws_id: *ws_id,
                 ws_rect: *ws_rect,
@@ -1679,6 +1694,7 @@ impl App {
                 badge,
                 has_multiple_panes,
                 tab_bar_height: ws_tab_bar_h,
+                active_tab_pixel_range,
             });
         }
 
@@ -4478,6 +4494,39 @@ fn apply_session_metadata(
 // Instance compositing
 // ---------------------------------------------------------------------------
 
+/// Compute the pixel X range `(start, end)` of the active tab on row 0 of the tab bar.
+///
+/// Returns `None` when the active tab is on a row other than row 0 (multi-row bar),
+/// when there are no tabs, or when the cell width is zero.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "column counts are small positive integers fitting in f32"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "all parameters are needed to compute the active tab pixel range for bg coloring"
+)]
+fn compute_active_tab_pixel_range(
+    ws_rect_x: f32,
+    active_tab_idx: usize,
+    tab_width: u16,
+    badge_cols: usize,
+    tabs_per_row: usize,
+    cell_w: f32,
+) -> Option<(f32, f32)> {
+    if cell_w <= 0.0 || tabs_per_row == 0 {
+        return None;
+    }
+    // Active tab must be on row 0.
+    if active_tab_idx >= tabs_per_row {
+        return None;
+    }
+    let tab_w = usize::from(tab_width).max(1);
+    let start_col = badge_cols + active_tab_idx * tab_w;
+    let end_col = start_col + tab_w;
+    Some((ws_rect_x + start_col as f32 * cell_w, ws_rect_x + end_col as f32 * cell_w))
+}
+
 /// Look up the tab bar height for a pane by its workspace id.
 /// Falls back to the first available workspace height, or 0.0.
 fn pane_tab_bar_h(
@@ -4489,6 +4538,14 @@ fn pane_tab_bar_h(
         .get(&pane_ws)
         .copied()
         .unwrap_or_else(|| ws_data.first().map_or(0.0, |d| d.tab_bar_height))
+}
+
+/// Look up the active tab pixel X range for a pane's workspace.
+fn pane_active_range(
+    pane_ws: WorkspaceId,
+    ws_data: &[tab_bar::WorkspaceTabBarData],
+) -> Option<(f32, f32)> {
+    ws_data.iter().find(|d| d.ws_id == pane_ws)?.active_tab_pixel_range
 }
 
 /// Minimum time the splash screen stays visible, ensuring the compositor
@@ -4664,12 +4721,21 @@ fn build_all_instances(
         }
     }
 
-    // Tab bar backgrounds + bottom separator (drawn after terminal content so
-    // the opaque bar always covers any stray cells that extend into its area).
+    // Tab bar backgrounds (drawn after terminal content so the opaque bar
+    // always covers any stray cells that extend into its area).
+    // The separator is drawn later, after build_tab_bar_text, using the exact
+    // active-tab column range returned by the render pass (Issue 2 fix).
     for (pane_id, pane_rect) in layout.pane_rects {
-        let tbh = panes.get(pane_id).map_or_else(
-            || layout.ws_tab_bar_data.first().map_or(0.0, |d| d.tab_bar_height),
-            |p| pane_tab_bar_h(p.workspace_id, &ws_tab_bar_heights, layout.ws_tab_bar_data),
+        let (tbh, active_range) = panes.get(pane_id).map_or_else(
+            || {
+                let h = layout.ws_tab_bar_data.first().map_or(0.0, |d| d.tab_bar_height);
+                (h, None)
+            },
+            |p| {
+                let h = pane_tab_bar_h(p.workspace_id, &ws_tab_bar_heights, layout.ws_tab_bar_data);
+                let r = pane_active_range(p.workspace_id, layout.ws_tab_bar_data);
+                (h, r)
+            },
         );
         tab_bar::build_tab_bar_bg(
             &mut all_instances,
@@ -4677,13 +4743,7 @@ fn build_all_instances(
             layout.cell_size,
             style.tab_colors,
             tbh,
-        );
-        tab_bar::build_tab_bar_separator(
-            &mut all_instances,
-            *pane_rect,
-            layout.cell_size,
-            style.divider_color,
-            tbh,
+            active_range,
         );
     }
 
@@ -4748,6 +4808,26 @@ fn build_all_instances(
         if let Some(upd_rect) = hit_targets.update_rect {
             tab_update_targets.push((ws_data.ws_id, upd_rect));
         }
+
+        // Draw the bottom separator using the exact active-tab column range
+        // returned by the render pass.  This avoids the pre-computation error
+        // where update-button columns were not accounted for (Issue 2 fix).
+        let (cell_w, _) = layout.cell_size;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "column indices are small positive integers fitting in f32"
+        )]
+        let exact_active_range = hit_targets.active_tab_col_range.map(|(sc, ec)| {
+            (ws_data.ws_rect.x + sc as f32 * cell_w, ws_data.ws_rect.x + ec as f32 * cell_w)
+        });
+        tab_bar::build_tab_bar_separator(
+            &mut all_instances,
+            tab_bar_rect,
+            layout.cell_size,
+            style.divider_color,
+            tbh,
+            exact_active_range,
+        );
     }
 
     // Pane dividers.
