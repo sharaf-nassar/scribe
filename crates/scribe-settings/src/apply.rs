@@ -155,6 +155,22 @@ fn apply_config_key(
             let v = value.as_f64().ok_or("indicator_height must be a number")? as f32;
             config.terminal.indicator_height = v.clamp(1.0, 10.0);
         }
+        "terminal.status_bar_stats.cpu" => {
+            config.terminal.status_bar_stats.cpu =
+                value.as_bool().ok_or("status_bar_stats.cpu must be a boolean")?;
+        }
+        "terminal.status_bar_stats.memory" => {
+            config.terminal.status_bar_stats.memory =
+                value.as_bool().ok_or("status_bar_stats.memory must be a boolean")?;
+        }
+        "terminal.status_bar_stats.gpu" => {
+            config.terminal.status_bar_stats.gpu =
+                value.as_bool().ok_or("status_bar_stats.gpu must be a boolean")?;
+        }
+        "terminal.status_bar_stats.network" => {
+            config.terminal.status_bar_stats.network =
+                value.as_bool().ok_or("status_bar_stats.network must be a boolean")?;
+        }
         // -- Claude States ----------------------------------------------------
         key if key.starts_with("claude_states.") => {
             apply_claude_state_key(&mut config.terminal.claude_states, key, value)?;

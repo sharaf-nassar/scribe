@@ -29,13 +29,21 @@ if [[ -n "$MSG" ]]; then
         !inside { print }
     ')
 
-    # Grab the last non-blank line and trim trailing whitespace.
-    LAST_LINE=$(printf '%s\n' "$STRIPPED" \
-        | sed '/^[[:space:]]*$/d' \
-        | tail -n1 \
-        | sed 's/[[:space:]]*$//')
+    # Extract the last paragraph (block of non-empty lines after the
+    # final blank line).  A question followed by bullet-point options
+    # lives in a single paragraph, so we must check the whole block.
+    LAST_PARA=$(printf '%s\n' "$STRIPPED" | awk '
+        /^[[:space:]]*$/ { para = ""; next }
+        { para = para (para ? "\n" : "") $0 }
+        END { print para }
+    ')
 
-    if [[ "$LAST_LINE" == *'?' ]]; then
+    # Heuristic 1: any line in the last paragraph ends with "?"
+    if printf '%s\n' "$LAST_PARA" | grep -qE '\?\s*$'; then
+        STATE="waiting_for_input"
+    # Heuristic 2: last paragraph contains common question phrases
+    elif printf '%s\n' "$LAST_PARA" \
+        | grep -qiE '(would you like|should i|do you want|which option|please (choose|select|pick)|how (should|would|do)|what (should|would|do)|let me know|your (choice|preference|call))'; then
         STATE="waiting_for_input"
     fi
 fi

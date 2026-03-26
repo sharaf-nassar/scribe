@@ -11,6 +11,7 @@ use scribe_renderer::srgb_to_linear_rgba;
 use scribe_renderer::types::CellInstance;
 
 use crate::layout::Rect;
+use crate::sys_stats::SystemStats;
 
 /// Height of the status bar in pixels.
 pub const STATUS_BAR_HEIGHT: f32 = 24.0;
@@ -40,12 +41,16 @@ pub struct StatusBarData<'a> {
     pub hostname: &'a str,
     /// Current time string (e.g. "14:32").
     pub time: &'a str,
+    pub sys_stats: Option<&'a SystemStats>,
+    pub stats_config: Option<&'a scribe_common::config::StatusBarStatsConfig>,
 }
 
 /// Fallback green when ANSI index 2 is unavailable.
 const FALLBACK_GREEN: [f32; 4] = [0.4, 0.9, 0.5, 1.0];
 /// Fallback red when ANSI index 1 is unavailable.
 const FALLBACK_RED: [f32; 4] = [1.0, 0.2, 0.2, 1.0];
+/// Fallback yellow when ANSI index 3 is unavailable.
+const FALLBACK_YELLOW: [f32; 4] = [0.9, 0.8, 0.2, 1.0];
 
 /// Colors for the status bar, derived from the theme's [`ChromeColors`]
 /// and ANSI palette.
@@ -58,6 +63,10 @@ pub struct StatusBarColors {
     pub connected_dot: [f32; 4],
     /// Color for the connection-status dot when disconnected (ANSI red).
     pub disconnected_dot: [f32; 4],
+    /// Color for moderate usage (60-85%) — ANSI yellow (index 3).
+    pub warning: [f32; 4],
+    /// Color for high usage (>85%) — ANSI red (index 1).
+    pub critical: [f32; 4],
 }
 
 impl StatusBarColors {
@@ -74,6 +83,8 @@ impl StatusBarColors {
             disconnected_dot: srgb_to_linear_rgba(
                 ansi_colors.get(1).copied().unwrap_or(FALLBACK_RED),
             ),
+            warning: srgb_to_linear_rgba(ansi_colors.get(3).copied().unwrap_or(FALLBACK_YELLOW)),
+            critical: srgb_to_linear_rgba(ansi_colors.get(1).copied().unwrap_or(FALLBACK_RED)),
         }
     }
 }
@@ -284,24 +295,153 @@ fn render_gear(
     Some(Rect { x: gear_x, y: w.y, width: gear_width, height: STATUS_BAR_HEIGHT })
 }
 
+/// Map a 0-100 percentage to a Unicode block element (▁▂▃▄▅▆▇█).
+fn sparkline_char(pct: f32) -> char {
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let idx = ((pct / 100.0) * 7.0).round().clamp(0.0, 7.0);
+    // cast is safe: idx is clamped to 0..=7
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "idx clamped to 0..=7"
+    )]
+    BLOCKS.get(idx as usize).copied().unwrap_or('▁')
+}
+
+/// Pick green/yellow/red based on usage percentage.
+fn usage_color(pct: f32, colors: &StatusBarColors) -> [f32; 4] {
+    if pct >= 85.0 {
+        colors.critical
+    } else if pct >= 60.0 {
+        colors.warning
+    } else {
+        colors.connected_dot
+    }
+}
+
+/// Format bytes/sec as a human-readable string (e.g., "1.2M", "340K", "0B").
+fn format_bytes_rate(bytes_per_sec: u64) -> String {
+    if bytes_per_sec >= 1_000_000 {
+        // cast is safe: bytes_per_sec fits in f64
+        #[allow(clippy::cast_precision_loss, reason = "bytes_per_sec is a reasonable network rate")]
+        let mb = bytes_per_sec as f64 / 1_000_000.0;
+        format!("{mb:.1}M")
+    } else if bytes_per_sec >= 1_000 {
+        #[allow(clippy::cast_precision_loss, reason = "bytes_per_sec is a reasonable network rate")]
+        let kb = bytes_per_sec as f64 / 1_000.0;
+        format!("{kb:.0}K")
+    } else {
+        format!("{bytes_per_sec}B")
+    }
+}
+
 /// A styled text segment for the right side of the status bar.
 struct RightSegment {
     text: String,
     color: [f32; 4],
 }
 
-/// Build the right-side text segments: git branch, session count, hostname, time.
+/// Push a separator " | " segment if `segs` is non-empty.
+fn push_sep(segs: &mut Vec<RightSegment>, color: [f32; 4]) {
+    if !segs.is_empty() {
+        segs.push(RightSegment { text: String::from(" | "), color });
+    }
+}
+
+/// Build system-stats segments (CPU, MEM, NET, GPU) for the right side.
+fn build_stats_segments(
+    stats: &SystemStats,
+    config: &scribe_common::config::StatusBarStatsConfig,
+    colors: &StatusBarColors,
+) -> Vec<RightSegment> {
+    let mut segs: Vec<RightSegment> = Vec::new();
+
+    if config.cpu {
+        push_sep(&mut segs, colors.separator);
+        segs.push(RightSegment { text: String::from("CPU "), color: colors.text });
+        for &v in &stats.cpu_history {
+            segs.push(RightSegment {
+                text: sparkline_char(v).to_string(),
+                color: usage_color(v, colors),
+            });
+        }
+        let val_str = format!(" {:.0}%", stats.cpu_percent);
+        segs.push(RightSegment { text: val_str, color: usage_color(stats.cpu_percent, colors) });
+    }
+
+    if config.memory {
+        push_sep(&mut segs, colors.separator);
+        let mem_pct = if stats.mem_total_gb > 0.0 {
+            stats.mem_used_gb / stats.mem_total_gb * 100.0
+        } else {
+            0.0
+        };
+        segs.push(RightSegment { text: String::from("MEM "), color: colors.text });
+        segs.push(RightSegment {
+            text: sparkline_char(mem_pct).to_string(),
+            color: usage_color(mem_pct, colors),
+        });
+        let mem_str = format!(" {:.1}G/{:.1}G", stats.mem_used_gb, stats.mem_total_gb);
+        segs.push(RightSegment { text: mem_str, color: usage_color(mem_pct, colors) });
+    }
+
+    if config.network {
+        push_sep(&mut segs, colors.separator);
+        segs.push(RightSegment { text: String::from("↑"), color: colors.text });
+        for &v in &stats.net_up_history {
+            #[allow(clippy::cast_precision_loss, reason = "network rate fits in f32 for sparkline")]
+            let pct = (v as f32 / 1_000_000.0).min(100.0);
+            segs.push(RightSegment { text: sparkline_char(pct).to_string(), color: colors.accent });
+        }
+        segs.push(RightSegment {
+            text: format!(" {}", format_bytes_rate(stats.net_up_bytes_sec)),
+            color: colors.text,
+        });
+        segs.push(RightSegment { text: String::from(" ↓"), color: colors.text });
+        for &v in &stats.net_down_history {
+            #[allow(clippy::cast_precision_loss, reason = "network rate fits in f32 for sparkline")]
+            let pct = (v as f32 / 1_000_000.0).min(100.0);
+            segs.push(RightSegment { text: sparkline_char(pct).to_string(), color: colors.accent });
+        }
+        segs.push(RightSegment {
+            text: format!(" {}", format_bytes_rate(stats.net_down_bytes_sec)),
+            color: colors.text,
+        });
+    }
+
+    if config.gpu {
+        if let Some(gpu_pct) = stats.gpu_percent {
+            push_sep(&mut segs, colors.separator);
+            segs.push(RightSegment { text: String::from("GPU "), color: colors.text });
+            for &v in &stats.gpu_history {
+                segs.push(RightSegment {
+                    text: sparkline_char(v).to_string(),
+                    color: usage_color(v, colors),
+                });
+            }
+            let val_str = format!(" {gpu_pct:.0}%");
+            segs.push(RightSegment { text: val_str, color: usage_color(gpu_pct, colors) });
+        }
+    }
+
+    segs
+}
+
+/// Build the right-side text segments: stats, git branch, session count, hostname, time.
 fn build_right_segments(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<RightSegment> {
     let mut segs = Vec::new();
 
+    if let (Some(stats), Some(config)) = (data.sys_stats, data.stats_config) {
+        segs.extend(build_stats_segments(stats, config, colors));
+    }
+
     if let Some(branch) = data.git_branch {
+        push_sep(&mut segs, colors.separator);
         segs.push(RightSegment { text: String::from(branch), color: colors.accent });
     }
 
     if data.session_count > 0 {
-        if !segs.is_empty() {
-            segs.push(RightSegment { text: String::from(" | "), color: colors.separator });
-        }
+        push_sep(&mut segs, colors.separator);
         let label = if data.session_count == 1 {
             String::from("1 session")
         } else {
@@ -311,16 +451,12 @@ fn build_right_segments(data: &StatusBarData<'_>, colors: &StatusBarColors) -> V
     }
 
     if !data.hostname.is_empty() {
-        if !segs.is_empty() {
-            segs.push(RightSegment { text: String::from(" | "), color: colors.separator });
-        }
+        push_sep(&mut segs, colors.separator);
         segs.push(RightSegment { text: String::from(data.hostname), color: colors.text });
     }
 
     if !data.time.is_empty() {
-        if !segs.is_empty() {
-            segs.push(RightSegment { text: String::from(" | "), color: colors.separator });
-        }
+        push_sep(&mut segs, colors.separator);
         segs.push(RightSegment { text: String::from(data.time), color: colors.text });
     }
 

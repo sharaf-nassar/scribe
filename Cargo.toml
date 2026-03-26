@@ -89,6 +89,7 @@ wry = "0.55"
 rust-embed = "8"
 tao = "0.33"
 signal-hook = "0.3"
+sysinfo = "0.35"
 
 # Workspace crates
 scribe-common = { path = "crates/scribe-common" }

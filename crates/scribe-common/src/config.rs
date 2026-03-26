@@ -380,6 +380,28 @@ fn default_error_entry() -> AiStateEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(
     clippy::struct_excessive_bools,
+    reason = "status bar stats config has independent boolean feature flags, not a state machine"
+)]
+pub struct StatusBarStatsConfig {
+    #[serde(default = "default_true")]
+    pub cpu: bool,
+    #[serde(default = "default_true")]
+    pub memory: bool,
+    #[serde(default = "default_true")]
+    pub gpu: bool,
+    #[serde(default = "default_true")]
+    pub network: bool,
+}
+
+impl Default for StatusBarStatsConfig {
+    fn default() -> Self {
+        Self { cpu: true, memory: true, gpu: true, network: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
     reason = "terminal config has independent boolean feature flags, not a state machine"
 )]
 pub struct TerminalConfig {
@@ -402,6 +424,9 @@ pub struct TerminalConfig {
     /// Height of the AI state indicator bar in pixels.
     #[serde(default = "default_indicator_height")]
     pub indicator_height: f32,
+    /// Which system stats are shown in the status bar.
+    #[serde(default)]
+    pub status_bar_stats: StatusBarStatsConfig,
 }
 
 impl Default for TerminalConfig {
@@ -414,6 +439,7 @@ impl Default for TerminalConfig {
             natural_scroll: false,
             claude_states: ClaudeStatesConfig::default(),
             indicator_height: default_indicator_height(),
+            status_bar_stats: StatusBarStatsConfig::default(),
         }
     }
 }

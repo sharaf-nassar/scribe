@@ -14,6 +14,7 @@ mod search_overlay;
 mod selection;
 mod splash;
 mod status_bar;
+mod sys_stats;
 mod tab_bar;
 mod window_state;
 mod workspace_layout;
@@ -196,6 +197,8 @@ struct App {
 
     /// System hostname for the window-level status bar (fetched once at startup).
     hostname: String,
+    /// System resource stats collector for the status bar.
+    sys_stats: sys_stats::SystemStatsCollector,
 
     /// Config file watcher -- kept alive for its side-effect of sending
     /// `UiEvent::ConfigChanged` events.
@@ -283,6 +286,7 @@ impl App {
             status_bar_gear_rect: None,
             status_bar_equalize_rect: None,
             hostname: read_hostname(),
+            sys_stats: sys_stats::SystemStatsCollector::new(),
             _config_watcher: config_watcher,
         }
     }
@@ -1472,6 +1476,7 @@ impl App {
         // Window-level status bar spanning the full window width.
         {
             let time_str = current_time_str();
+            self.sys_stats.maybe_refresh();
             let sb_data = status_bar::StatusBarData {
                 connected: self.server_connected,
                 show_equalize: multi_workspace,
@@ -1481,6 +1486,8 @@ impl App {
                 session_count,
                 hostname: &self.hostname,
                 time: &time_str,
+                sys_stats: Some(self.sys_stats.stats()),
+                stats_config: Some(&self.config.terminal.status_bar_stats),
             };
             let mut resolve_glyph =
                 |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
