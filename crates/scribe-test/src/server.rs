@@ -1,13 +1,23 @@
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use scribe_common::error::ScribeError;
-use scribe_common::socket::server_socket_path;
+use scribe_common::socket::{current_uid, server_socket_path};
 
-/// Path to the PID file used to track the running scribe-server process.
-const PID_FILE: &str = "/tmp/scribe-server.pid";
+/// Returns the path to the PID file used to track the running scribe-server
+/// process. Stored in the user runtime directory alongside the server socket.
+///
+/// - Linux: `/run/user/{uid}/scribe/scribe-server.pid`
+/// - macOS: `$TMPDIR/scribe-{uid}/scribe-server.pid`
+fn pid_file_path() -> PathBuf {
+    server_socket_path().parent().map_or_else(
+        || PathBuf::from(format!("/run/user/{}/scribe/scribe-server.pid", current_uid())),
+        |dir| dir.join("scribe-server.pid"),
+    )
+}
 
 /// Maximum time to wait for the server socket to appear after spawning.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,7 +45,7 @@ pub async fn start() -> Result<(), ScribeError> {
         })?;
 
     let pid = child.id();
-    tokio::fs::write(PID_FILE, pid.to_string())
+    tokio::fs::write(pid_file_path(), pid.to_string())
         .await
         .map_err(|e| ScribeError::IpcError { reason: format!("failed to write PID file: {e}") })?;
 
@@ -66,7 +76,8 @@ async fn wait_for_socket() -> Result<(), ScribeError> {
 /// the process to exit, then sends `SIGKILL` if it is still running. The PID
 /// file is removed before returning.
 pub async fn stop() -> Result<(), ScribeError> {
-    let pid_str = tokio::fs::read_to_string(PID_FILE)
+    let pid_file = pid_file_path();
+    let pid_str = tokio::fs::read_to_string(&pid_file)
         .await
         .map_err(|e| ScribeError::IpcError { reason: format!("failed to read PID file: {e}") })?;
 
@@ -79,7 +90,7 @@ pub async fn stop() -> Result<(), ScribeError> {
 
     send_signal_and_wait(pid).await?;
 
-    tokio::fs::remove_file(PID_FILE)
+    tokio::fs::remove_file(&pid_file)
         .await
         .map_err(|e| ScribeError::IpcError { reason: format!("failed to remove PID file: {e}") })?;
 
@@ -93,7 +104,7 @@ pub async fn stop() -> Result<(), ScribeError> {
 /// new server. The old server exits after the handoff. The PID file is
 /// updated to point to the new process.
 pub async fn upgrade() -> Result<(), ScribeError> {
-    let old_pid_str = tokio::fs::read_to_string(PID_FILE)
+    let old_pid_str = tokio::fs::read_to_string(pid_file_path())
         .await
         .map_err(|e| ScribeError::IpcError { reason: format!("failed to read PID file: {e}") })?;
 
@@ -134,7 +145,7 @@ pub async fn upgrade() -> Result<(), ScribeError> {
     wait_for_socket().await?;
 
     // Update PID file to point to the new process.
-    tokio::fs::write(PID_FILE, new_pid.to_string())
+    tokio::fs::write(pid_file_path(), new_pid.to_string())
         .await
         .map_err(|e| ScribeError::IpcError { reason: format!("failed to write PID file: {e}") })?;
 

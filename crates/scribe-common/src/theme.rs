@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::error::ScribeError;
 
 #[path = "theme_community_presets.rs"]
@@ -33,7 +35,7 @@ pub struct ChromeColors {
 /// A complete terminal color theme including chrome (UI) colors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     pub foreground: [f32; 4],
     pub background: [f32; 4],
     pub cursor: [f32; 4],
@@ -45,9 +47,9 @@ pub struct Theme {
 }
 
 /// Input parameters for constructing a `Theme` via [`Theme::from_colors`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ThemeColors {
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     pub foreground: [f32; 4],
     pub background: [f32; 4],
     pub cursor: [f32; 4],
@@ -63,7 +65,7 @@ impl Theme {
     pub fn from_colors(colors: &ThemeColors) -> Self {
         let chrome = Self::derive_chrome(colors.foreground, colors.background, &colors.ansi_colors);
         Self {
-            name: colors.name,
+            name: colors.name.clone(),
             foreground: colors.foreground,
             background: colors.background,
             cursor: colors.cursor,
@@ -282,7 +284,7 @@ impl ThemeSpec {
         let chrome = Theme::derive_chrome(foreground, background, &ansi_colors);
 
         Theme {
-            name: self.name,
+            name: Cow::Borrowed(self.name),
             foreground,
             background,
             cursor,

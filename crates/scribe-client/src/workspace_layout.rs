@@ -673,7 +673,7 @@ fn node_from_tree(tree: &WorkspaceTreeNode) -> WindowNode {
         }),
         WorkspaceTreeNode::Split { direction, ratio, first, second } => WindowNode::Split {
             direction: direction_from_protocol(*direction),
-            ratio: *ratio,
+            ratio: ratio.clamp(0.1, 0.9),
             first: Box::new(node_from_tree(first)),
             second: Box::new(node_from_tree(second)),
         },

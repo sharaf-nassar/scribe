@@ -67,6 +67,9 @@ pub struct TerminalRenderer {
     cursor_color: [f32; 4],
     selection_bg: [f32; 4],
     selection_fg: [f32; 4],
+    /// Reusable buffer for cells collected from `display_iter`, cleared and
+    /// refilled each frame to avoid per-frame heap allocation.
+    cell_scratch: Vec<CollectedCell>,
 }
 
 impl TerminalRenderer {
@@ -106,18 +109,21 @@ impl TerminalRenderer {
             default_fg: srgb_to_linear_rgba([0.8, 0.8, 0.8, 1.0]),
             default_bg: srgb_to_linear_rgba([0.0, 0.0, 0.0, 1.0]),
             default_fg_dim: {
-                let fg = srgb_to_linear_rgba([0.8, 0.8, 0.8, 1.0]);
+                // Apply DIM in sRGB space: multiply the sRGB value by DIM_FACTOR,
+                // then convert to linear for the GPU pipeline.
+                let srgb = [0.8_f32, 0.8, 0.8, 1.0];
                 [
-                    fg.first().copied().unwrap_or(0.0) * DIM_FACTOR,
-                    fg.get(1).copied().unwrap_or(0.0) * DIM_FACTOR,
-                    fg.get(2).copied().unwrap_or(0.0) * DIM_FACTOR,
-                    fg.get(3).copied().unwrap_or(1.0),
+                    srgb_channel_to_linear(srgb[0] * DIM_FACTOR),
+                    srgb_channel_to_linear(srgb[1] * DIM_FACTOR),
+                    srgb_channel_to_linear(srgb[2] * DIM_FACTOR),
+                    srgb[3],
                 ]
             },
             cursor_shape: CursorShape::Block,
             cursor_color: srgb_to_linear_rgba([0.8, 0.8, 0.8, 1.0]),
             selection_bg: srgb_to_linear_rgba([0.25, 0.25, 0.28, 1.0]),
             selection_fg: srgb_to_linear_rgba([1.0, 1.0, 1.0, 1.0]),
+            cell_scratch: Vec::new(),
         }
     }
 
@@ -152,10 +158,6 @@ impl TerminalRenderer {
         offset: (f32, f32),
         cursor_visible: bool,
     ) -> Vec<CellInstance> {
-        {
-            let _damage = term.damage();
-        }
-
         let content = term.renderable_content();
         let cursor_point = content.cursor.point;
 
@@ -195,7 +197,6 @@ impl TerminalRenderer {
         );
 
         self.cursor_shape = saved_shape;
-        term.reset_damage();
         instances
     }
 
@@ -232,12 +233,14 @@ impl TerminalRenderer {
         self.default_fg = srgb_to_linear_rgba(theme.foreground);
         self.default_bg = srgb_to_linear_rgba(theme.background);
         self.cursor_color = srgb_to_linear_rgba(theme.cursor);
-        let linear_fg = self.default_fg;
+        // Apply DIM in sRGB space: use the raw sRGB theme foreground values,
+        // multiply by DIM_FACTOR, then convert to linear for the GPU pipeline.
+        let srgb_fg = theme.foreground;
         self.default_fg_dim = [
-            linear_fg.first().copied().unwrap_or(0.0) * DIM_FACTOR,
-            linear_fg.get(1).copied().unwrap_or(0.0) * DIM_FACTOR,
-            linear_fg.get(2).copied().unwrap_or(0.0) * DIM_FACTOR,
-            linear_fg.get(3).copied().unwrap_or(1.0),
+            srgb_channel_to_linear(srgb_fg.first().copied().unwrap_or(0.0) * DIM_FACTOR),
+            srgb_channel_to_linear(srgb_fg.get(1).copied().unwrap_or(0.0) * DIM_FACTOR),
+            srgb_channel_to_linear(srgb_fg.get(2).copied().unwrap_or(0.0) * DIM_FACTOR),
+            srgb_fg.get(3).copied().unwrap_or(1.0),
         ];
         let mut linear_ansi = [[0.0_f32; 4]; 16];
         for (i, color) in theme.ansi_colors.iter().enumerate() {
@@ -294,6 +297,9 @@ impl TerminalRenderer {
         self.cell_size = self.atlas.cell_size();
         self.grid_size = compute_grid_size(self.viewport_size, self.cell_size);
         self.pipeline.rebuild_bind_group(device, self.atlas.texture_view(), self.atlas.sampler());
+        // The atlas texture was replaced: UV coordinates in any cached instance
+        // data are now stale.  Force a full GPU re-upload on the next frame.
+        self.pipeline.invalidate_instance_cache();
         self.pipeline.update_viewport(
             queue,
             self.viewport_size,
@@ -334,17 +340,19 @@ impl TerminalRenderer {
         )]
         let line_offset = content.display_offset as i32;
 
-        // Collect cells: display_iter is a one-shot iterator.
-        let cells: Vec<CollectedCell> = content
-            .display_iter
-            .map(|indexed| CollectedCell {
-                point: indexed.point,
-                c: indexed.cell.c,
-                fg: indexed.cell.fg,
-                bg: indexed.cell.bg,
-                flags: indexed.cell.flags,
-            })
-            .collect();
+        // Collect cells: display_iter is a one-shot iterator.  Reuse the
+        // scratch buffer to avoid a heap allocation every frame.  We take it
+        // out of `self` so the borrow checker lets us call `&mut self` methods
+        // freely inside the loop; the vec is returned to `self` afterwards.
+        self.cell_scratch.clear();
+        self.cell_scratch.extend(content.display_iter.map(|indexed| CollectedCell {
+            point: indexed.point,
+            c: indexed.cell.c,
+            fg: indexed.cell.fg,
+            bg: indexed.cell.bg,
+            flags: indexed.cell.flags,
+        }));
+        let cells = std::mem::take(&mut self.cell_scratch);
 
         // Run ligature pre-pass when the atlas has ligatures enabled.
         let ligature_map = if self.atlas.ligatures() {
@@ -358,33 +366,85 @@ impl TerminalRenderer {
         // Beam/underline cursors push an extra overlay quad — allow some headroom.
         let estimated_capacity =
             usize::from(self.grid_size.cols) * usize::from(self.grid_size.rows) + 1;
-        let mut instances = Vec::with_capacity(estimated_capacity);
+        let instances = self.build_cell_instances(
+            device,
+            queue,
+            &cells,
+            &ligature_map,
+            use_ligatures,
+            line_offset,
+            cell_w,
+            cell_h,
+            offset,
+            cursor_point,
+            cursor_visible,
+            estimated_capacity,
+        );
 
-        for cell in &cells {
-            // Skip spacer cells that follow wide characters.
+        // Return the scratch buffer so it retains its allocation for the next frame.
+        self.cell_scratch = cells;
+        instances
+    }
+
+    /// Build the instance list from a collected-cell slice.
+    ///
+    /// Factored out of `build_instances_offset` so that method stays under the
+    /// 80-line limit while the cell slice can be passed as a plain reference
+    /// (no borrow conflict with `self`).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all render-context parameters are required; factored out purely for line-count"
+    )]
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "use_ligatures and cursor_visible are independent flags with no natural enum grouping"
+    )]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "grid coordinates are small (< 2^16) and fit exactly in f32"
+    )]
+    fn build_cell_instances(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        cells: &[CollectedCell],
+        ligature_map: &LigatureMap,
+        use_ligatures: bool,
+        line_offset: i32,
+        cell_w: f32,
+        cell_h: f32,
+        offset: (f32, f32),
+        cursor_point: alacritty_terminal::index::Point,
+        cursor_visible: bool,
+        estimated_capacity: usize,
+    ) -> Vec<CellInstance> {
+        let mut instances = Vec::with_capacity(estimated_capacity);
+        for cell in cells {
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
                 || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
             {
                 continue;
             }
-
             let col = cell.point.column.0 as f32;
             let row = (cell.point.line.0 + line_offset) as f32;
             let pos = [col * cell_w + offset.0, row * cell_h + offset.1];
-
             let (fg, bg) = self.resolve_cell_colors_raw(cell.fg, cell.bg, cell.flags);
-
-            // Look up glyph UV in the atlas.
             let (uv_min, uv_max) = if use_ligatures {
-                self.resolve_glyph_uv_for_collected(device, queue, cell, &ligature_map)
+                self.resolve_glyph_uv_for_collected_fields(
+                    device,
+                    queue,
+                    cell.c,
+                    cell.flags,
+                    cell.point.line.0,
+                    cell.point.column.0,
+                    ligature_map,
+                )
             } else {
                 self.resolve_glyph_uv_raw(device, queue, cell.c, cell.flags)
             };
-
             let is_cursor = cursor_visible
                 && cell.point.line == cursor_point.line
                 && cell.point.column == cursor_point.column;
-
             if is_cursor {
                 self.push_cursor_instances(
                     &mut instances,
@@ -407,7 +467,6 @@ impl TerminalRenderer {
                 });
             }
         }
-
         instances
     }
 
@@ -581,24 +640,33 @@ impl TerminalRenderer {
         (entry.uv_min, entry.uv_max)
     }
 
-    /// Resolve glyph UV for a collected cell, checking ligature map first.
+    /// Resolve glyph UV for a cell, checking ligature map first.
     ///
-    /// If the cell is found in the ligature map, the shaped glyph is looked
-    /// up (or rasterised) via the atlas shaped cache. For multi-cell ligatures
-    /// the UV is split horizontally so each cell renders its portion of the
-    /// wider glyph.
+    /// Accepts individual cell fields by value so the caller is not required
+    /// to hold a borrow on `self.cell_scratch` while calling this `&mut self`
+    /// method. If the cell is found in the ligature map, the shaped glyph is
+    /// looked up (or rasterised) via the atlas shaped cache. For multi-cell
+    /// ligatures the UV is split horizontally so each cell renders its portion
+    /// of the wider glyph.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all cell fields are needed; using individual values avoids borrow aliasing with self.cell_scratch"
+    )]
     #[allow(
         clippy::cast_precision_loss,
         reason = "glyph_span and cell_index are small integers that fit exactly in f32"
     )]
-    fn resolve_glyph_uv_for_collected(
+    fn resolve_glyph_uv_for_collected_fields(
         &mut self,
         device: &Device,
         queue: &Queue,
-        cell: &CollectedCell,
+        c: char,
+        flags: Flags,
+        line: i32,
+        column: usize,
         ligature_map: &LigatureMap,
     ) -> ([f32; 2], [f32; 2]) {
-        if cell.c == ' ' || cell.c == '\u{0}' {
+        if c == ' ' || c == '\u{0}' {
             return ([0.0, 0.0], [0.0, 0.0]);
         }
 
@@ -606,11 +674,11 @@ impl TerminalRenderer {
         // atlas (in `rasterize_rgba`). Skip the ligature map so they are
         // never served via the shaped-glyph path, which would bypass the
         // procedural renderer.
-        if crate::box_drawing::is_box_drawing(cell.c) {
-            return self.resolve_glyph_uv_raw(device, queue, cell.c, cell.flags);
+        if crate::box_drawing::is_box_drawing(c) {
+            return self.resolve_glyph_uv_raw(device, queue, c, flags);
         }
 
-        if let Some(info) = ligature_map.get(&(cell.point.line.0, cell.point.column.0)) {
+        if let Some(info) = ligature_map.get(&(line, column)) {
             let entry = self.atlas.get_or_insert_shaped(queue, info.cache_key, info.glyph_span);
 
             if info.glyph_span > 1 {
@@ -626,7 +694,7 @@ impl TerminalRenderer {
                 (entry.uv_min, entry.uv_max)
             }
         } else {
-            self.resolve_glyph_uv_raw(device, queue, cell.c, cell.flags)
+            self.resolve_glyph_uv_raw(device, queue, c, flags)
         }
     }
 
@@ -652,27 +720,39 @@ impl TerminalRenderer {
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "viewport / cell_size yields a small positive value that fits in u16"
+    clippy::cast_precision_loss,
+    reason = "viewport as f32 then divided by cell size yields a small positive value that fits in u16; precision loss from u32→f32 is irrelevant at terminal grid scales"
 )]
 fn compute_grid_size(viewport: (u32, u32), cell: CellSize) -> GridSize {
-    let cols =
-        if cell.width > 0.0 { (f32::from(viewport.0 as u16) / cell.width) as u16 } else { 1 };
-    let rows =
-        if cell.height > 0.0 { (f32::from(viewport.1 as u16) / cell.height) as u16 } else { 1 };
+    let cols = if cell.width > 0.0 { (viewport.0 as f32 / cell.width) as u16 } else { 1 };
+    let rows = if cell.height > 0.0 { (viewport.1 as f32 / cell.height) as u16 } else { 1 };
     GridSize { cols: cols.max(1), rows: rows.max(1) }
 }
 
-/// Apply the DIM effect: multiply RGB by [`DIM_FACTOR`], leave alpha unchanged.
+/// Apply the DIM effect in sRGB space, then convert back to linear.
+///
+/// Terminal convention applies DIM by multiplying sRGB channel values by
+/// [`DIM_FACTOR`].  Because our pipeline stores linear colours, we round-trip
+/// through sRGB so the perceptual result matches other terminal emulators.
 fn apply_dim(color: &mut [f32; 4]) {
-    if let Some(r) = color.get_mut(0) {
-        *r *= DIM_FACTOR;
+    // DIM is conventionally applied in sRGB space.  Since our pipeline stores
+    // linear colours, we convert each channel back to sRGB, apply the factor,
+    // and convert to linear again.
+    for c in color.get_mut(..3).into_iter().flatten() {
+        let srgb = linear_to_srgb_channel(*c);
+        *c = srgb_channel_to_linear(srgb * DIM_FACTOR);
     }
-    if let Some(g) = color.get_mut(1) {
-        *g *= DIM_FACTOR;
-    }
-    if let Some(b) = color.get_mut(2) {
-        *b *= DIM_FACTOR;
-    }
+}
+
+/// Convert a single linear channel to sRGB space.
+///
+/// This is the inverse of [`srgb_channel_to_linear`].
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "clarity over micro-optimisation for the standard sRGB transfer function"
+)]
+fn linear_to_srgb_channel(l: f32) -> f32 {
+    if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }
 }
 
 /// Convert a single sRGB channel to linear space.

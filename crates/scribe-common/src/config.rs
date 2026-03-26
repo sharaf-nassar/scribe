@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::ScribeError;
@@ -234,6 +236,25 @@ impl Default for ContentPadding {
             right: default_content_padding_side(),
             bottom: default_content_padding_side(),
             left: default_content_padding_side(),
+        }
+    }
+}
+
+impl AppearanceConfig {
+    /// Return a copy of this config with all float fields clamped to valid ranges.
+    ///
+    /// - `font_size`: clamped to `[4.0, 72.0]`
+    /// - `opacity`: clamped to `[0.0, 1.0]`
+    /// - `scrollbar_width`: clamped to `[0.0, 20.0]`
+    /// - `content_padding`: each side clamped to `[0.0, 50.0]`
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        Self {
+            font_size: self.font_size.clamp(4.0, 72.0),
+            opacity: self.opacity.clamp(0.0, 1.0),
+            scrollbar_width: self.scrollbar_width.clamp(0.0, 20.0),
+            content_padding: self.content_padding.clamped(),
+            ..self
         }
     }
 }
@@ -881,7 +902,7 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
     let mut config: ScribeConfig = toml::from_str(&content)
         .map_err(|e| ScribeError::ConfigError { reason: format!("config parse error: {e}") })?;
 
-    config.appearance.content_padding = config.appearance.content_padding.clamped();
+    config.appearance = config.appearance.clamped();
 
     Ok(config)
 }
@@ -986,11 +1007,8 @@ fn try_build_theme_from_config(tc: &ThemeConfig) -> Result<Theme, ScribeError> {
         }
     }
 
-    // Leak the name string to get a `&'static str` that `Theme` requires.
-    let name: &'static str = Box::leak(tc.name.clone().into_boxed_str());
-
     Ok(Theme::from_colors(&ThemeColors {
-        name,
+        name: Cow::Owned(tc.name.clone()),
         foreground,
         background,
         cursor,

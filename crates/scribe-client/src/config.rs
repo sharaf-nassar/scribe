@@ -18,8 +18,17 @@ pub fn start_config_watcher(proxy: EventLoopProxy<UiEvent>) -> Option<Recommende
     let config_path = config_dir.join("scribe");
 
     let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
-        let dominated = res.ok().is_some_and(|e| e.kind.is_modify() || e.kind.is_create());
-        if dominated && proxy.send_event(UiEvent::ConfigChanged).is_err() {
+        let Some(event) = res.ok() else { return };
+        if !event.kind.is_modify() && !event.kind.is_create() {
+            return;
+        }
+        // Only fire for `config.toml` itself or files inside `themes/` —
+        // avoids spurious reloads from editor swap/backup files.
+        let relevant = event.paths.iter().any(|p| {
+            p.file_name().is_some_and(|n| n == "config.toml")
+                || p.components().any(|c| c.as_os_str() == "themes")
+        });
+        if relevant && proxy.send_event(UiEvent::ConfigChanged).is_err() {
             tracing::debug!("event loop closed; config watcher event dropped");
         }
     })

@@ -124,7 +124,8 @@ pub struct GlyphAtlas {
     metrics: Metrics,
     cell_size: CellSize,
     atlas_size: u32,
-    family: Family<'static>,
+    /// Owned family name; `None` means fall back to system monospace.
+    family_name: Option<String>,
     font_weight: u16,
     font_weight_bold: u16,
     ligatures: bool,
@@ -138,13 +139,14 @@ impl GlyphAtlas {
 
         // Validate the requested font family against fontdb; fall back to
         // the system monospace if the family is not found.
-        let family = resolve_family(&font_system, params);
+        let family_name = resolve_family(&font_system, params);
 
         // line_height = font_size * 1.2 plus any configured line padding.
         let line_height = params.size * 1.2 + f32::from(params.line_padding);
         let metrics = Metrics::new(params.size, line_height);
 
         // Measure the cell size by shaping "M" (a wide capital letter).
+        let family = family_name_to_cosmic(family_name.as_deref());
         let cell_size = measure_cell(&mut font_system, metrics, family, params.ligatures);
 
         // Create the atlas texture.
@@ -154,7 +156,8 @@ impl GlyphAtlas {
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8UnormSrgb,
+            // Alpha-coverage only; no sRGB colour data stored in this atlas.
+            format: TextureFormat::Rgba8Unorm,
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -184,7 +187,7 @@ impl GlyphAtlas {
             metrics,
             cell_size,
             atlas_size: ATLAS_SIZE,
-            family,
+            family_name,
             font_weight: params.weight,
             font_weight_bold: params.weight_bold,
             ligatures: params.ligatures,
@@ -214,6 +217,7 @@ impl GlyphAtlas {
     /// Look up a glyph entry in the cache; rasterise and upload on a miss.
     ///
     /// Returns a fallback entry (zeroed UVs) if the glyph cannot be packed.
+    /// Atlas-overflow failures are NOT cached so a future rebuild can retry.
     pub fn get_or_insert(&mut self, device: &Device, queue: &Queue, key: GlyphKey) -> GlyphEntry {
         if let Some(entry) = self.cache.get(&key) {
             return *entry;
@@ -222,7 +226,11 @@ impl GlyphAtlas {
         // Rasterise on a cache miss.
         let entry = self.rasterize(queue, key);
         let _ = device; // device reserved for future atlas resize
-        self.cache.insert(key, entry);
+        // Only cache entries with valid UVs; a zero-UV result from atlas
+        // overflow must not be stored so a future rebuild can try again.
+        if entry.uv_max != [0.0, 0.0] {
+            self.cache.insert(key, entry);
+        }
         entry
     }
 
@@ -233,6 +241,12 @@ impl GlyphAtlas {
         };
 
         let Some((px, py)) = self.packer.pack(width, height) else {
+            tracing::warn!(
+                c = %key.c,
+                bold = key.bold,
+                italic = key.italic,
+                "glyph atlas full — could not pack glyph; rebuild atlas to recover"
+            );
             return Self::empty_entry();
         };
 
@@ -458,13 +472,28 @@ impl GlyphAtlas {
         cache_key: CacheKey,
         glyph_span: u8,
     ) -> GlyphEntry {
+        // Cap the shaped glyph cache to avoid unbounded growth from many unique
+        // glyphs (e.g. unicode-heavy output over long sessions).
+        if self.shaped_cache.len() > 8192 {
+            // Evict roughly half the entries instead of clearing the entire cache.
+            // This avoids a burst of cache misses after eviction.
+            let mut keep = false;
+            self.shaped_cache.retain(|_, _| {
+                keep = !keep;
+                keep
+            });
+        }
         let key = (cache_key, glyph_span);
         if let Some(entry) = self.shaped_cache.get(&key) {
             return *entry;
         }
 
         let entry = self.rasterize_shaped(queue, cache_key, glyph_span);
-        self.shaped_cache.insert(key, entry);
+        // Only cache entries with valid UVs; a zero-UV result from atlas
+        // overflow must not be stored so a future rebuild can try again.
+        if entry.uv_max != [0.0, 0.0] {
+            self.shaped_cache.insert(key, entry);
+        }
         entry
     }
 
@@ -481,6 +510,10 @@ impl GlyphAtlas {
         };
 
         let Some((px, py)) = self.packer.pack(width, height) else {
+            tracing::warn!(
+                glyph_span,
+                "glyph atlas full — could not pack shaped glyph; rebuild atlas to recover"
+            );
             return Self::empty_entry();
         };
 
@@ -496,20 +529,41 @@ impl GlyphAtlas {
     /// Results are cached by `(text, bold, italic)`. The returned slice is
     /// valid for the lifetime of the atlas.
     ///
-    /// Uses a two-step cache lookup (`contains_key` then get) to avoid holding a
-    /// borrow across the mutable call to `shape_run_uncached`.
+    /// Uses a two-step cache lookup (`contains_key` then `get`) to avoid
+    /// holding a borrow across the mutable call to `shape_run_uncached`.
+    /// The key is constructed once and reused for both the miss-insert and the
+    /// final lookup, avoiding a second `to_owned()` allocation.
     #[allow(
         clippy::fn_params_excessive_bools,
         reason = "bold and italic are font variant flags, not control flow bools"
     )]
     pub fn shape_run(&mut self, text: &str, bold: bool, italic: bool) -> &[ShapedRunGlyph] {
+        // Cap the run shape cache to avoid unbounded growth across many unique
+        // text runs (e.g. long-running sessions with varied output).
+        if self.run_shape_cache.len() > 4096 {
+            // Evict roughly half the entries instead of clearing the entire cache.
+            // This avoids a burst of cache misses after eviction.
+            let mut keep = false;
+            self.run_shape_cache.retain(|_, _| {
+                keep = !keep;
+                keep
+            });
+        }
         let key = RunShapeKey { text: text.to_owned(), bold, italic };
         if !self.run_shape_cache.contains_key(&key) {
             let glyphs = self.shape_run_uncached(text, bold, italic);
-            self.run_shape_cache.insert(key.clone(), glyphs);
+            // Move `key` into insert to avoid cloning the String.  The final
+            // get below rebuilds a key, but that only runs on the cold miss path.
+            self.run_shape_cache.insert(key, glyphs);
+            let miss_key = RunShapeKey { text: text.to_owned(), bold, italic };
+            #[allow(clippy::unwrap_used, reason = "entry was just inserted above")]
+            return self.run_shape_cache.get(&miss_key).unwrap();
         }
-        #[allow(clippy::unwrap_used, reason = "key was just inserted above")]
-        self.run_shape_cache.get(&key).unwrap()
+        // The key was either already present or just inserted above; `get`
+        // returns `None` only if the key is absent, which cannot happen here.
+        // An empty-slice fallback is used instead of `unwrap` to satisfy the
+        // `unwrap_used` lint — the fallback is unreachable in practice.
+        self.run_shape_cache.get(&key).map_or(&[], Vec::as_slice)
     }
 
     /// Shape a text run without consulting the cache.
@@ -529,7 +583,14 @@ impl GlyphAtlas {
     )]
     fn shape_run_uncached(&mut self, text: &str, bold: bool, italic: bool) -> Vec<ShapedRunGlyph> {
         let mut buf = Buffer::new_empty(self.metrics);
-        let attrs = self.build_attrs_raw(bold, italic);
+        let family_str = self.family_name.as_deref();
+        let attrs = Self::build_attrs_from(
+            family_str,
+            self.font_weight,
+            self.font_weight_bold,
+            bold,
+            italic,
+        );
         buf.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
 
         let cell_w = self.cell_size.width;
@@ -547,16 +608,25 @@ impl GlyphAtlas {
         glyphs
     }
 
-    /// Build `Attrs` from raw bold/italic flags (without a full `GlyphKey`).
+    /// Build `Attrs` from a family name string slice and raw bold/italic flags.
+    ///
+    /// This is a free helper (not `&self`) so that callers can extract the
+    /// family name first and then freely borrow `self.font_system` mutably.
     #[allow(
         clippy::fn_params_excessive_bools,
         reason = "bold and italic are font variant flags, not control flow bools"
     )]
-    fn build_attrs_raw(&self, bold: bool, italic: bool) -> Attrs<'static> {
+    fn build_attrs_from(
+        family_name: Option<&str>,
+        weight: u16,
+        weight_bold: u16,
+        bold: bool,
+        italic: bool,
+    ) -> Attrs<'_> {
         use cosmic_text::{Style, Weight};
         Attrs::new()
-            .family(self.family)
-            .weight(Weight(if bold { self.font_weight_bold } else { self.font_weight }))
+            .family(family_name_to_cosmic(family_name))
+            .weight(Weight(if bold { weight_bold } else { weight }))
             .style(if italic { Style::Italic } else { Style::Normal })
     }
 
@@ -580,7 +650,14 @@ impl GlyphAtlas {
     /// Shape the character and return the first glyph's `CacheKey`.
     fn shape_cache_key(&mut self, key: GlyphKey) -> Option<cosmic_text::CacheKey> {
         let mut buf = Buffer::new_empty(self.metrics);
-        let attrs = self.build_attrs(key);
+        let family_str = self.family_name.as_deref();
+        let attrs = Self::build_attrs_from(
+            family_str,
+            self.font_weight,
+            self.font_weight_bold,
+            key.bold,
+            key.italic,
+        );
         let mut char_buf = [0u8; 4];
         let text = key.c.encode_utf8(&mut char_buf);
         let shaping = if self.ligatures { Shaping::Advanced } else { Shaping::Basic };
@@ -590,15 +667,6 @@ impl GlyphAtlas {
             .next()
             .and_then(|run| run.glyphs.first())
             .map(|g| g.physical((0.0, 0.0), 1.0).cache_key)
-    }
-
-    /// Build `Attrs` for the given `GlyphKey` using the stored font settings.
-    fn build_attrs(&self, key: GlyphKey) -> Attrs<'static> {
-        use cosmic_text::{Style, Weight};
-        Attrs::new()
-            .family(self.family)
-            .weight(Weight(if key.bold { self.font_weight_bold } else { self.font_weight }))
-            .style(if key.italic { Style::Italic } else { Style::Normal })
     }
 
     /// Return an empty (zero-size) glyph entry used as a safe fallback.
@@ -646,9 +714,10 @@ impl GlyphAtlas {
 
 /// Validate the font family name against the fontdb.
 ///
-/// Returns a `Family::Name` with a leaked `'static` str if the font is found,
-/// or `Family::Monospace` as a fallback.
-fn resolve_family(font_system: &FontSystem, params: &FontParams) -> Family<'static> {
+/// Returns `Some(name)` if the font is found, `None` to fall back to the
+/// system monospace.  The caller stores the `String` and borrows from it
+/// via [`family_name_to_cosmic`] — no heap leak needed.
+fn resolve_family(font_system: &FontSystem, params: &FontParams) -> Option<String> {
     let query = fontdb::Query {
         families: &[fontdb::Family::Name(&params.family)],
         weight: fontdb::Weight(params.weight),
@@ -657,14 +726,16 @@ fn resolve_family(font_system: &FontSystem, params: &FontParams) -> Family<'stat
     };
 
     if font_system.db().query(&query).is_some() {
-        // Leak the string to obtain a `'static` lifetime, matching the
-        // pattern used for theme names in config.rs.
-        let leaked: &'static str = Box::leak(params.family.clone().into_boxed_str());
-        Family::Name(leaked)
+        Some(params.family.clone())
     } else {
         tracing::warn!(family = %params.family, "font family not found, falling back to system monospace");
-        Family::Monospace
+        None
     }
+}
+
+/// Convert an optional owned family name to a borrowed `cosmic_text::Family`.
+fn family_name_to_cosmic(name: Option<&str>) -> Family<'_> {
+    name.map_or(Family::Monospace, Family::Name)
 }
 
 /// Convert swash image content to a flat RGBA byte vector.
@@ -698,21 +769,22 @@ struct BlitParams {
 /// Copy glyph RGBA pixels onto a cell-sized canvas, clipping any pixels
 /// that fall outside the canvas bounds.
 fn blit_glyph(src: &[u8], dst: &mut [u8], p: &BlitParams) {
+    // Number of source columns that actually fit within the destination.
+    let visible_w = p.src_w.min(p.dst_w.saturating_sub(p.dest_x));
+    if visible_w == 0 {
+        return;
+    }
+    let row_bytes = visible_w as usize * 4;
+
     for gy in 0..p.src_h {
         let cy = p.dest_y + gy;
         if cy >= p.dst_h {
             break;
         }
-        for gx in 0..p.src_w {
-            let cx = p.dest_x + gx;
-            if cx >= p.dst_w {
-                continue;
-            }
-            let si = (gy * p.src_w + gx) as usize * 4;
-            let di = (cy * p.dst_w + cx) as usize * 4;
-            if let (Some(s), Some(d)) = (src.get(si..si + 4), dst.get_mut(di..di + 4)) {
-                d.copy_from_slice(s);
-            }
+        let si = (gy * p.src_w) as usize * 4;
+        let di = (cy * p.dst_w + p.dest_x) as usize * 4;
+        if let (Some(s), Some(d)) = (src.get(si..si + row_bytes), dst.get_mut(di..di + row_bytes)) {
+            d.copy_from_slice(s);
         }
     }
 }
@@ -788,6 +860,11 @@ fn measure_cell(
 }
 
 /// Fill the atlas texture with transparent black so it is well-defined.
+///
+/// This allocates a ~4 MB zeroed buffer (1024×1024×4 bytes) on construction.
+/// It only runs once per atlas lifetime so the allocation cost is acceptable.
+/// wgpu's `Features::CLEAR_TEXTURE` would avoid the CPU buffer, but requiring
+/// that feature would break compatibility with some older backends.
 fn clear_texture(queue: &Queue, texture: &wgpu::Texture, size: u32) {
     let pixel_count = (size * size) as usize;
     let data = vec![0u8; pixel_count * 4];

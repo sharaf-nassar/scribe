@@ -52,6 +52,8 @@ struct SessionState {
     latest_snapshot: Option<ScreenSnapshot>,
     /// When the latest snapshot was received, for cache freshness checks.
     snapshot_time: Option<tokio::time::Instant>,
+    /// When the most recent PTY output was received for this session.
+    last_output_at: Option<tokio::time::Instant>,
     cwd: Option<PathBuf>,
     title: Option<String>,
     status: SessionStatus,
@@ -63,6 +65,7 @@ impl SessionState {
             output_buffer: VecDeque::with_capacity(MAX_OUTPUT_BUFFER),
             latest_snapshot: None,
             snapshot_time: None,
+            last_output_at: None,
             cwd: None,
             title: None,
             status: SessionStatus::Running,
@@ -338,6 +341,7 @@ async fn handle_pty_output(
     if let Some(session) = guard.sessions.get_mut(&session_id) {
         session.output_buffer.extend(data);
         drain_output_buffer(session_id, &mut session.output_buffer);
+        session.last_output_at = Some(tokio::time::Instant::now());
         drop(guard);
         notifiers.output.notify_waiters();
     }
@@ -532,7 +536,7 @@ async fn process_request(
             handle_wait_cwd(session_id, &path, timeout_ms, state, notifiers).await
         }
         DaemonRequest::WaitIdle { session_id, quiet_ms, timeout_ms } => {
-            handle_wait_idle(session_id, quiet_ms, timeout_ms, notifiers).await
+            handle_wait_idle(session_id, quiet_ms, timeout_ms, notifiers, state).await
         }
         DaemonRequest::AssertCell { session_id, row, col, expected } => {
             let params = CellAssertParams { session_id, row, col, expected };
@@ -824,16 +828,29 @@ async fn check_cwd_match(session_id: SessionId, expected: &PathBuf, state: &Shar
     session.cwd.as_ref() == Some(expected)
 }
 
-/// Wait until no PTY output arrives for `quiet_ms` duration.
+/// Wait until no PTY output arrives for `quiet_ms` duration for the given session.
+///
+/// The global output notifier fires for all sessions, so after each
+/// notification we check whether the output was for our session by comparing
+/// `last_output_at`. Only output belonging to `session_id` resets the quiet
+/// timer.
 async fn handle_wait_idle(
     session_id: SessionId,
     quiet_ms: u64,
     timeout_ms: u64,
     notifiers: &Arc<WaitNotifiers>,
+    state: &SharedState,
 ) -> DaemonResponse {
     let quiet = Duration::from_millis(quiet_ms);
     let timeout = Duration::from_millis(timeout_ms);
     let deadline = tokio::time::Instant::now() + timeout;
+
+    // Record the last output time for this session at the start of the wait.
+    // When the notifier fires, we compare against this to detect new output.
+    let mut last_seen = {
+        let guard = state.lock().await;
+        guard.sessions.get(&session_id).and_then(|s| s.last_output_at)
+    };
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -843,14 +860,29 @@ async fn handle_wait_idle(
             };
         }
 
-        // Wait for quiet period or new output.
+        // Wait for the quiet period or a global output notification.
         let wait_time = quiet.min(remaining);
         let result = tokio::time::timeout(wait_time, notifiers.output.notified()).await;
         if result.is_err() {
-            // Timeout means no output for wait_time — idle achieved.
+            // Timed out waiting — no output for wait_time. Idle achieved.
             return DaemonResponse::Ok;
         }
-        // Output arrived — reset the quiet timer and loop again.
+
+        // A notification fired. Check whether it belongs to our session.
+        let current = {
+            let guard = state.lock().await;
+            guard.sessions.get(&session_id).and_then(|s| s.last_output_at)
+        };
+
+        if current != last_seen {
+            // New output for our session — reset the quiet timer by updating
+            // last_seen and looping; the next iteration will wait another
+            // full quiet period.
+            last_seen = current;
+        }
+        // If current == last_seen, the output was from a different session;
+        // the quiet period is uninterrupted for our session — loop and wait
+        // again for the remaining quiet duration.
     }
 }
 

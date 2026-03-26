@@ -54,29 +54,6 @@ pub fn build_html() -> Result<String, String> {
 /// Query the system for installed monospace font families.
 ///
 /// Returns a sorted, deduplicated list of font family names.
-#[cfg(target_os = "linux")]
-fn list_monospace_fonts() -> Vec<String> {
-    use std::collections::BTreeSet;
-
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
-
-    let mut families = BTreeSet::new();
-    for info in db.faces() {
-        if info.monospaced {
-            for (name, _) in &info.families {
-                families.insert(name.clone());
-            }
-        }
-    }
-
-    families.into_iter().collect()
-}
-
-/// Query the system for installed monospace font families (macOS / other).
-///
-/// Returns a sorted, deduplicated list of font family names.
-#[cfg(not(target_os = "linux"))]
 fn list_monospace_fonts() -> Vec<String> {
     use std::collections::BTreeSet;
 
@@ -96,7 +73,6 @@ fn list_monospace_fonts() -> Vec<String> {
 }
 
 /// Inject keybinding defaults into the webview for reset-to-default support.
-#[cfg(target_os = "linux")]
 fn inject_keybinding_defaults(webview: &wry::WebView) {
     let defaults = scribe_common::config::KeybindingsConfig::default();
     let json = serde_json::to_string(&defaults).unwrap_or_else(|_| String::from("{}"));
@@ -109,32 +85,6 @@ fn inject_keybinding_defaults(webview: &wry::WebView) {
 }
 
 /// Inject the available font list into the webview.
-#[cfg(target_os = "linux")]
-fn inject_font_list(webview: &wry::WebView) {
-    let fonts = list_monospace_fonts();
-    let fonts_json = serde_json::to_string(&fonts).unwrap_or_else(|_| String::from("[]"));
-    let script =
-        format!("if (typeof loadFontList === 'function') {{ loadFontList({fonts_json}); }}");
-    if let Err(e) = webview.evaluate_script(&script) {
-        tracing::warn!("failed to inject font list into settings webview: {e}");
-    }
-}
-
-/// Inject keybinding defaults into the webview for reset-to-default support.
-#[cfg(not(target_os = "linux"))]
-fn inject_keybinding_defaults(webview: &wry::WebView) {
-    let defaults = scribe_common::config::KeybindingsConfig::default();
-    let json = serde_json::to_string(&defaults).unwrap_or_else(|_| String::from("{}"));
-    let script = format!(
-        "if (typeof loadKeybindingDefaults === 'function') {{ loadKeybindingDefaults({json}); }}"
-    );
-    if let Err(e) = webview.evaluate_script(&script) {
-        tracing::warn!("failed to inject keybinding defaults into settings webview: {e}");
-    }
-}
-
-/// Inject the available font list into the webview.
-#[cfg(not(target_os = "linux"))]
 fn inject_font_list(webview: &wry::WebView) {
     let fonts = list_monospace_fonts();
     let fonts_json = serde_json::to_string(&fonts).unwrap_or_else(|_| String::from("[]"));
@@ -227,7 +177,12 @@ pub fn run_settings_window(
         .with_html(&html)
         .with_ipc_handler(move |request| {
             let body = request.body();
-            if body.contains("\"type\":\"request_fonts\"") {
+            let is_request_fonts = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+                .as_deref()
+                == Some("request_fonts");
+            if is_request_fonts {
                 if let Some(wv) = webview_for_ipc.borrow().as_ref() {
                     inject_font_list(wv);
                 }
@@ -262,17 +217,35 @@ pub fn run_settings_window(
         gtk::glib::ControlFlow::Continue
     });
 
-    // SIGTERM/SIGINT handlers via glib (signal-safe, runs in GTK main loop).
-    gtk::glib::unix_signal_add_local(libc::SIGTERM, || {
-        gtk::main_quit();
-        gtk::glib::ControlFlow::Break
-    });
-    gtk::glib::unix_signal_add_local(libc::SIGINT, || {
+    // Wrap on_close in an Rc<RefCell<Option<...>>> so it can be shared
+    // between the delete-event handler and the SIGTERM/SIGINT signal handlers.
+    // Each handler calls take() to fire the callback exactly once.
+    let on_close = Rc::new(RefCell::new(Some(on_close)));
+
+    let window_for_sigterm = window.clone();
+    let on_close_for_sigterm = Rc::clone(&on_close);
+    gtk::glib::unix_signal_add_local(libc::SIGTERM, move || {
+        let (x, y) = window_for_sigterm.position();
+        let (width, height) = window_for_sigterm.size();
+        if let Some(cb) = on_close_for_sigterm.borrow_mut().take() {
+            cb(SettingsWindowGeometry { x, y, width, height });
+        }
         gtk::main_quit();
         gtk::glib::ControlFlow::Break
     });
 
-    let on_close = RefCell::new(Some(on_close));
+    let window_for_sigint = window.clone();
+    let on_close_for_sigint = Rc::clone(&on_close);
+    gtk::glib::unix_signal_add_local(libc::SIGINT, move || {
+        let (x, y) = window_for_sigint.position();
+        let (width, height) = window_for_sigint.size();
+        if let Some(cb) = on_close_for_sigint.borrow_mut().take() {
+            cb(SettingsWindowGeometry { x, y, width, height });
+        }
+        gtk::main_quit();
+        gtk::glib::ControlFlow::Break
+    });
+
     window.connect_delete_event(move |win, _| {
         let (x, y) = win.position();
         let (width, height) = win.size();
@@ -427,7 +400,12 @@ pub fn run_settings_window(
         .with_html(&html)
         .with_ipc_handler(move |request| {
             let body = request.body();
-            if body.contains("\"type\":\"request_fonts\"") {
+            let is_request_fonts = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+                .as_deref()
+                == Some("request_fonts");
+            if is_request_fonts {
                 if let Some(wv) = webview_for_ipc.borrow().as_ref() {
                     inject_font_list(wv);
                 }

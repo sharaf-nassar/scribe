@@ -43,6 +43,17 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let payload = rmp_serde::to_vec_named(msg)?;
+
+    if payload.len() > MAX_MESSAGE_SIZE as usize {
+        return Err(ScribeError::ProtocolError {
+            reason: format!(
+                "outgoing message size {} exceeds limit {}",
+                payload.len(),
+                MAX_MESSAGE_SIZE
+            ),
+        });
+    }
+
     let len: u32 = payload
         .len()
         .try_into()

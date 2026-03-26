@@ -35,13 +35,25 @@ pub enum ClientMessage {
         session_id: SessionId,
     },
     CreateWorkspace,
+    /// Close a workspace by ID.
+    ///
+    /// TODO: not yet implemented on the server side — the server does not currently
+    /// handle this variant.
     CloseWorkspace {
         workspace_id: WorkspaceId,
     },
+    /// Move a session to a different workspace.
+    ///
+    /// TODO: not yet implemented on the server side — the server does not currently
+    /// handle this variant.
     MoveSession {
         session_id: SessionId,
         target_workspace: WorkspaceId,
     },
+    /// Request a scrollback snapshot at a given offset from the bottom.
+    ///
+    /// TODO: not yet implemented on the server side — the server does not currently
+    /// handle this variant.
     ScrollRequest {
         session_id: SessionId,
         offset: i32,
@@ -67,6 +79,9 @@ pub enum ClientMessage {
         tree: WorkspaceTreeNode,
     },
     /// Search for text in the terminal scrollback/screen.
+    ///
+    /// TODO: not yet implemented on the server side — the server does not currently
+    /// handle this variant.
     SearchRequest {
         session_id: SessionId,
         query: String,

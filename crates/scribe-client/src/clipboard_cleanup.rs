@@ -200,6 +200,11 @@ fn is_intentional_break(line: &str) -> bool {
         return true;
     }
 
+    // Blockquote marker: > optionally followed by space.
+    if stripped.starts_with('>') {
+        return true;
+    }
+
     // Unordered list marker: -, *, + followed by space.
     if starts_with_list_marker(stripped) {
         return true;
@@ -491,6 +496,15 @@ mod tests {
     }
 
     #[test]
+    fn unwrap_preserves_blockquotes() {
+        let w = 40;
+        let line = format!("{:<width$}", "Some prose that wraps at exactly", width = w);
+        let input = format!("{line}\n{line}\n> quoted line one\n> quoted line two");
+        let result = unwrap_lines(&input);
+        assert!(result.contains("\n> quoted line one\n> quoted line two"));
+    }
+
+    #[test]
     fn unwrap_preserves_trailing_newline() {
         let w = 40;
         let line = format!("{:<width$}", "Some prose that wraps at exactly", width = w);
@@ -578,6 +592,12 @@ mod tests {
     fn break_brace_ending() {
         assert!(is_intentional_break("fn main() {"));
         assert!(is_intentional_break("}"));
+    }
+
+    #[test]
+    fn break_blockquote() {
+        assert!(is_intentional_break("> quoted text"));
+        assert!(is_intentional_break(">no space after marker"));
     }
 
     #[test]

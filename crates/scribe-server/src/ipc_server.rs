@@ -396,14 +396,14 @@ async fn dispatch_message(
             .await;
         }
         ClientMessage::KeyInput { session_id, data } => {
-            handle_key_input(session_id, &data, live_sessions).await;
+            handle_key_input(session_id, &data, live_sessions, attached_ids).await;
         }
         ClientMessage::CloseSession { session_id } => {
             handle_close_session(session_id, workspace_manager, live_sessions, attached_ids).await;
             workspace_manager.write().await.remove_session_from_window(session_id);
         }
         ClientMessage::Resize { session_id, cols, rows } => {
-            handle_resize(session_id, cols, rows, live_sessions).await;
+            handle_resize(session_id, cols, rows, live_sessions, attached_ids).await;
         }
         ClientMessage::Subscribe { session_ids } => {
             let cap = session_ids.len().min(MAX_SUBSCRIBE_IDS);
@@ -430,7 +430,7 @@ async fn dispatch_message(
             .await;
         }
         ClientMessage::ConfigReloaded => {
-            handle_config_reloaded();
+            handle_config_reloaded(session_manager, live_sessions).await;
         }
         ClientMessage::ReportWorkspaceTree { tree } => {
             debug!(%window_id, "received workspace tree from client");
@@ -521,7 +521,8 @@ async fn handle_create_session(
         Some(writer),
         workspace_manager,
         live_sessions,
-    );
+    )
+    .await;
     attached_ids.insert(session_id);
 }
 
@@ -529,11 +530,15 @@ async fn handle_create_session(
 /// the PTY reader task. When `writer` is `None` the session starts in
 /// detached mode (PTY reader runs but output is silently discarded until
 /// a client attaches).
+///
+/// The registry insert is performed synchronously (before the PTY reader
+/// task is spawned) to eliminate the race where `CloseSession` could arrive
+/// before the session is visible in the registry.
 #[allow(
     clippy::too_many_arguments,
     reason = "session startup wires together all subsystem references"
 )]
-fn start_session(
+async fn start_session(
     session_id: SessionId,
     workspace_id: WorkspaceId,
     session: ManagedSession,
@@ -572,12 +577,9 @@ fn start_session(
         handoff_snapshot,
     };
 
-    // Insert into registry synchronously (called from an async context
-    // but we use try_write to avoid blocking the event loop).
-    let ls = Arc::clone(live_sessions);
-    tokio::spawn(async move {
-        ls.write().await.insert(session_id, live);
-    });
+    // Insert into the registry before spawning the PTY reader task so that
+    // any concurrent `CloseSession` message sees the session immediately.
+    live_sessions.write().await.insert(session_id, live);
 
     let state = PtyReaderState {
         session_id,
@@ -599,7 +601,17 @@ fn start_session(
 }
 
 /// Write key input data to the PTY.
-async fn handle_key_input(session_id: SessionId, data: &[u8], live_sessions: &LiveSessionRegistry) {
+async fn handle_key_input(
+    session_id: SessionId,
+    data: &[u8],
+    live_sessions: &LiveSessionRegistry,
+    attached_ids: &HashSet<SessionId>,
+) {
+    if !attached_ids.contains(&session_id) {
+        tracing::warn!(%session_id, "client sent KeyInput for unattached session");
+        return;
+    }
+
     if data.len() > MAX_KEY_INPUT_BYTES {
         warn!(
             %session_id,
@@ -630,6 +642,11 @@ async fn handle_close_session(
     live_sessions: &LiveSessionRegistry,
     attached_ids: &mut HashSet<SessionId>,
 ) {
+    if !attached_ids.contains(&session_id) {
+        tracing::warn!(%session_id, "client sent CloseSession for unattached session");
+        return;
+    }
+
     live_sessions.write().await.remove(&session_id);
     workspace_manager.write().await.remove_session(session_id);
     attached_ids.remove(&session_id);
@@ -670,7 +687,13 @@ async fn handle_resize(
     cols: u16,
     rows: u16,
     live_sessions: &LiveSessionRegistry,
+    attached_ids: &HashSet<SessionId>,
 ) {
+    if !attached_ids.contains(&session_id) {
+        tracing::warn!(%session_id, "client sent Resize for unattached session");
+        return;
+    }
+
     if cols == 0 || rows == 0 {
         warn!(%session_id, cols, rows, "ignoring resize with zero dimension");
         return;
@@ -941,50 +964,75 @@ async fn handle_attach_sessions(
     drop(sessions);
 
     for entry in attach_data {
+        attach_one_session(&entry, writer, live_sessions, workspace_manager).await;
         attached_ids.insert(entry.session_id);
-
-        // Send SessionCreated so the client can process it through the normal flow.
-        let creation_msg = ServerMessage::SessionCreated {
-            session_id: entry.session_id,
-            workspace_id: entry.workspace_id,
-            shell_name: String::from("shell"),
-        };
-        send_message(writer, &creation_msg).await;
-
-        // Send stored metadata so tabs display correctly on reconnect.
-        send_stored_metadata(writer, entry.session_id, &entry.title, entry.cwd.as_ref()).await;
-
-        // Send workspace info.
-        {
-            let wm = workspace_manager.read().await;
-            if let Some((name, accent_color, split_direction)) =
-                wm.workspace_info(entry.workspace_id)
-            {
-                let msg = ServerMessage::WorkspaceInfo {
-                    workspace_id: entry.workspace_id,
-                    name,
-                    accent_color,
-                    split_direction,
-                };
-                send_message(writer, &msg).await;
-            }
-        }
-
-        let snapshot = take_session_snapshot(entry.session_id, &entry.term, live_sessions).await;
-        let snap_msg = ServerMessage::ScreenSnapshot { session_id: entry.session_id, snapshot };
-        send_message(writer, &snap_msg).await;
-
-        // Set the writer AFTER the snapshot is sent.  The PTY reader task
-        // checks this writer on every read — while it is `None`, output
-        // is silently dropped (the Term state is still updated).  By
-        // deferring the set, we guarantee the client receives the
-        // ScreenSnapshot before any live PtyOutput, preventing stale
-        // terminal state (cursor position, alt-screen mode) from racing
-        // with the snapshot and producing ghost cursors on reconnect.
-        *entry.client_writer.lock().await = Some(Arc::clone(writer));
-
-        info!(session_id = %entry.session_id, "session attached to new client");
     }
+}
+
+/// Set the client writer on one session, send `SessionCreated`, workspace info,
+/// stored metadata, and a screen snapshot to the attaching client.
+///
+/// The writer is set **after** the snapshot is sent to prevent the PTY reader
+/// task from racing live `PtyOutput` against the snapshot (ghost cursors).
+///
+/// Warns when overwriting an existing writer — this indicates a second client
+/// is trying to attach to an already-attached session.
+async fn attach_one_session(
+    entry: &AttachEntry,
+    writer: &SharedWriter,
+    live_sessions: &LiveSessionRegistry,
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+) {
+    let session_id = entry.session_id;
+
+    // Send SessionCreated so the client can process it through the normal flow.
+    let creation_msg = ServerMessage::SessionCreated {
+        session_id,
+        workspace_id: entry.workspace_id,
+        shell_name: String::from("shell"),
+    };
+    send_message(writer, &creation_msg).await;
+
+    // Send stored metadata so tabs display correctly on reconnect.
+    send_stored_metadata(writer, session_id, &entry.title, entry.cwd.as_ref()).await;
+
+    // Send workspace info.
+    {
+        let wm = workspace_manager.read().await;
+        if let Some((name, accent_color, split_direction)) = wm.workspace_info(entry.workspace_id) {
+            let msg = ServerMessage::WorkspaceInfo {
+                workspace_id: entry.workspace_id,
+                name,
+                accent_color,
+                split_direction,
+            };
+            send_message(writer, &msg).await;
+        }
+    }
+
+    let snapshot = take_session_snapshot(session_id, &entry.term, live_sessions).await;
+    let snap_msg = ServerMessage::ScreenSnapshot { session_id, snapshot };
+    send_message(writer, &snap_msg).await;
+
+    // Set the writer AFTER the snapshot is sent.  The PTY reader task
+    // checks this writer on every read — while it is `None`, output
+    // is silently dropped (the Term state is still updated).  By
+    // deferring the set, we guarantee the client receives the
+    // ScreenSnapshot before any live PtyOutput, preventing stale
+    // terminal state (cursor position, alt-screen mode) from racing
+    // with the snapshot and producing ghost cursors on reconnect.
+    let mut cw = entry.client_writer.lock().await;
+    if cw.is_some() {
+        warn!(
+            %session_id,
+            "AttachSessions: overwriting existing client writer — \
+             previous client may still be connected"
+        );
+    }
+    *cw = Some(Arc::clone(writer));
+    drop(cw);
+
+    info!(%session_id, "session attached to new client");
 }
 
 /// Send stored title, CWD, and git branch metadata for a reattached session.
@@ -1007,16 +1055,38 @@ async fn send_stored_metadata(
     }
 }
 
-/// Handle `ConfigReloaded` — reload the config file and log the result.
-fn handle_config_reloaded() {
-    match crate::config::load_config() {
-        Ok(_cfg) => {
+/// Handle `ConfigReloaded` — reload the config file and apply live changes.
+async fn handle_config_reloaded(
+    session_manager: &Arc<SessionManager>,
+    live_sessions: &LiveSessionRegistry,
+) {
+    let cfg = match crate::config::load_config() {
+        Ok(cfg) => {
             info!("config reloaded successfully via client request");
+            cfg
         }
         Err(e) => {
             warn!("config reload failed: {e}");
+            return;
         }
+    };
+
+    let new_scrollback = usize::try_from(cfg.scrollback_lines).unwrap_or(usize::MAX);
+    session_manager.set_scrollback_lines(new_scrollback);
+
+    let term_config = alacritty_terminal::term::Config {
+        scrolling_history: new_scrollback,
+        ..alacritty_terminal::term::Config::default()
+    };
+    let sessions = live_sessions.read().await;
+    for session in sessions.values() {
+        session.term.lock().await.set_options(term_config.clone());
     }
+    info!(
+        scrollback_lines = new_scrollback,
+        sessions = sessions.len(),
+        "scrollback updated on live sessions"
+    );
 }
 
 /// Broadcast `QuitRequested` to all connected clients except the sender.
@@ -1337,13 +1407,26 @@ fn macos_proc_cwd(child_pid: u32) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Maximum number of parent directories to traverse when searching for a
+/// `.git/HEAD` file. Prevents unbounded walks on deep or unusual directory
+/// trees where no git repository is ever found.
+const GIT_WALK_DEPTH_LIMIT: usize = 50;
+
 /// Detect the current git branch by walking up from `cwd` looking for `.git/HEAD`.
 ///
 /// Returns `Some(branch_name)` if on a named branch, `Some(short_sha)` if in
 /// detached HEAD state, or `None` if not inside a git repository.
+/// Stops after `GIT_WALK_DEPTH_LIMIT` iterations to avoid walking all the
+/// way to `/` on very deep directory trees.
 fn detect_git_branch(cwd: &Path) -> Option<String> {
     let mut dir = cwd.to_path_buf();
+    let mut depth = 0usize;
     loop {
+        if depth >= GIT_WALK_DEPTH_LIMIT {
+            return None;
+        }
+        depth += 1;
+
         let head = dir.join(".git/HEAD");
         if let Ok(content) = std::fs::read_to_string(&head) {
             return content
@@ -1505,7 +1588,8 @@ pub async fn activate_pending_sessions(
                 None,
                 workspace_manager,
                 live_sessions,
-            );
+            )
+            .await;
             info!(%session_id, "activated restored session (detached)");
         }
     }

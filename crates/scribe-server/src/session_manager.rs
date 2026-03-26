@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::WindowSize;
@@ -89,7 +90,7 @@ impl Dimensions for TermDimensions {
 pub struct SessionManager {
     sessions: Arc<tokio::sync::RwLock<HashMap<SessionId, ManagedSession>>>,
     /// Scrollback lines used when creating new sessions.
-    scrollback_lines: usize,
+    scrollback_lines: AtomicUsize,
 }
 
 impl Default for SessionManager {
@@ -112,7 +113,15 @@ impl SessionManager {
     /// Create a new `SessionManager` with a specific scrollback line count.
     #[must_use]
     pub fn with_scrollback(scrollback_lines: usize) -> Self {
-        Self { sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())), scrollback_lines }
+        Self {
+            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            scrollback_lines: AtomicUsize::new(scrollback_lines),
+        }
+    }
+
+    /// Update the scrollback line count used for new sessions and live sessions.
+    pub fn set_scrollback_lines(&self, lines: usize) {
+        self.scrollback_lines.store(lines, Ordering::Relaxed);
     }
 
     /// Create a new PTY session in the given workspace.
@@ -126,7 +135,7 @@ impl SessionManager {
         workspace_id: WorkspaceId,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<SessionId, ScribeError> {
-        let scrollback_lines = self.scrollback_lines;
+        let scrollback_lines = self.scrollback_lines.load(Ordering::Relaxed);
         {
             let sessions = self.sessions.read().await;
             if sessions.len() >= MAX_SESSIONS {
@@ -306,7 +315,7 @@ impl SessionManager {
 
         Ok(Self {
             sessions: Arc::new(tokio::sync::RwLock::new(sessions_map)),
-            scrollback_lines: scrollback,
+            scrollback_lines: AtomicUsize::new(scrollback),
         })
     }
 }

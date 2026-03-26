@@ -24,6 +24,7 @@ mod workspace_layout;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -137,6 +138,7 @@ struct App {
     // AI state
     ai_tracker: AiStateTracker,
     animation_running: bool,
+    animation_stop: Arc<AtomicBool>,
 
     // Input state
     modifiers: ModifiersState,
@@ -211,6 +213,8 @@ struct App {
     saved_geometry: Option<window_state::WindowGeometry>,
     /// When set, a geometry save is pending (debounced).
     geometry_save_pending: Option<Instant>,
+    /// When set, a resize IPC flush is pending (debounced).
+    resize_pending: Option<Instant>,
 
     /// `true` after a workspace tree has been received from the server,
     /// suppressing the legacy `split_direction` fallback in
@@ -302,6 +306,7 @@ impl App {
             server_connected: false,
             ai_tracker: AiStateTracker::new(claude_states),
             animation_running: false,
+            animation_stop: Arc::new(AtomicBool::new(false)),
             modifiers: ModifiersState::default(),
             bindings,
             clipboard: arboard::Clipboard::new()
@@ -330,6 +335,7 @@ impl App {
             window_registry,
             saved_geometry,
             geometry_save_pending: None,
+            resize_pending: None,
             received_workspace_tree: false,
             tab_hit_targets: Vec::new(),
             tab_close_hit_targets: Vec::new(),
@@ -417,6 +423,7 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::ServerDisconnected => {
                 tracing::info!("server disconnected, exiting");
                 self.server_connected = false;
+                self.flush_geometry_now();
                 self.request_redraw();
                 event_loop.exit();
             }
@@ -448,6 +455,7 @@ impl ApplicationHandler<UiEvent> for App {
         // When blink is disabled, don't set ControlFlow — let winit use its default (Wait).
 
         self.flush_geometry_if_due();
+        self.flush_resize_if_due();
     }
 
     fn window_event(
@@ -626,6 +634,11 @@ impl App {
         session_id: SessionId,
         snapshot: &scribe_common::screen::ScreenSnapshot,
     ) {
+        if snapshot.cols == 0 || snapshot.rows == 0 {
+            tracing::warn!(%session_id, "snapshot has zero dimensions, skipping");
+            return;
+        }
+
         let non_empty = snapshot.cells.iter().filter(|c| c.c != ' ' && c.c != '\0').count();
         let first_char = snapshot.cells.iter().find(|c| c.c != ' ' && c.c != '\0');
         tracing::info!(
@@ -747,8 +760,10 @@ impl App {
 
         tracing::info!(count = sessions.len(), "reattaching to existing sessions");
 
-        let session_ids: Vec<SessionId> = sessions.iter().map(|s| s.session_id).collect();
-        send_command(&tx, ClientCommand::AttachSessions { session_ids: session_ids.clone() });
+        // SessionId is Copy — collect independently for each command instead of
+        // cloning the Vec.
+        let attach_ids: Vec<SessionId> = sessions.iter().map(|s| s.session_id).collect();
+        send_command(&tx, ClientCommand::AttachSessions { session_ids: attach_ids });
 
         // Build a metadata lookup so panes can be initialised with the
         // last-known title and CWD instead of defaulting to "shell".
@@ -816,7 +831,8 @@ impl App {
         }
 
         // Subscribe to output from all restored sessions.
-        send_command(&tx, ClientCommand::Subscribe { session_ids });
+        let subscribe_ids: Vec<SessionId> = sessions.iter().map(|s| s.session_id).collect();
+        send_command(&tx, ClientCommand::Subscribe { session_ids: subscribe_ids });
 
         // Recompute pane geometry for each workspace and send the correct
         // grid dimensions to the server.
@@ -1038,14 +1054,16 @@ impl App {
         // Find which workspace owns this session and remove its tab.
         let ws_id = self.window_layout.workspace_for_session(session_id);
 
-        // Check the active tab's pane layout for this pane.
-        let can_close = self
-            .window_layout
-            .active_tab()
+        // Check the pane's own tab (not the active tab) for the pane count.
+        // If focus is on a different tab, active_tab() would check the wrong layout.
+        let can_close = ws_id
+            .and_then(|wid| self.window_layout.find_workspace(wid))
+            .and_then(|ws| ws.tabs.iter().find(|t| t.pane_layout.all_pane_ids().contains(&pane_id)))
             .is_some_and(|tab| tab.pane_layout.all_pane_ids().len() > 1);
 
         if !can_close {
-            // Only one pane in the active tab; remove the tab from the workspace.
+            // Only one pane in the exiting session's tab; remove the tab from
+            // the workspace.
             self.remove_tab_and_cleanup_workspace(ws_id, session_id);
             self.panes.remove(&pane_id);
             self.url_caches.remove(&pane_id);
@@ -1056,14 +1074,27 @@ impl App {
         self.panes.remove(&pane_id);
         self.url_caches.remove(&pane_id);
 
-        if let Some(tab) = self.window_layout.active_tab_mut() {
-            if tab.pane_layout.close_pane(pane_id) && tab.focused_pane == pane_id {
-                tab.focused_pane = tab.pane_layout.next_pane(pane_id);
-            }
-        }
+        // Close the pane in the tab that owns it, not necessarily the active tab.
+        self.close_exited_pane_in_tab(ws_id, pane_id);
 
         self.resize_after_layout_change();
         self.request_redraw();
+    }
+
+    /// Remove a pane from whichever tab in `ws_id` owns it, updating
+    /// `focused_pane` if necessary.  A no-op when `ws_id` is `None` or the
+    /// pane cannot be found.
+    fn close_exited_pane_in_tab(&mut self, ws_id: Option<WorkspaceId>, pane_id: PaneId) {
+        let Some(wid) = ws_id else { return };
+        let Some(ws) = self.window_layout.find_workspace_mut(wid) else { return };
+        let Some(tab) =
+            ws.tabs.iter_mut().find(|t| t.pane_layout.all_pane_ids().contains(&pane_id))
+        else {
+            return;
+        };
+        if tab.pane_layout.close_pane(pane_id) && tab.focused_pane == pane_id {
+            tab.focused_pane = tab.pane_layout.next_pane(pane_id);
+        }
     }
 
     /// Remove a session's tab and clean up the workspace if it becomes empty.
@@ -1149,7 +1180,7 @@ impl App {
             && !drag_active
         {
             self.animation_running = false;
-            // Timer thread will see the flag and stop.
+            self.animation_stop.store(false, Ordering::Relaxed);
         }
 
         self.request_redraw();
@@ -1227,6 +1258,7 @@ impl App {
     /// Reload config from disk and apply changed settings.
     #[allow(
         clippy::too_many_lines,
+        clippy::cognitive_complexity,
         reason = "sequential comparison of all hot-reloadable config fields in one method"
     )]
     fn handle_config_changed(&mut self) {
@@ -1249,6 +1281,10 @@ impl App {
                 gpu.renderer.set_theme(&new_theme);
             }
             self.theme = new_theme;
+            // Theme affects cell colors — all pane caches are stale.
+            for pane in self.panes.values_mut() {
+                pane.content_dirty = true;
+            }
         }
 
         // -- Font params --
@@ -1315,6 +1351,12 @@ impl App {
 
         self.ai_tracker.reconfigure(new_config.terminal.claude_states.clone());
         self.config = new_config;
+
+        // Notify the server so it can apply config changes that affect
+        // server-side state (e.g. scrollback_lines on live sessions).
+        if let Some(tx) = &self.cmd_tx {
+            send_command(tx, ClientCommand::ConfigReloaded);
+        }
 
         // When tab bar height, font, or content padding changes, the grid row/col
         // count changes and every pane must be resized so the server PTY gets the
@@ -1646,32 +1688,41 @@ impl App {
         );
 
         let indicator_h = self.config.terminal.indicator_height.clamp(1.0, 10.0);
+        let frame_layout = FrameLayout {
+            pane_rects: &pane_rects,
+            dividers: &dividers,
+            ws_dividers: &ws_dividers,
+            ws_tab_bar_data: &ws_tab_bar_data,
+            cell_size,
+            focused_pane,
+            focus_split_direction,
+            padding: &self.config.appearance.content_padding,
+        };
+        let frame_style = FrameStyle {
+            border_colors: &border_colors,
+            tab_colors: &tab_colors,
+            divider_color,
+            accent_color,
+            scrollbar_width,
+            scrollbar_color,
+            indicator_height: indicator_h,
+        };
+        let frame_interaction = FrameInteraction {
+            cursor_visible,
+            tab_width: self.config.appearance.tab_width,
+            active_selection: self.active_selection.as_ref(),
+            hovered_tab_close: self.hovered_tab_close,
+            tab_drag: self.tab_drag.as_ref(),
+            tab_drag_offsets: &self.tab_drag_offsets,
+        };
         let (mut all_instances, tab_hits, tab_close_hits, tab_eq_hits) = build_all_instances(
             &mut gpu.renderer,
             &gpu.device,
             &gpu.queue,
             &mut self.panes,
-            &pane_rects,
-            &dividers,
-            &ws_dividers,
-            cell_size,
-            focused_pane,
-            &border_colors,
-            &tab_colors,
-            &ws_tab_bar_data,
-            divider_color,
-            accent_color,
-            scrollbar_width,
-            scrollbar_color,
-            focus_split_direction,
-            cursor_visible,
-            self.config.appearance.tab_width,
-            indicator_h,
-            self.active_selection.as_ref(),
-            self.hovered_tab_close,
-            &self.config.appearance.content_padding,
-            self.tab_drag.as_ref(),
-            &self.tab_drag_offsets,
+            &frame_layout,
+            &frame_style,
+            &frame_interaction,
         );
         self.tab_hit_targets = tab_hits;
         self.tab_close_hit_targets = tab_close_hits;
@@ -1844,6 +1895,7 @@ impl App {
         if scrolled_up {
             pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
             pane.scrollbar_state.on_scroll_action();
+            pane.content_dirty = true;
         }
         if scrolled_up {
             self.ensure_animation_running();
@@ -1994,7 +2046,7 @@ impl App {
             );
         }
 
-        self.resize_all_panes_from_rects(&rects);
+        self.resize_all_panes_from_rects(&rects, &ws_rects);
 
         if let Some(active) = self.window_layout.active_tab_mut() {
             active.focused_pane = new_pane_id;
@@ -2390,7 +2442,15 @@ impl App {
                 }
             }
         };
+        self.send_paste_data(text);
+    }
 
+    /// Send paste text to the focused pane, wrapping in bracketed-paste
+    /// sequences when the terminal has enabled that mode.
+    ///
+    /// This is the shared core used by both clipboard paste and (when added)
+    /// primary-selection paste so the two paths stay in sync.
+    fn send_paste_data(&mut self, text: String) {
         if text.is_empty() {
             return;
         }
@@ -2406,6 +2466,7 @@ impl App {
             if offset > 0 {
                 pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
                 pane.scrollbar_state.on_scroll_action();
+                pane.content_dirty = true;
             }
             offset > 0
         };
@@ -2442,6 +2503,7 @@ impl App {
         let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::PageUp);
         pane.scrollbar_state.on_scroll_action();
+        pane.content_dirty = true;
         self.ensure_animation_running();
         self.request_redraw();
     }
@@ -2451,6 +2513,7 @@ impl App {
         let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::PageDown);
         pane.scrollbar_state.on_scroll_action();
+        pane.content_dirty = true;
         self.ensure_animation_running();
         self.request_redraw();
     }
@@ -2460,6 +2523,7 @@ impl App {
         let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::Top);
         pane.scrollbar_state.on_scroll_action();
+        pane.content_dirty = true;
         self.ensure_animation_running();
         self.request_redraw();
     }
@@ -2469,6 +2533,7 @@ impl App {
         let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
         pane.scrollbar_state.on_scroll_action();
+        pane.content_dirty = true;
         self.ensure_animation_running();
         self.request_redraw();
     }
@@ -2514,6 +2579,7 @@ impl App {
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
         pane.scrollbar_state.on_scroll_action();
+        pane.content_dirty = true;
         self.ensure_animation_running();
         self.request_redraw();
     }
@@ -2862,6 +2928,7 @@ impl App {
             ScrollbarAction::JumpTo { delta } => {
                 pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
                 pane.scrollbar_state.on_scroll_action();
+                pane.content_dirty = true;
             }
         }
 
@@ -2900,6 +2967,7 @@ impl App {
         if delta != 0 {
             let Some(pane) = self.panes.get_mut(&pane_id) else { return };
             pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
+            pane.content_dirty = true;
         }
         self.request_redraw();
     }
@@ -3305,6 +3373,7 @@ impl App {
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
         pane.scrollbar_state.on_scroll_action();
+        pane.content_dirty = true;
         self.ensure_animation_running();
         self.request_redraw();
     }
@@ -3349,6 +3418,7 @@ impl App {
             if offset > 0 {
                 pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
                 pane.scrollbar_state.on_scroll_action();
+                pane.content_dirty = true;
             }
             offset > 0
         };
@@ -3385,14 +3455,21 @@ impl App {
         if sel.is_empty() {
             return;
         }
-        let text = {
+        let (raw, claude_active) = {
             let Some(tab) = self.window_layout.active_tab() else { return };
             let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
-            selection::extract_text(&pane.term, &sel)
+            let text = selection::extract_text(&pane.term, &sel);
+            let ai = self.ai_tracker.get(pane.session_id).is_some();
+            (text, ai)
         };
-        if text.is_empty() {
+        if raw.is_empty() {
             return;
         }
+        let text = clipboard_cleanup::prepare_copy_text(
+            &raw,
+            claude_active,
+            self.config.terminal.claude_copy_cleanup,
+        );
         let Some(cb) = &mut self.clipboard else { return };
         if let Err(e) = cb.set().clipboard(LinuxClipboardKind::Primary).text(text) {
             tracing::debug!("primary selection write failed: {e}");
@@ -3631,11 +3708,13 @@ impl App {
         clippy::cast_precision_loss,
         reason = "viewport dimensions are small enough to fit in f32"
     )]
-    fn resize_all_panes_from_rects(&mut self, rects: &[(PaneId, Rect, PaneEdges)]) {
+    fn resize_all_panes_from_rects(
+        &mut self,
+        rects: &[(PaneId, Rect, PaneEdges)],
+        ws_rects: &[(WorkspaceId, Rect)],
+    ) {
         let Some(gpu) = &self.gpu else { return };
         let cell = gpu.renderer.cell_size();
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
-        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
 
         // Build per-workspace tab bar heights so each pane uses the correct height.
         let ws_heights: std::collections::HashMap<WorkspaceId, f32> = ws_rects
@@ -3650,10 +3729,9 @@ impl App {
             let tab_bar_h = ws_heights.get(&pane.workspace_id).copied().unwrap_or(fallback_h);
             let eff_pad = pane::effective_padding(&self.config.appearance.content_padding, *edges);
             let grid = pane::compute_pane_grid(*rect, cell.width, cell.height, tab_bar_h, &eff_pad);
-            let new_grid = pane.resize(*rect, grid);
-            let Some(tx) = &self.cmd_tx else { continue };
-            send_resize(tx, pane.session_id, new_grid.cols, new_grid.rows);
+            pane.resize(*rect, grid);
         }
+        self.resize_pending = Some(Instant::now());
     }
 
     /// Recompute rects and resize all panes after a layout change.
@@ -3664,22 +3742,17 @@ impl App {
     fn resize_after_layout_change(&mut self) {
         let Some(gpu) = &self.gpu else { return };
         let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
 
-        let rects = if let Some(tab) = self.window_layout.active_tab() {
-            // Compute workspace rect for the focused workspace.
-            let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+        let rects = self.window_layout.active_tab().map_or_else(Vec::new, |tab| {
             let ws_rect = ws_rects
                 .iter()
                 .find(|(wid, _)| *wid == self.window_layout.focused_workspace_id())
                 .map_or(ws_viewport, |(_, r)| *r);
             tab.pane_layout.compute_rects(ws_rect)
-        } else {
-            Vec::new()
-        };
+        });
 
-        // Need to drop gpu borrow before calling resize_all_panes_from_rects
-        // which borrows self mutably.
-        self.resize_all_panes_from_rects(&rects);
+        self.resize_all_panes_from_rects(&rects, &ws_rects);
     }
 
     /// Recompute rects and resize panes in all workspaces.
@@ -3704,7 +3777,7 @@ impl App {
             .flatten()
             .collect();
 
-        self.resize_all_panes_from_rects(&all_pane_rects);
+        self.resize_all_panes_from_rects(&all_pane_rects, &ws_rects);
     }
 
     /// Request a redraw from winit.
@@ -3728,6 +3801,25 @@ impl App {
         if self.geometry_save_pending.is_some_and(|t| t.elapsed() >= GEOMETRY_DEBOUNCE) {
             self.flush_geometry_now();
         }
+    }
+
+    /// Send any pending resize IPC messages if the debounce interval has elapsed.
+    fn flush_resize_if_due(&mut self) {
+        if self.resize_pending.is_none_or(|t| t.elapsed() < RESIZE_DEBOUNCE) {
+            return;
+        }
+        let Some(tx) = &self.cmd_tx else {
+            self.resize_pending = None;
+            return;
+        };
+        let tx = tx.clone();
+        for pane in self.panes.values_mut() {
+            if pane.last_sent_grid != Some(pane.grid) {
+                send_resize(&tx, pane.session_id, pane.grid.cols, pane.grid.rows);
+                pane.last_sent_grid = Some(pane.grid);
+            }
+        }
+        self.resize_pending = None;
     }
 
     // ── Multi-window ──────────────────────────────────────────────
@@ -3939,10 +4031,12 @@ impl App {
             return;
         }
         self.animation_running = true;
+        self.animation_stop.store(true, Ordering::Relaxed);
         self.last_tick = Instant::now();
 
         let Some(proxy) = self.animation_proxy.clone() else { return };
-        std::thread::spawn(move || run_animation_loop(proxy));
+        let stop = Arc::clone(&self.animation_stop);
+        std::thread::spawn(move || run_animation_loop(proxy, stop));
     }
 }
 
@@ -3959,9 +4053,12 @@ impl App {
     clippy::needless_pass_by_value,
     reason = "proxy must be owned by this thread; it is moved into std::thread::spawn"
 )]
-fn run_animation_loop(proxy: EventLoopProxy<UiEvent>) {
+fn run_animation_loop(proxy: EventLoopProxy<UiEvent>, stop: Arc<AtomicBool>) {
     loop {
         std::thread::sleep(std::time::Duration::from_millis(33));
+        if !stop.load(Ordering::Relaxed) {
+            break;
+        }
         if proxy.send_event(UiEvent::AnimationTick).is_err() {
             break;
         }
@@ -4019,6 +4116,9 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 /// Debounce interval for geometry saves (move/resize events fire rapidly).
 const GEOMETRY_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// Debounce interval for resize IPC sends (window drag fires rapidly).
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(30);
+
 /// Dimming factor applied to RGB channels of unfocused pane content.
 const UNFOCUSED_DIM: f32 = 0.85;
 
@@ -4030,9 +4130,42 @@ type TabHitTargets = Vec<(WorkspaceId, usize, layout::Rect)>;
 /// `(workspace_id, equalize_rect)` for tab bar equalize button click handling.
 type TabEqualizeTargets = Vec<(WorkspaceId, layout::Rect)>;
 
+/// Layout and focus state passed to [`build_all_instances`].
+struct FrameLayout<'a> {
+    pane_rects: &'a [(PaneId, Rect)],
+    dividers: &'a [divider::Divider],
+    ws_dividers: &'a [workspace_layout::WorkspaceDivider],
+    ws_tab_bar_data: &'a [tab_bar::WorkspaceTabBarData],
+    cell_size: (f32, f32),
+    focused_pane: PaneId,
+    focus_split_direction: Option<layout::SplitDirection>,
+    padding: &'a ContentPadding,
+}
+
+/// Colors and visual styling passed to [`build_all_instances`].
+struct FrameStyle<'a> {
+    border_colors: &'a HashMap<PaneId, [f32; 4]>,
+    tab_colors: &'a tab_bar::TabBarColors,
+    divider_color: [f32; 4],
+    accent_color: [f32; 4],
+    scrollbar_width: f32,
+    scrollbar_color: [f32; 4],
+    indicator_height: f32,
+}
+
+/// Interaction state passed to [`build_all_instances`].
+struct FrameInteraction<'a> {
+    cursor_visible: bool,
+    tab_width: u16,
+    active_selection: Option<&'a selection::SelectionRange>,
+    hovered_tab_close: Option<(WorkspaceId, usize)>,
+    tab_drag: Option<&'a TabDrag>,
+    tab_drag_offsets: &'a [f32],
+}
+
 #[allow(
     clippy::too_many_arguments,
-    reason = "needs all render context: renderer, GPU resources, panes, layout data, AI state"
+    reason = "renderer, device, queue, panes plus 3 grouped structs — splitting further would add indirection"
 )]
 #[allow(
     clippy::too_many_lines,
@@ -4042,93 +4175,113 @@ type TabEqualizeTargets = Vec<(WorkspaceId, layout::Rect)>;
     clippy::cognitive_complexity,
     reason = "single render-pass function; extracting sub-functions would add indirection without clarity"
 )]
+#[allow(
+    clippy::excessive_nesting,
+    reason = "damage-tracking cache check adds one nesting level inside the pane loop; extracting would require passing many parameters"
+)]
 fn build_all_instances(
     renderer: &mut TerminalRenderer,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     panes: &mut HashMap<PaneId, Pane>,
-    pane_rects: &[(PaneId, Rect)],
-    dividers: &[divider::Divider],
-    ws_dividers: &[workspace_layout::WorkspaceDivider],
-    cell_size: (f32, f32),
-    focused_pane: PaneId,
-    border_colors: &HashMap<PaneId, [f32; 4]>,
-    tab_colors: &tab_bar::TabBarColors,
-    ws_tab_bar_data: &[tab_bar::WorkspaceTabBarData],
-    divider_color: [f32; 4],
-    accent_color: [f32; 4],
-    scrollbar_width: f32,
-    scrollbar_color: [f32; 4],
-    focus_split_direction: Option<layout::SplitDirection>,
-    cursor_visible: bool,
-    tab_width: u16,
-    indicator_height: f32,
-    active_selection: Option<&selection::SelectionRange>,
-    hovered_tab_close: Option<(WorkspaceId, usize)>,
-    padding: &ContentPadding,
-    tab_drag: Option<&TabDrag>,
-    tab_drag_offsets: &[f32],
+    layout: &FrameLayout<'_>,
+    style: &FrameStyle<'_>,
+    interaction: &FrameInteraction<'_>,
 ) -> (Vec<scribe_renderer::types::CellInstance>, TabHitTargets, TabHitTargets, TabEqualizeTargets) {
     // Build a workspace-id → tab_bar_height lookup for per-pane height queries.
     let ws_tab_bar_heights: HashMap<WorkspaceId, f32> =
-        ws_tab_bar_data.iter().map(|d| (d.ws_id, d.tab_bar_height)).collect();
+        layout.ws_tab_bar_data.iter().map(|d| (d.ws_id, d.tab_bar_height)).collect();
 
     // Pre-allocate based on a typical 80x24 grid per pane plus tab bar and
     // border quads, to avoid repeated reallocations during the per-pane loops.
     let estimated_per_pane = 80 * 24 + 80 + 4;
-    let mut all_instances = Vec::with_capacity(pane_rects.len() * estimated_per_pane);
+    let mut all_instances = Vec::with_capacity(layout.pane_rects.len() * estimated_per_pane);
+
+    let default_bg = renderer.default_bg();
 
     // Terminal content first — tab bar is drawn on top afterwards so that any
     // content that bleeds into the tab bar region (rounding, partial rows) is
     // covered by the opaque tab bar background.
-    let has_multiple_panes = pane_rects.len() > 1;
+    let has_multiple_panes = layout.pane_rects.len() > 1;
     let selection_colors = (renderer.selection_bg(), renderer.selection_fg());
     // Non-empty selection for the focused pane (precompute to avoid nesting).
-    let effective_selection = active_selection.filter(|s| !s.is_empty());
-    for (pane_id, _) in pane_rects {
+    let effective_selection = interaction.active_selection.filter(|s| !s.is_empty());
+    for (pane_id, _) in layout.pane_rects {
         if let Some(pane) = panes.get_mut(pane_id) {
-            let tbh = pane_tab_bar_h(pane.workspace_id, &ws_tab_bar_heights, ws_tab_bar_data);
-            let offset = pane.content_offset(tbh, padding);
+            let tbh =
+                pane_tab_bar_h(pane.workspace_id, &ws_tab_bar_heights, layout.ws_tab_bar_data);
+            let offset = pane.content_offset(tbh, layout.padding);
             // Only the focused pane shows the blinking cursor; unfocused panes hide it.
-            let pane_cursor_visible = *pane_id == focused_pane && cursor_visible;
-            let mut instances = renderer.build_instances_at(
-                device,
-                queue,
-                &mut pane.term,
-                offset,
-                pane_cursor_visible,
-            );
-            if let Some(sel) = effective_selection.filter(|_| *pane_id == focused_pane) {
-                let disp_off = pane.term.grid().display_offset();
-                apply_selection_highlight(
-                    &mut instances,
+            let is_focused = *pane_id == layout.focused_pane;
+            let pane_cursor_visible = is_focused && interaction.cursor_visible;
+            let pane_has_selection = is_focused && effective_selection.is_some();
+
+            // Background fill covering the full content area — emitted before
+            // cell instances so cells draw on top.  Covers remainder pixels at
+            // right/bottom edges left by floor-division of pixels by cell size.
+            let dim = has_multiple_panes && !is_focused;
+            push_pane_bg_fill(&mut all_instances, pane, tbh, (default_bg, layout.padding, dim));
+
+            // Skip rebuilding instances when the pane content and all
+            // rendering context (cursor blink, focus, selection) are unchanged.
+            let needs_rebuild = pane.content_dirty
+                || pane.last_cursor_visible != Some(pane_cursor_visible)
+                || pane.last_was_focused != Some(is_focused)
+                || pane.last_had_selection != pane_has_selection;
+
+            if needs_rebuild {
+                let mut instances = renderer.build_instances_at(
+                    device,
+                    queue,
+                    &mut pane.term,
                     offset,
-                    cell_size,
-                    sel,
-                    selection_colors,
-                    disp_off,
+                    pane_cursor_visible,
                 );
+                if let Some(sel) = effective_selection.filter(|_| is_focused) {
+                    let disp_off = pane.term.grid().display_offset();
+                    apply_selection_highlight(
+                        &mut instances,
+                        offset,
+                        layout.cell_size,
+                        sel,
+                        selection_colors,
+                        disp_off,
+                    );
+                }
+                if dim {
+                    dim_instances(&mut instances);
+                }
+                all_instances.extend_from_slice(&instances);
+                std::mem::swap(&mut pane.last_instances, &mut instances);
+                pane.content_dirty = false;
+                pane.last_cursor_visible = Some(pane_cursor_visible);
+                pane.last_was_focused = Some(is_focused);
+                pane.last_had_selection = pane_has_selection;
+            } else {
+                all_instances.extend_from_slice(&pane.last_instances);
             }
-            if has_multiple_panes && *pane_id != focused_pane {
-                dim_instances(&mut instances);
-            }
-            all_instances.extend(instances);
         }
     }
 
     // Tab bar backgrounds + bottom separator (drawn after terminal content so
     // the opaque bar always covers any stray cells that extend into its area).
-    for (pane_id, pane_rect) in pane_rects {
+    for (pane_id, pane_rect) in layout.pane_rects {
         let tbh = panes.get(pane_id).map_or_else(
-            || ws_tab_bar_data.first().map_or(0.0, |d| d.tab_bar_height),
-            |p| pane_tab_bar_h(p.workspace_id, &ws_tab_bar_heights, ws_tab_bar_data),
+            || layout.ws_tab_bar_data.first().map_or(0.0, |d| d.tab_bar_height),
+            |p| pane_tab_bar_h(p.workspace_id, &ws_tab_bar_heights, layout.ws_tab_bar_data),
         );
-        tab_bar::build_tab_bar_bg(&mut all_instances, *pane_rect, cell_size, tab_colors, tbh);
+        tab_bar::build_tab_bar_bg(
+            &mut all_instances,
+            *pane_rect,
+            layout.cell_size,
+            style.tab_colors,
+            tbh,
+        );
         tab_bar::build_tab_bar_separator(
             &mut all_instances,
             *pane_rect,
-            cell_size,
-            divider_color,
+            layout.cell_size,
+            style.divider_color,
             tbh,
         );
     }
@@ -4137,7 +4290,7 @@ fn build_all_instances(
     let mut tab_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)> = Vec::new();
     let mut tab_close_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)> = Vec::new();
     let mut tab_equalize_targets: TabEqualizeTargets = Vec::new();
-    for ws_data in ws_tab_bar_data {
+    for ws_data in layout.ws_tab_bar_data {
         let tbh = ws_data.tab_bar_height;
         let tab_bar_rect = layout::Rect {
             x: ws_data.ws_rect.x,
@@ -4148,32 +4301,34 @@ fn build_all_instances(
         let badge = ws_data.badge.as_ref().map(|(name, color)| (name.as_str(), *color));
         let mut resolve_glyph = |ch: char| renderer.resolve_glyph(device, queue, ch);
         // Pass the hovered close index only for this workspace.
-        let ws_hovered_close = hovered_tab_close
+        let ws_hovered_close = interaction
+            .hovered_tab_close
             .and_then(|(ws, idx)| if ws == ws_data.ws_id { Some(idx) } else { None });
         // Drag state for this workspace only.
-        let ws_drag = tab_drag.filter(|d| d.workspace_id == ws_data.ws_id && d.dragging);
-        let ws_tab_offsets = if ws_drag.is_some() { tab_drag_offsets } else { &[] };
+        let ws_drag =
+            interaction.tab_drag.filter(|d| d.workspace_id == ws_data.ws_id && d.dragging);
+        let ws_tab_offsets = if ws_drag.is_some() { interaction.tab_drag_offsets } else { &[] };
         let ws_dragging_tab = ws_drag.map(|d| d.tab_index);
         let ws_drag_cursor_x = ws_drag.map_or(0.0, |d| d.cursor_x);
         let ws_drag_grab_offset = ws_drag.map_or(0.0, |d| d.grab_offset_x);
         let mut params = tab_bar::TabBarTextParams {
             rect: tab_bar_rect,
-            cell_size,
+            cell_size: layout.cell_size,
             tabs: &ws_data.tabs,
             badge,
             show_gear: false,
             show_equalize: ws_data.has_multiple_panes,
-            colors: tab_colors,
+            colors: style.tab_colors,
             resolve_glyph: &mut resolve_glyph,
             tab_bar_height: tbh,
-            indicator_height,
-            tab_width,
+            indicator_height: style.indicator_height,
+            tab_width: interaction.tab_width,
             hovered_tab_close: ws_hovered_close,
             tab_offsets: ws_tab_offsets,
             dragging_tab: ws_dragging_tab,
             drag_cursor_x: ws_drag_cursor_x,
             drag_grab_offset: ws_drag_grab_offset,
-            accent_color,
+            accent_color: style.accent_color,
         };
         let (text_instances, hit_targets) = tab_bar::build_tab_bar_text(&mut params);
         all_instances.extend(text_instances);
@@ -4189,28 +4344,29 @@ fn build_all_instances(
     }
 
     // Pane dividers.
-    divider::build_divider_instances(&mut all_instances, dividers, divider_color);
+    divider::build_divider_instances(&mut all_instances, layout.dividers, style.divider_color);
     // Workspace dividers — rendered directly as single quads.
-    for ws_div in ws_dividers {
+    for ws_div in layout.ws_dividers {
         all_instances.push(scribe_renderer::types::CellInstance {
             pos: [ws_div.rect.x, ws_div.rect.y],
             size: [ws_div.rect.width, ws_div.rect.height],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
-            fg_color: divider_color,
-            bg_color: divider_color,
+            fg_color: style.divider_color,
+            bg_color: style.divider_color,
         });
     }
 
     // Scrollbar overlays.
-    for (pane_id, _) in pane_rects {
+    for (pane_id, _) in layout.pane_rects {
         if let Some(pane) = panes.get(pane_id) {
-            let tbh = pane_tab_bar_h(pane.workspace_id, &ws_tab_bar_heights, ws_tab_bar_data);
+            let tbh =
+                pane_tab_bar_h(pane.workspace_id, &ws_tab_bar_heights, layout.ws_tab_bar_data);
             scrollbar::build_scrollbar_instances(
                 &mut all_instances,
                 pane,
-                scrollbar_width,
-                scrollbar_color,
+                style.scrollbar_width,
+                style.scrollbar_color,
                 tbh,
             );
         }
@@ -4218,24 +4374,26 @@ fn build_all_instances(
 
     // Focus border on the focused pane's leading edge.
     if has_multiple_panes {
-        if let Some((_, focused_rect)) = pane_rects.iter().find(|(id, _)| *id == focused_pane) {
+        if let Some((_, focused_rect)) =
+            layout.pane_rects.iter().find(|(id, _)| *id == layout.focused_pane)
+        {
             divider::build_focus_border(
                 &mut all_instances,
                 *focused_rect,
-                focus_split_direction,
-                accent_color,
-                cell_size,
+                layout.focus_split_direction,
+                style.accent_color,
+                layout.cell_size,
             );
         }
     }
 
     // AI state border overlays (rendered last so they appear on top).
     // Border wraps the terminal content area only, excluding the tab bar.
-    for (pane_id, pane_rect) in pane_rects {
-        if let Some(&color) = border_colors.get(pane_id) {
+    for (pane_id, pane_rect) in layout.pane_rects {
+        if let Some(&color) = style.border_colors.get(pane_id) {
             let tbh = panes.get(pane_id).map_or_else(
-                || ws_tab_bar_data.first().map_or(0.0, |d| d.tab_bar_height),
-                |p| pane_tab_bar_h(p.workspace_id, &ws_tab_bar_heights, ws_tab_bar_data),
+                || layout.ws_tab_bar_data.first().map_or(0.0, |d| d.tab_bar_height),
+                |p| pane_tab_bar_h(p.workspace_id, &ws_tab_bar_heights, layout.ws_tab_bar_data),
             );
             let border = ai_indicator::build_border_instances(*pane_rect, color, tbh);
             all_instances.extend(border);
@@ -4243,6 +4401,43 @@ fn build_all_instances(
     }
 
     (all_instances, tab_hit_targets, tab_close_hit_targets, tab_equalize_targets)
+}
+
+/// Emit one solid-colour quad covering a pane's full content area.
+///
+/// Covers remainder pixels at right/bottom edges left by floor-dividing pixel
+/// dimensions by cell size.  Must be pushed before cell instances so cells
+/// render on top.  Applies unfocused dimming when `dim` is true.
+#[allow(clippy::indexing_slicing, reason = "fixed-size [f32; 4] array, indices 0-2 always valid")]
+fn push_pane_bg_fill(
+    out: &mut Vec<scribe_renderer::types::CellInstance>,
+    pane: &Pane,
+    tab_bar_height: f32,
+    bg_and_dim: ([f32; 4], &ContentPadding, bool),
+) {
+    let (default_bg, padding, dim) = bg_and_dim;
+    let eff_pad = pane::effective_padding(padding, pane.edges);
+    let content_x = pane.rect.x + eff_pad.left;
+    let content_y = pane.rect.y + tab_bar_height + eff_pad.top;
+    let content_w = (pane.rect.width - eff_pad.left - eff_pad.right).max(0.0);
+    let content_h = (pane.rect.height - tab_bar_height - eff_pad.top - eff_pad.bottom).max(0.0);
+    if content_w <= 0.0 || content_h <= 0.0 {
+        return;
+    }
+    let mut bg = default_bg;
+    if dim {
+        bg[0] *= UNFOCUSED_DIM;
+        bg[1] *= UNFOCUSED_DIM;
+        bg[2] *= UNFOCUSED_DIM;
+    }
+    out.push(scribe_renderer::types::CellInstance {
+        pos: [content_x, content_y],
+        size: [content_w, content_h],
+        uv_min: [0.0, 0.0],
+        uv_max: [0.0, 0.0],
+        fg_color: bg,
+        bg_color: bg,
+    });
 }
 
 /// Apply window opacity to cell background alpha values.
@@ -4492,7 +4687,13 @@ fn configure_device_and_surface(
 
     let size = window.inner_size();
     let caps = surface.get_capabilities(&adapter);
-    let format = caps.formats.first().copied().ok_or(InitError::NoSurfaceFormat)?;
+    let format = caps
+        .formats
+        .iter()
+        .find(|f| f.is_srgb())
+        .or_else(|| caps.formats.first())
+        .copied()
+        .ok_or(InitError::NoSurfaceFormat)?;
     let alpha_mode = select_alpha_mode(&caps.alpha_modes, transparent);
 
     let config = wgpu::SurfaceConfiguration {
@@ -4642,6 +4843,72 @@ fn current_time_str() -> String {
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
+/// Tracks the "current" SGR state while emitting ANSI for a snapshot.
+///
+/// Allows diff-based emission: only emit a new SGR escape when the next cell's
+/// attributes differ from the currently-active attributes, avoiding a full
+/// `\x1b[0m` reset for every cell.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "mirrors CellFlags — terminal SGR attributes are inherently boolean flags"
+)]
+struct SgrState {
+    fg: scribe_common::screen::ScreenColor,
+    bg: scribe_common::screen::ScreenColor,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+    hidden: bool,
+    strikethrough: bool,
+}
+
+impl SgrState {
+    /// Initial state: all flags off, colors are the terminal defaults
+    /// (`Named(256)` = Foreground, `Named(257)` = Background in alacritty's
+    /// `NamedColor` numbering).
+    fn default_state() -> Self {
+        Self {
+            fg: scribe_common::screen::ScreenColor::Named(256),
+            bg: scribe_common::screen::ScreenColor::Named(257),
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+            hidden: false,
+            strikethrough: false,
+        }
+    }
+
+    /// Returns `true` if the cell's attributes exactly match the current state.
+    fn matches(&self, cell: &scribe_common::screen::ScreenCell) -> bool {
+        self.fg == cell.fg
+            && self.bg == cell.bg
+            && self.bold == cell.flags.bold
+            && self.dim == cell.flags.dim
+            && self.italic == cell.flags.italic
+            && self.underline == cell.flags.underline
+            && self.inverse == cell.flags.inverse
+            && self.hidden == cell.flags.hidden
+            && self.strikethrough == cell.flags.strikethrough
+    }
+
+    /// Update state to match the given cell's attributes.
+    fn update(&mut self, cell: &scribe_common::screen::ScreenCell) {
+        self.fg = cell.fg;
+        self.bg = cell.bg;
+        self.bold = cell.flags.bold;
+        self.dim = cell.flags.dim;
+        self.italic = cell.flags.italic;
+        self.underline = cell.flags.underline;
+        self.inverse = cell.flags.inverse;
+        self.hidden = cell.flags.hidden;
+        self.strikethrough = cell.flags.strikethrough;
+    }
+}
+
 /// Convert a `ScreenSnapshot` to ANSI escape sequences that reproduce the
 /// visible screen content when fed through a VTE parser.
 ///
@@ -4670,6 +4937,10 @@ fn snapshot_to_ansi(snapshot: &scribe_common::screen::ScreenSnapshot) -> Vec<u8>
 
     let mut is_first_row = true;
 
+    // SGR diff state: start from the known-reset state (we just emitted \x1b[0m
+    // above), so the first cell will only emit SGR if it differs from defaults.
+    let mut sgr_state = SgrState::default_state();
+
     // --- Scrollback lines (oldest first) ---
     // As these overflow the visible area, they naturally flow into the
     // client Term's scrollback buffer — the same mechanism as normal use.
@@ -4678,7 +4949,7 @@ fn snapshot_to_ansi(snapshot: &scribe_common::screen::ScreenSnapshot) -> Vec<u8>
             buf.push_str("\r\n");
         }
         is_first_row = false;
-        write_snapshot_row(&mut buf, &snapshot.scrollback, row, cols);
+        write_snapshot_row(&mut buf, &snapshot.scrollback, row, cols, &mut sgr_state);
     }
 
     // --- Visible lines ---
@@ -4687,7 +4958,7 @@ fn snapshot_to_ansi(snapshot: &scribe_common::screen::ScreenSnapshot) -> Vec<u8>
             buf.push_str("\r\n");
         }
         is_first_row = false;
-        write_snapshot_row(&mut buf, &snapshot.cells, row, cols);
+        write_snapshot_row(&mut buf, &snapshot.cells, row, cols, &mut sgr_state);
     }
 
     // Reset attributes, position cursor, show cursor if visible.
@@ -4699,23 +4970,39 @@ fn snapshot_to_ansi(snapshot: &scribe_common::screen::ScreenSnapshot) -> Vec<u8>
         u32::from(snapshot.cursor_row) + 1,
         u32::from(snapshot.cursor_col) + 1,
     );
-    // For alt screen snapshots, leave the cursor hidden — the alt screen app
-    // (e.g. Claude Code, vim) will control cursor visibility through its own
-    // live PTY output.  Showing it here causes a "double cursor": the terminal
-    // cursor overlaps with the app's own drawn cursor.
-    if snapshot.cursor_visible && !snapshot.alt_screen {
-        buf.push_str("\x1b[?25h");
+    // For alt screen snapshots, leave the cursor hidden and skip DECSCUSR —
+    // the alt screen app (e.g. Claude Code, vim) will control cursor
+    // visibility and shape through its own live PTY output.  Emitting them
+    // here causes a "double cursor": the terminal cursor overlaps with the
+    // app's own drawn cursor.
+    if !snapshot.alt_screen {
+        if snapshot.cursor_visible {
+            buf.push_str("\x1b[?25h");
+        }
+        // Restore cursor shape via DECSCUSR so reconnect preserves the style
+        // that was active in the session (e.g. beam in a text editor).
+        let decscusr = match snapshot.cursor_style {
+            scribe_common::screen::CursorStyle::Block => "\x1b[2 q",
+            scribe_common::screen::CursorStyle::Beam => "\x1b[6 q",
+            scribe_common::screen::CursorStyle::Underline => "\x1b[4 q",
+            scribe_common::screen::CursorStyle::HollowBlock => "\x1b[1 q",
+        };
+        buf.push_str(decscusr);
     }
 
     buf.into_bytes()
 }
 
 /// Write a single row of cells as ANSI escape sequences.
+///
+/// `sgr_state` tracks the currently-active SGR attributes across calls so that
+/// unchanged runs of cells can skip emitting a redundant escape sequence.
 fn write_snapshot_row(
     buf: &mut String,
     cells: &[scribe_common::screen::ScreenCell],
     row: usize,
     cols: usize,
+    sgr_state: &mut SgrState,
 ) {
     for col in 0..cols {
         let idx = row * cols + col;
@@ -4728,8 +5015,13 @@ fn write_snapshot_row(
             continue;
         }
 
-        // Build SGR (Select Graphic Rendition) sequence.
-        write_sgr(buf, cell);
+        // Only emit SGR when this cell's attributes differ from the current
+        // state.  Terminals preserve SGR across line breaks, so the state
+        // carries over between rows without resetting.
+        if !sgr_state.matches(cell) {
+            write_sgr(buf, cell);
+            sgr_state.update(cell);
+        }
 
         // Write the character (space for null/empty cells).
         if cell.c == '\0' || cell.c == ' ' {

@@ -1,3 +1,5 @@
+use std::hash::{DefaultHasher, Hasher};
+
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, BlendState, Buffer, BufferBindingType,
@@ -40,6 +42,10 @@ pub struct TerminalPipeline {
     instance_buffer: Buffer,
     instance_count: u32,
     max_instances: u32,
+    /// Hash of the last uploaded instance slice.  Used to skip the GPU
+    /// `write_buffer` call when the frame content is identical.  Reset to
+    /// `0` after an atlas rebuild so stale UV coordinates are never reused.
+    last_instance_hash: u64,
 }
 
 impl TerminalPipeline {
@@ -76,10 +82,16 @@ impl TerminalPipeline {
             instance_buffer,
             instance_count: 0,
             max_instances: INITIAL_INSTANCE_CAPACITY,
+            last_instance_hash: 0,
         }
     }
 
     /// Upload instance data to the GPU, growing the buffer if needed.
+    ///
+    /// Hashes the instance slice and skips the GPU `write_buffer` call when
+    /// the content is identical to the previous frame.  `instance_count` is
+    /// always updated so the draw call uses the correct count even on a
+    /// hash-skip early return.
     #[allow(
         clippy::cast_possible_truncation,
         reason = "instance count is bounded by buffer capacity which fits in u32"
@@ -87,13 +99,32 @@ impl TerminalPipeline {
     pub fn update_instances(&mut self, device: &Device, queue: &Queue, instances: &[CellInstance]) {
         let count = instances.len() as u32;
 
+        let mut hasher = DefaultHasher::new();
+        // CellInstance is `bytemuck::Pod` (plain bytes); hash the raw byte
+        // representation to avoid requiring a `Hash` impl on the GPU type.
+        hasher.write(bytemuck::cast_slice(instances));
+        let new_hash = hasher.finish();
+
+        // Always keep instance_count in sync — the draw call reads it even
+        // when we skip the GPU upload.
+        self.instance_count = count;
+
+        if new_hash == self.last_instance_hash {
+            return;
+        }
+        self.last_instance_hash = new_hash;
+
         if count > self.max_instances {
             let new_capacity = count.max(self.max_instances.saturating_mul(2));
             self.instance_buffer = create_instance_buffer(device, new_capacity);
             self.max_instances = new_capacity;
+        } else if count < self.max_instances / 4 && self.max_instances > INITIAL_INSTANCE_CAPACITY {
+            // Shrink the buffer when usage drops below 25% of capacity to
+            // avoid holding onto GPU memory after a large terminal is closed.
+            let new_capacity = count.max(INITIAL_INSTANCE_CAPACITY).max(count.saturating_mul(2));
+            self.instance_buffer = create_instance_buffer(device, new_capacity);
+            self.max_instances = new_capacity;
         }
-
-        self.instance_count = count;
 
         if !instances.is_empty() {
             queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
@@ -153,6 +184,17 @@ impl TerminalPipeline {
             atlas_view,
             atlas_sampler,
         );
+    }
+
+    /// Invalidate the cached instance hash so the next frame always re-uploads
+    /// instance data to the GPU.
+    ///
+    /// Must be called after an atlas rebuild: the atlas texture is replaced but
+    /// the instance data (UV coordinates) now references stale atlas positions.
+    /// Resetting the hash forces a full GPU upload on the next frame.
+    /// `instance_count` is intentionally preserved — only the hash needs reset.
+    pub fn invalidate_instance_cache(&mut self) {
+        self.last_instance_hash = 0;
     }
 }
 

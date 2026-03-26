@@ -82,6 +82,28 @@ pub fn build_tab_bar_bg(
             bg_color: bg,
         });
     }
+
+    // Fill the fractional-pixel remainder at the right edge.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "column count is a small positive integer fitting in f32"
+    )]
+    let remainder = rect.width - cols as f32 * cell_w;
+    if remainder > 0.0 {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "column count is a small positive integer fitting in f32"
+        )]
+        let x = rect.x + cols as f32 * cell_w;
+        out.push(CellInstance {
+            pos: [x, rect.y],
+            size: [remainder, tab_bar_height],
+            uv_min: [0.0, 0.0],
+            uv_max: [0.0, 0.0],
+            fg_color: bg,
+            bg_color: bg,
+        });
+    }
 }
 
 /// Height of the bottom separator line in pixels.
@@ -114,6 +136,28 @@ pub fn build_tab_bar_separator(
         out.push(CellInstance {
             pos: [x, separator_y],
             size: [cell_w, SEPARATOR_HEIGHT],
+            uv_min: [0.0, 0.0],
+            uv_max: [0.0, 0.0],
+            fg_color: color,
+            bg_color: color,
+        });
+    }
+
+    // Fill the fractional-pixel remainder at the right edge.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "column count is a small positive integer fitting in f32"
+    )]
+    let remainder = rect.width - cols as f32 * cell_w;
+    if remainder > 0.0 {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "column count is a small positive integer fitting in f32"
+        )]
+        let x = rect.x + cols as f32 * cell_w;
+        out.push(CellInstance {
+            pos: [x, separator_y],
+            size: [remainder, SEPARATOR_HEIGHT],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
             fg_color: color,

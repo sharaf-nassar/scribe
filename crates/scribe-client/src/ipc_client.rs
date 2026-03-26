@@ -40,7 +40,6 @@ pub enum ClientCommand {
     /// Attach to existing (detached) sessions on the server.
     AttachSessions { session_ids: Vec<SessionId> },
     /// Notify server that config file has been updated.
-    #[allow(dead_code, reason = "will be triggered by config hot-reload file watcher")]
     ConfigReloaded,
     /// Report the current workspace split tree to the server.
     ReportWorkspaceTree { tree: scribe_common::protocol::WorkspaceTreeNode },

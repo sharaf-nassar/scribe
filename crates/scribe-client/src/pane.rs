@@ -10,7 +10,7 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions as _;
 use scribe_common::config::ContentPadding;
 use scribe_common::ids::{SessionId, WorkspaceId};
-use scribe_renderer::types::GridSize;
+use scribe_renderer::types::{CellInstance, GridSize};
 
 use crate::layout::{PaneEdges, Rect};
 use crate::scrollbar::ScrollbarState;
@@ -41,6 +41,25 @@ pub struct Pane {
         reason = "read by scrollbar rendering and hit-testing, wired in later tasks"
     )]
     pub scrollbar_state: ScrollbarState,
+    /// Set to `true` whenever PTY output, resize, or scroll changes the
+    /// terminal state. Cleared after the instances are rebuilt. Starts as
+    /// `true` so the first frame always performs a full build.
+    pub content_dirty: bool,
+    /// Last-built cell instances for this pane, reused when `content_dirty`
+    /// is false and rendering context (cursor, focus, selection) hasn't changed.
+    pub last_instances: Vec<CellInstance>,
+    /// The `cursor_visible` value used when `last_instances` was built.
+    /// `None` means instances have never been built.
+    pub last_cursor_visible: Option<bool>,
+    /// Whether this pane was the focused pane when `last_instances` was built.
+    /// `None` means instances have never been built.
+    pub last_was_focused: Option<bool>,
+    /// Whether there was an active selection on this pane when
+    /// `last_instances` was built.
+    pub last_had_selection: bool,
+    /// The grid size last sent to the server via IPC resize.
+    /// `None` means a resize has never been sent for this pane.
+    pub last_sent_grid: Option<GridSize>,
 }
 
 /// Simple adapter implementing `alacritty_terminal::grid::Dimensions`.
@@ -89,12 +108,19 @@ impl Pane {
             grid,
             edges,
             scrollbar_state: ScrollbarState::new(),
+            content_dirty: true,
+            last_instances: Vec::new(),
+            last_cursor_visible: None,
+            last_was_focused: None,
+            last_had_selection: false,
+            last_sent_grid: None,
         }
     }
 
     /// Feed raw PTY output bytes into the ANSI processor / terminal.
     pub fn feed_output(&mut self, bytes: &[u8]) {
         self.ansi_processor.advance(&mut self.term, bytes);
+        self.content_dirty = true;
     }
 
     /// Resize just the underlying terminal emulator without changing the
@@ -108,6 +134,7 @@ impl Pane {
         if self.term.columns() != dims.cols || self.term.screen_lines() != dims.lines {
             self.term.resize(dims);
         }
+        self.content_dirty = true;
     }
 
     /// Resize this pane to a new pixel rect.
@@ -116,6 +143,7 @@ impl Pane {
     pub fn resize(&mut self, new_rect: Rect, new_grid: GridSize) -> GridSize {
         self.rect = new_rect;
         self.grid = new_grid;
+        self.content_dirty = true;
 
         let dims = TermDims { cols: usize::from(new_grid.cols), lines: usize::from(new_grid.rows) };
         if self.term.columns() != dims.cols || self.term.screen_lines() != dims.lines {

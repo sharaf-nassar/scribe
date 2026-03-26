@@ -569,8 +569,13 @@ fn cloexec_flag() -> SockFlag {
 }
 
 /// No-op on Linux — `SOCK_CLOEXEC` was already set at socket creation.
+/// Returns `Result` to match the non-Linux signature so callers can use `?`
+/// uniformly across both `cfg` variants.
 #[cfg(target_os = "linux")]
-#[allow(clippy::unnecessary_wraps, reason = "signature must match the non-Linux variant")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "signature must match the non-Linux variant so callers can use ? uniformly"
+)]
 fn set_cloexec_if_needed(_fd: &OwnedFd) -> Result<(), ScribeError> {
     Ok(())
 }
