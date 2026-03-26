@@ -3,7 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::ScribeError;
 
-const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024; // 16 MiB max message
+const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024; // 256 MiB — reattach can send many snapshots at once
 
 /// Read a single length-prefixed msgpack frame from an async reader.
 ///

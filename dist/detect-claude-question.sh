@@ -3,13 +3,14 @@
 #
 # Called by the Stop hook. Reads JSON from stdin, inspects
 # last_assistant_message, and emits:
-#   waiting_for_input — if response ends with a question
+#   waiting_for_input — if response ends with a question or approval request
 #   idle_prompt       — otherwise
 #
-# Heuristics (in priority order):
-#   1. Last non-empty line (outside a fenced code block) ends with "?"
-#   2. Last paragraph contains question phrases ("Would you like",
-#      "Should I", "Do you want", "Which option", etc.)
+# Heuristics (checked against the last ~20 non-empty lines, not just the
+# last paragraph, so questions followed by a concluding sentence are caught):
+#   1. Any line ends with "?"
+#   2. Contains question phrases ("Would you like", "Should I", etc.)
+#   3. Contains approval/review phrases ("please review", "once approved", etc.)
 
 set -euo pipefail
 
@@ -29,21 +30,22 @@ if [[ -n "$MSG" ]]; then
         !inside { print }
     ')
 
-    # Extract the last paragraph (block of non-empty lines after the
-    # final blank line).  A question followed by bullet-point options
-    # lives in a single paragraph, so we must check the whole block.
-    LAST_PARA=$(printf '%s\n' "$STRIPPED" | awk '
-        /^[[:space:]]*$/ { para = ""; next }
-        { para = para (para ? "\n" : "") $0 }
-        END { print para }
-    ')
+    # Take the last 20 non-empty lines instead of just the last paragraph.
+    # This catches questions that are followed by a concluding sentence in
+    # a separate paragraph (e.g. "These answers will help me..." after
+    # numbered questions ending with "?").
+    TAIL_LINES=$(printf '%s\n' "$STRIPPED" | grep -v '^[[:space:]]*$' | tail -n 20)
 
-    # Heuristic 1: any line in the last paragraph ends with "?"
-    if printf '%s\n' "$LAST_PARA" | grep -qE '\?\s*$'; then
+    # Heuristic 1: any line in the tail ends with "?"
+    if printf '%s\n' "$TAIL_LINES" | grep -qE '\?\s*$'; then
         STATE="waiting_for_input"
-    # Heuristic 2: last paragraph contains common question phrases
-    elif printf '%s\n' "$LAST_PARA" \
+    # Heuristic 2: tail contains common question phrases
+    elif printf '%s\n' "$TAIL_LINES" \
         | grep -qiE '(would you like|should i|do you want|which option|please (choose|select|pick)|how (should|would|do)|what (should|would|do)|let me know|your (choice|preference|call))'; then
+        STATE="waiting_for_input"
+    # Heuristic 3: tail contains approval/review request phrases
+    elif printf '%s\n' "$TAIL_LINES" \
+        | grep -qiE '(please (review|approve)|review and approve|once approved|approve (the|this|it|above)|waiting for.*(approval|review)|I.ll execute.*once approved|confirm (the|this|before)|ready to (proceed|execute|start)|proceed\?)'; then
         STATE="waiting_for_input"
     fi
 fi

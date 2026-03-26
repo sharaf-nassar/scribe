@@ -9,7 +9,10 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::index::{Column, Line};
 
+use scribe_common::config::ContentPadding;
+
 use crate::layout::Rect;
+use crate::mouse_state::SelectionMode;
 
 /// A position on the terminal grid, in row/column coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,9 +26,25 @@ pub struct SelectionPoint {
 pub struct SelectionRange {
     pub start: SelectionPoint,
     pub end: SelectionPoint,
+    pub mode: SelectionMode,
 }
 
 impl SelectionRange {
+    /// Create a cell-granularity selection.
+    pub fn cell(start: SelectionPoint, end: SelectionPoint) -> Self {
+        Self { start, end, mode: SelectionMode::Cell }
+    }
+
+    /// Create a word-granularity selection.
+    pub fn word(start: SelectionPoint, end: SelectionPoint) -> Self {
+        Self { start, end, mode: SelectionMode::Word }
+    }
+
+    /// Create a line-granularity selection.
+    pub fn line(start: SelectionPoint, end: SelectionPoint) -> Self {
+        Self { start, end, mode: SelectionMode::Line }
+    }
+
     /// Return `(start, end)` in reading order: top-to-bottom,
     /// left-to-right. The first element is always the earlier position.
     pub fn normalized(&self) -> (SelectionPoint, SelectionPoint) {
@@ -97,11 +116,12 @@ pub fn pixel_to_grid(
     cell_h: f32,
     tab_bar_height: f32,
     display_offset: usize,
+    padding: &ContentPadding,
 ) -> Option<SelectionPoint> {
-    let content_x = pane_rect.x;
-    let content_y = pane_rect.y + tab_bar_height;
-    let content_w = pane_rect.width;
-    let content_h = (pane_rect.height - tab_bar_height).max(0.0);
+    let content_x = pane_rect.x + padding.left;
+    let content_y = pane_rect.y + tab_bar_height + padding.top;
+    let content_w = (pane_rect.width - padding.left - padding.right).max(0.0);
+    let content_h = (pane_rect.height - tab_bar_height - padding.top - padding.bottom).max(0.0);
 
     // Pixel offset relative to the content area origin.
     let rel_x = x - content_x;
@@ -174,11 +194,95 @@ pub fn extract_text(term: &Term<VoidListener>, range: &SelectionRange) -> String
     lines.join("\n")
 }
 
+/// Return whether `c` is a word character for double-click word selection.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(c, '_' | '-' | '.' | '/' | '~' | '@' | '+' | ':' | '%' | '#' | '?' | '&' | '=')
+}
+
+/// Find the word boundaries around `point` on the terminal grid.
+///
+/// If the character at `point` is a delimiter, both bounds equal `point`
+/// (single-cell selection).  Returns `(start, end)` in reading order.
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "column index is bounded by terminal width which fits in i32"
+)]
+pub fn word_bounds_at(
+    term: &Term<VoidListener>,
+    point: SelectionPoint,
+) -> (SelectionPoint, SelectionPoint) {
+    let cols = term.grid().columns();
+    let max_col = cols.saturating_sub(1);
+    let line = Line(point.row);
+    let c = read_cell_char(term, line, Column(point.col.min(max_col)));
+    if !is_word_char(c) {
+        return (point, point);
+    }
+
+    // Scan left for word start.
+    let mut start_col = point.col;
+    while start_col > 0 {
+        let prev = start_col.saturating_sub(1);
+        if !is_word_char(read_cell_char(term, line, Column(prev))) {
+            break;
+        }
+        start_col = prev;
+    }
+
+    // Scan right for word end.
+    let mut end_col = point.col;
+    while end_col < max_col {
+        let next = end_col.saturating_add(1);
+        if !is_word_char(read_cell_char(term, line, Column(next))) {
+            break;
+        }
+        end_col = next;
+    }
+
+    (
+        SelectionPoint { row: point.row, col: start_col },
+        SelectionPoint { row: point.row, col: end_col },
+    )
+}
+
+/// Return the start and end of the full line at `row`.
+pub fn line_bounds_at(term: &Term<VoidListener>, row: i32) -> (SelectionPoint, SelectionPoint) {
+    let last_col = term.grid().columns().saturating_sub(1);
+    (SelectionPoint { row, col: 0 }, SelectionPoint { row, col: last_col })
+}
+
+/// Extend a word-mode selection during double-click drag.
+///
+/// `anchor_start` and `anchor_end` are the word bounds from the initial
+/// double-click.  `new_point` is the current drag position.
+pub fn extend_by_word(
+    term: &Term<VoidListener>,
+    anchor_start: SelectionPoint,
+    anchor_end: SelectionPoint,
+    new_point: SelectionPoint,
+) -> SelectionRange {
+    let after_end = new_point.row > anchor_end.row
+        || (new_point.row == anchor_end.row && new_point.col > anchor_end.col);
+    let before_start = new_point.row < anchor_start.row
+        || (new_point.row == anchor_start.row && new_point.col < anchor_start.col);
+
+    if after_end {
+        let (_, word_end) = word_bounds_at(term, new_point);
+        SelectionRange::word(anchor_start, word_end)
+    } else if before_start {
+        let (word_start, _) = word_bounds_at(term, new_point);
+        SelectionRange::word(word_start, anchor_end)
+    } else {
+        SelectionRange::word(anchor_start, anchor_end)
+    }
+}
+
 /// Read a single cell character from the terminal grid.
 ///
 /// `alacritty_terminal`'s `Grid` and `Row` only implement the `Index` trait
 /// with no fallible `.get()` alternative, so we must use indexing here.
-fn read_cell_char(term: &Term<VoidListener>, line: Line, col: Column) -> char {
+pub fn read_cell_char(term: &Term<VoidListener>, line: Line, col: Column) -> char {
     #[allow(
         clippy::indexing_slicing,
         reason = "alacritty_terminal grid only supports Index trait, no get() alternative"

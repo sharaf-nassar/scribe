@@ -129,6 +129,8 @@ pub struct AppearanceConfig {
     pub tab_bar_padding: f32,
     #[serde(default = "default_tab_width")]
     pub tab_width: u16,
+    #[serde(default)]
+    pub content_padding: ContentPadding,
 }
 
 impl Default for AppearanceConfig {
@@ -148,6 +150,7 @@ impl Default for AppearanceConfig {
             scrollbar_color: None,
             tab_bar_padding: default_tab_bar_padding(),
             tab_width: default_tab_width(),
+            content_padding: ContentPadding::default(),
         }
     }
 }
@@ -190,6 +193,49 @@ fn default_tab_bar_padding() -> f32 {
 
 fn default_tab_width() -> u16 {
     20
+}
+
+fn default_content_padding_side() -> f32 {
+    2.0
+}
+
+// ---------------------------------------------------------------------------
+// Content padding
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentPadding {
+    #[serde(default = "default_content_padding_side")]
+    pub top: f32,
+    #[serde(default = "default_content_padding_side")]
+    pub right: f32,
+    #[serde(default = "default_content_padding_side")]
+    pub bottom: f32,
+    #[serde(default = "default_content_padding_side")]
+    pub left: f32,
+}
+
+impl ContentPadding {
+    /// Clamp all sides to the valid range `0.0..=50.0`.
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        Self {
+            top: self.top.clamp(0.0, 50.0),
+            right: self.right.clamp(0.0, 50.0),
+            bottom: self.bottom.clamp(0.0, 50.0),
+            left: self.left.clamp(0.0, 50.0),
+        }
+    }
+}
+
+impl Default for ContentPadding {
+    fn default() -> Self {
+        Self {
+            top: default_content_padding_side(),
+            right: default_content_padding_side(),
+            bottom: default_content_padding_side(),
+            left: default_content_padding_side(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -832,8 +878,10 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
 
     tracing::info!(?config_path, "loading config");
 
-    let config: ScribeConfig = toml::from_str(&content)
+    let mut config: ScribeConfig = toml::from_str(&content)
         .map_err(|e| ScribeError::ConfigError { reason: format!("config parse error: {e}") })?;
+
+    config.appearance.content_padding = config.appearance.content_padding.clamped();
 
     Ok(config)
 }

@@ -8,10 +8,11 @@ use std::path::PathBuf;
 use alacritty_terminal::Term;
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions as _;
+use scribe_common::config::ContentPadding;
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_renderer::types::GridSize;
 
-use crate::layout::Rect;
+use crate::layout::{PaneEdges, Rect};
 use crate::scrollbar::ScrollbarState;
 
 /// State for a single terminal pane.
@@ -33,6 +34,8 @@ pub struct Pane {
     pub rect: Rect,
     /// Grid size (cols, rows) for this pane's content area.
     pub grid: GridSize,
+    /// Which edges of this pane border the viewport (vs. another pane).
+    pub edges: PaneEdges,
     #[allow(
         dead_code,
         reason = "read by scrollbar rendering and hit-testing, wired in later tasks"
@@ -68,6 +71,7 @@ impl Pane {
         grid: GridSize,
         session_id: SessionId,
         workspace_id: WorkspaceId,
+        edges: PaneEdges,
     ) -> Self {
         let dims = TermDims { cols: usize::from(grid.cols), lines: usize::from(grid.rows) };
         let term = Term::new(alacritty_terminal::term::Config::default(), &dims, VoidListener);
@@ -83,6 +87,7 @@ impl Pane {
             ansi_processor: vte::ansi::Processor::new(),
             rect,
             grid,
+            edges,
             scrollbar_state: ScrollbarState::new(),
         }
     }
@@ -121,8 +126,9 @@ impl Pane {
     }
 
     /// Return the pixel offset where terminal content starts (below tab bar).
-    pub fn content_offset(&self, tab_bar_height: f32) -> (f32, f32) {
-        (self.rect.x, self.rect.y + tab_bar_height)
+    pub fn content_offset(&self, tab_bar_height: f32, padding: &ContentPadding) -> (f32, f32) {
+        let eff = effective_padding(padding, self.edges);
+        (self.rect.x + eff.left, self.rect.y + tab_bar_height + eff.top)
     }
 
     /// Return the content area (below tab bar) as a viewport size tuple.
@@ -138,15 +144,27 @@ impl Pane {
     }
 }
 
+/// Compute effective content padding for a pane, zeroing out padding on
+/// internal edges (those adjacent to a sibling pane).
+pub fn effective_padding(padding: &ContentPadding, edges: PaneEdges) -> ContentPadding {
+    ContentPadding {
+        top: if edges.top { padding.top } else { 0.0 },
+        right: if edges.right { padding.right } else { 0.0 },
+        bottom: if edges.bottom { padding.bottom } else { 0.0 },
+        left: if edges.left { padding.left } else { 0.0 },
+    }
+}
+
 /// Compute the grid size for a pane's content area.
 pub fn compute_pane_grid(
     rect: Rect,
     cell_width: f32,
     cell_height: f32,
     tab_bar_height: f32,
+    padding: &ContentPadding,
 ) -> GridSize {
-    let content_w = rect.width;
-    let content_h = (rect.height - tab_bar_height).max(1.0);
+    let content_w = (rect.width - padding.left - padding.right).max(1.0);
+    let content_h = (rect.height - tab_bar_height - padding.top - padding.bottom).max(1.0);
     grid_from_pixels(content_w, content_h, cell_width, cell_height)
 }
 

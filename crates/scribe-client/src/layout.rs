@@ -78,6 +78,33 @@ impl Rect {
     }
 }
 
+/// Which edges of a pane border the viewport (external edges).
+///
+/// Internal edges — those adjacent to a sibling pane — should not have
+/// content padding applied, preventing visual gaps between panes.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "four independent directional flags; each is semantically distinct and no state machine applies"
+)]
+#[derive(Debug, Clone, Copy)]
+pub struct PaneEdges {
+    /// True when the top edge borders the viewport (not another pane).
+    pub top: bool,
+    /// True when the right edge borders the viewport.
+    pub right: bool,
+    /// True when the bottom edge borders the viewport.
+    pub bottom: bool,
+    /// True when the left edge borders the viewport.
+    pub left: bool,
+}
+
+impl PaneEdges {
+    /// All edges are external (single pane, no adjacent siblings).
+    pub const fn all_external() -> Self {
+        Self { top: true, right: true, bottom: true, left: true }
+    }
+}
+
 /// A node in the binary split tree.
 #[derive(Debug)]
 pub enum LayoutNode {
@@ -131,9 +158,9 @@ impl LayoutTree {
     }
 
     /// Compute pixel rects for every leaf in the tree.
-    pub fn compute_rects(&self, viewport: Rect) -> Vec<(PaneId, Rect)> {
+    pub fn compute_rects(&self, viewport: Rect) -> Vec<(PaneId, Rect, PaneEdges)> {
         let mut out = Vec::new();
-        collect_rects(&self.root, viewport, &mut out);
+        collect_rects(&self.root, viewport, PaneEdges::all_external(), &mut out);
         out
     }
 
@@ -217,9 +244,9 @@ impl LayoutTree {
         &self,
         current: PaneId,
         direction: FocusDirection,
-        rects: &[(PaneId, Rect)],
+        rects: &[(PaneId, Rect, PaneEdges)],
     ) -> Option<PaneId> {
-        let current_rect = rects.iter().find(|(id, _)| *id == current).map(|(_, r)| r)?;
+        let current_rect = rects.iter().find(|(id, _, _)| *id == current).map(|(_, r, _)| r)?;
         best_candidate_in_direction(*current_rect, current, direction, rects)
     }
 }
@@ -229,13 +256,19 @@ impl LayoutTree {
 // ---------------------------------------------------------------------------
 
 /// Recursively compute rects for all leaves.
-fn collect_rects(node: &LayoutNode, rect: Rect, out: &mut Vec<(PaneId, Rect)>) {
+fn collect_rects(
+    node: &LayoutNode,
+    rect: Rect,
+    edges: PaneEdges,
+    out: &mut Vec<(PaneId, Rect, PaneEdges)>,
+) {
     match node {
-        LayoutNode::Leaf(id) => out.push((*id, rect)),
+        LayoutNode::Leaf(id) => out.push((*id, rect, edges)),
         LayoutNode::Split { direction, ratio, first, second } => {
             let (r1, r2) = split_rect(rect, *direction, *ratio);
-            collect_rects(first, r1, out);
-            collect_rects(second, r2, out);
+            let (e1, e2) = split_edges(edges, *direction);
+            collect_rects(first, r1, e1, out);
+            collect_rects(second, r2, e2, out);
         }
     }
 }
@@ -264,6 +297,23 @@ fn split_rect(rect: Rect, direction: SplitDirection, ratio: f32) -> (Rect, Rect)
                 height: rect.height - top_h,
             };
             (first, second)
+        }
+    }
+}
+
+/// Split edge flags for a parent being divided into two children.
+///
+/// The child on the split boundary loses its external edge on that side
+/// because it now borders a sibling pane, not the viewport.
+fn split_edges(edges: PaneEdges, direction: SplitDirection) -> (PaneEdges, PaneEdges) {
+    match direction {
+        SplitDirection::Horizontal => {
+            // Left | Right: first child loses right edge, second loses left.
+            (PaneEdges { right: false, ..edges }, PaneEdges { left: false, ..edges })
+        }
+        SplitDirection::Vertical => {
+            // Top / Bottom: first child loses bottom, second loses top.
+            (PaneEdges { bottom: false, ..edges }, PaneEdges { top: false, ..edges })
         }
     }
 }
@@ -536,10 +586,10 @@ fn best_candidate_in_direction(
     current_rect: Rect,
     current_id: PaneId,
     direction: FocusDirection,
-    rects: &[(PaneId, Rect)],
+    rects: &[(PaneId, Rect, PaneEdges)],
 ) -> Option<PaneId> {
     let mut best: Option<(PaneId, f32)> = None;
-    for &(id, rect) in rects {
+    for &(id, rect, _) in rects {
         if id == current_id {
             continue;
         }

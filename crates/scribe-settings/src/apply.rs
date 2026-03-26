@@ -124,6 +124,38 @@ fn apply_config_key(
             let v = value.as_f64().ok_or("tab_width must be a number")? as u16;
             config.appearance.tab_width = v.clamp(8, 50);
         }
+        "appearance.content_padding_top" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "content padding top is a small non-negative float"
+            )]
+            let v = value.as_f64().ok_or("content_padding_top must be a number")? as f32;
+            config.appearance.content_padding.top = v.clamp(0.0, 50.0);
+        }
+        "appearance.content_padding_right" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "content padding right is a small non-negative float"
+            )]
+            let v = value.as_f64().ok_or("content_padding_right must be a number")? as f32;
+            config.appearance.content_padding.right = v.clamp(0.0, 50.0);
+        }
+        "appearance.content_padding_bottom" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "content padding bottom is a small non-negative float"
+            )]
+            let v = value.as_f64().ok_or("content_padding_bottom must be a number")? as f32;
+            config.appearance.content_padding.bottom = v.clamp(0.0, 50.0);
+        }
+        "appearance.content_padding_left" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "content padding left is a small non-negative float"
+            )]
+            let v = value.as_f64().ok_or("content_padding_left must be a number")? as f32;
+            config.appearance.content_padding.left = v.clamp(0.0, 50.0);
+        }
         // -- Theme preset -----------------------------------------------------
         "theme.preset" => {
             let preset = value.as_str().ok_or("theme preset must be a string")?;

@@ -4,10 +4,12 @@ mod ai_indicator;
 mod clipboard_cleanup;
 mod close_dialog;
 mod config;
+mod context_menu;
 mod divider;
 mod input;
 mod ipc_client;
 mod layout;
+mod mouse_state;
 mod pane;
 mod scrollbar;
 mod search_overlay;
@@ -16,6 +18,7 @@ mod splash;
 mod status_bar;
 mod sys_stats;
 mod tab_bar;
+mod url_detect;
 mod window_state;
 mod workspace_layout;
 
@@ -24,7 +27,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use scribe_common::config::{ScribeConfig, resolve_theme};
+use scribe_common::config::{ContentPadding, ScribeConfig, resolve_theme};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::theme::Theme;
 use scribe_renderer::TerminalRenderer;
@@ -39,7 +42,7 @@ use crate::ai_indicator::AiStateTracker;
 use crate::divider::DividerDrag;
 use crate::input::{KeyAction, LayoutAction};
 use crate::ipc_client::{ClientCommand, UiEvent};
-use crate::layout::{PaneId, Rect};
+use crate::layout::{PaneEdges, PaneId, Rect};
 use crate::pane::Pane;
 use crate::workspace_layout::WindowLayout;
 
@@ -120,6 +123,10 @@ struct App {
     active_selection: Option<selection::SelectionRange>,
     /// Whether the left mouse button is currently held (for drag detection).
     mouse_selecting: bool,
+    /// Click state for single/double/triple click classification.
+    mouse_click: mouse_state::MouseClickState,
+    /// Word bounds from the initial double-click (for drag-by-word).
+    word_drag_anchor: Option<(selection::SelectionPoint, selection::SelectionPoint)>,
 
     // Connection state
     /// Whether the IPC connection to the server is alive.
@@ -146,6 +153,9 @@ struct App {
 
     // Close dialog overlay (shown on window close request)
     close_dialog: Option<close_dialog::CloseDialog>,
+
+    // Context menu overlay (shown on right-click)
+    context_menu: Option<context_menu::ContextMenu>,
 
     /// Whether the splash screen is still showing.
     /// Set to `true` on init; cleared after the splash has been visible for
@@ -224,6 +234,11 @@ struct App {
     /// System resource stats collector for the status bar.
     sys_stats: sys_stats::SystemStatsCollector,
 
+    /// Per-pane URL span caches (dirty-flag lazy refresh).
+    url_caches: HashMap<PaneId, url_detect::PaneUrlCache>,
+    /// The URL span the cursor is currently hovering over, if any.
+    hovered_url: Option<url_detect::UrlSpan>,
+
     /// Config file watcher -- kept alive for its side-effect of sending
     /// `UiEvent::ConfigChanged` events.
     #[allow(dead_code, reason = "watcher must be stored to keep receiving file-system events")]
@@ -274,6 +289,8 @@ impl App {
             scrollbar_drag_pane: None,
             active_selection: None,
             mouse_selecting: false,
+            mouse_click: mouse_state::MouseClickState::new(),
+            word_drag_anchor: None,
             server_connected: false,
             ai_tracker: AiStateTracker::new(claude_states),
             animation_running: false,
@@ -287,6 +304,7 @@ impl App {
             zoom_level: 0,
             search_overlay: search_overlay::SearchOverlay::new(),
             close_dialog: None,
+            context_menu: None,
             splash_active: true,
             splash_needs_list_sessions: true,
             splash_first_rendered: None,
@@ -314,6 +332,8 @@ impl App {
             status_bar_equalize_rect: None,
             hostname: read_hostname(),
             sys_stats: sys_stats::SystemStatsCollector::new(),
+            url_caches: HashMap::new(),
+            hovered_url: None,
             _config_watcher: config_watcher,
         }
     }
@@ -662,6 +682,10 @@ impl App {
         let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
         pane.feed_output(bytes);
+        // Invalidate the URL cache so it re-scans on next hover check.
+        if let Some(cache) = self.url_caches.get_mut(&pane_id) {
+            cache.mark_dirty();
+        }
 
         // Mark content as ready (same deferred-dismiss as screen snapshots).
         if self.splash_active {
@@ -747,8 +771,9 @@ impl App {
         };
         let Some((_geo_id, pane_rect, grid)) = self.first_pane_geometry() else { return };
 
-        let first_pane = Pane::new(pane_rect, grid, first_sid, first_ws);
+        let first_pane = Pane::new(pane_rect, grid, first_sid, first_ws, PaneEdges::all_external());
         self.panes.insert(first_pane_id, first_pane);
+        self.url_caches.insert(first_pane_id, url_detect::PaneUrlCache::new());
         self.session_to_pane.insert(first_sid, first_pane_id);
 
         // Collect remaining (workspace, session) pairs across all workspaces.
@@ -767,8 +792,9 @@ impl App {
             let Some(pane_id) = self.window_layout.add_tab(ws_id, sid) else {
                 continue;
             };
-            let pane = Pane::new(pane_rect, grid, sid, ws_id);
+            let pane = Pane::new(pane_rect, grid, sid, ws_id, PaneEdges::all_external());
             self.panes.insert(pane_id, pane);
+            self.url_caches.insert(pane_id, url_detect::PaneUrlCache::new());
             self.session_to_pane.insert(sid, pane_id);
         }
 
@@ -841,13 +867,14 @@ impl App {
         let Some(pane_id) = self.window_layout.add_tab(workspace_id, session_id) else { return };
 
         let Some((_first_id, pane_rect, grid)) = self.first_pane_geometry() else { return };
-        let pane = Pane::new(pane_rect, grid, session_id, workspace_id);
+        let pane = Pane::new(pane_rect, grid, session_id, workspace_id, PaneEdges::all_external());
 
         send_command(
             tx,
             ClientCommand::CreateSession { workspace_id, split_direction: None, cwd: None },
         );
         self.panes.insert(pane_id, pane);
+        self.url_caches.insert(pane_id, url_detect::PaneUrlCache::new());
         self.session_to_pane.insert(session_id, pane_id);
         self.pending_sessions.push_back(session_id);
         send_resize(tx, session_id, grid.cols, grid.rows);
@@ -943,9 +970,15 @@ impl App {
 
         let tab = self.window_layout.active_tab()?;
         let pane_rects = tab.pane_layout.compute_rects(ws_rect);
-        let &(pane_id, pane_rect) = pane_rects.first()?;
+        let &(pane_id, pane_rect, pane_edges) = pane_rects.first()?;
         let tab_bar_h = self.tab_bar_height_for(first_ws_id, ws_rect);
-        let grid = pane::compute_pane_grid(pane_rect, cell.width, cell.height, tab_bar_h);
+        let grid = pane::compute_pane_grid(
+            pane_rect,
+            cell.width,
+            cell.height,
+            tab_bar_h,
+            &pane::effective_padding(&self.config.appearance.content_padding, pane_edges),
+        );
         Some((pane_id, pane_rect, grid))
     }
 
@@ -998,11 +1031,13 @@ impl App {
             // Only one pane in the active tab; remove the tab from the workspace.
             self.remove_tab_and_cleanup_workspace(ws_id, session_id);
             self.panes.remove(&pane_id);
+            self.url_caches.remove(&pane_id);
             self.request_redraw();
             return;
         }
 
         self.panes.remove(&pane_id);
+        self.url_caches.remove(&pane_id);
 
         if let Some(tab) = self.window_layout.active_tab_mut() {
             if tab.pane_layout.close_pane(pane_id) && tab.focused_pane == pane_id {
@@ -1225,14 +1260,22 @@ impl App {
                 > f32::EPSILON
                 || old.appearance.tab_width != new_config.appearance.tab_width;
 
+        // -- Content padding --
+        let old_pad = &old.appearance.content_padding;
+        let new_pad = &new_config.appearance.content_padding;
+        let padding_changed = (old_pad.top - new_pad.top).abs() > f32::EPSILON
+            || (old_pad.right - new_pad.right).abs() > f32::EPSILON
+            || (old_pad.bottom - new_pad.bottom).abs() > f32::EPSILON
+            || (old_pad.left - new_pad.left).abs() > f32::EPSILON;
+
         self.ai_tracker.reconfigure(new_config.terminal.claude_states.clone());
         self.config = new_config;
 
-        // When tab bar height or font changes, the grid row count changes and
-        // every pane must be resized so the server PTY gets the correct
-        // dimensions.  Use the all-workspaces variant so that visible but
+        // When tab bar height, font, or content padding changes, the grid row/col
+        // count changes and every pane must be resized so the server PTY gets the
+        // correct dimensions.  Use the all-workspaces variant so that visible but
         // unfocused workspaces also pick up the new cell metrics.
-        if font_changed || tab_bar_changed {
+        if font_changed || tab_bar_changed || padding_changed {
             self.resize_all_workspace_panes();
         }
 
@@ -1307,13 +1350,19 @@ impl App {
             .map(|(ws_id, ws_rect)| (*ws_id, self.tab_bar_height_for(*ws_id, *ws_rect)))
             .collect();
 
-        let any_stale = expected_rects.iter().any(|(pid, rect)| {
+        let any_stale = expected_rects.iter().any(|(pid, rect, edges)| {
             self.panes.get(pid).is_some_and(|pane| {
                 let tbh = ws_heights
                     .get(&pane.workspace_id)
                     .copied()
                     .unwrap_or_else(|| self.effective_tab_bar_height());
-                let expected = pane::compute_pane_grid(*rect, cell.width, cell.height, tbh);
+                let expected = pane::compute_pane_grid(
+                    *rect,
+                    cell.width,
+                    cell.height,
+                    tbh,
+                    &pane::effective_padding(&self.config.appearance.content_padding, *edges),
+                );
                 pane.grid.cols != expected.cols || pane.grid.rows != expected.rows
             })
         });
@@ -1412,7 +1461,8 @@ impl App {
             let Some(ws) = ws else { continue };
             let Some(tab) = ws.active_tab() else { continue };
 
-            pane_rects.extend(tab.pane_layout.compute_rects(*ws_rect));
+            let rects_with_edges = tab.pane_layout.compute_rects(*ws_rect);
+            pane_rects.extend(rects_with_edges.iter().map(|&(id, rect, _)| (id, rect)));
             dividers.extend(divider::collect_dividers(tab.pane_layout.root(), *ws_rect));
             if *ws_id == focused_ws_id {
                 focused_pane = tab.focused_pane;
@@ -1574,10 +1624,29 @@ impl App {
             indicator_h,
             self.active_selection.as_ref(),
             self.hovered_tab_close,
+            &self.config.appearance.content_padding,
         );
         self.tab_hit_targets = tab_hits;
         self.tab_close_hit_targets = tab_close_hits;
         self.tab_bar_equalize_targets = tab_eq_hits;
+
+        // URL underlines — rendered on top of terminal content, below tab bars.
+        {
+            let ws_tab_bar_heights: HashMap<WorkspaceId, f32> =
+                ws_tab_bar_data.iter().map(|d| (d.ws_id, d.tab_bar_height)).collect();
+            let fallback_tbh = ws_tab_bar_data.first().map_or(0.0, |d| d.tab_bar_height);
+            apply_url_underlines(
+                &mut all_instances,
+                &mut self.url_caches,
+                &self.panes,
+                &pane_rects,
+                &ws_tab_bar_heights,
+                fallback_tbh,
+                cell_size,
+                self.hovered_url.as_ref(),
+                &self.config.appearance.content_padding,
+            );
+        }
 
         // Window-level status bar spanning the full window width.
         {
@@ -1614,6 +1683,19 @@ impl App {
             let mut resolve_glyph =
                 |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
             dialog.build_instances(
+                &mut all_instances,
+                full_viewport,
+                cell_size,
+                &self.theme.chrome,
+                &mut resolve_glyph,
+            );
+        }
+
+        // Context menu overlay (rendered on top of close dialog).
+        if let Some(menu) = &mut self.context_menu {
+            let mut resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            menu.build_instances(
                 &mut all_instances,
                 full_viewport,
                 cell_size,
@@ -1674,6 +1756,16 @@ impl App {
 
     /// Translate a keyboard event and forward it to the correct handler.
     fn handle_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        // Dismiss context menu on any key press.
+        if self.context_menu.is_some() && event.state == winit::event::ElementState::Pressed {
+            use winit::keyboard::{Key, NamedKey};
+            if event.logical_key == Key::Named(NamedKey::Escape) {
+                self.context_menu = None;
+                self.request_redraw();
+                return;
+            }
+        }
+
         let Some(action) = input::translate_key_action(event, self.modifiers, &self.bindings)
         else {
             return;
@@ -1824,13 +1916,23 @@ impl App {
             None => return,
         };
 
-        let new_rect = rects.iter().find(|(id, _)| *id == new_pane_id).map_or(ws_rect, |(_, r)| *r);
+        let (new_rect, new_edges) = rects
+            .iter()
+            .find(|(id, _, _)| *id == new_pane_id)
+            .map_or((ws_rect, PaneEdges::all_external()), |&(_, r, e)| (r, e));
 
         let tab_bar_h = self.tab_bar_height_for(workspace_id, ws_rect);
-        let grid = pane::compute_pane_grid(new_rect, cell.width, cell.height, tab_bar_h);
-        let pane = Pane::new(new_rect, grid, session_id, workspace_id);
+        let grid = pane::compute_pane_grid(
+            new_rect,
+            cell.width,
+            cell.height,
+            tab_bar_h,
+            &pane::effective_padding(&self.config.appearance.content_padding, new_edges),
+        );
+        let pane = Pane::new(new_rect, grid, session_id, workspace_id, new_edges);
 
         self.panes.insert(new_pane_id, pane);
+        self.url_caches.insert(new_pane_id, url_detect::PaneUrlCache::new());
         self.session_to_pane.insert(session_id, new_pane_id);
         self.pending_sessions.push_back(session_id);
 
@@ -1882,10 +1984,18 @@ impl App {
             .map_or(ws_viewport, |(_, r)| *r);
 
         let tab_bar_h = self.tab_bar_height_for(new_workspace_id, ws_rect);
-        let grid = pane::compute_pane_grid(ws_rect, cell.width, cell.height, tab_bar_h);
-        let pane = Pane::new(ws_rect, grid, session_id, new_workspace_id);
+        let grid = pane::compute_pane_grid(
+            ws_rect,
+            cell.width,
+            cell.height,
+            tab_bar_h,
+            &self.config.appearance.content_padding,
+        );
+        let pane =
+            Pane::new(ws_rect, grid, session_id, new_workspace_id, PaneEdges::all_external());
 
         self.panes.insert(pane_id, pane);
+        self.url_caches.insert(pane_id, url_detect::PaneUrlCache::new());
         self.session_to_pane.insert(session_id, pane_id);
         self.pending_sessions.push_back(session_id);
 
@@ -1932,6 +2042,7 @@ impl App {
 
         if let Some(pane) = self.panes.remove(&pane_id) {
             self.session_to_pane.remove(&pane.session_id);
+            self.url_caches.remove(&pane_id);
             if let Some(tx) = &self.cmd_tx {
                 send_command(tx, ClientCommand::CloseSession { session_id: pane.session_id });
             }
@@ -2008,10 +2119,17 @@ impl App {
             ws_rects.iter().find(|(wid, _)| *wid == workspace_id).map_or(ws_viewport, |(_, r)| *r);
 
         let tab_bar_h = self.tab_bar_height_for(workspace_id, ws_rect);
-        let grid = pane::compute_pane_grid(ws_rect, cell.width, cell.height, tab_bar_h);
-        let pane = Pane::new(ws_rect, grid, session_id, workspace_id);
+        let grid = pane::compute_pane_grid(
+            ws_rect,
+            cell.width,
+            cell.height,
+            tab_bar_h,
+            &self.config.appearance.content_padding,
+        );
+        let pane = Pane::new(ws_rect, grid, session_id, workspace_id, PaneEdges::all_external());
 
         self.panes.insert(pane_id, pane);
+        self.url_caches.insert(pane_id, url_detect::PaneUrlCache::new());
         self.session_to_pane.insert(session_id, pane_id);
         self.pending_sessions.push_back(session_id);
 
@@ -2058,6 +2176,7 @@ impl App {
             if let Some(pane) = self.panes.remove(pid) {
                 self.session_to_pane.remove(&pane.session_id);
             }
+            self.url_caches.remove(pid);
         }
 
         // Tell the server to close each session.
@@ -2100,6 +2219,7 @@ impl App {
             if let Some(pane) = self.panes.remove(pid) {
                 self.session_to_pane.remove(&pane.session_id);
             }
+            self.url_caches.remove(pid);
         }
 
         for sid in sessions_to_close {
@@ -2339,7 +2459,7 @@ impl App {
             let tab = self.window_layout.find_workspace(*ws_id).and_then(|ws| ws.active_tab());
             let Some(tab) = tab else { continue };
             let pane_rects = tab.pane_layout.compute_rects(*ws_rect);
-            if let Some((pane_id, _)) = pane_rects.iter().find(|(_, r)| r.contains(x, y)) {
+            if let Some((pane_id, _, _)) = pane_rects.iter().find(|(_, r, _)| r.contains(x, y)) {
                 return Some(*pane_id);
             }
         }
@@ -2426,18 +2546,47 @@ impl App {
         state: winit::event::ElementState,
         button: winit::event::MouseButton,
     ) {
-        if button != winit::event::MouseButton::Left {
-            return;
-        }
-
-        match state {
-            winit::event::ElementState::Pressed => self.handle_mouse_press(),
-            winit::event::ElementState::Released => {
+        use winit::event::{ElementState, MouseButton};
+        match (button, state) {
+            (MouseButton::Left, ElementState::Pressed) => self.handle_left_press(),
+            (MouseButton::Left, ElementState::Released) => {
+                let had_ws_drag = self.workspace_divider_drag.is_some();
                 self.divider_drag = None;
                 self.workspace_divider_drag = None;
                 self.end_scrollbar_drag();
                 self.handle_mouse_release();
+                if had_ws_drag {
+                    self.report_workspace_tree();
+                }
             }
+            (MouseButton::Middle, ElementState::Pressed) => self.perform_primary_paste(),
+            (MouseButton::Right, ElementState::Pressed) => self.open_context_menu(),
+            _ => {}
+        }
+    }
+
+    /// Handle left mouse button press, routing through context menu if open.
+    fn handle_left_press(&mut self) {
+        if self.context_menu.is_none() {
+            self.handle_mouse_press();
+            return;
+        }
+        let Some((x, y)) = self.last_cursor_pos else {
+            self.context_menu = None;
+            self.request_redraw();
+            return;
+        };
+        let inside = self.context_menu.as_ref().is_some_and(|m| m.click_is_inside(x, y));
+        if inside {
+            let action = self.context_menu.as_ref().and_then(|m| m.click(x, y));
+            self.context_menu = None;
+            if let Some(a) = action {
+                self.dispatch_context_menu_action(a);
+            }
+        } else {
+            self.context_menu = None;
+            self.request_redraw();
+            self.handle_mouse_press();
         }
     }
 
@@ -2466,6 +2615,7 @@ impl App {
             if eq_rect.contains(x, y) {
                 self.window_layout.equalize_all_workspace_ratios();
                 self.resize_all_workspace_panes();
+                self.report_workspace_tree();
                 self.request_redraw();
                 return;
             }
@@ -2531,8 +2681,25 @@ impl App {
         // Click-to-focus: find which pane the click landed in.
         self.focus_pane_at(x, y, &ws_rects);
 
-        // Start a new text selection.
+        // Ctrl+click opens hovered URL in the system browser.
+        if self.try_open_hovered_url() {
+            return;
+        }
+
+        // Shift+click extends an existing selection instead of starting a new one.
+        if self.modifiers.shift_key() && self.active_selection.is_some() {
+            self.extend_selection_to(x, y);
+            return;
+        }
+
+        // Start selection with click-count classification.
         self.start_selection(x, y);
+        let click_kind = self.mouse_click.record_press(x, y);
+        match click_kind {
+            mouse_state::ClickKind::Single => {}
+            mouse_state::ClickKind::Double => self.start_selection_word(x, y),
+            mouse_state::ClickKind::Triple => self.start_selection_line(x, y),
+        }
     }
 
     /// Try to start a divider drag in the focused workspace. Returns `true`
@@ -2697,8 +2864,8 @@ impl App {
             let Some(tab) = tab else { continue };
 
             let pane_rects = tab.pane_layout.compute_rects(*ws_rect);
-            let hit = pane_rects.iter().find(|(_, r)| r.contains(x, y));
-            let Some((clicked_pane, _)) = hit else { continue };
+            let hit = pane_rects.iter().find(|(_, r, _)| r.contains(x, y));
+            let Some((clicked_pane, _, _)) = hit else { continue };
 
             // Switch workspace focus if needed.
             self.window_layout.set_focused_workspace(*ws_id);
@@ -2712,6 +2879,10 @@ impl App {
         }
     }
 
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "sequential dispatch for multiple independent drag/hover states; each branch is simple"
+    )]
     fn handle_cursor_moved(&mut self) {
         // Scrollbar drag takes highest priority.
         if let Some(pane_id) = self.scrollbar_drag_pane {
@@ -2721,6 +2892,12 @@ impl App {
 
         // Extend active text selection while mouse is held.
         self.extend_selection();
+
+        // Edge-scroll while selecting: scroll pane when cursor is near top/bottom edge.
+        self.maybe_edge_scroll();
+
+        // Update context menu hover if open.
+        self.maybe_update_context_menu_hover();
 
         // Update scrollbar hover state for the focused pane.
         self.update_scrollbar_hover();
@@ -2780,6 +2957,11 @@ impl App {
 
         // No drag active — update cursor icon based on divider hover.
         self.update_hover_cursor(x, y);
+
+        // Refresh URL hover state when not dragging a selection.
+        if !self.mouse_selecting && self.refresh_hovered_url() {
+            self.request_redraw();
+        }
     }
 
     /// Set the window cursor icon based on whether the pointer is hovering over
@@ -2819,8 +3001,92 @@ impl App {
             }
         }
 
-        // Not over any divider — reset to default.
+        // Check if the cursor is over terminal content in any pane.
+        if self.cursor_over_terminal_content(x, y, &ws_rects) {
+            let icon = if self.hovered_url.is_some() && self.modifiers.control_key() {
+                winit::window::CursorIcon::Pointer
+            } else {
+                winit::window::CursorIcon::Text
+            };
+            window.set_cursor(icon);
+            return;
+        }
+
+        // Not over any divider or terminal content — reset to default.
         window.set_cursor(winit::window::CursorIcon::Default);
+    }
+
+    /// Return `true` if pixel `(x, y)` is inside any pane's terminal content area
+    /// (below the tab bar) across all given workspace rects.
+    #[allow(
+        clippy::excessive_nesting,
+        reason = "nested iteration over workspaces and pane rects to find hit-tested pane; extraction would obscure logic"
+    )]
+    fn cursor_over_terminal_content(
+        &self,
+        x: f32,
+        y: f32,
+        ws_rects: &[(WorkspaceId, Rect)],
+    ) -> bool {
+        let tab_bar_h = self.focused_workspace_tab_bar_height();
+        for (ws_id, ws_rect) in ws_rects {
+            if !ws_rect.contains(x, y) {
+                continue;
+            }
+            let tab = self.window_layout.find_workspace(*ws_id).and_then(|ws| ws.active_tab());
+            let Some(tab) = tab else { continue };
+            let pane_rects = tab.pane_layout.compute_rects(*ws_rect);
+            for (_, pane_rect, _) in &pane_rects {
+                let content_top = pane_rect.y + tab_bar_h;
+                if x >= pane_rect.x
+                    && x < pane_rect.x + pane_rect.width
+                    && y >= content_top
+                    && y < pane_rect.y + pane_rect.height
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    // -------------------------------------------------------------------
+    // URL hover helpers
+    // -------------------------------------------------------------------
+
+    /// Refresh the hovered URL based on the current cursor position.
+    ///
+    /// Returns `true` if the hovered URL changed (caller should request redraw).
+    fn refresh_hovered_url(&mut self) -> bool {
+        let new_url = self.compute_hovered_url();
+        let changed = url_span_changed(self.hovered_url.as_ref(), new_url.as_ref());
+        self.hovered_url = new_url;
+        changed
+    }
+
+    /// Compute the URL span under the cursor without mutating `hovered_url`.
+    fn compute_hovered_url(&mut self) -> Option<url_detect::UrlSpan> {
+        let (cx, cy) = self.last_cursor_pos?;
+        let point = self.cursor_to_grid(cx, cy)?;
+        let pane_id = self.window_layout.active_tab()?.focused_pane;
+        // Pass panes and url_caches as separate parameters so the borrow
+        // checker can see they are independent — no unsafe needed.
+        hovered_url_at(point, pane_id, &self.panes, &mut self.url_caches)
+    }
+
+    /// If Ctrl is held and a URL is hovered, open it in the default browser.
+    ///
+    /// Returns `true` if a URL was opened.
+    pub fn try_open_hovered_url(&mut self) -> bool {
+        if !self.modifiers.control_key() {
+            return false;
+        }
+        if let Some(ref span) = self.hovered_url {
+            let url = span.url.clone();
+            url_detect::open_url(&url);
+            return true;
+        }
+        false
     }
 
     // -------------------------------------------------------------------
@@ -2831,8 +3097,46 @@ impl App {
     fn start_selection(&mut self, x: f32, y: f32) {
         self.mouse_selecting = true;
         self.active_selection = None;
+        self.word_drag_anchor = None;
         let Some(point) = self.cursor_to_grid(x, y) else { return };
-        self.active_selection = Some(selection::SelectionRange { start: point, end: point });
+        self.active_selection = Some(selection::SelectionRange::cell(point, point));
+    }
+
+    /// Begin a word-granularity selection (double-click).
+    fn start_selection_word(&mut self, x: f32, y: f32) {
+        let Some(point) = self.cursor_to_grid(x, y) else { return };
+        let pane_id = {
+            let Some(tab) = self.window_layout.active_tab() else { return };
+            tab.focused_pane
+        };
+        let Some(pane) = self.panes.get(&pane_id) else { return };
+        let (start, end) = selection::word_bounds_at(&pane.term, point);
+        self.active_selection = Some(selection::SelectionRange::word(start, end));
+        self.word_drag_anchor = Some((start, end));
+        self.mouse_selecting = true;
+        self.request_redraw();
+    }
+
+    /// Begin a line-granularity selection (triple-click).
+    fn start_selection_line(&mut self, x: f32, y: f32) {
+        let Some(point) = self.cursor_to_grid(x, y) else { return };
+        let pane_id = {
+            let Some(tab) = self.window_layout.active_tab() else { return };
+            tab.focused_pane
+        };
+        let Some(pane) = self.panes.get(&pane_id) else { return };
+        let (start, end) = selection::line_bounds_at(&pane.term, point.row);
+        self.active_selection = Some(selection::SelectionRange::line(start, end));
+        self.mouse_selecting = true;
+        self.request_redraw();
+    }
+
+    /// Extend the active selection to the given pixel position (shift+click).
+    fn extend_selection_to(&mut self, x: f32, y: f32) {
+        let Some(sel) = self.active_selection else { return };
+        let Some(point) = self.cursor_to_grid(x, y) else { return };
+        self.active_selection = Some(selection::SelectionRange::cell(sel.start, point));
+        self.request_redraw();
     }
 
     /// Extend the in-progress selection to the current cursor position.
@@ -2843,7 +3147,56 @@ impl App {
         let Some(sel) = self.active_selection else { return };
         let Some((x, y)) = self.last_cursor_pos else { return };
         let Some(point) = self.cursor_to_grid(x, y) else { return };
-        self.active_selection = Some(selection::SelectionRange { start: sel.start, end: point });
+        match sel.mode {
+            mouse_state::SelectionMode::Cell => {
+                self.active_selection = Some(selection::SelectionRange::cell(sel.start, point));
+                self.request_redraw();
+            }
+            mouse_state::SelectionMode::Word => {
+                self.extend_selection_word(point);
+            }
+            mouse_state::SelectionMode::Line => {
+                self.extend_selection_line(sel.start, point);
+            }
+        }
+    }
+
+    fn extend_selection_word(&mut self, point: selection::SelectionPoint) {
+        let Some((anchor_start, anchor_end)) = self.word_drag_anchor else { return };
+        let pane_id = {
+            let Some(tab) = self.window_layout.active_tab() else { return };
+            tab.focused_pane
+        };
+        let Some(pane) = self.panes.get(&pane_id) else { return };
+        let new_sel = selection::extend_by_word(&pane.term, anchor_start, anchor_end, point);
+        self.active_selection = Some(new_sel);
+        self.request_redraw();
+    }
+
+    fn extend_selection_line(
+        &mut self,
+        anchor_start: selection::SelectionPoint,
+        point: selection::SelectionPoint,
+    ) {
+        let pane_id = {
+            let Some(tab) = self.window_layout.active_tab() else { return };
+            tab.focused_pane
+        };
+        let Some(pane) = self.panes.get(&pane_id) else { return };
+        // When dragging upward the drag point is above the anchor line.
+        // Extend from the start of the drag row to the end of the anchor row.
+        // When dragging downward (or same row), extend from the start of the
+        // anchor row to the end of the drag row.
+        let new_sel = if point.row < anchor_start.row {
+            let (drag_line_start, _) = selection::line_bounds_at(&pane.term, point.row);
+            let (_, anchor_line_end) = selection::line_bounds_at(&pane.term, anchor_start.row);
+            selection::SelectionRange::line(drag_line_start, anchor_line_end)
+        } else {
+            let (anchor_line_start, _) = selection::line_bounds_at(&pane.term, anchor_start.row);
+            let (_, drag_line_end) = selection::line_bounds_at(&pane.term, point.row);
+            selection::SelectionRange::line(anchor_line_start, drag_line_end)
+        };
+        self.active_selection = Some(new_sel);
         self.request_redraw();
     }
 
@@ -2855,6 +3208,161 @@ impl App {
             return;
         }
         self.finalize_copy();
+        #[cfg(target_os = "linux")]
+        self.set_primary_selection();
+    }
+
+    /// Scroll the focused pane if the cursor is near the top/bottom edge during drag selection.
+    fn maybe_edge_scroll(&mut self) {
+        if !self.mouse_selecting {
+            return;
+        }
+        let Some((_, cursor_y)) = self.last_cursor_pos else { return };
+        let tab_bar_h = self.focused_workspace_tab_bar_height();
+        let Some(pane_rect) = self.focused_pane_rect() else { return };
+        let content_top = pane_rect.y + tab_bar_h;
+        let content_bottom = pane_rect.y + pane_rect.height;
+        let Some(delta) = mouse_state::edge_scroll_delta(cursor_y, content_top, content_bottom)
+        else {
+            return;
+        };
+        let pane_id = self.window_layout.active_tab().map(|t| t.focused_pane);
+        let Some(pane_id) = pane_id else { return };
+        let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+        pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
+        pane.scrollbar_state.on_scroll_action();
+        self.ensure_animation_running();
+        self.request_redraw();
+    }
+
+    /// Update context menu hover state from current cursor position.
+    fn maybe_update_context_menu_hover(&mut self) {
+        let Some((cx, cy)) = self.last_cursor_pos else { return };
+        let changed = self.context_menu.as_mut().is_some_and(|m| m.update_hover(cx, cy));
+        if changed {
+            self.request_redraw();
+        }
+    }
+
+    /// Paste from the primary selection on Linux (X11/Wayland primary selection).
+    #[cfg(target_os = "linux")]
+    fn perform_primary_paste(&mut self) {
+        use arboard::{GetExtLinux, LinuxClipboardKind};
+        let text = {
+            let Some(cb) = &mut self.clipboard else {
+                tracing::debug!("clipboard not available");
+                return;
+            };
+            match cb.get().clipboard(LinuxClipboardKind::Primary).text() {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!("primary selection read failed: {e}");
+                    return;
+                }
+            }
+        };
+        if text.is_empty() {
+            return;
+        }
+        let Some(tx) = self.cmd_tx.clone() else { return };
+        let focused_pane_id = {
+            let Some(tab) = self.window_layout.active_tab() else { return };
+            tab.focused_pane
+        };
+        let scrolled_up = {
+            let Some(pane) = self.panes.get_mut(&focused_pane_id) else { return };
+            let offset = pane.term.grid().display_offset();
+            if offset > 0 {
+                pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+                pane.scrollbar_state.on_scroll_action();
+            }
+            offset > 0
+        };
+        if scrolled_up {
+            self.ensure_animation_running();
+        }
+        let Some(pane) = self.panes.get(&focused_pane_id) else { return };
+        let bracketed =
+            pane.term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+        let data = if bracketed {
+            let mut buf = b"\x1b[200~".to_vec();
+            buf.extend_from_slice(text.as_bytes());
+            buf.extend_from_slice(b"\x1b[201~");
+            buf
+        } else {
+            text.into_bytes()
+        };
+        if tx.send(ClientCommand::KeyInput { session_id: pane.session_id, data }).is_err() {
+            tracing::warn!("IPC channel closed; primary paste dropped");
+        }
+    }
+
+    /// Paste from primary selection on non-Linux (falls back to regular clipboard).
+    #[cfg(not(target_os = "linux"))]
+    fn perform_primary_paste(&mut self) {
+        self.perform_paste();
+    }
+
+    /// Write the current selection text to the Linux primary selection buffer.
+    #[cfg(target_os = "linux")]
+    fn set_primary_selection(&mut self) {
+        use arboard::{LinuxClipboardKind, SetExtLinux};
+        let Some(sel) = self.active_selection else { return };
+        if sel.is_empty() {
+            return;
+        }
+        let text = {
+            let Some(tab) = self.window_layout.active_tab() else { return };
+            let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
+            selection::extract_text(&pane.term, &sel)
+        };
+        if text.is_empty() {
+            return;
+        }
+        let Some(cb) = &mut self.clipboard else { return };
+        if let Err(e) = cb.set().clipboard(LinuxClipboardKind::Primary).text(text) {
+            tracing::debug!("primary selection write failed: {e}");
+        }
+    }
+
+    /// Open the right-click context menu at the current cursor position.
+    fn open_context_menu(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        let has_selection =
+            self.active_selection.is_some_and(|s: selection::SelectionRange| !s.is_empty());
+        let url = self.hovered_url.as_ref().map(|s| s.url.clone());
+        self.context_menu = Some(context_menu::ContextMenu::new(x, y, has_selection, url));
+        self.request_redraw();
+    }
+
+    /// Dispatch an action selected from the context menu.
+    fn dispatch_context_menu_action(&mut self, action: context_menu::ContextMenuAction) {
+        match action {
+            context_menu::ContextMenuAction::Copy => self.finalize_copy(),
+            context_menu::ContextMenuAction::Paste => self.perform_paste(),
+            context_menu::ContextMenuAction::SelectAll => self.select_all(),
+            context_menu::ContextMenuAction::OpenUrl(url) => url_detect::open_url(&url),
+        }
+        self.request_redraw();
+    }
+
+    /// Select all content in the focused pane (viewport + scrollback).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "history_size and screen_lines are bounded by scrollback_lines (≤ 100_000), fit in i32"
+    )]
+    fn select_all(&mut self) {
+        use alacritty_terminal::grid::Dimensions as _;
+        let Some(tab) = self.window_layout.active_tab() else { return };
+        let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
+        let history = pane.term.grid().history_size() as i32;
+        let last_row = pane.term.grid().screen_lines().saturating_sub(1) as i32;
+        let last_col = pane.term.grid().columns().saturating_sub(1);
+        let start = selection::SelectionPoint { row: -history, col: 0 };
+        let end = selection::SelectionPoint { row: last_row, col: last_col };
+        self.active_selection = Some(selection::SelectionRange::cell(start, end));
+        self.request_redraw();
     }
 
     /// Update the in-progress tab drag position and threshold.
@@ -2880,6 +3388,7 @@ impl App {
         } else {
             // No drag threshold reached — treat as a plain tab click.
             if self.window_layout.set_active_tab(drag.workspace_id, drag.tab_index) {
+                self.window_layout.set_focused_workspace(drag.workspace_id);
                 self.request_redraw();
             }
         }
@@ -2895,6 +3404,7 @@ impl App {
         if let Some(ws) = self.window_layout.find_workspace_mut(drag.workspace_id) {
             ws.reorder_tab(drag.tab_index, to);
         }
+        self.window_layout.set_focused_workspace(drag.workspace_id);
         self.request_redraw();
     }
 
@@ -2918,6 +3428,7 @@ impl App {
             cell.height,
             tab_bar_h,
             display_offset,
+            &pane::effective_padding(&self.config.appearance.content_padding, pane.edges),
         )
     }
 
@@ -2935,7 +3446,7 @@ impl App {
             ws_rects.iter().find(|(wid, _)| *wid == focused_ws).map_or(ws_viewport, |(_, r)| *r);
         let tab = self.window_layout.active_tab()?;
         let pane_rects = tab.pane_layout.compute_rects(ws_rect);
-        let (_, rect) = pane_rects.iter().find(|(pid, _)| *pid == tab.focused_pane)?;
+        let (_, rect, _) = pane_rects.iter().find(|(pid, _, _)| *pid == tab.focused_pane)?;
         Some(*rect)
     }
 }
@@ -2950,7 +3461,7 @@ impl App {
         clippy::cast_precision_loss,
         reason = "viewport dimensions are small enough to fit in f32"
     )]
-    fn resize_all_panes_from_rects(&mut self, rects: &[(PaneId, Rect)]) {
+    fn resize_all_panes_from_rects(&mut self, rects: &[(PaneId, Rect, PaneEdges)]) {
         let Some(gpu) = &self.gpu else { return };
         let cell = gpu.renderer.cell_size();
         let ws_viewport = workspace_viewport(&gpu.surface_config);
@@ -2963,10 +3474,12 @@ impl App {
             .collect();
         let fallback_h = self.effective_tab_bar_height();
 
-        for (pane_id, rect) in rects {
+        for (pane_id, rect, edges) in rects {
             let Some(pane) = self.panes.get_mut(pane_id) else { continue };
+            pane.edges = *edges;
             let tab_bar_h = ws_heights.get(&pane.workspace_id).copied().unwrap_or(fallback_h);
-            let grid = pane::compute_pane_grid(*rect, cell.width, cell.height, tab_bar_h);
+            let eff_pad = pane::effective_padding(&self.config.appearance.content_padding, *edges);
+            let grid = pane::compute_pane_grid(*rect, cell.width, cell.height, tab_bar_h, &eff_pad);
             let new_grid = pane.resize(*rect, grid);
             let Some(tx) = &self.cmd_tx else { continue };
             send_resize(tx, pane.session_id, new_grid.cols, new_grid.rows);
@@ -3361,6 +3874,7 @@ fn build_all_instances(
     indicator_height: f32,
     active_selection: Option<&selection::SelectionRange>,
     hovered_tab_close: Option<(WorkspaceId, usize)>,
+    padding: &ContentPadding,
 ) -> (Vec<scribe_renderer::types::CellInstance>, TabHitTargets, TabHitTargets, TabEqualizeTargets) {
     // Build a workspace-id → tab_bar_height lookup for per-pane height queries.
     let ws_tab_bar_heights: HashMap<WorkspaceId, f32> =
@@ -3381,7 +3895,7 @@ fn build_all_instances(
     for (pane_id, _) in pane_rects {
         if let Some(pane) = panes.get_mut(pane_id) {
             let tbh = pane_tab_bar_h(pane.workspace_id, &ws_tab_bar_heights, ws_tab_bar_data);
-            let offset = pane.content_offset(tbh);
+            let offset = pane.content_offset(tbh, padding);
             // Only the focused pane shows the blinking cursor; unfocused panes hide it.
             let pane_cursor_visible = *pane_id == focused_pane && cursor_visible;
             let mut instances = renderer.build_instances_at(
@@ -3512,9 +4026,14 @@ fn build_all_instances(
     }
 
     // AI state border overlays (rendered last so they appear on top).
+    // Border wraps the terminal content area only, excluding the tab bar.
     for (pane_id, pane_rect) in pane_rects {
         if let Some(&color) = border_colors.get(pane_id) {
-            let border = ai_indicator::build_border_instances(*pane_rect, color);
+            let tbh = panes.get(pane_id).map_or_else(
+                || ws_tab_bar_data.first().map_or(0.0, |d| d.tab_bar_height),
+                |p| pane_tab_bar_h(p.workspace_id, &ws_tab_bar_heights, ws_tab_bar_data),
+            );
+            let border = ai_indicator::build_border_instances(*pane_rect, color, tbh);
             all_instances.extend(border);
         }
     }
@@ -3597,6 +4116,125 @@ fn apply_selection_highlight(
         if sel.contains_cell(grid_row, col) {
             inst.bg_color = colors.0;
             inst.fg_color = colors.1;
+        }
+    }
+}
+
+/// Refresh the URL cache for `pane_id` and return the URL span at `point`.
+///
+/// `panes` and `url_caches` are passed as separate parameters so the borrow
+/// checker can verify they are independent — the same pattern used by
+/// `apply_url_underlines`.
+fn hovered_url_at(
+    point: selection::SelectionPoint,
+    pane_id: PaneId,
+    panes: &HashMap<PaneId, Pane>,
+    url_caches: &mut HashMap<PaneId, url_detect::PaneUrlCache>,
+) -> Option<url_detect::UrlSpan> {
+    let pane = panes.get(&pane_id)?;
+    let cache = url_caches.get_mut(&pane_id)?;
+    cache.refresh(&pane.term);
+    cache.url_at(point.row, point.col).map(|span| url_detect::UrlSpan {
+        row: span.row,
+        col_start: span.col_start,
+        col_end: span.col_end,
+        url: span.url.clone(),
+    })
+}
+
+/// Return `true` if two `Option<UrlSpan>` values point to different URL spans.
+fn url_span_changed(old: Option<&url_detect::UrlSpan>, new: Option<&url_detect::UrlSpan>) -> bool {
+    match (old, new) {
+        (None, None) => false,
+        (Some(prev), Some(next)) => prev.row != next.row || prev.col_start != next.col_start,
+        _ => true,
+    }
+}
+
+/// Underline thickness for URL spans (pixels).
+const URL_UNDERLINE_HEIGHT: f32 = 1.5;
+
+/// URL underline color (unhovered): subtle blue tint.
+const URL_UNDERLINE_COLOR: [f32; 4] = [0.5, 0.7, 1.0, 0.7];
+
+/// URL underline color when the cursor is over this URL.
+const URL_UNDERLINE_HOVER_COLOR: [f32; 4] = [0.4, 0.8, 1.0, 1.0];
+
+/// Push URL underline quad instances for all visible URL spans in each pane.
+///
+/// Refreshes dirty URL caches before rendering (lazy re-scan). For each URL
+/// span, a thin horizontal bar is drawn at the bottom of each spanned cell.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "needs pane data, url caches, layout geometry, and hovered url for rendering"
+)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "display_offset bounded by scrollback_lines (100_000), screen_row checked >= 0"
+)]
+fn apply_url_underlines(
+    instances: &mut Vec<scribe_renderer::types::CellInstance>,
+    url_caches: &mut HashMap<PaneId, url_detect::PaneUrlCache>,
+    panes: &HashMap<PaneId, Pane>,
+    pane_rects: &[(PaneId, Rect)],
+    ws_tab_bar_heights: &HashMap<WorkspaceId, f32>,
+    fallback_tbh: f32,
+    cell_size: (f32, f32),
+    hovered_url: Option<&url_detect::UrlSpan>,
+    padding: &ContentPadding,
+) {
+    let (cell_w, cell_h) = cell_size;
+    if cell_w <= 0.0 || cell_h <= 0.0 {
+        return;
+    }
+    let ul_h = URL_UNDERLINE_HEIGHT.max(1.0);
+
+    for (pane_id, _) in pane_rects {
+        let Some(pane) = panes.get(pane_id) else { continue };
+        let tbh = ws_tab_bar_heights.get(&pane.workspace_id).copied().unwrap_or(fallback_tbh);
+        let offset = pane.content_offset(tbh, padding);
+        let display_offset = pane.term.grid().display_offset() as i32;
+
+        let Some(cache) = url_caches.get_mut(pane_id) else { continue };
+        // `panes` and `url_caches` are separate parameters — no aliasing.
+        cache.refresh(&pane.term);
+
+        for span in cache.visible_spans() {
+            let is_hovered =
+                hovered_url.is_some_and(|h| h.row == span.row && h.col_start == span.col_start);
+            let color = if is_hovered { URL_UNDERLINE_HOVER_COLOR } else { URL_UNDERLINE_COLOR };
+
+            // Convert absolute row to screen row.
+            let screen_row = span.row + display_offset;
+            if screen_row < 0 {
+                continue;
+            }
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "screen_row bounded by terminal rows (≤ 100_000); col values bounded by terminal columns"
+            )]
+            let y_top = offset.1 + screen_row as f32 * cell_h + cell_h - ul_h;
+            if span.col_start > span.col_end {
+                continue;
+            }
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "col values bounded by terminal columns (≤ 500), precision loss negligible"
+            )]
+            let (span_cols, col_x) =
+                ((span.col_end - span.col_start + 1) as f32, span.col_start as f32);
+            let x = offset.0 + col_x * cell_w;
+
+            instances.push(scribe_renderer::types::CellInstance {
+                pos: [x, y_top],
+                size: [span_cols * cell_w, ul_h],
+                uv_min: [0.0, 0.0],
+                uv_max: [0.0, 0.0],
+                fg_color: color,
+                bg_color: color,
+            });
         }
     }
 }
@@ -3751,7 +4389,7 @@ fn workspace_viewport(config: &wgpu::SurfaceConfiguration) -> Rect {
 fn collect_expected_pane_rects(
     layout: &workspace_layout::WindowLayout,
     ws_rects: &[(WorkspaceId, Rect)],
-) -> Vec<(PaneId, Rect)> {
+) -> Vec<(PaneId, Rect, PaneEdges)> {
     ws_rects
         .iter()
         .filter_map(|(ws_id, ws_rect)| {

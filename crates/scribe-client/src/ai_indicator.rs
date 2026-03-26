@@ -297,7 +297,8 @@ fn pulse_alpha(t: f32, hz: f32) -> f32 {
 // Border instance generation
 // ---------------------------------------------------------------------------
 
-/// Build four thin border quads around a pane's full area (including tab bar).
+/// Build four thin border quads around a pane's terminal content area
+/// (excluding the tab bar).
 ///
 /// Each of the four sides is rendered as one solid-colour [`CellInstance`]
 /// (no glyph: `uv_min == uv_max == [0,0]`).  The `color` comes from
@@ -306,11 +307,15 @@ fn pulse_alpha(t: f32, hz: f32) -> f32 {
     clippy::many_single_char_names,
     reason = "x/y/w/h/bw are conventional 2-D geometry shorthands"
 )]
-pub fn build_border_instances(pane_rect: Rect, color: [f32; 4]) -> [CellInstance; 4] {
+pub fn build_border_instances(
+    pane_rect: Rect,
+    color: [f32; 4],
+    tab_bar_height: f32,
+) -> [CellInstance; 4] {
     let x = pane_rect.x;
-    let y = pane_rect.y;
+    let y = pane_rect.y + tab_bar_height;
     let w = pane_rect.width;
-    let h = pane_rect.height;
+    let h = pane_rect.height - tab_bar_height;
     let bw = BORDER_WIDTH;
 
     let top = solid_quad(x, y, w, bw, color);
