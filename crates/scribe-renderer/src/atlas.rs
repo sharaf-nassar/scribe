@@ -116,7 +116,7 @@ pub struct GlyphAtlas {
     texture_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     cache: HashMap<GlyphKey, GlyphEntry>,
-    shaped_cache: HashMap<CacheKey, GlyphEntry>,
+    shaped_cache: HashMap<(CacheKey, u8), GlyphEntry>,
     run_shape_cache: HashMap<RunShapeKey, Vec<ShapedRunGlyph>>,
     packer: ShelfPacker,
     font_system: FontSystem,
@@ -394,7 +394,35 @@ impl GlyphAtlas {
         let canvas_w = cell_w.saturating_mul(u32::from(glyph_span));
         let mut canvas = vec![0u8; (canvas_w * cell_h * 4) as usize];
 
-        let dest_x = left.max(0) as u32;
+        // For multi-cell glyphs with negative left bearing, the glyph's
+        // origin is not at the left edge of the canvas.  Monospace fonts
+        // like JetBrains Mono use empty placeholder glyphs for the leading
+        // cells and place all visual content in the last glyph, which
+        // extends backward via negative bearing.  Compute the origin cell
+        // from the bearing magnitude so the glyph lands in the right place.
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "left is a small pixel offset that fits exactly in f32"
+        )]
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "origin_x is bounded by glyph_span * cell_w, well within i32 range"
+        )]
+        let dest_x = if left < 0 && glyph_span > 1 {
+            let cell_w_f = self.cell_size.width;
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "cells_before is derived from a non-negative ceil result"
+            )]
+            let cells_before = ((-left) as f32 / cell_w_f).ceil() as u32;
+            let origin_x = cells_before.min(u32::from(glyph_span) - 1) * cell_w;
+            #[allow(clippy::cast_sign_loss, reason = "origin_x + left is clamped to non-negative")]
+            {
+                (origin_x as i32 + left).max(0) as u32
+            }
+        } else {
+            left.max(0) as u32
+        };
         #[allow(
             clippy::cast_precision_loss,
             reason = "placement.top is a small integer that fits exactly in f32"
@@ -430,12 +458,13 @@ impl GlyphAtlas {
         cache_key: CacheKey,
         glyph_span: u8,
     ) -> GlyphEntry {
-        if let Some(entry) = self.shaped_cache.get(&cache_key) {
+        let key = (cache_key, glyph_span);
+        if let Some(entry) = self.shaped_cache.get(&key) {
             return *entry;
         }
 
         let entry = self.rasterize_shaped(queue, cache_key, glyph_span);
-        self.shaped_cache.insert(cache_key, entry);
+        self.shaped_cache.insert(key, entry);
         entry
     }
 
@@ -575,6 +604,43 @@ impl GlyphAtlas {
     /// Return an empty (zero-size) glyph entry used as a safe fallback.
     const fn empty_entry() -> GlyphEntry {
         GlyphEntry { uv_min: [0.0, 0.0], uv_max: [0.0, 0.0] }
+    }
+
+    /// Check if a shaped glyph produces visible content that fits in one cell.
+    ///
+    /// Returns `false` for empty placeholders (0×0 image) and for glyphs
+    /// whose visual bounds extend well beyond a single cell.  Monospace fonts
+    /// like `JetBrains Mono` use this pattern for ligatures: N-1 empty
+    /// placeholder glyphs followed by one wide glyph with large negative
+    /// left bearing.  Both the placeholders and the wide glyph fail this
+    /// check, allowing [`build_ligature_map`] to merge them into a proper
+    /// multi-cell ligature.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "cell_size.width is a small float that fits in i32"
+    )]
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "placement.width is a small glyph dimension that fits in i32"
+    )]
+    pub fn fits_single_cell(&mut self, cache_key: CacheKey) -> bool {
+        let image = self.swash_cache.get_image(&mut self.font_system, cache_key);
+        let Some(img) = image.as_ref() else { return false };
+
+        if img.placement.width == 0 || img.placement.height == 0 {
+            return false;
+        }
+
+        let cell_w = self.cell_size.width.ceil() as i32;
+        let max_left_extension = cell_w / 3;
+        if img.placement.left < -max_left_extension {
+            return false;
+        }
+        if img.placement.width as i32 > cell_w + cell_w / 2 {
+            return false;
+        }
+
+        true
     }
 }
 
@@ -740,4 +806,91 @@ fn clear_texture(queue: &Queue, texture: &wgpu::Texture, size: u32) {
         },
         Extent3d { width: size, height: size, depth_or_array_layers: 1 },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that `fits_single_cell` correctly rejects empty placeholder
+    /// glyphs and oversized glyphs used in monospace ligature patterns.
+    #[test]
+    fn fits_single_cell_rejects_ligature_placeholders() {
+        let mut font_system = FontSystem::new();
+        let size = 16.0;
+        let line_height = size * 1.2;
+        let metrics = Metrics::new(size, line_height);
+        let family = Family::Name("JetBrains Mono");
+        let attrs = Attrs::new().family(family);
+
+        // Measure cell width.
+        let cell_w = {
+            let mut buf = Buffer::new_empty(metrics);
+            buf.set_text(&mut font_system, "M", &attrs, Shaping::Advanced, None);
+            buf.layout_runs().next().and_then(|run| run.glyphs.first()).map_or(size, |g| g.w)
+        };
+        let cell_size = CellSize { width: cell_w, height: line_height };
+        let mut swash = SwashCache::new();
+
+        // Shape "//" with ligatures → two contextual alternates.
+        let mut buf = Buffer::new_empty(metrics);
+        buf.set_text(&mut font_system, "//", &attrs, Shaping::Advanced, None);
+        let glyphs: Vec<_> = buf
+            .layout_runs()
+            .flat_map(|r| r.glyphs.iter())
+            .map(|g| g.physical((0.0, 0.0), 1.0).cache_key)
+            .collect();
+        assert_eq!(glyphs.len(), 2, "expected 2 shaped glyphs for '//'");
+
+        // First glyph (empty placeholder) must NOT fit a single cell.
+        let img0 = swash.get_image(&mut font_system, glyphs[0]);
+        let empty = img0.as_ref().is_none_or(|i| i.placement.width == 0 || i.placement.height == 0);
+        assert!(empty, "first glyph of '//' ligature should be empty");
+
+        // Build a minimal atlas just for the fits_single_cell check.
+        // We only need font_system, swash_cache, and cell_size.
+        let mut mini = MiniFitChecker { font_system, swash_cache: swash, cell_size };
+        assert!(!mini.fits(glyphs[0]), "empty placeholder must not fit single cell");
+        assert!(!mini.fits(glyphs[1]), "wide ligature glyph must not fit single cell");
+
+        // Solo "/" should fit.
+        let mut buf_solo = Buffer::new_empty(metrics);
+        buf_solo.set_text(&mut mini.font_system, "/", &attrs, Shaping::Advanced, None);
+        let solo_key = buf_solo
+            .layout_runs()
+            .next()
+            .and_then(|r| r.glyphs.first())
+            .map(|g| g.physical((0.0, 0.0), 1.0).cache_key)
+            .expect("solo '/' should produce a glyph");
+        assert!(mini.fits(solo_key), "solo '/' must fit single cell");
+    }
+
+    /// Helper to run the same logic as `GlyphAtlas::fits_single_cell`
+    /// without needing a GPU device.
+    struct MiniFitChecker {
+        font_system: FontSystem,
+        swash_cache: SwashCache,
+        cell_size: CellSize,
+    }
+
+    impl MiniFitChecker {
+        #[allow(clippy::cast_possible_truncation, reason = "test helper")]
+        #[allow(clippy::cast_possible_wrap, reason = "test helper")]
+        fn fits(&mut self, cache_key: CacheKey) -> bool {
+            let image = self.swash_cache.get_image(&mut self.font_system, cache_key);
+            let Some(img) = image.as_ref() else { return false };
+            if img.placement.width == 0 || img.placement.height == 0 {
+                return false;
+            }
+            let cell_w = self.cell_size.width.ceil() as i32;
+            let max_ext = cell_w / 3;
+            if img.placement.left < -max_ext {
+                return false;
+            }
+            if img.placement.width as i32 > cell_w + cell_w / 2 {
+                return false;
+            }
+            true
+        }
+    }
 }

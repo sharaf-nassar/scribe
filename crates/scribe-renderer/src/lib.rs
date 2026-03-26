@@ -818,47 +818,41 @@ fn insert_multi_cell_glyph(map: &mut LigatureMap, line: i32, col: usize, glyph: 
     }
 }
 
-/// Context for checking whether a single-cell glyph is a contextual alternate.
-struct SingleGlyphCtx<'a> {
-    map: &'a mut LigatureMap,
-    atlas: &'a mut GlyphAtlas,
-    run: &'a StyledRun,
-    chars: &'a [char],
-}
-
-impl SingleGlyphCtx<'_> {
-    /// Insert the glyph at `(line, col)` only if it is a contextual alternate.
-    ///
-    /// A glyph is a contextual alternate when its run-shaped `CacheKey`
-    /// differs from the key produced by shaping the character in isolation.
-    #[allow(
-        clippy::fn_params_excessive_bools,
-        reason = "bold and italic are font variant flags, not control flow bools"
-    )]
-    fn insert_if_alternate(&mut self, col: usize, glyph: &ShapedRunGlyph) {
-        let ch = self.chars.get(glyph.col_offset).copied();
-        let is_alternate = ch.is_some_and(|c| {
-            self.atlas
-                .shape_single_cache_key(c, self.run.bold, self.run.italic)
-                .is_some_and(|solo_key| solo_key != glyph.cache_key)
-        });
-        if is_alternate {
-            self.map.insert(
-                (self.run.line, col),
-                LigatureCellInfo { cache_key: glyph.cache_key, glyph_span: 1, cell_index: 0 },
-            );
-        }
-    }
+/// Check whether `glyph` is a contextual alternate in `run`.
+///
+/// A glyph is a contextual alternate when its run-shaped `CacheKey` differs
+/// from the key produced by shaping the character in isolation.
+fn is_contextual_alternate(
+    atlas: &mut GlyphAtlas,
+    glyph: &ShapedRunGlyph,
+    chars: &[char],
+    run: &StyledRun,
+) -> bool {
+    chars.get(glyph.col_offset).is_some_and(|&c| {
+        atlas
+            .shape_single_cache_key(c, run.bold, run.italic)
+            .is_some_and(|solo_key| solo_key != glyph.cache_key)
+    })
 }
 
 /// Build a map from `(line, column)` to [`LigatureCellInfo`] for every cell
 /// that participates in a ligature or contextual alternate.
 ///
-/// For each [`StyledRun`], the run is shaped as a whole. Glyphs that span
-/// more than one column (`glyph_span > 1`) are always recorded. Single-cell
+/// For each [`StyledRun`], the run is shaped as a whole.  Glyphs that span
+/// more than one column (`glyph_span > 1`) are always recorded.  Single-cell
 /// glyphs are only recorded when their shaped `CacheKey` differs from the
-/// key produced by shaping the character in isolation — this detects
-/// contextual alternates without wasting atlas space on unchanged glyphs.
+/// key produced by shaping the character in isolation.
+///
+/// Many monospace fonts (e.g. `JetBrains Mono`) implement ligatures using a
+/// pattern of N-1 empty placeholder glyphs followed by one wide glyph with
+/// large negative left bearing that visually covers all N cells.  This
+/// function detects that pattern and merges the group into a single
+/// multi-cell entry so the renderer can split the visual glyph across
+/// the correct cells.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "phantom_count is bounded by glyph count per run, which fits in u8"
+)]
 fn build_ligature_map(runs: &[StyledRun], atlas: &mut GlyphAtlas) -> LigatureMap {
     let mut map = LigatureMap::new();
 
@@ -866,14 +860,69 @@ fn build_ligature_map(runs: &[StyledRun], atlas: &mut GlyphAtlas) -> LigatureMap
         let shaped = atlas.shape_run(&run.text, run.bold, run.italic).to_vec();
         let chars: Vec<char> = run.text.chars().collect();
 
-        for glyph in &shaped {
+        let mut i = 0;
+        while let Some(glyph) = shaped.get(i) {
             let col = run.start_col + glyph.col_offset;
+
+            // Multi-cell glyph from the shaper — use as-is.
             if glyph.glyph_span > 1 {
                 insert_multi_cell_glyph(&mut map, run.line, col, glyph);
-            } else {
-                let mut ctx = SingleGlyphCtx { map: &mut map, atlas, run, chars: &chars };
-                ctx.insert_if_alternate(col, glyph);
+                i += 1;
+                continue;
             }
+
+            if !is_contextual_alternate(atlas, glyph, &chars, run) {
+                i += 1;
+                continue;
+            }
+
+            // Contextual alternate that fits in a single cell — record it.
+            if atlas.fits_single_cell(glyph.cache_key) {
+                map.insert(
+                    (run.line, col),
+                    LigatureCellInfo { cache_key: glyph.cache_key, glyph_span: 1, cell_index: 0 },
+                );
+                i += 1;
+                continue;
+            }
+
+            // This glyph doesn't fit a single cell (empty placeholder or
+            // oversized).  Scan ahead to count consecutive such glyphs.
+            let phantom_start = i;
+            while shaped.get(i).is_some_and(|g| {
+                g.glyph_span == 1
+                    && is_contextual_alternate(atlas, g, &chars, run)
+                    && !atlas.fits_single_cell(g.cache_key)
+            }) {
+                i += 1;
+            }
+            let phantom_count = i - phantom_start;
+
+            // If the next glyph is a renderable contextual alternate
+            // adjacent to the phantoms, merge them into one multi-cell
+            // ligature using the visual glyph's cache key.
+            let phantom_start_col = shaped.get(phantom_start).map_or(0, |g| g.col_offset);
+            let visual = shaped.get(i).filter(|next| {
+                next.glyph_span == 1
+                    && next.col_offset == phantom_start_col + phantom_count
+                    && is_contextual_alternate(atlas, next, &chars, run)
+            });
+            if let Some(visual) = visual {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "phantom_count is bounded by glyph count per run, fits u8"
+                )]
+                let total_span = (phantom_count + 1).min(255) as u8;
+                let merged = ShapedRunGlyph {
+                    cache_key: visual.cache_key,
+                    col_offset: phantom_start_col,
+                    glyph_span: total_span,
+                };
+                insert_multi_cell_glyph(&mut map, run.line, col, &merged);
+                i += 1;
+            }
+            // else: orphan phantoms with no visual partner — skip them,
+            // letting the cells fall through to regular per-character rendering.
         }
     }
 

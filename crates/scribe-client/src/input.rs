@@ -3,6 +3,7 @@
 use scribe_common::config::{KeyComboList, KeybindingsConfig};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 /// A set of parsed keybindings for a single action (one or more combos).
 pub type BindingSet = Vec<Keybinding>;
@@ -158,14 +159,14 @@ impl Keybinding {
         }
         match &self.key {
             KeyMatch::Character(c) => {
-                if let Key::Character(key_str) = &event.logical_key {
+                if let Key::Character(key_str) = &event.key_without_modifiers() {
                     key_str.chars().next().is_some_and(|k| k.eq_ignore_ascii_case(c))
                 } else {
                     false
                 }
             }
             KeyMatch::Named(named) => {
-                matches!(&event.logical_key, Key::Named(n) if n == named)
+                matches!(event.key_without_modifiers(), Key::Named(n) if n == *named)
             }
         }
     }

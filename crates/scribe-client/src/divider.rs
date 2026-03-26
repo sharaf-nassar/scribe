@@ -60,18 +60,12 @@ pub fn hit_test_divider(dividers: &[Divider], mouse_x: f32, mouse_y: f32) -> Opt
 
 /// Build cell instances for all dividers.
 ///
-/// Pushes solid-colour quads for each divider into `out`. `cell_size` is
-/// `(width, height)` from the font. `color` is the theme-derived divider
-/// colour. Pushing directly into the caller's `Vec` avoids a per-call heap
-/// allocation.
-pub fn build_divider_instances(
-    out: &mut Vec<CellInstance>,
-    dividers: &[Divider],
-    cell_size: (f32, f32),
-    color: [f32; 4],
-) {
+/// Pushes a single solid-colour quad per divider into `out`. Dividers are
+/// 1px lines, so the quad covers the exact divider rect. Pushing directly
+/// into the caller's `Vec` avoids a per-call heap allocation.
+pub fn build_divider_instances(out: &mut Vec<CellInstance>, dividers: &[Divider], color: [f32; 4]) {
     for divider in dividers {
-        build_single_divider(out, divider, cell_size, color);
+        build_single_divider(out, divider, color);
     }
 }
 
@@ -232,40 +226,10 @@ fn is_within_divider(divider: &Divider, mouse_x: f32, mouse_y: f32) -> bool {
         && mouse_y <= expanded.y + expanded.height
 }
 
-/// Build solid-colour instances for a single divider.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "step index is a small positive integer fitting in f32"
-)]
-fn build_single_divider(
-    instances: &mut Vec<CellInstance>,
-    divider: &Divider,
-    cell_size: (f32, f32),
-    color: [f32; 4],
-) {
-    let (cell_w, cell_h) = cell_size;
+/// Build a solid-colour instance for a single divider using its actual rect.
+fn build_single_divider(instances: &mut Vec<CellInstance>, divider: &Divider, color: [f32; 4]) {
     let r = &divider.rect;
-
-    // Emit quads to cover the divider rect. Use cell-sized quads
-    // stepping along the longer axis.
-    match divider.direction {
-        SplitDirection::Horizontal => {
-            // Vertical divider line: step along Y in cell_h increments.
-            let steps = steps_for(r.height, cell_h);
-            for i in 0..steps {
-                let y = r.y + i as f32 * cell_h;
-                instances.push(solid_quad(r.x, y, cell_w, cell_h, color));
-            }
-        }
-        SplitDirection::Vertical => {
-            // Horizontal divider line: step along X in cell_w increments.
-            let steps = steps_for(r.width, cell_w);
-            for i in 0..steps {
-                let x = r.x + i as f32 * cell_w;
-                instances.push(solid_quad(x, r.y, cell_w, cell_h, color));
-            }
-        }
-    }
+    instances.push(solid_quad(r.x, r.y, r.width, r.height, color));
 }
 
 /// Create a solid-colour quad (no glyph) with explicit pixel dimensions.

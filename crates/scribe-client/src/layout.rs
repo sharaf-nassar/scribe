@@ -439,14 +439,36 @@ fn set_ratio_node(node: &mut LayoutNode, target: PaneId, new_ratio: f32) -> bool
     set_ratio_node(first, target, new_ratio) || set_ratio_node(second, target, new_ratio)
 }
 
-/// Recursively set every split node's ratio to `DEFAULT_RATIO`.
+/// Count the number of leaf (pane) nodes in a subtree.
+fn count_pane_leaves(node: &LayoutNode) -> u32 {
+    match node {
+        LayoutNode::Leaf(_) => 1,
+        LayoutNode::Split { first, second, .. } => {
+            count_pane_leaves(first) + count_pane_leaves(second)
+        }
+    }
+}
+
+/// Recursively set split ratios so every leaf pane gets equal space.
+///
+/// For a split with `L` leaves on the left and `R` on the right, the ratio
+/// is set to `L / (L + R)`.  This ensures each pane gets `1 / total_panes`
+/// of the available space regardless of tree shape.
 #[allow(dead_code, reason = "called by equalize_all_ratios which is part of the public API")]
 fn equalize_node(node: &mut LayoutNode) {
     let LayoutNode::Split { ratio, first, second, .. } = node else {
         return;
     };
 
-    *ratio = DEFAULT_RATIO;
+    let left = count_pane_leaves(first);
+    let right = count_pane_leaves(second);
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "pane count is tiny, f32 is exact for small integers"
+    )]
+    {
+        *ratio = left as f32 / (left + right) as f32;
+    }
     equalize_node(first);
     equalize_node(second);
 }

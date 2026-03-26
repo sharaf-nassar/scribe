@@ -62,6 +62,24 @@ enum ScrollbarAction {
     JumpTo { delta: i32 },
 }
 
+/// State for an in-progress tab drag-reorder operation.
+struct TabDrag {
+    /// Workspace the dragged tab belongs to.
+    workspace_id: WorkspaceId,
+    /// Original tab index of the dragged tab.
+    tab_index: usize,
+    /// Cursor X at drag start (used for threshold detection).
+    start_x: f32,
+    /// Cursor Y at drag start (used for threshold detection).
+    start_y: f32,
+    /// Current cursor X (updated on mouse move).
+    cursor_x: f32,
+    /// Current cursor Y (updated on mouse move).
+    cursor_y: f32,
+    /// `true` once the cursor has moved more than 5 px from the start.
+    dragging: bool,
+}
+
 /// Application state for the winit event loop.
 #[allow(
     clippy::struct_excessive_bools,
@@ -188,6 +206,12 @@ struct App {
     received_workspace_tree: bool,
     /// Clickable tab rects `(workspace_id, tab_index, rect)` (updated each frame).
     tab_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)>,
+    /// Close button rects `(workspace_id, tab_index, rect)` (updated each frame).
+    tab_close_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)>,
+    /// Which tab's close button is currently hovered: `(workspace_id, tab_index)`.
+    hovered_tab_close: Option<(WorkspaceId, usize)>,
+    /// Active tab drag state for reordering.
+    tab_drag: Option<TabDrag>,
     /// Clickable equalize rects from tab bars `(workspace_id, rect)` (updated each frame).
     tab_bar_equalize_targets: Vec<(WorkspaceId, layout::Rect)>,
     /// Clickable rect for the status bar gear icon (updated each frame).
@@ -282,6 +306,9 @@ impl App {
             geometry_save_pending: None,
             received_workspace_tree: false,
             tab_hit_targets: Vec::new(),
+            tab_close_hit_targets: Vec::new(),
+            hovered_tab_close: None,
+            tab_drag: None,
             tab_bar_equalize_targets: Vec::new(),
             status_bar_gear_rect: None,
             status_bar_equalize_rect: None,
@@ -829,10 +856,63 @@ impl App {
         self.report_workspace_tree();
     }
 
-    /// Compute the effective tab bar height from cell height + configured padding.
+    /// Compute the single-row tab bar height from cell height + configured padding.
     fn effective_tab_bar_height(&self) -> f32 {
         let cell_h = self.gpu.as_ref().map_or(20.0, |gpu| gpu.renderer.cell_size().height);
         cell_h + self.config.appearance.tab_bar_padding
+    }
+
+    /// Compute the tab bar height for a specific workspace, accounting for
+    /// multi-row stacking based on tab count and workspace width.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "workspace name length is a small positive integer fitting in f32"
+    )]
+    fn tab_bar_height_for(&self, workspace_id: WorkspaceId, ws_rect: Rect) -> f32 {
+        let (cell_w, cell_h) = self.gpu.as_ref().map_or((8.0, 20.0), |g| {
+            let c = g.renderer.cell_size();
+            (c.width, c.height)
+        });
+        let row_h = cell_h + self.config.appearance.tab_bar_padding;
+        let tab_count =
+            self.window_layout.find_workspace(workspace_id).map_or(1, |ws| ws.tabs.len().max(1));
+        let badge_cols = if self.window_layout.workspace_count() > 1 {
+            // badge = dot + space + name + gap (≈4 extra chars)
+            let name_len = self
+                .window_layout
+                .find_workspace(workspace_id)
+                .and_then(|ws| ws.name.as_ref())
+                .map_or(9, |n| n.chars().count()); // "workspace" default
+            name_len + 4
+        } else {
+            0
+        };
+        tab_bar::compute_tab_bar_height(
+            tab_count,
+            ws_rect.width,
+            self.config.appearance.tab_width,
+            cell_w,
+            row_h,
+            badge_cols,
+        )
+    }
+
+    /// Compute the tab bar height for the currently focused workspace.
+    ///
+    /// Used by scrollbar and selection hit-testing where only the focused
+    /// pane is relevant.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "viewport dimensions are small enough to fit in f32"
+    )]
+    fn focused_workspace_tab_bar_height(&self) -> f32 {
+        let Some(gpu) = &self.gpu else { return self.effective_tab_bar_height() };
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_id = self.window_layout.focused_workspace_id();
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+        let ws_rect =
+            ws_rects.iter().find(|(wid, _)| *wid == ws_id).map_or(ws_viewport, |(_, r)| *r);
+        self.tab_bar_height_for(ws_id, ws_rect)
     }
 
     /// Compute the pane ID, rect, and grid size for the first pane of the
@@ -858,12 +938,13 @@ impl App {
         let cell = gpu.renderer.cell_size();
 
         let ws_rects = self.window_layout.compute_workspace_rects(viewport);
-        let ws_rect = ws_rects.first().map_or(viewport, |(_wid, r)| *r);
+        let &(first_ws_id, ws_rect) =
+            ws_rects.first().map_or(&(self.window_layout.focused_workspace_id(), viewport), |p| p);
 
         let tab = self.window_layout.active_tab()?;
         let pane_rects = tab.pane_layout.compute_rects(ws_rect);
         let &(pane_id, pane_rect) = pane_rects.first()?;
-        let tab_bar_h = self.effective_tab_bar_height();
+        let tab_bar_h = self.tab_bar_height_for(first_ws_id, ws_rect);
         let grid = pane::compute_pane_grid(pane_rect, cell.width, cell.height, tab_bar_h);
         Some((pane_id, pane_rect, grid))
     }
@@ -1138,10 +1219,11 @@ impl App {
         // -- Keybindings --
         self.bindings = input::Bindings::parse(&new_config.keybindings);
 
-        // -- Tab bar height --
+        // -- Tab bar height / layout --
         let tab_bar_changed =
             (old.appearance.tab_bar_padding - new_config.appearance.tab_bar_padding).abs()
-                > f32::EPSILON;
+                > f32::EPSILON
+                || old.appearance.tab_width != new_config.appearance.tab_width;
 
         self.ai_tracker.reconfigure(new_config.terminal.claude_states.clone());
         self.config = new_config;
@@ -1214,15 +1296,24 @@ impl App {
         }
         let Some(gpu) = &self.gpu else { return };
         let cell = gpu.renderer.cell_size();
-        let tab_bar_h = self.effective_tab_bar_height();
         let ws_viewport = workspace_viewport(&gpu.surface_config);
 
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
         let expected_rects = collect_expected_pane_rects(&self.window_layout, &ws_rects);
 
+        // Build a ws_id → tab_bar_height map for staleness checking.
+        let ws_heights: std::collections::HashMap<WorkspaceId, f32> = ws_rects
+            .iter()
+            .map(|(ws_id, ws_rect)| (*ws_id, self.tab_bar_height_for(*ws_id, *ws_rect)))
+            .collect();
+
         let any_stale = expected_rects.iter().any(|(pid, rect)| {
             self.panes.get(pid).is_some_and(|pane| {
-                let expected = pane::compute_pane_grid(*rect, cell.width, cell.height, tab_bar_h);
+                let tbh = ws_heights
+                    .get(&pane.workspace_id)
+                    .copied()
+                    .unwrap_or_else(|| self.effective_tab_bar_height());
+                let expected = pane::compute_pane_grid(*rect, cell.width, cell.height, tbh);
                 pane.grid.cols != expected.cols || pane.grid.rows != expected.rows
             })
         });
@@ -1354,27 +1445,40 @@ impl App {
             };
 
             let has_multiple_panes = tab.pane_layout.all_pane_ids().len() > 1;
+
+            // Compute per-workspace tab bar height (may be multi-row).
+            let row_h = cell_size.1 + self.config.appearance.tab_bar_padding;
+            let badge_cols_for_h = if multi_workspace {
+                let name_len = ws.name.as_ref().map_or(9, |n| n.chars().count());
+                name_len + 4
+            } else {
+                0
+            };
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "badge col count is a small positive integer fitting in f32"
+            )]
+            let ws_tab_bar_h = tab_bar::compute_tab_bar_height(
+                ws.tabs.len(),
+                ws_rect.width,
+                self.config.appearance.tab_width,
+                cell_size.0,
+                row_h,
+                badge_cols_for_h,
+            );
+
             ws_tab_bar_data.push(tab_bar::WorkspaceTabBarData {
                 ws_id: *ws_id,
                 ws_rect: *ws_rect,
                 tabs,
                 badge,
                 has_multiple_panes,
+                tab_bar_height: ws_tab_bar_h,
             });
         }
 
         // Collect workspace dividers (needs the full viewport, not per-workspace).
         let ws_dividers = self.window_layout.collect_workspace_dividers(ws_viewport);
-        // Render workspace dividers alongside pane dividers by converting them
-        // to the same Divider type (pane IDs are unused in rendering).
-        for ws_div in &ws_dividers {
-            dividers.push(divider::Divider {
-                rect: ws_div.rect,
-                direction: ws_div.direction,
-                first_pane: layout::PaneId::from_raw(0),
-                second_pane: layout::PaneId::from_raw(0),
-            });
-        }
 
         // Workspace-aggregated AI border colours: for each pane, find the
         // workspace it belongs to and pick the highest-priority AI state.
@@ -1446,15 +1550,15 @@ impl App {
             },
         );
 
-        let tab_bar_h = cell_size.1 + self.config.appearance.tab_bar_padding;
         let indicator_h = self.config.terminal.indicator_height.clamp(1.0, 10.0);
-        let (mut all_instances, tab_hits, tab_eq_hits) = build_all_instances(
+        let (mut all_instances, tab_hits, tab_close_hits, tab_eq_hits) = build_all_instances(
             &mut gpu.renderer,
             &gpu.device,
             &gpu.queue,
             &mut self.panes,
             &pane_rects,
             &dividers,
+            &ws_dividers,
             cell_size,
             focused_pane,
             &border_colors,
@@ -1466,11 +1570,13 @@ impl App {
             scrollbar_color,
             focus_split_direction,
             cursor_visible,
-            tab_bar_h,
+            self.config.appearance.tab_width,
             indicator_h,
             self.active_selection.as_ref(),
+            self.hovered_tab_close,
         );
         self.tab_hit_targets = tab_hits;
+        self.tab_close_hit_targets = tab_close_hits;
         self.tab_bar_equalize_targets = tab_eq_hits;
 
         // Window-level status bar spanning the full window width.
@@ -1587,10 +1693,22 @@ impl App {
     }
 
     fn handle_terminal_key(&mut self, bytes: Vec<u8>) {
-        let Some(tx) = &self.cmd_tx else { return };
-        let Some(tab) = self.window_layout.active_tab() else { return };
-        let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
+        let Some(tx) = self.cmd_tx.clone() else { return };
+        let focused_pane_id = {
+            let Some(tab) = self.window_layout.active_tab() else { return };
+            tab.focused_pane
+        };
+        let Some(pane) = self.panes.get_mut(&focused_pane_id) else { return };
         let sid = pane.session_id;
+
+        let scrolled_up = pane.term.grid().display_offset() > 0;
+        if scrolled_up {
+            pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+            pane.scrollbar_state.on_scroll_action();
+        }
+        if scrolled_up {
+            self.ensure_animation_running();
+        }
 
         if tx.send(ClientCommand::KeyInput { session_id: sid, data: bytes }).is_err() {
             tracing::warn!("IPC channel closed; keyboard input dropped");
@@ -1708,7 +1826,7 @@ impl App {
 
         let new_rect = rects.iter().find(|(id, _)| *id == new_pane_id).map_or(ws_rect, |(_, r)| *r);
 
-        let tab_bar_h = self.effective_tab_bar_height();
+        let tab_bar_h = self.tab_bar_height_for(workspace_id, ws_rect);
         let grid = pane::compute_pane_grid(new_rect, cell.width, cell.height, tab_bar_h);
         let pane = Pane::new(new_rect, grid, session_id, workspace_id);
 
@@ -1763,7 +1881,7 @@ impl App {
             .find(|(wid, _)| *wid == new_workspace_id)
             .map_or(ws_viewport, |(_, r)| *r);
 
-        let tab_bar_h = self.effective_tab_bar_height();
+        let tab_bar_h = self.tab_bar_height_for(new_workspace_id, ws_rect);
         let grid = pane::compute_pane_grid(ws_rect, cell.width, cell.height, tab_bar_h);
         let pane = Pane::new(ws_rect, grid, session_id, new_workspace_id);
 
@@ -1889,7 +2007,7 @@ impl App {
         let ws_rect =
             ws_rects.iter().find(|(wid, _)| *wid == workspace_id).map_or(ws_viewport, |(_, r)| *r);
 
-        let tab_bar_h = self.effective_tab_bar_height();
+        let tab_bar_h = self.tab_bar_height_for(workspace_id, ws_rect);
         let grid = pane::compute_pane_grid(ws_rect, cell.width, cell.height, tab_bar_h);
         let pane = Pane::new(ws_rect, grid, session_id, workspace_id);
 
@@ -1952,6 +2070,45 @@ impl App {
         // Remove the tab from the workspace.
         self.window_layout.remove_tab(ws_id, session_id);
 
+        self.resize_all_workspace_panes();
+        self.request_redraw();
+    }
+
+    /// Close a specific tab by workspace ID and tab index (e.g. via close button click).
+    ///
+    /// No-op if the workspace does not exist, the index is out of bounds, or
+    /// this would close the last tab in the workspace.
+    fn close_tab_by_index(&mut self, ws_id: WorkspaceId, tab_idx: usize) {
+        let Some(ws) = self.window_layout.find_workspace(ws_id) else { return };
+        if ws.tab_count() <= 1 {
+            return;
+        }
+        let Some(tab) = ws.tabs.get(tab_idx) else { return };
+        let session_id = tab.session_id;
+
+        let pane_ids: Vec<PaneId> = self
+            .window_layout
+            .find_workspace(ws_id)
+            .and_then(|w| w.tabs.get(tab_idx))
+            .map(|t| t.pane_layout.all_pane_ids())
+            .unwrap_or_default();
+
+        let sessions_to_close: Vec<SessionId> =
+            pane_ids.iter().filter_map(|pid| self.panes.get(pid).map(|p| p.session_id)).collect();
+
+        for pid in &pane_ids {
+            if let Some(pane) = self.panes.remove(pid) {
+                self.session_to_pane.remove(&pane.session_id);
+            }
+        }
+
+        for sid in sessions_to_close {
+            if let Some(tx) = &self.cmd_tx {
+                send_command(tx, ClientCommand::CloseSession { session_id: sid });
+            }
+        }
+
+        self.window_layout.remove_tab(ws_id, session_id);
         self.resize_all_workspace_panes();
         self.request_redraw();
     }
@@ -2045,9 +2202,25 @@ impl App {
             return;
         }
 
-        let Some(tx) = &self.cmd_tx else { return };
-        let Some(tab) = self.window_layout.active_tab() else { return };
-        let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
+        let Some(tx) = self.cmd_tx.clone() else { return };
+        let focused_pane_id = {
+            let Some(tab) = self.window_layout.active_tab() else { return };
+            tab.focused_pane
+        };
+        let scrolled_up = {
+            let Some(pane) = self.panes.get_mut(&focused_pane_id) else { return };
+            let offset = pane.term.grid().display_offset();
+            if offset > 0 {
+                pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+                pane.scrollbar_state.on_scroll_action();
+            }
+            offset > 0
+        };
+        if scrolled_up {
+            self.ensure_animation_running();
+        }
+
+        let Some(pane) = self.panes.get(&focused_pane_id) else { return };
 
         // Wrap in bracketed paste sequences when the shell has enabled the mode.
         // This prevents newlines in pasted text from executing commands prematurely.
@@ -2312,15 +2485,31 @@ impl App {
             return;
         }
 
-        // Check for tab bar click (switch active tab in that workspace).
+        // Check for tab close button click (before tab switch).
+        if let Some((ws_id, tab_idx)) = self
+            .tab_close_hit_targets
+            .iter()
+            .find_map(|(ws_id, idx, rect)| rect.contains(x, y).then_some((*ws_id, *idx)))
+        {
+            self.close_tab_by_index(ws_id, tab_idx);
+            return;
+        }
+
+        // Check for tab bar click: start a drag candidate (switch on release if no drag).
         if let Some((ws_id, tab_idx)) = self
             .tab_hit_targets
             .iter()
             .find_map(|(ws_id, idx, rect)| rect.contains(x, y).then_some((*ws_id, *idx)))
         {
-            if self.window_layout.set_active_tab(ws_id, tab_idx) {
-                self.request_redraw();
-            }
+            self.tab_drag = Some(TabDrag {
+                workspace_id: ws_id,
+                tab_index: tab_idx,
+                start_x: x,
+                start_y: y,
+                cursor_x: x,
+                cursor_y: y,
+                dragging: false,
+            });
             return;
         }
 
@@ -2368,8 +2557,7 @@ impl App {
     fn try_start_workspace_divider_drag(&mut self, x: f32, y: f32, ws_viewport: Rect) -> bool {
         let ws_dividers = self.window_layout.collect_workspace_dividers(ws_viewport);
         if let Some(hit) = workspace_layout::hit_test_workspace_divider(&ws_dividers, x, y) {
-            self.workspace_divider_drag =
-                Some(workspace_layout::start_workspace_drag(hit, ws_viewport));
+            self.workspace_divider_drag = Some(workspace_layout::start_workspace_drag(hit));
             return true;
         }
         false
@@ -2391,7 +2579,7 @@ impl App {
         let Some(tab) = tab else { return false };
         let focused_pane_id = tab.focused_pane;
         let scrollbar_width = self.config.appearance.scrollbar_width.clamp(2.0, 20.0);
-        let tab_bar_h = self.effective_tab_bar_height();
+        let tab_bar_h = self.focused_workspace_tab_bar_height();
 
         // Phase 1: read-only queries (immutable borrow of self.panes).
         let action = {
@@ -2445,7 +2633,7 @@ impl App {
     fn handle_scrollbar_drag(&mut self, pane_id: layout::PaneId) {
         let Some((_, y)) = self.last_cursor_pos else { return };
         let scrollbar_width = self.config.appearance.scrollbar_width.clamp(2.0, 20.0);
-        let tab_bar_h = self.effective_tab_bar_height();
+        let tab_bar_h = self.focused_workspace_tab_bar_height();
 
         // Phase 1: read-only — compute the scroll delta.
         let delta = {
@@ -2482,7 +2670,7 @@ impl App {
         let Some(tab) = tab else { return };
         let focused_pane_id = tab.focused_pane;
         let scrollbar_width = self.config.appearance.scrollbar_width.clamp(2.0, 20.0);
-        let tab_bar_h = self.effective_tab_bar_height();
+        let tab_bar_h = self.focused_workspace_tab_bar_height();
 
         let Some(pane) = self.panes.get_mut(&focused_pane_id) else { return };
         let in_zone = scrollbar::hit_test_scrollbar(pane, x, y, scrollbar_width, tab_bar_h);
@@ -2546,7 +2734,11 @@ impl App {
                 layout::SplitDirection::Vertical => y,
             };
             let new_ratio = workspace_layout::workspace_drag_ratio(&drag, mouse_pos);
-            let _ = self.window_layout.set_workspace_ratio(drag.first_workspace, new_ratio);
+            let _ = self.window_layout.set_workspace_ratio(
+                drag.first_workspace,
+                drag.second_workspace,
+                new_ratio,
+            );
             self.resize_all_workspace_panes();
             self.request_redraw();
             return;
@@ -2568,6 +2760,22 @@ impl App {
             self.resize_after_layout_change();
             self.request_redraw();
             return;
+        }
+
+        // Tab drag update.
+        if self.tab_drag.is_some() {
+            self.update_tab_drag(x, y);
+            return;
+        }
+
+        // Update tab close hover state.
+        let new_hover = self
+            .tab_close_hit_targets
+            .iter()
+            .find_map(|(ws_id, idx, rect)| rect.contains(x, y).then_some((*ws_id, *idx)));
+        if new_hover != self.hovered_tab_close {
+            self.hovered_tab_close = new_hover;
+            self.request_redraw();
         }
 
         // No drag active — update cursor icon based on divider hover.
@@ -2642,10 +2850,52 @@ impl App {
     /// Finalize selection on mouse release and auto-copy if enabled.
     fn handle_mouse_release(&mut self) {
         self.mouse_selecting = false;
+        self.finish_tab_drag();
         if !self.config.terminal.copy_on_select {
             return;
         }
         self.finalize_copy();
+    }
+
+    /// Update the in-progress tab drag position and threshold.
+    fn update_tab_drag(&mut self, x: f32, y: f32) {
+        let Some(drag) = self.tab_drag.as_mut() else { return };
+        drag.cursor_x = x;
+        drag.cursor_y = y;
+        if !drag.dragging {
+            let dx = x - drag.start_x;
+            let dy = y - drag.start_y;
+            drag.dragging = dx * dx + dy * dy > 25.0;
+        }
+        if drag.dragging {
+            self.request_redraw();
+        }
+    }
+
+    /// Complete the tab drag on mouse release: reorder or switch tab.
+    fn finish_tab_drag(&mut self) {
+        let Some(drag) = self.tab_drag.take() else { return };
+        if drag.dragging {
+            self.finish_tab_drag_reorder(&drag);
+        } else {
+            // No drag threshold reached — treat as a plain tab click.
+            if self.window_layout.set_active_tab(drag.workspace_id, drag.tab_index) {
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Apply the drag reorder when the drag threshold was exceeded.
+    fn finish_tab_drag_reorder(&mut self, drag: &TabDrag) {
+        let drop_idx = self.tab_hit_targets.iter().find_map(|(ws_id, idx, rect)| {
+            (*ws_id == drag.workspace_id && rect.contains(drag.cursor_x, drag.cursor_y))
+                .then_some(*idx)
+        });
+        let Some(to) = drop_idx else { return };
+        if let Some(ws) = self.window_layout.find_workspace_mut(drag.workspace_id) {
+            ws.reorder_tab(drag.tab_index, to);
+        }
+        self.request_redraw();
     }
 
     /// Convert a pixel position to an absolute grid cell in the focused pane.
@@ -2656,7 +2906,7 @@ impl App {
         let gpu = self.gpu.as_ref()?;
         let cell = gpu.renderer.cell_size();
         let pane_rect = self.focused_pane_rect()?;
-        let tab_bar_h = self.effective_tab_bar_height();
+        let tab_bar_h = self.focused_workspace_tab_bar_height();
         let tab = self.window_layout.active_tab()?;
         let pane = self.panes.get(&tab.focused_pane)?;
         let display_offset = pane.term.grid().display_offset();
@@ -2696,13 +2946,26 @@ impl App {
 
 impl App {
     /// Resize all panes to their computed rects and notify the server.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "viewport dimensions are small enough to fit in f32"
+    )]
     fn resize_all_panes_from_rects(&mut self, rects: &[(PaneId, Rect)]) {
         let Some(gpu) = &self.gpu else { return };
         let cell = gpu.renderer.cell_size();
-        let tab_bar_h = self.effective_tab_bar_height();
+        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+
+        // Build per-workspace tab bar heights so each pane uses the correct height.
+        let ws_heights: std::collections::HashMap<WorkspaceId, f32> = ws_rects
+            .iter()
+            .map(|(ws_id, ws_rect)| (*ws_id, self.tab_bar_height_for(*ws_id, *ws_rect)))
+            .collect();
+        let fallback_h = self.effective_tab_bar_height();
 
         for (pane_id, rect) in rects {
             let Some(pane) = self.panes.get_mut(pane_id) else { continue };
+            let tab_bar_h = ws_heights.get(&pane.workspace_id).copied().unwrap_or(fallback_h);
             let grid = pane::compute_pane_grid(*rect, cell.width, cell.height, tab_bar_h);
             let new_grid = pane.resize(*rect, grid);
             let Some(tx) = &self.cmd_tx else { continue };
@@ -3026,6 +3289,19 @@ fn run_animation_loop(proxy: EventLoopProxy<UiEvent>) {
 // Instance compositing
 // ---------------------------------------------------------------------------
 
+/// Look up the tab bar height for a pane by its workspace id.
+/// Falls back to the first available workspace height, or 0.0.
+fn pane_tab_bar_h(
+    pane_ws: WorkspaceId,
+    heights: &HashMap<WorkspaceId, f32>,
+    ws_data: &[tab_bar::WorkspaceTabBarData],
+) -> f32 {
+    heights
+        .get(&pane_ws)
+        .copied()
+        .unwrap_or_else(|| ws_data.first().map_or(0.0, |d| d.tab_bar_height))
+}
+
 /// Minimum time the splash screen stays visible, ensuring the compositor
 /// presents it before the terminal content frame overwrites it.  On X11,
 /// `request_redraw` does not respect vsync pacing, so without a floor the
@@ -3058,6 +3334,10 @@ type TabEqualizeTargets = Vec<(WorkspaceId, layout::Rect)>;
     clippy::too_many_lines,
     reason = "single render-pass collector: tab bars, terminals, dividers, AI borders"
 )]
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "single render-pass function; extracting sub-functions would add indirection without clarity"
+)]
 fn build_all_instances(
     renderer: &mut TerminalRenderer,
     device: &wgpu::Device,
@@ -3065,6 +3345,7 @@ fn build_all_instances(
     panes: &mut HashMap<PaneId, Pane>,
     pane_rects: &[(PaneId, Rect)],
     dividers: &[divider::Divider],
+    ws_dividers: &[workspace_layout::WorkspaceDivider],
     cell_size: (f32, f32),
     focused_pane: PaneId,
     border_colors: &HashMap<PaneId, [f32; 4]>,
@@ -3076,10 +3357,15 @@ fn build_all_instances(
     scrollbar_color: [f32; 4],
     focus_split_direction: Option<layout::SplitDirection>,
     cursor_visible: bool,
-    tab_bar_height: f32,
+    tab_width: u16,
     indicator_height: f32,
     active_selection: Option<&selection::SelectionRange>,
-) -> (Vec<scribe_renderer::types::CellInstance>, TabHitTargets, TabEqualizeTargets) {
+    hovered_tab_close: Option<(WorkspaceId, usize)>,
+) -> (Vec<scribe_renderer::types::CellInstance>, TabHitTargets, TabHitTargets, TabEqualizeTargets) {
+    // Build a workspace-id → tab_bar_height lookup for per-pane height queries.
+    let ws_tab_bar_heights: HashMap<WorkspaceId, f32> =
+        ws_tab_bar_data.iter().map(|d| (d.ws_id, d.tab_bar_height)).collect();
+
     // Pre-allocate based on a typical 80x24 grid per pane plus tab bar and
     // border quads, to avoid repeated reallocations during the per-pane loops.
     let estimated_per_pane = 80 * 24 + 80 + 4;
@@ -3094,7 +3380,8 @@ fn build_all_instances(
     let effective_selection = active_selection.filter(|s| !s.is_empty());
     for (pane_id, _) in pane_rects {
         if let Some(pane) = panes.get_mut(pane_id) {
-            let offset = pane.content_offset(tab_bar_height);
+            let tbh = pane_tab_bar_h(pane.workspace_id, &ws_tab_bar_heights, ws_tab_bar_data);
+            let offset = pane.content_offset(tbh);
             // Only the focused pane shows the blinking cursor; unfocused panes hide it.
             let pane_cursor_visible = *pane_id == focused_pane && cursor_visible;
             let mut instances = renderer.build_instances_at(
@@ -3124,35 +3411,38 @@ fn build_all_instances(
 
     // Tab bar backgrounds + bottom separator (drawn after terminal content so
     // the opaque bar always covers any stray cells that extend into its area).
-    for (_pane_id, pane_rect) in pane_rects {
-        tab_bar::build_tab_bar_bg(
-            &mut all_instances,
-            *pane_rect,
-            cell_size,
-            tab_colors,
-            tab_bar_height,
+    for (pane_id, pane_rect) in pane_rects {
+        let tbh = panes.get(pane_id).map_or_else(
+            || ws_tab_bar_data.first().map_or(0.0, |d| d.tab_bar_height),
+            |p| pane_tab_bar_h(p.workspace_id, &ws_tab_bar_heights, ws_tab_bar_data),
         );
+        tab_bar::build_tab_bar_bg(&mut all_instances, *pane_rect, cell_size, tab_colors, tbh);
         tab_bar::build_tab_bar_separator(
             &mut all_instances,
             *pane_rect,
             cell_size,
             divider_color,
-            tab_bar_height,
+            tbh,
         );
     }
 
     // Tab bar text — rendered once per workspace, spanning the full workspace width.
     let mut tab_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)> = Vec::new();
+    let mut tab_close_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)> = Vec::new();
     let mut tab_equalize_targets: TabEqualizeTargets = Vec::new();
     for ws_data in ws_tab_bar_data {
+        let tbh = ws_data.tab_bar_height;
         let tab_bar_rect = layout::Rect {
             x: ws_data.ws_rect.x,
             y: ws_data.ws_rect.y,
             width: ws_data.ws_rect.width,
-            height: tab_bar_height,
+            height: tbh,
         };
         let badge = ws_data.badge.as_ref().map(|(name, color)| (name.as_str(), *color));
         let mut resolve_glyph = |ch: char| renderer.resolve_glyph(device, queue, ch);
+        // Pass the hovered close index only for this workspace.
+        let ws_hovered_close = hovered_tab_close
+            .and_then(|(ws, idx)| if ws == ws_data.ws_id { Some(idx) } else { None });
         let mut params = tab_bar::TabBarTextParams {
             rect: tab_bar_rect,
             cell_size,
@@ -3162,31 +3452,48 @@ fn build_all_instances(
             show_equalize: ws_data.has_multiple_panes,
             colors: tab_colors,
             resolve_glyph: &mut resolve_glyph,
-            tab_bar_height,
+            tab_bar_height: tbh,
             indicator_height,
+            tab_width,
+            hovered_tab_close: ws_hovered_close,
         };
         let (text_instances, hit_targets) = tab_bar::build_tab_bar_text(&mut params);
         all_instances.extend(text_instances);
         for (tab_idx, rect) in hit_targets.tab_rects {
             tab_hit_targets.push((ws_data.ws_id, tab_idx, rect));
         }
+        for (tab_idx, rect) in hit_targets.close_rects {
+            tab_close_hit_targets.push((ws_data.ws_id, tab_idx, rect));
+        }
         if let Some(eq_rect) = hit_targets.equalize_rect {
             tab_equalize_targets.push((ws_data.ws_id, eq_rect));
         }
     }
 
-    // Dividers.
-    divider::build_divider_instances(&mut all_instances, dividers, cell_size, divider_color);
+    // Pane dividers.
+    divider::build_divider_instances(&mut all_instances, dividers, divider_color);
+    // Workspace dividers — rendered directly as single quads.
+    for ws_div in ws_dividers {
+        all_instances.push(scribe_renderer::types::CellInstance {
+            pos: [ws_div.rect.x, ws_div.rect.y],
+            size: [ws_div.rect.width, ws_div.rect.height],
+            uv_min: [0.0, 0.0],
+            uv_max: [0.0, 0.0],
+            fg_color: divider_color,
+            bg_color: divider_color,
+        });
+    }
 
     // Scrollbar overlays.
     for (pane_id, _) in pane_rects {
         if let Some(pane) = panes.get(pane_id) {
+            let tbh = pane_tab_bar_h(pane.workspace_id, &ws_tab_bar_heights, ws_tab_bar_data);
             scrollbar::build_scrollbar_instances(
                 &mut all_instances,
                 pane,
                 scrollbar_width,
                 scrollbar_color,
-                tab_bar_height,
+                tbh,
             );
         }
     }
@@ -3212,7 +3519,7 @@ fn build_all_instances(
         }
     }
 
-    (all_instances, tab_hit_targets, tab_equalize_targets)
+    (all_instances, tab_hit_targets, tab_close_hit_targets, tab_equalize_targets)
 }
 
 /// Apply window opacity to cell background alpha values.

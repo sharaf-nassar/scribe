@@ -115,6 +115,15 @@ fn apply_config_key(
             let v = value.as_f64().ok_or("tab_bar_padding must be a number")? as f32;
             config.appearance.tab_bar_padding = v.clamp(0.0, 20.0);
         }
+        "appearance.tab_width" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "tab width is a small positive integer within u16 range"
+            )]
+            let v = value.as_f64().ok_or("tab_width must be a number")? as u16;
+            config.appearance.tab_width = v.clamp(8, 50);
+        }
         // -- Theme preset -----------------------------------------------------
         "theme.preset" => {
             let preset = value.as_str().ok_or("theme preset must be a string")?;

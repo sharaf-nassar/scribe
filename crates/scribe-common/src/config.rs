@@ -127,6 +127,8 @@ pub struct AppearanceConfig {
     /// height is `cell_height + tab_bar_padding`. `0` means no padding.
     #[serde(default = "default_tab_bar_padding")]
     pub tab_bar_padding: f32,
+    #[serde(default = "default_tab_width")]
+    pub tab_width: u16,
 }
 
 impl Default for AppearanceConfig {
@@ -145,6 +147,7 @@ impl Default for AppearanceConfig {
             scrollbar_width: default_scrollbar_width(),
             scrollbar_color: None,
             tab_bar_padding: default_tab_bar_padding(),
+            tab_width: default_tab_width(),
         }
     }
 }
@@ -183,6 +186,10 @@ fn default_scrollbar_width() -> f32 {
 
 fn default_tab_bar_padding() -> f32 {
     4.0
+}
+
+fn default_tab_width() -> u16 {
+    20
 }
 
 // ---------------------------------------------------------------------------

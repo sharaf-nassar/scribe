@@ -378,6 +378,27 @@ impl WorkspaceSlot {
     pub fn tab_count(&self) -> usize {
         self.tabs.len()
     }
+
+    /// Move a tab from one position to another within this workspace.
+    ///
+    /// Adjusts `active_tab` so the currently active tab remains active after
+    /// the reorder.  No-op when `from == to` or either index is out of bounds.
+    pub fn reorder_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        // Adjust active_tab to follow the moved tab.
+        if self.active_tab == from {
+            self.active_tab = to;
+        } else if from < self.active_tab && to >= self.active_tab {
+            self.active_tab = self.active_tab.saturating_sub(1);
+        } else if from > self.active_tab && to <= self.active_tab {
+            self.active_tab =
+                self.active_tab.saturating_add(1).min(self.tabs.len().saturating_sub(1));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -703,14 +724,18 @@ pub struct WorkspaceDivider {
     pub first_workspace: WorkspaceId,
     /// First workspace leaf ID in the second subtree.
     pub second_workspace: WorkspaceId,
+    /// The rect of the parent split node that contains this divider.
+    pub parent_rect: Rect,
 }
 
 /// State for an in-progress workspace divider drag.
 #[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
 #[derive(Clone, Copy)]
 pub struct WorkspaceDividerDrag {
-    /// First workspace adjacent to the divider being dragged.
+    /// First workspace leaf in the first subtree of the dragged split.
     pub first_workspace: WorkspaceId,
+    /// First workspace leaf in the second subtree of the dragged split.
+    pub second_workspace: WorkspaceId,
     /// The direction of the split.
     pub direction: SplitDirection,
     /// The total extent (width or height) of the parent area.
@@ -731,15 +756,16 @@ pub fn hit_test_workspace_divider(
     dividers.iter().find(|d| is_within_workspace_divider(d, mouse_x, mouse_y))
 }
 
-/// Create a `WorkspaceDividerDrag` from a workspace divider and its parent viewport.
+/// Create a `WorkspaceDividerDrag` from a workspace divider.
 #[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
-pub fn start_workspace_drag(divider: &WorkspaceDivider, viewport: Rect) -> WorkspaceDividerDrag {
+pub fn start_workspace_drag(divider: &WorkspaceDivider) -> WorkspaceDividerDrag {
     let (parent_extent, parent_origin) = match divider.direction {
-        SplitDirection::Horizontal => (viewport.width, viewport.x),
-        SplitDirection::Vertical => (viewport.height, viewport.y),
+        SplitDirection::Horizontal => (divider.parent_rect.width, divider.parent_rect.x),
+        SplitDirection::Vertical => (divider.parent_rect.height, divider.parent_rect.y),
     };
     WorkspaceDividerDrag {
         first_workspace: divider.first_workspace,
+        second_workspace: divider.second_workspace,
         direction: divider.direction,
         parent_extent,
         parent_origin,
@@ -767,13 +793,22 @@ impl WindowLayout {
         out
     }
 
-    /// Find the split node whose direct child is the workspace with the given ID
-    /// and update its ratio to `new_ratio`, clamped to [0.1, 0.9].
+    /// Find the split node whose first subtree contains `first_ws` and whose
+    /// second subtree contains `second_ws`, then update its ratio to
+    /// `new_ratio`, clamped to [0.1, 0.9].
     ///
-    /// Returns `true` if the workspace was found and the ratio updated.
+    /// Using both workspace IDs ensures the correct split is found even when
+    /// the same leaf appears as the first leaf of nested splits.
+    ///
+    /// Returns `true` if the split was found and the ratio updated.
     #[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
-    pub fn set_workspace_ratio(&mut self, workspace_id: WorkspaceId, new_ratio: f32) -> bool {
-        set_workspace_ratio_in(&mut self.root, workspace_id, new_ratio)
+    pub fn set_workspace_ratio(
+        &mut self,
+        first_ws: WorkspaceId,
+        second_ws: WorkspaceId,
+        new_ratio: f32,
+    ) -> bool {
+        set_workspace_ratio_in(&mut self.root, first_ws, second_ws, new_ratio)
     }
 
     /// Set every split node's ratio to 0.5 recursively.
@@ -805,6 +840,7 @@ fn collect_workspace_dividers_inner(
         direction: *direction,
         first_workspace,
         second_workspace,
+        parent_rect: rect,
     });
 
     collect_workspace_dividers_inner(first, r1, out);
@@ -852,36 +888,65 @@ fn is_within_workspace_divider(divider: &WorkspaceDivider, mouse_x: f32, mouse_y
         && mouse_y <= expanded.y + expanded.height
 }
 
-/// Find the split whose direct child is the given workspace and update its ratio.
+/// Find the split whose first subtree contains `first_ws` and whose second
+/// subtree contains `second_ws`, then update its ratio.
 #[allow(dead_code, reason = "called by set_workspace_ratio public API")]
 fn set_workspace_ratio_in(
     node: &mut WindowNode,
-    workspace_id: WorkspaceId,
+    first_ws: WorkspaceId,
+    second_ws: WorkspaceId,
     new_ratio: f32,
 ) -> bool {
     let WindowNode::Split { ratio, first, second, .. } = node else {
         return false;
     };
 
-    let first_match =
-        matches!(first.as_ref(), WindowNode::Workspace(s) if s.workspace_id == workspace_id);
-    let second_match =
-        matches!(second.as_ref(), WindowNode::Workspace(s) if s.workspace_id == workspace_id);
-
-    if first_match || second_match {
+    if contains_workspace(first, first_ws) && contains_workspace(second, second_ws) {
         *ratio = new_ratio.clamp(0.1, 0.9);
         return true;
     }
 
-    set_workspace_ratio_in(first, workspace_id, new_ratio)
-        || set_workspace_ratio_in(second, workspace_id, new_ratio)
+    set_workspace_ratio_in(first, first_ws, second_ws, new_ratio)
+        || set_workspace_ratio_in(second, first_ws, second_ws, new_ratio)
 }
 
-/// Recursively set every split ratio to 0.5.
+/// Return `true` if the given workspace ID exists anywhere in the subtree.
+fn contains_workspace(node: &WindowNode, target: WorkspaceId) -> bool {
+    match node {
+        WindowNode::Workspace(s) => s.workspace_id == target,
+        WindowNode::Split { first, second, .. } => {
+            contains_workspace(first, target) || contains_workspace(second, target)
+        }
+    }
+}
+
+/// Count the number of leaf (workspace) nodes in a subtree.
+fn count_workspace_leaves(node: &WindowNode) -> u32 {
+    match node {
+        WindowNode::Workspace(_) => 1,
+        WindowNode::Split { first, second, .. } => {
+            count_workspace_leaves(first) + count_workspace_leaves(second)
+        }
+    }
+}
+
+/// Recursively set split ratios so every leaf gets equal space.
+///
+/// For a split with `L` leaves on the left and `R` on the right, the ratio
+/// is set to `L / (L + R)`.  This ensures each leaf gets `1 / total_leaves`
+/// of the available space regardless of tree shape.
 #[allow(dead_code, reason = "called by equalize_all_workspace_ratios public API")]
 fn equalize_workspace_node(node: &mut WindowNode) {
     if let WindowNode::Split { ratio, first, second, .. } = node {
-        *ratio = 0.5;
+        let left = count_workspace_leaves(first);
+        let right = count_workspace_leaves(second);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "workspace count is tiny, f32 is exact for small integers"
+        )]
+        {
+            *ratio = left as f32 / (left + right) as f32;
+        }
         equalize_workspace_node(first);
         equalize_workspace_node(second);
     }

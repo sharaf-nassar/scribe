@@ -122,6 +122,38 @@ pub fn build_tab_bar_separator(
     }
 }
 
+/// Compute the tab bar height in pixels for a workspace with the given parameters.
+///
+/// Accounts for multi-row stacking when there are more tabs than fit in one row.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "tab and column counts are small positive integers fitting in f32"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "all parameters are needed to compute multi-row tab bar height"
+)]
+pub fn compute_tab_bar_height(
+    tab_count: usize,
+    ws_width: f32,
+    tab_width_chars: u16,
+    cell_w: f32,
+    row_height: f32,
+    badge_cols: usize,
+) -> f32 {
+    if cell_w <= 0.0 || row_height <= 0.0 {
+        return row_height.max(1.0);
+    }
+    let gear_cols: usize = 2;
+    let total_cols = columns_in_width(ws_width, cell_w);
+    let available = total_cols.saturating_sub(badge_cols).saturating_sub(gear_cols);
+    let tab_w = usize::from(tab_width_chars).max(1);
+    let tabs_per_row = (available / tab_w).max(1);
+    let effective_count = tab_count.max(1);
+    let rows = effective_count.div_ceil(tabs_per_row);
+    rows as f32 * row_height
+}
+
 /// Pre-collected workspace-level data for tab bar text rendering.
 ///
 /// Gathered at the call site (where workspace metadata is accessible) and
@@ -137,6 +169,8 @@ pub struct WorkspaceTabBarData {
     pub badge: Option<(String, [f32; 4])>,
     /// Whether the active tab in this workspace has multiple panes.
     pub has_multiple_panes: bool,
+    /// Pre-computed tab bar height for this workspace (accounts for multi-row stacking).
+    pub tab_bar_height: f32,
 }
 
 /// Parameters for building tab bar text instances.
@@ -160,6 +194,10 @@ pub struct TabBarTextParams<'a> {
     pub tab_bar_height: f32,
     /// AI indicator bar height in pixels (from config).
     pub indicator_height: f32,
+    /// Fixed tab width in characters (includes leading/trailing padding).
+    pub tab_width: u16,
+    /// Which tab's close button is shown (hovered). `None` = no hover.
+    pub hovered_tab_close: Option<usize>,
 }
 
 /// Clickable regions produced by [`build_tab_bar_text`].
@@ -170,6 +208,8 @@ pub struct TabBarHitTargets {
     pub gear_rect: Option<Rect>,
     /// Clickable rect for the equalize icon, if rendered.
     pub equalize_rect: Option<Rect>,
+    /// Close button clickable regions per tab: `(tab_index, rect)`.
+    pub close_rects: Vec<(usize, Rect)>,
 }
 
 /// Build cell instances for the tab bar text overlay.
@@ -182,15 +222,24 @@ pub fn build_tab_bar_text(
     if cell_w <= 0.0 {
         return (
             Vec::new(),
-            TabBarHitTargets { tab_rects: Vec::new(), gear_rect: None, equalize_rect: None },
+            TabBarHitTargets {
+                tab_rects: Vec::new(),
+                gear_rect: None,
+                equalize_rect: None,
+                close_rects: Vec::new(),
+            },
         );
     }
 
     let max_cols = columns_in_width(params.rect.width, cell_w);
     let mut instances = Vec::new();
     let mut col: usize = 0;
-    let mut hit_targets =
-        TabBarHitTargets { tab_rects: Vec::new(), gear_rect: None, equalize_rect: None };
+    let mut hit_targets = TabBarHitTargets {
+        tab_rects: Vec::new(),
+        gear_rect: None,
+        equalize_rect: None,
+        close_rects: Vec::new(),
+    };
 
     // Reserve columns for the gear icon on the far right (2 cols: space + gear).
     let gear_cols: usize = if params.show_gear { 2 } else { 0 };
@@ -258,64 +307,153 @@ fn render_badge(
 
 /// Render tab labels with hit targets for click handling, plus AI indicator
 /// bars underneath tabs that have an active AI state.
+///
+/// Tabs have a fixed width (`params.tab_width` columns) and wrap to new rows
+/// when they would exceed `max_cols`. Returns the column where content ends
+/// on row 0 (for gear/equalize icon positioning).
 #[allow(
     clippy::too_many_arguments,
     reason = "helper function that needs all render context from build_tab_bar_text"
 )]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "column and row indices are small positive integers fitting in f32"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "multi-row fixed-width tab rendering with hit targets and AI indicators"
+)]
 fn render_tabs(
     instances: &mut Vec<CellInstance>,
     hit_targets: &mut TabBarHitTargets,
-    mut col: usize,
+    start_col: usize,
     max_cols: usize,
     cell_w: f32,
     params: &mut TabBarTextParams<'_>,
 ) -> usize {
     let bg = params.colors.bg;
+    let tab_w = usize::from(params.tab_width).max(1);
+
+    // Compute the single-row height from total height / number of rows.
+    let tab_count = params.tabs.len().max(1);
+    let available = max_cols.saturating_sub(start_col);
+    let tabs_per_row = (available / tab_w).max(1);
+    let num_rows = tab_count.div_ceil(tabs_per_row);
+    let row_height =
+        if num_rows > 0 { params.tab_bar_height / num_rows as f32 } else { params.tab_bar_height };
+
+    // Save original params that we temporarily mutate per row.
+    let base_y = params.rect.y;
+    let total_tab_bar_h = params.tab_bar_height;
+
+    let mut row: usize = 0;
+    let mut col: usize = start_col;
+    // Track where row 0 ends (for gear/equalize positioning).
+    let mut row0_end_col: usize = start_col;
 
     for (tab_idx, tab) in params.tabs.iter().enumerate() {
+        // Wrap to next row if this tab would not fit.
+        if tab_idx > 0 && col + tab_w > max_cols {
+            row += 1;
+            col = start_col;
+        }
+
         let fg = if tab.is_active { params.colors.active_text } else { params.colors.text };
         let tab_bg = if tab.is_active { params.colors.active_bg } else { bg };
         let tab_start_col = col;
+        let row_base_y = base_y + row as f32 * row_height;
 
+        // Set per-row context so emit_char positions glyphs correctly.
+        params.rect.y = row_base_y;
+        params.tab_bar_height = row_height;
+
+        // Determine title display:
+        // Each tab has `tab_w` columns: 1 left-pad + title + 1 right-pad.
+        // If close button shown, the last 2 chars are " ×" instead of title overflow.
+        let show_close = params.hovered_tab_close == Some(tab_idx);
+        let available_title = if tab_w >= 4 {
+            if show_close && tab_w >= 6 {
+                tab_w.saturating_sub(4) // 1 left-pad + title + " ×"
+            } else {
+                tab_w.saturating_sub(2) // 1 left-pad + title + 1 right-pad
+            }
+        } else {
+            tab_w.saturating_sub(2)
+        };
+
+        // Build the display title: truncate with '…' if too long, or pad with spaces.
+        let title_chars: Vec<char> = tab.title.chars().collect();
+        let display_title: Vec<char> = if tab_w >= 4 && title_chars.len() > available_title {
+            let keep = available_title.saturating_sub(1);
+            let mut t: Vec<char> = title_chars.get(..keep).map_or_else(Vec::new, <[char]>::to_vec);
+            t.push('\u{2026}'); // '…'
+            t
+        } else {
+            let mut t = title_chars;
+            while t.len() < available_title {
+                t.push(' ');
+            }
+            t
+        };
+
+        // Emit: leading space + title + (close " ×" or trailing space).
         col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
-        for ch in tab.title.chars() {
+        for &ch in &display_title {
             col = emit_char(instances, ch, col, max_cols, params, fg, tab_bg);
         }
-        col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
+        if show_close {
+            col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
+            col = emit_char(instances, '\u{00D7}', col, max_cols, params, fg, tab_bg);
+        } else {
+            col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
+        }
 
-        let tab_width_cols = col - tab_start_col;
+        // Fill any remaining columns in this fixed-width tab slot.
+        let expected_end = tab_start_col + tab_w;
+        while col < expected_end.min(max_cols) {
+            col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
+        }
+        col = expected_end.min(max_cols);
 
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "column indices are small positive integers fitting in f32"
-        )]
+        if row == 0 {
+            row0_end_col = col;
+        }
+
+        let tab_width_px = tab_w as f32 * cell_w;
         let tab_x = params.rect.x + tab_start_col as f32 * cell_w;
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "column indices are small positive integers fitting in f32"
-        )]
-        let tab_width = tab_width_cols as f32 * cell_w;
+
+        // Close-button rect: rightmost 2 columns of the tab.
+        let close_x = params.rect.x + (tab_start_col + tab_w).saturating_sub(2) as f32 * cell_w;
+        hit_targets.close_rects.push((
+            tab_idx,
+            Rect { x: close_x, y: row_base_y, width: 2.0 * cell_w, height: row_height },
+        ));
 
         hit_targets.tab_rects.push((
             tab_idx,
-            Rect { x: tab_x, y: params.rect.y, width: tab_width, height: params.tab_bar_height },
+            Rect { x: tab_x, y: row_base_y, width: tab_width_px, height: row_height },
         ));
 
-        // Render AI indicator bar above this tab if active.
+        // Render AI indicator bar at the top of this tab's row.
         if let Some(indicator_color) = tab.ai_indicator {
             render_indicator_bar(
                 instances,
-                params.rect.y,
+                row_base_y,
                 indicator_color,
                 tab_x,
-                tab_width_cols,
+                tab_w,
                 cell_w,
                 params.indicator_height,
             );
         }
     }
 
-    col
+    // Restore original params.
+    params.rect.y = base_y;
+    params.tab_bar_height = total_tab_bar_h;
+
+    // Return row 0 end column so gear/equalize render correctly in row 0.
+    row0_end_col
 }
 
 /// Render a thin coloured indicator bar above a tab (at the top of the tab bar).
