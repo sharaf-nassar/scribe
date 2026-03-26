@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.0-dev"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.87"
@@ -90,6 +90,13 @@ rust-embed = "8"
 tao = "0.33"
 signal-hook = "0.3"
 sysinfo = "0.35"
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+  "stream",
+] }
+semver = "1.0"
+minisign-verify = "0.2"
 
 # Workspace crates
 scribe-common = { path = "crates/scribe-common" }

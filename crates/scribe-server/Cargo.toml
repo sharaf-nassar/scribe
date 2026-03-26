@@ -78,7 +78,16 @@ assets = [
 maintainer-scripts = "../../dist/debian/"
 
 [package.metadata.cargo-machete]
-ignored = ["rmp-serde", "serde", "thiserror", "uuid"]
+ignored = [
+  "rmp-serde",
+  "serde",
+  "thiserror",
+  "uuid",
+  "reqwest",
+  "semver",
+  "serde_json",
+  "minisign-verify",
+]
 
 [dependencies]
 scribe-common.workspace = true
@@ -95,6 +104,10 @@ tracing-subscriber.workspace = true
 vte.workspace = true
 libc.workspace = true
 nix.workspace = true
+reqwest.workspace = true
+semver.workspace = true
+serde_json.workspace = true
+minisign-verify.workspace = true
 
 [dev-dependencies]
 # test-util: provides #[tokio::test] macro for async tests.

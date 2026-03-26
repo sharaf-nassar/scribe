@@ -16,6 +16,7 @@ use tracing::info;
 use vte::Parser as VteParser;
 use vte::ansi::Processor as AnsiProcessor;
 
+use scribe_common::ai_state::AiProcessState;
 use scribe_common::error::ScribeError;
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::screen::{
@@ -64,6 +65,12 @@ pub struct ManagedSession {
     /// that attaches (then cleared) so the pre-handoff screen content is
     /// restored instead of a blank terminal.
     pub handoff_snapshot: Option<ScreenSnapshot>,
+    /// Title from handoff, used to restore tab name. `None` for fresh sessions.
+    pub title: Option<String>,
+    /// CWD from handoff, used to restore working directory. `None` for fresh sessions.
+    pub cwd: Option<std::path::PathBuf>,
+    /// AI state from handoff. `None` for fresh sessions.
+    pub ai_state: Option<AiProcessState>,
 }
 
 /// Terminal dimensions implementing the `Dimensions` trait from `alacritty_terminal`.
@@ -214,6 +221,9 @@ impl SessionManager {
             workspace_id,
             pty: Some(pty),
             handoff_snapshot: None,
+            title: None,
+            cwd: None,
+            ai_state: None,
         };
 
         self.sessions.write().await.insert(session_id, managed);
@@ -308,6 +318,9 @@ impl SessionManager {
                 workspace_id: handoff_session.workspace_id,
                 pty: None,
                 handoff_snapshot: handoff_session.snapshot.clone(),
+                title: handoff_session.title.clone(),
+                cwd: handoff_session.cwd.clone(),
+                ai_state: handoff_session.ai_state.clone(),
             };
 
             sessions_map.insert(handoff_session.session_id, managed);

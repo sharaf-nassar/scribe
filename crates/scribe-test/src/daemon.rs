@@ -324,6 +324,12 @@ async fn dispatch_server_message(
         ServerMessage::QuitRequested => {
             debug!("quit requested (ignored by test daemon)");
         }
+        ServerMessage::UpdateAvailable { version, .. } => {
+            debug!(%version, "update available (ignored by test daemon)");
+        }
+        ServerMessage::UpdateProgress { .. } => {
+            debug!("update progress (ignored by test daemon)");
+        }
     }
 }
 

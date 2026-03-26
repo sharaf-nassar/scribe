@@ -56,7 +56,7 @@ deb:
 
 # Build and install .deb
 install: deb
-    sudo dpkg -i target/debian/scribe_0.1.0-1_amd64.deb
+    sudo dpkg -i $(find target/debian -name 'scribe_*.deb' -print -quit)
 
 # Build macOS .app bundle and .dmg installer
 dmg:

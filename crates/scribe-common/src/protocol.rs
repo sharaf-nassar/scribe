@@ -101,6 +101,10 @@ pub enum ClientMessage {
     },
     /// Request all connected clients to save state and close gracefully.
     QuitAll,
+    /// User confirmed the update — download and install.
+    TriggerUpdate,
+    /// User dismissed the update notification.
+    DismissUpdate,
 }
 
 // ── Server → UI ──────────────────────────────────────────────────
@@ -200,6 +204,15 @@ pub enum ServerMessage {
     /// Server requests this client to save state and close gracefully.
     /// Sent in response to another client's `QuitAll`.
     QuitRequested,
+    /// A newer version is available for download.
+    UpdateAvailable {
+        version: String,
+        release_url: String,
+    },
+    /// Progress update during download/install.
+    UpdateProgress {
+        state: UpdateProgressState,
+    },
 }
 
 // ── Shared types ─────────────────────────────────────────────────
@@ -245,6 +258,9 @@ pub struct SessionInfo {
     pub title: Option<String>,
     /// Last-known working directory (from OSC 7). `None` before first CWD event.
     pub cwd: Option<PathBuf>,
+    /// Last-known AI process state (from OSC 1337). `None` when no AI is active.
+    #[serde(default)]
+    pub ai_state: Option<AiProcessState>,
 }
 
 /// A single search match location in the terminal grid.
@@ -253,4 +269,20 @@ pub struct SearchMatch {
     pub row: u16,
     pub col_start: u16,
     pub col_end: u16,
+}
+
+/// Progress state for an in-flight update.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UpdateProgressState {
+    /// Downloading the update package.
+    Downloading,
+    /// Verifying the cryptographic signature.
+    Verifying,
+    /// Installing the update package.
+    Installing,
+    /// Installation completed successfully. Client should restart (macOS) or
+    /// sessions will hot-reload automatically (Linux).
+    Completed { version: String },
+    /// An error occurred during the update process.
+    Failed { reason: String },
 }

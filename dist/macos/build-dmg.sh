@@ -14,12 +14,32 @@ BUILD_DIR="${REPO_ROOT}/target/release"
 DIST_DIR="${REPO_ROOT}/dist"
 STAGING_DIR="${REPO_ROOT}/target/macos-staging"
 
+# Parse arguments
+SKIP_BUILD=false
+VERSION=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --skip-build)
+            SKIP_BUILD=true
+            shift
+            ;;
+        --version)
+            VERSION="${2:?--version requires an argument}"
+            shift 2
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
 # Clean previous staging
 rm -rf "${STAGING_DIR}"
 mkdir -p "${STAGING_DIR}"
 
 # --- Step 1: Build release binaries (unless --skip-build) ---
-if [[ "${1:-}" != "--skip-build" ]]; then
+if [[ "$SKIP_BUILD" != "true" ]]; then
     echo "==> Building release binaries..."
     (cd "${REPO_ROOT}" && cargo build --release)
 fi
@@ -83,6 +103,13 @@ mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
 # Copy Info.plist
 cp "${SCRIPT_DIR}/Info.plist" "${CONTENTS}/Info.plist"
+
+# Inject version into staged Info.plist if --version was provided
+if [[ -n "$VERSION" ]]; then
+    sed -i \
+        "/<key>CFBundleShortVersionString<\/key>/{n; s|<string>[^<]*</string>|<string>${VERSION}</string>|;}" \
+        "${CONTENTS}/Info.plist"
+fi
 
 # Copy binaries
 cp "${BUILD_DIR}/scribe-client"   "${MACOS_DIR}/"

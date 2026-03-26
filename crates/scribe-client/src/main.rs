@@ -18,6 +18,7 @@ mod splash;
 mod status_bar;
 mod sys_stats;
 mod tab_bar;
+mod update_dialog;
 mod url_detect;
 mod window_state;
 mod workspace_layout;
@@ -30,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use scribe_common::config::{ContentPadding, ScribeConfig, resolve_theme};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
+use scribe_common::protocol::UpdateProgressState;
 use scribe_common::theme::Theme;
 use scribe_renderer::TerminalRenderer;
 use scribe_renderer::types::GridSize;
@@ -157,6 +159,16 @@ struct App {
 
     // Close dialog overlay (shown on window close request)
     close_dialog: Option<close_dialog::CloseDialog>,
+
+    // Update state
+    /// Available update version and URL. Set by `UpdateAvailable`, cleared on dismiss.
+    update_available: Option<(String, String)>,
+    /// Current update progress state. Set by `UpdateProgress`, cleared on completion/failure.
+    update_progress: Option<UpdateProgressState>,
+    /// Active update confirmation dialog (shown when user clicks the update button).
+    update_dialog: Option<update_dialog::UpdateDialog>,
+    /// Clickable update button rect in tab bars `(workspace_id, rect)` (updated each frame).
+    tab_bar_update_targets: Vec<(WorkspaceId, layout::Rect)>,
 
     // Context menu overlay (shown on right-click)
     context_menu: Option<context_menu::ContextMenu>,
@@ -317,6 +329,10 @@ impl App {
             zoom_level: 0,
             search_overlay: search_overlay::SearchOverlay::new(),
             close_dialog: None,
+            update_available: None,
+            update_progress: None,
+            update_dialog: None,
+            tab_bar_update_targets: Vec::new(),
             context_menu: None,
             splash_active: true,
             splash_needs_list_sessions: true,
@@ -435,6 +451,14 @@ impl ApplicationHandler<UiEvent> for App {
             }
             UiEvent::QuitRequested => {
                 self.handle_quit_requested(event_loop);
+            }
+            UiEvent::UpdateAvailable { version, release_url } => {
+                self.update_available = Some((version, release_url));
+                self.request_redraw();
+            }
+            UiEvent::UpdateProgress { state } => {
+                self.update_progress = Some(state);
+                self.request_redraw();
             } // QuitAllFromDialog / CloseWindow / CancelClose were removed —
               // the close dialog is now an in-app GPU overlay (close_dialog module).
         }
@@ -458,6 +482,10 @@ impl ApplicationHandler<UiEvent> for App {
         self.flush_resize_if_due();
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "dispatches close/update dialog intercepts and main event variants; splitting adds indirection"
+    )]
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -497,6 +525,45 @@ impl ApplicationHandler<UiEvent> for App {
                 WindowEvent::CursorMoved { position, .. } => {
                     self.last_cursor_pos = Some((position.x as f32, position.y as f32));
                     self.handle_dialog_hover();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // When the update dialog is active, intercept input events and route
+        // them to the update dialog instead of the terminal / layout handlers.
+        if self.update_dialog.is_some() {
+            match event {
+                WindowEvent::CloseRequested => {
+                    self.handle_close_requested(event_loop);
+                }
+                WindowEvent::RedrawRequested => self.handle_redraw(),
+                WindowEvent::Resized(size) => {
+                    self.handle_resize(size);
+                    self.mark_geometry_dirty();
+                }
+                WindowEvent::Moved(_) => self.mark_geometry_dirty(),
+                WindowEvent::ModifiersChanged(new_mods) => {
+                    self.modifiers = new_mods.state();
+                }
+                WindowEvent::KeyboardInput { event: ref key_event, .. } => {
+                    self.handle_update_dialog_keyboard(key_event);
+                }
+                WindowEvent::MouseInput {
+                    state: winit::event::ElementState::Pressed,
+                    button: winit::event::MouseButton::Left,
+                    ..
+                } => {
+                    self.handle_update_dialog_click();
+                }
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "cursor position from winit is f64 but fits in f32"
+                )]
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.last_cursor_pos = Some((position.x as f32, position.y as f32));
+                    self.handle_update_dialog_hover();
                 }
                 _ => {}
             }
@@ -1707,6 +1774,7 @@ impl App {
             scrollbar_color,
             indicator_height: indicator_h,
         };
+        let update_version = self.update_available.as_ref().map(|(v, _)| v.as_str());
         let frame_interaction = FrameInteraction {
             cursor_visible,
             tab_width: self.config.appearance.tab_width,
@@ -1714,19 +1782,23 @@ impl App {
             hovered_tab_close: self.hovered_tab_close,
             tab_drag: self.tab_drag.as_ref(),
             tab_drag_offsets: &self.tab_drag_offsets,
+            update_available: update_version,
+            update_progress: self.update_progress.as_ref(),
         };
-        let (mut all_instances, tab_hits, tab_close_hits, tab_eq_hits) = build_all_instances(
-            &mut gpu.renderer,
-            &gpu.device,
-            &gpu.queue,
-            &mut self.panes,
-            &frame_layout,
-            &frame_style,
-            &frame_interaction,
-        );
+        let (mut all_instances, tab_hits, tab_close_hits, tab_eq_hits, tab_upd_hits) =
+            build_all_instances(
+                &mut gpu.renderer,
+                &gpu.device,
+                &gpu.queue,
+                &mut self.panes,
+                &frame_layout,
+                &frame_style,
+                &frame_interaction,
+            );
         self.tab_hit_targets = tab_hits;
         self.tab_close_hit_targets = tab_close_hits;
         self.tab_bar_equalize_targets = tab_eq_hits;
+        self.tab_bar_update_targets = tab_upd_hits;
 
         // URL underlines — rendered on top of terminal content, below tab bars.
         {
@@ -1778,6 +1850,19 @@ impl App {
 
         // Close dialog overlay (rendered on top of everything).
         if let Some(dialog) = &mut self.close_dialog {
+            let mut resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            dialog.build_instances(
+                &mut all_instances,
+                full_viewport,
+                cell_size,
+                &self.theme.chrome,
+                &mut resolve_glyph,
+            );
+        }
+
+        // Update dialog overlay (rendered on top of everything, below close dialog).
+        if let Some(dialog) = &mut self.update_dialog {
             let mut resolve_glyph =
                 |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
             dialog.build_instances(
@@ -2735,6 +2820,10 @@ impl App {
         clippy::cast_precision_loss,
         reason = "viewport dimensions are small enough to fit in f32"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "click dispatch: gear, equalize, update button, tab close, tab drag, scrollbar, divider, selection"
+    )]
     fn handle_mouse_press(&mut self) {
         let Some((x, y)) = self.last_cursor_pos else { return };
         let Some(gpu) = &self.gpu else { return };
@@ -2758,6 +2847,12 @@ impl App {
                 self.request_redraw();
                 return;
             }
+        }
+
+        // Check for tab bar update button click (opens update confirmation dialog).
+        if self.tab_bar_update_targets.iter().any(|(_, rect)| rect.contains(x, y)) {
+            self.open_update_dialog();
+            return;
         }
 
         // Check for tab bar equalize click (equalize pane ratios in that workspace).
@@ -3979,6 +4074,100 @@ impl App {
         self.request_redraw();
     }
 
+    // -------------------------------------------------------------------
+    // Update dialog input handlers
+    // -------------------------------------------------------------------
+
+    /// Open the update confirmation dialog.
+    fn open_update_dialog(&mut self) {
+        if self.update_dialog.is_some() {
+            return;
+        }
+        let Some((version, release_url)) = self.update_available.clone() else { return };
+        self.update_dialog = Some(update_dialog::UpdateDialog::new(version, release_url));
+        self.request_redraw();
+    }
+
+    /// Process an [`update_dialog::UpdateAction`] from the in-app update dialog.
+    fn handle_update_action(&mut self, action: update_dialog::UpdateAction) {
+        self.update_dialog = None;
+        match action {
+            update_dialog::UpdateAction::Confirm => {
+                tracing::info!("user confirmed update");
+                self.update_available = None;
+                if let Some(tx) = &self.cmd_tx {
+                    send_command(tx, ClientCommand::TriggerUpdate);
+                }
+            }
+            update_dialog::UpdateAction::Dismiss => {
+                tracing::info!("user dismissed update");
+                self.update_available = None;
+                self.update_progress = None;
+                if let Some(tx) = &self.cmd_tx {
+                    send_command(tx, ClientCommand::DismissUpdate);
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Handle keyboard input while the update dialog is active.
+    fn handle_update_dialog_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        use winit::keyboard::{Key, NamedKey};
+
+        if event.state != winit::event::ElementState::Pressed {
+            return;
+        }
+
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                let action = update_dialog::UpdateAction::Dismiss;
+                self.handle_update_action(action);
+            }
+            Key::Named(NamedKey::Enter) => {
+                let action = self.update_dialog.as_ref().map_or(
+                    update_dialog::UpdateAction::Dismiss,
+                    update_dialog::UpdateDialog::confirm,
+                );
+                self.handle_update_action(action);
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.cycle_update_dialog_focus();
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle mouse click while the update dialog is active.
+    fn handle_update_dialog_click(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        let action = self.update_dialog.as_ref().and_then(|d| d.click(x, y));
+        if let Some(action) = action {
+            self.handle_update_action(action);
+        }
+    }
+
+    /// Handle mouse hover while the update dialog is active.
+    fn handle_update_dialog_hover(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        if let Some(dialog) = &mut self.update_dialog {
+            if dialog.update_hover(x, y) {
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Cycle update dialog button focus (Tab / Shift+Tab).
+    fn cycle_update_dialog_focus(&mut self) {
+        let Some(dialog) = &mut self.update_dialog else { return };
+        if self.modifiers.shift_key() {
+            dialog.focus_prev();
+        } else {
+            dialog.focus_next();
+        }
+        self.request_redraw();
+    }
+
     /// Handle `QuitRequested` from the server — save state and close.
     ///
     /// Does NOT re-broadcast `QuitAll`: only the originating window
@@ -4130,6 +4319,9 @@ type TabHitTargets = Vec<(WorkspaceId, usize, layout::Rect)>;
 /// `(workspace_id, equalize_rect)` for tab bar equalize button click handling.
 type TabEqualizeTargets = Vec<(WorkspaceId, layout::Rect)>;
 
+/// `(workspace_id, update_rect)` for tab bar update button click handling.
+type TabUpdateTargets = Vec<(WorkspaceId, layout::Rect)>;
+
 /// Layout and focus state passed to [`build_all_instances`].
 struct FrameLayout<'a> {
     pane_rects: &'a [(PaneId, Rect)],
@@ -4161,6 +4353,10 @@ struct FrameInteraction<'a> {
     hovered_tab_close: Option<(WorkspaceId, usize)>,
     tab_drag: Option<&'a TabDrag>,
     tab_drag_offsets: &'a [f32],
+    /// Version string of available update. `None` when no update available.
+    update_available: Option<&'a str>,
+    /// Current update progress state. `None` when idle.
+    update_progress: Option<&'a UpdateProgressState>,
 }
 
 #[allow(
@@ -4187,7 +4383,13 @@ fn build_all_instances(
     layout: &FrameLayout<'_>,
     style: &FrameStyle<'_>,
     interaction: &FrameInteraction<'_>,
-) -> (Vec<scribe_renderer::types::CellInstance>, TabHitTargets, TabHitTargets, TabEqualizeTargets) {
+) -> (
+    Vec<scribe_renderer::types::CellInstance>,
+    TabHitTargets,
+    TabHitTargets,
+    TabEqualizeTargets,
+    TabUpdateTargets,
+) {
     // Build a workspace-id → tab_bar_height lookup for per-pane height queries.
     let ws_tab_bar_heights: HashMap<WorkspaceId, f32> =
         layout.ws_tab_bar_data.iter().map(|d| (d.ws_id, d.tab_bar_height)).collect();
@@ -4290,6 +4492,7 @@ fn build_all_instances(
     let mut tab_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)> = Vec::new();
     let mut tab_close_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)> = Vec::new();
     let mut tab_equalize_targets: TabEqualizeTargets = Vec::new();
+    let mut tab_update_targets: TabUpdateTargets = Vec::new();
     for ws_data in layout.ws_tab_bar_data {
         let tbh = ws_data.tab_bar_height;
         let tab_bar_rect = layout::Rect {
@@ -4323,6 +4526,8 @@ fn build_all_instances(
             tab_bar_height: tbh,
             indicator_height: style.indicator_height,
             tab_width: interaction.tab_width,
+            update_available: interaction.update_available,
+            update_progress: interaction.update_progress,
             hovered_tab_close: ws_hovered_close,
             tab_offsets: ws_tab_offsets,
             dragging_tab: ws_dragging_tab,
@@ -4340,6 +4545,9 @@ fn build_all_instances(
         }
         if let Some(eq_rect) = hit_targets.equalize_rect {
             tab_equalize_targets.push((ws_data.ws_id, eq_rect));
+        }
+        if let Some(upd_rect) = hit_targets.update_rect {
+            tab_update_targets.push((ws_data.ws_id, upd_rect));
         }
     }
 
@@ -4400,7 +4608,13 @@ fn build_all_instances(
         }
     }
 
-    (all_instances, tab_hit_targets, tab_close_hit_targets, tab_equalize_targets)
+    (
+        all_instances,
+        tab_hit_targets,
+        tab_close_hit_targets,
+        tab_equalize_targets,
+        tab_update_targets,
+    )
 }
 
 /// Emit one solid-colour quad covering a pane's full content area.

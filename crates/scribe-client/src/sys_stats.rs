@@ -214,18 +214,40 @@ fn read_gpu_percent_linux() -> Option<f32> {
 }
 
 #[cfg(target_os = "linux")]
+fn drm_cards() -> impl Iterator<Item = std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+        return vec![].into_iter();
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.file_name())
+        .filter(|name| {
+            let s = name.to_string_lossy();
+            // Match bare `card0`, `card1`, … but not `card0-DP-1` connector entries.
+            s.starts_with("card") && s.len() > 4 && s.chars().skip(4).all(|c| c.is_ascii_digit())
+        })
+        .map(|name| std::path::Path::new("/sys/class/drm").join(name))
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+#[cfg(target_os = "linux")]
 fn read_amd_gpu() -> Option<f32> {
-    let raw = std::fs::read_to_string("/sys/class/drm/card0/device/gpu_busy_percent").ok()?;
-    parse_percent(raw.trim())
+    drm_cards().find_map(|card| {
+        let path = card.join("device/gpu_busy_percent");
+        let raw = std::fs::read_to_string(path).ok()?;
+        parse_percent(raw.trim())
+    })
 }
 
 #[cfg(target_os = "linux")]
 fn read_nvidia_gpu() -> Option<f32> {
-    let sysfs = std::fs::read_to_string("/sys/class/drm/card0/device/nvidia/gpuutil");
-    if let Ok(raw) = sysfs {
-        return parse_percent(raw.trim());
-    }
-    read_nvidia_smi()
+    let sysfs_result = drm_cards().find_map(|card| {
+        let path = card.join("device/nvidia/gpuutil");
+        let raw = std::fs::read_to_string(path).ok()?;
+        parse_percent(raw.trim())
+    });
+    sysfs_result.or_else(read_nvidia_smi)
 }
 
 #[cfg(target_os = "linux")]
@@ -238,7 +260,8 @@ fn read_nvidia_smi() -> Option<f32> {
         return None;
     }
     let stdout = String::from_utf8(output.stdout).ok()?;
-    parse_percent(stdout.trim())
+    let first_line = stdout.lines().next()?;
+    parse_percent(first_line.trim())
 }
 
 /// Parse a decimal string into a clamped 0–100 f32 percentage.

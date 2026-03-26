@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use scribe_common::ai_state::AiProcessState;
 use scribe_common::error::ScribeError;
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::screen::ScreenSnapshot;
@@ -77,6 +78,16 @@ pub struct HandoffSession {
     pub cols: u16,
     pub rows: u16,
     pub snapshot: Option<ScreenSnapshot>,
+    /// Last-known terminal title. `#[serde(default)]` for backward compat with
+    /// old servers that did not include this field.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Last-known working directory. `#[serde(default)]` for backward compat.
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    /// Last-known AI process state. `#[serde(default)]` for backward compat.
+    #[serde(default)]
+    pub ai_state: Option<AiProcessState>,
 }
 
 /// Per-workspace state transferred during handoff.

@@ -40,4 +40,12 @@ pub enum ScribeError {
         #[from]
         source: rmp_serde::decode::Error,
     },
+
+    /// Update check failed (network error, parse error, etc.).
+    #[error("update check failed: {reason}")]
+    UpdateCheckFailed { reason: String },
+
+    /// Update installation failed.
+    #[error("update install failed: {reason}")]
+    UpdateInstallFailed { reason: String },
 }

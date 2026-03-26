@@ -24,6 +24,7 @@ use scribe_pty::osc_interceptor::OscInterceptor;
 
 use crate::handoff::HandoffSession;
 use crate::session_manager::{ManagedSession, SessionManager, snapshot_term};
+use crate::updater::UpdaterHandle;
 use crate::workspace_manager::WorkspaceManager;
 
 /// Buffer size for PTY reads. 64 KiB balances throughput and latency.
@@ -93,6 +94,8 @@ pub struct LiveSession {
     title: String,
     /// Last-known working directory (OSC 7), persisted for reconnect.
     cwd: Option<std::path::PathBuf>,
+    /// Last-known AI process state (OSC 1337), persisted for reconnect.
+    ai_state: Option<scribe_common::ai_state::AiProcessState>,
     /// Keep the Pty alive so the child process isn't killed by SIGHUP on Drop.
     /// `None` for sessions restored from a hot-reload handoff. Taken and leaked
     /// by `defuse_for_handoff` during hot-reload to prevent SIGHUP.
@@ -103,12 +106,14 @@ pub struct LiveSession {
 }
 
 /// Start the IPC accept loop on an already-bound listener.
+#[allow(clippy::too_many_arguments, reason = "IPC server requires all server subsystems")]
 pub async fn start_ipc_server(
     listener: UnixListener,
     session_manager: Arc<SessionManager>,
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     live_sessions: LiveSessionRegistry,
     connected_clients: ConnectedClients,
+    updater_handle: Arc<UpdaterHandle>,
 ) -> Result<(), ScribeError> {
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
@@ -131,8 +136,9 @@ pub async fn start_ipc_server(
                 let wm = Arc::clone(&workspace_manager);
                 let ls = Arc::clone(&live_sessions);
                 let cc = Arc::clone(&connected_clients);
+                let uh = Arc::clone(&updater_handle);
                 tokio::spawn(async move {
-                    handle_client(stream, sm, wm, ls, cc).await;
+                    handle_client(stream, sm, wm, ls, cc, uh).await;
                     drop(permit);
                 });
             }
@@ -249,7 +255,8 @@ fn verify_peer_uid(stream: &tokio::net::UnixStream) -> bool {
 /// reads `ClientMessage`s and dispatches them.
 #[allow(
     clippy::cognitive_complexity,
-    reason = "connection handler with handshake + message loop is inherently complex"
+    clippy::too_many_arguments,
+    reason = "connection handler with handshake + message loop requires all server subsystems"
 )]
 async fn handle_client(
     stream: tokio::net::UnixStream,
@@ -257,6 +264,7 @@ async fn handle_client(
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     live_sessions: LiveSessionRegistry,
     connected_clients: ConnectedClients,
+    updater_handle: Arc<UpdaterHandle>,
 ) {
     let (reader, writer) = tokio::io::split(stream);
     let writer: SharedWriter = Arc::new(Mutex::new(writer));
@@ -305,6 +313,7 @@ async fn handle_client(
                 &mut attached_ids,
                 window_id,
                 &connected_clients,
+                &updater_handle,
             )
             .await;
             window_id
@@ -341,6 +350,7 @@ async fn handle_client(
             &mut attached_ids,
             window_id,
             &connected_clients,
+            &updater_handle,
         )
         .await;
     }
@@ -368,6 +378,7 @@ async fn detach_sessions(live_sessions: &LiveSessionRegistry, ids: &HashSet<Sess
 #[allow(
     clippy::too_many_arguments,
     clippy::cognitive_complexity,
+    clippy::too_many_lines,
     reason = "dispatch hub — all handler dependencies are passed through"
 )]
 async fn dispatch_message(
@@ -379,6 +390,7 @@ async fn dispatch_message(
     attached_ids: &mut HashSet<SessionId>,
     window_id: WindowId,
     connected_clients: &ConnectedClients,
+    updater_handle: &UpdaterHandle,
 ) {
     match msg {
         ClientMessage::CreateSession { workspace_id, split_direction, cwd } => {
@@ -448,6 +460,14 @@ async fn dispatch_message(
         }
         ClientMessage::QuitAll => {
             handle_quit_all(window_id, connected_clients).await;
+        }
+        ClientMessage::TriggerUpdate => {
+            info!(%window_id, "client triggered update");
+            updater_handle.trigger();
+        }
+        ClientMessage::DismissUpdate => {
+            info!(%window_id, "client dismissed update notification");
+            updater_handle.dismiss();
         }
         other => {
             debug!(?other, "unhandled client message");
@@ -556,6 +576,9 @@ async fn start_session(
     let osc_parser = session.osc_parser;
     let metadata_parser = session.metadata_parser;
     let metadata_rx = session.metadata_rx;
+    let title = session.title.unwrap_or_else(|| String::from("shell"));
+    let cwd = session.cwd;
+    let ai_state = session.ai_state;
 
     let (pty_read, pty_write) = tokio::io::split(session.pty_fd);
     let pty_write = Arc::new(Mutex::new(pty_write));
@@ -571,8 +594,9 @@ async fn start_session(
         child_pid,
         client_writer: Arc::clone(&client_writer),
         workspace_id,
-        title: String::from("shell"),
-        cwd: None,
+        title,
+        cwd,
+        ai_state,
         pty,
         handoff_snapshot,
     };
@@ -855,6 +879,7 @@ async fn handle_list_sessions(
                     workspace_id: s.workspace_id,
                     title: Some(s.title.clone()),
                     cwd: s.cwd.clone(),
+                    ai_state: s.ai_state.clone(),
                 })
             })
             .collect()
@@ -869,6 +894,7 @@ async fn handle_list_sessions(
                 workspace_id: s.workspace_id,
                 title: Some(s.title.clone()),
                 cwd: s.cwd.clone(),
+                ai_state: s.ai_state.clone(),
             })
             .collect()
     };
@@ -932,6 +958,7 @@ struct AttachEntry {
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     title: String,
     cwd: Option<std::path::PathBuf>,
+    ai_state: Option<scribe_common::ai_state::AiProcessState>,
 }
 
 /// Handle `AttachSessions` — take ownership of detached sessions, set the
@@ -956,6 +983,7 @@ async fn handle_attach_sessions(
                 term: Arc::clone(&session.term),
                 title: session.title.clone(),
                 cwd: session.cwd.clone(),
+                ai_state: session.ai_state.clone(),
             });
         } else {
             warn!(%session_id, "AttachSessions: session not found");
@@ -994,7 +1022,14 @@ async fn attach_one_session(
     send_message(writer, &creation_msg).await;
 
     // Send stored metadata so tabs display correctly on reconnect.
-    send_stored_metadata(writer, session_id, &entry.title, entry.cwd.as_ref()).await;
+    send_stored_metadata(
+        writer,
+        session_id,
+        &entry.title,
+        entry.cwd.as_ref(),
+        entry.ai_state.as_ref(),
+    )
+    .await;
 
     // Send workspace info.
     {
@@ -1035,12 +1070,13 @@ async fn attach_one_session(
     info!(%session_id, "session attached to new client");
 }
 
-/// Send stored title, CWD, and git branch metadata for a reattached session.
+/// Send stored title, CWD, git branch, and AI state metadata for a reattached session.
 async fn send_stored_metadata(
     writer: &SharedWriter,
     session_id: SessionId,
     title: &str,
     cwd: Option<&std::path::PathBuf>,
+    ai_state: Option<&scribe_common::ai_state::AiProcessState>,
 ) {
     if title != "shell" {
         let title_msg = ServerMessage::TitleChanged { session_id, title: title.to_owned() };
@@ -1052,6 +1088,10 @@ async fn send_stored_metadata(
         let branch = detect_git_branch(cwd);
         let git_msg = ServerMessage::GitBranch { session_id, branch };
         send_message(writer, &git_msg).await;
+    }
+    if let Some(ai) = ai_state {
+        let ai_msg = ServerMessage::AiStateChanged { session_id, ai_state: ai.clone() };
+        send_message(writer, &ai_msg).await;
     }
 }
 
@@ -1440,6 +1480,37 @@ fn detect_git_branch(cwd: &Path) -> Option<String> {
     }
 }
 
+/// Persist metadata from a `ServerMessage` into the live session registry.
+async fn persist_session_metadata(
+    server_msg: &ServerMessage,
+    session_id: SessionId,
+    live_sessions: &LiveSessionRegistry,
+) {
+    match server_msg {
+        ServerMessage::TitleChanged { title, .. } => {
+            if let Some(session) = live_sessions.write().await.get_mut(&session_id) {
+                title.clone_into(&mut session.title);
+            }
+        }
+        ServerMessage::CwdChanged { cwd, .. } => {
+            if let Some(session) = live_sessions.write().await.get_mut(&session_id) {
+                session.cwd = Some(cwd.clone());
+            }
+        }
+        ServerMessage::AiStateChanged { ai_state, .. } => {
+            if let Some(session) = live_sessions.write().await.get_mut(&session_id) {
+                session.ai_state = Some(ai_state.clone());
+            }
+        }
+        ServerMessage::AiStateCleared { .. } => {
+            if let Some(session) = live_sessions.write().await.get_mut(&session_id) {
+                session.ai_state = None;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Convert a `MetadataEvent` to a `ServerMessage` and send it.
 /// For `CwdChanged`, also notifies the workspace manager and sends git branch.
 /// Workspace naming always runs (even when detached) so names are ready on
@@ -1453,20 +1524,7 @@ async fn send_metadata_event(
 ) {
     let (server_msg, cwd_for_workspace) = convert_metadata_event(event, session_id);
 
-    // Persist title/cwd in the live session for reconnect.
-    match &server_msg {
-        ServerMessage::TitleChanged { title, .. } => {
-            if let Some(session) = live_sessions.write().await.get_mut(&session_id) {
-                title.clone_into(&mut session.title);
-            }
-        }
-        ServerMessage::CwdChanged { cwd, .. } => {
-            if let Some(session) = live_sessions.write().await.get_mut(&session_id) {
-                session.cwd = Some(cwd.clone());
-            }
-        }
-        _ => {}
-    }
+    persist_session_metadata(&server_msg, session_id, live_sessions).await;
 
     send_to_client(client_writer, &server_msg).await;
 
@@ -1550,6 +1608,9 @@ pub async fn serialize_live_for_handoff(
             cols,
             rows,
             snapshot,
+            title: Some(live.title.clone()),
+            cwd: live.cwd.clone(),
+            ai_state: live.ai_state.clone(),
         });
 
         fds.push(live.pty_raw_fd);

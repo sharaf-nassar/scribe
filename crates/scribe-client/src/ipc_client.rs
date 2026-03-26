@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use scribe_common::ai_state::AiProcessState;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
-use scribe_common::protocol::{ClientMessage, ServerMessage};
+use scribe_common::protocol::{ClientMessage, ServerMessage, UpdateProgressState};
 use scribe_common::socket::server_socket_path;
 use tokio::io::AsyncWriteExt as _;
 use winit::event_loop::EventLoopProxy;
@@ -49,6 +49,10 @@ pub enum ClientCommand {
     CloseWindow { window_id: WindowId },
     /// Request all clients to save state and quit.
     QuitAll,
+    /// User confirmed update — download and install.
+    TriggerUpdate,
+    /// User dismissed update notification.
+    DismissUpdate,
 }
 
 /// Events forwarded from the IPC background thread to the winit event loop.
@@ -108,6 +112,10 @@ pub enum UiEvent {
     Welcome { window_id: WindowId, other_windows: Vec<WindowId> },
     /// Server requested us to save state and quit (another client sent `QuitAll`).
     QuitRequested,
+    /// Server found an available update.
+    UpdateAvailable { version: String, release_url: String },
+    /// Update progress changed.
+    UpdateProgress { state: UpdateProgressState },
 }
 
 /// Start the IPC client on a background thread.
@@ -213,6 +221,13 @@ async fn run_read_task(
                 tracing::info!("received QuitRequested from server");
                 send_event(&proxy, UiEvent::QuitRequested);
             }
+            Ok(ServerMessage::UpdateAvailable { version, release_url }) => {
+                tracing::info!(%version, "update available");
+                send_event(&proxy, UiEvent::UpdateAvailable { version, release_url });
+            }
+            Ok(ServerMessage::UpdateProgress { state }) => {
+                send_event(&proxy, UiEvent::UpdateProgress { state });
+            }
             Ok(other) => {
                 tracing::debug!(?other, "unhandled server message");
             }
@@ -283,6 +298,8 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         ClientCommand::Hello { window_id } => ClientMessage::Hello { window_id },
         ClientCommand::CloseWindow { window_id } => ClientMessage::CloseWindow { window_id },
         ClientCommand::QuitAll => ClientMessage::QuitAll,
+        ClientCommand::TriggerUpdate => ClientMessage::TriggerUpdate,
+        ClientCommand::DismissUpdate => ClientMessage::DismissUpdate,
     }
 }
 

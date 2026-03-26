@@ -12,6 +12,7 @@ mod config;
 mod handoff;
 mod ipc_server;
 mod session_manager;
+mod updater;
 mod workspace_manager;
 
 #[cfg(test)]
@@ -125,6 +126,10 @@ async fn run_server_loop(
     ipc_server::activate_pending_sessions(&session_manager, &workspace_manager, &live_sessions)
         .await;
 
+    // Spawn the background updater. The handle is passed into the IPC server
+    // so that TriggerUpdate / DismissUpdate messages can reach it.
+    let updater_handle = Arc::new(updater::spawn_updater(Arc::clone(&connected_clients)));
+
     let handoff_triggered = tokio::select! {
         result = ipc_server::start_ipc_server(
             listener,
@@ -132,6 +137,7 @@ async fn run_server_loop(
             Arc::clone(&workspace_manager),
             Arc::clone(&live_sessions),
             Arc::clone(&connected_clients),
+            Arc::clone(&updater_handle),
         ) => {
             result?;
             false

@@ -62,6 +62,9 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
             cols: 80,
             rows: 24,
             snapshot: Some(dummy_snapshot(80, 24)),
+            title: None,
+            cwd: None,
+            ai_state: None,
         });
         masters.push(pty.master);
         slaves.push(pty.slave);
