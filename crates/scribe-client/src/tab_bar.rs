@@ -198,6 +198,16 @@ pub struct TabBarTextParams<'a> {
     pub tab_width: u16,
     /// Which tab's close button is shown (hovered). `None` = no hover.
     pub hovered_tab_close: Option<usize>,
+    /// Per-tab pixel X offsets for slide animation. Empty slice when no drag active.
+    pub tab_offsets: &'a [f32],
+    /// Index of the tab being dragged, if any.
+    pub dragging_tab: Option<usize>,
+    /// Current cursor X position during drag.
+    pub drag_cursor_x: f32,
+    /// Grab offset (cursor X minus tab left edge at drag start).
+    pub drag_grab_offset: f32,
+    /// Accent color for the drag underline.
+    pub accent_color: [f32; 4],
 }
 
 /// Clickable regions produced by [`build_tab_bar_text`].
@@ -321,7 +331,11 @@ fn render_badge(
 )]
 #[allow(
     clippy::too_many_lines,
-    reason = "multi-row fixed-width tab rendering with hit targets and AI indicators"
+    reason = "multi-row fixed-width tab rendering with hit targets, AI indicators, and drag offsets"
+)]
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "multi-row fixed-width tab rendering with hit targets, AI indicators, and drag offsets"
 )]
 fn render_tabs(
     instances: &mut Vec<CellInstance>,
@@ -396,6 +410,10 @@ fn render_tabs(
             t
         };
 
+        // Record the instance index before emitting this tab's quads so we can
+        // retroactively apply the slide offset to all of them.
+        let tab_start_instance = instances.len();
+
         // Emit: leading space + title + (close " ×" or trailing space).
         col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
         for &ch in &display_title {
@@ -429,6 +447,7 @@ fn render_tabs(
             Rect { x: close_x, y: row_base_y, width: 2.0 * cell_w, height: row_height },
         ));
 
+        // Hit targets use logical (un-offset) positions for reliable reorder detection.
         hit_targets.tab_rects.push((
             tab_idx,
             Rect { x: tab_x, y: row_base_y, width: tab_width_px, height: row_height },
@@ -446,6 +465,42 @@ fn render_tabs(
                 params.indicator_height,
             );
         }
+
+        // Compute slide/drag offset for this tab.
+        // tab_x is the logical (un-offset) left edge of this tab.
+        let tab_offset = if params.dragging_tab == Some(tab_idx) {
+            // Dragged tab follows cursor: shift so its left edge tracks the cursor.
+            params.drag_cursor_x - params.drag_grab_offset - tab_x
+        } else {
+            params.tab_offsets.get(tab_idx).copied().unwrap_or(0.0)
+        };
+
+        // Apply offset to all instances emitted for this tab.
+        if tab_offset != 0.0 {
+            apply_x_offset(instances, tab_start_instance, tab_offset);
+        }
+
+        // Render accent underline at bottom of dragged tab.
+        if params.dragging_tab == Some(tab_idx) {
+            let underline_height = 2.0;
+            let underline_y = row_base_y + row_height - underline_height;
+            let visual_x = tab_x + tab_offset;
+            for bar_col in 0..tab_w {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "column index is a small positive integer fitting in f32"
+                )]
+                let bx = visual_x + bar_col as f32 * cell_w;
+                instances.push(CellInstance {
+                    pos: [bx, underline_y],
+                    size: [cell_w, underline_height],
+                    uv_min: [0.0, 0.0],
+                    uv_max: [0.0, 0.0],
+                    fg_color: params.accent_color,
+                    bg_color: params.accent_color,
+                });
+            }
+        }
     }
 
     // Restore original params.
@@ -454,6 +509,16 @@ fn render_tabs(
 
     // Return row 0 end column so gear/equalize render correctly in row 0.
     row0_end_col
+}
+
+/// Shift all instances from `start_idx` onward by `dx` pixels along the X axis.
+fn apply_x_offset(instances: &mut [CellInstance], start_idx: usize, dx: f32) {
+    let end = instances.len();
+    for idx in start_idx..end {
+        if let Some(inst) = instances.get_mut(idx) {
+            inst.pos[0] += dx;
+        }
+    }
 }
 
 /// Render a thin coloured indicator bar above a tab (at the top of the tab bar).

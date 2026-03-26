@@ -10,6 +10,7 @@ use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::{LayoutDirection, WorkspaceTreeNode};
 
 use crate::layout::{LayoutTree, PaneId, Rect, SplitDirection};
+use crate::selection::SelectionRange;
 
 /// Fallback accent colour for new workspaces when no theme is available.
 const FALLBACK_ACCENT: [f32; 4] = [0.0, 0.8, 0.7, 1.0];
@@ -54,6 +55,7 @@ pub struct TabState {
     pub session_id: SessionId,
     pub pane_layout: LayoutTree,
     pub focused_pane: PaneId,
+    pub selection: Option<SelectionRange>,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +137,14 @@ impl WindowLayout {
         self.focused_workspace_mut().and_then(WorkspaceSlot::active_tab_mut)
     }
 
+    /// Return a mutable reference to the active tab of a specific workspace.
+    pub fn active_tab_for_workspace_mut(
+        &mut self,
+        workspace_id: WorkspaceId,
+    ) -> Option<&mut TabState> {
+        self.find_workspace_mut(workspace_id).and_then(WorkspaceSlot::active_tab_mut)
+    }
+
     /// Add a tab to the specified workspace.
     ///
     /// Returns the [`PaneId`] of the new tab's initial pane, or `None` if the
@@ -144,7 +154,7 @@ impl WindowLayout {
         let layout = LayoutTree::new();
         let focused_pane = layout.initial_pane_id();
         let pane_id = focused_pane;
-        ws.tabs.push(TabState { session_id, pane_layout: layout, focused_pane });
+        ws.tabs.push(TabState { session_id, pane_layout: layout, focused_pane, selection: None });
         ws.active_tab = ws.tabs.len().saturating_sub(1);
         Some(pane_id)
     }

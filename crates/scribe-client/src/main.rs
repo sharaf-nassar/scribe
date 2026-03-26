@@ -69,7 +69,7 @@ enum ScrollbarAction {
 struct TabDrag {
     /// Workspace the dragged tab belongs to.
     workspace_id: WorkspaceId,
-    /// Original tab index of the dragged tab.
+    /// Current tab index of the dragged tab (updated on live reorder).
     tab_index: usize,
     /// Cursor X at drag start (used for threshold detection).
     start_x: f32,
@@ -81,6 +81,8 @@ struct TabDrag {
     cursor_y: f32,
     /// `true` once the cursor has moved more than 5 px from the start.
     dragging: bool,
+    /// Cursor X minus tab left edge at drag start; keeps the tab under the cursor.
+    grab_offset_x: f32,
 }
 
 /// Application state for the winit event loop.
@@ -222,6 +224,8 @@ struct App {
     hovered_tab_close: Option<(WorkspaceId, usize)>,
     /// Active tab drag state for reordering.
     tab_drag: Option<TabDrag>,
+    /// Per-tab pixel X offsets for the slide animation on the drag workspace.
+    tab_drag_offsets: Vec<f32>,
     /// Clickable equalize rects from tab bars `(workspace_id, rect)` (updated each frame).
     tab_bar_equalize_targets: Vec<(WorkspaceId, layout::Rect)>,
     /// Clickable rect for the status bar gear icon (updated each frame).
@@ -246,6 +250,10 @@ struct App {
 }
 
 impl App {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "App::new initialises all fields; splitting adds no clarity"
+    )]
     fn new(
         wgpu_instance: wgpu::Instance,
         proxy: EventLoopProxy<UiEvent>,
@@ -327,6 +335,7 @@ impl App {
             tab_close_hit_targets: Vec::new(),
             hovered_tab_close: None,
             tab_drag: None,
+            tab_drag_offsets: Vec::new(),
             tab_bar_equalize_targets: Vec::new(),
             status_bar_gear_rect: None,
             status_bar_equalize_rect: None,
@@ -741,6 +750,11 @@ impl App {
         let session_ids: Vec<SessionId> = sessions.iter().map(|s| s.session_id).collect();
         send_command(&tx, ClientCommand::AttachSessions { session_ids: session_ids.clone() });
 
+        // Build a metadata lookup so panes can be initialised with the
+        // last-known title and CWD instead of defaulting to "shell".
+        let metadata: HashMap<SessionId, (Option<&str>, Option<&std::path::PathBuf>)> =
+            sessions.iter().map(|s| (s.session_id, (s.title.as_deref(), s.cwd.as_ref()))).collect();
+
         // -- Group sessions by workspace ------------------------------------
         let mut groups: HashMap<WorkspaceId, Vec<SessionId>> = HashMap::new();
         for info in sessions {
@@ -771,7 +785,9 @@ impl App {
         };
         let Some((_geo_id, pane_rect, grid)) = self.first_pane_geometry() else { return };
 
-        let first_pane = Pane::new(pane_rect, grid, first_sid, first_ws, PaneEdges::all_external());
+        let mut first_pane =
+            Pane::new(pane_rect, grid, first_sid, first_ws, PaneEdges::all_external());
+        apply_session_metadata(&mut first_pane, &metadata);
         self.panes.insert(first_pane_id, first_pane);
         self.url_caches.insert(first_pane_id, url_detect::PaneUrlCache::new());
         self.session_to_pane.insert(first_sid, first_pane_id);
@@ -792,7 +808,8 @@ impl App {
             let Some(pane_id) = self.window_layout.add_tab(ws_id, sid) else {
                 continue;
             };
-            let pane = Pane::new(pane_rect, grid, sid, ws_id, PaneEdges::all_external());
+            let mut pane = Pane::new(pane_rect, grid, sid, ws_id, PaneEdges::all_external());
+            apply_session_metadata(&mut pane, &metadata);
             self.panes.insert(pane_id, pane);
             self.url_caches.insert(pane_id, url_detect::PaneUrlCache::new());
             self.session_to_pane.insert(sid, pane_id);
@@ -1102,7 +1119,35 @@ impl App {
             }
         }
 
-        if !self.ai_tracker.needs_animation() && !scrollbar_animating {
+        // Tick tab slide offsets — exponential decay toward zero.
+        let dragging_tab_idx = self.tab_drag.as_ref().filter(|d| d.dragging).map(|d| d.tab_index);
+        let mut tab_animating = false;
+        for (i, offset) in self.tab_drag_offsets.iter_mut().enumerate() {
+            if Some(i) == dragging_tab_idx {
+                // Dragged tab is cursor-driven, not decayed.
+                continue;
+            }
+            if *offset == 0.0 {
+                continue;
+            }
+            *offset *= (1.0 - 10.0 * dt).max(0.0);
+            if offset.abs() < 0.5 {
+                *offset = 0.0;
+            }
+            if *offset != 0.0 {
+                tab_animating = true;
+            }
+        }
+        if !tab_animating && self.tab_drag.is_none() {
+            self.tab_drag_offsets.clear();
+        }
+
+        let drag_active = self.tab_drag.as_ref().is_some_and(|d| d.dragging);
+        if !self.ai_tracker.needs_animation()
+            && !scrollbar_animating
+            && !tab_animating
+            && !drag_active
+        {
             self.animation_running = false;
             // Timer thread will see the flag and stop.
         }
@@ -1625,6 +1670,8 @@ impl App {
             self.active_selection.as_ref(),
             self.hovered_tab_close,
             &self.config.appearance.content_padding,
+            self.tab_drag.as_ref(),
+            &self.tab_drag_offsets,
         );
         self.tab_hit_targets = tab_hits;
         self.tab_close_hit_targets = tab_close_hits;
@@ -2233,11 +2280,37 @@ impl App {
         self.request_redraw();
     }
 
+    /// Switch the active tab in a workspace, saving and restoring per-tab
+    /// selection state. Returns `true` if the active tab actually changed.
+    fn switch_active_tab(&mut self, workspace_id: WorkspaceId, new_index: usize) -> bool {
+        // Save current selection to outgoing tab.
+        if let Some(tab) = self.window_layout.active_tab_for_workspace_mut(workspace_id) {
+            tab.selection = self.active_selection.take();
+        }
+        // Clear transient drag state.
+        self.mouse_selecting = false;
+        self.word_drag_anchor = None;
+        // Perform the switch.
+        let changed = self.window_layout.set_active_tab(workspace_id, new_index);
+        if changed {
+            // Restore selection from incoming tab.
+            if let Some(tab) = self.window_layout.active_tab_for_workspace_mut(workspace_id) {
+                self.active_selection = tab.selection.take();
+            }
+        } else {
+            // Switch didn't happen — restore selection to original tab.
+            if let Some(tab) = self.window_layout.active_tab_for_workspace_mut(workspace_id) {
+                tab.selection = self.active_selection;
+            }
+        }
+        changed
+    }
+
     fn handle_next_tab(&mut self) {
         let ws_id = self.window_layout.focused_workspace_id();
         let Some(ws) = self.window_layout.focused_workspace() else { return };
         let next_idx = ws.next_tab_index();
-        if self.window_layout.set_active_tab(ws_id, next_idx) {
+        if self.switch_active_tab(ws_id, next_idx) {
             self.request_redraw();
         }
     }
@@ -2246,14 +2319,14 @@ impl App {
         let ws_id = self.window_layout.focused_workspace_id();
         let Some(ws) = self.window_layout.focused_workspace() else { return };
         let prev_idx = ws.prev_tab_index();
-        if self.window_layout.set_active_tab(ws_id, prev_idx) {
+        if self.switch_active_tab(ws_id, prev_idx) {
             self.request_redraw();
         }
     }
 
     fn handle_select_tab(&mut self, index: usize) {
         let ws_id = self.window_layout.focused_workspace_id();
-        if self.window_layout.set_active_tab(ws_id, index) {
+        if self.switch_active_tab(ws_id, index) {
             self.request_redraw();
         }
     }
@@ -2659,6 +2732,7 @@ impl App {
                 cursor_x: x,
                 cursor_y: y,
                 dragging: false,
+                grab_offset_x: 0.0,
             });
             return;
         }
@@ -3367,45 +3441,117 @@ impl App {
 
     /// Update the in-progress tab drag position and threshold.
     fn update_tab_drag(&mut self, x: f32, y: f32) {
-        let Some(drag) = self.tab_drag.as_mut() else { return };
-        drag.cursor_x = x;
-        drag.cursor_y = y;
-        if !drag.dragging {
-            let dx = x - drag.start_x;
-            let dy = y - drag.start_y;
-            drag.dragging = dx * dx + dy * dy > 25.0;
+        let (was_dragging, now_dragging, ws_id, tab_idx) = {
+            let Some(drag) = self.tab_drag.as_mut() else { return };
+            drag.cursor_x = x;
+            drag.cursor_y = y;
+            let was = drag.dragging;
+            if !drag.dragging {
+                let dx = x - drag.start_x;
+                let dy = y - drag.start_y;
+                drag.dragging = dx * dx + dy * dy > 25.0;
+            }
+            (was, drag.dragging, drag.workspace_id, drag.tab_index)
+        };
+        // On threshold first exceeded: compute grab offset, init offsets, set cursor.
+        if !was_dragging && now_dragging {
+            // Find the hit rect for this tab to compute grab offset.
+            let tab_left = self
+                .tab_hit_targets
+                .iter()
+                .find_map(|(w, i, r)| (*w == ws_id && *i == tab_idx).then_some(r.x))
+                .unwrap_or(x);
+            if let Some(state) = self.tab_drag.as_mut() {
+                state.grab_offset_x = x - tab_left;
+            }
+            let tab_count = self
+                .window_layout
+                .find_workspace(ws_id)
+                .map_or(0, workspace_layout::WorkspaceSlot::tab_count);
+            self.tab_drag_offsets = vec![0.0; tab_count];
+            if let Some(window) = &self.window {
+                window.set_cursor(winit::window::CursorIcon::Grabbing);
+            }
         }
-        if drag.dragging {
+        if now_dragging {
+            self.try_live_reorder_tab();
             self.request_redraw();
         }
     }
 
-    /// Complete the tab drag on mouse release: reorder or switch tab.
+    /// Live-reorder the dragged tab as the cursor crosses tab boundaries.
+    fn try_live_reorder_tab(&mut self) {
+        let (ws_id, from, cursor_x, cursor_y) = {
+            let Some(drag) = &self.tab_drag else { return };
+            if !drag.dragging {
+                return;
+            }
+            (drag.workspace_id, drag.tab_index, drag.cursor_x, drag.cursor_y)
+        };
+
+        let to = self.tab_hit_targets.iter().find_map(|(ws, idx, rect)| {
+            (*ws == ws_id && rect.contains(cursor_x, cursor_y)).then_some(*idx)
+        });
+        let Some(to) = to else { return };
+        if from == to {
+            return;
+        }
+
+        let cell_w = self.gpu.as_ref().map_or(0.0, |g| g.renderer.cell_size().width);
+        let tab_w_px = f32::from(self.config.appearance.tab_width) * cell_w;
+
+        if let Some(ws) = self.window_layout.find_workspace_mut(ws_id) {
+            ws.reorder_tab(from, to);
+        }
+
+        // Rearrange offsets Vec to follow the reordered tab.
+        if let Some(dragged_offset) = self.tab_drag_offsets.get(from).copied() {
+            self.tab_drag_offsets.remove(from);
+            let insert_at = to.min(self.tab_drag_offsets.len());
+            self.tab_drag_offsets.insert(insert_at, dragged_offset);
+        }
+
+        // Give displaced tabs a starting offset so they animate to their new slot.
+        displace_tab_offsets(&mut self.tab_drag_offsets, from, to, tab_w_px);
+
+        if let Some(drag) = self.tab_drag.as_mut() {
+            drag.tab_index = to;
+        }
+
+        self.ensure_animation_running();
+    }
+
+    /// Complete the tab drag on mouse release: set release animation offset or switch tab.
     fn finish_tab_drag(&mut self) {
         let Some(drag) = self.tab_drag.take() else { return };
         if drag.dragging {
-            self.finish_tab_drag_reorder(&drag);
+            self.apply_release_offset(&drag);
+            self.ensure_animation_running();
+            self.window_layout.set_focused_workspace(drag.workspace_id);
         } else {
             // No drag threshold reached — treat as a plain tab click.
-            if self.window_layout.set_active_tab(drag.workspace_id, drag.tab_index) {
+            if self.switch_active_tab(drag.workspace_id, drag.tab_index) {
                 self.window_layout.set_focused_workspace(drag.workspace_id);
-                self.request_redraw();
             }
         }
+        if let Some(window) = &self.window {
+            window.set_cursor(winit::window::CursorIcon::Default);
+        }
+        self.request_redraw();
     }
 
-    /// Apply the drag reorder when the drag threshold was exceeded.
-    fn finish_tab_drag_reorder(&mut self, drag: &TabDrag) {
-        let drop_idx = self.tab_hit_targets.iter().find_map(|(ws_id, idx, rect)| {
-            (*ws_id == drag.workspace_id && rect.contains(drag.cursor_x, drag.cursor_y))
-                .then_some(*idx)
-        });
-        let Some(to) = drop_idx else { return };
-        if let Some(ws) = self.window_layout.find_workspace_mut(drag.workspace_id) {
-            ws.reorder_tab(drag.tab_index, to);
+    /// Set the release animation offset for the dragged tab after drop.
+    fn apply_release_offset(&mut self, drag: &TabDrag) {
+        let release_offset = self
+            .tab_hit_targets
+            .iter()
+            .find(|(ws, idx, _)| *ws == drag.workspace_id && *idx == drag.tab_index)
+            .map(|(_, _, rect)| drag.cursor_x - drag.grab_offset_x - rect.x);
+        if let Some(offset_val) = release_offset {
+            if let Some(offset) = self.tab_drag_offsets.get_mut(drag.tab_index) {
+                *offset = offset_val;
+            }
         }
-        self.window_layout.set_focused_workspace(drag.workspace_id);
-        self.request_redraw();
     }
 
     /// Convert a pixel position to an absolute grid cell in the focused pane.
@@ -3448,6 +3594,30 @@ impl App {
         let pane_rects = tab.pane_layout.compute_rects(ws_rect);
         let (_, rect, _) = pane_rects.iter().find(|(pid, _, _)| *pid == tab.focused_pane)?;
         Some(*rect)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tab drag helpers
+// ---------------------------------------------------------------------------
+
+/// Adjust per-tab slide offsets when a drag reorders tabs from `from` to `to`.
+///
+/// Tabs that are displaced by the reorder receive an initial offset so they
+/// appear to start at their old position and then animate back to their new
+/// logical position via exponential decay.
+fn displace_tab_offsets(offsets: &mut [f32], from: usize, to: usize, tab_w_px: f32) {
+    if from < to {
+        // Dragged right: tabs in [from, to) are pushed one slot left.
+        for offset in offsets.get_mut(from..to).unwrap_or(&mut []) {
+            *offset += tab_w_px;
+        }
+    } else {
+        // Dragged left: tabs in (to, from] are pushed one slot right.
+        let end = from.min(offsets.len().saturating_sub(1));
+        for offset in offsets.get_mut((to + 1)..=end).unwrap_or(&mut []) {
+            *offset -= tab_w_px;
+        }
     }
 }
 
@@ -3799,6 +3969,27 @@ fn run_animation_loop(proxy: EventLoopProxy<UiEvent>) {
 }
 
 // ---------------------------------------------------------------------------
+// Session metadata helpers
+// ---------------------------------------------------------------------------
+
+/// Apply stored title and CWD from a metadata lookup to a newly created pane.
+/// Called during reconnection so panes display the last-known tab name instead
+/// of the default "shell".
+fn apply_session_metadata(
+    pane: &mut Pane,
+    metadata: &HashMap<SessionId, (Option<&str>, Option<&std::path::PathBuf>)>,
+) {
+    if let Some(&(title, cwd)) = metadata.get(&pane.session_id) {
+        if let Some(title) = title {
+            title.clone_into(&mut pane.title);
+        }
+        if let Some(cwd) = cwd {
+            pane.cwd = Some((*cwd).clone());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Instance compositing
 // ---------------------------------------------------------------------------
 
@@ -3875,6 +4066,8 @@ fn build_all_instances(
     active_selection: Option<&selection::SelectionRange>,
     hovered_tab_close: Option<(WorkspaceId, usize)>,
     padding: &ContentPadding,
+    tab_drag: Option<&TabDrag>,
+    tab_drag_offsets: &[f32],
 ) -> (Vec<scribe_renderer::types::CellInstance>, TabHitTargets, TabHitTargets, TabEqualizeTargets) {
     // Build a workspace-id → tab_bar_height lookup for per-pane height queries.
     let ws_tab_bar_heights: HashMap<WorkspaceId, f32> =
@@ -3957,6 +4150,12 @@ fn build_all_instances(
         // Pass the hovered close index only for this workspace.
         let ws_hovered_close = hovered_tab_close
             .and_then(|(ws, idx)| if ws == ws_data.ws_id { Some(idx) } else { None });
+        // Drag state for this workspace only.
+        let ws_drag = tab_drag.filter(|d| d.workspace_id == ws_data.ws_id && d.dragging);
+        let ws_tab_offsets = if ws_drag.is_some() { tab_drag_offsets } else { &[] };
+        let ws_dragging_tab = ws_drag.map(|d| d.tab_index);
+        let ws_drag_cursor_x = ws_drag.map_or(0.0, |d| d.cursor_x);
+        let ws_drag_grab_offset = ws_drag.map_or(0.0, |d| d.grab_offset_x);
         let mut params = tab_bar::TabBarTextParams {
             rect: tab_bar_rect,
             cell_size,
@@ -3970,6 +4169,11 @@ fn build_all_instances(
             indicator_height,
             tab_width,
             hovered_tab_close: ws_hovered_close,
+            tab_offsets: ws_tab_offsets,
+            dragging_tab: ws_dragging_tab,
+            drag_cursor_x: ws_drag_cursor_x,
+            drag_grab_offset: ws_drag_grab_offset,
+            accent_color,
         };
         let (text_instances, hit_targets) = tab_bar::build_tab_bar_text(&mut params);
         all_instances.extend(text_instances);
@@ -4381,7 +4585,7 @@ fn workspace_viewport(config: &wgpu::SurfaceConfiguration) -> Rect {
     }
 }
 
-/// Collect the expected `(PaneId, Rect)` pairs for every active tab in
+/// Collect the expected `(PaneId, Rect, PaneEdges)` tuples for every active tab in
 /// every workspace, using the provided workspace rects.
 ///
 /// This flattens the workspace → tab → pane hierarchy into a single vec

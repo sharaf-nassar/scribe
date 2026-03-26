@@ -226,6 +226,10 @@ pub enum WorkspaceTreeNode {
 pub struct SessionInfo {
     pub session_id: SessionId,
     pub workspace_id: WorkspaceId,
+    /// Last-known terminal title (from OSC 0/2). `None` before first title event.
+    pub title: Option<String>,
+    /// Last-known working directory (from OSC 7). `None` before first CWD event.
+    pub cwd: Option<PathBuf>,
 }
 
 /// A single search match location in the terminal grid.

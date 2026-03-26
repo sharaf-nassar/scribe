@@ -89,6 +89,10 @@ pub struct LiveSession {
     child_pid: u32,
     client_writer: ClientWriter,
     workspace_id: WorkspaceId,
+    /// Last-known terminal title (OSC 0/2), persisted for reconnect.
+    title: String,
+    /// Last-known working directory (OSC 7), persisted for reconnect.
+    cwd: Option<std::path::PathBuf>,
     /// Keep the Pty alive so the child process isn't killed by SIGHUP on Drop.
     /// `None` for sessions restored from a hot-reload handoff. Taken and leaked
     /// by `defuse_for_handoff` during hot-reload to prevent SIGHUP.
@@ -562,6 +566,8 @@ fn start_session(
         child_pid,
         client_writer: Arc::clone(&client_writer),
         workspace_id,
+        title: String::from("shell"),
+        cwd: None,
         pty,
         handoff_snapshot,
     };
@@ -821,9 +827,12 @@ async fn handle_list_sessions(
         window_session_ids
             .iter()
             .filter_map(|&sid| {
-                sessions
-                    .get(&sid)
-                    .map(|s| SessionInfo { session_id: sid, workspace_id: s.workspace_id })
+                sessions.get(&sid).map(|s| SessionInfo {
+                    session_id: sid,
+                    workspace_id: s.workspace_id,
+                    title: Some(s.title.clone()),
+                    cwd: s.cwd.clone(),
+                })
             })
             .collect()
     } else {
@@ -832,7 +841,12 @@ async fn handle_list_sessions(
         sessions
             .iter()
             .filter(|&(&sid, _)| wm.window_for_session(sid).is_none())
-            .map(|(&id, s)| SessionInfo { session_id: id, workspace_id: s.workspace_id })
+            .map(|(&id, s)| SessionInfo {
+                session_id: id,
+                workspace_id: s.workspace_id,
+                title: Some(s.title.clone()),
+                cwd: s.cwd.clone(),
+            })
             .collect()
     };
 
@@ -886,6 +900,17 @@ pub async fn take_session_snapshot(
     }
 }
 
+/// Data extracted from a `LiveSession` for reattachment, collected while
+/// holding the registry lock and consumed after releasing it.
+struct AttachEntry {
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    client_writer: ClientWriter,
+    term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    title: String,
+    cwd: Option<std::path::PathBuf>,
+}
+
 /// Handle `AttachSessions` — take ownership of detached sessions, set the
 /// client writer, and send back session + workspace info for each.
 async fn handle_attach_sessions(
@@ -895,44 +920,48 @@ async fn handle_attach_sessions(
     writer: &SharedWriter,
     attached_ids: &mut HashSet<SessionId>,
 ) {
-    type TermArc =
-        Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>;
-
     let sessions = live_sessions.read().await;
 
     // Collect data we need, then drop the registry lock before sending.
-    let mut attach_data: Vec<(SessionId, WorkspaceId, ClientWriter, TermArc)> = Vec::new();
+    let mut attach_data: Vec<AttachEntry> = Vec::new();
     for &session_id in session_ids {
         if let Some(session) = sessions.get(&session_id) {
-            attach_data.push((
+            attach_data.push(AttachEntry {
                 session_id,
-                session.workspace_id,
-                Arc::clone(&session.client_writer),
-                Arc::clone(&session.term),
-            ));
+                workspace_id: session.workspace_id,
+                client_writer: Arc::clone(&session.client_writer),
+                term: Arc::clone(&session.term),
+                title: session.title.clone(),
+                cwd: session.cwd.clone(),
+            });
         } else {
             warn!(%session_id, "AttachSessions: session not found");
         }
     }
     drop(sessions);
 
-    for (session_id, workspace_id, client_writer, term) in attach_data {
-        attached_ids.insert(session_id);
+    for entry in attach_data {
+        attached_ids.insert(entry.session_id);
 
         // Send SessionCreated so the client can process it through the normal flow.
         let creation_msg = ServerMessage::SessionCreated {
-            session_id,
-            workspace_id,
+            session_id: entry.session_id,
+            workspace_id: entry.workspace_id,
             shell_name: String::from("shell"),
         };
         send_message(writer, &creation_msg).await;
 
+        // Send stored metadata so tabs display correctly on reconnect.
+        send_stored_metadata(writer, entry.session_id, &entry.title, entry.cwd.as_ref()).await;
+
         // Send workspace info.
         {
             let wm = workspace_manager.read().await;
-            if let Some((name, accent_color, split_direction)) = wm.workspace_info(workspace_id) {
+            if let Some((name, accent_color, split_direction)) =
+                wm.workspace_info(entry.workspace_id)
+            {
                 let msg = ServerMessage::WorkspaceInfo {
-                    workspace_id,
+                    workspace_id: entry.workspace_id,
                     name,
                     accent_color,
                     split_direction,
@@ -941,8 +970,8 @@ async fn handle_attach_sessions(
             }
         }
 
-        let snapshot = take_session_snapshot(session_id, &term, live_sessions).await;
-        let snap_msg = ServerMessage::ScreenSnapshot { session_id, snapshot };
+        let snapshot = take_session_snapshot(entry.session_id, &entry.term, live_sessions).await;
+        let snap_msg = ServerMessage::ScreenSnapshot { session_id: entry.session_id, snapshot };
         send_message(writer, &snap_msg).await;
 
         // Set the writer AFTER the snapshot is sent.  The PTY reader task
@@ -952,9 +981,29 @@ async fn handle_attach_sessions(
         // ScreenSnapshot before any live PtyOutput, preventing stale
         // terminal state (cursor position, alt-screen mode) from racing
         // with the snapshot and producing ghost cursors on reconnect.
-        *client_writer.lock().await = Some(Arc::clone(writer));
+        *entry.client_writer.lock().await = Some(Arc::clone(writer));
 
-        info!(%session_id, "session attached to new client");
+        info!(session_id = %entry.session_id, "session attached to new client");
+    }
+}
+
+/// Send stored title, CWD, and git branch metadata for a reattached session.
+async fn send_stored_metadata(
+    writer: &SharedWriter,
+    session_id: SessionId,
+    title: &str,
+    cwd: Option<&std::path::PathBuf>,
+) {
+    if title != "shell" {
+        let title_msg = ServerMessage::TitleChanged { session_id, title: title.to_owned() };
+        send_message(writer, &title_msg).await;
+    }
+    if let Some(cwd) = cwd {
+        let cwd_msg = ServerMessage::CwdChanged { session_id, cwd: cwd.clone() };
+        send_message(writer, &cwd_msg).await;
+        let branch = detect_git_branch(cwd);
+        let git_msg = ServerMessage::GitBranch { session_id, branch };
+        send_message(writer, &git_msg).await;
     }
 }
 
@@ -1127,6 +1176,7 @@ async fn process_metadata_events(state: &mut PtyReaderState, bytes: &[u8]) {
             state.session_id,
             &state.client_writer,
             &state.workspace_manager,
+            &state.live_sessions,
         )
         .await;
     }
@@ -1145,6 +1195,7 @@ async fn process_metadata_events(state: &mut PtyReaderState, bytes: &[u8]) {
             state.session_id,
             &state.client_writer,
             &state.workspace_manager,
+            &state.live_sessions,
         )
         .await;
     }
@@ -1188,8 +1239,14 @@ async fn check_proc_cwd(state: &mut PtyReaderState) {
     }
     state.last_proc_cwd = Some(cwd.clone());
     let event = MetadataEvent::CwdChanged(cwd);
-    send_metadata_event(event, state.session_id, &state.client_writer, &state.workspace_manager)
-        .await;
+    send_metadata_event(
+        event,
+        state.session_id,
+        &state.client_writer,
+        &state.workspace_manager,
+        &state.live_sessions,
+    )
+    .await;
 }
 
 /// macOS fallback: use `proc_pidinfo` with `PROC_PIDVNODEPATHINFO` to read
@@ -1205,8 +1262,14 @@ async fn check_proc_cwd(state: &mut PtyReaderState) {
     }
     state.last_proc_cwd = Some(cwd.clone());
     let event = MetadataEvent::CwdChanged(cwd);
-    send_metadata_event(event, state.session_id, &state.client_writer, &state.workspace_manager)
-        .await;
+    send_metadata_event(
+        event,
+        state.session_id,
+        &state.client_writer,
+        &state.workspace_manager,
+        &state.live_sessions,
+    )
+    .await;
 }
 
 /// Stub for platforms other than Linux and macOS — no CWD fallback available.
@@ -1303,8 +1366,24 @@ async fn send_metadata_event(
     session_id: SessionId,
     client_writer: &ClientWriter,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    live_sessions: &LiveSessionRegistry,
 ) {
     let (server_msg, cwd_for_workspace) = convert_metadata_event(event, session_id);
+
+    // Persist title/cwd in the live session for reconnect.
+    match &server_msg {
+        ServerMessage::TitleChanged { title, .. } => {
+            if let Some(session) = live_sessions.write().await.get_mut(&session_id) {
+                title.clone_into(&mut session.title);
+            }
+        }
+        ServerMessage::CwdChanged { cwd, .. } => {
+            if let Some(session) = live_sessions.write().await.get_mut(&session_id) {
+                session.cwd = Some(cwd.clone());
+            }
+        }
+        _ => {}
+    }
 
     send_to_client(client_writer, &server_msg).await;
 

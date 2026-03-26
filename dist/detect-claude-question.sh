@@ -6,8 +6,8 @@
 #   waiting_for_input — if response ends with a question or approval request
 #   idle_prompt       — otherwise
 #
-# Heuristics (checked against the last ~20 non-empty lines, not just the
-# last paragraph, so questions followed by a concluding sentence are caught):
+# Heuristics (checked against the last ~20 lines, not just the last paragraph,
+# so questions followed by a concluding sentence are still caught):
 #   1. Any line ends with "?"
 #   2. Contains question phrases ("Would you like", "Should I", etc.)
 #   3. Contains approval/review phrases ("please review", "once approved", etc.)

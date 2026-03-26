@@ -820,8 +820,11 @@ fn insert_multi_cell_glyph(map: &mut LigatureMap, line: i32, col: usize, glyph: 
 
 /// Check whether `glyph` is a contextual alternate in `run`.
 ///
-/// A glyph is a contextual alternate when its run-shaped `CacheKey` differs
-/// from the key produced by shaping the character in isolation.
+/// A glyph is a contextual alternate when its run-shaped glyph identity
+/// (font + glyph ID) differs from the identity produced by shaping the
+/// character in isolation.  We compare only `font_id` and `glyph_id`,
+/// ignoring subpixel bins (`x_bin`, `y_bin`) which vary by position
+/// within the run and would cause false positives.
 fn is_contextual_alternate(
     atlas: &mut GlyphAtlas,
     glyph: &ShapedRunGlyph,
@@ -829,9 +832,10 @@ fn is_contextual_alternate(
     run: &StyledRun,
 ) -> bool {
     chars.get(glyph.col_offset).is_some_and(|&c| {
-        atlas
-            .shape_single_cache_key(c, run.bold, run.italic)
-            .is_some_and(|solo_key| solo_key != glyph.cache_key)
+        atlas.shape_single_cache_key(c, run.bold, run.italic).is_some_and(|solo_key| {
+            solo_key.font_id != glyph.cache_key.font_id
+                || solo_key.glyph_id != glyph.cache_key.glyph_id
+        })
     })
 }
 
