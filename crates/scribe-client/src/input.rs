@@ -94,6 +94,7 @@ pub struct Bindings {
 
     // General
     pub settings: BindingSet,
+    pub driver: BindingSet,
 
     // Terminal shortcuts (send escape sequences to PTY)
     pub word_left: BindingSet,
@@ -234,6 +235,7 @@ impl Bindings {
 
             // General
             settings: parse_set(&config.settings),
+            driver: parse_set(&config.driver),
 
             // Terminal shortcuts
             word_left: parse_set(&config.word_left),
@@ -346,6 +348,8 @@ pub enum KeyAction {
     Layout(LayoutAction),
     /// Open the settings window.
     OpenSettings,
+    /// Open the driver window.
+    OpenDriver,
     /// Open the find-in-scrollback overlay.
     OpenFind,
 }
@@ -370,6 +374,10 @@ pub fn translate_key_action(
 
     if any_matches(&bindings.settings, event, modifiers) {
         return Some(KeyAction::OpenSettings);
+    }
+
+    if any_matches(&bindings.driver, event, modifiers) {
+        return Some(KeyAction::OpenDriver);
     }
 
     if any_matches(&bindings.find, event, modifiers) {

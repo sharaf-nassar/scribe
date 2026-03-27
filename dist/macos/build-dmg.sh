@@ -45,7 +45,7 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
 fi
 
 # Verify binaries exist
-for bin in scribe-client scribe-server scribe-settings; do
+for bin in scribe-client scribe-server scribe-settings scribe-driver; do
     if [[ ! -f "${BUILD_DIR}/${bin}" ]]; then
         echo "ERROR: ${BUILD_DIR}/${bin} not found. Run 'cargo build --release' first."
         exit 1

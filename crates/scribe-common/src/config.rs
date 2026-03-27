@@ -125,6 +125,12 @@ pub struct AppearanceConfig {
     pub scrollbar_width: f32,
     #[serde(default)]
     pub scrollbar_color: Option<String>,
+    /// Override color for active pane and workspace focus borders (`#rrggbb`).
+    /// Falls back to the theme accent color when `None`.
+    #[serde(default)]
+    pub focus_border_color: Option<String>,
+    #[serde(default = "default_focus_border_width")]
+    pub focus_border_width: f32,
     /// Vertical padding added to `tab_height` for the effective tab bar row height.
     #[serde(default = "default_tab_bar_padding")]
     pub tab_bar_padding: f32,
@@ -153,6 +159,8 @@ impl Default for AppearanceConfig {
             theme: default_theme_name(),
             scrollbar_width: default_scrollbar_width(),
             scrollbar_color: None,
+            focus_border_color: None,
+            focus_border_width: default_focus_border_width(),
             tab_bar_padding: default_tab_bar_padding(),
             tab_width: default_tab_width(),
             status_bar_height: default_status_bar_height(),
@@ -192,6 +200,10 @@ fn default_theme_name() -> String {
 
 fn default_scrollbar_width() -> f32 {
     6.0
+}
+
+fn default_focus_border_width() -> f32 {
+    2.0
 }
 
 fn default_tab_bar_padding() -> f32 {
@@ -266,6 +278,7 @@ impl AppearanceConfig {
             font_size: self.font_size.clamp(4.0, 72.0),
             opacity: self.opacity.clamp(0.0, 1.0),
             scrollbar_width: self.scrollbar_width.clamp(0.0, 20.0),
+            focus_border_width: self.focus_border_width.clamp(1.0, 10.0),
             content_padding: self.content_padding.clamped(),
             ..self
         }
@@ -634,6 +647,8 @@ pub struct KeybindingsConfig {
     // General
     #[serde(default = "default_settings")]
     pub settings: KeyComboList,
+    #[serde(default = "default_driver")]
+    pub driver: KeyComboList,
 
     // Terminal shortcuts (send escape sequences to PTY)
     #[serde(default = "default_word_left")]
@@ -692,6 +707,7 @@ impl Default for KeybindingsConfig {
             zoom_reset: default_zoom_reset(),
             new_window: default_new_window(),
             settings: default_settings(),
+            driver: default_driver(),
             word_left: default_word_left(),
             word_right: default_word_right(),
             delete_word_backward: default_delete_word_backward(),
@@ -849,6 +865,10 @@ fn default_new_window() -> KeyComboList {
 
 fn default_settings() -> KeyComboList {
     KeyComboList::single("ctrl+,")
+}
+
+fn default_driver() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+d")
 }
 
 fn default_word_left() -> KeyComboList {

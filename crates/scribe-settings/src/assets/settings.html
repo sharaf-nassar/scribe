@@ -378,6 +378,45 @@
         </div>
       </div>
 
+      <!-- Focus Border -->
+      <div class="section-group">
+        <div class="section-label">Focus Border</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Color</div>
+              <div class="setting-desc">Active pane and workspace border color</div>
+            </div>
+            <div class="control-with-reset">
+              <div class="color-swatch-group">
+                <div class="color-swatch" data-key="appearance.focus_border_color" style="background:#3b82f6;">
+                  <input type="color" value="#3b82f6">
+                </div>
+              </div>
+              <button class="reset-btn" data-reset-key="appearance.focus_border_color" title="Reset to theme default">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 1 3.36-7"/><path d="M3 5v4.5h4.5"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Width</div>
+              <div class="setting-desc">Border thickness in pixels</div>
+            </div>
+            <div class="control-with-reset">
+              <div class="number-control" data-key="appearance.focus_border_width" data-min="1" data-max="10" data-step="1">
+                <div class="number-btn">&minus;</div>
+                <div class="number-value">2</div>
+                <div class="number-btn">+</div>
+              </div>
+              <button class="reset-btn" data-reset-key="appearance.focus_border_width" title="Reset to default (2px)">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 1 3.36-7"/><path d="M3 5v4.5h4.5"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- Unified Theme Grid -->
       <div class="section-group">
         <input type="text" id="theme-search" class="text-input"

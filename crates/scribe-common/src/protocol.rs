@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::ai_state::AiProcessState;
+use crate::driver::{DriverTaskInfo, DriverTaskState};
 use crate::ids::{SessionId, WindowId, WorkspaceId};
 
 // ── UI → Server ──────────────────────────────────────────────────
@@ -134,6 +136,27 @@ pub enum ClientMessage {
         /// (previous focus is unknown from the first focus event).
         lost: Option<SessionId>,
     },
+    /// Create a new driver task for the given project and description.
+    CreateDriverTask {
+        task_id: Uuid,
+        project_path: PathBuf,
+        description: String,
+    },
+    /// Stop a running driver task.
+    StopDriverTask {
+        task_id: Uuid,
+    },
+    /// Send input bytes to a driver task's PTY.
+    DriverTaskInput {
+        task_id: Uuid,
+        data: Vec<u8>,
+    },
+    /// Request a list of all live driver tasks.
+    ListDriverTasks,
+    /// Attach to an existing driver task to receive its output.
+    AttachDriverTask {
+        task_id: Uuid,
+    },
 }
 
 // ── Server → UI ──────────────────────────────────────────────────
@@ -241,6 +264,31 @@ pub enum ServerMessage {
     /// Progress update during download/install.
     UpdateProgress {
         state: UpdateProgressState,
+    },
+    /// Confirms a driver task was created.
+    DriverTaskCreated {
+        task_id: Uuid,
+        project_path: PathBuf,
+    },
+    /// Raw output bytes from a driver task's PTY.
+    DriverTaskOutput {
+        task_id: Uuid,
+        data: Vec<u8>,
+    },
+    /// Driver task lifecycle state changed.
+    DriverTaskStateChanged {
+        task_id: Uuid,
+        state: DriverTaskState,
+        ai_state: Option<AiProcessState>,
+    },
+    /// List of all live driver tasks, sent in response to `ListDriverTasks`.
+    DriverTaskList {
+        tasks: Vec<DriverTaskInfo>,
+    },
+    /// A driver task's PTY process has exited.
+    DriverTaskExited {
+        task_id: Uuid,
+        exit_code: Option<i32>,
     },
 }
 

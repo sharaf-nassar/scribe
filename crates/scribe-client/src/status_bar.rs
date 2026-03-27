@@ -20,6 +20,8 @@ pub struct StatusBarHitTargets {
     pub equalize_rect: Option<Rect>,
     /// Clickable rect for the settings gear icon.
     pub gear_rect: Option<Rect>,
+    /// Clickable rect for the driver robot icon.
+    pub robot_rect: Option<Rect>,
     /// Tooltip hover targets for each status bar segment.
     pub tooltip_targets: Vec<TooltipAnchor>,
 }
@@ -133,6 +135,7 @@ pub fn build_status_bar(
         return StatusBarHitTargets {
             equalize_rect: None,
             gear_rect: None,
+            robot_rect: None,
             tooltip_targets: Vec::new(),
         };
     }
@@ -186,10 +189,10 @@ pub fn build_status_bar(
     let col = render_left_side(&mut w, colors, data, resolve_glyph, &mut tooltips);
     w.col = col;
 
-    let (equalize_rect, gear_rect) =
+    let (equalize_rect, gear_rect, robot_rect) =
         render_right_side(&mut w, colors, data, resolve_glyph, &mut tooltips);
 
-    StatusBarHitTargets { equalize_rect, gear_rect, tooltip_targets: tooltips }
+    StatusBarHitTargets { equalize_rect, gear_rect, robot_rect, tooltip_targets: tooltips }
 }
 
 /// Mutable writer state for emitting status bar characters.
@@ -316,23 +319,27 @@ fn render_left_side(
     w.col
 }
 
-/// Render the right side: git branch | session count | hostname | time | equalize | gear.
+/// Render the right side: git branch | session count | hostname | time | robot | equalize | gear.
 ///
-/// Returns `(equalize_rect, gear_rect)` — clickable rects for the equalize and gear icons.
+/// Returns `(equalize_rect, gear_rect, robot_rect)` — clickable rects for equalize, gear, and robot icons.
 fn render_right_side(
     w: &mut BarWriter<'_>,
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
     tooltips: &mut Vec<TooltipAnchor>,
-) -> (Option<Rect>, Option<Rect>) {
+) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
     // +3 for the gear segment: " ⚙ " (space, gear, space)
     let gear_cols: usize = 3;
     // +2 for the equalize segment: " ⊞" (space, icon) — gear provides the trailing space
     let equalize_cols: usize = if data.show_equalize { 2 } else { 0 };
+    // +3 for the robot segment: " ◆ " (space, diamond, space)
+    let robot_cols: usize = 3;
     let segments = build_right_segments(data, colors);
-    let right_cols: usize =
-        segments.iter().map(|s| s.text.chars().count()).sum::<usize>() + equalize_cols + gear_cols;
+    let right_cols: usize = segments.iter().map(|s| s.text.chars().count()).sum::<usize>()
+        + equalize_cols
+        + gear_cols
+        + robot_cols;
     let right_start = w.max_cols.saturating_sub(right_cols + 1);
 
     w.pad_to(right_start, colors.text, colors.bg, resolve_glyph);
@@ -340,6 +347,12 @@ fn render_right_side(
     // Render segments tracking per-named-item rects for tooltips.
     let groups = build_segment_groups(data);
     render_right_segments_with_tooltips(w, colors.bg, resolve_glyph, &segments, tooltips, &groups);
+
+    // Robot icon: " ◆ " left of equalize and gear.
+    let robot_rect = render_robot(w, colors, resolve_glyph);
+    if let Some(r_rect) = robot_rect {
+        tooltips.push(TooltipAnchor { text: String::from("Driver (Ctrl+Shift+D)"), rect: r_rect });
+    }
 
     // Equalize icon: " ⊞" left of the gear, only when multiple workspaces exist.
     let equalize_rect = render_equalize(w, colors, data, resolve_glyph);
@@ -355,7 +368,7 @@ fn render_right_side(
 
     w.pad_to(w.max_cols, colors.text, colors.bg, resolve_glyph);
 
-    (equalize_rect, gear_rect)
+    (equalize_rect, gear_rect, robot_rect)
 }
 
 /// Build the `(tooltip_text, segment_count)` group list from `data`.
@@ -468,6 +481,28 @@ fn render_equalize(
     let eq_x = w.x_origin + eq_col as f32 * w.cell_w;
     let eq_width = (w.col - eq_col) as f32 * w.cell_w;
     Some(Rect { x: eq_x, y: w.bar_y, width: eq_width, height: w.bar_height })
+}
+
+/// Render the driver robot icon (◆) and return its clickable rect.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "column index is a small positive integer fitting in f32"
+)]
+fn render_robot(
+    w: &mut BarWriter<'_>,
+    colors: &StatusBarColors,
+    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+) -> Option<Rect> {
+    if w.col >= w.max_cols {
+        return None;
+    }
+    w.put(' ', colors.text, colors.bg, resolve_glyph);
+    let robot_col = w.col;
+    w.put('\u{25C6}', colors.accent, colors.bg, resolve_glyph);
+    w.put(' ', colors.text, colors.bg, resolve_glyph);
+    let robot_x = w.x_origin + robot_col as f32 * w.cell_w;
+    let robot_width = (w.col - robot_col) as f32 * w.cell_w;
+    Some(Rect { x: robot_x, y: w.bar_y, width: robot_width, height: w.bar_height })
 }
 
 /// Render the gear icon and return its clickable rect.

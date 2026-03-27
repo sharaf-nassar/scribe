@@ -1,0 +1,36 @@
+[package]
+name = "scribe-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+scribe-common.workspace = true
+wry.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rust-embed.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+toml.workspace = true
+nix.workspace = true
+libc.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+rusqlite = { version = "0.34", features = ["bundled"] }
+tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tao.workspace = true
+signal-hook.workspace = true
+
+[[bin]]
+name = "scribe-driver"
+path = "src/main.rs"

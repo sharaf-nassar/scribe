@@ -152,7 +152,7 @@ cmd_retag() {
 
   # Find the tag before this one for release notes range
   local prev_tag
-  prev_tag=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${tag}$" | head -n1)
+  prev_tag=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${tag}$" | head -n1 || true)
 
   echo "This will re-point $tag to HEAD ($(git rev-parse --short HEAD))."
   echo "WARNING: This deletes the tag on the remote and re-pushes it."

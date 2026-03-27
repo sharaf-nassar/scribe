@@ -330,6 +330,21 @@ async fn dispatch_server_message(
         ServerMessage::UpdateProgress { .. } => {
             debug!("update progress (ignored by test daemon)");
         }
+        ServerMessage::DriverTaskCreated { task_id, .. } => {
+            debug!(%task_id, "driver task created (ignored by test daemon)");
+        }
+        ServerMessage::DriverTaskOutput { task_id, .. } => {
+            debug!(%task_id, "driver task output (ignored by test daemon)");
+        }
+        ServerMessage::DriverTaskStateChanged { task_id, .. } => {
+            debug!(%task_id, "driver task state changed (ignored by test daemon)");
+        }
+        ServerMessage::DriverTaskList { .. } => {
+            debug!("driver task list (ignored by test daemon)");
+        }
+        ServerMessage::DriverTaskExited { task_id, .. } => {
+            debug!(%task_id, "driver task exited (ignored by test daemon)");
+        }
     }
 }
 

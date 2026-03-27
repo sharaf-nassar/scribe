@@ -14,6 +14,7 @@ use scribe_renderer::types::{CellInstance, GridSize};
 
 use crate::layout::{PaneEdges, Rect};
 use crate::scrollbar::ScrollbarState;
+use crate::selection::SelectionRange;
 
 /// State for a single terminal pane.
 pub struct Pane {
@@ -54,9 +55,8 @@ pub struct Pane {
     /// Whether this pane was the focused pane when `last_instances` was built.
     /// `None` means instances have never been built.
     pub last_was_focused: Option<bool>,
-    /// Whether there was an active selection on this pane when
-    /// `last_instances` was built.
-    pub last_had_selection: bool,
+    /// The selection rendered when `last_instances` was built, or `None`.
+    pub last_selection: Option<SelectionRange>,
     /// The grid size last sent to the server via IPC resize.
     /// `None` means a resize has never been sent for this pane.
     pub last_sent_grid: Option<GridSize>,
@@ -112,7 +112,7 @@ impl Pane {
             last_instances: Vec::new(),
             last_cursor_visible: None,
             last_was_focused: None,
-            last_had_selection: false,
+            last_selection: None,
             last_sent_grid: None,
         }
     }

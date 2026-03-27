@@ -22,6 +22,7 @@ use scribe_common::socket::current_uid;
 use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
 
+use crate::driver_tasks::DriverTaskRegistryHandle;
 use crate::handoff::HandoffSession;
 use crate::session_manager::{ManagedSession, SessionManager, snapshot_term};
 use crate::updater::UpdaterHandle;
@@ -114,6 +115,7 @@ pub async fn start_ipc_server(
     live_sessions: LiveSessionRegistry,
     connected_clients: ConnectedClients,
     updater_handle: Arc<UpdaterHandle>,
+    driver_registry: DriverTaskRegistryHandle,
 ) -> Result<(), ScribeError> {
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
@@ -137,8 +139,9 @@ pub async fn start_ipc_server(
                 let ls = Arc::clone(&live_sessions);
                 let cc = Arc::clone(&connected_clients);
                 let uh = Arc::clone(&updater_handle);
+                let dr = Arc::clone(&driver_registry);
                 tokio::spawn(async move {
-                    handle_client(stream, sm, wm, ls, cc, uh).await;
+                    handle_client(stream, sm, wm, ls, cc, uh, dr).await;
                     drop(permit);
                 });
             }
@@ -265,6 +268,7 @@ async fn handle_client(
     live_sessions: LiveSessionRegistry,
     connected_clients: ConnectedClients,
     updater_handle: Arc<UpdaterHandle>,
+    driver_registry: DriverTaskRegistryHandle,
 ) {
     let (reader, writer) = tokio::io::split(stream);
     let writer: SharedWriter = Arc::new(Mutex::new(writer));
@@ -314,6 +318,7 @@ async fn handle_client(
                 window_id,
                 &connected_clients,
                 &updater_handle,
+                &driver_registry,
             )
             .await;
             window_id
@@ -351,6 +356,7 @@ async fn handle_client(
             window_id,
             &connected_clients,
             &updater_handle,
+            &driver_registry,
         )
         .await;
     }
@@ -406,6 +412,7 @@ async fn dispatch_message(
     window_id: WindowId,
     connected_clients: &ConnectedClients,
     updater_handle: &UpdaterHandle,
+    driver_registry: &DriverTaskRegistryHandle,
 ) {
     match msg {
         ClientMessage::CreateSession {
@@ -498,6 +505,29 @@ async fn dispatch_message(
         }
         ClientMessage::FocusChanged { gained, lost } => {
             handle_focus_changed(gained, lost, live_sessions, attached_ids).await;
+        }
+        ClientMessage::CreateDriverTask { task_id, project_path, description } => {
+            handle_create_driver_task(task_id, project_path, description, writer, driver_registry)
+                .await;
+        }
+        ClientMessage::StopDriverTask { task_id } => {
+            driver_registry.lock().await.stop_task(task_id);
+        }
+        ClientMessage::DriverTaskInput { task_id, data } => {
+            driver_registry.lock().await.send_input(task_id, &data).await;
+        }
+        ClientMessage::ListDriverTasks => {
+            let tasks = driver_registry.lock().await.list_tasks();
+            let list_msg = scribe_common::protocol::ServerMessage::DriverTaskList { tasks };
+            send_message(writer, &list_msg).await;
+        }
+        ClientMessage::AttachDriverTask { task_id } => {
+            if let Err(e) =
+                driver_registry.lock().await.attach_task(task_id, Arc::clone(writer)).await
+            {
+                let err_msg = ServerMessage::Error { message: e };
+                send_message(writer, &err_msg).await;
+            }
         }
         other => {
             debug!(?other, "unhandled client message");
@@ -864,7 +894,7 @@ fn set_pty_winsize(fd: RawFd, cols: u16, rows: u16) -> Result<(), ScribeError> {
     // struct is fully initialized and lives on the stack for the duration of
     // the ioctl call. `TIOCSWINSZ` writes a `winsize` to the kernel.
     #[allow(unsafe_code, reason = "TIOCSWINSZ ioctl requires unsafe libc call")]
-    let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
+    let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as libc::c_ulong, &ws) };
 
     if ret == -1 {
         return Err(ScribeError::Io { source: std::io::Error::last_os_error() });
@@ -1245,6 +1275,32 @@ async fn send_to_client(client_writer: &ClientWriter, msg: &ServerMessage) {
 async fn send_error(writer: &SharedWriter, message: &str) {
     let msg = ServerMessage::Error { message: message.to_owned() };
     send_message(writer, &msg).await;
+}
+
+/// Handle `CreateDriverTask` — create a git worktree, spawn claude, start reader.
+async fn handle_create_driver_task(
+    task_id: uuid::Uuid,
+    project_path: std::path::PathBuf,
+    description: String,
+    writer: &SharedWriter,
+    driver_registry: &DriverTaskRegistryHandle,
+) {
+    match crate::driver_tasks::DriverTaskRegistry::create_task(
+        driver_registry,
+        task_id,
+        project_path.clone(),
+        description,
+    )
+    .await
+    {
+        Ok(_info) => {
+            let msg = ServerMessage::DriverTaskCreated { task_id, project_path };
+            send_message(writer, &msg).await;
+        }
+        Err(e) => {
+            send_error(writer, &format!("failed to create driver task: {e}")).await;
+        }
+    }
 }
 
 // ── PTY reader task ─────────────────────────────────────────────

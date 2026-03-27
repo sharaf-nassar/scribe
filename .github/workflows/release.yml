@@ -74,6 +74,7 @@ jobs:
           cp target/${{ matrix.target }}/release/scribe-client   target/release/
           cp target/${{ matrix.target }}/release/scribe-server   target/release/
           cp target/${{ matrix.target }}/release/scribe-settings target/release/
+          cp target/${{ matrix.target }}/release/scribe-driver   target/release/
 
       - name: Build DMG
         if: matrix.os == 'macos'

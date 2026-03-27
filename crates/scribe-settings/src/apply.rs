@@ -172,6 +172,24 @@ fn apply_config_key(
             let v = value.as_f64().ok_or("content_padding_left must be a number")? as f32;
             config.appearance.content_padding.left = v.clamp(0.0, 50.0);
         }
+        "appearance.focus_border_color" => {
+            let hex = value.as_str().ok_or("focus_border_color must be a string")?;
+            if hex.is_empty() {
+                config.appearance.focus_border_color = None;
+            } else {
+                scribe_common::theme::hex_to_rgba(hex)
+                    .map_err(|e| format!("invalid focus_border_color: {e}"))?;
+                config.appearance.focus_border_color = Some(hex.to_owned());
+            }
+        }
+        "appearance.focus_border_width" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "focus border width is a small positive float"
+            )]
+            let v = value.as_f64().ok_or("focus_border_width must be a number")? as f32;
+            config.appearance.focus_border_width = v.clamp(1.0, 10.0);
+        }
         // -- Theme preset -----------------------------------------------------
         "theme.preset" => {
             let preset = value.as_str().ok_or("theme preset must be a string")?;

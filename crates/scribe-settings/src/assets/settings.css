@@ -919,3 +919,27 @@ input[type="range"]::-webkit-slider-thumb {
 [data-tooltip]:hover::after {
   opacity: 1;
 }
+
+.control-with-reset {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.reset-btn {
+  background: none;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 6px;
+  color: rgba(255,255,255,0.4);
+  cursor: pointer;
+  padding: 4px 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+.reset-btn:hover {
+  border-color: rgba(255,255,255,0.25);
+  color: rgba(255,255,255,0.7);
+  background: rgba(255,255,255,0.05);
+}

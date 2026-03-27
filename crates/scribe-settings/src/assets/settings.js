@@ -591,6 +591,10 @@ function loadConfig(config) {
   setStepperValue("appearance.tab_bar_padding", config.appearance?.tab_bar_padding);
   setStepperValue("appearance.status_bar_height", config.appearance?.status_bar_height);
 
+  // Appearance — Focus Border
+  setColorSwatch('appearance.focus_border_color', config.appearance?.focus_border_color || '#3b82f6');
+  setStepperValue('appearance.focus_border_width', config.appearance?.focus_border_width ?? 2);
+
   // Terminal
   setStepperValue("terminal.scrollback_lines", config.terminal?.scrollback_lines);
   setToggleValue("terminal.natural_scroll", config.terminal?.natural_scroll);
@@ -1320,6 +1324,29 @@ document.addEventListener("DOMContentLoaded", function() {
   initTextInputs();
   initColorSwatches();
   initThemeColorEditor();
+
+  // Reset-to-default buttons
+  document.querySelectorAll('.reset-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.resetKey;
+      if (!key) return;
+      if (key === 'appearance.focus_border_color') {
+        // Send empty string to clear override (server sets to None)
+        sendChange(key, '');
+        // Reset swatch to theme default visually (ANSI blue)
+        const swatch = document.querySelector(`.color-swatch[data-key="${key}"]`);
+        if (swatch) {
+          swatch.style.background = '#3b82f6';
+          const input = swatch.querySelector('input[type="color"]');
+          if (input) input.value = '#3b82f6';
+        }
+      } else if (key === 'appearance.focus_border_width') {
+        sendChange(key, 2);
+        setStepperValue(key, 2);
+      }
+    });
+  });
+
   initWorkspaces();
   initBadgeColorReset();
   initGlobalSearch();

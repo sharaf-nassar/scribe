@@ -67,6 +67,9 @@ pub struct HandoffState {
     /// window's workspace tree.
     #[serde(default)]
     pub windows: Vec<HandoffWindowState>,
+    /// Live driver tasks to restore after upgrade.
+    #[serde(default)]
+    pub driver_tasks: Vec<crate::driver_tasks::HandoffDriverTask>,
 }
 
 /// Per-session state transferred during handoff.
@@ -110,6 +113,7 @@ pub struct HandoffWorkspace {
 pub async fn run_handoff_listener(
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     live_sessions: LiveSessionRegistry,
+    driver_registry: crate::driver_tasks::DriverTaskRegistryHandle,
 ) -> Result<(), ScribeError> {
     let path = handoff_socket_path();
 
@@ -171,7 +175,7 @@ pub async fn run_handoff_listener(
     info!("received upgrade request from new server");
 
     // Serialise state.
-    let (state, fds) = serialize_state(&live_sessions, &workspace_manager).await;
+    let (state, fds) = serialize_state(&live_sessions, &workspace_manager, &driver_registry).await;
     let state_bytes = rmp_serde::to_vec(&state).map_err(ScribeError::from)?;
 
     // Send state (length-prefixed).
@@ -290,13 +294,23 @@ fn read_upgrade_request(fd: RawFd) -> Result<(), ScribeError> {
 async fn serialize_state(
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    driver_registry: &crate::driver_tasks::DriverTaskRegistryHandle,
 ) -> (HandoffState, Vec<RawFd>) {
-    let (sessions, fds) = crate::ipc_server::serialize_live_for_handoff(live_sessions).await;
+    let (sessions, mut fds) = crate::ipc_server::serialize_live_for_handoff(live_sessions).await;
     let (workspaces, workspace_tree, windows) =
         workspace_manager.read().await.serialize_for_handoff();
 
-    let state =
-        HandoffState { version: HANDOFF_VERSION, sessions, workspaces, workspace_tree, windows };
+    let (driver_tasks, driver_fds) = driver_registry.lock().await.serialize_for_handoff();
+    fds.extend_from_slice(&driver_fds);
+
+    let state = HandoffState {
+        version: HANDOFF_VERSION,
+        sessions,
+        workspaces,
+        workspace_tree,
+        windows,
+        driver_tasks,
+    };
 
     (state, fds)
 }
@@ -416,9 +430,10 @@ pub fn receive_handoff() -> Result<(HandoffState, Vec<OwnedFd>), ScribeError> {
         "received handoff state"
     );
 
-    // Receive fds via SCM_RIGHTS.
-    let fds =
-        if state.sessions.is_empty() { Vec::new() } else { receive_fds(fd, state.sessions.len())? };
+    // Receive fds via SCM_RIGHTS.  The sender packs session fds first,
+    // then driver task fds, all in a single SCM_RIGHTS message.
+    let total_fds = state.sessions.len() + state.driver_tasks.len();
+    let fds = if total_fds == 0 { Vec::new() } else { receive_fds(fd, total_fds)? };
 
     info!(count = fds.len(), "received PTY fds via SCM_RIGHTS");
 

@@ -15,9 +15,6 @@ const DIVIDER_THICKNESS: f32 = 1.0;
 /// as "on the divider" for drag purposes.
 const HIT_TOLERANCE: f32 = 4.0;
 
-/// Focus border thickness in pixels.
-const FOCUS_BORDER_THICKNESS: f32 = 2.0;
-
 /// A divider between two pane groups, positioned in pixel coordinates.
 #[derive(Debug, Clone, Copy)]
 pub struct Divider {
@@ -72,18 +69,23 @@ pub fn build_divider_instances(out: &mut Vec<CellInstance>, dividers: &[Divider]
 
 /// Build a 2px accent-coloured border on the focused pane's leading edge.
 ///
-/// For vertical splits the border appears on the left edge; for horizontal
+/// For horizontal splits the border appears on the left edge; for vertical
 /// splits it appears on the top edge. If `split_direction` is `None` (the
 /// pane is the sole root), no border is emitted.
 #[allow(
     clippy::cast_precision_loss,
     reason = "step index is a small positive integer fitting in f32"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "border rendering needs rect, direction, color, width, and cell size"
+)]
 pub fn build_focus_border(
     out: &mut Vec<CellInstance>,
     pane_rect: Rect,
     split_direction: Option<SplitDirection>,
     accent_color: [f32; 4],
+    border_width: f32,
     cell_size: (f32, f32),
 ) {
     let Some(dir) = split_direction else { return };
@@ -91,26 +93,23 @@ pub fn build_focus_border(
 
     match dir {
         SplitDirection::Horizontal => {
-            // Left edge: vertical stripe, FOCUS_BORDER_THICKNESS wide.
+            // Left edge: vertical stripe, border_width wide.
             let steps = steps_for(pane_rect.height, cell_h);
             for i in 0..steps {
                 let y = pane_rect.y + i as f32 * cell_h;
-                out.push(solid_quad(pane_rect.x, y, FOCUS_BORDER_THICKNESS, cell_h, accent_color));
+                out.push(solid_quad(pane_rect.x, y, border_width, cell_h, accent_color));
             }
         }
         SplitDirection::Vertical => {
-            // Top edge: horizontal stripe, FOCUS_BORDER_THICKNESS tall.
+            // Top edge: horizontal stripe, border_width tall.
             let steps = steps_for(pane_rect.width, cell_w);
             for i in 0..steps {
                 let x = pane_rect.x + i as f32 * cell_w;
-                out.push(solid_quad(x, pane_rect.y, cell_w, FOCUS_BORDER_THICKNESS, accent_color));
+                out.push(solid_quad(x, pane_rect.y, cell_w, border_width, accent_color));
             }
         }
     }
 }
-
-/// Workspace focus border thickness in pixels.
-const WS_FOCUS_BORDER_THICKNESS: f32 = 2.0;
 
 /// Build a solid accent border around the entire focused workspace rect.
 ///
@@ -120,8 +119,9 @@ pub fn build_workspace_focus_border(
     out: &mut Vec<CellInstance>,
     ws_rect: Rect,
     accent_color: [f32; 4],
+    border_width: f32,
 ) {
-    let t = WS_FOCUS_BORDER_THICKNESS;
+    let t = border_width;
     // Top edge
     out.push(solid_quad(ws_rect.x, ws_rect.y, ws_rect.width, t, accent_color));
     // Bottom edge

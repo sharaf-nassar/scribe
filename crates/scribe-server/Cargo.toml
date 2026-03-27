@@ -35,6 +35,11 @@ assets = [
     "755",
   ],
   [
+    "target/release/scribe-driver",
+    "usr/bin/",
+    "755",
+  ],
+  [
     "../../dist/scribe-server.service",
     "usr/lib/systemd/user/",
     "644",

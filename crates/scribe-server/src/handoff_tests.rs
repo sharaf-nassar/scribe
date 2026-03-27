@@ -76,6 +76,7 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
         workspaces: vec![],
         workspace_tree: None,
         windows: vec![],
+        driver_tasks: Vec::new(),
     };
 
     (state, masters, slaves)

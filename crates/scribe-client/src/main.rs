@@ -254,6 +254,8 @@ struct App {
     tab_bar_equalize_targets: Vec<(WorkspaceId, layout::Rect)>,
     /// Clickable rect for the status bar gear icon (updated each frame).
     status_bar_gear_rect: Option<layout::Rect>,
+    /// Clickable rect for the status bar robot icon (updated each frame).
+    status_bar_robot_rect: Option<layout::Rect>,
     /// Clickable rect for the status bar equalize icon (updated each frame).
     status_bar_equalize_rect: Option<layout::Rect>,
 
@@ -378,6 +380,7 @@ impl App {
             tab_drag_offsets: Vec::new(),
             tab_bar_equalize_targets: Vec::new(),
             status_bar_gear_rect: None,
+            status_bar_robot_rect: None,
             status_bar_equalize_rect: None,
             status_bar_tooltip_targets: Vec::new(),
             tab_bar_tooltip_targets: Vec::new(),
@@ -412,6 +415,7 @@ impl ApplicationHandler<UiEvent> for App {
         // Only for fresh launches (no --window-id), not spawned child windows.
         if self.window_id.is_none() {
             restore_settings_if_open();
+            restore_driver_if_open();
         }
     }
 
@@ -811,6 +815,11 @@ impl App {
         let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
         pane.feed_output(bytes);
+        // Standard terminal behavior: new output clears the selection
+        // unless the user is actively dragging to extend it.
+        if !self.mouse_selecting {
+            self.active_selection = None;
+        }
         // Invalidate the URL cache so it re-scans on next hover check.
         if let Some(cache) = self.url_caches.get_mut(&pane_id) {
             cache.mark_dirty();
@@ -1343,11 +1352,16 @@ impl App {
             self.tab_drag_offsets.clear();
         }
 
+        // Edge-scroll: keep scrolling while the cursor is near the pane edge
+        // during a selection drag, even when the mouse is not moving.
+        let edge_scrolling = self.maybe_edge_scroll();
+
         let drag_active = self.tab_drag.as_ref().is_some_and(|d| d.dragging);
         if !self.ai_tracker.needs_animation()
             && !scrollbar_animating
             && !tab_animating
             && !drag_active
+            && !edge_scrolling
         {
             self.animation_running = false;
             self.animation_stop.store(false, Ordering::Relaxed);
@@ -1840,6 +1854,12 @@ impl App {
         let sb_colors = status_bar::StatusBarColors::from_theme(&self.theme.chrome, ansi_colors);
         let divider_color = scribe_renderer::srgb_to_linear_rgba(self.theme.chrome.divider);
         let accent_color = scribe_renderer::srgb_to_linear_rgba(self.theme.chrome.accent);
+        let focus_border_color =
+            self.config.appearance.focus_border_color.as_deref().map_or(accent_color, |hex| {
+                scribe_common::theme::hex_to_rgba(hex)
+                    .map_or(accent_color, scribe_renderer::srgb_to_linear_rgba)
+            });
+        let focus_border_width = self.config.appearance.focus_border_width.clamp(1.0, 10.0);
 
         // Gather focused pane data for the window-level status bar.
         let focused_pane_cwd = self
@@ -1913,6 +1933,8 @@ impl App {
             tab_colors: &tab_colors,
             divider_color,
             accent_color,
+            focus_border_color,
+            focus_border_width,
             scrollbar_width,
             scrollbar_color,
             indicator_height: indicator_h,
@@ -1991,6 +2013,7 @@ impl App {
                 &mut resolve_glyph,
             );
             self.status_bar_gear_rect = sb_hits.gear_rect;
+            self.status_bar_robot_rect = sb_hits.robot_rect;
             self.status_bar_equalize_rect = sb_hits.equalize_rect;
             self.status_bar_tooltip_targets = sb_hits.tooltip_targets;
         }
@@ -2128,6 +2151,7 @@ impl App {
             KeyAction::Terminal(bytes) => self.handle_terminal_key(bytes),
             KeyAction::Layout(layout_action) => self.handle_layout_action(layout_action),
             KeyAction::OpenSettings => self.open_settings(),
+            KeyAction::OpenDriver => self.open_driver(),
             KeyAction::OpenFind => self.handle_open_find(),
         }
     }
@@ -3040,6 +3064,15 @@ impl App {
         open_or_focus_settings();
     }
 
+    /// Open the driver window or focus it if already running.
+    #[allow(
+        clippy::unused_self,
+        reason = "called as self.open_driver() from input handlers that hold &mut self"
+    )]
+    fn open_driver(&mut self) {
+        open_or_focus_driver();
+    }
+
     // -----------------------------------------------------------------------
     // Mouse
     // -----------------------------------------------------------------------
@@ -3186,6 +3219,14 @@ impl App {
         let ws_viewport =
             workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+
+        // Check for status-bar robot icon click (opens driver).
+        if let Some(robot) = self.status_bar_robot_rect {
+            if robot.contains(x, y) {
+                self.open_driver();
+                return;
+            }
+        }
 
         // Check for status-bar gear icon click (opens settings).
         if let Some(gear) = self.status_bar_gear_rect {
@@ -3501,8 +3542,11 @@ impl App {
         // Extend active text selection while mouse is held.
         self.extend_selection();
 
-        // Edge-scroll while selecting: scroll pane when cursor is near top/bottom edge.
-        self.maybe_edge_scroll();
+        // Ensure animation is ticking during selection drag so
+        // edge-scroll fires at a steady rate via the animation tick.
+        if self.mouse_selecting {
+            self.ensure_animation_running();
+        }
 
         // Update context menu hover if open.
         self.maybe_update_context_menu_hover();
@@ -3918,27 +3962,30 @@ impl App {
     }
 
     /// Scroll the focused pane if the cursor is near the top/bottom edge during drag selection.
-    fn maybe_edge_scroll(&mut self) {
+    /// Returns `true` if scrolling happened.
+    fn maybe_edge_scroll(&mut self) -> bool {
         if !self.mouse_selecting {
-            return;
+            return false;
         }
-        let Some((_, cursor_y)) = self.last_cursor_pos else { return };
+        let Some((_, cursor_y)) = self.last_cursor_pos else { return false };
         let tab_bar_h = self.focused_workspace_tab_bar_height();
-        let Some(pane_rect) = self.focused_pane_rect() else { return };
+        let Some(pane_rect) = self.focused_pane_rect() else { return false };
         let content_top = pane_rect.y + tab_bar_h;
         let content_bottom = pane_rect.y + pane_rect.height;
         let Some(delta) = mouse_state::edge_scroll_delta(cursor_y, content_top, content_bottom)
         else {
-            return;
+            return false;
         };
         let pane_id = self.window_layout.active_tab().map(|t| t.focused_pane);
-        let Some(pane_id) = pane_id else { return };
-        let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+        let Some(pane_id) = pane_id else { return false };
+        let Some(pane) = self.panes.get_mut(&pane_id) else { return false };
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
         pane.scrollbar_state.on_scroll_action();
         pane.content_dirty = true;
+        self.extend_selection();
         self.ensure_animation_running();
         self.request_redraw();
+        true
     }
 
     /// Update context menu hover state from current cursor position.
@@ -4462,6 +4509,7 @@ impl App {
 
     /// Send any pending resize IPC messages if the debounce interval has elapsed.
     fn flush_resize_if_due(&mut self) {
+        use alacritty_terminal::grid::Dimensions as _;
         if self.resize_pending.is_none_or(|t| t.elapsed() < RESIZE_DEBOUNCE) {
             return;
         }
@@ -4474,6 +4522,11 @@ impl App {
             if pane.last_sent_grid != Some(pane.grid) {
                 send_resize(&tx, pane.session_id, pane.grid.cols, pane.grid.rows);
                 pane.last_sent_grid = Some(pane.grid);
+            }
+            if pane.term.columns() != usize::from(pane.grid.cols)
+                || pane.term.screen_lines() != usize::from(pane.grid.rows)
+            {
+                pane.resize_term_only(pane.grid.cols, pane.grid.rows);
             }
         }
         self.resize_pending = None;
@@ -4949,6 +5002,8 @@ struct FrameStyle<'a> {
     tab_colors: &'a tab_bar::TabBarColors,
     divider_color: [f32; 4],
     accent_color: [f32; 4],
+    focus_border_color: [f32; 4],
+    focus_border_width: f32,
     scrollbar_width: f32,
     scrollbar_color: [f32; 4],
     indicator_height: f32,
@@ -5027,8 +5082,6 @@ fn build_all_instances(
             // Only the focused pane shows the blinking cursor; unfocused panes hide it.
             let is_focused = *pane_id == layout.focused_pane;
             let pane_cursor_visible = is_focused && interaction.cursor_visible;
-            let pane_has_selection = is_focused && effective_selection.is_some();
-
             // Background fill covering the full content area — emitted before
             // cell instances so cells draw on top.  Covers remainder pixels at
             // right/bottom edges left by floor-division of pixels by cell size.
@@ -5037,10 +5090,11 @@ fn build_all_instances(
 
             // Skip rebuilding instances when the pane content and all
             // rendering context (cursor blink, focus, selection) are unchanged.
+            let pane_sel = effective_selection.filter(|_| is_focused).copied();
             let needs_rebuild = pane.content_dirty
                 || pane.last_cursor_visible != Some(pane_cursor_visible)
                 || pane.last_was_focused != Some(is_focused)
-                || pane.last_had_selection != pane_has_selection;
+                || pane.last_selection != pane_sel;
 
             if needs_rebuild {
                 let mut instances = renderer.build_instances_at(
@@ -5069,7 +5123,7 @@ fn build_all_instances(
                 pane.content_dirty = false;
                 pane.last_cursor_visible = Some(pane_cursor_visible);
                 pane.last_was_focused = Some(is_focused);
-                pane.last_had_selection = pane_has_selection;
+                pane.last_selection = pane_sel;
             } else {
                 all_instances.extend_from_slice(&pane.last_instances);
             }
@@ -5105,7 +5159,12 @@ fn build_all_instances(
     // Focused workspace border — rendered after tab-bar background but before tab-bar text
     // so that AI indicator bars draw on top.
     if let Some(ws_rect) = layout.focused_ws_rect {
-        divider::build_workspace_focus_border(&mut all_instances, ws_rect, style.accent_color);
+        divider::build_workspace_focus_border(
+            &mut all_instances,
+            ws_rect,
+            style.focus_border_color,
+            style.focus_border_width,
+        );
     }
 
     // Tab bar text — rendered once per workspace, spanning the full workspace width.
@@ -5238,7 +5297,8 @@ fn build_all_instances(
                 &mut all_instances,
                 *focused_rect,
                 layout.focus_split_direction,
-                style.accent_color,
+                style.focus_border_color,
+                style.focus_border_width,
                 layout.cell_size,
             );
         }
@@ -6113,6 +6173,75 @@ fn restore_settings_if_open() {
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
             spawn_settings_process();
+        }
+    }
+}
+
+/// Open the driver window or focus it if already running.
+///
+/// Tries to connect to the driver socket. If connected, sends a focus
+/// command. If not, spawns the `scribe-driver` binary.
+fn open_or_focus_driver() {
+    let socket_path = scribe_common::socket::driver_socket_path();
+
+    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
+        use std::io::Write as _;
+        if let Err(e) = stream.write_all(b"{\"cmd\":\"focus\"}\n") {
+            tracing::warn!("failed to send focus command to driver: {e}");
+        } else {
+            tracing::debug!("sent focus to existing driver process");
+        }
+    } else {
+        spawn_driver_process();
+    }
+}
+
+/// Spawn the `scribe-driver` binary as a detached process.
+fn spawn_driver_process() {
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("scribe-driver"));
+    let driver_exe = exe.with_file_name("scribe-driver");
+
+    match std::process::Command::new(&driver_exe).spawn() {
+        Ok(child) => {
+            tracing::info!(pid = child.id(), "spawned driver process");
+        }
+        Err(e) => {
+            tracing::warn!(exe = %driver_exe.display(), "failed to spawn driver: {e}");
+        }
+    }
+}
+
+/// Check if driver was open at last exit and restore it.
+///
+/// Reads the state file directly (read-only, no `StateStore` retained).
+fn restore_driver_if_open() {
+    #[derive(serde::Deserialize)]
+    struct DriverOpenCheck {
+        #[serde(default)]
+        open: bool,
+    }
+
+    let Some(state_dir) = dirs::state_dir() else {
+        return;
+    };
+    let path = state_dir.join("scribe").join("driver_state.toml");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+
+    if let Ok(state) = toml::from_str::<DriverOpenCheck>(&content) {
+        if state.open {
+            // Kill any stale driver process so the newly-installed binary
+            // is used (e.g. after dpkg upgrade + server handoff).
+            let socket_path = scribe_common::socket::driver_socket_path();
+            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
+                use std::io::Write as _;
+                drop(stream.write_all(b"{\"cmd\":\"quit\"}\n"));
+                drop(stream);
+                // Brief pause for the old process to exit and release the socket.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            spawn_driver_process();
         }
     }
 }
