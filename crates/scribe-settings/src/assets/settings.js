@@ -587,7 +587,9 @@ function loadConfig(config) {
 
   // Appearance — Window
   setSliderValue("appearance.opacity", config.appearance?.opacity);
+  setStepperValue("appearance.tab_height", config.appearance?.tab_height);
   setStepperValue("appearance.tab_bar_padding", config.appearance?.tab_bar_padding);
+  setStepperValue("appearance.status_bar_height", config.appearance?.status_bar_height);
 
   // Terminal
   setStepperValue("terminal.scrollback_lines", config.terminal?.scrollback_lines);

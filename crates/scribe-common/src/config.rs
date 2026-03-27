@@ -125,12 +125,15 @@ pub struct AppearanceConfig {
     pub scrollbar_width: f32,
     #[serde(default)]
     pub scrollbar_color: Option<String>,
-    /// Vertical padding around tab bar text in pixels. The effective tab bar
-    /// height is `cell_height + tab_bar_padding`. `0` means no padding.
+    /// Vertical padding added to `tab_height` for the effective tab bar row height.
     #[serde(default = "default_tab_bar_padding")]
     pub tab_bar_padding: f32,
     #[serde(default = "default_tab_width")]
     pub tab_width: u16,
+    #[serde(default = "default_status_bar_height")]
+    pub status_bar_height: f32,
+    #[serde(default = "default_tab_height")]
+    pub tab_height: f32,
     #[serde(default)]
     pub content_padding: ContentPadding,
 }
@@ -152,6 +155,8 @@ impl Default for AppearanceConfig {
             scrollbar_color: None,
             tab_bar_padding: default_tab_bar_padding(),
             tab_width: default_tab_width(),
+            status_bar_height: default_status_bar_height(),
+            tab_height: default_tab_height(),
             content_padding: ContentPadding::default(),
         }
     }
@@ -195,6 +200,14 @@ fn default_tab_bar_padding() -> f32 {
 
 fn default_tab_width() -> u16 {
     20
+}
+
+fn default_status_bar_height() -> f32 {
+    24.0
+}
+
+fn default_tab_height() -> f32 {
+    28.0
 }
 
 fn default_content_padding_side() -> f32 {

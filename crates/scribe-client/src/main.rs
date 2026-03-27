@@ -1048,10 +1048,9 @@ impl App {
         self.report_workspace_tree();
     }
 
-    /// Compute the single-row tab bar height from cell height + configured padding.
+    /// Return the configured single-row tab bar height.
     fn effective_tab_bar_height(&self) -> f32 {
-        let cell_h = self.gpu.as_ref().map_or(20.0, |gpu| gpu.renderer.cell_size().height);
-        cell_h + self.config.appearance.tab_bar_padding
+        self.config.appearance.tab_height + self.config.appearance.tab_bar_padding
     }
 
     /// Compute the tab bar height for a specific workspace, accounting for
@@ -1061,11 +1060,8 @@ impl App {
         reason = "workspace name length is a small positive integer fitting in f32"
     )]
     fn tab_bar_height_for(&self, workspace_id: WorkspaceId, ws_rect: Rect) -> f32 {
-        let (cell_w, cell_h) = self.gpu.as_ref().map_or((8.0, 20.0), |g| {
-            let c = g.renderer.cell_size();
-            (c.width, c.height)
-        });
-        let row_h = cell_h + self.config.appearance.tab_bar_padding;
+        let cell_w = self.gpu.as_ref().map_or(8.0, |g| g.renderer.cell_size().width);
+        let row_h = self.config.appearance.tab_height;
         let tab_count =
             self.window_layout.find_workspace(workspace_id).map_or(1, |ws| ws.tabs.len().max(1));
         let badge_cols = tab_bar::badge_columns(
@@ -1092,7 +1088,8 @@ impl App {
     )]
     fn focused_workspace_tab_bar_height(&self) -> f32 {
         let Some(gpu) = &self.gpu else { return self.effective_tab_bar_height() };
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let ws_id = self.window_layout.focused_workspace_id();
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
         let ws_rect =
@@ -1126,7 +1123,8 @@ impl App {
         let Some(gpu) = self.gpu.as_ref() else {
             return (HashMap::new(), HashMap::new(), HashMap::new());
         };
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
         let cell = gpu.renderer.cell_size();
         let tab_bar_h = self.effective_tab_bar_height();
@@ -1165,7 +1163,7 @@ impl App {
             x: 0.0,
             y: 0.0,
             width: size.width as f32,
-            height: (size.height as f32 - status_bar::STATUS_BAR_HEIGHT).max(1.0),
+            height: (size.height as f32 - self.config.appearance.status_bar_height).max(1.0),
         };
         let cell = gpu.renderer.cell_size();
 
@@ -1511,10 +1509,14 @@ impl App {
         self.bindings = input::Bindings::parse(&new_config.keybindings);
 
         // -- Tab bar height / layout --
-        let tab_bar_changed =
-            (old.appearance.tab_bar_padding - new_config.appearance.tab_bar_padding).abs()
-                > f32::EPSILON
-                || old.appearance.tab_width != new_config.appearance.tab_width;
+        let tab_bar_changed = (old.appearance.tab_bar_padding
+            - new_config.appearance.tab_bar_padding)
+            .abs()
+            > f32::EPSILON
+            || old.appearance.tab_width != new_config.appearance.tab_width
+            || (old.appearance.tab_height - new_config.appearance.tab_height).abs() > f32::EPSILON
+            || (old.appearance.status_bar_height - new_config.appearance.status_bar_height).abs()
+                > f32::EPSILON;
 
         // -- Content padding --
         let old_pad = &old.appearance.content_padding;
@@ -1601,7 +1603,8 @@ impl App {
         }
         let Some(gpu) = &self.gpu else { return };
         let cell = gpu.renderer.cell_size();
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
 
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
         let expected_rects = collect_expected_pane_rects(&self.window_layout, &ws_rects);
@@ -1699,7 +1702,8 @@ impl App {
         }
 
         let full_viewport = viewport_rect(&gpu.surface_config);
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let cell_size = (gpu.renderer.cell_size().width, gpu.renderer.cell_size().height);
 
         // Get pane rects and dividers from ALL workspaces' active tabs.
@@ -1756,7 +1760,7 @@ impl App {
             let has_multiple_panes = tab.pane_layout.all_pane_ids().len() > 1;
 
             // Compute per-workspace tab bar height (may be multi-row).
-            let row_h = cell_size.1 + self.config.appearance.tab_bar_padding;
+            let row_h = self.config.appearance.tab_height;
             let badge_cols_for_h = tab_bar::badge_columns(ws.name.as_deref(), multi_workspace);
             #[allow(
                 clippy::cast_precision_loss,
@@ -1981,6 +1985,7 @@ impl App {
                 &mut all_instances,
                 full_viewport,
                 cell_size,
+                self.config.appearance.status_bar_height,
                 &sb_colors,
                 &sb_data,
                 &mut resolve_glyph,
@@ -2243,7 +2248,8 @@ impl App {
         };
 
         let Some(gpu) = &self.gpu else { return };
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let session_id = SessionId::new();
         let cell = gpu.renderer.cell_size();
 
@@ -2307,7 +2313,8 @@ impl App {
     fn handle_workspace_split(&mut self, direction: layout::SplitDirection) {
         let Some(gpu) = &self.gpu else { return };
         let accent = Some(self.theme.chrome.accent);
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let cell = gpu.renderer.cell_size();
 
         // Split the window layout tree, creating a new workspace region.
@@ -2453,7 +2460,8 @@ impl App {
 
     fn handle_focus_directional(&mut self, direction: layout::FocusDirection) {
         let Some(gpu) = &self.gpu else { return };
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let ws_id = self.window_layout.focused_workspace_id();
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
         let ws_rect =
@@ -2514,7 +2522,8 @@ impl App {
         let Some(pane_id) = self.window_layout.add_tab(workspace_id, session_id) else { return };
 
         let Some(gpu) = &self.gpu else { return };
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let cell = gpu.renderer.cell_size();
 
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
@@ -2941,7 +2950,8 @@ impl App {
     fn pane_id_at_cursor(&self) -> Option<PaneId> {
         let (x, y) = self.last_cursor_pos?;
         let gpu = self.gpu.as_ref()?;
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
 
         for (ws_id, ws_rect) in &ws_rects {
@@ -3172,7 +3182,8 @@ impl App {
     fn handle_mouse_press(&mut self) {
         let Some((x, y)) = self.last_cursor_pos else { return };
         let Some(gpu) = &self.gpu else { return };
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
 
         // Check for status-bar gear icon click (opens settings).
@@ -3636,7 +3647,8 @@ impl App {
     fn update_hover_cursor(&self, x: f32, y: f32) {
         let Some(gpu) = &self.gpu else { return };
         let Some(window) = &self.window else { return };
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
 
         // Check workspace dividers first.
         let ws_dividers = self.window_layout.collect_workspace_dividers(ws_viewport);
@@ -4213,7 +4225,8 @@ impl App {
     )]
     fn focused_pane_rect(&self) -> Option<Rect> {
         let gpu = self.gpu.as_ref()?;
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
         let focused_ws = self.window_layout.focused_workspace_id();
         let ws_rect =
@@ -4347,7 +4360,8 @@ impl App {
     )]
     fn resize_after_layout_change(&mut self) {
         let Some(gpu) = &self.gpu else { return };
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
 
         let rects = self.window_layout.active_tab().map_or_else(Vec::new, |tab| {
@@ -4373,7 +4387,8 @@ impl App {
     )]
     fn resize_all_workspace_panes(&mut self) {
         let Some(gpu) = &self.gpu else { return };
-        let ws_viewport = workspace_viewport(&gpu.surface_config);
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let cell = gpu.renderer.cell_size();
         let tab_bar_h = self.effective_tab_bar_height();
         let padding = pane::effective_padding(
@@ -5628,12 +5643,12 @@ fn viewport_rect(config: &wgpu::SurfaceConfiguration) -> Rect {
 /// Return the viewport rect available to workspaces — full surface minus
 /// the window-level status bar at the bottom.
 #[allow(clippy::cast_precision_loss, reason = "viewport dimensions are small enough to fit in f32")]
-fn workspace_viewport(config: &wgpu::SurfaceConfiguration) -> Rect {
+fn workspace_viewport(config: &wgpu::SurfaceConfiguration, status_bar_height: f32) -> Rect {
     Rect {
         x: 0.0,
         y: 0.0,
         width: config.width as f32,
-        height: (config.height as f32 - status_bar::STATUS_BAR_HEIGHT).max(1.0),
+        height: (config.height as f32 - status_bar_height).max(1.0),
     }
 }
 

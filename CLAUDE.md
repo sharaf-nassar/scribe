@@ -223,7 +223,7 @@ Window
 - **Tab (Session)**: A shell session within a workspace, shown in that workspace's tab bar.
 - **Pane**: A split within a tab's content area. Panes divide the active tab, not the workspace.
 - **Workspace Badge**: Colored dot + workspace name shown in the tab bar. Only visible when 2+ workspaces are open. Separated from tabs by a gap.
-- **Status Bar**: A single bar at the bottom of the window (not per-workspace). Shows: connection dot, focused workspace name, CWD, git branch, session count, hostname, and time. The workspace viewport is shrunk by `STATUS_BAR_HEIGHT` (24px) before workspace rects are computed, so the bar occupies the gap below all workspaces.
+- **Status Bar**: A single bar at the bottom of the window (not per-workspace). Shows: connection dot, focused workspace name, CWD, git branch, session count, hostname, and time. The workspace viewport is shrunk by `config.appearance.status_bar_height` (default 24px) before workspace rects are computed, so the bar occupies the gap below all workspaces.
 
 Workspaces are never tabbed — they always occupy visible screen real estate side by side.
 

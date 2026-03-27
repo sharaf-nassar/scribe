@@ -124,6 +124,22 @@ fn apply_config_key(
             let v = value.as_f64().ok_or("tab_width must be a number")? as u16;
             config.appearance.tab_width = v.clamp(8, 50);
         }
+        "appearance.status_bar_height" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "status bar height is a small positive float"
+            )]
+            let v = value.as_f64().ok_or("status_bar_height must be a number")? as f32;
+            config.appearance.status_bar_height = v.clamp(8.0, 48.0);
+        }
+        "appearance.tab_height" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "tab height is a small positive float"
+            )]
+            let v = value.as_f64().ok_or("tab_height must be a number")? as f32;
+            config.appearance.tab_height = v.clamp(16.0, 60.0);
+        }
         "appearance.content_padding_top" => {
             #[allow(
                 clippy::cast_possible_truncation,

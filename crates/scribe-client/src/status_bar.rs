@@ -14,9 +14,6 @@ use crate::layout::Rect;
 use crate::sys_stats::SystemStats;
 use crate::tooltip::TooltipAnchor;
 
-/// Height of the status bar in pixels.
-pub const STATUS_BAR_HEIGHT: f32 = 24.0;
-
 /// Clickable regions produced by [`build_status_bar`].
 pub struct StatusBarHitTargets {
     /// Clickable rect for the equalize icon.
@@ -117,15 +114,16 @@ impl StatusBarColors {
 /// Build cell instances for the window-level status bar.
 ///
 /// The bar spans the full `window_rect` width and is anchored at
-/// `window_rect.y + window_rect.height - STATUS_BAR_HEIGHT`.
+/// `window_rect.y + window_rect.height - status_bar_height`.
 #[allow(
     clippy::too_many_arguments,
-    reason = "needs rect, cell size, colors, data, and glyph resolver for full status bar rendering"
+    reason = "needs rect, cell size, bar height, colors, data, and glyph resolver for full status bar rendering"
 )]
 pub fn build_status_bar(
     out: &mut Vec<CellInstance>,
     window_rect: Rect,
     cell_size: (f32, f32),
+    status_bar_height: f32,
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
@@ -139,9 +137,17 @@ pub fn build_status_bar(
         };
     }
 
-    let bar_y = window_rect.y + window_rect.height - STATUS_BAR_HEIGHT;
+    let bar_y = window_rect.y + window_rect.height - status_bar_height;
     let max_cols = columns_in_width(window_rect.width, cell_w);
-    let mut w = BarWriter { out, x_origin: window_rect.x, y: bar_y, cell_w, max_cols, col: 0 };
+    let mut w = BarWriter {
+        out,
+        x_origin: window_rect.x,
+        y: bar_y,
+        cell_w,
+        max_cols,
+        col: 0,
+        bar_height: status_bar_height,
+    };
 
     // 1px hairline separator at the top edge.
     w.out.push(scribe_renderer::chrome::solid_quad(
@@ -153,7 +159,7 @@ pub fn build_status_bar(
     ));
 
     // Two-tone gradient background: lighter top half, darker bottom half.
-    let half = STATUS_BAR_HEIGHT / 2.0;
+    let half = status_bar_height / 2.0;
     build_background(
         w.out,
         w.x_origin,
@@ -193,6 +199,7 @@ struct BarWriter<'a> {
     cell_w: f32,
     max_cols: usize,
     col: usize,
+    bar_height: f32,
 }
 
 impl BarWriter<'_> {
@@ -204,7 +211,7 @@ impl BarWriter<'_> {
     fn col_rect(&self, start_col: usize) -> Rect {
         let x = self.x_origin + start_col as f32 * self.cell_w;
         let width = (self.col - start_col) as f32 * self.cell_w;
-        Rect { x, y: self.y, width, height: STATUS_BAR_HEIGHT }
+        Rect { x, y: self.y, width, height: self.bar_height }
     }
 
     /// Emit a single character at the current column with the given colors.
@@ -458,7 +465,7 @@ fn render_equalize(
     w.put('\u{229E}', colors.text, colors.bg, resolve_glyph);
     let eq_x = w.x_origin + eq_col as f32 * w.cell_w;
     let eq_width = (w.col - eq_col) as f32 * w.cell_w;
-    Some(Rect { x: eq_x, y: w.y, width: eq_width, height: STATUS_BAR_HEIGHT })
+    Some(Rect { x: eq_x, y: w.y, width: eq_width, height: w.bar_height })
 }
 
 /// Render the gear icon and return its clickable rect.
@@ -480,7 +487,7 @@ fn render_gear(
     w.put(' ', colors.text, colors.bg, resolve_glyph);
     let gear_x = w.x_origin + gear_col as f32 * w.cell_w;
     let gear_width = (w.col - gear_col) as f32 * w.cell_w;
-    Some(Rect { x: gear_x, y: w.y, width: gear_width, height: STATUS_BAR_HEIGHT })
+    Some(Rect { x: gear_x, y: w.y, width: gear_width, height: w.bar_height })
 }
 
 /// Map a 0-100 percentage to a Unicode block element (▁▂▃▄▅▆▇█).
