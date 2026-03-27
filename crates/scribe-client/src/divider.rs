@@ -108,6 +108,35 @@ pub fn build_focus_border(
     }
 }
 
+/// Workspace focus border thickness in pixels.
+const WS_FOCUS_BORDER_THICKNESS: f32 = 2.0;
+
+/// Build a solid accent border around the entire focused workspace rect.
+///
+/// Draws four thin quads (top, bottom, left, right edges) so the focused
+/// workspace is visually distinct from unfocused siblings.
+pub fn build_workspace_focus_border(
+    out: &mut Vec<CellInstance>,
+    ws_rect: Rect,
+    accent_color: [f32; 4],
+) {
+    let t = WS_FOCUS_BORDER_THICKNESS;
+    // Top edge
+    out.push(solid_quad(ws_rect.x, ws_rect.y, ws_rect.width, t, accent_color));
+    // Bottom edge
+    out.push(solid_quad(ws_rect.x, ws_rect.y + ws_rect.height - t, ws_rect.width, t, accent_color));
+    // Left edge (inset by t to avoid corner overlap)
+    out.push(solid_quad(ws_rect.x, ws_rect.y + t, t, ws_rect.height - t * 2.0, accent_color));
+    // Right edge (inset by t to avoid corner overlap)
+    out.push(solid_quad(
+        ws_rect.x + ws_rect.width - t,
+        ws_rect.y + t,
+        t,
+        ws_rect.height - t * 2.0,
+        accent_color,
+    ));
+}
+
 /// Create a `DividerDrag` from a divider and its parent viewport.
 pub fn start_drag(divider: &Divider, viewport: Rect) -> DividerDrag {
     let (parent_extent, parent_origin) = match divider.direction {

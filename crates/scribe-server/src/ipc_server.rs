@@ -17,7 +17,7 @@ use alacritty_terminal::grid::Dimensions as _;
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
-use scribe_common::protocol::{ClientMessage, ServerMessage, SessionInfo};
+use scribe_common::protocol::{ClientMessage, ServerMessage, SessionInfo, WorkspaceTreeNode};
 use scribe_common::socket::current_uid;
 use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
@@ -374,6 +374,21 @@ async fn detach_sessions(live_sessions: &LiveSessionRegistry, ids: &HashSet<Sess
     }
 }
 
+/// Extract per-workspace session order from a reported tree and apply it.
+fn apply_tab_order_from_tree(wm: &mut WorkspaceManager, tree: &WorkspaceTreeNode) {
+    match tree {
+        WorkspaceTreeNode::Leaf { workspace_id, session_ids } => {
+            if !session_ids.is_empty() {
+                wm.reorder_sessions(*workspace_id, session_ids);
+            }
+        }
+        WorkspaceTreeNode::Split { first, second, .. } => {
+            apply_tab_order_from_tree(wm, first);
+            apply_tab_order_from_tree(wm, second);
+        }
+    }
+}
+
 /// Dispatch a single `ClientMessage` to the appropriate handler.
 #[allow(
     clippy::too_many_arguments,
@@ -458,6 +473,7 @@ async fn dispatch_message(
         ClientMessage::ReportWorkspaceTree { tree } => {
             debug!(%window_id, "received workspace tree from client");
             let mut wm = workspace_manager.write().await;
+            apply_tab_order_from_tree(&mut wm, &tree);
             wm.set_workspace_tree(tree.clone());
             wm.set_window_tree(window_id, tree);
         }
@@ -479,6 +495,9 @@ async fn dispatch_message(
         ClientMessage::DismissUpdate => {
             info!(%window_id, "client dismissed update notification");
             updater_handle.dismiss();
+        }
+        ClientMessage::FocusChanged { gained, lost } => {
+            handle_focus_changed(gained, lost, live_sessions, attached_ids).await;
         }
         other => {
             debug!(?other, "unhandled client message");
@@ -670,6 +689,50 @@ async fn handle_key_input(
     let mut pty_write = session.pty_write.lock().await;
     if let Err(e) = pty_write.write_all(data).await {
         warn!(%session_id, "failed to write to PTY: {e}");
+    }
+}
+
+/// Return `true` when the session has `TermMode::FOCUS_IN_OUT` active.
+async fn session_has_focus_mode(session: &LiveSession) -> bool {
+    let term = session.term.lock().await;
+    term.mode().contains(alacritty_terminal::term::TermMode::FOCUS_IN_OUT)
+}
+
+/// Write a CSI focus byte sequence to a session's PTY if it has opted in.
+async fn send_focus_event(session: &LiveSession, bytes: &[u8]) {
+    if session_has_focus_mode(session).await {
+        let mut pty_write = session.pty_write.lock().await;
+        if let Err(e) = pty_write.write_all(bytes).await {
+            debug!("focus event write failed: {e}");
+        }
+    }
+}
+
+/// Send CSI focus events to PTY sessions that have DECSET 1004 enabled.
+///
+/// When a session has `TermMode::FOCUS_IN_OUT` active, write `\x1b[I`
+/// (focus gained) or `\x1b[O` (focus lost) to the PTY so the
+/// application can respond (e.g. hide cursor, reduce animation).
+async fn handle_focus_changed(
+    gained: Option<SessionId>,
+    lost: Option<SessionId>,
+    live_sessions: &LiveSessionRegistry,
+    attached_ids: &HashSet<SessionId>,
+) {
+    let sessions = live_sessions.read().await;
+    if let Some(lost_id) = lost {
+        if attached_ids.contains(&lost_id) {
+            if let Some(session) = sessions.get(&lost_id) {
+                send_focus_event(session, b"\x1b[O").await;
+            }
+        }
+    }
+    if let Some(gained_id) = gained {
+        if attached_ids.contains(&gained_id) {
+            if let Some(session) = sessions.get(&gained_id) {
+                send_focus_event(session, b"\x1b[I").await;
+            }
+        }
     }
 }
 

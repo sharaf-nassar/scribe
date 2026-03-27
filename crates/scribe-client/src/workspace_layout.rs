@@ -664,7 +664,7 @@ fn direction_to_protocol(d: SplitDirection) -> LayoutDirection {
 /// Recursively build a `WindowNode` tree from a `WorkspaceTreeNode`.
 fn node_from_tree(tree: &WorkspaceTreeNode) -> WindowNode {
     match tree {
-        WorkspaceTreeNode::Leaf { workspace_id } => WindowNode::Workspace(WorkspaceSlot {
+        WorkspaceTreeNode::Leaf { workspace_id, .. } => WindowNode::Workspace(WorkspaceSlot {
             workspace_id: *workspace_id,
             tabs: Vec::new(),
             active_tab: 0,
@@ -683,7 +683,10 @@ fn node_from_tree(tree: &WorkspaceTreeNode) -> WindowNode {
 /// Recursively serialise a `WindowNode` tree to a `WorkspaceTreeNode`.
 fn node_to_tree(node: &WindowNode) -> WorkspaceTreeNode {
     match node {
-        WindowNode::Workspace(slot) => WorkspaceTreeNode::Leaf { workspace_id: slot.workspace_id },
+        WindowNode::Workspace(slot) => WorkspaceTreeNode::Leaf {
+            workspace_id: slot.workspace_id,
+            session_ids: slot.tabs.iter().map(|tab| tab.session_id).collect(),
+        },
         WindowNode::Split { direction, ratio, first, second } => WorkspaceTreeNode::Split {
             direction: direction_to_protocol(*direction),
             ratio: *ratio,
@@ -1060,8 +1063,11 @@ mod tests {
         let tree = WorkspaceTreeNode::Split {
             direction: LayoutDirection::Vertical,
             ratio: 0.3,
-            first: Box::new(WorkspaceTreeNode::Leaf { workspace_id: ws_a }),
-            second: Box::new(WorkspaceTreeNode::Leaf { workspace_id: WorkspaceId::new() }),
+            first: Box::new(WorkspaceTreeNode::Leaf { workspace_id: ws_a, session_ids: vec![] }),
+            second: Box::new(WorkspaceTreeNode::Leaf {
+                workspace_id: WorkspaceId::new(),
+                session_ids: vec![],
+            }),
         };
 
         let layout = WindowLayout::from_tree(&tree);

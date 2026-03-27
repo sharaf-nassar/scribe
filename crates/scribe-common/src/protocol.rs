@@ -125,6 +125,15 @@ pub enum ClientMessage {
     TriggerUpdate,
     /// User dismissed the update notification.
     DismissUpdate,
+    /// Notify server of pane focus change so it can send CSI focus events
+    /// to PTY applications that have enabled DECSET 1004 (`FOCUS_IN_OUT`).
+    FocusChanged {
+        /// Session that gained focus. `None` when window lost OS focus.
+        gained: Option<SessionId>,
+        /// Session that lost focus. `None` when window gained OS focus
+        /// (previous focus is unknown from the first focus event).
+        lost: Option<SessionId>,
+    },
 }
 
 // ── Server → UI ──────────────────────────────────────────────────
@@ -258,7 +267,13 @@ pub enum LayoutDirection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkspaceTreeNode {
     /// A single workspace occupying its entire region.
-    Leaf { workspace_id: WorkspaceId },
+    Leaf {
+        workspace_id: WorkspaceId,
+        /// Ordered session IDs for tabs in this workspace.
+        /// Populated by client when reporting tree; empty when received from server.
+        #[serde(default)]
+        session_ids: Vec<SessionId>,
+    },
     /// A split dividing space between two sub-trees.
     Split {
         direction: LayoutDirection,

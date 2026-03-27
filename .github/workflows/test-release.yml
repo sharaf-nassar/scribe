@@ -1,9 +1,7 @@
-name: Release
+name: Test Release Pipeline
 
 on:
-  push:
-    tags:
-      - 'v[0-9]*'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -40,9 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Inject version
-        env:
-          TAG: ${{ github.ref_name }}
-        run: bash dist/ci/inject-version.sh "${TAG#v}"
+        run: bash dist/ci/inject-version.sh "0.0.0-test"
 
       - name: Install Linux dependencies
         if: matrix.os == 'linux'
@@ -77,9 +73,7 @@ jobs:
 
       - name: Build DMG
         if: matrix.os == 'macos'
-        env:
-          TAG: ${{ github.ref_name }}
-        run: bash dist/macos/build-dmg.sh --skip-build --version "${TAG#v}"
+        run: bash dist/macos/build-dmg.sh --skip-build --version "0.0.0-test"
 
       - name: Sign and notarize DMG
         if: matrix.os == 'macos'
@@ -108,17 +102,16 @@ jobs:
         id: artifact
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-          TAG: ${{ github.ref_name }}
           MATRIX_OS: ${{ matrix.os }}
           MATRIX_LABEL: ${{ matrix.label }}
           MATRIX_TARGET: ${{ matrix.target }}
         run: |
           if [[ "$MATRIX_OS" == "linux" ]]; then
             SRC=$(find "target/${MATRIX_TARGET}/debian" -name '*.deb' | head -1)
-            DEST="scribe_${TAG}_${MATRIX_LABEL}.deb"
+            DEST="scribe_v0.0.0-test_${MATRIX_LABEL}.deb"
           else
             SRC="target/Scribe.dmg"
-            DEST="Scribe_${TAG}_${MATRIX_LABEL}.dmg"
+            DEST="Scribe_v0.0.0-test_${MATRIX_LABEL}.dmg"
           fi
           cp "$SRC" "$DEST"
           KEYFILE="$(mktemp)"
@@ -130,47 +123,15 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.label }}
+          name: test-${{ matrix.label }}
           path: |
             ${{ steps.artifact.outputs.artifact }}
             ${{ steps.artifact.outputs.sigfile }}
           if-no-files-found: error
 
-  publish:
-    name: Publish release
-    needs: build
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
-          path: artifacts
-
-      - name: Extract release notes
-        id: notes
-        env:
-          TAG: ${{ github.ref_name }}
+      - name: Summary
         run: |
-          NOTES=$(git tag -l --format='%(contents)' "$TAG")
-          {
-            echo "notes<<RELEASE_NOTES_EOF"
-            echo "$NOTES"
-            echo "RELEASE_NOTES_EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --notes "${{ steps.notes.outputs.notes }}" \
-            artifacts/*.deb artifacts/*.dmg artifacts/*.minisig
+          echo "### Build ${{ matrix.label }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Target: \`${{ matrix.target }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Artifact: \`${{ steps.artifact.outputs.artifact }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Signature: \`${{ steps.artifact.outputs.sigfile }}\`" >> "$GITHUB_STEP_SUMMARY"

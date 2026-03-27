@@ -8,6 +8,7 @@ use alacritty_terminal::Term;
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::{Cell, Flags};
 
 use scribe_common::config::ContentPadding;
 
@@ -19,6 +20,18 @@ use crate::mouse_state::SelectionMode;
 pub struct SelectionPoint {
     pub row: i32,
     pub col: usize,
+}
+
+impl PartialOrd for SelectionPoint {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SelectionPoint {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.row.cmp(&other.row).then(self.col.cmp(&other.col))
+    }
 }
 
 /// A range of selected cells between two grid positions.
@@ -160,14 +173,16 @@ pub fn pixel_to_grid(
 /// Selection rows are **absolute grid lines** (0 = viewport top, negative =
 /// scrollback), matching the `Line` index used by `alacritty_terminal`.
 /// Walks rows from the normalised start to the normalised end, collecting
-/// cell characters.  Trailing spaces on each row are trimmed, and rows are
-/// joined with `'\n'`.
+/// cell characters.  Trailing spaces on each row are trimmed.  Rows that wrap
+/// into the next row (WRAPLINE flag set on the last cell) are joined without
+/// a newline; other row boundaries produce `'\n'`.
 pub fn extract_text(term: &Term<VoidListener>, range: &SelectionRange) -> String {
     let (lo, hi) = range.normalized();
 
     let cols = term.grid().columns();
-
-    let mut lines: Vec<String> = Vec::new();
+    let last_col = Column(cols.saturating_sub(1));
+    let mut out = String::new();
+    let mut prev_row: Option<i32> = None;
 
     let mut row = lo.row;
     while row <= hi.row {
@@ -184,14 +199,22 @@ pub fn extract_text(term: &Term<VoidListener>, range: &SelectionRange) -> String
             col_idx = col_idx.saturating_add(1);
         }
 
-        // Trim trailing spaces from this row.
         let trimmed = line_buf.trim_end();
-        lines.push(trimmed.to_owned());
+
+        // Insert separator: newline unless the previous row wraps into this one.
+        if let Some(pr) = prev_row {
+            let wraps = read_cell_flags(term, Line(pr), last_col).contains(Flags::WRAPLINE);
+            if !wraps {
+                out.push('\n');
+            }
+        }
+        out.push_str(trimmed);
+        prev_row = Some(row);
 
         row = row.saturating_add(1);
     }
 
-    lines.join("\n")
+    out
 }
 
 /// Return whether `c` is a word character for double-click word selection.
@@ -246,10 +269,15 @@ pub fn word_bounds_at(
     )
 }
 
-/// Return the start and end of the full line at `row`.
+/// Return the start and end of the full logical line at `row`, spanning any
+/// WRAPLINE-connected screen rows.
 pub fn line_bounds_at(term: &Term<VoidListener>, row: i32) -> (SelectionPoint, SelectionPoint) {
+    let logical = logical_line_at(term, row);
     let last_col = term.grid().columns().saturating_sub(1);
-    (SelectionPoint { row, col: 0 }, SelectionPoint { row, col: last_col })
+    (
+        SelectionPoint { row: logical.first, col: 0 },
+        SelectionPoint { row: logical.last, col: last_col },
+    )
 }
 
 /// Extend a word-mode selection during double-click drag.
@@ -262,10 +290,8 @@ pub fn extend_by_word(
     anchor_end: SelectionPoint,
     new_point: SelectionPoint,
 ) -> SelectionRange {
-    let after_end = new_point.row > anchor_end.row
-        || (new_point.row == anchor_end.row && new_point.col > anchor_end.col);
-    let before_start = new_point.row < anchor_start.row
-        || (new_point.row == anchor_start.row && new_point.col < anchor_start.col);
+    let after_end = new_point > anchor_end;
+    let before_start = new_point < anchor_start;
 
     if after_end {
         let (_, word_end) = word_bounds_at(term, new_point);
@@ -278,15 +304,90 @@ pub fn extend_by_word(
     }
 }
 
-/// Read a single cell character from the terminal grid.
+/// Extend a line-mode selection during triple-click drag.
+///
+/// `anchor_start` and `anchor_end` are the line bounds from the initial
+/// triple-click.  `new_point` is the current drag position.
+pub fn extend_by_line(
+    term: &Term<VoidListener>,
+    anchor_start: SelectionPoint,
+    anchor_end: SelectionPoint,
+    new_point: SelectionPoint,
+) -> SelectionRange {
+    let after_end = new_point > anchor_end;
+    let before_start = new_point < anchor_start;
+
+    if after_end {
+        let (_, drag_line_end) = line_bounds_at(term, new_point.row);
+        SelectionRange::line(anchor_start, drag_line_end)
+    } else if before_start {
+        let (drag_line_start, _) = line_bounds_at(term, new_point.row);
+        SelectionRange::line(drag_line_start, anchor_end)
+    } else {
+        SelectionRange::line(anchor_start, anchor_end)
+    }
+}
+
+/// Return a reference to a single cell from the terminal grid.
 ///
 /// `alacritty_terminal`'s `Grid` and `Row` only implement the `Index` trait
 /// with no fallible `.get()` alternative, so we must use indexing here.
-pub fn read_cell_char(term: &Term<VoidListener>, line: Line, col: Column) -> char {
+fn read_cell(term: &Term<VoidListener>, line: Line, col: Column) -> &Cell {
     #[allow(
         clippy::indexing_slicing,
         reason = "alacritty_terminal grid only supports Index trait, no get() alternative"
     )]
-    let cell = &term.grid()[line][col];
-    cell.c
+    &term.grid()[line][col]
+}
+
+/// Read a single cell character from the terminal grid.
+pub fn read_cell_char(term: &Term<VoidListener>, line: Line, col: Column) -> char {
+    read_cell(term, line, col).c
+}
+
+/// Read the flags of a single cell from the terminal grid.
+fn read_cell_flags(term: &Term<VoidListener>, line: Line, col: Column) -> Flags {
+    read_cell(term, line, col).flags
+}
+
+/// The row extent of a wrapped logical line.
+#[derive(Debug, Clone, Copy)]
+struct LogicalLine {
+    first: i32,
+    last: i32,
+}
+
+/// Find the full extent of the logical line that contains `row`, following
+/// WRAPLINE flags to join screen rows that belong to the same logical line.
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "topmost_line/bottommost_line are bounded by scrollback_lines (≤ 100_000), fits in i32"
+)]
+fn logical_line_at(term: &Term<VoidListener>, row: i32) -> LogicalLine {
+    let topmost = term.grid().topmost_line().0;
+    let bottommost = term.grid().bottommost_line().0;
+    let last_col = Column(term.grid().columns().saturating_sub(1));
+
+    // Scan upward: row_above wraps into row_above+1 when it has WRAPLINE set.
+    let mut first = row;
+    while first > topmost {
+        let above = first - 1;
+        if read_cell_flags(term, Line(above), last_col).contains(Flags::WRAPLINE) {
+            first = above;
+        } else {
+            break;
+        }
+    }
+
+    // Scan downward: current row wraps into current+1 when it has WRAPLINE set.
+    let mut last = row;
+    while last < bottommost {
+        if read_cell_flags(term, Line(last), last_col).contains(Flags::WRAPLINE) {
+            last += 1;
+        } else {
+            break;
+        }
+    }
+
+    LogicalLine { first, last }
 }

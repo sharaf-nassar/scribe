@@ -115,6 +115,7 @@ impl MouseClickState {
         self.click_count = 0;
         self.last_press_time = None;
         self.last_press_point = None;
+        self.selection_mode = SelectionMode::Cell;
     }
 }
 

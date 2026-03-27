@@ -272,13 +272,42 @@ impl WorkspaceManager {
         debug!(%session_id, %window_id, "assigned session to window");
     }
 
-    /// Return all session IDs belonging to a window.
+    /// Return all session IDs belonging to a window, in workspace-stored order.
     pub fn sessions_for_window(&self, window_id: WindowId) -> Vec<SessionId> {
-        self.session_to_window
+        // Collect which sessions belong to this window.
+        let window_sids: HashSet<SessionId> = self
+            .session_to_window
             .iter()
             .filter(|&(_, &wid)| wid == window_id)
             .map(|(&sid, _)| sid)
+            .collect();
+
+        // Walk workspaces and emit sessions in their stored order,
+        // filtered to only those belonging to this window.
+        self.workspaces
+            .values()
+            .flat_map(|ws| &ws.sessions)
+            .copied()
+            .filter(|sid| window_sids.contains(sid))
             .collect()
+    }
+
+    /// Reorder the sessions in a workspace to match the given order.
+    ///
+    /// Sessions in `ordered` that don't belong to the workspace are ignored.
+    /// Sessions in the workspace but missing from `ordered` are appended at the end.
+    pub fn reorder_sessions(&mut self, workspace_id: WorkspaceId, ordered: &[SessionId]) {
+        let Some(ws) = self.workspaces.get_mut(&workspace_id) else { return };
+        let existing: HashSet<SessionId> = ws.sessions.iter().copied().collect();
+        let mut new_order: Vec<SessionId> =
+            ordered.iter().copied().filter(|s| existing.contains(s)).collect();
+        // Append any sessions not in the ordered list (shouldn't happen normally).
+        for &s in &ws.sessions {
+            if !new_order.contains(&s) {
+                new_order.push(s);
+            }
+        }
+        ws.sessions = new_order;
     }
 
     /// Return the window that owns a session, if any.
@@ -593,8 +622,8 @@ mod tests {
         let tree = WorkspaceTreeNode::Split {
             direction: LayoutDirection::Vertical,
             ratio: 0.4,
-            first: Box::new(WorkspaceTreeNode::Leaf { workspace_id: ws_a }),
-            second: Box::new(WorkspaceTreeNode::Leaf { workspace_id: ws_b }),
+            first: Box::new(WorkspaceTreeNode::Leaf { workspace_id: ws_a, session_ids: vec![] }),
+            second: Box::new(WorkspaceTreeNode::Leaf { workspace_id: ws_b, session_ids: vec![] }),
         };
         mgr.set_workspace_tree(tree);
 

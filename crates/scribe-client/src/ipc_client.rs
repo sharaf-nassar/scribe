@@ -56,6 +56,8 @@ pub enum ClientCommand {
     TriggerUpdate,
     /// User dismissed update notification.
     DismissUpdate,
+    /// Notify server of pane focus change for CSI focus events.
+    FocusChanged { gained: Option<SessionId>, lost: Option<SessionId> },
 }
 
 /// Events forwarded from the IPC background thread to the winit event loop.
@@ -310,6 +312,9 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         ClientCommand::QuitAll => ClientMessage::QuitAll,
         ClientCommand::TriggerUpdate => ClientMessage::TriggerUpdate,
         ClientCommand::DismissUpdate => ClientMessage::DismissUpdate,
+        ClientCommand::FocusChanged { gained, lost } => {
+            ClientMessage::FocusChanged { gained, lost }
+        }
     }
 }
 

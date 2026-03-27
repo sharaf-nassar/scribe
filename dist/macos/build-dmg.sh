@@ -106,7 +106,7 @@ cp "${SCRIPT_DIR}/Info.plist" "${CONTENTS}/Info.plist"
 
 # Inject version into staged Info.plist if --version was provided
 if [[ -n "$VERSION" ]]; then
-    sed -i \
+    sed -i '' \
         "/<key>CFBundleShortVersionString<\/key>/{n; s|<string>[^<]*</string>|<string>${VERSION}</string>|;}" \
         "${CONTENTS}/Info.plist"
 fi

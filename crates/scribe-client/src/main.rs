@@ -93,7 +93,7 @@ struct TabDrag {
 /// Application state for the winit event loop.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "App tracks independent boolean flags: animation, splash, cursor visibility, blink"
+    reason = "App tracks independent boolean flags: animation, splash, cursor visibility, blink, window focus"
 )]
 struct App {
     // Window identity
@@ -134,6 +134,8 @@ struct App {
     mouse_click: mouse_state::MouseClickState,
     /// Word bounds from the initial double-click (for drag-by-word).
     word_drag_anchor: Option<(selection::SelectionPoint, selection::SelectionPoint)>,
+    /// Line bounds from the initial triple-click (for drag-by-line).
+    line_drag_anchor: Option<(selection::SelectionPoint, selection::SelectionPoint)>,
 
     // Connection state
     /// Whether the IPC connection to the server is alive.
@@ -213,6 +215,8 @@ struct App {
     cursor_visible: bool,
     /// Whether cursor blinking is enabled (from config).
     cursor_blink_enabled: bool,
+    /// Whether the OS window currently has focus.
+    window_focused: bool,
     /// Time of last blink toggle.
     blink_timer: Instant,
 
@@ -324,6 +328,7 @@ impl App {
             mouse_selecting: false,
             mouse_click: mouse_state::MouseClickState::new(),
             word_drag_anchor: None,
+            line_drag_anchor: None,
             server_connected: false,
             ai_tracker: AiStateTracker::new(claude_states),
             animation_running: false,
@@ -354,6 +359,7 @@ impl App {
             last_tick: Instant::now(),
             cursor_visible: true,
             cursor_blink_enabled,
+            window_focused: true,
             blink_timer: Instant::now(),
             opacity,
             window_transparent,
@@ -611,6 +617,19 @@ impl ApplicationHandler<UiEvent> for App {
                     self.last_cursor_pos = Some((position.x as f32, position.y as f32));
                 }
                 self.handle_cursor_moved();
+            }
+            WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
+                if focused {
+                    self.cursor_visible = true;
+                    self.blink_timer = Instant::now();
+                    let session = self.focused_session_id();
+                    self.notify_focus_change(session, None);
+                } else {
+                    let session = self.focused_session_id();
+                    self.notify_focus_change(None, session);
+                }
+                self.request_redraw();
             }
             _ => {}
         }
@@ -1813,7 +1832,7 @@ impl App {
             self.cursor_visible = !self.cursor_visible;
             self.blink_timer = Instant::now();
         }
-        let cursor_visible = self.cursor_visible;
+        let cursor_visible = self.cursor_visible && self.window_focused;
 
         // Sync pane rects with the freshly-computed layout so that content,
         // scrollbars, and hit-testing all use the same authoritative geometry.
@@ -1840,6 +1859,11 @@ impl App {
         );
 
         let indicator_h = self.config.terminal.indicator_height.clamp(1.0, 10.0);
+        let focused_ws_rect = if multi_workspace {
+            ws_rects.iter().find(|(id, _)| *id == focused_ws_id).map(|(_, r)| *r)
+        } else {
+            None
+        };
         let frame_layout = FrameLayout {
             pane_rects: &pane_rects,
             dividers: &dividers,
@@ -1849,6 +1873,7 @@ impl App {
             focused_pane,
             focus_split_direction,
             padding: &self.config.appearance.content_padding,
+            focused_ws_rect,
         };
         let frame_style = FrameStyle {
             border_colors: &border_colors,
@@ -2136,9 +2161,7 @@ impl App {
                 self.handle_workspace_split(layout::SplitDirection::Vertical);
             }
             LayoutAction::CycleWorkspaceFocus => {
-                if self.window_layout.cycle_workspace_focus() {
-                    self.request_redraw();
-                }
+                self.handle_cycle_workspace_focus();
             }
             LayoutAction::NewWindow => self.handle_new_window(),
 
@@ -2351,11 +2374,46 @@ impl App {
         self.request_redraw();
     }
 
+    /// Return the session ID of the currently focused pane, if any.
+    fn focused_session_id(&self) -> Option<SessionId> {
+        let tab = self.window_layout.active_tab()?;
+        let pane = self.panes.get(&tab.focused_pane)?;
+        Some(pane.session_id)
+    }
+
+    /// Send a focus-change notification to the server so it can relay
+    /// CSI focus events (`\x1b[I` / `\x1b[O`) to PTY applications.
+    fn notify_focus_change(&self, gained: Option<SessionId>, lost: Option<SessionId>) {
+        if gained.is_none() && lost.is_none() {
+            return;
+        }
+        if let Some(tx) = &self.cmd_tx {
+            send_command(tx, ipc_client::ClientCommand::FocusChanged { gained, lost });
+        }
+    }
+
     fn handle_focus_next(&mut self) {
+        let old_session = self.focused_session_id();
         let Some(active) = self.window_layout.active_tab_mut() else { return };
         let current = active.focused_pane;
         active.focused_pane = active.pane_layout.next_pane(current);
         tracing::debug!(from = %current, to = %active.focused_pane, "focus cycled");
+        let new_session = self.focused_session_id();
+        if old_session != new_session {
+            self.notify_focus_change(new_session, old_session);
+        }
+        self.request_redraw();
+    }
+
+    fn handle_cycle_workspace_focus(&mut self) {
+        let old_session = self.focused_session_id();
+        if !self.window_layout.cycle_workspace_focus() {
+            return;
+        }
+        let new_session = self.focused_session_id();
+        if old_session != new_session {
+            self.notify_focus_change(new_session, old_session);
+        }
         self.request_redraw();
     }
 
@@ -2375,13 +2433,18 @@ impl App {
         let current = active.focused_pane;
         let rects = active.pane_layout.compute_rects(ws_rect);
 
-        if let Some(target) = active.pane_layout.find_pane_in_direction(current, direction, &rects)
-        {
-            if let Some(active_mut) = self.window_layout.active_tab_mut() {
-                active_mut.focused_pane = target;
-                self.request_redraw();
-            }
+        let Some(target) = active.pane_layout.find_pane_in_direction(current, direction, &rects)
+        else {
+            return;
+        };
+        let old_session = self.focused_session_id();
+        let Some(active_mut) = self.window_layout.active_tab_mut() else { return };
+        active_mut.focused_pane = target;
+        let new_session = self.focused_session_id();
+        if old_session != new_session {
+            self.notify_focus_change(new_session, old_session);
         }
+        self.request_redraw();
     }
 
     // -----------------------------------------------------------------------
@@ -2556,6 +2619,8 @@ impl App {
         // Clear transient drag state.
         self.mouse_selecting = false;
         self.word_drag_anchor = None;
+        self.line_drag_anchor = None;
+        self.mouse_click.reset();
         // Perform the switch.
         let changed = self.window_layout.set_active_tab(workspace_id, new_index);
         if changed {
@@ -2576,7 +2641,12 @@ impl App {
         let ws_id = self.window_layout.focused_workspace_id();
         let Some(ws) = self.window_layout.focused_workspace() else { return };
         let next_idx = ws.next_tab_index();
+        let old_session = self.focused_session_id();
         if self.switch_active_tab(ws_id, next_idx) {
+            let new_session = self.focused_session_id();
+            if old_session != new_session {
+                self.notify_focus_change(new_session, old_session);
+            }
             self.request_redraw();
         }
     }
@@ -2585,14 +2655,24 @@ impl App {
         let ws_id = self.window_layout.focused_workspace_id();
         let Some(ws) = self.window_layout.focused_workspace() else { return };
         let prev_idx = ws.prev_tab_index();
+        let old_session = self.focused_session_id();
         if self.switch_active_tab(ws_id, prev_idx) {
+            let new_session = self.focused_session_id();
+            if old_session != new_session {
+                self.notify_focus_change(new_session, old_session);
+            }
             self.request_redraw();
         }
     }
 
     fn handle_select_tab(&mut self, index: usize) {
         let ws_id = self.window_layout.focused_workspace_id();
+        let old_session = self.focused_session_id();
         if self.switch_active_tab(ws_id, index) {
+            let new_session = self.focused_session_id();
+            if old_session != new_session {
+                self.notify_focus_change(new_session, old_session);
+            }
             self.request_redraw();
         }
     }
@@ -3345,6 +3425,8 @@ impl App {
             let hit = pane_rects.iter().find(|(_, r, _)| r.contains(x, y));
             let Some((clicked_pane, _, _)) = hit else { continue };
 
+            let old_session = self.focused_session_id();
+
             // Switch workspace focus if needed.
             self.window_layout.set_focused_workspace(*ws_id);
 
@@ -3352,6 +3434,12 @@ impl App {
             if let Some(active) = self.window_layout.active_tab_mut() {
                 active.focused_pane = *clicked_pane;
             }
+
+            let new_session = self.focused_session_id();
+            if old_session != new_session {
+                self.notify_focus_change(new_session, old_session);
+            }
+
             self.request_redraw();
             return;
         }
@@ -3637,6 +3725,7 @@ impl App {
         self.mouse_selecting = true;
         self.active_selection = None;
         self.word_drag_anchor = None;
+        self.line_drag_anchor = None;
         let Some(point) = self.cursor_to_grid(x, y) else { return };
         self.active_selection = Some(selection::SelectionRange::cell(point, point));
     }
@@ -3666,6 +3755,7 @@ impl App {
         let Some(pane) = self.panes.get(&pane_id) else { return };
         let (start, end) = selection::line_bounds_at(&pane.term, point.row);
         self.active_selection = Some(selection::SelectionRange::line(start, end));
+        self.line_drag_anchor = Some((start, end));
         self.mouse_selecting = true;
         self.request_redraw();
     }
@@ -3674,7 +3764,45 @@ impl App {
     fn extend_selection_to(&mut self, x: f32, y: f32) {
         let Some(sel) = self.active_selection else { return };
         let Some(point) = self.cursor_to_grid(x, y) else { return };
-        self.active_selection = Some(selection::SelectionRange::cell(sel.start, point));
+        match sel.mode {
+            mouse_state::SelectionMode::Cell => {
+                self.active_selection = Some(selection::SelectionRange::cell(sel.start, point));
+                self.request_redraw();
+            }
+            mouse_state::SelectionMode::Word => {
+                self.extend_selection_word_with_fallback(sel, point);
+            }
+            mouse_state::SelectionMode::Line => {
+                self.extend_selection_line_with_fallback(sel, point);
+            }
+        }
+    }
+
+    fn extend_selection_word_with_fallback(
+        &mut self,
+        sel: selection::SelectionRange,
+        point: selection::SelectionPoint,
+    ) {
+        let (anchor_start, anchor_end) = self.word_drag_anchor.unwrap_or((sel.start, sel.end));
+        let Some(tab) = self.window_layout.active_tab() else { return };
+        let pane_id = tab.focused_pane;
+        let Some(pane) = self.panes.get(&pane_id) else { return };
+        let new_sel = selection::extend_by_word(&pane.term, anchor_start, anchor_end, point);
+        self.active_selection = Some(new_sel);
+        self.request_redraw();
+    }
+
+    fn extend_selection_line_with_fallback(
+        &mut self,
+        sel: selection::SelectionRange,
+        point: selection::SelectionPoint,
+    ) {
+        let (anchor_start, anchor_end) = self.line_drag_anchor.unwrap_or((sel.start, sel.end));
+        let Some(tab) = self.window_layout.active_tab() else { return };
+        let pane_id = tab.focused_pane;
+        let Some(pane) = self.panes.get(&pane_id) else { return };
+        let new_sel = selection::extend_by_line(&pane.term, anchor_start, anchor_end, point);
+        self.active_selection = Some(new_sel);
         self.request_redraw();
     }
 
@@ -3695,7 +3823,7 @@ impl App {
                 self.extend_selection_word(point);
             }
             mouse_state::SelectionMode::Line => {
-                self.extend_selection_line(sel.start, point);
+                self.extend_selection_line(point);
             }
         }
     }
@@ -3712,29 +3840,14 @@ impl App {
         self.request_redraw();
     }
 
-    fn extend_selection_line(
-        &mut self,
-        anchor_start: selection::SelectionPoint,
-        point: selection::SelectionPoint,
-    ) {
+    fn extend_selection_line(&mut self, point: selection::SelectionPoint) {
+        let Some((anchor_start, anchor_end)) = self.line_drag_anchor else { return };
         let pane_id = {
             let Some(tab) = self.window_layout.active_tab() else { return };
             tab.focused_pane
         };
         let Some(pane) = self.panes.get(&pane_id) else { return };
-        // When dragging upward the drag point is above the anchor line.
-        // Extend from the start of the drag row to the end of the anchor row.
-        // When dragging downward (or same row), extend from the start of the
-        // anchor row to the end of the drag row.
-        let new_sel = if point.row < anchor_start.row {
-            let (drag_line_start, _) = selection::line_bounds_at(&pane.term, point.row);
-            let (_, anchor_line_end) = selection::line_bounds_at(&pane.term, anchor_start.row);
-            selection::SelectionRange::line(drag_line_start, anchor_line_end)
-        } else {
-            let (anchor_line_start, _) = selection::line_bounds_at(&pane.term, anchor_start.row);
-            let (_, drag_line_end) = selection::line_bounds_at(&pane.term, point.row);
-            selection::SelectionRange::line(anchor_line_start, drag_line_end)
-        };
+        let new_sel = selection::extend_by_line(&pane.term, anchor_start, anchor_end, point);
         self.active_selection = Some(new_sel);
         self.request_redraw();
     }
@@ -4002,6 +4115,7 @@ impl App {
             self.apply_release_offset(&drag);
             self.ensure_animation_running();
             self.window_layout.set_focused_workspace(drag.workspace_id);
+            self.report_workspace_tree();
         } else {
             // No drag threshold reached — treat as a plain tab click.
             if self.switch_active_tab(drag.workspace_id, drag.tab_index) {
@@ -4709,7 +4823,7 @@ const GEOMETRY_DEBOUNCE: Duration = Duration::from_millis(500);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(30);
 
 /// Dimming factor applied to RGB channels of unfocused pane content.
-const UNFOCUSED_DIM: f32 = 0.85;
+const UNFOCUSED_DIM: f32 = 0.50;
 
 /// Collect all cell instances (tab bars + terminals + dividers + AI borders)
 /// into one buffer.
@@ -4735,6 +4849,7 @@ struct FrameLayout<'a> {
     focused_pane: PaneId,
     focus_split_direction: Option<layout::SplitDirection>,
     padding: &'a ContentPadding,
+    focused_ws_rect: Option<Rect>,
 }
 
 /// Colors and visual styling passed to [`build_all_instances`].
@@ -5022,6 +5137,11 @@ fn build_all_instances(
                 layout.cell_size,
             );
         }
+    }
+
+    // Focused workspace border — rendered when multiple workspaces are open.
+    if let Some(ws_rect) = layout.focused_ws_rect {
+        divider::build_workspace_focus_border(&mut all_instances, ws_rect, style.accent_color);
     }
 
     // AI state border overlays (rendered last so they appear on top).
