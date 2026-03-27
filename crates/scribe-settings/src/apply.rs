@@ -161,6 +161,9 @@ fn apply_config_key(
             let preset = value.as_str().ok_or("theme preset must be a string")?;
             // Convert preset name: "minimal_dark" -> "minimal-dark"
             config.appearance.theme = preset.replace('_', "-");
+            if preset != "custom" {
+                config.theme = None;
+            }
         }
         // -- Terminal ---------------------------------------------------------
         "terminal.scrollback_lines" => {
@@ -250,6 +253,9 @@ fn apply_config_key(
             if let Some(slot) = config.workspaces.badge_colors.get_mut(index) {
                 color.clone_into(slot);
             }
+        }
+        key if key.starts_with("theme.") => {
+            apply_theme_color_key(config, key, value)?;
         }
         _ => {
             tracing::debug!(key, "unhandled settings key");
@@ -371,5 +377,80 @@ fn apply_keybinding_field(
         "line_start" => kb.line_start = list,
         "line_end" => kb.line_end = list,
         _ => tracing::warn!(action, "unhandled keybinding action"),
+    }
+}
+
+/// Apply a `theme.<field>` color key to the config's inline theme.
+fn apply_theme_color_key(
+    config: &mut scribe_common::config::ScribeConfig,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let hex = value.as_str().ok_or("theme color value must be a string")?;
+    scribe_common::theme::hex_to_rgba(hex).map_err(|e| format!("invalid hex color: {e}"))?;
+
+    if config.theme.is_none() {
+        config.theme = Some(seed_theme_config(&config.appearance.theme));
+    }
+
+    let tc = config.theme.as_mut().ok_or("theme config unexpectedly missing")?;
+
+    match key {
+        "theme.foreground" => hex.clone_into(&mut tc.foreground),
+        "theme.background" => hex.clone_into(&mut tc.background),
+        "theme.cursor" => hex.clone_into(&mut tc.cursor),
+        "theme.cursor_text" => hex.clone_into(&mut tc.cursor_accent),
+        "theme.selection" => hex.clone_into(&mut tc.selection),
+        "theme.selection_text" => hex.clone_into(&mut tc.selection_foreground),
+        key if key.starts_with("theme.ansi_normal.") => {
+            let idx_str = key.get("theme.ansi_normal.".len()..).ok_or("invalid ansi_normal key")?;
+            let idx: usize =
+                idx_str.parse().map_err(|_| String::from("invalid ansi_normal index"))?;
+            if idx > 7 {
+                return Err(format!("ansi_normal index {idx} out of range 0-7"));
+            }
+            let slot = tc
+                .colors
+                .get_mut(idx)
+                .ok_or_else(|| format!("ansi_normal index {idx} out of range"))?;
+            hex.clone_into(slot);
+        }
+        key if key.starts_with("theme.ansi_bright.") => {
+            let idx_str = key.get("theme.ansi_bright.".len()..).ok_or("invalid ansi_bright key")?;
+            let idx: usize =
+                idx_str.parse().map_err(|_| String::from("invalid ansi_bright index"))?;
+            if idx > 7 {
+                return Err(format!("ansi_bright index {idx} out of range 0-7"));
+            }
+            let slot = tc
+                .colors
+                .get_mut(idx + 8)
+                .ok_or_else(|| format!("ansi_bright index {idx} out of range"))?;
+            hex.clone_into(slot);
+        }
+        _ => return Err(format!("unhandled theme color key: {key}")),
+    }
+
+    config.appearance.theme = String::from("custom");
+    Ok(())
+}
+
+/// Build a `ThemeConfig` seeded from the named preset, converted to hex strings.
+fn seed_theme_config(preset_name: &str) -> scribe_common::config::ThemeConfig {
+    use scribe_common::theme::{minimal_dark, resolve_preset, rgba_to_hex};
+
+    let theme = resolve_preset(preset_name).unwrap_or_else(minimal_dark);
+
+    let colors = theme.ansi_colors.iter().map(|c| rgba_to_hex(*c)).collect();
+
+    scribe_common::config::ThemeConfig {
+        name: String::from("custom"),
+        foreground: rgba_to_hex(theme.foreground),
+        background: rgba_to_hex(theme.background),
+        cursor: rgba_to_hex(theme.cursor),
+        cursor_accent: rgba_to_hex(theme.cursor_accent),
+        selection: rgba_to_hex(theme.selection),
+        selection_foreground: rgba_to_hex(theme.selection_foreground),
+        colors,
     }
 }

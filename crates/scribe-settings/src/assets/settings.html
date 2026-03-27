@@ -263,92 +263,8 @@
       <div class="page-title">Theme</div>
       <div class="page-subtitle">Choose a color scheme for your terminal</div>
 
-      <!-- Presets -->
-      <div class="section-group">
-        <div class="section-label">Presets</div>
-        <div class="theme-grid">
-          <!-- Minimal Dark -->
-          <div class="theme-card selected" data-theme="minimal_dark">
-            <div class="theme-preview" style="background:#0e0e10;">
-              <div><span style="color:#22c55e;">$</span> <span style="color:#e4e4e7;">cargo build</span></div>
-              <div><span style="color:#3b82f6;">src/</span> <span style="color:#eab308;">Cargo.toml</span></div>
-              <div><span style="color:#ef4444;">error</span> <span style="color:#a855f7;">fn</span> <span style="color:#71717a;">main()</span></div>
-            </div>
-            <div class="theme-name">
-              <span style="color:#60a5fa;">Minimal Dark</span>
-              <div class="theme-check">&#10003;</div>
-            </div>
-          </div>
-          <!-- Tokyo Night -->
-          <div class="theme-card" data-theme="tokyo_night">
-            <div class="theme-preview" style="background:#1a1b26;">
-              <div><span style="color:#9ece6a;">$</span> <span style="color:#c0caf5;">cargo build</span></div>
-              <div><span style="color:#7aa2f7;">src/</span> <span style="color:#e0af68;">Cargo.toml</span></div>
-              <div><span style="color:#f7768e;">error</span> <span style="color:#bb9af7;">fn</span> <span style="color:#565f89;">main()</span></div>
-            </div>
-            <div class="theme-name">
-              <span>Tokyo Night</span>
-              <div class="theme-check" style="display:none;">&#10003;</div>
-            </div>
-          </div>
-          <!-- Catppuccin Mocha -->
-          <div class="theme-card" data-theme="catppuccin_mocha">
-            <div class="theme-preview" style="background:#1e1e2e;">
-              <div><span style="color:#a6e3a1;">$</span> <span style="color:#cdd6f4;">cargo build</span></div>
-              <div><span style="color:#89b4fa;">src/</span> <span style="color:#f9e2af;">Cargo.toml</span></div>
-              <div><span style="color:#f38ba8;">error</span> <span style="color:#cba6f7;">fn</span> <span style="color:#6c7086;">main()</span></div>
-            </div>
-            <div class="theme-name">
-              <span>Catppuccin Mocha</span>
-              <div class="theme-check" style="display:none;">&#10003;</div>
-            </div>
-          </div>
-          <!-- Dracula -->
-          <div class="theme-card" data-theme="dracula">
-            <div class="theme-preview" style="background:#282a36;">
-              <div><span style="color:#50fa7b;">$</span> <span style="color:#f8f8f2;">cargo build</span></div>
-              <div><span style="color:#8be9fd;">src/</span> <span style="color:#f1fa8c;">Cargo.toml</span></div>
-              <div><span style="color:#ff5555;">error</span> <span style="color:#ff79c6;">fn</span> <span style="color:#6272a4;">main()</span></div>
-            </div>
-            <div class="theme-name">
-              <span>Dracula</span>
-              <div class="theme-check" style="display:none;">&#10003;</div>
-            </div>
-          </div>
-          <!-- Solarized Dark -->
-          <div class="theme-card" data-theme="solarized_dark">
-            <div class="theme-preview" style="background:#002b36;">
-              <div><span style="color:#859900;">$</span> <span style="color:#839496;">cargo build</span></div>
-              <div><span style="color:#268bd2;">src/</span> <span style="color:#b58900;">Cargo.toml</span></div>
-              <div><span style="color:#dc322f;">error</span> <span style="color:#d33682;">fn</span> <span style="color:#586e75;">main()</span></div>
-            </div>
-            <div class="theme-name">
-              <span>Solarized Dark</span>
-              <div class="theme-check" style="display:none;">&#10003;</div>
-            </div>
-          </div>
-          <!-- Custom -->
-          <div class="theme-card-custom">
-            <div style="text-align:center;">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-                <line x1="12" y1="5" x2="12" y2="19"/>
-                <line x1="5" y1="12" x2="19" y2="12"/>
-              </svg>
-              <div style="font-size:11px;margin-top:4px;">Custom</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Community Themes -->
-      <div class="section-group">
-        <div class="section-label">Community Themes</div>
-        <input type="text" id="community-search" class="text-input" placeholder="Search 188 themes..." style="margin-bottom:10px;width:100%;box-sizing:border-box;">
-        <div id="community-grid" class="theme-grid" style="max-height:320px;overflow-y:auto;"></div>
-      </div>
-
       <!-- Color Editor -->
-      <div class="section-group">
+      <div class="section-group" id="theme-color-editor">
         <div class="section-label">Colors</div>
         <div class="section-card" style="padding:16px;">
           <!-- Core colors -->
@@ -449,6 +365,14 @@
             </div>
           </div>
         </div>
+      </div>
+
+      <!-- Unified Theme Grid -->
+      <div class="section-group">
+        <input type="text" id="theme-search" class="text-input"
+               placeholder="Search themes..."
+               style="margin-bottom:10px;width:100%;box-sizing:border-box;">
+        <div id="theme-grid" class="theme-grid" style="max-height:420px;overflow-y:auto;"></div>
       </div>
     </div>
 

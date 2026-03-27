@@ -544,22 +544,6 @@ input[type="range"]::-webkit-slider-thumb {
   color: #fff;
 }
 
-.theme-card-custom {
-  border: 2px dashed rgba(255, 255, 255, 0.08);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 112px;
-  border-radius: 10px;
-  cursor: pointer;
-  transition: all 0.2s;
-  color: #3f3f46;
-}
-
-.theme-card-custom:hover {
-  border-color: rgba(255, 255, 255, 0.15);
-  color: #52525b;
-}
 
 /* ───────── Color Swatches ───────── */
 

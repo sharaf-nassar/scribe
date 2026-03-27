@@ -84,6 +84,58 @@ fn inject_keybinding_defaults(webview: &wry::WebView) {
     }
 }
 
+/// Inject all theme preset colors into the webview.
+fn inject_theme_colors(webview: &wry::WebView) {
+    use serde_json::{Map, Value};
+
+    let mut map = Map::new();
+    for name in scribe_common::theme::all_preset_names() {
+        let Some(theme) = scribe_common::theme::resolve_preset(name) else {
+            continue;
+        };
+        let key = name.replace('-', "_");
+        let ansi: Vec<Value> = theme
+            .ansi_colors
+            .iter()
+            .map(|c| Value::String(scribe_common::theme::rgba_to_hex(*c)))
+            .collect();
+        let mut entry = Map::new();
+        entry.insert(String::from("name"), Value::String(theme.name.into_owned()));
+        entry.insert(
+            String::from("fg"),
+            Value::String(scribe_common::theme::rgba_to_hex(theme.foreground)),
+        );
+        entry.insert(
+            String::from("bg"),
+            Value::String(scribe_common::theme::rgba_to_hex(theme.background)),
+        );
+        entry.insert(
+            String::from("cursor"),
+            Value::String(scribe_common::theme::rgba_to_hex(theme.cursor)),
+        );
+        entry.insert(
+            String::from("cursor_accent"),
+            Value::String(scribe_common::theme::rgba_to_hex(theme.cursor_accent)),
+        );
+        entry.insert(
+            String::from("selection"),
+            Value::String(scribe_common::theme::rgba_to_hex(theme.selection)),
+        );
+        entry.insert(
+            String::from("selection_fg"),
+            Value::String(scribe_common::theme::rgba_to_hex(theme.selection_foreground)),
+        );
+        entry.insert(String::from("ansi"), Value::Array(ansi));
+        map.insert(key, Value::Object(entry));
+    }
+    let json = serde_json::to_string(&map).unwrap_or_else(|_| String::from("{}"));
+    let script =
+        format!("if (typeof loadThemeColors === 'function') {{ loadThemeColors({json}); }}");
+    if let Err(e) = webview.evaluate_script(&script) {
+        tracing::warn!("failed to inject theme colors into settings webview: {e}");
+    }
+}
+
 /// Inject the available font list into the webview.
 fn inject_font_list(webview: &wry::WebView) {
     let fonts = list_monospace_fonts();
@@ -202,6 +254,9 @@ pub fn run_settings_window(
 
     // Inject keybinding defaults so JS can implement reset-to-default.
     inject_keybinding_defaults(&webview);
+
+    // Inject theme color map for the theme picker.
+    inject_theme_colors(&webview);
 
     // Inject available monospace fonts.
     inject_font_list(&webview);
@@ -423,6 +478,7 @@ pub fn run_settings_window(
         tracing::warn!("failed to inject config into settings webview: {e}");
     }
     inject_keybinding_defaults(&webview);
+    inject_theme_colors(&webview);
     inject_font_list(&webview);
 
     *webview_ref.borrow_mut() = Some(webview);
