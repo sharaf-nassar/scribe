@@ -1034,10 +1034,6 @@ struct AttachEntry {
     workspace_id: WorkspaceId,
     client_writer: ClientWriter,
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
-    pty_raw_fd: RawFd,
-    /// Target dimensions `(cols, rows)` for the new client.  When `Some`, the
-    /// session's `Term` and PTY are resized before the snapshot is captured.
-    dims: Option<(u16, u16)>,
     title: String,
     cwd: Option<std::path::PathBuf>,
     ai_state: Option<scribe_common::ai_state::AiProcessState>,
@@ -1048,7 +1044,7 @@ struct AttachEntry {
 #[allow(clippy::too_many_arguments, reason = "mirrors dispatch_message's dependency set")]
 async fn handle_attach_sessions(
     session_ids: &[SessionId],
-    dimensions: &[(u16, u16)],
+    _dimensions: &[(u16, u16)],
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     writer: &SharedWriter,
@@ -1058,15 +1054,13 @@ async fn handle_attach_sessions(
 
     // Collect data we need, then drop the registry lock before sending.
     let mut attach_data: Vec<AttachEntry> = Vec::new();
-    for (i, &session_id) in session_ids.iter().enumerate() {
+    for &session_id in session_ids {
         if let Some(session) = sessions.get(&session_id) {
             attach_data.push(AttachEntry {
                 session_id,
                 workspace_id: session.workspace_id,
                 client_writer: Arc::clone(&session.client_writer),
                 term: Arc::clone(&session.term),
-                pty_raw_fd: session.pty_raw_fd,
-                dims: dimensions.get(i).copied(),
                 title: session.title.clone(),
                 cwd: session.cwd.clone(),
                 ai_state: session.ai_state.clone(),
@@ -1080,20 +1074,6 @@ async fn handle_attach_sessions(
     for entry in attach_data {
         attach_one_session(&entry, writer, live_sessions, workspace_manager).await;
         attached_ids.insert(entry.session_id);
-    }
-}
-
-/// Resize the session's `Term` and PTY to the client's current dimensions so
-/// the snapshot reflects the correct grid size.  No-op when dims are absent or
-/// contain a zero dimension.
-async fn resize_for_attach(entry: &AttachEntry) {
-    if let Some((cols, rows)) = entry.dims {
-        if cols > 0 && rows > 0 {
-            resize_term(&entry.term, cols, rows).await;
-            if let Err(e) = set_pty_winsize(entry.pty_raw_fd, cols, rows) {
-                warn!(session_id = %entry.session_id, error = %e, "attach resize: TIOCSWINSZ failed");
-            }
-        }
     }
 }
 
@@ -1144,9 +1124,6 @@ async fn attach_one_session(
             send_message(writer, &msg).await;
         }
     }
-
-    // Resize Term and PTY to the client's dimensions before snapshot capture.
-    resize_for_attach(entry).await;
 
     let snapshot = take_session_snapshot(session_id, &entry.term, live_sessions).await;
     let snap_msg = ServerMessage::ScreenSnapshot { session_id, snapshot };

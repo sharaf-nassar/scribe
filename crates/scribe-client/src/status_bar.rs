@@ -77,6 +77,10 @@ pub struct StatusBarColors {
     pub critical: [f32; 4],
     /// Dimmed color for stat labels — text at reduced alpha.
     pub label: [f32; 4],
+    /// 1px hairline at the top edge of the status bar.
+    pub top_border: [f32; 4],
+    /// Lighter top half for subtle gradient depth.
+    pub gradient_top: [f32; 4],
 }
 
 impl StatusBarColors {
@@ -104,6 +108,8 @@ impl StatusBarColors {
                     t.get(3).copied().unwrap_or(1.0) * 0.55,
                 ]
             },
+            top_border: srgb_to_linear_rgba(chrome.status_bar_separator),
+            gradient_top: srgb_to_linear_rgba(chrome.tab_bar_gradient_top),
         }
     }
 }
@@ -137,7 +143,37 @@ pub fn build_status_bar(
     let max_cols = columns_in_width(window_rect.width, cell_w);
     let mut w = BarWriter { out, x_origin: window_rect.x, y: bar_y, cell_w, max_cols, col: 0 };
 
-    build_background(w.out, w.x_origin, w.y, w.max_cols, w.cell_w, window_rect.width, colors.bg);
+    // 1px hairline separator at the top edge.
+    w.out.push(scribe_renderer::chrome::solid_quad(
+        window_rect.x,
+        bar_y,
+        window_rect.width,
+        1.0,
+        colors.top_border,
+    ));
+
+    // Two-tone gradient background: lighter top half, darker bottom half.
+    let half = STATUS_BAR_HEIGHT / 2.0;
+    build_background(
+        w.out,
+        w.x_origin,
+        w.y,
+        w.max_cols,
+        w.cell_w,
+        window_rect.width,
+        colors.gradient_top,
+        half,
+    );
+    build_background(
+        w.out,
+        w.x_origin,
+        w.y + half,
+        w.max_cols,
+        w.cell_w,
+        window_rect.width,
+        colors.bg,
+        half,
+    );
 
     let mut tooltips: Vec<TooltipAnchor> = Vec::new();
     let col = render_left_side(&mut w, colors, data, resolve_glyph, &mut tooltips);
@@ -195,6 +231,8 @@ impl BarWriter<'_> {
             uv_max,
             fg_color: fg,
             bg_color: bg,
+            corner_radius: 0.0,
+            _pad: 0.0,
         });
         self.col += 1;
     }
@@ -249,7 +287,10 @@ fn render_left_side(
     if let Some(name) = data.workspace_name {
         let ws_col = w.col;
         w.put_str(name, colors.accent, colors.bg, resolve_glyph);
-        tooltips.push(TooltipAnchor { text: String::from(name), rect: w.col_rect(ws_col) });
+        tooltips.push(TooltipAnchor {
+            text: String::from("Focused workspace"),
+            rect: w.col_rect(ws_col),
+        });
         w.put_str("  ", colors.text, colors.bg, resolve_glyph);
     }
 
@@ -257,8 +298,10 @@ fn render_left_side(
         let short = shorten_cwd(cwd);
         let cwd_col = w.col;
         w.put_str(&short, colors.text, colors.bg, resolve_glyph);
-        let full_cwd = cwd.to_string_lossy().into_owned();
-        tooltips.push(TooltipAnchor { text: full_cwd, rect: w.col_rect(cwd_col) });
+        tooltips.push(TooltipAnchor {
+            text: format!("Current directory: {}", cwd.to_string_lossy()),
+            rect: w.col_rect(cwd_col),
+        });
     }
 
     w.col
@@ -317,53 +360,41 @@ fn build_segment_groups(data: &StatusBarData<'_>) -> Vec<(String, usize)> {
     if let (Some(stats), Some(config)) = (data.sys_stats, data.stats_config) {
         if config.cpu {
             let sep = usize::from(!groups.is_empty());
-            let cpu_pct = stats.cpu_percent;
-            groups.push((format!("CPU {cpu_pct:.0}%"), sep + 1 + CPU_SPARK_WIDTH + 1));
+            groups.push((String::from("CPU usage"), sep + 1 + CPU_SPARK_WIDTH + 1));
         }
         if config.memory {
             let sep = usize::from(!groups.is_empty());
-            let mem_used = stats.mem_used_gb;
-            let mem_total = stats.mem_total_gb;
-            groups.push((format!("MEM {mem_used:.1}/{mem_total:.1} GB"), sep + 3));
+            groups.push((String::from("Memory usage"), sep + 3));
         }
         if config.network {
             let sep = usize::from(!groups.is_empty());
-            let up = format_bytes_rate(stats.net_up_bytes_sec);
-            let down = format_bytes_rate(stats.net_down_bytes_sec);
             let count = sep + 1 + NET_SPARK_WIDTH + 1 + 1 + NET_SPARK_WIDTH + 1;
-            groups.push((format!("NET \u{2191}{up} \u{2193}{down}"), count));
+            groups.push((String::from("Network activity"), count));
         }
         if config.gpu && stats.gpu_percent.is_some() {
             let sep = usize::from(!groups.is_empty());
-            let gpu_pct = stats.gpu_percent.unwrap_or(0.0);
-            groups.push((format!("GPU {gpu_pct:.0}%"), sep + 1 + CPU_SPARK_WIDTH + 1));
+            groups.push((String::from("GPU usage"), sep + 1 + CPU_SPARK_WIDTH + 1));
         }
     }
 
-    if let Some(branch) = data.git_branch {
+    if data.git_branch.is_some() {
         let sep = usize::from(!groups.is_empty());
-        groups.push((String::from(branch), sep + 1));
+        groups.push((String::from("Git branch"), sep + 1));
     }
 
     if data.session_count > 0 {
         let sep = usize::from(!groups.is_empty());
-        let label = if data.session_count == 1 {
-            String::from("1 session")
-        } else {
-            let n = data.session_count;
-            format!("{n} sessions")
-        };
-        groups.push((label, sep + 1));
+        groups.push((String::from("Active sessions"), sep + 1));
     }
 
     if !data.hostname.is_empty() {
         let sep = usize::from(!groups.is_empty());
-        groups.push((String::from(data.hostname), sep + 1));
+        groups.push((String::from("Hostname"), sep + 1));
     }
 
     if !data.time.is_empty() {
         let sep = usize::from(!groups.is_empty());
-        groups.push((String::from(data.time), sep + 1));
+        groups.push((String::from("Current time"), sep + 1));
     }
 
     groups
@@ -708,7 +739,7 @@ fn home_dir() -> Option<std::path::PathBuf> {
 /// Fill columns with background quads (no glyph).
 #[allow(
     clippy::too_many_arguments,
-    reason = "helper function needs position, column count, cell width, total width, and color"
+    reason = "helper function needs position, column count, cell width, total width, color, and height"
 )]
 fn build_background(
     out: &mut Vec<CellInstance>,
@@ -718,6 +749,7 @@ fn build_background(
     cell_w: f32,
     total_width: f32,
     bg: [f32; 4],
+    height: f32,
 ) {
     for col_idx in 0..cols {
         #[allow(
@@ -727,11 +759,13 @@ fn build_background(
         let x = x_origin + col_idx as f32 * cell_w;
         out.push(CellInstance {
             pos: [x, y],
-            size: [cell_w, STATUS_BAR_HEIGHT],
+            size: [cell_w, height],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
             fg_color: bg,
             bg_color: bg,
+            corner_radius: 0.0,
+            _pad: 0.0,
         });
     }
 
@@ -749,11 +783,13 @@ fn build_background(
         let x = x_origin + cols as f32 * cell_w;
         out.push(CellInstance {
             pos: [x, y],
-            size: [remainder, STATUS_BAR_HEIGHT],
+            size: [remainder, height],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
             fg_color: bg,
             bg_color: bg,
+            corner_radius: 0.0,
+            _pad: 0.0,
         });
     }
 }

@@ -3,6 +3,7 @@
 //! Dividers are 1px lines between adjacent panes, rendered as solid-colour
 //! quads (no glyph atlas — `uv_min == uv_max == [0,0]`).
 
+use scribe_renderer::chrome::solid_quad;
 use scribe_renderer::types::CellInstance;
 
 use crate::layout::{LayoutNode, PaneId, Rect, SplitDirection};
@@ -259,22 +260,6 @@ fn is_within_divider(divider: &Divider, mouse_x: f32, mouse_y: f32) -> bool {
 fn build_single_divider(instances: &mut Vec<CellInstance>, divider: &Divider, color: [f32; 4]) {
     let r = &divider.rect;
     instances.push(solid_quad(r.x, r.y, r.width, r.height, color));
-}
-
-/// Create a solid-colour quad (no glyph) with explicit pixel dimensions.
-#[allow(
-    clippy::many_single_char_names,
-    reason = "x/y/w/h are conventional 2-D geometry shorthands"
-)]
-fn solid_quad(x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> CellInstance {
-    CellInstance {
-        pos: [x, y],
-        size: [w, h],
-        uv_min: [0.0, 0.0],
-        uv_max: [0.0, 0.0],
-        fg_color: color,
-        bg_color: color,
-    }
 }
 
 /// Calculate how many cell-sized steps are needed to cover a pixel extent.

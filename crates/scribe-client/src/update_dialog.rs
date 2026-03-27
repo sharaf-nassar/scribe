@@ -425,6 +425,8 @@ fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
         uv_max: [0.0, 0.0],
         fg_color: color,
         bg_color: color,
+        corner_radius: 0.0,
+        _pad: 0.0,
     });
 }
 
@@ -500,6 +502,8 @@ fn emit_text_line(
             uv_max,
             fg_color: fg,
             bg_color: bg,
+            corner_radius: 0.0,
+            _pad: 0.0,
         });
     }
 }

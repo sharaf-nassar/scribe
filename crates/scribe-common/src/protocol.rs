@@ -80,10 +80,10 @@ pub enum ClientMessage {
     ListSessions,
     /// Attach to existing (detached) sessions, taking ownership.
     ///
-    /// When `dimensions` is provided, the server resizes each session's `Term`
-    /// and PTY to the given `(cols, rows)` before capturing the screen snapshot,
-    /// avoiding a dimension mismatch on reconnect.  The length of `dimensions`
-    /// must match the length of `session_ids`.
+    /// The `dimensions` field is retained for wire compatibility but is no
+    /// longer used by the server — snapshots are captured at the session's
+    /// current `Term` dimensions.  The client sends a `Resize` message after
+    /// attachment once pane geometry is finalised.
     AttachSessions {
         session_ids: Vec<SessionId>,
         /// Per-session dimensions `(cols, rows)` parallel to `session_ids`.

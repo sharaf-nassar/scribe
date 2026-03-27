@@ -31,6 +31,8 @@ pub struct ChromeColors {
     pub divider: [f32; 4],
     pub accent: [f32; 4],
     pub scrollbar: [f32; 4],
+    pub tab_bar_gradient_top: [f32; 4],
+    pub status_bar_separator: [f32; 4],
 }
 
 /// A complete terminal color theme including chrome (UI) colors.
@@ -88,13 +90,15 @@ impl Theme {
         let tab_bar_active_bg = background;
         let tab_text = with_alpha(foreground, 0.45);
         let tab_text_active = foreground;
-        let tab_separator = with_alpha(foreground, 0.12);
+        let tab_separator = with_alpha(foreground, 0.18);
         let status_bar_bg = tab_bar_bg;
         let status_bar_text = with_alpha(foreground, 0.5);
-        let divider = with_alpha(foreground, 0.08);
+        let divider = with_alpha(foreground, 0.15);
         // ANSI blue is index 4
         let accent = ansi_colors.get(4).copied().unwrap_or(foreground);
         let scrollbar = with_alpha(foreground, 0.4);
+        let tab_bar_gradient_top = lighten(tab_bar_bg, 0.03);
+        let status_bar_separator = with_alpha(foreground, 0.12);
 
         ChromeColors {
             tab_bar_bg,
@@ -107,6 +111,8 @@ impl Theme {
             divider,
             accent,
             scrollbar,
+            tab_bar_gradient_top,
+            status_bar_separator,
         }
     }
 }

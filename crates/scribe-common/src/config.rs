@@ -190,7 +190,7 @@ fn default_scrollbar_width() -> f32 {
 }
 
 fn default_tab_bar_padding() -> f32 {
-    4.0
+    8.0
 }
 
 fn default_tab_width() -> u16 {
@@ -198,7 +198,7 @@ fn default_tab_width() -> u16 {
 }
 
 fn default_content_padding_side() -> f32 {
-    2.0
+    8.0
 }
 
 // ---------------------------------------------------------------------------

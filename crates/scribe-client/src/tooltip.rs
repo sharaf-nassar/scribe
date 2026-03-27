@@ -100,7 +100,16 @@ fn emit_glyph(
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
 ) -> f32 {
     let (uv_min, uv_max) = resolve_glyph(ch);
-    out.push(CellInstance { pos: [x, y], size: [0.0, 0.0], uv_min, uv_max, fg_color, bg_color });
+    out.push(CellInstance {
+        pos: [x, y],
+        size: [0.0, 0.0],
+        uv_min,
+        uv_max,
+        fg_color,
+        bg_color,
+        corner_radius: 0.0,
+        _pad: 0.0,
+    });
     x + cell_w
 }
 
@@ -113,5 +122,7 @@ fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
         uv_max: [0.0, 0.0],
         fg_color: color,
         bg_color: color,
+        corner_radius: 0.0,
+        _pad: 0.0,
     });
 }

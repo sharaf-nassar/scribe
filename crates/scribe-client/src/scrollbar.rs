@@ -7,6 +7,7 @@
 use std::time::Instant;
 
 use alacritty_terminal::grid::Dimensions as _;
+use scribe_renderer::chrome::rounded_quad;
 use scribe_renderer::types::CellInstance;
 
 use crate::pane::Pane;
@@ -23,6 +24,12 @@ const FADE_DELAY_SECS: f32 = 1.5;
 /// Duration (seconds) of the fade-out animation.
 const FADE_DURATION_SECS: f32 = 0.3;
 
+/// Extra width added to the scrollbar when hovering, in physical pixels.
+const HOVER_EXTRA_WIDTH: f32 = 3.0;
+
+/// Speed of the width animation (lerp factor per second).
+const WIDTH_LERP_SPEED: f32 = 12.0;
+
 /// Per-pane scrollbar state.
 pub struct ScrollbarState {
     /// Current visual opacity (0.0 = invisible, 1.0 = fully visible).
@@ -33,6 +40,12 @@ pub struct ScrollbarState {
     pub hover: bool,
     /// Active thumb drag, if any.
     pub drag: Option<ScrollbarDrag>,
+    /// Current animated scrollbar width (pixels). Lerps toward `target_width`.
+    display_width: f32,
+    /// Target scrollbar width (pixels). Set on hover enter/leave.
+    target_width: f32,
+    /// Last tick timestamp for width animation delta-time.
+    last_tick: Option<Instant>,
 }
 
 /// State captured when a scrollbar thumb drag begins.
@@ -46,7 +59,21 @@ pub struct ScrollbarDrag {
 impl ScrollbarState {
     /// Create a new scrollbar state (invisible, no drag).
     pub fn new() -> Self {
-        Self { opacity: 0.0, fade_start: None, hover: false, drag: None }
+        Self {
+            opacity: 0.0,
+            fade_start: None,
+            hover: false,
+            drag: None,
+            display_width: 0.0,
+            target_width: 0.0,
+            last_tick: None,
+        }
+    }
+
+    /// Current animated width of the scrollbar thumb. Falls back to
+    /// `base_width` if the animation has not been initialised yet.
+    pub fn current_width(&self, base_width: f32) -> f32 {
+        if self.display_width > 0.0 { self.display_width } else { base_width }
     }
 
     /// Signal that a scroll action occurred (keyboard, wheel, or drag).
@@ -78,9 +105,23 @@ impl ScrollbarState {
         }
     }
 
-    /// Advance the fade animation. Returns `true` if the scrollbar is still
-    /// visible and needs further redraws.
+    /// Advance the fade and width animations. Returns `true` if the scrollbar
+    /// is still visible and needs further redraws.
     pub fn tick_fade(&mut self, display_offset: usize) -> bool {
+        // --- Width lerp animation ---
+        let now = Instant::now();
+        if self.target_width > 0.0 {
+            let dt = self.last_tick.map_or(0.0, |prev| now.duration_since(prev).as_secs_f32());
+            let factor = (WIDTH_LERP_SPEED * dt).min(1.0);
+            self.display_width += (self.target_width - self.display_width) * factor;
+        }
+        self.last_tick = Some(now);
+
+        let width_animating =
+            self.target_width > 0.0 && (self.display_width - self.target_width).abs() > 0.1;
+
+        // --- Opacity fade animation ---
+
         // While dragging or hovering, stay fully opaque.
         if self.drag.is_some() || self.hover {
             self.opacity = 1.0;
@@ -88,13 +129,17 @@ impl ScrollbarState {
         }
 
         // At bottom with no hover/drag — snap to invisible.
-        if display_offset == 0 && self.fade_start.is_none() && self.opacity <= 0.0 {
+        if display_offset == 0
+            && self.fade_start.is_none()
+            && self.opacity <= 0.0
+            && !width_animating
+        {
             return false;
         }
 
         let Some(start) = self.fade_start else {
             // No fade timer, but opacity > 0 (e.g. just scrolled).
-            return self.opacity > 0.0;
+            return self.opacity > 0.0 || width_animating;
         };
 
         let elapsed = start.elapsed().as_secs_f32();
@@ -107,7 +152,7 @@ impl ScrollbarState {
         if fade_progress >= 1.0 {
             self.opacity = 0.0;
             self.fade_start = None;
-            return false;
+            return width_animating;
         }
 
         self.opacity = 1.0 - fade_progress;
@@ -150,7 +195,7 @@ fn compute_thumb(pane: &Pane, scrollbar_width: f32, tab_bar_height: f32) -> Opti
 
     let total = (history_size + screen_lines) as f32;
     let thumb_height = (screen_lines as f32 / total * track_height).max(MIN_THUMB_HEIGHT);
-    let available = track_height - thumb_height;
+    let available = (track_height - thumb_height).max(0.0);
 
     let ratio = 1.0 - (display_offset as f32 / history_size as f32);
     let thumb_y = (track_top + ratio * available).clamp(track_top, track_top + available);
@@ -170,18 +215,29 @@ fn compute_thumb(pane: &Pane, scrollbar_width: f32, tab_bar_height: f32) -> Opti
 /// Build scrollbar instances for a single pane and push them into `out`.
 ///
 /// Does nothing if the pane has no scrollback or the scrollbar is invisible.
+/// Mutably borrows `pane` to update width animation targets.
 pub fn build_scrollbar_instances(
     out: &mut Vec<CellInstance>,
-    pane: &Pane,
+    pane: &mut Pane,
     scrollbar_width: f32,
     scrollbar_color: [f32; 4],
     tab_bar_height: f32,
 ) {
+    // Update width animation targets based on hover state.
+    let hover_width = scrollbar_width + HOVER_EXTRA_WIDTH;
+    pane.scrollbar_state.target_width =
+        if pane.scrollbar_state.hover { hover_width } else { scrollbar_width };
+    if pane.scrollbar_state.display_width <= 0.0 {
+        pane.scrollbar_state.display_width = scrollbar_width;
+    }
+
     if pane.scrollbar_state.opacity <= 0.0 {
         return;
     }
 
-    let Some(thumb) = compute_thumb(pane, scrollbar_width, tab_bar_height) else {
+    let animated_width = pane.scrollbar_state.current_width(scrollbar_width);
+
+    let Some(thumb) = compute_thumb(pane, animated_width, tab_bar_height) else {
         return;
     };
 
@@ -194,14 +250,8 @@ pub fn build_scrollbar_instances(
         alpha,
     ];
 
-    out.push(CellInstance {
-        pos: [thumb.x, thumb.y],
-        size: [thumb.width, thumb.height],
-        uv_min: [0.0, 0.0],
-        uv_max: [0.0, 0.0],
-        fg_color: color,
-        bg_color: color,
-    });
+    let corner_radius = animated_width / 2.0;
+    out.push(rounded_quad(thumb.x, thumb.y, thumb.width, thumb.height, color, corner_radius));
 }
 
 /// Hit-test whether a point is within the scrollbar hit zone of a pane.

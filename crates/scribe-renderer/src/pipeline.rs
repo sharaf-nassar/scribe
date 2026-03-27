@@ -124,6 +124,7 @@ impl TerminalPipeline {
             let new_capacity = count.max(INITIAL_INSTANCE_CAPACITY).max(count.saturating_mul(2));
             self.instance_buffer = create_instance_buffer(device, new_capacity);
             self.max_instances = new_capacity;
+            self.last_instance_hash = 0;
         }
 
         if !instances.is_empty() {
@@ -299,6 +300,7 @@ fn instance_buffer_layout() -> VertexBufferLayout<'static> {
         VertexAttribute { format: VertexFormat::Float32x2, offset: 24, shader_location: 3 }, // uv_max
         VertexAttribute { format: VertexFormat::Float32x4, offset: 32, shader_location: 4 }, // fg_color
         VertexAttribute { format: VertexFormat::Float32x4, offset: 48, shader_location: 5 }, // bg_color
+        VertexAttribute { format: VertexFormat::Float32, offset: 64, shader_location: 6 }, // corner_radius
     ];
 
     VertexBufferLayout {

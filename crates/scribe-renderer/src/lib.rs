@@ -1,5 +1,6 @@
 pub mod atlas;
 pub mod box_drawing;
+pub mod chrome;
 pub mod palette;
 pub mod pipeline;
 pub mod types;
@@ -464,6 +465,8 @@ impl TerminalRenderer {
                     uv_max,
                     fg_color: fg,
                     bg_color: bg,
+                    corner_radius: 0.0,
+                    _pad: 0.0,
                 });
             }
         }
@@ -496,6 +499,8 @@ impl TerminalRenderer {
                     uv_max,
                     fg_color: bg,
                     bg_color: fg,
+                    corner_radius: 0.0,
+                    _pad: 0.0,
                 });
             }
             CursorShape::Beam => {
@@ -507,6 +512,8 @@ impl TerminalRenderer {
                     uv_max,
                     fg_color: fg,
                     bg_color: bg,
+                    corner_radius: 0.0,
+                    _pad: 0.0,
                 });
                 // Thin vertical bar overlay.
                 let beam_w = f32::max(2.0, cell_w / 8.0);
@@ -517,6 +524,8 @@ impl TerminalRenderer {
                     uv_max: [0.0, 0.0],
                     fg_color: self.cursor_color,
                     bg_color: self.cursor_color,
+                    corner_radius: 0.0,
+                    _pad: 0.0,
                 });
             }
             CursorShape::Underline => {
@@ -528,6 +537,8 @@ impl TerminalRenderer {
                     uv_max,
                     fg_color: fg,
                     bg_color: bg,
+                    corner_radius: 0.0,
+                    _pad: 0.0,
                 });
                 // Thin horizontal bar at the bottom of the cell.
                 let ul_h = f32::max(2.0, cell_h / 8.0);
@@ -541,6 +552,8 @@ impl TerminalRenderer {
                     uv_max: [0.0, 0.0],
                     fg_color: self.cursor_color,
                     bg_color: self.cursor_color,
+                    corner_radius: 0.0,
+                    _pad: 0.0,
                 });
             }
         }

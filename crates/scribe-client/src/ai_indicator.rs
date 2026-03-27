@@ -6,11 +6,12 @@
 //! Colours, per-state enable flags, and auto-clear timeouts are driven by
 //! [`ClaudeStatesConfig`] rather than compile-time constants.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use scribe_common::ai_state::{AiProcessState, AiState};
 use scribe_common::config::{AiStateEntry, ClaudeStatesConfig};
 use scribe_common::ids::SessionId;
+use scribe_renderer::chrome::solid_quad;
 use scribe_renderer::types::CellInstance;
 
 use crate::layout::Rect;
@@ -34,6 +35,11 @@ const ANIMATION_WRAP_PERIOD: f32 = std::f32::consts::TAU * 100.0;
 /// Tracks AI state for all sessions and drives border / indicator colours.
 pub struct AiStateTracker {
     states: HashMap<SessionId, AiProcessState>,
+    /// Sessions where Claude Code has ever been detected.
+    ///
+    /// Unlike `states`, this is not cleared by timeouts or keystrokes — only
+    /// by an explicit `AiStateCleared` / session removal.
+    claude_sessions: HashSet<SessionId>,
     /// Monotonically increasing time in seconds, used for pulse animation.
     animation_time: f32,
     /// Time each session entered its current state, for timeout expiry.
@@ -48,6 +54,7 @@ impl AiStateTracker {
     pub fn new(config: ClaudeStatesConfig) -> Self {
         Self {
             states: HashMap::new(),
+            claude_sessions: HashSet::new(),
             animation_time: 0.0,
             state_enter_times: HashMap::new(),
             config,
@@ -63,17 +70,13 @@ impl AiStateTracker {
     ///
     /// States whose per-state `enabled` flag is `false` are silently ignored.
     pub fn update(&mut self, session_id: SessionId, ai_state: AiProcessState) {
+        self.claude_sessions.insert(session_id);
         let entry = self.entry_for(&ai_state.state);
         if !entry.tab_indicator && !entry.pane_border {
             return;
         }
         self.state_enter_times.insert(session_id, self.animation_time);
         self.states.insert(session_id, ai_state);
-    }
-
-    /// Get the current AI state for a session.
-    pub fn get(&self, session_id: SessionId) -> Option<&AiProcessState> {
-        self.states.get(&session_id)
     }
 
     /// Clear attention states (`IdlePrompt` / `WaitingForInput` /
@@ -131,6 +134,16 @@ impl AiStateTracker {
     pub fn remove(&mut self, session_id: SessionId) {
         self.states.remove(&session_id);
         self.state_enter_times.remove(&session_id);
+        self.claude_sessions.remove(&session_id);
+    }
+
+    /// Whether Claude Code has been detected in this session.
+    ///
+    /// Unlike [`get`], this returns `true` even after the visual indicator
+    /// has timed out or been cleared by a keystroke.  It is only reset when
+    /// the session explicitly sends `ClaudeState=inactive` or is removed.
+    pub fn has_claude_session(&self, session_id: SessionId) -> bool {
+        self.claude_sessions.contains(&session_id)
     }
 
     /// Compute the tab-bar indicator colour for a session.
@@ -324,20 +337,4 @@ pub fn build_border_instances(
     let right = solid_quad(x + w - bw, y + bw, bw, h - 2.0 * bw, color);
 
     [top, bottom, left, right]
-}
-
-/// Create one solid-colour [`CellInstance`] quad with explicit pixel dimensions.
-#[allow(
-    clippy::many_single_char_names,
-    reason = "x/y/w/h are conventional 2-D geometry shorthands"
-)]
-fn solid_quad(x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> CellInstance {
-    CellInstance {
-        pos: [x, y],
-        size: [w, h],
-        uv_min: [0.0, 0.0],
-        uv_max: [0.0, 0.0],
-        fg_color: color,
-        bg_color: color,
-    }
 }

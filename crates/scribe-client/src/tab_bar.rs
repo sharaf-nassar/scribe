@@ -5,6 +5,7 @@
 //! collected into the same buffer and drawn in a single render pass.
 
 use scribe_common::theme::ChromeColors;
+use scribe_renderer::chrome::rounded_quad;
 use scribe_renderer::srgb_to_linear_rgba;
 use scribe_renderer::types::CellInstance;
 
@@ -23,6 +24,10 @@ pub struct TabBarColors {
     pub separator: [f32; 4],
     #[allow(dead_code, reason = "reserved for future bottom border rendering")]
     pub border: [f32; 4],
+    /// Slightly lighter background for the top half of the gradient tab bar.
+    pub gradient_top: [f32; 4],
+    /// Accent color for the active tab bottom indicator.
+    pub accent: [f32; 4],
 }
 
 impl From<&ChromeColors> for TabBarColors {
@@ -34,6 +39,8 @@ impl From<&ChromeColors> for TabBarColors {
             active_text: srgb_to_linear_rgba(chrome.tab_text_active),
             separator: srgb_to_linear_rgba(chrome.tab_separator),
             border: srgb_to_linear_rgba(chrome.divider),
+            gradient_top: srgb_to_linear_rgba(chrome.tab_bar_gradient_top),
+            accent: srgb_to_linear_rgba(chrome.accent),
         }
     }
 }
@@ -66,58 +73,78 @@ pub fn build_tab_bar_bg(
     tab_bar_height: f32,
     active_range: Option<(f32, f32)>,
 ) {
-    let (cell_w, _cell_h) = cell_size;
-    if cell_w <= 0.0 {
-        return;
+    let (_cell_w, _cell_h) = cell_size;
+    let half_h = tab_bar_height / 2.0;
+
+    // Emit wide-span quads instead of per-column quads.
+    // Split into up to three horizontal regions: before-active, active, after-active.
+    // Each region gets two half-height quads for a subtle vertical gradient
+    // (except active tabs which use a uniform color to stand out).
+    let regions = build_bg_regions(rect, active_range);
+    for (rx, rw, is_active) in regions {
+        if rw <= 0.0 {
+            continue;
+        }
+        if is_active {
+            // Active tab: uniform color, no gradient.
+            out.push(CellInstance {
+                pos: [rx, rect.y],
+                size: [rw, tab_bar_height],
+                uv_min: [0.0, 0.0],
+                uv_max: [0.0, 0.0],
+                fg_color: colors.active_bg,
+                bg_color: colors.active_bg,
+                corner_radius: 0.0,
+                _pad: 0.0,
+            });
+        } else {
+            // Inactive region: lighter top half, normal bottom half.
+            out.push(CellInstance {
+                pos: [rx, rect.y],
+                size: [rw, half_h],
+                uv_min: [0.0, 0.0],
+                uv_max: [0.0, 0.0],
+                fg_color: colors.gradient_top,
+                bg_color: colors.gradient_top,
+                corner_radius: 0.0,
+                _pad: 0.0,
+            });
+            out.push(CellInstance {
+                pos: [rx, rect.y + half_h],
+                size: [rw, tab_bar_height - half_h],
+                uv_min: [0.0, 0.0],
+                uv_max: [0.0, 0.0],
+                fg_color: colors.bg,
+                bg_color: colors.bg,
+                corner_radius: 0.0,
+                _pad: 0.0,
+            });
+        }
     }
+}
 
-    // Fill the tab bar area with background quads, one per cell-width column.
-    let cols = columns_in_width(rect.width, cell_w);
+/// Build horizontal regions for the tab bar background.
+///
+/// Returns a list of `(x, width, is_active)` tuples covering the full rect width.
+/// When an active range is present, the bar is split into up to three regions:
+/// before-active (inactive), the active tab, and after-active (inactive).
+fn build_bg_regions(rect: Rect, active_range: Option<(f32, f32)>) -> Vec<(f32, f32, bool)> {
+    let left = rect.x;
+    let right = rect.x + rect.width;
 
-    for col_idx in 0..cols {
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "column index is a small positive integer fitting in f32"
-        )]
-        let x = rect.x + col_idx as f32 * cell_w;
-        let bg_color = match active_range {
-            Some((xa, xb)) if x >= xa && x + cell_w <= xb => colors.active_bg,
-            _ => colors.bg,
-        };
-        out.push(CellInstance {
-            pos: [x, rect.y],
-            size: [cell_w, tab_bar_height],
-            uv_min: [0.0, 0.0],
-            uv_max: [0.0, 0.0],
-            fg_color: bg_color,
-            bg_color,
-        });
-    }
-
-    // Fill the fractional-pixel remainder at the right edge.
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "column count is a small positive integer fitting in f32"
-    )]
-    let remainder = rect.width - cols as f32 * cell_w;
-    if remainder > 0.0 {
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "column count is a small positive integer fitting in f32"
-        )]
-        let x = rect.x + cols as f32 * cell_w;
-        let bg_color = match active_range {
-            Some((xa, xb)) if x >= xa && x + remainder <= xb => colors.active_bg,
-            _ => colors.bg,
-        };
-        out.push(CellInstance {
-            pos: [x, rect.y],
-            size: [remainder, tab_bar_height],
-            uv_min: [0.0, 0.0],
-            uv_max: [0.0, 0.0],
-            fg_color: bg_color,
-            bg_color,
-        });
+    match active_range {
+        Some((xa, xb)) => {
+            let mut regions = Vec::with_capacity(3);
+            if xa > left {
+                regions.push((left, xa - left, false));
+            }
+            regions.push((xa, (xb - xa).min(right - xa), true));
+            if xb < right {
+                regions.push((xb, right - xb, false));
+            }
+            regions
+        }
+        None => vec![(left, rect.width, false)],
     }
 }
 
@@ -173,6 +200,8 @@ pub fn build_tab_bar_separator(
             uv_max: [0.0, 0.0],
             fg_color: color,
             bg_color: color,
+            corner_radius: 0.0,
+            _pad: 0.0,
         });
     }
 
@@ -197,6 +226,8 @@ pub fn build_tab_bar_separator(
                 uv_max: [0.0, 0.0],
                 fg_color: color,
                 bg_color: color,
+                corner_radius: 0.0,
+                _pad: 0.0,
             });
         }
     }
@@ -295,6 +326,8 @@ pub struct TabBarTextParams<'a> {
     pub update_progress: Option<&'a UpdateProgressState>,
     /// Which tab's close button is shown (hovered). `None` = no hover.
     pub hovered_tab_close: Option<usize>,
+    /// Which tab is hovered (for background highlight). `None` = no hover.
+    pub hovered_tab: Option<usize>,
     /// Per-tab pixel X offsets for slide animation. Empty slice when no drag active.
     pub tab_offsets: &'a [f32],
     /// Index of the tab being dragged, if any.
@@ -433,14 +466,15 @@ fn render_badge(
 
         let pill_width = pill_char_count as f32 * cell_w;
         let pill_x = params.rect.x + pill_start_col as f32 * cell_w;
-        instances.push(CellInstance {
-            pos: [pill_x, params.rect.y],
-            size: [pill_width, params.tab_bar_height],
-            uv_min: [0.0, 0.0],
-            uv_max: [0.0, 0.0],
-            fg_color: pill_bg,
-            bg_color: pill_bg,
-        });
+        let pill_radius = params.tab_bar_height / 2.0;
+        instances.push(rounded_quad(
+            pill_x,
+            params.rect.y,
+            pill_width,
+            params.tab_bar_height,
+            pill_bg,
+            pill_radius,
+        ));
 
         // Use high-contrast active text color for readability on the pill.
         let text_fg = params.colors.active_text;
@@ -600,7 +634,14 @@ fn render_tabs(
         }
 
         let fg = if tab.is_active { params.colors.active_text } else { params.colors.text };
-        let tab_bg = if tab.is_active { params.colors.active_bg } else { bg };
+        let is_hovered = !tab.is_active && params.hovered_tab == Some(tab_idx);
+        let tab_bg = if tab.is_active {
+            params.colors.active_bg
+        } else if is_hovered {
+            [bg[0] + 0.04, bg[1] + 0.04, bg[2] + 0.04, bg[3]]
+        } else {
+            bg
+        };
         let tab_start_col = col;
         let row_base_y = base_y + row as f32 * row_height;
 
@@ -677,6 +718,25 @@ fn render_tabs(
                 uv_max: [0.0, 0.0],
                 fg_color: params.colors.separator,
                 bg_color: params.colors.separator,
+                corner_radius: 0.0,
+                _pad: 0.0,
+            });
+        }
+
+        // Active tab bottom accent indicator: 2px bar spanning the full tab width.
+        if tab.is_active {
+            let accent_h = 2.0;
+            let accent_y = row_base_y + row_height - accent_h;
+            let accent_x = params.rect.x + tab_start_col as f32 * cell_w;
+            instances.push(CellInstance {
+                pos: [accent_x, accent_y],
+                size: [tab_w as f32 * cell_w, accent_h],
+                uv_min: [0.0, 0.0],
+                uv_max: [0.0, 0.0],
+                fg_color: params.colors.accent,
+                bg_color: params.colors.accent,
+                corner_radius: 0.0,
+                _pad: 0.0,
             });
         }
 
@@ -750,6 +810,8 @@ fn render_tabs(
                     uv_max: [0.0, 0.0],
                     fg_color: params.accent_color,
                     bg_color: params.accent_color,
+                    corner_radius: 0.0,
+                    _pad: 0.0,
                 });
             }
         }
@@ -801,6 +863,8 @@ fn render_indicator_bar(
             uv_max: [0.0, 0.0],
             fg_color: color,
             bg_color: color,
+            corner_radius: 0.0,
+            _pad: 0.0,
         });
     }
 }
@@ -932,6 +996,8 @@ fn emit_char(
         uv_max,
         fg_color: fg,
         bg_color: bg,
+        corner_radius: 0.0,
+        _pad: 0.0,
     });
 
     col + 1
