@@ -115,6 +115,7 @@ fi
 cp "${BUILD_DIR}/scribe-client"   "${MACOS_DIR}/"
 cp "${BUILD_DIR}/scribe-server"   "${MACOS_DIR}/"
 cp "${BUILD_DIR}/scribe-settings" "${MACOS_DIR}/"
+cp "${BUILD_DIR}/scribe-driver"   "${MACOS_DIR}/"
 
 # Copy icon
 cp "${STAGING_DIR}/Scribe.icns" "${RESOURCES_DIR}/"

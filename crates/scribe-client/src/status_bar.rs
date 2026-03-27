@@ -128,7 +128,7 @@ pub fn build_status_bar(
     data: &StatusBarData<'_>,
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
 ) -> StatusBarHitTargets {
-    let (cell_w, _cell_h) = cell_size;
+    let (cell_w, cell_h) = cell_size;
     if cell_w <= 0.0 {
         return StatusBarHitTargets {
             equalize_rect: None,
@@ -142,7 +142,8 @@ pub fn build_status_bar(
     let mut w = BarWriter {
         out,
         x_origin: window_rect.x,
-        y: bar_y,
+        y: bar_y + ((status_bar_height - cell_h) / 2.0).max(0.0),
+        bar_y,
         cell_w,
         max_cols,
         col: 0,
@@ -163,7 +164,7 @@ pub fn build_status_bar(
     build_background(
         w.out,
         w.x_origin,
-        w.y,
+        bar_y,
         w.max_cols,
         w.cell_w,
         window_rect.width,
@@ -173,7 +174,7 @@ pub fn build_status_bar(
     build_background(
         w.out,
         w.x_origin,
-        w.y + half,
+        bar_y + half,
         w.max_cols,
         w.cell_w,
         window_rect.width,
@@ -196,6 +197,7 @@ struct BarWriter<'a> {
     out: &'a mut Vec<CellInstance>,
     x_origin: f32,
     y: f32,
+    bar_y: f32,
     cell_w: f32,
     max_cols: usize,
     col: usize,
@@ -211,7 +213,7 @@ impl BarWriter<'_> {
     fn col_rect(&self, start_col: usize) -> Rect {
         let x = self.x_origin + start_col as f32 * self.cell_w;
         let width = (self.col - start_col) as f32 * self.cell_w;
-        Rect { x, y: self.y, width, height: self.bar_height }
+        Rect { x, y: self.bar_y, width, height: self.bar_height }
     }
 
     /// Emit a single character at the current column with the given colors.
@@ -465,7 +467,7 @@ fn render_equalize(
     w.put('\u{229E}', colors.text, colors.bg, resolve_glyph);
     let eq_x = w.x_origin + eq_col as f32 * w.cell_w;
     let eq_width = (w.col - eq_col) as f32 * w.cell_w;
-    Some(Rect { x: eq_x, y: w.y, width: eq_width, height: w.bar_height })
+    Some(Rect { x: eq_x, y: w.bar_y, width: eq_width, height: w.bar_height })
 }
 
 /// Render the gear icon and return its clickable rect.
@@ -487,7 +489,7 @@ fn render_gear(
     w.put(' ', colors.text, colors.bg, resolve_glyph);
     let gear_x = w.x_origin + gear_col as f32 * w.cell_w;
     let gear_width = (w.col - gear_col) as f32 * w.cell_w;
-    Some(Rect { x: gear_x, y: w.y, width: gear_width, height: w.bar_height })
+    Some(Rect { x: gear_x, y: w.bar_y, width: gear_width, height: w.bar_height })
 }
 
 /// Map a 0-100 percentage to a Unicode block element (▁▂▃▄▅▆▇█).

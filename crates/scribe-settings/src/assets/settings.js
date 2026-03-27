@@ -469,7 +469,7 @@ function initColorSwatches() {
     if (!colorInput || !key) { return; }
 
     colorInput.addEventListener("input", function() {
-      swatch.style.backgroundColor = colorInput.value;
+      swatch.style.background = colorInput.value;
     });
 
     colorInput.addEventListener("change", function() {
@@ -483,7 +483,7 @@ function initColorSwatches() {
     if (!colorInput || !key) { return; }
 
     colorInput.addEventListener("input", function() {
-      swatch.style.backgroundColor = colorInput.value;
+      swatch.style.background = colorInput.value;
     });
 
     colorInput.addEventListener("change", function() {
@@ -534,14 +534,14 @@ function populateBadgeColors(colors) {
     var swatch = document.createElement("div");
     swatch.className = "color-swatch";
     swatch.setAttribute("data-key", key);
-    swatch.style.backgroundColor = color;
+    swatch.style.background = color;
 
     var colorInput = document.createElement("input");
     colorInput.type = "color";
     colorInput.value = color;
 
     colorInput.addEventListener("input", function() {
-      swatch.style.backgroundColor = colorInput.value;
+      swatch.style.background = colorInput.value;
     });
 
     colorInput.addEventListener("change", function() {
@@ -721,7 +721,7 @@ function setColorSwatch(key, color) {
   if (!color) { return; }
   var swatch = document.querySelector(".color-swatch[data-key='" + key + "']");
   if (swatch) {
-    swatch.style.backgroundColor = color;
+    swatch.style.background = color;
     var input = swatch.querySelector("input[type='color']");
     if (input) { input.value = color; }
   }
@@ -731,7 +731,7 @@ function setAnsiSwatch(key, color) {
   if (!color) { return; }
   var swatch = document.querySelector(".ansi-swatch[data-key='" + key + "']");
   if (swatch) {
-    swatch.style.backgroundColor = color;
+    swatch.style.background = color;
     var input = swatch.querySelector("input[type='color']");
     if (input) { input.value = color; }
   }

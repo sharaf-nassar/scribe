@@ -5,7 +5,7 @@
 //! collected into the same buffer and drawn in a single render pass.
 
 use scribe_common::theme::ChromeColors;
-use scribe_renderer::chrome::rounded_quad;
+use scribe_renderer::chrome::solid_quad;
 use scribe_renderer::srgb_to_linear_rgba;
 use scribe_renderer::types::CellInstance;
 
@@ -437,7 +437,7 @@ pub fn build_tab_bar_text(
     (instances, hit_targets)
 }
 
-/// Render the workspace badge: accent-coloured pill (leading space + name + trailing space)
+/// Render the workspace badge: accent-coloured cell (leading space + name + trailing space)
 /// followed by a 16px gap.
 #[allow(
     clippy::too_many_arguments,
@@ -466,14 +466,12 @@ fn render_badge(
 
         let pill_width = pill_char_count as f32 * cell_w;
         let pill_x = params.rect.x + pill_start_col as f32 * cell_w;
-        let pill_radius = params.tab_bar_height / 2.0;
-        instances.push(rounded_quad(
+        instances.push(solid_quad(
             pill_x,
             params.rect.y,
             pill_width,
             params.tab_bar_height,
             pill_bg,
-            pill_radius,
         ));
 
         // Use high-contrast active text color for readability on the pill.

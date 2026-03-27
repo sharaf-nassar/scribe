@@ -25,9 +25,10 @@ pub struct TooltipAnchor {
 ///
 /// The tooltip has a 1-character left/right padding, a dark background, and
 /// light text. The background is drawn first (solid quad), then text glyphs.
+/// The tooltip is clamped to stay within `viewport_width`.
 #[allow(
     clippy::too_many_arguments,
-    reason = "needs output vec, anchor, position, colors, cell size, and glyph resolver"
+    reason = "needs output vec, anchor, position, colors, cell size, viewport width, and glyph resolver"
 )]
 pub fn render_tooltip(
     out: &mut Vec<CellInstance>,
@@ -38,6 +39,7 @@ pub fn render_tooltip(
     fg_color: [f32; 4],
     border_color: [f32; 4],
     cell_size: (f32, f32),
+    viewport_width: f32,
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
 ) {
     let (cell_w, cell_h) = cell_size;
@@ -53,9 +55,9 @@ pub fn render_tooltip(
     let tooltip_w = total_cols as f32 * cell_w;
     let tooltip_h = cell_h;
 
-    // Center horizontally on the anchor rect.
+    // Center horizontally on the anchor rect, clamped to stay within the viewport.
     let center_x = anchor.x + anchor.width / 2.0;
-    let tooltip_x = center_x - tooltip_w / 2.0;
+    let tooltip_x = (center_x - tooltip_w / 2.0).clamp(0.0, (viewport_width - tooltip_w).max(0.0));
 
     let tooltip_y = match position {
         TooltipPosition::Above => anchor.y - tooltip_h,

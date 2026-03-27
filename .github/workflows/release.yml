@@ -169,8 +169,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          RELEASE_NOTES: ${{ steps.notes.outputs.notes }}
         run: |
+          printf '%s\n' "$RELEASE_NOTES" > /tmp/release-notes.md
           gh release create "$TAG" \
             --title "$TAG" \
-            --notes "${{ steps.notes.outputs.notes }}" \
+            --notes-file /tmp/release-notes.md \
             artifacts/*.deb artifacts/*.dmg artifacts/*.minisig

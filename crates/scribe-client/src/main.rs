@@ -2047,6 +2047,7 @@ impl App {
                 sb_colors.text,
                 sb_colors.separator,
                 cell_size,
+                full_viewport.width,
                 &mut resolve_glyph,
             );
         }

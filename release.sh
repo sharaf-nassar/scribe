@@ -21,7 +21,7 @@ EOF
 }
 
 get_latest_tag() {
-  git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1
+  git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true
 }
 
 parse_version() {
