@@ -561,6 +561,8 @@ pub struct KeybindingsConfig {
     // Tabs
     #[serde(default = "default_new_tab")]
     pub new_tab: KeyComboList,
+    #[serde(default = "default_new_claude_tab")]
+    pub new_claude_tab: KeyComboList,
     #[serde(default = "default_close_tab")]
     pub close_tab: KeyComboList,
     #[serde(default = "default_next_tab")]
@@ -652,6 +654,7 @@ impl Default for KeybindingsConfig {
             workspace_split_horizontal: default_workspace_split_horizontal(),
             cycle_workspace: default_cycle_workspace(),
             new_tab: default_new_tab(),
+            new_claude_tab: default_new_claude_tab(),
             close_tab: default_close_tab(),
             next_tab: default_next_tab(),
             prev_tab: default_prev_tab(),
@@ -733,6 +736,10 @@ fn default_cycle_workspace() -> KeyComboList {
 
 fn default_new_tab() -> KeyComboList {
     KeyComboList::single("ctrl+shift+t")
+}
+
+fn default_new_claude_tab() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+c")
 }
 
 fn default_close_tab() -> KeyComboList {
@@ -863,10 +870,31 @@ fn default_line_end() -> KeyComboList {
 // Workspaces
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_badge_colors() -> Vec<String> {
+    vec![
+        "#a78bfa".to_owned(),
+        "#38bdf8".to_owned(),
+        "#6ee7b7".to_owned(),
+        "#fb7185".to_owned(),
+        "#fbbf24".to_owned(),
+        "#a3e635".to_owned(),
+        "#f472b6".to_owned(),
+        "#22d3ee".to_owned(),
+    ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspacesConfig {
     #[serde(default)]
     pub roots: Vec<String>,
+    #[serde(default = "default_badge_colors")]
+    pub badge_colors: Vec<String>,
+}
+
+impl Default for WorkspacesConfig {
+    fn default() -> Self {
+        Self { roots: Vec::new(), badge_colors: default_badge_colors() }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -253,7 +253,8 @@ pub struct WorkspaceTabBarData {
     /// Tab data for each tab in the workspace.
     pub tabs: Vec<TabData>,
     /// Workspace badge: `(workspace_name, accent_color)`. `None` when single workspace.
-    pub badge: Option<(String, [f32; 4])>,
+    /// The inner `Option<[f32; 4]>` is `None` for unnamed workspaces (no colored pill).
+    pub badge: Option<(String, Option<[f32; 4]>)>,
     /// Whether the active tab in this workspace has multiple panes.
     pub has_multiple_panes: bool,
     /// Pre-computed tab bar height for this workspace (accounts for multi-row stacking).
@@ -270,7 +271,8 @@ pub struct TabBarTextParams<'a> {
     /// Tab data for each tab in the workspace.
     pub tabs: &'a [TabData],
     /// Workspace badge: `(workspace_name, accent_color)`. `None` when single workspace.
-    pub badge: Option<(&'a str, [f32; 4])>,
+    /// The inner `Option<[f32; 4]>` is `None` for unnamed workspaces (no colored pill).
+    pub badge: Option<(&'a str, Option<[f32; 4]>)>,
     /// Whether to render the gear icon on the far right.
     pub show_gear: bool,
     /// Whether to render the equalize icon left of the gear.
@@ -414,32 +416,43 @@ fn render_badge(
     cell_w: f32,
     params: &mut TabBarTextParams<'_>,
     ws_name: &str,
-    accent_color: [f32; 4],
+    accent_color: Option<[f32; 4]>,
 ) -> usize {
     let bg = params.colors.bg;
 
-    // Pill background: leading space + name + trailing space.
-    let pill_start_col = col;
-    let pill_char_count = 1 + ws_name.chars().count() + 1;
-    let pill_bg = [accent_color[0], accent_color[1], accent_color[2], 0.25];
+    if let Some(accent) = accent_color {
+        // Named workspace: render accent-coloured pill with high-contrast text.
+        let pill_start_col = col;
+        let pill_char_count = 1 + ws_name.chars().count() + 1;
+        let pill_bg = [accent[0], accent[1], accent[2], 0.25];
 
-    let pill_width = pill_char_count as f32 * cell_w;
-    let pill_x = params.rect.x + pill_start_col as f32 * cell_w;
-    instances.push(CellInstance {
-        pos: [pill_x, params.rect.y],
-        size: [pill_width, params.tab_bar_height],
-        uv_min: [0.0, 0.0],
-        uv_max: [0.0, 0.0],
-        fg_color: pill_bg,
-        bg_color: pill_bg,
-    });
+        let pill_width = pill_char_count as f32 * cell_w;
+        let pill_x = params.rect.x + pill_start_col as f32 * cell_w;
+        instances.push(CellInstance {
+            pos: [pill_x, params.rect.y],
+            size: [pill_width, params.tab_bar_height],
+            uv_min: [0.0, 0.0],
+            uv_max: [0.0, 0.0],
+            fg_color: pill_bg,
+            bg_color: pill_bg,
+        });
 
-    // Text on top of pill background.
-    col = emit_char(instances, ' ', col, max_cols, params, accent_color, pill_bg);
-    for ch in ws_name.chars() {
-        col = emit_char(instances, ch, col, max_cols, params, accent_color, pill_bg);
+        // Use high-contrast active text color for readability on the pill.
+        let text_fg = params.colors.active_text;
+        col = emit_char(instances, ' ', col, max_cols, params, text_fg, pill_bg);
+        for ch in ws_name.chars() {
+            col = emit_char(instances, ch, col, max_cols, params, text_fg, pill_bg);
+        }
+        col = emit_char(instances, ' ', col, max_cols, params, text_fg, pill_bg);
+    } else {
+        // Unnamed workspace: render plain muted text, no pill background.
+        let text_fg = params.colors.text;
+        col = emit_char(instances, ' ', col, max_cols, params, text_fg, bg);
+        for ch in ws_name.chars() {
+            col = emit_char(instances, ch, col, max_cols, params, text_fg, bg);
+        }
+        col = emit_char(instances, ' ', col, max_cols, params, text_fg, bg);
     }
-    col = emit_char(instances, ' ', col, max_cols, params, accent_color, pill_bg);
 
     // 16px gap after badge (approximately 2 cell widths), reverting to normal bg.
     let gap = gap_columns(16.0, cell_w);

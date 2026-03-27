@@ -130,7 +130,7 @@ pub fn build_status_bar(
     let max_cols = columns_in_width(window_rect.width, cell_w);
     let mut w = BarWriter { out, x_origin: window_rect.x, y: bar_y, cell_w, max_cols, col: 0 };
 
-    build_background(w.out, w.x_origin, w.y, w.max_cols, w.cell_w, colors.bg);
+    build_background(w.out, w.x_origin, w.y, w.max_cols, w.cell_w, window_rect.width, colors.bg);
 
     let col = render_left_side(&mut w, colors, data, resolve_glyph);
     w.col = col;
@@ -567,7 +567,7 @@ fn home_dir() -> Option<std::path::PathBuf> {
 /// Fill columns with background quads (no glyph).
 #[allow(
     clippy::too_many_arguments,
-    reason = "helper function needs position, column count, cell width, and color"
+    reason = "helper function needs position, column count, cell width, total width, and color"
 )]
 fn build_background(
     out: &mut Vec<CellInstance>,
@@ -575,6 +575,7 @@ fn build_background(
     y: f32,
     cols: usize,
     cell_w: f32,
+    total_width: f32,
     bg: [f32; 4],
 ) {
     for col_idx in 0..cols {
@@ -585,7 +586,29 @@ fn build_background(
         let x = x_origin + col_idx as f32 * cell_w;
         out.push(CellInstance {
             pos: [x, y],
-            size: [0.0, 0.0],
+            size: [cell_w, STATUS_BAR_HEIGHT],
+            uv_min: [0.0, 0.0],
+            uv_max: [0.0, 0.0],
+            fg_color: bg,
+            bg_color: bg,
+        });
+    }
+
+    // Fill the fractional-pixel remainder at the right edge.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "column count is a small positive integer fitting in f32"
+    )]
+    let remainder = total_width - cols as f32 * cell_w;
+    if remainder > 0.0 {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "column count is a small positive integer fitting in f32"
+        )]
+        let x = x_origin + cols as f32 * cell_w;
+        out.push(CellInstance {
+            pos: [x, y],
+            size: [remainder, STATUS_BAR_HEIGHT],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
             fg_color: bg,

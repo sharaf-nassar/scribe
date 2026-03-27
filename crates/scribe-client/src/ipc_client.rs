@@ -30,6 +30,9 @@ pub enum ClientCommand {
         workspace_id: WorkspaceId,
         split_direction: Option<scribe_common::protocol::LayoutDirection>,
         cwd: Option<std::path::PathBuf>,
+        cols: Option<u16>,
+        rows: Option<u16>,
+        command: Option<Vec<String>>,
     },
     /// Close a session.
     CloseSession { session_id: SessionId },
@@ -38,7 +41,7 @@ pub enum ClientCommand {
     /// Request a list of all live sessions on the server.
     ListSessions,
     /// Attach to existing (detached) sessions on the server.
-    AttachSessions { session_ids: Vec<SessionId> },
+    AttachSessions { session_ids: Vec<SessionId>, dimensions: Vec<(u16, u16)> },
     /// Notify server that config file has been updated.
     ConfigReloaded,
     /// Report the current workspace split tree to the server.
@@ -284,14 +287,21 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         ClientCommand::Resize { session_id, cols, rows } => {
             ClientMessage::Resize { session_id, cols, rows }
         }
-        ClientCommand::CreateSession { workspace_id, split_direction, cwd } => {
-            ClientMessage::CreateSession { workspace_id, split_direction, cwd }
+        ClientCommand::CreateSession {
+            workspace_id,
+            split_direction,
+            cwd,
+            cols,
+            rows,
+            command,
+        } => {
+            ClientMessage::CreateSession { workspace_id, split_direction, cwd, cols, rows, command }
         }
         ClientCommand::CloseSession { session_id } => ClientMessage::CloseSession { session_id },
         ClientCommand::Subscribe { session_ids } => ClientMessage::Subscribe { session_ids },
         ClientCommand::ListSessions => ClientMessage::ListSessions,
-        ClientCommand::AttachSessions { session_ids } => {
-            ClientMessage::AttachSessions { session_ids }
+        ClientCommand::AttachSessions { session_ids, dimensions } => {
+            ClientMessage::AttachSessions { session_ids, dimensions }
         }
         ClientCommand::ConfigReloaded => ClientMessage::ConfigReloaded,
         ClientCommand::ReportWorkspaceTree { tree } => ClientMessage::ReportWorkspaceTree { tree },

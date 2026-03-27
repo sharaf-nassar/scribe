@@ -59,6 +59,7 @@ pub struct Bindings {
 
     // Tabs
     pub new_tab: BindingSet,
+    pub new_claude_tab: BindingSet,
     pub close_tab: BindingSet,
     pub next_tab: BindingSet,
     pub prev_tab: BindingSet,
@@ -198,6 +199,7 @@ impl Bindings {
 
             // Tabs
             new_tab: parse_set(&config.new_tab),
+            new_claude_tab: parse_set(&config.new_claude_tab),
             close_tab: parse_set(&config.close_tab),
             next_tab: parse_set(&config.next_tab),
             prev_tab: parse_set(&config.prev_tab),
@@ -295,6 +297,8 @@ pub enum LayoutAction {
     // Tabs
     /// Create a new tab in the focused workspace.
     NewTab,
+    /// Open a new tab running Claude Code in the focused workspace.
+    NewClaudeTab,
     /// Close the active tab in the focused workspace.
     CloseTab,
     /// Switch to the next tab.
@@ -457,6 +461,9 @@ fn translate_layout_shortcut(
     }
 
     // Tabs
+    if any_matches(&bindings.new_claude_tab, event, modifiers) {
+        return Some(LayoutAction::NewClaudeTab);
+    }
     if any_matches(&bindings.new_tab, event, modifiers) {
         return Some(LayoutAction::NewTab);
     }

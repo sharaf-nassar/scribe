@@ -592,7 +592,14 @@ async fn handle_create_session(
         let mut guard = state.lock().await;
         guard.last_session_created = None;
     }
-    let msg = ClientMessage::CreateSession { workspace_id, split_direction: None, cwd: None };
+    let msg = ClientMessage::CreateSession {
+        workspace_id,
+        split_direction: None,
+        cwd: None,
+        cols: None,
+        rows: None,
+        command: None,
+    };
     if let Err(e) = send_to_server(server_writer, &msg).await {
         return DaemonResponse::Error { message: format!("failed to send CreateSession: {e}") };
     }
@@ -614,7 +621,7 @@ async fn handle_attach_session(
     notifiers: &Arc<WaitNotifiers>,
     server_writer: &Arc<Mutex<OwnedWriteHalf>>,
 ) -> DaemonResponse {
-    let msg = ClientMessage::AttachSessions { session_ids: vec![session_id] };
+    let msg = ClientMessage::AttachSessions { session_ids: vec![session_id], dimensions: vec![] };
     if let Err(e) = send_to_server(server_writer, &msg).await {
         return DaemonResponse::Error { message: format!("failed to send AttachSessions: {e}") };
     }

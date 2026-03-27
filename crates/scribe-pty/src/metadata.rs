@@ -67,6 +67,9 @@ impl MetadataParser {
     fn parse_title(params: &[&[u8]]) -> Option<MetadataEvent> {
         let title_bytes = params.get(1)?;
         let title = truncate_chars(&String::from_utf8_lossy(title_bytes), MAX_TITLE_LEN);
+        if title.trim().is_empty() {
+            return None;
+        }
         Some(MetadataEvent::TitleChanged(title))
     }
 

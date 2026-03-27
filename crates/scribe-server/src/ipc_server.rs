@@ -393,11 +393,21 @@ async fn dispatch_message(
     updater_handle: &UpdaterHandle,
 ) {
     match msg {
-        ClientMessage::CreateSession { workspace_id, split_direction, cwd } => {
+        ClientMessage::CreateSession {
+            workspace_id,
+            split_direction,
+            cwd,
+            cols,
+            rows,
+            command,
+        } => {
             handle_create_session(
                 workspace_id,
                 split_direction,
                 cwd,
+                cols,
+                rows,
+                command,
                 session_manager,
                 workspace_manager,
                 writer,
@@ -431,9 +441,10 @@ async fn dispatch_message(
         ClientMessage::ListSessions => {
             handle_list_sessions(live_sessions, workspace_manager, writer, window_id).await;
         }
-        ClientMessage::AttachSessions { session_ids } => {
+        ClientMessage::AttachSessions { session_ids, dimensions } => {
             handle_attach_sessions(
                 &session_ids,
+                &dimensions,
                 live_sessions,
                 workspace_manager,
                 writer,
@@ -484,6 +495,9 @@ async fn handle_create_session(
     workspace_id: WorkspaceId,
     split_direction: Option<scribe_common::protocol::LayoutDirection>,
     cwd: Option<std::path::PathBuf>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    command: Option<Vec<String>>,
     session_manager: &Arc<SessionManager>,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     writer: &SharedWriter,
@@ -491,13 +505,14 @@ async fn handle_create_session(
     attached_ids: &mut HashSet<SessionId>,
     window_id: WindowId,
 ) {
-    let session_id = match session_manager.create_session(workspace_id, cwd).await {
-        Ok(id) => id,
-        Err(e) => {
-            send_error(writer, &format!("failed to create session: {e}")).await;
-            return;
-        }
-    };
+    let session_id =
+        match session_manager.create_session(workspace_id, cwd, cols, rows, command).await {
+            Ok(id) => id,
+            Err(e) => {
+                send_error(writer, &format!("failed to create session: {e}")).await;
+                return;
+            }
+        };
 
     // Register session with workspace manager.  When `split_direction` is
     // `Some` the workspace is auto-created (client just split the window).
@@ -956,6 +971,10 @@ struct AttachEntry {
     workspace_id: WorkspaceId,
     client_writer: ClientWriter,
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    pty_raw_fd: RawFd,
+    /// Target dimensions `(cols, rows)` for the new client.  When `Some`, the
+    /// session's `Term` and PTY are resized before the snapshot is captured.
+    dims: Option<(u16, u16)>,
     title: String,
     cwd: Option<std::path::PathBuf>,
     ai_state: Option<scribe_common::ai_state::AiProcessState>,
@@ -963,8 +982,10 @@ struct AttachEntry {
 
 /// Handle `AttachSessions` — take ownership of detached sessions, set the
 /// client writer, and send back session + workspace info for each.
+#[allow(clippy::too_many_arguments, reason = "mirrors dispatch_message's dependency set")]
 async fn handle_attach_sessions(
     session_ids: &[SessionId],
+    dimensions: &[(u16, u16)],
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     writer: &SharedWriter,
@@ -974,13 +995,15 @@ async fn handle_attach_sessions(
 
     // Collect data we need, then drop the registry lock before sending.
     let mut attach_data: Vec<AttachEntry> = Vec::new();
-    for &session_id in session_ids {
+    for (i, &session_id) in session_ids.iter().enumerate() {
         if let Some(session) = sessions.get(&session_id) {
             attach_data.push(AttachEntry {
                 session_id,
                 workspace_id: session.workspace_id,
                 client_writer: Arc::clone(&session.client_writer),
                 term: Arc::clone(&session.term),
+                pty_raw_fd: session.pty_raw_fd,
+                dims: dimensions.get(i).copied(),
                 title: session.title.clone(),
                 cwd: session.cwd.clone(),
                 ai_state: session.ai_state.clone(),
@@ -994,6 +1017,20 @@ async fn handle_attach_sessions(
     for entry in attach_data {
         attach_one_session(&entry, writer, live_sessions, workspace_manager).await;
         attached_ids.insert(entry.session_id);
+    }
+}
+
+/// Resize the session's `Term` and PTY to the client's current dimensions so
+/// the snapshot reflects the correct grid size.  No-op when dims are absent or
+/// contain a zero dimension.
+async fn resize_for_attach(entry: &AttachEntry) {
+    if let Some((cols, rows)) = entry.dims {
+        if cols > 0 && rows > 0 {
+            resize_term(&entry.term, cols, rows).await;
+            if let Err(e) = set_pty_winsize(entry.pty_raw_fd, cols, rows) {
+                warn!(session_id = %entry.session_id, error = %e, "attach resize: TIOCSWINSZ failed");
+            }
+        }
     }
 }
 
@@ -1044,6 +1081,9 @@ async fn attach_one_session(
             send_message(writer, &msg).await;
         }
     }
+
+    // Resize Term and PTY to the client's dimensions before snapshot capture.
+    resize_for_attach(entry).await;
 
     let snapshot = take_session_snapshot(session_id, &entry.term, live_sessions).await;
     let snap_msg = ServerMessage::ScreenSnapshot { session_id, snapshot };
@@ -1488,8 +1528,10 @@ async fn persist_session_metadata(
 ) {
     match server_msg {
         ServerMessage::TitleChanged { title, .. } => {
-            if let Some(session) = live_sessions.write().await.get_mut(&session_id) {
-                title.clone_into(&mut session.title);
+            if !title.trim().is_empty() {
+                if let Some(session) = live_sessions.write().await.get_mut(&session_id) {
+                    title.clone_into(&mut session.title);
+                }
             }
         }
         ServerMessage::CwdChanged { cwd, .. } => {

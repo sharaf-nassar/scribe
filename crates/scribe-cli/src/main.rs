@@ -109,8 +109,14 @@ async fn main() -> Result<(), ScribeError> {
 
     // Create a session
     let workspace_id = WorkspaceId::new();
-    let create_msg =
-        ClientMessage::CreateSession { workspace_id, split_direction: None, cwd: None };
+    let create_msg = ClientMessage::CreateSession {
+        workspace_id,
+        split_direction: None,
+        cwd: None,
+        cols: None,
+        rows: None,
+        command: None,
+    };
     write_message(&mut write_half, &create_msg).await?;
 
     // Read the SessionCreated response

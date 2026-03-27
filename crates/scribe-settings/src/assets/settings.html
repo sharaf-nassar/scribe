@@ -715,6 +715,12 @@
             </div>
           </div>
           <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">New Claude Tab</div></div>
+            <div class="keybinding-cell" data-action="new_claude_tab">
+              <button class="kb-reset-btn" data-action="new_claude_tab" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
             <div class="setting-info"><div class="setting-label">Close Tab</div></div>
             <div class="keybinding-cell" data-action="close_tab">
               <button class="kb-reset-btn" data-action="close_tab" title="Reset to default">&#8635;</button>
@@ -946,6 +952,17 @@
               Add workspace root...
             </button>
           </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Badge Colors</div>
+        <div class="section-description">Colors assigned to workspace badges. Same-named workspaces share a color.</div>
+        <div class="section-card">
+          <div id="badge-color-list" class="color-row">
+            <!-- Populated by loadConfig -->
+          </div>
+          <button class="badge-color-reset" type="button">Reset to defaults</button>
         </div>
       </div>
     </div>

@@ -30,6 +30,18 @@ pub enum ClientMessage {
         /// `None` falls back to `$HOME`.
         #[serde(default)]
         cwd: Option<PathBuf>,
+        /// Initial terminal dimensions.  When provided the PTY is created at
+        /// this size instead of the 80×24 default, avoiding a resize race
+        /// where the shell's first output is formatted for the wrong width.
+        #[serde(default)]
+        cols: Option<u16>,
+        #[serde(default)]
+        rows: Option<u16>,
+        /// Optional command to run instead of the default shell.
+        /// When `Some`, the PTY spawns this command directly (e.g. `["claude"]`).
+        /// The first element is the program, remaining elements are arguments.
+        #[serde(default)]
+        command: Option<Vec<String>>,
     },
     CloseSession {
         session_id: SessionId,
@@ -67,8 +79,16 @@ pub enum ClientMessage {
     /// Request a list of all live sessions on the server.
     ListSessions,
     /// Attach to existing (detached) sessions, taking ownership.
+    ///
+    /// When `dimensions` is provided, the server resizes each session's `Term`
+    /// and PTY to the given `(cols, rows)` before capturing the screen snapshot,
+    /// avoiding a dimension mismatch on reconnect.  The length of `dimensions`
+    /// must match the length of `session_ids`.
     AttachSessions {
         session_ids: Vec<SessionId>,
+        /// Per-session dimensions `(cols, rows)` parallel to `session_ids`.
+        #[serde(default)]
+        dimensions: Vec<(u16, u16)>,
     },
     /// Notify server that config file has been updated.
     ConfigReloaded,

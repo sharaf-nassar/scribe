@@ -585,6 +585,59 @@ function initWorkspaces() {
   });
 }
 
+// ─────────── Badge Colors ───────────
+
+function populateBadgeColors(colors) {
+  var list = document.getElementById("badge-color-list");
+  if (!list) { return; }
+
+  // Remove existing swatch groups but keep other siblings
+  var existing = list.querySelectorAll(".color-swatch-group");
+  existing.forEach(function(el) { el.remove(); });
+
+  colors.forEach(function(color, index) {
+    var key = "workspaces.badge_colors." + index;
+
+    var group = document.createElement("div");
+    group.className = "color-swatch-group";
+
+    var swatch = document.createElement("div");
+    swatch.className = "color-swatch";
+    swatch.setAttribute("data-key", key);
+    swatch.style.backgroundColor = color;
+
+    var colorInput = document.createElement("input");
+    colorInput.type = "color";
+    colorInput.value = color;
+
+    colorInput.addEventListener("input", function() {
+      swatch.style.backgroundColor = colorInput.value;
+    });
+
+    colorInput.addEventListener("change", function() {
+      sendChange(key, colorInput.value);
+    });
+
+    swatch.appendChild(colorInput);
+    group.appendChild(swatch);
+
+    var label = document.createElement("span");
+    label.className = "color-swatch-label";
+    label.textContent = String(index + 1);
+    group.appendChild(label);
+
+    list.appendChild(group);
+  });
+}
+
+function initBadgeColorReset() {
+  var btn = document.querySelector(".badge-color-reset");
+  if (!btn) { return; }
+  btn.addEventListener("click", function() {
+    sendChange("workspaces.reset_badge_colors", true);
+  });
+}
+
 // ─────────── loadConfig — called by Rust ───────────
 
 function loadConfig(config) {
@@ -667,6 +720,11 @@ function loadConfig(config) {
   // Workspaces
   if (config.workspaces?.roots) {
     populateWorkspaceRoots(config.workspaces.roots);
+  }
+
+  // Badge colors
+  if (config.workspaces?.badge_colors) {
+    populateBadgeColors(config.workspaces.badge_colors);
   }
 }
 
@@ -1347,6 +1405,7 @@ document.addEventListener("DOMContentLoaded", function() {
   initCommunityThemes();
   initColorSwatches();
   initWorkspaces();
+  initBadgeColorReset();
   initGlobalSearch();
   initKeybindingRecorder();
 

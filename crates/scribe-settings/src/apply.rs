@@ -238,6 +238,19 @@ fn apply_config_key(
             let path = value.as_str().ok_or("remove_root value must be a string")?;
             config.workspaces.roots.retain(|r| r != path);
         }
+        "workspaces.reset_badge_colors" => {
+            config.workspaces.badge_colors =
+                scribe_common::config::WorkspacesConfig::default().badge_colors;
+        }
+        key if key.starts_with("workspaces.badge_colors.") => {
+            let index_str = key.trim_start_matches("workspaces.badge_colors.");
+            let index: usize =
+                index_str.parse().map_err(|_| String::from("invalid badge color index"))?;
+            let color = value.as_str().ok_or("badge color must be a string")?;
+            if let Some(slot) = config.workspaces.badge_colors.get_mut(index) {
+                color.clone_into(slot);
+            }
+        }
         _ => {
             tracing::debug!(key, "unhandled settings key");
         }
@@ -325,6 +338,7 @@ fn apply_keybinding_field(
         "workspace_split_horizontal" => kb.workspace_split_horizontal = list,
         "cycle_workspace" => kb.cycle_workspace = list,
         "new_tab" => kb.new_tab = list,
+        "new_claude_tab" => kb.new_claude_tab = list,
         "close_tab" => kb.close_tab = list,
         "next_tab" => kb.next_tab = list,
         "prev_tab" => kb.prev_tab = list,

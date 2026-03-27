@@ -137,10 +137,17 @@ impl SessionManager {
     /// wrapper for epoll-driven I/O, and creates a `Term<ScribeEventListener>`
     /// for terminal state management. Uses the scrollback line count configured
     /// at construction time.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "session creation requires workspace, cwd, dimensions, and optional command override"
+    )]
     pub async fn create_session(
         &self,
         workspace_id: WorkspaceId,
         cwd: Option<std::path::PathBuf>,
+        cols: Option<u16>,
+        rows: Option<u16>,
+        command: Option<Vec<String>>,
     ) -> Result<SessionId, ScribeError> {
         let scrollback_lines = self.scrollback_lines.load(Ordering::Relaxed);
         {
@@ -164,19 +171,25 @@ impl SessionManager {
         let term_config =
             TermConfig { scrolling_history: scrollback_lines, ..TermConfig::default() };
 
-        // 4. Create Term with default 80x24 dimensions.
+        // 4. Create Term — use caller-supplied dimensions when available so
+        //    the PTY starts at the correct size and the shell's first output
+        //    is formatted for the actual window width.
+        let init_cols = cols.filter(|&c| c > 0).unwrap_or(DEFAULT_COLS);
+        let init_rows = rows.filter(|&r| r > 0).unwrap_or(DEFAULT_ROWS);
         let dimensions =
-            TermDimensions { cols: usize::from(DEFAULT_COLS), lines: usize::from(DEFAULT_ROWS) };
+            TermDimensions { cols: usize::from(init_cols), lines: usize::from(init_rows) };
         let term = Term::new(term_config, &dimensions, event_listener);
 
         // 5. Create PTY using `alacritty_terminal::tty`.
-        let window_size = WindowSize {
-            num_lines: DEFAULT_ROWS,
-            num_cols: DEFAULT_COLS,
-            cell_width: 1,
-            cell_height: 1,
-        };
+        let window_size =
+            WindowSize { num_lines: init_rows, num_cols: init_cols, cell_width: 1, cell_height: 1 };
+        let shell = command.and_then(|parts| {
+            let mut iter = parts.into_iter();
+            let program = iter.next()?;
+            Some(alacritty_terminal::tty::Shell::new(program, iter.collect()))
+        });
         let pty_options = PtyOptions {
+            shell,
             env: HashMap::from([
                 ("TERM".to_owned(), "xterm-256color".to_owned()),
                 ("COLORTERM".to_owned(), "truecolor".to_owned()),

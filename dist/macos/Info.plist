@@ -11,7 +11,7 @@
     <key>CFBundleIconFile</key>
     <string>Scribe.icns</string>
     <key>CFBundleIdentifier</key>
-    <string>com.scribe-terminal.scribe</string>
+    <string>com.scribeterminal.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

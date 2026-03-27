@@ -73,9 +73,6 @@ hook_script = os.path.join(hooks_dir, "detect-claude-question.sh")
 # Each entry: (event, matcher_or_none, hook_commands)
 # matcher_or_none=None means no matcher field (matches everything).
 SCRIBE_HOOKS = [
-    ("Notification", "idle_prompt", [
-        {"type": "command", "command": "printf '\\e]1337;ClaudeState=idle_prompt\\a' > /dev/tty"},
-    ]),
     ("Notification", "permission_prompt", [
         {"type": "command", "command": "printf '\\e]1337;ClaudeState=permission_prompt\\a' > /dev/tty"},
     ]),
@@ -136,9 +133,8 @@ for event, matcher, hook_cmds in SCRIBE_HOOKS:
         entry["matcher"] = matcher
     scribe_by_event.setdefault(event, []).append(entry)
 
-# Add the Stop hook with the detection script
+# Add the Stop hook with the detection script (no matcher = matches all stop reasons)
 stop_entry = {
-    "matcher": "",
     "hooks": [{"type": "command", "command": hook_script}],
 }
 scribe_by_event.setdefault("Stop", []).append(stop_entry)

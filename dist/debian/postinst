@@ -26,13 +26,26 @@ case "$1" in
             # TOCTOU symlink attacks from other local users.
             UPGRADE_LOG=$(mktemp /run/user/"${TARGET_UID}"/scribe/upgrade-log.XXXXXX) || \
                 UPGRADE_LOG=$(mktemp)
+            # mktemp runs as root; chown so the user subprocess can write.
+            chown "${TARGET_UID}" "${UPGRADE_LOG}" 2>/dev/null || true
 
+            # Launch the upgrade server detached from sudo.
+            #
+            # Plain `sudo -u user server &` makes sudo wait for the
+            # long-lived server child — it never exits, leaving zombie
+            # sudo processes after every install.  Using `sh -c '... &'`
+            # backgrounds the server *inside* the sh, so sh exits
+            # immediately, sudo exits, and the server is reparented to
+            # init.  The PID is captured via stdout.
             if [ -n "$SUDO_UID" ]; then
-                sudo -u "#${SUDO_UID}" "${UPGRADE_BIN}" --upgrade >"${UPGRADE_LOG}" 2>&1 &
+                UPGRADE_PID=$(sudo -u "#${SUDO_UID}" sh -c '
+                    "$1" --upgrade >"$2" 2>&1 &
+                    echo $!
+                ' _ "${UPGRADE_BIN}" "${UPGRADE_LOG}")
             else
                 "${UPGRADE_BIN}" --upgrade >"${UPGRADE_LOG}" 2>&1 &
+                UPGRADE_PID=$!
             fi
-            UPGRADE_PID=$!
 
             # Wait briefly for the new server to be fully ready. We check
             # for "IPC server listening" (emitted after socket bind) rather
@@ -139,7 +152,8 @@ case "$1" in
                     echo "    systemctl --user restart scribe-server"
                 fi
             fi
-            rm -f "${UPGRADE_LOG}" 2>/dev/null || true
+            # Clean up all upgrade logs (current + stale from previous installs).
+            rm -f /run/user/"${TARGET_UID}"/scribe/upgrade-log.* 2>/dev/null || true
             echo ""
         else
             # Fresh install: clean up any stale socket and start the service

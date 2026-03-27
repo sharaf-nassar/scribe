@@ -3,7 +3,6 @@ set -euo pipefail
 
 : "${MACOS_CERT_P12:?MACOS_CERT_P12 must be set}"
 : "${MACOS_CERT_PASSWORD:?MACOS_CERT_PASSWORD must be set}"
-: "${MACOS_SIGNING_IDENTITY:?MACOS_SIGNING_IDENTITY must be set}"
 : "${APPLE_ID:?APPLE_ID must be set}"
 : "${APPLE_TEAM_ID:?APPLE_TEAM_ID must be set}"
 : "${APPLE_APP_PASSWORD:?APPLE_APP_PASSWORD must be set}"
@@ -45,6 +44,14 @@ security set-key-partition-list \
     "${KEYCHAIN_PATH}"
 
 security list-keychains -d user -s "${KEYCHAIN_PATH}" $(security list-keychains -d user | tr -d '"')
+
+echo "==> Extracting signing identity..."
+MACOS_SIGNING_IDENTITY=$(security find-identity -v -p codesigning "${KEYCHAIN_PATH}" | head -1 | awk -F'"' '{print $2}')
+if [ -z "${MACOS_SIGNING_IDENTITY}" ]; then
+    echo "ERROR: No codesigning identity found in keychain"
+    exit 1
+fi
+echo "    Identity: ${MACOS_SIGNING_IDENTITY}"
 
 echo "==> Signing .app bundle..."
 codesign \

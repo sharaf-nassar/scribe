@@ -808,6 +808,10 @@ impl App {
     /// tab per session in the correct workspace.  Multiple server-side
     /// workspaces are reconstructed by splitting the window layout.
     /// If no sessions exist, fall back to creating a fresh session.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "sequential attach flow; extracting helpers would obscure the ordering invariant"
+    )]
     fn handle_session_list(
         &mut self,
         sessions: &[scribe_common::protocol::SessionInfo],
@@ -828,10 +832,8 @@ impl App {
 
         tracing::info!(count = sessions.len(), "reattaching to existing sessions");
 
-        // SessionId is Copy — collect independently for each command instead of
-        // cloning the Vec.
+        // SessionId is Copy — collect independently for each command.
         let attach_ids: Vec<SessionId> = sessions.iter().map(|s| s.session_id).collect();
-        send_command(&tx, ClientCommand::AttachSessions { session_ids: attach_ids });
 
         // Build a metadata lookup so panes can be initialised with the
         // last-known title and CWD instead of defaulting to "shell".
@@ -852,6 +854,55 @@ impl App {
         } else {
             self.reconstruct_fallback(sessions);
         }
+
+        // -- Compute per-workspace grid dimensions --------------------------
+        // Build a session→workspace map for the dimensions lookup below.
+        let session_workspace: HashMap<SessionId, WorkspaceId> =
+            sessions.iter().map(|s| (s.session_id, s.workspace_id)).collect();
+
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "viewport dimensions are small enough to fit in f32"
+        )]
+        let ws_dims: HashMap<WorkspaceId, (u16, u16)> = if let Some(gpu) = self.gpu.as_ref() {
+            let ws_viewport = workspace_viewport(&gpu.surface_config);
+            let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+            let cell = gpu.renderer.cell_size();
+            let tab_bar_h = self.effective_tab_bar_height();
+            let padding = pane::effective_padding(
+                &self.config.appearance.content_padding,
+                PaneEdges::all_external(),
+            );
+            ws_rects
+                .iter()
+                .map(|&(ws_id, ws_rect)| {
+                    let grid = pane::compute_pane_grid(
+                        ws_rect,
+                        cell.width,
+                        cell.height,
+                        tab_bar_h,
+                        &padding,
+                    );
+                    (ws_id, (grid.cols, grid.rows))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        // Build dimensions vec in the same order as attach_ids.
+        let dimensions: Vec<(u16, u16)> = attach_ids
+            .iter()
+            .map(|sid| {
+                session_workspace
+                    .get(sid)
+                    .and_then(|ws_id| ws_dims.get(ws_id))
+                    .copied()
+                    .unwrap_or((0, 0))
+            })
+            .collect();
+
+        send_command(&tx, ClientCommand::AttachSessions { session_ids: attach_ids, dimensions });
 
         // Use the layout's own leaf order to determine workspace iteration.
         // When a tree was provided, this preserves the exact spatial order;
@@ -972,13 +1023,19 @@ impl App {
 
         send_command(
             tx,
-            ClientCommand::CreateSession { workspace_id, split_direction: None, cwd: None },
+            ClientCommand::CreateSession {
+                workspace_id,
+                split_direction: None,
+                cwd: None,
+                cols: Some(grid.cols),
+                rows: Some(grid.rows),
+                command: None,
+            },
         );
         self.panes.insert(pane_id, pane);
         self.url_caches.insert(pane_id, url_detect::PaneUrlCache::new());
         self.session_to_pane.insert(session_id, pane_id);
         self.pending_sessions.push_back(session_id);
-        send_resize(tx, session_id, grid.cols, grid.rows);
 
         // Seed the server with the initial (single-leaf) tree.
         self.report_workspace_tree();
@@ -1257,6 +1314,9 @@ impl App {
 
     /// Handle title change for a session — update pane title.
     fn handle_title_changed(&mut self, session_id: SessionId, title: &str) {
+        if title.trim().is_empty() {
+            return;
+        }
         let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
         tracing::debug!(%session_id, %title, "title changed");
@@ -1635,12 +1695,9 @@ impl App {
                 })
                 .collect();
 
-            let badge = if multi_workspace {
-                let name = ws.name.clone().unwrap_or_else(|| String::from("workspace"));
-                Some((name, scribe_renderer::srgb_to_linear_rgba(ws.accent_color)))
-            } else {
-                None
-            };
+            let badge = multi_workspace.then(|| {
+                make_workspace_badge(ws.name.as_deref(), &self.config.workspaces.badge_colors)
+            });
 
             let has_multiple_panes = tab.pane_layout.all_pane_ids().len() > 1;
 
@@ -2057,6 +2114,7 @@ impl App {
 
             // Tabs
             LayoutAction::NewTab => self.handle_new_tab(),
+            LayoutAction::NewClaudeTab => self.handle_new_claude_tab(),
             LayoutAction::CloseTab => self.handle_close_tab(),
             LayoutAction::NextTab => self.handle_next_tab(),
             LayoutAction::PrevTab => self.handle_prev_tab(),
@@ -2144,6 +2202,9 @@ impl App {
                     workspace_id,
                     split_direction: None,
                     cwd: inherited_cwd,
+                    cols: Some(grid.cols),
+                    rows: Some(grid.rows),
+                    command: None,
                 },
             );
         }
@@ -2207,6 +2268,9 @@ impl App {
                     workspace_id: new_workspace_id,
                     split_direction: Some(to_layout_direction(direction)),
                     cwd: None,
+                    cols: Some(grid.cols),
+                    rows: Some(grid.rows),
+                    command: None,
                 },
             );
         }
@@ -2299,6 +2363,21 @@ impl App {
         reason = "viewport dimensions are small enough to fit in f32"
     )]
     fn handle_new_tab(&mut self) {
+        self.create_new_tab(None);
+    }
+
+    fn handle_new_claude_tab(&mut self) {
+        // Wrap in an interactive login shell so the user's full environment
+        // is initialised before claude starts.  The server runs as a systemd
+        // service with a minimal env, and Ubuntu's default .bashrc bails out
+        // early for non-interactive shells (`case $- in *i*) ;; *) return`),
+        // so `-i` is required to ensure NVM, Go, pnpm, etc. PATH entries
+        // added at the end of .bashrc are actually loaded.
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
+        self.create_new_tab(Some(vec![shell, "-lic".to_owned(), "exec claude".to_owned()]));
+    }
+
+    fn create_new_tab(&mut self, command: Option<Vec<String>>) {
         // Capture the focused pane's CWD before add_tab changes the active tab.
         let inherited_cwd = self
             .window_layout
@@ -2341,6 +2420,9 @@ impl App {
                     workspace_id,
                     split_direction: None,
                     cwd: inherited_cwd,
+                    cols: Some(grid.cols),
+                    rows: Some(grid.rows),
+                    command,
                 },
             );
         }
@@ -4482,7 +4564,9 @@ fn apply_session_metadata(
 ) {
     if let Some(&(title, cwd)) = metadata.get(&pane.session_id) {
         if let Some(title) = title {
-            title.clone_into(&mut pane.title);
+            if !title.trim().is_empty() {
+                title.clone_into(&mut pane.title);
+            }
         }
         if let Some(cwd) = cwd {
             pane.cwd = Some((*cwd).clone());
@@ -5618,6 +5702,41 @@ fn parse_hex_color(hex_str: &str) -> Option<[f32; 4]> {
         reason = "u8 to f32 is always lossless but clippy pedantic flags it"
     )]
     Some([red as f32 / 255.0, green as f32 / 255.0, blue as f32 / 255.0, 1.0])
+}
+
+/// Deterministic accent color for a workspace name.
+///
+/// Hashes the name with `DefaultHasher` ([`SipHash`]) mod palette length and
+/// returns the corresponding palette color converted to linear RGBA. Returns
+/// `None` when the palette is empty.
+///
+/// [`SipHash`]: std::collections::hash_map::DefaultHasher
+fn name_to_accent_color(name: &str, palette: &[String]) -> Option<[f32; 4]> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    if palette.is_empty() {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "truncation is acceptable for a palette index — we only need a stable bucket, not the exact hash value"
+    )]
+    let hash = hasher.finish() as usize;
+    let hex = palette.get(hash % palette.len())?;
+    parse_hex_color(hex).map(scribe_renderer::srgb_to_linear_rgba)
+}
+
+/// Build the workspace badge tuple for multi-workspace mode.
+///
+/// Named workspaces get a deterministic accent color from the palette.
+/// Unnamed workspaces get a plain "workspace" label with no color.
+fn make_workspace_badge(name: Option<&str>, palette: &[String]) -> (String, Option<[f32; 4]>) {
+    name.map_or_else(
+        || (String::from("workspace"), None),
+        |n| (n.to_owned(), name_to_accent_color(n, palette)),
+    )
 }
 
 // ---------------------------------------------------------------------------

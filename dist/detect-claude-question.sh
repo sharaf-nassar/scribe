@@ -41,7 +41,7 @@ if [[ -n "$MSG" ]]; then
         STATE="waiting_for_input"
     # Heuristic 2: tail contains common question phrases
     elif printf '%s\n' "$TAIL_LINES" \
-        | grep -qiE '(would you like|should i|do you want|which option|please (choose|select|pick)|how (should|would|do)|what (should|would|do)|let me know|your (choice|preference|call))'; then
+        | grep -qiE '(would you like|should i|do you want|which option|please (choose|select|pick)|how (should|would|do|to)|what (should|would|do)|let me know|your (choice|preference|call))'; then
         STATE="waiting_for_input"
     # Heuristic 3: tail contains approval/review request phrases
     elif printf '%s\n' "$TAIL_LINES" \
