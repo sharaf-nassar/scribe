@@ -97,21 +97,3 @@ pub fn server_lock_path() -> PathBuf {
 pub fn handoff_socket_path() -> PathBuf {
     runtime_dir().join("handoff.sock")
 }
-
-/// Returns the socket path for the driver singleton.
-///
-/// - Linux: `/run/user/{uid}/scribe/driver.sock`
-/// - macOS: `$TMPDIR/scribe-{uid}/driver.sock`
-#[must_use]
-pub fn driver_socket_path() -> PathBuf {
-    runtime_dir().join("driver.sock")
-}
-
-/// Returns the lock file path for the driver singleton.
-///
-/// - Linux: `/run/user/{uid}/scribe/driver.lock`
-/// - macOS: `$TMPDIR/scribe-{uid}/driver.lock`
-#[must_use]
-pub fn driver_lock_path() -> PathBuf {
-    runtime_dir().join("driver.lock")
-}

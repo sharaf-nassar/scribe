@@ -2,6 +2,8 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
+use crate::ai_state::AiProvider;
+
 use crate::error::ScribeError;
 use crate::theme::{self, Theme, ThemeColors, hex_to_rgba, rgba_to_hex};
 
@@ -93,6 +95,8 @@ pub struct ScribeConfig {
     pub keybindings: KeybindingsConfig,
     #[serde(default)]
     pub workspaces: WorkspacesConfig,
+    #[serde(default)]
+    pub update: UpdateConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -396,13 +400,11 @@ fn default_pulse_duration() -> u32 {
     1000
 }
 
-/// Configuration for all five Claude Code AI indicator states.
+/// Configuration for the four Claude Code AI indicator states.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeStatesConfig {
     #[serde(default = "default_processing_entry")]
     pub processing: AiStateEntry,
-    #[serde(default = "default_idle_prompt_entry")]
-    pub idle_prompt: AiStateEntry,
     #[serde(default = "default_waiting_for_input_entry")]
     pub waiting_for_input: AiStateEntry,
     #[serde(default = "default_permission_prompt_entry")]
@@ -415,7 +417,6 @@ impl Default for ClaudeStatesConfig {
     fn default() -> Self {
         Self {
             processing: default_processing_entry(),
-            idle_prompt: default_idle_prompt_entry(),
             waiting_for_input: default_waiting_for_input_entry(),
             permission_prompt: default_permission_prompt_entry(),
             error: default_error_entry(),
@@ -430,16 +431,6 @@ fn default_processing_entry() -> AiStateEntry {
         color: AiColor::Ansi(2),
         pulse_ms: 1400,
         timeout_secs: 0.0,
-    }
-}
-
-fn default_idle_prompt_entry() -> AiStateEntry {
-    AiStateEntry {
-        tab_indicator: true,
-        pane_border: true,
-        color: AiColor::Hex([1.0, 0.65, 0.1, 1.0]),
-        pulse_ms: 2000,
-        timeout_secs: 10.0,
     }
 }
 
@@ -513,6 +504,13 @@ pub struct TerminalConfig {
     pub claude_copy_cleanup: bool,
     #[serde(default = "default_true")]
     pub claude_code_integration: bool,
+    #[serde(default = "default_true")]
+    pub codex_code_integration: bool,
+    #[serde(default)]
+    pub hide_codex_hook_logs: bool,
+    /// Which AI CLI the AI tab keybindings launch.
+    #[serde(default = "default_ai_tab_provider")]
+    pub ai_tab_provider: AiProvider,
     /// When `true`, the OS-reported scroll direction is used as-is (natural
     /// scrolling).  When `false` (default), the scroll delta is inverted for
     /// traditional terminal behaviour.
@@ -527,6 +525,8 @@ pub struct TerminalConfig {
     /// Which system stats are shown in the status bar.
     #[serde(default)]
     pub status_bar_stats: StatusBarStatsConfig,
+    #[serde(default)]
+    pub shell_integration: ShellIntegrationConfig,
 }
 
 impl Default for TerminalConfig {
@@ -536,16 +536,50 @@ impl Default for TerminalConfig {
             copy_on_select: true,
             claude_copy_cleanup: true,
             claude_code_integration: true,
+            codex_code_integration: true,
+            hide_codex_hook_logs: false,
+            ai_tab_provider: default_ai_tab_provider(),
             natural_scroll: false,
             claude_states: ClaudeStatesConfig::default(),
             indicator_height: default_indicator_height(),
             status_bar_stats: StatusBarStatsConfig::default(),
+            shell_integration: ShellIntegrationConfig::default(),
         }
+    }
+}
+
+impl TerminalConfig {
+    #[must_use]
+    pub fn ai_provider_enabled(&self, provider: AiProvider) -> bool {
+        match provider {
+            AiProvider::ClaudeCode => self.claude_code_integration,
+            AiProvider::CodexCode => self.codex_code_integration,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shell integration
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellIntegrationConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for ShellIntegrationConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
 fn default_scrollback_lines() -> u32 {
     10_000
+}
+
+fn default_ai_tab_provider() -> AiProvider {
+    AiProvider::ClaudeCode
 }
 
 fn default_indicator_height() -> f32 {
@@ -581,14 +615,22 @@ pub struct KeybindingsConfig {
     pub workspace_split_vertical: KeyComboList,
     #[serde(default = "default_workspace_split_horizontal")]
     pub workspace_split_horizontal: KeyComboList,
-    #[serde(default = "default_cycle_workspace")]
-    pub cycle_workspace: KeyComboList,
+    #[serde(default = "default_workspace_focus_left")]
+    pub workspace_focus_left: KeyComboList,
+    #[serde(default = "default_workspace_focus_right")]
+    pub workspace_focus_right: KeyComboList,
+    #[serde(default = "default_workspace_focus_up")]
+    pub workspace_focus_up: KeyComboList,
+    #[serde(default = "default_workspace_focus_down")]
+    pub workspace_focus_down: KeyComboList,
 
     // Tabs
     #[serde(default = "default_new_tab")]
     pub new_tab: KeyComboList,
     #[serde(default = "default_new_claude_tab")]
     pub new_claude_tab: KeyComboList,
+    #[serde(default = "default_new_claude_resume_tab")]
+    pub new_claude_resume_tab: KeyComboList,
     #[serde(default = "default_close_tab")]
     pub close_tab: KeyComboList,
     #[serde(default = "default_next_tab")]
@@ -631,6 +673,10 @@ pub struct KeybindingsConfig {
     pub scroll_bottom: KeyComboList,
     #[serde(default = "default_find")]
     pub find: KeyComboList,
+    #[serde(default = "default_prompt_jump_up")]
+    pub prompt_jump_up: KeyComboList,
+    #[serde(default = "default_prompt_jump_down")]
+    pub prompt_jump_down: KeyComboList,
 
     // View
     #[serde(default = "default_zoom_in")]
@@ -645,10 +691,10 @@ pub struct KeybindingsConfig {
     pub new_window: KeyComboList,
 
     // General
+    #[serde(default = "default_command_palette")]
+    pub command_palette: KeyComboList,
     #[serde(default = "default_settings")]
     pub settings: KeyComboList,
-    #[serde(default = "default_driver")]
-    pub driver: KeyComboList,
 
     // Terminal shortcuts (send escape sequences to PTY)
     #[serde(default = "default_word_left")]
@@ -680,9 +726,13 @@ impl Default for KeybindingsConfig {
             focus_down: default_focus_down(),
             workspace_split_vertical: default_workspace_split_vertical(),
             workspace_split_horizontal: default_workspace_split_horizontal(),
-            cycle_workspace: default_cycle_workspace(),
+            workspace_focus_left: default_workspace_focus_left(),
+            workspace_focus_right: default_workspace_focus_right(),
+            workspace_focus_up: default_workspace_focus_up(),
+            workspace_focus_down: default_workspace_focus_down(),
             new_tab: default_new_tab(),
             new_claude_tab: default_new_claude_tab(),
+            new_claude_resume_tab: default_new_claude_resume_tab(),
             close_tab: default_close_tab(),
             next_tab: default_next_tab(),
             prev_tab: default_prev_tab(),
@@ -702,12 +752,14 @@ impl Default for KeybindingsConfig {
             scroll_top: default_scroll_top(),
             scroll_bottom: default_scroll_bottom(),
             find: default_find(),
+            prompt_jump_up: default_prompt_jump_up(),
+            prompt_jump_down: default_prompt_jump_down(),
             zoom_in: default_zoom_in(),
             zoom_out: default_zoom_out(),
             zoom_reset: default_zoom_reset(),
             new_window: default_new_window(),
+            command_palette: default_command_palette(),
             settings: default_settings(),
-            driver: default_driver(),
             word_left: default_word_left(),
             word_right: default_word_right(),
             delete_word_backward: default_delete_word_backward(),
@@ -719,16 +771,27 @@ impl Default for KeybindingsConfig {
     }
 }
 
+/// Return a [`KeyComboList`] with the macOS combo on macOS, otherwise the
+/// other combo.  Evaluated entirely at compile time — the optimizer removes
+/// the dead branch.
+fn platform_combo(macos: &str, other: &str) -> KeyComboList {
+    if cfg!(target_os = "macos") {
+        KeyComboList::single(macos)
+    } else {
+        KeyComboList::single(other)
+    }
+}
+
 fn default_split_vertical() -> KeyComboList {
-    KeyComboList::single("ctrl+shift+\\")
+    platform_combo("cmd+d", "ctrl+shift+\\")
 }
 
 fn default_split_horizontal() -> KeyComboList {
-    KeyComboList::single("ctrl+shift+-")
+    platform_combo("cmd+shift+d", "ctrl+shift+-")
 }
 
 fn default_close_pane() -> KeyComboList {
-    KeyComboList::single("ctrl+shift+w")
+    platform_combo("cmd+w", "ctrl+shift+w")
 }
 
 fn default_cycle_pane() -> KeyComboList {
@@ -736,95 +799,111 @@ fn default_cycle_pane() -> KeyComboList {
 }
 
 fn default_focus_left() -> KeyComboList {
-    KeyComboList::single("ctrl+alt+left")
+    platform_combo("cmd+alt+left", "shift+ctrl+alt+left")
 }
 
 fn default_focus_right() -> KeyComboList {
-    KeyComboList::single("ctrl+alt+right")
+    platform_combo("cmd+alt+right", "shift+ctrl+alt+right")
 }
 
 fn default_focus_up() -> KeyComboList {
-    KeyComboList::single("ctrl+alt+up")
+    platform_combo("cmd+alt+up", "shift+ctrl+alt+up")
 }
 
 fn default_focus_down() -> KeyComboList {
-    KeyComboList::single("ctrl+alt+down")
+    platform_combo("cmd+alt+down", "shift+ctrl+alt+down")
 }
 
 fn default_workspace_split_vertical() -> KeyComboList {
-    KeyComboList::single("ctrl+alt+\\")
+    platform_combo("cmd+ctrl+\\", "ctrl+alt+\\")
 }
 
 fn default_workspace_split_horizontal() -> KeyComboList {
-    KeyComboList::single("ctrl+alt+-")
+    platform_combo("cmd+ctrl+-", "ctrl+alt+-")
 }
 
-fn default_cycle_workspace() -> KeyComboList {
-    KeyComboList::single("ctrl+alt+tab")
+fn default_workspace_focus_left() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+left")
+}
+
+fn default_workspace_focus_right() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+right")
+}
+
+fn default_workspace_focus_up() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+up")
+}
+
+fn default_workspace_focus_down() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+down")
 }
 
 fn default_new_tab() -> KeyComboList {
-    KeyComboList::single("ctrl+shift+t")
+    platform_combo("cmd+t", "ctrl+shift+t")
 }
 
 fn default_new_claude_tab() -> KeyComboList {
     KeyComboList::single("ctrl+alt+c")
 }
 
+fn default_new_claude_resume_tab() -> KeyComboList {
+    KeyComboList::single("ctrl+alt+r")
+}
+
 fn default_close_tab() -> KeyComboList {
-    KeyComboList::single("ctrl+shift+q")
+    platform_combo("cmd+shift+w", "ctrl+shift+q")
 }
 
 fn default_next_tab() -> KeyComboList {
-    KeyComboList::single("ctrl+pagedown")
+    platform_combo("cmd+shift+]", "ctrl+pagedown")
 }
 
 fn default_prev_tab() -> KeyComboList {
-    KeyComboList::single("ctrl+pageup")
+    platform_combo("cmd+shift+[", "ctrl+pageup")
 }
 
 fn default_select_tab_1() -> KeyComboList {
-    KeyComboList::single("alt+1")
+    platform_combo("cmd+1", "alt+1")
 }
 
 fn default_select_tab_2() -> KeyComboList {
-    KeyComboList::single("alt+2")
+    platform_combo("cmd+2", "alt+2")
 }
 
 fn default_select_tab_3() -> KeyComboList {
-    KeyComboList::single("alt+3")
+    platform_combo("cmd+3", "alt+3")
 }
 
 fn default_select_tab_4() -> KeyComboList {
-    KeyComboList::single("alt+4")
+    platform_combo("cmd+4", "alt+4")
 }
 
 fn default_select_tab_5() -> KeyComboList {
-    KeyComboList::single("alt+5")
+    platform_combo("cmd+5", "alt+5")
 }
 
 fn default_select_tab_6() -> KeyComboList {
-    KeyComboList::single("alt+6")
+    platform_combo("cmd+6", "alt+6")
 }
 
 fn default_select_tab_7() -> KeyComboList {
-    KeyComboList::single("alt+7")
+    platform_combo("cmd+7", "alt+7")
 }
 
 fn default_select_tab_8() -> KeyComboList {
-    KeyComboList::single("alt+8")
+    platform_combo("cmd+8", "alt+8")
 }
 
 fn default_select_tab_9() -> KeyComboList {
-    KeyComboList::single("alt+9")
+    platform_combo("cmd+9", "alt+9")
 }
 
 fn default_copy() -> KeyComboList {
-    KeyComboList::single("ctrl+shift+c")
+    platform_combo("cmd+c", "ctrl+shift+c")
 }
 
 fn default_paste() -> KeyComboList {
-    KeyComboList::single("ctrl+shift+v")
+    platform_combo("cmd+v", "ctrl+shift+v")
 }
 
 fn default_scroll_up() -> KeyComboList {
@@ -836,39 +915,47 @@ fn default_scroll_down() -> KeyComboList {
 }
 
 fn default_scroll_top() -> KeyComboList {
-    KeyComboList::single("shift+home")
+    platform_combo("cmd+home", "shift+home")
 }
 
 fn default_scroll_bottom() -> KeyComboList {
-    KeyComboList::single("shift+end")
+    platform_combo("cmd+end", "shift+end")
+}
+
+fn default_prompt_jump_up() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+z")
+}
+
+fn default_prompt_jump_down() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+x")
 }
 
 fn default_find() -> KeyComboList {
-    KeyComboList::single("ctrl+shift+f")
+    platform_combo("cmd+f", "ctrl+shift+f")
 }
 
 fn default_zoom_in() -> KeyComboList {
-    KeyComboList::single("ctrl+=")
+    platform_combo("cmd+=", "ctrl+=")
 }
 
 fn default_zoom_out() -> KeyComboList {
-    KeyComboList::single("ctrl+-")
+    platform_combo("cmd+-", "ctrl+-")
 }
 
 fn default_zoom_reset() -> KeyComboList {
-    KeyComboList::single("ctrl+0")
+    platform_combo("cmd+0", "ctrl+0")
 }
 
 fn default_new_window() -> KeyComboList {
-    KeyComboList::single("ctrl+shift+n")
+    platform_combo("cmd+n", "ctrl+shift+n")
 }
 
 fn default_settings() -> KeyComboList {
-    KeyComboList::single("ctrl+,")
+    platform_combo("cmd+,", "ctrl+,")
 }
 
-fn default_driver() -> KeyComboList {
-    KeyComboList::single("ctrl+shift+d")
+fn default_command_palette() -> KeyComboList {
+    platform_combo("cmd+shift+p", "ctrl+shift+p")
 }
 
 fn default_word_left() -> KeyComboList {
@@ -928,6 +1015,46 @@ impl Default for WorkspacesConfig {
     fn default() -> Self {
         Self { roots: Vec::new(), badge_colors: default_badge_colors() }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Update
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Beta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    #[serde(default = "default_update_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_update_check_interval_secs")]
+    pub check_interval_secs: u64,
+    #[serde(default)]
+    pub channel: UpdateChannel,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_update_enabled(),
+            check_interval_secs: default_update_check_interval_secs(),
+            channel: UpdateChannel::default(),
+        }
+    }
+}
+
+fn default_update_enabled() -> bool {
+    true
+}
+
+fn default_update_check_interval_secs() -> u64 {
+    86_400
 }
 
 // ---------------------------------------------------------------------------

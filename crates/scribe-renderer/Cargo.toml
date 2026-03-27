@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description.workspace = true
 
 [lints]
 workspace = true
@@ -16,3 +17,4 @@ bytemuck.workspace = true
 alacritty_terminal.workspace = true
 tracing.workspace = true
 scribe-common.workspace = true
+unicode-width = "0.2"

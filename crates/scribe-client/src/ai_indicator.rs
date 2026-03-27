@@ -6,10 +6,10 @@
 //! Colours, per-state enable flags, and auto-clear timeouts are driven by
 //! [`ClaudeStatesConfig`] rather than compile-time constants.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use scribe_common::ai_state::{AiProcessState, AiState};
-use scribe_common::config::{AiStateEntry, ClaudeStatesConfig};
+use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
+use scribe_common::config::{AiStateEntry, ClaudeStatesConfig, TerminalConfig};
 use scribe_common::ids::SessionId;
 use scribe_renderer::chrome::solid_quad;
 use scribe_renderer::types::CellInstance;
@@ -35,11 +35,11 @@ const ANIMATION_WRAP_PERIOD: f32 = std::f32::consts::TAU * 100.0;
 /// Tracks AI state for all sessions and drives border / indicator colours.
 pub struct AiStateTracker {
     states: HashMap<SessionId, AiProcessState>,
-    /// Sessions where Claude Code has ever been detected.
+    /// Providers detected per session.
     ///
     /// Unlike `states`, this is not cleared by timeouts or keystrokes — only
     /// by an explicit `AiStateCleared` / session removal.
-    claude_sessions: HashSet<SessionId>,
+    detected_providers: HashMap<SessionId, AiProvider>,
     /// Monotonically increasing time in seconds, used for pulse animation.
     animation_time: f32,
     /// Time each session entered its current state, for timeout expiry.
@@ -54,7 +54,7 @@ impl AiStateTracker {
     pub fn new(config: ClaudeStatesConfig) -> Self {
         Self {
             states: HashMap::new(),
-            claude_sessions: HashSet::new(),
+            detected_providers: HashMap::new(),
             animation_time: 0.0,
             state_enter_times: HashMap::new(),
             config,
@@ -70,13 +70,19 @@ impl AiStateTracker {
     ///
     /// States whose per-state `enabled` flag is `false` are silently ignored.
     pub fn update(&mut self, session_id: SessionId, ai_state: AiProcessState) {
-        self.claude_sessions.insert(session_id);
+        self.detected_providers.insert(session_id, ai_state.provider);
         let entry = self.entry_for(&ai_state.state);
         if !entry.tab_indicator && !entry.pane_border {
             return;
         }
         self.state_enter_times.insert(session_id, self.animation_time);
         self.states.insert(session_id, ai_state);
+    }
+
+    /// Remember the last provider seen for a session without restoring a
+    /// visible state.
+    pub fn remember_provider(&mut self, session_id: SessionId, provider: AiProvider) {
+        self.detected_providers.insert(session_id, provider);
     }
 
     /// Clear attention states (`IdlePrompt` / `WaitingForInput` /
@@ -119,8 +125,11 @@ impl AiStateTracker {
 
     /// Returns `true` if any session has an animated (pulsing or decaying)
     /// state that requires continuous redraw.
-    pub fn needs_animation(&self) -> bool {
+    pub fn needs_animation(&self, terminal: &TerminalConfig) -> bool {
         self.states.values().any(|s| {
+            if !terminal.ai_provider_enabled(s.provider) {
+                return false;
+            }
             if matches!(s.state, AiState::Error) {
                 // Error decays over timeout_secs; animate while decay is active.
                 self.config.error.timeout_secs > 0.0
@@ -134,7 +143,7 @@ impl AiStateTracker {
     pub fn remove(&mut self, session_id: SessionId) {
         self.states.remove(&session_id);
         self.state_enter_times.remove(&session_id);
-        self.claude_sessions.remove(&session_id);
+        self.detected_providers.remove(&session_id);
     }
 
     /// Whether Claude Code has been detected in this session.
@@ -142,8 +151,14 @@ impl AiStateTracker {
     /// Unlike [`get`], this returns `true` even after the visual indicator
     /// has timed out or been cleared by a keystroke.  It is only reset when
     /// the session explicitly sends `ClaudeState=inactive` or is removed.
+    #[cfg(test)]
     pub fn has_claude_session(&self, session_id: SessionId) -> bool {
-        self.claude_sessions.contains(&session_id)
+        self.detected_providers.get(&session_id) == Some(&AiProvider::ClaudeCode)
+    }
+
+    /// Provider last seen for a session, if any.
+    pub fn provider_for_session(&self, session_id: SessionId) -> Option<AiProvider> {
+        self.detected_providers.get(&session_id).copied()
     }
 
     /// Compute the tab-bar indicator colour for a session.
@@ -154,8 +169,12 @@ impl AiStateTracker {
         &self,
         session_id: SessionId,
         ansi_colors: &[[f32; 4]; 16],
+        terminal: &TerminalConfig,
     ) -> Option<[f32; 4]> {
         let state = self.states.get(&session_id)?;
+        if !terminal.ai_provider_enabled(state.provider) {
+            return None;
+        }
         if !self.entry_for(&state.state).tab_indicator {
             return None;
         }
@@ -170,11 +189,15 @@ impl AiStateTracker {
         &self,
         session_ids: &[SessionId],
         ansi_colors: &[[f32; 4]; 16],
+        terminal: &TerminalConfig,
     ) -> Option<[f32; 4]> {
         let mut best: Option<(u8, [f32; 4])> = None;
 
         for &sid in session_ids {
             let Some(state) = self.states.get(&sid) else { continue };
+            if !terminal.ai_provider_enabled(state.provider) {
+                continue;
+            }
             if !self.entry_for(&state.state).pane_border {
                 continue;
             }
@@ -257,8 +280,7 @@ impl Default for AiStateTracker {
 fn entry_for_config<'a>(config: &'a ClaudeStatesConfig, state: &AiState) -> &'a AiStateEntry {
     match state {
         AiState::Processing => &config.processing,
-        AiState::IdlePrompt => &config.idle_prompt,
-        AiState::WaitingForInput => &config.waiting_for_input,
+        AiState::IdlePrompt | AiState::WaitingForInput => &config.waiting_for_input,
         AiState::PermissionPrompt => &config.permission_prompt,
         AiState::Error => &config.error,
     }
@@ -337,4 +359,42 @@ pub fn build_border_instances(
     let right = solid_quad(x + w - bw, y + bw, bw, h - 2.0 * bw, color);
 
     [top, bottom, left, right]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AiStateTracker;
+    use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
+    use scribe_common::config::TerminalConfig;
+    use scribe_common::ids::SessionId;
+
+    const ANSI_COLORS: [[f32; 4]; 16] = [[0.25, 0.5, 0.75, 1.0]; 16];
+
+    #[test]
+    fn codex_indicator_respects_provider_toggle() {
+        let mut tracker = AiStateTracker::default();
+        let session_id = SessionId::new();
+        let terminal =
+            TerminalConfig { codex_code_integration: false, ..TerminalConfig::default() };
+
+        tracker.update(
+            session_id,
+            AiProcessState::new_with_provider(AiProvider::CodexCode, AiState::Processing),
+        );
+
+        assert_eq!(tracker.tab_indicator_color(session_id, &ANSI_COLORS, &terminal), None);
+    }
+
+    #[test]
+    fn codex_sessions_do_not_enable_claude_cleanup() {
+        let mut tracker = AiStateTracker::default();
+        let session_id = SessionId::new();
+
+        tracker.update(
+            session_id,
+            AiProcessState::new_with_provider(AiProvider::CodexCode, AiState::Processing),
+        );
+
+        assert!(!tracker.has_claude_session(session_id));
+    }
 }

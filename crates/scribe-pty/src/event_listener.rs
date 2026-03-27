@@ -1,9 +1,25 @@
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
+use alacritty_terminal::term::ClipboardType;
+use alacritty_terminal::vte::ansi::Rgb;
 use scribe_common::ids::SessionId;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::metadata::MetadataEvent;
+
+type ClipboardFormatter = std::sync::Arc<dyn Fn(&str) -> String + Sync + Send + 'static>;
+type ColorFormatter = std::sync::Arc<dyn Fn(Rgb) -> String + Sync + Send + 'static>;
+type TextAreaSizeFormatter = std::sync::Arc<dyn Fn(WindowSize) -> String + Sync + Send + 'static>;
+
+/// Events emitted by the terminal core that require server handling.
+pub enum SessionEvent {
+    Metadata(MetadataEvent),
+    ClipboardStore(ClipboardType, String),
+    ClipboardLoad(ClipboardType, ClipboardFormatter),
+    ColorRequest(usize, ColorFormatter),
+    PtyWrite(String),
+    TextAreaSizeRequest(TextAreaSizeFormatter),
+}
 
 /// Bridges `alacritty_terminal` [`Event`]s into a [`MetadataEvent`] channel.
 ///
@@ -12,13 +28,13 @@ use crate::metadata::MetadataEvent;
 /// rest for observability.
 pub struct ScribeEventListener {
     session_id: SessionId,
-    event_tx: mpsc::UnboundedSender<MetadataEvent>,
+    event_tx: mpsc::UnboundedSender<SessionEvent>,
 }
 
 impl ScribeEventListener {
     /// Create a new listener that forwards events to `event_tx`.
     #[must_use]
-    pub fn new(session_id: SessionId, event_tx: mpsc::UnboundedSender<MetadataEvent>) -> Self {
+    pub fn new(session_id: SessionId, event_tx: mpsc::UnboundedSender<SessionEvent>) -> Self {
         Self { session_id, event_tx }
     }
 
@@ -29,11 +45,11 @@ impl ScribeEventListener {
     }
 
     /// Send a `MetadataEvent` on the channel, logging if the receiver has dropped.
-    fn emit(&self, event: MetadataEvent) {
+    fn emit(&self, event: SessionEvent) {
         if self.event_tx.send(event).is_err() {
             debug!(
                 session_id = %self.session_id,
-                "MetadataEvent dropped: receiver closed"
+                "SessionEvent dropped: receiver closed"
             );
         }
     }
@@ -43,76 +59,35 @@ impl EventListener for ScribeEventListener {
     fn send_event(&self, event: Event) {
         match event {
             Event::Title(title) => {
-                self.emit(MetadataEvent::TitleChanged(title));
+                self.emit(SessionEvent::Metadata(MetadataEvent::TitleChanged(title)));
             }
 
             Event::ResetTitle => {
-                self.emit(MetadataEvent::TitleChanged(String::new()));
+                self.emit(SessionEvent::Metadata(MetadataEvent::TitleChanged(String::new())));
             }
 
             Event::Bell => {
-                self.emit(MetadataEvent::Bell);
+                self.emit(SessionEvent::Metadata(MetadataEvent::Bell));
             }
 
             Event::ClipboardStore(kind, text) => {
-                // We don't manage a clipboard — log for future integration.
-                debug!(
-                    session_id = %self.session_id,
-                    clipboard_type = ?kind,
-                    len = text.len(),
-                    "ClipboardStore: clipboard integration not yet implemented"
-                );
+                self.emit(SessionEvent::ClipboardStore(kind, text));
             }
 
             Event::ClipboardLoad(kind, formatter) => {
-                // Reply with an empty string so the child process doesn't block.
-                // A real clipboard integration would call formatter(clipboard_contents).
-                let response = formatter("");
-                debug!(
-                    session_id = %self.session_id,
-                    clipboard_type = ?kind,
-                    response_len = response.len(),
-                    "ClipboardLoad: replying with empty clipboard (not yet implemented)"
-                );
-                // NOTE: The response would normally be written back to the PTY via a
-                // Notify channel. We log it here; Task 7's read loop will wire the
-                // Notify path and can use a separate mechanism for write-back.
+                self.emit(SessionEvent::ClipboardLoad(kind, formatter));
             }
 
             Event::PtyWrite(data) => {
-                // Terminal-initiated write-back (e.g., DA response, color query reply).
-                // Task 7 will route these through the PTY write path.
-                debug!(
-                    session_id = %self.session_id,
-                    len = data.len(),
-                    "PtyWrite request from Term (not yet forwarded to PTY)"
-                );
+                self.emit(SessionEvent::PtyWrite(data));
             }
 
             Event::ColorRequest(index, formatter) => {
-                // Color query — reply with a default black (#000000).
-                let response = formatter(alacritty_terminal::vte::ansi::Rgb { r: 0, g: 0, b: 0 });
-                debug!(
-                    session_id = %self.session_id,
-                    color_index = index,
-                    response_len = response.len(),
-                    "ColorRequest: replying with default black (not yet implemented)"
-                );
+                self.emit(SessionEvent::ColorRequest(index, formatter));
             }
 
             Event::TextAreaSizeRequest(formatter) => {
-                // Size query — reply with a zero-size placeholder.
-                let response = formatter(alacritty_terminal::event::WindowSize {
-                    num_lines: 0,
-                    num_cols: 0,
-                    cell_width: 0,
-                    cell_height: 0,
-                });
-                debug!(
-                    session_id = %self.session_id,
-                    response_len = response.len(),
-                    "TextAreaSizeRequest: replying with zero size (not yet implemented)"
-                );
+                self.emit(SessionEvent::TextAreaSizeRequest(formatter));
             }
 
             // The following events are UI/renderer signals that don't map to metadata.

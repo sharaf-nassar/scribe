@@ -561,6 +561,7 @@ fn render_update_progress(
         UpdateProgressState::Verifying => "Verifying\u{2026}",
         UpdateProgressState::Installing => "Installing\u{2026}",
         UpdateProgressState::Completed { .. } => "Updated!",
+        UpdateProgressState::CompletedRestartRequired { .. } => "Updated! Restart required",
         UpdateProgressState::Failed { .. } => "Update failed",
     };
 
@@ -1019,4 +1020,100 @@ fn columns_in_width(width: f32, cell_w: f32) -> usize {
 )]
 fn gap_columns(gap_px: f32, cell_w: f32) -> usize {
     if cell_w <= 0.0 { 0 } else { (gap_px / cell_w).ceil() as usize }
+}
+
+/// Maximum fraction of pane width that the title pill may occupy.
+pub const PILL_MAX_WIDTH_FRACTION: f32 = 0.3;
+
+/// Build a semi-transparent title pill in the top-right corner of a pane.
+///
+/// Only call this when the active tab has 2+ panes. The pill is positioned at
+/// the first terminal content line (`pane_rect.y` + `tab_bar_height` for top-edge
+/// panes, or `pane_rect.y` otherwise). Its height is exactly one cell height.
+/// Title is truncated with `…` if it exceeds 30% of the pane width.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "all parameters are needed to position and render the pill with correct colors and glyphs"
+)]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "character counts are small positive integers fitting in f32"
+)]
+pub fn build_pane_title_pill(
+    out: &mut Vec<CellInstance>,
+    title: &str,
+    pane_rect: Rect,
+    tab_bar_height: f32,
+    cell_size: (f32, f32),
+    colors: &TabBarColors,
+    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+) {
+    let (cell_w, cell_h) = cell_size;
+    if cell_w <= 0.0 || cell_h <= 0.0 {
+        return;
+    }
+
+    // Pill height is exactly one cell height.
+    let pill_h = cell_h;
+
+    // Maximum chars allowed (30% of pane width, minus 2 padding chars).
+    let pane_cols = columns_in_width(pane_rect.width, cell_w);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bounded non-negative value"
+    )]
+    let max_content_cols =
+        ((pane_cols as f32 * PILL_MAX_WIDTH_FRACTION) as usize).saturating_sub(2);
+    if max_content_cols == 0 {
+        return;
+    }
+
+    // Build the display string (truncate with ellipsis if needed).
+    let chars: Vec<char> = title.chars().collect();
+    let (display_chars, truncated): (Vec<char>, bool) = if chars.len() <= max_content_cols {
+        (chars, false)
+    } else {
+        // Reserve 1 slot for the ellipsis.
+        let truncated_len = max_content_cols.saturating_sub(1);
+        let mut tc: Vec<char> = chars.into_iter().take(truncated_len).collect();
+        tc.push('\u{2026}'); // …
+        (tc, true)
+    };
+    let _ = truncated; // used only to construct the display string
+
+    // Pill width: 1 padding + content + 1 padding.
+    let content_len = display_chars.len();
+    let pill_cols = content_len + 2;
+    let pill_width = pill_cols as f32 * cell_w;
+
+    // X position: inset by 1 cell from the right edge of the pane.
+    let pill_x = (pane_rect.x + pane_rect.width - pill_width - cell_w).max(pane_rect.x);
+    let pill_y = pane_rect.y + tab_bar_height;
+
+    // Semi-transparent background.
+    let pill_bg = [colors.bg[0], colors.bg[1], colors.bg[2], 0.7];
+    out.push(solid_quad(pill_x, pill_y, pill_width, pill_h, pill_bg));
+
+    // Text: vertically centred within pill_h.
+    let text_y = pill_y + ((pill_h - cell_h) / 2.0).max(0.0);
+    let text_color = colors.text;
+
+    // Leading padding space (no glyph needed — background covers it).
+    // Emit each content character.
+    for (i, &ch) in display_chars.iter().enumerate() {
+        // +1 to skip the leading padding column.
+        let char_x = pill_x + (i + 1) as f32 * cell_w;
+        let (uv_min, uv_max) = resolve_glyph(ch);
+        out.push(CellInstance {
+            pos: [char_x, text_y],
+            size: [0.0, 0.0],
+            uv_min,
+            uv_max,
+            fg_color: text_color,
+            bg_color: [0.0; 4],
+            corner_radius: 0.0,
+            _pad: 0.0,
+        });
+    }
 }

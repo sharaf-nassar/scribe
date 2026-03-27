@@ -1,11 +1,64 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use crate::ai_state::AiProcessState;
-use crate::driver::{DriverTaskInfo, DriverTaskState};
+use crate::ai_state::{AiProcessState, AiProvider};
 use crate::ids::{SessionId, WindowId, WorkspaceId};
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub cols: u16,
+    pub rows: u16,
+    #[serde(default)]
+    pub cell_width: u16,
+    #[serde(default)]
+    pub cell_height: u16,
+}
+
+impl TerminalSize {
+    #[must_use]
+    pub fn has_grid(self) -> bool {
+        self.cols > 0 && self.rows > 0
+    }
+
+    #[must_use]
+    pub fn has_pixels(self) -> bool {
+        self.cell_width > 0 && self.cell_height > 0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AutomationAction {
+    OpenSettings,
+    OpenFind,
+    NewTab,
+    NewClaudeTab,
+    NewClaudeResumeTab,
+    SplitVertical,
+    SplitHorizontal,
+    ClosePane,
+    CloseTab,
+    NewWindow,
+    SwitchProfile { name: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub window_id: WindowId,
+    pub session_count: usize,
+    pub connected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionContext {
+    #[serde(default)]
+    pub remote: bool,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub tmux_session: Option<String>,
+}
 
 // ── UI → Server ──────────────────────────────────────────────────
 
@@ -15,11 +68,14 @@ pub enum ClientMessage {
     KeyInput {
         session_id: SessionId,
         data: Vec<u8>,
+        /// Whether this input should dismiss client-attention AI states such
+        /// as waiting-for-input and permission prompts.
+        #[serde(default)]
+        dismisses_attention: bool,
     },
     Resize {
         session_id: SessionId,
-        cols: u16,
-        rows: u16,
+        size: TerminalSize,
     },
     CreateSession {
         workspace_id: WorkspaceId,
@@ -36,11 +92,9 @@ pub enum ClientMessage {
         /// this size instead of the 80×24 default, avoiding a resize race
         /// where the shell's first output is formatted for the wrong width.
         #[serde(default)]
-        cols: Option<u16>,
-        #[serde(default)]
-        rows: Option<u16>,
+        size: Option<TerminalSize>,
         /// Optional command to run instead of the default shell.
-        /// When `Some`, the PTY spawns this command directly (e.g. `["claude"]`).
+        /// When `Some`, the PTY spawns this command directly (e.g. `["codex"]`).
         /// The first element is the program, remaining elements are arguments.
         #[serde(default)]
         command: Option<Vec<String>>,
@@ -65,9 +119,6 @@ pub enum ClientMessage {
         target_workspace: WorkspaceId,
     },
     /// Request a scrollback snapshot at a given offset from the bottom.
-    ///
-    /// TODO: not yet implemented on the server side — the server does not currently
-    /// handle this variant.
     ScrollRequest {
         session_id: SessionId,
         offset: i32,
@@ -82,15 +133,15 @@ pub enum ClientMessage {
     ListSessions,
     /// Attach to existing (detached) sessions, taking ownership.
     ///
-    /// The `dimensions` field is retained for wire compatibility but is no
-    /// longer used by the server — snapshots are captured at the session's
-    /// current `Term` dimensions.  The client sends a `Resize` message after
-    /// attachment once pane geometry is finalised.
+    /// When `dimensions` is non-empty, the server resizes each session's
+    /// Term and PTY to the given terminal size **before** taking the
+    /// snapshot.  This ensures the snapshot matches the client's pane
+    /// grid and avoids a post-attach SIGWINCH that corrupts content.
     AttachSessions {
         session_ids: Vec<SessionId>,
-        /// Per-session dimensions `(cols, rows)` parallel to `session_ids`.
+        /// Per-session terminal sizes parallel to `session_ids`.
         #[serde(default)]
-        dimensions: Vec<(u16, u16)>,
+        dimensions: Vec<TerminalSize>,
     },
     /// Notify server that config file has been updated.
     ConfigReloaded,
@@ -101,9 +152,6 @@ pub enum ClientMessage {
         tree: WorkspaceTreeNode,
     },
     /// Search for text in the terminal scrollback/screen.
-    ///
-    /// TODO: not yet implemented on the server side — the server does not currently
-    /// handle this variant.
     SearchRequest {
         session_id: SessionId,
         query: String,
@@ -127,6 +175,13 @@ pub enum ClientMessage {
     TriggerUpdate,
     /// User dismissed the update notification.
     DismissUpdate,
+    /// Request a list of windows known to the server.
+    ListWindows,
+    /// Ask a connected client window to run an automation action.
+    DispatchAction {
+        window_id: Option<WindowId>,
+        action: AutomationAction,
+    },
     /// Notify server of pane focus change so it can send CSI focus events
     /// to PTY applications that have enabled DECSET 1004 (`FOCUS_IN_OUT`).
     FocusChanged {
@@ -135,27 +190,6 @@ pub enum ClientMessage {
         /// Session that lost focus. `None` when window gained OS focus
         /// (previous focus is unknown from the first focus event).
         lost: Option<SessionId>,
-    },
-    /// Create a new driver task for the given project and description.
-    CreateDriverTask {
-        task_id: Uuid,
-        project_path: PathBuf,
-        description: String,
-    },
-    /// Stop a running driver task.
-    StopDriverTask {
-        task_id: Uuid,
-    },
-    /// Send input bytes to a driver task's PTY.
-    DriverTaskInput {
-        task_id: Uuid,
-        data: Vec<u8>,
-    },
-    /// Request a list of all live driver tasks.
-    ListDriverTasks,
-    /// Attach to an existing driver task to receive its output.
-    AttachDriverTask {
-        task_id: Uuid,
     },
 }
 
@@ -185,9 +219,20 @@ pub enum ServerMessage {
         session_id: SessionId,
         cwd: PathBuf,
     },
+    SessionContextChanged {
+        session_id: SessionId,
+        context: SessionContext,
+    },
     TitleChanged {
         session_id: SessionId,
         title: String,
+    },
+    CodexTaskLabelChanged {
+        session_id: SessionId,
+        task_label: String,
+    },
+    CodexTaskLabelCleared {
+        session_id: SessionId,
     },
     WorkspaceNamed {
         workspace_id: WorkspaceId,
@@ -253,8 +298,24 @@ pub enum ServerMessage {
         /// The receiving client should spawn a new process for each.
         other_windows: Vec<WindowId>,
     },
+    /// Confirms that the server permanently removed a window and its sessions.
+    WindowClosed {
+        window_id: WindowId,
+    },
+    /// List of windows known to the server and whether they are connected.
+    WindowList {
+        windows: Vec<WindowInfo>,
+    },
+    /// Request for a connected client window to execute an automation action.
+    RunAction {
+        action: AutomationAction,
+    },
+    /// Confirms that a requested automation action was routed to a target window.
+    ActionDispatched {
+        window_id: WindowId,
+    },
     /// Server requests this client to save state and close gracefully.
-    /// Sent in response to another client's `QuitAll`.
+    /// Sent in response to a client's `QuitAll`, including the sender.
     QuitRequested,
     /// A newer version is available for download.
     UpdateAvailable {
@@ -265,34 +326,31 @@ pub enum ServerMessage {
     UpdateProgress {
         state: UpdateProgressState,
     },
-    /// Confirms a driver task was created.
-    DriverTaskCreated {
-        task_id: Uuid,
-        project_path: PathBuf,
-    },
-    /// Raw output bytes from a driver task's PTY.
-    DriverTaskOutput {
-        task_id: Uuid,
-        data: Vec<u8>,
-    },
-    /// Driver task lifecycle state changed.
-    DriverTaskStateChanged {
-        task_id: Uuid,
-        state: DriverTaskState,
-        ai_state: Option<AiProcessState>,
-    },
-    /// List of all live driver tasks, sent in response to `ListDriverTasks`.
-    DriverTaskList {
-        tasks: Vec<DriverTaskInfo>,
-    },
-    /// A driver task's PTY process has exited.
-    DriverTaskExited {
-        task_id: Uuid,
+    /// A shell prompt-mark event from OSC 133.
+    PromptMark {
+        session_id: SessionId,
+        kind: PromptMarkKind,
+        /// Whether the shell requested click-to-move (OSC 133;A with `click_events=1`).
+        click_events: bool,
+        /// Exit code from the previous command (only for `CommandEnd` / D mark).
         exit_code: Option<i32>,
     },
 }
 
 // ── Shared types ─────────────────────────────────────────────────
+
+/// Shell prompt-mark variant from OSC 133.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PromptMarkKind {
+    /// OSC 133;A — prompt start.
+    PromptStart,
+    /// OSC 133;B — prompt end / command start.
+    PromptEnd,
+    /// OSC 133;C — command start (after prompt).
+    CommandStart,
+    /// OSC 133;D — command end (with optional exit code).
+    CommandEnd,
+}
 
 /// Direction of a workspace split, persisted by the server so the client
 /// can reconstruct the window layout on reconnect.
@@ -321,6 +379,11 @@ pub enum WorkspaceTreeNode {
         /// Populated by client when reporting tree; empty when received from server.
         #[serde(default)]
         session_ids: Vec<SessionId>,
+        /// Per-tab pane layout trees, parallel to `session_ids`.
+        /// `None` entries represent single-pane tabs (the default).
+        /// Empty vec means all tabs are single-pane (backward compat).
+        #[serde(default)]
+        pane_trees: Vec<Option<PaneTreeNode>>,
     },
     /// A split dividing space between two sub-trees.
     Split {
@@ -332,24 +395,54 @@ pub enum WorkspaceTreeNode {
     },
 }
 
+/// Serialisable pane split tree within a single tab.
+///
+/// Each leaf holds the session ID of the pane's PTY session. Split nodes
+/// describe how the tab's content area is divided.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PaneTreeNode {
+    /// A single pane occupying the full tab content area.
+    Leaf { session_id: SessionId },
+    /// A split dividing the tab content area between two sub-trees.
+    Split {
+        direction: LayoutDirection,
+        ratio: f32,
+        first: Box<PaneTreeNode>,
+        second: Box<PaneTreeNode>,
+    },
+}
+
 /// Summary of a live session, sent in `SessionList` responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: SessionId,
     pub workspace_id: WorkspaceId,
+    /// Basename of the session shell or command entrypoint.
+    pub shell_name: String,
     /// Last-known terminal title (from OSC 0/2). `None` before first title event.
     pub title: Option<String>,
+    /// Last-known shell/session context (remote host, tmux session).
+    #[serde(default)]
+    pub context: Option<SessionContext>,
+    /// Last-known Codex task label. `None` when the session is not showing one.
+    #[serde(default)]
+    pub codex_task_label: Option<String>,
     /// Last-known working directory (from OSC 7). `None` before first CWD event.
     pub cwd: Option<PathBuf>,
     /// Last-known AI process state (from OSC 1337). `None` when no AI is active.
     #[serde(default)]
     pub ai_state: Option<AiProcessState>,
+    /// Last-known AI provider for the session even when there is no active
+    /// visible AI state. Used to preserve provider-aware client behavior on
+    /// reconnect after an attention state was dismissed locally.
+    #[serde(default)]
+    pub ai_provider_hint: Option<AiProvider>,
 }
 
 /// A single search match location in the terminal grid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchMatch {
-    pub row: u16,
+    pub row: i32,
     pub col_start: u16,
     pub col_end: u16,
 }
@@ -366,6 +459,9 @@ pub enum UpdateProgressState {
     /// Installation completed successfully. Client should restart (macOS) or
     /// sessions will hot-reload automatically (Linux).
     Completed { version: String },
+    /// Installation succeeded but the automatic restart failed; the user must
+    /// restart manually to apply the update.
+    CompletedRestartRequired { version: String },
     /// An error occurred during the update process.
     Failed { reason: String },
 }

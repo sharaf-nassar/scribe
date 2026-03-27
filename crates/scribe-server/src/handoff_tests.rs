@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::protocol::SessionContext;
 use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor, ScreenSnapshot};
 
 use crate::handoff::{HandoffSession, HandoffState};
@@ -61,22 +62,31 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
             child_pid: std::process::id(),
             cols: 80,
             rows: 24,
+            cell_width: 1,
+            cell_height: 1,
             snapshot: Some(dummy_snapshot(80, 24)),
             title: None,
+            shell_name: String::from("zsh"),
+            codex_task_label: None,
             cwd: None,
+            context: Some(SessionContext {
+                remote: true,
+                host: Some(String::from("builder")),
+                tmux_session: Some(String::from("editor")),
+            }),
             ai_state: None,
+            ai_provider_hint: None,
         });
         masters.push(pty.master);
         slaves.push(pty.slave);
     }
 
     let state = HandoffState {
-        version: 2,
+        version: 4,
         sessions,
         workspaces: vec![],
         workspace_tree: None,
         windows: vec![],
-        driver_tasks: Vec::new(),
     };
 
     (state, masters, slaves)
@@ -100,12 +110,20 @@ async fn wait_registry_count(registry: &LiveSessionRegistry, expected: usize) {
 #[tokio::test]
 async fn restore_from_handoff_populates_session_manager() {
     let (state, masters, _slaves) = make_handoff_state(1);
+    let expected_id = state.sessions[0].session_id;
 
     let sm = SessionManager::restore_from_handoff(&state, masters, 100).unwrap();
 
     let pending = sm.pending_session_ids().await;
     assert_eq!(pending.len(), 1, "restored session should be pending");
-    assert_eq!(pending[0].0, state.sessions[0].session_id);
+    assert_eq!(pending[0].0, expected_id);
+
+    let restored = sm.take_session(expected_id).await.unwrap();
+    assert_eq!(restored.shell_name, "zsh");
+    assert_eq!(
+        restored.context.as_ref().and_then(|context| context.host.as_deref()),
+        Some("builder")
+    );
 }
 
 #[tokio::test]
@@ -152,6 +170,11 @@ async fn serialize_live_returns_activated_sessions() {
     assert_eq!(fds.len(), 1);
     assert_eq!(sessions[0].session_id, expected_id);
     assert!(sessions[0].snapshot.is_some(), "snapshot should be included");
+    assert_eq!(sessions[0].shell_name, "zsh");
+    assert_eq!(
+        sessions[0].context.as_ref().and_then(|context| context.host.as_deref()),
+        Some("builder")
+    );
 }
 
 #[tokio::test]

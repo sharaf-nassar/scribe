@@ -10,7 +10,10 @@ use std::sync::{Arc, Mutex};
 use scribe_common::ai_state::AiProcessState;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
-use scribe_common::protocol::{ClientMessage, ServerMessage, UpdateProgressState};
+use scribe_common::protocol::{
+    AutomationAction, ClientMessage, PromptMarkKind, SearchMatch, ServerMessage, TerminalSize,
+    UpdateProgressState,
+};
 use scribe_common::socket::server_socket_path;
 use tokio::io::AsyncWriteExt as _;
 use winit::event_loop::EventLoopProxy;
@@ -19,9 +22,9 @@ use winit::event_loop::EventLoopProxy;
 #[derive(Debug)]
 pub enum ClientCommand {
     /// Raw bytes produced by a key press, routed to a specific session.
-    KeyInput { session_id: SessionId, data: Vec<u8> },
+    KeyInput { session_id: SessionId, data: Vec<u8>, dismisses_attention: bool },
     /// PTY resize notification for a specific session.
-    Resize { session_id: SessionId, cols: u16, rows: u16 },
+    Resize { session_id: SessionId, size: TerminalSize },
     /// Create a new session in the given workspace.
     ///
     /// When `split_direction` is `Some`, the server records the layout
@@ -30,8 +33,7 @@ pub enum ClientCommand {
         workspace_id: WorkspaceId,
         split_direction: Option<scribe_common::protocol::LayoutDirection>,
         cwd: Option<std::path::PathBuf>,
-        cols: Option<u16>,
-        rows: Option<u16>,
+        size: Option<TerminalSize>,
         command: Option<Vec<String>>,
     },
     /// Close a session.
@@ -41,7 +43,7 @@ pub enum ClientCommand {
     /// Request a list of all live sessions on the server.
     ListSessions,
     /// Attach to existing (detached) sessions on the server.
-    AttachSessions { session_ids: Vec<SessionId>, dimensions: Vec<(u16, u16)> },
+    AttachSessions { session_ids: Vec<SessionId>, dimensions: Vec<TerminalSize> },
     /// Notify server that config file has been updated.
     ConfigReloaded,
     /// Report the current workspace split tree to the server.
@@ -58,6 +60,14 @@ pub enum ClientCommand {
     DismissUpdate,
     /// Notify server of pane focus change for CSI focus events.
     FocusChanged { gained: Option<SessionId>, lost: Option<SessionId> },
+    /// Request a scrollback snapshot at a given offset from the bottom.
+    #[allow(
+        dead_code,
+        reason = "server-backed scroll snapshots are implemented ahead of the client UX that consumes them"
+    )]
+    ScrollRequest { session_id: SessionId, offset: i32 },
+    /// Search the terminal scrollback/screen.
+    SearchRequest { session_id: SessionId, query: String, limit: u32 },
 }
 
 /// Events forwarded from the IPC background thread to the winit event loop.
@@ -72,6 +82,7 @@ pub enum UiEvent {
         session_id: SessionId,
         #[allow(dead_code, reason = "workspace_id preserved for future workspace management")]
         workspace_id: WorkspaceId,
+        shell_name: String,
     },
     /// A session has exited.
     SessionExited {
@@ -83,10 +94,21 @@ pub enum UiEvent {
     AiStateChanged { session_id: SessionId, ai_state: AiProcessState },
     /// The AI state for a session was explicitly cleared.
     AiStateCleared { session_id: SessionId },
+    /// The terminal emitted BEL for a session.
+    Bell { session_id: SessionId },
     /// The working directory for a session has changed.
     CwdChanged { session_id: SessionId, cwd: PathBuf },
+    /// The shell/session context for a session has changed.
+    SessionContextChanged {
+        session_id: SessionId,
+        context: scribe_common::protocol::SessionContext,
+    },
     /// The terminal title for a session has changed.
     TitleChanged { session_id: SessionId, title: String },
+    /// The active Codex task label for a session has changed.
+    CodexTaskLabelChanged { session_id: SessionId, task_label: String },
+    /// The active Codex task label for a session was cleared.
+    CodexTaskLabelCleared { session_id: SessionId },
     /// Git branch for a session's CWD (None if not in a git repo).
     GitBranch {
         session_id: SessionId,
@@ -115,12 +137,33 @@ pub enum UiEvent {
     AnimationTick,
     /// Server confirmed our window identity and listed other windows to spawn.
     Welcome { window_id: WindowId, other_windows: Vec<WindowId> },
-    /// Server requested us to save state and quit (another client sent `QuitAll`).
+    /// Server confirmed that this window was permanently removed.
+    WindowClosed { window_id: WindowId },
+    /// Server requested us to save state and quit (`QuitAll` was acknowledged).
     QuitRequested,
+    /// Server requested that this client execute an automation action.
+    RunAction { action: AutomationAction },
     /// Server found an available update.
     UpdateAvailable { version: String, release_url: String },
     /// Update progress changed.
     UpdateProgress { state: UpdateProgressState },
+    /// A shell prompt-mark event from OSC 133.
+    PromptMark {
+        session_id: SessionId,
+        kind: PromptMarkKind,
+        #[allow(dead_code, reason = "click_events preserved for future click-to-move feature")]
+        click_events: bool,
+        #[allow(dead_code, reason = "exit_code preserved for future command status display")]
+        exit_code: Option<i32>,
+    },
+    /// Scrollback snapshot at an offset from the bottom.
+    ScrolledSnapshot {
+        session_id: SessionId,
+        snapshot: scribe_common::screen::ScreenSnapshot,
+        applied_offset: u32,
+    },
+    /// Search results for the current query.
+    SearchResults { session_id: SessionId, query: String, matches: Vec<SearchMatch> },
 }
 
 /// Start the IPC client on a background thread.
@@ -166,6 +209,10 @@ fn send_event(proxy: &EventLoopProxy<UiEvent>, event: UiEvent) {
 }
 
 /// Drive the read half: forward server messages to the winit event loop.
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat sequential match arms for all server message variants"
+)]
 async fn run_read_task(
     mut reader: tokio::net::unix::OwnedReadHalf,
     proxy: EventLoopProxy<UiEvent>,
@@ -182,9 +229,12 @@ async fn run_read_task(
             Ok(ServerMessage::ScreenSnapshot { session_id, snapshot }) => {
                 send_event(&proxy, UiEvent::ScreenSnapshot { session_id, snapshot });
             }
-            Ok(ServerMessage::SessionCreated { session_id, workspace_id, .. }) => {
+            Ok(ServerMessage::SessionCreated { session_id, workspace_id, shell_name }) => {
                 tracing::debug!(session = %session_id, "session created via server response");
-                send_event(&proxy, UiEvent::SessionCreated { session_id, workspace_id });
+                send_event(
+                    &proxy,
+                    UiEvent::SessionCreated { session_id, workspace_id, shell_name },
+                );
             }
             Ok(ServerMessage::AiStateChanged { session_id, ai_state }) => {
                 send_event(&proxy, UiEvent::AiStateChanged { session_id, ai_state });
@@ -192,11 +242,23 @@ async fn run_read_task(
             Ok(ServerMessage::AiStateCleared { session_id }) => {
                 send_event(&proxy, UiEvent::AiStateCleared { session_id });
             }
+            Ok(ServerMessage::Bell { session_id }) => {
+                send_event(&proxy, UiEvent::Bell { session_id });
+            }
             Ok(ServerMessage::CwdChanged { session_id, cwd }) => {
                 send_event(&proxy, UiEvent::CwdChanged { session_id, cwd });
             }
+            Ok(ServerMessage::SessionContextChanged { session_id, context }) => {
+                send_event(&proxy, UiEvent::SessionContextChanged { session_id, context });
+            }
             Ok(ServerMessage::TitleChanged { session_id, title }) => {
                 send_event(&proxy, UiEvent::TitleChanged { session_id, title });
+            }
+            Ok(ServerMessage::CodexTaskLabelChanged { session_id, task_label }) => {
+                send_event(&proxy, UiEvent::CodexTaskLabelChanged { session_id, task_label });
+            }
+            Ok(ServerMessage::CodexTaskLabelCleared { session_id }) => {
+                send_event(&proxy, UiEvent::CodexTaskLabelCleared { session_id });
             }
             Ok(ServerMessage::GitBranch { session_id, branch }) => {
                 send_event(&proxy, UiEvent::GitBranch { session_id, branch });
@@ -222,9 +284,20 @@ async fn run_read_task(
                 tracing::info!(%window_id, others = other_windows.len(), "received Welcome");
                 send_event(&proxy, UiEvent::Welcome { window_id, other_windows });
             }
+            Ok(ServerMessage::WindowClosed { window_id }) => {
+                tracing::info!(%window_id, "received WindowClosed from server");
+                send_event(&proxy, UiEvent::WindowClosed { window_id });
+            }
             Ok(ServerMessage::QuitRequested) => {
                 tracing::info!("received QuitRequested from server");
                 send_event(&proxy, UiEvent::QuitRequested);
+            }
+            Ok(ServerMessage::RunAction { action }) => {
+                tracing::info!(?action, "received RunAction from server");
+                send_event(&proxy, UiEvent::RunAction { action });
+            }
+            Ok(ServerMessage::ActionDispatched { window_id }) => {
+                tracing::debug!(%window_id, "ignoring ActionDispatched on UI client connection");
             }
             Ok(ServerMessage::UpdateAvailable { version, release_url }) => {
                 tracing::info!(%version, "update available");
@@ -232,6 +305,21 @@ async fn run_read_task(
             }
             Ok(ServerMessage::UpdateProgress { state }) => {
                 send_event(&proxy, UiEvent::UpdateProgress { state });
+            }
+            Ok(ServerMessage::PromptMark { session_id, kind, click_events, exit_code }) => {
+                send_event(
+                    &proxy,
+                    UiEvent::PromptMark { session_id, kind, click_events, exit_code },
+                );
+            }
+            Ok(ServerMessage::ScrolledSnapshot { session_id, snapshot, applied_offset }) => {
+                send_event(
+                    &proxy,
+                    UiEvent::ScrolledSnapshot { session_id, snapshot, applied_offset },
+                );
+            }
+            Ok(ServerMessage::SearchResults { session_id, query, matches }) => {
+                send_event(&proxy, UiEvent::SearchResults { session_id, query, matches });
             }
             Ok(other) => {
                 tracing::debug!(?other, "unhandled server message");
@@ -250,6 +338,7 @@ async fn run_read_task(
 async fn run_write_task(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     cmd_rx: Arc<Mutex<mpsc::Receiver<ClientCommand>>>,
+    proxy: EventLoopProxy<UiEvent>,
 ) {
     loop {
         // Clone the Arc so the spawn_blocking closure owns its reference.
@@ -270,6 +359,7 @@ async fn run_write_task(
 
         if let Err(e) = write_message(&mut writer, &msg).await {
             tracing::warn!(error = %e, "server write error; closing connection");
+            send_event(&proxy, UiEvent::ServerDisconnected);
             break;
         }
     }
@@ -283,21 +373,12 @@ async fn run_write_task(
 /// Convert a `ClientCommand` to a `ClientMessage` for the wire.
 fn command_to_message(cmd: ClientCommand) -> ClientMessage {
     match cmd {
-        ClientCommand::KeyInput { session_id, data } => {
-            ClientMessage::KeyInput { session_id, data }
+        ClientCommand::KeyInput { session_id, data, dismisses_attention } => {
+            ClientMessage::KeyInput { session_id, data, dismisses_attention }
         }
-        ClientCommand::Resize { session_id, cols, rows } => {
-            ClientMessage::Resize { session_id, cols, rows }
-        }
-        ClientCommand::CreateSession {
-            workspace_id,
-            split_direction,
-            cwd,
-            cols,
-            rows,
-            command,
-        } => {
-            ClientMessage::CreateSession { workspace_id, split_direction, cwd, cols, rows, command }
+        ClientCommand::Resize { session_id, size } => ClientMessage::Resize { session_id, size },
+        ClientCommand::CreateSession { workspace_id, split_direction, cwd, size, command } => {
+            ClientMessage::CreateSession { workspace_id, split_direction, cwd, size, command }
         }
         ClientCommand::CloseSession { session_id } => ClientMessage::CloseSession { session_id },
         ClientCommand::Subscribe { session_ids } => ClientMessage::Subscribe { session_ids },
@@ -314,6 +395,12 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         ClientCommand::DismissUpdate => ClientMessage::DismissUpdate,
         ClientCommand::FocusChanged { gained, lost } => {
             ClientMessage::FocusChanged { gained, lost }
+        }
+        ClientCommand::ScrollRequest { session_id, offset } => {
+            ClientMessage::ScrollRequest { session_id, offset }
+        }
+        ClientCommand::SearchRequest { session_id, query, limit } => {
+            ClientMessage::SearchRequest { session_id, query, limit }
         }
     }
 }
@@ -355,6 +442,66 @@ fn platform_start_server() -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn platform_start_server() -> Result<(), String> {
+    match start_server_via_launchctl() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::warn!("launchctl start failed ({e}), falling back to direct spawn");
+            start_server_directly()
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_server_via_launchctl() -> Result<(), String> {
+    let uid = scribe_common::socket::current_uid();
+    let domain = format!("user/{uid}");
+    let service = format!("user/{uid}/com.scribe.server");
+
+    let home = std::env::var("HOME").map_err(|e| format!("HOME not set: {e}"))?;
+    let agents_dir = std::path::PathBuf::from(&home).join("Library/LaunchAgents");
+    let installed_plist = agents_dir.join("com.scribe.server.plist");
+
+    if !installed_plist.exists() {
+        let exe = std::env::current_exe().map_err(|e| format!("failed to get current exe: {e}"))?;
+        // In a .app bundle: Contents/MacOS/scribe-client → parent = MacOS → parent = Contents
+        let contents_dir = exe.parent().and_then(|p| p.parent()).ok_or_else(|| {
+            String::from("could not resolve Contents directory from executable path")
+        })?;
+        let bundled_plist = contents_dir.join("Resources/com.scribe.server.plist");
+
+        if !bundled_plist.exists() {
+            return Err(format!("bundled plist not found at {}", bundled_plist.display()));
+        }
+
+        std::fs::create_dir_all(&agents_dir)
+            .map_err(|e| format!("failed to create LaunchAgents dir: {e}"))?;
+        std::fs::copy(&bundled_plist, &installed_plist)
+            .map_err(|e| format!("failed to copy plist: {e}"))?;
+        tracing::info!(plist = %installed_plist.display(), "installed launchd agent plist");
+
+        let status = std::process::Command::new("launchctl")
+            .args(["bootstrap", &domain, installed_plist.to_str().unwrap_or("")])
+            .status()
+            .map_err(|e| format!("failed to run launchctl bootstrap: {e}"))?;
+        if !status.success() {
+            return Err(format!("launchctl bootstrap exited with {status}"));
+        }
+        tracing::info!(%service, "bootstrapped launchd agent");
+    }
+
+    let status = std::process::Command::new("launchctl")
+        .args(["kickstart", &service])
+        .status()
+        .map_err(|e| format!("failed to run launchctl kickstart: {e}"))?;
+    if !status.success() {
+        return Err(format!("launchctl kickstart exited with {status}"));
+    }
+    tracing::info!(%service, "kickstarted launchd agent");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn start_server_directly() -> Result<(), String> {
     use std::process::Stdio;
 
     // Resolve server binary relative to current executable.
@@ -430,8 +577,9 @@ async fn ipc_main(
     let (reader, writer) = stream.into_split();
 
     let read_proxy = proxy.clone();
+    let write_proxy = proxy.clone();
     let read_task = tokio::spawn(run_read_task(reader, read_proxy));
-    let write_task = tokio::spawn(run_write_task(writer, cmd_rx));
+    let write_task = tokio::spawn(run_write_task(writer, cmd_rx, write_proxy));
 
     // When either task finishes, abort the other so the process can exit.
     // Typically the write task exits first (cmd_tx dropped when the UI

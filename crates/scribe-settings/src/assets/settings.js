@@ -19,6 +19,26 @@ var themeColors = {};
 var activeThemeId = null;
 var isCustomMode = false;
 
+function normalizeAiTabProvider(provider) {
+  return provider === "codex_code" ? "codex_code" : "claude_code";
+}
+
+function renderAiTabLabels(provider) {
+  var name = normalizeAiTabProvider(provider) === "codex_code" ? "Codex" : "Claude";
+  var newLabel = document.querySelector("[data-ai-tab-label='new']");
+  var resumeLabel = document.querySelector("[data-ai-tab-label='resume']");
+  if (newLabel) { newLabel.textContent = "New " + name + " Tab"; }
+  if (resumeLabel) { resumeLabel.textContent = "Resume " + name + " Tab"; }
+}
+
+function setAiTabProvider(provider) {
+  var normalized = normalizeAiTabProvider(provider);
+  currentConfig.terminal = currentConfig.terminal || {};
+  currentConfig.terminal.ai_tab_provider = normalized;
+  setSegmentedValue("terminal.ai_tab_provider", normalized);
+  renderAiTabLabels(normalized);
+}
+
 // ─────────── Theme Grid ───────────
 
 function makeColorSpan(text, color) {
@@ -409,9 +429,13 @@ function initSegmented() {
 
     opts.forEach(function(opt) {
       opt.addEventListener("click", function() {
+        var value = opt.getAttribute("data-value");
         opts.forEach(function(o) { o.classList.remove("active"); });
         opt.classList.add("active");
-        sendChange(key, opt.getAttribute("data-value"));
+        if (key === "terminal.ai_tab_provider") {
+          setAiTabProvider(value);
+        }
+        sendChange(key, value);
       });
     });
   });
@@ -601,9 +625,12 @@ function loadConfig(config) {
   setToggleValue("terminal.copy_on_select", config.terminal?.copy_on_select);
   setToggleValue("terminal.claude_copy_cleanup", config.terminal?.claude_copy_cleanup);
   setToggleValue("terminal.claude_code_integration", config.terminal?.claude_code_integration);
+  setToggleValue("terminal.codex_code_integration", config.terminal?.codex_code_integration);
+  setToggleValue("terminal.hide_codex_hook_logs", config.terminal?.hide_codex_hook_logs);
+  setAiTabProvider(config.terminal?.ai_tab_provider);
   setStepperValue("terminal.indicator_height", config.terminal?.indicator_height);
 
-  // Claude Code States
+  // AI assistant states
   var states = config.terminal?.claude_states;
   if (states) {
     ["processing","idle_prompt","waiting_for_input","permission_prompt","error"]
@@ -662,6 +689,11 @@ function loadConfig(config) {
   if (config.workspaces?.badge_colors) {
     populateBadgeColors(config.workspaces.badge_colors);
   }
+
+  // Updates
+  setToggleValue('update.enabled', config.update?.enabled ?? true);
+  setStepperValue('update.check_interval_hours', Math.round((config.update?.check_interval_secs ?? 86400) / 3600));
+  setSegmentedValue('update.channel', config.update?.channel ?? 'stable');
 }
 
 // ─────────── Value Setters ───────────
@@ -741,14 +773,31 @@ function setAnsiSwatch(key, color) {
   }
 }
 
+var NAMED_KEYS = ["pageup", "pagedown", "home", "end", "left", "right", "up", "down",
+  "tab", "backspace", "delete", "enter", "space", "escape"];
+
+var MODIFIER_DISPLAY_MAC = { "cmd": "\u2318", "super": "\u2318", "ctrl": "\u2303", "shift": "\u21e7", "alt": "\u2325" };
+var MODIFIER_DISPLAY_LINUX = { "cmd": "Super", "super": "Super", "ctrl": "Ctrl", "shift": "Shift", "alt": "Alt" };
+
 function formatKeybinding(shortcut) {
-  return shortcut.split("+").map(function(part) {
+  var isMac = window.SCRIBE_PLATFORM === "macos";
+  var glyphs = isMac ? MODIFIER_DISPLAY_MAC : MODIFIER_DISPLAY_LINUX;
+
+  // Robust split: handle "+" as a key (e.g. "ctrl++").
+  var parts = shortcut.split("+");
+  parts = parts.filter(function(p) { return p !== ""; });
+  if (shortcut.endsWith("+") && shortcut.length > 1) {
+    parts.push("+");
+  }
+
+  parts = parts.map(function(part) {
     var p = part.trim();
-    if (p === "ctrl" || p === "shift" || p === "alt") {
-      return p.charAt(0).toUpperCase() + p.slice(1);
-    }
-    return p.length === 1 ? p.toUpperCase() : p;
-  }).join("+");
+    if (glyphs[p] !== undefined) { return glyphs[p]; }
+    if (p.length === 1) { return p.toUpperCase(); }
+    if (NAMED_KEYS.indexOf(p) !== -1) { return p.charAt(0).toUpperCase() + p.slice(1); }
+    return p;
+  });
+  return isMac ? parts.join("") : parts.join("+");
 }
 
 var MAX_BINDINGS = 5;
@@ -896,7 +945,8 @@ function buildComboString(e) {
   }
 
   var parts = [];
-  if (e.ctrlKey || e.metaKey) { parts.push("ctrl"); }
+  if (e.metaKey) { parts.push("cmd"); }
+  if (e.ctrlKey) { parts.push("ctrl"); }
   if (e.shiftKey) { parts.push("shift"); }
   if (e.altKey) { parts.push("alt"); }
 
@@ -1160,10 +1210,44 @@ function initGlobalSearch() {
   var input = document.getElementById("global-search");
   if (!input) { return; }
 
+  var wrapper = input.closest(".global-search-wrapper");
+  var clearBtn = wrapper ? wrapper.querySelector(".global-search-clear") : null;
+
+  function updateClearVisibility() {
+    if (wrapper) {
+      if (input.value.length > 0) {
+        wrapper.classList.add("has-value");
+      } else {
+        wrapper.classList.remove("has-value");
+      }
+    }
+  }
+
+  function clearSearch() {
+    input.value = "";
+    updateClearVisibility();
+    filterAllSettings("");
+    input.focus();
+  }
+
   input.addEventListener("input", function() {
     var query = input.value.trim().toLowerCase();
+    updateClearVisibility();
     filterAllSettings(query);
   });
+
+  input.addEventListener("keydown", function(e) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      clearSearch();
+    }
+  });
+
+  if (clearBtn) {
+    clearBtn.addEventListener("click", function() {
+      clearSearch();
+    });
+  }
 }
 
 function filterAllSettings(query) {

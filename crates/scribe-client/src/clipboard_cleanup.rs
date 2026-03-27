@@ -1,21 +1,21 @@
-//! Clipboard text cleanup for Claude Code sessions.
+//! Clipboard text cleanup for AI-assisted sessions.
 //!
 //! Two transforms are applied in sequence when the active session is running
-//! Claude Code and the user has the `claude_copy_cleanup` setting enabled:
+//! Claude Code or Codex and the user has clipboard cleanup enabled:
 //!
 //! 1. **Dedent** — strip the minimum shared leading whitespace from all lines.
 //! 2. **Unwrap** — rejoin hard-wrapped prose lines into flowing paragraphs.
 
 /// Apply configured cleanup transforms to terminal-selected text.
 ///
-/// When `claude_active` is `false` or `cleanup_enabled` is `false` the text
-/// is returned unchanged.
+/// When `ai_session_active` is `false` or `cleanup_enabled` is `false`, the
+/// text is returned unchanged.
 #[allow(
     clippy::fn_params_excessive_bools,
     reason = "two independent booleans (AI state + config toggle) are clearer than an enum here"
 )]
-pub fn prepare_copy_text(text: &str, claude_active: bool, cleanup_enabled: bool) -> String {
-    if !claude_active || !cleanup_enabled {
+pub fn prepare_copy_text(text: &str, ai_session_active: bool, cleanup_enabled: bool) -> String {
+    if !ai_session_active || !cleanup_enabled {
         return text.to_owned();
     }
     let dedented = dedent(text);
@@ -77,40 +77,27 @@ fn unwrap_lines(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let width = detect_wrap_width(&lines);
 
-    if width == 0 {
-        return text.to_owned();
-    }
-
     let mut out: Vec<String> = Vec::new();
-    let mut idx = 0;
-    let len = lines.len();
 
-    while idx < len {
-        let line = lines.get(idx).copied().unwrap_or_default();
+    #[allow(clippy::excessive_nesting, reason = "paragraph accumulation loop is clearest as-is")]
+    if width == 0 {
+        // No dominant wrap width — join consecutive non-break lines.
+        // This handles content like commands that Claude formatted across
+        // multiple lines at natural token boundaries (varying lengths).
+        join_non_break_runs(&lines, &mut out);
+    } else {
+        let mut idx = 0;
+        let len = lines.len();
 
-        if should_join(line, lines.get(idx + 1).copied(), width) {
-            // Start accumulating a joined paragraph.
-            let mut paragraph = String::from(line.trim_end());
-            idx += 1;
-            while idx < len && should_join_continuation(lines.get(idx).copied(), width) {
-                paragraph.push(' ');
-                paragraph.push_str(lines.get(idx).copied().unwrap_or_default().trim());
+        while idx < len {
+            let line = lines.get(idx).copied().unwrap_or_default();
+
+            if should_join(line, lines.get(idx + 1).copied(), width) {
+                out.push(collect_joined_paragraph(&lines, &mut idx, len, width, line));
+            } else {
+                out.push(line.to_owned());
                 idx += 1;
             }
-            // Append the final short tail of this paragraph (the last line
-            // that didn't reach the wrap width).  Skip lines that are longer
-            // than the wrap width — those are standalone, not tails.
-            let tail = lines.get(idx).copied().unwrap_or_default();
-            let tail_len = tail.chars().count();
-            if idx < len && !is_intentional_break(tail) && tail_len < width {
-                paragraph.push(' ');
-                paragraph.push_str(tail.trim());
-                idx += 1;
-            }
-            out.push(paragraph);
-        } else {
-            out.push(line.to_owned());
-            idx += 1;
         }
     }
 
@@ -140,6 +127,71 @@ fn should_join_continuation(line: Option<&str>, width: usize) -> bool {
     }
     let char_len = l.chars().count();
     char_len >= width.saturating_sub(2) && char_len <= width.saturating_add(2)
+}
+
+/// Accumulate continuation lines into a single paragraph string.
+fn collect_joined_paragraph(
+    lines: &[&str],
+    idx: &mut usize,
+    len: usize,
+    width: usize,
+    first_line: &str,
+) -> String {
+    let mut paragraph = String::from(first_line.trim_end());
+    *idx += 1;
+    while *idx < len && should_join_continuation(lines.get(*idx).copied(), width) {
+        paragraph.push(' ');
+        paragraph.push_str(lines.get(*idx).copied().unwrap_or_default().trim());
+        *idx += 1;
+    }
+    // Append the final short tail (last line that didn't reach wrap width).
+    let tail = lines.get(*idx).copied().unwrap_or_default();
+    let tail_len = tail.chars().count();
+    if *idx < len && !is_intentional_break(tail) && tail_len < width {
+        paragraph.push(' ');
+        paragraph.push_str(tail.trim());
+        *idx += 1;
+    }
+    paragraph
+}
+
+/// Minimum character length of the longest line for the no-width fallback
+/// to activate.  Short lines (e.g. "hello world") are likely intentionally
+/// separate, not formatting artifacts from Claude's output wrapping.
+const MIN_LONG_LINE_FOR_JOIN: usize = 40;
+
+/// Join consecutive non-intentional-break lines into single lines.
+///
+/// Intentional breaks (blank lines, bullets, headings, code fences, etc.)
+/// are preserved as-is and act as paragraph separators.  Only activates
+/// when at least one line exceeds [`MIN_LONG_LINE_FOR_JOIN`] characters —
+/// short multi-line text is left as-is.
+fn join_non_break_runs(lines: &[&str], out: &mut Vec<String>) {
+    let has_long_line = lines.iter().any(|l| l.chars().count() >= MIN_LONG_LINE_FOR_JOIN);
+    if !has_long_line {
+        out.extend(lines.iter().map(|l| (*l).to_owned()));
+        return;
+    }
+
+    let mut run = String::new();
+
+    for line in lines {
+        if is_intentional_break(line) {
+            if !run.is_empty() {
+                out.push(run);
+                run = String::new();
+            }
+            out.push((*line).to_owned());
+        } else {
+            if !run.is_empty() {
+                run.push(' ');
+            }
+            run.push_str(line.trim());
+        }
+    }
+    if !run.is_empty() {
+        out.push(run);
+    }
 }
 
 /// Detect the most likely hard-wrap column from a block of text.
@@ -490,8 +542,34 @@ mod tests {
     }
 
     #[test]
-    fn unwrap_noop_when_no_dominant_width() {
+    fn unwrap_noop_for_short_lines_without_dominant_width() {
+        // All lines below MIN_LONG_LINE_FOR_JOIN — left as-is.
         let input = "short\nmedium length\na different size line";
+        assert_eq!(unwrap_lines(input), input);
+    }
+
+    #[test]
+    fn unwrap_no_width_preserves_intentional_breaks() {
+        let input = "line one\nline two\n\nline three\n- bullet item";
+        let result = unwrap_lines(input);
+        assert_eq!(result, "line one line two\n\nline three\n- bullet item");
+    }
+
+    #[test]
+    fn unwrap_no_width_joins_command_lines() {
+        let input = "setsid env -i HOME=/home/mamba USER=mamba\n\
+                      DBUS_SESSION_BUS_ADDRESS=\"unix:path=/run/user/1000/bus\"\n\
+                      PATH=/usr/bin command --print\n\
+                      --output-format json --verbose";
+        let result = unwrap_lines(input);
+        assert!(!result.contains('\n'), "expected single line, got:\n{result}");
+        assert!(result.starts_with("setsid"));
+        assert!(result.ends_with("--verbose"));
+    }
+
+    #[test]
+    fn unwrap_no_width_single_line_noop() {
+        let input = "just one line here";
         assert_eq!(unwrap_lines(input), input);
     }
 

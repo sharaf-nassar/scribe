@@ -846,7 +846,12 @@ impl RunAccum {
 
     /// Whether `cell` continues the current run (same style, row, and adjacent column).
     fn matches(&self, cell: &CollectedCell) -> bool {
-        let expected_col = self.start_col + self.text.chars().count();
+        let expected_col = self.start_col
+            + self
+                .text
+                .chars()
+                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum::<usize>();
         cell.point.column.0 == expected_col
             && self.line == cell.point.line.0
             && self.bold == cell.flags.contains(Flags::BOLD)

@@ -147,6 +147,15 @@ fn inject_font_list(webview: &wry::WebView) {
     }
 }
 
+/// Inject `window.SCRIBE_PLATFORM` into the webview so JS can adapt to the host OS.
+fn inject_platform(webview: &wry::WebView) {
+    let platform = if cfg!(target_os = "macos") { "macos" } else { "linux" };
+    let script = format!("window.SCRIBE_PLATFORM = \"{platform}\";");
+    if let Err(e) = webview.evaluate_script(&script) {
+        tracing::warn!("failed to inject platform into settings webview: {e}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Linux: GTK-based settings window
 // ---------------------------------------------------------------------------
@@ -251,6 +260,9 @@ pub fn run_settings_window(
     if let Err(e) = webview.evaluate_script(&init_script) {
         tracing::warn!("failed to inject config into settings webview: {e}");
     }
+
+    // Inject platform identifier before keybinding defaults so JS display is correct.
+    inject_platform(&webview);
 
     // Inject keybinding defaults so JS can implement reset-to-default.
     inject_keybinding_defaults(&webview);
@@ -477,6 +489,7 @@ pub fn run_settings_window(
     if let Err(e) = webview.evaluate_script(&init_script) {
         tracing::warn!("failed to inject config into settings webview: {e}");
     }
+    inject_platform(&webview);
     inject_keybinding_defaults(&webview);
     inject_theme_colors(&webview);
     inject_font_list(&webview);

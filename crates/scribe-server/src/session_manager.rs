@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -16,18 +17,20 @@ use tracing::info;
 use vte::Parser as VteParser;
 use vte::ansi::Processor as AnsiProcessor;
 
-use scribe_common::ai_state::AiProcessState;
+use scribe_common::ai_state::{AiProcessState, AiProvider};
 use scribe_common::error::ScribeError;
 use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::protocol::{SessionContext, TerminalSize};
 use scribe_common::screen::{
     CellFlags as ScreenCellFlags, CursorStyle as ScreenCursorStyle, ScreenCell, ScreenColor,
     ScreenSnapshot,
 };
 use scribe_pty::async_fd::AsyncPtyFd;
-use scribe_pty::event_listener::ScribeEventListener;
-use scribe_pty::metadata::{MetadataEvent, MetadataParser};
+use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
+use scribe_pty::metadata::MetadataParser;
 
 use crate::handoff::HandoffState;
+use crate::shell_integration;
 
 /// Maximum number of active PTY sessions across all clients.
 const MAX_SESSIONS: usize = 256;
@@ -37,6 +40,17 @@ const DEFAULT_COLS: u16 = 80;
 
 /// Default terminal rows.
 const DEFAULT_ROWS: u16 = 24;
+
+/// Build the terminal core config used for live PTY sessions.
+pub fn build_term_config(scrollback_lines: usize) -> TermConfig {
+    TermConfig {
+        scrolling_history: scrollback_lines,
+        // Codex probes kitty keyboard mode during startup; enabling support
+        // lets alacritty_terminal answer `CSI ? u` queries and mode updates.
+        kitty_keyboard: true,
+        ..TermConfig::default()
+    }
+}
 
 /// A managed PTY session with terminal emulator state.
 ///
@@ -51,8 +65,9 @@ pub struct ManagedSession {
     /// VTE parser for the OSC interceptor (calls `Perform` on `OscInterceptor`).
     pub osc_parser: VteParser,
     pub metadata_parser: MetadataParser,
-    pub metadata_rx: mpsc::UnboundedReceiver<MetadataEvent>,
+    pub event_rx: mpsc::UnboundedReceiver<SessionEvent>,
     pub workspace_id: WorkspaceId,
+    pub shell_name: String,
     /// Keep the Pty object alive so the child process is not killed by SIGHUP
     /// when Pty's Drop impl runs. The Pty owns the child process handle.
     /// Owns the child process. Moved into `SessionHandle` by the IPC server.
@@ -67,10 +82,19 @@ pub struct ManagedSession {
     pub handoff_snapshot: Option<ScreenSnapshot>,
     /// Title from handoff, used to restore tab name. `None` for fresh sessions.
     pub title: Option<String>,
+    /// Codex task label from handoff. `None` when unset for the session.
+    pub codex_task_label: Option<String>,
     /// CWD from handoff, used to restore working directory. `None` for fresh sessions.
     pub cwd: Option<std::path::PathBuf>,
+    /// Remote/tmux context from handoff. `None` for fresh sessions.
+    pub context: Option<SessionContext>,
     /// AI state from handoff. `None` for fresh sessions.
     pub ai_state: Option<AiProcessState>,
+    /// Launch-time AI provider hint derived from the session command.
+    pub ai_provider_hint: Option<AiProvider>,
+    /// Latest known terminal cell size in pixels for PTY winsize replies.
+    pub cell_width: u16,
+    pub cell_height: u16,
 }
 
 /// Terminal dimensions implementing the `Dimensions` trait from `alacritty_terminal`.
@@ -98,6 +122,8 @@ pub struct SessionManager {
     sessions: Arc<tokio::sync::RwLock<HashMap<SessionId, ManagedSession>>>,
     /// Scrollback lines used when creating new sessions.
     scrollback_lines: AtomicUsize,
+    /// Whether shell integration env injection is enabled.
+    shell_integration_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl Default for SessionManager {
@@ -123,7 +149,13 @@ impl SessionManager {
         Self {
             sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             scrollback_lines: AtomicUsize::new(scrollback_lines),
+            shell_integration_enabled: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Enable or disable shell integration env injection for new sessions.
+    pub fn set_shell_integration_enabled(&self, enabled: bool) {
+        self.shell_integration_enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Update the scrollback line count used for new sessions and live sessions.
@@ -141,12 +173,15 @@ impl SessionManager {
         clippy::too_many_arguments,
         reason = "session creation requires workspace, cwd, dimensions, and optional command override"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "session creation involves sequential PTY setup, shell detection, and integration wiring"
+    )]
     pub async fn create_session(
         &self,
         workspace_id: WorkspaceId,
         cwd: Option<std::path::PathBuf>,
-        cols: Option<u16>,
-        rows: Option<u16>,
+        size: Option<TerminalSize>,
         command: Option<Vec<String>>,
     ) -> Result<SessionId, ScribeError> {
         let scrollback_lines = self.scrollback_lines.load(Ordering::Relaxed);
@@ -160,42 +195,62 @@ impl SessionManager {
         }
 
         let session_id = SessionId::new();
+        let ai_provider_hint = command_ai_provider_hint(command.as_deref());
 
         // 1. Create metadata event channel.
-        let (event_tx, metadata_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         // 2. Create event listener for `alacritty_terminal` events.
         let event_listener = ScribeEventListener::new(session_id, event_tx);
 
         // 3. Create Term config with scrollback.
-        let term_config =
-            TermConfig { scrolling_history: scrollback_lines, ..TermConfig::default() };
+        let term_config = build_term_config(scrollback_lines);
 
         // 4. Create Term — use caller-supplied dimensions when available so
         //    the PTY starts at the correct size and the shell's first output
         //    is formatted for the actual window width.
-        let init_cols = cols.filter(|&c| c > 0).unwrap_or(DEFAULT_COLS);
-        let init_rows = rows.filter(|&r| r > 0).unwrap_or(DEFAULT_ROWS);
+        let init_cols = size.and_then(|s| (s.cols > 0).then_some(s.cols)).unwrap_or(DEFAULT_COLS);
+        let init_rows = size.and_then(|s| (s.rows > 0).then_some(s.rows)).unwrap_or(DEFAULT_ROWS);
+        let cell_width = size.and_then(|s| (s.cell_width > 0).then_some(s.cell_width)).unwrap_or(1);
+        let cell_height =
+            size.and_then(|s| (s.cell_height > 0).then_some(s.cell_height)).unwrap_or(1);
         let dimensions =
             TermDimensions { cols: usize::from(init_cols), lines: usize::from(init_rows) };
         let term = Term::new(term_config, &dimensions, event_listener);
 
         // 5. Create PTY using `alacritty_terminal::tty`.
         let window_size =
-            WindowSize { num_lines: init_rows, num_cols: init_cols, cell_width: 1, cell_height: 1 };
-        let shell = command.and_then(|parts| {
-            let mut iter = parts.into_iter();
-            let program = iter.next()?;
-            Some(alacritty_terminal::tty::Shell::new(program, iter.collect()))
-        });
+            WindowSize { num_lines: init_rows, num_cols: init_cols, cell_width, cell_height };
+        // Determine shell binary before consuming `command` so it can be used
+        // for shell integration env injection.
+        let shell_binary = shell_binary_str(command.as_deref());
+        let shell_name = Path::new(&shell_binary)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("shell")
+            .to_owned();
+        let kind = shell_integration::detect_shell(&shell_binary);
+        let integration_enabled = self.shell_integration_enabled.load(Ordering::Relaxed);
+        let integration_script = if integration_enabled {
+            shell_integration::find_scripts_dir()
+                .and_then(|dir| shell_integration::integration_script_path(&shell_binary, &dir))
+                .and_then(|path| path.to_str().map(String::from))
+        } else {
+            None
+        };
+        let shell = build_shell(&shell_binary, command, kind, integration_script.as_deref());
+        let mut env = HashMap::from([
+            ("TERM".to_owned(), "xterm-256color".to_owned()),
+            ("COLORTERM".to_owned(), "truecolor".to_owned()),
+            ("TERM_PROGRAM".to_owned(), "Scribe".to_owned()),
+            ("TERM_PROGRAM_VERSION".to_owned(), env!("CARGO_PKG_VERSION").to_owned()),
+        ]);
+        if integration_enabled {
+            inject_shell_integration_env(&shell_binary, &mut env);
+        }
         let pty_options = PtyOptions {
             shell,
-            env: HashMap::from([
-                ("TERM".to_owned(), "xterm-256color".to_owned()),
-                ("COLORTERM".to_owned(), "truecolor".to_owned()),
-                ("TERM_PROGRAM".to_owned(), "Scribe".to_owned()),
-                ("TERM_PROGRAM_VERSION".to_owned(), env!("CARGO_PKG_VERSION").to_owned()),
-            ]),
+            env,
             working_directory: cwd.filter(|p| p.is_dir()).or_else(dirs::home_dir),
             ..PtyOptions::default()
         };
@@ -230,13 +285,19 @@ impl SessionManager {
             ansi_processor,
             osc_parser,
             metadata_parser,
-            metadata_rx,
+            event_rx,
             workspace_id,
+            shell_name,
             pty: Some(pty),
             handoff_snapshot: None,
             title: None,
+            codex_task_label: None,
             cwd: None,
+            context: None,
             ai_state: None,
+            ai_provider_hint,
+            cell_width,
+            cell_height,
         };
 
         self.sessions.write().await.insert(session_id, managed);
@@ -270,6 +331,8 @@ impl SessionManager {
         fds: Vec<OwnedFd>,
         scrollback: usize,
     ) -> Result<Self, ScribeError> {
+        // shell_integration_enabled defaults to true; callers may override via
+        // set_shell_integration_enabled after construction.
         let mut sessions_map = HashMap::new();
 
         for (handoff_session, owned_fd) in state.sessions.iter().zip(fds) {
@@ -277,7 +340,7 @@ impl SessionManager {
             let rows = handoff_session.rows;
 
             // Create metadata event channel.
-            let (event_tx, metadata_rx) = mpsc::unbounded_channel();
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
 
             // Create event listener.
             let event_listener = ScribeEventListener::new(handoff_session.session_id, event_tx);
@@ -327,13 +390,19 @@ impl SessionManager {
                 ansi_processor,
                 osc_parser,
                 metadata_parser,
-                metadata_rx,
+                event_rx,
                 workspace_id: handoff_session.workspace_id,
+                shell_name: handoff_session.shell_name.clone(),
                 pty: None,
                 handoff_snapshot: handoff_session.snapshot.clone(),
                 title: handoff_session.title.clone(),
+                codex_task_label: handoff_session.codex_task_label.clone(),
                 cwd: handoff_session.cwd.clone(),
+                context: handoff_session.context.clone(),
                 ai_state: handoff_session.ai_state.clone(),
+                ai_provider_hint: handoff_session.ai_provider_hint,
+                cell_width: handoff_session.cell_width.max(1),
+                cell_height: handoff_session.cell_height.max(1),
             };
 
             sessions_map.insert(handoff_session.session_id, managed);
@@ -342,8 +411,129 @@ impl SessionManager {
         Ok(Self {
             sessions: Arc::new(tokio::sync::RwLock::new(sessions_map)),
             scrollback_lines: AtomicUsize::new(scrollback),
+            shell_integration_enabled: std::sync::atomic::AtomicBool::new(true),
         })
     }
+}
+
+/// Extract the shell binary string from an optional command slice, falling
+/// back to `$SHELL` or `"sh"`.
+fn shell_binary_str(command: Option<&[String]>) -> String {
+    command
+        .and_then(|parts| parts.first())
+        .cloned()
+        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "sh".to_owned()))
+}
+
+fn command_ai_provider_hint(command: Option<&[String]>) -> Option<AiProvider> {
+    let parts = command?;
+    if command_mentions_binary(parts, "codex") {
+        Some(AiProvider::CodexCode)
+    } else if command_mentions_binary(parts, "claude") {
+        Some(AiProvider::ClaudeCode)
+    } else {
+        None
+    }
+}
+
+fn command_mentions_binary(parts: &[String], binary_name: &str) -> bool {
+    parts.iter().any(|part| {
+        if path_basename_eq(part, binary_name) {
+            return true;
+        }
+        part.split_whitespace()
+            .any(|token| path_basename_eq(token.trim_matches('\'').trim_matches('"'), binary_name))
+    })
+}
+
+fn path_basename_eq(candidate: &str, expected: &str) -> bool {
+    Path::new(candidate).file_name().and_then(|name| name.to_str()) == Some(expected)
+}
+
+/// Build the `Shell` for a PTY, adding `--rcfile` for bash.
+///
+/// When `command` is `None` (use the user's default shell) and the detected
+/// shell is bash with shell integration enabled, we pass `--rcfile <script>`
+/// so bash reads the integration script instead of `~/.bashrc` (the script
+/// itself sources `~/.bashrc`).  We avoid `--posix` because POSIX mode
+/// corrupts the history subsystem — even after `set +o posix`, `history -r`
+/// only loads a handful of entries instead of the full `$HISTFILE`.
+fn build_shell(
+    shell_binary: &str,
+    command: Option<Vec<String>>,
+    kind: shell_integration::ShellKind,
+    integration_script: Option<&str>,
+) -> Option<alacritty_terminal::tty::Shell> {
+    match command {
+        Some(parts) => {
+            let mut iter = parts.into_iter();
+            let program = iter.next()?;
+            let mut args: Vec<String> = iter.collect();
+            match kind {
+                shell_integration::ShellKind::Bash => {
+                    if let Some(script) = integration_script {
+                        args.insert(0, script.to_owned());
+                        args.insert(0, "--rcfile".to_owned());
+                    }
+                }
+                shell_integration::ShellKind::PowerShell => {
+                    if let Some(script) = integration_script.filter(|_| args.is_empty()) {
+                        args.splice(
+                            0..0,
+                            [
+                                String::from("-NoLogo"),
+                                String::from("-NoExit"),
+                                String::from("-File"),
+                                script.to_owned(),
+                            ],
+                        );
+                    }
+                }
+                shell_integration::ShellKind::Zsh
+                | shell_integration::ShellKind::Fish
+                | shell_integration::ShellKind::Nushell
+                | shell_integration::ShellKind::Unknown => {}
+            }
+            Some(alacritty_terminal::tty::Shell::new(program, args))
+        }
+        None => {
+            match kind {
+                shell_integration::ShellKind::Bash => {
+                    let args = integration_script.map_or_else(Vec::new, |script| {
+                        vec!["--rcfile".to_owned(), script.to_owned()]
+                    });
+                    Some(alacritty_terminal::tty::Shell::new(shell_binary.to_owned(), args))
+                }
+                shell_integration::ShellKind::PowerShell => {
+                    let args = integration_script.map_or_else(Vec::new, |script| {
+                        vec![
+                            String::from("-NoLogo"),
+                            String::from("-NoExit"),
+                            String::from("-File"),
+                            script.to_owned(),
+                        ]
+                    });
+                    Some(alacritty_terminal::tty::Shell::new(shell_binary.to_owned(), args))
+                }
+                shell_integration::ShellKind::Zsh
+                | shell_integration::ShellKind::Fish
+                | shell_integration::ShellKind::Nushell
+                | shell_integration::ShellKind::Unknown => {
+                    // zsh, fish, and nushell rely on environment-based startup hooks.
+                    // Return None so alacritty spawns $SHELL with its default arguments.
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Inject shell integration environment variables when a scripts directory
+/// is available. Modifies `env` in place.
+fn inject_shell_integration_env(shell_binary: &str, env: &mut HashMap<String, String>) {
+    let Some(scripts_dir) = shell_integration::find_scripts_dir() else { return };
+    let extra = shell_integration::build_env(shell_binary, &scripts_dir);
+    env.extend(extra);
 }
 
 /// Create a `ScreenSnapshot` from a locked `Term`.

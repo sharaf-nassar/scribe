@@ -361,9 +361,8 @@ impl UpdateDialog {
         vec![
             format!("Version {} is ready to install.", self.version),
             String::new(),
-            String::from("On Linux, your sessions will be preserved"),
-            String::from("via hot-reload. On macOS, you'll need to"),
-            String::from("restart after the update completes."),
+            String::from("Your terminal sessions will be preserved"),
+            String::from("during the update via live reload."),
         ]
     }
 }

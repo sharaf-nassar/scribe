@@ -3,13 +3,17 @@
 //! Each pane owns a [`Term`] and a VTE [`Processor`]. Rendering is
 //! performed by the shared [`TerminalRenderer`] in `GpuContext`.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions as _;
 use scribe_common::config::ContentPadding;
 use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::protocol::SessionContext;
+use scribe_pty::sync_update_filter::SyncUpdateFrameSplitter;
 use scribe_renderer::types::{CellInstance, GridSize};
 
 use crate::layout::{PaneEdges, Rect};
@@ -25,8 +29,13 @@ pub struct Pane {
     pub workspace_name: Option<String>,
     #[allow(dead_code, reason = "used by tab bar text rendering")]
     pub title: String,
+    pub shell_name: String,
+    /// Preferred tab label while Codex is actively working on a task.
+    pub codex_task_label: Option<String>,
     /// Current working directory reported by the shell via OSC 7.
     pub cwd: Option<PathBuf>,
+    /// Current shell/session context (remote host and tmux session).
+    pub session_context: Option<SessionContext>,
     /// Current git branch name (or short SHA in detached HEAD).
     pub git_branch: Option<String>,
     pub term: Term<VoidListener>,
@@ -60,6 +69,33 @@ pub struct Pane {
     /// The grid size last sent to the server via IPC resize.
     /// `None` means a resize has never been sent for this pane.
     pub last_sent_grid: Option<GridSize>,
+    /// Absolute line positions where prompts start (OSC 133;A marks).
+    /// Used for prompt jumping and scrollbar indicators. Stored as
+    /// "lines from the very top of the scrollback" (0 = oldest line).
+    pub prompt_marks: Vec<usize>,
+    /// Whether the current prompt has `click_events=1` enabled (OSC 133;A).
+    pub click_events: bool,
+    /// Absolute position where the prompt input starts (OSC 133;B mark).
+    /// `Some((absolute_line, column))` while waiting for user input.
+    /// Cleared when a command starts or ends (OSC 133;C / D).
+    pub input_start: Option<(usize, usize)>,
+    /// PTY output chunks queued behind the current frame so light bursts can
+    /// animate incrementally while larger backlogs can be coalesced before
+    /// the next redraw.
+    pub pending_output_frames: VecDeque<Vec<u8>>,
+    /// Streaming raw-frame splitter that preserves `CSI ? 2026 h/l`
+    /// boundaries across arbitrary PTY IPC chunking.
+    sync_output_frames: SyncUpdateFrameSplitter,
+}
+
+/// Result of feeding PTY bytes into a pane's ANSI processor.
+pub struct FeedOutputResult {
+    /// `true` when the processed bytes changed visible terminal state and the
+    /// pane should be re-rendered immediately.
+    pub needs_redraw: bool,
+    /// `true` when a synchronized update is still open and may require a
+    /// timeout-based flush if no terminating `CSI ? 2026 l` arrives.
+    pub sync_pending: bool,
 }
 
 /// Simple adapter implementing `alacritty_terminal::grid::Dimensions`.
@@ -100,7 +136,10 @@ impl Pane {
             workspace_id,
             workspace_name: None,
             title: String::from("shell"),
+            shell_name: String::from("shell"),
+            codex_task_label: None,
             cwd: None,
+            session_context: None,
             git_branch: None,
             term,
             ansi_processor: vte::ansi::Processor::new(),
@@ -114,13 +153,60 @@ impl Pane {
             last_was_focused: None,
             last_selection: None,
             last_sent_grid: None,
+            prompt_marks: Vec::new(),
+            click_events: false,
+            input_start: None,
+            pending_output_frames: VecDeque::new(),
+            sync_output_frames: SyncUpdateFrameSplitter::new(),
         }
     }
 
+    /// Queue raw PTY output frames, preserving synchronized-update commit
+    /// boundaries across IPC message splits.
+    pub fn queue_output_frames(&mut self, bytes: &[u8]) -> bool {
+        let frames = self.sync_output_frames.split_frames(bytes);
+        if frames.is_empty() {
+            return false;
+        }
+
+        self.pending_output_frames.extend(frames);
+        true
+    }
+
     /// Feed raw PTY output bytes into the ANSI processor / terminal.
-    pub fn feed_output(&mut self, bytes: &[u8]) {
+    pub fn feed_output(&mut self, bytes: &[u8]) -> FeedOutputResult {
         self.ansi_processor.advance(&mut self.term, bytes);
+        let needs_redraw = self.ansi_processor.sync_bytes_count() < bytes.len();
+        if needs_redraw {
+            self.content_dirty = true;
+        }
+
+        FeedOutputResult { needs_redraw, sync_pending: self.has_pending_sync_update() }
+    }
+
+    /// Flush a synchronized update after its timeout elapses.
+    ///
+    /// Returns `true` when buffered synchronized bytes were committed to the
+    /// terminal and the pane should be redrawn.
+    pub fn flush_sync_timeout(&mut self, now: Instant) -> bool {
+        let Some(deadline) = self.sync_deadline() else { return false };
+        if deadline > now {
+            return false;
+        }
+
+        self.ansi_processor.stop_sync(&mut self.term);
         self.content_dirty = true;
+        true
+    }
+
+    /// Deadline for the current synchronized update, if one is pending.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.ansi_processor.sync_timeout().sync_timeout()
+    }
+
+    /// Whether a synchronized update is currently buffering terminal output.
+    pub fn has_pending_sync_update(&self) -> bool {
+        self.sync_deadline().is_some()
     }
 
     /// Resize just the underlying terminal emulator without changing the
@@ -161,7 +247,8 @@ impl Pane {
     /// Return the pixel offset where terminal content starts (below tab bar).
     pub fn content_offset(&self, tab_bar_height: f32, padding: &ContentPadding) -> (f32, f32) {
         let eff = effective_padding(padding, self.edges);
-        (self.rect.x + eff.left, self.rect.y + tab_bar_height + eff.top)
+        let tbh = if self.edges.top { tab_bar_height } else { 0.0 };
+        (self.rect.x + eff.left, self.rect.y + tbh + eff.top)
     }
 
     /// Return the content area (below tab bar) as a viewport size tuple.
@@ -172,8 +259,14 @@ impl Pane {
         reason = "pane rect dimensions are small non-negative pixel values that fit in u32"
     )]
     pub fn content_viewport(&self, tab_bar_height: f32) -> (u32, u32) {
-        let h = (self.rect.height - tab_bar_height).max(1.0);
+        let tbh = if self.edges.top { tab_bar_height } else { 0.0 };
+        let h = (self.rect.height - tbh).max(1.0);
         (self.rect.width.max(1.0) as u32, h as u32)
+    }
+
+    /// Prefer a Codex task label over the terminal title when one is active.
+    pub fn preferred_tab_title(&self) -> &str {
+        self.codex_task_label.as_deref().unwrap_or(&self.title)
     }
 }
 

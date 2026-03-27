@@ -6,10 +6,14 @@
 //! tabbed sessions ([`TabState`]). Each tab owns a [`LayoutTree`] for
 //! sub-pane splits within that session.
 
-use scribe_common::ids::{SessionId, WorkspaceId};
-use scribe_common::protocol::{LayoutDirection, WorkspaceTreeNode};
+use std::collections::HashMap;
 
-use crate::layout::{LayoutTree, PaneId, Rect, SplitDirection};
+use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::protocol::{LayoutDirection, PaneTreeNode, WorkspaceTreeNode};
+
+use crate::layout::{
+    FocusDirection, LayoutNode, LayoutTree, PaneId, Rect, SplitDirection, alloc_pane_id,
+};
 use crate::selection::SelectionRange;
 
 /// Fallback accent colour for new workspaces when no theme is available.
@@ -96,8 +100,11 @@ impl WindowLayout {
 
     /// Serialise the current layout tree to a `WorkspaceTreeNode` for
     /// reporting to the server.
-    pub fn to_tree(&self) -> WorkspaceTreeNode {
-        node_to_tree(&self.root)
+    ///
+    /// `pane_to_session` maps each `PaneId` to the session it hosts, enabling
+    /// per-tab pane split trees to be serialised alongside the workspace tree.
+    pub fn to_tree(&self, pane_to_session: &HashMap<PaneId, SessionId>) -> WorkspaceTreeNode {
+        node_to_tree(&self.root, pane_to_session)
     }
 
     /// Return all workspace IDs in tree order (left-to-right depth-first).
@@ -157,6 +164,32 @@ impl WindowLayout {
         ws.tabs.push(TabState { session_id, pane_layout: layout, focused_pane, selection: None });
         ws.active_tab = ws.tabs.len().saturating_sub(1);
         Some(pane_id)
+    }
+
+    /// Add a tab to the specified workspace, restoring a previously serialised
+    /// pane layout.
+    ///
+    /// Returns the new `(SessionId, PaneId)` pairs — one per leaf in the
+    /// restored pane tree — or `None` if the workspace was not found.
+    /// The first entry in the returned vec is the root session's pane.
+    pub fn add_tab_with_pane_tree(
+        &mut self,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        pane_tree: &PaneTreeNode,
+    ) -> Option<Vec<(SessionId, PaneId)>> {
+        let (layout_root, pairs) = pane_tree_to_layout_node(pane_tree);
+        let first_pane_id = pairs.first().map(|&(_, pid)| pid)?;
+        let layout = LayoutTree::from_root(layout_root, first_pane_id);
+        let ws = self.find_workspace_mut(workspace_id)?;
+        ws.tabs.push(TabState {
+            session_id,
+            pane_layout: layout,
+            focused_pane: first_pane_id,
+            selection: None,
+        });
+        ws.active_tab = ws.tabs.len().saturating_sub(1);
+        Some(pairs)
     }
 
     /// Remove a tab from the specified workspace.
@@ -220,22 +253,36 @@ impl WindowLayout {
         count_workspaces(&self.root)
     }
 
-    /// Cycle focus to the next workspace in tree order.
+    /// Find the workspace in the given direction from the currently focused workspace.
     ///
-    /// Wraps around to the first workspace after the last. Returns `true` if
-    /// focus actually changed.
-    pub fn cycle_workspace_focus(&mut self) -> bool {
-        let mut ids = Vec::new();
-        collect_workspace_ids(&self.root, &mut ids);
-        let current = ids.iter().position(|id| *id == self.focused_workspace);
-        let next = current.map_or(0, |i| (i + 1) % ids.len());
-        if let Some(&new_id) = ids.get(next) {
-            if new_id != self.focused_workspace {
-                self.focused_workspace = new_id;
-                return true;
-            }
-        }
-        false
+    /// Uses the same spatial rect algorithm as pane directional focus:
+    /// finds the nearest workspace whose rect is past the current workspace's
+    /// edge in the movement direction, with perpendicular axis overlap. If no
+    /// direct neighbor exists, focus wraps to the opposite edge while keeping
+    /// the same overlap rule.
+    pub fn find_workspace_in_direction(
+        &self,
+        direction: FocusDirection,
+        viewport: Rect,
+    ) -> Option<WorkspaceId> {
+        let rects = self.compute_workspace_rects(viewport);
+        let current_rect =
+            rects.iter().find(|(id, _)| *id == self.focused_workspace).map(|(_, r)| *r)?;
+        best_workspace_candidate_in_direction(
+            current_rect,
+            self.focused_workspace,
+            direction,
+            &rects,
+        )
+        .or_else(|| {
+            wrapped_workspace_candidate_in_direction(
+                current_rect,
+                self.focused_workspace,
+                direction,
+                viewport,
+                &rects,
+            )
+        })
     }
 
     /// Compute the pixel rect for each workspace leaf, given the full viewport.
@@ -316,11 +363,6 @@ impl WindowLayout {
     /// Find a workspace slot by ID (mutable).
     pub fn find_workspace_mut(&mut self, id: WorkspaceId) -> Option<&mut WorkspaceSlot> {
         find_workspace_in_mut(&mut self.root, id)
-    }
-
-    /// Find which workspace contains a given session.
-    pub fn workspace_for_session(&self, session_id: SessionId) -> Option<WorkspaceId> {
-        workspace_for_session_in(&self.root, session_id)
     }
 
     /// Update the split direction of the parent split node that contains the
@@ -503,21 +545,6 @@ fn find_workspace_in_mut(node: &mut WindowNode, id: WorkspaceId) -> Option<&mut 
     }
 }
 
-/// Recursively find which workspace contains the given session.
-fn workspace_for_session_in(node: &WindowNode, session_id: SessionId) -> Option<WorkspaceId> {
-    match node {
-        WindowNode::Workspace(slot) => {
-            if slot.tabs.iter().any(|t| t.session_id == session_id) {
-                Some(slot.workspace_id)
-            } else {
-                None
-            }
-        }
-        WindowNode::Split { first, second, .. } => workspace_for_session_in(first, session_id)
-            .or_else(|| workspace_for_session_in(second, session_id)),
-    }
-}
-
 /// Replace the workspace leaf matching `target_id` with a split node
 /// containing the original workspace and a new workspace slot.
 ///
@@ -681,18 +708,81 @@ fn node_from_tree(tree: &WorkspaceTreeNode) -> WindowNode {
 }
 
 /// Recursively serialise a `WindowNode` tree to a `WorkspaceTreeNode`.
-fn node_to_tree(node: &WindowNode) -> WorkspaceTreeNode {
+fn node_to_tree(
+    node: &WindowNode,
+    pane_to_session: &HashMap<PaneId, SessionId>,
+) -> WorkspaceTreeNode {
     match node {
-        WindowNode::Workspace(slot) => WorkspaceTreeNode::Leaf {
-            workspace_id: slot.workspace_id,
-            session_ids: slot.tabs.iter().map(|tab| tab.session_id).collect(),
-        },
+        WindowNode::Workspace(slot) => {
+            let session_ids: Vec<SessionId> = slot.tabs.iter().map(|tab| tab.session_id).collect();
+            let pane_trees: Vec<Option<PaneTreeNode>> = slot
+                .tabs
+                .iter()
+                .map(|tab| {
+                    let tree = layout_node_to_pane_tree(tab.pane_layout.root(), pane_to_session);
+                    // Only store split trees; single-pane tabs are represented as None.
+                    if matches!(tree, PaneTreeNode::Leaf { .. }) { None } else { Some(tree) }
+                })
+                .collect();
+            WorkspaceTreeNode::Leaf { workspace_id: slot.workspace_id, session_ids, pane_trees }
+        }
         WindowNode::Split { direction, ratio, first, second } => WorkspaceTreeNode::Split {
             direction: direction_to_protocol(*direction),
             ratio: *ratio,
-            first: Box::new(node_to_tree(first)),
-            second: Box::new(node_to_tree(second)),
+            first: Box::new(node_to_tree(first, pane_to_session)),
+            second: Box::new(node_to_tree(second, pane_to_session)),
         },
+    }
+}
+
+/// Convert a `LayoutNode` subtree to a `PaneTreeNode` using the given pane→session mapping.
+///
+/// When a `PaneId` is not found in the map (e.g. pending session not yet confirmed),
+/// the node is omitted by falling back to a synthetic leaf for the tab's root session.
+/// Callers should ensure the map is complete before serialising.
+fn layout_node_to_pane_tree(
+    node: &LayoutNode,
+    pane_to_session: &HashMap<PaneId, SessionId>,
+) -> PaneTreeNode {
+    match node {
+        LayoutNode::Leaf(pane_id) => {
+            // Use a placeholder session if the mapping is incomplete.
+            let session_id = pane_to_session.get(pane_id).copied().unwrap_or_else(SessionId::new);
+            PaneTreeNode::Leaf { session_id }
+        }
+        LayoutNode::Split { direction, ratio, first, second } => PaneTreeNode::Split {
+            direction: direction_to_protocol(*direction),
+            ratio: *ratio,
+            first: Box::new(layout_node_to_pane_tree(first, pane_to_session)),
+            second: Box::new(layout_node_to_pane_tree(second, pane_to_session)),
+        },
+    }
+}
+
+/// Convert a `PaneTreeNode` to a `LayoutNode`, allocating new `PaneId`s.
+///
+/// Returns the layout node and a parallel list of `(SessionId, PaneId)` pairs
+/// in depth-first order.
+fn pane_tree_to_layout_node(tree: &PaneTreeNode) -> (LayoutNode, Vec<(SessionId, PaneId)>) {
+    match tree {
+        PaneTreeNode::Leaf { session_id } => {
+            let pane_id = alloc_pane_id();
+            (LayoutNode::Leaf(pane_id), vec![(*session_id, pane_id)])
+        }
+        PaneTreeNode::Split { direction, ratio, first, second } => {
+            let (first_node, mut pairs) = pane_tree_to_layout_node(first);
+            let (second_node, second_pairs) = pane_tree_to_layout_node(second);
+            pairs.extend(second_pairs);
+            (
+                LayoutNode::Split {
+                    direction: direction_from_protocol(*direction),
+                    ratio: ratio.clamp(0.1, 0.9),
+                    first: Box::new(first_node),
+                    second: Box::new(second_node),
+                },
+                pairs,
+            )
+        }
     }
 }
 
@@ -966,6 +1056,157 @@ fn equalize_workspace_node(node: &mut WindowNode) {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace directional focus helpers
+// ---------------------------------------------------------------------------
+
+fn ranges_overlap_ws(a_start: f32, a_end: f32, b_start: f32, b_end: f32) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+fn workspace_candidate_distance(
+    current: Rect,
+    candidate: Rect,
+    direction: FocusDirection,
+) -> Option<f32> {
+    match direction {
+        FocusDirection::Right => {
+            let past_edge = candidate.x >= current.x + current.width - 1.0;
+            let y_overlap = ranges_overlap_ws(
+                current.y,
+                current.y + current.height,
+                candidate.y,
+                candidate.y + candidate.height,
+            );
+            (past_edge && y_overlap).then_some(candidate.x - (current.x + current.width))
+        }
+        FocusDirection::Left => {
+            let past_edge = candidate.x + candidate.width <= current.x + 1.0;
+            let y_overlap = ranges_overlap_ws(
+                current.y,
+                current.y + current.height,
+                candidate.y,
+                candidate.y + candidate.height,
+            );
+            (past_edge && y_overlap).then_some(current.x - (candidate.x + candidate.width))
+        }
+        FocusDirection::Down => {
+            let past_edge = candidate.y >= current.y + current.height - 1.0;
+            let x_overlap = ranges_overlap_ws(
+                current.x,
+                current.x + current.width,
+                candidate.x,
+                candidate.x + candidate.width,
+            );
+            (past_edge && x_overlap).then_some(candidate.y - (current.y + current.height))
+        }
+        FocusDirection::Up => {
+            let past_edge = candidate.y + candidate.height <= current.y + 1.0;
+            let x_overlap = ranges_overlap_ws(
+                current.x,
+                current.x + current.width,
+                candidate.x,
+                candidate.x + candidate.width,
+            );
+            (past_edge && x_overlap).then_some(current.y - (candidate.y + candidate.height))
+        }
+    }
+}
+
+fn best_workspace_candidate_in_direction(
+    current_rect: Rect,
+    current_id: WorkspaceId,
+    direction: FocusDirection,
+    rects: &[(WorkspaceId, Rect)],
+) -> Option<WorkspaceId> {
+    let mut best: Option<(WorkspaceId, f32)> = None;
+    for &(id, rect) in rects {
+        if id == current_id {
+            continue;
+        }
+        let Some(dist) = workspace_candidate_distance(current_rect, rect, direction) else {
+            continue;
+        };
+        if best.is_none_or(|(_, best_dist)| dist < best_dist) {
+            best = Some((id, dist));
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+fn wrapped_workspace_candidate_in_direction(
+    current_rect: Rect,
+    current_id: WorkspaceId,
+    direction: FocusDirection,
+    viewport: Rect,
+    rects: &[(WorkspaceId, Rect)],
+) -> Option<WorkspaceId> {
+    let mut best: Option<(WorkspaceId, f32)> = None;
+    for &(id, rect) in rects {
+        if id == current_id {
+            continue;
+        }
+        let Some(dist) =
+            wrapped_workspace_candidate_distance(current_rect, rect, direction, viewport)
+        else {
+            continue;
+        };
+        if best.is_none_or(|(_, best_dist)| dist < best_dist) {
+            best = Some((id, dist));
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+fn wrapped_workspace_candidate_distance(
+    current: Rect,
+    candidate: Rect,
+    direction: FocusDirection,
+    viewport: Rect,
+) -> Option<f32> {
+    let viewport_right = viewport.x + viewport.width;
+    let viewport_bottom = viewport.y + viewport.height;
+
+    match direction {
+        FocusDirection::Right => {
+            let y_overlap = ranges_overlap_ws(
+                current.y,
+                current.y + current.height,
+                candidate.y,
+                candidate.y + candidate.height,
+            );
+            y_overlap.then_some(candidate.x - viewport.x)
+        }
+        FocusDirection::Left => {
+            let y_overlap = ranges_overlap_ws(
+                current.y,
+                current.y + current.height,
+                candidate.y,
+                candidate.y + candidate.height,
+            );
+            y_overlap.then_some(viewport_right - (candidate.x + candidate.width))
+        }
+        FocusDirection::Down => {
+            let x_overlap = ranges_overlap_ws(
+                current.x,
+                current.x + current.width,
+                candidate.x,
+                candidate.x + candidate.width,
+            );
+            x_overlap.then_some(candidate.y - viewport.y)
+        }
+        FocusDirection::Up => {
+            let x_overlap = ranges_overlap_ws(
+                current.x,
+                current.x + current.width,
+                candidate.x,
+                candidate.x + candidate.width,
+            );
+            x_overlap.then_some(viewport_bottom - (candidate.y + candidate.height))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -973,13 +1214,17 @@ fn equalize_workspace_node(node: &mut WindowNode) {
 mod tests {
     use super::*;
 
+    fn empty_pane_map() -> HashMap<PaneId, SessionId> {
+        HashMap::new()
+    }
+
     /// Single-leaf tree survives a `to_tree` → `from_tree` roundtrip.
     #[test]
     fn roundtrip_single_leaf() {
         let ws_id = WorkspaceId::new();
         let layout = WindowLayout::new(ws_id, None);
 
-        let wire = layout.to_tree();
+        let wire = layout.to_tree(&empty_pane_map());
         let restored = WindowLayout::from_tree(&wire);
 
         let ids = restored.workspace_ids_in_order();
@@ -996,7 +1241,7 @@ mod tests {
         let ws_b =
             layout.split_workspace(SplitDirection::Horizontal, None).expect("split should succeed");
 
-        let wire = layout.to_tree();
+        let wire = layout.to_tree(&empty_pane_map());
         let restored = WindowLayout::from_tree(&wire);
 
         let ids = restored.workspace_ids_in_order();
@@ -1028,7 +1273,7 @@ mod tests {
             .split_workspace(SplitDirection::Horizontal, None)
             .expect("second split should succeed");
 
-        let wire = layout.to_tree();
+        let wire = layout.to_tree(&empty_pane_map());
         let restored = WindowLayout::from_tree(&wire);
 
         // Leaf order must match: A (top), B (bottom-left), C (bottom-right).
@@ -1063,15 +1308,20 @@ mod tests {
         let tree = WorkspaceTreeNode::Split {
             direction: LayoutDirection::Vertical,
             ratio: 0.3,
-            first: Box::new(WorkspaceTreeNode::Leaf { workspace_id: ws_a, session_ids: vec![] }),
+            first: Box::new(WorkspaceTreeNode::Leaf {
+                workspace_id: ws_a,
+                session_ids: vec![],
+                pane_trees: vec![],
+            }),
             second: Box::new(WorkspaceTreeNode::Leaf {
                 workspace_id: WorkspaceId::new(),
                 session_ids: vec![],
+                pane_trees: vec![],
             }),
         };
 
         let layout = WindowLayout::from_tree(&tree);
-        let roundtripped = layout.to_tree();
+        let roundtripped = layout.to_tree(&empty_pane_map());
 
         // Extract ratio from the roundtripped tree.
         match roundtripped {
@@ -1080,5 +1330,83 @@ mod tests {
             }
             WorkspaceTreeNode::Leaf { .. } => panic!("expected Split, got Leaf"),
         }
+    }
+
+    /// Pane split tree roundtrips through `to_tree` → `from_tree` via `add_tab_with_pane_tree`.
+    #[test]
+    fn roundtrip_pane_tree() {
+        use scribe_common::protocol::{LayoutDirection, PaneTreeNode};
+
+        let ws_id = WorkspaceId::new();
+        let sid_root = SessionId::new();
+        let sid_split = SessionId::new();
+
+        // Build a pane tree: horizontal split, root on left, split on right.
+        let pane_tree = PaneTreeNode::Split {
+            direction: LayoutDirection::Horizontal,
+            ratio: 0.6,
+            first: Box::new(PaneTreeNode::Leaf { session_id: sid_root }),
+            second: Box::new(PaneTreeNode::Leaf { session_id: sid_split }),
+        };
+
+        let mut layout = WindowLayout::new(ws_id, None);
+        let pairs = layout
+            .add_tab_with_pane_tree(ws_id, sid_root, &pane_tree)
+            .expect("workspace should exist");
+
+        // Should get two (sid, pane_id) pairs.
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, sid_root);
+        assert_eq!(pairs[1].0, sid_split);
+
+        // Verify the pane layout has two leaves.
+        let tab = layout.find_workspace(ws_id).and_then(|ws| ws.active_tab()).unwrap();
+        let pane_ids = tab.pane_layout.all_pane_ids();
+        assert_eq!(pane_ids.len(), 2);
+    }
+
+    fn three_workspace_row() -> (WindowLayout, WorkspaceId, WorkspaceId, WorkspaceId, Rect) {
+        let ws_a = WorkspaceId::new();
+        let ws_b = WorkspaceId::new();
+        let ws_c = WorkspaceId::new();
+        let viewport = Rect { x: 0.0, y: 0.0, width: 150.0, height: 100.0 };
+        let tree = WorkspaceTreeNode::Split {
+            direction: LayoutDirection::Horizontal,
+            ratio: 2.0 / 3.0,
+            first: Box::new(WorkspaceTreeNode::Split {
+                direction: LayoutDirection::Horizontal,
+                ratio: 0.5,
+                first: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: ws_a,
+                    session_ids: vec![],
+                    pane_trees: vec![],
+                }),
+                second: Box::new(WorkspaceTreeNode::Leaf {
+                    workspace_id: ws_b,
+                    session_ids: vec![],
+                    pane_trees: vec![],
+                }),
+            }),
+            second: Box::new(WorkspaceTreeNode::Leaf {
+                workspace_id: ws_c,
+                session_ids: vec![],
+                pane_trees: vec![],
+            }),
+        };
+        (WindowLayout::from_tree(&tree), ws_a, ws_b, ws_c, viewport)
+    }
+
+    #[test]
+    fn workspace_focus_wraps_right_to_leftmost_overlapping_workspace() {
+        let (mut layout, ws_a, _, ws_c, viewport) = three_workspace_row();
+        layout.set_focused_workspace(ws_c);
+        assert_eq!(layout.find_workspace_in_direction(FocusDirection::Right, viewport), Some(ws_a));
+    }
+
+    #[test]
+    fn workspace_focus_prefers_direct_neighbor_before_wrapping() {
+        let (mut layout, _, ws_b, ws_c, viewport) = three_workspace_row();
+        layout.set_focused_workspace(ws_b);
+        assert_eq!(layout.find_workspace_in_direction(FocusDirection::Right, viewport), Some(ws_c));
     }
 }

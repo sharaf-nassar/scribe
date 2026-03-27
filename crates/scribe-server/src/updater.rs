@@ -6,18 +6,16 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+use scribe_common::config::{UpdateChannel, UpdateConfig};
 use scribe_common::error::ScribeError;
 use scribe_common::protocol::{ServerMessage, UpdateProgressState};
 
 use crate::ipc_server::ConnectedClients;
 
-const CHECK_INTERVAL: Duration = Duration::from_secs(86_400);
 const INITIAL_DELAY: Duration = Duration::from_secs(30);
 const GITHUB_API_URL: &str = "https://api.github.com/repos/sharaf-nassar/scribe/releases/latest";
 /// Minisign public key for verifying release signatures.
-/// Generate a keypair with `minisign -G` and replace this value with the public key.
-/// The corresponding secret key goes into the `MINISIGN_SECRET_KEY` GitHub secret.
-const MINISIGN_PUBLIC_KEY: &str = "RWXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+const MINISIGN_PUBLIC_KEY: &str = "RWSEN3ob4jI+FaJ5K+IIhUKdE6GZ9PvrCilK9ra2n/ajSZO6u6uRuILJ";
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const ASSET_SUFFIX: &str = "linux-x86_64.deb";
@@ -72,12 +70,16 @@ impl UpdaterHandle {
     }
 }
 
+fn api_url() -> String {
+    std::env::var("SCRIBE_UPDATE_API_URL").unwrap_or_else(|_| GITHUB_API_URL.to_owned())
+}
+
 /// Spawn the background updater task and return a handle for IPC control.
-pub fn spawn_updater(connected_clients: ConnectedClients) -> UpdaterHandle {
+pub fn spawn_updater(connected_clients: ConnectedClients, config: UpdateConfig) -> UpdaterHandle {
     let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel(1);
     let (dismiss_tx, dismiss_rx) = tokio::sync::mpsc::channel(1);
 
-    tokio::spawn(run_updater_loop(connected_clients, trigger_rx, dismiss_rx));
+    tokio::spawn(run_updater_loop(connected_clients, trigger_rx, dismiss_rx, config));
 
     UpdaterHandle { trigger_tx, dismiss_tx }
 }
@@ -88,7 +90,13 @@ async fn run_updater_loop(
     connected_clients: ConnectedClients,
     mut trigger_rx: tokio::sync::mpsc::Receiver<()>,
     mut dismiss_rx: tokio::sync::mpsc::Receiver<()>,
+    config: UpdateConfig,
 ) {
+    if !config.enabled {
+        info!("auto-update disabled by config");
+        return;
+    }
+
     tokio::time::sleep(INITIAL_DELAY).await;
 
     let http = match reqwest::Client::builder()
@@ -105,7 +113,8 @@ async fn run_updater_loop(
     // Track which version we last notified about so dismiss works correctly.
     let dismissed: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
-    let mut interval = tokio::time::interval(CHECK_INTERVAL);
+    let check_interval = Duration::from_secs(config.check_interval_secs.max(300));
+    let mut interval = tokio::time::interval(check_interval);
     // The first tick fires immediately; we handle the initial check inline
     // after INITIAL_DELAY has already elapsed, so skip that first tick.
     interval.tick().await;
@@ -113,15 +122,30 @@ async fn run_updater_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                run_check(&http, &connected_clients, &dismissed).await;
+                run_check(&http, &connected_clients, &dismissed, config.channel).await;
             }
             Some(()) = trigger_rx.recv() => {
                 run_install(&http, &connected_clients).await;
             }
             Some(()) = dismiss_rx.recv() => {
                 info!("update notification dismissed by user");
-                // Nothing to do — the dismissed version is cleared on next check.
             }
+        }
+    }
+}
+
+/// Calls `check_for_update` up to two times, waiting 5 s between attempts.
+async fn check_for_update_with_retry(
+    client: &reqwest::Client,
+    channel: UpdateChannel,
+) -> Result<Option<(String, String)>, ScribeError> {
+    const RETRY_DELAY: Duration = Duration::from_secs(5);
+    match check_for_update(client, channel).await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            warn!("update check attempt 1 failed: {e}; retrying in {RETRY_DELAY:?}");
+            tokio::time::sleep(RETRY_DELAY).await;
+            check_for_update(client, channel).await
         }
     }
 }
@@ -130,8 +154,9 @@ async fn run_check(
     client: &reqwest::Client,
     connected_clients: &ConnectedClients,
     dismissed: &Arc<RwLock<Option<String>>>,
+    channel: UpdateChannel,
 ) {
-    match check_for_update(client).await {
+    match check_for_update_with_retry(client, channel).await {
         Ok(Some((version, release_url))) => {
             let already_dismissed = dismissed.read().await.as_deref() == Some(version.as_str());
             if already_dismissed {
@@ -156,10 +181,14 @@ async fn run_check(
 async fn run_install(client: &reqwest::Client, connected_clients: &ConnectedClients) {
     info!("user triggered update — starting download");
     match try_install(client, connected_clients).await {
-        Ok(version) => {
+        Ok((version, hot_reload_succeeded)) => {
             info!(%version, "update installed successfully");
-            let msg =
-                ServerMessage::UpdateProgress { state: UpdateProgressState::Completed { version } };
+            let state = if hot_reload_succeeded {
+                UpdateProgressState::Completed { version }
+            } else {
+                UpdateProgressState::CompletedRestartRequired { version }
+            };
+            let msg = ServerMessage::UpdateProgress { state };
             broadcast(&msg, connected_clients).await;
         }
         Err(e) => {
@@ -172,12 +201,13 @@ async fn run_install(client: &reqwest::Client, connected_clients: &ConnectedClie
     }
 }
 
-/// Runs all download/verify/install steps and returns the installed version string.
-/// Broadcasts progress messages along the way but returns errors to the caller.
+/// Runs all download/verify/install steps and returns the installed version string
+/// and whether hot-reload succeeded. Broadcasts progress messages along the way
+/// but returns errors to the caller.
 async fn try_install(
     client: &reqwest::Client,
     connected_clients: &ConnectedClients,
-) -> Result<String, ScribeError> {
+) -> Result<(String, bool), ScribeError> {
     let (asset_url, sig_url, version) = fetch_asset_urls(client).await?;
 
     broadcast(
@@ -202,20 +232,17 @@ async fn try_install(
     )
     .await;
 
-    install_update(&asset_path)?;
+    let hot_reload_succeeded = install_update(&asset_path)?;
 
-    Ok(version)
+    Ok((version, hot_reload_succeeded))
 }
 
 // ── Core update logic ─────────────────────────────────────────────
 
-/// Checks GitHub releases API. Returns `Some((version, release_url))` if
-/// a release newer than the running binary is available.
-async fn check_for_update(
-    client: &reqwest::Client,
-) -> Result<Option<(String, String)>, ScribeError> {
-    let release: GhRelease = client
-        .get(GITHUB_API_URL)
+/// Fetches and deserialises the latest GitHub release.
+async fn fetch_latest_release(client: &reqwest::Client) -> Result<GhRelease, ScribeError> {
+    client
+        .get(api_url())
         .send()
         .await
         .map_err(|e| ScribeError::UpdateCheckFailed { reason: format!("{e}") })?
@@ -223,9 +250,18 @@ async fn check_for_update(
         .map_err(|e| ScribeError::UpdateCheckFailed { reason: format!("{e}") })?
         .json()
         .await
-        .map_err(|e| ScribeError::UpdateCheckFailed { reason: format!("{e}") })?;
+        .map_err(|e| ScribeError::UpdateCheckFailed { reason: format!("{e}") })
+}
 
-    if release.draft || release.prerelease {
+/// Checks GitHub releases API. Returns `Some((version, release_url))` if
+/// a release newer than the running binary is available.
+async fn check_for_update(
+    client: &reqwest::Client,
+    channel: UpdateChannel,
+) -> Result<Option<(String, String)>, ScribeError> {
+    let release = fetch_latest_release(client).await?;
+
+    if release.draft || (release.prerelease && channel == UpdateChannel::Stable) {
         return Ok(None);
     }
 
@@ -243,16 +279,7 @@ async fn check_for_update(
 async fn fetch_asset_urls(
     client: &reqwest::Client,
 ) -> Result<(String, String, String), ScribeError> {
-    let release: GhRelease = client
-        .get(GITHUB_API_URL)
-        .send()
-        .await
-        .map_err(|e| ScribeError::UpdateCheckFailed { reason: format!("{e}") })?
-        .error_for_status()
-        .map_err(|e| ScribeError::UpdateCheckFailed { reason: format!("{e}") })?
-        .json()
-        .await
-        .map_err(|e| ScribeError::UpdateCheckFailed { reason: format!("{e}") })?;
+    let release = fetch_latest_release(client).await?;
 
     let asset = find_asset(&release.assets).ok_or_else(|| ScribeError::UpdateInstallFailed {
         reason: format!("no asset matching '{ASSET_SUFFIX}' in release"),
@@ -279,6 +306,7 @@ fn find_signature<'a>(assets: &'a [GhAsset], asset_name: &str) -> Option<&'a GhA
 
 /// Downloads a URL to a temp file and returns the path.
 async fn download_asset(client: &reqwest::Client, url: &str) -> Result<PathBuf, ScribeError> {
+    use futures_util::StreamExt as _;
     use tokio::io::AsyncWriteExt as _;
 
     let tmp_dir = std::env::temp_dir();
@@ -296,14 +324,17 @@ async fn download_asset(client: &reqwest::Client, url: &str) -> Result<PathBuf, 
         .error_for_status()
         .map_err(|e| ScribeError::UpdateInstallFailed { reason: format!("{e}") })?;
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| ScribeError::UpdateInstallFailed { reason: format!("{e}") })?;
-
     let mut file =
         tokio::fs::File::create(&dest).await.map_err(|e| ScribeError::Io { source: e })?;
-    file.write_all(&bytes).await.map_err(|e| ScribeError::Io { source: e })?;
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| ScribeError::UpdateInstallFailed { reason: format!("{e}") })?;
+        file.write_all(&chunk).await.map_err(|e| ScribeError::Io { source: e })?;
+    }
+
+    file.flush().await.map_err(|e| ScribeError::Io { source: e })?;
 
     Ok(dest)
 }
@@ -336,7 +367,7 @@ fn verify_signature(asset_path: &Path, sig_path: &Path) -> Result<(), ScribeErro
 }
 
 #[cfg(target_os = "linux")]
-fn install_update(asset_path: &Path) -> Result<(), ScribeError> {
+fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
     let path_str = asset_path.to_string_lossy();
     let status = std::process::Command::new("pkexec")
         .args(["dpkg", "-i", &path_str])
@@ -346,7 +377,7 @@ fn install_update(asset_path: &Path) -> Result<(), ScribeError> {
         })?;
 
     if status.success() {
-        Ok(())
+        Ok(true)
     } else {
         Err(ScribeError::UpdateInstallFailed {
             reason: format!(
@@ -358,7 +389,11 @@ fn install_update(asset_path: &Path) -> Result<(), ScribeError> {
 }
 
 #[cfg(target_os = "macos")]
-fn install_update(asset_path: &Path) -> Result<(), ScribeError> {
+fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
+    use scribe_common::socket::handoff_socket_path;
+    use std::collections::HashMap;
+    use std::process::Stdio;
+
     let path_str = asset_path.to_string_lossy();
 
     // Attach the DMG.
@@ -390,8 +425,31 @@ fn install_update(asset_path: &Path) -> Result<(), ScribeError> {
         })?
         .to_owned();
 
+    // Capture which client processes are running before the update.
+    let is_running = |name: &str| -> bool {
+        std::process::Command::new("pgrep")
+            .args(["-x", name])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    let client_was_running = is_running("scribe-client");
+    let settings_was_running = is_running("scribe-settings");
+
+    // Remove any stale .app.prev left by a previous failed update so the
+    // upcoming rename doesn't collide with it.
+    let prev_path = Path::new("/Applications/Scribe.app.prev");
+    if prev_path.exists() {
+        let _ = std::fs::remove_dir_all(prev_path);
+    }
+
+    // Rename existing app to .app.prev for rollback (O(rename), same filesystem).
+    // If it doesn't exist (fresh install), continue without backup.
+    let backup_existed =
+        std::fs::rename("/Applications/Scribe.app", "/Applications/Scribe.app.prev").is_ok();
+
     let app_src = format!("{mount_point}/Scribe.app");
-    let result = std::process::Command::new("ditto")
+    let ditto_result = std::process::Command::new("ditto")
         .args([&app_src, "/Applications/Scribe.app"])
         .status()
         .map_err(|e| ScribeError::UpdateInstallFailed { reason: format!("ditto failed: {e}") });
@@ -403,11 +461,168 @@ fn install_update(asset_path: &Path) -> Result<(), ScribeError> {
         warn!("hdiutil detach failed: {e}");
     }
 
-    let status = result?;
-    if status.success() {
-        Ok(())
+    let ditto_status = match ditto_result {
+        Err(e) => {
+            // ditto could not be launched — restore backup if we have one.
+            if backup_existed {
+                if let Err(re) =
+                    std::fs::rename("/Applications/Scribe.app.prev", "/Applications/Scribe.app")
+                {
+                    warn!("rollback rename failed: {re}");
+                }
+            }
+            return Err(e);
+        }
+        Ok(s) => s,
+    };
+
+    if !ditto_status.success() {
+        // ditto ran but failed — restore backup if we have one.
+        if backup_existed {
+            if let Err(re) =
+                std::fs::rename("/Applications/Scribe.app.prev", "/Applications/Scribe.app")
+            {
+                warn!("rollback rename failed: {re}");
+            }
+        }
+        return Err(ScribeError::UpdateInstallFailed {
+            reason: format!("ditto exited with {ditto_status}"),
+        });
+    }
+
+    // Compare old and new binaries to determine which components need restart.
+    // If no backup existed (fresh install), treat all as changed.
+    let binaries = ["scribe-server", "scribe-client", "scribe-settings"];
+    let mut changed: HashMap<&str, bool> = HashMap::new();
+    for name in &binaries {
+        let differs = if backup_existed {
+            let old_path = format!("/Applications/Scribe.app.prev/Contents/MacOS/{name}");
+            let new_path = format!("/Applications/Scribe.app/Contents/MacOS/{name}");
+            file_hash_differs(&old_path, &new_path)
+        } else {
+            true
+        };
+        changed.insert(name, differs);
+    }
+
+    // Remove the backup now that hash comparison is complete (best-effort).
+    if backup_existed {
+        if let Err(e) = std::fs::remove_dir_all("/Applications/Scribe.app.prev") {
+            warn!("failed to remove .app.prev backup: {e}");
+        }
+    }
+
+    // Restart the server: try launchctl kickstart first, fall back to direct spawn.
+    let handoff_path = handoff_socket_path();
+
+    let wait_for_handoff = || -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut handed_off = false;
+        while std::time::Instant::now() < deadline {
+            if !handoff_path.exists() {
+                handed_off = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        if !handed_off {
+            warn!("hot-reload handoff timed out after 10 s");
+        }
+        handed_off
+    };
+
+    let server_changed = *changed.get("scribe-server").unwrap_or(&true);
+    let hot_reload_succeeded = if server_changed {
+        let uid = scribe_common::socket::current_uid();
+        let service_target = format!("user/{uid}/com.scribe.server");
+
+        let launchctl_ok = std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &service_target])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if launchctl_ok {
+            info!("launchctl kickstart succeeded — waiting for handoff");
+            wait_for_handoff()
+        } else {
+            info!("launchctl kickstart unavailable — falling back to direct --upgrade spawn");
+            match std::env::current_exe() {
+                Err(e) => {
+                    warn!("could not determine current exe path for --upgrade spawn: {e}");
+                    false
+                }
+                Ok(exe) => {
+                    match std::process::Command::new(&exe)
+                        .arg("--upgrade")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    {
+                        Err(e) => {
+                            warn!("failed to spawn new server with --upgrade: {e}");
+                            false
+                        }
+                        Ok(_child) => wait_for_handoff(),
+                    }
+                }
+            }
+        }
     } else {
-        Err(ScribeError::UpdateInstallFailed { reason: format!("ditto exited with {status}") })
+        info!("server binary unchanged — skipping server restart");
+        true
+    };
+
+    // Restart client binaries that changed and were running before the update.
+    let macos_dir = "/Applications/Scribe.app/Contents/MacOS";
+    for &name in &["scribe-client", "scribe-settings"] {
+        if !changed.get(name).unwrap_or(&true) {
+            info!("{name} binary unchanged — skipping restart");
+            continue;
+        }
+        let was_running = match name {
+            "scribe-client" => client_was_running,
+            "scribe-settings" => settings_was_running,
+            _ => false,
+        };
+        if !was_running {
+            continue;
+        }
+        // Kill the old process (best-effort, it may not be running).
+        let _ = std::process::Command::new("pkill").args(["-x", name]).status();
+        // Brief wait for singleton socket release (settings).
+        if name != "scribe-client" {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        // Relaunch.
+        let bin_path = format!("{macos_dir}/{name}");
+        match std::process::Command::new(&bin_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(_) => info!("relaunched {name}"),
+            Err(e) => warn!("failed to relaunch {name}: {e}"),
+        }
+    }
+
+    Ok(hot_reload_succeeded)
+}
+
+/// Returns `true` if the two files have different content (or if either cannot be read).
+/// Safety-first: any failure to compare is treated as "changed".
+#[cfg(target_os = "macos")]
+fn file_hash_differs(old_path: &str, new_path: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let hash_file = |path: &str| -> Option<[u8; 32]> {
+        let data = std::fs::read(path).ok()?;
+        Some(Sha256::digest(&data).into())
+    };
+    match (hash_file(old_path), hash_file(new_path)) {
+        (Some(old), Some(new)) => old != new,
+        _ => true,
     }
 }
 

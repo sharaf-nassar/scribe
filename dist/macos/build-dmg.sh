@@ -45,7 +45,7 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
 fi
 
 # Verify binaries exist
-for bin in scribe-client scribe-server scribe-settings scribe-driver; do
+for bin in scribe-client scribe-server scribe-settings; do
     if [[ ! -f "${BUILD_DIR}/${bin}" ]]; then
         echo "ERROR: ${BUILD_DIR}/${bin} not found. Run 'cargo build --release' first."
         exit 1
@@ -115,7 +115,6 @@ fi
 cp "${BUILD_DIR}/scribe-client"   "${MACOS_DIR}/"
 cp "${BUILD_DIR}/scribe-server"   "${MACOS_DIR}/"
 cp "${BUILD_DIR}/scribe-settings" "${MACOS_DIR}/"
-cp "${BUILD_DIR}/scribe-driver"   "${MACOS_DIR}/"
 
 # Copy icon
 cp "${STAGING_DIR}/Scribe.icns" "${RESOURCES_DIR}/"
@@ -123,6 +122,10 @@ cp "${STAGING_DIR}/Scribe.icns" "${RESOURCES_DIR}/"
 # Copy Claude Code hook integration scripts
 cp "${DIST_DIR}/setup-claude-hooks.sh" "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/detect-claude-question.sh" "${RESOURCES_DIR}/"
+cp "${DIST_DIR}/setup-codex-hooks.sh" "${RESOURCES_DIR}/"
+cp "${DIST_DIR}/detect-codex-question.sh" "${RESOURCES_DIR}/"
+cp -R "${DIST_DIR}/shell-integration" "${RESOURCES_DIR}/"
+cp "${DIST_DIR}/macos/com.scribe.server.plist" "${RESOURCES_DIR}/"
 
 echo "==> ${BUNDLE_NAME} assembled at ${APP_DIR}"
 

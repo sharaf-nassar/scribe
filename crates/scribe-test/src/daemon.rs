@@ -12,7 +12,7 @@ use regex::Regex;
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WorkspaceId};
-use scribe_common::protocol::{ClientMessage, ServerMessage};
+use scribe_common::protocol::{ClientMessage, ServerMessage, TerminalSize};
 use scribe_common::screen::ScreenSnapshot;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
@@ -262,6 +262,7 @@ async fn server_reader_loop(
 /// Dispatch a single `ServerMessage` to the appropriate session state.
 #[allow(
     clippy::cognitive_complexity,
+    clippy::too_many_lines,
     reason = "flat match dispatch on server message variants; each arm is a one-line delegation"
 )]
 async fn dispatch_server_message(
@@ -281,6 +282,12 @@ async fn dispatch_server_message(
         }
         ServerMessage::TitleChanged { session_id, title } => {
             handle_title_changed(session_id, title, state).await;
+        }
+        ServerMessage::CodexTaskLabelChanged { session_id, task_label } => {
+            debug!(%session_id, %task_label, "codex task label changed (ignored by test daemon)");
+        }
+        ServerMessage::CodexTaskLabelCleared { session_id } => {
+            debug!(%session_id, "codex task label cleared (ignored by test daemon)");
         }
         ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
             handle_session_created(session_id, workspace_id, &shell_name, state, notifiers).await;
@@ -318,6 +325,9 @@ async fn dispatch_server_message(
         ServerMessage::Welcome { window_id, .. } => {
             debug!(%window_id, "welcome (ignored by test daemon)");
         }
+        ServerMessage::WindowClosed { window_id } => {
+            debug!(%window_id, "window closed (ignored by test daemon)");
+        }
         ServerMessage::AiStateCleared { session_id } => {
             debug!(%session_id, "AI state cleared (ignored by test daemon)");
         }
@@ -330,20 +340,20 @@ async fn dispatch_server_message(
         ServerMessage::UpdateProgress { .. } => {
             debug!("update progress (ignored by test daemon)");
         }
-        ServerMessage::DriverTaskCreated { task_id, .. } => {
-            debug!(%task_id, "driver task created (ignored by test daemon)");
+        ServerMessage::PromptMark { session_id, .. } => {
+            debug!(%session_id, "prompt mark (ignored by test daemon)");
         }
-        ServerMessage::DriverTaskOutput { task_id, .. } => {
-            debug!(%task_id, "driver task output (ignored by test daemon)");
+        ServerMessage::SessionContextChanged { session_id, context } => {
+            debug!(%session_id, ?context, "session context changed (ignored by test daemon)");
         }
-        ServerMessage::DriverTaskStateChanged { task_id, .. } => {
-            debug!(%task_id, "driver task state changed (ignored by test daemon)");
+        ServerMessage::WindowList { windows } => {
+            debug!(count = windows.len(), "window list (ignored by test daemon)");
         }
-        ServerMessage::DriverTaskList { .. } => {
-            debug!("driver task list (ignored by test daemon)");
+        ServerMessage::RunAction { action } => {
+            debug!(?action, "run action (ignored by test daemon)");
         }
-        ServerMessage::DriverTaskExited { task_id, .. } => {
-            debug!(%task_id, "driver task exited (ignored by test daemon)");
+        ServerMessage::ActionDispatched { window_id } => {
+            debug!(%window_id, "action dispatched (ignored by test daemon)");
         }
     }
 }
@@ -611,8 +621,7 @@ async fn handle_create_session(
         workspace_id,
         split_direction: None,
         cwd: None,
-        cols: None,
-        rows: None,
+        size: None,
         command: None,
     };
     if let Err(e) = send_to_server(server_writer, &msg).await {
@@ -722,7 +731,7 @@ async fn handle_send(
     data: Vec<u8>,
     server_writer: &Arc<Mutex<OwnedWriteHalf>>,
 ) -> DaemonResponse {
-    let msg = ClientMessage::KeyInput { session_id, data };
+    let msg = ClientMessage::KeyInput { session_id, data, dismisses_attention: true };
     match send_to_server(server_writer, &msg).await {
         Ok(()) => DaemonResponse::Ok,
         Err(e) => DaemonResponse::Error { message: format!("failed to send KeyInput: {e}") },
@@ -735,7 +744,10 @@ async fn handle_resize(
     rows: u16,
     server_writer: &Arc<Mutex<OwnedWriteHalf>>,
 ) -> DaemonResponse {
-    let msg = ClientMessage::Resize { session_id, cols, rows };
+    let msg = ClientMessage::Resize {
+        session_id,
+        size: TerminalSize { cols, rows, cell_width: 1, cell_height: 1 },
+    };
     match send_to_server(server_writer, &msg).await {
         Ok(()) => DaemonResponse::Ok,
         Err(e) => DaemonResponse::Error { message: format!("failed to send Resize: {e}") },

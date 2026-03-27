@@ -22,6 +22,13 @@ pub struct SelectionPoint {
     pub col: usize,
 }
 
+impl SelectionPoint {
+    /// Adjust the row by `delta` grid lines (positive = down, negative = up).
+    pub fn shift_row(&mut self, delta: i32) {
+        self.row += delta;
+    }
+}
+
 impl PartialOrd for SelectionPoint {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -98,6 +105,12 @@ impl SelectionRange {
     /// Return `true` if the selection covers zero cells (start equals end).
     pub fn is_empty(&self) -> bool {
         self.start == self.end
+    }
+
+    /// Adjust both endpoints by `delta` grid lines.
+    pub fn shift_rows(&mut self, delta: i32) {
+        self.start.shift_row(delta);
+        self.end.shift_row(delta);
     }
 }
 

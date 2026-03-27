@@ -33,7 +33,7 @@ sleep 1
 echo "PHASE 2 PASS: client closed"
 
 # --- Phase 3: Restart the client (reconnects to server) ---
-# Vulkan device is lost after the first client exits (container driver
+# Vulkan device is lost after the first client exits (container graphics stack
 # limitation). Reset the instance by unsetting the cached device.
 export WGPU_BACKEND=vulkan
 scribe-client &

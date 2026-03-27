@@ -47,6 +47,14 @@ server:
 client:
     cargo run --bin scribe-client
 
+# Hot-reload the server with the current debug binary
+restart-server:
+    target/debug/scribe-server --upgrade
+
+# Hot-reload the server with the current release binary
+restart-server-release:
+    target/release/scribe-server --upgrade
+
 # ==================== Package ====================
 
 # Build release .deb (full workspace so scribe-client is included)
@@ -69,6 +77,10 @@ dmg-quick:
 # Set up Claude Code AI indicator hooks (run after installing Claude Code)
 setup-claude:
     bash dist/setup-claude-hooks.sh --hook-source dist
+
+# Set up Codex Code AI indicator hooks (run after installing Codex)
+setup-codex:
+    bash dist/setup-codex-hooks.sh --hook-source dist
 
 # ==================== E2E Testing ====================
 
@@ -93,3 +105,4 @@ e2e: build-release docker-func
     just e2e-func func/smoke.sh
     just e2e-func func/reconnect.sh
     just e2e-func func/workspace-split.sh
+    just e2e-func func/shell-integration.sh

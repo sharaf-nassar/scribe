@@ -1,18 +1,19 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
+use scribe_common::config::UpdateConfig;
 use scribe_common::error::ScribeError;
 use scribe_common::socket::server_socket_path;
 
 mod config;
-mod driver_tasks;
 mod handoff;
 mod ipc_server;
 mod session_manager;
+mod shell_integration;
 mod updater;
 mod workspace_manager;
 
@@ -52,13 +53,14 @@ async fn run_normal_server() -> Result<(), ScribeError> {
         clippy::cast_possible_truncation,
         reason = "scrollback_lines is clamped to 100_000 in config which fits usize"
     )]
-    let session_manager =
-        Arc::new(session_manager::SessionManager::with_scrollback(cfg.scrollback_lines as usize));
+    let session_manager = {
+        let sm = session_manager::SessionManager::with_scrollback(cfg.scrollback_lines as usize);
+        sm.set_shell_integration_enabled(cfg.shell_integration_enabled);
+        Arc::new(sm)
+    };
     let workspace_manager =
         Arc::new(RwLock::new(workspace_manager::WorkspaceManager::new(cfg.workspace_roots)));
-    let driver_registry = Arc::new(Mutex::new(driver_tasks::DriverTaskRegistry::new()));
-
-    run_server_loop(session_manager, workspace_manager, driver_registry, false).await
+    run_server_loop(session_manager, workspace_manager, false, cfg.update).await
 }
 
 /// Upgrade receiver mode: connect to old server, receive handoff, then serve.
@@ -89,21 +91,8 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
     )]
     let scrollback = cfg.scrollback_lines as usize;
 
-    let session_count = state.sessions.len();
-    let driver_task_count = state.driver_tasks.len();
-
-    // Split the received fds: session fds first, then driver task fds.
-    let (session_fds, driver_fds) = {
-        let mut all = fds;
-        let driver = all.split_off(session_count);
-        (all, driver)
-    };
-
-    let session_manager = Arc::new(session_manager::SessionManager::restore_from_handoff(
-        &state,
-        session_fds,
-        scrollback,
-    )?);
+    let session_manager =
+        Arc::new(session_manager::SessionManager::restore_from_handoff(&state, fds, scrollback)?);
     let workspace_manager =
         Arc::new(RwLock::new(workspace_manager::WorkspaceManager::restore_from_handoff(
             cfg.workspace_roots,
@@ -112,21 +101,9 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
             &state.windows,
         )));
 
-    let driver_registry = Arc::new(Mutex::new(driver_tasks::DriverTaskRegistry::new()));
-    if driver_task_count > 0 {
-        driver_tasks::DriverTaskRegistry::restore_from_handoff(
-            &driver_registry,
-            state.driver_tasks,
-            driver_fds,
-        )
-        .await
-        .map_err(|e| ScribeError::IpcError { reason: e })?;
-        info!(driver_task_count, "driver tasks restored from handoff");
-    }
-
     info!("session restoration complete — starting IPC server");
 
-    run_server_loop(session_manager, workspace_manager, driver_registry, true).await
+    run_server_loop(session_manager, workspace_manager, true, cfg.update).await
 }
 
 /// Run the IPC server, handoff listener, and signal handler concurrently.
@@ -134,11 +111,12 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
 /// Shared between normal and upgrade startup paths. Cleans up the IPC socket
 /// on exit. `upgrade_mode` is forwarded to the socket acquisition logic so
 /// that upgrade receivers skip the singleton lock (the old server holds it).
+#[allow(clippy::too_many_arguments, reason = "server loop requires all server subsystems")]
 async fn run_server_loop(
     session_manager: Arc<session_manager::SessionManager>,
     workspace_manager: Arc<RwLock<workspace_manager::WorkspaceManager>>,
-    driver_registry: driver_tasks::DriverTaskRegistryHandle,
     upgrade_mode: bool,
+    update_config: UpdateConfig,
 ) -> Result<(), ScribeError> {
     let path = server_socket_path();
     let live_sessions = ipc_server::new_live_session_registry();
@@ -156,7 +134,8 @@ async fn run_server_loop(
 
     // Spawn the background updater. The handle is passed into the IPC server
     // so that TriggerUpdate / DismissUpdate messages can reach it.
-    let updater_handle = Arc::new(updater::spawn_updater(Arc::clone(&connected_clients)));
+    let updater_handle =
+        Arc::new(updater::spawn_updater(Arc::clone(&connected_clients), update_config));
 
     let handoff_triggered = tokio::select! {
         result = ipc_server::start_ipc_server(
@@ -166,7 +145,6 @@ async fn run_server_loop(
             Arc::clone(&live_sessions),
             Arc::clone(&connected_clients),
             Arc::clone(&updater_handle),
-            Arc::clone(&driver_registry),
         ) => {
             result?;
             false
@@ -174,7 +152,6 @@ async fn run_server_loop(
         result = handoff::run_handoff_listener(
             Arc::clone(&workspace_manager),
             Arc::clone(&live_sessions),
-            Arc::clone(&driver_registry),
         ) => {
             match result {
                 Ok(()) => {

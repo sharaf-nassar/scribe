@@ -4,6 +4,9 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         fonts-jetbrains-mono \
         ca-certificates \
+        git \
+        python3 \
+        sqlite3 \
         xvfb \
         mesa-utils \
         libgl1-mesa-dri \

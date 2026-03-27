@@ -17,6 +17,12 @@
         <line x1="21" y1="21" x2="16.65" y2="16.65"/>
       </svg>
       <input type="text" id="global-search" class="global-search-input" placeholder="Search settings...">
+      <button type="button" class="global-search-clear" aria-label="Clear search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"/>
+          <line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
     </div>
     <div class="sidebar-section">
       <div class="nav-item active" data-tab="appearance">
@@ -55,6 +61,13 @@
           <rect x="14" y="14" width="7" height="7"/>
         </svg>
         Workspaces
+      </div>
+      <div class="nav-item" data-tab="updates">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2v10m0 0l3-3m-3 3l-3-3"/>
+          <path d="M4 15v2a2 2 0 002 2h12a2 2 0 002-2v-2"/>
+        </svg>
+        Updates
       </div>
     </div>
     <div class="sidebar-footer">Scribe v0.1.0</div>
@@ -465,8 +478,8 @@
           </div>
           <div class="setting-row">
             <div class="setting-info">
-              <div class="setting-label">Claude Code Clipboard Cleanup</div>
-              <div class="setting-desc">Dedent and unwrap copied text when Claude Code is running</div>
+              <div class="setting-label">Clipboard Cleanup</div>
+              <div class="setting-desc">Dedent and unwrap copied text when Claude Code or Codex is running</div>
             </div>
             <div class="toggle on" data-key="terminal.claude_copy_cleanup">
               <div class="toggle-knob"></div>
@@ -478,6 +491,24 @@
               <div class="setting-desc">Show AI state indicators in tab bars and pane borders</div>
             </div>
             <div class="toggle on" data-key="terminal.claude_code_integration">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Codex Code Integration</div>
+              <div class="setting-desc">Show AI state indicators for Codex sessions in tab bars and pane borders</div>
+            </div>
+            <div class="toggle on" data-key="terminal.codex_code_integration">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Hide Codex Hook Logs</div>
+              <div class="setting-desc">Filter Codex hook log blocks, including status-message starts and failed, blocked, or stopped trailers</div>
+            </div>
+            <div class="toggle off" data-key="terminal.hide_codex_hook_logs">
               <div class="toggle-knob"></div>
             </div>
           </div>
@@ -545,7 +576,7 @@
           </div>
         </div>
 
-        <div class="section-label">Claude Code States</div>
+        <div class="section-label">AI Assistant States</div>
         <div class="section-card">
           <!-- Column headers -->
           <div class="setting-row" style="opacity:0.5;font-size:11px;">
@@ -558,7 +589,7 @@
           </div>
           <!-- Processing -->
           <div class="setting-row">
-            <div class="setting-info"><div class="setting-label">Processing</div><div class="setting-desc">Claude is thinking</div></div>
+            <div class="setting-info"><div class="setting-label">Processing</div><div class="setting-desc">Claude or Codex is thinking</div></div>
             <div class="toggle on" data-key="claude_states.processing.tab_indicator"><div class="toggle-knob"></div></div>
             <div class="toggle on" data-key="claude_states.processing.pane_border"><div class="toggle-knob"></div></div>
             <div class="color-swatch" data-key="claude_states.processing.color" style="background:#22c55e;"><input type="color" value="#22c55e"></div>
@@ -567,7 +598,7 @@
           </div>
           <!-- Idle Prompt -->
           <div class="setting-row">
-            <div class="setting-info"><div class="setting-label">Idle Prompt</div><div class="setting-desc">Claude finished, waiting for next prompt</div></div>
+            <div class="setting-info"><div class="setting-label">Idle Prompt</div><div class="setting-desc">The assistant finished and is waiting for the next prompt</div></div>
             <div class="toggle on" data-key="claude_states.idle_prompt.tab_indicator"><div class="toggle-knob"></div></div>
             <div class="toggle on" data-key="claude_states.idle_prompt.pane_border"><div class="toggle-knob"></div></div>
             <div class="color-swatch" data-key="claude_states.idle_prompt.color" style="background:#ffa51a;"><input type="color" value="#ffa51a"></div>
@@ -576,7 +607,7 @@
           </div>
           <!-- Waiting for Input -->
           <div class="setting-row">
-            <div class="setting-info"><div class="setting-label">Waiting for Input</div><div class="setting-desc">Claude asked you a question</div></div>
+            <div class="setting-info"><div class="setting-label">Waiting for Input</div><div class="setting-desc">The assistant asked you a question</div></div>
             <div class="toggle on" data-key="claude_states.waiting_for_input.tab_indicator"><div class="toggle-knob"></div></div>
             <div class="toggle on" data-key="claude_states.waiting_for_input.pane_border"><div class="toggle-knob"></div></div>
             <div class="color-swatch" data-key="claude_states.waiting_for_input.color" style="background:#ff8c00;"><input type="color" value="#ff8c00"></div>
@@ -585,7 +616,7 @@
           </div>
           <!-- Permission Prompt -->
           <div class="setting-row">
-            <div class="setting-info"><div class="setting-label">Permission Prompt</div><div class="setting-desc">Claude needs tool approval</div></div>
+            <div class="setting-info"><div class="setting-label">Permission Prompt</div><div class="setting-desc">The assistant needs tool approval</div></div>
             <div class="toggle on" data-key="claude_states.permission_prompt.tab_indicator"><div class="toggle-knob"></div></div>
             <div class="toggle on" data-key="claude_states.permission_prompt.pane_border"><div class="toggle-knob"></div></div>
             <div class="color-swatch" data-key="claude_states.permission_prompt.color" style="background:#ef4444;"><input type="color" value="#ef4444"></div>
@@ -594,7 +625,7 @@
           </div>
           <!-- Error -->
           <div class="setting-row">
-            <div class="setting-info"><div class="setting-label">Error</div><div class="setting-desc">Something went wrong</div></div>
+            <div class="setting-info"><div class="setting-label">Error</div><div class="setting-desc">Something went wrong in the active assistant session</div></div>
             <div class="toggle on" data-key="claude_states.error.tab_indicator"><div class="toggle-knob"></div></div>
             <div class="toggle on" data-key="claude_states.error.pane_border"><div class="toggle-knob"></div></div>
             <div class="color-swatch" data-key="claude_states.error.color" style="background:#9933cc;"><input type="color" value="#9933cc"></div>
@@ -609,6 +640,22 @@
     <div id="page-keybindings" class="content-page">
       <div class="page-title">Keybindings</div>
       <div class="page-subtitle">Click a shortcut to reassign it</div>
+
+      <div class="section-group">
+        <div class="section-label">AI Tabs</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">AI Tab Provider</div>
+              <div class="setting-desc">Choose which assistant the AI tab shortcuts open</div>
+            </div>
+            <div class="segmented-control" data-key="terminal.ai_tab_provider">
+              <div class="segment-opt active" data-value="claude_code">Claude Code</div>
+              <div class="segment-opt" data-value="codex_code">Codex</div>
+            </div>
+          </div>
+        </div>
+      </div>
 
       <div id="kb-conflict-banner" class="kb-conflict-banner" style="display:none;"></div>
 
@@ -682,9 +729,27 @@
             </div>
           </div>
           <div class="setting-row">
-            <div class="setting-info"><div class="setting-label">Cycle Workspace Focus</div></div>
-            <div class="keybinding-cell" data-action="cycle_workspace">
-              <button class="kb-reset-btn" data-action="cycle_workspace" title="Reset to default">&#8635;</button>
+            <div class="setting-info"><div class="setting-label">Focus Workspace Left</div></div>
+            <div class="keybinding-cell" data-action="workspace_focus_left">
+              <button class="kb-reset-btn" data-action="workspace_focus_left" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Focus Workspace Right</div></div>
+            <div class="keybinding-cell" data-action="workspace_focus_right">
+              <button class="kb-reset-btn" data-action="workspace_focus_right" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Focus Workspace Up</div></div>
+            <div class="keybinding-cell" data-action="workspace_focus_up">
+              <button class="kb-reset-btn" data-action="workspace_focus_up" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Focus Workspace Down</div></div>
+            <div class="keybinding-cell" data-action="workspace_focus_down">
+              <button class="kb-reset-btn" data-action="workspace_focus_down" title="Reset to default">&#8635;</button>
             </div>
           </div>
         </div>
@@ -700,9 +765,15 @@
             </div>
           </div>
           <div class="setting-row">
-            <div class="setting-info"><div class="setting-label">New Claude Tab</div></div>
+            <div class="setting-info"><div class="setting-label" data-ai-tab-label="new">New Claude Tab</div></div>
             <div class="keybinding-cell" data-action="new_claude_tab">
               <button class="kb-reset-btn" data-action="new_claude_tab" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label" data-ai-tab-label="resume">Resume Claude Tab</div></div>
+            <div class="keybinding-cell" data-action="new_claude_resume_tab">
+              <button class="kb-reset-btn" data-action="new_claude_resume_tab" title="Reset to default">&#8635;</button>
             </div>
           </div>
           <div class="setting-row">
@@ -910,6 +981,12 @@
         <div class="section-label">General</div>
         <div class="section-card">
           <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Command Palette</div></div>
+            <div class="keybinding-cell" data-action="command_palette">
+              <button class="kb-reset-btn" data-action="command_palette" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
             <div class="setting-info"><div class="setting-label">Settings</div></div>
             <div class="keybinding-cell" data-action="settings">
               <button class="kb-reset-btn" data-action="settings" title="Reset to default">&#8635;</button>
@@ -948,6 +1025,54 @@
             <!-- Populated by loadConfig -->
           </div>
           <button class="badge-color-reset" type="button">Reset to defaults</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ Updates Page ═══════ -->
+    <div id="page-updates" class="content-page">
+      <div class="page-title">Updates</div>
+      <div class="page-subtitle">Configure automatic update checking and installation</div>
+
+      <div class="section-group">
+        <div class="section-label">Update Checking</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Automatic Updates</div>
+              <div class="setting-desc">Check for and notify about new versions</div>
+            </div>
+            <div class="toggle on" data-key="update.enabled">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Check Interval (hours)</div>
+              <div class="setting-desc">How often to check for updates (minimum 1 hour)</div>
+            </div>
+            <div class="number-control" data-key="update.check_interval_hours" data-min="1" data-max="168" data-step="1">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">24</div>
+              <div class="number-btn">+</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Release Channel</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Channel</div>
+              <div class="setting-desc">Stable releases only, or include beta previews</div>
+            </div>
+            <div class="segmented-control" data-key="update.channel">
+              <div class="segment-opt active" data-value="stable">Stable</div>
+              <div class="segment-opt" data-value="beta">Beta</div>
+            </div>
+          </div>
         </div>
       </div>
     </div>

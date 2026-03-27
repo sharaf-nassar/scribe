@@ -221,6 +221,21 @@ fn apply_config_key(
             config.terminal.claude_code_integration =
                 value.as_bool().ok_or("claude_code_integration must be a boolean")?;
         }
+        "terminal.codex_code_integration" => {
+            config.terminal.codex_code_integration =
+                value.as_bool().ok_or("codex_code_integration must be a boolean")?;
+        }
+        "terminal.hide_codex_hook_logs" => {
+            config.terminal.hide_codex_hook_logs =
+                value.as_bool().ok_or("hide_codex_hook_logs must be a boolean")?;
+        }
+        "terminal.ai_tab_provider" => {
+            let provider_str = value.as_str().ok_or("ai_tab_provider must be a string")?;
+            let provider: scribe_common::ai_state::AiProvider =
+                serde_json::from_value(serde_json::Value::String(provider_str.to_owned()))
+                    .map_err(|e| format!("invalid ai_tab_provider: {e}"))?;
+            config.terminal.ai_tab_provider = provider;
+        }
         "terminal.natural_scroll" => {
             config.terminal.natural_scroll =
                 value.as_bool().ok_or("natural_scroll must be a boolean")?;
@@ -288,6 +303,30 @@ fn apply_config_key(
                 color.clone_into(slot);
             }
         }
+        // -- Updates ----------------------------------------------------------
+        "update.enabled" => {
+            let v = value.as_bool().ok_or("update.enabled must be a boolean")?;
+            config.update.enabled = v;
+        }
+        "update.check_interval_hours" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "check interval hours is a small positive integer within u64 range"
+            )]
+            let hours = (value.as_f64().ok_or("update.check_interval_hours must be a number")?
+                as u64)
+                .clamp(1, 168);
+            config.update.check_interval_secs = hours * 3600;
+        }
+        "update.channel" => {
+            let s = value.as_str().ok_or("update.channel must be a string")?;
+            config.update.channel = match s {
+                "stable" => scribe_common::config::UpdateChannel::Stable,
+                "beta" => scribe_common::config::UpdateChannel::Beta,
+                other => return Err(format!("unknown channel: {other}")),
+            };
+        }
         key if key.starts_with("theme.") => {
             apply_theme_color_key(config, key, value)?;
         }
@@ -314,8 +353,7 @@ fn apply_claude_state_key(
 
     let entry = match state_name {
         "processing" => &mut states.processing,
-        "idle_prompt" => &mut states.idle_prompt,
-        "waiting_for_input" => &mut states.waiting_for_input,
+        "idle_prompt" | "waiting_for_input" => &mut states.waiting_for_input,
         "permission_prompt" => &mut states.permission_prompt,
         "error" => &mut states.error,
         _ => return Err(format!("unknown claude state: {state_name}")),
@@ -376,9 +414,13 @@ fn apply_keybinding_field(
         "focus_down" => kb.focus_down = list,
         "workspace_split_vertical" => kb.workspace_split_vertical = list,
         "workspace_split_horizontal" => kb.workspace_split_horizontal = list,
-        "cycle_workspace" => kb.cycle_workspace = list,
+        "workspace_focus_left" => kb.workspace_focus_left = list,
+        "workspace_focus_right" => kb.workspace_focus_right = list,
+        "workspace_focus_up" => kb.workspace_focus_up = list,
+        "workspace_focus_down" => kb.workspace_focus_down = list,
         "new_tab" => kb.new_tab = list,
         "new_claude_tab" => kb.new_claude_tab = list,
+        "new_claude_resume_tab" => kb.new_claude_resume_tab = list,
         "close_tab" => kb.close_tab = list,
         "next_tab" => kb.next_tab = list,
         "prev_tab" => kb.prev_tab = list,
@@ -401,6 +443,7 @@ fn apply_keybinding_field(
         "zoom_in" => kb.zoom_in = list,
         "zoom_out" => kb.zoom_out = list,
         "zoom_reset" => kb.zoom_reset = list,
+        "command_palette" => kb.command_palette = list,
         "settings" => kb.settings = list,
         "new_window" => kb.new_window = list,
         "word_left" => kb.word_left = list,
@@ -486,5 +529,24 @@ fn seed_theme_config(preset_name: &str) -> scribe_common::config::ThemeConfig {
         selection: rgba_to_hex(theme.selection),
         selection_foreground: rgba_to_hex(theme.selection_foreground),
         colors,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_config_key;
+
+    #[test]
+    fn applies_codex_integration_toggle() {
+        let mut config = scribe_common::config::ScribeConfig::default();
+
+        apply_config_key(
+            &mut config,
+            "terminal.codex_code_integration",
+            &serde_json::Value::Bool(false),
+        )
+        .expect("codex toggle should apply");
+
+        assert!(!config.terminal.codex_code_integration);
     }
 }

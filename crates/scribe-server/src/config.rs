@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
+use scribe_common::config::UpdateConfig;
 use scribe_common::error::ScribeError;
 
 /// Maximum allowed scrollback lines to prevent excessive memory use.
@@ -10,11 +11,20 @@ const MAX_SCROLLBACK_LINES: u32 = 100_000;
 pub struct ScribeConfig {
     pub workspace_roots: Vec<PathBuf>,
     pub scrollback_lines: u32,
+    pub shell_integration_enabled: bool,
+    pub hide_codex_hook_logs: bool,
+    pub update: UpdateConfig,
 }
 
 impl Default for ScribeConfig {
     fn default() -> Self {
-        Self { workspace_roots: Vec::new(), scrollback_lines: 10_000 }
+        Self {
+            workspace_roots: Vec::new(),
+            scrollback_lines: 10_000,
+            shell_integration_enabled: true,
+            hide_codex_hook_logs: false,
+            update: UpdateConfig::default(),
+        }
     }
 }
 
@@ -46,9 +56,22 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
     }
     let scrollback_lines = raw_scrollback.min(MAX_SCROLLBACK_LINES);
 
-    info!(roots = workspace_roots.len(), scrollback_lines, "server config loaded");
+    let shell_integration_enabled = full.terminal.shell_integration.enabled;
+    let hide_codex_hook_logs = full.terminal.hide_codex_hook_logs;
+    let update = full.update;
 
-    Ok(ScribeConfig { workspace_roots, scrollback_lines })
+    info!(
+        roots = workspace_roots.len(),
+        scrollback_lines, hide_codex_hook_logs, "server config loaded"
+    );
+
+    Ok(ScribeConfig {
+        workspace_roots,
+        scrollback_lines,
+        shell_integration_enabled,
+        hide_codex_hook_logs,
+        update,
+    })
 }
 
 fn expand_tilde(path: &str) -> PathBuf {

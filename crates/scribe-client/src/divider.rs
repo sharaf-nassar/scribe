@@ -3,6 +3,7 @@
 //! Dividers are 1px lines between adjacent panes, rendered as solid-colour
 //! quads (no glyph atlas — `uv_min == uv_max == [0,0]`).
 
+use scribe_common::config::ContentPadding;
 use scribe_renderer::chrome::solid_quad;
 use scribe_renderer::types::CellInstance;
 
@@ -49,6 +50,57 @@ pub fn collect_dividers(node: &LayoutNode, viewport: Rect) -> Vec<Divider> {
     out
 }
 
+/// Apply viewport padding insets to divider edges that touch the viewport boundary.
+///
+/// Horizontal dividers (`SplitDirection::Vertical`) have their left/right edges inset
+/// by `padding.left`/`padding.right` when they coincide with the viewport boundary.
+/// Vertical dividers (`SplitDirection::Horizontal`) are clipped below the tab bar and
+/// have their top/bottom edges inset when they coincide with the viewport boundary.
+pub fn apply_viewport_insets(
+    dividers: &mut [Divider],
+    viewport: Rect,
+    padding: &ContentPadding,
+    tab_bar_height: f32,
+) {
+    for d in dividers.iter_mut() {
+        match d.direction {
+            SplitDirection::Vertical => {
+                // Horizontal line: inset left/right edges at viewport boundary.
+                let vp_right = viewport.x + viewport.width;
+                let d_right = d.rect.x + d.rect.width;
+                if (d.rect.x - viewport.x).abs() < 0.5 {
+                    d.rect.x += padding.left;
+                    d.rect.width -= padding.left;
+                }
+                if (d_right - vp_right).abs() < 0.5 {
+                    d.rect.width -= padding.right;
+                }
+            }
+            SplitDirection::Horizontal => {
+                // Vertical line: clip below tab bar and inset top/bottom edges.
+                let content_top = viewport.y + tab_bar_height;
+                let vp_bottom = viewport.y + viewport.height;
+                let d_bottom = d.rect.y + d.rect.height;
+                // Clip top below tab bar.
+                if d.rect.y < content_top {
+                    let clip = content_top - d.rect.y;
+                    d.rect.y = content_top;
+                    d.rect.height = (d.rect.height - clip).max(0.0);
+                }
+                // Inset top edge if at content boundary.
+                if (d.rect.y - content_top).abs() < 0.5 {
+                    d.rect.y += padding.top;
+                    d.rect.height = (d.rect.height - padding.top).max(0.0);
+                }
+                // Inset bottom edge if at viewport boundary.
+                if (d_bottom - vp_bottom).abs() < 0.5 {
+                    d.rect.height = (d.rect.height - padding.bottom).max(0.0);
+                }
+            }
+        }
+    }
+}
+
 /// Hit-test: check if a mouse position hits any divider.
 ///
 /// Returns the matching `Divider` if found.
@@ -67,73 +119,24 @@ pub fn build_divider_instances(out: &mut Vec<CellInstance>, dividers: &[Divider]
     }
 }
 
-/// Build a 2px accent-coloured border on the focused pane's leading edge.
+/// Build a solid accent border around all four edges of a rectangle.
 ///
-/// For horizontal splits the border appears on the left edge; for vertical
-/// splits it appears on the top edge. If `split_direction` is `None` (the
-/// pane is the sole root), no border is emitted.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "step index is a small positive integer fitting in f32"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "border rendering needs rect, direction, color, width, and cell size"
-)]
-pub fn build_focus_border(
+/// Used for both focused pane borders and focused workspace borders.
+pub fn build_rect_border(
     out: &mut Vec<CellInstance>,
-    pane_rect: Rect,
-    split_direction: Option<SplitDirection>,
-    accent_color: [f32; 4],
-    border_width: f32,
-    cell_size: (f32, f32),
-) {
-    let Some(dir) = split_direction else { return };
-    let (cell_w, cell_h) = cell_size;
-
-    match dir {
-        SplitDirection::Horizontal => {
-            // Left edge: vertical stripe, border_width wide.
-            let steps = steps_for(pane_rect.height, cell_h);
-            for i in 0..steps {
-                let y = pane_rect.y + i as f32 * cell_h;
-                out.push(solid_quad(pane_rect.x, y, border_width, cell_h, accent_color));
-            }
-        }
-        SplitDirection::Vertical => {
-            // Top edge: horizontal stripe, border_width tall.
-            let steps = steps_for(pane_rect.width, cell_w);
-            for i in 0..steps {
-                let x = pane_rect.x + i as f32 * cell_w;
-                out.push(solid_quad(x, pane_rect.y, cell_w, border_width, accent_color));
-            }
-        }
-    }
-}
-
-/// Build a solid accent border around the entire focused workspace rect.
-///
-/// Draws four thin quads (top, bottom, left, right edges) so the focused
-/// workspace is visually distinct from unfocused siblings.
-pub fn build_workspace_focus_border(
-    out: &mut Vec<CellInstance>,
-    ws_rect: Rect,
+    rect: Rect,
     accent_color: [f32; 4],
     border_width: f32,
 ) {
     let t = border_width;
-    // Top edge
-    out.push(solid_quad(ws_rect.x, ws_rect.y, ws_rect.width, t, accent_color));
-    // Bottom edge
-    out.push(solid_quad(ws_rect.x, ws_rect.y + ws_rect.height - t, ws_rect.width, t, accent_color));
-    // Left edge (inset by t to avoid corner overlap)
-    out.push(solid_quad(ws_rect.x, ws_rect.y + t, t, ws_rect.height - t * 2.0, accent_color));
-    // Right edge (inset by t to avoid corner overlap)
+    out.push(solid_quad(rect.x, rect.y, rect.width, t, accent_color));
+    out.push(solid_quad(rect.x, rect.y + rect.height - t, rect.width, t, accent_color));
+    out.push(solid_quad(rect.x, rect.y + t, t, rect.height - t * 2.0, accent_color));
     out.push(solid_quad(
-        ws_rect.x + ws_rect.width - t,
-        ws_rect.y + t,
+        rect.x + rect.width - t,
+        rect.y + t,
         t,
-        ws_rect.height - t * 2.0,
+        rect.height - t * 2.0,
         accent_color,
     ));
 }
@@ -260,14 +263,4 @@ fn is_within_divider(divider: &Divider, mouse_x: f32, mouse_y: f32) -> bool {
 fn build_single_divider(instances: &mut Vec<CellInstance>, divider: &Divider, color: [f32; 4]) {
     let r = &divider.rect;
     instances.push(solid_quad(r.x, r.y, r.width, r.height, color));
-}
-
-/// Calculate how many cell-sized steps are needed to cover a pixel extent.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "extent / cell_size yields a small positive value fitting in usize"
-)]
-fn steps_for(extent: f32, cell_size: f32) -> usize {
-    if cell_size <= 0.0 { 0 } else { ((extent / cell_size).ceil() as usize).max(1) }
 }

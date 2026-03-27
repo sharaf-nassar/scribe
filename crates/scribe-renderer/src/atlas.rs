@@ -571,11 +571,11 @@ impl GlyphAtlas {
     /// Always uses `Shaping::Advanced` to enable ligature substitution.
     #[allow(
         clippy::cast_possible_truncation,
-        reason = "glyph x and w are cell-scale values that fit in u8 / usize"
+        reason = "glyph_span is a cell count that fits in u8; next_col is a column index that fits in usize"
     )]
     #[allow(
         clippy::cast_sign_loss,
-        reason = "glyph x/w are non-negative advance values from cosmic-text"
+        reason = "g.w is a non-negative advance width from cosmic-text"
     )]
     #[allow(
         clippy::fn_params_excessive_bools,
@@ -595,12 +595,17 @@ impl GlyphAtlas {
 
         let cell_w = self.cell_size.width;
         let mut glyphs = Vec::new();
+        // Track column position incrementally instead of dividing g.x by cell_w.
+        // The division-based approach accumulates floating-point drift across long
+        // runs — by column 50+, multiple glyphs round to the same index.
+        let mut next_col: usize = 0;
 
         for run in buf.layout_runs() {
             for g in run.glyphs {
                 let cache_key = g.physical((0.0, 0.0), 1.0).cache_key;
-                let col_offset = (g.x / cell_w).round().max(0.0) as usize;
-                let glyph_span = ((g.w / cell_w).ceil() as u8).max(1);
+                let glyph_span = ((g.w / cell_w).round() as u8).max(1);
+                let col_offset = next_col;
+                next_col += usize::from(glyph_span);
                 glyphs.push(ShapedRunGlyph { cache_key, col_offset, glyph_span });
             }
         }

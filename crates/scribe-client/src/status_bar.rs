@@ -20,8 +20,6 @@ pub struct StatusBarHitTargets {
     pub equalize_rect: Option<Rect>,
     /// Clickable rect for the settings gear icon.
     pub gear_rect: Option<Rect>,
-    /// Clickable rect for the driver robot icon.
-    pub robot_rect: Option<Rect>,
     /// Tooltip hover targets for each status bar segment.
     pub tooltip_targets: Vec<TooltipAnchor>,
 }
@@ -39,8 +37,10 @@ pub struct StatusBarData<'a> {
     pub git_branch: Option<&'a str>,
     /// Total number of active sessions in this window.
     pub session_count: usize,
-    /// System hostname.
-    pub hostname: &'a str,
+    /// Remote or local host label for the focused pane.
+    pub host_label: &'a str,
+    /// tmux session label for the focused pane when present.
+    pub tmux_label: Option<&'a str>,
     /// Current time string (e.g. "14:32").
     pub time: &'a str,
     pub sys_stats: Option<&'a SystemStats>,
@@ -135,7 +135,6 @@ pub fn build_status_bar(
         return StatusBarHitTargets {
             equalize_rect: None,
             gear_rect: None,
-            robot_rect: None,
             tooltip_targets: Vec::new(),
         };
     }
@@ -189,10 +188,10 @@ pub fn build_status_bar(
     let col = render_left_side(&mut w, colors, data, resolve_glyph, &mut tooltips);
     w.col = col;
 
-    let (equalize_rect, gear_rect, robot_rect) =
+    let (equalize_rect, gear_rect) =
         render_right_side(&mut w, colors, data, resolve_glyph, &mut tooltips);
 
-    StatusBarHitTargets { equalize_rect, gear_rect, robot_rect, tooltip_targets: tooltips }
+    StatusBarHitTargets { equalize_rect, gear_rect, tooltip_targets: tooltips }
 }
 
 /// Mutable writer state for emitting status bar characters.
@@ -319,27 +318,23 @@ fn render_left_side(
     w.col
 }
 
-/// Render the right side: git branch | session count | hostname | time | robot | equalize | gear.
+/// Render the right side: git branch | session count | tmux | host | time | equalize | gear.
 ///
-/// Returns `(equalize_rect, gear_rect, robot_rect)` — clickable rects for equalize, gear, and robot icons.
+/// Returns `(equalize_rect, gear_rect)` — clickable rects for equalize and gear icons.
 fn render_right_side(
     w: &mut BarWriter<'_>,
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
     tooltips: &mut Vec<TooltipAnchor>,
-) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
+) -> (Option<Rect>, Option<Rect>) {
     // +3 for the gear segment: " ⚙ " (space, gear, space)
     let gear_cols: usize = 3;
     // +2 for the equalize segment: " ⊞" (space, icon) — gear provides the trailing space
     let equalize_cols: usize = if data.show_equalize { 2 } else { 0 };
-    // +3 for the robot segment: " ◆ " (space, diamond, space)
-    let robot_cols: usize = 3;
     let segments = build_right_segments(data, colors);
-    let right_cols: usize = segments.iter().map(|s| s.text.chars().count()).sum::<usize>()
-        + equalize_cols
-        + gear_cols
-        + robot_cols;
+    let right_cols: usize =
+        segments.iter().map(|s| s.text.chars().count()).sum::<usize>() + equalize_cols + gear_cols;
     let right_start = w.max_cols.saturating_sub(right_cols + 1);
 
     w.pad_to(right_start, colors.text, colors.bg, resolve_glyph);
@@ -347,12 +342,6 @@ fn render_right_side(
     // Render segments tracking per-named-item rects for tooltips.
     let groups = build_segment_groups(data);
     render_right_segments_with_tooltips(w, colors.bg, resolve_glyph, &segments, tooltips, &groups);
-
-    // Robot icon: " ◆ " left of equalize and gear.
-    let robot_rect = render_robot(w, colors, resolve_glyph);
-    if let Some(r_rect) = robot_rect {
-        tooltips.push(TooltipAnchor { text: String::from("Driver (Ctrl+Shift+D)"), rect: r_rect });
-    }
 
     // Equalize icon: " ⊞" left of the gear, only when multiple workspaces exist.
     let equalize_rect = render_equalize(w, colors, data, resolve_glyph);
@@ -368,7 +357,7 @@ fn render_right_side(
 
     w.pad_to(w.max_cols, colors.text, colors.bg, resolve_glyph);
 
-    (equalize_rect, gear_rect, robot_rect)
+    (equalize_rect, gear_rect)
 }
 
 /// Build the `(tooltip_text, segment_count)` group list from `data`.
@@ -409,9 +398,16 @@ fn build_segment_groups(data: &StatusBarData<'_>) -> Vec<(String, usize)> {
         groups.push((String::from("Active sessions"), sep + 1));
     }
 
-    if !data.hostname.is_empty() {
+    if let Some(tmux_label) = data.tmux_label {
+        if !tmux_label.is_empty() {
+            let sep = usize::from(!groups.is_empty());
+            groups.push((String::from("tmux session"), sep + 1));
+        }
+    }
+
+    if !data.host_label.is_empty() {
         let sep = usize::from(!groups.is_empty());
-        groups.push((String::from("Hostname"), sep + 1));
+        groups.push((String::from("Host"), sep + 1));
     }
 
     if !data.time.is_empty() {
@@ -481,28 +477,6 @@ fn render_equalize(
     let eq_x = w.x_origin + eq_col as f32 * w.cell_w;
     let eq_width = (w.col - eq_col) as f32 * w.cell_w;
     Some(Rect { x: eq_x, y: w.bar_y, width: eq_width, height: w.bar_height })
-}
-
-/// Render the driver robot icon (◆) and return its clickable rect.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "column index is a small positive integer fitting in f32"
-)]
-fn render_robot(
-    w: &mut BarWriter<'_>,
-    colors: &StatusBarColors,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) -> Option<Rect> {
-    if w.col >= w.max_cols {
-        return None;
-    }
-    w.put(' ', colors.text, colors.bg, resolve_glyph);
-    let robot_col = w.col;
-    w.put('\u{25C6}', colors.accent, colors.bg, resolve_glyph);
-    w.put(' ', colors.text, colors.bg, resolve_glyph);
-    let robot_x = w.x_origin + robot_col as f32 * w.cell_w;
-    let robot_width = (w.col - robot_col) as f32 * w.cell_w;
-    Some(Rect { x: robot_x, y: w.bar_y, width: robot_width, height: w.bar_height })
 }
 
 /// Render the gear icon and return its clickable rect.
@@ -725,7 +699,7 @@ fn build_gpu_segments(stats: &SystemStats, colors: &StatusBarColors) -> Vec<Righ
     segs
 }
 
-/// Build the right-side text segments: stats, git branch, session count, hostname, time.
+/// Build the right-side text segments: stats, git branch, session count, tmux, host, time.
 fn build_right_segments(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<RightSegment> {
     let mut segs = Vec::new();
 
@@ -748,9 +722,14 @@ fn build_right_segments(data: &StatusBarData<'_>, colors: &StatusBarColors) -> V
         segs.push(RightSegment { text: label, color: colors.text });
     }
 
-    if !data.hostname.is_empty() {
+    if let Some(tmux_label) = data.tmux_label {
         push_sep(&mut segs, colors.separator);
-        segs.push(RightSegment { text: String::from(data.hostname), color: colors.text });
+        segs.push(RightSegment { text: format!("tmux:{tmux_label}"), color: colors.accent });
+    }
+
+    if !data.host_label.is_empty() {
+        push_sep(&mut segs, colors.separator);
+        segs.push(RightSegment { text: String::from(data.host_label), color: colors.text });
     }
 
     if !data.time.is_empty() {

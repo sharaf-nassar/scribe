@@ -4,12 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description.workspace = true
 
 [lints]
 workspace = true
 
 [dependencies]
 scribe-common.workspace = true
+scribe-pty.workspace = true
 scribe-renderer.workspace = true
 alacritty_terminal.workspace = true
 wgpu.workspace = true
@@ -33,6 +35,8 @@ sysinfo.workspace = true
 arboard = { version = "3", default-features = false, features = [
   "wayland-data-control",
 ] }
+x11rb.workspace = true
+raw-window-handle.workspace = true
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 arboard = { version = "3", default-features = false }

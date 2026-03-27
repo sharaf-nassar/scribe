@@ -26,7 +26,7 @@ pub enum KeyMatch {
 #[derive(Debug, Clone)]
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "three independent modifier flags (ctrl, shift, alt) are not a state machine"
+    reason = "four independent modifier flags (ctrl, shift, alt, super_key) are not a state machine"
 )]
 pub struct Keybinding {
     /// Whether the Ctrl modifier is required.
@@ -35,6 +35,8 @@ pub struct Keybinding {
     pub shift: bool,
     /// Whether the Alt modifier is required.
     pub alt: bool,
+    /// Whether the Super/Cmd modifier is required.
+    pub super_key: bool,
     /// The key that must be pressed.
     pub key: KeyMatch,
 }
@@ -55,11 +57,15 @@ pub struct Bindings {
     // Workspaces
     pub workspace_split_vertical: BindingSet,
     pub workspace_split_horizontal: BindingSet,
-    pub cycle_workspace: BindingSet,
+    pub workspace_focus_left: BindingSet,
+    pub workspace_focus_right: BindingSet,
+    pub workspace_focus_up: BindingSet,
+    pub workspace_focus_down: BindingSet,
 
     // Tabs
     pub new_tab: BindingSet,
     pub new_claude_tab: BindingSet,
+    pub new_claude_resume_tab: BindingSet,
     pub close_tab: BindingSet,
     pub next_tab: BindingSet,
     pub prev_tab: BindingSet,
@@ -83,6 +89,8 @@ pub struct Bindings {
     pub scroll_top: BindingSet,
     pub scroll_bottom: BindingSet,
     pub find: BindingSet,
+    pub prompt_jump_up: BindingSet,
+    pub prompt_jump_down: BindingSet,
 
     // View
     pub zoom_in: BindingSet,
@@ -93,8 +101,8 @@ pub struct Bindings {
     pub new_window: BindingSet,
 
     // General
+    pub command_palette: BindingSet,
     pub settings: BindingSet,
-    pub driver: BindingSet,
 
     // Terminal shortcuts (send escape sequences to PTY)
     pub word_left: BindingSet,
@@ -114,6 +122,7 @@ impl Keybinding {
         let mut ctrl = false;
         let mut shift = false;
         let mut alt = false;
+        let mut super_key = false;
         let mut key_part: Option<String> = None;
 
         for part in s.split('+') {
@@ -122,6 +131,7 @@ impl Keybinding {
                 "ctrl" => ctrl = true,
                 "shift" => shift = true,
                 "alt" => alt = true,
+                "cmd" | "super" => super_key = true,
                 _ => key_part = Some(lower),
             }
         }
@@ -145,7 +155,7 @@ impl Keybinding {
             _ => return None,
         };
 
-        Some(Self { ctrl, shift, alt, key })
+        Some(Self { ctrl, shift, alt, super_key, key })
     }
 
     /// Returns `true` if `event` with `modifiers` matches this keybinding.
@@ -156,6 +166,7 @@ impl Keybinding {
         if self.ctrl != modifiers.control_key()
             || self.shift != modifiers.shift_key()
             || self.alt != modifiers.alt_key()
+            || self.super_key != modifiers.super_key()
         {
             return false;
         }
@@ -196,11 +207,15 @@ impl Bindings {
             // Workspaces
             workspace_split_vertical: parse_set(&config.workspace_split_vertical),
             workspace_split_horizontal: parse_set(&config.workspace_split_horizontal),
-            cycle_workspace: parse_set(&config.cycle_workspace),
+            workspace_focus_left: parse_set(&config.workspace_focus_left),
+            workspace_focus_right: parse_set(&config.workspace_focus_right),
+            workspace_focus_up: parse_set(&config.workspace_focus_up),
+            workspace_focus_down: parse_set(&config.workspace_focus_down),
 
             // Tabs
             new_tab: parse_set(&config.new_tab),
             new_claude_tab: parse_set(&config.new_claude_tab),
+            new_claude_resume_tab: parse_set(&config.new_claude_resume_tab),
             close_tab: parse_set(&config.close_tab),
             next_tab: parse_set(&config.next_tab),
             prev_tab: parse_set(&config.prev_tab),
@@ -224,6 +239,8 @@ impl Bindings {
             scroll_top: parse_set(&config.scroll_top),
             scroll_bottom: parse_set(&config.scroll_bottom),
             find: parse_set(&config.find),
+            prompt_jump_up: parse_set(&config.prompt_jump_up),
+            prompt_jump_down: parse_set(&config.prompt_jump_down),
 
             // View
             zoom_in: parse_set(&config.zoom_in),
@@ -234,8 +251,8 @@ impl Bindings {
             new_window: parse_set(&config.new_window),
 
             // General
+            command_palette: parse_set(&config.command_palette),
             settings: parse_set(&config.settings),
-            driver: parse_set(&config.driver),
 
             // Terminal shortcuts
             word_left: parse_set(&config.word_left),
@@ -293,14 +310,22 @@ pub enum LayoutAction {
     WorkspaceSplitVertical,
     /// Split the window to create a workspace top/bottom.
     WorkspaceSplitHorizontal,
-    /// Cycle focus to the next workspace.
-    CycleWorkspaceFocus,
+    /// Move focus to the workspace on the left.
+    WorkspaceFocusLeft,
+    /// Move focus to the workspace on the right.
+    WorkspaceFocusRight,
+    /// Move focus to the workspace above.
+    WorkspaceFocusUp,
+    /// Move focus to the workspace below.
+    WorkspaceFocusDown,
 
     // Tabs
     /// Create a new tab in the focused workspace.
     NewTab,
-    /// Open a new tab running Claude Code in the focused workspace.
+    /// Open a new tab running the selected AI CLI in the focused workspace.
     NewClaudeTab,
+    /// Open a new tab resuming the selected AI CLI in the focused workspace.
+    NewClaudeResumeTab,
     /// Close the active tab in the focused workspace.
     CloseTab,
     /// Switch to the next tab.
@@ -329,6 +354,10 @@ pub enum LayoutAction {
     ScrollTop,
     /// Scroll to the bottom (live view).
     ScrollBottom,
+    /// Jump to the previous prompt mark.
+    PromptJumpUp,
+    /// Jump to the next prompt mark.
+    PromptJumpDown,
 
     // View
     /// Increase the font size.
@@ -348,8 +377,8 @@ pub enum KeyAction {
     Layout(LayoutAction),
     /// Open the settings window.
     OpenSettings,
-    /// Open the driver window.
-    OpenDriver,
+    /// Open the command palette overlay.
+    OpenCommandPalette,
     /// Open the find-in-scrollback overlay.
     OpenFind,
 }
@@ -372,12 +401,12 @@ pub fn translate_key_action(
         return Some(KeyAction::Layout(action));
     }
 
-    if any_matches(&bindings.settings, event, modifiers) {
-        return Some(KeyAction::OpenSettings);
+    if any_matches(&bindings.command_palette, event, modifiers) {
+        return Some(KeyAction::OpenCommandPalette);
     }
 
-    if any_matches(&bindings.driver, event, modifiers) {
-        return Some(KeyAction::OpenDriver);
+    if any_matches(&bindings.settings, event, modifiers) {
+        return Some(KeyAction::OpenSettings);
     }
 
     if any_matches(&bindings.find, event, modifiers) {
@@ -459,8 +488,17 @@ fn translate_layout_shortcut(
     if any_matches(&bindings.workspace_split_horizontal, event, modifiers) {
         return Some(LayoutAction::WorkspaceSplitHorizontal);
     }
-    if any_matches(&bindings.cycle_workspace, event, modifiers) {
-        return Some(LayoutAction::CycleWorkspaceFocus);
+    if any_matches(&bindings.workspace_focus_left, event, modifiers) {
+        return Some(LayoutAction::WorkspaceFocusLeft);
+    }
+    if any_matches(&bindings.workspace_focus_right, event, modifiers) {
+        return Some(LayoutAction::WorkspaceFocusRight);
+    }
+    if any_matches(&bindings.workspace_focus_up, event, modifiers) {
+        return Some(LayoutAction::WorkspaceFocusUp);
+    }
+    if any_matches(&bindings.workspace_focus_down, event, modifiers) {
+        return Some(LayoutAction::WorkspaceFocusDown);
     }
 
     // Window
@@ -471,6 +509,9 @@ fn translate_layout_shortcut(
     // Tabs
     if any_matches(&bindings.new_claude_tab, event, modifiers) {
         return Some(LayoutAction::NewClaudeTab);
+    }
+    if any_matches(&bindings.new_claude_resume_tab, event, modifiers) {
+        return Some(LayoutAction::NewClaudeResumeTab);
     }
     if any_matches(&bindings.new_tab, event, modifiers) {
         return Some(LayoutAction::NewTab);
@@ -533,6 +574,12 @@ fn translate_layout_shortcut(
     if any_matches(&bindings.scroll_bottom, event, modifiers) {
         return Some(LayoutAction::ScrollBottom);
     }
+    if any_matches(&bindings.prompt_jump_up, event, modifiers) {
+        return Some(LayoutAction::PromptJumpUp);
+    }
+    if any_matches(&bindings.prompt_jump_down, event, modifiers) {
+        return Some(LayoutAction::PromptJumpDown);
+    }
 
     // View
     if any_matches(&bindings.zoom_in, event, modifiers) {
@@ -591,6 +638,12 @@ fn translate_terminal_shortcut(
 /// - Alt+char → ESC + character bytes
 /// - No relevant modifiers → raw character bytes
 fn translate_character_with_modifiers(c: &str, modifiers: ModifiersState) -> Option<Vec<u8>> {
+    // Drop Cmd/Super combos that didn't match any binding — on macOS these are
+    // OS-level shortcuts and sending raw chars to the PTY would be wrong.
+    if modifiers.super_key() {
+        return None;
+    }
+
     let ctrl = modifiers.control_key();
     let alt = modifiers.alt_key();
 
@@ -644,6 +697,12 @@ fn char_to_control_byte(c: &str) -> Option<u8> {
     reason = "comprehensive named key table is inherently long but each arm is trivial"
 )]
 fn translate_named_with_modifiers(named: NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
+    // Drop Cmd/Super combos that didn't match any binding — on macOS these are
+    // OS-level shortcuts and sending wrong PTY sequences would be incorrect.
+    if modifiers.super_key() {
+        return None;
+    }
+
     // Special keys that don't use standard xterm modifier encoding.
     match named {
         NamedKey::Backspace => {

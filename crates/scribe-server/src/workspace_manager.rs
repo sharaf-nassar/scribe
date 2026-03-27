@@ -622,8 +622,16 @@ mod tests {
         let tree = WorkspaceTreeNode::Split {
             direction: LayoutDirection::Vertical,
             ratio: 0.4,
-            first: Box::new(WorkspaceTreeNode::Leaf { workspace_id: ws_a, session_ids: vec![] }),
-            second: Box::new(WorkspaceTreeNode::Leaf { workspace_id: ws_b, session_ids: vec![] }),
+            first: Box::new(WorkspaceTreeNode::Leaf {
+                workspace_id: ws_a,
+                session_ids: vec![],
+                pane_trees: vec![],
+            }),
+            second: Box::new(WorkspaceTreeNode::Leaf {
+                workspace_id: ws_b,
+                session_ids: vec![],
+                pane_trees: vec![],
+            }),
         };
         mgr.set_workspace_tree(tree);
 

@@ -17,6 +17,8 @@ pub enum ContextMenuAction {
     SelectAll,
     /// Open the given URL.
     OpenUrl(String),
+    /// Open the given file path.
+    OpenFile(String),
 }
 
 /// A single item in the context menu.
@@ -44,8 +46,15 @@ impl ContextMenu {
     /// Build a context menu at `(x, y)`.
     ///
     /// Items are populated based on the current state: `has_selection`
-    /// enables Copy, and `url` appends an "Open URL" item when present.
-    pub fn new(x: f32, y: f32, has_selection: bool, url: Option<String>) -> Self {
+    /// enables Copy, `url` appends an "Open URL" item when present, and
+    /// `file_path` appends an "Open File" item when present.
+    pub fn new(
+        x: f32,
+        y: f32,
+        has_selection: bool,
+        url: Option<String>,
+        file_path: Option<String>,
+    ) -> Self {
         let mut items = vec![
             MenuItem {
                 label: String::from("Copy"),
@@ -68,6 +77,14 @@ impl ContextMenu {
             items.push(MenuItem {
                 label: String::from("Open URL"),
                 action: ContextMenuAction::OpenUrl(u),
+                enabled: true,
+            });
+        }
+
+        if let Some(p) = file_path {
+            items.push(MenuItem {
+                label: String::from("Open File"),
+                action: ContextMenuAction::OpenFile(p),
                 enabled: true,
             });
         }
@@ -140,10 +157,11 @@ impl ContextMenu {
         // Height: each item is 2 cell rows (0.5 top pad + 1 label + 0.5 bottom pad).
         // We approximate this as 2 rows per item.
         let item_rows: usize = 2;
-        let has_url_item =
-            self.items.iter().any(|item| matches!(item.action, ContextMenuAction::OpenUrl(_)));
-        // Extra row for separator before URL item.
-        let separator_rows: usize = usize::from(has_url_item);
+        let has_open_item = self.items.iter().any(|item| {
+            matches!(item.action, ContextMenuAction::OpenUrl(_) | ContextMenuAction::OpenFile(_))
+        });
+        // Extra row for separator before the first open (URL/file) item.
+        let separator_rows: usize = usize::from(has_open_item);
         let total_rows = self.items.len() * item_rows + separator_rows;
 
         #[allow(
@@ -194,9 +212,12 @@ impl ContextMenu {
 
         let mut row: usize = 0;
         for (idx, item) in self.items.iter().enumerate() {
-            // Insert separator before the URL item.
-            let is_url = matches!(item.action, ContextMenuAction::OpenUrl(_));
-            if is_url && has_url_item {
+            // Insert separator before the first open (URL or file) item.
+            let is_open_item = matches!(
+                item.action,
+                ContextMenuAction::OpenUrl(_) | ContextMenuAction::OpenFile(_)
+            );
+            if is_open_item && has_open_item {
                 #[allow(
                     clippy::cast_precision_loss,
                     reason = "row is a small positive integer fitting in f32"

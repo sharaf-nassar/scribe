@@ -146,6 +146,14 @@ impl LayoutTree {
         Self { root: LayoutNode::Leaf(id), initial_pane: id }
     }
 
+    /// Construct a layout tree from a pre-built root node.
+    ///
+    /// `initial_pane` should be the `PaneId` of the first leaf in depth-first
+    /// order (used as the default focused pane when no other pane is selected).
+    pub fn from_root(root: LayoutNode, initial_pane: PaneId) -> Self {
+        Self { root, initial_pane }
+    }
+
     /// Return a reference to the root node.
     pub const fn root(&self) -> &LayoutNode {
         &self.root
@@ -201,13 +209,6 @@ impl LayoutTree {
         collect_leaves(&self.root)
     }
 
-    /// Find the direction of the nearest parent split that contains `pane_id`.
-    ///
-    /// Returns `None` when the pane is the sole root leaf (no split exists).
-    pub fn parent_split_direction(&self, pane_id: PaneId) -> Option<SplitDirection> {
-        parent_split_direction_inner(&self.root, pane_id)
-    }
-
     /// Find the split containing `pane_id` and adjust its ratio.
     ///
     /// Returns `true` if the pane was found and the ratio was adjusted.
@@ -231,11 +232,22 @@ impl LayoutTree {
         equalize_node(&mut self.root);
     }
 
+    /// Swap the positions of two leaf panes in the tree.
+    ///
+    /// Uses a three-pass sentinel approach to avoid double-mutable-borrow:
+    /// replace `a` with a sentinel, replace `b` with `a`, replace sentinel
+    /// with `b`. Returns `true` if both panes were found and swapped.
+    pub fn swap_panes(&mut self, a: PaneId, b: PaneId) -> bool {
+        swap_panes_in(&mut self.root, a, b)
+    }
+
     /// Find the nearest pane in the given direction from `current`.
     ///
     /// Uses the precomputed `rects` (as returned by [`Self::compute_rects`])
-    /// to determine spatial adjacency. Returns `None` when no pane exists in
-    /// the requested direction or `current` is not present in `rects`.
+    /// to determine spatial adjacency. If no pane exists in the requested
+    /// direction, focus wraps to the opposite edge while preserving
+    /// perpendicular-axis overlap. Returns `None` only when no matching pane
+    /// exists or `current` is not present in `rects`.
     #[allow(
         clippy::unused_self,
         reason = "method semantically belongs to LayoutTree even though rects are pre-computed"
@@ -248,6 +260,7 @@ impl LayoutTree {
     ) -> Option<PaneId> {
         let current_rect = rects.iter().find(|(id, _, _)| *id == current).map(|(_, r, _)| r)?;
         best_candidate_in_direction(*current_rect, current, direction, rects)
+            .or_else(|| wrapped_candidate_in_direction(*current_rect, current, direction, rects))
     }
 }
 
@@ -418,29 +431,6 @@ fn cycle_pane(leaves: &[PaneId], current: PaneId) -> PaneId {
     )
 }
 
-/// Recursively find the nearest parent split that contains `target` as
-/// a descendant and return its direction.
-fn parent_split_direction_inner(node: &LayoutNode, target: PaneId) -> Option<SplitDirection> {
-    let LayoutNode::Split { direction, first, second, .. } = node else {
-        return None;
-    };
-
-    // Check whether the target lives somewhere in either subtree.
-    if contains_pane(first, target) || contains_pane(second, target) {
-        // Prefer a deeper match first (the nearest ancestor).
-        if let Some(dir) = parent_split_direction_inner(first, target) {
-            return Some(dir);
-        }
-        if let Some(dir) = parent_split_direction_inner(second, target) {
-            return Some(dir);
-        }
-        // No deeper split contains the target — this node is the nearest.
-        return Some(*direction);
-    }
-
-    None
-}
-
 /// Check whether `node` contains a leaf with `target`.
 fn contains_pane(node: &LayoutNode, target: PaneId) -> bool {
     match node {
@@ -523,6 +513,33 @@ fn equalize_node(node: &mut LayoutNode) {
     equalize_node(second);
 }
 
+/// Sentinel `PaneId` used internally by `swap_panes_in`.
+const SWAP_SENTINEL: PaneId = PaneId(u32::MAX);
+
+/// Swap two leaf panes using a three-pass sentinel technique.
+fn swap_panes_in(node: &mut LayoutNode, a: PaneId, b: PaneId) -> bool {
+    // Pass 1: replace `a` with the sentinel.
+    replace_pane_id(node, a, SWAP_SENTINEL);
+    // Pass 2: replace `b` with `a`.
+    replace_pane_id(node, b, a);
+    // Pass 3: replace sentinel with `b`.
+    replace_pane_id(node, SWAP_SENTINEL, b);
+    // If the sentinel is gone, both panes were found and swapped.
+    !contains_pane(node, SWAP_SENTINEL)
+}
+
+/// Recursively replace every leaf whose `PaneId` equals `target` with `replacement`.
+fn replace_pane_id(node: &mut LayoutNode, target: PaneId, replacement: PaneId) {
+    match node {
+        LayoutNode::Leaf(id) if *id == target => *id = replacement,
+        LayoutNode::Leaf(_) => {}
+        LayoutNode::Split { first, second, .. } => {
+            replace_pane_id(first, target, replacement);
+            replace_pane_id(second, target, replacement);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Directional focus helpers
 // ---------------------------------------------------------------------------
@@ -601,4 +618,144 @@ fn best_candidate_in_direction(
         }
     }
     best.map(|(id, _)| id)
+}
+
+fn wrapped_candidate_in_direction(
+    current_rect: Rect,
+    current_id: PaneId,
+    direction: FocusDirection,
+    rects: &[(PaneId, Rect, PaneEdges)],
+) -> Option<PaneId> {
+    let viewport = rect_bounds(rects)?;
+    let mut best: Option<(PaneId, f32)> = None;
+    for &(id, rect, _) in rects {
+        if id == current_id {
+            continue;
+        }
+        let Some(dist) = wrapped_candidate_distance(current_rect, rect, direction, viewport) else {
+            continue;
+        };
+        if best.is_none_or(|(_, best_dist)| dist < best_dist) {
+            best = Some((id, dist));
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+fn rect_bounds(rects: &[(PaneId, Rect, PaneEdges)]) -> Option<Rect> {
+    let &(_, first, _) = rects.first()?;
+    let mut min_x = first.x;
+    let mut min_y = first.y;
+    let mut max_x = first.x + first.width;
+    let mut max_y = first.y + first.height;
+
+    for &(_, rect, _) in rects.iter().skip(1) {
+        min_x = min_x.min(rect.x);
+        min_y = min_y.min(rect.y);
+        max_x = max_x.max(rect.x + rect.width);
+        max_y = max_y.max(rect.y + rect.height);
+    }
+
+    Some(Rect { x: min_x, y: min_y, width: max_x - min_x, height: max_y - min_y })
+}
+
+fn wrapped_candidate_distance(
+    current: Rect,
+    candidate: Rect,
+    direction: FocusDirection,
+    viewport: Rect,
+) -> Option<f32> {
+    let viewport_right = viewport.x + viewport.width;
+    let viewport_bottom = viewport.y + viewport.height;
+
+    match direction {
+        FocusDirection::Right => {
+            let y_overlap = ranges_overlap(
+                current.y,
+                current.y + current.height,
+                candidate.y,
+                candidate.y + candidate.height,
+            );
+            y_overlap.then_some(candidate.x - viewport.x)
+        }
+        FocusDirection::Left => {
+            let y_overlap = ranges_overlap(
+                current.y,
+                current.y + current.height,
+                candidate.y,
+                candidate.y + candidate.height,
+            );
+            y_overlap.then_some(viewport_right - (candidate.x + candidate.width))
+        }
+        FocusDirection::Down => {
+            let x_overlap = ranges_overlap(
+                current.x,
+                current.x + current.width,
+                candidate.x,
+                candidate.x + candidate.width,
+            );
+            x_overlap.then_some(candidate.y - viewport.y)
+        }
+        FocusDirection::Up => {
+            let x_overlap = ranges_overlap(
+                current.x,
+                current.x + current.width,
+                candidate.x,
+                candidate.x + candidate.width,
+            );
+            x_overlap.then_some(viewport_bottom - (candidate.y + candidate.height))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type PaneRect = (PaneId, Rect, PaneEdges);
+    type ThreePaneRow = (LayoutTree, PaneId, PaneId, PaneId, Vec<PaneRect>);
+
+    fn three_pane_row() -> ThreePaneRow {
+        let pane_a = PaneId::from_raw(1);
+        let pane_b = PaneId::from_raw(2);
+        let pane_c = PaneId::from_raw(3);
+        let layout = LayoutTree::from_root(
+            LayoutNode::Split {
+                direction: SplitDirection::Horizontal,
+                ratio: 2.0 / 3.0,
+                first: Box::new(LayoutNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(LayoutNode::Leaf(pane_a)),
+                    second: Box::new(LayoutNode::Leaf(pane_b)),
+                }),
+                second: Box::new(LayoutNode::Leaf(pane_c)),
+            },
+            pane_a,
+        );
+        let rects = layout.compute_rects(Rect { x: 0.0, y: 0.0, width: 150.0, height: 100.0 });
+        (layout, pane_a, pane_b, pane_c, rects)
+    }
+
+    #[test]
+    fn directional_focus_wraps_right_to_leftmost_overlapping_pane() {
+        let (layout, pane_a, _, pane_c, rects) = three_pane_row();
+        assert_eq!(
+            layout.find_pane_in_direction(pane_c, FocusDirection::Right, &rects),
+            Some(pane_a)
+        );
+    }
+
+    #[test]
+    fn directional_focus_prefers_direct_neighbor_before_wrapping() {
+        let (layout, _, pane_b, pane_c, rects) = three_pane_row();
+        assert_eq!(
+            layout.find_pane_in_direction(pane_b, FocusDirection::Right, &rects),
+            Some(pane_c)
+        );
+    }
 }

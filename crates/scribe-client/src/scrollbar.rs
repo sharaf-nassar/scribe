@@ -216,6 +216,10 @@ fn compute_thumb(pane: &Pane, scrollbar_width: f32, tab_bar_height: f32) -> Opti
 ///
 /// Does nothing if the pane has no scrollback or the scrollbar is invisible.
 /// Mutably borrows `pane` to update width animation targets.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "grid dimensions and mark positions are small positive integers fitting in f32"
+)]
 pub fn build_scrollbar_instances(
     out: &mut Vec<CellInstance>,
     pane: &mut Pane,
@@ -252,6 +256,23 @@ pub fn build_scrollbar_instances(
 
     let corner_radius = animated_width / 2.0;
     out.push(rounded_quad(thumb.x, thumb.y, thumb.width, thumb.height, color, corner_radius));
+
+    // Render prompt mark indicators on the scrollbar track.
+    if !pane.prompt_marks.is_empty() {
+        let history_size = pane.term.grid().history_size();
+        let screen_lines = pane.term.grid().screen_lines();
+        let total = (history_size + screen_lines) as f32;
+        let mark_height = 2.0_f32;
+        let mark_color = [0.6, 0.6, 0.8, alpha * 0.6];
+        for &mark_abs in &pane.prompt_marks {
+            let ratio = mark_abs as f32 / total;
+            // Clamp so that stale abs_pos values (from before a resize shrinks
+            // scrollback) cannot produce ratio > 1.0 and render outside the track.
+            let mark_y = (thumb.track_top + ratio * thumb.track_height)
+                .clamp(thumb.track_top, thumb.track_top + thumb.track_height - mark_height);
+            out.push(rounded_quad(thumb.x, mark_y, animated_width, mark_height, mark_color, 1.0));
+        }
+    }
 }
 
 /// Hit-test whether a point is within the scrollbar hit zone of a pane.

@@ -30,3 +30,11 @@ test-output/
 .qbuild-lock.*
 .claude
 
+.mcp.json
+
+# lat.md cache (generated embeddings)
+lat.md/.cache/
+
+node_modules/
+
+.codex

@@ -1,11 +1,117 @@
 #!/bin/bash
 set -e
 
+# binary_changed PID INSTALLED_PATH
+# Returns 0 (true) if the binary changed or comparison failed, 1 (false) if unchanged.
+# Safety-first: any failure to compare treats as changed.
+binary_changed() {
+    local pid="$1" installed="$2"
+    local old_hash="" new_hash=""
+    if [ -n "$pid" ] && [ -f "/proc/$pid/exe" ]; then
+        old_hash="$(sha256sum "/proc/$pid/exe" 2>/dev/null | cut -d' ' -f1 || true)"
+        new_hash="$(sha256sum "$installed" 2>/dev/null | cut -d' ' -f1 || true)"
+    fi
+    # If both hashes are non-empty and equal, binary is unchanged
+    if [ -n "$old_hash" ] && [ -n "$new_hash" ] && [ "$old_hash" = "$new_hash" ]; then
+        return 1  # unchanged
+    fi
+    return 0  # changed (or comparison failed — treat as changed for safety)
+}
+
+run_user_systemctl() {
+    if [ -n "$SUDO_UID" ]; then
+        sudo -u "#${SUDO_UID}" \
+            XDG_RUNTIME_DIR="$XDG_DIR" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
+            systemctl --user "$@" 2>/dev/null
+    else
+        systemctl --user "$@" 2>/dev/null
+    fi
+}
+
+ensure_state_dir() {
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    chmod 0700 "$STATE_DIR" 2>/dev/null || true
+    chown "${TARGET_UID}:${TARGET_UID}" "$STATE_DIR" 2>/dev/null || true
+}
+
+launch_user_binary() {
+    local binary="$1"
+
+    if [ -n "$SUDO_UID" ]; then
+        sudo -u "#${SUDO_UID}" \
+            ${DISPLAY:+"DISPLAY=$DISPLAY"} \
+            ${WAYLAND_DISPLAY:+"WAYLAND_DISPLAY=$WAYLAND_DISPLAY"} \
+            XDG_RUNTIME_DIR="$XDG_DIR" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
+            nohup "$binary" >/dev/null 2>&1 &
+    else
+        nohup "$binary" >/dev/null 2>&1 &
+    fi
+}
+
+cold_restart_server() {
+    # A detached `scribe-server --upgrade` is not the systemd unit's main PID,
+    # so `systemctl restart` alone can leave it behind holding the singleton
+    # lock and IPC socket. Stop the unit, kill any surviving server processes,
+    # clear stale sockets, then start the fresh unit.
+    run_user_systemctl daemon-reload || true
+    run_user_systemctl stop scribe-server || true
+
+    pkill -u "$TARGET_UID" -x scribe-server 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        pgrep -u "$TARGET_UID" -x scribe-server >/dev/null 2>&1 || break
+        sleep 0.2
+    done
+    if pgrep -u "$TARGET_UID" -x scribe-server >/dev/null 2>&1; then
+        pkill -9 -u "$TARGET_UID" -x scribe-server 2>/dev/null || true
+        sleep 0.2
+    fi
+
+    rm -f "$SOCK" "${XDG_DIR}/scribe/handoff.sock" 2>/dev/null || true
+
+    run_user_systemctl reset-failed scribe-server || true
+    if run_user_systemctl start scribe-server; then
+        return 0
+    fi
+    return 1
+}
+
+restart_singleton_binary() {
+    local label="$1"
+    local pid="$2"
+    local binary="$3"
+
+    echo "  Relaunching ${label}..."
+    kill "$pid" 2>/dev/null || true
+
+    for _ in 1 2 3 4 5; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.2
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+        sleep 0.2
+    fi
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "  ✗ Could not stop ${label}; leaving the existing instance running."
+        return 1
+    fi
+
+    launch_user_binary "$binary"
+}
+
 case "$1" in
     configure)
         TARGET_UID="${SUDO_UID:-$(id -u)}"
-        SOCK="/run/user/${TARGET_UID}/scribe/server.sock"
         XDG_DIR="/run/user/${TARGET_UID}"
+        STATE_DIR="/run/user/${TARGET_UID}/scribe"
+        SOCK="${STATE_DIR}/server.sock"
+
+        ensure_state_dir
+        run_user_systemctl daemon-reload || true
 
         # Check for a running server process, not just a stale socket file
         SERVER_RUNNING=0
@@ -14,145 +120,174 @@ case "$1" in
         fi
 
         if [ "$SERVER_RUNNING" = "1" ]; then
-            # Upgrade: server is running — launch hot-reload in background.
-            # The --upgrade process takes over from the old server (receives
-            # PTY fds, starts serving). We run it in the background because
-            # it continues running as the new server after handoff.
-            echo ""
-            echo "Scribe server is running. Starting hot-reload..."
-
             UPGRADE_BIN="/usr/bin/scribe-server"
-            # Use mktemp instead of predictable /tmp paths to prevent
-            # TOCTOU symlink attacks from other local users.
-            UPGRADE_LOG=$(mktemp /run/user/"${TARGET_UID}"/scribe/upgrade-log.XXXXXX) || \
-                UPGRADE_LOG=$(mktemp)
-            # mktemp runs as root; chown so the user subprocess can write.
-            chown "${TARGET_UID}" "${UPGRADE_LOG}" 2>/dev/null || true
+            SERVER_READY=1
+            SERVER_COLD_RESTARTED=0
 
-            # Launch the upgrade server detached from sudo.
-            #
-            # Plain `sudo -u user server &` makes sudo wait for the
-            # long-lived server child — it never exits, leaving zombie
-            # sudo processes after every install.  Using `sh -c '... &'`
-            # backgrounds the server *inside* the sh, so sh exits
-            # immediately, sudo exits, and the server is reparented to
-            # init.  The PID is captured via stdout.
-            if [ -n "$SUDO_UID" ]; then
-                UPGRADE_PID=$(sudo -u "#${SUDO_UID}" sh -c '
-                    "$1" --upgrade >"$2" 2>&1 &
-                    echo $!
-                ' _ "${UPGRADE_BIN}" "${UPGRADE_LOG}")
+            # Compare the newly installed binary against the running one.
+            # /proc/PID/exe still points to the old (deleted) binary on disk;
+            # the kernel keeps it readable until the process exits.
+            SERVER_PID="$(pgrep -u "$TARGET_UID" -x scribe-server | sort -n | head -1)"
+
+            if ! binary_changed "$SERVER_PID" "$UPGRADE_BIN"; then
+                echo ""
+                echo "  Server binary unchanged — skipping server restart."
             else
-                "${UPGRADE_BIN}" --upgrade >"${UPGRADE_LOG}" 2>&1 &
-                UPGRADE_PID=$!
-            fi
+                # Server binary changed — launch hot-reload in background.
+                # The --upgrade process takes over from the old server (receives
+                # PTY fds, starts serving). We run it in the background because
+                # it continues running as the new server after handoff.
+                echo ""
+                echo "Scribe server is running. Starting hot-reload..."
+                # Use mktemp instead of predictable /tmp paths to prevent
+                # TOCTOU symlink attacks from other local users.
+                UPGRADE_LOG=$(mktemp /run/user/"${TARGET_UID}"/scribe/upgrade-log.XXXXXX) || \
+                    UPGRADE_LOG=$(mktemp)
+                # mktemp runs as root; chown so the user subprocess can write.
+                chown "${TARGET_UID}" "${UPGRADE_LOG}" 2>/dev/null || true
 
-            # Wait briefly for the new server to be fully ready. We check
-            # for "IPC server listening" (emitted after socket bind) rather
-            # than "session restoration complete" to ensure the new server is
-            # accepting connections before we kill the old one.
-            UPGRADE_OK=0
-            for i in 1 2 3 4 5; do
-                sleep 1
-                if grep -q "IPC server listening" "${UPGRADE_LOG}" 2>/dev/null; then
-                    UPGRADE_OK=1
-                    break
-                fi
-                # Check if the upgrade process died
-                if ! kill -0 "$UPGRADE_PID" 2>/dev/null; then
-                    break
-                fi
-            done
-
-            if [ "$UPGRADE_OK" = "1" ]; then
-                echo "  ✓ Scribe server hot-reloaded successfully."
-                echo "    All terminal sessions have been preserved."
-
-                # The old server exits on its own after handoff (clean exit
-                # code 0). With Restart=on-failure in the service file,
-                # systemd will not auto-restart it.  The singleton flock
-                # in acquire_server_socket prevents duplicate servers.
+                # Launch the upgrade server detached from sudo.
                 #
-                # We intentionally do NOT `systemctl stop` or kill server
-                # processes here:
-                #  - `systemctl stop` uses KillMode=control-group by default,
-                #    which sends SIGTERM to ALL processes in the cgroup —
-                #    including the user's shell sessions from the PTY.
-                #    This kills the very sessions we're trying to preserve
-                #    and causes a 90-second hang waiting for bash to exit.
-                #  - Killing via `kill` would cause systemd to see a
-                #    signal exit, triggering Restart=on-failure.
-
-                # Relaunch clients if any were running before the upgrade
-                # (recorded by preinst before the old binary was replaced)
-                STATE_FILE="/run/user/${TARGET_UID}/scribe/upgrade-state"
-                PREV_CLIENTS=$(cat "${STATE_FILE}" 2>/dev/null || echo "0")
-                rm -f "${STATE_FILE}" 2>/dev/null || true
-
-                if [ "$PREV_CLIENTS" -gt 0 ] 2>/dev/null; then
-                    echo "  Relaunching client..."
-                    if [ -n "$SUDO_UID" ]; then
-                        # Forward display and session environment so the GPU
-                        # client can open a window under the user's session.
-                        # Each variable is passed as a separately quoted argument
-                        # to avoid word-splitting injection via $DISPLAY values.
-                        sudo -u "#${SUDO_UID}" \
-                            ${DISPLAY:+"DISPLAY=$DISPLAY"} \
-                            ${WAYLAND_DISPLAY:+"WAYLAND_DISPLAY=$WAYLAND_DISPLAY"} \
-                            XDG_RUNTIME_DIR="$XDG_DIR" \
-                            DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
-                            nohup /usr/bin/scribe-client >/dev/null 2>&1 &
-                    else
-                        nohup /usr/bin/scribe-client >/dev/null 2>&1 &
-                    fi
-                fi
-            else
-                # Kill the stuck upgrade process
-                kill "$UPGRADE_PID" 2>/dev/null || true
-
-                echo ""
-                echo "  ⚠  Hot-reload failed. A cold restart is needed to"
-                echo "     complete the upgrade."
-                echo ""
-                echo "     This will CLOSE all open terminal sessions."
-                echo ""
-
-                if [ -f "${UPGRADE_LOG}" ]; then
-                    echo "  Error details:"
-                    tail -3 "${UPGRADE_LOG}" 2>/dev/null | sed 's/^/    /'
-                    echo ""
-                fi
-
-                # Prompt for cold restart. Read from /dev/tty since stdin
-                # may be piped through apt/dpkg.
-                RESTART_CONFIRMED=0
-                if [ -e /dev/tty ]; then
-                    printf "  Restart now? (this will kill all running terminals) [y/N] "
-                    read -r REPLY < /dev/tty 2>/dev/null || REPLY=""
-                    case "$REPLY" in
-                        y|Y|yes|YES) RESTART_CONFIRMED=1 ;;
-                    esac
-                fi
-
-                if [ "$RESTART_CONFIRMED" = "1" ]; then
-                    if [ -n "$SUDO_UID" ]; then
-                        sudo -u "#${SUDO_UID}" \
-                            XDG_RUNTIME_DIR="$XDG_DIR" \
-                            DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
-                            systemctl --user restart scribe-server 2>/dev/null
-                    else
-                        systemctl --user restart scribe-server 2>/dev/null
-                    fi
-                    echo ""
-                    echo "  ✓ Scribe server restarted with new version."
+                # Plain `sudo -u user server &` makes sudo wait for the
+                # long-lived server child — it never exits, leaving zombie
+                # sudo processes after every install.  Using `sh -c '... &'`
+                # backgrounds the server *inside* the sh, so sh exits
+                # immediately, sudo exits, and the server is reparented to
+                # init.  The PID is captured via stdout.
+                if [ -n "$SUDO_UID" ]; then
+                    UPGRADE_PID=$(sudo -u "#${SUDO_UID}" sh -c '
+                        "$1" --upgrade >"$2" 2>&1 &
+                        echo $!
+                    ' _ "${UPGRADE_BIN}" "${UPGRADE_LOG}")
                 else
+                    "${UPGRADE_BIN}" --upgrade >"${UPGRADE_LOG}" 2>&1 &
+                    UPGRADE_PID=$!
+                fi
+
+                # Wait briefly for the new server to be fully ready. We check
+                # for "IPC server listening" (emitted after socket bind) rather
+                # than "session restoration complete" to ensure the new server is
+                # accepting connections before we kill the old one.
+                UPGRADE_OK=0
+                for i in 1 2 3 4 5; do
+                    sleep 1
+                    if grep -q "IPC server listening" "${UPGRADE_LOG}" 2>/dev/null; then
+                        UPGRADE_OK=1
+                        break
+                    fi
+                    # Check if the upgrade process died
+                    if ! kill -0 "$UPGRADE_PID" 2>/dev/null; then
+                        break
+                    fi
+                done
+
+                if [ "$UPGRADE_OK" = "1" ]; then
+                    echo "  ✓ Scribe server hot-reloaded successfully."
+                    echo "    All terminal sessions have been preserved."
+
+                    # The old server exits on its own after handoff (clean exit
+                    # code 0). With Restart=on-failure in the service file,
+                    # systemd will not auto-restart it.  The singleton flock
+                    # in acquire_server_socket prevents duplicate servers.
+                    #
+                    # We intentionally do NOT `systemctl stop` or kill server
+                    # processes here:
+                    #  - `systemctl stop` uses KillMode=control-group by default,
+                    #    which sends SIGTERM to ALL processes in the cgroup —
+                    #    including the user's shell sessions from the PTY.
+                    #    This kills the very sessions we're trying to preserve
+                    #    and causes a 90-second hang waiting for bash to exit.
+                    #  - Killing via `kill` would cause systemd to see a
+                    #    signal exit, triggering Restart=on-failure.
+                else
+                    # Handoff failed (likely version mismatch). Cold restart
+                    # is mandatory — the new binary can't take over the old
+                    # server's state.
+                    kill "$UPGRADE_PID" 2>/dev/null || true
+                    ORIGINAL_SERVER_ALIVE=0
+                    if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+                        ORIGINAL_SERVER_ALIVE=1
+                    fi
+
                     echo ""
-                    echo "  Skipped. To complete the upgrade later, run:"
+                    if [ "$ORIGINAL_SERVER_ALIVE" = "1" ]; then
+                        echo "  ⚠  Hot-reload failed — a cold restart is required."
+                        echo "     This will CLOSE all open terminal sessions."
+                    else
+                        echo "  ⚠  Hot-reload could not contact the previous server."
+                        echo "     Starting the new version with a cold restart."
+                    fi
                     echo ""
-                    echo "    systemctl --user restart scribe-server"
+
+                    # Prompt only when the previous server is still alive and
+                    # a cold restart would terminate any open sessions it owns.
+                    if [ "$ORIGINAL_SERVER_ALIVE" = "1" ] && [ -e /dev/tty ]; then
+                        printf "  Save your work, then press Enter to restart... "
+                        read -r _ < /dev/tty 2>/dev/null || true
+                    fi
+
+                    if cold_restart_server; then
+                        SERVER_COLD_RESTARTED=1
+                        echo ""
+                        echo "  ✓ Scribe server restarted with new version."
+                    else
+                        echo ""
+                        echo "  ✗ Scribe server restart failed."
+                        echo "    Run 'systemctl --user status scribe-server' for details."
+                        SERVER_READY=0
+                    fi
                 fi
             fi
-            # Clean up all upgrade logs (current + stale from previous installs).
+
+            # Relaunch client only if the binary changed.
+            CLIENT_PIDS_FILE="${STATE_DIR}/upgrade-client-pids"
+            CLIENT_PIDS=$(cat "${CLIENT_PIDS_FILE}" 2>/dev/null || true)
+            if [ "$SERVER_READY" = "1" ] && [ -n "$CLIENT_PIDS" ]; then
+                # Pick first PID for hash comparison (all instances run the same binary).
+                FIRST_CLIENT_PID="${CLIENT_PIDS%% *}"
+                if [ "$SERVER_COLD_RESTARTED" = "1" ] || \
+                    binary_changed "$FIRST_CLIENT_PID" "/usr/bin/scribe-client"; then
+                    echo "  Relaunching client..."
+                    # Kill old client instances. If the server also changed, old
+                    # clients may already be exiting via ServerDisconnected — the
+                    # kill is harmless in that case. After a cold server restart,
+                    # the previously running client has already exited, so we
+                    # must relaunch even when its binary is unchanged.
+                    for cpid in $CLIENT_PIDS; do
+                        kill "$cpid" 2>/dev/null || true
+                    done
+                    # Give old clients a moment to fully exit.  Prevents the
+                    # new client from appearing "connected" alongside a dying
+                    # old client during the Hello handshake.
+                    #
+                    # Multi-window note: we launch exactly ONE client here.
+                    # The server's Welcome message includes an `other_windows`
+                    # list of all remaining unconnected windows, and the client
+                    # automatically spawns a separate process (with --window-id)
+                    # for each of them.
+                    sleep 0.5
+                    launch_user_binary /usr/bin/scribe-client
+                else
+                    echo "  Client binary unchanged — skipping restart."
+                fi
+            elif [ "$SERVER_READY" != "1" ] && [ -n "$CLIENT_PIDS" ]; then
+                echo "  Skipping client restart because the server restart failed."
+            fi
+
+            # Relaunch settings only if the binary changed.
+            SETTINGS_PID=$(cat "${STATE_DIR}/upgrade-settings-pid" 2>/dev/null | tr -d '[:space:]' || true)
+            if [ "$SERVER_READY" = "1" ] && [ -n "$SETTINGS_PID" ]; then
+                if binary_changed "$SETTINGS_PID" "/usr/bin/scribe-settings"; then
+                    restart_singleton_binary "settings" "$SETTINGS_PID" /usr/bin/scribe-settings
+                else
+                    echo "  Settings binary unchanged — skipping restart."
+                fi
+            elif [ "$SERVER_READY" != "1" ] && [ -n "$SETTINGS_PID" ]; then
+                echo "  Skipping settings restart because the server restart failed."
+            fi
+
+            # Clean up all upgrade state files and logs.
+            rm -f "${STATE_DIR}/upgrade-client-pids" "${STATE_DIR}/upgrade-settings-pid" 2>/dev/null || true
             rm -f /run/user/"${TARGET_UID}"/scribe/upgrade-log.* 2>/dev/null || true
             echo ""
         else
@@ -162,18 +297,14 @@ case "$1" in
             STARTED=0
 
             if [ -n "$SUDO_UID" ] && [ -d "$XDG_DIR" ]; then
-                sudo -u "#${SUDO_UID}" \
-                    XDG_RUNTIME_DIR="$XDG_DIR" \
-                    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
-                    systemctl --user enable scribe-server 2>/dev/null && \
-                sudo -u "#${SUDO_UID}" \
-                    XDG_RUNTIME_DIR="$XDG_DIR" \
-                    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
-                    systemctl --user start scribe-server 2>/dev/null && \
+                run_user_systemctl daemon-reload && \
+                run_user_systemctl enable scribe-server && \
+                run_user_systemctl start scribe-server && \
                 STARTED=1
             elif [ -z "$SUDO_UID" ]; then
-                systemctl --user enable scribe-server 2>/dev/null && \
-                systemctl --user start scribe-server 2>/dev/null && \
+                run_user_systemctl daemon-reload && \
+                run_user_systemctl enable scribe-server && \
+                run_user_systemctl start scribe-server && \
                 STARTED=1
             fi
 
@@ -201,6 +332,24 @@ case "$1" in
 
             if [ -d "$CLAUDE_DIR" ]; then
                 echo "  Setting up Claude Code AI indicator hooks..."
+                if [ -n "$SUDO_UID" ]; then
+                    sudo -u "#${SUDO_UID}" \
+                        HOME="$TARGET_HOME" \
+                        "$SETUP_SCRIPT" --hook-source /usr/share/scribe 2>&1 | sed 's/^/  /'
+                else
+                    "$SETUP_SCRIPT" --hook-source /usr/share/scribe 2>&1 | sed 's/^/  /'
+                fi
+            fi
+        fi
+
+        # ── Codex hook integration (both fresh and upgrade) ──────────────
+        SETUP_SCRIPT="/usr/share/scribe/setup-codex-hooks.sh"
+        if [ -x "$SETUP_SCRIPT" ]; then
+            TARGET_HOME=$(eval echo "~$(id -un "$TARGET_UID")" 2>/dev/null) || true
+            CODEX_DIR="${TARGET_HOME}/.codex"
+
+            if [ -d "$CODEX_DIR" ]; then
+                echo "  Setting up Codex AI indicator hooks..."
                 if [ -n "$SUDO_UID" ]; then
                     sudo -u "#${SUDO_UID}" \
                         HOME="$TARGET_HOME" \

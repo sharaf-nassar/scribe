@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description.workspace = true
 
 [lints]
 workspace = true
@@ -31,11 +32,6 @@ assets = [
   ],
   [
     "target/release/scribe-settings",
-    "usr/bin/",
-    "755",
-  ],
-  [
-    "target/release/scribe-driver",
     "usr/bin/",
     "755",
   ],
@@ -79,6 +75,36 @@ assets = [
     "usr/share/scribe/detect-claude-question.sh",
     "755",
   ],
+  [
+    "../../dist/setup-codex-hooks.sh",
+    "usr/share/scribe/setup-codex-hooks.sh",
+    "755",
+  ],
+  [
+    "../../dist/detect-codex-question.sh",
+    "usr/share/scribe/detect-codex-question.sh",
+    "755",
+  ],
+  [
+    "../../dist/shell-integration/bash/scribe.bash",
+    "usr/share/scribe/shell-integration/bash/",
+    "644",
+  ],
+  [
+    "../../dist/shell-integration/zsh/.zshenv",
+    "usr/share/scribe/shell-integration/zsh/",
+    "644",
+  ],
+  [
+    "../../dist/shell-integration/zsh/scribe.zsh",
+    "usr/share/scribe/shell-integration/zsh/",
+    "644",
+  ],
+  [
+    "../../dist/shell-integration/fish/vendor_conf.d/scribe.fish",
+    "usr/share/scribe/shell-integration/fish/vendor_conf.d/",
+    "644",
+  ],
 ]
 maintainer-scripts = "../../dist/debian/"
 
@@ -110,9 +136,11 @@ vte.workspace = true
 libc.workspace = true
 nix.workspace = true
 reqwest.workspace = true
+futures-util = "0.3"
 semver.workspace = true
 serde_json.workspace = true
 minisign-verify.workspace = true
+sha2 = "0.10"
 
 [dev-dependencies]
 # test-util: provides #[tokio::test] macro for async tests.

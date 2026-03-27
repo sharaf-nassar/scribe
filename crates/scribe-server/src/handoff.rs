@@ -22,9 +22,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use scribe_common::ai_state::AiProcessState;
+use scribe_common::ai_state::{AiProcessState, AiProvider};
 use scribe_common::error::ScribeError;
 use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::protocol::SessionContext;
 use scribe_common::screen::ScreenSnapshot;
 use scribe_common::socket::{current_uid, handoff_socket_path};
 
@@ -39,7 +40,7 @@ use crate::workspace_manager::WorkspaceManager;
 ///
 /// A version mismatch causes the new server to abort the handoff and perform
 /// a full restart instead, so all live sessions are terminated.
-const HANDOFF_VERSION: u32 = 2;
+const HANDOFF_VERSION: u32 = 4;
 
 /// Magic bytes the receiver sends to request an upgrade.
 const UPGRADE_REQUEST: &[u8] = b"SCRIBE_UPGRADE";
@@ -47,12 +48,12 @@ const UPGRADE_REQUEST: &[u8] = b"SCRIBE_UPGRADE";
 /// Magic bytes the receiver sends after successful fd reception.
 const ACK: &[u8] = b"ACK";
 
-/// Maximum serialised state size we accept (16 MiB). Prevents a rogue peer
+/// Maximum serialised state size we accept (1 GiB). Prevents a rogue peer
 /// from making us allocate unbounded memory.
-const MAX_STATE_SIZE: u32 = 16 * 1024 * 1024;
+const MAX_STATE_SIZE: u32 = 1024 * 1024 * 1024;
 
 /// Maximum number of PTY fds we support in a single handoff.
-const MAX_FDS: usize = 256;
+const MAX_FDS: usize = 1024;
 
 /// Complete serialised server state for a handoff.
 #[derive(Serialize, Deserialize)]
@@ -67,9 +68,6 @@ pub struct HandoffState {
     /// window's workspace tree.
     #[serde(default)]
     pub windows: Vec<HandoffWindowState>,
-    /// Live driver tasks to restore after upgrade.
-    #[serde(default)]
-    pub driver_tasks: Vec<crate::driver_tasks::HandoffDriverTask>,
 }
 
 /// Per-session state transferred during handoff.
@@ -80,17 +78,37 @@ pub struct HandoffSession {
     pub child_pid: u32,
     pub cols: u16,
     pub rows: u16,
+    #[serde(default)]
+    pub cell_width: u16,
+    #[serde(default)]
+    pub cell_height: u16,
     pub snapshot: Option<ScreenSnapshot>,
     /// Last-known terminal title. `#[serde(default)]` for backward compat with
     /// old servers that did not include this field.
     #[serde(default)]
     pub title: Option<String>,
+    /// Last-known session shell name. `#[serde(default)]` for backward compat.
+    #[serde(default = "default_shell_name")]
+    pub shell_name: String,
+    /// Last-known Codex task label. `#[serde(default)]` for backward compat.
+    #[serde(default)]
+    pub codex_task_label: Option<String>,
     /// Last-known working directory. `#[serde(default)]` for backward compat.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    /// Last-known remote/tmux context. `#[serde(default)]` for backward compat.
+    #[serde(default)]
+    pub context: Option<SessionContext>,
     /// Last-known AI process state. `#[serde(default)]` for backward compat.
     #[serde(default)]
     pub ai_state: Option<AiProcessState>,
+    /// Launch-time AI provider hint. `#[serde(default)]` for backward compat.
+    #[serde(default)]
+    pub ai_provider_hint: Option<AiProvider>,
+}
+
+fn default_shell_name() -> String {
+    String::from("shell")
 }
 
 /// Per-workspace state transferred during handoff.
@@ -110,10 +128,14 @@ pub struct HandoffWorkspace {
 ///
 /// This function blocks (async) until a new server connects and the handoff
 /// completes. On success the caller should exit so the new server takes over.
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "handoff serialization requires sequential steps across all server subsystems"
+)]
 pub async fn run_handoff_listener(
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     live_sessions: LiveSessionRegistry,
-    driver_registry: crate::driver_tasks::DriverTaskRegistryHandle,
 ) -> Result<(), ScribeError> {
     let path = handoff_socket_path();
 
@@ -149,57 +171,85 @@ pub async fn run_handoff_listener(
     let listen_async =
         tokio::io::unix::AsyncFd::new(listen_fd).map_err(|e| ScribeError::Io { source: e })?;
 
-    let peer_fd = loop {
-        let mut guard = listen_async.readable().await.map_err(|e| ScribeError::Io { source: e })?;
+    // Loop so the old server survives a failed handoff (e.g. version
+    // mismatch) and keeps serving until a compatible upgrade arrives or
+    // postinst cold-restarts via systemctl.
+    loop {
+        let peer_fd = loop {
+            let mut guard =
+                listen_async.readable().await.map_err(|e| ScribeError::Io { source: e })?;
 
-        match socket::accept(listen_async.get_ref().as_raw_fd()) {
-            Ok(raw) => break scribe_pty::async_fd::wrap_raw_fd(raw),
-            Err(nix::errno::Errno::EAGAIN) => {
-                guard.clear_ready();
+            match socket::accept(listen_async.get_ref().as_raw_fd()) {
+                Ok(raw) => break scribe_pty::async_fd::wrap_raw_fd(raw),
+                Err(nix::errno::Errno::EAGAIN) => {
+                    guard.clear_ready();
+                }
+                Err(e) => {
+                    return Err(ScribeError::IpcError {
+                        reason: format!("handoff accept failed: {e}"),
+                    });
+                }
             }
+        };
+
+        let raw_peer = peer_fd.as_raw_fd();
+
+        // Verify peer UID.
+        if let Err(e) = verify_peer_uid(&peer_fd) {
+            warn!("handoff peer rejected: {e}");
+            continue;
+        }
+
+        // Read upgrade request.
+        if let Err(e) = read_upgrade_request(raw_peer) {
+            warn!("handoff upgrade request failed: {e}");
+            continue;
+        }
+        info!("received upgrade request from new server");
+
+        // Serialise state.
+        let (state, fds) = serialize_state(&live_sessions, &workspace_manager).await;
+        let state_bytes = match rmp_serde::to_vec(&state) {
+            Ok(bytes) => bytes,
             Err(e) => {
-                return Err(ScribeError::IpcError {
-                    reason: format!("handoff accept failed: {e}"),
-                });
+                warn!("handoff serialization failed: {e}");
+                continue;
+            }
+        };
+
+        // Send state (length-prefixed).
+        if let Err(e) = send_state_bytes(raw_peer, &state_bytes) {
+            warn!("handoff send state failed: {e}");
+            continue;
+        }
+        info!(state_len = state_bytes.len(), fd_count = fds.len(), "sent handoff state");
+
+        // Send PTY fds via SCM_RIGHTS.
+        if !fds.is_empty() {
+            if let Err(e) = send_fds(raw_peer, &fds) {
+                warn!("handoff send fds failed: {e}");
+                continue;
+            }
+            info!(count = fds.len(), "sent PTY fds via SCM_RIGHTS");
+        }
+
+        // Wait for ACK — this is the confirmation that the new server
+        // accepted the state and is ready to serve.
+        if let Err(e) = read_ack(raw_peer) {
+            warn!("handoff not acknowledged (version mismatch?): {e}");
+            continue;
+        }
+        info!("received ACK from new server — handoff complete");
+
+        // Clean up handoff socket.
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(?path, "failed to remove handoff socket: {e}");
             }
         }
-    };
 
-    let raw_peer = peer_fd.as_raw_fd();
-
-    // Verify peer UID.
-    verify_peer_uid(&peer_fd)?;
-
-    // Read upgrade request.
-    read_upgrade_request(raw_peer)?;
-    info!("received upgrade request from new server");
-
-    // Serialise state.
-    let (state, fds) = serialize_state(&live_sessions, &workspace_manager, &driver_registry).await;
-    let state_bytes = rmp_serde::to_vec(&state).map_err(ScribeError::from)?;
-
-    // Send state (length-prefixed).
-    send_state_bytes(raw_peer, &state_bytes)?;
-    info!(state_len = state_bytes.len(), fd_count = fds.len(), "sent handoff state");
-
-    // Send PTY fds via SCM_RIGHTS.
-    if !fds.is_empty() {
-        send_fds(raw_peer, &fds)?;
-        info!(count = fds.len(), "sent PTY fds via SCM_RIGHTS");
+        return Ok(());
     }
-
-    // Wait for ACK.
-    read_ack(raw_peer)?;
-    info!("received ACK from new server — handoff complete");
-
-    // Clean up handoff socket.
-    if let Err(e) = std::fs::remove_file(&path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            warn!(?path, "failed to remove handoff socket: {e}");
-        }
-    }
-
-    Ok(())
 }
 
 /// Prepare the handoff socket path: create parent dirs, remove stale socket.
@@ -294,23 +344,13 @@ fn read_upgrade_request(fd: RawFd) -> Result<(), ScribeError> {
 async fn serialize_state(
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-    driver_registry: &crate::driver_tasks::DriverTaskRegistryHandle,
 ) -> (HandoffState, Vec<RawFd>) {
-    let (sessions, mut fds) = crate::ipc_server::serialize_live_for_handoff(live_sessions).await;
+    let (sessions, fds) = crate::ipc_server::serialize_live_for_handoff(live_sessions).await;
     let (workspaces, workspace_tree, windows) =
         workspace_manager.read().await.serialize_for_handoff();
 
-    let (driver_tasks, driver_fds) = driver_registry.lock().await.serialize_for_handoff();
-    fds.extend_from_slice(&driver_fds);
-
-    let state = HandoffState {
-        version: HANDOFF_VERSION,
-        sessions,
-        workspaces,
-        workspace_tree,
-        windows,
-        driver_tasks,
-    };
+    let state =
+        HandoffState { version: HANDOFF_VERSION, sessions, workspaces, workspace_tree, windows };
 
     (state, fds)
 }
@@ -430,9 +470,8 @@ pub fn receive_handoff() -> Result<(HandoffState, Vec<OwnedFd>), ScribeError> {
         "received handoff state"
     );
 
-    // Receive fds via SCM_RIGHTS.  The sender packs session fds first,
-    // then driver task fds, all in a single SCM_RIGHTS message.
-    let total_fds = state.sessions.len() + state.driver_tasks.len();
+    // Receive session PTY fds via SCM_RIGHTS.
+    let total_fds = state.sessions.len();
     let fds = if total_fds == 0 { Vec::new() } else { receive_fds(fd, total_fds)? };
 
     info!(count = fds.len(), "received PTY fds via SCM_RIGHTS");
