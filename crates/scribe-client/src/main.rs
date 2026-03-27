@@ -19,6 +19,7 @@ mod splash;
 mod status_bar;
 mod sys_stats;
 mod tab_bar;
+mod tooltip;
 mod update_dialog;
 mod url_detect;
 mod window_state;
@@ -250,6 +251,13 @@ struct App {
     /// Clickable rect for the status bar equalize icon (updated each frame).
     status_bar_equalize_rect: Option<layout::Rect>,
 
+    /// Tooltip hover targets for the status bar (updated each frame).
+    status_bar_tooltip_targets: Vec<tooltip::TooltipAnchor>,
+    /// Tooltip hover targets for tab bars across all workspaces (updated each frame).
+    tab_bar_tooltip_targets: Vec<tooltip::TooltipAnchor>,
+    /// Active tooltip state: (text, `anchor_rect`, position).
+    active_tooltip: Option<(String, layout::Rect, tooltip::TooltipPosition)>,
+
     /// System hostname for the window-level status bar (fetched once at startup).
     hostname: String,
     /// System resource stats collector for the status bar.
@@ -362,6 +370,9 @@ impl App {
             tab_bar_equalize_targets: Vec::new(),
             status_bar_gear_rect: None,
             status_bar_equalize_rect: None,
+            status_bar_tooltip_targets: Vec::new(),
+            tab_bar_tooltip_targets: Vec::new(),
+            active_tooltip: None,
             hostname: read_hostname(),
             sys_stats: sys_stats::SystemStatsCollector::new(),
             url_caches: HashMap::new(),
@@ -1859,7 +1870,7 @@ impl App {
             update_available: update_version,
             update_progress: self.update_progress.as_ref(),
         };
-        let (mut all_instances, tab_hits, tab_close_hits, tab_eq_hits, tab_upd_hits) =
+        let (mut all_instances, tab_hits, tab_close_hits, tab_eq_hits, tab_upd_hits, tab_tt_hits) =
             build_all_instances(
                 &mut gpu.renderer,
                 &gpu.device,
@@ -1873,6 +1884,7 @@ impl App {
         self.tab_close_hit_targets = tab_close_hits;
         self.tab_bar_equalize_targets = tab_eq_hits;
         self.tab_bar_update_targets = tab_upd_hits;
+        self.tab_bar_tooltip_targets = tab_tt_hits;
 
         // URL underlines — rendered on top of terminal content, below tab bars.
         {
@@ -1920,6 +1932,7 @@ impl App {
             );
             self.status_bar_gear_rect = sb_hits.gear_rect;
             self.status_bar_equalize_rect = sb_hits.equalize_rect;
+            self.status_bar_tooltip_targets = sb_hits.tooltip_targets;
         }
 
         // Close dialog overlay (rendered on top of everything).
@@ -1957,6 +1970,23 @@ impl App {
                 full_viewport,
                 cell_size,
                 &self.theme.chrome,
+                &mut resolve_glyph,
+            );
+        }
+
+        // Tooltip overlay — rendered on top of everything.
+        if let Some((ref text, anchor, position)) = self.active_tooltip {
+            let mut resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            tooltip::render_tooltip(
+                &mut all_instances,
+                text,
+                anchor,
+                position,
+                sb_colors.bg,
+                sb_colors.text,
+                sb_colors.separator,
+                cell_size,
                 &mut resolve_glyph,
             );
         }
@@ -3413,6 +3443,36 @@ impl App {
         if !self.mouse_selecting && self.refresh_hovered_url() {
             self.request_redraw();
         }
+
+        // Update tooltip state: check status bar targets (Above) then tab targets (Below).
+        self.update_active_tooltip(x, y);
+    }
+
+    /// Check tooltip hover targets and update `active_tooltip`.
+    ///
+    /// Status bar targets show Above; tab bar targets show Below.
+    fn update_active_tooltip(&mut self, cursor_x: f32, cursor_y: f32) {
+        let new_tooltip = self
+            .status_bar_tooltip_targets
+            .iter()
+            .find(|t| t.rect.contains(cursor_x, cursor_y))
+            .map(|t| (t.text.clone(), t.rect, tooltip::TooltipPosition::Above))
+            .or_else(|| {
+                self.tab_bar_tooltip_targets
+                    .iter()
+                    .find(|t| t.rect.contains(cursor_x, cursor_y))
+                    .map(|t| (t.text.clone(), t.rect, tooltip::TooltipPosition::Below))
+            });
+
+        let changed = match (&self.active_tooltip, &new_tooltip) {
+            (None, None) => false,
+            (Some((prev_text, _, _)), Some((new_text, _, _))) => prev_text != new_text,
+            _ => true,
+        };
+        if changed {
+            self.active_tooltip = new_tooltip;
+            self.request_redraw();
+        }
     }
 
     /// Forward a mouse motion event to the focused pane's PTY when the
@@ -4662,6 +4722,9 @@ type TabEqualizeTargets = Vec<(WorkspaceId, layout::Rect)>;
 /// `(workspace_id, update_rect)` for tab bar update button click handling.
 type TabUpdateTargets = Vec<(WorkspaceId, layout::Rect)>;
 
+/// Tooltip anchors from all tab bars (updated each frame).
+type TabTooltipTargets = Vec<tooltip::TooltipAnchor>;
+
 /// Layout and focus state passed to [`build_all_instances`].
 struct FrameLayout<'a> {
     pane_rects: &'a [(PaneId, Rect)],
@@ -4729,6 +4792,7 @@ fn build_all_instances(
     TabHitTargets,
     TabEqualizeTargets,
     TabUpdateTargets,
+    TabTooltipTargets,
 ) {
     // Build a workspace-id → tab_bar_height lookup for per-pane height queries.
     let ws_tab_bar_heights: HashMap<WorkspaceId, f32> =
@@ -4835,6 +4899,7 @@ fn build_all_instances(
     let mut tab_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)> = Vec::new();
     let mut tab_close_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)> = Vec::new();
     let mut tab_equalize_targets: TabEqualizeTargets = Vec::new();
+    let mut tab_tooltip_targets: TabTooltipTargets = Vec::new();
     let mut tab_update_targets: TabUpdateTargets = Vec::new();
     for ws_data in layout.ws_tab_bar_data {
         let tbh = ws_data.tab_bar_height;
@@ -4892,6 +4957,7 @@ fn build_all_instances(
         if let Some(upd_rect) = hit_targets.update_rect {
             tab_update_targets.push((ws_data.ws_id, upd_rect));
         }
+        tab_tooltip_targets.extend(hit_targets.tooltip_targets);
 
         // Draw the bottom separator using the exact active-tab column range
         // returned by the render pass.  This avoids the pre-computation error
@@ -4977,6 +5043,7 @@ fn build_all_instances(
         tab_close_hit_targets,
         tab_equalize_targets,
         tab_update_targets,
+        tab_tooltip_targets,
     )
 }
 

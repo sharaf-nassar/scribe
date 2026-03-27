@@ -12,6 +12,7 @@ use scribe_renderer::types::CellInstance;
 
 use crate::layout::Rect;
 use crate::sys_stats::SystemStats;
+use crate::tooltip::TooltipAnchor;
 
 /// Height of the status bar in pixels.
 pub const STATUS_BAR_HEIGHT: f32 = 24.0;
@@ -22,6 +23,8 @@ pub struct StatusBarHitTargets {
     pub equalize_rect: Option<Rect>,
     /// Clickable rect for the settings gear icon.
     pub gear_rect: Option<Rect>,
+    /// Tooltip hover targets for each status bar segment.
+    pub tooltip_targets: Vec<TooltipAnchor>,
 }
 
 /// Data needed to render the window-level status bar.
@@ -123,7 +126,11 @@ pub fn build_status_bar(
 ) -> StatusBarHitTargets {
     let (cell_w, _cell_h) = cell_size;
     if cell_w <= 0.0 {
-        return StatusBarHitTargets { equalize_rect: None, gear_rect: None };
+        return StatusBarHitTargets {
+            equalize_rect: None,
+            gear_rect: None,
+            tooltip_targets: Vec::new(),
+        };
     }
 
     let bar_y = window_rect.y + window_rect.height - STATUS_BAR_HEIGHT;
@@ -132,12 +139,14 @@ pub fn build_status_bar(
 
     build_background(w.out, w.x_origin, w.y, w.max_cols, w.cell_w, window_rect.width, colors.bg);
 
-    let col = render_left_side(&mut w, colors, data, resolve_glyph);
+    let mut tooltips: Vec<TooltipAnchor> = Vec::new();
+    let col = render_left_side(&mut w, colors, data, resolve_glyph, &mut tooltips);
     w.col = col;
 
-    let (equalize_rect, gear_rect) = render_right_side(&mut w, colors, data, resolve_glyph);
+    let (equalize_rect, gear_rect) =
+        render_right_side(&mut w, colors, data, resolve_glyph, &mut tooltips);
 
-    StatusBarHitTargets { equalize_rect, gear_rect }
+    StatusBarHitTargets { equalize_rect, gear_rect, tooltip_targets: tooltips }
 }
 
 /// Mutable writer state for emitting status bar characters.
@@ -151,6 +160,17 @@ struct BarWriter<'a> {
 }
 
 impl BarWriter<'_> {
+    /// Compute a [`Rect`] spanning `start_col..self.col` at the bar's Y position.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "column indices are small positive integers fitting in f32"
+    )]
+    fn col_rect(&self, start_col: usize) -> Rect {
+        let x = self.x_origin + start_col as f32 * self.cell_w;
+        let width = (self.col - start_col) as f32 * self.cell_w;
+        Rect { x, y: self.y, width, height: STATUS_BAR_HEIGHT }
+    }
+
     /// Emit a single character at the current column with the given colors.
     #[allow(
         clippy::cast_precision_loss,
@@ -212,21 +232,33 @@ fn render_left_side(
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+    tooltips: &mut Vec<TooltipAnchor>,
 ) -> usize {
     w.put(' ', colors.text, colors.bg, resolve_glyph);
 
+    // Connection dot tooltip.
+    let dot_col = w.col;
     let dot_color = if data.connected { colors.connected_dot } else { colors.disconnected_dot };
     w.put('\u{25CF}', dot_color, colors.bg, resolve_glyph);
+    let dot_text =
+        if data.connected { String::from("Connected") } else { String::from("Disconnected") };
+    tooltips.push(TooltipAnchor { text: dot_text, rect: w.col_rect(dot_col) });
+
     w.put(' ', colors.text, colors.bg, resolve_glyph);
 
     if let Some(name) = data.workspace_name {
+        let ws_col = w.col;
         w.put_str(name, colors.accent, colors.bg, resolve_glyph);
+        tooltips.push(TooltipAnchor { text: String::from(name), rect: w.col_rect(ws_col) });
         w.put_str("  ", colors.text, colors.bg, resolve_glyph);
     }
 
     if let Some(cwd) = data.cwd {
         let short = shorten_cwd(cwd);
+        let cwd_col = w.col;
         w.put_str(&short, colors.text, colors.bg, resolve_glyph);
+        let full_cwd = cwd.to_string_lossy().into_owned();
+        tooltips.push(TooltipAnchor { text: full_cwd, rect: w.col_rect(cwd_col) });
     }
 
     w.col
@@ -240,6 +272,7 @@ fn render_right_side(
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+    tooltips: &mut Vec<TooltipAnchor>,
 ) -> (Option<Rect>, Option<Rect>) {
     // +3 for the gear segment: " ⚙ " (space, gear, space)
     let gear_cols: usize = 3;
@@ -252,19 +285,127 @@ fn render_right_side(
 
     w.pad_to(right_start, colors.text, colors.bg, resolve_glyph);
 
-    for seg in &segments {
-        w.put_str(&seg.text, seg.color, colors.bg, resolve_glyph);
-    }
+    // Render segments tracking per-named-item rects for tooltips.
+    let groups = build_segment_groups(data);
+    render_right_segments_with_tooltips(w, colors.bg, resolve_glyph, &segments, tooltips, &groups);
 
     // Equalize icon: " ⊞" left of the gear, only when multiple workspaces exist.
     let equalize_rect = render_equalize(w, colors, data, resolve_glyph);
+    if let Some(eq_rect) = equalize_rect {
+        tooltips.push(TooltipAnchor { text: String::from("Equalize workspaces"), rect: eq_rect });
+    }
 
     // Gear icon: " ⚙ " at the far right.
     let gear_rect = render_gear(w, colors, resolve_glyph);
+    if let Some(g_rect) = gear_rect {
+        tooltips.push(TooltipAnchor { text: String::from("Settings (Ctrl+,)"), rect: g_rect });
+    }
 
     w.pad_to(w.max_cols, colors.text, colors.bg, resolve_glyph);
 
     (equalize_rect, gear_rect)
+}
+
+/// Build the `(tooltip_text, segment_count)` group list from `data`.
+///
+/// Segment counts mirror the layout logic in `build_stats_segments` /
+/// `build_right_segments` so that we can slice the flat segment list into
+/// named groups for tooltip rect assignment.
+fn build_segment_groups(data: &StatusBarData<'_>) -> Vec<(String, usize)> {
+    let mut groups: Vec<(String, usize)> = Vec::new();
+
+    if let (Some(stats), Some(config)) = (data.sys_stats, data.stats_config) {
+        if config.cpu {
+            let sep = usize::from(!groups.is_empty());
+            let cpu_pct = stats.cpu_percent;
+            groups.push((format!("CPU {cpu_pct:.0}%"), sep + 1 + CPU_SPARK_WIDTH + 1));
+        }
+        if config.memory {
+            let sep = usize::from(!groups.is_empty());
+            let mem_used = stats.mem_used_gb;
+            let mem_total = stats.mem_total_gb;
+            groups.push((format!("MEM {mem_used:.1}/{mem_total:.1} GB"), sep + 3));
+        }
+        if config.network {
+            let sep = usize::from(!groups.is_empty());
+            let up = format_bytes_rate(stats.net_up_bytes_sec);
+            let down = format_bytes_rate(stats.net_down_bytes_sec);
+            let count = sep + 1 + NET_SPARK_WIDTH + 1 + 1 + NET_SPARK_WIDTH + 1;
+            groups.push((format!("NET \u{2191}{up} \u{2193}{down}"), count));
+        }
+        if config.gpu && stats.gpu_percent.is_some() {
+            let sep = usize::from(!groups.is_empty());
+            let gpu_pct = stats.gpu_percent.unwrap_or(0.0);
+            groups.push((format!("GPU {gpu_pct:.0}%"), sep + 1 + CPU_SPARK_WIDTH + 1));
+        }
+    }
+
+    if let Some(branch) = data.git_branch {
+        let sep = usize::from(!groups.is_empty());
+        groups.push((String::from(branch), sep + 1));
+    }
+
+    if data.session_count > 0 {
+        let sep = usize::from(!groups.is_empty());
+        let label = if data.session_count == 1 {
+            String::from("1 session")
+        } else {
+            let n = data.session_count;
+            format!("{n} sessions")
+        };
+        groups.push((label, sep + 1));
+    }
+
+    if !data.hostname.is_empty() {
+        let sep = usize::from(!groups.is_empty());
+        groups.push((String::from(data.hostname), sep + 1));
+    }
+
+    if !data.time.is_empty() {
+        let sep = usize::from(!groups.is_empty());
+        groups.push((String::from(data.time), sep + 1));
+    }
+
+    groups
+}
+
+/// Render right-side segments and push tooltip anchors for each named item.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "needs bar writer, bg color, resolve_glyph, segments, tooltips, and group counts"
+)]
+fn render_right_segments_with_tooltips(
+    w: &mut BarWriter<'_>,
+    bg: [f32; 4],
+    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+    segments: &[RightSegment],
+    tooltips: &mut Vec<TooltipAnchor>,
+    groups: &[(String, usize)],
+) {
+    let mut seg_idx: usize = 0;
+
+    // Render each named group and record its tooltip rect.
+    for (tooltip_text, count) in groups {
+        let start_col = w.col;
+        let end_seg = seg_idx + count;
+        while seg_idx < end_seg {
+            if let Some(seg) = segments.get(seg_idx) {
+                w.put_str(&seg.text, seg.color, bg, resolve_glyph);
+                seg_idx += 1;
+            } else {
+                break;
+            }
+        }
+        if w.col > start_col {
+            tooltips
+                .push(TooltipAnchor { text: tooltip_text.clone(), rect: w.col_rect(start_col) });
+        }
+    }
+
+    // Trailing space segment (1 segment, no tooltip).
+    if let Some(seg) = segments.get(seg_idx) {
+        w.put_str(&seg.text, seg.color, bg, resolve_glyph);
+    }
 }
 
 /// Render the equalize icon and return its clickable rect, or `None` when hidden.

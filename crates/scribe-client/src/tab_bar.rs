@@ -12,6 +12,7 @@ use scribe_common::ids::WorkspaceId;
 use scribe_common::protocol::UpdateProgressState;
 
 use crate::layout::Rect;
+use crate::tooltip::TooltipAnchor;
 
 /// Colors for the tab bar, derived from the theme's [`ChromeColors`].
 pub struct TabBarColors {
@@ -321,6 +322,8 @@ pub struct TabBarHitTargets {
     /// Column range `(start_col, end_col)` of the active tab on row 0. `None` when no active tab
     /// is on row 0 (e.g. active tab is on row 1+ in a multi-row bar).
     pub active_tab_col_range: Option<(usize, usize)>,
+    /// Tooltip hover targets for truncated tab titles.
+    pub tooltip_targets: Vec<TooltipAnchor>,
 }
 
 /// Build cell instances for the tab bar text overlay.
@@ -340,6 +343,7 @@ pub fn build_tab_bar_text(
                 close_rects: Vec::new(),
                 update_rect: None,
                 active_tab_col_range: None,
+                tooltip_targets: Vec::new(),
             },
         );
     }
@@ -354,6 +358,7 @@ pub fn build_tab_bar_text(
         close_rects: Vec::new(),
         update_rect: None,
         active_tab_col_range: None,
+        tooltip_targets: Vec::new(),
     };
 
     // Reserve columns for the gear icon on the far right (2 cols: space + gear).
@@ -624,7 +629,8 @@ fn render_tabs(
 
         // Build the display title: truncate with '…' if too long, or pad with spaces.
         let title_chars: Vec<char> = tab.title.chars().collect();
-        let display_title: Vec<char> = if tab_w >= 4 && title_chars.len() > available_title {
+        let is_truncated = tab_w >= 4 && title_chars.len() > available_title;
+        let display_title: Vec<char> = if is_truncated {
             let keep = available_title.saturating_sub(1);
             let mut t: Vec<char> = title_chars.get(..keep).map_or_else(Vec::new, <[char]>::to_vec);
             t.push('\u{2026}'); // '…'
@@ -689,10 +695,15 @@ fn render_tabs(
         ));
 
         // Hit targets use logical (un-offset) positions for reliable reorder detection.
-        hit_targets.tab_rects.push((
-            tab_idx,
-            Rect { x: tab_x, y: row_base_y, width: tab_width_px, height: row_height },
-        ));
+        let tab_rect = Rect { x: tab_x, y: row_base_y, width: tab_width_px, height: row_height };
+        hit_targets.tab_rects.push((tab_idx, tab_rect));
+
+        // Tooltip: show full title when it was truncated with '…'.
+        if is_truncated {
+            hit_targets
+                .tooltip_targets
+                .push(TooltipAnchor { text: tab.title.clone(), rect: tab_rect });
+        }
 
         // Render AI indicator bar at the top of this tab's row.
         if let Some(indicator_color) = tab.ai_indicator {
