@@ -62,9 +62,18 @@ deb:
     cargo build --release
     cargo deb -p scribe-server --no-build
 
+# Build release .deb for the isolated scribe-dev install flavor
+deb-dev:
+    cargo build --release
+    cargo deb -p scribe-server --no-build --variant dev
+
 # Build and install .deb
 install: deb
     sudo dpkg -i $(find target/debian -name 'scribe_*.deb' -print -quit)
+
+# Build and install isolated scribe-dev .deb
+install-dev: deb-dev
+    sudo dpkg -i $(find target/debian -name 'scribe-dev_*.deb' -print -quit)
 
 # Build macOS .app bundle and .dmg installer
 dmg:

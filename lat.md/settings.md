@@ -6,7 +6,7 @@ The scribe-settings crate provides a webview-based configuration editor for term
 
 The settings window in [[crates/scribe-settings/src/lib.rs]] uses an embedded webview (GTK on Linux, tao/wry on macOS) with inlined HTML/CSS/JS assets.
 
-On launch, four pieces of state are injected into the webview: the current config, keybinding defaults (for reset-to-default UI), all theme preset colours, and a list of available monospace fonts from fontdb.
+On launch, five pieces of state are injected into the webview: the host platform, the current config, keybinding defaults (for reset-to-default UI), all theme preset colours, and a list of available monospace fonts from fontdb.
 
 ### Font Discovery
 
@@ -15,6 +15,8 @@ The `list_monospace_fonts` function queries fontdb for all system monospace font
 ### Platform Differences
 
 Linux uses GTK3 with glib socket/signal watchers; macOS uses tao EventLoop with background threads.
+
+The settings frontend formats shortcut badges from the injected platform flag. On macOS, both `cmd` and `super` modifiers render as the `⌘` glyph, and the platform is injected before config so reopened settings windows do not fall back to Linux-style `Super` labels. Search indexes the raw shortcut plus modifier aliases, so queries like `command`, `cmd`, or `super` still find `⌘`-rendered keybindings. Bare `cmd+w` is handled at the tao window layer and closes the settings window through the same path as a native close request.
 
 ## Config Application
 
@@ -68,4 +70,4 @@ The settings app uses the same singleton structure as the server: a lock file pl
 
 ## State Persistence
 
-Window geometry and open state are saved to `$XDG_STATE_HOME/scribe/settings_state.toml` via [[crates/scribe-settings/src/state.rs]].
+Window geometry and open state are saved to the active flavor's state root, using `$XDG_STATE_HOME/scribe/settings_state.toml` for stable installs and `$XDG_STATE_HOME/scribe-dev/settings_state.toml` for `scribe-dev`, via [[crates/scribe-settings/src/state.rs]].

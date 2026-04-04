@@ -205,12 +205,12 @@ async fn attach_prefers_handoff_snapshot_over_blank_term() {
         let live = registry.read().await;
         Arc::clone(&live.get(&session_id).unwrap().term)
     };
-    let snapshot = ipc_server::take_session_snapshot(session_id, &term, &registry).await;
+    let snapshot = crate::attach_flow::take_session_snapshot(session_id, &term, &registry).await;
 
     assert!(snapshot.alt_screen, "should return handoff snapshot (alt_screen=true)");
     assert!(!snapshot.cursor_visible, "should return handoff snapshot (cursor_visible=false)");
 
     // Second call should fall back to the live Term (handoff snapshot consumed).
-    let snapshot2 = ipc_server::take_session_snapshot(session_id, &term, &registry).await;
+    let snapshot2 = crate::attach_flow::take_session_snapshot(session_id, &term, &registry).await;
     assert!(!snapshot2.alt_screen, "handoff consumed; blank Term has alt_screen=false");
 }

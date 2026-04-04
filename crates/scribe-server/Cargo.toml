@@ -86,6 +86,11 @@ assets = [
     "755",
   ],
   [
+    "../../dist/codex-task-label.sh",
+    "usr/share/scribe/codex-task-label.sh",
+    "755",
+  ],
+  [
     "../../dist/shell-integration/bash/scribe.bash",
     "usr/share/scribe/shell-integration/bash/",
     "644",
@@ -107,6 +112,101 @@ assets = [
   ],
 ]
 maintainer-scripts = "../../dist/debian/"
+
+[package.metadata.deb.variants.dev]
+name = "scribe-dev"
+assets = [
+  [
+    "target/release/scribe-server",
+    "usr/bin/scribe-dev-server",
+    "755",
+  ],
+  [
+    "target/release/scribe-client",
+    "usr/bin/scribe-dev",
+    "755",
+  ],
+  [
+    "target/release/scribe-settings",
+    "usr/bin/scribe-dev-settings",
+    "755",
+  ],
+  [
+    "../../dist/scribe-dev-server.service",
+    "usr/lib/systemd/user/scribe-dev-server.service",
+    "644",
+  ],
+  [
+    "../../dist/scribe-dev.desktop",
+    "usr/share/applications/scribe-dev.desktop",
+    "644",
+  ],
+  [
+    "../../dist/scribe-icon-48.png",
+    "usr/share/icons/hicolor/48x48/apps/scribe-dev.png",
+    "644",
+  ],
+  [
+    "../../dist/scribe-icon-128.png",
+    "usr/share/icons/hicolor/128x128/apps/scribe-dev.png",
+    "644",
+  ],
+  [
+    "../../dist/scribe-icon-256.png",
+    "usr/share/icons/hicolor/256x256/apps/scribe-dev.png",
+    "644",
+  ],
+  [
+    "../../dist/scribe-icon-512.png",
+    "usr/share/icons/hicolor/512x512/apps/scribe-dev.png",
+    "644",
+  ],
+  [
+    "../../dist/setup-claude-hooks.sh",
+    "usr/share/scribe-dev/setup-claude-hooks.sh",
+    "755",
+  ],
+  [
+    "../../dist/detect-claude-question.sh",
+    "usr/share/scribe-dev/detect-claude-question.sh",
+    "755",
+  ],
+  [
+    "../../dist/setup-codex-hooks.sh",
+    "usr/share/scribe-dev/setup-codex-hooks.sh",
+    "755",
+  ],
+  [
+    "../../dist/detect-codex-question.sh",
+    "usr/share/scribe-dev/detect-codex-question.sh",
+    "755",
+  ],
+  [
+    "../../dist/codex-task-label.sh",
+    "usr/share/scribe-dev/codex-task-label.sh",
+    "755",
+  ],
+  [
+    "../../dist/shell-integration/bash/scribe.bash",
+    "usr/share/scribe-dev/shell-integration/bash/",
+    "644",
+  ],
+  [
+    "../../dist/shell-integration/zsh/.zshenv",
+    "usr/share/scribe-dev/shell-integration/zsh/",
+    "644",
+  ],
+  [
+    "../../dist/shell-integration/zsh/scribe.zsh",
+    "usr/share/scribe-dev/shell-integration/zsh/",
+    "644",
+  ],
+  [
+    "../../dist/shell-integration/fish/vendor_conf.d/scribe.fish",
+    "usr/share/scribe-dev/shell-integration/fish/vendor_conf.d/",
+    "644",
+  ],
+]
 
 [package.metadata.cargo-machete]
 ignored = [

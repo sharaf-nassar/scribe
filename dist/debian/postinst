@@ -1,6 +1,34 @@
 #!/bin/bash
 set -e
 
+PACKAGE_NAME="${DPKG_MAINTSCRIPT_PACKAGE:-scribe}"
+if [ "$PACKAGE_NAME" = "scribe-dev" ]; then
+    APP_DISPLAY_NAME="Scribe Dev"
+    APP_SLUG="scribe-dev"
+    SERVER_BIN_NAME="scribe-dev-server"
+    CLIENT_BIN_NAME="scribe-dev"
+    SETTINGS_BIN_NAME="scribe-dev-settings"
+    AUTO_SETUP_HOOKS=0
+else
+    APP_DISPLAY_NAME="Scribe"
+    APP_SLUG="scribe"
+    SERVER_BIN_NAME="scribe-server"
+    CLIENT_BIN_NAME="scribe-client"
+    SETTINGS_BIN_NAME="scribe-settings"
+    AUTO_SETUP_HOOKS=1
+fi
+
+SERVER_BIN_PATH="/usr/bin/${SERVER_BIN_NAME}"
+CLIENT_BIN_PATH="/usr/bin/${CLIENT_BIN_NAME}"
+SETTINGS_BIN_PATH="/usr/bin/${SETTINGS_BIN_NAME}"
+SERVICE_NAME="${SERVER_BIN_NAME}"
+SHARE_DIR="/usr/share/${APP_SLUG}"
+# Opaque launch-contract stamp recorded for the running server. It is computed
+# from the runtime-critical maintainer-script behavior and installed service
+# unit so package installs hot-reload the server whenever those inputs change,
+# even if the server binary itself is unchanged.
+SERVER_RUNTIME_GENERATION=""
+
 # binary_changed PID INSTALLED_PATH
 # Returns 0 (true) if the binary changed or comparison failed, 1 (false) if unchanged.
 # Safety-first: any failure to compare treats as changed.
@@ -35,43 +63,117 @@ ensure_state_dir() {
     chown "${TARGET_UID}:${TARGET_UID}" "$STATE_DIR" 2>/dev/null || true
 }
 
-launch_user_binary() {
-    local binary="$1"
-
-    if [ -n "$SUDO_UID" ]; then
-        sudo -u "#${SUDO_UID}" \
-            ${DISPLAY:+"DISPLAY=$DISPLAY"} \
-            ${WAYLAND_DISPLAY:+"WAYLAND_DISPLAY=$WAYLAND_DISPLAY"} \
-            XDG_RUNTIME_DIR="$XDG_DIR" \
-            DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
-            nohup "$binary" >/dev/null 2>&1 &
+sha256_file_or_missing() {
+    local path="$1"
+    if [ -r "$path" ]; then
+        sha256sum "$path" 2>/dev/null | cut -d' ' -f1 || echo "unreadable"
     else
-        nohup "$binary" >/dev/null 2>&1 &
+        echo "missing"
     fi
 }
 
+emit_function_definition() {
+    local function_name="$1"
+    if declare -f "$function_name" >/dev/null 2>&1; then
+        declare -f "$function_name"
+    else
+        printf 'missing-function:%s\n' "$function_name"
+    fi
+}
+
+user_manager_env() {
+    local key="$1"
+    run_user_systemctl show-environment | sed -n "s/^${key}=//p" | head -n 1
+}
+
+server_runtime_generation_changed() {
+    local current=""
+    if [ -r "${SERVER_RUNTIME_GENERATION_FILE}" ]; then
+        current="$(tr -d '[:space:]' < "${SERVER_RUNTIME_GENERATION_FILE}" 2>/dev/null || true)"
+    fi
+    [ "$current" != "$SERVER_RUNTIME_GENERATION" ]
+}
+
+record_server_runtime_generation() {
+    printf '%s\n' "$SERVER_RUNTIME_GENERATION" > "${SERVER_RUNTIME_GENERATION_FILE}" 2>/dev/null || true
+    chmod 0600 "${SERVER_RUNTIME_GENERATION_FILE}" 2>/dev/null || true
+    chown "${TARGET_UID}:${TARGET_UID}" "${SERVER_RUNTIME_GENERATION_FILE}" 2>/dev/null || true
+}
+
+compute_server_runtime_generation() {
+    local service_unit="/usr/lib/systemd/user/${SERVICE_NAME}.service"
+    {
+        printf 'runtime-contract-v1\n'
+        printf 'app-slug=%s\n' "$APP_SLUG"
+        printf 'service-name=%s\n' "$SERVICE_NAME"
+        printf 'service-unit-sha256=%s\n' "$(sha256_file_or_missing "$service_unit")"
+        emit_function_definition run_user_systemctl
+        emit_function_definition user_manager_env
+        emit_function_definition run_user_command
+        emit_function_definition launch_user_binary
+        emit_function_definition cold_restart_server
+    } | sha256sum | cut -d' ' -f1
+}
+
+run_user_command() {
+    if [ -n "$SUDO_UID" ]; then
+        local display="$(user_manager_env DISPLAY)"
+        local wayland_display="$(user_manager_env WAYLAND_DISPLAY)"
+        local session_type="$(user_manager_env XDG_SESSION_TYPE)"
+        local xauthority="$(user_manager_env XAUTHORITY)"
+        local -a env_args=()
+
+        [ -z "$display" ] && display="${DISPLAY:-}"
+        [ -z "$wayland_display" ] && wayland_display="${WAYLAND_DISPLAY:-}"
+        [ -z "$session_type" ] && session_type="${XDG_SESSION_TYPE:-}"
+        [ -z "$xauthority" ] && xauthority="${XAUTHORITY:-}"
+
+        [ -n "$display" ] && env_args+=("DISPLAY=$display")
+        [ -n "$wayland_display" ] && env_args+=("WAYLAND_DISPLAY=$wayland_display")
+        [ -n "$session_type" ] && env_args+=("XDG_SESSION_TYPE=$session_type")
+        [ -n "$xauthority" ] && env_args+=("XAUTHORITY=$xauthority")
+
+        sudo -u "#${SUDO_UID}" \
+            "${env_args[@]}" \
+            XDG_RUNTIME_DIR="$XDG_DIR" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
+            "$@"
+    else
+        "$@"
+    fi
+}
+
+launch_user_binary() {
+    local binary="$1"
+
+    run_user_command nohup "$binary" >/dev/null 2>&1 &
+}
+
 cold_restart_server() {
-    # A detached `scribe-server --upgrade` is not the systemd unit's main PID,
+    # A detached `${SERVER_BIN_NAME} --upgrade` is not the systemd unit's main PID,
     # so `systemctl restart` alone can leave it behind holding the singleton
     # lock and IPC socket. Stop the unit, kill any surviving server processes,
     # clear stale sockets, then start the fresh unit.
     run_user_systemctl daemon-reload || true
-    run_user_systemctl stop scribe-server || true
+    run_user_systemctl stop "$SERVICE_NAME" || true
 
-    pkill -u "$TARGET_UID" -x scribe-server 2>/dev/null || true
+    # Use -f (match full cmdline) instead of -x (match comm) because Linux
+    # truncates comm to 15 chars — "scribe-dev-server" (17) silently becomes
+    # "scribe-dev-serv" and -x never matches.
+    pkill -u "$TARGET_UID" -f "$SERVER_BIN_PATH" 2>/dev/null || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        pgrep -u "$TARGET_UID" -x scribe-server >/dev/null 2>&1 || break
+        pgrep -u "$TARGET_UID" -f "$SERVER_BIN_PATH" >/dev/null 2>&1 || break
         sleep 0.2
     done
-    if pgrep -u "$TARGET_UID" -x scribe-server >/dev/null 2>&1; then
-        pkill -9 -u "$TARGET_UID" -x scribe-server 2>/dev/null || true
+    if pgrep -u "$TARGET_UID" -f "$SERVER_BIN_PATH" >/dev/null 2>&1; then
+        pkill -9 -u "$TARGET_UID" -f "$SERVER_BIN_PATH" 2>/dev/null || true
         sleep 0.2
     fi
 
-    rm -f "$SOCK" "${XDG_DIR}/scribe/handoff.sock" 2>/dev/null || true
+    rm -f "$SOCK" "${XDG_DIR}/${APP_SLUG}/handoff.sock" 2>/dev/null || true
 
-    run_user_systemctl reset-failed scribe-server || true
-    if run_user_systemctl start scribe-server; then
+    run_user_systemctl reset-failed "$SERVICE_NAME" || true
+    if run_user_systemctl start "$SERVICE_NAME"; then
         return 0
     fi
     return 1
@@ -103,45 +205,65 @@ restart_singleton_binary() {
     launch_user_binary "$binary"
 }
 
+SERVER_RUNTIME_GENERATION="$(compute_server_runtime_generation)"
+
 case "$1" in
     configure)
         TARGET_UID="${SUDO_UID:-$(id -u)}"
         XDG_DIR="/run/user/${TARGET_UID}"
-        STATE_DIR="/run/user/${TARGET_UID}/scribe"
+        STATE_DIR="/run/user/${TARGET_UID}/${APP_SLUG}"
         SOCK="${STATE_DIR}/server.sock"
+        SERVER_RUNTIME_GENERATION_FILE="${STATE_DIR}/server-runtime-generation"
 
         ensure_state_dir
         run_user_systemctl daemon-reload || true
 
-        # Check for a running server process, not just a stale socket file
+        # Check for a running server process, not just a stale socket file.
+        # Use -f (full cmdline match) — see cold_restart_server for rationale.
         SERVER_RUNNING=0
-        if [ -S "$SOCK" ] && pgrep -u "$TARGET_UID" -x scribe-server >/dev/null 2>&1; then
+        if [ -S "$SOCK" ] && pgrep -u "$TARGET_UID" -f "$SERVER_BIN_PATH" >/dev/null 2>&1; then
             SERVER_RUNNING=1
         fi
 
         if [ "$SERVER_RUNNING" = "1" ]; then
-            UPGRADE_BIN="/usr/bin/scribe-server"
+            UPGRADE_BIN="$SERVER_BIN_PATH"
             SERVER_READY=1
             SERVER_COLD_RESTARTED=0
 
             # Compare the newly installed binary against the running one.
             # /proc/PID/exe still points to the old (deleted) binary on disk;
             # the kernel keeps it readable until the process exits.
-            SERVER_PID="$(pgrep -u "$TARGET_UID" -x scribe-server | sort -n | head -1)"
+            SERVER_PID="$(pgrep -u "$TARGET_UID" -f "$SERVER_BIN_PATH" | sort -n | head -1)"
 
-            if ! binary_changed "$SERVER_PID" "$UPGRADE_BIN"; then
+            SERVER_BINARY_CHANGED=0
+            if binary_changed "$SERVER_PID" "$UPGRADE_BIN"; then
+                SERVER_BINARY_CHANGED=1
+            fi
+
+            SERVER_RUNTIME_CHANGED=0
+            if server_runtime_generation_changed; then
+                SERVER_RUNTIME_CHANGED=1
+            fi
+
+            if [ "$SERVER_BINARY_CHANGED" = "0" ] && [ "$SERVER_RUNTIME_CHANGED" = "0" ]; then
                 echo ""
-                echo "  Server binary unchanged — skipping server restart."
+                echo "  Server binary and runtime unchanged — skipping server restart."
             else
-                # Server binary changed — launch hot-reload in background.
+                # Server binary or runtime changed — launch hot-reload in background.
                 # The --upgrade process takes over from the old server (receives
                 # PTY fds, starts serving). We run it in the background because
                 # it continues running as the new server after handoff.
                 echo ""
-                echo "Scribe server is running. Starting hot-reload..."
+                if [ "$SERVER_BINARY_CHANGED" = "1" ] && [ "$SERVER_RUNTIME_CHANGED" = "1" ]; then
+                    echo "${APP_DISPLAY_NAME} server runtime and binary changed. Starting hot-reload..."
+                elif [ "$SERVER_BINARY_CHANGED" = "1" ]; then
+                    echo "${APP_DISPLAY_NAME} server binary changed. Starting hot-reload..."
+                else
+                    echo "${APP_DISPLAY_NAME} server runtime changed. Starting hot-reload..."
+                fi
                 # Use mktemp instead of predictable /tmp paths to prevent
                 # TOCTOU symlink attacks from other local users.
-                UPGRADE_LOG=$(mktemp /run/user/"${TARGET_UID}"/scribe/upgrade-log.XXXXXX) || \
+                UPGRADE_LOG=$(mktemp /run/user/"${TARGET_UID}"/"${APP_SLUG}"/upgrade-log.XXXXXX) || \
                     UPGRADE_LOG=$(mktemp)
                 # mktemp runs as root; chown so the user subprocess can write.
                 chown "${TARGET_UID}" "${UPGRADE_LOG}" 2>/dev/null || true
@@ -155,7 +277,7 @@ case "$1" in
                 # immediately, sudo exits, and the server is reparented to
                 # init.  The PID is captured via stdout.
                 if [ -n "$SUDO_UID" ]; then
-                    UPGRADE_PID=$(sudo -u "#${SUDO_UID}" sh -c '
+                    UPGRADE_PID=$(run_user_command sh -c '
                         "$1" --upgrade >"$2" 2>&1 &
                         echo $!
                     ' _ "${UPGRADE_BIN}" "${UPGRADE_LOG}")
@@ -182,7 +304,8 @@ case "$1" in
                 done
 
                 if [ "$UPGRADE_OK" = "1" ]; then
-                    echo "  ✓ Scribe server hot-reloaded successfully."
+                    record_server_runtime_generation
+                    echo "  ✓ ${APP_DISPLAY_NAME} server hot-reloaded successfully."
                     echo "    All terminal sessions have been preserved."
 
                     # The old server exits on its own after handoff (clean exit
@@ -228,12 +351,13 @@ case "$1" in
 
                     if cold_restart_server; then
                         SERVER_COLD_RESTARTED=1
+                        record_server_runtime_generation
                         echo ""
                         echo "  ✓ Scribe server restarted with new version."
                     else
                         echo ""
                         echo "  ✗ Scribe server restart failed."
-                        echo "    Run 'systemctl --user status scribe-server' for details."
+                        echo "    Run 'systemctl --user status ${SERVICE_NAME}' for details."
                         SERVER_READY=0
                     fi
                 fi
@@ -246,7 +370,7 @@ case "$1" in
                 # Pick first PID for hash comparison (all instances run the same binary).
                 FIRST_CLIENT_PID="${CLIENT_PIDS%% *}"
                 if [ "$SERVER_COLD_RESTARTED" = "1" ] || \
-                    binary_changed "$FIRST_CLIENT_PID" "/usr/bin/scribe-client"; then
+                    binary_changed "$FIRST_CLIENT_PID" "$CLIENT_BIN_PATH"; then
                     echo "  Relaunching client..."
                     # Kill old client instances. If the server also changed, old
                     # clients may already be exiting via ServerDisconnected — the
@@ -266,7 +390,7 @@ case "$1" in
                     # automatically spawns a separate process (with --window-id)
                     # for each of them.
                     sleep 0.5
-                    launch_user_binary /usr/bin/scribe-client
+                    launch_user_binary "$CLIENT_BIN_PATH"
                 else
                     echo "  Client binary unchanged — skipping restart."
                 fi
@@ -277,8 +401,8 @@ case "$1" in
             # Relaunch settings only if the binary changed.
             SETTINGS_PID=$(cat "${STATE_DIR}/upgrade-settings-pid" 2>/dev/null | tr -d '[:space:]' || true)
             if [ "$SERVER_READY" = "1" ] && [ -n "$SETTINGS_PID" ]; then
-                if binary_changed "$SETTINGS_PID" "/usr/bin/scribe-settings"; then
-                    restart_singleton_binary "settings" "$SETTINGS_PID" /usr/bin/scribe-settings
+                if binary_changed "$SETTINGS_PID" "$SETTINGS_BIN_PATH"; then
+                    restart_singleton_binary "settings" "$SETTINGS_PID" "$SETTINGS_BIN_PATH"
                 else
                     echo "  Settings binary unchanged — skipping restart."
                 fi
@@ -288,7 +412,7 @@ case "$1" in
 
             # Clean up all upgrade state files and logs.
             rm -f "${STATE_DIR}/upgrade-client-pids" "${STATE_DIR}/upgrade-settings-pid" 2>/dev/null || true
-            rm -f /run/user/"${TARGET_UID}"/scribe/upgrade-log.* 2>/dev/null || true
+            rm -f /run/user/"${TARGET_UID}"/"${APP_SLUG}"/upgrade-log.* 2>/dev/null || true
             echo ""
         else
             # Fresh install: clean up any stale socket and start the service
@@ -298,35 +422,41 @@ case "$1" in
 
             if [ -n "$SUDO_UID" ] && [ -d "$XDG_DIR" ]; then
                 run_user_systemctl daemon-reload && \
-                run_user_systemctl enable scribe-server && \
-                run_user_systemctl start scribe-server && \
+                run_user_systemctl enable "$SERVICE_NAME" && \
+                run_user_systemctl start "$SERVICE_NAME" && \
                 STARTED=1
             elif [ -z "$SUDO_UID" ]; then
                 run_user_systemctl daemon-reload && \
-                run_user_systemctl enable scribe-server && \
-                run_user_systemctl start scribe-server && \
+                run_user_systemctl enable "$SERVICE_NAME" && \
+                run_user_systemctl start "$SERVICE_NAME" && \
                 STARTED=1
             fi
 
             if [ "$STARTED" = "1" ]; then
-                echo "  ✓ Scribe server enabled and started."
-                echo "    Run 'scribe-client' to open a terminal."
+                record_server_runtime_generation
+                echo "  ✓ ${APP_DISPLAY_NAME} server enabled and started."
+                echo "    Run '${CLIENT_BIN_NAME}' to open a terminal."
             else
                 echo ""
-                echo "  Scribe installed successfully."
+                echo "  ${APP_DISPLAY_NAME} installed successfully."
                 echo ""
                 echo "  To start the server, run:"
-                echo "    systemctl --user enable --now scribe-server"
+                echo "    systemctl --user enable --now ${SERVICE_NAME}"
                 echo ""
                 echo "  Then launch the terminal:"
-                echo "    scribe-client"
+                echo "    ${CLIENT_BIN_NAME}"
             fi
             echo ""
         fi
 
+        if [ "$AUTO_SETUP_HOOKS" != "1" ]; then
+            echo "  Skipping Claude/Codex hook setup for ${APP_DISPLAY_NAME} to keep the stable install isolated."
+            echo ""
+        fi
+
         # ── Claude Code hook integration (both fresh and upgrade) ───────
-        SETUP_SCRIPT="/usr/share/scribe/setup-claude-hooks.sh"
-        if [ -x "$SETUP_SCRIPT" ]; then
+        SETUP_SCRIPT="${SHARE_DIR}/setup-claude-hooks.sh"
+        if [ "$AUTO_SETUP_HOOKS" = "1" ] && [ -x "$SETUP_SCRIPT" ]; then
             TARGET_HOME=$(eval echo "~$(id -un "$TARGET_UID")" 2>/dev/null) || true
             CLAUDE_DIR="${TARGET_HOME}/.claude"
 
@@ -335,16 +465,16 @@ case "$1" in
                 if [ -n "$SUDO_UID" ]; then
                     sudo -u "#${SUDO_UID}" \
                         HOME="$TARGET_HOME" \
-                        "$SETUP_SCRIPT" --hook-source /usr/share/scribe 2>&1 | sed 's/^/  /'
+                        "$SETUP_SCRIPT" --hook-source "$SHARE_DIR" 2>&1 | sed 's/^/  /'
                 else
-                    "$SETUP_SCRIPT" --hook-source /usr/share/scribe 2>&1 | sed 's/^/  /'
+                    "$SETUP_SCRIPT" --hook-source "$SHARE_DIR" 2>&1 | sed 's/^/  /'
                 fi
             fi
         fi
 
         # ── Codex hook integration (both fresh and upgrade) ──────────────
-        SETUP_SCRIPT="/usr/share/scribe/setup-codex-hooks.sh"
-        if [ -x "$SETUP_SCRIPT" ]; then
+        SETUP_SCRIPT="${SHARE_DIR}/setup-codex-hooks.sh"
+        if [ "$AUTO_SETUP_HOOKS" = "1" ] && [ -x "$SETUP_SCRIPT" ]; then
             TARGET_HOME=$(eval echo "~$(id -un "$TARGET_UID")" 2>/dev/null) || true
             CODEX_DIR="${TARGET_HOME}/.codex"
 
@@ -353,9 +483,9 @@ case "$1" in
                 if [ -n "$SUDO_UID" ]; then
                     sudo -u "#${SUDO_UID}" \
                         HOME="$TARGET_HOME" \
-                        "$SETUP_SCRIPT" --hook-source /usr/share/scribe 2>&1 | sed 's/^/  /'
+                        "$SETUP_SCRIPT" --hook-source "$SHARE_DIR" 2>&1 | sed 's/^/  /'
                 else
-                    "$SETUP_SCRIPT" --hook-source /usr/share/scribe 2>&1 | sed 's/^/  /'
+                    "$SETUP_SCRIPT" --hook-source "$SHARE_DIR" 2>&1 | sed 's/^/  /'
                 fi
             fi
         fi

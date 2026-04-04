@@ -294,6 +294,7 @@ struct AiStateBuilder {
     agent: Option<String>,
     model: Option<String>,
     context: Option<u8>,
+    conversation_id: Option<String>,
 }
 
 impl Default for AiStateBuilder {
@@ -305,6 +306,7 @@ impl Default for AiStateBuilder {
             agent: None,
             model: None,
             context: None,
+            conversation_id: None,
         }
     }
 }
@@ -328,6 +330,9 @@ impl AiStateBuilder {
             "agent" => self.agent = Some(truncate_chars(value, MAX_AI_FIELD_LEN)),
             "model" => self.model = Some(truncate_chars(value, MAX_AI_FIELD_LEN)),
             "context" => self.context = value.parse().ok(),
+            "conversation_id" => {
+                self.conversation_id = Some(sanitize_text_payload(value, MAX_AI_FIELD_LEN));
+            }
             _ => {} // Ignore unknown keys (forward compatibility)
         }
     }
@@ -341,6 +346,7 @@ impl AiStateBuilder {
             agent: self.agent,
             model: self.model,
             context: self.context,
+            conversation_id: self.conversation_id,
         }))
     }
 }
@@ -423,6 +429,26 @@ mod tests {
 
     fn parse_iterm2(payload: &[&[u8]]) -> Option<MetadataEvent> {
         MetadataParser::new(SessionId::new()).process_osc(payload)
+    }
+
+    #[test]
+    fn parses_codex_processing_state_with_conversation_id() {
+        let event = parse_iterm2(&[
+            b"1337",
+            b"CodexState=processing",
+            b"tool=Bash",
+            b"conversation_id=abc-123",
+        ]);
+
+        match event {
+            Some(MetadataEvent::AiStateChanged(ai_state)) => {
+                assert_eq!(ai_state.provider, AiProvider::CodexCode);
+                assert_eq!(ai_state.state, AiState::Processing);
+                assert_eq!(ai_state.tool.as_deref(), Some("Bash"));
+                assert_eq!(ai_state.conversation_id.as_deref(), Some("abc-123"));
+            }
+            other => panic!("expected Codex processing state, got {other:?}"),
+        }
     }
 
     #[test]

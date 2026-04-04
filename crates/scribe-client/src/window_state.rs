@@ -8,6 +8,7 @@
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
+use scribe_common::app::current_state_dir;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use winit::event_loop::ActiveEventLoop;
@@ -54,7 +55,7 @@ impl<T: Serialize + DeserializeOwned + Default> StateStore<T> {
     /// Returns a store with `Default::default()` data if the file is absent,
     /// unreadable, or unparseable.
     pub fn load(filename: &str) -> (Self, T) {
-        let path = dirs::state_dir().map(|d| d.join("scribe").join(filename));
+        let path = current_state_dir().map(|dir| dir.join(filename));
 
         let data = path.as_ref().map_or_else(
             || {
@@ -139,7 +140,7 @@ pub struct WindowRegistry {
 impl WindowRegistry {
     /// Load the registry, resolving the directory path once.
     pub fn new() -> Self {
-        Self { dir: dirs::state_dir().map(|d| d.join("scribe").join("windows")) }
+        Self { dir: current_state_dir().map(|dir| dir.join("windows")) }
     }
 
     /// Load geometry for a specific window.
@@ -211,7 +212,7 @@ impl WindowRegistry {
         &self,
         window_id: scribe_common::ids::WindowId,
     ) -> Option<WindowGeometry> {
-        let legacy_path = dirs::state_dir().map(|d| d.join("scribe").join("state.toml"))?;
+        let legacy_path = current_state_dir().map(|dir| dir.join("state.toml"))?;
         let content = std::fs::read_to_string(&legacy_path).ok()?;
         let geom: WindowGeometry = toml::from_str(&content).ok()?;
 

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use scribe_common::app::current_identity;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -18,16 +19,16 @@ const GITHUB_API_URL: &str = "https://api.github.com/repos/sharaf-nassar/scribe/
 const MINISIGN_PUBLIC_KEY: &str = "RWSEN3ob4jI+FaJ5K+IIhUKdE6GZ9PvrCilK9ra2n/ajSZO6u6uRuILJ";
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const ASSET_SUFFIX: &str = "linux-x86_64.deb";
+const STABLE_ASSET_SUFFIX: &str = "linux-x86_64.deb";
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const ASSET_SUFFIX: &str = "linux-arm64.deb";
+const STABLE_ASSET_SUFFIX: &str = "linux-arm64.deb";
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const ASSET_SUFFIX: &str = "macos-arm64.dmg";
+const STABLE_ASSET_SUFFIX: &str = "macos-arm64.dmg";
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-const ASSET_SUFFIX: &str = "macos-x86_64.dmg";
+const STABLE_ASSET_SUFFIX: &str = "macos-x86_64.dmg";
 
 // ── GitHub API types ──────────────────────────────────────────────
 
@@ -72,6 +73,10 @@ impl UpdaterHandle {
 
 fn api_url() -> String {
     std::env::var("SCRIBE_UPDATE_API_URL").unwrap_or_else(|_| GITHUB_API_URL.to_owned())
+}
+
+fn asset_suffix() -> Option<&'static str> {
+    (!current_identity().is_dev()).then_some(STABLE_ASSET_SUFFIX)
 }
 
 /// Spawn the background updater task and return a handle for IPC control.
@@ -259,6 +264,10 @@ async fn check_for_update(
     client: &reqwest::Client,
     channel: UpdateChannel,
 ) -> Result<Option<(String, String)>, ScribeError> {
+    if current_identity().is_dev() {
+        return Ok(None);
+    }
+
     let release = fetch_latest_release(client).await?;
 
     if release.draft || (release.prerelease && channel == UpdateChannel::Stable) {
@@ -279,10 +288,18 @@ async fn check_for_update(
 async fn fetch_asset_urls(
     client: &reqwest::Client,
 ) -> Result<(String, String, String), ScribeError> {
+    let Some(asset_suffix) = asset_suffix() else {
+        return Err(ScribeError::UpdateInstallFailed {
+            reason: String::from("auto-update is disabled for scribe-dev installs"),
+        });
+    };
+
     let release = fetch_latest_release(client).await?;
 
-    let asset = find_asset(&release.assets).ok_or_else(|| ScribeError::UpdateInstallFailed {
-        reason: format!("no asset matching '{ASSET_SUFFIX}' in release"),
+    let asset = find_asset(&release.assets, asset_suffix).ok_or_else(|| {
+        ScribeError::UpdateInstallFailed {
+            reason: format!("no asset matching '{asset_suffix}' in release"),
+        }
     })?;
 
     let sig = find_signature(&release.assets, &asset.name).ok_or_else(|| {
@@ -295,8 +312,8 @@ async fn fetch_asset_urls(
     Ok((asset.browser_download_url.clone(), sig.browser_download_url.clone(), version))
 }
 
-fn find_asset(assets: &[GhAsset]) -> Option<&GhAsset> {
-    assets.iter().find(|a| a.name.ends_with(ASSET_SUFFIX))
+fn find_asset<'a>(assets: &'a [GhAsset], asset_suffix: &str) -> Option<&'a GhAsset> {
+    assets.iter().find(|a| a.name.ends_with(asset_suffix))
 }
 
 fn find_signature<'a>(assets: &'a [GhAsset], asset_name: &str) -> Option<&'a GhAsset> {

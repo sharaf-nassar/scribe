@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 
 use crate::ai_state::AiProvider;
-
+use crate::app::current_config_dir;
 use crate::error::ScribeError;
 use crate::theme::{self, Theme, ThemeColors, hex_to_rgba, rgba_to_hex};
 
@@ -19,7 +19,7 @@ pub const MAX_BINDINGS: usize = 5;
 /// Deserializes from either a bare TOML string (`"ctrl+shift+w"`) for backward
 /// compatibility, or a TOML array (`["ctrl+shift+w", "ctrl+w"]`).  Always
 /// serializes as an array.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyComboList(pub Vec<String>);
 
 impl KeyComboList {
@@ -791,7 +791,7 @@ fn default_split_horizontal() -> KeyComboList {
 }
 
 fn default_close_pane() -> KeyComboList {
-    platform_combo("cmd+w", "ctrl+shift+w")
+    platform_combo("super+ctrl+w", "ctrl+shift+w")
 }
 
 fn default_cycle_pane() -> KeyComboList {
@@ -986,6 +986,159 @@ fn default_line_end() -> KeyComboList {
     KeyComboList::single("ctrl+end")
 }
 
+#[cfg(target_os = "macos")]
+fn migrate_legacy_macos_keybindings(config: &mut ScribeConfig, raw_content: &str) -> bool {
+    let legacy_hint = raw_content.contains("\ncycle_workspace") || raw_content.contains("\ndriver");
+    let score = legacy_macos_keybinding_score(&config.keybindings);
+    if !(score >= 14 || (legacy_hint && score >= 4)) {
+        return false;
+    }
+
+    let kb = &mut config.keybindings;
+    let mut changed = false;
+
+    changed |=
+        migrate_keybinding(&mut kb.split_vertical, default_split_vertical(), &["ctrl+shift+\\"]);
+    changed |=
+        migrate_keybinding(&mut kb.split_horizontal, default_split_horizontal(), &["ctrl+shift+-"]);
+    changed |= migrate_keybinding(&mut kb.close_pane, default_close_pane(), &["ctrl+shift+w"]);
+    changed |= migrate_keybinding(
+        &mut kb.focus_left,
+        default_focus_left(),
+        &["ctrl+alt+left", "shift+ctrl+alt+left"],
+    );
+    changed |= migrate_keybinding(
+        &mut kb.focus_right,
+        default_focus_right(),
+        &["ctrl+alt+right", "shift+ctrl+alt+right"],
+    );
+    changed |= migrate_keybinding(
+        &mut kb.focus_up,
+        default_focus_up(),
+        &["ctrl+alt+up", "shift+ctrl+alt+up"],
+    );
+    changed |= migrate_keybinding(
+        &mut kb.focus_down,
+        default_focus_down(),
+        &["ctrl+alt+down", "shift+ctrl+alt+down"],
+    );
+    changed |= migrate_keybinding(
+        &mut kb.workspace_split_vertical,
+        default_workspace_split_vertical(),
+        &["ctrl+alt+\\"],
+    );
+    changed |= migrate_keybinding(
+        &mut kb.workspace_split_horizontal,
+        default_workspace_split_horizontal(),
+        &["ctrl+alt+-"],
+    );
+    changed |= migrate_keybinding(&mut kb.new_tab, default_new_tab(), &["ctrl+shift+t"]);
+    changed |= migrate_keybinding(&mut kb.close_tab, default_close_tab(), &["ctrl+shift+q"]);
+    changed |= migrate_keybinding(&mut kb.next_tab, default_next_tab(), &["ctrl+pagedown"]);
+    changed |= migrate_keybinding(&mut kb.prev_tab, default_prev_tab(), &["ctrl+pageup"]);
+    changed |=
+        migrate_keybinding(&mut kb.select_tab_1, default_select_tab_1(), &["ctrl+1", "alt+1"]);
+    changed |=
+        migrate_keybinding(&mut kb.select_tab_2, default_select_tab_2(), &["ctrl+2", "alt+2"]);
+    changed |=
+        migrate_keybinding(&mut kb.select_tab_3, default_select_tab_3(), &["ctrl+3", "alt+3"]);
+    changed |=
+        migrate_keybinding(&mut kb.select_tab_4, default_select_tab_4(), &["ctrl+4", "alt+4"]);
+    changed |=
+        migrate_keybinding(&mut kb.select_tab_5, default_select_tab_5(), &["ctrl+5", "alt+5"]);
+    changed |=
+        migrate_keybinding(&mut kb.select_tab_6, default_select_tab_6(), &["ctrl+6", "alt+6"]);
+    changed |=
+        migrate_keybinding(&mut kb.select_tab_7, default_select_tab_7(), &["ctrl+7", "alt+7"]);
+    changed |=
+        migrate_keybinding(&mut kb.select_tab_8, default_select_tab_8(), &["ctrl+8", "alt+8"]);
+    changed |=
+        migrate_keybinding(&mut kb.select_tab_9, default_select_tab_9(), &["ctrl+9", "alt+9"]);
+    changed |= migrate_keybinding(&mut kb.copy, default_copy(), &["ctrl+shift+c"]);
+    changed |= migrate_keybinding(&mut kb.paste, default_paste(), &["ctrl+shift+v"]);
+    changed |= migrate_keybinding(&mut kb.scroll_top, default_scroll_top(), &["shift+home"]);
+    changed |= migrate_keybinding(&mut kb.scroll_bottom, default_scroll_bottom(), &["shift+end"]);
+    changed |= migrate_keybinding(&mut kb.find, default_find(), &["ctrl+shift+f"]);
+    changed |= migrate_keybinding(&mut kb.zoom_in, default_zoom_in(), &["ctrl+="]);
+    changed |= migrate_keybinding(&mut kb.zoom_out, default_zoom_out(), &["ctrl+-"]);
+    changed |= migrate_keybinding(&mut kb.zoom_reset, default_zoom_reset(), &["ctrl+0"]);
+    changed |= migrate_keybinding(&mut kb.new_window, default_new_window(), &["ctrl+shift+n"]);
+    changed |= migrate_keybinding(&mut kb.settings, default_settings(), &["ctrl+,"]);
+    changed |=
+        migrate_keybinding(&mut kb.command_palette, default_command_palette(), &["ctrl+shift+p"]);
+
+    changed
+}
+
+#[cfg(target_os = "macos")]
+fn legacy_macos_keybinding_score(kb: &KeybindingsConfig) -> usize {
+    usize::from(keybinding_matches_any(&kb.split_vertical, &["ctrl+shift+\\"]))
+        + usize::from(keybinding_matches_any(&kb.split_horizontal, &["ctrl+shift+-"]))
+        + usize::from(keybinding_matches_any(&kb.close_pane, &["ctrl+shift+w"]))
+        + usize::from(keybinding_matches_any(
+            &kb.focus_left,
+            &["ctrl+alt+left", "shift+ctrl+alt+left"],
+        ))
+        + usize::from(keybinding_matches_any(
+            &kb.focus_right,
+            &["ctrl+alt+right", "shift+ctrl+alt+right"],
+        ))
+        + usize::from(keybinding_matches_any(&kb.focus_up, &["ctrl+alt+up", "shift+ctrl+alt+up"]))
+        + usize::from(keybinding_matches_any(
+            &kb.focus_down,
+            &["ctrl+alt+down", "shift+ctrl+alt+down"],
+        ))
+        + usize::from(keybinding_matches_any(&kb.workspace_split_vertical, &["ctrl+alt+\\"]))
+        + usize::from(keybinding_matches_any(&kb.workspace_split_horizontal, &["ctrl+alt+-"]))
+        + usize::from(keybinding_matches_any(&kb.new_tab, &["ctrl+shift+t"]))
+        + usize::from(keybinding_matches_any(&kb.close_tab, &["ctrl+shift+q"]))
+        + usize::from(keybinding_matches_any(&kb.next_tab, &["ctrl+pagedown"]))
+        + usize::from(keybinding_matches_any(&kb.prev_tab, &["ctrl+pageup"]))
+        + usize::from(keybinding_matches_any(&kb.select_tab_1, &["ctrl+1", "alt+1"]))
+        + usize::from(keybinding_matches_any(&kb.select_tab_2, &["ctrl+2", "alt+2"]))
+        + usize::from(keybinding_matches_any(&kb.select_tab_3, &["ctrl+3", "alt+3"]))
+        + usize::from(keybinding_matches_any(&kb.select_tab_4, &["ctrl+4", "alt+4"]))
+        + usize::from(keybinding_matches_any(&kb.select_tab_5, &["ctrl+5", "alt+5"]))
+        + usize::from(keybinding_matches_any(&kb.select_tab_6, &["ctrl+6", "alt+6"]))
+        + usize::from(keybinding_matches_any(&kb.select_tab_7, &["ctrl+7", "alt+7"]))
+        + usize::from(keybinding_matches_any(&kb.select_tab_8, &["ctrl+8", "alt+8"]))
+        + usize::from(keybinding_matches_any(&kb.select_tab_9, &["ctrl+9", "alt+9"]))
+        + usize::from(keybinding_matches_any(&kb.copy, &["ctrl+shift+c"]))
+        + usize::from(keybinding_matches_any(&kb.paste, &["ctrl+shift+v"]))
+        + usize::from(keybinding_matches_any(&kb.scroll_top, &["shift+home"]))
+        + usize::from(keybinding_matches_any(&kb.scroll_bottom, &["shift+end"]))
+        + usize::from(keybinding_matches_any(&kb.find, &["ctrl+shift+f"]))
+        + usize::from(keybinding_matches_any(&kb.zoom_in, &["ctrl+="]))
+        + usize::from(keybinding_matches_any(&kb.zoom_out, &["ctrl+-"]))
+        + usize::from(keybinding_matches_any(&kb.zoom_reset, &["ctrl+0"]))
+        + usize::from(keybinding_matches_any(&kb.new_window, &["ctrl+shift+n"]))
+        + usize::from(keybinding_matches_any(&kb.settings, &["ctrl+,"]))
+        + usize::from(keybinding_matches_any(&kb.command_palette, &["ctrl+shift+p"]))
+}
+
+#[cfg(target_os = "macos")]
+fn migrate_keybinding(
+    binding: &mut KeyComboList,
+    mac_default: KeyComboList,
+    legacy: &[&str],
+) -> bool {
+    if keybinding_matches_any(binding, legacy) {
+        *binding = mac_default;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn keybinding_matches_any(binding: &KeyComboList, candidates: &[&str]) -> bool {
+    if binding.as_slice().len() != 1 {
+        return false;
+    }
+    let current = &binding.as_slice()[0];
+    candidates.iter().any(|candidate| current.eq_ignore_ascii_case(candidate))
+}
+
 // ---------------------------------------------------------------------------
 // Workspaces
 // ---------------------------------------------------------------------------
@@ -1065,12 +1218,12 @@ fn default_update_check_interval_secs() -> u64 {
 ///
 /// Returns `ScribeConfig::default()` if the file does not exist.
 pub fn load_config() -> Result<ScribeConfig, ScribeError> {
-    let Some(config_dir) = dirs::config_dir() else {
+    let Some(config_dir) = current_config_dir() else {
         tracing::info!("no config directory found, using defaults");
         return Ok(ScribeConfig::default());
     };
 
-    let config_path = config_dir.join("scribe").join("config.toml");
+    let config_path = config_dir.join("config.toml");
 
     let content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
@@ -1092,6 +1245,11 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
 
     config.appearance = config.appearance.clamped();
 
+    #[cfg(target_os = "macos")]
+    if migrate_legacy_macos_keybindings(&mut config, &content) {
+        tracing::info!(?config_path, "migrated legacy non-mac keybindings to macOS defaults");
+    }
+
     Ok(config)
 }
 
@@ -1099,18 +1257,17 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
 ///
 /// Creates parent directories if they do not exist.
 pub fn save_config(config: &ScribeConfig) -> Result<(), ScribeError> {
-    let Some(config_dir) = dirs::config_dir() else {
+    let Some(config_dir) = current_config_dir() else {
         return Err(ScribeError::ConfigError {
             reason: String::from("could not determine config directory"),
         });
     };
 
-    let scribe_dir = config_dir.join("scribe");
-    std::fs::create_dir_all(&scribe_dir).map_err(|e| ScribeError::ConfigError {
-        reason: format!("failed to create config directory {}: {e}", scribe_dir.display()),
+    std::fs::create_dir_all(&config_dir).map_err(|e| ScribeError::ConfigError {
+        reason: format!("failed to create config directory {}: {e}", config_dir.display()),
     })?;
 
-    let config_path = scribe_dir.join("config.toml");
+    let config_path = config_dir.join("config.toml");
     let content = toml::to_string_pretty(config)
         .map_err(|e| ScribeError::ConfigError { reason: format!("TOML serialize error: {e}") })?;
 
@@ -1221,11 +1378,11 @@ fn load_theme_file(name: &str) -> Theme {
 
 /// Fallible theme file loading.
 fn try_load_theme_file(name: &str) -> Result<Theme, ScribeError> {
-    let config_dir = dirs::config_dir().ok_or_else(|| ScribeError::ConfigError {
+    let config_dir = current_config_dir().ok_or_else(|| ScribeError::ConfigError {
         reason: String::from("could not determine config directory"),
     })?;
 
-    let theme_path = config_dir.join("scribe").join("themes").join(format!("{name}.toml"));
+    let theme_path = config_dir.join("themes").join(format!("{name}.toml"));
 
     let content = std::fs::read_to_string(&theme_path).map_err(|e| ScribeError::ConfigError {
         reason: format!("failed to read {}: {e}", theme_path.display()),
@@ -1235,4 +1392,43 @@ fn try_load_theme_file(name: &str) -> Result<Theme, ScribeError> {
         .map_err(|e| ScribeError::ConfigError { reason: format!("theme parse error: {e}") })?;
 
     try_build_theme_from_config(&tc)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{KeyComboList, ScribeConfig, migrate_legacy_macos_keybindings};
+
+    #[test]
+    fn migrates_legacy_non_mac_defaults_when_config_looks_stale() {
+        let mut config = ScribeConfig::default();
+        config.keybindings.split_vertical = KeyComboList::single("ctrl+shift+\\");
+        config.keybindings.close_pane = KeyComboList::single("ctrl+shift+w");
+        config.keybindings.new_tab = KeyComboList::single("ctrl+shift+t");
+        config.keybindings.copy = KeyComboList::single("ctrl+shift+c");
+        config.keybindings.paste = KeyComboList::single("ctrl+shift+v");
+        config.keybindings.find = KeyComboList::single("ctrl+shift+f");
+        config.keybindings.new_window = KeyComboList::single("ctrl+shift+n");
+        config.keybindings.settings = KeyComboList::single("ctrl+,");
+
+        let raw = "[keybindings]\ndriver = [\"ctrl+shift+d\"]\n";
+        assert!(migrate_legacy_macos_keybindings(&mut config, raw));
+
+        assert_eq!(config.keybindings.split_vertical, KeyComboList::single("cmd+d"));
+        assert_eq!(config.keybindings.close_pane, KeyComboList::single("super+ctrl+w"));
+        assert_eq!(config.keybindings.new_tab, KeyComboList::single("cmd+t"));
+        assert_eq!(config.keybindings.copy, KeyComboList::single("cmd+c"));
+        assert_eq!(config.keybindings.paste, KeyComboList::single("cmd+v"));
+        assert_eq!(config.keybindings.find, KeyComboList::single("cmd+f"));
+        assert_eq!(config.keybindings.new_window, KeyComboList::single("cmd+n"));
+        assert_eq!(config.keybindings.settings, KeyComboList::single("cmd+,"));
+    }
+
+    #[test]
+    fn leaves_one_off_non_mac_customizations_alone() {
+        let mut config = ScribeConfig::default();
+        config.keybindings.close_pane = KeyComboList::single("ctrl+shift+w");
+
+        assert!(!migrate_legacy_macos_keybindings(&mut config, ""));
+        assert_eq!(config.keybindings.close_pane, KeyComboList::single("ctrl+shift+w"));
+    }
 }

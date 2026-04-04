@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Scribe terminal emulator — bash shell integration
-# Sourced via the ENV variable when bash starts in POSIX mode inside Scribe.
+# Loaded via --rcfile for interactive bash sessions inside Scribe.
 
 # ---------------------------------------------------------------------------
 # Guards
@@ -27,21 +27,33 @@ set +o posix 2>/dev/null
 
 # ---------------------------------------------------------------------------
 # Source user startup files
-# --rcfile replaces ~/.bashrc, so we must source it ourselves.
+# --rcfile replaces ~/.bashrc, so we must source startup files ourselves.
+# On macOS, Terminal.app historically launches bash as a login shell, so many
+# users keep their interactive setup in ~/.bash_profile. Scribe still uses a
+# non-login bash to keep shell integration attached, so emulate the login-shell
+# startup order on Darwin before falling back to ~/.bashrc.
 # ---------------------------------------------------------------------------
 
 # Unset ENV to prevent re-sourcing in child shells
 unset ENV
 
-if shopt -q login_shell; then
-	# Login shell: source profile files
+__scribe_source_login_profile() {
 	[[ -f /etc/profile ]] && source /etc/profile
 	for f in ~/.bash_profile ~/.bash_login ~/.profile; do
 		if [[ -f "$f" ]]; then
 			source "$f"
-			break  # bash only sources the FIRST one found
+			return 0  # bash only sources the FIRST one found
 		fi
 	done
+	return 1
+}
+
+if shopt -q login_shell; then
+	__scribe_source_login_profile
+elif [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+	if ! __scribe_source_login_profile; then
+		[[ -f ~/.bashrc ]] && source ~/.bashrc
+	fi
 else
 	# Non-login interactive: source .bashrc
 	[[ -f ~/.bashrc ]] && source ~/.bashrc

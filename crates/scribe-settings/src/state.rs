@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use scribe_common::app::current_state_dir;
+
 use crate::SettingsWindowGeometry;
 
 /// Persisted settings window state.
@@ -19,7 +21,7 @@ pub struct SettingsState {
 
 /// Resolve the state file path: `$XDG_STATE_HOME/scribe/settings_state.toml`.
 fn state_path() -> Option<PathBuf> {
-    dirs::state_dir().map(|d| d.join("scribe").join("settings_state.toml"))
+    current_state_dir().map(|dir| dir.join("settings_state.toml"))
 }
 
 /// Load settings state from disk. Returns defaults if absent or unparseable.

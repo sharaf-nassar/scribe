@@ -1,4 +1,14 @@
 #!/bin/bash
+PACKAGE_NAME="${DPKG_MAINTSCRIPT_PACKAGE:-scribe}"
+if [ "$PACKAGE_NAME" = "scribe-dev" ]; then
+    APP_SLUG="scribe-dev"
+    SERVER_BIN_NAME="scribe-dev-server"
+else
+    APP_SLUG="scribe"
+    SERVER_BIN_NAME="scribe-server"
+fi
+SERVER_BIN_PATH="/usr/bin/${SERVER_BIN_NAME}"
+
 case "$1" in
     remove|purge)
         TARGET_UID="${SUDO_UID:-$(id -u)}"
@@ -10,22 +20,24 @@ case "$1" in
             sudo -u "#${SUDO_UID}" \
                 XDG_RUNTIME_DIR="$XDG_DIR" \
                 DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
-                systemctl --user stop scribe-server 2>/dev/null || true
+                systemctl --user stop "$SERVER_BIN_NAME" 2>/dev/null || true
             sudo -u "#${SUDO_UID}" \
                 XDG_RUNTIME_DIR="$XDG_DIR" \
                 DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
-                systemctl --user disable scribe-server 2>/dev/null || true
+                systemctl --user disable "$SERVER_BIN_NAME" 2>/dev/null || true
         elif [ -z "$SUDO_UID" ]; then
-            systemctl --user stop scribe-server 2>/dev/null || true
-            systemctl --user disable scribe-server 2>/dev/null || true
+            systemctl --user stop "$SERVER_BIN_NAME" 2>/dev/null || true
+            systemctl --user disable "$SERVER_BIN_NAME" 2>/dev/null || true
         fi
 
-        # Fallback: kill any remaining scribe-server processes for this user
-        pkill -u "$TARGET_UID" -x scribe-server 2>/dev/null || true
+        # Fallback: kill any remaining server processes for this user.
+        # Use -f (full cmdline) — comm is truncated to 15 chars, breaking -x
+        # for "scribe-dev-server" (17 chars).
+        pkill -u "$TARGET_UID" -f "$SERVER_BIN_PATH" 2>/dev/null || true
 
         # Clean up socket
-        rm -f "${XDG_DIR}/scribe/server.sock" 2>/dev/null || true
-        rm -f "${XDG_DIR}/scribe/handoff.sock" 2>/dev/null || true
+        rm -f "${XDG_DIR}/${APP_SLUG}/server.sock" 2>/dev/null || true
+        rm -f "${XDG_DIR}/${APP_SLUG}/handoff.sock" 2>/dev/null || true
         ;;
 esac
 

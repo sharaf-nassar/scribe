@@ -13,6 +13,8 @@ mod layout;
 mod mouse_reporting;
 mod mouse_state;
 mod pane;
+mod restore_replay;
+mod restore_state;
 mod scrollbar;
 mod search_overlay;
 mod selection;
@@ -36,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::Dimensions as _;
 use scribe_common::ai_state::AiProvider;
+use scribe_common::app::{current_identity, current_state_dir};
 use scribe_common::config::{ContentPadding, ScribeConfig, resolve_theme};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
@@ -58,6 +61,28 @@ use crate::layout::{PaneEdges, PaneId, Rect};
 use crate::pane::{FeedOutputResult, Pane};
 use crate::workspace_layout::WindowLayout;
 
+#[cfg(target_os = "macos")]
+fn is_macos_close_window_shortcut(
+    event: &winit::event::KeyEvent,
+    modifiers: ModifiersState,
+) -> bool {
+    event.state.is_pressed()
+        && !event.repeat
+        && modifiers.super_key()
+        && !modifiers.control_key()
+        && !modifiers.alt_key()
+        && !modifiers.shift_key()
+        && matches!(&event.logical_key, Key::Character(ch) if ch.eq_ignore_ascii_case("w"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_macos_close_window_shortcut(
+    _event: &winit::event::KeyEvent,
+    _modifiers: ModifiersState,
+) -> bool {
+    false
+}
+
 /// GPU resources shared across all panes.
 struct GpuContext {
     surface: wgpu::Surface<'static>,
@@ -76,21 +101,6 @@ enum ScrollbarAction {
     StartDrag { display_offset: usize },
     JumpTo { delta: i32 },
 }
-
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "drain results track three independent rendering facts: current-frame visibility, queued follow-up work, and open sync state"
-)]
-struct PendingOutputDrainResult {
-    needs_redraw: bool,
-    has_more: bool,
-    sync_pending: bool,
-}
-
-/// Once a pane accumulates more than this many committed PTY bursts, stop
-/// replaying them one redraw at a time and catch up to the latest committed
-/// terminal state instead.
-const OUTPUT_FRAME_CATCH_UP_THRESHOLD: usize = 4;
 
 /// State for an in-progress tab drag-reorder operation.
 struct TabDrag {
@@ -131,6 +141,8 @@ type SessionMetadata<'a> = (
     Option<&'a str>,
     Option<&'a std::path::PathBuf>,
     Option<&'a scribe_common::protocol::SessionContext>,
+    Option<&'a str>,
+    Option<AiProvider>,
     Option<&'a str>,
 );
 type SessionMetadataMap<'a> = HashMap<SessionId, SessionMetadata<'a>>;
@@ -199,6 +211,10 @@ struct App {
     server_connected: bool,
     /// Destructive shutdown requested by this window and awaiting server acknowledgment.
     pending_shutdown: Option<PendingShutdown>,
+    /// Persisted logical restore state for this client window.
+    restore_store: restore_state::RestoreStore,
+    /// Debounce marker for the next restore snapshot write.
+    restore_save_pending: Option<Instant>,
 
     // AI state
     ai_tracker: AiStateTracker,
@@ -334,6 +350,11 @@ struct App {
     /// System resource stats collector for the status bar.
     sys_stats: sys_stats::SystemStatsCollector,
 
+    /// Pending PTY output bytes, accumulated per session and drained in
+    /// `about_to_wait`. Coalescing output processing ensures input events
+    /// are never blocked behind a queue of `PtyOutput` messages.
+    pending_pty_bytes: HashMap<SessionId, Vec<u8>>,
+
     /// Per-pane URL span caches (dirty-flag lazy refresh).
     url_caches: HashMap<PaneId, url_detect::PaneUrlCache>,
     /// The URL span the cursor is currently hovering over, if any.
@@ -398,6 +419,8 @@ impl App {
             line_drag_anchor: None,
             server_connected: false,
             pending_shutdown: None,
+            restore_store: restore_state::RestoreStore::new(),
+            restore_save_pending: None,
             ai_tracker: AiStateTracker::new(claude_states),
             animation_running: false,
             animation_stop: Arc::new(AtomicBool::new(false)),
@@ -455,6 +478,7 @@ impl App {
             active_tooltip: None,
             hostname: read_hostname(),
             sys_stats: sys_stats::SystemStatsCollector::new(),
+            pending_pty_bytes: HashMap::new(),
             url_caches: HashMap::new(),
             hovered_url: None,
             _config_watcher: config_watcher,
@@ -493,9 +517,11 @@ impl ApplicationHandler<UiEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UiEvent) {
         match event {
             UiEvent::PtyOutput { session_id, data } => {
-                self.handle_pty_output(session_id, &data);
+                self.pending_pty_bytes.entry(session_id).or_default().extend_from_slice(&data);
             }
             UiEvent::ScreenSnapshot { session_id, snapshot } => {
+                // Discard any buffered bytes — the snapshot replaces VTE state.
+                self.pending_pty_bytes.remove(&session_id);
                 self.handle_screen_snapshot(session_id, &snapshot);
             }
             UiEvent::SessionCreated { session_id, shell_name, .. } => {
@@ -603,10 +629,11 @@ impl ApplicationHandler<UiEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.has_pending_output_frames() {
-            self.request_redraw();
-            event_loop.set_control_flow(ControlFlow::Poll);
-        } else if self.cursor_blink_enabled {
+        // Drain coalesced PTY output — all input events have already been
+        // processed, so keystrokes are never blocked behind output messages.
+        self.drain_pending_pty_output();
+
+        if self.cursor_blink_enabled {
             let elapsed = self.blink_timer.elapsed();
             if elapsed >= BLINK_INTERVAL {
                 // Blink interval elapsed — request a redraw so `handle_redraw`
@@ -628,10 +655,12 @@ impl ApplicationHandler<UiEvent> for App {
 
         self.flush_geometry_if_due();
         self.flush_resize_if_due();
+        self.flush_restore_if_due();
     }
 
     #[allow(
         clippy::too_many_lines,
+        clippy::excessive_nesting,
         reason = "dispatches close/update dialog intercepts and main event variants; splitting adds indirection"
     )]
     fn window_event(
@@ -657,6 +686,9 @@ impl ApplicationHandler<UiEvent> for App {
                     self.modifiers = new_mods.state();
                 }
                 WindowEvent::KeyboardInput { event: ref key_event, .. } => {
+                    if self.handle_native_close_window_shortcut(key_event, event_loop) {
+                        return;
+                    }
                     self.handle_dialog_keyboard(key_event, event_loop);
                 }
                 WindowEvent::MouseInput {
@@ -696,6 +728,9 @@ impl ApplicationHandler<UiEvent> for App {
                     self.modifiers = new_mods.state();
                 }
                 WindowEvent::KeyboardInput { event: ref key_event, .. } => {
+                    if self.handle_native_close_window_shortcut(key_event, event_loop) {
+                        return;
+                    }
                     self.handle_update_dialog_keyboard(key_event);
                 }
                 WindowEvent::MouseInput {
@@ -736,6 +771,9 @@ impl ApplicationHandler<UiEvent> for App {
                 self.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if self.handle_native_close_window_shortcut(&event, event_loop) {
+                    return;
+                }
                 if self.window_focused && !self.compositor_overlay_active() {
                     self.handle_keyboard(&event);
                 }
@@ -785,6 +823,19 @@ impl ApplicationHandler<UiEvent> for App {
 // ---------------------------------------------------------------------------
 
 impl App {
+    fn handle_native_close_window_shortcut(
+        &mut self,
+        event: &winit::event::KeyEvent,
+        event_loop: &ActiveEventLoop,
+    ) -> bool {
+        if is_macos_close_window_shortcut(event, self.modifiers) {
+            self.handle_close_requested(event_loop);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Initialise the window, wgpu surface/device/queue, renderer, layout,
     /// and IPC thread.
     #[allow(
@@ -957,92 +1008,27 @@ impl App {
         self.request_redraw();
     }
 
+    /// Drain all pending PTY output buffers, feeding coalesced bytes into
+    /// their panes in a single VTE advance per session.
+    fn drain_pending_pty_output(&mut self) {
+        if self.pending_pty_bytes.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_pty_bytes);
+        for (session_id, data) in pending {
+            self.handle_pty_output(session_id, &data);
+        }
+    }
+
     fn handle_pty_output(&mut self, session_id: SessionId, bytes: &[u8]) {
         let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
-        self.enqueue_pane_output_frames(pane_id, bytes);
-    }
+        let Some(feed) = self.apply_pane_output_bytes(pane_id, bytes) else { return };
 
-    fn enqueue_pane_output_frames(&mut self, pane_id: PaneId, bytes: &[u8]) {
-        let queue_was_empty =
-            self.panes.get(&pane_id).is_some_and(|pane| pane.pending_output_frames.is_empty());
-        let queued_any = {
-            let Some(pane) = self.panes.get_mut(&pane_id) else { return };
-            pane.queue_output_frames(bytes)
-        };
-
-        if !queued_any {
-            return;
+        if feed.sync_pending {
+            self.ensure_animation_running();
         }
-
-        // On X11, redraw delivery can lag behind bursts of user events. When
-        // the pane was idle, advance to the first committed frame immediately
-        // so the next render has fresh content instead of starting from an
-        // accumulated backlog.
-        if queue_was_empty && let Some(result) = self.drain_pane_output_until_frame(pane_id) {
-            if result.sync_pending {
-                self.ensure_animation_running();
-            }
-            // A single immediate-drain frame still needs its own redraw so
-            // typed echo is presented without waiting for a later event.
-            if result.needs_redraw || result.has_more {
-                self.request_redraw();
-            }
-            return;
-        }
-
-        self.request_redraw();
-    }
-
-    fn drain_pending_output_frames(&mut self) -> bool {
-        let pane_ids: Vec<PaneId> = self
-            .panes
-            .iter()
-            .filter_map(|(&pane_id, pane)| {
-                (!pane.pending_output_frames.is_empty()).then_some(pane_id)
-            })
-            .collect();
-        let mut request_redraw = false;
-
-        for pane_id in pane_ids {
-            let Some(result) = self.drain_pane_output_until_frame(pane_id) else { continue };
-            if result.sync_pending {
-                self.ensure_animation_running();
-            }
-            request_redraw |= result.has_more;
-        }
-
-        request_redraw
-    }
-
-    fn drain_pane_output_until_frame(
-        &mut self,
-        pane_id: PaneId,
-    ) -> Option<PendingOutputDrainResult> {
-        let mut sync_pending = false;
-        let catch_up_to_latest = self
-            .panes
-            .get(&pane_id)
-            .is_some_and(|pane| pane.pending_output_frames.len() > OUTPUT_FRAME_CATCH_UP_THRESHOLD);
-
-        loop {
-            let bytes = {
-                let pane = self.panes.get_mut(&pane_id)?;
-                pane.pending_output_frames.pop_front()?
-            };
-            let feed = self.apply_pane_output_bytes(pane_id, &bytes)?;
-            let remaining_frames =
-                self.panes.get(&pane_id).map_or(0, |pane| pane.pending_output_frames.len());
-            let has_more = remaining_frames != 0;
-            sync_pending |= feed.sync_pending;
-            let keep_draining = catch_up_to_latest && has_more;
-
-            if !keep_draining && (feed.needs_redraw || !has_more) {
-                return Some(PendingOutputDrainResult {
-                    needs_redraw: feed.needs_redraw,
-                    has_more,
-                    sync_pending,
-                });
-            }
+        if feed.needs_redraw {
+            self.request_redraw();
         }
     }
 
@@ -1080,9 +1066,17 @@ impl App {
             cache.mark_dirty();
         }
 
+        // Standard terminal behavior: visible output clears the active
+        // selection in the focused pane unless the user is actively dragging.
+        let focused_pane = self.window_layout.active_tab().map(|t| t.focused_pane);
+        if focused_pane == Some(pane_id) && !self.mouse_selecting {
+            self.active_selection = None;
+            self.word_drag_anchor = None;
+            self.line_drag_anchor = None;
+        }
+
         // Adjust selections to follow scrollback growth.
         if delta != 0 {
-            let focused_pane = self.window_layout.active_tab().map(|t| t.focused_pane);
             if focused_pane == Some(pane_id) {
                 self.shift_active_selection(delta, topmost);
             } else {
@@ -1212,7 +1206,7 @@ impl App {
         self.legacy_workspace_direction_updates.clear();
 
         if sessions.is_empty() {
-            self.create_initial_session();
+            self.try_cold_restart_or_fresh();
             return;
         }
 
@@ -1235,6 +1229,8 @@ impl App {
                         s.cwd.as_ref(),
                         s.context.as_ref(),
                         Some(s.shell_name.as_str()),
+                        s.ai_state.as_ref().map(|state| state.provider).or(s.ai_provider_hint),
+                        s.ai_state.as_ref().and_then(|state| state.conversation_id.as_deref()),
                     ),
                 )
             })
@@ -1491,7 +1487,21 @@ impl App {
                 eff_tbh,
                 &pane::effective_padding(&self.config.appearance.content_padding, pane_edges),
             );
-            let mut pane = Pane::new(pane_rect, grid, pane_sid, ws_id, pane_edges);
+            let binding = if let Some((_, _, cwd, _, _, Some(provider), conversation_id)) =
+                metadata.get(&pane_sid)
+            {
+                restore_replay::new_ai_binding(
+                    *provider,
+                    restore_state::AiResumeMode::Resume,
+                    cwd.cloned(),
+                    conversation_id.map(ToOwned::to_owned),
+                )
+            } else {
+                restore_replay::new_shell_binding(
+                    metadata.get(&pane_sid).and_then(|(_, _, cwd, _, _, _, _)| cwd.cloned()),
+                )
+            };
+            let mut pane = Pane::new(pane_rect, grid, pane_sid, ws_id, pane_edges, binding);
             apply_session_metadata(&mut pane, metadata);
             self.panes.insert(pane_id, pane);
             self.url_caches.insert(pane_id, url_detect::PaneUrlCache::new());
@@ -1509,7 +1519,18 @@ impl App {
         let Some(pane_id) = self.window_layout.add_tab(workspace_id, session_id) else { return };
 
         let Some((_first_id, pane_rect, grid)) = self.first_pane_geometry() else { return };
-        let pane = Pane::new(pane_rect, grid, session_id, workspace_id, PaneEdges::all_external());
+        let pane = Pane::new(
+            pane_rect,
+            grid,
+            session_id,
+            workspace_id,
+            PaneEdges::all_external(),
+            restore_state::LaunchBinding {
+                launch_id: SessionId::new().to_full_string(),
+                kind: restore_state::LaunchKind::Shell,
+                fallback_cwd: None,
+            },
+        );
 
         send_command(
             tx,
@@ -1528,6 +1549,78 @@ impl App {
 
         // Seed the server with the initial (single-leaf) tree.
         self.report_workspace_tree();
+    }
+
+    /// Try to restore the previous layout from a cold restart snapshot.
+    /// Falls back to a fresh session if no snapshot is available or replay
+    /// fails.
+    fn try_cold_restart_or_fresh(&mut self) {
+        let claimed = self.restore_store.claim_first_window();
+        let restored = claimed.as_ref().is_some_and(|(snapshot, _)| {
+            tracing::info!(
+                window_id = %snapshot.window_id,
+                "restoring window layout from cold restart snapshot"
+            );
+            self.replay_cold_restart(snapshot)
+        });
+        if restored {
+            let remaining = claimed.map_or(0, |(_, r)| r);
+            (0..remaining).for_each(|_| spawn_fresh_client_process());
+        } else {
+            self.create_initial_session();
+        }
+    }
+
+    /// Rebuild the window layout from a cold restart snapshot and create
+    /// sessions for each saved pane.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "viewport dimensions are small enough to fit in f32"
+    )]
+    fn replay_cold_restart(&mut self, snapshot: &restore_state::WindowRestoreState) -> bool {
+        let Some(tx) = self.cmd_tx.clone() else { return false };
+        let Some(gpu) = self.gpu.as_ref() else { return false };
+        let Some(window) = self.window.as_ref() else { return false };
+
+        let mut replay =
+            restore_replay::prepare_replay(snapshot, &mut self.window_layout, &mut self.panes);
+
+        // Recompute pane geometry now that the window is known.
+        let win_size = window.inner_size();
+        let viewport = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: win_size.width as f32,
+            height: (win_size.height as f32 - self.config.appearance.status_bar_height).max(1.0),
+        };
+        let cell = gpu.renderer.cell_size();
+        self.recompute_replay_pane_geometry(viewport, cell);
+
+        // Drive the replay queue: create a session for each saved pane.
+        while let Some(launch) = restore_replay::next_launch(&mut replay) {
+            self.session_to_pane.insert(launch.placeholder_session_id, launch.pane_id);
+            self.url_caches.insert(launch.pane_id, url_detect::PaneUrlCache::new());
+            self.pending_sessions.push_back(launch.placeholder_session_id);
+
+            let term_size = self
+                .panes
+                .get(&launch.pane_id)
+                .and_then(|pane| self.terminal_size_for_grid(pane.grid));
+
+            send_command(
+                &tx,
+                ClientCommand::CreateSession {
+                    workspace_id: launch.workspace_id,
+                    split_direction: None,
+                    cwd: launch.cwd.clone(),
+                    size: term_size,
+                    command: restore_replay::command_argv(&launch.command),
+                },
+            );
+        }
+
+        self.report_workspace_tree();
+        true
     }
 
     /// Return the configured single-row tab bar height.
@@ -1567,6 +1660,49 @@ impl App {
             row_h,
             badge_cols,
         )
+    }
+
+    /// Update geometry (rect, grid, Term dimensions) on every pane in the
+    /// restored layout so they match the current window viewport.
+    fn recompute_replay_pane_geometry(
+        &mut self,
+        viewport: Rect,
+        cell: scribe_renderer::types::CellSize,
+    ) {
+        // Collect (pane_id, rect, edges, tab_bar_h) to avoid borrowing the
+        // layout while mutating panes.
+        let ws_rects = self.window_layout.compute_workspace_rects(viewport);
+        let pane_geom: Vec<_> = ws_rects
+            .iter()
+            .filter_map(|&(ws_id, ws_rect)| {
+                let workspace = self.window_layout.find_workspace(ws_id)?;
+                let tab_count = workspace.tabs.len().max(1);
+                let tbh = self.tab_bar_height_for_tab_count(ws_id, ws_rect, tab_count);
+                Some(workspace.tabs.iter().flat_map(move |tab| {
+                    tab.pane_layout
+                        .compute_rects(ws_rect)
+                        .into_iter()
+                        .map(move |(pid, rect, edges)| (pid, rect, edges, tbh))
+                }))
+            })
+            .flatten()
+            .collect();
+
+        for (pane_id, pane_rect, pane_edges, tab_bar_h) in pane_geom {
+            let Some(pane) = self.panes.get_mut(&pane_id) else { continue };
+            let eff_tbh = if pane_edges.top { tab_bar_h } else { 0.0 };
+            let grid = pane::compute_pane_grid(
+                pane_rect,
+                cell.width,
+                cell.height,
+                eff_tbh,
+                &pane::effective_padding(&self.config.appearance.content_padding, pane_edges),
+            );
+            pane.rect = pane_rect;
+            pane.grid = grid;
+            pane.edges = pane_edges;
+            pane.resize_term_only(grid.cols, grid.rows);
+        }
     }
 
     /// Compute the tab bar height for the currently focused workspace.
@@ -1789,6 +1925,8 @@ impl App {
         session_id: SessionId,
         ai_state: scribe_common::ai_state::AiProcessState,
     ) {
+        self.update_ai_launch_binding(session_id, &ai_state);
+
         let provider_enabled = self.config.terminal.ai_provider_enabled(ai_state.provider);
         tracing::debug!(
             session = %session_id,
@@ -1807,6 +1945,31 @@ impl App {
         }
 
         self.request_redraw();
+    }
+
+    fn update_ai_launch_binding(
+        &mut self,
+        session_id: SessionId,
+        ai_state: &scribe_common::ai_state::AiProcessState,
+    ) {
+        let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
+        let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+        let next_kind = restore_state::LaunchKind::Ai {
+            provider: ai_state.provider,
+            resume_mode: restore_state::AiResumeMode::Resume,
+            conversation_id: ai_state.conversation_id.clone(),
+        };
+
+        if let restore_state::LaunchKind::Ai { provider, conversation_id, .. } =
+            &pane.launch_binding.kind
+        {
+            if *provider == ai_state.provider && *conversation_id == ai_state.conversation_id {
+                return;
+            }
+        }
+
+        pane.launch_binding.kind = next_kind;
+        self.mark_restore_dirty();
     }
 
     /// Handle animation timer tick.
@@ -2270,7 +2433,6 @@ impl App {
     )]
     fn handle_redraw(&mut self) {
         self.sync_surface_to_window();
-        let request_redraw = self.drain_pending_output_frames();
 
         let Some(gpu) = &mut self.gpu else { return };
 
@@ -2313,7 +2475,7 @@ impl App {
 
             self.send_deferred_list_sessions();
 
-            if self.splash_content_ready || request_redraw {
+            if self.splash_content_ready {
                 self.request_redraw();
             }
 
@@ -2766,9 +2928,6 @@ impl App {
         gpu.queue.submit(std::iter::once(encoder.finish()));
         self.notify_pre_present();
         frame.present();
-        if request_redraw {
-            self.request_redraw();
-        }
     }
 
     /// Reconfigure the surface and renderer on window resize.
@@ -3048,7 +3207,18 @@ impl App {
             eff_tbh,
             &pane::effective_padding(&self.config.appearance.content_padding, new_edges),
         );
-        let pane = Pane::new(new_rect, grid, session_id, workspace_id, new_edges);
+        let pane = Pane::new(
+            new_rect,
+            grid,
+            session_id,
+            workspace_id,
+            new_edges,
+            restore_state::LaunchBinding {
+                launch_id: SessionId::new().to_full_string(),
+                kind: restore_state::LaunchKind::Shell,
+                fallback_cwd: inherited_cwd.clone(),
+            },
+        );
 
         self.panes.insert(new_pane_id, pane);
         self.url_caches.insert(new_pane_id, url_detect::PaneUrlCache::new());
@@ -3115,8 +3285,18 @@ impl App {
             tab_bar_h,
             &self.config.appearance.content_padding,
         );
-        let pane =
-            Pane::new(ws_rect, grid, session_id, new_workspace_id, PaneEdges::all_external());
+        let pane = Pane::new(
+            ws_rect,
+            grid,
+            session_id,
+            new_workspace_id,
+            PaneEdges::all_external(),
+            restore_state::LaunchBinding {
+                launch_id: SessionId::new().to_full_string(),
+                kind: restore_state::LaunchKind::Shell,
+                fallback_cwd: None,
+            },
+        );
 
         self.panes.insert(pane_id, pane);
         self.url_caches.insert(pane_id, url_detect::PaneUrlCache::new());
@@ -3275,7 +3455,7 @@ impl App {
     }
 
     fn ai_tab_command(&self, resume: bool) -> Vec<String> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
+        let shell = scribe_common::shell::default_shell_program();
         let command = match (self.config.terminal.ai_tab_provider, resume) {
             (AiProvider::ClaudeCode, false) => String::from("exec claude"),
             (AiProvider::ClaudeCode, true) => String::from("exec claude --resume"),
@@ -3297,6 +3477,47 @@ impl App {
         self.create_new_tab(Some(self.ai_tab_command(true)));
     }
 
+    fn launch_binding_for_command(
+        command: Option<&Vec<String>>,
+        inherited_cwd: Option<std::path::PathBuf>,
+    ) -> restore_state::LaunchBinding {
+        match command {
+            None => restore_replay::new_shell_binding(inherited_cwd),
+            Some(argv) if restore_replay::is_ai_command(argv, AiProvider::ClaudeCode, true) => {
+                restore_replay::new_ai_binding(
+                    AiProvider::ClaudeCode,
+                    restore_state::AiResumeMode::Resume,
+                    inherited_cwd,
+                    None,
+                )
+            }
+            Some(argv) if restore_replay::is_ai_command(argv, AiProvider::CodexCode, true) => {
+                restore_replay::new_ai_binding(
+                    AiProvider::CodexCode,
+                    restore_state::AiResumeMode::Resume,
+                    inherited_cwd,
+                    None,
+                )
+            }
+            Some(argv) if restore_replay::is_ai_command(argv, AiProvider::ClaudeCode, false) => {
+                restore_replay::new_ai_binding(
+                    AiProvider::ClaudeCode,
+                    restore_state::AiResumeMode::New,
+                    inherited_cwd,
+                    None,
+                )
+            }
+            Some(argv) if restore_replay::is_ai_command(argv, AiProvider::CodexCode, false) => {
+                restore_replay::new_ai_binding(
+                    AiProvider::CodexCode,
+                    restore_state::AiResumeMode::New,
+                    inherited_cwd,
+                    None,
+                )
+            }
+            Some(argv) => restore_replay::new_custom_binding(argv.clone(), inherited_cwd),
+        }
+    }
     fn create_new_tab(&mut self, command: Option<Vec<String>>) {
         // Capture the focused pane's CWD before add_tab changes the active tab.
         let inherited_cwd = self
@@ -3327,7 +3548,14 @@ impl App {
             tab_bar_h,
             &self.config.appearance.content_padding,
         );
-        let pane = Pane::new(ws_rect, grid, session_id, workspace_id, PaneEdges::all_external());
+        let pane = Pane::new(
+            ws_rect,
+            grid,
+            session_id,
+            workspace_id,
+            PaneEdges::all_external(),
+            Self::launch_binding_for_command(command.as_ref(), inherited_cwd.clone()),
+        );
 
         self.panes.insert(pane_id, pane);
         self.url_caches.insert(pane_id, url_detect::PaneUrlCache::new());
@@ -4219,7 +4447,7 @@ impl App {
     ///
     /// Send the current workspace split tree to the server so it can be
     /// persisted for reconnect and handoff.
-    fn report_workspace_tree(&self) {
+    fn report_workspace_tree(&mut self) {
         if let Some(tx) = &self.cmd_tx {
             // Invert the session→pane map so serialisation can look up the session
             // for each PaneId in the layout tree.
@@ -4228,6 +4456,7 @@ impl App {
             let tree = self.window_layout.to_tree(&pane_to_session);
             send_command(tx, ClientCommand::ReportWorkspaceTree { tree });
         }
+        self.mark_restore_dirty();
     }
 
     /// Open the settings window or focus it if already running.
@@ -5960,10 +6189,6 @@ impl App {
         }
     }
 
-    fn has_pending_output_frames(&self) -> bool {
-        self.panes.values().any(|pane| !pane.pending_output_frames.is_empty())
-    }
-
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -6310,11 +6535,14 @@ impl App {
     fn handle_server_disconnected(&mut self, event_loop: &ActiveEventLoop) {
         tracing::info!("server disconnected, exiting");
         self.server_connected = false;
-        match self.pending_shutdown {
-            Some(PendingShutdown::CloseWindow { window_id }) => {
-                self.window_registry.remove(window_id);
-            }
-            _ => self.flush_geometry_now(),
+        if let Some(PendingShutdown::CloseWindow { window_id }) = self.pending_shutdown {
+            self.window_registry.remove(window_id);
+            self.clear_restore_state();
+        } else {
+            // Server crashed — preserve restore state for cold restart
+            // and flush any pending snapshot.
+            self.flush_restore_now();
+            self.flush_geometry_now();
         }
         self.pending_shutdown = None;
         self.request_redraw();
@@ -6333,6 +6561,7 @@ impl App {
             }
             _ => self.flush_geometry_now(),
         }
+        self.clear_restore_state();
         self.pending_shutdown = None;
         event_loop.exit();
     }
@@ -6354,6 +6583,7 @@ impl App {
 
         quit_settings_process();
         self.flush_geometry_now();
+        self.clear_restore_state();
         event_loop.exit();
     }
 
@@ -6384,6 +6614,7 @@ impl App {
             Some(PendingShutdown::CloseWindow { window_id: pending }) if pending == window_id => {
                 tracing::info!(%window_id, "window close acknowledged by server");
                 self.window_registry.remove(window_id);
+                self.clear_restore_state();
                 self.pending_shutdown = None;
                 event_loop.exit();
             }
@@ -6401,6 +6632,46 @@ impl App {
             tracing::warn!("failed to persist window geometry: {e}");
         }
         self.geometry_save_pending = None;
+    }
+
+    // -- Restore state persistence ---------------------------------------------
+
+    /// Mark that the window layout has changed and a restore snapshot should
+    /// be saved after the debounce interval.
+    fn mark_restore_dirty(&mut self) {
+        if self.restore_save_pending.is_none() {
+            self.restore_save_pending = Some(Instant::now());
+        }
+    }
+
+    /// Flush restore state to disk if the debounce interval has elapsed.
+    fn flush_restore_if_due(&mut self) {
+        if self.restore_save_pending.is_some_and(|t| t.elapsed() >= RESTORE_DEBOUNCE) {
+            self.flush_restore_now();
+        }
+    }
+
+    /// Immediately persist the current window layout as a restore snapshot.
+    fn flush_restore_now(&mut self) {
+        let Some(wid) = self.window_id else { return };
+        let snapshot =
+            restore_replay::snapshot_window_restore(wid, &self.window_layout, &self.panes);
+        if let Err(e) = self.restore_store.save_window(&snapshot) {
+            tracing::warn!("failed to persist restore state: {e}");
+        }
+        if let Err(e) = self.restore_store.upsert_index(wid) {
+            tracing::warn!("failed to update restore index: {e}");
+        }
+        self.restore_save_pending = None;
+    }
+
+    /// Remove this window's restore state from disk (explicit close/quit).
+    fn clear_restore_state(&mut self) {
+        let Some(wid) = self.window_id else { return };
+        if let Err(e) = self.restore_store.remove_from_index(wid) {
+            tracing::warn!("failed to remove window from restore index: {e}");
+        }
+        self.restore_store.remove_window(wid);
     }
 
     /// Start the animation timer thread for AI state pulsing.
@@ -6450,7 +6721,9 @@ fn run_animation_loop(proxy: EventLoopProxy<UiEvent>, stop: Arc<AtomicBool>) {
 /// Apply stored title, Codex task label, and CWD from a metadata lookup to a
 /// newly created pane during reconnection.
 fn apply_session_metadata(pane: &mut Pane, metadata: &SessionMetadataMap<'_>) {
-    if let Some(&(title, task_label, cwd, context, shell_name)) = metadata.get(&pane.session_id) {
+    if let Some(&(title, task_label, cwd, context, shell_name, _provider, _conversation_id)) =
+        metadata.get(&pane.session_id)
+    {
         if let Some(title) = title {
             if !title.trim().is_empty() {
                 title.clone_into(&mut pane.title);
@@ -6584,6 +6857,9 @@ const GEOMETRY_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Debounce interval for resize IPC sends (window drag fires rapidly).
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(30);
+
+/// Debounce interval for restore snapshot saves.
+const RESTORE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Dimming factor applied to RGB channels of unfocused pane content.
 const UNFOCUSED_DIM: f32 = 0.50;
@@ -7634,7 +7910,8 @@ fn snapshot_to_ansi(snapshot: &scribe_common::screen::ScreenSnapshot) -> Vec<u8>
     // Hide cursor, move home, clear screen, reset attributes.
     buf.push_str("\x1b[?25l\x1b[H\x1b[2J\x1b[0m");
 
-    let mut is_first_row = true;
+    let mut wrote_row = false;
+    let mut previous_row_wrapped = false;
 
     // SGR diff state: start from the known-reset state (we just emitted \x1b[0m
     // above), so the first cell will only emit SGR if it differs from defaults.
@@ -7644,20 +7921,22 @@ fn snapshot_to_ansi(snapshot: &scribe_common::screen::ScreenSnapshot) -> Vec<u8>
     // As these overflow the visible area, they naturally flow into the
     // client Term's scrollback buffer — the same mechanism as normal use.
     for row in 0..scrollback_rows {
-        if !is_first_row {
+        if wrote_row && !previous_row_wrapped {
             buf.push_str("\r\n");
         }
-        is_first_row = false;
         write_snapshot_row(&mut buf, &snapshot.scrollback, row, cols, &mut sgr_state);
+        previous_row_wrapped = row_wraps(&snapshot.scrollback, row, cols);
+        wrote_row = true;
     }
 
     // --- Visible lines ---
     for row in 0..visible_rows {
-        if !is_first_row {
+        if wrote_row && !previous_row_wrapped {
             buf.push_str("\r\n");
         }
-        is_first_row = false;
         write_snapshot_row(&mut buf, &snapshot.cells, row, cols, &mut sgr_state);
+        previous_row_wrapped = row_wraps(&snapshot.cells, row, cols);
+        wrote_row = true;
     }
 
     // Reset attributes, position cursor, show cursor if visible.
@@ -7729,6 +8008,18 @@ fn write_snapshot_row(
             buf.push(cell.c);
         }
     }
+}
+
+/// Whether the given row soft-wraps into the next row.
+fn row_wraps(cells: &[scribe_common::screen::ScreenCell], row: usize, cols: usize) -> bool {
+    if cols == 0 {
+        return false;
+    }
+
+    row.checked_mul(cols)
+        .and_then(|base| base.checked_add(cols - 1))
+        .and_then(|idx| cells.get(idx))
+        .is_some_and(|cell| cell.flags.wrap)
 }
 
 /// Write SGR escape sequences for a cell's foreground, background, and flags.
@@ -7900,9 +8191,10 @@ fn open_or_focus_settings() {
 
 /// Spawn the `scribe-settings` binary as a detached process.
 fn spawn_settings_process() {
-    let exe =
-        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("scribe-settings"));
-    let settings_exe = exe.with_file_name("scribe-settings");
+    let identity = current_identity();
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from(identity.client_binary_name()));
+    let settings_exe = exe.with_file_name(identity.settings_binary_name());
 
     match std::process::Command::new(&settings_exe).spawn() {
         Ok(child) => {
@@ -7924,10 +8216,10 @@ fn restore_settings_if_open() {
         open: bool,
     }
 
-    let Some(state_dir) = dirs::state_dir() else {
+    let Some(state_dir) = current_state_dir() else {
         return;
     };
-    let path = state_dir.join("scribe").join("settings_state.toml");
+    let path = state_dir.join("settings_state.toml");
     let Ok(content) = std::fs::read_to_string(&path) else {
         return;
     };
@@ -7951,7 +8243,8 @@ fn restore_settings_if_open() {
 
 /// Spawn a new `scribe-client` process with the given window ID.
 fn spawn_client_process(window_id: WindowId) {
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("scribe-client"));
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from(current_identity().client_binary_name()));
     let id_str = window_id.to_full_string();
 
     match std::process::Command::new(&exe).arg("--window-id").arg(&id_str).spawn() {
@@ -7960,6 +8253,23 @@ fn spawn_client_process(window_id: WindowId) {
         }
         Err(e) => {
             tracing::warn!(exe = %exe.display(), %window_id, "failed to spawn window: {e}");
+        }
+    }
+}
+
+/// Spawn a fresh client process (no `--window-id`) for cold restart
+/// multi-window restore.  The spawned process will connect, receive a new
+/// window ID, and claim the next entry from the restore index.
+fn spawn_fresh_client_process() {
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from(current_identity().client_binary_name()));
+
+    match std::process::Command::new(&exe).spawn() {
+        Ok(child) => {
+            tracing::info!(pid = child.id(), "spawned restore window process");
+        }
+        Err(e) => {
+            tracing::warn!(exe = %exe.display(), "failed to spawn restore window: {e}");
         }
     }
 }

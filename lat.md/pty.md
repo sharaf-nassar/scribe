@@ -54,7 +54,7 @@ Extracts the title string from the second parameter, truncated to 4096 character
 
 Two named provider formats plus a Claude-compatible legacy format are supported.
 
-The primary formats are `ClaudeState=<state>[;key=value...]` and `CodexState=<state>[;key=value...]`, where state is one of idle_prompt, processing, waiting_for_input, permission_prompt, or error. Additional fields (tool, agent, model, context) arrive in subsequent semicolon-delimited parameters, each capped at 256 characters. A legacy format `AiState=state=<state>;key=val...` is also supported and is treated as Claude for compatibility. The special value `<Provider>State=inactive` emits `AiStateCleared`.
+The primary formats are `ClaudeState=<state>[;key=value...]` and `CodexState=<state>[;key=value...]`, where state is one of idle_prompt, processing, waiting_for_input, permission_prompt, or error. Additional fields (tool, agent, model, context, conversation_id) arrive in subsequent semicolon-delimited parameters, each capped at 256 characters. A legacy format `AiState=state=<state>;key=val...` is also supported and is treated as Claude for compatibility. The special value `<Provider>State=inactive` emits `AiStateCleared`.
 
 Codex hooks also use OSC 1337 for a separate task-label channel. `CodexTaskLabel=<label>` sets the short, sanitized task label shown in the tab bar, and `CodexTaskLabelCleared` clears it without disturbing the underlying shell title.
 
@@ -66,9 +66,9 @@ Shell integration prompt marks with optional exit codes. These are forwarded as 
 
 VTE synchronized updates buffer terminal bytes between `CSI ? 2026 h` and `CSI ? 2026 l` so multi-step redraws appear atomically.
 
-Scribe uses the VTE processor's built-in sync buffer in both the client and the server-side Term pipeline. The client suppresses redraw while all processed bytes are still buffered, and [[crates/scribe-pty/src/sync_update_filter.rs#SyncUpdateFrameSplitter]] preserves raw `CSI ? 2026 h/l` commit boundaries across arbitrary PTY IPC chunking before [[crates/scribe-client/src/main.rs#App#drain_pane_output_until_frame]] stages committed bursts on a redraw queue. Light traffic can still animate one committed burst per redraw, but once a pane accumulates a larger backlog the client drains through the stale bursts and presents the latest committed terminal state on the next redraw. The event loop stays in `ControlFlow::Poll` while queued bursts remain, and the server flushes expired sync blocks on timeout so snapshots and reconnects see the committed content even if the application never sends the closing sequence.
+Scribe uses the VTE processor's built-in sync buffer in both the client and the server-side Term pipeline. The server forwards raw `CSI ? 2026 h/l` markers unchanged, and the client feeds each PTY chunk directly into its pane-local VTE processor instead of staging committed bursts in a redraw queue. A chunk only requests redraw when some of its bytes changed visible terminal state, while both sides still flush expired sync blocks on timeout so snapshots, reconnects, and stalled TUIs see the committed content.
 
-Normal session panes now receive the raw `CSI ? 2026 h/l` markers end to end. Only the client-side queueing logic uses the shared raw-frame splitter to preserve commit boundaries before those bytes reach the pane-local VTE processor.
+Normal session panes now receive the raw `CSI ? 2026 h/l` markers end to end, so in-place line edits keep the same PTY byte ordering that terminal applications emitted.
 
 ## ED 3 Filter
 
@@ -84,7 +84,7 @@ Four states track partial matches of the `\x1b[3J` sequence across `filter()` ca
 
 The [[crates/scribe-pty/src/codex_hook_log_filter.rs#CodexHookLogFilter]] suppresses contiguous Codex hook log blocks while failing open if a block never closes.
 
-When the setting is enabled, the filter recognizes the current documented Codex hook events (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`), including bullet-prefixed `Running ... hook: <status>` start lines. It buffers the full contiguous hook block until the matching `hook (completed|failed|blocked|stopped)` trailer arrives, removes the hook boilerplate and the first blank spacer line after it, and still releases buffered bytes unchanged if Codex never emits a trailer.
+When the setting is enabled, the filter recognizes the current documented Codex hook events (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`), including bullet-prefixed `Running ... hook: <status>` start lines. It buffers the full contiguous hook block until the matching `hook (completed|failed|blocked|stopped)` trailer arrives, removes the hook boilerplate and the first blank spacer line after it, and still releases buffered bytes unchanged if Codex never emits a trailer. Prefix matching requires at least one visible character — empty visible content (from escape-only line prefixes) does not match, preventing ANSI erase/cursor sequences from being held indefinitely.
 
 ## Event Listener
 

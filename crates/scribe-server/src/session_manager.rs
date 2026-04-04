@@ -417,12 +417,12 @@ impl SessionManager {
 }
 
 /// Extract the shell binary string from an optional command slice, falling
-/// back to `$SHELL` or `"sh"`.
+/// back to `$SHELL`, then the account login shell, then `"sh"`.
 fn shell_binary_str(command: Option<&[String]>) -> String {
     command
         .and_then(|parts| parts.first())
         .cloned()
-        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "sh".to_owned()))
+        .unwrap_or_else(scribe_common::shell::default_shell_program)
 }
 
 fn command_ai_provider_hint(command: Option<&[String]>) -> Option<AiProvider> {
@@ -457,7 +457,9 @@ fn path_basename_eq(candidate: &str, expected: &str) -> bool {
 /// so bash reads the integration script instead of `~/.bashrc` (the script
 /// itself sources `~/.bashrc`).  We avoid `--posix` because POSIX mode
 /// corrupts the history subsystem — even after `set +o posix`, `history -r`
-/// only loads a handful of entries instead of the full `$HISTFILE`.
+/// only loads a handful of entries instead of the full `$HISTFILE`. For other
+/// shells we still spawn the resolved default shell explicitly so GUI-launched
+/// apps do not silently fall back to the server process environment's `SHELL`.
 fn build_shell(
     shell_binary: &str,
     command: Option<Vec<String>>,
@@ -519,9 +521,9 @@ fn build_shell(
                 | shell_integration::ShellKind::Fish
                 | shell_integration::ShellKind::Nushell
                 | shell_integration::ShellKind::Unknown => {
-                    // zsh, fish, and nushell rely on environment-based startup hooks.
-                    // Return None so alacritty spawns $SHELL with its default arguments.
-                    None
+                    // These shells rely on environment-based startup hooks, but
+                    // we still spawn the resolved shell binary explicitly.
+                    Some(alacritty_terminal::tty::Shell::new(shell_binary.to_owned(), Vec::new()))
                 }
             }
         }
@@ -659,6 +661,7 @@ pub fn convert_flags(flags: CellFlags) -> ScreenCellFlags {
         inverse: flags.contains(CellFlags::INVERSE),
         hidden: flags.contains(CellFlags::HIDDEN),
         wide: flags.contains(CellFlags::WIDE_CHAR),
+        wrap: flags.contains(CellFlags::WRAPLINE),
     }
 }
 
@@ -672,5 +675,101 @@ pub fn convert_cursor_style(
         alacritty_terminal::vte::ansi::CursorShape::HollowBlock => ScreenCursorStyle::HollowBlock,
         // Block, Hidden, and any future variants all map to Block.
         _ => ScreenCursorStyle::Block,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "macos")]
+    use std::fs;
+    #[cfg(target_os = "macos")]
+    use std::path::{Path, PathBuf};
+    #[cfg(target_os = "macos")]
+    use std::process::Command;
+    #[cfg(target_os = "macos")]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use alacritty_terminal::tty::Shell;
+
+    use super::build_shell;
+    use crate::shell_integration::ShellKind;
+
+    #[test]
+    fn build_shell_uses_explicit_resolved_shell_for_zsh_defaults() {
+        let shell = build_shell("/bin/zsh", None, ShellKind::Zsh, None);
+
+        assert_eq!(shell, Some(Shell::new(String::from("/bin/zsh"), Vec::new())));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bash_integration_sources_bash_profile_for_non_login_shells_on_macos() {
+        let home = make_temp_home("profile");
+        fs::write(home.join(".bash_profile"), "export PROFILE_SEEN=1\n")
+            .expect("write .bash_profile");
+        fs::write(home.join(".bashrc"), "export BASHRC_SEEN=1\n").expect("write .bashrc");
+
+        let output = run_bash_integration_check(&home);
+        cleanup_temp_home(&home);
+
+        assert!(
+            output.contains("PROFILE=1 BASHRC=0"),
+            "expected bash profile to win on macOS, got output: {output}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bash_integration_falls_back_to_bashrc_when_no_profile_exists_on_macos() {
+        let home = make_temp_home("bashrc");
+        fs::write(home.join(".bashrc"), "export BASHRC_SEEN=1\n").expect("write .bashrc");
+
+        let output = run_bash_integration_check(&home);
+        cleanup_temp_home(&home);
+
+        assert!(
+            output.contains("PROFILE=0 BASHRC=1"),
+            "expected bashrc fallback on macOS, got output: {output}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_bash_integration_check(home: &Path) -> String {
+        let script = bash_integration_script_path();
+        let output = Command::new("/bin/bash")
+            .arg("--rcfile")
+            .arg(&script)
+            .arg("-ic")
+            .arg("printf 'PROFILE=%s BASHRC=%s\\n' \"${PROFILE_SEEN:-0}\" \"${BASHRC_SEEN:-0}\"")
+            .env("HOME", home)
+            .env("TERM_PROGRAM", "Scribe")
+            .env("SCRIBE_SHELL_INTEGRATION", "1")
+            .output()
+            .expect("run bash integration check");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn bash_integration_script_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../dist/shell-integration/bash/scribe.bash")
+            .canonicalize()
+            .expect("canonicalize bash integration script path")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn make_temp_home(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("scribe-bash-startup-{name}-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp home");
+        dir
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cleanup_temp_home(home: &Path) {
+        let _ignore = fs::remove_dir_all(home);
     }
 }

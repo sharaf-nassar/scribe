@@ -12,7 +12,9 @@ Each frame is a 4-byte big-endian u32 payload length followed by the MessagePack
 
 ### Socket Path
 
-The server socket lives at a platform-specific runtime directory. On Linux this is `/run/user/{uid}/scribe/server.sock`. On macOS it is `$TMPDIR/scribe-{uid}/server.sock`. All socket path logic is in [[crates/scribe-common/src/socket.rs#server_socket_path]].
+The server socket lives at a platform-specific runtime directory selected by the active install flavor.
+
+On Linux this is `/run/user/{uid}/scribe/server.sock` for stable installs and `/run/user/{uid}/scribe-dev/server.sock` for `scribe-dev`. On macOS it uses `~/Library/Application Support/Scribe*/run/server.sock` so GUI clients and launchd services share a stable path. All socket path logic is in [[crates/scribe-common/src/socket.rs#server_socket_path]].
 
 ### Security
 
@@ -134,4 +136,6 @@ UUID-based newtypes defined in [[crates/scribe-common/src/ids.rs]] provide type-
 
 ## AI Process State
 
-Defined in [[crates/scribe-common/src/ai_state.rs#AiProcessState]]. Tracks the current AI agent state (idle_prompt, processing, waiting_for_input, permission_prompt, error) along with optional tool name, agent identifier, model name, and context usage percentage (0-100).
+Defined in [[crates/scribe-common/src/ai_state.rs#AiProcessState]]. Tracks the current AI state and optional metadata for resuming provider sessions.
+
+Tracked fields include state (`idle_prompt`, `processing`, `waiting_for_input`, `permission_prompt`, `error`), tool name, agent identifier, model name, context usage percentage (0-100), and optional provider conversation IDs.

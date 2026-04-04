@@ -6,8 +6,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
+use std::time::UNIX_EPOCH;
 
 use scribe_common::ai_state::AiProcessState;
+use scribe_common::app::current_identity;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
@@ -415,6 +418,10 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
 /// Maximum time to wait for the server to become ready after starting the service.
 const SERVER_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Maximum time to wait for a hot-reloaded macOS server to take over.
+#[cfg(target_os = "macos")]
+const SERVER_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Interval between connection retry attempts while waiting for the service.
 const SERVER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -428,101 +435,457 @@ fn start_server() -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn platform_start_server() -> Result<(), String> {
+    sync_linux_service_environment();
+    let identity = current_identity();
     let status = std::process::Command::new("systemctl")
-        .args(["--user", "start", "scribe-server"])
+        .args(["--user", "start", identity.systemd_service_name()])
         .status()
         .map_err(|e| format!("failed to run systemctl: {e}"))?;
     if status.success() {
-        tracing::info!("scribe-server.service started");
+        tracing::info!(service = identity.systemd_service_name(), "server service started");
         Ok(())
     } else {
         Err(format!("systemctl start exited with {status}"))
     }
 }
 
+#[cfg(target_os = "linux")]
+fn sync_linux_service_environment() {
+    const GUI_ENV_VARS: &[&str] = &[
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XAUTHORITY",
+    ];
+
+    let present: Vec<&str> =
+        GUI_ENV_VARS.iter().copied().filter(|name| std::env::var_os(name).is_some()).collect();
+    if !present.is_empty() {
+        match std::process::Command::new("systemctl")
+            .arg("--user")
+            .arg("import-environment")
+            .args(&present)
+            .status()
+        {
+            Ok(status) if status.success() => {
+                tracing::debug!(vars = ?present, "refreshed user systemd GUI environment");
+            }
+            Ok(status) => {
+                tracing::warn!(vars = ?present, %status, "systemctl import-environment failed");
+            }
+            Err(e) => {
+                tracing::warn!(vars = ?present, "failed to run systemctl import-environment: {e}");
+            }
+        }
+    }
+
+    let missing: Vec<&str> =
+        GUI_ENV_VARS.iter().copied().filter(|name| std::env::var_os(name).is_none()).collect();
+    if !missing.is_empty() {
+        match std::process::Command::new("systemctl")
+            .arg("--user")
+            .arg("unset-environment")
+            .args(&missing)
+            .status()
+        {
+            Ok(status) if status.success() => {
+                tracing::debug!(vars = ?missing, "cleared absent GUI vars from user systemd env");
+            }
+            Ok(status) => {
+                tracing::warn!(vars = ?missing, %status, "systemctl unset-environment failed");
+            }
+            Err(e) => {
+                tracing::warn!(vars = ?missing, "failed to run systemctl unset-environment: {e}");
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn platform_start_server() -> Result<(), String> {
-    match start_server_via_launchctl() {
+    match start_server_via_launchctl(false) {
         Ok(()) => Ok(()),
         Err(e) => {
             tracing::warn!("launchctl start failed ({e}), falling back to direct spawn");
-            start_server_directly()
+            start_server_directly(false)
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn start_server_via_launchctl() -> Result<(), String> {
+fn restart_server() -> Result<(), String> {
+    match start_server_via_launchctl(true) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::warn!("launchctl restart failed ({e}), falling back to --upgrade spawn");
+            start_server_directly(true)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_server_via_launchctl(force_restart: bool) -> Result<(), String> {
+    let identity = current_identity();
     let uid = scribe_common::socket::current_uid();
     let domain = format!("user/{uid}");
-    let service = format!("user/{uid}/com.scribe.server");
+    let service = format!("user/{uid}/{}", identity.launchd_label());
 
     let home = std::env::var("HOME").map_err(|e| format!("HOME not set: {e}"))?;
     let agents_dir = std::path::PathBuf::from(&home).join("Library/LaunchAgents");
-    let installed_plist = agents_dir.join("com.scribe.server.plist");
+    let installed_plist = agents_dir.join(identity.launchd_plist_name());
 
-    if !installed_plist.exists() {
-        let exe = std::env::current_exe().map_err(|e| format!("failed to get current exe: {e}"))?;
-        // In a .app bundle: Contents/MacOS/scribe-client → parent = MacOS → parent = Contents
-        let contents_dir = exe.parent().and_then(|p| p.parent()).ok_or_else(|| {
-            String::from("could not resolve Contents directory from executable path")
-        })?;
-        let bundled_plist = contents_dir.join("Resources/com.scribe.server.plist");
+    std::fs::create_dir_all(&agents_dir)
+        .map_err(|e| format!("failed to create LaunchAgents dir: {e}"))?;
 
-        if !bundled_plist.exists() {
-            return Err(format!("bundled plist not found at {}", bundled_plist.display()));
-        }
+    let server_exe = bundled_server_exe_path(identity)?;
+    let plist = launchd_plist_contents(identity.launchd_label(), &server_exe);
+    let refreshed = sync_launchd_plist(&installed_plist, &plist)?;
 
-        std::fs::create_dir_all(&agents_dir)
-            .map_err(|e| format!("failed to create LaunchAgents dir: {e}"))?;
-        std::fs::copy(&bundled_plist, &installed_plist)
-            .map_err(|e| format!("failed to copy plist: {e}"))?;
-        tracing::info!(plist = %installed_plist.display(), "installed launchd agent plist");
-
-        let status = std::process::Command::new("launchctl")
-            .args(["bootstrap", &domain, installed_plist.to_str().unwrap_or("")])
-            .status()
-            .map_err(|e| format!("failed to run launchctl bootstrap: {e}"))?;
-        if !status.success() {
-            return Err(format!("launchctl bootstrap exited with {status}"));
-        }
-        tracing::info!(%service, "bootstrapped launchd agent");
+    if refreshed {
+        tracing::info!(
+            plist = %installed_plist.display(),
+            server = %server_exe.display(),
+            "updated launchd agent plist"
+        );
+        rebootstrap_launchd_agent(&domain, &service, &installed_plist)?;
     }
 
-    let status = std::process::Command::new("launchctl")
-        .args(["kickstart", &service])
-        .status()
-        .map_err(|e| format!("failed to run launchctl kickstart: {e}"))?;
-    if !status.success() {
-        return Err(format!("launchctl kickstart exited with {status}"));
+    match kickstart_launchd_agent(&service, force_restart) {
+        Ok(()) => Ok(()),
+        Err(e) if !refreshed => {
+            tracing::warn!("launchctl kickstart failed ({e}), re-bootstrapping agent");
+            rebootstrap_launchd_agent(&domain, &service, &installed_plist)?;
+            kickstart_launchd_agent(&service, force_restart)
+        }
+        Err(e) => Err(e),
     }
-    tracing::info!(%service, "kickstarted launchd agent");
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn start_server_directly() -> Result<(), String> {
+fn start_server_directly(upgrade: bool) -> Result<(), String> {
     use std::process::Stdio;
 
+    let identity = current_identity();
     // Resolve server binary relative to current executable.
     // In a .app bundle: Contents/MacOS/scribe-server
     // In dev: same directory as scribe-client
     let exe = std::env::current_exe().map_err(|e| format!("failed to get current exe: {e}"))?;
-    let server_exe = exe.with_file_name("scribe-server");
+    let server_exe = exe.with_file_name(identity.server_binary_name());
 
     if !server_exe.exists() {
         return Err(format!("server binary not found at {}", server_exe.display()));
     }
 
-    let child = std::process::Command::new(&server_exe)
+    let mut command = std::process::Command::new(&server_exe);
+    if upgrade {
+        command.arg("--upgrade");
+    }
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("failed to spawn scribe-server: {e}"))?;
 
-    tracing::info!(pid = child.id(), exe = %server_exe.display(), "spawned scribe-server");
+    tracing::info!(pid = child.id(), exe = %server_exe.display(), upgrade, "spawned scribe-server");
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn bundled_server_exe_path(identity: scribe_common::app::AppIdentity) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("failed to get current exe: {e}"))?;
+    let server_exe = exe.with_file_name(identity.server_binary_name());
+    if server_exe.exists() {
+        Ok(server_exe)
+    } else {
+        Err(format!("server binary not found at {}", server_exe.display()))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_plist_contents(label: &str, server_exe: &Path) -> String {
+    let label = escape_launchd_plist_value(label);
+    let server_exe = escape_launchd_plist_value(&server_exe.display().to_string());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{label}</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>{server_exe}</string>
+	</array>
+
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+
+	<key>ProcessType</key>
+	<string>Background</string>
+
+	<key>ThrottleInterval</key>
+	<integer>1</integer>
+
+	<key>StandardOutPath</key>
+	<string>/dev/null</string>
+
+	<key>StandardErrorPath</key>
+	<string>/dev/null</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn escape_launchd_plist_value(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "macos")]
+fn sync_launchd_plist(path: &Path, expected: &str) -> Result<bool, String> {
+    let current = match std::fs::read_to_string(path) {
+        Ok(contents) => Some(contents),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("failed to read launchd plist {}: {e}", path.display())),
+    };
+
+    if current.as_deref() == Some(expected) {
+        return Ok(false);
+    }
+
+    std::fs::write(path, expected)
+        .map_err(|e| format!("failed to write launchd plist {}: {e}", path.display()))?;
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn rebootstrap_launchd_agent(domain: &str, service: &str, plist: &Path) -> Result<(), String> {
+    let bootout_status =
+        std::process::Command::new("launchctl").args(["bootout", service]).status();
+    match bootout_status {
+        Ok(status) if status.success() => {
+            tracing::info!(%service, "booted out existing launchd agent");
+        }
+        Ok(status) => {
+            tracing::debug!(%service, %status, "launchd agent bootout skipped");
+        }
+        Err(e) => {
+            tracing::debug!(%service, "launchctl bootout unavailable: {e}");
+        }
+    }
+
+    let status = std::process::Command::new("launchctl")
+        .arg("bootstrap")
+        .arg(domain)
+        .arg(plist)
+        .status()
+        .map_err(|e| format!("failed to run launchctl bootstrap: {e}"))?;
+    if !status.success() {
+        return Err(format!("launchctl bootstrap exited with {status}"));
+    }
+    tracing::info!(%service, plist = %plist.display(), "bootstrapped launchd agent");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn kickstart_launchd_agent(service: &str, force_restart: bool) -> Result<(), String> {
+    let mut command = std::process::Command::new("launchctl");
+    command.arg("kickstart");
+    if force_restart {
+        command.arg("-k");
+    }
+    let status = command
+        .arg(service)
+        .status()
+        .map_err(|e| format!("failed to run launchctl kickstart: {e}"))?;
+    if !status.success() {
+        return Err(format!("launchctl kickstart exited with {status}"));
+    }
+    tracing::info!(%service, force_restart, "kickstarted launchd agent");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectedServerInfo {
+    pid: i32,
+    exe_path: Option<PathBuf>,
+    start_time_secs: Option<u64>,
+}
+
+#[cfg(target_os = "macos")]
+fn connected_server_info(stream: &tokio::net::UnixStream) -> Result<ConnectedServerInfo, String> {
+    use nix::sys::socket::{getsockopt, sockopt};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let pid = getsockopt(stream, sockopt::LocalPeerPid)
+        .map_err(|e| format!("failed to query server peer pid: {e}"))?;
+
+    let sys_pid = Pid::from(pid as usize);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sys_pid]),
+        true,
+        ProcessRefreshKind::everything()
+            .without_cpu()
+            .without_disk_usage()
+            .without_memory()
+            .without_tasks()
+            .with_exe(UpdateKind::Always),
+    );
+
+    let process = system.process(sys_pid);
+    Ok(ConnectedServerInfo {
+        pid,
+        exe_path: process.and_then(|proc| proc.exe()).map(std::path::Path::to_path_buf),
+        start_time_secs: process.map(sysinfo::Process::start_time),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn file_modified_epoch_secs(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    modified.duration_since(UNIX_EPOCH).ok().map(|duration| duration.as_secs())
+}
+
+#[cfg(target_os = "macos")]
+fn same_file_path(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+#[cfg(target_os = "macos")]
+fn stale_server_reason(
+    running: &ConnectedServerInfo,
+    bundled_server_exe: &Path,
+    bundled_modified_secs: Option<u64>,
+) -> Option<String> {
+    if let Some(exe_path) =
+        running.exe_path.as_deref().filter(|path| !same_file_path(path, bundled_server_exe))
+    {
+        return Some(format!(
+            "running server path {} differs from installed {}",
+            exe_path.display(),
+            bundled_server_exe.display()
+        ));
+    }
+
+    match (running.start_time_secs, bundled_modified_secs) {
+        (Some(start_time), Some(modified)) if modified > start_time => Some(format!(
+            "installed server binary modified at {modified} after running server started at {start_time}"
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn refresh_stale_connected_server(
+    stream: &tokio::net::UnixStream,
+) -> Result<Option<String>, String> {
+    let bundled_server = bundled_server_exe_path(current_identity())?;
+    let running = connected_server_info(stream)?;
+    let bundled_modified = file_modified_epoch_secs(&bundled_server);
+    let Some(reason) = stale_server_reason(&running, &bundled_server, bundled_modified) else {
+        return Ok(None);
+    };
+
+    tracing::info!(pid = running.pid, %reason, "connected scribe-server is stale; requesting refresh");
+    restart_server()?;
+    Ok(Some(reason))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        ConnectedServerInfo, escape_launchd_plist_value, launchd_plist_contents,
+        stale_server_reason,
+    };
+
+    #[test]
+    fn launchd_plist_escapes_server_path() {
+        let plist = launchd_plist_contents(
+            "com.scribe.server",
+            Path::new("/Applications/A&B's <Scribe>.app/Contents/MacOS/scribe-server"),
+        );
+        assert!(plist.contains("com.scribe.server"));
+        assert!(plist.contains(
+            "/Applications/A&amp;B&apos;s &lt;Scribe&gt;.app/Contents/MacOS/scribe-server"
+        ));
+    }
+
+    #[test]
+    fn launchd_plist_value_escape_handles_xml_meta_chars() {
+        assert_eq!(escape_launchd_plist_value("&<>\"'"), "&amp;&lt;&gt;&quot;&apos;");
+    }
+
+    #[test]
+    fn stale_server_reason_detects_path_drift() {
+        let running = ConnectedServerInfo {
+            pid: 42,
+            exe_path: Some(PathBuf::from(
+                "/Applications/Old Scribe.app/Contents/MacOS/scribe-server",
+            )),
+            start_time_secs: Some(100),
+        };
+
+        let reason = stale_server_reason(
+            &running,
+            Path::new("/Applications/Scribe.app/Contents/MacOS/scribe-server"),
+            Some(100),
+        );
+
+        assert!(reason.is_some(), "expected path drift to mark server stale");
+    }
+
+    #[test]
+    fn stale_server_reason_detects_newer_installed_binary() {
+        let running = ConnectedServerInfo {
+            pid: 42,
+            exe_path: Some(PathBuf::from("/Applications/Scribe.app/Contents/MacOS/scribe-server")),
+            start_time_secs: Some(100),
+        };
+
+        let reason = stale_server_reason(
+            &running,
+            Path::new("/Applications/Scribe.app/Contents/MacOS/scribe-server"),
+            Some(101),
+        );
+
+        assert!(reason.is_some(), "expected newer installed binary to mark server stale");
+    }
+
+    #[test]
+    fn stale_server_reason_ignores_matching_fresh_server() {
+        let running = ConnectedServerInfo {
+            pid: 42,
+            exe_path: Some(PathBuf::from("/Applications/Scribe.app/Contents/MacOS/scribe-server")),
+            start_time_secs: Some(101),
+        };
+
+        let reason = stale_server_reason(
+            &running,
+            Path::new("/Applications/Scribe.app/Contents/MacOS/scribe-server"),
+            Some(100),
+        );
+
+        assert!(reason.is_none(), "matching current server should not be marked stale");
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -537,24 +900,62 @@ async fn connect_or_start_server(
 ) -> Result<tokio::net::UnixStream, Box<dyn std::error::Error + Send + Sync>> {
     // First attempt — server may already be running.
     if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
+        #[cfg(target_os = "macos")]
+        match refresh_stale_connected_server(&stream) {
+            Ok(Some(reason)) => {
+                drop(stream);
+                tracing::info!(%reason, "waiting for refreshed scribe-server");
+                return wait_for_server_connection(socket_path, SERVER_REFRESH_TIMEOUT).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "failed to verify running server freshness ({e}); using existing connection"
+                );
+            }
+        }
         return Ok(stream);
     }
 
     tracing::info!("server not running, starting scribe-server");
     start_server().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-    // Wait for the socket to appear.
-    let deadline = tokio::time::Instant::now() + SERVER_STARTUP_TIMEOUT;
+    wait_for_server_connection(socket_path, SERVER_STARTUP_TIMEOUT).await
+}
+
+async fn wait_for_server_connection(
+    socket_path: &Path,
+    timeout: std::time::Duration,
+) -> Result<tokio::net::UnixStream, Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         tokio::time::sleep(SERVER_RETRY_INTERVAL).await;
 
         if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
+            #[cfg(target_os = "macos")]
+            match refresh_stale_connected_server(&stream) {
+                Ok(Some(reason)) => {
+                    tracing::info!(%reason, "stale server reconnected during wait; retrying");
+                    drop(stream);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to verify running server freshness while waiting ({e}); using existing connection"
+                    );
+                }
+            }
             tracing::info!("connected to scribe-server");
             return Ok(stream);
         }
 
         if tokio::time::Instant::now() >= deadline {
-            return Err("scribe-server did not become ready within 5s".into());
+            return Err(format!(
+                "scribe-server did not become ready within {}s",
+                timeout.as_secs()
+            )
+            .into());
         }
     }
 }

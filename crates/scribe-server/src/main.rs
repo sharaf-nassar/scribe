@@ -9,6 +9,7 @@ use scribe_common::config::UpdateConfig;
 use scribe_common::error::ScribeError;
 use scribe_common::socket::server_socket_path;
 
+mod attach_flow;
 mod config;
 mod handoff;
 mod ipc_server;

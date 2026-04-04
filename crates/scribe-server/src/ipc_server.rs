@@ -63,7 +63,11 @@ pub type SharedWriter = Arc<Mutex<WriteHalf<tokio::net::UnixStream>>>;
 /// Optional client writer: `Some` when a client is attached, `None` when
 /// the session is detached (client disconnected). The PTY reader task
 /// silently skips sends when `None`.
-type ClientWriter = Arc<Mutex<Option<SharedWriter>>>;
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "sibling attach_flow module needs visibility without making this alias fully public"
+)]
+pub(crate) type ClientWriter = Arc<Mutex<Option<SharedWriter>>>;
 
 /// Server-wide registry of all running sessions. Shared across client
 /// handlers and the handoff listener — sessions survive client disconnects.
@@ -113,7 +117,8 @@ struct PtyReaderState {
 pub struct LiveSession {
     pty_write: Arc<Mutex<WriteHalf<scribe_pty::async_fd::AsyncPtyFd>>>,
     pty_raw_fd: RawFd,
-    pub term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    pub(crate) term:
+        Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     child_pid: u32,
     client_writer: ClientWriter,
     workspace_id: WorkspaceId,
@@ -140,9 +145,56 @@ pub struct LiveSession {
     pty: Option<alacritty_terminal::tty::Pty>,
     /// Screen snapshot from a hot-reload handoff, sent to the first client
     /// that attaches. Taken (cleared) after first use.
-    pub handoff_snapshot: Option<scribe_common::screen::ScreenSnapshot>,
+    pub(crate) handoff_snapshot: Option<scribe_common::screen::ScreenSnapshot>,
     /// Shared runtime flag updated by config reloads.
     hide_codex_hook_logs: Arc<AtomicBool>,
+}
+
+pub struct AttachSessionData {
+    pub session_id: SessionId,
+    pub workspace_id: WorkspaceId,
+    pub shell_name: String,
+    pub client_writer: ClientWriter,
+    pub term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    pub pty_raw_fd: RawFd,
+    pub target_dims: Option<TerminalSize>,
+    pub title: String,
+    pub codex_task_label: Option<String>,
+    pub cwd: Option<std::path::PathBuf>,
+    pub context: Option<scribe_common::protocol::SessionContext>,
+    pub ai_state: Option<scribe_common::ai_state::AiProcessState>,
+}
+
+impl LiveSession {
+    pub fn prepare_attach_data(
+        &mut self,
+        session_id: SessionId,
+        target_dims: Option<TerminalSize>,
+    ) -> AttachSessionData {
+        if let Some(size) = target_dims.filter(|size| size.has_pixels()) {
+            self.cell_width = size.cell_width;
+            self.cell_height = size.cell_height;
+        }
+
+        AttachSessionData {
+            session_id,
+            workspace_id: self.workspace_id,
+            shell_name: self.shell_name.clone(),
+            client_writer: Arc::clone(&self.client_writer),
+            term: Arc::clone(&self.term),
+            pty_raw_fd: self.pty_raw_fd,
+            target_dims,
+            title: self.title.clone(),
+            codex_task_label: self.codex_task_label.clone(),
+            cwd: self.cwd.clone(),
+            context: self.context.clone(),
+            ai_state: self.ai_state.clone(),
+        }
+    }
+
+    pub fn take_handoff_snapshot(&mut self) -> Option<ScreenSnapshot> {
+        self.handoff_snapshot.take()
+    }
 }
 
 type SharedClipboard = Arc<Mutex<ServerClipboard>>;
@@ -1150,7 +1202,11 @@ impl alacritty_terminal::grid::Dimensions for ResizeDimensions {
 }
 
 /// Lock the `Term` and apply the new dimensions.
-async fn resize_term(
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "sibling attach_flow module needs visibility without making this helper fully public"
+)]
+pub(crate) async fn resize_term(
     term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     cols: u16,
     rows: u16,
@@ -1165,7 +1221,11 @@ async fn resize_term(
 ///
 /// Writes a `libc::winsize` to the PTY fd, which causes the kernel to send
 /// `SIGWINCH` to the foreground process group.
-fn set_pty_winsize(fd: RawFd, size: TerminalSize) -> Result<(), ScribeError> {
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "sibling attach_flow module needs visibility without making this helper fully public"
+)]
+pub(crate) fn set_pty_winsize(fd: RawFd, size: TerminalSize) -> Result<(), ScribeError> {
     let ws = libc::winsize {
         ws_row: size.rows,
         ws_col: size.cols,
@@ -1333,47 +1393,6 @@ async fn handle_list_sessions(
     }
 }
 
-/// Take the handoff snapshot if one exists, otherwise snapshot the live Term.
-///
-/// The handoff snapshot captures the exact pre-handoff screen (including cursor
-/// visibility). For just-restored sessions the live Term may be blank, so the
-/// handoff snapshot is strongly preferred.
-pub async fn take_session_snapshot(
-    session_id: SessionId,
-    term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
-    live_sessions: &LiveSessionRegistry,
-) -> scribe_common::screen::ScreenSnapshot {
-    let handoff_snap = {
-        let mut registry = live_sessions.write().await;
-        registry.get_mut(&session_id).and_then(|s| s.handoff_snapshot.take())
-    };
-
-    if let Some(snap) = handoff_snap {
-        snap
-    } else {
-        let term_guard = term.lock().await;
-        snapshot_term(&term_guard)
-    }
-}
-
-/// Data extracted from a `LiveSession` for reattachment, collected while
-/// holding the registry lock and consumed after releasing it.
-struct AttachEntry {
-    session_id: SessionId,
-    workspace_id: WorkspaceId,
-    shell_name: String,
-    client_writer: ClientWriter,
-    term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
-    pty_raw_fd: RawFd,
-    /// Target dimensions from the client; resize Term before snapshotting.
-    target_dims: Option<TerminalSize>,
-    title: String,
-    codex_task_label: Option<String>,
-    cwd: Option<std::path::PathBuf>,
-    context: Option<scribe_common::protocol::SessionContext>,
-    ai_state: Option<scribe_common::ai_state::AiProcessState>,
-}
-
 /// Handle `AttachSessions` — take ownership of detached sessions, set the
 /// client writer, and send back session + workspace info for each.
 #[allow(clippy::too_many_arguments, reason = "mirrors dispatch_message's dependency set")]
@@ -1385,166 +1404,16 @@ async fn handle_attach_sessions(
     writer: &SharedWriter,
     attached_ids: &mut HashSet<SessionId>,
 ) {
-    let mut sessions = live_sessions.write().await;
-
-    // Collect data we need, then drop the registry lock before sending.
-    let mut attach_data: Vec<AttachEntry> = Vec::new();
-    for (i, &session_id) in session_ids.iter().enumerate() {
-        if let Some(session) = sessions.get_mut(&session_id) {
-            if let Some(size) = dimensions.get(i).copied().filter(|size| size.has_pixels()) {
-                session.cell_width = size.cell_width;
-                session.cell_height = size.cell_height;
-            }
-            attach_data.push(AttachEntry {
-                session_id,
-                workspace_id: session.workspace_id,
-                shell_name: session.shell_name.clone(),
-                client_writer: Arc::clone(&session.client_writer),
-                term: Arc::clone(&session.term),
-                pty_raw_fd: session.pty_raw_fd,
-                target_dims: dimensions.get(i).copied(),
-                title: session.title.clone(),
-                codex_task_label: session.codex_task_label.clone(),
-                cwd: session.cwd.clone(),
-                context: session.context.clone(),
-                ai_state: session.ai_state.clone(),
-            });
-        } else {
-            warn!(%session_id, "AttachSessions: session not found");
-        }
-    }
-    drop(sessions);
-
-    for entry in &attach_data {
-        attach_one_session(entry, writer, live_sessions, workspace_manager).await;
-        attached_ids.insert(entry.session_id);
-    }
-}
-
-/// Set the client writer on one session, send `SessionCreated`, workspace info,
-/// stored metadata, and a screen snapshot to the attaching client.
-///
-/// When `target_dims` is provided, the server resizes the session's Term and
-/// PTY **before** taking the snapshot so the client receives content at its
-/// current pane dimensions.  The SIGWINCH response from the shell (if any) is
-/// absorbed by the server's PTY reader before the client writer is set,
-/// preventing stale cursor-positioning sequences from corrupting the client's
-/// terminal state.
-///
-/// The writer is set **after** the snapshot is sent to prevent the PTY reader
-/// task from racing live `PtyOutput` against the snapshot (ghost cursors).
-///
-/// Warns when overwriting an existing writer — this indicates a second client
-/// is trying to attach to an already-attached session.
-#[allow(
-    clippy::cognitive_complexity,
-    reason = "sequential attach steps; splitting adds indirection"
-)]
-async fn attach_one_session(
-    entry: &AttachEntry,
-    writer: &SharedWriter,
-    live_sessions: &LiveSessionRegistry,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-) {
-    let session_id = entry.session_id;
-
-    // Resize the Term and PTY to the client's dimensions BEFORE taking
-    // the snapshot.  This ensures the snapshot matches the client's pane
-    // grid and eliminates the post-attach resize that would otherwise
-    // trigger SIGWINCH → shell redraw → content corruption.
-    if let Some(size) = entry.target_dims {
-        if size.has_grid() {
-            resize_term(&entry.term, size.cols, size.rows).await;
-            if let Err(e) = set_pty_winsize(entry.pty_raw_fd, size) {
-                warn!(%session_id, "pre-snapshot TIOCSWINSZ failed: {e}");
-            }
-        }
-    }
-
-    // Send SessionCreated so the client can process it through the normal flow.
-    let creation_msg = ServerMessage::SessionCreated {
-        session_id,
-        workspace_id: entry.workspace_id,
-        shell_name: entry.shell_name.clone(),
-    };
-    send_message(writer, &creation_msg).await;
-
-    // Send stored metadata so tabs display correctly on reconnect.
-    send_stored_metadata(writer, session_id, entry).await;
-
-    // Send workspace info.
-    {
-        let wm = workspace_manager.read().await;
-        if let Some((name, accent_color, split_direction)) = wm.workspace_info(entry.workspace_id) {
-            let msg = ServerMessage::WorkspaceInfo {
-                workspace_id: entry.workspace_id,
-                name,
-                accent_color,
-                split_direction,
-            };
-            send_message(writer, &msg).await;
-        }
-    }
-
-    let snapshot = take_session_snapshot(session_id, &entry.term, live_sessions).await;
-    let snap_msg = ServerMessage::ScreenSnapshot { session_id, snapshot };
-    send_message(writer, &snap_msg).await;
-
-    // Set the writer AFTER the snapshot is sent.  The PTY reader task
-    // checks this writer on every read — while it is `None`, output
-    // is silently dropped (the Term state is still updated).  By
-    // deferring the set, we guarantee the client receives the
-    // ScreenSnapshot before any live PtyOutput, preventing stale
-    // terminal state (cursor position, alt-screen mode) from racing
-    // with the snapshot and producing ghost cursors on reconnect.
-    let mut cw = entry.client_writer.lock().await;
-    if cw.is_some() {
-        warn!(
-            %session_id,
-            "AttachSessions: overwriting existing client writer — \
-             previous client may still be connected"
-        );
-    }
-    *cw = Some(Arc::clone(writer));
-    drop(cw);
-
-    info!(%session_id, "session attached to new client");
-}
-
-/// Send stored title, CWD, git branch, and AI state metadata for a reattached session.
-async fn send_stored_metadata(writer: &SharedWriter, session_id: SessionId, entry: &AttachEntry) {
-    if entry.title != "shell" {
-        let title_msg = ServerMessage::TitleChanged { session_id, title: entry.title.clone() };
-        send_message(writer, &title_msg).await;
-    }
-    if let Some(task_label) = entry.codex_task_label.as_deref() {
-        if !task_label.trim().is_empty() {
-            let task_msg = ServerMessage::CodexTaskLabelChanged {
-                session_id,
-                task_label: task_label.to_owned(),
-            };
-            send_message(writer, &task_msg).await;
-        }
-    }
-    if let Some(cwd) = entry.cwd.as_ref() {
-        let cwd_msg = ServerMessage::CwdChanged { session_id, cwd: cwd.clone() };
-        send_message(writer, &cwd_msg).await;
-        let branch = detect_git_branch(cwd);
-        let git_msg = ServerMessage::GitBranch { session_id, branch };
-        send_message(writer, &git_msg).await;
-    }
-    if let Some(context) = entry.context.as_ref() {
-        let context_msg =
-            ServerMessage::SessionContextChanged { session_id, context: context.clone() };
-        send_message(writer, &context_msg).await;
-    }
-    if let Some(ai) = entry.ai_state.as_ref() {
-        tracing::debug!(%session_id, ai_state = ?ai, "sending stored ai_state to reattached client");
-        let ai_msg = ServerMessage::AiStateChanged { session_id, ai_state: ai.clone() };
-        send_message(writer, &ai_msg).await;
-    } else {
-        tracing::debug!(%session_id, "no stored ai_state to send for reattached session");
-    }
+    attached_ids.extend(
+        crate::attach_flow::attach_sessions(
+            session_ids,
+            dimensions,
+            live_sessions,
+            workspace_manager,
+            writer,
+        )
+        .await,
+    );
 }
 
 /// Handle `ConfigReloaded` — reload the config file and apply live changes.
@@ -2208,7 +2077,11 @@ const GIT_WALK_DEPTH_LIMIT: usize = 50;
 /// detached HEAD state, or `None` if not inside a git repository.
 /// Stops after `GIT_WALK_DEPTH_LIMIT` iterations to avoid walking all the
 /// way to `/` on very deep directory trees.
-fn detect_git_branch(cwd: &Path) -> Option<String> {
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "sibling attach_flow module needs visibility without making this helper fully public"
+)]
+pub(crate) fn detect_git_branch(cwd: &Path) -> Option<String> {
     let mut dir = cwd.to_path_buf();
     let mut depth = 0usize;
     loop {
@@ -2525,6 +2398,27 @@ mod tests {
             tokio::net::UnixStream::from_std(left).unwrap(),
             tokio::net::UnixStream::from_std(right).unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn attach_sessions_returns_empty_when_registry_has_no_matching_sessions() {
+        let live_sessions = new_live_session_registry();
+        let workspace_manager = Arc::new(RwLock::new(WorkspaceManager::new(vec![])));
+
+        let (server, _client) = unix_stream_pair();
+        let (_read, write) = tokio::io::split(server);
+        let writer: SharedWriter = Arc::new(Mutex::new(write));
+
+        let attached = crate::attach_flow::attach_sessions(
+            &[SessionId::new()],
+            &[],
+            &live_sessions,
+            &workspace_manager,
+            &writer,
+        )
+        .await;
+
+        assert!(attached.is_empty());
     }
 
     /// Fresh first launch — no prior sessions exist.

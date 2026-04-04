@@ -16,21 +16,27 @@ Content dirty tracking avoids rebuilding instances when nothing has changed. A s
 
 Each terminal session is represented by a [[crates/scribe-client/src/pane.rs#Pane]] that owns an alacritty_terminal `Term`, VTE processor, grid dimensions, scrollbar state, and cached render instances.
 
+### PTY Output Coalescing
+
+`PtyOutput` IPC messages are buffered per session and drained once in `about_to_wait` by [[crates/scribe-client/src/main.rs#App#drain_pending_pty_output]].
+
+Deferring VTE processing until after all input events are handled ensures keystrokes are never blocked behind a queue of output messages. This matters most when TUI applications like Claude Code produce large screen redraws that arrive as multiple IPC chunks. A `ScreenSnapshot` discards any buffered bytes for that session since the snapshot replaces VTE state entirely.
+
 ### Content Dirty Tracking
 
 The `content_dirty` flag is set on PTY output or resize and cleared after instance rebuild.
 
-Bytes buffered inside a VTE synchronized update (`CSI ? 2026 h/l`) do not mark the pane dirty until the update terminates or its timeout flushes the buffered output. [[crates/scribe-client/src/pane.rs#Pane#queue_output_frames]] uses the streaming [[crates/scribe-pty/src/sync_update_filter.rs#SyncUpdateFrameSplitter]] so synchronized-update commits stay distinct even when the `CSI ? 2026 l` terminator is split across PTY IPC messages. [[crates/scribe-client/src/main.rs#App#drain_pane_output_until_frame]] then queues later committed bursts behind the current frame so light traffic can still animate incrementally, while larger backlogs can be coalesced into the next presented state.
+Bytes buffered inside a VTE synchronized update (`CSI ? 2026 h/l`) do not mark the pane dirty until the update terminates or its timeout flushes the buffered output. [[crates/scribe-client/src/main.rs#App#handle_pty_output]] feeds each coalesced PTY chunk into [[crates/scribe-client/src/pane.rs#Pane#feed_output]], and the pane uses the VTE processor's `sync_bytes_count()` to avoid redraw requests while the current chunk is still fully buffered inside an open synchronized update. [[crates/scribe-client/src/main.rs#App#flush_expired_sync_updates]] commits expired sync blocks and marks the pane dirty when an application never sends the closing `CSI ? 2026 l`.
 
-When a pane was idle and a new PTY batch arrives, [[crates/scribe-client/src/main.rs#App#enqueue_pane_output_frames]] immediately advances through the first committed visible frame before the next `RedrawRequested`. That path still schedules a redraw when the drained frame changed visible content, so single-frame local echo does not wait for a later event. It also keeps X11 clients from starting each burst with a stale backlog when redraw delivery trails the IPC event stream.
+Visible output in the focused pane clears the active selection unless the user is actively dragging, while the shared post-output path still invalidates URL caches and shifts saved selections when scrollback grows.
 
 The cache stores the last-built instances along with cursor visibility, focus state, selection range, and sent grid dimensions. If all match, the cached instances are reused without GPU upload.
 
 ### Synchronized Updates
 
-Normal live sessions receive the raw synchronized-update markers from the server, and the client chooses between incremental redraws and latest-state catch-up based on committed backlog depth.
+Normal live sessions receive the raw synchronized-update markers from the server, and the client feeds them directly into the pane-local VTE processor in PTY delivery order.
 
-[[crates/scribe-client/src/main.rs#App#handle_pty_output]] hands incoming PTY bytes to [[crates/scribe-client/src/pane.rs#Pane#queue_output_frames]], which uses the shared streaming splitter to preserve raw `CSI ? 2026 h/l` frame boundaries across message splits before enqueuing the resulting raw frames on the pane. The PTY user-event path no longer advances the pane immediately, so multiple PTY output events cannot overwrite several committed Codex frames before winit delivers a redraw. [[crates/scribe-client/src/main.rs#App#handle_redraw]] still lets small queues present one committed burst per frame, but once the pane falls behind it drains through the queued stale bursts before building the scene so the redraw shows the freshest committed state. [[crates/scribe-client/src/main.rs#App#about_to_wait]] switches winit to `ControlFlow::Poll` whenever queued output remains so redraws cannot stall behind a long user-event burst. [[crates/scribe-client/src/pane.rs#Pane]] still relies on the VTE processor's built-in sync buffer for the actual terminal state, and the existing animation timer still flushes expired sync blocks before requesting a redraw.
+[[crates/scribe-client/src/main.rs#App#handle_pty_output]] requests a redraw only when [[crates/scribe-client/src/pane.rs#Pane#feed_output]] reports that the processed bytes changed visible terminal state. Bytes that remain buffered inside an open synchronized update do not trigger intermediate redraws, and [[crates/scribe-client/src/main.rs#App#flush_expired_sync_updates]] still flushes stalled sync blocks on timeout so committed content cannot stay hidden forever. This keeps Claude Code, Codex, and other TUIs on the normal byte stream instead of replaying PTY output through a client-side frame queue.
 
 ### Snapshot Restore
 
@@ -40,7 +46,7 @@ Most panes send their dimensions in `AttachSessions` so the server resizes each 
 
 Reconnect restores each pane from its actual pane-tree rect, edge padding, and final workspace tab count before `AttachSessions` is sent. That lets split panes report their real grids up front instead of restoring at full-workspace size and correcting them with a second reconnect-wide resize pass.
 
-Codex panes still keep `last_sent_grid = None` during reconnect, but they only queue a post-restore `Resize` when the incoming snapshot dimensions differ from the restored pane grid. If dimensions still differ, snapshot ANSI is fed at the snapshot's dimensions, then the term is always resized back to `pane.grid`. `sync_pane_grids_if_stale` enforces that `pane.term` dimensions match `pane.grid` before every render frame as a safety net.
+Codex panes still keep `last_sent_grid = None` during reconnect, but they only queue a post-restore `Resize` when the incoming snapshot dimensions differ from the restored pane grid. If dimensions still differ, snapshot ANSI is fed at the snapshot's dimensions, then the term is always resized back to `pane.grid`. Snapshot replay preserves soft-wrapped rows by carrying `WRAPLINE` through [[crates/scribe-common/src/screen.rs#CellFlags]] and avoiding an extra `CRLF` between rows that already wrap into the next line. `sync_pane_grids_if_stale` enforces that `pane.term` dimensions match `pane.grid` before every render frame as a safety net.
 
 ### Padding
 
@@ -104,6 +110,8 @@ Compositor overlays (e.g. GNOME Shell screenshot) clear or change this EWMH prop
 
 Key events are resolved through a four-level priority chain from layout shortcuts down to raw terminal byte encoding.
 
+On macOS, bare `cmd+w` is handled before that chain and routed to the same close-request path as the native window close button, so it never falls through to pane bindings or terminal input.
+
 1. Layout shortcuts (configurable keybindings) produce `LayoutAction` enum values
 2. Special commands (command palette, settings, find)
 3. Terminal shortcuts (word navigation, line navigation)
@@ -113,7 +121,7 @@ Key events are resolved through a four-level priority chain from layout shortcut
 
 Over 50 variants in the `LayoutAction` enum covering pane, workspace, and tab management, clipboard, scrolling, zoom, and more.
 
-Tab actions: new, new/resume the selected AI CLI, close, next, prev, select 1-9. The legacy `new_claude_*` action names remain in config and code, but at runtime they launch Claude Code or Codex based on the keybindings-page provider toggle. Those AI-tab shortcuts start the selected CLI through the user's login shell with `-lic` and `exec`, which preserves shell-initialized PATH changes without first rendering a normal shell prompt. Also: pane splits, pane focus/cycling, workspace splits/cycling, copy, paste, settings, find, zoom, and equalize.
+Tab actions: new, new/resume the selected AI CLI, close, next, prev, select 1-9. The legacy `new_claude_*` action names remain in config and code, but at runtime they launch Claude Code or Codex based on the keybindings-page provider toggle. Those AI-tab shortcuts start the selected CLI through the user's login shell with `-lic` and `exec`, resolving the shell from `SHELL` first and then the account database so Finder-launched macOS apps still inherit the expected PATH and rc files without first rendering a normal shell prompt. Also: pane splits, pane focus/cycling, workspace splits/cycling, copy, paste, settings, find, zoom, and equalize.
 
 ### Command Palette
 
@@ -155,7 +163,7 @@ Automation requests use that same path in both directions. `scribe-cli action ..
 
 Starts and connects to the server process, with a retry loop waiting up to 5 seconds for the socket to appear.
 
-On Linux, the client starts the server via `systemctl --user start scribe-server`. On macOS, release builds use the bundled `com.scribe.server.plist` launchd agent: on first run the plist is installed to `~/Library/LaunchAgents/` and activated via `launchctl bootstrap` + `launchctl kickstart`; subsequent runs simply call `kickstart`. Dev builds without a bundle fall back to spawning the server binary directly.
+On Linux, the client starts the server via `systemctl --user start scribe-server`. On macOS, release builds install `com.scribe.server.plist` into `~/Library/LaunchAgents/` with the current bundle's `scribe-server` path, re-bootstrap the job if that path changes, and then `kickstart` it. If a socket already exists, the client inspects the connected server's peer PID and restarts it when the running executable path differs from the current bundle or when the installed server binary is newer than the running process start time, which lets manual DMG replacements hot-reload the background server on next launch. Dev builds without a bundle fall back to spawning the server binary directly.
 
 ## Selection
 
@@ -187,7 +195,7 @@ The [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker]] tracks per-sessi
 
 Priority order: PermissionPrompt > WaitingForInput > IdlePrompt > Error > Processing. Each state has configurable color, pulse frequency, tab indicator, and pane border settings. Error state decays over a timeout. Attention states (IdlePrompt, WaitingForInput, PermissionPrompt) clear on keystroke. Both `IdlePrompt` and `WaitingForInput` share the same `waiting_for_input` indicator config (color, pulse, timeout).
 
-On reconnect, active AI state is populated from `SessionInfo.ai_state` during `handle_session_list` so indicators appear immediately without waiting for the per-session `AiStateChanged` messages from the server's `send_stored_metadata` path. `SessionInfo.ai_provider_hint` is restored separately so clipboard cleanup and other provider-aware behavior survive reconnect even when no visible indicator should be shown.
+On reconnect, active AI state is populated from `SessionInfo.ai_state` during handle_session_list so indicators appear immediately without waiting for the per-session `AiStateChanged` messages from the server's `send_stored_metadata` path. `SessionInfo.ai_provider_hint` is restored separately so clipboard cleanup and other provider-aware behavior survive reconnect even when no visible indicator should be shown. When available, `SessionInfo.ai_state.conversation_id` is also used to seed per-pane AI resume bindings so restored windows attempt targeted resume of prior provider sessions.
 
 ## Status Bar
 
@@ -231,13 +239,23 @@ Dedent strips minimum shared leading whitespace. Unwrap joins hard-wrapped prose
 
 ## Window State
 
-Per-window geometry is persisted to `$XDG_STATE_HOME/scribe/windows/{window_id}.toml` via [[crates/scribe-client/src/window_state.rs#WindowRegistry]]. `Kill Window` removes the file only after the server confirms the window was destroyed.
+Per-window geometry is persisted under the active install flavor's XDG state root via [[crates/scribe-client/src/window_state.rs#WindowRegistry]].
+
+Stable installs use `$XDG_STATE_HOME/scribe/windows/{window_id}.toml`, while `scribe-dev` uses `$XDG_STATE_HOME/scribe-dev/windows/{window_id}.toml`. `Kill Window` removes the file only after the server confirms the window was destroyed.
 
 Position is stored as Optional since Wayland does not expose window positions. Maximized state is restored after size to avoid window manager override.
 
+### Cold Restart Restore Store
+
+The [[crates/scribe-client/src/restore_state.rs#RestoreStore]] persists logical window state for cold restart recovery under `$XDG_STATE_HOME/{flavor}/restore/`.
+
+A debounced save runs after every layout change via `report_workspace_tree`, snapshotting workspace splits, tabs, pane trees, and per-pane launch bindings. On startup with an empty `SessionList`, the client atomically claims the first entry from the restore index and rebuilds the layout via [[crates/scribe-client/src/restore_replay.rs#prepare_replay]], then creates sessions for each saved pane. Explicit close or quit clears the snapshot; server crash preserves it.
+
 ## Config Watching
 
-A file watcher in [[crates/scribe-client/src/config.rs#start_config_watcher]] monitors `$XDG_CONFIG_HOME/scribe/` for config.toml and theme file changes, sending `ConfigChanged` events through the event loop proxy.
+A file watcher in [[crates/scribe-client/src/config.rs#start_config_watcher]] monitors the active install flavor's XDG config root.
+
+Stable installs watch `$XDG_CONFIG_HOME/scribe/`, while `scribe-dev` watches `$XDG_CONFIG_HOME/scribe-dev/`, for config.toml and theme file changes and forwards `ConfigChanged` through the event loop proxy.
 
 ## Search Overlay
 

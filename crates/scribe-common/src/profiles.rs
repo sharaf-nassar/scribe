@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::current_config_dir;
 use crate::config::{ScribeConfig, load_config, save_config};
 use crate::error::ScribeError;
 
@@ -44,22 +45,21 @@ fn validate_profile_name(name: &str) -> Result<String, ScribeError> {
 }
 
 fn ensure_profiles_dir() -> Result<PathBuf, ScribeError> {
-    let Some(config_dir) = dirs::config_dir() else {
+    let Some(config_dir) = current_config_dir() else {
         return Err(ScribeError::ConfigError {
             reason: String::from("could not determine config directory"),
         });
     };
 
-    let scribe_dir = config_dir.join("scribe");
-    std::fs::create_dir_all(&scribe_dir).map_err(|e| ScribeError::ConfigError {
-        reason: format!("failed to create config directory {}: {e}", scribe_dir.display()),
+    std::fs::create_dir_all(&config_dir).map_err(|e| ScribeError::ConfigError {
+        reason: format!("failed to create config directory {}: {e}", config_dir.display()),
     })?;
-    Ok(scribe_dir)
+    Ok(config_dir)
 }
 
 #[must_use]
 pub fn profile_store_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("scribe").join("profiles.toml"))
+    current_config_dir().map(|dir| dir.join("profiles.toml"))
 }
 
 fn bootstrap_store_from_current_config() -> Result<ProfileStore, ScribeError> {

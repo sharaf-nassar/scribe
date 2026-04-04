@@ -1,6 +1,7 @@
 //! Config file watcher for live-reloading `~/.config/scribe/config.toml`.
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use scribe_common::app::current_config_dir;
 use winit::event_loop::EventLoopProxy;
 
 use crate::ipc_client::UiEvent;
@@ -14,8 +15,7 @@ use crate::ipc_client::UiEvent;
 /// Returns the watcher handle.  **The caller must store this** -- dropping it
 /// stops the watcher.
 pub fn start_config_watcher(proxy: EventLoopProxy<UiEvent>) -> Option<RecommendedWatcher> {
-    let config_dir = dirs::config_dir()?;
-    let config_path = config_dir.join("scribe");
+    let config_path = current_config_dir()?;
 
     let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
         let Some(event) = res.ok() else { return };

@@ -3,7 +3,6 @@
 //! Each pane owns a [`Term`] and a VTE [`Processor`]. Rendering is
 //! performed by the shared [`TerminalRenderer`] in `GpuContext`.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -13,16 +12,17 @@ use alacritty_terminal::grid::Dimensions as _;
 use scribe_common::config::ContentPadding;
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::SessionContext;
-use scribe_pty::sync_update_filter::SyncUpdateFrameSplitter;
 use scribe_renderer::types::{CellInstance, GridSize};
 
 use crate::layout::{PaneEdges, Rect};
+use crate::restore_state::LaunchBinding;
 use crate::scrollbar::ScrollbarState;
 use crate::selection::SelectionRange;
 
 /// State for a single terminal pane.
 pub struct Pane {
     pub session_id: SessionId,
+    pub launch_binding: LaunchBinding,
     #[allow(dead_code, reason = "used by tab bar rendering and workspace management")]
     pub workspace_id: WorkspaceId,
     #[allow(dead_code, reason = "used by tab bar text rendering")]
@@ -79,13 +79,6 @@ pub struct Pane {
     /// `Some((absolute_line, column))` while waiting for user input.
     /// Cleared when a command starts or ends (OSC 133;C / D).
     pub input_start: Option<(usize, usize)>,
-    /// PTY output chunks queued behind the current frame so light bursts can
-    /// animate incrementally while larger backlogs can be coalesced before
-    /// the next redraw.
-    pub pending_output_frames: VecDeque<Vec<u8>>,
-    /// Streaming raw-frame splitter that preserves `CSI ? 2026 h/l`
-    /// boundaries across arbitrary PTY IPC chunking.
-    sync_output_frames: SyncUpdateFrameSplitter,
 }
 
 /// Result of feeding PTY bytes into a pane's ANSI processor.
@@ -121,18 +114,24 @@ impl Pane {
     ///
     /// `rect` is the pixel area assigned to this pane by the layout engine.
     /// `grid` is the initial grid size computed from the content area.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pane construction already needs layout + launch binding"
+    )]
     pub fn new(
         rect: Rect,
         grid: GridSize,
         session_id: SessionId,
         workspace_id: WorkspaceId,
         edges: PaneEdges,
+        launch_binding: LaunchBinding,
     ) -> Self {
         let dims = TermDims { cols: usize::from(grid.cols), lines: usize::from(grid.rows) };
         let term = Term::new(alacritty_terminal::term::Config::default(), &dims, VoidListener);
 
         Self {
             session_id,
+            launch_binding,
             workspace_id,
             workspace_name: None,
             title: String::from("shell"),
@@ -156,21 +155,7 @@ impl Pane {
             prompt_marks: Vec::new(),
             click_events: false,
             input_start: None,
-            pending_output_frames: VecDeque::new(),
-            sync_output_frames: SyncUpdateFrameSplitter::new(),
         }
-    }
-
-    /// Queue raw PTY output frames, preserving synchronized-update commit
-    /// boundaries across IPC message splits.
-    pub fn queue_output_frames(&mut self, bytes: &[u8]) -> bool {
-        let frames = self.sync_output_frames.split_frames(bytes);
-        if frames.is_empty() {
-            return false;
-        }
-
-        self.pending_output_frames.extend(frames);
-        true
     }
 
     /// Feed raw PTY output bytes into the ANSI processor / terminal.

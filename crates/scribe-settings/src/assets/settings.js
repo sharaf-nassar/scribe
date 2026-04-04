@@ -18,6 +18,7 @@ let recordingPrevText = null;
 var themeColors = {};
 var activeThemeId = null;
 var isCustomMode = false;
+window.SCRIBE_PLATFORM = window.SCRIBE_PLATFORM || "linux";
 
 function normalizeAiTabProvider(provider) {
   return provider === "codex_code" ? "codex_code" : "claude_code";
@@ -37,6 +38,20 @@ function setAiTabProvider(provider) {
   currentConfig.terminal.ai_tab_provider = normalized;
   setSegmentedValue("terminal.ai_tab_provider", normalized);
   renderAiTabLabels(normalized);
+}
+
+function rerenderAllKeybindingBadges() {
+  var cells = document.querySelectorAll(".keybinding-cell[data-action]");
+  cells.forEach(function(cell) {
+    var action = cell.getAttribute("data-action");
+    if (!action) { return; }
+    renderBadges(cell, action, getCombosForAction(action));
+  });
+}
+
+function setPlatform(platform) {
+  window.SCRIBE_PLATFORM = platform || "linux";
+  rerenderAllKeybindingBadges();
 }
 
 // ─────────── Theme Grid ───────────
@@ -779,25 +794,50 @@ var NAMED_KEYS = ["pageup", "pagedown", "home", "end", "left", "right", "up", "d
 var MODIFIER_DISPLAY_MAC = { "cmd": "\u2318", "super": "\u2318", "ctrl": "\u2303", "shift": "\u21e7", "alt": "\u2325" };
 var MODIFIER_DISPLAY_LINUX = { "cmd": "Super", "super": "Super", "ctrl": "Ctrl", "shift": "Shift", "alt": "Alt" };
 
-function formatKeybinding(shortcut) {
-  var isMac = window.SCRIBE_PLATFORM === "macos";
-  var glyphs = isMac ? MODIFIER_DISPLAY_MAC : MODIFIER_DISPLAY_LINUX;
-
+function splitKeybindingParts(shortcut) {
   // Robust split: handle "+" as a key (e.g. "ctrl++").
   var parts = shortcut.split("+");
   parts = parts.filter(function(p) { return p !== ""; });
   if (shortcut.endsWith("+") && shortcut.length > 1) {
     parts.push("+");
   }
+  return parts.map(function(part) { return part.trim(); });
+}
 
-  parts = parts.map(function(part) {
-    var p = part.trim();
+function formatKeybinding(shortcut) {
+  var isMac = window.SCRIBE_PLATFORM === "macos";
+  var glyphs = isMac ? MODIFIER_DISPLAY_MAC : MODIFIER_DISPLAY_LINUX;
+
+  var parts = splitKeybindingParts(shortcut).map(function(p) {
     if (glyphs[p] !== undefined) { return glyphs[p]; }
     if (p.length === 1) { return p.toUpperCase(); }
     if (NAMED_KEYS.indexOf(p) !== -1) { return p.charAt(0).toUpperCase() + p.slice(1); }
     return p;
   });
   return isMac ? parts.join("") : parts.join("+");
+}
+
+function keybindingSearchText(shortcut) {
+  var isMac = window.SCRIBE_PLATFORM === "macos";
+  var parts = splitKeybindingParts((shortcut || "").toLowerCase());
+  var aliases = [(shortcut || "").toLowerCase()];
+
+  parts.forEach(function(part) {
+    if (!part) { return; }
+    aliases.push(part);
+    if (part === "cmd" || part === "super") {
+      aliases.push("cmd", "command", "super", "meta");
+    } else if (part === "ctrl") {
+      aliases.push("ctrl", "control");
+    } else if (part === "alt") {
+      aliases.push("alt");
+      if (isMac) { aliases.push("option"); }
+    } else if (part === "shift") {
+      aliases.push("shift");
+    }
+  });
+
+  return Array.from(new Set(aliases)).join(" ");
 }
 
 var MAX_BINDINGS = 5;
@@ -821,6 +861,7 @@ function renderBadges(cell, action, combos) {
     badge.setAttribute("data-action", action);
     badge.setAttribute("data-index", String(idx));
     badge.setAttribute("data-current", combos[idx]);
+    badge.setAttribute("data-search", keybindingSearchText(combos[idx]));
     badge.textContent = formatKeybinding(combos[idx]);
     cell.insertBefore(badge, resetBtn);
 
@@ -848,7 +889,7 @@ function renderBadges(cell, action, combos) {
   if (query) {
     var badges = cell.querySelectorAll(".keybinding-key");
     for (var h = 0; h < badges.length; h++) {
-      highlightText(badges[h], query);
+      highlightKeybindingBadge(badges[h], query);
     }
   }
 }
@@ -1181,6 +1222,11 @@ function clearHighlights(container) {
     parent.replaceChild(document.createTextNode(mark.textContent), mark);
     parent.normalize();
   }
+
+  var aliasMatches = container.querySelectorAll(".search-alias-match");
+  for (var j = 0; j < aliasMatches.length; j++) {
+    aliasMatches[j].classList.remove("search-alias-match");
+  }
 }
 
 function highlightText(el, query) {
@@ -1200,6 +1246,19 @@ function highlightText(el, query) {
   el.appendChild(before);
   el.appendChild(mark);
   el.appendChild(after);
+}
+
+function highlightKeybindingBadge(el, query) {
+  if (!query || !el) { return; }
+  el.classList.remove("search-alias-match");
+  if (el.textContent.toLowerCase().indexOf(query) !== -1) {
+    highlightText(el, query);
+    return;
+  }
+  var searchText = (el.getAttribute("data-search") || "").toLowerCase();
+  if (searchText.indexOf(query) !== -1) {
+    el.classList.add("search-alias-match");
+  }
 }
 
 // ─────────── Global Search ───────────
@@ -1323,7 +1382,7 @@ function filterAllSettings(query) {
           var workspaceText = workspacePathEl ? workspacePathEl.textContent.toLowerCase() : "";
           var keyText = "";
           for (var k = 0; k < keyEls.length; k++) {
-            keyText += " " + keyEls[k].textContent.toLowerCase();
+            keyText += " " + ((keyEls[k].getAttribute("data-search") || keyEls[k].textContent).toLowerCase());
           }
           var swatchText = "";
           for (var s = 0; s < colorSwatchLabelEls.length; s++) {
@@ -1346,7 +1405,7 @@ function filterAllSettings(query) {
             if (descEl) { highlightText(descEl, query); }
             if (themeNameEl) { highlightText(themeNameEl, query); }
             if (workspacePathEl) { highlightText(workspacePathEl, query); }
-            for (var k2 = 0; k2 < keyEls.length; k2++) { highlightText(keyEls[k2], query); }
+            for (var k2 = 0; k2 < keyEls.length; k2++) { highlightKeybindingBadge(keyEls[k2], query); }
             for (var s2 = 0; s2 < colorSwatchLabelEls.length; s2++) { highlightText(colorSwatchLabelEls[s2], query); }
           }
         });

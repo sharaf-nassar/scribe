@@ -35,6 +35,8 @@ pub struct AiProcessState {
     pub model: Option<String>,
     /// Context window usage percentage (0-100).
     pub context: Option<u8>,
+    /// Conversation identifier to resume this AI context.
+    pub conversation_id: Option<String>,
 }
 
 impl AiProcessState {
@@ -45,7 +47,15 @@ impl AiProcessState {
 
     #[must_use]
     pub fn new_with_provider(provider: AiProvider, state: AiState) -> Self {
-        Self { provider, state, tool: None, agent: None, model: None, context: None }
+        Self {
+            provider,
+            state,
+            tool: None,
+            agent: None,
+            model: None,
+            context: None,
+            conversation_id: None,
+        }
     }
 }
 

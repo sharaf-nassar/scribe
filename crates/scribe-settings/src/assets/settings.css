@@ -710,6 +710,12 @@ input[type="range"]::-webkit-slider-thumb {
   border-radius: 2px;
 }
 
+.keybinding-key.search-alias-match {
+  border-color: rgba(234, 179, 8, 0.4);
+  background: rgba(234, 179, 8, 0.12);
+  color: #fbbf24;
+}
+
 /* ───────── Keybinding Row ───────── */
 
 .keybinding-key {

@@ -150,10 +150,34 @@ fn inject_font_list(webview: &wry::WebView) {
 /// Inject `window.SCRIBE_PLATFORM` into the webview so JS can adapt to the host OS.
 fn inject_platform(webview: &wry::WebView) {
     let platform = if cfg!(target_os = "macos") { "macos" } else { "linux" };
-    let script = format!("window.SCRIBE_PLATFORM = \"{platform}\";");
+    let script = format!(
+        "if (typeof setPlatform === 'function') {{ setPlatform(\"{platform}\"); }} else {{ window.SCRIBE_PLATFORM = \"{platform}\"; }}"
+    );
     if let Err(e) = webview.evaluate_script(&script) {
         tracing::warn!("failed to inject platform into settings webview: {e}");
     }
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_close_window_shortcut(
+    event: &tao::event::KeyEvent,
+    modifiers: tao::keyboard::ModifiersState,
+) -> bool {
+    event.state == tao::event::ElementState::Pressed
+        && !event.repeat
+        && modifiers.super_key()
+        && !modifiers.control_key()
+        && !modifiers.alt_key()
+        && !modifiers.shift_key()
+        && matches!(&event.logical_key, tao::keyboard::Key::Character(ch) if ch.eq_ignore_ascii_case("w"))
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+fn is_macos_close_window_shortcut(
+    _event: &tao::event::KeyEvent,
+    _modifiers: tao::keyboard::ModifiersState,
+) -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -254,15 +278,16 @@ pub fn run_settings_window(
         .build_gtk(&container)
         .map_err(|e| format!("failed to create webview: {e}"))?;
 
+    // Inject platform identifier before config so keybinding badges render with
+    // the correct modifier glyphs on first load.
+    inject_platform(&webview);
+
     // Inject current config into the webview after it loads.
     let init_script =
         format!("if (typeof loadConfig === 'function') {{ loadConfig({config_json}); }}");
     if let Err(e) = webview.evaluate_script(&init_script) {
         tracing::warn!("failed to inject config into settings webview: {e}");
     }
-
-    // Inject platform identifier before keybinding defaults so JS display is correct.
-    inject_platform(&webview);
 
     // Inject keybinding defaults so JS can implement reset-to-default.
     inject_keybinding_defaults(&webview);
@@ -483,13 +508,15 @@ pub fn run_settings_window(
         .build(&window)
         .map_err(|e| format!("failed to create webview: {e}"))?;
 
-    // Inject config, keybinding defaults, and font list.
+    inject_platform(&webview);
+
+    // Inject config after platform so keybinding badges render with mac glyphs
+    // on first paint.
     let init_script =
         format!("if (typeof loadConfig === 'function') {{ loadConfig({config_json}); }}");
     if let Err(e) = webview.evaluate_script(&init_script) {
         tracing::warn!("failed to inject config into settings webview: {e}");
     }
-    inject_platform(&webview);
     inject_keybinding_defaults(&webview);
     inject_theme_colors(&webview);
     inject_font_list(&webview);
@@ -498,11 +525,29 @@ pub fn run_settings_window(
 
     let on_close = RefCell::new(Some(on_close));
     let target_window_id = window.id();
+    let modifiers = RefCell::new(tao::keyboard::ModifiersState::default());
 
     event_loop.run_return(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::UserEvent(TaoUserEvent::FocusWindow) => window.set_focus(),
+            Event::WindowEvent {
+                event: WindowEvent::ModifiersChanged(new_mods),
+                window_id: id,
+                ..
+            } if id == target_window_id => {
+                *modifiers.borrow_mut() = new_mods;
+            }
+            Event::WindowEvent {
+                event: WindowEvent::KeyboardInput { event, .. },
+                window_id: id,
+                ..
+            } if id == target_window_id
+                && is_macos_close_window_shortcut(&event, *modifiers.borrow()) =>
+            {
+                fire_on_close(&window, &on_close);
+                *control_flow = ControlFlow::Exit;
+            }
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. }
             | Event::UserEvent(TaoUserEvent::Terminate) => {
                 fire_on_close(&window, &on_close);

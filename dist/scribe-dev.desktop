@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Scribe Dev
+Comment=GPU-accelerated terminal emulator with AI awareness
+Exec=scribe-dev
+Icon=scribe-dev
+Terminal=false
+Type=Application
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;

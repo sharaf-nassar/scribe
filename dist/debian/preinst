@@ -1,12 +1,25 @@
 #!/bin/bash
 set -e
 
+PACKAGE_NAME="${DPKG_MAINTSCRIPT_PACKAGE:-scribe}"
+if [ "$PACKAGE_NAME" = "scribe-dev" ]; then
+    APP_SLUG="scribe-dev"
+    CLIENT_BIN_NAME="scribe-dev"
+    SETTINGS_BIN_NAME="scribe-dev-settings"
+else
+    APP_SLUG="scribe"
+    CLIENT_BIN_NAME="scribe-client"
+    SETTINGS_BIN_NAME="scribe-settings"
+fi
+CLIENT_BIN_PATH="/usr/bin/${CLIENT_BIN_NAME}"
+SETTINGS_BIN_PATH="/usr/bin/${SETTINGS_BIN_NAME}"
+
 case "$1" in
     upgrade|install)
         TARGET_UID="${SUDO_UID:-$(id -u)}"
         # Use /run/user (mode 0700, owned by user) instead of world-writable /tmp
         # to prevent symlink attacks from other local users.
-        STATE_DIR="/run/user/${TARGET_UID}/scribe"
+        STATE_DIR="/run/user/${TARGET_UID}/${APP_SLUG}"
         # Ensure state directory exists (may not if server hasn't run yet).
         mkdir -p "${STATE_DIR}" 2>/dev/null || true
         chmod 0700 "${STATE_DIR}" 2>/dev/null || true
@@ -14,8 +27,10 @@ case "$1" in
 
         # Record PIDs of running components BEFORE the upgrade so postinst
         # can detect which processes were replaced and act accordingly.
-        pgrep -u "$TARGET_UID" -x scribe-client 2>/dev/null | tr '\n' ' ' > "${STATE_DIR}/upgrade-client-pids" || true
-        pgrep -u "$TARGET_UID" -x scribe-settings 2>/dev/null > "${STATE_DIR}/upgrade-settings-pid" || true
+        # Use -f (full cmdline) — comm is truncated to 15 chars, breaking -x
+        # for "scribe-dev-settings" (19 chars).
+        pgrep -u "$TARGET_UID" -f "$CLIENT_BIN_PATH" 2>/dev/null | tr '\n' ' ' > "${STATE_DIR}/upgrade-client-pids" || true
+        pgrep -u "$TARGET_UID" -f "$SETTINGS_BIN_PATH" 2>/dev/null > "${STATE_DIR}/upgrade-settings-pid" || true
         ;;
 esac
 

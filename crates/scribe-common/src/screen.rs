@@ -36,6 +36,10 @@ pub struct CellFlags {
     pub inverse: bool,
     pub hidden: bool,
     pub wide: bool,
+    /// Whether this cell is the last cell of a row that soft-wraps into the
+    /// next row (`WRAPLINE` in alacritty).
+    #[serde(default)]
+    pub wrap: bool,
 }
 
 /// Cursor style for rendering.

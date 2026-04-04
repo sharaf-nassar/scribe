@@ -11,7 +11,6 @@ workspace = true
 
 [dependencies]
 scribe-common.workspace = true
-scribe-pty.workspace = true
 scribe-renderer.workspace = true
 alacritty_terminal.workspace = true
 wgpu.workspace = true
@@ -25,11 +24,11 @@ bytemuck.workspace = true
 thiserror.workspace = true
 png.workspace = true
 notify.workspace = true
-dirs.workspace = true
 serde.workspace = true
 toml.workspace = true
 libc.workspace = true
 sysinfo.workspace = true
+nix.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3", default-features = false, features = [

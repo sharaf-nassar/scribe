@@ -364,7 +364,7 @@ fn is_hook_block_end_line(s: &str) -> bool {
 
 fn running_hook_line_prefix(s: &str) -> bool {
     let prefix = "Running ";
-    if prefix.starts_with(s) {
+    if !s.is_empty() && prefix.starts_with(s) {
         return true;
     }
 
@@ -386,7 +386,8 @@ fn completed_hook_line(s: &str) -> bool {
 
 fn known_hook_name_then_prefix(s: &str, suffix_prefix: impl Fn(&str) -> bool) -> bool {
     CODEX_HOOK_EVENT_NAMES.iter().any(|hook_name| {
-        hook_name.starts_with(s) || s.strip_prefix(hook_name).is_some_and(&suffix_prefix)
+        (!s.is_empty() && hook_name.starts_with(s))
+            || s.strip_prefix(hook_name).is_some_and(&suffix_prefix)
     })
 }
 

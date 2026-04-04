@@ -11,7 +11,7 @@ use scribe_common::socket::{current_uid, server_socket_path};
 /// process. Stored in the user runtime directory alongside the server socket.
 ///
 /// - Linux: `/run/user/{uid}/scribe/scribe-server.pid`
-/// - macOS: `$TMPDIR/scribe-{uid}/scribe-server.pid`
+/// - macOS: `~/Library/Application Support/Scribe/run/scribe-server.pid`
 fn pid_file_path() -> PathBuf {
     server_socket_path().parent().map_or_else(
         || PathBuf::from(format!("/run/user/{}/scribe/scribe-server.pid", current_uid())),

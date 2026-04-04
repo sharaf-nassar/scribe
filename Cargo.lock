@@ -3553,14 +3553,13 @@ dependencies = [
  "alacritty_terminal",
  "arboard",
  "bytemuck",
- "dirs",
  "libc",
+ "nix",
  "notify",
  "png",
  "pollster",
  "raw-window-handle",
  "scribe-common",
- "scribe-pty",
  "scribe-renderer",
  "serde",
  "sysinfo",
@@ -3646,7 +3645,6 @@ dependencies = [
 name = "scribe-settings"
 version = "0.0.0-dev"
 dependencies = [
- "dirs",
  "fontdb",
  "gtk",
  "libc",

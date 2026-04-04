@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use scribe_common::app::current_identity;
 use tracing::debug;
 
 /// Detected shell type.
@@ -33,9 +34,11 @@ pub fn detect_shell(binary: &str) -> ShellKind {
 pub fn find_scripts_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
+    let identity = current_identity();
 
     // Installed Linux: /usr/bin/scribe-server → /usr/share/scribe/shell-integration
-    let installed = exe_dir.parent()?.join("share/scribe/shell-integration");
+    let installed =
+        exe_dir.parent()?.join("share").join(identity.share_dir_name()).join("shell-integration");
     if installed.is_dir() {
         return Some(installed);
     }

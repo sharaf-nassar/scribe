@@ -1,10 +1,17 @@
 #!/bin/bash
+PACKAGE_NAME="${DPKG_MAINTSCRIPT_PACKAGE:-scribe}"
+if [ "$PACKAGE_NAME" = "scribe-dev" ]; then
+    ETC_DIR="/etc/scribe-dev"
+else
+    ETC_DIR="/etc/scribe"
+fi
+
 case "$1" in
     purge)
         # Clean up config directory. Guard against symlink substitution:
         # only remove if it is a real directory, not a symlink.
-        if [ -d /etc/scribe ] && [ ! -L /etc/scribe ]; then
-            rm -rf /etc/scribe 2>/dev/null || true
+        if [ -d "$ETC_DIR" ] && [ ! -L "$ETC_DIR" ]; then
+            rm -rf "$ETC_DIR" 2>/dev/null || true
         fi
         ;;
 esac

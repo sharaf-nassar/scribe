@@ -20,7 +20,7 @@ Each PTY session is represented by a [[crates/scribe-server/src/session_manager.
 
 The SessionManager creates sessions through alacritty_terminal's PTY spawner, wrapping the master fd in an [[crates/scribe-pty/src/async_fd.rs#AsyncPtyFd]] for epoll-driven async I/O. A maximum of 256 concurrent sessions is enforced.
 
-Environment variables are set to TERM=xterm-256color, COLORTERM=truecolor, and TERM_PROGRAM=Scribe.
+Environment variables are set to TERM=xterm-256color, COLORTERM=truecolor, and TERM_PROGRAM=Scribe on top of the server process environment. On Linux, [[crates/scribe-client/src/ipc_client.rs#sync_linux_service_environment]] refreshes the user systemd manager's GUI session variables before starting the service so new PTY sessions inherit working clipboard/display access.
 
 The terminal core is created with kitty keyboard protocol enabled, so alacritty_terminal can answer Codex and shell keyboard-mode probes (`CSI ? u` and related mode updates) through the normal PTY write-back path.
 
@@ -50,7 +50,9 @@ Terminal query callbacks share that same reader-task path. Clipboard loads, text
 
 Client disconnection clears the client writer but keeps the session alive in the LiveSessionRegistry. Only an explicit `CloseWindow` removes the sessions and window state from future reconnect or handoff.
 
-When a new client attaches, the server resizes each session's Term and PTY to the client-provided dimensions before taking the snapshot. This ensures the snapshot matches the client's pane grid and absorbs the shell's SIGWINCH response before the client writer is set. The client then receives stored metadata (title, CWD, shell basename, session context, git branch, AI state) and the correctly-dimensioned screen snapshot.
+`ipc_server.rs` remains the transport and message-dispatch layer for `AttachSessions`, but `attach_flow.rs` now owns the reattach sequence itself: attach-entry preparation from live sessions, pre-snapshot Term and PTY resize, stored metadata and workspace replay, screen snapshot delivery, and the delayed client-writer install.
+
+When a new client attaches, the attach flow resizes each session's Term and PTY to the client-provided dimensions before taking the snapshot. This ensures the snapshot matches the client's pane grid and absorbs the shell's SIGWINCH response before the client writer is set. The client then receives stored metadata (title, CWD, shell basename, session context, git branch, AI state) and the correctly-dimensioned screen snapshot.
 
 ### Terminal Resize
 
@@ -94,7 +96,9 @@ An ACK confirms receipt. If the ACK is not received (version mismatch, peer cras
 
 ### State Transfer
 
-The HandoffState contains per-session metadata, including title, shell basename, remote context, Codex task label, CWD, and AI state, plus workspace definitions with accent colors and split directions and per-window state.
+The HandoffState contains per-session metadata and workspace layout state for restart handoff.
+
+Per-session payloads include title, shell basename, remote context, Codex task label, CWD, and AI state, including optional provider conversation IDs used for resume behavior.
 
 Per-session metadata includes ID, workspace, child PID, dimensions, screen snapshot, title, shell basename, remote/tmux context, CWD, AI state, and the launch-time AI-provider hint used for built-in Codex or Claude tabs. File descriptors are transferred one-for-one with the serialized session list.
 
@@ -116,9 +120,9 @@ On Linux that cold-restart path must also clean up any detached `scribe-server -
 
 ### Binary Change Detection
 
-All three binaries (server, client, settings) use SHA-256 hash comparison to skip unnecessary restarts during upgrades.
+All three binaries (server, client, settings) use SHA-256 hash comparison to skip unnecessary restarts during upgrades, and Linux server upgrades also track a persisted runtime-generation stamp for launcher and service behavior changes.
 
-On Linux, `postinst` compares each running binary (`/proc/PID/exe`) against the installed copy — unchanged binaries are left running after a successful handoff. If Linux must fall back to a cold server restart, the package script still relaunches any previously running client window even when the client binary is unchanged because that client exits on `ServerDisconnected`. On macOS, the [[server#Updater]] compares old (`.app.prev`) and new app bundle binaries before deciding which components to restart. Hash comparison failure is treated as "changed" for safety. Use `just restart-server` for manual hot-reload.
+On Linux, `postinst` compares each running binary (`/proc/PID/exe`) against the installed copy and also checks whether the desired `server-runtime-generation` differs from the stamp recorded in `/run/user/{uid}/{app}/server-runtime-generation`. That stamp is an opaque SHA-256 signature derived from the launch-critical `postinst` functions and the installed user service unit, not a hand-maintained integer, so maintainer-script and service-launch changes automatically force hot-reload even when the server binary is unchanged. When `postinst` launches replacement user processes, it prefers GUI session variables from `systemctl --user show-environment` and only falls back to the invoking shell for values the user manager lacks. If Linux must fall back to a cold server restart, the package script still relaunches any previously running client window even when the client binary is unchanged because that client exits on `ServerDisconnected`. On macOS, the [[server#Updater]] compares old (`.app.prev`) and new app bundle binaries before deciding which components to restart. Hash comparison failure is treated as "changed" for safety. Use `just restart-server` for manual hot-reload.
 
 ## Updater
 
@@ -162,7 +166,7 @@ Server config in [[crates/scribe-server/src/config.rs#ScribeConfig]] holds works
 
 Shell integration detects the user's shell (Bash, Zsh, Fish, Nushell, PowerShell) and injects startup scripts via shell-specific mechanisms.
 
-Bash uses `--rcfile` to load the integration script, which sources `~/.bashrc` itself. Zsh uses `ZDOTDIR` wrapping. Fish and Nushell extend `XDG_DATA_DIRS` so vendor autoload directories are discovered. PowerShell starts with `-NoExit -File` so the integration script is dot-sourced into the interactive session.
+Bash uses `--rcfile` to load the integration script, which sources startup files itself; on macOS it mirrors Terminal's login-shell behavior by preferring `~/.bash_profile`/`~/.bash_login`/`~/.profile` before falling back to `~/.bashrc`. Zsh uses `ZDOTDIR` wrapping. Fish and Nushell extend `XDG_DATA_DIRS` so vendor autoload directories are discovered. PowerShell starts with `-NoExit -File` so the integration script is dot-sourced into the interactive session. When `SHELL` is missing, Scribe falls back to the account's login shell from the user database, and default sessions spawn that resolved shell explicitly so Finder- and launchd-started macOS installs do not inherit a stale shell choice.
 
 Those prompt hooks also clear any stale Codex task label as soon as control returns to the shell. They emit OSC 7 CWD updates, OSC 133 prompt marks, and OSC 1337 `ScribeContext` payloads carrying remote-host and tmux-session labels. Separately, `setup-codex-hooks.sh` installs Codex hooks that emit a new task label from the first non-command prompt in each task thread, keeping Codex tab names independent from normal OSC 0/2 titles.
 

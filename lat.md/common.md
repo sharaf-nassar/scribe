@@ -6,13 +6,13 @@ Shared types and utilities used by every Scribe crate: IPC [[protocol]], identit
 
 Tracks Claude Code and Codex Code process lifecycle by parsing OSC 1337 escape sequences into typed Rust values.
 
-[[crates/scribe-common/src/ai_state.rs#AiState]] is a five-variant enum (`IdlePrompt`, `Processing`, `WaitingForInput`, `PermissionPrompt`, `Error`) shared by both integrations. [[crates/scribe-common/src/ai_state.rs#AiProvider]] distinguishes `ClaudeCode` from `CodexCode`, and [[crates/scribe-common/src/ai_state.rs#AiProcessState]] carries that provider alongside optional metadata fields (`tool`, `agent`, `model`, `context`). The [[pty]] crate's `MetadataParser` produces `AiProcessState` values; the [[server]] broadcasts them to connected clients and preserves backward compatibility by defaulting missing providers to Claude on deserialize.
+[[crates/scribe-common/src/ai_state.rs#AiState]] is a five-variant enum (`IdlePrompt`, `Processing`, `WaitingForInput`, `PermissionPrompt`, `Error`) shared by both integrations. [[crates/scribe-common/src/ai_state.rs#AiProvider]] distinguishes `ClaudeCode` from `CodexCode`, and [[crates/scribe-common/src/ai_state.rs#AiProcessState]] carries that provider alongside optional metadata fields (`tool`, `agent`, `model`, `context`, `conversation_id`). The [[pty]] crate's `MetadataParser` produces `AiProcessState` values; the [[server]] broadcasts them to connected clients and preserves backward compatibility by defaulting missing providers to Claude on deserialize.
 
 ## Configuration
 
-Unified TOML config for server and client, deserialized from `~/.config/scribe/config.toml` into [[crates/scribe-common/src/config.rs#ScribeConfig]].
+Unified TOML config for server and client, deserialized from the active install flavor's XDG config root into [[crates/scribe-common/src/config.rs#ScribeConfig]].
 
-`ScribeConfig` is the top-level struct with six sub-sections: `appearance`, `theme`, `terminal`, `keybindings`, `workspaces`, and `update`. The [[crates/scribe-common/src/config.rs#load_config]] function reads the file and returns `ScribeConfig::default()` if absent.
+Stable installs read `~/.config/scribe/config.toml`, while `scribe-dev` reads `~/.config/scribe-dev/config.toml`. `ScribeConfig` is the top-level struct with six sub-sections: `appearance`, `theme`, `terminal`, `keybindings`, `workspaces`, and `update`. The [[crates/scribe-common/src/config.rs#load_config]] function reads the file and returns `ScribeConfig::default()` if absent.
 
 ### Appearance
 
@@ -36,13 +36,15 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 [[crates/scribe-common/src/config.rs#KeybindingsConfig]] exposes 50+ configurable actions across pane navigation, workspace splits, tab management, clipboard, scrolling, zoom, and terminal word-motion shortcuts.
 
-Each field uses [[crates/scribe-common/src/config.rs#KeyComboList]], which deserializes from either a bare TOML string (`"ctrl+shift+w"`) or an array (`["ctrl+shift+w", "ctrl+w"]`). Up to [[crates/scribe-common/src/config.rs#MAX_BINDINGS]] (5) combos per action are stored. Default bindings are platform-aware: macOS uses `cmd+`-prefixed combos, other platforms use `ctrl+shift+`-prefixed equivalents.
+Each field uses [[crates/scribe-common/src/config.rs#KeyComboList]], which deserializes from either a bare TOML string (`"ctrl+shift+w"`) or an array (`["ctrl+shift+w", "ctrl+w"]`). Up to [[crates/scribe-common/src/config.rs#MAX_BINDINGS]] (5) combos per action are stored. Default bindings are platform-aware: macOS uses `cmd+`-prefixed combos where they do not collide with standard app shortcuts, with close-pane intentionally on `super+ctrl+w`, while other platforms use `ctrl+shift+`-prefixed equivalents.
+
+On macOS, config load also migrates stale legacy non-mac defaults when a saved keybindings block still looks like an older generated config, so pre-existing Linux-style defaults do not mask the platform-native shortcuts after install.
 
 ### Profiles
 
 Named config profiles are stored separately from `config.toml` so switching profiles can atomically rewrite the active config without losing the saved variants.
 
-[[crates/scribe-common/src/profiles.rs#ProfileStore]] keeps a `BTreeMap<String, ScribeConfig>` plus the active profile name in `$XDG_CONFIG_HOME/scribe/profiles.toml`. [[crates/scribe-common/src/profiles.rs#load_profile_store]], [[crates/scribe-common/src/profiles.rs#switch_profile]], [[crates/scribe-common/src/profiles.rs#export_profile]], and [[crates/scribe-common/src/profiles.rs#import_profile]] back the CLI profile commands and the client command palette's profile switcher.
+[[crates/scribe-common/src/profiles.rs#ProfileStore]] keeps a `BTreeMap<String, ScribeConfig>` plus the active profile name in `$XDG_CONFIG_HOME/scribe/profiles.toml` for stable installs or `$XDG_CONFIG_HOME/scribe-dev/profiles.toml` for the dev flavor. [[crates/scribe-common/src/profiles.rs#load_profile_store]], [[crates/scribe-common/src/profiles.rs#switch_profile]], [[crates/scribe-common/src/profiles.rs#export_profile]], and [[crates/scribe-common/src/profiles.rs#import_profile]] back the CLI profile commands and the client command palette's profile switcher.
 
 ### Unicode Width
 
@@ -57,6 +59,8 @@ Both the server and client terminal cores inherit width from alacritty_terminal'
 ### Update
 
 [[crates/scribe-common/src/config.rs#UpdateConfig]] controls auto-update behavior: `enabled` flag, `check_interval_secs` (default 86 400 s), and [[crates/scribe-common/src/config.rs#UpdateChannel]] (`Stable` or `Beta`).
+
+The updater is intentionally disabled for `scribe-dev` installs so test builds cannot download and install the stable package over the main app.
 
 [[crates/scribe-common/src/config.rs#ThemeConfig]] is an optional inline theme definition used when `appearance.theme == "custom"` to supply foreground, background, cursor, selection, and 16 ANSI colors directly in the config file.
 
@@ -82,7 +86,7 @@ Three ID types are defined in [[crates/scribe-common/src/ids.rs]]: `SessionId` (
 
 Serializable terminal screen state for IPC transport, used when reconnecting a client to a running session.
 
-[[crates/scribe-common/src/screen.rs#ScreenSnapshot]] carries the full visible grid as a flat `Vec<ScreenCell>`, dimensions, cursor position and style, alternate-screen flag, and scrollback rows. [[crates/scribe-common/src/screen.rs#ScreenCell]] holds a character, foreground/background color, and cell attribute flags. [[crates/scribe-common/src/screen.rs#ScreenColor]] is a three-variant enum (`Named(u16)`, `Indexed(u8)`, `Rgb`) that uses `u16` for named colors to accommodate alacritty_terminal's extended named color indices above 255. [[crates/scribe-common/src/screen.rs#CellFlags]] and [[crates/scribe-common/src/screen.rs#CursorStyle]] complete the rendering model.
+[[crates/scribe-common/src/screen.rs#ScreenSnapshot]] carries the full visible grid as a flat `Vec<ScreenCell>`, dimensions, cursor position and style, alternate-screen flag, and scrollback rows. [[crates/scribe-common/src/screen.rs#ScreenCell]] holds a character, foreground/background color, and cell attribute flags. [[crates/scribe-common/src/screen.rs#ScreenColor]] is a three-variant enum (`Named(u16)`, `Indexed(u8)`, `Rgb`) that uses `u16` for named colors to accommodate alacritty_terminal's extended named color indices above 255. [[crates/scribe-common/src/screen.rs#CellFlags]] includes both wide-character placeholders and `WRAPLINE` state so reconnect snapshot replay can preserve logical soft-wrapped lines. [[crates/scribe-common/src/screen.rs#CursorStyle]] completes the rendering model.
 
 ## Socket Paths
 
@@ -90,11 +94,11 @@ Platform-specific socket and lock file paths for all Scribe singleton processes,
 
 | Platform | Base directory |
 | --- | --- |
-| Linux | `/run/user/{uid}/scribe/` |
-| macOS | `$TMPDIR/scribe-{uid}/` (fallback: `~/Library/Application Support/Scribe/run/`) |
-| Other Unix | `$TMPDIR/scribe-{uid}/` (fallback: `/tmp/scribe-{uid}/`) |
+| Linux | `/run/user/{uid}/scribe/` for stable installs, `/run/user/{uid}/scribe-dev/` for `scribe-dev` |
+| macOS | `~/Library/Application Support/Scribe/run/` for stable installs, `~/Library/Application Support/Scribe Dev/run/` for `scribe-dev` |
+| Other Unix | `$TMPDIR/scribe-{uid}/` for stable installs, `$TMPDIR/scribe-dev-{uid}/` for `scribe-dev` |
 
-Named sockets in the base directory: `server.sock`, `settings.sock`, and `handoff.sock`, with lock files for the long-lived singleton processes. Public API: [[crates/scribe-common/src/socket.rs#server_socket_path]], [[crates/scribe-common/src/socket.rs#settings_socket_path]], [[crates/scribe-common/src/socket.rs#settings_lock_path]], [[crates/scribe-common/src/socket.rs#server_lock_path]], [[crates/scribe-common/src/socket.rs#handoff_socket_path]], and [[crates/scribe-common/src/socket.rs#current_uid]].
+Named sockets in the base directory: `server.sock`, `settings.sock`, and `handoff.sock`, with lock files for the long-lived singleton processes. macOS uses a stable Application Support path so Finder-launched clients and `launchctl`-started background services resolve the same socket location. Public API: [[crates/scribe-common/src/socket.rs#server_socket_path]], [[crates/scribe-common/src/socket.rs#settings_socket_path]], [[crates/scribe-common/src/socket.rs#settings_lock_path]], [[crates/scribe-common/src/socket.rs#server_lock_path]], [[crates/scribe-common/src/socket.rs#handoff_socket_path]], and [[crates/scribe-common/src/socket.rs#current_uid]].
 
 ## Theme System
 
