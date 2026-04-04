@@ -86,7 +86,7 @@ Messages sent from the server to clients, defined in [[crates/scribe-common/src/
 
 `AiStateChanged` and `AiStateCleared` report AI process state from OSC 1337. `CwdChanged` reports working directory from OSC 7.
 
-`TitleChanged` reports window title from OSC 0/2. `SessionContextChanged` reports shell-emitted remote-host and tmux metadata from OSC 1337 `ScribeContext`. `CodexTaskLabelChanged` and `CodexTaskLabelCleared` report the separate Codex task-label channel used for tab naming. `GitBranch` reports the detected git branch for a session's CWD. `WorkspaceNamed` reports auto-detected workspace names.
+`TitleChanged` reports window title from OSC 0/2. `SessionContextChanged` reports shell-emitted remote-host and tmux metadata from OSC 1337 `ScribeContext`. `CodexTaskLabelChanged` and `CodexTaskLabelCleared` report the separate Codex task-label channel used for tab naming. `GitBranch` reports the detected git branch for a session's CWD. `WorkspaceNamed` reports auto-detected workspace names. `PromptReceived` carries the session ID, AI provider, and submitted prompt text for display in the prompt bar UI.
 
 ### Connection
 

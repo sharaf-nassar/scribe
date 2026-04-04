@@ -112,6 +112,15 @@ pub enum UiEvent {
     CodexTaskLabelChanged { session_id: SessionId, task_label: String },
     /// The active Codex task label for a session was cleared.
     CodexTaskLabelCleared { session_id: SessionId },
+    /// A user prompt was submitted in a Claude Code or Codex session.
+    PromptReceived {
+        #[allow(dead_code, reason = "session_id used in Task 6 prompt state handler")]
+        session_id: SessionId,
+        #[allow(dead_code, reason = "provider used in Task 6 prompt state handler")]
+        provider: scribe_common::ai_state::AiProvider,
+        #[allow(dead_code, reason = "text used in Task 6 prompt state handler")]
+        text: String,
+    },
     /// Git branch for a session's CWD (None if not in a git repo).
     GitBranch {
         session_id: SessionId,
@@ -262,6 +271,9 @@ async fn run_read_task(
             }
             Ok(ServerMessage::CodexTaskLabelCleared { session_id }) => {
                 send_event(&proxy, UiEvent::CodexTaskLabelCleared { session_id });
+            }
+            Ok(ServerMessage::PromptReceived { session_id, provider, text }) => {
+                send_event(&proxy, UiEvent::PromptReceived { session_id, provider, text });
             }
             Ok(ServerMessage::GitBranch { session_id, branch }) => {
                 send_event(&proxy, UiEvent::GitBranch { session_id, branch });

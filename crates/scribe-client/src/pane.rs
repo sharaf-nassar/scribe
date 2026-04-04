@@ -79,6 +79,17 @@ pub struct Pane {
     /// `Some((absolute_line, column))` while waiting for user input.
     /// Cleared when a command starts or ends (OSC 133;C / D).
     pub input_start: Option<(usize, usize)>,
+    /// Text of the first user prompt submitted in this AI session.
+    #[allow(dead_code, reason = "read by prompt bar renderer in a later task")]
+    pub first_prompt: Option<String>,
+    /// Text of the most recent user prompt (differs from first after 2+ prompts).
+    #[allow(dead_code, reason = "read by prompt bar renderer in a later task")]
+    pub latest_prompt: Option<String>,
+    /// Total number of prompts received in this session.
+    pub prompt_count: u32,
+    /// Last-seen `conversation_id` for detecting session resets.
+    #[allow(dead_code, reason = "read by prompt bar renderer in a later task")]
+    pub last_conversation_id: Option<String>,
 }
 
 /// Result of feeding PTY bytes into a pane's ANSI processor.
@@ -155,6 +166,10 @@ impl Pane {
             prompt_marks: Vec::new(),
             click_events: false,
             input_start: None,
+            first_prompt: None,
+            latest_prompt: None,
+            prompt_count: 0,
+            last_conversation_id: None,
         }
     }
 
@@ -229,11 +244,16 @@ impl Pane {
         self.term.mode().contains(alacritty_terminal::term::TermMode::MOUSE_MODE)
     }
 
-    /// Return the pixel offset where terminal content starts (below tab bar).
-    pub fn content_offset(&self, tab_bar_height: f32, padding: &ContentPadding) -> (f32, f32) {
+    /// Return the pixel offset where terminal content starts (below tab bar and prompt bar).
+    pub fn content_offset(
+        &self,
+        tab_bar_height: f32,
+        prompt_bar_height: f32,
+        padding: &ContentPadding,
+    ) -> (f32, f32) {
         let eff = effective_padding(padding, self.edges);
         let tbh = if self.edges.top { tab_bar_height } else { 0.0 };
-        (self.rect.x + eff.left, self.rect.y + tbh + eff.top)
+        (self.rect.x + eff.left, self.rect.y + tbh + prompt_bar_height + eff.top)
     }
 
     /// Return the content area (below tab bar) as a viewport size tuple.
@@ -253,6 +273,18 @@ impl Pane {
     pub fn preferred_tab_title(&self) -> &str {
         self.codex_task_label.as_deref().unwrap_or(&self.title)
     }
+
+    /// Pixel height of the prompt bar for this pane.
+    ///
+    /// Returns 0.0 when `prompt_bar` is disabled or no prompts have been received.
+    /// One prompt = 1 line + padding. Two or more = 2 lines + padding.
+    pub fn prompt_bar_height(&self, cell_height: f32, prompt_bar_enabled: bool) -> f32 {
+        if !prompt_bar_enabled || self.prompt_count == 0 {
+            return 0.0;
+        }
+        let lines = if self.prompt_count == 1 { 1.0 } else { 2.0 };
+        lines * cell_height + 8.0 + 6.0 // top_pad + bottom_pad
+    }
 }
 
 /// Compute effective content padding for a pane, zeroing out padding on
@@ -267,15 +299,21 @@ pub fn effective_padding(padding: &ContentPadding, edges: PaneEdges) -> ContentP
 }
 
 /// Compute the grid size for a pane's content area.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "layout requires rect, two cell dims, two bar heights, and padding"
+)]
 pub fn compute_pane_grid(
     rect: Rect,
     cell_width: f32,
     cell_height: f32,
     tab_bar_height: f32,
+    prompt_bar_height: f32,
     padding: &ContentPadding,
 ) -> GridSize {
     let content_w = (rect.width - padding.left - padding.right).max(1.0);
-    let content_h = (rect.height - tab_bar_height - padding.top - padding.bottom).max(1.0);
+    let content_h =
+        (rect.height - tab_bar_height - prompt_bar_height - padding.top - padding.bottom).max(1.0);
     grid_from_pixels(content_w, content_h, cell_width, cell_height)
 }
 

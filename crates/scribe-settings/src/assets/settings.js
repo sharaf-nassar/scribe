@@ -355,6 +355,14 @@ function initNavigation() {
       });
     });
   });
+
+  var crosslink = document.getElementById("ai-tab-crosslink");
+  if (crosslink) {
+    crosslink.addEventListener("click", function() {
+      var aiNav = document.querySelector('.nav-item[data-tab="ai"]');
+      if (aiNav) { aiNav.click(); }
+    });
+  }
 }
 
 // ─────────── Number Steppers ───────────
@@ -642,6 +650,7 @@ function loadConfig(config) {
   setToggleValue("terminal.claude_code_integration", config.terminal?.claude_code_integration);
   setToggleValue("terminal.codex_code_integration", config.terminal?.codex_code_integration);
   setToggleValue("terminal.hide_codex_hook_logs", config.terminal?.hide_codex_hook_logs);
+  setToggleValue("terminal.prompt_bar", config.terminal?.prompt_bar);
   setAiTabProvider(config.terminal?.ai_tab_provider);
   setStepperValue("terminal.indicator_height", config.terminal?.indicator_height);
 

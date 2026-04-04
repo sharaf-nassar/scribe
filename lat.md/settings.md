@@ -1,6 +1,6 @@
 # Settings
 
-The scribe-settings crate provides a webview-based configuration editor for terminal appearance, keybindings, themes, and workspace management.
+The scribe-settings crate provides a webview-based configuration editor for terminal appearance, keybindings, colors, AI integrations, and workspace management.
 
 ## Window
 
@@ -30,31 +30,31 @@ Controls font, cursor, opacity, scrollbar, tab bar, status bar, content padding,
 
 Font family, font size (f32), font weight (u16, 100-900), bold weight, ligatures (bool), line padding, cursor shape (Block/Beam/Underline), cursor blink, opacity (0.0-1.0), scrollbar width (2.0-20.0), tab bar padding (0.0-20.0), tab width (8-50), status bar height (8.0-48.0), tab height (16.0-60.0), content padding per side (0.0-50.0), focus border colour (hex or empty for None), and focus border width (1.0-10.0).
 
-### Theme Keys
+### Colors Keys
 
-Preset selection and custom theme colours including foreground, background, cursor, selection, and all 16 ANSI colours.
+Colors page (formerly Theme) — preset selection and custom theme colours with full ANSI color names and descriptions.
 
 Preset selection converts underscore-separated names to hyphen-separated and clears any custom theme if not "custom". Custom theme colours include foreground, background, cursor, cursor text, selection, selection text, and all 16 ANSI colours (normal 0-7 and bright 0-7). When switching to custom, colours are seeded from the current preset.
 
 ### Terminal Keys
 
-Scrollback lines, copy on select, clipboard cleanup, AI integrations, Codex hook-log filtering, the AI tab provider, natural scroll, indicator height, and status bar stat toggles are configurable terminal keys.
+Terminal page general section — scrollback lines, natural scrolling, and copy on select. AI integration settings moved to the AI page.
 
-Clipboard cleanup remains persisted as `claude_copy_cleanup` for backward compatibility. `hide_codex_hook_logs` defaults to false and suppresses full Codex hook log blocks for the current documented hook events (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`), including bullet-prefixed `Running ... hook: ...` lines, non-`completed` trailers, nested hook output, and only the first trailing blank spacer line, while failing open if the block never closes. The AI tab provider is persisted separately so the existing `new_claude_tab` and `new_claude_resume_tab` keybinding keys can stay backward compatible while switching between Claude Code and Codex behavior.
+Status bar stat toggles remain on the Terminal page under the Status Bar section.
 
-### AI State Keys
+### AI Keys
 
-Shared indicator settings cover both Claude Code and Codex Code, even though the persisted key prefix remains `claude_states` for backward compatibility.
+AI page consolidates all AI integration settings: Claude Code Integration, Codex Code Integration, AI Tab Provider, Clipboard Cleanup, Hide Codex Hook Logs, Prompt Bar, Indicator Height, and the AI Assistant States table.
 
-Per-state configuration for processing, waiting_for_input, permission_prompt, and error. Each state has: tab indicator (bool), pane border (bool), colour (hex or ANSI index), pulse milliseconds (u32), and timeout seconds (f32, min 0.0).
+Clipboard cleanup remains persisted as `claude_copy_cleanup` for backward compatibility. `hide_codex_hook_logs` defaults to false and suppresses full Codex hook log blocks for the documented hook events (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`), including bullet-prefixed `Running ... hook: ...` lines, non-`completed` trailers, nested hook output, and only the first trailing blank spacer line, while failing open if the block never closes. The AI tab provider is persisted separately so the existing `new_claude_tab` and `new_claude_resume_tab` keybinding keys stay backward compatible while switching between Claude Code and Codex behavior.
 
-Both `IdlePrompt` and `WaitingForInput` AI states share the `waiting_for_input` config key. The old `idle_prompt` key is silently ignored if present in existing configs.
+Shared indicator settings cover both Claude Code and Codex Code, even though the persisted key prefix remains `claude_states` for backward compatibility. Per-state configuration for processing, waiting_for_input, permission_prompt, and error. Each state has: tab indicator (bool), pane border (bool), colour (hex or ANSI index), pulse milliseconds (u32), and timeout seconds (f32, min 0.0). Both `IdlePrompt` and `WaitingForInput` AI states share the `waiting_for_input` config key. The old `idle_prompt` key is silently ignored if present in existing configs.
 
 ### Keybinding Keys
 
 All keybinding actions accept a string or array of strings (combo list, max 5 per action).
 
-Actions cover: pane splits, focus directions, workspace splits, workspace cycling, tab management (new, provider-selected AI tab, provider-selected AI resume tab, close, next, prev, select 1-9), clipboard, scrolling, command palette, find, zoom, settings, new window, and terminal shortcuts (word left/right, delete word, line start/end).
+Actions cover: pane splits, focus directions, workspace splits, workspace cycling, tab management (new, provider-selected AI tab, provider-selected AI resume tab, close, next, prev, select 1-9), clipboard, scrolling, command palette, find, zoom, settings, new window, and terminal shortcuts (word left/right, delete word, line start/end). The AI Tab Provider setting that controls which provider `new_claude_tab` uses is configured on the AI page, not here — the Keybindings page shows a cross-link note pointing to it.
 
 ### Update Keys
 

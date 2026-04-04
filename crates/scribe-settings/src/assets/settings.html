@@ -32,11 +32,19 @@
         </svg>
         Appearance
       </div>
-      <div class="nav-item" data-tab="theme">
+      <div class="nav-item" data-tab="colors">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/>
         </svg>
-        Theme
+        Colors
+      </div>
+      <div class="nav-item" data-tab="ai">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2a4 4 0 0 1 4 4v1a3 3 0 0 1 3 3v1a2 2 0 0 1-1 1.73V15a5 5 0 0 1-5 5h-2a5 5 0 0 1-5-5v-2.27A2 2 0 0 1 5 11v-1a3 3 0 0 1 3-3V6a4 4 0 0 1 4-4z"/>
+          <circle cx="9" cy="13" r="1"/>
+          <circle cx="15" cy="13" r="1"/>
+        </svg>
+        AI
       </div>
       <div class="nav-item" data-tab="terminal">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -282,14 +290,14 @@
       </div>
     </div>
 
-    <!-- ═══════ Theme Page ═══════ -->
-    <div id="page-theme" class="content-page">
-      <div class="page-title">Theme</div>
-      <div class="page-subtitle">Choose a color scheme for your terminal</div>
+    <!-- ═══════ Colors Page ═══════ -->
+    <div id="page-colors" class="content-page">
+      <div class="page-title">Colors</div>
+      <div class="page-subtitle">Terminal color scheme and theme presets</div>
 
       <!-- Color Editor -->
       <div class="section-group" id="theme-color-editor">
-        <div class="section-label">Colors</div>
+        <div class="section-label">Core Colors</div>
         <div class="section-card" style="padding:16px;">
           <!-- Core colors -->
           <div class="color-row">
@@ -297,95 +305,151 @@
               <div class="color-swatch" data-key="theme.foreground" style="background:#e4e4e7;">
                 <input type="color" value="#e4e4e7">
               </div>
-              <span class="color-swatch-label">FG</span>
+              <span class="color-swatch-label">Foreground</span>
+              <span class="color-swatch-desc">Default text color</span>
             </div>
             <div class="color-swatch-group">
               <div class="color-swatch" data-key="theme.background" style="background:#0e0e10;">
                 <input type="color" value="#0e0e10">
               </div>
-              <span class="color-swatch-label">BG</span>
+              <span class="color-swatch-label">Background</span>
+              <span class="color-swatch-desc">Terminal background</span>
             </div>
             <div class="color-swatch-group">
               <div class="color-swatch" data-key="theme.cursor" style="background:#e4e4e7;">
                 <input type="color" value="#e4e4e7">
               </div>
               <span class="color-swatch-label">Cursor</span>
+              <span class="color-swatch-desc">Cursor block color</span>
             </div>
             <div class="color-swatch-group">
               <div class="color-swatch" data-key="theme.cursor_text" style="background:#0e0e10;">
                 <input type="color" value="#0e0e10">
               </div>
               <span class="color-swatch-label">Cursor Text</span>
+              <span class="color-swatch-desc">Text under the cursor</span>
             </div>
             <div class="color-swatch-group">
               <div class="color-swatch" data-key="theme.selection" style="background:#3f3f46;">
                 <input type="color" value="#3f3f46">
               </div>
               <span class="color-swatch-label">Selection</span>
+              <span class="color-swatch-desc">Selected text highlight</span>
             </div>
             <div class="color-swatch-group">
               <div class="color-swatch" data-key="theme.selection_text" style="background:#ffffff;">
                 <input type="color" value="#ffffff">
               </div>
-              <span class="color-swatch-label">Sel. Text</span>
+              <span class="color-swatch-label">Selection Text</span>
+              <span class="color-swatch-desc">Text inside selection</span>
             </div>
           </div>
 
           <!-- ANSI Normal -->
           <div class="ansi-row-label">Normal</div>
+          <div class="ansi-row-desc">Standard terminal colors used by programs</div>
           <div class="ansi-grid">
-            <div class="ansi-swatch" data-key="theme.ansi_normal.0" style="background:#27272a;border:1px solid rgba(255,255,255,0.08);">
-              <input type="color" value="#27272a">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_normal.0" title="Black" style="background:#27272a;border:1px solid rgba(255,255,255,0.08);">
+                <input type="color" value="#27272a">
+              </div>
+              <span class="ansi-swatch-label">Black</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_normal.1" style="background:#ef4444;">
-              <input type="color" value="#ef4444">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_normal.1" title="Red" style="background:#ef4444;">
+                <input type="color" value="#ef4444">
+              </div>
+              <span class="ansi-swatch-label">Red</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_normal.2" style="background:#22c55e;">
-              <input type="color" value="#22c55e">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_normal.2" title="Green" style="background:#22c55e;">
+                <input type="color" value="#22c55e">
+              </div>
+              <span class="ansi-swatch-label">Green</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_normal.3" style="background:#eab308;">
-              <input type="color" value="#eab308">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_normal.3" title="Yellow" style="background:#eab308;">
+                <input type="color" value="#eab308">
+              </div>
+              <span class="ansi-swatch-label">Yellow</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_normal.4" style="background:#3b82f6;">
-              <input type="color" value="#3b82f6">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_normal.4" title="Blue" style="background:#3b82f6;">
+                <input type="color" value="#3b82f6">
+              </div>
+              <span class="ansi-swatch-label">Blue</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_normal.5" style="background:#a855f7;">
-              <input type="color" value="#a855f7">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_normal.5" title="Magenta" style="background:#a855f7;">
+                <input type="color" value="#a855f7">
+              </div>
+              <span class="ansi-swatch-label">Magenta</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_normal.6" style="background:#06b6d4;">
-              <input type="color" value="#06b6d4">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_normal.6" title="Cyan" style="background:#06b6d4;">
+                <input type="color" value="#06b6d4">
+              </div>
+              <span class="ansi-swatch-label">Cyan</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_normal.7" style="background:#d4d4d8;">
-              <input type="color" value="#d4d4d8">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_normal.7" title="White" style="background:#d4d4d8;">
+                <input type="color" value="#d4d4d8">
+              </div>
+              <span class="ansi-swatch-label">White</span>
             </div>
           </div>
 
           <!-- ANSI Bright -->
           <div class="ansi-row-label">Bright</div>
+          <div class="ansi-row-desc">Bright/bold variants of standard colors</div>
           <div class="ansi-grid">
-            <div class="ansi-swatch" data-key="theme.ansi_bright.0" style="background:#52525b;">
-              <input type="color" value="#52525b">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_bright.0" title="Bright Black" style="background:#52525b;">
+                <input type="color" value="#52525b">
+              </div>
+              <span class="ansi-swatch-label">Black</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_bright.1" style="background:#f87171;">
-              <input type="color" value="#f87171">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_bright.1" title="Bright Red" style="background:#f87171;">
+                <input type="color" value="#f87171">
+              </div>
+              <span class="ansi-swatch-label">Red</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_bright.2" style="background:#4ade80;">
-              <input type="color" value="#4ade80">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_bright.2" title="Bright Green" style="background:#4ade80;">
+                <input type="color" value="#4ade80">
+              </div>
+              <span class="ansi-swatch-label">Green</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_bright.3" style="background:#facc15;">
-              <input type="color" value="#facc15">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_bright.3" title="Bright Yellow" style="background:#facc15;">
+                <input type="color" value="#facc15">
+              </div>
+              <span class="ansi-swatch-label">Yellow</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_bright.4" style="background:#60a5fa;">
-              <input type="color" value="#60a5fa">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_bright.4" title="Bright Blue" style="background:#60a5fa;">
+                <input type="color" value="#60a5fa">
+              </div>
+              <span class="ansi-swatch-label">Blue</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_bright.5" style="background:#c084fc;">
-              <input type="color" value="#c084fc">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_bright.5" title="Bright Magenta" style="background:#c084fc;">
+                <input type="color" value="#c084fc">
+              </div>
+              <span class="ansi-swatch-label">Magenta</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_bright.6" style="background:#22d3ee;">
-              <input type="color" value="#22d3ee">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_bright.6" title="Bright Cyan" style="background:#22d3ee;">
+                <input type="color" value="#22d3ee">
+              </div>
+              <span class="ansi-swatch-label">Cyan</span>
             </div>
-            <div class="ansi-swatch" data-key="theme.ansi_bright.7" style="background:#fafafa;">
-              <input type="color" value="#fafafa">
+            <div class="ansi-swatch-group">
+              <div class="ansi-swatch" data-key="theme.ansi_bright.7" title="Bright White" style="background:#fafafa;">
+                <input type="color" value="#fafafa">
+              </div>
+              <span class="ansi-swatch-label">White</span>
             </div>
           </div>
         </div>
@@ -439,52 +503,15 @@
       </div>
     </div>
 
-    <!-- ═══════ Terminal Page ═══════ -->
-    <div id="page-terminal" class="content-page">
-      <div class="page-title">Terminal</div>
-      <div class="page-subtitle">Shell and scrollback settings</div>
+
+    <!-- ═══════ AI Page ═══════ -->
+    <div id="page-ai" class="content-page">
+      <div class="page-title">AI</div>
+      <div class="page-subtitle">Configure AI assistant integrations and indicators</div>
 
       <div class="section-group">
-        <div class="section-label">General</div>
+        <div class="section-label">Integration</div>
         <div class="section-card">
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Scrollback Lines</div>
-              <div class="setting-desc">Maximum number of lines kept in scrollback buffer</div>
-            </div>
-            <div class="number-control" data-key="terminal.scrollback_lines" data-min="0" data-max="100000" data-step="1000">
-              <div class="number-btn">&minus;</div>
-              <div class="number-value">10000</div>
-              <div class="number-btn">+</div>
-            </div>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Natural Scrolling</div>
-              <div class="setting-desc">Use the OS scroll direction instead of traditional (inverted) terminal scrolling</div>
-            </div>
-            <div class="toggle off" data-key="terminal.natural_scroll">
-              <div class="toggle-knob"></div>
-            </div>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Copy on Select</div>
-              <div class="setting-desc">Automatically copy selected text to clipboard</div>
-            </div>
-            <div class="toggle on" data-key="terminal.copy_on_select">
-              <div class="toggle-knob"></div>
-            </div>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Clipboard Cleanup</div>
-              <div class="setting-desc">Dedent and unwrap copied text when Claude Code or Codex is running</div>
-            </div>
-            <div class="toggle on" data-key="terminal.claude_copy_cleanup">
-              <div class="toggle-knob"></div>
-            </div>
-          </div>
           <div class="setting-row">
             <div class="setting-info">
               <div class="setting-label">Claude Code Integration</div>
@@ -505,13 +532,47 @@
           </div>
           <div class="setting-row">
             <div class="setting-info">
+              <div class="setting-label">AI Tab Provider</div>
+              <div class="setting-desc">Choose which assistant the AI tab shortcuts open</div>
+            </div>
+            <div class="segmented-control" data-key="terminal.ai_tab_provider">
+              <div class="segment-opt active" data-value="claude_code">Claude Code</div>
+              <div class="segment-opt" data-value="codex_code">Codex</div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Clipboard Cleanup</div>
+              <div class="setting-desc">Dedent and unwrap copied text during AI sessions</div>
+            </div>
+            <div class="toggle on" data-key="terminal.claude_copy_cleanup">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
               <div class="setting-label">Hide Codex Hook Logs</div>
-              <div class="setting-desc">Filter Codex hook log blocks, including status-message starts and failed, blocked, or stopped trailers</div>
+              <div class="setting-desc">Filter Codex hook log blocks from terminal output</div>
             </div>
             <div class="toggle off" data-key="terminal.hide_codex_hook_logs">
               <div class="toggle-knob"></div>
             </div>
           </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Prompt Bar</div>
+              <div class="setting-desc">Show first and latest prompt text at the top of AI panes</div>
+            </div>
+            <div class="toggle off" data-key="terminal.prompt_bar">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Indicators</div>
+        <div class="section-card">
           <div class="setting-row">
             <div class="setting-info">
               <div class="setting-label">Indicator Height</div>
@@ -521,57 +582,6 @@
               <div class="number-btn">&minus;</div>
               <div class="number-value">2</div>
               <div class="number-btn">+</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="section-label">Status Bar</div>
-        <div class="section-card">
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Status Bar Height</div>
-              <div class="setting-desc">Height of the status bar in pixels</div>
-            </div>
-            <div class="number-control" data-key="appearance.status_bar_height" data-min="8" data-max="48" data-step="1">
-              <div class="number-btn">&minus;</div>
-              <div class="number-value">24</div>
-              <div class="number-btn">+</div>
-            </div>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">CPU Usage</div>
-              <div class="setting-desc">Show CPU utilization with sparkline in the status bar</div>
-            </div>
-            <div class="toggle on" data-key="terminal.status_bar_stats.cpu">
-              <div class="toggle-knob"></div>
-            </div>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Memory Usage</div>
-              <div class="setting-desc">Show memory utilization in the status bar</div>
-            </div>
-            <div class="toggle on" data-key="terminal.status_bar_stats.memory">
-              <div class="toggle-knob"></div>
-            </div>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">GPU Usage</div>
-              <div class="setting-desc">Show GPU utilization in the status bar when available</div>
-            </div>
-            <div class="toggle on" data-key="terminal.status_bar_stats.gpu">
-              <div class="toggle-knob"></div>
-            </div>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">Network Activity</div>
-              <div class="setting-desc">Show network upload and download throughput in the status bar</div>
-            </div>
-            <div class="toggle on" data-key="terminal.status_bar_stats.network">
-              <div class="toggle-knob"></div>
             </div>
           </div>
         </div>
@@ -636,25 +646,106 @@
       </div>
     </div>
 
+    <!-- ═══════ Terminal Page ═══════ -->
+    <div id="page-terminal" class="content-page">
+      <div class="page-title">Terminal</div>
+      <div class="page-subtitle">Shell and scrollback settings</div>
+
+      <div class="section-group">
+        <div class="section-label">General</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Scrollback Lines</div>
+              <div class="setting-desc">Maximum number of lines kept in scrollback buffer</div>
+            </div>
+            <div class="number-control" data-key="terminal.scrollback_lines" data-min="0" data-max="100000" data-step="1000">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">10000</div>
+              <div class="number-btn">+</div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Natural Scrolling</div>
+              <div class="setting-desc">Use the OS scroll direction instead of traditional (inverted) terminal scrolling</div>
+            </div>
+            <div class="toggle off" data-key="terminal.natural_scroll">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Copy on Select</div>
+              <div class="setting-desc">Automatically copy selected text to clipboard</div>
+            </div>
+            <div class="toggle on" data-key="terminal.copy_on_select">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-label">Status Bar</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Status Bar Height</div>
+              <div class="setting-desc">Height of the status bar in pixels</div>
+            </div>
+            <div class="number-control" data-key="appearance.status_bar_height" data-min="8" data-max="48" data-step="1">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">24</div>
+              <div class="number-btn">+</div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">CPU Usage</div>
+              <div class="setting-desc">Show CPU utilization with sparkline in the status bar</div>
+            </div>
+            <div class="toggle on" data-key="terminal.status_bar_stats.cpu">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Memory Usage</div>
+              <div class="setting-desc">Show memory utilization in the status bar</div>
+            </div>
+            <div class="toggle on" data-key="terminal.status_bar_stats.memory">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">GPU Usage</div>
+              <div class="setting-desc">Show GPU utilization in the status bar when available</div>
+            </div>
+            <div class="toggle on" data-key="terminal.status_bar_stats.gpu">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Network Activity</div>
+              <div class="setting-desc">Show network upload and download throughput in the status bar</div>
+            </div>
+            <div class="toggle on" data-key="terminal.status_bar_stats.network">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
     <!-- ═══════ Keybindings Page ═══════ -->
     <div id="page-keybindings" class="content-page">
       <div class="page-title">Keybindings</div>
       <div class="page-subtitle">Click a shortcut to reassign it</div>
 
       <div class="section-group">
-        <div class="section-label">AI Tabs</div>
-        <div class="section-card">
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-label">AI Tab Provider</div>
-              <div class="setting-desc">Choose which assistant the AI tab shortcuts open</div>
-            </div>
-            <div class="segmented-control" data-key="terminal.ai_tab_provider">
-              <div class="segment-opt active" data-value="claude_code">Claude Code</div>
-              <div class="segment-opt" data-value="codex_code">Codex</div>
-            </div>
-          </div>
-        </div>
+        <div class="cross-link-note" id="ai-tab-crosslink">AI tab provider is configured in AI settings &#8594;</div>
       </div>
 
       <div id="kb-conflict-banner" class="kb-conflict-banner" style="display:none;"></div>

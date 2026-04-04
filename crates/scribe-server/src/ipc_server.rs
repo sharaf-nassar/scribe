@@ -2202,8 +2202,9 @@ async fn send_metadata_event(
     }
 }
 
-/// Convert a `MetadataEvent` to a `ServerMessage`.
-/// Returns the message and optionally the CWD path for workspace naming.
+/// Convert a `MetadataEvent` to a `ServerMessage` and an optional CWD.
+/// The second tuple element is `Some(cwd)` only for `CwdChanged` events,
+/// which also need workspace naming and git-branch updates.
 fn convert_metadata_event(
     event: MetadataEvent,
     session_id: SessionId,
@@ -2232,6 +2233,9 @@ fn convert_metadata_event(
         MetadataEvent::Bell => (ServerMessage::Bell { session_id }, None),
         MetadataEvent::PromptMark { kind, click_events, exit_code } => {
             (ServerMessage::PromptMark { session_id, kind, click_events, exit_code }, None)
+        }
+        MetadataEvent::PromptReceived { provider, text } => {
+            (ServerMessage::PromptReceived { session_id, provider, text }, None)
         }
     }
 }

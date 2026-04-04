@@ -527,6 +527,9 @@ pub struct TerminalConfig {
     pub status_bar_stats: StatusBarStatsConfig,
     #[serde(default)]
     pub shell_integration: ShellIntegrationConfig,
+    /// Show first/latest prompt text at the top of AI terminal panes.
+    #[serde(default)]
+    pub prompt_bar: bool,
 }
 
 impl Default for TerminalConfig {
@@ -544,6 +547,7 @@ impl Default for TerminalConfig {
             indicator_height: default_indicator_height(),
             status_bar_stats: StatusBarStatsConfig::default(),
             shell_integration: ShellIntegrationConfig::default(),
+            prompt_bar: false,
         }
     }
 }

@@ -12,6 +12,8 @@ const MAX_AI_FIELD_LEN: usize = 256;
 
 /// Maximum length for Codex task labels emitted via hook metadata.
 const MAX_CODEX_TASK_LABEL_LEN: usize = 256;
+/// Maximum length for prompt text emitted by AI CLIs.
+const MAX_PROMPT_TEXT_LEN: usize = 256;
 /// Maximum length for shell context fields (host, tmux session).
 const MAX_CONTEXT_FIELD_LEN: usize = 256;
 
@@ -23,6 +25,11 @@ pub enum MetadataEvent {
     SessionContextChanged(SessionContext),
     CodexTaskLabelChanged(String),
     CodexTaskLabelCleared,
+    /// A user prompt was submitted in a Claude Code or Codex session.
+    PromptReceived {
+        provider: AiProvider,
+        text: String,
+    },
     AiStateChanged(AiProcessState),
     /// The AI state was explicitly cleared (OSC 1337 `ClaudeState=inactive`).
     AiStateCleared,
@@ -169,6 +176,12 @@ impl MetadataParser {
         if let Some(label) = payload.strip_prefix("CodexTaskLabel=") {
             return Self::parse_codex_task_label(label);
         }
+        if let Some(text) = payload.strip_prefix("ClaudePrompt=") {
+            return Self::parse_prompt(AiProvider::ClaudeCode, text);
+        }
+        if let Some(text) = payload.strip_prefix("CodexPrompt=") {
+            return Self::parse_prompt(AiProvider::CodexCode, text);
+        }
         if payload == "ScribeContext" || payload.starts_with("ScribeContext=") {
             return Some(Self::parse_session_context(payload.as_ref(), params));
         }
@@ -234,6 +247,14 @@ impl MetadataParser {
             return None;
         }
         Some(MetadataEvent::CodexTaskLabelChanged(label))
+    }
+
+    fn parse_prompt(provider: AiProvider, text: &str) -> Option<MetadataEvent> {
+        let text = sanitize_text_payload(text, MAX_PROMPT_TEXT_LEN);
+        if text.is_empty() {
+            return None;
+        }
+        Some(MetadataEvent::PromptReceived { provider, text })
     }
 
     fn parse_session_context(payload: &str, params: &[&[u8]]) -> MetadataEvent {
@@ -520,6 +541,49 @@ mod tests {
                 assert_eq!(context.tmux_session.as_deref(), Some("editor"));
             }
             other => panic!("expected legacy session context event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_claude_prompt() {
+        let event = parse_iterm2(&[b"1337", b"ClaudePrompt=Fix the login bug"]);
+        match event {
+            Some(MetadataEvent::PromptReceived { provider, text }) => {
+                assert_eq!(provider, AiProvider::ClaudeCode);
+                assert_eq!(text, "Fix the login bug");
+            }
+            other => panic!("expected PromptReceived, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_codex_prompt() {
+        let event = parse_iterm2(&[b"1337", b"CodexPrompt=Add OAuth support"]);
+        match event {
+            Some(MetadataEvent::PromptReceived { provider, text }) => {
+                assert_eq!(provider, AiProvider::CodexCode);
+                assert_eq!(text, "Add OAuth support");
+            }
+            other => panic!("expected PromptReceived, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_prompt() {
+        let event = parse_iterm2(&[b"1337", b"ClaudePrompt="]);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn truncates_long_prompt() {
+        let long_text = "x".repeat(300);
+        let payload = format!("ClaudePrompt={long_text}");
+        let event = parse_iterm2(&[b"1337", payload.as_bytes()]);
+        match event {
+            Some(MetadataEvent::PromptReceived { text, .. }) => {
+                assert_eq!(text.len(), 256);
+            }
+            other => panic!("expected PromptReceived, got {other:?}"),
         }
     }
 }

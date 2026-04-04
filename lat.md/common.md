@@ -28,7 +28,7 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 ### Terminal
 
-[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback line count, copy-on-select, Claude clipboard cleanup, Claude/Codex integration toggles, the selected AI tab provider, natural scroll, AI state indicator height, shell integration, and status bar stats.
+[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, clipboard cleanup, Claude/Codex integration toggles, AI tab provider, natural scroll, indicator height, shell integration, status bar stats, and the `prompt_bar` flag.
 
 [[crates/scribe-common/src/config.rs#StatusBarStatsConfig]] independently toggles CPU, memory, GPU, and network display. [[crates/scribe-common/src/config.rs#ShellIntegrationConfig]] wraps a single `enabled` flag for shell prompt marks. [[crates/scribe-common/src/config.rs#TerminalConfig#ai_provider_enabled]] maps an [[crates/scribe-common/src/ai_state.rs#AiProvider]] to the matching integration toggle.
 

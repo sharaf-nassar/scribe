@@ -13,6 +13,7 @@ mod layout;
 mod mouse_reporting;
 mod mouse_state;
 mod pane;
+mod prompt_bar;
 mod restore_replay;
 mod restore_state;
 mod scrollbar;
@@ -345,6 +346,9 @@ struct App {
     /// Active tooltip state: (text, `anchor_rect`, position).
     active_tooltip: Option<(String, layout::Rect, tooltip::TooltipPosition)>,
 
+    /// Prompt bar hover state: which pane and which line the cursor is over.
+    prompt_bar_hover: Option<(PaneId, prompt_bar::PromptBarHover)>,
+
     /// System hostname for the window-level status bar (fetched once at startup).
     hostname: String,
     /// System resource stats collector for the status bar.
@@ -476,6 +480,7 @@ impl App {
             status_bar_tooltip_targets: Vec::new(),
             tab_bar_tooltip_targets: Vec::new(),
             active_tooltip: None,
+            prompt_bar_hover: None,
             hostname: read_hostname(),
             sys_stats: sys_stats::SystemStatsCollector::new(),
             pending_pty_bytes: HashMap::new(),
@@ -535,6 +540,7 @@ impl ApplicationHandler<UiEvent> for App {
             }
             UiEvent::AiStateCleared { session_id } => {
                 self.ai_tracker.remove(session_id);
+                self.clear_pane_prompts(session_id);
                 self.request_redraw();
             }
             UiEvent::Bell { session_id } => {
@@ -596,6 +602,7 @@ impl ApplicationHandler<UiEvent> for App {
             }
             UiEvent::UpdateAvailable { version, release_url } => {
                 self.update_available = Some((version, release_url));
+                self.update_window_title();
                 self.request_redraw();
             }
             UiEvent::UpdateProgress { state } => {
@@ -623,8 +630,10 @@ impl ApplicationHandler<UiEvent> for App {
                     self.scroll_focused_pane_to_search_match();
                     self.request_redraw();
                 }
-            } // QuitAllFromDialog / CloseWindow / CancelClose were removed —
-              // the close dialog is now an in-app GPU overlay (close_dialog module).
+            }
+            UiEvent::PromptReceived { session_id, provider: _, text } => {
+                self.handle_prompt_received(session_id, text);
+            }
         }
     }
 
@@ -1485,6 +1494,7 @@ impl App {
                 cell.width,
                 cell.height,
                 eff_tbh,
+                0.0,
                 &pane::effective_padding(&self.config.appearance.content_padding, pane_edges),
             );
             let binding = if let Some((_, _, cwd, _, _, Some(provider), conversation_id)) =
@@ -1691,11 +1701,13 @@ impl App {
         for (pane_id, pane_rect, pane_edges, tab_bar_h) in pane_geom {
             let Some(pane) = self.panes.get_mut(&pane_id) else { continue };
             let eff_tbh = if pane_edges.top { tab_bar_h } else { 0.0 };
+            let pbh = pane.prompt_bar_height(cell.height, self.config.terminal.prompt_bar);
             let grid = pane::compute_pane_grid(
                 pane_rect,
                 cell.width,
                 cell.height,
                 eff_tbh,
+                pbh,
                 &pane::effective_padding(&self.config.appearance.content_padding, pane_edges),
             );
             pane.rect = pane_rect;
@@ -1764,7 +1776,7 @@ impl App {
         let mut grids = HashMap::new();
         for &(ws_id, ws_rect) in &ws_rects {
             let grid =
-                pane::compute_pane_grid(ws_rect, cell.width, cell.height, tab_bar_h, &padding);
+                pane::compute_pane_grid(ws_rect, cell.width, cell.height, tab_bar_h, 0.0, &padding);
             dims.insert(ws_id, (grid.cols, grid.rows));
             rects.insert(ws_id, ws_rect);
             grids.insert(ws_id, grid);
@@ -1808,6 +1820,7 @@ impl App {
             cell.width,
             cell.height,
             eff_tbh,
+            0.0,
             &pane::effective_padding(&self.config.appearance.content_padding, pane_edges),
         );
         Some((pane_id, pane_rect, grid))
@@ -1927,6 +1940,11 @@ impl App {
     ) {
         self.update_ai_launch_binding(session_id, &ai_state);
 
+        // Detect conversation reset: if conversation_id changed, clear prompts.
+        if let Some(new_conv_id) = ai_state.conversation_id.as_deref() {
+            self.maybe_reset_prompts_on_conversation_change(session_id, new_conv_id);
+        }
+
         let provider_enabled = self.config.terminal.ai_provider_enabled(ai_state.provider);
         tracing::debug!(
             session = %session_id,
@@ -1954,21 +1972,31 @@ impl App {
     ) {
         let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
-        let next_kind = restore_state::LaunchKind::Ai {
-            provider: ai_state.provider,
-            resume_mode: restore_state::AiResumeMode::Resume,
-            conversation_id: ai_state.conversation_id.clone(),
-        };
+
+        // Preserve existing conversation_id when the incoming state omits it
+        // (e.g. Notification hooks that don't receive session_id from Claude).
+        let effective_conversation_id = ai_state.conversation_id.clone().or_else(|| {
+            if let restore_state::LaunchKind::Ai { conversation_id, .. } = &pane.launch_binding.kind
+            {
+                conversation_id.clone()
+            } else {
+                None
+            }
+        });
 
         if let restore_state::LaunchKind::Ai { provider, conversation_id, .. } =
             &pane.launch_binding.kind
         {
-            if *provider == ai_state.provider && *conversation_id == ai_state.conversation_id {
+            if *provider == ai_state.provider && *conversation_id == effective_conversation_id {
                 return;
             }
         }
 
-        pane.launch_binding.kind = next_kind;
+        pane.launch_binding.kind = restore_state::LaunchKind::Ai {
+            provider: ai_state.provider,
+            resume_mode: restore_state::AiResumeMode::Resume,
+            conversation_id: effective_conversation_id,
+        };
         self.mark_restore_dirty();
     }
 
@@ -2081,6 +2109,76 @@ impl App {
         tracing::debug!(%session_id, %task_label, "codex task label changed");
         pane.codex_task_label = Some(task_label.to_owned());
         self.request_redraw();
+    }
+
+    /// Record a prompt received from the user and resize the pane if the
+    /// prompt bar height changes.
+    fn handle_prompt_received(&mut self, session_id: SessionId, text: String) {
+        let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
+        let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+
+        let old_line_count = prompt_bar_line_count(pane.prompt_count);
+
+        pane.prompt_count += 1;
+        if pane.prompt_count == 1 {
+            pane.first_prompt = Some(text);
+        } else {
+            pane.latest_prompt = Some(text);
+        }
+
+        let new_line_count = prompt_bar_line_count(pane.prompt_count);
+
+        tracing::debug!(
+            %session_id,
+            prompt_count = pane.prompt_count,
+            "prompt received"
+        );
+
+        if self.config.terminal.prompt_bar && new_line_count != old_line_count {
+            self.resize_after_layout_change();
+        }
+        self.request_redraw();
+    }
+
+    /// Clear prompt state for the pane associated with a session.
+    fn clear_pane_prompts(&mut self, session_id: SessionId) {
+        let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
+        let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+
+        let had_prompts = pane.prompt_count > 0;
+        pane.first_prompt = None;
+        pane.latest_prompt = None;
+        pane.prompt_count = 0;
+        pane.last_conversation_id = None;
+
+        if self.config.terminal.prompt_bar && had_prompts {
+            self.resize_after_layout_change();
+        }
+    }
+
+    /// Reset prompt state when the conversation ID changes for a session.
+    ///
+    /// Called from `handle_ai_state_changed` when a new `conversation_id` is
+    /// seen. If the ID differs from the last recorded one, all prompt fields
+    /// are cleared and the pane is resized if the prompt bar was visible.
+    fn maybe_reset_prompts_on_conversation_change(
+        &mut self,
+        session_id: SessionId,
+        new_conv_id: &str,
+    ) {
+        let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
+        let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+        let changed = pane.last_conversation_id.as_deref().is_some_and(|old| old != new_conv_id);
+        pane.last_conversation_id = Some(new_conv_id.to_owned());
+        if changed {
+            let old_lines = prompt_bar_line_count(pane.prompt_count);
+            pane.first_prompt = None;
+            pane.latest_prompt = None;
+            pane.prompt_count = 0;
+            if self.config.terminal.prompt_bar && old_lines > 0 {
+                self.resize_after_layout_change();
+            }
+        }
     }
 
     /// Handle explicit Codex task-label clearing for a session.
@@ -2285,6 +2383,8 @@ impl App {
             || (old_pad.bottom - new_pad.bottom).abs() > f32::EPSILON
             || (old_pad.left - new_pad.left).abs() > f32::EPSILON;
 
+        let old_prompt_bar = old.terminal.prompt_bar;
+
         self.ai_tracker.reconfigure(new_config.terminal.claude_states.clone());
         self.config = new_config;
 
@@ -2304,6 +2404,11 @@ impl App {
         // unfocused workspaces also pick up the new cell metrics.
         if font_changed || tab_bar_changed || padding_changed {
             self.resize_all_workspace_panes();
+        }
+
+        // If prompt_bar setting changed, resize all panes to add/remove bar rows.
+        if old_prompt_bar != self.config.terminal.prompt_bar {
+            self.resize_after_layout_change();
         }
 
         tracing::info!("config hot-reloaded");
@@ -2388,11 +2493,13 @@ impl App {
                 .copied()
                 .unwrap_or_else(|| self.effective_tab_bar_height());
             let tbh = if edges.top { tab_bar_h } else { 0.0 };
+            let pbh = pane.prompt_bar_height(cell.height, self.config.terminal.prompt_bar);
             let expected = pane::compute_pane_grid(
                 *rect,
                 cell.width,
                 cell.height,
                 tbh,
+                pbh,
                 &pane::effective_padding(&self.config.appearance.content_padding, *edges),
             );
             if pane.grid.cols != expected.cols || pane.grid.rows != expected.rows {
@@ -2722,6 +2829,8 @@ impl App {
             focused_pane,
             padding: &self.config.appearance.content_padding,
             focused_ws_rect,
+            prompt_bar_enabled: self.config.terminal.prompt_bar,
+            prompt_bar_hover: self.prompt_bar_hover,
         };
         let frame_style = FrameStyle {
             border_colors: &border_colors,
@@ -2734,7 +2843,6 @@ impl App {
             scrollbar_color,
             indicator_height: indicator_h,
         };
-        let update_version = self.update_available.as_ref().map(|(v, _)| v.as_str());
         let frame_interaction = FrameInteraction {
             cursor_visible,
             tab_width: self.config.appearance.tab_width,
@@ -2744,7 +2852,7 @@ impl App {
             hovered_tab: self.hovered_tab,
             tab_drag: self.tab_drag.as_ref(),
             tab_drag_offsets: &self.tab_drag_offsets,
-            update_available: update_version,
+            update_available: None,
             update_progress: self.update_progress.as_ref(),
         };
         let (mut all_instances, tab_hits, tab_close_hits, tab_eq_hits, tab_upd_hits, tab_tt_hits) =
@@ -2763,10 +2871,12 @@ impl App {
         self.tab_bar_update_targets = tab_upd_hits;
         self.tab_bar_tooltip_targets = tab_tt_hits;
 
+        // Tab bar height lookup, shared by URL underlines and prompt bar tooltip.
+        let ws_tab_bar_heights: HashMap<WorkspaceId, f32> =
+            ws_tab_bar_data.iter().map(|d| (d.ws_id, d.tab_bar_height)).collect();
+
         // URL underlines — rendered on top of terminal content, below tab bars.
         {
-            let ws_tab_bar_heights: HashMap<WorkspaceId, f32> =
-                ws_tab_bar_data.iter().map(|d| (d.ws_id, d.tab_bar_height)).collect();
             let fallback_tbh = ws_tab_bar_data.first().map_or(0.0, |d| d.tab_bar_height);
             apply_url_underlines(
                 &mut all_instances,
@@ -2780,6 +2890,7 @@ impl App {
                 self.hovered_url.as_ref(),
                 &self.config.appearance.content_padding,
                 self.modifiers.control_key(),
+                self.config.terminal.prompt_bar,
             );
         }
 
@@ -2858,6 +2969,45 @@ impl App {
                 full_viewport,
                 cell_size,
                 &self.theme.chrome,
+                &mut resolve_glyph,
+            );
+        }
+
+        // Prompt bar tooltip — shown when hovering a truncated prompt line.
+        // Compute the tooltip anchor outside the render call to avoid nesting.
+        let prompt_tooltip_anchor = self.prompt_bar_hover.and_then(|(pid, hover)| {
+            let pane = self.panes.get(&pid)?;
+            let full_text = prompt_bar::hovered_prompt_text(pane, hover)?;
+            if !prompt_bar::is_prompt_truncated(full_text, pane.rect.width, cell_size.0) {
+                return None;
+            }
+            let tbh = if pane.edges.top {
+                pane_tab_bar_h(pane.workspace_id, &ws_tab_bar_heights, &ws_tab_bar_data)
+            } else {
+                0.0
+            };
+            let pbh = pane.prompt_bar_height(cell_size.1, true);
+            let anchor = layout::Rect {
+                x: pane.rect.x,
+                y: pane.rect.y + tbh,
+                width: pane.rect.width,
+                height: pbh,
+            };
+            Some((full_text.to_owned(), anchor))
+        });
+        if let Some((ref text, anchor)) = prompt_tooltip_anchor {
+            let mut resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            tooltip::render_tooltip(
+                &mut all_instances,
+                text,
+                anchor,
+                tooltip::TooltipPosition::Below,
+                [0.086, 0.086, 0.188, 1.0], // #161630
+                [0.690, 0.690, 0.816, 1.0], // #b0b0d0
+                [0.149, 0.149, 0.282, 1.0], // #262648
+                cell_size,
+                full_viewport.width,
                 &mut resolve_glyph,
             );
         }
@@ -3147,6 +3297,7 @@ impl App {
                     }
                 }
             }
+            AutomationAction::OpenUpdateDialog => self.open_update_dialog(),
         }
     }
 
@@ -3205,6 +3356,7 @@ impl App {
             cell.width,
             cell.height,
             eff_tbh,
+            0.0,
             &pane::effective_padding(&self.config.appearance.content_padding, new_edges),
         );
         let pane = Pane::new(
@@ -3283,6 +3435,7 @@ impl App {
             cell.width,
             cell.height,
             tab_bar_h,
+            0.0,
             &self.config.appearance.content_padding,
         );
         let pane = Pane::new(
@@ -3546,6 +3699,7 @@ impl App {
             cell.width,
             cell.height,
             tab_bar_h,
+            0.0,
             &self.config.appearance.content_padding,
         );
         let pane = Pane::new(
@@ -4209,6 +4363,13 @@ impl App {
                 action: AutomationAction::NewWindow,
             },
         ];
+
+        if let Some((version, _)) = &self.update_available {
+            entries.push(CommandPaletteEntry {
+                label: format!("Update Scribe to v{version}"),
+                action: AutomationAction::OpenUpdateDialog,
+            });
+        }
 
         let active_profile = scribe_common::profiles::active_profile_name().ok();
         if let Ok(profile_names) = scribe_common::profiles::list_profiles() {
@@ -5088,6 +5249,9 @@ impl App {
             self.request_redraw();
         }
 
+        // Prompt bar hover detection.
+        self.update_prompt_bar_hover(x, y);
+
         // Update tooltip state: check status bar targets (Above) then tab targets (Below).
         self.update_active_tooltip(x, y);
     }
@@ -5115,6 +5279,61 @@ impl App {
         };
         if changed {
             self.active_tooltip = new_tooltip;
+            self.request_redraw();
+        }
+    }
+
+    /// Update prompt bar hover state by hit-testing the cursor against
+    /// prompt bars in all visible panes.
+    fn update_prompt_bar_hover(&mut self, mouse_x: f32, mouse_y: f32) {
+        let old_hover = self.prompt_bar_hover;
+        self.prompt_bar_hover = None;
+
+        if !self.config.terminal.prompt_bar {
+            if old_hover.is_some() {
+                self.request_redraw();
+            }
+            return;
+        }
+
+        let Some(gpu) = &self.gpu else {
+            if old_hover.is_some() {
+                self.request_redraw();
+            }
+            return;
+        };
+        let cell_h = gpu.renderer.cell_size().height;
+
+        // Iterate pane rects to find the pane whose prompt bar the cursor is over.
+        for (pane_id, pane) in &self.panes {
+            if pane.prompt_count == 0 {
+                continue;
+            }
+            let pbh = pane.prompt_bar_height(cell_h, true);
+            if pbh <= 0.0 {
+                continue;
+            }
+            // Compute effective tab bar height for this pane.
+            let tbh = if pane.edges.top {
+                self.tab_bar_height_for(pane.workspace_id, pane.rect)
+            } else {
+                0.0
+            };
+            let bar_rect = layout::Rect {
+                x: pane.rect.x,
+                y: pane.rect.y + tbh,
+                width: pane.rect.width,
+                height: pbh,
+            };
+            if let Some(hover) =
+                prompt_bar::hit_test_prompt_bar(pane, bar_rect, cell_h, mouse_x, mouse_y)
+            {
+                self.prompt_bar_hover = Some((*pane_id, hover));
+                break;
+            }
+        }
+
+        if self.prompt_bar_hover != old_hover {
             self.request_redraw();
         }
     }
@@ -5979,7 +6198,8 @@ impl App {
         let tab = self.window_layout.active_tab()?;
         let pane = self.panes.get(&tab.focused_pane)?;
         let padding = pane::effective_padding(&self.config.appearance.content_padding, pane.edges);
-        let (content_x, content_y) = pane.content_offset(tab_bar_h, &padding);
+        let pbh = pane.prompt_bar_height(cell.height, self.config.terminal.prompt_bar);
+        let (content_x, content_y) = pane.content_offset(tab_bar_h, pbh, &padding);
         let rel_x = x - content_x;
         let rel_y = y - content_y;
         if rel_x < 0.0 || rel_y < 0.0 {
@@ -6074,7 +6294,8 @@ impl App {
             let tab_bar_h = ws_heights.get(&pane.workspace_id).copied().unwrap_or(fallback_h);
             let tbh = if edges.top { tab_bar_h } else { 0.0 };
             let eff_pad = pane::effective_padding(&self.config.appearance.content_padding, *edges);
-            let grid = pane::compute_pane_grid(*rect, cell.width, cell.height, tbh, &eff_pad);
+            let pbh = pane.prompt_bar_height(cell.height, self.config.terminal.prompt_bar);
+            let grid = pane::compute_pane_grid(*rect, cell.width, cell.height, tbh, pbh, &eff_pad);
             let old_history = pane.term.grid().history_size();
             pane.resize(*rect, grid);
             let new_history = pane.term.grid().history_size();
@@ -6148,8 +6369,14 @@ impl App {
         let ws_grid_map: HashMap<WorkspaceId, (Rect, GridSize)> = ws_rects
             .iter()
             .map(|&(ws_id, ws_rect)| {
-                let grid =
-                    pane::compute_pane_grid(ws_rect, cell.width, cell.height, tab_bar_h, &padding);
+                let grid = pane::compute_pane_grid(
+                    ws_rect,
+                    cell.width,
+                    cell.height,
+                    tab_bar_h,
+                    0.0,
+                    &padding,
+                );
                 (ws_id, (ws_rect, grid))
             })
             .collect();
@@ -6457,6 +6684,7 @@ impl App {
             update_dialog::UpdateAction::Confirm => {
                 tracing::info!("user confirmed update");
                 self.update_available = None;
+                self.update_window_title();
                 if let Some(tx) = &self.cmd_tx {
                     send_command(tx, ClientCommand::TriggerUpdate);
                 }
@@ -6465,12 +6693,24 @@ impl App {
                 tracing::info!("user dismissed update");
                 self.update_available = None;
                 self.update_progress = None;
+                self.update_window_title();
                 if let Some(tx) = &self.cmd_tx {
                     send_command(tx, ClientCommand::DismissUpdate);
                 }
             }
         }
         self.request_redraw();
+    }
+
+    /// Update the compositor window title to reflect the current update state.
+    fn update_window_title(&self) {
+        if let Some(window) = &self.window {
+            if let Some((version, _)) = &self.update_available {
+                window.set_title(&format!("Scribe — v{version} available"));
+            } else {
+                window.set_title("Scribe");
+            }
+        }
     }
 
     /// Handle keyboard input while the update dialog is active.
@@ -6891,6 +7131,8 @@ struct FrameLayout<'a> {
     focused_pane: PaneId,
     padding: &'a ContentPadding,
     focused_ws_rect: Option<Rect>,
+    prompt_bar_enabled: bool,
+    prompt_bar_hover: Option<(PaneId, prompt_bar::PromptBarHover)>,
 }
 
 /// Colors and visual styling passed to [`build_all_instances`].
@@ -6977,7 +7219,8 @@ fn build_all_instances(
         if let Some(pane) = panes.get_mut(pane_id) {
             let tbh =
                 pane_tab_bar_h(pane.workspace_id, &ws_tab_bar_heights, layout.ws_tab_bar_data);
-            let offset = pane.content_offset(tbh, layout.padding);
+            let pbh = pane.prompt_bar_height(layout.cell_size.1, layout.prompt_bar_enabled);
+            let offset = pane.content_offset(tbh, pbh, layout.padding);
             // Only the focused pane shows the blinking cursor; unfocused panes hide it.
             let is_focused = *pane_id == layout.focused_pane;
             let pane_cursor_visible = is_focused && interaction.cursor_visible;
@@ -6986,7 +7229,14 @@ fn build_all_instances(
             // right/bottom edges left by floor-division of pixels by cell size.
             let dim = has_multiple_panes && !is_focused;
             let eff_tbh = if pane.edges.top { tbh } else { 0.0 };
-            push_pane_bg_fill(&mut all_instances, pane, eff_tbh, (default_bg, dim));
+            let prompt_chrome_h = if pane.edges.top { pbh } else { 0.0 };
+            push_pane_bg_fill(
+                &mut all_instances,
+                pane,
+                eff_tbh,
+                prompt_chrome_h,
+                (default_bg, dim),
+            );
 
             // Skip rebuilding instances when the pane content and all
             // rendering context (cursor blink, focus, selection) are unchanged.
@@ -7161,6 +7411,35 @@ fn build_all_instances(
         );
     }
 
+    // Prompt bars — drawn after tab bar text so they render below the tab bar.
+    for (pane_id, pane_rect) in layout.pane_rects {
+        if let Some(pane) = panes.get(pane_id) {
+            if pane.prompt_count == 0 || !layout.prompt_bar_enabled {
+                continue;
+            }
+            let eff_tbh = if pane.edges.top {
+                pane_tab_bar_h(pane.workspace_id, &ws_tab_bar_heights, layout.ws_tab_bar_data)
+            } else {
+                0.0
+            };
+            let pbh = pane.prompt_bar_height(layout.cell_size.1, layout.prompt_bar_enabled);
+            let bar_rect = layout::Rect {
+                x: pane_rect.x,
+                y: pane_rect.y + eff_tbh,
+                width: pane_rect.width,
+                height: pbh,
+            };
+            prompt_bar::render_prompt_bar(
+                &mut all_instances,
+                pane,
+                bar_rect,
+                layout.cell_size,
+                layout.prompt_bar_hover.filter(|h| h.0 == *pane_id).map(|h| h.1),
+                &mut |ch| renderer.resolve_glyph(device, queue, ch),
+            );
+        }
+    }
+
     // Pane dividers.
     divider::build_divider_instances(&mut all_instances, layout.dividers, style.divider_color);
     // Workspace dividers — rendered directly as single quads.
@@ -7277,7 +7556,8 @@ fn build_all_instances(
     )
 }
 
-/// Emit one solid-colour quad covering the full pane area below the tab bar.
+/// Emit one solid-colour quad covering the full pane area below the tab bar
+/// and prompt bar.
 ///
 /// Covers remainder pixels at right/bottom edges left by floor-dividing pixel
 /// dimensions by cell size.  Must be pushed before cell instances so cells
@@ -7287,13 +7567,15 @@ fn push_pane_bg_fill(
     out: &mut Vec<scribe_renderer::types::CellInstance>,
     pane: &Pane,
     tab_bar_height: f32,
+    prompt_bar_height: f32,
     bg_and_dim: ([f32; 4], bool),
 ) {
     let (default_bg, dim) = bg_and_dim;
+    let chrome_h = tab_bar_height + prompt_bar_height;
     let fill_x = pane.rect.x;
-    let fill_y = pane.rect.y + tab_bar_height;
+    let fill_y = pane.rect.y + chrome_h;
     let fill_w = pane.rect.width.max(0.0);
-    let fill_h = (pane.rect.height - tab_bar_height).max(0.0);
+    let fill_h = (pane.rect.height - chrome_h).max(0.0);
     if fill_w <= 0.0 || fill_h <= 0.0 {
         return;
     }
@@ -7496,6 +7778,10 @@ const URL_UNDERLINE_ACTIVE_COLOR: [f32; 4] = [0.4, 0.8, 1.0, 1.0];
     reason = "needs pane data, url caches, layout geometry, focused pane id, and hovered url for rendering"
 )]
 #[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "ctrl_held and prompt_bar_enabled are independent boolean flags with different semantics"
+)]
+#[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
@@ -7513,6 +7799,7 @@ fn apply_url_underlines(
     hovered_url: Option<&url_detect::UrlSpan>,
     padding: &ContentPadding,
     ctrl_held: bool,
+    prompt_bar_enabled: bool,
 ) {
     if !ctrl_held {
         return;
@@ -7531,7 +7818,8 @@ fn apply_url_underlines(
     };
     let Some(pane) = panes.get(&focused_pane_id) else { return };
     let tbh = ws_tab_bar_heights.get(&pane.workspace_id).copied().unwrap_or(fallback_tbh);
-    let offset = pane.content_offset(tbh, padding);
+    let pbh = pane.prompt_bar_height(cell_size.1, prompt_bar_enabled);
+    let offset = pane.content_offset(tbh, pbh, padding);
     let display_offset = pane.term.grid().display_offset() as i32;
 
     let Some(cache) = url_caches.get_mut(&focused_pane_id) else { return };
@@ -7803,6 +8091,15 @@ fn read_hostname() -> String {
 /// Format the current local time as `HH:MM`.
 ///
 /// Uses `libc::localtime_r` (the reentrant POSIX API) for timezone-aware
+/// Number of prompt bar lines for a given prompt count.
+fn prompt_bar_line_count(prompt_count: u32) -> u32 {
+    match prompt_count {
+        0 => 0,
+        1 => 1,
+        _ => 2,
+    }
+}
+
 /// local time. The two `unsafe` calls are sound because `localtime_r` writes
 /// into a caller-owned `tm` struct and does not share mutable state.
 #[allow(unsafe_code, reason = "localtime_r is the reentrant POSIX API; we own the tm struct")]

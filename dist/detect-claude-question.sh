@@ -50,4 +50,11 @@ if [[ -n "$MSG" ]]; then
     fi
 fi
 
-printf '\e]1337;ClaudeState=%s\a' "$STATE" > /dev/tty
+# Extract session_id for Scribe cold-restart conversation tracking.
+SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // ""' 2>/dev/null) || SESSION_ID=""
+
+if [[ -n "$SESSION_ID" ]]; then
+    printf '\e]1337;ClaudeState=%s;conversation_id=%s\a' "$STATE" "$SESSION_ID" > /dev/tty
+else
+    printf '\e]1337;ClaudeState=%s\a' "$STATE" > /dev/tty
+fi

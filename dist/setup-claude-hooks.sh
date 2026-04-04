@@ -86,7 +86,7 @@ SCRIBE_HOOKS = [
         {"type": "command", "command": "printf '\\e]1337;ClaudeState=processing\\a' > /dev/tty"},
     ]),
     ("UserPromptSubmit", None, [
-        {"type": "command", "command": "printf '\\e]1337;ClaudeState=processing\\a' > /dev/tty"},
+        {"type": "command", "command": "python3 -c 'import json,sys;d=json.load(sys.stdin);sid=d.get(\"session_id\",\"\");p=d.get(\"prompt\",\"\")[:256].replace(chr(7),\"\").replace(chr(27),\"\");f=open(\"/dev/tty\",\"w\");f.write(f\"\\x1b]1337;ClaudeState=processing;conversation_id={sid}\\x07\" if sid else \"\\x1b]1337;ClaudeState=processing\\x07\");f.write(f\"\\x1b]1337;ClaudePrompt={p}\\x07\") if p else None;f.close()' 2>/dev/null || true"},
     ]),
 ]
 

@@ -41,6 +41,7 @@ pub enum AutomationAction {
     CloseTab,
     NewWindow,
     SwitchProfile { name: String },
+    OpenUpdateDialog,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +234,12 @@ pub enum ServerMessage {
     },
     CodexTaskLabelCleared {
         session_id: SessionId,
+    },
+    /// A user prompt was submitted in a Claude Code or Codex session.
+    PromptReceived {
+        session_id: SessionId,
+        provider: AiProvider,
+        text: String,
     },
     WorkspaceNamed {
         workspace_id: WorkspaceId,

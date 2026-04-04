@@ -127,7 +127,7 @@ Tab actions: new, new/resume the selected AI CLI, close, next, prev, select 1-9.
 
 The command palette is a GPU-rendered action picker for common window actions and profile switching, opened from a dedicated keybinding and reusing the normal layout-action handlers.
 
-[[crates/scribe-client/src/command_palette.rs#CommandPalette]] owns the query string, active state, and selected row. [[crates/scribe-client/src/main.rs#App#handle_open_command_palette]] populates entries for settings, find, tab and pane actions, new windows, and every saved profile from [[crates/scribe-common/src/profiles.rs#list_profiles]]. Selecting an entry routes through [[crates/scribe-client/src/main.rs#App#execute_automation_action]], so command-palette actions and server-forwarded automation stay on the same code path.
+[[crates/scribe-client/src/command_palette.rs#CommandPalette]] owns the query string, active state, and selected row. [[crates/scribe-client/src/main.rs#App#handle_open_command_palette]] populates entries for settings, find, tab and pane actions, new windows, every saved profile from [[crates/scribe-common/src/profiles.rs#list_profiles]], and (when available) an "Update Scribe to v{version}" entry. Selecting an entry routes through [[crates/scribe-client/src/main.rs#App#execute_automation_action]], so command-palette actions and server-forwarded automation stay on the same code path.
 
 ### Mouse Handling
 
@@ -155,7 +155,7 @@ The IPC connection runs in a background thread with its own Tokio runtime, defin
 
 The main thread sends `ClientCommand` variants through an mpsc channel to the write task for socket serialization.
 
-The write task serializes commands to `ClientMessage` and writes to the socket. The read task deserializes `ServerMessage` responses and dispatches them as `UiEvent` variants through the winit event loop proxy.
+The write task serializes commands to `ClientMessage` and writes to the socket. The read task deserializes `ServerMessage` responses and dispatches them as `UiEvent` variants through the winit event loop proxy. `UiEvent::PromptReceived` carries session ID, provider, and prompt text for the prompt bar feature.
 
 Automation requests use that same path in both directions. `scribe-cli action ...` becomes [[protocol#Client Messages#Automation]] `DispatchAction`, the server forwards it as [[protocol#Server Messages#Automation]] `RunAction`, and the client executes it through the same handlers the keyboard shortcuts and command palette already use.
 
@@ -197,6 +197,16 @@ Priority order: PermissionPrompt > WaitingForInput > IdlePrompt > Error > Proces
 
 On reconnect, active AI state is populated from `SessionInfo.ai_state` during handle_session_list so indicators appear immediately without waiting for the per-session `AiStateChanged` messages from the server's `send_stored_metadata` path. `SessionInfo.ai_provider_hint` is restored separately so clipboard cleanup and other provider-aware behavior survive reconnect even when no visible indicator should be shown. When available, `SessionInfo.ai_state.conversation_id` is also used to seed per-pane AI resume bindings so restored windows attempt targeted resume of prior provider sessions.
 
+## Prompt Bar
+
+A per-pane bar that tracks the user's most recent AI prompts, rendered between the tab bar and terminal content.
+
+Prompt state is stored in [[crates/scribe-client/src/pane.rs#Pane]]: `first_prompt`, `latest_prompt`, `prompt_count`, and `last_conversation_id`. [[crates/scribe-client/src/main.rs#App#handle_prompt_received]] increments `prompt_count` and stores prompt text, triggering `resize_after_layout_change` when the bar height changes (0→1 line, 1→2+ lines). [[crates/scribe-client/src/pane.rs#Pane#prompt_bar_height]] returns 0.0 when the feature is disabled or no prompts have been received; otherwise it is `lines * cell_height + 14.0` (8px top pad + 6px bottom pad). [[crates/scribe-client/src/pane.rs#compute_pane_grid]] and [[crates/scribe-client/src/pane.rs#Pane#content_offset]] both accept a `prompt_bar_height` parameter so the terminal grid is sized and positioned below the bar.
+
+Rendering is handled by [[crates/scribe-client/src/prompt_bar.rs#render_prompt_bar]], which emits `CellInstance` quads: a background rect (`#151528`), icon glyphs (`⊙` for first, `→` for latest), and truncated prompt text. Text is clipped with an ellipsis (`…`) when it overflows the available width. [[crates/scribe-client/src/prompt_bar.rs#hit_test_prompt_bar]] maps mouse coordinates to a [[crates/scribe-client/src/prompt_bar.rs#PromptBarHover]] variant for hover highlighting. [[crates/scribe-client/src/prompt_bar.rs#hovered_prompt_text]] returns the full text of the hovered line for tooltip display. [[crates/scribe-client/src/prompt_bar.rs#is_prompt_truncated]] checks whether a given text would overflow, used to decide whether to show a tooltip.
+
+Conversation resets are detected in [[crates/scribe-client/src/main.rs#App#maybe_reset_prompts_on_conversation_change]]: when `AiStateChanged` arrives with a different `conversation_id` than `pane.last_conversation_id`, all prompt fields are cleared and the pane is resized if the bar was visible. [[crates/scribe-client/src/main.rs#App#clear_pane_prompts]] performs the same clearing when `AiStateCleared` is received.
+
 ## Status Bar
 
 The status bar at the bottom of the window shows connection status, workspace info, CWD, git branch, session count, host context, tmux context, time, and system stats.
@@ -217,7 +227,9 @@ An in-app GPU-rendered confirmation dialog with three buttons: Quit Scribe, Kill
 
 ### Update Dialog
 
-Shows version information and platform-specific notes with Update Now and Later buttons.
+Shows version information and platform-specific notes with Update Now and Later buttons, opened via the command palette.
+
+The update notification appears in the compositor window title (replacing "Scribe" with "Scribe — v{version} available") rather than in the tab bar. The command palette shows an "Update Scribe to v{version}" entry when an update is available.
 
 ### Context Menu
 
@@ -250,6 +262,8 @@ Position is stored as Optional since Wayland does not expose window positions. M
 The [[crates/scribe-client/src/restore_state.rs#RestoreStore]] persists logical window state for cold restart recovery under `$XDG_STATE_HOME/{flavor}/restore/`.
 
 A debounced save runs after every layout change via `report_workspace_tree`, snapshotting workspace splits, tabs, pane trees, and per-pane launch bindings. On startup with an empty `SessionList`, the client atomically claims the first entry from the restore index and rebuilds the layout via [[crates/scribe-client/src/restore_replay.rs#prepare_replay]], then creates sessions for each saved pane. Explicit close or quit clears the snapshot; server crash preserves it.
+
+AI panes persist `conversation_id` via OSC 1337 hooks that include `session_id` from the hook JSON payload. [[crates/scribe-client/src/main.rs#App#update_ai_launch_binding]] preserves an existing non-None `conversation_id` when subsequent state updates omit it, ensuring hooks without `session_id` access (e.g. Notification hooks) do not erase the tracking ID. On replay, panes with a `conversation_id` launch `claude --resume <id>` directly; those without fall back to the generic resume picker.
 
 ## Config Watching
 

@@ -120,6 +120,7 @@ SCRIBE_HOOKS = [
     ]),
     ("UserPromptSubmit", None, [
         {"type": "command", "command": f'"{task_label_script}" user-prompt-submit'},
+        {"type": "command", "command": "python3 -c 'import json,sys;d=json.load(sys.stdin);sid=d.get(\"session_id\",\"\");p=d.get(\"prompt\",\"\")[:256].replace(chr(7),\"\").replace(chr(27),\"\");f=open(\"/dev/tty\",\"w\");f.write(f\"\\x1b]1337;CodexState=processing;conversation_id={sid}\\x07\" if sid else \"\\x1b]1337;CodexState=processing\\x07\");f.write(f\"\\x1b]1337;CodexPrompt={p}\\x07\") if p else None;f.close()' 2>/dev/null || true"},
     ]),
     ("PreToolUse", "Bash", [
         {"type": "command", "command": f'"{task_label_script}" tool-processing'},

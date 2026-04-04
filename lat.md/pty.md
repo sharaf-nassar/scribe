@@ -58,6 +58,12 @@ The primary formats are `ClaudeState=<state>[;key=value...]` and `CodexState=<st
 
 Codex hooks also use OSC 1337 for a separate task-label channel. `CodexTaskLabel=<label>` sets the short, sanitized task label shown in the tab bar, and `CodexTaskLabelCleared` clears it without disturbing the underlying shell title.
 
+### OSC 1337 — Prompt Text
+
+`ClaudePrompt=<text>` and `CodexPrompt=<text>` carry the user's submitted prompt, capped at 256 characters. Parsed into `MetadataEvent::PromptReceived` with provider and sanitized text.
+
+Empty prompt payloads are silently dropped. The provider is set to `ClaudeCode` or `CodexCode` based on the prefix. Text is truncated at 256 bytes to bound IPC message size.
+
 ### OSC 133 — Prompt Marks
 
 Shell integration prompt marks with optional exit codes. These are forwarded as `PromptMark` events for scrollbar indicators.

@@ -343,6 +343,9 @@ async fn dispatch_server_message(
         ServerMessage::PromptMark { session_id, .. } => {
             debug!(%session_id, "prompt mark (ignored by test daemon)");
         }
+        ServerMessage::PromptReceived { session_id, .. } => {
+            debug!(%session_id, "prompt received (ignored by test daemon)");
+        }
         ServerMessage::SessionContextChanged { session_id, context } => {
             debug!(%session_id, ?context, "session context changed (ignored by test daemon)");
         }
