@@ -494,8 +494,93 @@
         </div>
       </div>
 
+      <!-- Prompt Bar Colors -->
+      <div class="section-label" id="colors-prompt-bar">Prompt Bar</div>
+      <div class="section-card">
+        <div class="setting-row">
+          <div class="setting-info">
+            <div class="setting-label">Background</div>
+            <div class="setting-desc">Main prompt bar background</div>
+          </div>
+          <div class="control-with-reset">
+            <div class="color-swatch-group">
+              <div class="color-swatch" data-key="appearance.prompt_bar_bg" style="background:#151528;">
+                <input type="color" value="#151528">
+              </div>
+            </div>
+            <button class="reset-btn" data-reset-key="appearance.prompt_bar_bg" title="Reset to theme default">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 1 3.36-7"/><path d="M3 5v4.5h4.5"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <div class="setting-label">First Row</div>
+            <div class="setting-desc">Darker background for the first prompt</div>
+          </div>
+          <div class="control-with-reset">
+            <div class="color-swatch-group">
+              <div class="color-swatch" data-key="appearance.prompt_bar_first_row_bg" style="background:#0f0f20;">
+                <input type="color" value="#0f0f20">
+              </div>
+            </div>
+            <button class="reset-btn" data-reset-key="appearance.prompt_bar_first_row_bg" title="Reset to theme default">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 1 3.36-7"/><path d="M3 5v4.5h4.5"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <div class="setting-label">Text</div>
+            <div class="setting-desc">Prompt text color</div>
+          </div>
+          <div class="control-with-reset">
+            <div class="color-swatch-group">
+              <div class="color-swatch" data-key="appearance.prompt_bar_text" style="background:#8e8eb5;">
+                <input type="color" value="#8e8eb5">
+              </div>
+            </div>
+            <button class="reset-btn" data-reset-key="appearance.prompt_bar_text" title="Reset to theme default">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 1 3.36-7"/><path d="M3 5v4.5h4.5"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <div class="setting-label">First Icon</div>
+            <div class="setting-desc">Origin marker icon color (⊙)</div>
+          </div>
+          <div class="control-with-reset">
+            <div class="color-swatch-group">
+              <div class="color-swatch" data-key="appearance.prompt_bar_icon_first" style="background:#d4a054;">
+                <input type="color" value="#d4a054">
+              </div>
+            </div>
+            <button class="reset-btn" data-reset-key="appearance.prompt_bar_icon_first" title="Reset to theme default">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 1 3.36-7"/><path d="M3 5v4.5h4.5"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <div class="setting-label">Latest Icon</div>
+            <div class="setting-desc">Latest prompt arrow icon color (→)</div>
+          </div>
+          <div class="control-with-reset">
+            <div class="color-swatch-group">
+              <div class="color-swatch" data-key="appearance.prompt_bar_icon_latest" style="background:#818cf8;">
+                <input type="color" value="#818cf8">
+              </div>
+            </div>
+            <button class="reset-btn" data-reset-key="appearance.prompt_bar_icon_latest" title="Reset to theme default">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 1 3.36-7"/><path d="M3 5v4.5h4.5"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+
       <!-- Unified Theme Grid -->
-      <div class="section-group">
+      <div class="section-group" style="margin-top:12px;">
         <input type="text" id="theme-search" class="text-input"
                placeholder="Search themes..."
                style="margin-bottom:10px;width:100%;box-sizing:border-box;">
@@ -558,13 +643,43 @@
               <div class="toggle-knob"></div>
             </div>
           </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label-row">
+          <div class="section-label">Prompt Bar</div>
+          <div class="cross-link-note" id="prompt-bar-colors-crosslink">Customize colors &#8594;</div>
+        </div>
+        <div class="section-card">
           <div class="setting-row">
             <div class="setting-info">
-              <div class="setting-label">Prompt Bar</div>
-              <div class="setting-desc">Show first and latest prompt text at the top of AI panes</div>
+              <div class="setting-label">Enabled</div>
+              <div class="setting-desc">Show first and latest prompt text in AI panes</div>
             </div>
             <div class="toggle off" data-key="terminal.prompt_bar">
               <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Position</div>
+              <div class="setting-desc">Show the prompt bar above or below the terminal content</div>
+            </div>
+            <div class="segmented-control" data-key="terminal.prompt_bar_position">
+              <div class="segment-opt active" data-value="top">Top</div>
+              <div class="segment-opt" data-value="bottom">Bottom</div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Font Size</div>
+              <div class="setting-desc">Text size in the prompt bar (affects truncation)</div>
+            </div>
+            <div class="number-control" data-key="terminal.prompt_bar_font_size" data-min="8" data-max="32" data-step="1">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">14</div>
+              <div class="number-btn">+</div>
             </div>
           </div>
         </div>

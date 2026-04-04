@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Scribe Settings
+Comment=Settings for Scribe terminal emulator
+Exec=scribe-settings
+Icon=scribe
+Terminal=false
+Type=Application
+StartupWMClass=scribe-settings
+Categories=System;Settings;
+NoDisplay=true

@@ -289,14 +289,16 @@ pub fn apply_window_geometry(event_loop: &ActiveEventLoop, window: &Window, geom
         }
     }
 
-    // Always restore size (unless maximized — the WM handles that).
-    if !geom.maximized {
-        // request_inner_size returns an optional immediate size; we don't need
-        // it since handle_resize will fire from the resulting Resized event.
-        let _applied =
-            window.request_inner_size(winit::dpi::PhysicalSize::new(geom.width, geom.height));
-        tracing::debug!(width = geom.width, height = geom.height, "restored window size");
-    }
+    // Always set the initial size from saved geometry.  For maximized
+    // windows this provides a sensible pre-configure buffer so the GPU
+    // surface and pane grids start at a reasonable size while we wait for
+    // the compositor to acknowledge the maximized state.  Without this,
+    // Wayland compositors may leave inner_size() at a tiny default until
+    // the first configure event arrives, causing shells to start with the
+    // wrong terminal dimensions.
+    let _applied =
+        window.request_inner_size(winit::dpi::PhysicalSize::new(geom.width, geom.height));
+    tracing::debug!(width = geom.width, height = geom.height, "restored window size");
 
     if geom.maximized {
         window.set_maximized(true);

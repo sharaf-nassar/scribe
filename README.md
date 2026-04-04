@@ -16,7 +16,12 @@
 - [Client-Server Architecture](#client-server-architecture)
 - [Zero-Downtime Upgrades](#zero-downtime-upgrades)
 - [AI / LLM Process Awareness](#ai--llm-process-awareness)
+- [Prompt Bar](#prompt-bar)
+- [Clipboard Cleanup](#clipboard-cleanup)
+- [Cold Restart Restore](#cold-restart-restore)
 - [GPU-Accelerated Rendering](#gpu-accelerated-rendering)
+- [Shell Integration](#shell-integration)
+- [Command Palette](#command-palette)
 - [Workspaces](#workspaces)
 - [Panes](#panes)
 - [Tabs](#tabs)
@@ -24,21 +29,22 @@
 - [Themes](#themes)
 - [Configurable Keybindings](#configurable-keybindings)
 - [Settings UI](#settings-ui)
+- [URL & Path Detection](#url--path-detection)
+- [Drag and Drop](#drag-and-drop)
 - [Scrollbar](#scrollbar)
+- [System Stats](#system-stats)
 - [Multi-Window Support](#multi-window-support)
 - [IPC Security](#ipc-security)
 
 ## Why Scribe?
 
-Most terminal emulators bundle the UI and the process manager into one inseparable application. Crash the terminal, lose every shell. Update the terminal, lose every shell. Scribe separates these concerns: the server runs headless and owns your PTY sessions; the GPU client connects on demand. Your shells, SSH tunnels, and long-running builds persist independent of what happens to the client.
+Crash your terminal, lose every shell. Update it, same story. Scribe splits the terminal into a headless server that owns your sessions and a GPU client that connects on demand — so your shells, tunnels, and builds are never at risk.
 
-**Sessions that survive reality.** The server never stops reading from the PTY. Disconnect, close the laptop, come back days later — on reconnect, Scribe sends you a full screen snapshot of exactly where you left off. No "session expired" dialogs. No lost scrollback.
-
-**See your AI agent's state at a glance.** Scribe natively parses OSC 1337 escape sequences from AI coding tools. The status bar shows whether your agent is idle, processing, waiting for approval, or errored — plus the active tool, model, and context window usage. No more window-switching to find out why your agent stopped.
-
-**Zero-downtime upgrades.** Upgrading Scribe doesn't interrupt your sessions. The running server hands off all PTY file descriptors to the new process via `SCM_RIGHTS` — your shells don't even notice the version changed.
-
-**Smooth rendering at any scale.** Every frame runs on the GPU via wgpu (Vulkan, Metal, or OpenGL ES). A shared glyph atlas keeps text crisp at any DPI, and all visible panes render in a single draw call — keeping Scribe responsive even with dozens of panes across multiple workspaces.
+- **Unkillable sessions** — close the lid, crash the client, come back days later. Your scrollback and cursor are exactly where you left them.
+- **AI agent awareness** — the status bar shows your agent's state, active tool, model, and context usage in real time. A prompt bar tracks your conversation. Copied text is auto-cleaned of hard wraps and indentation artifacts. No window-switching needed.
+- **Zero-downtime upgrades** — the running server hands PTY file descriptors to the new binary. Your shells don't notice.
+- **GPU rendering** — wgpu-powered (Vulkan / Metal / OpenGL ES), single draw call, smooth at any pane count or DPI.
+- **Cold restart recovery** — if the server crashes, layout, tabs, pane splits, and AI conversation IDs are restored on next launch.
 
 ## Quick Start
 
@@ -153,6 +159,26 @@ When a new server binary is available, the running server hands off all PTY file
 
 Scribe natively parses OSC 1337 escape sequences emitted by AI coding tools like Claude Code. It tracks four AI states: idle/prompt, processing, waiting for permission, and error. Metadata includes the active tool, agent name, model, and context window usage percentage. The status bar surfaces this information in real time, giving developers instant visibility into their AI agent's state without switching windows.
 
+### Prompt Bar
+
+A per-pane bar that tracks AI prompts at the top or bottom of the terminal content. Shows the first and latest prompt with icons, and a prompt count. Click a prompt line to copy it; click the dismiss button to hide the bar until a new conversation starts. Font size, position, and colors are all configurable in settings.
+
+### Clipboard Cleanup
+
+When copying text from a Claude Code or Codex session, Scribe automatically strips common leading whitespace (dedent) and joins hard-wrapped prose lines (unwrap). Structural elements — bullets, headings, code blocks, tables — are preserved. The result is clean, paste-ready text without manual reformatting.
+
+### Cold Restart Restore
+
+If the server crashes, the client restores your full window layout on next launch. Workspace splits, tabs, pane trees, and per-pane launch commands are persisted after every layout change. AI panes also save their `conversation_id`, so resumed sessions can pick up the prior conversation directly.
+
+### Shell Integration
+
+Scribe detects your shell (Bash, Zsh, Fish, Nushell, PowerShell) and injects lightweight startup scripts that emit OSC escape sequences for prompt marks, working directory, and session context. This powers features like the status bar CWD, scrollbar prompt indicators, and remote host display.
+
+### Command Palette
+
+A GPU-rendered fuzzy action picker opened via keybinding. Lists settings, pane/tab/workspace actions, saved profiles, and available updates. Entries execute through the same handlers as keyboard shortcuts, so every command-palette action is also automatable via the CLI.
+
 ### GPU-Accelerated Rendering
 
 Built on wgpu with backends for Vulkan, Metal, and OpenGL ES. Text is shaped by cosmic-text with a shared glyph atlas across all panes. All visible panes are rendered in a single instance-buffered draw call per frame. Supports font ligatures, variable font weight, configurable cursor shapes (block/underline/bar), and cursor blink.
@@ -185,9 +211,21 @@ Every keyboard shortcut is configurable in `config.toml` under `[keybindings]`. 
 
 A standalone settings window (`scribe-settings`) opens with `Ctrl+,`. Built as a webview using wry with HTML/CSS/JS. Changes are applied live without restarting. Singleton-enforced — opening settings twice focuses the existing window. Covers appearance, terminal behavior, keybindings, and workspace configuration.
 
+### URL & Path Detection
+
+Ctrl+click opens URLs (http, https, ftp, file) and file-system paths detected in terminal output. File paths with a `:N` line-number suffix open in VS Code at that line. Relative paths resolve against the pane's working directory. Only the hovered span is underlined, and the pointer cursor appears while Ctrl is held.
+
+### Drag and Drop
+
+Drop files or directories onto a pane to insert their paths into the shell. Paths are quoted for the session's actual shell (POSIX, Fish, PowerShell, or Nushell) with a trailing space.
+
 ### Scrollbar
 
 macOS-style overlay scrollbar that fades in on scroll activity and fades out after 1.5 seconds of inactivity. Supports click-to-jump and drag-to-scroll. Minimal visual footprint with smooth opacity transitions (0.3s fade duration).
+
+### System Stats
+
+CPU, memory, GPU, and network sparklines in the status bar, refreshed every 2 seconds. GPU detection reads AMD sysfs or NVIDIA sysfs/nvidia-smi on Linux. Individually toggleable in settings.
 
 ### Multi-Window Support
 

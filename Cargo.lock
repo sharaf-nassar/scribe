@@ -3646,6 +3646,7 @@ name = "scribe-settings"
 version = "0.0.0-dev"
 dependencies = [
  "fontdb",
+ "gdk-pixbuf",
  "gtk",
  "libc",
  "nix",

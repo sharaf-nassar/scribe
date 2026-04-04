@@ -146,6 +146,21 @@ pub struct AppearanceConfig {
     pub tab_height: f32,
     #[serde(default)]
     pub content_padding: ContentPadding,
+    /// Override color for the prompt bar background (`#rrggbb`).
+    #[serde(default)]
+    pub prompt_bar_bg: Option<String>,
+    /// Override color for the first-row darker background (`#rrggbb`).
+    #[serde(default)]
+    pub prompt_bar_first_row_bg: Option<String>,
+    /// Override color for prompt bar text (`#rrggbb`).
+    #[serde(default)]
+    pub prompt_bar_text: Option<String>,
+    /// Override color for the first prompt icon (`#rrggbb`).
+    #[serde(default)]
+    pub prompt_bar_icon_first: Option<String>,
+    /// Override color for the latest prompt icon (`#rrggbb`).
+    #[serde(default)]
+    pub prompt_bar_icon_latest: Option<String>,
 }
 
 impl Default for AppearanceConfig {
@@ -170,6 +185,11 @@ impl Default for AppearanceConfig {
             status_bar_height: default_status_bar_height(),
             tab_height: default_tab_height(),
             content_padding: ContentPadding::default(),
+            prompt_bar_bg: None,
+            prompt_bar_first_row_bg: None,
+            prompt_bar_text: None,
+            prompt_bar_icon_first: None,
+            prompt_bar_icon_latest: None,
         }
     }
 }
@@ -300,6 +320,18 @@ pub enum CursorShape {
     Block,
     Beam,
     Underline,
+}
+
+// ---------------------------------------------------------------------------
+// Prompt bar position
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptBarPosition {
+    #[default]
+    Top,
+    Bottom,
 }
 
 // ---------------------------------------------------------------------------
@@ -527,9 +559,15 @@ pub struct TerminalConfig {
     pub status_bar_stats: StatusBarStatsConfig,
     #[serde(default)]
     pub shell_integration: ShellIntegrationConfig,
-    /// Show first/latest prompt text at the top of AI terminal panes.
-    #[serde(default)]
+    /// Show first/latest prompt text in AI terminal panes.
+    #[serde(default = "default_true")]
     pub prompt_bar: bool,
+    /// Font size for prompt bar text (independent of terminal font size).
+    #[serde(default = "default_prompt_bar_font_size")]
+    pub prompt_bar_font_size: f32,
+    /// Where the prompt bar appears relative to the terminal content.
+    #[serde(default)]
+    pub prompt_bar_position: PromptBarPosition,
 }
 
 impl Default for TerminalConfig {
@@ -547,7 +585,9 @@ impl Default for TerminalConfig {
             indicator_height: default_indicator_height(),
             status_bar_stats: StatusBarStatsConfig::default(),
             shell_integration: ShellIntegrationConfig::default(),
-            prompt_bar: false,
+            prompt_bar: true,
+            prompt_bar_font_size: default_prompt_bar_font_size(),
+            prompt_bar_position: PromptBarPosition::default(),
         }
     }
 }
@@ -588,6 +628,10 @@ fn default_ai_tab_provider() -> AiProvider {
 
 fn default_indicator_height() -> f32 {
     2.0
+}
+
+fn default_prompt_bar_font_size() -> f32 {
+    14.0
 }
 
 // ---------------------------------------------------------------------------

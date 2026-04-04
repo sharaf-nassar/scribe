@@ -110,6 +110,11 @@ impl SearchOverlay {
         self.current_match
     }
 
+    /// Returns all matches.
+    pub fn matches(&self) -> &[SearchMatch] {
+        &self.matches
+    }
+
     /// Returns the total number of matches.
     pub fn match_count(&self) -> usize {
         self.matches.len()

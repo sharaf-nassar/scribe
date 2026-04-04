@@ -363,6 +363,18 @@ function initNavigation() {
       if (aiNav) { aiNav.click(); }
     });
   }
+
+  var promptBarColorsCrosslink = document.getElementById("prompt-bar-colors-crosslink");
+  if (promptBarColorsCrosslink) {
+    promptBarColorsCrosslink.addEventListener("click", function() {
+      var colorsNav = document.querySelector('.nav-item[data-tab="colors"]');
+      if (colorsNav) {
+        colorsNav.click();
+        var target = document.getElementById("colors-prompt-bar");
+        if (target) { target.scrollIntoView({ behavior: "smooth", block: "start" }); }
+      }
+    });
+  }
 }
 
 // ─────────── Number Steppers ───────────
@@ -642,6 +654,13 @@ function loadConfig(config) {
   setColorSwatch('appearance.focus_border_color', config.appearance?.focus_border_color || '#3b82f6');
   setStepperValue('appearance.focus_border_width', config.appearance?.focus_border_width ?? 2);
 
+  // Appearance — Prompt Bar
+  setColorSwatch('appearance.prompt_bar_bg', config.appearance?.prompt_bar_bg || '#151528');
+  setColorSwatch('appearance.prompt_bar_first_row_bg', config.appearance?.prompt_bar_first_row_bg || '#0f0f20');
+  setColorSwatch('appearance.prompt_bar_text', config.appearance?.prompt_bar_text || '#8e8eb5');
+  setColorSwatch('appearance.prompt_bar_icon_first', config.appearance?.prompt_bar_icon_first || '#d4a054');
+  setColorSwatch('appearance.prompt_bar_icon_latest', config.appearance?.prompt_bar_icon_latest || '#818cf8');
+
   // Terminal
   setStepperValue("terminal.scrollback_lines", config.terminal?.scrollback_lines);
   setToggleValue("terminal.natural_scroll", config.terminal?.natural_scroll);
@@ -651,6 +670,8 @@ function loadConfig(config) {
   setToggleValue("terminal.codex_code_integration", config.terminal?.codex_code_integration);
   setToggleValue("terminal.hide_codex_hook_logs", config.terminal?.hide_codex_hook_logs);
   setToggleValue("terminal.prompt_bar", config.terminal?.prompt_bar);
+  setSegmentedValue("terminal.prompt_bar_position", config.terminal?.prompt_bar_position || "top");
+  setStepperValue("terminal.prompt_bar_font_size", config.terminal?.prompt_bar_font_size);
   setAiTabProvider(config.terminal?.ai_tab_provider);
   setStepperValue("terminal.indicator_height", config.terminal?.indicator_height);
 
@@ -1495,6 +1516,19 @@ document.addEventListener("DOMContentLoaded", function() {
       } else if (key === 'appearance.focus_border_width') {
         sendChange(key, 2);
         setStepperValue(key, 2);
+      } else if (key.startsWith('appearance.prompt_bar_')) {
+        // Send empty string to clear override (server sets to None)
+        sendChange(key, '');
+        // Reset swatch to default visual
+        const defaults = {
+          'appearance.prompt_bar_bg': '#151528',
+          'appearance.prompt_bar_first_row_bg': '#0f0f20',
+          'appearance.prompt_bar_text': '#8e8eb5',
+          'appearance.prompt_bar_icon_first': '#d4a054',
+          'appearance.prompt_bar_icon_latest': '#818cf8'
+        };
+        const def = defaults[key];
+        if (def) setColorSwatch(key, def);
       }
     });
   });

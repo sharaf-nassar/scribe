@@ -33,6 +33,12 @@ pub struct ChromeColors {
     pub scrollbar: [f32; 4],
     pub tab_bar_gradient_top: [f32; 4],
     pub status_bar_separator: [f32; 4],
+    // Prompt bar
+    pub prompt_bar_bg: [f32; 4],
+    pub prompt_bar_first_row_bg: [f32; 4],
+    pub prompt_bar_text: [f32; 4],
+    pub prompt_bar_icon_first: [f32; 4],
+    pub prompt_bar_icon_latest: [f32; 4],
 }
 
 /// A complete terminal color theme including chrome (UI) colors.
@@ -100,6 +106,14 @@ impl Theme {
         let tab_bar_gradient_top = lighten(tab_bar_bg, 0.03);
         let status_bar_separator = with_alpha(foreground, 0.12);
 
+        // Prompt bar: slightly lighter than terminal bg, with muted text
+        let prompt_bar_bg = lighten(background, 0.03);
+        let prompt_bar_first_row_bg = darken(background, 0.02);
+        let prompt_bar_text = with_alpha(foreground, 0.50);
+        // ANSI yellow (index 3) for the origin icon, ANSI blue (index 4) for latest
+        let prompt_bar_icon_first = ansi_colors.get(3).copied().unwrap_or(foreground);
+        let prompt_bar_icon_latest = ansi_colors.get(4).copied().unwrap_or(foreground);
+
         ChromeColors {
             tab_bar_bg,
             tab_bar_active_bg,
@@ -113,6 +127,11 @@ impl Theme {
             scrollbar,
             tab_bar_gradient_top,
             status_bar_separator,
+            prompt_bar_bg,
+            prompt_bar_first_row_bg,
+            prompt_bar_text,
+            prompt_bar_icon_first,
+            prompt_bar_icon_latest,
         }
     }
 }
@@ -338,6 +357,15 @@ fn lighten(color: [f32; 4], amount: f32) -> [f32; 4] {
     let red = (color.first().copied().unwrap_or(0.0) + amount).min(1.0);
     let green = (color.get(1).copied().unwrap_or(0.0) + amount).min(1.0);
     let blue = (color.get(2).copied().unwrap_or(0.0) + amount).min(1.0);
+    let alpha = color.get(3).copied().unwrap_or(1.0);
+    [red, green, blue, alpha]
+}
+
+/// Darken a color by subtracting `amount` from each RGB channel (clamped to 0.0).
+fn darken(color: [f32; 4], amount: f32) -> [f32; 4] {
+    let red = (color.first().copied().unwrap_or(0.0) - amount).max(0.0);
+    let green = (color.get(1).copied().unwrap_or(0.0) - amount).max(0.0);
+    let blue = (color.get(2).copied().unwrap_or(0.0) - amount).max(0.0);
     let alpha = color.get(3).copied().unwrap_or(1.0);
     [red, green, blue, alpha]
 }

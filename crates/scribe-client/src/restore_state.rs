@@ -87,6 +87,12 @@ pub struct LaunchRecord {
     pub launch_id: String,
     pub cwd: Option<PathBuf>,
     pub kind: LaunchKind,
+    #[serde(default)]
+    pub first_prompt: Option<String>,
+    #[serde(default)]
+    pub latest_prompt: Option<String>,
+    #[serde(default)]
+    pub prompt_count: u32,
 }
 
 /// Launch type recorded for restore replay.

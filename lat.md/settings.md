@@ -6,6 +6,8 @@ The scribe-settings crate provides a webview-based configuration editor for term
 
 The settings window in [[crates/scribe-settings/src/lib.rs]] uses an embedded webview (GTK on Linux, tao/wry on macOS) with inlined HTML/CSS/JS assets.
 
+On Linux, the icon pixbuf is loaded from the hicolor theme and set directly on the window so that panels which match by WM_CLASS still display the correct icon.
+
 On launch, five pieces of state are injected into the webview: the host platform, the current config, keybinding defaults (for reset-to-default UI), all theme preset colours, and a list of available monospace fonts from fontdb.
 
 ### Font Discovery
@@ -34,7 +36,7 @@ Font family, font size (f32), font weight (u16, 100-900), bold weight, ligatures
 
 Colors page (formerly Theme) — preset selection and custom theme colours with full ANSI color names and descriptions.
 
-Preset selection converts underscore-separated names to hyphen-separated and clears any custom theme if not "custom". Custom theme colours include foreground, background, cursor, cursor text, selection, selection text, and all 16 ANSI colours (normal 0-7 and bright 0-7). When switching to custom, colours are seeded from the current preset.
+Preset selection converts underscore-separated names to hyphen-separated and clears any custom theme if not "custom". Custom theme colours include foreground, background, cursor, cursor text, selection, selection text, and all 16 ANSI colours (normal 0-7 and bright 0-7). When switching to custom, colours are seeded from the current preset. The Colors page also exposes five prompt bar color overrides (`appearance.prompt_bar_bg`, `prompt_bar_first_row_bg`, `prompt_bar_text`, `prompt_bar_icon_first`, `prompt_bar_icon_latest`) with reset-to-theme-default buttons; these are `Option<String>` fields on `AppearanceConfig` that override the auto-derived `ChromeColors` values.
 
 ### Terminal Keys
 
@@ -44,7 +46,9 @@ Status bar stat toggles remain on the Terminal page under the Status Bar section
 
 ### AI Keys
 
-AI page consolidates all AI integration settings: Claude Code Integration, Codex Code Integration, AI Tab Provider, Clipboard Cleanup, Hide Codex Hook Logs, Prompt Bar, Indicator Height, and the AI Assistant States table.
+AI page consolidates all AI integration settings including Prompt Bar, Indicator Height, and the AI Assistant States table.
+
+The Prompt Bar section title includes a "Customize colors" crosslink that switches to the Colors page and scrolls to the Prompt Bar color overrides.
 
 Clipboard cleanup remains persisted as `claude_copy_cleanup` for backward compatibility. `hide_codex_hook_logs` defaults to false and suppresses full Codex hook log blocks for the documented hook events (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`), including bullet-prefixed `Running ... hook: ...` lines, non-`completed` trailers, nested hook output, and only the first trailing blank spacer line, while failing open if the block never closes. The AI tab provider is persisted separately so the existing `new_claude_tab` and `new_claude_resume_tab` keybinding keys stay backward compatible while switching between Claude Code and Codex behavior.
 

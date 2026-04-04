@@ -227,8 +227,24 @@ pub fn run_settings_window(
 
     let html = build_html()?;
 
+    // Set the window icon so the taskbar shows the correct app icon.
+    // set_default_icon_name alone is not enough — some panels match by
+    // WM_CLASS and ignore the theme name.  Loading a pixbuf from the
+    // installed icon file and setting it directly on the window embeds
+    // the icon in _NET_WM_ICON, which all panels respect.
+    let icon_name = scribe_common::app::current_identity().slug();
+    gtk::Window::set_default_icon_name(icon_name);
+
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title("Scribe Settings");
+
+    {
+        let icon_path = format!("/usr/share/icons/hicolor/256x256/apps/{icon_name}.png");
+        match gdk_pixbuf::Pixbuf::from_file(&icon_path) {
+            Ok(pixbuf) => window.set_icon(Some(&pixbuf)),
+            Err(e) => tracing::warn!("failed to load window icon from {icon_path}: {e}"),
+        }
+    }
 
     // Restore saved size, or use defaults.
     if let Some(geom) = geometry {

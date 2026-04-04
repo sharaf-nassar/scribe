@@ -78,13 +78,15 @@ Normal session panes now receive the raw `CSI ? 2026 h/l` markers end to end, so
 
 ## ED 3 Filter
 
-The [[crates/scribe-pty/src/ed3_filter.rs#Ed3Filter]] rewrites CSI ED 3 (`\x1b[3J`) to CSI ED 2 (`\x1b[2J`) for Claude Code and Codex Code PTY output, so the visible screen clears without dropping scrollback.
+The [[crates/scribe-pty/src/ed3_filter.rs#Ed3Filter]] strips CSI ED 3 (`\x1b[3J`) from Claude Code and Codex Code PTY output, preserving scrollback history when the AI clears the screen.
 
-Regular shell sessions are unaffected, and the helper only runs for sessions whose active AI provider is Claude Code or Codex Code. The old `/clear` bypass path no longer exists.
+Regular shell sessions are unaffected — the filter only runs for sessions whose active AI provider is Claude Code or Codex Code.
 
 ### State Machine
 
-Four states track partial matches of the `\x1b[3J` sequence across `filter()` calls and preserve split escapes. A fast path skips allocation when no ESC byte is present. Pending bytes stay in state until the next call or `flush()`.
+Four states track partial matches of the `\x1b[3J` sequence across `filter()` calls.
+
+On a complete match the sequence is silently dropped (no replacement bytes emitted). A fast path skips allocation when no ESC byte is present. Pending bytes stay in state until the next call or `flush()`.
 
 ## Codex Hook Log Filter
 

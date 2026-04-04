@@ -24,6 +24,7 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+gdk-pixbuf = "0.18"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 tao.workspace = true

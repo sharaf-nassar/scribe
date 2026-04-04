@@ -169,6 +169,9 @@ struct App {
     // Window identity
     /// Window ID from CLI arg (if provided) or assigned by the server.
     window_id: Option<WindowId>,
+    /// `true` when launched via `--window-id` (explicit new window), which
+    /// means cold restart restore must be skipped.
+    explicit_new_window: bool,
 
     // Config + Theme
     config: ScribeConfig,
@@ -403,6 +406,7 @@ impl App {
         let claude_states = config.terminal.claude_states.clone();
 
         Self {
+            explicit_new_window: window_id.is_some(),
             window_id,
             config,
             theme,
@@ -852,7 +856,13 @@ impl App {
         reason = "viewport dimensions are small enough to fit in f32"
     )]
     fn init_gpu_and_terminal(&mut self, event_loop: &ActiveEventLoop) -> Result<(), InitError> {
-        let mut attrs = Window::default_attributes().with_title("Scribe");
+        // Set a reasonable initial size so the GPU surface, renderer, and
+        // pane grids have usable dimensions even before the compositor sends
+        // a configure event.  On Wayland, inner_size() can return a tiny
+        // default until the first configure; this hint prevents that.
+        let mut attrs = Window::default_attributes()
+            .with_title("Scribe")
+            .with_inner_size(winit::dpi::PhysicalSize::new(1200u32, 800u32));
         if self.window_transparent {
             attrs = attrs.with_transparent(true);
             tracing::info!(opacity = self.opacity, "window transparency enabled");
@@ -1565,6 +1575,15 @@ impl App {
     /// Falls back to a fresh session if no snapshot is available or replay
     /// fails.
     fn try_cold_restart_or_fresh(&mut self) {
+        // Only attempt cold restart restore when launched without --window-id
+        // (i.e. a fresh launch after a server crash).  Windows spawned via
+        // handle_new_window() always carry a pre-assigned window_id and must
+        // start with a blank session — otherwise they would claim another
+        // live window's restore snapshot and appear as a duplicate.
+        if self.explicit_new_window {
+            self.create_initial_session();
+            return;
+        }
         let claimed = self.restore_store.claim_first_window();
         let restored = claimed.as_ref().is_some_and(|(snapshot, _)| {
             tracing::info!(
@@ -1597,6 +1616,15 @@ impl App {
 
         // Recompute pane geometry now that the window is known.
         let win_size = window.inner_size();
+        let surface_w = gpu.surface_config.width;
+        let surface_h = gpu.surface_config.height;
+        tracing::info!(
+            win_w = win_size.width,
+            win_h = win_size.height,
+            surface_w,
+            surface_h,
+            "replay_cold_restart: window and surface dimensions"
+        );
         let viewport = Rect {
             x: 0.0,
             y: 0.0,
@@ -1701,7 +1729,10 @@ impl App {
         for (pane_id, pane_rect, pane_edges, tab_bar_h) in pane_geom {
             let Some(pane) = self.panes.get_mut(&pane_id) else { continue };
             let eff_tbh = if pane_edges.top { tab_bar_h } else { 0.0 };
-            let pbh = pane.prompt_bar_height(cell.height, self.config.terminal.prompt_bar);
+            let pb_font_scale =
+                self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+            let pb_cell_h = cell.height * pb_font_scale;
+            let pbh = pane.prompt_bar_height(pb_cell_h, self.config.terminal.prompt_bar);
             let grid = pane::compute_pane_grid(
                 pane_rect,
                 cell.width,
@@ -2146,12 +2177,14 @@ impl App {
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
 
         let had_prompts = pane.prompt_count > 0;
+        let was_dismissed = pane.prompt_bar_dismissed;
         pane.first_prompt = None;
         pane.latest_prompt = None;
         pane.prompt_count = 0;
         pane.last_conversation_id = None;
+        pane.prompt_bar_dismissed = false;
 
-        if self.config.terminal.prompt_bar && had_prompts {
+        if self.config.terminal.prompt_bar && (had_prompts || was_dismissed) {
             self.resize_after_layout_change();
         }
     }
@@ -2172,10 +2205,12 @@ impl App {
         pane.last_conversation_id = Some(new_conv_id.to_owned());
         if changed {
             let old_lines = prompt_bar_line_count(pane.prompt_count);
+            let was_dismissed = pane.prompt_bar_dismissed;
             pane.first_prompt = None;
             pane.latest_prompt = None;
             pane.prompt_count = 0;
-            if self.config.terminal.prompt_bar && old_lines > 0 {
+            pane.prompt_bar_dismissed = false;
+            if self.config.terminal.prompt_bar && (old_lines > 0 || was_dismissed) {
                 self.resize_after_layout_change();
             }
         }
@@ -2493,7 +2528,10 @@ impl App {
                 .copied()
                 .unwrap_or_else(|| self.effective_tab_bar_height());
             let tbh = if edges.top { tab_bar_h } else { 0.0 };
-            let pbh = pane.prompt_bar_height(cell.height, self.config.terminal.prompt_bar);
+            let pb_font_scale =
+                self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+            let pb_cell_h = cell.height * pb_font_scale;
+            let pbh = pane.prompt_bar_height(pb_cell_h, self.config.terminal.prompt_bar);
             let expected = pane::compute_pane_grid(
                 *rect,
                 cell.width,
@@ -2815,17 +2853,51 @@ impl App {
         );
 
         let indicator_h = self.config.terminal.indicator_height.clamp(1.0, 10.0);
+
+        let prompt_bar_colors = {
+            let chrome = &self.theme.chrome;
+            let resolve = |opt: &Option<String>, fallback: [f32; 4]| -> [f32; 4] {
+                opt.as_deref().and_then(|hex| scribe_common::theme::hex_to_rgba(hex).ok()).map_or(
+                    scribe_renderer::srgb_to_linear_rgba(fallback),
+                    scribe_renderer::srgb_to_linear_rgba,
+                )
+            };
+            prompt_bar::PromptBarColors {
+                bg: resolve(&self.config.appearance.prompt_bar_bg, chrome.prompt_bar_bg),
+                first_row_bg: resolve(
+                    &self.config.appearance.prompt_bar_first_row_bg,
+                    chrome.prompt_bar_first_row_bg,
+                ),
+                text: resolve(&self.config.appearance.prompt_bar_text, chrome.prompt_bar_text),
+                icon_first: resolve(
+                    &self.config.appearance.prompt_bar_icon_first,
+                    chrome.prompt_bar_icon_first,
+                ),
+                icon_latest: resolve(
+                    &self.config.appearance.prompt_bar_icon_latest,
+                    chrome.prompt_bar_icon_latest,
+                ),
+            }
+        };
+
         let focused_ws_rect = if multi_workspace {
             ws_rects.iter().find(|(id, _)| *id == focused_ws_id).map(|(_, r)| *r)
         } else {
             None
         };
+        let font_scale =
+            self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+        let pb_cell = (cell_size.0 * font_scale, cell_size.1 * font_scale);
+        let pb_at_top = self.config.terminal.prompt_bar_position
+            == scribe_common::config::PromptBarPosition::Top;
         let frame_layout = FrameLayout {
             pane_rects: &pane_rects,
             dividers: &dividers,
             ws_dividers: &ws_dividers,
             ws_tab_bar_data: &ws_tab_bar_data,
             cell_size,
+            prompt_bar_cell_size: pb_cell,
+            prompt_bar_at_top: pb_at_top,
             focused_pane,
             padding: &self.config.appearance.content_padding,
             focused_ws_rect,
@@ -2842,12 +2914,14 @@ impl App {
             scrollbar_width,
             scrollbar_color,
             indicator_height: indicator_h,
+            prompt_bar_colors,
         };
         let frame_interaction = FrameInteraction {
             cursor_visible,
             tab_width: self.config.appearance.tab_width,
             active_selection: self.active_selection.as_ref(),
-            search_match: self.search_overlay.current_match().cloned(),
+            search_matches: self.search_overlay.matches(),
+            search_current_index: self.search_overlay.current_match_index(),
             hovered_tab_close: self.hovered_tab_close,
             hovered_tab: self.hovered_tab,
             tab_drag: self.tab_drag.as_ref(),
@@ -2891,6 +2965,8 @@ impl App {
                 &self.config.appearance.content_padding,
                 self.modifiers.control_key(),
                 self.config.terminal.prompt_bar,
+                pb_cell.1,
+                pb_at_top,
             );
         }
 
@@ -2978,7 +3054,8 @@ impl App {
         let prompt_tooltip_anchor = self.prompt_bar_hover.and_then(|(pid, hover)| {
             let pane = self.panes.get(&pid)?;
             let full_text = prompt_bar::hovered_prompt_text(pane, hover)?;
-            if !prompt_bar::is_prompt_truncated(full_text, pane.rect.width, cell_size.0) {
+            let effective_width = pane.rect.width - prompt_bar::DISMISS_BTN_W;
+            if !prompt_bar::is_prompt_truncated(full_text, effective_width, pb_cell.0) {
                 return None;
             }
             let tbh = if pane.edges.top {
@@ -2986,13 +3063,11 @@ impl App {
             } else {
                 0.0
             };
-            let pbh = pane.prompt_bar_height(cell_size.1, true);
-            let anchor = layout::Rect {
-                x: pane.rect.x,
-                y: pane.rect.y + tbh,
-                width: pane.rect.width,
-                height: pbh,
-            };
+            let pbh = pane.prompt_bar_height(pb_cell.1, true);
+            let bar_y =
+                if pb_at_top { pane.rect.y + tbh } else { pane.rect.y + pane.rect.height - pbh };
+            let anchor =
+                layout::Rect { x: pane.rect.x, y: bar_y, width: pane.rect.width, height: pbh };
             Some((full_text.to_owned(), anchor))
         });
         if let Some((ref text, anchor)) = prompt_tooltip_anchor {
@@ -3085,6 +3160,7 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return;
         }
+        tracing::info!(w = size.width, h = size.height, "handle_resize");
 
         let Some(gpu) = &mut self.gpu else { return };
 
@@ -4849,6 +4925,16 @@ impl App {
             return;
         }
 
+        // Check for prompt bar dismiss button click.
+        if self.try_dismiss_prompt_bar(x, y) {
+            return;
+        }
+
+        // Check for prompt bar text click (copies full prompt to clipboard).
+        if self.try_copy_prompt_bar_text(x, y) {
+            return;
+        }
+
         // Check for workspace divider drag (before pane divider).
         if self.try_start_workspace_divider_drag(x, y, ws_viewport) {
             return;
@@ -5303,13 +5389,18 @@ impl App {
             return;
         };
         let cell_h = gpu.renderer.cell_size().height;
+        let pb_font_scale =
+            self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+        let pb_cell_h = cell_h * pb_font_scale;
+        let pb_at_top = self.config.terminal.prompt_bar_position
+            == scribe_common::config::PromptBarPosition::Top;
 
         // Iterate pane rects to find the pane whose prompt bar the cursor is over.
         for (pane_id, pane) in &self.panes {
-            if pane.prompt_count == 0 {
+            if pane.prompt_count == 0 || pane.prompt_bar_dismissed {
                 continue;
             }
-            let pbh = pane.prompt_bar_height(cell_h, true);
+            let pbh = pane.prompt_bar_height(pb_cell_h, true);
             if pbh <= 0.0 {
                 continue;
             }
@@ -5319,14 +5410,12 @@ impl App {
             } else {
                 0.0
             };
-            let bar_rect = layout::Rect {
-                x: pane.rect.x,
-                y: pane.rect.y + tbh,
-                width: pane.rect.width,
-                height: pbh,
-            };
+            let bar_y =
+                if pb_at_top { pane.rect.y + tbh } else { pane.rect.y + pane.rect.height - pbh };
+            let bar_rect =
+                layout::Rect { x: pane.rect.x, y: bar_y, width: pane.rect.width, height: pbh };
             if let Some(hover) =
-                prompt_bar::hit_test_prompt_bar(pane, bar_rect, cell_h, mouse_x, mouse_y)
+                prompt_bar::hit_test_prompt_bar(pane, bar_rect, pb_cell_h, mouse_x, mouse_y)
             {
                 self.prompt_bar_hover = Some((*pane_id, hover));
                 break;
@@ -5336,6 +5425,97 @@ impl App {
         if self.prompt_bar_hover != old_hover {
             self.request_redraw();
         }
+    }
+
+    /// Dismiss the prompt bar if the click lands on the × button.
+    ///
+    /// Returns `true` when the click was consumed.
+    fn try_dismiss_prompt_bar(&mut self, x: f32, y: f32) -> bool {
+        if !self.config.terminal.prompt_bar {
+            return false;
+        }
+        let Some(gpu) = &self.gpu else { return false };
+        let cell_h = gpu.renderer.cell_size().height;
+        let pb_font_scale =
+            self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+        let pb_cell_h = cell_h * pb_font_scale;
+        let pb_at_top = self.config.terminal.prompt_bar_position
+            == scribe_common::config::PromptBarPosition::Top;
+
+        let target = self.panes.iter().find_map(|(pane_id, pane)| {
+            if pane.prompt_count == 0 || pane.prompt_bar_dismissed {
+                return None;
+            }
+            let pbh = pane.prompt_bar_height(pb_cell_h, true);
+            if pbh <= 0.0 {
+                return None;
+            }
+            let tbh = if pane.edges.top {
+                self.tab_bar_height_for(pane.workspace_id, pane.rect)
+            } else {
+                0.0
+            };
+            let bar_y =
+                if pb_at_top { pane.rect.y + tbh } else { pane.rect.y + pane.rect.height - pbh };
+            let bar_rect =
+                layout::Rect { x: pane.rect.x, y: bar_y, width: pane.rect.width, height: pbh };
+            let hover = prompt_bar::hit_test_prompt_bar(pane, bar_rect, pb_cell_h, x, y)?;
+            if hover == prompt_bar::PromptBarHover::DismissButton { Some(*pane_id) } else { None }
+        });
+
+        let Some(pane_id) = target else { return false };
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            pane.prompt_bar_dismissed = true;
+        }
+        self.prompt_bar_hover = None;
+        self.resize_after_layout_change();
+        self.request_redraw();
+        true
+    }
+
+    /// Copy the full prompt text to clipboard when a prompt line is clicked.
+    ///
+    /// Returns `true` when the click was consumed.
+    fn try_copy_prompt_bar_text(&mut self, x: f32, y: f32) -> bool {
+        if !self.config.terminal.prompt_bar {
+            return false;
+        }
+        let Some(gpu) = &self.gpu else { return false };
+        let cell_h = gpu.renderer.cell_size().height;
+        let pb_font_scale =
+            self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+        let pb_cell_h = cell_h * pb_font_scale;
+        let pb_at_top = self.config.terminal.prompt_bar_position
+            == scribe_common::config::PromptBarPosition::Top;
+
+        let text = self.panes.iter().find_map(|(_, pane)| {
+            if pane.prompt_count == 0 || pane.prompt_bar_dismissed {
+                return None;
+            }
+            let pbh = pane.prompt_bar_height(pb_cell_h, true);
+            if pbh <= 0.0 {
+                return None;
+            }
+            let tbh = if pane.edges.top {
+                self.tab_bar_height_for(pane.workspace_id, pane.rect)
+            } else {
+                0.0
+            };
+            let bar_y =
+                if pb_at_top { pane.rect.y + tbh } else { pane.rect.y + pane.rect.height - pbh };
+            let bar_rect =
+                layout::Rect { x: pane.rect.x, y: bar_y, width: pane.rect.width, height: pbh };
+            let hover = prompt_bar::hit_test_prompt_bar(pane, bar_rect, pb_cell_h, x, y)?;
+            prompt_bar::hovered_prompt_text(pane, hover).map(str::to_owned)
+        });
+
+        let Some(text) = text else { return false };
+        if let Some(cb) = self.clipboard.as_mut() {
+            if let Err(e) = cb.set_text(text) {
+                tracing::warn!("clipboard write failed: {e}");
+            }
+        }
+        true
     }
 
     /// Forward a mouse motion event to the focused pane's PTY when the
@@ -5670,8 +5850,19 @@ impl App {
         let Some((_, cursor_y)) = self.last_cursor_pos else { return false };
         let tab_bar_h = self.focused_workspace_tab_bar_height();
         let Some(pane_rect) = self.focused_pane_rect() else { return false };
-        let content_top = pane_rect.y + tab_bar_h;
-        let content_bottom = pane_rect.y + pane_rect.height;
+        let pb_at_top = self.config.terminal.prompt_bar_position
+            == scribe_common::config::PromptBarPosition::Top;
+        let pbh = self.gpu.as_ref().map_or(0.0, |gpu| {
+            let cell = gpu.renderer.cell_size();
+            let pb_font_scale =
+                self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+            let pb_cell_h = cell.height * pb_font_scale;
+            let tab = self.window_layout.active_tab();
+            tab.and_then(|t| self.panes.get(&t.focused_pane))
+                .map_or(0.0, |p| p.prompt_bar_height(pb_cell_h, self.config.terminal.prompt_bar))
+        });
+        let content_top = pane_rect.y + tab_bar_h + if pb_at_top { pbh } else { 0.0 };
+        let content_bottom = pane_rect.y + pane_rect.height - if pb_at_top { 0.0 } else { pbh };
         let Some(delta) = mouse_state::edge_scroll_delta(cursor_y, content_top, content_bottom)
         else {
             return false;
@@ -6131,6 +6322,12 @@ impl App {
         let tab = self.window_layout.active_tab()?;
         let pane = self.panes.get(&tab.focused_pane)?;
         let display_offset = pane.term.grid().display_offset();
+        let pb_font_scale =
+            self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+        let pb_cell_h = cell.height * pb_font_scale;
+        let pbh = pane.prompt_bar_height(pb_cell_h, self.config.terminal.prompt_bar);
+        let pb_at_top = self.config.terminal.prompt_bar_position
+            == scribe_common::config::PromptBarPosition::Top;
         selection::pixel_to_grid(
             x,
             y,
@@ -6138,6 +6335,8 @@ impl App {
             cell.width,
             cell.height,
             tab_bar_h,
+            pbh,
+            pb_at_top,
             display_offset,
             &pane::effective_padding(&self.config.appearance.content_padding, pane.edges),
         )
@@ -6198,8 +6397,14 @@ impl App {
         let tab = self.window_layout.active_tab()?;
         let pane = self.panes.get(&tab.focused_pane)?;
         let padding = pane::effective_padding(&self.config.appearance.content_padding, pane.edges);
-        let pbh = pane.prompt_bar_height(cell.height, self.config.terminal.prompt_bar);
-        let (content_x, content_y) = pane.content_offset(tab_bar_h, pbh, &padding);
+        let pb_font_scale =
+            self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+        let pb_cell_h = cell.height * pb_font_scale;
+        let pb_at_top = self.config.terminal.prompt_bar_position
+            == scribe_common::config::PromptBarPosition::Top;
+        let pbh = pane.prompt_bar_height(pb_cell_h, self.config.terminal.prompt_bar);
+        let content_pbh = if pb_at_top { pbh } else { 0.0 };
+        let (content_x, content_y) = pane.content_offset(tab_bar_h, content_pbh, &padding);
         let rel_x = x - content_x;
         let rel_y = y - content_y;
         if rel_x < 0.0 || rel_y < 0.0 {
@@ -6276,6 +6481,12 @@ impl App {
     ) {
         let Some(gpu) = &self.gpu else { return };
         let cell = gpu.renderer.cell_size();
+        tracing::debug!(
+            pane_count = rects.len(),
+            cell_w = cell.width,
+            cell_h = cell.height,
+            "resize_all_panes_from_rects"
+        );
 
         // Build per-workspace tab bar heights so each pane uses the correct height.
         let ws_heights: std::collections::HashMap<WorkspaceId, f32> = ws_rects
@@ -6294,7 +6505,10 @@ impl App {
             let tab_bar_h = ws_heights.get(&pane.workspace_id).copied().unwrap_or(fallback_h);
             let tbh = if edges.top { tab_bar_h } else { 0.0 };
             let eff_pad = pane::effective_padding(&self.config.appearance.content_padding, *edges);
-            let pbh = pane.prompt_bar_height(cell.height, self.config.terminal.prompt_bar);
+            let pb_font_scale =
+                self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+            let pb_cell_h = cell.height * pb_font_scale;
+            let pbh = pane.prompt_bar_height(pb_cell_h, self.config.terminal.prompt_bar);
             let grid = pane::compute_pane_grid(*rect, cell.width, cell.height, tbh, pbh, &eff_pad);
             let old_history = pane.term.grid().history_size();
             pane.resize(*rect, grid);
@@ -6402,6 +6616,11 @@ impl App {
                 continue;
             }
             let Some(&(ws_rect, ws_grid)) = ws_grid_map.get(&pane.workspace_id) else {
+                tracing::warn!(
+                    pane_id = pane_id.raw(),
+                    workspace_id = %pane.workspace_id,
+                    "non-active-tab pane has no workspace rect — skipping resize"
+                );
                 continue;
             };
             pane.resize(ws_rect, ws_grid);
@@ -7128,6 +7347,8 @@ struct FrameLayout<'a> {
     ws_dividers: &'a [workspace_layout::WorkspaceDivider],
     ws_tab_bar_data: &'a [tab_bar::WorkspaceTabBarData],
     cell_size: (f32, f32),
+    prompt_bar_cell_size: (f32, f32),
+    prompt_bar_at_top: bool,
     focused_pane: PaneId,
     padding: &'a ContentPadding,
     focused_ws_rect: Option<Rect>,
@@ -7146,6 +7367,7 @@ struct FrameStyle<'a> {
     scrollbar_width: f32,
     scrollbar_color: [f32; 4],
     indicator_height: f32,
+    prompt_bar_colors: prompt_bar::PromptBarColors,
 }
 
 /// Interaction state passed to [`build_all_instances`].
@@ -7153,7 +7375,8 @@ struct FrameInteraction<'a> {
     cursor_visible: bool,
     tab_width: u16,
     active_selection: Option<&'a selection::SelectionRange>,
-    search_match: Option<SearchMatch>,
+    search_matches: &'a [SearchMatch],
+    search_current_index: usize,
     hovered_tab_close: Option<(WorkspaceId, usize)>,
     hovered_tab: Option<(WorkspaceId, usize)>,
     tab_drag: Option<&'a TabDrag>,
@@ -7219,8 +7442,10 @@ fn build_all_instances(
         if let Some(pane) = panes.get_mut(pane_id) {
             let tbh =
                 pane_tab_bar_h(pane.workspace_id, &ws_tab_bar_heights, layout.ws_tab_bar_data);
-            let pbh = pane.prompt_bar_height(layout.cell_size.1, layout.prompt_bar_enabled);
-            let offset = pane.content_offset(tbh, pbh, layout.padding);
+            let pbh =
+                pane.prompt_bar_height(layout.prompt_bar_cell_size.1, layout.prompt_bar_enabled);
+            let content_pbh = if layout.prompt_bar_at_top { pbh } else { 0.0 };
+            let offset = pane.content_offset(tbh, content_pbh, layout.padding);
             // Only the focused pane shows the blinking cursor; unfocused panes hide it.
             let is_focused = *pane_id == layout.focused_pane;
             let pane_cursor_visible = is_focused && interaction.cursor_visible;
@@ -7235,6 +7460,7 @@ fn build_all_instances(
                 pane,
                 eff_tbh,
                 prompt_chrome_h,
+                layout.prompt_bar_at_top,
                 (default_bg, dim),
             );
 
@@ -7279,20 +7505,19 @@ fn build_all_instances(
                 all_instances.extend_from_slice(&pane.last_instances);
             }
 
-            if is_focused {
-                if let Some(search_match) = interaction.search_match.as_ref() {
-                    let Some(search_instances) = all_instances.get_mut(instance_start..) else {
-                        continue;
-                    };
-                    apply_search_match_highlight(
-                        search_instances,
-                        offset,
-                        layout.cell_size,
-                        search_match,
-                        search_highlight_colors,
-                        pane.term.grid().display_offset(),
-                    );
-                }
+            if is_focused && !interaction.search_matches.is_empty() {
+                let Some(search_instances) = all_instances.get_mut(instance_start..) else {
+                    continue;
+                };
+                apply_search_match_highlight(
+                    search_instances,
+                    offset,
+                    layout.cell_size,
+                    interaction.search_matches,
+                    interaction.search_current_index,
+                    &search_highlight_colors,
+                    pane.term.grid().display_offset(),
+                );
             }
         }
     }
@@ -7414,7 +7639,7 @@ fn build_all_instances(
     // Prompt bars — drawn after tab bar text so they render below the tab bar.
     for (pane_id, pane_rect) in layout.pane_rects {
         if let Some(pane) = panes.get(pane_id) {
-            if pane.prompt_count == 0 || !layout.prompt_bar_enabled {
+            if pane.prompt_count == 0 || pane.prompt_bar_dismissed || !layout.prompt_bar_enabled {
                 continue;
             }
             let eff_tbh = if pane.edges.top {
@@ -7422,19 +7647,30 @@ fn build_all_instances(
             } else {
                 0.0
             };
-            let pbh = pane.prompt_bar_height(layout.cell_size.1, layout.prompt_bar_enabled);
-            let bar_rect = layout::Rect {
-                x: pane_rect.x,
-                y: pane_rect.y + eff_tbh,
-                width: pane_rect.width,
-                height: pbh,
+            let pbh =
+                pane.prompt_bar_height(layout.prompt_bar_cell_size.1, layout.prompt_bar_enabled);
+            let bar_y = if layout.prompt_bar_at_top {
+                pane_rect.y + eff_tbh
+            } else {
+                pane_rect.y + pane_rect.height - pbh
+            };
+            let bar_rect =
+                layout::Rect { x: pane_rect.x, y: bar_y, width: pane_rect.width, height: pbh };
+            let glyph_size = if (layout.prompt_bar_cell_size.0 - layout.cell_size.0).abs() < 0.01
+                && (layout.prompt_bar_cell_size.1 - layout.cell_size.1).abs() < 0.01
+            {
+                [0.0, 0.0]
+            } else {
+                [layout.prompt_bar_cell_size.0, layout.prompt_bar_cell_size.1]
             };
             prompt_bar::render_prompt_bar(
                 &mut all_instances,
                 pane,
                 bar_rect,
-                layout.cell_size,
+                layout.prompt_bar_cell_size,
+                glyph_size,
                 layout.prompt_bar_hover.filter(|h| h.0 == *pane_id).map(|h| h.1),
+                &style.prompt_bar_colors,
                 &mut |ch| renderer.resolve_glyph(device, queue, ch),
             );
         }
@@ -7563,19 +7799,25 @@ fn build_all_instances(
 /// dimensions by cell size.  Must be pushed before cell instances so cells
 /// render on top.  Applies unfocused dimming when `dim` is true.
 #[allow(clippy::indexing_slicing, reason = "fixed-size [f32; 4] array, indices 0-2 always valid")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "rendering helper needs geometry, position, and style inputs"
+)]
 fn push_pane_bg_fill(
     out: &mut Vec<scribe_renderer::types::CellInstance>,
     pane: &Pane,
     tab_bar_height: f32,
     prompt_bar_height: f32,
+    prompt_bar_at_top: bool,
     bg_and_dim: ([f32; 4], bool),
 ) {
     let (default_bg, dim) = bg_and_dim;
-    let chrome_h = tab_bar_height + prompt_bar_height;
+    let chrome_h = tab_bar_height + if prompt_bar_at_top { prompt_bar_height } else { 0.0 };
+    let total_chrome = tab_bar_height + prompt_bar_height;
     let fill_x = pane.rect.x;
     let fill_y = pane.rect.y + chrome_h;
     let fill_w = pane.rect.width.max(0.0);
-    let fill_h = (pane.rect.height - chrome_h).max(0.0);
+    let fill_h = (pane.rect.height - total_chrome).max(0.0);
     if fill_w <= 0.0 || fill_h <= 0.0 {
         return;
     }
@@ -7630,8 +7872,15 @@ fn dim_color(color: &mut [f32; 4]) {
 
 /// Selection highlight colors: `(background, foreground)`.
 type SelectionColors = ([f32; 4], [f32; 4]);
-/// Search highlight colors: `(background, foreground)`.
-type SearchHighlightColors = ([f32; 4], [f32; 4]);
+/// Search highlight colors for active (current) and passive (other) matches.
+struct SearchHighlightColors {
+    /// Background color for the current match (full accent).
+    active_bg: [f32; 4],
+    /// Foreground color for the current match (contrast against accent).
+    active_fg: [f32; 4],
+    /// Accent color blended with the cell's existing bg for non-current matches.
+    passive_accent: [f32; 4],
+}
 
 /// Apply selection highlight to cell instances for the focused pane.
 ///
@@ -7678,18 +7927,27 @@ fn apply_selection_highlight(
     }
 }
 
+#[allow(clippy::similar_names, reason = "active_bg and active_fg are a natural pair")]
 fn search_highlight_colors(accent_color: [f32; 4]) -> SearchHighlightColors {
     let luminance = 0.2126 * accent_color[0] + 0.7152 * accent_color[1] + 0.0722 * accent_color[2];
-    let fg_color = if luminance > 0.45 { [0.05, 0.05, 0.05, 1.0] } else { [0.98, 0.98, 0.98, 1.0] };
-    let mut bg_color = accent_color;
-    bg_color[3] = 1.0;
-    (bg_color, fg_color)
+    let active_fg =
+        if luminance > 0.45 { [0.05, 0.05, 0.05, 1.0] } else { [0.98, 0.98, 0.98, 1.0] };
+    let mut active_bg = accent_color;
+    active_bg[3] = 1.0;
+    SearchHighlightColors { active_bg, active_fg, passive_accent: active_bg }
 }
 
-/// Apply the active search-match highlight to visible cell instances.
+/// Blend factor for passive (non-current) match backgrounds.
+const PASSIVE_MATCH_BLEND: f32 = 0.4;
+
+/// Apply search-match highlights to visible cell instances.
+///
+/// The current match gets the full accent background with a contrast foreground.
+/// All other matches get the accent color blended into their existing background
+/// at [`PASSIVE_MATCH_BLEND`] intensity, preserving the original foreground.
 #[allow(
     clippy::too_many_arguments,
-    reason = "needs offset, cell size, search span, colors, and scroll offset for absolute coordinate mapping"
+    reason = "needs offset, cell size, match list, current index, colors, and scroll offset"
 )]
 #[allow(
     clippy::cast_possible_truncation,
@@ -7702,8 +7960,9 @@ fn apply_search_match_highlight(
     instances: &mut [scribe_renderer::types::CellInstance],
     offset: (f32, f32),
     cell_size: (f32, f32),
-    search_match: &SearchMatch,
-    colors: SearchHighlightColors,
+    matches: &[SearchMatch],
+    current_index: usize,
+    colors: &SearchHighlightColors,
     display_offset: usize,
 ) {
     let (cell_w, cell_h) = cell_size;
@@ -7720,14 +7979,33 @@ fn apply_search_match_highlight(
         let col = ((inst.pos[0] - offset.0) / cell_w + 0.5) as u16;
         let screen_row = ((inst.pos[1] - offset.1) / cell_h + 0.5) as i32;
         let grid_row = screen_row - offset_i32;
-        if grid_row == search_match.row
-            && col >= search_match.col_start
-            && col <= search_match.col_end
-        {
-            inst.bg_color = colors.0;
-            inst.fg_color = colors.1;
+
+        let hit = matches
+            .iter()
+            .enumerate()
+            .find(|(_, m)| grid_row == m.row && col >= m.col_start && col <= m.col_end);
+        if let Some((i, _)) = hit {
+            if i == current_index {
+                inst.bg_color = colors.active_bg;
+                inst.fg_color = colors.active_fg;
+            } else {
+                let bg = inst.bg_color;
+                let accent = colors.passive_accent;
+                inst.bg_color = blend_search_bg(bg, accent);
+            }
         }
     }
+}
+
+/// Blend a cell's existing background with the search accent at [`PASSIVE_MATCH_BLEND`] intensity.
+fn blend_search_bg(bg: [f32; 4], accent: [f32; 4]) -> [f32; 4] {
+    let inv = 1.0 - PASSIVE_MATCH_BLEND;
+    [
+        bg[0] * inv + accent[0] * PASSIVE_MATCH_BLEND,
+        bg[1] * inv + accent[1] * PASSIVE_MATCH_BLEND,
+        bg[2] * inv + accent[2] * PASSIVE_MATCH_BLEND,
+        1.0,
+    ]
 }
 
 /// Refresh the URL cache for `pane_id` and return the URL span at `point`.
@@ -7800,6 +8078,8 @@ fn apply_url_underlines(
     padding: &ContentPadding,
     ctrl_held: bool,
     prompt_bar_enabled: bool,
+    pb_cell_h: f32,
+    pb_at_top: bool,
 ) {
     if !ctrl_held {
         return;
@@ -7818,8 +8098,9 @@ fn apply_url_underlines(
     };
     let Some(pane) = panes.get(&focused_pane_id) else { return };
     let tbh = ws_tab_bar_heights.get(&pane.workspace_id).copied().unwrap_or(fallback_tbh);
-    let pbh = pane.prompt_bar_height(cell_size.1, prompt_bar_enabled);
-    let offset = pane.content_offset(tbh, pbh, padding);
+    let pbh = pane.prompt_bar_height(pb_cell_h, prompt_bar_enabled);
+    let content_pbh = if pb_at_top { pbh } else { 0.0 };
+    let offset = pane.content_offset(tbh, content_pbh, padding);
     let display_offset = pane.term.grid().display_offset() as i32;
 
     let Some(cache) = url_caches.get_mut(&focused_pane_id) else { return };

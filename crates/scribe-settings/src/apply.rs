@@ -182,6 +182,21 @@ fn apply_config_key(
                 config.appearance.focus_border_color = Some(hex.to_owned());
             }
         }
+        "appearance.prompt_bar_bg" => {
+            apply_optional_hex_color(value, &mut config.appearance.prompt_bar_bg, key)?;
+        }
+        "appearance.prompt_bar_first_row_bg" => {
+            apply_optional_hex_color(value, &mut config.appearance.prompt_bar_first_row_bg, key)?;
+        }
+        "appearance.prompt_bar_text" => {
+            apply_optional_hex_color(value, &mut config.appearance.prompt_bar_text, key)?;
+        }
+        "appearance.prompt_bar_icon_first" => {
+            apply_optional_hex_color(value, &mut config.appearance.prompt_bar_icon_first, key)?;
+        }
+        "appearance.prompt_bar_icon_latest" => {
+            apply_optional_hex_color(value, &mut config.appearance.prompt_bar_icon_latest, key)?;
+        }
         "appearance.focus_border_width" => {
             #[allow(
                 clippy::cast_possible_truncation,
@@ -231,6 +246,22 @@ fn apply_config_key(
         }
         "terminal.prompt_bar" => {
             config.terminal.prompt_bar = value.as_bool().ok_or("prompt_bar must be a boolean")?;
+        }
+        "terminal.prompt_bar_font_size" => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "prompt bar font size is a small positive float"
+            )]
+            let v = value.as_f64().ok_or("prompt_bar_font_size must be a number")? as f32;
+            config.terminal.prompt_bar_font_size = v.clamp(8.0, 32.0);
+        }
+        "terminal.prompt_bar_position" => {
+            let s = value.as_str().ok_or("prompt_bar_position must be a string")?;
+            config.terminal.prompt_bar_position = match s {
+                "top" => scribe_common::config::PromptBarPosition::Top,
+                "bottom" => scribe_common::config::PromptBarPosition::Bottom,
+                _ => return Err(format!("invalid prompt_bar_position: {s}")),
+            };
         }
         "terminal.ai_tab_provider" => {
             let provider_str = value.as_str().ok_or("ai_tab_provider must be a string")?;
@@ -458,6 +489,22 @@ fn apply_keybinding_field(
         "line_end" => kb.line_end = list,
         _ => tracing::warn!(action, "unhandled keybinding action"),
     }
+}
+
+/// Apply an optional hex color override: empty string clears it to `None`.
+fn apply_optional_hex_color(
+    value: &serde_json::Value,
+    field: &mut Option<String>,
+    key: &str,
+) -> Result<(), String> {
+    let hex = value.as_str().ok_or(format!("{key} must be a string"))?;
+    if hex.is_empty() {
+        *field = None;
+    } else {
+        scribe_common::theme::hex_to_rgba(hex).map_err(|e| format!("invalid {key}: {e}"))?;
+        *field = Some(hex.to_owned());
+    }
+    Ok(())
 }
 
 /// Apply a `theme.<field>` color key to the config's inline theme.

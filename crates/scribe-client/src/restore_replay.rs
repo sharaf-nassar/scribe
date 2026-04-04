@@ -607,6 +607,12 @@ fn queue_from_launch_record(
         binding.clone(),
     );
     pane.cwd.clone_from(&binding.fallback_cwd);
+    pane.first_prompt.clone_from(&record.first_prompt);
+    pane.latest_prompt.clone_from(&record.latest_prompt);
+    pane.prompt_count = record.prompt_count;
+    if let LaunchKind::Ai { conversation_id: Some(conv_id), .. } = &record.kind {
+        pane.last_conversation_id = Some(conv_id.clone());
+    }
     panes.insert(pane_id, pane);
     launches.push_back(ReplayLaunch {
         launch_id: binding.launch_id.clone(),
@@ -722,6 +728,9 @@ fn snapshot_launches(layout: &WindowLayout, panes: &HashMap<PaneId, Pane>) -> Ve
                     launch_id: pane.launch_binding.launch_id.clone(),
                     cwd: pane.cwd.clone().or_else(|| pane.launch_binding.fallback_cwd.clone()),
                     kind: pane.launch_binding.kind.clone(),
+                    first_prompt: pane.first_prompt.clone(),
+                    latest_prompt: pane.latest_prompt.clone(),
+                    prompt_count: pane.prompt_count,
                 })
             }));
         }

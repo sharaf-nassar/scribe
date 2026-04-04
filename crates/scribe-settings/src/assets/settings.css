@@ -245,6 +245,17 @@ body {
   margin-bottom: 12px;
 }
 
+.section-label-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.section-label-row .section-label {
+  margin-bottom: 0;
+}
+
 .section-card + .section-label {
   margin-top: 28px;
 }
@@ -641,13 +652,13 @@ input[type="range"]::-webkit-slider-thumb {
 
 .color-swatch-label {
   font-size: 10px;
-  color: #52525b;
+  color: #a1a1aa;
   font-weight: 500;
 }
 
 .color-swatch-desc {
   font-size: 9px;
-  color: #3f3f46;
+  color: #71717a;
   font-weight: 400;
   text-align: center;
 }
@@ -656,13 +667,14 @@ input[type="range"]::-webkit-slider-thumb {
 
 .ansi-row-label {
   font-size: 10px;
-  color: #3f3f46;
+  color: #a1a1aa;
   margin-bottom: 4px;
+  font-weight: 500;
 }
 
 .ansi-row-desc {
   font-size: 10px;
-  color: #3f3f46;
+  color: #71717a;
   margin-bottom: 6px;
   font-style: italic;
 }
@@ -675,6 +687,7 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .ansi-swatch {
+  width: 100%;
   height: 30px;
   border-radius: 6px;
   cursor: pointer;
@@ -708,7 +721,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 .ansi-swatch-label {
   font-size: 9px;
-  color: #52525b;
+  color: #a1a1aa;
   font-weight: 500;
 }
 

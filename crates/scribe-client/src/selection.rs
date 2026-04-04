@@ -141,13 +141,17 @@ pub fn pixel_to_grid(
     cell_w: f32,
     cell_h: f32,
     tab_bar_height: f32,
+    prompt_bar_height: f32,
+    prompt_bar_at_top: bool,
     display_offset: usize,
     padding: &ContentPadding,
 ) -> Option<SelectionPoint> {
+    let chrome_above = tab_bar_height + if prompt_bar_at_top { prompt_bar_height } else { 0.0 };
+    let total_chrome = tab_bar_height + prompt_bar_height;
     let content_x = pane_rect.x + padding.left;
-    let content_y = pane_rect.y + tab_bar_height + padding.top;
+    let content_y = pane_rect.y + chrome_above + padding.top;
     let content_w = (pane_rect.width - padding.left - padding.right).max(0.0);
-    let content_h = (pane_rect.height - tab_bar_height - padding.top - padding.bottom).max(0.0);
+    let content_h = (pane_rect.height - total_chrome - padding.top - padding.bottom).max(0.0);
 
     // Pixel offset relative to the content area origin.
     let rel_x = x - content_x;

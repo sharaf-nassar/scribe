@@ -28,7 +28,9 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 ### Terminal
 
-[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, clipboard cleanup, Claude/Codex integration toggles, AI tab provider, natural scroll, indicator height, shell integration, status bar stats, and the `prompt_bar` flag.
+[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, AI toggles, indicator height, shell integration, status bar stats, and prompt bar settings.
+
+Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (f32, 8–32, default 14), and `prompt_bar_position` ([[crates/scribe-common/src/config.rs#PromptBarPosition]]: Top or Bottom).
 
 [[crates/scribe-common/src/config.rs#StatusBarStatsConfig]] independently toggles CPU, memory, GPU, and network display. [[crates/scribe-common/src/config.rs#ShellIntegrationConfig]] wraps a single `enabled` flag for shell prompt marks. [[crates/scribe-common/src/config.rs#TerminalConfig#ai_provider_enabled]] maps an [[crates/scribe-common/src/ai_state.rs#AiProvider]] to the matching integration toggle.
 
@@ -122,4 +124,4 @@ The presets are defined in `theme_community_presets.rs` as a static slice of `Th
 
 [[crates/scribe-common/src/theme.rs#ChromeColors]] is derived automatically from the terminal foreground, background, and ANSI palette — no manual chrome configuration is required.
 
-The derivation algorithm lightens the background by 6% for the tab bar, uses ANSI blue (index 4) as the accent, and applies alpha-reduced foreground tones for separators, dividers, scrollbar, and status bar text. This ensures chrome colors remain visually coherent when a user switches themes or defines a custom palette.
+The derivation algorithm lightens the background by 6% for the tab bar, uses ANSI blue (index 4) as the accent, and applies alpha-reduced foreground tones for separators, dividers, scrollbar, and status bar text. Prompt bar colors are also derived: background from lightened terminal background, first-row from darkened background, text at 50% foreground alpha, first icon from ANSI yellow (index 3), latest icon from ANSI blue (index 4). All prompt bar colors can be overridden via `AppearanceConfig` fields. This ensures chrome colors remain visually coherent when a user switches themes or defines a custom palette.

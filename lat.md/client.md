@@ -131,7 +131,7 @@ The command palette is a GPU-rendered action picker for common window actions an
 
 ### Mouse Handling
 
-Mouse events are processed for text selection, scrollbar interaction, divider drag, tab drag, and context menus.
+Mouse events are processed for text selection, scrollbar interaction, divider drag, tab drag, prompt bar interactions, and context menus.
 
 Selection modes are click-drag for cell, double-click for word, triple-click for line. Scrollbar supports click-to-jump and drag-to-scroll. Divider drag resizes splits with 4px hit tolerance. Tab drag reorders with visual offset.
 
@@ -169,7 +169,7 @@ On Linux, the client starts the server via `systemctl --user start scribe-server
 
 Text selection in [[crates/scribe-client/src/selection.rs]] supports three modes: Cell, Word, and Line. Coordinates are absolute grid positions.
 
-Cell selects individual characters. Word boundaries include alphanumeric, underscore, dash, dot, slash, tilde, at, plus, percent, hash, question, ampersand, and equals. Line mode follows WRAPLINE flags for logical lines.
+Cell selects individual characters. Word boundaries include alphanumeric, underscore, dash, dot, slash, tilde, at, plus, percent, hash, question, ampersand, and equals. Line mode follows WRAPLINE flags for logical lines. [[crates/scribe-client/src/selection.rs#pixel_to_grid]] converts mouse pixel coordinates to grid positions, subtracting tab bar height, prompt bar height (position-aware), and content padding before dividing by cell size.
 
 ### Scroll Adjustment
 
@@ -199,13 +199,17 @@ On reconnect, active AI state is populated from `SessionInfo.ai_state` during ha
 
 ## Prompt Bar
 
-A per-pane bar that tracks the user's most recent AI prompts, rendered between the tab bar and terminal content.
+A per-pane bar that tracks the user's most recent AI prompts, rendered at the top or bottom of the terminal content.
 
-Prompt state is stored in [[crates/scribe-client/src/pane.rs#Pane]]: `first_prompt`, `latest_prompt`, `prompt_count`, and `last_conversation_id`. [[crates/scribe-client/src/main.rs#App#handle_prompt_received]] increments `prompt_count` and stores prompt text, triggering `resize_after_layout_change` when the bar height changes (0→1 line, 1→2+ lines). [[crates/scribe-client/src/pane.rs#Pane#prompt_bar_height]] returns 0.0 when the feature is disabled or no prompts have been received; otherwise it is `lines * cell_height + 14.0` (8px top pad + 6px bottom pad). [[crates/scribe-client/src/pane.rs#compute_pane_grid]] and [[crates/scribe-client/src/pane.rs#Pane#content_offset]] both accept a `prompt_bar_height` parameter so the terminal grid is sized and positioned below the bar.
+Prompt state is stored in [[crates/scribe-client/src/pane.rs#Pane]]: `first_prompt`, `latest_prompt`, `prompt_count`, `last_conversation_id`, and `prompt_bar_dismissed`. [[crates/scribe-client/src/main.rs#App#handle_prompt_received]] increments `prompt_count` and stores prompt text, triggering `resize_after_layout_change` when the bar height changes (0→1 line, 1→2+ lines). [[crates/scribe-client/src/pane.rs#Pane#prompt_bar_height]] returns 0.0 when the feature is disabled, dismissed, or no prompts have been received; otherwise it is `lines * cell_height + 14.0` (8px top pad + 6px bottom pad). [[crates/scribe-client/src/pane.rs#compute_pane_grid]] and [[crates/scribe-client/src/pane.rs#Pane#content_offset]] both accept a `prompt_bar_height` parameter so the terminal grid is sized and positioned below the bar.
 
-Rendering is handled by [[crates/scribe-client/src/prompt_bar.rs#render_prompt_bar]], which emits `CellInstance` quads: a background rect (`#151528`), icon glyphs (`⊙` for first, `→` for latest), and truncated prompt text. Text is clipped with an ellipsis (`…`) when it overflows the available width. [[crates/scribe-client/src/prompt_bar.rs#hit_test_prompt_bar]] maps mouse coordinates to a [[crates/scribe-client/src/prompt_bar.rs#PromptBarHover]] variant for hover highlighting. [[crates/scribe-client/src/prompt_bar.rs#hovered_prompt_text]] returns the full text of the hovered line for tooltip display. [[crates/scribe-client/src/prompt_bar.rs#is_prompt_truncated]] checks whether a given text would overflow, used to decide whether to show a tooltip.
+`TerminalConfig` exposes `prompt_bar_font_size` (f32, 8.0–32.0, default 14.0) and `prompt_bar_position` ([[crates/scribe-common/src/config.rs#PromptBarPosition]]: Top or Bottom, default Top). The font size is independent of the terminal font: a scale factor `prompt_bar_font_size / appearance.font_size` is applied to the terminal cell dimensions to produce the prompt bar cell size. The scaled cell size is used for bar height, text truncation, hit testing, and glyph rendering (via the per-instance `size` override in `CellInstance`). When position is Bottom, `content_offset` does not include the bar height so terminal content starts directly below the tab bar; the bar rect is placed at the pane bottom edge instead.
 
-Conversation resets are detected in [[crates/scribe-client/src/main.rs#App#maybe_reset_prompts_on_conversation_change]]: when `AiStateChanged` arrives with a different `conversation_id` than `pane.last_conversation_id`, all prompt fields are cleared and the pane is resized if the bar was visible. [[crates/scribe-client/src/main.rs#App#clear_pane_prompts]] performs the same clearing when `AiStateCleared` is received.
+Rendering is handled by [[crates/scribe-client/src/prompt_bar.rs#render_prompt_bar]], which accepts a [[crates/scribe-client/src/prompt_bar.rs#PromptBarColors]] struct controlling all five configurable colors (background, first-row background, text, first icon, latest icon) and a `glyph_size` override for custom font scaling. Colors are derived from [[crates/scribe-common/src/theme.rs#ChromeColors]] with optional per-field overrides from `AppearanceConfig` (e.g. `prompt_bar_bg`, `prompt_bar_text`). The renderer emits `CellInstance` quads: a background rect, a darker first-row background, icon glyphs (`⊙` for first, `→` for latest), truncated prompt text, and a dismiss button (`×`) at the right edge. Text is clipped with an ellipsis (`…`) when it overflows the available width (reduced by the dismiss button zone). [[crates/scribe-client/src/prompt_bar.rs#hit_test_prompt_bar]] maps mouse coordinates to a [[crates/scribe-client/src/prompt_bar.rs#PromptBarHover]] variant (`First`, `Latest`, or `DismissButton`) for hover highlighting. The dismiss zone is the rightmost 28px and takes priority over line hover. [[crates/scribe-client/src/prompt_bar.rs#hovered_prompt_text]] returns the full text of the hovered line for tooltip display. [[crates/scribe-client/src/prompt_bar.rs#is_prompt_truncated]] checks whether a given text would overflow, used to decide whether to show a tooltip. The Colors page in settings exposes all five prompt bar colors with reset-to-theme-default buttons. The AI page exposes a dedicated Prompt Bar section with the enabled toggle, position (Top/Bottom segmented control), and font size stepper.
+
+Clicking a prompt line copies its full (untruncated) text to the clipboard via [[crates/scribe-client/src/main.rs#App#try_copy_prompt_bar_text]]. Clicking the dismiss button (×) hides the bar for that pane via [[crates/scribe-client/src/main.rs#App#try_dismiss_prompt_bar]], setting `prompt_bar_dismissed = true` and triggering a layout resize. The bar stays hidden until a new conversation starts.
+
+Conversation resets are detected in [[crates/scribe-client/src/main.rs#App#maybe_reset_prompts_on_conversation_change]]: when `AiStateChanged` arrives with a different `conversation_id` than `pane.last_conversation_id`, all prompt fields are cleared, `prompt_bar_dismissed` is reset to `false`, and the pane is resized if the bar was visible. [[crates/scribe-client/src/main.rs#App#clear_pane_prompts]] performs the same clearing when `AiStateCleared` is received.
 
 ## Status Bar
 
@@ -255,15 +259,15 @@ Per-window geometry is persisted under the active install flavor's XDG state roo
 
 Stable installs use `$XDG_STATE_HOME/scribe/windows/{window_id}.toml`, while `scribe-dev` uses `$XDG_STATE_HOME/scribe-dev/windows/{window_id}.toml`. `Kill Window` removes the file only after the server confirms the window was destroyed.
 
-Position is stored as Optional since Wayland does not expose window positions. Maximized state is restored after size to avoid window manager override.
+Position is stored as Optional since Wayland does not expose window positions. Size is always restored via `request_inner_size` — even for maximized windows — so the GPU surface and pane grids have reasonable pre-configure dimensions on Wayland where `inner_size()` can return a tiny default before the compositor responds. The window is created with an initial 1200×800 hint for the same reason. Maximized state is set after size.
 
 ### Cold Restart Restore Store
 
 The [[crates/scribe-client/src/restore_state.rs#RestoreStore]] persists logical window state for cold restart recovery under `$XDG_STATE_HOME/{flavor}/restore/`.
 
-A debounced save runs after every layout change via `report_workspace_tree`, snapshotting workspace splits, tabs, pane trees, and per-pane launch bindings. On startup with an empty `SessionList`, the client atomically claims the first entry from the restore index and rebuilds the layout via [[crates/scribe-client/src/restore_replay.rs#prepare_replay]], then creates sessions for each saved pane. Explicit close or quit clears the snapshot; server crash preserves it.
+A debounced save runs after every layout change via `report_workspace_tree`, snapshotting workspace splits, tabs, pane trees, and per-pane launch bindings. On startup with an empty `SessionList`, the client atomically claims the first entry from the restore index and rebuilds the layout via [[crates/scribe-client/src/restore_replay.rs#prepare_replay]], then creates sessions for each saved pane. Explicit close or quit clears the snapshot; server crash preserves it. Restore is skipped when the client was launched with `--window-id` (i.e. spawned as a new window by an existing client) to prevent claiming a live window's snapshot.
 
-AI panes persist `conversation_id` via OSC 1337 hooks that include `session_id` from the hook JSON payload. [[crates/scribe-client/src/main.rs#App#update_ai_launch_binding]] preserves an existing non-None `conversation_id` when subsequent state updates omit it, ensuring hooks without `session_id` access (e.g. Notification hooks) do not erase the tracking ID. On replay, panes with a `conversation_id` launch `claude --resume <id>` directly; those without fall back to the generic resume picker.
+AI panes persist `conversation_id` via OSC 1337 hooks that include `session_id` from the hook JSON payload. [[crates/scribe-client/src/main.rs#App#update_ai_launch_binding]] preserves an existing non-None `conversation_id` when subsequent state updates omit it, ensuring hooks without `session_id` access (e.g. Notification hooks) do not erase the tracking ID. On replay, panes with a `conversation_id` launch `claude --resume <id>` directly; those without fall back to the generic resume picker. Prompt bar state (`first_prompt`, `latest_prompt`, `prompt_count`) is persisted in [[crates/scribe-client/src/restore_state.rs#LaunchRecord]] and restored during replay so the bar appears immediately after a cold restart. The `last_conversation_id` is also seeded from the launch record's `conversation_id` to ensure conversation-change detection works correctly from the first `AiStateChanged` event.
 
 ## Config Watching
 
@@ -275,7 +279,7 @@ Stable installs watch `$XDG_CONFIG_HOME/scribe/`, while `scribe-dev` watches `$X
 
 Find-in-scrollback overlay state in [[crates/scribe-client/src/search_overlay.rs#SearchOverlay]], tracking query text, match results, and highlighted match index.
 
-This is pure state — no rendering logic is included. The module carries `#![allow(dead_code)]` because rendering integration is pending. Methods: `open` (clears previous query and results), `close` (resets all state), `push_char`/`pop_char` (edit the query string), `set_results` (replace match list and reset highlight), `next_match`/`prev_match` (cycle through results with wrap-around). Match results are `Vec<SearchMatch>` received from the server.
+State module plus GPU-rendered overlay. Methods: `open` (clears previous query and results), `close` (resets all state), `push_char`/`pop_char` (edit the query string), `set_results` (replace match list and reset highlight), `next_match`/`prev_match` (cycle through results with wrap-around), `matches` (borrow all results). Match results are `Vec<SearchMatch>` received from the server. All visible matches on the focused pane are highlighted: the current match uses the full accent background with a contrast foreground, while other matches blend the accent into their existing cell background at 40% intensity.
 
 ## Tooltip
 

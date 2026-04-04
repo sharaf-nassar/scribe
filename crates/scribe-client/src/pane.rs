@@ -20,6 +20,7 @@ use crate::scrollbar::ScrollbarState;
 use crate::selection::SelectionRange;
 
 /// State for a single terminal pane.
+#[allow(clippy::struct_excessive_bools, reason = "pane has legitimate independent boolean flags")]
 pub struct Pane {
     pub session_id: SessionId,
     pub launch_binding: LaunchBinding,
@@ -90,6 +91,9 @@ pub struct Pane {
     /// Last-seen `conversation_id` for detecting session resets.
     #[allow(dead_code, reason = "read by prompt bar renderer in a later task")]
     pub last_conversation_id: Option<String>,
+    /// Whether the user has dismissed the prompt bar for this pane.
+    /// Cleared when a new conversation starts or prompts are reset.
+    pub prompt_bar_dismissed: bool,
 }
 
 /// Result of feeding PTY bytes into a pane's ANSI processor.
@@ -170,6 +174,7 @@ impl Pane {
             latest_prompt: None,
             prompt_count: 0,
             last_conversation_id: None,
+            prompt_bar_dismissed: false,
         }
     }
 
@@ -227,12 +232,24 @@ impl Pane {
     ///
     /// Returns the new grid dimensions (cols, rows) for sending to the server.
     pub fn resize(&mut self, new_rect: Rect, new_grid: GridSize) -> GridSize {
+        let old_cols = self.grid.cols;
         self.rect = new_rect;
         self.grid = new_grid;
         self.content_dirty = true;
 
         let dims = TermDims { cols: usize::from(new_grid.cols), lines: usize::from(new_grid.rows) };
         if self.term.columns() != dims.cols || self.term.screen_lines() != dims.lines {
+            if new_grid.cols < old_cols.saturating_sub(5) || (old_cols > 1 && new_grid.cols <= 30) {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    old_cols,
+                    new_cols = new_grid.cols,
+                    new_rows = new_grid.rows,
+                    rect_w = new_rect.width,
+                    rect_h = new_rect.height,
+                    "pane columns shrank significantly"
+                );
+            }
             self.term.resize(dims);
         }
 
@@ -279,7 +296,7 @@ impl Pane {
     /// Returns 0.0 when `prompt_bar` is disabled or no prompts have been received.
     /// One prompt = 1 line + padding. Two or more = 2 lines + padding.
     pub fn prompt_bar_height(&self, cell_height: f32, prompt_bar_enabled: bool) -> f32 {
-        if !prompt_bar_enabled || self.prompt_count == 0 {
+        if !prompt_bar_enabled || self.prompt_bar_dismissed || self.prompt_count == 0 {
             return 0.0;
         }
         let lines = if self.prompt_count == 1 { 1.0 } else { 2.0 };

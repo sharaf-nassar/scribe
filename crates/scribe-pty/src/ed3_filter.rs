@@ -16,7 +16,11 @@ impl Ed3Output<'_> {
     }
 }
 
-/// State machine that rewrites CSI ED 3 (`\x1b[3J`) to CSI ED 2 (`\x1b[2J`).
+/// State machine that strips CSI ED 3 (`\x1b[3J`) from the output stream.
+///
+/// When an AI assistant sends ED 3 to wipe scrollback, this filter silently
+/// drops the sequence so the user's scrollback history is preserved (matching
+/// iTerm2's "Prevent CSI 3 J from clearing scrollback" behaviour).
 ///
 /// Handles sequences split across multiple `filter()` calls. Pending bytes
 /// from a partial match are carried over until confirmed or flushed.
@@ -34,7 +38,7 @@ impl Ed3Filter {
         Self { state: 0 }
     }
 
-    /// Filter `input`, rewriting any complete `\x1b[3J` sequences to `\x1b[2J`.
+    /// Filter `input`, stripping any complete `\x1b[3J` sequences.
     ///
     /// Partial matches at the end of `input` are held in state and not emitted
     /// until the next call (or `flush()`).
@@ -87,13 +91,13 @@ impl Ed3Filter {
         diverged
     }
 
-    /// Advance the match. If the full 4-byte sequence is matched, emit ED 2.
+    /// Advance the match. If the full 4-byte sequence is matched, drop it.
     /// Returns `true` when a complete sequence was consumed (output diverged).
-    fn advance_match(&mut self, out: &mut Vec<u8>) -> bool {
+    fn advance_match(&mut self, _out: &mut Vec<u8>) -> bool {
         self.state += 1;
         if self.state == 4 {
             self.state = 0;
-            out.extend_from_slice(&[0x1B, 0x5B, 0x32, 0x4A]);
+            // Strip the sequence entirely — don't emit anything.
             return true;
         }
         false
@@ -138,17 +142,17 @@ mod tests {
     use super::Ed3Filter;
 
     #[test]
-    fn rewrites_complete_ed3_sequence_to_ed2() {
+    fn strips_complete_ed3_sequence() {
         let mut filter = Ed3Filter::new();
 
         let output = filter.filter(b"before\x1b[3Jafter");
 
-        assert_eq!(output.as_bytes(), b"before\x1b[2Jafter");
+        assert_eq!(output.as_bytes(), b"beforeafter");
         assert_eq!(filter.flush(), None);
     }
 
     #[test]
-    fn rewrites_split_ed3_sequence_across_chunks() {
+    fn strips_split_ed3_sequence_across_chunks() {
         let mut filter = Ed3Filter::new();
 
         let first = filter.filter(b"before\x1b[");
@@ -156,7 +160,7 @@ mod tests {
 
         let second = filter.filter(b"3Jafter");
 
-        assert_eq!(second.as_bytes(), b"\x1b[2Jafter");
+        assert_eq!(second.as_bytes(), b"after");
         assert_eq!(filter.flush(), None);
     }
 
