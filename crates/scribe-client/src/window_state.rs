@@ -239,16 +239,28 @@ impl WindowRegistry {
 ///
 /// On Wayland, `outer_position()` is unavailable — position is stored as
 /// `None` rather than a misleading `(0, 0)`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "logical window coordinates are small enough for i32/u32"
+)]
 pub fn capture_window_geometry(window: &Window) -> WindowGeometry {
-    let size = window.outer_size();
+    let scale = window.scale_factor();
+    let size: winit::dpi::LogicalSize<f64> = window.outer_size().to_logical(scale);
     let pos = window.outer_position().ok();
     let monitor_name = window.current_monitor().and_then(|m| m.name());
 
     WindowGeometry {
-        x: pos.map(|p| p.x),
-        y: pos.map(|p| p.y),
-        width: size.width,
-        height: size.height,
+        x: pos.map(|p| {
+            let lp: winit::dpi::LogicalPosition<f64> = p.to_logical(scale);
+            lp.x as i32
+        }),
+        y: pos.map(|p| {
+            let lp: winit::dpi::LogicalPosition<f64> = p.to_logical(scale);
+            lp.y as i32
+        }),
+        width: size.width as u32,
+        height: size.height as u32,
         maximized: window.is_maximized(),
         monitor_name,
     }
@@ -279,7 +291,7 @@ pub fn apply_window_geometry(event_loop: &ActiveEventLoop, window: &Window, geom
         });
 
         if monitor_found {
-            window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+            window.set_outer_position(winit::dpi::LogicalPosition::new(f64::from(x), f64::from(y)));
             tracing::debug!(x, y, "restored window position");
         } else if geom.monitor_name.is_some() {
             tracing::info!(
@@ -296,8 +308,10 @@ pub fn apply_window_geometry(event_loop: &ActiveEventLoop, window: &Window, geom
     // Wayland compositors may leave inner_size() at a tiny default until
     // the first configure event arrives, causing shells to start with the
     // wrong terminal dimensions.
-    let _applied =
-        window.request_inner_size(winit::dpi::PhysicalSize::new(geom.width, geom.height));
+    let _applied = window.request_inner_size(winit::dpi::LogicalSize::new(
+        f64::from(geom.width),
+        f64::from(geom.height),
+    ));
     tracing::debug!(width = geom.width, height = geom.height, "restored window size");
 
     if geom.maximized {

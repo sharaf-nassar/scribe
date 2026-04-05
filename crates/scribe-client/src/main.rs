@@ -862,7 +862,7 @@ impl App {
         // default until the first configure; this hint prevents that.
         let mut attrs = Window::default_attributes()
             .with_title("Scribe")
-            .with_inner_size(winit::dpi::PhysicalSize::new(1200u32, 800u32));
+            .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0));
         if self.window_transparent {
             attrs = attrs.with_transparent(true);
             tracing::info!(opacity = self.opacity, "window transparency enabled");
