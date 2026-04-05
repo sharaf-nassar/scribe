@@ -109,6 +109,8 @@ struct PtyReaderState {
     cell_height: u16,
     /// Shared runtime flag updated by `ConfigReloaded`.
     hide_codex_hook_logs: Arc<AtomicBool>,
+    /// When `true`, strip `CSI 3 J` from AI sessions to preserve scrollback.
+    preserve_ai_scrollback: Arc<AtomicBool>,
 }
 
 /// A running session in the server-wide registry. Lives independently of
@@ -148,6 +150,8 @@ pub struct LiveSession {
     pub(crate) handoff_snapshot: Option<scribe_common::screen::ScreenSnapshot>,
     /// Shared runtime flag updated by config reloads.
     hide_codex_hook_logs: Arc<AtomicBool>,
+    /// Shared runtime flag updated by config reloads.
+    preserve_ai_scrollback: Arc<AtomicBool>,
 }
 
 pub struct AttachSessionData {
@@ -763,6 +767,7 @@ async fn start_session(
     let client_writer: ClientWriter = Arc::new(Mutex::new(writer.map(Arc::clone)));
 
     let hide_codex_hook_logs = Arc::new(AtomicBool::new(load_hide_codex_hook_logs_setting()));
+    let preserve_ai_scrollback = Arc::new(AtomicBool::new(load_preserve_ai_scrollback_setting()));
     let ai_provider = ai_state.as_ref().map(|state| state.provider).or(ai_provider_hint);
 
     let live = LiveSession {
@@ -784,6 +789,7 @@ async fn start_session(
         pty,
         handoff_snapshot,
         hide_codex_hook_logs: Arc::clone(&hide_codex_hook_logs),
+        preserve_ai_scrollback: Arc::clone(&preserve_ai_scrollback),
     };
 
     // Insert into the registry before spawning the PTY reader task so that
@@ -812,6 +818,7 @@ async fn start_session(
         cell_width,
         cell_height,
         hide_codex_hook_logs,
+        preserve_ai_scrollback,
     };
 
     tokio::spawn(pty_reader_task(state));
@@ -1440,10 +1447,12 @@ async fn handle_config_reloaded(
     for session in sessions.values() {
         session.term.lock().await.set_options(term_config.clone());
         session.hide_codex_hook_logs.store(cfg.hide_codex_hook_logs, Ordering::Relaxed);
+        session.preserve_ai_scrollback.store(cfg.preserve_ai_scrollback, Ordering::Relaxed);
     }
     info!(
         scrollback_lines = new_scrollback,
         hide_codex_hook_logs = cfg.hide_codex_hook_logs,
+        preserve_ai_scrollback = cfg.preserve_ai_scrollback,
         sessions = sessions.len(),
         "scrollback updated on live sessions"
     );
@@ -1454,6 +1463,16 @@ fn load_hide_codex_hook_logs_setting() -> bool {
         Ok(config) => config.terminal.hide_codex_hook_logs,
         Err(e) => {
             warn!("failed to load codex hook log filter setting: {e}");
+            false
+        }
+    }
+}
+
+fn load_preserve_ai_scrollback_setting() -> bool {
+    match scribe_common::config::load_config() {
+        Ok(config) => config.terminal.preserve_ai_scrollback,
+        Err(e) => {
+            warn!("failed to load preserve_ai_scrollback setting: {e}");
             false
         }
     }
@@ -1612,12 +1631,13 @@ async fn pty_reader_task(state: PtyReaderState) {
             let Some(bytes) = buf.get(..bytes_read) else { break };
             capture_osc_metadata_events(&mut state, bytes);
             let chunk_has_ed3_provider = chunk_mentions_ed3_provider(&state.osc_events);
-            let ed3_filtered = if should_apply_ed3_filter(state.ai_provider, chunk_has_ed3_provider)
-            {
-                Some(state.ed3_filter.filter(bytes))
-            } else {
-                None
-            };
+            let preserve = state.preserve_ai_scrollback.load(Ordering::Relaxed);
+            let ed3_filtered =
+                if preserve && should_apply_ed3_filter(state.ai_provider, chunk_has_ed3_provider) {
+                    Some(state.ed3_filter.filter(bytes))
+                } else {
+                    None
+                };
             let effective = ed3_filtered.as_ref().map_or(bytes, |f| f.as_bytes());
             let codex_filtered = if should_apply_codex_hook_log_filter(&state) {
                 Some(state.codex_hook_log_filter.filter(effective))

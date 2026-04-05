@@ -22,6 +22,12 @@ All theme colours are specified in sRGB but the GPU pipeline operates in linear 
 
 The DIM flag is applied in sRGB space before conversion to match terminal convention. A dimming factor of 0.67 is used.
 
+### Bold-Bright Colors
+
+Cells with the BOLD flag have their foreground promoted to the bright palette variant via [[crates/scribe-renderer/src/lib.rs#bold_to_bright]].
+
+Basic ANSI colours 0-7 become indices 8-15, and the semantic `Foreground` becomes `BrightForeground` — a brighter variant computed by [[crates/scribe-renderer/src/lib.rs#boost_srgb_brightness]]. RGB and already-bright colours pass through unchanged.
+
 ## Glyph Atlas
 
 The [[crates/scribe-renderer/src/atlas.rs#GlyphAtlas]] rasterizes glyphs via cosmic-text and caches them in a 1024x1024 RGBA8 texture.

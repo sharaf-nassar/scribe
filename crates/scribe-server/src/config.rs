@@ -8,11 +8,13 @@ use scribe_common::error::ScribeError;
 /// Maximum allowed scrollback lines to prevent excessive memory use.
 const MAX_SCROLLBACK_LINES: u32 = 100_000;
 
+#[allow(clippy::struct_excessive_bools, reason = "config struct with independent boolean flags")]
 pub struct ScribeConfig {
     pub workspace_roots: Vec<PathBuf>,
     pub scrollback_lines: u32,
     pub shell_integration_enabled: bool,
     pub hide_codex_hook_logs: bool,
+    pub preserve_ai_scrollback: bool,
     pub update: UpdateConfig,
 }
 
@@ -23,6 +25,7 @@ impl Default for ScribeConfig {
             scrollback_lines: 10_000,
             shell_integration_enabled: true,
             hide_codex_hook_logs: false,
+            preserve_ai_scrollback: false,
             update: UpdateConfig::default(),
         }
     }
@@ -58,11 +61,12 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
 
     let shell_integration_enabled = full.terminal.shell_integration.enabled;
     let hide_codex_hook_logs = full.terminal.hide_codex_hook_logs;
+    let preserve_ai_scrollback = full.terminal.preserve_ai_scrollback;
     let update = full.update;
 
     info!(
         roots = workspace_roots.len(),
-        scrollback_lines, hide_codex_hook_logs, "server config loaded"
+        scrollback_lines, hide_codex_hook_logs, preserve_ai_scrollback, "server config loaded"
     );
 
     Ok(ScribeConfig {
@@ -70,6 +74,7 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
         scrollback_lines,
         shell_integration_enabled,
         hide_codex_hook_logs,
+        preserve_ai_scrollback,
         update,
     })
 }

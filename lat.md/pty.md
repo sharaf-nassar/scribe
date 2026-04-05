@@ -78,9 +78,9 @@ Normal session panes now receive the raw `CSI ? 2026 h/l` markers end to end, so
 
 ## ED 3 Filter
 
-The [[crates/scribe-pty/src/ed3_filter.rs#Ed3Filter]] strips CSI ED 3 (`\x1b[3J`) from Claude Code and Codex Code PTY output, preserving scrollback history when the AI clears the screen.
+The [[crates/scribe-pty/src/ed3_filter.rs#Ed3Filter]] strips CSI ED 3 (`\x1b[3J`) from AI PTY output when `preserve_ai_scrollback` is enabled (default off).
 
-Regular shell sessions are unaffected — the filter only runs for sessions whose active AI provider is Claude Code or Codex Code.
+Only runs for Claude Code / Codex Code sessions when `preserve_ai_scrollback` is `true`. Regular shell sessions are never filtered. Disabled by default to match standard terminal behaviour and prevent duplicate scrollback content.
 
 ### State Machine
 

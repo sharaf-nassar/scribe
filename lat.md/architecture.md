@@ -88,6 +88,8 @@ Active AI state is restored from the `SessionList` response before `AttachSessio
 
 Sessions that were active during a [[server#Handoff]] retain their pre-handoff snapshot for the first attaching client.
 
+Prompt bar state (`first_prompt`, `latest_prompt`, `prompt_count`) is client-side only and not part of `SessionList` or the handoff protocol. During hot restart reattach, [[crates/scribe-client/src/main.rs#App#apply_snapshot_prompt_state]] reads the cold restart snapshot saved by the previous client and copies prompt data to matching panes by `conversation_id`.
+
 ### Cold Restart Restore
 
 When the server crashes or is killed and relaunched, all PTY sessions are lost. The client detects a cold restart by receiving an empty `SessionList` while a restore snapshot exists on disk, then replays the previous window layout.

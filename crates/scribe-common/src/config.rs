@@ -540,6 +540,11 @@ pub struct TerminalConfig {
     pub codex_code_integration: bool,
     #[serde(default)]
     pub hide_codex_hook_logs: bool,
+    /// When `true`, block `CSI 3 J` (clear scrollback) from AI sessions so
+    /// the user's scrollback history is preserved.  When `false` (default),
+    /// the sequence is passed through, matching standard terminal behaviour.
+    #[serde(default)]
+    pub preserve_ai_scrollback: bool,
     /// Which AI CLI the AI tab keybindings launch.
     #[serde(default = "default_ai_tab_provider")]
     pub ai_tab_provider: AiProvider,
@@ -579,6 +584,7 @@ impl Default for TerminalConfig {
             claude_code_integration: true,
             codex_code_integration: true,
             hide_codex_hook_logs: false,
+            preserve_ai_scrollback: false,
             ai_tab_provider: default_ai_tab_provider(),
             natural_scroll: false,
             claude_states: ClaudeStatesConfig::default(),

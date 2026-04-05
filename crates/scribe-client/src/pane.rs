@@ -65,6 +65,10 @@ pub struct Pane {
     /// Whether this pane was the focused pane when `last_instances` was built.
     /// `None` means instances have never been built.
     pub last_was_focused: Option<bool>,
+    /// Whether the terminal's own cursor was hidden (DECTCEM off) when
+    /// `last_instances` was built.  Ensures the cache invalidates when the
+    /// program toggles cursor visibility without other content changes.
+    pub last_term_cursor_hidden: Option<bool>,
     /// The selection rendered when `last_instances` was built, or `None`.
     pub last_selection: Option<SelectionRange>,
     /// The grid size last sent to the server via IPC resize.
@@ -164,6 +168,7 @@ impl Pane {
             content_dirty: true,
             last_instances: Vec::new(),
             last_cursor_visible: None,
+            last_term_cursor_hidden: None,
             last_was_focused: None,
             last_selection: None,
             last_sent_grid: None,
@@ -300,7 +305,7 @@ impl Pane {
             return 0.0;
         }
         let lines = if self.prompt_count == 1 { 1.0 } else { 2.0 };
-        lines * cell_height + 8.0 + 6.0 // top_pad + bottom_pad
+        lines * cell_height + 8.0 + 8.0 // top_pad + bottom_pad
     }
 }
 

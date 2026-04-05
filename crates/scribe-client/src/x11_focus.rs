@@ -58,6 +58,15 @@ impl X11FocusGuard {
         }
     }
 
+    /// Clear the reactivation debounce.
+    ///
+    /// Call when the window receives a real focus event (`Focused(true)`).
+    /// Compositor overlays don't send focus events, so this only fires for
+    /// genuine focus transitions where the debounce should not apply.
+    pub fn clear_reactivation_debounce(&mut self) {
+        self.last_inactive = None;
+    }
+
     /// Returns `true` when keyboard input should be suppressed.
     ///
     /// Suppression occurs when:

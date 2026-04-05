@@ -62,6 +62,7 @@ pub struct TerminalRenderer {
     grid_size: GridSize,
     viewport_size: (u32, u32),
     default_fg: [f32; 4],
+    default_bright_fg: [f32; 4],
     default_bg: [f32; 4],
     default_fg_dim: [f32; 4],
     cursor_shape: CursorShape,
@@ -108,6 +109,7 @@ impl TerminalRenderer {
             grid_size,
             viewport_size,
             default_fg: srgb_to_linear_rgba([0.8, 0.8, 0.8, 1.0]),
+            default_bright_fg: srgb_to_linear_rgba(boost_srgb_brightness([0.8, 0.8, 0.8, 1.0])),
             default_bg: srgb_to_linear_rgba([0.0, 0.0, 0.0, 1.0]),
             default_fg_dim: {
                 // Apply DIM in sRGB space: multiply the sRGB value by DIM_FACTOR,
@@ -232,6 +234,7 @@ impl TerminalRenderer {
     /// (the sRGB framebuffer applies the inverse transform on output).
     pub fn set_theme(&mut self, theme: &scribe_common::theme::Theme) {
         self.default_fg = srgb_to_linear_rgba(theme.foreground);
+        self.default_bright_fg = srgb_to_linear_rgba(boost_srgb_brightness(theme.foreground));
         self.default_bg = srgb_to_linear_rgba(theme.background);
         self.cursor_color = srgb_to_linear_rgba(theme.cursor);
         // Apply DIM in sRGB space: use the raw sRGB theme foreground values,
@@ -560,13 +563,15 @@ impl TerminalRenderer {
     }
 
     /// Resolve foreground and background colours for a cell, applying
-    /// INVERSE, HIDDEN, and DIM flags.
+    /// BOLD-bright, INVERSE, HIDDEN, and DIM flags.
     #[allow(dead_code, reason = "retained for callers that work with &Cell directly")]
     fn resolve_cell_colors(
         &self,
         cell: &alacritty_terminal::term::cell::Cell,
     ) -> ([f32; 4], [f32; 4]) {
-        let mut fg = self.resolve_color(cell.fg);
+        let effective_fg =
+            if cell.flags.contains(Flags::BOLD) { bold_to_bright(cell.fg) } else { cell.fg };
+        let mut fg = self.resolve_color(effective_fg);
         let mut bg = self.resolve_color(cell.bg);
 
         if cell.flags.contains(Flags::INVERSE) {
@@ -606,14 +611,16 @@ impl TerminalRenderer {
     }
 
     /// Resolve foreground and background colours from raw fields, applying
-    /// INVERSE, HIDDEN, and DIM flags.
+    /// BOLD-bright, INVERSE, HIDDEN, and DIM flags.
     fn resolve_cell_colors_raw(
         &self,
         fg_color: alacritty_terminal::vte::ansi::Color,
         bg_color: alacritty_terminal::vte::ansi::Color,
         flags: Flags,
     ) -> ([f32; 4], [f32; 4]) {
-        let mut fg = self.resolve_color(fg_color);
+        let effective_fg =
+            if flags.contains(Flags::BOLD) { bold_to_bright(fg_color) } else { fg_color };
+        let mut fg = self.resolve_color(effective_fg);
         let mut bg = self.resolve_color(bg_color);
 
         if flags.contains(Flags::INVERSE) {
@@ -717,14 +724,56 @@ impl TerminalRenderer {
         use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
         match color {
-            Color::Named(
-                NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::Cursor,
-            ) => self.default_fg,
+            Color::Named(NamedColor::Foreground | NamedColor::Cursor) => self.default_fg,
+            Color::Named(NamedColor::BrightForeground) => self.default_bright_fg,
             Color::Named(NamedColor::Background) => self.default_bg,
             Color::Named(NamedColor::DimForeground) => self.default_fg_dim,
             other => self.palette.resolve(other),
         }
     }
+}
+
+/// Map a foreground colour to its bright variant when the BOLD flag is set.
+///
+/// Standard terminal behaviour: ANSI colours 0-7 (named or indexed) are
+/// promoted to their bright equivalents 8-15, and the semantic `Foreground`
+/// is promoted to `BrightForeground`.  RGB / 256-colour values and already-
+/// bright colours are returned unchanged.
+fn bold_to_bright(
+    color: alacritty_terminal::vte::ansi::Color,
+) -> alacritty_terminal::vte::ansi::Color {
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+
+    match color {
+        Color::Named(named) => Color::Named(match named {
+            NamedColor::Black => NamedColor::BrightBlack,
+            NamedColor::Red => NamedColor::BrightRed,
+            NamedColor::Green => NamedColor::BrightGreen,
+            NamedColor::Yellow => NamedColor::BrightYellow,
+            NamedColor::Blue => NamedColor::BrightBlue,
+            NamedColor::Magenta => NamedColor::BrightMagenta,
+            NamedColor::Cyan => NamedColor::BrightCyan,
+            NamedColor::White => NamedColor::BrightWhite,
+            NamedColor::Foreground => NamedColor::BrightForeground,
+            other => other,
+        }),
+        Color::Indexed(idx @ 0..=7) => Color::Indexed(idx + 8),
+        other => other,
+    }
+}
+
+/// Boost an sRGB colour toward full brightness for the bold-bright foreground.
+///
+/// Each channel is pushed 30 % of the way toward 1.0, so dim themes gain a
+/// noticeable bump while themes near white stay clamped.
+fn boost_srgb_brightness(srgb: [f32; 4]) -> [f32; 4] {
+    const FACTOR: f32 = 0.30;
+    [
+        srgb[0] + (1.0 - srgb[0]) * FACTOR,
+        srgb[1] + (1.0 - srgb[1]) * FACTOR,
+        srgb[2] + (1.0 - srgb[2]) * FACTOR,
+        srgb[3],
+    ]
 }
 
 /// Compute grid dimensions from viewport size and cell size.

@@ -996,41 +996,6 @@ input[type="range"]::-webkit-slider-thumb {
   color: #a1a1aa;
 }
 
-/* ───────── Tooltips ───────── */
-
-[data-tooltip] {
-  position: relative;
-  cursor: default;
-}
-
-[data-tooltip]::after {
-  content: attr(data-tooltip);
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 50%;
-  transform: translateX(-50%);
-  background: #27272a;
-  color: #e4e4e7;
-  font-size: 11px;
-  line-height: 1.4;
-  padding: 4px 8px;
-  border-radius: 4px;
-  white-space: nowrap;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.12s;
-  z-index: 100;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-[data-tooltip]:hover {
-  z-index: 101;
-}
-
-[data-tooltip]:hover::after {
-  opacity: 1;
-}
-
 .control-with-reset {
   display: flex;
   align-items: center;

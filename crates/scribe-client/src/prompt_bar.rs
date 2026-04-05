@@ -28,14 +28,14 @@ const DISMISS_COLOR: [f32; 4] = [0.45, 0.45, 0.54, 1.0];
 /// Dismiss button × glyph color (hovered).
 const DISMISS_HOVER_COLOR: [f32; 4] = [0.80, 0.80, 0.87, 1.0];
 
-/// Width of the dismiss (×) button hit zone at the right edge.
+/// Width of the dismiss (×) button hit zone at the left edge.
 pub const DISMISS_BTN_W: f32 = 28.0;
 
 /// Top padding above the first line.
 const TOP_PAD: f32 = 8.0;
 /// Bottom padding below the last line (used in `Pane::prompt_bar_height`).
 #[allow(dead_code, reason = "documents the prompt bar layout constant used in pane.rs")]
-const BOTTOM_PAD: f32 = 6.0;
+const BOTTOM_PAD: f32 = 8.0;
 /// Left padding before the icon.
 const LEFT_PAD: f32 = 14.0;
 /// Gap between icon and text.
@@ -86,8 +86,9 @@ pub fn render_prompt_bar(
         return;
     }
 
-    // Effective width for text lines — leave room for the dismiss button.
+    // Effective width for text lines — dismiss button sits on the left.
     let text_bar_width = bar_rect.width - DISMISS_BTN_W;
+    let text_x = bar_rect.x + DISMISS_BTN_W;
 
     // Background quad for the entire bar.
     push_solid_rect(out, bar_rect, colors.bg);
@@ -97,8 +98,10 @@ pub fn render_prompt_bar(
         let y = bar_rect.y + TOP_PAD;
         let is_hovered = hover == Some(PromptBarHover::First);
 
-        // Darker first-row background (clipped before dismiss button).
-        let first_row_rect = Rect { x: bar_rect.x, y, width: text_bar_width, height: cell_h };
+        // Darker first-row background covers from bar top through the first
+        // text line (including TOP_PAD) so the color fills the gap above the text.
+        let first_row_rect =
+            Rect { x: text_x, y: bar_rect.y, width: text_bar_width, height: cell_h + TOP_PAD };
         push_solid_rect(out, first_row_rect, colors.first_row_bg);
 
         if is_hovered {
@@ -109,7 +112,7 @@ pub fn render_prompt_bar(
             out,
             ICON_FIRST,
             text,
-            bar_rect.x,
+            text_x,
             y,
             text_bar_width,
             colors.icon_first,
@@ -129,8 +132,7 @@ pub fn render_prompt_bar(
             let is_hovered = hover == Some(PromptBarHover::Latest);
 
             if is_hovered {
-                let highlight_rect =
-                    Rect { x: bar_rect.x, y, width: bar_rect.width, height: cell_h };
+                let highlight_rect = Rect { x: text_x, y, width: text_bar_width, height: cell_h };
                 push_solid_rect(out, highlight_rect, HOVER_OVERLAY);
             }
 
@@ -138,7 +140,7 @@ pub fn render_prompt_bar(
                 out,
                 ICON_LATEST,
                 text,
-                bar_rect.x,
+                text_x,
                 y,
                 text_bar_width,
                 colors.icon_latest,
@@ -152,10 +154,10 @@ pub fn render_prompt_bar(
         }
     }
 
-    // Dismiss button (×) at the right edge, vertically centred.
+    // Dismiss button (×) at the left edge, vertically centred.
     let dismiss_hovered = hover == Some(PromptBarHover::DismissButton);
     let dismiss_fg = if dismiss_hovered { DISMISS_HOVER_COLOR } else { DISMISS_COLOR };
-    let dismiss_x = bar_rect.x + bar_rect.width - DISMISS_BTN_W / 2.0 - cell_w / 2.0;
+    let dismiss_x = bar_rect.x + DISMISS_BTN_W / 2.0 - cell_w / 2.0;
     let dismiss_y = bar_rect.y + (bar_rect.height - cell_h) / 2.0;
     emit_glyph(
         out,
@@ -249,18 +251,18 @@ pub fn hit_test_prompt_bar(
         return None;
     }
 
-    // Dismiss button: rightmost DISMISS_BTN_W pixels of the bar.
-    if mouse_x >= bar_rect.x + bar_rect.width - DISMISS_BTN_W {
+    // Dismiss button: leftmost DISMISS_BTN_W pixels of the bar.
+    if mouse_x <= bar_rect.x + DISMISS_BTN_W {
         return Some(PromptBarHover::DismissButton);
     }
 
-    let first_y = bar_rect.y + TOP_PAD;
-    if mouse_y >= first_y && mouse_y < first_y + cell_height {
+    // First row hit zone includes the top padding area above the text.
+    if mouse_y >= bar_rect.y && mouse_y < bar_rect.y + TOP_PAD + cell_height {
         return Some(PromptBarHover::First);
     }
 
     if pane.prompt_count >= 2 {
-        let latest_y = first_y + cell_height + 3.0;
+        let latest_y = bar_rect.y + TOP_PAD + cell_height + 3.0;
         if mouse_y >= latest_y && mouse_y < latest_y + cell_height {
             return Some(PromptBarHover::Latest);
         }

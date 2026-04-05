@@ -244,6 +244,10 @@ fn apply_config_key(
             config.terminal.hide_codex_hook_logs =
                 value.as_bool().ok_or("hide_codex_hook_logs must be a boolean")?;
         }
+        "terminal.preserve_ai_scrollback" => {
+            config.terminal.preserve_ai_scrollback =
+                value.as_bool().ok_or("preserve_ai_scrollback must be a boolean")?;
+        }
         "terminal.prompt_bar" => {
             config.terminal.prompt_bar = value.as_bool().ok_or("prompt_bar must be a boolean")?;
         }

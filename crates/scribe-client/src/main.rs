@@ -816,6 +816,14 @@ impl ApplicationHandler<UiEvent> for App {
                     window.request_user_attention(None);
                 }
                 if focused {
+                    // Real focus event — clear the X11 overlay debounce so the
+                    // first keystroke isn't suppressed.  Compositor overlays
+                    // don't send Focused events, so the debounce still protects
+                    // against stray keys from overlay dismissal.
+                    #[cfg(target_os = "linux")]
+                    if let Some(guard) = &mut self.x11_focus_guard {
+                        guard.clear_reactivation_debounce();
+                    }
                     self.cursor_visible = true;
                     self.blink_timer = Instant::now();
                     let session = self.focused_session_id();
@@ -1342,6 +1350,11 @@ impl App {
                 self.handle_ai_state_changed(info.session_id, state);
             }
         }
+
+        // Restore prompt bar state from the previous client's snapshot.
+        // SessionList does not carry prompt fields; the snapshot bridges
+        // the gap during hot restart reattach.
+        self.apply_snapshot_prompt_state();
 
         // Build per-session dimensions from the pane grids so the server
         // can resize each session's Term BEFORE taking the snapshot.  This
@@ -2213,6 +2226,60 @@ impl App {
             if self.config.terminal.prompt_bar && (old_lines > 0 || was_dismissed) {
                 self.resize_after_layout_change();
             }
+        }
+    }
+
+    /// Restore prompt bar state from a saved cold restart snapshot during
+    /// hot restart reattach.
+    ///
+    /// The previous client saved a snapshot (including prompt state) before
+    /// exiting, but `SessionList` does not carry prompt fields.  This reads
+    /// the snapshot's `LaunchRecord` entries and copies prompt state to live
+    /// panes matched by `conversation_id`.
+    fn apply_snapshot_prompt_state(&mut self) {
+        let Some((snapshot, _)) = self.restore_store.claim_first_window() else {
+            return;
+        };
+
+        // Build conversation_id → prompt state from the snapshot.
+        let mut prompt_map: HashMap<String, SnapshotPromptState> = HashMap::new();
+        for record in snapshot.launches {
+            if record.prompt_count == 0 {
+                continue;
+            }
+            if let restore_state::LaunchKind::Ai { conversation_id: Some(conv_id), .. } =
+                record.kind
+            {
+                prompt_map.insert(
+                    conv_id,
+                    SnapshotPromptState {
+                        first: record.first_prompt,
+                        latest: record.latest_prompt,
+                        count: record.prompt_count,
+                    },
+                );
+            }
+        }
+
+        if prompt_map.is_empty() {
+            return;
+        }
+
+        let mut restored_any = false;
+        for pane in self.panes.values_mut() {
+            if pane.prompt_count > 0 {
+                continue;
+            }
+            let Some(conv_id) = pane.last_conversation_id.as_deref() else { continue };
+            let Some(state) = prompt_map.remove(conv_id) else { continue };
+            pane.first_prompt = state.first;
+            pane.latest_prompt = state.latest;
+            pane.prompt_count = state.count;
+            restored_any = true;
+        }
+
+        if restored_any && self.config.terminal.prompt_bar {
+            self.resize_after_layout_change();
         }
     }
 
@@ -3194,6 +3261,13 @@ impl App {
 
     /// Translate a keyboard event and forward it to the correct handler.
     fn handle_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        // Reset cursor blink on any key-down so the cursor never stays
+        // hidden mid-blink, regardless of which handler consumes the event.
+        if event.state == winit::event::ElementState::Pressed {
+            self.cursor_visible = true;
+            self.blink_timer = Instant::now();
+        }
+
         // Dismiss context menu on any key press.
         if self.context_menu.is_some()
             && event.state == winit::event::ElementState::Pressed
@@ -3213,11 +3287,6 @@ impl App {
         else {
             return;
         };
-
-        // Reset cursor to visible on any keypress so it doesn't stay hidden mid-blink.
-        self.cursor_visible = true;
-        self.blink_timer = Instant::now();
-        self.request_redraw();
 
         match action {
             KeyAction::Terminal(bytes) => self.handle_terminal_key(bytes),
@@ -4920,18 +4989,17 @@ impl App {
             return;
         }
 
-        // Check for scrollbar click (before divider, before selection).
-        if self.try_start_scrollbar_interaction(x, y) {
-            return;
-        }
-
-        // Check for prompt bar dismiss button click.
+        // Check for prompt bar clicks before scrollbar — the scrollbar hit
+        // zone is 3x its visible width and overlaps the dismiss button area.
         if self.try_dismiss_prompt_bar(x, y) {
             return;
         }
-
-        // Check for prompt bar text click (copies full prompt to clipboard).
         if self.try_copy_prompt_bar_text(x, y) {
+            return;
+        }
+
+        // Check for scrollbar click (before divider, before selection).
+        if self.try_start_scrollbar_interaction(x, y) {
             return;
         }
 
@@ -7465,10 +7533,14 @@ fn build_all_instances(
             );
 
             // Skip rebuilding instances when the pane content and all
-            // rendering context (cursor blink, focus, selection) are unchanged.
+            // rendering context (cursor blink, focus, selection, terminal
+            // cursor visibility) are unchanged.
             let pane_sel = effective_selection.filter(|_| is_focused).copied();
+            let term_cursor_hidden =
+                !pane.term.mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
             let needs_rebuild = pane.content_dirty
                 || pane.last_cursor_visible != Some(pane_cursor_visible)
+                || pane.last_term_cursor_hidden != Some(term_cursor_hidden)
                 || pane.last_was_focused != Some(is_focused)
                 || pane.last_selection != pane_sel;
             let instance_start = all_instances.len();
@@ -7499,6 +7571,7 @@ fn build_all_instances(
                 std::mem::swap(&mut pane.last_instances, &mut instances);
                 pane.content_dirty = false;
                 pane.last_cursor_visible = Some(pane_cursor_visible);
+                pane.last_term_cursor_hidden = Some(term_cursor_hidden);
                 pane.last_was_focused = Some(is_focused);
                 pane.last_selection = pane_sel;
             } else {
@@ -8373,6 +8446,15 @@ fn read_hostname() -> String {
 ///
 /// Uses `libc::localtime_r` (the reentrant POSIX API) for timezone-aware
 /// Number of prompt bar lines for a given prompt count.
+/// Prompt state extracted from a cold restart snapshot for hot restart
+/// reattach.  Used by `apply_snapshot_prompt_state` to avoid a complex
+/// inline tuple type.
+struct SnapshotPromptState {
+    first: Option<String>,
+    latest: Option<String>,
+    count: u32,
+}
+
 fn prompt_bar_line_count(prompt_count: u32) -> u32 {
     match prompt_count {
         0 => 0,
