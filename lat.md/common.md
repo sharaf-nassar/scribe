@@ -28,7 +28,9 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 ### Terminal
 
-[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, AI toggles, indicator height, shell integration, status bar stats, prompt bar settings, and `preserve_ai_scrollback` (blocks `CSI 3 J` from AI sessions when enabled, default `false`).
+[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, AI toggles, indicator height, shell integration, status bar stats, prompt bar, and scroll pin settings.
+
+`scroll_pin` (bool, default `false`) enables split-scroll in AI panes, but only while the pane is in the normal screen buffer; alternate-screen TUIs fall back to the regular live view. `preserve_ai_scrollback` (bool, default `true`) downgrades AI-session `CSI 3 J` scrollback clears into `CSI 2 J` full-screen clears so redraws keep their clean viewport without wiping prior history.
 
 Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (f32, 8–32, default 14), and `prompt_bar_position` ([[crates/scribe-common/src/config.rs#PromptBarPosition]]: Top or Bottom).
 

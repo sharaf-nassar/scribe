@@ -20,6 +20,7 @@ mod scrollbar;
 mod search_overlay;
 mod selection;
 mod splash;
+mod split_scroll;
 mod status_bar;
 mod sys_stats;
 mod tab_bar;
@@ -172,6 +173,9 @@ struct App {
     /// `true` when launched via `--window-id` (explicit new window), which
     /// means cold restart restore must be skipped.
     explicit_new_window: bool,
+    /// `true` when this process was spawned by the cold-restart bootstrap
+    /// client to restore exactly one additional window snapshot.
+    restore_spawn_child: bool,
 
     // Config + Theme
     config: ScribeConfig,
@@ -352,6 +356,9 @@ struct App {
     /// Prompt bar hover state: which pane and which line the cursor is over.
     prompt_bar_hover: Option<(PaneId, prompt_bar::PromptBarHover)>,
 
+    /// Split-scroll jump button hover state.
+    scroll_pin_hover: Option<PaneId>,
+
     /// System hostname for the window-level status bar (fetched once at startup).
     hostname: String,
     /// System resource stats collector for the status bar.
@@ -382,6 +389,7 @@ impl App {
         wgpu_instance: wgpu::Instance,
         proxy: EventLoopProxy<UiEvent>,
         window_id: Option<WindowId>,
+        restore_spawn_child: bool,
     ) -> Self {
         let animation_proxy = proxy.clone();
         let watcher_proxy = proxy.clone();
@@ -407,6 +415,7 @@ impl App {
 
         Self {
             explicit_new_window: window_id.is_some(),
+            restore_spawn_child,
             window_id,
             config,
             theme,
@@ -485,6 +494,7 @@ impl App {
             tab_bar_tooltip_targets: Vec::new(),
             active_tooltip: None,
             prompt_bar_hover: None,
+            scroll_pin_hover: None,
             hostname: read_hostname(),
             sys_stats: sys_stats::SystemStatsCollector::new(),
             pending_pty_bytes: HashMap::new(),
@@ -1015,9 +1025,13 @@ impl App {
 
             if !dims_match {
                 pane.resize_term_only(pane_grid.cols, pane_grid.rows);
+                // A mismatched snapshot means the server-side PTY was not
+                // actually restored at this pane's grid yet, regardless of
+                // what we assumed before AttachSessions.
+                pane.last_sent_grid = None;
             }
 
-            pane.last_sent_grid.is_none() && !dims_match
+            !dims_match
         };
 
         if needs_post_restore_resize {
@@ -1064,10 +1078,17 @@ impl App {
         pane_id: PaneId,
         bytes: &[u8],
     ) -> Option<FeedOutputResult> {
+        let session_id = self.panes.get(&pane_id)?.session_id;
+        let split_scroll_eligibility = SplitScrollEligibility::for_session(
+            session_id,
+            &self.ai_tracker,
+            &self.config.terminal,
+        );
         let (feed, delta, topmost) = {
             let pane = self.panes.get_mut(&pane_id)?;
             let old_history = pane.term.grid().history_size();
             let feed = pane.feed_output(bytes);
+            reconcile_split_scroll(pane, split_scroll_eligibility);
             let new_history = pane.term.grid().history_size();
             #[allow(
                 clippy::cast_possible_wrap,
@@ -1293,7 +1314,7 @@ impl App {
         // Use the layout's own leaf order to determine workspace iteration.
         // When a tree was provided, this preserves the exact spatial order;
         // when falling back, it matches the construction order.
-        let workspace_order = self.window_layout.workspace_ids_in_order();
+        let mut workspace_order = self.window_layout.workspace_ids_in_order();
 
         // -- Add tabs and create panes --------------------------------------
         // Compute a viewport-based fallback geometry for workspaces that
@@ -1308,10 +1329,26 @@ impl App {
         // When a tree was provided, we use session_ids from the tree leaves (which
         // are in the correct tab order). When falling back, groups preserves
         // insertion order which matches server-reported workspace ordering.
-        let tabs_by_ws: Vec<(WorkspaceId, Vec<SessionId>)> = workspace_order
+        let mut tabs_by_ws: Vec<(WorkspaceId, Vec<SessionId>)> = workspace_order
             .iter()
             .filter_map(|&ws_id| groups.get(&ws_id).map(|sids| (ws_id, sids.clone())))
             .collect();
+
+        // If the tree's workspace IDs don't match any session workspace IDs
+        // (e.g. after a hot-reload handoff that re-created workspaces with
+        // new IDs), discard the stale tree and fall back to the session-based
+        // reconstruction so panes can still be created.
+        if tabs_by_ws.is_empty() && !groups.is_empty() {
+            tracing::warn!(
+                "workspace tree IDs do not match session workspace IDs — falling back"
+            );
+            self.reconstruct_fallback(sessions);
+            workspace_order = self.window_layout.workspace_ids_in_order();
+            tabs_by_ws = workspace_order
+                .iter()
+                .filter_map(|&ws_id| groups.get(&ws_id).map(|sids| (ws_id, sids.clone())))
+                .collect();
+        }
 
         // Flatten the per-workspace session lists into `(ws_id, sid, rect, tab_count)`
         // tuples so the per-tab restore logic can be expressed without nesting.
@@ -1607,7 +1644,9 @@ impl App {
         });
         if restored {
             let remaining = claimed.map_or(0, |(_, r)| r);
-            (0..remaining).for_each(|_| spawn_fresh_client_process());
+            if !self.restore_spawn_child {
+                (0..remaining).for_each(|_| spawn_fresh_client_process());
+            }
         } else {
             self.create_initial_session();
         }
@@ -1711,6 +1750,41 @@ impl App {
             row_h,
             badge_cols,
         )
+    }
+
+    /// Return the rects for panes that are currently visible in active tabs.
+    ///
+    /// Hidden tabs keep their last `pane.rect`, so interaction hit-testing must
+    /// derive visibility from the live layout instead of iterating `self.panes`.
+    fn visible_pane_rects(&self) -> Vec<(PaneId, Rect, PaneEdges)> {
+        let Some(gpu) = &self.gpu else { return Vec::new() };
+        let ws_viewport =
+            workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
+        let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
+        collect_expected_pane_rects(&self.window_layout, &ws_rects)
+    }
+
+    /// Compute the on-screen prompt bar rect for a visible pane.
+    fn prompt_bar_rect_for_visible_pane(
+        &self,
+        pane: &Pane,
+        visible_pane: (Rect, PaneEdges),
+        pb_cell_h: f32,
+        pb_at_top: bool,
+    ) -> Option<Rect> {
+        let (pane_rect, pane_edges) = visible_pane;
+        let pbh = pane.prompt_bar_height(pb_cell_h, true);
+        if pbh <= 0.0 {
+            return None;
+        }
+        let tbh = if pane_edges.top {
+            self.tab_bar_height_for(pane.workspace_id, pane_rect)
+        } else {
+            0.0
+        };
+        let bar_y =
+            if pb_at_top { pane_rect.y + tbh } else { pane_rect.y + pane_rect.height - pbh };
+        Some(Rect { x: pane_rect.x, y: bar_y, width: pane_rect.width, height: pbh })
     }
 
     /// Update geometry (rect, grid, Term dimensions) on every pane in the
@@ -1997,6 +2071,7 @@ impl App {
             "AI state changed received"
         );
         self.ai_tracker.update(session_id, ai_state);
+        self.reconcile_split_scroll_for_session(session_id);
 
         if !provider_enabled {
             return;
@@ -2007,6 +2082,18 @@ impl App {
         }
 
         self.request_redraw();
+    }
+
+    /// Clear stale split-scroll state when AI/provider eligibility changes.
+    fn reconcile_split_scroll_for_session(&mut self, session_id: SessionId) {
+        let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
+        let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+        let split_scroll_eligibility = SplitScrollEligibility::for_session(
+            session_id,
+            &self.ai_tracker,
+            &self.config.terminal,
+        );
+        reconcile_split_scroll(pane, split_scroll_eligibility);
     }
 
     fn update_ai_launch_binding(
@@ -2438,6 +2525,12 @@ impl App {
                     line_padding: new_config.appearance.line_padding,
                 };
                 gpu.renderer.rebuild_atlas(&gpu.device, &gpu.queue, &params);
+            }
+        }
+
+        if old.terminal.hide_codex_hook_logs != new_config.terminal.hide_codex_hook_logs {
+            for pane in self.panes.values_mut() {
+                pane.content_dirty = true;
             }
         }
 
@@ -2970,6 +3063,8 @@ impl App {
             focused_ws_rect,
             prompt_bar_enabled: self.config.terminal.prompt_bar,
             prompt_bar_hover: self.prompt_bar_hover,
+            scroll_pin_enabled: self.config.terminal.scroll_pin,
+            scroll_pin_hover: self.scroll_pin_hover,
         };
         let frame_style = FrameStyle {
             border_colors: &border_colors,
@@ -3120,8 +3215,9 @@ impl App {
         // Compute the tooltip anchor outside the render call to avoid nesting.
         let prompt_tooltip_anchor = self.prompt_bar_hover.and_then(|(pid, hover)| {
             let pane = self.panes.get(&pid)?;
+            let (_, pane_rect) = pane_rects.iter().find(|(pane_id, _)| *pane_id == pid)?;
             let full_text = prompt_bar::hovered_prompt_text(pane, hover)?;
-            let effective_width = pane.rect.width - prompt_bar::DISMISS_BTN_W;
+            let effective_width = pane_rect.width - prompt_bar::DISMISS_BTN_W;
             if !prompt_bar::is_prompt_truncated(full_text, effective_width, pb_cell.0) {
                 return None;
             }
@@ -3132,9 +3228,9 @@ impl App {
             };
             let pbh = pane.prompt_bar_height(pb_cell.1, true);
             let bar_y =
-                if pb_at_top { pane.rect.y + tbh } else { pane.rect.y + pane.rect.height - pbh };
+                if pb_at_top { pane_rect.y + tbh } else { pane_rect.y + pane_rect.height - pbh };
             let anchor =
-                layout::Rect { x: pane.rect.x, y: bar_y, width: pane.rect.width, height: pbh };
+                layout::Rect { x: pane_rect.x, y: bar_y, width: pane_rect.width, height: pbh };
             Some((full_text.to_owned(), anchor))
         });
         if let Some((ref text, anchor)) = prompt_tooltip_anchor {
@@ -3307,13 +3403,27 @@ impl App {
         let sid = pane.session_id;
 
         let scrolled_up = pane.term.grid().display_offset() > 0;
-        if scrolled_up {
+
+        // When scroll_pin is active in an AI pane, only snap to bottom on
+        // Enter — other keystrokes are sent without scrolling so the user
+        // can compose prompts while reading scrollback.
+        let is_enter = bytes == b"\r";
+        let split_scroll_eligibility =
+            SplitScrollEligibility::for_session(sid, &self.ai_tracker, &self.config.terminal);
+        let pin_active = split_scroll_eligible(pane, split_scroll_eligibility);
+
+        if scrolled_up && (!pin_active || is_enter) {
+            pane.split_scroll = None;
             pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
             pane.scrollbar_state.on_scroll_action();
             pane.content_dirty = true;
-        }
-        if scrolled_up {
             self.ensure_animation_running();
+        } else if pin_active && !is_enter {
+            // Activate split-scroll if not already active.
+            if pane.split_scroll.is_none() {
+                pane.split_scroll = Some(split_scroll::SplitScrollState::new());
+            }
+            pane.content_dirty = true;
         }
 
         if tx
@@ -4123,6 +4233,7 @@ impl App {
             let Some(pane) = self.panes.get_mut(&focused_pane_id) else { return };
             let offset = pane.term.grid().display_offset();
             if offset > 0 {
+                pane.split_scroll = None;
                 pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
                 pane.scrollbar_state.on_scroll_action();
                 pane.content_dirty = true;
@@ -4228,6 +4339,12 @@ impl App {
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::PageUp);
         pane.scrollbar_state.on_scroll_action();
         pane.content_dirty = true;
+        update_split_scroll(
+            pane,
+            self.config.terminal.scroll_pin,
+            &self.ai_tracker,
+            &self.config.terminal,
+        );
         self.ensure_animation_running();
         self.request_redraw();
     }
@@ -4238,6 +4355,12 @@ impl App {
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::PageDown);
         pane.scrollbar_state.on_scroll_action();
         pane.content_dirty = true;
+        update_split_scroll(
+            pane,
+            self.config.terminal.scroll_pin,
+            &self.ai_tracker,
+            &self.config.terminal,
+        );
         self.ensure_animation_running();
         self.request_redraw();
     }
@@ -4248,6 +4371,12 @@ impl App {
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::Top);
         pane.scrollbar_state.on_scroll_action();
         pane.content_dirty = true;
+        update_split_scroll(
+            pane,
+            self.config.terminal.scroll_pin,
+            &self.ai_tracker,
+            &self.config.terminal,
+        );
         self.ensure_animation_running();
         self.request_redraw();
     }
@@ -4255,6 +4384,7 @@ impl App {
     fn handle_scroll_bottom(&mut self) {
         let Some(tab) = self.window_layout.active_tab() else { return };
         let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
+        pane.split_scroll = None;
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
         pane.scrollbar_state.on_scroll_action();
         pane.content_dirty = true;
@@ -4281,6 +4411,12 @@ impl App {
                 pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
                 pane.scrollbar_state.on_scroll_action();
                 pane.content_dirty = true;
+                update_split_scroll(
+                    pane,
+                    self.config.terminal.scroll_pin,
+                    &self.ai_tracker,
+                    &self.config.terminal,
+                );
                 self.ensure_animation_running();
                 self.request_redraw();
             }
@@ -4306,6 +4442,12 @@ impl App {
                 pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
                 pane.scrollbar_state.on_scroll_action();
                 pane.content_dirty = true;
+                update_split_scroll(
+                    pane,
+                    self.config.terminal.scroll_pin,
+                    &self.ai_tracker,
+                    &self.config.terminal,
+                );
                 self.ensure_animation_running();
                 self.request_redraw();
             }
@@ -4383,6 +4525,12 @@ impl App {
         pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
         pane.scrollbar_state.on_scroll_action();
         pane.content_dirty = true;
+        update_split_scroll(
+            pane,
+            self.config.terminal.scroll_pin,
+            &self.ai_tracker,
+            &self.config.terminal,
+        );
         self.ensure_animation_running();
         self.request_redraw();
     }
@@ -4998,6 +5146,11 @@ impl App {
             return;
         }
 
+        // Check for split-scroll jump-to-bottom button.
+        if self.try_scroll_pin_jump(x, y) {
+            return;
+        }
+
         // Check for scrollbar click (before divider, before selection).
         if self.try_start_scrollbar_interaction(x, y) {
             return;
@@ -5195,6 +5348,12 @@ impl App {
                 pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
                 pane.scrollbar_state.on_scroll_action();
                 pane.content_dirty = true;
+                update_split_scroll(
+                    pane,
+                    self.config.terminal.scroll_pin,
+                    &self.ai_tracker,
+                    &self.config.terminal,
+                );
             }
         }
 
@@ -5234,6 +5393,12 @@ impl App {
             let Some(pane) = self.panes.get_mut(&pane_id) else { return };
             pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
             pane.content_dirty = true;
+            update_split_scroll(
+                pane,
+                self.config.terminal.scroll_pin,
+                &self.ai_tracker,
+                &self.config.terminal,
+            );
         }
         self.request_redraw();
     }
@@ -5406,6 +5571,9 @@ impl App {
         // Prompt bar hover detection.
         self.update_prompt_bar_hover(x, y);
 
+        // Split-scroll jump button hover detection.
+        self.update_scroll_pin_hover(x, y);
+
         // Update tooltip state: check status bar targets (Above) then tab targets (Below).
         self.update_active_tooltip(x, y);
     }
@@ -5463,29 +5631,25 @@ impl App {
         let pb_at_top = self.config.terminal.prompt_bar_position
             == scribe_common::config::PromptBarPosition::Top;
 
-        // Iterate pane rects to find the pane whose prompt bar the cursor is over.
-        for (pane_id, pane) in &self.panes {
+        // Iterate the visible pane layout so inactive tabs cannot leak stale
+        // prompt bars into hover state.
+        for (pane_id, pane_rect, pane_edges) in self.visible_pane_rects() {
+            let Some(pane) = self.panes.get(&pane_id) else { continue };
             if pane.prompt_count == 0 || pane.prompt_bar_dismissed {
                 continue;
             }
-            let pbh = pane.prompt_bar_height(pb_cell_h, true);
-            if pbh <= 0.0 {
+            let Some(bar_rect) = self.prompt_bar_rect_for_visible_pane(
+                pane,
+                (pane_rect, pane_edges),
+                pb_cell_h,
+                pb_at_top,
+            ) else {
                 continue;
-            }
-            // Compute effective tab bar height for this pane.
-            let tbh = if pane.edges.top {
-                self.tab_bar_height_for(pane.workspace_id, pane.rect)
-            } else {
-                0.0
             };
-            let bar_y =
-                if pb_at_top { pane.rect.y + tbh } else { pane.rect.y + pane.rect.height - pbh };
-            let bar_rect =
-                layout::Rect { x: pane.rect.x, y: bar_y, width: pane.rect.width, height: pbh };
             if let Some(hover) =
                 prompt_bar::hit_test_prompt_bar(pane, bar_rect, pb_cell_h, mouse_x, mouse_y)
             {
-                self.prompt_bar_hover = Some((*pane_id, hover));
+                self.prompt_bar_hover = Some((pane_id, hover));
                 break;
             }
         }
@@ -5493,6 +5657,134 @@ impl App {
         if self.prompt_bar_hover != old_hover {
             self.request_redraw();
         }
+    }
+
+    /// Update scroll-pin jump button hover state.
+    fn update_scroll_pin_hover(&mut self, mouse_x: f32, mouse_y: f32) {
+        let old = self.scroll_pin_hover;
+        self.scroll_pin_hover = None;
+
+        if !self.config.terminal.scroll_pin {
+            if old.is_some() {
+                self.request_redraw();
+            }
+            return;
+        }
+
+        let Some(gpu) = &self.gpu else {
+            if old.is_some() {
+                self.request_redraw();
+            }
+            return;
+        };
+        let cell_size = gpu.renderer.cell_size();
+        let cell_h = cell_size.height;
+
+        let pb_font_scale =
+            self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+        let pb_cell_h = cell_h * pb_font_scale;
+        let pb_at_top = self.config.terminal.prompt_bar_position
+            == scribe_common::config::PromptBarPosition::Top;
+
+        for (pane_id, pane_rect, pane_edges) in self.visible_pane_rects() {
+            let Some(pane) = self.panes.get(&pane_id) else { continue };
+            let Some(ss) = &pane.split_scroll else { continue };
+            if ss.pin_height <= 0.0 {
+                continue;
+            }
+            let tbh = if pane_edges.top {
+                self.tab_bar_height_for(pane.workspace_id, pane_rect)
+            } else {
+                0.0
+            };
+            let pbh = pane.prompt_bar_height(pb_cell_h, self.config.terminal.prompt_bar);
+            let content_pbh = if pb_at_top { pbh } else { 0.0 };
+            let content_offset =
+                pane.content_offset(tbh, content_pbh, &self.config.appearance.content_padding);
+            let screen_lines = pane.term.grid().screen_lines();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "screen_lines is bounded terminal dimension"
+            )]
+            let content_h = screen_lines as f32 * cell_h;
+            let geo = split_scroll::compute_geometry(
+                layout::Rect {
+                    x: content_offset.0,
+                    y: content_offset.1,
+                    width: f32::from(pane.grid.cols) * cell_size.width,
+                    height: content_h,
+                },
+                ss.pin_height,
+            );
+            if split_scroll::hit_test_jump_btn(&geo, mouse_x, mouse_y) {
+                self.scroll_pin_hover = Some(pane_id);
+                break;
+            }
+        }
+
+        if self.scroll_pin_hover != old {
+            self.request_redraw();
+        }
+    }
+
+    /// Jump to bottom if the click lands on the split-scroll jump button.
+    fn try_scroll_pin_jump(&mut self, x: f32, y: f32) -> bool {
+        if !self.config.terminal.scroll_pin {
+            return false;
+        }
+        let Some(gpu) = &self.gpu else { return false };
+        let cell_size = gpu.renderer.cell_size();
+        let cell_h = cell_size.height;
+
+        let pb_font_scale =
+            self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+        let pb_cell_h = cell_h * pb_font_scale;
+        let pb_at_top = self.config.terminal.prompt_bar_position
+            == scribe_common::config::PromptBarPosition::Top;
+
+        let target =
+            self.visible_pane_rects().into_iter().find_map(|(pane_id, pane_rect, pane_edges)| {
+                let pane = self.panes.get(&pane_id)?;
+                let ss = pane.split_scroll.as_ref()?;
+                if ss.pin_height <= 0.0 {
+                    return None;
+                }
+                let tbh = if pane_edges.top {
+                    self.tab_bar_height_for(pane.workspace_id, pane_rect)
+                } else {
+                    0.0
+                };
+                let pbh = pane.prompt_bar_height(pb_cell_h, self.config.terminal.prompt_bar);
+                let content_pbh = if pb_at_top { pbh } else { 0.0 };
+                let content_offset =
+                    pane.content_offset(tbh, content_pbh, &self.config.appearance.content_padding);
+                let screen_lines = pane.term.grid().screen_lines();
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "screen_lines is bounded terminal dimension"
+                )]
+                let content_h = screen_lines as f32 * cell_h;
+                let geo = split_scroll::compute_geometry(
+                    layout::Rect {
+                        x: content_offset.0,
+                        y: content_offset.1,
+                        width: f32::from(pane.grid.cols) * cell_size.width,
+                        height: content_h,
+                    },
+                    ss.pin_height,
+                );
+                split_scroll::hit_test_jump_btn(&geo, x, y).then_some(pane_id)
+            });
+        let Some(pane_id) = target else { return false };
+        let Some(pane) = self.panes.get_mut(&pane_id) else { return false };
+        pane.split_scroll = None;
+        pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+        pane.scrollbar_state.on_scroll_action();
+        pane.content_dirty = true;
+        self.scroll_pin_hover = None;
+        self.ensure_animation_running();
+        self.request_redraw();
+        true
     }
 
     /// Dismiss the prompt bar if the click lands on the × button.
@@ -5510,26 +5802,25 @@ impl App {
         let pb_at_top = self.config.terminal.prompt_bar_position
             == scribe_common::config::PromptBarPosition::Top;
 
-        let target = self.panes.iter().find_map(|(pane_id, pane)| {
-            if pane.prompt_count == 0 || pane.prompt_bar_dismissed {
-                return None;
-            }
-            let pbh = pane.prompt_bar_height(pb_cell_h, true);
-            if pbh <= 0.0 {
-                return None;
-            }
-            let tbh = if pane.edges.top {
-                self.tab_bar_height_for(pane.workspace_id, pane.rect)
-            } else {
-                0.0
-            };
-            let bar_y =
-                if pb_at_top { pane.rect.y + tbh } else { pane.rect.y + pane.rect.height - pbh };
-            let bar_rect =
-                layout::Rect { x: pane.rect.x, y: bar_y, width: pane.rect.width, height: pbh };
-            let hover = prompt_bar::hit_test_prompt_bar(pane, bar_rect, pb_cell_h, x, y)?;
-            if hover == prompt_bar::PromptBarHover::DismissButton { Some(*pane_id) } else { None }
-        });
+        let target =
+            self.visible_pane_rects().into_iter().find_map(|(pane_id, pane_rect, pane_edges)| {
+                let pane = self.panes.get(&pane_id)?;
+                if pane.prompt_count == 0 || pane.prompt_bar_dismissed {
+                    return None;
+                }
+                let bar_rect = self.prompt_bar_rect_for_visible_pane(
+                    pane,
+                    (pane_rect, pane_edges),
+                    pb_cell_h,
+                    pb_at_top,
+                )?;
+                let hover = prompt_bar::hit_test_prompt_bar(pane, bar_rect, pb_cell_h, x, y)?;
+                if hover == prompt_bar::PromptBarHover::DismissButton {
+                    Some(pane_id)
+                } else {
+                    None
+                }
+            });
 
         let Some(pane_id) = target else { return false };
         if let Some(pane) = self.panes.get_mut(&pane_id) {
@@ -5556,26 +5847,21 @@ impl App {
         let pb_at_top = self.config.terminal.prompt_bar_position
             == scribe_common::config::PromptBarPosition::Top;
 
-        let text = self.panes.iter().find_map(|(_, pane)| {
-            if pane.prompt_count == 0 || pane.prompt_bar_dismissed {
-                return None;
-            }
-            let pbh = pane.prompt_bar_height(pb_cell_h, true);
-            if pbh <= 0.0 {
-                return None;
-            }
-            let tbh = if pane.edges.top {
-                self.tab_bar_height_for(pane.workspace_id, pane.rect)
-            } else {
-                0.0
-            };
-            let bar_y =
-                if pb_at_top { pane.rect.y + tbh } else { pane.rect.y + pane.rect.height - pbh };
-            let bar_rect =
-                layout::Rect { x: pane.rect.x, y: bar_y, width: pane.rect.width, height: pbh };
-            let hover = prompt_bar::hit_test_prompt_bar(pane, bar_rect, pb_cell_h, x, y)?;
-            prompt_bar::hovered_prompt_text(pane, hover).map(str::to_owned)
-        });
+        let text =
+            self.visible_pane_rects().into_iter().find_map(|(pane_id, pane_rect, pane_edges)| {
+                let pane = self.panes.get(&pane_id)?;
+                if pane.prompt_count == 0 || pane.prompt_bar_dismissed {
+                    return None;
+                }
+                let bar_rect = self.prompt_bar_rect_for_visible_pane(
+                    pane,
+                    (pane_rect, pane_edges),
+                    pb_cell_h,
+                    pb_at_top,
+                )?;
+                let hover = prompt_bar::hit_test_prompt_bar(pane, bar_rect, pb_cell_h, x, y)?;
+                prompt_bar::hovered_prompt_text(pane, hover).map(str::to_owned)
+            });
 
         let Some(text) = text else { return false };
         if let Some(cb) = self.clipboard.as_mut() {
@@ -5985,6 +6271,7 @@ impl App {
             let Some(pane) = self.panes.get_mut(&focused_pane_id) else { return };
             let offset = pane.term.grid().display_offset();
             if offset > 0 {
+                pane.split_scroll = None;
                 pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
                 pane.scrollbar_state.on_scroll_action();
                 pane.content_dirty = true;
@@ -7185,6 +7472,8 @@ impl App {
             restore_replay::snapshot_window_restore(wid, &self.window_layout, &self.panes);
         if let Err(e) = self.restore_store.save_window(&snapshot) {
             tracing::warn!("failed to persist restore state: {e}");
+            self.restore_save_pending = None;
+            return;
         }
         if let Err(e) = self.restore_store.upsert_index(wid) {
             tracing::warn!("failed to update restore index: {e}");
@@ -7409,6 +7698,10 @@ type TabUpdateTargets = Vec<(WorkspaceId, layout::Rect)>;
 type TabTooltipTargets = Vec<tooltip::TooltipAnchor>;
 
 /// Layout and focus state passed to [`build_all_instances`].
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "layout state needs separate toggles and hover variants"
+)]
 struct FrameLayout<'a> {
     pane_rects: &'a [(PaneId, Rect)],
     dividers: &'a [divider::Divider],
@@ -7422,6 +7715,8 @@ struct FrameLayout<'a> {
     focused_ws_rect: Option<Rect>,
     prompt_bar_enabled: bool,
     prompt_bar_hover: Option<(PaneId, prompt_bar::PromptBarHover)>,
+    scroll_pin_enabled: bool,
+    scroll_pin_hover: Option<PaneId>,
 }
 
 /// Colors and visual styling passed to [`build_all_instances`].
@@ -7453,6 +7748,81 @@ struct FrameInteraction<'a> {
     update_available: Option<&'a str>,
     /// Current update progress state. `None` when idle.
     update_progress: Option<&'a UpdateProgressState>,
+}
+
+#[derive(Clone, Copy)]
+struct SplitScrollEligibility {
+    scroll_pin_enabled: bool,
+    ai_provider_enabled: bool,
+}
+
+impl SplitScrollEligibility {
+    fn for_session(
+        session_id: SessionId,
+        ai_tracker: &ai_indicator::AiStateTracker,
+        terminal_config: &scribe_common::config::TerminalConfig,
+    ) -> Self {
+        Self {
+            scroll_pin_enabled: terminal_config.scroll_pin,
+            ai_provider_enabled: split_scroll_provider_enabled(
+                session_id,
+                ai_tracker,
+                terminal_config,
+            ),
+        }
+    }
+
+    fn allows_split_scroll(self) -> bool {
+        self.scroll_pin_enabled && self.ai_provider_enabled
+    }
+}
+
+fn split_scroll_provider_enabled(
+    session_id: SessionId,
+    ai_tracker: &ai_indicator::AiStateTracker,
+    terminal_config: &scribe_common::config::TerminalConfig,
+) -> bool {
+    ai_tracker
+        .provider_for_session(session_id)
+        .is_some_and(|p| terminal_config.ai_provider_enabled(p))
+}
+
+/// Split-scroll only applies to AI panes in the normal screen buffer.
+fn split_scroll_eligible(pane: &pane::Pane, eligibility: SplitScrollEligibility) -> bool {
+    eligibility.allows_split_scroll()
+        && pane.term.grid().display_offset() > 0
+        && !pane.term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN)
+}
+
+/// Activate or deactivate split-scroll for a pane after a scroll operation.
+fn update_split_scroll(
+    pane: &mut pane::Pane,
+    scroll_pin_cfg: bool,
+    ai_tracker: &ai_indicator::AiStateTracker,
+    terminal_config: &scribe_common::config::TerminalConfig,
+) {
+    let eligibility = SplitScrollEligibility {
+        scroll_pin_enabled: scroll_pin_cfg,
+        ai_provider_enabled: split_scroll_provider_enabled(
+            pane.session_id,
+            ai_tracker,
+            terminal_config,
+        ),
+    };
+    if split_scroll_eligible(pane, eligibility) {
+        if pane.split_scroll.is_none() {
+            pane.split_scroll = Some(split_scroll::SplitScrollState::new());
+        }
+    } else {
+        pane.split_scroll = None;
+    }
+}
+
+/// Clear stale split-scroll state after output or AI mode changes.
+fn reconcile_split_scroll(pane: &mut pane::Pane, eligibility: SplitScrollEligibility) {
+    if !split_scroll_eligible(pane, eligibility) {
+        pane.split_scroll = None;
+    }
 }
 
 #[allow(
@@ -7538,37 +7908,141 @@ fn build_all_instances(
             let pane_sel = effective_selection.filter(|_| is_focused).copied();
             let term_cursor_hidden =
                 !pane.term.mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
+            let split_active = pane.split_scroll.is_some() && layout.scroll_pin_enabled;
             let needs_rebuild = pane.content_dirty
                 || pane.last_cursor_visible != Some(pane_cursor_visible)
                 || pane.last_term_cursor_hidden != Some(term_cursor_hidden)
                 || pane.last_was_focused != Some(is_focused)
-                || pane.last_selection != pane_sel;
+                || pane.last_selection != pane_sel
+                || split_active; // always rebuild when split-scroll is active
             let instance_start = all_instances.len();
 
             if needs_rebuild {
-                let mut instances = renderer.build_instances_at(
-                    device,
-                    queue,
-                    &mut pane.term,
-                    offset,
-                    pane_cursor_visible,
-                );
-                if let Some(sel) = effective_selection.filter(|_| is_focused) {
-                    let disp_off = pane.term.grid().display_offset();
-                    apply_selection_highlight(
-                        &mut instances,
-                        offset,
-                        layout.cell_size,
-                        sel,
-                        selection_colors,
-                        disp_off,
+                if split_active {
+                    // --- Split-scroll dual render ---
+                    // Compute pin height from cursor position.
+                    #[allow(clippy::cast_sign_loss, reason = "cursor line bounded by grid height")]
+                    let cursor_line = pane.term.grid().cursor.point.line.0.max(0) as usize;
+                    let screen_lines = pane.term.grid().screen_lines();
+                    let base_pin_rows = split_scroll::compute_pin_rows(cursor_line, screen_lines);
+                    let pin_rows = split_scroll::align_pin_rows_to_logical_lines(
+                        &pane.term,
+                        base_pin_rows,
+                        screen_lines,
                     );
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "pin_rows is bounded terminal dimension"
+                    )]
+                    let pin_h = pin_rows as f32 * layout.cell_size.1;
+
+                    // Update stored pin height.
+                    if let Some(ss) = &mut pane.split_scroll {
+                        ss.pin_height = pin_h;
+                    }
+
+                    // Content area geometry.
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "screen_lines is bounded terminal dimension"
+                    )]
+                    let content_h = screen_lines as f32 * layout.cell_size.1;
+                    let content_y = offset.1;
+                    let geo = split_scroll::compute_geometry(
+                        layout::Rect {
+                            x: offset.0,
+                            y: content_y,
+                            width: f32::from(pane.grid.cols) * layout.cell_size.0,
+                            height: content_h,
+                        },
+                        pin_h,
+                    );
+
+                    // 1. Render scrollback (top portion) at current display_offset.
+                    let top_instances = renderer.build_instances_at(
+                        device,
+                        queue,
+                        &mut pane.term,
+                        offset,
+                        false, // no cursor in scrollback
+                    );
+                    let mut top_filtered = split_scroll::filter_instances_by_y(
+                        &top_instances,
+                        geo.top_rect.y,
+                        geo.top_rect.y + geo.top_rect.height,
+                    );
+                    if dim {
+                        dim_instances(&mut top_filtered);
+                    }
+
+                    // 2. Render live terminal (bottom portion) at display_offset=0.
+                    let saved_offset = pane.term.grid().display_offset();
+                    pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+                    let live_instances = renderer.build_instances_at(
+                        device,
+                        queue,
+                        &mut pane.term,
+                        offset,
+                        pane_cursor_visible,
+                    );
+                    // Restore scroll position.
+                    #[allow(
+                        clippy::cast_possible_wrap,
+                        clippy::cast_possible_truncation,
+                        reason = "display offset bounded by scrollback_lines ≤ 100_000, fits i32"
+                    )]
+                    {
+                        pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(
+                            saved_offset as i32,
+                        ));
+                    }
+                    let mut bottom_filtered = split_scroll::filter_instances_by_y(
+                        &live_instances,
+                        geo.bottom_rect.y,
+                        geo.bottom_rect.y + geo.bottom_rect.height,
+                    );
+                    if dim {
+                        dim_instances(&mut bottom_filtered);
+                    }
+
+                    // Background fill for the bottom portion (covers scrollback bleed).
+                    push_solid_rect_raw(&mut all_instances, geo.bottom_rect, default_bg);
+
+                    // Combine.
+                    all_instances.extend_from_slice(&top_filtered);
+                    all_instances.extend_from_slice(&bottom_filtered);
+
+                    // Chrome (divider + jump button) rendered later in the chrome pass.
+
+                    let mut composite = top_filtered;
+                    composite.extend_from_slice(&bottom_filtered);
+                    std::mem::swap(&mut pane.last_instances, &mut composite);
+                } else {
+                    // --- Normal single render ---
+                    let mut instances = renderer.build_instances_at(
+                        device,
+                        queue,
+                        &mut pane.term,
+                        offset,
+                        pane_cursor_visible,
+                    );
+                    if let Some(sel) = effective_selection.filter(|_| is_focused) {
+                        let disp_off = pane.term.grid().display_offset();
+                        apply_selection_highlight(
+                            &mut instances,
+                            offset,
+                            layout.cell_size,
+                            sel,
+                            selection_colors,
+                            disp_off,
+                        );
+                    }
+                    if dim {
+                        dim_instances(&mut instances);
+                    }
+                    all_instances.extend_from_slice(&instances);
+                    std::mem::swap(&mut pane.last_instances, &mut instances);
                 }
-                if dim {
-                    dim_instances(&mut instances);
-                }
-                all_instances.extend_from_slice(&instances);
-                std::mem::swap(&mut pane.last_instances, &mut instances);
                 pane.content_dirty = false;
                 pane.last_cursor_visible = Some(pane_cursor_visible);
                 pane.last_term_cursor_hidden = Some(term_cursor_hidden);
@@ -7578,7 +8052,7 @@ fn build_all_instances(
                 all_instances.extend_from_slice(&pane.last_instances);
             }
 
-            if is_focused && !interaction.search_matches.is_empty() {
+            if is_focused && !interaction.search_matches.is_empty() && !split_active {
                 let Some(search_instances) = all_instances.get_mut(instance_start..) else {
                     continue;
                 };
@@ -7749,6 +8223,46 @@ fn build_all_instances(
         }
     }
 
+    // Split-scroll chrome (divider + jump-to-bottom button).
+    for (pane_id, _) in layout.pane_rects {
+        if let Some(pane) = panes.get(pane_id) {
+            let Some(ss) = &pane.split_scroll else { continue };
+            if !layout.scroll_pin_enabled || ss.pin_height <= 0.0 {
+                continue;
+            }
+            let tbh =
+                pane_tab_bar_h(pane.workspace_id, &ws_tab_bar_heights, layout.ws_tab_bar_data);
+            let pbh =
+                pane.prompt_bar_height(layout.prompt_bar_cell_size.1, layout.prompt_bar_enabled);
+            let content_pbh = if layout.prompt_bar_at_top { pbh } else { 0.0 };
+            let content_offset = pane.content_offset(tbh, content_pbh, layout.padding);
+            let screen_lines = pane.term.grid().screen_lines();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "screen_lines is bounded terminal dimension"
+            )]
+            let content_h = screen_lines as f32 * layout.cell_size.1;
+            let geo = split_scroll::compute_geometry(
+                layout::Rect {
+                    x: content_offset.0,
+                    y: content_offset.1,
+                    width: f32::from(pane.grid.cols) * layout.cell_size.0,
+                    height: content_h,
+                },
+                ss.pin_height,
+            );
+            let jump_hovered = layout.scroll_pin_hover == Some(*pane_id);
+            split_scroll::render_chrome(
+                &mut all_instances,
+                &geo,
+                style.divider_color,
+                jump_hovered,
+                style.accent_color,
+                &mut |ch| renderer.resolve_glyph(device, queue, ch),
+            );
+        }
+    }
+
     // Pane dividers.
     divider::build_divider_instances(&mut all_instances, layout.dividers, style.divider_color);
     // Workspace dividers — rendered directly as single quads.
@@ -7907,6 +8421,24 @@ fn push_pane_bg_fill(
         uv_max: [0.0, 0.0],
         fg_color: bg,
         bg_color: bg,
+        corner_radius: 0.0,
+        _pad: 0.0,
+    });
+}
+
+/// Push a solid-color rectangle (no glyph, no corner radius).
+fn push_solid_rect_raw(
+    out: &mut Vec<scribe_renderer::types::CellInstance>,
+    rect: layout::Rect,
+    color: [f32; 4],
+) {
+    out.push(scribe_renderer::types::CellInstance {
+        pos: [rect.x, rect.y],
+        size: [rect.width, rect.height],
+        uv_min: [0.0, 0.0],
+        uv_max: [0.0, 0.0],
+        fg_color: color,
+        bg_color: color,
         corner_radius: 0.0,
         _pad: 0.0,
     });
@@ -8919,12 +9451,13 @@ fn spawn_client_process(window_id: WindowId) {
 
 /// Spawn a fresh client process (no `--window-id`) for cold restart
 /// multi-window restore.  The spawned process will connect, receive a new
-/// window ID, and claim the next entry from the restore index.
+/// window ID, and claim exactly one entry from the restore index without
+/// spawning further restore children.
 fn spawn_fresh_client_process() {
     let exe = std::env::current_exe()
         .unwrap_or_else(|_| std::path::PathBuf::from(current_identity().client_binary_name()));
 
-    match std::process::Command::new(&exe).spawn() {
+    match std::process::Command::new(&exe).arg("--restore-child").spawn() {
         Ok(child) => {
             tracing::info!(pid = child.id(), "spawned restore window process");
         }
@@ -8947,6 +9480,10 @@ fn parse_window_id() -> Option<WindowId> {
         i += 1;
     }
     None
+}
+
+fn parse_restore_spawn_child() -> bool {
+    std::env::args().any(|arg| arg == "--restore-child")
 }
 
 /// Walk a `WorkspaceTreeNode` tree and collect every (`SessionId` → `PaneTreeNode`)
@@ -9002,7 +9539,8 @@ fn main() {
     });
 
     let window_id = parse_window_id();
-    let mut app = App::new(wgpu_instance, proxy, window_id);
+    let restore_spawn_child = parse_restore_spawn_child();
+    let mut app = App::new(wgpu_instance, proxy, window_id, restore_spawn_child);
 
     event_loop.run_app(&mut app).expect("event loop exited with error");
 }

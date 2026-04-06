@@ -78,21 +78,21 @@ Normal session panes now receive the raw `CSI ? 2026 h/l` markers end to end, so
 
 ## ED 3 Filter
 
-The [[crates/scribe-pty/src/ed3_filter.rs#Ed3Filter]] strips CSI ED 3 (`\x1b[3J`) from AI PTY output when `preserve_ai_scrollback` is enabled (default off).
+The [[crates/scribe-pty/src/ed3_filter.rs#Ed3Filter]] rewrites CSI ED 3 (`\x1b[3J`) to CSI ED 2 (`\x1b[2J`) for AI PTY output when `preserve_ai_scrollback` is enabled (default on).
 
-Only runs for Claude Code / Codex Code sessions when `preserve_ai_scrollback` is `true`. Regular shell sessions are never filtered. Disabled by default to match standard terminal behaviour and prevent duplicate scrollback content.
+Only runs for Claude Code / Codex Code sessions when `preserve_ai_scrollback` is `true`. Regular shell sessions are never filtered. Enabled by default so AI sessions keep earlier transcript history unless the user opts back into standard terminal scrollback clearing.
 
 ### State Machine
 
 Four states track partial matches of the `\x1b[3J` sequence across `filter()` calls.
 
-On a complete match the sequence is silently dropped (no replacement bytes emitted). A fast path skips allocation when no ESC byte is present. Pending bytes stay in state until the next call or `flush()`.
+On a complete match the filter emits `\x1b[2J`, preserving the visible clear-screen repaint while preventing the scrollback wipe. A fast path skips allocation when no ESC byte is present. Pending bytes stay in state until the next call or `flush()`.
 
 ## Codex Hook Log Filter
 
 The [[crates/scribe-pty/src/codex_hook_log_filter.rs#CodexHookLogFilter]] suppresses contiguous Codex hook log blocks while failing open if a block never closes.
 
-When the setting is enabled, the filter recognizes the current documented Codex hook events (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`), including bullet-prefixed `Running ... hook: <status>` start lines. It buffers the full contiguous hook block until the matching `hook (completed|failed|blocked|stopped)` trailer arrives, removes the hook boilerplate and the first blank spacer line after it, and still releases buffered bytes unchanged if Codex never emits a trailer. Prefix matching requires at least one visible character — empty visible content (from escape-only line prefixes) does not match, preventing ANSI erase/cursor sequences from being held indefinitely.
+When the setting is enabled, the filter recognizes the current documented Codex hook events (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`) in both legacy `Running ... hook` / `hook (...)` blocks and the current ANSI-styled `hook: <event>` / `hook: <event> Completed` form. It buffers the full contiguous hook block until the matching trailer arrives, removes the hook boilerplate and only the first raw whitespace-only spacer line after it, and still releases buffered bytes unchanged if Codex never emits a trailer. ANSI-painted blank redraw lines are preserved so Codex prompt backgrounds and other post-hook paint operations survive filtering. Prefix matching waits for complete visible text through multibyte bullets and bounded ANSI styling prefixes, and if interactive Codex redraws a completed hook row without a trailing newline, the filter splits at the last visible hook byte so later cursor-motion and prompt repaint control sequences stay in the stream instead of disappearing with the hidden hook line. When a stripped hook prefix had already established non-default SGR colors or attributes, the kept tail replays those active styles before the remaining bytes so inherited prompt backgrounds do not drop back to the terminal default. For VTE synchronized updates, it trims hook-only rows or hook prefixes from the buffered sync block itself but keeps control-only and ANSI-painted blank rows, so prompt-background repaint tails survive even when Codex redraws the completion row and the follow-up prompt fill in one atomic commit.
 
 ## Event Listener
 

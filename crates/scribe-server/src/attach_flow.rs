@@ -25,6 +25,7 @@ struct AttachEntry {
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     pty_raw_fd: RawFd,
     target_dims: Option<TerminalSize>,
+    has_handoff_snapshot: bool,
     title: String,
     codex_task_label: Option<String>,
     cwd: Option<std::path::PathBuf>,
@@ -42,6 +43,7 @@ impl From<AttachSessionData> for AttachEntry {
             term: data.term,
             pty_raw_fd: data.pty_raw_fd,
             target_dims: data.target_dims,
+            has_handoff_snapshot: data.has_handoff_snapshot,
             title: data.title,
             codex_task_label: data.codex_task_label,
             cwd: data.cwd,
@@ -116,7 +118,12 @@ async fn send_attach_replay(
 ) {
     let session_id = entry.session_id;
 
-    if let Some(size) = entry.target_dims {
+    if let Some(size) = entry.target_dims
+        && !entry.has_handoff_snapshot
+    {
+        // Handoff-restored sessions replay the preserved pre-upgrade snapshot
+        // first; resizing before that replay can make a live foreground
+        // process redraw and overwrite the restored history immediately.
         if size.has_grid() {
             resize_term(&entry.term, size.cols, size.rows).await;
             if let Err(error) = set_pty_winsize(entry.pty_raw_fd, size) {
@@ -318,6 +325,7 @@ mod tests {
             term: Arc::new(Mutex::new(make_term(session_id))),
             pty_raw_fd: -1,
             target_dims: None,
+            has_handoff_snapshot: false,
             title: String::from("sample"),
             codex_task_label: Some(String::from("task")),
             cwd: Some(std::env::temp_dir()),

@@ -25,7 +25,7 @@ impl Default for ScribeConfig {
             scrollback_lines: 10_000,
             shell_integration_enabled: true,
             hide_codex_hook_logs: false,
-            preserve_ai_scrollback: false,
+            preserve_ai_scrollback: true,
             update: UpdateConfig::default(),
         }
     }

@@ -287,27 +287,31 @@ impl RestoreStore {
     pub fn claim_first_window(&self) -> Option<(WindowRestoreState, usize)> {
         let _lock = self.acquire_index_lock().ok()?;
         let mut index = self.read_index_for_update().ok()?;
+        let mut claimed: Option<WindowRestoreState> = None;
+        let mut remaining_valid = Vec::with_capacity(index.windows.len());
 
-        // Skip corrupted entries until we find a loadable window or exhaust
-        // the index.
-        while let Some(&window_id) = index.windows.first() {
-            index.windows.remove(0);
-            if let Some(state) = self.load_window(window_id) {
-                self.remove_window(window_id);
-                let remaining = index.windows.len();
-                index.updated_at_ms = unix_time_ms();
-                drop(self.save_index(&index));
-                return Some((state, remaining));
+        for window_id in index.windows.drain(..) {
+            match self.load_window(window_id) {
+                Some(state) if claimed.is_none() => {
+                    self.remove_window(window_id);
+                    claimed = Some(state);
+                }
+                Some(_) => {
+                    remaining_valid.push(window_id);
+                }
+                None => {
+                    // File missing or corrupted — clean up and drop the stale index entry.
+                    self.remove_window(window_id);
+                    tracing::warn!(%window_id, "skipping unreadable restore entry");
+                }
             }
-            // File missing or corrupted — clean up and try next.
-            self.remove_window(window_id);
-            tracing::warn!(%window_id, "skipping unreadable restore entry");
         }
 
-        // All entries were corrupted — save the now-empty index.
+        index.windows = remaining_valid;
         index.updated_at_ms = unix_time_ms();
         drop(self.save_index(&index));
-        None
+
+        claimed.map(|state| (state, index.windows.len()))
     }
 
     /// Remove all restore state: the index and every per-window file.

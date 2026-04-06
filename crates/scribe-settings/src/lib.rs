@@ -378,6 +378,9 @@ pub fn run_settings_window(
 enum TaoUserEvent {
     /// Another instance sent a "focus" command via the singleton socket.
     FocusWindow,
+    /// App shutdown requested over the singleton socket; preserve open state
+    /// so a fresh Scribe launch can restore the settings window.
+    QuitWindow,
     /// A termination signal (SIGTERM/SIGINT) was received.
     Terminate,
 }
@@ -431,7 +434,7 @@ fn spawn_singleton_listener(
             }
             match singleton::read_command(&stream).as_deref() {
                 Some("focus") => drop(proxy.send_event(TaoUserEvent::FocusWindow)),
-                Some("quit") => drop(proxy.send_event(TaoUserEvent::Terminate)),
+                Some("quit") => drop(proxy.send_event(TaoUserEvent::QuitWindow)),
                 _ => {}
             }
         }
@@ -547,6 +550,9 @@ pub fn run_settings_window(
         *control_flow = ControlFlow::Wait;
         match event {
             Event::UserEvent(TaoUserEvent::FocusWindow) => window.set_focus(),
+            Event::UserEvent(TaoUserEvent::QuitWindow) => {
+                *control_flow = ControlFlow::Exit;
+            }
             Event::WindowEvent {
                 event: WindowEvent::ModifiersChanged(new_mods),
                 window_id: id,

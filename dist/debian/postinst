@@ -205,6 +205,48 @@ restart_singleton_binary() {
     launch_user_binary "$binary"
 }
 
+wait_for_pid_exit() {
+    local pid="$1"
+    local attempts="${2:-5}"
+    local remaining="$attempts"
+
+    while [ "$remaining" -gt 0 ]; do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.2
+        remaining=$((remaining - 1))
+    done
+
+    return 1
+}
+
+stop_client_processes() {
+    local pid=""
+
+    for pid in "$@"; do
+        [ -n "$pid" ] || continue
+        kill "$pid" 2>/dev/null || true
+    done
+
+    for pid in "$@"; do
+        [ -n "$pid" ] || continue
+        if wait_for_pid_exit "$pid" 5; then
+            continue
+        fi
+
+        kill -9 "$pid" 2>/dev/null || true
+        sleep 0.2
+
+        if ! wait_for_pid_exit "$pid" 1; then
+            echo "  ✗ Could not stop client PID ${pid}; leaving existing clients running."
+            return 1
+        fi
+    done
+
+    # Give the server a brief moment to observe EOF and clear connected-client
+    # state before the replacement client performs Hello/ListSessions.
+    sleep 0.2
+}
+
 SERVER_RUNTIME_GENERATION="$(compute_server_runtime_generation)"
 
 case "$1" in
@@ -377,20 +419,24 @@ case "$1" in
                     # kill is harmless in that case. After a cold server restart,
                     # the previously running client has already exited, so we
                     # must relaunch even when its binary is unchanged.
-                    for cpid in $CLIENT_PIDS; do
-                        kill "$cpid" 2>/dev/null || true
-                    done
-                    # Give old clients a moment to fully exit.  Prevents the
-                    # new client from appearing "connected" alongside a dying
-                    # old client during the Hello handshake.
+                    #
+                    # Wait for the old processes to actually exit before
+                    # launching the replacement. If a fresh client connects
+                    # while the server still marks the old window as connected,
+                    # the server assigns a brand-new window ID and the client
+                    # falls back to cold-restore replay, which duplicates the
+                    # old layout instead of reattaching.
                     #
                     # Multi-window note: we launch exactly ONE client here.
                     # The server's Welcome message includes an `other_windows`
                     # list of all remaining unconnected windows, and the client
                     # automatically spawns a separate process (with --window-id)
                     # for each of them.
-                    sleep 0.5
-                    launch_user_binary "$CLIENT_BIN_PATH"
+                    if stop_client_processes $CLIENT_PIDS; then
+                        launch_user_binary "$CLIENT_BIN_PATH"
+                    else
+                        echo "  Skipping client relaunch because an existing client is still running."
+                    fi
                 else
                     echo "  Client binary unchanged — skipping restart."
                 fi

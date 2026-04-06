@@ -18,6 +18,7 @@ use crate::layout::{PaneEdges, Rect};
 use crate::restore_state::LaunchBinding;
 use crate::scrollbar::ScrollbarState;
 use crate::selection::SelectionRange;
+use crate::split_scroll::SplitScrollState;
 
 /// State for a single terminal pane.
 #[allow(clippy::struct_excessive_bools, reason = "pane has legitimate independent boolean flags")]
@@ -98,6 +99,9 @@ pub struct Pane {
     /// Whether the user has dismissed the prompt bar for this pane.
     /// Cleared when a new conversation starts or prompts are reset.
     pub prompt_bar_dismissed: bool,
+    /// Split-scroll state: `Some` when the pane is scrolled up with the
+    /// live-bottom pin active (AI panes with `scroll_pin` enabled).
+    pub split_scroll: Option<SplitScrollState>,
 }
 
 /// Result of feeding PTY bytes into a pane's ANSI processor.
@@ -180,6 +184,7 @@ impl Pane {
             prompt_count: 0,
             last_conversation_id: None,
             prompt_bar_dismissed: false,
+            split_scroll: None,
         }
     }
 

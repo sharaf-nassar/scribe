@@ -540,10 +540,10 @@ pub struct TerminalConfig {
     pub codex_code_integration: bool,
     #[serde(default)]
     pub hide_codex_hook_logs: bool,
-    /// When `true`, block `CSI 3 J` (clear scrollback) from AI sessions so
-    /// the user's scrollback history is preserved.  When `false` (default),
+    /// When `true` (default), block `CSI 3 J` (clear scrollback) from AI
+    /// sessions so the user's scrollback history is preserved. When `false`,
     /// the sequence is passed through, matching standard terminal behaviour.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub preserve_ai_scrollback: bool,
     /// Which AI CLI the AI tab keybindings launch.
     #[serde(default = "default_ai_tab_provider")]
@@ -573,6 +573,11 @@ pub struct TerminalConfig {
     /// Where the prompt bar appears relative to the terminal content.
     #[serde(default)]
     pub prompt_bar_position: PromptBarPosition,
+    /// Optional viewport mode that pins the live terminal bottom while
+    /// scrolled up in AI panes so the user can compose prompts while reading
+    /// scrollback.
+    #[serde(default)]
+    pub scroll_pin: bool,
 }
 
 impl Default for TerminalConfig {
@@ -584,7 +589,7 @@ impl Default for TerminalConfig {
             claude_code_integration: true,
             codex_code_integration: true,
             hide_codex_hook_logs: false,
-            preserve_ai_scrollback: false,
+            preserve_ai_scrollback: true,
             ai_tab_provider: default_ai_tab_provider(),
             natural_scroll: false,
             claude_states: ClaudeStatesConfig::default(),
@@ -594,6 +599,7 @@ impl Default for TerminalConfig {
             prompt_bar: true,
             prompt_bar_font_size: default_prompt_bar_font_size(),
             prompt_bar_position: PromptBarPosition::default(),
+            scroll_pin: false,
         }
     }
 }

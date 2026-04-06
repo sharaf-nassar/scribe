@@ -46,11 +46,11 @@ Status bar stat toggles remain on the Terminal page under the Status Bar section
 
 ### AI Keys
 
-AI page consolidates all AI integration settings including Prompt Bar, Indicator Height, and the AI Assistant States table.
+AI page consolidates all AI integration settings including Prompt Bar, Scroll Pin, Preserve AI Scrollback, Indicator Height, and the AI Assistant States table.
 
 The Prompt Bar section title includes a "Customize colors" crosslink that switches to the Colors page and scrolls to the Prompt Bar color overrides.
 
-Clipboard cleanup remains persisted as `claude_copy_cleanup` for backward compatibility. `hide_codex_hook_logs` defaults to false and suppresses full Codex hook log blocks for the documented hook events (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`), including bullet-prefixed `Running ... hook: ...` lines, non-`completed` trailers, nested hook output, and only the first trailing blank spacer line, while failing open if the block never closes. The AI tab provider is persisted separately so the existing `new_claude_tab` and `new_claude_resume_tab` keybinding keys stay backward compatible while switching between Claude Code and Codex behavior.
+Clipboard cleanup remains persisted as `claude_copy_cleanup` for backward compatibility. `hide_codex_hook_logs` defaults to false and suppresses full Codex hook log blocks for the documented hook events (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`), including bullet-prefixed `Running ... hook: ...` lines, non-`completed` trailers, nested hook output, and only the first trailing raw whitespace-only spacer line. Interactive Codex can repaint completion rows without newline terminators, so the filter hides only the visible hook portion and leaves the following cursor-move redraw bytes intact; if the removed hook prefix had already established the gray prompt background or other inherited SGR styling, the kept tail restores that active style state before replaying the remaining bytes. Synchronized-update trimming keeps prompt repaint tails in the same atomic block, and ANSI-painted blank redraw lines are preserved so Codex startup chrome keeps its background. The client no longer collapses blank rows after render because that heuristic could move legitimate Codex prompt/layout rows upward. `scroll_pin` now defaults to false so AI history keeps the normal contiguous scrollback unless the user explicitly opts into split-scroll. The filter still fails open if the block never closes. The AI tab provider is persisted separately so the existing `new_claude_tab` and `new_claude_resume_tab` keybinding keys stay backward compatible while switching between Claude Code and Codex behavior.
 
 Shared indicator settings cover both Claude Code and Codex Code, even though the persisted key prefix remains `claude_states` for backward compatibility. Per-state configuration for processing, waiting_for_input, permission_prompt, and error. Each state has: tab indicator (bool), pane border (bool), colour (hex or ANSI index), pulse milliseconds (u32), and timeout seconds (f32, min 0.0). Both `IdlePrompt` and `WaitingForInput` AI states share the `waiting_for_input` config key. The old `idle_prompt` key is silently ignored if present in existing configs.
 
@@ -71,6 +71,8 @@ Add/remove root directories and badge colour customization per index with reset-
 ## Singleton
 
 The settings app uses the same singleton structure as the server: a lock file plus a Unix socket for focus handoff. It takes `settings.lock`, listens on `settings.sock`, and sends a `focus` command to an existing instance when one is already running.
+
+That same socket also accepts a `quit` command from the client and server shutdown paths. The client sends it immediately for explicit `Quit Scribe`, and the server sends it after a short grace period once the last client disconnects, so the standalone settings window does not outlive the app while still tolerating fast reconnect handoffs. Socket-driven `quit` exits preserve the persisted `open` flag on both Linux and macOS so the next fresh Scribe launch restores settings only when the window had been open before app shutdown; native user closes still mark it closed.
 
 ## State Persistence
 

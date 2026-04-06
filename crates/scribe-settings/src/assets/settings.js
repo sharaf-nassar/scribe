@@ -671,6 +671,7 @@ function loadConfig(config) {
   setToggleValue("terminal.hide_codex_hook_logs", config.terminal?.hide_codex_hook_logs);
   setToggleValue("terminal.preserve_ai_scrollback", config.terminal?.preserve_ai_scrollback);
   setToggleValue("terminal.prompt_bar", config.terminal?.prompt_bar);
+  setToggleValue("terminal.scroll_pin", config.terminal?.scroll_pin);
   setSegmentedValue("terminal.prompt_bar_position", config.terminal?.prompt_bar_position || "top");
   setStepperValue("terminal.prompt_bar_font_size", config.terminal?.prompt_bar_font_size);
   setAiTabProvider(config.terminal?.ai_tab_provider);

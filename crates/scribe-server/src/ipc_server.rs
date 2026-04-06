@@ -162,6 +162,7 @@ pub struct AttachSessionData {
     pub term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     pub pty_raw_fd: RawFd,
     pub target_dims: Option<TerminalSize>,
+    pub has_handoff_snapshot: bool,
     pub title: String,
     pub codex_task_label: Option<String>,
     pub cwd: Option<std::path::PathBuf>,
@@ -188,6 +189,7 @@ impl LiveSession {
             term: Arc::clone(&self.term),
             pty_raw_fd: self.pty_raw_fd,
             target_dims,
+            has_handoff_snapshot: self.handoff_snapshot.is_some(),
             title: self.title.clone(),
             codex_task_label: self.codex_task_label.clone(),
             cwd: self.cwd.clone(),
@@ -487,8 +489,15 @@ async fn handle_client(
     // Detach all sessions — clear the writer so the reader task stops
     // forwarding output, but keep the session alive for reconnection.
     detach_sessions(&live_sessions, &attached_ids).await;
-    connected_clients.write().await.remove(&window_id);
+    let last_client_disconnected = {
+        let mut connected = connected_clients.write().await;
+        connected.remove(&window_id);
+        connected.is_empty()
+    };
     info!(%window_id, "client removed from connected clients");
+    if last_client_disconnected {
+        schedule_settings_shutdown_if_no_clients(Arc::clone(&connected_clients));
+    }
 }
 
 /// Clear the client writer for each session so output stops being forwarded.
@@ -499,6 +508,39 @@ async fn detach_sessions(live_sessions: &LiveSessionRegistry, ids: &HashSet<Sess
         if let Some(session) = sessions.get(id) {
             *session.client_writer.lock().await = None;
             info!(%id, "session detached (client disconnected)");
+        }
+    }
+}
+
+/// Close the singleton settings window once the client registry stays empty
+/// long enough to rule out a hot-reload or reconnect race.
+fn schedule_settings_shutdown_if_no_clients(connected_clients: ConnectedClients) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if connected_clients.read().await.is_empty() {
+            quit_settings_process();
+        } else {
+            debug!("settings shutdown skipped because a client reconnected");
+        }
+    });
+}
+
+/// Ask the standalone settings process to quit, if it is running.
+fn quit_settings_process() {
+    let socket_path = scribe_common::socket::settings_socket_path();
+    match std::os::unix::net::UnixStream::connect(&socket_path) {
+        Ok(mut stream) => {
+            use std::io::Write as _;
+
+            if let Err(e) = stream.write_all(b"{\"cmd\":\"quit\"}\n") {
+                warn!("failed to send quit command to settings: {e}");
+            } else {
+                debug!("sent quit to settings process after last client disconnect");
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            debug!("settings quit skipped because socket connect failed: {e}");
         }
     }
 }
@@ -1473,7 +1515,7 @@ fn load_preserve_ai_scrollback_setting() -> bool {
         Ok(config) => config.terminal.preserve_ai_scrollback,
         Err(e) => {
             warn!("failed to load preserve_ai_scrollback setting: {e}");
-            false
+            true
         }
     }
 }
