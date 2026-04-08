@@ -3,6 +3,7 @@
 //! Each pane owns a [`Term`] and a VTE [`Processor`]. Rendering is
 //! performed by the shared [`TerminalRenderer`] in `GpuContext`.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -12,6 +13,7 @@ use alacritty_terminal::grid::Dimensions as _;
 use scribe_common::config::ContentPadding;
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::SessionContext;
+use scribe_pty::sync_update_filter::SyncUpdateFrameSplitter;
 use scribe_renderer::types::{CellInstance, GridSize};
 
 use crate::layout::{PaneEdges, Rect};
@@ -85,6 +87,13 @@ pub struct Pane {
     /// `Some((absolute_line, column))` while waiting for user input.
     /// Cleared when a command starts or ends (OSC 133;C / D).
     pub input_start: Option<(usize, usize)>,
+    /// PTY output chunks queued behind the current frame so light bursts can
+    /// animate incrementally while larger backlogs can be coalesced before
+    /// the next redraw.
+    pub pending_output_frames: VecDeque<Vec<u8>>,
+    /// Streaming raw-frame splitter that preserves `CSI ? 2026 h/l`
+    /// boundaries across arbitrary PTY IPC chunking.
+    sync_output_frames: SyncUpdateFrameSplitter,
     /// Text of the first user prompt submitted in this AI session.
     #[allow(dead_code, reason = "read by prompt bar renderer in a later task")]
     pub first_prompt: Option<String>,
@@ -179,6 +188,8 @@ impl Pane {
             prompt_marks: Vec::new(),
             click_events: false,
             input_start: None,
+            pending_output_frames: VecDeque::new(),
+            sync_output_frames: SyncUpdateFrameSplitter::new(),
             first_prompt: None,
             latest_prompt: None,
             prompt_count: 0,
@@ -186,6 +197,24 @@ impl Pane {
             prompt_bar_dismissed: false,
             split_scroll: None,
         }
+    }
+
+    /// Queue raw PTY output frames, preserving synchronized-update commit
+    /// boundaries across IPC message splits.
+    pub fn queue_output_frames(&mut self, bytes: &[u8]) -> bool {
+        let frames = self.sync_output_frames.split_frames(bytes);
+        if frames.is_empty() {
+            return false;
+        }
+
+        self.pending_output_frames.extend(frames);
+        true
+    }
+
+    /// Drop any staged PTY frames and reset the sync-frame splitter.
+    pub fn reset_output_queue(&mut self) {
+        self.pending_output_frames.clear();
+        self.sync_output_frames = SyncUpdateFrameSplitter::new();
     }
 
     /// Feed raw PTY output bytes into the ANSI processor / terminal.
@@ -309,8 +338,7 @@ impl Pane {
         if !prompt_bar_enabled || self.prompt_bar_dismissed || self.prompt_count == 0 {
             return 0.0;
         }
-        let lines = if self.prompt_count == 1 { 1.0 } else { 2.0 };
-        lines * cell_height + 8.0 + 8.0 // top_pad + bottom_pad
+        crate::prompt_bar::prompt_bar_height(self.prompt_count, cell_height)
     }
 }
 

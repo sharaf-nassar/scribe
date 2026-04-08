@@ -513,7 +513,7 @@ impl PendingLine {
 
         if appended_visible
             && self.complete_hook_line_raw_len.is_none()
-            && complete_hook_line(self.visible.trim())
+            && is_hook_block_end_line(self.visible.trim())
         {
             self.complete_hook_line_raw_len = Some(self.raw.len());
         }
@@ -949,15 +949,23 @@ fn split_sync_block_lines(body: &[u8]) -> Vec<SyncBlockLine<'_>> {
 }
 
 fn analyze_sync_block_line(line: SyncBlockLine<'_>) -> SyncBlockLineAnalysis<'_> {
-    let pending = pending_line_from_raw(line.raw);
-    if let Some((_, trailing_raw)) = pending.split_complete_hook_line_prefix() {
+    if let Some((keep_tail, trailing_raw)) = split_sync_block_hook_line_prefix(line.raw) {
         return SyncBlockLineAnalysis {
             line,
-            retention: SyncBlockRetention::Partial(trailing_raw),
-            kind: SyncBlockLineKind::HookPrefixContent,
+            retention: if keep_tail {
+                SyncBlockRetention::Partial(trailing_raw)
+            } else {
+                SyncBlockRetention::Drop
+            },
+            kind: if keep_tail {
+                SyncBlockLineKind::HookPrefixContent
+            } else {
+                SyncBlockLineKind::Hook
+            },
         };
     }
 
+    let pending = pending_line_from_raw(line.raw);
     let trimmed = pending.visible.trim();
     if trimmed.is_empty() {
         let is_raw_blank_spacer = pending.is_raw_blank_spacer();
@@ -996,6 +1004,73 @@ fn push_color_params(params: &mut Vec<String>, color: SgrColor, background: bool
             params.push(b.to_string());
         }
     }
+}
+
+fn split_sync_block_hook_line_prefix(raw: &[u8]) -> Option<(bool, Vec<u8>)> {
+    let raw_len = last_complete_hook_line_raw_len(raw)?;
+    if raw_len >= raw.len() {
+        return None;
+    }
+
+    let line_raw = raw.get(..raw_len)?;
+    let trailing_suffix = raw.get(raw_len..)?;
+    let line = pending_line_from_raw(line_raw);
+    if !complete_hook_line(line.visible.trim()) {
+        return None;
+    }
+
+    let keep_tail = sync_hook_tail_has_meaningful_bytes(trailing_suffix);
+    let mut trailing_raw = Vec::new();
+    if keep_tail {
+        trailing_raw.extend_from_slice(&sgr_restore_bytes_for_prefix(line_raw));
+        trailing_raw.extend_from_slice(trailing_suffix);
+    }
+
+    Some((keep_tail, trailing_raw))
+}
+
+fn last_complete_hook_line_raw_len(raw: &[u8]) -> Option<usize> {
+    let mut pending = PendingLine::new();
+    let mut complete_hook_line_raw_len = None;
+
+    for &byte in raw {
+        pending.raw.push(byte);
+        pending.record_visible(byte);
+        if complete_hook_line(pending.visible.trim()) {
+            complete_hook_line_raw_len = Some(pending.raw.len());
+        }
+    }
+
+    complete_hook_line_raw_len
+}
+
+fn sync_hook_tail_has_meaningful_bytes(raw: &[u8]) -> bool {
+    let mut idx = 0usize;
+    while let Some(&byte) = raw.get(idx) {
+        match byte {
+            b'\r' | b'\n' => idx += 1,
+            0x1B if raw.get(idx + 1) == Some(&b'[') => {
+                let params_start = idx + 2;
+                let Some(params_tail) = raw.get(params_start..) else {
+                    return true;
+                };
+                let Some(final_rel_idx) =
+                    params_tail.iter().position(|param_byte| matches!(param_byte, 0x40..=0x7E))
+                else {
+                    return true;
+                };
+                let final_idx = params_start + final_rel_idx;
+                if raw.get(final_idx) == Some(&b'm') {
+                    idx = final_idx + 1;
+                } else {
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+    }
+
+    false
 }
 
 fn indexed_sgr_color(value: u16) -> Option<SgrColor> {

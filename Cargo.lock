@@ -3560,6 +3560,7 @@ dependencies = [
  "pollster",
  "raw-window-handle",
  "scribe-common",
+ "scribe-pty",
  "scribe-renderer",
  "serde",
  "sysinfo",

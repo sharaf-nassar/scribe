@@ -1703,11 +1703,15 @@ async fn pty_reader_task(state: PtyReaderState) {
             feed_term(&state.term, &mut state.ansi_processor, &flushed).await;
         }
 
-        // Session EOF — notify client (if attached) and remove from registry.
+        // Session EOF — notify client (if attached) and remove all server-side
+        // ownership so reconnect and handoff state cannot retain dead sessions.
         let exit_msg =
             ServerMessage::SessionExited { session_id: state.session_id, exit_code: None };
         send_to_client(&state.client_writer, &exit_msg).await;
         state.live_sessions.write().await.remove(&state.session_id);
+        let mut workspace_manager = state.workspace_manager.write().await;
+        workspace_manager.remove_session(state.session_id);
+        workspace_manager.remove_session_from_window(state.session_id);
         info!(session_id = %state.session_id, "PTY reader task exited");
     }
     run(state).await;

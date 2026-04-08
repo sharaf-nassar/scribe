@@ -104,6 +104,21 @@ enum ScrollbarAction {
     JumpTo { delta: i32 },
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "drain results track three independent rendering facts: current-frame visibility, queued follow-up work, and open sync state"
+)]
+struct PendingOutputDrainResult {
+    needs_redraw: bool,
+    has_more: bool,
+    sync_pending: bool,
+}
+
+/// Once a pane accumulates more than this many committed PTY bursts, stop
+/// replaying them one redraw at a time and catch up to the latest committed
+/// terminal state instead.
+const OUTPUT_FRAME_CATCH_UP_THRESHOLD: usize = 4;
+
 /// State for an in-progress tab drag-reorder operation.
 struct TabDrag {
     /// Workspace the dragged tab belongs to.
@@ -355,6 +370,8 @@ struct App {
 
     /// Prompt bar hover state: which pane and which line the cursor is over.
     prompt_bar_hover: Option<(PaneId, prompt_bar::PromptBarHover)>,
+    /// Prompt bar pressed state: which pane and which target is currently active.
+    prompt_bar_pressed: Option<(PaneId, prompt_bar::PromptBarHover)>,
 
     /// Split-scroll jump button hover state.
     scroll_pin_hover: Option<PaneId>,
@@ -494,6 +511,7 @@ impl App {
             tab_bar_tooltip_targets: Vec::new(),
             active_tooltip: None,
             prompt_bar_hover: None,
+            prompt_bar_pressed: None,
             scroll_pin_hover: None,
             hostname: read_hostname(),
             sys_stats: sys_stats::SystemStatsCollector::new(),
@@ -541,13 +559,18 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::ScreenSnapshot { session_id, snapshot } => {
                 // Discard any buffered bytes — the snapshot replaces VTE state.
                 self.pending_pty_bytes.remove(&session_id);
+                if let Some(pane_id) = self.session_to_pane.get(&session_id).copied()
+                    && let Some(pane) = self.panes.get_mut(&pane_id)
+                {
+                    pane.reset_output_queue();
+                }
                 self.handle_screen_snapshot(session_id, &snapshot);
             }
             UiEvent::SessionCreated { session_id, shell_name, .. } => {
                 self.handle_session_created(session_id, &shell_name);
             }
             UiEvent::SessionExited { session_id, .. } => {
-                self.handle_session_exited(session_id);
+                self.handle_session_exited(session_id, event_loop);
             }
             UiEvent::AiStateChanged { session_id, ai_state } => {
                 self.handle_ai_state_changed(session_id, ai_state);
@@ -656,7 +679,10 @@ impl ApplicationHandler<UiEvent> for App {
         // processed, so keystrokes are never blocked behind output messages.
         self.drain_pending_pty_output();
 
-        if self.cursor_blink_enabled {
+        if self.has_pending_output_frames() {
+            self.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else if self.cursor_blink_enabled {
             let elapsed = self.blink_timer.elapsed();
             if elapsed >= BLINK_INTERVAL {
                 // Blink interval elapsed — request a redraw so `handle_redraw`
@@ -878,8 +904,9 @@ impl App {
         // pane grids have usable dimensions even before the compositor sends
         // a configure event.  On Wayland, inner_size() can return a tiny
         // default until the first configure; this hint prevents that.
+        let window_title = current_identity().window_title_name();
         let mut attrs = Window::default_attributes()
-            .with_title("Scribe")
+            .with_title(window_title)
             .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0));
         if self.window_transparent {
             attrs = attrs.with_transparent(true);
@@ -1049,8 +1076,12 @@ impl App {
         self.request_redraw();
     }
 
-    /// Drain all pending PTY output buffers, feeding coalesced bytes into
-    /// their panes in a single VTE advance per session.
+    /// Drain all pending PTY output buffers into per-pane committed frames.
+    ///
+    /// IPC delivery is still coalesced per session so input events are never
+    /// blocked behind a burst of `PtyOutput` messages, but redraw pacing is
+    /// decided from pane-local frame queues to preserve synchronized-update
+    /// commit boundaries.
     fn drain_pending_pty_output(&mut self) {
         if self.pending_pty_bytes.is_empty() {
             return;
@@ -1063,13 +1094,87 @@ impl App {
 
     fn handle_pty_output(&mut self, session_id: SessionId, bytes: &[u8]) {
         let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
-        let Some(feed) = self.apply_pane_output_bytes(pane_id, bytes) else { return };
+        self.enqueue_pane_output_frames(pane_id, bytes);
+    }
 
-        if feed.sync_pending {
-            self.ensure_animation_running();
+    fn enqueue_pane_output_frames(&mut self, pane_id: PaneId, bytes: &[u8]) {
+        let queue_was_empty =
+            self.panes.get(&pane_id).is_some_and(|pane| pane.pending_output_frames.is_empty());
+        let queued_any = {
+            let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+            pane.queue_output_frames(bytes)
+        };
+
+        if !queued_any {
+            return;
         }
-        if feed.needs_redraw {
-            self.request_redraw();
+
+        // When the pane was idle, advance to the first committed frame
+        // immediately so the next render reflects fresh content instead of
+        // waiting for another event-loop turn.
+        if queue_was_empty && let Some(result) = self.drain_pane_output_until_frame(pane_id) {
+            if result.sync_pending {
+                self.ensure_animation_running();
+            }
+            if result.needs_redraw || result.has_more {
+                self.request_redraw();
+            }
+            return;
+        }
+
+        self.request_redraw();
+    }
+
+    fn drain_pending_output_frames(&mut self) -> bool {
+        let pane_ids: Vec<PaneId> = self
+            .panes
+            .iter()
+            .filter_map(|(&pane_id, pane)| {
+                (!pane.pending_output_frames.is_empty()).then_some(pane_id)
+            })
+            .collect();
+        let mut request_redraw = false;
+
+        for pane_id in pane_ids {
+            let Some(result) = self.drain_pane_output_until_frame(pane_id) else { continue };
+            if result.sync_pending {
+                self.ensure_animation_running();
+            }
+            request_redraw |= result.has_more;
+        }
+
+        request_redraw
+    }
+
+    fn drain_pane_output_until_frame(
+        &mut self,
+        pane_id: PaneId,
+    ) -> Option<PendingOutputDrainResult> {
+        let mut sync_pending = false;
+        let catch_up_to_latest = self
+            .panes
+            .get(&pane_id)
+            .is_some_and(|pane| pane.pending_output_frames.len() > OUTPUT_FRAME_CATCH_UP_THRESHOLD);
+
+        loop {
+            let bytes = {
+                let pane = self.panes.get_mut(&pane_id)?;
+                pane.pending_output_frames.pop_front()?
+            };
+            let feed = self.apply_pane_output_bytes(pane_id, &bytes)?;
+            let remaining_frames =
+                self.panes.get(&pane_id).map_or(0, |pane| pane.pending_output_frames.len());
+            let has_more = remaining_frames != 0;
+            sync_pending |= feed.sync_pending;
+            let keep_draining = catch_up_to_latest && has_more;
+
+            if !keep_draining && (feed.needs_redraw || !has_more) {
+                return Some(PendingOutputDrainResult {
+                    needs_redraw: feed.needs_redraw,
+                    has_more,
+                    sync_pending,
+                });
+            }
         }
     }
 
@@ -1339,9 +1444,7 @@ impl App {
         // new IDs), discard the stale tree and fall back to the session-based
         // reconstruction so panes can still be created.
         if tabs_by_ws.is_empty() && !groups.is_empty() {
-            tracing::warn!(
-                "workspace tree IDs do not match session workspace IDs — falling back"
-            );
+            tracing::warn!("workspace tree IDs do not match session workspace IDs — falling back");
             self.reconstruct_fallback(sessions);
             workspace_order = self.window_layout.workspace_ids_in_order();
             tabs_by_ws = workspace_order
@@ -1662,6 +1765,14 @@ impl App {
         let Some(tx) = self.cmd_tx.clone() else { return false };
         let Some(gpu) = self.gpu.as_ref() else { return false };
         let Some(window) = self.window.as_ref() else { return false };
+        if !snapshot.is_replayable() {
+            tracing::warn!(
+                window_id = %snapshot.window_id,
+                launches = snapshot.launches.len(),
+                "skipping non-replayable cold restart snapshot"
+            );
+            return false;
+        }
 
         let mut replay =
             restore_replay::prepare_replay(snapshot, &mut self.window_layout, &mut self.panes);
@@ -1785,6 +1896,36 @@ impl App {
         let bar_y =
             if pb_at_top { pane_rect.y + tbh } else { pane_rect.y + pane_rect.height - pbh };
         Some(Rect { x: pane_rect.x, y: bar_y, width: pane_rect.width, height: pbh })
+    }
+
+    /// Resolve the prompt-bar target under the cursor for the visible pane layout.
+    fn prompt_bar_target_at(&self, x: f32, y: f32) -> Option<(PaneId, prompt_bar::PromptBarHover)> {
+        if !self.config.terminal.prompt_bar {
+            return None;
+        }
+        let Some(gpu) = &self.gpu else { return None };
+
+        let cell = gpu.renderer.cell_size();
+        let pb_font_scale =
+            self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
+        let pb_cell = (cell.width * pb_font_scale, cell.height * pb_font_scale);
+        let pb_at_top = self.config.terminal.prompt_bar_position
+            == scribe_common::config::PromptBarPosition::Top;
+
+        self.visible_pane_rects().into_iter().find_map(|(pane_id, pane_rect, pane_edges)| {
+            let pane = self.panes.get(&pane_id)?;
+            if pane.prompt_count == 0 || pane.prompt_bar_dismissed {
+                return None;
+            }
+            let bar_rect = self.prompt_bar_rect_for_visible_pane(
+                pane,
+                (pane_rect, pane_edges),
+                pb_cell.1,
+                pb_at_top,
+            )?;
+            let hover = prompt_bar::hit_test_prompt_bar(pane, bar_rect, pb_cell, x, y)?;
+            Some((pane_id, hover))
+        })
     }
 
     /// Update geometry (rect, grid, Term dimensions) on every pane in the
@@ -1977,7 +2118,7 @@ impl App {
     }
 
     /// Handle session exit.
-    fn handle_session_exited(&mut self, session_id: SessionId) {
+    fn handle_session_exited(&mut self, session_id: SessionId, event_loop: &ActiveEventLoop) {
         tracing::info!(session = %session_id, "session exited");
         self.ai_tracker.remove(session_id);
 
@@ -2001,6 +2142,10 @@ impl App {
             self.remove_tab_and_cleanup_workspace(ws_id, session_id);
             self.panes.remove(&pane_id);
             self.url_caches.remove(&pane_id);
+            if self.panes.is_empty() {
+                self.handle_close_window(event_loop);
+                return;
+            }
             self.request_redraw();
             return;
         }
@@ -2738,6 +2883,7 @@ impl App {
     )]
     fn handle_redraw(&mut self) {
         self.sync_surface_to_window();
+        let request_redraw = self.drain_pending_output_frames();
 
         let Some(gpu) = &mut self.gpu else { return };
 
@@ -3063,6 +3209,7 @@ impl App {
             focused_ws_rect,
             prompt_bar_enabled: self.config.terminal.prompt_bar,
             prompt_bar_hover: self.prompt_bar_hover,
+            prompt_bar_pressed: self.prompt_bar_pressed,
             scroll_pin_enabled: self.config.terminal.scroll_pin,
             scroll_pin_hover: self.scroll_pin_hover,
         };
@@ -3217,8 +3364,8 @@ impl App {
             let pane = self.panes.get(&pid)?;
             let (_, pane_rect) = pane_rects.iter().find(|(pane_id, _)| *pane_id == pid)?;
             let full_text = prompt_bar::hovered_prompt_text(pane, hover)?;
-            let effective_width = pane_rect.width - prompt_bar::DISMISS_BTN_W;
-            if !prompt_bar::is_prompt_truncated(full_text, effective_width, pb_cell.0) {
+            let pbh = pane.prompt_bar_height(pb_cell.1, true);
+            if pbh <= 0.0 {
                 return None;
             }
             let tbh = if pane.edges.top {
@@ -3226,11 +3373,14 @@ impl App {
             } else {
                 0.0
             };
-            let pbh = pane.prompt_bar_height(pb_cell.1, true);
             let bar_y =
                 if pb_at_top { pane_rect.y + tbh } else { pane_rect.y + pane_rect.height - pbh };
             let anchor =
                 layout::Rect { x: pane_rect.x, y: bar_y, width: pane_rect.width, height: pbh };
+            let effective_width = prompt_bar::prompt_bar_text_width(pane, anchor, pb_cell, hover)?;
+            if !prompt_bar::is_prompt_truncated(full_text, effective_width, pb_cell.0) {
+                return None;
+            }
             Some((full_text.to_owned(), anchor))
         });
         if let Some((ref text, anchor)) = prompt_tooltip_anchor {
@@ -3316,6 +3466,9 @@ impl App {
         gpu.queue.submit(std::iter::once(encoder.finish()));
         self.notify_pre_present();
         frame.present();
+        if request_redraw {
+            self.request_redraw();
+        }
     }
 
     /// Reconfigure the surface and renderer on window resize.
@@ -5062,6 +5215,10 @@ impl App {
         clippy::too_many_lines,
         reason = "click dispatch: gear, equalize, update button, tab close, tab drag, scrollbar, divider, selection"
     )]
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "mouse press routing keeps click-priority rules in one place"
+    )]
     fn handle_mouse_press(&mut self) {
         let Some((x, y)) = self.last_cursor_pos else { return };
         let Some(gpu) = &self.gpu else { return };
@@ -5139,11 +5296,19 @@ impl App {
 
         // Check for prompt bar clicks before scrollbar — the scrollbar hit
         // zone is 3x its visible width and overlaps the dismiss button area.
-        if self.try_dismiss_prompt_bar(x, y) {
+        let old_prompt_bar_pressed = self.prompt_bar_pressed;
+        self.prompt_bar_pressed = self.prompt_bar_target_at(x, y);
+        if self.prompt_bar_pressed != old_prompt_bar_pressed {
+            self.request_redraw();
+        }
+        if matches!(self.prompt_bar_pressed, Some((_, prompt_bar::PromptBarHover::DismissButton))) {
             return;
         }
         if self.try_copy_prompt_bar_text(x, y) {
             return;
+        }
+        if self.prompt_bar_pressed.take().is_some() {
+            self.request_redraw();
         }
 
         // Check for split-scroll jump-to-bottom button.
@@ -5609,50 +5774,7 @@ impl App {
     /// prompt bars in all visible panes.
     fn update_prompt_bar_hover(&mut self, mouse_x: f32, mouse_y: f32) {
         let old_hover = self.prompt_bar_hover;
-        self.prompt_bar_hover = None;
-
-        if !self.config.terminal.prompt_bar {
-            if old_hover.is_some() {
-                self.request_redraw();
-            }
-            return;
-        }
-
-        let Some(gpu) = &self.gpu else {
-            if old_hover.is_some() {
-                self.request_redraw();
-            }
-            return;
-        };
-        let cell_h = gpu.renderer.cell_size().height;
-        let pb_font_scale =
-            self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
-        let pb_cell_h = cell_h * pb_font_scale;
-        let pb_at_top = self.config.terminal.prompt_bar_position
-            == scribe_common::config::PromptBarPosition::Top;
-
-        // Iterate the visible pane layout so inactive tabs cannot leak stale
-        // prompt bars into hover state.
-        for (pane_id, pane_rect, pane_edges) in self.visible_pane_rects() {
-            let Some(pane) = self.panes.get(&pane_id) else { continue };
-            if pane.prompt_count == 0 || pane.prompt_bar_dismissed {
-                continue;
-            }
-            let Some(bar_rect) = self.prompt_bar_rect_for_visible_pane(
-                pane,
-                (pane_rect, pane_edges),
-                pb_cell_h,
-                pb_at_top,
-            ) else {
-                continue;
-            };
-            if let Some(hover) =
-                prompt_bar::hit_test_prompt_bar(pane, bar_rect, pb_cell_h, mouse_x, mouse_y)
-            {
-                self.prompt_bar_hover = Some((pane_id, hover));
-                break;
-            }
-        }
+        self.prompt_bar_hover = self.prompt_bar_target_at(mouse_x, mouse_y);
 
         if self.prompt_bar_hover != old_hover {
             self.request_redraw();
@@ -5791,42 +5913,15 @@ impl App {
     ///
     /// Returns `true` when the click was consumed.
     fn try_dismiss_prompt_bar(&mut self, x: f32, y: f32) -> bool {
-        if !self.config.terminal.prompt_bar {
+        let Some((pane_id, hover)) = self.prompt_bar_target_at(x, y) else { return false };
+        if hover != prompt_bar::PromptBarHover::DismissButton {
             return false;
         }
-        let Some(gpu) = &self.gpu else { return false };
-        let cell_h = gpu.renderer.cell_size().height;
-        let pb_font_scale =
-            self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
-        let pb_cell_h = cell_h * pb_font_scale;
-        let pb_at_top = self.config.terminal.prompt_bar_position
-            == scribe_common::config::PromptBarPosition::Top;
-
-        let target =
-            self.visible_pane_rects().into_iter().find_map(|(pane_id, pane_rect, pane_edges)| {
-                let pane = self.panes.get(&pane_id)?;
-                if pane.prompt_count == 0 || pane.prompt_bar_dismissed {
-                    return None;
-                }
-                let bar_rect = self.prompt_bar_rect_for_visible_pane(
-                    pane,
-                    (pane_rect, pane_edges),
-                    pb_cell_h,
-                    pb_at_top,
-                )?;
-                let hover = prompt_bar::hit_test_prompt_bar(pane, bar_rect, pb_cell_h, x, y)?;
-                if hover == prompt_bar::PromptBarHover::DismissButton {
-                    Some(pane_id)
-                } else {
-                    None
-                }
-            });
-
-        let Some(pane_id) = target else { return false };
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             pane.prompt_bar_dismissed = true;
         }
         self.prompt_bar_hover = None;
+        self.prompt_bar_pressed = None;
         self.resize_after_layout_change();
         self.request_redraw();
         true
@@ -5836,32 +5931,10 @@ impl App {
     ///
     /// Returns `true` when the click was consumed.
     fn try_copy_prompt_bar_text(&mut self, x: f32, y: f32) -> bool {
-        if !self.config.terminal.prompt_bar {
-            return false;
-        }
-        let Some(gpu) = &self.gpu else { return false };
-        let cell_h = gpu.renderer.cell_size().height;
-        let pb_font_scale =
-            self.config.terminal.prompt_bar_font_size / self.config.appearance.font_size;
-        let pb_cell_h = cell_h * pb_font_scale;
-        let pb_at_top = self.config.terminal.prompt_bar_position
-            == scribe_common::config::PromptBarPosition::Top;
-
-        let text =
-            self.visible_pane_rects().into_iter().find_map(|(pane_id, pane_rect, pane_edges)| {
-                let pane = self.panes.get(&pane_id)?;
-                if pane.prompt_count == 0 || pane.prompt_bar_dismissed {
-                    return None;
-                }
-                let bar_rect = self.prompt_bar_rect_for_visible_pane(
-                    pane,
-                    (pane_rect, pane_edges),
-                    pb_cell_h,
-                    pb_at_top,
-                )?;
-                let hover = prompt_bar::hit_test_prompt_bar(pane, bar_rect, pb_cell_h, x, y)?;
-                prompt_bar::hovered_prompt_text(pane, hover).map(str::to_owned)
-            });
+        let text = self.prompt_bar_target_at(x, y).and_then(|(pane_id, hover)| {
+            let pane = self.panes.get(&pane_id)?;
+            prompt_bar::hovered_prompt_text(pane, hover).map(str::to_owned)
+        });
 
         let Some(text) = text else { return false };
         if let Some(cb) = self.clipboard.as_mut() {
@@ -6184,6 +6257,19 @@ impl App {
 
     /// Finalize selection on mouse release and auto-copy if enabled.
     fn handle_mouse_release(&mut self) {
+        let pressed_prompt_bar = self.prompt_bar_pressed;
+        let released_prompt_bar =
+            self.last_cursor_pos.and_then(|(x, y)| self.prompt_bar_target_at(x, y));
+        if self.prompt_bar_pressed.take().is_some() {
+            self.request_redraw();
+        }
+        if let (Some((x, y)), Some((_, prompt_bar::PromptBarHover::DismissButton))) =
+            (self.last_cursor_pos, pressed_prompt_bar)
+        {
+            if released_prompt_bar == pressed_prompt_bar && self.try_dismiss_prompt_bar(x, y) {
+                return;
+            }
+        }
         self.mouse_selecting = false;
         self.finish_tab_drag();
         self.finish_pane_drag();
@@ -6990,6 +7076,10 @@ impl App {
         }
     }
 
+    fn has_pending_output_frames(&self) -> bool {
+        self.panes.values().any(|pane| !pane.pending_output_frames.is_empty())
+    }
+
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -7279,10 +7369,11 @@ impl App {
     /// Update the compositor window title to reflect the current update state.
     fn update_window_title(&self) {
         if let Some(window) = &self.window {
+            let window_title = current_identity().window_title_name();
             if let Some((version, _)) = &self.update_available {
-                window.set_title(&format!("Scribe — v{version} available"));
+                window.set_title(&format!("{window_title} — v{version} available"));
             } else {
-                window.set_title("Scribe");
+                window.set_title(window_title);
             }
         }
     }
@@ -7470,6 +7561,14 @@ impl App {
         let Some(wid) = self.window_id else { return };
         let snapshot =
             restore_replay::snapshot_window_restore(wid, &self.window_layout, &self.panes);
+        if !snapshot.is_replayable() {
+            if let Err(e) = self.restore_store.remove_from_index(wid) {
+                tracing::warn!("failed to remove empty window from restore index: {e}");
+            }
+            self.restore_store.remove_window(wid);
+            self.restore_save_pending = None;
+            return;
+        }
         if let Err(e) = self.restore_store.save_window(&snapshot) {
             tracing::warn!("failed to persist restore state: {e}");
             self.restore_save_pending = None;
@@ -7715,6 +7814,7 @@ struct FrameLayout<'a> {
     focused_ws_rect: Option<Rect>,
     prompt_bar_enabled: bool,
     prompt_bar_hover: Option<(PaneId, prompt_bar::PromptBarHover)>,
+    prompt_bar_pressed: Option<(PaneId, prompt_bar::PromptBarHover)>,
     scroll_pin_enabled: bool,
     scroll_pin_hover: Option<PaneId>,
 }
@@ -8217,6 +8317,7 @@ fn build_all_instances(
                 layout.prompt_bar_cell_size,
                 glyph_size,
                 layout.prompt_bar_hover.filter(|h| h.0 == *pane_id).map(|h| h.1),
+                layout.prompt_bar_pressed.filter(|h| h.0 == *pane_id).map(|h| h.1),
                 &style.prompt_bar_colors,
                 &mut |ch| renderer.resolve_glyph(device, queue, ch),
             );

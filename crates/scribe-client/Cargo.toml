@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 scribe-common.workspace = true
+scribe-pty.workspace = true
 scribe-renderer.workspace = true
 alacritty_terminal.workspace = true
 wgpu.workspace = true

@@ -390,12 +390,20 @@ impl WorkspaceManager {
         workspaces: &[HandoffWorkspace],
         workspace_tree: Option<WorkspaceTreeNode>,
         windows: &[HandoffWindowState],
+        valid_session_ids: &HashSet<SessionId>,
     ) -> Self {
         let mut ws_map = HashMap::new();
         let mut session_to_workspace = HashMap::new();
 
         for hw in workspaces {
-            for &session_id in &hw.session_ids {
+            let session_ids: Vec<SessionId> = hw
+                .session_ids
+                .iter()
+                .copied()
+                .filter(|session_id| valid_session_ids.contains(session_id))
+                .collect();
+
+            for &session_id in &session_ids {
                 session_to_workspace.insert(session_id, hw.id);
             }
 
@@ -404,7 +412,7 @@ impl WorkspaceManager {
                 Workspace {
                     id: hw.id,
                     name: hw.name.clone(),
-                    sessions: hw.session_ids.clone(),
+                    sessions: session_ids.clone(),
                     accent_color: hw.accent_color.clone(),
                     split_direction: hw.split_direction,
                 },
@@ -413,7 +421,8 @@ impl WorkspaceManager {
             info!(
                 workspace_id = %hw.id,
                 name = ?hw.name,
-                sessions = hw.session_ids.len(),
+                sessions = session_ids.len(),
+                dropped_sessions = hw.session_ids.len().saturating_sub(session_ids.len()),
                 "restored workspace from handoff"
             );
         }
@@ -421,7 +430,14 @@ impl WorkspaceManager {
         let mut session_to_window = HashMap::new();
         let mut window_trees = HashMap::new();
         for hw in windows {
-            for &session_id in &hw.session_ids {
+            let session_ids: Vec<SessionId> = hw
+                .session_ids
+                .iter()
+                .copied()
+                .filter(|session_id| valid_session_ids.contains(session_id))
+                .collect();
+
+            for &session_id in &session_ids {
                 session_to_window.insert(session_id, hw.window_id);
             }
             if let Some(tree) = &hw.workspace_tree {
@@ -429,7 +445,8 @@ impl WorkspaceManager {
             }
             info!(
                 window_id = %hw.window_id,
-                sessions = hw.session_ids.len(),
+                sessions = session_ids.len(),
+                dropped_sessions = hw.session_ids.len().saturating_sub(session_ids.len()),
                 "restored window from handoff"
             );
         }
@@ -640,7 +657,14 @@ mod tests {
         assert!(tree_out.is_some(), "tree should be present in handoff");
 
         // Restore from handoff.
-        let restored = WorkspaceManager::restore_from_handoff(vec![], &workspaces, tree_out, &[]);
+        let valid_session_ids = HashSet::from([sess_a, sess_b]);
+        let restored = WorkspaceManager::restore_from_handoff(
+            vec![],
+            &workspaces,
+            tree_out,
+            &[],
+            &valid_session_ids,
+        );
 
         // Verify sessions survived.
         assert_eq!(restored.workspace_for_session(sess_a), Some(ws_a));

@@ -1,5 +1,5 @@
 [Desktop Entry]
-Name=Scribe Dev
+Name=devScribe
 Comment=GPU-accelerated terminal emulator with AI awareness
 Exec=scribe-dev
 Icon=scribe-dev

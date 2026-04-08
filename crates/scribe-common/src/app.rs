@@ -70,6 +70,14 @@ impl AppIdentity {
     }
 
     #[must_use]
+    pub const fn window_title_name(self) -> &'static str {
+        match self.flavor {
+            AppFlavor::Stable => "Scribe",
+            AppFlavor::Dev => "devScribe",
+        }
+    }
+
+    #[must_use]
     pub const fn client_binary_name(self) -> &'static str {
         match self.flavor {
             AppFlavor::Stable => "scribe-client",

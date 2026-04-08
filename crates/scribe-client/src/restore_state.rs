@@ -31,6 +31,13 @@ pub struct WindowRestoreState {
     pub launches: Vec<LaunchRecord>,
 }
 
+impl WindowRestoreState {
+    pub fn is_replayable(&self) -> bool {
+        !self.launches.is_empty()
+            && self.workspaces.iter().any(|workspace| !workspace.tabs.is_empty())
+    }
+}
+
 /// Snapshot of the workspace split tree.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +299,14 @@ impl RestoreStore {
 
         for window_id in index.windows.drain(..) {
             match self.load_window(window_id) {
+                Some(state) if !state.is_replayable() => {
+                    self.remove_window(window_id);
+                    tracing::warn!(
+                        %window_id,
+                        launches = state.launches.len(),
+                        "skipping non-replayable restore entry"
+                    );
+                }
                 Some(state) if claimed.is_none() => {
                     self.remove_window(window_id);
                     claimed = Some(state);

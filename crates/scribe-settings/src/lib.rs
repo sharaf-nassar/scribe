@@ -236,7 +236,9 @@ pub fn run_settings_window(
     gtk::Window::set_default_icon_name(icon_name);
 
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
-    window.set_title("Scribe Settings");
+    let window_title =
+        format!("{} Settings", scribe_common::app::current_identity().window_title_name());
+    window.set_title(&window_title);
 
     {
         let icon_path = format!("/usr/share/icons/hicolor/256x256/apps/{icon_name}.png");
@@ -406,7 +408,9 @@ fn build_tao_window(
 ) -> Result<tao::window::Window, String> {
     use tao::dpi::{LogicalPosition, LogicalSize};
 
-    let mut builder = tao::window::WindowBuilder::new().with_title("Scribe Settings");
+    let window_title =
+        format!("{} Settings", scribe_common::app::current_identity().window_title_name());
+    let mut builder = tao::window::WindowBuilder::new().with_title(&window_title);
 
     if let Some(geom) = geometry {
         builder = builder

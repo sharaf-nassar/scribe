@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -94,12 +95,15 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
 
     let session_manager =
         Arc::new(session_manager::SessionManager::restore_from_handoff(&state, fds, scrollback)?);
+    let live_session_ids: HashSet<_> =
+        state.sessions.iter().map(|handoff_session| handoff_session.session_id).collect();
     let workspace_manager =
         Arc::new(RwLock::new(workspace_manager::WorkspaceManager::restore_from_handoff(
             cfg.workspace_roots,
             &state.workspaces,
             state.workspace_tree,
             &state.windows,
+            &live_session_ids,
         )));
 
     info!("session restoration complete — starting IPC server");

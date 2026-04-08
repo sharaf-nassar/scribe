@@ -10,7 +10,9 @@ It acquires the singleton lock via flock on `server.lock`. The main loop uses `t
 
 ### Upgrade Path
 
-When launched with `--upgrade`, the server restores handoff state and received file descriptors from the old instance instead of starting fresh. It rebuilds the session and workspace managers, then enters the normal event loop.
+When launched with `--upgrade`, the server restores handoff state and received file descriptors from the old instance instead of starting fresh.
+
+It rebuilds the session and workspace managers, filtering workspace and window membership against the received live-session set so stale IDs from older servers are dropped before serving.
 
 ## Sessions
 
@@ -34,7 +36,7 @@ The reader task runs three processing paths per read cycle: raw byte forwarding,
 
 For Claude Code and Codex Code sessions, an [[crates/scribe-pty/src/ed3_filter.rs#Ed3Filter]] rewrites `\x1b[3J` to `\x1b[2J` before forwarding PTY output to the client and the server's Term. That clears only the visible screen while preserving scrollback in alacritty_terminal during TUI re-renders. The old `/clear` bypass no longer exists.
 
-When `terminal.hide_codex_hook_logs` is enabled, sessions apply the [[pty#Codex Hook Log Filter]] on the same PTY read path before forwarding bytes to the client or the server-side Term. The filter recognizes Codex's current documented hook wrappers for `SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`, including `Running ... hook: ...` status-message lines and `hook (completed|failed|blocked|stopped)` trailers, so hook command summaries and only the first raw whitespace-only spacer line after them disappear. Interactive Codex redraws some completion rows without a trailing newline, so the filter preserves the control-sequence tail after the last visible hook byte; if the hidden hook prefix had established a background or other SGR styling that later prompt bytes inherit, the kept tail now reapplies that active style state before replaying the remaining bytes. Inside synchronized updates it also trims hook-only rows from the buffered sync block without discarding ANSI-painted blank rows or other control-only repaint tails, which keeps prompt-background repaint bytes in the live stream while still hiding the hook row itself. Because it runs server-side and hot-reloads through `ConfigReloaded`, live output, scrollback, reconnect snapshots, and search all stay consistent.
+When `terminal.hide_codex_hook_logs` is enabled, sessions apply the [[pty#Codex Hook Log Filter]] on the same PTY read path before forwarding bytes to the client or the server-side Term. The filter recognizes Codex's current documented hook wrappers for `SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`, including `Running ... hook: ...` status-message lines and `hook (completed|failed|blocked|stopped)` trailers, so hook command summaries and only the first raw whitespace-only spacer line after them disappear. Interactive Codex redraws some completion rows without a trailing newline, so the filter preserves the control-sequence tail after the last visible hook byte; if the hidden hook prefix had established a background or other SGR styling that later prompt bytes inherit, the kept tail now reapplies that active style state before replaying the remaining bytes. Inside synchronized updates it also trims hook-only rows from the buffered sync block without discarding ANSI-painted blank rows or other control-only repaint tails, splits legacy `Running ... hook` rows away from later repaint bytes in the same atomic update, and drops trivial reset-plus-newline tails so removed hook rows do not leave blank gaps. Because it runs server-side and hot-reloads through `ConfigReloaded`, live output, scrollback, reconnect snapshots, and search all stay consistent.
 
 The server-side ANSI processor also honors VTE synchronized updates (`CSI ? 2026 h/l`). If a sync block remains open past the parser timeout, the reader task flushes the buffered bytes into the server's Term before polling again so snapshots, reconnect, and search do not lag behind buffered Codex output forever.
 
@@ -48,7 +50,9 @@ Terminal query callbacks share that same reader-task path. Clipboard loads, text
 
 ### Detach and Reattach
 
-Client disconnection clears the client writer but keeps the session alive in the LiveSessionRegistry. Only an explicit `CloseWindow` removes the sessions and window state from future reconnect or handoff.
+Client disconnection clears the client writer, while PTY EOF removes that session from live and ownership state before reconnect or handoff.
+
+`CloseWindow` still removes the whole window and its persisted tree.
 
 `ipc_server.rs` remains the transport and message-dispatch layer for `AttachSessions`, but `attach_flow.rs` now owns the reattach sequence itself: attach-entry preparation from live sessions, pre-snapshot Term and PTY resize, stored metadata and workspace replay, screen snapshot delivery, and the delayed client-writer install.
 

@@ -28,7 +28,7 @@ Messages sent from the UI client to the server, defined in [[crates/scribe-commo
 
 `CreateSession` spawns a new PTY with optional workspace, split direction, working directory, dimensions, and command.
 
-`CloseSession` terminates a session. `CloseWindow` closes all sessions in a window and is acknowledged with `WindowClosed` before the client exits. `QuitAll` broadcasts a shutdown request to every connected client, including the sender.
+`CloseSession` terminates a session. `CloseWindow` closes all sessions in a window and is acknowledged with `WindowClosed` before the client exits. The client also uses `CloseWindow` when a session exit leaves the window with no panes so the empty window is removed from persisted state before it exits. `QuitAll` broadcasts a shutdown request to every connected client, including the sender.
 
 ### Terminal I/O
 
