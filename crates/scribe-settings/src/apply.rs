@@ -182,8 +182,8 @@ fn apply_config_key(
                 config.appearance.focus_border_color = Some(hex.to_owned());
             }
         }
-        "appearance.prompt_bar_bg" => {
-            apply_optional_hex_color(value, &mut config.appearance.prompt_bar_bg, key)?;
+        "appearance.prompt_bar_second_row_bg" | "appearance.prompt_bar_bg" => {
+            apply_optional_hex_color(value, &mut config.appearance.prompt_bar_second_row_bg, key)?;
         }
         "appearance.prompt_bar_first_row_bg" => {
             apply_optional_hex_color(value, &mut config.appearance.prompt_bar_first_row_bg, key)?;

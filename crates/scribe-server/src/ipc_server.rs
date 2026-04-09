@@ -98,7 +98,7 @@ struct PtyReaderState {
     /// Last known CWD from `/proc/pid/cwd`, used to detect changes triggered
     /// by title-change events (for shells that emit OSC 0 but not OSC 7).
     last_proc_cwd: Option<std::path::PathBuf>,
-    /// Rewrites ED 3 (`\x1b[3J`) to ED 2 (`\x1b[2J`) for supported AI sessions.
+    /// Strips ED 3 (`\x1b[3J`) from supported AI sessions to preserve scrollback.
     ed3_filter: Ed3Filter,
     /// Suppresses contiguous Codex hook log blocks when enabled.
     codex_hook_log_filter: CodexHookLogFilter,
@@ -109,7 +109,7 @@ struct PtyReaderState {
     cell_height: u16,
     /// Shared runtime flag updated by `ConfigReloaded`.
     hide_codex_hook_logs: Arc<AtomicBool>,
-    /// When `true`, strip `CSI 3 J` from AI sessions to preserve scrollback.
+    /// When `true`, suppress `CSI 3 J` in AI sessions to preserve scrollback.
     preserve_ai_scrollback: Arc<AtomicBool>,
 }
 

@@ -146,6 +146,85 @@ pub fn pixel_to_grid(
     display_offset: usize,
     padding: &ContentPadding,
 ) -> Option<SelectionPoint> {
+    pixel_to_grid_impl(
+        x,
+        y,
+        pane_rect,
+        cell_w,
+        cell_h,
+        tab_bar_height,
+        prompt_bar_height,
+        prompt_bar_at_top,
+        display_offset,
+        padding,
+        false,
+    )
+}
+
+/// Convert pixel coordinates to an absolute grid position, clamping points
+/// outside the content area to the nearest visible cell.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "pixel / cell_size yields a small positive value fitting in usize / i32"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "coordinate conversion needs pane geometry, cell size, tab bar height, and scroll offset"
+)]
+pub fn pixel_to_grid_clamped(
+    x: f32,
+    y: f32,
+    pane_rect: Rect,
+    cell_w: f32,
+    cell_h: f32,
+    tab_bar_height: f32,
+    prompt_bar_height: f32,
+    prompt_bar_at_top: bool,
+    display_offset: usize,
+    padding: &ContentPadding,
+) -> Option<SelectionPoint> {
+    pixel_to_grid_impl(
+        x,
+        y,
+        pane_rect,
+        cell_w,
+        cell_h,
+        tab_bar_height,
+        prompt_bar_height,
+        prompt_bar_at_top,
+        display_offset,
+        padding,
+        true,
+    )
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "pixel / cell_size yields a small positive value fitting in usize / i32"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "coordinate conversion needs pane geometry, cell size, tab bar height, and scroll offset"
+)]
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "prompt_bar_at_top and clamp_to_content are independent axis concerns"
+)]
+fn pixel_to_grid_impl(
+    x: f32,
+    y: f32,
+    pane_rect: Rect,
+    cell_w: f32,
+    cell_h: f32,
+    tab_bar_height: f32,
+    prompt_bar_height: f32,
+    prompt_bar_at_top: bool,
+    display_offset: usize,
+    padding: &ContentPadding,
+    clamp_to_content: bool,
+) -> Option<SelectionPoint> {
     let chrome_above = tab_bar_height + if prompt_bar_at_top { prompt_bar_height } else { 0.0 };
     let total_chrome = tab_bar_height + prompt_bar_height;
     let content_x = pane_rect.x + padding.left;
@@ -153,18 +232,35 @@ pub fn pixel_to_grid(
     let content_w = (pane_rect.width - padding.left - padding.right).max(0.0);
     let content_h = (pane_rect.height - total_chrome - padding.top - padding.bottom).max(0.0);
 
+    if content_w <= 0.0 || content_h <= 0.0 {
+        return None;
+    }
+
     // Pixel offset relative to the content area origin.
-    let rel_x = x - content_x;
-    let rel_y = y - content_y;
+    let raw_rel_x = x - content_x;
+    let raw_rel_y = y - content_y;
 
     // Reject clicks outside the content area.
-    if rel_x < 0.0 || rel_y < 0.0 || rel_x >= content_w || rel_y >= content_h {
+    if !clamp_to_content
+        && (raw_rel_x < 0.0 || raw_rel_y < 0.0 || raw_rel_x >= content_w || raw_rel_y >= content_h)
+    {
         return None;
     }
 
     if cell_w <= 0.0 || cell_h <= 0.0 {
         return None;
     }
+
+    let rel_x = if clamp_to_content {
+        raw_rel_x.clamp(0.0, (content_w - f32::EPSILON).max(0.0))
+    } else {
+        raw_rel_x
+    };
+    let rel_y = if clamp_to_content {
+        raw_rel_y.clamp(0.0, (content_h - f32::EPSILON).max(0.0))
+    } else {
+        raw_rel_y
+    };
 
     // Clamp to the valid grid range — the content area may contain a
     // fractional cell at the right/bottom edge, so `floor(content / cell)`

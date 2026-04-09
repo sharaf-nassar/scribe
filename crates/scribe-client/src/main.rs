@@ -1016,6 +1016,7 @@ impl App {
             non_empty,
             first_char = ?first_char.map(|c| c.c),
             scrollback_rows = snapshot.scrollback_rows,
+            alt_screen = snapshot.alt_screen,
             "applying screen snapshot"
         );
 
@@ -1023,6 +1024,10 @@ impl App {
             tracing::warn!(%session_id, "snapshot: no pane for session");
             return;
         };
+        let is_codex = self
+            .ai_tracker
+            .provider_for_session(session_id)
+            .is_some_and(|p| p == AiProvider::CodexCode);
         let needs_post_restore_resize = {
             let Some(pane) = self.panes.get_mut(&pane_id) else {
                 tracing::warn!(%session_id, "snapshot: pane not found");
@@ -1052,6 +1057,19 @@ impl App {
 
             if !dims_match {
                 pane.resize_term_only(pane_grid.cols, pane_grid.rows);
+
+                // Codex (via Ink) uses cursor-addressed rendering and may not
+                // fully clear the screen on SIGWINCH redraw.  The reflow from
+                // resizing the snapshot content to the pane's grid garbles the
+                // TUI layout, and Ink's differential render leaves remnants of
+                // the old snapshot visible.  Clear the visible area so Codex's
+                // SIGWINCH redraw starts from a clean slate — scrollback from
+                // the snapshot is preserved.
+                #[allow(clippy::excessive_nesting, reason = "codex guard inside resize branch")]
+                if is_codex {
+                    let _ = pane.feed_output(b"\x1b[H\x1b[2J");
+                }
+
                 // A mismatched snapshot means the server-side PTY was not
                 // actually restored at this pane's grid yet, regardless of
                 // what we assumed before AttachSessions.
@@ -2619,7 +2637,6 @@ impl App {
         }
     }
 
-    /// Reload config from disk and apply changed settings.
     #[allow(
         clippy::too_many_lines,
         clippy::cognitive_complexity,
@@ -2639,15 +2656,21 @@ impl App {
         let old = &self.config;
 
         // -- Theme (conditional) --
-        if old.appearance.theme != new_config.appearance.theme {
+        let theme_name_changed = old.appearance.theme != new_config.appearance.theme;
+        let inline_theme_changed = old.theme != new_config.theme;
+        let external_theme_selected = new_config.appearance.theme != "custom"
+            && scribe_common::theme::resolve_preset(&new_config.appearance.theme).is_none();
+        #[allow(clippy::excessive_nesting, reason = "theme guard inside config reload")]
+        if theme_name_changed || inline_theme_changed || external_theme_selected {
             let new_theme = resolve_theme(&new_config);
-            if let Some(gpu) = &mut self.gpu {
-                gpu.renderer.set_theme(&new_theme);
-            }
-            self.theme = new_theme;
-            // Theme affects cell colors — all pane caches are stale.
-            for pane in self.panes.values_mut() {
-                pane.content_dirty = true;
+            if self.theme != new_theme {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.renderer.set_theme(&new_theme);
+                }
+                self.theme = new_theme;
+                for pane in self.panes.values_mut() {
+                    pane.content_dirty = true;
+                }
             }
         }
 
@@ -3169,10 +3192,13 @@ impl App {
                 )
             };
             prompt_bar::PromptBarColors {
-                bg: resolve(&self.config.appearance.prompt_bar_bg, chrome.prompt_bar_bg),
                 first_row_bg: resolve(
                     &self.config.appearance.prompt_bar_first_row_bg,
                     chrome.prompt_bar_first_row_bg,
+                ),
+                second_row_bg: resolve(
+                    &self.config.appearance.prompt_bar_second_row_bg,
+                    chrome.prompt_bar_second_row_bg,
                 ),
                 text: resolve(&self.config.appearance.prompt_bar_text, chrome.prompt_bar_text),
                 icon_first: resolve(
@@ -3235,7 +3261,7 @@ impl App {
             hovered_tab: self.hovered_tab,
             tab_drag: self.tab_drag.as_ref(),
             tab_drag_offsets: &self.tab_drag_offsets,
-            update_available: None,
+            update_available: self.update_available.as_ref().map(|(v, _)| v.as_str()),
             update_progress: self.update_progress.as_ref(),
         };
         let (mut all_instances, tab_hits, tab_close_hits, tab_eq_hits, tab_upd_hits, tab_tt_hits) =
@@ -5295,7 +5321,7 @@ impl App {
         }
 
         // Check for prompt bar clicks before scrollbar — the scrollbar hit
-        // zone is 3x its visible width and overlaps the dismiss button area.
+        // zone is 3x its visible width and can overlap the prompt-bar overlay.
         let old_prompt_bar_pressed = self.prompt_bar_pressed;
         self.prompt_bar_pressed = self.prompt_bar_target_at(x, y);
         if self.prompt_bar_pressed != old_prompt_bar_pressed {
@@ -5909,7 +5935,7 @@ impl App {
         true
     }
 
-    /// Dismiss the prompt bar if the click lands on the × button.
+    /// Dismiss the prompt bar if the click lands on the hover-only × overlay.
     ///
     /// Returns `true` when the click was consumed.
     fn try_dismiss_prompt_bar(&mut self, x: f32, y: f32) -> bool {
@@ -6216,7 +6242,7 @@ impl App {
         }
         let Some(sel) = self.active_selection else { return };
         let Some((x, y)) = self.last_cursor_pos else { return };
-        let Some(point) = self.cursor_to_grid(x, y) else { return };
+        let Some(point) = self.cursor_to_grid_impl(x, y, true) else { return };
         match sel.mode {
             mouse_state::SelectionMode::Cell => {
                 self.active_selection = Some(selection::SelectionRange::cell(sel.start, point));
@@ -6756,6 +6782,17 @@ impl App {
     /// The returned row is an absolute grid line (negative = scrollback),
     /// incorporating the pane's current `display_offset`.
     fn cursor_to_grid(&self, x: f32, y: f32) -> Option<selection::SelectionPoint> {
+        self.cursor_to_grid_impl(x, y, false)
+    }
+
+    /// Convert a pixel position to an absolute grid cell, optionally clamping
+    /// points outside the content area to the nearest visible cell.
+    fn cursor_to_grid_impl(
+        &self,
+        x: f32,
+        y: f32,
+        clamp_to_content: bool,
+    ) -> Option<selection::SelectionPoint> {
         let gpu = self.gpu.as_ref()?;
         let cell = gpu.renderer.cell_size();
         let pane_rect = self.focused_pane_rect()?;
@@ -6769,18 +6806,34 @@ impl App {
         let pbh = pane.prompt_bar_height(pb_cell_h, self.config.terminal.prompt_bar);
         let pb_at_top = self.config.terminal.prompt_bar_position
             == scribe_common::config::PromptBarPosition::Top;
-        selection::pixel_to_grid(
-            x,
-            y,
-            pane_rect,
-            cell.width,
-            cell.height,
-            tab_bar_h,
-            pbh,
-            pb_at_top,
-            display_offset,
-            &pane::effective_padding(&self.config.appearance.content_padding, pane.edges),
-        )
+        let padding = pane::effective_padding(&self.config.appearance.content_padding, pane.edges);
+        if clamp_to_content {
+            selection::pixel_to_grid_clamped(
+                x,
+                y,
+                pane_rect,
+                cell.width,
+                cell.height,
+                tab_bar_h,
+                pbh,
+                pb_at_top,
+                display_offset,
+                &padding,
+            )
+        } else {
+            selection::pixel_to_grid(
+                x,
+                y,
+                pane_rect,
+                cell.width,
+                cell.height,
+                tab_bar_h,
+                pbh,
+                pb_at_top,
+                display_offset,
+                &padding,
+            )
+        }
     }
 
     /// Compute the screen rect of the currently focused pane.
@@ -8058,14 +8111,26 @@ fn build_all_instances(
                         pin_h,
                     );
 
+                    let saved_offset = pane.term.grid().display_offset();
+
                     // 1. Render scrollback (top portion) at current display_offset.
-                    let top_instances = renderer.build_instances_at(
+                    let mut top_instances = renderer.build_instances_at(
                         device,
                         queue,
                         &mut pane.term,
                         offset,
                         false, // no cursor in scrollback
                     );
+                    if let Some(sel) = effective_selection.filter(|_| is_focused) {
+                        apply_selection_highlight(
+                            &mut top_instances,
+                            offset,
+                            layout.cell_size,
+                            sel,
+                            selection_colors,
+                            saved_offset,
+                        );
+                    }
                     let mut top_filtered = split_scroll::filter_instances_by_y(
                         &top_instances,
                         geo.top_rect.y,
@@ -8076,15 +8141,24 @@ fn build_all_instances(
                     }
 
                     // 2. Render live terminal (bottom portion) at display_offset=0.
-                    let saved_offset = pane.term.grid().display_offset();
                     pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
-                    let live_instances = renderer.build_instances_at(
+                    let mut live_instances = renderer.build_instances_at(
                         device,
                         queue,
                         &mut pane.term,
                         offset,
                         pane_cursor_visible,
                     );
+                    if let Some(sel) = effective_selection.filter(|_| is_focused) {
+                        apply_selection_highlight(
+                            &mut live_instances,
+                            offset,
+                            layout.cell_size,
+                            sel,
+                            selection_colors,
+                            0,
+                        );
+                    }
                     // Restore scroll position.
                     #[allow(
                         clippy::cast_possible_wrap,

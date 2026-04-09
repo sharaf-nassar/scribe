@@ -78,15 +78,15 @@ Normal session panes still receive the raw `CSI ? 2026 h/l` markers end to end. 
 
 ## ED 3 Filter
 
-The [[crates/scribe-pty/src/ed3_filter.rs#Ed3Filter]] rewrites CSI ED 3 (`\x1b[3J`) to CSI ED 2 (`\x1b[2J`) for AI PTY output when `preserve_ai_scrollback` is enabled (default on).
+The [[crates/scribe-pty/src/ed3_filter.rs#Ed3Filter]] strips CSI ED 3 (`\x1b[3J`) from AI PTY output when `preserve_ai_scrollback` is enabled (default on).
 
-Only runs for Claude Code / Codex Code sessions when `preserve_ai_scrollback` is `true`. Regular shell sessions are never filtered. Enabled by default so AI sessions keep earlier transcript history unless the user opts back into standard terminal scrollback clearing.
+Only runs for Claude Code / Codex Code sessions when `preserve_ai_scrollback` is `true`. Regular shell sessions are never filtered. Enabled by default so AI sessions keep earlier transcript history unless the user opts back into standard terminal scrollback clearing. The filter drops ED 3 entirely rather than converting it to ED 2, because a standalone ED 3 (e.g. Codex exit cleanup) must not erase the visible screen — if the program also wants a visible clear it sends its own ED 2.
 
 ### State Machine
 
 Four states track partial matches of the `\x1b[3J` sequence across `filter()` calls.
 
-On a complete match the filter emits `\x1b[2J`, preserving the visible clear-screen repaint while preventing the scrollback wipe. A fast path skips allocation when no ESC byte is present. Pending bytes stay in state until the next call or `flush()`.
+On a complete match the filter drops the sequence (emits nothing), preserving scrollback without injecting a visible screen clear. A fast path skips allocation when no ESC byte is present. Pending bytes stay in state until the next call or `flush()`.
 
 ## Codex Hook Log Filter
 

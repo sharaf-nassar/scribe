@@ -1,10 +1,24 @@
-//! Config file watcher for live-reloading `~/.config/scribe/config.toml`.
+//! Config file watcher for live-reloading the active Scribe config directory.
+
+use std::path::Path;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use scribe_common::app::current_config_dir;
 use winit::event_loop::EventLoopProxy;
 
 use crate::ipc_client::UiEvent;
+
+/// Return whether a notify path should trigger a config reload.
+///
+/// We normally care only about `config.toml` or files inside `themes/`.
+/// On macOS, `notify` uses `FSEvents`, which can report only the watched
+/// directory and expects clients to rescan it, so the root config dir itself
+/// must also count as relevant there.
+fn is_relevant_config_event_path(config_dir: &Path, path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "config.toml")
+        || path.components().any(|component| component.as_os_str() == "themes")
+        || (cfg!(target_os = "macos") && path == config_dir)
+}
 
 /// Start a file watcher on the scribe config directory.
 ///
@@ -16,18 +30,15 @@ use crate::ipc_client::UiEvent;
 /// stops the watcher.
 pub fn start_config_watcher(proxy: EventLoopProxy<UiEvent>) -> Option<RecommendedWatcher> {
     let config_path = current_config_dir()?;
+    let watched_config_dir = config_path.clone();
 
     let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
         let Some(event) = res.ok() else { return };
         if !event.kind.is_modify() && !event.kind.is_create() {
             return;
         }
-        // Only fire for `config.toml` itself or files inside `themes/` —
-        // avoids spurious reloads from editor swap/backup files.
-        let relevant = event.paths.iter().any(|p| {
-            p.file_name().is_some_and(|n| n == "config.toml")
-                || p.components().any(|c| c.as_os_str() == "themes")
-        });
+        let relevant =
+            event.paths.iter().any(|path| is_relevant_config_event_path(&watched_config_dir, path));
         if relevant && proxy.send_event(UiEvent::ConfigChanged).is_err() {
             tracing::debug!("event loop closed; config watcher event dropped");
         }

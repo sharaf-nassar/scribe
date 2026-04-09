@@ -12,7 +12,7 @@ Tracks Claude Code and Codex Code process lifecycle by parsing OSC 1337 escape s
 
 Unified TOML config for server and client, deserialized from the active install flavor's XDG config root into [[crates/scribe-common/src/config.rs#ScribeConfig]].
 
-Stable installs read `~/.config/scribe/config.toml`, while `scribe-dev` reads `~/.config/scribe-dev/config.toml`. `ScribeConfig` is the top-level struct with six sub-sections: `appearance`, `theme`, `terminal`, `keybindings`, `workspaces`, and `update`. The [[crates/scribe-common/src/config.rs#load_config]] function reads the file and returns `ScribeConfig::default()` if absent.
+Stable installs read `~/.config/scribe/config.toml`, while `scribe-dev` reads `~/.config/scribe-dev/config.toml`. `ScribeConfig` is the top-level struct with six sub-sections: `appearance`, `theme`, `terminal`, `keybindings`, `workspaces`, and `update`. The [[crates/scribe-common/src/config.rs#load_config]] function reads the file and returns `ScribeConfig::default()` if absent. Prompt-bar configs still deserialize the legacy `prompt_bar_bg` key as a compatibility alias for `prompt_bar_second_row_bg`, while Debian package installs additionally rewrite that legacy key on disk during upgrade so future launches use the exact-fill row model directly.
 
 ### Appearance
 
@@ -30,9 +30,9 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 [[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, AI toggles, indicator height, shell integration, status bar stats, prompt bar, and scroll pin settings.
 
-`scroll_pin` (bool, default `false`) enables split-scroll in AI panes, but only while the pane is in the normal screen buffer; alternate-screen TUIs fall back to the regular live view. `preserve_ai_scrollback` (bool, default `true`) downgrades AI-session `CSI 3 J` scrollback clears into `CSI 2 J` full-screen clears so redraws keep their clean viewport without wiping prior history.
+`scroll_pin` (bool, default `false`) enables split-scroll in AI panes, but only while the pane is in the normal screen buffer; alternate-screen TUIs fall back to the regular live view. `preserve_ai_scrollback` (bool, default `true`) strips AI-session `CSI 3 J` scrollback clears so prior history is preserved without injecting a visible screen clear.
 
-Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (f32, 8–32, default 14), and `prompt_bar_position` ([[crates/scribe-common/src/config.rs#PromptBarPosition]]: Top or Bottom).
+Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (f32, 8–32, default 14), `prompt_bar_position` ([[crates/scribe-common/src/config.rs#PromptBarPosition]]: Top or Bottom), and optional row-surface overrides for the first row, second row, text, first icon, and latest icon.
 
 [[crates/scribe-common/src/config.rs#StatusBarStatsConfig]] independently toggles CPU, memory, GPU, and network display. [[crates/scribe-common/src/config.rs#ShellIntegrationConfig]] wraps a single `enabled` flag for shell prompt marks. [[crates/scribe-common/src/config.rs#TerminalConfig#ai_provider_enabled]] maps an [[crates/scribe-common/src/ai_state.rs#AiProvider]] to the matching integration toggle.
 
@@ -126,4 +126,4 @@ The presets are defined in `theme_community_presets.rs` as a static slice of `Th
 
 [[crates/scribe-common/src/theme.rs#ChromeColors]] is derived automatically from the terminal foreground, background, and ANSI palette — no manual chrome configuration is required.
 
-The derivation algorithm lightens the background by 6% for the tab bar, uses ANSI blue (index 4) as the accent, and applies alpha-reduced foreground tones for separators, dividers, scrollbar, and status bar text. Prompt bar colors are also derived: background from lightened terminal background, first-row from darkened background, text at 50% foreground alpha, first icon from ANSI yellow (index 3), latest icon from ANSI blue (index 4). All prompt bar colors can be overridden via `AppearanceConfig` fields. This ensures chrome colors remain visually coherent when a user switches themes or defines a custom palette.
+The derivation algorithm lightens the background by 6% for the tab bar, uses ANSI blue (index 4) as the accent, and applies alpha-reduced foreground tones for separators, dividers, scrollbar, and status bar text. Prompt bar colors are also derived as restrained first-row and second-row surfaces, plus muted text, first icon, and latest icon; `AppearanceConfig` can override those surfaces directly. This keeps the chrome visually coherent when a user switches themes or defines a custom palette.

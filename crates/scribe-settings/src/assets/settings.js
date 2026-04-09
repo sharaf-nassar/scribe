@@ -77,6 +77,9 @@ function loadThemeColors(data) {
   if (!isCustomMode && themeColors[activeThemeId]) {
     populateColorEditor(themeColors[activeThemeId]);
   }
+  if (currentConfig && Object.keys(currentConfig).length > 0) {
+    syncPromptBarSwatches(currentConfig);
+  }
   renderThemeGrid();
 }
 
@@ -222,6 +225,7 @@ function selectTheme(id) {
   if (spec) { populateColorEditor(spec); }
   sendChange("theme.preset", id);
   renderThemeGrid();
+  syncPromptBarSwatches(currentConfig);
 }
 
 function populateColorEditor(spec) {
@@ -242,6 +246,150 @@ function populateColorEditor(spec) {
   }
 }
 
+function clampChannel(value) {
+  return Math.max(0, Math.min(255, Math.round(value)));
+}
+
+function hexToRgb(hex) {
+  if (!hex || typeof hex !== "string") { return null; }
+  var normalized = hex.charAt(0) === "#" ? hex.slice(1) : hex;
+  if (normalized.length !== 6) { return null; }
+  return {
+    r: parseInt(normalized.slice(0, 2), 16),
+    g: parseInt(normalized.slice(2, 4), 16),
+    b: parseInt(normalized.slice(4, 6), 16)
+  };
+}
+
+function rgbToHex(rgb) {
+  if (!rgb) { return "#000000"; }
+  return "#" + [rgb.r, rgb.g, rgb.b].map(function(channel) {
+    return clampChannel(channel).toString(16).padStart(2, "0");
+  }).join("");
+}
+
+function lightenHex(hex, amount) {
+  var rgb = hexToRgb(hex);
+  if (!rgb) { return "#151528"; }
+  return rgbToHex({
+    r: rgb.r + amount * 255,
+    g: rgb.g + amount * 255,
+    b: rgb.b + amount * 255
+  });
+}
+
+function darkenHex(hex, amount) {
+  var rgb = hexToRgb(hex);
+  if (!rgb) { return "#0f0f20"; }
+  return rgbToHex({
+    r: rgb.r - amount * 255,
+    g: rgb.g - amount * 255,
+    b: rgb.b - amount * 255
+  });
+}
+
+function activeThemeSpec() {
+  if (isCustomMode) {
+    var savedAnsi = Array.isArray(currentConfig.theme?.colors) ? currentConfig.theme.colors : [];
+    return {
+      fg: getSwatchColor("theme.foreground") || currentConfig.theme?.foreground || "#e4e4e7",
+      bg: getSwatchColor("theme.background") || currentConfig.theme?.background || "#0e0e10",
+      ansi: [
+        getAnsiSwatchColor("theme.ansi_normal.0") || savedAnsi[0] || "#27272a",
+        getAnsiSwatchColor("theme.ansi_normal.1") || savedAnsi[1] || "#ef4444",
+        getAnsiSwatchColor("theme.ansi_normal.2") || savedAnsi[2] || "#22c55e",
+        getAnsiSwatchColor("theme.ansi_normal.3") || savedAnsi[3] || "#eab308",
+        getAnsiSwatchColor("theme.ansi_normal.4") || savedAnsi[4] || "#3b82f6"
+      ]
+    };
+  }
+  if (themeColors[activeThemeId]) {
+    return themeColors[activeThemeId];
+  }
+  return {
+    fg: "#e4e4e7",
+    bg: "#0e0e10",
+    ansi: ["#27272a", "#ef4444", "#22c55e", "#eab308", "#3b82f6"]
+  };
+}
+
+function alphaColorString(hex, alpha) {
+  var rgb = hexToRgb(hex);
+  if (!rgb) { return "rgba(142, 142, 181, 0.5)"; }
+  return "rgba(" + clampChannel(rgb.r) + ", " + clampChannel(rgb.g) + ", " + clampChannel(rgb.b) + ", " + alpha + ")";
+}
+
+function getPromptBarThemeDefaults() {
+  var spec = activeThemeSpec();
+  var background = spec.bg || "#0e0e10";
+  var foreground = spec.fg || "#e4e4e7";
+  var ansi = Array.isArray(spec.ansi) ? spec.ansi : [];
+  return {
+    firstRow: darkenHex(background, 0.02),
+    secondRow: lightenHex(background, 0.03),
+    textSwatch: alphaColorString(foreground, 0.5),
+    textInput: foreground,
+    iconFirst: ansi[3] || foreground,
+    iconLatest: ansi[4] || foreground
+  };
+}
+
+function syncPromptBarSwatches(config) {
+  var defaults = getPromptBarThemeDefaults();
+  var secondRowOverride =
+    config.appearance?.prompt_bar_second_row_bg || config.appearance?.prompt_bar_bg;
+  var firstRowOverride = config.appearance?.prompt_bar_first_row_bg;
+  var textOverride = config.appearance?.prompt_bar_text;
+  var iconFirstOverride = config.appearance?.prompt_bar_icon_first;
+  var iconLatestOverride = config.appearance?.prompt_bar_icon_latest;
+
+  if (secondRowOverride) {
+    setColorSwatch("appearance.prompt_bar_second_row_bg", secondRowOverride);
+  } else {
+    setColorSwatchVisual(
+      "appearance.prompt_bar_second_row_bg",
+      defaults.secondRow,
+      defaults.secondRow
+    );
+  }
+
+  if (firstRowOverride) {
+    setColorSwatch("appearance.prompt_bar_first_row_bg", firstRowOverride);
+  } else {
+    setColorSwatchVisual(
+      "appearance.prompt_bar_first_row_bg",
+      defaults.firstRow,
+      defaults.firstRow
+    );
+  }
+
+  if (textOverride) {
+    setColorSwatch("appearance.prompt_bar_text", textOverride);
+  } else {
+    setColorSwatchVisual("appearance.prompt_bar_text", defaults.textSwatch, defaults.textInput);
+  }
+
+  if (iconFirstOverride) {
+    setColorSwatch("appearance.prompt_bar_icon_first", iconFirstOverride);
+  } else {
+    setColorSwatchVisual(
+      "appearance.prompt_bar_icon_first",
+      defaults.iconFirst,
+      defaults.iconFirst
+    );
+  }
+
+  if (iconLatestOverride) {
+    setColorSwatch("appearance.prompt_bar_icon_latest", iconLatestOverride);
+  } else {
+    setColorSwatchVisual(
+      "appearance.prompt_bar_icon_latest",
+      defaults.iconLatest,
+      defaults.iconLatest
+    );
+  }
+}
+
 function enterCustomMode() {
   if (isCustomMode) { return; }
   isCustomMode = true;
@@ -259,6 +407,7 @@ function initThemeColorEditor() {
     if (!colorInput) { return; }
     colorInput.addEventListener("change", function() {
       enterCustomMode();
+      syncPromptBarSwatches(currentConfig);
     });
   });
 
@@ -267,6 +416,7 @@ function initThemeColorEditor() {
     if (!colorInput) { return; }
     colorInput.addEventListener("change", function() {
       enterCustomMode();
+      syncPromptBarSwatches(currentConfig);
     });
   });
 
@@ -533,6 +683,9 @@ function initColorSwatches() {
 
     colorInput.addEventListener("change", function() {
       sendChange(key, colorInput.value);
+      if (key.startsWith("appearance.prompt_bar_")) {
+        syncPromptBarConfigValue(key, colorInput.value);
+      }
     });
   });
 
@@ -547,6 +700,9 @@ function initColorSwatches() {
 
     colorInput.addEventListener("change", function() {
       sendChange(key, colorInput.value);
+      if (key.startsWith("appearance.prompt_bar_")) {
+        syncPromptBarConfigValue(key, colorInput.value);
+      }
     });
   });
 }
@@ -654,13 +810,6 @@ function loadConfig(config) {
   setColorSwatch('appearance.focus_border_color', config.appearance?.focus_border_color || '#3b82f6');
   setStepperValue('appearance.focus_border_width', config.appearance?.focus_border_width ?? 2);
 
-  // Appearance — Prompt Bar
-  setColorSwatch('appearance.prompt_bar_bg', config.appearance?.prompt_bar_bg || '#151528');
-  setColorSwatch('appearance.prompt_bar_first_row_bg', config.appearance?.prompt_bar_first_row_bg || '#0f0f20');
-  setColorSwatch('appearance.prompt_bar_text', config.appearance?.prompt_bar_text || '#8e8eb5');
-  setColorSwatch('appearance.prompt_bar_icon_first', config.appearance?.prompt_bar_icon_first || '#d4a054');
-  setColorSwatch('appearance.prompt_bar_icon_latest', config.appearance?.prompt_bar_icon_latest || '#818cf8');
-
   // Terminal
   setStepperValue("terminal.scrollback_lines", config.terminal?.scrollback_lines);
   setToggleValue("terminal.natural_scroll", config.terminal?.natural_scroll);
@@ -715,6 +864,9 @@ function loadConfig(config) {
   } else if (themeColors[activeThemeId]) {
     populateColorEditor(themeColors[activeThemeId]);
   }
+
+  // Appearance — Prompt Bar
+  syncPromptBarSwatches(config);
 
   renderThemeGrid();
 
@@ -807,6 +959,40 @@ function setColorSwatch(key, color) {
     swatch.style.background = color;
     var input = swatch.querySelector("input[type='color']");
     if (input) { input.value = color; }
+  }
+}
+
+function syncPromptBarConfigValue(key, value) {
+  if (!currentConfig.appearance) {
+    currentConfig.appearance = {};
+  }
+
+  if (key === "appearance.prompt_bar_second_row_bg") {
+    if (value === undefined || value === null || value === "") {
+      delete currentConfig.appearance.prompt_bar_second_row_bg;
+      delete currentConfig.appearance.prompt_bar_bg;
+    } else {
+      currentConfig.appearance.prompt_bar_second_row_bg = value;
+      delete currentConfig.appearance.prompt_bar_bg;
+    }
+    return;
+  }
+
+  var appearanceKey = key.slice("appearance.".length);
+  if (value === undefined || value === null || value === "") {
+    delete currentConfig.appearance[appearanceKey];
+  } else {
+    currentConfig.appearance[appearanceKey] = value;
+  }
+}
+
+function setColorSwatchVisual(key, swatchColor, inputColor) {
+  if (!swatchColor) { return; }
+  var swatch = document.querySelector(".color-swatch[data-key='" + key + "']");
+  if (swatch) {
+    swatch.style.background = swatchColor;
+    var input = swatch.querySelector("input[type='color']");
+    if (input && inputColor) { input.value = inputColor; }
   }
 }
 
@@ -1521,16 +1707,24 @@ document.addEventListener("DOMContentLoaded", function() {
       } else if (key.startsWith('appearance.prompt_bar_')) {
         // Send empty string to clear override (server sets to None)
         sendChange(key, '');
+        syncPromptBarConfigValue(key, '');
         // Reset swatch to default visual
+        const promptBarDefaults = getPromptBarThemeDefaults();
         const defaults = {
-          'appearance.prompt_bar_bg': '#151528',
-          'appearance.prompt_bar_first_row_bg': '#0f0f20',
-          'appearance.prompt_bar_text': '#8e8eb5',
-          'appearance.prompt_bar_icon_first': '#d4a054',
-          'appearance.prompt_bar_icon_latest': '#818cf8'
+          'appearance.prompt_bar_second_row_bg': promptBarDefaults.secondRow,
+          'appearance.prompt_bar_first_row_bg': promptBarDefaults.firstRow,
+          'appearance.prompt_bar_text': promptBarDefaults.textSwatch,
+          'appearance.prompt_bar_icon_first': promptBarDefaults.iconFirst,
+          'appearance.prompt_bar_icon_latest': promptBarDefaults.iconLatest
         };
         const def = defaults[key];
-        if (def) setColorSwatch(key, def);
+        if (def) {
+          if (key === 'appearance.prompt_bar_text') {
+            setColorSwatchVisual(key, def, promptBarDefaults.textInput);
+          } else {
+            setColorSwatchVisual(key, def, def);
+          }
+        }
       }
     });
   });

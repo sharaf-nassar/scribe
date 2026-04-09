@@ -146,10 +146,10 @@ pub struct AppearanceConfig {
     pub tab_height: f32,
     #[serde(default)]
     pub content_padding: ContentPadding,
-    /// Override color for the prompt bar background (`#rrggbb`).
-    #[serde(default)]
-    pub prompt_bar_bg: Option<String>,
-    /// Override color for the first-row darker background (`#rrggbb`).
+    /// Override color for the second prompt bar row background (`#rrggbb`).
+    #[serde(default, alias = "prompt_bar_bg")]
+    pub prompt_bar_second_row_bg: Option<String>,
+    /// Override color for the first prompt bar row background (`#rrggbb`).
     #[serde(default)]
     pub prompt_bar_first_row_bg: Option<String>,
     /// Override color for prompt bar text (`#rrggbb`).
@@ -185,7 +185,7 @@ impl Default for AppearanceConfig {
             status_bar_height: default_status_bar_height(),
             tab_height: default_tab_height(),
             content_padding: ContentPadding::default(),
-            prompt_bar_bg: None,
+            prompt_bar_second_row_bg: None,
             prompt_bar_first_row_bg: None,
             prompt_bar_text: None,
             prompt_bar_icon_first: None,
@@ -342,7 +342,7 @@ pub enum PromptBarPosition {
 ///
 /// When `appearance.theme == "custom"`, these values are used to build a
 /// runtime `Theme`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThemeConfig {
     pub name: String,
     pub foreground: String,

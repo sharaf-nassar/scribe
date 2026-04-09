@@ -34,8 +34,8 @@ pub struct ChromeColors {
     pub tab_bar_gradient_top: [f32; 4],
     pub status_bar_separator: [f32; 4],
     // Prompt bar
-    pub prompt_bar_bg: [f32; 4],
     pub prompt_bar_first_row_bg: [f32; 4],
+    pub prompt_bar_second_row_bg: [f32; 4],
     pub prompt_bar_text: [f32; 4],
     pub prompt_bar_icon_first: [f32; 4],
     pub prompt_bar_icon_latest: [f32; 4],
@@ -106,9 +106,9 @@ impl Theme {
         let tab_bar_gradient_top = lighten(tab_bar_bg, 0.03);
         let status_bar_separator = with_alpha(foreground, 0.12);
 
-        // Prompt bar: slightly lighter than terminal bg, with muted text
-        let prompt_bar_bg = lighten(background, 0.03);
+        // Prompt bar: restrained first- and second-row surfaces with muted text
         let prompt_bar_first_row_bg = darken(background, 0.02);
+        let prompt_bar_second_row_bg = lighten(background, 0.03);
         let prompt_bar_text = with_alpha(foreground, 0.50);
         // ANSI yellow (index 3) for the origin icon, ANSI blue (index 4) for latest
         let prompt_bar_icon_first = ansi_colors.get(3).copied().unwrap_or(foreground);
@@ -127,8 +127,8 @@ impl Theme {
             scrollbar,
             tab_bar_gradient_top,
             status_bar_separator,
-            prompt_bar_bg,
             prompt_bar_first_row_bg,
+            prompt_bar_second_row_bg,
             prompt_bar_text,
             prompt_bar_icon_first,
             prompt_bar_icon_latest,

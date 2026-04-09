@@ -602,6 +602,8 @@ pub fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
         (scrollback, history)
     };
 
+    tracing::debug!(cols, rows, alt_screen, scrollback_rows = history, "snapshot_term captured");
+
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,

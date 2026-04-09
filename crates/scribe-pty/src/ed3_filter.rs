@@ -1,9 +1,9 @@
 /// Result of filtering: either the original bytes (no ED 3 found) or
-/// a new buffer with ED 3 sequences rewritten to ED 2.
+/// a new buffer with ED 3 sequences stripped out.
 pub enum Ed3Output<'a> {
     /// No ED 3 found — original bytes unchanged.
     Unchanged(&'a [u8]),
-    /// ED 3 sequences rewritten — use this filtered buffer instead.
+    /// ED 3 sequences stripped — use this filtered buffer instead.
     Filtered(Vec<u8>),
 }
 
@@ -16,12 +16,12 @@ impl Ed3Output<'_> {
     }
 }
 
-/// State machine that rewrites CSI ED 3 (`\x1b[3J`) to CSI ED 2 (`\x1b[2J`).
+/// State machine that strips CSI ED 3 (`\x1b[3J`) from AI PTY output.
 ///
-/// When an AI assistant sends ED 3 to wipe scrollback, preserve the visible
-/// clear-screen effect but downgrade the scrollback wipe to a normal full-screen
-/// clear. This keeps prior history while still letting the client repaint from
-/// a clean viewport.
+/// When an AI assistant sends ED 3 to wipe scrollback, silently drop the
+/// sequence so prior history is preserved. If the program also wants to clear
+/// the visible screen, it sends its own ED 2 — we don't inject one, because a
+/// standalone ED 3 (e.g. Codex exit cleanup) must not erase the visible area.
 ///
 /// Handles sequences split across multiple `filter()` calls. Pending bytes
 /// from a partial match are carried over until confirmed or flushed.
@@ -39,7 +39,7 @@ impl Ed3Filter {
         Self { state: 0 }
     }
 
-    /// Filter `input`, rewriting any complete `\x1b[3J` sequences to `\x1b[2J`.
+    /// Filter `input`, stripping any complete `\x1b[3J` sequences.
     ///
     /// Partial matches at the end of `input` are held in state and not emitted
     /// until the next call (or `flush()`).
@@ -92,13 +92,14 @@ impl Ed3Filter {
         diverged
     }
 
-    /// Advance the match. If the full 4-byte sequence is matched, emit ED 2.
+    /// Advance the match. If the full 4-byte sequence is matched, drop it.
     /// Returns `true` when a complete sequence was consumed (output diverged).
-    fn advance_match(&mut self, out: &mut Vec<u8>) -> bool {
+    fn advance_match(&mut self, _out: &mut Vec<u8>) -> bool {
         self.state += 1;
         if self.state == 4 {
             self.state = 0;
-            out.extend_from_slice(&[0x1B, 0x5B, 0x32, 0x4A]);
+            // Don't emit anything — just suppress the scrollback wipe.
+            // If the program wanted a visible clear, it sends its own ED 2.
             return true;
         }
         false
@@ -143,17 +144,17 @@ mod tests {
     use super::Ed3Filter;
 
     #[test]
-    fn rewrites_complete_ed3_sequence_to_ed2() {
+    fn strips_complete_ed3_sequence() {
         let mut filter = Ed3Filter::new();
 
         let output = filter.filter(b"before\x1b[3Jafter");
 
-        assert_eq!(output.as_bytes(), b"before\x1b[2Jafter");
+        assert_eq!(output.as_bytes(), b"beforeafter");
         assert_eq!(filter.flush(), None);
     }
 
     #[test]
-    fn rewrites_split_ed3_sequence_across_chunks() {
+    fn strips_split_ed3_sequence_across_chunks() {
         let mut filter = Ed3Filter::new();
 
         let first = filter.filter(b"before\x1b[");
@@ -161,7 +162,7 @@ mod tests {
 
         let second = filter.filter(b"3Jafter");
 
-        assert_eq!(second.as_bytes(), b"\x1b[2Jafter");
+        assert_eq!(second.as_bytes(), b"after");
         assert_eq!(filter.flush(), None);
     }
 

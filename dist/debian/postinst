@@ -115,6 +115,151 @@ compute_server_runtime_generation() {
     } | sha256sum | cut -d' ' -f1
 }
 
+user_config_home() {
+    local config_home=""
+
+    if [ -n "$SUDO_UID" ]; then
+        config_home="$(run_user_command sh -lc 'printf %s "${XDG_CONFIG_HOME:-}"' 2>/dev/null || true)"
+    else
+        config_home="${XDG_CONFIG_HOME:-}"
+    fi
+
+    if [ -n "$config_home" ]; then
+        printf '%s\n' "$config_home"
+        return 0
+    fi
+
+    local home_dir=""
+    home_dir="$(getent passwd "$TARGET_UID" | cut -d: -f6)"
+    [ -n "$home_dir" ] || return 1
+    printf '%s/.config\n' "$home_dir"
+}
+
+is_hex_color() {
+    [[ "$1" =~ ^#?[0-9A-Fa-f]{6}$ ]]
+}
+
+normalize_hex_color() {
+    local value="${1#\#}"
+    if ! is_hex_color "$value"; then
+        return 1
+    fi
+    printf '#%s\n' "${value^^}"
+}
+
+mix_hex_colors() {
+    local a="" b="" numerator="$3" denominator="$4"
+    local ar="" ag="" ab="" br="" bg="" bb=""
+    local rr="" rg="" rb=""
+
+    a="$(normalize_hex_color "$1")" || return 1
+    b="$(normalize_hex_color "$2")" || return 1
+
+    a="${a#\#}"
+    b="${b#\#}"
+
+    ar=$((16#${a:0:2}))
+    ag=$((16#${a:2:2}))
+    ab=$((16#${a:4:2}))
+    br=$((16#${b:0:2}))
+    bg=$((16#${b:2:2}))
+    bb=$((16#${b:4:2}))
+
+    rr=$((((ar * (denominator - numerator)) + (br * numerator) + denominator / 2) / denominator))
+    rg=$((((ag * (denominator - numerator)) + (bg * numerator) + denominator / 2) / denominator))
+    rb=$((((ab * (denominator - numerator)) + (bb * numerator) + denominator / 2) / denominator))
+
+    printf '#%02X%02X%02X\n' "$rr" "$rg" "$rb"
+}
+
+migrate_prompt_bar_config() {
+    local config_path="$1"
+    [ -f "$config_path" ] || return 0
+
+    local owner mode tmp_path changed=0
+    owner="$(stat -c '%u:%g' "$config_path" 2>/dev/null || printf '%s:%s' "$TARGET_UID" "$TARGET_UID")"
+    mode="$(stat -c '%a' "$config_path" 2>/dev/null || echo 600)"
+
+    local -a lines=()
+    local -A drop_lines=()
+    local section=""
+    local line=""
+    local legacy_idx=-1 first_idx=-1 second_idx=-1
+    local legacy_quote='"' legacy_suffix="" legacy_value=""
+    local first_quote='"' first_suffix="" first_value=""
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        lines+=("$line")
+        local idx=$((${#lines[@]} - 1))
+
+        if [[ "$line" =~ ^[[:space:]]*\[([[:alnum:]_.-]+)\][[:space:]]*$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        [ "$section" = "appearance" ] || continue
+
+        if [[ "$line" =~ ^([[:space:]]*)prompt_bar_bg([[:space:]]*=[[:space:]]*)\"(#?[0-9A-Fa-f]{6})\"([[:space:]]*(#.*)?)$ ]]; then
+            legacy_idx="$idx"
+            legacy_quote='"'
+            legacy_value="${BASH_REMATCH[3]}"
+            legacy_suffix="${BASH_REMATCH[4]}"
+            continue
+        fi
+
+        if [[ "$line" =~ ^([[:space:]]*)prompt_bar_first_row_bg([[:space:]]*=[[:space:]]*)\"(#?[0-9A-Fa-f]{6})\"([[:space:]]*(#.*)?)$ ]]; then
+            first_idx="$idx"
+            first_quote='"'
+            first_value="${BASH_REMATCH[3]}"
+            first_suffix="${BASH_REMATCH[4]}"
+            continue
+        fi
+
+        if [[ "$line" =~ ^[[:space:]]*prompt_bar_second_row_bg[[:space:]]*= ]]; then
+            second_idx="$idx"
+        fi
+    done < "$config_path"
+
+    [ "$legacy_idx" -ge 0 ] || return 0
+
+    if [ "$second_idx" -ge 0 ]; then
+        drop_lines["$legacy_idx"]=1
+        changed=1
+    else
+        local migrated_second=""
+        migrated_second="$(normalize_hex_color "$legacy_value")" || return 0
+
+        if [ "$first_idx" -ge 0 ]; then
+            local migrated_first="" shell_bg=""
+            shell_bg="$(mix_hex_colors "$legacy_value" "$first_value" 14 100)" || return 0
+            migrated_first="$(mix_hex_colors "$shell_bg" "$first_value" 50 100)" || return 0
+            migrated_second="$(mix_hex_colors "$shell_bg" "$legacy_value" 8 100)" || return 0
+            lines[$first_idx]="prompt_bar_first_row_bg = ${first_quote}${migrated_first}${first_quote}${first_suffix}"
+        fi
+
+        lines[$legacy_idx]="prompt_bar_second_row_bg = ${legacy_quote}${migrated_second}${legacy_quote}${legacy_suffix}"
+        changed=1
+    fi
+
+    [ "$changed" = "1" ] || return 0
+
+    tmp_path="$(mktemp "${config_path}.XXXXXX")" || return 1
+    {
+        local idx
+        for idx in "${!lines[@]}"; do
+            if [[ -v drop_lines[$idx] ]]; then
+                continue
+            fi
+            printf '%s\n' "${lines[$idx]}"
+        done
+    } > "$tmp_path"
+
+    chmod "$mode" "$tmp_path" 2>/dev/null || true
+    chown "$owner" "$tmp_path" 2>/dev/null || true
+    mv "$tmp_path" "$config_path"
+    echo "  Migrated legacy prompt bar colors in ${config_path}."
+}
+
 run_user_command() {
     if [ -n "$SUDO_UID" ]; then
         local display="$(user_manager_env DISPLAY)"
@@ -258,6 +403,10 @@ case "$1" in
         SERVER_RUNTIME_GENERATION_FILE="${STATE_DIR}/server-runtime-generation"
 
         ensure_state_dir
+        CONFIG_HOME="$(user_config_home || true)"
+        if [ -n "$CONFIG_HOME" ]; then
+            migrate_prompt_bar_config "${CONFIG_HOME}/${APP_SLUG}/config.toml" || true
+        fi
         run_user_systemctl daemon-reload || true
 
         # Check for a running server process, not just a stale socket file.
