@@ -244,6 +244,9 @@ pub enum ServerMessage {
     WorkspaceNamed {
         workspace_id: WorkspaceId,
         name: String,
+        /// Absolute path to the project directory (root + first CWD component).
+        #[serde(default)]
+        project_root: Option<PathBuf>,
     },
     SessionCreated {
         session_id: SessionId,
@@ -283,6 +286,9 @@ pub enum ServerMessage {
         /// Direction of the split that created this workspace.  `None` for
         /// the initial (unsplit) workspace.
         split_direction: Option<LayoutDirection>,
+        /// Absolute path to the project directory (root + first CWD component).
+        #[serde(default)]
+        project_root: Option<PathBuf>,
     },
     /// Scrollback snapshot at a specific offset from the bottom.
     ScrolledSnapshot {

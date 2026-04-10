@@ -86,13 +86,13 @@ Messages sent from the server to clients, defined in [[crates/scribe-common/src/
 
 `AiStateChanged` and `AiStateCleared` report AI process state from OSC 1337. `CwdChanged` reports working directory from OSC 7.
 
-`TitleChanged` reports window title from OSC 0/2. `SessionContextChanged` reports shell-emitted remote-host and tmux metadata from OSC 1337 `ScribeContext`. `CodexTaskLabelChanged` and `CodexTaskLabelCleared` report the separate Codex task-label channel used for tab naming. `GitBranch` reports the detected git branch for a session's CWD. `WorkspaceNamed` reports auto-detected workspace names. `PromptReceived` carries the session ID, AI provider, and submitted prompt text for display in the prompt bar UI.
+`TitleChanged` reports window title from OSC 0/2. `SessionContextChanged` reports shell-emitted remote-host and tmux metadata from OSC 1337 `ScribeContext`. `CodexTaskLabelChanged` and `CodexTaskLabelCleared` report the separate Codex task-label channel used for tab naming. `GitBranch` reports the detected git branch for a session's CWD. `WorkspaceNamed` reports auto-detected workspace names and the project root path. `PromptReceived` carries the session ID, AI provider, and submitted prompt text for display in the prompt bar UI.
 
 ### Connection
 
 `Welcome` responds to Hello with the assigned window ID and a list of other connected windows. `WindowClosed` confirms that a `CloseWindow` request permanently removed that window. `QuitRequested` is the shutdown acknowledgment for `QuitAll`.
 
-`SessionList` returns all sessions grouped by workspace in response to `ListSessions`. Each session entry includes the active AI state, if any, the last known AI provider hint, the last known Codex task label, the shell basename, and the last known session context so reconnect can restore provider-aware titles and remote labels without waiting for a fresh prompt. `WorkspaceInfo` sends workspace metadata (name, accent color, split direction).
+`SessionList` returns all sessions grouped by workspace in response to `ListSessions`. Each session entry includes the active AI state, if any, the last known AI provider hint, the last known Codex task label, the shell basename, and the last known session context so reconnect can restore provider-aware titles and remote labels without waiting for a fresh prompt. `WorkspaceInfo` sends workspace metadata (name, accent color, split direction, and project root path).
 
 When `SessionList` also includes a workspace tree, that tree is the authoritative workspace layout. The `split_direction` field is only needed for the legacy reconnect fallback where older servers omit the tree and the client must repair the linear default layout once during startup.
 

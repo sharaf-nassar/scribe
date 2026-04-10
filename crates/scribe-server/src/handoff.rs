@@ -120,6 +120,9 @@ pub struct HandoffWorkspace {
     pub session_ids: Vec<SessionId>,
     /// Direction of the split that created this workspace.
     pub split_direction: Option<scribe_common::protocol::LayoutDirection>,
+    /// Absolute path to the project directory (root + first CWD component).
+    #[serde(default)]
+    pub project_root: Option<PathBuf>,
 }
 
 // ── Sender (old server) ─────────────────────────────────────────────

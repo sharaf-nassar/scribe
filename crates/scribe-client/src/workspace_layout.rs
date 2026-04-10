@@ -48,6 +48,9 @@ pub struct WorkspaceSlot {
     pub active_tab: usize,
     pub accent_color: [f32; 4],
     pub name: Option<String>,
+    /// Absolute path to the project directory (root + first CWD component).
+    /// Set by the server when a session CWD matches a configured workspace root.
+    pub project_root: Option<std::path::PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +81,7 @@ impl WindowLayout {
             active_tab: 0,
             accent_color: accent.unwrap_or(FALLBACK_ACCENT),
             name: None,
+            project_root: None,
         };
         Self { root: WindowNode::Workspace(slot), focused_workspace: workspace_id }
     }
@@ -324,6 +328,7 @@ impl WindowLayout {
             active_tab: 0,
             accent_color: accent.unwrap_or(FALLBACK_ACCENT),
             name: None,
+            project_root: None,
         };
         split_workspace_node(&mut self.root, self.focused_workspace, direction, new_slot).is_ok()
     }
@@ -344,6 +349,7 @@ impl WindowLayout {
             active_tab: 0,
             accent_color: accent.unwrap_or(FALLBACK_ACCENT),
             name: None,
+            project_root: None,
         };
 
         if split_workspace_node(&mut self.root, self.focused_workspace, direction, new_slot).is_ok()
@@ -569,6 +575,7 @@ fn split_workspace_node(
                     active_tab: 0,
                     accent_color: FALLBACK_ACCENT,
                     name: None,
+                    project_root: None,
                 }),
             );
             *node = WindowNode::Split {
@@ -611,6 +618,7 @@ fn remove_workspace_node(node: &mut WindowNode, target_id: WorkspaceId) -> bool 
                 active_tab: 0,
                 accent_color: FALLBACK_ACCENT,
                 name: None,
+                project_root: None,
             }),
         );
         *node = promoted;
@@ -627,6 +635,7 @@ fn remove_workspace_node(node: &mut WindowNode, target_id: WorkspaceId) -> bool 
                 active_tab: 0,
                 accent_color: FALLBACK_ACCENT,
                 name: None,
+                project_root: None,
             }),
         );
         *node = promoted;
@@ -697,6 +706,7 @@ fn node_from_tree(tree: &WorkspaceTreeNode) -> WindowNode {
             active_tab: 0,
             accent_color: FALLBACK_ACCENT,
             name: None,
+            project_root: None,
         }),
         WorkspaceTreeNode::Split { direction, ratio, first, second } => WindowNode::Split {
             direction: direction_from_protocol(*direction),

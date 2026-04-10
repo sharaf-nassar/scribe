@@ -607,14 +607,26 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::GitBranch { session_id, branch } => {
                 self.handle_git_branch(session_id, branch);
             }
-            UiEvent::WorkspaceInfo { workspace_id, name, accent_color, split_direction } => {
-                self.handle_workspace_info(workspace_id, name, &accent_color, split_direction);
+            UiEvent::WorkspaceInfo {
+                workspace_id,
+                name,
+                accent_color,
+                split_direction,
+                project_root,
+            } => {
+                self.handle_workspace_info(
+                    workspace_id,
+                    name,
+                    &accent_color,
+                    split_direction,
+                    project_root,
+                );
             }
             UiEvent::SessionList { sessions, workspace_tree } => {
                 self.handle_session_list(&sessions, workspace_tree.as_ref());
             }
-            UiEvent::WorkspaceNamed { workspace_id, name } => {
-                self.handle_workspace_named(workspace_id, &name);
+            UiEvent::WorkspaceNamed { workspace_id, name, project_root } => {
+                self.handle_workspace_named(workspace_id, &name, project_root);
             }
             UiEvent::ConfigChanged => {
                 self.handle_config_changed();
@@ -2594,16 +2606,19 @@ impl App {
     /// Handle full workspace info from server — update name, accent color,
     /// and, for legacy reconnect fallback only, patch the parent split
     /// direction once.
+    #[allow(clippy::too_many_arguments, reason = "mirrors the WorkspaceInfo protocol fields")]
     fn handle_workspace_info(
         &mut self,
         workspace_id: WorkspaceId,
         name: Option<String>,
         accent_color: &str,
         split_direction: Option<scribe_common::protocol::LayoutDirection>,
+        project_root: Option<std::path::PathBuf>,
     ) {
         tracing::debug!(%workspace_id, ?name, %accent_color, ?split_direction, "workspace info received");
         if let Some(ws) = self.window_layout.find_workspace_mut(workspace_id) {
             ws.name = name;
+            ws.project_root = project_root;
             if let Some(color) = parse_hex_color(accent_color) {
                 ws.accent_color = color;
             }
@@ -2621,13 +2636,20 @@ impl App {
         }
     }
 
-    /// Handle workspace auto-naming — update the workspace slot and pane names.
-    fn handle_workspace_named(&mut self, workspace_id: WorkspaceId, name: &str) {
+    /// Handle workspace auto-naming — update the workspace slot, pane names,
+    /// and project root.
+    fn handle_workspace_named(
+        &mut self,
+        workspace_id: WorkspaceId,
+        name: &str,
+        project_root: Option<std::path::PathBuf>,
+    ) {
         tracing::debug!(%workspace_id, %name, "workspace named");
 
-        // Update the workspace slot name.
+        // Update the workspace slot name and project root.
         if let Some(ws) = self.window_layout.find_workspace_mut(workspace_id) {
             ws.name = Some(name.to_owned());
+            ws.project_root = project_root;
         }
 
         for pane in self.panes.values_mut() {
@@ -4038,7 +4060,7 @@ impl App {
         reason = "viewport dimensions are small enough to fit in f32"
     )]
     fn handle_new_tab(&mut self) {
-        self.create_new_tab(None);
+        self.create_new_tab(None, None);
     }
 
     fn ai_tab_command(&self, resume: bool) -> Vec<String> {
@@ -4052,16 +4074,27 @@ impl App {
         vec![shell, String::from("-lic"), command]
     }
 
+    /// Return the focused workspace's project root, if the workspace is named
+    /// (i.e. the CWD matched a configured workspace root).
+    fn focused_workspace_project_root(&self) -> Option<std::path::PathBuf> {
+        self.window_layout.focused_workspace().and_then(|ws| ws.project_root.clone())
+    }
+
     fn handle_new_claude_tab(&mut self) {
         // Wrap in an interactive login shell so the user's full environment
         // is initialised before the selected AI CLI starts. The server runs
         // with a minimal service environment, so `-l`/`-i` ensure PATH
         // additions from shell startup files are available before `exec`.
-        self.create_new_tab(Some(self.ai_tab_command(false)));
+        //
+        // When inside a workspace, start at the project root rather than
+        // inheriting the current tab's CWD.
+        let project_root = self.focused_workspace_project_root();
+        self.create_new_tab(Some(self.ai_tab_command(false)), project_root);
     }
 
     fn handle_new_claude_resume_tab(&mut self) {
-        self.create_new_tab(Some(self.ai_tab_command(true)));
+        let project_root = self.focused_workspace_project_root();
+        self.create_new_tab(Some(self.ai_tab_command(true)), project_root);
     }
 
     fn launch_binding_for_command(
@@ -4105,13 +4138,19 @@ impl App {
             Some(argv) => restore_replay::new_custom_binding(argv.clone(), inherited_cwd),
         }
     }
-    fn create_new_tab(&mut self, command: Option<Vec<String>>) {
-        // Capture the focused pane's CWD before add_tab changes the active tab.
-        let inherited_cwd = self
-            .window_layout
-            .active_tab()
-            .and_then(|t| self.panes.get(&t.focused_pane))
-            .and_then(|p| p.cwd.clone());
+    fn create_new_tab(
+        &mut self,
+        command: Option<Vec<String>>,
+        cwd_override: Option<std::path::PathBuf>,
+    ) {
+        // Use the override if provided (e.g. workspace project root for AI
+        // tabs), otherwise inherit the focused pane's CWD.
+        let inherited_cwd = cwd_override.or_else(|| {
+            self.window_layout
+                .active_tab()
+                .and_then(|t| self.panes.get(&t.focused_pane))
+                .and_then(|p| p.cwd.clone())
+        });
 
         let workspace_id = self.window_layout.focused_workspace_id();
         let session_id = SessionId::new();

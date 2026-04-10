@@ -133,6 +133,7 @@ pub enum UiEvent {
         name: Option<String>,
         accent_color: String,
         split_direction: Option<scribe_common::protocol::LayoutDirection>,
+        project_root: Option<std::path::PathBuf>,
     },
     /// List of all live sessions, received in response to `ListSessions`.
     SessionList {
@@ -140,7 +141,11 @@ pub enum UiEvent {
         workspace_tree: Option<scribe_common::protocol::WorkspaceTreeNode>,
     },
     /// A workspace has been auto-named.
-    WorkspaceNamed { workspace_id: WorkspaceId, name: String },
+    WorkspaceNamed {
+        workspace_id: WorkspaceId,
+        name: String,
+        project_root: Option<std::path::PathBuf>,
+    },
     /// Server configuration has been reloaded.
     ConfigChanged,
     /// The connection to the server was lost.
@@ -283,17 +288,24 @@ async fn run_read_task(
                 name,
                 accent_color,
                 split_direction,
+                project_root,
             }) => {
                 send_event(
                     &proxy,
-                    UiEvent::WorkspaceInfo { workspace_id, name, accent_color, split_direction },
+                    UiEvent::WorkspaceInfo {
+                        workspace_id,
+                        name,
+                        accent_color,
+                        split_direction,
+                        project_root,
+                    },
                 );
             }
             Ok(ServerMessage::SessionList { sessions, workspace_tree }) => {
                 send_event(&proxy, UiEvent::SessionList { sessions, workspace_tree });
             }
-            Ok(ServerMessage::WorkspaceNamed { workspace_id, name }) => {
-                send_event(&proxy, UiEvent::WorkspaceNamed { workspace_id, name });
+            Ok(ServerMessage::WorkspaceNamed { workspace_id, name, project_root }) => {
+                send_event(&proxy, UiEvent::WorkspaceNamed { workspace_id, name, project_root });
             }
             Ok(ServerMessage::Welcome { window_id, other_windows }) => {
                 tracing::info!(%window_id, others = other_windows.len(), "received Welcome");

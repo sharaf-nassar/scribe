@@ -169,10 +169,18 @@ async fn send_workspace_info(
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
 ) {
     let wm = workspace_manager.read().await;
-    if let Some((name, accent_color, split_direction)) = wm.workspace_info(workspace_id) {
+    if let Some((name, accent_color, split_direction, project_root)) =
+        wm.workspace_info(workspace_id)
+    {
         send_message(
             writer,
-            &ServerMessage::WorkspaceInfo { workspace_id, name, accent_color, split_direction },
+            &ServerMessage::WorkspaceInfo {
+                workspace_id,
+                name,
+                accent_color,
+                split_direction,
+                project_root,
+            },
         )
         .await;
     }

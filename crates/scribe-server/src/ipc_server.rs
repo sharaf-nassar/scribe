@@ -738,12 +738,15 @@ async fn handle_create_session(
     // Send workspace info so the client knows the accent color and name.
     {
         let wm = workspace_manager.read().await;
-        if let Some((name, accent_color, ws_split_dir)) = wm.workspace_info(workspace_id) {
+        if let Some((name, accent_color, ws_split_dir, project_root)) =
+            wm.workspace_info(workspace_id)
+        {
             let info_msg = ServerMessage::WorkspaceInfo {
                 workspace_id,
                 name,
                 accent_color,
                 split_direction: ws_split_dir,
+                project_root,
             };
             send_message(writer, &info_msg).await;
         }
@@ -1347,11 +1350,18 @@ async fn handle_create_workspace(
 ) {
     let mut wm = workspace_manager.write().await;
     let workspace_id = wm.create_workspace();
-    let (name, accent_color, split_direction) =
-        wm.workspace_info(workspace_id).unwrap_or_else(|| (None, String::from("#a78bfa"), None));
+    let (name, accent_color, split_direction, project_root) = wm
+        .workspace_info(workspace_id)
+        .unwrap_or_else(|| (None, String::from("#a78bfa"), None, None));
     drop(wm);
 
-    let msg = ServerMessage::WorkspaceInfo { workspace_id, name, accent_color, split_direction };
+    let msg = ServerMessage::WorkspaceInfo {
+        workspace_id,
+        name,
+        accent_color,
+        split_direction,
+        project_root,
+    };
     send_message(writer, &msg).await;
 }
 
@@ -1429,12 +1439,15 @@ async fn handle_list_sessions(
     let mut seen = HashSet::new();
     for wid in workspace_ids {
         if seen.insert(wid) {
-            if let Some((name, accent_color, split_direction)) = wm_guard.workspace_info(wid) {
+            if let Some((name, accent_color, split_direction, project_root)) =
+                wm_guard.workspace_info(wid)
+            {
                 let msg = ServerMessage::WorkspaceInfo {
                     workspace_id: wid,
                     name,
                     accent_color,
                     split_direction,
+                    project_root,
                 };
                 send_message(writer, &msg).await;
             }

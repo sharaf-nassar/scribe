@@ -74,9 +74,9 @@ Managed by [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager]], w
 
 ### Auto-Naming
 
-When a session's CWD changes (via OSC 7 or /proc fallback), the server matches it against configured workspace roots and derives the workspace name.
+When a session's CWD changes (via OSC 7 or /proc fallback), the server matches it against configured workspace roots and derives the workspace name and project root.
 
-The first path component after the matching root becomes the workspace name. Moving to a different project under the same root updates the name.
+The first path component after the matching root becomes the workspace name; the full `root / name` path becomes the project root. Moving to a different project under the same root updates both. The project root is sent to the client so AI tabs can open at the workspace root directory instead of inheriting the current tab's CWD.
 
 ### CWD Fallback Detection
 
@@ -107,6 +107,8 @@ The HandoffState contains per-session metadata and workspace layout state for re
 Per-session payloads include title, shell basename, remote context, Codex task label, CWD, and AI state, including optional provider conversation IDs used for resume behavior.
 
 Per-session metadata includes ID, workspace, child PID, dimensions, screen snapshot, title, shell basename, remote/tmux context, CWD, AI state, and the launch-time AI-provider hint used for built-in Codex or Claude tabs. File descriptors are transferred one-for-one with the serialized session list.
+
+Per-workspace payloads include name, accent color, split direction, session list, and project root path. The project root is an additive `#[serde(default)]` field so handoff from older servers defaults to `None`.
 
 ### Defuse Strategy
 

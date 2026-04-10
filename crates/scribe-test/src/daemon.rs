@@ -304,7 +304,7 @@ async fn dispatch_server_message(
         ServerMessage::GitBranch { session_id, branch } => {
             debug!(%session_id, ?branch, "git branch updated");
         }
-        ServerMessage::WorkspaceNamed { workspace_id, name } => {
+        ServerMessage::WorkspaceNamed { workspace_id, name, .. } => {
             debug!(%workspace_id, %name, "workspace named");
         }
         ServerMessage::Bell { session_id } => {

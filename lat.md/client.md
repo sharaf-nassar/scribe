@@ -74,7 +74,7 @@ If no direct pane or workspace neighbor exists in that direction, focus wraps to
 
 ### Workspace Layout
 
-Defined in [[crates/scribe-client/src/workspace_layout.rs#WindowLayout]], the window-level tree splits the viewport into workspace regions. Each `WorkspaceSlot` holds a workspace ID, tab list, active tab index, accent color, and name.
+Defined in [[crates/scribe-client/src/workspace_layout.rs#WindowLayout]], the window-level tree splits the viewport into workspace regions. Each `WorkspaceSlot` holds a workspace ID, tab list, active tab index, accent color, name, and project root path.
 
 Splitting a workspace automatically equalizes all workspace ratios so every region gets equal space.
 

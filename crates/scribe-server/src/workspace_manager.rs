@@ -44,6 +44,9 @@ struct Workspace {
     #[allow(dead_code, reason = "used for workspace identity in future UI sync messages")]
     id: WorkspaceId,
     name: Option<String>,
+    /// Absolute path to the project directory (`root / first_component`).
+    /// Set alongside `name` when a CWD matches a configured workspace root.
+    project_root: Option<PathBuf>,
     sessions: Vec<SessionId>,
     #[allow(dead_code, reason = "sent to UI in future WorkspaceInfo messages")]
     accent_color: String,
@@ -80,8 +83,14 @@ impl WorkspaceManager {
 
         info!(%id, color = %accent_color, "created workspace");
 
-        let workspace =
-            Workspace { id, name: None, sessions: Vec::new(), accent_color, split_direction: None };
+        let workspace = Workspace {
+            id,
+            name: None,
+            project_root: None,
+            sessions: Vec::new(),
+            accent_color,
+            split_direction: None,
+        };
         self.workspaces.insert(id, workspace);
 
         id
@@ -115,6 +124,7 @@ impl WorkspaceManager {
                 Workspace {
                     id: workspace_id,
                     name: None,
+                    project_root: None,
                     sessions: Vec::new(),
                     accent_color,
                     split_direction,
@@ -150,20 +160,21 @@ impl WorkspaceManager {
     pub fn on_cwd_changed(&mut self, session_id: SessionId, cwd: &Path) -> Option<ServerMessage> {
         let workspace_id = *self.session_to_workspace.get(&session_id)?;
 
-        // Extract name from roots. Clone to avoid borrowing self while
-        // the mutable borrow of workspaces is needed below.
+        // Extract name and project root from roots. Clone to avoid borrowing
+        // self while the mutable borrow of workspaces is needed below.
         let roots = self.roots.clone();
-        let name = Self::extract_workspace_name_with_roots(cwd, &roots)?;
+        let (name, project_root) = Self::extract_workspace_info_with_roots(cwd, &roots)?;
 
-        // Only send a message when the name actually changes.
+        // Only send a message when the name or project root actually changes.
         let ws = self.workspaces.get_mut(&workspace_id)?;
-        if ws.name.as_ref() == Some(&name) {
+        if ws.name.as_ref() == Some(&name) && ws.project_root.as_ref() == Some(&project_root) {
             return None;
         }
         ws.name = Some(name.clone());
+        ws.project_root = Some(project_root.clone());
         info!(%workspace_id, %name, "workspace auto-named from CWD");
 
-        Some(ServerMessage::WorkspaceNamed { workspace_id, name })
+        Some(ServerMessage::WorkspaceNamed { workspace_id, name, project_root: Some(project_root) })
     }
 
     /// Linux-only fallback: read the CWD of `child_pid` from `/proc/{pid}/cwd`
@@ -220,16 +231,21 @@ impl WorkspaceManager {
         self.session_to_workspace.get(&session_id).copied()
     }
 
-    /// Return the name, accent color, and split direction of a workspace.
+    /// Return the name, accent color, split direction, and project root of a
+    /// workspace.
     ///
     /// Returns `Some(…)` if the workspace exists, `None` otherwise.
+    #[allow(
+        clippy::type_complexity,
+        reason = "flat tuple avoids a one-off struct for an internal API"
+    )]
     pub fn workspace_info(
         &self,
         id: WorkspaceId,
-    ) -> Option<(Option<String>, String, Option<LayoutDirection>)> {
-        self.workspaces
-            .get(&id)
-            .map(|ws| (ws.name.clone(), ws.accent_color.clone(), ws.split_direction))
+    ) -> Option<(Option<String>, String, Option<LayoutDirection>, Option<PathBuf>)> {
+        self.workspaces.get(&id).map(|ws| {
+            (ws.name.clone(), ws.accent_color.clone(), ws.split_direction, ws.project_root.clone())
+        })
     }
 
     /// Return the legacy single workspace split tree (used by handoff serialisation).
@@ -334,20 +350,28 @@ impl WorkspaceManager {
         }
     }
 
-    /// Extract the workspace name from a CWD path by matching against the
-    /// configured roots and taking the first component after the root prefix.
+    /// Extract the workspace name and project root from a CWD path by matching
+    /// against the configured roots and taking the first component after the
+    /// root prefix.
     #[allow(dead_code, reason = "called from extract_workspace_name_pub in tests")]
-    fn extract_workspace_name(&self, cwd: &Path) -> Option<String> {
-        Self::extract_workspace_name_with_roots(cwd, &self.roots)
+    fn extract_workspace_info(&self, cwd: &Path) -> Option<(String, PathBuf)> {
+        Self::extract_workspace_info_with_roots(cwd, &self.roots)
     }
 
     /// Inner helper that takes an explicit roots slice so the borrow checker
     /// is happy when `on_cwd_changed` passes a cloned roots vec.
-    fn extract_workspace_name_with_roots(cwd: &Path, roots: &[PathBuf]) -> Option<String> {
+    ///
+    /// Returns `(name, project_root)` where `project_root` is `root / name`.
+    fn extract_workspace_info_with_roots(
+        cwd: &Path,
+        roots: &[PathBuf],
+    ) -> Option<(String, PathBuf)> {
         roots.iter().find_map(|root| {
             let suffix = cwd.strip_prefix(root).ok()?;
-            // Take the first component of the relative path.
-            suffix.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned())
+            let first = suffix.components().next()?;
+            let name = first.as_os_str().to_string_lossy().into_owned();
+            let project_root = root.join(&name);
+            Some((name, project_root))
         })
     }
 
@@ -364,6 +388,7 @@ impl WorkspaceManager {
                 accent_color: ws.accent_color.clone(),
                 session_ids: ws.sessions.clone(),
                 split_direction: ws.split_direction,
+                project_root: ws.project_root.clone(),
             })
             .collect();
 
@@ -412,6 +437,7 @@ impl WorkspaceManager {
                 Workspace {
                     id: hw.id,
                     name: hw.name.clone(),
+                    project_root: hw.project_root.clone(),
                     sessions: session_ids.clone(),
                     accent_color: hw.accent_color.clone(),
                     split_direction: hw.split_direction,
@@ -529,7 +555,7 @@ fn macos_proc_cwd(child_pid: u32) -> Option<PathBuf> {
 #[cfg(test)]
 impl WorkspaceManager {
     pub fn extract_workspace_name_pub(&self, cwd: &Path) -> Option<String> {
-        self.extract_workspace_name(cwd)
+        self.extract_workspace_info(cwd).map(|(name, _)| name)
     }
 }
 

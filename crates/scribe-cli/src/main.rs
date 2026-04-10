@@ -119,7 +119,7 @@ where
             Ok(ServerMessage::AiStateChanged { session_id, ai_state }) => {
                 info!(%session_id, ?ai_state, "AI state changed");
             }
-            Ok(ServerMessage::WorkspaceNamed { workspace_id, name }) => {
+            Ok(ServerMessage::WorkspaceNamed { workspace_id, name, .. }) => {
                 info!(%workspace_id, %name, "workspace named");
             }
             Ok(ServerMessage::Bell { session_id }) => {
