@@ -22,8 +22,11 @@ pub struct X11FocusGuard {
     root: u32,
     net_active_window: u32,
     our_window: u32,
-    /// Last time our window was detected as *not* active.
-    last_inactive: Option<Instant>,
+    /// Whether the window has been inactive since the last re-activation.
+    was_inactive: bool,
+    /// When the inactive→active transition was first detected (by `poll` or
+    /// `should_suppress_key`).  The debounce is measured from this moment.
+    reactivated_at: Option<Instant>,
 }
 
 impl X11FocusGuard {
@@ -44,7 +47,8 @@ impl X11FocusGuard {
             root,
             net_active_window: atom_reply.atom,
             our_window: our_x11_window_id,
-            last_inactive: None,
+            was_inactive: false,
+            reactivated_at: None,
         })
     }
 
@@ -54,7 +58,13 @@ impl X11FocusGuard {
     /// has an up-to-date picture of whether a compositor overlay is active.
     pub fn poll(&mut self) {
         if !self.query_is_active() {
-            self.last_inactive = Some(Instant::now());
+            self.was_inactive = true;
+        } else if self.was_inactive {
+            // Transition: inactive → active detected by poll.  Start the
+            // debounce from this moment so stray keystrokes that arrive
+            // shortly after are still suppressed.
+            self.was_inactive = false;
+            self.reactivated_at = Some(Instant::now());
         }
     }
 
@@ -64,7 +74,8 @@ impl X11FocusGuard {
     /// Compositor overlays don't send focus events, so this only fires for
     /// genuine focus transitions where the debounce should not apply.
     pub fn clear_reactivation_debounce(&mut self) {
-        self.last_inactive = None;
+        self.was_inactive = false;
+        self.reactivated_at = None;
     }
 
     /// Returns `true` when keyboard input should be suppressed.
@@ -74,17 +85,24 @@ impl X11FocusGuard {
     /// 2. Our window *just* became active again (within [`REACTIVATION_DEBOUNCE`]).
     pub fn should_suppress_key(&mut self) -> bool {
         if !self.query_is_active() {
-            self.last_inactive = Some(Instant::now());
+            self.was_inactive = true;
             return true;
         }
 
-        // Active now — but was it recently inactive?
-        if let Some(t) = self.last_inactive {
+        // Transition: inactive → active.  Start the debounce from this
+        // exact moment so the stray keystroke that triggered this call is
+        // always within the window.
+        if self.was_inactive {
+            self.was_inactive = false;
+            self.reactivated_at = Some(Instant::now());
+        }
+
+        // Within the post-reactivation debounce window?
+        if let Some(t) = self.reactivated_at {
             if t.elapsed() < REACTIVATION_DEBOUNCE {
                 return true;
             }
-            // Past the debounce window — clear the marker.
-            self.last_inactive = None;
+            self.reactivated_at = None;
         }
 
         false

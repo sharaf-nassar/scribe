@@ -267,10 +267,13 @@ pub fn compute_tab_bar_height(
 
 /// Compute the number of columns occupied by the workspace badge.
 ///
-/// Returns 0 when no badge is shown (single workspace).
+/// Returns 0 when no badge is shown (single workspace or unnamed workspace).
 /// Badge layout: space + name + space + gap ≈ `name_len` + 4 columns.
 pub fn badge_columns(ws_name: Option<&str>, show_badge: bool) -> usize {
-    if show_badge { ws_name.map_or(9, |n| n.chars().count()) + 4 } else { 0 }
+    match (show_badge, ws_name) {
+        (true, Some(n)) => n.chars().count() + 4,
+        _ => 0,
+    }
 }
 
 /// Pre-collected workspace-level data for tab bar text rendering.

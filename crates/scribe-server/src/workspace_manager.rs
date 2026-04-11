@@ -163,18 +163,37 @@ impl WorkspaceManager {
         // Extract name and project root from roots. Clone to avoid borrowing
         // self while the mutable borrow of workspaces is needed below.
         let roots = self.roots.clone();
-        let (name, project_root) = Self::extract_workspace_info_with_roots(cwd, &roots)?;
+        let info = Self::extract_workspace_info_with_roots(cwd, &roots);
 
-        // Only send a message when the name or project root actually changes.
         let ws = self.workspaces.get_mut(&workspace_id)?;
-        if ws.name.as_ref() == Some(&name) && ws.project_root.as_ref() == Some(&project_root) {
-            return None;
-        }
-        ws.name = Some(name.clone());
-        ws.project_root = Some(project_root.clone());
-        info!(%workspace_id, %name, "workspace auto-named from CWD");
 
-        Some(ServerMessage::WorkspaceNamed { workspace_id, name, project_root: Some(project_root) })
+        if let Some((name, project_root)) = info {
+            // Only send a message when the name or project root actually changes.
+            if ws.name.as_ref() == Some(&name) && ws.project_root.as_ref() == Some(&project_root) {
+                return None;
+            }
+            ws.name = Some(name.clone());
+            ws.project_root = Some(project_root.clone());
+            info!(%workspace_id, %name, "workspace auto-named from CWD");
+            Some(ServerMessage::WorkspaceNamed {
+                workspace_id,
+                name,
+                project_root: Some(project_root),
+            })
+        } else {
+            // CWD is outside all workspace roots — clear name if previously set.
+            if ws.name.is_none() && ws.project_root.is_none() {
+                return None;
+            }
+            ws.name = None;
+            ws.project_root = None;
+            info!(%workspace_id, "workspace name cleared (CWD outside roots)");
+            Some(ServerMessage::WorkspaceNamed {
+                workspace_id,
+                name: String::new(),
+                project_root: None,
+            })
+        }
     }
 
     /// Linux-only fallback: read the CWD of `child_pid` from `/proc/{pid}/cwd`

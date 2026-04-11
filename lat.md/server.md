@@ -76,7 +76,7 @@ Managed by [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager]], w
 
 When a session's CWD changes (via OSC 7 or /proc fallback), the server matches it against configured workspace roots and derives the workspace name and project root.
 
-The first path component after the matching root becomes the workspace name; the full `root / name` path becomes the project root. Moving to a different project under the same root updates both. The project root is sent to the client so AI tabs can open at the workspace root directory instead of inheriting the current tab's CWD.
+The first path component after the matching root becomes the workspace name; the full `root / name` path becomes the project root. Moving to a different project under the same root updates both. When the CWD moves outside all configured roots, the name and project root are cleared (an empty-string name is sent to the client). The project root is sent to the client so AI tabs can open at the workspace root directory instead of inheriting the current tab's CWD.
 
 ### CWD Fallback Detection
 

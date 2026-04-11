@@ -2637,7 +2637,8 @@ impl App {
     }
 
     /// Handle workspace auto-naming — update the workspace slot, pane names,
-    /// and project root.
+    /// and project root. An empty name signals the workspace is no longer
+    /// inside a configured root, clearing the previous name.
     fn handle_workspace_named(
         &mut self,
         workspace_id: WorkspaceId,
@@ -2646,15 +2647,17 @@ impl App {
     ) {
         tracing::debug!(%workspace_id, %name, "workspace named");
 
+        let name_opt = if name.is_empty() { None } else { Some(name.to_owned()) };
+
         // Update the workspace slot name and project root.
         if let Some(ws) = self.window_layout.find_workspace_mut(workspace_id) {
-            ws.name = Some(name.to_owned());
+            ws.name.clone_from(&name_opt);
             ws.project_root = project_root;
         }
 
         for pane in self.panes.values_mut() {
             if pane.workspace_id == workspace_id {
-                pane.workspace_name = Some(name.to_owned());
+                pane.workspace_name.clone_from(&name_opt);
             }
         }
     }
@@ -3020,9 +3023,11 @@ impl App {
                 })
                 .collect();
 
-            let badge = multi_workspace.then(|| {
+            let badge = if multi_workspace {
                 make_workspace_badge(ws.name.as_deref(), &self.config.workspaces.badge_colors)
-            });
+            } else {
+                None
+            };
 
             let has_multiple_panes = tab.pane_layout.all_pane_ids().len() > 1;
 
@@ -9551,12 +9556,12 @@ fn name_to_accent_color(name: &str, palette: &[String]) -> Option<[f32; 4]> {
 /// Build the workspace badge tuple for multi-workspace mode.
 ///
 /// Named workspaces get a deterministic accent color from the palette.
-/// Unnamed workspaces get a plain "workspace" label with no color.
-fn make_workspace_badge(name: Option<&str>, palette: &[String]) -> (String, Option<[f32; 4]>) {
-    name.map_or_else(
-        || (String::from("workspace"), None),
-        |n| (n.to_owned(), name_to_accent_color(n, palette)),
-    )
+/// Unnamed workspaces return `None` — no badge is rendered.
+fn make_workspace_badge(
+    name: Option<&str>,
+    palette: &[String],
+) -> Option<(String, Option<[f32; 4]>)> {
+    name.map(|n| (n.to_owned(), name_to_accent_color(n, palette)))
 }
 
 // ---------------------------------------------------------------------------
