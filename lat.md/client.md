@@ -171,7 +171,7 @@ On Linux, the client starts the server via `systemctl --user start scribe-server
 
 Text selection in [[crates/scribe-client/src/selection.rs]] supports three modes: Cell, Word, and Line. Coordinates are absolute grid positions.
 
-Cell selects individual characters. Word boundaries include alphanumeric, underscore, dash, dot, slash, tilde, at, plus, percent, hash, question, ampersand, and equals. Line mode follows WRAPLINE flags for logical lines. [[crates/scribe-client/src/selection.rs#pixel_to_grid]] converts mouse pixel coordinates to grid positions, subtracting tab bar height, prompt bar height (position-aware), and content padding before dividing by cell size. During an active drag, [[crates/scribe-client/src/selection.rs#pixel_to_grid_clamped]] clamps points that stray into prompt-bar chrome or outside the pane back to the nearest visible terminal cell so the last visible row still highlights.
+Cell selects individual characters. Word boundaries include alphanumeric, underscore, dash, dot, slash, tilde, at, plus, percent, hash, question, ampersand, and equals, and double-click word scans cross WRAPLINE-connected rows so soft-wrapped paths or commands stay contiguous. Line mode follows WRAPLINE flags for logical lines. [[crates/scribe-client/src/selection.rs#pixel_to_grid]] converts mouse pixel coordinates to grid positions, subtracting tab bar height, prompt bar height (position-aware), and content padding before dividing by cell size. During an active drag, [[crates/scribe-client/src/selection.rs#pixel_to_grid_clamped]] clamps points that stray into prompt-bar chrome or outside the pane back to the nearest visible terminal cell so the last visible row still highlights.
 
 ### Scroll Adjustment
 

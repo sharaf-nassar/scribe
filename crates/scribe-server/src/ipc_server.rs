@@ -1704,6 +1704,15 @@ async fn pty_reader_task(state: PtyReaderState) {
             // Step 1: Fast path — forward (possibly filtered) bytes to UI client.
             send_pty_output(&state.client_writer, state.session_id, effective).await;
 
+            // Step 1b: If ED 3 was suppressed, tell the client to snap the
+            // viewport to bottom.  A real ED 3 would have reset
+            // `display_offset` to 0 inside `clear_history()`, but since we
+            // stripped the sequence, the client's Term never ran that code.
+            if state.ed3_filter.take_suppressed() {
+                let msg = ServerMessage::ScrollBottom { session_id: state.session_id };
+                send_to_client(&state.client_writer, &msg).await;
+            }
+
             // Step 2: State path — feed (possibly filtered) bytes into Term.
             feed_term(&state.term, &mut state.ansi_processor, effective).await;
 

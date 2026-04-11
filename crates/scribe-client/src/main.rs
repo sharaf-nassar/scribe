@@ -683,6 +683,16 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::PromptReceived { session_id, provider: _, text } => {
                 self.handle_prompt_received(session_id, text);
             }
+            UiEvent::ScrollBottom { session_id } => {
+                if let Some(&pane_id) = self.session_to_pane.get(&session_id)
+                    && let Some(pane) = self.panes.get_mut(&pane_id)
+                {
+                    pane.split_scroll = None;
+                    pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+                    pane.content_dirty = true;
+                    self.request_redraw();
+                }
+            }
         }
     }
 

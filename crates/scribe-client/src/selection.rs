@@ -350,36 +350,32 @@ pub fn word_bounds_at(
 ) -> (SelectionPoint, SelectionPoint) {
     let cols = term.grid().columns();
     let max_col = cols.saturating_sub(1);
+    let point = SelectionPoint { row: point.row, col: point.col.min(max_col) };
     let line = Line(point.row);
-    let c = read_cell_char(term, line, Column(point.col.min(max_col)));
+    let c = read_cell_char(term, line, Column(point.col));
     if !is_word_char(c) {
         return (point, point);
     }
 
     // Scan left for word start.
-    let mut start_col = point.col;
-    while start_col > 0 {
-        let prev = start_col.saturating_sub(1);
-        if !is_word_char(read_cell_char(term, line, Column(prev))) {
+    let mut start = point;
+    while let Some(prev) = previous_cell_point(term, start) {
+        if !is_word_char(read_cell_char(term, Line(prev.row), Column(prev.col))) {
             break;
         }
-        start_col = prev;
+        start = prev;
     }
 
     // Scan right for word end.
-    let mut end_col = point.col;
-    while end_col < max_col {
-        let next = end_col.saturating_add(1);
-        if !is_word_char(read_cell_char(term, line, Column(next))) {
+    let mut end = point;
+    while let Some(next) = next_cell_point(term, end) {
+        if !is_word_char(read_cell_char(term, Line(next.row), Column(next.col))) {
             break;
         }
-        end_col = next;
+        end = next;
     }
 
-    (
-        SelectionPoint { row: point.row, col: start_col },
-        SelectionPoint { row: point.row, col: end_col },
-    )
+    (start, end)
 }
 
 /// Return the start and end of the full logical line at `row`, spanning any
@@ -461,6 +457,55 @@ pub fn read_cell_char(term: &Term<VoidListener>, line: Line, col: Column) -> cha
 /// Read the flags of a single cell from the terminal grid.
 fn read_cell_flags(term: &Term<VoidListener>, line: Line, col: Column) -> Flags {
     read_cell(term, line, col).flags
+}
+
+/// Return the previous logical neighbor for word scanning, crossing into the
+/// wrapped row above when the current row is a continuation.
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "topmost_line is bounded by scrollback_lines (≤ 100_000), fits in i32"
+)]
+fn previous_cell_point(term: &Term<VoidListener>, point: SelectionPoint) -> Option<SelectionPoint> {
+    if point.col > 0 {
+        return Some(SelectionPoint { row: point.row, col: point.col.saturating_sub(1) });
+    }
+
+    let topmost = term.grid().topmost_line().0;
+    if point.row <= topmost {
+        return None;
+    }
+
+    let last_col = term.grid().columns().saturating_sub(1);
+    let row_above = point.row - 1;
+    if read_cell_flags(term, Line(row_above), Column(last_col)).contains(Flags::WRAPLINE) {
+        Some(SelectionPoint { row: row_above, col: last_col })
+    } else {
+        None
+    }
+}
+
+/// Return the next logical neighbor for word scanning, crossing into the
+/// wrapped continuation row when the current row ends with WRAPLINE.
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "bottommost_line is bounded by scrollback_lines (≤ 100_000), fits in i32"
+)]
+fn next_cell_point(term: &Term<VoidListener>, point: SelectionPoint) -> Option<SelectionPoint> {
+    let last_col = term.grid().columns().saturating_sub(1);
+    if point.col < last_col {
+        return Some(SelectionPoint { row: point.row, col: point.col.saturating_add(1) });
+    }
+
+    let bottommost = term.grid().bottommost_line().0;
+    if point.row >= bottommost {
+        return None;
+    }
+
+    if read_cell_flags(term, Line(point.row), Column(last_col)).contains(Flags::WRAPLINE) {
+        Some(SelectionPoint { row: point.row + 1, col: 0 })
+    } else {
+        None
+    }
 }
 
 /// The row extent of a wrapped logical line.

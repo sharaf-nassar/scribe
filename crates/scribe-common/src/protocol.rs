@@ -348,6 +348,13 @@ pub enum ServerMessage {
         /// Exit code from the previous command (only for `CommandEnd` / D mark).
         exit_code: Option<i32>,
     },
+    /// The server suppressed an ED 3 (clear scrollback) sequence from an AI
+    /// session.  The client should reset `display_offset` to 0 so the
+    /// viewport snaps to the live terminal, matching the scroll-to-bottom
+    /// side-effect of a real ED 3.
+    ScrollBottom {
+        session_id: SessionId,
+    },
 }
 
 // ── Shared types ─────────────────────────────────────────────────

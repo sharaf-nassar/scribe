@@ -181,6 +181,8 @@ pub enum UiEvent {
     },
     /// Search results for the current query.
     SearchResults { session_id: SessionId, query: String, matches: Vec<SearchMatch> },
+    /// The server suppressed an ED 3 sequence — snap the viewport to bottom.
+    ScrollBottom { session_id: SessionId },
 }
 
 /// Start the IPC client on a background thread.
@@ -347,6 +349,9 @@ async fn run_read_task(
             }
             Ok(ServerMessage::SearchResults { session_id, query, matches }) => {
                 send_event(&proxy, UiEvent::SearchResults { session_id, query, matches });
+            }
+            Ok(ServerMessage::ScrollBottom { session_id }) => {
+                send_event(&proxy, UiEvent::ScrollBottom { session_id });
             }
             Ok(other) => {
                 tracing::debug!(?other, "unhandled server message");

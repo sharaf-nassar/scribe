@@ -358,6 +358,9 @@ async fn dispatch_server_message(
         ServerMessage::ActionDispatched { window_id } => {
             debug!(%window_id, "action dispatched (ignored by test daemon)");
         }
+        ServerMessage::ScrollBottom { session_id } => {
+            debug!(%session_id, "scroll bottom (ignored by test daemon)");
+        }
     }
 }
 

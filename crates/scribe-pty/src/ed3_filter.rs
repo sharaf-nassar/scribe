@@ -28,6 +28,9 @@ impl Ed3Output<'_> {
 pub struct Ed3Filter {
     /// Number of leading bytes of the ED 3 sequence matched so far (0–3).
     state: u8,
+    /// Set when a complete `\x1b[3J` sequence is consumed (and dropped).
+    /// Read and cleared via [`take_suppressed`](Self::take_suppressed).
+    suppressed: bool,
 }
 
 /// The four-byte ED 3 sequence: ESC [ 3 J.
@@ -36,7 +39,13 @@ const SEQ: [u8; 4] = [0x1B, 0x5B, 0x33, 0x4A];
 impl Ed3Filter {
     #[must_use]
     pub fn new() -> Self {
-        Self { state: 0 }
+        Self { state: 0, suppressed: false }
+    }
+
+    /// Returns `true` and clears the flag if at least one `\x1b[3J`
+    /// sequence was suppressed since the last call.
+    pub fn take_suppressed(&mut self) -> bool {
+        std::mem::take(&mut self.suppressed)
     }
 
     /// Filter `input`, stripping any complete `\x1b[3J` sequences.
@@ -98,6 +107,7 @@ impl Ed3Filter {
         self.state += 1;
         if self.state == 4 {
             self.state = 0;
+            self.suppressed = true;
             // Don't emit anything — just suppress the scrollback wipe.
             // If the program wanted a visible clear, it sends its own ED 2.
             return true;
@@ -136,6 +146,14 @@ impl Ed3Filter {
 impl Default for Ed3Filter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+impl Ed3Filter {
+    /// Test helper: check suppression state without clearing it.
+    fn was_suppressed(&self) -> bool {
+        self.suppressed
     }
 }
 
@@ -185,5 +203,38 @@ mod tests {
         assert_eq!(output.as_bytes(), b"before");
         assert_eq!(filter.flush(), Some(b"\x1b[3".to_vec()));
         assert_eq!(filter.flush(), None);
+    }
+
+    #[test]
+    fn sets_suppressed_flag_on_complete_match() {
+        let mut filter = Ed3Filter::new();
+        assert!(!filter.was_suppressed());
+
+        filter.filter(b"\x1b[3J");
+
+        assert!(filter.was_suppressed());
+        assert!(filter.take_suppressed());
+        // take_suppressed clears the flag.
+        assert!(!filter.take_suppressed());
+    }
+
+    #[test]
+    fn sets_suppressed_flag_across_chunks() {
+        let mut filter = Ed3Filter::new();
+
+        filter.filter(b"\x1b[");
+        assert!(!filter.was_suppressed());
+
+        filter.filter(b"3J");
+        assert!(filter.was_suppressed());
+    }
+
+    #[test]
+    fn no_suppressed_flag_for_non_ed3() {
+        let mut filter = Ed3Filter::new();
+
+        filter.filter(b"\x1b[2J");
+
+        assert!(!filter.was_suppressed());
     }
 }

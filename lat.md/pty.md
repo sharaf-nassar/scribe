@@ -82,11 +82,17 @@ The [[crates/scribe-pty/src/ed3_filter.rs#Ed3Filter]] strips CSI ED 3 (`\x1b[3J`
 
 Only runs for Claude Code / Codex Code sessions when `preserve_ai_scrollback` is `true`. Regular shell sessions are never filtered. Enabled by default so AI sessions keep earlier transcript history unless the user opts back into standard terminal scrollback clearing. The filter drops ED 3 entirely rather than converting it to ED 2, because a standalone ED 3 (e.g. Codex exit cleanup) must not erase the visible screen — if the program also wants a visible clear it sends its own ED 2.
 
+### Scroll-Bottom on Suppression
+
+When the filter suppresses ED 3, the PTY reader sends a [[crates/scribe-common/src/protocol.rs#ServerMessage]]`::ScrollBottom` so the client snaps the viewport to bottom.
+
+A real ED 3 resets `display_offset` to 0 inside alacritty_terminal's `clear_history`. Stripping it without this compensating message would leave the viewport stuck at a stale scroll position while the live terminal redraws below the visible area.
+
 ### State Machine
 
 Four states track partial matches of the `\x1b[3J` sequence across `filter()` calls.
 
-On a complete match the filter drops the sequence (emits nothing), preserving scrollback without injecting a visible screen clear. A fast path skips allocation when no ESC byte is present. Pending bytes stay in state until the next call or `flush()`.
+On a complete match the filter drops the sequence (emits nothing), preserving scrollback without injecting a visible screen clear. The filter sets an internal `suppressed` flag that the PTY reader consumes via `take_suppressed()`. A fast path skips allocation when no ESC byte is present. Pending bytes stay in state until the next call or `flush()`.
 
 ## Codex Hook Log Filter
 
