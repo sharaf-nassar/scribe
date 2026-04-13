@@ -545,7 +545,8 @@ pub struct TerminalConfig {
     /// the sequence is passed through, matching standard terminal behaviour.
     #[serde(default = "default_true")]
     pub preserve_ai_scrollback: bool,
-    /// Which AI CLI the AI tab keybindings launch.
+    /// Compatibility-only state for legacy settings surfaces.
+    /// Runtime AI tab routing uses explicit Claude/Codex actions.
     #[serde(default = "default_ai_tab_provider")]
     pub ai_tab_provider: AiProvider,
     /// When `true`, the OS-reported scroll direction is used as-is (natural
@@ -691,6 +692,10 @@ pub struct KeybindingsConfig {
     pub new_claude_tab: KeyComboList,
     #[serde(default = "default_new_claude_resume_tab")]
     pub new_claude_resume_tab: KeyComboList,
+    #[serde(default = "default_new_codex_tab")]
+    pub new_codex_tab: KeyComboList,
+    #[serde(default = "default_new_codex_resume_tab")]
+    pub new_codex_resume_tab: KeyComboList,
     #[serde(default = "default_close_tab")]
     pub close_tab: KeyComboList,
     #[serde(default = "default_next_tab")]
@@ -793,6 +798,8 @@ impl Default for KeybindingsConfig {
             new_tab: default_new_tab(),
             new_claude_tab: default_new_claude_tab(),
             new_claude_resume_tab: default_new_claude_resume_tab(),
+            new_codex_tab: default_new_codex_tab(),
+            new_codex_resume_tab: default_new_codex_resume_tab(),
             close_tab: default_close_tab(),
             next_tab: default_next_tab(),
             prev_tab: default_prev_tab(),
@@ -908,6 +915,14 @@ fn default_new_claude_tab() -> KeyComboList {
 
 fn default_new_claude_resume_tab() -> KeyComboList {
     KeyComboList::single("ctrl+alt+r")
+}
+
+fn default_new_codex_tab() -> KeyComboList {
+    platform_combo("cmd+alt+x", "ctrl+alt+x")
+}
+
+fn default_new_codex_resume_tab() -> KeyComboList {
+    platform_combo("cmd+alt+e", "ctrl+alt+e")
 }
 
 fn default_close_tab() -> KeyComboList {

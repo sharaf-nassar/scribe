@@ -20,26 +20,6 @@ var activeThemeId = null;
 var isCustomMode = false;
 window.SCRIBE_PLATFORM = window.SCRIBE_PLATFORM || "linux";
 
-function normalizeAiTabProvider(provider) {
-  return provider === "codex_code" ? "codex_code" : "claude_code";
-}
-
-function renderAiTabLabels(provider) {
-  var name = normalizeAiTabProvider(provider) === "codex_code" ? "Codex" : "Claude";
-  var newLabel = document.querySelector("[data-ai-tab-label='new']");
-  var resumeLabel = document.querySelector("[data-ai-tab-label='resume']");
-  if (newLabel) { newLabel.textContent = "New " + name + " Tab"; }
-  if (resumeLabel) { resumeLabel.textContent = "Resume " + name + " Tab"; }
-}
-
-function setAiTabProvider(provider) {
-  var normalized = normalizeAiTabProvider(provider);
-  currentConfig.terminal = currentConfig.terminal || {};
-  currentConfig.terminal.ai_tab_provider = normalized;
-  setSegmentedValue("terminal.ai_tab_provider", normalized);
-  renderAiTabLabels(normalized);
-}
-
 function rerenderAllKeybindingBadges() {
   var cells = document.querySelectorAll(".keybinding-cell[data-action]");
   cells.forEach(function(cell) {
@@ -506,14 +486,6 @@ function initNavigation() {
     });
   });
 
-  var crosslink = document.getElementById("ai-tab-crosslink");
-  if (crosslink) {
-    crosslink.addEventListener("click", function() {
-      var aiNav = document.querySelector('.nav-item[data-tab="ai"]');
-      if (aiNav) { aiNav.click(); }
-    });
-  }
-
   var promptBarColorsCrosslink = document.getElementById("prompt-bar-colors-crosslink");
   if (promptBarColorsCrosslink) {
     promptBarColorsCrosslink.addEventListener("click", function() {
@@ -617,9 +589,6 @@ function initSegmented() {
         var value = opt.getAttribute("data-value");
         opts.forEach(function(o) { o.classList.remove("active"); });
         opt.classList.add("active");
-        if (key === "terminal.ai_tab_provider") {
-          setAiTabProvider(value);
-        }
         sendChange(key, value);
       });
     });
@@ -823,7 +792,6 @@ function loadConfig(config) {
   setToggleValue("terminal.scroll_pin", config.terminal?.scroll_pin);
   setSegmentedValue("terminal.prompt_bar_position", config.terminal?.prompt_bar_position || "top");
   setStepperValue("terminal.prompt_bar_font_size", config.terminal?.prompt_bar_font_size);
-  setAiTabProvider(config.terminal?.ai_tab_provider);
   setStepperValue("terminal.indicator_height", config.terminal?.indicator_height);
 
   // AI assistant states

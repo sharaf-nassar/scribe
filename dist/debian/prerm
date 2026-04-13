@@ -1,5 +1,6 @@
 #!/bin/bash
 PACKAGE_NAME="${DPKG_MAINTSCRIPT_PACKAGE:-scribe}"
+PRIVILEGED_USER_UID="${SUDO_UID:-${PKEXEC_UID:-}}"
 if [ "$PACKAGE_NAME" = "scribe-dev" ]; then
     APP_SLUG="scribe-dev"
     SERVER_BIN_NAME="scribe-dev-server"
@@ -11,21 +12,21 @@ SERVER_BIN_PATH="/usr/bin/${SERVER_BIN_NAME}"
 
 case "$1" in
     remove|purge)
-        TARGET_UID="${SUDO_UID:-$(id -u)}"
+        TARGET_UID="${PRIVILEGED_USER_UID:-$(id -u)}"
         XDG_DIR="/run/user/${TARGET_UID}"
 
         # Try systemctl with proper environment (use UID-based sudo to
-        # prevent spoofed SUDO_USER from targeting a different user).
-        if [ -n "$SUDO_UID" ] && [ -d "$XDG_DIR" ]; then
-            sudo -u "#${SUDO_UID}" \
+        # prevent spoofed user names from targeting a different user).
+        if [ -n "$PRIVILEGED_USER_UID" ] && [ -d "$XDG_DIR" ]; then
+            sudo -u "#${PRIVILEGED_USER_UID}" \
                 XDG_RUNTIME_DIR="$XDG_DIR" \
                 DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
                 systemctl --user stop "$SERVER_BIN_NAME" 2>/dev/null || true
-            sudo -u "#${SUDO_UID}" \
+            sudo -u "#${PRIVILEGED_USER_UID}" \
                 XDG_RUNTIME_DIR="$XDG_DIR" \
                 DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
                 systemctl --user disable "$SERVER_BIN_NAME" 2>/dev/null || true
-        elif [ -z "$SUDO_UID" ]; then
+        elif [ -z "$PRIVILEGED_USER_UID" ]; then
             systemctl --user stop "$SERVER_BIN_NAME" 2>/dev/null || true
             systemctl --user disable "$SERVER_BIN_NAME" 2>/dev/null || true
         fi

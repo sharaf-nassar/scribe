@@ -411,6 +411,8 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
     use std::collections::HashMap;
     use std::process::Stdio;
 
+    let app_bundle_path = current_app_bundle_path()?;
+    let prev_path = app_bundle_path.with_extension("app.prev");
     let path_str = asset_path.to_string_lossy();
 
     // Attach the DMG.
@@ -455,19 +457,18 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
 
     // Remove any stale .app.prev left by a previous failed update so the
     // upcoming rename doesn't collide with it.
-    let prev_path = Path::new("/Applications/Scribe.app.prev");
     if prev_path.exists() {
-        let _ = std::fs::remove_dir_all(prev_path);
+        let _ = std::fs::remove_dir_all(&prev_path);
     }
 
     // Rename existing app to .app.prev for rollback (O(rename), same filesystem).
     // If it doesn't exist (fresh install), continue without backup.
-    let backup_existed =
-        std::fs::rename("/Applications/Scribe.app", "/Applications/Scribe.app.prev").is_ok();
+    let backup_existed = std::fs::rename(&app_bundle_path, &prev_path).is_ok();
 
-    let app_src = format!("{mount_point}/Scribe.app");
+    let app_src = Path::new(&mount_point).join(current_identity().app_bundle_name());
     let ditto_result = std::process::Command::new("ditto")
-        .args([&app_src, "/Applications/Scribe.app"])
+        .arg(&app_src)
+        .arg(&app_bundle_path)
         .status()
         .map_err(|e| ScribeError::UpdateInstallFailed { reason: format!("ditto failed: {e}") });
 
@@ -482,9 +483,7 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
         Err(e) => {
             // ditto could not be launched — restore backup if we have one.
             if backup_existed {
-                if let Err(re) =
-                    std::fs::rename("/Applications/Scribe.app.prev", "/Applications/Scribe.app")
-                {
+                if let Err(re) = std::fs::rename(&prev_path, &app_bundle_path) {
                     warn!("rollback rename failed: {re}");
                 }
             }
@@ -496,9 +495,7 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
     if !ditto_status.success() {
         // ditto ran but failed — restore backup if we have one.
         if backup_existed {
-            if let Err(re) =
-                std::fs::rename("/Applications/Scribe.app.prev", "/Applications/Scribe.app")
-            {
+            if let Err(re) = std::fs::rename(&prev_path, &app_bundle_path) {
                 warn!("rollback rename failed: {re}");
             }
         }
@@ -513,8 +510,8 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
     let mut changed: HashMap<&str, bool> = HashMap::new();
     for name in &binaries {
         let differs = if backup_existed {
-            let old_path = format!("/Applications/Scribe.app.prev/Contents/MacOS/{name}");
-            let new_path = format!("/Applications/Scribe.app/Contents/MacOS/{name}");
+            let old_path = prev_path.join("Contents/MacOS").join(name);
+            let new_path = app_bundle_path.join("Contents/MacOS").join(name);
             file_hash_differs(&old_path, &new_path)
         } else {
             true
@@ -524,7 +521,7 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
 
     // Remove the backup now that hash comparison is complete (best-effort).
     if backup_existed {
-        if let Err(e) = std::fs::remove_dir_all("/Applications/Scribe.app.prev") {
+        if let Err(e) = std::fs::remove_dir_all(&prev_path) {
             warn!("failed to remove .app.prev backup: {e}");
         }
     }
@@ -592,7 +589,7 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
     };
 
     // Restart client binaries that changed and were running before the update.
-    let macos_dir = "/Applications/Scribe.app/Contents/MacOS";
+    let macos_dir = app_bundle_path.join("Contents/MacOS");
     for &name in &["scribe-client", "scribe-settings"] {
         if !changed.get(name).unwrap_or(&true) {
             info!("{name} binary unchanged — skipping restart");
@@ -613,7 +610,7 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
         // Relaunch.
-        let bin_path = format!("{macos_dir}/{name}");
+        let bin_path = macos_dir.join(name);
         match std::process::Command::new(&bin_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -631,9 +628,9 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
 /// Returns `true` if the two files have different content (or if either cannot be read).
 /// Safety-first: any failure to compare is treated as "changed".
 #[cfg(target_os = "macos")]
-fn file_hash_differs(old_path: &str, new_path: &str) -> bool {
+fn file_hash_differs(old_path: &Path, new_path: &Path) -> bool {
     use sha2::{Digest, Sha256};
-    let hash_file = |path: &str| -> Option<[u8; 32]> {
+    let hash_file = |path: &Path| -> Option<[u8; 32]> {
         let data = std::fs::read(path).ok()?;
         Some(Sha256::digest(&data).into())
     };
@@ -641,6 +638,19 @@ fn file_hash_differs(old_path: &str, new_path: &str) -> bool {
         (Some(old), Some(new)) => old != new,
         _ => true,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn current_app_bundle_path() -> Result<PathBuf, ScribeError> {
+    let exe = std::env::current_exe().map_err(|e| ScribeError::UpdateInstallFailed {
+        reason: format!("failed to resolve current executable path: {e}"),
+    })?;
+    exe.ancestors()
+        .find(|path| path.extension().is_some_and(|ext| ext == "app"))
+        .map(Path::to_path_buf)
+        .ok_or_else(|| ScribeError::UpdateInstallFailed {
+            reason: format!("current executable is not inside an app bundle: {}", exe.display()),
+        })
 }
 
 fn parse_version(tag: &str) -> Result<semver::Version, ScribeError> {

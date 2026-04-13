@@ -234,6 +234,9 @@ struct App {
     server_connected: bool,
     /// Destructive shutdown requested by this window and awaiting server acknowledgment.
     pending_shutdown: Option<PendingShutdown>,
+    /// Set when `handle_quit_requested` has already cleared restore state,
+    /// so a subsequent `handle_server_disconnected` does not re-save it.
+    quit_restore_cleared: bool,
     /// Persisted logical restore state for this client window.
     restore_store: restore_state::RestoreStore,
     /// Debounce marker for the next restore snapshot write.
@@ -453,6 +456,7 @@ impl App {
             line_drag_anchor: None,
             server_connected: false,
             pending_shutdown: None,
+            quit_restore_cleared: false,
             restore_store: restore_state::RestoreStore::new(),
             restore_save_pending: None,
             ai_tracker: AiStateTracker::new(claude_states),
@@ -3730,6 +3734,8 @@ impl App {
             LayoutAction::NewTab => self.handle_new_tab(),
             LayoutAction::NewClaudeTab => self.handle_new_claude_tab(),
             LayoutAction::NewClaudeResumeTab => self.handle_new_claude_resume_tab(),
+            LayoutAction::NewCodexTab => self.handle_new_codex_tab(),
+            LayoutAction::NewCodexResumeTab => self.handle_new_codex_resume_tab(),
             LayoutAction::CloseTab => self.handle_close_tab(),
             LayoutAction::NextTab => self.handle_next_tab(),
             LayoutAction::PrevTab => self.handle_prev_tab(),
@@ -3761,6 +3767,8 @@ impl App {
             AutomationAction::NewTab => self.handle_new_tab(),
             AutomationAction::NewClaudeTab => self.handle_new_claude_tab(),
             AutomationAction::NewClaudeResumeTab => self.handle_new_claude_resume_tab(),
+            AutomationAction::NewCodexTab => self.handle_new_codex_tab(),
+            AutomationAction::NewCodexResumeTab => self.handle_new_codex_resume_tab(),
             AutomationAction::SplitVertical => {
                 self.handle_layout_action(LayoutAction::SplitVertical);
             }
@@ -4092,9 +4100,9 @@ impl App {
         self.create_new_tab(None, None);
     }
 
-    fn ai_tab_command(&self, resume: bool) -> Vec<String> {
+    fn ai_tab_command(provider: AiProvider, resume: bool) -> Vec<String> {
         let shell = scribe_common::shell::default_shell_program();
-        let command = match (self.config.terminal.ai_tab_provider, resume) {
+        let command = match (provider, resume) {
             (AiProvider::ClaudeCode, false) => String::from("exec claude"),
             (AiProvider::ClaudeCode, true) => String::from("exec claude --resume"),
             (AiProvider::CodexCode, false) => String::from("exec codex"),
@@ -4118,12 +4126,25 @@ impl App {
         // When inside a workspace, start at the project root rather than
         // inheriting the current tab's CWD.
         let project_root = self.focused_workspace_project_root();
-        self.create_new_tab(Some(self.ai_tab_command(false)), project_root);
+        self.create_new_tab(
+            Some(Self::ai_tab_command(AiProvider::ClaudeCode, false)),
+            project_root,
+        );
     }
 
     fn handle_new_claude_resume_tab(&mut self) {
         let project_root = self.focused_workspace_project_root();
-        self.create_new_tab(Some(self.ai_tab_command(true)), project_root);
+        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::ClaudeCode, true)), project_root);
+    }
+
+    fn handle_new_codex_tab(&mut self) {
+        let project_root = self.focused_workspace_project_root();
+        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::CodexCode, false)), project_root);
+    }
+
+    fn handle_new_codex_resume_tab(&mut self) {
+        let project_root = self.focused_workspace_project_root();
+        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::CodexCode, true)), project_root);
     }
 
     fn launch_binding_for_command(
@@ -4857,10 +4878,6 @@ impl App {
         reason = "palette entries are assembled inline from static actions plus dynamic profiles"
     )]
     fn command_palette_entries(&self) -> Vec<CommandPaletteEntry> {
-        let ai_name = match self.config.terminal.ai_tab_provider {
-            AiProvider::ClaudeCode => "Claude",
-            AiProvider::CodexCode => "Codex",
-        };
         let mut entries = vec![
             CommandPaletteEntry {
                 label: String::from("Open Settings"),
@@ -4875,12 +4892,20 @@ impl App {
                 action: AutomationAction::NewTab,
             },
             CommandPaletteEntry {
-                label: format!("New {ai_name} Tab"),
+                label: String::from("New Claude Tab"),
                 action: AutomationAction::NewClaudeTab,
             },
             CommandPaletteEntry {
-                label: format!("Resume {ai_name} Tab"),
+                label: String::from("Resume Claude Tab"),
                 action: AutomationAction::NewClaudeResumeTab,
+            },
+            CommandPaletteEntry {
+                label: String::from("New Codex Tab"),
+                action: AutomationAction::NewCodexTab,
+            },
+            CommandPaletteEntry {
+                label: String::from("Resume Codex Tab"),
+                action: AutomationAction::NewCodexResumeTab,
             },
             CommandPaletteEntry {
                 label: String::from("Split Pane Vertical"),
@@ -7308,8 +7333,15 @@ impl App {
             self.restore_geometry_from_registry(event_loop, window_id);
         }
 
-        for &other_wid in other_windows {
-            spawn_client_process(other_wid);
+        // Only the bootstrap client (launched without --window-id) spawns
+        // children for other unconnected windows.  Children spawned with
+        // --window-id must NOT fan out — by the time they connect, some
+        // siblings may not yet be registered in connected_clients, causing
+        // them to appear in other_windows and get spawned a second time.
+        if !self.explicit_new_window {
+            for &other_wid in other_windows {
+                spawn_client_process(other_wid);
+            }
         }
     }
 
@@ -7562,13 +7594,17 @@ impl App {
     }
 
     /// Handle `ServerDisconnected` — persist state unless a permanent window
-    /// close was already requested, then exit.
+    /// close or quit was already processed, then exit.
     fn handle_server_disconnected(&mut self, event_loop: &ActiveEventLoop) {
         tracing::info!("server disconnected, exiting");
         self.server_connected = false;
         if let Some(PendingShutdown::CloseWindow { window_id }) = self.pending_shutdown {
             self.window_registry.remove(window_id);
             self.clear_restore_state();
+        } else if self.quit_restore_cleared {
+            // QuitRequested already cleared restore state — the server
+            // socket closing after the quit ack is expected, not a crash.
+            tracing::debug!("skipping restore save — quit already handled");
         } else {
             // Server crashed — preserve restore state for cold restart
             // and flush any pending snapshot.
@@ -7593,6 +7629,7 @@ impl App {
             _ => self.flush_geometry_now(),
         }
         self.clear_restore_state();
+        self.quit_restore_cleared = true;
         self.pending_shutdown = None;
         event_loop.exit();
     }

@@ -90,7 +90,9 @@ Messages sent from the server to clients, defined in [[crates/scribe-common/src/
 
 ### Connection
 
-`Welcome` responds to Hello with the assigned window ID and a list of other connected windows. `WindowClosed` confirms that a `CloseWindow` request permanently removed that window. `QuitRequested` is the shutdown acknowledgment for `QuitAll`.
+`Welcome` responds to Hello with the assigned window ID and a list of other unconnected windows that have sessions. `WindowClosed` and `QuitRequested` are shutdown acknowledgments.
+
+Only the bootstrap client (launched without `--window-id`) spawns child processes for the other windows in `Welcome`; children ignore the list to prevent fan-out duplication where racing siblings each spawn redundant processes for windows not yet registered in `connected_clients`.
 
 `SessionList` returns all sessions grouped by workspace in response to `ListSessions`. Each session entry includes the active AI state, if any, the last known AI provider hint, the last known Codex task label, the shell basename, and the last known session context so reconnect can restore provider-aware titles and remote labels without waiting for a fresh prompt. `WorkspaceInfo` sends workspace metadata (name, accent color, split direction, and project root path).
 

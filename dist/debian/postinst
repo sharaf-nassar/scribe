@@ -2,6 +2,7 @@
 set -e
 
 PACKAGE_NAME="${DPKG_MAINTSCRIPT_PACKAGE:-scribe}"
+PRIVILEGED_USER_UID="${SUDO_UID:-${PKEXEC_UID:-}}"
 if [ "$PACKAGE_NAME" = "scribe-dev" ]; then
     APP_DISPLAY_NAME="Scribe Dev"
     APP_SLUG="scribe-dev"
@@ -47,8 +48,8 @@ binary_changed() {
 }
 
 run_user_systemctl() {
-    if [ -n "$SUDO_UID" ]; then
-        sudo -u "#${SUDO_UID}" \
+    if [ -n "$PRIVILEGED_USER_UID" ]; then
+        sudo -u "#${PRIVILEGED_USER_UID}" \
             XDG_RUNTIME_DIR="$XDG_DIR" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
             systemctl --user "$@" 2>/dev/null
@@ -118,7 +119,7 @@ compute_server_runtime_generation() {
 user_config_home() {
     local config_home=""
 
-    if [ -n "$SUDO_UID" ]; then
+    if [ -n "$PRIVILEGED_USER_UID" ]; then
         config_home="$(run_user_command sh -lc 'printf %s "${XDG_CONFIG_HOME:-}"' 2>/dev/null || true)"
     else
         config_home="${XDG_CONFIG_HOME:-}"
@@ -261,7 +262,7 @@ migrate_prompt_bar_config() {
 }
 
 run_user_command() {
-    if [ -n "$SUDO_UID" ]; then
+    if [ -n "$PRIVILEGED_USER_UID" ]; then
         local display="$(user_manager_env DISPLAY)"
         local wayland_display="$(user_manager_env WAYLAND_DISPLAY)"
         local session_type="$(user_manager_env XDG_SESSION_TYPE)"
@@ -278,7 +279,7 @@ run_user_command() {
         [ -n "$session_type" ] && env_args+=("XDG_SESSION_TYPE=$session_type")
         [ -n "$xauthority" ] && env_args+=("XAUTHORITY=$xauthority")
 
-        sudo -u "#${SUDO_UID}" \
+        sudo -u "#${PRIVILEGED_USER_UID}" \
             "${env_args[@]}" \
             XDG_RUNTIME_DIR="$XDG_DIR" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_DIR}/bus" \
@@ -396,7 +397,7 @@ SERVER_RUNTIME_GENERATION="$(compute_server_runtime_generation)"
 
 case "$1" in
     configure)
-        TARGET_UID="${SUDO_UID:-$(id -u)}"
+        TARGET_UID="${PRIVILEGED_USER_UID:-$(id -u)}"
         XDG_DIR="/run/user/${TARGET_UID}"
         STATE_DIR="/run/user/${TARGET_UID}/${APP_SLUG}"
         SOCK="${STATE_DIR}/server.sock"
@@ -467,7 +468,7 @@ case "$1" in
                 # backgrounds the server *inside* the sh, so sh exits
                 # immediately, sudo exits, and the server is reparented to
                 # init.  The PID is captured via stdout.
-                if [ -n "$SUDO_UID" ]; then
+                if [ -n "$PRIVILEGED_USER_UID" ]; then
                     UPGRADE_PID=$(run_user_command sh -c '
                         "$1" --upgrade >"$2" 2>&1 &
                         echo $!
@@ -615,12 +616,12 @@ case "$1" in
 
             STARTED=0
 
-            if [ -n "$SUDO_UID" ] && [ -d "$XDG_DIR" ]; then
+            if [ -n "$PRIVILEGED_USER_UID" ] && [ -d "$XDG_DIR" ]; then
                 run_user_systemctl daemon-reload && \
                 run_user_systemctl enable "$SERVICE_NAME" && \
                 run_user_systemctl start "$SERVICE_NAME" && \
                 STARTED=1
-            elif [ -z "$SUDO_UID" ]; then
+            elif [ -z "$PRIVILEGED_USER_UID" ]; then
                 run_user_systemctl daemon-reload && \
                 run_user_systemctl enable "$SERVICE_NAME" && \
                 run_user_systemctl start "$SERVICE_NAME" && \
@@ -657,8 +658,8 @@ case "$1" in
 
             if [ -d "$CLAUDE_DIR" ]; then
                 echo "  Setting up Claude Code AI indicator hooks..."
-                if [ -n "$SUDO_UID" ]; then
-                    sudo -u "#${SUDO_UID}" \
+                if [ -n "$PRIVILEGED_USER_UID" ]; then
+                    sudo -u "#${PRIVILEGED_USER_UID}" \
                         HOME="$TARGET_HOME" \
                         "$SETUP_SCRIPT" --hook-source "$SHARE_DIR" 2>&1 | sed 's/^/  /'
                 else
@@ -675,8 +676,8 @@ case "$1" in
 
             if [ -d "$CODEX_DIR" ]; then
                 echo "  Setting up Codex AI indicator hooks..."
-                if [ -n "$SUDO_UID" ]; then
-                    sudo -u "#${SUDO_UID}" \
+                if [ -n "$PRIVILEGED_USER_UID" ]; then
+                    sudo -u "#${PRIVILEGED_USER_UID}" \
                         HOME="$TARGET_HOME" \
                         "$SETUP_SCRIPT" --hook-source "$SHARE_DIR" 2>&1 | sed 's/^/  /'
                 else

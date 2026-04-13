@@ -41,14 +41,22 @@ enum ActionCommand {
     OpenSettings,
     OpenFind,
     NewTab,
+    NewClaudeTab,
+    ResumeClaudeTab,
+    NewCodexTab,
+    ResumeCodexTab,
+    /// Compatibility alias for `new-claude-tab`.
     NewAiTab,
+    /// Compatibility alias for `resume-claude-tab`.
     ResumeAiTab,
     SplitVertical,
     SplitHorizontal,
     ClosePane,
     CloseTab,
     NewWindow,
-    SwitchProfile { name: String },
+    SwitchProfile {
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -236,8 +244,12 @@ fn to_automation_action(action: ActionCommand) -> AutomationAction {
         ActionCommand::OpenSettings => AutomationAction::OpenSettings,
         ActionCommand::OpenFind => AutomationAction::OpenFind,
         ActionCommand::NewTab => AutomationAction::NewTab,
-        ActionCommand::NewAiTab => AutomationAction::NewClaudeTab,
-        ActionCommand::ResumeAiTab => AutomationAction::NewClaudeResumeTab,
+        ActionCommand::NewClaudeTab | ActionCommand::NewAiTab => AutomationAction::NewClaudeTab,
+        ActionCommand::ResumeClaudeTab | ActionCommand::ResumeAiTab => {
+            AutomationAction::NewClaudeResumeTab
+        }
+        ActionCommand::NewCodexTab => AutomationAction::NewCodexTab,
+        ActionCommand::ResumeCodexTab => AutomationAction::NewCodexResumeTab,
         ActionCommand::SplitVertical => AutomationAction::SplitVertical,
         ActionCommand::SplitHorizontal => AutomationAction::SplitHorizontal,
         ActionCommand::ClosePane => AutomationAction::ClosePane,
@@ -265,8 +277,8 @@ async fn run_action_command(
     action: ActionCommand,
 ) -> Result<(), ScribeError> {
     let mut stream = connect_server().await?;
-    let msg =
-        ClientMessage::DispatchAction { window_id: window, action: to_automation_action(action) };
+    let resolved_action = to_automation_action(action);
+    let msg = ClientMessage::DispatchAction { window_id: window, action: resolved_action };
     write_message(&mut stream, &msg).await?;
     let response: ServerMessage = read_message(&mut stream).await?;
     parse_dispatch_response(response)?;

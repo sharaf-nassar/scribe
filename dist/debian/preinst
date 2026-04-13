@@ -2,6 +2,7 @@
 set -e
 
 PACKAGE_NAME="${DPKG_MAINTSCRIPT_PACKAGE:-scribe}"
+PRIVILEGED_USER_UID="${SUDO_UID:-${PKEXEC_UID:-}}"
 if [ "$PACKAGE_NAME" = "scribe-dev" ]; then
     APP_SLUG="scribe-dev"
     CLIENT_BIN_NAME="scribe-dev"
@@ -16,7 +17,7 @@ SETTINGS_BIN_PATH="/usr/bin/${SETTINGS_BIN_NAME}"
 
 case "$1" in
     upgrade|install)
-        TARGET_UID="${SUDO_UID:-$(id -u)}"
+        TARGET_UID="${PRIVILEGED_USER_UID:-$(id -u)}"
         # Use /run/user (mode 0700, owned by user) instead of world-writable /tmp
         # to prevent symlink attacks from other local users.
         STATE_DIR="/run/user/${TARGET_UID}/${APP_SLUG}"

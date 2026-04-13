@@ -617,16 +617,6 @@
           </div>
           <div class="setting-row">
             <div class="setting-info">
-              <div class="setting-label">AI Tab Provider</div>
-              <div class="setting-desc">Choose which assistant the AI tab shortcuts open</div>
-            </div>
-            <div class="segmented-control" data-key="terminal.ai_tab_provider">
-              <div class="segment-opt active" data-value="claude_code">Claude Code</div>
-              <div class="segment-opt" data-value="codex_code">Codex</div>
-            </div>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
               <div class="setting-label">Clipboard Cleanup</div>
               <div class="setting-desc">Dedent and unwrap copied text during AI sessions</div>
             </div>
@@ -913,10 +903,6 @@
       <div class="page-title">Keybindings</div>
       <div class="page-subtitle">Click a shortcut to reassign it</div>
 
-      <div class="section-group">
-        <div class="cross-link-note" id="ai-tab-crosslink">AI tab provider is configured in AI settings &#8594;</div>
-      </div>
-
       <div id="kb-conflict-banner" class="kb-conflict-banner" style="display:none;"></div>
 
       <div class="section-group">
@@ -1025,15 +1011,27 @@
             </div>
           </div>
           <div class="setting-row">
-            <div class="setting-info"><div class="setting-label" data-ai-tab-label="new">New Claude Tab</div></div>
+            <div class="setting-info"><div class="setting-label">New Claude Tab</div></div>
             <div class="keybinding-cell" data-action="new_claude_tab">
               <button class="kb-reset-btn" data-action="new_claude_tab" title="Reset to default">&#8635;</button>
             </div>
           </div>
           <div class="setting-row">
-            <div class="setting-info"><div class="setting-label" data-ai-tab-label="resume">Resume Claude Tab</div></div>
+            <div class="setting-info"><div class="setting-label">Resume Claude Tab</div></div>
             <div class="keybinding-cell" data-action="new_claude_resume_tab">
               <button class="kb-reset-btn" data-action="new_claude_resume_tab" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">New Codex Tab</div></div>
+            <div class="keybinding-cell" data-action="new_codex_tab">
+              <button class="kb-reset-btn" data-action="new_codex_tab" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Resume Codex Tab</div></div>
+            <div class="keybinding-cell" data-action="new_codex_resume_tab">
+              <button class="kb-reset-btn" data-action="new_codex_resume_tab" title="Reset to default">&#8635;</button>
             </div>
           </div>
           <div class="setting-row">

@@ -52,7 +52,7 @@ Terminal query callbacks share that same reader-task path. Clipboard loads, text
 
 Client disconnection clears the client writer, while PTY EOF removes that session from live and ownership state before reconnect or handoff.
 
-`CloseWindow` still removes the whole window and its persisted tree.
+`CloseWindow` removes the whole window and its persisted tree. `CloseSession` and `CloseWindow` rely on `Pty::Drop` to send SIGHUP for fresh sessions, but handoff-restored sessions have `pty: None` so [[crates/scribe-server/src/ipc_server.rs#signal_if_handoff_session]] sends `kill(child_pid, SIGHUP)` explicitly. The PTY reader task exits naturally on EOF once the child dies.
 
 `ipc_server.rs` remains the transport and message-dispatch layer for `AttachSessions`, but `attach_flow.rs` now owns the reattach sequence itself: attach-entry preparation from live sessions, pre-snapshot Term and PTY resize, stored metadata and workspace replay, screen snapshot delivery, and the delayed client-writer install.
 
@@ -112,7 +112,9 @@ Per-workspace payloads include name, accent color, split direction, session list
 
 ### Defuse Strategy
 
-Before the old server exits, Pty objects are wrapped in `ManuallyDrop` to prevent their Drop impl from sending SIGHUP to child processes. The new server already holds the master fds via SCM_RIGHTS.
+Before the old server exits, Pty objects are wrapped in `ManuallyDrop` to prevent their Drop impl from sending SIGHUP to child processes.
+
+The new server already holds the master fds via SCM_RIGHTS. Because defused sessions have `pty: None`, close handlers use [[crates/scribe-server/src/ipc_server.rs#signal_if_handoff_session]] to send SIGHUP explicitly when those sessions are later destroyed.
 
 ### Size Limits
 
@@ -146,13 +148,13 @@ Stable channel filters out drafts and prereleases; Beta channel includes prerele
 
 Downloads the platform-specific asset via streaming (no full buffering in memory) and fetches its minisig signature in parallel, then verifies with the embedded real minisign public key.
 
-On Linux, installation uses `pkexec dpkg -i`; on macOS, it uses `hdiutil attach` + `ditto`. Progress is broadcast to all connected clients.
+On Linux, installation uses `pkexec dpkg -i`; the Debian maintainer scripts recover the invoking desktop UID from `SUDO_UID` or `PKEXEC_UID` so user services, runtime directories, and hook setup still target the logged-in user. On macOS, it uses `hdiutil attach` + `ditto` and replaces the currently running `.app` bundle derived from `current_exe()` instead of assuming `/Applications/Scribe.app`. Progress is broadcast to all connected clients.
 
 ### Rollback
 
 Restores the previous installation if an update fails mid-install.
 
-On macOS, the existing `.app` bundle is renamed to `.app.prev` before `ditto` copies the new version. If `ditto` fails, `.app.prev` is renamed back to restore the previous version. On Linux, rollback relies on dpkg's own transactional behavior.
+On macOS, the existing `.app` bundle is renamed to an adjacent `.app.prev` backup before `ditto` copies the new version. If `ditto` fails, that adjacent backup is renamed back to restore the previous version. On Linux, rollback relies on dpkg's own transactional behavior.
 
 ### macOS Hot-Reload
 

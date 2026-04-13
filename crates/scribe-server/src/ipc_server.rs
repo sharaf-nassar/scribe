@@ -977,8 +977,34 @@ async fn handle_focus_changed(
     }
 }
 
-/// Close a session and clean up. Dropping the `LiveSession` sends SIGHUP
-/// to the child process and the PTY reader task exits on EOF.
+/// Send `SIGHUP` to the child process of a handoff-restored session.
+///
+/// After a hot-reload handoff the `pty` field is `None` because we only
+/// received the master fd via `SCM_RIGHTS`, not the original `Pty` object.
+/// Without the `Pty`, dropping the `LiveSession` does not send `SIGHUP`
+/// to the child. This helper fills that gap so `CloseSession` and
+/// `CloseWindow` can clean up handoff-restored sessions correctly.
+fn signal_if_handoff_session(session_id: SessionId, session: &LiveSession) {
+    if session.pty.is_some() {
+        return; // `Pty::Drop` will send SIGHUP.
+    }
+    let pid = session.child_pid.cast_signed();
+    info!(%session_id, pid, "sending SIGHUP to handoff-restored session");
+    // SAFETY: `pid` is the child process spawned by a prior server instance.
+    // Sending SIGHUP to a PID is safe — if the process already exited, the
+    // kernel returns ESRCH which we intentionally ignore.
+    #[allow(unsafe_code, reason = "kill(2) requires unsafe FFI")]
+    let ret = unsafe { libc::kill(pid, libc::SIGHUP) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        warn!(%session_id, pid, %err, "failed to send SIGHUP to child");
+    }
+}
+
+/// Close a session and clean up. For fresh sessions the `Pty::Drop` inside
+/// `LiveSession` sends SIGHUP to the child process; for handoff-restored
+/// sessions (`pty: None`) we send SIGHUP explicitly so the child is not
+/// leaked. The PTY reader task exits naturally on EOF once the child dies.
 async fn handle_close_session(
     session_id: SessionId,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
@@ -990,7 +1016,12 @@ async fn handle_close_session(
         return;
     }
 
-    live_sessions.write().await.remove(&session_id);
+    let removed = live_sessions.write().await.remove(&session_id);
+    if let Some(session) = &removed {
+        signal_if_handoff_session(session_id, session);
+    }
+    // `removed` is dropped here — if `pty` is `Some`, `Pty::Drop` sends SIGHUP.
+    drop(removed);
     workspace_manager.write().await.remove_session(session_id);
     attached_ids.remove(&session_id);
     info!(%session_id, "session closed by client");
@@ -1008,11 +1039,15 @@ async fn handle_close_window(
     let session_ids = workspace_manager.read().await.sessions_for_window(window_id);
     info!(%window_id, count = session_ids.len(), "closing window — destroying sessions");
 
-    // Destroy each session (drops PTY fd → SIGHUP → child exit).
+    // Destroy each session. For fresh sessions `Pty::Drop` sends SIGHUP;
+    // for handoff-restored sessions (`pty: None`) we signal explicitly.
     {
         let mut sessions = live_sessions.write().await;
         for &sid in &session_ids {
-            sessions.remove(&sid);
+            if let Some(session) = sessions.remove(&sid) {
+                signal_if_handoff_session(sid, &session);
+                // `session` dropped here — `Pty::Drop` fires if `pty` is `Some`.
+            }
             attached_ids.remove(&sid);
         }
     }

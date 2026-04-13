@@ -66,6 +66,8 @@ pub struct Bindings {
     pub new_tab: BindingSet,
     pub new_claude_tab: BindingSet,
     pub new_claude_resume_tab: BindingSet,
+    pub new_codex_tab: BindingSet,
+    pub new_codex_resume_tab: BindingSet,
     pub close_tab: BindingSet,
     pub next_tab: BindingSet,
     pub prev_tab: BindingSet,
@@ -216,6 +218,8 @@ impl Bindings {
             new_tab: parse_set(&config.new_tab),
             new_claude_tab: parse_set(&config.new_claude_tab),
             new_claude_resume_tab: parse_set(&config.new_claude_resume_tab),
+            new_codex_tab: parse_set(&config.new_codex_tab),
+            new_codex_resume_tab: parse_set(&config.new_codex_resume_tab),
             close_tab: parse_set(&config.close_tab),
             next_tab: parse_set(&config.next_tab),
             prev_tab: parse_set(&config.prev_tab),
@@ -322,10 +326,14 @@ pub enum LayoutAction {
     // Tabs
     /// Create a new tab in the focused workspace.
     NewTab,
-    /// Open a new tab running the selected AI CLI in the focused workspace.
+    /// Open a new tab running Claude Code in the focused workspace.
     NewClaudeTab,
-    /// Open a new tab resuming the selected AI CLI in the focused workspace.
+    /// Open a new tab resuming Claude Code in the focused workspace.
     NewClaudeResumeTab,
+    /// Open a new tab running Codex in the focused workspace.
+    NewCodexTab,
+    /// Open a new tab resuming Codex in the focused workspace.
+    NewCodexResumeTab,
     /// Close the active tab in the focused workspace.
     CloseTab,
     /// Switch to the next tab.
@@ -512,6 +520,12 @@ fn translate_layout_shortcut(
     }
     if any_matches(&bindings.new_claude_resume_tab, event, modifiers) {
         return Some(LayoutAction::NewClaudeResumeTab);
+    }
+    if any_matches(&bindings.new_codex_tab, event, modifiers) {
+        return Some(LayoutAction::NewCodexTab);
+    }
+    if any_matches(&bindings.new_codex_resume_tab, event, modifiers) {
+        return Some(LayoutAction::NewCodexResumeTab);
     }
     if any_matches(&bindings.new_tab, event, modifiers) {
         return Some(LayoutAction::NewTab);

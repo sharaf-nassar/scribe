@@ -267,13 +267,6 @@ fn apply_config_key(
                 _ => return Err(format!("invalid prompt_bar_position: {s}")),
             };
         }
-        "terminal.ai_tab_provider" => {
-            let provider_str = value.as_str().ok_or("ai_tab_provider must be a string")?;
-            let provider: scribe_common::ai_state::AiProvider =
-                serde_json::from_value(serde_json::Value::String(provider_str.to_owned()))
-                    .map_err(|e| format!("invalid ai_tab_provider: {e}"))?;
-            config.terminal.ai_tab_provider = provider;
-        }
         "terminal.natural_scroll" => {
             config.terminal.natural_scroll =
                 value.as_bool().ok_or("natural_scroll must be a boolean")?;
@@ -459,6 +452,8 @@ fn apply_keybinding_field(
         "new_tab" => kb.new_tab = list,
         "new_claude_tab" => kb.new_claude_tab = list,
         "new_claude_resume_tab" => kb.new_claude_resume_tab = list,
+        "new_codex_tab" => kb.new_codex_tab = list,
+        "new_codex_resume_tab" => kb.new_codex_resume_tab = list,
         "close_tab" => kb.close_tab = list,
         "next_tab" => kb.next_tab = list,
         "prev_tab" => kb.prev_tab = list,

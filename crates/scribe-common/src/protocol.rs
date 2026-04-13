@@ -35,6 +35,8 @@ pub enum AutomationAction {
     NewTab,
     NewClaudeTab,
     NewClaudeResumeTab,
+    NewCodexTab,
+    NewCodexResumeTab,
     SplitVertical,
     SplitHorizontal,
     ClosePane,
