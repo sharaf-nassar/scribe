@@ -10,7 +10,6 @@ use scribe_renderer::srgb_to_linear_rgba;
 use scribe_renderer::types::CellInstance;
 
 use scribe_common::ids::WorkspaceId;
-use scribe_common::protocol::UpdateProgressState;
 
 use crate::layout::Rect;
 use crate::tooltip::TooltipAnchor;
@@ -323,10 +322,6 @@ pub struct TabBarTextParams<'a> {
     pub indicator_height: f32,
     /// Fixed tab width in characters (includes leading/trailing padding).
     pub tab_width: u16,
-    /// Version string of available update. `None` when no update available.
-    pub update_available: Option<&'a str>,
-    /// Current update progress state for display. `None` when idle.
-    pub update_progress: Option<&'a UpdateProgressState>,
     /// Which tab's close button is shown (hovered). `None` = no hover.
     pub hovered_tab_close: Option<usize>,
     /// Which tab is hovered (for background highlight). `None` = no hover.
@@ -353,8 +348,6 @@ pub struct TabBarHitTargets {
     pub equalize_rect: Option<Rect>,
     /// Close button clickable regions per tab: `(tab_index, rect)`.
     pub close_rects: Vec<(usize, Rect)>,
-    /// Clickable rect for the update button, if rendered.
-    pub update_rect: Option<Rect>,
     /// Column range `(start_col, end_col)` of the active tab on row 0. `None` when no active tab
     /// is on row 0 (e.g. active tab is on row 1+ in a multi-row bar).
     pub active_tab_col_range: Option<(usize, usize)>,
@@ -377,7 +370,6 @@ pub fn build_tab_bar_text(
                 gear_rect: None,
                 equalize_rect: None,
                 close_rects: Vec::new(),
-                update_rect: None,
                 active_tab_col_range: None,
                 tooltip_targets: Vec::new(),
             },
@@ -392,7 +384,6 @@ pub fn build_tab_bar_text(
         gear_rect: None,
         equalize_rect: None,
         close_rects: Vec::new(),
-        update_rect: None,
         active_tab_col_range: None,
         tooltip_targets: Vec::new(),
     };
@@ -407,21 +398,6 @@ pub fn build_tab_bar_text(
     if let Some((ws_name, accent_color)) = params.badge {
         col =
             render_badge(&mut instances, col, content_cols, cell_w, params, ws_name, accent_color);
-    }
-
-    // Render update button or progress indicator if present.
-    if let Some(version) = params.update_available {
-        col = render_update_button(
-            &mut instances,
-            &mut hit_targets,
-            col,
-            content_cols,
-            cell_w,
-            params,
-            version,
-        );
-    } else if let Some(progress) = params.update_progress {
-        col = render_update_progress(&mut instances, col, content_cols, cell_w, params, progress);
     }
 
     // Render tab labels (and indicator bars for tabs with active AI state).
@@ -499,81 +475,6 @@ fn render_badge(
     for _ in 0..gap {
         col = emit_char(instances, ' ', col, max_cols, params, params.colors.text, bg);
     }
-
-    col
-}
-
-/// Render the update availability button: "↑ v{version}" in accent color.
-///
-/// Records a hit rect in `hit_targets.update_rect` for click handling.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "helper function that needs all render context from build_tab_bar_text"
-)]
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "column index is a small positive integer fitting in f32"
-)]
-fn render_update_button(
-    instances: &mut Vec<CellInstance>,
-    hit_targets: &mut TabBarHitTargets,
-    mut col: usize,
-    max_cols: usize,
-    cell_w: f32,
-    params: &mut TabBarTextParams<'_>,
-    version: &str,
-) -> usize {
-    let bg = params.colors.bg;
-    let accent = params.accent_color;
-
-    let start_col = col;
-    let label = format!("\u{2191} v{version}");
-    for ch in label.chars() {
-        col = emit_char(instances, ch, col, max_cols, params, accent, bg);
-    }
-
-    // One space gap after the button.
-    col = emit_char(instances, ' ', col, max_cols, params, params.colors.text, bg);
-
-    let btn_x = params.rect.x + start_col as f32 * cell_w;
-    let btn_width = (col - start_col) as f32 * cell_w;
-    hit_targets.update_rect =
-        Some(Rect { x: btn_x, y: params.rect.y, width: btn_width, height: params.tab_bar_height });
-
-    col
-}
-
-/// Render update progress text in the tab bar area.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "helper function that needs all render context from build_tab_bar_text"
-)]
-fn render_update_progress(
-    instances: &mut Vec<CellInstance>,
-    mut col: usize,
-    max_cols: usize,
-    _cell_w: f32,
-    params: &mut TabBarTextParams<'_>,
-    progress: &UpdateProgressState,
-) -> usize {
-    let bg = params.colors.bg;
-    let text_color = params.colors.text;
-
-    let label = match progress {
-        UpdateProgressState::Downloading => "Downloading\u{2026}",
-        UpdateProgressState::Verifying => "Verifying\u{2026}",
-        UpdateProgressState::Installing => "Installing\u{2026}",
-        UpdateProgressState::Completed { .. } => "Updated!",
-        UpdateProgressState::CompletedRestartRequired { .. } => "Updated! Restart required",
-        UpdateProgressState::Failed { .. } => "Update failed",
-    };
-
-    for ch in label.chars() {
-        col = emit_char(instances, ch, col, max_cols, params, text_color, bg);
-    }
-
-    // One space gap after.
-    col = emit_char(instances, ' ', col, max_cols, params, text_color, bg);
 
     col
 }

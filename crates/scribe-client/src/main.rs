@@ -271,8 +271,8 @@ struct App {
     update_progress: Option<UpdateProgressState>,
     /// Active update confirmation dialog (shown when user clicks the update button).
     update_dialog: Option<update_dialog::UpdateDialog>,
-    /// Clickable update button rect in tab bars `(workspace_id, rect)` (updated each frame).
-    tab_bar_update_targets: Vec<(WorkspaceId, layout::Rect)>,
+    /// Clickable update segment rect in the window status bar (updated each frame).
+    status_bar_update_rect: Option<layout::Rect>,
 
     // Context menu overlay (shown on right-click)
     context_menu: Option<context_menu::ContextMenu>,
@@ -473,7 +473,7 @@ impl App {
             update_available: None,
             update_progress: None,
             update_dialog: None,
-            tab_bar_update_targets: Vec::new(),
+            status_bar_update_rect: None,
             context_menu: None,
             splash_active: true,
             splash_needs_list_sessions: true,
@@ -651,11 +651,14 @@ impl ApplicationHandler<UiEvent> for App {
             }
             UiEvent::UpdateAvailable { version, release_url } => {
                 self.update_available = Some((version, release_url));
+                self.status_bar_update_rect = None;
                 self.update_window_title();
                 self.request_redraw();
             }
             UiEvent::UpdateProgress { state } => {
                 self.update_progress = Some(state);
+                self.status_bar_update_rect = None;
+                self.update_window_title();
                 self.request_redraw();
             }
             UiEvent::PromptMark { session_id, kind, click_events, .. } => {
@@ -2995,6 +2998,7 @@ impl App {
         let ws_viewport =
             workspace_viewport(&gpu.surface_config, self.config.appearance.status_bar_height);
         let cell_size = (gpu.renderer.cell_size().width, gpu.renderer.cell_size().height);
+        let mut refresh_window_title = false;
 
         // Get pane rects and dividers from ALL workspaces' active tabs.
         let ws_rects = self.window_layout.compute_workspace_rects(ws_viewport);
@@ -3298,10 +3302,8 @@ impl App {
             hovered_tab: self.hovered_tab,
             tab_drag: self.tab_drag.as_ref(),
             tab_drag_offsets: &self.tab_drag_offsets,
-            update_available: self.update_available.as_ref().map(|(v, _)| v.as_str()),
-            update_progress: self.update_progress.as_ref(),
         };
-        let (mut all_instances, tab_hits, tab_close_hits, tab_eq_hits, tab_upd_hits, tab_tt_hits) =
+        let (mut all_instances, tab_hits, tab_close_hits, tab_eq_hits, tab_tt_hits) =
             build_all_instances(
                 &mut gpu.renderer,
                 &gpu.device,
@@ -3314,7 +3316,6 @@ impl App {
         self.tab_hit_targets = tab_hits;
         self.tab_close_hit_targets = tab_close_hits;
         self.tab_bar_equalize_targets = tab_eq_hits;
-        self.tab_bar_update_targets = tab_upd_hits;
         self.tab_bar_tooltip_targets = tab_tt_hits;
 
         // Tab bar height lookup, shared by URL underlines and prompt bar tooltip.
@@ -3363,6 +3364,11 @@ impl App {
                 host_label,
                 tmux_label,
                 time: &time_str,
+                update_available: self
+                    .update_available
+                    .as_ref()
+                    .map(|(version, _)| version.as_str()),
+                update_progress: self.update_progress.as_ref(),
                 sys_stats: Some(self.sys_stats.stats()),
                 stats_config: Some(&self.config.terminal.status_bar_stats),
             };
@@ -3377,9 +3383,14 @@ impl App {
                 &sb_data,
                 &mut resolve_glyph,
             );
+            let prev_update_clickable = self.status_bar_update_rect.is_some();
             self.status_bar_gear_rect = sb_hits.gear_rect;
             self.status_bar_equalize_rect = sb_hits.equalize_rect;
+            self.status_bar_update_rect = sb_hits.update_rect;
             self.status_bar_tooltip_targets = sb_hits.tooltip_targets;
+            if prev_update_clickable != self.status_bar_update_rect.is_some() {
+                refresh_window_title = true;
+            }
         }
 
         // Close dialog overlay (rendered on top of everything).
@@ -3529,6 +3540,9 @@ impl App {
         gpu.queue.submit(std::iter::once(encoder.finish()));
         self.notify_pre_present();
         frame.present();
+        if refresh_window_title {
+            self.update_window_title();
+        }
         if request_redraw {
             self.request_redraw();
         }
@@ -5293,7 +5307,7 @@ impl App {
     )]
     #[allow(
         clippy::too_many_lines,
-        reason = "click dispatch: gear, equalize, update button, tab close, tab drag, scrollbar, divider, selection"
+        reason = "click dispatch: status bar update, equalize, tab close, tab drag, scrollbar, divider, selection"
     )]
     #[allow(
         clippy::cognitive_complexity,
@@ -5325,8 +5339,8 @@ impl App {
             }
         }
 
-        // Check for tab bar update button click (opens update confirmation dialog).
-        if self.tab_bar_update_targets.iter().any(|(_, rect)| rect.contains(x, y)) {
+        // Check for centered status-bar update click (opens update confirmation dialog).
+        if self.status_bar_update_rect.is_some_and(|rect| rect.contains(x, y)) {
             self.open_update_dialog();
             return;
         }
@@ -7455,6 +7469,7 @@ impl App {
             update_dialog::UpdateAction::Confirm => {
                 tracing::info!("user confirmed update");
                 self.update_available = None;
+                self.status_bar_update_rect = None;
                 self.update_window_title();
                 if let Some(tx) = &self.cmd_tx {
                     send_command(tx, ClientCommand::TriggerUpdate);
@@ -7464,6 +7479,7 @@ impl App {
                 tracing::info!("user dismissed update");
                 self.update_available = None;
                 self.update_progress = None;
+                self.status_bar_update_rect = None;
                 self.update_window_title();
                 if let Some(tx) = &self.cmd_tx {
                     send_command(tx, ClientCommand::DismissUpdate);
@@ -7477,11 +7493,14 @@ impl App {
     fn update_window_title(&self) {
         if let Some(window) = &self.window {
             let window_title = current_identity().window_title_name();
-            if let Some((version, _)) = &self.update_available {
-                window.set_title(&format!("{window_title} — v{version} available"));
-            } else {
-                window.set_title(window_title);
-            }
+            let title = match &self.update_available {
+                Some((version, _)) if self.status_bar_update_rect.is_some() => {
+                    format!("{window_title} - v{version} available - click below to update")
+                }
+                Some((version, _)) => format!("{window_title} - v{version} available"),
+                None => window_title.to_owned(),
+            };
+            window.set_title(&title);
         }
     }
 
@@ -7897,9 +7916,6 @@ type TabHitTargets = Vec<(WorkspaceId, usize, layout::Rect)>;
 /// `(workspace_id, equalize_rect)` for tab bar equalize button click handling.
 type TabEqualizeTargets = Vec<(WorkspaceId, layout::Rect)>;
 
-/// `(workspace_id, update_rect)` for tab bar update button click handling.
-type TabUpdateTargets = Vec<(WorkspaceId, layout::Rect)>;
-
 /// Tooltip anchors from all tab bars (updated each frame).
 type TabTooltipTargets = Vec<tooltip::TooltipAnchor>;
 
@@ -7951,10 +7967,6 @@ struct FrameInteraction<'a> {
     hovered_tab: Option<(WorkspaceId, usize)>,
     tab_drag: Option<&'a TabDrag>,
     tab_drag_offsets: &'a [f32],
-    /// Version string of available update. `None` when no update available.
-    update_available: Option<&'a str>,
-    /// Current update progress state. `None` when idle.
-    update_progress: Option<&'a UpdateProgressState>,
 }
 
 #[derive(Clone, Copy)]
@@ -8061,7 +8073,6 @@ fn build_all_instances(
     TabHitTargets,
     TabHitTargets,
     TabEqualizeTargets,
-    TabUpdateTargets,
     TabTooltipTargets,
 ) {
     // Build a workspace-id → tab_bar_height lookup for per-pane height queries.
@@ -8326,7 +8337,6 @@ fn build_all_instances(
     let mut tab_close_hit_targets: Vec<(WorkspaceId, usize, layout::Rect)> = Vec::new();
     let mut tab_equalize_targets: TabEqualizeTargets = Vec::new();
     let mut tab_tooltip_targets: TabTooltipTargets = Vec::new();
-    let mut tab_update_targets: TabUpdateTargets = Vec::new();
     for ws_data in layout.ws_tab_bar_data {
         let tbh = ws_data.tab_bar_height;
         let tab_bar_rect = layout::Rect {
@@ -8364,8 +8374,6 @@ fn build_all_instances(
             tab_bar_height: tbh,
             indicator_height: style.indicator_height,
             tab_width: interaction.tab_width,
-            update_available: interaction.update_available,
-            update_progress: interaction.update_progress,
             hovered_tab_close: ws_hovered_close,
             hovered_tab: ws_hovered_tab,
             tab_offsets: ws_tab_offsets,
@@ -8385,14 +8393,10 @@ fn build_all_instances(
         if let Some(eq_rect) = hit_targets.equalize_rect {
             tab_equalize_targets.push((ws_data.ws_id, eq_rect));
         }
-        if let Some(upd_rect) = hit_targets.update_rect {
-            tab_update_targets.push((ws_data.ws_id, upd_rect));
-        }
         tab_tooltip_targets.extend(hit_targets.tooltip_targets);
 
         // Draw the bottom separator using the exact active-tab column range
-        // returned by the render pass.  This avoids the pre-computation error
-        // where update-button columns were not accounted for (Issue 2 fix).
+        // returned by the render pass.
         let (cell_w, _) = layout.cell_size;
         #[allow(
             clippy::cast_precision_loss,
@@ -8603,7 +8607,6 @@ fn build_all_instances(
         tab_hit_targets,
         tab_close_hit_targets,
         tab_equalize_targets,
-        tab_update_targets,
         tab_tooltip_targets,
     )
 }

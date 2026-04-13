@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use scribe_common::protocol::UpdateProgressState;
 use scribe_common::theme::ChromeColors;
 use scribe_renderer::srgb_to_linear_rgba;
 use scribe_renderer::types::CellInstance;
@@ -20,6 +21,8 @@ pub struct StatusBarHitTargets {
     pub equalize_rect: Option<Rect>,
     /// Clickable rect for the settings gear icon.
     pub gear_rect: Option<Rect>,
+    /// Clickable rect for the centered update status segment.
+    pub update_rect: Option<Rect>,
     /// Tooltip hover targets for each status bar segment.
     pub tooltip_targets: Vec<TooltipAnchor>,
 }
@@ -43,6 +46,10 @@ pub struct StatusBarData<'a> {
     pub tmux_label: Option<&'a str>,
     /// Current time string (e.g. "14:32").
     pub time: &'a str,
+    /// Version string for a pending update, if available.
+    pub update_available: Option<&'a str>,
+    /// Current update progress state, if an update is in progress.
+    pub update_progress: Option<&'a UpdateProgressState>,
     pub sys_stats: Option<&'a SystemStats>,
     pub stats_config: Option<&'a scribe_common::config::StatusBarStatsConfig>,
 }
@@ -135,6 +142,7 @@ pub fn build_status_bar(
         return StatusBarHitTargets {
             equalize_rect: None,
             gear_rect: None,
+            update_rect: None,
             tooltip_targets: Vec::new(),
         };
     }
@@ -185,13 +193,16 @@ pub fn build_status_bar(
     );
 
     let mut tooltips: Vec<TooltipAnchor> = Vec::new();
-    let col = render_left_side(&mut w, colors, data, resolve_glyph, &mut tooltips);
-    w.col = col;
+    let left_end = render_left_side(&mut w, colors, data, resolve_glyph, &mut tooltips);
+    w.col = left_end;
 
-    let (equalize_rect, gear_rect) =
+    let (equalize_rect, gear_rect, right_start) =
         render_right_side(&mut w, colors, data, resolve_glyph, &mut tooltips);
 
-    StatusBarHitTargets { equalize_rect, gear_rect, tooltip_targets: tooltips }
+    let update_rect =
+        render_centered_update(&mut w, colors, data, resolve_glyph, left_end, right_start);
+
+    StatusBarHitTargets { equalize_rect, gear_rect, update_rect, tooltip_targets: tooltips }
 }
 
 /// Mutable writer state for emitting status bar characters.
@@ -215,6 +226,17 @@ impl BarWriter<'_> {
     fn col_rect(&self, start_col: usize) -> Rect {
         let x = self.x_origin + start_col as f32 * self.cell_w;
         let width = (self.col - start_col) as f32 * self.cell_w;
+        Rect { x, y: self.bar_y, width, height: self.bar_height }
+    }
+
+    /// Compute a [`Rect`] spanning `start_col..end_col` at the bar's Y position.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "column indices are small positive integers fitting in f32"
+    )]
+    fn col_rect_range(&self, start_col: usize, end_col: usize) -> Rect {
+        let x = self.x_origin + start_col as f32 * self.cell_w;
+        let width = (end_col.saturating_sub(start_col)) as f32 * self.cell_w;
         Rect { x, y: self.bar_y, width, height: self.bar_height }
     }
 
@@ -248,6 +270,40 @@ impl BarWriter<'_> {
         self.col += 1;
     }
 
+    /// Emit a single character at an explicit column index.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "explicit-position helper needs column, colors, and glyph resolver"
+    )]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "column index is a small positive integer fitting in f32"
+    )]
+    fn put_at(
+        &mut self,
+        col: usize,
+        ch: char,
+        fg: [f32; 4],
+        bg: [f32; 4],
+        resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+    ) {
+        if col >= self.max_cols {
+            return;
+        }
+        let x = self.x_origin + col as f32 * self.cell_w;
+        let (uv_min, uv_max) = resolve_glyph(ch);
+        self.out.push(CellInstance {
+            pos: [x, self.y],
+            size: [0.0, 0.0],
+            uv_min,
+            uv_max,
+            fg_color: fg,
+            bg_color: bg,
+            corner_radius: 0.0,
+            _pad: 0.0,
+        });
+    }
+
     /// Emit a string with the given colors.
     fn put_str(
         &mut self,
@@ -273,6 +329,115 @@ impl BarWriter<'_> {
             self.put(' ', fg, bg, resolve_glyph);
         }
     }
+
+    /// Emit a string at an explicit column start index and return the end column.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "explicit-position string helper needs column, colors, and glyph resolver"
+    )]
+    fn put_str_at(
+        &mut self,
+        start_col: usize,
+        s: &str,
+        fg: [f32; 4],
+        bg: [f32; 4],
+        resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+    ) -> usize {
+        let mut end_col = start_col;
+        for (offset, ch) in s.chars().enumerate() {
+            let col = start_col + offset;
+            if col >= self.max_cols {
+                break;
+            }
+            self.put_at(col, ch, fg, bg, resolve_glyph);
+            end_col = col + 1;
+        }
+        end_col
+    }
+}
+
+/// Information about the centered update CTA area and whether it should handle clicks.
+struct CenteredUpdateSegment {
+    labels: Vec<String>,
+    clickable: bool,
+}
+
+/// Resolve the centered status-bar update label and clickability from update state.
+fn resolve_centered_update_segment(
+    update_available: Option<&str>,
+    update_progress: Option<&UpdateProgressState>,
+) -> Option<CenteredUpdateSegment> {
+    match update_progress {
+        Some(UpdateProgressState::Downloading) => Some(CenteredUpdateSegment {
+            labels: vec![String::from("Downloading...")],
+            clickable: false,
+        }),
+        Some(UpdateProgressState::Verifying) => Some(CenteredUpdateSegment {
+            labels: vec![String::from("Verifying...")],
+            clickable: false,
+        }),
+        Some(UpdateProgressState::Installing) => Some(CenteredUpdateSegment {
+            labels: vec![String::from("Installing...")],
+            clickable: false,
+        }),
+        Some(UpdateProgressState::Completed { .. }) => {
+            Some(CenteredUpdateSegment { labels: vec![String::from("Updated!")], clickable: false })
+        }
+        Some(UpdateProgressState::CompletedRestartRequired { .. }) => Some(CenteredUpdateSegment {
+            labels: vec![String::from("Updated! Restart required")],
+            clickable: false,
+        }),
+        Some(UpdateProgressState::Failed { .. }) => Some(CenteredUpdateSegment {
+            labels: vec![String::from("Update failed")],
+            clickable: false,
+        }),
+        None => update_available.map(|version| CenteredUpdateSegment {
+            labels: vec![format!("↑ Update to v{version}"), String::from("↑ Update")],
+            clickable: true,
+        }),
+    }
+}
+
+/// Render the centered update segment and return the clickable rectangle if appropriate.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "centered update renderer needs bounds plus full draw context"
+)]
+fn render_centered_update(
+    w: &mut BarWriter<'_>,
+    colors: &StatusBarColors,
+    data: &StatusBarData<'_>,
+    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+    left_end: usize,
+    right_start: usize,
+) -> Option<Rect> {
+    let segment = resolve_centered_update_segment(data.update_available, data.update_progress)?;
+
+    if w.max_cols == 0 || left_end >= right_start {
+        return None;
+    }
+
+    for label in &segment.labels {
+        if label.is_empty() {
+            continue;
+        }
+
+        let label_cols = label.chars().count();
+        if label_cols == 0 || label_cols > w.max_cols {
+            continue;
+        }
+
+        let start_col = (w.max_cols - label_cols) / 2;
+        let end_col = start_col + label_cols;
+        if start_col < left_end || end_col > right_start {
+            continue;
+        }
+
+        w.put_str_at(start_col, label, colors.text, colors.bg, resolve_glyph);
+        return segment.clickable.then_some(w.col_rect_range(start_col, end_col));
+    }
+
+    None
 }
 
 /// Render the left side: connection dot, workspace name (if multi), CWD.
@@ -327,7 +492,7 @@ fn render_right_side(
     data: &StatusBarData<'_>,
     resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
     tooltips: &mut Vec<TooltipAnchor>,
-) -> (Option<Rect>, Option<Rect>) {
+) -> (Option<Rect>, Option<Rect>, usize) {
     // +3 for the gear segment: " ⚙ " (space, gear, space)
     let gear_cols: usize = 3;
     // +2 for the equalize segment: " ⊞" (space, icon) — gear provides the trailing space
@@ -357,7 +522,7 @@ fn render_right_side(
 
     w.pad_to(w.max_cols, colors.text, colors.bg, resolve_glyph);
 
-    (equalize_rect, gear_rect)
+    (equalize_rect, gear_rect, right_start)
 }
 
 /// Build the `(tooltip_text, segment_count)` group list from `data`.

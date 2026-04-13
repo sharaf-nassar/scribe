@@ -233,7 +233,9 @@ Typing while split-scrolled sends keystrokes without snapping to bottom. Pressin
 
 ## Status Bar
 
-The status bar at the bottom of the window shows connection status, workspace info, CWD, git branch, session count, host context, tmux context, time, and system stats.
+The status bar is rendered at the bottom of the window.
+
+It shows connection status, workspace info, CWD, git branch, session count, host context, tmux context, time, and system stats. Update availability and progress now render in this centered status bar segment too, and its update segment opens the in-app confirmation dialog on click.
 
 Connection is indicated by a green/red dot. Workspace name appears when multi-workspace. The focused pane's remote host overrides the local hostname when shell integration emits session context, and tmux session names render as a separate accent segment. Stats include CPU sparkline, memory percentage, GPU sparkline (Linux only), and network sparklines.
 
@@ -255,7 +257,8 @@ When a PTY exit removes the last remaining pane in a window, the client reuses t
 
 Shows version information and platform-specific notes with Update Now and Later buttons, opened via the command palette.
 
-The update notification appears in the compositor window title rather than in the tab bar. Stable windows use `Scribe`, while `scribe-dev` windows use `devScribe`, yielding titles such as `devScribe — v{version} available`. The command palette shows an "Update Scribe to v{version}" entry when an update is available.
+The update notification appears in the compositor window title rather than in the tab bar. Stable windows use `Scribe`, while `scribe-dev` windows use `devScribe`, yielding titles such as `devScribe - v{version} available - click below to update` when the centered bottom status-bar CTA is clickable and `devScribe - v{version} available` otherwise. The command palette shows an "Update Scribe to v{version}" entry when an update is available.
+The same notification state is surfaced in the centered bottom status bar, so users can start the update flow from one location in the window chrome instead of any per-workspace tab bar.
 
 ### Context Menu
 
