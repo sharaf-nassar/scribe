@@ -163,14 +163,18 @@ struct LineMetrics {
 ///
 /// Returns `None` for characters that are not simple line compositions
 /// (e.g. diagonal lines return `None`; rounded corners map to light).
-#[allow(
-    clippy::too_many_lines,
-    reason = "exhaustive match over 128 box-drawing codepoints is inherently long"
-)]
 fn decode_segments(c: char) -> Option<Segments> {
-    use LineWeight::{Double, Heavy, HeavyDash, Light, LightDash, None as N};
+    decode_straight_segments(c)
+        .or_else(|| decode_corner_segments(c))
+        .or_else(|| decode_t_segments(c))
+        .or_else(|| decode_double_segments(c))
+        .or_else(|| decode_half_line_segments(c))
+}
 
-    let seg = match c {
+fn decode_straight_segments(c: char) -> Option<Segments> {
+    use LineWeight::{Heavy, HeavyDash, Light, LightDash, None as N};
+
+    Some(match c {
         // ─ ━ │ ┃  Solid horizontal/vertical
         '\u{2500}' => Segments { left: Light, right: Light, up: N, down: N },
         '\u{2501}' => Segments { left: Heavy, right: Heavy, up: N, down: N },
@@ -190,6 +194,14 @@ fn decode_segments(c: char) -> Option<Segments> {
         '\u{2507}' | '\u{250B}' | '\u{254F}' => {
             Segments { left: N, right: N, up: HeavyDash, down: HeavyDash }
         }
+        _ => return None,
+    })
+}
+
+fn decode_corner_segments(c: char) -> Option<Segments> {
+    use LineWeight::{Heavy, Light, None as N};
+
+    Some(match c {
         // ┌ Down-and-right corners (╭ rounded maps to light)
         '\u{250C}' | '\u{256D}' => Segments { left: N, right: Light, up: N, down: Light },
         '\u{250D}' => Segments { left: N, right: Heavy, up: N, down: Light },
@@ -210,6 +222,14 @@ fn decode_segments(c: char) -> Option<Segments> {
         '\u{2519}' => Segments { left: Heavy, right: N, up: Light, down: N },
         '\u{251A}' => Segments { left: Light, right: N, up: Heavy, down: N },
         '\u{251B}' => Segments { left: Heavy, right: N, up: Heavy, down: N },
+        _ => return None,
+    })
+}
+
+fn decode_t_segments(c: char) -> Option<Segments> {
+    use LineWeight::{Heavy, Light, None as N};
+
+    Some(match c {
         // ├ Vertical-and-right (T-pieces)
         '\u{251C}' => Segments { left: N, right: Light, up: Light, down: Light },
         '\u{251D}' => Segments { left: N, right: Heavy, up: Light, down: Light },
@@ -263,6 +283,14 @@ fn decode_segments(c: char) -> Option<Segments> {
         '\u{2549}' => Segments { left: Heavy, right: Light, up: Heavy, down: Heavy },
         '\u{254A}' => Segments { left: Light, right: Heavy, up: Heavy, down: Heavy },
         '\u{254B}' => Segments { left: Heavy, right: Heavy, up: Heavy, down: Heavy },
+        _ => return None,
+    })
+}
+
+fn decode_double_segments(c: char) -> Option<Segments> {
+    use LineWeight::{Double, Light, None as N};
+
+    Some(match c {
         // ═ ║ Double lines
         '\u{2550}' => Segments { left: Double, right: Double, up: N, down: N },
         '\u{2551}' => Segments { left: N, right: N, up: Double, down: Double },
@@ -302,6 +330,14 @@ fn decode_segments(c: char) -> Option<Segments> {
         '\u{256A}' => Segments { left: Double, right: Double, up: Light, down: Light },
         '\u{256B}' => Segments { left: Light, right: Light, up: Double, down: Double },
         '\u{256C}' => Segments { left: Double, right: Double, up: Double, down: Double },
+        _ => return None,
+    })
+}
+
+fn decode_half_line_segments(c: char) -> Option<Segments> {
+    use LineWeight::{Heavy, Light, None as N};
+
+    Some(match c {
         // ╴╵╶╷ Light half-lines
         '\u{2574}' => Segments { left: Light, right: N, up: N, down: N },
         '\u{2575}' => Segments { left: N, right: N, up: Light, down: N },
@@ -318,9 +354,7 @@ fn decode_segments(c: char) -> Option<Segments> {
         '\u{257E}' => Segments { left: Heavy, right: Light, up: N, down: N },
         '\u{257F}' => Segments { left: N, right: N, up: Heavy, down: Light },
         _ => return None,
-    };
-
-    Some(seg)
+    })
 }
 
 /// Render a box-drawing character by composing its directional segments.

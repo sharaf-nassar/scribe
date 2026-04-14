@@ -1,0 +1,3 @@
+crates/scribe-client/src/selection.rs|#[allow(clippy::indexing_slicing)]
+crates/scribe-client/src/split_scroll.rs|#[allow(clippy::indexing_slicing)]
+crates/scribe-server/src/macos_proc.rs|#[allow(unsafe_code)]

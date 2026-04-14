@@ -168,37 +168,25 @@ impl RestoreStore {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing state dir"))
     }
 
-    #[allow(
-        clippy::excessive_nesting,
-        reason = "simple retry loop needs a stale-lock branch and stays local to index writes"
-    )]
     fn acquire_index_lock(&self) -> Result<RestoreIndexLock, crate::window_state::StateError> {
         let path = self.lock_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         loop {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    use std::io::Write as _;
-                    writeln!(file, "{}", unix_time_ms())?;
-                    return Ok(RestoreIndexLock { path });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = self.lock_is_stale(&path, unix_time_ms())?;
-                    if stale {
-                        drop(std::fs::remove_file(&path));
-                        continue;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => return Err(error.into()),
+            if let Some(lock) = Self::try_create_index_lock(&path)? {
+                return Ok(lock);
             }
+
+            if Self::remove_stale_lock_if_needed(&path, unix_time_ms())? {
+                continue;
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
-    #[allow(clippy::unused_self, reason = "method for API consistency with write_toml_atomic")]
-    fn read_toml<T: DeserializeOwned>(&self, path: Option<PathBuf>) -> std::io::Result<T> {
+    fn read_toml<T: DeserializeOwned>(path: Option<PathBuf>) -> std::io::Result<T> {
         let path = path.ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "missing state dir")
         })?;
@@ -207,9 +195,7 @@ impl RestoreStore {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    #[allow(clippy::unused_self, reason = "method for API consistency with read_toml")]
     fn write_toml_atomic<T: Serialize>(
-        &self,
         path: Option<PathBuf>,
         value: &T,
     ) -> Result<(), crate::window_state::StateError> {
@@ -224,19 +210,9 @@ impl RestoreStore {
         Ok(())
     }
 
-    /// Load the persisted restore index, or return an empty one.
-    #[allow(dead_code, reason = "used by clear_all for iterating windows")]
-    pub fn load_index(&self) -> RestoreIndex {
-        self.read_toml(self.index_path()).unwrap_or_else(|_| RestoreIndex {
-            version: 1,
-            updated_at_ms: 0,
-            windows: Vec::new(),
-        })
-    }
-
     /// Save the restore index to disk.
     pub fn save_index(&self, index: &RestoreIndex) -> Result<(), crate::window_state::StateError> {
-        self.write_toml_atomic(self.index_path(), index)
+        Self::write_toml_atomic(self.index_path(), index)
     }
 
     /// Insert or refresh a window entry in the restore index.
@@ -264,7 +240,7 @@ impl RestoreStore {
 
     /// Load the persisted logical state for a single window.
     pub fn load_window(&self, window_id: WindowId) -> Option<WindowRestoreState> {
-        self.read_toml(self.window_path(window_id)).ok()
+        Self::read_toml(self.window_path(window_id)).ok()
     }
 
     /// Save one window's logical state to disk.
@@ -272,7 +248,7 @@ impl RestoreStore {
         &self,
         state: &WindowRestoreState,
     ) -> Result<(), crate::window_state::StateError> {
-        self.write_toml_atomic(self.window_path(state.window_id), state)
+        Self::write_toml_atomic(self.window_path(state.window_id), state)
     }
 
     /// Remove a window's persisted logical state.
@@ -329,21 +305,8 @@ impl RestoreStore {
         claimed.map(|state| (state, index.windows.len()))
     }
 
-    /// Remove all restore state: the index and every per-window file.
-    #[allow(dead_code, reason = "available for full cleanup on quit-all")]
-    pub fn clear_all(&self) {
-        let index = self.load_index();
-        for window_id in &index.windows {
-            self.remove_window(*window_id);
-        }
-        if let Some(path) = self.index_path() {
-            drop(std::fs::remove_file(path));
-        }
-    }
-
     /// Check whether a bootstrap lock file is old enough to be considered stale.
-    #[allow(clippy::unused_self, reason = "method for API consistency with other store operations")]
-    pub fn lock_is_stale(&self, path: &PathBuf, now_ms: u64) -> std::io::Result<bool> {
+    pub fn lock_is_stale(path: &PathBuf, now_ms: u64) -> std::io::Result<bool> {
         let created_ms = match std::fs::read_to_string(path) {
             Ok(raw) => raw.trim().parse::<u64>().ok(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -358,6 +321,32 @@ impl RestoreStore {
         })
         .unwrap_or(now_ms);
         Ok(now_ms.saturating_sub(created_ms) > 30_000)
+    }
+
+    fn try_create_index_lock(
+        path: &PathBuf,
+    ) -> Result<Option<RestoreIndexLock>, crate::window_state::StateError> {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                writeln!(file, "{}", unix_time_ms())?;
+                Ok(Some(RestoreIndexLock { path: path.clone() }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn remove_stale_lock_if_needed(
+        path: &PathBuf,
+        now_ms: u64,
+    ) -> Result<bool, crate::window_state::StateError> {
+        if !Self::lock_is_stale(path, now_ms)? {
+            return Ok(false);
+        }
+
+        drop(std::fs::remove_file(path));
+        Ok(true)
     }
 
     fn read_index_for_update(&self) -> Result<RestoreIndex, crate::window_state::StateError> {

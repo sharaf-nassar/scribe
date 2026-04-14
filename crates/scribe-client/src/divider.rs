@@ -25,9 +25,6 @@ pub struct Divider {
     pub direction: SplitDirection,
     /// Pane IDs in the first subtree (used for ratio adjustment).
     pub first_pane: PaneId,
-    /// Pane ID in the second subtree (used for future resize logic).
-    #[allow(dead_code, reason = "will be used for bidirectional divider drag")]
-    pub second_pane: PaneId,
 }
 
 /// State for an in-progress divider drag.
@@ -182,9 +179,7 @@ fn collect_dividers_inner(node: &LayoutNode, rect: Rect, out: &mut Vec<Divider>)
     // The divider sits between the two sub-rects.
     let divider_rect = divider_rect_between(&r1, &r2, *direction);
     let first_pane = first_leaf_of(first);
-    let second_pane = first_leaf_of(second);
-
-    out.push(Divider { rect: divider_rect, direction: *direction, first_pane, second_pane });
+    out.push(Divider { rect: divider_rect, direction: *direction, first_pane });
 
     // Recurse into children.
     collect_dividers_inner(first, r1, out);

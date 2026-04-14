@@ -97,6 +97,8 @@ pub struct ScribeConfig {
     pub workspaces: WorkspacesConfig,
     #[serde(default)]
     pub update: UpdateConfig,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -501,43 +503,77 @@ fn default_error_entry() -> AiStateEntry {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "status bar stats config has independent boolean feature flags, not a state machine"
-)]
-pub struct StatusBarStatsConfig {
+pub struct StatusBarComputeStatsConfig {
     #[serde(default = "default_true")]
     pub cpu: bool,
     #[serde(default = "default_true")]
-    pub memory: bool,
-    #[serde(default = "default_true")]
     pub gpu: bool,
+}
+
+impl Default for StatusBarComputeStatsConfig {
+    fn default() -> Self {
+        Self { cpu: true, gpu: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusBarUsageStatsConfig {
+    #[serde(default, flatten)]
+    pub compute: StatusBarComputeStatsConfig,
+    #[serde(default = "default_true")]
+    pub memory: bool,
+}
+
+impl Default for StatusBarUsageStatsConfig {
+    fn default() -> Self {
+        Self { compute: StatusBarComputeStatsConfig::default(), memory: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusBarStatsConfig {
+    #[serde(default, flatten)]
+    pub usage: StatusBarUsageStatsConfig,
     #[serde(default = "default_true")]
     pub network: bool,
 }
 
 impl Default for StatusBarStatsConfig {
     fn default() -> Self {
-        Self { cpu: true, memory: true, gpu: true, network: true }
+        Self { usage: StatusBarUsageStatsConfig::default(), network: true }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "terminal config has independent boolean feature flags, not a state machine"
-)]
-pub struct TerminalConfig {
-    #[serde(default = "default_scrollback_lines")]
-    pub scrollback_lines: u32,
+pub struct TerminalClipboardConfig {
     #[serde(default = "default_true")]
     pub copy_on_select: bool,
     #[serde(default = "default_true")]
     pub claude_copy_cleanup: bool,
+}
+
+impl Default for TerminalClipboardConfig {
+    fn default() -> Self {
+        Self { copy_on_select: true, claude_copy_cleanup: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalAiIntegrationConfig {
     #[serde(default = "default_true")]
     pub claude_code_integration: bool,
     #[serde(default = "default_true")]
     pub codex_code_integration: bool,
+}
+
+impl Default for TerminalAiIntegrationConfig {
+    fn default() -> Self {
+        Self { claude_code_integration: true, codex_code_integration: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalAiSessionConfig {
     #[serde(default)]
     pub hide_codex_hook_logs: bool,
     /// When `true` (default), block `CSI 3 J` (clear scrollback) from AI
@@ -549,31 +585,36 @@ pub struct TerminalConfig {
     /// Runtime AI tab routing uses explicit Claude/Codex actions.
     #[serde(default = "default_ai_tab_provider")]
     pub ai_tab_provider: AiProvider,
-    /// When `true`, the OS-reported scroll direction is used as-is (natural
-    /// scrolling).  When `false` (default), the scroll delta is inverted for
-    /// traditional terminal behaviour.
-    #[serde(default)]
-    pub natural_scroll: bool,
     /// Per-state configuration for Claude Code AI indicators.
     #[serde(default)]
     pub claude_states: ClaudeStatesConfig,
     /// Height of the AI state indicator bar in pixels.
     #[serde(default = "default_indicator_height")]
     pub indicator_height: f32,
-    /// Which system stats are shown in the status bar.
-    #[serde(default)]
-    pub status_bar_stats: StatusBarStatsConfig,
     #[serde(default)]
     pub shell_integration: ShellIntegrationConfig,
-    /// Show first/latest prompt text in AI terminal panes.
-    #[serde(default = "default_true")]
-    pub prompt_bar: bool,
-    /// Font size for prompt bar text (independent of terminal font size).
-    #[serde(default = "default_prompt_bar_font_size")]
-    pub prompt_bar_font_size: f32,
-    /// Where the prompt bar appears relative to the terminal content.
+}
+
+impl Default for TerminalAiSessionConfig {
+    fn default() -> Self {
+        Self {
+            hide_codex_hook_logs: false,
+            preserve_ai_scrollback: true,
+            ai_tab_provider: default_ai_tab_provider(),
+            claude_states: ClaudeStatesConfig::default(),
+            indicator_height: default_indicator_height(),
+            shell_integration: ShellIntegrationConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TerminalScrollConfig {
+    /// When `true`, the OS-reported scroll direction is used as-is (natural
+    /// scrolling).  When `false` (default), the scroll delta is inverted for
+    /// traditional terminal behaviour.
     #[serde(default)]
-    pub prompt_bar_position: PromptBarPosition,
+    pub natural_scroll: bool,
     /// Optional viewport mode that pins the live terminal bottom while
     /// scrolled up in AI panes so the user can compose prompts while reading
     /// scrollback.
@@ -581,26 +622,58 @@ pub struct TerminalConfig {
     pub scroll_pin: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalPromptBarConfig {
+    /// Show first/latest prompt text in AI terminal panes.
+    #[serde(default = "default_true", rename = "prompt_bar")]
+    pub enabled: bool,
+    /// Font size for prompt bar text (independent of terminal font size).
+    #[serde(default = "default_prompt_bar_font_size", rename = "prompt_bar_font_size")]
+    pub font_size: f32,
+    /// Where the prompt bar appears relative to the terminal content.
+    #[serde(default, rename = "prompt_bar_position")]
+    pub position: PromptBarPosition,
+}
+
+impl Default for TerminalPromptBarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            font_size: default_prompt_bar_font_size(),
+            position: PromptBarPosition::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalConfig {
+    #[serde(default = "default_scrollback_lines")]
+    pub scrollback_lines: u32,
+    #[serde(default, flatten)]
+    pub clipboard: TerminalClipboardConfig,
+    #[serde(default, flatten)]
+    pub ai_integration: TerminalAiIntegrationConfig,
+    #[serde(default, flatten)]
+    pub ai_session: TerminalAiSessionConfig,
+    /// Which system stats are shown in the status bar.
+    #[serde(default)]
+    pub status_bar_stats: StatusBarStatsConfig,
+    #[serde(default, flatten)]
+    pub scroll: TerminalScrollConfig,
+    #[serde(default, flatten)]
+    pub prompt_bar: TerminalPromptBarConfig,
+}
+
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             scrollback_lines: default_scrollback_lines(),
-            copy_on_select: true,
-            claude_copy_cleanup: true,
-            claude_code_integration: true,
-            codex_code_integration: true,
-            hide_codex_hook_logs: false,
-            preserve_ai_scrollback: true,
-            ai_tab_provider: default_ai_tab_provider(),
-            natural_scroll: false,
-            claude_states: ClaudeStatesConfig::default(),
-            indicator_height: default_indicator_height(),
+            clipboard: TerminalClipboardConfig::default(),
+            ai_integration: TerminalAiIntegrationConfig::default(),
+            ai_session: TerminalAiSessionConfig::default(),
             status_bar_stats: StatusBarStatsConfig::default(),
-            shell_integration: ShellIntegrationConfig::default(),
-            prompt_bar: true,
-            prompt_bar_font_size: default_prompt_bar_font_size(),
-            prompt_bar_position: PromptBarPosition::default(),
-            scroll_pin: false,
+            scroll: TerminalScrollConfig::default(),
+            prompt_bar: TerminalPromptBarConfig::default(),
         }
     }
 }
@@ -609,8 +682,8 @@ impl TerminalConfig {
     #[must_use]
     pub fn ai_provider_enabled(&self, provider: AiProvider) -> bool {
         match provider {
-            AiProvider::ClaudeCode => self.claude_code_integration,
-            AiProvider::CodexCode => self.codex_code_integration,
+            AiProvider::ClaudeCode => self.ai_integration.claude_code_integration,
+            AiProvider::CodexCode => self.ai_integration.codex_code_integration,
         }
     }
 }
@@ -1283,6 +1356,37 @@ fn default_update_enabled() -> bool {
 
 fn default_update_check_interval_secs() -> u64 {
     86_400
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+/// When to fire desktop notifications for AI session state changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyCondition {
+    /// Only fire when the OS window is not focused.
+    #[default]
+    WhenUnfocused,
+    /// Also fire when the session is on a background tab.
+    WhenUnfocusedOrBackgroundTab,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    /// Enable desktop notifications when an AI session finishes processing.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// When notifications should fire relative to window/tab focus.
+    #[serde(default)]
+    pub condition: NotifyCondition,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self { enabled: true, condition: NotifyCondition::default() }
+    }
 }
 
 // ---------------------------------------------------------------------------

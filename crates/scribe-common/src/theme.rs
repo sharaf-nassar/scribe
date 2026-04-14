@@ -378,13 +378,31 @@ fn with_alpha(color: [f32; 4], new_alpha: f32) -> [f32; 4] {
     [red, green, blue, new_alpha]
 }
 
-/// Clamp and convert a 0.0..=1.0 float channel to a u8.
-fn channel_to_u8(value: f32) -> u8 {
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "value is clamped to 0..=255 so truncation to u8 is safe"
-    )]
-    #[allow(clippy::cast_sign_loss, reason = "value is clamped to 0..=255 so it is non-negative")]
-    let byte = (value.mul_add(255.0, 0.5).clamp(0.0, 255.0)) as u8;
-    byte
+/// Clamp and convert a 0.0..=1.0 float channel to the nearest u8.
+#[must_use]
+pub fn channel_to_u8(value: f32) -> u8 {
+    let target = value.clamp(0.0, 1.0) * 255.0;
+    let floor = greatest_byte_at_most(target);
+    if floor == u8::MAX {
+        return floor;
+    }
+
+    let ceil = floor.saturating_add(1);
+    let lower_error = target - f32::from(floor);
+    let upper_error = f32::from(ceil) - target;
+    if lower_error < upper_error { floor } else { ceil }
+}
+
+fn greatest_byte_at_most(target: f32) -> u8 {
+    let mut low = 0u8;
+    let mut high = u8::MAX;
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if f32::from(mid) <= target {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+    low
 }

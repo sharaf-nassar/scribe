@@ -15,6 +15,13 @@ repos:
 
   - repo: local
     hooks:
+      - id: no-new-lint-suppressions
+        name: no new lint suppressions
+        entry: tools/check-no-new-lint-suppressions.sh --staged
+        language: system
+        types: [rust]
+        pass_filenames: false
+
       - id: cargo-fmt
         name: cargo fmt
         entry: cargo fmt --all -- --check

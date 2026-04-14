@@ -1,12 +1,14 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::io::AsRawFd as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use scribe_pty::codex_hook_log_filter::CodexHookLogFilter;
 use scribe_pty::ed3_filter::Ed3Filter;
 use tokio::io::{AsyncWriteExt as _, ReadHalf, WriteHalf};
@@ -36,7 +38,9 @@ use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
 
 use crate::handoff::HandoffSession;
-use crate::session_manager::{ManagedSession, SessionManager, build_term_config, snapshot_term};
+use crate::session_manager::{
+    ManagedSession, SessionLaunchRequest, SessionManager, build_term_config, snapshot_term,
+};
 use crate::updater::UpdaterHandle;
 use crate::workspace_manager::WorkspaceManager;
 
@@ -57,17 +61,40 @@ const MAX_CONNECTIONS: usize = 32;
 /// a client from holding the workspace write-lock in a tight loop.
 const MAX_SUBSCRIBE_IDS: usize = 256;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PreservedAiScrollback {
+    baseline_history: Option<usize>,
+}
+
+impl PreservedAiScrollback {
+    fn reset(&mut self) {
+        self.baseline_history = None;
+    }
+
+    fn trim_target(&mut self, current_history: usize) -> Option<usize> {
+        if let Some(baseline) = self.baseline_history {
+            (current_history > baseline).then_some(baseline)
+        } else {
+            self.baseline_history = Some(current_history);
+            None
+        }
+    }
+}
+
 /// Shared writer half of the client connection.
 pub type SharedWriter = Arc<Mutex<WriteHalf<tokio::net::UnixStream>>>;
 
 /// Optional client writer: `Some` when a client is attached, `None` when
 /// the session is detached (client disconnected). The PTY reader task
 /// silently skips sends when `None`.
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "sibling attach_flow module needs visibility without making this alias fully public"
-)]
-pub(crate) type ClientWriter = Arc<Mutex<Option<SharedWriter>>>;
+pub type ClientWriter = Arc<Mutex<Option<SharedWriter>>>;
+
+/// Session IDs currently attached to a specific client connection.
+pub type AttachedSessionIds = Arc<Mutex<HashSet<SessionId>>>;
+
+/// Shared pointer from a live session to the current attached-session set for
+/// its active client, if any.
+pub type SessionAttachment = Arc<Mutex<Option<AttachedSessionIds>>>;
 
 /// Server-wide registry of all running sessions. Shared across client
 /// handlers and the handoff listener — sessions survive client disconnects.
@@ -76,6 +103,42 @@ pub type LiveSessionRegistry = Arc<RwLock<HashMap<SessionId, LiveSession>>>;
 /// Registry of connected client windows, keyed by `WindowId`.
 /// Used to broadcast `QuitRequested` to all connected clients.
 pub type ConnectedClients = Arc<RwLock<HashMap<WindowId, SharedWriter>>>;
+
+#[derive(Clone)]
+pub struct IpcServerState {
+    pub session_manager: Arc<SessionManager>,
+    pub workspace_manager: Arc<RwLock<WorkspaceManager>>,
+    pub live_sessions: LiveSessionRegistry,
+    pub connected_clients: ConnectedClients,
+    pub updater_handle: Arc<UpdaterHandle>,
+}
+
+struct ClientDispatchContext<'a> {
+    server: &'a IpcServerState,
+    writer: &'a SharedWriter,
+    attached_ids: &'a AttachedSessionIds,
+    window_id: WindowId,
+}
+
+struct CreateSessionRequest {
+    workspace_id: WorkspaceId,
+    split_direction: Option<scribe_common::protocol::LayoutDirection>,
+    cwd: Option<std::path::PathBuf>,
+    size: Option<TerminalSize>,
+    command: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy)]
+struct SessionRuntimeContext<'a> {
+    workspace_manager: &'a Arc<RwLock<WorkspaceManager>>,
+    live_sessions: &'a LiveSessionRegistry,
+}
+
+#[derive(Clone, Copy)]
+struct InitialAttachment<'a> {
+    writer: Option<&'a SharedWriter>,
+    attached_ids: Option<&'a AttachedSessionIds>,
+}
 
 /// State needed by the PTY reader task, extracted from `ManagedSession`.
 struct PtyReaderState {
@@ -86,9 +149,9 @@ struct PtyReaderState {
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     ansi_processor: AnsiProcessor,
     osc_parser: VteParser,
-    metadata_parser: scribe_pty::metadata::MetadataParser,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
     client_writer: ClientWriter,
+    attachment: SessionAttachment,
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     live_sessions: LiveSessionRegistry,
     clipboard: SharedClipboard,
@@ -111,6 +174,10 @@ struct PtyReaderState {
     hide_codex_hook_logs: Arc<AtomicBool>,
     /// When `true`, suppress `CSI 3 J` in AI sessions to preserve scrollback.
     preserve_ai_scrollback: Arc<AtomicBool>,
+    /// Shared scrollback limit for trimming duplicate AI redraw history.
+    scrollback_lines: Arc<AtomicUsize>,
+    /// Preserved pre-AI scrollback baseline for this session.
+    preserved_ai_scrollback: PreservedAiScrollback,
 }
 
 /// A running session in the server-wide registry. Lives independently of
@@ -118,11 +185,12 @@ struct PtyReaderState {
 /// attach and detach.
 pub struct LiveSession {
     pty_write: Arc<Mutex<WriteHalf<scribe_pty::async_fd::AsyncPtyFd>>>,
-    pty_raw_fd: RawFd,
+    resize_fd: Arc<OwnedFd>,
     pub(crate) term:
         Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     child_pid: u32,
     client_writer: ClientWriter,
+    attachment: SessionAttachment,
     workspace_id: WorkspaceId,
     shell_name: String,
     /// Last-known terminal title (OSC 0/2), persisted for reconnect.
@@ -152,6 +220,8 @@ pub struct LiveSession {
     hide_codex_hook_logs: Arc<AtomicBool>,
     /// Shared runtime flag updated by config reloads.
     preserve_ai_scrollback: Arc<AtomicBool>,
+    /// Shared runtime scrollback limit updated by config reloads.
+    scrollback_lines: Arc<AtomicUsize>,
 }
 
 pub struct AttachSessionData {
@@ -159,8 +229,9 @@ pub struct AttachSessionData {
     pub workspace_id: WorkspaceId,
     pub shell_name: String,
     pub client_writer: ClientWriter,
+    pub attachment: SessionAttachment,
     pub term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
-    pub pty_raw_fd: RawFd,
+    pub resize_fd: Arc<OwnedFd>,
     pub target_dims: Option<TerminalSize>,
     pub has_handoff_snapshot: bool,
     pub title: String,
@@ -186,8 +257,9 @@ impl LiveSession {
             workspace_id: self.workspace_id,
             shell_name: self.shell_name.clone(),
             client_writer: Arc::clone(&self.client_writer),
+            attachment: Arc::clone(&self.attachment),
             term: Arc::clone(&self.term),
-            pty_raw_fd: self.pty_raw_fd,
+            resize_fd: Arc::clone(&self.resize_fd),
             target_dims,
             has_handoff_snapshot: self.handoff_snapshot.is_some(),
             title: self.title.clone(),
@@ -232,15 +304,44 @@ fn shared_clipboard() -> &'static SharedClipboard {
     CLIPBOARD.get_or_init(|| Arc::new(Mutex::new(ServerClipboard::default())))
 }
 
+async fn attached_contains(attached_ids: &AttachedSessionIds, session_id: SessionId) -> bool {
+    attached_ids.lock().await.contains(&session_id)
+}
+
+async fn attached_insert(attached_ids: &AttachedSessionIds, session_id: SessionId) {
+    attached_ids.lock().await.insert(session_id);
+}
+
+async fn attached_extend(
+    attached_ids: &AttachedSessionIds,
+    ids: impl IntoIterator<Item = SessionId>,
+) {
+    attached_ids.lock().await.extend(ids);
+}
+
+async fn attached_remove(attached_ids: &AttachedSessionIds, session_id: SessionId) {
+    attached_ids.lock().await.remove(&session_id);
+}
+
+async fn attached_snapshot(attached_ids: &AttachedSessionIds) -> HashSet<SessionId> {
+    attached_ids.lock().await.clone()
+}
+
+async fn clear_session_attachment(attachment: &SessionAttachment) {
+    *attachment.lock().await = None;
+}
+
+async fn remove_from_session_attachment(attachment: &SessionAttachment, session_id: SessionId) {
+    let attached_ids = attachment.lock().await.clone();
+    if let Some(attached_ids) = attached_ids {
+        attached_remove(&attached_ids, session_id).await;
+    }
+}
+
 /// Start the IPC accept loop on an already-bound listener.
-#[allow(clippy::too_many_arguments, reason = "IPC server requires all server subsystems")]
 pub async fn start_ipc_server(
     listener: UnixListener,
-    session_manager: Arc<SessionManager>,
-    workspace_manager: Arc<RwLock<WorkspaceManager>>,
-    live_sessions: LiveSessionRegistry,
-    connected_clients: ConnectedClients,
-    updater_handle: Arc<UpdaterHandle>,
+    server: IpcServerState,
 ) -> Result<(), ScribeError> {
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
@@ -259,13 +360,9 @@ pub async fn start_ipc_server(
                 };
 
                 info!("client connected");
-                let sm = Arc::clone(&session_manager);
-                let wm = Arc::clone(&workspace_manager);
-                let ls = Arc::clone(&live_sessions);
-                let cc = Arc::clone(&connected_clients);
-                let uh = Arc::clone(&updater_handle);
+                let server = server.clone();
                 tokio::spawn(async move {
-                    handle_client(stream, sm, wm, ls, cc, uh).await;
+                    handle_client(stream, server).await;
                     drop(permit);
                 });
             }
@@ -288,7 +385,7 @@ pub async fn start_ipc_server(
 pub fn acquire_server_socket(
     socket_path: &Path,
     upgrade_mode: bool,
-) -> Result<(Option<std::fs::File>, UnixListener), ScribeError> {
+) -> Result<(Option<nix::fcntl::Flock<std::fs::File>>, UnixListener), ScribeError> {
     // Ensure the parent directory exists with 0700 permissions.
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ScribeError::Io { source: e })?;
@@ -312,15 +409,10 @@ pub fn acquire_server_socket(
         .open(&lock_path)
         .map_err(|e| ScribeError::Io { source: e })?;
 
-    #[allow(
-        deprecated,
-        reason = "nix::fcntl::Flock requires OwnedFd which conflicts with our File ownership"
-    )]
-    nix::fcntl::flock(lock_file.as_raw_fd(), nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(
-        |_| ScribeError::IpcError {
+    let lock_file = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .map_err(|(_, _)| ScribeError::IpcError {
             reason: "another scribe-server is already running (lock held)".into(),
-        },
-    )?;
+        })?;
 
     // Try to bind the socket.  If it fails with EADDRINUSE the path
     // already exists; any other error is a real failure.
@@ -380,87 +472,118 @@ fn verify_peer_uid(stream: &tokio::net::UnixStream) -> bool {
 
 /// Per-client connection handler. Performs `Hello`/`Welcome` handshake, then
 /// reads `ClientMessage`s and dispatches them.
-#[allow(
-    clippy::cognitive_complexity,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "connection handler with handshake + message loop requires all server subsystems"
-)]
-async fn handle_client(
-    stream: tokio::net::UnixStream,
-    session_manager: Arc<SessionManager>,
-    workspace_manager: Arc<RwLock<WorkspaceManager>>,
-    live_sessions: LiveSessionRegistry,
-    connected_clients: ConnectedClients,
-    updater_handle: Arc<UpdaterHandle>,
-) {
+async fn handle_client(stream: tokio::net::UnixStream, server: IpcServerState) {
     let (reader, writer) = tokio::io::split(stream);
     let writer: SharedWriter = Arc::new(Mutex::new(writer));
     let mut reader = reader;
 
     // Track which sessions this client has attached to, for detach on disconnect.
-    let mut attached_ids: HashSet<SessionId> = HashSet::new();
+    let attached_ids: AttachedSessionIds = Arc::new(Mutex::new(HashSet::new()));
 
-    // Perform Hello/Welcome handshake — wait for the first message.
-    let window_id = match read_message::<ClientMessage, _>(&mut reader).await {
+    let Some(window_id) =
+        establish_client_window(&mut reader, &server, &writer, &attached_ids).await
+    else {
+        return;
+    };
+
+    run_client_message_loop(&mut reader, window_id, &server, &writer, &attached_ids).await;
+
+    detach_client_window(
+        window_id,
+        &server.live_sessions,
+        &server.connected_clients,
+        &attached_ids,
+    )
+    .await;
+}
+
+async fn establish_client_window<R>(
+    reader: &mut R,
+    server: &IpcServerState,
+    writer: &SharedWriter,
+    attached_ids: &AttachedSessionIds,
+) -> Option<WindowId>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    match read_message::<ClientMessage, _>(reader).await {
         Ok(ClientMessage::Hello { window_id }) => {
-            let wm = workspace_manager.read().await;
-            let all_windows = wm.window_ids_with_sessions();
-
-            // Read connected clients first so we can reuse an unconnected
-            // window on fresh-launch restarts (no --window-id).
-            let connected = connected_clients.read().await;
-
-            let (assigned, other_windows) =
-                resolve_window_assignment(window_id, &all_windows, &connected);
-            drop(connected);
-            drop(wm);
-
-            // Register this client in the connected clients map.
-            connected_clients.write().await.insert(assigned, Arc::clone(&writer));
-
-            if !other_windows.is_empty() {
-                info!(%assigned, other_count = other_windows.len(), "Welcome includes other_windows — client will spawn additional processes");
-            }
-            let welcome = ServerMessage::Welcome { window_id: assigned, other_windows };
-            send_message(&writer, &welcome).await;
-
-            info!(%assigned, "client identified via Hello");
-            assigned
+            Some(handle_client_hello(window_id, server, writer).await)
         }
-        Ok(msg) => {
-            // Legacy client — no Hello. Assign a new window and process the
-            // message inline.
-            let window_id = WindowId::new();
-            connected_clients.write().await.insert(window_id, Arc::clone(&writer));
-            info!(%window_id, "legacy client (no Hello), assigned window");
-
-            dispatch_message(
-                msg,
-                &session_manager,
-                &workspace_manager,
-                &writer,
-                &live_sessions,
-                &mut attached_ids,
-                window_id,
-                &connected_clients,
-                &updater_handle,
-            )
-            .await;
-            window_id
-        }
+        Ok(msg) => Some(handle_legacy_client(msg, server, writer, attached_ids).await),
         Err(ScribeError::Io { .. }) => {
             debug!("client disconnected before Hello");
-            return;
+            None
         }
         Err(e) => {
             warn!("failed to read Hello message: {e}");
-            return;
+            None
         }
-    };
+    }
+}
 
+async fn handle_client_hello(
+    requested_window_id: Option<WindowId>,
+    server: &IpcServerState,
+    writer: &SharedWriter,
+) -> WindowId {
+    let wm = server.workspace_manager.read().await;
+    let all_windows = wm.window_ids_with_sessions();
+
+    // Read connected clients first so we can reuse an unconnected window on
+    // fresh-launch restarts (no --window-id).
+    let connected = server.connected_clients.read().await;
+    let (assigned, other_windows) =
+        resolve_window_assignment(requested_window_id, &all_windows, &connected);
+    drop(connected);
+    drop(wm);
+
+    register_connected_client(assigned, &server.connected_clients, writer).await;
+
+    if !other_windows.is_empty() {
+        info!(%assigned, other_count = other_windows.len(), "Welcome includes other_windows — client will spawn additional processes");
+    }
+    let welcome = ServerMessage::Welcome { window_id: assigned, other_windows };
+    send_message(writer, &welcome).await;
+
+    info!(%assigned, "client identified via Hello");
+    assigned
+}
+
+async fn handle_legacy_client(
+    msg: ClientMessage,
+    server: &IpcServerState,
+    writer: &SharedWriter,
+    attached_ids: &AttachedSessionIds,
+) -> WindowId {
+    let window_id = WindowId::new();
+    register_connected_client(window_id, &server.connected_clients, writer).await;
+    info!(%window_id, "legacy client (no Hello), assigned window");
+
+    let mut context = ClientDispatchContext { server, writer, attached_ids, window_id };
+    dispatch_message(msg, &mut context).await;
+    window_id
+}
+
+async fn register_connected_client(
+    window_id: WindowId,
+    connected_clients: &ConnectedClients,
+    writer: &SharedWriter,
+) {
+    connected_clients.write().await.insert(window_id, Arc::clone(writer));
+}
+
+async fn run_client_message_loop<R>(
+    reader: &mut R,
+    window_id: WindowId,
+    server: &IpcServerState,
+    writer: &SharedWriter,
+    attached_ids: &AttachedSessionIds,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
     loop {
-        let msg: ClientMessage = match read_message(&mut reader).await {
+        let msg: ClientMessage = match read_message(reader).await {
             Ok(msg) => msg,
             Err(ScribeError::Io { .. }) => {
                 debug!(%window_id, "client disconnected");
@@ -472,23 +595,21 @@ async fn handle_client(
             }
         };
 
-        dispatch_message(
-            msg,
-            &session_manager,
-            &workspace_manager,
-            &writer,
-            &live_sessions,
-            &mut attached_ids,
-            window_id,
-            &connected_clients,
-            &updater_handle,
-        )
-        .await;
+        let mut context = ClientDispatchContext { server, writer, attached_ids, window_id };
+        dispatch_message(msg, &mut context).await;
     }
+}
 
+async fn detach_client_window(
+    window_id: WindowId,
+    live_sessions: &LiveSessionRegistry,
+    connected_clients: &ConnectedClients,
+    attached_ids: &AttachedSessionIds,
+) {
+    let attached_ids = attached_snapshot(attached_ids).await;
     // Detach all sessions — clear the writer so the reader task stops
     // forwarding output, but keep the session alive for reconnection.
-    detach_sessions(&live_sessions, &attached_ids).await;
+    detach_sessions(live_sessions, &attached_ids).await;
     let last_client_disconnected = {
         let mut connected = connected_clients.write().await;
         connected.remove(&window_id);
@@ -496,7 +617,7 @@ async fn handle_client(
     };
     info!(%window_id, "client removed from connected clients");
     if last_client_disconnected {
-        schedule_settings_shutdown_if_no_clients(Arc::clone(&connected_clients));
+        schedule_settings_shutdown_if_no_clients(Arc::clone(connected_clients));
     }
 }
 
@@ -507,6 +628,7 @@ async fn detach_sessions(live_sessions: &LiveSessionRegistry, ids: &HashSet<Sess
     for id in ids {
         if let Some(session) = sessions.get(id) {
             *session.client_writer.lock().await = None;
+            clear_session_attachment(&session.attachment).await;
             info!(%id, "session detached (client disconnected)");
         }
     }
@@ -561,155 +683,192 @@ fn apply_tab_order_from_tree(wm: &mut WorkspaceManager, tree: &WorkspaceTreeNode
 }
 
 /// Dispatch a single `ClientMessage` to the appropriate handler.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    reason = "dispatch hub — all handler dependencies are passed through"
-)]
-async fn dispatch_message(
-    msg: ClientMessage,
-    session_manager: &Arc<SessionManager>,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-    writer: &SharedWriter,
-    live_sessions: &LiveSessionRegistry,
-    attached_ids: &mut HashSet<SessionId>,
-    window_id: WindowId,
-    connected_clients: &ConnectedClients,
-    updater_handle: &UpdaterHandle,
-) {
+async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContext<'_>) {
+    match msg {
+        msg @ (ClientMessage::CreateSession { .. }
+        | ClientMessage::KeyInput { .. }
+        | ClientMessage::CloseSession { .. }
+        | ClientMessage::Resize { .. }
+        | ClientMessage::AttachSessions { .. }
+        | ClientMessage::ConfigReloaded
+        | ClientMessage::FocusChanged { .. }
+        | ClientMessage::SearchRequest { .. }) => {
+            dispatch_session_message(msg, context).await;
+        }
+        msg @ (ClientMessage::Subscribe { .. }
+        | ClientMessage::RequestSnapshot { .. }
+        | ClientMessage::CreateWorkspace
+        | ClientMessage::ListSessions
+        | ClientMessage::ReportWorkspaceTree { .. }) => {
+            dispatch_workspace_message(msg, context).await;
+        }
+        msg @ (ClientMessage::CloseWindow { .. }
+        | ClientMessage::QuitAll
+        | ClientMessage::TriggerUpdate
+        | ClientMessage::DismissUpdate
+        | ClientMessage::ListWindows
+        | ClientMessage::DispatchAction { .. }) => {
+            dispatch_window_message(msg, context).await;
+        }
+        ClientMessage::Hello { .. } => debug!("unexpected Hello after handshake, ignoring"),
+        other => debug!(?other, "unhandled client message"),
+    }
+}
+
+async fn dispatch_session_message(msg: ClientMessage, context: &mut ClientDispatchContext<'_>) {
     match msg {
         ClientMessage::CreateSession { workspace_id, split_direction, cwd, size, command } => {
             handle_create_session(
-                workspace_id,
-                split_direction,
-                cwd,
-                size,
-                command,
-                session_manager,
-                workspace_manager,
-                writer,
-                live_sessions,
-                attached_ids,
-                window_id,
+                CreateSessionRequest { workspace_id, split_direction, cwd, size, command },
+                context,
             )
             .await;
         }
         ClientMessage::KeyInput { session_id, data, dismisses_attention } => {
-            handle_key_input(session_id, &data, dismisses_attention, live_sessions, attached_ids)
-                .await;
-        }
-        ClientMessage::CloseSession { session_id } => {
-            handle_close_session(session_id, workspace_manager, live_sessions, attached_ids).await;
-            workspace_manager.write().await.remove_session_from_window(session_id);
-        }
-        ClientMessage::Resize { session_id, size } => {
-            handle_resize(session_id, size, live_sessions, attached_ids).await;
-        }
-        ClientMessage::Subscribe { session_ids } => {
-            let cap = session_ids.len().min(MAX_SUBSCRIBE_IDS);
-            let ids = session_ids.get(..cap).unwrap_or(&session_ids);
-            handle_subscribe(ids, workspace_manager, writer, live_sessions).await;
-        }
-        ClientMessage::RequestSnapshot { session_id } => {
-            handle_request_snapshot(session_id, writer, live_sessions).await;
-        }
-        ClientMessage::CreateWorkspace => {
-            handle_create_workspace(workspace_manager, writer).await;
-        }
-        ClientMessage::ListSessions => {
-            handle_list_sessions(live_sessions, workspace_manager, writer, window_id).await;
-        }
-        ClientMessage::AttachSessions { session_ids, dimensions } => {
-            handle_attach_sessions(
-                &session_ids,
-                &dimensions,
-                live_sessions,
-                workspace_manager,
-                writer,
-                attached_ids,
+            handle_key_input(
+                session_id,
+                &data,
+                dismisses_attention,
+                &context.server.live_sessions,
+                context.attached_ids,
             )
             .await;
         }
+        ClientMessage::CloseSession { session_id } => {
+            handle_close_session(
+                session_id,
+                &context.server.workspace_manager,
+                &context.server.live_sessions,
+                context.attached_ids,
+            )
+            .await;
+            context.server.workspace_manager.write().await.remove_session_from_window(session_id);
+        }
+        ClientMessage::Resize { session_id, size } => {
+            handle_resize(session_id, size, &context.server.live_sessions, context.attached_ids)
+                .await;
+        }
+        ClientMessage::AttachSessions { session_ids, dimensions } => {
+            handle_attach_sessions(&session_ids, &dimensions, context).await;
+        }
         ClientMessage::ConfigReloaded => {
-            handle_config_reloaded(session_manager, live_sessions).await;
+            handle_config_reloaded(&context.server.session_manager, &context.server.live_sessions)
+                .await;
+        }
+        ClientMessage::FocusChanged { gained, lost } => {
+            handle_focus_changed(gained, lost, &context.server.live_sessions, context.attached_ids)
+                .await;
+        }
+        ClientMessage::SearchRequest { session_id, query, limit } => {
+            handle_search_request(session_id, query, limit, context).await;
+        }
+        other => debug!(?other, "ignored non-session client message in session dispatcher"),
+    }
+}
+
+async fn dispatch_workspace_message(msg: ClientMessage, context: &mut ClientDispatchContext<'_>) {
+    match msg {
+        ClientMessage::Subscribe { session_ids } => {
+            let cap = session_ids.len().min(MAX_SUBSCRIBE_IDS);
+            let ids = session_ids.get(..cap).unwrap_or(&session_ids);
+            handle_subscribe(
+                ids,
+                &context.server.workspace_manager,
+                context.writer,
+                &context.server.live_sessions,
+            )
+            .await;
+        }
+        ClientMessage::RequestSnapshot { session_id } => {
+            handle_request_snapshot(session_id, context.writer, &context.server.live_sessions)
+                .await;
+        }
+        ClientMessage::CreateWorkspace => {
+            handle_create_workspace(&context.server.workspace_manager, context.writer).await;
+        }
+        ClientMessage::ListSessions => {
+            handle_list_sessions(
+                &context.server.live_sessions,
+                &context.server.workspace_manager,
+                context.writer,
+                context.window_id,
+            )
+            .await;
         }
         ClientMessage::ReportWorkspaceTree { tree } => {
-            debug!(%window_id, "received workspace tree from client");
-            let mut wm = workspace_manager.write().await;
+            debug!(window_id = %context.window_id, "received workspace tree from client");
+            let mut wm = context.server.workspace_manager.write().await;
             apply_tab_order_from_tree(&mut wm, &tree);
             wm.set_workspace_tree(tree.clone());
-            wm.set_window_tree(window_id, tree);
+            wm.set_window_tree(context.window_id, tree);
         }
-        ClientMessage::Hello { .. } => {
-            // Hello is handled during the handshake phase, not here.
-            debug!("unexpected Hello after handshake, ignoring");
-        }
+        other => debug!(?other, "ignored non-workspace client message in workspace dispatcher"),
+    }
+}
+
+async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatchContext<'_>) {
+    match msg {
         ClientMessage::CloseWindow { window_id: target_window } => {
             handle_close_window(
                 target_window,
-                workspace_manager,
-                live_sessions,
-                attached_ids,
-                writer,
+                &context.server.workspace_manager,
+                &context.server.live_sessions,
+                context.attached_ids,
+                context.writer,
             )
             .await;
         }
         ClientMessage::QuitAll => {
-            handle_quit_all(window_id, connected_clients).await;
+            handle_quit_all(context.window_id, &context.server.connected_clients).await;
         }
         ClientMessage::TriggerUpdate => {
-            info!(%window_id, "client triggered update");
-            updater_handle.trigger();
+            info!(window_id = %context.window_id, "client triggered update");
+            context.server.updater_handle.trigger();
         }
         ClientMessage::DismissUpdate => {
-            info!(%window_id, "client dismissed update notification");
-            updater_handle.dismiss();
+            info!(window_id = %context.window_id, "client dismissed update notification");
+            context.server.updater_handle.dismiss();
         }
         ClientMessage::ListWindows => {
-            handle_list_windows(connected_clients, workspace_manager, writer).await;
+            handle_list_windows(
+                &context.server.connected_clients,
+                &context.server.workspace_manager,
+                context.writer,
+            )
+            .await;
         }
         ClientMessage::DispatchAction { window_id: target_window_id, action } => {
-            handle_dispatch_action(target_window_id, action, connected_clients, writer).await;
+            handle_dispatch_action(
+                target_window_id,
+                action,
+                &context.server.connected_clients,
+                context.writer,
+            )
+            .await;
         }
-        ClientMessage::FocusChanged { gained, lost } => {
-            handle_focus_changed(gained, lost, live_sessions, attached_ids).await;
-        }
-        ClientMessage::ScrollRequest { session_id, offset } => {
-            handle_scroll_request(session_id, offset, writer, live_sessions, attached_ids).await;
-        }
-        ClientMessage::SearchRequest { session_id, query, limit } => {
-            handle_search_request(session_id, query, limit, writer, live_sessions, attached_ids)
-                .await;
-        }
-        other => {
-            debug!(?other, "unhandled client message");
-        }
+        other => debug!(?other, "ignored non-window client message in window dispatcher"),
     }
 }
 
 /// Create a new PTY session, register it, start the reader task.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "session creation requires access to all server subsystems"
-)]
 async fn handle_create_session(
-    workspace_id: WorkspaceId,
-    split_direction: Option<scribe_common::protocol::LayoutDirection>,
-    cwd: Option<std::path::PathBuf>,
-    size: Option<TerminalSize>,
-    command: Option<Vec<String>>,
-    session_manager: &Arc<SessionManager>,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-    writer: &SharedWriter,
-    live_sessions: &LiveSessionRegistry,
-    attached_ids: &mut HashSet<SessionId>,
-    window_id: WindowId,
+    request: CreateSessionRequest,
+    context: &mut ClientDispatchContext<'_>,
 ) {
-    let session_id = match session_manager.create_session(workspace_id, cwd, size, command).await {
+    let session_id = match context
+        .server
+        .session_manager
+        .create_session(SessionLaunchRequest {
+            workspace_id: request.workspace_id,
+            cwd: request.cwd,
+            size: request.size,
+            command: request.command,
+        })
+        .await
+    {
         Ok(id) => id,
         Err(e) => {
-            send_error(writer, &format!("failed to create session: {e}")).await;
+            send_error(context.writer, &format!("failed to create session: {e}")).await;
             return;
         }
     };
@@ -717,51 +876,56 @@ async fn handle_create_session(
     // Register session with workspace manager.  When `split_direction` is
     // `Some` the workspace is auto-created (client just split the window).
     {
-        let mut wm = workspace_manager.write().await;
-        wm.add_session(workspace_id, session_id, split_direction);
-        wm.assign_session_to_window(window_id, session_id);
+        let mut wm = context.server.workspace_manager.write().await;
+        wm.add_session(request.workspace_id, session_id, request.split_direction);
+        wm.assign_session_to_window(context.window_id, session_id);
     }
 
-    let Some(session) = session_manager.take_session(session_id).await else {
-        send_error(writer, "session vanished after creation").await;
+    let Some(session) = context.server.session_manager.take_session(session_id).await else {
+        send_error(context.writer, "session vanished after creation").await;
         return;
     };
 
     // Notify client of session creation.
     let creation_msg = ServerMessage::SessionCreated {
         session_id,
-        workspace_id,
+        workspace_id: request.workspace_id,
         shell_name: session.shell_name.clone(),
     };
-    send_message(writer, &creation_msg).await;
+    send_message(context.writer, &creation_msg).await;
 
     // Send workspace info so the client knows the accent color and name.
     {
-        let wm = workspace_manager.read().await;
+        let wm = context.server.workspace_manager.read().await;
         if let Some((name, accent_color, ws_split_dir, project_root)) =
-            wm.workspace_info(workspace_id)
+            wm.workspace_info(request.workspace_id)
         {
             let info_msg = ServerMessage::WorkspaceInfo {
-                workspace_id,
+                workspace_id: request.workspace_id,
                 name,
                 accent_color,
                 split_direction: ws_split_dir,
                 project_root,
             };
-            send_message(writer, &info_msg).await;
+            send_message(context.writer, &info_msg).await;
         }
     }
 
     start_session(
         session_id,
-        workspace_id,
+        request.workspace_id,
         session,
-        Some(writer),
-        workspace_manager,
-        live_sessions,
+        InitialAttachment {
+            writer: Some(context.writer),
+            attached_ids: Some(context.attached_ids),
+        },
+        SessionRuntimeContext {
+            workspace_manager: &context.server.workspace_manager,
+            live_sessions: &context.server.live_sessions,
+        },
     )
     .await;
-    attached_ids.insert(session_id);
+    attached_insert(context.attached_ids, session_id).await;
 }
 
 /// Split a `ManagedSession`, register in the live registry, and start
@@ -772,28 +936,22 @@ async fn handle_create_session(
 /// The registry insert is performed synchronously (before the PTY reader
 /// task is spawned) to eliminate the race where `CloseSession` could arrive
 /// before the session is visible in the registry.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "session startup wires together all subsystem references"
-)]
 async fn start_session(
     session_id: SessionId,
     workspace_id: WorkspaceId,
     session: ManagedSession,
-    writer: Option<&SharedWriter>,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-    live_sessions: &LiveSessionRegistry,
+    initial_attachment: InitialAttachment<'_>,
+    runtime: SessionRuntimeContext<'_>,
 ) {
     // Extract all fields from session before partial moves.
-    let raw_fd = session.pty_fd.raw_fd();
     let term = session.term;
+    let resize_fd = Arc::new(session.resize_fd);
     let child_pid = session.child_pid;
     let shell_name = session.shell_name;
     let pty = session.pty;
     let handoff_snapshot = session.handoff_snapshot;
     let ansi_processor = session.ansi_processor;
     let osc_parser = session.osc_parser;
-    let metadata_parser = session.metadata_parser;
     let event_rx = session.event_rx;
     let title = session.title.unwrap_or_else(|| String::from("shell"));
     let codex_task_label = session.codex_task_label;
@@ -809,18 +967,23 @@ async fn start_session(
 
     // Wrap the client writer in an optional so the reader task can
     // continue running when the client disconnects.
-    let client_writer: ClientWriter = Arc::new(Mutex::new(writer.map(Arc::clone)));
+    let client_writer: ClientWriter =
+        Arc::new(Mutex::new(initial_attachment.writer.map(Arc::clone)));
+    let attachment: SessionAttachment =
+        Arc::new(Mutex::new(initial_attachment.attached_ids.map(Arc::clone)));
 
     let hide_codex_hook_logs = Arc::new(AtomicBool::new(load_hide_codex_hook_logs_setting()));
     let preserve_ai_scrollback = Arc::new(AtomicBool::new(load_preserve_ai_scrollback_setting()));
+    let scrollback_lines = Arc::new(AtomicUsize::new(load_scrollback_lines_setting()));
     let ai_provider = ai_state.as_ref().map(|state| state.provider).or(ai_provider_hint);
 
     let live = LiveSession {
         pty_write: Arc::clone(&pty_write),
-        pty_raw_fd: raw_fd,
+        resize_fd,
         term: Arc::clone(&term),
         child_pid,
         client_writer: Arc::clone(&client_writer),
+        attachment: Arc::clone(&attachment),
         workspace_id,
         shell_name,
         title,
@@ -835,11 +998,12 @@ async fn start_session(
         handoff_snapshot,
         hide_codex_hook_logs: Arc::clone(&hide_codex_hook_logs),
         preserve_ai_scrollback: Arc::clone(&preserve_ai_scrollback),
+        scrollback_lines: Arc::clone(&scrollback_lines),
     };
 
     // Insert into the registry before spawning the PTY reader task so that
     // any concurrent `CloseSession` message sees the session immediately.
-    live_sessions.write().await.insert(session_id, live);
+    runtime.live_sessions.write().await.insert(session_id, live);
 
     let state = PtyReaderState {
         session_id,
@@ -849,11 +1013,11 @@ async fn start_session(
         term,
         ansi_processor,
         osc_parser,
-        metadata_parser,
         event_rx,
         client_writer,
-        workspace_manager: Arc::clone(workspace_manager),
-        live_sessions: Arc::clone(live_sessions),
+        attachment,
+        workspace_manager: Arc::clone(runtime.workspace_manager),
+        live_sessions: Arc::clone(runtime.live_sessions),
         clipboard: Arc::clone(shared_clipboard()),
         osc_events: Vec::new(),
         last_proc_cwd: None,
@@ -864,6 +1028,8 @@ async fn start_session(
         cell_height,
         hide_codex_hook_logs,
         preserve_ai_scrollback,
+        scrollback_lines,
+        preserved_ai_scrollback: PreservedAiScrollback::default(),
     };
 
     tokio::spawn(pty_reader_task(state));
@@ -884,9 +1050,9 @@ async fn handle_key_input(
     data: &[u8],
     dismisses_attention: bool,
     live_sessions: &LiveSessionRegistry,
-    attached_ids: &HashSet<SessionId>,
+    attached_ids: &AttachedSessionIds,
 ) {
-    if !attached_ids.contains(&session_id) {
+    if !attached_contains(attached_ids, session_id).await {
         tracing::warn!(%session_id, "client sent KeyInput for unattached session");
         return;
     }
@@ -958,18 +1124,18 @@ async fn handle_focus_changed(
     gained: Option<SessionId>,
     lost: Option<SessionId>,
     live_sessions: &LiveSessionRegistry,
-    attached_ids: &HashSet<SessionId>,
+    attached_ids: &AttachedSessionIds,
 ) {
     let sessions = live_sessions.read().await;
     if let Some(lost_id) = lost {
-        if attached_ids.contains(&lost_id) {
+        if attached_contains(attached_ids, lost_id).await {
             if let Some(session) = sessions.get(&lost_id) {
                 send_focus_event(session, b"\x1b[O").await;
             }
         }
     }
     if let Some(gained_id) = gained {
-        if attached_ids.contains(&gained_id) {
+        if attached_contains(attached_ids, gained_id).await {
             if let Some(session) = sessions.get(&gained_id) {
                 send_focus_event(session, b"\x1b[I").await;
             }
@@ -990,13 +1156,7 @@ fn signal_if_handoff_session(session_id: SessionId, session: &LiveSession) {
     }
     let pid = session.child_pid.cast_signed();
     info!(%session_id, pid, "sending SIGHUP to handoff-restored session");
-    // SAFETY: `pid` is the child process spawned by a prior server instance.
-    // Sending SIGHUP to a PID is safe — if the process already exited, the
-    // kernel returns ESRCH which we intentionally ignore.
-    #[allow(unsafe_code, reason = "kill(2) requires unsafe FFI")]
-    let ret = unsafe { libc::kill(pid, libc::SIGHUP) };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
+    if let Err(err) = kill(Pid::from_raw(pid), Signal::SIGHUP) {
         warn!(%session_id, pid, %err, "failed to send SIGHUP to child");
     }
 }
@@ -1009,9 +1169,9 @@ async fn handle_close_session(
     session_id: SessionId,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     live_sessions: &LiveSessionRegistry,
-    attached_ids: &mut HashSet<SessionId>,
+    attached_ids: &AttachedSessionIds,
 ) {
-    if !attached_ids.contains(&session_id) {
+    if !attached_contains(attached_ids, session_id).await {
         tracing::warn!(%session_id, "client sent CloseSession for unattached session");
         return;
     }
@@ -1023,7 +1183,7 @@ async fn handle_close_session(
     // `removed` is dropped here — if `pty` is `Some`, `Pty::Drop` sends SIGHUP.
     drop(removed);
     workspace_manager.write().await.remove_session(session_id);
-    attached_ids.remove(&session_id);
+    attached_remove(attached_ids, session_id).await;
     info!(%session_id, "session closed by client");
 }
 
@@ -1033,7 +1193,7 @@ async fn handle_close_window(
     window_id: WindowId,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     live_sessions: &LiveSessionRegistry,
-    attached_ids: &mut HashSet<SessionId>,
+    attached_ids: &AttachedSessionIds,
     writer: &SharedWriter,
 ) {
     let session_ids = workspace_manager.read().await.sessions_for_window(window_id);
@@ -1048,7 +1208,7 @@ async fn handle_close_window(
                 signal_if_handoff_session(sid, &session);
                 // `session` dropped here — `Pty::Drop` fires if `pty` is `Some`.
             }
-            attached_ids.remove(&sid);
+            attached_remove(attached_ids, sid).await;
         }
     }
 
@@ -1068,9 +1228,9 @@ async fn handle_resize(
     session_id: SessionId,
     size: TerminalSize,
     live_sessions: &LiveSessionRegistry,
-    attached_ids: &HashSet<SessionId>,
+    attached_ids: &AttachedSessionIds,
 ) {
-    if !attached_ids.contains(&session_id) {
+    if !attached_contains(attached_ids, session_id).await {
         tracing::warn!(%session_id, "client sent Resize for unattached session");
         return;
     }
@@ -1080,7 +1240,7 @@ async fn handle_resize(
         return;
     }
 
-    let (term, raw_fd) = {
+    let (term, resize_fd) = {
         let mut sessions = live_sessions.write().await;
         let Some(session) = sessions.get_mut(&session_id) else {
             warn!(%session_id, "Resize for unknown session");
@@ -1088,88 +1248,30 @@ async fn handle_resize(
         };
         session.cell_width = size.cell_width.max(1);
         session.cell_height = size.cell_height.max(1);
-        (Arc::clone(&session.term), session.pty_raw_fd)
+        (Arc::clone(&session.term), Arc::clone(&session.resize_fd))
     };
 
     // Resize the Term state (lock + drop before any await).
     resize_term(&term, size.cols, size.rows).await;
 
     // Signal the PTY with TIOCSWINSZ.
-    if let Err(e) = set_pty_winsize(raw_fd, size) {
+    if let Err(e) = set_pty_winsize(resize_fd.as_ref(), size) {
         warn!(%session_id, "TIOCSWINSZ failed: {e}");
     }
 }
 
-async fn handle_scroll_request(
-    session_id: SessionId,
-    offset: i32,
-    writer: &SharedWriter,
-    live_sessions: &LiveSessionRegistry,
-    attached_ids: &HashSet<SessionId>,
-) {
-    if !attached_ids.contains(&session_id) {
-        tracing::warn!(%session_id, "client sent ScrollRequest for unattached session");
-        return;
-    }
-
-    let sessions = live_sessions.read().await;
-    let Some(session) = sessions.get(&session_id) else {
-        warn!(%session_id, "ScrollRequest for unknown session");
-        return;
-    };
-    let term = Arc::clone(&session.term);
-    drop(sessions);
-
-    let (snapshot, applied_offset) = snapshot_term_at_offset(&term, offset).await;
-    let msg = ServerMessage::ScrolledSnapshot { session_id, snapshot, applied_offset };
-    send_message(writer, &msg).await;
-}
-
-async fn snapshot_term_at_offset(
-    term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
-    offset: i32,
-) -> (ScreenSnapshot, u32) {
-    let mut term_guard = term.lock().await;
-    let history_size = term_guard.grid().history_size();
-    let history_limit = i32::try_from(history_size).unwrap_or(i32::MAX);
-    let applied_offset_i32 = offset.clamp(0, history_limit);
-    let applied_offset = usize::try_from(applied_offset_i32).unwrap_or(0);
-    let current_offset = term_guard.grid().display_offset();
-    let current_offset_i32 = i32::try_from(current_offset).unwrap_or(i32::MAX);
-    let delta = applied_offset_i32 - current_offset_i32;
-
-    if delta != 0 {
-        term_guard.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
-    }
-
-    let snapshot = snapshot_term(&term_guard);
-
-    let restore_delta = current_offset_i32 - applied_offset_i32;
-    if restore_delta != 0 {
-        term_guard.scroll_display(alacritty_terminal::grid::Scroll::Delta(restore_delta));
-    }
-
-    (snapshot, u32::try_from(applied_offset).unwrap_or(u32::MAX))
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "search dispatch needs session identity, query, writer, registry, and attachment state"
-)]
 async fn handle_search_request(
     session_id: SessionId,
     query: String,
     limit: u32,
-    writer: &SharedWriter,
-    live_sessions: &LiveSessionRegistry,
-    attached_ids: &HashSet<SessionId>,
+    context: &ClientDispatchContext<'_>,
 ) {
-    if !attached_ids.contains(&session_id) {
+    if !attached_contains(context.attached_ids, session_id).await {
         tracing::warn!(%session_id, "client sent SearchRequest for unattached session");
         return;
     }
 
-    let sessions = live_sessions.read().await;
+    let sessions = context.server.live_sessions.read().await;
     let Some(session) = sessions.get(&session_id) else {
         warn!(%session_id, "SearchRequest for unknown session");
         return;
@@ -1184,7 +1286,7 @@ async fn handle_search_request(
     };
 
     let msg = ServerMessage::SearchResults { session_id, query, matches };
-    send_message(writer, &msg).await;
+    send_message(context.writer, &msg).await;
 }
 
 fn search_snapshot(snapshot: &ScreenSnapshot, query: &str, limit: u32) -> Vec<SearchMatch> {
@@ -1289,11 +1391,7 @@ impl alacritty_terminal::grid::Dimensions for ResizeDimensions {
 }
 
 /// Lock the `Term` and apply the new dimensions.
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "sibling attach_flow module needs visibility without making this helper fully public"
-)]
-pub(crate) async fn resize_term(
+pub async fn resize_term(
     term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     cols: u16,
     rows: u16,
@@ -1306,31 +1404,17 @@ pub(crate) async fn resize_term(
 
 /// Set PTY window size via `TIOCSWINSZ` ioctl.
 ///
-/// Writes a `libc::winsize` to the PTY fd, which causes the kernel to send
+/// Writes a terminal `Winsize` to the PTY fd, which causes the kernel to send
 /// `SIGWINCH` to the foreground process group.
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "sibling attach_flow module needs visibility without making this helper fully public"
-)]
-pub(crate) fn set_pty_winsize(fd: RawFd, size: TerminalSize) -> Result<(), ScribeError> {
-    let ws = libc::winsize {
+pub fn set_pty_winsize(fd: impl AsFd, size: TerminalSize) -> Result<(), ScribeError> {
+    let ws = rustix::termios::Winsize {
         ws_row: size.rows,
         ws_col: size.cols,
         ws_xpixel: size.cols.saturating_mul(size.cell_width.max(1)),
         ws_ypixel: size.rows.saturating_mul(size.cell_height.max(1)),
     };
 
-    // SAFETY: `fd` is a valid, open PTY master file descriptor. The `winsize`
-    // struct is fully initialized and lives on the stack for the duration of
-    // the ioctl call. `TIOCSWINSZ` writes a `winsize` to the kernel.
-    #[allow(unsafe_code, reason = "TIOCSWINSZ ioctl requires unsafe libc call")]
-    let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as libc::c_ulong, &ws) };
-
-    if ret == -1 {
-        return Err(ScribeError::Io { source: std::io::Error::last_os_error() });
-    }
-
-    Ok(())
+    rustix::termios::tcsetwinsize(fd, ws).map_err(std::io::Error::from).map_err(ScribeError::from)
 }
 
 /// Handle `Subscribe` — trigger CWD fallback check for visible sessions.
@@ -1492,25 +1576,23 @@ async fn handle_list_sessions(
 
 /// Handle `AttachSessions` — take ownership of detached sessions, set the
 /// client writer, and send back session + workspace info for each.
-#[allow(clippy::too_many_arguments, reason = "mirrors dispatch_message's dependency set")]
 async fn handle_attach_sessions(
     session_ids: &[SessionId],
     dimensions: &[TerminalSize],
-    live_sessions: &LiveSessionRegistry,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-    writer: &SharedWriter,
-    attached_ids: &mut HashSet<SessionId>,
+    context: &mut ClientDispatchContext<'_>,
 ) {
-    attached_ids.extend(
-        crate::attach_flow::attach_sessions(
-            session_ids,
-            dimensions,
-            live_sessions,
-            workspace_manager,
-            writer,
-        )
-        .await,
-    );
+    let attached = crate::attach_flow::attach_sessions(
+        session_ids,
+        dimensions,
+        &context.server.live_sessions,
+        &context.server.workspace_manager,
+        crate::attach_flow::AttachClientContext {
+            writer: context.writer,
+            attached_ids: context.attached_ids,
+        },
+    )
+    .await;
+    attached_extend(context.attached_ids, attached).await;
 }
 
 /// Handle `ConfigReloaded` — reload the config file and apply live changes.
@@ -1536,13 +1618,16 @@ async fn handle_config_reloaded(
     let sessions = live_sessions.read().await;
     for session in sessions.values() {
         session.term.lock().await.set_options(term_config.clone());
-        session.hide_codex_hook_logs.store(cfg.hide_codex_hook_logs, Ordering::Relaxed);
-        session.preserve_ai_scrollback.store(cfg.preserve_ai_scrollback, Ordering::Relaxed);
+        session.scrollback_lines.store(new_scrollback, Ordering::Relaxed);
+        session.hide_codex_hook_logs.store(cfg.ai_terminal.hide_codex_hook_logs, Ordering::Relaxed);
+        session
+            .preserve_ai_scrollback
+            .store(cfg.ai_terminal.preserve_ai_scrollback, Ordering::Relaxed);
     }
     info!(
         scrollback_lines = new_scrollback,
-        hide_codex_hook_logs = cfg.hide_codex_hook_logs,
-        preserve_ai_scrollback = cfg.preserve_ai_scrollback,
+        hide_codex_hook_logs = cfg.ai_terminal.hide_codex_hook_logs,
+        preserve_ai_scrollback = cfg.ai_terminal.preserve_ai_scrollback,
         sessions = sessions.len(),
         "scrollback updated on live sessions"
     );
@@ -1550,7 +1635,7 @@ async fn handle_config_reloaded(
 
 fn load_hide_codex_hook_logs_setting() -> bool {
     match scribe_common::config::load_config() {
-        Ok(config) => config.terminal.hide_codex_hook_logs,
+        Ok(config) => config.terminal.ai_session.hide_codex_hook_logs,
         Err(e) => {
             warn!("failed to load codex hook log filter setting: {e}");
             false
@@ -1560,10 +1645,20 @@ fn load_hide_codex_hook_logs_setting() -> bool {
 
 fn load_preserve_ai_scrollback_setting() -> bool {
     match scribe_common::config::load_config() {
-        Ok(config) => config.terminal.preserve_ai_scrollback,
+        Ok(config) => config.terminal.ai_session.preserve_ai_scrollback,
         Err(e) => {
             warn!("failed to load preserve_ai_scrollback setting: {e}");
             true
+        }
+    }
+}
+
+fn load_scrollback_lines_setting() -> usize {
+    match scribe_common::config::load_config() {
+        Ok(config) => usize::try_from(config.terminal.scrollback_lines).unwrap_or(usize::MAX),
+        Err(e) => {
+            warn!("failed to load scrollback_lines setting: {e}");
+            10_000
         }
     }
 }
@@ -1685,93 +1780,166 @@ async fn send_error(writer: &SharedWriter, message: &str) {
 /// Uses `ClientWriter` (optional) so the task keeps running even when no
 /// client is connected. Output is silently dropped when detached, but the
 /// `Term` state continues to be updated.
-async fn pty_reader_task(state: PtyReaderState) {
-    #[allow(
-        clippy::cognitive_complexity,
-        reason = "reader loop interleaves PTY reads, sync timeout flushes, filtering, forwarding, and metadata handling"
-    )]
-    async fn run(mut state: PtyReaderState) {
-        let mut buf = vec![0u8; PTY_READ_BUF_SIZE];
+async fn pty_reader_task(mut state: PtyReaderState) {
+    let mut buf = vec![0u8; PTY_READ_BUF_SIZE];
 
-        loop {
-            let read_result =
-                if let Some(deadline) = state.ansi_processor.sync_timeout().sync_timeout() {
-                    let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
-                    tokio::pin!(sleep);
-                    tokio::select! {
-                        () = &mut sleep => {
-                            stop_term_sync(&state.term, &mut state.ansi_processor).await;
-                            continue;
-                        }
-                        result = read_pty_bytes(&mut state.pty_read, &mut buf) => result,
-                    }
-                } else {
-                    read_pty_bytes(&mut state.pty_read, &mut buf).await
-                };
-
-            let bytes_read = match read_result {
-                ReadResult::Data(n) => n,
-                ReadResult::Eof => break,
-                ReadResult::Err(e) => {
-                    warn!(session_id = %state.session_id, "PTY read error: {e}");
-                    break;
-                }
-            };
-
-            let Some(bytes) = buf.get(..bytes_read) else { break };
-            capture_osc_metadata_events(&mut state, bytes);
-            let chunk_has_ed3_provider = chunk_mentions_ed3_provider(&state.osc_events);
-            let preserve = state.preserve_ai_scrollback.load(Ordering::Relaxed);
-            let ed3_filtered =
-                if preserve && should_apply_ed3_filter(state.ai_provider, chunk_has_ed3_provider) {
-                    Some(state.ed3_filter.filter(bytes))
-                } else {
-                    None
-                };
-            let effective = ed3_filtered.as_ref().map_or(bytes, |f| f.as_bytes());
-            let codex_filtered = if should_apply_codex_hook_log_filter(&state) {
-                Some(state.codex_hook_log_filter.filter(effective))
-            } else {
-                None
-            };
-            let effective = codex_filtered.as_ref().map_or(effective, |f| f.as_bytes());
-
-            // Step 1: Fast path — forward (possibly filtered) bytes to UI client.
-            send_pty_output(&state.client_writer, state.session_id, effective).await;
-
-            // Step 1b: If ED 3 was suppressed, tell the client to snap the
-            // viewport to bottom.  A real ED 3 would have reset
-            // `display_offset` to 0 inside `clear_history()`, but since we
-            // stripped the sequence, the client's Term never ran that code.
-            if state.ed3_filter.take_suppressed() {
-                let msg = ServerMessage::ScrollBottom { session_id: state.session_id };
-                send_to_client(&state.client_writer, &msg).await;
+    loop {
+        match next_pty_read_action(&mut state, &mut buf).await {
+            PtyReadAction::Continue => {}
+            PtyReadAction::End => break,
+            PtyReadAction::Data(bytes_read) => {
+                let Some(bytes) = buf.get(..bytes_read) else { break };
+                process_pty_chunk(&mut state, bytes).await;
             }
-
-            // Step 2: State path — feed (possibly filtered) bytes into Term.
-            feed_term(&state.term, &mut state.ansi_processor, effective).await;
-
-            // Steps 3–5: Metadata uses original bytes (OSC parser doesn't care about CSI ED 3).
-            process_metadata_events(&mut state).await;
         }
-
-        if let Some(flushed) = state.codex_hook_log_filter.flush() {
-            send_pty_output(&state.client_writer, state.session_id, &flushed).await;
-            feed_term(&state.term, &mut state.ansi_processor, &flushed).await;
-        }
-
-        // Session EOF — notify client (if attached) and remove all server-side
-        // ownership so reconnect and handoff state cannot retain dead sessions.
-        let exit_msg =
-            ServerMessage::SessionExited { session_id: state.session_id, exit_code: None };
-        send_to_client(&state.client_writer, &exit_msg).await;
-        state.live_sessions.write().await.remove(&state.session_id);
-        let mut workspace_manager = state.workspace_manager.write().await;
-        workspace_manager.remove_session(state.session_id);
-        workspace_manager.remove_session_from_window(state.session_id);
-        info!(session_id = %state.session_id, "PTY reader task exited");
     }
-    run(state).await;
+
+    flush_pending_codex_output(&mut state).await;
+    finalize_pty_reader(state).await;
+}
+
+enum PtyReadAction {
+    Continue,
+    Data(usize),
+    End,
+}
+
+async fn next_pty_read_action(state: &mut PtyReaderState, buf: &mut [u8]) -> PtyReadAction {
+    let read_result = if let Some(deadline) = state.ansi_processor.sync_timeout().sync_timeout() {
+        let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(sleep);
+        tokio::select! {
+            () = &mut sleep => {
+                stop_term_sync(&state.term, &mut state.ansi_processor).await;
+                return PtyReadAction::Continue;
+            }
+            result = read_pty_bytes(&mut state.pty_read, buf) => result,
+        }
+    } else {
+        read_pty_bytes(&mut state.pty_read, buf).await
+    };
+
+    match read_result {
+        ReadResult::Data(n) => PtyReadAction::Data(n),
+        ReadResult::Eof => PtyReadAction::End,
+        ReadResult::Err(e) => {
+            warn!(session_id = %state.session_id, "PTY read error: {e}");
+            PtyReadAction::End
+        }
+    }
+}
+
+async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
+    capture_osc_metadata_events(state, bytes);
+    let effective = apply_pty_filters(state, bytes);
+    let suppressed_ed3 = state.ed3_filter.take_suppressed();
+    let trimmed_rows = if suppressed_ed3 { handle_suppressed_ai_ed3(state).await } else { None };
+
+    if let Some(rows) = trimmed_rows {
+        send_trim_scrollback(&state.client_writer, state.session_id, rows).await;
+    }
+
+    // Step 1: Fast path — forward (possibly filtered) bytes to UI client.
+    send_pty_output(&state.client_writer, state.session_id, effective.as_ref()).await;
+
+    // Step 1b: If ED 3 was suppressed, tell the client to snap the
+    // viewport to bottom.  A real ED 3 would have reset `display_offset`
+    // to 0 inside `clear_history()`, but since we stripped the sequence,
+    // the client's Term never ran that code.
+    if suppressed_ed3 {
+        let msg = ServerMessage::ScrollBottom { session_id: state.session_id };
+        send_to_client(&state.client_writer, &msg).await;
+    }
+
+    // Step 2: State path — feed (possibly filtered) bytes into Term.
+    feed_term(&state.term, &mut state.ansi_processor, effective.as_ref()).await;
+
+    // Steps 3–5: Metadata uses original bytes (OSC parser doesn't care about CSI ED 3).
+    process_metadata_events(state).await;
+}
+
+fn apply_pty_filters<'a>(state: &mut PtyReaderState, bytes: &'a [u8]) -> Cow<'a, [u8]> {
+    let chunk_has_ed3_provider = chunk_mentions_ed3_provider(&state.osc_events);
+    let preserve = state.preserve_ai_scrollback.load(Ordering::Relaxed);
+    if !preserve {
+        state.preserved_ai_scrollback.reset();
+    }
+    let ed3_output =
+        if preserve && should_apply_ed3_filter(state.ai_provider, chunk_has_ed3_provider) {
+            state.ed3_filter.filter(bytes)
+        } else {
+            scribe_pty::ed3_filter::Ed3Output::Unchanged(bytes)
+        };
+    let after_ed3 = match ed3_output {
+        scribe_pty::ed3_filter::Ed3Output::Unchanged(filtered_bytes) => {
+            Cow::Borrowed(filtered_bytes)
+        }
+        scribe_pty::ed3_filter::Ed3Output::Filtered(filtered_bytes) => Cow::Owned(filtered_bytes),
+    };
+    if !should_apply_codex_hook_log_filter(state) {
+        return after_ed3;
+    }
+
+    match state.codex_hook_log_filter.filter(after_ed3.as_ref()) {
+        scribe_pty::codex_hook_log_filter::CodexHookLogOutput::Unchanged(_) => after_ed3,
+        scribe_pty::codex_hook_log_filter::CodexHookLogOutput::Filtered(filtered_bytes) => {
+            Cow::Owned(filtered_bytes)
+        }
+    }
+}
+
+async fn flush_pending_codex_output(state: &mut PtyReaderState) {
+    let Some(flushed) = state.codex_hook_log_filter.flush() else { return };
+    send_pty_output(&state.client_writer, state.session_id, &flushed).await;
+    feed_term(&state.term, &mut state.ansi_processor, &flushed).await;
+}
+
+async fn handle_suppressed_ai_ed3(state: &mut PtyReaderState) -> Option<usize> {
+    let current_history = {
+        let term_guard = state.term.lock().await;
+        term_guard.grid().history_size()
+    };
+    let trim_rows = state.preserved_ai_scrollback.trim_target(current_history);
+    if let Some(kept_rows) = trim_rows {
+        trim_term_scrollback(
+            &state.term,
+            kept_rows,
+            state.scrollback_lines.load(Ordering::Relaxed),
+        )
+        .await;
+    }
+    trim_rows
+}
+
+async fn trim_term_scrollback(
+    term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    kept_rows: usize,
+    max_rows: usize,
+) {
+    let mut term_guard = term.lock().await;
+    trim_term_scrollback_inner(&mut term_guard, kept_rows, max_rows);
+}
+
+fn trim_term_scrollback_inner(
+    term: &mut alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>,
+    kept_rows: usize,
+    max_rows: usize,
+) {
+    let kept_rows = kept_rows.min(max_rows);
+    let grid = term.grid_mut();
+    grid.update_history(kept_rows);
+    grid.update_history(max_rows);
+}
+
+async fn finalize_pty_reader(state: PtyReaderState) {
+    let exit_msg = ServerMessage::SessionExited { session_id: state.session_id, exit_code: None };
+    send_to_client(&state.client_writer, &exit_msg).await;
+    remove_from_session_attachment(&state.attachment, state.session_id).await;
+    state.live_sessions.write().await.remove(&state.session_id);
+    let mut workspace_manager = state.workspace_manager.write().await;
+    workspace_manager.remove_session(state.session_id);
+    workspace_manager.remove_session_from_window(state.session_id);
+    info!(session_id = %state.session_id, "PTY reader task exited");
 }
 
 /// Result of a PTY read attempt.
@@ -1801,6 +1969,18 @@ async fn send_pty_output(client_writer: &ClientWriter, session_id: SessionId, by
     send_to_client(client_writer, &msg).await;
 }
 
+async fn send_trim_scrollback(
+    client_writer: &ClientWriter,
+    session_id: SessionId,
+    history_rows: usize,
+) {
+    let msg = ServerMessage::TrimScrollback {
+        session_id,
+        history_rows: u32::try_from(history_rows).unwrap_or(u32::MAX),
+    };
+    send_to_client(client_writer, &msg).await;
+}
+
 /// Feed bytes into the terminal emulator via the ANSI processor.
 /// The Term mutex lock is held only during `advance()` — dropped before returning.
 async fn feed_term(
@@ -1823,25 +2003,15 @@ async fn stop_term_sync(
 }
 
 fn capture_osc_metadata_events(state: &mut PtyReaderState, bytes: &[u8]) {
-    run_osc_interceptor(
-        &mut state.osc_parser,
-        &state.metadata_parser,
-        bytes,
-        &mut state.osc_events,
-    );
+    run_osc_interceptor(&mut state.osc_parser, bytes, &mut state.osc_events);
 }
 
 /// Parse OSC sequences from bytes using the interceptor. Pure computation, no async.
 ///
 /// Events are pushed into `out`, which the caller clears between iterations to
 /// avoid allocating a new `Vec` on every PTY read.
-fn run_osc_interceptor(
-    osc_parser: &mut VteParser,
-    metadata_parser: &scribe_pty::metadata::MetadataParser,
-    bytes: &[u8],
-    out: &mut Vec<MetadataEvent>,
-) {
-    let mut interceptor = OscInterceptor::new(metadata_parser, out);
+fn run_osc_interceptor(osc_parser: &mut VteParser, bytes: &[u8], out: &mut Vec<MetadataEvent>) {
+    let mut interceptor = OscInterceptor::new(out);
     osc_parser.advance(&mut interceptor, bytes);
 }
 
@@ -1923,9 +2093,19 @@ async fn handle_session_event(
 }
 
 fn update_ai_provider_state(state: &mut PtyReaderState, event: &MetadataEvent) {
+    // Don't clear ai_provider on inactive — the ED 3 filter must remain
+    // engaged across tool restarts.  Without this, `codex --resume` sends
+    // ED 3 before re-identifying via OSC 1337, slipping through the filter
+    // and wiping scrollback.  The AiStateCleared event is still forwarded
+    // to the client for UI tracking; only the PTY reader's filter decision
+    // is affected.
     match event {
-        MetadataEvent::AiStateChanged(ai_state) => state.ai_provider = Some(ai_state.provider),
-        MetadataEvent::AiStateCleared => state.ai_provider = None,
+        MetadataEvent::AiStateChanged(ai_state) => {
+            state.ai_provider = Some(ai_state.provider);
+        }
+        MetadataEvent::AiStateCleared => {
+            state.preserved_ai_scrollback.reset();
+        }
         _ => {}
     }
 }
@@ -2015,33 +2195,19 @@ fn dim_theme_color(color: [f32; 4]) -> [f32; 4] {
 
 fn theme_color_to_rgb(color: [f32; 4]) -> alacritty_terminal::vte::ansi::Rgb {
     alacritty_terminal::vte::ansi::Rgb {
-        r: theme_channel_to_u8(color[0]),
-        g: theme_channel_to_u8(color[1]),
-        b: theme_channel_to_u8(color[2]),
+        r: scribe_common::theme::channel_to_u8(color[0]),
+        g: scribe_common::theme::channel_to_u8(color[1]),
+        b: scribe_common::theme::channel_to_u8(color[2]),
     }
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "channel is clamped to 0.0..=1.0 and rounded to the nearest 0..=255 byte value"
-)]
-fn theme_channel_to_u8(channel: f32) -> u8 {
-    (channel.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 async fn current_window_size(state: &PtyReaderState) -> alacritty_terminal::event::WindowSize {
     let term_guard = state.term.lock().await;
     let rows = term_guard.grid().screen_lines();
     let cols = term_guard.grid().columns();
-
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "terminal grid dimensions are bounded well within u16 range"
-    )]
     alacritty_terminal::event::WindowSize {
-        num_lines: rows as u16,
-        num_cols: cols as u16,
+        num_lines: u16::try_from(rows).unwrap_or(u16::MAX),
+        num_cols: u16::try_from(cols).unwrap_or(u16::MAX),
         cell_width: state.cell_width.max(1),
         cell_height: state.cell_height.max(1),
     }
@@ -2106,7 +2272,7 @@ async fn check_proc_cwd(state: &mut PtyReaderState) {
 /// from the last known value.
 #[cfg(target_os = "macos")]
 async fn check_proc_cwd(state: &mut PtyReaderState) {
-    let Some(cwd) = macos_proc_cwd(state.child_pid) else {
+    let Some(cwd) = crate::macos_proc::macos_proc_cwd(state.child_pid) else {
         return;
     };
     if state.last_proc_cwd.as_ref() == Some(&cwd) {
@@ -2128,67 +2294,6 @@ async fn check_proc_cwd(state: &mut PtyReaderState) {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn check_proc_cwd(_state: &mut PtyReaderState) {}
 
-/// Query the CWD of a process on macOS via `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
-#[cfg(target_os = "macos")]
-fn macos_proc_cwd(child_pid: u32) -> Option<std::path::PathBuf> {
-    use std::ffi::CStr;
-    use std::mem::MaybeUninit;
-    use std::os::raw::c_void;
-
-    const PROC_PIDVNODEPATHINFO: i32 = 9;
-
-    // `proc_vnodepathinfo` is 2 * `vnode_info_path` (each 1152 bytes) = 2304 bytes.
-    // `vnode_info_path` = `vnode_info` (128 bytes) + path `[c_char; 1024]`.
-    // `pvi_cdir` is the first `vnode_info_path` member; its path starts at byte 128.
-    const VIP_PATH_OFFSET: usize = 128;
-    const VNODE_INFO_PATH_SIZE: usize = 1152;
-    const PROC_VNODEPATHINFO_SIZE: usize = VNODE_INFO_PATH_SIZE * 2;
-
-    #[allow(unsafe_code, reason = "proc_pidinfo FFI is required for macOS CWD detection")]
-    {
-        unsafe extern "C" {
-            fn proc_pidinfo(
-                pid: i32,
-                flavor: i32,
-                arg: u64,
-                buffer: *mut c_void,
-                buffersize: i32,
-            ) -> i32;
-        }
-
-        let mut buf = MaybeUninit::<[u8; PROC_VNODEPATHINFO_SIZE]>::uninit();
-
-        let ret = unsafe {
-            proc_pidinfo(
-                i32::try_from(child_pid).ok()?,
-                PROC_PIDVNODEPATHINFO,
-                0,
-                buf.as_mut_ptr().cast::<c_void>(),
-                i32::try_from(PROC_VNODEPATHINFO_SIZE).ok()?,
-            )
-        };
-
-        if ret <= 0 {
-            return None;
-        }
-
-        let buf = unsafe { buf.assume_init() };
-
-        // `pvi_cdir.vip_path` starts at VIP_PATH_OFFSET within the first
-        // `vnode_info_path` member. Max path length is 1024 bytes (MAXPATHLEN).
-        let path_bytes = buf.get(VIP_PATH_OFFSET..VNODE_INFO_PATH_SIZE)?;
-
-        let c_str = CStr::from_bytes_until_nul(path_bytes).ok()?;
-        let path = std::path::PathBuf::from(c_str.to_str().ok()?);
-
-        if path.as_os_str().is_empty() {
-            return None;
-        }
-
-        Some(path)
-    }
-}
-
 /// Maximum number of parent directories to traverse when searching for a
 /// `.git/HEAD` file. Prevents unbounded walks on deep or unusual directory
 /// trees where no git repository is ever found.
@@ -2200,11 +2305,7 @@ const GIT_WALK_DEPTH_LIMIT: usize = 50;
 /// detached HEAD state, or `None` if not inside a git repository.
 /// Stops after `GIT_WALK_DEPTH_LIMIT` iterations to avoid walking all the
 /// way to `/` on very deep directory trees.
-#[allow(
-    clippy::redundant_pub_crate,
-    reason = "sibling attach_flow module needs visibility without making this helper fully public"
-)]
-pub(crate) fn detect_git_branch(cwd: &Path) -> Option<String> {
+pub fn detect_git_branch(cwd: &Path) -> Option<String> {
     let mut dir = cwd.to_path_buf();
     let mut depth = 0usize;
     loop {
@@ -2377,15 +2478,11 @@ pub fn new_connected_clients() -> ConnectedClients {
 
 /// Serialise all live sessions for a hot-reload handoff.
 ///
-/// Returns `(sessions, raw_fds)` where the fds are in the same order as the
+/// Returns `(sessions, fds)` where the fds are in the same order as the
 /// session vec. The caller must send these fds via `SCM_RIGHTS`.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "terminal dimensions are always within u16 range"
-)]
 pub async fn serialize_live_for_handoff(
     live_sessions: &LiveSessionRegistry,
-) -> (Vec<HandoffSession>, Vec<RawFd>) {
+) -> (Vec<HandoffSession>, Vec<Arc<OwnedFd>>) {
     let sessions = live_sessions.read().await;
     let mut handoff_sessions = Vec::with_capacity(sessions.len());
     let mut fds = Vec::with_capacity(sessions.len());
@@ -2393,8 +2490,8 @@ pub async fn serialize_live_for_handoff(
     for (&session_id, live) in sessions.iter() {
         let term = live.term.lock().await;
         let snapshot = Some(snapshot_term(&term));
-        let cols = term.grid().columns() as u16;
-        let rows = term.grid().screen_lines() as u16;
+        let cols = u16::try_from(term.grid().columns()).unwrap_or(u16::MAX);
+        let rows = u16::try_from(term.grid().screen_lines()).unwrap_or(u16::MAX);
         drop(term);
 
         let has_ai_state = live.ai_state.is_some();
@@ -2422,7 +2519,7 @@ pub async fn serialize_live_for_handoff(
                 .or(live.ai_provider_hint),
         });
 
-        fds.push(live.pty_raw_fd);
+        fds.push(Arc::clone(&live.resize_fd));
     }
 
     (handoff_sessions, fds)
@@ -2455,9 +2552,8 @@ pub async fn activate_pending_sessions(
                 session_id,
                 workspace_id,
                 session,
-                None,
-                workspace_manager,
-                live_sessions,
+                InitialAttachment { writer: None, attached_ids: None },
+                SessionRuntimeContext { workspace_manager, live_sessions },
             )
             .await;
             info!(%session_id, "activated restored session (detached)");
@@ -2507,10 +2603,6 @@ fn resolve_window_assignment<V>(
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::zero_sized_map_values,
-    reason = "tests use HashMap<WindowId, ()> to match the production connected_clients type"
-)]
 mod tests {
     use super::*;
     use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
@@ -2535,13 +2627,17 @@ mod tests {
         let (server, _client) = unix_stream_pair();
         let (_read, write) = tokio::io::split(server);
         let writer: SharedWriter = Arc::new(Mutex::new(write));
+        let attached_ids: AttachedSessionIds = Arc::new(Mutex::new(HashSet::new()));
 
         let attached = crate::attach_flow::attach_sessions(
             &[SessionId::new()],
             &[],
             &live_sessions,
             &workspace_manager,
-            &writer,
+            crate::attach_flow::AttachClientContext {
+                writer: &writer,
+                attached_ids: &attached_ids,
+            },
         )
         .await;
 
@@ -2553,7 +2649,7 @@ mod tests {
     #[test]
     fn fresh_launch_no_sessions_creates_new_window() {
         let sessions: HashSet<WindowId> = HashSet::new();
-        let connected: HashMap<WindowId, ()> = HashMap::new();
+        let connected: HashMap<WindowId, bool> = HashMap::new();
 
         let (assigned, others) = resolve_window_assignment(None, &sessions, &connected);
 
@@ -2568,7 +2664,7 @@ mod tests {
     fn restart_single_window_reuses_existing() {
         let w1 = WindowId::new();
         let sessions: HashSet<WindowId> = [w1].into_iter().collect();
-        let connected: HashMap<WindowId, ()> = HashMap::new();
+        let connected: HashMap<WindowId, bool> = HashMap::new();
 
         let (assigned, others) = resolve_window_assignment(None, &sessions, &connected);
 
@@ -2583,7 +2679,7 @@ mod tests {
         let w2 = WindowId::new();
         let w3 = WindowId::new();
         let sessions: HashSet<WindowId> = [w1, w2, w3].into_iter().collect();
-        let connected: HashMap<WindowId, ()> = HashMap::new();
+        let connected: HashMap<WindowId, bool> = HashMap::new();
 
         let (assigned, others) = resolve_window_assignment(None, &sessions, &connected);
 
@@ -2601,7 +2697,7 @@ mod tests {
         let w1 = WindowId::new();
         let w_explicit = WindowId::new();
         let sessions: HashSet<WindowId> = [w1].into_iter().collect();
-        let connected: HashMap<WindowId, ()> = HashMap::new();
+        let connected: HashMap<WindowId, bool> = HashMap::new();
 
         let (assigned, others) = resolve_window_assignment(Some(w_explicit), &sessions, &connected);
 
@@ -2615,7 +2711,7 @@ mod tests {
     fn does_not_steal_connected_window() {
         let w1 = WindowId::new();
         let sessions: HashSet<WindowId> = [w1].into_iter().collect();
-        let connected: HashMap<WindowId, ()> = [(w1, ())].into_iter().collect();
+        let connected: HashMap<WindowId, bool> = [(w1, true)].into_iter().collect();
 
         let (assigned, others) = resolve_window_assignment(None, &sessions, &connected);
 
@@ -2629,7 +2725,7 @@ mod tests {
         let w1 = WindowId::new();
         let w2 = WindowId::new();
         let sessions: HashSet<WindowId> = [w1, w2].into_iter().collect();
-        let connected: HashMap<WindowId, ()> = [(w1, ())].into_iter().collect();
+        let connected: HashMap<WindowId, bool> = [(w1, true)].into_iter().collect();
 
         let (assigned, others) = resolve_window_assignment(None, &sessions, &connected);
 
@@ -2643,7 +2739,7 @@ mod tests {
         let w1 = WindowId::new();
         let w2 = WindowId::new();
         let sessions: HashSet<WindowId> = [w1, w2].into_iter().collect();
-        let connected: HashMap<WindowId, ()> = HashMap::new();
+        let connected: HashMap<WindowId, bool> = HashMap::new();
 
         let (assigned, others) = resolve_window_assignment(Some(w1), &sessions, &connected);
 

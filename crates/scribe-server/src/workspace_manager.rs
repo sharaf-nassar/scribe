@@ -18,9 +18,10 @@ pub struct HandoffWindowState {
     pub workspace_tree: Option<WorkspaceTreeNode>,
 }
 
-#[allow(dead_code, reason = "used by create_workspace, called from CreateWorkspace handler")]
 const ACCENT_COLORS: &[&str] =
     &["#a78bfa", "#38bdf8", "#6ee7b7", "#fb7185", "#fbbf24", "#a3e635", "#f472b6", "#22d3ee"];
+
+type WorkspaceInfoSummary = (Option<String>, String, Option<LayoutDirection>, Option<PathBuf>);
 
 /// Manages workspace ↔ session relationships, window ↔ session ownership,
 /// and auto-names workspaces based on configured root directories.
@@ -28,7 +29,6 @@ pub struct WorkspaceManager {
     roots: Vec<PathBuf>,
     workspaces: HashMap<WorkspaceId, Workspace>,
     session_to_workspace: HashMap<SessionId, WorkspaceId>,
-    #[allow(dead_code, reason = "used by create_workspace, called from CreateWorkspace handler")]
     color_index: usize,
     /// Legacy single workspace tree — used as fallback when no per-window
     /// trees exist (backwards compatibility with pre-multi-window handoffs).
@@ -41,14 +41,12 @@ pub struct WorkspaceManager {
 }
 
 struct Workspace {
-    #[allow(dead_code, reason = "used for workspace identity in future UI sync messages")]
     id: WorkspaceId,
     name: Option<String>,
     /// Absolute path to the project directory (`root / first_component`).
     /// Set alongside `name` when a CWD matches a configured workspace root.
     project_root: Option<PathBuf>,
     sessions: Vec<SessionId>,
-    #[allow(dead_code, reason = "sent to UI in future WorkspaceInfo messages")]
     accent_color: String,
     /// Direction of the split that created this workspace (`None` for the
     /// initial workspace which was not created by splitting).
@@ -72,7 +70,6 @@ impl WorkspaceManager {
 
     /// Create a new workspace and assign it the next accent color from the
     /// rotating palette.
-    #[allow(dead_code, reason = "called from CreateWorkspace handler and tests")]
     pub fn create_workspace(&mut self) -> WorkspaceId {
         let id = WorkspaceId::new();
         let color_count = ACCENT_COLORS.len();
@@ -139,7 +136,6 @@ impl WorkspaceManager {
     }
 
     /// Remove a session from its workspace.
-    #[allow(dead_code, reason = "called from CloseSession handler and tests")]
     pub fn remove_session(&mut self, session_id: SessionId) {
         if let Some(workspace_id) = self.session_to_workspace.remove(&session_id) {
             if let Some(ws) = self.workspaces.get_mut(&workspace_id) {
@@ -230,7 +226,7 @@ impl WorkspaceManager {
             debug!(%session_id, "skipping proc CWD check: child_pid is 0");
             return None;
         }
-        let cwd = macos_proc_cwd(child_pid)?;
+        let cwd = crate::macos_proc::macos_proc_cwd(child_pid)?;
         self.on_cwd_changed(session_id, &cwd)
     }
 
@@ -244,33 +240,14 @@ impl WorkspaceManager {
         None
     }
 
-    /// Return the workspace a session belongs to, if any.
-    #[allow(dead_code, reason = "used by MoveSession handler and tests")]
-    pub fn workspace_for_session(&self, session_id: SessionId) -> Option<WorkspaceId> {
-        self.session_to_workspace.get(&session_id).copied()
-    }
-
     /// Return the name, accent color, split direction, and project root of a
     /// workspace.
     ///
     /// Returns `Some(…)` if the workspace exists, `None` otherwise.
-    #[allow(
-        clippy::type_complexity,
-        reason = "flat tuple avoids a one-off struct for an internal API"
-    )]
-    pub fn workspace_info(
-        &self,
-        id: WorkspaceId,
-    ) -> Option<(Option<String>, String, Option<LayoutDirection>, Option<PathBuf>)> {
+    pub fn workspace_info(&self, id: WorkspaceId) -> Option<WorkspaceInfoSummary> {
         self.workspaces.get(&id).map(|ws| {
             (ws.name.clone(), ws.accent_color.clone(), ws.split_direction, ws.project_root.clone())
         })
-    }
-
-    /// Return the legacy single workspace split tree (used by handoff serialisation).
-    #[allow(dead_code, reason = "used in handoff serialization and tests")]
-    pub fn workspace_tree(&self) -> Option<&WorkspaceTreeNode> {
-        self.workspace_tree.as_ref()
     }
 
     /// Return the workspace tree for a specific window.
@@ -372,15 +349,6 @@ impl WorkspaceManager {
     /// Extract the workspace name and project root from a CWD path by matching
     /// against the configured roots and taking the first component after the
     /// root prefix.
-    #[allow(dead_code, reason = "called from extract_workspace_name_pub in tests")]
-    fn extract_workspace_info(&self, cwd: &Path) -> Option<(String, PathBuf)> {
-        Self::extract_workspace_info_with_roots(cwd, &self.roots)
-    }
-
-    /// Inner helper that takes an explicit roots slice so the borrow checker
-    /// is happy when `on_cwd_changed` passes a cloned roots vec.
-    ///
-    /// Returns `(name, project_root)` where `project_root` is `root / name`.
     fn extract_workspace_info_with_roots(
         cwd: &Path,
         roots: &[PathBuf],
@@ -508,73 +476,20 @@ impl WorkspaceManager {
     }
 }
 
-/// Query the CWD of a process on macOS via `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
-#[cfg(target_os = "macos")]
-fn macos_proc_cwd(child_pid: u32) -> Option<PathBuf> {
-    use std::ffi::CStr;
-    use std::mem::MaybeUninit;
-    use std::os::raw::c_void;
-
-    const PROC_PIDVNODEPATHINFO: i32 = 9;
-
-    // `proc_vnodepathinfo` is 2 * `vnode_info_path` (each 1152 bytes) = 2304 bytes.
-    // `vnode_info_path` = `vnode_info` (128 bytes) + path `[c_char; 1024]`.
-    // `pvi_cdir` is the first `vnode_info_path` member; its path starts at byte 128.
-    const VIP_PATH_OFFSET: usize = 128;
-    const VNODE_INFO_PATH_SIZE: usize = 1152;
-    const PROC_VNODEPATHINFO_SIZE: usize = VNODE_INFO_PATH_SIZE * 2;
-
-    #[allow(unsafe_code, reason = "proc_pidinfo FFI is required for macOS CWD detection")]
-    {
-        unsafe extern "C" {
-            fn proc_pidinfo(
-                pid: i32,
-                flavor: i32,
-                arg: u64,
-                buffer: *mut c_void,
-                buffersize: i32,
-            ) -> i32;
-        }
-
-        let mut buf = MaybeUninit::<[u8; PROC_VNODEPATHINFO_SIZE]>::uninit();
-
-        let ret = unsafe {
-            proc_pidinfo(
-                i32::try_from(child_pid).ok()?,
-                PROC_PIDVNODEPATHINFO,
-                0,
-                buf.as_mut_ptr().cast::<c_void>(),
-                i32::try_from(PROC_VNODEPATHINFO_SIZE).ok()?,
-            )
-        };
-
-        if ret <= 0 {
-            return None;
-        }
-
-        let buf = unsafe { buf.assume_init() };
-
-        // `pvi_cdir.vip_path` starts at VIP_PATH_OFFSET within the first
-        // `vnode_info_path` member. Max path length is 1024 bytes (MAXPATHLEN).
-        let path_bytes = buf.get(VIP_PATH_OFFSET..VNODE_INFO_PATH_SIZE)?;
-
-        let c_str = CStr::from_bytes_until_nul(path_bytes).ok()?;
-        let path = PathBuf::from(c_str.to_str().ok()?);
-
-        if path.as_os_str().is_empty() {
-            return None;
-        }
-
-        Some(path)
-    }
-}
-
 // Expose the private helper for unit-testing without making it pub on the
 // main type.
 #[cfg(test)]
 impl WorkspaceManager {
-    pub fn extract_workspace_name_pub(&self, cwd: &Path) -> Option<String> {
-        self.extract_workspace_info(cwd).map(|(name, _)| name)
+    fn workspace_for_session(&self, session_id: SessionId) -> Option<WorkspaceId> {
+        self.session_to_workspace.get(&session_id).copied()
+    }
+
+    fn workspace_tree(&self) -> Option<&WorkspaceTreeNode> {
+        self.workspace_tree.as_ref()
+    }
+
+    fn extract_workspace_name_pub(&self, cwd: &Path) -> Option<String> {
+        Self::extract_workspace_info_with_roots(cwd, &self.roots).map(|(name, _)| name)
     }
 }
 

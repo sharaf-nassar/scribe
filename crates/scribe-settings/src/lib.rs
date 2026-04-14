@@ -1,5 +1,3 @@
-#![allow(unsafe_code, reason = "wry webview FFI bindings require unsafe")]
-
 pub mod apply;
 pub mod singleton;
 pub mod state;
@@ -158,6 +156,58 @@ fn inject_platform(webview: &wry::WebView) {
     }
 }
 
+/// Load the current config and serialise it for webview injection.
+fn load_config_json() -> String {
+    let config = scribe_common::config::load_config().unwrap_or_else(|e| {
+        tracing::warn!("failed to load config: {e}, using defaults");
+        scribe_common::config::ScribeConfig::default()
+    });
+    serde_json::to_string(&config).unwrap_or_else(|e| {
+        tracing::warn!("failed to serialize config: {e}");
+        String::from("{}")
+    })
+}
+
+/// Inject the initial runtime state needed by the settings frontend.
+fn inject_initial_webview_state(webview: &wry::WebView, config_json: &str) {
+    inject_platform(webview);
+
+    let init_script =
+        format!("if (typeof loadConfig === 'function') {{ loadConfig({config_json}); }}");
+    if let Err(e) = webview.evaluate_script(&init_script) {
+        tracing::warn!("failed to inject config into settings webview: {e}");
+    }
+
+    inject_keybinding_defaults(webview);
+    inject_theme_colors(webview);
+    inject_font_list(webview);
+}
+
+/// Detect whether a webview IPC request is asking for the font list.
+fn is_requesting_fonts(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+        .as_deref()
+        == Some("request_fonts")
+}
+
+/// Handle an IPC request from the settings webview.
+fn handle_settings_ipc_request<F: Fn(String)>(
+    body: &str,
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+    on_change: &F,
+) {
+    if is_requesting_fonts(body) {
+        if let Some(wv) = webview_ref.borrow().as_ref() {
+            inject_font_list(wv);
+        }
+        return;
+    }
+
+    on_change(body.to_owned());
+}
+
 #[cfg(target_os = "macos")]
 fn is_macos_close_window_shortcut(
     event: &tao::event::KeyEvent,
@@ -195,10 +245,6 @@ fn is_macos_close_window_shortcut(
 /// `on_change` is called for each setting change from the webview.
 /// `on_close` is called with the final geometry when the window closes.
 #[cfg(target_os = "linux")]
-#[allow(
-    clippy::too_many_lines,
-    reason = "GTK window setup + webview + socket watcher in one function"
-)]
 pub fn run_settings_window(
     geometry: Option<SettingsWindowGeometry>,
     on_change: impl Fn(String) + 'static,
@@ -210,51 +256,14 @@ pub fn run_settings_window(
     use std::rc::Rc;
 
     use gtk::prelude::*;
-    use wry::WebViewBuilderExtUnix;
 
     if let Err(e) = gtk::init() {
         return Err(format!("GTK init failed: {e}"));
     }
 
-    let config = scribe_common::config::load_config().unwrap_or_else(|e| {
-        tracing::warn!("failed to load config: {e}, using defaults");
-        scribe_common::config::ScribeConfig::default()
-    });
-    let config_json = serde_json::to_string(&config).unwrap_or_else(|e| {
-        tracing::warn!("failed to serialize config: {e}");
-        String::from("{}")
-    });
-
+    let config_json = load_config_json();
     let html = build_html()?;
-
-    // Set the window icon so the taskbar shows the correct app icon.
-    // set_default_icon_name alone is not enough — some panels match by
-    // WM_CLASS and ignore the theme name.  Loading a pixbuf from the
-    // installed icon file and setting it directly on the window embeds
-    // the icon in _NET_WM_ICON, which all panels respect.
-    let icon_name = scribe_common::app::current_identity().slug();
-    gtk::Window::set_default_icon_name(icon_name);
-
-    let window = gtk::Window::new(gtk::WindowType::Toplevel);
-    let window_title =
-        format!("{} Settings", scribe_common::app::current_identity().window_title_name());
-    window.set_title(&window_title);
-
-    {
-        let icon_path = format!("/usr/share/icons/hicolor/256x256/apps/{icon_name}.png");
-        match gdk_pixbuf::Pixbuf::from_file(&icon_path) {
-            Ok(pixbuf) => window.set_icon(Some(&pixbuf)),
-            Err(e) => tracing::warn!("failed to load window icon from {icon_path}: {e}"),
-        }
-    }
-
-    // Restore saved size, or use defaults.
-    if let Some(geom) = geometry {
-        window.set_default_size(geom.width, geom.height);
-    } else {
-        window.set_default_size(880, 680);
-        window.set_position(gtk::WindowPosition::Center);
-    }
+    let window = build_linux_window(geometry);
 
     // Create a GTK Box to hold the webview.
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -274,101 +283,150 @@ pub fn run_settings_window(
     // Shared webview reference so the IPC handler can call evaluate_script
     // for font refresh requests. The webview is stored after build_gtk.
     let webview_ref: Rc<RefCell<Option<wry::WebView>>> = Rc::new(RefCell::new(None));
-    let webview_for_ipc = Rc::clone(&webview_ref);
-
-    let webview = wry::WebViewBuilder::new()
-        .with_html(&html)
-        .with_ipc_handler(move |request| {
-            let body = request.body();
-            let is_request_fonts = serde_json::from_str::<serde_json::Value>(body)
-                .ok()
-                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
-                .as_deref()
-                == Some("request_fonts");
-            if is_request_fonts {
-                if let Some(wv) = webview_for_ipc.borrow().as_ref() {
-                    inject_font_list(wv);
-                }
-                return;
-            }
-            on_change(body.clone());
-        })
-        .build_gtk(&container)
-        .map_err(|e| format!("failed to create webview: {e}"))?;
-
-    // Inject platform identifier before config so keybinding badges render with
-    // the correct modifier glyphs on first load.
-    inject_platform(&webview);
-
-    // Inject current config into the webview after it loads.
-    let init_script =
-        format!("if (typeof loadConfig === 'function') {{ loadConfig({config_json}); }}");
-    if let Err(e) = webview.evaluate_script(&init_script) {
-        tracing::warn!("failed to inject config into settings webview: {e}");
-    }
-
-    // Inject keybinding defaults so JS can implement reset-to-default.
-    inject_keybinding_defaults(&webview);
-
-    // Inject theme color map for the theme picker.
-    inject_theme_colors(&webview);
-
-    // Inject available monospace fonts.
-    inject_font_list(&webview);
+    let webview = build_linux_webview(&container, &html, &config_json, on_change, &webview_ref)?;
 
     // Store webview in the shared ref so the IPC handler can use it for refresh.
     *webview_ref.borrow_mut() = Some(webview);
 
-    // Watch the singleton socket for incoming focus commands.
+    // Wrap on_close in an Rc<RefCell<Option<...>>> so it can be shared
+    // between the delete-event handler and the SIGTERM/SIGINT signal handlers.
+    // Each handler calls take() to fire the callback exactly once.
+    let on_close = Rc::new(RefCell::new(Some(on_close)));
+    install_linux_runtime_hooks(&window, listener, Rc::clone(&on_close));
+
+    gtk::main();
+
+    Ok(())
+}
+
+/// Build the GTK window with the saved geometry and app icon.
+#[cfg(target_os = "linux")]
+fn build_linux_window(geometry: Option<SettingsWindowGeometry>) -> gtk::Window {
+    use gtk::prelude::*;
+
+    // Set the window icon so the taskbar shows the correct app icon.
+    // set_default_icon_name alone is not enough — some panels match by
+    // WM_CLASS and ignore the theme name. Loading a pixbuf from the installed
+    // icon file and setting it directly on the window embeds the icon in
+    // _NET_WM_ICON, which all panels respect.
+    let icon_name = scribe_common::app::current_identity().slug();
+    gtk::Window::set_default_icon_name(icon_name);
+
+    let window = gtk::Window::new(gtk::WindowType::Toplevel);
+    let window_title =
+        format!("{} Settings", scribe_common::app::current_identity().window_title_name());
+    window.set_title(&window_title);
+
+    let icon_path = format!("/usr/share/icons/hicolor/256x256/apps/{icon_name}.png");
+    match gdk_pixbuf::Pixbuf::from_file(&icon_path) {
+        Ok(pixbuf) => window.set_icon(Some(&pixbuf)),
+        Err(e) => tracing::warn!("failed to load window icon from {icon_path}: {e}"),
+    }
+
+    if let Some(geom) = geometry {
+        window.set_default_size(geom.width, geom.height);
+    } else {
+        window.set_default_size(880, 680);
+        window.set_position(gtk::WindowPosition::Center);
+    }
+
+    window
+}
+
+/// Build the GTK webview and wire the settings IPC handler.
+#[cfg(target_os = "linux")]
+fn build_linux_webview<F: Fn(String) + 'static>(
+    container: &gtk::Box,
+    html: &str,
+    config_json: &str,
+    on_change: F,
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+) -> Result<wry::WebView, String> {
+    use wry::WebViewBuilderExtUnix;
+
+    let webview = wry::WebViewBuilder::new()
+        .with_html(html)
+        .with_ipc_handler({
+            let webview_for_ipc = std::rc::Rc::clone(webview_ref);
+            move |request| handle_settings_ipc_request(request.body(), &webview_for_ipc, &on_change)
+        })
+        .build_gtk(container)
+        .map_err(|e| format!("failed to create webview: {e}"))?;
+
+    inject_initial_webview_state(&webview, config_json);
+    Ok(webview)
+}
+
+/// Install the Linux singleton watcher and shutdown handlers.
+#[cfg(target_os = "linux")]
+fn install_linux_runtime_hooks<F: FnOnce(SettingsWindowGeometry) + 'static>(
+    window: &gtk::Window,
+    listener: std::os::unix::net::UnixListener,
+    on_close: std::rc::Rc<std::cell::RefCell<Option<F>>>,
+) {
+    install_linux_singleton_watcher(listener, window);
+    install_linux_signal_handler(libc::SIGTERM, window, std::rc::Rc::clone(&on_close));
+    install_linux_signal_handler(libc::SIGINT, window, std::rc::Rc::clone(&on_close));
+    install_linux_delete_handler(window, on_close);
+}
+
+/// Watch the singleton socket for incoming focus commands.
+#[cfg(target_os = "linux")]
+fn install_linux_singleton_watcher(
+    listener: std::os::unix::net::UnixListener,
+    window: &gtk::Window,
+) {
     let fd = std::os::unix::io::AsRawFd::as_raw_fd(&listener);
     let window_for_focus = window.clone();
     gtk::glib::unix_fd_add_local(fd, gtk::glib::IOCondition::IN, move |_, _| {
         handle_singleton_connection(&listener, &window_for_focus);
         gtk::glib::ControlFlow::Continue
     });
+}
 
-    // Wrap on_close in an Rc<RefCell<Option<...>>> so it can be shared
-    // between the delete-event handler and the SIGTERM/SIGINT signal handlers.
-    // Each handler calls take() to fire the callback exactly once.
-    let on_close = Rc::new(RefCell::new(Some(on_close)));
-
-    let window_for_sigterm = window.clone();
-    let on_close_for_sigterm = Rc::clone(&on_close);
-    gtk::glib::unix_signal_add_local(libc::SIGTERM, move || {
-        let (x, y) = window_for_sigterm.position();
-        let (width, height) = window_for_sigterm.size();
-        if let Some(cb) = on_close_for_sigterm.borrow_mut().take() {
-            cb(SettingsWindowGeometry { x, y, width, height });
-        }
+/// Register one Linux termination signal handler.
+#[cfg(target_os = "linux")]
+fn install_linux_signal_handler<F: FnOnce(SettingsWindowGeometry) + 'static>(
+    signal: libc::c_int,
+    window: &gtk::Window,
+    on_close: std::rc::Rc<std::cell::RefCell<Option<F>>>,
+) {
+    let window_for_signal = window.clone();
+    gtk::glib::unix_signal_add_local(signal, move || {
+        fire_linux_on_close(&window_for_signal, &on_close);
         gtk::main_quit();
         gtk::glib::ControlFlow::Break
     });
+}
 
-    let window_for_sigint = window.clone();
-    let on_close_for_sigint = Rc::clone(&on_close);
-    gtk::glib::unix_signal_add_local(libc::SIGINT, move || {
-        let (x, y) = window_for_sigint.position();
-        let (width, height) = window_for_sigint.size();
-        if let Some(cb) = on_close_for_sigint.borrow_mut().take() {
-            cb(SettingsWindowGeometry { x, y, width, height });
-        }
-        gtk::main_quit();
-        gtk::glib::ControlFlow::Break
-    });
+/// Register the Linux window delete handler.
+#[cfg(target_os = "linux")]
+fn install_linux_delete_handler<F: FnOnce(SettingsWindowGeometry) + 'static>(
+    window: &gtk::Window,
+    on_close: std::rc::Rc<std::cell::RefCell<Option<F>>>,
+) {
+    use gtk::prelude::WidgetExt;
 
     window.connect_delete_event(move |win, _| {
-        let (x, y) = win.position();
-        let (width, height) = win.size();
-        if let Some(cb) = on_close.borrow_mut().take() {
-            cb(SettingsWindowGeometry { x, y, width, height });
-        }
+        fire_linux_on_close(win, &on_close);
         gtk::main_quit();
         gtk::glib::Propagation::Proceed
     });
+}
 
-    gtk::main();
+/// Fire the Linux close callback exactly once with the current geometry.
+#[cfg(target_os = "linux")]
+fn fire_linux_on_close<F: FnOnce(SettingsWindowGeometry)>(
+    window: &gtk::Window,
+    on_close: &std::rc::Rc<std::cell::RefCell<Option<F>>>,
+) {
+    use gtk::prelude::GtkWindowExt;
 
-    Ok(())
+    let (x, y) = window.position();
+    let (width, height) = window.size();
+    if let Some(cb) = on_close.borrow_mut().take() {
+        cb(SettingsWindowGeometry { x, y, width, height });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -385,19 +443,6 @@ enum TaoUserEvent {
     QuitWindow,
     /// A termination signal (SIGTERM/SIGINT) was received.
     Terminate,
-}
-
-/// Load configuration and serialise it to JSON for webview injection.
-#[cfg(not(target_os = "linux"))]
-fn load_config_json() -> String {
-    let config = scribe_common::config::load_config().unwrap_or_else(|e| {
-        tracing::warn!("failed to load config: {e}, using defaults");
-        scribe_common::config::ScribeConfig::default()
-    });
-    serde_json::to_string(&config).unwrap_or_else(|e| {
-        tracing::warn!("failed to serialize config: {e}");
-        String::from("{}")
-    })
 }
 
 /// Build the tao window with optional saved geometry.
@@ -481,7 +526,6 @@ fn capture_geometry(window: &tao::window::Window) -> SettingsWindowGeometry {
 /// Uses `tao::EventLoop` for windowing and `wry::WebViewBuilder::build()`
 /// with the tao window (no GTK dependency).
 #[cfg(not(target_os = "linux"))]
-#[allow(clippy::too_many_lines, reason = "tao window setup + webview + event loop in one function")]
 pub fn run_settings_window(
     geometry: Option<SettingsWindowGeometry>,
     on_change: impl Fn(String) + 'static,
@@ -491,10 +535,6 @@ pub fn run_settings_window(
 ) -> Result<(), String> {
     use std::cell::RefCell;
     use std::rc::Rc;
-
-    use tao::event::{Event, WindowEvent};
-    use tao::event_loop::ControlFlow;
-    use tao::platform::run_return::EventLoopExtRunReturn;
 
     let config_json = load_config_json();
     let html = build_html()?;
@@ -509,96 +549,114 @@ pub fn run_settings_window(
 
     // Shared webview ref for IPC font-refresh requests.
     let webview_ref: Rc<RefCell<Option<wry::WebView>>> = Rc::new(RefCell::new(None));
-    let webview_for_ipc = Rc::clone(&webview_ref);
-
-    let webview = wry::WebViewBuilder::new()
-        .with_html(&html)
-        .with_ipc_handler(move |request| {
-            let body = request.body();
-            let is_request_fonts = serde_json::from_str::<serde_json::Value>(body)
-                .ok()
-                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
-                .as_deref()
-                == Some("request_fonts");
-            if is_request_fonts {
-                if let Some(wv) = webview_for_ipc.borrow().as_ref() {
-                    inject_font_list(wv);
-                }
-                return;
-            }
-            on_change(body.clone());
-        })
-        .build(&window)
-        .map_err(|e| format!("failed to create webview: {e}"))?;
-
-    inject_platform(&webview);
-
-    // Inject config after platform so keybinding badges render with mac glyphs
-    // on first paint.
-    let init_script =
-        format!("if (typeof loadConfig === 'function') {{ loadConfig({config_json}); }}");
-    if let Err(e) = webview.evaluate_script(&init_script) {
-        tracing::warn!("failed to inject config into settings webview: {e}");
-    }
-    inject_keybinding_defaults(&webview);
-    inject_theme_colors(&webview);
-    inject_font_list(&webview);
+    let webview = build_tao_webview(&window, &html, &config_json, on_change, &webview_ref)?;
 
     *webview_ref.borrow_mut() = Some(webview);
 
-    let on_close = RefCell::new(Some(on_close));
-    let target_window_id = window.id();
-    let modifiers = RefCell::new(tao::keyboard::ModifiersState::default());
-
-    event_loop.run_return(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-        match event {
-            Event::UserEvent(TaoUserEvent::FocusWindow) => window.set_focus(),
-            Event::UserEvent(TaoUserEvent::QuitWindow) => {
-                *control_flow = ControlFlow::Exit;
-            }
-            Event::WindowEvent {
-                event: WindowEvent::ModifiersChanged(new_mods),
-                window_id: id,
-                ..
-            } if id == target_window_id => {
-                *modifiers.borrow_mut() = new_mods;
-            }
-            Event::WindowEvent {
-                event: WindowEvent::KeyboardInput { event, .. },
-                window_id: id,
-                ..
-            } if id == target_window_id
-                && is_macos_close_window_shortcut(&event, *modifiers.borrow()) =>
-            {
-                fire_on_close(&window, &on_close);
-                *control_flow = ControlFlow::Exit;
-            }
-            Event::WindowEvent { event: WindowEvent::CloseRequested, .. }
-            | Event::UserEvent(TaoUserEvent::Terminate) => {
-                fire_on_close(&window, &on_close);
-                *control_flow = ControlFlow::Exit;
-            }
-            Event::WindowEvent { event: WindowEvent::Destroyed, window_id: id, .. }
-                if id == target_window_id =>
-            {
-                *control_flow = ControlFlow::Exit;
-            }
-            _ => {}
-        }
-    });
+    run_tao_settings_loop(&mut event_loop, window, RefCell::new(Some(on_close)));
 
     Ok(())
 }
 
 /// Fire the `on_close` callback exactly once, capturing current geometry.
 #[cfg(not(target_os = "linux"))]
-fn fire_on_close(
+fn fire_on_close<F: FnOnce(SettingsWindowGeometry)>(
     window: &tao::window::Window,
-    on_close: &std::cell::RefCell<Option<impl FnOnce(SettingsWindowGeometry)>>,
+    on_close: &std::cell::RefCell<Option<F>>,
 ) {
     if let Some(cb) = on_close.borrow_mut().take() {
         cb(capture_geometry(window));
+    }
+}
+
+/// Build the tao webview and wire the settings IPC handler.
+#[cfg(not(target_os = "linux"))]
+fn build_tao_webview<F: Fn(String) + 'static>(
+    window: &tao::window::Window,
+    html: &str,
+    config_json: &str,
+    on_change: F,
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+) -> Result<wry::WebView, String> {
+    let webview = wry::WebViewBuilder::new()
+        .with_html(html)
+        .with_ipc_handler({
+            let webview_for_ipc = std::rc::Rc::clone(webview_ref);
+            move |request| handle_settings_ipc_request(request.body(), &webview_for_ipc, &on_change)
+        })
+        .build(window)
+        .map_err(|e| format!("failed to create webview: {e}"))?;
+
+    inject_initial_webview_state(&webview, config_json);
+    Ok(webview)
+}
+
+/// Run the tao event loop for the settings window.
+#[cfg(not(target_os = "linux"))]
+fn run_tao_settings_loop<F: FnOnce(SettingsWindowGeometry) + 'static>(
+    event_loop: &mut tao::event_loop::EventLoop<TaoUserEvent>,
+    window: tao::window::Window,
+    on_close: std::cell::RefCell<Option<F>>,
+) {
+    use tao::event_loop::ControlFlow;
+    use tao::platform::run_return::EventLoopExtRunReturn;
+
+    let target_window_id = window.id();
+    let modifiers = std::cell::RefCell::new(tao::keyboard::ModifiersState::default());
+
+    event_loop.run_return(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+        handle_tao_event(event, &window, &on_close, &modifiers, target_window_id, control_flow);
+    });
+}
+
+/// Handle a single tao event for the settings window.
+#[cfg(not(target_os = "linux"))]
+fn handle_tao_event<F: FnOnce(SettingsWindowGeometry)>(
+    event: tao::event::Event<TaoUserEvent>,
+    window: &tao::window::Window,
+    on_close: &std::cell::RefCell<Option<F>>,
+    modifiers: &std::cell::RefCell<tao::keyboard::ModifiersState>,
+    target_window_id: tao::window::WindowId,
+    control_flow: &mut tao::event_loop::ControlFlow,
+) {
+    use tao::event::Event;
+    use tao::event::WindowEvent;
+    use tao::event_loop::ControlFlow;
+
+    match event {
+        Event::UserEvent(TaoUserEvent::FocusWindow) => window.set_focus(),
+        Event::UserEvent(TaoUserEvent::QuitWindow) => {
+            *control_flow = ControlFlow::Exit;
+        }
+        Event::WindowEvent {
+            event: WindowEvent::ModifiersChanged(new_mods),
+            window_id: id,
+            ..
+        } if id == target_window_id => {
+            *modifiers.borrow_mut() = new_mods;
+        }
+        Event::WindowEvent {
+            event: WindowEvent::KeyboardInput { event, .. },
+            window_id: id,
+            ..
+        } if id == target_window_id
+            && is_macos_close_window_shortcut(&event, *modifiers.borrow()) =>
+        {
+            fire_on_close(window, on_close);
+            *control_flow = ControlFlow::Exit;
+        }
+        Event::WindowEvent { event: WindowEvent::CloseRequested, .. }
+        | Event::UserEvent(TaoUserEvent::Terminate) => {
+            fire_on_close(window, on_close);
+            *control_flow = ControlFlow::Exit;
+        }
+        Event::WindowEvent { event: WindowEvent::Destroyed, window_id: id, .. }
+            if id == target_window_id =>
+        {
+            *control_flow = ControlFlow::Exit;
+        }
+        _ => {}
     }
 }
 

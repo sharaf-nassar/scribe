@@ -9,6 +9,35 @@ use crate::layout::Rect;
 const COMMAND_PALETTE_MIN_COLS: usize = 32;
 const COMMAND_PALETTE_MAX_COLS: usize = 72;
 const COMMAND_PALETTE_MAX_ITEMS: usize = 8;
+/// Overlay layout never needs more than this many grid units, which keeps the
+/// integer-to-float conversion exact for pixel placement.
+const MAX_OVERLAY_GRID_UNITS: usize = 65_535;
+type GlyphResolver<'a> = dyn FnMut(char) -> ([f32; 2], [f32; 2]) + 'a;
+
+pub struct CommandPaletteBuildContext<'a> {
+    pub out: &'a mut Vec<CellInstance>,
+    pub viewport: Rect,
+    pub cell_size: (f32, f32),
+    pub chrome: &'a ChromeColors,
+    pub items: &'a [String],
+    pub resolve_glyph: &'a mut GlyphResolver<'a>,
+}
+
+fn overlay_grid_units(units: usize) -> u16 {
+    u16::try_from(units.min(MAX_OVERLAY_GRID_UNITS)).unwrap_or(u16::MAX)
+}
+
+fn overlay_grid_width(cols: usize, cell_w: f32) -> f32 {
+    f32::from(overlay_grid_units(cols)) * cell_w
+}
+
+fn overlay_grid_height(rows: usize, cell_h: f32) -> f32 {
+    f32::from(overlay_grid_units(rows)) * cell_h
+}
+
+fn overlay_grid_y(origin: f32, row: usize, cell_h: f32) -> f32 {
+    origin + overlay_grid_height(row, cell_h)
+}
 
 pub struct CommandPalette {
     active: bool,
@@ -84,46 +113,50 @@ impl CommandPalette {
         }
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "overlay builder needs output vec, viewport, cell size, chrome colors, and glyph resolver"
-    )]
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
-        reason = "overlay dimensions are derived from viewport and cell sizes and fit within usize/f32 bounds"
-    )]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "overlay builder emits multiple rows of text, background, border, and selection states"
-    )]
-    pub fn build_instances(
-        &self,
-        out: &mut Vec<CellInstance>,
-        viewport: Rect,
-        cell_size: (f32, f32),
-        chrome: &ChromeColors,
-        items: &[String],
-        resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-    ) {
+    pub fn build_instances(&self, ctx: CommandPaletteBuildContext<'_>) {
+        let CommandPaletteBuildContext { out, viewport, cell_size, chrome, items, resolve_glyph } =
+            ctx;
         if !self.active {
             return;
         }
 
-        let (cell_w, cell_h) = cell_size;
-        if cell_w <= 0.0 || cell_h <= 0.0 {
-            return;
-        }
-
         let colors = CommandPaletteColors::from_chrome(chrome);
-        let visible_items = items.len().min(COMMAND_PALETTE_MAX_ITEMS);
-        let query_text = if self.query.is_empty() {
-            String::from("Type a command or profile name")
-        } else {
-            self.query.clone()
+        let Some(layout) = CommandPaletteLayout::new(self, viewport, cell_size, items) else {
+            return;
         };
 
+        let mut renderer = CommandPaletteRenderer::new(out, cell_size.0, resolve_glyph);
+        push_solid_rect(renderer.out, viewport, colors.backdrop);
+        draw_command_palette_frame(renderer.out, &layout, &colors);
+        draw_command_palette_text(&mut renderer, &layout, &colors, cell_size.1, items);
+    }
+}
+
+struct CommandPaletteLayout {
+    overlay: Rect,
+    visible_items: usize,
+    query_text: String,
+    selected: usize,
+}
+
+impl CommandPaletteLayout {
+    fn new(
+        palette: &CommandPalette,
+        viewport: Rect,
+        cell_size: (f32, f32),
+        items: &[String],
+    ) -> Option<Self> {
+        let (cell_w, cell_h) = cell_size;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+
+        let visible_items = items.len().min(COMMAND_PALETTE_MAX_ITEMS);
+        let query_text = if palette.query.is_empty() {
+            String::from("Type a command or profile name")
+        } else {
+            palette.query.clone()
+        };
         let max_text_cols = items
             .iter()
             .take(COMMAND_PALETTE_MAX_ITEMS)
@@ -133,8 +166,8 @@ impl CommandPalette {
             .unwrap_or(COMMAND_PALETTE_MIN_COLS);
         let overlay_cols = max_text_cols.clamp(COMMAND_PALETTE_MIN_COLS, COMMAND_PALETTE_MAX_COLS);
         let overlay_rows = visible_items + 2;
-        let overlay_width = overlay_cols as f32 * cell_w;
-        let overlay_height = overlay_rows as f32 * cell_h;
+        let overlay_width = overlay_grid_width(overlay_cols, cell_w);
+        let overlay_height = overlay_grid_height(overlay_rows, cell_h);
         let overlay = Rect {
             x: viewport.x + ((viewport.width - overlay_width) / 2.0).max(0.0),
             y: viewport.y + ((viewport.height - overlay_height) / 4.0).max(0.0),
@@ -142,118 +175,162 @@ impl CommandPalette {
             height: overlay_height,
         };
 
-        push_solid_rect(out, viewport, colors.backdrop);
-        push_solid_rect(out, overlay, colors.bg);
-        push_solid_rect(
-            out,
-            Rect { x: overlay.x, y: overlay.y, width: overlay.width, height: 1.0 },
-            colors.border,
-        );
-        push_solid_rect(
-            out,
-            Rect {
-                x: overlay.x,
-                y: overlay.y + overlay.height - 1.0,
-                width: overlay.width,
-                height: 1.0,
-            },
-            colors.border,
-        );
-        push_solid_rect(
-            out,
-            Rect { x: overlay.x, y: overlay.y, width: 1.0, height: overlay.height },
-            colors.border,
-        );
-        push_solid_rect(
-            out,
-            Rect {
-                x: overlay.x + overlay.width - 1.0,
-                y: overlay.y,
-                width: 1.0,
-                height: overlay.height,
-            },
-            colors.border,
-        );
-        push_solid_rect(
-            out,
-            Rect {
-                x: overlay.x + 1.0,
-                y: overlay.y + cell_h,
-                width: (overlay.width - 2.0).max(0.0),
-                height: (cell_h - 1.0).max(0.0),
-            },
-            colors.input_bg,
-        );
+        Some(Self { overlay, visible_items, query_text, selected: palette.selected })
+    }
+}
 
-        emit_text_line(
-            out,
-            "Command Palette",
-            overlay.x + cell_w,
-            overlay.y,
-            colors.header_fg,
-            colors.bg,
-            cell_w,
-            resolve_glyph,
-        );
-        emit_text_line(
-            out,
-            ">",
-            overlay.x + cell_w,
-            overlay.y + cell_h,
-            colors.border,
-            colors.input_bg,
-            cell_w,
-            resolve_glyph,
-        );
-        emit_text_line(
-            out,
-            &query_text,
-            overlay.x + 2.0 * cell_w,
-            overlay.y + cell_h,
-            if self.query.is_empty() { colors.placeholder_fg } else { colors.query_fg },
-            colors.input_bg,
-            cell_w,
-            resolve_glyph,
-        );
+fn draw_command_palette_frame(
+    out: &mut Vec<CellInstance>,
+    layout: &CommandPaletteLayout,
+    colors: &CommandPaletteColors,
+) {
+    push_solid_rect(out, layout.overlay, colors.bg);
+    push_solid_rect(
+        out,
+        Rect { x: layout.overlay.x, y: layout.overlay.y, width: layout.overlay.width, height: 1.0 },
+        colors.border,
+    );
+    push_solid_rect(
+        out,
+        Rect {
+            x: layout.overlay.x,
+            y: layout.overlay.y + layout.overlay.height - 1.0,
+            width: layout.overlay.width,
+            height: 1.0,
+        },
+        colors.border,
+    );
+    push_solid_rect(
+        out,
+        Rect {
+            x: layout.overlay.x,
+            y: layout.overlay.y,
+            width: 1.0,
+            height: layout.overlay.height,
+        },
+        colors.border,
+    );
+    push_solid_rect(
+        out,
+        Rect {
+            x: layout.overlay.x + layout.overlay.width - 1.0,
+            y: layout.overlay.y,
+            width: 1.0,
+            height: layout.overlay.height,
+        },
+        colors.border,
+    );
+    push_solid_rect(
+        out,
+        Rect {
+            x: layout.overlay.x + 1.0,
+            y: layout.overlay.y + (layout.overlay.height / 2.0),
+            width: (layout.overlay.width - 2.0).max(0.0),
+            height: (layout.overlay.height / 2.0 - 1.0).max(0.0),
+        },
+        colors.input_bg,
+    );
+}
 
-        for (index, item) in items.iter().take(COMMAND_PALETTE_MAX_ITEMS).enumerate() {
-            let row_y = overlay.y + (index + 2) as f32 * cell_h;
-            let selected = index == self.selected;
-            if selected {
-                push_solid_rect(
-                    out,
-                    Rect {
-                        x: overlay.x + 1.0,
-                        y: row_y,
-                        width: (overlay.width - 2.0).max(0.0),
-                        height: cell_h,
-                    },
-                    colors.selection_bg,
-                );
-            }
-            emit_text_line(
-                out,
-                item,
-                overlay.x + cell_w,
-                row_y,
-                if selected { colors.selection_fg } else { colors.item_fg },
-                if selected { colors.selection_bg } else { colors.bg },
-                cell_w,
-                resolve_glyph,
+fn draw_command_palette_text(
+    renderer: &mut CommandPaletteRenderer<'_>,
+    layout: &CommandPaletteLayout,
+    colors: &CommandPaletteColors,
+    cell_h: f32,
+    items: &[String],
+) {
+    let cell_w = renderer.cell_w;
+    renderer.emit_text_line(
+        "Command Palette",
+        layout.overlay.x + cell_w,
+        layout.overlay.y,
+        TextColors { fg: colors.header_fg, bg: colors.bg },
+    );
+    renderer.emit_text_line(
+        ">",
+        layout.overlay.x + cell_w,
+        layout.overlay.y + cell_h,
+        TextColors { fg: colors.border, bg: colors.input_bg },
+    );
+    renderer.emit_text_line(
+        &layout.query_text,
+        layout.overlay.x + 2.0 * cell_w,
+        layout.overlay.y + cell_h,
+        TextColors {
+            fg: if layout.query_text.is_empty() { colors.placeholder_fg } else { colors.query_fg },
+            bg: colors.input_bg,
+        },
+    );
+
+    for (index, item) in items.iter().take(COMMAND_PALETTE_MAX_ITEMS).enumerate() {
+        let row_y = overlay_grid_y(layout.overlay.y, index + 2, cell_h);
+        let selected = index == layout.selected;
+        if selected {
+            push_solid_rect(
+                renderer.out,
+                Rect {
+                    x: layout.overlay.x + 1.0,
+                    y: row_y,
+                    width: (layout.overlay.width - 2.0).max(0.0),
+                    height: cell_h,
+                },
+                colors.selection_bg,
             );
         }
+        renderer.emit_text_line(
+            item,
+            layout.overlay.x + cell_w,
+            row_y,
+            TextColors {
+                fg: if selected { colors.selection_fg } else { colors.item_fg },
+                bg: if selected { colors.selection_bg } else { colors.bg },
+            },
+        );
+    }
 
-        if visible_items == 0 {
-            emit_text_line(
-                out,
-                "No matching commands",
-                overlay.x + cell_w,
-                overlay.y + 2.0 * cell_h,
-                colors.placeholder_fg,
-                colors.bg,
-                cell_w,
-                resolve_glyph,
-            );
+    if layout.visible_items == 0 {
+        renderer.emit_text_line(
+            "No matching commands",
+            layout.overlay.x + cell_w,
+            layout.overlay.y + 2.0 * cell_h,
+            TextColors { fg: colors.placeholder_fg, bg: colors.bg },
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TextColors {
+    fg: [f32; 4],
+    bg: [f32; 4],
+}
+
+struct CommandPaletteRenderer<'a> {
+    out: &'a mut Vec<CellInstance>,
+    cell_w: f32,
+    resolve_glyph: &'a mut GlyphResolver<'a>,
+}
+
+impl<'a> CommandPaletteRenderer<'a> {
+    fn new(
+        out: &'a mut Vec<CellInstance>,
+        cell_w: f32,
+        resolve_glyph: &'a mut GlyphResolver<'a>,
+    ) -> Self {
+        Self { out, cell_w, resolve_glyph }
+    }
+
+    fn emit_text_line(&mut self, text: &str, start_x: f32, y: f32, colors: TextColors) {
+        for (idx, ch) in text.chars().enumerate() {
+            let (uv_min, uv_max) = (self.resolve_glyph)(ch);
+            self.out.push(CellInstance {
+                pos: [start_x + overlay_grid_width(idx, self.cell_w), y],
+                size: [0.0, 0.0],
+                uv_min,
+                uv_max,
+                fg_color: colors.fg,
+                bg_color: colors.bg,
+                corner_radius: 0.0,
+            });
         }
     }
 }
@@ -306,37 +383,4 @@ impl CommandPaletteColors {
 
 fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
     out.push(scribe_renderer::chrome::solid_quad(rect.x, rect.y, rect.width, rect.height, color));
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "text emission needs the output buffer, layout coordinates, colors, and glyph resolver"
-)]
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "command palette rows are bounded to a handful of columns and safely fit in f32"
-)]
-fn emit_text_line(
-    out: &mut Vec<CellInstance>,
-    text: &str,
-    start_x: f32,
-    y: f32,
-    fg: [f32; 4],
-    bg: [f32; 4],
-    cell_w: f32,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
-    for (idx, ch) in text.chars().enumerate() {
-        let (uv_min, uv_max) = resolve_glyph(ch);
-        out.push(CellInstance {
-            pos: [start_x + idx as f32 * cell_w, y],
-            size: [0.0, 0.0],
-            uv_min,
-            uv_max,
-            fg_color: fg,
-            bg_color: bg,
-            corner_radius: 0.0,
-            _pad: 0.0,
-        });
-    }
 }

@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
-use scribe_common::ids::SessionId;
 use scribe_common::protocol::{PromptMarkKind, SessionContext};
 
 /// Maximum length for window title strings (chars). Longer titles are truncated.
@@ -41,30 +40,14 @@ pub enum MetadataEvent {
     },
 }
 
-/// Stateful parser that extracts OSC metadata from a VTE Perform implementation.
-pub struct MetadataParser {
-    session_id: SessionId,
-}
+/// Stateless parser helpers that extract OSC metadata from a VTE Perform implementation.
+pub struct MetadataParser;
 
 impl MetadataParser {
-    #[must_use]
-    pub fn new(session_id: SessionId) -> Self {
-        Self { session_id }
-    }
-
-    #[must_use]
-    pub fn session_id(&self) -> SessionId {
-        self.session_id
-    }
-
     /// Process an OSC sequence and return a metadata event if one was extracted.
     /// The `params` slice contains the semicolon-delimited parts.
     #[must_use]
-    #[allow(
-        clippy::unused_self,
-        reason = "Consistent API: process_* methods take &self for future extensibility"
-    )]
-    pub fn process_osc(&self, params: &[&[u8]]) -> Option<MetadataEvent> {
+    pub fn process_osc(params: &[&[u8]]) -> Option<MetadataEvent> {
         let osc_number = params.first()?;
 
         match *osc_number {
@@ -78,11 +61,7 @@ impl MetadataParser {
 
     /// Process a C0 control byte and return a metadata event if applicable.
     #[must_use]
-    #[allow(
-        clippy::unused_self,
-        reason = "Consistent API: process_* methods take &self for future extensibility"
-    )]
-    pub fn process_execute(&self, byte: u8) -> Option<MetadataEvent> {
+    pub fn process_execute(byte: u8) -> Option<MetadataEvent> {
         if byte == 0x07 { Some(MetadataEvent::Bell) } else { None }
     }
 
@@ -446,10 +425,9 @@ fn hex_digit_value(b: u8) -> Option<u8> {
 mod tests {
     use super::{MetadataEvent, MetadataParser};
     use scribe_common::ai_state::{AiProvider, AiState};
-    use scribe_common::ids::SessionId;
 
     fn parse_iterm2(payload: &[&[u8]]) -> Option<MetadataEvent> {
-        MetadataParser::new(SessionId::new()).process_osc(payload)
+        MetadataParser::process_osc(payload)
     }
 
     #[test]

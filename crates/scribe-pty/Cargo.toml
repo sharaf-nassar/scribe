@@ -15,4 +15,4 @@ alacritty_terminal.workspace = true
 tokio.workspace = true
 vte.workspace = true
 tracing.workspace = true
-libc.workspace = true
+rustix.workspace = true

@@ -22,13 +22,11 @@ pub struct PaneId(u32);
 
 impl PaneId {
     /// Create a `PaneId` from a raw `u32` value.
-    #[allow(dead_code, reason = "public API for external pane ID construction")]
     pub const fn from_raw(value: u32) -> Self {
         Self(value)
     }
 
     /// Return the inner `u32` value.
-    #[allow(dead_code, reason = "public API for pane ID inspection")]
     pub const fn raw(self) -> u32 {
         self.0
     }
@@ -82,26 +80,79 @@ impl Rect {
 ///
 /// Internal edges — those adjacent to a sibling pane — should not have
 /// content padding applied, preventing visual gaps between panes.
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "four independent directional flags; each is semantically distinct and no state machine applies"
-)]
+#[derive(Debug, Clone, Copy)]
+struct VerticalPaneEdges {
+    top: bool,
+    bottom: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HorizontalPaneEdges {
+    right: bool,
+    left: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PaneEdges {
-    /// True when the top edge borders the viewport (not another pane).
-    pub top: bool,
-    /// True when the right edge borders the viewport.
-    pub right: bool,
-    /// True when the bottom edge borders the viewport.
-    pub bottom: bool,
-    /// True when the left edge borders the viewport.
-    pub left: bool,
+    vertical: VerticalPaneEdges,
+    horizontal: HorizontalPaneEdges,
 }
 
 impl PaneEdges {
     /// All edges are external (single pane, no adjacent siblings).
     pub const fn all_external() -> Self {
-        Self { top: true, right: true, bottom: true, left: true }
+        Self {
+            vertical: VerticalPaneEdges { top: true, bottom: true },
+            horizontal: HorizontalPaneEdges { right: true, left: true },
+        }
+    }
+
+    /// Return `true` when the top edge borders the viewport.
+    pub const fn top(self) -> bool {
+        self.vertical.top
+    }
+
+    /// Return `true` when the right edge borders the viewport.
+    pub const fn right(self) -> bool {
+        self.horizontal.right
+    }
+
+    /// Return `true` when the bottom edge borders the viewport.
+    pub const fn bottom(self) -> bool {
+        self.vertical.bottom
+    }
+
+    /// Return `true` when the left edge borders the viewport.
+    pub const fn left(self) -> bool {
+        self.horizontal.left
+    }
+
+    const fn without_right(self) -> Self {
+        Self {
+            vertical: self.vertical,
+            horizontal: HorizontalPaneEdges { right: false, left: self.horizontal.left },
+        }
+    }
+
+    const fn without_left(self) -> Self {
+        Self {
+            vertical: self.vertical,
+            horizontal: HorizontalPaneEdges { right: self.horizontal.right, left: false },
+        }
+    }
+
+    const fn without_bottom(self) -> Self {
+        Self {
+            vertical: VerticalPaneEdges { top: self.vertical.top, bottom: false },
+            horizontal: self.horizontal,
+        }
+    }
+
+    const fn without_top(self) -> Self {
+        Self {
+            vertical: VerticalPaneEdges { top: false, bottom: self.vertical.bottom },
+            horizontal: self.horizontal,
+        }
     }
 }
 
@@ -190,12 +241,6 @@ impl LayoutTree {
         close_node(&mut self.root, pane_id)
     }
 
-    /// Find a pane in the tree.
-    #[allow(dead_code, reason = "public API for pane lookup")]
-    pub fn find_pane(&self, pane_id: PaneId) -> Option<&LayoutNode> {
-        find_node(&self.root, pane_id)
-    }
-
     /// Cycle to the next pane after `current` in a depth-first order.
     ///
     /// Wraps around to the first pane if `current` is the last.
@@ -212,22 +257,15 @@ impl LayoutTree {
     /// Find the split containing `pane_id` and adjust its ratio.
     ///
     /// Returns `true` if the pane was found and the ratio was adjusted.
-    #[allow(dead_code, reason = "retained for API completeness; drag now uses set_ratio_for_pane")]
-    pub fn adjust_ratio(&mut self, pane_id: PaneId, delta: f32) -> bool {
-        adjust_ratio_node(&mut self.root, pane_id, delta)
-    }
-
     /// Find the split containing `pane_id` and set its ratio to an absolute value.
     ///
     /// The ratio is clamped to `[MIN_RATIO, MAX_RATIO]`. Returns `true` if the
     /// pane was found and the ratio was set, `false` otherwise.
-    #[allow(dead_code, reason = "public API for drag-resize integration")]
     pub fn set_ratio_for_pane(&mut self, pane_id: PaneId, new_ratio: f32) -> bool {
         set_ratio_node(&mut self.root, pane_id, new_ratio)
     }
 
     /// Set every split node's ratio to `DEFAULT_RATIO` (0.5).
-    #[allow(dead_code, reason = "public API for equalize-all-panes interaction")]
     pub fn equalize_all_ratios(&mut self) {
         equalize_node(&mut self.root);
     }
@@ -248,16 +286,15 @@ impl LayoutTree {
     /// direction, focus wraps to the opposite edge while preserving
     /// perpendicular-axis overlap. Returns `None` only when no matching pane
     /// exists or `current` is not present in `rects`.
-    #[allow(
-        clippy::unused_self,
-        reason = "method semantically belongs to LayoutTree even though rects are pre-computed"
-    )]
     pub fn find_pane_in_direction(
         &self,
         current: PaneId,
         direction: FocusDirection,
         rects: &[(PaneId, Rect, PaneEdges)],
     ) -> Option<PaneId> {
+        if !contains_pane(&self.root, current) {
+            return None;
+        }
         let current_rect = rects.iter().find(|(id, _, _)| *id == current).map(|(_, r, _)| r)?;
         best_candidate_in_direction(*current_rect, current, direction, rects)
             .or_else(|| wrapped_candidate_in_direction(*current_rect, current, direction, rects))
@@ -322,11 +359,11 @@ fn split_edges(edges: PaneEdges, direction: SplitDirection) -> (PaneEdges, PaneE
     match direction {
         SplitDirection::Horizontal => {
             // Left | Right: first child loses right edge, second loses left.
-            (PaneEdges { right: false, ..edges }, PaneEdges { left: false, ..edges })
+            (edges.without_right(), edges.without_left())
         }
         SplitDirection::Vertical => {
             // Top / Bottom: first child loses bottom, second loses top.
-            (PaneEdges { bottom: false, ..edges }, PaneEdges { top: false, ..edges })
+            (edges.without_bottom(), edges.without_top())
         }
     }
 }
@@ -390,18 +427,6 @@ fn take_node(boxed: &mut Box<LayoutNode>) -> LayoutNode {
     std::mem::replace(boxed.as_mut(), LayoutNode::Leaf(PaneId(u32::MAX)))
 }
 
-/// Recursively find a node containing the given pane ID.
-#[allow(dead_code, reason = "called by find_pane which is part of the public API")]
-fn find_node(node: &LayoutNode, target: PaneId) -> Option<&LayoutNode> {
-    match node {
-        LayoutNode::Leaf(id) if *id == target => Some(node),
-        LayoutNode::Leaf(_) => None,
-        LayoutNode::Split { first, second, .. } => {
-            find_node(first, target).or_else(|| find_node(second, target))
-        }
-    }
-}
-
 /// Collect all leaf IDs in depth-first order.
 fn collect_leaves(node: &LayoutNode) -> Vec<PaneId> {
     let mut out = Vec::new();
@@ -442,27 +467,7 @@ fn contains_pane(node: &LayoutNode, target: PaneId) -> bool {
 }
 
 /// Recursively find the split containing `target` (as a direct child)
-/// and adjust its ratio by `delta`, clamping to `[MIN_RATIO, MAX_RATIO]`.
-#[allow(dead_code, reason = "called by adjust_ratio which is retained for API completeness")]
-fn adjust_ratio_node(node: &mut LayoutNode, target: PaneId, delta: f32) -> bool {
-    let LayoutNode::Split { ratio, first, second, .. } = node else {
-        return false;
-    };
-
-    let first_is_target = matches!(first.as_ref(), LayoutNode::Leaf(id) if *id == target);
-    let second_is_target = matches!(second.as_ref(), LayoutNode::Leaf(id) if *id == target);
-
-    if first_is_target || second_is_target {
-        *ratio = (*ratio + delta).clamp(MIN_RATIO, MAX_RATIO);
-        return true;
-    }
-
-    adjust_ratio_node(first, target, delta) || adjust_ratio_node(second, target, delta)
-}
-
-/// Recursively find the split containing `target` (as a direct child)
 /// and set its ratio to `new_ratio`, clamping to `[MIN_RATIO, MAX_RATIO]`.
-#[allow(dead_code, reason = "called by set_ratio_for_pane which is part of the public API")]
 fn set_ratio_node(node: &mut LayoutNode, target: PaneId, new_ratio: f32) -> bool {
     let LayoutNode::Split { ratio, first, second, .. } = node else {
         return false;
@@ -494,7 +499,6 @@ fn count_pane_leaves(node: &LayoutNode) -> u32 {
 /// For a split with `L` leaves on the left and `R` on the right, the ratio
 /// is set to `L / (L + R)`.  This ensures each pane gets `1 / total_panes`
 /// of the available space regardless of tree shape.
-#[allow(dead_code, reason = "called by equalize_all_ratios which is part of the public API")]
 fn equalize_node(node: &mut LayoutNode) {
     let LayoutNode::Split { ratio, first, second, .. } = node else {
         return;
@@ -502,13 +506,9 @@ fn equalize_node(node: &mut LayoutNode) {
 
     let left = count_pane_leaves(first);
     let right = count_pane_leaves(second);
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "pane count is tiny, f32 is exact for small integers"
-    )]
-    {
-        *ratio = left as f32 / (left + right) as f32;
-    }
+    let left_f = f32::from(u16::try_from(left).unwrap_or(u16::MAX));
+    let total_f = f32::from(u16::try_from(left + right).unwrap_or(u16::MAX));
+    *ratio = left_f / total_f;
     equalize_node(first);
     equalize_node(second);
 }

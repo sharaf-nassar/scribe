@@ -230,6 +230,12 @@ impl SyncUpdateFrameSplitter {
         frames
     }
 
+    /// Whether a synchronized update is still open.
+    #[must_use]
+    pub fn inside_sync(&self) -> bool {
+        self.inside_sync
+    }
+
     /// Flush any pending partial escape bytes plus buffered raw content.
     pub fn flush(&mut self) -> Option<Vec<u8>> {
         self.drain_pending_non_sync();
@@ -238,6 +244,26 @@ impl SyncUpdateFrameSplitter {
         }
 
         self.inside_sync = false;
+        (!self.current.is_empty()).then(|| std::mem::take(&mut self.current))
+    }
+
+    /// Flush a timed-out synchronized update as visible bytes.
+    ///
+    /// Unlike [`Self::flush`], this strips the leading BSU marker so callers
+    /// can replay buffered content without re-entering synchronized-update
+    /// mode after the timeout has already expired.
+    pub fn flush_timed_out(&mut self) -> Option<Vec<u8>> {
+        self.drain_pending_non_sync();
+        if !self.pending.is_empty() {
+            self.current.append(&mut self.pending);
+        }
+
+        self.inside_sync = false;
+
+        if self.current.starts_with(&BSU_CSI) {
+            self.current.drain(..BSU_CSI.len());
+        }
+
         (!self.current.is_empty()).then(|| std::mem::take(&mut self.current))
     }
 

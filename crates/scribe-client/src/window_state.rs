@@ -2,14 +2,10 @@
 //!
 //! Stores window position, size, maximized state, and monitor name in
 //! `$XDG_STATE_HOME/scribe/state.toml` (defaults to `~/.local/state/scribe/state.toml`).
-//! Uses a generic `StateStore<T>` that can be reused for other client-side
-//! runtime state in the future.
 
-use std::marker::PhantomData;
 use std::path::PathBuf;
 
 use scribe_common::app::current_state_dir;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -33,75 +29,6 @@ pub enum StateError {
     #[error("TOML serialize error: {0}")]
     Serialize(#[from] toml::ser::Error),
 }
-
-// ---------------------------------------------------------------------------
-// StateStore<T>
-// ---------------------------------------------------------------------------
-
-/// Generic persistent state store backed by a TOML file.
-///
-/// Resolves `$XDG_STATE_HOME/scribe/<filename>` once at construction and
-/// provides `load`/`save` with graceful degradation on errors.
-#[allow(dead_code, reason = "generic state store retained for future client-side state")]
-pub struct StateStore<T> {
-    path: Option<PathBuf>,
-    _marker: PhantomData<T>,
-}
-
-#[allow(dead_code, reason = "generic state store retained for future client-side state")]
-impl<T: Serialize + DeserializeOwned + Default> StateStore<T> {
-    /// Load state from `$XDG_STATE_HOME/scribe/<filename>`.
-    ///
-    /// Returns a store with `Default::default()` data if the file is absent,
-    /// unreadable, or unparseable.
-    pub fn load(filename: &str) -> (Self, T) {
-        let path = current_state_dir().map(|dir| dir.join(filename));
-
-        let data = path.as_ref().map_or_else(
-            || {
-                tracing::info!("no XDG state directory found, using defaults");
-                T::default()
-            },
-            |p| match std::fs::read_to_string(p) {
-                Ok(content) => toml::from_str(&content).unwrap_or_else(|e| {
-                    tracing::warn!(path = %p.display(), error = %e, "state file parse error, using defaults");
-                    T::default()
-                }),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    tracing::info!(path = %p.display(), "no state file found, using defaults");
-                    T::default()
-                }
-                Err(e) => {
-                    tracing::warn!(path = %p.display(), error = %e, "failed to read state file, using defaults");
-                    T::default()
-                }
-            },
-        );
-
-        (Self { path, _marker: PhantomData }, data)
-    }
-
-    /// Write state to the backing file.
-    ///
-    /// Creates parent directories if they do not exist.
-    pub fn save(&self, data: &T) -> Result<(), StateError> {
-        let path = self.path.as_ref().ok_or(StateError::NoStateDir)?;
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let content = toml::to_string_pretty(data)?;
-        std::fs::write(path, content)?;
-
-        tracing::debug!(path = %path.display(), "window state saved");
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WindowGeometry
-// ---------------------------------------------------------------------------
 
 /// Persisted window geometry and display state.
 ///
@@ -188,21 +115,6 @@ impl WindowRegistry {
         }
     }
 
-    /// List all saved window IDs (for startup restoration).
-    #[allow(dead_code, reason = "public API for future multi-window startup restoration")]
-    pub fn saved_window_ids(&self) -> Vec<scribe_common::ids::WindowId> {
-        let Some(dir) = &self.dir else { return Vec::new() };
-        let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-        entries
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let name = entry.file_name();
-                let stem = std::path::Path::new(&name).file_stem()?.to_str()?;
-                stem.parse::<scribe_common::ids::WindowId>().ok()
-            })
-            .collect()
-    }
-
     /// Migrate the legacy `state.toml` into a per-window file.
     ///
     /// Called on first startup when no window files exist yet. Creates a file
@@ -239,28 +151,23 @@ impl WindowRegistry {
 ///
 /// On Wayland, `outer_position()` is unavailable — position is stored as
 /// `None` rather than a misleading `(0, 0)`.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "logical window coordinates are small enough for i32/u32"
-)]
 pub fn capture_window_geometry(window: &Window) -> WindowGeometry {
     let scale = window.scale_factor();
-    let size: winit::dpi::LogicalSize<f64> = window.outer_size().to_logical(scale);
+    let size = window.outer_size().to_logical::<u32>(scale);
     let pos = window.outer_position().ok();
     let monitor_name = window.current_monitor().and_then(|m| m.name());
 
     WindowGeometry {
         x: pos.map(|p| {
-            let lp: winit::dpi::LogicalPosition<f64> = p.to_logical(scale);
-            lp.x as i32
+            let lp = p.to_logical::<i32>(scale);
+            lp.x
         }),
         y: pos.map(|p| {
-            let lp: winit::dpi::LogicalPosition<f64> = p.to_logical(scale);
-            lp.y as i32
+            let lp = p.to_logical::<i32>(scale);
+            lp.y
         }),
-        width: size.width as u32,
-        height: size.height as u32,
+        width: size.width,
+        height: size.height,
         maximized: window.is_maximized(),
         monitor_name,
     }

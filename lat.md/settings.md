@@ -54,7 +54,7 @@ AI page consolidates all AI integration settings including Prompt Bar, Scroll Pi
 
 The Prompt Bar section title includes a "Customize colors" crosslink that switches to the Colors page and scrolls to the Prompt Bar color overrides.
 
-Clipboard cleanup remains persisted as `claude_copy_cleanup` for backward compatibility. `hide_codex_hook_logs` defaults to false and suppresses full Codex hook log blocks for the documented hook events (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`), including bullet-prefixed `Running ... hook: ...` lines, non-`completed` trailers, nested hook output, and only the first trailing raw whitespace-only spacer line. Interactive Codex can repaint completion rows without newline terminators, so the filter hides only the visible hook portion and leaves the following cursor-move redraw bytes intact; if the removed hook prefix had already established the gray prompt background or other inherited SGR styling, the kept tail restores that active style state before replaying the remaining bytes. Synchronized-update trimming keeps prompt repaint tails in the same atomic block, splits legacy `Running ... hook` rows away from later repaint bytes, and drops reset-only newline tails so hidden hook rows do not become blank spacer rows, while still preserving ANSI-painted blank redraw lines for Codex startup chrome. The client no longer collapses blank rows after render because that heuristic could move legitimate Codex prompt/layout rows upward. `scroll_pin` now defaults to false so AI history keeps the normal contiguous scrollback unless the user explicitly opts into split-scroll. The filter still fails open if the block never closes.
+Clipboard cleanup remains persisted as `claude_copy_cleanup` for backward compatibility. `hide_codex_hook_logs` defaults to false and suppresses full Codex hook log blocks for the documented hook events (`SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, and `Stop`), including bullet-prefixed `Running ... hook: ...` lines, non-`completed` trailers, nested hook output, and only the first trailing raw whitespace-only spacer line. Interactive Codex can repaint completion rows without newline terminators, so the filter hides only the visible hook portion and leaves the following cursor-move redraw bytes intact; if the removed hook prefix had already established the gray prompt background or other inherited SGR styling, the kept tail restores that active style state before replaying the remaining bytes. Synchronized-update trimming keeps prompt repaint tails in the same atomic block, splits legacy `Running ... hook` rows away from later repaint bytes, and drops reset-only newline tails so hidden hook rows do not become blank spacer rows, while still preserving ANSI-painted blank redraw lines for Codex startup chrome. `preserve_ai_scrollback` now trims repeated AI redraw clears back to the first preserved history size, so earlier shell output survives without duplicate Claude/Codex transcript frames stacking up in scrollback. The client no longer collapses blank rows after render because that heuristic could move legitimate Codex prompt/layout rows upward. `scroll_pin` now defaults to false so AI history keeps the normal contiguous scrollback unless the user explicitly opts into split-scroll. The filter still fails open if the block never closes.
 
 `terminal.ai_tab_provider` is compatibility-only legacy state; AI tab shortcuts are configured through `new_claude_tab`, `new_claude_resume_tab`, `new_codex_tab`, and `new_codex_resume_tab`.
 
@@ -69,6 +69,12 @@ Actions cover: pane splits, focus directions, workspace splits, workspace cyclin
 ### Update Keys
 
 Controls the auto-update behavior: `enabled` (bool), `check_interval` (integer hours, 1–168, stored internally as seconds), and `channel` (stable/beta) to select the release track.
+
+### Notification Keys
+
+Desktop notification settings: `enabled` (bool) and `condition` (when to fire).
+
+`enabled` (default true) toggles notifications on or off. `condition` selects `when_unfocused` (default, only when the OS window lacks focus) or `when_unfocused_or_background_tab` (also when the session is on a background tab in a focused window).
 
 ### Workspace Keys
 

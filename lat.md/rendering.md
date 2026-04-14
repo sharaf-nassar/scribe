@@ -32,6 +32,12 @@ Basic ANSI colours 0-7 become indices 8-15, and the semantic `Foreground` become
 
 The [[crates/scribe-renderer/src/atlas.rs#GlyphAtlas]] rasterizes glyphs via cosmic-text and caches them in a 1024x1024 RGBA8 texture.
 
+### DPI Scaling
+
+Font sizes and chrome dimensions are multiplied by `window.scale_factor()` so the UI renders at the native physical resolution.
+
+The wgpu surface operates in physical pixels (e.g. 2x on Retina), so raw config values would appear at half the expected size without scaling. The client stores `scale_factor` on [[crates/scribe-client/src/main.rs#App]] and applies it to: font sizes in all four [[crates/scribe-renderer/src/atlas.rs#FontParams]] construction sites (init, config hot-reload, zoom, resize), status bar height, tab bar height and padding, scrollbar width, content padding (via [[crates/scribe-client/src/pane.rs#effective_padding]]), focus border width, and indicator height. On resize, scale-factor changes (e.g. dragging between monitors) are detected and the atlas is rebuilt.
+
 ### Shelf Packing
 
 The `ShelfPacker` places glyphs using a simple shelf algorithm: advance along the current row until full, then start a new shelf.

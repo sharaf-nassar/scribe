@@ -24,19 +24,9 @@ pub enum KeyMatch {
 
 /// A parsed keybinding: modifier flags + key target.
 #[derive(Debug, Clone)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "four independent modifier flags (ctrl, shift, alt, super_key) are not a state machine"
-)]
 pub struct Keybinding {
-    /// Whether the Ctrl modifier is required.
-    pub ctrl: bool,
-    /// Whether the Shift modifier is required.
-    pub shift: bool,
-    /// Whether the Alt modifier is required.
-    pub alt: bool,
-    /// Whether the Super/Cmd modifier is required.
-    pub super_key: bool,
+    /// The exact modifier bitset required for this keybinding.
+    pub modifiers: ModifiersState,
     /// The key that must be pressed.
     pub key: KeyMatch,
 }
@@ -121,19 +111,16 @@ impl Keybinding {
     ///
     /// Returns `None` if the string is malformed or the key part is unrecognised.
     pub fn parse(s: &str) -> Option<Self> {
-        let mut ctrl = false;
-        let mut shift = false;
-        let mut alt = false;
-        let mut super_key = false;
+        let mut modifiers = ModifiersState::empty();
         let mut key_part: Option<String> = None;
 
         for part in s.split('+') {
             let lower = part.trim().to_lowercase();
             match lower.as_str() {
-                "ctrl" => ctrl = true,
-                "shift" => shift = true,
-                "alt" => alt = true,
-                "cmd" | "super" => super_key = true,
+                "ctrl" => modifiers.insert(ModifiersState::CONTROL),
+                "shift" => modifiers.insert(ModifiersState::SHIFT),
+                "alt" => modifiers.insert(ModifiersState::ALT),
+                "cmd" | "super" => modifiers.insert(ModifiersState::SUPER),
                 _ => key_part = Some(lower),
             }
         }
@@ -157,7 +144,7 @@ impl Keybinding {
             _ => return None,
         };
 
-        Some(Self { ctrl, shift, alt, super_key, key })
+        Some(Self { modifiers, key })
     }
 
     /// Returns `true` if `event` with `modifiers` matches this keybinding.
@@ -165,11 +152,7 @@ impl Keybinding {
         if event.state != ElementState::Pressed {
             return false;
         }
-        if self.ctrl != modifiers.control_key()
-            || self.shift != modifiers.shift_key()
-            || self.alt != modifiers.alt_key()
-            || self.super_key != modifiers.super_key()
-        {
+        if self.modifiers != modifiers {
             return false;
         }
         match &self.key {
@@ -453,160 +436,24 @@ pub fn translate_key(event: &KeyEvent, modifiers: ModifiersState) -> Option<Vec<
 }
 
 /// Check for layout shortcuts using the provided bindings.
-#[allow(
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    reason = "flat sequential binding checks including tab selection are inherently simple despite the count"
-)]
 fn translate_layout_shortcut(
     event: &KeyEvent,
     modifiers: ModifiersState,
     bindings: &Bindings,
 ) -> Option<LayoutAction> {
-    // Panes
-    if any_matches(&bindings.split_vertical, event, modifiers) {
-        return Some(LayoutAction::SplitVertical);
-    }
-    if any_matches(&bindings.split_horizontal, event, modifiers) {
-        return Some(LayoutAction::SplitHorizontal);
-    }
-    if any_matches(&bindings.close_pane, event, modifiers) {
-        return Some(LayoutAction::ClosePane);
-    }
-    if any_matches(&bindings.cycle_pane, event, modifiers) {
-        return Some(LayoutAction::FocusNext);
-    }
-    if any_matches(&bindings.focus_left, event, modifiers) {
-        return Some(LayoutAction::FocusLeft);
-    }
-    if any_matches(&bindings.focus_right, event, modifiers) {
-        return Some(LayoutAction::FocusRight);
-    }
-    if any_matches(&bindings.focus_up, event, modifiers) {
-        return Some(LayoutAction::FocusUp);
-    }
-    if any_matches(&bindings.focus_down, event, modifiers) {
-        return Some(LayoutAction::FocusDown);
-    }
+    let pane_actions = pane_layout_actions(bindings);
+    let workspace_actions = workspace_layout_actions(bindings);
+    let tab_actions = tab_layout_actions(bindings);
+    let view_actions = view_layout_actions(bindings);
 
-    // Workspaces
-    if any_matches(&bindings.workspace_split_vertical, event, modifiers) {
-        return Some(LayoutAction::WorkspaceSplitVertical);
-    }
-    if any_matches(&bindings.workspace_split_horizontal, event, modifiers) {
-        return Some(LayoutAction::WorkspaceSplitHorizontal);
-    }
-    if any_matches(&bindings.workspace_focus_left, event, modifiers) {
-        return Some(LayoutAction::WorkspaceFocusLeft);
-    }
-    if any_matches(&bindings.workspace_focus_right, event, modifiers) {
-        return Some(LayoutAction::WorkspaceFocusRight);
-    }
-    if any_matches(&bindings.workspace_focus_up, event, modifiers) {
-        return Some(LayoutAction::WorkspaceFocusUp);
-    }
-    if any_matches(&bindings.workspace_focus_down, event, modifiers) {
-        return Some(LayoutAction::WorkspaceFocusDown);
-    }
-
-    // Window
-    if any_matches(&bindings.new_window, event, modifiers) {
-        return Some(LayoutAction::NewWindow);
-    }
-
-    // Tabs
-    if any_matches(&bindings.new_claude_tab, event, modifiers) {
-        return Some(LayoutAction::NewClaudeTab);
-    }
-    if any_matches(&bindings.new_claude_resume_tab, event, modifiers) {
-        return Some(LayoutAction::NewClaudeResumeTab);
-    }
-    if any_matches(&bindings.new_codex_tab, event, modifiers) {
-        return Some(LayoutAction::NewCodexTab);
-    }
-    if any_matches(&bindings.new_codex_resume_tab, event, modifiers) {
-        return Some(LayoutAction::NewCodexResumeTab);
-    }
-    if any_matches(&bindings.new_tab, event, modifiers) {
-        return Some(LayoutAction::NewTab);
-    }
-    if any_matches(&bindings.close_tab, event, modifiers) {
-        return Some(LayoutAction::CloseTab);
-    }
-    if any_matches(&bindings.next_tab, event, modifiers) {
-        return Some(LayoutAction::NextTab);
-    }
-    if any_matches(&bindings.prev_tab, event, modifiers) {
-        return Some(LayoutAction::PrevTab);
-    }
-    if any_matches(&bindings.select_tab_1, event, modifiers) {
-        return Some(LayoutAction::SelectTab(0));
-    }
-    if any_matches(&bindings.select_tab_2, event, modifiers) {
-        return Some(LayoutAction::SelectTab(1));
-    }
-    if any_matches(&bindings.select_tab_3, event, modifiers) {
-        return Some(LayoutAction::SelectTab(2));
-    }
-    if any_matches(&bindings.select_tab_4, event, modifiers) {
-        return Some(LayoutAction::SelectTab(3));
-    }
-    if any_matches(&bindings.select_tab_5, event, modifiers) {
-        return Some(LayoutAction::SelectTab(4));
-    }
-    if any_matches(&bindings.select_tab_6, event, modifiers) {
-        return Some(LayoutAction::SelectTab(5));
-    }
-    if any_matches(&bindings.select_tab_7, event, modifiers) {
-        return Some(LayoutAction::SelectTab(6));
-    }
-    if any_matches(&bindings.select_tab_8, event, modifiers) {
-        return Some(LayoutAction::SelectTab(7));
-    }
-    if any_matches(&bindings.select_tab_9, event, modifiers) {
-        return Some(LayoutAction::SelectTab(8));
-    }
-
-    // Clipboard
-    if any_matches(&bindings.copy, event, modifiers) {
-        return Some(LayoutAction::CopySelection);
-    }
-    if any_matches(&bindings.paste, event, modifiers) {
-        return Some(LayoutAction::PasteClipboard);
-    }
-
-    // Navigation
-    if any_matches(&bindings.scroll_up, event, modifiers) {
-        return Some(LayoutAction::ScrollUp);
-    }
-    if any_matches(&bindings.scroll_down, event, modifiers) {
-        return Some(LayoutAction::ScrollDown);
-    }
-    if any_matches(&bindings.scroll_top, event, modifiers) {
-        return Some(LayoutAction::ScrollTop);
-    }
-    if any_matches(&bindings.scroll_bottom, event, modifiers) {
-        return Some(LayoutAction::ScrollBottom);
-    }
-    if any_matches(&bindings.prompt_jump_up, event, modifiers) {
-        return Some(LayoutAction::PromptJumpUp);
-    }
-    if any_matches(&bindings.prompt_jump_down, event, modifiers) {
-        return Some(LayoutAction::PromptJumpDown);
-    }
-
-    // View
-    if any_matches(&bindings.zoom_in, event, modifiers) {
-        return Some(LayoutAction::ZoomIn);
-    }
-    if any_matches(&bindings.zoom_out, event, modifiers) {
-        return Some(LayoutAction::ZoomOut);
-    }
-    if any_matches(&bindings.zoom_reset, event, modifiers) {
-        return Some(LayoutAction::ZoomReset);
-    }
-
-    None
+    [
+        pane_actions.as_slice(),
+        workspace_actions.as_slice(),
+        tab_actions.as_slice(),
+        view_actions.as_slice(),
+    ]
+    .iter()
+    .find_map(|actions| match_binding_actions(event, modifiers, actions))
 }
 
 /// Check configurable terminal shortcut bindings.
@@ -617,28 +464,30 @@ fn translate_terminal_shortcut(
     modifiers: ModifiersState,
     bindings: &Bindings,
 ) -> Option<Vec<u8>> {
-    if any_matches(&bindings.word_left, event, modifiers) {
-        return Some(b"\x1b[1;5D".to_vec());
-    }
-    if any_matches(&bindings.word_right, event, modifiers) {
-        return Some(b"\x1b[1;5C".to_vec());
-    }
-    if any_matches(&bindings.delete_word_backward, event, modifiers) {
-        return Some(vec![0x1b, 0x7f]);
-    }
-    if any_matches(&bindings.delete_word_backward_ctrl, event, modifiers) {
-        return Some(vec![0x08]);
-    }
-    if any_matches(&bindings.delete_word_forward, event, modifiers) {
-        return Some(b"\x1b[3;5~".to_vec());
-    }
-    if any_matches(&bindings.line_start, event, modifiers) {
-        return Some(b"\x1b[1;5H".to_vec());
-    }
-    if any_matches(&bindings.line_end, event, modifiers) {
-        return Some(b"\x1b[1;5F".to_vec());
-    }
-    None
+    const WORD_LEFT: &[u8] = b"\x1b[1;5D";
+    const WORD_RIGHT: &[u8] = b"\x1b[1;5C";
+    const DELETE_WORD_BACKWARD: &[u8] = &[0x1b, 0x7f];
+    const DELETE_WORD_BACKWARD_CTRL: &[u8] = &[0x08];
+    const DELETE_WORD_FORWARD: &[u8] = b"\x1b[3;5~";
+    const LINE_START: &[u8] = b"\x1b[1;5H";
+    const LINE_END: &[u8] = b"\x1b[1;5F";
+
+    let shortcuts: [BindingAction<'_, &[u8]>; 7] = [
+        BindingAction { bindings: &bindings.word_left, action: WORD_LEFT },
+        BindingAction { bindings: &bindings.word_right, action: WORD_RIGHT },
+        BindingAction { bindings: &bindings.delete_word_backward, action: DELETE_WORD_BACKWARD },
+        BindingAction {
+            bindings: &bindings.delete_word_backward_ctrl,
+            action: DELETE_WORD_BACKWARD_CTRL,
+        },
+        BindingAction { bindings: &bindings.delete_word_forward, action: DELETE_WORD_FORWARD },
+        BindingAction { bindings: &bindings.line_start, action: LINE_START },
+        BindingAction { bindings: &bindings.line_end, action: LINE_END },
+    ];
+
+    shortcuts.iter().find_map(|entry| {
+        any_matches(entry.bindings, event, modifiers).then(|| entry.action.to_vec())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -686,14 +535,11 @@ fn translate_character_with_modifiers(c: &str, modifiers: ModifiersState) -> Opt
 /// Maps a–z / A–Z to 0x01–0x1a. Space is handled separately via `NamedKey::Space`.
 fn char_to_control_byte(c: &str) -> Option<u8> {
     let ch = c.chars().next()?;
-    #[allow(
-        clippy::as_conversions,
-        reason = "ASCII char is guaranteed to fit in u8 for control byte computation"
-    )]
+    let ch = u8::try_from(u32::from(ch)).ok()?;
     if ch.is_ascii_lowercase() {
-        Some(ch as u8 - b'a' + 1)
+        Some(ch - b'a' + 1)
     } else if ch.is_ascii_uppercase() {
-        Some(ch as u8 - b'A' + 1)
+        Some(ch - b'A' + 1)
     } else {
         None
     }
@@ -706,10 +552,6 @@ fn char_to_control_byte(c: &str) -> Option<u8> {
 ///
 /// Special cases (Backspace, Space, Enter, Tab, Escape) are handled separately
 /// since they don't follow the standard CSI modifier encoding.
-#[allow(
-    clippy::too_many_lines,
-    reason = "comprehensive named key table is inherently long but each arm is trivial"
-)]
 fn translate_named_with_modifiers(named: NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
     // Drop Cmd/Super combos that didn't match any binding — on macOS these are
     // OS-level shortcuts and sending wrong PTY sequences would be incorrect.
@@ -717,74 +559,184 @@ fn translate_named_with_modifiers(named: NamedKey, modifiers: ModifiersState) ->
         return None;
     }
 
-    // Special keys that don't use standard xterm modifier encoding.
-    match named {
-        NamedKey::Backspace => {
-            return if modifiers.control_key() && modifiers.alt_key() {
-                Some(vec![0x1b, 0x08]) // Ctrl+Alt+Backspace → ESC BS
-            } else if modifiers.alt_key() {
-                Some(vec![0x1b, 0x7f]) // Alt+Backspace → ESC DEL
-            } else if modifiers.control_key() {
-                Some(vec![0x08]) // Ctrl+Backspace → BS
-            } else {
-                Some(vec![0x7f]) // Plain Backspace → DEL
-            };
-        }
-        NamedKey::Space => {
-            return if modifiers.control_key() {
-                Some(vec![0]) // Ctrl+Space → NUL
-            } else if modifiers.alt_key() {
-                Some(vec![0x1b, b' ']) // Alt+Space → ESC SP
-            } else {
-                Some(b" ".to_vec())
-            };
-        }
-        NamedKey::Enter => {
-            return if modifiers.alt_key() {
-                Some(vec![0x1b, b'\r']) // Alt+Enter → ESC CR
-            } else {
-                Some(b"\r".to_vec())
-            };
-        }
-        NamedKey::Tab => {
-            return if modifiers.shift_key() {
-                Some(b"\x1b[Z".to_vec()) // Shift+Tab → backtab
-            } else {
-                Some(b"\t".to_vec())
-            };
-        }
-        NamedKey::Escape => return Some(b"\x1b".to_vec()),
-        _ => {}
+    if let Some(bytes) = translate_named_special(named, modifiers) {
+        return Some(bytes);
     }
 
     // Compute xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4).
     let modifier_param = xterm_modifier_param(modifiers);
 
-    // Keys using CSI letter format: \x1b[1;{mod}{letter} or \x1b[{letter}
-    if let Some(letter) = csi_letter_for_named(named) {
-        return Some(build_csi_letter_seq(letter, modifier_param));
-    }
+    translate_named_csi_letter(named, modifier_param)
+        .or_else(|| translate_named_csi_tilde(named, modifier_param))
+        .or_else(|| translate_named_function_key(named, modifier_param))
+}
 
-    // Keys using CSI tilde format: \x1b[{code};{mod}~ or \x1b[{code}~
-    if let Some(code) = csi_tilde_code_for_named(named) {
-        return Some(build_csi_tilde_seq(code, modifier_param));
+fn translate_named_special(named: NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
+    match named {
+        NamedKey::Backspace => {
+            if modifiers.control_key() && modifiers.alt_key() {
+                Some(vec![0x1b, 0x08])
+            } else if modifiers.alt_key() {
+                Some(vec![0x1b, 0x7f])
+            } else if modifiers.control_key() {
+                Some(vec![0x08])
+            } else {
+                Some(vec![0x7f])
+            }
+        }
+        NamedKey::Space => {
+            if modifiers.control_key() {
+                Some(vec![0])
+            } else if modifiers.alt_key() {
+                Some(vec![0x1b, b' '])
+            } else {
+                Some(b" ".to_vec())
+            }
+        }
+        NamedKey::Enter => {
+            if modifiers.alt_key() {
+                Some(vec![0x1b, b'\r'])
+            } else {
+                Some(b"\r".to_vec())
+            }
+        }
+        NamedKey::Tab => {
+            if modifiers.shift_key() {
+                Some(b"\x1b[Z".to_vec())
+            } else {
+                Some(b"\t".to_vec())
+            }
+        }
+        NamedKey::Escape => Some(b"\x1b".to_vec()),
+        _ => None,
     }
+}
 
-    // F1–F4 use SS3 format normally but CSI with modifiers.
-    if let Some(letter) = ss3_letter_for_fkey(named) {
-        return if modifier_param.is_some() {
-            Some(build_csi_letter_seq(letter, modifier_param))
-        } else {
-            Some(vec![0x1b, b'O', letter])
-        };
-    }
+fn translate_named_csi_letter(named: NamedKey, modifier_param: Option<u8>) -> Option<Vec<u8>> {
+    csi_letter_for_named(named).map(|letter| build_csi_letter_seq(letter, modifier_param))
+}
 
-    // F5+ use CSI tilde format with specific codes.
-    if let Some(code) = fkey_tilde_code(named) {
-        return Some(build_csi_tilde_seq(code, modifier_param));
-    }
+fn translate_named_csi_tilde(named: NamedKey, modifier_param: Option<u8>) -> Option<Vec<u8>> {
+    csi_tilde_code_for_named(named).map(|code| build_csi_tilde_seq(code, modifier_param))
+}
 
-    None
+fn translate_named_function_key(named: NamedKey, modifier_param: Option<u8>) -> Option<Vec<u8>> {
+    ss3_letter_for_fkey(named)
+        .map(|letter| {
+            modifier_param.map_or_else(
+                || vec![0x1b, b'O', letter],
+                |param| build_csi_letter_seq(letter, Some(param)),
+            )
+        })
+        .or_else(|| fkey_tilde_code(named).map(|code| build_csi_tilde_seq(code, modifier_param)))
+}
+
+struct BindingAction<'a, T> {
+    bindings: &'a BindingSet,
+    action: T,
+}
+
+fn pane_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 8] {
+    [
+        BindingAction { bindings: &bindings.split_vertical, action: LayoutAction::SplitVertical },
+        BindingAction {
+            bindings: &bindings.split_horizontal,
+            action: LayoutAction::SplitHorizontal,
+        },
+        BindingAction { bindings: &bindings.close_pane, action: LayoutAction::ClosePane },
+        BindingAction { bindings: &bindings.cycle_pane, action: LayoutAction::FocusNext },
+        BindingAction { bindings: &bindings.focus_left, action: LayoutAction::FocusLeft },
+        BindingAction { bindings: &bindings.focus_right, action: LayoutAction::FocusRight },
+        BindingAction { bindings: &bindings.focus_up, action: LayoutAction::FocusUp },
+        BindingAction { bindings: &bindings.focus_down, action: LayoutAction::FocusDown },
+    ]
+}
+
+fn workspace_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 6] {
+    [
+        BindingAction {
+            bindings: &bindings.workspace_split_vertical,
+            action: LayoutAction::WorkspaceSplitVertical,
+        },
+        BindingAction {
+            bindings: &bindings.workspace_split_horizontal,
+            action: LayoutAction::WorkspaceSplitHorizontal,
+        },
+        BindingAction {
+            bindings: &bindings.workspace_focus_left,
+            action: LayoutAction::WorkspaceFocusLeft,
+        },
+        BindingAction {
+            bindings: &bindings.workspace_focus_right,
+            action: LayoutAction::WorkspaceFocusRight,
+        },
+        BindingAction {
+            bindings: &bindings.workspace_focus_up,
+            action: LayoutAction::WorkspaceFocusUp,
+        },
+        BindingAction {
+            bindings: &bindings.workspace_focus_down,
+            action: LayoutAction::WorkspaceFocusDown,
+        },
+    ]
+}
+
+fn tab_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 18] {
+    [
+        BindingAction { bindings: &bindings.new_window, action: LayoutAction::NewWindow },
+        BindingAction { bindings: &bindings.new_claude_tab, action: LayoutAction::NewClaudeTab },
+        BindingAction {
+            bindings: &bindings.new_claude_resume_tab,
+            action: LayoutAction::NewClaudeResumeTab,
+        },
+        BindingAction { bindings: &bindings.new_codex_tab, action: LayoutAction::NewCodexTab },
+        BindingAction {
+            bindings: &bindings.new_codex_resume_tab,
+            action: LayoutAction::NewCodexResumeTab,
+        },
+        BindingAction { bindings: &bindings.new_tab, action: LayoutAction::NewTab },
+        BindingAction { bindings: &bindings.close_tab, action: LayoutAction::CloseTab },
+        BindingAction { bindings: &bindings.next_tab, action: LayoutAction::NextTab },
+        BindingAction { bindings: &bindings.prev_tab, action: LayoutAction::PrevTab },
+        BindingAction { bindings: &bindings.select_tab_1, action: LayoutAction::SelectTab(0) },
+        BindingAction { bindings: &bindings.select_tab_2, action: LayoutAction::SelectTab(1) },
+        BindingAction { bindings: &bindings.select_tab_3, action: LayoutAction::SelectTab(2) },
+        BindingAction { bindings: &bindings.select_tab_4, action: LayoutAction::SelectTab(3) },
+        BindingAction { bindings: &bindings.select_tab_5, action: LayoutAction::SelectTab(4) },
+        BindingAction { bindings: &bindings.select_tab_6, action: LayoutAction::SelectTab(5) },
+        BindingAction { bindings: &bindings.select_tab_7, action: LayoutAction::SelectTab(6) },
+        BindingAction { bindings: &bindings.select_tab_8, action: LayoutAction::SelectTab(7) },
+        BindingAction { bindings: &bindings.select_tab_9, action: LayoutAction::SelectTab(8) },
+    ]
+}
+
+fn view_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 11] {
+    [
+        BindingAction { bindings: &bindings.copy, action: LayoutAction::CopySelection },
+        BindingAction { bindings: &bindings.paste, action: LayoutAction::PasteClipboard },
+        BindingAction { bindings: &bindings.scroll_up, action: LayoutAction::ScrollUp },
+        BindingAction { bindings: &bindings.scroll_down, action: LayoutAction::ScrollDown },
+        BindingAction { bindings: &bindings.scroll_top, action: LayoutAction::ScrollTop },
+        BindingAction { bindings: &bindings.scroll_bottom, action: LayoutAction::ScrollBottom },
+        BindingAction { bindings: &bindings.prompt_jump_up, action: LayoutAction::PromptJumpUp },
+        BindingAction {
+            bindings: &bindings.prompt_jump_down,
+            action: LayoutAction::PromptJumpDown,
+        },
+        BindingAction { bindings: &bindings.zoom_in, action: LayoutAction::ZoomIn },
+        BindingAction { bindings: &bindings.zoom_out, action: LayoutAction::ZoomOut },
+        BindingAction { bindings: &bindings.zoom_reset, action: LayoutAction::ZoomReset },
+    ]
+}
+
+fn match_binding_actions<T: Copy>(
+    event: &KeyEvent,
+    modifiers: ModifiersState,
+    candidates: &[BindingAction<'_, T>],
+) -> Option<T> {
+    candidates
+        .iter()
+        .find_map(|entry| any_matches(entry.bindings, event, modifiers).then_some(entry.action))
 }
 
 /// Compute the xterm modifier parameter.

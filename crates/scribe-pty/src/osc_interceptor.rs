@@ -16,7 +16,6 @@ use crate::metadata::{MetadataEvent, MetadataParser};
 /// Create one per read-loop iteration, advance it with `vte::Parser::advance`,
 /// then inspect the `events` vec passed in at construction time.
 pub struct OscInterceptor<'a> {
-    parser: &'a MetadataParser,
     events: &'a mut Vec<MetadataEvent>,
 }
 
@@ -26,15 +25,15 @@ impl<'a> OscInterceptor<'a> {
     /// The caller owns the `Vec` and is responsible for clearing it between
     /// iterations, avoiding a heap allocation per read.
     #[must_use]
-    pub fn new(parser: &'a MetadataParser, events: &'a mut Vec<MetadataEvent>) -> Self {
-        Self { parser, events }
+    pub fn new(events: &'a mut Vec<MetadataEvent>) -> Self {
+        Self { events }
     }
 }
 
 impl Perform for OscInterceptor<'_> {
     /// Called for every OSC sequence. Delegates to [`MetadataParser::process_osc`].
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        if let Some(event) = self.parser.process_osc(params) {
+        if let Some(event) = MetadataParser::process_osc(params) {
             self.events.push(event);
         }
     }
@@ -42,7 +41,7 @@ impl Perform for OscInterceptor<'_> {
     /// Called for C0/C1 control bytes. Delegates to [`MetadataParser::process_execute`]
     /// to capture BEL (0x07).
     fn execute(&mut self, byte: u8) {
-        if let Some(event) = self.parser.process_execute(byte) {
+        if let Some(event) = MetadataParser::process_execute(byte) {
             self.events.push(event);
         }
     }

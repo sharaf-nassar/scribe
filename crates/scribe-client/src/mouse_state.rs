@@ -41,7 +41,6 @@ pub struct MouseClickState {
     last_press_time: Option<Instant>,
     last_press_point: Option<(f32, f32)>,
     click_count: u8,
-    selection_mode: SelectionMode,
 }
 
 impl Default for MouseClickState {
@@ -53,12 +52,7 @@ impl Default for MouseClickState {
 impl MouseClickState {
     /// Create a new state with no recorded press.
     pub fn new() -> Self {
-        Self {
-            last_press_time: None,
-            last_press_point: None,
-            click_count: 0,
-            selection_mode: SelectionMode::Cell,
-        }
+        Self { last_press_time: None, last_press_point: None, click_count: 0 }
     }
 
     /// Record a mouse press at `(x, y)` and return the resulting click kind.
@@ -88,34 +82,18 @@ impl MouseClickState {
         self.last_press_time = Some(now);
         self.last_press_point = Some((x, y));
 
-        let kind = match self.click_count {
+        match self.click_count {
             2 => ClickKind::Double,
             3 => ClickKind::Triple,
             _ => ClickKind::Single,
-        };
-
-        self.selection_mode = match kind {
-            ClickKind::Single => SelectionMode::Cell,
-            ClickKind::Double => SelectionMode::Word,
-            ClickKind::Triple => SelectionMode::Line,
-        };
-
-        kind
-    }
-
-    /// Return the current selection granularity.
-    #[allow(dead_code, reason = "public API for future use by pane focus handlers")]
-    pub fn selection_mode(&self) -> SelectionMode {
-        self.selection_mode
+        }
     }
 
     /// Reset click count to zero (e.g. on pane focus changes).
-    #[allow(dead_code, reason = "public API for future use by pane focus handlers")]
     pub fn reset(&mut self) {
         self.click_count = 0;
         self.last_press_time = None;
         self.last_press_point = None;
-        self.selection_mode = SelectionMode::Cell;
     }
 }
 

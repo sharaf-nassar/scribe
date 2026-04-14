@@ -861,6 +861,10 @@ function loadConfig(config) {
   setToggleValue('update.enabled', config.update?.enabled ?? true);
   setStepperValue('update.check_interval_hours', Math.round((config.update?.check_interval_secs ?? 86400) / 3600));
   setSegmentedValue('update.channel', config.update?.channel ?? 'stable');
+
+  // Notifications
+  setToggleValue('notifications.enabled', config.notifications?.enabled ?? true);
+  setSegmentedValue('notifications.condition', config.notifications?.condition ?? 'when_unfocused');
 }
 
 // ─────────── Value Setters ───────────

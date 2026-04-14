@@ -55,6 +55,7 @@ impl ButtonIndex {
 }
 
 const BUTTON_COUNT: usize = 3;
+type GlyphResolver<'a> = dyn FnMut(char) -> ([f32; 2], [f32; 2]) + 'a;
 
 /// Labels for each button, in order matching [`ButtonIndex`].
 const BUTTON_LABELS: [&str; BUTTON_COUNT] = ["Quit Scribe", "Kill Window", "Cancel"];
@@ -67,6 +68,64 @@ const PADDING: usize = 3;
 
 /// Height of each button in cell rows (top pad + label + bottom pad).
 const BUTTON_HEIGHT_ROWS: usize = 3;
+/// Dialog layout never needs more than this many grid units, which keeps the
+/// integer-to-float conversion exact for pixel placement.
+const MAX_DIALOG_GRID_UNITS: usize = 65_535;
+
+pub struct CloseDialogBuildContext<'a> {
+    pub out: &'a mut Vec<CellInstance>,
+    pub viewport: Rect,
+    pub cell_size: (f32, f32),
+    pub chrome: &'a ChromeColors,
+    pub resolve_glyph: &'a mut GlyphResolver<'a>,
+}
+
+fn dialog_grid_units(units: usize) -> u16 {
+    u16::try_from(units).unwrap_or(u16::MAX)
+}
+
+fn dialog_grid_x(origin: f32, col: usize, cell_w: f32) -> f32 {
+    origin + f32::from(dialog_grid_units(col)) * cell_w
+}
+
+fn dialog_grid_y(origin: f32, row: usize, cell_h: f32) -> f32 {
+    origin + f32::from(dialog_grid_units(row)) * cell_h
+}
+
+fn dialog_grid_width(cols: usize, cell_w: f32) -> f32 {
+    f32::from(dialog_grid_units(cols)) * cell_w
+}
+
+fn dialog_grid_height(rows: usize, cell_h: f32) -> f32 {
+    f32::from(dialog_grid_units(rows)) * cell_h
+}
+
+fn dialog_units_in_extent(extent: f32, unit: f32) -> usize {
+    if unit <= 0.0 || !extent.is_finite() || extent <= 0.0 {
+        return 0;
+    }
+
+    let mut low = 0usize;
+    let mut high = 1usize;
+    while high < MAX_DIALOG_GRID_UNITS && dialog_grid_width(high, unit) <= extent {
+        low = high;
+        high = high.saturating_mul(2).min(MAX_DIALOG_GRID_UNITS);
+        if high == low {
+            break;
+        }
+    }
+
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if dialog_grid_width(mid, unit) <= extent {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+
+    low
+}
 
 /// State for the in-app close dialog overlay.
 pub struct CloseDialog {
@@ -128,163 +187,34 @@ impl CloseDialog {
     ///
     /// Appends a full-viewport backdrop and a centered dialog box with title,
     /// description, separator, and buttons into `out`.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "single render builder: backdrop, border, box, title, separator, body, buttons"
-    )]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "needs output vec, viewport, cell size, chrome colors, and glyph resolver"
-    )]
-    pub fn build_instances(
-        &mut self,
-        out: &mut Vec<CellInstance>,
-        viewport: Rect,
-        cell_size: (f32, f32),
-        chrome: &ChromeColors,
-        resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-    ) {
+    pub fn build_instances(&mut self, ctx: CloseDialogBuildContext<'_>) {
+        let CloseDialogBuildContext { out, viewport, cell_size, chrome, resolve_glyph } = ctx;
         let (cell_w, cell_h) = cell_size;
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return;
         }
 
         let colors = DialogColors::from_chrome(chrome);
+        let layout = DialogLayout::new(viewport, cell_size, self.body_lines(MIN_DIALOG_COLS));
+        let mut renderer = DialogRenderer::new(out, &layout, cell_size, resolve_glyph);
 
-        // -- Backdrop --
-        push_solid_rect(out, viewport, colors.backdrop);
-
-        // -- Dialog dimensions --
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "viewport.width / cell_w yields a small positive value fitting in usize"
-        )]
-        let max_cols = (viewport.width / cell_w) as usize;
-        let dialog_cols: usize = 46_usize.min(max_cols.max(MIN_DIALOG_COLS));
-
-        let body_lines = self.body_lines(dialog_cols);
-
-        // Vertical layout (row indices relative to dialog top):
-        //   0           top border (1px line)
-        //   1           blank
-        //   2           title
-        //   3           blank
-        //   4..4+body   body lines
-        //   4+body      blank
-        //   4+body+1    separator line
-        //   4+body+2    blank
-        //   4+body+3    button row (3 rows tall: pad + label + pad)
-        //   4+body+5+1  blank (bottom padding)
-        //   4+body+5+2  bottom border
-        let body_count = body_lines.len();
-        let content_rows = 2 + 1 + 1 + body_count + 1 + 1 + 1 + BUTTON_HEIGHT_ROWS + 1;
-
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "dialog_cols and content_rows are small computed values fitting in f32"
-        )]
-        let (dialog_w, dialog_h) = (dialog_cols as f32 * cell_w, content_rows as f32 * cell_h);
-
-        let dialog_x = viewport.x + (viewport.width - dialog_w).max(0.0) / 2.0;
-        let dialog_y = viewport.y + (viewport.height - dialog_h).max(0.0) / 2.0;
-        let dialog_rect = Rect { x: dialog_x, y: dialog_y, width: dialog_w, height: dialog_h };
-
-        // -- Dialog background --
-        push_solid_rect(out, dialog_rect, colors.dialog_bg);
-
-        // -- Border (1px lines on top and bottom edges) --
-        let border_rect_top = Rect { x: dialog_x, y: dialog_y, width: dialog_w, height: 1.0 };
-        let border_rect_bottom =
-            Rect { x: dialog_x, y: dialog_y + dialog_h - 1.0, width: dialog_w, height: 1.0 };
-        push_solid_rect(out, border_rect_top, colors.border);
-        push_solid_rect(out, border_rect_bottom, colors.border);
-
-        // -- Title (centered) --
-        let title = "Close Scribe";
-        let title_row = 2;
-        emit_text_centered(
-            out,
-            title,
-            dialog_x,
-            dialog_y,
-            title_row,
-            dialog_cols,
-            cell_size,
-            colors.title_fg,
-            colors.dialog_bg,
-            resolve_glyph,
-        );
-
-        // -- Body text --
-        let body_start_row = 4;
-        for (i, line) in body_lines.iter().enumerate() {
-            emit_text_line(
-                out,
-                line,
-                dialog_x,
-                dialog_y,
-                body_start_row + i,
-                PADDING,
-                dialog_cols,
-                cell_size,
-                colors.body_fg,
-                colors.dialog_bg,
-                resolve_glyph,
-            );
-        }
-
-        // -- Separator line between body and buttons --
-        let sep_row = body_start_row + body_count + 1;
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "sep_row is a small computed value fitting in f32"
-        )]
-        let sep_y = dialog_y + sep_row as f32 * cell_h + cell_h / 2.0;
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "PADDING is a small constant (3) fitting in f32"
-        )]
-        let sep_inset = PADDING as f32 * cell_w;
-        let sep_rect = Rect {
-            x: dialog_x + sep_inset,
-            y: sep_y,
-            width: dialog_w - sep_inset * 2.0,
-            height: 1.0,
-        };
-        push_solid_rect(out, sep_rect, colors.separator);
-
-        // -- Buttons --
-        let button_row = sep_row + 2;
-        self.build_buttons(
-            out,
-            dialog_x,
-            dialog_y,
-            button_row,
-            dialog_cols,
-            cell_size,
-            &colors,
-            resolve_glyph,
-        );
+        renderer.push_solid_rect(viewport, colors.backdrop);
+        renderer.push_solid_rect(layout.dialog_rect, colors.dialog_bg);
+        renderer.draw_frame(colors.border);
+        renderer
+            .draw_title("Close Scribe", TextColors { fg: colors.title_fg, bg: colors.dialog_bg });
+        renderer.draw_body(TextColors { fg: colors.body_fg, bg: colors.dialog_bg });
+        renderer.draw_separator(colors.separator);
+        self.build_buttons(&mut renderer, &colors);
     }
 
     /// Build the three action buttons with proper padding and per-button colors.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "needs dialog origin, row, column count, cell size, colors, and glyph resolver"
-    )]
-    fn build_buttons(
-        &mut self,
-        out: &mut Vec<CellInstance>,
-        dialog_x: f32,
-        dialog_y: f32,
-        button_row: usize,
-        dialog_cols: usize,
-        cell_size: (f32, f32),
-        colors: &DialogColors,
-        resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-    ) {
-        let (cell_w, cell_h) = cell_size;
+    fn build_buttons(&mut self, renderer: &mut DialogRenderer<'_, '_>, colors: &DialogColors) {
+        let (cell_w, cell_h) = renderer.cell_size;
+        let dialog_x = renderer.layout.dialog_rect.x;
+        let dialog_y = renderer.layout.dialog_rect.y;
+        let button_row = renderer.layout.button_row;
+        let dialog_cols = renderer.layout.dialog_cols;
 
         // Each button: 2 padding + label + 2 padding.
         let btn_col_widths: Vec<usize> = BUTTON_LABELS.iter().map(|l| l.len() + 4).collect();
@@ -293,24 +223,14 @@ impl CloseDialog {
         let remaining = usable.saturating_sub(total_btn_cols);
         let gap = if BUTTON_COUNT > 1 { remaining / (BUTTON_COUNT - 1) } else { 0 };
 
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "button_row is a small computed value fitting in f32"
-        )]
-        let button_y = dialog_y + button_row as f32 * cell_h;
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "BUTTON_HEIGHT_ROWS is a small constant (3) fitting in f32"
-        )]
-        let button_h = BUTTON_HEIGHT_ROWS as f32 * cell_h;
+        let button_y = dialog_grid_y(dialog_y, button_row, cell_h);
+        let button_h = dialog_grid_height(BUTTON_HEIGHT_ROWS, cell_h);
 
         let mut col = PADDING;
         for (btn_idx, label) in BUTTON_LABELS.iter().enumerate() {
-            #[allow(
-                clippy::indexing_slicing,
-                reason = "btn_idx < BUTTON_COUNT (3), btn_col_widths has 3 elements"
-            )]
-            let btn_w_cols = btn_col_widths[btn_idx];
+            let Some(btn_w_cols) = btn_col_widths.get(btn_idx).copied() else {
+                continue;
+            };
             let is_focused = self.focused as usize == btn_idx;
             let is_hovered = self.hovered == Some(btn_idx);
             let active = is_focused || is_hovered;
@@ -319,41 +239,21 @@ impl CloseDialog {
             let (fg, bg) = button_colors(btn_idx, active, colors);
 
             // Button background rect (spans BUTTON_HEIGHT_ROWS).
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "col and btn_w_cols are small positive integers fitting in f32"
-            )]
             let btn_rect = Rect {
-                x: dialog_x + col as f32 * cell_w,
+                x: dialog_grid_x(dialog_x, col, cell_w),
                 y: button_y,
-                width: btn_w_cols as f32 * cell_w,
+                width: dialog_grid_width(btn_w_cols, cell_w),
                 height: button_h,
             };
-            push_solid_rect(out, btn_rect, bg);
+            renderer.push_solid_rect(btn_rect, bg);
 
             // Label (vertically centered in the button — middle row of 3).
             let label_col = col + 2;
             let label_row = button_row + 1; // middle row
-            emit_text_line(
-                out,
-                label,
-                dialog_x,
-                dialog_y,
-                label_row,
-                label_col,
-                dialog_cols,
-                cell_size,
-                fg,
-                bg,
-                resolve_glyph,
-            );
+            renderer.emit_text_line(label, label_row, label_col, TextColors { fg, bg });
 
-            #[allow(
-                clippy::indexing_slicing,
-                reason = "btn_idx is always < BUTTON_COUNT (3), array has 3 elements"
-            )]
-            {
-                self.button_rects[btn_idx] = btn_rect;
+            if let Some(rect) = self.button_rects.get_mut(btn_idx) {
+                *rect = btn_rect;
             }
 
             col += btn_w_cols + gap;
@@ -378,6 +278,127 @@ impl CloseDialog {
         }
 
         lines
+    }
+}
+
+struct DialogLayout {
+    dialog_rect: Rect,
+    dialog_cols: usize,
+    body_lines: Vec<String>,
+    body_count: usize,
+    button_row: usize,
+}
+
+impl DialogLayout {
+    fn new(viewport: Rect, cell_size: (f32, f32), body_lines: Vec<String>) -> Self {
+        let (cell_w, cell_h) = cell_size;
+        let max_cols = dialog_units_in_extent(viewport.width, cell_w);
+        let dialog_cols = 46_usize.min(max_cols.max(MIN_DIALOG_COLS));
+        let body_count = body_lines.len();
+        let content_rows = 2 + 1 + 1 + body_count + 1 + 1 + 1 + BUTTON_HEIGHT_ROWS + 1;
+        let dialog_w = dialog_grid_width(dialog_cols, cell_w);
+        let dialog_h = dialog_grid_height(content_rows, cell_h);
+        let dialog_x = viewport.x + (viewport.width - dialog_w).max(0.0) / 2.0;
+        let dialog_y = viewport.y + (viewport.height - dialog_h).max(0.0) / 2.0;
+
+        Self {
+            dialog_rect: Rect { x: dialog_x, y: dialog_y, width: dialog_w, height: dialog_h },
+            dialog_cols,
+            body_lines,
+            body_count,
+            button_row: 4 + body_count + 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TextColors {
+    fg: [f32; 4],
+    bg: [f32; 4],
+}
+
+struct DialogRenderer<'a, 'layout> {
+    out: &'a mut Vec<CellInstance>,
+    layout: &'layout DialogLayout,
+    cell_size: (f32, f32),
+    resolve_glyph: &'a mut GlyphResolver<'a>,
+}
+
+impl<'a, 'layout> DialogRenderer<'a, 'layout> {
+    fn new(
+        out: &'a mut Vec<CellInstance>,
+        layout: &'layout DialogLayout,
+        cell_size: (f32, f32),
+        resolve_glyph: &'a mut GlyphResolver<'a>,
+    ) -> Self {
+        Self { out, layout, cell_size, resolve_glyph }
+    }
+
+    fn push_solid_rect(&mut self, rect: Rect, color: [f32; 4]) {
+        push_solid_rect(self.out, rect, color);
+    }
+
+    fn draw_frame(&mut self, border: [f32; 4]) {
+        let rect = self.layout.dialog_rect;
+        self.push_solid_rect(Rect { x: rect.x, y: rect.y, width: rect.width, height: 1.0 }, border);
+        self.push_solid_rect(
+            Rect { x: rect.x, y: rect.y + rect.height - 1.0, width: rect.width, height: 1.0 },
+            border,
+        );
+    }
+
+    fn draw_title(&mut self, title: &str, colors: TextColors) {
+        self.emit_text_centered(title, 2, colors);
+    }
+
+    fn draw_body(&mut self, colors: TextColors) {
+        for (i, line) in self.layout.body_lines.iter().enumerate() {
+            self.emit_text_line(line, 4 + i, PADDING, colors);
+        }
+    }
+
+    fn draw_separator(&mut self, color: [f32; 4]) {
+        let (cell_w, cell_h) = self.cell_size;
+        let sep_row = 4 + self.layout.body_count + 1;
+        let sep_y = dialog_grid_y(self.layout.dialog_rect.y, sep_row, cell_h) + cell_h / 2.0;
+        let sep_inset = dialog_grid_width(PADDING, cell_w);
+        self.push_solid_rect(
+            Rect {
+                x: self.layout.dialog_rect.x + sep_inset,
+                y: sep_y,
+                width: self.layout.dialog_rect.width - sep_inset * 2.0,
+                height: 1.0,
+            },
+            color,
+        );
+    }
+
+    fn emit_text_centered(&mut self, text: &str, row: usize, colors: TextColors) {
+        let start_col = self.layout.dialog_cols.saturating_sub(text.len()) / 2;
+        self.emit_text_line(text, row, start_col, colors);
+    }
+
+    fn emit_text_line(&mut self, text: &str, row: usize, start_col: usize, colors: TextColors) {
+        let (cell_w, cell_h) = self.cell_size;
+        let y = dialog_grid_y(self.layout.dialog_rect.y, row, cell_h);
+
+        for (i, ch) in text.chars().enumerate() {
+            let col = start_col + i;
+            if col >= self.layout.dialog_cols {
+                break;
+            }
+            let x = dialog_grid_x(self.layout.dialog_rect.x, col, cell_w);
+            let (uv_min, uv_max) = (self.resolve_glyph)(ch);
+            self.out.push(CellInstance {
+                pos: [x, y],
+                size: [0.0, 0.0],
+                uv_min,
+                uv_max,
+                fg_color: colors.fg,
+                bg_color: colors.bg,
+                corner_radius: 0.0,
+            });
+        }
     }
 }
 
@@ -453,107 +474,25 @@ fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
         fg_color: color,
         bg_color: color,
         corner_radius: 0.0,
-        _pad: 0.0,
     });
-}
-
-/// Emit centered text on a given row.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "needs dialog origin, row, column count, cell size, colors, and glyph resolver"
-)]
-fn emit_text_centered(
-    out: &mut Vec<CellInstance>,
-    text: &str,
-    dialog_x: f32,
-    dialog_y: f32,
-    row: usize,
-    dialog_cols: usize,
-    cell_size: (f32, f32),
-    fg: [f32; 4],
-    bg: [f32; 4],
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
-    let start_col = dialog_cols.saturating_sub(text.len()) / 2;
-    emit_text_line(
-        out,
-        text,
-        dialog_x,
-        dialog_y,
-        row,
-        start_col,
-        dialog_cols,
-        cell_size,
-        fg,
-        bg,
-        resolve_glyph,
-    );
-}
-
-/// Emit a line of text as individual character instances.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "needs dialog origin, row, column, cell size, colors, and glyph resolver"
-)]
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "row/col indices are small positive integers fitting in f32"
-)]
-fn emit_text_line(
-    out: &mut Vec<CellInstance>,
-    text: &str,
-    dialog_x: f32,
-    dialog_y: f32,
-    row: usize,
-    start_col: usize,
-    max_cols: usize,
-    cell_size: (f32, f32),
-    fg: [f32; 4],
-    bg: [f32; 4],
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
-    let (cell_w, cell_h) = cell_size;
-    let y = dialog_y + row as f32 * cell_h;
-
-    for (i, ch) in text.chars().enumerate() {
-        let col = start_col + i;
-        if col >= max_cols {
-            break;
-        }
-        let x = dialog_x + col as f32 * cell_w;
-        let (uv_min, uv_max) = resolve_glyph(ch);
-        out.push(CellInstance {
-            pos: [x, y],
-            size: [0.0, 0.0],
-            uv_min,
-            uv_max,
-            fg_color: fg,
-            bg_color: bg,
-            corner_radius: 0.0,
-            _pad: 0.0,
-        });
-    }
 }
 
 /// Lighten an sRGB color by adding `amount` to each RGB channel, clamped to 1.0.
 fn lighten(color: [f32; 4], amount: f32) -> [f32; 4] {
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "fixed-size [f32; 4] array, indices 0-3 always valid"
-    )]
     [
-        (color[0] + amount).min(1.0),
-        (color[1] + amount).min(1.0),
-        (color[2] + amount).min(1.0),
-        color[3],
+        (color.first().copied().unwrap_or(0.0) + amount).min(1.0),
+        (color.get(1).copied().unwrap_or(0.0) + amount).min(1.0),
+        (color.get(2).copied().unwrap_or(0.0) + amount).min(1.0),
+        color.get(3).copied().unwrap_or(1.0),
     ]
 }
 
 /// Return a copy of `color` with a new alpha value.
 fn with_alpha(color: [f32; 4], new_alpha: f32) -> [f32; 4] {
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "fixed-size [f32; 4] array, indices 0-2 always valid"
-    )]
-    [color[0], color[1], color[2], new_alpha]
+    [
+        color.first().copied().unwrap_or(0.0),
+        color.get(1).copied().unwrap_or(0.0),
+        color.get(2).copied().unwrap_or(0.0),
+        new_alpha,
+    ]
 }

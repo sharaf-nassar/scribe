@@ -54,6 +54,22 @@ Scripts and helpers used during local development builds.
 
 Manual server restarts during active work require explicit user approval because even zero-downtime handoff attempts can still disrupt in-flight tasks and connected clients.
 
+### Lint Suppression Guard
+
+New Rust lint suppressions are blocked by a committed baseline so contributors must fix the underlying warning instead of adding `#[allow]` or `#[expect]`.
+
+`tools/check-no-new-lint-suppressions.sh` scans the staged, working, or CI target tree and compares the discovered suppression inventory against `tools/lint-suppressions-allowlist.txt`. That keeps the repo's three narrowly scoped unavoidable suppressions explicit while rejecting any drift. The guard runs in pre-commit, `just lint-suppressions`, and the normal pull-request quality workflow. `third_party/` is pruned from the scan so vendored upstream suppressions do not need allowlist entries.
+
+### Vendored Third-Party Dependencies
+
+The `third_party/` directory holds path-patched copies of external crates with outstanding upstream bugs, wired in via `[patch.crates-io]` in the root `Cargo.toml`.
+
+The directory is excluded from the workspace (`exclude = ["third_party/*"]`) so workspace lints do not apply to vendored code.
+
+Current entries:
+
+- `third_party/unix-ancillary/` — local fork of `unix-ancillary 0.1.0`. Upstream 0.1.0 fails to compile on Apple targets because `ancillary.rs::set_cloexec` references `io::Result`/`io::Error` without importing `std::io`. The fork adds a cfg-gated `use std::io;` that mirrors the function's own cfg. Remove once a fixed release ships on crates.io.
+
 ### Package Install Flow
 
 `just install` builds and installs the stable `scribe` package, while `just install-dev` builds and installs an isolated `scribe-dev` package with renamed binaries, service unit, and share directory.

@@ -224,10 +224,6 @@ impl AiStateTracker {
         entry_for_config(&self.config, state)
     }
 
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "fixed-size [f32; 4] arrays, indices 0-2 always valid"
-    )]
     fn animated_color(
         &self,
         session_id: SessionId,
@@ -247,7 +243,12 @@ impl AiStateTracker {
             AiState::Error => {
                 let timeout = self.config.error.timeout_secs;
                 if timeout <= 0.0 {
-                    return [base[0], base[1], base[2], PULSE_ALPHA_MAX];
+                    return [
+                        base.first().copied().unwrap_or(0.0),
+                        base.get(1).copied().unwrap_or(0.0),
+                        base.get(2).copied().unwrap_or(0.0),
+                        PULSE_ALPHA_MAX,
+                    ];
                 }
                 self.state_enter_times.get(&session_id).map_or(0.0, |&t| {
                     let elapsed = (self.animation_time - t).max(0.0);
@@ -256,17 +257,23 @@ impl AiStateTracker {
                 })
             }
         };
-        [base[0], base[1], base[2], alpha]
+        [
+            base.first().copied().unwrap_or(0.0),
+            base.get(1).copied().unwrap_or(0.0),
+            base.get(2).copied().unwrap_or(0.0),
+            alpha,
+        ]
     }
 
     /// Return the base colour for an AI state at full opacity (for tab indicators).
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "fixed-size [f32; 4] arrays, indices 0-2 always valid"
-    )]
     fn base_color_full_alpha(&self, state: &AiState, ansi_colors: &[[f32; 4]; 16]) -> [f32; 4] {
         let c = self.entry_for(state).color.resolve(ansi_colors);
-        [c[0], c[1], c[2], 1.0]
+        [
+            c.first().copied().unwrap_or(0.0),
+            c.get(1).copied().unwrap_or(0.0),
+            c.get(2).copied().unwrap_or(0.0),
+            1.0,
+        ]
     }
 }
 
@@ -315,8 +322,7 @@ fn pulse_hz(pulse_ms: u32) -> f32 {
     if pulse_ms == 0 {
         return DEFAULT_PULSE_HZ;
     }
-    #[allow(clippy::cast_precision_loss, reason = "pulse_ms is a small integer")]
-    let secs = pulse_ms as f32 / 1000.0;
+    let secs = std::time::Duration::from_millis(u64::from(pulse_ms)).as_secs_f32();
     1.0 / secs
 }
 
@@ -338,25 +344,28 @@ fn pulse_alpha(t: f32, hz: f32) -> f32 {
 /// Each of the four sides is rendered as one solid-colour [`CellInstance`]
 /// (no glyph: `uv_min == uv_max == [0,0]`).  The `color` comes from
 /// [`AiStateTracker::workspace_border_color`].
-#[allow(
-    clippy::many_single_char_names,
-    reason = "x/y/w/h/bw are conventional 2-D geometry shorthands"
-)]
 pub fn build_border_instances(
     pane_rect: Rect,
     color: [f32; 4],
     tab_bar_height: f32,
 ) -> [CellInstance; 4] {
-    let x = pane_rect.x;
-    let y = pane_rect.y + tab_bar_height;
-    let w = pane_rect.width;
-    let h = pane_rect.height - tab_bar_height;
-    let bw = BORDER_WIDTH;
+    let x_pos = pane_rect.x;
+    let y_pos = pane_rect.y + tab_bar_height;
+    let width = pane_rect.width;
+    let height = pane_rect.height - tab_bar_height;
+    let border_width = BORDER_WIDTH;
 
-    let top = solid_quad(x, y, w, bw, color);
-    let bottom = solid_quad(x, y + h - bw, w, bw, color);
-    let left = solid_quad(x, y + bw, bw, h - 2.0 * bw, color);
-    let right = solid_quad(x + w - bw, y + bw, bw, h - 2.0 * bw, color);
+    let top = solid_quad(x_pos, y_pos, width, border_width, color);
+    let bottom = solid_quad(x_pos, y_pos + height - border_width, width, border_width, color);
+    let left =
+        solid_quad(x_pos, y_pos + border_width, border_width, height - 2.0 * border_width, color);
+    let right = solid_quad(
+        x_pos + width - border_width,
+        y_pos + border_width,
+        border_width,
+        height - 2.0 * border_width,
+        color,
+    );
 
     [top, bottom, left, right]
 }
@@ -374,8 +383,13 @@ mod tests {
     fn codex_indicator_respects_provider_toggle() {
         let mut tracker = AiStateTracker::default();
         let session_id = SessionId::new();
-        let terminal =
-            TerminalConfig { codex_code_integration: false, ..TerminalConfig::default() };
+        let terminal = TerminalConfig {
+            ai_integration: scribe_common::config::TerminalAiIntegrationConfig {
+                codex_code_integration: false,
+                ..scribe_common::config::TerminalAiIntegrationConfig::default()
+            },
+            ..TerminalConfig::default()
+        };
 
         tracker.update(
             session_id,

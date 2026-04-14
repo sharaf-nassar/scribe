@@ -10,12 +10,6 @@ pub struct CellInstance {
     pub fg_color: [f32; 4],
     pub bg_color: [f32; 4],
     pub corner_radius: f32,
-    #[allow(
-        dead_code,
-        clippy::pub_underscore_fields,
-        reason = "GPU vertex buffer alignment padding"
-    )]
-    pub _pad: f32,
 }
 
 #[derive(Debug, Clone, Copy)]

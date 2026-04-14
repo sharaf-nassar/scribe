@@ -13,8 +13,12 @@ use scribe_common::socket::{settings_lock_path, settings_socket_path};
 /// Result of attempting to become the singleton settings process.
 pub enum SingletonResult {
     /// We are the singleton. The listener is ready to accept focus commands.
-    /// The caller must keep the `_lock_file` alive to hold the flock.
-    Primary { listener: UnixListener, socket_path: PathBuf, _lock_file: std::fs::File },
+    /// The caller must keep the `lock_file` guard alive to hold the flock.
+    Primary {
+        listener: UnixListener,
+        socket_path: PathBuf,
+        lock_file: nix::fcntl::Flock<std::fs::File>,
+    },
     /// Another instance is already running and was told to focus.
     AlreadyRunning,
 }
@@ -43,21 +47,12 @@ pub fn acquire() -> Result<SingletonResult, String> {
         .open(&lock_path)
         .map_err(|e| format!("failed to open lock file: {e}"))?;
 
-    #[allow(
-        deprecated,
-        reason = "nix::fcntl::Flock requires OwnedFd which conflicts with our File ownership"
-    )]
-    nix::fcntl::flock(
-        std::os::unix::io::AsRawFd::as_raw_fd(&lock_file),
-        nix::fcntl::FlockArg::LockExclusive,
-    )
-    .map_err(|e| format!("flock failed: {e}"))?;
+    let lock_file = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, e)| format!("flock failed: {e}"))?;
 
     // Try to bind the socket.
     match try_bind(&socket_path) {
-        Ok(listener) => {
-            Ok(SingletonResult::Primary { listener, socket_path, _lock_file: lock_file })
-        }
+        Ok(listener) => Ok(SingletonResult::Primary { listener, socket_path, lock_file }),
         Err(_bind_err) => {
             // Socket exists — try to connect and send focus.
             if send_focus_to_existing(&socket_path) {
@@ -67,7 +62,7 @@ pub fn acquire() -> Result<SingletonResult, String> {
                 drop(std::fs::remove_file(&socket_path));
                 let listener = try_bind(&socket_path)
                     .map_err(|e| format!("failed to bind after stale removal: {e}"))?;
-                Ok(SingletonResult::Primary { listener, socket_path, _lock_file: lock_file })
+                Ok(SingletonResult::Primary { listener, socket_path, lock_file })
             }
         }
     }
@@ -94,7 +89,7 @@ fn send_focus_to_existing(socket_path: &std::path::Path) -> bool {
 
 /// Check if an incoming connection is from the same UID.
 ///
-/// Linux: `SO_PEERCRED` via nix. macOS: `getpeereid()` via libc.
+/// Linux: `SO_PEERCRED` via nix. macOS: `getpeereid()` via nix.
 /// Returns `false` if credentials cannot be retrieved or the UID does not match.
 pub fn verify_peer_uid(stream: &UnixStream) -> bool {
     let peer_uid = match get_peer_uid(stream) {
@@ -120,24 +115,12 @@ fn get_peer_uid(stream: &UnixStream) -> Result<u32, String> {
     Ok(cred.uid())
 }
 
-/// macOS: use `getpeereid()` via libc.
+/// macOS: use nix's safe `getpeereid()` wrapper.
 #[cfg(not(target_os = "linux"))]
 fn get_peer_uid(stream: &UnixStream) -> Result<u32, String> {
-    use std::os::unix::io::AsRawFd as _;
-
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-
-    // SAFETY: `stream` is a valid, open Unix domain socket. `getpeereid`
-    // writes the peer's effective UID and GID into the provided pointers,
-    // which are stack-allocated and live for the duration of the call.
-    #[allow(unsafe_code, reason = "getpeereid requires unsafe libc FFI call")]
-    let ret = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
-
-    if ret != 0 {
-        return Err(format!("getpeereid failed: {}", std::io::Error::last_os_error()));
-    }
-    Ok(uid)
+    nix::unistd::getpeereid(stream)
+        .map(|(uid, _gid)| uid.as_raw())
+        .map_err(|e| format!("getpeereid failed: {e}"))
 }
 
 /// Parse a command from a connected client.

@@ -10,17 +10,15 @@
 //! The handoff socket path is platform-specific (see `scribe_common::socket`).
 
 use std::io::{IoSlice, IoSliceMut};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nix::sys::socket::{
-    self, AddressFamily, Backlog, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag,
-    SockType, UnixAddr,
-};
+use nix::sys::socket::{self, AddressFamily, Backlog, MsgFlags, SockFlag, SockType, UnixAddr};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+use unix_ancillary::{AncillaryData, SocketAncillary};
 
 use scribe_common::ai_state::{AiProcessState, AiProvider};
 use scribe_common::error::ScribeError;
@@ -125,31 +123,54 @@ pub struct HandoffWorkspace {
     pub project_root: Option<PathBuf>,
 }
 
+struct HandoffPayload {
+    state_bytes: Vec<u8>,
+    fds: Vec<Arc<OwnedFd>>,
+}
+
 // ── Sender (old server) ─────────────────────────────────────────────
 
 /// Listen for an incoming upgrade connection and perform the handoff.
 ///
 /// This function blocks (async) until a new server connects and the handoff
 /// completes. On success the caller should exit so the new server takes over.
-#[allow(
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    reason = "handoff serialization requires sequential steps across all server subsystems"
-)]
 pub async fn run_handoff_listener(
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     live_sessions: LiveSessionRegistry,
 ) -> Result<(), ScribeError> {
     let path = handoff_socket_path();
+    let listen_async = prepare_handoff_listener(&path)?;
+    wait_for_successful_handoff(&listen_async, &path, &live_sessions, &workspace_manager).await
+}
 
+async fn wait_for_successful_handoff(
+    listen_async: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    path: &PathBuf,
+    live_sessions: &LiveSessionRegistry,
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+) -> Result<(), ScribeError> {
+    // Loop so the old server survives a failed handoff (e.g. version
+    // mismatch) and keeps serving until a compatible upgrade arrives or
+    // postinst cold-restarts via systemctl.
+    loop {
+        let peer_fd = accept_handoff_peer(listen_async).await?;
+        if process_handoff_peer(&peer_fd, path, live_sessions, workspace_manager).await {
+            return Ok(());
+        }
+    }
+}
+
+fn prepare_handoff_listener(
+    path: &PathBuf,
+) -> Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, ScribeError> {
     // Prepare the socket directory and clean stale socket.
-    prepare_handoff_socket(&path)?;
+    prepare_handoff_socket(path)?;
 
     let listen_fd = socket::socket(AddressFamily::Unix, SockType::Stream, cloexec_flag(), None)
         .map_err(|e| ScribeError::IpcError { reason: format!("handoff socket() failed: {e}") })?;
     set_cloexec_if_needed(&listen_fd)?;
 
-    let addr = UnixAddr::new(&path).map_err(|e| ScribeError::IpcError {
+    let addr = UnixAddr::new(path).map_err(|e| ScribeError::IpcError {
         reason: format!("handoff UnixAddr::new failed: {e}"),
     })?;
 
@@ -158,7 +179,7 @@ pub async fn run_handoff_listener(
 
     // Restrict the socket file to owner-only access (0600). The parent
     // directory is already 0700, but defense-in-depth against umask variance.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| ScribeError::Io { source: e })?;
 
     let backlog = Backlog::new(1).map_err(|e| ScribeError::IpcError {
@@ -170,88 +191,104 @@ pub async fn run_handoff_listener(
 
     info!(?path, "handoff listener ready");
 
-    // Wait for a connection (non-blocking via tokio).
-    let listen_async =
-        tokio::io::unix::AsyncFd::new(listen_fd).map_err(|e| ScribeError::Io { source: e })?;
+    tokio::io::unix::AsyncFd::new(listen_fd).map_err(|e| ScribeError::Io { source: e })
+}
 
-    // Loop so the old server survives a failed handoff (e.g. version
-    // mismatch) and keeps serving until a compatible upgrade arrives or
-    // postinst cold-restarts via systemctl.
+async fn accept_handoff_peer(
+    listen_async: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+) -> Result<std::os::fd::OwnedFd, ScribeError> {
     loop {
-        let peer_fd = loop {
-            let mut guard =
-                listen_async.readable().await.map_err(|e| ScribeError::Io { source: e })?;
+        let mut guard = listen_async.readable().await.map_err(|e| ScribeError::Io { source: e })?;
 
-            match socket::accept(listen_async.get_ref().as_raw_fd()) {
-                Ok(raw) => break scribe_pty::async_fd::wrap_raw_fd(raw),
-                Err(nix::errno::Errno::EAGAIN) => {
-                    guard.clear_ready();
-                }
-                Err(e) => {
-                    return Err(ScribeError::IpcError {
-                        reason: format!("handoff accept failed: {e}"),
-                    });
-                }
+        match rustix::net::accept(listen_async.get_ref()) {
+            Ok(peer_fd) => break Ok(peer_fd),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                guard.clear_ready();
             }
-        };
-
-        let raw_peer = peer_fd.as_raw_fd();
-
-        // Verify peer UID.
-        if let Err(e) = verify_peer_uid(&peer_fd) {
-            warn!("handoff peer rejected: {e}");
-            continue;
-        }
-
-        // Read upgrade request.
-        if let Err(e) = read_upgrade_request(raw_peer) {
-            warn!("handoff upgrade request failed: {e}");
-            continue;
-        }
-        info!("received upgrade request from new server");
-
-        // Serialise state.
-        let (state, fds) = serialize_state(&live_sessions, &workspace_manager).await;
-        let state_bytes = match rmp_serde::to_vec(&state) {
-            Ok(bytes) => bytes,
             Err(e) => {
-                warn!("handoff serialization failed: {e}");
-                continue;
-            }
-        };
-
-        // Send state (length-prefixed).
-        if let Err(e) = send_state_bytes(raw_peer, &state_bytes) {
-            warn!("handoff send state failed: {e}");
-            continue;
-        }
-        info!(state_len = state_bytes.len(), fd_count = fds.len(), "sent handoff state");
-
-        // Send PTY fds via SCM_RIGHTS.
-        if !fds.is_empty() {
-            if let Err(e) = send_fds(raw_peer, &fds) {
-                warn!("handoff send fds failed: {e}");
-                continue;
-            }
-            info!(count = fds.len(), "sent PTY fds via SCM_RIGHTS");
-        }
-
-        // Wait for ACK — this is the confirmation that the new server
-        // accepted the state and is ready to serve.
-        if let Err(e) = read_ack(raw_peer) {
-            warn!("handoff not acknowledged (version mismatch?): {e}");
-            continue;
-        }
-        info!("received ACK from new server — handoff complete");
-
-        // Clean up handoff socket.
-        if let Err(e) = std::fs::remove_file(&path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!(?path, "failed to remove handoff socket: {e}");
+                break Err(ScribeError::IpcError { reason: format!("handoff accept failed: {e}") });
             }
         }
+    }
+}
 
+async fn process_handoff_peer(
+    peer_fd: &std::os::fd::OwnedFd,
+    path: &PathBuf,
+    live_sessions: &LiveSessionRegistry,
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+) -> bool {
+    if let Err(e) = receive_upgrade_request(peer_fd) {
+        warn!("handoff upgrade request failed: {e}");
+        return false;
+    }
+
+    let payload = match prepare_handoff_payload(live_sessions, workspace_manager).await {
+        Ok(payload) => payload,
+        Err(e) => {
+            warn!("handoff serialization failed: {e}");
+            return false;
+        }
+    };
+
+    if let Err(e) = send_handoff_payload(peer_fd, &payload) {
+        warn!("handoff transfer failed: {e}");
+        return false;
+    }
+
+    if let Err(e) = receive_handoff_ack(peer_fd.as_raw_fd()) {
+        warn!("handoff not acknowledged (version mismatch?): {e}");
+        return false;
+    }
+
+    cleanup_handoff_socket(path);
+    true
+}
+
+fn receive_upgrade_request(peer_fd: &OwnedFd) -> Result<(), ScribeError> {
+    verify_peer_uid(peer_fd)?;
+    read_upgrade_request(peer_fd.as_raw_fd())?;
+    info!("received upgrade request from new server");
+    Ok(())
+}
+
+async fn prepare_handoff_payload(
+    live_sessions: &LiveSessionRegistry,
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+) -> Result<HandoffPayload, ScribeError> {
+    let (state, fds) = serialize_state(live_sessions, workspace_manager).await;
+    let state_bytes = rmp_serde::to_vec(&state).map_err(ScribeError::from)?;
+    Ok(HandoffPayload { state_bytes, fds })
+}
+
+fn send_handoff_payload(peer_fd: &OwnedFd, payload: &HandoffPayload) -> Result<(), ScribeError> {
+    send_state_bytes(peer_fd.as_raw_fd(), &payload.state_bytes)?;
+    info!(
+        state_len = payload.state_bytes.len(),
+        fd_count = payload.fds.len(),
+        "sent handoff state"
+    );
+
+    if payload.fds.is_empty() {
         return Ok(());
+    }
+
+    send_fds(peer_fd, &payload.fds)?;
+    info!(count = payload.fds.len(), "sent PTY fds via SCM_RIGHTS");
+    Ok(())
+}
+
+fn receive_handoff_ack(raw_peer: RawFd) -> Result<(), ScribeError> {
+    read_ack(raw_peer)?;
+    info!("received ACK from new server — handoff complete");
+    Ok(())
+}
+
+fn cleanup_handoff_socket(path: &PathBuf) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(?path, "failed to remove handoff socket: {e}");
+        }
     }
 }
 
@@ -275,7 +312,7 @@ fn prepare_handoff_socket(path: &PathBuf) -> Result<(), ScribeError> {
 /// Verify the peer's UID matches our own.
 ///
 /// Linux: `SO_PEERCRED` via `getsockopt`.
-/// macOS: `getpeereid()` via libc.
+/// macOS: `getpeereid()` via nix.
 fn verify_peer_uid(fd: &OwnedFd) -> Result<(), ScribeError> {
     let peer_uid = get_peer_uid(fd)?;
     let expected = current_uid();
@@ -298,24 +335,12 @@ fn get_peer_uid(fd: &OwnedFd) -> Result<u32, ScribeError> {
     Ok(cred.uid())
 }
 
-/// macOS: use `getpeereid()` via libc.
+/// macOS: use nix's safe `getpeereid()` wrapper.
 #[cfg(not(target_os = "linux"))]
 fn get_peer_uid(fd: &OwnedFd) -> Result<u32, ScribeError> {
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-
-    // SAFETY: `fd` is a valid, open Unix domain socket. `getpeereid` writes
-    // the peer's effective UID and GID into the provided pointers, which are
-    // stack-allocated and live for the duration of the call.
-    #[allow(unsafe_code, reason = "getpeereid requires unsafe libc FFI call")]
-    let ret = unsafe { libc::getpeereid(fd.as_raw_fd(), &raw mut uid, &raw mut gid) };
-
-    if ret != 0 {
-        return Err(ScribeError::IpcError {
-            reason: format!("handoff getpeereid failed: {}", std::io::Error::last_os_error()),
-        });
-    }
-    Ok(uid)
+    nix::unistd::getpeereid(fd)
+        .map(|(uid, _gid)| uid.as_raw())
+        .map_err(|e| ScribeError::IpcError { reason: format!("handoff getpeereid failed: {e}") })
 }
 
 /// Read the upgrade request magic bytes from the peer.
@@ -347,7 +372,7 @@ fn read_upgrade_request(fd: RawFd) -> Result<(), ScribeError> {
 async fn serialize_state(
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-) -> (HandoffState, Vec<RawFd>) {
+) -> (HandoffState, Vec<Arc<OwnedFd>>) {
     let (sessions, fds) = crate::ipc_server::serialize_live_for_handoff(live_sessions).await;
     let (workspaces, workspace_tree, windows) =
         workspace_manager.read().await.serialize_for_handoff();
@@ -376,11 +401,16 @@ fn send_state_bytes(fd: RawFd, state_bytes: &[u8]) -> Result<(), ScribeError> {
 }
 
 /// Send file descriptors via `SCM_RIGHTS`.
-fn send_fds(fd: RawFd, fds: &[RawFd]) -> Result<(), ScribeError> {
-    let cmsg = [ControlMessage::ScmRights(fds)];
-    let iov = [IoSlice::new(b"fds")];
+fn send_fds(fd: &OwnedFd, fds: &[Arc<OwnedFd>]) -> Result<(), ScribeError> {
+    let borrowed: Vec<_> = fds.iter().map(|owned_fd| owned_fd.as_fd()).collect();
+    let mut ancillary_buf = vec![0u8; SocketAncillary::buffer_size_for_rights(borrowed.len())];
+    let mut ancillary = SocketAncillary::new(&mut ancillary_buf);
+    ancillary.add_fds(&borrowed).map_err(|e| ScribeError::IpcError {
+        reason: format!("handoff ancillary buffer setup failed: {e}"),
+    })?;
 
-    socket::sendmsg::<()>(fd, &iov, &cmsg, MsgFlags::empty(), None).map_err(|e| {
+    let iov = [IoSlice::new(b"fds")];
+    unix_ancillary::cmsg_sendmsg(fd.as_fd(), &iov, &ancillary).map_err(|e| {
         ScribeError::IpcError { reason: format!("handoff sendmsg (SCM_RIGHTS) failed: {e}") }
     })?;
 
@@ -475,7 +505,7 @@ pub fn receive_handoff() -> Result<(HandoffState, Vec<OwnedFd>), ScribeError> {
 
     // Receive session PTY fds via SCM_RIGHTS.
     let total_fds = state.sessions.len();
-    let fds = if total_fds == 0 { Vec::new() } else { receive_fds(fd, total_fds)? };
+    let fds = if total_fds == 0 { Vec::new() } else { receive_fds(&sock_fd, total_fds)? };
 
     info!(count = fds.len(), "received PTY fds via SCM_RIGHTS");
 
@@ -565,7 +595,7 @@ fn read_exact_bytes(fd: RawFd, len: usize) -> Result<Vec<u8>, ScribeError> {
 }
 
 /// Receive file descriptors from `SCM_RIGHTS` ancillary data.
-fn receive_fds(fd: RawFd, expected_count: usize) -> Result<Vec<OwnedFd>, ScribeError> {
+fn receive_fds(fd: &OwnedFd, expected_count: usize) -> Result<Vec<OwnedFd>, ScribeError> {
     if expected_count > MAX_FDS {
         return Err(ScribeError::IpcError {
             reason: format!("too many fds to receive: {expected_count} (max {MAX_FDS})"),
@@ -573,26 +603,31 @@ fn receive_fds(fd: RawFd, expected_count: usize) -> Result<Vec<OwnedFd>, ScribeE
     }
 
     let mut data_buf = [0u8; 8];
-    let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
+    let mut ancillary_buf = vec![0u8; SocketAncillary::buffer_size_for_rights(expected_count)];
+    let mut ancillary = SocketAncillary::new(&mut ancillary_buf);
     let mut iov = [IoSliceMut::new(&mut data_buf)];
 
-    // MSG_CMSG_CLOEXEC ensures received fds are close-on-exec, preventing
-    // them from leaking to child processes forked before we wrap them in
-    // AsyncPtyFd.
-    let msg = socket::recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_buf), recv_fds_flags()).map_err(
-        |e| ScribeError::IpcError { reason: format!("handoff recvmsg (SCM_RIGHTS) failed: {e}") },
-    )?;
+    let bytes_read =
+        unix_ancillary::cmsg_recvmsg(fd.as_fd(), &mut iov, &mut ancillary).map_err(|e| {
+            ScribeError::IpcError { reason: format!("handoff recvmsg (SCM_RIGHTS) failed: {e}") }
+        })?;
 
-    let mut received_fds = Vec::new();
-    let cmsgs = msg.cmsgs().map_err(|e| ScribeError::IpcError {
-        reason: format!("handoff cmsgs() failed (MSG_CTRUNC?): {e}"),
-    })?;
+    if bytes_read == 0 {
+        return Err(ScribeError::IpcError {
+            reason: "handoff peer closed connection while reading PTY fds".to_owned(),
+        });
+    }
 
-    for cmsg in cmsgs {
-        if let ControlMessageOwned::ScmRights(fds) = cmsg {
-            for raw_fd in fds {
-                received_fds.push(scribe_pty::async_fd::wrap_raw_fd(raw_fd));
-            }
+    if ancillary.is_truncated() {
+        return Err(ScribeError::IpcError {
+            reason: "handoff ancillary data was truncated while receiving PTY fds".to_owned(),
+        });
+    }
+
+    let mut received_fds = Vec::with_capacity(expected_count);
+    for message in ancillary.messages() {
+        match message {
+            AncillaryData::ScmRights(rights) => received_fds.extend(rights),
         }
     }
 
@@ -608,21 +643,6 @@ fn receive_fds(fd: RawFd, expected_count: usize) -> Result<Vec<OwnedFd>, ScribeE
     Ok(received_fds)
 }
 
-// ── CLOEXEC helpers ─────────────────────────────────────────────────
-
-/// On Linux, use `MSG_CMSG_CLOEXEC` so received fds are close-on-exec.
-#[cfg(target_os = "linux")]
-fn recv_fds_flags() -> MsgFlags {
-    MsgFlags::MSG_CMSG_CLOEXEC
-}
-
-/// On macOS, `MSG_CMSG_CLOEXEC` does not exist. Received fds get
-/// `FD_CLOEXEC` set by `wrap_raw_fd` after reception.
-#[cfg(not(target_os = "linux"))]
-fn recv_fds_flags() -> MsgFlags {
-    MsgFlags::empty()
-}
-
 /// On Linux, `SOCK_CLOEXEC` is available as a socket flag.
 #[cfg(target_os = "linux")]
 fn cloexec_flag() -> SockFlag {
@@ -636,20 +656,7 @@ fn cloexec_flag() -> SockFlag {
     SockFlag::empty()
 }
 
-/// No-op on Linux — `SOCK_CLOEXEC` was already set at socket creation.
-/// Returns `Result` to match the non-Linux signature so callers can use `?`
-/// uniformly across both `cfg` variants.
-#[cfg(target_os = "linux")]
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "signature must match the non-Linux variant so callers can use ? uniformly"
-)]
-fn set_cloexec_if_needed(_fd: &OwnedFd) -> Result<(), ScribeError> {
-    Ok(())
-}
-
-/// On non-Linux, set `FD_CLOEXEC` via `fcntl` after socket creation.
-#[cfg(not(target_os = "linux"))]
+/// Ensure the socket fd has `FD_CLOEXEC` set after creation.
 fn set_cloexec_if_needed(fd: &OwnedFd) -> Result<(), ScribeError> {
     use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 

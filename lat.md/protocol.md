@@ -54,7 +54,7 @@ The client chunks large pastes into multiple `KeyInput` messages to fit the 4 Ki
 
 Window automation messages let the CLI inspect windows and ask a connected client to execute the same actions exposed by keyboard shortcuts and the command palette.
 
-`ListWindows` returns every connected window with its ID, session count, and connection status. `DispatchAction` targets an optional window ID and carries an [[crates/scribe-common/src/protocol.rs#AutomationAction]] value such as settings, find, new tab, split, close, new window, or profile switch. The server answers each dispatch with either `ActionDispatched` naming the routed window or `Error` when no connected target exists.
+`ListWindows` returns every connected window with its ID, session count, and connection status. `DispatchAction` targets an optional window ID and carries an [[crates/scribe-common/src/protocol.rs#AutomationAction]] value such as settings, find, new tab, split, close, new window, profile switch, or focus session. The server answers each dispatch with either `ActionDispatched` naming the routed window or `Error` when no connected target exists. `FocusSession` raises the target window and switches to the tab containing the specified session, used by desktop notification click callbacks to bring the user directly to the session that needs attention.
 
 ### Connection
 
@@ -74,7 +74,9 @@ Messages sent from the server to clients, defined in [[crates/scribe-common/src/
 
 ### Terminal Output
 
-`PtyOutput` carries raw PTY bytes for a session. `ScreenSnapshot` sends a full [[protocol#Screen Snapshots]] for reconnect or initial attach. `ScrolledSnapshot` returns scrollback at a requested offset.
+`PtyOutput` carries raw PTY bytes for a session. `ScreenSnapshot` restores a full screen, and `ScrolledSnapshot` returns scrollback at a requested offset.
+
+`TrimScrollback` prunes a client's history back to the preserved pre-AI baseline before a redraw when suppressed ED 3 clears would otherwise stack duplicate inline transcript frames into scrollback.
 
 `SearchResults` pairs with `SearchRequest` and returns absolute grid spans for the current query so the client can highlight and jump between matches without replaying search locally.
 

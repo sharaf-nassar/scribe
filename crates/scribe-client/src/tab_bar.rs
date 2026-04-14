@@ -14,6 +14,8 @@ use scribe_common::ids::WorkspaceId;
 use crate::layout::Rect;
 use crate::tooltip::TooltipAnchor;
 
+type GlyphResolver<'a> = dyn FnMut(char) -> ([f32; 2], [f32; 2]) + 'a;
+
 /// Colors for the tab bar, derived from the theme's [`ChromeColors`].
 pub struct TabBarColors {
     pub bg: [f32; 4],
@@ -21,12 +23,8 @@ pub struct TabBarColors {
     pub text: [f32; 4],
     pub active_text: [f32; 4],
     pub separator: [f32; 4],
-    #[allow(dead_code, reason = "reserved for future bottom border rendering")]
-    pub border: [f32; 4],
     /// Slightly lighter background for the top half of the gradient tab bar.
     pub gradient_top: [f32; 4],
-    /// Accent color for the active tab bottom indicator.
-    pub accent: [f32; 4],
 }
 
 impl From<&ChromeColors> for TabBarColors {
@@ -37,14 +35,13 @@ impl From<&ChromeColors> for TabBarColors {
             text: srgb_to_linear_rgba(chrome.tab_text),
             active_text: srgb_to_linear_rgba(chrome.tab_text_active),
             separator: srgb_to_linear_rgba(chrome.tab_separator),
-            border: srgb_to_linear_rgba(chrome.divider),
             gradient_top: srgb_to_linear_rgba(chrome.tab_bar_gradient_top),
-            accent: srgb_to_linear_rgba(chrome.accent),
         }
     }
 }
 
 /// Per-tab data for rendering.
+#[derive(Clone)]
 pub struct TabData {
     /// Tab title (e.g. shell name, process title).
     pub title: String,
@@ -60,19 +57,16 @@ pub struct TabData {
 /// that fill the tab bar area into `out`. `cell_size` is `(width, height)` from
 /// the font. Pushing directly into the caller's `Vec` avoids a per-call heap
 /// allocation.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "all parameters are needed to fill the tab bar background with per-column color selection"
-)]
-pub fn build_tab_bar_bg(
-    out: &mut Vec<CellInstance>,
-    rect: Rect,
-    cell_size: (f32, f32),
-    colors: &TabBarColors,
-    tab_bar_height: f32,
-    active_range: Option<(f32, f32)>,
-) {
-    let (_cell_w, _cell_h) = cell_size;
+pub struct TabBarBackgroundContext<'a> {
+    pub out: &'a mut Vec<CellInstance>,
+    pub rect: Rect,
+    pub colors: &'a TabBarColors,
+    pub tab_bar_height: f32,
+    pub active_range: Option<(f32, f32)>,
+}
+
+pub fn build_tab_bar_bg(ctx: TabBarBackgroundContext<'_>) {
+    let TabBarBackgroundContext { out, rect, colors, tab_bar_height, active_range } = ctx;
     let half_h = tab_bar_height / 2.0;
 
     // Emit wide-span quads instead of per-column quads.
@@ -94,7 +88,6 @@ pub fn build_tab_bar_bg(
                 fg_color: colors.active_bg,
                 bg_color: colors.active_bg,
                 corner_radius: 0.0,
-                _pad: 0.0,
             });
         } else {
             // Inactive region: lighter top half, normal bottom half.
@@ -106,7 +99,6 @@ pub fn build_tab_bar_bg(
                 fg_color: colors.gradient_top,
                 bg_color: colors.gradient_top,
                 corner_radius: 0.0,
-                _pad: 0.0,
             });
             out.push(CellInstance {
                 pos: [rx, rect.y + half_h],
@@ -116,7 +108,6 @@ pub fn build_tab_bar_bg(
                 fg_color: colors.bg,
                 bg_color: colors.bg,
                 corner_radius: 0.0,
-                _pad: 0.0,
             });
         }
     }
@@ -155,25 +146,26 @@ const GEAR_RESERVED_COLS: usize = 2;
 
 /// Columns reserved for the equalize icon: one space + one glyph.
 const EQUALIZE_RESERVED_COLS: usize = 2;
+/// Tab bar layout never needs more than this many grid units, which keeps the
+/// integer-to-float conversion exact for pixel placement.
+const MAX_RENDER_GRID_UNITS: usize = 65_535;
 
 /// Build a 1px separator line at the bottom of a pane's tab bar area.
 ///
 /// Gives a clear visual boundary between the tab bar and terminal content.
 /// `skip_range` is an optional pixel X range to leave undrawn (used to omit the separator
 /// beneath the active tab so it appears raised).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "all parameters are needed to build the tab bar separator with active-tab skip logic"
-)]
-pub fn build_tab_bar_separator(
-    out: &mut Vec<CellInstance>,
-    rect: Rect,
-    cell_size: (f32, f32),
-    color: [f32; 4],
-    tab_bar_height: f32,
-    skip_range: Option<(f32, f32)>,
-) {
-    let (cell_w, _) = cell_size;
+pub struct TabBarSeparatorContext<'a> {
+    pub out: &'a mut Vec<CellInstance>,
+    pub rect: Rect,
+    pub cell_w: f32,
+    pub color: [f32; 4],
+    pub tab_bar_height: f32,
+    pub skip_range: Option<(f32, f32)>,
+}
+
+pub fn build_tab_bar_separator(ctx: TabBarSeparatorContext<'_>) {
+    let TabBarSeparatorContext { out, rect, cell_w, color, tab_bar_height, skip_range } = ctx;
     if cell_w <= 0.0 {
         return;
     }
@@ -182,11 +174,7 @@ pub fn build_tab_bar_separator(
     let cols = columns_in_width(rect.width, cell_w);
 
     for col_idx in 0..cols {
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "column index is a small positive integer fitting in f32"
-        )]
-        let x = rect.x + col_idx as f32 * cell_w;
+        let x = rect.x + columns_to_pixels(col_idx, cell_w);
         if let Some((xa, xb)) = skip_range {
             if x + cell_w > xa && x < xb {
                 continue;
@@ -200,22 +188,13 @@ pub fn build_tab_bar_separator(
             fg_color: color,
             bg_color: color,
             corner_radius: 0.0,
-            _pad: 0.0,
         });
     }
 
     // Fill the fractional-pixel remainder at the right edge.
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "column count is a small positive integer fitting in f32"
-    )]
-    let remainder = rect.width - cols as f32 * cell_w;
+    let remainder = rect.width - columns_to_pixels(cols, cell_w);
     if remainder > 0.0 {
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "column count is a small positive integer fitting in f32"
-        )]
-        let x = rect.x + cols as f32 * cell_w;
+        let x = rect.x + columns_to_pixels(cols, cell_w);
         let skip = skip_range.is_some_and(|(xa, xb)| x + remainder > xa && x < xb);
         if !skip {
             out.push(CellInstance {
@@ -226,7 +205,6 @@ pub fn build_tab_bar_separator(
                 fg_color: color,
                 bg_color: color,
                 corner_radius: 0.0,
-                _pad: 0.0,
             });
         }
     }
@@ -235,22 +213,25 @@ pub fn build_tab_bar_separator(
 /// Compute the tab bar height in pixels for a workspace with the given parameters.
 ///
 /// Accounts for multi-row stacking when there are more tabs than fit in one row.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "tab and column counts are small positive integers fitting in f32"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "all parameters are needed to compute multi-row tab bar height"
-)]
-pub fn compute_tab_bar_height(
-    tab_count: usize,
-    ws_width: f32,
-    tab_width_chars: u16,
-    cell_w: f32,
-    row_height: f32,
-    badge_cols: usize,
-) -> f32 {
+#[derive(Clone, Copy)]
+pub struct TabBarHeightRequest {
+    pub tab_count: usize,
+    pub ws_width: f32,
+    pub tab_width_chars: u16,
+    pub cell_w: f32,
+    pub row_height: f32,
+    pub badge_cols: usize,
+}
+
+pub fn compute_tab_bar_height(request: TabBarHeightRequest) -> f32 {
+    let TabBarHeightRequest {
+        tab_count,
+        ws_width,
+        tab_width_chars,
+        cell_w,
+        row_height,
+        badge_cols,
+    } = request;
     if cell_w <= 0.0 || row_height <= 0.0 {
         return row_height.max(1.0);
     }
@@ -261,7 +242,7 @@ pub fn compute_tab_bar_height(
     let tabs_per_row = (available / tab_w).max(1);
     let effective_count = tab_count.max(1);
     let rows = effective_count.div_ceil(tabs_per_row);
-    rows as f32 * row_height
+    columns_to_pixels(rows, row_height)
 }
 
 /// Compute the number of columns occupied by the workspace badge.
@@ -315,7 +296,7 @@ pub struct TabBarTextParams<'a> {
     /// Closure that resolves a character to atlas UV coordinates.
     /// Returns `(uv_min, uv_max)`. `FnMut` because atlas rasterization
     /// may occur for uncached glyphs.
-    pub resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+    pub resolve_glyph: &'a mut GlyphResolver<'a>,
     /// Tab bar height in pixels (from config).
     pub tab_bar_height: f32,
     /// AI indicator bar height in pixels (from config).
@@ -395,88 +376,186 @@ pub fn build_tab_bar_text(
     let content_cols = max_cols.saturating_sub(gear_cols).saturating_sub(equalize_cols);
 
     // Render workspace badge if present.
-    if let Some((ws_name, accent_color)) = params.badge {
-        col =
-            render_badge(&mut instances, col, content_cols, cell_w, params, ws_name, accent_color);
+    {
+        let mut writer = TabBarWriter { instances: &mut instances, params, max_cols: content_cols };
+        if let Some((ws_name, accent_color)) = writer.params.badge {
+            col = writer.render_badge(col, ws_name, accent_color);
+        }
+
+        // Render tab labels (and indicator bars for tabs with active AI state).
+        col = render_tabs(&mut writer, &mut hit_targets, col);
     }
 
-    // Render tab labels (and indicator bars for tabs with active AI state).
-    col = render_tabs(&mut instances, &mut hit_targets, col, content_cols, cell_w, params);
+    {
+        let mut writer = TabBarWriter { instances: &mut instances, params, max_cols };
+        // Render equalize icon left of gear if requested.
+        if writer.params.show_equalize {
+            col = writer.render_equalize(&mut hit_targets, col, gear_cols);
+        }
 
-    // Render equalize icon left of gear if requested.
-    if params.show_equalize {
-        col = render_equalize(&mut instances, &mut hit_targets, col, max_cols, gear_cols, params);
-    }
-
-    // Render gear icon on the far right if requested.
-    if params.show_gear {
-        render_gear(&mut instances, &mut hit_targets, col, max_cols, params);
+        // Render gear icon on the far right if requested.
+        if writer.params.show_gear {
+            writer.render_gear(&mut hit_targets, col);
+        }
     }
 
     (instances, hit_targets)
 }
 
-/// Render the workspace badge: accent-coloured cell (leading space + name + trailing space)
-/// followed by a 16px gap.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "helper function that needs all render context from build_tab_bar_text"
-)]
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "pill character count is a small positive integer fitting in f32"
-)]
-fn render_badge(
-    instances: &mut Vec<CellInstance>,
-    mut col: usize,
+struct TabBarWriter<'a, 'b> {
+    instances: &'a mut Vec<CellInstance>,
+    params: &'a mut TabBarTextParams<'b>,
     max_cols: usize,
-    cell_w: f32,
-    params: &mut TabBarTextParams<'_>,
-    ws_name: &str,
-    accent_color: Option<[f32; 4]>,
-) -> usize {
-    let bg = params.colors.bg;
+}
 
-    if let Some(accent) = accent_color {
-        // Named workspace: render accent-coloured pill with high-contrast text.
-        let pill_start_col = col;
-        let pill_char_count = 1 + ws_name.chars().count() + 1;
-        let pill_bg = [accent[0], accent[1], accent[2], 0.25];
-
-        let pill_width = pill_char_count as f32 * cell_w;
-        let pill_x = params.rect.x + pill_start_col as f32 * cell_w;
-        instances.push(solid_quad(
-            pill_x,
-            params.rect.y,
-            pill_width,
-            params.tab_bar_height,
-            pill_bg,
-        ));
-
-        // Use high-contrast active text color for readability on the pill.
-        let text_fg = params.colors.active_text;
-        col = emit_char(instances, ' ', col, max_cols, params, text_fg, pill_bg);
-        for ch in ws_name.chars() {
-            col = emit_char(instances, ch, col, max_cols, params, text_fg, pill_bg);
-        }
-        col = emit_char(instances, ' ', col, max_cols, params, text_fg, pill_bg);
-    } else {
-        // Unnamed workspace: render plain muted text, no pill background.
-        let text_fg = params.colors.text;
-        col = emit_char(instances, ' ', col, max_cols, params, text_fg, bg);
-        for ch in ws_name.chars() {
-            col = emit_char(instances, ch, col, max_cols, params, text_fg, bg);
-        }
-        col = emit_char(instances, ' ', col, max_cols, params, text_fg, bg);
+impl TabBarWriter<'_, '_> {
+    fn cell_w(&self) -> f32 {
+        self.params.cell_size.0
     }
 
-    // 16px gap after badge (approximately 2 cell widths), reverting to normal bg.
-    let gap = gap_columns(16.0, cell_w);
-    for _ in 0..gap {
-        col = emit_char(instances, ' ', col, max_cols, params, params.colors.text, bg);
+    /// Emit a single character instance at the given column, returning the next
+    /// column index.
+    fn emit_char(&mut self, ch: char, col: usize, fg: [f32; 4], bg: [f32; 4]) -> usize {
+        if col >= self.max_cols {
+            return col;
+        }
+
+        let (cell_w, cell_h) = self.params.cell_size;
+        let x = self.params.rect.x + columns_to_pixels(col, cell_w);
+        let y = self.params.rect.y + ((self.params.tab_bar_height - cell_h) / 2.0).max(0.0);
+        let (uv_min, uv_max) = (self.params.resolve_glyph)(ch);
+
+        self.instances.push(CellInstance {
+            pos: [x, y],
+            size: [0.0, 0.0],
+            uv_min,
+            uv_max,
+            fg_color: fg,
+            bg_color: bg,
+            corner_radius: 0.0,
+        });
+
+        col + 1
     }
 
-    col
+    /// Render the workspace badge: accent-coloured cell (leading space + name + trailing space)
+    /// followed by a 16px gap.
+    fn render_badge(
+        &mut self,
+        mut col: usize,
+        ws_name: &str,
+        accent_color: Option<[f32; 4]>,
+    ) -> usize {
+        let bg = self.params.colors.bg;
+
+        if let Some(accent) = accent_color {
+            // Named workspace: render accent-coloured pill with high-contrast text.
+            let pill_start_col = col;
+            let pill_char_count = 1 + ws_name.chars().count() + 1;
+            let pill_bg = [accent[0], accent[1], accent[2], 0.25];
+
+            let pill_width = columns_to_pixels(pill_char_count, self.cell_w());
+            let pill_x = self.params.rect.x + columns_to_pixels(pill_start_col, self.cell_w());
+            self.instances.push(solid_quad(
+                pill_x,
+                self.params.rect.y,
+                pill_width,
+                self.params.tab_bar_height,
+                pill_bg,
+            ));
+
+            // Use high-contrast active text color for readability on the pill.
+            let text_fg = self.params.colors.active_text;
+            col = self.emit_char(' ', col, text_fg, pill_bg);
+            for ch in ws_name.chars() {
+                col = self.emit_char(ch, col, text_fg, pill_bg);
+            }
+            col = self.emit_char(' ', col, text_fg, pill_bg);
+        } else {
+            // Unnamed workspace: render plain muted text, no pill background.
+            let text_fg = self.params.colors.text;
+            col = self.emit_char(' ', col, text_fg, bg);
+            for ch in ws_name.chars() {
+                col = self.emit_char(ch, col, text_fg, bg);
+            }
+            col = self.emit_char(' ', col, text_fg, bg);
+        }
+
+        // 16px gap after badge (approximately 2 cell widths), reverting to normal bg.
+        let gap = gap_columns(16.0, self.cell_w());
+        for _ in 0..gap {
+            col = self.emit_char(' ', col, self.params.colors.text, bg);
+        }
+
+        col
+    }
+
+    /// Render the equalize icon (⊞) just left of the gear icon's reserved space.
+    fn render_equalize(
+        &mut self,
+        hit_targets: &mut TabBarHitTargets,
+        mut col: usize,
+        gear_cols: usize,
+    ) -> usize {
+        // Need at least 2 cols for equalize + gear reserved space.
+        if self.max_cols < 2 {
+            return col;
+        }
+
+        let bg = self.params.colors.bg;
+
+        // Equalize icon sits at the rightmost column before the gear's reserved space.
+        let equalize_col = self.max_cols.saturating_sub(gear_cols).saturating_sub(1);
+
+        // Fill gap between last tab and equalize icon with background.
+        while col < equalize_col {
+            col = self.emit_char(' ', col, self.params.colors.text, bg);
+        }
+
+        let equalize_start_col = col;
+        col = self.emit_char('\u{229E}', col, self.params.colors.text, bg);
+
+        let equalize_x = self.params.rect.x + columns_to_pixels(equalize_start_col, self.cell_w());
+        let equalize_width =
+            columns_to_pixels(col.saturating_sub(equalize_start_col), self.cell_w());
+        hit_targets.equalize_rect = Some(Rect {
+            x: equalize_x,
+            y: self.params.rect.y,
+            width: equalize_width,
+            height: self.params.tab_bar_height,
+        });
+
+        col
+    }
+
+    /// Render the gear icon on the far right of the tab bar.
+    fn render_gear(&mut self, hit_targets: &mut TabBarHitTargets, mut col: usize) {
+        if self.max_cols < 2 {
+            return;
+        }
+
+        let bg = self.params.colors.bg;
+
+        // Position the gear at the rightmost column.
+        let gear_col = self.max_cols - 1;
+
+        // Fill gap between last tab and gear with background.
+        while col < gear_col {
+            col = self.emit_char(' ', col, self.params.colors.text, bg);
+        }
+
+        let gear_start_col = col;
+        col = self.emit_char('\u{2699}', col, self.params.colors.text, bg);
+
+        let gear_x = self.params.rect.x + columns_to_pixels(gear_start_col, self.cell_w());
+        let gear_width = columns_to_pixels(col.saturating_sub(gear_start_col), self.cell_w());
+        hit_targets.gear_rect = Some(Rect {
+            x: gear_x,
+            y: self.params.rect.y,
+            width: gear_width,
+            height: self.params.tab_bar_height,
+        });
+    }
 }
 
 /// Render tab labels with hit targets for click handling, plus AI indicator
@@ -485,247 +564,290 @@ fn render_badge(
 /// Tabs have a fixed width (`params.tab_width` columns) and wrap to new rows
 /// when they would exceed `max_cols`. Returns the column where content ends
 /// on row 0 (for gear/equalize icon positioning).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "helper function that needs all render context from build_tab_bar_text"
-)]
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "column and row indices are small positive integers fitting in f32"
-)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "multi-row fixed-width tab rendering with hit targets, AI indicators, and drag offsets"
-)]
-#[allow(
-    clippy::cognitive_complexity,
-    reason = "multi-row fixed-width tab rendering with hit targets, AI indicators, and drag offsets"
-)]
 fn render_tabs(
-    instances: &mut Vec<CellInstance>,
+    writer: &mut TabBarWriter<'_, '_>,
     hit_targets: &mut TabBarHitTargets,
     start_col: usize,
-    max_cols: usize,
-    cell_w: f32,
-    params: &mut TabBarTextParams<'_>,
 ) -> usize {
-    let bg = params.colors.bg;
-    let tab_w = usize::from(params.tab_width).max(1);
+    let bg = writer.params.colors.bg;
+    let tab_w = usize::from(writer.params.tab_width).max(1);
 
     // Compute the single-row height from total height / number of rows.
-    let tab_count = params.tabs.len().max(1);
-    let available = max_cols.saturating_sub(start_col);
+    let tab_count = writer.params.tabs.len().max(1);
+    let available = writer.max_cols.saturating_sub(start_col);
     let tabs_per_row = (available / tab_w).max(1);
     let num_rows = tab_count.div_ceil(tabs_per_row);
-    let row_height =
-        if num_rows > 0 { params.tab_bar_height / num_rows as f32 } else { params.tab_bar_height };
+    let row_height = if num_rows > 0 {
+        writer.params.tab_bar_height / f32::from(render_grid_units(num_rows))
+    } else {
+        writer.params.tab_bar_height
+    };
 
     // Save original params that we temporarily mutate per row.
-    let base_y = params.rect.y;
-    let total_tab_bar_h = params.tab_bar_height;
+    let base_y = writer.params.rect.y;
+    let total_tab_bar_h = writer.params.tab_bar_height;
+    let mut ctx = TabRenderContext {
+        writer,
+        hit_targets,
+        tab_w,
+        row_height,
+        base_y,
+        start_col,
+        bg,
+        row: 0,
+        col: start_col,
+        row0_end_col: start_col,
+    };
 
-    let mut row: usize = 0;
-    let mut col: usize = start_col;
-    // Track where row 0 ends (for gear/equalize positioning).
-    let mut row0_end_col: usize = start_col;
-
-    for (tab_idx, tab) in params.tabs.iter().enumerate() {
-        // Wrap to next row if this tab would not fit.
-        if tab_idx > 0 && col + tab_w > max_cols {
-            row += 1;
-            col = start_col;
-        }
-
-        let fg = if tab.is_active { params.colors.active_text } else { params.colors.text };
-        let is_hovered = !tab.is_active && params.hovered_tab == Some(tab_idx);
-        let tab_bg = if tab.is_active {
-            params.colors.active_bg
-        } else if is_hovered {
-            [bg[0] + 0.04, bg[1] + 0.04, bg[2] + 0.04, bg[3]]
-        } else {
-            bg
-        };
-        let tab_start_col = col;
-        let row_base_y = base_y + row as f32 * row_height;
-
-        // Record active tab column range on row 0 for the bg/separator pass.
-        if tab.is_active && row == 0 {
-            hit_targets.active_tab_col_range = Some((tab_start_col, tab_start_col + tab_w));
-        }
-
-        // Set per-row context so emit_char positions glyphs correctly.
-        params.rect.y = row_base_y;
-        params.tab_bar_height = row_height;
-
-        // Determine title display:
-        // Each tab has `tab_w` columns: 1 left-pad + title + 1 right-pad.
-        // If close button shown, the last 2 chars are " ×" instead of title overflow.
-        let show_close = params.hovered_tab_close == Some(tab_idx);
-        let available_title = if tab_w >= 4 {
-            if show_close && tab_w >= 6 {
-                tab_w.saturating_sub(4) // 1 left-pad + title + " ×"
-            } else {
-                tab_w.saturating_sub(2) // 1 left-pad + title + 1 right-pad
-            }
-        } else {
-            tab_w.saturating_sub(2)
-        };
-
-        // Build the display title: truncate with '…' if too long, or pad with spaces.
-        let title_chars: Vec<char> = tab.title.chars().collect();
-        let is_truncated = tab_w >= 4 && title_chars.len() > available_title;
-        let display_title: Vec<char> = if is_truncated {
-            let keep = available_title.saturating_sub(1);
-            let mut t: Vec<char> = title_chars.get(..keep).map_or_else(Vec::new, <[char]>::to_vec);
-            t.push('\u{2026}'); // '…'
-            t
-        } else {
-            let mut t = title_chars;
-            while t.len() < available_title {
-                t.push(' ');
-            }
-            t
-        };
-
-        // Record the instance index before emitting this tab's quads so we can
-        // retroactively apply the slide offset to all of them.
-        let tab_start_instance = instances.len();
-
-        // Emit: leading space + title + (close " ×" or trailing space).
-        col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
-        for &ch in &display_title {
-            col = emit_char(instances, ch, col, max_cols, params, fg, tab_bg);
-        }
-        if show_close {
-            col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
-            col = emit_char(instances, '\u{00D7}', col, max_cols, params, fg, tab_bg);
-        } else {
-            col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
-        }
-
-        // Fill any remaining columns in this fixed-width tab slot.
-        let expected_end = tab_start_col + tab_w;
-        while col < expected_end.min(max_cols) {
-            col = emit_char(instances, ' ', col, max_cols, params, fg, tab_bg);
-        }
-        col = expected_end.min(max_cols);
-
-        // Emit a 1px vertical separator between adjacent inactive tabs.
-        let next_is_inactive = params.tabs.get(tab_idx + 1).is_some_and(|t| !t.is_active);
-        if !tab.is_active && next_is_inactive && params.dragging_tab != Some(tab_idx) {
-            let sep_x = params.rect.x + (tab_start_col + tab_w) as f32 * cell_w;
-            instances.push(CellInstance {
-                pos: [sep_x - 1.0, row_base_y],
-                size: [1.0, row_height],
-                uv_min: [0.0, 0.0],
-                uv_max: [0.0, 0.0],
-                fg_color: params.colors.separator,
-                bg_color: params.colors.separator,
-                corner_radius: 0.0,
-                _pad: 0.0,
-            });
-        }
-
-        // Active tab bottom accent indicator: 2px bar spanning the full tab width.
-        if tab.is_active {
-            let accent_h = 2.0;
-            let accent_y = row_base_y + row_height - accent_h;
-            let accent_x = params.rect.x + tab_start_col as f32 * cell_w;
-            instances.push(CellInstance {
-                pos: [accent_x, accent_y],
-                size: [tab_w as f32 * cell_w, accent_h],
-                uv_min: [0.0, 0.0],
-                uv_max: [0.0, 0.0],
-                fg_color: params.colors.accent,
-                bg_color: params.colors.accent,
-                corner_radius: 0.0,
-                _pad: 0.0,
-            });
-        }
-
-        if row == 0 {
-            row0_end_col = col;
-        }
-
-        let tab_width_px = tab_w as f32 * cell_w;
-        let tab_x = params.rect.x + tab_start_col as f32 * cell_w;
-
-        // Close-button rect: rightmost 2 columns of the tab.
-        let close_x = params.rect.x + (tab_start_col + tab_w).saturating_sub(2) as f32 * cell_w;
-        hit_targets.close_rects.push((
-            tab_idx,
-            Rect { x: close_x, y: row_base_y, width: 2.0 * cell_w, height: row_height },
-        ));
-
-        // Hit targets use logical (un-offset) positions for reliable reorder detection.
-        let tab_rect = Rect { x: tab_x, y: row_base_y, width: tab_width_px, height: row_height };
-        hit_targets.tab_rects.push((tab_idx, tab_rect));
-
-        // Tooltip: show full title when it was truncated with '…'.
-        if is_truncated {
-            hit_targets
-                .tooltip_targets
-                .push(TooltipAnchor { text: tab.title.clone(), rect: tab_rect });
-        }
-
-        // Render AI indicator bar at the top of this tab's row.
-        if let Some(indicator_color) = tab.ai_indicator {
-            render_indicator_bar(
-                instances,
-                row_base_y,
-                indicator_color,
-                tab_x,
-                tab_w,
-                cell_w,
-                params.indicator_height,
-            );
-        }
-
-        // Compute slide/drag offset for this tab.
-        // tab_x is the logical (un-offset) left edge of this tab.
-        let tab_offset = if params.dragging_tab == Some(tab_idx) {
-            // Dragged tab follows cursor: shift so its left edge tracks the cursor.
-            params.drag_cursor_x - params.drag_grab_offset - tab_x
-        } else {
-            params.tab_offsets.get(tab_idx).copied().unwrap_or(0.0)
-        };
-
-        // Apply offset to all instances emitted for this tab.
-        if tab_offset != 0.0 {
-            apply_x_offset(instances, tab_start_instance, tab_offset);
-        }
-
-        // Render accent underline at bottom of dragged tab.
-        if params.dragging_tab == Some(tab_idx) {
-            let underline_height = 2.0;
-            let underline_y = row_base_y + row_height - underline_height;
-            let visual_x = tab_x + tab_offset;
-            for bar_col in 0..tab_w {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "column index is a small positive integer fitting in f32"
-                )]
-                let bx = visual_x + bar_col as f32 * cell_w;
-                instances.push(CellInstance {
-                    pos: [bx, underline_y],
-                    size: [cell_w, underline_height],
-                    uv_min: [0.0, 0.0],
-                    uv_max: [0.0, 0.0],
-                    fg_color: params.accent_color,
-                    bg_color: params.accent_color,
-                    corner_radius: 0.0,
-                    _pad: 0.0,
-                });
-            }
-        }
+    let tabs: Vec<TabData> = ctx.writer.params.tabs.to_vec();
+    for (tab_idx, tab) in tabs.iter().enumerate() {
+        render_tab(&mut ctx, tab_idx, tab);
     }
 
     // Restore original params.
-    params.rect.y = base_y;
-    params.tab_bar_height = total_tab_bar_h;
+    ctx.writer.params.rect.y = base_y;
+    ctx.writer.params.tab_bar_height = total_tab_bar_h;
 
     // Return row 0 end column so gear/equalize render correctly in row 0.
-    row0_end_col
+    ctx.row0_end_col
+}
+
+struct TabRenderContext<'a, 'b, 'c> {
+    writer: &'a mut TabBarWriter<'b, 'c>,
+    hit_targets: &'a mut TabBarHitTargets,
+    tab_w: usize,
+    row_height: f32,
+    base_y: f32,
+    start_col: usize,
+    bg: [f32; 4],
+    row: usize,
+    col: usize,
+    row0_end_col: usize,
+}
+
+impl TabRenderContext<'_, '_, '_> {
+    fn cell_w(&self) -> f32 {
+        self.writer.cell_w()
+    }
+
+    fn max_cols(&self) -> usize {
+        self.writer.max_cols
+    }
+
+    fn emit_char(&mut self, ch: char, fg: [f32; 4], bg: [f32; 4]) {
+        self.col = self.writer.emit_char(ch, self.col, fg, bg);
+    }
+
+    fn record_hit_targets(
+        &mut self,
+        tab_idx: usize,
+        tab: &TabData,
+        tab_rect: Rect,
+        is_truncated: bool,
+    ) {
+        let close_x = tab_rect.x + tab_rect.width - (2.0 * self.cell_w());
+        self.hit_targets.close_rects.push((
+            tab_idx,
+            Rect { x: close_x, y: tab_rect.y, width: 2.0 * self.cell_w(), height: self.row_height },
+        ));
+
+        self.hit_targets.tab_rects.push((tab_idx, tab_rect));
+        if is_truncated {
+            self.hit_targets
+                .tooltip_targets
+                .push(TooltipAnchor { text: tab.title.clone(), rect: tab_rect });
+        }
+    }
+
+    fn render_indicator_bar(
+        &mut self,
+        indicator_color: [f32; 4],
+        tab_start_col: usize,
+        row_base_y: f32,
+    ) {
+        let tab_x = self.writer.params.rect.x + columns_to_pixels(tab_start_col, self.cell_w());
+        let tab_width = columns_to_pixels(self.tab_w, self.cell_w());
+        self.writer.instances.push(solid_quad(
+            tab_x,
+            row_base_y,
+            tab_width,
+            self.writer.params.indicator_height,
+            indicator_color,
+        ));
+    }
+}
+
+fn render_grid_units(units: usize) -> u16 {
+    u16::try_from(units).unwrap_or(u16::MAX)
+}
+
+fn columns_to_pixels(columns: usize, unit: f32) -> f32 {
+    f32::from(render_grid_units(columns)) * unit
+}
+
+fn render_tab(ctx: &mut TabRenderContext<'_, '_, '_>, tab_idx: usize, tab: &TabData) {
+    if tab_idx > 0 && ctx.col + ctx.tab_w > ctx.max_cols() {
+        ctx.row += 1;
+        ctx.col = ctx.start_col;
+    }
+
+    let fg = if tab.is_active {
+        ctx.writer.params.colors.active_text
+    } else {
+        ctx.writer.params.colors.text
+    };
+    let is_hovered = !tab.is_active && ctx.writer.params.hovered_tab == Some(tab_idx);
+    let tab_bg = if tab.is_active {
+        ctx.writer.params.colors.active_bg
+    } else if is_hovered {
+        [ctx.bg[0] + 0.04, ctx.bg[1] + 0.04, ctx.bg[2] + 0.04, ctx.bg[3]]
+    } else {
+        ctx.bg
+    };
+    let tab_start_col = ctx.col;
+    let row_base_y = ctx.base_y + columns_to_pixels(ctx.row, ctx.row_height);
+
+    if tab.is_active && ctx.row == 0 {
+        ctx.hit_targets.active_tab_col_range = Some((tab_start_col, tab_start_col + ctx.tab_w));
+    }
+
+    ctx.writer.params.rect.y = row_base_y;
+    ctx.writer.params.tab_bar_height = ctx.row_height;
+
+    let (display_title, is_truncated, show_close) =
+        tab_display_title(tab, ctx.tab_w, ctx.writer.params.hovered_tab_close == Some(tab_idx));
+
+    let tab_start_instance = ctx.writer.instances.len();
+    ctx.emit_char(' ', fg, tab_bg);
+    for &ch in &display_title {
+        ctx.emit_char(ch, fg, tab_bg);
+    }
+    if show_close {
+        ctx.emit_char(' ', fg, tab_bg);
+        ctx.emit_char('\u{00D7}', fg, tab_bg);
+    } else {
+        ctx.emit_char(' ', fg, tab_bg);
+    }
+
+    let expected_end = tab_start_col + ctx.tab_w;
+    while ctx.col < expected_end.min(ctx.max_cols()) {
+        ctx.emit_char(' ', fg, tab_bg);
+    }
+    ctx.col = expected_end.min(ctx.max_cols());
+
+    render_tab_separator(ctx, tab_idx, tab, tab_start_col, row_base_y);
+    render_tab_indicator(ctx, tab, tab_start_col, row_base_y);
+    let tab_rect = Rect {
+        x: ctx.writer.params.rect.x + columns_to_pixels(tab_start_col, ctx.cell_w()),
+        y: row_base_y,
+        width: columns_to_pixels(ctx.tab_w, ctx.cell_w()),
+        height: ctx.row_height,
+    };
+    ctx.record_hit_targets(tab_idx, tab, tab_rect, is_truncated);
+
+    if ctx.row == 0 {
+        ctx.row0_end_col = ctx.col;
+    }
+
+    let tab_offset = tab_slide_offset(ctx, tab_idx, tab_start_col);
+    if tab_offset != 0.0 {
+        apply_x_offset(ctx.writer.instances, tab_start_instance, tab_offset);
+    }
+    if ctx.writer.params.dragging_tab == Some(tab_idx) {
+        render_drag_underline(ctx, tab_start_col, row_base_y, tab_offset);
+    }
+}
+
+fn tab_display_title(tab: &TabData, tab_w: usize, show_close: bool) -> (Vec<char>, bool, bool) {
+    let available_title = if tab_w >= 4 {
+        if show_close && tab_w >= 6 { tab_w.saturating_sub(4) } else { tab_w.saturating_sub(2) }
+    } else {
+        tab_w.saturating_sub(2)
+    };
+
+    let title_chars: Vec<char> = tab.title.chars().collect();
+    let is_truncated = tab_w >= 4 && title_chars.len() > available_title;
+    let display_title: Vec<char> = if is_truncated {
+        let keep = available_title.saturating_sub(1);
+        let mut t: Vec<char> = title_chars.get(..keep).map_or_else(Vec::new, <[char]>::to_vec);
+        t.push('\u{2026}');
+        t
+    } else {
+        let mut t = title_chars;
+        while t.len() < available_title {
+            t.push(' ');
+        }
+        t
+    };
+
+    (display_title, is_truncated, show_close)
+}
+
+fn render_tab_separator(
+    ctx: &mut TabRenderContext<'_, '_, '_>,
+    tab_idx: usize,
+    tab: &TabData,
+    tab_start_col: usize,
+    row_base_y: f32,
+) {
+    let next_is_inactive = ctx.writer.params.tabs.get(tab_idx + 1).is_some_and(|t| !t.is_active);
+    if !tab.is_active && next_is_inactive && ctx.writer.params.dragging_tab != Some(tab_idx) {
+        let sep_x =
+            ctx.writer.params.rect.x + columns_to_pixels(tab_start_col + ctx.tab_w, ctx.cell_w());
+        ctx.writer.instances.push(CellInstance {
+            pos: [sep_x - 1.0, row_base_y],
+            size: [1.0, ctx.row_height],
+            uv_min: [0.0, 0.0],
+            uv_max: [0.0, 0.0],
+            fg_color: ctx.writer.params.colors.separator,
+            bg_color: ctx.writer.params.colors.separator,
+            corner_radius: 0.0,
+        });
+    }
+}
+
+fn render_tab_indicator(
+    ctx: &mut TabRenderContext<'_, '_, '_>,
+    tab: &TabData,
+    tab_start_col: usize,
+    row_base_y: f32,
+) {
+    if let Some(indicator_color) = tab.ai_indicator {
+        ctx.render_indicator_bar(indicator_color, tab_start_col, row_base_y);
+    }
+}
+
+fn tab_slide_offset(
+    ctx: &TabRenderContext<'_, '_, '_>,
+    tab_idx: usize,
+    tab_start_col: usize,
+) -> f32 {
+    let tab_x = ctx.writer.params.rect.x + columns_to_pixels(tab_start_col, ctx.cell_w());
+    if ctx.writer.params.dragging_tab == Some(tab_idx) {
+        ctx.writer.params.drag_cursor_x - ctx.writer.params.drag_grab_offset - tab_x
+    } else {
+        ctx.writer.params.tab_offsets.get(tab_idx).copied().unwrap_or(0.0)
+    }
+}
+
+fn render_drag_underline(
+    ctx: &mut TabRenderContext<'_, '_, '_>,
+    tab_start_col: usize,
+    row_base_y: f32,
+    tab_offset: f32,
+) {
+    let underline_height = 2.0;
+    let underline_y = row_base_y + ctx.row_height - underline_height;
+    let visual_x =
+        ctx.writer.params.rect.x + columns_to_pixels(tab_start_col, ctx.cell_w()) + tab_offset;
+    let underline_width = columns_to_pixels(ctx.tab_w, ctx.cell_w());
+    ctx.writer.instances.push(solid_quad(
+        visual_x,
+        underline_y,
+        underline_width,
+        underline_height,
+        ctx.writer.params.accent_color,
+    ));
 }
 
 /// Shift all instances from `start_idx` onward by `dx` pixels along the X axis.
@@ -738,192 +860,46 @@ fn apply_x_offset(instances: &mut [CellInstance], start_idx: usize, dx: f32) {
     }
 }
 
-/// Render a thin coloured indicator bar above a tab (at the top of the tab bar).
-#[allow(clippy::too_many_arguments, reason = "render helper needs tab geometry and colour context")]
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "column indices are small positive integers fitting in f32"
-)]
-fn render_indicator_bar(
-    instances: &mut Vec<CellInstance>,
-    rect_y: f32,
-    color: [f32; 4],
-    tab_x: f32,
-    tab_width_cols: usize,
-    cell_w: f32,
-    indicator_height: f32,
-) {
-    // Position at the very top of the tab bar area.
-    let bar_y = rect_y;
-
-    // Solid colour bar spanning the full tab width.
-    for bar_col in 0..tab_width_cols {
-        let bx = tab_x + bar_col as f32 * cell_w;
-        instances.push(CellInstance {
-            pos: [bx, bar_y],
-            size: [cell_w, indicator_height],
-            uv_min: [0.0, 0.0],
-            uv_max: [0.0, 0.0],
-            fg_color: color,
-            bg_color: color,
-            corner_radius: 0.0,
-            _pad: 0.0,
-        });
-    }
-}
-
-/// Render the gear icon on the far right of the tab bar.
-fn render_gear(
-    instances: &mut Vec<CellInstance>,
-    hit_targets: &mut TabBarHitTargets,
-    mut col: usize,
-    max_cols: usize,
-    params: &mut TabBarTextParams<'_>,
-) {
-    if max_cols < 2 {
-        return;
-    }
-
-    let bg = params.colors.bg;
-
-    // Position the gear at the rightmost column.
-    let gear_col = max_cols - 1;
-
-    // Fill gap between last tab and gear with background.
-    while col < gear_col {
-        col = emit_char(instances, ' ', col, max_cols, params, params.colors.text, bg);
-    }
-
-    let gear_start_col = col;
-    col = emit_char(instances, '\u{2699}', col, max_cols, params, params.colors.text, bg);
-
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "column index is a small positive integer fitting in f32"
-    )]
-    {
-        let (cell_w, _) = params.cell_size;
-        let gear_x = params.rect.x + gear_start_col as f32 * cell_w;
-        let gear_width = (col - gear_start_col) as f32 * cell_w;
-        hit_targets.gear_rect = Some(Rect {
-            x: gear_x,
-            y: params.rect.y,
-            width: gear_width,
-            height: params.tab_bar_height,
-        });
-    }
-}
-
-/// Render the equalize icon (⊞) just left of the gear icon's reserved space.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "helper function that needs all render context from build_tab_bar_text"
-)]
-fn render_equalize(
-    instances: &mut Vec<CellInstance>,
-    hit_targets: &mut TabBarHitTargets,
-    mut col: usize,
-    max_cols: usize,
-    gear_cols: usize,
-    params: &mut TabBarTextParams<'_>,
-) -> usize {
-    // Need at least 2 cols for equalize + gear reserved space.
-    if max_cols < 2 {
-        return col;
-    }
-
-    let bg = params.colors.bg;
-
-    // Equalize icon sits at the rightmost column before the gear's reserved space.
-    let equalize_col = max_cols.saturating_sub(gear_cols).saturating_sub(1);
-
-    // Fill gap between last tab and equalize icon with background.
-    while col < equalize_col {
-        col = emit_char(instances, ' ', col, max_cols, params, params.colors.text, bg);
-    }
-
-    let equalize_start_col = col;
-    col = emit_char(instances, '\u{229E}', col, max_cols, params, params.colors.text, bg);
-
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "column index is a small positive integer fitting in f32"
-    )]
-    {
-        let (cell_w, _) = params.cell_size;
-        let equalize_x = params.rect.x + equalize_start_col as f32 * cell_w;
-        let equalize_width = (col - equalize_start_col) as f32 * cell_w;
-        hit_targets.equalize_rect = Some(Rect {
-            x: equalize_x,
-            y: params.rect.y,
-            width: equalize_width,
-            height: params.tab_bar_height,
-        });
-    }
-
-    col
-}
-
-/// Emit a single character instance at the given column, returning the next
-/// column index.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "helper function that needs all render context parameters"
-)]
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "column index is a small positive integer fitting in f32"
-)]
-fn emit_char(
-    instances: &mut Vec<CellInstance>,
-    ch: char,
-    col: usize,
-    max_cols: usize,
-    params: &mut TabBarTextParams<'_>,
-    fg: [f32; 4],
-    bg: [f32; 4],
-) -> usize {
-    if col >= max_cols {
-        return col;
-    }
-
-    let (cell_w, cell_h) = params.cell_size;
-    let x = params.rect.x + col as f32 * cell_w;
-    let y = params.rect.y + ((params.tab_bar_height - cell_h) / 2.0).max(0.0);
-    let (uv_min, uv_max) = (params.resolve_glyph)(ch);
-
-    instances.push(CellInstance {
-        pos: [x, y],
-        size: [0.0, 0.0],
-        uv_min,
-        uv_max,
-        fg_color: fg,
-        bg_color: bg,
-        corner_radius: 0.0,
-        _pad: 0.0,
-    });
-
-    col + 1
-}
-
 /// Calculate how many cell-width columns fit in a given pixel width.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "width / cell_w yields a small positive value fitting in usize"
-)]
 fn columns_in_width(width: f32, cell_w: f32) -> usize {
-    if cell_w <= 0.0 { 0 } else { (width / cell_w) as usize }
+    if cell_w <= 0.0 || !width.is_finite() || width <= 0.0 {
+        return 0;
+    }
+
+    let mut low = 0usize;
+    let mut high = 1usize;
+    while high < MAX_RENDER_GRID_UNITS && columns_to_pixels(high, cell_w) <= width {
+        low = high;
+        high = high.saturating_mul(2).min(MAX_RENDER_GRID_UNITS);
+        if high == low {
+            break;
+        }
+    }
+
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if columns_to_pixels(mid, cell_w) <= width {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+
+    low
 }
 
 /// Calculate how many columns a pixel gap requires.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "gap_px / cell_w yields a small positive value fitting in usize"
-)]
 fn gap_columns(gap_px: f32, cell_w: f32) -> usize {
-    if cell_w <= 0.0 { 0 } else { (gap_px / cell_w).ceil() as usize }
+    if cell_w <= 0.0 || !gap_px.is_finite() || gap_px <= 0.0 {
+        return 0;
+    }
+
+    let floor_cols = columns_in_width(gap_px, cell_w);
+    if columns_to_pixels(floor_cols, cell_w) < gap_px {
+        floor_cols.saturating_add(1).min(MAX_RENDER_GRID_UNITS)
+    } else {
+        floor_cols
+    }
 }
 
 /// Maximum fraction of pane width that the title pill may occupy.
@@ -935,23 +911,26 @@ pub const PILL_MAX_WIDTH_FRACTION: f32 = 0.3;
 /// the first terminal content line (`pane_rect.y` + `tab_bar_height` for top-edge
 /// panes, or `pane_rect.y` otherwise). Its height is exactly one cell height.
 /// Title is truncated with `…` if it exceeds 30% of the pane width.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "all parameters are needed to position and render the pill with correct colors and glyphs"
-)]
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "character counts are small positive integers fitting in f32"
-)]
-pub fn build_pane_title_pill(
-    out: &mut Vec<CellInstance>,
-    title: &str,
-    pane_rect: Rect,
-    tab_bar_height: f32,
-    cell_size: (f32, f32),
-    colors: &TabBarColors,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
+pub struct PaneTitlePillContext<'a, 'b> {
+    pub out: &'a mut Vec<CellInstance>,
+    pub title: &'b str,
+    pub pane_rect: Rect,
+    pub tab_bar_height: f32,
+    pub cell_size: (f32, f32),
+    pub colors: &'b TabBarColors,
+    pub resolve_glyph: &'a mut GlyphResolver<'a>,
+}
+
+pub fn build_pane_title_pill(ctx: PaneTitlePillContext<'_, '_>) {
+    let PaneTitlePillContext {
+        out,
+        title,
+        pane_rect,
+        tab_bar_height,
+        cell_size,
+        colors,
+        resolve_glyph,
+    } = ctx;
     let (cell_w, cell_h) = cell_size;
     if cell_w <= 0.0 || cell_h <= 0.0 {
         return;
@@ -962,13 +941,7 @@ pub fn build_pane_title_pill(
 
     // Maximum chars allowed (30% of pane width, minus 2 padding chars).
     let pane_cols = columns_in_width(pane_rect.width, cell_w);
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "bounded non-negative value"
-    )]
-    let max_content_cols =
-        ((pane_cols as f32 * PILL_MAX_WIDTH_FRACTION) as usize).saturating_sub(2);
+    let max_content_cols = pane_cols.saturating_mul(3).saturating_div(10).saturating_sub(2);
     if max_content_cols == 0 {
         return;
     }
@@ -989,7 +962,7 @@ pub fn build_pane_title_pill(
     // Pill width: 1 padding + content + 1 padding.
     let content_len = display_chars.len();
     let pill_cols = content_len + 2;
-    let pill_width = pill_cols as f32 * cell_w;
+    let pill_width = columns_to_pixels(pill_cols, cell_w);
 
     // X position: inset by 1 cell from the right edge of the pane.
     let pill_x = (pane_rect.x + pane_rect.width - pill_width - cell_w).max(pane_rect.x);
@@ -1007,7 +980,7 @@ pub fn build_pane_title_pill(
     // Emit each content character.
     for (i, &ch) in display_chars.iter().enumerate() {
         // +1 to skip the leading padding column.
-        let char_x = pill_x + (i + 1) as f32 * cell_w;
+        let char_x = pill_x + columns_to_pixels(i + 1, cell_w);
         let (uv_min, uv_max) = resolve_glyph(ch);
         out.push(CellInstance {
             pos: [char_x, text_y],
@@ -1017,7 +990,6 @@ pub fn build_pane_title_pill(
             fg_color: text_color,
             bg_color: [0.0; 4],
             corner_radius: 0.0,
-            _pad: 0.0,
         });
     }
 }

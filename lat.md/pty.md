@@ -72,7 +72,7 @@ Shell integration prompt marks with optional exit codes. These are forwarded as 
 
 VTE synchronized updates buffer terminal bytes between `CSI ? 2026 h` and `CSI ? 2026 l` so multi-step redraws appear atomically.
 
-Scribe uses the VTE processor's built-in sync buffer in both the client and the server-side Term pipeline. The server forwards raw `CSI ? 2026 h/l` markers unchanged, and [[crates/scribe-pty/src/sync_update_filter.rs#SyncUpdateFrameSplitter]] preserves those raw commit boundaries across arbitrary PTY IPC chunking before [[crates/scribe-client/src/main.rs#App#drain_pane_output_until_frame]] stages committed bursts on a pane-local redraw queue. Light traffic can still animate one committed burst per redraw, but once a pane accumulates a larger backlog the client drains through stale bursts and presents the latest committed terminal state on the next redraw. The event loop stays in `ControlFlow::Poll` while queued bursts remain, and both sides still flush expired sync blocks on timeout so snapshots, reconnects, and stalled TUIs see the committed content.
+Scribe uses the VTE processor's built-in sync buffer in both the client and the server-side Term pipeline. The server forwards raw `CSI ? 2026 h/l` markers unchanged, and [[crates/scribe-pty/src/sync_update_filter.rs#SyncUpdateFrameSplitter]] preserves those raw commit boundaries across arbitrary PTY IPC chunking before [[crates/scribe-client/src/main.rs#App#drain_pane_output_until_frame]] stages committed bursts on a pane-local redraw queue. Light traffic can still animate one committed burst per redraw, but once a pane accumulates a larger backlog the client drains through stale bursts and presents the latest committed terminal state on the next redraw. The event loop stays in `ControlFlow::Poll` while queued bursts remain, and both sides still flush expired sync blocks on timeout so snapshots, reconnects, and stalled TUIs see the committed content. When the client-side splitter itself times out before it has emitted a committed frame, it flushes the buffered visible bytes without the leading BSU marker so the pane-local VTE sees the timed-out content once instead of starting a fresh synchronized update.
 
 Normal session panes still receive the raw `CSI ? 2026 h/l` markers end to end. Only the client-side queueing logic uses the shared raw-frame splitter to preserve commit boundaries before those bytes reach the pane-local VTE processor.
 
@@ -80,13 +80,19 @@ Normal session panes still receive the raw `CSI ? 2026 h/l` markers end to end. 
 
 The [[crates/scribe-pty/src/ed3_filter.rs#Ed3Filter]] strips CSI ED 3 (`\x1b[3J`) from AI PTY output when `preserve_ai_scrollback` is enabled (default on).
 
-Only runs for Claude Code / Codex Code sessions when `preserve_ai_scrollback` is `true`. Regular shell sessions are never filtered. Enabled by default so AI sessions keep earlier transcript history unless the user opts back into standard terminal scrollback clearing. The filter drops ED 3 entirely rather than converting it to ED 2, because a standalone ED 3 (e.g. Codex exit cleanup) must not erase the visible screen — if the program also wants a visible clear it sends its own ED 2.
+Only runs for Claude Code / Codex Code sessions when `preserve_ai_scrollback` is `true`. Regular shell sessions are never filtered. Enabled by default so AI sessions keep earlier transcript history unless the user opts back into standard terminal scrollback clearing. The filter drops ED 3 entirely rather than converting it to ED 2, because a standalone ED 3 (e.g. Codex exit cleanup) must not erase the visible screen — if the program also wants a visible clear it sends its own ED 2. The PTY reader records the first preserved history size as the baseline and trims later AI redraw clears back to that baseline, so preserved shell history survives without repeated inline redraw frames piling up in scrollback. The PTY reader's `ai_provider` is set on the first `AiStateChanged` and never cleared — `AiStateCleared` is still forwarded to the client for UI tracking, but the filter decision persists across tool restarts so an ED 3 sent before the tool re-identifies via OSC 1337 is still caught.
 
 ### Scroll-Bottom on Suppression
 
 When the filter suppresses ED 3, the PTY reader sends a [[crates/scribe-common/src/protocol.rs#ServerMessage]]`::ScrollBottom` so the client snaps the viewport to bottom.
 
 A real ED 3 resets `display_offset` to 0 inside alacritty_terminal's `clear_history`. Stripping it without this compensating message would leave the viewport stuck at a stale scroll position while the live terminal redraws below the visible area.
+
+### Baseline Trim on Repaint
+
+When a later ED 3 arrives after baseline capture, the PTY reader trims the server Term back to that preserved history size and sends [[crates/scribe-common/src/protocol.rs#ServerMessage]]`::TrimScrollback` before forwarding the redraw bytes.
+
+The client flushes any queued PTY output for that pane, trims its own Term back to the same baseline, and then applies the new bytes. This keeps preserved shell history while preventing Claude or Codex inline redraws from stacking duplicate transcript frames above it.
 
 ### State Machine
 

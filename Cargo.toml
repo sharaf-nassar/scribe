@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["third_party/*"]
 resolver = "3"
 
 [workspace.package]
@@ -61,11 +62,14 @@ nix = { version = "0.31", features = [
   "process",
   "signal",
   "fs",
+  "hostname",
   "user",
   "socket",
   "uio",
 ] }
+rustix = { version = "1.1", features = ["net"] }
 libc = "0.2"
+unix-ancillary = "0.1"
 x11rb = { version = "0.13", default-features = false }
 raw-window-handle = "0.6"
 
@@ -137,6 +141,8 @@ shadow_unrelated = "deny"
 rc_mutex = "deny"
 clone_on_ref_ptr = "deny"
 let_underscore_must_use = "deny"
+# Full allow/expect bans are enforced on new diffs by
+# tools/check-no-new-lint-suppressions.sh until legacy narrow allows are retired.
 allow_attributes_without_reason = "deny"
 await_holding_lock = "deny"
 
@@ -160,3 +166,9 @@ cargo_common_metadata = "allow"
 opt-level = 3
 lto = "thin"
 strip = true
+
+# Local fork of unix-ancillary 0.1.0 — upstream 0.1.0 fails to compile on Apple
+# targets because `set_cloexec` references `io::Result` without importing
+# `std::io`. Drop this patch once a fixed release ships on crates.io.
+[patch.crates-io]
+unix-ancillary = { path = "third_party/unix-ancillary" }

@@ -275,7 +275,7 @@ async fn check_for_update(
     }
 
     let remote_ver = parse_version(&release.tag_name)?;
-    let local_ver = current_version();
+    let local_ver = current_version()?;
 
     if remote_ver > local_ver {
         Ok(Some((release.tag_name.trim_start_matches('v').to_owned(), release.html_url)))
@@ -368,7 +368,7 @@ async fn download_both(
 }
 
 fn verify_signature(asset_path: &Path, sig_path: &Path) -> Result<(), ScribeError> {
-    let pk = minisign_verify::PublicKey::decode(MINISIGN_PUBLIC_KEY)
+    let pk = minisign_verify::PublicKey::from_base64(MINISIGN_PUBLIC_KEY)
         .map_err(|e| ScribeError::UpdateInstallFailed { reason: format!("bad public key: {e}") })?;
 
     let sig_bytes = std::fs::read(sig_path).map_err(|e| ScribeError::Io { source: e })?;
@@ -659,9 +659,12 @@ fn parse_version(tag: &str) -> Result<semver::Version, ScribeError> {
         .map_err(|e| ScribeError::UpdateCheckFailed { reason: format!("bad version '{tag}': {e}") })
 }
 
-fn current_version() -> semver::Version {
-    #[allow(clippy::unwrap_used, reason = "CARGO_PKG_VERSION is always valid semver set by Cargo")]
-    semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap()
+fn current_version() -> Result<semver::Version, ScribeError> {
+    semver::Version::parse(env!("CARGO_PKG_VERSION")).map_err(|error| {
+        ScribeError::UpdateCheckFailed {
+            reason: format!("invalid CARGO_PKG_VERSION '{}': {error}", env!("CARGO_PKG_VERSION")),
+        }
+    })
 }
 
 // ── Broadcast helper ──────────────────────────────────────────────

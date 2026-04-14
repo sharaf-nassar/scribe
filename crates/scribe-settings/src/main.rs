@@ -7,16 +7,12 @@ fn main() {
     init_tracing();
 
     // Attempt to become the singleton settings process.
-    #[allow(
-        clippy::used_underscore_binding,
-        reason = "lock_file is kept alive for its drop guard; underscore prefix signals intent"
-    )]
-    let (listener, socket_path, _lock_file) = match scribe_settings::singleton::acquire() {
+    let (listener, socket_path, lock_file_guard) = match scribe_settings::singleton::acquire() {
         Ok(scribe_settings::singleton::SingletonResult::Primary {
             listener,
             socket_path,
-            _lock_file,
-        }) => (listener, socket_path, _lock_file),
+            lock_file,
+        }) => (listener, socket_path, lock_file),
         Ok(scribe_settings::singleton::SingletonResult::AlreadyRunning) => {
             tracing::info!("another settings instance is running, sent focus and exiting");
             return;
@@ -74,13 +70,14 @@ fn main() {
             geometry: saved_geometry,
         });
     }
+
+    drop(lock_file_guard);
 }
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
 
-    #[allow(clippy::unwrap_used, reason = "EnvFilter::new with static string cannot fail")]
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().map_or(EnvFilter::new("info"), |filter| filter);
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }

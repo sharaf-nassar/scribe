@@ -42,29 +42,21 @@ impl SplitScrollState {
 }
 
 /// Precomputed geometry for the split-scroll viewport.
-#[allow(clippy::struct_field_names, reason = "rects are semantically distinct regions")]
 pub struct SplitScrollGeometry {
-    /// Full content area of the pane (below tab bar / prompt bar).
-    #[allow(dead_code, reason = "kept for future scrollbar confinement")]
-    pub content_rect: Rect,
     /// The top portion showing scrollback.
-    pub top_rect: Rect,
+    pub top: Rect,
     /// The 1px divider line.
-    pub divider_rect: Rect,
+    pub divider: Rect,
     /// The bottom portion showing live terminal.
-    pub bottom_rect: Rect,
+    pub bottom: Rect,
     /// The jump-to-bottom button rect.
-    pub jump_btn_rect: Rect,
+    pub jump_button: Rect,
 }
 
 /// Compute the number of rows to pin at the bottom, based on cursor position.
 ///
 /// `cursor_line` is 0-indexed from the top of the visible screen (at
 /// `display_offset = 0`).  The result is clamped to `[MIN_PIN_ROWS, max_rows]`.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "screen_lines is a small terminal dimension fitting in usize"
-)]
 pub fn compute_pin_rows(cursor_line: usize, screen_lines: usize) -> usize {
     let max_rows = screen_lines / 2;
     // Rows from cursor to bottom, plus 2 rows of margin above cursor.
@@ -74,11 +66,6 @@ pub fn compute_pin_rows(cursor_line: usize, screen_lines: usize) -> usize {
 
 /// Expand the pinned bottom upward so the split never starts mid-way through
 /// a soft-wrapped logical line, while still leaving room for the top portion.
-#[allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_possible_truncation,
-    reason = "screen row indices are bounded by terminal dimensions and fit in i32"
-)]
 pub fn align_pin_rows_to_logical_lines(
     term: &Term<VoidListener>,
     pin_rows: usize,
@@ -95,7 +82,12 @@ pub fn align_pin_rows_to_logical_lines(
 
     while boundary_row > 0
         && aligned_pin_rows < max_pin_rows
-        && term.grid()[Line(boundary_row as i32 - 1)][last_col].flags.contains(Flags::WRAPLINE)
+        && read_cell_flags(
+            term,
+            Line(i32::try_from(boundary_row).unwrap_or(i32::MAX).saturating_sub(1)),
+            last_col,
+        )
+        .contains(Flags::WRAPLINE)
     {
         boundary_row -= 1;
         aligned_pin_rows += 1;
@@ -133,7 +125,21 @@ pub fn compute_geometry(content_rect: Rect, pin_height: f32) -> SplitScrollGeome
         height: JUMP_BTN_SIZE,
     };
 
-    SplitScrollGeometry { content_rect, top_rect, divider_rect, bottom_rect, jump_btn_rect }
+    SplitScrollGeometry {
+        top: top_rect,
+        divider: divider_rect,
+        bottom: bottom_rect,
+        jump_button: jump_btn_rect,
+    }
+}
+
+pub struct SplitScrollChromeRequest<'a> {
+    pub out: &'a mut Vec<CellInstance>,
+    pub geometry: &'a SplitScrollGeometry,
+    pub divider_color: [f32; 4],
+    pub jump_button_hovered: bool,
+    pub accent_color: [f32; 4],
+    pub resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
 }
 
 /// Filter instances, keeping only those whose `pos[1]` (Y) falls in `[y_min, y_max)`.
@@ -146,44 +152,35 @@ pub fn filter_instances_by_y(
 }
 
 /// Render the split-scroll chrome: divider line and jump-to-bottom button.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "chrome rendering needs geometry, colors, hover state, and glyph resolver"
-)]
-pub fn render_chrome(
-    out: &mut Vec<CellInstance>,
-    geo: &SplitScrollGeometry,
-    divider_color: [f32; 4],
-    jump_btn_hovered: bool,
-    accent_color: [f32; 4],
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
+pub fn render_chrome(request: SplitScrollChromeRequest<'_>) {
+    let out = request.out;
+    let geo = request.geometry;
     // Divider line.
-    push_solid_rect(out, geo.divider_rect, divider_color);
+    push_solid_rect(out, geo.divider, request.divider_color);
 
     // Jump-to-bottom button background (rounded).
-    let btn_bg = if jump_btn_hovered {
-        [accent_color[0], accent_color[1], accent_color[2], 0.35]
+    let btn_bg = if request.jump_button_hovered {
+        [request.accent_color[0], request.accent_color[1], request.accent_color[2], 0.35]
     } else {
-        [accent_color[0], accent_color[1], accent_color[2], 0.18]
+        [request.accent_color[0], request.accent_color[1], request.accent_color[2], 0.18]
     };
     out.push(CellInstance {
-        pos: [geo.jump_btn_rect.x, geo.jump_btn_rect.y],
-        size: [geo.jump_btn_rect.width, geo.jump_btn_rect.height],
+        pos: [geo.jump_button.x, geo.jump_button.y],
+        size: [geo.jump_button.width, geo.jump_button.height],
         uv_min: [0.0, 0.0],
         uv_max: [0.0, 0.0],
         fg_color: btn_bg,
         bg_color: btn_bg,
         corner_radius: 4.0,
-        _pad: 0.0,
     });
 
     // Jump icon glyph centered in button.
-    let (uv_min, uv_max) = resolve_glyph(JUMP_ICON);
-    let icon_color = if jump_btn_hovered { [1.0, 1.0, 1.0, 0.9] } else { [1.0, 1.0, 1.0, 0.55] };
+    let (uv_min, uv_max) = (request.resolve_glyph)(JUMP_ICON);
+    let icon_color =
+        if request.jump_button_hovered { [1.0, 1.0, 1.0, 0.9] } else { [1.0, 1.0, 1.0, 0.55] };
     // Center glyph in the button.
-    let glyph_x = geo.jump_btn_rect.x + 3.0;
-    let glyph_y = geo.jump_btn_rect.y + 1.0;
+    let glyph_x = geo.jump_button.x + 3.0;
+    let glyph_y = geo.jump_button.y + 1.0;
     out.push(CellInstance {
         pos: [glyph_x, glyph_y],
         size: [0.0, 0.0], // use uniform cell size
@@ -192,13 +189,12 @@ pub fn render_chrome(
         fg_color: icon_color,
         bg_color: btn_bg,
         corner_radius: 0.0,
-        _pad: 0.0,
     });
 }
 
 /// Hit-test the jump-to-bottom button.
 pub fn hit_test_jump_btn(geo: &SplitScrollGeometry, x: f32, y: f32) -> bool {
-    geo.jump_btn_rect.contains(x, y)
+    geo.jump_button.contains(x, y)
 }
 
 /// Push a solid-color rectangle.
@@ -211,6 +207,15 @@ fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
         fg_color: color,
         bg_color: color,
         corner_radius: 0.0,
-        _pad: 0.0,
     });
+}
+
+fn read_cell_flags(term: &Term<VoidListener>, line: Line, col: Column) -> Flags {
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "alacritty_terminal grid only supports Index trait, no get() alternative"
+    )]
+    {
+        term.grid()[line][col].flags
+    }
 }

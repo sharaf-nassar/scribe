@@ -14,6 +14,7 @@ mod attach_flow;
 mod config;
 mod handoff;
 mod ipc_server;
+mod macos_proc;
 mod session_manager;
 mod shell_integration;
 mod updater;
@@ -29,8 +30,7 @@ fn main() -> Result<(), ScribeError> {
     // Set TERM/COLORTERM before any threads are spawned.
     alacritty_terminal::tty::setup_env();
 
-    #[allow(clippy::unwrap_used, reason = "EnvFilter::new with static string cannot fail")]
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().map_or(EnvFilter::new("info"), |filter| filter);
 
     fmt().with_env_filter(filter).init();
 
@@ -51,12 +51,10 @@ async fn run_normal_server() -> Result<(), ScribeError> {
 
     let cfg = config::load_config()?;
 
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "scrollback_lines is clamped to 100_000 in config which fits usize"
-    )]
     let session_manager = {
-        let sm = session_manager::SessionManager::with_scrollback(cfg.scrollback_lines as usize);
+        let sm = session_manager::SessionManager::with_scrollback(
+            usize::try_from(cfg.scrollback_lines).unwrap_or(usize::MAX),
+        );
         sm.set_shell_integration_enabled(cfg.shell_integration_enabled);
         Arc::new(sm)
     };
@@ -87,11 +85,7 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
     );
 
     // Reconstruct managers from handoff state.
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "scrollback_lines is clamped to 100_000 in config which fits usize"
-    )]
-    let scrollback = cfg.scrollback_lines as usize;
+    let scrollback = usize::try_from(cfg.scrollback_lines).unwrap_or(usize::MAX);
 
     let session_manager =
         Arc::new(session_manager::SessionManager::restore_from_handoff(&state, fds, scrollback)?);
@@ -116,7 +110,6 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
 /// Shared between normal and upgrade startup paths. Cleans up the IPC socket
 /// on exit. `upgrade_mode` is forwarded to the socket acquisition logic so
 /// that upgrade receivers skip the singleton lock (the old server holds it).
-#[allow(clippy::too_many_arguments, reason = "server loop requires all server subsystems")]
 async fn run_server_loop(
     session_manager: Arc<session_manager::SessionManager>,
     workspace_manager: Arc<RwLock<workspace_manager::WorkspaceManager>>,
@@ -145,11 +138,13 @@ async fn run_server_loop(
     let handoff_triggered = tokio::select! {
         result = ipc_server::start_ipc_server(
             listener,
-            Arc::clone(&session_manager),
-            Arc::clone(&workspace_manager),
-            Arc::clone(&live_sessions),
-            Arc::clone(&connected_clients),
-            Arc::clone(&updater_handle),
+            ipc_server::IpcServerState {
+                session_manager: Arc::clone(&session_manager),
+                workspace_manager: Arc::clone(&workspace_manager),
+                live_sessions: Arc::clone(&live_sessions),
+                connected_clients: Arc::clone(&connected_clients),
+                updater_handle: Arc::clone(&updater_handle),
+            },
         ) => {
             result?;
             false

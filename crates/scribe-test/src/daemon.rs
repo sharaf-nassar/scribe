@@ -223,17 +223,12 @@ pub async fn run() -> Result<(), ScribeError> {
 
 /// Remove a stale socket file if it exists.
 async fn cleanup_stale_socket(path: &PathBuf) {
-    #[allow(
-        clippy::let_underscore_must_use,
-        reason = "best-effort removal of stale socket; ignore errors"
-    )]
-    let _ = tokio::fs::remove_file(path).await;
+    drop(tokio::fs::remove_file(path).await);
 }
 
 /// Remove the daemon socket on shutdown.
 async fn cleanup_socket(path: &PathBuf) {
-    #[allow(clippy::let_underscore_must_use, reason = "best-effort cleanup on shutdown")]
-    let _ = tokio::fs::remove_file(path).await;
+    drop(tokio::fs::remove_file(path).await);
 }
 
 /// Bind the daemon Unix socket.
@@ -260,12 +255,52 @@ async fn server_reader_loop(
 }
 
 /// Dispatch a single `ServerMessage` to the appropriate session state.
-#[allow(
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    reason = "flat match dispatch on server message variants; each arm is a one-line delegation"
-)]
 async fn dispatch_server_message(
+    msg: ServerMessage,
+    state: &SharedState,
+    notifiers: &Arc<WaitNotifiers>,
+) {
+    match msg {
+        msg @ (ServerMessage::PtyOutput { .. }
+        | ServerMessage::ScreenSnapshot { .. }
+        | ServerMessage::CwdChanged { .. }
+        | ServerMessage::TitleChanged { .. }
+        | ServerMessage::SessionCreated { .. }
+        | ServerMessage::SessionExited { .. }
+        | ServerMessage::SessionContextChanged { .. }
+        | ServerMessage::TrimScrollback { .. }
+        | ServerMessage::ScrollBottom { .. }) => {
+            dispatch_session_message(msg, state, notifiers).await;
+        }
+        msg @ (ServerMessage::WorkspaceInfo { .. }
+        | ServerMessage::WorkspaceNamed { .. }
+        | ServerMessage::Welcome { .. }
+        | ServerMessage::WindowClosed { .. }
+        | ServerMessage::QuitRequested
+        | ServerMessage::UpdateAvailable { .. }
+        | ServerMessage::UpdateProgress { .. }
+        | ServerMessage::WindowList { .. }
+        | ServerMessage::RunAction { .. }
+        | ServerMessage::ActionDispatched { .. }) => {
+            dispatch_window_message(msg, state, notifiers).await;
+        }
+        msg @ (ServerMessage::CodexTaskLabelChanged { .. }
+        | ServerMessage::CodexTaskLabelCleared { .. }
+        | ServerMessage::AiStateChanged { .. }
+        | ServerMessage::AiStateCleared { .. }
+        | ServerMessage::GitBranch { .. }
+        | ServerMessage::Bell { .. }
+        | ServerMessage::Error { .. }
+        | ServerMessage::SessionList { .. }
+        | ServerMessage::SearchResults { .. }
+        | ServerMessage::PromptMark { .. }
+        | ServerMessage::PromptReceived { .. }) => {
+            dispatch_notice_message(msg);
+        }
+    }
+}
+
+async fn dispatch_session_message(
     msg: ServerMessage,
     state: &SharedState,
     notifiers: &Arc<WaitNotifiers>,
@@ -283,53 +318,42 @@ async fn dispatch_server_message(
         ServerMessage::TitleChanged { session_id, title } => {
             handle_title_changed(session_id, title, state).await;
         }
-        ServerMessage::CodexTaskLabelChanged { session_id, task_label } => {
-            debug!(%session_id, %task_label, "codex task label changed (ignored by test daemon)");
-        }
-        ServerMessage::CodexTaskLabelCleared { session_id } => {
-            debug!(%session_id, "codex task label cleared (ignored by test daemon)");
-        }
         ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
             handle_session_created(session_id, workspace_id, &shell_name, state, notifiers).await;
         }
         ServerMessage::SessionExited { session_id, exit_code } => {
             handle_session_exited(session_id, exit_code, state, notifiers).await;
         }
+        ServerMessage::SessionContextChanged { session_id, context } => {
+            debug!(%session_id, ?context, "session context changed (ignored by test daemon)");
+        }
+        ServerMessage::TrimScrollback { session_id, history_rows } => {
+            debug!(%session_id, history_rows, "trim scrollback (ignored by test daemon)");
+        }
+        ServerMessage::ScrollBottom { session_id } => {
+            debug!(%session_id, "scroll bottom (ignored by test daemon)");
+        }
+        other => debug!(?other, "ignored non-session server message in session dispatcher"),
+    }
+}
+
+async fn dispatch_window_message(
+    msg: ServerMessage,
+    state: &SharedState,
+    notifiers: &Arc<WaitNotifiers>,
+) {
+    match msg {
         ServerMessage::WorkspaceInfo { workspace_id, .. } => {
             handle_workspace_info(workspace_id, state, notifiers).await;
         }
-        ServerMessage::AiStateChanged { session_id, ai_state } => {
-            debug!(%session_id, ?ai_state, "AI state changed");
-        }
-        ServerMessage::GitBranch { session_id, branch } => {
-            debug!(%session_id, ?branch, "git branch updated");
-        }
         ServerMessage::WorkspaceNamed { workspace_id, name, .. } => {
             debug!(%workspace_id, %name, "workspace named");
-        }
-        ServerMessage::Bell { session_id } => {
-            debug!(%session_id, "bell");
-        }
-        ServerMessage::Error { message } => {
-            error!(%message, "server error");
-        }
-        ServerMessage::SessionList { .. } => {
-            debug!("received session list (ignored by test daemon)");
-        }
-        ServerMessage::ScrolledSnapshot { session_id, .. } => {
-            debug!(%session_id, "scrolled snapshot (ignored by test daemon)");
-        }
-        ServerMessage::SearchResults { session_id, .. } => {
-            debug!(%session_id, "search results (ignored by test daemon)");
         }
         ServerMessage::Welcome { window_id, .. } => {
             debug!(%window_id, "welcome (ignored by test daemon)");
         }
         ServerMessage::WindowClosed { window_id } => {
             debug!(%window_id, "window closed (ignored by test daemon)");
-        }
-        ServerMessage::AiStateCleared { session_id } => {
-            debug!(%session_id, "AI state cleared (ignored by test daemon)");
         }
         ServerMessage::QuitRequested => {
             debug!("quit requested (ignored by test daemon)");
@@ -340,15 +364,6 @@ async fn dispatch_server_message(
         ServerMessage::UpdateProgress { .. } => {
             debug!("update progress (ignored by test daemon)");
         }
-        ServerMessage::PromptMark { session_id, .. } => {
-            debug!(%session_id, "prompt mark (ignored by test daemon)");
-        }
-        ServerMessage::PromptReceived { session_id, .. } => {
-            debug!(%session_id, "prompt received (ignored by test daemon)");
-        }
-        ServerMessage::SessionContextChanged { session_id, context } => {
-            debug!(%session_id, ?context, "session context changed (ignored by test daemon)");
-        }
         ServerMessage::WindowList { windows } => {
             debug!(count = windows.len(), "window list (ignored by test daemon)");
         }
@@ -358,9 +373,46 @@ async fn dispatch_server_message(
         ServerMessage::ActionDispatched { window_id } => {
             debug!(%window_id, "action dispatched (ignored by test daemon)");
         }
-        ServerMessage::ScrollBottom { session_id } => {
-            debug!(%session_id, "scroll bottom (ignored by test daemon)");
+        other => debug!(?other, "ignored non-window server message in window dispatcher"),
+    }
+}
+
+fn dispatch_notice_message(msg: ServerMessage) {
+    match msg {
+        ServerMessage::CodexTaskLabelChanged { session_id, task_label } => {
+            debug!(%session_id, %task_label, "codex task label changed (ignored by test daemon)");
         }
+        ServerMessage::CodexTaskLabelCleared { session_id } => {
+            debug!(%session_id, "codex task label cleared (ignored by test daemon)");
+        }
+        ServerMessage::AiStateChanged { session_id, ai_state } => {
+            debug!(%session_id, ?ai_state, "AI state changed");
+        }
+        ServerMessage::AiStateCleared { session_id } => {
+            debug!(%session_id, "AI state cleared (ignored by test daemon)");
+        }
+        ServerMessage::GitBranch { session_id, branch } => {
+            debug!(%session_id, ?branch, "git branch updated");
+        }
+        ServerMessage::Bell { session_id } => {
+            debug!(%session_id, "bell");
+        }
+        ServerMessage::Error { message } => {
+            error!(%message, "server error");
+        }
+        ServerMessage::SessionList { .. } => {
+            debug!("received session list (ignored by test daemon)");
+        }
+        ServerMessage::SearchResults { session_id, .. } => {
+            debug!(%session_id, "search results (ignored by test daemon)");
+        }
+        ServerMessage::PromptMark { session_id, .. } => {
+            debug!(%session_id, "prompt mark (ignored by test daemon)");
+        }
+        ServerMessage::PromptReceived { session_id, .. } => {
+            debug!(%session_id, "prompt received (ignored by test daemon)");
+        }
+        other => debug!(?other, "ignored non-notice server message in notice dispatcher"),
     }
 }
 
@@ -816,11 +868,7 @@ async fn handle_wait_output(
                 message: format!("timed out waiting for output matching /{pattern}/"),
             };
         }
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "timeout expiry is handled by the loop condition"
-        )]
-        let _ = tokio::time::timeout(remaining, notifiers.output.notified()).await;
+        drop(tokio::time::timeout(remaining, notifiers.output.notified()).await);
     }
 }
 
@@ -857,11 +905,7 @@ async fn handle_wait_cwd(
                 message: format!("timed out waiting for CWD to match {path}"),
             };
         }
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "timeout expiry is handled by the loop condition"
-        )]
-        let _ = tokio::time::timeout(remaining, notifiers.cwd.notified()).await;
+        drop(tokio::time::timeout(remaining, notifiers.cwd.notified()).await);
     }
 }
 
@@ -1186,11 +1230,7 @@ async fn handle_assert_exit(
                         message: format!("timed out waiting for {session_id} to exit"),
                     };
                 }
-                #[allow(
-                    clippy::let_underscore_must_use,
-                    reason = "timeout expiry is handled by the loop condition"
-                )]
-                let _ = tokio::time::timeout(remaining, notifiers.exit.notified()).await;
+                drop(tokio::time::timeout(remaining, notifiers.exit.notified()).await);
             }
         }
     }

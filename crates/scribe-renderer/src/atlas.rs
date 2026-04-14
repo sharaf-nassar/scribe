@@ -14,10 +14,84 @@ use crate::types::CellSize;
 /// Atlas texture size (width = height).
 const ATLAS_SIZE: u32 = 1024;
 
+fn atlas_units_f32(units: u32) -> f32 {
+    f32::from(u16::try_from(units).unwrap_or(u16::MAX))
+}
+
+fn atlas_signed_units_f32(units: i32) -> f32 {
+    if units >= 0 {
+        atlas_units_f32(u32::try_from(units).unwrap_or(u32::MAX))
+    } else {
+        -atlas_units_f32(units.unsigned_abs())
+    }
+}
+
+fn atlas_nonnegative_i32_to_u32(units: i32) -> u32 {
+    u32::try_from(units.max(0)).unwrap_or(u32::MAX)
+}
+
+fn atlas_ceil_u16(value: f32) -> u16 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+
+    let mut low = 0u16;
+    let mut high = u16::MAX;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if f32::from(mid) < value {
+            low = mid.saturating_add(1);
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+fn atlas_ceil_u32(value: f32) -> u32 {
+    u32::from(atlas_ceil_u16(value))
+}
+
+fn atlas_round_u8(value: f32) -> u8 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+
+    let target = value + 0.5;
+    let mut low = 0u8;
+    let mut high = u8::MAX;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if f32::from(mid) < target {
+            low = mid.saturating_add(1);
+        } else {
+            high = mid;
+        }
+    }
+    low.saturating_sub(1)
+}
+
+fn atlas_buffer_len(width: u32, height: u32) -> usize {
+    usize::try_from(width)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(usize::try_from(height).unwrap_or(usize::MAX))
+        .saturating_mul(4)
+}
+
+fn atlas_offset(value: u32) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 /// Key that uniquely identifies one rasterised glyph variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GlyphKey {
     pub c: char,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct GlyphStyle {
     pub bold: bool,
     pub italic: bool,
 }
@@ -33,8 +107,7 @@ pub struct GlyphEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RunShapeKey {
     text: String,
-    bold: bool,
-    italic: bool,
+    style: GlyphStyle,
 }
 
 /// One glyph produced by shaping a multi-character run.
@@ -259,11 +332,8 @@ impl GlyphAtlas {
         // keep the full canvas width so the shader scales the whole glyph
         // into the cell quad.
         let cell_w_ceil = self.cell_size.width.ceil();
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "canvas width is a small integer that fits exactly in f32"
-        )]
-        let uv_w = if (width as f32) > cell_w_ceil { width as f32 } else { self.cell_size.width };
+        let width_f = atlas_units_f32(width);
+        let uv_w = if width_f > cell_w_ceil { width_f } else { self.cell_size.width };
         compute_uvs(px, py, uv_w, self.cell_size.height, self.atlas_size)
     }
 
@@ -275,20 +345,12 @@ impl GlyphAtlas {
     ///
     /// Returns `Some((cell_w, cell_h, rgba))` or `None` if the glyph is
     /// empty or uses an unsupported pixel format.
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "cell dimensions and glyph offsets are small values that fit in u32"
-    )]
-    #[allow(
-        clippy::cast_sign_loss,
-        reason = "placement offsets are clamped to non-negative before cast"
-    )]
     fn rasterize_rgba(&mut self, key: GlyphKey) -> Option<(u32, u32, Vec<u8>)> {
         // Box-drawing and block elements are rendered procedurally so they
         // fill the cell edge-to-edge with no font-bearing gaps.
         if crate::box_drawing::is_box_drawing(key.c) {
-            let cell_w = self.cell_size.width.ceil() as u32;
-            let cell_h = self.cell_size.height.ceil() as u32;
+            let cell_w = atlas_ceil_u32(self.cell_size.width);
+            let cell_h = atlas_ceil_u32(self.cell_size.height);
             if let Some(result) = crate::box_drawing::render(key.c, cell_w, cell_h) {
                 return Some(result);
             }
@@ -318,8 +380,8 @@ impl GlyphAtlas {
         let glyph_rgba = content_to_rgba(content, data)?;
 
         // Cell dimensions (the atlas entry will be exactly this size).
-        let cell_w = self.cell_size.width.ceil() as u32;
-        let cell_h = self.cell_size.height.ceil() as u32;
+        let cell_w = atlas_ceil_u32(self.cell_size.width);
+        let cell_h = atlas_ceil_u32(self.cell_size.height);
         if cell_w == 0 || cell_h == 0 {
             return None;
         }
@@ -327,19 +389,16 @@ impl GlyphAtlas {
         // Destination offset within the cell canvas:
         //   x: placement.left (horizontal bearing from cell origin)
         //   y: font_size acts as approximate ascent; top is distance above baseline
-        let dest_x = left.max(0) as u32;
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "placement.top is a small integer that fits exactly in f32"
-        )]
-        let dest_y = (self.metrics.font_size - top as f32).max(0.0) as u32;
+        let dest_x = atlas_nonnegative_i32_to_u32(left);
+        let dest_y =
+            atlas_ceil_u32((self.metrics.font_size - atlas_signed_units_f32(top)).max(0.0));
 
         // Canvas width: expand beyond cell_w if the glyph overflows
         // horizontally (e.g. ⚙ U+2699 is wider than one monospace cell
         // in many fonts). The atlas stores the full glyph and the shader
         // maps its UV onto the cell-sized quad, scaling it to fit.
         let canvas_w = cell_w.max(dest_x.saturating_add(glyph_w));
-        let mut canvas = vec![0u8; (canvas_w * cell_h * 4) as usize];
+        let mut canvas = vec![0u8; atlas_buffer_len(canvas_w, cell_h)];
 
         // Blit glyph pixels onto the canvas.
         blit_glyph(
@@ -366,14 +425,6 @@ impl GlyphAtlas {
     ///
     /// Returns `Some((canvas_w, canvas_h, rgba))` or `None` if the glyph is
     /// empty or uses an unsupported pixel format.
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "cell dimensions and glyph offsets are small values that fit in u32"
-    )]
-    #[allow(
-        clippy::cast_sign_loss,
-        reason = "placement offsets are clamped to non-negative before cast"
-    )]
     fn rasterize_from_cache_key(
         &mut self,
         cache_key: CacheKey,
@@ -398,15 +449,15 @@ impl GlyphAtlas {
 
         let glyph_rgba = content_to_rgba(content, data)?;
 
-        let cell_w = self.cell_size.width.ceil() as u32;
-        let cell_h = self.cell_size.height.ceil() as u32;
+        let cell_w = atlas_ceil_u32(self.cell_size.width);
+        let cell_h = atlas_ceil_u32(self.cell_size.height);
         if cell_w == 0 || cell_h == 0 {
             return None;
         }
 
         // Canvas is `glyph_span` cells wide to accommodate multi-col glyphs.
         let canvas_w = cell_w.saturating_mul(u32::from(glyph_span));
-        let mut canvas = vec![0u8; (canvas_w * cell_h * 4) as usize];
+        let mut canvas = vec![0u8; atlas_buffer_len(canvas_w, cell_h)];
 
         // For multi-cell glyphs with negative left bearing, the glyph's
         // origin is not at the left edge of the canvas.  Monospace fonts
@@ -414,34 +465,18 @@ impl GlyphAtlas {
         // cells and place all visual content in the last glyph, which
         // extends backward via negative bearing.  Compute the origin cell
         // from the bearing magnitude so the glyph lands in the right place.
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "left is a small pixel offset that fits exactly in f32"
-        )]
-        #[allow(
-            clippy::cast_possible_wrap,
-            reason = "origin_x is bounded by glyph_span * cell_w, well within i32 range"
-        )]
         let dest_x = if left < 0 && glyph_span > 1 {
             let cell_w_f = self.cell_size.width;
-            #[allow(
-                clippy::cast_sign_loss,
-                reason = "cells_before is derived from a non-negative ceil result"
-            )]
-            let cells_before = ((-left) as f32 / cell_w_f).ceil() as u32;
+            let cells_before = atlas_ceil_u32(atlas_units_f32(left.unsigned_abs()) / cell_w_f);
             let origin_x = cells_before.min(u32::from(glyph_span) - 1) * cell_w;
-            #[allow(clippy::cast_sign_loss, reason = "origin_x + left is clamped to non-negative")]
-            {
-                (origin_x as i32 + left).max(0) as u32
-            }
+            atlas_nonnegative_i32_to_u32(
+                i32::try_from(origin_x).unwrap_or(i32::MAX).saturating_add(left),
+            )
         } else {
-            left.max(0) as u32
+            atlas_nonnegative_i32_to_u32(left)
         };
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "placement.top is a small integer that fits exactly in f32"
-        )]
-        let dest_y = (self.metrics.font_size - top as f32).max(0.0) as u32;
+        let dest_y =
+            atlas_ceil_u32((self.metrics.font_size - atlas_signed_units_f32(top)).max(0.0));
 
         blit_glyph(
             &glyph_rgba,
@@ -533,11 +568,7 @@ impl GlyphAtlas {
     /// holding a borrow across the mutable call to `shape_run_uncached`.
     /// The key is constructed once and reused for both the miss-insert and the
     /// final lookup, avoiding a second `to_owned()` allocation.
-    #[allow(
-        clippy::fn_params_excessive_bools,
-        reason = "bold and italic are font variant flags, not control flow bools"
-    )]
-    pub fn shape_run(&mut self, text: &str, bold: bool, italic: bool) -> &[ShapedRunGlyph] {
+    pub fn shape_run(&mut self, text: &str, style: GlyphStyle) -> &[ShapedRunGlyph] {
         // Cap the run shape cache to avoid unbounded growth across many unique
         // text runs (e.g. long-running sessions with varied output).
         if self.run_shape_cache.len() > 4096 {
@@ -549,15 +580,17 @@ impl GlyphAtlas {
                 keep
             });
         }
-        let key = RunShapeKey { text: text.to_owned(), bold, italic };
+        let key = RunShapeKey { text: text.to_owned(), style };
         if !self.run_shape_cache.contains_key(&key) {
-            let glyphs = self.shape_run_uncached(text, bold, italic);
+            let glyphs = self.shape_run_uncached(text, style);
             // Move `key` into insert to avoid cloning the String.  The final
             // get below rebuilds a key, but that only runs on the cold miss path.
             self.run_shape_cache.insert(key, glyphs);
-            let miss_key = RunShapeKey { text: text.to_owned(), bold, italic };
-            #[allow(clippy::unwrap_used, reason = "entry was just inserted above")]
-            return self.run_shape_cache.get(&miss_key).unwrap();
+            let miss_key = RunShapeKey { text: text.to_owned(), style };
+            if let Some(cached_glyphs) = self.run_shape_cache.get(&miss_key) {
+                return cached_glyphs.as_slice();
+            }
+            return &[];
         }
         // The key was either already present or just inserted above; `get`
         // returns `None` only if the key is absent, which cannot happen here.
@@ -569,28 +602,11 @@ impl GlyphAtlas {
     /// Shape a text run without consulting the cache.
     ///
     /// Always uses `Shaping::Advanced` to enable ligature substitution.
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "glyph_span is a cell count that fits in u8; next_col is a column index that fits in usize"
-    )]
-    #[allow(
-        clippy::cast_sign_loss,
-        reason = "g.w is a non-negative advance width from cosmic-text"
-    )]
-    #[allow(
-        clippy::fn_params_excessive_bools,
-        reason = "bold and italic are font variant flags, not control flow bools"
-    )]
-    fn shape_run_uncached(&mut self, text: &str, bold: bool, italic: bool) -> Vec<ShapedRunGlyph> {
+    fn shape_run_uncached(&mut self, text: &str, style: GlyphStyle) -> Vec<ShapedRunGlyph> {
         let mut buf = Buffer::new_empty(self.metrics);
         let family_str = self.family_name.as_deref();
-        let attrs = Self::build_attrs_from(
-            family_str,
-            self.font_weight,
-            self.font_weight_bold,
-            bold,
-            italic,
-        );
+        let attrs =
+            Self::build_attrs_from(family_str, self.font_weight, self.font_weight_bold, style);
         buf.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
 
         let cell_w = self.cell_size.width;
@@ -603,7 +619,7 @@ impl GlyphAtlas {
         for run in buf.layout_runs() {
             for g in run.glyphs {
                 let cache_key = g.physical((0.0, 0.0), 1.0).cache_key;
-                let glyph_span = ((g.w / cell_w).round() as u8).max(1);
+                let glyph_span = atlas_round_u8((g.w / cell_w).round()).max(1);
                 let col_offset = next_col;
                 next_col += usize::from(glyph_span);
                 glyphs.push(ShapedRunGlyph { cache_key, col_offset, glyph_span });
@@ -617,39 +633,25 @@ impl GlyphAtlas {
     ///
     /// This is a free helper (not `&self`) so that callers can extract the
     /// family name first and then freely borrow `self.font_system` mutably.
-    #[allow(
-        clippy::fn_params_excessive_bools,
-        reason = "bold and italic are font variant flags, not control flow bools"
-    )]
     fn build_attrs_from(
         family_name: Option<&str>,
         weight: u16,
         weight_bold: u16,
-        bold: bool,
-        italic: bool,
+        style: GlyphStyle,
     ) -> Attrs<'_> {
         use cosmic_text::{Style, Weight};
         Attrs::new()
             .family(family_name_to_cosmic(family_name))
-            .weight(Weight(if bold { weight_bold } else { weight }))
-            .style(if italic { Style::Italic } else { Style::Normal })
+            .weight(Weight(if style.bold { weight_bold } else { weight }))
+            .style(if style.italic { Style::Italic } else { Style::Normal })
     }
 
     /// Shape a single character and return its `CacheKey`.
     ///
     /// Useful for callers that need to compare single-glyph cache keys against
     /// the keys produced by `shape_run`.
-    #[allow(
-        clippy::fn_params_excessive_bools,
-        reason = "bold and italic are font variant flags, not control flow bools"
-    )]
-    pub fn shape_single_cache_key(
-        &mut self,
-        c: char,
-        bold: bool,
-        italic: bool,
-    ) -> Option<CacheKey> {
-        self.shape_cache_key(GlyphKey { c, bold, italic })
+    pub fn shape_single_cache_key(&mut self, c: char, style: GlyphStyle) -> Option<CacheKey> {
+        self.shape_cache_key(GlyphKey { c, bold: style.bold, italic: style.italic })
     }
 
     /// Shape the character and return the first glyph's `CacheKey`.
@@ -660,8 +662,7 @@ impl GlyphAtlas {
             family_str,
             self.font_weight,
             self.font_weight_bold,
-            key.bold,
-            key.italic,
+            GlyphStyle { bold: key.bold, italic: key.italic },
         );
         let mut char_buf = [0u8; 4];
         let text = key.c.encode_utf8(&mut char_buf);
@@ -688,14 +689,6 @@ impl GlyphAtlas {
     /// left bearing.  Both the placeholders and the wide glyph fail this
     /// check, allowing [`build_ligature_map`] to merge them into a proper
     /// multi-cell ligature.
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "cell_size.width is a small float that fits in i32"
-    )]
-    #[allow(
-        clippy::cast_possible_wrap,
-        reason = "placement.width is a small glyph dimension that fits in i32"
-    )]
     pub fn fits_single_cell(&mut self, cache_key: CacheKey) -> bool {
         let image = self.swash_cache.get_image(&mut self.font_system, cache_key);
         let Some(img) = image.as_ref() else { return false };
@@ -704,12 +697,12 @@ impl GlyphAtlas {
             return false;
         }
 
-        let cell_w = self.cell_size.width.ceil() as i32;
+        let cell_w = i32::from(atlas_ceil_u16(self.cell_size.width));
         let max_left_extension = cell_w / 3;
         if img.placement.left < -max_left_extension {
             return false;
         }
-        if img.placement.width as i32 > cell_w + cell_w / 2 {
+        if i32::try_from(img.placement.width).unwrap_or(i32::MAX) > cell_w + cell_w / 2 {
             return false;
         }
 
@@ -779,15 +772,16 @@ fn blit_glyph(src: &[u8], dst: &mut [u8], p: &BlitParams) {
     if visible_w == 0 {
         return;
     }
-    let row_bytes = visible_w as usize * 4;
+    let row_bytes = atlas_offset(visible_w).saturating_mul(4);
 
     for gy in 0..p.src_h {
         let cy = p.dest_y + gy;
         if cy >= p.dst_h {
             break;
         }
-        let si = (gy * p.src_w) as usize * 4;
-        let di = (cy * p.dst_w + p.dest_x) as usize * 4;
+        let si = atlas_offset(gy.saturating_mul(p.src_w)).saturating_mul(4);
+        let di =
+            atlas_offset(cy.saturating_mul(p.dst_w).saturating_add(p.dest_x)).saturating_mul(4);
         if let (Some(s), Some(d)) = (src.get(si..si + row_bytes), dst.get_mut(di..di + row_bytes)) {
             d.copy_from_slice(s);
         }
@@ -830,15 +824,11 @@ fn upload_glyph(queue: &Queue, texture: &wgpu::Texture, params: &UploadParams<'_
 /// pixels, preventing texel skipping under Nearest-filter sampling.
 ///
 /// Atlas coordinates fit comfortably within f32 precision (max 1023 < 2^23).
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "atlas coordinates ≤ 1023 fit exactly in f32 mantissa"
-)]
 fn compute_uvs(px: u32, py: u32, uv_width: f32, uv_height: f32, atlas_size: u32) -> GlyphEntry {
-    let s = atlas_size as f32;
+    let s = atlas_units_f32(atlas_size);
     GlyphEntry {
-        uv_min: [px as f32 / s, py as f32 / s],
-        uv_max: [(px as f32 + uv_width) / s, (py as f32 + uv_height) / s],
+        uv_min: [atlas_units_f32(px) / s, atlas_units_f32(py) / s],
+        uv_max: [(atlas_units_f32(px) + uv_width) / s, (atlas_units_f32(py) + uv_height) / s],
     }
 }
 
@@ -871,7 +861,7 @@ fn measure_cell(
 /// wgpu's `Features::CLEAR_TEXTURE` would avoid the CPU buffer, but requiring
 /// that feature would break compatibility with some older backends.
 fn clear_texture(queue: &Queue, texture: &wgpu::Texture, size: u32) {
-    let pixel_count = (size * size) as usize;
+    let pixel_count = atlas_offset(size).saturating_mul(atlas_offset(size));
     let data = vec![0u8; pixel_count * 4];
     queue.write_texture(
         TexelCopyTextureInfo {
@@ -956,20 +946,18 @@ mod tests {
     }
 
     impl MiniFitChecker {
-        #[allow(clippy::cast_possible_truncation, reason = "test helper")]
-        #[allow(clippy::cast_possible_wrap, reason = "test helper")]
         fn fits(&mut self, cache_key: CacheKey) -> bool {
             let image = self.swash_cache.get_image(&mut self.font_system, cache_key);
             let Some(img) = image.as_ref() else { return false };
             if img.placement.width == 0 || img.placement.height == 0 {
                 return false;
             }
-            let cell_w = self.cell_size.width.ceil() as i32;
+            let cell_w = i32::from(atlas_ceil_u16(self.cell_size.width));
             let max_ext = cell_w / 3;
             if img.placement.left < -max_ext {
                 return false;
             }
-            if img.placement.width as i32 > cell_w + cell_w / 2 {
+            if i32::try_from(img.placement.width).unwrap_or(i32::MAX) > cell_w + cell_w / 2 {
                 return false;
             }
             true

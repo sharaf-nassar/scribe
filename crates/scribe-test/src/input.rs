@@ -60,8 +60,7 @@ pub fn parse_escapes(input: &str) -> Vec<u8> {
 fn parse_hex_byte(chars: &mut std::str::Chars<'_>) -> Option<u8> {
     let hi = chars.next()?.to_digit(16)?;
     let lo = chars.next()?.to_digit(16)?;
-    #[allow(clippy::cast_possible_truncation, reason = "hex digit pairs are always in 0..=255")]
-    Some((hi * 16 + lo) as u8)
+    u8::try_from(hi * 16 + lo).ok()
 }
 
 /// Send data (keystrokes) to a session.

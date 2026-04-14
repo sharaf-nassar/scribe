@@ -65,6 +65,22 @@ const FALLBACK_YELLOW: [f32; 4] = [0.9, 0.8, 0.2, 1.0];
 const CPU_SPARK_WIDTH: usize = 8;
 /// Number of sparkline chars for network displays.
 const NET_SPARK_WIDTH: usize = 4;
+/// UI chrome never needs more than this many columns; keeping counts in the
+/// `u16` range lets us convert exactly into `f32` for pixel math.
+const MAX_RENDER_COLUMNS: usize = 65_535;
+/// Network sparklines saturate at 100 MB/s.
+const NET_SPARK_MAX_BYTES_PER_SEC: u64 = 100_000_000;
+type GlyphResolver<'a> = dyn FnMut(char) -> ([f32; 2], [f32; 2]) + 'a;
+
+pub struct StatusBarBuildContext<'a, 'data> {
+    pub out: &'a mut Vec<CellInstance>,
+    pub window_rect: Rect,
+    pub cell_size: (f32, f32),
+    pub status_bar_height: f32,
+    pub colors: &'a StatusBarColors,
+    pub data: &'data StatusBarData<'data>,
+    pub resolve_glyph: &'a mut GlyphResolver<'a>,
+}
 
 /// Colors for the status bar, derived from the theme's [`ChromeColors`]
 /// and ANSI palette.
@@ -124,19 +140,16 @@ impl StatusBarColors {
 ///
 /// The bar spans the full `window_rect` width and is anchored at
 /// `window_rect.y + window_rect.height - status_bar_height`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "needs rect, cell size, bar height, colors, data, and glyph resolver for full status bar rendering"
-)]
-pub fn build_status_bar(
-    out: &mut Vec<CellInstance>,
-    window_rect: Rect,
-    cell_size: (f32, f32),
-    status_bar_height: f32,
-    colors: &StatusBarColors,
-    data: &StatusBarData<'_>,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) -> StatusBarHitTargets {
+pub fn build_status_bar(ctx: StatusBarBuildContext<'_, '_>) -> StatusBarHitTargets {
+    let StatusBarBuildContext {
+        out,
+        window_rect,
+        cell_size,
+        status_bar_height,
+        colors,
+        data,
+        resolve_glyph,
+    } = ctx;
     let (cell_w, cell_h) = cell_size;
     if cell_w <= 0.0 {
         return StatusBarHitTargets {
@@ -158,6 +171,7 @@ pub fn build_status_bar(
         max_cols,
         col: 0,
         bar_height: status_bar_height,
+        resolve_glyph,
     };
 
     // 1px hairline separator at the top edge.
@@ -173,36 +187,51 @@ pub fn build_status_bar(
     let half = status_bar_height / 2.0;
     build_background(
         w.out,
-        w.x_origin,
-        bar_y,
-        w.max_cols,
-        w.cell_w,
-        window_rect.width,
-        colors.gradient_top,
-        half,
+        BackgroundBand {
+            x_origin: w.x_origin,
+            y: bar_y,
+            cols: w.max_cols,
+            cell_w: w.cell_w,
+            total_width: window_rect.width,
+            bg: colors.gradient_top,
+            height: half,
+        },
     );
     build_background(
         w.out,
-        w.x_origin,
-        bar_y + half,
-        w.max_cols,
-        w.cell_w,
-        window_rect.width,
-        colors.bg,
-        half,
+        BackgroundBand {
+            x_origin: w.x_origin,
+            y: bar_y + half,
+            cols: w.max_cols,
+            cell_w: w.cell_w,
+            total_width: window_rect.width,
+            bg: colors.bg,
+            height: half,
+        },
     );
 
     let mut tooltips: Vec<TooltipAnchor> = Vec::new();
-    let left_end = render_left_side(&mut w, colors, data, resolve_glyph, &mut tooltips);
+    let left_end = render_left_side(&mut w, colors, data, &mut tooltips);
     w.col = left_end;
 
     let (equalize_rect, gear_rect, right_start) =
-        render_right_side(&mut w, colors, data, resolve_glyph, &mut tooltips);
+        render_right_side(&mut w, colors, data, &mut tooltips);
 
-    let update_rect =
-        render_centered_update(&mut w, colors, data, resolve_glyph, left_end, right_start);
+    let update_rect = render_centered_update(&mut w, colors, data, left_end, right_start);
 
     StatusBarHitTargets { equalize_rect, gear_rect, update_rect, tooltip_targets: tooltips }
+}
+
+fn render_column_units(columns: usize) -> u16 {
+    u16::try_from(columns).unwrap_or(u16::MAX)
+}
+
+fn status_col_x(x_origin: f32, column: usize, cell_w: f32) -> f32 {
+    x_origin + f32::from(render_column_units(column)) * cell_w
+}
+
+fn status_cols_width(columns: usize, cell_w: f32) -> f32 {
+    f32::from(render_column_units(columns)) * cell_w
 }
 
 /// Mutable writer state for emitting status bar characters.
@@ -215,48 +244,31 @@ struct BarWriter<'a> {
     max_cols: usize,
     col: usize,
     bar_height: f32,
+    resolve_glyph: &'a mut GlyphResolver<'a>,
 }
 
 impl BarWriter<'_> {
     /// Compute a [`Rect`] spanning `start_col..self.col` at the bar's Y position.
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "column indices are small positive integers fitting in f32"
-    )]
     fn col_rect(&self, start_col: usize) -> Rect {
-        let x = self.x_origin + start_col as f32 * self.cell_w;
-        let width = (self.col - start_col) as f32 * self.cell_w;
+        let x = status_col_x(self.x_origin, start_col, self.cell_w);
+        let width = status_cols_width(self.col.saturating_sub(start_col), self.cell_w);
         Rect { x, y: self.bar_y, width, height: self.bar_height }
     }
 
     /// Compute a [`Rect`] spanning `start_col..end_col` at the bar's Y position.
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "column indices are small positive integers fitting in f32"
-    )]
     fn col_rect_range(&self, start_col: usize, end_col: usize) -> Rect {
-        let x = self.x_origin + start_col as f32 * self.cell_w;
-        let width = (end_col.saturating_sub(start_col)) as f32 * self.cell_w;
+        let x = status_col_x(self.x_origin, start_col, self.cell_w);
+        let width = status_cols_width(end_col.saturating_sub(start_col), self.cell_w);
         Rect { x, y: self.bar_y, width, height: self.bar_height }
     }
 
     /// Emit a single character at the current column with the given colors.
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "column index is a small positive integer fitting in f32"
-    )]
-    fn put(
-        &mut self,
-        ch: char,
-        fg: [f32; 4],
-        bg: [f32; 4],
-        resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-    ) {
+    fn put(&mut self, ch: char, fg: [f32; 4], bg: [f32; 4]) {
         if self.col >= self.max_cols {
             return;
         }
-        let x = self.x_origin + self.col as f32 * self.cell_w;
-        let (uv_min, uv_max) = resolve_glyph(ch);
+        let x = status_col_x(self.x_origin, self.col, self.cell_w);
+        let (uv_min, uv_max) = (self.resolve_glyph)(ch);
         self.out.push(CellInstance {
             pos: [x, self.y],
             size: [0.0, 0.0],
@@ -265,33 +277,17 @@ impl BarWriter<'_> {
             fg_color: fg,
             bg_color: bg,
             corner_radius: 0.0,
-            _pad: 0.0,
         });
         self.col += 1;
     }
 
     /// Emit a single character at an explicit column index.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "explicit-position helper needs column, colors, and glyph resolver"
-    )]
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "column index is a small positive integer fitting in f32"
-    )]
-    fn put_at(
-        &mut self,
-        col: usize,
-        ch: char,
-        fg: [f32; 4],
-        bg: [f32; 4],
-        resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-    ) {
+    fn put_at(&mut self, col: usize, ch: char, fg: [f32; 4], bg: [f32; 4]) {
         if col >= self.max_cols {
             return;
         }
-        let x = self.x_origin + col as f32 * self.cell_w;
-        let (uv_min, uv_max) = resolve_glyph(ch);
+        let x = status_col_x(self.x_origin, col, self.cell_w);
+        let (uv_min, uv_max) = (self.resolve_glyph)(ch);
         self.out.push(CellInstance {
             pos: [x, self.y],
             size: [0.0, 0.0],
@@ -300,56 +296,32 @@ impl BarWriter<'_> {
             fg_color: fg,
             bg_color: bg,
             corner_radius: 0.0,
-            _pad: 0.0,
         });
     }
 
     /// Emit a string with the given colors.
-    fn put_str(
-        &mut self,
-        s: &str,
-        fg: [f32; 4],
-        bg: [f32; 4],
-        resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-    ) {
+    fn put_str(&mut self, s: &str, fg: [f32; 4], bg: [f32; 4]) {
         for ch in s.chars() {
-            self.put(ch, fg, bg, resolve_glyph);
+            self.put(ch, fg, bg);
         }
     }
 
     /// Fill from current column to target with spaces.
-    fn pad_to(
-        &mut self,
-        target: usize,
-        fg: [f32; 4],
-        bg: [f32; 4],
-        resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-    ) {
+    fn pad_to(&mut self, target: usize, fg: [f32; 4], bg: [f32; 4]) {
         while self.col < target {
-            self.put(' ', fg, bg, resolve_glyph);
+            self.put(' ', fg, bg);
         }
     }
 
     /// Emit a string at an explicit column start index and return the end column.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "explicit-position string helper needs column, colors, and glyph resolver"
-    )]
-    fn put_str_at(
-        &mut self,
-        start_col: usize,
-        s: &str,
-        fg: [f32; 4],
-        bg: [f32; 4],
-        resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-    ) -> usize {
+    fn put_str_at(&mut self, start_col: usize, s: &str, fg: [f32; 4], bg: [f32; 4]) -> usize {
         let mut end_col = start_col;
         for (offset, ch) in s.chars().enumerate() {
             let col = start_col + offset;
             if col >= self.max_cols {
                 break;
             }
-            self.put_at(col, ch, fg, bg, resolve_glyph);
+            self.put_at(col, ch, fg, bg);
             end_col = col + 1;
         }
         end_col
@@ -399,15 +371,10 @@ fn resolve_centered_update_segment(
 }
 
 /// Render the centered update segment and return the clickable rectangle if appropriate.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "centered update renderer needs bounds plus full draw context"
-)]
 fn render_centered_update(
     w: &mut BarWriter<'_>,
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
     left_end: usize,
     right_start: usize,
 ) -> Option<Rect> {
@@ -433,7 +400,7 @@ fn render_centered_update(
             continue;
         }
 
-        w.put_str_at(start_col, label, colors.text, colors.bg, resolve_glyph);
+        w.put_str_at(start_col, label, colors.text, colors.bg);
         return segment.clickable.then_some(w.col_rect_range(start_col, end_col));
     }
 
@@ -445,35 +412,34 @@ fn render_left_side(
     w: &mut BarWriter<'_>,
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
     tooltips: &mut Vec<TooltipAnchor>,
 ) -> usize {
-    w.put(' ', colors.text, colors.bg, resolve_glyph);
+    w.put(' ', colors.text, colors.bg);
 
     // Connection dot tooltip.
     let dot_col = w.col;
     let dot_color = if data.connected { colors.connected_dot } else { colors.disconnected_dot };
-    w.put('\u{25CF}', dot_color, colors.bg, resolve_glyph);
+    w.put('\u{25CF}', dot_color, colors.bg);
     let dot_text =
         if data.connected { String::from("Connected") } else { String::from("Disconnected") };
     tooltips.push(TooltipAnchor { text: dot_text, rect: w.col_rect(dot_col) });
 
-    w.put(' ', colors.text, colors.bg, resolve_glyph);
+    w.put(' ', colors.text, colors.bg);
 
     if let Some(name) = data.workspace_name {
         let ws_col = w.col;
-        w.put_str(name, colors.accent, colors.bg, resolve_glyph);
+        w.put_str(name, colors.accent, colors.bg);
         tooltips.push(TooltipAnchor {
             text: String::from("Focused workspace"),
             rect: w.col_rect(ws_col),
         });
-        w.put_str("  ", colors.text, colors.bg, resolve_glyph);
+        w.put_str("  ", colors.text, colors.bg);
     }
 
     if let Some(cwd) = data.cwd {
         let short = shorten_cwd(cwd);
         let cwd_col = w.col;
-        w.put_str(&short, colors.text, colors.bg, resolve_glyph);
+        w.put_str(&short, colors.text, colors.bg);
         tooltips.push(TooltipAnchor {
             text: format!("Current directory: {}", cwd.to_string_lossy()),
             rect: w.col_rect(cwd_col),
@@ -490,7 +456,6 @@ fn render_right_side(
     w: &mut BarWriter<'_>,
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
     tooltips: &mut Vec<TooltipAnchor>,
 ) -> (Option<Rect>, Option<Rect>, usize) {
     // +3 for the gear segment: " ⚙ " (space, gear, space)
@@ -502,25 +467,25 @@ fn render_right_side(
         segments.iter().map(|s| s.text.chars().count()).sum::<usize>() + equalize_cols + gear_cols;
     let right_start = w.max_cols.saturating_sub(right_cols + 1);
 
-    w.pad_to(right_start, colors.text, colors.bg, resolve_glyph);
+    w.pad_to(right_start, colors.text, colors.bg);
 
     // Render segments tracking per-named-item rects for tooltips.
     let groups = build_segment_groups(data);
-    render_right_segments_with_tooltips(w, colors.bg, resolve_glyph, &segments, tooltips, &groups);
+    render_right_segments_with_tooltips(w, colors.bg, &segments, tooltips, &groups);
 
     // Equalize icon: " ⊞" left of the gear, only when multiple workspaces exist.
-    let equalize_rect = render_equalize(w, colors, data, resolve_glyph);
+    let equalize_rect = render_equalize(w, colors, data);
     if let Some(eq_rect) = equalize_rect {
         tooltips.push(TooltipAnchor { text: String::from("Equalize workspaces"), rect: eq_rect });
     }
 
     // Gear icon: " ⚙ " at the far right.
-    let gear_rect = render_gear(w, colors, resolve_glyph);
+    let gear_rect = render_gear(w, colors);
     if let Some(g_rect) = gear_rect {
         tooltips.push(TooltipAnchor { text: String::from("Settings (Ctrl+,)"), rect: g_rect });
     }
 
-    w.pad_to(w.max_cols, colors.text, colors.bg, resolve_glyph);
+    w.pad_to(w.max_cols, colors.text, colors.bg);
 
     (equalize_rect, gear_rect, right_start)
 }
@@ -534,11 +499,11 @@ fn build_segment_groups(data: &StatusBarData<'_>) -> Vec<(String, usize)> {
     let mut groups: Vec<(String, usize)> = Vec::new();
 
     if let (Some(stats), Some(config)) = (data.sys_stats, data.stats_config) {
-        if config.cpu {
+        if config.usage.compute.cpu {
             let sep = usize::from(!groups.is_empty());
             groups.push((String::from("CPU usage"), sep + 1 + CPU_SPARK_WIDTH + 1));
         }
-        if config.memory {
+        if config.usage.memory {
             let sep = usize::from(!groups.is_empty());
             groups.push((String::from("Memory usage"), sep + 3));
         }
@@ -547,7 +512,7 @@ fn build_segment_groups(data: &StatusBarData<'_>) -> Vec<(String, usize)> {
             let count = sep + 1 + NET_SPARK_WIDTH + 1 + 1 + NET_SPARK_WIDTH + 1;
             groups.push((String::from("Network activity"), count));
         }
-        if config.gpu && stats.gpu_percent.is_some() {
+        if config.usage.compute.gpu && stats.gpu_percent.is_some() {
             let sep = usize::from(!groups.is_empty());
             groups.push((String::from("GPU usage"), sep + 1 + CPU_SPARK_WIDTH + 1));
         }
@@ -584,14 +549,9 @@ fn build_segment_groups(data: &StatusBarData<'_>) -> Vec<(String, usize)> {
 }
 
 /// Render right-side segments and push tooltip anchors for each named item.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "needs bar writer, bg color, resolve_glyph, segments, tooltips, and group counts"
-)]
 fn render_right_segments_with_tooltips(
     w: &mut BarWriter<'_>,
     bg: [f32; 4],
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
     segments: &[RightSegment],
     tooltips: &mut Vec<TooltipAnchor>,
     groups: &[(String, usize)],
@@ -604,7 +564,7 @@ fn render_right_segments_with_tooltips(
         let end_seg = seg_idx + count;
         while seg_idx < end_seg {
             if let Some(seg) = segments.get(seg_idx) {
-                w.put_str(&seg.text, seg.color, bg, resolve_glyph);
+                w.put_str(&seg.text, seg.color, bg);
                 seg_idx += 1;
             } else {
                 break;
@@ -618,65 +578,63 @@ fn render_right_segments_with_tooltips(
 
     // Trailing space segment (1 segment, no tooltip).
     if let Some(seg) = segments.get(seg_idx) {
-        w.put_str(&seg.text, seg.color, bg, resolve_glyph);
+        w.put_str(&seg.text, seg.color, bg);
     }
 }
 
 /// Render the equalize icon and return its clickable rect, or `None` when hidden.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "column index is a small positive integer fitting in f32"
-)]
 fn render_equalize(
     w: &mut BarWriter<'_>,
     colors: &StatusBarColors,
     data: &StatusBarData<'_>,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
 ) -> Option<Rect> {
     if !data.show_equalize || w.col >= w.max_cols {
         return None;
     }
-    w.put(' ', colors.text, colors.bg, resolve_glyph);
+    w.put(' ', colors.text, colors.bg);
     let eq_col = w.col;
-    w.put('\u{229E}', colors.text, colors.bg, resolve_glyph);
-    let eq_x = w.x_origin + eq_col as f32 * w.cell_w;
-    let eq_width = (w.col - eq_col) as f32 * w.cell_w;
-    Some(Rect { x: eq_x, y: w.bar_y, width: eq_width, height: w.bar_height })
+    w.put('\u{229E}', colors.text, colors.bg);
+    Some(w.col_rect(eq_col))
 }
 
 /// Render the gear icon and return its clickable rect.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "column index is a small positive integer fitting in f32"
-)]
-fn render_gear(
-    w: &mut BarWriter<'_>,
-    colors: &StatusBarColors,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) -> Option<Rect> {
+fn render_gear(w: &mut BarWriter<'_>, colors: &StatusBarColors) -> Option<Rect> {
     if w.col >= w.max_cols {
         return None;
     }
-    w.put(' ', colors.text, colors.bg, resolve_glyph);
+    w.put(' ', colors.text, colors.bg);
     let gear_col = w.col;
-    w.put('\u{2699}', colors.text, colors.bg, resolve_glyph);
-    w.put(' ', colors.text, colors.bg, resolve_glyph);
-    let gear_x = w.x_origin + gear_col as f32 * w.cell_w;
-    let gear_width = (w.col - gear_col) as f32 * w.cell_w;
-    Some(Rect { x: gear_x, y: w.bar_y, width: gear_width, height: w.bar_height })
+    w.put('\u{2699}', colors.text, colors.bg);
+    w.put(' ', colors.text, colors.bg);
+    Some(w.col_rect(gear_col))
 }
 
 /// Map a 0-100 percentage to a Unicode block element (▁▂▃▄▅▆▇█).
 fn sparkline_char(pct: f32) -> char {
     const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let idx = ((pct / 100.0) * 7.0).round().clamp(0.0, 7.0);
-    // cast is safe: idx is clamped to 0..=7
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "idx clamped to 0..=7"
-    )]
-    BLOCKS.get(idx as usize).copied().unwrap_or('▁')
+    const THRESHOLDS: [f32; 7] =
+        [7.142_857, 21.428_572, 35.714_287, 50.0, 64.285_71, 78.571_43, 92.857_14];
+
+    if !pct.is_finite() {
+        return BLOCKS.first().copied().unwrap_or('▁');
+    }
+
+    let index = THRESHOLDS.iter().position(|threshold| pct <= *threshold).unwrap_or(7);
+    BLOCKS.get(index).copied().unwrap_or('▁')
+}
+
+fn sparkline_char_for_network_rate(bytes_per_sec: u64) -> char {
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    let capped = bytes_per_sec.min(NET_SPARK_MAX_BYTES_PER_SEC);
+    let rounded_index = capped.saturating_mul(7).saturating_add(NET_SPARK_MAX_BYTES_PER_SEC / 2)
+        / NET_SPARK_MAX_BYTES_PER_SEC;
+    let index = usize::try_from(rounded_index).unwrap_or(BLOCKS.len().saturating_sub(1));
+    BLOCKS.get(index).copied().unwrap_or('▁')
+}
+
+fn rounded_div(value: u64, divisor: u64) -> u64 {
+    value.saturating_add(divisor / 2) / divisor
 }
 
 /// Pick green/yellow/red based on usage percentage.
@@ -695,17 +653,14 @@ fn format_bytes_rate(bytes_per_sec: u64) -> String {
     if bytes_per_sec >= 1_000_000_000 {
         String::from(">1G")
     } else if bytes_per_sec >= 10_000_000 {
-        #[allow(clippy::cast_precision_loss, reason = "bytes_per_sec is a reasonable network rate")]
-        let mb = bytes_per_sec as f64 / 1_000_000.0;
-        if mb >= 999.5 { String::from(">1G") } else { format!("{mb:.0}M") }
+        let mb = rounded_div(bytes_per_sec, 1_000_000);
+        if mb >= 1_000 { String::from(">1G") } else { format!("{mb}M") }
     } else if bytes_per_sec >= 1_000_000 {
-        #[allow(clippy::cast_precision_loss, reason = "bytes_per_sec is a reasonable network rate")]
-        let mb = bytes_per_sec as f64 / 1_000_000.0;
-        format!("{mb:.1}M")
+        let tenths_mb = rounded_div(bytes_per_sec, 100_000);
+        format!("{}.{}M", tenths_mb / 10, tenths_mb % 10)
     } else if bytes_per_sec >= 1_000 {
-        #[allow(clippy::cast_precision_loss, reason = "bytes_per_sec is a reasonable network rate")]
-        let kb = bytes_per_sec as f64 / 1_000.0;
-        if kb >= 999.5 { String::from("1.0M") } else { format!("{kb:.0}K") }
+        let kb = rounded_div(bytes_per_sec, 1_000);
+        if kb >= 1_000 { String::from("1.0M") } else { format!("{kb}K") }
     } else {
         format!("{bytes_per_sec}B")
     }
@@ -737,12 +692,12 @@ fn build_stats_segments(
 ) -> Vec<RightSegment> {
     let mut segs: Vec<RightSegment> = Vec::new();
 
-    if config.cpu {
+    if config.usage.compute.cpu {
         push_sep(&mut segs, colors.separator);
         segs.extend(build_cpu_segments(stats, colors));
     }
 
-    if config.memory {
+    if config.usage.memory {
         push_sep(&mut segs, colors.separator);
         segs.extend(build_mem_segments(stats, colors));
     }
@@ -752,7 +707,7 @@ fn build_stats_segments(
         segs.extend(build_net_segments(stats, colors));
     }
 
-    if config.gpu && stats.gpu_percent.is_some() {
+    if config.usage.compute.gpu && stats.gpu_percent.is_some() {
         push_sep(&mut segs, colors.separator);
         segs.extend(build_gpu_segments(stats, colors));
     }
@@ -809,9 +764,10 @@ fn build_net_segments(stats: &SystemStats, colors: &StatusBarColors) -> Vec<Righ
         segs.push(RightSegment { text: String::from("\u{2581}"), color: colors.label });
     }
     for &v in &stats.net_up_history {
-        #[allow(clippy::cast_precision_loss, reason = "network rate fits in f32 for sparkline")]
-        let pct = (v as f32 / 1_000_000.0).min(100.0);
-        segs.push(RightSegment { text: sparkline_char(pct).to_string(), color: colors.accent });
+        segs.push(RightSegment {
+            text: sparkline_char_for_network_rate(v).to_string(),
+            color: colors.accent,
+        });
     }
     segs.push(RightSegment {
         text: format!(" {}", format_bytes_rate_fixed(stats.net_up_bytes_sec)),
@@ -824,9 +780,10 @@ fn build_net_segments(stats: &SystemStats, colors: &StatusBarColors) -> Vec<Righ
         segs.push(RightSegment { text: String::from("\u{2581}"), color: colors.label });
     }
     for &v in &stats.net_down_history {
-        #[allow(clippy::cast_precision_loss, reason = "network rate fits in f32 for sparkline")]
-        let pct = (v as f32 / 1_000_000.0).min(100.0);
-        segs.push(RightSegment { text: sparkline_char(pct).to_string(), color: colors.accent });
+        segs.push(RightSegment {
+            text: sparkline_char_for_network_rate(v).to_string(),
+            color: colors.accent,
+        });
     }
     segs.push(RightSegment {
         text: format!(" {}", format_bytes_rate_fixed(stats.net_down_bytes_sec)),
@@ -925,12 +882,8 @@ fn home_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Fill columns with background quads (no glyph).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "helper function needs position, column count, cell width, total width, color, and height"
-)]
-fn build_background(
-    out: &mut Vec<CellInstance>,
+#[derive(Clone, Copy)]
+struct BackgroundBand {
     x_origin: f32,
     y: f32,
     cols: usize,
@@ -938,13 +891,12 @@ fn build_background(
     total_width: f32,
     bg: [f32; 4],
     height: f32,
-) {
+}
+
+fn build_background(out: &mut Vec<CellInstance>, band: BackgroundBand) {
+    let BackgroundBand { x_origin, y, cols, cell_w, total_width, bg, height } = band;
     for col_idx in 0..cols {
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "column index is a small positive integer fitting in f32"
-        )]
-        let x = x_origin + col_idx as f32 * cell_w;
+        let x = status_col_x(x_origin, col_idx, cell_w);
         out.push(CellInstance {
             pos: [x, y],
             size: [cell_w, height],
@@ -953,22 +905,13 @@ fn build_background(
             fg_color: bg,
             bg_color: bg,
             corner_radius: 0.0,
-            _pad: 0.0,
         });
     }
 
     // Fill the fractional-pixel remainder at the right edge.
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "column count is a small positive integer fitting in f32"
-    )]
-    let remainder = total_width - cols as f32 * cell_w;
+    let remainder = total_width - status_cols_width(cols, cell_w);
     if remainder > 0.0 {
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "column count is a small positive integer fitting in f32"
-        )]
-        let x = x_origin + cols as f32 * cell_w;
+        let x = status_col_x(x_origin, cols, cell_w);
         out.push(CellInstance {
             pos: [x, y],
             size: [remainder, height],
@@ -977,17 +920,34 @@ fn build_background(
             fg_color: bg,
             bg_color: bg,
             corner_radius: 0.0,
-            _pad: 0.0,
         });
     }
 }
 
 /// Calculate how many cell-width columns fit in a given pixel width.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "width / cell_w yields a small positive value fitting in usize"
-)]
 fn columns_in_width(width: f32, cell_w: f32) -> usize {
-    if cell_w <= 0.0 { 0 } else { (width / cell_w) as usize }
+    if cell_w <= 0.0 || !width.is_finite() || width <= 0.0 {
+        return 0;
+    }
+
+    let mut low = 0usize;
+    let mut high = 1usize;
+    while high < MAX_RENDER_COLUMNS && status_cols_width(high, cell_w) <= width {
+        low = high;
+        high = high.saturating_mul(2).min(MAX_RENDER_COLUMNS);
+        if high == low {
+            break;
+        }
+    }
+
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if status_cols_width(mid, cell_w) <= width {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+
+    low
 }

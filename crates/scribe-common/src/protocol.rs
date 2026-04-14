@@ -42,8 +42,14 @@ pub enum AutomationAction {
     ClosePane,
     CloseTab,
     NewWindow,
-    SwitchProfile { name: String },
+    SwitchProfile {
+        name: String,
+    },
     OpenUpdateDialog,
+    /// Raise the window and switch to the tab containing this session.
+    FocusSession {
+        session_id: SessionId,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,11 +126,6 @@ pub enum ClientMessage {
     MoveSession {
         session_id: SessionId,
         target_workspace: WorkspaceId,
-    },
-    /// Request a scrollback snapshot at a given offset from the bottom.
-    ScrollRequest {
-        session_id: SessionId,
-        offset: i32,
     },
     Subscribe {
         session_ids: Vec<SessionId>,
@@ -292,13 +293,6 @@ pub enum ServerMessage {
         #[serde(default)]
         project_root: Option<PathBuf>,
     },
-    /// Scrollback snapshot at a specific offset from the bottom.
-    ScrolledSnapshot {
-        session_id: SessionId,
-        snapshot: crate::screen::ScreenSnapshot,
-        /// The actual offset applied (clamped by available history).
-        applied_offset: u32,
-    },
     /// Search results for a `SearchRequest`.
     SearchResults {
         session_id: SessionId,
@@ -349,6 +343,14 @@ pub enum ServerMessage {
         click_events: bool,
         /// Exit code from the previous command (only for `CommandEnd` / D mark).
         exit_code: Option<i32>,
+    },
+    /// The server trimmed AI-added redraw history after suppressing ED 3.
+    /// The client should shrink its scrollback to `history_rows` before
+    /// applying subsequent PTY bytes so preserved pre-AI history stays intact
+    /// without accumulating duplicate full-screen redraw frames.
+    TrimScrollback {
+        session_id: SessionId,
+        history_rows: u32,
     },
     /// The server suppressed an ED 3 (clear scrollback) sequence from an AI
     /// session.  The client should reset `display_offset` to 0 so the

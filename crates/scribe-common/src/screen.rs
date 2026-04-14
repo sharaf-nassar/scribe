@@ -21,25 +21,139 @@ pub enum ScreenColor {
     Rgb { r: u8, g: u8, b: u8 },
 }
 
-/// Cell attribute flags.
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "terminal cell attributes are inherently boolean flags; a bitfield enum would obscure semantics"
-)]
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub struct CellFlags {
+/// Emphasis-related cell attributes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellWeightFlags {
     pub bold: bool,
+    pub dim: bool,
+}
+
+/// Emphasis-related cell attributes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellEmphasisFlags {
+    #[serde(default, flatten)]
+    pub weight: CellWeightFlags,
     pub italic: bool,
+}
+
+/// Decoration-related cell attributes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellDecorationFlags {
     pub underline: bool,
     pub strikethrough: bool,
-    pub dim: bool,
+}
+
+/// Visibility and colour-presentation attributes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellPresentationFlags {
     pub inverse: bool,
     pub hidden: bool,
+}
+
+/// Layout-affecting cell attributes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellLayoutFlags {
     pub wide: bool,
     /// Whether this cell is the last cell of a row that soft-wraps into the
     /// next row (`WRAPLINE` in alacritty).
     #[serde(default)]
     pub wrap: bool,
+}
+
+/// Cell attribute flags.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellFlags {
+    #[serde(default, flatten)]
+    pub emphasis: CellEmphasisFlags,
+    #[serde(default, flatten)]
+    pub decoration: CellDecorationFlags,
+    #[serde(default, flatten)]
+    pub presentation: CellPresentationFlags,
+    #[serde(default, flatten)]
+    pub layout: CellLayoutFlags,
+}
+
+impl CellFlags {
+    #[must_use]
+    pub const fn bold(self) -> bool {
+        self.emphasis.weight.bold
+    }
+
+    pub fn set_bold(&mut self, value: bool) {
+        self.emphasis.weight.bold = value;
+    }
+
+    #[must_use]
+    pub const fn italic(self) -> bool {
+        self.emphasis.italic
+    }
+
+    pub fn set_italic(&mut self, value: bool) {
+        self.emphasis.italic = value;
+    }
+
+    #[must_use]
+    pub const fn underline(self) -> bool {
+        self.decoration.underline
+    }
+
+    pub fn set_underline(&mut self, value: bool) {
+        self.decoration.underline = value;
+    }
+
+    #[must_use]
+    pub const fn strikethrough(self) -> bool {
+        self.decoration.strikethrough
+    }
+
+    pub fn set_strikethrough(&mut self, value: bool) {
+        self.decoration.strikethrough = value;
+    }
+
+    #[must_use]
+    pub const fn dim(self) -> bool {
+        self.emphasis.weight.dim
+    }
+
+    pub fn set_dim(&mut self, value: bool) {
+        self.emphasis.weight.dim = value;
+    }
+
+    #[must_use]
+    pub const fn inverse(self) -> bool {
+        self.presentation.inverse
+    }
+
+    pub fn set_inverse(&mut self, value: bool) {
+        self.presentation.inverse = value;
+    }
+
+    #[must_use]
+    pub const fn hidden(self) -> bool {
+        self.presentation.hidden
+    }
+
+    pub fn set_hidden(&mut self, value: bool) {
+        self.presentation.hidden = value;
+    }
+
+    #[must_use]
+    pub const fn wide(self) -> bool {
+        self.layout.wide
+    }
+
+    pub fn set_wide(&mut self, value: bool) {
+        self.layout.wide = value;
+    }
+
+    #[must_use]
+    pub const fn wrap(self) -> bool {
+        self.layout.wrap
+    }
+
+    pub fn set_wrap(&mut self, value: bool) {
+        self.layout.wrap = value;
+    }
 }
 
 /// Cursor style for rendering.

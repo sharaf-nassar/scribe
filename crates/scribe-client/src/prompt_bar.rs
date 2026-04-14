@@ -19,35 +19,18 @@ pub struct PromptBarColors {
     pub icon_latest: [f32; 4],
 }
 
-/// Prompt bar now fills the full prompt-bar rect; outer inset is gone.
-#[allow(dead_code, reason = "shared geometry constant consumed by later renderer work")]
-pub const CARD_INSET_X: f32 = 0.0;
-#[allow(dead_code, reason = "shared geometry constant consumed by later renderer work")]
-pub const CARD_INSET_Y: f32 = 0.0;
-/// Square prompt-bar geometry.
-#[allow(dead_code, reason = "shared geometry constant consumed by later renderer work")]
-pub const CARD_RADIUS: f32 = 0.0;
 /// Horizontal padding within a prompt row.
-#[allow(dead_code, reason = "shared geometry constant consumed by later renderer work")]
 pub const ROW_SIDE_PAD: f32 = 14.0;
-/// Rows meet directly; only a thin seam remains between them.
-#[allow(dead_code, reason = "shared geometry constant consumed by later renderer work")]
-pub const ROW_GAP: f32 = 0.0;
 const ROW_SEAM_H: f32 = 1.0;
 /// Minimum prompt-row height.
-#[allow(dead_code, reason = "shared geometry constant consumed by later renderer work")]
 pub const ROW_MIN_HEIGHT: f32 = 28.0;
 /// Gap between icon and text.
-#[allow(dead_code, reason = "shared geometry constant consumed by later renderer work")]
 pub const ICON_TEXT_GAP: f32 = 10.0;
 /// Count badge height.
-#[allow(dead_code, reason = "shared geometry constant consumed by later renderer work")]
 pub const COUNT_BADGE_H: f32 = 18.0;
 /// Horizontal padding inside the count badge.
-#[allow(dead_code, reason = "shared geometry constant consumed by later renderer work")]
 pub const COUNT_BADGE_PAD_X: f32 = 8.0;
 /// Minimum count badge width.
-#[allow(dead_code, reason = "shared geometry constant consumed by later renderer work")]
 pub const COUNT_BADGE_MIN_W: f32 = 30.0;
 
 /// Unicode for the circle-dot (origin) icon.
@@ -67,7 +50,6 @@ pub enum PromptBarHover {
 }
 
 /// Shared prompt-bar geometry for later rendering and hit-testing.
-#[allow(dead_code, reason = "shared geometry struct consumed by later renderer work")]
 #[derive(Clone, Copy)]
 pub struct PromptBarLayout {
     pub card_rect: Rect,
@@ -80,8 +62,208 @@ pub struct PromptBarLayout {
     pub latest_line_width: Option<f32>,
 }
 
+#[derive(Clone, Copy)]
+struct PromptRenderMetrics {
+    row_content_x: f32,
+    cell_size: (f32, f32),
+    glyph_size: [f32; 2],
+}
+
+#[derive(Clone, Copy)]
+struct PromptRowColors {
+    icon: [f32; 4],
+    text: [f32; 4],
+    base_bg: [f32; 4],
+    hover_bg: [f32; 4],
+    active_bg: [f32; 4],
+}
+
+#[derive(Clone, Copy)]
+enum PromptRowState {
+    Idle,
+    Hovered,
+    Active,
+}
+
+struct PromptRowSpec<'a> {
+    row_rect: Rect,
+    icon: char,
+    text: &'a str,
+    line_width: f32,
+    colors: PromptRowColors,
+    state: PromptRowState,
+}
+
+#[derive(Clone, Copy)]
+struct DismissOverlayStyle {
+    background: [f32; 4],
+    foreground: [f32; 4],
+}
+
+pub struct PromptBarRenderContext<'a> {
+    pub out: &'a mut Vec<CellInstance>,
+    pub pane: &'a Pane,
+    pub bar_rect: Rect,
+    pub cell_size: (f32, f32),
+    pub glyph_size: [f32; 2],
+    pub hover: Option<PromptBarHover>,
+    pub active: Option<PromptBarHover>,
+    pub colors: &'a PromptBarColors,
+    pub resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+}
+
+#[derive(Clone, Copy)]
+struct PromptLineRequest<'a> {
+    icon: char,
+    text: &'a str,
+    bar_x: f32,
+    y: f32,
+    bar_width: f32,
+    icon_color: [f32; 4],
+    text_color: [f32; 4],
+    bg_color: [f32; 4],
+}
+
+#[derive(Clone, Copy)]
+struct PromptGlyphRequest {
+    ch: char,
+    x: f32,
+    y: f32,
+    fg_color: [f32; 4],
+    bg_color: [f32; 4],
+}
+
+struct PromptRenderer<'a> {
+    out: &'a mut Vec<CellInstance>,
+    metrics: PromptRenderMetrics,
+    resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+}
+
+impl PromptRenderer<'_> {
+    fn render_prompt_row(&mut self, spec: &PromptRowSpec<'_>) {
+        let cell_h = self.metrics.cell_size.1;
+
+        push_solid_rect(self.out, spec.row_rect, spec.colors.base_bg);
+        match spec.state {
+            PromptRowState::Hovered => {
+                push_solid_rect(self.out, spec.row_rect, spec.colors.hover_bg);
+            }
+            PromptRowState::Active => {
+                push_solid_rect(self.out, spec.row_rect, spec.colors.active_bg);
+            }
+            PromptRowState::Idle => {}
+        }
+
+        self.render_prompt_line(PromptLineRequest {
+            icon: spec.icon,
+            text: spec.text,
+            bar_x: self.metrics.row_content_x,
+            y: spec.row_rect.y + (spec.row_rect.height - cell_h) * 0.5,
+            bar_width: spec.line_width,
+            icon_color: spec.colors.icon,
+            text_color: spec.colors.text,
+            bg_color: spec.colors.base_bg,
+        });
+    }
+
+    fn render_dismiss_overlay(&mut self, layout: &PromptBarLayout, style: DismissOverlayStyle) {
+        let (cell_w, cell_h) = self.metrics.cell_size;
+        let dismiss_rect = dismiss_overlay_rect(layout, self.metrics.cell_size);
+
+        push_solid_rect(self.out, dismiss_rect, style.background);
+        let dismiss_x = dismiss_rect.x + (dismiss_rect.width - cell_w) * 0.5;
+        let dismiss_y = dismiss_rect.y + (dismiss_rect.height - cell_h) * 0.5;
+        self.emit_glyph(PromptGlyphRequest {
+            ch: ICON_DISMISS,
+            x: dismiss_x,
+            y: dismiss_y,
+            fg_color: style.foreground,
+            bg_color: style.background,
+        });
+    }
+
+    fn render_prompt_line(&mut self, request: PromptLineRequest<'_>) {
+        let mut x = request.bar_x + ROW_SIDE_PAD;
+        let max_x = request.bar_x + request.bar_width - ROW_SIDE_PAD;
+
+        x = self.emit_glyph(PromptGlyphRequest {
+            ch: request.icon,
+            x,
+            y: request.y,
+            fg_color: request.icon_color,
+            bg_color: request.bg_color,
+        });
+        x += ICON_TEXT_GAP;
+
+        let chars: Vec<char> = request.text.chars().collect();
+        let available_chars = prompt_chars_in_width(max_x - x, self.metrics.cell_size.0);
+
+        let needs_ellipsis = chars.len() > available_chars;
+        let visible_count =
+            if needs_ellipsis { available_chars.saturating_sub(1) } else { chars.len() };
+
+        for &ch in chars.get(..visible_count).unwrap_or(&[]) {
+            if x + self.metrics.cell_size.0 > max_x {
+                break;
+            }
+            x = self.emit_glyph(PromptGlyphRequest {
+                ch,
+                x,
+                y: request.y,
+                fg_color: request.text_color,
+                bg_color: request.bg_color,
+            });
+        }
+
+        if needs_ellipsis && x + self.metrics.cell_size.0 <= max_x {
+            self.emit_glyph(PromptGlyphRequest {
+                ch: '…',
+                x,
+                y: request.y,
+                fg_color: request.text_color,
+                bg_color: request.bg_color,
+            });
+        }
+    }
+
+    fn render_count_badge(&mut self, rect: Rect, count: u32, colors: &PromptBarColors) {
+        let (cell_w, cell_h) = self.metrics.cell_size;
+        let badge_fill = mix(colors.second_row_bg, colors.text, 0.06);
+        let badge_text = with_alpha(colors.text, 0.96);
+
+        push_solid_rect(self.out, rect, badge_fill);
+
+        let text = count.to_string();
+        let text_width = text.chars().fold(0.0, |width, _| width + cell_w);
+        let mut x = rect.x + (rect.width - text_width).max(0.0) * 0.5;
+        let y = rect.y + (rect.height - cell_h) * 0.5;
+        for ch in text.chars() {
+            x = self.emit_glyph(PromptGlyphRequest {
+                ch,
+                x,
+                y,
+                fg_color: badge_text,
+                bg_color: badge_fill,
+            });
+        }
+    }
+
+    fn emit_glyph(&mut self, request: PromptGlyphRequest) -> f32 {
+        let (uv_min, uv_max) = (self.resolve_glyph)(request.ch);
+        self.out.push(CellInstance {
+            pos: [request.x, request.y],
+            size: self.metrics.glyph_size,
+            uv_min,
+            uv_max,
+            fg_color: request.fg_color,
+            bg_color: request.bg_color,
+            corner_radius: 0.0,
+        });
+        request.x + self.metrics.cell_size.0
+    }
+}
+
 /// Compute the row height used by the prompt-bar strip layout.
-#[allow(dead_code, reason = "shared geometry helper consumed by later renderer work")]
 fn prompt_bar_row_height(cell_height: f32) -> f32 {
     (cell_height + 10.0).max(ROW_MIN_HEIGHT)
 }
@@ -105,8 +287,6 @@ fn dismiss_overlay_rect(layout: &PromptBarLayout, cell_size: (f32, f32)) -> Rect
 }
 
 /// Compute the prompt bar height for the current live strip renderer.
-#[allow(dead_code, reason = "shared geometry helper consumed by later pane/layout work")]
-#[allow(clippy::cast_precision_loss, reason = "small integer counts map cleanly to f32")]
 pub fn prompt_bar_height(prompt_count: u32, cell_height: f32) -> f32 {
     if prompt_count == 0 || cell_height <= 0.0 {
         return 0.0;
@@ -117,7 +297,6 @@ pub fn prompt_bar_height(prompt_count: u32, cell_height: f32) -> f32 {
 }
 
 /// Compute the shared geometry for the prompt bar strip, rows, badge, and truncation widths.
-#[allow(dead_code, reason = "shared geometry helper consumed by later renderer work")]
 pub fn compute_prompt_bar_layout(
     pane: &Pane,
     bar_rect: Rect,
@@ -189,22 +368,19 @@ pub fn compute_prompt_bar_layout(
 /// a custom prompt bar font size). `glyph_size` is the per-instance quad
 /// override (`[0.0, 0.0]` to use the uniform, or explicit dimensions when
 /// the prompt bar font differs from the terminal font).
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "rendering function needs pane state, geometry, hover state, and glyph resolver"
-)]
-pub fn render_prompt_bar(
-    out: &mut Vec<CellInstance>,
-    pane: &Pane,
-    bar_rect: Rect,
-    cell_size: (f32, f32),
-    glyph_size: [f32; 2],
-    hover: Option<PromptBarHover>,
-    active: Option<PromptBarHover>,
-    colors: &PromptBarColors,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
+pub fn render_prompt_bar(context: PromptBarRenderContext<'_>) {
+    let PromptBarRenderContext {
+        out,
+        pane,
+        bar_rect,
+        cell_size,
+        glyph_size,
+        hover,
+        active,
+        colors,
+        resolve_glyph,
+    } = context;
+
     if pane.prompt_count == 0 {
         return;
     }
@@ -214,199 +390,108 @@ pub fn render_prompt_bar(
         return;
     }
 
-    let Some(layout) = compute_prompt_bar_layout(pane, bar_rect, cell_size) else {
-        return;
-    };
-    let first_row_bg = colors.first_row_bg;
-    let latest_row_bg = colors.second_row_bg;
-    let first_row_hover_bg = lift_color(colors.first_row_bg, 0.035);
-    let first_row_active_bg = lift_color(colors.first_row_bg, 0.07);
-    let latest_row_hover_bg = lift_color(colors.second_row_bg, 0.035);
-    let latest_row_active_bg = lift_color(colors.second_row_bg, 0.07);
+    let Some(layout) = compute_prompt_bar_layout(pane, bar_rect, cell_size) else { return };
+    let metrics =
+        PromptRenderMetrics { row_content_x: layout.row_content_x, cell_size, glyph_size };
     let seam_color = with_alpha(mix(colors.first_row_bg, colors.second_row_bg, 0.5), 0.20);
+    let mut renderer = PromptRenderer { out, metrics, resolve_glyph };
 
-    if let Some(text) = &pane.first_prompt {
-        push_solid_rect(out, layout.first_row_rect, first_row_bg);
-        if hover == Some(PromptBarHover::First) {
-            push_solid_rect(out, layout.first_row_rect, first_row_hover_bg);
-        }
-        if active == Some(PromptBarHover::First) {
-            push_solid_rect(out, layout.first_row_rect, first_row_active_bg);
-        }
-
-        render_prompt_line(
-            out,
-            ICON_FIRST,
-            text,
-            layout.row_content_x,
-            layout.first_row_rect.y + (layout.first_row_rect.height - cell_h) * 0.5,
-            layout.first_line_width,
-            colors.icon_first,
-            colors.text,
-            first_row_bg,
-            cell_w,
-            cell_h,
-            glyph_size,
-            resolve_glyph,
-        );
+    if let Some(spec) = first_prompt_row_spec(pane, &layout, colors, hover, active) {
+        renderer.render_prompt_row(&spec);
     }
 
-    if let (Some(latest_row_rect), Some(text)) = (layout.latest_row_rect, &pane.latest_prompt) {
-        push_solid_rect(out, latest_row_rect, latest_row_bg);
-        if hover == Some(PromptBarHover::Latest) {
-            push_solid_rect(out, latest_row_rect, latest_row_hover_bg);
-        }
-        if active == Some(PromptBarHover::Latest) {
-            push_solid_rect(out, latest_row_rect, latest_row_active_bg);
-        }
-
-        render_prompt_line(
-            out,
-            ICON_LATEST,
-            text,
-            layout.row_content_x,
-            latest_row_rect.y + (latest_row_rect.height - cell_h) * 0.5,
-            layout.latest_line_width.unwrap_or(layout.first_line_width),
-            colors.icon_latest,
-            colors.text,
-            latest_row_bg,
-            cell_w,
-            cell_h,
-            glyph_size,
-            resolve_glyph,
-        );
+    if let Some(spec) = latest_prompt_row_spec(pane, &layout, colors, hover, active) {
+        renderer.render_prompt_row(&spec);
     }
 
     if let Some(seam_rect) = layout.seam_rect {
-        push_solid_rect(out, seam_rect, seam_color);
+        push_solid_rect(renderer.out, seam_rect, seam_color);
     }
 
     let show_dismiss_overlay = hover.is_some() || active == Some(PromptBarHover::DismissButton);
     if show_dismiss_overlay {
-        let dismiss_rect = dismiss_overlay_rect(&layout, (cell_w, cell_h));
-        let dismiss_background = if active == Some(PromptBarHover::DismissButton) {
-            with_alpha(mix(colors.first_row_bg, colors.second_row_bg, 0.38), 1.0)
-        } else {
-            with_alpha(mix(colors.first_row_bg, colors.second_row_bg, 0.28), 1.0)
-        };
-        let dismiss_foreground = if active == Some(PromptBarHover::DismissButton) {
-            with_alpha(colors.text, 1.0)
-        } else {
-            with_alpha(colors.text, 0.94)
-        };
-
-        push_solid_rect(out, dismiss_rect, dismiss_background);
-        let dismiss_x = dismiss_rect.x + (dismiss_rect.width - cell_w) * 0.5;
-        let dismiss_y = dismiss_rect.y + (dismiss_rect.height - cell_h) * 0.5;
-        emit_glyph(
-            out,
-            ICON_DISMISS,
-            dismiss_x,
-            dismiss_y,
-            dismiss_foreground,
-            dismiss_background,
-            cell_w,
-            glyph_size,
-            resolve_glyph,
-        );
+        let style = dismiss_overlay_style(*colors, active == Some(PromptBarHover::DismissButton));
+        renderer.render_dismiss_overlay(&layout, style);
     }
 
     if let Some(badge_rect) = layout.count_badge_rect {
-        render_count_badge(
-            out,
-            badge_rect,
-            pane.prompt_count,
-            colors,
-            cell_w,
-            cell_h,
-            glyph_size,
-            resolve_glyph,
-        );
+        renderer.render_count_badge(badge_rect, pane.prompt_count, colors);
     }
 }
 
-/// Render one prompt line: icon + text with truncation.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "line renderer needs all positioning, color, and glyph parameters"
-)]
-fn render_prompt_line(
-    out: &mut Vec<CellInstance>,
-    icon: char,
-    text: &str,
-    bar_x: f32,
-    y: f32,
-    bar_width: f32,
-    icon_color: [f32; 4],
-    text_color: [f32; 4],
-    bg_color: [f32; 4],
-    cell_w: f32,
-    _cell_h: f32,
-    glyph_size: [f32; 2],
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
-    let mut x = bar_x + ROW_SIDE_PAD;
-    let max_x = bar_x + bar_width - ROW_SIDE_PAD;
-
-    // Icon glyph.
-    x = emit_glyph(out, icon, x, y, icon_color, bg_color, cell_w, glyph_size, resolve_glyph);
-    x += ICON_TEXT_GAP;
-
-    // Text glyphs with truncation.
-    let chars: Vec<char> = text.chars().collect();
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "pixel count fits in usize; value is non-negative"
-    )]
-    let available_chars = ((max_x - x) / cell_w) as usize;
-
-    let needs_ellipsis = chars.len() > available_chars;
-    let visible_count = if needs_ellipsis {
-        available_chars.saturating_sub(1) // leave room for ellipsis
-    } else {
-        chars.len()
-    };
-
-    #[allow(clippy::indexing_slicing, reason = "visible_count <= chars.len() by construction")]
-    for &ch in &chars[..visible_count] {
-        if x + cell_w > max_x {
-            break;
-        }
-        x = emit_glyph(out, ch, x, y, text_color, bg_color, cell_w, glyph_size, resolve_glyph);
-    }
-
-    if needs_ellipsis && x + cell_w <= max_x {
-        emit_glyph(out, '…', x, y, text_color, bg_color, cell_w, glyph_size, resolve_glyph);
-    }
-}
-
-/// Render the count badge shown when multiple prompts are available.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "badge renderer needs geometry, colors, size, and glyph resolver"
-)]
-fn render_count_badge(
-    out: &mut Vec<CellInstance>,
-    rect: Rect,
-    count: u32,
+fn first_prompt_row_spec<'a>(
+    pane: &'a Pane,
+    layout: &PromptBarLayout,
     colors: &PromptBarColors,
-    cell_w: f32,
-    cell_h: f32,
-    glyph_size: [f32; 2],
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
-    let badge_fill = mix(colors.second_row_bg, colors.text, 0.06);
-    let badge_text = with_alpha(colors.text, 0.96);
+    hover: Option<PromptBarHover>,
+    active: Option<PromptBarHover>,
+) -> Option<PromptRowSpec<'a>> {
+    let text = pane.first_prompt.as_deref()?;
+    Some(PromptRowSpec {
+        row_rect: layout.first_row_rect,
+        icon: ICON_FIRST,
+        text,
+        line_width: layout.first_line_width,
+        colors: row_colors(colors.icon_first, colors.text, colors.first_row_bg),
+        state: prompt_row_state(hover, active, PromptBarHover::First),
+    })
+}
 
-    push_solid_rect(out, rect, badge_fill);
+fn latest_prompt_row_spec<'a>(
+    pane: &'a Pane,
+    layout: &PromptBarLayout,
+    colors: &PromptBarColors,
+    hover: Option<PromptBarHover>,
+    active: Option<PromptBarHover>,
+) -> Option<PromptRowSpec<'a>> {
+    let row_rect = layout.latest_row_rect?;
+    let text = pane.latest_prompt.as_deref()?;
+    Some(PromptRowSpec {
+        row_rect,
+        icon: ICON_LATEST,
+        text,
+        line_width: layout.latest_line_width.unwrap_or(layout.first_line_width),
+        colors: row_colors(colors.icon_latest, colors.text, colors.second_row_bg),
+        state: prompt_row_state(hover, active, PromptBarHover::Latest),
+    })
+}
 
-    let text = count.to_string();
-    let text_width = text.chars().fold(0.0, |width, _| width + cell_w);
-    let mut x = rect.x + (rect.width - text_width).max(0.0) * 0.5;
-    let y = rect.y + (rect.height - cell_h) * 0.5;
-    for ch in text.chars() {
-        x = emit_glyph(out, ch, x, y, badge_text, badge_fill, cell_w, glyph_size, resolve_glyph);
+fn row_colors(icon: [f32; 4], text: [f32; 4], base_bg: [f32; 4]) -> PromptRowColors {
+    PromptRowColors {
+        icon,
+        text,
+        base_bg,
+        hover_bg: lift_color(base_bg, 0.035),
+        active_bg: lift_color(base_bg, 0.07),
+    }
+}
+
+fn prompt_row_state(
+    hover: Option<PromptBarHover>,
+    active: Option<PromptBarHover>,
+    target: PromptBarHover,
+) -> PromptRowState {
+    if active == Some(target) {
+        PromptRowState::Active
+    } else if hover == Some(target) {
+        PromptRowState::Hovered
+    } else {
+        PromptRowState::Idle
+    }
+}
+
+fn dismiss_overlay_style(colors: PromptBarColors, active: bool) -> DismissOverlayStyle {
+    DismissOverlayStyle {
+        background: if active {
+            with_alpha(mix(colors.first_row_bg, colors.second_row_bg, 0.38), 1.0)
+        } else {
+            with_alpha(mix(colors.first_row_bg, colors.second_row_bg, 0.28), 1.0)
+        },
+        foreground: if active {
+            with_alpha(colors.text, 1.0)
+        } else {
+            with_alpha(colors.text, 0.94)
+        },
     }
 }
 
@@ -469,44 +554,41 @@ pub fn prompt_bar_text_width(
 }
 
 /// Check whether the given prompt text would be truncated at the given width.
-#[allow(clippy::cast_precision_loss, reason = "char count is small, fits in f32")]
 pub fn is_prompt_truncated(text: &str, bar_width: f32, cell_w: f32) -> bool {
     let usable = bar_width - ROW_SIDE_PAD * 2.0 - cell_w - ICON_TEXT_GAP;
-    let text_width = text.chars().count() as f32 * cell_w;
+    let text_width = prompt_text_width(text.chars().count(), cell_w);
     text_width > usable
 }
 
-/// Emit one glyph character at `(x, y)` and return `x + cell_w`.
-///
-/// `glyph_size` overrides the uniform cell size when non-zero, allowing the
-/// prompt bar to render at a different font scale than the terminal grid.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "glyph emitter needs position, colors, size, and resolver"
-)]
-fn emit_glyph(
-    out: &mut Vec<CellInstance>,
-    ch: char,
-    x: f32,
-    y: f32,
-    fg_color: [f32; 4],
-    bg_color: [f32; 4],
-    cell_w: f32,
-    glyph_size: [f32; 2],
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) -> f32 {
-    let (uv_min, uv_max) = resolve_glyph(ch);
-    out.push(CellInstance {
-        pos: [x, y],
-        size: glyph_size,
-        uv_min,
-        uv_max,
-        fg_color,
-        bg_color,
-        corner_radius: 0.0,
-        _pad: 0.0,
-    });
-    x + cell_w
+fn prompt_text_width(char_count: usize, cell_w: f32) -> f32 {
+    f32::from(u16::try_from(char_count).unwrap_or(u16::MAX)) * cell_w
+}
+
+fn prompt_chars_in_width(width: f32, cell_w: f32) -> usize {
+    if cell_w <= 0.0 || !width.is_finite() || width <= 0.0 {
+        return 0;
+    }
+
+    let mut low = 0usize;
+    let mut high = 1usize;
+    while prompt_text_width(high, cell_w) <= width && high < usize::from(u16::MAX) {
+        low = high;
+        high = high.saturating_mul(2).min(usize::from(u16::MAX));
+        if high == low {
+            break;
+        }
+    }
+
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if prompt_text_width(mid, cell_w) <= width {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+
+    low
 }
 
 /// Push a solid-color rectangle into `out`.
@@ -523,7 +605,6 @@ fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
         fg_color: color,
         bg_color: color,
         corner_radius: 0.0,
-        _pad: 0.0,
     });
 }
 

@@ -18,8 +18,12 @@ const NET_HISTORY_CAP: usize = 4;
 /// Minimum elapsed time between refreshes.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Bytes per gigabyte as f64 for precision during conversion.
-const BYTES_PER_GB: f64 = 1_073_741_824.0;
+/// Bytes per gibibyte.
+const BYTES_PER_GIB: u64 = 1_073_741_824;
+/// Bytes per mebibyte.
+const BYTES_PER_MIB: u64 = 1_048_576;
+/// Mebibytes per gibibyte.
+const MIB_PER_GIB: u16 = 1024;
 
 /// Cached snapshot of system resource usage.
 pub struct SystemStats {
@@ -103,7 +107,7 @@ impl SystemStatsCollector {
     // -----------------------------------------------------------------------
 
     fn do_refresh(&mut self) {
-        let elapsed_secs = self.last_refresh.elapsed().as_secs_f64().max(f64::EPSILON);
+        let elapsed = self.last_refresh.elapsed().max(Duration::from_nanos(1));
         self.last_refresh = Instant::now();
 
         self.sys.refresh_cpu_all();
@@ -118,8 +122,8 @@ impl SystemStatsCollector {
         self.stats.mem_total_gb = bytes_to_gb(self.sys.total_memory());
 
         let (up_bytes, down_bytes) = net_delta(&self.networks);
-        let up_rate = rate(up_bytes, elapsed_secs);
-        let down_rate = rate(down_bytes, elapsed_secs);
+        let up_rate = rate(up_bytes, elapsed);
+        let down_rate = rate(down_bytes, elapsed);
         push_capped(&mut self.stats.net_up_history, up_rate, NET_HISTORY_CAP);
         push_capped(&mut self.stats.net_down_history, down_rate, NET_HISTORY_CAP);
         self.stats.net_up_bytes_sec = up_rate;
@@ -151,14 +155,10 @@ fn push_capped<T>(buf: &mut VecDeque<T>, value: T, cap: usize) {
     buf.push_back(value);
 }
 
-/// Convert a byte count (u64) to gigabytes as f32.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    reason = "memory sizes fit comfortably in f32 for display"
-)]
 fn bytes_to_gb(bytes: u64) -> f32 {
-    (bytes as f64 / BYTES_PER_GB) as f32
+    let whole_gib = u16::try_from(bytes / BYTES_PER_GIB).unwrap_or(u16::MAX);
+    let remainder_mib = u16::try_from(bytes % BYTES_PER_GIB / BYTES_PER_MIB).unwrap_or(u16::MAX);
+    f32::from(whole_gib) + f32::from(remainder_mib) / f32::from(MIB_PER_GIB)
 }
 
 /// Sum received and transmitted bytes across all non-loopback interfaces.
@@ -176,18 +176,11 @@ fn net_delta(networks: &Networks) -> (u64, u64) {
 }
 
 /// Convert a byte delta to a per-second rate, rounding to u64.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "byte rates are non-negative and fit in u64"
-)]
-fn rate(bytes: u64, elapsed_secs: f64) -> u64 {
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "bytes as f64 is precise enough for network rate display"
-    )]
-    let bps = bytes as f64 / elapsed_secs;
-    bps as u64
+fn rate(bytes: u64, elapsed: Duration) -> u64 {
+    let nanos = elapsed.as_nanos().max(1);
+    let scaled = u128::from(bytes).saturating_mul(1_000_000_000);
+    let rounded = scaled.saturating_add(nanos / 2) / nanos;
+    u64::try_from(rounded).unwrap_or(u64::MAX)
 }
 
 // ---------------------------------------------------------------------------

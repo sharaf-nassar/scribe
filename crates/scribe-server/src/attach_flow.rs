@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::os::fd::RawFd;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
@@ -10,8 +10,8 @@ use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::{ServerMessage, SessionContext, TerminalSize};
 
 use crate::ipc_server::{
-    AttachSessionData, ClientWriter, LiveSessionRegistry, SharedWriter, detect_git_branch,
-    resize_term, send_message, set_pty_winsize,
+    AttachSessionData, AttachedSessionIds, ClientWriter, LiveSessionRegistry, SessionAttachment,
+    SharedWriter, detect_git_branch, resize_term, send_message, set_pty_winsize,
 };
 use crate::session_manager::snapshot_term;
 use crate::workspace_manager::WorkspaceManager;
@@ -22,8 +22,9 @@ struct AttachEntry {
     workspace_id: WorkspaceId,
     shell_name: String,
     client_writer: ClientWriter,
+    attachment: SessionAttachment,
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
-    pty_raw_fd: RawFd,
+    resize_fd: Arc<OwnedFd>,
     target_dims: Option<TerminalSize>,
     has_handoff_snapshot: bool,
     title: String,
@@ -40,8 +41,9 @@ impl From<AttachSessionData> for AttachEntry {
             workspace_id: data.workspace_id,
             shell_name: data.shell_name,
             client_writer: data.client_writer,
+            attachment: data.attachment,
             term: data.term,
-            pty_raw_fd: data.pty_raw_fd,
+            resize_fd: data.resize_fd,
             target_dims: data.target_dims,
             has_handoff_snapshot: data.has_handoff_snapshot,
             title: data.title,
@@ -53,15 +55,28 @@ impl From<AttachSessionData> for AttachEntry {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct AttachClientContext<'a> {
+    pub writer: &'a SharedWriter,
+    pub attached_ids: &'a AttachedSessionIds,
+}
+
 pub async fn attach_sessions(
     session_ids: &[SessionId],
     dimensions: &[TerminalSize],
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-    writer: &SharedWriter,
+    client: AttachClientContext<'_>,
 ) -> HashSet<SessionId> {
     let entries = prepare_attach_entries(session_ids, dimensions, live_sessions).await;
-    attach_prepared_entries(&entries, writer, live_sessions, workspace_manager).await
+    attach_prepared_entries(
+        &entries,
+        client.writer,
+        live_sessions,
+        workspace_manager,
+        client.attached_ids,
+    )
+    .await
 }
 
 async fn prepare_attach_entries(
@@ -89,15 +104,16 @@ async fn attach_prepared_entries(
     writer: &SharedWriter,
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    attached_ids: &AttachedSessionIds,
 ) -> HashSet<SessionId> {
-    let mut attached_ids = HashSet::with_capacity(entries.len());
+    let mut attached = HashSet::with_capacity(entries.len());
 
     for entry in entries {
-        attach_one_session(entry, writer, live_sessions, workspace_manager).await;
-        attached_ids.insert(entry.session_id);
+        attach_one_session(entry, writer, live_sessions, workspace_manager, attached_ids).await;
+        attached.insert(entry.session_id);
     }
 
-    attached_ids
+    attached
 }
 
 async fn attach_one_session(
@@ -105,9 +121,10 @@ async fn attach_one_session(
     writer: &SharedWriter,
     live_sessions: &LiveSessionRegistry,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+    attached_ids: &AttachedSessionIds,
 ) {
     send_attach_replay(entry, writer, live_sessions, workspace_manager).await;
-    install_client_writer(entry, writer).await;
+    install_client_writer(entry, writer, attached_ids).await;
 }
 
 async fn send_attach_replay(
@@ -126,7 +143,7 @@ async fn send_attach_replay(
         // process redraw and overwrite the restored history immediately.
         if size.has_grid() {
             resize_term(&entry.term, size.cols, size.rows).await;
-            if let Err(error) = set_pty_winsize(entry.pty_raw_fd, size) {
+            if let Err(error) = set_pty_winsize(entry.resize_fd.as_ref(), size) {
                 warn!(%session_id, "pre-snapshot TIOCSWINSZ failed: {error}");
             }
         }
@@ -149,7 +166,11 @@ async fn send_attach_replay(
     send_message(writer, &ServerMessage::ScreenSnapshot { session_id, snapshot }).await;
 }
 
-async fn install_client_writer(entry: &AttachEntry, writer: &SharedWriter) {
+async fn install_client_writer(
+    entry: &AttachEntry,
+    writer: &SharedWriter,
+    attached_ids: &AttachedSessionIds,
+) {
     let mut client_writer = entry.client_writer.lock().await;
     if client_writer.is_some() {
         warn!(
@@ -159,6 +180,7 @@ async fn install_client_writer(entry: &AttachEntry, writer: &SharedWriter) {
     }
     *client_writer = Some(Arc::clone(writer));
     drop(client_writer);
+    *entry.attachment.lock().await = Some(Arc::clone(attached_ids));
 
     info!(session_id = %entry.session_id, "session attached to new client");
 }
@@ -330,8 +352,9 @@ mod tests {
             workspace_id,
             shell_name: String::from("zsh"),
             client_writer: Arc::new(Mutex::new(None)),
+            attachment: Arc::new(Mutex::new(None)),
             term: Arc::new(Mutex::new(make_term(session_id))),
-            pty_raw_fd: -1,
+            resize_fd: Arc::new(std::fs::File::open("/dev/null").unwrap().into()),
             target_dims: None,
             has_handoff_snapshot: false,
             title: String::from("sample"),
@@ -349,24 +372,41 @@ mod tests {
         }
     }
 
+    struct AttachReplayExpectation {
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        cwd: std::path::PathBuf,
+        context: SessionContext,
+        ai_state: AiProcessState,
+        snapshot: ScreenSnapshot,
+    }
+
+    impl AttachReplayExpectation {
+        async fn capture(entry: &AttachEntry) -> Self {
+            let snapshot = {
+                let term = entry.term.lock().await;
+                snapshot_term(&term)
+            };
+
+            Self {
+                session_id: entry.session_id,
+                workspace_id: entry.workspace_id,
+                cwd: entry.cwd.clone().unwrap(),
+                context: entry.context.clone().unwrap(),
+                ai_state: entry.ai_state.clone().unwrap(),
+                snapshot,
+            }
+        }
+    }
+
     #[tokio::test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "replay assertion intentionally checks payload fields explicitly"
-    )]
     async fn send_attach_replay_emits_expected_sequence_and_leaves_writer_unset() {
         let live_sessions = crate::ipc_server::new_live_session_registry();
         let workspace_manager = Arc::new(RwLock::new(WorkspaceManager::new(vec![])));
         let workspace_id = workspace_manager.write().await.create_workspace();
         let session_id = SessionId::new();
         let entry = sample_entry(session_id, workspace_id);
-        let expected_cwd = entry.cwd.clone().unwrap();
-        let expected_context = entry.context.clone().unwrap();
-        let expected_ai_state = entry.ai_state.clone().unwrap();
-        let expected_snapshot = {
-            let term = entry.term.lock().await;
-            snapshot_term(&term)
-        };
+        let expected = AttachReplayExpectation::capture(&entry).await;
 
         let (server, client) = unix_stream_pair();
         let (_server_read, server_write) = tokio::io::split(server);
@@ -377,96 +417,8 @@ mod tests {
 
         assert!(entry.client_writer.lock().await.is_none());
 
-        let messages = [
-            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
-            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
-            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
-            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
-            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
-            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
-            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
-            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
-            read_message::<ServerMessage, _>(&mut client_read).await.unwrap(),
-        ];
-
-        assert!(matches!(
-            &messages[0],
-            ServerMessage::SessionCreated {
-                session_id: actual_session_id,
-                workspace_id: actual_workspace_id,
-                shell_name,
-            } if actual_session_id == &session_id
-                && actual_workspace_id == &workspace_id
-                && shell_name == "zsh"
-        ));
-        assert!(matches!(
-            &messages[1],
-            ServerMessage::TitleChanged { session_id: actual_session_id, title }
-                if actual_session_id == &session_id && title == "sample"
-        ));
-        assert!(matches!(
-            &messages[2],
-            ServerMessage::CodexTaskLabelChanged { session_id: actual_session_id, task_label }
-                if actual_session_id == &session_id && task_label == "task"
-        ));
-        assert!(matches!(
-            &messages[3],
-            ServerMessage::CwdChanged { session_id: actual_session_id, cwd }
-                if actual_session_id == &session_id && cwd == &expected_cwd
-        ));
-        assert!(matches!(
-            &messages[4],
-            ServerMessage::GitBranch { session_id: actual_session_id, .. }
-                if actual_session_id == &session_id
-        ));
-        assert!(matches!(
-            &messages[5],
-            ServerMessage::SessionContextChanged { session_id: actual_session_id, context }
-                if actual_session_id == &session_id && context == &expected_context
-        ));
-        assert!(matches!(
-            &messages[6],
-            ServerMessage::AiStateChanged { session_id: actual_session_id, ai_state }
-                if actual_session_id == &session_id && ai_state == &expected_ai_state
-        ));
-        assert!(matches!(
-            &messages[7],
-            ServerMessage::WorkspaceInfo { workspace_id: actual_workspace_id, .. }
-                if actual_workspace_id == &workspace_id
-        ));
-        match &messages[8] {
-            ServerMessage::ScreenSnapshot { session_id: actual_session_id, snapshot } => {
-                assert_eq!(*actual_session_id, session_id);
-                assert_eq!(snapshot.cols, expected_snapshot.cols);
-                assert_eq!(snapshot.rows, expected_snapshot.rows);
-                assert_eq!(snapshot.cursor_col, expected_snapshot.cursor_col);
-                assert_eq!(snapshot.cursor_row, expected_snapshot.cursor_row);
-                assert!(matches!(snapshot.cursor_style, CursorStyle::Block));
-                assert!(matches!(expected_snapshot.cursor_style, CursorStyle::Block));
-                assert_eq!(snapshot.cursor_visible, expected_snapshot.cursor_visible);
-                assert_eq!(snapshot.alt_screen, expected_snapshot.alt_screen);
-                assert_eq!(snapshot.scrollback_rows, expected_snapshot.scrollback_rows);
-                assert_eq!(snapshot.scrollback.len(), expected_snapshot.scrollback.len());
-                assert_eq!(snapshot.cells.len(), expected_snapshot.cells.len());
-
-                let actual_cell = snapshot.cells.first().unwrap();
-                let expected_cell = expected_snapshot.cells.first().unwrap();
-                assert_eq!(actual_cell.c, expected_cell.c);
-                assert!(matches!(actual_cell.fg, ScreenColor::Named(256)));
-                assert!(matches!(expected_cell.fg, ScreenColor::Named(256)));
-                assert!(matches!(actual_cell.bg, ScreenColor::Named(257)));
-                assert!(matches!(expected_cell.bg, ScreenColor::Named(257)));
-                assert_eq!(actual_cell.flags.bold, expected_cell.flags.bold);
-                assert_eq!(actual_cell.flags.italic, expected_cell.flags.italic);
-                assert_eq!(actual_cell.flags.underline, expected_cell.flags.underline);
-                assert_eq!(actual_cell.flags.strikethrough, expected_cell.flags.strikethrough);
-                assert_eq!(actual_cell.flags.dim, expected_cell.flags.dim);
-                assert_eq!(actual_cell.flags.inverse, expected_cell.flags.inverse);
-                assert_eq!(actual_cell.flags.hidden, expected_cell.flags.hidden);
-                assert_eq!(actual_cell.flags.wide, expected_cell.flags.wide);
-            }
-            other => panic!("expected ScreenSnapshot, got {other:?}"),
-        }
+        let messages = read_attach_replay_messages(&mut client_read).await;
+        assert_attach_replay_sequence(&messages, &expected);
     }
 
     #[tokio::test]
@@ -486,12 +438,193 @@ mod tests {
         let (server, _client) = unix_stream_pair();
         let (_read, write) = tokio::io::split(server);
         let writer: SharedWriter = Arc::new(Mutex::new(write));
+        let attached_ids = Arc::new(Mutex::new(HashSet::new()));
 
-        let attached =
-            attach_prepared_entries(&entries, &writer, &live_sessions, &workspace_manager).await;
+        let attached = attach_prepared_entries(
+            &entries,
+            &writer,
+            &live_sessions,
+            &workspace_manager,
+            &attached_ids,
+        )
+        .await;
 
         assert_eq!(attached.len(), 2);
         assert!(attached.contains(&entries[0].session_id));
         assert!(attached.contains(&entries[1].session_id));
+    }
+
+    async fn read_attach_replay_messages(
+        client_read: &mut tokio::io::ReadHalf<tokio::net::UnixStream>,
+    ) -> Vec<ServerMessage> {
+        let mut messages = Vec::with_capacity(9);
+        for _ in 0..9 {
+            messages.push(read_message::<ServerMessage, _>(client_read).await.unwrap());
+        }
+        messages
+    }
+
+    fn assert_attach_replay_sequence(
+        messages: &[ServerMessage],
+        expected: &AttachReplayExpectation,
+    ) {
+        assert_session_created_message(&messages[0], expected.session_id, expected.workspace_id);
+        assert_title_changed_message(&messages[1], expected.session_id);
+        assert_codex_task_label_message(&messages[2], expected.session_id);
+        assert_cwd_changed_message(&messages[3], expected.session_id, &expected.cwd);
+        assert_git_branch_message(&messages[4], expected.session_id);
+        assert_context_message(&messages[5], expected.session_id, &expected.context);
+        assert_ai_state_message(&messages[6], expected.session_id, &expected.ai_state);
+        assert_workspace_info_message(&messages[7], expected.workspace_id);
+        assert_snapshot_message(&messages[8], expected.session_id, &expected.snapshot);
+    }
+
+    fn assert_session_created_message(
+        message: &ServerMessage,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+    ) {
+        assert!(matches!(
+            message,
+            ServerMessage::SessionCreated {
+                session_id: actual_session_id,
+                workspace_id: actual_workspace_id,
+                shell_name,
+            } if actual_session_id == &session_id
+                && actual_workspace_id == &workspace_id
+                && shell_name == "zsh"
+        ));
+    }
+
+    fn assert_title_changed_message(message: &ServerMessage, session_id: SessionId) {
+        assert!(matches!(
+            message,
+            ServerMessage::TitleChanged { session_id: actual_session_id, title }
+                if actual_session_id == &session_id && title == "sample"
+        ));
+    }
+
+    fn assert_codex_task_label_message(message: &ServerMessage, session_id: SessionId) {
+        assert!(matches!(
+            message,
+            ServerMessage::CodexTaskLabelChanged { session_id: actual_session_id, task_label }
+                if actual_session_id == &session_id && task_label == "task"
+        ));
+    }
+
+    fn assert_cwd_changed_message(
+        message: &ServerMessage,
+        session_id: SessionId,
+        expected_cwd: &std::path::PathBuf,
+    ) {
+        assert!(matches!(
+            message,
+            ServerMessage::CwdChanged { session_id: actual_session_id, cwd }
+                if actual_session_id == &session_id && cwd == expected_cwd
+        ));
+    }
+
+    fn assert_git_branch_message(message: &ServerMessage, session_id: SessionId) {
+        assert!(matches!(
+            message,
+            ServerMessage::GitBranch { session_id: actual_session_id, .. }
+                if actual_session_id == &session_id
+        ));
+    }
+
+    fn assert_context_message(
+        message: &ServerMessage,
+        session_id: SessionId,
+        expected_context: &SessionContext,
+    ) {
+        assert!(matches!(
+            message,
+            ServerMessage::SessionContextChanged { session_id: actual_session_id, context }
+                if actual_session_id == &session_id && context == expected_context
+        ));
+    }
+
+    fn assert_ai_state_message(
+        message: &ServerMessage,
+        session_id: SessionId,
+        expected_ai_state: &AiProcessState,
+    ) {
+        assert!(matches!(
+            message,
+            ServerMessage::AiStateChanged { session_id: actual_session_id, ai_state }
+                if actual_session_id == &session_id && ai_state == expected_ai_state
+        ));
+    }
+
+    fn assert_workspace_info_message(message: &ServerMessage, workspace_id: WorkspaceId) {
+        assert!(matches!(
+            message,
+            ServerMessage::WorkspaceInfo { workspace_id: actual_workspace_id, .. }
+                if actual_workspace_id == &workspace_id
+        ));
+    }
+
+    fn assert_snapshot_message(
+        message: &ServerMessage,
+        session_id: SessionId,
+        expected_snapshot: &ScreenSnapshot,
+    ) {
+        let ServerMessage::ScreenSnapshot { session_id: actual_session_id, snapshot } = message
+        else {
+            panic!("expected ScreenSnapshot, got {message:?}");
+        };
+
+        assert_eq!(*actual_session_id, session_id);
+        assert_snapshot_header(snapshot, expected_snapshot);
+        assert_snapshot_cursor(snapshot, expected_snapshot);
+        assert_snapshot_cells(snapshot, expected_snapshot);
+    }
+
+    fn assert_snapshot_header(snapshot: &ScreenSnapshot, expected_snapshot: &ScreenSnapshot) {
+        assert_eq!(snapshot.cols, expected_snapshot.cols);
+        assert_eq!(snapshot.rows, expected_snapshot.rows);
+        assert_eq!(snapshot.alt_screen, expected_snapshot.alt_screen);
+        assert_eq!(snapshot.scrollback_rows, expected_snapshot.scrollback_rows);
+        assert_eq!(snapshot.scrollback.len(), expected_snapshot.scrollback.len());
+        assert_eq!(snapshot.cells.len(), expected_snapshot.cells.len());
+    }
+
+    fn assert_snapshot_cursor(snapshot: &ScreenSnapshot, expected_snapshot: &ScreenSnapshot) {
+        assert_eq!(snapshot.cursor_col, expected_snapshot.cursor_col);
+        assert_eq!(snapshot.cursor_row, expected_snapshot.cursor_row);
+        assert!(matches!(snapshot.cursor_style, CursorStyle::Block));
+        assert!(matches!(expected_snapshot.cursor_style, CursorStyle::Block));
+        assert_eq!(snapshot.cursor_visible, expected_snapshot.cursor_visible);
+    }
+
+    fn assert_snapshot_cells(snapshot: &ScreenSnapshot, expected_snapshot: &ScreenSnapshot) {
+        let actual_cell = snapshot.cells.first().unwrap();
+        let expected_cell = expected_snapshot.cells.first().unwrap();
+        assert_eq!(actual_cell.c, expected_cell.c);
+        assert_named_color(actual_cell.fg, 256);
+        assert_named_color(expected_cell.fg, 256);
+        assert_named_color(actual_cell.bg, 257);
+        assert_named_color(expected_cell.bg, 257);
+        assert_cell_flags(&actual_cell.flags, &expected_cell.flags);
+    }
+
+    fn assert_named_color(color: ScreenColor, expected_index: u16) {
+        assert!(
+            matches!(color, ScreenColor::Named(actual_index) if actual_index == expected_index)
+        );
+    }
+
+    fn assert_cell_flags(
+        actual: &scribe_common::screen::CellFlags,
+        expected: &scribe_common::screen::CellFlags,
+    ) {
+        assert_eq!(actual.bold(), expected.bold());
+        assert_eq!(actual.italic(), expected.italic());
+        assert_eq!(actual.underline(), expected.underline());
+        assert_eq!(actual.strikethrough(), expected.strikethrough());
+        assert_eq!(actual.dim(), expected.dim());
+        assert_eq!(actual.inverse(), expected.inverse());
+        assert_eq!(actual.hidden(), expected.hidden());
+        assert_eq!(actual.wide(), expected.wide());
     }
 }

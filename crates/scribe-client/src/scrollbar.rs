@@ -7,7 +7,7 @@
 use std::time::Instant;
 
 use alacritty_terminal::grid::Dimensions as _;
-use scribe_renderer::chrome::rounded_quad;
+use scribe_renderer::chrome::{QuadRect, rounded_quad};
 use scribe_renderer::types::CellInstance;
 
 use crate::pane::Pane;
@@ -29,6 +29,8 @@ const HOVER_EXTRA_WIDTH: f32 = 3.0;
 
 /// Speed of the width animation (lerp factor per second).
 const WIDTH_LERP_SPEED: f32 = 12.0;
+const F32_CHUNK_SIZE: usize = 65_536;
+const F32_CHUNK_SIZE_F32: f32 = 65_536.0;
 
 /// Per-pane scrollbar state.
 pub struct ScrollbarState {
@@ -54,6 +56,32 @@ pub struct ScrollbarDrag {
     pub start_mouse_y: f32,
     /// `display_offset` when the drag started.
     pub start_display_offset: usize,
+}
+
+fn scroll_units_f32(units: usize) -> f32 {
+    let high = u16::try_from(units / F32_CHUNK_SIZE).unwrap_or(u16::MAX);
+    let low = u16::try_from(units % F32_CHUNK_SIZE).unwrap_or(u16::MAX);
+    f32::from(high) * F32_CHUNK_SIZE_F32 + f32::from(low)
+}
+
+fn round_scroll_units(value: f32, max_units: usize) -> usize {
+    if max_units == 0 || !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+
+    let max_value = scroll_units_f32(max_units);
+    let target = value.min(max_value).max(0.0) + 0.5;
+    let mut low = 0usize;
+    let mut high = max_units;
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if scroll_units_f32(mid) < target {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+    low
 }
 
 impl ScrollbarState {
@@ -177,10 +205,6 @@ struct ThumbGeometry {
 }
 
 /// Compute thumb geometry for a pane, or `None` if the pane has no scrollback.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "grid dimensions and display_offset are small positive integers fitting in f32"
-)]
 fn compute_thumb(pane: &Pane, scrollbar_width: f32, tab_bar_height: f32) -> Option<ThumbGeometry> {
     let history_size = pane.term.grid().history_size();
     if history_size == 0 {
@@ -193,11 +217,12 @@ fn compute_thumb(pane: &Pane, scrollbar_width: f32, tab_bar_height: f32) -> Opti
     let track_top = pane.rect.y + tab_bar_height;
     let track_height = (pane.rect.height - tab_bar_height).max(1.0);
 
-    let total = (history_size + screen_lines) as f32;
-    let thumb_height = (screen_lines as f32 / total * track_height).max(MIN_THUMB_HEIGHT);
+    let total = scroll_units_f32(history_size.saturating_add(screen_lines));
+    let thumb_height =
+        (scroll_units_f32(screen_lines) / total * track_height).max(MIN_THUMB_HEIGHT);
     let available = (track_height - thumb_height).max(0.0);
 
-    let ratio = 1.0 - (display_offset as f32 / history_size as f32);
+    let ratio = 1.0 - (scroll_units_f32(display_offset) / scroll_units_f32(history_size));
     let thumb_y = (track_top + ratio * available).clamp(track_top, track_top + available);
 
     let thumb_x = pane.rect.x + pane.rect.width - scrollbar_width - RIGHT_INSET;
@@ -216,10 +241,6 @@ fn compute_thumb(pane: &Pane, scrollbar_width: f32, tab_bar_height: f32) -> Opti
 ///
 /// Does nothing if the pane has no scrollback or the scrollbar is invisible.
 /// Mutably borrows `pane` to update width animation targets.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "grid dimensions and mark positions are small positive integers fitting in f32"
-)]
 pub fn build_scrollbar_instances(
     out: &mut Vec<CellInstance>,
     pane: &mut Pane,
@@ -255,22 +276,30 @@ pub fn build_scrollbar_instances(
     ];
 
     let corner_radius = animated_width / 2.0;
-    out.push(rounded_quad(thumb.x, thumb.y, thumb.width, thumb.height, color, corner_radius));
+    out.push(rounded_quad(
+        QuadRect { pos: [thumb.x, thumb.y], size: [thumb.width, thumb.height] },
+        color,
+        corner_radius,
+    ));
 
     // Render prompt mark indicators on the scrollbar track.
     if !pane.prompt_marks.is_empty() {
         let history_size = pane.term.grid().history_size();
         let screen_lines = pane.term.grid().screen_lines();
-        let total = (history_size + screen_lines) as f32;
+        let total = scroll_units_f32(history_size.saturating_add(screen_lines));
         let mark_height = 2.0_f32;
         let mark_color = [0.6, 0.6, 0.8, alpha * 0.6];
         for &mark_abs in &pane.prompt_marks {
-            let ratio = mark_abs as f32 / total;
+            let ratio = scroll_units_f32(mark_abs) / total;
             // Clamp so that stale abs_pos values (from before a resize shrinks
             // scrollback) cannot produce ratio > 1.0 and render outside the track.
             let mark_y = (thumb.track_top + ratio * thumb.track_height)
                 .clamp(thumb.track_top, thumb.track_top + thumb.track_height - mark_height);
-            out.push(rounded_quad(thumb.x, mark_y, animated_width, mark_height, mark_color, 1.0));
+            out.push(rounded_quad(
+                QuadRect { pos: [thumb.x, mark_y], size: [animated_width, mark_height] },
+                mark_color,
+                1.0,
+            ));
         }
     }
 }
@@ -319,12 +348,6 @@ pub fn hit_test_thumb(
 /// Compute a target `display_offset` from a click Y position on the track.
 ///
 /// Returns the offset that would position the thumb center at the click point.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "grid dimensions are small positive integers; result is clamped to valid range"
-)]
 pub fn offset_from_track_click(
     pane: &Pane,
     click_y: f32,
@@ -343,7 +366,7 @@ pub fn offset_from_track_click(
     let available = thumb.track_height - thumb.height;
     // Ratio: 0.0 = bottom (display_offset=0), 1.0 = top (display_offset=history_size)
     let ratio = 1.0 - ((click_y - thumb.track_top) / available).clamp(0.0, 1.0);
-    let offset = (ratio * history_size as f32).round() as usize;
+    let offset = round_scroll_units(ratio * scroll_units_f32(history_size), history_size);
     offset.min(history_size)
 }
 
@@ -351,12 +374,6 @@ pub fn offset_from_track_click(
 ///
 /// `drag` is the captured state from drag start. `current_mouse_y` is the
 /// current Y position.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "grid dimensions are small positive integers; result is clamped to valid range"
-)]
 pub fn offset_from_drag(
     pane: &Pane,
     drag: &ScrollbarDrag,
@@ -376,8 +393,8 @@ pub fn offset_from_drag(
     let available = thumb.track_height - thumb.height;
     let delta_y = current_mouse_y - drag.start_mouse_y;
     // Dragging down (positive delta_y) decreases display_offset (scroll toward bottom).
-    let delta_lines = -(delta_y * history_size as f32 / available);
+    let delta_lines = -(delta_y * scroll_units_f32(history_size) / available);
 
-    let new_offset = drag.start_display_offset as f32 + delta_lines;
-    (new_offset.round().max(0.0) as usize).min(history_size)
+    let new_offset = scroll_units_f32(drag.start_display_offset) + delta_lines;
+    round_scroll_units(new_offset.max(0.0), history_size).min(history_size)
 }

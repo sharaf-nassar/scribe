@@ -348,12 +348,13 @@ impl SplashRenderer {
 
 /// Write `[viewport_w, viewport_h, logo_display_w, logo_display_h]` to the
 /// uniform buffer.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "viewport dimensions are small (< 2^23) and fit exactly in f32"
-)]
 fn write_uniforms(queue: &Queue, buf: &Buffer, viewport: (u32, u32)) {
-    let data: [f32; 4] = [viewport.0 as f32, viewport.1 as f32, LOGO_DISPLAY_PX, LOGO_DISPLAY_PX];
+    let data: [f32; 4] = [
+        f32::from(u16::try_from(viewport.0).unwrap_or(u16::MAX)),
+        f32::from(u16::try_from(viewport.1).unwrap_or(u16::MAX)),
+        LOGO_DISPLAY_PX,
+        LOGO_DISPLAY_PX,
+    ];
     queue.write_buffer(buf, 0, bytemuck::cast_slice(&data));
 }
 

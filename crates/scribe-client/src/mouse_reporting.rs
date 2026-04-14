@@ -6,6 +6,18 @@
 use winit::event::MouseButton;
 use winit::keyboard::ModifiersState;
 
+#[derive(Clone, Copy)]
+pub enum MouseReportMode {
+    Sgr,
+    X10,
+}
+
+#[derive(Clone, Copy)]
+pub enum ScrollDirection {
+    Up,
+    Down,
+}
+
 /// Encode modifier bits into the Cb byte per xterm spec.
 ///
 /// +4 = Shift, +8 = Alt, +16 = Ctrl.
@@ -44,11 +56,11 @@ pub fn encode_mouse_press(
     col: u16,
     row: u16,
     modifiers: ModifiersState,
-    sgr_mode: bool,
+    mode: MouseReportMode,
 ) -> Vec<u8> {
     let Some(base) = button_base(button) else { return Vec::new() };
     let cb = base | modifier_bits(modifiers);
-    if sgr_mode { encode_sgr(cb, col, row, true) } else { encode_x10(cb, col, row) }
+    encode_button_report(mode, cb, col, row, true)
 }
 
 /// Encode a mouse button release event.
@@ -60,35 +72,35 @@ pub fn encode_mouse_release(
     col: u16,
     row: u16,
     modifiers: ModifiersState,
-    sgr_mode: bool,
+    mode: MouseReportMode,
 ) -> Vec<u8> {
     let Some(base) = button_base(button) else { return Vec::new() };
     let cb = base | modifier_bits(modifiers);
-    if sgr_mode {
-        encode_sgr(cb, col, row, false)
-    } else {
-        // X10 release: Cb = 3, modifiers not preserved.
-        encode_x10(3, col, row)
+    match mode {
+        MouseReportMode::Sgr => encode_sgr(cb, col, row, false),
+        MouseReportMode::X10 => {
+            // X10 release: Cb = 3, modifiers not preserved.
+            encode_x10(3, col, row)
+        }
     }
 }
 
 /// Encode a scroll wheel event.
 ///
 /// Button 64 = scroll up, 65 = scroll down per xterm spec.
-#[allow(
-    clippy::fn_params_excessive_bools,
-    reason = "scroll_up and sgr_mode are distinct boolean flags with no useful enum equivalent"
-)]
 pub fn encode_mouse_scroll(
-    scroll_up: bool,
+    direction: ScrollDirection,
     col: u16,
     row: u16,
     modifiers: ModifiersState,
-    sgr_mode: bool,
+    mode: MouseReportMode,
 ) -> Vec<u8> {
-    let base: u8 = if scroll_up { 64 } else { 65 };
+    let base: u8 = match direction {
+        ScrollDirection::Up => 64,
+        ScrollDirection::Down => 65,
+    };
     let cb = base | modifier_bits(modifiers);
-    if sgr_mode { encode_sgr(cb, col, row, true) } else { encode_x10(cb, col, row) }
+    encode_button_report(mode, cb, col, row, true)
 }
 
 /// Encode a mouse motion event.
@@ -100,11 +112,18 @@ pub fn encode_mouse_motion(
     row: u16,
     button_held: Option<MouseButton>,
     modifiers: ModifiersState,
-    sgr_mode: bool,
+    mode: MouseReportMode,
 ) -> Vec<u8> {
     let base = button_held.and_then(button_base).unwrap_or(0);
     let cb = base | 32 | modifier_bits(modifiers);
-    if sgr_mode { encode_sgr(cb, col, row, true) } else { encode_x10(cb, col, row) }
+    encode_button_report(mode, cb, col, row, true)
+}
+
+fn encode_button_report(mode: MouseReportMode, cb: u8, col: u16, row: u16, press: bool) -> Vec<u8> {
+    match mode {
+        MouseReportMode::Sgr => encode_sgr(cb, col, row, press),
+        MouseReportMode::X10 => encode_x10(cb, col, row),
+    }
 }
 
 /// Build an SGR (`\x1b[<Cb;Cx;CyM` or `\x1b[<Cb;Cx;Cym`) sequence.

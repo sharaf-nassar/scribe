@@ -27,7 +27,6 @@ use scribe_common::screen::{
 };
 use scribe_pty::async_fd::AsyncPtyFd;
 use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
-use scribe_pty::metadata::MetadataParser;
 
 use crate::handoff::HandoffState;
 use crate::shell_integration;
@@ -40,6 +39,62 @@ const DEFAULT_COLS: u16 = 80;
 
 /// Default terminal rows.
 const DEFAULT_ROWS: u16 = 24;
+
+fn snapshot_line(index: usize) -> Line {
+    Line(i32::try_from(index).unwrap_or(i32::MAX))
+}
+
+fn scrollback_line(offset: usize) -> Line {
+    Line(-i32::try_from(offset).unwrap_or(i32::MAX))
+}
+
+fn snapshot_u16(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+fn nonnegative_u16(value: i32) -> u16 {
+    u16::try_from(value.max(0)).unwrap_or(u16::MAX)
+}
+
+fn snapshot_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn convert_named_color(named: alacritty_terminal::vte::ansi::NamedColor) -> u16 {
+    use alacritty_terminal::vte::ansi::NamedColor;
+
+    match named {
+        NamedColor::Black => 0,
+        NamedColor::Red => 1,
+        NamedColor::Green => 2,
+        NamedColor::Yellow => 3,
+        NamedColor::Blue => 4,
+        NamedColor::Magenta => 5,
+        NamedColor::Cyan => 6,
+        NamedColor::White => 7,
+        NamedColor::BrightBlack => 8,
+        NamedColor::BrightRed => 9,
+        NamedColor::BrightGreen => 10,
+        NamedColor::BrightYellow => 11,
+        NamedColor::BrightBlue => 12,
+        NamedColor::BrightMagenta => 13,
+        NamedColor::BrightCyan => 14,
+        NamedColor::BrightWhite => 15,
+        NamedColor::Foreground => 256,
+        NamedColor::Background => 257,
+        NamedColor::Cursor => 258,
+        NamedColor::DimBlack => 259,
+        NamedColor::DimRed => 260,
+        NamedColor::DimGreen => 261,
+        NamedColor::DimYellow => 262,
+        NamedColor::DimBlue => 263,
+        NamedColor::DimMagenta => 264,
+        NamedColor::DimCyan => 265,
+        NamedColor::DimWhite => 266,
+        NamedColor::BrightForeground => 267,
+        NamedColor::DimForeground => 268,
+    }
+}
 
 /// Build the terminal core config used for live PTY sessions.
 pub fn build_term_config(scrollback_lines: usize) -> TermConfig {
@@ -57,6 +112,8 @@ pub fn build_term_config(scrollback_lines: usize) -> TermConfig {
 /// Fields are `pub` for crate-internal access (the module itself is private).
 pub struct ManagedSession {
     pub pty_fd: AsyncPtyFd,
+    /// Duplicate PTY master fd used for safe winsize updates and handoff fd passing.
+    pub resize_fd: OwnedFd,
     pub child_pid: u32,
     pub term: Arc<Mutex<Term<ScribeEventListener>>>,
     /// ANSI processor for feeding bytes into `Term<ScribeEventListener>`.
@@ -64,7 +121,6 @@ pub struct ManagedSession {
     pub ansi_processor: AnsiProcessor,
     /// VTE parser for the OSC interceptor (calls `Perform` on `OscInterceptor`).
     pub osc_parser: VteParser,
-    pub metadata_parser: MetadataParser,
     pub event_rx: mpsc::UnboundedReceiver<SessionEvent>,
     pub workspace_id: WorkspaceId,
     pub shell_name: String,
@@ -117,6 +173,82 @@ impl Dimensions for TermDimensions {
     }
 }
 
+struct SessionGeometry {
+    dimensions: TermDimensions,
+    window_size: WindowSize,
+    cell_width: u16,
+    cell_height: u16,
+}
+
+pub struct SessionLaunchRequest {
+    pub workspace_id: WorkspaceId,
+    pub cwd: Option<std::path::PathBuf>,
+    pub size: Option<TerminalSize>,
+    pub command: Option<Vec<String>>,
+}
+
+struct PreparedSessionLaunch {
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    ai_provider_hint: Option<AiProvider>,
+    term: Term<ScribeEventListener>,
+    event_rx: mpsc::UnboundedReceiver<SessionEvent>,
+    shell_name: String,
+    pty_options: PtyOptions,
+    geometry: SessionGeometry,
+}
+
+impl PreparedSessionLaunch {
+    fn spawn_pty(&self) -> Result<alacritty_terminal::tty::Pty, ScribeError> {
+        alacritty_terminal::tty::new(&self.pty_options, self.geometry.window_size, 0).map_err(|e| {
+            ScribeError::PtySpawnFailed { reason: format!("alacritty tty::new failed: {e}") }
+        })
+    }
+
+    fn into_managed_session(
+        self,
+        pty: alacritty_terminal::tty::Pty,
+    ) -> Result<ManagedSession, ScribeError> {
+        let child_pid = pty.child().id();
+        let master_file = pty.file().try_clone().map_err(|e| ScribeError::PtySpawnFailed {
+            reason: format!("failed to clone PTY master fd: {e}"),
+        })?;
+        let master_fd: OwnedFd = master_file.into();
+        let resize_fd = rustix::io::dup(&master_fd).map_err(|e| ScribeError::PtySpawnFailed {
+            reason: format!("failed to duplicate PTY master fd: {e}"),
+        })?;
+        let pty_fd = AsyncPtyFd::new(master_fd).map_err(|e| ScribeError::PtySpawnFailed {
+            reason: format!("AsyncPtyFd::new failed: {e}"),
+        })?;
+        let ansi_processor = AnsiProcessor::new();
+        let osc_parser = VteParser::new();
+
+        info!(%self.session_id, %self.workspace_id, "created new PTY session");
+
+        Ok(ManagedSession {
+            pty_fd,
+            resize_fd,
+            child_pid,
+            term: Arc::new(Mutex::new(self.term)),
+            ansi_processor,
+            osc_parser,
+            event_rx: self.event_rx,
+            workspace_id: self.workspace_id,
+            shell_name: self.shell_name,
+            pty: Some(pty),
+            handoff_snapshot: None,
+            title: None,
+            codex_task_label: None,
+            cwd: None,
+            context: None,
+            ai_state: None,
+            ai_provider_hint: self.ai_provider_hint,
+            cell_width: self.geometry.cell_width,
+            cell_height: self.geometry.cell_height,
+        })
+    }
+}
+
 /// Manages all active PTY sessions.
 pub struct SessionManager {
     sessions: Arc<tokio::sync::RwLock<HashMap<SessionId, ManagedSession>>>,
@@ -133,16 +265,6 @@ impl Default for SessionManager {
 }
 
 impl SessionManager {
-    /// Create a new `SessionManager` with a default scrollback of 10 000 lines.
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "public constructor retained for API symmetry with with_scrollback"
-    )]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Create a new `SessionManager` with a specific scrollback line count.
     #[must_use]
     pub fn with_scrollback(scrollback_lines: usize) -> Self {
@@ -169,61 +291,42 @@ impl SessionManager {
     /// wrapper for epoll-driven I/O, and creates a `Term<ScribeEventListener>`
     /// for terminal state management. Uses the scrollback line count configured
     /// at construction time.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "session creation requires workspace, cwd, dimensions, and optional command override"
-    )]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "session creation involves sequential PTY setup, shell detection, and integration wiring"
-    )]
     pub async fn create_session(
         &self,
-        workspace_id: WorkspaceId,
-        cwd: Option<std::path::PathBuf>,
-        size: Option<TerminalSize>,
-        command: Option<Vec<String>>,
+        request: SessionLaunchRequest,
     ) -> Result<SessionId, ScribeError> {
-        let scrollback_lines = self.scrollback_lines.load(Ordering::Relaxed);
-        {
-            let sessions = self.sessions.read().await;
-            if sessions.len() >= MAX_SESSIONS {
-                return Err(ScribeError::IpcError {
-                    reason: "global session limit reached".to_owned(),
-                });
-            }
-        }
-
         let session_id = SessionId::new();
-        let ai_provider_hint = command_ai_provider_hint(command.as_deref());
+        self.reserve_session_slot().await?;
+        let launch = self.prepare_session_launch(session_id, request);
+        let pty = launch.spawn_pty()?;
+        let managed = launch.into_managed_session(pty)?;
+        self.sessions.write().await.insert(session_id, managed);
+        Ok(session_id)
+    }
 
-        // 1. Create metadata event channel.
+    async fn reserve_session_slot(&self) -> Result<(), ScribeError> {
+        let sessions = self.sessions.read().await;
+        if sessions.len() >= MAX_SESSIONS {
+            return Err(ScribeError::IpcError {
+                reason: "global session limit reached".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn prepare_session_launch(
+        &self,
+        session_id: SessionId,
+        request: SessionLaunchRequest,
+    ) -> PreparedSessionLaunch {
+        let scrollback_lines = self.scrollback_lines.load(Ordering::Relaxed);
+        let ai_provider_hint = command_ai_provider_hint(request.command.as_deref());
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-
-        // 2. Create event listener for `alacritty_terminal` events.
         let event_listener = ScribeEventListener::new(session_id, event_tx);
-
-        // 3. Create Term config with scrollback.
         let term_config = build_term_config(scrollback_lines);
-
-        // 4. Create Term — use caller-supplied dimensions when available so
-        //    the PTY starts at the correct size and the shell's first output
-        //    is formatted for the actual window width.
-        let init_cols = size.and_then(|s| (s.cols > 0).then_some(s.cols)).unwrap_or(DEFAULT_COLS);
-        let init_rows = size.and_then(|s| (s.rows > 0).then_some(s.rows)).unwrap_or(DEFAULT_ROWS);
-        let cell_width = size.and_then(|s| (s.cell_width > 0).then_some(s.cell_width)).unwrap_or(1);
-        let cell_height =
-            size.and_then(|s| (s.cell_height > 0).then_some(s.cell_height)).unwrap_or(1);
-        let dimensions =
-            TermDimensions { cols: usize::from(init_cols), lines: usize::from(init_rows) };
-        let term = Term::new(term_config, &dimensions, event_listener);
-
-        // 5. Create PTY using `alacritty_terminal::tty`.
-        let window_size =
-            WindowSize { num_lines: init_rows, num_cols: init_cols, cell_width, cell_height };
-        // Determine shell binary before consuming `command` so it can be used
-        // for shell integration env injection.
-        let shell_binary = shell_binary_str(command.as_deref());
+        let geometry = session_geometry(request.size);
+        let term = Term::new(term_config, &geometry.dimensions, event_listener);
+        let shell_binary = shell_binary_str(request.command.as_deref());
         let shell_name = Path::new(&shell_binary)
             .file_stem()
             .and_then(|name| name.to_str())
@@ -231,77 +334,21 @@ impl SessionManager {
             .to_owned();
         let kind = shell_integration::detect_shell(&shell_binary);
         let integration_enabled = self.shell_integration_enabled.load(Ordering::Relaxed);
-        let integration_script = if integration_enabled {
-            shell_integration::find_scripts_dir()
-                .and_then(|dir| shell_integration::integration_script_path(&shell_binary, &dir))
-                .and_then(|path| path.to_str().map(String::from))
-        } else {
-            None
-        };
-        let shell = build_shell(&shell_binary, command, kind, integration_script.as_deref());
-        let mut env = HashMap::from([
-            ("TERM".to_owned(), "xterm-256color".to_owned()),
-            ("COLORTERM".to_owned(), "truecolor".to_owned()),
-            ("TERM_PROGRAM".to_owned(), "Scribe".to_owned()),
-            ("TERM_PROGRAM_VERSION".to_owned(), env!("CARGO_PKG_VERSION").to_owned()),
-        ]);
-        if integration_enabled {
-            inject_shell_integration_env(&shell_binary, &mut env);
-        }
-        let pty_options = PtyOptions {
-            shell,
-            env,
-            working_directory: cwd.filter(|p| p.is_dir()).or_else(dirs::home_dir),
-            ..PtyOptions::default()
-        };
+        let integration_script = session_integration_script(&shell_binary, integration_enabled);
+        let shell =
+            build_shell(&shell_binary, request.command, kind, integration_script.as_deref());
+        let pty_options = build_pty_options(shell, request.cwd, &shell_binary, integration_enabled);
 
-        let pty = alacritty_terminal::tty::new(&pty_options, window_size, 0).map_err(|e| {
-            ScribeError::PtySpawnFailed { reason: format!("alacritty tty::new failed: {e}") }
-        })?;
-
-        // 6. Extract child PID and master fd.
-        let child_pid = pty.child().id();
-        let master_file = pty.file().try_clone().map_err(|e| ScribeError::PtySpawnFailed {
-            reason: format!("failed to clone PTY master fd: {e}"),
-        })?;
-        let master_fd: OwnedFd = master_file.into();
-
-        // 7. Wrap in `AsyncPtyFd` for epoll-driven I/O.
-        let pty_fd = AsyncPtyFd::new(master_fd).map_err(|e| ScribeError::PtySpawnFailed {
-            reason: format!("AsyncPtyFd::new failed: {e}"),
-        })?;
-
-        // 8. Create `MetadataParser` and parsers.
-        let metadata_parser = MetadataParser::new(session_id);
-        let ansi_processor = AnsiProcessor::new();
-        let osc_parser = VteParser::new();
-
-        info!(%session_id, %workspace_id, "created new PTY session");
-
-        let managed = ManagedSession {
-            pty_fd,
-            child_pid,
-            term: Arc::new(Mutex::new(term)),
-            ansi_processor,
-            osc_parser,
-            metadata_parser,
-            event_rx,
-            workspace_id,
-            shell_name,
-            pty: Some(pty),
-            handoff_snapshot: None,
-            title: None,
-            codex_task_label: None,
-            cwd: None,
-            context: None,
-            ai_state: None,
+        PreparedSessionLaunch {
+            session_id,
+            workspace_id: request.workspace_id,
             ai_provider_hint,
-            cell_width,
-            cell_height,
-        };
-
-        self.sessions.write().await.insert(session_id, managed);
-        Ok(session_id)
+            term,
+            event_rx,
+            shell_name,
+            pty_options,
+            geometry,
+        }
     }
 
     /// Remove a session from the map and return it.
@@ -353,6 +400,13 @@ impl SessionManager {
             let term = Term::new(term_config, &dimensions, event_listener);
 
             // Wrap the received fd for async I/O.
+            let resize_fd =
+                rustix::io::dup(&owned_fd).map_err(|e| ScribeError::PtySpawnFailed {
+                    reason: format!(
+                        "failed to duplicate restored PTY master fd for {}: {e}",
+                        handoff_session.session_id
+                    ),
+                })?;
             let pty_fd = AsyncPtyFd::new(owned_fd).map_err(|e| ScribeError::PtySpawnFailed {
                 reason: format!(
                     "AsyncPtyFd::new failed during restore for {}: {e}",
@@ -361,7 +415,6 @@ impl SessionManager {
             })?;
 
             // Create parsers.
-            let metadata_parser = MetadataParser::new(handoff_session.session_id);
             let ansi_processor = AnsiProcessor::new();
             let osc_parser = VteParser::new();
 
@@ -385,11 +438,11 @@ impl SessionManager {
             // Option. See the ManagedSession struct change.
             let managed = ManagedSession {
                 pty_fd,
+                resize_fd,
                 child_pid: handoff_session.child_pid,
                 term: Arc::new(Mutex::new(term)),
                 ansi_processor,
                 osc_parser,
-                metadata_parser,
                 event_rx,
                 workspace_id: handoff_session.workspace_id,
                 shell_name: handoff_session.shell_name.clone(),
@@ -414,6 +467,52 @@ impl SessionManager {
             shell_integration_enabled: std::sync::atomic::AtomicBool::new(true),
         })
     }
+}
+
+fn session_geometry(size: Option<TerminalSize>) -> SessionGeometry {
+    let init_cols = size.and_then(|s| (s.cols > 0).then_some(s.cols)).unwrap_or(DEFAULT_COLS);
+    let init_rows = size.and_then(|s| (s.rows > 0).then_some(s.rows)).unwrap_or(DEFAULT_ROWS);
+    let cell_width = size.and_then(|s| (s.cell_width > 0).then_some(s.cell_width)).unwrap_or(1);
+    let cell_height = size.and_then(|s| (s.cell_height > 0).then_some(s.cell_height)).unwrap_or(1);
+    let dimensions = TermDimensions { cols: usize::from(init_cols), lines: usize::from(init_rows) };
+    let window_size =
+        WindowSize { num_lines: init_rows, num_cols: init_cols, cell_width, cell_height };
+
+    SessionGeometry { dimensions, window_size, cell_width, cell_height }
+}
+
+fn build_pty_options(
+    shell: Option<alacritty_terminal::tty::Shell>,
+    cwd: Option<std::path::PathBuf>,
+    shell_binary: &str,
+    integration_enabled: bool,
+) -> PtyOptions {
+    let mut env = HashMap::from([
+        ("TERM".to_owned(), "xterm-256color".to_owned()),
+        ("COLORTERM".to_owned(), "truecolor".to_owned()),
+        ("TERM_PROGRAM".to_owned(), "Scribe".to_owned()),
+        ("TERM_PROGRAM_VERSION".to_owned(), env!("CARGO_PKG_VERSION").to_owned()),
+    ]);
+    if integration_enabled {
+        inject_shell_integration_env(shell_binary, &mut env);
+    }
+
+    PtyOptions {
+        shell,
+        env,
+        working_directory: cwd.filter(|p| p.is_dir()).or_else(dirs::home_dir),
+        ..PtyOptions::default()
+    }
+}
+
+fn session_integration_script(shell_binary: &str, integration_enabled: bool) -> Option<String> {
+    if !integration_enabled {
+        return None;
+    }
+
+    shell_integration::find_scripts_dir()
+        .and_then(|dir| shell_integration::integration_script_path(shell_binary, &dir))
+        .and_then(|path| path.to_str().map(String::from))
 }
 
 /// Extract the shell binary string from an optional command slice, falling
@@ -552,12 +651,7 @@ pub fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
     let mut cells = Vec::with_capacity(cols * rows);
 
     for line_idx in 0..rows {
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_possible_wrap,
-            reason = "terminal rows are always within i32 range (max ~65535)"
-        )]
-        let line = Line(line_idx as i32);
+        let line = snapshot_line(line_idx);
         let row = &grid[line];
         for col_idx in 0..cols {
             let cell = &row[Column(col_idx)];
@@ -586,12 +680,7 @@ pub fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
         let mut scrollback = Vec::with_capacity(cols * history);
 
         for i in (1..=history).rev() {
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_possible_wrap,
-                reason = "scrollback index bounded by history_size (≤ 100_000), fits in i32"
-            )]
-            let line = Line(-(i as i32));
+            let line = scrollback_line(i);
             let row = &grid[line];
             for col_idx in 0..cols {
                 let cell = &row[Column(col_idx)];
@@ -604,23 +693,17 @@ pub fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
 
     tracing::debug!(cols, rows, alt_screen, scrollback_rows = history, "snapshot_term captured");
 
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "terminal dimensions and cursor position are always within u16 range; \
-                  history bounded by scrollback_lines (≤ 100_000) fits u32"
-    )]
     ScreenSnapshot {
         cells,
-        cols: cols as u16,
-        rows: rows as u16,
-        cursor_col: cursor_point.column.0 as u16,
-        cursor_row: cursor_point.line.0.max(0) as u16,
+        cols: snapshot_u16(cols),
+        rows: snapshot_u16(rows),
+        cursor_col: snapshot_u16(cursor_point.column.0),
+        cursor_row: nonnegative_u16(cursor_point.line.0),
         cursor_style: convert_cursor_style(cursor_style),
         cursor_visible,
         alt_screen,
         scrollback,
-        scrollback_rows: history as u32,
+        scrollback_rows: snapshot_u32(history),
     }
 }
 
@@ -637,13 +720,8 @@ pub fn convert_cell(cell: &alacritty_terminal::term::cell::Cell) -> ScreenCell {
 /// Convert an `alacritty_terminal` `Color` to our `ScreenColor`.
 pub fn convert_color(color: alacritty_terminal::vte::ansi::Color) -> ScreenColor {
     match color {
-        alacritty_terminal::vte::ansi::Color::Named(named) =>
-        {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "NamedColor max variant (DimCyan = 266) fits in u16"
-            )]
-            ScreenColor::Named(named as u16)
+        alacritty_terminal::vte::ansi::Color::Named(named) => {
+            ScreenColor::Named(convert_named_color(named))
         }
         alacritty_terminal::vte::ansi::Color::Indexed(idx) => ScreenColor::Indexed(idx),
         alacritty_terminal::vte::ansi::Color::Spec(rgb) => {
@@ -655,15 +733,25 @@ pub fn convert_color(color: alacritty_terminal::vte::ansi::Color) -> ScreenColor
 /// Convert `alacritty_terminal` cell `Flags` to our `CellFlags`.
 pub fn convert_flags(flags: CellFlags) -> ScreenCellFlags {
     ScreenCellFlags {
-        bold: flags.contains(CellFlags::BOLD),
-        italic: flags.contains(CellFlags::ITALIC),
-        underline: flags.contains(CellFlags::UNDERLINE),
-        strikethrough: flags.contains(CellFlags::STRIKEOUT),
-        dim: flags.contains(CellFlags::DIM),
-        inverse: flags.contains(CellFlags::INVERSE),
-        hidden: flags.contains(CellFlags::HIDDEN),
-        wide: flags.contains(CellFlags::WIDE_CHAR),
-        wrap: flags.contains(CellFlags::WRAPLINE),
+        emphasis: scribe_common::screen::CellEmphasisFlags {
+            weight: scribe_common::screen::CellWeightFlags {
+                bold: flags.contains(CellFlags::BOLD),
+                dim: flags.contains(CellFlags::DIM),
+            },
+            italic: flags.contains(CellFlags::ITALIC),
+        },
+        decoration: scribe_common::screen::CellDecorationFlags {
+            underline: flags.contains(CellFlags::UNDERLINE),
+            strikethrough: flags.contains(CellFlags::STRIKEOUT),
+        },
+        presentation: scribe_common::screen::CellPresentationFlags {
+            inverse: flags.contains(CellFlags::INVERSE),
+            hidden: flags.contains(CellFlags::HIDDEN),
+        },
+        layout: scribe_common::screen::CellLayoutFlags {
+            wide: flags.contains(CellFlags::WIDE_CHAR),
+            wrap: flags.contains(CellFlags::WRAPLINE),
+        },
     }
 }
 

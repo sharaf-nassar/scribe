@@ -92,12 +92,8 @@ impl TerminalPipeline {
     /// the content is identical to the previous frame.  `instance_count` is
     /// always updated so the draw call uses the correct count even on a
     /// hash-skip early return.
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "instance count is bounded by buffer capacity which fits in u32"
-    )]
     pub fn update_instances(&mut self, device: &Device, queue: &Queue, instances: &[CellInstance]) {
-        let count = instances.len() as u32;
+        let count = u32::try_from(instances.len()).unwrap_or(u32::MAX);
 
         let mut hasher = DefaultHasher::new();
         // CellInstance is `bytemuck::Pod` (plain bytes); hash the raw byte
@@ -311,12 +307,13 @@ fn instance_buffer_layout() -> VertexBufferLayout<'static> {
 }
 
 /// Write viewport and cell-size data into the uniform buffer.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "viewport dimensions are small enough (< 2^23) to fit exactly in f32"
-)]
 fn write_uniforms(queue: &Queue, buffer: &Buffer, viewport: (u32, u32), cell_size: (f32, f32)) {
-    let data: [f32; 4] = [viewport.0 as f32, viewport.1 as f32, cell_size.0, cell_size.1];
+    let data: [f32; 4] = [
+        f32::from(u16::try_from(viewport.0).unwrap_or(u16::MAX)),
+        f32::from(u16::try_from(viewport.1).unwrap_or(u16::MAX)),
+        cell_size.0,
+        cell_size.1,
+    ];
     queue.write_buffer(buffer, 0, bytemuck::cast_slice(&data));
 }
 

@@ -42,6 +42,34 @@ pub struct ContextMenu {
     pub item_rects: Vec<Rect>,
 }
 
+pub struct ContextMenuBuildContext<'a> {
+    pub out: &'a mut Vec<CellInstance>,
+    pub viewport: Rect,
+    pub cell_size: (f32, f32),
+    pub chrome: &'a ChromeColors,
+    pub resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+}
+
+fn menu_grid_units(units: usize) -> u16 {
+    u16::try_from(units).unwrap_or(u16::MAX)
+}
+
+fn menu_grid_x(origin: f32, col: usize, cell_w: f32) -> f32 {
+    origin + f32::from(menu_grid_units(col)) * cell_w
+}
+
+fn menu_grid_y(origin: f32, row: usize, cell_h: f32) -> f32 {
+    origin + f32::from(menu_grid_units(row)) * cell_h
+}
+
+fn menu_grid_width(cols: usize, cell_w: f32) -> f32 {
+    f32::from(menu_grid_units(cols)) * cell_w
+}
+
+fn menu_grid_height(rows: usize, cell_h: f32) -> f32 {
+    f32::from(menu_grid_units(rows)) * cell_h
+}
+
 impl ContextMenu {
     /// Build a context menu at `(x, y)`.
     ///
@@ -119,168 +147,185 @@ impl ContextMenu {
     ///
     /// Appends a near-invisible click-capture backdrop (full viewport),
     /// a dark menu box with border, and individual item rows into `out`.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "single render builder: backdrop, box, border, items, hover highlight, separator"
-    )]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "needs output vec, viewport, cell size, chrome colors, and glyph resolver"
-    )]
-    pub fn build_instances(
-        &mut self,
-        out: &mut Vec<CellInstance>,
-        viewport: Rect,
-        cell_size: (f32, f32),
-        chrome: &ChromeColors,
-        resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-    ) {
+    pub fn build_instances(&mut self, context: ContextMenuBuildContext<'_>) {
+        let ContextMenuBuildContext { out, viewport, cell_size, chrome, resolve_glyph } = context;
         let (cell_w, cell_h) = cell_size;
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return;
         }
 
         let colors = MenuColors::from_chrome(chrome);
-
-        // -- Near-invisible backdrop (captures clicks outside the menu) --
         push_solid_rect(out, viewport, colors.backdrop);
 
-        if self.items.is_empty() {
+        let Some(layout) = MenuLayout::new(self, viewport, cell_size, &colors) else {
             return;
-        }
+        };
 
-        // -- Menu dimensions --
-        // Width: widest label + 4 columns padding (2 each side).
-        let label_max = self.items.iter().map(|item| item.label.len()).max().unwrap_or(0);
-        let menu_cols = label_max + 4;
-
-        // Height: each item is 2 cell rows (0.5 top pad + 1 label + 0.5 bottom pad).
-        // We approximate this as 2 rows per item.
-        let item_rows: usize = 2;
-        let has_open_item = self.items.iter().any(|item| {
-            matches!(item.action, ContextMenuAction::OpenUrl(_) | ContextMenuAction::OpenFile(_))
-        });
-        // Extra row for separator before the first open (URL/file) item.
-        let separator_rows: usize = usize::from(has_open_item);
-        let total_rows = self.items.len() * item_rows + separator_rows;
-
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "menu_cols and total_rows are small positive integers fitting in f32"
-        )]
-        let menu_w = menu_cols as f32 * cell_w;
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "total_rows is a small positive integer fitting in f32"
-        )]
-        let menu_h = total_rows as f32 * cell_h;
-
-        // Clamp menu position so it stays within the viewport.
-        let menu_x = self.x.min(viewport.x + viewport.width - menu_w).max(viewport.x);
-        let menu_y = self.y.min(viewport.y + viewport.height - menu_h).max(viewport.y);
-
-        let menu_rect = Rect { x: menu_x, y: menu_y, width: menu_w, height: menu_h };
-
-        // -- Menu background --
-        push_solid_rect(out, menu_rect, colors.menu_bg);
-
-        // -- Border (1px on all four sides) --
-        push_solid_rect(
-            out,
-            Rect { x: menu_x, y: menu_y, width: menu_w, height: 1.0 },
-            colors.border,
-        );
-        push_solid_rect(
-            out,
-            Rect { x: menu_x, y: menu_y + menu_h - 1.0, width: menu_w, height: 1.0 },
-            colors.border,
-        );
-        push_solid_rect(
-            out,
-            Rect { x: menu_x, y: menu_y, width: 1.0, height: menu_h },
-            colors.border,
-        );
-        push_solid_rect(
-            out,
-            Rect { x: menu_x + menu_w - 1.0, y: menu_y, width: 1.0, height: menu_h },
-            colors.border,
-        );
-
-        // -- Items --
-        // Ensure item_rects is the right size.
+        push_solid_rect(out, layout.menu_rect, colors.menu_bg);
+        draw_menu_frame(out, &layout, colors.border);
         self.item_rects.resize(self.items.len(), Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
+        let mut renderer =
+            MenuRenderer { out, layout: &layout, colors: &colors, cell_size, resolve_glyph };
+        renderer.render_items(self);
+    }
+}
 
-        let mut row: usize = 0;
-        for (idx, item) in self.items.iter().enumerate() {
-            // Insert separator before the first open (URL or file) item.
+struct MenuLayout {
+    menu_rect: Rect,
+    menu_cols: usize,
+    item_rows: usize,
+    has_open_item: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MenuTextLine<'a> {
+    text: &'a str,
+    row: usize,
+    start_col: usize,
+    max_cols: usize,
+    fg: [f32; 4],
+    bg: [f32; 4],
+}
+
+struct MenuRenderer<'a> {
+    out: &'a mut Vec<CellInstance>,
+    layout: &'a MenuLayout,
+    colors: &'a MenuColors,
+    cell_size: (f32, f32),
+    resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
+}
+
+impl MenuRenderer<'_> {
+    fn render_items(&mut self, menu: &mut ContextMenu) {
+        let (cell_w, cell_h) = self.cell_size;
+        let mut row = 0usize;
+
+        for (idx, item) in menu.items.iter().enumerate() {
             let is_open_item = matches!(
                 item.action,
                 ContextMenuAction::OpenUrl(_) | ContextMenuAction::OpenFile(_)
             );
-            if is_open_item && has_open_item {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "row is a small positive integer fitting in f32"
-                )]
-                let sep_y = menu_y + row as f32 * cell_h + cell_h / 2.0;
-                let sep_rect = Rect {
-                    x: menu_x + cell_w,
-                    y: sep_y,
-                    width: menu_w - 2.0 * cell_w,
-                    height: 1.0,
-                };
-                push_solid_rect(out, sep_rect, colors.separator);
+            if is_open_item && self.layout.has_open_item {
+                let sep_y = menu_grid_y(self.layout.menu_rect.y, row, cell_h) + cell_h / 2.0;
+                push_solid_rect(
+                    self.out,
+                    Rect {
+                        x: self.layout.menu_rect.x + cell_w,
+                        y: sep_y,
+                        width: self.layout.menu_rect.width - 2.0 * cell_w,
+                        height: 1.0,
+                    },
+                    self.colors.separator,
+                );
                 row += 1;
             }
 
-            let is_hovered = self.hovered == Some(idx);
-
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "row and item_rows are small positive integers fitting in f32"
-            )]
             let item_rect = Rect {
-                x: menu_x,
-                y: menu_y + row as f32 * cell_h,
-                width: menu_w,
-                height: item_rows as f32 * cell_h,
+                x: self.layout.menu_rect.x,
+                y: menu_grid_y(self.layout.menu_rect.y, row, cell_h),
+                width: self.layout.menu_rect.width,
+                height: menu_grid_height(self.layout.item_rows, cell_h),
             };
-
-            // Hover highlight.
-            if is_hovered && item.enabled {
-                push_solid_rect(out, item_rect, colors.item_hover_bg);
+            let hovered = menu.hovered == Some(idx);
+            if hovered && item.enabled {
+                push_solid_rect(self.out, item_rect, self.colors.item_hover_bg);
             }
 
-            // Text — vertically centered in the item row (middle of the 2 rows).
-            let text_row = row + 1;
-            let fg = if item.enabled { colors.item_fg } else { colors.item_disabled_fg };
-            let bg = if is_hovered && item.enabled { colors.item_hover_bg } else { colors.menu_bg };
-
-            emit_text_line(
-                out,
-                &item.label,
-                menu_x,
-                menu_y,
-                text_row,
-                2,
-                menu_cols,
-                cell_size,
+            let fg = if item.enabled { self.colors.item_fg } else { self.colors.item_disabled_fg };
+            let bg = if hovered && item.enabled {
+                self.colors.item_hover_bg
+            } else {
+                self.colors.menu_bg
+            };
+            self.emit_text_line(MenuTextLine {
+                text: &item.label,
+                row: row + 1,
+                start_col: 2,
+                max_cols: self.layout.menu_cols,
                 fg,
                 bg,
-                resolve_glyph,
-            );
+            });
 
-            #[allow(
-                clippy::indexing_slicing,
-                reason = "idx < self.items.len() and item_rects was resized to match"
-            )]
-            {
-                self.item_rects[idx] = item_rect;
+            if let Some(rect) = menu.item_rects.get_mut(idx) {
+                *rect = item_rect;
             }
-
-            row += item_rows;
+            row += self.layout.item_rows;
         }
     }
+
+    fn emit_text_line(&mut self, line: MenuTextLine<'_>) {
+        let (cell_w, cell_h) = self.cell_size;
+        let y = menu_grid_y(self.layout.menu_rect.y, line.row, cell_h);
+
+        for (i, ch) in line.text.chars().enumerate() {
+            let col = line.start_col + i;
+            if col >= line.max_cols {
+                break;
+            }
+            let x = menu_grid_x(self.layout.menu_rect.x, col, cell_w);
+            let (uv_min, uv_max) = (self.resolve_glyph)(ch);
+            self.out.push(CellInstance {
+                pos: [x, y],
+                size: [0.0, 0.0],
+                uv_min,
+                uv_max,
+                fg_color: line.fg,
+                bg_color: line.bg,
+                corner_radius: 0.0,
+            });
+        }
+    }
+}
+
+impl MenuLayout {
+    fn new(
+        menu: &ContextMenu,
+        viewport: Rect,
+        cell_size: (f32, f32),
+        _colors: &MenuColors,
+    ) -> Option<Self> {
+        let (cell_w, cell_h) = cell_size;
+        if menu.items.is_empty() || cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+
+        let label_max = menu.items.iter().map(|item| item.label.len()).max().unwrap_or(0);
+        let menu_cols = label_max + 4;
+        let item_rows = 2;
+        let has_open_item = menu.items.iter().any(|item| {
+            matches!(item.action, ContextMenuAction::OpenUrl(_) | ContextMenuAction::OpenFile(_))
+        });
+        let total_rows = menu.items.len() * item_rows + usize::from(has_open_item);
+
+        let menu_w = menu_grid_width(menu_cols, cell_w);
+        let menu_h = menu_grid_height(total_rows, cell_h);
+
+        let menu_x = menu.x.min(viewport.x + viewport.width - menu_w).max(viewport.x);
+        let menu_y = menu.y.min(viewport.y + viewport.height - menu_h).max(viewport.y);
+
+        Some(Self {
+            menu_rect: Rect { x: menu_x, y: menu_y, width: menu_w, height: menu_h },
+            menu_cols,
+            item_rows,
+            has_open_item,
+        })
+    }
+}
+
+fn draw_menu_frame(out: &mut Vec<CellInstance>, layout: &MenuLayout, border: [f32; 4]) {
+    let menu = layout.menu_rect;
+    push_solid_rect(out, Rect { x: menu.x, y: menu.y, width: menu.width, height: 1.0 }, border);
+    push_solid_rect(
+        out,
+        Rect { x: menu.x, y: menu.y + menu.height - 1.0, width: menu.width, height: 1.0 },
+        border,
+    );
+    push_solid_rect(out, Rect { x: menu.x, y: menu.y, width: 1.0, height: menu.height }, border);
+    push_solid_rect(
+        out,
+        Rect { x: menu.x + menu.width - 1.0, y: menu.y, width: 1.0, height: menu.height },
+        border,
+    );
 }
 
 /// Pre-computed linear-RGB colors for context menu rendering.
@@ -318,74 +363,25 @@ fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
         fg_color: color,
         bg_color: color,
         corner_radius: 0.0,
-        _pad: 0.0,
     });
-}
-
-/// Emit a line of text as individual character instances.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "needs menu origin, row, column, cell size, colors, and glyph resolver"
-)]
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "row/col indices are small positive integers fitting in f32"
-)]
-fn emit_text_line(
-    out: &mut Vec<CellInstance>,
-    text: &str,
-    menu_x: f32,
-    menu_y: f32,
-    row: usize,
-    start_col: usize,
-    max_cols: usize,
-    cell_size: (f32, f32),
-    fg: [f32; 4],
-    bg: [f32; 4],
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
-    let (cell_w, cell_h) = cell_size;
-    let y = menu_y + row as f32 * cell_h;
-
-    for (i, ch) in text.chars().enumerate() {
-        let col = start_col + i;
-        if col >= max_cols {
-            break;
-        }
-        let x = menu_x + col as f32 * cell_w;
-        let (uv_min, uv_max) = resolve_glyph(ch);
-        out.push(CellInstance {
-            pos: [x, y],
-            size: [0.0, 0.0],
-            uv_min,
-            uv_max,
-            fg_color: fg,
-            bg_color: bg,
-            corner_radius: 0.0,
-            _pad: 0.0,
-        });
-    }
 }
 
 /// Lighten an sRGB color by adding `amount` to each RGB channel, clamped to 1.0.
 fn lighten(color: [f32; 4], amount: f32) -> [f32; 4] {
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "fixed-size [f32; 4] array, indices 0-3 always valid"
-    )]
     [
-        (color[0] + amount).min(1.0),
-        (color[1] + amount).min(1.0),
-        (color[2] + amount).min(1.0),
-        color[3],
+        (color.first().copied().unwrap_or(0.0) + amount).min(1.0),
+        (color.get(1).copied().unwrap_or(0.0) + amount).min(1.0),
+        (color.get(2).copied().unwrap_or(0.0) + amount).min(1.0),
+        color.get(3).copied().unwrap_or(1.0),
     ]
 }
 
 /// Return a copy of `color` with a new alpha value.
 fn with_alpha(color: [f32; 4], new_alpha: f32) -> [f32; 4] {
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "fixed-size [f32; 4] array, indices 0-2 always valid"
-    )]
-    [color[0], color[1], color[2], new_alpha]
+    [
+        color.first().copied().unwrap_or(0.0),
+        color.get(1).copied().unwrap_or(0.0),
+        color.get(2).copied().unwrap_or(0.0),
+        new_alpha,
+    ]
 }

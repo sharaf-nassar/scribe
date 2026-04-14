@@ -93,15 +93,14 @@ fn is_url_terminator(ch: char) -> bool {
     ch.is_whitespace() || URL_TERMINATORS.contains(&ch)
 }
 
+fn grid_index_i32(index: usize) -> i32 {
+    i32::try_from(index).unwrap_or(i32::MAX)
+}
+
 /// Scan all visible rows of `term` for URLs and return their spans.
 ///
 /// Row indices in the returned spans are **absolute grid lines**: screen row
 /// minus `display_offset`, matching `alacritty_terminal`'s `Line` convention.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    reason = "screen_lines and display_offset are bounded by scrollback_lines (≤ 100_000), fit in i32"
-)]
 fn scan_visible_urls(term: &Term<VoidListener>) -> Vec<UrlSpan> {
     let rows = term.grid().screen_lines();
     let cols = term.grid().columns();
@@ -111,7 +110,7 @@ fn scan_visible_urls(term: &Term<VoidListener>) -> Vec<UrlSpan> {
 
     let mut screen_row: usize = 0;
     while screen_row < rows {
-        let row_abs = screen_row as i32 - display_offset as i32;
+        let row_abs = grid_index_i32(screen_row).saturating_sub(grid_index_i32(display_offset));
         let line = Line(row_abs);
 
         // Build the row text; each cell contributes exactly one char.
@@ -128,12 +127,12 @@ fn scan_visible_urls(term: &Term<VoidListener>) -> Vec<UrlSpan> {
         // Collect the URL spans just added into a temporary vec so the path
         // scanner can reference them without holding an immutable borrow on
         // `spans` while we also push into it.
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "url_count_before <= spans.len() by construction"
-        )]
-        let row_url_spans: Vec<(usize, usize)> =
-            spans[url_count_before..].iter().map(|s| (s.col_start, s.col_end)).collect();
+        let row_url_spans: Vec<(usize, usize)> = spans
+            .get(url_count_before..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|s| (s.col_start, s.col_end))
+            .collect();
         let chars: Vec<char> = row_text.chars().collect();
         scan_row_paths(&chars, cols, row_abs, &row_url_spans, &mut spans);
 
@@ -164,11 +163,7 @@ fn scan_row_urls(row_text: &str, cols: usize, row_abs: i32, out: &mut Vec<UrlSpa
 
         let url_col_start = char_pos;
         let url_col_end_raw = collect_url_end_chars(&chars, char_pos + prefix_len_chars);
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "url_col_end_raw is returned by collect_url_end_chars which is bounded by chars.len()"
-        )]
-        let raw: String = chars[url_col_start..url_col_end_raw].iter().collect();
+        let raw: String = chars.get(url_col_start..url_col_end_raw).unwrap_or(&[]).iter().collect();
         let url = strip_trailing_punct(raw);
         let url_char_len = url.chars().count();
         let url_col_end = url_col_start + url_char_len;
@@ -192,13 +187,12 @@ fn scan_row_urls(row_text: &str, cols: usize, row_abs: i32, out: &mut Vec<UrlSpa
 /// chars if found.
 fn match_prefix_chars(chars: &[char], pos: usize) -> Option<usize> {
     for prefix in PREFIXES {
-        let prefix_chars: Vec<char> = prefix.chars().collect();
-        let prefix_len = prefix_chars.len();
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "pos + prefix_len <= chars.len() is verified in the enclosing condition"
-        )]
-        if pos + prefix_len <= chars.len() && chars[pos..pos + prefix_len] == prefix_chars[..] {
+        let prefix_len = prefix.chars().count();
+        let matches = prefix
+            .chars()
+            .enumerate()
+            .all(|(offset, prefix_char)| chars.get(pos + offset) == Some(&prefix_char));
+        if matches {
             return Some(prefix_len);
         }
     }
@@ -210,8 +204,10 @@ fn match_prefix_chars(chars: &[char], pos: usize) -> Option<usize> {
 fn collect_url_end_chars(chars: &[char], start: usize) -> usize {
     let mut end = start;
     while end < chars.len() {
-        #[allow(clippy::indexing_slicing, reason = "end < chars.len() is the loop condition")]
-        if is_url_terminator(chars[end]) {
+        let Some(ch) = chars.get(end).copied() else {
+            break;
+        };
+        if is_url_terminator(ch) {
             break;
         }
         end = end.saturating_add(1);
@@ -275,11 +271,7 @@ fn scan_row_paths(
         let body_start = char_pos + prefix_len;
         let raw_end = collect_url_end_chars(chars, body_start);
 
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "path_col_start <= raw_end <= char_count, both bounds valid"
-        )]
-        let raw: String = chars[path_col_start..raw_end].iter().collect();
+        let raw: String = chars.get(path_col_start..raw_end).unwrap_or(&[]).iter().collect();
         let path = strip_trailing_punct(raw);
         let path_char_len = path.chars().count();
         let path_col_end_exclusive = path_col_start + path_char_len;
@@ -344,17 +336,13 @@ fn detect_path_prefix(chars: &[char], pos: usize) -> Option<(usize, bool)> {
     // Require alphanumeric start and at least one `/` in the lookahead window.
     if chars.get(pos).is_some_and(char::is_ascii_alphanumeric) {
         let look_end = (pos + BARE_PATH_LOOKAHEAD).min(chars.len());
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "look_end = min(pos + BARE_PATH_LOOKAHEAD, chars.len()) — always valid"
-        )]
-        let window = &chars[pos..look_end];
+        let window = chars.get(pos..look_end).unwrap_or(&[]);
         // Ensure there is a `/` in the window and no space before it.
         let slash_pos = window.iter().position(|c| *c == '/');
         if let Some(rel_slash) = slash_pos {
             // No whitespace before the slash.
-            #[allow(clippy::indexing_slicing, reason = "rel_slash < window.len() by position()")]
-            let no_space = window[..rel_slash].iter().all(|c| !c.is_whitespace());
+            let no_space =
+                window.get(..rel_slash).unwrap_or(&[]).iter().all(|c| !c.is_whitespace());
             if no_space {
                 return Some((0, true));
             }

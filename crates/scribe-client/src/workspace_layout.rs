@@ -252,7 +252,6 @@ impl WindowLayout {
     }
 
     /// Count the total number of workspace leaves in the tree.
-    #[allow(dead_code, reason = "public API for multi-workspace badge rendering")]
     pub fn workspace_count(&self) -> usize {
         count_workspaces(&self.root)
     }
@@ -475,7 +474,6 @@ fn collect_workspace_ids(node: &WindowNode, out: &mut Vec<WorkspaceId>) {
 }
 
 /// Count workspace leaves in a window node tree.
-#[allow(dead_code, reason = "called by workspace_count which is a public API")]
 fn count_workspaces(node: &WindowNode) -> usize {
     match node {
         WindowNode::Workspace(_) => 1,
@@ -819,15 +817,12 @@ fn update_tab_session_in(node: &mut WindowNode, old_id: SessionId, new_id: Sessi
 // ---------------------------------------------------------------------------
 
 /// Divider line thickness in pixels (matches pane divider).
-#[allow(dead_code, reason = "used by workspace divider rendering pipeline")]
 const WORKSPACE_DIVIDER_THICKNESS: f32 = 1.0;
 
 /// Hit-test tolerance: mouse within this many pixels counts as on the divider.
-#[allow(dead_code, reason = "used by workspace divider hit-test pipeline")]
 const WORKSPACE_HIT_TOLERANCE: f32 = 4.0;
 
 /// A divider between two workspace regions, positioned in pixel coordinates.
-#[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
 pub struct WorkspaceDivider {
     /// Pixel rect of the divider line.
     pub rect: Rect,
@@ -842,7 +837,6 @@ pub struct WorkspaceDivider {
 }
 
 /// State for an in-progress workspace divider drag.
-#[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
 #[derive(Clone, Copy)]
 pub struct WorkspaceDividerDrag {
     /// First workspace leaf in the first subtree of the dragged split.
@@ -860,7 +854,6 @@ pub struct WorkspaceDividerDrag {
 /// Hit-test: check if a mouse position hits any workspace divider.
 ///
 /// Returns a reference to the matching `WorkspaceDivider` if found.
-#[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
 pub fn hit_test_workspace_divider(
     dividers: &[WorkspaceDivider],
     mouse_x: f32,
@@ -870,7 +863,6 @@ pub fn hit_test_workspace_divider(
 }
 
 /// Create a `WorkspaceDividerDrag` from a workspace divider.
-#[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
 pub fn start_workspace_drag(divider: &WorkspaceDivider) -> WorkspaceDividerDrag {
     let (parent_extent, parent_origin) = match divider.direction {
         SplitDirection::Horizontal => (divider.parent_rect.width, divider.parent_rect.x),
@@ -888,7 +880,6 @@ pub fn start_workspace_drag(divider: &WorkspaceDivider) -> WorkspaceDividerDrag 
 /// Compute a new split ratio from a workspace drag position.
 ///
 /// `mouse_pos` is the x or y coordinate depending on direction.
-#[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
 pub fn workspace_drag_ratio(drag: &WorkspaceDividerDrag, mouse_pos: f32) -> f32 {
     if drag.parent_extent <= 0.0 {
         return 0.5;
@@ -899,7 +890,6 @@ pub fn workspace_drag_ratio(drag: &WorkspaceDividerDrag, mouse_pos: f32) -> f32 
 
 impl WindowLayout {
     /// Collect all workspace divider rects given the full viewport.
-    #[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
     pub fn collect_workspace_dividers(&self, viewport: Rect) -> Vec<WorkspaceDivider> {
         let mut out = Vec::new();
         collect_workspace_dividers_inner(&self.root, viewport, &mut out);
@@ -914,7 +904,6 @@ impl WindowLayout {
     /// the same leaf appears as the first leaf of nested splits.
     ///
     /// Returns `true` if the split was found and the ratio updated.
-    #[allow(dead_code, reason = "public API for workspace drag-resize pipeline")]
     pub fn set_workspace_ratio(
         &mut self,
         first_ws: WorkspaceId,
@@ -925,14 +914,12 @@ impl WindowLayout {
     }
 
     /// Set every split node's ratio to 0.5 recursively.
-    #[allow(dead_code, reason = "public API for workspace equalize interaction")]
     pub fn equalize_all_workspace_ratios(&mut self) {
         equalize_workspace_node(&mut self.root);
     }
 }
 
 /// Recursively collect workspace dividers from the window node tree.
-#[allow(dead_code, reason = "called by collect_workspace_dividers public API")]
 fn collect_workspace_dividers_inner(
     node: &WindowNode,
     rect: Rect,
@@ -961,7 +948,6 @@ fn collect_workspace_dividers_inner(
 }
 
 /// Compute the first leaf workspace ID in a subtree (depth-first).
-#[allow(dead_code, reason = "called by collect_workspace_dividers_inner")]
 fn first_leaf_workspace_of(node: &WindowNode) -> WorkspaceId {
     match node {
         WindowNode::Workspace(slot) => slot.workspace_id,
@@ -970,7 +956,6 @@ fn first_leaf_workspace_of(node: &WindowNode) -> WorkspaceId {
 }
 
 /// Compute the pixel rect of a workspace divider between two adjacent rects.
-#[allow(dead_code, reason = "called by collect_workspace_dividers_inner")]
 fn workspace_divider_rect_between(r1: &Rect, direction: SplitDirection) -> Rect {
     let half = WORKSPACE_DIVIDER_THICKNESS / 2.0;
     match direction {
@@ -986,7 +971,6 @@ fn workspace_divider_rect_between(r1: &Rect, direction: SplitDirection) -> Rect 
 }
 
 /// Check if a mouse position is within hit-test tolerance of a workspace divider.
-#[allow(dead_code, reason = "called by hit_test_workspace_divider public API")]
 fn is_within_workspace_divider(divider: &WorkspaceDivider, mouse_x: f32, mouse_y: f32) -> bool {
     let r = &divider.rect;
     let expanded = Rect {
@@ -1003,7 +987,6 @@ fn is_within_workspace_divider(divider: &WorkspaceDivider, mouse_x: f32, mouse_y
 
 /// Find the split whose first subtree contains `first_ws` and whose second
 /// subtree contains `second_ws`, then update its ratio.
-#[allow(dead_code, reason = "called by set_workspace_ratio public API")]
 fn set_workspace_ratio_in(
     node: &mut WindowNode,
     first_ws: WorkspaceId,
@@ -1048,18 +1031,13 @@ fn count_workspace_leaves(node: &WindowNode) -> u32 {
 /// For a split with `L` leaves on the left and `R` on the right, the ratio
 /// is set to `L / (L + R)`.  This ensures each leaf gets `1 / total_leaves`
 /// of the available space regardless of tree shape.
-#[allow(dead_code, reason = "called by equalize_all_workspace_ratios public API")]
 fn equalize_workspace_node(node: &mut WindowNode) {
     if let WindowNode::Split { ratio, first, second, .. } = node {
         let left = count_workspace_leaves(first);
         let right = count_workspace_leaves(second);
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "workspace count is tiny, f32 is exact for small integers"
-        )]
-        {
-            *ratio = left as f32 / (left + right) as f32;
-        }
+        let left_f = f32::from(u16::try_from(left).unwrap_or(u16::MAX));
+        let total_f = f32::from(u16::try_from(left + right).unwrap_or(u16::MAX));
+        *ratio = left_f / total_f;
         equalize_workspace_node(first);
         equalize_workspace_node(second);
     }

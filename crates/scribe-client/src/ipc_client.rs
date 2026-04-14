@@ -63,12 +63,6 @@ pub enum ClientCommand {
     DismissUpdate,
     /// Notify server of pane focus change for CSI focus events.
     FocusChanged { gained: Option<SessionId>, lost: Option<SessionId> },
-    /// Request a scrollback snapshot at a given offset from the bottom.
-    #[allow(
-        dead_code,
-        reason = "server-backed scroll snapshots are implemented ahead of the client UX that consumes them"
-    )]
-    ScrollRequest { session_id: SessionId, offset: i32 },
     /// Search the terminal scrollback/screen.
     SearchRequest { session_id: SessionId, query: String, limit: u32 },
 }
@@ -81,18 +75,9 @@ pub enum UiEvent {
     /// Full screen snapshot for restoring visible content on reconnect.
     ScreenSnapshot { session_id: SessionId, snapshot: scribe_common::screen::ScreenSnapshot },
     /// The server has acknowledged session creation.
-    SessionCreated {
-        session_id: SessionId,
-        #[allow(dead_code, reason = "workspace_id preserved for future workspace management")]
-        workspace_id: WorkspaceId,
-        shell_name: String,
-    },
+    SessionCreated { session_id: SessionId, shell_name: String },
     /// A session has exited.
-    SessionExited {
-        session_id: SessionId,
-        #[allow(dead_code, reason = "exit_code preserved for future status display")]
-        exit_code: Option<i32>,
-    },
+    SessionExited { session_id: SessionId },
     /// The AI state for a session has changed.
     AiStateChanged { session_id: SessionId, ai_state: AiProcessState },
     /// The AI state for a session was explicitly cleared.
@@ -113,20 +98,9 @@ pub enum UiEvent {
     /// The active Codex task label for a session was cleared.
     CodexTaskLabelCleared { session_id: SessionId },
     /// A user prompt was submitted in a Claude Code or Codex session.
-    PromptReceived {
-        #[allow(dead_code, reason = "session_id used in Task 6 prompt state handler")]
-        session_id: SessionId,
-        #[allow(dead_code, reason = "provider used in Task 6 prompt state handler")]
-        provider: scribe_common::ai_state::AiProvider,
-        #[allow(dead_code, reason = "text used in Task 6 prompt state handler")]
-        text: String,
-    },
+    PromptReceived { session_id: SessionId, text: String },
     /// Git branch for a session's CWD (None if not in a git repo).
-    GitBranch {
-        session_id: SessionId,
-        #[allow(dead_code, reason = "branch preserved for future status bar display")]
-        branch: Option<String>,
-    },
+    GitBranch { session_id: SessionId, branch: Option<String> },
     /// Full workspace state sent from the server.
     WorkspaceInfo {
         workspace_id: WorkspaceId,
@@ -161,26 +135,15 @@ pub enum UiEvent {
     /// Server requested that this client execute an automation action.
     RunAction { action: AutomationAction },
     /// Server found an available update.
-    UpdateAvailable { version: String, release_url: String },
+    UpdateAvailable { version: String },
     /// Update progress changed.
     UpdateProgress { state: UpdateProgressState },
     /// A shell prompt-mark event from OSC 133.
-    PromptMark {
-        session_id: SessionId,
-        kind: PromptMarkKind,
-        #[allow(dead_code, reason = "click_events preserved for future click-to-move feature")]
-        click_events: bool,
-        #[allow(dead_code, reason = "exit_code preserved for future command status display")]
-        exit_code: Option<i32>,
-    },
-    /// Scrollback snapshot at an offset from the bottom.
-    ScrolledSnapshot {
-        session_id: SessionId,
-        snapshot: scribe_common::screen::ScreenSnapshot,
-        applied_offset: u32,
-    },
+    PromptMark { session_id: SessionId, kind: PromptMarkKind, click_events: bool },
     /// Search results for the current query.
     SearchResults { session_id: SessionId, query: String, matches: Vec<SearchMatch> },
+    /// The server trimmed duplicate AI redraw scrollback for this session.
+    TrimScrollback { session_id: SessionId, history_rows: u32 },
     /// The server suppressed an ED 3 sequence — snap the viewport to bottom.
     ScrollBottom { session_id: SessionId },
 }
@@ -209,11 +172,14 @@ pub fn start_ipc_thread(
     }
 
     std::thread::spawn(move || {
-        #[allow(
-            clippy::expect_used,
-            reason = "runtime creation in thread spawn setup is infallible in practice"
-        )]
-        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!(error = %error, "failed to create tokio runtime");
+                send_event(&proxy, UiEvent::ServerDisconnected);
+                return;
+            }
+        };
         rt.block_on(ipc_main(proxy, cmd_rx));
     });
 
@@ -228,140 +194,193 @@ fn send_event(proxy: &EventLoopProxy<UiEvent>, event: UiEvent) {
 }
 
 /// Drive the read half: forward server messages to the winit event loop.
-#[allow(
-    clippy::too_many_lines,
-    reason = "flat sequential match arms for all server message variants"
-)]
 async fn run_read_task(
     mut reader: tokio::net::unix::OwnedReadHalf,
     proxy: EventLoopProxy<UiEvent>,
 ) {
     loop {
         match read_message::<ServerMessage, _>(&mut reader).await {
-            Ok(ServerMessage::PtyOutput { session_id, data }) => {
-                send_event(&proxy, UiEvent::PtyOutput { session_id, data });
-            }
-            Ok(ServerMessage::SessionExited { session_id, exit_code }) => {
-                tracing::info!(session = %session_id, ?exit_code, "session exited");
-                send_event(&proxy, UiEvent::SessionExited { session_id, exit_code });
-            }
-            Ok(ServerMessage::ScreenSnapshot { session_id, snapshot }) => {
-                send_event(&proxy, UiEvent::ScreenSnapshot { session_id, snapshot });
-            }
-            Ok(ServerMessage::SessionCreated { session_id, workspace_id, shell_name }) => {
-                tracing::debug!(session = %session_id, "session created via server response");
-                send_event(
-                    &proxy,
-                    UiEvent::SessionCreated { session_id, workspace_id, shell_name },
-                );
-            }
-            Ok(ServerMessage::AiStateChanged { session_id, ai_state }) => {
-                send_event(&proxy, UiEvent::AiStateChanged { session_id, ai_state });
-            }
-            Ok(ServerMessage::AiStateCleared { session_id }) => {
-                send_event(&proxy, UiEvent::AiStateCleared { session_id });
-            }
-            Ok(ServerMessage::Bell { session_id }) => {
-                send_event(&proxy, UiEvent::Bell { session_id });
-            }
-            Ok(ServerMessage::CwdChanged { session_id, cwd }) => {
-                send_event(&proxy, UiEvent::CwdChanged { session_id, cwd });
-            }
-            Ok(ServerMessage::SessionContextChanged { session_id, context }) => {
-                send_event(&proxy, UiEvent::SessionContextChanged { session_id, context });
-            }
-            Ok(ServerMessage::TitleChanged { session_id, title }) => {
-                send_event(&proxy, UiEvent::TitleChanged { session_id, title });
-            }
-            Ok(ServerMessage::CodexTaskLabelChanged { session_id, task_label }) => {
-                send_event(&proxy, UiEvent::CodexTaskLabelChanged { session_id, task_label });
-            }
-            Ok(ServerMessage::CodexTaskLabelCleared { session_id }) => {
-                send_event(&proxy, UiEvent::CodexTaskLabelCleared { session_id });
-            }
-            Ok(ServerMessage::PromptReceived { session_id, provider, text }) => {
-                send_event(&proxy, UiEvent::PromptReceived { session_id, provider, text });
-            }
-            Ok(ServerMessage::GitBranch { session_id, branch }) => {
-                send_event(&proxy, UiEvent::GitBranch { session_id, branch });
-            }
-            Ok(ServerMessage::WorkspaceInfo {
-                workspace_id,
-                name,
-                accent_color,
-                split_direction,
-                project_root,
-            }) => {
-                send_event(
-                    &proxy,
-                    UiEvent::WorkspaceInfo {
-                        workspace_id,
-                        name,
-                        accent_color,
-                        split_direction,
-                        project_root,
-                    },
-                );
-            }
-            Ok(ServerMessage::SessionList { sessions, workspace_tree }) => {
-                send_event(&proxy, UiEvent::SessionList { sessions, workspace_tree });
-            }
-            Ok(ServerMessage::WorkspaceNamed { workspace_id, name, project_root }) => {
-                send_event(&proxy, UiEvent::WorkspaceNamed { workspace_id, name, project_root });
-            }
-            Ok(ServerMessage::Welcome { window_id, other_windows }) => {
-                tracing::info!(%window_id, others = other_windows.len(), "received Welcome");
-                send_event(&proxy, UiEvent::Welcome { window_id, other_windows });
-            }
-            Ok(ServerMessage::WindowClosed { window_id }) => {
-                tracing::info!(%window_id, "received WindowClosed from server");
-                send_event(&proxy, UiEvent::WindowClosed { window_id });
-            }
-            Ok(ServerMessage::QuitRequested) => {
-                tracing::info!("received QuitRequested from server");
-                send_event(&proxy, UiEvent::QuitRequested);
-            }
-            Ok(ServerMessage::RunAction { action }) => {
-                tracing::info!(?action, "received RunAction from server");
-                send_event(&proxy, UiEvent::RunAction { action });
-            }
-            Ok(ServerMessage::ActionDispatched { window_id }) => {
-                tracing::debug!(%window_id, "ignoring ActionDispatched on UI client connection");
-            }
-            Ok(ServerMessage::UpdateAvailable { version, release_url }) => {
-                tracing::info!(%version, "update available");
-                send_event(&proxy, UiEvent::UpdateAvailable { version, release_url });
-            }
-            Ok(ServerMessage::UpdateProgress { state }) => {
-                send_event(&proxy, UiEvent::UpdateProgress { state });
-            }
-            Ok(ServerMessage::PromptMark { session_id, kind, click_events, exit_code }) => {
-                send_event(
-                    &proxy,
-                    UiEvent::PromptMark { session_id, kind, click_events, exit_code },
-                );
-            }
-            Ok(ServerMessage::ScrolledSnapshot { session_id, snapshot, applied_offset }) => {
-                send_event(
-                    &proxy,
-                    UiEvent::ScrolledSnapshot { session_id, snapshot, applied_offset },
-                );
-            }
-            Ok(ServerMessage::SearchResults { session_id, query, matches }) => {
-                send_event(&proxy, UiEvent::SearchResults { session_id, query, matches });
-            }
-            Ok(ServerMessage::ScrollBottom { session_id }) => {
-                send_event(&proxy, UiEvent::ScrollBottom { session_id });
-            }
-            Ok(other) => {
-                tracing::debug!(?other, "unhandled server message");
-            }
+            Ok(message) => dispatch_server_message(&proxy, message),
             Err(e) => {
                 tracing::warn!(error = %e, "server read error; closing connection");
                 send_event(&proxy, UiEvent::ServerDisconnected);
                 break;
             }
         }
+    }
+}
+
+fn dispatch_server_message(proxy: &EventLoopProxy<UiEvent>, message: ServerMessage) {
+    let message = dispatch_session_message(proxy, message);
+    let message = dispatch_workspace_message(proxy, message);
+    let message = dispatch_control_message(proxy, message);
+
+    if let Some(message) = message {
+        tracing::debug!(?message, "unhandled server message");
+    }
+}
+
+fn dispatch_session_message(
+    proxy: &EventLoopProxy<UiEvent>,
+    message: ServerMessage,
+) -> Option<ServerMessage> {
+    match message {
+        ServerMessage::PtyOutput { session_id, data } => {
+            send_event(proxy, UiEvent::PtyOutput { session_id, data });
+            None
+        }
+        ServerMessage::SessionExited { session_id, exit_code } => {
+            tracing::info!(session = %session_id, ?exit_code, "session exited");
+            send_event(proxy, UiEvent::SessionExited { session_id });
+            None
+        }
+        ServerMessage::ScreenSnapshot { session_id, snapshot } => {
+            send_event(proxy, UiEvent::ScreenSnapshot { session_id, snapshot });
+            None
+        }
+        ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
+            tracing::debug!(session = %session_id, %workspace_id, "session created via server response");
+            send_event(proxy, UiEvent::SessionCreated { session_id, shell_name });
+            None
+        }
+        ServerMessage::AiStateChanged { session_id, ai_state } => {
+            send_event(proxy, UiEvent::AiStateChanged { session_id, ai_state });
+            None
+        }
+        ServerMessage::AiStateCleared { session_id } => {
+            send_event(proxy, UiEvent::AiStateCleared { session_id });
+            None
+        }
+        ServerMessage::Bell { session_id } => {
+            send_event(proxy, UiEvent::Bell { session_id });
+            None
+        }
+        ServerMessage::CwdChanged { session_id, cwd } => {
+            send_event(proxy, UiEvent::CwdChanged { session_id, cwd });
+            None
+        }
+        ServerMessage::SessionContextChanged { session_id, context } => {
+            send_event(proxy, UiEvent::SessionContextChanged { session_id, context });
+            None
+        }
+        ServerMessage::TitleChanged { session_id, title } => {
+            send_event(proxy, UiEvent::TitleChanged { session_id, title });
+            None
+        }
+        ServerMessage::CodexTaskLabelChanged { session_id, task_label } => {
+            send_event(proxy, UiEvent::CodexTaskLabelChanged { session_id, task_label });
+            None
+        }
+        ServerMessage::CodexTaskLabelCleared { session_id } => {
+            send_event(proxy, UiEvent::CodexTaskLabelCleared { session_id });
+            None
+        }
+        ServerMessage::PromptReceived { session_id, provider, text } => {
+            tracing::debug!(session = %session_id, ?provider, "prompt received");
+            send_event(proxy, UiEvent::PromptReceived { session_id, text });
+            None
+        }
+        ServerMessage::GitBranch { session_id, branch } => {
+            send_event(proxy, UiEvent::GitBranch { session_id, branch });
+            None
+        }
+        ServerMessage::PromptMark { session_id, kind, click_events, exit_code } => {
+            tracing::debug!(session = %session_id, ?exit_code, "prompt mark received");
+            send_event(proxy, UiEvent::PromptMark { session_id, kind, click_events });
+            None
+        }
+        ServerMessage::SearchResults { session_id, query, matches } => {
+            send_event(proxy, UiEvent::SearchResults { session_id, query, matches });
+            None
+        }
+        ServerMessage::TrimScrollback { session_id, history_rows } => {
+            send_event(proxy, UiEvent::TrimScrollback { session_id, history_rows });
+            None
+        }
+        ServerMessage::ScrollBottom { session_id } => {
+            send_event(proxy, UiEvent::ScrollBottom { session_id });
+            None
+        }
+        _ => Some(message),
+    }
+}
+
+fn dispatch_workspace_message(
+    proxy: &EventLoopProxy<UiEvent>,
+    message: Option<ServerMessage>,
+) -> Option<ServerMessage> {
+    match message? {
+        ServerMessage::WorkspaceInfo {
+            workspace_id,
+            name,
+            accent_color,
+            split_direction,
+            project_root,
+        } => {
+            send_event(
+                proxy,
+                UiEvent::WorkspaceInfo {
+                    workspace_id,
+                    name,
+                    accent_color,
+                    split_direction,
+                    project_root,
+                },
+            );
+            None
+        }
+        ServerMessage::SessionList { sessions, workspace_tree } => {
+            send_event(proxy, UiEvent::SessionList { sessions, workspace_tree });
+            None
+        }
+        ServerMessage::WorkspaceNamed { workspace_id, name, project_root } => {
+            send_event(proxy, UiEvent::WorkspaceNamed { workspace_id, name, project_root });
+            None
+        }
+        ServerMessage::Welcome { window_id, other_windows } => {
+            tracing::info!(%window_id, others = other_windows.len(), "received Welcome");
+            send_event(proxy, UiEvent::Welcome { window_id, other_windows });
+            None
+        }
+        ServerMessage::WindowClosed { window_id } => {
+            tracing::info!(%window_id, "received WindowClosed from server");
+            send_event(proxy, UiEvent::WindowClosed { window_id });
+            None
+        }
+        other => Some(other),
+    }
+}
+
+fn dispatch_control_message(
+    proxy: &EventLoopProxy<UiEvent>,
+    message: Option<ServerMessage>,
+) -> Option<ServerMessage> {
+    match message? {
+        ServerMessage::QuitRequested => {
+            tracing::info!("received QuitRequested from server");
+            send_event(proxy, UiEvent::QuitRequested);
+            None
+        }
+        ServerMessage::RunAction { action } => {
+            tracing::info!(?action, "received RunAction from server");
+            send_event(proxy, UiEvent::RunAction { action });
+            None
+        }
+        ServerMessage::ActionDispatched { window_id } => {
+            tracing::debug!(%window_id, "ignoring ActionDispatched on UI client connection");
+            None
+        }
+        ServerMessage::UpdateAvailable { version, release_url } => {
+            tracing::info!(%version, "update available");
+            tracing::debug!(%release_url, "update release URL");
+            send_event(proxy, UiEvent::UpdateAvailable { version });
+            None
+        }
+        ServerMessage::UpdateProgress { state } => {
+            send_event(proxy, UiEvent::UpdateProgress { state });
+            None
+        }
+        other => Some(other),
     }
 }
 
@@ -427,9 +446,6 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         ClientCommand::DismissUpdate => ClientMessage::DismissUpdate,
         ClientCommand::FocusChanged { gained, lost } => {
             ClientMessage::FocusChanged { gained, lost }
-        }
-        ClientCommand::ScrollRequest { session_id, offset } => {
-            ClientMessage::ScrollRequest { session_id, offset }
         }
         ClientCommand::SearchRequest { session_id, query, limit } => {
             ClientMessage::SearchRequest { session_id, query, limit }
@@ -545,11 +561,17 @@ fn platform_start_server() -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn restart_server() -> Result<(), String> {
-    match start_server_via_launchctl(true) {
+    // Prefer a direct `--upgrade` spawn so the new server performs a handoff
+    // with the still-running old one instead of racing it on `server.lock`.
+    // `launchctl kickstart -k` only kills the old server when launchd is the
+    // one managing it; after a DMG drop-replace the old server becomes a
+    // launchd orphan, and kickstart silently starts a non-upgrade child that
+    // crash-loops on the flock the orphan still holds.
+    match start_server_directly(true) {
         Ok(()) => Ok(()),
         Err(e) => {
-            tracing::warn!("launchctl restart failed ({e}), falling back to --upgrade spawn");
-            start_server_directly(true)
+            tracing::warn!("--upgrade spawn failed ({e}), falling back to launchctl kickstart");
+            start_server_via_launchctl(true)
         }
     }
 }

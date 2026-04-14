@@ -8,13 +8,22 @@ use scribe_common::error::ScribeError;
 /// Maximum allowed scrollback lines to prevent excessive memory use.
 const MAX_SCROLLBACK_LINES: u32 = 100_000;
 
-#[allow(clippy::struct_excessive_bools, reason = "config struct with independent boolean flags")]
+pub struct AiTerminalConfig {
+    pub hide_codex_hook_logs: bool,
+    pub preserve_ai_scrollback: bool,
+}
+
+impl Default for AiTerminalConfig {
+    fn default() -> Self {
+        Self { hide_codex_hook_logs: false, preserve_ai_scrollback: true }
+    }
+}
+
 pub struct ScribeConfig {
     pub workspace_roots: Vec<PathBuf>,
     pub scrollback_lines: u32,
     pub shell_integration_enabled: bool,
-    pub hide_codex_hook_logs: bool,
-    pub preserve_ai_scrollback: bool,
+    pub ai_terminal: AiTerminalConfig,
     pub update: UpdateConfig,
 }
 
@@ -24,8 +33,7 @@ impl Default for ScribeConfig {
             workspace_roots: Vec::new(),
             scrollback_lines: 10_000,
             shell_integration_enabled: true,
-            hide_codex_hook_logs: false,
-            preserve_ai_scrollback: true,
+            ai_terminal: AiTerminalConfig::default(),
             update: UpdateConfig::default(),
         }
     }
@@ -59,22 +67,26 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
     }
     let scrollback_lines = raw_scrollback.min(MAX_SCROLLBACK_LINES);
 
-    let shell_integration_enabled = full.terminal.shell_integration.enabled;
-    let hide_codex_hook_logs = full.terminal.hide_codex_hook_logs;
-    let preserve_ai_scrollback = full.terminal.preserve_ai_scrollback;
+    let shell_integration_enabled = full.terminal.ai_session.shell_integration.enabled;
+    let ai_terminal = AiTerminalConfig {
+        hide_codex_hook_logs: full.terminal.ai_session.hide_codex_hook_logs,
+        preserve_ai_scrollback: full.terminal.ai_session.preserve_ai_scrollback,
+    };
     let update = full.update;
 
     info!(
         roots = workspace_roots.len(),
-        scrollback_lines, hide_codex_hook_logs, preserve_ai_scrollback, "server config loaded"
+        scrollback_lines,
+        hide_codex_hook_logs = ai_terminal.hide_codex_hook_logs,
+        preserve_ai_scrollback = ai_terminal.preserve_ai_scrollback,
+        "server config loaded"
     );
 
     Ok(ScribeConfig {
         workspace_roots,
         scrollback_lines,
         shell_integration_enabled,
-        hide_codex_hook_logs,
-        preserve_ai_scrollback,
+        ai_terminal,
         update,
     })
 }

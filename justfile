@@ -19,9 +19,13 @@ check:
 
 # ==================== Quality ====================
 
+# Block new Rust lint suppression attributes in local diffs.
+lint-suppressions:
+    tools/check-no-new-lint-suppressions.sh --working-tree
+
 # Lint (strict clippy config)
 clippy:
-    cargo clippy --workspace
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Format
 fmt:
@@ -33,6 +37,7 @@ test:
 
 # Pre-commit gate: fmt, lint, test
 ready:
+    just lint-suppressions
     just fmt
     just clippy
     just test

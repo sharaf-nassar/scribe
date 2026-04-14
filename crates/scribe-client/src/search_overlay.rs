@@ -13,6 +13,53 @@ use crate::layout::Rect;
 const SEARCH_OVERLAY_MARGIN: f32 = 14.0;
 const SEARCH_OVERLAY_MIN_COLS: usize = 24;
 const SEARCH_OVERLAY_MAX_COLS: usize = 56;
+/// Overlay layout never needs more than this many grid units, which keeps the
+/// integer-to-float conversion exact for pixel placement.
+const MAX_OVERLAY_GRID_UNITS: usize = 65_535;
+type GlyphResolver<'a> = dyn FnMut(char) -> ([f32; 2], [f32; 2]) + 'a;
+
+pub struct SearchOverlayBuildContext<'a> {
+    pub out: &'a mut Vec<CellInstance>,
+    pub viewport: Rect,
+    pub cell_size: (f32, f32),
+    pub chrome: &'a ChromeColors,
+    pub resolve_glyph: &'a mut GlyphResolver<'a>,
+}
+
+fn overlay_grid_units(units: usize) -> u16 {
+    u16::try_from(units.min(MAX_OVERLAY_GRID_UNITS)).unwrap_or(u16::MAX)
+}
+
+fn overlay_grid_width(cols: usize, cell_w: f32) -> f32 {
+    f32::from(overlay_grid_units(cols)) * cell_w
+}
+
+fn overlay_units_in_width(width: f32, cell_w: f32) -> usize {
+    if cell_w <= 0.0 || !width.is_finite() || width <= 0.0 {
+        return 0;
+    }
+
+    let mut low = 0usize;
+    let mut high = 1usize;
+    while high < MAX_OVERLAY_GRID_UNITS && overlay_grid_width(high, cell_w) <= width {
+        low = high;
+        high = high.saturating_mul(2).min(MAX_OVERLAY_GRID_UNITS);
+        if high == low {
+            break;
+        }
+    }
+
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if overlay_grid_width(mid, cell_w) <= width {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+
+    low
+}
 
 /// UI state for the find-in-scrollback overlay.
 pub struct SearchOverlay {
@@ -121,145 +168,197 @@ impl SearchOverlay {
     }
 
     /// Build GPU instances for the active search overlay.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "overlay builder needs output vec, viewport, cell size, chrome colors, and glyph resolver"
-    )]
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
-        reason = "overlay dimensions are derived from viewport and cell sizes and fit within usize/f32 bounds"
-    )]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "overlay builder emits background, border, and two text rows"
-    )]
-    pub fn build_instances(
-        &self,
-        out: &mut Vec<CellInstance>,
-        viewport: Rect,
-        cell_size: (f32, f32),
-        chrome: &ChromeColors,
-        resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-    ) {
+    pub fn build_instances(&self, ctx: SearchOverlayBuildContext<'_>) {
+        let SearchOverlayBuildContext { out, viewport, cell_size, chrome, resolve_glyph } = ctx;
         if !self.active {
             return;
         }
 
+        let colors = SearchOverlayColors::from_chrome(chrome);
+        let Some(layout) = SearchOverlayLayout::new(self, viewport, cell_size) else {
+            return;
+        };
+        let mut renderer = SearchOverlayRenderer::new(out, cell_size.0, resolve_glyph);
+
+        draw_search_overlay_frame(renderer.out, &layout.overlay, &colors);
+        draw_search_overlay_text(&mut renderer, &layout, &colors, cell_size.1);
+    }
+}
+
+struct SearchOverlayLayout {
+    overlay: Rect,
+    overlay_cols: usize,
+    header: String,
+    query_text: String,
+}
+
+impl SearchOverlayLayout {
+    fn new(overlay: &SearchOverlay, viewport: Rect, cell_size: (f32, f32)) -> Option<Self> {
         let (cell_w, cell_h) = cell_size;
         if cell_w <= 0.0 || cell_h <= 0.0 {
-            return;
+            return None;
         }
 
-        let available_cols =
-            ((viewport.width - 2.0 * SEARCH_OVERLAY_MARGIN) / cell_w).floor().max(0.0) as usize;
+        let available_width = (viewport.width - 2.0 * SEARCH_OVERLAY_MARGIN).max(0.0);
+        let available_cols = overlay_units_in_width(available_width, cell_w);
         if available_cols < SEARCH_OVERLAY_MIN_COLS {
-            return;
+            return None;
         }
 
-        let colors = SearchOverlayColors::from_chrome(chrome);
-        let header = if self.query.is_empty() {
+        let header = if overlay.query.is_empty() {
             String::from("Find")
-        } else if self.matches.is_empty() {
+        } else if overlay.matches.is_empty() {
             String::from("Find  no matches")
         } else {
-            format!("Find  {}/{}", self.current_match_index() + 1, self.match_count())
+            format!("Find  {}/{}", overlay.current_match_index() + 1, overlay.match_count())
         };
-        let query_text = if self.query.is_empty() {
+        let query_text = if overlay.query.is_empty() {
             String::from("Type to search scrollback")
         } else {
-            self.query.clone()
+            overlay.query.clone()
         };
 
         let desired_cols =
             header.chars().count().max(query_text.chars().count() + 2).saturating_add(2);
         let overlay_cols = desired_cols
             .clamp(SEARCH_OVERLAY_MIN_COLS, available_cols.min(SEARCH_OVERLAY_MAX_COLS));
-        let overlay_width = overlay_cols as f32 * cell_w;
+        let overlay_width = overlay_grid_width(overlay_cols, cell_w);
         let overlay_height = 2.0 * cell_h;
         let overlay_x =
             (viewport.x + viewport.width - overlay_width - SEARCH_OVERLAY_MARGIN).max(viewport.x);
         let overlay_y = viewport.y + SEARCH_OVERLAY_MARGIN;
-        let overlay =
-            Rect { x: overlay_x, y: overlay_y, width: overlay_width, height: overlay_height };
 
-        push_solid_rect(out, overlay, colors.bg);
-        push_solid_rect(
-            out,
-            Rect { x: overlay.x, y: overlay.y, width: overlay.width, height: 1.0 },
-            colors.border,
-        );
-        push_solid_rect(
-            out,
-            Rect {
-                x: overlay.x,
-                y: overlay.y + overlay.height - 1.0,
-                width: overlay.width,
-                height: 1.0,
+        Some(Self {
+            overlay: Rect {
+                x: overlay_x,
+                y: overlay_y,
+                width: overlay_width,
+                height: overlay_height,
             },
-            colors.border,
-        );
-        push_solid_rect(
-            out,
-            Rect { x: overlay.x, y: overlay.y, width: 1.0, height: overlay.height },
-            colors.border,
-        );
-        push_solid_rect(
-            out,
-            Rect {
-                x: overlay.x + overlay.width - 1.0,
-                y: overlay.y,
-                width: 1.0,
-                height: overlay.height,
-            },
-            colors.border,
-        );
-        push_solid_rect(
-            out,
-            Rect {
-                x: overlay.x + 1.0,
-                y: overlay.y + cell_h,
-                width: (overlay.width - 2.0).max(0.0),
-                height: (cell_h - 1.0).max(0.0),
-            },
-            colors.input_bg,
-        );
+            overlay_cols,
+            header,
+            query_text,
+        })
+    }
+}
 
-        let header_cols = overlay_cols.saturating_sub(2);
-        emit_text_line(
-            out,
-            &tail_chars(&header, header_cols),
-            overlay.x + cell_w,
-            overlay.y,
-            colors.header_fg,
-            colors.bg,
-            cell_w,
-            resolve_glyph,
-        );
+fn draw_search_overlay_frame(
+    out: &mut Vec<CellInstance>,
+    overlay: &Rect,
+    colors: &SearchOverlayColors,
+) {
+    push_solid_rect(out, *overlay, colors.bg);
+    push_solid_rect(
+        out,
+        Rect { x: overlay.x, y: overlay.y, width: overlay.width, height: 1.0 },
+        colors.border,
+    );
+    push_solid_rect(
+        out,
+        Rect {
+            x: overlay.x,
+            y: overlay.y + overlay.height - 1.0,
+            width: overlay.width,
+            height: 1.0,
+        },
+        colors.border,
+    );
+    push_solid_rect(
+        out,
+        Rect { x: overlay.x, y: overlay.y, width: 1.0, height: overlay.height },
+        colors.border,
+    );
+    push_solid_rect(
+        out,
+        Rect {
+            x: overlay.x + overlay.width - 1.0,
+            y: overlay.y,
+            width: 1.0,
+            height: overlay.height,
+        },
+        colors.border,
+    );
+    push_solid_rect(
+        out,
+        Rect {
+            x: overlay.x + 1.0,
+            y: overlay.y + (overlay.height / 2.0),
+            width: (overlay.width - 2.0).max(0.0),
+            height: (overlay.height / 2.0 - 1.0).max(0.0),
+        },
+        colors.input_bg,
+    );
+}
 
-        let query_cols = overlay_cols.saturating_sub(3);
-        let visible_query = tail_chars(&query_text, query_cols);
-        emit_text_line(
-            out,
-            "/",
-            overlay.x + cell_w,
-            overlay.y + cell_h,
-            colors.border,
-            colors.input_bg,
-            cell_w,
-            resolve_glyph,
-        );
-        emit_text_line(
-            out,
-            &visible_query,
-            overlay.x + 2.0 * cell_w,
-            overlay.y + cell_h,
-            if self.query.is_empty() { colors.placeholder_fg } else { colors.query_fg },
-            colors.input_bg,
-            cell_w,
-            resolve_glyph,
-        );
+fn draw_search_overlay_text(
+    renderer: &mut SearchOverlayRenderer<'_>,
+    layout: &SearchOverlayLayout,
+    colors: &SearchOverlayColors,
+    cell_h: f32,
+) {
+    let cell_w = renderer.cell_w;
+    let header_cols = layout.overlay_cols.saturating_sub(2);
+    renderer.emit_text_line(
+        &tail_chars(&layout.header, header_cols),
+        layout.overlay.x + cell_w,
+        layout.overlay.y,
+        TextColors { fg: colors.header_fg, bg: colors.bg },
+    );
+
+    let query_cols = layout.overlay_cols.saturating_sub(3);
+    renderer.emit_text_line(
+        "/",
+        layout.overlay.x + cell_w,
+        layout.overlay.y + cell_h,
+        TextColors { fg: colors.border, bg: colors.input_bg },
+    );
+    renderer.emit_text_line(
+        &tail_chars(&layout.query_text, query_cols),
+        layout.overlay.x + 2.0 * cell_w,
+        layout.overlay.y + cell_h,
+        TextColors {
+            fg: if layout.query_text.is_empty() { colors.placeholder_fg } else { colors.query_fg },
+            bg: colors.input_bg,
+        },
+    );
+}
+
+#[derive(Clone, Copy)]
+struct TextColors {
+    fg: [f32; 4],
+    bg: [f32; 4],
+}
+
+struct SearchOverlayRenderer<'a> {
+    out: &'a mut Vec<CellInstance>,
+    cell_w: f32,
+    resolve_glyph: &'a mut GlyphResolver<'a>,
+}
+
+impl<'a> SearchOverlayRenderer<'a> {
+    fn new(
+        out: &'a mut Vec<CellInstance>,
+        cell_w: f32,
+        resolve_glyph: &'a mut GlyphResolver<'a>,
+    ) -> Self {
+        Self { out, cell_w, resolve_glyph }
+    }
+
+    fn emit_text_line(&mut self, text: &str, x: f32, y: f32, colors: TextColors) {
+        let mut cursor_x = x;
+        for ch in text.chars() {
+            let (uv_min, uv_max) = (self.resolve_glyph)(ch);
+            self.out.push(CellInstance {
+                pos: [cursor_x, y],
+                size: [0.0, 0.0],
+                uv_min,
+                uv_max,
+                fg_color: colors.fg,
+                bg_color: colors.bg,
+                corner_radius: 0.0,
+            });
+            cursor_x += self.cell_w;
+        }
     }
 }
 
@@ -305,37 +404,6 @@ fn tail_chars(text: &str, max_chars: usize) -> String {
     chars.get(start..).unwrap_or(&[]).iter().collect()
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "text emission needs output vec, text, position, colors, cell width, and glyph resolver"
-)]
-fn emit_text_line(
-    out: &mut Vec<CellInstance>,
-    text: &str,
-    x: f32,
-    y: f32,
-    fg_color: [f32; 4],
-    bg_color: [f32; 4],
-    cell_w: f32,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
-    let mut cursor_x = x;
-    for ch in text.chars() {
-        let (uv_min, uv_max) = resolve_glyph(ch);
-        out.push(CellInstance {
-            pos: [cursor_x, y],
-            size: [0.0, 0.0],
-            uv_min,
-            uv_max,
-            fg_color,
-            bg_color,
-            corner_radius: 0.0,
-            _pad: 0.0,
-        });
-        cursor_x += cell_w;
-    }
-}
-
 fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
     out.push(CellInstance {
         pos: [rect.x, rect.y],
@@ -345,6 +413,5 @@ fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
         fg_color: color,
         bg_color: color,
         corner_radius: 0.0,
-        _pad: 0.0,
     });
 }

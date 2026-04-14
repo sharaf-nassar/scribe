@@ -173,11 +173,7 @@ async fn send_signal_and_wait(pid: Pid) -> Result<(), ScribeError> {
     }
 
     // Process is still alive after timeout — force kill.
-    #[allow(
-        clippy::let_underscore_must_use,
-        reason = "SIGKILL delivery is best-effort; process may have exited between check and kill"
-    )]
-    let _ = kill(pid, Signal::SIGKILL);
+    let _kill_result = kill(pid, Signal::SIGKILL);
 
     Ok(())
 }

@@ -114,6 +114,66 @@ impl SelectionRange {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct PixelToGridRequest<'a> {
+    pub x: f32,
+    pub y: f32,
+    pub pane_rect: Rect,
+    pub cell_size: (f32, f32),
+    pub tab_bar_height: f32,
+    pub prompt_bar_height: f32,
+    pub prompt_bar_at_top: bool,
+    pub display_offset: usize,
+    pub padding: &'a ContentPadding,
+}
+
+#[derive(Clone, Copy)]
+enum ContentBoundsMode {
+    RejectOutsideContent,
+    ClampToContent,
+}
+
+const MAX_SELECTION_GRID_UNITS: usize = 65_535;
+
+fn selection_grid_units(units: usize) -> u16 {
+    u16::try_from(units.min(MAX_SELECTION_GRID_UNITS)).unwrap_or(u16::MAX)
+}
+
+fn selection_grid_pixels(units: usize, cell_size: f32) -> f32 {
+    f32::from(selection_grid_units(units)) * cell_size
+}
+
+fn selection_units_in_extent(extent: f32, cell_size: f32) -> usize {
+    if cell_size <= 0.0 || !extent.is_finite() || extent <= 0.0 {
+        return 0;
+    }
+
+    let mut low = 0usize;
+    let mut high = 1usize;
+    while high < MAX_SELECTION_GRID_UNITS && selection_grid_pixels(high, cell_size) <= extent {
+        low = high;
+        high = high.saturating_mul(2).min(MAX_SELECTION_GRID_UNITS);
+        if high == low {
+            break;
+        }
+    }
+
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if selection_grid_pixels(mid, cell_size) <= extent {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+
+    low
+}
+
+fn selection_grid_i32(units: usize) -> i32 {
+    i32::try_from(units).unwrap_or(i32::MAX)
+}
+
 /// Convert pixel coordinates to an absolute grid position within a pane.
 ///
 /// The content area excludes the tab bar at the top and the status bar at the
@@ -125,123 +185,42 @@ impl SelectionRange {
 /// viewport, negative values point into scrollback history.  The
 /// `display_offset` parameter is subtracted from the screen row so that
 /// the selection tracks content rather than screen position.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "pixel / cell_size yields a small positive value fitting in usize / i32"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "coordinate conversion needs pane geometry, cell size, tab bar height, and scroll offset"
-)]
-pub fn pixel_to_grid(
-    x: f32,
-    y: f32,
-    pane_rect: Rect,
-    cell_w: f32,
-    cell_h: f32,
-    tab_bar_height: f32,
-    prompt_bar_height: f32,
-    prompt_bar_at_top: bool,
-    display_offset: usize,
-    padding: &ContentPadding,
-) -> Option<SelectionPoint> {
-    pixel_to_grid_impl(
-        x,
-        y,
-        pane_rect,
-        cell_w,
-        cell_h,
-        tab_bar_height,
-        prompt_bar_height,
-        prompt_bar_at_top,
-        display_offset,
-        padding,
-        false,
-    )
+pub fn pixel_to_grid(request: PixelToGridRequest<'_>) -> Option<SelectionPoint> {
+    pixel_to_grid_impl(request, ContentBoundsMode::RejectOutsideContent)
 }
 
 /// Convert pixel coordinates to an absolute grid position, clamping points
 /// outside the content area to the nearest visible cell.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "pixel / cell_size yields a small positive value fitting in usize / i32"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "coordinate conversion needs pane geometry, cell size, tab bar height, and scroll offset"
-)]
-pub fn pixel_to_grid_clamped(
-    x: f32,
-    y: f32,
-    pane_rect: Rect,
-    cell_w: f32,
-    cell_h: f32,
-    tab_bar_height: f32,
-    prompt_bar_height: f32,
-    prompt_bar_at_top: bool,
-    display_offset: usize,
-    padding: &ContentPadding,
-) -> Option<SelectionPoint> {
-    pixel_to_grid_impl(
-        x,
-        y,
-        pane_rect,
-        cell_w,
-        cell_h,
-        tab_bar_height,
-        prompt_bar_height,
-        prompt_bar_at_top,
-        display_offset,
-        padding,
-        true,
-    )
+pub fn pixel_to_grid_clamped(request: PixelToGridRequest<'_>) -> Option<SelectionPoint> {
+    pixel_to_grid_impl(request, ContentBoundsMode::ClampToContent)
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "pixel / cell_size yields a small positive value fitting in usize / i32"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "coordinate conversion needs pane geometry, cell size, tab bar height, and scroll offset"
-)]
-#[allow(
-    clippy::fn_params_excessive_bools,
-    reason = "prompt_bar_at_top and clamp_to_content are independent axis concerns"
-)]
 fn pixel_to_grid_impl(
-    x: f32,
-    y: f32,
-    pane_rect: Rect,
-    cell_w: f32,
-    cell_h: f32,
-    tab_bar_height: f32,
-    prompt_bar_height: f32,
-    prompt_bar_at_top: bool,
-    display_offset: usize,
-    padding: &ContentPadding,
-    clamp_to_content: bool,
+    request: PixelToGridRequest<'_>,
+    bounds_mode: ContentBoundsMode,
 ) -> Option<SelectionPoint> {
-    let chrome_above = tab_bar_height + if prompt_bar_at_top { prompt_bar_height } else { 0.0 };
-    let total_chrome = tab_bar_height + prompt_bar_height;
-    let content_x = pane_rect.x + padding.left;
-    let content_y = pane_rect.y + chrome_above + padding.top;
-    let content_w = (pane_rect.width - padding.left - padding.right).max(0.0);
-    let content_h = (pane_rect.height - total_chrome - padding.top - padding.bottom).max(0.0);
+    let (cell_w, cell_h) = request.cell_size;
+    let chrome_above = request.tab_bar_height
+        + if request.prompt_bar_at_top { request.prompt_bar_height } else { 0.0 };
+    let total_chrome = request.tab_bar_height + request.prompt_bar_height;
+    let content_x = request.pane_rect.x + request.padding.left;
+    let content_y = request.pane_rect.y + chrome_above + request.padding.top;
+    let content_w =
+        (request.pane_rect.width - request.padding.left - request.padding.right).max(0.0);
+    let content_h =
+        (request.pane_rect.height - total_chrome - request.padding.top - request.padding.bottom)
+            .max(0.0);
 
     if content_w <= 0.0 || content_h <= 0.0 {
         return None;
     }
 
     // Pixel offset relative to the content area origin.
-    let raw_rel_x = x - content_x;
-    let raw_rel_y = y - content_y;
+    let raw_rel_x = request.x - content_x;
+    let raw_rel_y = request.y - content_y;
 
     // Reject clicks outside the content area.
-    if !clamp_to_content
+    if matches!(bounds_mode, ContentBoundsMode::RejectOutsideContent)
         && (raw_rel_x < 0.0 || raw_rel_y < 0.0 || raw_rel_x >= content_w || raw_rel_y >= content_h)
     {
         return None;
@@ -251,12 +230,12 @@ fn pixel_to_grid_impl(
         return None;
     }
 
-    let rel_x = if clamp_to_content {
+    let rel_x = if matches!(bounds_mode, ContentBoundsMode::ClampToContent) {
         raw_rel_x.clamp(0.0, (content_w - f32::EPSILON).max(0.0))
     } else {
         raw_rel_x
     };
-    let rel_y = if clamp_to_content {
+    let rel_y = if matches!(bounds_mode, ContentBoundsMode::ClampToContent) {
         raw_rel_y.clamp(0.0, (content_h - f32::EPSILON).max(0.0))
     } else {
         raw_rel_y
@@ -265,18 +244,15 @@ fn pixel_to_grid_impl(
     // Clamp to the valid grid range — the content area may contain a
     // fractional cell at the right/bottom edge, so `floor(content / cell)`
     // could exceed the last valid index.
-    let max_col = (content_w / cell_w) as usize;
-    let max_row = (content_h / cell_h) as i32;
-    let col = ((rel_x / cell_w) as usize).min(max_col.saturating_sub(1));
-    let screen_row = ((rel_y / cell_h) as i32).min(max_row.saturating_sub(1));
+    let max_col = selection_units_in_extent(content_w, cell_w);
+    let max_row = selection_grid_i32(selection_units_in_extent(content_h, cell_h));
+    let col = selection_units_in_extent(rel_x, cell_w).min(max_col.saturating_sub(1));
+    let screen_row =
+        selection_grid_i32(selection_units_in_extent(rel_y, cell_h)).min(max_row.saturating_sub(1));
 
     // Convert screen row to absolute grid line: subtract display_offset so
     // that scrollback lines get negative indices matching alacritty_terminal.
-    #[allow(
-        clippy::cast_possible_wrap,
-        reason = "display_offset is bounded by scrollback_lines (≤ 100_000), fits in i32"
-    )]
-    let row = screen_row - display_offset as i32;
+    let row = screen_row.saturating_sub(selection_grid_i32(request.display_offset));
 
     Some(SelectionPoint { row, col })
 }
@@ -340,10 +316,6 @@ fn is_word_char(c: char) -> bool {
 ///
 /// If the character at `point` is a delimiter, both bounds equal `point`
 /// (single-cell selection).  Returns `(start, end)` in reading order.
-#[allow(
-    clippy::cast_possible_wrap,
-    reason = "column index is bounded by terminal width which fits in i32"
-)]
 pub fn word_bounds_at(
     term: &Term<VoidListener>,
     point: SelectionPoint,
@@ -461,10 +433,6 @@ fn read_cell_flags(term: &Term<VoidListener>, line: Line, col: Column) -> Flags 
 
 /// Return the previous logical neighbor for word scanning, crossing into the
 /// wrapped row above when the current row is a continuation.
-#[allow(
-    clippy::cast_possible_wrap,
-    reason = "topmost_line is bounded by scrollback_lines (≤ 100_000), fits in i32"
-)]
 fn previous_cell_point(term: &Term<VoidListener>, point: SelectionPoint) -> Option<SelectionPoint> {
     if point.col > 0 {
         return Some(SelectionPoint { row: point.row, col: point.col.saturating_sub(1) });
@@ -486,10 +454,6 @@ fn previous_cell_point(term: &Term<VoidListener>, point: SelectionPoint) -> Opti
 
 /// Return the next logical neighbor for word scanning, crossing into the
 /// wrapped continuation row when the current row ends with WRAPLINE.
-#[allow(
-    clippy::cast_possible_wrap,
-    reason = "bottommost_line is bounded by scrollback_lines (≤ 100_000), fits in i32"
-)]
 fn next_cell_point(term: &Term<VoidListener>, point: SelectionPoint) -> Option<SelectionPoint> {
     let last_col = term.grid().columns().saturating_sub(1);
     if point.col < last_col {
@@ -517,10 +481,6 @@ struct LogicalLine {
 
 /// Find the full extent of the logical line that contains `row`, following
 /// WRAPLINE flags to join screen rows that belong to the same logical line.
-#[allow(
-    clippy::cast_possible_wrap,
-    reason = "topmost_line/bottommost_line are bounded by scrollback_lines (≤ 100_000), fits in i32"
-)]
 fn logical_line_at(term: &Term<VoidListener>, row: i32) -> LogicalLine {
     let topmost = term.grid().topmost_line().0;
     let bottommost = term.grid().bottommost_line().0;

@@ -45,19 +45,11 @@ impl From<TestError> for ExitCode {
         let mut stderr = io::stderr().lock();
         match err {
             TestError::TestFailure(ref msg) => {
-                #[allow(
-                    clippy::let_underscore_must_use,
-                    reason = "stderr write failure is non-recoverable in an exit path"
-                )]
-                let _ = writeln!(stderr, "FAIL: {msg}");
+                drop(writeln!(stderr, "FAIL: {msg}"));
                 Self::from(1)
             }
             TestError::InfraError(ref msg) => {
-                #[allow(
-                    clippy::let_underscore_must_use,
-                    reason = "stderr write failure is non-recoverable in an exit path"
-                )]
-                let _ = writeln!(stderr, "ERROR: {msg}");
+                drop(writeln!(stderr, "ERROR: {msg}"));
                 Self::from(2)
             }
         }

@@ -86,16 +86,8 @@ enum ProfileCommand {
 /// Stdout write failures are acceptable in a test CLI tool.
 fn write_stdout(data: &[u8]) {
     let mut stdout = std::io::stdout().lock();
-    #[allow(
-        clippy::let_underscore_must_use,
-        reason = "stdout write errors in a test CLI tool are intentionally discarded"
-    )]
-    let _ = stdout.write_all(data);
-    #[allow(
-        clippy::let_underscore_must_use,
-        reason = "stdout flush errors in a test CLI tool are intentionally discarded"
-    )]
-    let _ = stdout.flush();
+    drop(stdout.write_all(data));
+    drop(stdout.flush());
 }
 
 fn write_line(line: &str) {
@@ -332,8 +324,7 @@ fn run_profile_command(action: ProfileCommand) -> Result<(), ScribeError> {
 
 #[tokio::main]
 async fn main() -> Result<(), ScribeError> {
-    #[allow(clippy::unwrap_used, reason = "EnvFilter::new with static string cannot fail")]
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().map_or(EnvFilter::new("info"), |filter| filter);
 
     fmt().with_env_filter(filter).init();
 

@@ -10,12 +10,14 @@
 ///
 /// When `ai_session_active` is `false` or `cleanup_enabled` is `false`, the
 /// text is returned unchanged.
-#[allow(
-    clippy::fn_params_excessive_bools,
-    reason = "two independent booleans (AI state + config toggle) are clearer than an enum here"
-)]
-pub fn prepare_copy_text(text: &str, ai_session_active: bool, cleanup_enabled: bool) -> String {
-    if !ai_session_active || !cleanup_enabled {
+#[derive(Clone, Copy)]
+pub struct CopyTextOptions {
+    pub ai_session_active: bool,
+    pub cleanup_enabled: bool,
+}
+
+pub fn prepare_copy_text(text: &str, options: CopyTextOptions) -> String {
+    if !options.ai_session_active || !options.cleanup_enabled {
         return text.to_owned();
     }
     let dedented = dedent(text);
@@ -79,25 +81,29 @@ fn unwrap_lines(text: &str) -> String {
 
     let mut out: Vec<String> = Vec::new();
 
-    #[allow(clippy::excessive_nesting, reason = "paragraph accumulation loop is clearest as-is")]
     if width == 0 {
         // No dominant wrap width — join consecutive non-break lines.
         // This handles content like commands that Claude formatted across
         // multiple lines at natural token boundaries (varying lengths).
         join_non_break_runs(&lines, &mut out);
-    } else {
-        let mut idx = 0;
-        let len = lines.len();
+        let mut result = out.join("\n");
+        if trailing_newline {
+            result.push('\n');
+        }
+        return result;
+    }
 
-        while idx < len {
-            let line = lines.get(idx).copied().unwrap_or_default();
+    let mut idx = 0;
+    let len = lines.len();
 
-            if should_join(line, lines.get(idx + 1).copied(), width) {
-                out.push(collect_joined_paragraph(&lines, &mut idx, len, width, line));
-            } else {
-                out.push(line.to_owned());
-                idx += 1;
-            }
+    while idx < len {
+        let line = lines.get(idx).copied().unwrap_or_default();
+
+        if should_join(line, lines.get(idx + 1).copied(), width) {
+            out.push(collect_joined_paragraph(&lines, &mut idx, len, width, line));
+        } else {
+            out.push(line.to_owned());
+            idx += 1;
         }
     }
 
@@ -335,19 +341,34 @@ mod tests {
     #[test]
     fn passthrough_when_claude_inactive() {
         let text = "    indented\n    lines\n";
-        assert_eq!(prepare_copy_text(text, false, true), text);
+        assert_eq!(
+            prepare_copy_text(
+                text,
+                CopyTextOptions { ai_session_active: false, cleanup_enabled: true }
+            ),
+            text
+        );
     }
 
     #[test]
     fn passthrough_when_cleanup_disabled() {
         let text = "    indented\n    lines\n";
-        assert_eq!(prepare_copy_text(text, true, false), text);
+        assert_eq!(
+            prepare_copy_text(
+                text,
+                CopyTextOptions { ai_session_active: true, cleanup_enabled: false }
+            ),
+            text
+        );
     }
 
     #[test]
     fn applies_transforms_when_enabled() {
         let text = "    hello world\n    goodbye world\n";
-        let result = prepare_copy_text(text, true, true);
+        let result = prepare_copy_text(
+            text,
+            CopyTextOptions { ai_session_active: true, cleanup_enabled: true },
+        );
         assert_eq!(result, "hello world\ngoodbye world\n");
     }
 
@@ -718,7 +739,10 @@ mod tests {
         ]
         .join("\n");
 
-        let result = prepare_copy_text(&input, true, true);
+        let result = prepare_copy_text(
+            &input,
+            CopyTextOptions { ai_session_active: true, cleanup_enabled: true },
+        );
 
         // Prose should be unwrapped into one line.
         assert!(result.contains("prose with hard line breaks at a fixed width"));
@@ -744,7 +768,10 @@ mod tests {
         ]
         .join("\n");
 
-        let result = prepare_copy_text(&input, true, true);
+        let result = prepare_copy_text(
+            &input,
+            CopyTextOptions { ai_session_active: true, cleanup_enabled: true },
+        );
 
         // Code block fences must survive as separate lines.
         assert!(result.contains("\n```\n"));

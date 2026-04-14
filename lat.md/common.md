@@ -26,11 +26,13 @@ Per-state visual config for Claude Code indicators lives in [[crates/scribe-comm
 
 Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto-clear timeout (`timeout_secs`), and booleans for tab indicator and pane border. [[crates/scribe-common/src/config.rs#AiColor]] is a polymorphic color type that accepts either a fixed `#rrggbb` hex string or an `"ansi:N"` palette index (0–15) that adapts to the active theme at render time.
 
+`pulse_ms` is interpreted as a full millisecond duration across the stored `u32` range, so very slow indicator pulses are preserved instead of being clamped to 16-bit timing.
+
 ### Terminal
 
 [[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, AI toggles, indicator height, shell integration, status bar stats, prompt bar, and scroll pin settings.
 
-`scroll_pin` (bool, default `false`) enables split-scroll in AI panes, but only while the pane is in the normal screen buffer; alternate-screen TUIs fall back to the regular live view. `preserve_ai_scrollback` (bool, default `true`) strips AI-session `CSI 3 J` scrollback clears so prior history is preserved without injecting a visible screen clear.
+`scroll_pin` (bool, default `false`) enables split-scroll in AI panes, but only while the pane is in the normal screen buffer; alternate-screen TUIs fall back to the regular live view. `preserve_ai_scrollback` (bool, default `true`) strips AI-session `CSI 3 J` scrollback clears, records the first preserved history size as a baseline, and trims later redraw clears back to that baseline so prior history survives without duplicate inline transcript frames piling up.
 
 Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (f32, 8–32, default 14), `prompt_bar_position` ([[crates/scribe-common/src/config.rs#PromptBarPosition]]: Top or Bottom), and optional row-surface overrides for the first row, second row, text, first icon, and latest icon.
 
@@ -109,6 +111,8 @@ Named sockets in the base directory: `server.sock`, `settings.sock`, and `handof
 A theme engine providing 5 built-in and 187 community presets, plus a derivation algorithm that produces chrome (UI) colors from the terminal palette.
 
 [[crates/scribe-common/src/theme.rs#Theme]] is the resolved theme struct with RGBA arrays for foreground, background, cursor, selection, 16 ANSI colors, and a [[crates/scribe-common/src/theme.rs#ChromeColors]] sub-struct. [[crates/scribe-common/src/theme.rs#ThemeColors]] is the input parameter bag passed to [[crates/scribe-common/src/theme.rs#resolve_preset]] produces a `Theme` from a preset name (case-insensitive) by checking curated presets first and falling back to the community set. [[crates/scribe-common/src/theme.rs#hex_to_rgba]] and [[crates/scribe-common/src/theme.rs#rgba_to_hex]] convert between `#rrggbb` strings and `[f32; 4]` RGBA arrays.
+
+RGBA-to-hex conversion rounds each clamped channel to the nearest byte, and the server reuses that same helper when it synthesizes fallback terminal colors from the configured theme.
 
 ### Built-in Presets
 

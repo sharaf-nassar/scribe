@@ -75,11 +75,7 @@ impl Ed3Filter {
     /// Process a single byte through the state machine.
     /// Returns `true` if the output diverged from a pass-through copy.
     fn process_byte(&mut self, byte: u8, out: &mut Vec<u8>) -> bool {
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "self.state is bounded to 0..=3 by the state machine; SEQ has length 4"
-        )]
-        let expected = SEQ[self.state as usize];
+        let expected = SEQ.get(usize::from(self.state)).copied().unwrap_or_default();
 
         if byte == expected {
             return self.advance_match(out);
@@ -117,11 +113,7 @@ impl Ed3Filter {
 
     /// Write pending partial-match bytes to `out` and reset state.
     fn flush_pending(&mut self, out: &mut Vec<u8>) {
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "self.state is bounded to 1..=3 here; SEQ has length 4"
-        )]
-        out.extend_from_slice(&SEQ[..self.state as usize]);
+        out.extend_from_slice(SEQ.get(..usize::from(self.state)).unwrap_or(&[]));
         self.state = 0;
     }
 
@@ -133,11 +125,7 @@ impl Ed3Filter {
         if self.state == 0 {
             return None;
         }
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "self.state is bounded to 1..=3 here; SEQ has length 4"
-        )]
-        let pending = SEQ[..self.state as usize].to_vec();
+        let pending = SEQ.get(..usize::from(self.state)).unwrap_or(&[]).to_vec();
         self.state = 0;
         Some(pending)
     }

@@ -9,11 +9,10 @@ pub struct ColorPalette {
 }
 
 /// Convert an 8-bit sRGB component to a linear f32 in \[0, 1\].
-#[allow(clippy::suboptimal_flops, reason = "clarity: standard sRGB transfer function")]
 #[inline]
 fn u8_to_linear(v: u8) -> f32 {
     let s = f32::from(v) / 255.0;
-    if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    if s <= 0.04045 { s / 12.92 } else { (s + 0.055).mul_add(1.0 / 1.055, 0.0).powf(2.4) }
 }
 
 /// Build an opaque RGBA entry from three sRGB u8 components (kept in sRGB
@@ -24,10 +23,9 @@ const fn rgba(r: u8, g: u8, b: u8) -> [f32; 4] {
 }
 
 /// Convert a single sRGB channel to linear space.
-#[allow(clippy::suboptimal_flops, reason = "clarity: standard sRGB transfer function")]
 #[inline]
 fn srgb_to_linear(s: f32) -> f32 {
-    if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    if s <= 0.04045 { s / 12.92 } else { (s + 0.055).mul_add(1.0 / 1.055, 0.0).powf(2.4) }
 }
 
 /// Linearise an RGBA colour from sRGB (alpha unchanged).
@@ -99,11 +97,8 @@ fn fill_cube_row(table: &mut [[f32; 4]; 256], idx: &mut usize, r: usize, g: usiz
 /// Populate the greyscale ramp region (entries 232-255) of `table`.
 fn fill_greyscale(table: &mut [[f32; 4]; 256]) {
     for i in 0_usize..24 {
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "i ≤ 23, so 8 + i*10 ≤ 238, which fits in u8"
-        )]
-        let v: u8 = 8 + (i as u8) * 10;
+        let step = u8::try_from(i).unwrap_or(u8::MAX);
+        let v = 8_u8.saturating_add(step.saturating_mul(10));
         if let Some(slot) = table.get_mut(232 + i) {
             *slot = rgba(v, v, v);
         }
@@ -189,12 +184,10 @@ impl ColorPalette {
     }
 
     /// Override ANSI colors 0-15 with theme values.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "entries is [_; 256] and colors is [_; 16], so [..16] is always valid"
-    )]
     pub fn override_ansi(&mut self, colors: &[[f32; 4]; 16]) {
-        self.entries[..16].copy_from_slice(colors);
+        if let Some(entries) = self.entries.get_mut(..16) {
+            entries.copy_from_slice(colors);
+        }
     }
 
     /// Opaque magenta — used as an unmistakeable "missing colour" sentinel.

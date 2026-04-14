@@ -11,6 +11,7 @@ use scribe_common::screen::{ScreenCell, ScreenColor, ScreenSnapshot};
 
 const CELL_WIDTH: u32 = 10;
 const CELL_HEIGHT: u32 = 20;
+const FONT_SIZE_PX: i32 = 14;
 const FONT_SIZE: f32 = 14.0;
 const LINE_HEIGHT_FACTOR: f32 = 1.2;
 /// Bytes per RGBA pixel.
@@ -139,10 +140,10 @@ fn fill_cube(table: &mut [[u8; 4]; 256]) {
 }
 
 /// Populate the greyscale ramp (entries 232-255).
-#[allow(clippy::cast_possible_truncation, reason = "i <= 23, so 8 + i*10 <= 238 which fits in u8")]
 fn fill_greyscale(table: &mut [[u8; 4]; 256]) {
     for i in 0_usize..24 {
-        let val = 8_u8 + (i as u8) * 10;
+        let step = u8::try_from(i).unwrap_or(u8::MAX);
+        let val = 8_u8.saturating_add(step.saturating_mul(10));
         if let Some(slot) = table.get_mut(232 + i) {
             *slot = [val, val, val, 0xFF];
         }
@@ -171,11 +172,11 @@ fn resolve_cell_colors(cell: &ScreenCell, palette: &[[u8; 4]; 256]) -> ([u8; 4],
     let mut fg = resolve_color(cell.fg, palette);
     let mut bg = resolve_color(cell.bg, palette);
 
-    if cell.flags.inverse {
+    if cell.flags.inverse() {
         std::mem::swap(&mut fg, &mut bg);
     }
 
-    if cell.flags.dim {
+    if cell.flags.dim() {
         fg = dim_color(fg);
     }
 
@@ -260,10 +261,6 @@ fn shape_cache_key(ctx: &mut RenderCtx, params: &GlyphParams) -> Option<cosmic_t
 }
 
 /// Build cosmic-text `Attrs` for the given style flags.
-#[allow(
-    clippy::fn_params_excessive_bools,
-    reason = "mirrors terminal cell flags directly; a wrapper enum would add boilerplate"
-)]
 fn build_attrs(params: &GlyphParams) -> Attrs<'static> {
     use cosmic_text::{Style, Weight};
     Attrs::new()
@@ -330,18 +327,6 @@ struct BlitParams {
 }
 
 /// Blit rasterised glyph pixels into the output buffer.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "placement top is a small integer that fits exactly in f32"
-)]
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "destination offsets are small non-negative values that fit in u32"
-)]
-#[allow(
-    clippy::cast_sign_loss,
-    reason = "destination offsets are clamped to non-negative before cast"
-)]
 fn blit_glyph_pixels(
     pixels: &mut [u8],
     img_width: u32,
@@ -349,8 +334,9 @@ fn blit_glyph_pixels(
     glyph_rgba: &[u8],
     blit: &BlitParams,
 ) {
-    let dest_x = params.px + blit.left.max(0) as u32;
-    let dest_y = params.py + (FONT_SIZE - blit.top as f32).max(0.0) as u32;
+    let dest_x = params.px + u32::try_from(blit.left.max(0)).unwrap_or(u32::MAX);
+    let baseline_offset = FONT_SIZE_PX.saturating_sub(blit.top).max(0);
+    let dest_y = params.py + u32::try_from(baseline_offset).unwrap_or(u32::MAX);
 
     for gy in 0..blit.gh {
         let cy = dest_y + gy;
@@ -376,10 +362,6 @@ struct BlendArgs<'a> {
 
 /// Alpha-blend a glyph source pixel onto the destination, applying the
 /// foreground colour tint.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "alpha blend math produces values 0-255 which fit in u8"
-)]
 fn blend_pixel(pixels: &mut [u8], args: &BlendArgs<'_>) {
     let alpha = args.src.get(3).copied().unwrap_or(0);
     if alpha == 0 {
@@ -400,7 +382,10 @@ fn blend_pixel(pixels: &mut [u8], args: &BlendArgs<'_>) {
 
     let al = u16::from(alpha);
     let inv_al = 255 - al;
-    let mix = |s: u8, d: u8| -> u8 { ((u16::from(s) * al + u16::from(d) * inv_al) / 255) as u8 };
+    let mix = |s: u8, d: u8| -> u8 {
+        let blended = (u16::from(s) * al + u16::from(d) * inv_al) / 255;
+        u8::try_from(blended).unwrap_or(u8::MAX)
+    };
 
     dest.copy_from_slice(&[mix(sr, dr), mix(sg, dg), mix(sb, db), 0xFF]);
 }
@@ -532,16 +517,12 @@ fn render_cells(
 }
 
 /// Render one cell: fill background and draw glyph if needed.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "col and row derived from u16 cols/rows fit in u32"
-)]
 fn render_single_cell(args: &mut CellRenderArgs<'_>, cell: &ScreenCell, idx: usize, cols: usize) {
     if cols == 0 {
         return;
     }
-    let col = (idx % cols) as u32;
-    let row = (idx / cols) as u32;
+    let col = u32::try_from(idx % cols).unwrap_or(u32::MAX);
+    let row = u32::try_from(idx / cols).unwrap_or(u32::MAX);
 
     let (fg, bg) = resolve_cell_colors(cell, args.palette);
     let fill = FillParams {
@@ -553,14 +534,14 @@ fn render_single_cell(args: &mut CellRenderArgs<'_>, cell: &ScreenCell, idx: usi
     };
     fill_rect(args.pixels, args.img_width, &fill);
 
-    if cell.c != ' ' && !cell.flags.hidden {
+    if cell.c != ' ' && !cell.flags.hidden() {
         let glyph = GlyphParams {
             ch: cell.c,
             fg,
             px: col * CELL_WIDTH,
             py: row * CELL_HEIGHT,
-            bold: cell.flags.bold,
-            italic: cell.flags.italic,
+            bold: cell.flags.bold(),
+            italic: cell.flags.italic(),
         };
         render_glyph(args.ctx, args.pixels, args.img_width, &glyph);
     }

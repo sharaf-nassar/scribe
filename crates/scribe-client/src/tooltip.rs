@@ -7,6 +7,7 @@
 use scribe_renderer::types::CellInstance;
 
 use crate::layout::Rect;
+type GlyphResolver<'a> = dyn FnMut(char) -> ([f32; 2], [f32; 2]) + 'a;
 
 /// Whether the tooltip should appear above or below its anchor rect.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -21,27 +22,37 @@ pub struct TooltipAnchor {
     pub rect: Rect,
 }
 
+pub struct TooltipRenderContext<'a> {
+    pub out: &'a mut Vec<CellInstance>,
+    pub text: &'a str,
+    pub anchor: Rect,
+    pub position: TooltipPosition,
+    pub bg_color: [f32; 4],
+    pub fg_color: [f32; 4],
+    pub border_color: [f32; 4],
+    pub cell_size: (f32, f32),
+    pub viewport_width: f32,
+    pub resolve_glyph: &'a mut GlyphResolver<'a>,
+}
+
 /// Render a tooltip above or below `anchor`, emitting into `out`.
 ///
 /// The tooltip has a 1-character left/right padding, a dark background, and
 /// light text. The background is drawn first (solid quad), then text glyphs.
 /// The tooltip is clamped to stay within `viewport_width`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "needs output vec, anchor, position, colors, cell size, viewport width, and glyph resolver"
-)]
-pub fn render_tooltip(
-    out: &mut Vec<CellInstance>,
-    text: &str,
-    anchor: Rect,
-    position: TooltipPosition,
-    bg_color: [f32; 4],
-    fg_color: [f32; 4],
-    border_color: [f32; 4],
-    cell_size: (f32, f32),
-    viewport_width: f32,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) {
+pub fn render_tooltip(ctx: TooltipRenderContext<'_>) {
+    let TooltipRenderContext {
+        out,
+        text,
+        anchor,
+        position,
+        bg_color,
+        fg_color,
+        border_color,
+        cell_size,
+        viewport_width,
+        resolve_glyph,
+    } = ctx;
     let (cell_w, cell_h) = cell_size;
     if cell_w <= 0.0 || cell_h <= 0.0 || text.is_empty() {
         return;
@@ -51,8 +62,7 @@ pub fn render_tooltip(
     // Padding: 1 char on each side.
     let total_cols = text_chars.len() + 2;
 
-    #[allow(clippy::cast_precision_loss, reason = "total_cols is a small value fitting in f32")]
-    let tooltip_w = total_cols as f32 * cell_w;
+    let tooltip_w = f32::from(u16::try_from(total_cols).unwrap_or(u16::MAX)) * cell_w;
     let tooltip_h = cell_h;
 
     // Center horizontally on the anchor rect, clamped to stay within the viewport.
@@ -78,41 +88,47 @@ pub fn render_tooltip(
     push_solid_rect(out, bg_rect, bg_color);
 
     // Text: leading space + chars + trailing space.
+    let mut renderer = TooltipRenderer::new(out, fg_color, bg_color, cell_w, resolve_glyph);
     let mut col_x = tooltip_x;
-    col_x = emit_glyph(out, ' ', col_x, tooltip_y, fg_color, bg_color, cell_w, resolve_glyph);
+    col_x = renderer.emit_glyph(' ', col_x, tooltip_y);
     for &ch in &text_chars {
-        col_x = emit_glyph(out, ch, col_x, tooltip_y, fg_color, bg_color, cell_w, resolve_glyph);
+        col_x = renderer.emit_glyph(ch, col_x, tooltip_y);
     }
-    emit_glyph(out, ' ', col_x, tooltip_y, fg_color, bg_color, cell_w, resolve_glyph);
+    renderer.emit_glyph(' ', col_x, tooltip_y);
 }
 
-/// Emit one glyph character at `(x, y)` and return `x + cell_w`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "emit helper needs all glyph positioning and color parameters"
-)]
-fn emit_glyph(
-    out: &mut Vec<CellInstance>,
-    ch: char,
-    x: f32,
-    y: f32,
+struct TooltipRenderer<'a> {
+    out: &'a mut Vec<CellInstance>,
     fg_color: [f32; 4],
     bg_color: [f32; 4],
     cell_w: f32,
-    resolve_glyph: &mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-) -> f32 {
-    let (uv_min, uv_max) = resolve_glyph(ch);
-    out.push(CellInstance {
-        pos: [x, y],
-        size: [0.0, 0.0],
-        uv_min,
-        uv_max,
-        fg_color,
-        bg_color,
-        corner_radius: 0.0,
-        _pad: 0.0,
-    });
-    x + cell_w
+    resolve_glyph: &'a mut GlyphResolver<'a>,
+}
+
+impl<'a> TooltipRenderer<'a> {
+    fn new(
+        out: &'a mut Vec<CellInstance>,
+        fg_color: [f32; 4],
+        bg_color: [f32; 4],
+        cell_w: f32,
+        resolve_glyph: &'a mut GlyphResolver<'a>,
+    ) -> Self {
+        Self { out, fg_color, bg_color, cell_w, resolve_glyph }
+    }
+
+    fn emit_glyph(&mut self, ch: char, x: f32, y: f32) -> f32 {
+        let (uv_min, uv_max) = (self.resolve_glyph)(ch);
+        self.out.push(CellInstance {
+            pos: [x, y],
+            size: [0.0, 0.0],
+            uv_min,
+            uv_max,
+            fg_color: self.fg_color,
+            bg_color: self.bg_color,
+            corner_radius: 0.0,
+        });
+        x + self.cell_w
+    }
 }
 
 /// Push a solid-color rectangle (no glyph) into `out`.
@@ -125,6 +141,5 @@ fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
         fg_color: color,
         bg_color: color,
         corner_radius: 0.0,
-        _pad: 0.0,
     });
 }

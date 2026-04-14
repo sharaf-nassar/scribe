@@ -14,13 +14,55 @@ use cosmic_text::CacheKey;
 use scribe_common::config::CursorShape;
 use wgpu::{Device, Queue, TextureFormat};
 
-use crate::atlas::{FontParams, GlyphAtlas, GlyphKey, ShapedRunGlyph};
+use crate::atlas::{FontParams, GlyphAtlas, GlyphKey, GlyphStyle, ShapedRunGlyph};
 use crate::palette::ColorPalette;
 use crate::pipeline::{PipelineConfig, TerminalPipeline};
 use crate::types::{CellInstance, CellSize, GridSize};
 
 /// Dimming factor applied to foreground when the DIM flag is set.
 const DIM_FACTOR: f32 = 0.67;
+/// Grid coordinates in the renderer stay within this range, which keeps
+/// integer-to-float conversion exact for pixel placement.
+const MAX_RENDER_GRID_UNITS: usize = 65_535;
+
+fn render_grid_units(units: usize) -> u16 {
+    u16::try_from(units.min(MAX_RENDER_GRID_UNITS)).unwrap_or(u16::MAX)
+}
+
+fn render_grid_pixels(units: usize, cell_size: f32) -> f32 {
+    f32::from(render_grid_units(units)) * cell_size
+}
+
+fn render_units_in_extent(extent: f32, cell_size: f32) -> u16 {
+    if cell_size <= 0.0 || !extent.is_finite() || extent <= 0.0 {
+        return 0;
+    }
+
+    let mut low = 0usize;
+    let mut high = 1usize;
+    while high < MAX_RENDER_GRID_UNITS && render_grid_pixels(high, cell_size) <= extent {
+        low = high;
+        high = high.saturating_mul(2).min(MAX_RENDER_GRID_UNITS);
+        if high == low {
+            break;
+        }
+    }
+
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if render_grid_pixels(mid, cell_size) <= extent {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+
+    render_grid_units(low)
+}
+
+fn viewport_axis_f32(axis: u32) -> f32 {
+    f32::from(u16::try_from(axis).unwrap_or(u16::MAX))
+}
 
 /// A cell collected from `display_iter` for the ligature pre-pass.
 struct CollectedCell {
@@ -49,6 +91,63 @@ struct LigatureCellInfo {
 
 /// Map from grid position `(line, column)` to ligature info.
 type LigatureMap = HashMap<(i32, usize), LigatureCellInfo>;
+
+#[derive(Clone, Copy)]
+pub struct RenderResources<'a> {
+    pub device: &'a Device,
+    pub queue: &'a Queue,
+}
+
+#[derive(Clone, Copy)]
+pub struct TerminalRenderOptions {
+    pub offset: (f32, f32),
+    pub cursor_visible: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CursorRenderState {
+    point: alacritty_terminal::index::Point,
+    visible: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RenderGeometry {
+    line_offset: i32,
+    cell_size: CellSize,
+    offset: (f32, f32),
+}
+
+enum LigatureRenderMode<'a> {
+    Disabled,
+    Enabled(&'a LigatureMap),
+}
+
+struct CellInstanceBuildRequest<'a> {
+    resources: RenderResources<'a>,
+    cells: &'a [CollectedCell],
+    ligatures: LigatureRenderMode<'a>,
+    geometry: RenderGeometry,
+    cursor: CursorRenderState,
+    estimated_capacity: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CursorInstanceRequest {
+    pos: [f32; 2],
+    cell_size: CellSize,
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
+    fg: [f32; 4],
+    bg: [f32; 4],
+}
+
+#[derive(Clone, Copy)]
+struct CollectedCellKey {
+    c: char,
+    flags: Flags,
+    line: i32,
+    column: usize,
+}
 
 /// GPU-accelerated terminal renderer.
 ///
@@ -149,20 +248,15 @@ impl TerminalRenderer {
     ///
     /// `cursor_visible` controls whether the cursor overlay is rendered.
     /// Pass `false` during a blink-off phase; pass `true` otherwise.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "public API needs device, queue, term, offset, and cursor_visible — cannot reduce"
-    )]
     pub fn build_instances_at<T: EventListener>(
         &mut self,
-        device: &Device,
-        queue: &Queue,
+        resources: RenderResources<'_>,
         term: &mut Term<T>,
-        offset: (f32, f32),
-        cursor_visible: bool,
+        options: TerminalRenderOptions,
     ) -> Vec<CellInstance> {
         let content = term.renderable_content();
-        let cursor_point = content.cursor.point;
+        let cursor =
+            CursorRenderState { point: content.cursor.point, visible: options.cursor_visible };
 
         // Respect the terminal's own cursor visibility (SHOW_CURSOR / DECTCEM).
         // When applications hide the cursor (e.g. during TUI redraws),
@@ -170,7 +264,8 @@ impl TerminalRenderer {
         // the blink timer says visible.
         let term_cursor_shown =
             content.cursor.shape != alacritty_terminal::vte::ansi::CursorShape::Hidden;
-        let effective_cursor_visible = cursor_visible && term_cursor_shown;
+        let effective_cursor_visible = cursor.visible && term_cursor_shown;
+        let effective_cursor = CursorRenderState { visible: effective_cursor_visible, ..cursor };
 
         // Honour the terminal's DECSCUSR cursor shape when a TUI app has
         // explicitly changed it (e.g. Claude Code sets Beam for its input
@@ -190,14 +285,8 @@ impl TerminalRenderer {
             }
         }
 
-        let instances = self.build_instances_offset(
-            device,
-            queue,
-            content,
-            cursor_point,
-            offset,
-            effective_cursor_visible,
-        );
+        let instances =
+            self.build_instances_offset(resources, content, effective_cursor, options.offset);
 
         self.cursor_shape = saved_shape;
         instances
@@ -313,36 +402,20 @@ impl TerminalRenderer {
 
     /// Build the per-cell instance buffer with a pixel offset applied to
     /// every instance position.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "internal method needs all render context parameters plus offset and cursor state"
-    )]
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "grid coordinates are small (< 2^16) and fit exactly in f32"
-    )]
     fn build_instances_offset(
         &mut self,
-        device: &Device,
-        queue: &Queue,
+        resources: RenderResources<'_>,
         content: alacritty_terminal::term::RenderableContent<'_>,
-        cursor_point: alacritty_terminal::index::Point,
+        cursor: CursorRenderState,
         offset: (f32, f32),
-        cursor_visible: bool,
     ) -> Vec<CellInstance> {
-        let cell_w = self.cell_size.width;
-        let cell_h = self.cell_size.height;
+        let cell_size = self.cell_size;
 
         // When the user scrolls into history, display_iter yields cells with
         // negative line indices (e.g. Line(-5) for display_offset=5).  Add the
         // offset back so screen row 0 maps to the top of the content area
         // rather than bleeding above the pane.
-        #[allow(
-            clippy::cast_possible_wrap,
-            clippy::cast_possible_truncation,
-            reason = "display_offset is bounded by scrollback_lines (≤ 100_000), fits in i32"
-        )]
-        let line_offset = content.display_offset as i32;
+        let line_offset = i32::try_from(content.display_offset).unwrap_or(i32::MAX);
 
         // Collect cells: display_iter is a one-shot iterator.  Reuse the
         // scratch buffer to avoid a heap allocation every frame.  We take it
@@ -365,25 +438,23 @@ impl TerminalRenderer {
         } else {
             LigatureMap::new()
         };
-        let use_ligatures = !ligature_map.is_empty();
+        let ligatures = if ligature_map.is_empty() {
+            LigatureRenderMode::Disabled
+        } else {
+            LigatureRenderMode::Enabled(&ligature_map)
+        };
 
         // Beam/underline cursors push an extra overlay quad — allow some headroom.
         let estimated_capacity =
             usize::from(self.grid_size.cols) * usize::from(self.grid_size.rows) + 1;
-        let instances = self.build_cell_instances(
-            device,
-            queue,
-            &cells,
-            &ligature_map,
-            use_ligatures,
-            line_offset,
-            cell_w,
-            cell_h,
-            offset,
-            cursor_point,
-            cursor_visible,
+        let instances = self.build_cell_instances(CellInstanceBuildRequest {
+            resources,
+            cells: &cells,
+            ligatures,
+            geometry: RenderGeometry { line_offset, cell_size, offset },
+            cursor,
             estimated_capacity,
-        );
+        });
 
         // Return the scratch buffer so it retains its allocation for the next frame.
         self.cell_scratch = cells;
@@ -395,33 +466,16 @@ impl TerminalRenderer {
     /// Factored out of `build_instances_offset` so that method stays under the
     /// 80-line limit while the cell slice can be passed as a plain reference
     /// (no borrow conflict with `self`).
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "all render-context parameters are required; factored out purely for line-count"
-    )]
-    #[allow(
-        clippy::fn_params_excessive_bools,
-        reason = "use_ligatures and cursor_visible are independent flags with no natural enum grouping"
-    )]
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "grid coordinates are small (< 2^16) and fit exactly in f32"
-    )]
-    fn build_cell_instances(
-        &mut self,
-        device: &Device,
-        queue: &Queue,
-        cells: &[CollectedCell],
-        ligature_map: &LigatureMap,
-        use_ligatures: bool,
-        line_offset: i32,
-        cell_w: f32,
-        cell_h: f32,
-        offset: (f32, f32),
-        cursor_point: alacritty_terminal::index::Point,
-        cursor_visible: bool,
-        estimated_capacity: usize,
-    ) -> Vec<CellInstance> {
+    fn build_cell_instances(&mut self, request: CellInstanceBuildRequest<'_>) -> Vec<CellInstance> {
+        let CellInstanceBuildRequest {
+            resources,
+            cells,
+            ligatures,
+            geometry,
+            cursor,
+            estimated_capacity,
+        } = request;
+
         let mut instances = Vec::with_capacity(estimated_capacity);
         for cell in cells {
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
@@ -429,36 +483,45 @@ impl TerminalRenderer {
             {
                 continue;
             }
-            let col = cell.point.column.0 as f32;
-            let row = (cell.point.line.0 + line_offset) as f32;
-            let pos = [col * cell_w + offset.0, row * cell_h + offset.1];
+            let col = f32::from(render_grid_units(cell.point.column.0));
+            let row_index = usize::try_from(cell.point.line.0.saturating_add(geometry.line_offset))
+                .unwrap_or(0);
+            let row = f32::from(render_grid_units(row_index));
+            let pos = [
+                col * geometry.cell_size.width + geometry.offset.0,
+                row * geometry.cell_size.height + geometry.offset.1,
+            ];
             let (fg, bg) = self.resolve_cell_colors_raw(cell.fg, cell.bg, cell.flags);
-            let (uv_min, uv_max) = if use_ligatures {
-                self.resolve_glyph_uv_for_collected_fields(
-                    device,
-                    queue,
-                    cell.c,
-                    cell.flags,
-                    cell.point.line.0,
-                    cell.point.column.0,
-                    ligature_map,
-                )
-            } else {
-                self.resolve_glyph_uv_raw(device, queue, cell.c, cell.flags)
+            let (uv_min, uv_max) = match ligatures {
+                LigatureRenderMode::Enabled(ligature_map) => self
+                    .resolve_glyph_uv_for_collected_fields(
+                        resources,
+                        CollectedCellKey {
+                            c: cell.c,
+                            flags: cell.flags,
+                            line: cell.point.line.0,
+                            column: cell.point.column.0,
+                        },
+                        ligature_map,
+                    ),
+                LigatureRenderMode::Disabled => {
+                    self.resolve_glyph_uv_raw(resources.device, resources.queue, cell.c, cell.flags)
+                }
             };
-            let is_cursor = cursor_visible
-                && cell.point.line == cursor_point.line
-                && cell.point.column == cursor_point.column;
+            let is_cursor = cursor.visible
+                && cell.point.line == cursor.point.line
+                && cell.point.column == cursor.point.column;
             if is_cursor {
                 self.push_cursor_instances(
                     &mut instances,
-                    pos,
-                    cell_w,
-                    cell_h,
-                    uv_min,
-                    uv_max,
-                    fg,
-                    bg,
+                    CursorInstanceRequest {
+                        pos,
+                        cell_size: geometry.cell_size,
+                        uv_min,
+                        uv_max,
+                        fg,
+                        bg,
+                    },
                 );
             } else {
                 instances.push(CellInstance {
@@ -469,7 +532,6 @@ impl TerminalRenderer {
                     fg_color: fg,
                     bg_color: bg,
                     corner_radius: 0.0,
-                    _pad: 0.0,
                 });
             }
         }
@@ -477,21 +539,12 @@ impl TerminalRenderer {
     }
 
     /// Push one or more instances for the cursor cell, based on the cursor shape.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "cursor rendering needs position, dimensions, UVs, and both cell colors"
-    )]
     fn push_cursor_instances(
         &self,
         instances: &mut Vec<CellInstance>,
-        pos: [f32; 2],
-        cell_w: f32,
-        cell_h: f32,
-        uv_min: [f32; 2],
-        uv_max: [f32; 2],
-        fg: [f32; 4],
-        bg: [f32; 4],
+        request: CursorInstanceRequest,
     ) {
+        let CursorInstanceRequest { pos, cell_size, uv_min, uv_max, fg, bg } = request;
         match self.cursor_shape {
             CursorShape::Block => {
                 // Invert fg/bg for the whole cell.
@@ -503,7 +556,6 @@ impl TerminalRenderer {
                     fg_color: bg,
                     bg_color: fg,
                     corner_radius: 0.0,
-                    _pad: 0.0,
                 });
             }
             CursorShape::Beam => {
@@ -516,19 +568,17 @@ impl TerminalRenderer {
                     fg_color: fg,
                     bg_color: bg,
                     corner_radius: 0.0,
-                    _pad: 0.0,
                 });
                 // Thin vertical bar overlay.
-                let beam_w = f32::max(2.0, cell_w / 8.0);
+                let beam_w = f32::max(2.0, cell_size.width / 8.0);
                 instances.push(CellInstance {
                     pos,
-                    size: [beam_w, cell_h],
+                    size: [beam_w, cell_size.height],
                     uv_min: [0.0, 0.0],
                     uv_max: [0.0, 0.0],
                     fg_color: self.cursor_color,
                     bg_color: self.cursor_color,
                     corner_radius: 0.0,
-                    _pad: 0.0,
                 });
             }
             CursorShape::Underline => {
@@ -541,73 +591,23 @@ impl TerminalRenderer {
                     fg_color: fg,
                     bg_color: bg,
                     corner_radius: 0.0,
-                    _pad: 0.0,
                 });
                 // Thin horizontal bar at the bottom of the cell.
-                let ul_h = f32::max(2.0, cell_h / 8.0);
+                let ul_h = f32::max(2.0, cell_size.height / 8.0);
                 instances.push(CellInstance {
                     pos: [
                         pos.first().copied().unwrap_or(0.0),
-                        pos.get(1).copied().unwrap_or(0.0) + cell_h - ul_h,
+                        pos.get(1).copied().unwrap_or(0.0) + cell_size.height - ul_h,
                     ],
-                    size: [cell_w, ul_h],
+                    size: [cell_size.width, ul_h],
                     uv_min: [0.0, 0.0],
                     uv_max: [0.0, 0.0],
                     fg_color: self.cursor_color,
                     bg_color: self.cursor_color,
                     corner_radius: 0.0,
-                    _pad: 0.0,
                 });
             }
         }
-    }
-
-    /// Resolve foreground and background colours for a cell, applying
-    /// BOLD-bright, INVERSE, HIDDEN, and DIM flags.
-    #[allow(dead_code, reason = "retained for callers that work with &Cell directly")]
-    fn resolve_cell_colors(
-        &self,
-        cell: &alacritty_terminal::term::cell::Cell,
-    ) -> ([f32; 4], [f32; 4]) {
-        let effective_fg =
-            if cell.flags.contains(Flags::BOLD) { bold_to_bright(cell.fg) } else { cell.fg };
-        let mut fg = self.resolve_color(effective_fg);
-        let mut bg = self.resolve_color(cell.bg);
-
-        if cell.flags.contains(Flags::INVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-
-        if cell.flags.contains(Flags::HIDDEN) {
-            fg = bg;
-        }
-
-        if cell.flags.contains(Flags::DIM) {
-            apply_dim(&mut fg);
-        }
-
-        (fg, bg)
-    }
-
-    /// Look up the glyph UV coordinates, returning zeroed UVs for blank cells.
-    #[allow(dead_code, reason = "retained for callers that work with &Cell directly")]
-    fn resolve_glyph_uv(
-        &mut self,
-        device: &Device,
-        queue: &Queue,
-        cell: &alacritty_terminal::term::cell::Cell,
-    ) -> ([f32; 2], [f32; 2]) {
-        if cell.c == ' ' || cell.c == '\u{0}' {
-            return ([0.0, 0.0], [0.0, 0.0]);
-        }
-
-        let key = GlyphKey {
-            c: cell.c,
-            bold: cell.flags.contains(Flags::BOLD),
-            italic: cell.flags.contains(Flags::ITALIC),
-        };
-        let entry = self.atlas.get_or_insert(device, queue, key);
-        (entry.uv_min, entry.uv_max)
     }
 
     /// Resolve foreground and background colours from raw fields, applying
@@ -651,11 +651,9 @@ impl TerminalRenderer {
             return ([0.0, 0.0], [0.0, 0.0]);
         }
 
-        let key = GlyphKey {
-            c,
-            bold: flags.contains(Flags::BOLD),
-            italic: flags.contains(Flags::ITALIC),
-        };
+        let style =
+            GlyphStyle { bold: flags.contains(Flags::BOLD), italic: flags.contains(Flags::ITALIC) };
+        let key = GlyphKey { c, bold: style.bold, italic: style.italic };
         let entry = self.atlas.get_or_insert(device, queue, key);
         (entry.uv_min, entry.uv_max)
     }
@@ -668,25 +666,13 @@ impl TerminalRenderer {
     /// looked up (or rasterised) via the atlas shaped cache. For multi-cell
     /// ligatures the UV is split horizontally so each cell renders its portion
     /// of the wider glyph.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "all cell fields are needed; using individual values avoids borrow aliasing with self.cell_scratch"
-    )]
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "glyph_span and cell_index are small integers that fit exactly in f32"
-    )]
     fn resolve_glyph_uv_for_collected_fields(
         &mut self,
-        device: &Device,
-        queue: &Queue,
-        c: char,
-        flags: Flags,
-        line: i32,
-        column: usize,
+        resources: RenderResources<'_>,
+        cell: CollectedCellKey,
         ligature_map: &LigatureMap,
     ) -> ([f32; 2], [f32; 2]) {
-        if c == ' ' || c == '\u{0}' {
+        if cell.c == ' ' || cell.c == '\u{0}' {
             return ([0.0, 0.0], [0.0, 0.0]);
         }
 
@@ -694,12 +680,18 @@ impl TerminalRenderer {
         // atlas (in `rasterize_rgba`). Skip the ligature map so they are
         // never served via the shaped-glyph path, which would bypass the
         // procedural renderer.
-        if crate::box_drawing::is_box_drawing(c) {
-            return self.resolve_glyph_uv_raw(device, queue, c, flags);
+        if crate::box_drawing::is_box_drawing(cell.c) {
+            return self.resolve_glyph_uv_raw(
+                resources.device,
+                resources.queue,
+                cell.c,
+                cell.flags,
+            );
         }
 
-        if let Some(info) = ligature_map.get(&(line, column)) {
-            let entry = self.atlas.get_or_insert_shaped(queue, info.cache_key, info.glyph_span);
+        if let Some(info) = ligature_map.get(&(cell.line, cell.column)) {
+            let entry =
+                self.atlas.get_or_insert_shaped(resources.queue, info.cache_key, info.glyph_span);
 
             if info.glyph_span > 1 {
                 // Split UV horizontally: each cell gets its slice of the
@@ -714,7 +706,7 @@ impl TerminalRenderer {
                 (entry.uv_min, entry.uv_max)
             }
         } else {
-            self.resolve_glyph_uv_raw(device, queue, c, flags)
+            self.resolve_glyph_uv_raw(resources.device, resources.queue, cell.c, cell.flags)
         }
     }
 
@@ -779,15 +771,13 @@ fn boost_srgb_brightness(srgb: [f32; 4]) -> [f32; 4] {
 /// Compute grid dimensions from viewport size and cell size.
 ///
 /// Returns at least 1 column and 1 row.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    reason = "viewport as f32 then divided by cell size yields a small positive value that fits in u16; precision loss from u32→f32 is irrelevant at terminal grid scales"
-)]
 fn compute_grid_size(viewport: (u32, u32), cell: CellSize) -> GridSize {
-    let cols = if cell.width > 0.0 { (viewport.0 as f32 / cell.width) as u16 } else { 1 };
-    let rows = if cell.height > 0.0 { (viewport.1 as f32 / cell.height) as u16 } else { 1 };
+    let viewport_width = viewport_axis_f32(viewport.0);
+    let viewport_height = viewport_axis_f32(viewport.1);
+    let cols =
+        if cell.width > 0.0 { render_units_in_extent(viewport_width, cell.width) } else { 1 };
+    let rows =
+        if cell.height > 0.0 { render_units_in_extent(viewport_height, cell.height) } else { 1 };
     GridSize { cols: cols.max(1), rows: rows.max(1) }
 }
 
@@ -809,19 +799,11 @@ fn apply_dim(color: &mut [f32; 4]) {
 /// Convert a single linear channel to sRGB space.
 ///
 /// This is the inverse of [`srgb_channel_to_linear`].
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "clarity over micro-optimisation for the standard sRGB transfer function"
-)]
 fn linear_to_srgb_channel(l: f32) -> f32 {
-    if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }
+    if l <= 0.003_130_8 { l * 12.92 } else { l.powf(1.0 / 2.4).mul_add(1.055, -0.055) }
 }
 
 /// Convert a single sRGB channel to linear space.
-#[allow(
-    clippy::suboptimal_flops,
-    reason = "clarity over micro-optimisation for the standard sRGB transfer function"
-)]
 fn srgb_channel_to_linear(s: f32) -> f32 {
     if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
 }
@@ -948,10 +930,6 @@ fn detect_styled_runs(cells: &[CollectedCell]) -> Vec<StyledRun> {
 }
 
 /// Insert all spanned columns for a multi-cell ligature glyph into `map`.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "span_idx iterates 0..glyph_span (u8), so always fits in u8"
-)]
 fn insert_multi_cell_glyph(map: &mut LigatureMap, line: i32, col: usize, glyph: &ShapedRunGlyph) {
     for span_idx in 0..usize::from(glyph.glyph_span) {
         map.insert(
@@ -959,7 +937,7 @@ fn insert_multi_cell_glyph(map: &mut LigatureMap, line: i32, col: usize, glyph: 
             LigatureCellInfo {
                 cache_key: glyph.cache_key,
                 glyph_span: glyph.glyph_span,
-                cell_index: span_idx as u8,
+                cell_index: u8::try_from(span_idx).unwrap_or(u8::MAX),
             },
         );
     }
@@ -979,10 +957,12 @@ fn is_contextual_alternate(
     run: &StyledRun,
 ) -> bool {
     chars.get(glyph.col_offset).is_some_and(|&c| {
-        atlas.shape_single_cache_key(c, run.bold, run.italic).is_some_and(|solo_key| {
-            solo_key.font_id != glyph.cache_key.font_id
-                || solo_key.glyph_id != glyph.cache_key.glyph_id
-        })
+        atlas
+            .shape_single_cache_key(c, GlyphStyle { bold: run.bold, italic: run.italic })
+            .is_some_and(|solo_key| {
+                solo_key.font_id != glyph.cache_key.font_id
+                    || solo_key.glyph_id != glyph.cache_key.glyph_id
+            })
     })
 }
 
@@ -1000,15 +980,12 @@ fn is_contextual_alternate(
 /// function detects that pattern and merges the group into a single
 /// multi-cell entry so the renderer can split the visual glyph across
 /// the correct cells.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "phantom_count is bounded by glyph count per run, which fits in u8"
-)]
 fn build_ligature_map(runs: &[StyledRun], atlas: &mut GlyphAtlas) -> LigatureMap {
     let mut map = LigatureMap::new();
 
     for run in runs {
-        let shaped = atlas.shape_run(&run.text, run.bold, run.italic).to_vec();
+        let shaped =
+            atlas.shape_run(&run.text, GlyphStyle { bold: run.bold, italic: run.italic }).to_vec();
         let chars: Vec<char> = run.text.chars().collect();
 
         let mut i = 0;
@@ -1059,11 +1036,8 @@ fn build_ligature_map(runs: &[StyledRun], atlas: &mut GlyphAtlas) -> LigatureMap
                     && is_contextual_alternate(atlas, next, &chars, run)
             });
             if let Some(visual) = visual {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "phantom_count is bounded by glyph count per run, fits u8"
-                )]
-                let total_span = (phantom_count + 1).min(255) as u8;
+                let total_span =
+                    u8::try_from((phantom_count + 1).min(usize::from(u8::MAX))).unwrap_or(u8::MAX);
                 let merged = ShapedRunGlyph {
                     cache_key: visual.cache_key,
                     col_offset: phantom_start_col,

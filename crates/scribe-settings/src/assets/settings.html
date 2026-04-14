@@ -77,6 +77,13 @@
         </svg>
         Updates
       </div>
+      <div class="nav-item" data-tab="notifications">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+          <path d="M13.73 21a2 2 0 01-3.46 0"/>
+        </svg>
+        Notifications
+      </div>
     </div>
     <div class="sidebar-footer">Scribe v0.1.0</div>
   </div>
@@ -636,7 +643,7 @@
           <div class="setting-row">
             <div class="setting-info">
               <div class="setting-label">Preserve AI Scrollback</div>
-              <div class="setting-desc">Block scrollback-clear sequences from AI sessions (may cause duplicate content)</div>
+              <div class="setting-desc">Block AI scrollback wipes while trimming duplicate redraw history</div>
             </div>
             <div class="toggle on" data-key="terminal.preserve_ai_scrollback">
               <div class="toggle-knob"></div>
@@ -1329,6 +1336,36 @@
             <div class="segmented-control" data-key="update.channel">
               <div class="segment-opt active" data-value="stable">Stable</div>
               <div class="segment-opt" data-value="beta">Beta</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="page-notifications" class="content-page">
+      <div class="page-title">Notifications</div>
+      <div class="page-subtitle">Desktop notifications for AI session state changes</div>
+
+      <div class="section-group">
+        <div class="section-label">Desktop Notifications</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Enable Notifications</div>
+              <div class="setting-desc">Show a desktop notification when an AI session finishes processing</div>
+            </div>
+            <div class="toggle on" data-key="notifications.enabled">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Notify When</div>
+              <div class="setting-desc">When window is unfocused, or also when the session is on a background tab</div>
+            </div>
+            <div class="segmented-control" data-key="notifications.condition">
+              <div class="segment-opt active" data-value="when_unfocused">Window unfocused</div>
+              <div class="segment-opt" data-value="when_unfocused_or_background_tab">Background tab</div>
             </div>
           </div>
         </div>

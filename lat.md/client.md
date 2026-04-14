@@ -36,7 +36,7 @@ The cache stores the last-built instances along with cursor blink visibility, te
 
 Normal live sessions receive the raw synchronized-update markers from the server, and the client decides redraw pacing from pane-local committed-frame queues instead of from raw PTY delivery order alone.
 
-[[crates/scribe-client/src/main.rs#App#handle_pty_output]] hands incoming PTY bytes to [[crates/scribe-client/src/pane.rs#Pane#queue_output_frames]], which preserves raw `CSI ? 2026 h/l` frame boundaries across message splits before enqueuing the resulting raw frames on the pane. [[crates/scribe-client/src/main.rs#App#handle_redraw]] still lets light traffic present one committed burst per frame, while [[crates/scribe-client/src/main.rs#App#about_to_wait]] switches winit to `ControlFlow::Poll` whenever queued output remains so redraws cannot stall behind a long user-event burst. The pane-local VTE processor still handles the actual synchronized-update buffering, and [[crates/scribe-client/src/main.rs#App#flush_expired_sync_updates]] still flushes stalled sync blocks on timeout so committed content cannot stay hidden forever.
+[[crates/scribe-client/src/main.rs#App#handle_pty_output]] hands incoming PTY bytes to [[crates/scribe-client/src/pane.rs#Pane#queue_output_frames]], which preserves raw `CSI ? 2026 h/l` frame boundaries across message splits before enqueuing the resulting raw frames on the pane. [[crates/scribe-client/src/main.rs#App#handle_redraw]] still lets light traffic present one committed burst per frame, while [[crates/scribe-client/src/main.rs#App#about_to_wait]] switches winit to `ControlFlow::Poll` whenever queued output remains so redraws cannot stall behind a long user-event burst. The pane-local VTE processor still handles the actual synchronized-update buffering, and [[crates/scribe-client/src/main.rs#App#flush_expired_sync_updates]] now mirrors VTE's 150 ms timeout for raw frames that are still buffered ahead of the pane-local processor, stripping the opening BSU marker before replay so a timed-out block cannot re-enter sync mode and leak bytes indefinitely.
 
 Codex hook-log cleanup now stays server-side. The client no longer reflows blank viewport rows after render because that heuristic could not distinguish hidden hook gaps from legitimate Codex layout spacing and could move the live prompt away from the pane bottom.
 
@@ -52,7 +52,9 @@ Codex panes still keep `last_sent_grid = None` during reconnect, but they only q
 
 ### Padding
 
-Padding is computed per-pane based on edge adjacency. Internal edges (adjacent to sibling panes) have zero padding; external edges (bordering the viewport) use the configured content padding values.
+Padding is computed per-pane based on edge adjacency via [[crates/scribe-client/src/pane.rs#effective_padding]]. Internal edges get zero padding; external edges use configured values.
+
+All padding values are multiplied by the display scale factor for physical-pixel rendering (see [[rendering#Glyph Atlas#DPI Scaling]]).
 
 ## Layout
 
@@ -89,6 +91,8 @@ Each tab in a workspace owns a `LayoutTree` for its panes, a focused pane ID, an
 GPU-rendered tab bar in [[crates/scribe-client/src/tab_bar.rs]] generating [[crates/scribe-client/src/tab_bar.rs#TabBarColors]] from [[crates/scribe-client/src/tab_bar.rs#TabData]] using the same glyph atlas as the terminal grid.
 
 [[crates/scribe-client/src/tab_bar.rs#TabBarColors]] is derived from `ChromeColors` and holds background, active background, text, separator, gradient-top, and accent color values. [[crates/scribe-client/src/tab_bar.rs#TabData]] carries per-tab title, active flag, and optional AI indicator color. The background is rendered as a two-tone vertical gradient (lighter top half, base bottom half) via `build_tab_bar_bg`. The active tab receives a uniform highlight color and a 2px accent indicator on its bottom edge. An AI state dot (from `TabData.ai_indicator`) is rendered in the tab when a session has an active AI state. For Codex sessions, the title prefers the last hook-emitted task label while that label is active, then falls back to the normal shell title. Tab titles are truncated to fit the available column width. In multi-workspace mode, named workspaces display a badge pill with a deterministic accent color; unnamed workspaces show no badge.
+
+Because tab chrome and tab glyphs are collected into the same `CellInstance` buffer and drawn in one render pass, [[crates/scribe-client/src/main.rs#build_all_instances]] must append the tab-bar background before the tab text so the labels are composited on top of their tabs.
 
 ## Input
 
@@ -165,7 +169,7 @@ Automation requests use that same path in both directions. `scribe-cli action ..
 
 Starts and connects to the server process, with a retry loop waiting up to 5 seconds for the socket to appear.
 
-On Linux, the client starts the server via `systemctl --user start scribe-server`. On macOS, release builds install `com.scribe.server.plist` into `~/Library/LaunchAgents/` with the current bundle's `scribe-server` path, re-bootstrap the job if that path changes, and then `kickstart` it. If a socket already exists, the client inspects the connected server's peer PID and restarts it when the running executable path differs from the current bundle or when the installed server binary is newer than the running process start time, which lets manual DMG replacements hot-reload the background server on next launch. Dev builds without a bundle fall back to spawning the server binary directly.
+On Linux, the client starts the server via `systemctl --user start scribe-server`. On macOS, release builds install `com.scribe.server.plist` into `~/Library/LaunchAgents/` with the current bundle's `scribe-server` path, re-bootstrap the job if that path changes, and then `kickstart` it. If a socket already exists, the client inspects the connected server's peer PID and restarts it when the running executable path differs from the current bundle or when the installed server binary is newer than the running process start time, which lets manual DMG replacements hot-reload the background server on next launch. When that stale-server refresh fires, the client prefers a direct `scribe-server --upgrade` spawn over `launchctl kickstart -k` so the new server performs a handoff with the still-running old one; kickstart only terminates the old server when launchd still manages it, and after a DMG drop-replace that old server is typically a launchd orphan whose flock a fresh non-upgrade child would crash-loop against. `launchctl` remains the fallback if the direct spawn fails. Dev builds without a bundle fall back to spawning the server binary directly.
 
 ## Selection
 
@@ -195,9 +199,19 @@ Focus borders are rendered as 2px accent-colored quads on the focused pane's lea
 
 The [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker]] tracks per-session AI state with pulsing border animations.
 
+The shared animation loop uses a generation token per spawned thread, so fast stop/start cycles from AI pulses, scrollbar fades, or stalled-sync recovery retire older timer threads instead of letting them keep emitting `AnimationTick`.
+
 Priority order: PermissionPrompt > WaitingForInput > IdlePrompt > Error > Processing. Each state has configurable color, pulse frequency, tab indicator, and pane border settings. Error state decays over a timeout. Attention states (IdlePrompt, WaitingForInput, PermissionPrompt) clear on keystroke. Both `IdlePrompt` and `WaitingForInput` share the same `waiting_for_input` indicator config (color, pulse, timeout).
 
 On reconnect, active AI state is populated from `SessionInfo.ai_state` during handle_session_list so indicators appear immediately without waiting for the per-session `AiStateChanged` messages from the server's `send_stored_metadata` path. `SessionInfo.ai_provider_hint` is restored separately so clipboard cleanup and other provider-aware behavior survive reconnect even when no visible indicator should be shown. When available, `SessionInfo.ai_state.conversation_id` is also used to seed per-pane AI resume bindings so restored windows attempt targeted resume of prior provider sessions.
+
+## Desktop Notifications
+
+The [[crates/scribe-client/src/notifications.rs#NotificationTracker]] fires OS desktop notifications when an AI session transitions from `Processing` to an attention state (`IdlePrompt`, `WaitingForInput`, `PermissionPrompt`).
+
+The tracker stores the previous `AiState` per session and is called from `handle_ai_state_changed` before the `AiStateTracker` update. When a `Processing → attention` transition is detected, a `NotificationPayload` is returned and `maybe_fire_notification` checks focus suppression based on [[crates/scribe-common/src/config.rs#NotifyCondition]]: `WhenUnfocused` suppresses when the window is focused regardless of tab, `WhenUnfocusedOrBackgroundTab` only suppresses when both the window is focused and the session is the active tab. The notification summary includes the workspace name or project root basename and the state label (Ready, Waiting for input, Permission required). The body carries the user's last submitted prompt text from `pane.latest_prompt`.
+
+On Linux, [[crates/scribe-client/src/notifications.rs#fire_os_notification]] uses `notify-rust` with D-Bus, tags notifications with the active install flavor (`scribe` vs `scribe-dev`) for desktop-entry/icon attribution, and spawns a thread that blocks on `wait_for_action` — clicking the notification sends `UiEvent::RunAction { FocusSession }` through the `EventLoopProxy`. Linux intentionally skips `request_user_attention` here because on X11 the urgency hint can become a second shell-level "`<app>` is ready" notification on top of the explicit desktop notification. On macOS, `notify-rust` does not support click callbacks, so the tracker uses a focus-on-activate fallback: `set_last_notified` records the session ID when a notification fires, and when macOS activates the app after a click, the `Focused(true)` handler calls `take_pending_focus` to consume the pending session and dispatch `handle_focus_session`. A 30-second expiry window prevents stale notifications from switching tabs. The [[crates/scribe-common/src/protocol.rs#AutomationAction]] `FocusSession` variant routes through the existing automation dispatch path: `execute_automation_action` calls `handle_focus_session`, which looks up the session via `session_to_pane`, switches workspace and tab, and raises the OS window with `focus_window`. Notification settings are configurable in the settings window under the Notifications page.
 
 ## Prompt Bar
 

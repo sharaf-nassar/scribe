@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::VoidListener;
@@ -22,16 +22,24 @@ use crate::scrollbar::ScrollbarState;
 use crate::selection::SelectionRange;
 use crate::split_scroll::SplitScrollState;
 
+/// Mirror vte's synchronized-update timeout for raw frames still buffered
+/// ahead of the pane-local ANSI processor.
+const RAW_SYNC_TIMEOUT: Duration = Duration::from_millis(150);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PromptUiState {
+    /// Whether the current prompt has `click_events=1` enabled (OSC 133;A).
+    pub click_events: bool,
+    /// Whether the user has dismissed the prompt bar for this pane.
+    pub dismissed: bool,
+}
+
 /// State for a single terminal pane.
-#[allow(clippy::struct_excessive_bools, reason = "pane has legitimate independent boolean flags")]
 pub struct Pane {
     pub session_id: SessionId,
     pub launch_binding: LaunchBinding,
-    #[allow(dead_code, reason = "used by tab bar rendering and workspace management")]
     pub workspace_id: WorkspaceId,
-    #[allow(dead_code, reason = "used by tab bar text rendering")]
     pub workspace_name: Option<String>,
-    #[allow(dead_code, reason = "used by tab bar text rendering")]
     pub title: String,
     pub shell_name: String,
     /// Preferred tab label while Codex is actively working on a task.
@@ -50,10 +58,6 @@ pub struct Pane {
     pub grid: GridSize,
     /// Which edges of this pane border the viewport (vs. another pane).
     pub edges: PaneEdges,
-    #[allow(
-        dead_code,
-        reason = "read by scrollbar rendering and hit-testing, wired in later tasks"
-    )]
     pub scrollbar_state: ScrollbarState,
     /// Set to `true` whenever PTY output, resize, or scroll changes the
     /// terminal state. Cleared after the instances are rebuilt. Starts as
@@ -81,8 +85,6 @@ pub struct Pane {
     /// Used for prompt jumping and scrollbar indicators. Stored as
     /// "lines from the very top of the scrollback" (0 = oldest line).
     pub prompt_marks: Vec<usize>,
-    /// Whether the current prompt has `click_events=1` enabled (OSC 133;A).
-    pub click_events: bool,
     /// Absolute position where the prompt input starts (OSC 133;B mark).
     /// `Some((absolute_line, column))` while waiting for user input.
     /// Cleared when a command starts or ends (OSC 133;C / D).
@@ -94,23 +96,29 @@ pub struct Pane {
     /// Streaming raw-frame splitter that preserves `CSI ? 2026 h/l`
     /// boundaries across arbitrary PTY IPC chunking.
     sync_output_frames: SyncUpdateFrameSplitter,
+    /// Timeout for raw synchronized-update bytes that have not reached the
+    /// pane-local ANSI processor yet.
+    sync_output_deadline: Option<Instant>,
     /// Text of the first user prompt submitted in this AI session.
-    #[allow(dead_code, reason = "read by prompt bar renderer in a later task")]
     pub first_prompt: Option<String>,
     /// Text of the most recent user prompt (differs from first after 2+ prompts).
-    #[allow(dead_code, reason = "read by prompt bar renderer in a later task")]
     pub latest_prompt: Option<String>,
     /// Total number of prompts received in this session.
     pub prompt_count: u32,
     /// Last-seen `conversation_id` for detecting session resets.
-    #[allow(dead_code, reason = "read by prompt bar renderer in a later task")]
     pub last_conversation_id: Option<String>,
-    /// Whether the user has dismissed the prompt bar for this pane.
-    /// Cleared when a new conversation starts or prompts are reset.
-    pub prompt_bar_dismissed: bool,
+    /// Prompt-bar interaction flags that affect hit testing and visibility.
+    pub prompt_ui: PromptUiState,
     /// Split-scroll state: `Some` when the pane is scrolled up with the
     /// live-bottom pin active (AI panes with `scroll_pin` enabled).
     pub split_scroll: Option<SplitScrollState>,
+}
+
+#[derive(Clone, Copy)]
+pub struct PaneLayoutState {
+    pub rect: Rect,
+    pub grid: GridSize,
+    pub edges: PaneEdges,
 }
 
 /// Result of feeding PTY bytes into a pane's ANSI processor.
@@ -146,18 +154,13 @@ impl Pane {
     ///
     /// `rect` is the pixel area assigned to this pane by the layout engine.
     /// `grid` is the initial grid size computed from the content area.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "pane construction already needs layout + launch binding"
-    )]
     pub fn new(
-        rect: Rect,
-        grid: GridSize,
+        layout: PaneLayoutState,
         session_id: SessionId,
         workspace_id: WorkspaceId,
-        edges: PaneEdges,
         launch_binding: LaunchBinding,
     ) -> Self {
+        let PaneLayoutState { rect, grid, edges } = layout;
         let dims = TermDims { cols: usize::from(grid.cols), lines: usize::from(grid.rows) };
         let term = Term::new(alacritty_terminal::term::Config::default(), &dims, VoidListener);
 
@@ -186,15 +189,15 @@ impl Pane {
             last_selection: None,
             last_sent_grid: None,
             prompt_marks: Vec::new(),
-            click_events: false,
             input_start: None,
             pending_output_frames: VecDeque::new(),
             sync_output_frames: SyncUpdateFrameSplitter::new(),
+            sync_output_deadline: None,
             first_prompt: None,
             latest_prompt: None,
             prompt_count: 0,
             last_conversation_id: None,
-            prompt_bar_dismissed: false,
+            prompt_ui: PromptUiState::default(),
             split_scroll: None,
         }
     }
@@ -203,6 +206,9 @@ impl Pane {
     /// boundaries across IPC message splits.
     pub fn queue_output_frames(&mut self, bytes: &[u8]) -> bool {
         let frames = self.sync_output_frames.split_frames(bytes);
+        self.sync_output_deadline = self.sync_output_frames.inside_sync().then(|| {
+            self.sync_output_deadline.unwrap_or_else(|| Instant::now() + RAW_SYNC_TIMEOUT)
+        });
         if frames.is_empty() {
             return false;
         }
@@ -215,6 +221,7 @@ impl Pane {
     pub fn reset_output_queue(&mut self) {
         self.pending_output_frames.clear();
         self.sync_output_frames = SyncUpdateFrameSplitter::new();
+        self.sync_output_deadline = None;
     }
 
     /// Feed raw PTY output bytes into the ANSI processor / terminal.
@@ -233,19 +240,39 @@ impl Pane {
     /// Returns `true` when buffered synchronized bytes were committed to the
     /// terminal and the pane should be redrawn.
     pub fn flush_sync_timeout(&mut self, now: Instant) -> bool {
-        let Some(deadline) = self.sync_deadline() else { return false };
-        if deadline > now {
-            return false;
+        let raw_timed_out = self.sync_output_deadline.is_some_and(|deadline| deadline <= now);
+        let mut flushed_any = false;
+
+        if raw_timed_out {
+            self.sync_output_deadline = None;
+            if let Some(bytes) = self.sync_output_frames.flush_timed_out() {
+                self.feed_output(&bytes);
+                flushed_any = true;
+            }
         }
 
-        self.ansi_processor.stop_sync(&mut self.term);
-        self.content_dirty = true;
-        true
+        let parser_timed_out = self
+            .ansi_processor
+            .sync_timeout()
+            .sync_timeout()
+            .is_some_and(|deadline| deadline <= now);
+        if parser_timed_out {
+            self.ansi_processor.stop_sync(&mut self.term);
+            self.content_dirty = true;
+            flushed_any = true;
+        }
+
+        flushed_any
     }
 
     /// Deadline for the current synchronized update, if one is pending.
     pub fn sync_deadline(&self) -> Option<Instant> {
-        self.ansi_processor.sync_timeout().sync_timeout()
+        match (self.sync_output_deadline, self.ansi_processor.sync_timeout().sync_timeout()) {
+            (Some(raw), Some(parser)) => Some(raw.min(parser)),
+            (Some(raw), None) => Some(raw),
+            (None, Some(parser)) => Some(parser),
+            (None, None) => None,
+        }
     }
 
     /// Whether a synchronized update is currently buffering terminal output.
@@ -306,23 +333,11 @@ impl Pane {
         tab_bar_height: f32,
         prompt_bar_height: f32,
         padding: &ContentPadding,
+        scale_factor: f32,
     ) -> (f32, f32) {
-        let eff = effective_padding(padding, self.edges);
-        let tbh = if self.edges.top { tab_bar_height } else { 0.0 };
+        let eff = effective_padding(padding, self.edges, scale_factor);
+        let tbh = if self.edges.top() { tab_bar_height } else { 0.0 };
         (self.rect.x + eff.left, self.rect.y + tbh + prompt_bar_height + eff.top)
-    }
-
-    /// Return the content area (below tab bar) as a viewport size tuple.
-    #[allow(dead_code, reason = "public API for pane viewport queries")]
-    #[allow(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "pane rect dimensions are small non-negative pixel values that fit in u32"
-    )]
-    pub fn content_viewport(&self, tab_bar_height: f32) -> (u32, u32) {
-        let tbh = if self.edges.top { tab_bar_height } else { 0.0 };
-        let h = (self.rect.height - tbh).max(1.0);
-        (self.rect.width.max(1.0) as u32, h as u32)
     }
 
     /// Prefer a Codex task label over the terminal title when one is active.
@@ -335,7 +350,7 @@ impl Pane {
     /// Returns 0.0 when `prompt_bar` is disabled or no prompts have been received.
     /// One prompt = 1 line + padding. Two or more = 2 lines + padding.
     pub fn prompt_bar_height(&self, cell_height: f32, prompt_bar_enabled: bool) -> f32 {
-        if !prompt_bar_enabled || self.prompt_bar_dismissed || self.prompt_count == 0 {
+        if !prompt_bar_enabled || self.prompt_ui.dismissed || self.prompt_count == 0 {
             return 0.0;
         }
         crate::prompt_bar::prompt_bar_height(self.prompt_count, cell_height)
@@ -343,43 +358,66 @@ impl Pane {
 }
 
 /// Compute effective content padding for a pane, zeroing out padding on
-/// internal edges (those adjacent to a sibling pane).
-pub fn effective_padding(padding: &ContentPadding, edges: PaneEdges) -> ContentPadding {
+/// internal edges (those adjacent to a sibling pane) and scaling by the
+/// display scale factor for physical-pixel rendering.
+pub fn effective_padding(
+    padding: &ContentPadding,
+    edges: PaneEdges,
+    scale_factor: f32,
+) -> ContentPadding {
     ContentPadding {
-        top: if edges.top { padding.top } else { 0.0 },
-        right: if edges.right { padding.right } else { 0.0 },
-        bottom: if edges.bottom { padding.bottom } else { 0.0 },
-        left: if edges.left { padding.left } else { 0.0 },
+        top: if edges.top() { padding.top * scale_factor } else { 0.0 },
+        right: if edges.right() { padding.right * scale_factor } else { 0.0 },
+        bottom: if edges.bottom() { padding.bottom * scale_factor } else { 0.0 },
+        left: if edges.left() { padding.left * scale_factor } else { 0.0 },
     }
 }
 
 /// Compute the grid size for a pane's content area.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "layout requires rect, two cell dims, two bar heights, and padding"
-)]
-pub fn compute_pane_grid(
-    rect: Rect,
-    cell_width: f32,
-    cell_height: f32,
-    tab_bar_height: f32,
-    prompt_bar_height: f32,
-    padding: &ContentPadding,
-) -> GridSize {
+pub struct PaneGridRequest<'a> {
+    pub rect: Rect,
+    pub cell_size: (f32, f32),
+    pub tab_bar_height: f32,
+    pub prompt_bar_height: f32,
+    pub padding: &'a ContentPadding,
+}
+
+pub fn compute_pane_grid(request: &PaneGridRequest<'_>) -> GridSize {
+    let rect = request.rect;
+    let (cell_width, cell_height) = request.cell_size;
+    let padding = request.padding;
     let content_w = (rect.width - padding.left - padding.right).max(1.0);
-    let content_h =
-        (rect.height - tab_bar_height - prompt_bar_height - padding.top - padding.bottom).max(1.0);
+    let content_h = (rect.height
+        - request.tab_bar_height
+        - request.prompt_bar_height
+        - padding.top
+        - padding.bottom)
+        .max(1.0);
     grid_from_pixels(content_w, content_h, cell_width, cell_height)
 }
 
+fn grid_axis_units(extent: f32, cell_size: f32) -> u16 {
+    if cell_size <= 0.0 || !extent.is_finite() || extent <= 0.0 {
+        return 1;
+    }
+
+    let mut low = 0u16;
+    let mut high = u16::MAX;
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if f32::from(mid) * cell_size <= extent {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+
+    low.max(1)
+}
+
 /// Compute grid dimensions from pixel dimensions and cell size.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "pixel / cell_size yields a small positive value fitting in u16"
-)]
 fn grid_from_pixels(width: f32, height: f32, cell_w: f32, cell_h: f32) -> GridSize {
-    let cols = if cell_w > 0.0 { (width / cell_w) as u16 } else { 1 };
-    let rows = if cell_h > 0.0 { (height / cell_h) as u16 } else { 1 };
-    GridSize { cols: cols.max(1), rows: rows.max(1) }
+    let cols = grid_axis_units(width, cell_w);
+    let rows = grid_axis_units(height, cell_h);
+    GridSize { cols, rows }
 }
