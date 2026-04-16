@@ -505,6 +505,7 @@ fn apply_notifications_key(
             let s = value.as_str().ok_or("notifications.condition must be a string")?;
             config.notifications.condition = match s {
                 "when_unfocused" => scribe_common::config::NotifyCondition::WhenUnfocused,
+                "always" => scribe_common::config::NotifyCondition::Always,
                 "when_unfocused_or_background_tab" => {
                     scribe_common::config::NotifyCondition::WhenUnfocusedOrBackgroundTab
                 }

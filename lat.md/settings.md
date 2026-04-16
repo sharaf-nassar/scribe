@@ -74,7 +74,7 @@ Controls the auto-update behavior: `enabled` (bool), `check_interval` (integer h
 
 Desktop notification settings: `enabled` (bool) and `condition` (when to fire).
 
-`enabled` (default true) toggles notifications on or off. `condition` selects `when_unfocused` (default, only when the OS window lacks focus) or `when_unfocused_or_background_tab` (also when the session is on a background tab in a focused window).
+`enabled` (default true) toggles notifications on or off. `condition` selects `when_unfocused` (default, only when the OS window lacks focus), `when_unfocused_or_background_tab` (also when the session is on a background tab in a focused window), or `always` (never suppress for focus reasons).
 
 ### Workspace Keys
 

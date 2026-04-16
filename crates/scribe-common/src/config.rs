@@ -1369,6 +1369,8 @@ pub enum NotifyCondition {
     /// Only fire when the OS window is not focused.
     #[default]
     WhenUnfocused,
+    /// Fire even when the session is already visible in the focused window.
+    Always,
     /// Also fire when the session is on a background tab.
     WhenUnfocusedOrBackgroundTab,
 }

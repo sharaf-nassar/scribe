@@ -2679,6 +2679,7 @@ impl App {
             NotifyCondition::WhenUnfocusedOrBackgroundTab => {
                 self.focus.window_focused && session_is_focused
             }
+            NotifyCondition::Always => false,
         };
         if suppress {
             return;
