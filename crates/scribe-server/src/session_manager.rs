@@ -397,7 +397,9 @@ impl SessionManager {
 
             // Create Term with the session's dimensions.
             let dimensions = TermDimensions { cols: usize::from(cols), lines: usize::from(rows) };
-            let term = Term::new(term_config, &dimensions, event_listener);
+            let mut term = Term::new(term_config, &dimensions, event_listener);
+
+            let handoff_snapshot = apply_handoff_content(handoff_session, &mut term, scrollback);
 
             // Wrap the received fd for async I/O.
             let resize_fd =
@@ -424,6 +426,7 @@ impl SessionManager {
                 child_pid = handoff_session.child_pid,
                 cols,
                 rows,
+                v5_replay = handoff_session.session_replay.is_some(),
                 "restored session from handoff"
             );
 
@@ -447,7 +450,7 @@ impl SessionManager {
                 workspace_id: handoff_session.workspace_id,
                 shell_name: handoff_session.shell_name.clone(),
                 pty: None,
-                handoff_snapshot: handoff_session.snapshot.clone(),
+                handoff_snapshot,
                 title: handoff_session.title.clone(),
                 codex_task_label: handoff_session.codex_task_label.clone(),
                 cwd: handoff_session.cwd.clone(),
@@ -467,6 +470,47 @@ impl SessionManager {
             shell_integration_enabled: std::sync::atomic::AtomicBool::new(true),
         })
     }
+}
+
+/// Populate a freshly-restored `Term` with the pre-handoff content.
+///
+/// - v5 path: decompress the `SessionReplay` and feed it through
+///   `AnsiProcessor` into `term`, then trim the pseudo-scrollback pushed in
+///   by the encoder's leading ED 2. Returns `None` because the Term now
+///   owns the content.
+/// - v4 fallback (or if v5 decompression fails): return the legacy
+///   `ScreenSnapshot` so the first attach can deliver it.
+fn apply_handoff_content(
+    handoff_session: &crate::handoff::HandoffSession,
+    term: &mut Term<ScribeEventListener>,
+    scrollback: usize,
+) -> Option<ScreenSnapshot> {
+    let Some(replay) = handoff_session.session_replay.as_ref() else {
+        return handoff_session.snapshot.clone();
+    };
+
+    let bytes = match scribe_common::screen_replay::decompress_session_replay(replay) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %handoff_session.session_id,
+                "v5 replay decompress failed, falling back to legacy snapshot: {e}"
+            );
+            return handoff_session.snapshot.clone();
+        }
+    };
+
+    let mut processor: AnsiProcessor = AnsiProcessor::new();
+    processor.advance(term, &bytes);
+
+    // Trim the pseudo-scrollback the encoder's leading ED 2 pushes into
+    // history on a fresh grid. The snapshot's true scrollback_rows survives.
+    let kept = (replay.scrollback_rows as usize).min(scrollback);
+    let grid = term.grid_mut();
+    grid.update_history(kept);
+    grid.update_history(scrollback);
+
+    None
 }
 
 fn session_geometry(size: Option<TerminalSize>) -> SessionGeometry {

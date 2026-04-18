@@ -207,10 +207,20 @@ pub enum ServerMessage {
         session_id: SessionId,
         data: Vec<u8>,
     },
-    /// Full screen state for reconnect or tab switch.
+    /// Full per-cell screen state, sent in response to `RequestSnapshot`.
+    /// Used by tooling (`scribe-cli`, `scribe-test`) for JSON dumps and
+    /// visual diffs. The reattach path uses `SessionReplay` instead.
     ScreenSnapshot {
         session_id: SessionId,
         snapshot: crate::screen::ScreenSnapshot,
+    },
+    /// zstd-compressed ANSI replay of a session's visible grid + scrollback.
+    /// Sent after `AttachSessions` in place of the legacy per-cell
+    /// `ScreenSnapshot`. The client decompresses the bytes and feeds them
+    /// through its VTE processor to rebuild the pane's `Term` durably.
+    SessionReplay {
+        session_id: SessionId,
+        replay: crate::screen_replay::SessionReplay,
     },
     AiStateChanged {
         session_id: SessionId,
@@ -279,6 +289,12 @@ pub enum ServerMessage {
         /// `None` when no client has connected yet or when upgrading from an
         /// older server that did not persist the tree.
         workspace_tree: Option<WorkspaceTreeNode>,
+        /// Per-workspace metadata (name, accent color, split direction, project
+        /// root) for every workspace referenced by `sessions`. Batched here so
+        /// the reattach flow does not need a per-session `WorkspaceInfo`
+        /// fan-out.
+        #[serde(default)]
+        workspaces: Vec<WorkspaceListEntry>,
     },
     /// Full workspace state sent to client on creation or reconnect.
     WorkspaceInfo {
@@ -436,6 +452,26 @@ pub enum PaneTreeNode {
     },
 }
 
+/// Per-workspace metadata carried in `SessionList` responses.
+///
+/// Replaces the per-session `WorkspaceInfo` fan-out that used to follow every
+/// `AttachSessions` reply. Clients apply one entry per workspace up front so
+/// the attach pipeline can ship session replays in parallel without waiting
+/// for redundant metadata messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceListEntry {
+    pub workspace_id: WorkspaceId,
+    pub name: Option<String>,
+    /// Hex color string (e.g. "#a78bfa") from the rotating accent palette.
+    pub accent_color: String,
+    /// Direction of the split that created this workspace. `None` for the
+    /// initial (unsplit) workspace.
+    pub split_direction: Option<LayoutDirection>,
+    /// Absolute path to the project directory (root + first CWD component).
+    #[serde(default)]
+    pub project_root: Option<PathBuf>,
+}
+
 /// Summary of a live session, sent in `SessionList` responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -453,6 +489,11 @@ pub struct SessionInfo {
     pub codex_task_label: Option<String>,
     /// Last-known working directory (from OSC 7). `None` before first CWD event.
     pub cwd: Option<PathBuf>,
+    /// Current git branch detected for `cwd`. `None` when not in a git repo or
+    /// when `cwd` is unset. Populated once by the server in `SessionList` so
+    /// clients avoid re-deriving it from the CWD on every reattach.
+    #[serde(default)]
+    pub git_branch: Option<String>,
     /// Last-known AI process state (from OSC 1337). `None` when no AI is active.
     #[serde(default)]
     pub ai_state: Option<AiProcessState>,

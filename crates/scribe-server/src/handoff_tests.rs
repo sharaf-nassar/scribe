@@ -8,16 +8,88 @@
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
+use alacritty_terminal::Term;
+use alacritty_terminal::grid::Dimensions;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
+use vte::ansi::Processor as AnsiProcessor;
 
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::SessionContext;
 use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor, ScreenSnapshot};
+use scribe_common::screen_replay::build_session_replay;
+use scribe_pty::event_listener::ScribeEventListener;
 
 use crate::handoff::{HandoffSession, HandoffState};
 use crate::ipc_server::{self, LiveSessionRegistry};
-use crate::session_manager::SessionManager;
+use crate::session_manager::{SessionManager, build_term_config, snapshot_term};
 use crate::workspace_manager::WorkspaceManager;
+
+#[derive(Clone, Copy)]
+struct TestDims {
+    cols: usize,
+    rows: usize,
+}
+
+impl Dimensions for TestDims {
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
+
+/// Build a fresh Term, feed it bytes through `AnsiProcessor`, and return it.
+fn term_with_bytes(bytes: &[u8], cols: usize, rows: usize) -> Term<ScribeEventListener> {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let listener = ScribeEventListener::new(SessionId::new(), tx);
+    let config = build_term_config(100);
+    let mut term = Term::new(config, &TestDims { cols, rows }, listener);
+    let mut processor: AnsiProcessor = AnsiProcessor::new();
+    processor.advance(&mut term, bytes);
+    term
+}
+
+/// Build a single-session `HandoffState` whose payload is a v5 replay built
+/// from the given `Term`.
+fn make_v5_state(term: &Term<ScribeEventListener>) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
+    let snap = snapshot_term(term);
+    let replay = build_session_replay(&snap).expect("build_session_replay");
+
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let session = HandoffSession {
+        session_id: SessionId::new(),
+        workspace_id: WorkspaceId::new(),
+        child_pid: std::process::id(),
+        cols: snap.cols,
+        rows: snap.rows,
+        cell_width: 1,
+        cell_height: 1,
+        snapshot: None,
+        session_replay: Some(replay),
+        title: None,
+        shell_name: String::from("zsh"),
+        codex_task_label: None,
+        cwd: None,
+        context: None,
+        ai_state: None,
+        ai_provider_hint: None,
+    };
+
+    let state = HandoffState {
+        version: 5,
+        sessions: vec![session],
+        workspaces: vec![],
+        workspace_tree: None,
+        windows: vec![],
+    };
+
+    (state, vec![pty.master], vec![pty.slave])
+}
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -65,6 +137,7 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
             cell_width: 1,
             cell_height: 1,
             snapshot: Some(dummy_snapshot(80, 24)),
+            session_replay: None,
             title: None,
             shell_name: String::from("zsh"),
             codex_task_label: None,
@@ -169,7 +242,8 @@ async fn serialize_live_returns_activated_sessions() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(fds.len(), 1);
     assert_eq!(sessions[0].session_id, expected_id);
-    assert!(sessions[0].snapshot.is_some(), "snapshot should be included");
+    assert!(sessions[0].session_replay.is_some(), "v5 sender must populate session_replay");
+    assert!(sessions[0].snapshot.is_none(), "v5 sender must leave legacy snapshot None");
     assert_eq!(sessions[0].shell_name, "zsh");
     assert_eq!(
         sessions[0].context.as_ref().and_then(|context| context.host.as_deref()),
@@ -178,7 +252,10 @@ async fn serialize_live_returns_activated_sessions() {
 }
 
 #[tokio::test]
-async fn attach_prefers_handoff_snapshot_over_blank_term() {
+async fn v4_legacy_handoff_snapshot_is_restored_durably() {
+    // v4 compat path: the sender populated `snapshot` (legacy), not
+    // `session_replay`. On first attach we feed the snapshot through
+    // AnsiProcessor into the Term, then every attach sees the same content.
     let (state, masters, _slaves) = make_handoff_state(1);
     let session_id = state.sessions[0].session_id;
 
@@ -189,28 +266,95 @@ async fn attach_prefers_handoff_snapshot_over_blank_term() {
     ipc_server::activate_pending_sessions(&sm, &wm, &registry).await;
     wait_registry_count(&registry, 1).await;
 
-    // The handoff snapshot had alt_screen=true and cursor_visible=false.
+    // The legacy handoff snapshot had alt_screen=true and cursor_visible=false.
     // A blank Term would have alt_screen=false and cursor_visible=true.
     {
         let live = registry.read().await;
         let session = live.get(&session_id).unwrap();
         assert!(
             session.handoff_snapshot.is_some(),
-            "handoff snapshot should be stored in LiveSession"
+            "v4 handoff snapshot should be stored in LiveSession pending first attach"
         );
     }
 
-    // Simulate what handle_attach_sessions does: take_session_snapshot.
+    // Simulate what handle_attach_sessions does: take_session_replay.
     let term = {
         let live = registry.read().await;
         Arc::clone(&live.get(&session_id).unwrap().term)
     };
-    let snapshot = crate::attach_flow::take_session_snapshot(session_id, &term, &registry).await;
+    let first = crate::attach_flow::take_session_replay(session_id, &term, &registry)
+        .await
+        .expect("first take_session_replay");
+    assert!(first.alt_screen, "first attach should see legacy snapshot (alt_screen=true)");
+    assert!(
+        !first.cursor_visible,
+        "first attach should see legacy snapshot (cursor_visible=false)"
+    );
 
-    assert!(snapshot.alt_screen, "should return handoff snapshot (alt_screen=true)");
-    assert!(!snapshot.cursor_visible, "should return handoff snapshot (cursor_visible=false)");
+    // Second attach MUST see the same content — the snapshot was fed into
+    // the Term durably. This is the regression guard against the
+    // pre-v5 "first-attach-only" bug.
+    let second = crate::attach_flow::take_session_replay(session_id, &term, &registry)
+        .await
+        .expect("second take_session_replay");
+    assert!(
+        second.alt_screen,
+        "second attach must see the durably-restored Term (alt_screen=true)"
+    );
+    assert!(
+        !second.cursor_visible,
+        "second attach must see the durably-restored Term (cursor_visible=false)"
+    );
+}
 
-    // Second call should fall back to the live Term (handoff snapshot consumed).
-    let snapshot2 = crate::attach_flow::take_session_snapshot(session_id, &term, &registry).await;
-    assert!(!snapshot2.alt_screen, "handoff consumed; blank Term has alt_screen=false");
+#[tokio::test]
+async fn restore_from_handoff_v5_replay_populates_term_durably() {
+    // Source Term with identifiable pre-handoff content.
+    let src = term_with_bytes(b"pre-handoff-scrollback\r\nline two\r\n", 80, 24);
+    let src_snap = snapshot_term(&src);
+
+    let (state, masters, _slaves) = make_v5_state(&src);
+    let session_id = state.sessions[0].session_id;
+
+    let sm = SessionManager::restore_from_handoff(&state, masters, 100).unwrap();
+
+    // v5 path must NOT store a handoff_snapshot — the Term carries state.
+    let restored = sm.take_session(session_id).await.expect("restored session");
+    assert!(
+        restored.handoff_snapshot.is_none(),
+        "v5 replay restore must leave handoff_snapshot None; the Term owns the state"
+    );
+
+    // Snapshotting the restored Term must reproduce the source's cells.
+    let restored_term = restored.term.lock().await;
+    let after = snapshot_term(&restored_term);
+    assert_eq!(after.cells, src_snap.cells, "visible grid must match source");
+    assert_eq!(after.scrollback, src_snap.scrollback, "scrollback must match source");
+}
+
+#[tokio::test]
+async fn restore_from_handoff_v5_restored_term_survives_multiple_snapshots() {
+    // Regression guard against the latent "Term empty after first attach"
+    // bug: with v5, the Term is durably populated, so repeated
+    // snapshot_term() calls must each produce the same cells.
+    let src = term_with_bytes(b"durable content\r\n", 80, 24);
+    let src_snap = snapshot_term(&src);
+
+    let (state, masters, _slaves) = make_v5_state(&src);
+    let session_id = state.sessions[0].session_id;
+
+    let sm = SessionManager::restore_from_handoff(&state, masters, 100).unwrap();
+    let restored = sm.take_session(session_id).await.expect("restored session");
+
+    let first = {
+        let guard = restored.term.lock().await;
+        snapshot_term(&guard)
+    };
+    let second = {
+        let guard = restored.term.lock().await;
+        snapshot_term(&guard)
+    };
+
+    assert_eq!(first.cells, src_snap.cells, "first snapshot must match source");
+    assert_eq!(first.cells, second.cells, "second snapshot must match first");
 }

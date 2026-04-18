@@ -72,8 +72,13 @@ pub enum ClientCommand {
 pub enum UiEvent {
     /// Raw PTY output bytes for a specific session.
     PtyOutput { session_id: SessionId, data: Vec<u8> },
-    /// Full screen snapshot for restoring visible content on reconnect.
+    /// Full screen snapshot for restoring visible content (used by tooling
+    /// like `scribe-cli` / `scribe-test` via `RequestSnapshot`). Reattach uses
+    /// `SessionReplay` instead.
     ScreenSnapshot { session_id: SessionId, snapshot: scribe_common::screen::ScreenSnapshot },
+    /// Compressed ANSI replay for a reattached session. Feed the decompressed
+    /// bytes into the pane's VTE processor to rebuild its `Term` durably.
+    SessionReplay { session_id: SessionId, replay: scribe_common::screen_replay::SessionReplay },
     /// The server has acknowledged session creation.
     SessionCreated { session_id: SessionId, shell_name: String },
     /// A session has exited.
@@ -110,9 +115,12 @@ pub enum UiEvent {
         project_root: Option<std::path::PathBuf>,
     },
     /// List of all live sessions, received in response to `ListSessions`.
+    /// Carries all per-workspace metadata as a batched `workspaces` vec so the
+    /// client can populate names / accent colors before reattach completes.
     SessionList {
         sessions: Vec<scribe_common::protocol::SessionInfo>,
         workspace_tree: Option<scribe_common::protocol::WorkspaceTreeNode>,
+        workspaces: Vec<scribe_common::protocol::WorkspaceListEntry>,
     },
     /// A workspace has been auto-named.
     WorkspaceNamed {
@@ -238,11 +246,40 @@ fn dispatch_session_message(
             send_event(proxy, UiEvent::ScreenSnapshot { session_id, snapshot });
             None
         }
+        ServerMessage::SessionReplay { session_id, replay } => {
+            send_event(proxy, UiEvent::SessionReplay { session_id, replay });
+            None
+        }
         ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
             tracing::debug!(session = %session_id, %workspace_id, "session created via server response");
             send_event(proxy, UiEvent::SessionCreated { session_id, shell_name });
             None
         }
+        ServerMessage::SearchResults { session_id, query, matches } => {
+            send_event(proxy, UiEvent::SearchResults { session_id, query, matches });
+            None
+        }
+        ServerMessage::TrimScrollback { session_id, history_rows } => {
+            send_event(proxy, UiEvent::TrimScrollback { session_id, history_rows });
+            None
+        }
+        ServerMessage::ScrollBottom { session_id } => {
+            send_event(proxy, UiEvent::ScrollBottom { session_id });
+            None
+        }
+        other => dispatch_session_metadata_message(proxy, other),
+    }
+}
+
+/// Per-session metadata events (AI state, OSC title/cwd/context updates,
+/// prompt marks, Codex task labels, git branch). Split out of
+/// `dispatch_session_message` to keep each routing function focused on a
+/// single category of message.
+fn dispatch_session_metadata_message(
+    proxy: &EventLoopProxy<UiEvent>,
+    message: ServerMessage,
+) -> Option<ServerMessage> {
+    match message {
         ServerMessage::AiStateChanged { session_id, ai_state } => {
             send_event(proxy, UiEvent::AiStateChanged { session_id, ai_state });
             None
@@ -289,19 +326,7 @@ fn dispatch_session_message(
             send_event(proxy, UiEvent::PromptMark { session_id, kind, click_events });
             None
         }
-        ServerMessage::SearchResults { session_id, query, matches } => {
-            send_event(proxy, UiEvent::SearchResults { session_id, query, matches });
-            None
-        }
-        ServerMessage::TrimScrollback { session_id, history_rows } => {
-            send_event(proxy, UiEvent::TrimScrollback { session_id, history_rows });
-            None
-        }
-        ServerMessage::ScrollBottom { session_id } => {
-            send_event(proxy, UiEvent::ScrollBottom { session_id });
-            None
-        }
-        _ => Some(message),
+        other => Some(other),
     }
 }
 
@@ -329,8 +354,8 @@ fn dispatch_workspace_message(
             );
             None
         }
-        ServerMessage::SessionList { sessions, workspace_tree } => {
-            send_event(proxy, UiEvent::SessionList { sessions, workspace_tree });
+        ServerMessage::SessionList { sessions, workspace_tree, workspaces } => {
+            send_event(proxy, UiEvent::SessionList { sessions, workspace_tree, workspaces });
             None
         }
         ServerMessage::WorkspaceNamed { workspace_id, name, project_root } => {

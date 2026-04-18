@@ -24,6 +24,7 @@ CLIENT_BIN_PATH="/usr/bin/${CLIENT_BIN_NAME}"
 SETTINGS_BIN_PATH="/usr/bin/${SETTINGS_BIN_NAME}"
 SERVICE_NAME="${SERVER_BIN_NAME}"
 SHARE_DIR="/usr/share/${APP_SLUG}"
+HOT_RELOAD_READY_TIMEOUT_SECS="${HOT_RELOAD_READY_TIMEOUT_SECS:-30}"
 # Opaque launch-contract stamp recorded for the running server. It is computed
 # from the runtime-critical maintainer-script behavior and installed service
 # unit so package installs hot-reload the server whenever those inputs change,
@@ -478,13 +479,17 @@ case "$1" in
                     UPGRADE_PID=$!
                 fi
 
-                # Wait briefly for the new server to be fully ready. We check
-                # for "IPC server listening" (emitted after socket bind) rather
-                # than "session restoration complete" to ensure the new server is
-                # accepting connections before we kill the old one.
+                # Wait for the new server to be fully ready. We check for
+                # "IPC server listening" (emitted after socket bind) rather than
+                # "session restoration complete" to ensure the new server is
+                # accepting connections before we declare success. Large live
+                # scrollback snapshots can make handoff restoration take much
+                # longer than 5 seconds, so use a longer watchdog here.
                 UPGRADE_OK=0
-                for i in 1 2 3 4 5; do
+                ELAPSED=0
+                while [ "$ELAPSED" -lt "$HOT_RELOAD_READY_TIMEOUT_SECS" ]; do
                     sleep 1
+                    ELAPSED=$((ELAPSED + 1))
                     if grep -q "IPC server listening" "${UPGRADE_LOG}" 2>/dev/null; then
                         UPGRADE_OK=1
                         break

@@ -14,6 +14,8 @@ use scribe_common::protocol::{ServerMessage, UpdateProgressState};
 use crate::ipc_server::ConnectedClients;
 
 const INITIAL_DELAY: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
+const HOT_RELOAD_HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_API_URL: &str = "https://api.github.com/repos/sharaf-nassar/scribe/releases/latest";
 /// Minisign public key for verifying release signatures.
 const MINISIGN_PUBLIC_KEY: &str = "RWSEN3ob4jI+FaJ5K+IIhUKdE6GZ9PvrCilK9ra2n/ajSZO6u6uRuILJ";
@@ -530,17 +532,20 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
     let handoff_path = handoff_socket_path();
 
     let wait_for_handoff = || -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + HOT_RELOAD_HANDOFF_TIMEOUT;
         let mut handed_off = false;
         while std::time::Instant::now() < deadline {
             if !handoff_path.exists() {
                 handed_off = true;
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(500));
         }
         if !handed_off {
-            warn!("hot-reload handoff timed out after 10 s");
+            warn!(
+                timeout_secs = HOT_RELOAD_HANDOFF_TIMEOUT.as_secs(),
+                "hot-reload handoff timed out"
+            );
         }
         handed_off
     };

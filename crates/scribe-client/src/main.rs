@@ -977,6 +977,10 @@ impl App {
                 self.handle_screen_snapshot_event(*session_id, snapshot);
                 true
             }
+            UiEvent::SessionReplay { session_id, replay } => {
+                self.handle_session_replay_event(*session_id, replay);
+                true
+            }
             UiEvent::SearchResults { session_id, query, matches } => {
                 if self.focused_session_id() == Some(*session_id)
                     && self.search_overlay.is_active()
@@ -1086,8 +1090,8 @@ impl App {
                 });
                 true
             }
-            UiEvent::SessionList { sessions, workspace_tree } => {
-                self.handle_session_list(sessions, workspace_tree.as_ref());
+            UiEvent::SessionList { sessions, workspace_tree, workspaces } => {
+                self.handle_session_list(sessions, workspace_tree.as_ref(), workspaces);
                 true
             }
             UiEvent::WorkspaceNamed { workspace_id, name, project_root } => {
@@ -1162,6 +1166,20 @@ impl App {
             pane.reset_output_queue();
         }
         self.handle_screen_snapshot(session_id, snapshot);
+    }
+
+    fn handle_session_replay_event(
+        &mut self,
+        session_id: SessionId,
+        replay: &scribe_common::screen_replay::SessionReplay,
+    ) {
+        self.pending_pty_bytes.remove(&session_id);
+        if let Some(pane_id) = self.session_to_pane.get(&session_id).copied()
+            && let Some(pane) = self.panes.get_mut(&pane_id)
+        {
+            pane.reset_output_queue();
+        }
+        self.handle_session_replay(session_id, replay);
     }
 
     fn handle_scroll_bottom_event(&mut self, session_id: SessionId) {
@@ -1497,10 +1515,10 @@ impl App {
 // ---------------------------------------------------------------------------
 
 impl App {
-    /// Feed PTY output bytes into the correct pane, then request a redraw.
-    /// Apply a screen snapshot to a pane by converting it to ANSI escape
-    /// sequences and feeding them through the normal VTE pipeline.
-    /// This restores visible terminal content on reconnect.
+    /// Apply a screen snapshot (from the `RequestSnapshot` tooling path) to a
+    /// pane by converting it to ANSI escape sequences and feeding them through
+    /// the normal VTE pipeline. Reattach uses [`handle_session_replay`] with
+    /// pre-compressed ANSI from the server and shares [`apply_replay_ansi`].
     fn handle_screen_snapshot(
         &mut self,
         session_id: SessionId,
@@ -1525,8 +1543,48 @@ impl App {
             "applying screen snapshot"
         );
 
+        let ansi = snapshot_to_ansi(snapshot);
+        self.apply_replay_ansi(session_id, snapshot.cols, snapshot.rows, &ansi);
+    }
+
+    /// Apply a `SessionReplay` from the server's reattach path. Decompresses
+    /// the zstd'd ANSI stream and feeds it through [`apply_replay_ansi`].
+    fn handle_session_replay(
+        &mut self,
+        session_id: SessionId,
+        replay: &scribe_common::screen_replay::SessionReplay,
+    ) {
+        if replay.cols == 0 || replay.rows == 0 {
+            tracing::warn!(%session_id, "SessionReplay has zero dimensions, skipping");
+            return;
+        }
+
+        let ansi = match scribe_common::screen_replay::decompress_session_replay(replay) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "failed to decompress SessionReplay");
+                return;
+            }
+        };
+        tracing::info!(
+            %session_id,
+            cols = replay.cols,
+            rows = replay.rows,
+            scrollback_rows = replay.scrollback_rows,
+            alt_screen = replay.alt_screen,
+            compressed = replay.replay_zstd.len(),
+            ansi_len = ansi.len(),
+            "applying SessionReplay"
+        );
+
+        self.apply_replay_ansi(session_id, replay.cols, replay.rows, &ansi);
+    }
+
+    /// Shared body that feeds ANSI bytes into a pane's Term, handling the
+    /// server-vs-client grid mismatch and scheduling a post-restore resize.
+    fn apply_replay_ansi(&mut self, session_id: SessionId, cols: u16, rows: u16, ansi: &[u8]) {
         let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else {
-            tracing::warn!(%session_id, "snapshot: no pane for session");
+            tracing::warn!(%session_id, "replay: no pane for session");
             return;
         };
         let is_codex = self
@@ -1535,44 +1593,43 @@ impl App {
             .is_some_and(|p| p == AiProvider::CodexCode);
         let needs_post_restore_resize = {
             let Some(pane) = self.panes.get_mut(&pane_id) else {
-                tracing::warn!(%session_id, "snapshot: pane not found");
+                tracing::warn!(%session_id, "replay: pane not found");
                 return;
             };
 
-            // The snapshot was captured with the server's current term dimensions,
-            // which may still differ from the restored pane grid. Feed the ANSI
-            // through a term sized to the snapshot, then resize back to the pane.
+            // The replay was captured with the server's current term
+            // dimensions, which may still differ from the restored pane grid.
+            // Feed the ANSI through a term sized to the replay, then resize
+            // back to the pane.
             let pane_grid = pane.grid;
-            let dims_match = pane_grid.cols == snapshot.cols && pane_grid.rows == snapshot.rows;
+            let dims_match = pane_grid.cols == cols && pane_grid.rows == rows;
 
             if !dims_match {
                 tracing::info!(
-                    snap_cols = snapshot.cols,
-                    snap_rows = snapshot.rows,
+                    replay_cols = cols,
+                    replay_rows = rows,
                     pane_cols = pane_grid.cols,
                     pane_rows = pane_grid.rows,
-                    "snapshot dimensions differ from pane — resizing term temporarily"
+                    "replay dimensions differ from pane — resizing term temporarily"
                 );
-                pane.resize_term_only(snapshot.cols, snapshot.rows);
+                pane.resize_term_only(cols, rows);
             }
 
-            let ansi = snapshot_to_ansi(snapshot);
-            tracing::info!(ansi_len = ansi.len(), "feeding snapshot ANSI to pane");
-            let _ = pane.feed_output(&ansi);
+            let _ = pane.feed_output(ansi);
 
             if !dims_match {
                 pane.resize_term_only(pane_grid.cols, pane_grid.rows);
 
                 // Codex (via Ink) uses cursor-addressed rendering and may not
-                // fully clear the screen on SIGWINCH redraw.  The reflow from
-                // resizing the snapshot content to the pane's grid garbles the
+                // fully clear the screen on SIGWINCH redraw. The reflow from
+                // resizing the replay content to the pane's grid garbles the
                 // TUI layout, and Ink's differential render leaves remnants of
-                // the old snapshot visible.  Clear the visible area so Codex's
+                // the old replay visible. Clear the visible area so Codex's
                 // SIGWINCH redraw starts from a clean slate — scrollback from
-                // the snapshot is preserved.
+                // the replay is preserved.
                 clear_restored_codex_snapshot_artifacts(pane, is_codex);
 
-                // A mismatched snapshot means the server-side PTY was not
+                // A mismatched replay means the server-side PTY was not
                 // actually restored at this pane's grid yet, regardless of
                 // what we assumed before AttachSessions.
                 pane.last_sent_grid = None;
@@ -1586,7 +1643,7 @@ impl App {
         }
 
         // Mark content as ready so the splash can be dismissed once it has
-        // been visible for MIN_SPLASH_DURATION.  The actual dismissal happens
+        // been visible for MIN_SPLASH_DURATION. The actual dismissal happens
         // in `handle_redraw` to avoid submitting the terminal-content frame
         // before the compositor has presented the splash frame.
         if self.splash.active {
@@ -1847,6 +1904,7 @@ impl App {
         &mut self,
         sessions: &[scribe_common::protocol::SessionInfo],
         workspace_tree: Option<&scribe_common::protocol::WorkspaceTreeNode>,
+        workspaces: &[scribe_common::protocol::WorkspaceListEntry],
     ) {
         let Some(tx) = self.cmd_tx.clone() else { return };
 
@@ -1858,6 +1916,21 @@ impl App {
         }
 
         tracing::info!(count = sessions.len(), "reattaching to existing sessions");
+
+        // Apply per-workspace metadata (names, accent colors, project roots)
+        // up front so the reconstructed layout carries correct styling before
+        // the first pane is drawn. Replaces the legacy per-session
+        // `WorkspaceInfo` fan-out that used to follow every attach.
+        for entry in workspaces {
+            self.handle_workspace_info(WorkspaceInfoUpdate {
+                workspace_id: entry.workspace_id,
+                name: entry.name.clone(),
+                accent_color: entry.accent_color.clone(),
+                split_direction: entry.split_direction,
+                project_root: entry.project_root.clone(),
+            });
+        }
+
         let attach_ids = collect_session_ids(sessions);
         let metadata = build_session_metadata_map(sessions);
         let groups = group_sessions_by_workspace(sessions);
@@ -1956,6 +2029,13 @@ impl App {
                     "restoring AI state from initial session list"
                 );
                 self.handle_ai_state_changed(info.session_id, state);
+            }
+            // Apply git branch directly from SessionInfo. Before the metadata
+            // fan-out was removed this was redelivered as `GitBranch`; the
+            // branch now rides on `SessionInfo` itself so the attach pipeline
+            // only needs to send `SessionCreated` + `SessionReplay`.
+            if info.git_branch.is_some() {
+                self.handle_git_branch(info.session_id, info.git_branch.clone());
             }
         }
         self.apply_snapshot_prompt_state();
@@ -9131,7 +9211,17 @@ fn rebuild_split_scroll_content(
     let cursor_line =
         usize::try_from(pane.term.grid().cursor.point.line.0.max(0)).unwrap_or(usize::MAX);
     let screen_lines = pane.term.grid().screen_lines();
-    let base_pin_rows = split_scroll::compute_pin_rows(cursor_line, screen_lines);
+    let heuristic_pin_rows = split_scroll::compute_pin_rows(cursor_line, screen_lines);
+    let prompt_pin_rows = pane.input_start.and_then(|(input_line, _)| {
+        split_scroll::compute_active_prompt_pin_rows(
+            pane.term.grid().history_size(),
+            screen_lines,
+            pane.prompt_marks.last().copied(),
+            Some(input_line),
+        )
+    });
+    let base_pin_rows =
+        prompt_pin_rows.map_or(heuristic_pin_rows, |rows| rows.max(heuristic_pin_rows));
     let pin_rows =
         split_scroll::align_pin_rows_to_logical_lines(&pane.term, base_pin_rows, screen_lines);
     let pin_h = usize_to_f32(pin_rows) * context.layout.cell_size.1;
@@ -10289,141 +10379,7 @@ fn current_time_str() -> String {
     chrono::Local::now().format("%H:%M").to_string()
 }
 
-/// Tracks the "current" SGR state while emitting ANSI for a snapshot.
-///
-/// Allows diff-based emission: only emit a new SGR escape when the next cell's
-/// attributes differ from the currently-active attributes, avoiding a full
-/// `\x1b[0m` reset for every cell.
-struct SgrState {
-    fg: scribe_common::screen::ScreenColor,
-    bg: scribe_common::screen::ScreenColor,
-    flags: scribe_common::screen::CellFlags,
-}
-
-impl SgrState {
-    /// Initial state: all flags off, colors are the terminal defaults
-    /// (`Named(256)` = Foreground, `Named(257)` = Background in alacritty's
-    /// `NamedColor` numbering).
-    fn default_state() -> Self {
-        Self {
-            fg: scribe_common::screen::ScreenColor::Named(256),
-            bg: scribe_common::screen::ScreenColor::Named(257),
-            flags: scribe_common::screen::CellFlags::default(),
-        }
-    }
-
-    /// Returns `true` if the cell's attributes exactly match the current state.
-    fn matches(&self, cell: &scribe_common::screen::ScreenCell) -> bool {
-        self.fg == cell.fg
-            && self.bg == cell.bg
-            && self.flags.bold() == cell.flags.bold()
-            && self.flags.dim() == cell.flags.dim()
-            && self.flags.italic() == cell.flags.italic()
-            && self.flags.underline() == cell.flags.underline()
-            && self.flags.inverse() == cell.flags.inverse()
-            && self.flags.hidden() == cell.flags.hidden()
-            && self.flags.strikethrough() == cell.flags.strikethrough()
-    }
-
-    /// Update state to match the given cell's attributes.
-    fn update(&mut self, cell: &scribe_common::screen::ScreenCell) {
-        self.fg = cell.fg;
-        self.bg = cell.bg;
-        self.flags.set_bold(cell.flags.bold());
-        self.flags.set_dim(cell.flags.dim());
-        self.flags.set_italic(cell.flags.italic());
-        self.flags.set_underline(cell.flags.underline());
-        self.flags.set_inverse(cell.flags.inverse());
-        self.flags.set_hidden(cell.flags.hidden());
-        self.flags.set_strikethrough(cell.flags.strikethrough());
-    }
-}
-
-/// Convert a `ScreenSnapshot` to ANSI escape sequences that reproduce the
-/// visible screen content when fed through a VTE parser.
-///
-/// Used to restore terminal content on reconnect: the server's `Term` has
-/// the full state, and this converts it to bytes the client's `Term` can
-/// process through the normal `pane.feed_output()` path.
-fn snapshot_to_ansi(snapshot: &scribe_common::screen::ScreenSnapshot) -> Vec<u8> {
-    let cols = usize::from(snapshot.cols);
-    let scrollback_rows = usize::try_from(snapshot.scrollback_rows).unwrap_or(usize::MAX);
-    let visible_rows = usize::from(snapshot.rows);
-
-    let mut buf = String::with_capacity((scrollback_rows + visible_rows) * cols * 4);
-
-    // If the server was in alternate screen mode, switch the client into it
-    // so that subsequent PTY output (which assumes alt screen) lands in the
-    // correct buffer.  Without this, apps like Claude Code that use alt screen
-    // produce ghost cursors and broken exit behaviour after reconnect.
-    if snapshot.alt_screen {
-        buf.push_str("\x1b[?1049h");
-    }
-
-    // Hide cursor, move home, clear screen, reset attributes.
-    buf.push_str("\x1b[?25l\x1b[H\x1b[2J\x1b[0m");
-
-    let mut wrote_row = false;
-    let mut previous_row_wrapped = false;
-
-    // SGR diff state: start from the known-reset state (we just emitted \x1b[0m
-    // above), so the first cell will only emit SGR if it differs from defaults.
-    let mut sgr_state = SgrState::default_state();
-
-    // --- Scrollback lines (oldest first) ---
-    // As these overflow the visible area, they naturally flow into the
-    // client Term's scrollback buffer — the same mechanism as normal use.
-    for row in 0..scrollback_rows {
-        if wrote_row && !previous_row_wrapped {
-            buf.push_str("\r\n");
-        }
-        write_snapshot_row(&mut buf, &snapshot.scrollback, row, cols, &mut sgr_state);
-        previous_row_wrapped = row_wraps(&snapshot.scrollback, row, cols);
-        wrote_row = true;
-    }
-
-    // --- Visible lines ---
-    for row in 0..visible_rows {
-        if wrote_row && !previous_row_wrapped {
-            buf.push_str("\r\n");
-        }
-        write_snapshot_row(&mut buf, &snapshot.cells, row, cols, &mut sgr_state);
-        previous_row_wrapped = row_wraps(&snapshot.cells, row, cols);
-        wrote_row = true;
-    }
-
-    // Reset attributes, position cursor, show cursor if visible.
-    buf.push_str("\x1b[0m");
-    write_string(
-        &mut buf,
-        format_args!(
-            "\x1b[{};{}H",
-            u32::from(snapshot.cursor_row) + 1,
-            u32::from(snapshot.cursor_col) + 1,
-        ),
-    );
-    // For alt screen snapshots, leave the cursor hidden and skip DECSCUSR —
-    // the alt screen app (e.g. Claude Code, vim) will control cursor
-    // visibility and shape through its own live PTY output.  Emitting them
-    // here causes a "double cursor": the terminal cursor overlaps with the
-    // app's own drawn cursor.
-    if !snapshot.alt_screen {
-        if snapshot.cursor_visible {
-            buf.push_str("\x1b[?25h");
-        }
-        // Restore cursor shape via DECSCUSR so reconnect preserves the style
-        // that was active in the session (e.g. beam in a text editor).
-        let decscusr = match snapshot.cursor_style {
-            scribe_common::screen::CursorStyle::Block => "\x1b[2 q",
-            scribe_common::screen::CursorStyle::Beam => "\x1b[6 q",
-            scribe_common::screen::CursorStyle::Underline => "\x1b[4 q",
-            scribe_common::screen::CursorStyle::HollowBlock => "\x1b[1 q",
-        };
-        buf.push_str(decscusr);
-    }
-
-    buf.into_bytes()
-}
+use scribe_common::screen_replay::snapshot_to_ansi;
 
 fn clear_restored_codex_snapshot_artifacts(pane: &mut Pane, is_codex: bool) {
     if is_codex {
@@ -10436,130 +10392,6 @@ fn trim_term_scrollback(term: &mut Term<VoidListener>, kept_rows: usize, max_row
     let grid = term.grid_mut();
     grid.update_history(kept_rows);
     grid.update_history(max_rows);
-}
-
-/// Write a single row of cells as ANSI escape sequences.
-///
-/// `sgr_state` tracks the currently-active SGR attributes across calls so that
-/// unchanged runs of cells can skip emitting a redundant escape sequence.
-fn write_snapshot_row(
-    buf: &mut String,
-    cells: &[scribe_common::screen::ScreenCell],
-    row: usize,
-    cols: usize,
-    sgr_state: &mut SgrState,
-) {
-    for col in 0..cols {
-        let idx = row * cols + col;
-        let Some(cell) = cells.get(idx) else { break };
-
-        // Skip spacer cells for wide characters.
-        let is_wide_spacer =
-            col > 0 && cells.get(row * cols + col - 1).is_some_and(|c| c.flags.wide());
-        if is_wide_spacer {
-            continue;
-        }
-
-        // Only emit SGR when this cell's attributes differ from the current
-        // state.  Terminals preserve SGR across line breaks, so the state
-        // carries over between rows without resetting.
-        if !sgr_state.matches(cell) {
-            write_sgr(buf, cell);
-            sgr_state.update(cell);
-        }
-
-        // Write the character (space for null/empty cells).
-        if cell.c == '\0' || cell.c == ' ' {
-            buf.push(' ');
-        } else {
-            buf.push(cell.c);
-        }
-    }
-}
-
-/// Whether the given row soft-wraps into the next row.
-fn row_wraps(cells: &[scribe_common::screen::ScreenCell], row: usize, cols: usize) -> bool {
-    if cols == 0 {
-        return false;
-    }
-
-    row.checked_mul(cols)
-        .and_then(|base| base.checked_add(cols - 1))
-        .and_then(|idx| cells.get(idx))
-        .is_some_and(|cell| cell.flags.wrap())
-}
-
-/// Write SGR escape sequences for a cell's foreground, background, and flags.
-fn write_sgr(buf: &mut String, cell: &scribe_common::screen::ScreenCell) {
-    buf.push_str("\x1b[0"); // reset, then append attributes
-
-    let f = &cell.flags;
-    if f.bold() {
-        buf.push_str(";1");
-    }
-    if f.dim() {
-        buf.push_str(";2");
-    }
-    if f.italic() {
-        buf.push_str(";3");
-    }
-    if f.underline() {
-        buf.push_str(";4");
-    }
-    if f.inverse() {
-        buf.push_str(";7");
-    }
-    if f.hidden() {
-        buf.push_str(";8");
-    }
-    if f.strikethrough() {
-        buf.push_str(";9");
-    }
-
-    write_color_sgr(buf, cell.fg, true);
-    write_color_sgr(buf, cell.bg, false);
-
-    buf.push('m');
-}
-
-/// Append the SGR parameters for a single color (foreground or background).
-///
-/// `NamedColor` values: 0–7 = normal ANSI, 8–15 = bright ANSI,
-/// 256 = Foreground, 257 = Background, 258 = Cursor, 259–266 = dim variants.
-/// Values >= 16 use the terminal default colour (SGR 39/49).
-fn write_color_sgr(buf: &mut String, color: scribe_common::screen::ScreenColor, foreground: bool) {
-    use scribe_common::screen::ScreenColor;
-
-    match color {
-        ScreenColor::Named(n) if n < 8 => {
-            let base: u32 = if foreground { 30 } else { 40 };
-            write_string(buf, format_args!(";{}", base + u32::from(n)));
-        }
-        ScreenColor::Named(n) if n < 16 => {
-            let base: u32 = if foreground { 90 } else { 100 };
-            write_string(buf, format_args!(";{}", base + u32::from(n - 8)));
-        }
-        ScreenColor::Named(_) => {
-            // Foreground (256), Background (257), Cursor (258), Dim* (259+)
-            // — use the terminal's default colour.
-            buf.push_str(if foreground { ";39" } else { ";49" });
-        }
-        ScreenColor::Indexed(idx) => {
-            let prefix = if foreground { "38" } else { "48" };
-            write_string(buf, format_args!(";{prefix};5;{idx}"));
-        }
-        ScreenColor::Rgb { r, g, b } => {
-            let prefix = if foreground { "38" } else { "48" };
-            write_string(buf, format_args!(";{prefix};2;{r};{g};{b}"));
-        }
-    }
-}
-
-fn write_string(buf: &mut String, args: std::fmt::Arguments<'_>) {
-    use std::fmt::Write as _;
-
-    let write_result = buf.write_fmt(args);
-    debug_assert!(write_result.is_ok(), "writing to String cannot fail");
 }
 
 /// Parse a `#RRGGBB` hex colour string into an `[f32; 4]` RGBA array.

@@ -29,7 +29,7 @@ use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
     AutomationAction, ClientMessage, SearchMatch, ServerMessage, SessionInfo, TerminalSize,
-    WindowInfo, WorkspaceTreeNode,
+    WindowInfo, WorkspaceListEntry, WorkspaceTreeNode,
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
@@ -234,11 +234,6 @@ pub struct AttachSessionData {
     pub resize_fd: Arc<OwnedFd>,
     pub target_dims: Option<TerminalSize>,
     pub has_handoff_snapshot: bool,
-    pub title: String,
-    pub codex_task_label: Option<String>,
-    pub cwd: Option<std::path::PathBuf>,
-    pub context: Option<scribe_common::protocol::SessionContext>,
-    pub ai_state: Option<scribe_common::ai_state::AiProcessState>,
 }
 
 impl LiveSession {
@@ -262,11 +257,6 @@ impl LiveSession {
             resize_fd: Arc::clone(&self.resize_fd),
             target_dims,
             has_handoff_snapshot: self.handoff_snapshot.is_some(),
-            title: self.title.clone(),
-            codex_task_label: self.codex_task_label.clone(),
-            cwd: self.cwd.clone(),
-            context: self.context.clone(),
-            ai_state: self.ai_state.clone(),
         }
     }
 
@@ -344,8 +334,6 @@ pub async fn start_ipc_server(
     server: IpcServerState,
 ) -> Result<(), ScribeError> {
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
-
-    info!("IPC server listening");
 
     loop {
         match listener.accept().await {
@@ -1498,27 +1486,24 @@ async fn handle_list_sessions(
     let window_session_ids = wm.sessions_for_window(window_id);
     let has_window_sessions = !window_session_ids.is_empty();
 
+    let build_info = |sid: SessionId, s: &LiveSession| SessionInfo {
+        session_id: sid,
+        workspace_id: s.workspace_id,
+        shell_name: s.shell_name.clone(),
+        title: Some(s.title.clone()),
+        context: s.context.clone(),
+        codex_task_label: s.codex_task_label.clone(),
+        cwd: s.cwd.clone(),
+        git_branch: s.cwd.as_deref().and_then(detect_git_branch),
+        ai_state: s.ai_state.clone(),
+        ai_provider_hint: s.ai_state.as_ref().map(|state| state.provider).or(s.ai_provider_hint),
+    };
+
     let infos: Vec<SessionInfo> = if has_window_sessions {
         // Return only this window's sessions.
         window_session_ids
             .iter()
-            .filter_map(|&sid| {
-                sessions.get(&sid).map(|s| SessionInfo {
-                    session_id: sid,
-                    workspace_id: s.workspace_id,
-                    shell_name: s.shell_name.clone(),
-                    title: Some(s.title.clone()),
-                    context: s.context.clone(),
-                    codex_task_label: s.codex_task_label.clone(),
-                    cwd: s.cwd.clone(),
-                    ai_state: s.ai_state.clone(),
-                    ai_provider_hint: s
-                        .ai_state
-                        .as_ref()
-                        .map(|state| state.provider)
-                        .or(s.ai_provider_hint),
-                })
-            })
+            .filter_map(|&sid| sessions.get(&sid).map(|s| build_info(sid, s)))
             .collect()
     } else {
         // No window-specific sessions — return all unowned sessions (legacy
@@ -1526,52 +1511,36 @@ async fn handle_list_sessions(
         sessions
             .iter()
             .filter(|&(&sid, _)| wm.window_for_session(sid).is_none())
-            .map(|(&id, s)| SessionInfo {
-                session_id: id,
-                workspace_id: s.workspace_id,
-                shell_name: s.shell_name.clone(),
-                title: Some(s.title.clone()),
-                context: s.context.clone(),
-                codex_task_label: s.codex_task_label.clone(),
-                cwd: s.cwd.clone(),
-                ai_state: s.ai_state.clone(),
-                ai_provider_hint: s
-                    .ai_state
-                    .as_ref()
-                    .map(|state| state.provider)
-                    .or(s.ai_provider_hint),
-            })
+            .map(|(&id, s)| build_info(id, s))
             .collect()
     };
 
-    let workspace_ids: Vec<WorkspaceId> = infos.iter().map(|i| i.workspace_id).collect();
+    // Batch per-workspace metadata into the SessionList so clients do not need
+    // a separate per-session WorkspaceInfo fan-out during reattach.
+    let mut seen = HashSet::new();
+    let mut workspaces: Vec<WorkspaceListEntry> = Vec::new();
+    for info in &infos {
+        if !seen.insert(info.workspace_id) {
+            continue;
+        }
+        if let Some((name, accent_color, split_direction, project_root)) =
+            wm.workspace_info(info.workspace_id)
+        {
+            workspaces.push(WorkspaceListEntry {
+                workspace_id: info.workspace_id,
+                name,
+                accent_color,
+                split_direction,
+                project_root,
+            });
+        }
+    }
     let workspace_tree = wm.window_tree(window_id).cloned();
     drop(wm);
     drop(sessions);
 
-    let list_msg = ServerMessage::SessionList { sessions: infos, workspace_tree };
+    let list_msg = ServerMessage::SessionList { sessions: infos, workspace_tree, workspaces };
     send_message(writer, &list_msg).await;
-
-    // Also send workspace info for each referenced workspace so the client
-    // can reconstruct the layout (names, accent colours).
-    let wm_guard = workspace_manager.read().await;
-    let mut seen = HashSet::new();
-    for wid in workspace_ids {
-        if seen.insert(wid) {
-            if let Some((name, accent_color, split_direction, project_root)) =
-                wm_guard.workspace_info(wid)
-            {
-                let msg = ServerMessage::WorkspaceInfo {
-                    workspace_id: wid,
-                    name,
-                    accent_color,
-                    split_direction,
-                    project_root,
-                };
-                send_message(writer, &msg).await;
-            }
-        }
-    }
 }
 
 /// Handle `AttachSessions` — take ownership of detached sessions, set the
@@ -1585,7 +1554,6 @@ async fn handle_attach_sessions(
         session_ids,
         dimensions,
         &context.server.live_sessions,
-        &context.server.workspace_manager,
         crate::attach_flow::AttachClientContext {
             writer: context.writer,
             attached_ids: context.attached_ids,
@@ -2489,10 +2457,21 @@ pub async fn serialize_live_for_handoff(
 
     for (&session_id, live) in sessions.iter() {
         let term = live.term.lock().await;
-        let snapshot = Some(snapshot_term(&term));
+        let snapshot = snapshot_term(&term);
         let cols = u16::try_from(term.grid().columns()).unwrap_or(u16::MAX);
         let rows = u16::try_from(term.grid().screen_lines()).unwrap_or(u16::MAX);
         drop(term);
+
+        // Encode as a v5 replay (compressed ANSI). If encoding fails, log and
+        // leave session_replay None — the receiver will fall back to the
+        // legacy snapshot field and still produce a working session.
+        let session_replay = match scribe_common::screen_replay::build_session_replay(&snapshot) {
+            Ok(replay) => Some(replay),
+            Err(e) => {
+                tracing::warn!(%session_id, "build_session_replay failed: {e}");
+                None
+            }
+        };
 
         let has_ai_state = live.ai_state.is_some();
         tracing::debug!(%session_id, has_ai_state, "serializing live session for handoff");
@@ -2505,7 +2484,8 @@ pub async fn serialize_live_for_handoff(
             rows,
             cell_width: live.cell_width,
             cell_height: live.cell_height,
-            snapshot,
+            snapshot: None,
+            session_replay,
             title: Some(live.title.clone()),
             shell_name: live.shell_name.clone(),
             codex_task_label: live.codex_task_label.clone(),
@@ -2622,7 +2602,6 @@ mod tests {
     #[tokio::test]
     async fn attach_sessions_returns_empty_when_registry_has_no_matching_sessions() {
         let live_sessions = new_live_session_registry();
-        let workspace_manager = Arc::new(RwLock::new(WorkspaceManager::new(vec![])));
 
         let (server, _client) = unix_stream_pair();
         let (_read, write) = tokio::io::split(server);
@@ -2633,7 +2612,6 @@ mod tests {
             &[SessionId::new()],
             &[],
             &live_sessions,
-            &workspace_manager,
             crate::attach_flow::AttachClientContext {
                 writer: &writer,
                 attached_ids: &attached_ids,

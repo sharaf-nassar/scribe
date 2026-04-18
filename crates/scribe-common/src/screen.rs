@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A single terminal cell, serializable for IPC transport.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenCell {
     pub c: char,
     pub fg: ScreenColor,
@@ -14,7 +14,7 @@ pub struct ScreenCell {
 /// `Named` uses `u16` because `alacritty_terminal::NamedColor` has variants
 /// above 255 (e.g. `Foreground = 256`, `Background = 257`, `Cursor = 258`,
 /// `DimBlack = 259`, …). A `u8` would silently truncate these to 0–15.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScreenColor {
     Named(u16),
     Indexed(u8),

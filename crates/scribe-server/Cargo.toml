@@ -208,6 +208,14 @@ assets = [
   ],
 ]
 
+[lib]
+name = "scribe_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scribe-server"
+path = "src/main.rs"
+
 [package.metadata.cargo-machete]
 ignored = [
   "rmp-serde",

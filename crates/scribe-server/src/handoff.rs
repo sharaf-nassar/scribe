@@ -25,6 +25,7 @@ use scribe_common::error::ScribeError;
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::SessionContext;
 use scribe_common::screen::ScreenSnapshot;
+use scribe_common::screen_replay::SessionReplay;
 use scribe_common::socket::{current_uid, handoff_socket_path};
 
 pub use crate::workspace_manager::HandoffWindowState;
@@ -38,7 +39,7 @@ use crate::workspace_manager::WorkspaceManager;
 ///
 /// A version mismatch causes the new server to abort the handoff and perform
 /// a full restart instead, so all live sessions are terminated.
-const HANDOFF_VERSION: u32 = 4;
+const HANDOFF_VERSION: u32 = 5;
 
 /// Magic bytes the receiver sends to request an upgrade.
 const UPGRADE_REQUEST: &[u8] = b"SCRIBE_UPGRADE";
@@ -81,6 +82,12 @@ pub struct HandoffSession {
     #[serde(default)]
     pub cell_height: u16,
     pub snapshot: Option<ScreenSnapshot>,
+    /// v5 replay payload (zstd-compressed ANSI produced by `snapshot_to_ansi`).
+    /// v5+ senders populate this and leave `snapshot` at None. v4 senders leave
+    /// this at None and populate `snapshot`. Receivers prefer `session_replay`
+    /// when present and fall through to `snapshot` otherwise.
+    #[serde(default)]
+    pub session_replay: Option<SessionReplay>,
     /// Last-known terminal title. `#[serde(default)]` for backward compat with
     /// old servers that did not include this field.
     #[serde(default)]
@@ -487,11 +494,16 @@ pub fn receive_handoff() -> Result<(HandoffState, Vec<OwnedFd>), ScribeError> {
         Err(e) => return Err(e),
     };
 
-    if state.version != HANDOFF_VERSION {
+    // Accept the current version and the immediately previous version (N-1),
+    // so normal forward upgrades never cold-restart. Everything else (skip
+    // more than one release, downgrade, pre-v4) falls to cold-restart.
+    if state.version != HANDOFF_VERSION && state.version != HANDOFF_VERSION.saturating_sub(1) {
         return Err(ScribeError::IpcError {
             reason: format!(
-                "handoff version mismatch: got {}, expected {HANDOFF_VERSION}",
-                state.version
+                "handoff version unsupported: got {}, supported {}..={HANDOFF_VERSION} \
+                 (cold-restart required)",
+                state.version,
+                HANDOFF_VERSION.saturating_sub(1),
             ),
         });
     }

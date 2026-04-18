@@ -16,6 +16,12 @@ use crate::layout::Rect;
 
 /// Minimum number of rows shown in the pinned bottom portion.
 const MIN_PIN_ROWS: usize = 3;
+/// Extra live rows above the cursor to keep visible in the pinned region.
+///
+/// Claude/Codex can draw prompt chrome one row above the input itself, so the
+/// old `+ 2` margin could clip the waiting-for-input block when the cursor sat
+/// on the last visible row.
+const CURSOR_CONTEXT_ROWS: usize = 3;
 
 /// Size of the jump-to-bottom button (pixels).
 const JUMP_BTN_SIZE: f32 = 22.0;
@@ -59,9 +65,37 @@ pub struct SplitScrollGeometry {
 /// `display_offset = 0`).  The result is clamped to `[MIN_PIN_ROWS, max_rows]`.
 pub fn compute_pin_rows(cursor_line: usize, screen_lines: usize) -> usize {
     let max_rows = screen_lines / 2;
-    // Rows from cursor to bottom, plus 2 rows of margin above cursor.
-    let rows = screen_lines.saturating_sub(cursor_line) + 2;
+    // Rows from cursor to bottom, plus a small context margin above the
+    // cursor so live prompt chrome stays intact when split-scroll is active.
+    let rows = screen_lines.saturating_sub(cursor_line) + CURSOR_CONTEXT_ROWS;
     rows.clamp(MIN_PIN_ROWS, max_rows.max(MIN_PIN_ROWS))
+}
+
+/// Compute the number of rows needed to keep the active prompt block intact.
+///
+/// `history_size` is the number of scrollback rows preceding the live viewport
+/// at `display_offset = 0`. `prompt_start_abs` and `input_start_abs` are
+/// absolute row indices from the top of scrollback (`0 = oldest line`).
+///
+/// When a live prompt is active, we prefer its `PromptStart` mark so the
+/// pinned region includes the full prompt chrome above the user's input. If
+/// that mark is unavailable, fall back to the input start row so at least the
+/// editable input block remains visible.
+pub fn compute_active_prompt_pin_rows(
+    history_size: usize,
+    screen_lines: usize,
+    prompt_start_abs: Option<usize>,
+    input_start_abs: Option<usize>,
+) -> Option<usize> {
+    if screen_lines == 0 {
+        return None;
+    }
+
+    let prompt_top_abs = prompt_start_abs.or(input_start_abs)?;
+    let live_bottom_abs = history_size.saturating_add(screen_lines.saturating_sub(1));
+    let max_rows = screen_lines.saturating_sub(MIN_PIN_ROWS).max(MIN_PIN_ROWS);
+    let rows = live_bottom_abs.saturating_sub(prompt_top_abs) + 1;
+    Some(rows.clamp(MIN_PIN_ROWS, max_rows))
 }
 
 /// Expand the pinned bottom upward so the split never starts mid-way through

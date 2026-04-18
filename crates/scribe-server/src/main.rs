@@ -124,6 +124,14 @@ async fn run_server_loop(
     // must live until the server shuts down to hold the advisory flock.
     let (_lock_guard, listener) = ipc_server::acquire_server_socket(&path, upgrade_mode)?;
 
+    // Emit the bind-ready signal as soon as the socket is acquired. The
+    // Debian postinst watchdog greps the upgrade log for this exact string
+    // and counts it as "new server is reachable". Logging it here, before
+    // session activation, guarantees the watchdog never times out on the
+    // per-session restore work that follows. Queued client connections sit
+    // in the kernel backlog until `start_ipc_server` begins accepting.
+    info!("IPC server listening");
+
     // Activate sessions restored from a hot-reload handoff. Moves them from
     // SessionManager into the live registry and starts their PTY reader tasks
     // in detached mode. No-op for normal (non-upgrade) startup.

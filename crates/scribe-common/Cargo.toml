@@ -19,3 +19,4 @@ dirs.workspace = true
 tokio.workspace = true
 nix.workspace = true
 tracing.workspace = true
+zstd.workspace = true

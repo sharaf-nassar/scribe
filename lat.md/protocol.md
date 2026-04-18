@@ -8,7 +8,9 @@ Messages use length-prefixed MessagePack encoding defined in [[crates/scribe-com
 
 ### Frame Format
 
-Each frame is a 4-byte big-endian u32 payload length followed by the MessagePack-serialized message body. The maximum payload size is 256 MiB to accommodate reattach scenarios that send many screen snapshots at once.
+Each frame is a 4-byte big-endian u32 payload length followed by the MessagePack-serialized message body.
+
+The maximum payload size is 256 MiB; reattach payloads ride on the far denser zstd-compressed ANSI `SessionReplay` encoding, so the 256 MiB cap is headroom for `RequestSnapshot` tooling rather than the hot path.
 
 ### Socket Path
 
@@ -44,7 +46,7 @@ The client chunks large pastes into multiple `KeyInput` messages to fit the 4 Ki
 
 `Subscribe` registers for output from a list of session IDs (max 256). `RequestSnapshot` fetches a single session's full screen state.
 
-`AttachSessions` reattaches to detached sessions with dimensions, receiving stored metadata (title, CWD, shell basename, session context, git branch, AI state) and a screen snapshot.
+`AttachSessions` reattaches to detached sessions with dimensions. Per-session metadata (title, CWD, shell basename, session context, git branch, AI state) rides on the preceding `SessionList`/`SessionInfo` response, and per-workspace metadata (names, accent colors) rides on `SessionList::workspaces`, so the attach reply is just `SessionCreated` + [[protocol#Server Messages#Terminal Output#SessionReplay]] per session with no additional fan-out.
 
 ### Workspace Management
 
@@ -74,9 +76,15 @@ Messages sent from the server to clients, defined in [[crates/scribe-common/src/
 
 ### Terminal Output
 
-`PtyOutput` carries raw PTY bytes for a session. `ScreenSnapshot` restores a full screen, and `ScrolledSnapshot` returns scrollback at a requested offset.
+`PtyOutput` carries raw PTY bytes. `SessionReplay` delivers a zstd-compressed ANSI rebuild on reattach. `ScreenSnapshot` is kept for tooling (`RequestSnapshot`, scribe-cli, scribe-test) that needs the per-cell grid.
 
 `TrimScrollback` prunes a client's history back to the preserved pre-AI baseline before a redraw when suppressed ED 3 clears would otherwise stack duplicate inline transcript frames into scrollback.
+
+#### SessionReplay
+
+Unified primitive for rebuilding a client's Term on reattach, defined in [[crates/scribe-common/src/screen_replay.rs#SessionReplay]].
+
+Carries cols, rows, scrollback rows, cursor position/style/visibility, alt-screen flag, and a zstd-compressed ANSI byte stream. Clients decompress and feed the bytes through their VTE processor — the same primitive the server uses for hot-reload handoff, so one encoding serves both the server-to-server and server-to-client paths.
 
 `SearchResults` pairs with `SearchRequest` and returns absolute grid spans for the current query so the client can highlight and jump between matches without replaying search locally.
 
@@ -96,7 +104,7 @@ Messages sent from the server to clients, defined in [[crates/scribe-common/src/
 
 Only the bootstrap client (launched without `--window-id`) spawns child processes for the other windows in `Welcome`; children ignore the list to prevent fan-out duplication where racing siblings each spawn redundant processes for windows not yet registered in `connected_clients`.
 
-`SessionList` returns all sessions grouped by workspace in response to `ListSessions`. Each session entry includes the active AI state, if any, the last known AI provider hint, the last known Codex task label, the shell basename, and the last known session context so reconnect can restore provider-aware titles and remote labels without waiting for a fresh prompt. `WorkspaceInfo` sends workspace metadata (name, accent color, split direction, and project root path).
+`SessionList` returns all sessions grouped by workspace in response to `ListSessions`. Each [[crates/scribe-common/src/protocol.rs#SessionInfo]] carries the active AI state, AI provider hint, Codex task label, shell basename, session context, CWD, and detected git branch — enough for the client to restore provider-aware titles, remote labels, and status-bar branches without any post-attach metadata fan-out. A batched `workspaces: Vec<WorkspaceListEntry>` field delivers per-workspace names, accent colors, split direction, and project root paths alongside the session list. `WorkspaceInfo` messages still exist for non-attach flows (session creation, auto-naming).
 
 When `SessionList` also includes a workspace tree, that tree is the authoritative workspace layout. The `split_direction` field is only needed for the legacy reconnect fallback where older servers omit the tree and the client must repair the linear default layout once during startup.
 
@@ -116,7 +124,7 @@ Automation responses expose connected windows to the CLI and let the server forw
 
 ## Screen Snapshots
 
-The wire format for terminal state, defined in [[crates/scribe-common/src/screen.rs#ScreenSnapshot]].
+The per-cell terminal-state wire format, defined in [[crates/scribe-common/src/screen.rs#ScreenSnapshot]]. Used by tooling (`RequestSnapshot`, scribe-cli, scribe-test JSON/PNG capture) that needs a direct cell-level representation. The client reattach path uses the denser [[protocol#Server Messages#Terminal Output#SessionReplay]] format instead.
 
 ### ScreenSnapshot
 

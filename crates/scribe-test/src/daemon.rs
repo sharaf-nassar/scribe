@@ -263,6 +263,7 @@ async fn dispatch_server_message(
     match msg {
         msg @ (ServerMessage::PtyOutput { .. }
         | ServerMessage::ScreenSnapshot { .. }
+        | ServerMessage::SessionReplay { .. }
         | ServerMessage::CwdChanged { .. }
         | ServerMessage::TitleChanged { .. }
         | ServerMessage::SessionCreated { .. }
@@ -311,6 +312,13 @@ async fn dispatch_session_message(
         }
         ServerMessage::ScreenSnapshot { session_id, snapshot } => {
             handle_screen_snapshot(session_id, snapshot, state).await;
+        }
+        ServerMessage::SessionReplay { session_id, .. } => {
+            // Attach reply uses `SessionReplay` instead of `ScreenSnapshot`.
+            // The test daemon drives assertions off the `RequestSnapshot`
+            // path (which still returns `ScreenSnapshot`), so the attach
+            // replay is intentionally ignored here.
+            debug!(%session_id, "session replay (ignored by test daemon)");
         }
         ServerMessage::CwdChanged { session_id, cwd } => {
             handle_cwd_changed(session_id, cwd, state, notifiers).await;

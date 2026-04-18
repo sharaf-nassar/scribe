@@ -56,9 +56,11 @@ Client disconnection clears the client writer, while PTY EOF removes that sessio
 
 Each live session also tracks the current client's attached-session set alongside its writer. Reattach swaps both handles together, disconnect clears both, and PTY EOF removes the session ID from that per-client set before the connection loop sees the exit. Long-lived clients therefore do not accumulate stale attachment IDs as short-lived sessions churn.
 
-`ipc_server.rs` remains the transport and message-dispatch layer for `AttachSessions`, but `attach_flow.rs` now owns the reattach sequence itself: attach-entry preparation from live sessions, pre-snapshot Term and PTY resize, stored metadata and workspace replay, screen snapshot delivery, and the delayed client-writer install.
+`ipc_server.rs` remains the transport and message-dispatch layer for `AttachSessions`, but [[crates/scribe-server/src/attach_flow.rs]] owns the reattach sequence itself: attach-entry preparation from live sessions, pre-snapshot Term and PTY resize, [[crates/scribe-server/src/attach_flow.rs#take_session_replay]] for the zstd-compressed ANSI replay, and the delayed client-writer install. Per-session metadata and per-workspace names travel on the preceding `SessionList` response, so the attach fan-out is just `SessionCreated` + `SessionReplay` per session.
 
-When a new client attaches, the attach flow usually resizes each session's Term and PTY to the client-provided dimensions before taking the snapshot. This ensures the snapshot matches the client's pane grid and absorbs the shell's SIGWINCH response before the client writer is set. Sessions still serving a preserved hot-reload handoff snapshot skip that pre-snapshot resize so a live foreground process cannot redraw over the pre-upgrade history before the first replay reaches the client.
+Each session's attach work runs on its own `tokio::spawn`ed task and the per-session futures are driven via `futures::future::join_all`, so the CPU-heavy snapshot/compression steps proceed concurrently across worker threads. The shared IPC writer is a `tokio::sync::Mutex`, which serializes only the final wire writes without blocking the parallel replay builds.
+
+When a new client attaches, the attach flow usually resizes each session's Term and PTY to the client-provided dimensions before taking the replay. This ensures the replay matches the client's pane grid and absorbs the shell's SIGWINCH response before the client writer is set. Sessions still serving a preserved v4 legacy handoff snapshot skip that pre-replay resize so a live foreground process cannot redraw over the pre-upgrade history before the first replay reaches the client.
 
 When the connected-client map drops to zero, the server starts a short 250 ms grace timer before asking the singleton settings process to quit over `settings.sock`. If a client reconnects during that grace window, the settings shutdown is skipped so hot-reload or restart handoffs do not spuriously close the settings window.
 
@@ -100,17 +102,27 @@ Zero-downtime server upgrades are implemented in [[crates/scribe-server/src/hand
 
 The new server (with `--upgrade`) connects to the old server's handoff socket, sends `SCRIBE_UPGRADE` magic bytes, and receives serialized state plus PTY master fds via SCM_RIGHTS.
 
-An ACK confirms receipt. If the ACK is not received (version mismatch, peer crash), the old server logs the failure and loops back to accept the next connection — it keeps serving until a compatible upgrade succeeds or `postinst` cold-restarts it. The handoff version is tracked to detect incompatible format changes.
+An ACK confirms receipt. If the ACK is not received (version mismatch, peer crash), the old server logs the failure and loops back to accept the next connection — it keeps serving until a compatible upgrade succeeds or `postinst` cold-restarts it. The handoff version is tracked to detect incompatible format changes. The new server emits `"IPC server listening"` immediately after it binds the IPC socket (see [[crates/scribe-server/src/main.rs#run_server_loop]]), which is the Debian hot-reload watchdog's bind-ready signal — session restoration continues on the same task after that log so the watchdog never blocks on per-session work.
 
 ### State Transfer
 
-The HandoffState contains per-session metadata and workspace layout state for restart handoff.
+The HandoffState contains per-session metadata, per-session replay payload, and workspace layout state for restart handoff.
 
-Per-session payloads include title, shell basename, remote context, Codex task label, CWD, and AI state, including optional provider conversation IDs used for resume behavior.
-
-Per-session metadata includes ID, workspace, child PID, dimensions, screen snapshot, title, shell basename, remote/tmux context, CWD, AI state, and the launch-time AI-provider hint used for built-in Codex or Claude tabs. File descriptors are transferred one-for-one with the serialized session list.
+Per-session payloads include title, shell basename, remote context, Codex task label, CWD, AI state (including optional provider conversation IDs used for resume behavior), and a [[crates/scribe-common/src/screen_replay.rs#SessionReplay]] carrying the zstd-compressed ANSI replay for the session's visible grid plus scrollback. File descriptors are transferred one-for-one with the serialized session list.
 
 Per-workspace payloads include name, accent color, split direction, session list, and project root path. The project root is an additive `#[serde(default)]` field so handoff from older servers defaults to `None`.
+
+### Session Replay Encoding
+
+Both server-to-server hot-reload handoff and server-to-client reattach use the same primitive: a zstd-compressed ANSI replay that receivers feed through VTE to rebuild the `Term` durably.
+
+The unified format replaces the legacy per-cell `ScreenSnapshot` on the reattach wire, shrinking attach payloads by 20-100x and eliminating the duplicate snapshot → ANSI round-trip the old two-format split produced.
+
+Producers call [[crates/scribe-common/src/screen_replay.rs#build_session_replay]], which snapshots the `Term`, runs [[crates/scribe-common/src/screen_replay.rs#snapshot_to_ansi]] to emit the scrollback + visible grid + cursor as an ANSI byte stream, and zstd-compresses the result. Consumers (both `restore_from_handoff` and the client's reattach `handle_session_replay`) decompress and feed the bytes through `vte::ansi::Processor::advance` into a freshly-constructed `Term`, so the restored session's grid and scrollback are populated durably — every subsequent attach sees the same content, not just the first.
+
+The encoder emits an ED 2 (erase display) early, which on a fresh grid scrolls the blank viewport into scrollback; [[crates/scribe-server/src/session_manager.rs#SessionManager#restore_from_handoff]] and the v4-legacy branch of [[crates/scribe-server/src/attach_flow.rs#take_session_replay]] call `Grid::update_history` after the feed to trim that pseudo-scrollback back down to the source's true `scrollback_rows`. On the client, pane.feed_output absorbs the ED 2 into its own Term and the receiving scrollback is bounded by `terminal.scrollback_lines`.
+
+Alt-screen sessions carry only the visible grid in the replay; alt-grid history is a resize artifact rather than user content, and alt-screen applications (vim, Claude Code) redraw their own UI on reconnect.
 
 ### Defuse Strategy
 
@@ -122,11 +134,13 @@ The new server already holds the master fds via SCM_RIGHTS. Because defused sess
 
 Maximum handoff state size is 1 GiB. Maximum file descriptors transferred is 1024. Both the sender and receiver verify peer UID for defense-in-depth.
 
+Typical v5 compressed payloads are in the low tens of megabytes even for many sessions at the default `scrollback_lines = 10_000`, since the ANSI replay + zstd combination is roughly 20-100x denser than the v4 per-cell MessagePack encoding.
+
 ### Version Bumps
 
 Bump [[crates/scribe-server/src/handoff.rs#HANDOFF_VERSION]] when [[crates/scribe-server/src/handoff.rs#HandoffState]] changes incompatibly. Additive per-session fields that use `#[serde(default)]` stay on the current version so hot-reload can still accept state from the immediately previous server.
 
-A mismatch causes the handoff to fail and `postinst` to cold-restart, killing all sessions. Do NOT bump for code-only changes or backward-compatible additive state fields — those are handled by normal hot-reload.
+Every `HANDOFF_VERSION` bump MUST ship a receiver capable of decoding the immediately previous version (N-1). The sender writes only the current format; the receiver branches on the version byte and carries both decoders. Cold-restart is permitted only when hot-reload is genuinely impossible: missing decoder for the peer's version (off by more than one normal release step), operational failure (OOM, fd/size limits, socket or zstd decode error, corrupted payload), or downgrade. A normal forward upgrade through any two consecutive releases must hot-reload without terminating sessions.
 
 On Linux that cold-restart path must also clean up any detached `scribe-server --upgrade` process left behind by the failed handoff before starting the user service again; otherwise the stale process can keep `server.sock` and `server.lock`, causing the restarted unit to fail with "another scribe-server is already running".
 
@@ -134,7 +148,7 @@ On Linux that cold-restart path must also clean up any detached `scribe-server -
 
 All three binaries (server, client, settings) use SHA-256 hash comparison to skip unnecessary restarts during upgrades, and Linux server upgrades also track a persisted runtime-generation stamp for launcher and service behavior changes.
 
-On Linux, `postinst` compares each running binary (`/proc/PID/exe`) against the installed copy and also checks whether the desired `server-runtime-generation` differs from the stamp recorded in `/run/user/{uid}/{app}/server-runtime-generation`. That stamp is an opaque SHA-256 signature derived from the launch-critical `postinst` functions and the installed user service unit, not a hand-maintained integer, so maintainer-script and service-launch changes automatically force hot-reload even when the server binary is unchanged. When `postinst` launches replacement user processes, it prefers GUI session variables from `systemctl --user show-environment` and only falls back to the invoking shell for values the user manager lacks. Client relaunches now wait for the previously running client PIDs to exit before spawning the replacement and skip relaunch if an old client refuses to die, which prevents a fresh client from receiving an empty `SessionList` and cold-restoring a duplicate window while the server still marks the old window connected. If Linux must fall back to a cold server restart, the package script still relaunches any previously running client window even when the client binary is unchanged because that client exits on `ServerDisconnected`. On macOS, the [[server#Updater]] compares old (`.app.prev`) and new app bundle binaries before deciding which components to restart. Hash comparison failure is treated as "changed" for safety. Use `just restart-server` for manual hot-reload.
+On Linux, `postinst` compares each running binary (`/proc/PID/exe`) against the installed copy and also checks whether the desired `server-runtime-generation` differs from the stamp recorded in `/run/user/{uid}/{app}/server-runtime-generation`. That stamp is an opaque SHA-256 signature derived from the launch-critical `postinst` functions and the installed user service unit, not a hand-maintained integer, so maintainer-script and service-launch changes automatically force hot-reload even when the server binary is unchanged. When `postinst` launches replacement user processes, it prefers GUI session variables from `systemctl --user show-environment` and only falls back to the invoking shell for values the user manager lacks. Client relaunches now wait for the previously running client PIDs to exit before spawning the replacement and skip relaunch if an old client refuses to die, which prevents a fresh client from receiving an empty `SessionList` and cold-restoring a duplicate window while the server still marks the old window connected. The Debian hot-reload watchdog now waits up to 30 seconds for the replacement server to bind its IPC socket, because large handoff snapshots can take substantially longer than 5 seconds to transfer and restore. If Linux must fall back to a cold server restart, the package script still relaunches any previously running client window even when the client binary is unchanged because that client exits on `ServerDisconnected`. On macOS, the [[server#Updater]] compares old (`.app.prev`) and new app bundle binaries before deciding which components to restart. Hash comparison failure is treated as "changed" for safety. Use `just restart-server` for manual hot-reload.
 
 ## Updater
 
@@ -162,7 +176,7 @@ On macOS, the existing `.app` bundle is renamed to an adjacent `.app.prev` backu
 
 After a successful `ditto`, the updater attempts a zero-downtime handoff by running `launchctl kickstart -k` to restart the launchd service in-place.
 
-If `kickstart` is unavailable or fails, it falls back to spawning the new binary with `--upgrade` and waits up to 10 seconds for the handoff to complete. If the handoff times out, the updater broadcasts `CompletedRestartRequired` to all connected clients so the UI can prompt the user to restart manually.
+If `kickstart` is unavailable or fails, it falls back to spawning the new binary with `--upgrade` and waits up to 30 seconds for the handoff to complete. The longer timeout avoids false restart-required fallbacks when large handoff snapshots take longer to transfer and restore. If the handoff still times out, the updater broadcasts `CompletedRestartRequired` to all connected clients so the UI can prompt the user to restart manually.
 
 ### Configuration
 

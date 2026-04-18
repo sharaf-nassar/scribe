@@ -80,7 +80,7 @@ A single `thiserror`-derived enum covering all error conditions that cross crate
 
 Length-prefixed MessagePack framing over async streams, used for all IPC connections in the [[protocol]].
 
-The wire format is a 4-byte big-endian `u32` length followed by an `rmp_serde` payload. The `MAX_MESSAGE_SIZE` constant caps messages at 256 MiB to accommodate large `ScreenSnapshot` batches sent during session reattach. [[crates/scribe-common/src/framing.rs#read_message]] and [[crates/scribe-common/src/framing.rs#write_message]] are generic async functions that work with any `AsyncReadExt`/`AsyncWriteExt` + `Unpin` stream.
+The wire format is a 4-byte big-endian `u32` length followed by an `rmp_serde` payload. The `MAX_MESSAGE_SIZE` constant caps messages at 256 MiB; the cap survives from the legacy per-cell `ScreenSnapshot` era and is now headroom for `RequestSnapshot` tooling — live reattach uses zstd-compressed ANSI replays that are typically orders of magnitude smaller. [[crates/scribe-common/src/framing.rs#read_message]] and [[crates/scribe-common/src/framing.rs#write_message]] are generic async functions that work with any `AsyncReadExt`/`AsyncWriteExt` + `Unpin` stream.
 
 ## Identity Types
 
@@ -90,9 +90,15 @@ Three ID types are defined in [[crates/scribe-common/src/ids.rs]]: `SessionId` (
 
 ## Screen Snapshots
 
-Serializable terminal screen state for IPC transport, used when reconnecting a client to a running session.
+Serializable per-cell terminal screen state used inside the server and for `RequestSnapshot` tooling. Client reattach uses the denser [[common#Session Replay]] encoding instead.
 
-[[crates/scribe-common/src/screen.rs#ScreenSnapshot]] carries the full visible grid as a flat `Vec<ScreenCell>`, dimensions, cursor position and style, alternate-screen flag, and scrollback rows. [[crates/scribe-common/src/screen.rs#ScreenCell]] holds a character, foreground/background color, and cell attribute flags. [[crates/scribe-common/src/screen.rs#ScreenColor]] is a three-variant enum (`Named(u16)`, `Indexed(u8)`, `Rgb`) that uses `u16` for named colors to accommodate alacritty_terminal's extended named color indices above 255. [[crates/scribe-common/src/screen.rs#CellFlags]] includes both wide-character placeholders and `WRAPLINE` state so reconnect snapshot replay can preserve logical soft-wrapped lines. [[crates/scribe-common/src/screen.rs#CursorStyle]] completes the rendering model.
+[[crates/scribe-common/src/screen.rs#ScreenSnapshot]] carries the full visible grid as a flat `Vec<ScreenCell>`, dimensions, cursor position and style, alternate-screen flag, and scrollback rows. [[crates/scribe-common/src/screen.rs#ScreenCell]] holds a character, foreground/background color, and cell attribute flags. [[crates/scribe-common/src/screen.rs#ScreenColor]] is a three-variant enum (`Named(u16)`, `Indexed(u8)`, `Rgb`) that uses `u16` for named colors to accommodate alacritty_terminal's extended named color indices above 255. [[crates/scribe-common/src/screen.rs#CellFlags]] includes both wide-character placeholders and `WRAPLINE` state so the ANSI encoder can preserve logical soft-wrapped lines. [[crates/scribe-common/src/screen.rs#CursorStyle]] completes the rendering model.
+
+## Session Replay
+
+[[crates/scribe-common/src/screen_replay.rs#SessionReplay]] is the unified primitive for transferring a terminal's state to a receiver that will rebuild a VTE `Term`.
+
+Carries cols/rows/scrollback-rows, cursor fields, alt-screen flag, and a zstd-compressed ANSI byte stream produced by [[crates/scribe-common/src/screen_replay.rs#snapshot_to_ansi]] and compressed by [[crates/scribe-common/src/screen_replay.rs#build_session_replay]]. Both server hot-reload handoff and server → client reattach use this same encoding — receivers decompress via [[crates/scribe-common/src/screen_replay.rs#decompress_session_replay]] and feed the bytes through `vte::ansi::Processor::advance`.
 
 ## Socket Paths
 
