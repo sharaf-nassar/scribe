@@ -1369,6 +1369,35 @@
               <div class="segment-opt" data-value="always">Always</div>
             </div>
           </div>
+          <div id="notifications-timeout-mode-row" class="setting-row platform-linux-only">
+            <div class="setting-info">
+              <div class="setting-label">Timeout Mode</div>
+              <div class="setting-desc">Use the desktop default timeout, choose a custom number of seconds, or keep notifications visible until dismissed</div>
+            </div>
+            <div class="segmented-control" data-key="notifications.timeout_mode">
+              <div class="segment-opt active" data-value="system_default">System</div>
+              <div class="segment-opt" data-value="custom">Seconds</div>
+              <div class="segment-opt" data-value="never">Always display</div>
+            </div>
+          </div>
+          <div id="notifications-timeout-secs-row" class="setting-row platform-linux-only">
+            <div class="setting-info">
+              <div class="setting-label">Timeout Seconds</div>
+              <div class="setting-desc">Used when Timeout Mode is set to Seconds</div>
+            </div>
+            <div class="number-control" data-key="notifications.timeout_secs" data-min="1" data-max="300" data-step="1">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">10</div>
+              <div class="number-btn">+</div>
+            </div>
+          </div>
+          <div id="notifications-macos-settings-row" class="setting-row platform-macos-only">
+            <div class="setting-info">
+              <div class="setting-label">Persistent Notifications</div>
+              <div class="setting-desc">Open macOS Notifications settings, select this app, and choose Persistent to keep banners visible until dismissed</div>
+            </div>
+            <button id="notifications-open-macos-settings" class="action-btn" type="button">Open macOS Settings</button>
+          </div>
         </div>
       </div>
     </div>

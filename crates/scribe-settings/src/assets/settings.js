@@ -2,10 +2,19 @@
 
 // ─────────── IPC ───────────
 
-function sendChange(key, value) {
+function sendIpc(message) {
   if (window.ipc && window.ipc.postMessage) {
-    window.ipc.postMessage(JSON.stringify({ type: "setting_changed", key, value }));
+    window.ipc.postMessage(JSON.stringify(message));
   }
+}
+
+function sendChange(key, value) {
+  sendIpc({ type: "setting_changed", key, value });
+}
+
+function sendHostAction(type, extra) {
+  var payload = Object.assign({ type: type }, extra || {});
+  sendIpc(payload);
 }
 
 // ─────────── State ───────────
@@ -32,6 +41,41 @@ function rerenderAllKeybindingBadges() {
 function setPlatform(platform) {
   window.SCRIBE_PLATFORM = platform || "linux";
   rerenderAllKeybindingBadges();
+  updateNotificationPlatformRows();
+}
+
+function setPlatformVisibility(selector, shouldShow) {
+  document.querySelectorAll(selector).forEach(function(el) {
+    el.classList.toggle("platform-hidden", !shouldShow);
+  });
+}
+
+function notificationTimeoutMode() {
+  return currentConfig.notifications?.timeout_mode || "system_default";
+}
+
+function updateNotificationTimeoutVisibility() {
+  var isLinux = window.SCRIBE_PLATFORM === "linux";
+  var customTimeout = notificationTimeoutMode() === "custom";
+  setPlatformVisibility("#notifications-timeout-secs-row", isLinux && customTimeout);
+}
+
+function updateNotificationPlatformRows() {
+  var isLinux = window.SCRIBE_PLATFORM === "linux";
+  var isMac = window.SCRIBE_PLATFORM === "macos";
+
+  setPlatformVisibility(".platform-linux-only", isLinux);
+  setPlatformVisibility(".platform-macos-only", isMac);
+  updateNotificationTimeoutVisibility();
+}
+
+function syncNotificationConfigValue(key, value) {
+  if (!currentConfig.notifications) {
+    currentConfig.notifications = {};
+  }
+
+  var notificationsKey = key.slice("notifications.".length);
+  currentConfig.notifications[notificationsKey] = value;
 }
 
 // ─────────── Theme Grid ───────────
@@ -452,8 +496,15 @@ function loadFontList(fonts) {
 }
 
 function requestFontRefresh() {
-  if (window.ipc && window.ipc.postMessage) {
-    window.ipc.postMessage(JSON.stringify({ type: "request_fonts" }));
+  sendHostAction("request_fonts");
+}
+
+function initNotificationActions() {
+  var macSettingsBtn = document.getElementById("notifications-open-macos-settings");
+  if (macSettingsBtn) {
+    macSettingsBtn.addEventListener("click", function() {
+      sendHostAction("open_macos_notification_settings");
+    });
   }
 }
 
@@ -531,18 +582,27 @@ function initSteppers() {
     btns[0].addEventListener("click", function() {
       var val = clamp(parseFloat(valueEl.value) - step);
       valueEl.value = String(val);
+      if (key.indexOf("notifications.") === 0) {
+        syncNotificationConfigValue(key, val);
+      }
       sendChange(key, val);
     });
 
     btns[1].addEventListener("click", function() {
       var val = clamp(parseFloat(valueEl.value) + step);
       valueEl.value = String(val);
+      if (key.indexOf("notifications.") === 0) {
+        syncNotificationConfigValue(key, val);
+      }
       sendChange(key, val);
     });
 
     valueEl.addEventListener("blur", function() {
       var val = clamp(valueEl.value);
       valueEl.value = String(val);
+      if (key.indexOf("notifications.") === 0) {
+        syncNotificationConfigValue(key, val);
+      }
       sendChange(key, val);
     });
 
@@ -589,6 +649,12 @@ function initSegmented() {
         var value = opt.getAttribute("data-value");
         opts.forEach(function(o) { o.classList.remove("active"); });
         opt.classList.add("active");
+        if (key.indexOf("notifications.") === 0) {
+          syncNotificationConfigValue(key, value);
+          if (key === "notifications.timeout_mode") {
+            updateNotificationTimeoutVisibility();
+          }
+        }
         sendChange(key, value);
       });
     });
@@ -865,6 +931,9 @@ function loadConfig(config) {
   // Notifications
   setToggleValue('notifications.enabled', config.notifications?.enabled ?? true);
   setSegmentedValue('notifications.condition', config.notifications?.condition ?? 'when_unfocused');
+  setSegmentedValue('notifications.timeout_mode', config.notifications?.timeout_mode ?? 'system_default');
+  setStepperValue('notifications.timeout_secs', config.notifications?.timeout_secs ?? 10);
+  updateNotificationPlatformRows();
 }
 
 // ─────────── Value Setters ───────────
@@ -1648,6 +1717,7 @@ function filterAllSettings(query) {
 // ─────────── Init ───────────
 
 document.addEventListener("DOMContentLoaded", function() {
+  updateNotificationPlatformRows();
   initNavigation();
   initSteppers();
   initToggles();
@@ -1703,6 +1773,7 @@ document.addEventListener("DOMContentLoaded", function() {
 
   initWorkspaces();
   initBadgeColorReset();
+  initNotificationActions();
   initGlobalSearch();
   initKeybindingRecorder();
 

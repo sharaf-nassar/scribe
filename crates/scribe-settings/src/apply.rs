@@ -512,6 +512,18 @@ fn apply_notifications_key(
                 other => return Err(format!("unknown notify condition: {other}")),
             };
         }
+        "notifications.timeout_mode" => {
+            let s = value.as_str().ok_or("notifications.timeout_mode must be a string")?;
+            config.notifications.timeout_mode = match s {
+                "system_default" => scribe_common::config::NotifyTimeoutMode::SystemDefault,
+                "custom" => scribe_common::config::NotifyTimeoutMode::Custom,
+                "never" => scribe_common::config::NotifyTimeoutMode::Never,
+                other => return Err(format!("unknown notify timeout mode: {other}")),
+            };
+        }
+        "notifications.timeout_secs" => {
+            config.notifications.timeout_secs = parse_number(value, "notifications.timeout_secs")?;
+        }
         _ => return Err(format!("unhandled notifications key: {key}")),
     }
 

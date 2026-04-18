@@ -216,6 +216,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_notification_timeout_secs() -> u32 {
+    10
+}
+
 fn default_opacity() -> f32 {
     1.0
 }
@@ -1375,6 +1379,19 @@ pub enum NotifyCondition {
     WhenUnfocusedOrBackgroundTab,
 }
 
+/// How Linux desktop notification expiry should be handled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyTimeoutMode {
+    /// Let the desktop notification server choose its default timeout.
+    #[default]
+    SystemDefault,
+    /// Use the configured `timeout_secs` value.
+    Custom,
+    /// Keep the notification visible until the user dismisses it.
+    Never,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationsConfig {
     /// Enable desktop notifications when an AI session finishes processing.
@@ -1383,11 +1400,22 @@ pub struct NotificationsConfig {
     /// When notifications should fire relative to window/tab focus.
     #[serde(default)]
     pub condition: NotifyCondition,
+    /// Linux-only timeout mode for desktop notifications.
+    #[serde(default)]
+    pub timeout_mode: NotifyTimeoutMode,
+    /// Timeout used when `timeout_mode` is `Custom`.
+    #[serde(default = "default_notification_timeout_secs")]
+    pub timeout_secs: u32,
 }
 
 impl Default for NotificationsConfig {
     fn default() -> Self {
-        Self { enabled: true, condition: NotifyCondition::default() }
+        Self {
+            enabled: true,
+            condition: NotifyCondition::default(),
+            timeout_mode: NotifyTimeoutMode::default(),
+            timeout_secs: default_notification_timeout_secs(),
+        }
     }
 }
 

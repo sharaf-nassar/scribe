@@ -1221,6 +1221,7 @@ impl App {
 
     fn handle_bell_event(&mut self, session_id: SessionId) {
         if (!self.focus.window_focused || self.focused_session_id() != Some(session_id))
+            && self.update_available.is_none()
             && let Some(window) = &self.window
         {
             window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
@@ -2783,8 +2784,15 @@ impl App {
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(proxy) = self.animation_proxy.clone() {
+            let notification_config = self.notification_tracker.config().clone();
             std::thread::spawn(move || {
-                notifications::fire_os_notification(&summary, &body, session_id, &proxy);
+                notifications::fire_os_notification(
+                    &summary,
+                    &body,
+                    session_id,
+                    &proxy,
+                    &notification_config,
+                );
             });
         }
 
@@ -2792,8 +2800,13 @@ impl App {
         // which GNOME turns into a second "is ready" shell notification.
         // Keep the explicit OS notification there and reserve user-attention
         // requests for platforms where it manifests as dock/taskbar flair.
+        // If an update is already announced in the window title, suppress
+        // extra attention requests so macOS does not re-surface the update
+        // notification text for unrelated AI state changes.
         #[cfg(not(target_os = "linux"))]
-        if let Some(window) = &self.window {
+        if self.update_available.is_none()
+            && let Some(window) = &self.window
+        {
             window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
         }
     }

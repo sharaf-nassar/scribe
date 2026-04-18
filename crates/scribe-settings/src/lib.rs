@@ -183,13 +183,34 @@ fn inject_initial_webview_state(webview: &wry::WebView, config_json: &str) {
     inject_font_list(webview);
 }
 
-/// Detect whether a webview IPC request is asking for the font list.
-fn is_requesting_fonts(body: &str) -> bool {
+/// Extract the `type` field from a webview IPC request body.
+fn settings_ipc_request_type(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
-        .as_deref()
-        == Some("request_fonts")
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_notification_settings() {
+    let url = "x-apple.systempreferences:com.apple.preference.notifications";
+    if let Err(e) = std::process::Command::new("open").arg(url).spawn() {
+        tracing::warn!("failed to open macOS notification settings: {e}");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_macos_notification_settings() {}
+
+/// Handle a webview IPC request that asks the host to perform an action.
+fn handle_settings_ipc_action(kind: &str) -> bool {
+    match kind {
+        "request_fonts" => true,
+        "open_macos_notification_settings" => {
+            open_macos_notification_settings();
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Handle an IPC request from the settings webview.
@@ -198,14 +219,25 @@ fn handle_settings_ipc_request<F: Fn(String)>(
     webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
     on_change: &F,
 ) {
-    if is_requesting_fonts(body) {
-        if let Some(wv) = webview_ref.borrow().as_ref() {
-            inject_font_list(wv);
+    if let Some(kind) = settings_ipc_request_type(body) {
+        if kind == "request_fonts" {
+            if let Some(wv) = webview_ref.borrow().as_ref() {
+                inject_font_list(wv);
+            }
+            return;
         }
+        if handle_settings_ipc_action(&kind) {
+            return;
+        }
+        if kind == "setting_changed" {
+            on_change(body.to_owned());
+            return;
+        }
+        tracing::debug!(kind, "unhandled settings IPC request");
         return;
     }
 
-    on_change(body.to_owned());
+    tracing::debug!("settings IPC request missing type");
 }
 
 #[cfg(target_os = "macos")]

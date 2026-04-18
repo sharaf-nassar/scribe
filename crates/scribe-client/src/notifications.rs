@@ -122,6 +122,7 @@ pub fn fire_os_notification(
     body: &str,
     session_id: SessionId,
     proxy: &winit::event_loop::EventLoopProxy<super::ipc_client::UiEvent>,
+    config: &NotificationsConfig,
 ) {
     use notify_rust::Notification;
 
@@ -131,9 +132,24 @@ pub fn fire_os_notification(
 
     #[cfg(target_os = "linux")]
     {
+        use notify_rust::Timeout;
+        use scribe_common::config::NotifyTimeoutMode;
+
         notif.icon(identity.slug());
         notif.hint(notify_rust::Hint::DesktopEntry(identity.slug().to_owned()));
         notif.action("default", "Focus");
+        match config.timeout_mode {
+            NotifyTimeoutMode::SystemDefault => {
+                notif.timeout(Timeout::Default);
+            }
+            NotifyTimeoutMode::Custom => {
+                let millis = config.timeout_secs.saturating_mul(1000);
+                notif.timeout(Timeout::Milliseconds(millis));
+            }
+            NotifyTimeoutMode::Never => {
+                notif.timeout(Timeout::Never);
+            }
+        }
     }
 
     match notif.show() {
@@ -147,7 +163,7 @@ pub fn fire_os_notification(
             // Focused(true) handler calls take_pending_focus().
             #[cfg(target_os = "macos")]
             {
-                let _ = (handle, proxy);
+                let _ = (config, handle, proxy);
             }
         }
         Err(e) => {

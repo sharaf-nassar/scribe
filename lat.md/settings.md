@@ -20,7 +20,7 @@ The `list_monospace_fonts` function queries fontdb for all system monospace font
 
 Linux uses GTK3 with glib socket/signal watchers; macOS uses tao EventLoop with background threads.
 
-The settings frontend formats shortcut badges from the injected platform flag. On macOS, both `cmd` and `super` modifiers render as the `⌘` glyph, and the platform is injected before config so reopened settings windows do not fall back to Linux-style `Super` labels. Search indexes the raw shortcut plus modifier aliases, so queries like `command`, `cmd`, or `super` still find `⌘`-rendered keybindings. Bare `cmd+w` is handled at the tao window layer and closes the settings window through the same path as a native close request.
+The settings frontend formats shortcut badges from the injected platform flag. On macOS, both `cmd` and `super` modifiers render as the `⌘` glyph, and the platform is injected before config so reopened settings windows do not fall back to Linux-style `Super` labels. Search indexes the raw shortcut plus modifier aliases, so queries like `command`, `cmd`, or `super` still find `⌘`-rendered keybindings. Bare `cmd+w` is handled at the tao window layer and closes the settings window through the same path as a native close request. The Notifications page also uses the platform flag to show Linux-only timeout controls or, on macOS, a shortcut button that opens the system Notifications pane.
 
 ## Config Application
 
@@ -72,9 +72,9 @@ Controls the auto-update behavior: `enabled` (bool), `check_interval` (integer h
 
 ### Notification Keys
 
-Desktop notification settings: `enabled` (bool) and `condition` (when to fire).
+Desktop notification settings cover enablement, focus suppression, and Linux-only timeout behavior.
 
-`enabled` (default true) toggles notifications on or off. `condition` selects `when_unfocused` (default, only when the OS window lacks focus), `when_unfocused_or_background_tab` (also when the session is on a background tab in a focused window), or `always` (never suppress for focus reasons).
+`enabled` (default true) toggles notifications on or off. `condition` selects `when_unfocused` (default, only when the OS window lacks focus), `when_unfocused_or_background_tab` (also when the session is on a background tab in a focused window), or `always` (never suppress for focus reasons). On Linux, `timeout_mode` selects `system_default`, `custom`, or `never`, and `timeout_secs` stores the custom timeout in seconds when that mode is active. On macOS the settings page hides those config keys and instead exposes a button that opens the system Notifications pane so the user can switch this app to the persistent notification style.
 
 ### Workspace Keys
 
