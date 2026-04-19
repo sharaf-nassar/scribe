@@ -402,6 +402,8 @@ case "$1" in
         XDG_DIR="/run/user/${TARGET_UID}"
         STATE_DIR="/run/user/${TARGET_UID}/${APP_SLUG}"
         SOCK="${STATE_DIR}/server.sock"
+        DEFER_COLD_RESTART_FLAG="${STATE_DIR}/update-defer-cold-restart"
+        RESTART_REQUIRED_FLAG="${STATE_DIR}/update-restart-required"
         SERVER_RUNTIME_GENERATION_FILE="${STATE_DIR}/server-runtime-generation"
 
         ensure_state_dir
@@ -422,6 +424,7 @@ case "$1" in
             UPGRADE_BIN="$SERVER_BIN_PATH"
             SERVER_READY=1
             SERVER_COLD_RESTARTED=0
+            SERVER_RESTART_DEFERRED=0
 
             # Compare the newly installed binary against the running one.
             # /proc/PID/exe still points to the old (deleted) binary on disk;
@@ -539,23 +542,32 @@ case "$1" in
                     fi
                     echo ""
 
-                    # Prompt only when the previous server is still alive and
-                    # a cold restart would terminate any open sessions it owns.
-                    if [ "$ORIGINAL_SERVER_ALIVE" = "1" ] && [ -e /dev/tty ]; then
-                        printf "  Save your work, then press Enter to restart... "
-                        read -r _ < /dev/tty 2>/dev/null || true
-                    fi
-
-                    if cold_restart_server; then
-                        SERVER_COLD_RESTARTED=1
-                        record_server_runtime_generation
-                        echo ""
-                        echo "  ✓ Scribe server restarted with new version."
+                    if [ "$ORIGINAL_SERVER_ALIVE" = "1" ] && [ -f "$DEFER_COLD_RESTART_FLAG" ]; then
+                        printf '' > "${RESTART_REQUIRED_FLAG}" 2>/dev/null || true
+                        chmod 0600 "${RESTART_REQUIRED_FLAG}" 2>/dev/null || true
+                        chown "${TARGET_UID}:${TARGET_UID}" "${RESTART_REQUIRED_FLAG}" 2>/dev/null || true
+                        rm -f "${DEFER_COLD_RESTART_FLAG}" 2>/dev/null || true
+                        SERVER_RESTART_DEFERRED=1
+                        echo "  Restart deferred — continue from the ${APP_DISPLAY_NAME} update prompt when ready."
                     else
-                        echo ""
-                        echo "  ✗ Scribe server restart failed."
-                        echo "    Run 'systemctl --user status ${SERVICE_NAME}' for details."
-                        SERVER_READY=0
+                        # Prompt only when the previous server is still alive and
+                        # a cold restart would terminate any open sessions it owns.
+                        if [ "$ORIGINAL_SERVER_ALIVE" = "1" ] && [ -e /dev/tty ]; then
+                            printf "  Save your work, then press Enter to restart... "
+                            read -r _ < /dev/tty 2>/dev/null || true
+                        fi
+
+                        if cold_restart_server; then
+                            SERVER_COLD_RESTARTED=1
+                            record_server_runtime_generation
+                            echo ""
+                            echo "  ✓ Scribe server restarted with new version."
+                        else
+                            echo ""
+                            echo "  ✗ Scribe server restart failed."
+                            echo "    Run 'systemctl --user status ${SERVICE_NAME}' for details."
+                            SERVER_READY=0
+                        fi
                     fi
                 fi
             fi
@@ -563,7 +575,9 @@ case "$1" in
             # Relaunch client only if the binary changed.
             CLIENT_PIDS_FILE="${STATE_DIR}/upgrade-client-pids"
             CLIENT_PIDS=$(cat "${CLIENT_PIDS_FILE}" 2>/dev/null || true)
-            if [ "$SERVER_READY" = "1" ] && [ -n "$CLIENT_PIDS" ]; then
+            if [ "$SERVER_RESTART_DEFERRED" = "1" ] && [ -n "$CLIENT_PIDS" ]; then
+                echo "  Skipping client relaunch until the deferred cold restart is approved."
+            elif [ "$SERVER_READY" = "1" ] && [ -n "$CLIENT_PIDS" ]; then
                 # Pick first PID for hash comparison (all instances run the same binary).
                 FIRST_CLIENT_PID="${CLIENT_PIDS%% *}"
                 if [ "$SERVER_COLD_RESTARTED" = "1" ] || \
@@ -601,7 +615,9 @@ case "$1" in
 
             # Relaunch settings only if the binary changed.
             SETTINGS_PID=$(cat "${STATE_DIR}/upgrade-settings-pid" 2>/dev/null | tr -d '[:space:]' || true)
-            if [ "$SERVER_READY" = "1" ] && [ -n "$SETTINGS_PID" ]; then
+            if [ "$SERVER_RESTART_DEFERRED" = "1" ] && [ -n "$SETTINGS_PID" ]; then
+                echo "  Skipping settings relaunch until the deferred cold restart is approved."
+            elif [ "$SERVER_READY" = "1" ] && [ -n "$SETTINGS_PID" ]; then
                 if binary_changed "$SETTINGS_PID" "$SETTINGS_BIN_PATH"; then
                     restart_singleton_binary "settings" "$SETTINGS_PID" "$SETTINGS_BIN_PATH"
                 else

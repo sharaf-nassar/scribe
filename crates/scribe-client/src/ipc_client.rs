@@ -17,7 +17,7 @@ use scribe_common::protocol::{
     AutomationAction, ClientMessage, PromptMarkKind, SearchMatch, ServerMessage, TerminalSize,
     UpdateProgressState,
 };
-use scribe_common::socket::server_socket_path;
+use scribe_common::socket::{handoff_socket_path, server_socket_path};
 use tokio::io::AsyncWriteExt as _;
 use winit::event_loop::EventLoopProxy;
 
@@ -501,6 +501,245 @@ const SERVER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 /// directly as a detached background process.
 fn start_server() -> Result<(), String> {
     platform_start_server()
+}
+
+fn installed_binary_path(binary_name: &str) -> PathBuf {
+    std::env::current_exe()
+        .map_or_else(|_| PathBuf::from(binary_name), |exe| exe.with_file_name(binary_name))
+}
+
+fn listed_process_pids(process_name: &str) -> Result<Vec<u32>, String> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-x", process_name])
+        .output()
+        .map_err(|e| format!("failed to run pgrep for {process_name}: {e}"))?;
+
+    if !output.status.success() {
+        return if output.status.code() == Some(1) {
+            Ok(Vec::new())
+        } else {
+            Err(format!("pgrep -x {process_name} exited with {}", output.status))
+        };
+    }
+
+    Ok(output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            let line = std::str::from_utf8(line).ok()?.trim();
+            (!line.is_empty()).then(|| line.parse::<u32>().ok()).flatten()
+        })
+        .collect::<Vec<_>>())
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn wait_for_process_exit(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !process_is_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    !process_is_alive(pid)
+}
+
+fn wait_for_tracked_clients_to_exit(client_pids: &[u32]) {
+    for pid in client_pids {
+        let _ = wait_for_process_exit(*pid, std::time::Duration::from_secs(5));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+fn spawn_replacement_client(client_exe: &Path) -> Result<(), String> {
+    let child = std::process::Command::new(client_exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to relaunch client {}: {e}", client_exe.display()))?;
+
+    tracing::info!(
+        pid = child.id(),
+        exe = %client_exe.display(),
+        "spawned replacement client for deferred update restart"
+    );
+    Ok(())
+}
+
+fn wait_for_server_ready(timeout: std::time::Duration) -> Result<(), String> {
+    let socket_path = server_socket_path();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "scribe-server did not become ready within {}s after deferred restart",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_server_processes_running(uid: &str, server_exe: &str) -> Result<bool, String> {
+    let status = std::process::Command::new("pgrep")
+        .args(["-u", uid, "-f", server_exe])
+        .status()
+        .map_err(|e| format!("failed to run pgrep for server processes: {e}"))?;
+    Ok(status.success())
+}
+
+#[cfg(target_os = "linux")]
+fn perform_linux_update_restart(client_exe: &Path) -> Result<(), String> {
+    let identity = current_identity();
+    let service_name = identity.systemd_service_name();
+    let server_exe = client_exe.with_file_name(identity.server_binary_name());
+    let server_exe_str = server_exe.to_string_lossy().into_owned();
+    let uid = scribe_common::socket::current_uid().to_string();
+
+    sync_linux_service_environment();
+
+    drop(std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status());
+    drop(std::process::Command::new("systemctl").args(["--user", "stop", service_name]).status());
+
+    drop(
+        std::process::Command::new("pkill")
+            .args(["-u", uid.as_str(), "-f", server_exe_str.as_str()])
+            .status(),
+    );
+
+    for _ in 0..10 {
+        if !linux_server_processes_running(uid.as_str(), server_exe_str.as_str())? {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    if linux_server_processes_running(uid.as_str(), server_exe_str.as_str())? {
+        drop(
+            std::process::Command::new("pkill")
+                .args(["-9", "-u", uid.as_str(), "-f", server_exe_str.as_str()])
+                .status(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    drop(std::fs::remove_file(server_socket_path()));
+    drop(std::fs::remove_file(handoff_socket_path()));
+
+    drop(
+        std::process::Command::new("systemctl")
+            .args(["--user", "reset-failed", service_name])
+            .status(),
+    );
+
+    platform_start_server()?;
+    wait_for_server_ready(SERVER_STARTUP_TIMEOUT)
+}
+
+#[cfg(target_os = "macos")]
+fn connected_server_pid() -> Result<Option<i32>, String> {
+    use nix::sys::socket::{getsockopt, sockopt};
+
+    let stream = match std::os::unix::net::UnixStream::connect(server_socket_path()) {
+        Ok(stream) => stream,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("failed to connect to server socket: {e}")),
+    };
+
+    getsockopt(&stream, sockopt::LocalPeerPid)
+        .map(Some)
+        .map_err(|e| format!("failed to query running server pid: {e}"))
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_pid(pid: i32, label: &str) -> Result<(), String> {
+    let pid_str = pid.to_string();
+    let status = std::process::Command::new("kill")
+        .arg(pid_str.as_str())
+        .status()
+        .map_err(|e| format!("failed to signal {label} pid {pid}: {e}"))?;
+    if !status.success() {
+        return Err(format!("kill {pid} for {label} exited with {status}"));
+    }
+
+    if wait_for_process_exit(pid as u32, std::time::Duration::from_secs(5)) {
+        return Ok(());
+    }
+
+    let status = std::process::Command::new("kill")
+        .args(["-9", pid_str.as_str()])
+        .status()
+        .map_err(|e| format!("failed to force-kill {label} pid {pid}: {e}"))?;
+    if !status.success() {
+        return Err(format!("kill -9 {pid} for {label} exited with {status}"));
+    }
+
+    if wait_for_process_exit(pid as u32, std::time::Duration::from_secs(1)) {
+        Ok(())
+    } else {
+        Err(format!("timed out waiting for {label} pid {pid} to exit"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn perform_macos_update_restart() -> Result<(), String> {
+    if let Some(pid) = connected_server_pid()? {
+        terminate_pid(pid, "scribe-server")?;
+    }
+
+    let _ = std::fs::remove_file(server_socket_path());
+    let _ = std::fs::remove_file(handoff_socket_path());
+
+    platform_start_server()?;
+    wait_for_server_ready(SERVER_STARTUP_TIMEOUT)
+}
+
+/// Finish a deferred update that needs a true cold restart.
+///
+/// The helper captures the currently running client PIDs, restarts the server
+/// out-of-process, waits for the old windows to exit and flush restore state,
+/// then launches a single fresh client that will claim the restore snapshot
+/// and fan out additional windows as needed.
+pub fn finish_update_restart() -> Result<(), String> {
+    let identity = current_identity();
+    let client_exe = installed_binary_path(identity.client_binary_name());
+    let current_pid = std::process::id();
+    let client_pids = listed_process_pids(identity.client_binary_name())?
+        .into_iter()
+        .filter(|pid| *pid != current_pid)
+        .collect::<Vec<_>>();
+
+    #[cfg(target_os = "linux")]
+    perform_linux_update_restart(&client_exe)?;
+
+    #[cfg(target_os = "macos")]
+    perform_macos_update_restart()?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(String::from("deferred update restart is only supported on macOS and Linux"));
+
+    wait_for_tracked_clients_to_exit(&client_pids);
+    spawn_replacement_client(&client_exe)
 }
 
 #[cfg(target_os = "linux")]

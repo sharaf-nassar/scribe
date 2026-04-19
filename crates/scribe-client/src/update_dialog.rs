@@ -12,10 +12,19 @@ use crate::layout::Rect;
 /// What the user chose in the update dialog.
 #[derive(Clone, Copy)]
 pub enum UpdateAction {
-    /// Install the update now.
-    Confirm,
-    /// Dismiss the notification.
-    Dismiss,
+    /// Activate the dialog's primary button.
+    Primary,
+    /// Activate the dialog's secondary button.
+    Secondary,
+}
+
+/// Which update flow the dialog is currently confirming.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UpdateDialogKind {
+    /// Confirm download/install of a newly available update.
+    InstallAvailable,
+    /// Confirm a deferred cold restart after install completed.
+    RestartRequired,
 }
 
 /// Index of the currently focused button.
@@ -42,17 +51,14 @@ impl ButtonIndex {
 
     fn to_action(self) -> UpdateAction {
         match self {
-            Self::UpdateNow => UpdateAction::Confirm,
-            Self::Later => UpdateAction::Dismiss,
+            Self::UpdateNow => UpdateAction::Primary,
+            Self::Later => UpdateAction::Secondary,
         }
     }
 }
 
 const BUTTON_COUNT: usize = 2;
 type GlyphResolver<'a> = dyn FnMut(char) -> ([f32; 2], [f32; 2]) + 'a;
-
-/// Labels for each button, in order matching [`ButtonIndex`].
-const BUTTON_LABELS: [&str; BUTTON_COUNT] = ["Update Now", "Later"];
 
 /// Minimum number of columns the dialog can shrink to (ensures buttons fit).
 const MIN_DIALOG_COLS: usize = 46;
@@ -123,6 +129,8 @@ fn dialog_units_in_extent(extent: f32, unit: f32) -> usize {
 
 /// State for the in-app update dialog overlay.
 pub struct UpdateDialog {
+    /// Which update flow this dialog is confirming.
+    kind: UpdateDialogKind,
     /// Version string of the available update.
     version: String,
     /// Currently keyboard-focused button.
@@ -134,13 +142,28 @@ pub struct UpdateDialog {
 }
 
 impl UpdateDialog {
-    pub fn new(version: String) -> Self {
+    pub fn new_install(version: String) -> Self {
         Self {
+            kind: UpdateDialogKind::InstallAvailable,
             version,
             focused: ButtonIndex::UpdateNow,
             hovered: None,
             button_rects: [Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }; BUTTON_COUNT],
         }
+    }
+
+    pub fn new_restart_required(version: String) -> Self {
+        Self {
+            kind: UpdateDialogKind::RestartRequired,
+            version,
+            focused: ButtonIndex::UpdateNow,
+            hovered: None,
+            button_rects: [Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }; BUTTON_COUNT],
+        }
+    }
+
+    pub fn kind(&self) -> UpdateDialogKind {
+        self.kind
     }
 
     /// Cycle focus to the next button.
@@ -194,10 +217,7 @@ impl UpdateDialog {
         renderer.push_solid_rect(viewport, colors.backdrop);
         renderer.push_solid_rect(layout.dialog_rect, colors.dialog_bg);
         renderer.draw_frame(colors.border);
-        renderer.draw_title(
-            "Update Available",
-            TextColors { fg: colors.title_fg, bg: colors.dialog_bg },
-        );
+        renderer.draw_title(self.title(), TextColors { fg: colors.title_fg, bg: colors.dialog_bg });
         renderer.draw_body(TextColors { fg: colors.body_fg, bg: colors.dialog_bg });
         renderer.draw_separator(colors.separator);
         self.build_buttons(&mut renderer, &colors);
@@ -212,7 +232,8 @@ impl UpdateDialog {
         let dialog_cols = renderer.layout.dialog_cols;
 
         // Each button: 2 padding + label + 2 padding.
-        let btn_col_widths: Vec<usize> = BUTTON_LABELS.iter().map(|l| l.len() + 4).collect();
+        let button_labels = self.button_labels();
+        let btn_col_widths: Vec<usize> = button_labels.iter().map(|l| l.len() + 4).collect();
         let total_btn_cols: usize = btn_col_widths.iter().sum();
         let usable = dialog_cols.saturating_sub(PADDING * 2);
         let remaining = usable.saturating_sub(total_btn_cols);
@@ -222,7 +243,7 @@ impl UpdateDialog {
         let button_h = dialog_grid_height(BUTTON_HEIGHT_ROWS, cell_h);
 
         let mut col = PADDING;
-        for (btn_idx, label) in BUTTON_LABELS.iter().enumerate() {
+        for (btn_idx, label) in button_labels.iter().enumerate() {
             let Some(btn_w_cols) = btn_col_widths.get(btn_idx).copied() else {
                 continue;
             };
@@ -257,12 +278,34 @@ impl UpdateDialog {
 
     /// Build the body text lines for the dialog.
     fn body_lines(&self) -> Vec<String> {
-        vec![
-            format!("Version {} is ready to install.", self.version),
-            String::new(),
-            String::from("Your terminal sessions will be preserved"),
-            String::from("during the update via live reload."),
-        ]
+        match self.kind {
+            UpdateDialogKind::InstallAvailable => vec![
+                format!("Version {} is ready to install.", self.version),
+                String::new(),
+                String::from("Your terminal sessions will be preserved"),
+                String::from("during the update via live reload."),
+            ],
+            UpdateDialogKind::RestartRequired => vec![
+                format!("Version {} has been installed.", self.version),
+                String::new(),
+                String::from("Applying it now requires a cold restart,"),
+                String::from("which will close all open terminal sessions."),
+            ],
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        match self.kind {
+            UpdateDialogKind::InstallAvailable => "Update Available",
+            UpdateDialogKind::RestartRequired => "Restart Required",
+        }
+    }
+
+    fn button_labels(&self) -> [&'static str; BUTTON_COUNT] {
+        match self.kind {
+            UpdateDialogKind::InstallAvailable => ["Update Now", "Later"],
+            UpdateDialogKind::RestartRequired => ["Continue", "Cancel"],
+        }
     }
 }
 

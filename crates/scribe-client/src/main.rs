@@ -914,7 +914,7 @@ impl ApplicationHandler<UiEvent> for App {
         let _ = self.handle_stream_user_event(&event)
             || self.handle_session_metadata_user_event(event_loop, &event)
             || self.handle_ai_prompt_user_event(&event)
-            || self.handle_workspace_user_event(&event)
+            || self.handle_workspace_user_event(event_loop, &event)
             || self.handle_lifecycle_user_event(event_loop, &event)
             || self.handle_update_user_event(&event);
     }
@@ -1072,7 +1072,11 @@ impl App {
         }
     }
 
-    fn handle_workspace_user_event(&mut self, event: &UiEvent) -> bool {
+    fn handle_workspace_user_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &UiEvent,
+    ) -> bool {
         match event {
             UiEvent::WorkspaceInfo {
                 workspace_id,
@@ -1091,7 +1095,7 @@ impl App {
                 true
             }
             UiEvent::SessionList { sessions, workspace_tree, workspaces } => {
-                self.handle_session_list(sessions, workspace_tree.as_ref(), workspaces);
+                self.handle_session_list(event_loop, sessions, workspace_tree.as_ref(), workspaces);
                 true
             }
             UiEvent::WorkspaceNamed { workspace_id, name, project_root } => {
@@ -1231,6 +1235,17 @@ impl App {
     fn handle_ai_state_cleared(&mut self, session_id: SessionId) {
         self.ai_tracker.remove(session_id);
         self.notification_tracker.remove(session_id);
+        if let Some(pane_id) = self.session_to_pane.get(&session_id).copied()
+            && let Some(pane) = self.panes.get_mut(&pane_id)
+            && matches!(pane.launch_binding.kind, restore_state::LaunchKind::Ai { .. })
+        {
+            // `AiStateCleared` only fires when the tool explicitly goes
+            // inactive while the PTY stays alive, which means this pane is
+            // back at a normal shell prompt. Persist that reality so cold
+            // restart does not reopen Claude/Codex on a plain shell tab.
+            pane.launch_binding.kind = restore_state::LaunchKind::Shell;
+            self.mark_restore_dirty();
+        }
         self.clear_pane_prompts(session_id);
         self.request_redraw();
     }
@@ -1243,10 +1258,16 @@ impl App {
     }
 
     fn handle_update_progress(&mut self, state: UpdateProgressState) {
+        let restart_required =
+            matches!(&state, UpdateProgressState::CompletedRestartRequired { .. });
         self.update_progress = Some(state);
         self.status_bar_update_rect = None;
         self.update_window_title();
-        self.request_redraw();
+        if restart_required {
+            self.open_update_dialog();
+        } else {
+            self.request_redraw();
+        }
     }
 
     fn handle_modal_window_event(
@@ -1903,6 +1924,7 @@ impl App {
     /// If no sessions exist, fall back to creating a fresh session.
     fn handle_session_list(
         &mut self,
+        event_loop: &ActiveEventLoop,
         sessions: &[scribe_common::protocol::SessionInfo],
         workspace_tree: Option<&scribe_common::protocol::WorkspaceTreeNode>,
         workspaces: &[scribe_common::protocol::WorkspaceListEntry],
@@ -1912,7 +1934,7 @@ impl App {
         self.connection.server_connected = true;
         self.legacy_workspace_direction_updates.clear();
         if sessions.is_empty() {
-            self.try_cold_restart_or_fresh();
+            self.try_cold_restart_or_fresh(event_loop);
             return;
         }
 
@@ -2254,7 +2276,7 @@ impl App {
     /// Try to restore the previous layout from a cold restart snapshot.
     /// Falls back to a fresh session if no snapshot is available or replay
     /// fails.
-    fn try_cold_restart_or_fresh(&mut self) {
+    fn try_cold_restart_or_fresh(&mut self, event_loop: &ActiveEventLoop) {
         // Only attempt cold restart restore when launched without --window-id
         // (i.e. a fresh launch after a server crash).  Windows spawned via
         // handle_new_window() always carry a pre-assigned window_id and must
@@ -2270,6 +2292,10 @@ impl App {
                 window_id = %snapshot.window_id,
                 "restoring window layout from cold restart snapshot"
             );
+            // True cold restart connects to a fresh server, so `Welcome`
+            // assigns a new window ID before we learn which snapshot we
+            // claimed. Geometry is keyed by the pre-crash snapshot ID.
+            self.restore_geometry_from_registry(event_loop, snapshot.window_id);
             self.replay_cold_restart(snapshot)
         });
         if restored {
@@ -7962,7 +7988,13 @@ impl App {
         window_id: WindowId,
     ) {
         let loaded = self.window_registry.load(window_id);
-        let has_saved = loaded.x.is_some() || loaded.maximized;
+        let default = window_state::WindowGeometry::default();
+        let has_saved = loaded.x.is_some()
+            || loaded.y.is_some()
+            || loaded.maximized
+            || loaded.monitor_name.is_some()
+            || loaded.width != default.width
+            || loaded.height != default.height;
         let geom =
             if has_saved { Some(loaded) } else { self.window_registry.migrate_legacy(window_id) };
         if let (Some(geom), Some(window)) = (geom, &self.window) {
@@ -8088,20 +8120,30 @@ impl App {
 
     /// Open the update confirmation dialog.
     fn open_update_dialog(&mut self) {
-        if self.update_dialog.is_some() {
-            return;
-        }
-        let Some(version) = self.update_available.clone() else { return };
-        self.update_dialog = Some(update_dialog::UpdateDialog::new(version));
+        let dialog = match (&self.update_progress, &self.update_available) {
+            (Some(UpdateProgressState::CompletedRestartRequired { version }), _) => {
+                update_dialog::UpdateDialog::new_restart_required(version.clone())
+            }
+            (_, Some(version)) => update_dialog::UpdateDialog::new_install(version.clone()),
+            _ => return,
+        };
+        self.update_dialog = Some(dialog);
         self.request_redraw();
     }
 
     /// Process an [`update_dialog::UpdateAction`] from the in-app update dialog.
     fn handle_update_action(&mut self, action: update_dialog::UpdateAction) {
-        self.update_dialog = None;
-        match action {
-            update_dialog::UpdateAction::Confirm => {
+        let Some(kind) = self.update_dialog.as_ref().map(update_dialog::UpdateDialog::kind) else {
+            return;
+        };
+
+        match (kind, action) {
+            (
+                update_dialog::UpdateDialogKind::InstallAvailable,
+                update_dialog::UpdateAction::Primary,
+            ) => {
                 tracing::info!("user confirmed update");
+                self.update_dialog = None;
                 self.update_available = None;
                 self.status_bar_update_rect = None;
                 self.update_window_title();
@@ -8109,8 +8151,12 @@ impl App {
                     send_command(tx, ClientCommand::TriggerUpdate);
                 }
             }
-            update_dialog::UpdateAction::Dismiss => {
+            (
+                update_dialog::UpdateDialogKind::InstallAvailable,
+                update_dialog::UpdateAction::Secondary,
+            ) => {
                 tracing::info!("user dismissed update");
+                self.update_dialog = None;
                 self.update_available = None;
                 self.update_progress = None;
                 self.status_bar_update_rect = None;
@@ -8118,6 +8164,28 @@ impl App {
                 if let Some(tx) = &self.cmd_tx {
                     send_command(tx, ClientCommand::DismissUpdate);
                 }
+            }
+            (
+                update_dialog::UpdateDialogKind::RestartRequired,
+                update_dialog::UpdateAction::Primary,
+            ) => match spawn_update_restart_helper() {
+                Ok(()) => {
+                    tracing::info!("user approved deferred cold restart");
+                    self.update_dialog = None;
+                    self.update_window_title();
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to spawn deferred update restart helper");
+                    return;
+                }
+            },
+            (
+                update_dialog::UpdateDialogKind::RestartRequired,
+                update_dialog::UpdateAction::Secondary,
+            ) => {
+                tracing::info!("user postponed deferred cold restart");
+                self.update_dialog = None;
+                self.update_window_title();
             }
         }
         self.request_redraw();
@@ -8127,12 +8195,20 @@ impl App {
     fn update_window_title(&self) {
         if let Some(window) = &self.window {
             let window_title = current_identity().window_title_name();
-            let title = match &self.update_available {
-                Some(version) if self.status_bar_update_rect.is_some() => {
+            let title = match (&self.update_progress, &self.update_available) {
+                (Some(UpdateProgressState::CompletedRestartRequired { version }), _)
+                    if self.status_bar_update_rect.is_some() =>
+                {
+                    format!("{window_title} - v{version} installed - click below to restart")
+                }
+                (Some(UpdateProgressState::CompletedRestartRequired { version }), _) => {
+                    format!("{window_title} - v{version} installed - restart required")
+                }
+                (_, Some(version)) if self.status_bar_update_rect.is_some() => {
                     format!("{window_title} - v{version} available - click below to update")
                 }
-                Some(version) => format!("{window_title} - v{version} available"),
-                None => window_title.to_owned(),
+                (_, Some(version)) => format!("{window_title} - v{version} available"),
+                _ => window_title.to_owned(),
             };
             window.set_title(&title);
         }
@@ -8148,12 +8224,12 @@ impl App {
 
         match event.logical_key {
             Key::Named(NamedKey::Escape) => {
-                let action = update_dialog::UpdateAction::Dismiss;
+                let action = update_dialog::UpdateAction::Secondary;
                 self.handle_update_action(action);
             }
             Key::Named(NamedKey::Enter) => {
                 let action = self.update_dialog.as_ref().map_or(
-                    update_dialog::UpdateAction::Dismiss,
+                    update_dialog::UpdateAction::Secondary,
                     update_dialog::UpdateDialog::confirm,
                 );
                 self.handle_update_action(action);
@@ -10586,6 +10662,33 @@ fn spawn_fresh_client_process() {
     }
 }
 
+fn installed_client_exe_path() -> std::path::PathBuf {
+    std::env::current_exe().map_or_else(
+        |_| std::path::PathBuf::from(current_identity().client_binary_name()),
+        |exe| exe.with_file_name(current_identity().client_binary_name()),
+    )
+}
+
+fn spawn_update_restart_helper() -> Result<(), String> {
+    let client_exe = installed_client_exe_path();
+    let child = std::process::Command::new(&client_exe)
+        .arg("--finish-update-restart")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            format!("failed to spawn deferred update restart helper {}: {e}", client_exe.display())
+        })?;
+
+    tracing::info!(
+        pid = child.id(),
+        exe = %client_exe.display(),
+        "spawned deferred update restart helper"
+    );
+    Ok(())
+}
+
 /// Parse `--window-id <uuid>` from CLI arguments.
 fn parse_window_id() -> Option<WindowId> {
     let args: Vec<String> = std::env::args().collect();
@@ -10603,6 +10706,10 @@ fn parse_window_id() -> Option<WindowId> {
 
 fn parse_restore_spawn_child() -> bool {
     std::env::args().any(|arg| arg == "--restore-child")
+}
+
+fn parse_finish_update_restart() -> bool {
+    std::env::args().any(|arg| arg == "--finish-update-restart")
 }
 
 /// Walk a `WorkspaceTreeNode` tree and collect every (`SessionId` → `PaneTreeNode`)
@@ -10645,6 +10752,10 @@ fn main() -> Result<(), String> {
                 .map_or(tracing_subscriber::EnvFilter::new("info"), |filter| filter),
         )
         .init();
+
+    if parse_finish_update_restart() {
+        return ipc_client::finish_update_restart();
+    }
 
     let event_loop = EventLoop::<UiEvent>::with_user_event()
         .build()

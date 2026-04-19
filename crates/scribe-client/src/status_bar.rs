@@ -357,7 +357,7 @@ fn resolve_centered_update_segment(
         }
         Some(UpdateProgressState::CompletedRestartRequired { .. }) => Some(CenteredUpdateSegment {
             labels: vec![String::from("Updated! Restart required")],
-            clickable: false,
+            clickable: true,
         }),
         Some(UpdateProgressState::Failed { .. }) => Some(CenteredUpdateSegment {
             labels: vec![String::from("Update failed")],

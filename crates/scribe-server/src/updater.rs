@@ -32,6 +32,12 @@ const STABLE_ASSET_SUFFIX: &str = "macos-arm64.dmg";
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 const STABLE_ASSET_SUFFIX: &str = "macos-x86_64.dmg";
 
+#[cfg(target_os = "linux")]
+const DEFER_COLD_RESTART_FLAG: &str = "update-defer-cold-restart";
+
+#[cfg(target_os = "linux")]
+const RESTART_REQUIRED_FLAG: &str = "update-restart-required";
+
 // ── GitHub API types ──────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -387,17 +393,38 @@ fn verify_signature(asset_path: &Path, sig_path: &Path) -> Result<(), ScribeErro
 
 #[cfg(target_os = "linux")]
 fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
+    let runtime_dir = scribe_common::socket::server_socket_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| ScribeError::UpdateInstallFailed {
+        reason: String::from("server socket path has no runtime directory"),
+    })?;
+    std::fs::create_dir_all(&runtime_dir).map_err(|e| ScribeError::Io { source: e })?;
+
+    let defer_flag = runtime_dir.join(DEFER_COLD_RESTART_FLAG);
+    let restart_required_flag = runtime_dir.join(RESTART_REQUIRED_FLAG);
+    drop(std::fs::remove_file(&restart_required_flag));
+    std::fs::write(&defer_flag, b"").map_err(|e| ScribeError::Io { source: e })?;
+
     let path_str = asset_path.to_string_lossy();
-    let status = std::process::Command::new("pkexec")
-        .args(["dpkg", "-i", &path_str])
-        .status()
-        .map_err(|e| ScribeError::UpdateInstallFailed {
-            reason: format!("failed to launch pkexec dpkg: {e}"),
-        })?;
+    let status = match std::process::Command::new("pkexec").args(["dpkg", "-i", &path_str]).status()
+    {
+        Ok(status) => status,
+        Err(e) => {
+            drop(std::fs::remove_file(&defer_flag));
+            return Err(ScribeError::UpdateInstallFailed {
+                reason: format!("failed to launch pkexec dpkg: {e}"),
+            });
+        }
+    };
+    drop(std::fs::remove_file(&defer_flag));
 
     if status.success() {
-        Ok(true)
+        let restart_required = restart_required_flag.exists();
+        drop(std::fs::remove_file(&restart_required_flag));
+        Ok(!restart_required)
     } else {
+        drop(std::fs::remove_file(&restart_required_flag));
         Err(ScribeError::UpdateInstallFailed {
             reason: format!(
                 "pkexec dpkg -i exited with {status}; \
@@ -592,6 +619,11 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
         info!("server binary unchanged — skipping server restart");
         true
     };
+
+    if !hot_reload_succeeded {
+        info!("macOS update requires a deferred cold restart; skipping client/settings relaunch");
+        return Ok(false);
+    }
 
     // Restart client binaries that changed and were running before the update.
     let macos_dir = app_bundle_path.join("Contents/MacOS");
