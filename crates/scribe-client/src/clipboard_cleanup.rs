@@ -1,10 +1,11 @@
 //! Clipboard text cleanup for AI-assisted sessions.
 //!
-//! Two transforms are applied in sequence when the active session is running
+//! Three transforms are applied in sequence when the active session is running
 //! Claude Code or Codex and the user has clipboard cleanup enabled:
 //!
 //! 1. **Dedent** — strip the minimum shared leading whitespace from all lines.
-//! 2. **Unwrap** — rejoin hard-wrapped prose lines into flowing paragraphs.
+//! 2. **Normalize blockquotes** — strip markdown and rendered quote markers.
+//! 3. **Unwrap** — rejoin hard-wrapped prose lines into flowing paragraphs.
 
 /// Apply configured cleanup transforms to terminal-selected text.
 ///
@@ -21,7 +22,8 @@ pub fn prepare_copy_text(text: &str, options: CopyTextOptions) -> String {
         return text.to_owned();
     }
     let dedented = dedent(text);
-    unwrap_lines(&dedented)
+    let normalized_blockquotes = normalize_blockquotes(&dedented);
+    unwrap_lines(&normalized_blockquotes)
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +64,40 @@ fn dedent(text: &str) -> String {
 /// Remove the first `n` characters from `s`.
 fn strip_leading_chars(s: &str, n: usize) -> String {
     s.chars().skip(n).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Blockquote normalization
+// ---------------------------------------------------------------------------
+
+/// Strip markdown quote markers so quoted AI prose copies as plain text.
+fn normalize_blockquotes(text: &str) -> String {
+    let trailing_newline = text.ends_with('\n');
+    let lines: Vec<&str> = text.lines().collect();
+
+    let mut result =
+        lines.iter().map(|line| strip_blockquote_prefix(line)).collect::<Vec<_>>().join("\n");
+    if trailing_newline {
+        result.push('\n');
+    }
+    result
+}
+
+/// Strip leading markdown quote markers (`>`) and rendered gutter markers (`▎`).
+fn strip_blockquote_prefix(line: &str) -> &str {
+    let mut rest = line.trim_start();
+    let mut stripped = false;
+
+    while let Some(first) = rest.chars().next() {
+        if first != '>' && first != '▎' {
+            break;
+        }
+        stripped = true;
+        rest = &rest[first.len_utf8()..];
+        rest = rest.strip_prefix(' ').unwrap_or(rest);
+    }
+
+    if stripped { rest } else { line }
 }
 
 // ---------------------------------------------------------------------------

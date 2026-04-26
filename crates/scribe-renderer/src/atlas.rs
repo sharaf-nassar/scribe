@@ -115,10 +115,17 @@ struct RunShapeKey {
 pub struct ShapedRunGlyph {
     /// Swash cache key for this glyph (used with `get_or_insert_shaped`).
     pub cache_key: CacheKey,
-    /// Column offset within the run (0-indexed).
+    /// Column offset within the run (0-indexed). Counts wide characters
+    /// (`glyph_span > 1`) as multiple columns, so it tracks grid position
+    /// rather than character index.
     pub col_offset: usize,
     /// Number of terminal columns this glyph occupies.
     pub glyph_span: u8,
+    /// The first character of the source bytes that produced this glyph.
+    /// Used by callers (e.g. contextual-alternate detection) to look up the
+    /// glyph's source character without indexing into a `chars` vec, which
+    /// would diverge from `col_offset` after any wide character.
+    pub source_char: char,
 }
 
 /// Bundled font configuration for atlas construction.
@@ -622,7 +629,9 @@ impl GlyphAtlas {
                 let glyph_span = atlas_round_u8((g.w / cell_w).round()).max(1);
                 let col_offset = next_col;
                 next_col += usize::from(glyph_span);
-                glyphs.push(ShapedRunGlyph { cache_key, col_offset, glyph_span });
+                let source_char =
+                    text.get(g.start..g.end).and_then(|s| s.chars().next()).unwrap_or('\0');
+                glyphs.push(ShapedRunGlyph { cache_key, col_offset, glyph_span, source_char });
             }
         }
 
@@ -962,5 +971,76 @@ mod tests {
             }
             true
         }
+    }
+
+    /// Regression test for the wide-character contextual-alternate bug: after
+    /// a wide character (e.g. emoji) the cumulative `col_offset` no longer
+    /// matches the source character index, so identifying the source character
+    /// by indexing a `chars` vec would return the wrong character. The
+    /// `source_char` field on `ShapedRunGlyph` must be populated from the
+    /// glyph's source byte range so identity checks (contextual-alternate
+    /// detection) get the right character regardless of column offset.
+    #[test]
+    fn shape_run_records_source_char_for_each_glyph() {
+        let mut font_system = FontSystem::new();
+        let metrics = Metrics::new(16.0, 19.2);
+        let family = Family::Name("JetBrains Mono");
+        let attrs = Attrs::new().family(family);
+
+        // Measure cell width.
+        let cell_w = {
+            let mut buf = Buffer::new_empty(metrics);
+            buf.set_text(&mut font_system, "M", &attrs, Shaping::Advanced, None);
+            buf.layout_runs().next().and_then(|r| r.glyphs.first()).map_or(16.0, |g| g.w)
+        };
+
+        // Shape the text using the same logic as `shape_run_uncached`. We
+        // can't construct a full `GlyphAtlas` without a wgpu device, so we
+        // reproduce the column-offset and source-char extraction inline.
+        let text = "## 🌟 Bonus";
+        let chars: Vec<char> = text.chars().collect();
+        // chars: ['#', '#', ' ', '🌟', ' ', 'B', 'o', 'n', 'u', 's'] (10 entries).
+
+        let mut buf = Buffer::new_empty(metrics);
+        buf.set_text(&mut font_system, text, &attrs, Shaping::Advanced, None);
+
+        let mut shaped: Vec<(char, usize, u8)> = Vec::new();
+        let mut next_col: usize = 0;
+        for run in buf.layout_runs() {
+            for g in run.glyphs {
+                let glyph_span = atlas_round_u8((g.w / cell_w).round()).max(1);
+                let col_offset = next_col;
+                next_col += usize::from(glyph_span);
+                let source_char =
+                    text.get(g.start..g.end).and_then(|s| s.chars().next()).unwrap_or('\0');
+                shaped.push((source_char, col_offset, glyph_span));
+            }
+        }
+
+        // Locate the 'B' glyph and verify the col_offset / chars-index split.
+        let b_idx = shaped
+            .iter()
+            .position(|(c, _, _)| *c == 'B')
+            .expect("'B' must appear among shaped glyphs");
+        let (b_char, b_col_offset, b_span) = shaped[b_idx];
+        assert_eq!(b_char, 'B');
+        assert_eq!(b_span, 1);
+        // 'B' is at character index 5 in the source text but at grid column
+        // offset 6 — the wide '🌟' takes columns 3 and 4.
+        assert_eq!(chars.iter().position(|c| *c == 'B'), Some(5));
+        assert_eq!(b_col_offset, 6);
+        // This is the bug we fixed: indexing `chars` by `col_offset` would
+        // return the wrong character ('o' at index 6, not 'B').
+        assert_eq!(
+            chars[b_col_offset], 'o',
+            "regression guard: chars[col_offset] returns the wrong character after a wide char",
+        );
+        assert_ne!(chars[b_col_offset], b_char);
+
+        // Sanity-check the emoji entry: source_char is the actual emoji and
+        // glyph_span is 2 (so it consumes columns 3 and 4).
+        let emoji = shaped.iter().find(|(c, _, _)| *c == '🌟').expect("emoji glyph present");
+        assert_eq!(emoji.1, 3, "emoji starts at grid column 3");
+        assert_eq!(emoji.2, 2, "emoji spans 2 grid columns");
     }
 }

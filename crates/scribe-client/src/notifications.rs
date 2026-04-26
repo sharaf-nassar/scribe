@@ -21,6 +21,11 @@ use scribe_common::ids::SessionId;
 /// remains valid.  If the user clicks the notification after this window
 /// the tab switch is skipped (they likely navigated away intentionally).
 const NOTIFICATION_FOCUS_WINDOW: Duration = Duration::from_secs(30);
+/// Linux bell events can arrive immediately after the richer AI desktop
+/// notification, and GNOME renders the urgency hint as a second shell-level
+/// "<app> is ready" toast. Keep the suppression narrow so later bells still
+/// raise attention normally.
+const LINUX_BELL_SUPPRESSION_WINDOW: Duration = Duration::from_secs(2);
 
 /// Payload produced when a notification should be shown.
 pub struct NotificationPayload {
@@ -86,6 +91,15 @@ impl NotificationTracker {
     /// to consume this and dispatch `handle_focus_session`.
     pub fn set_last_notified(&mut self, session_id: SessionId) {
         self.last_notified = Some((session_id, Instant::now()));
+    }
+
+    /// Return whether Linux should suppress a bell-driven urgency hint
+    /// because the same session just fired an explicit AI notification.
+    #[must_use]
+    pub fn should_suppress_linux_bell_attention(&self, session_id: SessionId) -> bool {
+        self.last_notified.as_ref().is_some_and(|(id, when)| {
+            *id == session_id && when.elapsed() < LINUX_BELL_SUPPRESSION_WINDOW
+        })
     }
 
     /// If a notification was shown recently, consume and return the session

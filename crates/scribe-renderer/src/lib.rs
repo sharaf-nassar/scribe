@@ -950,20 +950,28 @@ fn insert_multi_cell_glyph(map: &mut LigatureMap, line: i32, col: usize, glyph: 
 /// character in isolation.  We compare only `font_id` and `glyph_id`,
 /// ignoring subpixel bins (`x_bin`, `y_bin`) which vary by position
 /// within the run and would cause false positives.
+///
+/// The source character comes from `glyph.source_char` rather than indexing
+/// into a `chars` vec by `col_offset`: `col_offset` counts wide characters
+/// (e.g. emoji) as multiple grid columns, but `chars` indexes them as one
+/// entry, so the two diverge after any wide character.
 fn is_contextual_alternate(
     atlas: &mut GlyphAtlas,
     glyph: &ShapedRunGlyph,
-    chars: &[char],
     run: &StyledRun,
 ) -> bool {
-    chars.get(glyph.col_offset).is_some_and(|&c| {
-        atlas
-            .shape_single_cache_key(c, GlyphStyle { bold: run.bold, italic: run.italic })
-            .is_some_and(|solo_key| {
-                solo_key.font_id != glyph.cache_key.font_id
-                    || solo_key.glyph_id != glyph.cache_key.glyph_id
-            })
-    })
+    if glyph.source_char == '\0' {
+        return false;
+    }
+    atlas
+        .shape_single_cache_key(
+            glyph.source_char,
+            GlyphStyle { bold: run.bold, italic: run.italic },
+        )
+        .is_some_and(|solo_key| {
+            solo_key.font_id != glyph.cache_key.font_id
+                || solo_key.glyph_id != glyph.cache_key.glyph_id
+        })
 }
 
 /// Build a map from `(line, column)` to [`LigatureCellInfo`] for every cell
@@ -986,7 +994,6 @@ fn build_ligature_map(runs: &[StyledRun], atlas: &mut GlyphAtlas) -> LigatureMap
     for run in runs {
         let shaped =
             atlas.shape_run(&run.text, GlyphStyle { bold: run.bold, italic: run.italic }).to_vec();
-        let chars: Vec<char> = run.text.chars().collect();
 
         let mut i = 0;
         while let Some(glyph) = shaped.get(i) {
@@ -999,7 +1006,7 @@ fn build_ligature_map(runs: &[StyledRun], atlas: &mut GlyphAtlas) -> LigatureMap
                 continue;
             }
 
-            if !is_contextual_alternate(atlas, glyph, &chars, run) {
+            if !is_contextual_alternate(atlas, glyph, run) {
                 i += 1;
                 continue;
             }
@@ -1019,7 +1026,7 @@ fn build_ligature_map(runs: &[StyledRun], atlas: &mut GlyphAtlas) -> LigatureMap
             let phantom_start = i;
             while shaped.get(i).is_some_and(|g| {
                 g.glyph_span == 1
-                    && is_contextual_alternate(atlas, g, &chars, run)
+                    && is_contextual_alternate(atlas, g, run)
                     && !atlas.fits_single_cell(g.cache_key)
             }) {
                 i += 1;
@@ -1033,7 +1040,7 @@ fn build_ligature_map(runs: &[StyledRun], atlas: &mut GlyphAtlas) -> LigatureMap
             let visual = shaped.get(i).filter(|next| {
                 next.glyph_span == 1
                     && next.col_offset == phantom_start_col + phantom_count
-                    && is_contextual_alternate(atlas, next, &chars, run)
+                    && is_contextual_alternate(atlas, next, run)
             });
             if let Some(visual) = visual {
                 let total_span =
@@ -1042,6 +1049,7 @@ fn build_ligature_map(runs: &[StyledRun], atlas: &mut GlyphAtlas) -> LigatureMap
                     cache_key: visual.cache_key,
                     col_offset: phantom_start_col,
                     glyph_span: total_span,
+                    source_char: visual.source_char,
                 };
                 insert_multi_cell_glyph(&mut map, run.line, col, &merged);
                 i += 1;

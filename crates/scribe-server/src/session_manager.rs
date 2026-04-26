@@ -392,8 +392,9 @@ impl SessionManager {
             // Create event listener.
             let event_listener = ScribeEventListener::new(handoff_session.session_id, event_tx);
 
-            // Create Term config with scrollback.
-            let term_config = TermConfig { scrolling_history: scrollback, ..TermConfig::default() };
+            // Create Term config with scrollback and the same terminal
+            // protocol support used by newly spawned sessions.
+            let term_config = build_term_config(scrollback);
 
             // Create Term with the session's dimensions.
             let dimensions = TermDimensions { cols: usize::from(cols), lines: usize::from(rows) };

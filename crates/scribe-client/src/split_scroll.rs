@@ -23,17 +23,20 @@ const MIN_PIN_ROWS: usize = 3;
 /// on the last visible row.
 const CURSOR_CONTEXT_ROWS: usize = 3;
 
-/// Size of the jump-to-bottom button (pixels).
-const JUMP_BTN_SIZE: f32 = 22.0;
+/// Width of the jump-to-bottom button (pixels).
+const JUMP_BTN_W: f32 = 28.0;
 
-/// Inset from the bottom-right corner of the top portion.
-const JUMP_BTN_INSET: f32 = 8.0;
+/// Height of the jump-to-bottom button (pixels).
+const JUMP_BTN_H: f32 = 24.0;
+
+/// Horizontal inset from the bottom-right corner of the top portion.
+const JUMP_BTN_INSET_X: f32 = 6.0;
+
+/// Vertical inset from the divider so the chip feels docked to the split.
+const JUMP_BTN_INSET_Y: f32 = 4.0;
 
 /// Divider thickness (pixels).
 const DIVIDER_H: f32 = 1.0;
-
-/// Jump-to-bottom icon glyph.
-const JUMP_ICON: char = '↓';
 
 /// Per-pane split-scroll state.
 pub struct SplitScrollState {
@@ -152,12 +155,12 @@ pub fn compute_geometry(content_rect: Rect, pin_height: f32) -> SplitScrollGeome
         height: bottom_h,
     };
 
-    let jump_btn_rect = Rect {
-        x: top_rect.x + top_rect.width - JUMP_BTN_SIZE - JUMP_BTN_INSET,
-        y: top_rect.y + top_rect.height - JUMP_BTN_SIZE - JUMP_BTN_INSET,
-        width: JUMP_BTN_SIZE,
-        height: JUMP_BTN_SIZE,
-    };
+    let jump_btn_x = (top_rect.x + top_rect.width - JUMP_BTN_W - JUMP_BTN_INSET_X)
+        .clamp(top_rect.x, top_rect.x + (top_rect.width - JUMP_BTN_W).max(0.0));
+    let jump_btn_y = (top_rect.y + top_rect.height - JUMP_BTN_H - JUMP_BTN_INSET_Y)
+        .clamp(top_rect.y, top_rect.y + (top_rect.height - JUMP_BTN_H).max(0.0));
+    let jump_btn_rect =
+        Rect { x: jump_btn_x, y: jump_btn_y, width: JUMP_BTN_W, height: JUMP_BTN_H };
 
     SplitScrollGeometry {
         top: top_rect,
@@ -173,7 +176,6 @@ pub struct SplitScrollChromeRequest<'a> {
     pub divider_color: [f32; 4],
     pub jump_button_hovered: bool,
     pub accent_color: [f32; 4],
-    pub resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
 }
 
 /// Filter instances, keeping only those whose `pos[1]` (Y) falls in `[y_min, y_max)`.
@@ -192,38 +194,82 @@ pub fn render_chrome(request: SplitScrollChromeRequest<'_>) {
     // Divider line.
     push_solid_rect(out, geo.divider, request.divider_color);
 
-    // Jump-to-bottom button background (rounded).
-    let btn_bg = if request.jump_button_hovered {
-        [request.accent_color[0], request.accent_color[1], request.accent_color[2], 0.35]
-    } else {
-        [request.accent_color[0], request.accent_color[1], request.accent_color[2], 0.18]
-    };
-    out.push(CellInstance {
-        pos: [geo.jump_button.x, geo.jump_button.y],
-        size: [geo.jump_button.width, geo.jump_button.height],
-        uv_min: [0.0, 0.0],
-        uv_max: [0.0, 0.0],
-        fg_color: btn_bg,
-        bg_color: btn_bg,
-        corner_radius: 4.0,
-    });
+    let shadow_rect = inset_rect(geo.jump_button, 0.0, -1.0);
+    out.push(rounded_rect(shadow_rect, [0.0, 0.0, 0.0, 0.28], 6.0));
 
-    // Jump icon glyph centered in button.
-    let (uv_min, uv_max) = (request.resolve_glyph)(JUMP_ICON);
-    let icon_color =
-        if request.jump_button_hovered { [1.0, 1.0, 1.0, 0.9] } else { [1.0, 1.0, 1.0, 0.55] };
-    // Center glyph in the button.
-    let glyph_x = geo.jump_button.x + 3.0;
-    let glyph_y = geo.jump_button.y + 1.0;
-    out.push(CellInstance {
-        pos: [glyph_x, glyph_y],
-        size: [0.0, 0.0], // use uniform cell size
-        uv_min,
-        uv_max,
-        fg_color: icon_color,
-        bg_color: btn_bg,
-        corner_radius: 0.0,
-    });
+    let frame_color = with_alpha(
+        mix_rgb(
+            request.divider_color,
+            request.accent_color,
+            if request.jump_button_hovered { 0.45 } else { 0.26 },
+        ),
+        if request.jump_button_hovered { 0.98 } else { 0.92 },
+    );
+    out.push(rounded_rect(geo.jump_button, frame_color, 6.0));
+
+    let body_rect = inset_rect(geo.jump_button, 1.0, 1.0);
+    let body_color = with_alpha(
+        mix_rgb(
+            request.divider_color,
+            [0.0, 0.0, 0.0, 1.0],
+            if request.jump_button_hovered { 0.82 } else { 0.9 },
+        ),
+        if request.jump_button_hovered { 0.98 } else { 0.94 },
+    );
+    out.push(rounded_rect(body_rect, body_color, 5.0));
+
+    let accent_strip = Rect {
+        x: body_rect.x + 2.0,
+        y: body_rect.y + 2.0,
+        width: (body_rect.width - 4.0).max(0.0),
+        height: 2.0,
+    };
+    let accent_strip_color = with_alpha(
+        mix_rgb(
+            request.accent_color,
+            [1.0, 1.0, 1.0, 1.0],
+            if request.jump_button_hovered { 0.12 } else { 0.04 },
+        ),
+        if request.jump_button_hovered { 0.78 } else { 0.52 },
+    );
+    out.push(rounded_rect(accent_strip, accent_strip_color, 1.0));
+
+    let inner_plate = Rect {
+        x: body_rect.x + 2.0,
+        y: body_rect.y + 6.0,
+        width: (body_rect.width - 4.0).max(0.0),
+        height: (body_rect.height - 8.0).max(0.0),
+    };
+    let inner_plate_color = with_alpha(
+        mix_rgb(
+            body_color,
+            request.accent_color,
+            if request.jump_button_hovered { 0.14 } else { 0.08 },
+        ),
+        if request.jump_button_hovered { 0.98 } else { 0.9 },
+    );
+    out.push(rounded_rect(inner_plate, inner_plate_color, 4.0));
+
+    let dock_rect = Rect {
+        x: geo.jump_button.x + 7.0,
+        y: geo.jump_button.y + geo.jump_button.height - 1.0,
+        width: 14.0,
+        height: 2.0,
+    };
+    let dock_color =
+        with_alpha(request.accent_color, if request.jump_button_hovered { 0.34 } else { 0.2 });
+    out.push(rounded_rect(dock_rect, dock_color, 1.0));
+
+    push_jump_arrow(out, geo.jump_button, [0.0, 0.0, 0.0, 0.32], (1.0, 1.0));
+    let icon_color = with_alpha(
+        mix_rgb(
+            request.accent_color,
+            [1.0, 1.0, 1.0, 1.0],
+            if request.jump_button_hovered { 0.7 } else { 0.54 },
+        ),
+        if request.jump_button_hovered { 0.98 } else { 0.86 },
+    );
+    push_jump_arrow(out, geo.jump_button, icon_color, (0.0, 0.0));
 }
 
 /// Hit-test the jump-to-bottom button.
@@ -233,15 +279,84 @@ pub fn hit_test_jump_btn(geo: &SplitScrollGeometry, x: f32, y: f32) -> bool {
 
 /// Push a solid-color rectangle.
 fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
-    out.push(CellInstance {
+    out.push(rounded_rect(rect, color, 0.0));
+}
+
+fn push_jump_arrow(out: &mut Vec<CellInstance>, button: Rect, color: [f32; 4], offset: (f32, f32)) {
+    let (offset_x, offset_y) = offset;
+    let stem = Rect {
+        x: button.x + 13.0 + offset_x,
+        y: button.y + 6.0 + offset_y,
+        width: 2.0,
+        height: 7.0,
+    };
+    let head_left_upper = Rect {
+        x: button.x + 10.0 + offset_x,
+        y: button.y + 10.0 + offset_y,
+        width: 2.0,
+        height: 2.0,
+    };
+    let head_left_lower = Rect {
+        x: button.x + 9.0 + offset_x,
+        y: button.y + 12.0 + offset_y,
+        width: 2.0,
+        height: 2.0,
+    };
+    let head_right_upper = Rect {
+        x: button.x + 16.0 + offset_x,
+        y: button.y + 10.0 + offset_y,
+        width: 2.0,
+        height: 2.0,
+    };
+    let head_right_lower = Rect {
+        x: button.x + 17.0 + offset_x,
+        y: button.y + 12.0 + offset_y,
+        width: 2.0,
+        height: 2.0,
+    };
+    let head_tip = Rect {
+        x: button.x + 13.0 + offset_x,
+        y: button.y + 14.0 + offset_y,
+        width: 2.0,
+        height: 2.0,
+    };
+
+    push_solid_rect(out, stem, color);
+    push_solid_rect(out, head_left_upper, color);
+    push_solid_rect(out, head_left_lower, color);
+    push_solid_rect(out, head_right_upper, color);
+    push_solid_rect(out, head_right_lower, color);
+    push_solid_rect(out, head_tip, color);
+}
+
+fn rounded_rect(rect: Rect, color: [f32; 4], corner_radius: f32) -> CellInstance {
+    CellInstance {
         pos: [rect.x, rect.y],
         size: [rect.width, rect.height],
         uv_min: [0.0, 0.0],
         uv_max: [0.0, 0.0],
         fg_color: color,
         bg_color: color,
-        corner_radius: 0.0,
-    });
+        corner_radius,
+    }
+}
+
+fn inset_rect(rect: Rect, inset_x: f32, inset_y: f32) -> Rect {
+    Rect {
+        x: rect.x + inset_x,
+        y: rect.y + inset_y,
+        width: (rect.width - inset_x * 2.0).max(0.0),
+        height: (rect.height - inset_y * 2.0).max(0.0),
+    }
+}
+
+fn mix_rgb(a: [f32; 4], b: [f32; 4], amount: f32) -> [f32; 4] {
+    let t = amount.clamp(0.0, 1.0);
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, 1.0]
+}
+
+fn with_alpha(color: [f32; 4], alpha: f32) -> [f32; 4] {
+    [color[0], color[1], color[2], alpha]
 }
 
 fn read_cell_flags(term: &Term<VoidListener>, line: Line, col: Column) -> Flags {

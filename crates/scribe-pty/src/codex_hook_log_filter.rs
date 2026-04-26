@@ -584,7 +584,7 @@ fn can_begin_candidate(byte: u8) -> bool {
 }
 
 const CODEX_HOOK_EVENT_NAMES: &[&str] =
-    &["PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "Stop"];
+    &["PreToolUse", "PermissionRequest", "PostToolUse", "SessionStart", "UserPromptSubmit", "Stop"];
 
 const CODEX_HOOK_END_SUFFIXES: &[&str] =
     &[" hook (completed)", " hook (failed)", " hook (blocked)", " hook (stopped)"];
@@ -1209,4 +1209,42 @@ fn pending_line_from_raw(raw: &[u8]) -> PendingLine {
 
 fn is_hook_visible_line(s: &str) -> bool {
     is_hook_block_start_line(s) || is_hook_block_end_line(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CodexHookLogFilter, CodexHookLogOutput};
+
+    fn filter_all(input: &[u8]) -> Vec<u8> {
+        let mut filter = CodexHookLogFilter::new();
+        let mut output = match filter.filter(input) {
+            CodexHookLogOutput::Unchanged(bytes) => bytes.to_vec(),
+            CodexHookLogOutput::Filtered(bytes) => bytes,
+        };
+        if let Some(flushed) = filter.flush() {
+            output.extend_from_slice(&flushed);
+        }
+        output
+    }
+
+    #[test]
+    fn hides_permission_request_legacy_hook_block() {
+        let input = b"before\nRunning PermissionRequest hook: checking policy\nPermissionRequest hook (completed)\n\nafter\n";
+
+        assert_eq!(filter_all(input), b"before\nafter\n");
+    }
+
+    #[test]
+    fn hides_permission_request_labeled_hook_block() {
+        let input = b"before\n\x1b[32mhook: PermissionRequest\x1b[0m\n\x1b[32mhook: PermissionRequest Completed\x1b[0m\n\nafter\n";
+
+        assert_eq!(filter_all(input), b"before\nafter\n");
+    }
+
+    #[test]
+    fn trims_permission_request_hook_rows_inside_sync_update() {
+        let input = b"\x1b[?2026hline 1\n\x1b[32mhook: PermissionRequest\x1b[0m\n\x1b[32mhook: PermissionRequest Completed\x1b[0m\nline 2\n\x1b[?2026l";
+
+        assert_eq!(filter_all(input), b"\x1b[?2026hline 1\nline 2\n\x1b[?2026l");
+    }
 }

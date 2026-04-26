@@ -12,6 +12,12 @@ The renderer groups cells into same-styled runs via `detect_styled_runs` and sha
 
 If a shaped glyph spans more than one terminal column or is a contextual alternate, it is treated as a ligature. Consecutive empty placeholder glyphs are merged with the following visual glyph to handle monospace font patterns.
 
+#### Contextual Alternate Source Char
+
+[[crates/scribe-renderer/src/lib.rs#is_contextual_alternate]] reads the glyph's source character from [[crates/scribe-renderer/src/atlas.rs#ShapedRunGlyph]]`.source_char` rather than indexing the run's `chars` vec by `col_offset`.
+
+`col_offset` counts wide characters as multiple grid columns while `chars` indexes them as one entry, so the two diverge after any wide character. Populating `source_char` from cosmic-text's `g.start..g.end` byte range during shaping keeps identity checks correct regardless of grid position — fixing the false-positive contextual-alternate detection that produced blank cells past emoji on the same run.
+
 ### Cursor Rendering
 
 Block cursor inverts foreground and background colours. Beam cursor renders the normal cell plus a thin vertical bar overlay. Underline cursor renders the normal cell plus a thin horizontal bar at the bottom.

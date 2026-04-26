@@ -150,6 +150,20 @@ const EQUALIZE_RESERVED_COLS: usize = 2;
 /// integer-to-float conversion exact for pixel placement.
 const MAX_RENDER_GRID_UNITS: usize = 65_535;
 
+/// Right-edge controls that reserve tab-row columns before tab labels wrap.
+#[derive(Clone, Copy)]
+pub struct TabBarTrailingControls {
+    pub gear: bool,
+    pub equalize: bool,
+}
+
+impl TabBarTrailingControls {
+    pub fn columns(self) -> usize {
+        usize::from(self.gear) * GEAR_RESERVED_COLS
+            + usize::from(self.equalize) * EQUALIZE_RESERVED_COLS
+    }
+}
+
 /// Build a 1px separator line at the bottom of a pane's tab bar area.
 ///
 /// Gives a clear visual boundary between the tab bar and terminal content.
@@ -221,6 +235,7 @@ pub struct TabBarHeightRequest {
     pub cell_w: f32,
     pub row_height: f32,
     pub badge_cols: usize,
+    pub trailing_controls: TabBarTrailingControls,
 }
 
 pub fn compute_tab_bar_height(request: TabBarHeightRequest) -> f32 {
@@ -231,13 +246,14 @@ pub fn compute_tab_bar_height(request: TabBarHeightRequest) -> f32 {
         cell_w,
         row_height,
         badge_cols,
+        trailing_controls,
     } = request;
     if cell_w <= 0.0 || row_height <= 0.0 {
         return row_height.max(1.0);
     }
-    let gear_cols: usize = GEAR_RESERVED_COLS;
     let total_cols = columns_in_width(ws_width, cell_w);
-    let available = total_cols.saturating_sub(badge_cols).saturating_sub(gear_cols);
+    let trailing_cols = trailing_controls.columns();
+    let available = total_cols.saturating_sub(badge_cols).saturating_sub(trailing_cols);
     let tab_w = usize::from(tab_width_chars).max(1);
     let tabs_per_row = (available / tab_w).max(1);
     let effective_count = tab_count.max(1);
@@ -372,8 +388,9 @@ pub fn build_tab_bar_text(
     // Reserve columns for the gear icon on the far right (2 cols: space + gear).
     let gear_cols: usize = if params.show_gear { GEAR_RESERVED_COLS } else { 0 };
     // Reserve columns for the equalize icon left of gear (2 cols: space + icon).
-    let equalize_cols: usize = if params.show_equalize { EQUALIZE_RESERVED_COLS } else { 0 };
-    let content_cols = max_cols.saturating_sub(gear_cols).saturating_sub(equalize_cols);
+    let trailing_cols =
+        TabBarTrailingControls { gear: params.show_gear, equalize: params.show_equalize }.columns();
+    let content_cols = max_cols.saturating_sub(trailing_cols);
 
     // Render workspace badge if present.
     {

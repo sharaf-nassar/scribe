@@ -1224,6 +1224,11 @@ impl App {
     }
 
     fn handle_bell_event(&mut self, session_id: SessionId) {
+        #[cfg(target_os = "linux")]
+        if self.notification_tracker.should_suppress_linux_bell_attention(session_id) {
+            return;
+        }
+
         if (!self.focus.window_focused || self.focused_session_id() != Some(session_id))
             && self.update_available.is_none()
             && let Some(window) = &self.window
@@ -2398,10 +2403,17 @@ impl App {
     ) -> f32 {
         let cell_w = self.gpu.as_ref().map_or(8.0, |g| g.renderer.cell_size().width);
         let row_h = self.config.appearance.tab_height * self.scale_factor;
+        let workspace = self.window_layout.find_workspace(workspace_id);
         let badge_cols = tab_bar::badge_columns(
-            self.window_layout.find_workspace(workspace_id).and_then(|ws| ws.name.as_deref()),
+            workspace.and_then(|ws| ws.name.as_deref()),
             self.window_layout.workspace_count() > 1,
         );
+        let trailing_controls = tab_bar::TabBarTrailingControls {
+            gear: false,
+            equalize: workspace
+                .and_then(|ws| ws.active_tab())
+                .is_some_and(|tab| tab.pane_layout.all_pane_ids().len() > 1),
+        };
         tab_bar::compute_tab_bar_height(tab_bar::TabBarHeightRequest {
             tab_count: tab_count.max(1),
             ws_width: ws_rect.width,
@@ -2409,6 +2421,7 @@ impl App {
             cell_w,
             row_height: row_h,
             badge_cols,
+            trailing_controls,
         })
     }
 
@@ -3053,7 +3066,7 @@ impl App {
         );
 
         if self.config.terminal.prompt_bar.enabled && new_line_count != old_line_count {
-            self.resize_after_layout_change();
+            self.resize_after_prompt_bar_height_change();
         }
         self.request_redraw();
     }
@@ -3072,7 +3085,7 @@ impl App {
         pane.prompt_ui.dismissed = false;
 
         if self.config.terminal.prompt_bar.enabled && (had_prompts || was_dismissed) {
-            self.resize_after_layout_change();
+            self.resize_after_prompt_bar_height_change();
         }
     }
 
@@ -3098,7 +3111,7 @@ impl App {
             pane.prompt_count = 0;
             pane.prompt_ui.dismissed = false;
             if self.config.terminal.prompt_bar.enabled && (old_lines > 0 || was_dismissed) {
-                self.resize_after_layout_change();
+                self.resize_after_prompt_bar_height_change();
             }
         }
     }
@@ -3153,7 +3166,7 @@ impl App {
         }
 
         if restored_any && self.config.terminal.prompt_bar.enabled {
-            self.resize_after_layout_change();
+            self.resize_after_prompt_bar_height_change();
         }
     }
 
@@ -3371,7 +3384,7 @@ impl App {
             self.resize_all_workspace_panes();
         }
         if plan.prompt_bar_changed() {
-            self.resize_after_layout_change();
+            self.resize_after_prompt_bar_height_change();
         }
         tracing::info!("config hot-reloaded");
         self.request_redraw();
@@ -3731,6 +3744,8 @@ impl App {
         let badge_cols = tab_bar::badge_columns(entry.ws.name.as_deref(), ctx.multi_workspace);
         let pane_count = entry.tab.pane_layout.all_pane_ids().len();
         let has_multiple_panes = pane_count > 1;
+        let trailing_controls =
+            tab_bar::TabBarTrailingControls { gear: false, equalize: has_multiple_panes };
         let row_height = self.config.appearance.tab_height * self.scale_factor;
         let tab_bar_height = tab_bar::compute_tab_bar_height(tab_bar::TabBarHeightRequest {
             tab_count: entry.ws.tabs.len(),
@@ -3739,12 +3754,13 @@ impl App {
             cell_w: ctx.cell_size.0,
             row_height,
             badge_cols,
+            trailing_controls,
         });
         let total_cols = workspace_columns(entry.ws_rect, ctx.cell_size.0);
-        let equalize_cols = usize::from(has_multiple_panes) * 2;
+        let trailing_cols = trailing_controls.columns();
         let tab_width = usize::from(self.config.appearance.tab_width).max(1);
         let available_for_tabs =
-            total_cols.saturating_sub(badge_cols).saturating_sub(equalize_cols);
+            total_cols.saturating_sub(badge_cols).saturating_sub(trailing_cols);
         let tabs_per_row = (available_for_tabs / tab_width).max(1);
 
         tab_bar::WorkspaceTabBarData {
@@ -6711,7 +6727,7 @@ impl App {
         }
         self.prompt_bar_hover = None;
         self.prompt_bar_pressed = None;
-        self.resize_after_layout_change();
+        self.resize_after_prompt_bar_height_change();
         self.request_redraw();
         true
     }
@@ -7807,6 +7823,18 @@ impl App {
         self.resize_all_panes_from_rects(&rects, &ws_rects);
     }
 
+    /// Resize after prompt-bar visibility changes and notify the PTY without
+    /// the normal resize debounce.
+    ///
+    /// Codex repaints as a full-screen synchronized TUI. If the client shrinks
+    /// its local grid for the prompt bar but the PTY keeps the old winsize for
+    /// the debounce window, old-size Codex frames can be replayed into the
+    /// smaller client grid and appear cut off.
+    fn resize_after_prompt_bar_height_change(&mut self) {
+        self.resize_after_layout_change();
+        self.flush_resize_now();
+    }
+
     /// Recompute rects and resize panes in all workspaces.
     ///
     /// Used after workspace splits where the window is re-divided and every
@@ -7926,6 +7954,11 @@ impl App {
         if self.resize_pending.is_none_or(|t| t.elapsed() < RESIZE_DEBOUNCE) {
             return;
         }
+        self.flush_resize_now();
+    }
+
+    /// Send pending resize IPC messages immediately.
+    fn flush_resize_now(&mut self) {
         let Some(tx) = &self.cmd_tx else {
             self.resize_pending = None;
             return;
@@ -9101,7 +9134,7 @@ fn build_chrome_passes(
 ) {
     build_focused_workspace_border_pass(all_instances, context.layout, context.style);
     build_prompt_bar_pass(all_instances, backend, panes, context);
-    build_split_scroll_chrome_pass(all_instances, backend, panes, context);
+    build_split_scroll_chrome_pass(all_instances, panes, context);
     build_divider_pass(all_instances, context.layout, context.style);
     build_scrollbar_pass(
         all_instances,
@@ -9593,7 +9626,6 @@ fn prompt_bar_glyph_size(layout: &FrameLayout<'_>) -> [f32; 2] {
 
 fn build_split_scroll_chrome_pass(
     all_instances: &mut Vec<CellInstance>,
-    backend: &mut RenderBackend<'_>,
     panes: &HashMap<PaneId, Pane>,
     context: &ChromePassContext<'_, '_>,
 ) {
@@ -9611,7 +9643,6 @@ fn build_split_scroll_chrome_pass(
             divider_color: context.style.divider_color,
             jump_button_hovered: context.layout.scroll_pin.hover == Some(*pane_id),
             accent_color: context.style.accent_color,
-            resolve_glyph: &mut |ch| backend.resolve_glyph(ch),
         });
     }
 }
