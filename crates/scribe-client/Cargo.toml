@@ -34,7 +34,7 @@ chrono = { version = "0.4", default-features = false, features = [
   "std",
 ] }
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 notify-rust = "4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -43,6 +43,8 @@ arboard = { version = "3", default-features = false, features = [
 ] }
 x11rb.workspace = true
 raw-window-handle.workspace = true
+zbus.workspace = true
+futures-util.workspace = true
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 arboard = { version = "3", default-features = false }

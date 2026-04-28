@@ -159,6 +159,14 @@ Dropped files and directories are pasted into the focused shell using shell-awar
 
 When a terminal application enables mouse mode (SGR 1006 or X10), mouse events are encoded as escape sequences and forwarded to the PTY. Modifier keys are encoded in the xterm Cb field (Shift +1, Alt +2, Ctrl +4).
 
+### Resize Coordination
+
+Window resize coalesces per event-loop tick rather than via a wall-clock debounce, and is flushed ahead of any input bytes so the server sees `Resize` → `KeyInput` in mpsc order.
+
+Every `WindowEvent::Resized` updates the local pane grid and sets `resize_pending`. [[crates/scribe-client/src/main.rs#App#flush_resize_if_pending]] runs in `about_to_wait` (per-tick batching) and from the input call sites — [[crates/scribe-client/src/main.rs#App#handle_terminal_key]], [[crates/scribe-client/src/main.rs#App#send_paste_data]], and [[crates/scribe-client/src/main.rs#App#perform_primary_paste]] — before any `KeyInput` is queued. The shared mpsc `Sender<ClientCommand>` preserves FIFO order, so the server processes `Resize` first; `tcsetwinsize` delivers `SIGWINCH` ahead of the bytes hitting the PTY, and bash updates `COLUMNS` before reading the next command.
+
+This mirrors alacritty/ghostty/wezterm/kitty/vte — none use a wall-clock debounce; all coalesce implicitly per tick or by last-known-size dedup.
+
 ## IPC Client
 
 The IPC connection runs in a background thread with its own Tokio runtime, defined in [[crates/scribe-client/src/ipc_client.rs#start_ipc_thread]].
@@ -213,13 +221,41 @@ On reconnect, active AI state is populated from `SessionInfo.ai_state` during ha
 
 ## Desktop Notifications
 
-The [[crates/scribe-client/src/notifications.rs#NotificationTracker]] fires OS desktop notifications when an AI session transitions from `Processing` to an attention state (`IdlePrompt`, `WaitingForInput`, `PermissionPrompt`).
+Desktop notifications fire on `Processing → attention` AI state transitions. Delivery goes through a cross-platform dispatcher so [[crates/scribe-client/src/main.rs#App]] talks to one channel regardless of OS.
 
-The tracker stores the previous `AiState` per session and is called from `handle_ai_state_changed` before the `AiStateTracker` update. When a `Processing → attention` transition is detected, a `NotificationPayload` is returned and `maybe_fire_notification` checks focus suppression based on [[crates/scribe-common/src/config.rs#NotifyCondition]]: `WhenUnfocused` suppresses when the window is focused regardless of tab, `WhenUnfocusedOrBackgroundTab` only suppresses when both the window is focused and the session is the active tab, and `Always` never suppresses for focus reasons. The notification summary includes the workspace name or project root basename and the state label (Ready, Waiting for input, Permission required). The body carries the user's last submitted prompt text from `pane.latest_prompt`.
+[[crates/scribe-client/src/notifications.rs#NotificationTracker]] stores the previous `AiState` per session and is called from `handle_ai_state_changed` before the `AiStateTracker` update. When a `Processing → attention` transition is detected (`IdlePrompt`, `WaitingForInput`, `PermissionPrompt`), a `NotificationPayload` is returned and [[crates/scribe-client/src/main.rs#App#maybe_fire_notification]] checks focus suppression based on [[crates/scribe-common/src/config.rs#NotifyCondition]]: `WhenUnfocused` suppresses when the window is focused regardless of tab, `WhenUnfocusedOrBackgroundTab` only suppresses when both the window is focused and the session is the active tab, and `Always` never suppresses for focus reasons. The notification summary includes the workspace name or project root basename and the state label (Ready, Waiting for input, Permission required). The body carries the user's last submitted prompt text from `pane.latest_prompt`.
 
-On Linux, [[crates/scribe-client/src/notifications.rs#fire_os_notification]] uses `notify-rust` with D-Bus, tags notifications with the active install flavor (`scribe` vs `scribe-dev`) for desktop-entry/icon attribution, and spawns a thread that blocks on `wait_for_action` — clicking the notification sends `UiEvent::RunAction { FocusSession }` through the `EventLoopProxy`. Linux intentionally skips `request_user_attention` here because on X11 the urgency hint can become a second shell-level "`<app>` is ready" notification on top of the explicit desktop notification. The tracker also suppresses Linux bell-driven urgency for two seconds after an AI notification from the same session so BEL does not immediately cover the richer D-Bus toast with the generic shell fallback. On macOS, `notify-rust` does not support click callbacks, so the tracker uses a focus-on-activate fallback: `set_last_notified` records the session ID when a notification fires, and when macOS activates the app after a click, the `Focused(true)` handler calls `take_pending_focus` to consume the pending session and dispatch `handle_focus_session`. A 30-second expiry window prevents stale notifications from switching tabs. While an update is already announced in the window title, non-update `request_user_attention` calls are suppressed so macOS does not keep resurfacing the update-ready text for unrelated AI notifications or bells. The [[crates/scribe-common/src/protocol.rs#AutomationAction]] `FocusSession` variant routes through the existing automation dispatch path: `execute_automation_action` calls `handle_focus_session`, which looks up the session via `session_to_pane`, switches workspace and tab, and raises the OS window with `focus_window`. Notification settings are configurable in the settings window under the Notifications page.
+### Cross-Platform Dispatcher
 
-Linux notification expiry is configurable through [[crates/scribe-common/src/config.rs#NotifyTimeoutMode]]: `system_default` leaves the timeout up to the desktop server, `custom` uses `timeout_secs`, and `never` maps to a resident notification that stays visible until dismissed. macOS ignores those config fields because `notify-rust` cannot set banner lifetime there; the Notifications settings page instead offers a shortcut to the system Notifications pane so the user can choose the persistent style for Scribe themselves.
+[[crates/scribe-client/src/notification_dispatcher/mod.rs#spawn_dispatcher]] is started alongside the IPC thread in `resumed` and returns an `mpsc::UnboundedSender<NotifReq>` stored on `App.notification_tx`.
+
+The sender always exists; main.rs has no `#[cfg(target_os = …)]` gates for notifications. Platform divergence lives entirely inside the `notification_dispatcher` directory — `linux.rs` (raw `zbus`) and `macos.rs` (`notify-rust`) — and both export the same `spawn(proxy) -> UnboundedSender<NotifReq>` shape, mirroring the `winit::platform_impl` / `wgpu::hal` pattern of OS-protocol abstraction.
+
+The dispatcher receives [[crates/scribe-client/src/notification_dispatcher/mod.rs#NotifReq]] variants: `Show(ShowReq{…})` from `maybe_fire_notification`, `Close { session_id }` from [[crates/scribe-client/src/main.rs#App#close_pending_notification]] on session exit and `AiStateCleared`, and `Shutdown` from [[crates/scribe-client/src/main.rs#App#shutdown_notification_dispatcher]] on the terminal exit paths.
+
+### Linux Backend
+
+[[crates/scribe-client/src/notification_dispatcher/linux.rs#spawn]] runs a single long-lived dispatcher thread that owns one D-Bus session-bus connection for every notification this client ever fires.
+
+The thread runs its own single-threaded tokio runtime, opens a `NotificationsProxy` (generated by `#[zbus::proxy]` from [[crates/scribe-client/src/notification_dispatcher/linux.rs#Notifications]]) against `org.freedesktop.Notifications`, and subscribes once to the `ActionInvoked` and `NotificationClosed` signal streams. The main loop `tokio::select!`s between the request channel and those two streams. Repeated state changes for the same session reuse `replaces_id` from a `session → notification id` map so the daemon atomically swaps an existing toast in place — no stacked toasts under `condition = "always"` and no thread or D-Bus connection accumulation under `timeout_mode = "never"`.
+
+`ActionInvoked` looks up the toast id in the reverse map and sends `UiEvent::RunAction { FocusSession }` through the `EventLoopProxy`. `NotificationClosed` removes the entry from both maps when the daemon retires a toast. `NotifReq::Close` calls `CloseNotification(id)` to dismiss stale toasts proactively; `NotifReq::Shutdown` closes every live notification before the loop exits.
+
+This replaces the earlier per-notification `std::thread` + `notify-rust` `wait_for_action` pattern, which leaked one OS thread and one D-Bus connection per fired notification under the `condition = "always"` + `timeout_mode = "never"` combination. `notify-rust` is dropped from the Linux dependency set; raw `zbus` handles the `Notifications` interface directly. Linux intentionally skips `request_user_attention` because on X11 the urgency hint can become a second shell-level "`<app>` is ready" notification on top of the explicit desktop notification. The tracker also suppresses Linux bell-driven urgency for two seconds after an AI notification from the same session so BEL does not immediately cover the richer D-Bus toast with the generic shell fallback.
+
+Linux notification expiry is configurable through [[crates/scribe-common/src/config.rs#NotifyTimeoutMode]]: `system_default` maps to `expire_timeout = -1` (server default), `custom` maps to `timeout_secs * 1000`, and `never` maps to `expire_timeout = 0` (resident until dismissed). The dispatcher passes the resolved value straight through to the `Notify` D-Bus call.
+
+### macOS Backend
+
+[[crates/scribe-client/src/notification_dispatcher/macos.rs#spawn]] runs the same dispatcher loop shape as Linux but services each `Show` request with a synchronous `notify_rust::Notification::show()` call against `NSUserNotification`.
+
+`Close` and `Shutdown` are no-ops on macOS because `notify-rust` exposes no programmatic dismiss path — the system retires toasts on its own timeline. Click-to-focus uses a focus-on-activate fallback: `set_last_notified` records the session ID when a notification fires, and when macOS activates the app after a click, the `Focused(true)` handler calls `take_pending_focus` to consume the pending session and dispatch `handle_focus_session`. A 30-second expiry window prevents stale notifications from switching tabs. While an update is already announced in the window title, non-update `request_user_attention` calls are suppressed so macOS does not keep resurfacing the update-ready text for unrelated AI notifications or bells. macOS ignores the timeout-mode config because `notify-rust` cannot set banner lifetime there; the Notifications settings page instead offers a shortcut to the system Notifications pane so the user can choose the persistent style for Scribe themselves.
+
+### FocusSession Routing
+
+The [[crates/scribe-common/src/protocol.rs#AutomationAction]] `FocusSession` variant routes through the existing automation dispatch path on both platforms.
+
+`execute_automation_action` calls `handle_focus_session`, which looks up the session via `session_to_pane`, switches workspace and tab, and raises the OS window with `focus_window`. Notification settings are configurable in the settings window under the Notifications page.
 
 ## Prompt Bar
 

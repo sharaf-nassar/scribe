@@ -1,14 +1,11 @@
-//! Desktop notification support for AI session state changes.
+//! Per-session AI state-transition tracking that decides when an OS
+//! notification should fire (`Processing → IdlePrompt`,
+//! `WaitingForInput`, or `PermissionPrompt`).
 //!
-//! Tracks per-session AI state transitions and fires OS notifications
-//! when a session leaves `Processing` and enters an attention state
-//! (`IdlePrompt`, `WaitingForInput`, `PermissionPrompt`).
-//!
-//! On Linux, clicking a notification dispatches `FocusSession` via the
-//! D-Bus `wait_for_action` callback.  On macOS, `notify-rust` does not
-//! support click callbacks, so the tracker records the last-notified
-//! session and the `Focused(true)` handler calls `take_pending_focus`
-//! to switch tabs when the OS activates the window after a click.
+//! Actual delivery is handled by [`crate::notification_dispatcher`] on
+//! every platform — the tracker only owns the state machine that
+//! turns AI state changes into [`NotificationPayload`] decisions and
+//! the focus-on-activate fallback used by macOS click-to-focus.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -87,7 +84,7 @@ impl NotificationTracker {
 
     /// Record that a notification was just shown for this session.
     ///
-    /// On macOS, the `Focused(true)` handler uses [`take_pending_focus`]
+    /// On macOS, the `Focused(true)` handler uses [`Self::take_pending_focus`]
     /// to consume this and dispatch `handle_focus_session`.
     pub fn set_last_notified(&mut self, session_id: SessionId) {
         self.last_notified = Some((session_id, Instant::now()));
@@ -123,87 +120,4 @@ impl NotificationTracker {
     pub fn config(&self) -> &NotificationsConfig {
         &self.config
     }
-}
-
-/// Send a desktop notification and optionally wait for the user to click it.
-///
-/// On Linux this function **blocks** on D-Bus `wait_for_action` and must be
-/// called from a spawned thread.  On macOS the call returns immediately —
-/// click handling is done via the focus-on-activate fallback in the caller.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub fn fire_os_notification(
-    summary: &str,
-    body: &str,
-    session_id: SessionId,
-    proxy: &winit::event_loop::EventLoopProxy<super::ipc_client::UiEvent>,
-    config: &NotificationsConfig,
-) {
-    use notify_rust::Notification;
-
-    let identity = scribe_common::app::current_identity();
-    let mut notif = Notification::new();
-    notif.summary(summary).body(body).appname(identity.window_title_name());
-
-    #[cfg(target_os = "linux")]
-    {
-        use notify_rust::Timeout;
-        use scribe_common::config::NotifyTimeoutMode;
-
-        notif.icon(identity.slug());
-        notif.hint(notify_rust::Hint::DesktopEntry(identity.slug().to_owned()));
-        notif.action("default", "Focus");
-        match config.timeout_mode {
-            NotifyTimeoutMode::SystemDefault => {
-                notif.timeout(Timeout::Default);
-            }
-            NotifyTimeoutMode::Custom => {
-                let millis = config.timeout_secs.saturating_mul(1000);
-                notif.timeout(Timeout::Milliseconds(millis));
-            }
-            NotifyTimeoutMode::Never => {
-                notif.timeout(Timeout::Never);
-            }
-        }
-    }
-
-    match notif.show() {
-        Ok(handle) => {
-            #[cfg(target_os = "linux")]
-            fire_on_click(handle, proxy, session_id);
-            // macOS: notify-rust does not support wait_for_action on
-            // NSUserNotification.  Click-to-focus is handled by the
-            // focus-on-activate fallback — macOS brings the app to the
-            // foreground when the user clicks the notification, and the
-            // Focused(true) handler calls take_pending_focus().
-            #[cfg(target_os = "macos")]
-            {
-                let _ = (config, handle, proxy);
-            }
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "desktop notification failed");
-        }
-    }
-}
-
-/// Block on a Linux D-Bus notification action callback and dispatch
-/// `FocusSession` when the user clicks the notification body.
-#[cfg(target_os = "linux")]
-fn fire_on_click(
-    handle: notify_rust::NotificationHandle,
-    proxy: &winit::event_loop::EventLoopProxy<super::ipc_client::UiEvent>,
-    session_id: SessionId,
-) {
-    use scribe_common::protocol::AutomationAction;
-
-    use super::ipc_client::UiEvent;
-
-    let proxy = proxy.clone();
-    handle.wait_for_action(|action| {
-        if action == "default" {
-            drop(proxy.send_event(UiEvent::RunAction {
-                action: AutomationAction::FocusSession { session_id },
-            }));
-        }
-    });
 }

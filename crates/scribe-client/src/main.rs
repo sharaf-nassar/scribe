@@ -12,6 +12,7 @@ mod ipc_client;
 mod layout;
 mod mouse_reporting;
 mod mouse_state;
+mod notification_dispatcher;
 mod notifications;
 mod pane;
 mod prompt_bar;
@@ -621,6 +622,10 @@ struct App {
     // AI state
     ai_tracker: AiStateTracker,
     notification_tracker: notifications::NotificationTracker,
+    /// Sender to the platform notification dispatcher thread.
+    /// Initialised alongside the IPC thread in `resumed`. `None`
+    /// before the dispatcher has been spawned.
+    notification_tx: Option<tokio::sync::mpsc::UnboundedSender<notification_dispatcher::NotifReq>>,
     animation: AppAnimationState,
 
     // Input state
@@ -834,6 +839,7 @@ impl App {
             pending_shutdown: None, restore_store: restore_state::RestoreStore::new(), restore_save_pending: None,
             ai_tracker: AiStateTracker::new(ClaudeStatesConfig::default()),
             notification_tracker: notifications::NotificationTracker::new(NotificationsConfig::default()),
+            notification_tx: None,
             animation: AppAnimationState {
                 running: false,
                 generation: Arc::new(AtomicU64::new(0)),
@@ -948,7 +954,7 @@ impl ApplicationHandler<UiEvent> for App {
         }
 
         self.flush_geometry_if_due();
-        self.flush_resize_if_due();
+        self.flush_resize_if_pending();
         self.flush_restore_if_due();
     }
 
@@ -1240,6 +1246,7 @@ impl App {
     fn handle_ai_state_cleared(&mut self, session_id: SessionId) {
         self.ai_tracker.remove(session_id);
         self.notification_tracker.remove(session_id);
+        self.close_pending_notification(session_id);
         if let Some(pane_id) = self.session_to_pane.get(&session_id).copied()
             && let Some(pane) = self.panes.get_mut(&pane_id)
             && matches!(pane.launch_binding.kind, restore_state::LaunchKind::Ai { .. })
@@ -1501,6 +1508,12 @@ impl App {
         // Start IPC thread (proxy was created before run_app).
         let proxy = self.proxy.take().ok_or(InitError::ProxyConsumed)?;
         let cmd_tx = ipc_client::start_ipc_thread(proxy, self.window_id);
+
+        // Start the platform notification dispatcher on its own
+        // thread — see lat.md/client.md §Desktop Notifications.
+        if let Some(notif_proxy) = self.animation_proxy.clone() {
+            self.notification_tx = Some(notification_dispatcher::spawn_dispatcher(notif_proxy));
+        }
 
         // `ListSessions` is deferred to the first splash frame — see
         // `handle_redraw`.  This guarantees the splash is visible before
@@ -2677,6 +2690,7 @@ impl App {
         tracing::info!(session = %session_id, "session exited");
         self.ai_tracker.remove(session_id);
         self.notification_tracker.remove(session_id);
+        self.close_pending_notification(session_id);
 
         let Some(pane_id) = self.session_to_pane.remove(&session_id) else { return };
 
@@ -2821,18 +2835,18 @@ impl App {
         // the click, so the Focused(true) handler checks this).
         self.notification_tracker.set_last_notified(session_id);
 
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if let Some(proxy) = self.animation_proxy.clone() {
-            let notification_config = self.notification_tracker.config().clone();
-            std::thread::spawn(move || {
-                notifications::fire_os_notification(
-                    &summary,
-                    &body,
-                    session_id,
-                    &proxy,
-                    &notification_config,
-                );
+        if let Some(tx) = &self.notification_tx {
+            let cfg = self.notification_tracker.config();
+            let req = notification_dispatcher::NotifReq::Show(notification_dispatcher::ShowReq {
+                session_id,
+                summary,
+                body,
+                timeout_mode: cfg.timeout_mode,
+                timeout_secs: cfg.timeout_secs,
             });
+            if tx.send(req).is_err() {
+                tracing::debug!("notification dispatcher closed");
+            }
         }
 
         // Linux/X11 surfaces `request_user_attention` as the WM urgency hint,
@@ -2847,6 +2861,25 @@ impl App {
             && let Some(window) = &self.window
         {
             window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+        }
+    }
+
+    /// Ask the dispatcher to dismiss the active notification for a
+    /// session. Best-effort: macOS treats this as a no-op because
+    /// `NSUserNotification` exposes no programmatic dismiss path
+    /// through `notify-rust`.
+    fn close_pending_notification(&self, session_id: SessionId) {
+        if let Some(tx) = &self.notification_tx {
+            drop(tx.send(notification_dispatcher::NotifReq::Close { session_id }));
+        }
+    }
+
+    /// Tell the dispatcher to close every live toast and exit. Called
+    /// from the terminal exit paths so a fresh client process does
+    /// not inherit lingering notifications it cannot manage.
+    fn shutdown_notification_dispatcher(&mut self) {
+        if let Some(tx) = self.notification_tx.take() {
+            drop(tx.send(notification_dispatcher::NotifReq::Shutdown));
         }
     }
 
@@ -4400,6 +4433,8 @@ impl App {
             let Some(tab) = self.window_layout.active_tab() else { return };
             tab.focused_pane
         };
+        // Send any pending resize first so SIGWINCH lands before the bytes do.
+        self.flush_resize_if_pending();
         let Some(pane) = self.panes.get_mut(&focused_pane_id) else { return };
         let sid = pane.session_id;
 
@@ -5303,6 +5338,7 @@ impl App {
         if text.is_empty() {
             return;
         }
+        self.flush_resize_if_pending();
 
         let Some(tx) = self.cmd_tx.clone() else { return };
         let Some(target) = self.prepare_paste_target() else { return };
@@ -7150,6 +7186,7 @@ impl App {
         if text.is_empty() {
             return;
         }
+        self.flush_resize_if_pending();
         let Some(tx) = self.cmd_tx.clone() else { return };
         let focused_pane_id = {
             let Some(tab) = self.window_layout.active_tab() else { return };
@@ -7949,12 +7986,18 @@ impl App {
         }
     }
 
-    /// Send any pending resize IPC messages if the debounce interval has elapsed.
-    fn flush_resize_if_due(&mut self) {
-        if self.resize_pending.is_none_or(|t| t.elapsed() < RESIZE_DEBOUNCE) {
-            return;
+    /// Send any pending resize IPC message.
+    ///
+    /// Called once per `about_to_wait` (per-tick batching) and before any
+    /// input bytes are queued so the server sees `Resize` ahead of `KeyInput`
+    /// in mpsc channel order — the kernel then delivers `SIGWINCH` to the
+    /// foreground process before the bytes reach the PTY. Matches the
+    /// alacritty/ghostty/wezterm/kitty/vte pattern of immediate ioctl with
+    /// implicit per-tick coalescing rather than a wall-clock debounce.
+    fn flush_resize_if_pending(&mut self) {
+        if self.resize_pending.is_some() {
+            self.flush_resize_now();
         }
-        self.flush_resize_now();
     }
 
     /// Send pending resize IPC messages immediately.
@@ -8342,6 +8385,7 @@ impl App {
         self.clear_restore_state();
         self.connection.quit_restore_cleared = true;
         self.pending_shutdown = None;
+        self.shutdown_notification_dispatcher();
         event_loop.exit();
     }
 
@@ -8384,6 +8428,7 @@ impl App {
             }
             self.window_registry.remove(wid);
         }
+        self.shutdown_notification_dispatcher();
         event_loop.exit();
     }
 
@@ -8395,6 +8440,7 @@ impl App {
                 self.window_registry.remove(window_id);
                 self.clear_restore_state();
                 self.pending_shutdown = None;
+                self.shutdown_notification_dispatcher();
                 event_loop.exit();
             }
             _ => {
@@ -8713,9 +8759,6 @@ const SEARCH_RESULT_LIMIT: u32 = 256;
 
 /// Debounce interval for geometry saves (move/resize events fire rapidly).
 const GEOMETRY_DEBOUNCE: Duration = Duration::from_millis(500);
-
-/// Debounce interval for resize IPC sends (window drag fires rapidly).
-const RESIZE_DEBOUNCE: Duration = Duration::from_millis(30);
 
 /// Debounce interval for restore snapshot saves.
 const RESTORE_DEBOUNCE: Duration = Duration::from_millis(500);
