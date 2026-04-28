@@ -1,8 +1,18 @@
 pub mod apply;
+pub mod server_action;
 pub mod singleton;
 pub mod state;
 
+use std::time::Duration;
+
 use rust_embed::Embed;
+use scribe_common::protocol::UpdateCheckResultState;
+
+/// Maximum time to wait for a manual update-check response from the server.
+/// The server-side check itself can take ~10 s including the 5 s retry, so we
+/// add headroom for a slow network or a busy updater task. After this elapses
+/// the user sees a "Check failed: …" message and the worker thread aborts.
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Embedded web assets (HTML, CSS, JS) for the settings UI.
 #[derive(Embed)]
@@ -190,6 +200,110 @@ fn settings_ipc_request_type(body: &str) -> Option<String> {
         .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
 }
 
+/// Push a manual update-check result into the webview's `updateCheckResult`
+/// callback. Always called on the UI thread (GTK main loop on Linux, the tao
+/// event loop on macOS) so `evaluate_script` is safe.
+fn inject_update_check_result(
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+    state: &UpdateCheckResultState,
+) {
+    let json = match serde_json::to_string(state) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("failed to serialise UpdateCheckResultState: {e}");
+            return;
+        }
+    };
+    let script =
+        format!("if (typeof updateCheckResult === 'function') {{ updateCheckResult({json}); }}");
+    if let Some(wv) = webview_ref.borrow().as_ref() {
+        if let Err(e) = wv.evaluate_script(&script) {
+            tracing::warn!("failed to inject update check result: {e}");
+        }
+    }
+}
+
+/// Shared cell holding the currently-active glib timeout source for an
+/// in-flight manual update check on Linux. Storing the [`SourceId`] lets the
+/// window-close path explicitly remove the source before the webview is
+/// dropped, avoiding a renderer-cleanup crash on some `WebKitGTK` versions
+/// when the closure outlives the underlying widget.
+#[cfg(target_os = "linux")]
+type ActiveCheckSource = std::rc::Rc<std::cell::RefCell<Option<gtk::glib::SourceId>>>;
+
+#[cfg(target_os = "linux")]
+fn new_active_check_source() -> ActiveCheckSource {
+    std::rc::Rc::new(std::cell::RefCell::new(None))
+}
+
+/// Linux: spawn a worker thread to talk to the server, then drain the result
+/// back to the webview via a `glib` timeout source on the GTK main loop.
+///
+/// We poll a `std::sync::mpsc` channel every 100 ms because `glib::idle_add`
+/// requires `Send` closures and our `Rc<RefCell<…>>` webview reference is not
+/// `Send`. Polling at this cadence is cheap and the latency between worker
+/// completion and UI update is imperceptible.
+///
+/// The registered [`SourceId`] is recorded in `active_source` so the window
+/// shutdown path can cancel it explicitly. A second click while a check is
+/// already in flight cancels the prior poll and starts fresh.
+#[cfg(target_os = "linux")]
+fn dispatch_check_for_updates_linux(
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+    active_source: &ActiveCheckSource,
+) {
+    if let Some(prev) = active_source.borrow_mut().take() {
+        prev.remove();
+    }
+
+    let webview_clone = std::rc::Rc::clone(webview_ref);
+    let active_for_closure = std::rc::Rc::clone(active_source);
+    let (tx, rx) = std::sync::mpsc::channel::<UpdateCheckResultState>();
+
+    std::thread::spawn(move || {
+        let state = server_action::request_update_check(UPDATE_CHECK_TIMEOUT);
+        drop(tx.send(state));
+    });
+
+    let source_id =
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
+            Ok(state) => {
+                inject_update_check_result(&webview_clone, &state);
+                *active_for_closure.borrow_mut() = None;
+                gtk::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                *active_for_closure.borrow_mut() = None;
+                gtk::glib::ControlFlow::Break
+            }
+        });
+    *active_source.borrow_mut() = Some(source_id);
+}
+
+/// Cancel any in-flight manual-check polling source. Called from the window
+/// shutdown path so the closure (which holds an `Rc` clone of the webview)
+/// drops before the underlying widget is torn down.
+#[cfg(target_os = "linux")]
+fn cancel_active_check_source(active_source: &ActiveCheckSource) {
+    if let Some(source) = active_source.borrow_mut().take() {
+        source.remove();
+    }
+}
+
+/// macOS: spawn a worker thread to talk to the server, then deliver the result
+/// as a tao user event so the main event loop can call `evaluate_script` on
+/// the UI thread. Mirrors how the existing `FocusWindow` / `QuitWindow` events
+/// hand off from the singleton-listener thread to the event loop.
+#[cfg(not(target_os = "linux"))]
+fn dispatch_check_for_updates_macos(proxy: &tao::event_loop::EventLoopProxy<TaoUserEvent>) {
+    let proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let state = server_action::request_update_check(UPDATE_CHECK_TIMEOUT);
+        drop(proxy.send_event(TaoUserEvent::UpdateCheckResult(state)));
+    });
+}
+
 #[cfg(target_os = "macos")]
 fn open_macos_notification_settings() {
     let url = "x-apple.systempreferences:com.apple.preference.notifications";
@@ -201,10 +315,14 @@ fn open_macos_notification_settings() {
 #[cfg(not(target_os = "macos"))]
 fn open_macos_notification_settings() {}
 
-/// Handle a webview IPC request that asks the host to perform an action.
+/// Handle a stateless platform action issued by the webview.
+///
+/// Returns `true` when the action was recognised and handled, `false`
+/// otherwise. Stateful actions (font refresh, manual update check, config
+/// writes) are handled directly in [`handle_settings_ipc_request`] because
+/// they need access to the webview reference or caller closures.
 fn handle_settings_ipc_action(kind: &str) -> bool {
     match kind {
-        "request_fonts" => true,
         "open_macos_notification_settings" => {
             open_macos_notification_settings();
             true
@@ -214,30 +332,35 @@ fn handle_settings_ipc_action(kind: &str) -> bool {
 }
 
 /// Handle an IPC request from the settings webview.
-fn handle_settings_ipc_request<F: Fn(String)>(
+///
+/// Dispatches by `type` field to the appropriate path. The match is structured
+/// as an explicit if/else chain (rather than a single `match` block) because
+/// the branches differ in what extra state they need: `request_fonts` and
+/// `request_update_check` need closures captured in the calling scope, while
+/// `setting_changed` carries the full body, and the platform-action group is
+/// handled by a stateless inner helper.
+fn handle_settings_ipc_request<F: Fn(String), G: Fn()>(
     body: &str,
     webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
     on_change: &F,
+    on_request_update_check: &G,
 ) {
-    if let Some(kind) = settings_ipc_request_type(body) {
-        if kind == "request_fonts" {
-            if let Some(wv) = webview_ref.borrow().as_ref() {
-                inject_font_list(wv);
-            }
-            return;
-        }
-        if handle_settings_ipc_action(&kind) {
-            return;
-        }
-        if kind == "setting_changed" {
-            on_change(body.to_owned());
-            return;
-        }
-        tracing::debug!(kind, "unhandled settings IPC request");
+    let Some(kind) = settings_ipc_request_type(body) else {
+        tracing::debug!("settings IPC request missing type");
         return;
-    }
+    };
 
-    tracing::debug!("settings IPC request missing type");
+    if kind == "request_fonts" {
+        if let Some(wv) = webview_ref.borrow().as_ref() {
+            inject_font_list(wv);
+        }
+    } else if kind == "request_update_check" {
+        on_request_update_check();
+    } else if kind == "setting_changed" {
+        on_change(body.to_owned());
+    } else if !handle_settings_ipc_action(&kind) {
+        tracing::debug!(kind, "unhandled settings IPC request");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -314,11 +437,14 @@ pub fn run_settings_window(
 
     // Shared webview reference so the IPC handler can call evaluate_script
     // for font refresh requests. The webview is stored after build_gtk.
-    let webview_ref: Rc<RefCell<Option<wry::WebView>>> = Rc::new(RefCell::new(None));
-    let webview = build_linux_webview(&container, &html, &config_json, on_change, &webview_ref)?;
+    let ctx = LinuxWebviewContext {
+        webview_ref: Rc::new(RefCell::new(None)),
+        active_check_source: new_active_check_source(),
+    };
+    let webview = build_linux_webview(&container, &html, &config_json, on_change, &ctx)?;
 
     // Store webview in the shared ref so the IPC handler can use it for refresh.
-    *webview_ref.borrow_mut() = Some(webview);
+    *ctx.webview_ref.borrow_mut() = Some(webview);
 
     // Wrap on_close in an Rc<RefCell<Option<...>>> so it can be shared
     // between the delete-event handler and the SIGTERM/SIGINT signal handlers.
@@ -327,6 +453,11 @@ pub fn run_settings_window(
     install_linux_runtime_hooks(&window, listener, Rc::clone(&on_close));
 
     gtk::main();
+
+    // Drop any in-flight manual-check timeout source before the webview is
+    // dropped, so the closure releases its `Rc<WebView>` before the underlying
+    // widget tears down.
+    cancel_active_check_source(&ctx.active_check_source);
 
     Ok(())
 }
@@ -365,6 +496,15 @@ fn build_linux_window(geometry: Option<SettingsWindowGeometry>) -> gtk::Window {
     window
 }
 
+/// Webview-side state shared between the IPC handler and the window shutdown
+/// path on Linux: the webview reference itself plus the cell tracking any
+/// in-flight manual-check timeout source.
+#[cfg(target_os = "linux")]
+struct LinuxWebviewContext {
+    webview_ref: std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+    active_check_source: ActiveCheckSource,
+}
+
 /// Build the GTK webview and wire the settings IPC handler.
 #[cfg(target_os = "linux")]
 fn build_linux_webview<F: Fn(String) + 'static>(
@@ -372,15 +512,27 @@ fn build_linux_webview<F: Fn(String) + 'static>(
     html: &str,
     config_json: &str,
     on_change: F,
-    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+    ctx: &LinuxWebviewContext,
 ) -> Result<wry::WebView, String> {
     use wry::WebViewBuilderExtUnix;
 
     let webview = wry::WebViewBuilder::new()
         .with_html(html)
         .with_ipc_handler({
-            let webview_for_ipc = std::rc::Rc::clone(webview_ref);
-            move |request| handle_settings_ipc_request(request.body(), &webview_for_ipc, &on_change)
+            let webview_for_ipc = std::rc::Rc::clone(&ctx.webview_ref);
+            let webview_for_check = std::rc::Rc::clone(&ctx.webview_ref);
+            let active_for_check = std::rc::Rc::clone(&ctx.active_check_source);
+            let on_request_update_check = move || {
+                dispatch_check_for_updates_linux(&webview_for_check, &active_for_check);
+            };
+            move |request| {
+                handle_settings_ipc_request(
+                    request.body(),
+                    &webview_for_ipc,
+                    &on_change,
+                    &on_request_update_check,
+                );
+            }
         })
         .build_gtk(container)
         .map_err(|e| format!("failed to create webview: {e}"))?;
@@ -475,6 +627,9 @@ enum TaoUserEvent {
     QuitWindow,
     /// A termination signal (SIGTERM/SIGINT) was received.
     Terminate,
+    /// A worker thread finished a manual update check; deliver the result to
+    /// the webview on the main thread.
+    UpdateCheckResult(UpdateCheckResultState),
 }
 
 /// Build the tao window with optional saved geometry.
@@ -581,11 +736,23 @@ pub fn run_settings_window(
 
     // Shared webview ref for IPC font-refresh requests.
     let webview_ref: Rc<RefCell<Option<wry::WebView>>> = Rc::new(RefCell::new(None));
-    let webview = build_tao_webview(&window, &html, &config_json, on_change, &webview_ref)?;
+    let webview = build_tao_webview(
+        &window,
+        &html,
+        &config_json,
+        on_change,
+        &webview_ref,
+        event_loop.create_proxy(),
+    )?;
 
     *webview_ref.borrow_mut() = Some(webview);
 
-    run_tao_settings_loop(&mut event_loop, window, RefCell::new(Some(on_close)));
+    run_tao_settings_loop(
+        &mut event_loop,
+        window,
+        Rc::clone(&webview_ref),
+        RefCell::new(Some(on_close)),
+    );
 
     Ok(())
 }
@@ -609,12 +776,23 @@ fn build_tao_webview<F: Fn(String) + 'static>(
     config_json: &str,
     on_change: F,
     webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+    event_loop_proxy: tao::event_loop::EventLoopProxy<TaoUserEvent>,
 ) -> Result<wry::WebView, String> {
     let webview = wry::WebViewBuilder::new()
         .with_html(html)
         .with_ipc_handler({
             let webview_for_ipc = std::rc::Rc::clone(webview_ref);
-            move |request| handle_settings_ipc_request(request.body(), &webview_for_ipc, &on_change)
+            let proxy_for_check = event_loop_proxy.clone();
+            let on_request_update_check =
+                move || dispatch_check_for_updates_macos(&proxy_for_check);
+            move |request| {
+                handle_settings_ipc_request(
+                    request.body(),
+                    &webview_for_ipc,
+                    &on_change,
+                    &on_request_update_check,
+                );
+            }
         })
         .build(window)
         .map_err(|e| format!("failed to create webview: {e}"))?;
@@ -628,6 +806,7 @@ fn build_tao_webview<F: Fn(String) + 'static>(
 fn run_tao_settings_loop<F: FnOnce(SettingsWindowGeometry) + 'static>(
     event_loop: &mut tao::event_loop::EventLoop<TaoUserEvent>,
     window: tao::window::Window,
+    webview_ref: std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
     on_close: std::cell::RefCell<Option<F>>,
 ) {
     use tao::event_loop::ControlFlow;
@@ -638,7 +817,15 @@ fn run_tao_settings_loop<F: FnOnce(SettingsWindowGeometry) + 'static>(
 
     event_loop.run_return(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
-        handle_tao_event(event, &window, &on_close, &modifiers, target_window_id, control_flow);
+        handle_tao_event(
+            event,
+            &window,
+            &webview_ref,
+            &on_close,
+            &modifiers,
+            target_window_id,
+            control_flow,
+        );
     });
 }
 
@@ -647,6 +834,7 @@ fn run_tao_settings_loop<F: FnOnce(SettingsWindowGeometry) + 'static>(
 fn handle_tao_event<F: FnOnce(SettingsWindowGeometry)>(
     event: tao::event::Event<TaoUserEvent>,
     window: &tao::window::Window,
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
     on_close: &std::cell::RefCell<Option<F>>,
     modifiers: &std::cell::RefCell<tao::keyboard::ModifiersState>,
     target_window_id: tao::window::WindowId,
@@ -660,6 +848,9 @@ fn handle_tao_event<F: FnOnce(SettingsWindowGeometry)>(
         Event::UserEvent(TaoUserEvent::FocusWindow) => window.set_focus(),
         Event::UserEvent(TaoUserEvent::QuitWindow) => {
             *control_flow = ControlFlow::Exit;
+        }
+        Event::UserEvent(TaoUserEvent::UpdateCheckResult(state)) => {
+            inject_update_check_result(webview_ref, &state);
         }
         Event::WindowEvent {
             event: WindowEvent::ModifiersChanged(new_mods),

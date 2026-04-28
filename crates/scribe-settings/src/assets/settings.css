@@ -330,6 +330,37 @@ body {
   border-color: rgba(255, 255, 255, 0.14);
 }
 
+.action-btn:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+.action-btn:disabled:hover {
+  background: #27272a;
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+/* Inline status text used by the "Check for Updates Now" row.
+   Inherits the muted setting-desc color by default; success/error
+   variants override it without changing layout. */
+.update-check-status.is-checking {
+  color: #d4d4d8;
+}
+
+.update-check-status.is-success {
+  color: #4ade80;
+}
+
+.update-check-status.is-error {
+  color: #f87171;
+}
+
+.update-check-status .update-check-link {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 /* ───────── Select / Dropdown ───────── */
 
 .font-select-row {

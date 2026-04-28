@@ -14,6 +14,7 @@ scribe-common.workspace = true
 wry.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rmp-serde.workspace = true
 rust-embed.workspace = true
 tracing.workspace = true
 fontdb = "0.23"

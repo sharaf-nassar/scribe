@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 
 use scribe_common::config::{UpdateChannel, UpdateConfig};
 use scribe_common::error::ScribeError;
-use scribe_common::protocol::{ServerMessage, UpdateProgressState};
+use scribe_common::protocol::{ServerMessage, UpdateCheckResultState, UpdateProgressState};
 
 use crate::ipc_server::ConnectedClients;
 
@@ -57,24 +57,73 @@ struct GhAsset {
 
 // ── Public API ────────────────────────────────────────────────────
 
+/// Reply channel carried alongside a manual-check request so the requester
+/// receives the outcome over its own connection rather than via broadcast.
+type CheckReplyTx = tokio::sync::oneshot::Sender<UpdateCheckResultState>;
+
+/// Upper bound on how long [`UpdaterHandle::request_check`] waits for the
+/// updater task to deliver a result. Capped well below the settings binary's
+/// 30s transport timeout so a multi-minute install (which hogs the select
+/// loop) surfaces a clean "install in progress" message instead of a generic
+/// network timeout on the requesting side.
+const MANUAL_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Handle for controlling the background updater task.
 pub struct UpdaterHandle {
-    trigger_tx: tokio::sync::mpsc::Sender<()>,
-    dismiss_tx: tokio::sync::mpsc::Sender<()>,
+    install: tokio::sync::mpsc::Sender<()>,
+    dismiss: tokio::sync::mpsc::Sender<()>,
+    check: tokio::sync::mpsc::Sender<CheckReplyTx>,
 }
 
 impl UpdaterHandle {
     /// Signal the updater to begin downloading and installing the latest version.
     pub fn trigger(&self) {
-        if self.trigger_tx.try_send(()).is_err() {
+        if self.install.try_send(()).is_err() {
             warn!("updater trigger channel full or closed");
         }
     }
 
     /// Signal the updater to suppress re-notification for the current version.
     pub fn dismiss(&self) {
-        if self.dismiss_tx.try_send(()).is_err() {
+        if self.dismiss.try_send(()).is_err() {
             warn!("updater dismiss channel full or closed");
+        }
+    }
+
+    /// Request an immediate update check and return the outcome.
+    ///
+    /// Bypasses the periodic-check schedule and the dismissed-version filter —
+    /// the user explicitly asked, so they get a fresh answer either way. When
+    /// the check finds an update, the same `UpdateAvailable` message is also
+    /// broadcast to all connected clients so existing UI surfaces stay in sync.
+    ///
+    /// Fails fast with a `Failed { reason }` outcome when:
+    /// - the check channel is full (another check is already queued), or
+    /// - the updater task is mid-install and cannot service the request within
+    ///   `MANUAL_CHECK_TIMEOUT`.
+    pub async fn request_check(&self) -> UpdateCheckResultState {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        // Fast-fail on a full slot rather than blocking on `send().await` for
+        // the duration of an in-flight install.
+        if self.check.try_send(reply_tx).is_err() {
+            warn!("updater check channel full or closed");
+            return UpdateCheckResultState::Failed {
+                reason: String::from("another update check or install is already in progress"),
+            };
+        }
+
+        match tokio::time::timeout(MANUAL_CHECK_TIMEOUT, reply_rx).await {
+            Ok(Ok(state)) => state,
+            Ok(Err(_)) => {
+                warn!("updater dropped manual check reply");
+                UpdateCheckResultState::Failed {
+                    reason: String::from("updater dropped reply channel"),
+                }
+            }
+            Err(_) => UpdateCheckResultState::Failed {
+                reason: String::from("update install in progress — try again later"),
+            },
         }
     }
 }
@@ -87,60 +136,93 @@ fn asset_suffix() -> Option<&'static str> {
     (!current_identity().is_dev()).then_some(STABLE_ASSET_SUFFIX)
 }
 
+/// Bundle of receivers driving the updater task. Grouped so [`run_updater_loop`]
+/// and its helpers stay within the workspace's argument-count budget.
+struct UpdaterReceivers {
+    install: tokio::sync::mpsc::Receiver<()>,
+    dismiss: tokio::sync::mpsc::Receiver<()>,
+    check: tokio::sync::mpsc::Receiver<CheckReplyTx>,
+}
+
 /// Spawn the background updater task and return a handle for IPC control.
 pub fn spawn_updater(connected_clients: ConnectedClients, config: UpdateConfig) -> UpdaterHandle {
-    let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel(1);
+    let (install_tx, install_rx) = tokio::sync::mpsc::channel(1);
     let (dismiss_tx, dismiss_rx) = tokio::sync::mpsc::channel(1);
+    let (check_tx, check_rx) = tokio::sync::mpsc::channel(1);
 
-    tokio::spawn(run_updater_loop(connected_clients, trigger_rx, dismiss_rx, config));
+    let receivers = UpdaterReceivers { install: install_rx, dismiss: dismiss_rx, check: check_rx };
+    tokio::spawn(run_updater_loop(connected_clients, receivers, config));
 
-    UpdaterHandle { trigger_tx, dismiss_tx }
+    UpdaterHandle { install: install_tx, dismiss: dismiss_tx, check: check_tx }
 }
 
 // ── Background loop ───────────────────────────────────────────────
 
 async fn run_updater_loop(
     connected_clients: ConnectedClients,
-    mut trigger_rx: tokio::sync::mpsc::Receiver<()>,
-    mut dismiss_rx: tokio::sync::mpsc::Receiver<()>,
+    receivers: UpdaterReceivers,
     config: UpdateConfig,
 ) {
     if !config.enabled {
-        info!("auto-update disabled by config");
-        return;
+        info!("auto-update polling disabled by config — manual checks still allowed");
     }
 
-    tokio::time::sleep(INITIAL_DELAY).await;
-
-    let http = match reqwest::Client::builder()
-        .user_agent(format!("scribe/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-    {
+    let http = match build_updater_http_client() {
         Ok(c) => c,
         Err(e) => {
             error!("failed to build HTTP client for updater: {e}");
+            // Without an HTTP client we cannot service any check, so drain
+            // manual-check requests with a Failed response forever.
+            drain_check_requests(receivers.check, format!("HTTP client unavailable: {e}")).await;
             return;
         }
     };
 
+    run_updater_select_loop(connected_clients, receivers, http, config).await;
+}
+
+fn build_updater_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder().user_agent(format!("scribe/{}", env!("CARGO_PKG_VERSION"))).build()
+}
+
+async fn drain_check_requests(
+    mut check_rx: tokio::sync::mpsc::Receiver<CheckReplyTx>,
+    reason: String,
+) {
+    while let Some(reply_tx) = check_rx.recv().await {
+        drop(reply_tx.send(UpdateCheckResultState::Failed { reason: reason.clone() }));
+    }
+}
+
+async fn run_updater_select_loop(
+    connected_clients: ConnectedClients,
+    mut receivers: UpdaterReceivers,
+    http: reqwest::Client,
+    config: UpdateConfig,
+) {
     // Track which version we last notified about so dismiss works correctly.
     let dismissed: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
+    // Periodic interval. Using `interval_at` schedules the first tick at
+    // `now + INITIAL_DELAY`, so the loop starts immediately and manual
+    // checks are responsive even within the startup grace period.
     let check_interval = Duration::from_secs(config.check_interval_secs.max(300));
-    let mut interval = tokio::time::interval(check_interval);
-    // The first tick fires immediately; we handle the initial check inline
-    // after INITIAL_DELAY has already elapsed, so skip that first tick.
-    interval.tick().await;
+    let first_tick = tokio::time::Instant::now() + INITIAL_DELAY;
+    let mut interval = tokio::time::interval_at(first_tick, check_interval);
 
     loop {
         tokio::select! {
-            _ = interval.tick() => {
+            _ = interval.tick(), if config.enabled => {
                 run_check(&http, &connected_clients, &dismissed, config.channel).await;
             }
-            Some(()) = trigger_rx.recv() => {
+            Some(reply_tx) = receivers.check.recv() => {
+                let state = run_check_now(&http, &connected_clients, &dismissed, config.channel).await;
+                drop(reply_tx.send(state));
+            }
+            Some(()) = receivers.install.recv() => {
                 run_install(&http, &connected_clients).await;
             }
-            Some(()) = dismiss_rx.recv() => {
+            Some(()) = receivers.dismiss.recv() => {
                 info!("update notification dismissed by user");
             }
         }
@@ -187,6 +269,46 @@ async fn run_check(
         }
         Err(e) => {
             warn!("update check failed: {e}");
+        }
+    }
+}
+
+/// Manual check requested by the user.
+///
+/// Differs from [`run_check`] in two ways: it returns the result so the caller
+/// can deliver inline feedback to the requester, and it ignores the dismissed
+/// guard so an explicit click always re-broadcasts a still-relevant update.
+async fn run_check_now(
+    client: &reqwest::Client,
+    connected_clients: &ConnectedClients,
+    dismissed: &Arc<RwLock<Option<String>>>,
+    channel: UpdateChannel,
+) -> UpdateCheckResultState {
+    info!("manual update check requested");
+    match check_for_update_with_retry(client, channel).await {
+        Ok(Some((version, release_url))) => {
+            // Manual checks always re-broadcast: the user explicitly asked, so
+            // we surface the available version even if it was previously
+            // dismissed. Update the tracker afterwards so subsequent periodic
+            // ticks do not re-broadcast the same version.
+            *dismissed.write().await = Some(version.clone());
+            broadcast(
+                &ServerMessage::UpdateAvailable {
+                    version: version.clone(),
+                    release_url: release_url.clone(),
+                },
+                connected_clients,
+            )
+            .await;
+            UpdateCheckResultState::UpdateAvailable { version, release_url }
+        }
+        Ok(None) => {
+            *dismissed.write().await = None;
+            UpdateCheckResultState::NoUpdate
+        }
+        Err(e) => {
+            warn!("manual update check failed: {e}");
+            UpdateCheckResultState::Failed { reason: format!("{e}") }
         }
     }
 }

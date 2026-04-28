@@ -3955,6 +3955,7 @@ dependencies = [
  "gtk",
  "libc",
  "nix",
+ "rmp-serde",
  "rust-embed",
  "scribe-common",
  "serde",

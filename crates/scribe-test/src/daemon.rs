@@ -280,6 +280,7 @@ async fn dispatch_server_message(
         | ServerMessage::QuitRequested
         | ServerMessage::UpdateAvailable { .. }
         | ServerMessage::UpdateProgress { .. }
+        | ServerMessage::UpdateCheckResult { .. }
         | ServerMessage::WindowList { .. }
         | ServerMessage::RunAction { .. }
         | ServerMessage::ActionDispatched { .. }) => {
@@ -371,6 +372,9 @@ async fn dispatch_window_message(
         }
         ServerMessage::UpdateProgress { .. } => {
             debug!("update progress (ignored by test daemon)");
+        }
+        ServerMessage::UpdateCheckResult { .. } => {
+            debug!("update check result (ignored by test daemon)");
         }
         ServerMessage::WindowList { windows } => {
             debug!(count = windows.len(), "window list (ignored by test daemon)");

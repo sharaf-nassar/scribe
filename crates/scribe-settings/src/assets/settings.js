@@ -508,6 +508,85 @@ function initNotificationActions() {
   }
 }
 
+// ─────────── Manual Update Check ───────────
+
+var UPDATE_CHECK_DEFAULT_TEXT = "Click to query GitHub releases for the active channel";
+
+function setUpdateCheckStatus(text, variant) {
+  var el = document.getElementById("update-check-status");
+  if (!el) { return; }
+  el.textContent = "";
+  el.classList.remove("is-checking", "is-success", "is-error");
+  if (variant) { el.classList.add(variant); }
+  if (typeof text === "string") {
+    el.textContent = text;
+  }
+}
+
+function setUpdateCheckButtonBusy(busy) {
+  var btn = document.getElementById("update-check-now-btn");
+  if (!btn) { return; }
+  btn.disabled = !!busy;
+  btn.textContent = busy ? "Checking…" : "Check Now";
+}
+
+function initUpdateActions() {
+  var btn = document.getElementById("update-check-now-btn");
+  if (!btn) { return; }
+  btn.addEventListener("click", function() {
+    setUpdateCheckButtonBusy(true);
+    setUpdateCheckStatus("Checking GitHub for the latest release…", "is-checking");
+    sendHostAction("request_update_check");
+  });
+}
+
+// Called from Rust after a manual check completes. `result` is the JSON form
+// of `UpdateCheckResultState` produced by serde with default external tagging:
+//   "NoUpdate"                                                → no update
+//   { "UpdateAvailable": { "version": "1.2.3", "release_url": "https://…" } }
+//   { "Failed": { "reason": "…" } }
+function updateCheckResult(result) {
+  setUpdateCheckButtonBusy(false);
+
+  if (result === "NoUpdate") {
+    var channel = currentConfig.update?.channel || "stable";
+    setUpdateCheckStatus("You're up to date on the " + channel + " channel", "is-success");
+    return;
+  }
+
+  if (result && typeof result === "object" && result.UpdateAvailable) {
+    renderUpdateAvailable(result.UpdateAvailable);
+    return;
+  }
+
+  if (result && typeof result === "object" && result.Failed) {
+    var reason = result.Failed.reason || "unknown error";
+    setUpdateCheckStatus("Check failed: " + reason, "is-error");
+    return;
+  }
+
+  setUpdateCheckStatus(UPDATE_CHECK_DEFAULT_TEXT, null);
+}
+
+function renderUpdateAvailable(payload) {
+  setUpdateCheckStatus("Update available: ", "is-success");
+  var statusEl = document.getElementById("update-check-status");
+  if (!statusEl) { return; }
+  var version = payload.version || "latest";
+  var url = payload.release_url || "";
+  if (url) {
+    var link = document.createElement("a");
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.className = "update-check-link";
+    link.textContent = "v" + version;
+    statusEl.appendChild(link);
+  } else {
+    statusEl.appendChild(document.createTextNode("v" + version));
+  }
+}
+
 // ─────────── Keybinding Defaults (injected by Rust) ───────────
 
 function loadKeybindingDefaults(defaults) {
@@ -1774,6 +1853,7 @@ document.addEventListener("DOMContentLoaded", function() {
   initWorkspaces();
   initBadgeColorReset();
   initNotificationActions();
+  initUpdateActions();
   initGlobalSearch();
   initKeybindingRecorder();
 

@@ -498,6 +498,14 @@ where
         Ok(ClientMessage::Hello { window_id }) => {
             Some(handle_client_hello(window_id, server, writer).await)
         }
+        Ok(ClientMessage::CheckForUpdates) => {
+            // Transient action: the caller (e.g. the standalone settings
+            // window) does not want a registered window. Run the check, send
+            // back a single result, and let the connection close without ever
+            // entering `connected_clients`.
+            handle_transient_check_for_updates(server, writer).await;
+            None
+        }
         Ok(msg) => Some(handle_legacy_client(msg, server, writer, attached_ids).await),
         Err(ScribeError::Io { .. }) => {
             debug!("client disconnected before Hello");
@@ -508,6 +516,12 @@ where
             None
         }
     }
+}
+
+async fn handle_transient_check_for_updates(server: &IpcServerState, writer: &SharedWriter) {
+    info!("transient client requested manual update check");
+    let state = server.updater_handle.request_check().await;
+    send_message(writer, &ServerMessage::UpdateCheckResult { state }).await;
 }
 
 async fn handle_client_hello(
@@ -694,6 +708,7 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::QuitAll
         | ClientMessage::TriggerUpdate
         | ClientMessage::DismissUpdate
+        | ClientMessage::CheckForUpdates
         | ClientMessage::ListWindows
         | ClientMessage::DispatchAction { .. }) => {
             dispatch_window_message(msg, context).await;
@@ -816,6 +831,11 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
         ClientMessage::DismissUpdate => {
             info!(window_id = %context.window_id, "client dismissed update notification");
             context.server.updater_handle.dismiss();
+        }
+        ClientMessage::CheckForUpdates => {
+            info!(window_id = %context.window_id, "client requested manual update check");
+            let state = context.server.updater_handle.request_check().await;
+            send_message(context.writer, &ServerMessage::UpdateCheckResult { state }).await;
         }
         ClientMessage::ListWindows => {
             handle_list_windows(

@@ -179,6 +179,12 @@ pub enum ClientMessage {
     TriggerUpdate,
     /// User dismissed the update notification.
     DismissUpdate,
+    /// User explicitly requested an update check (e.g. "Check now" button in
+    /// settings). The server replies with a single `UpdateCheckResult` on the
+    /// same connection. May be sent as the first message on a transient
+    /// connection that never registers a window, or after a `Hello` on a
+    /// regular client connection.
+    CheckForUpdates,
     /// Request a list of windows known to the server.
     ListWindows,
     /// Ask a connected client window to run an automation action.
@@ -351,6 +357,12 @@ pub enum ServerMessage {
     UpdateProgress {
         state: UpdateProgressState,
     },
+    /// Result of a manual `CheckForUpdates` request, sent back over the
+    /// requesting connection. When an update is available the server also
+    /// broadcasts the usual `UpdateAvailable` to every connected client.
+    UpdateCheckResult {
+        state: UpdateCheckResultState,
+    },
     /// A shell prompt-mark event from OSC 133.
     PromptMark {
         session_id: SessionId,
@@ -510,6 +522,24 @@ pub struct SearchMatch {
     pub row: i32,
     pub col_start: u16,
     pub col_end: u16,
+}
+
+/// Outcome of a manual update check requested via `CheckForUpdates`.
+///
+/// Mirrors what the periodic checker logs internally but is shaped for direct
+/// user-facing feedback (e.g. "Up to date", "v1.2.3 available", "Check failed").
+/// `UpdateAvailable` here always follows a fresh broadcast of the same version,
+/// even when the version was previously dismissed — manual checks override
+/// dismissal so the user always sees the up-to-date state of the world.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UpdateCheckResultState {
+    /// The current build is the latest released version on the active channel.
+    NoUpdate,
+    /// A newer version is available; the same data was also broadcast as
+    /// `ServerMessage::UpdateAvailable` to every connected client.
+    UpdateAvailable { version: String, release_url: String },
+    /// The check failed (network error, GitHub API failure, etc.).
+    Failed { reason: String },
 }
 
 /// Progress state for an in-flight update.

@@ -34,6 +34,8 @@ GPU-accelerated frontend that renders terminal [[client#Panes]] via wgpu, handle
 
 [[settings]] UI: webview-based configuration editor for appearance, keybindings, themes, workspace roots, and AI indicator behaviour. Changes are saved to TOML and picked up by a file watcher.
 
+Stateful actions that need an immediate server-side response (e.g. the Updates page's "Check Now" button) open a transient `server.sock` connection via [[crates/scribe-settings/src/server_action.rs]] instead of going through the config file.
+
 ### scribe-cli
 
 Thin CLI entry point that launches the client process.

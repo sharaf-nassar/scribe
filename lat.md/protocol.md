@@ -62,13 +62,17 @@ Window automation messages let the CLI inspect windows and ask a connected clien
 
 `Hello` is the first message sent, carrying an optional window ID for multi-window reconnection. The server responds with [[protocol#Server Messages]] `Welcome`.
 
+Transient actions are an exception: the [[server#Server#Updater#Manual Check]] path lets a non-client process (the standalone settings window) open `server.sock`, send `CheckForUpdates` as the first and only message, read back a single `UpdateCheckResult`, and disconnect — never registering as a connected client and never receiving a `Welcome`.
+
 ### Configuration
 
 `ConfigReloaded` notifies the server that the config file has changed, triggering scrollback limit and shell integration updates across all live sessions.
 
 ### Update Control
 
-`TriggerUpdate` confirms a download. `DismissUpdate` suppresses the notification for the current version.
+`TriggerUpdate` confirms a download. `DismissUpdate` suppresses the notification for the current version. `CheckForUpdates` requests an immediate update check.
+
+The check is answered with a single `UpdateCheckResult` on the same connection. It can be sent as the very first message on a transient connection (the settings window's "Check Now" path) or after a `Hello` on a registered client connection.
 
 ## Server Messages
 
@@ -116,7 +120,9 @@ Automation responses expose connected windows to the CLI and let the server forw
 
 ### Update Notifications
 
-`UpdateAvailable` announces a new version with a release URL. `UpdateProgress` reports download, verification, and installation state transitions.
+`UpdateAvailable` announces a new version with a release URL. `UpdateProgress` reports download, verification, and installation state transitions. `UpdateCheckResult` answers a `CheckForUpdates` request.
+
+The result variants are `NoUpdate`, `UpdateAvailable { version, release_url }`, and `Failed { reason }` (see [[crates/scribe-common/src/protocol.rs#UpdateCheckResultState]]). When the outcome is `UpdateAvailable`, the server also broadcasts the matching `UpdateAvailable` to every connected client so the regular client-side CTA stays in sync with the requester's inline status.
 
 ### Error
 

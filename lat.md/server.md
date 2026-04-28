@@ -160,6 +160,14 @@ After a 30-second initial delay, the updater checks on a configurable interval (
 
 Stable channel filters out drafts and prereleases; Beta channel includes prereleases. The endpoint can be overridden via the `SCRIBE_UPDATE_API_URL` environment variable for testing. On failure, one retry is attempted after a 5-second backoff before giving up until the next cycle. Dismissed versions remain suppressed until a newer version appears.
 
+### Manual Check
+
+`UpdaterHandle::request_check` runs an immediate check off the periodic schedule and returns the outcome via a per-call oneshot reply channel.
+
+Unlike the periodic path, it overrides the dismissed-version filter so an explicit user click always re-broadcasts a still-current update; the dismissed tracker is then refreshed so the next periodic tick stays quiet. Manual checks work even when `update.enabled = false` — the updater task always runs and only the periodic interval branch is gated by the config flag, so a user with auto-checks turned off can still drive checks from the settings window's "Check Now" button.
+
+The reply channel has capacity 1; concurrent requests fail-fast with `Failed { reason: "already in progress" }` rather than blocking the caller's connection budget. A 20-second internal timeout caps the wait if the select loop is busy installing an update, surfacing a clean "install in progress" message instead of a generic transport timeout.
+
 ### Install Flow
 
 Downloads the platform-specific asset via streaming (no full buffering in memory) and fetches its minisig signature in parallel, then verifies with the embedded real minisign public key.
