@@ -98,6 +98,12 @@ pub struct LaunchRecord {
     pub first_prompt: Option<String>,
     #[serde(default)]
     pub latest_prompt: Option<String>,
+    /// Wall-clock time the most recent prompt was received, encoded as
+    /// Unix-epoch seconds. Used by the prompt bar's elapsed-time counter
+    /// to keep counting up across cold restarts. `None` for snapshots
+    /// written by older clients that predate this field.
+    #[serde(default)]
+    pub latest_prompt_at: Option<u64>,
     #[serde(default)]
     pub prompt_count: u32,
 }

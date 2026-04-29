@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::VoidListener;
@@ -933,18 +933,12 @@ impl ApplicationHandler<UiEvent> for App {
         if self.has_pending_output_frames() {
             self.request_redraw();
             event_loop.set_control_flow(ControlFlow::Poll);
-        } else if self.cursor.blink_enabled {
-            let elapsed = self.blink_timer.elapsed();
-            if elapsed >= BLINK_INTERVAL {
-                // Blink interval elapsed — request a redraw so `handle_redraw`
-                // toggles `cursor_visible` and paints the new state.
-                self.request_redraw();
-            } else {
-                let remaining = BLINK_INTERVAL.saturating_sub(elapsed);
-                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + remaining));
-            }
+        } else if let Some(deadline) = self.next_idle_wake_deadline() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         }
-        // When blink is disabled, don't set ControlFlow — let winit use its default (Wait).
+        // When no deadline is returned, leave ControlFlow at winit's default
+        // (Wait). `next_idle_wake_deadline` already calls `request_redraw`
+        // for any branch that fires immediately.
 
         // Keep the X11 active-window guard up to date so it can detect
         // compositor overlays even when no key events are arriving.
@@ -1471,7 +1465,7 @@ impl App {
 
         // Restore saved window geometry (position, size, maximized state).
         if let Some(geom) = self.saved_geometry.take() {
-            window_state::apply_window_geometry(event_loop, &window, &geom);
+            let _ = window_state::apply_window_geometry(event_loop, &window, &geom);
         }
 
         let surface =
@@ -2313,8 +2307,13 @@ impl App {
             // True cold restart connects to a fresh server, so `Welcome`
             // assigns a new window ID before we learn which snapshot we
             // claimed. Geometry is keyed by the pre-crash snapshot ID.
-            self.restore_geometry_from_registry(event_loop, snapshot.window_id);
-            self.replay_cold_restart(snapshot)
+            //
+            // Capture the applied geom so the replay can size pane grids
+            // from it directly: `request_inner_size` and `set_maximized`
+            // are async on most compositors, so `window.inner_size()`
+            // would still report the pre-restore initial hint here.
+            let saved_geom = self.restore_geometry_from_registry(event_loop, snapshot.window_id);
+            self.replay_cold_restart(snapshot, saved_geom.as_ref())
         });
         if restored {
             let remaining = claimed.map_or(0, |(_, r)| r);
@@ -2328,7 +2327,22 @@ impl App {
 
     /// Rebuild the window layout from a cold restart snapshot and create
     /// sessions for each saved pane.
-    fn replay_cold_restart(&mut self, snapshot: &restore_state::WindowRestoreState) -> bool {
+    ///
+    /// `saved_geom` is the geometry that was just reapplied via
+    /// `apply_window_geometry` for `snapshot.window_id`, when one exists.
+    /// Sizing pane grids from it (instead of `window.inner_size()`) avoids
+    /// a race where the compositor has not yet acknowledged the
+    /// `request_inner_size`/`set_maximized` calls made microseconds earlier
+    /// — the previous code path created PTYs at the 1200×800 startup hint
+    /// for any maximized window, leaving the cells stuck below the actual
+    /// viewport for the lifetime of the session because the corrective
+    /// `Resize` IPC is dispatched while panes still hold placeholder
+    /// session IDs that the server cannot match.
+    fn replay_cold_restart(
+        &mut self,
+        snapshot: &restore_state::WindowRestoreState,
+        saved_geom: Option<&window_state::WindowGeometry>,
+    ) -> bool {
         let Some(tx) = self.cmd_tx.clone() else { return false };
         let Some(gpu) = self.gpu.as_ref() else { return false };
         let Some(window) = self.window.as_ref() else { return false };
@@ -2344,15 +2358,27 @@ impl App {
         let mut replay =
             restore_replay::prepare_replay(snapshot, &mut self.window_layout, &mut self.panes);
 
-        // Recompute pane geometry now that the window is known.
-        let win_size = window.inner_size();
+        // Prefer the saved geom's logical dimensions (× current
+        // scale_factor) over `window.inner_size()`. Both `request_inner_size`
+        // and `set_maximized(true)` are async on most compositors, so
+        // `inner_size()` here typically still returns the pre-restore
+        // initial 1200×800 hint — sizing pane grids from that would leave
+        // the PTY undersized once the compositor settles on the real
+        // (often-maximized) viewport.
+        let observed_inner = window.inner_size();
+        let win_size = saved_geom.map_or(observed_inner, |geom| {
+            window_state::expected_physical_size(geom, self.scale_factor)
+        });
         let surface_w = gpu.surface_config.width;
         let surface_h = gpu.surface_config.height;
         tracing::info!(
             win_w = win_size.width,
             win_h = win_size.height,
+            inner_w = observed_inner.width,
+            inner_h = observed_inner.height,
             surface_w,
             surface_h,
+            used_saved_geom = saved_geom.is_some(),
             "replay_cold_restart: window and surface dimensions"
         );
         let win_size = win_size.cast::<f32>();
@@ -3075,6 +3101,79 @@ impl App {
         self.request_redraw();
     }
 
+    /// Compose the soonest of the cursor-blink and prompt-timer wake
+    /// deadlines into a single `Instant`. Returns `None` when neither is
+    /// active. Branches that should fire *immediately* call
+    /// [`Self::request_redraw`] directly and contribute no deadline.
+    fn next_idle_wake_deadline(&mut self) -> Option<Instant> {
+        let blink = self.next_blink_wake();
+        let timer = self.next_prompt_timer_wake();
+        match (blink, timer) {
+            (Some(b), Some(t)) => Some(b.min(t)),
+            (Some(b), None) => Some(b),
+            (None, Some(t)) => Some(t),
+            (None, None) => None,
+        }
+    }
+
+    /// Cursor-blink contribution to the idle wake deadline.
+    fn next_blink_wake(&mut self) -> Option<Instant> {
+        if !self.cursor.blink_enabled {
+            return None;
+        }
+        let elapsed = self.blink_timer.elapsed();
+        if elapsed >= BLINK_INTERVAL {
+            // Interval already elapsed — toggle on the next redraw.
+            self.request_redraw();
+            return None;
+        }
+        Some(Instant::now() + BLINK_INTERVAL.saturating_sub(elapsed))
+    }
+
+    /// The soonest moment any visible prompt bar's elapsed-time counter
+    /// needs to redraw. Within the first hour of a prompt the timer ticks
+    /// every second (because seconds are visible); past one hour it ticks
+    /// once a minute. Returns `None` when no pane has a visible counter.
+    /// If a tick is already due, calls [`Self::request_redraw`] and
+    /// returns `None`.
+    fn next_prompt_timer_wake(&mut self) -> Option<Instant> {
+        if !self.config.terminal.prompt_bar.enabled {
+            return None;
+        }
+        let now_system = SystemTime::now();
+        let now_instant = Instant::now();
+        let mut next: Option<Instant> = None;
+        let mut fire_now = false;
+        for pane in self.panes.values() {
+            if pane.prompt_count == 0 || pane.prompt_ui.dismissed {
+                continue;
+            }
+            let Some(since) = pane.latest_prompt_at else { continue };
+            let elapsed = now_system.duration_since(since).unwrap_or(Duration::ZERO);
+            let elapsed_secs = elapsed.as_secs();
+            let elapsed_subsec = elapsed.saturating_sub(Duration::from_secs(elapsed_secs));
+            let wait = if elapsed_secs < 3600 {
+                Duration::from_secs(1).saturating_sub(elapsed_subsec)
+            } else {
+                let remaining_full_secs = 60 - (elapsed_secs % 60);
+                Duration::from_secs(remaining_full_secs).saturating_sub(elapsed_subsec)
+            };
+            if wait.is_zero() {
+                fire_now = true;
+                continue;
+            }
+            // Floor at a small minimum so scheduling jitter near a boundary
+            // never leaves us in a tight wake-up loop.
+            let wait = wait.max(Duration::from_millis(50));
+            let deadline = now_instant + wait;
+            next = Some(next.map_or(deadline, |prev| prev.min(deadline)));
+        }
+        if fire_now {
+            self.request_redraw();
+        }
+        next
+    }
+
     /// Record a prompt received from the user and resize the pane if the
     /// prompt bar height changes.
     fn handle_prompt_received(&mut self, session_id: SessionId, text: String) {
@@ -3089,6 +3188,7 @@ impl App {
         } else {
             pane.latest_prompt = Some(text);
         }
+        pane.latest_prompt_at = Some(SystemTime::now());
 
         let new_line_count = prompt_bar_line_count(pane.prompt_count);
 
@@ -3113,6 +3213,7 @@ impl App {
         let was_dismissed = pane.prompt_ui.dismissed;
         pane.first_prompt = None;
         pane.latest_prompt = None;
+        pane.latest_prompt_at = None;
         pane.prompt_count = 0;
         pane.last_conversation_id = None;
         pane.prompt_ui.dismissed = false;
@@ -3141,6 +3242,7 @@ impl App {
             let was_dismissed = pane.prompt_ui.dismissed;
             pane.first_prompt = None;
             pane.latest_prompt = None;
+            pane.latest_prompt_at = None;
             pane.prompt_count = 0;
             pane.prompt_ui.dismissed = false;
             if self.config.terminal.prompt_bar.enabled && (old_lines > 0 || was_dismissed) {
@@ -3175,6 +3277,9 @@ impl App {
                     SnapshotPromptState {
                         first: record.first_prompt,
                         latest: record.latest_prompt,
+                        latest_at: record
+                            .latest_prompt_at
+                            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
                         count: record.prompt_count,
                     },
                 );
@@ -3194,6 +3299,7 @@ impl App {
             let Some(state) = prompt_map.remove(conv_id) else { continue };
             pane.first_prompt = state.first;
             pane.latest_prompt = state.latest;
+            pane.latest_prompt_at = state.latest_at;
             pane.prompt_count = state.count;
             restored_any = true;
         }
@@ -8035,7 +8141,7 @@ impl App {
         // restore path (position + size + maximized) so that a restart
         // without --window-id still places the window correctly.
         if self.saved_geometry.is_none() {
-            self.restore_geometry_from_registry(event_loop, window_id);
+            let _ = self.restore_geometry_from_registry(event_loop, window_id);
         }
 
         // Only the bootstrap client (launched without --window-id) spawns
@@ -8058,11 +8164,17 @@ impl App {
     /// this is a resume scenario and full geometry (position + size +
     /// maximized) is restored.  For truly fresh installs the registry has
     /// no entry, so no geometry is applied and the OS decides placement.
+    ///
+    /// Returns the geometry that was actually applied so callers can use it
+    /// as a stable hint for the eventual window viewport.
+    /// `request_inner_size` and `set_maximized(true)` are async on most
+    /// compositors, so `window.inner_size()` is not a reliable source of
+    /// truth in the same synchronous block — see [[lat.md/client#Window State]].
     fn restore_geometry_from_registry(
         &mut self,
         event_loop: &ActiveEventLoop,
         window_id: WindowId,
-    ) {
+    ) -> Option<window_state::WindowGeometry> {
         let loaded = self.window_registry.load(window_id);
         let default = window_state::WindowGeometry::default();
         let has_saved = loaded.x.is_some()
@@ -8073,8 +8185,11 @@ impl App {
             || loaded.height != default.height;
         let geom =
             if has_saved { Some(loaded) } else { self.window_registry.migrate_legacy(window_id) };
-        if let (Some(geom), Some(window)) = (geom, &self.window) {
-            window_state::apply_window_geometry(event_loop, window, &geom);
+        let (Some(geom), Some(window)) = (geom, &self.window) else { return None };
+        if window_state::apply_window_geometry(event_loop, window, &geom) {
+            Some(geom)
+        } else {
+            None
         }
     }
 
@@ -9652,6 +9767,7 @@ fn build_prompt_bar_pass(
                 .filter(|hover| hover.0 == *pane_id)
                 .map(|hover| hover.1),
             colors: &context.style.prompt_bar_colors,
+            now: SystemTime::now(),
             resolve_glyph: &mut |ch| backend.resolve_glyph(ch),
         });
     }
@@ -10526,6 +10642,7 @@ fn read_hostname() -> String {
 struct SnapshotPromptState {
     first: Option<String>,
     latest: Option<String>,
+    latest_at: Option<SystemTime>,
     count: u32,
 }
 

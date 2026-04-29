@@ -2,6 +2,10 @@
 //!
 //! Renders a background quad, icon glyphs, and truncated prompt text for
 //! the first and latest prompts submitted in a Claude Code or Codex session.
+//! Also renders a `#N` message-count annotation and an elapsed-time counter
+//! since the most recent prompt was sent.
+
+use std::time::{Duration, SystemTime};
 
 use scribe_renderer::types::CellInstance;
 
@@ -26,12 +30,15 @@ const ROW_SEAM_H: f32 = 1.0;
 pub const ROW_MIN_HEIGHT: f32 = 28.0;
 /// Gap between icon and text.
 pub const ICON_TEXT_GAP: f32 = 10.0;
-/// Count badge height.
-pub const COUNT_BADGE_H: f32 = 18.0;
-/// Horizontal padding inside the count badge.
-pub const COUNT_BADGE_PAD_X: f32 = 8.0;
-/// Minimum count badge width.
-pub const COUNT_BADGE_MIN_W: f32 = 30.0;
+/// Cell-width slot reserved for the elapsed-time counter. Sized for the
+/// widest possible format ("12m 04s" / "18h 03m" — 7 characters) so digit
+/// rollovers do not jitter the surrounding layout.
+const TIMER_SLOT_CELLS: usize = 7;
+/// Cells used between the timer and count in the 1-message state: `" · "`.
+const SEPARATOR_CELLS: usize = 3;
+/// Cells of breathing room between the prompt-text run and the right-edge
+/// cluster (count / timer).
+const RIGHT_GUTTER_CELLS: usize = 2;
 
 /// Unicode for the circle-dot (origin) icon.
 const ICON_FIRST: char = '⊙';
@@ -39,6 +46,11 @@ const ICON_FIRST: char = '⊙';
 const ICON_LATEST: char = '→';
 /// Unicode for the dismiss overlay icon.
 const ICON_DISMISS: char = '×';
+/// Middle-dot used as a typographic separator between timer and count
+/// in the 1-message state.
+const SEPARATOR_GLYPH: char = '·';
+/// Hash glyph that prefixes the message count (`#4`).
+const COUNT_PREFIX: char = '#';
 const DISMISS_OVERLAY_PAD_Y: f32 = 2.0;
 
 /// Which prompt bar line the mouse is hovering over, if any.
@@ -56,7 +68,16 @@ pub struct PromptBarLayout {
     pub first_row_rect: Rect,
     pub latest_row_rect: Option<Rect>,
     pub seam_rect: Option<Rect>,
-    pub count_badge_rect: Option<Rect>,
+    /// Rect occupied by the `#N` count text. Always present whenever the
+    /// bar is visible (single- and multi-prompt states).
+    pub count_text_rect: Rect,
+    /// Rect occupied by the elapsed-time text. Sits left of the count in
+    /// the 1-message state and directly under the count in the 2-message
+    /// state.
+    pub timer_text_rect: Rect,
+    /// Rect occupied by the middle-dot separator between timer and count
+    /// in the 1-message state. `None` in the 2-message state.
+    pub separator_text_rect: Option<Rect>,
     pub row_content_x: f32,
     pub first_line_width: f32,
     pub latest_line_width: Option<f32>,
@@ -109,6 +130,10 @@ pub struct PromptBarRenderContext<'a> {
     pub hover: Option<PromptBarHover>,
     pub active: Option<PromptBarHover>,
     pub colors: &'a PromptBarColors,
+    /// Wall-clock time used to compute the elapsed-time counter. Threaded
+    /// in (rather than read from `SystemTime::now()` inside the renderer)
+    /// so tests can drive the counter deterministically.
+    pub now: SystemTime,
     pub resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
 }
 
@@ -226,26 +251,57 @@ impl PromptRenderer<'_> {
         }
     }
 
-    fn render_count_badge(&mut self, rect: Rect, count: u32, colors: &PromptBarColors) {
-        let (cell_w, cell_h) = self.metrics.cell_size;
-        let badge_fill = mix(colors.second_row_bg, colors.text, 0.06);
-        let badge_text = with_alpha(colors.text, 0.96);
-
-        push_solid_rect(self.out, rect, badge_fill);
-
-        let text = count.to_string();
-        let text_width = text.chars().fold(0.0, |width, _| width + cell_w);
-        let mut x = rect.x + (rect.width - text_width).max(0.0) * 0.5;
-        let y = rect.y + (rect.height - cell_h) * 0.5;
-        for ch in text.chars() {
-            x = self.emit_glyph(PromptGlyphRequest {
-                ch,
-                x,
-                y,
-                fg_color: badge_text,
-                bg_color: badge_fill,
-            });
+    fn render_count_text(
+        &mut self,
+        rect: Rect,
+        count: u32,
+        text_color: [f32; 4],
+        bg_color: [f32; 4],
+    ) {
+        let mut x = rect.x;
+        let y = rect.y;
+        x = self.emit_glyph(PromptGlyphRequest {
+            ch: COUNT_PREFIX,
+            x,
+            y,
+            fg_color: text_color,
+            bg_color,
+        });
+        for ch in count.to_string().chars() {
+            x = self.emit_glyph(PromptGlyphRequest { ch, x, y, fg_color: text_color, bg_color });
         }
+    }
+
+    fn render_timer_text(
+        &mut self,
+        rect: Rect,
+        text: &str,
+        text_color: [f32; 4],
+        bg_color: [f32; 4],
+    ) {
+        let cell_w = self.metrics.cell_size.0;
+        let text_width = cells_to_pixels(text.chars().count(), cell_w);
+        // Right-align inside the slot so digit-width changes (e.g. 9 sec → 10 sec)
+        // do not jitter the position of the rest of the bar.
+        let mut x = rect.x + (rect.width - text_width).max(0.0);
+        let y = rect.y;
+        for ch in text.chars() {
+            x = self.emit_glyph(PromptGlyphRequest { ch, x, y, fg_color: text_color, bg_color });
+        }
+    }
+
+    fn render_separator(&mut self, rect: Rect, text_color: [f32; 4], bg_color: [f32; 4]) {
+        let cell_w = self.metrics.cell_size.0;
+        // Center the middle-dot inside the 3-cell slot (`" · "`).
+        let x = rect.x + cell_w;
+        let y = rect.y;
+        self.emit_glyph(PromptGlyphRequest {
+            ch: SEPARATOR_GLYPH,
+            x,
+            y,
+            fg_color: text_color,
+            bg_color,
+        });
     }
 
     fn emit_glyph(&mut self, request: PromptGlyphRequest) -> f32 {
@@ -296,7 +352,7 @@ pub fn prompt_bar_height(prompt_count: u32, cell_height: f32) -> f32 {
     if prompt_count >= 2 { row_height * 2.0 + ROW_SEAM_H } else { row_height }
 }
 
-/// Compute the shared geometry for the prompt bar strip, rows, badge, and truncation widths.
+/// Compute the shared geometry for the prompt bar strip, rows, count, timer, and truncation widths.
 pub fn compute_prompt_bar_layout(
     pane: &Pane,
     bar_rect: Rect,
@@ -311,54 +367,216 @@ pub fn compute_prompt_bar_layout(
         return None;
     }
 
-    let row_height = prompt_bar_row_height(cell_h);
     let card_rect = bar_rect;
-    let first_row_rect =
-        Rect { x: card_rect.x, y: card_rect.y, width: card_rect.width, height: row_height };
-    let latest_row_rect = (pane.prompt_count >= 2).then_some(Rect {
-        x: card_rect.x,
-        y: first_row_rect.y + row_height + ROW_SEAM_H,
-        width: card_rect.width,
-        height: row_height,
-    });
-    let seam_rect = latest_row_rect.map(|latest| Rect {
-        x: card_rect.x,
-        y: latest.y - ROW_SEAM_H,
-        width: card_rect.width,
-        height: ROW_SEAM_H,
-    });
+    let two_rows = pane.prompt_count >= 2;
+    let RowGeometry { first: first_row_rect, latest: latest_row_rect, seam: seam_rect } =
+        compute_row_geometry(card_rect, cell_h, two_rows);
     let row_content_x = card_rect.x;
-    let count_badge_rect = if pane.prompt_count > 1 {
-        let digit_width =
-            pane.prompt_count.to_string().chars().fold(0.0, |width, _| width + cell_w);
-        let badge_height = COUNT_BADGE_H.max(cell_h + 4.0);
-        let badge_width =
-            (digit_width + COUNT_BADGE_PAD_X * 2.0).max(COUNT_BADGE_MIN_W).max(badge_height * 1.5);
-        Some(Rect {
-            x: card_rect.x + card_rect.width - ROW_SIDE_PAD - badge_width,
-            y: first_row_rect.y + (first_row_rect.height - badge_height) * 0.5,
-            width: badge_width,
-            height: badge_height,
-        })
-    } else {
-        None
+
+    let cluster_right = card_rect.x + card_rect.width - ROW_SIDE_PAD;
+    let count_cells = count_text_cells(pane.prompt_count);
+    let count_width = cells_to_pixels(count_cells, cell_w);
+    let timer_width = cells_to_pixels(TIMER_SLOT_CELLS, cell_w);
+    let separator_width = cells_to_pixels(SEPARATOR_CELLS, cell_w);
+    let gutter_width = cells_to_pixels(RIGHT_GUTTER_CELLS, cell_w);
+
+    // The count text is always anchored to the right edge of the first row.
+    let row_one_text_y = first_row_rect.y + (first_row_rect.height - cell_h) * 0.5;
+    let count_text_rect = Rect {
+        x: cluster_right - count_width,
+        y: row_one_text_y,
+        width: count_width,
+        height: cell_h,
     };
 
-    let badge_reserved = count_badge_rect.map_or(0.0, |rect| rect.width + COUNT_BADGE_PAD_X);
-    let first_line_width = (card_rect.width - badge_reserved).max(1.0);
+    let one_row_args = OneRowClusterArgs {
+        count_text_rect,
+        row_text_y: row_one_text_y,
+        cell_h,
+        count_width,
+        timer_width,
+        separator_width,
+        gutter_width,
+    };
+    let cluster = latest_row_rect.map_or_else(
+        || one_row_cluster(one_row_args),
+        |latest| {
+            two_row_cluster(TwoRowClusterArgs {
+                latest_row_rect: latest,
+                cluster_right,
+                cell_h,
+                count_width,
+                timer_width,
+                gutter_width,
+            })
+        },
+    );
+    let RightCluster {
+        timer_text_rect,
+        separator_text_rect,
+        first_right_reserved,
+        latest_right_reserved,
+    } = cluster;
+
+    let first_line_width = (card_rect.width - first_right_reserved).max(1.0);
     let latest_line_width =
-        if pane.prompt_count >= 2 { Some(card_rect.width.max(1.0)) } else { None };
+        if two_rows { Some((card_rect.width - latest_right_reserved).max(1.0)) } else { None };
 
     Some(PromptBarLayout {
         card_rect,
         first_row_rect,
         latest_row_rect,
         seam_rect,
-        count_badge_rect,
+        count_text_rect,
+        timer_text_rect,
+        separator_text_rect,
         row_content_x,
         first_line_width,
         latest_line_width,
     })
+}
+
+/// First-row rect, optional second-row rect, and the seam between them.
+struct RowGeometry {
+    first: Rect,
+    latest: Option<Rect>,
+    seam: Option<Rect>,
+}
+
+fn compute_row_geometry(card_rect: Rect, cell_h: f32, two_rows: bool) -> RowGeometry {
+    let row_height = prompt_bar_row_height(cell_h);
+    let first = Rect { x: card_rect.x, y: card_rect.y, width: card_rect.width, height: row_height };
+    let latest = two_rows.then_some(Rect {
+        x: card_rect.x,
+        y: first.y + row_height + ROW_SEAM_H,
+        width: card_rect.width,
+        height: row_height,
+    });
+    let seam = latest.map(|latest_rect| Rect {
+        x: card_rect.x,
+        y: latest_rect.y - ROW_SEAM_H,
+        width: card_rect.width,
+        height: ROW_SEAM_H,
+    });
+    RowGeometry { first, latest, seam }
+}
+
+/// Geometry for the right-edge cluster (count, timer, optional separator)
+/// plus how much horizontal width each row reserves for it.
+struct RightCluster {
+    timer_text_rect: Rect,
+    separator_text_rect: Option<Rect>,
+    first_right_reserved: f32,
+    latest_right_reserved: f32,
+}
+
+#[derive(Clone, Copy)]
+struct TwoRowClusterArgs {
+    latest_row_rect: Rect,
+    cluster_right: f32,
+    cell_h: f32,
+    count_width: f32,
+    timer_width: f32,
+    gutter_width: f32,
+}
+
+#[derive(Clone, Copy)]
+struct OneRowClusterArgs {
+    count_text_rect: Rect,
+    row_text_y: f32,
+    cell_h: f32,
+    count_width: f32,
+    timer_width: f32,
+    separator_width: f32,
+    gutter_width: f32,
+}
+
+/// 2-message layout: count is anchored on row 1 (already laid out by the
+/// caller); the timer slot mirrors its right edge on row 2 directly under it.
+fn two_row_cluster(args: TwoRowClusterArgs) -> RightCluster {
+    let row_two_text_y = args.latest_row_rect.y + (args.latest_row_rect.height - args.cell_h) * 0.5;
+    let timer_text_rect = Rect {
+        x: args.cluster_right - args.timer_width,
+        y: row_two_text_y,
+        width: args.timer_width,
+        height: args.cell_h,
+    };
+    RightCluster {
+        timer_text_rect,
+        separator_text_rect: None,
+        first_right_reserved: args.count_width + args.gutter_width,
+        latest_right_reserved: args.timer_width + args.gutter_width,
+    }
+}
+
+/// 1-message layout: row 1 carries `<timer>  ·  #N`, right-aligned. Row 2
+/// does not exist, so it reserves zero width.
+fn one_row_cluster(args: OneRowClusterArgs) -> RightCluster {
+    let separator_text_rect = Rect {
+        x: args.count_text_rect.x - args.separator_width,
+        y: args.row_text_y,
+        width: args.separator_width,
+        height: args.cell_h,
+    };
+    let timer_text_rect = Rect {
+        x: separator_text_rect.x - args.timer_width,
+        y: args.row_text_y,
+        width: args.timer_width,
+        height: args.cell_h,
+    };
+    let cluster_width = args.timer_width + args.separator_width + args.count_width;
+    RightCluster {
+        timer_text_rect,
+        separator_text_rect: Some(separator_text_rect),
+        first_right_reserved: cluster_width + args.gutter_width,
+        latest_right_reserved: 0.0,
+    }
+}
+
+/// Number of cells the `#N` count occupies (`#` + decimal digits of `count`).
+fn count_text_cells(count: u32) -> usize {
+    let digits = if count == 0 { 1 } else { (count.ilog10() as usize) + 1 };
+    1 + digits
+}
+
+/// Format an elapsed `Duration` into the prompt-bar display string.
+///
+/// Thresholds:
+/// - `< 60s`: `"X sec"` — counts up second-by-second from a fresh prompt.
+/// - `< 1h`: `"Xm YYs"` — minutes (un-padded) and seconds (zero-padded).
+/// - `>= 1h`: `"Xh YYm"` — hours (un-padded) and minutes (zero-padded).
+///
+/// All formats fit within `TIMER_SLOT_CELLS`; the rendered text is
+/// right-aligned inside that slot to keep digit rollovers jitter-free.
+#[must_use]
+pub fn format_elapsed(elapsed: Duration) -> String {
+    let total_secs = elapsed.as_secs();
+    if total_secs < 60 {
+        format!("{total_secs} sec")
+    } else if total_secs < 3600 {
+        let minutes = total_secs / 60;
+        let seconds = total_secs % 60;
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        let hours = total_secs / 3600;
+        let minutes = (total_secs % 3600) / 60;
+        format!("{hours}h {minutes:02}m")
+    }
+}
+
+/// Compute the elapsed `Duration` from `since` to `now`, clamped to zero
+/// when the wall clock has moved backwards (DST shift, NTP correction).
+fn elapsed_since(now: SystemTime, since: SystemTime) -> Duration {
+    now.duration_since(since).unwrap_or(Duration::ZERO)
+}
+
+/// Compute the formatted elapsed-time string for `pane`, if a prompt has
+/// been received and a timestamp is recorded. Returns `None` when nothing
+/// should be drawn (no prompt, or restored from a snapshot that predates
+/// the timestamp field).
+fn pane_elapsed_text(pane: &Pane, now: SystemTime) -> Option<String> {
+    let since = pane.latest_prompt_at?;
+    Some(format_elapsed(elapsed_since(now, since)))
 }
 
 /// Render the prompt bar for a pane, returning instances to draw.
@@ -378,6 +596,7 @@ pub fn render_prompt_bar(context: PromptBarRenderContext<'_>) {
         hover,
         active,
         colors,
+        now,
         resolve_glyph,
     } = context;
 
@@ -414,8 +633,31 @@ pub fn render_prompt_bar(context: PromptBarRenderContext<'_>) {
         renderer.render_dismiss_overlay(&layout, style);
     }
 
-    if let Some(badge_rect) = layout.count_badge_rect {
-        renderer.render_count_badge(badge_rect, pane.prompt_count, colors);
+    // Right-edge cluster: count is anchored to row 1; timer + separator
+    // either sit beside the count (1-message state) or directly under it
+    // on row 2 (2-message state). All three pick up the row background of
+    // the row they live in so they blend with hover/press tinting above.
+    let two_rows = layout.latest_row_rect.is_some();
+    let count_text_color = with_alpha(colors.text, 0.62);
+    let timer_text_color = with_alpha(colors.text, 0.42);
+    let separator_text_color = with_alpha(colors.text, 0.28);
+    renderer.render_count_text(
+        layout.count_text_rect,
+        pane.prompt_count,
+        count_text_color,
+        colors.first_row_bg,
+    );
+    if let Some(elapsed_text) = pane_elapsed_text(pane, now) {
+        let timer_bg = if two_rows { colors.second_row_bg } else { colors.first_row_bg };
+        renderer.render_timer_text(
+            layout.timer_text_rect,
+            &elapsed_text,
+            timer_text_color,
+            timer_bg,
+        );
+        if let Some(sep_rect) = layout.separator_text_rect {
+            renderer.render_separator(sep_rect, separator_text_color, colors.first_row_bg);
+        }
     }
 }
 
@@ -564,6 +806,15 @@ fn prompt_text_width(char_count: usize, cell_w: f32) -> f32 {
     f32::from(u16::try_from(char_count).unwrap_or(u16::MAX)) * cell_w
 }
 
+/// Convert a cell count to pixel width using the same lossy-but-bounded
+/// `usize → u16 → f32` path as [`prompt_text_width`]. Caller-side casts
+/// from `usize` directly to `f32` would trip clippy's
+/// `cast_precision_loss` even though prompt-bar widths cannot realistically
+/// exceed `u16::MAX` cells.
+fn cells_to_pixels(cells: usize, cell_w: f32) -> f32 {
+    prompt_text_width(cells, cell_w)
+}
+
 fn prompt_chars_in_width(width: f32, cell_w: f32) -> usize {
     if cell_w <= 0.0 || !width.is_finite() || width <= 0.0 {
         return 0;
@@ -627,4 +878,72 @@ fn lift_color(color: [f32; 4], amount: f32) -> [f32; 4] {
 /// Replace a color's alpha channel.
 fn with_alpha(color: [f32; 4], alpha: f32) -> [f32; 4] {
     [color[0], color[1], color[2], alpha]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(secs: u64) -> Duration {
+        Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn format_elapsed_under_a_minute_uses_x_sec() {
+        assert_eq!(format_elapsed(d(0)), "0 sec");
+        assert_eq!(format_elapsed(d(3)), "3 sec");
+        assert_eq!(format_elapsed(d(47)), "47 sec");
+        assert_eq!(format_elapsed(d(59)), "59 sec");
+    }
+
+    #[test]
+    fn format_elapsed_under_an_hour_uses_xm_yys() {
+        assert_eq!(format_elapsed(d(60)), "1m 00s");
+        assert_eq!(format_elapsed(d(61)), "1m 01s");
+        assert_eq!(format_elapsed(d(4 * 60 + 22)), "4m 22s");
+        assert_eq!(format_elapsed(d(12 * 60 + 4)), "12m 04s");
+        assert_eq!(format_elapsed(d(59 * 60 + 59)), "59m 59s");
+    }
+
+    #[test]
+    fn format_elapsed_one_hour_or_more_uses_xh_yym() {
+        assert_eq!(format_elapsed(d(3600)), "1h 00m");
+        assert_eq!(format_elapsed(d(2 * 3600 + 15 * 60)), "2h 15m");
+        assert_eq!(format_elapsed(d(18 * 3600 + 3 * 60)), "18h 03m");
+    }
+
+    #[test]
+    fn format_elapsed_widths_fit_timer_slot() {
+        // The reserved slot must accommodate the widest output of every
+        // threshold so the right-anchored cluster never has to grow.
+        let samples = [d(0), d(9), d(59), d(60), d(599), d(3599), d(3600), d(99 * 3600)];
+        for sample in samples {
+            let s = format_elapsed(sample);
+            assert!(
+                s.chars().count() <= TIMER_SLOT_CELLS,
+                "format_elapsed({sample:?}) = {s:?} exceeds TIMER_SLOT_CELLS={TIMER_SLOT_CELLS}",
+            );
+        }
+    }
+
+    #[test]
+    fn count_text_cells_includes_hash_prefix() {
+        assert_eq!(count_text_cells(0), 2); // "#0"
+        assert_eq!(count_text_cells(1), 2); // "#1"
+        assert_eq!(count_text_cells(9), 2);
+        assert_eq!(count_text_cells(10), 3); // "#10"
+        assert_eq!(count_text_cells(99), 3);
+        assert_eq!(count_text_cells(100), 4);
+    }
+
+    #[test]
+    fn elapsed_since_clamps_clock_skew() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        // since is in the future relative to now → should clamp to ZERO.
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        assert_eq!(elapsed_since(now, since), Duration::ZERO);
+        // since in the past → straightforward subtraction.
+        let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(40);
+        assert_eq!(elapsed_since(now, earlier), Duration::from_secs(60));
+    }
 }

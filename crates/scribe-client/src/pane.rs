@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::VoidListener;
@@ -103,6 +103,11 @@ pub struct Pane {
     pub first_prompt: Option<String>,
     /// Text of the most recent user prompt (differs from first after 2+ prompts).
     pub latest_prompt: Option<String>,
+    /// Wall-clock time the most recent prompt was received, used by the
+    /// prompt bar to render an elapsed-time counter. Stored as `SystemTime`
+    /// (not `Instant`) so it can be serialized into the cold-restart
+    /// snapshot as Unix-epoch seconds.
+    pub latest_prompt_at: Option<SystemTime>,
     /// Total number of prompts received in this session.
     pub prompt_count: u32,
     /// Last-seen `conversation_id` for detecting session resets.
@@ -195,6 +200,7 @@ impl Pane {
             sync_output_deadline: None,
             first_prompt: None,
             latest_prompt: None,
+            latest_prompt_at: None,
             prompt_count: 0,
             last_conversation_id: None,
             prompt_ui: PromptUiState::default(),

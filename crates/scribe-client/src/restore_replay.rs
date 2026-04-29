@@ -447,6 +447,7 @@ fn snapshot_launches(layout: &WindowLayout, panes: &HashMap<PaneId, Pane>) -> Ve
                     kind: pane.launch_binding.kind.clone(),
                     first_prompt: pane.first_prompt.clone(),
                     latest_prompt: pane.latest_prompt.clone(),
+                    latest_prompt_at: pane.latest_prompt_at.and_then(system_time_to_unix_seconds),
                     prompt_count: pane.prompt_count,
                 })
             }));
@@ -460,4 +461,10 @@ fn snapshot_direction(direction: SplitDirection) -> LayoutDirection {
         SplitDirection::Horizontal => LayoutDirection::Horizontal,
         SplitDirection::Vertical => LayoutDirection::Vertical,
     }
+}
+
+/// Convert a `SystemTime` to Unix-epoch seconds, or `None` if the time is
+/// before the epoch (which the prompt-bar timestamp can never be).
+fn system_time_to_unix_seconds(time: std::time::SystemTime) -> Option<u64> {
+    time.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
 }

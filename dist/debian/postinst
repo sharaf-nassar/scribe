@@ -334,22 +334,19 @@ restart_singleton_binary() {
     echo "  Relaunching ${label}..."
     kill "$pid" 2>/dev/null || true
 
-    for _ in 1 2 3 4 5; do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.2
-    done
-
-    if kill -0 "$pid" 2>/dev/null; then
+    if ! wait_for_pid_exit "$pid" 5; then
         kill -9 "$pid" 2>/dev/null || true
-        sleep 0.2
-    fi
-
-    if kill -0 "$pid" 2>/dev/null; then
-        echo "  ✗ Could not stop ${label}; leaving the existing instance running."
-        return 1
+        if ! wait_for_pid_exit "$pid" 1; then
+            echo "  ✗ Could not stop ${label}; leaving the existing instance running."
+            return 1
+        fi
     fi
 
     launch_user_binary "$binary"
+}
+
+pid_is_zombie() {
+    grep -qE '^State:[[:space:]]+Z' "/proc/$1/status" 2>/dev/null
 }
 
 wait_for_pid_exit() {
@@ -359,6 +356,14 @@ wait_for_pid_exit() {
 
     while [ "$remaining" -gt 0 ]; do
         kill -0 "$pid" 2>/dev/null || return 0
+        # A zombie's task is already gone — only the exit-status entry
+        # remains until the parent reaps it. SIGTERM/SIGKILL are silently
+        # dropped, so waiting longer cannot make it disappear from /proc.
+        # Treat as exited so an unreaped client (e.g. gnome-shell still
+        # holding its child) does not block the post-upgrade relaunch.
+        if pid_is_zombie "$pid"; then
+            return 0
+        fi
         sleep 0.2
         remaining=$((remaining - 1))
     done

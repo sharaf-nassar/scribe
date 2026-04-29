@@ -120,6 +120,6 @@ scribe-test server stop
 
 ## Installer Script Regression Harness
 
-Offline shell harness for Debian `preinst` and `postinst` behavior so packaging regressions can be caught without touching the live user session.
+Offline shell harness for Debian `postinst` behavior so packaging regressions can be caught without touching the live user session.
 
-`tests/install/postinst-regressions.sh` copies the installer scripts into a temp directory, rewrites `/run/user/...` paths into that temp runtime tree, and injects fake `systemctl`, `sudo`, `kill`, `pkill`, `pgrep`, and `sha256sum` binaries through `PATH`. The harness currently covers state-dir ownership in `preinst`, `daemon-reload` on successful hot-reload, truthful reporting when fallback server restart fails, and force-killing lingering singleton settings processes before relaunch.
+`tests/install/postinst-regressions.sh` sources only the variable and function definitions from `dist/debian/postinst` (truncating before the `SERVER_RUNTIME_GENERATION` invocation so the case-statement and trailing `exit 0` cannot terminate the harness) and exercises individual functions against fixtures. A python launcher `os.fork()`s a child that exits immediately and then sleeps to keep the orphan in zombie (`Z`) state, since bash auto-reaps its own backgrounded children. The harness currently asserts that `wait_for_pid_exit`, `stop_client_processes`, and `restart_singleton_binary` all treat a zombie PID as exited rather than blocking the post-upgrade relaunch.

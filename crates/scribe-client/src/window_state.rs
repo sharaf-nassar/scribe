@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use scribe_common::app::current_state_dir;
 use serde::{Deserialize, Serialize};
+use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
@@ -173,19 +174,50 @@ pub fn capture_window_geometry(window: &Window) -> WindowGeometry {
     }
 }
 
+/// Returns `true` if `geom` is within the safe size range and apply will
+/// actually mutate the window.  Sizes outside the range are rejected to
+/// keep a corrupt or hostile state file from leaving the window unusable.
+pub fn geometry_size_is_sane(geom: &WindowGeometry) -> bool {
+    geom.width >= 40 && geom.height >= 40 && geom.width <= 16384 && geom.height <= 16384
+}
+
+/// Compute the eventual physical inner size implied by saved geometry.
+///
+/// Cold-restart replay needs to know the size the window will settle on
+/// before the compositor has acknowledged `request_inner_size` and
+/// `set_maximized(true)` — both are async on most compositors and may not
+/// be reflected by `window.inner_size()` until a later configure event.
+/// The saved width and height are logical pixels, so converting through
+/// winit's [`winit::dpi::LogicalSize::to_physical`] with the current scale
+/// factor yields the equivalent physical inner size.  The result is
+/// clamped to at least 1×1 so callers can always treat it as a non-zero
+/// viewport.
+pub fn expected_physical_size(geom: &WindowGeometry, scale_factor: f32) -> PhysicalSize<u32> {
+    let logical: winit::dpi::LogicalSize<u32> =
+        winit::dpi::LogicalSize::new(geom.width, geom.height);
+    let physical: PhysicalSize<u32> = logical.to_physical(f64::from(scale_factor));
+    PhysicalSize::new(physical.width.max(1), physical.height.max(1))
+}
+
 /// Apply saved geometry to a window.
 ///
 /// Restores position only if the saved monitor is still connected and
 /// position was captured. Always restores size. Sets maximized state last.
-pub fn apply_window_geometry(event_loop: &ActiveEventLoop, window: &Window, geom: &WindowGeometry) {
-    // Validate size is sane before applying.
-    if geom.width < 40 || geom.height < 40 || geom.width > 16384 || geom.height > 16384 {
+/// Returns `false` (without mutating the window) when `geom` fails
+/// [`geometry_size_is_sane`]; callers can then fall back to the OS default
+/// instead of trusting the rejected geometry as the eventual viewport.
+pub fn apply_window_geometry(
+    event_loop: &ActiveEventLoop,
+    window: &Window,
+    geom: &WindowGeometry,
+) -> bool {
+    if !geometry_size_is_sane(geom) {
         tracing::warn!(
             width = geom.width,
             height = geom.height,
             "saved window size out of range, skipping restore"
         );
-        return;
+        return false;
     }
 
     // Restore position only if we have coordinates and the saved monitor is
@@ -224,5 +256,56 @@ pub fn apply_window_geometry(event_loop: &ActiveEventLoop, window: &Window, geom
     if geom.maximized {
         window.set_maximized(true);
         tracing::debug!("restored maximized state");
+    }
+
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn maximized_geom(width: u32, height: u32) -> WindowGeometry {
+        WindowGeometry { x: None, y: None, width, height, maximized: true, monitor_name: None }
+    }
+
+    #[test]
+    fn expected_physical_size_at_unit_scale_matches_logical() {
+        let geom = maximized_geom(1920, 1080);
+        assert_eq!(expected_physical_size(&geom, 1.0), PhysicalSize::new(1920, 1080));
+    }
+
+    #[test]
+    fn expected_physical_size_scales_with_dpi() {
+        let geom = maximized_geom(1280, 720);
+        assert_eq!(expected_physical_size(&geom, 2.0), PhysicalSize::new(2560, 1440));
+    }
+
+    #[test]
+    fn expected_physical_size_handles_fractional_scale() {
+        let geom = maximized_geom(1366, 768);
+        let size = expected_physical_size(&geom, 1.5);
+        // 1366 * 1.5 = 2049, 768 * 1.5 = 1152.
+        assert_eq!(size, PhysicalSize::new(2049, 1152));
+    }
+
+    #[test]
+    fn expected_physical_size_clamps_to_at_least_one_pixel() {
+        // A tiny-but-valid scale factor multiplied with the smallest
+        // accepted geometry rounds down to 0×0 inside winit's
+        // `to_physical`; the clamp keeps the result usable as a viewport.
+        let geom = maximized_geom(40, 40);
+        let size = expected_physical_size(&geom, 0.01);
+        assert!(size.width >= 1 && size.height >= 1);
+    }
+
+    #[test]
+    fn geometry_size_is_sane_rejects_extremes() {
+        assert!(!geometry_size_is_sane(&maximized_geom(0, 0)));
+        assert!(!geometry_size_is_sane(&maximized_geom(39, 800)));
+        assert!(!geometry_size_is_sane(&maximized_geom(1200, 16385)));
+        assert!(geometry_size_is_sane(&maximized_geom(40, 40)));
+        assert!(geometry_size_is_sane(&maximized_geom(1920, 1080)));
+        assert!(geometry_size_is_sane(&maximized_geom(16384, 16384)));
     }
 }

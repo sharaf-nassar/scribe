@@ -370,6 +370,22 @@ fn resolve_centered_update_segment(
     }
 }
 
+/// Pick the start column to center a `label_cols`-wide label inside the empty
+/// span `[left_end, right_start)`. Returns `None` when the empty span is
+/// missing or too narrow to hold the label — callers should then try a shorter
+/// fallback label. Centering is done relative to the empty span, not the full
+/// bar, so the label stays visible on narrow windows.
+fn centered_start_col(left_end: usize, right_start: usize, label_cols: usize) -> Option<usize> {
+    if label_cols == 0 || left_end >= right_start {
+        return None;
+    }
+    let available = right_start - left_end;
+    if label_cols > available {
+        return None;
+    }
+    Some(left_end + (available - label_cols) / 2)
+}
+
 /// Render the centered update segment and return the clickable rectangle if appropriate.
 fn render_centered_update(
     w: &mut BarWriter<'_>,
@@ -380,25 +396,16 @@ fn render_centered_update(
 ) -> Option<Rect> {
     let segment = resolve_centered_update_segment(data.update_available, data.update_progress)?;
 
-    if w.max_cols == 0 || left_end >= right_start {
+    if w.max_cols == 0 {
         return None;
     }
 
     for label in &segment.labels {
-        if label.is_empty() {
-            continue;
-        }
-
         let label_cols = label.chars().count();
-        if label_cols == 0 || label_cols > w.max_cols {
+        let Some(start_col) = centered_start_col(left_end, right_start, label_cols) else {
             continue;
-        }
-
-        let start_col = (w.max_cols - label_cols) / 2;
+        };
         let end_col = start_col + label_cols;
-        if start_col < left_end || end_col > right_start {
-            continue;
-        }
 
         w.put_str_at(start_col, label, colors.text, colors.bg);
         return segment.clickable.then_some(w.col_rect_range(start_col, end_col));
@@ -950,4 +957,44 @@ fn columns_in_width(width: f32, cell_w: f32) -> usize {
     }
 
     low
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn centers_label_in_empty_span_not_full_bar() {
+        // Narrow bar where the full-bar midpoint lands inside the left side: the
+        // label only fits when centered inside the empty span [50, 70).
+        assert_eq!(centered_start_col(50, 70, 19), Some(50));
+    }
+
+    #[test]
+    fn centers_inside_a_far_off_center_empty_span() {
+        assert_eq!(centered_start_col(150, 200, 10), Some(170));
+    }
+
+    #[test]
+    fn returns_none_when_label_wider_than_empty_span() {
+        assert_eq!(centered_start_col(50, 60, 19), None);
+    }
+
+    #[test]
+    fn returns_none_when_no_empty_span() {
+        assert_eq!(centered_start_col(80, 80, 5), None);
+        // saturating math elsewhere can produce right_start < left_end; treat as no room.
+        assert_eq!(centered_start_col(90, 80, 5), None);
+    }
+
+    #[test]
+    fn returns_none_for_zero_width_label() {
+        assert_eq!(centered_start_col(0, 100, 0), None);
+    }
+
+    #[test]
+    fn fits_label_that_exactly_fills_empty_span() {
+        // No slack: label aligns flush against left_end.
+        assert_eq!(centered_start_col(10, 18, 8), Some(10));
+    }
 }
