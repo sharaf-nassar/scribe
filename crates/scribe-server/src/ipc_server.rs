@@ -71,13 +71,16 @@ impl PreservedAiScrollback {
         self.baseline_history = None;
     }
 
-    fn trim_target(&mut self, current_history: usize) -> Option<usize> {
-        if let Some(baseline) = self.baseline_history {
-            (current_history > baseline).then_some(baseline)
-        } else {
-            self.baseline_history = Some(current_history);
-            None
-        }
+    fn needs_baseline(&self) -> bool {
+        self.baseline_history.is_none()
+    }
+
+    fn set_baseline(&mut self, history: usize) {
+        self.baseline_history = Some(history);
+    }
+
+    fn trim_target(&self, current_history: usize) -> Option<usize> {
+        self.baseline_history.and_then(|baseline| (current_history > baseline).then_some(baseline))
     }
 }
 
@@ -176,8 +179,10 @@ struct PtyReaderState {
     preserve_ai_scrollback: Arc<AtomicBool>,
     /// Shared scrollback limit for trimming duplicate AI redraw history.
     scrollback_lines: Arc<AtomicUsize>,
-    /// Preserved pre-AI scrollback baseline for this session.
+    /// Duplicate-redraw trim baseline for the current AI scrollback epoch.
     preserved_ai_scrollback: PreservedAiScrollback,
+    /// Waiting for the first filtered redraw in the epoch to commit.
+    pending_ai_scrollback_baseline: bool,
 }
 
 /// A running session in the server-wide registry. Lives independently of
@@ -975,10 +980,8 @@ async fn start_session(
 
     // Wrap the client writer in an optional so the reader task can
     // continue running when the client disconnects.
-    let client_writer: ClientWriter =
-        Arc::new(Mutex::new(initial_attachment.writer.map(Arc::clone)));
-    let attachment: SessionAttachment =
-        Arc::new(Mutex::new(initial_attachment.attached_ids.map(Arc::clone)));
+    let client_writer = Arc::new(Mutex::new(initial_attachment.writer.map(Arc::clone)));
+    let attachment = Arc::new(Mutex::new(initial_attachment.attached_ids.map(Arc::clone)));
 
     let hide_codex_hook_logs = Arc::new(AtomicBool::new(load_hide_codex_hook_logs_setting()));
     let preserve_ai_scrollback = Arc::new(AtomicBool::new(load_preserve_ai_scrollback_setting()));
@@ -1038,6 +1041,7 @@ async fn start_session(
         preserve_ai_scrollback,
         scrollback_lines,
         preserved_ai_scrollback: PreservedAiScrollback::default(),
+        pending_ai_scrollback_baseline: false,
     };
 
     tokio::spawn(pty_reader_task(state));
@@ -1799,6 +1803,7 @@ async fn next_pty_read_action(state: &mut PtyReaderState, buf: &mut [u8]) -> Pty
         tokio::select! {
             () = &mut sleep => {
                 stop_term_sync(&state.term, &mut state.ansi_processor).await;
+                maybe_capture_preserved_ai_scrollback_baseline(state).await;
                 return PtyReadAction::Continue;
             }
             result = read_pty_bytes(&mut state.pty_read, buf) => result,
@@ -1819,8 +1824,11 @@ async fn next_pty_read_action(state: &mut PtyReaderState, buf: &mut [u8]) -> Pty
 
 async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
     capture_osc_metadata_events(state, bytes);
+    prepare_preserved_ai_scrollback_epoch(state);
     let effective = apply_pty_filters(state, bytes);
     let suppressed_ed3 = state.ed3_filter.take_suppressed();
+    let capture_baseline_after_feed =
+        suppressed_ed3 && state.preserved_ai_scrollback.needs_baseline();
     let trimmed_rows = if suppressed_ed3 { handle_suppressed_ai_ed3(state).await } else { None };
 
     if let Some(rows) = trimmed_rows {
@@ -1840,7 +1848,11 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
     }
 
     // Step 2: State path — feed (possibly filtered) bytes into Term.
+    if capture_baseline_after_feed {
+        state.pending_ai_scrollback_baseline = true;
+    }
     feed_term(&state.term, &mut state.ansi_processor, effective.as_ref()).await;
+    maybe_capture_preserved_ai_scrollback_baseline(state).await;
 
     // Steps 3–5: Metadata uses original bytes (OSC parser doesn't care about CSI ED 3).
     process_metadata_events(state).await;
@@ -1850,7 +1862,7 @@ fn apply_pty_filters<'a>(state: &mut PtyReaderState, bytes: &'a [u8]) -> Cow<'a,
     let chunk_has_ed3_provider = chunk_mentions_ed3_provider(&state.osc_events);
     let preserve = state.preserve_ai_scrollback.load(Ordering::Relaxed);
     if !preserve {
-        state.preserved_ai_scrollback.reset();
+        reset_preserved_ai_scrollback_epoch(state);
     }
     let ed3_output =
         if preserve && should_apply_ed3_filter(state.ai_provider, chunk_has_ed3_provider) {
@@ -1880,6 +1892,7 @@ async fn flush_pending_codex_output(state: &mut PtyReaderState) {
     let Some(flushed) = state.codex_hook_log_filter.flush() else { return };
     send_pty_output(&state.client_writer, state.session_id, &flushed).await;
     feed_term(&state.term, &mut state.ansi_processor, &flushed).await;
+    maybe_capture_preserved_ai_scrollback_baseline(state).await;
 }
 
 async fn handle_suppressed_ai_ed3(state: &mut PtyReaderState) -> Option<usize> {
@@ -1897,6 +1910,19 @@ async fn handle_suppressed_ai_ed3(state: &mut PtyReaderState) -> Option<usize> {
         .await;
     }
     trim_rows
+}
+
+async fn maybe_capture_preserved_ai_scrollback_baseline(state: &mut PtyReaderState) {
+    if !state.pending_ai_scrollback_baseline || state.ansi_processor.sync_bytes_count() != 0 {
+        return;
+    }
+
+    let history = {
+        let term_guard = state.term.lock().await;
+        term_guard.grid().history_size()
+    };
+    state.preserved_ai_scrollback.set_baseline(history);
+    state.pending_ai_scrollback_baseline = false;
 }
 
 async fn trim_term_scrollback(
@@ -2085,16 +2111,35 @@ fn update_ai_provider_state(state: &mut PtyReaderState, event: &MetadataEvent) {
     // engaged across tool restarts.  Without this, `codex --resume` sends
     // ED 3 before re-identifying via OSC 1337, slipping through the filter
     // and wiping scrollback.  The AiStateCleared event is still forwarded
-    // to the client for UI tracking; only the PTY reader's filter decision
-    // is affected.
+    // to the client for UI tracking. Scrollback epoch resets are applied
+    // before filtering in `prepare_preserved_ai_scrollback_epoch`.
+    if let MetadataEvent::AiStateChanged(ai_state) = event {
+        state.ai_provider = Some(ai_state.provider);
+    }
+}
+
+fn prepare_preserved_ai_scrollback_epoch(state: &mut PtyReaderState) {
+    if state.osc_events.iter().any(metadata_starts_ai_scrollback_epoch) {
+        reset_preserved_ai_scrollback_epoch(state);
+    }
+}
+
+fn reset_preserved_ai_scrollback_epoch(state: &mut PtyReaderState) {
+    state.preserved_ai_scrollback.reset();
+    state.pending_ai_scrollback_baseline = false;
+}
+
+fn metadata_starts_ai_scrollback_epoch(event: &MetadataEvent) -> bool {
     match event {
-        MetadataEvent::AiStateChanged(ai_state) => {
-            state.ai_provider = Some(ai_state.provider);
-        }
-        MetadataEvent::AiStateCleared => {
-            state.preserved_ai_scrollback.reset();
-        }
-        _ => {}
+        MetadataEvent::AiStateChanged(ai_state) => matches!(
+            ai_state.state,
+            AiState::IdlePrompt
+                | AiState::WaitingForInput
+                | AiState::PermissionPrompt
+                | AiState::Error
+        ),
+        MetadataEvent::AiStateCleared | MetadataEvent::PromptReceived { .. } => true,
+        _ => false,
     }
 }
 

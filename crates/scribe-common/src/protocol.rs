@@ -374,7 +374,7 @@ pub enum ServerMessage {
     },
     /// The server trimmed AI-added redraw history after suppressing ED 3.
     /// The client should shrink its scrollback to `history_rows` before
-    /// applying subsequent PTY bytes so preserved pre-AI history stays intact
+    /// applying subsequent PTY bytes so committed transcript history stays intact
     /// without accumulating duplicate full-screen redraw frames.
     TrimScrollback {
         session_id: SessionId,

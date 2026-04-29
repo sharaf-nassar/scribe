@@ -82,7 +82,7 @@ Messages sent from the server to clients, defined in [[crates/scribe-common/src/
 
 `PtyOutput` carries raw PTY bytes. `SessionReplay` delivers a zstd-compressed ANSI rebuild on reattach. `ScreenSnapshot` is kept for tooling (`RequestSnapshot`, scribe-cli, scribe-test) that needs the per-cell grid.
 
-`TrimScrollback` prunes a client's history back to the preserved pre-AI baseline before a redraw when suppressed ED 3 clears would otherwise stack duplicate inline transcript frames into scrollback.
+`TrimScrollback` prunes a client's history back to the current AI redraw epoch baseline before a redraw when suppressed ED 3 clears would otherwise stack duplicate inline transcript frames into scrollback.
 
 #### SessionReplay
 

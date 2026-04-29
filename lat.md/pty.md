@@ -80,7 +80,7 @@ Normal session panes still receive the raw `CSI ? 2026 h/l` markers end to end. 
 
 The [[crates/scribe-pty/src/ed3_filter.rs#Ed3Filter]] strips CSI ED 3 (`\x1b[3J`) from AI PTY output when `preserve_ai_scrollback` is enabled (default on).
 
-Only runs for Claude Code / Codex Code sessions when `preserve_ai_scrollback` is `true`. Regular shell sessions are never filtered. Enabled by default so AI sessions keep earlier transcript history unless the user opts back into standard terminal scrollback clearing. The filter drops ED 3 entirely rather than converting it to ED 2, because a standalone ED 3 (e.g. Codex exit cleanup) must not erase the visible screen — if the program also wants a visible clear it sends its own ED 2. The PTY reader records the first preserved history size as the baseline and trims later AI redraw clears back to that baseline, so preserved shell history survives without repeated inline redraw frames piling up in scrollback. The PTY reader's `ai_provider` is set on the first `AiStateChanged` and never cleared — `AiStateCleared` is still forwarded to the client for UI tracking, but the filter decision persists across tool restarts so an ED 3 sent before the tool re-identifies via OSC 1337 is still caught.
+Only runs for Claude Code / Codex Code sessions when `preserve_ai_scrollback` is `true`. Regular shell sessions are never filtered. Enabled by default so AI sessions keep earlier transcript history unless the user opts back into standard terminal scrollback clearing. The filter drops ED 3 entirely rather than converting it to ED 2, because a standalone ED 3 (e.g. Codex exit cleanup) must not erase the visible screen — if the program also wants a visible clear it sends its own ED 2. The PTY reader treats prompt text, attention/error states, and inactive markers as scrollback epoch boundaries. The first suppressed clear in an epoch captures its trim baseline after replay, so a Codex ED 2 can push one copy of the prior visible transcript into scrollback; later clears in the same epoch trim back to that baseline so duplicate redraw frames do not pile up. The PTY reader's `ai_provider` is set on the first `AiStateChanged` and never cleared — `AiStateCleared` is still forwarded to the client for UI tracking, but the filter decision persists across tool restarts so an ED 3 sent before the tool re-identifies via OSC 1337 is still caught.
 
 ### Scroll-Bottom on Suppression
 
@@ -90,9 +90,9 @@ A real ED 3 resets `display_offset` to 0 inside alacritty_terminal's `clear_hist
 
 ### Baseline Trim on Repaint
 
-When a later ED 3 arrives after baseline capture, the PTY reader trims the server Term back to that preserved history size and sends [[crates/scribe-common/src/protocol.rs#ServerMessage]]`::TrimScrollback` before forwarding the redraw bytes.
+When a later ED 3 arrives in the same scrollback epoch, the PTY reader trims the server Term back to that epoch baseline and sends [[crates/scribe-common/src/protocol.rs#ServerMessage]]`::TrimScrollback` before forwarding the redraw bytes.
 
-The client flushes any queued PTY output for that pane, trims its own Term back to the same baseline, and then applies the new bytes. This keeps preserved shell history while preventing Claude or Codex inline redraws from stacking duplicate transcript frames above it.
+The client flushes any queued PTY output for that pane, trims its own Term back to the same baseline, and then applies the new bytes. This keeps committed Claude/Codex transcript history while preventing repeated inline redraws from stacking duplicate frames above it.
 
 ### State Machine
 
