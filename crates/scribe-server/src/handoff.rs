@@ -99,7 +99,10 @@ pub struct HandoffSession {
     /// Last-known session shell name. `#[serde(default)]` for backward compat.
     #[serde(default = "default_shell_name")]
     pub shell_name: String,
-    /// Last-known Codex task label. `#[serde(default)]` for backward compat.
+    /// Last-known provider task label. `#[serde(default)]` for backward compat.
+    #[serde(default)]
+    pub task_label: Option<String>,
+    /// Legacy Codex task label. `#[serde(default)]` for backward compat.
     #[serde(default)]
     pub codex_task_label: Option<String>,
     /// Last-known working directory. `#[serde(default)]` for backward compat.

@@ -9,8 +9,8 @@ const MAX_TITLE_LEN: usize = 4096;
 /// Maximum length for AI metadata fields (tool, agent, model) in chars.
 const MAX_AI_FIELD_LEN: usize = 256;
 
-/// Maximum length for Codex task labels emitted via hook metadata.
-const MAX_CODEX_TASK_LABEL_LEN: usize = 256;
+/// Maximum length for task labels emitted via hook metadata.
+const MAX_TASK_LABEL_LEN: usize = 256;
 /// Maximum length for prompt text emitted by AI CLIs.
 const MAX_PROMPT_TEXT_LEN: usize = 256;
 /// Maximum length for shell context fields (host, tmux session).
@@ -22,9 +22,16 @@ pub enum MetadataEvent {
     CwdChanged(PathBuf),
     TitleChanged(String),
     SessionContextChanged(SessionContext),
+    TaskLabelChanged {
+        provider: AiProvider,
+        label: String,
+    },
+    TaskLabelCleared {
+        provider: AiProvider,
+    },
     CodexTaskLabelChanged(String),
     CodexTaskLabelCleared,
-    /// A user prompt was submitted in a Claude Code or Codex session.
+    /// A user prompt was submitted in a supported AI coding session.
     PromptReceived {
         provider: AiProvider,
         text: String,
@@ -140,26 +147,14 @@ impl MetadataParser {
         let payload_bytes = params.get(1)?;
         let payload = String::from_utf8_lossy(payload_bytes);
 
-        // Primary formats:
-        //   ESC ] 1337 ; ClaudeState=<state> [; key=value ...] ST
-        //   ESC ] 1337 ; CodexState=<state> [; key=value ...] ST
-        if let Some(state_value) = payload.strip_prefix("ClaudeState=") {
-            return Self::parse_named_ai_state(AiProvider::ClaudeCode, state_value, params);
-        }
-        if let Some(state_value) = payload.strip_prefix("CodexState=") {
-            return Self::parse_named_ai_state(AiProvider::CodexCode, state_value, params);
-        }
-        if payload == "CodexTaskLabelCleared" {
-            return Some(MetadataEvent::CodexTaskLabelCleared);
-        }
-        if let Some(label) = payload.strip_prefix("CodexTaskLabel=") {
-            return Self::parse_codex_task_label(label);
-        }
-        if let Some(text) = payload.strip_prefix("ClaudePrompt=") {
-            return Self::parse_prompt(AiProvider::ClaudeCode, text);
-        }
-        if let Some(text) = payload.strip_prefix("CodexPrompt=") {
-            return Self::parse_prompt(AiProvider::CodexCode, text);
+        // Primary provider formats:
+        //   ESC ] 1337 ; <Provider>State=<state> [; key=value ...] ST
+        //   ESC ] 1337 ; <Provider>Prompt=<text> ST
+        //   ESC ] 1337 ; <Provider>TaskLabel=<label> ST
+        for provider in AiProvider::all() {
+            if let Some(event) = Self::parse_provider_iterm2_payload(*provider, &payload, params) {
+                return Some(event);
+            }
         }
         if payload == "ScribeContext" || payload.starts_with("ScribeContext=") {
             return Some(Self::parse_session_context(payload.as_ref(), params));
@@ -172,6 +167,33 @@ impl MetadataParser {
         }
 
         None
+    }
+
+    fn parse_provider_iterm2_payload(
+        provider: AiProvider,
+        payload: &str,
+        params: &[&[u8]],
+    ) -> Option<MetadataEvent> {
+        let state_prefix = format!("{}=", provider.state_osc_key());
+        if let Some(state_value) = payload.strip_prefix(&state_prefix) {
+            return Self::parse_named_ai_state(provider, state_value, params);
+        }
+
+        let prompt_prefix = format!("{}=", provider.prompt_osc_key());
+        if let Some(text) = payload.strip_prefix(&prompt_prefix) {
+            return Self::parse_prompt(provider, text);
+        }
+
+        let task_label_key = provider.task_label_osc_key()?;
+        let clear_payload = format!("{task_label_key}Cleared");
+        if payload == clear_payload {
+            return Some(MetadataEvent::TaskLabelCleared { provider });
+        }
+
+        let label_prefix = format!("{task_label_key}=");
+        payload
+            .strip_prefix(&label_prefix)
+            .and_then(|label| Self::parse_task_label(provider, label))
     }
 
     /// Parse the legacy `AiState=state=X;key=val` single-payload format.
@@ -220,12 +242,12 @@ impl MetadataParser {
         builder.build()
     }
 
-    fn parse_codex_task_label(label: &str) -> Option<MetadataEvent> {
-        let label = sanitize_text_payload(label, MAX_CODEX_TASK_LABEL_LEN);
+    fn parse_task_label(provider: AiProvider, label: &str) -> Option<MetadataEvent> {
+        let label = sanitize_text_payload(label, MAX_TASK_LABEL_LEN);
         if label.is_empty() {
             return None;
         }
-        Some(MetadataEvent::CodexTaskLabelChanged(label))
+        Some(MetadataEvent::TaskLabelChanged { provider, label })
     }
 
     fn parse_prompt(provider: AiProvider, text: &str) -> Option<MetadataEvent> {
@@ -544,6 +566,36 @@ mod tests {
             }
             other => panic!("expected PromptReceived, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_auggie_prompt() {
+        let event = parse_iterm2(&[b"1337", b"AuggiePrompt=Trace the config reload bug"]);
+        match event {
+            Some(MetadataEvent::PromptReceived { provider, text }) => {
+                assert_eq!(provider, AiProvider::Auggie);
+                assert_eq!(text, "Trace the config reload bug");
+            }
+            other => panic!("expected Auggie PromptReceived, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_auggie_task_label_events() {
+        let label_event = parse_iterm2(&[b"1337", b"AuggieTaskLabel=Ship JSON5 support"]);
+        match label_event {
+            Some(MetadataEvent::TaskLabelChanged { provider, label }) => {
+                assert_eq!(provider, AiProvider::Auggie);
+                assert_eq!(label, "Ship JSON5 support");
+            }
+            other => panic!("expected Auggie task label event, got {other:?}"),
+        }
+
+        let clear_event = parse_iterm2(&[b"1337", b"AuggieTaskLabelCleared"]);
+        assert_eq!(
+            clear_event,
+            Some(MetadataEvent::TaskLabelCleared { provider: AiProvider::Auggie })
+        );
     }
 
     #[test]

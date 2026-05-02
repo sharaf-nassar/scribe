@@ -82,7 +82,7 @@ If Linux hot-reload fails because the handoff state version changed, `postinst` 
 
 Auto-update package downloads are staged under the user runtime directory and Linux passes a verified, unlinked package fd to `pkexec dpkg`, so maintainer scripts install the same inode that minisign verified rather than reopening a mutable temp path.
 
-Settings relaunches also wait for the old singleton to release its lock and socket, then escalate to SIGKILL before starting the replacement if the old process refuses to exit. `scribe-dev` additionally skips automatic Claude/Codex hook setup during install so the stable install's global hook configuration remains untouched.
+Settings relaunches also wait for the old singleton to release its lock and socket, then escalate to SIGKILL before starting the replacement if the old process refuses to exit. `scribe-dev` additionally skips automatic Claude/Codex/Auggie hook setup during install so the stable install's global hook configuration remains untouched.
 
 ## Data Flow
 

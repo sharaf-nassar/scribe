@@ -672,7 +672,7 @@ case "$1" in
         fi
 
         if [ "$AUTO_SETUP_HOOKS" != "1" ]; then
-            echo "  Skipping Claude/Codex hook setup for ${APP_DISPLAY_NAME} to keep the stable install isolated."
+            echo "  Skipping Claude/Codex/Auggie hook setup for ${APP_DISPLAY_NAME} to keep the stable install isolated."
             echo ""
         fi
 
@@ -702,6 +702,24 @@ case "$1" in
 
             if [ -d "$CODEX_DIR" ]; then
                 echo "  Setting up Codex AI indicator hooks..."
+                if [ -n "$PRIVILEGED_USER_UID" ]; then
+                    sudo -u "#${PRIVILEGED_USER_UID}" \
+                        HOME="$TARGET_HOME" \
+                        "$SETUP_SCRIPT" --hook-source "$SHARE_DIR" 2>&1 | sed 's/^/  /'
+                else
+                    "$SETUP_SCRIPT" --hook-source "$SHARE_DIR" 2>&1 | sed 's/^/  /'
+                fi
+            fi
+        fi
+
+        # ── Auggie hook integration (both fresh and upgrade) ─────────────
+        SETUP_SCRIPT="${SHARE_DIR}/setup-auggie-hooks.sh"
+        if [ "$AUTO_SETUP_HOOKS" = "1" ] && [ -x "$SETUP_SCRIPT" ]; then
+            TARGET_HOME=$(eval echo "~$(id -un "$TARGET_UID")" 2>/dev/null) || true
+            AUGMENT_DIR="${TARGET_HOME}/.augment"
+
+            if [ -d "$AUGMENT_DIR" ]; then
+                echo "  Setting up Auggie AI indicator hooks..."
                 if [ -n "$PRIVILEGED_USER_UID" ]; then
                     sudo -u "#${PRIVILEGED_USER_UID}" \
                         HOME="$TARGET_HOME" \

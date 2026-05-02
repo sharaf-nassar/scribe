@@ -138,8 +138,8 @@ pub struct ManagedSession {
     pub handoff_snapshot: Option<ScreenSnapshot>,
     /// Title from handoff, used to restore tab name. `None` for fresh sessions.
     pub title: Option<String>,
-    /// Codex task label from handoff. `None` when unset for the session.
-    pub codex_task_label: Option<String>,
+    /// Provider task label from handoff. `None` when unset for the session.
+    pub task_label: Option<String>,
     /// CWD from handoff, used to restore working directory. `None` for fresh sessions.
     pub cwd: Option<std::path::PathBuf>,
     /// Remote/tmux context from handoff. `None` for fresh sessions.
@@ -238,7 +238,7 @@ impl PreparedSessionLaunch {
             pty: Some(pty),
             handoff_snapshot: None,
             title: None,
-            codex_task_label: None,
+            task_label: None,
             cwd: None,
             context: None,
             ai_state: None,
@@ -453,7 +453,10 @@ impl SessionManager {
                 pty: None,
                 handoff_snapshot,
                 title: handoff_session.title.clone(),
-                codex_task_label: handoff_session.codex_task_label.clone(),
+                task_label: handoff_session
+                    .task_label
+                    .clone()
+                    .or_else(|| handoff_session.codex_task_label.clone()),
                 cwd: handoff_session.cwd.clone(),
                 context: handoff_session.context.clone(),
                 ai_state: handoff_session.ai_state.clone(),
@@ -571,13 +574,10 @@ fn shell_binary_str(command: Option<&[String]>) -> String {
 
 fn command_ai_provider_hint(command: Option<&[String]>) -> Option<AiProvider> {
     let parts = command?;
-    if command_mentions_binary(parts, "codex") {
-        Some(AiProvider::CodexCode)
-    } else if command_mentions_binary(parts, "claude") {
-        Some(AiProvider::ClaudeCode)
-    } else {
-        None
-    }
+    AiProvider::all()
+        .iter()
+        .copied()
+        .find(|provider| command_mentions_binary(parts, provider.binary_name()))
 }
 
 fn command_mentions_binary(parts: &[String], binary_name: &str) -> bool {

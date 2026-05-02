@@ -1,6 +1,6 @@
 //! Split-scroll: pin the live terminal bottom while scrolled up in AI panes.
 //!
-//! When the user scrolls up in a pane running Claude Code or Codex, the
+//! When the user scrolls up in a pane running a supported AI coding tool, the
 //! viewport splits into a top portion (scrollback) and a bottom portion
 //! (live terminal where the cursor/prompt is). This lets users compose
 //! prompts while reading earlier output.
@@ -18,7 +18,7 @@ use crate::layout::Rect;
 const MIN_PIN_ROWS: usize = 3;
 /// Extra live rows above the cursor to keep visible in the pinned region.
 ///
-/// Claude/Codex can draw prompt chrome one row above the input itself, so the
+/// AI tools can draw prompt chrome one row above the input itself, so the
 /// old `+ 2` margin could clip the waiting-for-input block when the cursor sat
 /// on the last visible row.
 const CURSOR_CONTEXT_ROWS: usize = 3;

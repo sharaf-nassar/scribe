@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use std::time::UNIX_EPOCH;
 
-use scribe_common::ai_state::AiProcessState;
+use scribe_common::ai_state::{AiProcessState, AiProvider};
 use scribe_common::app::current_identity;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
@@ -98,11 +98,11 @@ pub enum UiEvent {
     },
     /// The terminal title for a session has changed.
     TitleChanged { session_id: SessionId, title: String },
-    /// The active Codex task label for a session has changed.
-    CodexTaskLabelChanged { session_id: SessionId, task_label: String },
-    /// The active Codex task label for a session was cleared.
-    CodexTaskLabelCleared { session_id: SessionId },
-    /// A user prompt was submitted in a Claude Code or Codex session.
+    /// The active provider task label for a session has changed.
+    TaskLabelChanged { session_id: SessionId, provider: AiProvider, task_label: String },
+    /// The active provider task label for a session was cleared.
+    TaskLabelCleared { session_id: SessionId, provider: AiProvider },
+    /// A user prompt was submitted in a supported AI coding session.
     PromptReceived { session_id: SessionId, text: String },
     /// Git branch for a session's CWD (None if not in a git repo).
     GitBranch { session_id: SessionId, branch: Option<String> },
@@ -272,7 +272,7 @@ fn dispatch_session_message(
 }
 
 /// Per-session metadata events (AI state, OSC title/cwd/context updates,
-/// prompt marks, Codex task labels, git branch). Split out of
+/// prompt marks, provider task labels, git branch). Split out of
 /// `dispatch_session_message` to keep each routing function focused on a
 /// single category of message.
 fn dispatch_session_metadata_message(
@@ -305,11 +305,29 @@ fn dispatch_session_metadata_message(
             None
         }
         ServerMessage::CodexTaskLabelChanged { session_id, task_label } => {
-            send_event(proxy, UiEvent::CodexTaskLabelChanged { session_id, task_label });
+            send_event(
+                proxy,
+                UiEvent::TaskLabelChanged {
+                    session_id,
+                    provider: AiProvider::CodexCode,
+                    task_label,
+                },
+            );
             None
         }
         ServerMessage::CodexTaskLabelCleared { session_id } => {
-            send_event(proxy, UiEvent::CodexTaskLabelCleared { session_id });
+            send_event(
+                proxy,
+                UiEvent::TaskLabelCleared { session_id, provider: AiProvider::CodexCode },
+            );
+            None
+        }
+        ServerMessage::TaskLabelChanged { session_id, provider, task_label } => {
+            send_event(proxy, UiEvent::TaskLabelChanged { session_id, provider, task_label });
+            None
+        }
+        ServerMessage::TaskLabelCleared { session_id, provider } => {
+            send_event(proxy, UiEvent::TaskLabelCleared { session_id, provider });
             None
         }
         ServerMessage::PromptReceived { session_id, provider, text } => {

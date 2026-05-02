@@ -1,7 +1,7 @@
 //! Clipboard text cleanup for AI-assisted sessions.
 //!
 //! Three transforms are applied in sequence when the active session is running
-//! Claude Code or Codex and the user has clipboard cleanup enabled:
+//! a supported AI coding tool and the user has clipboard cleanup enabled:
 //!
 //! 1. **Dedent** — strip the minimum shared leading whitespace from all lines.
 //! 2. **Normalize blockquotes** — strip markdown and rendered quote markers.

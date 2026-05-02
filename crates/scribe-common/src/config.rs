@@ -438,9 +438,9 @@ fn default_pulse_duration() -> u32 {
     1000
 }
 
-/// Configuration for the four Claude Code AI indicator states.
+/// Configuration for AI indicator states shared by supported coding tools.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaudeStatesConfig {
+pub struct AiStateStylesConfig {
     #[serde(default = "default_processing_entry")]
     pub processing: AiStateEntry,
     #[serde(default = "default_waiting_for_input_entry")]
@@ -451,7 +451,7 @@ pub struct ClaudeStatesConfig {
     pub error: AiStateEntry,
 }
 
-impl Default for ClaudeStatesConfig {
+impl Default for AiStateStylesConfig {
     fn default() -> Self {
         Self {
             processing: default_processing_entry(),
@@ -461,6 +461,9 @@ impl Default for ClaudeStatesConfig {
         }
     }
 }
+
+/// Backward-compatible type name retained for downstream code.
+pub type ClaudeStatesConfig = AiStateStylesConfig;
 
 fn default_processing_entry() -> AiStateEntry {
     AiStateEntry {
@@ -562,18 +565,36 @@ impl Default for TerminalClipboardConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TerminalAiIntegrationConfig {
-    #[serde(default = "default_true")]
-    pub claude_code_integration: bool,
-    #[serde(default = "default_true")]
-    pub codex_code_integration: bool,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AiIntegrationToggle(bool);
+
+impl AiIntegrationToggle {
+    #[must_use]
+    pub fn new(enabled: bool) -> Self {
+        Self(enabled)
+    }
+
+    #[must_use]
+    pub fn enabled(self) -> bool {
+        self.0
+    }
 }
 
-impl Default for TerminalAiIntegrationConfig {
+impl Default for AiIntegrationToggle {
     fn default() -> Self {
-        Self { claude_code_integration: true, codex_code_integration: true }
+        Self(true)
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TerminalAiIntegrationConfig {
+    #[serde(default, rename = "claude_code_integration")]
+    pub claude_code: AiIntegrationToggle,
+    #[serde(default, rename = "codex_code_integration")]
+    pub codex_code: AiIntegrationToggle,
+    #[serde(default, rename = "auggie_integration")]
+    pub auggie: AiIntegrationToggle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -586,12 +607,12 @@ pub struct TerminalAiSessionConfig {
     #[serde(default = "default_true")]
     pub preserve_ai_scrollback: bool,
     /// Compatibility-only state for legacy settings surfaces.
-    /// Runtime AI tab routing uses explicit Claude/Codex actions.
+    /// Runtime AI tab routing uses explicit provider actions.
     #[serde(default = "default_ai_tab_provider")]
     pub ai_tab_provider: AiProvider,
-    /// Per-state configuration for Claude Code AI indicators.
-    #[serde(default)]
-    pub claude_states: ClaudeStatesConfig,
+    /// Per-state configuration for AI indicators.
+    #[serde(default, alias = "claude_states")]
+    pub ai_states: AiStateStylesConfig,
     /// Height of the AI state indicator bar in pixels.
     #[serde(default = "default_indicator_height")]
     pub indicator_height: f32,
@@ -605,7 +626,7 @@ impl Default for TerminalAiSessionConfig {
             hide_codex_hook_logs: false,
             preserve_ai_scrollback: true,
             ai_tab_provider: default_ai_tab_provider(),
-            claude_states: ClaudeStatesConfig::default(),
+            ai_states: AiStateStylesConfig::default(),
             indicator_height: default_indicator_height(),
             shell_integration: ShellIntegrationConfig::default(),
         }
@@ -686,8 +707,9 @@ impl TerminalConfig {
     #[must_use]
     pub fn ai_provider_enabled(&self, provider: AiProvider) -> bool {
         match provider {
-            AiProvider::ClaudeCode => self.ai_integration.claude_code_integration,
-            AiProvider::CodexCode => self.ai_integration.codex_code_integration,
+            AiProvider::ClaudeCode => self.ai_integration.claude_code.enabled(),
+            AiProvider::CodexCode => self.ai_integration.codex_code.enabled(),
+            AiProvider::Auggie => self.ai_integration.auggie.enabled(),
         }
     }
 }
@@ -773,6 +795,10 @@ pub struct KeybindingsConfig {
     pub new_codex_tab: KeyComboList,
     #[serde(default = "default_new_codex_resume_tab")]
     pub new_codex_resume_tab: KeyComboList,
+    #[serde(default = "default_new_auggie_tab")]
+    pub new_auggie_tab: KeyComboList,
+    #[serde(default = "default_new_auggie_resume_tab")]
+    pub new_auggie_resume_tab: KeyComboList,
     #[serde(default = "default_close_tab")]
     pub close_tab: KeyComboList,
     #[serde(default = "default_next_tab")]
@@ -877,6 +903,8 @@ impl Default for KeybindingsConfig {
             new_claude_resume_tab: default_new_claude_resume_tab(),
             new_codex_tab: default_new_codex_tab(),
             new_codex_resume_tab: default_new_codex_resume_tab(),
+            new_auggie_tab: default_new_auggie_tab(),
+            new_auggie_resume_tab: default_new_auggie_resume_tab(),
             close_tab: default_close_tab(),
             next_tab: default_next_tab(),
             prev_tab: default_prev_tab(),
@@ -1000,6 +1028,14 @@ fn default_new_codex_tab() -> KeyComboList {
 
 fn default_new_codex_resume_tab() -> KeyComboList {
     platform_combo("cmd+alt+e", "ctrl+alt+e")
+}
+
+fn default_new_auggie_tab() -> KeyComboList {
+    platform_combo("cmd+alt+g", "ctrl+alt+g")
+}
+
+fn default_new_auggie_resume_tab() -> KeyComboList {
+    platform_combo("cmd+alt+shift+g", "ctrl+alt+shift+g")
 }
 
 fn default_close_tab() -> KeyComboList {

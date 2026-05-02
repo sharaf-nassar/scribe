@@ -931,6 +931,7 @@ function loadConfig(config) {
   setToggleValue("terminal.claude_copy_cleanup", config.terminal?.claude_copy_cleanup);
   setToggleValue("terminal.claude_code_integration", config.terminal?.claude_code_integration);
   setToggleValue("terminal.codex_code_integration", config.terminal?.codex_code_integration);
+  setToggleValue("terminal.auggie_integration", config.terminal?.auggie_integration);
   setToggleValue("terminal.hide_codex_hook_logs", config.terminal?.hide_codex_hook_logs);
   setToggleValue("terminal.preserve_ai_scrollback", config.terminal?.preserve_ai_scrollback);
   setToggleValue("terminal.prompt_bar", config.terminal?.prompt_bar);
@@ -940,20 +941,20 @@ function loadConfig(config) {
   setStepperValue("terminal.indicator_height", config.terminal?.indicator_height);
 
   // AI assistant states
-  var states = config.terminal?.claude_states;
+  var states = config.terminal?.ai_states || config.terminal?.claude_states;
   if (states) {
     ["processing","idle_prompt","waiting_for_input","permission_prompt","error"]
       .forEach(function(s) {
         var e = states[s];
         if (!e) { return; }
-        setToggleValue("claude_states." + s + ".tab_indicator", e.tab_indicator);
-        setToggleValue("claude_states." + s + ".pane_border", e.pane_border);
+        setToggleValue("ai_states." + s + ".tab_indicator", e.tab_indicator);
+        setToggleValue("ai_states." + s + ".pane_border", e.pane_border);
         // Color swatches only accept hex; ansi:N values are left at default.
         if (typeof e.color === "string" && e.color.charAt(0) === "#") {
-          setColorSwatch("claude_states." + s + ".color", e.color);
+          setColorSwatch("ai_states." + s + ".color", e.color);
         }
-        setStepperValue("claude_states." + s + ".pulse_ms", e.pulse_ms);
-        setStepperValue("claude_states." + s + ".timeout_secs", e.timeout_secs);
+        setStepperValue("ai_states." + s + ".pulse_ms", e.pulse_ms);
+        setStepperValue("ai_states." + s + ".timeout_secs", e.timeout_secs);
       });
   }
 

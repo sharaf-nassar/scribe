@@ -73,6 +73,7 @@ fn make_v5_state(term: &Term<ScribeEventListener>) -> (HandoffState, Vec<OwnedFd
         session_replay: Some(replay),
         title: None,
         shell_name: String::from("zsh"),
+        task_label: None,
         codex_task_label: None,
         cwd: None,
         context: None,
@@ -140,6 +141,7 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
             session_replay: None,
             title: None,
             shell_name: String::from("zsh"),
+            task_label: None,
             codex_task_label: None,
             cwd: None,
             context: Some(SessionContext {

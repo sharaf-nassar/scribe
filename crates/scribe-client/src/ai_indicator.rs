@@ -4,12 +4,12 @@
 //! quads for pane border overlays and tab-bar indicator bars.
 //!
 //! Colours, per-state enable flags, and auto-clear timeouts are driven by
-//! [`ClaudeStatesConfig`] rather than compile-time constants.
+//! [`AiStateStylesConfig`] rather than compile-time constants.
 
 use std::collections::HashMap;
 
 use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
-use scribe_common::config::{AiStateEntry, ClaudeStatesConfig, TerminalConfig};
+use scribe_common::config::{AiStateEntry, AiStateStylesConfig, TerminalConfig};
 use scribe_common::ids::SessionId;
 use scribe_renderer::chrome::solid_quad;
 use scribe_renderer::types::CellInstance;
@@ -45,13 +45,13 @@ pub struct AiStateTracker {
     /// Time each session entered its current state, for timeout expiry.
     state_enter_times: HashMap<SessionId, f32>,
     /// Per-state configuration (colours, enabled, timeouts).
-    config: ClaudeStatesConfig,
+    config: AiStateStylesConfig,
 }
 
 impl AiStateTracker {
     /// Create a new tracker with no sessions.
     #[must_use]
-    pub fn new(config: ClaudeStatesConfig) -> Self {
+    pub fn new(config: AiStateStylesConfig) -> Self {
         Self {
             states: HashMap::new(),
             detected_providers: HashMap::new(),
@@ -62,7 +62,7 @@ impl AiStateTracker {
     }
 
     /// Replace the per-state configuration snapshot (called on config reload).
-    pub fn reconfigure(&mut self, config: ClaudeStatesConfig) {
+    pub fn reconfigure(&mut self, config: AiStateStylesConfig) {
         self.config = config;
     }
 
@@ -279,12 +279,12 @@ impl AiStateTracker {
 
 impl Default for AiStateTracker {
     fn default() -> Self {
-        Self::new(ClaudeStatesConfig::default())
+        Self::new(AiStateStylesConfig::default())
     }
 }
 
 /// Look up the config entry for a given AI state.
-fn entry_for_config<'a>(config: &'a ClaudeStatesConfig, state: &AiState) -> &'a AiStateEntry {
+fn entry_for_config<'a>(config: &'a AiStateStylesConfig, state: &AiState) -> &'a AiStateEntry {
     match state {
         AiState::Processing => &config.processing,
         AiState::IdlePrompt | AiState::WaitingForInput => &config.waiting_for_input,
@@ -385,7 +385,7 @@ mod tests {
         let session_id = SessionId::new();
         let terminal = TerminalConfig {
             ai_integration: scribe_common::config::TerminalAiIntegrationConfig {
-                codex_code_integration: false,
+                codex_code: scribe_common::config::AiIntegrationToggle::new(false),
                 ..scribe_common::config::TerminalAiIntegrationConfig::default()
             },
             ..TerminalConfig::default()

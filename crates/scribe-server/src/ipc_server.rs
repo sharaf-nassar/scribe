@@ -200,8 +200,8 @@ pub struct LiveSession {
     shell_name: String,
     /// Last-known terminal title (OSC 0/2), persisted for reconnect.
     title: String,
-    /// Last-known Codex task label, persisted separately from OSC 0/2 titles.
-    codex_task_label: Option<String>,
+    /// Last-known provider task label, persisted separately from OSC 0/2 titles.
+    task_label: Option<String>,
     /// Last-known working directory (OSC 7), persisted for reconnect.
     cwd: Option<std::path::PathBuf>,
     /// Last-known remote/tmux context reported by shell integration.
@@ -967,7 +967,7 @@ async fn start_session(
     let osc_parser = session.osc_parser;
     let event_rx = session.event_rx;
     let title = session.title.unwrap_or_else(|| String::from("shell"));
-    let codex_task_label = session.codex_task_label;
+    let task_label = session.task_label;
     let cwd = session.cwd;
     let context = session.context;
     let ai_state = session.ai_state;
@@ -998,7 +998,7 @@ async fn start_session(
         workspace_id,
         shell_name,
         title,
-        codex_task_label,
+        task_label,
         cwd,
         context,
         ai_state,
@@ -1053,7 +1053,7 @@ fn ai_state_uses_ed3_filter(ai_state: Option<&AiProcessState>) -> bool {
 }
 
 fn ai_provider_uses_ed3_filter(ai_provider: Option<AiProvider>) -> bool {
-    matches!(ai_provider, Some(AiProvider::ClaudeCode | AiProvider::CodexCode))
+    ai_provider.is_some_and(|provider| AiProvider::all().contains(&provider))
 }
 
 /// Write key input data to the PTY.
@@ -1528,7 +1528,8 @@ async fn handle_list_sessions(
         shell_name: s.shell_name.clone(),
         title: Some(s.title.clone()),
         context: s.context.clone(),
-        codex_task_label: s.codex_task_label.clone(),
+        task_label: s.task_label.clone(),
+        codex_task_label: s.task_label.clone(),
         cwd: s.cwd.clone(),
         git_branch: s.cwd.as_deref().and_then(detect_git_branch),
         ai_state: s.ai_state.clone(),
@@ -2430,13 +2431,25 @@ async fn persist_session_metadata(
             if !task_label.trim().is_empty() =>
         {
             update_live_session(session_id, live_sessions, |session| {
-                session.codex_task_label = Some(task_label.clone());
+                session.task_label = Some(task_label.clone());
+            })
+            .await;
+        }
+        ServerMessage::TaskLabelChanged { task_label, .. } if !task_label.trim().is_empty() => {
+            update_live_session(session_id, live_sessions, |session| {
+                session.task_label = Some(task_label.clone());
             })
             .await;
         }
         ServerMessage::CodexTaskLabelCleared { .. } => {
             update_live_session(session_id, live_sessions, |session| {
-                session.codex_task_label = None;
+                session.task_label = None;
+            })
+            .await;
+        }
+        ServerMessage::TaskLabelCleared { .. } => {
+            update_live_session(session_id, live_sessions, |session| {
+                session.task_label = None;
             })
             .await;
         }
@@ -2530,11 +2543,19 @@ fn convert_metadata_event(
         MetadataEvent::TitleChanged(title) => {
             (ServerMessage::TitleChanged { session_id, title }, None)
         }
-        MetadataEvent::CodexTaskLabelChanged(task_label) => {
-            (ServerMessage::CodexTaskLabelChanged { session_id, task_label }, None)
+        MetadataEvent::TaskLabelChanged { provider: AiProvider::CodexCode, label }
+        | MetadataEvent::CodexTaskLabelChanged(label) => {
+            (ServerMessage::CodexTaskLabelChanged { session_id, task_label: label }, None)
         }
-        MetadataEvent::CodexTaskLabelCleared => {
+        MetadataEvent::TaskLabelChanged { provider, label } => {
+            (ServerMessage::TaskLabelChanged { session_id, provider, task_label: label }, None)
+        }
+        MetadataEvent::TaskLabelCleared { provider: AiProvider::CodexCode }
+        | MetadataEvent::CodexTaskLabelCleared => {
             (ServerMessage::CodexTaskLabelCleared { session_id }, None)
+        }
+        MetadataEvent::TaskLabelCleared { provider } => {
+            (ServerMessage::TaskLabelCleared { session_id, provider }, None)
         }
         MetadataEvent::AiStateChanged(ai_state) => {
             (ServerMessage::AiStateChanged { session_id, ai_state }, None)
@@ -2606,7 +2627,8 @@ pub async fn serialize_live_for_handoff(
             session_replay,
             title: Some(live.title.clone()),
             shell_name: live.shell_name.clone(),
-            codex_task_label: live.codex_task_label.clone(),
+            task_label: live.task_label.clone(),
+            codex_task_label: live.task_label.clone(),
             cwd: live.cwd.clone(),
             context: live.context.clone(),
             ai_state: live.ai_state.clone(),
@@ -2871,6 +2893,58 @@ mod tests {
         assert!(!chunk_has_no_supported);
         assert!(should_apply_ed3_filter(None, chunk_has_supported));
         assert!(!should_apply_ed3_filter(None, chunk_has_no_supported));
+    }
+
+    #[test]
+    fn codex_task_label_metadata_preserves_legacy_wire_variant() {
+        let session_id = SessionId::new();
+        let (changed_message, changed_cwd) = convert_metadata_event(
+            MetadataEvent::TaskLabelChanged {
+                provider: AiProvider::CodexCode,
+                label: String::from("refactor parser"),
+            },
+            session_id,
+        );
+
+        assert!(changed_cwd.is_none());
+        assert!(matches!(
+            changed_message,
+            ServerMessage::CodexTaskLabelChanged { session_id: sid, task_label }
+                if sid == session_id && task_label == "refactor parser"
+        ));
+
+        let (cleared_message, cleared_cwd) = convert_metadata_event(
+            MetadataEvent::TaskLabelCleared { provider: AiProvider::CodexCode },
+            session_id,
+        );
+
+        assert!(cleared_cwd.is_none());
+        assert!(matches!(
+            cleared_message,
+            ServerMessage::CodexTaskLabelCleared { session_id: sid } if sid == session_id
+        ));
+    }
+
+    #[test]
+    fn auggie_task_label_metadata_uses_generic_wire_variant() {
+        let session_id = SessionId::new();
+        let (message, cwd) = convert_metadata_event(
+            MetadataEvent::TaskLabelChanged {
+                provider: AiProvider::Auggie,
+                label: String::from("wire compatibility"),
+            },
+            session_id,
+        );
+
+        assert!(cwd.is_none());
+        assert!(matches!(
+            message,
+            ServerMessage::TaskLabelChanged {
+                session_id: sid,
+                provider: AiProvider::Auggie,
+                task_label,
+            } if sid == session_id && task_label == "wire compatibility"
+        ));
     }
 
     #[tokio::test]

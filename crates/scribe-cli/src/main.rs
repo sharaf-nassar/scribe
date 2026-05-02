@@ -45,6 +45,8 @@ enum ActionCommand {
     ResumeClaudeTab,
     NewCodexTab,
     ResumeCodexTab,
+    NewAuggieTab,
+    ResumeAuggieTab,
     /// Compatibility alias for `new-claude-tab`.
     NewAiTab,
     /// Compatibility alias for `resume-claude-tab`.
@@ -242,6 +244,8 @@ fn to_automation_action(action: ActionCommand) -> AutomationAction {
         }
         ActionCommand::NewCodexTab => AutomationAction::NewCodexTab,
         ActionCommand::ResumeCodexTab => AutomationAction::NewCodexResumeTab,
+        ActionCommand::NewAuggieTab => AutomationAction::NewAuggieTab,
+        ActionCommand::ResumeAuggieTab => AutomationAction::NewAuggieResumeTab,
         ActionCommand::SplitVertical => AutomationAction::SplitVertical,
         ActionCommand::SplitHorizontal => AutomationAction::SplitHorizontal,
         ActionCommand::ClosePane => AutomationAction::ClosePane,

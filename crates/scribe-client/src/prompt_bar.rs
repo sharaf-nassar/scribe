@@ -1,7 +1,7 @@
 //! GPU-rendered prompt bar for AI terminal panes.
 //!
 //! Renders a background quad, icon glyphs, and truncated prompt text for
-//! the first and latest prompts submitted in a Claude Code or Codex session.
+//! the first and latest prompts submitted in a supported AI coding session.
 //! Also renders a `#N` message-count annotation and an elapsed-time counter
 //! since the most recent prompt was sent.
 

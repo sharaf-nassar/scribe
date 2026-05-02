@@ -288,6 +288,8 @@ async fn dispatch_server_message(
         }
         msg @ (ServerMessage::CodexTaskLabelChanged { .. }
         | ServerMessage::CodexTaskLabelCleared { .. }
+        | ServerMessage::TaskLabelChanged { .. }
+        | ServerMessage::TaskLabelCleared { .. }
         | ServerMessage::AiStateChanged { .. }
         | ServerMessage::AiStateCleared { .. }
         | ServerMessage::GitBranch { .. }
@@ -390,13 +392,11 @@ async fn dispatch_window_message(
 }
 
 fn dispatch_notice_message(msg: ServerMessage) {
+    if dispatch_task_label_notice(&msg) {
+        return;
+    }
+
     match msg {
-        ServerMessage::CodexTaskLabelChanged { session_id, task_label } => {
-            debug!(%session_id, %task_label, "codex task label changed (ignored by test daemon)");
-        }
-        ServerMessage::CodexTaskLabelCleared { session_id } => {
-            debug!(%session_id, "codex task label cleared (ignored by test daemon)");
-        }
         ServerMessage::AiStateChanged { session_id, ai_state } => {
             debug!(%session_id, ?ai_state, "AI state changed");
         }
@@ -426,6 +426,25 @@ fn dispatch_notice_message(msg: ServerMessage) {
         }
         other => debug!(?other, "ignored non-notice server message in notice dispatcher"),
     }
+}
+
+fn dispatch_task_label_notice(msg: &ServerMessage) -> bool {
+    match msg {
+        ServerMessage::CodexTaskLabelChanged { session_id, task_label } => {
+            debug!(%session_id, %task_label, "codex task label changed (ignored by test daemon)");
+        }
+        ServerMessage::CodexTaskLabelCleared { session_id } => {
+            debug!(%session_id, "codex task label cleared (ignored by test daemon)");
+        }
+        ServerMessage::TaskLabelChanged { session_id, provider, task_label } => {
+            debug!(%session_id, ?provider, %task_label, "AI task label changed");
+        }
+        ServerMessage::TaskLabelCleared { session_id, provider } => {
+            debug!(%session_id, ?provider, "AI task label cleared");
+        }
+        _ => return false,
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------

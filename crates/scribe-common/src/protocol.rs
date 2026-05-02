@@ -37,6 +37,8 @@ pub enum AutomationAction {
     NewClaudeResumeTab,
     NewCodexTab,
     NewCodexResumeTab,
+    NewAuggieTab,
+    NewAuggieResumeTab,
     SplitVertical,
     SplitHorizontal,
     ClosePane,
@@ -254,7 +256,16 @@ pub enum ServerMessage {
     CodexTaskLabelCleared {
         session_id: SessionId,
     },
-    /// A user prompt was submitted in a Claude Code or Codex session.
+    TaskLabelChanged {
+        session_id: SessionId,
+        provider: AiProvider,
+        task_label: String,
+    },
+    TaskLabelCleared {
+        session_id: SessionId,
+        provider: AiProvider,
+    },
+    /// A user prompt was submitted in a supported AI coding session.
     PromptReceived {
         session_id: SessionId,
         provider: AiProvider,
@@ -496,7 +507,10 @@ pub struct SessionInfo {
     /// Last-known shell/session context (remote host, tmux session).
     #[serde(default)]
     pub context: Option<SessionContext>,
-    /// Last-known Codex task label. `None` when the session is not showing one.
+    /// Last-known provider task label. `None` when the session is not showing one.
+    #[serde(default)]
+    pub task_label: Option<String>,
+    /// Legacy Codex task label field retained for backward compatibility.
     #[serde(default)]
     pub codex_task_label: Option<String>,
     /// Last-known working directory (from OSC 7). `None` before first CWD event.

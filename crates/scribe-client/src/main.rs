@@ -46,7 +46,7 @@ use alacritty_terminal::grid::Dimensions as _;
 use scribe_common::ai_state::AiProvider;
 use scribe_common::app::{current_identity, current_state_dir};
 use scribe_common::config::{
-    ClaudeStatesConfig, ContentPadding, NotificationsConfig, ScribeConfig, resolve_theme,
+    AiStateStylesConfig, ContentPadding, NotificationsConfig, ScribeConfig, resolve_theme,
 };
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
@@ -291,7 +291,7 @@ impl AppStartup {
             window_transparent: config.appearance.opacity < 1.0,
             bindings: input::Bindings::parse(&config.keybindings),
             saved_geometry: window_id.map(|wid| window_registry.load(wid)),
-            ai_tracker: AiStateTracker::new(config.terminal.ai_session.claude_states.clone()),
+            ai_tracker: AiStateTracker::new(config.terminal.ai_session.ai_states.clone()),
             notification_tracker: notifications::NotificationTracker::new(
                 config.notifications.clone(),
             ),
@@ -460,6 +460,14 @@ fn base_command_palette_entries() -> Vec<CommandPaletteEntry> {
         CommandPaletteEntry {
             label: String::from("Resume Codex Tab"),
             action: AutomationAction::NewCodexResumeTab,
+        },
+        CommandPaletteEntry {
+            label: String::from("New Auggie Tab"),
+            action: AutomationAction::NewAuggieTab,
+        },
+        CommandPaletteEntry {
+            label: String::from("Resume Auggie Tab"),
+            action: AutomationAction::NewAuggieResumeTab,
         },
         CommandPaletteEntry {
             label: String::from("Split Pane Vertical"),
@@ -846,7 +854,7 @@ impl App {
             word_drag_anchor: None, line_drag_anchor: None,
             connection: AppConnectionState { server_connected: false, quit_restore_cleared: false },
             pending_shutdown: None, restore_store: restore_state::RestoreStore::new(), restore_save_pending: None,
-            ai_tracker: AiStateTracker::new(ClaudeStatesConfig::default()),
+            ai_tracker: AiStateTracker::new(AiStateStylesConfig::default()),
             notification_tracker: notifications::NotificationTracker::new(NotificationsConfig::default()),
             notification_tx: None,
             animation: AppAnimationState {
@@ -1043,12 +1051,12 @@ impl App {
                 self.handle_title_changed(*session_id, title);
                 true
             }
-            UiEvent::CodexTaskLabelChanged { session_id, task_label } => {
-                self.handle_codex_task_label_changed(*session_id, task_label);
+            UiEvent::TaskLabelChanged { session_id, provider, task_label } => {
+                self.handle_task_label_changed(*session_id, *provider, task_label);
                 true
             }
-            UiEvent::CodexTaskLabelCleared { session_id } => {
-                self.handle_codex_task_label_cleared(*session_id);
+            UiEvent::TaskLabelCleared { session_id, provider } => {
+                self.handle_task_label_cleared(*session_id, *provider);
                 true
             }
             UiEvent::GitBranch { session_id, branch } => {
@@ -1268,7 +1276,7 @@ impl App {
             // `AiStateCleared` only fires when the tool explicitly goes
             // inactive while the PTY stays alive, which means this pane is
             // back at a normal shell prompt. Persist that reality so cold
-            // restart does not reopen Claude/Codex on a plain shell tab.
+            // restart does not reopen an AI CLI on a plain shell tab.
             pane.launch_binding.kind = restore_state::LaunchKind::Shell;
             self.mark_restore_dirty();
         }
@@ -3109,15 +3117,20 @@ impl App {
         title.clone_into(&mut pane.title);
     }
 
-    /// Handle Codex task-label changes for a session.
-    fn handle_codex_task_label_changed(&mut self, session_id: SessionId, task_label: &str) {
+    /// Handle provider task-label changes for a session.
+    fn handle_task_label_changed(
+        &mut self,
+        session_id: SessionId,
+        provider: AiProvider,
+        task_label: &str,
+    ) {
         if task_label.trim().is_empty() {
             return;
         }
         let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
-        tracing::debug!(%session_id, %task_label, "codex task label changed");
-        pane.codex_task_label = Some(task_label.to_owned());
+        tracing::debug!(%session_id, ?provider, %task_label, "AI task label changed");
+        pane.task_label = Some(task_label.to_owned());
         self.request_redraw();
     }
 
@@ -3329,12 +3342,12 @@ impl App {
         }
     }
 
-    /// Handle explicit Codex task-label clearing for a session.
-    fn handle_codex_task_label_cleared(&mut self, session_id: SessionId) {
+    /// Handle explicit provider task-label clearing for a session.
+    fn handle_task_label_cleared(&mut self, session_id: SessionId, provider: AiProvider) {
         let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
-        tracing::debug!(%session_id, "codex task label cleared");
-        pane.codex_task_label = None;
+        tracing::debug!(%session_id, ?provider, "AI task label cleared");
+        pane.task_label = None;
         self.request_redraw();
     }
 
@@ -3458,7 +3471,7 @@ impl App {
         self.apply_cursor_config(&new_config);
         self.apply_opacity_change(&new_config, plan.opacity_changed());
         self.bindings = input::Bindings::parse(&new_config.keybindings);
-        self.ai_tracker.reconfigure(new_config.terminal.ai_session.claude_states.clone());
+        self.ai_tracker.reconfigure(new_config.terminal.ai_session.ai_states.clone());
         self.notification_tracker.reconfigure(new_config.notifications.clone());
         self.config = new_config;
         self.finish_config_reload(&plan);
@@ -4719,6 +4732,8 @@ impl App {
             LayoutAction::NewClaudeResumeTab => self.handle_new_claude_resume_tab(),
             LayoutAction::NewCodexTab => self.handle_new_codex_tab(),
             LayoutAction::NewCodexResumeTab => self.handle_new_codex_resume_tab(),
+            LayoutAction::NewAuggieTab => self.handle_new_auggie_tab(),
+            LayoutAction::NewAuggieResumeTab => self.handle_new_auggie_resume_tab(),
             LayoutAction::CloseTab => self.handle_close_tab(),
             LayoutAction::NextTab => self.handle_next_tab(),
             LayoutAction::PrevTab => self.handle_prev_tab(),
@@ -4769,6 +4784,8 @@ impl App {
             AutomationAction::NewClaudeResumeTab => self.handle_new_claude_resume_tab(),
             AutomationAction::NewCodexTab => self.handle_new_codex_tab(),
             AutomationAction::NewCodexResumeTab => self.handle_new_codex_resume_tab(),
+            AutomationAction::NewAuggieTab => self.handle_new_auggie_tab(),
+            AutomationAction::NewAuggieResumeTab => self.handle_new_auggie_resume_tab(),
             AutomationAction::SplitVertical => {
                 self.handle_layout_action(LayoutAction::SplitVertical);
             }
@@ -5133,11 +5150,11 @@ impl App {
 
     fn ai_tab_command(provider: AiProvider, resume: bool) -> Vec<String> {
         let shell = scribe_common::shell::default_shell_program();
-        let command = match (provider, resume) {
-            (AiProvider::ClaudeCode, false) => String::from("exec claude"),
-            (AiProvider::ClaudeCode, true) => String::from("exec claude --resume"),
-            (AiProvider::CodexCode, false) => String::from("exec codex"),
-            (AiProvider::CodexCode, true) => String::from("exec codex resume"),
+        let command = if resume {
+            let args = provider.resume_args().join(" ");
+            format!("exec {} {args}", provider.binary_name())
+        } else {
+            format!("exec {}", provider.binary_name())
         };
         vec![shell, String::from("-lic"), command]
     }
@@ -5178,45 +5195,41 @@ impl App {
         self.create_new_tab(Some(Self::ai_tab_command(AiProvider::CodexCode, true)), project_root);
     }
 
+    fn handle_new_auggie_tab(&mut self) {
+        let project_root = self.focused_workspace_project_root();
+        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::Auggie, false)), project_root);
+    }
+
+    fn handle_new_auggie_resume_tab(&mut self) {
+        let project_root = self.focused_workspace_project_root();
+        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::Auggie, true)), project_root);
+    }
+
     fn launch_binding_for_command(
         command: Option<&Vec<String>>,
         inherited_cwd: Option<std::path::PathBuf>,
     ) -> restore_state::LaunchBinding {
         match command {
             None => restore_replay::new_shell_binding(inherited_cwd),
-            Some(argv) if restore_replay::is_ai_command(argv, AiProvider::ClaudeCode, true) => {
-                restore_replay::new_ai_binding(
-                    AiProvider::ClaudeCode,
-                    restore_state::AiResumeMode::Resume,
-                    inherited_cwd,
-                    None,
-                )
+            Some(argv) => {
+                if let Some(provider) = restore_replay::detect_ai_command(argv, true) {
+                    return restore_replay::new_ai_binding(
+                        provider,
+                        restore_state::AiResumeMode::Resume,
+                        inherited_cwd,
+                        None,
+                    );
+                }
+                if let Some(provider) = restore_replay::detect_ai_command(argv, false) {
+                    return restore_replay::new_ai_binding(
+                        provider,
+                        restore_state::AiResumeMode::New,
+                        inherited_cwd,
+                        None,
+                    );
+                }
+                restore_replay::new_custom_binding(argv.clone(), inherited_cwd)
             }
-            Some(argv) if restore_replay::is_ai_command(argv, AiProvider::CodexCode, true) => {
-                restore_replay::new_ai_binding(
-                    AiProvider::CodexCode,
-                    restore_state::AiResumeMode::Resume,
-                    inherited_cwd,
-                    None,
-                )
-            }
-            Some(argv) if restore_replay::is_ai_command(argv, AiProvider::ClaudeCode, false) => {
-                restore_replay::new_ai_binding(
-                    AiProvider::ClaudeCode,
-                    restore_state::AiResumeMode::New,
-                    inherited_cwd,
-                    None,
-                )
-            }
-            Some(argv) if restore_replay::is_ai_command(argv, AiProvider::CodexCode, false) => {
-                restore_replay::new_ai_binding(
-                    AiProvider::CodexCode,
-                    restore_state::AiResumeMode::New,
-                    inherited_cwd,
-                    None,
-                )
-            }
-            Some(argv) => restore_replay::new_custom_binding(argv.clone(), inherited_cwd),
         }
     }
     fn create_new_tab(
@@ -5447,7 +5460,7 @@ impl App {
         self.finalize_copy();
     }
 
-    /// Extract selected text, apply cleanup if Claude Code is active, and
+    /// Extract selected text, apply cleanup if an AI coding session is active, and
     /// write the result to the system clipboard.
     fn finalize_copy(&mut self) {
         let Some(sel) = self.active_selection else { return };
@@ -8749,7 +8762,7 @@ fn build_session_metadata_map(
                 info.session_id,
                 (
                     info.title.as_deref(),
-                    info.codex_task_label.as_deref(),
+                    info.task_label.as_deref().or(info.codex_task_label.as_deref()),
                     info.cwd.as_ref(),
                     info.context.as_ref(),
                     Some(info.shell_name.as_str()),
@@ -8802,7 +8815,7 @@ fn is_codex_session(info: &scribe_common::protocol::SessionInfo) -> bool {
         == Some(AiProvider::CodexCode)
 }
 
-/// Apply stored title, Codex task label, and CWD from a metadata lookup to a
+/// Apply stored title, provider task label, and CWD from a metadata lookup to a
 /// newly created pane during reconnection.
 fn apply_session_metadata(pane: &mut Pane, metadata: &SessionMetadataMap<'_>) {
     if let Some(&(title, task_label, cwd, context, shell_name, _provider, _conversation_id)) =
@@ -8815,7 +8828,7 @@ fn apply_session_metadata(pane: &mut Pane, metadata: &SessionMetadataMap<'_>) {
         }
         if let Some(task_label) = task_label {
             if !task_label.trim().is_empty() {
-                pane.codex_task_label = Some(task_label.to_owned());
+                pane.task_label = Some(task_label.to_owned());
             }
         }
         if let Some(cwd) = cwd {

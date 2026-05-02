@@ -104,7 +104,7 @@ Carries cols, rows, scrollback rows, cursor position/style/visibility, alt-scree
 
 `AiStateChanged` and `AiStateCleared` report AI process state from OSC 1337. `CwdChanged` reports working directory from OSC 7.
 
-`TitleChanged` reports window title from OSC 0/2. `SessionContextChanged` reports shell-emitted remote-host and tmux metadata from OSC 1337 `ScribeContext`. `CodexTaskLabelChanged` and `CodexTaskLabelCleared` report the separate Codex task-label channel used for tab naming. `GitBranch` reports the detected git branch for a session's CWD. `WorkspaceNamed` reports auto-detected workspace names and the project root path. `PromptReceived` carries the session ID, AI provider, and submitted prompt text for display in the prompt bar UI.
+`TitleChanged` reports window title from OSC 0/2. `SessionContextChanged` reports shell-emitted remote-host and tmux metadata from OSC 1337 `ScribeContext`. `TaskLabelChanged` and `TaskLabelCleared` report provider task-label channels used for tab naming, while legacy Codex task-label messages remain accepted for compatibility. `GitBranch` reports the detected git branch for a session's CWD. `WorkspaceNamed` reports auto-detected workspace names and the project root path. `PromptReceived` carries the session ID, AI provider, and submitted prompt text for display in the prompt bar UI.
 
 ### Connection
 
@@ -112,7 +112,7 @@ Carries cols, rows, scrollback rows, cursor position/style/visibility, alt-scree
 
 Only the bootstrap client (launched without `--window-id`) spawns child processes for the other windows in `Welcome`; children ignore the list to prevent fan-out duplication where racing siblings each spawn redundant processes for windows not yet registered in `connected_clients`.
 
-`SessionList` returns all sessions grouped by workspace in response to `ListSessions`. Each [[crates/scribe-common/src/protocol.rs#SessionInfo]] carries the active AI state, AI provider hint, Codex task label, shell basename, session context, CWD, and detected git branch — enough for the client to restore provider-aware titles, remote labels, and status-bar branches without any post-attach metadata fan-out. A batched `workspaces: Vec<WorkspaceListEntry>` field delivers per-workspace names, accent colors, split direction, and project root paths alongside the session list. `WorkspaceInfo` messages still exist for non-attach flows (session creation, auto-naming).
+`SessionList` returns all sessions grouped by workspace in response to `ListSessions`. Each [[crates/scribe-common/src/protocol.rs#SessionInfo]] carries the active AI state, AI provider hint, provider task label, legacy Codex task label, shell basename, session context, CWD, and detected git branch — enough for the client to restore provider-aware titles, remote labels, and status-bar branches without any post-attach metadata fan-out. A batched `workspaces: Vec<WorkspaceListEntry>` field delivers per-workspace names, accent colors, split direction, and project root paths alongside the session list. `WorkspaceInfo` messages still exist for non-attach flows (session creation, auto-naming).
 
 When `SessionList` also includes a workspace tree, that tree is the authoritative workspace layout. The `split_direction` field is only needed for the legacy reconnect fallback where older servers omit the tree and the client must repair the linear default layout once during startup.
 

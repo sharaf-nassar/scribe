@@ -91,6 +91,16 @@ assets = [
     "755",
   ],
   [
+    "../../dist/setup-auggie-hooks.sh",
+    "usr/share/scribe/setup-auggie-hooks.sh",
+    "755",
+  ],
+  [
+    "../../dist/auggie-state.sh",
+    "usr/share/scribe/auggie-state.sh",
+    "755",
+  ],
+  [
     "../../dist/shell-integration/bash/scribe.bash",
     "usr/share/scribe/shell-integration/bash/",
     "644",
@@ -184,6 +194,16 @@ assets = [
   [
     "../../dist/codex-task-label.sh",
     "usr/share/scribe-dev/codex-task-label.sh",
+    "755",
+  ],
+  [
+    "../../dist/setup-auggie-hooks.sh",
+    "usr/share/scribe-dev/setup-auggie-hooks.sh",
+    "755",
+  ],
+  [
+    "../../dist/auggie-state.sh",
+    "usr/share/scribe-dev/auggie-state.sh",
     "755",
   ],
   [

@@ -4,9 +4,9 @@ Shared types and utilities used by every Scribe crate: IPC [[protocol]], identit
 
 ## AI State
 
-Tracks Claude Code and Codex Code process lifecycle by parsing OSC 1337 escape sequences into typed Rust values.
+Tracks supported AI coding tool lifecycles by parsing OSC 1337 escape sequences into typed Rust values.
 
-[[crates/scribe-common/src/ai_state.rs#AiState]] is a five-variant enum (`IdlePrompt`, `Processing`, `WaitingForInput`, `PermissionPrompt`, `Error`) shared by both integrations. [[crates/scribe-common/src/ai_state.rs#AiProvider]] distinguishes `ClaudeCode` from `CodexCode`, and [[crates/scribe-common/src/ai_state.rs#AiProcessState]] carries that provider alongside optional metadata fields (`tool`, `agent`, `model`, `context`, `conversation_id`). The [[pty]] crate's `MetadataParser` produces `AiProcessState` values; the [[server]] broadcasts them to connected clients and preserves backward compatibility by defaulting missing providers to Claude on deserialize.
+[[crates/scribe-common/src/ai_state.rs#AiState]] is a five-variant enum (`IdlePrompt`, `Processing`, `WaitingForInput`, `PermissionPrompt`, `Error`) shared by Claude Code, Codex, and Auggie. [[crates/scribe-common/src/ai_state.rs#AiProvider]] supplies stable provider IDs, binary names, OSC keys, task-label support, and resume arguments; [[crates/scribe-common/src/ai_state.rs#AiProcessState]] carries that provider alongside optional metadata fields (`tool`, `agent`, `model`, `context`, `conversation_id`). The [[pty]] crate's `MetadataParser` produces `AiProcessState` values; the [[server]] broadcasts them to connected clients and preserves backward compatibility by defaulting missing providers to Claude on deserialize.
 
 ## Configuration
 
@@ -22,7 +22,7 @@ Font family, size, weight, ligatures, line padding, cursor shape, opacity, theme
 
 ### AI State Colors
 
-Per-state visual config for Claude Code indicators lives in [[crates/scribe-common/src/config.rs#ClaudeStatesConfig]], which holds one [[crates/scribe-common/src/config.rs#AiStateEntry]] per `AiState` variant.
+Per-state visual config for AI indicators lives in [[crates/scribe-common/src/config.rs#AiStateStylesConfig]], which holds one [[crates/scribe-common/src/config.rs#AiStateEntry]] per `AiState` variant.
 
 Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto-clear timeout (`timeout_secs`), and booleans for tab indicator and pane border. [[crates/scribe-common/src/config.rs#AiColor]] is a polymorphic color type that accepts either a fixed `#rrggbb` hex string or an `"ansi:N"` palette index (0–15) that adapts to the active theme at render time.
 
@@ -40,7 +40,7 @@ Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (f32, 8–32, def
 
 ### Keybindings
 
-[[crates/scribe-common/src/config.rs#KeybindingsConfig]] exposes 50+ configurable actions across pane navigation, workspace splits, tab management, clipboard, scrolling, zoom, and terminal word-motion shortcuts, including explicit Claude Code and Codex open/resume shortcuts.
+[[crates/scribe-common/src/config.rs#KeybindingsConfig]] exposes 50+ configurable actions across pane navigation, workspace splits, tab management, clipboard, scrolling, zoom, and terminal word-motion shortcuts, including explicit Claude Code, Codex, and Auggie open/resume shortcuts.
 
 Each field uses [[crates/scribe-common/src/config.rs#KeyComboList]], which deserializes from either a bare TOML string (`"ctrl+shift+w"`) or an array (`["ctrl+shift+w", "ctrl+w"]`). Up to [[crates/scribe-common/src/config.rs#MAX_BINDINGS]] (5) combos per action are stored. Default bindings are platform-aware: macOS uses `cmd+`-prefixed combos where they do not collide with standard app shortcuts, with close-pane intentionally on `super+ctrl+w`, while other platforms use `ctrl+shift+`-prefixed equivalents.
 

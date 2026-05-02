@@ -87,6 +87,7 @@ function global:prompt {
     __Scribe-Osc "7;file://$(__Scribe-HostName)$(__Scribe-EncodePath $cwd)"
     __Scribe-EmitContext
     __Scribe-Osc '1337;CodexTaskLabelCleared'
+    __Scribe-Osc '1337;AuggieTaskLabelCleared'
     __Scribe-Osc "2;$(__Scribe-SanitizeContext $title)"
     __Scribe-Osc '133;A;click_events=1'
 

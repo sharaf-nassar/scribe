@@ -43,8 +43,8 @@ fn apply_config_key(
         key if key.starts_with("terminal.") => {
             apply_terminal_key(config, key, value)?;
         }
-        key if key.starts_with("claude_states.") => {
-            apply_claude_state_key(&mut config.terminal.ai_session.claude_states, key, value)?;
+        key if key.starts_with("ai_states.") || key.starts_with("claude_states.") => {
+            apply_ai_state_key(&mut config.terminal.ai_session.ai_states, key, value)?;
         }
         key if key.starts_with("keybindings.") => {
             apply_keybindings_key(&mut config.keybindings, key, value)?;
@@ -292,6 +292,7 @@ fn apply_terminal_key(
         | "terminal.claude_copy_cleanup"
         | "terminal.claude_code_integration"
         | "terminal.codex_code_integration"
+        | "terminal.auggie_integration"
         | "terminal.hide_codex_hook_logs"
         | "terminal.preserve_ai_scrollback"
         | "terminal.natural_scroll" => apply_terminal_behavior_key(config, key, value),
@@ -326,12 +327,21 @@ fn apply_terminal_behavior_key(
                 value.as_bool().ok_or("claude_copy_cleanup must be a boolean")?;
         }
         "terminal.claude_code_integration" => {
-            config.terminal.ai_integration.claude_code_integration =
-                value.as_bool().ok_or("claude_code_integration must be a boolean")?;
+            config.terminal.ai_integration.claude_code =
+                scribe_common::config::AiIntegrationToggle::new(
+                    value.as_bool().ok_or("claude_code_integration must be a boolean")?,
+                );
         }
         "terminal.codex_code_integration" => {
-            config.terminal.ai_integration.codex_code_integration =
-                value.as_bool().ok_or("codex_code_integration must be a boolean")?;
+            config.terminal.ai_integration.codex_code =
+                scribe_common::config::AiIntegrationToggle::new(
+                    value.as_bool().ok_or("codex_code_integration must be a boolean")?,
+                );
+        }
+        "terminal.auggie_integration" => {
+            config.terminal.ai_integration.auggie = scribe_common::config::AiIntegrationToggle::new(
+                value.as_bool().ok_or("auggie_integration must be a boolean")?,
+            );
         }
         "terminal.hide_codex_hook_logs" => {
             config.terminal.ai_session.hide_codex_hook_logs =
@@ -530,25 +540,27 @@ fn apply_notifications_key(
     Ok(())
 }
 
-/// Apply a `claude_states.<state>.<field>` settings change.
-fn apply_claude_state_key(
-    states: &mut scribe_common::config::ClaudeStatesConfig,
+/// Apply an `ai_states.<state>.<field>` settings change.
+fn apply_ai_state_key(
+    states: &mut scribe_common::config::AiStateStylesConfig,
     key: &str,
     value: &serde_json::Value,
 ) -> Result<(), String> {
-    // Key format: "claude_states.<state>.<field>"
+    // Key format: "ai_states.<state>.<field>". The legacy
+    // "claude_states." prefix remains accepted for old settings surfaces.
     let rest = key
-        .strip_prefix("claude_states.")
-        .ok_or_else(|| format!("invalid claude_states key: {key}"))?;
+        .strip_prefix("ai_states.")
+        .or_else(|| key.strip_prefix("claude_states."))
+        .ok_or_else(|| format!("invalid AI state key: {key}"))?;
     let (state_name, field) =
-        rest.split_once('.').ok_or_else(|| format!("invalid claude_states key: {key}"))?;
+        rest.split_once('.').ok_or_else(|| format!("invalid AI state key: {key}"))?;
 
     let entry = match state_name {
         "processing" => &mut states.processing,
         "idle_prompt" | "waiting_for_input" => &mut states.waiting_for_input,
         "permission_prompt" => &mut states.permission_prompt,
         "error" => &mut states.error,
-        _ => return Err(format!("unknown claude state: {state_name}")),
+        _ => return Err(format!("unknown AI state: {state_name}")),
     };
 
     match field {
@@ -647,6 +659,8 @@ fn apply_keybinding_tab_actions(
         "new_claude_resume_tab" => kb.new_claude_resume_tab = list.clone(),
         "new_codex_tab" => kb.new_codex_tab = list.clone(),
         "new_codex_resume_tab" => kb.new_codex_resume_tab = list.clone(),
+        "new_auggie_tab" => kb.new_auggie_tab = list.clone(),
+        "new_auggie_resume_tab" => kb.new_auggie_resume_tab = list.clone(),
         "close_tab" => kb.close_tab = list.clone(),
         "next_tab" => kb.next_tab = list.clone(),
         "prev_tab" => kb.prev_tab = list.clone(),
@@ -801,6 +815,6 @@ mod tests {
         )
         .expect("codex toggle should apply");
 
-        assert!(!config.terminal.ai_integration.codex_code_integration);
+        assert!(!config.terminal.ai_integration.codex_code.enabled());
     }
 }

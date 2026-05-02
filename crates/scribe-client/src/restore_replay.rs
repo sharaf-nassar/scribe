@@ -52,22 +52,21 @@ struct ReplayRebuildContext<'a> {
 
 pub fn is_ai_command(argv: &[String], provider: AiProvider, resume: bool) -> bool {
     let tokens: Vec<&str> = argv.iter().flat_map(|part| part.split_whitespace()).collect();
-    let binary = match provider {
-        AiProvider::ClaudeCode => "claude",
-        AiProvider::CodexCode => "codex",
-    };
+    let binary = provider.binary_name();
 
     if resume {
-        let resume_flag = match provider {
-            AiProvider::ClaudeCode => "--resume",
-            AiProvider::CodexCode => "resume",
-        };
-        tokens.windows(2).any(|parts| {
-            parts.first().copied() == Some(binary) && parts.get(1).copied() == Some(resume_flag)
+        let resume_args = provider.resume_args();
+        tokens.windows(1 + resume_args.len()).any(|parts| {
+            parts.first().copied() == Some(binary)
+                && parts.get(1..).is_some_and(|args| args == resume_args)
         })
     } else {
         tokens.contains(&binary)
     }
+}
+
+pub fn detect_ai_command(argv: &[String], resume: bool) -> Option<AiProvider> {
+    AiProvider::all().iter().copied().find(|provider| is_ai_command(argv, *provider, resume))
 }
 
 pub fn new_shell_binding(cwd: Option<PathBuf>) -> LaunchBinding {
@@ -132,32 +131,23 @@ pub fn command_argv(command: &ReplayCommand) -> Option<Vec<String>> {
     match command {
         ReplayCommand::Shell => None,
         ReplayCommand::Custom(argv) => Some(argv.clone()),
-        ReplayCommand::AiTargeted { provider: AiProvider::ClaudeCode, conversation_id } => {
+        ReplayCommand::AiTargeted { provider, conversation_id } => {
             let conversation_id = shell_single_quote(conversation_id);
+            let args = provider.resume_args().join(" ");
             Some(vec![
                 scribe_common::shell::default_shell_program(),
                 String::from("-lic"),
-                format!("exec claude --resume {conversation_id}"),
+                format!("exec {} {args} {conversation_id}", provider.binary_name()),
             ])
         }
-        ReplayCommand::AiTargeted { provider: AiProvider::CodexCode, conversation_id } => {
-            let conversation_id = shell_single_quote(conversation_id);
+        ReplayCommand::AiGeneric { provider } => {
+            let args = provider.resume_args().join(" ");
             Some(vec![
                 scribe_common::shell::default_shell_program(),
                 String::from("-lic"),
-                format!("exec codex resume {conversation_id}"),
+                format!("exec {} {args}", provider.binary_name()),
             ])
         }
-        ReplayCommand::AiGeneric { provider: AiProvider::ClaudeCode } => Some(vec![
-            scribe_common::shell::default_shell_program(),
-            String::from("-lic"),
-            String::from("exec claude --resume"),
-        ]),
-        ReplayCommand::AiGeneric { provider: AiProvider::CodexCode } => Some(vec![
-            scribe_common::shell::default_shell_program(),
-            String::from("-lic"),
-            String::from("exec codex resume"),
-        ]),
     }
 }
 
@@ -467,4 +457,43 @@ fn snapshot_direction(direction: SplitDirection) -> LayoutDirection {
 /// before the epoch (which the prompt-bar timestamp can never be).
 fn system_time_to_unix_seconds(time: std::time::SystemTime) -> Option<u64> {
     time.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReplayCommand, command_argv, detect_ai_command, is_ai_command};
+    use scribe_common::ai_state::AiProvider;
+
+    #[test]
+    fn detects_auggie_new_and_resume_commands() {
+        let new_argv =
+            vec![String::from("/bin/bash"), String::from("-lic"), String::from("exec auggie")];
+        let resume_argv = vec![
+            String::from("/bin/bash"),
+            String::from("-lic"),
+            String::from("exec auggie --resume"),
+        ];
+
+        assert!(is_ai_command(&new_argv, AiProvider::Auggie, false));
+        assert_eq!(detect_ai_command(&new_argv, false), Some(AiProvider::Auggie));
+        assert!(is_ai_command(&resume_argv, AiProvider::Auggie, true));
+        assert_eq!(detect_ai_command(&resume_argv, true), Some(AiProvider::Auggie));
+    }
+
+    #[test]
+    fn builds_auggie_resume_argv() {
+        let generic = command_argv(&ReplayCommand::AiGeneric { provider: AiProvider::Auggie })
+            .expect("generic Auggie resume should have argv");
+        assert_eq!(generic.get(2).map(String::as_str), Some("exec auggie --resume"));
+
+        let targeted = command_argv(&ReplayCommand::AiTargeted {
+            provider: AiProvider::Auggie,
+            conversation_id: String::from("conv'42"),
+        })
+        .expect("targeted Auggie resume should have argv");
+        assert_eq!(
+            targeted.get(2).map(String::as_str),
+            Some("exec auggie --resume 'conv'\"'\"'42'")
+        );
+    }
 }

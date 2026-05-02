@@ -40,7 +40,7 @@ The [[crates/scribe-pty/src/metadata.rs#MetadataParser]] is a stateful parser th
 
 ### Metadata Events
 
-Metadata events cover CWD, title, Codex task label, AI state, prompt marks, and BEL updates extracted from OSC sequences and control bytes.
+Metadata events cover CWD, title, provider task label, AI state, prompt text, prompt marks, and BEL updates extracted from OSC sequences and control bytes.
 
 ### OSC 7 — Working Directory
 
@@ -52,17 +52,19 @@ Extracts the title string from the second parameter, truncated to 4096 character
 
 ### OSC 1337 — AI State
 
-Two named provider formats plus a Claude-compatible legacy format are supported.
+Named provider formats plus a Claude-compatible legacy format are supported.
 
-The primary formats are `ClaudeState=<state>[;key=value...]` and `CodexState=<state>[;key=value...]`, where state is one of idle_prompt, processing, waiting_for_input, permission_prompt, or error. Additional fields (tool, agent, model, context, conversation_id) arrive in subsequent semicolon-delimited parameters, each capped at 256 characters. A legacy format `AiState=state=<state>;key=val...` is also supported and is treated as Claude for compatibility. The special value `<Provider>State=inactive` emits `AiStateCleared`.
+The primary formats are `ClaudeState=<state>[;key=value...]`, `CodexState=<state>[;key=value...]`, and `AuggieState=<state>[;key=value...]`, where state is one of idle_prompt, processing, waiting_for_input, permission_prompt, or error. Additional fields (tool, agent, model, context, conversation_id) arrive in subsequent semicolon-delimited parameters, each capped at 256 characters. A legacy format `AiState=state=<state>;key=val...` is also supported and is treated as Claude for compatibility. The special value `<Provider>State=inactive` emits `AiStateCleared`.
 
-Codex hooks also use OSC 1337 for a separate task-label channel. `CodexTaskLabel=<label>` sets the short, sanitized task label shown in the tab bar, and `CodexTaskLabelCleared` clears it without disturbing the underlying shell title.
+Codex and Auggie hooks also use OSC 1337 for separate task-label channels. `<Provider>TaskLabel=<label>` sets the short, sanitized task label shown in the tab bar, and `<Provider>TaskLabelCleared` clears it without disturbing the underlying shell title.
 
 ### OSC 1337 — Prompt Text
 
-`ClaudePrompt=<text>` and `CodexPrompt=<text>` carry the user's submitted prompt, capped at 256 characters. Parsed into `MetadataEvent::PromptReceived` with provider and sanitized text.
+`ClaudePrompt=<text>`, `CodexPrompt=<text>`, and `AuggiePrompt=<text>` carry the user's submitted prompt, capped at 256 characters.
 
-Empty prompt payloads are silently dropped. The provider is set to `ClaudeCode` or `CodexCode` based on the prefix. Text is truncated at 256 bytes to bound IPC message size.
+Parsed into `MetadataEvent::PromptReceived` with provider and sanitized text. Auggie emits this from Augment's `Stop` hook because `includeConversationData` is only documented for `Stop`, so prompt-bar updates arrive after the response completes.
+
+Empty prompt payloads are silently dropped. The provider is set from the prefix. Text is truncated at 256 bytes to bound IPC message size.
 
 ### OSC 133 — Prompt Marks
 
@@ -92,7 +94,7 @@ A real ED 3 resets `display_offset` to 0 inside alacritty_terminal's `clear_hist
 
 When a later ED 3 arrives in the same scrollback epoch, the PTY reader trims the server Term back to that epoch baseline and sends [[crates/scribe-common/src/protocol.rs#ServerMessage]]`::TrimScrollback` before forwarding the redraw bytes.
 
-The client flushes any queued PTY output for that pane, trims its own Term back to the same baseline, and then applies the new bytes. This keeps committed Claude/Codex transcript history while preventing repeated inline redraws from stacking duplicate frames above it. Because [[crates/scribe-client/src/pane.rs#Pane]]`::prompt_marks` and `input_start` store positions as "lines from the very top of scrollback (0 = oldest)", the client also calls [[crates/scribe-client/src/pane.rs#shift_absolute_marks_after_trim]] with the dropped-row count so split-scroll's pin math, prompt jump, and scrollbar markers continue to point at the right rows after each trim.
+The client flushes any queued PTY output for that pane, trims its own Term back to the same baseline, and then applies the new bytes. This keeps committed AI transcript history while preventing repeated inline redraws from stacking duplicate frames above it. Because [[crates/scribe-client/src/pane.rs#Pane]]`::prompt_marks` and `input_start` store positions as "lines from the very top of scrollback (0 = oldest)", the client also calls [[crates/scribe-client/src/pane.rs#shift_absolute_marks_after_trim]] with the dropped-row count so split-scroll's pin math, prompt jump, and scrollbar markers continue to point at the right rows after each trim.
 
 ### State Machine
 

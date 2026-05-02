@@ -625,6 +625,15 @@
           </div>
           <div class="setting-row">
             <div class="setting-info">
+              <div class="setting-label">Auggie Integration</div>
+              <div class="setting-desc">Show AI state indicators for Auggie sessions in tab bars and pane borders</div>
+            </div>
+            <div class="toggle on" data-key="terminal.auggie_integration">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
               <div class="setting-label">Clipboard Cleanup</div>
               <div class="setting-desc">Dedent and unwrap copied text during AI sessions</div>
             </div>
@@ -736,78 +745,78 @@
           </div>
           <!-- Processing -->
           <div class="setting-row">
-            <div class="setting-info"><div class="setting-label">Processing</div><div class="setting-desc">Claude or Codex is thinking</div></div>
+            <div class="setting-info"><div class="setting-label">Processing</div><div class="setting-desc">The assistant is thinking</div></div>
             <div style="display:flex;flex-direction:column;align-items:center;gap:2px;">
-              <div class="toggle on" data-key="claude_states.processing.tab_indicator"><div class="toggle-knob"></div></div>
+              <div class="toggle on" data-key="ai_states.processing.tab_indicator"><div class="toggle-knob"></div></div>
               <span style="font-size:9px;opacity:0.4;">Tab</span>
             </div>
             <div style="display:flex;flex-direction:column;align-items:center;gap:2px;">
-              <div class="toggle on" data-key="claude_states.processing.pane_border"><div class="toggle-knob"></div></div>
+              <div class="toggle on" data-key="ai_states.processing.pane_border"><div class="toggle-knob"></div></div>
               <span style="font-size:9px;opacity:0.4;">Pane</span>
             </div>
-            <div class="color-swatch" data-key="claude_states.processing.color" style="background:#22c55e;margin-left:8px;"><input type="color" value="#22c55e"></div>
-            <div class="number-control" data-key="claude_states.processing.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">1400</div><div class="number-btn">+</div></div>
-            <div class="number-control" data-key="claude_states.processing.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">0</div><div class="number-btn">+</div></div>
+            <div class="color-swatch" data-key="ai_states.processing.color" style="background:#22c55e;margin-left:8px;"><input type="color" value="#22c55e"></div>
+            <div class="number-control" data-key="ai_states.processing.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">1400</div><div class="number-btn">+</div></div>
+            <div class="number-control" data-key="ai_states.processing.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">0</div><div class="number-btn">+</div></div>
           </div>
           <!-- Idle Prompt -->
           <div class="setting-row">
             <div class="setting-info"><div class="setting-label">Idle Prompt</div><div class="setting-desc">The assistant finished and is waiting for the next prompt</div></div>
             <div style="display:flex;flex-direction:column;align-items:center;gap:2px;">
-              <div class="toggle on" data-key="claude_states.idle_prompt.tab_indicator"><div class="toggle-knob"></div></div>
+              <div class="toggle on" data-key="ai_states.idle_prompt.tab_indicator"><div class="toggle-knob"></div></div>
               <span style="font-size:9px;opacity:0.4;">Tab</span>
             </div>
             <div style="display:flex;flex-direction:column;align-items:center;gap:2px;">
-              <div class="toggle on" data-key="claude_states.idle_prompt.pane_border"><div class="toggle-knob"></div></div>
+              <div class="toggle on" data-key="ai_states.idle_prompt.pane_border"><div class="toggle-knob"></div></div>
               <span style="font-size:9px;opacity:0.4;">Pane</span>
             </div>
-            <div class="color-swatch" data-key="claude_states.idle_prompt.color" style="background:#ffa51a;margin-left:8px;"><input type="color" value="#ffa51a"></div>
-            <div class="number-control" data-key="claude_states.idle_prompt.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">2000</div><div class="number-btn">+</div></div>
-            <div class="number-control" data-key="claude_states.idle_prompt.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">10</div><div class="number-btn">+</div></div>
+            <div class="color-swatch" data-key="ai_states.idle_prompt.color" style="background:#ffa51a;margin-left:8px;"><input type="color" value="#ffa51a"></div>
+            <div class="number-control" data-key="ai_states.idle_prompt.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">2000</div><div class="number-btn">+</div></div>
+            <div class="number-control" data-key="ai_states.idle_prompt.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">10</div><div class="number-btn">+</div></div>
           </div>
           <!-- Waiting for Input -->
           <div class="setting-row">
             <div class="setting-info"><div class="setting-label">Waiting for Input</div><div class="setting-desc">The assistant asked you a question</div></div>
             <div style="display:flex;flex-direction:column;align-items:center;gap:2px;">
-              <div class="toggle on" data-key="claude_states.waiting_for_input.tab_indicator"><div class="toggle-knob"></div></div>
+              <div class="toggle on" data-key="ai_states.waiting_for_input.tab_indicator"><div class="toggle-knob"></div></div>
               <span style="font-size:9px;opacity:0.4;">Tab</span>
             </div>
             <div style="display:flex;flex-direction:column;align-items:center;gap:2px;">
-              <div class="toggle on" data-key="claude_states.waiting_for_input.pane_border"><div class="toggle-knob"></div></div>
+              <div class="toggle on" data-key="ai_states.waiting_for_input.pane_border"><div class="toggle-knob"></div></div>
               <span style="font-size:9px;opacity:0.4;">Pane</span>
             </div>
-            <div class="color-swatch" data-key="claude_states.waiting_for_input.color" style="background:#ff8c00;margin-left:8px;"><input type="color" value="#ff8c00"></div>
-            <div class="number-control" data-key="claude_states.waiting_for_input.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">2000</div><div class="number-btn">+</div></div>
-            <div class="number-control" data-key="claude_states.waiting_for_input.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">0</div><div class="number-btn">+</div></div>
+            <div class="color-swatch" data-key="ai_states.waiting_for_input.color" style="background:#ff8c00;margin-left:8px;"><input type="color" value="#ff8c00"></div>
+            <div class="number-control" data-key="ai_states.waiting_for_input.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">2000</div><div class="number-btn">+</div></div>
+            <div class="number-control" data-key="ai_states.waiting_for_input.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">0</div><div class="number-btn">+</div></div>
           </div>
           <!-- Permission Prompt -->
           <div class="setting-row">
             <div class="setting-info"><div class="setting-label">Permission Prompt</div><div class="setting-desc">The assistant needs tool approval</div></div>
             <div style="display:flex;flex-direction:column;align-items:center;gap:2px;">
-              <div class="toggle on" data-key="claude_states.permission_prompt.tab_indicator"><div class="toggle-knob"></div></div>
+              <div class="toggle on" data-key="ai_states.permission_prompt.tab_indicator"><div class="toggle-knob"></div></div>
               <span style="font-size:9px;opacity:0.4;">Tab</span>
             </div>
             <div style="display:flex;flex-direction:column;align-items:center;gap:2px;">
-              <div class="toggle on" data-key="claude_states.permission_prompt.pane_border"><div class="toggle-knob"></div></div>
+              <div class="toggle on" data-key="ai_states.permission_prompt.pane_border"><div class="toggle-knob"></div></div>
               <span style="font-size:9px;opacity:0.4;">Pane</span>
             </div>
-            <div class="color-swatch" data-key="claude_states.permission_prompt.color" style="background:#ef4444;margin-left:8px;"><input type="color" value="#ef4444"></div>
-            <div class="number-control" data-key="claude_states.permission_prompt.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">1500</div><div class="number-btn">+</div></div>
-            <div class="number-control" data-key="claude_states.permission_prompt.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">0</div><div class="number-btn">+</div></div>
+            <div class="color-swatch" data-key="ai_states.permission_prompt.color" style="background:#ef4444;margin-left:8px;"><input type="color" value="#ef4444"></div>
+            <div class="number-control" data-key="ai_states.permission_prompt.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">1500</div><div class="number-btn">+</div></div>
+            <div class="number-control" data-key="ai_states.permission_prompt.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">0</div><div class="number-btn">+</div></div>
           </div>
           <!-- Error -->
           <div class="setting-row">
             <div class="setting-info"><div class="setting-label">Error</div><div class="setting-desc">Something went wrong in the active assistant session</div></div>
             <div style="display:flex;flex-direction:column;align-items:center;gap:2px;">
-              <div class="toggle on" data-key="claude_states.error.tab_indicator"><div class="toggle-knob"></div></div>
+              <div class="toggle on" data-key="ai_states.error.tab_indicator"><div class="toggle-knob"></div></div>
               <span style="font-size:9px;opacity:0.4;">Tab</span>
             </div>
             <div style="display:flex;flex-direction:column;align-items:center;gap:2px;">
-              <div class="toggle on" data-key="claude_states.error.pane_border"><div class="toggle-knob"></div></div>
+              <div class="toggle on" data-key="ai_states.error.pane_border"><div class="toggle-knob"></div></div>
               <span style="font-size:9px;opacity:0.4;">Pane</span>
             </div>
-            <div class="color-swatch" data-key="claude_states.error.color" style="background:#9933cc;margin-left:8px;"><input type="color" value="#9933cc"></div>
-            <div class="number-control" data-key="claude_states.error.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">0</div><div class="number-btn">+</div></div>
-            <div class="number-control" data-key="claude_states.error.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">3</div><div class="number-btn">+</div></div>
+            <div class="color-swatch" data-key="ai_states.error.color" style="background:#9933cc;margin-left:8px;"><input type="color" value="#9933cc"></div>
+            <div class="number-control" data-key="ai_states.error.pulse_ms" data-min="0" data-max="5000" data-step="100"><div class="number-btn">&minus;</div><div class="number-value">0</div><div class="number-btn">+</div></div>
+            <div class="number-control" data-key="ai_states.error.timeout_secs" data-min="0" data-max="300" data-step="1"><div class="number-btn">&minus;</div><div class="number-value">3</div><div class="number-btn">+</div></div>
           </div>
         </div>
       </div>
@@ -1040,6 +1049,18 @@
             <div class="setting-info"><div class="setting-label">Resume Codex Tab</div></div>
             <div class="keybinding-cell" data-action="new_codex_resume_tab">
               <button class="kb-reset-btn" data-action="new_codex_resume_tab" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">New Auggie Tab</div></div>
+            <div class="keybinding-cell" data-action="new_auggie_tab">
+              <button class="kb-reset-btn" data-action="new_auggie_tab" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Resume Auggie Tab</div></div>
+            <div class="keybinding-cell" data-action="new_auggie_resume_tab">
+              <button class="kb-reset-btn" data-action="new_auggie_resume_tab" title="Reset to default">&#8635;</button>
             </div>
           </div>
           <div class="setting-row">

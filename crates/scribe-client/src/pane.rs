@@ -42,8 +42,8 @@ pub struct Pane {
     pub workspace_name: Option<String>,
     pub title: String,
     pub shell_name: String,
-    /// Preferred tab label while Codex is actively working on a task.
-    pub codex_task_label: Option<String>,
+    /// Preferred tab label while an AI provider is actively working on a task.
+    pub task_label: Option<String>,
     /// Current working directory reported by the shell via OSC 7.
     pub cwd: Option<PathBuf>,
     /// Current shell/session context (remote host and tmux session).
@@ -178,7 +178,7 @@ impl Pane {
             workspace_name: None,
             title: String::from("shell"),
             shell_name: String::from("shell"),
-            codex_task_label: None,
+            task_label: None,
             cwd: None,
             session_context: None,
             git_branch: None,
@@ -348,9 +348,9 @@ impl Pane {
         (self.rect.x + eff.left, self.rect.y + tbh + prompt_bar_height + eff.top)
     }
 
-    /// Prefer a Codex task label over the terminal title when one is active.
+    /// Prefer a provider task label over the terminal title when one is active.
     pub fn preferred_tab_title(&self) -> &str {
-        self.codex_task_label.as_deref().unwrap_or(&self.title)
+        self.task_label.as_deref().unwrap_or(&self.title)
     }
 
     /// Pixel height of the prompt bar for this pane.

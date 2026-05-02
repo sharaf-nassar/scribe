@@ -82,8 +82,9 @@ function __scribe_fish_prompt --on-event fish_prompt
     # OSC 1337 — report remote host/tmux context
     __scribe_emit_context
 
-    # Clear any stale Codex task label once control returns to the shell.
+    # Clear any stale provider task label once control returns to the shell.
     printf '\e]1337;CodexTaskLabelCleared\e\\'
+    printf '\e]1337;AuggieTaskLabelCleared\e\\'
 
     # OSC 2 — window title (basename of CWD)
     printf '\e]2;%s\e\\' (basename "$PWD")

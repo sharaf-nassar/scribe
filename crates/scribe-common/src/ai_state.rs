@@ -6,13 +6,87 @@ use serde::{Deserialize, Serialize};
 pub enum AiProvider {
     ClaudeCode,
     CodexCode,
+    #[serde(rename = "auggie", alias = "auggie_code")]
+    Auggie,
 }
 
 fn default_ai_provider() -> AiProvider {
     AiProvider::ClaudeCode
 }
 
-/// Core AI process states emitted by Claude Code via OSC 1337 hooks.
+const AI_PROVIDERS: [AiProvider; 3] =
+    [AiProvider::ClaudeCode, AiProvider::CodexCode, AiProvider::Auggie];
+
+impl AiProvider {
+    #[must_use]
+    pub fn all() -> &'static [AiProvider] {
+        &AI_PROVIDERS
+    }
+
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            AiProvider::ClaudeCode => "claude_code",
+            AiProvider::CodexCode => "codex_code",
+            AiProvider::Auggie => "auggie",
+        }
+    }
+
+    #[must_use]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            AiProvider::ClaudeCode => "Claude Code",
+            AiProvider::CodexCode => "Codex",
+            AiProvider::Auggie => "Auggie",
+        }
+    }
+
+    #[must_use]
+    pub fn binary_name(self) -> &'static str {
+        match self {
+            AiProvider::ClaudeCode => "claude",
+            AiProvider::CodexCode => "codex",
+            AiProvider::Auggie => "auggie",
+        }
+    }
+
+    #[must_use]
+    pub fn state_osc_key(self) -> &'static str {
+        match self {
+            AiProvider::ClaudeCode => "ClaudeState",
+            AiProvider::CodexCode => "CodexState",
+            AiProvider::Auggie => "AuggieState",
+        }
+    }
+
+    #[must_use]
+    pub fn prompt_osc_key(self) -> &'static str {
+        match self {
+            AiProvider::ClaudeCode => "ClaudePrompt",
+            AiProvider::CodexCode => "CodexPrompt",
+            AiProvider::Auggie => "AuggiePrompt",
+        }
+    }
+
+    #[must_use]
+    pub fn task_label_osc_key(self) -> Option<&'static str> {
+        match self {
+            AiProvider::ClaudeCode => None,
+            AiProvider::CodexCode => Some("CodexTaskLabel"),
+            AiProvider::Auggie => Some("AuggieTaskLabel"),
+        }
+    }
+
+    #[must_use]
+    pub fn resume_args(self) -> &'static [&'static str] {
+        match self {
+            AiProvider::ClaudeCode | AiProvider::Auggie => &["--resume"],
+            AiProvider::CodexCode => &["resume"],
+        }
+    }
+}
+
+/// Core AI process states emitted by AI coding CLIs via OSC 1337 hooks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiState {
@@ -24,7 +98,7 @@ pub enum AiState {
 }
 
 /// Full AI process state with optional metadata keys.
-/// Parsed from: `ESC ] 1337 ; ClaudeState=<state> [; key=value]... ST`
+/// Parsed from: `ESC ] 1337 ; <Provider>State=<state> [; key=value]... ST`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiProcessState {
     #[serde(default = "default_ai_provider")]

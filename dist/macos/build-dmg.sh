@@ -124,6 +124,8 @@ cp "${DIST_DIR}/setup-claude-hooks.sh" "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/detect-claude-question.sh" "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/setup-codex-hooks.sh" "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/detect-codex-question.sh" "${RESOURCES_DIR}/"
+cp "${DIST_DIR}/setup-auggie-hooks.sh" "${RESOURCES_DIR}/"
+cp "${DIST_DIR}/auggie-state.sh" "${RESOURCES_DIR}/"
 cp -R "${DIST_DIR}/shell-integration" "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/macos/com.scribe.server.plist" "${RESOURCES_DIR}/"
 
