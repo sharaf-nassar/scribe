@@ -11,7 +11,7 @@
 
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nix::sys::socket::{self, AddressFamily, Backlog, MsgFlags, SockFlag, SockType, UnixAddr};
@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 use unix_ancillary::{AncillaryData, SocketAncillary};
 
 use scribe_common::ai_state::{AiProcessState, AiProvider};
+use scribe_common::app::current_identity;
 use scribe_common::error::ScribeError;
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::SessionContext;
@@ -44,12 +45,15 @@ const HANDOFF_VERSION: u32 = 5;
 /// Magic bytes the receiver sends to request an upgrade.
 const UPGRADE_REQUEST: &[u8] = b"SCRIBE_UPGRADE";
 
+/// Command-line flag required on handoff receivers.
+const UPGRADE_ARG: &str = "--upgrade";
+
 /// Magic bytes the receiver sends after successful fd reception.
 const ACK: &[u8] = b"ACK";
 
-/// Maximum serialised state size we accept (1 GiB). Prevents a rogue peer
+/// Maximum serialised state size we accept (256 MiB). Prevents a rogue peer
 /// from making us allocate unbounded memory.
-const MAX_STATE_SIZE: u32 = 1024 * 1024 * 1024;
+const MAX_STATE_SIZE: u32 = 256 * 1024 * 1024;
 
 /// Maximum number of PTY fds we support in a single handoff.
 const MAX_FDS: usize = 1024;
@@ -133,6 +137,12 @@ pub struct HandoffWorkspace {
 struct HandoffPayload {
     state_bytes: Vec<u8>,
     fds: Vec<Arc<OwnedFd>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PeerIdentity {
+    uid: u32,
+    pid: Option<i32>,
 }
 
 // ── Sender (old server) ─────────────────────────────────────────────
@@ -253,7 +263,7 @@ async fn process_handoff_peer(
 }
 
 fn receive_upgrade_request(peer_fd: &OwnedFd) -> Result<(), ScribeError> {
-    verify_peer_uid(peer_fd)?;
+    verify_peer_identity(peer_fd)?;
     read_upgrade_request(peer_fd.as_raw_fd())?;
     info!("received upgrade request from new server");
     Ok(())
@@ -316,38 +326,154 @@ fn prepare_handoff_socket(path: &PathBuf) -> Result<(), ScribeError> {
     Ok(())
 }
 
-/// Verify the peer's UID matches our own.
+/// Verify the peer is the same UID and, where the platform exposes the peer
+/// PID safely, that it is the installed Scribe server running in upgrade mode.
 ///
 /// Linux: `SO_PEERCRED` via `getsockopt`.
-/// macOS: `getpeereid()` via nix.
-fn verify_peer_uid(fd: &OwnedFd) -> Result<(), ScribeError> {
-    let peer_uid = get_peer_uid(fd)?;
+/// macOS: `getpeereid()` plus `LOCAL_PEERPID` via nix.
+fn verify_peer_identity(fd: &OwnedFd) -> Result<(), ScribeError> {
+    let peer = get_peer_identity(fd)?;
     let expected = current_uid();
-    if peer_uid != expected {
+    if peer.uid != expected {
         return Err(ScribeError::IpcError {
-            reason: format!("handoff peer UID mismatch: got {peer_uid}, expected {expected}"),
+            reason: format!("handoff peer UID mismatch: got {}, expected {expected}", peer.uid),
         });
     }
 
-    debug!(uid = expected, "handoff peer UID verified");
+    verify_peer_process(&peer)?;
+
+    debug!(uid = expected, pid = peer.pid, "handoff peer identity verified");
     Ok(())
 }
 
 /// Linux: use `SO_PEERCRED` via nix `getsockopt`.
 #[cfg(target_os = "linux")]
-fn get_peer_uid(fd: &OwnedFd) -> Result<u32, ScribeError> {
+fn get_peer_identity(fd: &OwnedFd) -> Result<PeerIdentity, ScribeError> {
     let cred = socket::getsockopt(fd, socket::sockopt::PeerCredentials).map_err(|e| {
         ScribeError::IpcError { reason: format!("handoff getsockopt(SO_PEERCRED) failed: {e}") }
     })?;
-    Ok(cred.uid())
+    Ok(PeerIdentity { uid: cred.uid(), pid: Some(cred.pid()) })
 }
 
 /// macOS: use nix's safe `getpeereid()` wrapper.
-#[cfg(not(target_os = "linux"))]
-fn get_peer_uid(fd: &OwnedFd) -> Result<u32, ScribeError> {
+#[cfg(target_os = "macos")]
+fn get_peer_identity(fd: &OwnedFd) -> Result<PeerIdentity, ScribeError> {
+    let (uid, _gid) = nix::unistd::getpeereid(fd)
+        .map_err(|e| ScribeError::IpcError { reason: format!("handoff getpeereid failed: {e}") })?;
+    let pid = socket::getsockopt(fd, socket::sockopt::LocalPeerPid).map_err(|e| {
+        ScribeError::IpcError { reason: format!("handoff getsockopt(LOCAL_PEERPID) failed: {e}") }
+    })?;
+    Ok(PeerIdentity { uid: uid.as_raw(), pid: Some(pid) })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn get_peer_identity(fd: &OwnedFd) -> Result<PeerIdentity, ScribeError> {
     nix::unistd::getpeereid(fd)
-        .map(|(uid, _gid)| uid.as_raw())
+        .map(|(uid, _gid)| PeerIdentity { uid: uid.as_raw(), pid: None })
         .map_err(|e| ScribeError::IpcError { reason: format!("handoff getpeereid failed: {e}") })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_peer_process(peer: &PeerIdentity) -> Result<(), ScribeError> {
+    let Some(pid) = peer.pid else {
+        return Err(ScribeError::IpcError { reason: "handoff peer PID unavailable".to_owned() });
+    };
+    if pid <= 0 {
+        return Err(ScribeError::IpcError { reason: format!("handoff peer PID invalid: {pid}") });
+    }
+
+    verify_peer_cmdline(pid)?;
+    verify_peer_executable(pid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn verify_peer_process(_peer: &PeerIdentity) -> Result<(), ScribeError> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_peer_cmdline(pid: i32) -> Result<(), ScribeError> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).map_err(|e| {
+        ScribeError::IpcError { reason: format!("handoff could not read peer cmdline: {e}") }
+    })?;
+    let has_upgrade_arg = cmdline.split(|byte| *byte == 0).any(|arg| arg == UPGRADE_ARG.as_bytes());
+    if !has_upgrade_arg {
+        return Err(ScribeError::IpcError {
+            reason: "handoff peer is not running in --upgrade mode".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_peer_cmdline(pid: i32) -> Result<(), ScribeError> {
+    let args = crate::macos_proc::macos_proc_args(pid).ok_or_else(|| ScribeError::IpcError {
+        reason: "handoff could not read peer cmdline".to_owned(),
+    })?;
+    let has_upgrade_arg = args.iter().any(|arg| arg == UPGRADE_ARG.as_bytes());
+    if !has_upgrade_arg {
+        return Err(ScribeError::IpcError {
+            reason: "handoff peer is not running in --upgrade mode".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_peer_executable(pid: i32) -> Result<(), ScribeError> {
+    let peer_exe = std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|e| {
+        ScribeError::IpcError { reason: format!("handoff could not read peer executable: {e}") }
+    })?;
+    let allowed = allowed_server_executable_paths();
+    if allowed.iter().any(|path| same_executable_path(&peer_exe, path)) {
+        return Ok(());
+    }
+
+    Err(ScribeError::IpcError {
+        reason: format!(
+            "handoff peer executable {} is not an allowed server binary",
+            peer_exe.display()
+        ),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn verify_peer_executable(pid: i32) -> Result<(), ScribeError> {
+    let peer_exe = crate::macos_proc::macos_proc_exe_path(pid).ok_or_else(|| {
+        ScribeError::IpcError { reason: "handoff could not read peer executable".to_owned() }
+    })?;
+    let allowed = allowed_server_executable_paths();
+    if allowed.iter().any(|path| same_executable_path(&peer_exe, path)) {
+        return Ok(());
+    }
+
+    Err(ScribeError::IpcError {
+        reason: format!(
+            "handoff peer executable {} is not an allowed server binary",
+            peer_exe.display()
+        ),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn allowed_server_executable_paths() -> Vec<PathBuf> {
+    let identity = current_identity();
+    let mut paths = vec![PathBuf::from("/usr/bin").join(identity.server_binary_name())];
+    if let Ok(current) = std::env::current_exe() {
+        paths.push(current.clone());
+        if let Some(parent) = current.parent() {
+            paths.push(parent.join(identity.server_binary_name()));
+        }
+    }
+    paths
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn same_executable_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 /// Read the upgrade request magic bytes from the peer.

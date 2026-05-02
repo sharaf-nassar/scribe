@@ -1,3 +1,4 @@
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +15,10 @@ use scribe_common::protocol::{ServerMessage, UpdateCheckResultState, UpdateProgr
 use crate::ipc_server::ConnectedClients;
 
 const INITIAL_DELAY: Duration = Duration::from_secs(30);
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_UPDATE_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_SIGNATURE_BYTES: u64 = 1024 * 1024;
 #[cfg(target_os = "macos")]
 const HOT_RELOAD_HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_API_URL: &str = "https://api.github.com/repos/sharaf-nassar/scribe/releases/latest";
@@ -53,6 +58,27 @@ struct GhRelease {
 struct GhAsset {
     name: String,
     browser_download_url: String,
+}
+
+struct UpdateDownloadStage {
+    path: PathBuf,
+}
+
+impl Drop for UpdateDownloadStage {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(path = %self.path.display(), "failed to remove update staging dir: {e}");
+            }
+        }
+    }
+}
+
+struct VerifiedAsset {
+    #[cfg(not(target_os = "linux"))]
+    path: PathBuf,
+    #[cfg(target_os = "linux")]
+    fd: std::fs::File,
 }
 
 // ── Public API ────────────────────────────────────────────────────
@@ -182,7 +208,11 @@ async fn run_updater_loop(
 }
 
 fn build_updater_http_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder().user_agent(format!("scribe/{}", env!("CARGO_PKG_VERSION"))).build()
+    reqwest::Client::builder()
+        .user_agent(format!("scribe/{}", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_TIMEOUT)
+        .build()
 }
 
 async fn drain_check_requests(
@@ -351,7 +381,7 @@ async fn try_install(
     )
     .await;
 
-    let (asset_path, sig_path) = download_both(client, &asset_url, &sig_url).await?;
+    let (asset_path, sig_path, _stage) = download_both(client, &asset_url, &sig_url).await?;
 
     broadcast(
         &ServerMessage::UpdateProgress { state: UpdateProgressState::Verifying },
@@ -359,7 +389,7 @@ async fn try_install(
     )
     .await;
 
-    verify_signature(&asset_path, &sig_path)?;
+    let verified_asset = verify_signature(&asset_path, &sig_path)?;
 
     broadcast(
         &ServerMessage::UpdateProgress { state: UpdateProgressState::Installing },
@@ -367,7 +397,7 @@ async fn try_install(
     )
     .await;
 
-    let hot_reload_succeeded = install_update(&asset_path)?;
+    let hot_reload_succeeded = install_update(&verified_asset)?;
 
     Ok((version, hot_reload_succeeded))
 }
@@ -451,17 +481,59 @@ fn find_signature<'a>(assets: &'a [GhAsset], asset_name: &str) -> Option<&'a GhA
     assets.iter().find(|a| a.name == sig_name)
 }
 
-/// Downloads a URL to a temp file and returns the path.
-async fn download_asset(client: &reqwest::Client, url: &str) -> Result<PathBuf, ScribeError> {
+fn create_update_stage() -> Result<UpdateDownloadStage, ScribeError> {
+    let runtime_dir = scribe_common::socket::server_socket_path()
+        .parent()
+        .map_or_else(std::env::temp_dir, Path::to_path_buf);
+    std::fs::create_dir_all(&runtime_dir).map_err(|e| ScribeError::Io { source: e })?;
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| ScribeError::Io { source: e })?;
+
+    for _ in 0..16 {
+        let stage_path = runtime_dir.join(format!("update-{}", uuid::Uuid::new_v4()));
+        match std::fs::create_dir(&stage_path) {
+            Ok(()) => {
+                std::fs::set_permissions(&stage_path, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|e| ScribeError::Io { source: e })?;
+                return Ok(UpdateDownloadStage { path: stage_path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(ScribeError::Io { source: e }),
+        }
+    }
+
+    Err(ScribeError::UpdateInstallFailed {
+        reason: "could not create a unique update staging directory".to_owned(),
+    })
+}
+
+fn asset_filename_from_url(url: &str) -> Result<String, ScribeError> {
+    let raw = url
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.split(['?', '#']).next())
+        .ok_or_else(|| ScribeError::UpdateInstallFailed { reason: "empty asset URL".into() })?;
+    let filename = Path::new(raw)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(|| ScribeError::UpdateInstallFailed {
+            reason: format!("invalid asset filename in URL: {url}"),
+        })?;
+    Ok(filename.to_owned())
+}
+
+/// Downloads a URL to a private staging directory and returns the path.
+async fn download_asset(
+    client: &reqwest::Client,
+    url: &str,
+    stage: &UpdateDownloadStage,
+    max_bytes: u64,
+) -> Result<PathBuf, ScribeError> {
     use futures_util::StreamExt as _;
     use tokio::io::AsyncWriteExt as _;
 
-    let tmp_dir = std::env::temp_dir();
-    let filename = url
-        .rsplit('/')
-        .next()
-        .ok_or_else(|| ScribeError::UpdateInstallFailed { reason: "empty asset URL".into() })?;
-    let dest = tmp_dir.join(filename);
+    let dest = stage.path.join(asset_filename_from_url(url)?);
 
     let response = client
         .get(url)
@@ -471,13 +543,38 @@ async fn download_asset(client: &reqwest::Client, url: &str) -> Result<PathBuf, 
         .error_for_status()
         .map_err(|e| ScribeError::UpdateInstallFailed { reason: format!("{e}") })?;
 
-    let mut file =
-        tokio::fs::File::create(&dest).await.map_err(|e| ScribeError::Io { source: e })?;
+    if let Some(len) = response.content_length() {
+        if len > max_bytes {
+            return Err(ScribeError::UpdateInstallFailed {
+                reason: format!("update asset too large: {len} bytes (max {max_bytes})"),
+            });
+        }
+    }
+
+    let std_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&dest)
+        .map_err(|e| ScribeError::Io { source: e })?;
+    let mut file = tokio::fs::File::from_std(std_file);
 
     let mut stream = response.bytes_stream();
+    let mut downloaded = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk =
             chunk.map_err(|e| ScribeError::UpdateInstallFailed { reason: format!("{e}") })?;
+        downloaded = downloaded
+            .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| ScribeError::UpdateInstallFailed {
+                reason: "update asset size overflowed".to_owned(),
+            })?;
+        if downloaded > max_bytes {
+            return Err(ScribeError::UpdateInstallFailed {
+                reason: format!("update asset too large: {downloaded} bytes (max {max_bytes})"),
+            });
+        }
         file.write_all(&chunk).await.map_err(|e| ScribeError::Io { source: e })?;
     }
 
@@ -491,30 +588,94 @@ async fn download_both(
     client: &reqwest::Client,
     asset_url: &str,
     sig_url: &str,
-) -> Result<(PathBuf, PathBuf), ScribeError> {
-    let (asset_res, sig_res) =
-        tokio::join!(download_asset(client, asset_url), download_asset(client, sig_url));
-    Ok((asset_res?, sig_res?))
+) -> Result<(PathBuf, PathBuf, UpdateDownloadStage), ScribeError> {
+    let stage = create_update_stage()?;
+    let (asset_res, sig_res) = tokio::join!(
+        download_asset(client, asset_url, &stage, MAX_UPDATE_DOWNLOAD_BYTES),
+        download_asset(client, sig_url, &stage, MAX_SIGNATURE_BYTES)
+    );
+    Ok((asset_res?, sig_res?, stage))
 }
 
-fn verify_signature(asset_path: &Path, sig_path: &Path) -> Result<(), ScribeError> {
+fn verify_signature(asset_path: &Path, sig_path: &Path) -> Result<VerifiedAsset, ScribeError> {
     let pk = minisign_verify::PublicKey::from_base64(MINISIGN_PUBLIC_KEY)
         .map_err(|e| ScribeError::UpdateInstallFailed { reason: format!("bad public key: {e}") })?;
 
-    let sig_bytes = std::fs::read(sig_path).map_err(|e| ScribeError::Io { source: e })?;
+    let sig_bytes = read_staged_file(sig_path, MAX_SIGNATURE_BYTES)?;
     let sig =
         minisign_verify::Signature::decode(&String::from_utf8_lossy(&sig_bytes)).map_err(|e| {
             ScribeError::UpdateInstallFailed { reason: format!("bad signature file: {e}") }
         })?;
 
-    let asset_bytes = std::fs::read(asset_path).map_err(|e| ScribeError::Io { source: e })?;
+    let mut asset_file = open_staged_file(asset_path)?;
+    let asset_bytes = read_open_file(&mut asset_file, MAX_UPDATE_DOWNLOAD_BYTES)?;
     pk.verify(&asset_bytes, &sig, false).map_err(|e| ScribeError::UpdateInstallFailed {
         reason: format!("signature mismatch: {e}"),
-    })
+    })?;
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::{Seek as _, SeekFrom};
+
+        asset_file.seek(SeekFrom::Start(0)).map_err(|e| ScribeError::Io { source: e })?;
+        drop(std::fs::remove_file(asset_path));
+        drop(std::fs::remove_file(sig_path));
+        Ok(VerifiedAsset { fd: asset_file })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(VerifiedAsset { path: asset_path.to_path_buf() })
+    }
+}
+
+fn open_staged_file(path: &Path) -> Result<std::fs::File, ScribeError> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| ScribeError::Io { source: e })?;
+    let metadata = file.metadata().map_err(|e| ScribeError::Io { source: e })?;
+    if !metadata.is_file() {
+        return Err(ScribeError::UpdateInstallFailed {
+            reason: format!("update path is not a regular file: {}", path.display()),
+        });
+    }
+    Ok(file)
+}
+
+fn read_staged_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ScribeError> {
+    let mut file = open_staged_file(path)?;
+    read_open_file(&mut file, max_bytes)
+}
+
+fn read_open_file(file: &mut std::fs::File, max_bytes: u64) -> Result<Vec<u8>, ScribeError> {
+    use std::io::Read as _;
+
+    let len = file.metadata().map_err(|e| ScribeError::Io { source: e })?.len();
+    if len > max_bytes {
+        return Err(ScribeError::UpdateInstallFailed {
+            reason: format!("update file too large: {len} bytes (max {max_bytes})"),
+        });
+    }
+
+    let capacity = usize::try_from(len).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| ScribeError::Io { source: e })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(ScribeError::UpdateInstallFailed {
+            reason: format!("update file exceeded max size {max_bytes}"),
+        });
+    }
+    Ok(bytes)
 }
 
 #[cfg(target_os = "linux")]
-fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
+fn install_update(asset: &VerifiedAsset) -> Result<bool, ScribeError> {
+    use std::os::fd::AsRawFd as _;
+
     let runtime_dir = scribe_common::socket::server_socket_path()
         .parent()
         .map(Path::to_path_buf)
@@ -528,17 +689,18 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
     drop(std::fs::remove_file(&restart_required_flag));
     std::fs::write(&defer_flag, b"").map_err(|e| ScribeError::Io { source: e })?;
 
-    let path_str = asset_path.to_string_lossy();
-    let status = match std::process::Command::new("pkexec").args(["dpkg", "-i", &path_str]).status()
-    {
-        Ok(status) => status,
-        Err(e) => {
-            drop(std::fs::remove_file(&defer_flag));
-            return Err(ScribeError::UpdateInstallFailed {
-                reason: format!("failed to launch pkexec dpkg: {e}"),
-            });
-        }
-    };
+    let verified_fd_path = format!("/proc/{}/fd/{}", std::process::id(), asset.fd.as_raw_fd());
+    let status =
+        match std::process::Command::new("pkexec").args(["dpkg", "-i", &verified_fd_path]).status()
+        {
+            Ok(status) => status,
+            Err(e) => {
+                drop(std::fs::remove_file(&defer_flag));
+                return Err(ScribeError::UpdateInstallFailed {
+                    reason: format!("failed to launch pkexec dpkg: {e}"),
+                });
+            }
+        };
     drop(std::fs::remove_file(&defer_flag));
 
     if status.success() {
@@ -557,14 +719,14 @@ fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
 }
 
 #[cfg(target_os = "macos")]
-fn install_update(asset_path: &Path) -> Result<bool, ScribeError> {
+fn install_update(asset: &VerifiedAsset) -> Result<bool, ScribeError> {
     use scribe_common::socket::handoff_socket_path;
     use std::collections::HashMap;
     use std::process::Stdio;
 
     let app_bundle_path = current_app_bundle_path()?;
     let prev_path = app_bundle_path.with_extension("app.prev");
-    let path_str = asset_path.to_string_lossy();
+    let path_str = asset.path.to_string_lossy();
 
     // Attach the DMG.
     let attach = std::process::Command::new("hdiutil")

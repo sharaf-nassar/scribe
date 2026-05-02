@@ -96,8 +96,15 @@ pub fn compute_active_prompt_pin_rows(
 
     let prompt_top_abs = prompt_start_abs.or(input_start_abs)?;
     let live_bottom_abs = history_size.saturating_add(screen_lines.saturating_sub(1));
+    // A stored absolute position past the live bottom means the mark survived
+    // a scrollback trim that was not reflected back into `pane.prompt_marks` /
+    // `pane.input_start`. Returning `None` lets the caller fall back to the
+    // cursor heuristic instead of collapsing the pin to MIN_PIN_ROWS.
+    if prompt_top_abs > live_bottom_abs {
+        return None;
+    }
     let max_rows = screen_lines.saturating_sub(MIN_PIN_ROWS).max(MIN_PIN_ROWS);
-    let rows = live_bottom_abs.saturating_sub(prompt_top_abs) + 1;
+    let rows = live_bottom_abs - prompt_top_abs + 1;
     Some(rows.clamp(MIN_PIN_ROWS, max_rows))
 }
 
@@ -284,49 +291,42 @@ fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
 
 fn push_jump_arrow(out: &mut Vec<CellInstance>, button: Rect, color: [f32; 4], offset: (f32, f32)) {
     let (offset_x, offset_y) = offset;
-    let stem = Rect {
-        x: button.x + 13.0 + offset_x,
-        y: button.y + 6.0 + offset_y,
-        width: 2.0,
-        height: 7.0,
-    };
-    let head_left_upper = Rect {
-        x: button.x + 10.0 + offset_x,
-        y: button.y + 10.0 + offset_y,
-        width: 2.0,
-        height: 2.0,
-    };
-    let head_left_lower = Rect {
+    let baseline = Rect {
         x: button.x + 9.0 + offset_x,
-        y: button.y + 12.0 + offset_y,
-        width: 2.0,
+        y: button.y + 17.0 + offset_y,
+        width: 10.0,
         height: 2.0,
     };
-    let head_right_upper = Rect {
-        x: button.x + 16.0 + offset_x,
-        y: button.y + 10.0 + offset_y,
-        width: 2.0,
+    let stem = Rect {
+        x: button.x + 12.0 + offset_x,
+        y: button.y + 5.0 + offset_y,
+        width: 4.0,
+        height: 8.0,
+    };
+    let wide_chevron = Rect {
+        x: button.x + 8.0 + offset_x,
+        y: button.y + 11.0 + offset_y,
+        width: 12.0,
         height: 2.0,
     };
-    let head_right_lower = Rect {
-        x: button.x + 17.0 + offset_x,
-        y: button.y + 12.0 + offset_y,
-        width: 2.0,
+    let middle_chevron = Rect {
+        x: button.x + 10.0 + offset_x,
+        y: button.y + 13.0 + offset_y,
+        width: 8.0,
         height: 2.0,
     };
-    let head_tip = Rect {
-        x: button.x + 13.0 + offset_x,
-        y: button.y + 14.0 + offset_y,
-        width: 2.0,
+    let arrow_point = Rect {
+        x: button.x + 12.0 + offset_x,
+        y: button.y + 15.0 + offset_y,
+        width: 4.0,
         height: 2.0,
     };
 
+    push_solid_rect(out, baseline, color);
     push_solid_rect(out, stem, color);
-    push_solid_rect(out, head_left_upper, color);
-    push_solid_rect(out, head_left_lower, color);
-    push_solid_rect(out, head_right_upper, color);
-    push_solid_rect(out, head_right_lower, color);
-    push_solid_rect(out, head_tip, color);
+    push_solid_rect(out, wide_chevron, color);
+    push_solid_rect(out, middle_chevron, color);
+    push_solid_rect(out, arrow_point, color);
 }
 
 fn rounded_rect(rect: Rect, color: [f32; 4], corner_radius: f32) -> CellInstance {
@@ -366,5 +366,48 @@ fn read_cell_flags(term: &Term<VoidListener>, line: Line, col: Column) -> Flags 
     )]
     {
         term.grid()[line][col].flags
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_prompt_returns_pin_for_valid_mark() {
+        // history=45, screen=30 → live_bottom=74. Mark at viewport line 5 (abs=50).
+        // rows = 74 - 50 + 1 = 25, clamp(3, 27) = 25.
+        assert_eq!(compute_active_prompt_pin_rows(45, 30, Some(50), None), Some(25));
+    }
+
+    #[test]
+    fn active_prompt_clamps_to_max_when_prompt_at_top() {
+        // Prompt at viewport top (abs = history). rows = screen_lines = 30, clamps to 27.
+        assert_eq!(compute_active_prompt_pin_rows(45, 30, Some(45), None), Some(27));
+    }
+
+    #[test]
+    fn active_prompt_clamps_to_min_when_prompt_at_bottom() {
+        // Prompt at live bottom: rows = 1, clamp to MIN_PIN_ROWS.
+        assert_eq!(compute_active_prompt_pin_rows(45, 30, Some(74), None), Some(MIN_PIN_ROWS));
+    }
+
+    #[test]
+    fn active_prompt_returns_none_for_stale_mark_past_live_bottom() {
+        // Stale mark from before a trim that shrunk history: abs > live_bottom.
+        // This must return None so the caller falls back to the cursor heuristic
+        // instead of clamping to MIN_PIN_ROWS (which collapses the pin).
+        assert_eq!(compute_active_prompt_pin_rows(10, 30, Some(100), None), None);
+    }
+
+    #[test]
+    fn active_prompt_falls_back_to_input_start() {
+        // No PromptStart mark, but PromptEnd recorded input_start.
+        assert_eq!(compute_active_prompt_pin_rows(45, 30, None, Some(50)), Some(25));
+    }
+
+    #[test]
+    fn active_prompt_returns_none_when_screen_lines_zero() {
+        assert_eq!(compute_active_prompt_pin_rows(45, 0, Some(50), None), None);
     }
 }

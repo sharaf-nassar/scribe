@@ -3,12 +3,14 @@
 //! Uses a Unix domain socket for singleton detection and a `flock` advisory
 //! lock to prevent TOCTOU races during the bind-or-connect sequence.
 
-use std::io::{BufRead as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
 use scribe_common::socket::{settings_lock_path, settings_socket_path};
+
+const MAX_COMMAND_LINE_BYTES: usize = 4096;
 
 /// Result of attempting to become the singleton settings process.
 pub enum SingletonResult {
@@ -130,9 +132,13 @@ pub fn read_command(stream: &UnixStream) -> Option<String> {
     // Set a short read timeout to avoid blocking the GTK loop.
     drop(stream.set_read_timeout(Some(std::time::Duration::from_millis(100))));
 
-    let mut reader = std::io::BufReader::new(stream);
+    let mut reader = std::io::BufReader::new(stream.take((MAX_COMMAND_LINE_BYTES + 1) as u64));
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
+        return None;
+    }
+    if line.len() > MAX_COMMAND_LINE_BYTES {
+        tracing::warn!("settings singleton command exceeded size limit");
         return None;
     }
 

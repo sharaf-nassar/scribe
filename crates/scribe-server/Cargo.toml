@@ -244,6 +244,7 @@ vte.workspace = true
 nix.workspace = true
 rustix.workspace = true
 unix-ancillary.workspace = true
+libc.workspace = true
 reqwest.workspace = true
 futures-util = "0.3"
 semver.workspace = true

@@ -92,7 +92,7 @@ A real ED 3 resets `display_offset` to 0 inside alacritty_terminal's `clear_hist
 
 When a later ED 3 arrives in the same scrollback epoch, the PTY reader trims the server Term back to that epoch baseline and sends [[crates/scribe-common/src/protocol.rs#ServerMessage]]`::TrimScrollback` before forwarding the redraw bytes.
 
-The client flushes any queued PTY output for that pane, trims its own Term back to the same baseline, and then applies the new bytes. This keeps committed Claude/Codex transcript history while preventing repeated inline redraws from stacking duplicate frames above it.
+The client flushes any queued PTY output for that pane, trims its own Term back to the same baseline, and then applies the new bytes. This keeps committed Claude/Codex transcript history while preventing repeated inline redraws from stacking duplicate frames above it. Because [[crates/scribe-client/src/pane.rs#Pane]]`::prompt_marks` and `input_start` store positions as "lines from the very top of scrollback (0 = oldest)", the client also calls [[crates/scribe-client/src/pane.rs#shift_absolute_marks_after_trim]] with the dropped-row count so split-scroll's pin math, prompt jump, and scrollbar markers continue to point at the right rows after each trim.
 
 ### State Machine
 

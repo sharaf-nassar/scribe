@@ -64,7 +64,7 @@ use winit::window::Window;
 
 use crate::ai_indicator::AiStateTracker;
 use crate::divider::DividerDrag;
-use crate::input::{KeyAction, LayoutAction};
+use crate::input::{KeyAction, KeyboardProtocol, LayoutAction};
 use crate::ipc_client::{ClientCommand, UiEvent};
 use crate::layout::{PaneEdges, PaneId, Rect};
 use crate::pane::{FeedOutputResult, Pane};
@@ -90,6 +90,15 @@ fn is_macos_close_window_shortcut(
     _modifiers: ModifiersState,
 ) -> bool {
     false
+}
+
+fn codex_alt_enter_newline_bytes(keyboard_protocol: KeyboardProtocol) -> Vec<u8> {
+    match keyboard_protocol {
+        // Codex defaults newline to Shift+Enter once kitty keyboard mode is active.
+        KeyboardProtocol::Kitty => b"\x1b[13;2u".to_vec(),
+        // Before negotiation is reflected locally, Ctrl+J is also a Codex newline binding.
+        KeyboardProtocol::Legacy => b"\n".to_vec(),
+    }
 }
 
 /// GPU resources shared across all panes.
@@ -1204,7 +1213,18 @@ impl App {
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
         let max_rows = usize::try_from(self.config.terminal.scrollback_lines).unwrap_or(usize::MAX);
         let kept_rows = usize::try_from(history_rows).unwrap_or(usize::MAX);
+        let history_before = pane.term.grid().history_size();
         trim_term_scrollback(&mut pane.term, kept_rows, max_rows);
+        let history_after = pane.term.grid().history_size();
+        // Shift stored absolute prompt positions to track the dropped scrollback
+        // rows so split-scroll's pin-height math (and prompt jump / scrollbar
+        // markers) continue to point at the correct rows after each trim.
+        let dropped_rows = history_before.saturating_sub(history_after);
+        pane::shift_absolute_marks_after_trim(
+            &mut pane.prompt_marks,
+            &mut pane.input_start,
+            dropped_rows,
+        );
         pane.content_dirty = true;
         self.request_redraw();
     }
@@ -4519,10 +4539,18 @@ impl App {
             return;
         }
 
-        let Some(action) = input::translate_key_action(event, self.modifiers, &self.bindings)
+        let keyboard_protocol = self.focused_keyboard_protocol();
+        let Some(mut action) =
+            input::translate_key_action(event, self.modifiers, &self.bindings, keyboard_protocol)
         else {
             return;
         };
+
+        if matches!(action, KeyAction::Terminal(_))
+            && self.should_send_codex_alt_enter_newline(event)
+        {
+            action = KeyAction::Terminal(codex_alt_enter_newline_bytes(keyboard_protocol));
+        }
 
         match action {
             KeyAction::Terminal(bytes) => self.handle_terminal_key(bytes),
@@ -4531,6 +4559,48 @@ impl App {
             KeyAction::OpenSettings => open_or_focus_settings(),
             KeyAction::OpenFind => self.handle_open_find(),
         }
+    }
+
+    fn focused_keyboard_protocol(&self) -> KeyboardProtocol {
+        use alacritty_terminal::term::TermMode;
+
+        let Some(pane) = self.focused_pane() else {
+            return KeyboardProtocol::Legacy;
+        };
+
+        let mode = pane.term.mode();
+        if mode.intersects(TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALL_KEYS_AS_ESC) {
+            KeyboardProtocol::Kitty
+        } else {
+            KeyboardProtocol::Legacy
+        }
+    }
+
+    fn should_send_codex_alt_enter_newline(&self, event: &winit::event::KeyEvent) -> bool {
+        event.state.is_pressed()
+            && matches!(event.logical_key, Key::Named(NamedKey::Enter))
+            && self.modifiers.alt_key()
+            && !self.modifiers.shift_key()
+            && !self.modifiers.control_key()
+            && self.focused_pane_is_codex()
+    }
+
+    fn focused_pane_is_codex(&self) -> bool {
+        let Some(pane) = self.focused_pane() else { return false };
+
+        if matches!(
+            pane.launch_binding.kind,
+            restore_state::LaunchKind::Ai { provider: AiProvider::CodexCode, .. }
+        ) {
+            return true;
+        }
+
+        self.ai_tracker.provider_for_session(pane.session_id) == Some(AiProvider::CodexCode)
+    }
+
+    fn focused_pane(&self) -> Option<&Pane> {
+        let tab = self.window_layout.active_tab()?;
+        self.panes.get(&tab.focused_pane)
     }
 
     fn handle_terminal_key(&mut self, bytes: Vec<u8>) {

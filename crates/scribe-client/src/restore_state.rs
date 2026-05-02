@@ -1,6 +1,9 @@
 //! Persisted startup restore state and runtime launch bindings.
 
-use std::path::PathBuf;
+use std::io::Write as _;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use scribe_common::ai_state::AiProvider;
@@ -141,6 +144,11 @@ pub struct RestoreStore {
     root: Option<PathBuf>,
 }
 
+#[cfg(unix)]
+const PRIVATE_DIR_MODE: u32 = 0o700;
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
+
 struct RestoreIndexLock {
     path: PathBuf,
 }
@@ -176,9 +184,7 @@ impl RestoreStore {
 
     fn acquire_index_lock(&self) -> Result<RestoreIndexLock, crate::window_state::StateError> {
         let path = self.lock_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        self.ensure_restore_parent(&path)?;
         loop {
             if let Some(lock) = Self::try_create_index_lock(&path)? {
                 return Ok(lock);
@@ -202,23 +208,65 @@ impl RestoreStore {
     }
 
     fn write_toml_atomic<T: Serialize>(
+        &self,
         path: Option<PathBuf>,
         value: &T,
     ) -> Result<(), crate::window_state::StateError> {
         let path = path.ok_or(crate::window_state::StateError::NoStateDir)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp_path = path.with_extension("tmp");
+        self.ensure_restore_parent(&path)?;
         let content = toml::to_string_pretty(value)?;
-        std::fs::write(&tmp_path, content)?;
-        std::fs::rename(&tmp_path, &path)?;
+        let tmp_path = Self::write_private_temp_file(&path, content.as_bytes())?;
+        if let Err(error) = std::fs::rename(&tmp_path, &path) {
+            drop(std::fs::remove_file(&tmp_path));
+            return Err(error.into());
+        }
+        set_private_file_permissions(&path)?;
         Ok(())
+    }
+
+    fn ensure_restore_parent(&self, path: &Path) -> Result<(), crate::window_state::StateError> {
+        let root = self.root.as_ref().ok_or(crate::window_state::StateError::NoStateDir)?;
+        ensure_private_dir(root)?;
+        if let Some(parent) = path.parent() {
+            if parent != root {
+                ensure_private_dir(parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_private_temp_file(
+        path: &Path,
+        content: &[u8],
+    ) -> Result<PathBuf, crate::window_state::StateError> {
+        let mut last_exists = None;
+        for attempt in 0..16 {
+            let tmp_path = private_temp_path(path, attempt);
+            match create_private_file(&tmp_path) {
+                Ok(mut file) => {
+                    file.write_all(content)?;
+                    return Ok(tmp_path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last_exists = Some(error);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(last_exists
+            .unwrap_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "could not allocate restore temp file",
+                )
+            })
+            .into())
     }
 
     /// Save the restore index to disk.
     pub fn save_index(&self, index: &RestoreIndex) -> Result<(), crate::window_state::StateError> {
-        Self::write_toml_atomic(self.index_path(), index)
+        self.write_toml_atomic(self.index_path(), index)
     }
 
     /// Insert or refresh a window entry in the restore index.
@@ -254,7 +302,7 @@ impl RestoreStore {
         &self,
         state: &WindowRestoreState,
     ) -> Result<(), crate::window_state::StateError> {
-        Self::write_toml_atomic(self.window_path(state.window_id), state)
+        self.write_toml_atomic(self.window_path(state.window_id), state)
     }
 
     /// Remove a window's persisted logical state.
@@ -330,13 +378,12 @@ impl RestoreStore {
     }
 
     fn try_create_index_lock(
-        path: &PathBuf,
+        path: &Path,
     ) -> Result<Option<RestoreIndexLock>, crate::window_state::StateError> {
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        match create_private_file(path) {
             Ok(mut file) => {
-                use std::io::Write as _;
                 writeln!(file, "{}", unix_time_ms())?;
-                Ok(Some(RestoreIndexLock { path: path.clone() }))
+                Ok(Some(RestoreIndexLock { path: path.to_path_buf() }))
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
             Err(error) => Err(error.into()),
@@ -371,6 +418,51 @@ impl RestoreStore {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+fn ensure_private_dir(path: &Path) -> Result<(), crate::window_state::StateError> {
+    std::fs::create_dir_all(path)?;
+    set_private_dir_permissions(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_dir_permissions(path: &Path) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(PRIVATE_FILE_MODE);
+    }
+    let file = options.open(path)?;
+    set_private_file_permissions(path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn private_temp_path(path: &Path, attempt: u32) -> PathBuf {
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("restore");
+    let tmp_name =
+        format!(".{file_name}.{}.{}.{}.tmp", std::process::id(), unix_time_ms(), attempt);
+    path.with_file_name(tmp_name)
 }
 
 /// Current UNIX time in milliseconds.

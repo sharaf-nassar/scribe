@@ -80,6 +80,8 @@ The Debian maintainer scripts branch on the package name so `scribe` manages `/r
 
 If Linux hot-reload fails because the handoff state version changed, `postinst` normally falls back to a true cold restart: it reloads the matching user unit, stops it, kills any detached flavor-specific server processes still holding the lock/socket, clears stale sockets, resets the failed unit state, and then starts the new server. The installer shows only a high-level warning, and it asks the user to save work only when the original server PID is still alive after the failed handoff attempt. Auto-update installs now set a runtime defer marker first, so that same failure path can leave the old server running, persist an `update-restart-required` flag, and skip client/settings relaunches until the UI explicitly approves the cold restart. Once approved, a detached client helper performs the cold restart and relaunches one fresh client after the previous windows exit, which preserves the existing cold-restore replay flow. If a non-deferred cold restart fails, the package script skips client and settings relaunches instead of piling new processes onto a broken server.
 
+Auto-update package downloads are staged under the user runtime directory and Linux passes a verified, unlinked package fd to `pkexec dpkg`, so maintainer scripts install the same inode that minisign verified rather than reopening a mutable temp path.
+
 Settings relaunches also wait for the old singleton to release its lock and socket, then escalate to SIGKILL before starting the replacement if the old process refuses to exit. `scribe-dev` additionally skips automatic Claude/Codex hook setup during install so the stable install's global hook configuration remains untouched.
 
 ## Data Flow

@@ -374,6 +374,15 @@ pub enum KeyAction {
     OpenFind,
 }
 
+/// Keyboard protocol currently requested by the focused terminal application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardProtocol {
+    /// Legacy terminal encoding.
+    Legacy,
+    /// Kitty/CSI-u disambiguated keyboard encoding.
+    Kitty,
+}
+
 /// Translate a winit key event into either terminal bytes or a layout command.
 ///
 /// Priority: layout shortcuts → settings/find → terminal shortcuts → generic key translation.
@@ -382,6 +391,7 @@ pub fn translate_key_action(
     event: &KeyEvent,
     modifiers: ModifiersState,
     bindings: &Bindings,
+    keyboard_protocol: KeyboardProtocol,
 ) -> Option<KeyAction> {
     if event.state != ElementState::Pressed {
         return None;
@@ -410,7 +420,7 @@ pub fn translate_key_action(
     }
 
     // Fall through to generic terminal key translation with modifier encoding.
-    translate_key(event, modifiers).map(KeyAction::Terminal)
+    translate_key(event, modifiers, keyboard_protocol).map(KeyAction::Terminal)
 }
 
 /// Translate a winit key event into terminal byte sequences.
@@ -419,18 +429,23 @@ pub fn translate_key_action(
 /// - Ctrl+character → control byte (0x01–0x1a)
 /// - Ctrl+Alt+character → ESC + control byte
 /// - Alt+character → ESC + character
+/// - Modified Enter in kitty mode → CSI-u sequence
 /// - Modifier+named-key → xterm modifier-encoded escape sequence
 ///
 /// Returns `None` if the key should be ignored (key-up events,
 /// unrecognised keys, or modifier-only keys).
-pub fn translate_key(event: &KeyEvent, modifiers: ModifiersState) -> Option<Vec<u8>> {
+pub fn translate_key(
+    event: &KeyEvent,
+    modifiers: ModifiersState,
+    keyboard_protocol: KeyboardProtocol,
+) -> Option<Vec<u8>> {
     if event.state != ElementState::Pressed {
         return None;
     }
 
     match &event.logical_key {
         Key::Character(c) => translate_character_with_modifiers(c, modifiers),
-        Key::Named(named) => translate_named_with_modifiers(*named, modifiers),
+        Key::Named(named) => translate_named_with_modifiers(*named, modifiers, keyboard_protocol),
         _ => None,
     }
 }
@@ -551,15 +566,19 @@ fn char_to_control_byte(c: &str) -> Option<u8> {
 /// `param = 1 + shift(1) + alt(2) + ctrl(4)`.
 ///
 /// Special cases (Backspace, Space, Enter, Tab, Escape) are handled separately
-/// since they don't follow the standard CSI modifier encoding.
-fn translate_named_with_modifiers(named: NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
+/// since they don't all follow the standard CSI modifier encoding.
+fn translate_named_with_modifiers(
+    named: NamedKey,
+    modifiers: ModifiersState,
+    keyboard_protocol: KeyboardProtocol,
+) -> Option<Vec<u8>> {
     // Drop Cmd/Super combos that didn't match any binding — on macOS these are
     // OS-level shortcuts and sending wrong PTY sequences would be incorrect.
     if modifiers.super_key() {
         return None;
     }
 
-    if let Some(bytes) = translate_named_special(named, modifiers) {
+    if let Some(bytes) = translate_named_special(named, modifiers, keyboard_protocol) {
         return Some(bytes);
     }
 
@@ -571,7 +590,11 @@ fn translate_named_with_modifiers(named: NamedKey, modifiers: ModifiersState) ->
         .or_else(|| translate_named_function_key(named, modifier_param))
 }
 
-fn translate_named_special(named: NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
+fn translate_named_special(
+    named: NamedKey,
+    modifiers: ModifiersState,
+    keyboard_protocol: KeyboardProtocol,
+) -> Option<Vec<u8>> {
     match named {
         NamedKey::Backspace => {
             if modifiers.control_key() && modifiers.alt_key() {
@@ -593,13 +616,7 @@ fn translate_named_special(named: NamedKey, modifiers: ModifiersState) -> Option
                 Some(b" ".to_vec())
             }
         }
-        NamedKey::Enter => {
-            if modifiers.alt_key() {
-                Some(vec![0x1b, b'\r'])
-            } else {
-                Some(b"\r".to_vec())
-            }
-        }
+        NamedKey::Enter => translate_enter_with_modifiers(modifiers, keyboard_protocol),
         NamedKey::Tab => {
             if modifiers.shift_key() {
                 Some(b"\x1b[Z".to_vec())
@@ -610,6 +627,19 @@ fn translate_named_special(named: NamedKey, modifiers: ModifiersState) -> Option
         NamedKey::Escape => Some(b"\x1b".to_vec()),
         _ => None,
     }
+}
+
+fn translate_enter_with_modifiers(
+    modifiers: ModifiersState,
+    keyboard_protocol: KeyboardProtocol,
+) -> Option<Vec<u8>> {
+    if keyboard_protocol == KeyboardProtocol::Kitty
+        && (modifiers.shift_key() || modifiers.alt_key() || modifiers.control_key())
+    {
+        return xterm_modifier_param(modifiers).map(|param| build_csi_u_seq(13, Some(param)));
+    }
+
+    if modifiers.alt_key() { Some(vec![0x1b, b'\r']) } else { Some(b"\r".to_vec()) }
 }
 
 fn translate_named_csi_letter(named: NamedKey, modifier_param: Option<u8>) -> Option<Vec<u8>> {
@@ -839,5 +869,17 @@ fn build_csi_tilde_seq(code: u8, modifier_param: Option<u8>) -> Vec<u8> {
         seq.extend_from_slice(param.to_string().as_bytes());
     }
     seq.push(b'~');
+    seq
+}
+
+fn build_csi_u_seq(codepoint: u32, modifier_param: Option<u8>) -> Vec<u8> {
+    let mut seq = Vec::with_capacity(12);
+    seq.extend_from_slice(b"\x1b[");
+    seq.extend_from_slice(codepoint.to_string().as_bytes());
+    if let Some(param) = modifier_param {
+        seq.push(b';');
+        seq.extend_from_slice(param.to_string().as_bytes());
+    }
+    seq.push(b'u');
     seq
 }

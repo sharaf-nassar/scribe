@@ -6,6 +6,8 @@ The scribe-settings crate provides a webview-based configuration editor for term
 
 The settings window in [[crates/scribe-settings/src/lib.rs]] uses an embedded webview (GTK on Linux, tao/wry on macOS) with inlined HTML/CSS/JS assets.
 
+The inlined document carries a restrictive Content Security Policy: no default loads, no network connects, and only the inline script/style blocks produced by the asset embedder are allowed.
+
 On Linux, the icon pixbuf is loaded from the hicolor theme and set directly on the window so that panels which match by WM_CLASS still display the correct icon.
 
 The visible window title is flavor-aware: stable installs use `Scribe Settings`, while `scribe-dev` uses `devScribe Settings` so task bars distinguish dev windows from production ones.
@@ -87,6 +89,8 @@ Add/remove root directories and badge colour customization per index with reset-
 ## Singleton
 
 The settings app uses the same singleton structure as the server: a lock file plus a Unix socket for focus handoff. It takes `settings.lock`, listens on `settings.sock`, and sends a `focus` command to an existing instance when one is already running.
+
+Singleton socket commands are one-line JSON payloads capped at 4 KiB before parsing, so a same-UID peer cannot force unbounded line allocation in the settings process.
 
 That same socket also accepts a `quit` command from the client and server shutdown paths. The client sends it immediately for explicit `Quit Scribe`, and the server sends it after a short grace period once the last client disconnects, so the standalone settings window does not outlive the app while still tolerating fast reconnect handoffs. Socket-driven `quit` exits preserve the persisted `open` flag on both Linux and macOS so the next fresh Scribe launch restores settings only when the window had been open before app shutdown; native user closes still mark it closed.
 

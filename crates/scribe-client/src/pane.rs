@@ -167,7 +167,9 @@ impl Pane {
     ) -> Self {
         let PaneLayoutState { rect, grid, edges } = layout;
         let dims = TermDims { cols: usize::from(grid.cols), lines: usize::from(grid.rows) };
-        let term = Term::new(alacritty_terminal::term::Config::default(), &dims, VoidListener);
+        let term_config =
+            alacritty_terminal::term::Config { kitty_keyboard: true, ..Default::default() };
+        let term = Term::new(term_config, &dims, VoidListener);
 
         Self {
             session_id,
@@ -426,4 +428,94 @@ fn grid_from_pixels(width: f32, height: f32, cell_w: f32, cell_h: f32) -> GridSi
     let cols = grid_axis_units(width, cell_w);
     let rows = grid_axis_units(height, cell_h);
     GridSize { cols, rows }
+}
+
+/// Shift stored absolute scrollback positions after a scrollback trim.
+///
+/// `dropped_rows` is the number of rows dropped from the oldest scrollback by
+/// `alacritty_terminal::grid::Grid::update_history`. Stored absolute positions
+/// in `marks` and `input_start` are stable identifiers from "lines since the
+/// very top of scrollback (0 = oldest)", so a trim of `K` oldest rows shifts
+/// every surviving row's absolute index down by `K`.
+///
+/// Marks whose stored row was inside the trimmed region (`m < dropped_rows`)
+/// are dropped — the row no longer exists. `input_start` is cleared in the
+/// same case so split-scroll falls back to the cursor heuristic instead of
+/// computing pin height against a synthetic row 0.
+pub fn shift_absolute_marks_after_trim(
+    marks: &mut Vec<usize>,
+    input_start: &mut Option<(usize, usize)>,
+    dropped_rows: usize,
+) {
+    if dropped_rows == 0 {
+        return;
+    }
+    marks.retain_mut(|m| {
+        if *m >= dropped_rows {
+            *m -= dropped_rows;
+            true
+        } else {
+            false
+        }
+    });
+    if let Some((line, col)) = *input_start {
+        *input_start = if line >= dropped_rows { Some((line - dropped_rows, col)) } else { None };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shift_absolute_marks_after_trim;
+
+    #[test]
+    fn shift_subtracts_delta_from_each_mark() {
+        let mut marks = vec![10, 20, 30];
+        let mut input_start = Some((25, 5));
+        shift_absolute_marks_after_trim(&mut marks, &mut input_start, 5);
+        assert_eq!(marks, vec![5, 15, 25]);
+        assert_eq!(input_start, Some((20, 5)));
+    }
+
+    #[test]
+    fn shift_drops_marks_below_delta() {
+        let mut marks = vec![3, 4, 10, 20];
+        let mut input_start = None;
+        shift_absolute_marks_after_trim(&mut marks, &mut input_start, 5);
+        assert_eq!(marks, vec![5, 15]);
+    }
+
+    #[test]
+    fn shift_clears_input_start_below_delta() {
+        let mut marks: Vec<usize> = vec![];
+        let mut input_start = Some((3, 7));
+        shift_absolute_marks_after_trim(&mut marks, &mut input_start, 5);
+        assert_eq!(input_start, None);
+    }
+
+    #[test]
+    fn shift_zero_delta_is_noop() {
+        let mut marks = vec![10, 20];
+        let mut input_start = Some((15, 0));
+        shift_absolute_marks_after_trim(&mut marks, &mut input_start, 0);
+        assert_eq!(marks, vec![10, 20]);
+        assert_eq!(input_start, Some((15, 0)));
+    }
+
+    #[test]
+    fn shift_mark_at_exact_delta_lands_on_oldest_row() {
+        let mut marks = vec![5, 10];
+        let mut input_start = Some((5, 0));
+        shift_absolute_marks_after_trim(&mut marks, &mut input_start, 5);
+        assert_eq!(marks, vec![0, 5]);
+        assert_eq!(input_start, Some((0, 0)));
+    }
+
+    #[test]
+    fn shift_empty_inputs_are_noop() {
+        let mut marks: Vec<usize> = vec![];
+        let mut input_start = None;
+        shift_absolute_marks_after_trim(&mut marks, &mut input_start, 10);
+        assert!(marks.is_empty());
+        assert_eq!(input_start, None);
+    }
 }

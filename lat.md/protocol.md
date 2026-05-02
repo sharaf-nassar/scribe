@@ -10,7 +10,7 @@ Messages use length-prefixed MessagePack encoding defined in [[crates/scribe-com
 
 Each frame is a 4-byte big-endian u32 payload length followed by the MessagePack-serialized message body.
 
-The maximum payload size is 256 MiB; reattach payloads ride on the far denser zstd-compressed ANSI `SessionReplay` encoding, so the 256 MiB cap is headroom for `RequestSnapshot` tooling rather than the hot path.
+The maximum payload size is 64 MiB; reattach payloads ride on the far denser zstd-compressed ANSI `SessionReplay` encoding, so routine attach traffic stays well below the cap.
 
 ### Socket Path
 
@@ -21,6 +21,8 @@ On Linux this is `/run/user/{uid}/scribe/server.sock` for stable installs and `/
 ### Security
 
 Every connection is verified by checking the peer UID via `SO_PEERCRED` on Linux or `getpeereid` on macOS. Connections from a different UID are rejected. The server enforces a maximum of 32 concurrent connections per UID.
+
+Window and session operations are further scoped after handshake: a client cannot claim an already-connected window ID, attach another window's sessions, request snapshots for unattached sessions, or close a different window.
 
 ## Client Messages
 
@@ -44,9 +46,9 @@ The client chunks large pastes into multiple `KeyInput` messages to fit the 4 Ki
 
 ### Subscription
 
-`Subscribe` registers for output from a list of session IDs (max 256). `RequestSnapshot` fetches a single session's full screen state.
+`Subscribe` registers for output from attached session IDs (max 256). `RequestSnapshot` fetches a single attached session's full screen state.
 
-`AttachSessions` reattaches to detached sessions with dimensions. Per-session metadata (title, CWD, shell basename, session context, git branch, AI state) rides on the preceding `SessionList`/`SessionInfo` response, and per-workspace metadata (names, accent colors) rides on `SessionList::workspaces`, so the attach reply is just `SessionCreated` + [[protocol#Server Messages#Terminal Output#SessionReplay]] per session with no additional fan-out.
+`AttachSessions` reattaches to detached sessions with dimensions when those sessions are unowned or already belong to the caller's window. Per-session metadata (title, CWD, shell basename, session context, git branch, AI state) rides on the preceding `SessionList`/`SessionInfo` response, and per-workspace metadata (names, accent colors) rides on `SessionList::workspaces`, so the attach reply is just `SessionCreated` + [[protocol#Server Messages#Terminal Output#SessionReplay]] per session with no additional fan-out.
 
 ### Workspace Management
 
@@ -56,11 +58,13 @@ The client chunks large pastes into multiple `KeyInput` messages to fit the 4 Ki
 
 Window automation messages let the CLI inspect windows and ask a connected client to execute the same actions exposed by keyboard shortcuts and the command palette.
 
-`ListWindows` returns every connected window with its ID, session count, and connection status. `DispatchAction` targets an optional window ID and carries an [[crates/scribe-common/src/protocol.rs#AutomationAction]] value such as settings, find, new tab, split, close, new window, profile switch, or focus session. The server answers each dispatch with either `ActionDispatched` naming the routed window or `Error` when no connected target exists. `FocusSession` raises the target window and switches to the tab containing the specified session, used by desktop notification click callbacks to bring the user directly to the session that needs attention.
+`ListWindows` returns every connected window with its ID, session count, and connection status. `DispatchAction` carries an [[crates/scribe-common/src/protocol.rs#AutomationAction]] value such as settings, find, new tab, split, close, new window, profile switch, or focus session, but the server only routes it to the caller's connected window. The server answers each dispatch with either `ActionDispatched` naming the routed window or `Error` when the target is missing or belongs to another connection.
 
 ### Connection
 
 `Hello` is the first message sent, carrying an optional window ID for multi-window reconnection. The server responds with [[protocol#Server Messages]] `Welcome`.
+
+If the requested window ID is already connected, the server assigns another unconnected window or a fresh ID instead of replacing the existing owner.
 
 Transient actions are an exception: the [[server#Server#Updater#Manual Check]] path lets a non-client process (the standalone settings window) open `server.sock`, send `CheckForUpdates` as the first and only message, read back a single `UpdateCheckResult`, and disconnect — never registering as a connected client and never receiving a `Welcome`.
 

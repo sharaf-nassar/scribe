@@ -5,10 +5,10 @@ use crate::error::ScribeError;
 
 /// Maximum size of a single length-prefixed protocol frame, in bytes.
 ///
-/// 256 MiB accommodates reattach payloads that batch many session snapshots
-/// at once. Exposed publicly so synchronous callers (e.g. the settings
-/// binary's transient action client) can enforce the same upper bound.
-pub const MAX_MESSAGE_SIZE: u32 = 256 * 1024 * 1024;
+/// 64 MiB accommodates compressed reattach payloads while limiting per-client
+/// allocation. Exposed publicly so synchronous callers can enforce the same
+/// upper bound.
+pub const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Read a single length-prefixed msgpack frame from an async reader.
 ///

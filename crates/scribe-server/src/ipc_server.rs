@@ -784,12 +784,18 @@ async fn dispatch_workspace_message(msg: ClientMessage, context: &mut ClientDisp
                 &context.server.workspace_manager,
                 context.writer,
                 &context.server.live_sessions,
+                context.attached_ids,
             )
             .await;
         }
         ClientMessage::RequestSnapshot { session_id } => {
-            handle_request_snapshot(session_id, context.writer, &context.server.live_sessions)
-                .await;
+            handle_request_snapshot(
+                session_id,
+                context.writer,
+                &context.server.live_sessions,
+                context.attached_ids,
+            )
+            .await;
         }
         ClientMessage::CreateWorkspace => {
             handle_create_workspace(&context.server.workspace_manager, context.writer).await;
@@ -817,14 +823,7 @@ async fn dispatch_workspace_message(msg: ClientMessage, context: &mut ClientDisp
 async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatchContext<'_>) {
     match msg {
         ClientMessage::CloseWindow { window_id: target_window } => {
-            handle_close_window(
-                target_window,
-                &context.server.workspace_manager,
-                &context.server.live_sessions,
-                context.attached_ids,
-                context.writer,
-            )
-            .await;
+            handle_close_window(target_window, context).await;
         }
         ClientMessage::QuitAll => {
             handle_quit_all(context.window_id, &context.server.connected_clients).await;
@@ -855,6 +854,7 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
                 target_window_id,
                 action,
                 &context.server.connected_clients,
+                context.window_id,
                 context.writer,
             )
             .await;
@@ -1201,38 +1201,37 @@ async fn handle_close_session(
 
 /// Close a window: destroy every session it owns and remove the window from
 /// the workspace manager so it won't be resurrected on the next client launch.
-async fn handle_close_window(
-    window_id: WindowId,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-    live_sessions: &LiveSessionRegistry,
-    attached_ids: &AttachedSessionIds,
-    writer: &SharedWriter,
-) {
-    let session_ids = workspace_manager.read().await.sessions_for_window(window_id);
+async fn handle_close_window(window_id: WindowId, context: &ClientDispatchContext<'_>) {
+    if window_id != context.window_id {
+        send_error(context.writer, &format!("cannot close another window: {window_id}")).await;
+        return;
+    }
+
+    let session_ids = context.server.workspace_manager.read().await.sessions_for_window(window_id);
     info!(%window_id, count = session_ids.len(), "closing window — destroying sessions");
 
     // Destroy each session. For fresh sessions `Pty::Drop` sends SIGHUP;
     // for handoff-restored sessions (`pty: None`) we signal explicitly.
     {
-        let mut sessions = live_sessions.write().await;
+        let mut sessions = context.server.live_sessions.write().await;
         for &sid in &session_ids {
             if let Some(session) = sessions.remove(&sid) {
                 signal_if_handoff_session(sid, &session);
                 // `session` dropped here — `Pty::Drop` fires if `pty` is `Some`.
             }
-            attached_remove(attached_ids, sid).await;
+            attached_remove(context.attached_ids, sid).await;
         }
     }
 
     // Remove window and all session→window mappings.
-    let mut wm = workspace_manager.write().await;
+    let mut wm = context.server.workspace_manager.write().await;
     for &sid in &session_ids {
         wm.remove_session(sid);
     }
     wm.remove_window(window_id);
     drop(wm);
 
-    send_message(writer, &ServerMessage::WindowClosed { window_id }).await;
+    send_message(context.writer, &ServerMessage::WindowClosed { window_id }).await;
 }
 
 /// Resize the terminal and PTY.
@@ -1435,9 +1434,15 @@ async fn handle_subscribe(
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     writer: &SharedWriter,
     live_sessions: &LiveSessionRegistry,
+    attached_ids: &AttachedSessionIds,
 ) {
     let sessions = live_sessions.read().await;
     for &session_id in session_ids {
+        if !attached_contains(attached_ids, session_id).await {
+            warn!(%session_id, "Subscribe denied for unattached session");
+            continue;
+        }
+
         let Some(session) = sessions.get(&session_id) else {
             continue;
         };
@@ -1458,7 +1463,14 @@ async fn handle_request_snapshot(
     session_id: SessionId,
     writer: &SharedWriter,
     live_sessions: &LiveSessionRegistry,
+    attached_ids: &AttachedSessionIds,
 ) {
+    if !attached_contains(attached_ids, session_id).await {
+        send_error(writer, &format!("RequestSnapshot denied for unattached session {session_id}"))
+            .await;
+        return;
+    }
+
     let sessions = live_sessions.read().await;
     let Some(session) = sessions.get(&session_id) else {
         send_error(writer, &format!("RequestSnapshot for unknown session {session_id}")).await;
@@ -1574,9 +1586,15 @@ async fn handle_attach_sessions(
     dimensions: &[TerminalSize],
     context: &mut ClientDispatchContext<'_>,
 ) {
+    let (session_ids, dimensions) =
+        filter_attachable_sessions(session_ids, dimensions, context).await;
+    if session_ids.is_empty() {
+        return;
+    }
+
     let attached = crate::attach_flow::attach_sessions(
-        session_ids,
-        dimensions,
+        &session_ids,
+        &dimensions,
         &context.server.live_sessions,
         crate::attach_flow::AttachClientContext {
             writer: context.writer,
@@ -1585,6 +1603,41 @@ async fn handle_attach_sessions(
     )
     .await;
     attached_extend(context.attached_ids, attached).await;
+}
+
+async fn filter_attachable_sessions(
+    session_ids: &[SessionId],
+    dimensions: &[TerminalSize],
+    context: &ClientDispatchContext<'_>,
+) -> (Vec<SessionId>, Vec<TerminalSize>) {
+    let wm = context.server.workspace_manager.read().await;
+    let include_dimensions = !dimensions.is_empty();
+    let mut allowed_ids = Vec::with_capacity(session_ids.len());
+    let mut allowed_dimensions = Vec::with_capacity(dimensions.len().min(session_ids.len()));
+    let mut denied_ids = Vec::new();
+
+    for (idx, &session_id) in session_ids.iter().enumerate() {
+        match wm.window_for_session(session_id) {
+            Some(owner) if owner != context.window_id => {
+                warn!(%session_id, owner = %owner, requester = %context.window_id, "AttachSessions denied for another window's session");
+                denied_ids.push(session_id);
+            }
+            _ => {
+                allowed_ids.push(session_id);
+                if include_dimensions {
+                    allowed_dimensions.push(dimensions.get(idx).copied().unwrap_or_default());
+                }
+            }
+        }
+    }
+    drop(wm);
+
+    for session_id in denied_ids {
+        send_error(context.writer, &format!("AttachSessions denied for session {session_id}"))
+            .await;
+    }
+
+    (allowed_ids, allowed_dimensions)
 }
 
 /// Handle `ConfigReloaded` — reload the config file and apply live changes.
@@ -1695,27 +1748,27 @@ async fn handle_dispatch_action(
     requested_window_id: Option<WindowId>,
     action: AutomationAction,
     connected_clients: &ConnectedClients,
+    sender_window_id: WindowId,
     writer: &SharedWriter,
 ) {
+    if let Some(window_id) = requested_window_id {
+        if window_id != sender_window_id {
+            send_error(writer, &format!("cannot dispatch action to another window: {window_id}"))
+                .await;
+            return;
+        }
+    }
+
     let connected = connected_clients.read().await;
-    let target_window_id = requested_window_id.map_or_else(
-        || {
-            let mut ids: Vec<WindowId> = connected.keys().copied().collect();
-            ids.sort_by_key(|window_id| window_id.to_full_string());
-            ids.first().copied()
-        },
-        |window_id| connected.contains_key(&window_id).then_some(window_id),
-    );
+    let requested_window_id = requested_window_id.unwrap_or(sender_window_id);
+    let target_window_id =
+        connected.contains_key(&requested_window_id).then_some(requested_window_id);
 
     let target_writer = target_window_id.and_then(|window_id| connected.get(&window_id).cloned());
     drop(connected);
 
     let Some(target_window_id) = target_window_id else {
-        if let Some(window_id) = requested_window_id {
-            send_error(writer, &format!("window not connected: {window_id}")).await;
-        } else {
-            send_error(writer, "no connected windows").await;
-        }
+        send_error(writer, &format!("window not connected: {requested_window_id}")).await;
         return;
     };
     let Some(target_writer) = target_writer else {
@@ -2622,21 +2675,30 @@ pub async fn defuse_for_handoff(live_sessions: &LiveSessionRegistry) {
 /// other unconnected windows should be spawned as separate processes.
 ///
 /// When `hello_window_id` is `Some`, the client already knows its ID
-/// (e.g. it was launched with `--window-id`). When `None`, this is a
-/// fresh launch — if there are unconnected windows with sessions
-/// (restart scenario), the client adopts one instead of creating a new ID.
+/// (e.g. it was launched with `--window-id`) and may claim it only if no
+/// current client owns that window. When `None`, this is a fresh launch — if
+/// there are unconnected windows with sessions (restart scenario), the client
+/// adopts one instead of creating a new ID.
 fn resolve_window_assignment<V>(
     hello_window_id: Option<WindowId>,
     windows_with_sessions: &HashSet<WindowId>,
     connected: &HashMap<WindowId, V>,
 ) -> (WindowId, Vec<WindowId>) {
-    let assigned = hello_window_id.unwrap_or_else(|| {
+    let next_unconnected = || {
         windows_with_sessions
             .iter()
             .find(|wid| !connected.contains_key(wid))
             .copied()
             .unwrap_or_else(WindowId::new)
-    });
+    };
+    let assigned = match hello_window_id {
+        Some(window_id) if !connected.contains_key(&window_id) => window_id,
+        Some(window_id) => {
+            warn!(%window_id, "requested window is already connected; assigning a different window");
+            next_unconnected()
+        }
+        None => next_unconnected(),
+    };
 
     let other_windows: Vec<WindowId> = windows_with_sessions
         .iter()
@@ -2830,6 +2892,7 @@ mod tests {
             Some(window_id),
             AutomationAction::OpenSettings,
             &connected,
+            window_id,
             &request_writer,
         )
         .await;
@@ -2859,6 +2922,7 @@ mod tests {
             Some(missing_window),
             AutomationAction::OpenSettings,
             &connected,
+            missing_window,
             &request_writer,
         )
         .await;

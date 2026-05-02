@@ -31,6 +31,7 @@ version = 2
 unmaintained = "all"
 unsound = "all"
 ignore = [
+  # Owner: Scribe maintainers. Review by 2026-08-01 or when wry moves off GTK3.
   # GTK3 bindings unmaintained — transitive via wry (webview); no GTK4 wry yet
   "RUSTSEC-2024-0411", # gdkwayland-sys
   "RUSTSEC-2024-0412", # atk
@@ -46,6 +47,7 @@ ignore = [
   "RUSTSEC-2024-0370",
   # glib VariantStrIter unsoundness — transitive via GTK3 bindings
   "RUSTSEC-2024-0429",
+  # Owner: Scribe maintainers. Review by 2026-08-01 or when transitive users update.
   # time 0.3.x stack exhaustion DoS — transitive via various crates
   "RUSTSEC-2026-0009",
 ]

@@ -62,6 +62,8 @@ Each session's attach work runs on its own `tokio::spawn`ed task and the per-ses
 
 When a new client attaches, the attach flow usually resizes each session's Term and PTY to the client-provided dimensions before taking the replay. This ensures the replay matches the client's pane grid and absorbs the shell's SIGWINCH response before the client writer is set. Sessions still serving a preserved v4 legacy handoff snapshot skip that pre-replay resize so a live foreground process cannot redraw over the pre-upgrade history before the first replay reaches the client.
 
+Attach, subscribe, and snapshot requests are scoped to the caller's attached sessions and window ownership. A new connection may claim a persisted window ID only when that window is not already connected.
+
 When the connected-client map drops to zero, the server starts a short 250 ms grace timer before asking the singleton settings process to quit over `settings.sock`. If a client reconnects during that grace window, the settings shutdown is skipped so hot-reload or restart handoffs do not spuriously close the settings window.
 
 ### Terminal Resize
@@ -102,6 +104,8 @@ Zero-downtime server upgrades are implemented in [[crates/scribe-server/src/hand
 
 The new server (with `--upgrade`) connects to the old server's handoff socket, sends `SCRIBE_UPGRADE` magic bytes, and receives serialized state plus PTY master fds via SCM_RIGHTS.
 
+On Linux and macOS, the old server also verifies that the peer PID is a permitted Scribe server executable running with `--upgrade` before sending state or PTY fds. This prevents arbitrary same-UID clients from speaking the raw handoff protocol.
+
 An ACK confirms receipt. If the ACK is not received (version mismatch, peer crash), the old server logs the failure and loops back to accept the next connection — it keeps serving until a compatible upgrade succeeds or `postinst` cold-restarts it. The handoff version is tracked to detect incompatible format changes. The new server emits `"IPC server listening"` immediately after it binds the IPC socket (see [[crates/scribe-server/src/main.rs#run_server_loop]]), which is the Debian hot-reload watchdog's bind-ready signal — session restoration continues on the same task after that log so the watchdog never blocks on per-session work.
 
 ### State Transfer
@@ -132,7 +136,7 @@ The new server already holds the master fds via SCM_RIGHTS. Because defused sess
 
 ### Size Limits
 
-Maximum handoff state size is 1 GiB. Maximum file descriptors transferred is 1024. Both the sender and receiver verify peer UID for defense-in-depth.
+Maximum handoff state size is 256 MiB. Maximum file descriptors transferred is 1024. Both sides verify peer UID, and Linux/macOS senders validate the peer process before sending sensitive state.
 
 Typical v5 compressed payloads are in the low tens of megabytes even for many sessions at the default `scrollback_lines = 10_000`, since the ANSI replay + zstd combination is roughly 20-100x denser than the v4 per-cell MessagePack encoding.
 
@@ -171,6 +175,8 @@ The reply channel has capacity 1; concurrent requests fail-fast with `Failed { r
 ### Install Flow
 
 Downloads the platform-specific asset via streaming (no full buffering in memory) and fetches its minisig signature in parallel, then verifies with the embedded real minisign public key.
+
+Downloads are staged in a private per-update runtime directory with owner-only files, download byte caps, and request timeouts. Linux installs keep the verified package fd open, unlink the path, and pass `/proc/{pid}/fd/{fd}` to `pkexec dpkg` so the privileged install reads the verified inode rather than a mutable temp path.
 
 On Linux, installation uses `pkexec dpkg -i`; the Debian maintainer scripts recover the invoking desktop UID from `SUDO_UID` or `PKEXEC_UID` so user services, runtime directories, and hook setup still target the logged-in user. Updater-triggered installs also create a runtime `update-defer-cold-restart` marker first, so `postinst` can report a handoff failure back to the UI with `update-restart-required` instead of immediately killing live sessions. On macOS, it uses `hdiutil attach` + `ditto` and replaces the currently running `.app` bundle derived from `current_exe()` instead of assuming `/Applications/Scribe.app`. Progress is broadcast to all connected clients.
 
