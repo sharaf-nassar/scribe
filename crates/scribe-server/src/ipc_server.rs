@@ -28,8 +28,8 @@ use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    AutomationAction, ClientMessage, SearchMatch, ServerMessage, SessionInfo, TerminalSize,
-    WindowInfo, WorkspaceListEntry, WorkspaceTreeNode,
+    AutomationAction, ClientMessage, PromptMarkKind, SearchMatch, ServerMessage, SessionInfo,
+    TerminalSize, WindowInfo, WorkspaceListEntry, WorkspaceTreeNode,
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
@@ -2123,6 +2123,12 @@ async fn handle_session_event(
     match event {
         SessionEvent::Metadata(event) => {
             update_ai_provider_state(state, &event);
+            // AiProviderArmed is a server-internal pre-arm signal —
+            // no ServerMessage variant exists for it and the client
+            // doesn't need to track it.
+            if matches!(event, MetadataEvent::AiProviderArmed { .. }) {
+                return;
+            }
             classify_event(&event, saw_title_change, saw_cwd_change, &mut state.last_proc_cwd);
             send_metadata_event(
                 event,
@@ -2161,14 +2167,39 @@ async fn handle_session_event(
 }
 
 fn update_ai_provider_state(state: &mut PtyReaderState, event: &MetadataEvent) {
-    // Don't clear ai_provider on inactive — the ED 3 filter must remain
-    // engaged across tool restarts.  Without this, `codex --resume` sends
-    // ED 3 before re-identifying via OSC 1337, slipping through the filter
-    // and wiping scrollback.  The AiStateCleared event is still forwarded
-    // to the client for UI tracking. Scrollback epoch resets are applied
-    // before filtering in `prepare_preserved_ai_scrollback_epoch`.
-    if let MetadataEvent::AiStateChanged(ai_state) = event {
-        state.ai_provider = Some(ai_state.provider);
+    // ai_provider lifecycle:
+    //
+    //   AiStateChanged                          → SET (AI tool announced itself)
+    //   AiProviderArmed { provider }            → SET (shell preexec pre-arm,
+    //                                                  covers `<tool> --resume`'s
+    //                                                  pre-OSC-1337 ED 3)
+    //   AiStateCleared                          → CLEAR (explicit inactive)
+    //   PromptMark { kind: PromptStart, .. }    → CLEAR (shell prompt returned;
+    //                                                    the AI tool has exited
+    //                                                    and we're back in plain
+    //                                                    shell — vim/less/etc.
+    //                                                    must not be filtered)
+    //
+    // On both clear paths, reset the preserved-scrollback trim baseline so a
+    // stale AI-era baseline can't trim a later main-screen redraw back into
+    // AI-era content. Without this reset, `preserved_ai_scrollback` would still
+    // hold a baseline pointing into history that no longer represents an active
+    // AI epoch, and a subsequent same-epoch ED 3 (after pre-arm re-engages)
+    // would trim to the wrong row.
+    match event {
+        MetadataEvent::AiStateChanged(ai_state) => {
+            state.ai_provider = Some(ai_state.provider);
+        }
+        MetadataEvent::AiProviderArmed { provider } => {
+            state.ai_provider = Some(*provider);
+        }
+        MetadataEvent::AiStateCleared
+        | MetadataEvent::PromptMark { kind: PromptMarkKind::PromptStart, .. } => {
+            state.ai_provider = None;
+            state.preserved_ai_scrollback.reset();
+            state.pending_ai_scrollback_baseline = false;
+        }
+        _ => {}
     }
 }
 
@@ -2210,12 +2241,12 @@ fn should_apply_codex_hook_log_filter(state: &PtyReaderState) -> bool {
 }
 
 fn chunk_mentions_ed3_provider(events: &[MetadataEvent]) -> bool {
-    events.iter().any(|event| {
-        matches!(
-            event,
-            MetadataEvent::AiStateChanged(ai_state)
-                if ai_provider_uses_ed3_filter(Some(ai_state.provider))
-        )
+    events.iter().any(|event| match event {
+        MetadataEvent::AiStateChanged(ai_state) => {
+            ai_provider_uses_ed3_filter(Some(ai_state.provider))
+        }
+        MetadataEvent::AiProviderArmed { provider } => ai_provider_uses_ed3_filter(Some(*provider)),
+        _ => false,
     })
 }
 
@@ -2502,7 +2533,9 @@ async fn send_metadata_event(
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     live_sessions: &LiveSessionRegistry,
 ) {
-    let (server_msg, cwd_for_workspace) = convert_metadata_event(event, session_id);
+    let Some((server_msg, cwd_for_workspace)) = convert_metadata_event(event, session_id) else {
+        return;
+    };
 
     persist_session_metadata(&server_msg, session_id, live_sessions).await;
 
@@ -2526,47 +2559,55 @@ async fn send_metadata_event(
 }
 
 /// Convert a `MetadataEvent` to a `ServerMessage` and an optional CWD.
-/// The second tuple element is `Some(cwd)` only for `CwdChanged` events,
-/// which also need workspace naming and git-branch updates.
+/// Returns `None` for server-internal events that have no client-facing
+/// `ServerMessage` (e.g. `AiProviderArmed`). The inner second tuple element
+/// is `Some(cwd)` only for `CwdChanged` events, which also need workspace
+/// naming and git-branch updates.
 fn convert_metadata_event(
     event: MetadataEvent,
     session_id: SessionId,
-) -> (ServerMessage, Option<std::path::PathBuf>) {
+) -> Option<(ServerMessage, Option<std::path::PathBuf>)> {
     match event {
         MetadataEvent::CwdChanged(cwd) => {
             let msg = ServerMessage::CwdChanged { session_id, cwd: cwd.clone() };
-            (msg, Some(cwd))
+            Some((msg, Some(cwd)))
         }
         MetadataEvent::SessionContextChanged(context) => {
-            (ServerMessage::SessionContextChanged { session_id, context }, None)
+            Some((ServerMessage::SessionContextChanged { session_id, context }, None))
         }
         MetadataEvent::TitleChanged(title) => {
-            (ServerMessage::TitleChanged { session_id, title }, None)
+            Some((ServerMessage::TitleChanged { session_id, title }, None))
         }
         MetadataEvent::TaskLabelChanged { provider: AiProvider::CodexCode, label }
         | MetadataEvent::CodexTaskLabelChanged(label) => {
-            (ServerMessage::CodexTaskLabelChanged { session_id, task_label: label }, None)
+            Some((ServerMessage::CodexTaskLabelChanged { session_id, task_label: label }, None))
         }
-        MetadataEvent::TaskLabelChanged { provider, label } => {
-            (ServerMessage::TaskLabelChanged { session_id, provider, task_label: label }, None)
-        }
+        MetadataEvent::TaskLabelChanged { provider, label } => Some((
+            ServerMessage::TaskLabelChanged { session_id, provider, task_label: label },
+            None,
+        )),
         MetadataEvent::TaskLabelCleared { provider: AiProvider::CodexCode }
         | MetadataEvent::CodexTaskLabelCleared => {
-            (ServerMessage::CodexTaskLabelCleared { session_id }, None)
+            Some((ServerMessage::CodexTaskLabelCleared { session_id }, None))
         }
         MetadataEvent::TaskLabelCleared { provider } => {
-            (ServerMessage::TaskLabelCleared { session_id, provider }, None)
+            Some((ServerMessage::TaskLabelCleared { session_id, provider }, None))
         }
         MetadataEvent::AiStateChanged(ai_state) => {
-            (ServerMessage::AiStateChanged { session_id, ai_state }, None)
+            Some((ServerMessage::AiStateChanged { session_id, ai_state }, None))
         }
-        MetadataEvent::AiStateCleared => (ServerMessage::AiStateCleared { session_id }, None),
-        MetadataEvent::Bell => (ServerMessage::Bell { session_id }, None),
+        MetadataEvent::AiStateCleared => Some((ServerMessage::AiStateCleared { session_id }, None)),
+        // AiProviderArmed is a server-internal pre-arm signal handled entirely
+        // inside `update_ai_provider_state`; there is no client-facing
+        // ServerMessage for it. `handle_session_event` also short-circuits
+        // before reaching here, so returning None is purely defensive.
+        MetadataEvent::AiProviderArmed { .. } => None,
+        MetadataEvent::Bell => Some((ServerMessage::Bell { session_id }, None)),
         MetadataEvent::PromptMark { kind, click_events, exit_code } => {
-            (ServerMessage::PromptMark { session_id, kind, click_events, exit_code }, None)
+            Some((ServerMessage::PromptMark { session_id, kind, click_events, exit_code }, None))
         }
         MetadataEvent::PromptReceived { provider, text } => {
-            (ServerMessage::PromptReceived { session_id, provider, text }, None)
+            Some((ServerMessage::PromptReceived { session_id, provider, text }, None))
         }
     }
 }
@@ -2898,13 +2939,15 @@ mod tests {
     #[test]
     fn codex_task_label_metadata_preserves_legacy_wire_variant() {
         let session_id = SessionId::new();
-        let (changed_message, changed_cwd) = convert_metadata_event(
+        let Some((changed_message, changed_cwd)) = convert_metadata_event(
             MetadataEvent::TaskLabelChanged {
                 provider: AiProvider::CodexCode,
                 label: String::from("refactor parser"),
             },
             session_id,
-        );
+        ) else {
+            panic!("convert_metadata_event returned None for TaskLabelChanged");
+        };
 
         assert!(changed_cwd.is_none());
         assert!(matches!(
@@ -2913,10 +2956,12 @@ mod tests {
                 if sid == session_id && task_label == "refactor parser"
         ));
 
-        let (cleared_message, cleared_cwd) = convert_metadata_event(
+        let Some((cleared_message, cleared_cwd)) = convert_metadata_event(
             MetadataEvent::TaskLabelCleared { provider: AiProvider::CodexCode },
             session_id,
-        );
+        ) else {
+            panic!("convert_metadata_event returned None for TaskLabelCleared");
+        };
 
         assert!(cleared_cwd.is_none());
         assert!(matches!(
@@ -2928,13 +2973,15 @@ mod tests {
     #[test]
     fn auggie_task_label_metadata_uses_generic_wire_variant() {
         let session_id = SessionId::new();
-        let (message, cwd) = convert_metadata_event(
+        let Some((message, cwd)) = convert_metadata_event(
             MetadataEvent::TaskLabelChanged {
                 provider: AiProvider::Auggie,
                 label: String::from("wire compatibility"),
             },
             session_id,
-        );
+        ) else {
+            panic!("convert_metadata_event returned None for TaskLabelChanged");
+        };
 
         assert!(cwd.is_none());
         assert!(matches!(
@@ -3004,6 +3051,140 @@ mod tests {
         let response: ServerMessage = read_message(&mut request_client).await.unwrap();
         assert!(
             matches!(response, ServerMessage::Error { message } if message.contains("window not connected"))
+        );
+    }
+
+    /// Codex (and other Ratatui apps) gate their shaded prompt-panel painting
+    /// on the OSC 10 (foreground) and OSC 11 (background) query responses.
+    /// If `\e]10;?\e\\` doesn't get answered, Codex never sends OSC 11 and never
+    /// emits the `\e[48;2;…m` SGR for the panel. These tests verify that the
+    /// alacritty → `ScribeEventListener` path emits a well-formed `ColorRequest`
+    /// with a formatter that produces the correct wire response.
+    fn make_term_with_listener() -> (
+        alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>,
+        tokio::sync::mpsc::UnboundedReceiver<scribe_pty::event_listener::SessionEvent>,
+    ) {
+        use alacritty_terminal::Term;
+        use alacritty_terminal::grid::Dimensions;
+        use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
+        use tokio::sync::mpsc;
+
+        struct Tiny;
+        impl Dimensions for Tiny {
+            fn total_lines(&self) -> usize {
+                1
+            }
+            fn screen_lines(&self) -> usize {
+                1
+            }
+            fn columns(&self) -> usize {
+                1
+            }
+        }
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let listener = ScribeEventListener::new(SessionId::new(), event_tx);
+        let term = Term::new(crate::session_manager::build_term_config(1), &Tiny, listener);
+        (term, event_rx)
+    }
+
+    #[test]
+    fn osc_10_query_emits_color_request_for_foreground_with_well_formed_response() {
+        use alacritty_terminal::vte::ansi::{NamedColor, Processor, Rgb};
+        use scribe_pty::event_listener::SessionEvent;
+
+        let (mut term, mut event_rx) = make_term_with_listener();
+        let mut processor: Processor<alacritty_terminal::vte::ansi::StdSyncHandler> =
+            Processor::new();
+        processor.advance(&mut term, b"\x1b]10;?\x1b\\");
+
+        let event = event_rx.try_recv().expect("OSC 10 query should emit a ColorRequest event");
+        let SessionEvent::ColorRequest(index, formatter) = event else {
+            panic!("expected ColorRequest variant");
+        };
+        assert_eq!(
+            index,
+            NamedColor::Foreground as usize,
+            "OSC 10 must map to NamedColor::Foreground (256)"
+        );
+
+        let response = formatter(Rgb { r: 0xeb, g: 0xdb, b: 0xb2 });
+        assert!(response.starts_with("\x1b]10;rgb:"), "wire prefix wrong: {response:?}");
+        assert!(response.ends_with("\x1b\\"), "ST terminator missing: {response:?}");
+        assert!(
+            response.contains("ebeb/dbdb/b2b2"),
+            "8-bit channels must be encoded as duplicated 16-bit hex pairs: {response:?}"
+        );
+    }
+
+    #[test]
+    fn osc_11_query_emits_color_request_for_background_with_well_formed_response() {
+        use alacritty_terminal::vte::ansi::{NamedColor, Processor, Rgb};
+        use scribe_pty::event_listener::SessionEvent;
+
+        let (mut term, mut event_rx) = make_term_with_listener();
+        let mut processor: Processor<alacritty_terminal::vte::ansi::StdSyncHandler> =
+            Processor::new();
+        processor.advance(&mut term, b"\x1b]11;?\x1b\\");
+
+        let event = event_rx.try_recv().expect("OSC 11 query should emit a ColorRequest event");
+        let SessionEvent::ColorRequest(index, formatter) = event else {
+            panic!("expected ColorRequest variant");
+        };
+        assert_eq!(
+            index,
+            NamedColor::Background as usize,
+            "OSC 11 must map to NamedColor::Background (257)"
+        );
+
+        let response = formatter(Rgb { r: 0x28, g: 0x28, b: 0x28 });
+        assert!(response.starts_with("\x1b]11;rgb:"), "wire prefix wrong: {response:?}");
+        assert!(response.ends_with("\x1b\\"), "ST terminator missing: {response:?}");
+        assert!(
+            response.contains("2828/2828/2828"),
+            "8-bit channels must be encoded as duplicated 16-bit hex pairs: {response:?}"
+        );
+    }
+
+    /// Verifies the fallback color-lookup table that `current_term_color` uses
+    /// when alacritty's runtime palette has no override for the queried index.
+    /// If this returned `None` for Foreground / Background, the OSC reply would
+    /// degrade to opaque black (see `current_term_color`), which is the most
+    /// likely cause of Codex skipping its bg-shading code path.
+    #[test]
+    fn theme_color_for_index_returns_named_slots_for_osc_10_11_12() {
+        use alacritty_terminal::vte::ansi::NamedColor;
+        use scribe_common::theme::{Theme, ThemeColors};
+        use std::borrow::Cow;
+
+        let fg = [0.92, 0.86, 0.70, 1.0];
+        let bg = [0.16, 0.16, 0.16, 1.0];
+        let cursor = [0.5, 0.5, 0.5, 1.0];
+        let theme = Theme::from_colors(&ThemeColors {
+            name: Cow::Borrowed("test"),
+            foreground: fg,
+            background: bg,
+            cursor,
+            cursor_accent: bg,
+            selection: [0.25, 0.25, 0.28, 1.0],
+            selection_foreground: fg,
+            ansi_colors: [[0.0, 0.0, 0.0, 1.0]; 16],
+        });
+
+        assert_eq!(
+            theme_color_for_index(&theme, NamedColor::Foreground as usize),
+            Some(fg),
+            "OSC 10 must resolve to theme.foreground, not the black fallback"
+        );
+        assert_eq!(
+            theme_color_for_index(&theme, NamedColor::Background as usize),
+            Some(bg),
+            "OSC 11 must resolve to theme.background, not the black fallback"
+        );
+        assert_eq!(
+            theme_color_for_index(&theme, NamedColor::Cursor as usize),
+            Some(cursor),
+            "OSC 12 must resolve to theme.cursor, not the black fallback"
         );
     }
 }

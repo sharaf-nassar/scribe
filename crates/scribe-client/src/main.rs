@@ -3910,7 +3910,17 @@ impl App {
                     ctx.ansi_colors,
                     &self.config.terminal,
                 );
-                tab_bar::TabData { title, is_active: index == entry.ws.active_tab, ai_indicator }
+                let context_suffix = self.ai_tracker.tab_context_suffix(
+                    tab_state.session_id,
+                    &self.config.terminal.ai_session.context_thresholds,
+                    scribe_renderer::srgb_to_linear_rgba(self.theme.chrome.tab_text),
+                );
+                tab_bar::TabData {
+                    title,
+                    is_active: index == entry.ws.active_tab,
+                    ai_indicator,
+                    context_suffix,
+                }
             })
             .collect();
         let badge_cols = tab_bar::badge_columns(entry.ws.name.as_deref(), ctx.multi_workspace);
@@ -4173,6 +4183,9 @@ impl App {
         prepared: &PreparedFrame,
         all_instances: &mut Vec<CellInstance>,
     ) -> bool {
+        // Compute before the mutable gpu borrow to avoid a borrow conflict.
+        let focused_ai_context =
+            self.focused_session_id().and_then(|sid| self.ai_tracker.context_for(sid));
         let Some(gpu) = self.gpu.as_mut() else { return false };
         let time_str = current_time_str();
         self.sys_stats.maybe_refresh();
@@ -4201,6 +4214,8 @@ impl App {
             update_progress: self.update_progress.as_ref(),
             sys_stats: Some(self.sys_stats.stats()),
             stats_config: Some(&self.config.terminal.status_bar_stats),
+            ai_context: focused_ai_context,
+            context_thresholds: &self.config.terminal.ai_session.context_thresholds,
         };
         let mut status_bar_resolve_glyph =
             |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);

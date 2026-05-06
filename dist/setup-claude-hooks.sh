@@ -146,6 +146,57 @@ for event, scribe_entries in scribe_by_event.items():
 
 settings["hooks"] = hooks
 
+# ── Clean up any Scribe-owned statusLine before re-inserting ─────────────
+# This handles uninstall: if statusLine still points at our shim, remove it.
+existing_sl = settings.get("statusLine")
+if isinstance(existing_sl, dict):
+    cmd = existing_sl.get("command", "")
+    if cmd.endswith("scribe-claude-statusline.sh"):
+        settings.pop("statusLine", None)
+
+# ── Resolve the install prefix so we work on scribe-dev and macOS ────
+def find_scribe_install_prefix():
+    env = os.environ.get("SCRIBE_INSTALL_PREFIX")
+    if env and os.path.isdir(env):
+        return env
+    for p in (
+        "/usr/share/scribe",
+        "/usr/share/scribe-dev",
+        "/usr/local/share/scribe",
+        "/usr/local/share/scribe-dev",
+        # macOS app bundle paths:
+        "/Applications/Scribe.app/Contents/Resources/dist",
+        "/Applications/Scribe-Dev.app/Contents/Resources/dist",
+    ):
+        if os.path.isfile(os.path.join(p, "scribe-claude-statusline.sh")):
+            return p
+    return "/usr/share/scribe"  # safe default
+
+install_prefix = find_scribe_install_prefix()
+
+# ── Ensure statusLine points at our shim ─────────────────────────────
+shim = os.path.join(install_prefix, "scribe-claude-statusline.sh")
+existing_sl = settings.get("statusLine")
+if existing_sl is None:
+    settings["statusLine"] = {
+        "type": "command",
+        "command": shim,
+        "padding": 0,
+    }
+elif isinstance(existing_sl, dict) and existing_sl.get("command", "").endswith("scribe-claude-statusline.sh"):
+    # Already pointing at our shim — refresh path in case of relocation.
+    existing_sl["command"] = shim
+    existing_sl.setdefault("type", "command")
+    existing_sl.setdefault("padding", 0)
+else:
+    # User has their own statusLine; do not clobber.
+    print(
+        "scribe: leaving custom statusLine intact; "
+        "Claude context % will not be displayed unless you point statusLine at "
+        + shim,
+        file=sys.stderr,
+    )
+
 # Write atomically via tmp + rename
 tmp_path = settings_path + ".tmp"
 with open(tmp_path, "w") as f:

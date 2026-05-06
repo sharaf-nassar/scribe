@@ -9,8 +9,11 @@
 use std::collections::HashMap;
 
 use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
-use scribe_common::config::{AiStateEntry, AiStateStylesConfig, TerminalConfig};
+use scribe_common::config::{
+    AiContextThresholds, AiStateEntry, AiStateStylesConfig, TerminalConfig,
+};
 use scribe_common::ids::SessionId;
+use scribe_common::theme::hex_to_rgba;
 use scribe_renderer::chrome::solid_quad;
 use scribe_renderer::types::CellInstance;
 
@@ -159,6 +162,46 @@ impl AiStateTracker {
     /// Provider last seen for a session, if any.
     pub fn provider_for_session(&self, session_id: SessionId) -> Option<AiProvider> {
         self.detected_providers.get(&session_id).copied()
+    }
+
+    /// Return the latest context-window usage percentage for a session, or
+    /// `None` when no context value has been received.
+    #[must_use]
+    pub fn context_for(&self, session: SessionId) -> Option<u8> {
+        self.states.get(&session)?.context
+    }
+
+    /// Return a colored context-% suffix to append to a tab label, or `None`
+    /// when no suffix should be drawn.
+    ///
+    /// Returns `Some((" NN%", color))` only when:
+    /// - the session has a context value at or above `thresholds.warn`, AND
+    /// - the session's AI state is NOT `PermissionPrompt` or `WaitingForInput`
+    ///   (those use the existing pulse indicators and must not compete).
+    ///
+    /// Color is derived from `thresholds.color_for(ctx)` via `hex_to_rgba` →
+    /// `srgb_to_linear_rgba`. Falls back to `fallback_color` on parse failure,
+    /// matching the symmetry of `build_context_segment` in the status bar.
+    #[must_use]
+    pub fn tab_context_suffix(
+        &self,
+        session: SessionId,
+        thresholds: &AiContextThresholds,
+        fallback_color: [f32; 4],
+    ) -> Option<(String, [f32; 4])> {
+        let ps = self.states.get(&session)?;
+        // Suppress suffix when pulsing/attention states are active.
+        if matches!(ps.state, AiState::PermissionPrompt | AiState::WaitingForInput) {
+            return None;
+        }
+        let ctx = ps.context?;
+        if ctx < thresholds.warn {
+            return None;
+        }
+        let hex = thresholds.color_for(ctx);
+        let color =
+            hex_to_rgba(hex).map(scribe_renderer::srgb_to_linear_rgba).unwrap_or(fallback_color);
+        Some((format!(" {ctx}%"), color))
     }
 
     /// Compute the tab-bar indicator colour for a session.
@@ -374,10 +417,136 @@ pub fn build_border_instances(
 mod tests {
     use super::AiStateTracker;
     use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
-    use scribe_common::config::TerminalConfig;
+    use scribe_common::config::{AiContextThresholds, TerminalConfig};
     use scribe_common::ids::SessionId;
+    use scribe_common::theme::hex_to_rgba;
+
+    const TEST_FALLBACK_COLOR: [f32; 4] = [0.5, 0.5, 0.5, 1.0];
 
     const ANSI_COLORS: [[f32; 4]; 16] = [[0.25, 0.5, 0.75, 1.0]; 16];
+
+    /// Compare two `[f32; 4]` arrays by bit pattern (deterministic float equality).
+    fn colors_eq(a: [f32; 4], b: [f32; 4]) -> bool {
+        a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    fn make_state_with_ctx(state: AiState, ctx: u8) -> AiProcessState {
+        AiProcessState { context: Some(ctx), ..AiProcessState::new(state) }
+    }
+
+    // @lat: [[client#Tab Bar#tab_context_suffix_below_warn_returns_none]]
+    #[test]
+    fn tab_context_suffix_below_warn_returns_none() {
+        let mut tracker = AiStateTracker::default();
+        let sid = SessionId::new();
+        tracker.update(sid, make_state_with_ctx(AiState::Processing, 50));
+        let thresholds = AiContextThresholds::default();
+        assert!(tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR).is_none());
+    }
+
+    // @lat: [[client#Tab Bar#tab_context_suffix_at_warn_returns_warn_color]]
+    #[test]
+    fn tab_context_suffix_at_warn_returns_warn_color() {
+        let mut tracker = AiStateTracker::default();
+        let sid = SessionId::new();
+        tracker.update(sid, make_state_with_ctx(AiState::Processing, 70));
+        let thresholds = AiContextThresholds::default();
+        let result = tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR);
+        assert!(result.is_some(), "expected Some for ctx=70 (warn threshold)");
+        let (text, color) = result.unwrap();
+        assert_eq!(text, " 70%");
+        let expected = scribe_renderer::srgb_to_linear_rgba(hex_to_rgba("#d4a017").unwrap());
+        assert!(colors_eq(color, expected), "expected warn color");
+    }
+
+    // @lat: [[client#Tab Bar#tab_context_suffix_at_danger_returns_danger_color]]
+    #[test]
+    fn tab_context_suffix_at_danger_returns_danger_color() {
+        let mut tracker = AiStateTracker::default();
+        let sid = SessionId::new();
+        tracker.update(sid, make_state_with_ctx(AiState::Processing, 92));
+        let thresholds = AiContextThresholds::default();
+        let result = tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR);
+        assert!(result.is_some(), "expected Some for ctx=92 (danger threshold)");
+        let (text, color) = result.unwrap();
+        assert_eq!(text, " 92%");
+        let expected = scribe_renderer::srgb_to_linear_rgba(hex_to_rgba("#c83030").unwrap());
+        assert!(colors_eq(color, expected), "expected danger color");
+    }
+
+    // @lat: [[client#Tab Bar#tab_context_suffix_suppressed_when_permission_prompt]]
+    #[test]
+    fn tab_context_suffix_suppressed_when_permission_prompt() {
+        let mut tracker = AiStateTracker::default();
+        let sid = SessionId::new();
+        tracker.update(sid, make_state_with_ctx(AiState::PermissionPrompt, 85));
+        let thresholds = AiContextThresholds::default();
+        assert!(tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR).is_none());
+    }
+
+    // @lat: [[client#Tab Bar#tab_context_suffix_suppressed_when_waiting_for_input]]
+    #[test]
+    fn tab_context_suffix_suppressed_when_waiting_for_input() {
+        let mut tracker = AiStateTracker::default();
+        let sid = SessionId::new();
+        tracker.update(sid, make_state_with_ctx(AiState::WaitingForInput, 85));
+        let thresholds = AiContextThresholds::default();
+        assert!(tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR).is_none());
+    }
+
+    // @lat: [[client#Tab Bar#tab_context_suffix_present_when_processing]]
+    #[test]
+    fn tab_context_suffix_present_when_processing() {
+        let mut tracker = AiStateTracker::default();
+        let sid = SessionId::new();
+        tracker.update(sid, make_state_with_ctx(AiState::Processing, 85));
+        let thresholds = AiContextThresholds::default();
+        let result = tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR);
+        assert!(result.is_some(), "expected Some for Processing + ctx=85");
+        let (text, color) = result.unwrap();
+        assert_eq!(text, " 85%");
+        // 85 is in warn band (>= 70, < 90)
+        let expected = scribe_renderer::srgb_to_linear_rgba(hex_to_rgba("#d4a017").unwrap());
+        assert!(colors_eq(color, expected), "expected warn color for ctx=85");
+    }
+
+    // @lat: [[client#Tab Bar#tab_context_suffix_none_when_no_session]]
+    #[test]
+    fn tab_context_suffix_none_when_no_session() {
+        let tracker = AiStateTracker::default();
+        let sid = SessionId::new(); // never inserted
+        let thresholds = AiContextThresholds::default();
+        assert!(tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR).is_none());
+    }
+
+    // @lat: [[client#Tab Bar#tab_context_suffix_none_when_no_context_value]]
+    #[test]
+    fn tab_context_suffix_none_when_no_context_value() {
+        let mut tracker = AiStateTracker::default();
+        let sid = SessionId::new();
+        tracker.update(sid, AiProcessState::new(AiState::Processing)); // context = None
+        let thresholds = AiContextThresholds::default();
+        assert!(tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR).is_none());
+    }
+
+    // @lat: [[client#Tab Bar#tab_context_suffix_falls_back_on_invalid_hex]]
+    #[test]
+    fn tab_context_suffix_falls_back_on_invalid_hex() {
+        let mut tracker = AiStateTracker::default();
+        let sid = SessionId::new();
+        tracker.update(sid, make_state_with_ctx(AiState::Processing, 75));
+        let thresholds = AiContextThresholds {
+            warn_color: "not-a-color".into(),
+            ..AiContextThresholds::default()
+        };
+        let result = tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR);
+        assert!(result.is_some(), "expected Some even when hex parse fails");
+        let (_, color) = result.unwrap();
+        assert!(
+            colors_eq(color, TEST_FALLBACK_COLOR),
+            "expected fallback color when hex parse fails"
+        );
+    }
 
     #[test]
     fn codex_indicator_respects_provider_toggle() {

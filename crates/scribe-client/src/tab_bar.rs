@@ -49,6 +49,12 @@ pub struct TabData {
     pub is_active: bool,
     /// AI state indicator colour. `None` when no active AI state.
     pub ai_indicator: Option<[f32; 4]>,
+    /// Colored context-% suffix appended to the tab label when context usage
+    /// is at or above the warn threshold and the session is not in a pulsing
+    /// attention state. `None` when no suffix should be drawn.
+    ///
+    /// Format: `" NN%"` (single leading space, integer, percent sign).
+    pub context_suffix: Option<(String, [f32; 4])>,
 }
 
 /// Build cell instances for a pane's tab bar background.
@@ -739,6 +745,12 @@ fn render_tab(ctx: &mut TabRenderContext<'_, '_, '_>, tab_idx: usize, tab: &TabD
     for &ch in &display_title {
         ctx.emit_char(ch, fg, tab_bg);
     }
+    // Emit the colored context-% suffix (e.g. " 85%") if present.
+    if let Some((suffix_text, suffix_color)) = &tab.context_suffix {
+        for ch in suffix_text.chars() {
+            ctx.emit_char(ch, *suffix_color, tab_bg);
+        }
+    }
     if show_close {
         ctx.emit_char(' ', fg, tab_bg);
         ctx.emit_char('\u{00D7}', fg, tab_bg);
@@ -776,11 +788,19 @@ fn render_tab(ctx: &mut TabRenderContext<'_, '_, '_>, tab_idx: usize, tab: &TabD
 }
 
 fn tab_display_title(tab: &TabData, tab_w: usize, show_close: bool) -> (Vec<char>, bool, bool) {
-    let available_title = if tab_w >= 4 {
+    // Columns reserved by the leading space + trailing space/close:
+    //   - tab_w < 4: saturating_sub(2) (leading space + trailing space)
+    //   - tab_w >= 4, no close: sub(2)
+    //   - tab_w >= 6, close: sub(4) (leading space + space + × + trailing space)
+    let base_available = if tab_w >= 4 {
         if show_close && tab_w >= 6 { tab_w.saturating_sub(4) } else { tab_w.saturating_sub(2) }
     } else {
         tab_w.saturating_sub(2)
     };
+
+    // Reserve columns for the colored context suffix (e.g. " 85%") if present.
+    let suffix_len = tab.context_suffix.as_ref().map_or(0, |(s, _)| s.chars().count());
+    let available_title = base_available.saturating_sub(suffix_len);
 
     let title_chars: Vec<char> = tab.title.chars().collect();
     let is_truncated = tab_w >= 4 && title_chars.len() > available_title;

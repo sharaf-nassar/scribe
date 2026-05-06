@@ -111,6 +111,20 @@ if (Get-Command Set-PSReadLineOption -ErrorAction SilentlyContinue) {
         $commandText = [string]$CommandAst.Extent.Text
         if (-not [string]::IsNullOrWhiteSpace($commandText)) {
             __Scribe-Osc "2;$(__Scribe-SanitizeContext $commandText)"
+
+            # OSC 1337 ScribeAiLaunch — pre-arm Scribe's ED 3 filter when
+            # the user runs an AI binary, so `<tool> --resume`'s
+            # pre-OSC-1337 ESC [3J still hits the filter even after
+            # ai_provider was cleared by the previous 133;A.
+            $firstWord = ($commandText.Trim() -split '\s+', 2)[0]
+            if (-not [string]::IsNullOrWhiteSpace($firstWord)) {
+                $firstWord = [System.IO.Path]::GetFileName($firstWord)
+                switch ($firstWord) {
+                    'claude' { __Scribe-Osc '1337;ScribeAiLaunch=claude_code' }
+                    'codex' { __Scribe-Osc '1337;ScribeAiLaunch=codex_code' }
+                    'auggie' { __Scribe-Osc '1337;ScribeAiLaunch=auggie' }
+                }
+            }
         }
     }
     Set-PSReadLineKeyHandler -Chord Enter -Function ValidateAndAcceptLine

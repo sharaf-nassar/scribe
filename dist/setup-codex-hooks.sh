@@ -32,6 +32,7 @@ HOOKS_JSON="${CODEX_DIR}/hooks.json"
 HOOK_SCRIPTS=(
     "detect-codex-question.sh"
     "codex-task-label.sh"
+    "detect-codex-context.sh"
 )
 
 # ── Step 1: Check that Codex is installed ────────────────────────────────
@@ -113,6 +114,7 @@ hooks_path = os.path.expanduser("~/.codex/hooks.json")
 hooks_dir = os.path.expanduser("~/.codex/hooks")
 stop_hook_script = os.path.join(hooks_dir, "detect-codex-question.sh")
 task_label_script = os.path.join(hooks_dir, "codex-task-label.sh")
+context_hook_script = os.path.join(hooks_dir, "detect-codex-context.sh")
 
 SCRIBE_HOOKS = [
     ("SessionStart", "startup|resume", [
@@ -133,7 +135,13 @@ SCRIBE_HOOKS = [
 def is_scribe_hook(entry):
     for hook in entry.get("hooks", []):
         cmd = hook.get("command", "")
-        if "CodexState=" in cmd or "CodexTaskLabel" in cmd or "detect-codex-question" in cmd or "codex-task-label" in cmd:
+        if (
+            "CodexState=" in cmd
+            or "CodexTaskLabel" in cmd
+            or "detect-codex-question" in cmd
+            or "codex-task-label" in cmd
+            or "detect-codex-context" in cmd
+        ):
             return True
     return False
 
@@ -160,6 +168,17 @@ stop_entry = {
     "hooks": [{"type": "command", "command": stop_hook_script, "timeout": 30}],
 }
 scribe_by_event.setdefault("Stop", []).append(stop_entry)
+
+# Context % producer: runs on every PostToolUse (no matcher) and Stop.
+context_post_tool_entry = {
+    "hooks": [{"type": "command", "command": context_hook_script, "timeout": 10}],
+}
+scribe_by_event.setdefault("PostToolUse", []).append(context_post_tool_entry)
+
+context_stop_entry = {
+    "hooks": [{"type": "command", "command": context_hook_script, "timeout": 10}],
+}
+scribe_by_event.setdefault("Stop", []).append(context_stop_entry)
 
 for event, scribe_entries in scribe_by_event.items():
     existing = hooks.get(event, [])

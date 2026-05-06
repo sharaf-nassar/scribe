@@ -82,6 +82,25 @@ def __scribe-pre-exec [] {
     __scribe-osc '133;C'
     if not ($command | is-empty) {
         __scribe-osc $"2;((__scribe-sanitize-context $command))"
+
+        # OSC 1337 ScribeAiLaunch — pre-arm Scribe's ED 3 filter when the
+        # user runs an AI binary, so `<tool> --resume`'s pre-OSC-1337
+        # \x1b[3J still hits the filter even after ai_provider was cleared
+        # by the previous 133;A on shell-prompt return.
+        let first_word = (
+            $command
+            | str trim
+            | split row ' '
+            | get 0?
+            | default ''
+            | path basename
+        )
+        match $first_word {
+            'claude' => { __scribe-osc '1337;ScribeAiLaunch=claude_code' }
+            'codex' => { __scribe-osc '1337;ScribeAiLaunch=codex_code' }
+            'auggie' => { __scribe-osc '1337;ScribeAiLaunch=auggie' }
+            _ => {}
+        }
     }
 }
 

@@ -465,6 +465,109 @@ impl Default for AiStateStylesConfig {
 /// Backward-compatible type name retained for downstream code.
 pub type ClaudeStatesConfig = AiStateStylesConfig;
 
+// ---------------------------------------------------------------------------
+// AI Context Thresholds
+// ---------------------------------------------------------------------------
+
+/// Which usage band a context-window percentage falls into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextBand {
+    /// Below the warn threshold — usage is nominal.
+    Ok,
+    /// At or above warn, below danger.
+    Warn,
+    /// At or above the danger threshold.
+    Danger,
+}
+
+/// Color and threshold configuration for the AI context-window usage indicator.
+///
+/// Thresholds are percentages (0–100). A percentage at or above `danger` is
+/// `Danger`; at or above `warn` is `Warn`; below `warn` is `Ok`.
+///
+/// Two-boundary band model. If a partial TOML override produces an inverted
+/// config (`warn > danger`), the `Warn` band collapses to empty — values at or
+/// above `danger` resolve to `Danger`, values below stay `Ok`. Inverted configs
+/// are accepted (no parse error) so partial overrides remain forgiving; users
+/// who want a Warn band must keep `warn <= danger`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiContextThresholds {
+    /// Percentage at which usage enters the Warn band (default: 70).
+    #[serde(default = "default_warn_threshold")]
+    pub warn: u8,
+    /// Percentage at which usage enters the Danger band (default: 90).
+    #[serde(default = "default_danger_threshold")]
+    pub danger: u8,
+    /// Hex color for the Ok band (default: `#5fa05f`).
+    #[serde(default = "default_ok_color")]
+    pub ok_color: String,
+    /// Hex color for the Warn band (default: `#d4a017`).
+    #[serde(default = "default_warn_color")]
+    pub warn_color: String,
+    /// Hex color for the Danger band (default: `#c83030`).
+    #[serde(default = "default_danger_color")]
+    pub danger_color: String,
+}
+
+fn default_warn_threshold() -> u8 {
+    70
+}
+fn default_danger_threshold() -> u8 {
+    90
+}
+fn default_ok_color() -> String {
+    "#5fa05f".into()
+}
+fn default_warn_color() -> String {
+    "#d4a017".into()
+}
+fn default_danger_color() -> String {
+    "#c83030".into()
+}
+
+impl Default for AiContextThresholds {
+    fn default() -> Self {
+        Self {
+            warn: default_warn_threshold(),
+            danger: default_danger_threshold(),
+            ok_color: default_ok_color(),
+            warn_color: default_warn_color(),
+            danger_color: default_danger_color(),
+        }
+    }
+}
+
+impl AiContextThresholds {
+    /// Classify a percentage value into a [`ContextBand`].
+    ///
+    /// Values at or above `danger` resolve to `Danger`; values at or above `warn`
+    /// (but below `danger`) resolve to `Warn`; values below `warn` resolve to `Ok`.
+    ///
+    /// If `warn > danger` is configured (inverted), the `Warn` band is empty: all
+    /// values >= `danger` hit `Danger` first, and all values < `danger` are < `warn`
+    /// by definition, so they remain `Ok`. This is a conservative failure mode.
+    #[must_use]
+    pub fn band(&self, pct: u8) -> ContextBand {
+        if pct >= self.danger {
+            ContextBand::Danger
+        } else if pct >= self.warn {
+            ContextBand::Warn
+        } else {
+            ContextBand::Ok
+        }
+    }
+
+    /// Return the configured hex color string for the band at `pct`.
+    #[must_use]
+    pub fn color_for(&self, pct: u8) -> &str {
+        match self.band(pct) {
+            ContextBand::Ok => &self.ok_color,
+            ContextBand::Warn => &self.warn_color,
+            ContextBand::Danger => &self.danger_color,
+        }
+    }
+}
+
 fn default_processing_entry() -> AiStateEntry {
     AiStateEntry {
         tab_indicator: true,
@@ -613,6 +716,9 @@ pub struct TerminalAiSessionConfig {
     /// Per-state configuration for AI indicators.
     #[serde(default, alias = "claude_states")]
     pub ai_states: AiStateStylesConfig,
+    /// Thresholds and colors for the AI context-window usage indicator.
+    #[serde(default)]
+    pub context_thresholds: AiContextThresholds,
     /// Height of the AI state indicator bar in pixels.
     #[serde(default = "default_indicator_height")]
     pub indicator_height: f32,
@@ -627,6 +733,7 @@ impl Default for TerminalAiSessionConfig {
             preserve_ai_scrollback: true,
             ai_tab_provider: default_ai_tab_provider(),
             ai_states: AiStateStylesConfig::default(),
+            context_thresholds: AiContextThresholds::default(),
             indicator_height: default_indicator_height(),
             shell_integration: ShellIntegrationConfig::default(),
         }
@@ -1639,8 +1746,69 @@ fn try_load_theme_file(name: &str) -> Result<Theme, ScribeError> {
     try_build_theme_from_config(&tc)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
+    use super::{AiContextThresholds, ContextBand};
+
+    #[test]
+    fn ai_context_thresholds_defaults() {
+        let t = AiContextThresholds::default();
+        assert_eq!(t.warn, 70);
+        assert_eq!(t.danger, 90);
+        assert_eq!(t.band(0), ContextBand::Ok);
+        assert_eq!(t.band(50), ContextBand::Ok);
+        assert_eq!(t.band(70), ContextBand::Warn);
+        assert_eq!(t.band(89), ContextBand::Warn);
+        assert_eq!(t.band(90), ContextBand::Danger);
+        assert_eq!(t.band(100), ContextBand::Danger);
+        assert_eq!(t.color_for(50), "#5fa05f");
+        assert_eq!(t.color_for(75), "#d4a017");
+        assert_eq!(t.color_for(95), "#c83030");
+    }
+
+    #[test]
+    fn ai_context_thresholds_deserialize_partial() {
+        // Allow users to override only some keys; missing keys take defaults.
+        let toml = r##"
+warn = 60
+danger_color = "#ff0000"
+"##;
+        let t: AiContextThresholds = toml::from_str(toml).expect("partial config should parse");
+        assert_eq!(t.warn, 60);
+        assert_eq!(t.danger, 90); // default
+        assert_eq!(t.danger_color, "#ff0000");
+        assert_eq!(t.ok_color, "#5fa05f"); // default
+    }
+
+    #[test]
+    fn ai_context_thresholds_inverted_config_collapses_warn() {
+        // Inverted (warn > danger): Warn band collapses to empty due to the
+        // order-of-checks in band(). Values >= danger resolve to Danger; values
+        // < danger are < warn by definition, so they resolve to Ok. Conservative
+        // failure mode keeps usage reporting as Danger rather than missing the
+        // Warn band entirely due to inverted config.
+        let t = AiContextThresholds {
+            warn: 95,
+            danger: 70,
+            ok_color: "#000".into(),
+            warn_color: "#111".into(),
+            danger_color: "#222".into(),
+        };
+        assert_eq!(t.band(50), ContextBand::Ok);
+        assert_eq!(t.band(70), ContextBand::Danger);
+        assert_eq!(t.band(99), ContextBand::Danger);
+    }
+
+    #[test]
+    fn ai_context_thresholds_pct_above_100_resolves_to_danger() {
+        let t = AiContextThresholds::default();
+        assert_eq!(t.band(150), ContextBand::Danger);
+        assert_eq!(t.band(255), ContextBand::Danger);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
     use super::{KeyComboList, ScribeConfig, migrate_legacy_macos_keybindings};
 
     #[test]

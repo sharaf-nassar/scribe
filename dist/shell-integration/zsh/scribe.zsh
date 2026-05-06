@@ -69,6 +69,17 @@ __scribe_preexec() {
 
 	# OSC 2 — update title with running command
 	printf '\e]2;%s\e\\' "$1"
+
+	# OSC 1337 ScribeAiLaunch — pre-arm Scribe's ED 3 filter when the user
+	# runs an AI binary, so `<tool> --resume`'s pre-OSC-1337 \x1b[3J still
+	# hits the filter even after ai_provider was cleared by the previous
+	# 133;A on shell-prompt return.
+	local first_word="${${1%% *}##*/}"
+	case "$first_word" in
+		claude) printf '\e]1337;ScribeAiLaunch=claude_code\e\\' ;;
+		codex) printf '\e]1337;ScribeAiLaunch=codex_code\e\\' ;;
+		auggie) printf '\e]1337;ScribeAiLaunch=auggie\e\\' ;;
+	esac
 }
 
 # URL-encode a path

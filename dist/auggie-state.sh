@@ -114,6 +114,9 @@ handle_session_start() {
 handle_session_end() {
     drain_stdin
     reset_task_label
+    # Tell Scribe the AI tool went inactive so `ai_provider` clears and the
+    # ED 3 filter stops applying to subsequent plain-shell bytes.
+    emit_osc "AuggieState=inactive"
 }
 
 handle_processing() {

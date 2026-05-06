@@ -60,6 +60,8 @@ Clipboard cleanup remains persisted as `claude_copy_cleanup` for backward compat
 
 `terminal.ai_tab_provider` is compatibility-only legacy state; AI tab shortcuts are configured through provider-specific keys: `new_claude_tab`, `new_claude_resume_tab`, `new_codex_tab`, `new_codex_resume_tab`, `new_auggie_tab`, and `new_auggie_resume_tab`.
 
+Context threshold settings are persisted under `terminal.ai_context_thresholds` and control the warn/danger band boundaries and their display colors. `warn` (default 70) and `danger` (default 90) are integer percentages. `ok_color`, `warn_color`, and `danger_color` are `#rrggbb` hex strings (defaults `#888888`, `#d4a017`, `#c83030`). These thresholds gate both the status bar AI context % segment color and the tab inline suffix; see [[common#Configuration#AI Context Thresholds]] for band classification logic.
+
 Shared indicator settings cover Claude Code, Codex, and Auggie. The persisted key is now `ai_states`, while `claude_states` remains accepted as a config alias for backward compatibility. Per-state configuration for processing, waiting_for_input, permission_prompt, and error. Each state has: tab indicator (bool), pane border (bool), colour (hex or ANSI index), pulse milliseconds (u32), and timeout seconds (f32, min 0.0). Both `IdlePrompt` and `WaitingForInput` AI states share the `waiting_for_input` config key. The old `idle_prompt` key is silently ignored if present in existing configs.
 
 ### Keybinding Keys

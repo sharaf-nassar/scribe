@@ -149,3 +149,20 @@ PS1="${PS1:-\\$ }\[\e]133;B\e\\\\\]"
 if [[ "${BASH_VERSINFO[0]}" -ge 5 || ( "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 ) ]]; then
 	PS0=$'\e]133;C\e\\'
 fi
+
+# OSC 1337 ScribeAiLaunch — pre-arm Scribe's ED 3 filter when the user runs an
+# AI binary so `<tool> --resume`'s pre-OSC-1337 \x1b[3J still hits the filter
+# even after ai_provider was cleared by the previous 133;A. DEBUG trap fires
+# for each top-level command bash is about to execute; subshell expansions
+# during PROMPT_COMMAND/PS1 substitution are skipped via BASH_SUBSHELL.
+__scribe_emit_ai_launch() {
+	[[ "${BASH_SUBSHELL:-0}" -ne 0 ]] && return
+	local first_word="${BASH_COMMAND%% *}"
+	first_word="${first_word##*/}"
+	case "$first_word" in
+		claude) printf '\e]1337;ScribeAiLaunch=claude_code\e\\' ;;
+		codex) printf '\e]1337;ScribeAiLaunch=codex_code\e\\' ;;
+		auggie) printf '\e]1337;ScribeAiLaunch=auggie\e\\' ;;
+	esac
+}
+trap '__scribe_emit_ai_launch' DEBUG

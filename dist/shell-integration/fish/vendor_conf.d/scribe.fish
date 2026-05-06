@@ -109,6 +109,21 @@ function __scribe_fish_preexec --on-event fish_preexec
 
     # OSC 2 — update title with running command
     printf '\e]2;%s\e\\' $argv[1]
+
+    # OSC 1337 ScribeAiLaunch — pre-arm Scribe's ED 3 filter when the user
+    # runs an AI binary, so `<tool> --resume`'s pre-OSC-1337 \x1b[3J still
+    # hits the filter even after ai_provider was cleared by the previous
+    # 133;A on shell-prompt return.
+    set -l __scribe_first_word (string split ' ' -- $argv[1])[1]
+    set __scribe_first_word (string replace -r '.*/' '' -- $__scribe_first_word)
+    switch $__scribe_first_word
+        case claude
+            printf '\e]1337;ScribeAiLaunch=claude_code\e\\'
+        case codex
+            printf '\e]1337;ScribeAiLaunch=codex_code\e\\'
+        case auggie
+            printf '\e]1337;ScribeAiLaunch=auggie\e\\'
+    end
 end
 
 # ── Command end (OSC 133;D) ─────────────────────────────────────

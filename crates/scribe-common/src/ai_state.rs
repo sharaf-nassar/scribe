@@ -32,6 +32,14 @@ impl AiProvider {
         }
     }
 
+    /// Inverse of [`Self::id`]. Used by the OSC 1337 `ScribeAiLaunch=<id>`
+    /// pre-arm sentinel so shell integration can re-arm the ED 3 filter
+    /// before an AI binary starts emitting bytes.
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::all().iter().copied().find(|p| p.id() == id)
+    }
+
     #[must_use]
     pub fn display_name(self) -> &'static str {
         match self {

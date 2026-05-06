@@ -39,6 +39,14 @@ pub enum MetadataEvent {
     AiStateChanged(AiProcessState),
     /// The AI state was explicitly cleared (OSC 1337 `ClaudeState=inactive`).
     AiStateCleared,
+    /// Shell-integration sentinel that pre-arms the ED 3 filter for the next
+    /// command. Emitted by `__scribe_preexec` (zsh) / DEBUG trap (bash) /
+    /// equivalents when the user runs `claude`, `codex`, or `auggie`. Lets
+    /// `<tool> --resume` survive its pre-OSC-1337 ED 3 even after `ai_provider`
+    /// has been cleared by an `AiStateCleared` from the previous run.
+    AiProviderArmed {
+        provider: AiProvider,
+    },
     Bell,
     PromptMark {
         kind: PromptMarkKind,
@@ -158,6 +166,12 @@ impl MetadataParser {
         }
         if payload == "ScribeContext" || payload.starts_with("ScribeContext=") {
             return Some(Self::parse_session_context(payload.as_ref(), params));
+        }
+
+        if let Some(provider_id) = payload.strip_prefix("ScribeAiLaunch=")
+            && let Some(provider) = AiProvider::from_id(provider_id.trim())
+        {
+            return Some(MetadataEvent::AiProviderArmed { provider });
         }
 
         // Legacy format: ESC ] 1337 ; AiState=state=<state>;key=val... ST
@@ -351,7 +365,9 @@ impl AiStateBuilder {
             "tool" => self.tool = Some(truncate_chars(value, MAX_AI_FIELD_LEN)),
             "agent" => self.agent = Some(truncate_chars(value, MAX_AI_FIELD_LEN)),
             "model" => self.model = Some(truncate_chars(value, MAX_AI_FIELD_LEN)),
-            "context" => self.context = value.parse().ok(),
+            "context" => {
+                self.context = value.parse::<u8>().ok().filter(|v| *v <= 100);
+            }
             "conversation_id" => {
                 self.conversation_id = Some(sanitize_text_payload(value, MAX_AI_FIELD_LEN));
             }
@@ -614,6 +630,62 @@ mod tests {
                 assert_eq!(text.len(), 256);
             }
             other => panic!("expected PromptReceived, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_context_field_on_claude_state() {
+        let event = parse_iterm2(&[b"1337", b"ClaudeState=processing", b"context=73"]);
+
+        match event {
+            Some(MetadataEvent::AiStateChanged(ai_state)) => {
+                assert_eq!(ai_state.provider, AiProvider::ClaudeCode);
+                assert_eq!(ai_state.state, AiState::Processing);
+                assert_eq!(ai_state.context, Some(73));
+            }
+            other => panic!("expected Claude processing state with context, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_context_field_on_codex_state() {
+        let event = parse_iterm2(&[b"1337", b"CodexState=processing", b"context=42"]);
+
+        match event {
+            Some(MetadataEvent::AiStateChanged(ai_state)) => {
+                assert_eq!(ai_state.provider, AiProvider::CodexCode);
+                assert_eq!(ai_state.state, AiState::Processing);
+                assert_eq!(ai_state.context, Some(42));
+            }
+            other => panic!("expected Codex processing state with context, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ignores_invalid_context_value() {
+        let event = parse_iterm2(&[b"1337", b"ClaudeState=processing", b"context=abc"]);
+
+        match event {
+            Some(MetadataEvent::AiStateChanged(ai_state)) => {
+                assert_eq!(ai_state.provider, AiProvider::ClaudeCode);
+                assert_eq!(ai_state.state, AiState::Processing);
+                assert_eq!(ai_state.context, None);
+            }
+            other => panic!("expected Claude processing state with no context, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ignores_context_value_above_100() {
+        let event = parse_iterm2(&[b"1337", b"ClaudeState=processing", b"context=200"]);
+
+        match event {
+            Some(MetadataEvent::AiStateChanged(ai_state)) => {
+                assert_eq!(ai_state.provider, AiProvider::ClaudeCode);
+                assert_eq!(ai_state.state, AiState::Processing);
+                assert_eq!(ai_state.context, None);
+            }
+            other => panic!("expected Claude processing state with no context, got {other:?}"),
         }
     }
 }

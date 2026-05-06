@@ -100,6 +100,44 @@ Tab rows wrap only after subtracting the same rendered badge and right-edge icon
 
 Because tab chrome and tab glyphs are collected into the same `CellInstance` buffer and drawn in one render pass, [[crates/scribe-client/src/main.rs#build_all_instances]] must append the tab-bar background before the tab text so the labels are composited on top of their tabs.
 
+When context-window usage reaches the warn threshold (default 70%), a colored `" NN%"` suffix is appended to the tab label. [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#tab_context_suffix]] returns the suffix text and its `srgb_to_linear_rgba` color, or `None` when the threshold is not met or the session is in a pulsing attention state (`PermissionPrompt`, `WaitingForInput`). A `fallback_color` parameter (passed as `tab_text` color by the caller) is used when the hex color string fails to parse, matching the status-bar segment's fallback behavior. `TabData.context_suffix` carries the result; `tab_display_title` reserves the suffix columns before truncation; `render_tab` emits the suffix chars in the suffix color after the title.
+
+### tab_context_suffix_below_warn_returns_none
+
+Verifies that [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#tab_context_suffix]] returns `None` when context=50 is below the default warn threshold of 70.
+
+### tab_context_suffix_at_warn_returns_warn_color
+
+Verifies that context=70 (exactly at the default warn threshold) returns the warn-band color `#d4a017`.
+
+### tab_context_suffix_at_danger_returns_danger_color
+
+Verifies that context=92 (above the default danger threshold of 90) returns the danger-band color `#c83030`.
+
+### tab_context_suffix_suppressed_when_permission_prompt
+
+Verifies that `tab_context_suffix` returns `None` for context=85 when the session state is `PermissionPrompt`, to avoid competing with the pulse indicator.
+
+### tab_context_suffix_suppressed_when_waiting_for_input
+
+Verifies that `tab_context_suffix` returns `None` for context=85 when the session state is `WaitingForInput`, for the same reason as `PermissionPrompt` suppression.
+
+### tab_context_suffix_present_when_processing
+
+Verifies that a `Processing` session with context=85 returns a suffix in the warn-band color, confirming non-pulsing states show the suffix.
+
+### tab_context_suffix_none_when_no_session
+
+Verifies that an unregistered `SessionId` returns `None` from `tab_context_suffix`.
+
+### tab_context_suffix_none_when_no_context_value
+
+Verifies that a registered session with `context=None` returns `None` from `tab_context_suffix`.
+
+### tab_context_suffix_falls_back_on_invalid_hex
+
+Verifies that when `warn_color` is set to an unparseable hex string, `tab_context_suffix` still returns `Some` and the color equals the provided `fallback_color` rather than `None`, matching the status-bar segment's fallback behavior.
+
 ## Input
 
 Keybindings are parsed from config into a `Bindings` struct in [[crates/scribe-client/src/input.rs#Bindings]] with over 50 configurable actions.
@@ -225,6 +263,8 @@ The shared animation loop uses a generation token per spawned thread, so fast st
 
 Priority order: PermissionPrompt > WaitingForInput > IdlePrompt > Error > Processing. Each state has configurable color, pulse frequency, tab indicator, and pane border settings. Error state decays over a timeout. Attention states (IdlePrompt, WaitingForInput, PermissionPrompt) clear on keystroke. Both `IdlePrompt` and `WaitingForInput` share the same `waiting_for_input` indicator config (color, pulse, timeout).
 
+Tab inline context % is gated via [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#tab_context_suffix]]; see [[client#Tab Bar]] for the gating rules and rendering details.
+
 On reconnect, active AI state is populated from `SessionInfo.ai_state` during handle_session_list so indicators appear immediately without waiting for the per-session `AiStateChanged` messages from the server's `send_stored_metadata` path. `SessionInfo.ai_provider_hint` is restored separately so clipboard cleanup and other provider-aware behavior survive reconnect even when no visible indicator should be shown. When available, `SessionInfo.ai_state.conversation_id` is also used to seed per-pane AI resume bindings so restored windows attempt targeted resume of prior provider sessions.
 
 ## Desktop Notifications
@@ -305,11 +345,21 @@ Typing while split-scrolled sends keystrokes without snapping to bottom. Pressin
 
 ## Status Bar
 
-The status bar is rendered at the bottom of the window.
+The status bar is rendered at the bottom of the window with segments for connection status, workspace info, CWD, git branch, session count, AI context %, time, and system stats.
 
-It shows connection status, workspace info, CWD, git branch, session count, host context, tmux context, time, and system stats. Update availability and progress also render here, centered in the empty span between the left and right segments — see [[crates/scribe-client/src/status_bar.rs#centered_start_col]] — so the CTA stays visible on narrow windows and steps down to a shorter `↑ Update` label, then disappears entirely, only when the empty span cannot hold it. Clicking the update segment opens the in-app confirmation dialog.
+Update availability and progress also render here, centered in the empty span between the left and right segments — see [[crates/scribe-client/src/status_bar.rs#centered_start_col]] — so the CTA stays visible on narrow windows and steps down to a shorter `↑ Update` label, then disappears entirely, only when the empty span cannot hold it. Clicking the update segment opens the in-app confirmation dialog.
 
 Connection is indicated by a green/red dot. Workspace name appears when multi-workspace. The focused pane's remote host overrides the local hostname when shell integration emits session context, and tmux session names render as a separate accent segment. Stats include CPU sparkline, memory percentage, GPU sparkline (Linux only), and network sparklines.
+
+### build_context_segment_uses_band_color
+
+Verifies that [[crates/scribe-client/src/status_bar.rs#build_context_segment]] picks the correct band color for Ok (50), Warn (75), and Danger (95) with default thresholds.
+
+Color comparison uses bitwise equality on the `[f32; 4]` arrays because the values are produced deterministically by `hex_to_rgba` → `srgb_to_linear_rgba`.
+
+### build_context_segment_falls_back_on_invalid_hex
+
+Verifies that [[crates/scribe-client/src/status_bar.rs#build_context_segment]] falls back to `colors.text` when `ok_color` is not a valid hex string.
 
 ## System Stats
 

@@ -57,7 +57,12 @@ if echo "$SNAP3" | grep -q "ClaudeState"; then
     echo "PHASE 3 FAIL: ClaudeState with fields leaked into output"
     exit 1
 fi
-echo "PHASE 3 PASS: optional fields accepted, OSC stripped"
+# Verify context % is rendered in the status bar.
+if ! echo "$SNAP3" | grep -q "42%"; then
+    echo "PHASE 3 FAIL: context=42 not rendered as 42% in status bar"
+    exit 1
+fi
+echo "PHASE 3 PASS: optional fields accepted, OSC stripped, context % rendered"
 
 # ── Phase 4: Interleaved output preserved ────────────────────────────────
 # Emit normal text, then an OSC, then more normal text — all in one printf.

@@ -71,6 +71,11 @@ assets = [
     "755",
   ],
   [
+    "../../dist/scribe-claude-statusline.sh",
+    "usr/share/scribe/scribe-claude-statusline.sh",
+    "755",
+  ],
+  [
     "../../dist/detect-claude-question.sh",
     "usr/share/scribe/detect-claude-question.sh",
     "755",
@@ -88,6 +93,11 @@ assets = [
   [
     "../../dist/codex-task-label.sh",
     "usr/share/scribe/codex-task-label.sh",
+    "755",
+  ],
+  [
+    "../../dist/detect-codex-context.sh",
+    "usr/share/scribe/detect-codex-context.sh",
     "755",
   ],
   [
@@ -177,6 +187,11 @@ assets = [
     "755",
   ],
   [
+    "../../dist/scribe-claude-statusline.sh",
+    "usr/share/scribe-dev/scribe-claude-statusline.sh",
+    "755",
+  ],
+  [
     "../../dist/detect-claude-question.sh",
     "usr/share/scribe-dev/detect-claude-question.sh",
     "755",
@@ -194,6 +209,11 @@ assets = [
   [
     "../../dist/codex-task-label.sh",
     "usr/share/scribe-dev/codex-task-label.sh",
+    "755",
+  ],
+  [
+    "../../dist/detect-codex-context.sh",
+    "usr/share/scribe-dev/detect-codex-context.sh",
     "755",
   ],
   [

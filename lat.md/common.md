@@ -8,6 +8,8 @@ Tracks supported AI coding tool lifecycles by parsing OSC 1337 escape sequences 
 
 [[crates/scribe-common/src/ai_state.rs#AiState]] is a five-variant enum (`IdlePrompt`, `Processing`, `WaitingForInput`, `PermissionPrompt`, `Error`) shared by Claude Code, Codex, and Auggie. [[crates/scribe-common/src/ai_state.rs#AiProvider]] supplies stable provider IDs, binary names, OSC keys, task-label support, and resume arguments; [[crates/scribe-common/src/ai_state.rs#AiProcessState]] carries that provider alongside optional metadata fields (`tool`, `agent`, `model`, `context`, `conversation_id`). The [[pty]] crate's `MetadataParser` produces `AiProcessState` values; the [[server]] broadcasts them to connected clients and preserves backward compatibility by defaulting missing providers to Claude on deserialize.
 
+The `context` field (`Option<u8>`) carries the AI tool's context-window fill percentage (0–100). It is populated by the Claude statusLine producer (`scribe-claude-statusline.sh`) and the Codex context hook (`detect-codex-context.sh`) via `ClaudeState=processing;context=NN` and `CodexState=processing;context=NN` OSC payloads respectively. Auggie has no producer for `context` and always leaves the field blank. The [[common#Configuration#AI Context Thresholds]] config controls the warn/danger band boundaries used by the status bar and tab-bar displays.
+
 ## Configuration
 
 Unified TOML config for server and client, deserialized from the active install flavor's XDG config root into [[crates/scribe-common/src/config.rs#ScribeConfig]].
@@ -19,6 +21,12 @@ Stable installs read `~/.config/scribe/config.toml`, while `scribe-dev` reads `~
 Font family, size, weight, ligatures, line padding, cursor shape, opacity, theme name, scrollbar, focus border, tab bar dimensions, status bar height, and content padding are all in [[crates/scribe-common/src/config.rs#AppearanceConfig]].
 
 [[crates/scribe-common/src/config.rs#ContentPadding]] provides per-side padding (top/right/bottom/left) with a `clamped()` helper that enforces the `0.0..=50.0` range. [[crates/scribe-common/src/config.rs#CursorShape]] is a three-variant enum (`Block`, `Beam`, `Underline`).
+
+### AI Context Thresholds
+
+Two-boundary band model classifying context-window fill into Ok, Warn, and Danger, used to color the status bar segment and tab inline % display.
+
+[[crates/scribe-common/src/config.rs#AiContextThresholds]] holds `warn` (default 70) and `danger` (default 90) as `u8` percentages, plus three hex-string color fields: `ok_color`, `warn_color`, and `danger_color`. [[crates/scribe-common/src/config.rs#ContextBand]] is a three-variant enum (`Ok`, `Warn`, `Danger`) returned by `AiContextThresholds::band(pct)`. A fill value at or above `danger` maps to `Danger`; at or above `warn` maps to `Warn`; below `warn` maps to `Ok`. Inverted configs (`warn > danger`) are normalized by treating `min(warn, danger)` as the effective warn threshold so the Warn band remains reachable.
 
 ### AI State Colors
 
