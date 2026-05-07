@@ -180,8 +180,7 @@ impl AiStateTracker {
     ///   (those use the existing pulse indicators and must not compete).
     ///
     /// Color is derived from `thresholds.color_for(ctx)` via `hex_to_rgba` →
-    /// `srgb_to_linear_rgba`. Falls back to `fallback_color` on parse failure,
-    /// matching the symmetry of `build_context_segment` in the status bar.
+    /// `srgb_to_linear_rgba`. Falls back to `fallback_color` on parse failure.
     #[must_use]
     pub fn tab_context_suffix(
         &self,

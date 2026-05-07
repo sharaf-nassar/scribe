@@ -41,7 +41,7 @@
 Crash your terminal, lose every shell. Update it, same story. Scribe splits the terminal into a headless server that owns your sessions and a GPU client that connects on demand — so your shells, tunnels, and builds are never at risk.
 
 - **Unkillable sessions** — close the lid, crash the client, come back days later. Your scrollback and cursor are exactly where you left them.
-- **AI agent awareness** — the status bar shows your agent's state, active tool, model, and context usage in real time. A prompt bar tracks your conversation. Copied text is auto-cleaned of hard wraps and indentation artifacts. No window-switching needed.
+- **AI agent awareness** — Scribe tracks your agent's state, active tool, model, and context usage in real time. A prompt bar tracks your conversation and shows context fill on the right. Copied text is auto-cleaned of hard wraps and indentation artifacts. No window-switching needed.
 - **Zero-downtime upgrades** — the running server hands PTY file descriptors to the new binary. Your shells don't notice.
 - **GPU rendering** — wgpu-powered (Vulkan / Metal / OpenGL ES), single draw call, smooth at any pane count or DPI.
 - **Cold restart recovery** — if the server crashes, layout, tabs, pane splits, and AI conversation IDs are restored on next launch.
@@ -157,7 +157,7 @@ When a new server binary is available, the running server hands off all PTY file
 
 ### AI / LLM Process Awareness
 
-Scribe natively parses OSC 1337 escape sequences emitted by AI coding tools including Claude Code, Codex, and Auggie. It tracks four AI states: idle/prompt, processing, waiting for permission, and error. Metadata includes the active tool, agent name, model, context window usage percentage, and conversation ID. The status bar surfaces this information in real time, giving developers instant visibility into their AI agent's state without switching windows.
+Scribe natively parses OSC 1337 escape sequences emitted by AI coding tools including Claude Code, Codex, and Auggie. It tracks four AI states: idle/prompt, processing, waiting for permission, and error. Metadata includes the active tool, agent name, model, context window usage percentage, and conversation ID. The prompt bar surfaces context fill in real time, giving developers instant visibility into their AI agent's state without switching windows.
 
 ### Prompt Bar
 

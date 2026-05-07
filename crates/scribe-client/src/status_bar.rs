@@ -6,9 +6,8 @@
 
 use std::path::Path;
 
-use scribe_common::config::AiContextThresholds;
 use scribe_common::protocol::UpdateProgressState;
-use scribe_common::theme::{ChromeColors, hex_to_rgba};
+use scribe_common::theme::ChromeColors;
 use scribe_renderer::srgb_to_linear_rgba;
 use scribe_renderer::types::CellInstance;
 
@@ -53,11 +52,6 @@ pub struct StatusBarData<'a> {
     pub update_progress: Option<&'a UpdateProgressState>,
     pub sys_stats: Option<&'a SystemStats>,
     pub stats_config: Option<&'a scribe_common::config::StatusBarStatsConfig>,
-    /// AI context-window usage percentage for the focused pane's session.
-    /// `None` means no context value received yet — segment is hidden.
-    pub ai_context: Option<u8>,
-    /// Threshold config used to color the context segment.
-    pub context_thresholds: &'a AiContextThresholds,
 }
 
 /// Fallback green when ANSI index 2 is unavailable.
@@ -553,11 +547,6 @@ fn build_segment_groups(data: &StatusBarData<'_>) -> Vec<(String, usize)> {
         groups.push((String::from("Host"), sep + 1));
     }
 
-    if data.ai_context.is_some() {
-        let sep = usize::from(!groups.is_empty());
-        groups.push((String::from("AI context usage"), sep + 1));
-    }
-
     if !data.time.is_empty() {
         let sep = usize::from(!groups.is_empty());
         groups.push((String::from("Current time"), sep + 1));
@@ -839,28 +828,6 @@ fn build_gpu_segments(stats: &SystemStats, colors: &StatusBarColors) -> Vec<Righ
     segs
 }
 
-/// Format the AI context segment label — `"◐ {ctx}%"`.
-///
-/// Extracted as a pure function so it can be unit-tested independently of
-/// the full render path.
-fn format_context_label(ctx: u8) -> String {
-    format!("\u{25D0} {ctx}%")
-}
-
-/// Build the context-window usage segment.
-///
-/// Color is derived from `thresholds.color_for(ctx)` parsed as a hex string;
-/// falls back to the bar's text color on parse failure.
-fn build_context_segment(
-    ctx: u8,
-    thresholds: &AiContextThresholds,
-    colors: &StatusBarColors,
-) -> Vec<RightSegment> {
-    let hex = thresholds.color_for(ctx);
-    let color = hex_to_rgba(hex).map(scribe_renderer::srgb_to_linear_rgba).unwrap_or(colors.text);
-    vec![RightSegment { text: format_context_label(ctx), color }]
-}
-
 /// Build the right-side text segments: stats, git branch, session count, tmux, host, time.
 fn build_right_segments(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Vec<RightSegment> {
     let mut segs = Vec::new();
@@ -892,11 +859,6 @@ fn build_right_segments(data: &StatusBarData<'_>, colors: &StatusBarColors) -> V
     if !data.host_label.is_empty() {
         push_sep(&mut segs, colors.separator);
         segs.push(RightSegment { text: String::from(data.host_label), color: colors.text });
-    }
-
-    if let Some(ctx) = data.ai_context {
-        push_sep(&mut segs, colors.separator);
-        segs.extend(build_context_segment(ctx, data.context_thresholds, colors));
     }
 
     if !data.time.is_empty() {
@@ -1000,84 +962,6 @@ fn columns_in_width(width: f32, cell_w: f32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Minimal [`StatusBarColors`] fixture for tests that need color fields.
-    fn test_colors() -> StatusBarColors {
-        let text = [0.9_f32, 0.9, 0.9, 1.0];
-        StatusBarColors {
-            bg: [0.1, 0.1, 0.1, 1.0],
-            text,
-            accent: [0.5, 0.7, 1.0, 1.0],
-            separator: [0.3, 0.3, 0.3, 1.0],
-            connected_dot: [0.0, 1.0, 0.0, 1.0],
-            disconnected_dot: [1.0, 0.0, 0.0, 1.0],
-            warning: [1.0, 0.8, 0.0, 1.0],
-            critical: [1.0, 0.2, 0.2, 1.0],
-            label: [0.6, 0.6, 0.6, 1.0],
-            top_border: [0.2, 0.2, 0.2, 1.0],
-            gradient_top: [0.15, 0.15, 0.15, 1.0],
-        }
-    }
-
-    #[test]
-    fn format_context_label_includes_glyph_and_percent() {
-        assert_eq!(format_context_label(73), "\u{25D0} 73%");
-        assert_eq!(format_context_label(0), "\u{25D0} 0%");
-        assert_eq!(format_context_label(100), "\u{25D0} 100%");
-    }
-
-    /// Compare two `[f32; 4]` color arrays by their bit patterns.
-    ///
-    /// The values originate from deterministic integer → float conversion
-    /// (`hex_to_rgba` → `srgb_to_linear_rgba`), so bitwise equality is valid.
-    fn colors_eq(a: [f32; 4], b: [f32; 4]) -> bool {
-        a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
-    }
-
-    #[test]
-    // @lat: [[client#Status Bar#build_context_segment_uses_band_color]]
-    fn build_context_segment_uses_band_color() {
-        let thresholds = AiContextThresholds::default();
-        let colors = test_colors();
-
-        // Ok band (50 < 70 warn threshold)
-        let ok_expected = srgb_to_linear_rgba(hex_to_rgba("#5fa05f").unwrap());
-        let ok_segs = build_context_segment(50, &thresholds, &colors);
-        assert_eq!(ok_segs.len(), 1);
-        assert!(colors_eq(ok_segs[0].color, ok_expected), "Ok band color mismatch");
-
-        // Warn band (75 >= 70 warn, < 90 danger)
-        let warn_expected = srgb_to_linear_rgba(hex_to_rgba("#d4a017").unwrap());
-        let warn_segs = build_context_segment(75, &thresholds, &colors);
-        assert_eq!(warn_segs.len(), 1);
-        assert!(colors_eq(warn_segs[0].color, warn_expected), "Warn band color mismatch");
-
-        // Danger band (95 >= 90 danger threshold)
-        let danger_expected = srgb_to_linear_rgba(hex_to_rgba("#c83030").unwrap());
-        let danger_segs = build_context_segment(95, &thresholds, &colors);
-        assert_eq!(danger_segs.len(), 1);
-        assert!(colors_eq(danger_segs[0].color, danger_expected), "Danger band color mismatch");
-    }
-
-    #[test]
-    // @lat: [[client#Status Bar#build_context_segment_falls_back_on_invalid_hex]]
-    fn build_context_segment_falls_back_on_invalid_hex() {
-        let thresholds = AiContextThresholds {
-            warn: 70,
-            danger: 90,
-            ok_color: "not-a-color".into(),
-            warn_color: "#d4a017".into(),
-            danger_color: "#c83030".into(),
-        };
-        let colors = test_colors();
-        // ctx=50 is in Ok band — ok_color is invalid, so fallback to colors.text
-        let fallback_segs = build_context_segment(50, &thresholds, &colors);
-        assert_eq!(fallback_segs.len(), 1);
-        assert!(
-            colors_eq(fallback_segs[0].color, colors.text),
-            "Should fall back to colors.text on invalid hex",
-        );
-    }
 
     #[test]
     fn centers_label_in_empty_span_not_full_bar() {

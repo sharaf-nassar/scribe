@@ -52,6 +52,9 @@ use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
     AutomationAction, PromptMarkKind, SearchMatch, TerminalSize, UpdateProgressState,
 };
+use scribe_common::settings_window::{
+    SETTINGS_WINDOW_ANCHOR_ENV, SettingsWindowAnchor, SettingsWindowCommand,
+};
 use scribe_common::theme::Theme;
 use scribe_renderer::types::{CellInstance, GridSize};
 use scribe_renderer::{RenderResources, TerminalRenderOptions, TerminalRenderer};
@@ -3809,6 +3812,10 @@ impl App {
             self.collect_workspace_border_colors(&workspace_scene.pane_rects, &ansi_colors);
         self.update_prepared_frame_state(&workspace_scene.pane_rects);
         let frame_style = self.prepare_frame_style(cell_size, &ansi_colors);
+        let prompt_context_indicators = self.collect_prompt_context_indicators(
+            &workspace_scene.pane_rects,
+            frame_style.prompt_bar_colors.text,
+        );
         let ws_tab_bar_heights = workspace_scene
             .ws_tab_bar_data
             .iter()
@@ -3838,6 +3845,7 @@ impl App {
             scrollbar_color: frame_style.scrollbar_color,
             indicator_height: frame_style.indicator_height,
             prompt_bar_colors: frame_style.prompt_bar_colors,
+            prompt_context_indicators,
             status: self.frame_status_snapshot(),
         }
     }
@@ -3997,6 +4005,34 @@ impl App {
             .collect()
     }
 
+    fn collect_prompt_context_indicators(
+        &self,
+        pane_rects: &[(PaneId, Rect)],
+        fallback_color: [f32; 4],
+    ) -> HashMap<PaneId, prompt_bar::PromptContextIndicator> {
+        pane_rects
+            .iter()
+            .filter_map(|(pane_id, _)| {
+                let pane = self.panes.get(pane_id)?;
+                let indicator =
+                    self.prompt_context_indicator_for_session(pane.session_id, fallback_color)?;
+                Some((*pane_id, indicator))
+            })
+            .collect()
+    }
+
+    fn prompt_context_indicator_for_session(
+        &self,
+        session_id: SessionId,
+        fallback_color: [f32; 4],
+    ) -> Option<prompt_bar::PromptContextIndicator> {
+        let percent = self.ai_tracker.context_for(session_id)?;
+        let thresholds = &self.config.terminal.ai_session.context_thresholds;
+        let color = scribe_common::theme::hex_to_rgba(thresholds.color_for(percent))
+            .map_or(fallback_color, scribe_renderer::srgb_to_linear_rgba);
+        Some(prompt_bar::PromptContextIndicator { percent, color })
+    }
+
     fn update_prepared_frame_state(&mut self, pane_rects: &[(PaneId, Rect)]) {
         if self.cursor.blink_enabled && self.blink_timer.elapsed() >= BLINK_INTERVAL {
             self.cursor.visible = !self.cursor.visible;
@@ -4103,6 +4139,7 @@ impl App {
             scrollbar_color: prepared.scrollbar_color,
             indicator_height: prepared.indicator_height,
             prompt_bar_colors: prepared.prompt_bar_colors,
+            prompt_context_indicators: &prepared.prompt_context_indicators,
         };
         let frame_interaction = FrameInteraction {
             cursor_visible: prepared.cursor_visible,
@@ -4183,9 +4220,6 @@ impl App {
         prepared: &PreparedFrame,
         all_instances: &mut Vec<CellInstance>,
     ) -> bool {
-        // Compute before the mutable gpu borrow to avoid a borrow conflict.
-        let focused_ai_context =
-            self.focused_session_id().and_then(|sid| self.ai_tracker.context_for(sid));
         let Some(gpu) = self.gpu.as_mut() else { return false };
         let time_str = current_time_str();
         self.sys_stats.maybe_refresh();
@@ -4214,8 +4248,6 @@ impl App {
             update_progress: self.update_progress.as_ref(),
             sys_stats: Some(self.sys_stats.stats()),
             stats_config: Some(&self.config.terminal.status_bar_stats),
-            ai_context: focused_ai_context,
-            context_thresholds: &self.config.terminal.ai_session.context_thresholds,
         };
         let mut status_bar_resolve_glyph =
             |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
@@ -4311,6 +4343,7 @@ impl App {
                 anchor,
                 prepared.prompt_bar_cell_size,
                 hover,
+                prepared.prompt_context_indicators.get(&pane_id).copied(),
             )?;
             prompt_bar::is_prompt_truncated(
                 full_text,
@@ -4584,7 +4617,7 @@ impl App {
             KeyAction::Terminal(bytes) => self.handle_terminal_key(bytes),
             KeyAction::Layout(layout_action) => self.handle_layout_action(layout_action),
             KeyAction::OpenCommandPalette => self.handle_open_command_palette(),
-            KeyAction::OpenSettings => open_or_focus_settings(),
+            KeyAction::OpenSettings => self.open_or_focus_settings(),
             KeyAction::OpenFind => self.handle_open_find(),
         }
     }
@@ -4792,7 +4825,7 @@ impl App {
 
     fn execute_automation_action(&mut self, action: AutomationAction) {
         match action {
-            AutomationAction::OpenSettings => open_or_focus_settings(),
+            AutomationAction::OpenSettings => self.open_or_focus_settings(),
             AutomationAction::OpenFind => self.handle_open_find(),
             AutomationAction::NewTab => self.handle_new_tab(),
             AutomationAction::NewClaudeTab => self.handle_new_claude_tab(),
@@ -6139,7 +6172,24 @@ impl App {
     // -----------------------------------------------------------------------
 
     /// Open the settings webview window via the persistent GTK thread.
-    ///
+    fn open_or_focus_settings(&self) {
+        open_or_focus_settings(self.settings_window_anchor());
+    }
+
+    /// Capture this terminal window as the settings placement anchor.
+    fn settings_window_anchor(&self) -> Option<SettingsWindowAnchor> {
+        let window = self.window.as_ref()?;
+        let pos = window.outer_position().ok()?;
+        let size = window.outer_size();
+        let anchor = SettingsWindowAnchor {
+            x: pos.x,
+            y: pos.y,
+            width: i32::try_from(size.width).ok()?,
+            height: i32::try_from(size.height).ok()?,
+        };
+        anchor.is_sane().then_some(anchor)
+    }
+
     /// Send the current workspace split tree to the server so it can be
     /// persisted for reconnect and handoff.
     fn report_workspace_tree(&mut self) {
@@ -6322,7 +6372,7 @@ impl App {
 
     fn handle_status_bar_mouse_press(&mut self, x: f32, y: f32) -> bool {
         if self.status_bar_gear_rect.is_some_and(|rect| rect.contains(x, y)) {
-            open_or_focus_settings();
+            self.open_or_focus_settings();
             return true;
         }
         if self.status_bar_equalize_rect.is_some_and(|rect| rect.contains(x, y)) {
@@ -9033,6 +9083,7 @@ struct FrameStyle<'a> {
     scrollbar_color: [f32; 4],
     indicator_height: f32,
     prompt_bar_colors: prompt_bar::PromptBarColors,
+    prompt_context_indicators: &'a HashMap<PaneId, prompt_bar::PromptContextIndicator>,
 }
 
 /// Interaction state passed to [`build_all_instances`].
@@ -9080,6 +9131,7 @@ struct PreparedFrame {
     scrollbar_color: [f32; 4],
     indicator_height: f32,
     prompt_bar_colors: prompt_bar::PromptBarColors,
+    prompt_context_indicators: HashMap<PaneId, prompt_bar::PromptContextIndicator>,
     status: FrameStatusSnapshot,
 }
 
@@ -9865,6 +9917,7 @@ fn build_prompt_bar_pass(
                 .filter(|hover| hover.0 == *pane_id)
                 .map(|hover| hover.1),
             colors: &context.style.prompt_bar_colors,
+            context_indicator: context.style.prompt_context_indicators.get(pane_id).copied(),
             now: SystemTime::now(),
             resolve_glyph: &mut |ch| backend.resolve_glyph(ch),
         });
@@ -10837,8 +10890,7 @@ fn make_workspace_badge(
 fn quit_settings_process() {
     let socket_path = scribe_common::socket::settings_socket_path();
     if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
-        use std::io::Write as _;
-        if let Err(e) = stream.write_all(b"{\"cmd\":\"quit\"}\n") {
+        if let Err(e) = write_settings_window_command(&mut stream, &SettingsWindowCommand::quit()) {
             tracing::warn!("failed to send quit command to settings: {e}");
         } else {
             tracing::debug!("sent quit to settings process");
@@ -10850,29 +10902,46 @@ fn quit_settings_process() {
 ///
 /// Tries to connect to the settings socket. If connected, sends a focus
 /// command. If not, spawns the `scribe-settings` binary.
-fn open_or_focus_settings() {
+fn open_or_focus_settings(anchor: Option<SettingsWindowAnchor>) {
     let socket_path = scribe_common::socket::settings_socket_path();
 
     if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
-        use std::io::Write as _;
-        if let Err(e) = stream.write_all(b"{\"cmd\":\"focus\"}\n") {
+        let command = SettingsWindowCommand::focus(anchor);
+        if let Err(e) = write_settings_window_command(&mut stream, &command) {
             tracing::warn!("failed to send focus command to settings: {e}");
         } else {
             tracing::debug!("sent focus to existing settings process");
         }
     } else {
-        spawn_settings_process();
+        spawn_settings_process(anchor);
     }
 }
 
+/// Write a singleton settings command as a newline-terminated JSON payload.
+fn write_settings_window_command(
+    stream: &mut std::os::unix::net::UnixStream,
+    command: &SettingsWindowCommand,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let payload = serde_json::to_vec(command)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    stream.write_all(&payload)?;
+    stream.write_all(b"\n")
+}
+
 /// Spawn the `scribe-settings` binary as a detached process.
-fn spawn_settings_process() {
+fn spawn_settings_process(anchor: Option<SettingsWindowAnchor>) {
     let identity = current_identity();
     let exe = std::env::current_exe()
         .unwrap_or_else(|_| std::path::PathBuf::from(identity.client_binary_name()));
     let settings_exe = exe.with_file_name(identity.settings_binary_name());
+    let mut command = std::process::Command::new(&settings_exe);
+    if let Some(anchor) = anchor {
+        command.env(SETTINGS_WINDOW_ANCHOR_ENV, anchor.to_env_value());
+    }
 
-    match std::process::Command::new(&settings_exe).spawn() {
+    match command.spawn() {
         Ok(child) => {
             tracing::info!(pid = child.id(), "spawned settings process");
         }
@@ -10906,13 +10975,12 @@ fn restore_settings_if_open() {
             // is used (e.g. after dpkg upgrade + server handoff).
             let socket_path = scribe_common::socket::settings_socket_path();
             if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
-                use std::io::Write as _;
-                drop(stream.write_all(b"{\"cmd\":\"quit\"}\n"));
+                drop(write_settings_window_command(&mut stream, &SettingsWindowCommand::quit()));
                 drop(stream);
                 // Brief pause for the old process to exit and release the socket.
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            spawn_settings_process();
+            spawn_settings_process(None);
         }
     }
 }

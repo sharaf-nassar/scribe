@@ -142,6 +142,6 @@ Functional end-to-end tests that drive real sessions through the `scribe-test` h
 
 ### AI Context Thresholds E2E
 
-Four-phase test in `tests/e2e/func/ai-context-thresholds.sh` validating status bar and tab inline % across all three threshold bands.
+Seven-phase test in `tests/e2e/func/ai-context-thresholds.sh` validating prompt-bar and tab inline % across all threshold bands for Claude and Codex.
 
-Phase 1: emits `context=50` (Ok band, below `warn=70`). Asserts `50%` appears in the snapshot (status bar segment). Phase 4: asserts `50%` count is ≤ 1, confirming the tab inline is suppressed below the warn threshold. Phase 2: emits `context=72` (Warn band). Asserts `72%` appears ≥ 2 times (status bar + tab inline both rendered). Phase 3: emits `context=91` (Danger band). Asserts `91%` appears ≥ 2 times. Phases 1 and 4 share the same snapshot; phases 2 and 3 each take a fresh snapshot after the state change.
+Claude phases emit `ClaudeState=processing;context=50/72/91` plus matching `ClaudePrompt=...` OSC payloads so the prompt bar is visible. Phase 1 asserts `50%` appears once in the prompt-bar cluster and Phase 4 confirms the tab inline is suppressed below `warn=70`; phases 2 and 3 assert Warn/Danger values appear at least twice (prompt bar + tab inline). Codex phases repeat the same provider-symmetric checks with `CodexState`/`CodexPrompt` at 51/73/92.

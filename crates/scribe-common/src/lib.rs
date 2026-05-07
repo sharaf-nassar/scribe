@@ -8,6 +8,7 @@ pub mod profiles;
 pub mod protocol;
 pub mod screen;
 pub mod screen_replay;
+pub mod settings_window;
 pub mod shell;
 pub mod socket;
 pub mod theme;

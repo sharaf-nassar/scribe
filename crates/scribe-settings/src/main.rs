@@ -6,22 +6,28 @@
 fn main() {
     init_tracing();
 
+    let launch_anchor =
+        std::env::var(scribe_common::settings_window::SETTINGS_WINDOW_ANCHOR_ENV).ok().and_then(
+            |value| scribe_common::settings_window::SettingsWindowAnchor::from_env_value(&value),
+        );
+
     // Attempt to become the singleton settings process.
-    let (listener, socket_path, lock_file_guard) = match scribe_settings::singleton::acquire() {
-        Ok(scribe_settings::singleton::SingletonResult::Primary {
-            listener,
-            socket_path,
-            lock_file,
-        }) => (listener, socket_path, lock_file),
-        Ok(scribe_settings::singleton::SingletonResult::AlreadyRunning) => {
-            tracing::info!("another settings instance is running, sent focus and exiting");
-            return;
-        }
-        Err(e) => {
-            tracing::error!("failed to acquire singleton: {e}");
-            return;
-        }
-    };
+    let (listener, socket_path, lock_file_guard) =
+        match scribe_settings::singleton::acquire(launch_anchor) {
+            Ok(scribe_settings::singleton::SingletonResult::Primary {
+                listener,
+                socket_path,
+                lock_file,
+            }) => (listener, socket_path, lock_file),
+            Ok(scribe_settings::singleton::SingletonResult::AlreadyRunning) => {
+                tracing::info!("another settings instance is running, sent focus and exiting");
+                return;
+            }
+            Err(e) => {
+                tracing::error!("failed to acquire singleton: {e}");
+                return;
+            }
+        };
 
     // Load saved state (geometry + open flag).
     let saved = scribe_settings::state::load();
@@ -55,13 +61,14 @@ fn main() {
         }
     };
 
-    if let Err(e) = scribe_settings::run_settings_window(
-        saved_geometry,
+    if let Err(e) = scribe_settings::run_settings_window(scribe_settings::SettingsWindowRunArgs {
+        geometry: saved_geometry,
+        launch_anchor,
         on_change,
         on_close,
         listener,
         socket_path,
-    ) {
+    }) {
         tracing::error!("settings window failed: {e}");
         // Still try to clean up.
         scribe_settings::singleton::cleanup_socket(&scribe_common::socket::settings_socket_path());

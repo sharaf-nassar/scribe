@@ -6,7 +6,10 @@ pub mod state;
 use std::time::Duration;
 
 use rust_embed::Embed;
-use scribe_common::protocol::UpdateCheckResultState;
+use scribe_common::{
+    protocol::UpdateCheckResultState,
+    settings_window::{SettingsWindowAnchor, centered_settings_position},
+};
 
 /// Maximum time to wait for a manual update-check response from the server.
 /// The server-side check itself can take ~10 s including the 5 s retry, so we
@@ -389,6 +392,15 @@ fn is_macos_close_window_shortcut(
 // Linux: GTK-based settings window
 // ---------------------------------------------------------------------------
 
+pub struct SettingsWindowRunArgs<OnChange, OnClose> {
+    pub geometry: Option<SettingsWindowGeometry>,
+    pub launch_anchor: Option<SettingsWindowAnchor>,
+    pub on_change: OnChange,
+    pub on_close: OnClose,
+    pub listener: std::os::unix::net::UnixListener,
+    pub socket_path: std::path::PathBuf,
+}
+
 /// Run the settings window (blocking until closed).
 ///
 /// On Linux, initialises GTK, creates the window, registers the singleton
@@ -400,17 +412,26 @@ fn is_macos_close_window_shortcut(
 /// `on_change` is called for each setting change from the webview.
 /// `on_close` is called with the final geometry when the window closes.
 #[cfg(target_os = "linux")]
-pub fn run_settings_window(
-    geometry: Option<SettingsWindowGeometry>,
-    on_change: impl Fn(String) + 'static,
-    on_close: impl FnOnce(SettingsWindowGeometry) + 'static,
-    listener: std::os::unix::net::UnixListener,
-    _socket_path: std::path::PathBuf,
-) -> Result<(), String> {
+pub fn run_settings_window<OnChange, OnClose>(
+    args: SettingsWindowRunArgs<OnChange, OnClose>,
+) -> Result<(), String>
+where
+    OnChange: Fn(String) + 'static,
+    OnClose: FnOnce(SettingsWindowGeometry) + 'static,
+{
     use std::cell::RefCell;
     use std::rc::Rc;
 
     use gtk::prelude::*;
+
+    let SettingsWindowRunArgs {
+        geometry,
+        launch_anchor,
+        on_change,
+        on_close,
+        listener,
+        socket_path: _socket_path,
+    } = args;
 
     if let Err(e) = gtk::init() {
         return Err(format!("GTK init failed: {e}"));
@@ -424,16 +445,7 @@ pub fn run_settings_window(
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
     window.add(&container);
     window.show_all();
-
-    // Restore saved position after the window is visible. GTK3 docs note
-    // that most window managers ignore position requests for unmapped
-    // windows but honour move() once the window is visible. On Wayland,
-    // move() is a no-op and position() always returns (0, 0), so skip.
-    if let Some(geom) = geometry {
-        if !is_wayland_backend() {
-            window.move_(geom.x, geom.y);
-        }
-    }
+    position_linux_window(&window, geometry, launch_anchor);
 
     // Shared webview reference so the IPC handler can call evaluate_script
     // for font refresh requests. The webview is stored after build_gtk.
@@ -460,6 +472,43 @@ pub fn run_settings_window(
     cancel_active_check_source(&ctx.active_check_source);
 
     Ok(())
+}
+
+/// Position the Linux settings window after it is visible.
+#[cfg(target_os = "linux")]
+fn position_linux_window(
+    window: &gtk::Window,
+    geometry: Option<SettingsWindowGeometry>,
+    launch_anchor: Option<SettingsWindowAnchor>,
+) {
+    use gtk::prelude::GtkWindowExt;
+
+    // GTK3 docs note that most window managers ignore position requests for
+    // unmapped windows but honour move() once the window is visible. On
+    // Wayland, move() is a protocol-level no-op for toplevel windows.
+    if is_wayland_backend() {
+        return;
+    }
+
+    if let Some(anchor) = launch_anchor {
+        move_linux_window_to_anchor(window, anchor);
+        window.present();
+        return;
+    }
+
+    if let Some(geom) = geometry {
+        if saved_geometry_intersects_current_monitor(geom) {
+            window.move_(geom.x, geom.y);
+        } else {
+            tracing::info!(
+                x = geom.x,
+                y = geom.y,
+                width = geom.width,
+                height = geom.height,
+                "saved settings window position is off-screen, letting window manager place it"
+            );
+        }
+    }
 }
 
 /// Build the GTK window with the saved geometry and app icon.
@@ -494,6 +543,80 @@ fn build_linux_window(geometry: Option<SettingsWindowGeometry>) -> gtk::Window {
     }
 
     window
+}
+
+/// Move the GTK settings window so it is centered over the launcher terminal.
+#[cfg(target_os = "linux")]
+fn move_linux_window_to_anchor(window: &gtk::Window, anchor: SettingsWindowAnchor) {
+    use gtk::prelude::GtkWindowExt;
+
+    if !anchor.is_sane() || is_wayland_backend() {
+        return;
+    }
+
+    let (width, height) = window.size();
+    let (x, y) = centered_settings_position(anchor, width, height);
+    let (x, y) = anchor_workarea(anchor)
+        .map_or((x, y), |area| clamp_position_to_rect(x, y, width, height, &area));
+    window.move_(x, y);
+}
+
+#[cfg(target_os = "linux")]
+fn anchor_workarea(anchor: SettingsWindowAnchor) -> Option<gdk::Rectangle> {
+    use gdk::prelude::MonitorExt;
+
+    let display = gdk::Display::default()?;
+    let center_x = i64_to_i32_saturating(i64::from(anchor.x) + i64::from(anchor.width) / 2);
+    let center_y = i64_to_i32_saturating(i64::from(anchor.y) + i64::from(anchor.height) / 2);
+    let monitor =
+        display.monitor_at_point(center_x, center_y).or_else(|| display.primary_monitor())?;
+    Some(monitor.workarea())
+}
+
+#[cfg(target_os = "linux")]
+fn saved_geometry_intersects_current_monitor(geom: SettingsWindowGeometry) -> bool {
+    use gdk::prelude::MonitorExt;
+
+    let Some(display) = gdk::Display::default() else {
+        return true;
+    };
+    let rect = gdk::Rectangle::new(geom.x, geom.y, geom.width.max(1), geom.height.max(1));
+    for idx in 0..display.n_monitors() {
+        let Some(monitor) = display.monitor(idx) else { continue };
+        if monitor.workarea().intersect(&rect).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn clamp_position_to_rect(
+    x: i32,
+    y: i32,
+    window_width: i32,
+    window_height: i32,
+    rect: &gdk::Rectangle,
+) -> (i32, i32) {
+    (
+        clamp_axis(x, rect.x(), rect.width(), window_width),
+        clamp_axis(y, rect.y(), rect.height(), window_height),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn clamp_axis(position: i32, rect_origin: i32, rect_size: i32, window_size: i32) -> i32 {
+    let max = if rect_size > window_size {
+        rect_origin.saturating_add(rect_size - window_size)
+    } else {
+        rect_origin
+    };
+    position.clamp(rect_origin, max)
+}
+
+#[cfg(target_os = "linux")]
+fn i64_to_i32_saturating(value: i64) -> i32 {
+    i32::try_from(value).unwrap_or_else(|_| if value.is_negative() { i32::MIN } else { i32::MAX })
 }
 
 /// Webview-side state shared between the IPC handler and the window shutdown
@@ -621,7 +744,7 @@ fn fire_linux_on_close<F: FnOnce(SettingsWindowGeometry)>(
 #[cfg(not(target_os = "linux"))]
 enum TaoUserEvent {
     /// Another instance sent a "focus" command via the singleton socket.
-    FocusWindow,
+    FocusWindow(Option<SettingsWindowAnchor>),
     /// App shutdown requested over the singleton socket; preserve open state
     /// so a fresh Scribe launch can restore the settings window.
     QuitWindow,
@@ -637,6 +760,7 @@ enum TaoUserEvent {
 fn build_tao_window(
     event_loop: &tao::event_loop::EventLoop<TaoUserEvent>,
     geometry: Option<SettingsWindowGeometry>,
+    launch_anchor: Option<SettingsWindowAnchor>,
 ) -> Result<tao::window::Window, String> {
     use tao::dpi::{LogicalPosition, LogicalSize};
 
@@ -646,8 +770,11 @@ fn build_tao_window(
 
     if let Some(geom) = geometry {
         builder = builder
-            .with_inner_size(LogicalSize::new(f64::from(geom.width), f64::from(geom.height)))
-            .with_position(LogicalPosition::new(f64::from(geom.x), f64::from(geom.y)));
+            .with_inner_size(LogicalSize::new(f64::from(geom.width), f64::from(geom.height)));
+        if launch_anchor.is_none() {
+            builder =
+                builder.with_position(LogicalPosition::new(f64::from(geom.x), f64::from(geom.y)));
+        }
     } else {
         builder = builder.with_inner_size(LogicalSize::new(880.0, 680.0));
     }
@@ -668,9 +795,13 @@ fn spawn_singleton_listener(
             if !singleton::verify_peer_uid(&stream) {
                 continue;
             }
-            match singleton::read_command(&stream).as_deref() {
-                Some("focus") => drop(proxy.send_event(TaoUserEvent::FocusWindow)),
-                Some("quit") => drop(proxy.send_event(TaoUserEvent::QuitWindow)),
+            match singleton::read_command(&stream) {
+                Some(command) if command.cmd == "focus" => {
+                    drop(proxy.send_event(TaoUserEvent::FocusWindow(command.anchor)));
+                }
+                Some(command) if command.cmd == "quit" => {
+                    drop(proxy.send_event(TaoUserEvent::QuitWindow))
+                }
                 _ => {}
             }
         }
@@ -708,27 +839,53 @@ fn capture_geometry(window: &tao::window::Window) -> SettingsWindowGeometry {
     }
 }
 
+/// Move the tao settings window so it is centered over the launcher terminal.
+#[cfg(not(target_os = "linux"))]
+fn move_tao_window_to_anchor(window: &tao::window::Window, anchor: SettingsWindowAnchor) {
+    if !anchor.is_sane() {
+        return;
+    }
+
+    let size = window.outer_size();
+    let width = i32::try_from(size.width).unwrap_or(i32::MAX);
+    let height = i32::try_from(size.height).unwrap_or(i32::MAX);
+    let (x, y) = centered_settings_position(anchor, width, height);
+    window.set_outer_position(tao::dpi::PhysicalPosition::new(x, y));
+}
+
 /// Run the settings window on macOS using tao + wry (blocking until closed).
 ///
 /// Uses `tao::EventLoop` for windowing and `wry::WebViewBuilder::build()`
 /// with the tao window (no GTK dependency).
 #[cfg(not(target_os = "linux"))]
-pub fn run_settings_window(
-    geometry: Option<SettingsWindowGeometry>,
-    on_change: impl Fn(String) + 'static,
-    on_close: impl FnOnce(SettingsWindowGeometry) + 'static,
-    listener: std::os::unix::net::UnixListener,
-    _socket_path: std::path::PathBuf,
-) -> Result<(), String> {
+pub fn run_settings_window<OnChange, OnClose>(
+    args: SettingsWindowRunArgs<OnChange, OnClose>,
+) -> Result<(), String>
+where
+    OnChange: Fn(String) + 'static,
+    OnClose: FnOnce(SettingsWindowGeometry) + 'static,
+{
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    let SettingsWindowRunArgs {
+        geometry,
+        launch_anchor,
+        on_change,
+        on_close,
+        listener,
+        socket_path: _socket_path,
+    } = args;
 
     let config_json = load_config_json();
     let html = build_html()?;
 
     let mut event_loop =
         tao::event_loop::EventLoopBuilder::<TaoUserEvent>::with_user_event().build();
-    let window = build_tao_window(&event_loop, geometry)?;
+    let window = build_tao_window(&event_loop, geometry, launch_anchor)?;
+    if let Some(anchor) = launch_anchor {
+        move_tao_window_to_anchor(&window, anchor);
+    }
 
     // Spawn singleton listener and signal handlers on background threads.
     spawn_singleton_listener(listener, event_loop.create_proxy());
@@ -845,7 +1002,12 @@ fn handle_tao_event<F: FnOnce(SettingsWindowGeometry)>(
     use tao::event_loop::ControlFlow;
 
     match event {
-        Event::UserEvent(TaoUserEvent::FocusWindow) => window.set_focus(),
+        Event::UserEvent(TaoUserEvent::FocusWindow(anchor)) => {
+            if let Some(anchor) = anchor {
+                move_tao_window_to_anchor(window, anchor);
+            }
+            window.set_focus();
+        }
         Event::UserEvent(TaoUserEvent::QuitWindow) => {
             *control_flow = ControlFlow::Exit;
         }
@@ -897,9 +1059,14 @@ fn handle_singleton_connection(listener: &std::os::unix::net::UnixListener, wind
     if !singleton::verify_peer_uid(&stream) {
         return;
     }
-    match singleton::read_command(&stream).as_deref() {
-        Some("focus") => window.present(),
-        Some("quit") => gtk::main_quit(),
+    match singleton::read_command(&stream) {
+        Some(command) if command.cmd == "focus" => {
+            if let Some(anchor) = command.anchor {
+                move_linux_window_to_anchor(window, anchor);
+            }
+            window.present();
+        }
+        Some(command) if command.cmd == "quit" => gtk::main_quit(),
         _ => {}
     }
 }

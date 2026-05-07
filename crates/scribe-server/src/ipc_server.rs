@@ -2445,6 +2445,26 @@ pub fn detect_git_branch(cwd: &Path) -> Option<String> {
     }
 }
 
+/// Carry forward optional `AiProcessState` metadata (`context`, `model`,
+/// `tool`, `agent`, `conversation_id`) from the previously-stored live
+/// session state when the incoming `AiStateChanged` left those fields as
+/// `None`. State-only hooks emit `<Provider>State=<state>` without any
+/// metadata, which would otherwise clobber the live `context=NN` last
+/// set by the statusLine producer.
+async fn merge_partial_ai_state(
+    server_msg: &mut ServerMessage,
+    session_id: SessionId,
+    live_sessions: &LiveSessionRegistry,
+) {
+    let ServerMessage::AiStateChanged { ai_state, .. } = server_msg else {
+        return;
+    };
+    let prev = live_sessions.read().await.get(&session_id).and_then(|s| s.ai_state.clone());
+    if let Some(prev) = prev {
+        ai_state.merge_partial_from_previous(&prev);
+    }
+}
+
 /// Persist metadata from a `ServerMessage` into the live session registry.
 async fn persist_session_metadata(
     server_msg: &ServerMessage,
@@ -2533,9 +2553,12 @@ async fn send_metadata_event(
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     live_sessions: &LiveSessionRegistry,
 ) {
-    let Some((server_msg, cwd_for_workspace)) = convert_metadata_event(event, session_id) else {
+    let Some((mut server_msg, cwd_for_workspace)) = convert_metadata_event(event, session_id)
+    else {
         return;
     };
+
+    merge_partial_ai_state(&mut server_msg, session_id, live_sessions).await;
 
     persist_session_metadata(&server_msg, session_id, live_sessions).await;
 

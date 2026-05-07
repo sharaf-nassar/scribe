@@ -139,6 +139,40 @@ impl AiProcessState {
             conversation_id: None,
         }
     }
+
+    /// Carry forward optional metadata from a previous same-provider state
+    /// when the new event left those fields unset.
+    ///
+    /// The OSC 1337 protocol treats every `<Provider>State=...` event as a
+    /// full snapshot, but state-only hooks (`PreToolUse`, `Notification`,
+    /// `PostToolUse`, etc.) emit just the state with no `context=`,
+    /// `model=`, or other metadata. Without this merge, every hook firing
+    /// would clobber the values that the statusLine producer just set,
+    /// hiding the live AI context % between hook events.
+    ///
+    /// Fields the new event explicitly carries are kept as-is. If the
+    /// previous state belongs to a different provider (e.g. Claude →
+    /// Codex), nothing is merged: switching providers starts fresh.
+    pub fn merge_partial_from_previous(&mut self, prev: &Self) {
+        if prev.provider != self.provider {
+            return;
+        }
+        if self.context.is_none() {
+            self.context = prev.context;
+        }
+        if self.model.is_none() {
+            self.model.clone_from(&prev.model);
+        }
+        if self.tool.is_none() {
+            self.tool.clone_from(&prev.tool);
+        }
+        if self.agent.is_none() {
+            self.agent.clone_from(&prev.agent);
+        }
+        if self.conversation_id.is_none() {
+            self.conversation_id.clone_from(&prev.conversation_id);
+        }
+    }
 }
 
 #[cfg(test)]

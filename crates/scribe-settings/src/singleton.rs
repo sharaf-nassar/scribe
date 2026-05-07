@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
+use scribe_common::settings_window::{SettingsWindowAnchor, SettingsWindowCommand};
 use scribe_common::socket::{settings_lock_path, settings_socket_path};
 
 const MAX_COMMAND_LINE_BYTES: usize = 4096;
@@ -30,7 +31,7 @@ pub enum SingletonResult {
 /// Acquires an advisory flock, then tries to bind the socket. If another
 /// instance holds the socket, sends it a focus command and returns
 /// `AlreadyRunning`.
-pub fn acquire() -> Result<SingletonResult, String> {
+pub fn acquire(anchor: Option<SettingsWindowAnchor>) -> Result<SingletonResult, String> {
     let lock_path = settings_lock_path();
     let socket_path = settings_socket_path();
 
@@ -57,7 +58,7 @@ pub fn acquire() -> Result<SingletonResult, String> {
         Ok(listener) => Ok(SingletonResult::Primary { listener, socket_path, lock_file }),
         Err(_bind_err) => {
             // Socket exists — try to connect and send focus.
-            if send_focus_to_existing(&socket_path) {
+            if send_focus_to_existing(&socket_path, anchor) {
                 Ok(SingletonResult::AlreadyRunning)
             } else {
                 // Stale socket — remove and retry.
@@ -82,11 +83,25 @@ fn try_bind(socket_path: &std::path::Path) -> Result<UnixListener, std::io::Erro
 }
 
 /// Try to connect to an existing settings process and send focus command.
-fn send_focus_to_existing(socket_path: &std::path::Path) -> bool {
+fn send_focus_to_existing(
+    socket_path: &std::path::Path,
+    anchor: Option<SettingsWindowAnchor>,
+) -> bool {
     let Ok(mut stream) = UnixStream::connect(socket_path) else {
         return false;
     };
-    stream.write_all(b"{\"cmd\":\"focus\"}\n").is_ok()
+    write_command(&mut stream, &SettingsWindowCommand::focus(anchor)).is_ok()
+}
+
+/// Write a singleton command as a newline-terminated JSON payload.
+pub fn write_command(
+    stream: &mut UnixStream,
+    command: &SettingsWindowCommand,
+) -> std::io::Result<()> {
+    let payload = serde_json::to_vec(command)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    stream.write_all(&payload)?;
+    stream.write_all(b"\n")
 }
 
 /// Check if an incoming connection is from the same UID.
@@ -128,7 +143,7 @@ fn get_peer_uid(stream: &UnixStream) -> Result<u32, String> {
 /// Parse a command from a connected client.
 ///
 /// Reads a single newline-terminated JSON line and returns the `cmd` field.
-pub fn read_command(stream: &UnixStream) -> Option<String> {
+pub fn read_command(stream: &UnixStream) -> Option<SettingsWindowCommand> {
     // Set a short read timeout to avoid blocking the GTK loop.
     drop(stream.set_read_timeout(Some(std::time::Duration::from_millis(100))));
 
@@ -142,8 +157,7 @@ pub fn read_command(stream: &UnixStream) -> Option<String> {
         return None;
     }
 
-    let parsed: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-    parsed.get("cmd")?.as_str().map(String::from)
+    serde_json::from_str::<SettingsWindowCommand>(line.trim()).ok()
 }
 
 /// Cleanup: remove the socket file.

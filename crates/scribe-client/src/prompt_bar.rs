@@ -3,7 +3,8 @@
 //! Renders a background quad, icon glyphs, and truncated prompt text for
 //! the first and latest prompts submitted in a supported AI coding session.
 //! Also renders a `#N` message-count annotation and an elapsed-time counter
-//! since the most recent prompt was sent.
+//! since the most recent prompt was sent, with optional AI context-window
+//! usage in the right-edge cluster.
 
 use std::time::{Duration, SystemTime};
 
@@ -34,6 +35,10 @@ pub const ICON_TEXT_GAP: f32 = 10.0;
 /// widest possible format ("12m 04s" / "18h 03m" — 7 characters) so digit
 /// rollovers do not jitter the surrounding layout.
 const TIMER_SLOT_CELLS: usize = 7;
+/// Cell-width slot reserved for the AI context indicator. Sized for the
+/// widest output ("◐ 100%") so percentage digit changes do not move the
+/// timer/count cluster.
+const CONTEXT_SLOT_CELLS: usize = 6;
 /// Cells used between the timer and count in the 1-message state: `" · "`.
 const SEPARATOR_CELLS: usize = 3;
 /// Cells of breathing room between the prompt-text run and the right-edge
@@ -51,6 +56,7 @@ const ICON_DISMISS: char = '×';
 const SEPARATOR_GLYPH: char = '·';
 /// Hash glyph that prefixes the message count (`#4`).
 const COUNT_PREFIX: char = '#';
+const CONTEXT_PREFIX: char = '\u{25D0}';
 const DISMISS_OVERLAY_PAD_Y: f32 = 2.0;
 
 /// Which prompt bar line the mouse is hovering over, if any.
@@ -78,9 +84,20 @@ pub struct PromptBarLayout {
     /// Rect occupied by the middle-dot separator between timer and count
     /// in the 1-message state. `None` in the 2-message state.
     pub separator_text_rect: Option<Rect>,
+    /// Rect occupied by the optional AI context-window indicator. Sits to
+    /// the right of the count so the timer remains paired with `#N`.
+    pub context_text_rect: Option<Rect>,
+    /// Rect occupied by the middle-dot separator between count and context.
+    pub context_separator_rect: Option<Rect>,
     pub row_content_x: f32,
     pub first_line_width: f32,
     pub latest_line_width: Option<f32>,
+}
+
+#[derive(Clone, Copy)]
+pub struct PromptContextIndicator {
+    pub percent: u8,
+    pub color: [f32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -130,6 +147,7 @@ pub struct PromptBarRenderContext<'a> {
     pub hover: Option<PromptBarHover>,
     pub active: Option<PromptBarHover>,
     pub colors: &'a PromptBarColors,
+    pub context_indicator: Option<PromptContextIndicator>,
     /// Wall-clock time used to compute the elapsed-time counter. Threaded
     /// in (rather than read from `SystemTime::now()` inside the renderer)
     /// so tests can drive the counter deterministically.
@@ -304,6 +322,23 @@ impl PromptRenderer<'_> {
         });
     }
 
+    fn render_context_text(
+        &mut self,
+        rect: Rect,
+        percent: u8,
+        text_color: [f32; 4],
+        bg_color: [f32; 4],
+    ) {
+        let text = format_context_label(percent);
+        let cell_w = self.metrics.cell_size.0;
+        let text_width = cells_to_pixels(text.chars().count(), cell_w);
+        let mut x = rect.x + (rect.width - text_width).max(0.0);
+        let y = rect.y;
+        for ch in text.chars() {
+            x = self.emit_glyph(PromptGlyphRequest { ch, x, y, fg_color: text_color, bg_color });
+        }
+    }
+
     fn emit_glyph(&mut self, request: PromptGlyphRequest) -> f32 {
         let (uv_min, uv_max) = (self.resolve_glyph)(request.ch);
         self.out.push(CellInstance {
@@ -357,6 +392,7 @@ pub fn compute_prompt_bar_layout(
     pane: &Pane,
     bar_rect: Rect,
     cell_size: (f32, f32),
+    context_indicator: Option<PromptContextIndicator>,
 ) -> Option<PromptBarLayout> {
     if pane.prompt_count == 0 {
         return None;
@@ -377,23 +413,25 @@ pub fn compute_prompt_bar_layout(
     let count_cells = count_text_cells(pane.prompt_count);
     let count_width = cells_to_pixels(count_cells, cell_w);
     let timer_width = cells_to_pixels(TIMER_SLOT_CELLS, cell_w);
+    let context_width =
+        context_indicator.map_or(0.0, |_| cells_to_pixels(CONTEXT_SLOT_CELLS, cell_w));
     let separator_width = cells_to_pixels(SEPARATOR_CELLS, cell_w);
     let gutter_width = cells_to_pixels(RIGHT_GUTTER_CELLS, cell_w);
 
-    // The count text is always anchored to the right edge of the first row.
-    let row_one_text_y = first_row_rect.y + (first_row_rect.height - cell_h) * 0.5;
-    let count_text_rect = Rect {
-        x: cluster_right - count_width,
-        y: row_one_text_y,
-        width: count_width,
-        height: cell_h,
-    };
-
-    let one_row_args = OneRowClusterArgs {
-        count_text_rect,
-        row_text_y: row_one_text_y,
+    let row_one = first_row_cluster_layout(FirstRowClusterArgs {
+        cluster_right,
+        row_text_y: first_row_rect.y + (first_row_rect.height - cell_h) * 0.5,
         cell_h,
         count_width,
+        context_width,
+        separator_width,
+    });
+
+    let one_row_args = OneRowClusterArgs {
+        cluster_right,
+        count_text_rect: row_one.count_text_rect,
+        row_text_y: row_one.text_y,
+        cell_h,
         timer_width,
         separator_width,
         gutter_width,
@@ -404,8 +442,8 @@ pub fn compute_prompt_bar_layout(
             two_row_cluster(TwoRowClusterArgs {
                 latest_row_rect: latest,
                 cluster_right,
+                count_text_rect: row_one.count_text_rect,
                 cell_h,
-                count_width,
                 timer_width,
                 gutter_width,
             })
@@ -417,6 +455,8 @@ pub fn compute_prompt_bar_layout(
         first_right_reserved,
         latest_right_reserved,
     } = cluster;
+    let (context_text_rect, context_separator_rect) =
+        row_one.context.map_or((None, None), |(text, separator)| (Some(text), Some(separator)));
 
     let first_line_width = (card_rect.width - first_right_reserved).max(1.0);
     let latest_line_width =
@@ -427,9 +467,11 @@ pub fn compute_prompt_bar_layout(
         first_row_rect,
         latest_row_rect,
         seam_rect,
-        count_text_rect,
+        count_text_rect: row_one.count_text_rect,
         timer_text_rect,
         separator_text_rect,
+        context_text_rect,
+        context_separator_rect,
         row_content_x,
         first_line_width,
         latest_line_width,
@@ -441,6 +483,41 @@ struct RowGeometry {
     first: Rect,
     latest: Option<Rect>,
     seam: Option<Rect>,
+}
+
+#[derive(Clone, Copy)]
+struct FirstRowClusterArgs {
+    cluster_right: f32,
+    row_text_y: f32,
+    cell_h: f32,
+    count_width: f32,
+    context_width: f32,
+    separator_width: f32,
+}
+
+#[derive(Clone, Copy)]
+struct FirstRowCluster {
+    text_y: f32,
+    count_text_rect: Rect,
+    context: Option<(Rect, Rect)>,
+}
+
+fn first_row_cluster_layout(args: FirstRowClusterArgs) -> FirstRowCluster {
+    let context = context_after_count_layout(
+        args.cluster_right,
+        args.row_text_y,
+        args.cell_h,
+        args.context_width,
+        args.separator_width,
+    );
+    let count_right = context.map_or(args.cluster_right, |(_, separator)| separator.x);
+    let count_text_rect = Rect {
+        x: count_right - args.count_width,
+        y: args.row_text_y,
+        width: args.count_width,
+        height: args.cell_h,
+    };
+    FirstRowCluster { text_y: args.row_text_y, count_text_rect, context }
 }
 
 fn compute_row_geometry(card_rect: Rect, cell_h: f32, two_rows: bool) -> RowGeometry {
@@ -474,29 +551,30 @@ struct RightCluster {
 struct TwoRowClusterArgs {
     latest_row_rect: Rect,
     cluster_right: f32,
+    count_text_rect: Rect,
     cell_h: f32,
-    count_width: f32,
     timer_width: f32,
     gutter_width: f32,
 }
 
 #[derive(Clone, Copy)]
 struct OneRowClusterArgs {
+    cluster_right: f32,
     count_text_rect: Rect,
     row_text_y: f32,
     cell_h: f32,
-    count_width: f32,
     timer_width: f32,
     separator_width: f32,
     gutter_width: f32,
 }
 
 /// 2-message layout: count is anchored on row 1 (already laid out by the
-/// caller); the timer slot mirrors its right edge on row 2 directly under it.
+/// caller); the timer slot mirrors the count's right edge on row 2.
 fn two_row_cluster(args: TwoRowClusterArgs) -> RightCluster {
     let row_two_text_y = args.latest_row_rect.y + (args.latest_row_rect.height - args.cell_h) * 0.5;
+    let count_right = args.count_text_rect.x + args.count_text_rect.width;
     let timer_text_rect = Rect {
-        x: args.cluster_right - args.timer_width,
+        x: count_right - args.timer_width,
         y: row_two_text_y,
         width: args.timer_width,
         height: args.cell_h,
@@ -504,8 +582,8 @@ fn two_row_cluster(args: TwoRowClusterArgs) -> RightCluster {
     RightCluster {
         timer_text_rect,
         separator_text_rect: None,
-        first_right_reserved: args.count_width + args.gutter_width,
-        latest_right_reserved: args.timer_width + args.gutter_width,
+        first_right_reserved: (args.cluster_right - args.count_text_rect.x) + args.gutter_width,
+        latest_right_reserved: (args.cluster_right - timer_text_rect.x) + args.gutter_width,
     }
 }
 
@@ -524,13 +602,38 @@ fn one_row_cluster(args: OneRowClusterArgs) -> RightCluster {
         width: args.timer_width,
         height: args.cell_h,
     };
-    let cluster_width = args.timer_width + args.separator_width + args.count_width;
     RightCluster {
         timer_text_rect,
         separator_text_rect: Some(separator_text_rect),
-        first_right_reserved: cluster_width + args.gutter_width,
+        first_right_reserved: (args.cluster_right - timer_text_rect.x) + args.gutter_width,
         latest_right_reserved: 0.0,
     }
+}
+
+fn context_after_count_layout(
+    cluster_right: f32,
+    row_text_y: f32,
+    cell_h: f32,
+    context_width: f32,
+    separator_width: f32,
+) -> Option<(Rect, Rect)> {
+    if context_width <= 0.0 {
+        return None;
+    }
+
+    let context_text_rect = Rect {
+        x: cluster_right - context_width,
+        y: row_text_y,
+        width: context_width,
+        height: cell_h,
+    };
+    let separator_text_rect = Rect {
+        x: context_text_rect.x - separator_width,
+        y: row_text_y,
+        width: separator_width,
+        height: cell_h,
+    };
+    Some((context_text_rect, separator_text_rect))
 }
 
 /// Number of cells the `#N` count occupies (`#` + decimal digits of `count`).
@@ -562,6 +665,10 @@ pub fn format_elapsed(elapsed: Duration) -> String {
         let minutes = (total_secs % 3600) / 60;
         format!("{hours}h {minutes:02}m")
     }
+}
+
+fn format_context_label(percent: u8) -> String {
+    format!("{CONTEXT_PREFIX} {percent}%")
 }
 
 /// Compute the elapsed `Duration` from `since` to `now`, clamped to zero
@@ -596,6 +703,7 @@ pub fn render_prompt_bar(context: PromptBarRenderContext<'_>) {
         hover,
         active,
         colors,
+        context_indicator,
         now,
         resolve_glyph,
     } = context;
@@ -609,7 +717,10 @@ pub fn render_prompt_bar(context: PromptBarRenderContext<'_>) {
         return;
     }
 
-    let Some(layout) = compute_prompt_bar_layout(pane, bar_rect, cell_size) else { return };
+    let Some(layout) = compute_prompt_bar_layout(pane, bar_rect, cell_size, context_indicator)
+    else {
+        return;
+    };
     let metrics =
         PromptRenderMetrics { row_content_x: layout.row_content_x, cell_size, glyph_size };
     let seam_color = with_alpha(mix(colors.first_row_bg, colors.second_row_bg, 0.5), 0.20);
@@ -633,10 +744,10 @@ pub fn render_prompt_bar(context: PromptBarRenderContext<'_>) {
         renderer.render_dismiss_overlay(&layout, style);
     }
 
-    // Right-edge cluster: count is anchored to row 1; timer + separator
-    // either sit beside the count (1-message state) or directly under it
-    // on row 2 (2-message state). All three pick up the row background of
-    // the row they live in so they blend with hover/press tinting above.
+    // Right-edge cluster: context sits after the count on row 1; timer
+    // either sits beside the count (1-message state) or directly under it
+    // on row 2 (2-message state). Each glyph uses the row background so it
+    // blends with hover/press tinting above.
     let two_rows = layout.latest_row_rect.is_some();
     let count_text_color = with_alpha(colors.text, 0.62);
     let timer_text_color = with_alpha(colors.text, 0.42);
@@ -657,6 +768,13 @@ pub fn render_prompt_bar(context: PromptBarRenderContext<'_>) {
         );
         if let Some(sep_rect) = layout.separator_text_rect {
             renderer.render_separator(sep_rect, separator_text_color, colors.first_row_bg);
+        }
+    }
+    if let (Some(indicator), Some(context_rect)) = (context_indicator, layout.context_text_rect) {
+        let context_bg = colors.first_row_bg;
+        renderer.render_context_text(context_rect, indicator.percent, indicator.color, context_bg);
+        if let Some(sep_rect) = layout.context_separator_rect {
+            renderer.render_separator(sep_rect, separator_text_color, context_bg);
         }
     }
 }
@@ -747,7 +865,7 @@ pub fn hit_test_prompt_bar(
     mouse_x: f32,
     mouse_y: f32,
 ) -> Option<PromptBarHover> {
-    let layout = compute_prompt_bar_layout(pane, bar_rect, cell_size)?;
+    let layout = compute_prompt_bar_layout(pane, bar_rect, cell_size, None)?;
     if !layout.card_rect.contains(mouse_x, mouse_y) {
         return None;
     }
@@ -786,8 +904,9 @@ pub fn prompt_bar_text_width(
     bar_rect: Rect,
     cell_size: (f32, f32),
     hover: PromptBarHover,
+    context_indicator: Option<PromptContextIndicator>,
 ) -> Option<f32> {
-    let layout = compute_prompt_bar_layout(pane, bar_rect, cell_size)?;
+    let layout = compute_prompt_bar_layout(pane, bar_rect, cell_size, context_indicator)?;
     match hover {
         PromptBarHover::First => Some(layout.first_line_width),
         PromptBarHover::Latest => layout.latest_line_width,

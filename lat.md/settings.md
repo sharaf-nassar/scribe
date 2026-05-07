@@ -14,6 +14,8 @@ The visible window title is flavor-aware: stable installs use `Scribe Settings`,
 
 On launch, five pieces of state are injected into the webview: the host platform, the current config, keybinding defaults (for reset-to-default UI), all theme preset colours, and a list of available monospace fonts from fontdb.
 
+When Settings is opened from a client terminal, the client sends a [[crates/scribe-common/src/settings_window.rs#SettingsWindowAnchor|settings window anchor]] so the window can be centered over that terminal instead of replaying stale off-screen coordinates.
+
 ### Font Discovery
 
 The `list_monospace_fonts` function queries fontdb for all system monospace font families, returning a deduplicated sorted list.
@@ -60,7 +62,7 @@ Clipboard cleanup remains persisted as `claude_copy_cleanup` for backward compat
 
 `terminal.ai_tab_provider` is compatibility-only legacy state; AI tab shortcuts are configured through provider-specific keys: `new_claude_tab`, `new_claude_resume_tab`, `new_codex_tab`, `new_codex_resume_tab`, `new_auggie_tab`, and `new_auggie_resume_tab`.
 
-Context threshold settings are persisted under `terminal.ai_context_thresholds` and control the warn/danger band boundaries and their display colors. `warn` (default 70) and `danger` (default 90) are integer percentages. `ok_color`, `warn_color`, and `danger_color` are `#rrggbb` hex strings (defaults `#888888`, `#d4a017`, `#c83030`). These thresholds gate both the status bar AI context % segment color and the tab inline suffix; see [[common#Configuration#AI Context Thresholds]] for band classification logic.
+Context threshold settings are persisted under `terminal.ai_context_thresholds` and control the warn/danger band boundaries and their display colors. `warn` (default 70) and `danger` (default 90) are integer percentages. `ok_color`, `warn_color`, and `danger_color` are `#rrggbb` hex strings (defaults `#5fa05f`, `#d4a017`, `#c83030`). These thresholds color both the prompt-bar AI context % indicator and the tab inline suffix; see [[common#Configuration#AI Context Thresholds]] for band classification logic.
 
 Shared indicator settings cover Claude Code, Codex, and Auggie. The persisted key is now `ai_states`, while `claude_states` remains accepted as a config alias for backward compatibility. Per-state configuration for processing, waiting_for_input, permission_prompt, and error. Each state has: tab indicator (bool), pane border (bool), colour (hex or ANSI index), pulse milliseconds (u32), and timeout seconds (f32, min 0.0). Both `IdlePrompt` and `WaitingForInput` AI states share the `waiting_for_input` config key. The old `idle_prompt` key is silently ignored if present in existing configs.
 
@@ -92,10 +94,12 @@ Add/remove root directories and badge colour customization per index with reset-
 
 The settings app uses the same singleton structure as the server: a lock file plus a Unix socket for focus handoff. It takes `settings.lock`, listens on `settings.sock`, and sends a `focus` command to an existing instance when one is already running.
 
-Singleton socket commands are one-line JSON payloads capped at 4 KiB before parsing, so a same-UID peer cannot force unbounded line allocation in the settings process.
+Singleton socket commands are one-line JSON payloads capped at 4 KiB before parsing, so a same-UID peer cannot force unbounded line allocation in the settings process. Focus commands may carry the launcher terminal rectangle; new settings processes receive the same anchor via `SCRIBE_SETTINGS_ANCHOR`.
 
 That same socket also accepts a `quit` command from the client and server shutdown paths. The client sends it immediately for explicit `Quit Scribe`, and the server sends it after a short grace period once the last client disconnects, so the standalone settings window does not outlive the app while still tolerating fast reconnect handoffs. Socket-driven `quit` exits preserve the persisted `open` flag on both Linux and macOS so the next fresh Scribe launch restores settings only when the window had been open before app shutdown; native user closes still mark it closed.
 
 ## State Persistence
 
 Window geometry and open state are saved to the active flavor's state root, using `$XDG_STATE_HOME/scribe/settings_state.toml` for stable installs and `$XDG_STATE_HOME/scribe-dev/settings_state.toml` for `scribe-dev`, via [[crates/scribe-settings/src/state.rs]].
+
+On GTK/X11, saved settings geometry is restored only when it intersects a currently connected monitor work area. Explicit open/focus requests with an anchor override saved position and clamp the settings window to the anchor monitor work area.
