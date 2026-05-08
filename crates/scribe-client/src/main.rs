@@ -4649,14 +4649,7 @@ impl App {
     fn focused_pane_is_codex(&self) -> bool {
         let Some(pane) = self.focused_pane() else { return false };
 
-        if matches!(
-            pane.launch_binding.kind,
-            restore_state::LaunchKind::Ai { provider: AiProvider::CodexCode, .. }
-        ) {
-            return true;
-        }
-
-        self.ai_tracker.provider_for_session(pane.session_id) == Some(AiProvider::CodexCode)
+        ai_provider_for_pane(pane, &self.ai_tracker) == Some(AiProvider::CodexCode)
     }
 
     fn focused_pane(&self) -> Option<&Pane> {
@@ -5525,7 +5518,7 @@ impl App {
                 return;
             };
             let text = selection::extract_text(&pane.term, &sel);
-            let cleanup_active = self.ai_tracker.provider_for_session(pane.session_id).is_some();
+            let cleanup_active = ai_provider_for_pane(pane, &self.ai_tracker).is_some();
             (text, cleanup_active)
         };
 
@@ -7501,7 +7494,7 @@ impl App {
             let Some(tab) = self.window_layout.active_tab() else { return };
             let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
             let text = selection::extract_text(&pane.term, &sel);
-            let cleanup_active = self.ai_tracker.provider_for_session(pane.session_id).is_some();
+            let cleanup_active = ai_provider_for_pane(pane, &self.ai_tracker).is_some();
             (text, cleanup_active)
         };
         if raw.is_empty() {
@@ -8784,6 +8777,45 @@ impl App {
         let generation = Arc::clone(&self.animation.generation);
         let thread_generation = generation.fetch_add(1, Ordering::Relaxed) + 1;
         std::thread::spawn(move || run_animation_loop(&proxy, &generation, thread_generation));
+    }
+}
+
+// @lat: [[client#Client#Clipboard Cleanup]]
+fn ai_provider_for_pane(pane: &Pane, ai_tracker: &AiStateTracker) -> Option<AiProvider> {
+    ai_tracker.provider_for_session(pane.session_id).or(match pane.launch_binding.kind {
+        restore_state::LaunchKind::Ai { provider, .. } => Some(provider),
+        restore_state::LaunchKind::Shell | restore_state::LaunchKind::CustomCommand { .. } => None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_pane_with_launch_binding(launch_binding: restore_state::LaunchBinding) -> Pane {
+        Pane::new(
+            pane::PaneLayoutState {
+                rect: Rect { x: 0.0, y: 0.0, width: 800.0, height: 600.0 },
+                grid: GridSize { cols: 80, rows: 24 },
+                edges: PaneEdges::all_external(),
+            },
+            SessionId::new(),
+            WorkspaceId::new(),
+            launch_binding,
+        )
+    }
+
+    #[test]
+    fn copy_cleanup_provider_uses_ai_launch_binding_before_tracker_state() {
+        let pane = test_pane_with_launch_binding(restore_replay::new_ai_binding(
+            AiProvider::CodexCode,
+            restore_state::AiResumeMode::New,
+            None,
+            None,
+        ));
+        let tracker = AiStateTracker::default();
+
+        assert_eq!(ai_provider_for_pane(&pane, &tracker), Some(AiProvider::CodexCode));
     }
 }
 

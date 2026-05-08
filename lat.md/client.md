@@ -388,6 +388,8 @@ URL highlighting and the pointer cursor are only shown while the Ctrl modifier i
 
 When copying from a supported AI coding session, [[crates/scribe-client/src/clipboard_cleanup.rs#prepare_copy_text]] applies dedent, blockquote normalization, then unwrap.
 
+Copy actions decide whether cleanup is active through [[crates/scribe-client/src/main.rs#ai_provider_for_pane]], which accepts either tracker-detected AI state or an AI launch binding on the pane. This keeps cleanup enabled for newly opened Codex/Claude/Auggie tabs before their first state OSC arrives.
+
 Dedent strips minimum shared leading whitespace. Blockquote normalization removes markdown `>` markers and the rendered `▎` gutter used by some AI UIs so quoted prose copies as plain text. Unwrap then joins hard-wrapped prose at auto-detected wrap width. When no dominant width is detected but at least one line exceeds 40 characters, [[crates/scribe-client/src/clipboard_cleanup.rs#join_non_break_runs]] joins consecutive non-break lines as a fallback. Structural breaks like bullets, headings, code blocks, and tables are preserved after quote markers are removed.
 
 ## Window State
