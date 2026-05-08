@@ -4,7 +4,7 @@
 //! readings refreshed at most every 2 seconds, with rolling history buffers
 //! for sparkline rendering.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use sysinfo::{Networks, System};
@@ -161,18 +161,81 @@ fn bytes_to_gb(bytes: u64) -> f32 {
     f32::from(whole_gib) + f32::from(remainder_mib) / f32::from(MIB_PER_GIB)
 }
 
-/// Sum received and transmitted bytes across all non-loopback interfaces.
+/// Sum received and transmitted bytes for routed network interfaces.
+///
+/// Linux prefers default-route interfaces to avoid double-counting bridge/veth
+/// traffic; other platforms and missing route data fall back to non-loopback.
 fn net_delta(networks: &Networks) -> (u64, u64) {
+    let preferred_interfaces = preferred_network_interfaces();
+    if !preferred_interfaces.is_empty() {
+        let (up, down, matched) = net_delta_for_interfaces(networks, Some(&preferred_interfaces));
+        if matched > 0 {
+            return (up, down);
+        }
+    }
+
+    let (up, down, _) = net_delta_for_interfaces(networks, None);
+    (up, down)
+}
+
+fn net_delta_for_interfaces(
+    networks: &Networks,
+    allowed_interfaces: Option<&HashSet<String>>,
+) -> (u64, u64, usize) {
     let mut up: u64 = 0;
     let mut down: u64 = 0;
+    let mut matched = 0;
     for (name, data) in networks {
         if name == "lo" {
             continue;
         }
+        if let Some(allowed) = allowed_interfaces {
+            if !allowed.contains(name) {
+                continue;
+            }
+        }
         up = up.saturating_add(data.transmitted());
         down = down.saturating_add(data.received());
+        matched += 1;
     }
-    (up, down)
+    (up, down, matched)
+}
+
+#[cfg(target_os = "linux")]
+fn preferred_network_interfaces() -> HashSet<String> {
+    linux_default_route_interfaces()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preferred_network_interfaces() -> HashSet<String> {
+    HashSet::new()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_default_route_interfaces() -> HashSet<String> {
+    const RTF_UP: u16 = 0x1;
+
+    let mut interfaces = HashSet::new();
+    let Ok(route_table) = std::fs::read_to_string("/proc/net/route") else {
+        return interfaces;
+    };
+
+    for line in route_table.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let Some(name) = fields.next() else { continue };
+        let Some(destination) = fields.next() else { continue };
+        let _gateway = fields.next();
+        let Some(flags) = fields.next().and_then(|value| u16::from_str_radix(value, 16).ok())
+        else {
+            continue;
+        };
+
+        if destination == "00000000" && flags & RTF_UP != 0 && name != "lo" {
+            interfaces.insert(name.to_owned());
+        }
+    }
+
+    interfaces
 }
 
 /// Convert a byte delta to a per-second rate, rounding to u64.

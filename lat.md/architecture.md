@@ -56,6 +56,12 @@ Scripts and helpers used during local development builds.
 
 Manual server restarts during active work require explicit user approval because even zero-downtime handoff attempts can still disrupt in-flight tasks and connected clients.
 
+### Release Script
+
+The shared `release.sh` wrapper keeps release-note generation noninteractive so terminal probes cannot pollute confirmation prompts.
+
+`tools/release-me/release.sh` invokes Codex with CI/no-colour terminal environment and, when `setsid` is available, runs the background `codex exec` in a fresh session without a controlling terminal. This prevents Codex's `/dev/tty` colour and cursor probes from being answered into the parent script's later `read -rp` prompts.
+
 ### Lint Suppression Guard
 
 New Rust lint suppressions are blocked by a committed baseline so contributors must fix the underlying warning instead of adding `#[allow]` or `#[expect]`.

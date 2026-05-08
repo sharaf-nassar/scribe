@@ -526,6 +526,34 @@ fn terminal_content_hit(
     })
 }
 
+#[derive(Clone, Copy)]
+struct PromptClickToMoveRequest {
+    click_col: usize,
+    click_row: usize,
+    cursor_col: usize,
+    cursor_row: usize,
+    selection: PromptClickSelection,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptClickSelection {
+    Empty,
+    Range,
+}
+
+fn prompt_click_to_move_displacement(request: PromptClickToMoveRequest) -> Option<i32> {
+    if request.selection != PromptClickSelection::Empty {
+        return None;
+    }
+    if request.click_row != request.cursor_row {
+        return None;
+    }
+
+    let displacement =
+        saturating_usize_to_i32(request.click_col) - saturating_usize_to_i32(request.cursor_col);
+    if displacement == 0 { None } else { Some(displacement) }
+}
+
 fn sync_pane_resize_state(
     pane: &mut Pane,
     tx: &Sender<ClientCommand>,
@@ -6463,9 +6491,6 @@ impl App {
         if self.try_forward_mouse_press(winit::event::MouseButton::Left) {
             return;
         }
-        if !self.modifiers.shift_key() && self.try_prompt_click_to_move() {
-            return;
-        }
         if self.modifiers.shift_key() && self.active_selection.is_some() {
             self.extend_selection_to(x, y);
             return;
@@ -6482,7 +6507,7 @@ impl App {
     /// lands in the active prompt input zone (OSC 133;B to cursor, same line).
     ///
     /// Returns `true` when arrow sequences were sent and the click is consumed.
-    fn try_prompt_click_to_move(&self) -> bool {
+    fn try_prompt_click_to_move(&self, selection_is_empty: bool) -> bool {
         let Some((x, y)) = self.last_cursor_pos else { return false };
         let Some(tab) = self.window_layout.active_tab() else { return false };
         let Some(pane) = self.panes.get(&tab.focused_pane) else { return false };
@@ -6503,14 +6528,19 @@ impl App {
         let cursor_row = usize::try_from(cursor.line.0.max(0)).unwrap_or(usize::MAX);
         let cursor_col = cursor.column.0;
 
-        if usize::from(click_row) != cursor_row {
+        let Some(displacement) = prompt_click_to_move_displacement(PromptClickToMoveRequest {
+            click_col: usize::from(click_col),
+            click_row: usize::from(click_row),
+            cursor_col,
+            cursor_row,
+            selection: if selection_is_empty {
+                PromptClickSelection::Empty
+            } else {
+                PromptClickSelection::Range
+            },
+        }) else {
             return false;
-        }
-
-        let displacement = i32::from(click_col) - saturating_usize_to_i32(cursor_col);
-        if displacement == 0 {
-            return false;
-        }
+        };
 
         let (arrow_seq, count) = if displacement > 0 {
             (b"\x1b[C".as_ref(), usize::try_from(displacement).unwrap_or(usize::MAX))
@@ -7354,9 +7384,17 @@ impl App {
                 return;
             }
         }
+        let was_text_selecting = self.mouse_selecting;
+        let selection_is_empty = self.active_selection.is_some_and(|sel| sel.is_empty());
         self.mouse_selecting = false;
         self.finish_tab_drag();
         self.finish_pane_drag();
+        if was_text_selecting
+            && !self.modifiers.shift_key()
+            && self.try_prompt_click_to_move(selection_is_empty)
+        {
+            return;
+        }
         if !self.config.terminal.clipboard.copy_on_select {
             return;
         }
@@ -8816,6 +8854,32 @@ mod tests {
         let tracker = AiStateTracker::default();
 
         assert_eq!(ai_provider_for_pane(&pane, &tracker), Some(AiProvider::CodexCode));
+    }
+
+    fn prompt_click_request(selection: PromptClickSelection) -> PromptClickToMoveRequest {
+        PromptClickToMoveRequest {
+            click_col: 4,
+            click_row: 23,
+            cursor_col: 16,
+            cursor_row: 23,
+            selection,
+        }
+    }
+
+    #[test]
+    fn prompt_click_to_move_moves_empty_click_on_cursor_row() {
+        assert_eq!(
+            prompt_click_to_move_displacement(prompt_click_request(PromptClickSelection::Empty)),
+            Some(-12)
+        );
+    }
+
+    #[test]
+    fn prompt_click_to_move_ignores_drag_selection_on_cursor_row() {
+        assert_eq!(
+            prompt_click_to_move_displacement(prompt_click_request(PromptClickSelection::Range)),
+            None
+        );
     }
 }
 

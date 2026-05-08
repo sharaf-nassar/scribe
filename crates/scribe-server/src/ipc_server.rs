@@ -9,8 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
+use scribe_pty::claude_picker_filter::ClaudePickerTruncationFilter;
 use scribe_pty::codex_hook_log_filter::CodexHookLogFilter;
 use scribe_pty::ed3_filter::Ed3Filter;
+use scribe_pty::lf_crlf_filter::LfCrlfFilter;
 use tokio::io::{AsyncWriteExt as _, ReadHalf, WriteHalf};
 use tokio::net::UnixListener;
 use tokio::net::unix::UCred;
@@ -168,6 +170,16 @@ struct PtyReaderState {
     ed3_filter: Ed3Filter,
     /// Suppresses contiguous Codex hook log blocks when enabled.
     codex_hook_log_filter: CodexHookLogFilter,
+    /// Neutralises Claude Code's picker-truncation 3rd-redraw to keep typed
+    /// input visible (workaround for an `alacritty_terminal` row-tracking
+    /// off-by-one vs xterm at the wrap-pending boundary).
+    claude_picker_filter: ClaudePickerTruncationFilter,
+    /// Upgrades bare LF to CRLF in PTY output so `alacritty_terminal`'s
+    /// `linefeed` clears `input_needs_wrap` (via the inserted CR) — works
+    /// around an upstream bug where wrap+LF advances the cursor by 2 rows
+    /// instead of 1, breaking cursor-up redraws like release.sh's bash
+    /// progress panel. Always-on, no AI-provider gating.
+    lf_crlf_filter: LfCrlfFilter,
     /// Last AI provider seen for this session, if any.
     ai_provider: Option<AiProvider>,
     /// Latest known terminal cell size in pixels for winsize replies.
@@ -966,7 +978,6 @@ async fn start_session(
     let ansi_processor = session.ansi_processor;
     let osc_parser = session.osc_parser;
     let event_rx = session.event_rx;
-    let title = session.title.unwrap_or_else(|| String::from("shell"));
     let task_label = session.task_label;
     let cwd = session.cwd;
     let context = session.context;
@@ -997,7 +1008,7 @@ async fn start_session(
         attachment: Arc::clone(&attachment),
         workspace_id,
         shell_name,
-        title,
+        title: session.title.unwrap_or_else(|| String::from("shell")),
         task_label,
         cwd,
         context,
@@ -1034,6 +1045,8 @@ async fn start_session(
         last_proc_cwd: None,
         ed3_filter: Ed3Filter::new(),
         codex_hook_log_filter: CodexHookLogFilter::new(),
+        claude_picker_filter: ClaudePickerTruncationFilter::new(),
+        lf_crlf_filter: LfCrlfFilter::new(),
         ai_provider,
         cell_width,
         cell_height,
@@ -1054,6 +1067,13 @@ fn ai_state_uses_ed3_filter(ai_state: Option<&AiProcessState>) -> bool {
 
 fn ai_provider_uses_ed3_filter(ai_provider: Option<AiProvider>) -> bool {
     ai_provider.is_some_and(|provider| AiProvider::all().contains(&provider))
+}
+
+/// True when the Claude picker truncation workaround should run for this
+/// session. Only Claude Code's Ink-based `AskUserQuestion` picker emits the
+/// 18-byte truncation signature this filter targets.
+fn ai_provider_uses_claude_picker_filter(ai_provider: Option<AiProvider>) -> bool {
+    matches!(ai_provider, Some(AiProvider::ClaudeCode))
 }
 
 /// Write key input data to the PTY.
@@ -1930,13 +1950,39 @@ fn apply_pty_filters<'a>(state: &mut PtyReaderState, bytes: &'a [u8]) -> Cow<'a,
         }
         scribe_pty::ed3_filter::Ed3Output::Filtered(filtered_bytes) => Cow::Owned(filtered_bytes),
     };
-    if !should_apply_codex_hook_log_filter(state) {
-        return after_ed3;
-    }
 
-    match state.codex_hook_log_filter.filter(after_ed3.as_ref()) {
-        scribe_pty::codex_hook_log_filter::CodexHookLogOutput::Unchanged(_) => after_ed3,
-        scribe_pty::codex_hook_log_filter::CodexHookLogOutput::Filtered(filtered_bytes) => {
+    let after_claude_picker = if ai_provider_uses_claude_picker_filter(state.ai_provider) {
+        match state.claude_picker_filter.filter(after_ed3.as_ref()) {
+            scribe_pty::claude_picker_filter::ClaudePickerOutput::Unchanged(_) => after_ed3,
+            scribe_pty::claude_picker_filter::ClaudePickerOutput::Filtered(filtered_bytes) => {
+                Cow::Owned(filtered_bytes)
+            }
+        }
+    } else {
+        after_ed3
+    };
+
+    let after_codex_hook_log = if should_apply_codex_hook_log_filter(state) {
+        match state.codex_hook_log_filter.filter(after_claude_picker.as_ref()) {
+            scribe_pty::codex_hook_log_filter::CodexHookLogOutput::Unchanged(_) => {
+                after_claude_picker
+            }
+            scribe_pty::codex_hook_log_filter::CodexHookLogOutput::Filtered(filtered_bytes) => {
+                Cow::Owned(filtered_bytes)
+            }
+        }
+    } else {
+        after_claude_picker
+    };
+
+    // Always-on workaround for alacritty_terminal 0.26.0's `linefeed` bug:
+    // bare LF after a print-at-last-column with DECAWM advances the cursor
+    // by 2 rows instead of 1 because `input_needs_wrap` is not cleared.
+    // Inserting `\r` before any bare LF makes the parser run
+    // `carriage_return` first, which clears the deferred-wrap flag.
+    match state.lf_crlf_filter.filter(after_codex_hook_log.as_ref()) {
+        scribe_pty::lf_crlf_filter::LfCrlfOutput::Unchanged(_) => after_codex_hook_log,
+        scribe_pty::lf_crlf_filter::LfCrlfOutput::Filtered(filtered_bytes) => {
             Cow::Owned(filtered_bytes)
         }
     }

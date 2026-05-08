@@ -112,6 +112,30 @@ Four states track partial matches of the `\x1b[3J` sequence across `filter()` ca
 
 On a complete match the filter drops the sequence (emits nothing), preserving scrollback without injecting a visible screen clear. The filter sets an internal `suppressed` flag that the PTY reader consumes via `take_suppressed()`. A fast path skips allocation when no ESC byte is present. Pending bytes stay in state until the next call or `flush()`.
 
+## Claude Picker Truncation Filter
+
+The [[crates/scribe-pty/src/claude_picker_filter.rs#ClaudePickerTruncationFilter]] neutralises Claude Code's `AskUserQuestion` "Other" custom-text-input picker truncation 3rd-redraw so the typed prefix on the input row stays visible.
+
+Only runs for [[crates/scribe-common/src/ai_state.rs#AiProvider]]`::ClaudeCode` sessions, gated by [[crates/scribe-server/src/ipc_server.rs#ai_provider_uses_claude_picker_filter]]. Claude Code's Ink-based picker emits a 3-stage redraw when typed text overflows the picker's 2-row input field: (1) re-emit the visible prefix on the input row, (2) overlay an `…` truncation indicator at the last column, (3) re-position to what Ink expects to be the wrap row, print `❯`, skip 3 cols, print `…`, then `\x1b[K` to erase the rest of the line. Step 3's `\x1b[K` lands on the input row instead of the wrap row in `alacritty_terminal` 0.26.0 (an off-by-one vs xterm in cursor row tracking after a print-at-last-column with DECAWM followed by `\r\n`), erasing the user's typed text. The filter detects the distinctive 18-byte signature `❯\x1b[3C\x1b[39m…\x1b[K` and replaces all 18 bytes with NULs, which `alacritty_terminal`'s parser drops. The earlier redraws' typed prefix and trailing `…` indicator on the input row then survive the redraw.
+
+### State Machine
+
+A single `state: u8` (0..18) tracks signature-prefix progress across PTY chunk boundaries.
+
+On a complete match all 18 signature bytes are replaced with NULs. On mismatch any partial-match bytes are flushed unchanged before the diverging byte is reconsidered as a possible new signature start. A fast path skips allocation when the chunk contains no `\xe2` byte (signature start) and no pending state.
+
+## LF to CRLF Filter
+
+The [[crates/scribe-pty/src/lf_crlf_filter.rs#LfCrlfFilter]] upgrades bare `\n` (LF without a preceding `\r`) to `\r\n` in PTY output, working around an upstream `alacritty_terminal` 0.26.0 bug where its `term::Term::linefeed` does not clear `input_needs_wrap` after a print-at-last-column with DECAWM.
+
+Always-on, no AI-provider gating. Runs as the last step in [[crates/scribe-server/src/ipc_server.rs#apply_pty_filters]] so it sees the bytes that any AI-gated filter (ED 3, Claude picker, Codex hook log) leaves on the wire. xterm clears the deferred-wrap flag on LF, so `\n` and `\r\n` behave the same after a last-column print. `alacritty_terminal::term::linefeed` does not, so a wrap+LF pair advances the cursor by 2 visual rows instead of 1, breaking cursor-up redraws like `tools/release-me/release.sh`'s bash progress panel (`printf '\033[%dA\r'` over a panel whose border is exactly `cols` wide). `\r` (carriage_return) does clear the flag, so prepending `\r` before any bare LF restores xterm-equivalent behaviour without touching already-CRLF streams.
+
+### State Machine
+
+A single `prev_was_cr: bool` tracks whether the most recently emitted byte was `\r`, carried across `filter()` calls so a chunk ending in `\r` followed by a chunk starting with `\n` is correctly recognised as already-CRLF.
+
+A fast path skips allocation when the input contains no `\n` byte; the only state update in that case is recording whether the input ended on `\r`. On a bare LF the filter pushes `\r` then `\n`; on an already-CRLF LF it pushes `\n` only. Five unit tests cover bare-LF upgrade, CRLF passthrough, mixed streams, consecutive LFs, CR-split-across-chunks, LF-split-across-chunks, and start-of-stream LF.
+
 ## Codex Hook Log Filter
 
 The [[crates/scribe-pty/src/codex_hook_log_filter.rs#CodexHookLogFilter]] suppresses contiguous Codex hook log blocks while failing open if a block never closes.
