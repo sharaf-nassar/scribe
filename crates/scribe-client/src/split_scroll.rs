@@ -16,12 +16,14 @@ use crate::layout::Rect;
 
 /// Minimum number of rows shown in the pinned bottom portion.
 const MIN_PIN_ROWS: usize = 3;
-/// Extra live rows above the cursor to keep visible in the pinned region.
+
+/// Default rows reserved for the AI tool's prompt UI block.
 ///
-/// AI tools can draw prompt chrome one row above the input itself, so the
-/// old `+ 2` margin could clip the waiting-for-input block when the cursor sat
-/// on the last visible row.
-const CURSOR_CONTEXT_ROWS: usize = 3;
+/// Claude Code, Codex, and Auggie all render a prompt block several rows
+/// tall — a status line, permission/help hints, the input box border, and
+/// the input row. 8 rows fits the typical block without consuming half the
+/// screen, which keeps scrollback readable in the top portion.
+const AI_PROMPT_BLOCK_ROWS: usize = 8;
 
 /// Width of the jump-to-bottom button (pixels).
 const JUMP_BTN_W: f32 = 28.0;
@@ -62,57 +64,47 @@ pub struct SplitScrollGeometry {
     pub jump_button: Rect,
 }
 
-/// Compute the number of rows to pin at the bottom, based on cursor position.
+/// Compute the number of rows to pin at the bottom of the screen.
 ///
-/// `cursor_line` is 0-indexed from the top of the visible screen (at
-/// `display_offset = 0`).  The result is clamped to `[MIN_PIN_ROWS, max_rows]`.
-pub fn compute_pin_rows(cursor_line: usize, screen_lines: usize) -> usize {
-    let max_rows = screen_lines / 2;
-    // Rows from cursor to bottom, plus a small context margin above the
-    // cursor so live prompt chrome stays intact when split-scroll is active.
-    let rows = screen_lines.saturating_sub(cursor_line) + CURSOR_CONTEXT_ROWS;
-    rows.clamp(MIN_PIN_ROWS, max_rows.max(MIN_PIN_ROWS))
-}
-
-/// Compute the number of rows needed to keep the active prompt block intact.
-///
-/// `history_size` is the number of scrollback rows preceding the live viewport
-/// at `display_offset = 0`. `prompt_start_abs` and `input_start_abs` are
-/// absolute row indices from the top of scrollback (`0 = oldest line`).
-///
-/// When a live prompt is active, we prefer its `PromptStart` mark so the
-/// pinned region includes the full prompt chrome above the user's input. If
-/// that mark is unavailable, fall back to the input start row so at least the
-/// editable input block remains visible.
-pub fn compute_active_prompt_pin_rows(
-    history_size: usize,
-    screen_lines: usize,
-    prompt_start_abs: Option<usize>,
-    input_start_abs: Option<usize>,
-) -> Option<usize> {
-    if screen_lines == 0 {
-        return None;
-    }
-
-    let prompt_top_abs = prompt_start_abs.or(input_start_abs)?;
-    let live_bottom_abs = history_size.saturating_add(screen_lines.saturating_sub(1));
-    // A stored absolute position past the live bottom means the mark survived
-    // a scrollback trim that was not reflected back into `pane.prompt_marks` /
-    // `pane.input_start`. Returning `None` lets the caller fall back to the
-    // cursor heuristic instead of collapsing the pin to MIN_PIN_ROWS.
-    if prompt_top_abs > live_bottom_abs {
-        return None;
-    }
+/// The pin sits at the bottom of the screen and is sized to fit the AI
+/// tool's prompt UI block. The pin's *contents* are translated downward by
+/// [`live_cell_y_translation`] so the cursor lands at the last row of the
+/// pin regardless of where it actually sits in the live screen — that's
+/// what keeps the prompt visible when an AI tool draws it in the top half.
+pub fn compute_pin_rows(screen_lines: usize) -> usize {
     let max_rows = screen_lines.saturating_sub(MIN_PIN_ROWS).max(MIN_PIN_ROWS);
-    let rows = live_bottom_abs - prompt_top_abs + 1;
-    Some(rows.clamp(MIN_PIN_ROWS, max_rows))
+    AI_PROMPT_BLOCK_ROWS.clamp(MIN_PIN_ROWS, max_rows)
 }
 
-/// Expand the pinned bottom upward so the split never starts mid-way through
+/// Compute the y-pixel shift to apply to live cells so the cursor row
+/// lands at the last row of the pin region.
+///
+/// Without this shift, when the AI tool's cursor is in the upper half of
+/// the live screen, the prompt cells fall above the pin rect and get
+/// filtered out by [`filter_instances_by_y`] — hiding the prompt entirely
+/// while scrolled. With this shift, every live cell is translated so the
+/// cursor row lands on the last screen row (the bottom of the pin), and
+/// the rows naturally above the cursor stack upward into the pin from
+/// there. Rows naturally below the cursor are pushed off-screen and get
+/// filtered out instead.
+pub fn live_cell_y_translation(cursor_line: usize, screen_lines: usize, cell_h: f32) -> f32 {
+    use winit::dpi::Pixel as _;
+    let last_row = screen_lines.saturating_sub(1);
+    let rows_to_shift = last_row.saturating_sub(cursor_line);
+    u32::try_from(rows_to_shift).unwrap_or(u32::MAX).cast::<f32>() * cell_h
+}
+
+/// Expand the pinned region upward so the split never starts mid-way through
 /// a soft-wrapped logical line, while still leaving room for the top portion.
+///
+/// In the cursor-anchored model, the pin shows the live rows
+/// `[cursor_line - pin_rows + 1, cursor_line]` translated to the bottom of
+/// the screen. The "boundary" we walk up from is therefore
+/// `cursor_line - pin_rows + 1`, not `screen_lines - pin_rows`.
 pub fn align_pin_rows_to_logical_lines(
     term: &Term<VoidListener>,
     pin_rows: usize,
+    cursor_line: usize,
     screen_lines: usize,
 ) -> usize {
     if screen_lines <= MIN_PIN_ROWS {
@@ -122,7 +114,7 @@ pub fn align_pin_rows_to_logical_lines(
     let max_pin_rows = screen_lines.saturating_sub(MIN_PIN_ROWS).max(MIN_PIN_ROWS);
     let last_col = Column(term.grid().columns().saturating_sub(1));
     let mut aligned_pin_rows = pin_rows.min(max_pin_rows);
-    let mut boundary_row = screen_lines.saturating_sub(aligned_pin_rows);
+    let mut boundary_row = cursor_line.saturating_sub(aligned_pin_rows.saturating_sub(1));
 
     while boundary_row > 0
         && aligned_pin_rows < max_pin_rows
@@ -374,40 +366,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn active_prompt_returns_pin_for_valid_mark() {
-        // history=45, screen=30 → live_bottom=74. Mark at viewport line 5 (abs=50).
-        // rows = 74 - 50 + 1 = 25, clamp(3, 27) = 25.
-        assert_eq!(compute_active_prompt_pin_rows(45, 30, Some(50), None), Some(25));
+    fn pin_rows_uses_ai_block_size_when_room() {
+        // Comfortable screen: AI_PROMPT_BLOCK_ROWS fits cleanly.
+        assert_eq!(compute_pin_rows(30), AI_PROMPT_BLOCK_ROWS);
     }
 
     #[test]
-    fn active_prompt_clamps_to_max_when_prompt_at_top() {
-        // Prompt at viewport top (abs = history). rows = screen_lines = 30, clamps to 27.
-        assert_eq!(compute_active_prompt_pin_rows(45, 30, Some(45), None), Some(27));
+    fn pin_rows_clamps_when_screen_is_tiny() {
+        // Screen barely larger than MIN_PIN_ROWS: pin can't exceed
+        // screen_lines - MIN_PIN_ROWS or top portion vanishes.
+        assert_eq!(compute_pin_rows(MIN_PIN_ROWS + 1), MIN_PIN_ROWS);
+        assert_eq!(compute_pin_rows(0), MIN_PIN_ROWS);
     }
 
     #[test]
-    fn active_prompt_clamps_to_min_when_prompt_at_bottom() {
-        // Prompt at live bottom: rows = 1, clamp to MIN_PIN_ROWS.
-        assert_eq!(compute_active_prompt_pin_rows(45, 30, Some(74), None), Some(MIN_PIN_ROWS));
+    fn pin_rows_caps_below_screen_minus_min() {
+        // 10-row screen: max = 10 - 3 = 7. AI_PROMPT_BLOCK_ROWS=8 > 7, so cap.
+        assert_eq!(compute_pin_rows(10), 7);
+    }
+
+    // Regression test for the prompt-hidden bug: when the cursor is in the
+    // upper half of the live screen, the translation moves the cursor row to
+    // the last row of the screen so the prompt stays visible at the bottom of
+    // the pin region instead of being filtered out.
+    #[test]
+    fn translation_moves_cursor_to_last_screen_row_when_cursor_high() {
+        // Cursor at line 5 of a 30-row screen, cell_h = 16.0.
+        // The cursor row should be shifted by (30 - 1 - 5) = 24 rows.
+        let shift = live_cell_y_translation(5, 30, 16.0);
+        assert!((shift - 24.0 * 16.0).abs() < f32::EPSILON, "expected 24*16 = 384.0, got {shift}",);
     }
 
     #[test]
-    fn active_prompt_returns_none_for_stale_mark_past_live_bottom() {
-        // Stale mark from before a trim that shrunk history: abs > live_bottom.
-        // This must return None so the caller falls back to the cursor heuristic
-        // instead of clamping to MIN_PIN_ROWS (which collapses the pin).
-        assert_eq!(compute_active_prompt_pin_rows(10, 30, Some(100), None), None);
+    fn translation_is_zero_when_cursor_already_on_last_row() {
+        // Cursor on the last visible row (line 29 of 30) — no shift needed,
+        // matches the original "pin shows bottom rows of live screen" behavior.
+        let shift = live_cell_y_translation(29, 30, 16.0);
+        assert!(shift.abs() < f32::EPSILON, "expected 0.0, got {shift}");
     }
 
     #[test]
-    fn active_prompt_falls_back_to_input_start() {
-        // No PromptStart mark, but PromptEnd recorded input_start.
-        assert_eq!(compute_active_prompt_pin_rows(45, 30, None, Some(50)), Some(25));
+    fn translation_is_one_row_for_cursor_one_above_bottom() {
+        // Cursor at line 28 of 30 → shift cells down 1 row so cursor lands
+        // at the last screen row.
+        let shift = live_cell_y_translation(28, 30, 16.0);
+        assert!((shift - 16.0).abs() < f32::EPSILON, "expected one row (16.0), got {shift}",);
     }
 
     #[test]
-    fn active_prompt_returns_none_when_screen_lines_zero() {
-        assert_eq!(compute_active_prompt_pin_rows(45, 0, Some(50), None), None);
+    fn translation_saturates_when_cursor_below_screen() {
+        // Defensive: cursor_line >= screen_lines should not underflow. The
+        // shift should be 0 (treat cursor as already past the last row).
+        let shift = live_cell_y_translation(40, 30, 16.0);
+        assert!(shift.abs() < f32::EPSILON, "expected 0.0, got {shift}");
+    }
+
+    #[test]
+    fn translation_handles_cursor_at_top_of_screen() {
+        // Cursor at line 0 → shift = 29 rows down.
+        let shift = live_cell_y_translation(0, 30, 16.0);
+        assert!((shift - 29.0 * 16.0).abs() < f32::EPSILON, "expected 29*16 = 464.0, got {shift}",);
     }
 }

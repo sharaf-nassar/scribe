@@ -1,6 +1,5 @@
 pub mod async_fd;
 pub mod claude_picker_filter;
-pub mod codex_hook_log_filter;
 pub mod ed3_filter;
 pub mod event_listener;
 pub mod lf_crlf_filter;

@@ -162,4 +162,6 @@ Defined in [[crates/scribe-common/src/ai_state.rs#AiProcessState]]. Tracks the c
 
 Tracked fields include state (`idle_prompt`, `processing`, `waiting_for_input`, `permission_prompt`, `error`), tool name, agent identifier, model name, context usage percentage (0-100), and optional provider conversation IDs.
 
-Optional metadata fields are sticky across same-provider state changes via [[crates/scribe-common/src/ai_state.rs#AiProcessState#merge_partial_from_previous]] — the [[server]] applies the merge before broadcasting `AiStateChanged` so partial events from state-only hooks do not erase live values like the context-window fill set by the statusLine producer.
+Optional metadata fields are sticky across same-provider state changes via [[crates/scribe-common/src/ai_state.rs#AiProcessState#merge_partial_from_previous]] — the [[server]] applies the merge before broadcasting `AiStateChanged` so partial events from state-only hooks do not erase live values like the context-window fill last set by an earlier same-provider state event.
+
+Context-window % updates flow through a dedicated channel: status-line and usage-poll producers emit `<Provider>Context=NN` (parsed by [[crates/scribe-pty/src/metadata.rs#MetadataParser#parse_named_ai_context]] into `MetadataEvent::AiContextChanged`), which [[crates/scribe-server/src/ipc_server.rs#send_ai_context_change]] applies as a partial patch on the existing live state. State transitions stay owned by the per-provider hook scripts so a periodic context refresh never resets a hook-set state.

@@ -702,8 +702,6 @@ pub struct TerminalAiIntegrationConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalAiSessionConfig {
-    #[serde(default)]
-    pub hide_codex_hook_logs: bool,
     /// When `true` (default), block `CSI 3 J` (clear scrollback) from AI
     /// sessions so the user's scrollback history is preserved. When `false`,
     /// the sequence is passed through, matching standard terminal behaviour.
@@ -729,7 +727,6 @@ pub struct TerminalAiSessionConfig {
 impl Default for TerminalAiSessionConfig {
     fn default() -> Self {
         Self {
-            hide_codex_hook_logs: false,
             preserve_ai_scrollback: true,
             ai_tab_provider: default_ai_tab_provider(),
             ai_states: AiStateStylesConfig::default(),

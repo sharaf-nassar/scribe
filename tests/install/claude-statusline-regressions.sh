@@ -44,7 +44,7 @@ capture_run() {
 # ── case_used_percentage_present ─────────────────────────────────────────────
 case_name="case_used_percentage_present"
 capture_run '{"context_window":{"used_percentage":73},"model":{"display_name":"Sonnet 4.6"}}'
-if grep -qaF $'\x1b]1337;ClaudeState=processing;context=73\x07' "$CAPTURE_FILE" \
+if grep -qaF $'\x1b]1337;ClaudeContext=73\x07' "$CAPTURE_FILE" \
    && grep -qaF 'Sonnet 4.6 • 73%' "$CAPTURE_FILE"; then
     echo "PASS: ${case_name}"
 else
@@ -57,7 +57,7 @@ fi
 # 50000 + 10000 = 60000 / 200000 = 30%
 case_name="case_fallback_to_tokens"
 capture_run '{"context_window":{"context_window_size":200000,"total_input_tokens":50000,"total_output_tokens":10000},"model":{"display_name":"Opus"}}'
-if grep -qaF $'\x1b]1337;ClaudeState=processing;context=30\x07' "$CAPTURE_FILE" \
+if grep -qaF $'\x1b]1337;ClaudeContext=30\x07' "$CAPTURE_FILE" \
    && grep -qaF 'Opus • 30%' "$CAPTURE_FILE"; then
     echo "PASS: ${case_name}"
 else
@@ -69,7 +69,7 @@ fi
 # ── case_missing_context_window ───────────────────────────────────────────────
 case_name="case_missing_context_window"
 capture_run '{"model":{"display_name":"Opus"}}'
-if ! grep -qaF $'\x1b]1337;ClaudeState=processing;context=' "$CAPTURE_FILE" \
+if ! grep -qaF $'\x1b]1337;ClaudeContext=' "$CAPTURE_FILE" \
    && grep -qaF 'Opus' "$CAPTURE_FILE"; then
     echo "PASS: ${case_name}"
 else
@@ -81,7 +81,7 @@ fi
 # ── case_malformed_json ───────────────────────────────────────────────────────
 case_name="case_malformed_json"
 capture_run 'not-json'
-if ! grep -qaF $'\x1b]1337;ClaudeState=processing;context=' "$CAPTURE_FILE"; then
+if ! grep -qaF $'\x1b]1337;ClaudeContext=' "$CAPTURE_FILE"; then
     echo "PASS: ${case_name}"
 else
     echo "FAIL: ${case_name}"
@@ -92,7 +92,7 @@ fi
 # ── case_clamp_overflow ───────────────────────────────────────────────────────
 case_name="case_clamp_overflow"
 capture_run '{"context_window":{"used_percentage":150},"model":{"display_name":"Opus"}}'
-if grep -qaF $'\x1b]1337;ClaudeState=processing;context=100\x07' "$CAPTURE_FILE" \
+if grep -qaF $'\x1b]1337;ClaudeContext=100\x07' "$CAPTURE_FILE" \
    && grep -qaF 'Opus • 100%' "$CAPTURE_FILE"; then
     echo "PASS: ${case_name}"
 else
@@ -104,7 +104,7 @@ fi
 # ── case_clamp_underflow ──────────────────────────────────────────────────────
 case_name="case_clamp_underflow"
 capture_run '{"context_window":{"used_percentage":-5},"model":{"display_name":"Opus"}}'
-if grep -qaF $'\x1b]1337;ClaudeState=processing;context=0\x07' "$CAPTURE_FILE" \
+if grep -qaF $'\x1b]1337;ClaudeContext=0\x07' "$CAPTURE_FILE" \
    && grep -qaF 'Opus • 0%' "$CAPTURE_FILE"; then
     echo "PASS: ${case_name}"
 else

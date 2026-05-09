@@ -492,7 +492,7 @@ fn position_linux_window(
 
     if let Some(anchor) = launch_anchor {
         move_linux_window_to_anchor(window, anchor);
-        window.present();
+        raise_linux_window_above_launcher(window);
         return;
     }
 
@@ -559,6 +559,36 @@ fn move_linux_window_to_anchor(window: &gtk::Window, anchor: SettingsWindowAncho
     let (x, y) = anchor_workarea(anchor)
         .map_or((x, y), |area| clamp_position_to_rect(x, y, width, height, &area));
     window.move_(x, y);
+}
+
+/// Raise the GTK settings window above the launcher terminal.
+///
+/// `gtk_window_present()` is documented as broken for cross-process raises:
+/// the WM has no fresh user-input timestamp from the settings process, so
+/// X11 focus-stealing prevention silently demotes the raise to "demand
+/// attention" and the window appears behind the launcher. Fetching
+/// `gdk_x11_get_server_time` does a cheap X round-trip to obtain a timestamp
+/// the WM accepts as "happening now", so `present_with_time` raises the
+/// window above the launcher reliably.
+#[cfg(target_os = "linux")]
+fn raise_linux_window_above_launcher(window: &gtk::Window) {
+    use gdk::prelude::Cast;
+    use gtk::prelude::*;
+
+    if is_wayland_backend() {
+        window.present();
+        return;
+    }
+
+    let timestamp = window
+        .window()
+        .and_then(|gdk_window| gdk_window.downcast::<gdkx11::X11Window>().ok())
+        .map(|x11_window| gdkx11::functions::x11_get_server_time(&x11_window));
+
+    match timestamp {
+        Some(t) => window.present_with_time(t),
+        None => window.present(),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1051,8 +1081,6 @@ fn handle_tao_event<F: FnOnce(SettingsWindowGeometry)>(
 /// presents the window if the command is `"focus"`.
 #[cfg(target_os = "linux")]
 fn handle_singleton_connection(listener: &std::os::unix::net::UnixListener, window: &gtk::Window) {
-    use gtk::prelude::GtkWindowExt;
-
     let Ok((stream, _)) = listener.accept() else {
         return;
     };
@@ -1064,7 +1092,7 @@ fn handle_singleton_connection(listener: &std::os::unix::net::UnixListener, wind
             if let Some(anchor) = command.anchor {
                 move_linux_window_to_anchor(window, anchor);
             }
-            window.present();
+            raise_linux_window_above_launcher(window);
         }
         Some(command) if command.cmd == "quit" => gtk::main_quit(),
         _ => {}

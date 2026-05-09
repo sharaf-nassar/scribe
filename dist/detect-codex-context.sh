@@ -4,7 +4,10 @@
 #
 # Reads the tail of the most recent rollout JSONL under ~/.codex/sessions/,
 # finds the newest event_msg/token_count record, computes context %, and
-# emits OSC 1337 CodexState=processing;context=NN to /dev/tty.
+# emits OSC 1337 CodexContext=NN to /dev/tty. The OSC carries no state —
+# Codex's state transitions are owned by detect-codex-question.sh /
+# codex-task-label.sh / setup-codex-hooks.sh emitters; this producer only
+# patches the context-window %.
 # Fails closed — exits 0 on every error path so Codex is never disrupted.
 #
 set -euo pipefail
@@ -92,7 +95,7 @@ if window <= 0:
 pct = max(0, min(100, round(100 * total / window)))
 try:
     with open("/dev/tty", "w") as tty:
-        tty.write(f"\x1b]1337;CodexState=processing;context={pct}\x07")
+        tty.write(f"\x1b]1337;CodexContext={pct}\x07")
 except OSError:
     pass
 PY

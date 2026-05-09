@@ -47,7 +47,7 @@ cat > "${home1}/.codex/sessions/2026/05/06/rollout-test.jsonl" <<'EOF'
 {"timestamp":"2026-05-06T01:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"output_tokens":2000,"total_tokens":52000},"last_token_usage":{"input_tokens":50000,"output_tokens":2000,"total_tokens":52000},"model_context_window":260000}}}
 EOF
 capture_run "$home1"
-if grep -qaF $'\x1b]1337;CodexState=processing;context=20\x07' "$CAPTURE_FILE"; then
+if grep -qaF $'\x1b]1337;CodexContext=20\x07' "$CAPTURE_FILE"; then
     echo "PASS: ${case_name}"
 else
     echo "FAIL: ${case_name}"
@@ -64,7 +64,7 @@ cat > "${home2}/.codex/sessions/2026/05/06/rollout-test.jsonl" <<'EOF'
 {"timestamp":"2026-05-06T01:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":100000},"model_context_window":200000}}}
 EOF
 capture_run "$home2"
-if grep -qaF $'\x1b]1337;CodexState=processing;context=50\x07' "$CAPTURE_FILE"; then
+if grep -qaF $'\x1b]1337;CodexContext=50\x07' "$CAPTURE_FILE"; then
     echo "PASS: ${case_name}"
 else
     echo "FAIL: ${case_name}"
@@ -81,7 +81,7 @@ cat > "${home3}/.codex/sessions/2026/05/06/rollout-test.jsonl" <<'EOF'
 {"timestamp":"2026-05-06T01:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100000}}}}
 EOF
 capture_run "$home3"
-if grep -qaF $'\x1b]1337;CodexState=processing;context=50\x07' "$CAPTURE_FILE"; then
+if grep -qaF $'\x1b]1337;CodexContext=50\x07' "$CAPTURE_FILE"; then
     echo "PASS: ${case_name}"
 else
     echo "FAIL: ${case_name}"
@@ -98,7 +98,7 @@ cat > "${home4}/.codex/sessions/2026/05/06/rollout-test.jsonl" <<'EOF'
 {"timestamp":"2026-05-06T01:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":9000000},"model_context_window":258400}}}
 EOF
 capture_run "$home4"
-if grep -qaF $'\x1b]1337;CodexState=processing;context=100\x07' "$CAPTURE_FILE"; then
+if grep -qaF $'\x1b]1337;CodexContext=100\x07' "$CAPTURE_FILE"; then
     echo "PASS: ${case_name}"
 else
     echo "FAIL: ${case_name}"
@@ -115,11 +115,11 @@ cat > "${home5}/.codex/sessions/2026/05/06/rollout-test.jsonl" <<'EOF'
 {"timestamp":"2026-05-06T01:00:00.000Z","type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}
 EOF
 capture_run "$home5"
-if ! grep -qaF $'\x1b]1337;CodexState=processing;context=' "$CAPTURE_FILE"; then
+if ! grep -qaF $'\x1b]1337;CodexContext=' "$CAPTURE_FILE"; then
     echo "PASS: ${case_name}"
 else
     echo "FAIL: ${case_name}"
-    echo "  expected no OSC CodexState=processing;context= for task_started-only rollout"
+    echo "  expected no OSC CodexContext= for task_started-only rollout"
     failures=$((failures + 1))
 fi
 
@@ -129,11 +129,11 @@ case_name="case_empty_sessions_dir"
 home6="${tmp_dir}/home6"
 mkdir -p "${home6}/.codex/sessions"
 capture_run "$home6"
-if ! grep -qaF $'\x1b]1337;CodexState=processing;context=' "$CAPTURE_FILE"; then
+if ! grep -qaF $'\x1b]1337;CodexContext=' "$CAPTURE_FILE"; then
     echo "PASS: ${case_name}"
 else
     echo "FAIL: ${case_name}"
-    echo "  expected no OSC CodexState=processing;context= for empty sessions dir"
+    echo "  expected no OSC CodexContext= for empty sessions dir"
     failures=$((failures + 1))
 fi
 

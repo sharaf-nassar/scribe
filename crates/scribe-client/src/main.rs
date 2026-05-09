@@ -321,21 +321,15 @@ struct ConfigReloadPlan {
 impl ConfigReloadPlan {
     const THEME_CHANGED: u8 = 1 << 0;
     const FONT_CHANGED: u8 = 1 << 1;
-    const HIDE_CODEX_LOGS_CHANGED: u8 = 1 << 2;
-    const OPACITY_CHANGED: u8 = 1 << 3;
-    const TAB_BAR_CHANGED: u8 = 1 << 4;
-    const PADDING_CHANGED: u8 = 1 << 5;
-    const PROMPT_BAR_CHANGED: u8 = 1 << 6;
+    const OPACITY_CHANGED: u8 = 1 << 2;
+    const TAB_BAR_CHANGED: u8 = 1 << 3;
+    const PADDING_CHANGED: u8 = 1 << 4;
+    const PROMPT_BAR_CHANGED: u8 = 1 << 5;
 
     fn analyze(old: &ScribeConfig, new: &ScribeConfig) -> Self {
         let mut plan = Self { changes: 0 };
         plan.set(Self::THEME_CHANGED, theme_reload_needed(old, new));
         plan.set(Self::FONT_CHANGED, font_params_changed(old, new));
-        plan.set(
-            Self::HIDE_CODEX_LOGS_CHANGED,
-            old.terminal.ai_session.hide_codex_hook_logs
-                != new.terminal.ai_session.hide_codex_hook_logs,
-        );
         plan.set(
             Self::OPACITY_CHANGED,
             (old.appearance.opacity - new.appearance.opacity).abs() > f32::EPSILON,
@@ -365,10 +359,6 @@ impl ConfigReloadPlan {
 
     fn font_changed(&self) -> bool {
         self.contains(Self::FONT_CHANGED)
-    }
-
-    fn hide_codex_logs_changed(&self) -> bool {
-        self.contains(Self::HIDE_CODEX_LOGS_CHANGED)
     }
 
     fn opacity_changed(&self) -> bool {
@@ -3496,9 +3486,6 @@ impl App {
 
         self.reload_theme_if_needed(&new_config, plan.theme_changed());
         self.reload_fonts_if_needed(&new_config, plan.font_changed());
-        if plan.hide_codex_logs_changed() {
-            self.mark_all_panes_dirty();
-        }
         self.apply_cursor_config(&new_config);
         self.apply_opacity_change(&new_config, plan.opacity_changed());
         self.bindings = input::Bindings::parse(&new_config.keybindings);
@@ -9737,25 +9724,20 @@ fn rebuild_split_scroll_content(
     let cursor_line =
         usize::try_from(pane.term.grid().cursor.point.line.0.max(0)).unwrap_or(usize::MAX);
     let screen_lines = pane.term.grid().screen_lines();
-    let heuristic_pin_rows = split_scroll::compute_pin_rows(cursor_line, screen_lines);
-    let prompt_pin_rows = pane.input_start.and_then(|(input_line, _)| {
-        split_scroll::compute_active_prompt_pin_rows(
-            pane.term.grid().history_size(),
-            screen_lines,
-            pane.prompt_marks.last().copied(),
-            Some(input_line),
-        )
-    });
-    let base_pin_rows =
-        prompt_pin_rows.map_or(heuristic_pin_rows, |rows| rows.max(heuristic_pin_rows));
-    let pin_rows =
-        split_scroll::align_pin_rows_to_logical_lines(&pane.term, base_pin_rows, screen_lines);
-    let pin_h = usize_to_f32(pin_rows) * context.layout.cell_size.1;
+    let cell_h = context.layout.cell_size.1;
+    let base_pin_rows = split_scroll::compute_pin_rows(screen_lines);
+    let pin_rows = split_scroll::align_pin_rows_to_logical_lines(
+        &pane.term,
+        base_pin_rows,
+        cursor_line,
+        screen_lines,
+    );
+    let pin_h = usize_to_f32(pin_rows) * cell_h;
     if let Some(ss) = &mut pane.split_scroll {
         ss.pin_height = pin_h;
     }
 
-    let content_h = usize_to_f32(screen_lines) * context.layout.cell_size.1;
+    let content_h = usize_to_f32(screen_lines) * cell_h;
     let geo = split_scroll::compute_geometry(
         layout::Rect {
             x: context.offset.0,
@@ -9783,6 +9765,18 @@ fn rebuild_split_scroll_content(
     pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(saturating_usize_to_i32(
         saved_offset,
     )));
+
+    // Translate live cells so the cursor row lands at the last row of the
+    // screen content area (= last row of the pin region). Without this,
+    // when an AI tool draws the prompt in the upper half of the live
+    // screen, those cells fall above the pin rect and get filtered out.
+    let translation = split_scroll::live_cell_y_translation(cursor_line, screen_lines, cell_h);
+    if translation != 0.0 {
+        for cell in &mut live_instances {
+            cell.pos[1] += translation;
+        }
+    }
+
     let bottom_filtered =
         filter_split_scroll_instances(&live_instances, geo.bottom, context.focus.dimmed());
 

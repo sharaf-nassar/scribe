@@ -67,6 +67,18 @@ impl AiProvider {
         }
     }
 
+    /// OSC 1337 key for context-only refreshes emitted by status-line /
+    /// usage-poll producers that should never change the AI state.
+    /// Format: `ESC ] 1337 ; <Provider>Context=<u8> ST` (no other params).
+    #[must_use]
+    pub fn context_osc_key(self) -> &'static str {
+        match self {
+            AiProvider::ClaudeCode => "ClaudeContext",
+            AiProvider::CodexCode => "CodexContext",
+            AiProvider::Auggie => "AuggieContext",
+        }
+    }
+
     #[must_use]
     pub fn prompt_osc_key(self) -> &'static str {
         match self {

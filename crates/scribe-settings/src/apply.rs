@@ -293,7 +293,6 @@ fn apply_terminal_key(
         | "terminal.claude_code_integration"
         | "terminal.codex_code_integration"
         | "terminal.auggie_integration"
-        | "terminal.hide_codex_hook_logs"
         | "terminal.preserve_ai_scrollback"
         | "terminal.natural_scroll" => apply_terminal_behavior_key(config, key, value),
         "terminal.prompt_bar"
@@ -342,10 +341,6 @@ fn apply_terminal_behavior_key(
             config.terminal.ai_integration.auggie = scribe_common::config::AiIntegrationToggle::new(
                 value.as_bool().ok_or("auggie_integration must be a boolean")?,
             );
-        }
-        "terminal.hide_codex_hook_logs" => {
-            config.terminal.ai_session.hide_codex_hook_logs =
-                value.as_bool().ok_or("hide_codex_hook_logs must be a boolean")?;
         }
         "terminal.preserve_ai_scrollback" => {
             config.terminal.ai_session.preserve_ai_scrollback =

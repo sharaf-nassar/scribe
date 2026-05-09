@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use scribe_pty::claude_picker_filter::ClaudePickerTruncationFilter;
-use scribe_pty::codex_hook_log_filter::CodexHookLogFilter;
 use scribe_pty::ed3_filter::Ed3Filter;
 use scribe_pty::lf_crlf_filter::LfCrlfFilter;
 use tokio::io::{AsyncWriteExt as _, ReadHalf, WriteHalf};
@@ -168,8 +167,6 @@ struct PtyReaderState {
     last_proc_cwd: Option<std::path::PathBuf>,
     /// Strips ED 3 (`\x1b[3J`) from supported AI sessions to preserve scrollback.
     ed3_filter: Ed3Filter,
-    /// Suppresses contiguous Codex hook log blocks when enabled.
-    codex_hook_log_filter: CodexHookLogFilter,
     /// Neutralises Claude Code's picker-truncation 3rd-redraw to keep typed
     /// input visible (workaround for an `alacritty_terminal` row-tracking
     /// off-by-one vs xterm at the wrap-pending boundary).
@@ -185,8 +182,6 @@ struct PtyReaderState {
     /// Latest known terminal cell size in pixels for winsize replies.
     cell_width: u16,
     cell_height: u16,
-    /// Shared runtime flag updated by `ConfigReloaded`.
-    hide_codex_hook_logs: Arc<AtomicBool>,
     /// When `true`, suppress `CSI 3 J` in AI sessions to preserve scrollback.
     preserve_ai_scrollback: Arc<AtomicBool>,
     /// Shared scrollback limit for trimming duplicate AI redraw history.
@@ -233,8 +228,6 @@ pub struct LiveSession {
     /// Screen snapshot from a hot-reload handoff, sent to the first client
     /// that attaches. Taken (cleared) after first use.
     pub(crate) handoff_snapshot: Option<scribe_common::screen::ScreenSnapshot>,
-    /// Shared runtime flag updated by config reloads.
-    hide_codex_hook_logs: Arc<AtomicBool>,
     /// Shared runtime flag updated by config reloads.
     preserve_ai_scrollback: Arc<AtomicBool>,
     /// Shared runtime scrollback limit updated by config reloads.
@@ -994,7 +987,6 @@ async fn start_session(
     let client_writer = Arc::new(Mutex::new(initial_attachment.writer.map(Arc::clone)));
     let attachment = Arc::new(Mutex::new(initial_attachment.attached_ids.map(Arc::clone)));
 
-    let hide_codex_hook_logs = Arc::new(AtomicBool::new(load_hide_codex_hook_logs_setting()));
     let preserve_ai_scrollback = Arc::new(AtomicBool::new(load_preserve_ai_scrollback_setting()));
     let scrollback_lines = Arc::new(AtomicUsize::new(load_scrollback_lines_setting()));
     let ai_provider = ai_state.as_ref().map(|state| state.provider).or(ai_provider_hint);
@@ -1018,7 +1010,6 @@ async fn start_session(
         cell_height,
         pty,
         handoff_snapshot,
-        hide_codex_hook_logs: Arc::clone(&hide_codex_hook_logs),
         preserve_ai_scrollback: Arc::clone(&preserve_ai_scrollback),
         scrollback_lines: Arc::clone(&scrollback_lines),
     };
@@ -1044,13 +1035,11 @@ async fn start_session(
         osc_events: Vec::new(),
         last_proc_cwd: None,
         ed3_filter: Ed3Filter::new(),
-        codex_hook_log_filter: CodexHookLogFilter::new(),
         claude_picker_filter: ClaudePickerTruncationFilter::new(),
         lf_crlf_filter: LfCrlfFilter::new(),
         ai_provider,
         cell_width,
         cell_height,
-        hide_codex_hook_logs,
         preserve_ai_scrollback,
         scrollback_lines,
         preserved_ai_scrollback: PreservedAiScrollback::default(),
@@ -1685,28 +1674,16 @@ async fn handle_config_reloaded(
     for session in sessions.values() {
         session.term.lock().await.set_options(term_config.clone());
         session.scrollback_lines.store(new_scrollback, Ordering::Relaxed);
-        session.hide_codex_hook_logs.store(cfg.ai_terminal.hide_codex_hook_logs, Ordering::Relaxed);
         session
             .preserve_ai_scrollback
             .store(cfg.ai_terminal.preserve_ai_scrollback, Ordering::Relaxed);
     }
     info!(
         scrollback_lines = new_scrollback,
-        hide_codex_hook_logs = cfg.ai_terminal.hide_codex_hook_logs,
         preserve_ai_scrollback = cfg.ai_terminal.preserve_ai_scrollback,
         sessions = sessions.len(),
         "scrollback updated on live sessions"
     );
-}
-
-fn load_hide_codex_hook_logs_setting() -> bool {
-    match scribe_common::config::load_config() {
-        Ok(config) => config.terminal.ai_session.hide_codex_hook_logs,
-        Err(e) => {
-            warn!("failed to load codex hook log filter setting: {e}");
-            false
-        }
-    }
 }
 
 fn load_preserve_ai_scrollback_setting() -> bool {
@@ -1860,7 +1837,6 @@ async fn pty_reader_task(mut state: PtyReaderState) {
         }
     }
 
-    flush_pending_codex_output(&mut state).await;
     finalize_pty_reader(state).await;
 }
 
@@ -1962,37 +1938,17 @@ fn apply_pty_filters<'a>(state: &mut PtyReaderState, bytes: &'a [u8]) -> Cow<'a,
         after_ed3
     };
 
-    let after_codex_hook_log = if should_apply_codex_hook_log_filter(state) {
-        match state.codex_hook_log_filter.filter(after_claude_picker.as_ref()) {
-            scribe_pty::codex_hook_log_filter::CodexHookLogOutput::Unchanged(_) => {
-                after_claude_picker
-            }
-            scribe_pty::codex_hook_log_filter::CodexHookLogOutput::Filtered(filtered_bytes) => {
-                Cow::Owned(filtered_bytes)
-            }
-        }
-    } else {
-        after_claude_picker
-    };
-
     // Always-on workaround for alacritty_terminal 0.26.0's `linefeed` bug:
     // bare LF after a print-at-last-column with DECAWM advances the cursor
     // by 2 rows instead of 1 because `input_needs_wrap` is not cleared.
     // Inserting `\r` before any bare LF makes the parser run
     // `carriage_return` first, which clears the deferred-wrap flag.
-    match state.lf_crlf_filter.filter(after_codex_hook_log.as_ref()) {
-        scribe_pty::lf_crlf_filter::LfCrlfOutput::Unchanged(_) => after_codex_hook_log,
+    match state.lf_crlf_filter.filter(after_claude_picker.as_ref()) {
+        scribe_pty::lf_crlf_filter::LfCrlfOutput::Unchanged(_) => after_claude_picker,
         scribe_pty::lf_crlf_filter::LfCrlfOutput::Filtered(filtered_bytes) => {
             Cow::Owned(filtered_bytes)
         }
     }
-}
-
-async fn flush_pending_codex_output(state: &mut PtyReaderState) {
-    let Some(flushed) = state.codex_hook_log_filter.flush() else { return };
-    send_pty_output(&state.client_writer, state.session_id, &flushed).await;
-    feed_term(&state.term, &mut state.ansi_processor, &flushed).await;
-    maybe_capture_preserved_ai_scrollback_baseline(state).await;
 }
 
 async fn handle_suppressed_ai_ed3(state: &mut PtyReaderState) -> Option<usize> {
@@ -2278,14 +2234,6 @@ fn should_apply_ed3_filter(ai_provider: Option<AiProvider>, chunk_has_ed3_provid
     ai_provider_uses_ed3_filter(ai_provider) || chunk_has_ed3_provider
 }
 
-fn should_apply_codex_hook_log_filter(state: &PtyReaderState) -> bool {
-    if state.codex_hook_log_filter.has_pending() {
-        return true;
-    }
-
-    state.hide_codex_hook_logs.load(Ordering::Relaxed)
-}
-
 fn chunk_mentions_ed3_provider(events: &[MetadataEvent]) -> bool {
     events.iter().any(|event| match event {
         MetadataEvent::AiStateChanged(ai_state) => {
@@ -2511,6 +2459,45 @@ async fn merge_partial_ai_state(
     }
 }
 
+/// Apply a context-only refresh from a status-line / usage-poll producer.
+///
+/// The refresh patches `context` on the live `AiProcessState` for the
+/// matching provider and re-broadcasts a full `AiStateChanged` so connected
+/// clients see the new percentage without the producer ever asserting a
+/// state of its own. Three drop conditions, all silent:
+///
+/// - The session has no live `ai_state` yet — nothing to patch. The first
+///   real state event (Stop hook, `PreToolUse`, etc.) will establish state;
+///   the next refresh will then take effect.
+/// - The live state's provider differs from the refresh's provider. Cross-
+///   provider context bleed (e.g. Codex's `CodexContext=NN` arriving while
+///   the live state is Claude's) is rejected as a defensive guard.
+/// - The session is gone (closed during the await race).
+async fn send_ai_context_change(
+    provider: AiProvider,
+    context: u8,
+    session_id: SessionId,
+    client_writer: &ClientWriter,
+    live_sessions: &LiveSessionRegistry,
+) {
+    let updated_state = {
+        let mut sessions = live_sessions.write().await;
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return;
+        };
+        let Some(ai_state) = session.ai_state.as_mut() else {
+            return;
+        };
+        if ai_state.provider != provider {
+            return;
+        }
+        ai_state.context = Some(context);
+        ai_state.clone()
+    };
+    let server_msg = ServerMessage::AiStateChanged { session_id, ai_state: updated_state };
+    send_to_client(client_writer, &server_msg).await;
+}
+
 /// Persist metadata from a `ServerMessage` into the live session registry.
 async fn persist_session_metadata(
     server_msg: &ServerMessage,
@@ -2599,6 +2586,15 @@ async fn send_metadata_event(
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     live_sessions: &LiveSessionRegistry,
 ) {
+    // Context-only refreshes patch the existing live state instead of
+    // creating a new `AiStateChanged`. They never carry a state value, so
+    // they cannot synthesize one — when no live state has been established
+    // yet, the event is dropped silently.
+    if let MetadataEvent::AiContextChanged { provider, context } = event {
+        send_ai_context_change(provider, context, session_id, client_writer, live_sessions).await;
+        return;
+    }
+
     let Some((mut server_msg, cwd_for_workspace)) = convert_metadata_event(event, session_id)
     else {
         return;
@@ -2666,11 +2662,13 @@ fn convert_metadata_event(
             Some((ServerMessage::AiStateChanged { session_id, ai_state }, None))
         }
         MetadataEvent::AiStateCleared => Some((ServerMessage::AiStateCleared { session_id }, None)),
-        // AiProviderArmed is a server-internal pre-arm signal handled entirely
-        // inside `update_ai_provider_state`; there is no client-facing
-        // ServerMessage for it. `handle_session_event` also short-circuits
-        // before reaching here, so returning None is purely defensive.
-        MetadataEvent::AiProviderArmed { .. } => None,
+        // Neither variant has a direct client-facing `ServerMessage`.
+        // `AiProviderArmed` is a server-internal pre-arm signal handled inside
+        // `update_ai_provider_state`; `handle_session_event` short-circuits
+        // before reaching here, so this arm is purely defensive.
+        // `AiContextChanged` is patched onto the live `AiProcessState` and
+        // re-broadcast as `AiStateChanged` directly from `send_metadata_event`.
+        MetadataEvent::AiProviderArmed { .. } | MetadataEvent::AiContextChanged { .. } => None,
         MetadataEvent::Bell => Some((ServerMessage::Bell { session_id }, None)),
         MetadataEvent::PromptMark { kind, click_events, exit_code } => {
             Some((ServerMessage::PromptMark { session_id, kind, click_events, exit_code }, None))

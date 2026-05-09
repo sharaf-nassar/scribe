@@ -6,8 +6,13 @@ set -euo pipefail
 # CC invokes this script with a JSON document on stdin whenever the status
 # line needs to be refreshed. This script:
 #   1. Reads context_window.used_percentage (or falls back to computing it
-#      from token counts) and emits an OSC 1337 ClaudeState=processing;
-#      context=NN sequence to /dev/tty so Scribe can update its indicators.
+#      from token counts) and emits an OSC 1337 ClaudeContext=NN sequence
+#      to /dev/tty so Scribe can update the live context-window % without
+#      ever asserting a state. State transitions are owned exclusively by
+#      Claude's hook scripts (PreToolUse / PostToolUse / Stop / etc.).
+#      The previous version of this script emitted ClaudeState=processing
+#      on every refresh, which clobbered idle/waiting states immediately
+#      after the Stop hook fired and left CC panes "stuck in processing".
 #   2. Writes a human-readable banner to stdout that CC renders as the
 #      visible status line.
 #
@@ -60,7 +65,7 @@ if isinstance(model, dict):
 
 # ── Emit OSC to /dev/tty (best effort) ───────────────────────────────────
 if pct is not None:
-    osc = f"\x1b]1337;ClaudeState=processing;context={pct}\x07"
+    osc = f"\x1b]1337;ClaudeContext={pct}\x07"
     try:
         with open("/dev/tty", "w") as tty:
             tty.write(osc)

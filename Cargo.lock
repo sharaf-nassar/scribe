@@ -3955,6 +3955,7 @@ dependencies = [
  "fontdb",
  "gdk",
  "gdk-pixbuf",
+ "gdkx11",
  "gtk",
  "libc",
  "nix",

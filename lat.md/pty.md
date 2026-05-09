@@ -60,6 +60,16 @@ The `context` field is parsed as a `u8` representing 0–100% context-window fil
 
 Codex and Auggie hooks also use OSC 1337 for separate task-label channels. `<Provider>TaskLabel=<label>` sets the short, sanitized task label shown in the tab bar, and `<Provider>TaskLabelCleared` clears it without disturbing the underlying shell title.
 
+### OSC 1337 — AI Context Refresh
+
+`<Provider>Context=<u8>` is a context-only refresh from status-line / usage-poll producers. Only the percentage travels — no state, no other params.
+
+The parser ([[crates/scribe-pty/src/metadata.rs#MetadataParser#parse_named_ai_context]]) clamps to 0..=100 and silently drops non-numeric or out-of-range values, then emits `MetadataEvent::AiContextChanged { provider, context }`.
+
+The server ([[crates/scribe-server/src/ipc_server.rs#send_ai_context_change]]) patches `context` on the live `AiProcessState` for the matching provider and re-broadcasts a full `AiStateChanged`. When no live state has been established yet, or when the live state's provider differs, the refresh is dropped — the producer never synthesizes state. State transitions stay owned by the per-provider hook scripts.
+
+This split exists because `dist/scribe-claude-statusline.sh` previously emitted `ClaudeState=processing;context=NN` on every CC status-line refresh, which clobbered idle/waiting states immediately after the `dist/detect-claude-question.sh` Stop hook fired and left CC panes "stuck in processing".
+
 ### OSC 1337 — Pre-Arm Sentinel
 
 `ScribeAiLaunch=<provider_id>` is a shell-integration sentinel that pre-arms the [[pty#ED 3 Filter]] for an AI binary the shell is about to execute.
@@ -104,7 +114,7 @@ A real ED 3 resets `display_offset` to 0 inside alacritty_terminal's `clear_hist
 
 When a later ED 3 arrives in the same scrollback epoch, the PTY reader trims the server Term back to that epoch baseline and sends [[crates/scribe-common/src/protocol.rs#ServerMessage]]`::TrimScrollback` before forwarding the redraw bytes.
 
-The client flushes any queued PTY output for that pane, trims its own Term back to the same baseline, and then applies the new bytes. This keeps committed AI transcript history while preventing repeated inline redraws from stacking duplicate frames above it. Because [[crates/scribe-client/src/pane.rs#Pane]]`::prompt_marks` and `input_start` store positions as "lines from the very top of scrollback (0 = oldest)", the client also calls [[crates/scribe-client/src/pane.rs#shift_absolute_marks_after_trim]] with the dropped-row count so split-scroll's pin math, prompt jump, and scrollbar markers continue to point at the right rows after each trim.
+The client flushes any queued PTY output for that pane, trims its own Term back to the same baseline, and then applies the new bytes. This keeps committed AI transcript history while preventing repeated inline redraws from stacking duplicate frames above it. Because [[crates/scribe-client/src/pane.rs#Pane]]`::prompt_marks` and `input_start` store positions as "lines from the very top of scrollback (0 = oldest)", the client also calls [[crates/scribe-client/src/pane.rs#shift_absolute_marks_after_trim]] with the dropped-row count so prompt jump and scrollbar markers continue to point at the right rows after each trim. Split-scroll itself no longer depends on these absolute marks — it sizes the pin from a fixed `AI_PROMPT_BLOCK_ROWS` constant and translates live cells by `cursor_line`, neither of which moves under a trim.
 
 ### State Machine
 
@@ -128,19 +138,13 @@ On a complete match all 18 signature bytes are replaced with NULs. On mismatch a
 
 The [[crates/scribe-pty/src/lf_crlf_filter.rs#LfCrlfFilter]] upgrades bare `\n` (LF without a preceding `\r`) to `\r\n` in PTY output, working around an upstream `alacritty_terminal` 0.26.0 bug where its `term::Term::linefeed` does not clear `input_needs_wrap` after a print-at-last-column with DECAWM.
 
-Always-on, no AI-provider gating. Runs as the last step in [[crates/scribe-server/src/ipc_server.rs#apply_pty_filters]] so it sees the bytes that any AI-gated filter (ED 3, Claude picker, Codex hook log) leaves on the wire. xterm clears the deferred-wrap flag on LF, so `\n` and `\r\n` behave the same after a last-column print. `alacritty_terminal::term::linefeed` does not, so a wrap+LF pair advances the cursor by 2 visual rows instead of 1, breaking cursor-up redraws like `tools/release-me/release.sh`'s bash progress panel (`printf '\033[%dA\r'` over a panel whose border is exactly `cols` wide). `\r` (carriage_return) does clear the flag, so prepending `\r` before any bare LF restores xterm-equivalent behaviour without touching already-CRLF streams.
+Always-on, no AI-provider gating. Runs as the last step in [[crates/scribe-server/src/ipc_server.rs#apply_pty_filters]] so it sees the bytes that any AI-gated filter (ED 3, Claude picker) leaves on the wire. xterm clears the deferred-wrap flag on LF, so `\n` and `\r\n` behave the same after a last-column print. `alacritty_terminal::term::linefeed` does not, so a wrap+LF pair advances the cursor by 2 visual rows instead of 1, breaking cursor-up redraws like `tools/release-me/release.sh`'s bash progress panel (`printf '\033[%dA\r'` over a panel whose border is exactly `cols` wide). `\r` (carriage_return) does clear the flag, so prepending `\r` before any bare LF restores xterm-equivalent behaviour without touching already-CRLF streams.
 
 ### State Machine
 
 A single `prev_was_cr: bool` tracks whether the most recently emitted byte was `\r`, carried across `filter()` calls so a chunk ending in `\r` followed by a chunk starting with `\n` is correctly recognised as already-CRLF.
 
 A fast path skips allocation when the input contains no `\n` byte; the only state update in that case is recording whether the input ended on `\r`. On a bare LF the filter pushes `\r` then `\n`; on an already-CRLF LF it pushes `\n` only. Five unit tests cover bare-LF upgrade, CRLF passthrough, mixed streams, consecutive LFs, CR-split-across-chunks, LF-split-across-chunks, and start-of-stream LF.
-
-## Codex Hook Log Filter
-
-The [[crates/scribe-pty/src/codex_hook_log_filter.rs#CodexHookLogFilter]] suppresses contiguous Codex hook log blocks while failing open if a block never closes.
-
-When the setting is enabled, the filter recognizes the current documented Codex hook events (`SessionStart`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `UserPromptSubmit`, and `Stop`) in both legacy `Running ... hook` / `hook (...)` blocks and the current ANSI-styled `hook: <event>` / `hook: <event> Completed` form. It buffers the full contiguous hook block until the matching trailer arrives, removes the hook boilerplate and only the first raw whitespace-only spacer line after it, and still releases buffered bytes unchanged if Codex never emits a trailer. ANSI-painted blank redraw lines are preserved so Codex prompt backgrounds and other post-hook paint operations survive filtering. Prefix matching waits for complete visible text through multibyte bullets and bounded ANSI styling prefixes, and if interactive Codex redraws a completed hook row without a trailing newline, the filter splits at the last visible hook byte so later cursor-motion and prompt repaint control sequences stay in the stream instead of disappearing with the hidden hook line. When a stripped hook prefix had already established non-default SGR colors or attributes, the kept tail replays those active styles before the remaining bytes so inherited prompt backgrounds do not drop back to the terminal default. For VTE synchronized updates, it trims hook-only rows or hook prefixes from the buffered sync block itself, splits legacy `Running ... hook` rows away from later repaint bytes in the same raw line, drops tails that are only SGR resets plus line endings, and still keeps control-only and ANSI-painted blank rows so prompt-background repaint tails survive even when Codex redraws the completion row and the follow-up prompt fill in one atomic commit.
 
 ## Event Listener
 

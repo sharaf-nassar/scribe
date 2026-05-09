@@ -39,6 +39,15 @@ pub enum MetadataEvent {
     AiStateChanged(AiProcessState),
     /// The AI state was explicitly cleared (OSC 1337 `ClaudeState=inactive`).
     AiStateCleared,
+    /// Context-window % refresh from a status-line / usage-poll producer.
+    /// Carries no state — the server patches `context` on the live
+    /// `AiProcessState` for the matching provider and re-broadcasts. If no
+    /// state has been established yet (or it belongs to a different
+    /// provider), the event is dropped to avoid synthesizing a fake state.
+    AiContextChanged {
+        provider: AiProvider,
+        context: u8,
+    },
     /// Shell-integration sentinel that pre-arms the ED 3 filter for the next
     /// command. Emitted by `__scribe_preexec` (zsh) / DEBUG trap (bash) /
     /// equivalents when the user runs `claude`, `codex`, or `auggie`. Lets
@@ -193,6 +202,11 @@ impl MetadataParser {
             return Self::parse_named_ai_state(provider, state_value, params);
         }
 
+        let context_prefix = format!("{}=", provider.context_osc_key());
+        if let Some(context_value) = payload.strip_prefix(&context_prefix) {
+            return Self::parse_named_ai_context(provider, context_value);
+        }
+
         let prompt_prefix = format!("{}=", provider.prompt_osc_key());
         if let Some(text) = payload.strip_prefix(&prompt_prefix) {
             return Self::parse_prompt(provider, text);
@@ -208,6 +222,14 @@ impl MetadataParser {
         payload
             .strip_prefix(&label_prefix)
             .and_then(|label| Self::parse_task_label(provider, label))
+    }
+
+    /// Parse a `<Provider>Context=<u8>` payload. Values outside 0..=100 or
+    /// non-numeric values are dropped (returns None) so a producer typo never
+    /// corrupts the live context %.
+    fn parse_named_ai_context(provider: AiProvider, value: &str) -> Option<MetadataEvent> {
+        let context = value.trim().parse::<u8>().ok().filter(|v| *v <= 100)?;
+        Some(MetadataEvent::AiContextChanged { provider, context })
     }
 
     /// Parse the legacy `AiState=state=X;key=val` single-payload format.
@@ -687,5 +709,50 @@ mod tests {
             }
             other => panic!("expected Claude processing state with no context, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_claude_context_only_event() {
+        let event = parse_iterm2(&[b"1337", b"ClaudeContext=42"]);
+        assert_eq!(
+            event,
+            Some(MetadataEvent::AiContextChanged { provider: AiProvider::ClaudeCode, context: 42 })
+        );
+    }
+
+    #[test]
+    fn parses_codex_context_only_event() {
+        let event = parse_iterm2(&[b"1337", b"CodexContext=7"]);
+        assert_eq!(
+            event,
+            Some(MetadataEvent::AiContextChanged { provider: AiProvider::CodexCode, context: 7 })
+        );
+    }
+
+    #[test]
+    fn parses_auggie_context_only_event() {
+        let event = parse_iterm2(&[b"1337", b"AuggieContext=99"]);
+        assert_eq!(
+            event,
+            Some(MetadataEvent::AiContextChanged { provider: AiProvider::Auggie, context: 99 })
+        );
+    }
+
+    #[test]
+    fn drops_context_only_event_above_100() {
+        let event = parse_iterm2(&[b"1337", b"ClaudeContext=150"]);
+        assert!(event.is_none(), "out-of-range context should not synthesize a state");
+    }
+
+    #[test]
+    fn drops_context_only_event_with_non_numeric_value() {
+        let event = parse_iterm2(&[b"1337", b"ClaudeContext=oops"]);
+        assert!(event.is_none(), "non-numeric context should not synthesize a state");
+    }
+
+    #[test]
+    fn drops_context_only_event_with_empty_value() {
+        let event = parse_iterm2(&[b"1337", b"ClaudeContext="]);
+        assert!(event.is_none());
     }
 }

@@ -9,13 +9,12 @@ use scribe_common::error::ScribeError;
 const MAX_SCROLLBACK_LINES: u32 = 100_000;
 
 pub struct AiTerminalConfig {
-    pub hide_codex_hook_logs: bool,
     pub preserve_ai_scrollback: bool,
 }
 
 impl Default for AiTerminalConfig {
     fn default() -> Self {
-        Self { hide_codex_hook_logs: false, preserve_ai_scrollback: true }
+        Self { preserve_ai_scrollback: true }
     }
 }
 
@@ -69,7 +68,6 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
 
     let shell_integration_enabled = full.terminal.ai_session.shell_integration.enabled;
     let ai_terminal = AiTerminalConfig {
-        hide_codex_hook_logs: full.terminal.ai_session.hide_codex_hook_logs,
         preserve_ai_scrollback: full.terminal.ai_session.preserve_ai_scrollback,
     };
     let update = full.update;
@@ -77,7 +75,6 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
     info!(
         roots = workspace_roots.len(),
         scrollback_lines,
-        hide_codex_hook_logs = ai_terminal.hide_codex_hook_logs,
         preserve_ai_scrollback = ai_terminal.preserve_ai_scrollback,
         "server config loaded"
     );
