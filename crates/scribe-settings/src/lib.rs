@@ -3,11 +3,11 @@ pub mod server_action;
 pub mod singleton;
 pub mod state;
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rust_embed::Embed;
 use scribe_common::{
-    protocol::UpdateCheckResultState,
+    protocol::{ReleaseListResultState, UpdateCheckResultState},
     settings_window::{SettingsWindowAnchor, centered_settings_position},
 };
 
@@ -16,6 +16,15 @@ use scribe_common::{
 /// add headroom for a slow network or a busy updater task. After this elapses
 /// the user sees a "Check failed: …" message and the worker thread aborts.
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum time to wait for a `ListReleases` response from the server.
+///
+/// SC-001 / SC-003 in the feature spec target a 5 s success window on a
+/// typical broadband connection. The 7 s budget here is the upper bound for
+/// failure detection: it gives a slow-but-eventually-successful fetch enough
+/// headroom to land while still flipping to `Failed` for genuinely stuck
+/// requests.
+const RELEASE_LIST_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// Embedded web assets (HTML, CSS, JS) for the settings UI.
 #[derive(Embed)]
@@ -160,13 +169,35 @@ fn inject_font_list(webview: &wry::WebView) {
 
 /// Inject `window.SCRIBE_PLATFORM` into the webview so JS can adapt to the host OS.
 fn inject_platform(webview: &wry::WebView) {
-    let platform = if cfg!(target_os = "macos") { "macos" } else { "linux" };
+    let platform = current_platform_string();
     let script = format!(
         "if (typeof setPlatform === 'function') {{ setPlatform(\"{platform}\"); }} else {{ window.SCRIBE_PLATFORM = \"{platform}\"; }}"
     );
     if let Err(e) = webview.evaluate_script(&script) {
         tracing::warn!("failed to inject platform into settings webview: {e}");
     }
+}
+
+/// Compile-time platform string used by both the legacy `window.SCRIBE_PLATFORM`
+/// path (`inject_platform`) and the new `window.SCRIBE_BOOTSTRAP.platform` field
+/// passed via the pre-page-load script. Keeping a single function ensures the
+/// two channels never disagree.
+fn current_platform_string() -> &'static str {
+    if cfg!(target_os = "macos") { "macos" } else { "linux" }
+}
+
+/// Build the JS snippet that defines `window.SCRIBE_BOOTSTRAP` before the
+/// settings page loads. The values are JSON-escaped via `serde_json::to_string`
+/// so an embedded `"` (or any other JS-special character) in a future version
+/// or platform string cannot break the literal or open an injection vector.
+///
+/// Output looks like:
+/// `window.SCRIBE_BOOTSTRAP = { version: "0.0.0-dev", platform: "linux" };`
+fn bootstrap_script(version: &str, platform: &str) -> String {
+    // `serde_json::to_string` always succeeds for `&str` (no IO, no recursion).
+    let version_lit = serde_json::to_string(version).unwrap_or_else(|_| String::from("\"\""));
+    let platform_lit = serde_json::to_string(platform).unwrap_or_else(|_| String::from("\"\""));
+    format!("window.SCRIBE_BOOTSTRAP = {{ version: {version_lit}, platform: {platform_lit} }};")
 }
 
 /// Load the current config and serialise it for webview injection.
@@ -222,6 +253,142 @@ fn inject_update_check_result(
     if let Some(wv) = webview_ref.borrow().as_ref() {
         if let Err(e) = wv.evaluate_script(&script) {
             tracing::warn!("failed to inject update check result: {e}");
+        }
+    }
+}
+
+/// Whether `url` is safe to hand to the platform browser opener.
+///
+/// The webview can ask the host to open arbitrary URLs via the
+/// `open_external_url` IPC message. To prevent the renderer from coercing the
+/// host into invoking `xdg-open`/`open` on `javascript:`, `file:`, `data:`,
+/// `vbscript:`, etc., we accept only `http://` and `https://` (case-insensitive)
+/// and drop everything else.
+fn external_url_is_safe(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Hand off `url` to the platform browser opener iff [`external_url_is_safe`]
+/// accepts it. Non-http(s) schemes are dropped with a `tracing::warn!` log,
+/// not silently ignored, so security audits can spot misbehaving renderers.
+fn dispatch_open_external_url(url: &str) {
+    if !external_url_is_safe(url) {
+        tracing::warn!("rejected non-http(s) external URL: {url}");
+        return;
+    }
+    let opener = if cfg!(target_os = "linux") { "xdg-open" } else { "open" };
+    match std::process::Command::new(opener).arg(url).spawn() {
+        Ok(child) => drop(child),
+        Err(e) => tracing::warn!("failed to launch {opener} for external URL {url}: {e}"),
+    }
+}
+
+/// Format a `SystemTime` as an ISO-8601 / RFC 3339 UTC timestamp, e.g.
+/// `2026-05-10T13:45:09Z`.
+///
+/// This is the `fetched_at` value the host reports to the webview alongside
+/// fresh and stale release lists. We avoid pulling `chrono` / `time` into
+/// `scribe-settings` for a single timestamp by deriving the date components
+/// directly from the seconds since the Unix epoch using the civil-from-days
+/// algorithm Howard Hinnant published; pre-1970 timestamps clamp to the
+/// epoch, which is fine because this is only ever called with `SystemTime::now()`.
+fn format_iso_utc(time: SystemTime) -> String {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let (year, month, day, hour, minute, second) = unix_seconds_to_utc(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Decompose an integer count of UTC seconds since the Unix epoch into
+/// `(year, month, day, hour, minute, second)` using Howard Hinnant's
+/// `civil_from_days` algorithm. Negative values clamp to the epoch.
+fn unix_seconds_to_utc(seconds: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let seconds = seconds.max(0);
+    // 86_400 seconds per day; 0..86_399 inclusive can never overflow `u32`.
+    let days = seconds / 86_400;
+    let day_seconds = seconds.rem_euclid(86_400);
+    let hour = u32::try_from(day_seconds / 3_600).unwrap_or(0);
+    let minute = u32::try_from((day_seconds / 60) % 60).unwrap_or(0);
+    let second = u32::try_from(day_seconds % 60).unwrap_or(0);
+
+    // civil_from_days: shift epoch from 1970-01-01 to 0000-03-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let doe = z - era * 146_097; // day of era, in [0, 146_096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // year of era
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year (March-based)
+    let mp = (5 * doy + 2) / 153;
+    let day = u32::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(1);
+    let month = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1);
+    let year = i32::try_from(if month <= 2 { y + 1 } else { y }).unwrap_or(1970);
+    (year, month, day, hour, minute, second)
+}
+
+/// Build the JSON payload `window.SCRIBE_ON_RELEASE_LIST` expects for `state`.
+///
+/// Per `contracts/releases-protocol.md` §2.2 the host transforms the
+/// externally-tagged `ReleaseListResultState` into a flat object with a
+/// lower-case `state` discriminator and conditional `releases`, `reason`, and
+/// `fetched_at` siblings. Building the JSON manually keeps the host in full
+/// control of which fields are present per state and lets `serde_json` handle
+/// HTML-/JS-safe escaping of the embedded strings.
+fn release_list_payload_json(
+    state: &ReleaseListResultState,
+    fetched_at: SystemTime,
+) -> Result<String, serde_json::Error> {
+    use serde_json::{Map, Value, json};
+
+    let fetched_at_iso = format_iso_utc(fetched_at);
+    let mut map: Map<String, Value> = Map::new();
+    match state {
+        ReleaseListResultState::Fresh { releases } => {
+            map.insert("state".to_owned(), Value::String("fresh".to_owned()));
+            map.insert("releases".to_owned(), serde_json::to_value(releases)?);
+            map.insert("fetched_at".to_owned(), Value::String(fetched_at_iso));
+        }
+        ReleaseListResultState::Stale { releases, reason } => {
+            map.insert("state".to_owned(), Value::String("stale".to_owned()));
+            map.insert("releases".to_owned(), serde_json::to_value(releases)?);
+            map.insert("reason".to_owned(), Value::String(reason.clone()));
+            map.insert("fetched_at".to_owned(), Value::String(fetched_at_iso));
+        }
+        ReleaseListResultState::Failed { reason } => {
+            map.insert("state".to_owned(), Value::String("failed".to_owned()));
+            map.insert("reason".to_owned(), Value::String(reason.clone()));
+        }
+    }
+    serde_json::to_string(&Value::Object(map)).or_else(|e| {
+        // Final defensive path: a serde-named `json!` literal can never fail
+        // serialise but the compiler does not know that here.
+        let fallback = json!({ "state": "failed", "reason": format!("payload error: {e}") });
+        serde_json::to_string(&fallback)
+    })
+}
+
+/// Push a manual release-list result into the webview's
+/// `window.SCRIBE_ON_RELEASE_LIST` callback. Always called on the UI thread
+/// (GTK main loop on Linux, the tao event loop on macOS) so `evaluate_script`
+/// is safe.
+fn inject_release_list_result(
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+    state: &ReleaseListResultState,
+) {
+    let payload = match release_list_payload_json(state, SystemTime::now()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("failed to serialise ReleaseListResultState: {e}");
+            return;
+        }
+    };
+    let script = format!(
+        "if (typeof window.SCRIBE_ON_RELEASE_LIST === 'function') {{ window.SCRIBE_ON_RELEASE_LIST({payload}); }}"
+    );
+    if let Some(wv) = webview_ref.borrow().as_ref() {
+        if let Err(e) = wv.evaluate_script(&script) {
+            tracing::warn!("failed to inject release list result: {e}");
         }
     }
 }
@@ -294,6 +461,50 @@ fn cancel_active_check_source(active_source: &ActiveCheckSource) {
     }
 }
 
+/// Linux: spawn a worker thread to issue a `ListReleases` request to the
+/// server, then drain the result back to the webview via a `glib` timeout
+/// source on the GTK main loop.
+///
+/// Mirrors [`dispatch_check_for_updates_linux`]: the worker thread cannot
+/// touch the webview directly (the `Rc<RefCell<…>>` reference is `!Send`), so
+/// we hand the result back over a `mpsc` channel that a 100 ms `glib` timeout
+/// source polls on the UI thread. A second click while a request is already
+/// in flight cancels the prior poll and starts fresh, just like the update
+/// check path.
+#[cfg(target_os = "linux")]
+fn dispatch_release_list_request_linux(
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+    active_source: &ActiveCheckSource,
+) {
+    if let Some(prev) = active_source.borrow_mut().take() {
+        prev.remove();
+    }
+
+    let webview_clone = std::rc::Rc::clone(webview_ref);
+    let active_for_closure = std::rc::Rc::clone(active_source);
+    let (tx, rx) = std::sync::mpsc::channel::<ReleaseListResultState>();
+
+    std::thread::spawn(move || {
+        let state = server_action::request_release_list(RELEASE_LIST_TIMEOUT);
+        drop(tx.send(state));
+    });
+
+    let source_id =
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
+            Ok(state) => {
+                inject_release_list_result(&webview_clone, &state);
+                *active_for_closure.borrow_mut() = None;
+                gtk::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                *active_for_closure.borrow_mut() = None;
+                gtk::glib::ControlFlow::Break
+            }
+        });
+    *active_source.borrow_mut() = Some(source_id);
+}
+
 /// macOS: spawn a worker thread to talk to the server, then deliver the result
 /// as a tao user event so the main event loop can call `evaluate_script` on
 /// the UI thread. Mirrors how the existing `FocusWindow` / `QuitWindow` events
@@ -304,6 +515,18 @@ fn dispatch_check_for_updates_macos(proxy: &tao::event_loop::EventLoopProxy<TaoU
     std::thread::spawn(move || {
         let state = server_action::request_update_check(UPDATE_CHECK_TIMEOUT);
         drop(proxy.send_event(TaoUserEvent::UpdateCheckResult(state)));
+    });
+}
+
+/// macOS: spawn a worker thread to issue a `ListReleases` request to the
+/// server, then deliver the result as a tao user event so the main event loop
+/// can call `evaluate_script` on the UI thread.
+#[cfg(not(target_os = "linux"))]
+fn dispatch_release_list_request_macos(proxy: &tao::event_loop::EventLoopProxy<TaoUserEvent>) {
+    let proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let state = server_action::request_release_list(RELEASE_LIST_TIMEOUT);
+        drop(proxy.send_event(TaoUserEvent::ReleaseListResult(state)));
     });
 }
 
@@ -321,33 +544,56 @@ fn open_macos_notification_settings() {}
 /// Handle a stateless platform action issued by the webview.
 ///
 /// Returns `true` when the action was recognised and handled, `false`
-/// otherwise. Stateful actions (font refresh, manual update check, config
-/// writes) are handled directly in [`handle_settings_ipc_request`] because
-/// they need access to the webview reference or caller closures.
-fn handle_settings_ipc_action(kind: &str) -> bool {
+/// otherwise. Stateful actions (font refresh, manual update check, manual
+/// release list, config writes) are handled directly in
+/// [`handle_settings_ipc_request`] because they need access to the webview
+/// reference or caller closures.
+fn handle_settings_ipc_action(kind: &str, body: &str) -> bool {
     match kind {
         "open_macos_notification_settings" => {
             open_macos_notification_settings();
+            true
+        }
+        "open_external_url" => {
+            if let Some(url) = settings_ipc_request_url(body) {
+                dispatch_open_external_url(&url);
+            } else {
+                tracing::warn!("open_external_url message missing url field");
+            }
             true
         }
         _ => false,
     }
 }
 
+/// Extract the `url` field from a webview IPC request body. Returns `None`
+/// when the field is absent or not a string so callers can log and drop the
+/// message instead of dispatching an undefined opener invocation.
+fn settings_ipc_request_url(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("url").and_then(|t| t.as_str()).map(str::to_owned))
+}
+
 /// Handle an IPC request from the settings webview.
 ///
 /// Dispatches by `type` field to the appropriate path. The match is structured
 /// as an explicit if/else chain (rather than a single `match` block) because
-/// the branches differ in what extra state they need: `request_fonts` and
-/// `request_update_check` need closures captured in the calling scope, while
-/// `setting_changed` carries the full body, and the platform-action group is
-/// handled by a stateless inner helper.
-fn handle_settings_ipc_request<F: Fn(String), G: Fn()>(
+/// the branches differ in what extra state they need: `request_fonts`,
+/// `request_update_check`, and `request_releases` need closures captured in
+/// the calling scope, while `setting_changed` carries the full body, and the
+/// platform-action group is handled by a stateless inner helper.
+fn handle_settings_ipc_request<F, G, H>(
     body: &str,
     webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
     on_change: &F,
     on_request_update_check: &G,
-) {
+    on_request_releases: &H,
+) where
+    F: Fn(String),
+    G: Fn(),
+    H: Fn(),
+{
     let Some(kind) = settings_ipc_request_type(body) else {
         tracing::debug!("settings IPC request missing type");
         return;
@@ -359,9 +605,11 @@ fn handle_settings_ipc_request<F: Fn(String), G: Fn()>(
         }
     } else if kind == "request_update_check" {
         on_request_update_check();
+    } else if kind == "request_releases" {
+        on_request_releases();
     } else if kind == "setting_changed" {
         on_change(body.to_owned());
-    } else if !handle_settings_ipc_action(&kind) {
+    } else if !handle_settings_ipc_action(&kind, body) {
         tracing::debug!(kind, "unhandled settings IPC request");
     }
 }
@@ -452,6 +700,7 @@ where
     let ctx = LinuxWebviewContext {
         webview_ref: Rc::new(RefCell::new(None)),
         active_check_source: new_active_check_source(),
+        active_release_source: new_active_check_source(),
     };
     let webview = build_linux_webview(&container, &html, &config_json, on_change, &ctx)?;
 
@@ -466,10 +715,11 @@ where
 
     gtk::main();
 
-    // Drop any in-flight manual-check timeout source before the webview is
-    // dropped, so the closure releases its `Rc<WebView>` before the underlying
-    // widget tears down.
+    // Drop any in-flight manual-check or release-list timeout source before
+    // the webview is dropped, so the closure releases its `Rc<WebView>`
+    // before the underlying widget tears down.
     cancel_active_check_source(&ctx.active_check_source);
+    cancel_active_check_source(&ctx.active_release_source);
 
     Ok(())
 }
@@ -650,12 +900,13 @@ fn i64_to_i32_saturating(value: i64) -> i32 {
 }
 
 /// Webview-side state shared between the IPC handler and the window shutdown
-/// path on Linux: the webview reference itself plus the cell tracking any
-/// in-flight manual-check timeout source.
+/// path on Linux: the webview reference itself plus the cells tracking any
+/// in-flight manual-check / release-list timeout sources.
 #[cfg(target_os = "linux")]
 struct LinuxWebviewContext {
     webview_ref: std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
     active_check_source: ActiveCheckSource,
+    active_release_source: ActiveCheckSource,
 }
 
 /// Build the GTK webview and wire the settings IPC handler.
@@ -669,7 +920,9 @@ fn build_linux_webview<F: Fn(String) + 'static>(
 ) -> Result<wry::WebView, String> {
     use wry::WebViewBuilderExtUnix;
 
+    let bootstrap = bootstrap_script(env!("CARGO_PKG_VERSION"), current_platform_string());
     let webview = wry::WebViewBuilder::new()
+        .with_initialization_script(bootstrap)
         .with_html(html)
         .with_ipc_handler({
             let webview_for_ipc = std::rc::Rc::clone(&ctx.webview_ref);
@@ -678,12 +931,18 @@ fn build_linux_webview<F: Fn(String) + 'static>(
             let on_request_update_check = move || {
                 dispatch_check_for_updates_linux(&webview_for_check, &active_for_check);
             };
+            let webview_for_releases = std::rc::Rc::clone(&ctx.webview_ref);
+            let active_for_releases = std::rc::Rc::clone(&ctx.active_release_source);
+            let on_request_releases = move || {
+                dispatch_release_list_request_linux(&webview_for_releases, &active_for_releases);
+            };
             move |request| {
                 handle_settings_ipc_request(
                     request.body(),
                     &webview_for_ipc,
                     &on_change,
                     &on_request_update_check,
+                    &on_request_releases,
                 );
             }
         })
@@ -783,6 +1042,9 @@ enum TaoUserEvent {
     /// A worker thread finished a manual update check; deliver the result to
     /// the webview on the main thread.
     UpdateCheckResult(UpdateCheckResultState),
+    /// A worker thread finished a manual release-list request; deliver the
+    /// result to the webview on the main thread.
+    ReleaseListResult(ReleaseListResultState),
 }
 
 /// Build the tao window with optional saved geometry.
@@ -965,19 +1227,25 @@ fn build_tao_webview<F: Fn(String) + 'static>(
     webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
     event_loop_proxy: tao::event_loop::EventLoopProxy<TaoUserEvent>,
 ) -> Result<wry::WebView, String> {
+    let bootstrap = bootstrap_script(env!("CARGO_PKG_VERSION"), current_platform_string());
     let webview = wry::WebViewBuilder::new()
+        .with_initialization_script(bootstrap)
         .with_html(html)
         .with_ipc_handler({
             let webview_for_ipc = std::rc::Rc::clone(webview_ref);
             let proxy_for_check = event_loop_proxy.clone();
+            let proxy_for_releases = event_loop_proxy.clone();
             let on_request_update_check =
                 move || dispatch_check_for_updates_macos(&proxy_for_check);
+            let on_request_releases =
+                move || dispatch_release_list_request_macos(&proxy_for_releases);
             move |request| {
                 handle_settings_ipc_request(
                     request.body(),
                     &webview_for_ipc,
                     &on_change,
                     &on_request_update_check,
+                    &on_request_releases,
                 );
             }
         })
@@ -1043,6 +1311,9 @@ fn handle_tao_event<F: FnOnce(SettingsWindowGeometry)>(
         }
         Event::UserEvent(TaoUserEvent::UpdateCheckResult(state)) => {
             inject_update_check_result(webview_ref, &state);
+        }
+        Event::UserEvent(TaoUserEvent::ReleaseListResult(state)) => {
+            inject_release_list_result(webview_ref, &state);
         }
         Event::WindowEvent {
             event: WindowEvent::ModifiersChanged(new_mods),
@@ -1112,5 +1383,164 @@ fn is_wayland_backend() -> bool {
         Some("wayland") => true,
         // GTK3 auto-selects Wayland when the compositor is running.
         _ => std::env::var_os("WAYLAND_DISPLAY").is_some(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bootstrap script must include the supplied version verbatim as a
+    /// JSON-escaped string literal so the webview can read it as
+    /// `window.SCRIBE_BOOTSTRAP.version` before the page loads.
+    #[test]
+    fn bootstrap_script_contains_version_and_platform() {
+        let script = bootstrap_script("9.9.9", "linux");
+        assert!(script.contains("window.SCRIBE_BOOTSTRAP"), "script: {script}");
+        assert!(script.contains("version: \"9.9.9\""), "script: {script}");
+        assert!(script.contains("platform: \"linux\""), "script: {script}");
+    }
+
+    /// The current workspace `CARGO_PKG_VERSION` must round-trip through the
+    /// bootstrap helper without mutation.
+    #[test]
+    fn bootstrap_script_uses_workspace_version() {
+        let version = env!("CARGO_PKG_VERSION");
+        let script = bootstrap_script(version, "linux");
+        let expected = format!("version: \"{version}\"");
+        assert!(script.contains(&expected), "script: {script}\nexpected: {expected}");
+    }
+
+    /// Embedded double-quotes in the version string must be JSON-escaped, not
+    /// interpolated raw — otherwise the resulting script would have unbalanced
+    /// quotes and break the webview.
+    #[test]
+    fn bootstrap_script_escapes_embedded_quotes() {
+        let script = bootstrap_script("1.0.0\"; alert(1);//", "linux");
+        // The literal closing quote of the version field must remain matched
+        // (escape sequence kept the inner quote inert).
+        assert!(script.contains("version: \"1.0.0\\\"; alert(1);//\""), "script: {script}");
+    }
+
+    // -----------------------------------------------------------------------
+    // T007: scheme validation for the host-side `open_external_url` handler.
+    // The host must accept only http(s) URLs; any other scheme (or no scheme
+    // at all) must be rejected so the renderer cannot coerce the host into
+    // launching `xdg-open file:///etc/passwd` or `open javascript:…`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn external_url_is_safe_accepts_http_and_https() {
+        assert!(external_url_is_safe("http://example.com"), "plain http must be allowed");
+        assert!(external_url_is_safe("https://example.com"), "plain https must be allowed");
+        assert!(
+            external_url_is_safe("HTTPS://example.com"),
+            "scheme check must be case-insensitive"
+        );
+        assert!(
+            external_url_is_safe("HtTp://example.com/path?q=1#frag"),
+            "mixed-case http with path/query/fragment must be allowed"
+        );
+        assert!(
+            external_url_is_safe("https://github.com/sharaf-nassar/scribe/releases/tag/v0.4.2"),
+            "the canonical 'View on GitHub' shape must be allowed"
+        );
+    }
+
+    #[test]
+    fn external_url_is_safe_rejects_dangerous_schemes() {
+        for url in [
+            "javascript:alert(1)",
+            "JAVASCRIPT:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "ftp://example.com/x",
+            "",
+            "www.example.com",
+            " https://example.com",
+        ] {
+            assert!(!external_url_is_safe(url), "non-http(s) input {url:?} must be rejected");
+        }
+    }
+
+    /// `format_iso_utc` must produce a stable RFC 3339 / ISO 8601 UTC literal
+    /// for the canonical wave date. Pinning the function against a known epoch
+    /// ensures any future arithmetic regression in `unix_seconds_to_utc`
+    /// trips this test instead of silently desynchronising the panel UI.
+    #[test]
+    fn format_iso_utc_emits_known_timestamp() {
+        let t = UNIX_EPOCH + Duration::from_secs(1_778_420_709);
+        assert_eq!(format_iso_utc(t), "2026-05-10T13:45:09Z");
+    }
+
+    /// `format_iso_utc` must agree on the Unix epoch boundary and on a leap
+    /// day (2020-02-29) — leap-year handling is the easiest place for a
+    /// home-rolled date arithmetic to get wrong.
+    #[test]
+    fn format_iso_utc_handles_epoch_and_leap_day() {
+        assert_eq!(format_iso_utc(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        let leap = UNIX_EPOCH + Duration::from_secs(1_582_934_400);
+        assert_eq!(format_iso_utc(leap), "2020-02-29T00:00:00Z");
+    }
+
+    /// The release-list payload mirrors `contracts/releases-protocol.md` §2.2:
+    /// a flat object with a lower-case `state` discriminator and conditional
+    /// `releases`, `reason`, and `fetched_at` siblings.
+    #[test]
+    fn release_list_payload_json_matches_contract() {
+        use scribe_common::protocol::Release;
+
+        let release = Release {
+            version: "0.4.2".to_owned(),
+            name: Some("0.4.2".to_owned()),
+            published_at: "2026-05-09T10:00:00Z".to_owned(),
+            body_html: "<p>x</p>".to_owned(),
+            prerelease: false,
+            html_url: "https://github.com/sharaf-nassar/scribe/releases/tag/v0.4.2".to_owned(),
+        };
+        let fetched_at = UNIX_EPOCH + Duration::from_secs(1_778_420_709);
+
+        // Fresh: state, releases, fetched_at; no reason.
+        let fresh_json = release_list_payload_json(
+            &ReleaseListResultState::Fresh { releases: vec![release.clone()] },
+            fetched_at,
+        )
+        .expect("Fresh payload must serialize");
+        let fresh: serde_json::Value =
+            serde_json::from_str(&fresh_json).expect("Fresh payload is JSON");
+        assert_eq!(fresh["state"], "fresh");
+        assert_eq!(fresh["fetched_at"], "2026-05-10T13:45:09Z");
+        assert!(fresh["releases"].is_array(), "Fresh must carry the releases array");
+        assert!(fresh.get("reason").is_none(), "Fresh must not carry reason");
+
+        // Stale: state, releases, reason, fetched_at.
+        let stale_json = release_list_payload_json(
+            &ReleaseListResultState::Stale {
+                releases: vec![release],
+                reason: "GitHub unreachable".to_owned(),
+            },
+            fetched_at,
+        )
+        .expect("Stale payload must serialize");
+        let stale: serde_json::Value =
+            serde_json::from_str(&stale_json).expect("Stale payload is JSON");
+        assert_eq!(stale["state"], "stale");
+        assert_eq!(stale["reason"], "GitHub unreachable");
+        assert!(stale["releases"].is_array(), "Stale must carry the releases array");
+        assert!(stale.get("fetched_at").is_some(), "Stale must carry fetched_at");
+
+        // Failed: state and reason only.
+        let failed_json = release_list_payload_json(
+            &ReleaseListResultState::Failed { reason: "rate limited".to_owned() },
+            fetched_at,
+        )
+        .expect("Failed payload must serialize");
+        let failed: serde_json::Value =
+            serde_json::from_str(&failed_json).expect("Failed payload is JSON");
+        assert_eq!(failed["state"], "failed");
+        assert_eq!(failed["reason"], "rate limited");
+        assert!(failed.get("releases").is_none(), "Failed must not carry releases");
+        assert!(failed.get("fetched_at").is_none(), "Failed must not carry fetched_at");
     }
 }

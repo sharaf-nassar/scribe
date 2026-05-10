@@ -12,7 +12,9 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use scribe_common::framing::MAX_MESSAGE_SIZE;
-use scribe_common::protocol::{ClientMessage, ServerMessage, UpdateCheckResultState};
+use scribe_common::protocol::{
+    ClientMessage, ReleaseListResultState, ServerMessage, UpdateCheckResultState,
+};
 use scribe_common::socket::server_socket_path;
 
 /// Send `CheckForUpdates` to the server and wait for the matching response.
@@ -65,4 +67,100 @@ fn read_frame<R: std::io::Read>(reader: &mut R) -> Result<ServerMessage, String>
     let mut buf = vec![0u8; len as usize];
     reader.read_exact(&mut buf).map_err(|e| format!("read payload: {e}"))?;
     rmp_serde::from_slice(&buf).map_err(|e| format!("deserialize ServerMessage failed: {e}"))
+}
+
+/// Send `ListReleases` to the server and wait for the matching response.
+///
+/// Mirrors [`request_update_check`]: any transport or protocol error becomes
+/// `ReleaseListResultState::Failed { reason }` so the UI always has a single
+/// shape to render. A fresh connection is opened per call so this never reuses
+/// the update-check socket.
+pub fn request_release_list(timeout: Duration) -> ReleaseListResultState {
+    match try_request_release_list(timeout) {
+        Ok(state) => state,
+        Err(reason) => {
+            tracing::warn!("manual release list transport error: {reason}");
+            ReleaseListResultState::Failed { reason }
+        }
+    }
+}
+
+fn try_request_release_list(timeout: Duration) -> Result<ReleaseListResultState, String> {
+    let path = server_socket_path();
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|e| format!("connect to {} failed: {e}", path.display()))?;
+    stream.set_read_timeout(Some(timeout)).map_err(|e| format!("set_read_timeout: {e}"))?;
+    stream.set_write_timeout(Some(timeout)).map_err(|e| format!("set_write_timeout: {e}"))?;
+
+    write_frame(&mut stream, &ClientMessage::ListReleases)?;
+
+    parse_release_list_response(read_frame(&mut stream)?)
+}
+
+/// Pure helper that maps an arbitrary `ServerMessage` into the state expected
+/// by the release-list code path. Anything other than `ReleaseList { state }`
+/// — including the wrong-variant case the server should never produce — is
+/// surfaced as an `Err` so the public entry point can fold it into
+/// `ReleaseListResultState::Failed { reason }`.
+fn parse_release_list_response(msg: ServerMessage) -> Result<ReleaseListResultState, String> {
+    match msg {
+        ServerMessage::ReleaseList { state } => Ok(state),
+        other => Err(format!("unexpected server response: {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scribe_common::protocol::UpdateCheckResultState;
+
+    /// A non-`ReleaseList` server response must surface as a non-empty `Err`
+    /// so the public entry point can fold it into
+    /// `ReleaseListResultState::Failed { reason }`.
+    ///
+    /// This is the parser-side proxy for the transport-failure mapping:
+    /// `request_release_list` cannot panic on an unexpected variant, and we
+    /// avoid spinning up a real Unix socket (which would require overriding
+    /// `server_socket_path` — there is no test hook today) by aiming the
+    /// assertion at the parser the public entry point delegates to.
+    #[test]
+    fn parse_release_list_response_rejects_unexpected_variant() {
+        let wrong_variant =
+            ServerMessage::UpdateCheckResult { state: UpdateCheckResultState::NoUpdate };
+        let err = parse_release_list_response(wrong_variant)
+            .expect_err("unexpected variant must be reported as Err");
+        assert!(!err.is_empty(), "error reason must not be empty");
+        assert!(
+            err.contains("unexpected server response"),
+            "error message should describe the wrong-variant case: {err}"
+        );
+
+        // The public entry point folds the same `Err` into a `Failed` state
+        // with a non-empty reason — verifying the contract end-to-end without
+        // touching the global socket.
+        let mapped = match parse_release_list_response(ServerMessage::UpdateCheckResult {
+            state: UpdateCheckResultState::NoUpdate,
+        }) {
+            Ok(state) => state,
+            Err(reason) => ReleaseListResultState::Failed { reason },
+        };
+        match mapped {
+            ReleaseListResultState::Failed { reason } => {
+                assert!(!reason.is_empty(), "Failed reason must not be empty");
+            }
+            unexpected => panic!("expected Failed, got {unexpected:?}"),
+        }
+    }
+
+    /// Sanity: a real `ReleaseList` payload round-trips through the parser
+    /// untouched.
+    #[test]
+    fn parse_release_list_response_passes_through_release_list() {
+        let state =
+            ReleaseListResultState::Failed { reason: String::from("synthetic upstream failure") };
+        let msg = ServerMessage::ReleaseList { state: state.clone() };
+        let parsed =
+            parse_release_list_response(msg).expect("ReleaseList variant must parse cleanly");
+        assert_eq!(parsed, state);
+    }
 }

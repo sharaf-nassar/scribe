@@ -105,3 +105,9 @@ Details about this child topic.
 ```
 
 The second example is invalid because `Bad Section` has no leading paragraph. `lat check` validates this rule and reports errors for missing or overly long leading paragraphs.
+
+<!-- SPECKIT START -->
+For additional context about technologies to be used, project structure,
+shell commands, and other important information, read the current plan at
+[specs/001-releases-page/plan.md](specs/001-releases-page/plan.md).
+<!-- SPECKIT END -->

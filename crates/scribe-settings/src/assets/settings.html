@@ -78,6 +78,15 @@
         </svg>
         Updates
       </div>
+      <div class="nav-item" data-tab="releases">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+          <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+          <line x1="9" y1="7" x2="15" y2="7"/>
+          <line x1="9" y1="11" x2="15" y2="11"/>
+        </svg>
+        Releases
+      </div>
       <div class="nav-item" data-tab="notifications">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9"/>
@@ -86,7 +95,7 @@
         Notifications
       </div>
     </div>
-    <div class="sidebar-footer">Scribe v0.1.0</div>
+    <div class="sidebar-footer" id="sidebar-footer"></div>
   </div>
 
   <!-- ───────── Content ───────── -->
@@ -1368,6 +1377,36 @@
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- ═══════ Releases Page ═══════ -->
+    <div id="page-releases" class="content-page">
+      <div class="page-header-row">
+        <div class="page-header-text">
+          <div class="page-title">Releases</div>
+          <div class="page-subtitle">Browse Scribe release notes and changelogs</div>
+        </div>
+        <a class="releases-external" id="releases-external" href="#"
+           data-external aria-label="View on GitHub">View on GitHub</a>
+      </div>
+
+      <section class="panel" id="releases-panel">
+        <header class="panel-header releases-header">
+          <div class="releases-nav">
+            <button type="button" class="releases-nav-btn" id="releases-older"
+                    aria-label="Older release" disabled>&lsaquo; Older</button>
+            <div class="select-wrapper">
+              <select id="releases-picker" class="select-control releases-picker"
+                      aria-label="Select Scribe release"></select>
+              <span class="select-arrow">&#9662;</span>
+            </div>
+            <button type="button" class="releases-nav-btn" id="releases-newer"
+                    aria-label="Newer release" disabled>Newer &rsaquo;</button>
+          </div>
+        </header>
+        <div class="releases-status" id="releases-status" hidden></div>
+        <article class="release-notes" id="release-notes" aria-live="polite"></article>
+      </section>
     </div>
 
     <div id="page-notifications" class="content-page">

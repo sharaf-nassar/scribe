@@ -14,13 +14,15 @@ The workspace contains eight crates, each with a focused responsibility.
 
 Shared types used by every other crate: the IPC [[protocol]], error definitions, [[protocol#Screen Snapshots]], configuration, theme system, and socket path conventions. This is a leaf dependency with no internal cross-crate references.
 
+The protocol surface also carries the [[protocol#Client Messages#List Releases]] / [[protocol#Server Messages#Release List]] message pair that backs the settings window's release-history panel.
+
 ### scribe-pty
 
 Low-level [[pty]] management: async file descriptor wrappers for zero-copy PTY I/O, OSC sequence interception running in parallel with alacritty_terminal's parser, and metadata extraction (CWD, title, AI state) from terminal output streams.
 
 ### scribe-server
 
-Long-running daemon that owns PTY sessions, manages [[server#Workspaces]] with auto-naming, coordinates [[server#Handoff]] for zero-downtime upgrades via SCM_RIGHTS fd passing, and handles software [[server#Updater]].
+Long-running daemon that owns PTY sessions, manages [[server#Workspaces]] with auto-naming, coordinates [[server#Handoff]] for zero-downtime upgrades via SCM_RIGHTS fd passing, and handles software [[server#Updater]]. Also backs the [[settings#Releases]] panel via the [[server#Releases#Release Catalog]] and the new [[protocol#Server Messages#Release List]] message.
 
 ### scribe-client
 
@@ -33,6 +35,8 @@ GPU-accelerated frontend that renders terminal [[client#Panes]] via wgpu, handle
 ### scribe-settings
 
 [[settings]] UI: webview-based configuration editor for appearance, keybindings, themes, workspace roots, and AI indicator behaviour. Changes are saved to TOML and picked up by a file watcher.
+
+The settings window also shows a [[settings#Releases]] browser fed over IPC and a [[settings#Sidebar Footer]] sourced from the build-time workspace version.
 
 Stateful actions that need an immediate server-side response (e.g. the Updates page's "Check Now" button) open a transient `server.sock` connection via [[crates/scribe-settings/src/server_action.rs]] instead of going through the config file.
 

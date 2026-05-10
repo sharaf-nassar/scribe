@@ -1,6 +1,6 @@
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use scribe_common::app::current_identity;
@@ -193,35 +193,37 @@ async fn run_updater_loop(
         info!("auto-update polling disabled by config — manual checks still allowed");
     }
 
-    let http = match build_updater_http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            error!("failed to build HTTP client for updater: {e}");
-            // Without an HTTP client we cannot service any check, so drain
-            // manual-check requests with a Failed response forever.
-            drain_check_requests(receivers.check, format!("HTTP client unavailable: {e}")).await;
-            return;
-        }
-    };
+    let http = http_client().clone();
 
     run_updater_select_loop(connected_clients, receivers, http, config).await;
 }
 
-fn build_updater_http_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
-        .user_agent(format!("scribe/{}", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(HTTP_CONNECT_TIMEOUT)
-        .read_timeout(HTTP_READ_TIMEOUT)
-        .build()
-}
-
-async fn drain_check_requests(
-    mut check_rx: tokio::sync::mpsc::Receiver<CheckReplyTx>,
-    reason: String,
-) {
-    while let Some(reply_tx) = check_rx.recv().await {
-        drop(reply_tx.send(UpdateCheckResultState::Failed { reason: reason.clone() }));
-    }
+/// Returns the process-wide configured `reqwest::Client` used for all
+/// scribe-server outbound HTTP traffic (updater + releases catalog).
+///
+/// The User-Agent and connect/read timeouts match what the original
+/// `build_updater_http_client` constructed; sharing a single client lets
+/// connection pools, DNS resolution, and TLS sessions be reused across
+/// the GitHub `releases/latest` poll and the new `releases?per_page=30`
+/// fetch in `releases.rs`.
+///
+/// Falls back to `reqwest::Client::new()` if the builder ever fails — in
+/// practice this only occurs when the TLS backend cannot initialise, in
+/// which case the fallback client behaves identically (rustls is the
+/// only enabled backend) but logs the original error for diagnostics.
+pub fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent(format!("scribe/{}", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .read_timeout(HTTP_READ_TIMEOUT)
+            .build()
+            .unwrap_or_else(|e| {
+                error!("failed to build shared HTTP client; falling back to defaults: {e}");
+                reqwest::Client::new()
+            })
+    })
 }
 
 async fn run_updater_select_loop(

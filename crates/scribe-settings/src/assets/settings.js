@@ -78,6 +78,278 @@ function syncNotificationConfigValue(key, value) {
   currentConfig.notifications[notificationsKey] = value;
 }
 
+// ─────────── Releases (US1 + US3) ───────────
+//
+// State is held at file scope so the tab-activation handler, the picker change
+// handler, the Older/Newer buttons, and the host-injected `SCRIBE_ON_RELEASE_LIST`
+// callback all share a single source of truth.
+//
+// `releases` is a newest-first array (the server returns it in that order).
+// `selectedReleaseVersion` is the canonical pointer — it is set by the picker,
+// the navigation buttons, and the auto-select-most-recent rule (FR-008).
+// `releaseListState` is "idle" until the panel is first opened; transitions
+// to "loading" while we wait on the host, and then "fresh" / "stale" / "failed"
+// based on the SCRIBE_ON_RELEASE_LIST payload.
+var releases = [];
+var selectedReleaseVersion = null;
+var releaseListState = "idle"; // "idle"|"loading"|"fresh"|"stale"|"failed"
+var releaseLastFetchedAt = null;
+
+// Defined early so the host's `evaluate_script` call can always reach it,
+// even if it fires before the rest of the script runs to its end.
+window.SCRIBE_ON_RELEASE_LIST = function(payload) {
+  onReleaseList(payload || {});
+};
+
+// Render pre-sanitized HTML coming from the host.
+// The server runs `body_html` through pulldown-cmark + ammonia
+// (see crates/scribe-server/src/releases.rs), so the string is safe to
+// mount as-is. All HTML insertion in this file goes through this single
+// helper to keep the trust boundary explicit.
+function setHostSanitizedHtml(el, html) {
+  if (!el) { return; }
+  el.innerHTML = html;
+}
+
+function onReleaseList(payload) {
+  var state = payload.state;
+  if (state === "fresh") {
+    releases = Array.isArray(payload.releases) ? payload.releases : [];
+    releaseLastFetchedAt = payload.fetched_at || null;
+    releaseListState = "fresh";
+    ensureSelectedReleaseValid();
+    populatePicker(releases);
+    renderRelease();
+    updateNavBoundaries();
+    hideReleasesStatus();
+  } else if (state === "stale") {
+    releases = Array.isArray(payload.releases) ? payload.releases : [];
+    releaseLastFetchedAt = payload.fetched_at || null;
+    releaseListState = "stale";
+    ensureSelectedReleaseValid();
+    populatePicker(releases);
+    renderRelease();
+    updateNavBoundaries();
+    showStaleStatus(payload.reason || "unknown reason", releaseLastFetchedAt);
+  } else if (state === "failed") {
+    releaseListState = "failed";
+    if (releases.length === 0) {
+      setHostSanitizedHtml(document.getElementById("release-notes"), "");
+    }
+    showFailedStatus(payload.reason || "unknown error");
+  } else {
+    // Unknown payload — render as a generic failure.
+    releaseListState = "failed";
+    showFailedStatus("unexpected response from host");
+  }
+}
+
+function ensureSelectedReleaseValid() {
+  if (releases.length === 0) {
+    selectedReleaseVersion = null;
+    return;
+  }
+  var stillExists = selectedReleaseVersion !== null
+    && releases.some(function(r) { return r.version === selectedReleaseVersion; });
+  if (!stillExists) {
+    selectedReleaseVersion = releases[0].version;
+  }
+}
+
+function formatReleaseDate(iso) {
+  if (typeof iso !== "string" || iso.length === 0) { return ""; }
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) { return ""; }
+  var y = d.getUTCFullYear();
+  var m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  var day = String(d.getUTCDate()).padStart(2, "0");
+  return y + "-" + m + "-" + day;
+}
+
+function populatePicker(list) {
+  var picker = document.getElementById("releases-picker");
+  if (!picker) { return; }
+  while (picker.firstChild) {
+    picker.removeChild(picker.firstChild);
+  }
+  for (var i = 0; i < list.length; i++) {
+    var r = list[i];
+    var opt = document.createElement("option");
+    opt.value = r.version;
+    var date = formatReleaseDate(r.published_at);
+    var label = "v" + r.version;
+    if (date) { label += " — " + date; }
+    if (r.prerelease) { label = "[PRE] " + label; }
+    opt.textContent = label;
+    picker.appendChild(opt);
+  }
+}
+
+function renderRelease() {
+  var notesEl = document.getElementById("release-notes");
+  var picker = document.getElementById("releases-picker");
+  var external = document.getElementById("releases-external");
+  if (!notesEl || !picker || !external) { return; }
+  if (selectedReleaseVersion === null) { return; }
+
+  var rel = null;
+  for (var i = 0; i < releases.length; i++) {
+    if (releases[i].version === selectedReleaseVersion) {
+      rel = releases[i];
+      break;
+    }
+  }
+  if (!rel) { return; }
+
+  // body_html is already sanitized server-side via ammonia.
+  // Re-sanitization in JS is explicitly disallowed by the feature spec.
+  var bodyHtml = typeof rel.body_html === "string" ? rel.body_html : "";
+  if (bodyHtml.length === 0) {
+    setHostSanitizedHtml(notesEl, '<p class="release-notes-empty">No release notes provided for this version.</p>');
+  } else {
+    setHostSanitizedHtml(notesEl, bodyHtml);
+  }
+
+  if (picker.value !== rel.version) {
+    picker.value = rel.version;
+  }
+  if (typeof rel.html_url === "string" && rel.html_url.length > 0) {
+    external.setAttribute("href", rel.html_url);
+  } else {
+    external.setAttribute("href", "#");
+  }
+}
+
+function updateNavBoundaries() {
+  var newer = document.getElementById("releases-newer");
+  var older = document.getElementById("releases-older");
+  if (!newer || !older) { return; }
+  var idx = -1;
+  for (var i = 0; i < releases.length; i++) {
+    if (releases[i].version === selectedReleaseVersion) { idx = i; break; }
+  }
+  // Newer = lower index (the list is newest-first). Disable when at index 0
+  // or when nothing is selected.
+  newer.disabled = (idx <= 0);
+  // Older = higher index. Disable at the tail or when nothing is selected.
+  older.disabled = (idx < 0 || idx >= releases.length - 1);
+}
+
+function hideReleasesStatus() {
+  var el = document.getElementById("releases-status");
+  if (!el) { return; }
+  el.hidden = true;
+  el.className = "releases-status";
+  while (el.firstChild) { el.removeChild(el.firstChild); }
+}
+
+function setReleasesStatus(variant, message, buttonLabel, onButtonClick) {
+  var el = document.getElementById("releases-status");
+  if (!el) { return; }
+  el.hidden = false;
+  el.className = "releases-status " + variant;
+  while (el.firstChild) { el.removeChild(el.firstChild); }
+  var msg = document.createElement("span");
+  msg.className = "releases-status-message";
+  msg.textContent = message;
+  el.appendChild(msg);
+  if (buttonLabel && typeof onButtonClick === "function") {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "releases-nav-btn";
+    btn.textContent = buttonLabel;
+    btn.addEventListener("click", onButtonClick);
+    el.appendChild(btn);
+  }
+}
+
+function showLoadingStatus() {
+  setReleasesStatus("is-loading", "Loading releases…", null, null);
+}
+
+function showStaleStatus(reason, fetchedAt) {
+  var label = "Showing cached releases";
+  if (fetchedAt) { label += " (last refreshed at " + fetchedAt + ")"; }
+  if (reason) { label += " — " + reason; }
+  label += ".";
+  setReleasesStatus("is-stale", label, "Refresh", function() {
+    requestReleases();
+  });
+}
+
+function showFailedStatus(reason) {
+  setReleasesStatus("is-error", "Could not load releases: " + reason, "Retry", function() {
+    requestReleases();
+  });
+}
+
+function requestReleases() {
+  releaseListState = "loading";
+  showLoadingStatus();
+  sendIpc({ type: "request_releases" });
+}
+
+function initReleasesPanel() {
+  var picker = document.getElementById("releases-picker");
+  var newer = document.getElementById("releases-newer");
+  var older = document.getElementById("releases-older");
+  var page = document.getElementById("page-releases");
+
+  if (picker) {
+    picker.addEventListener("change", function(e) {
+      selectedReleaseVersion = e.target.value;
+      renderRelease();
+      updateNavBoundaries();
+    });
+  }
+
+  if (newer) {
+    newer.addEventListener("click", function() {
+      // step toward newer = lower index in our newest-first list
+      var i = -1;
+      for (var k = 0; k < releases.length; k++) {
+        if (releases[k].version === selectedReleaseVersion) { i = k; break; }
+      }
+      if (i > 0) {
+        selectedReleaseVersion = releases[i - 1].version;
+        renderRelease();
+        updateNavBoundaries();
+      }
+    });
+  }
+
+  if (older) {
+    older.addEventListener("click", function() {
+      var i = -1;
+      for (var k = 0; k < releases.length; k++) {
+        if (releases[k].version === selectedReleaseVersion) { i = k; break; }
+      }
+      if (i >= 0 && i < releases.length - 1) {
+        selectedReleaseVersion = releases[i + 1].version;
+        renderRelease();
+        updateNavBoundaries();
+      }
+    });
+  }
+
+  // Delegate any <a href> click inside the releases page (panel + title row)
+  // to the host so the OS browser opens it instead of the webview. Covers
+  // both the rendered notes' inline links and the [data-external] "View on
+  // GitHub" header link, which sits in the page-header row outside the
+  // panel itself.
+  if (page) {
+    page.addEventListener("click", function(e) {
+      var anchor = e.target && e.target.closest ? e.target.closest("a") : null;
+      if (!anchor) { return; }
+      if (!page.contains(anchor)) { return; }
+      var href = anchor.getAttribute("href");
+      if (!href || href === "#") { return; }
+      e.preventDefault();
+      sendIpc({ type: "open_external_url", url: anchor.href });
+    });
+  }
+}
+
 // ─────────── Theme Grid ───────────
 
 function makeColorSpan(text, color) {
@@ -613,6 +885,14 @@ function initNavigation() {
           p.classList.remove("active");
         }
       });
+
+      // First time the user opens Releases we kick off the IPC fetch.
+      // Subsequent activations just re-show the cached JS state.
+      if (target === "releases") {
+        if (releases.length === 0 && releaseListState !== "loading") {
+          requestReleases();
+        }
+      }
     });
   });
 
@@ -1796,6 +2076,15 @@ function filterAllSettings(query) {
 // ─────────── Init ───────────
 
 document.addEventListener("DOMContentLoaded", function() {
+  // Sidebar footer: write the running Scribe version sourced from the host
+  // bootstrap script (set by lib.rs via WebViewBuilder::with_initialization_script
+  // before page load). Falls back to plain "Scribe" when the value is missing.
+  var footerEl = document.getElementById("sidebar-footer");
+  if (footerEl) {
+    var bootstrapVersion = window.SCRIBE_BOOTSTRAP && window.SCRIBE_BOOTSTRAP.version;
+    footerEl.textContent = bootstrapVersion ? "Scribe v" + bootstrapVersion : "Scribe";
+  }
+
   updateNotificationPlatformRows();
   initNavigation();
   initSteppers();
@@ -1854,6 +2143,7 @@ document.addEventListener("DOMContentLoaded", function() {
   initBadgeColorReset();
   initNotificationActions();
   initUpdateActions();
+  initReleasesPanel();
   initGlobalSearch();
   initKeybindingRecorder();
 

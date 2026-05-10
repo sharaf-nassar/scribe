@@ -78,6 +78,12 @@ Transient actions are an exception: the [[server#Server#Updater#Manual Check]] p
 
 The check is answered with a single `UpdateCheckResult` on the same connection. It can be sent as the very first message on a transient connection (the settings window's "Check Now" path) or after a `Hello` on a registered client connection.
 
+### List Releases
+
+`ListReleases` requests a snapshot of the GitHub releases cache backing the [[settings#Releases]] panel. It carries no payload and is answered by a single [[protocol#Server Messages#Release List]] on the same connection.
+
+The server reads the cache via [[server#Releases#Release Catalog]]. The message is sent on first Releases-tab activation when the JS-side cache is empty and again on explicit Retry / Refresh from the failure / stale sub-views, riding the same one-shot transient connection pattern as `CheckForUpdates`.
+
 ## Server Messages
 
 Messages sent from the server to clients, defined in [[crates/scribe-common/src/protocol.rs#ServerMessage]].
@@ -127,6 +133,14 @@ Automation responses expose connected windows to the CLI and let the server forw
 `UpdateAvailable` announces a new version with a release URL. `UpdateProgress` reports download, verification, and installation state transitions. `UpdateCheckResult` answers a `CheckForUpdates` request.
 
 The result variants are `NoUpdate`, `UpdateAvailable { version, release_url }`, and `Failed { reason }` (see [[crates/scribe-common/src/protocol.rs#UpdateCheckResultState]]). When the outcome is `UpdateAvailable`, the server also broadcasts the matching `UpdateAvailable` to every connected client so the regular client-side CTA stays in sync with the requester's inline status.
+
+### Release List
+
+`ReleaseList { state: ReleaseListResultState }` answers [[protocol#Client Messages#List Releases]]. Like `UpdateCheckResult`, it can ride a one-shot transient connection from the standalone settings window without registering as a connected client.
+
+The `state` enum carried by [[crates/scribe-common/src/protocol.rs#ReleaseListResultState]] has three variants: `Fresh { releases }` for a cache hit within TTL or a just-completed cold fetch; `Stale { releases, reason }` for a cache hit past TTL while a background refresh is in flight (the cached vector still ships so the UI never goes blank); and `Failed { reason }` when no cache exists and the on-demand fetch failed.
+
+Each [[crates/scribe-common/src/protocol.rs#Release]] carries `version`, `name`, `published_at`, `body_html` (pre-sanitized HTML rendered server-side from the GitHub `body` markdown), `prerelease`, and `html_url`.
 
 ### Error
 

@@ -92,6 +92,32 @@ Desktop notification settings cover enablement, focus suppression, and Linux-onl
 
 Add/remove root directories and badge colour customization per index with reset-to-defaults.
 
+## Releases
+
+Browse historical Scribe releases from inside the settings window. The panel uses a single-content-area layout with a native `<select>` picker, Newer / Older nav buttons, and a "View on GitHub" link, driven by a `selectedReleaseVersion` JS state.
+
+Release data is fetched over IPC from [[server#Releases#Release Catalog]] via a one-shot Unix-socket request implemented in [[crates/scribe-settings/src/server_action.rs#request_release_list]]. The host-side IPC dispatcher in [[crates/scribe-settings/src/lib.rs]] routes `request_releases` (spawns a worker thread, calls `request_release_list`, then `evaluate_script("window.SCRIBE_ON_RELEASE_LIST(...)")` on the UI thread) and `open_external_url` (http(s)-scheme-validated via [[crates/scribe-settings/src/lib.rs#dispatch_open_external_url]], dispatched to `xdg-open` / `open`).
+
+### Layout
+
+The page header is a flex row: title and subtitle on the left, "View on GitHub" anchor on the right. The panel below centers `[Older]` `[picker]` `[Newer]` as a single flex row.
+
+The content area below is a single `<article id="release-notes">` that receives the pre-sanitized HTML for the selected release. Both nav buttons start `disabled`; `updateNavBoundaries()` is the single source of truth that toggles the `disabled` attribute as the selection moves — Newer disables at index 0, Older at index `releases.length - 1` — so the picker and buttons stay in sync.
+
+The native `<select>` carries one `<option>` per release labeled `vX.Y.Z — YYYY-MM-DD` with a `[PRE] ` prefix when `prerelease` is true. Native `<select>` cannot render arbitrary HTML, so pre-release affordances live in the option label text and as a `.pre-release-badge` span inside the rendered notes header. Links inside rendered notes and the `[data-external]` GitHub link are delegated to `open_external_url` so the OS browser opens them instead of the webview.
+
+### Failure UX
+
+The status banner under the content area renders distinct loading, stale, and failed sub-views, all backed by the Fresh / Stale / Failed transitions in [[server#Releases#Release Catalog]].
+
+Loading shows a non-blocking "Loading releases…" message (class `is-loading`). Stale renders the cached releases plus a "may be stale" indicator with the last refresh timestamp and reason (class `is-stale`) and a Refresh button that re-posts `request_releases`. Failed renders the plain-language `reason` from the payload (class `is-error`) and a Retry button that re-posts `request_releases`. The Refresh / Retry buttons reuse the `.releases-nav-btn` styling for visual consistency.
+
+## Sidebar Footer
+
+The settings sidebar footer displays the running Scribe version, sourced at build time from `env!("CARGO_PKG_VERSION")` and injected into the webview via [[crates/scribe-settings/src/lib.rs#bootstrap_script]] as `window.SCRIBE_BOOTSTRAP.version`.
+
+The `settings.js` `DOMContentLoaded` handler reads that value and writes `Scribe v<version>` into `#sidebar-footer`; a missing or falsy value degrades to just `Scribe` so the footer never shows a broken interpolation. The injection runs as a pre-page-load script so the bootstrap object is already defined before any other JS on the page runs.
+
 ## Singleton
 
 The settings app uses the same singleton structure as the server: a lock file plus a Unix socket for focus handoff. It takes `settings.lock`, listens on `settings.sock`, and sends a `focus` command to an existing instance when one is already running.

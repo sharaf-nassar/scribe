@@ -198,6 +198,28 @@ If `kickstart` is unavailable or fails, it falls back to spawning the new binary
 
 The GitHub API endpoint defaults to the official releases URL and can be overridden with the `SCRIBE_UPDATE_API_URL` environment variable.
 
+## Releases
+
+Server-side release-history fetcher and cache that backs the [[settings#Releases]] panel. Independent of the [[server#Updater]] auto-update path; reuses only the shared HTTP client in [[crates/scribe-server/src/updater.rs#http_client]] so connection pooling, DNS, and TLS sessions are shared across the updater and the catalog.
+
+### Release Catalog
+
+In-memory cache held in [[crates/scribe-server/src/releases.rs#ReleaseCatalog]]: an `Option<Vec<Release>>` plus `last_fetched_at`, `last_fetch_was_success`, a `ttl` (defaults to one hour via `ReleaseCatalog::DEFAULT_TTL`), and an `inflight_refresh` flag preventing thundering-herd refreshes.
+
+A `last_refresh_error` string is carried forward into Stale responses. Entries are stale-while-revalidate: when `last_fetched_at` is older than `ttl`, the next request schedules a background refresh and returns [[crates/scribe-common/src/protocol.rs#ReleaseListResultState]]`::Stale { releases, reason }` immediately. On no-cache + fetch failure, [[crates/scribe-server/src/releases.rs#handle_list_releases]] returns `Failed { reason }` and does NOT poison the cache. Per-call branches are computed under the lock by [[crates/scribe-server/src/releases.rs#inspect_locked]] so concurrent callers see the same view of the cache.
+
+### Fetcher
+
+The fetcher is dependency-injected via [[crates/scribe-server/src/releases.rs#ReleaseFetcher]] (trait); the production implementation is [[crates/scribe-server/src/releases.rs#GithubReleaseFetcher]].
+
+It hits `https://api.github.com/repos/sharaf-nassar/scribe/releases?per_page=30` (capped via `MAX_RELEASES = 30`), drops drafts, keeps pre-releases, and runs each release `body` through `pulldown-cmark` (CommonMark + GFM features) → `ammonia::clean` via [[crates/scribe-server/src/releases.rs#render_release_body]] before storing it in `Release.body_html`. Tests inject `StaticFetcher` / `PanicFetcher` implementations via the same trait so the cache state machine and render-and-sanitize pipeline can be exercised without live HTTP.
+
+### Dispatch
+
+[[crates/scribe-server/src/ipc_server.rs]] routes [[crates/scribe-common/src/protocol.rs#ClientMessage]]`::ListReleases` to [[crates/scribe-server/src/releases.rs#handle_list_releases]], which reads the catalog state machine and replies with [[crates/scribe-common/src/protocol.rs#ServerMessage]]`::ReleaseList { state }`.
+
+Background refreshes scheduled by the Stale branch run on the existing tokio runtime via [[crates/scribe-server/src/releases.rs#spawn_background_refresh]] and clear `inflight_refresh` when they finish, regardless of success or failure.
+
 ## Configuration
 
 Server config in [[crates/scribe-server/src/config.rs#ScribeConfig]] holds workspace roots and scrollback lines. Roots are validated as absolute paths with tilde expansion. Scrollback is clamped to a maximum of 100,000 lines.

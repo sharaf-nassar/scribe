@@ -187,6 +187,11 @@ pub enum ClientMessage {
     /// connection that never registers a window, or after a `Hello` on a
     /// regular client connection.
     CheckForUpdates,
+    /// User opened the Releases settings panel. The server replies with a
+    /// single `ReleaseList` on the same connection. Mirrors the request shape
+    /// of `CheckForUpdates`: no payload, sent over a transient or registered
+    /// connection.
+    ListReleases,
     /// Request a list of windows known to the server.
     ListWindows,
     /// Ask a connected client window to run an automation action.
@@ -374,6 +379,13 @@ pub enum ServerMessage {
     UpdateCheckResult {
         state: UpdateCheckResultState,
     },
+    /// Result of a `ListReleases` request, sent back over the requesting
+    /// connection. Mirrors the shape of `UpdateCheckResult`: a single struct
+    /// variant that wraps the result-state enum so the wire format follows
+    /// the existing pattern.
+    ReleaseList {
+        state: ReleaseListResultState,
+    },
     /// A shell prompt-mark event from OSC 133.
     PromptMark {
         session_id: SessionId,
@@ -556,6 +568,49 @@ pub enum UpdateCheckResultState {
     Failed { reason: String },
 }
 
+/// One published Scribe release, in the post-render shape the settings webview
+/// can display directly.
+///
+/// Built on the server side from a GitHub releases response: `tag_name` becomes
+/// `version` (with the leading `v` stripped, mirroring the existing updater
+/// convention), and the markdown `body` is run through `pulldown-cmark` and
+/// `ammonia::clean` to produce the sanitized `body_html`. The settings binary
+/// receives `Release` values verbatim and renders them as static HTML.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Release {
+    /// `tag_name` from GitHub with the leading `v` stripped (e.g. "0.4.2").
+    pub version: String,
+    /// Optional human title from GitHub's `name` field. May equal `version`.
+    pub name: Option<String>,
+    /// ISO-8601 timestamp from GitHub's `published_at`, kept verbatim.
+    pub published_at: String,
+    /// Sanitized HTML, ready to be assigned to `innerHTML` in the webview.
+    pub body_html: String,
+    /// `true` when GitHub marks the release as a pre-release.
+    pub prerelease: bool,
+    /// Canonical GitHub URL for the "View on GitHub" panel-header link.
+    pub html_url: String,
+}
+
+/// Outcome of a `ListReleases` request, parallel in structure to
+/// [`UpdateCheckResultState`].
+///
+/// The `Stale` variant carries the cached release vector alongside a reason
+/// string so the panel can render the cached data with a "may be stale"
+/// indicator instead of dropping back to a pure error state — see FR-013 in
+/// the feature spec.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ReleaseListResultState {
+    /// Cache was within TTL, or the synchronous on-demand fetch just succeeded.
+    Fresh { releases: Vec<Release> },
+    /// Cache existed but was past TTL; a background refresh either failed or
+    /// has not completed. The webview renders `releases` plus a stale banner
+    /// citing `reason`.
+    Stale { releases: Vec<Release>, reason: String },
+    /// No cache exists and the on-demand fetch failed.
+    Failed { reason: String },
+}
+
 /// Progress state for an in-flight update.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UpdateProgressState {
@@ -573,4 +628,158 @@ pub enum UpdateProgressState {
     CompletedRestartRequired { version: String },
     /// An error occurred during the update process.
     Failed { reason: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::de::IgnoredAny;
+
+    fn sample_release() -> Release {
+        Release {
+            version: "0.4.2".to_string(),
+            name: Some("0.4.2 — Releases page".to_string()),
+            published_at: "2026-05-09T10:00:00Z".to_string(),
+            body_html: "<h2>Highlights</h2>\n<ul><li>x</li></ul>".to_string(),
+            prerelease: false,
+            html_url: "https://github.com/sharaf-nassar/scribe/releases/tag/v0.4.2".to_string(),
+        }
+    }
+
+    fn sample_release_no_name() -> Release {
+        Release {
+            version: "0.4.1".to_string(),
+            name: None,
+            published_at: "2026-05-01T10:00:00Z".to_string(),
+            body_html: String::new(),
+            prerelease: true,
+            html_url: "https://github.com/sharaf-nassar/scribe/releases/tag/v0.4.1".to_string(),
+        }
+    }
+
+    /// Holds the named-msgpack tag of a struct serialized through
+    /// `#[serde(tag = "type")]` so wire-name assertions can read the tag
+    /// without bringing in `serde_json` or `rmpv` as dev-deps.
+    #[derive(Deserialize)]
+    struct InternalTagOnly {
+        #[serde(rename = "type")]
+        tag: String,
+    }
+
+    /// Mirror of [`ReleaseListResultState`] used purely to assert the
+    /// externally-tagged discriminator a real serde-default-enum produces
+    /// on the wire.
+    #[derive(Deserialize)]
+    enum ReleaseListResultStateTagShadow {
+        Fresh(IgnoredAny),
+        Stale(IgnoredAny),
+        Failed(IgnoredAny),
+    }
+
+    #[test]
+    fn release_round_trips_through_msgpack_named() {
+        let original = sample_release();
+        let bytes = rmp_serde::to_vec_named(&original).expect("serialize Release");
+        let decoded: Release = rmp_serde::from_slice(&bytes).expect("deserialize Release");
+        assert_eq!(decoded, original);
+
+        // None case: confirms the Option<String> field round-trips when absent.
+        let original_no_name = sample_release_no_name();
+        let bytes_no_name =
+            rmp_serde::to_vec_named(&original_no_name).expect("serialize Release no_name");
+        let decoded_no_name: Release =
+            rmp_serde::from_slice(&bytes_no_name).expect("deserialize Release no_name");
+        assert_eq!(decoded_no_name, original_no_name);
+    }
+
+    #[test]
+    fn release_list_result_state_fresh_round_trips_through_msgpack_named() {
+        let original = ReleaseListResultState::Fresh { releases: vec![sample_release()] };
+        let bytes = rmp_serde::to_vec_named(&original).expect("serialize Fresh");
+        let decoded: ReleaseListResultState =
+            rmp_serde::from_slice(&bytes).expect("deserialize Fresh");
+        assert_eq!(decoded, original);
+
+        // Wire-name assertion: ReleaseListResultState has no serde attribute
+        // so it serializes externally-tagged as `{ "Fresh": { ... } }`.
+        // (Same convention as the existing UpdateCheckResultState in this
+        // file — see the report from the agent that landed T008.)
+        // Decoding through the shadow enum confirms both the tag name and
+        // the externally-tagged shape in one step.
+        let shadow: ReleaseListResultStateTagShadow =
+            rmp_serde::from_slice(&bytes).expect("decode Fresh through shadow enum");
+        assert!(matches!(shadow, ReleaseListResultStateTagShadow::Fresh(_)));
+    }
+
+    #[test]
+    fn release_list_result_state_stale_round_trips_through_msgpack_named() {
+        let original = ReleaseListResultState::Stale {
+            releases: vec![sample_release(), sample_release_no_name()],
+            reason: "GitHub unreachable".to_string(),
+        };
+        let bytes = rmp_serde::to_vec_named(&original).expect("serialize Stale");
+        let decoded: ReleaseListResultState =
+            rmp_serde::from_slice(&bytes).expect("deserialize Stale");
+        assert_eq!(decoded, original);
+
+        let shadow: ReleaseListResultStateTagShadow =
+            rmp_serde::from_slice(&bytes).expect("decode Stale through shadow enum");
+        assert!(matches!(shadow, ReleaseListResultStateTagShadow::Stale(_)));
+    }
+
+    #[test]
+    fn release_list_result_state_failed_round_trips_through_msgpack_named() {
+        let original = ReleaseListResultState::Failed {
+            reason: "GitHub rate limit reached, retry after 12 minutes".to_string(),
+        };
+        let bytes = rmp_serde::to_vec_named(&original).expect("serialize Failed");
+        let decoded: ReleaseListResultState =
+            rmp_serde::from_slice(&bytes).expect("deserialize Failed");
+        assert_eq!(decoded, original);
+
+        let shadow: ReleaseListResultStateTagShadow =
+            rmp_serde::from_slice(&bytes).expect("decode Failed through shadow enum");
+        assert!(matches!(shadow, ReleaseListResultStateTagShadow::Failed(_)));
+    }
+
+    #[test]
+    fn client_message_list_releases_round_trips_through_msgpack_named() {
+        let original = ClientMessage::ListReleases;
+        let bytes = rmp_serde::to_vec_named(&original).expect("serialize ListReleases");
+
+        // Wire-name assertion: ClientMessage uses #[serde(tag = "type")] with
+        // no rename_all, so the discriminator is the PascalCase variant name.
+        let tagged: InternalTagOnly =
+            rmp_serde::from_slice(&bytes).expect("decode ListReleases as tag-only");
+        assert_eq!(tagged.tag, "ListReleases");
+
+        // Round-trip back to the actual variant.
+        let decoded: ClientMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize ListReleases");
+        assert!(matches!(decoded, ClientMessage::ListReleases));
+    }
+
+    #[test]
+    fn server_message_release_list_round_trips_through_msgpack_named() {
+        let original = ServerMessage::ReleaseList {
+            state: ReleaseListResultState::Fresh { releases: vec![sample_release()] },
+        };
+        let bytes = rmp_serde::to_vec_named(&original).expect("serialize ReleaseList");
+
+        // Wire-name assertion: ServerMessage uses #[serde(tag = "type")] with
+        // no rename_all, so the discriminator is the PascalCase variant name.
+        let tagged: InternalTagOnly =
+            rmp_serde::from_slice(&bytes).expect("decode ReleaseList as tag-only");
+        assert_eq!(tagged.tag, "ReleaseList");
+
+        // Round-trip and confirm the inner state survives byte-for-byte.
+        let decoded: ServerMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize ReleaseList");
+        match decoded {
+            ServerMessage::ReleaseList { state: ReleaseListResultState::Fresh { releases } } => {
+                assert_eq!(releases, vec![sample_release()]);
+            }
+            other => panic!("unexpected variant after round-trip: {other:?}"),
+        }
+    }
 }

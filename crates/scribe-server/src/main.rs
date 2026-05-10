@@ -15,6 +15,7 @@ mod config;
 mod handoff;
 mod ipc_server;
 mod macos_proc;
+mod releases;
 mod session_manager;
 mod shell_integration;
 mod updater;
@@ -143,6 +144,13 @@ async fn run_server_loop(
     let updater_handle =
         Arc::new(updater::spawn_updater(Arc::clone(&connected_clients), update_config));
 
+    // Build the release catalog + GitHub fetcher used by the Releases settings
+    // panel. The catalog is empty until the first `ListReleases` request; the
+    // fetcher reuses the shared HTTP client from `updater::http_client()`.
+    let release_catalog = Arc::new(tokio::sync::Mutex::new(releases::ReleaseCatalog::default()));
+    let release_fetcher: Arc<dyn releases::ReleaseFetcher> =
+        Arc::new(releases::GithubReleaseFetcher::new());
+
     let handoff_triggered = tokio::select! {
         result = ipc_server::start_ipc_server(
             listener,
@@ -152,6 +160,8 @@ async fn run_server_loop(
                 live_sessions: Arc::clone(&live_sessions),
                 connected_clients: Arc::clone(&connected_clients),
                 updater_handle: Arc::clone(&updater_handle),
+                release_catalog: Arc::clone(&release_catalog),
+                release_fetcher: Arc::clone(&release_fetcher),
             },
         ) => {
             result?;

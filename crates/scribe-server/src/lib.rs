@@ -10,6 +10,7 @@ pub mod config;
 pub mod handoff;
 pub mod ipc_server;
 pub mod macos_proc;
+pub mod releases;
 pub mod session_manager;
 pub mod shell_integration;
 pub mod updater;

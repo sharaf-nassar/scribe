@@ -271,6 +271,7 @@ ignored = [
 [dependencies]
 scribe-common.workspace = true
 alacritty_terminal.workspace = true
+ammonia = "4.1"
 dirs.workspace = true
 scribe-pty.workspace = true
 tokio.workspace = true
@@ -287,6 +288,9 @@ unix-ancillary.workspace = true
 libc.workspace = true
 reqwest.workspace = true
 futures-util = "0.3"
+pulldown-cmark = { version = "0.13", default-features = false, features = [
+  "html",
+] }
 semver.workspace = true
 serde_json.workspace = true
 minisign-verify.workspace = true

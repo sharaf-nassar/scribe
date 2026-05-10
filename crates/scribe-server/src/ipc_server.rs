@@ -39,6 +39,7 @@ use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
 
 use crate::handoff::HandoffSession;
+use crate::releases::{ReleaseCatalog, ReleaseFetcher};
 use crate::session_manager::{
     ManagedSession, SessionLaunchRequest, SessionManager, build_term_config, snapshot_term,
 };
@@ -115,6 +116,13 @@ pub struct IpcServerState {
     pub live_sessions: LiveSessionRegistry,
     pub connected_clients: ConnectedClients,
     pub updater_handle: Arc<UpdaterHandle>,
+    /// In-memory cache of GitHub releases populated lazily on the first
+    /// `ListReleases` request and refreshed in the background past its TTL.
+    /// See [`crate::releases`] for the cache state machine.
+    pub release_catalog: Arc<Mutex<ReleaseCatalog>>,
+    /// Fetcher used to refresh `release_catalog`. Production wires the real
+    /// `GithubReleaseFetcher`; tests may inject deterministic stubs.
+    pub release_fetcher: Arc<dyn ReleaseFetcher>,
 }
 
 struct ClientDispatchContext<'a> {
@@ -516,6 +524,13 @@ where
             handle_transient_check_for_updates(server, writer).await;
             None
         }
+        Ok(ClientMessage::ListReleases) => {
+            // Same transient-action shape as `CheckForUpdates`: settings
+            // window opens a fresh socket, sends `ListReleases`, reads one
+            // `ReleaseList` reply, closes. No window registration required.
+            handle_transient_list_releases(server, writer).await;
+            None
+        }
         Ok(msg) => Some(handle_legacy_client(msg, server, writer, attached_ids).await),
         Err(ScribeError::Io { .. }) => {
             debug!("client disconnected before Hello");
@@ -532,6 +547,14 @@ async fn handle_transient_check_for_updates(server: &IpcServerState, writer: &Sh
     info!("transient client requested manual update check");
     let state = server.updater_handle.request_check().await;
     send_message(writer, &ServerMessage::UpdateCheckResult { state }).await;
+}
+
+async fn handle_transient_list_releases(server: &IpcServerState, writer: &SharedWriter) {
+    info!("transient client requested release list");
+    let state =
+        crate::releases::handle_list_releases(&server.release_catalog, &server.release_fetcher)
+            .await;
+    send_message(writer, &ServerMessage::ReleaseList { state }).await;
 }
 
 async fn handle_client_hello(
@@ -719,6 +742,7 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::TriggerUpdate
         | ClientMessage::DismissUpdate
         | ClientMessage::CheckForUpdates
+        | ClientMessage::ListReleases
         | ClientMessage::ListWindows
         | ClientMessage::DispatchAction { .. }) => {
             dispatch_window_message(msg, context).await;
@@ -845,6 +869,15 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
             info!(window_id = %context.window_id, "client requested manual update check");
             let state = context.server.updater_handle.request_check().await;
             send_message(context.writer, &ServerMessage::UpdateCheckResult { state }).await;
+        }
+        ClientMessage::ListReleases => {
+            info!(window_id = %context.window_id, "client requested release list");
+            let state = crate::releases::handle_list_releases(
+                &context.server.release_catalog,
+                &context.server.release_fetcher,
+            )
+            .await;
+            send_message(context.writer, &ServerMessage::ReleaseList { state }).await;
         }
         ClientMessage::ListWindows => {
             handle_list_windows(

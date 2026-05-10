@@ -281,6 +281,7 @@ async fn dispatch_server_message(
         | ServerMessage::UpdateAvailable { .. }
         | ServerMessage::UpdateProgress { .. }
         | ServerMessage::UpdateCheckResult { .. }
+        | ServerMessage::ReleaseList { .. }
         | ServerMessage::WindowList { .. }
         | ServerMessage::RunAction { .. }
         | ServerMessage::ActionDispatched { .. }) => {
