@@ -7,51 +7,9 @@
 
 set -euo pipefail
 
-ACTION="${1:-}"
-
-TTY_PATH="$(
-    python3 - <<'PY'
-import os
-
-try:
-    fd = os.open("/dev/tty", os.O_RDWR)
-except OSError:
-    raise SystemExit(0)
-
-try:
-    print(os.ttyname(fd))
-except OSError:
-    pass
-finally:
-    os.close(fd)
-PY
-)"
-
-CACHE_DIR="${HOME}/.codex/hooks/.scribe-task-label-cache"
-CACHE_FILE=""
-if [[ -n "$TTY_PATH" ]]; then
-    CACHE_KEY="$(
-        python3 - "$TTY_PATH" <<'PY'
-import re
-import sys
-
-print(re.sub(r"[^A-Za-z0-9._-]+", "_", sys.argv[1]))
-PY
-    )"
-    CACHE_FILE="${CACHE_DIR}/${CACHE_KEY}.thread"
-fi
-
-has_tty() {
-    [[ -n "$TTY_PATH" ]]
-}
-
-read_payload() {
-    if [[ -t 0 ]]; then
-        printf ''
-    else
-        cat || true
-    fi
-}
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=dist/codex-hook-common.sh
+. "${SCRIPT_DIR}/codex-hook-common.sh"
 
 drain_stdin() {
     if [[ ! -t 0 ]]; then
@@ -59,38 +17,42 @@ drain_stdin() {
     fi
 }
 
-emit_osc() {
-    if ! has_tty; then
-        return
-    fi
-    printf '\e]1337;%s\a' "$1" > /dev/tty 2>/dev/null || true
-}
+ACTION="${1:-}"
 
 reset_task_label() {
-    if ! has_tty; then
+    if ! scribe_codex_has_tty; then
         return
     fi
-    if [[ -n "$CACHE_FILE" ]]; then
-        mkdir -p "$CACHE_DIR"
-        rm -f "$CACHE_FILE"
+    if [[ -n "$SCRIBE_CODEX_LABEL_CACHE_FILE" ]]; then
+        mkdir -p "$SCRIBE_CODEX_CACHE_DIR"
+        rm -f "$SCRIBE_CODEX_LABEL_CACHE_FILE"
     fi
-    emit_osc 'CodexTaskLabelCleared'
+    scribe_codex_emit_osc 'CodexTaskLabelCleared'
 }
 
 handle_session_start() {
-    drain_stdin
+    local payload
+    payload="$(scribe_codex_read_payload)"
+    if ! scribe_codex_owner_allows_payload "$payload" 1; then
+        return
+    fi
     reset_task_label
-    emit_osc 'CodexState=idle_prompt'
+    if [[ "${SCRIBE_CODEX_OWNER_CLAIMED:-0}" == "1" ]]; then
+        scribe_codex_emit_osc 'CodexState=idle_prompt'
+    fi
 }
 
 handle_user_prompt_submit() {
     local payload parsed session_id label command
-    payload="$(read_payload)"
-    if ! has_tty; then
+    payload="$(scribe_codex_read_payload)"
+    if ! scribe_codex_has_tty; then
+        return
+    fi
+    if ! scribe_codex_owner_allows_payload "$payload" 1; then
         return
     fi
 
-    emit_osc 'CodexState=processing'
+    scribe_codex_emit_osc 'CodexState=processing'
     parsed="$(
         PAYLOAD="$payload" python3 - <<'PY'
 import json
@@ -155,6 +117,7 @@ PY
     done <<< "$parsed"
 
     if [[ "$command" == "reset" ]]; then
+        scribe_codex_owner_reset
         reset_task_label
         return
     fi
@@ -163,23 +126,27 @@ PY
         return
     fi
 
-    if [[ -n "$CACHE_FILE" ]] && [[ -f "$CACHE_FILE" ]] && [[ "$(cat "$CACHE_FILE")" == "$session_id" ]]; then
+    if [[ -n "$SCRIBE_CODEX_LABEL_CACHE_FILE" ]] && [[ -f "$SCRIBE_CODEX_LABEL_CACHE_FILE" ]] && [[ "$(cat "$SCRIBE_CODEX_LABEL_CACHE_FILE")" == "$session_id" ]]; then
         return
     fi
 
-    if [[ -n "$CACHE_FILE" ]]; then
-        mkdir -p "$CACHE_DIR"
-        printf '%s' "$session_id" > "$CACHE_FILE"
+    if [[ -n "$SCRIBE_CODEX_LABEL_CACHE_FILE" ]]; then
+        mkdir -p "$SCRIBE_CODEX_CACHE_DIR"
+        printf '%s' "$session_id" > "$SCRIBE_CODEX_LABEL_CACHE_FILE"
     fi
-    emit_osc "CodexTaskLabel=${label}"
+    scribe_codex_emit_osc "CodexTaskLabel=${label}"
 }
 
 handle_tool_processing() {
-    drain_stdin
-    if ! has_tty; then
+    local payload
+    payload="$(scribe_codex_read_payload)"
+    if ! scribe_codex_has_tty; then
         return
     fi
-    emit_osc 'CodexState=processing'
+    if ! scribe_codex_owner_allows_payload "$payload" 0; then
+        return
+    fi
+    scribe_codex_emit_osc 'CodexState=processing'
 }
 
 case "$ACTION" in

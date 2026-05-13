@@ -668,6 +668,231 @@ impl Default for TerminalClipboardConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartSelectionActivation {
+    DoubleClick,
+    #[default]
+    QuadClick,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartSelectionPrecision {
+    VeryLow,
+    Low,
+    #[default]
+    Normal,
+    High,
+    VeryHigh,
+}
+
+impl SmartSelectionPrecision {
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::VeryLow => 0,
+            Self::Low => 1,
+            Self::Normal => 2,
+            Self::High => 3,
+            Self::VeryHigh => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartSelectionParameterMode {
+    #[default]
+    Legacy,
+    Interpolated,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartSelectionActionKind {
+    OpenFile,
+    OpenUrl,
+    RunCommand,
+    RunCoprocess,
+    SendText,
+    RunCommandInWindow,
+    #[default]
+    Copy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartSelectionAction {
+    #[serde(default)]
+    pub kind: SmartSelectionActionKind,
+    #[serde(default)]
+    pub parameter: String,
+    #[serde(default)]
+    pub parameter_mode: SmartSelectionParameterMode,
+}
+
+impl Default for SmartSelectionAction {
+    fn default() -> Self {
+        Self {
+            kind: SmartSelectionActionKind::Copy,
+            parameter: String::new(),
+            parameter_mode: SmartSelectionParameterMode::Legacy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartSelectionRule {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub regex: String,
+    #[serde(default)]
+    pub precision: SmartSelectionPrecision,
+    #[serde(default)]
+    pub actions: Vec<SmartSelectionAction>,
+}
+
+impl Default for SmartSelectionRule {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            regex: String::new(),
+            precision: SmartSelectionPrecision::Normal,
+            actions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartSelectionConfig {
+    #[serde(
+        default = "default_smart_selection_activation",
+        deserialize_with = "deserialize_smart_selection_activation"
+    )]
+    pub activation: SmartSelectionActivation,
+    #[serde(default = "default_smart_selection_rules")]
+    pub rules: Vec<SmartSelectionRule>,
+}
+
+impl Default for SmartSelectionConfig {
+    fn default() -> Self {
+        Self {
+            activation: default_smart_selection_activation(),
+            rules: default_smart_selection_rules(),
+        }
+    }
+}
+
+fn default_smart_selection_activation() -> SmartSelectionActivation {
+    SmartSelectionActivation::QuadClick
+}
+
+fn deserialize_smart_selection_activation<'de, D>(
+    deserializer: D,
+) -> Result<SmartSelectionActivation, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    Ok(match value.as_str() {
+        "double_click" => SmartSelectionActivation::DoubleClick,
+        _ => SmartSelectionActivation::QuadClick,
+    })
+}
+
+fn default_smart_selection_rules() -> Vec<SmartSelectionRule> {
+    vec![
+        smart_selection_rule(
+            "whitespace_word",
+            "Whitespace-bounded word",
+            r"\S+",
+            SmartSelectionPrecision::VeryLow,
+            Vec::new(),
+        ),
+        smart_selection_rule(
+            "namespace_identifier",
+            "Namespace identifier",
+            r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+",
+            SmartSelectionPrecision::Normal,
+            Vec::new(),
+        ),
+        smart_selection_rule(
+            "path",
+            "Path",
+            r#"(?:~|\.{1,2})?/[^\s"'<>|]+|[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+"#,
+            SmartSelectionPrecision::High,
+            vec![smart_selection_action(SmartSelectionActionKind::OpenFile, "")],
+        ),
+        smart_selection_rule(
+            "quoted_string",
+            "Quoted string",
+            r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'"#,
+            SmartSelectionPrecision::Normal,
+            Vec::new(),
+        ),
+        smart_selection_rule(
+            "include_path",
+            "Java/Python include path",
+            r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){2,}",
+            SmartSelectionPrecision::High,
+            Vec::new(),
+        ),
+        smart_selection_rule(
+            "uri",
+            "URI",
+            r#"(?:mailto|https?|ssh|telnet):[^\s"'<>|]+"#,
+            SmartSelectionPrecision::VeryHigh,
+            vec![smart_selection_action(SmartSelectionActionKind::OpenUrl, "")],
+        ),
+        smart_selection_rule(
+            "objective_c_selector",
+            "Objective-C selector",
+            r"@selector\([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*:?\)|[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)+:",
+            SmartSelectionPrecision::High,
+            Vec::new(),
+        ),
+        smart_selection_rule(
+            "email",
+            "Email address",
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            SmartSelectionPrecision::VeryHigh,
+            vec![smart_selection_action(SmartSelectionActionKind::OpenUrl, "mailto:\\0")],
+        ),
+    ]
+}
+
+fn smart_selection_rule(
+    id: &str,
+    name: &str,
+    regex: &str,
+    precision: SmartSelectionPrecision,
+    actions: Vec<SmartSelectionAction>,
+) -> SmartSelectionRule {
+    SmartSelectionRule {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        enabled: true,
+        regex: regex.to_owned(),
+        precision,
+        actions,
+    }
+}
+
+fn smart_selection_action(kind: SmartSelectionActionKind, parameter: &str) -> SmartSelectionAction {
+    SmartSelectionAction {
+        kind,
+        parameter: parameter.to_owned(),
+        parameter_mode: SmartSelectionParameterMode::Legacy,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AiIntegrationToggle(bool);
@@ -780,6 +1005,8 @@ pub struct TerminalConfig {
     pub scrollback_lines: u32,
     #[serde(default, flatten)]
     pub clipboard: TerminalClipboardConfig,
+    #[serde(default)]
+    pub smart_selection: SmartSelectionConfig,
     #[serde(default, flatten)]
     pub ai_integration: TerminalAiIntegrationConfig,
     #[serde(default, flatten)]
@@ -798,6 +1025,7 @@ impl Default for TerminalConfig {
         Self {
             scrollback_lines: default_scrollback_lines(),
             clipboard: TerminalClipboardConfig::default(),
+            smart_selection: SmartSelectionConfig::default(),
             ai_integration: TerminalAiIntegrationConfig::default(),
             ai_session: TerminalAiSessionConfig::default(),
             status_bar_stats: StatusBarStatsConfig::default(),

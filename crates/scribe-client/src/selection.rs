@@ -427,7 +427,7 @@ pub fn read_cell_char(term: &Term<VoidListener>, line: Line, col: Column) -> cha
 }
 
 /// Read the flags of a single cell from the terminal grid.
-fn read_cell_flags(term: &Term<VoidListener>, line: Line, col: Column) -> Flags {
+pub fn read_cell_flags(term: &Term<VoidListener>, line: Line, col: Column) -> Flags {
     read_cell(term, line, col).flags
 }
 

@@ -118,6 +118,12 @@ scribe-test daemon stop
 scribe-test server stop
 ```
 
+### Smart Selection Manual Verification
+
+Smart Selection currently relies on manual quickstart scenarios rather than new test code, matching the project instruction for this feature.
+
+Manual coverage lives in `specs/002-smart-selection/quickstart.md`: configure quad-click and double-click activation, verify default matches for words, namespace identifiers, paths, quoted strings, include paths, URIs, Objective-C selectors, and emails, edit and restore rules in Settings, and confirm context-menu actions execute only after explicit menu selection.
+
 ## Installer Script Regression Harness
 
 Offline shell harness for Debian `postinst` behavior so packaging regressions can be caught without touching the live user session.
@@ -132,9 +138,9 @@ Each case feeds a synthetic CC statusLine JSON under `script(1)` to capture stdo
 
 ### Codex Context Regressions
 
-Offline regression harness for `dist/detect-codex-context.sh` covering JSONL parsing, fallback logic, default window size, clamping, and missing-data paths. Skipped on macOS.
+Offline regression harness for `dist/detect-codex-context.sh` covering transcript-path selection, JSONL parsing, strict required fields, clamping, and missing-data paths. Skipped on macOS.
 
-Each case seeds a synthetic `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` in a temp HOME, runs the producer under `script(1)`, and asserts the emitted OSC bytes. Six cases: `case_total_token_usage_present` (`total_tokens/model_context_window` → correct `context=NN`), `case_last_token_usage_fallback` (`total_token_usage` absent → falls back to `last_token_usage.total_tokens`), `case_default_window_when_absent` (`model_context_window` absent → default 200 000 denominator), `case_clamp_overflow` (tokens >> window → clamped to `context=100`), `case_no_token_count_record` (JSONL has no `token_count` event → no OSC emitted), `case_empty_sessions_dir` (no JSONL files at all → no OSC emitted).
+Each case seeds a synthetic `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` in a temp HOME, runs the producer under `script(1)` with a Codex hook JSON payload, and asserts the emitted OSC bytes. Cases cover `last_token_usage.total_tokens/model_context_window`, transcript-path isolation from an unrelated newer rollout, overflow clamping, missing or invalid `transcript_path`, no `token_count` record, missing `last_token_usage`, and missing `model_context_window`.
 
 ## E2E Functional Tests
 

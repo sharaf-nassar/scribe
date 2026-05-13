@@ -861,6 +861,73 @@
           </div>
         </div>
 
+        <div class="section-label">Smart Selection</div>
+        <div class="section-card smart-selection-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Activation</div>
+              <div class="setting-desc">Choose the click gesture that selects semantic terminal text</div>
+            </div>
+            <div class="smart-segmented-control" id="smart-selection-activation" role="group" aria-label="Smart Selection activation">
+              <button type="button" class="smart-segment-opt" data-value="double_click">Double Click</button>
+              <button type="button" class="smart-segment-opt active" data-value="quad_click">Quad Click</button>
+            </div>
+          </div>
+          <div class="smart-selection-panel">
+            <div class="smart-rule-sidebar">
+              <div class="smart-rule-toolbar">
+                <button type="button" class="smart-tool-btn" id="smart-rule-add" title="Add rule">+</button>
+                <button type="button" class="smart-tool-btn" id="smart-rule-duplicate" title="Duplicate rule">Duplicate</button>
+                <button type="button" class="smart-tool-btn" id="smart-rule-remove" title="Remove rule">Remove</button>
+                <button type="button" class="smart-tool-btn" id="smart-rule-up" title="Move rule up">&#8593;</button>
+                <button type="button" class="smart-tool-btn" id="smart-rule-down" title="Move rule down">&#8595;</button>
+                <button type="button" class="smart-tool-btn" id="smart-rule-restore" title="Restore default rules">Restore</button>
+              </div>
+              <div class="smart-rule-list" id="smart-rule-list"></div>
+            </div>
+            <div class="smart-rule-editor" id="smart-rule-editor">
+              <label class="smart-enabled-row">
+                <input type="checkbox" id="smart-rule-enabled" checked>
+                <span>Enabled</span>
+              </label>
+              <div class="smart-editor-grid">
+                <label class="smart-field">
+                  <span>Name</span>
+                  <input type="text" class="text-input smart-input" id="smart-rule-name">
+                </label>
+                <label class="smart-field">
+                  <span>Precision</span>
+                  <select class="select-control smart-select" id="smart-rule-precision">
+                    <option value="very_low">Very Low</option>
+                    <option value="low">Low</option>
+                    <option value="normal">Normal</option>
+                    <option value="high">High</option>
+                    <option value="very_high">Very High</option>
+                  </select>
+                </label>
+              </div>
+              <label class="smart-field">
+                <span>Regular Expression</span>
+                <textarea class="text-input smart-regex" id="smart-rule-regex" spellcheck="false"></textarea>
+              </label>
+              <div class="smart-validation" id="smart-rule-validation"></div>
+              <div class="smart-actions-header">
+                <div>
+                  <div class="smart-subtitle">Actions</div>
+                  <div class="setting-desc">Context menu commands for matches from this rule</div>
+                </div>
+                <button type="button" class="action-btn" id="smart-action-add">Add Action</button>
+              </div>
+              <div class="smart-action-list" id="smart-action-list"></div>
+              <label class="smart-field">
+                <span>Preview Text</span>
+                <textarea class="text-input smart-sample" id="smart-sample-text" spellcheck="false">cargo test crates/scribe-client/src/main.rs https://example.com user@example.com</textarea>
+              </label>
+              <div class="smart-preview" id="smart-preview-result">No match</div>
+            </div>
+          </div>
+        </div>
+
         <div class="section-label">Status Bar</div>
         <div class="section-card">
           <div class="setting-row">

@@ -78,6 +78,519 @@ function syncNotificationConfigValue(key, value) {
   currentConfig.notifications[notificationsKey] = value;
 }
 
+// ─────────── Smart Selection ───────────
+
+var smartSelectionState = null;
+var smartSelectionSelectedIndex = 0;
+
+var SMART_PRECISIONS = [
+  ["very_low", "Very Low"],
+  ["low", "Low"],
+  ["normal", "Normal"],
+  ["high", "High"],
+  ["very_high", "Very High"]
+];
+
+var SMART_ACTION_KINDS = [
+  ["open_file", "Open File"],
+  ["open_url", "Open URL"],
+  ["run_command", "Run Command"],
+  ["run_coprocess", "Run Coprocess"],
+  ["send_text", "Send Text"],
+  ["run_command_in_window", "Run Command in Window"],
+  ["copy", "Copy"]
+];
+
+function cloneSmartSelection(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function defaultSmartAction(kind, parameter) {
+  return {
+    kind: kind || "copy",
+    parameter: parameter || "",
+    parameter_mode: "legacy"
+  };
+}
+
+function defaultSmartSelectionConfig() {
+  return {
+    activation: "quad_click",
+    rules: [
+      {
+        id: "whitespace_word",
+        name: "Whitespace-bounded word",
+        enabled: true,
+        regex: "\\S+",
+        precision: "very_low",
+        actions: []
+      },
+      {
+        id: "namespace_identifier",
+        name: "Namespace identifier",
+        enabled: true,
+        regex: "[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+",
+        precision: "normal",
+        actions: []
+      },
+      {
+        id: "path",
+        name: "Path",
+        enabled: true,
+        regex: "(?:~|\\.{1,2})?/[^\\s\"'<>|]+|[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+",
+        precision: "high",
+        actions: [defaultSmartAction("open_file")]
+      },
+      {
+        id: "quoted_string",
+        name: "Quoted string",
+        enabled: true,
+        regex: "\"(?:[^\"\\\\]|\\\\.)*\"|'(?:[^'\\\\]|\\\\.)*'",
+        precision: "normal",
+        actions: []
+      },
+      {
+        id: "include_path",
+        name: "Java/Python include path",
+        enabled: true,
+        regex: "[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*){2,}",
+        precision: "high",
+        actions: []
+      },
+      {
+        id: "uri",
+        name: "URI",
+        enabled: true,
+        regex: "(?:mailto|https?|ssh|telnet):[^\\s\"'<>|]+",
+        precision: "very_high",
+        actions: [defaultSmartAction("open_url")]
+      },
+      {
+        id: "objective_c_selector",
+        name: "Objective-C selector",
+        enabled: true,
+        regex: "@selector\\([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*:?\\)|[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)+:",
+        precision: "high",
+        actions: []
+      },
+      {
+        id: "email",
+        name: "Email address",
+        enabled: true,
+        regex: "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}",
+        precision: "very_high",
+        actions: [defaultSmartAction("open_url", "mailto:\\0")]
+      }
+    ]
+  };
+}
+
+function normalizeSmartSelectionConfig(config) {
+  var fallback = defaultSmartSelectionConfig();
+  var input = config && typeof config === "object" ? cloneSmartSelection(config) : fallback;
+  if (input.activation !== "double_click" && input.activation !== "quad_click") {
+    input.activation = "quad_click";
+  }
+  if (!Array.isArray(input.rules)) {
+    input.rules = fallback.rules;
+  }
+  input.rules = input.rules.map(function(rule, index) {
+    var normalized = rule && typeof rule === "object" ? rule : {};
+    var precision = SMART_PRECISIONS.some(function(item) { return item[0] === normalized.precision; })
+      ? normalized.precision
+      : "normal";
+    return {
+      id: normalized.id || ("rule_" + String(index + 1)),
+      name: normalized.name || "Untitled Rule",
+      enabled: normalized.enabled !== false,
+      regex: normalized.regex || "",
+      precision: precision,
+      actions: Array.isArray(normalized.actions) ? normalized.actions.map(normalizeSmartAction) : []
+    };
+  });
+  return input;
+}
+
+function normalizeSmartAction(action) {
+  var value = action && typeof action === "object" ? action : {};
+  var kind = SMART_ACTION_KINDS.some(function(item) { return item[0] === value.kind; })
+    ? value.kind
+    : "copy";
+  return {
+    kind: kind,
+    parameter: value.parameter || "",
+    parameter_mode: value.parameter_mode === "interpolated" ? "interpolated" : "legacy"
+  };
+}
+
+function selectedSmartRule() {
+  if (!smartSelectionState || smartSelectionState.rules.length === 0) { return null; }
+  smartSelectionSelectedIndex = Math.max(
+    0,
+    Math.min(smartSelectionSelectedIndex, smartSelectionState.rules.length - 1)
+  );
+  return smartSelectionState.rules[smartSelectionSelectedIndex];
+}
+
+function validateSmartRule(rule) {
+  if (!rule || !rule.enabled) { return ""; }
+  if (!rule.regex || rule.regex.trim().length === 0) {
+    return "Regex is required for enabled rules.";
+  }
+  try {
+    new RegExp(rule.regex);
+  } catch (error) {
+    return error.message;
+  }
+  return "";
+}
+
+function allSmartRulesValid() {
+  if (!smartSelectionState) { return false; }
+  for (var i = 0; i < smartSelectionState.rules.length; i++) {
+    if (validateSmartRule(smartSelectionState.rules[i])) { return false; }
+  }
+  return true;
+}
+
+function sendSmartSelectionConfig() {
+  if (!smartSelectionState || !allSmartRulesValid()) { return; }
+  if (!currentConfig.terminal) { currentConfig.terminal = {}; }
+  currentConfig.terminal.smart_selection = cloneSmartSelection(smartSelectionState);
+  sendChange("terminal.smart_selection", smartSelectionState);
+}
+
+function renderSmartSelection() {
+  if (!smartSelectionState) {
+    smartSelectionState = defaultSmartSelectionConfig();
+  }
+  renderSmartActivation();
+  renderSmartRuleList();
+  renderSmartRuleEditor();
+}
+
+function renderSmartActivation() {
+  var ctrl = document.getElementById("smart-selection-activation");
+  if (!ctrl) { return; }
+  ctrl.querySelectorAll(".smart-segment-opt").forEach(function(opt) {
+    opt.classList.toggle("active", opt.getAttribute("data-value") === smartSelectionState.activation);
+  });
+}
+
+function renderSmartRuleList() {
+  var list = document.getElementById("smart-rule-list");
+  if (!list || !smartSelectionState) { return; }
+  while (list.firstChild) { list.removeChild(list.firstChild); }
+  smartSelectionState.rules.forEach(function(rule, index) {
+    var item = document.createElement("button");
+    item.type = "button";
+    item.className = "smart-rule-item" + (index === smartSelectionSelectedIndex ? " active" : "") + (rule.enabled ? "" : " disabled");
+    item.setAttribute("data-index", String(index));
+    var dot = document.createElement("span");
+    dot.className = "smart-rule-enabled";
+    var name = document.createElement("span");
+    name.className = "smart-rule-name";
+    name.textContent = rule.name || "Untitled Rule";
+    item.appendChild(dot);
+    item.appendChild(name);
+    list.appendChild(item);
+  });
+}
+
+function renderSmartRuleEditor() {
+  var editor = document.getElementById("smart-rule-editor");
+  var rule = selectedSmartRule();
+  if (!editor) { return; }
+  editor.style.display = rule ? "" : "none";
+  if (!rule) { return; }
+
+  document.getElementById("smart-rule-enabled").checked = rule.enabled !== false;
+  document.getElementById("smart-rule-name").value = rule.name || "";
+  document.getElementById("smart-rule-regex").value = rule.regex || "";
+  document.getElementById("smart-rule-precision").value = rule.precision || "normal";
+  renderSmartActionList(rule);
+  renderSmartPreview();
+}
+
+function fillSelectOptions(select, items) {
+  while (select.firstChild) { select.removeChild(select.firstChild); }
+  items.forEach(function(item) {
+    var option = document.createElement("option");
+    option.value = item[0];
+    option.textContent = item[1];
+    select.appendChild(option);
+  });
+}
+
+function renderSmartActionList(rule) {
+  var list = document.getElementById("smart-action-list");
+  if (!list) { return; }
+  while (list.firstChild) { list.removeChild(list.firstChild); }
+  rule.actions.forEach(function(action, index) {
+    var row = document.createElement("div");
+    row.className = "smart-action-row";
+    row.setAttribute("data-index", String(index));
+
+    var kind = document.createElement("select");
+    kind.className = "select-control smart-select";
+    kind.setAttribute("data-field", "kind");
+    fillSelectOptions(kind, SMART_ACTION_KINDS);
+    kind.value = action.kind || "copy";
+
+    var parameter = document.createElement("input");
+    parameter.type = "text";
+    parameter.className = "text-input smart-input";
+    parameter.setAttribute("data-field", "parameter");
+    parameter.value = action.parameter || "";
+    parameter.placeholder = "\\0";
+
+    var mode = document.createElement("select");
+    mode.className = "select-control smart-select";
+    mode.setAttribute("data-field", "parameter_mode");
+    fillSelectOptions(mode, [["legacy", "Legacy"], ["interpolated", "Interpolated"]]);
+    mode.value = action.parameter_mode || "legacy";
+
+    var buttons = document.createElement("div");
+    buttons.className = "smart-action-buttons";
+    [["up", "\u2191"], ["down", "\u2193"], ["duplicate", "Duplicate"], ["remove", "Remove"]]
+      .forEach(function(item) {
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "smart-tool-btn";
+        btn.setAttribute("data-smart-action", item[0]);
+        btn.textContent = item[1];
+        buttons.appendChild(btn);
+      });
+
+    row.appendChild(kind);
+    row.appendChild(parameter);
+    row.appendChild(mode);
+    row.appendChild(buttons);
+    list.appendChild(row);
+  });
+}
+
+function renderSmartPreview() {
+  var rule = selectedSmartRule();
+  var validation = document.getElementById("smart-rule-validation");
+  var preview = document.getElementById("smart-preview-result");
+  var sample = document.getElementById("smart-sample-text");
+  if (!rule || !validation || !preview || !sample) { return; }
+
+  var error = validateSmartRule(rule);
+  validation.textContent = error;
+  if (error) {
+    preview.textContent = "No match";
+    return;
+  }
+
+  var regex = new RegExp(rule.regex);
+  var match = regex.exec(sample.value || "");
+  preview.textContent = match ? ("Match: " + match[0]) : "No match";
+}
+
+function updateSelectedSmartRule(mutator) {
+  var rule = selectedSmartRule();
+  if (!rule) { return; }
+  mutator(rule);
+  renderSmartSelection();
+  sendSmartSelectionConfig();
+}
+
+function makeSmartRuleId() {
+  return "custom_" + Date.now().toString(36) + "_" + Math.floor(Math.random() * 10000).toString(36);
+}
+
+function initSmartSelection() {
+  var activation = document.getElementById("smart-selection-activation");
+  if (activation) {
+    activation.addEventListener("click", function(event) {
+      var opt = event.target.closest(".smart-segment-opt");
+      if (!opt) { return; }
+      smartSelectionState.activation = opt.getAttribute("data-value") || "quad_click";
+      renderSmartActivation();
+      sendSmartSelectionConfig();
+    });
+  }
+
+  var list = document.getElementById("smart-rule-list");
+  if (list) {
+    list.addEventListener("click", function(event) {
+      var item = event.target.closest(".smart-rule-item");
+      if (!item) { return; }
+      smartSelectionSelectedIndex = parseInt(item.getAttribute("data-index") || "0", 10);
+      renderSmartSelection();
+    });
+  }
+
+  var enabled = document.getElementById("smart-rule-enabled");
+  if (enabled) {
+    enabled.addEventListener("change", function() {
+      updateSelectedSmartRule(function(rule) { rule.enabled = enabled.checked; });
+    });
+  }
+
+  var name = document.getElementById("smart-rule-name");
+  if (name) {
+    name.addEventListener("input", function() {
+      var rule = selectedSmartRule();
+      if (!rule) { return; }
+      rule.name = name.value;
+      renderSmartRuleList();
+      sendSmartSelectionConfig();
+    });
+  }
+
+  var regex = document.getElementById("smart-rule-regex");
+  if (regex) {
+    regex.addEventListener("input", function() {
+      var rule = selectedSmartRule();
+      if (!rule) { return; }
+      rule.regex = regex.value;
+      renderSmartPreview();
+      renderSmartRuleList();
+      sendSmartSelectionConfig();
+    });
+  }
+
+  var precision = document.getElementById("smart-rule-precision");
+  if (precision) {
+    precision.addEventListener("change", function() {
+      updateSelectedSmartRule(function(rule) { rule.precision = precision.value; });
+    });
+  }
+
+  var sample = document.getElementById("smart-sample-text");
+  if (sample) {
+    sample.addEventListener("input", renderSmartPreview);
+  }
+
+  var add = document.getElementById("smart-rule-add");
+  if (add) {
+    add.addEventListener("click", function() {
+      smartSelectionState.rules.push({
+        id: makeSmartRuleId(),
+        name: "New Rule",
+        enabled: true,
+        regex: "\\S+",
+        precision: "normal",
+        actions: [defaultSmartAction("copy")]
+      });
+      smartSelectionSelectedIndex = smartSelectionState.rules.length - 1;
+      renderSmartSelection();
+      sendSmartSelectionConfig();
+    });
+  }
+
+  var duplicate = document.getElementById("smart-rule-duplicate");
+  if (duplicate) {
+    duplicate.addEventListener("click", function() {
+      var rule = selectedSmartRule();
+      if (!rule) { return; }
+      var copy = cloneSmartSelection(rule);
+      copy.id = makeSmartRuleId();
+      copy.name = copy.name + " Copy";
+      smartSelectionState.rules.splice(smartSelectionSelectedIndex + 1, 0, copy);
+      smartSelectionSelectedIndex += 1;
+      renderSmartSelection();
+      sendSmartSelectionConfig();
+    });
+  }
+
+  var remove = document.getElementById("smart-rule-remove");
+  if (remove) {
+    remove.addEventListener("click", function() {
+      if (!smartSelectionState || smartSelectionState.rules.length === 0) { return; }
+      smartSelectionState.rules.splice(smartSelectionSelectedIndex, 1);
+      smartSelectionSelectedIndex = Math.max(0, smartSelectionSelectedIndex - 1);
+      renderSmartSelection();
+      sendSmartSelectionConfig();
+    });
+  }
+
+  var up = document.getElementById("smart-rule-up");
+  var down = document.getElementById("smart-rule-down");
+  if (up) { up.addEventListener("click", function() { moveSmartRule(-1); }); }
+  if (down) { down.addEventListener("click", function() { moveSmartRule(1); }); }
+
+  var restore = document.getElementById("smart-rule-restore");
+  if (restore) {
+    restore.addEventListener("click", function() {
+      smartSelectionState = defaultSmartSelectionConfig();
+      smartSelectionSelectedIndex = 0;
+      if (!currentConfig.terminal) { currentConfig.terminal = {}; }
+      currentConfig.terminal.smart_selection = cloneSmartSelection(smartSelectionState);
+      renderSmartSelection();
+      sendChange("terminal.smart_selection.reset", true);
+    });
+  }
+
+  var addAction = document.getElementById("smart-action-add");
+  if (addAction) {
+    addAction.addEventListener("click", function() {
+      updateSelectedSmartRule(function(rule) {
+        rule.actions.push(defaultSmartAction("copy"));
+      });
+    });
+  }
+
+  var actionList = document.getElementById("smart-action-list");
+  if (actionList) {
+    actionList.addEventListener("input", onSmartActionInput);
+    actionList.addEventListener("change", onSmartActionInput);
+    actionList.addEventListener("click", onSmartActionClick);
+  }
+}
+
+function moveSmartRule(delta) {
+  if (!smartSelectionState) { return; }
+  var from = smartSelectionSelectedIndex;
+  var to = from + delta;
+  if (to < 0 || to >= smartSelectionState.rules.length) { return; }
+  var moved = smartSelectionState.rules.splice(from, 1)[0];
+  smartSelectionState.rules.splice(to, 0, moved);
+  smartSelectionSelectedIndex = to;
+  renderSmartSelection();
+  sendSmartSelectionConfig();
+}
+
+function onSmartActionInput(event) {
+  var row = event.target.closest(".smart-action-row");
+  if (!row) { return; }
+  var field = event.target.getAttribute("data-field");
+  if (!field) { return; }
+  var rule = selectedSmartRule();
+  if (!rule) { return; }
+  var index = parseInt(row.getAttribute("data-index") || "0", 10);
+  var action = rule.actions[index];
+  if (!action) { return; }
+  action[field] = event.target.value;
+  sendSmartSelectionConfig();
+}
+
+function onSmartActionClick(event) {
+  var button = event.target.closest("[data-smart-action]");
+  if (!button) { return; }
+  var row = button.closest(".smart-action-row");
+  var rule = selectedSmartRule();
+  if (!row || !rule) { return; }
+  var index = parseInt(row.getAttribute("data-index") || "0", 10);
+  var command = button.getAttribute("data-smart-action");
+  if (command === "remove") {
+    rule.actions.splice(index, 1);
+  } else if (command === "duplicate" && rule.actions[index]) {
+    rule.actions.splice(index + 1, 0, cloneSmartSelection(rule.actions[index]));
+  } else if (command === "up" && index > 0) {
+    var upAction = rule.actions.splice(index, 1)[0];
+    rule.actions.splice(index - 1, 0, upAction);
+  } else if (command === "down" && index < rule.actions.length - 1) {
+    var downAction = rule.actions.splice(index, 1)[0];
+    rule.actions.splice(index + 1, 0, downAction);
+  }
+  renderSmartRuleEditor();
+  sendSmartSelectionConfig();
+}
+
 // ─────────── Releases (US1 + US3) ───────────
 //
 // State is held at file scope so the tab-activation handler, the picker change
@@ -1044,6 +1557,7 @@ function initSliders() {
 function initSelects() {
   document.querySelectorAll("select.select-control").forEach(function(sel) {
     const key = sel.getAttribute("data-key");
+    if (!key) { return; }
 
     sel.addEventListener("change", function() {
       sendChange(key, sel.value);
@@ -1056,6 +1570,7 @@ function initSelects() {
 function initTextInputs() {
   document.querySelectorAll("input.text-input").forEach(function(input) {
     const key = input.getAttribute("data-key");
+    if (!key) { return; }
 
     input.addEventListener("change", function() {
       sendChange(key, input.value);
@@ -1218,6 +1733,9 @@ function loadConfig(config) {
   setSegmentedValue("terminal.prompt_bar_position", config.terminal?.prompt_bar_position || "top");
   setStepperValue("terminal.prompt_bar_font_size", config.terminal?.prompt_bar_font_size);
   setStepperValue("terminal.indicator_height", config.terminal?.indicator_height);
+  smartSelectionState = normalizeSmartSelectionConfig(config.terminal?.smart_selection);
+  smartSelectionSelectedIndex = 0;
+  renderSmartSelection();
 
   // AI assistant states
   var states = config.terminal?.ai_states || config.terminal?.claude_states;
@@ -2094,6 +2612,7 @@ document.addEventListener("DOMContentLoaded", function() {
   initSelects();
   initTextInputs();
   initColorSwatches();
+  initSmartSelection();
   initThemeColorEditor();
 
   // Reset-to-default buttons

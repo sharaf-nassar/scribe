@@ -1,6 +1,6 @@
 //! Mouse click counting and selection mode classification.
 //!
-//! Tracks single/double/triple click sequences and derives the active
+//! Tracks single/double/triple/quad click sequences and derives the active
 //! selection granularity (cell, word, or line).  Also provides an
 //! edge-scroll helper for autoscrolling during drag selection.
 
@@ -34,6 +34,7 @@ pub enum ClickKind {
     Single,
     Double,
     Triple,
+    Quadruple,
 }
 
 /// Per-pane state used to classify mouse presses and derive selection mode.
@@ -59,7 +60,7 @@ impl MouseClickState {
     ///
     /// If the press arrives within [`MULTI_CLICK_TIMEOUT`] and within
     /// [`MULTI_CLICK_MAX_DIST_SQ`] pixels squared of the last press, the
-    /// click count is incremented (clamped at 3).  Otherwise it resets to 1.
+    /// click count is incremented (clamped at 4).  Otherwise it resets to 1.
     /// The selection mode is updated accordingly.
     pub fn record_press(&mut self, x: f32, y: f32) -> ClickKind {
         let now = Instant::now();
@@ -74,7 +75,7 @@ impl MouseClickState {
         });
 
         if within_time && within_dist {
-            self.click_count = self.click_count.saturating_add(1).min(3);
+            self.click_count = self.click_count.saturating_add(1).min(4);
         } else {
             self.click_count = 1;
         }
@@ -85,6 +86,7 @@ impl MouseClickState {
         match self.click_count {
             2 => ClickKind::Double,
             3 => ClickKind::Triple,
+            4 => ClickKind::Quadruple,
             _ => ClickKind::Single,
         }
     }

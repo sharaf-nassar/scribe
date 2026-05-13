@@ -54,6 +54,14 @@ Terminal page general section — scrollback lines, natural scrolling, and copy 
 
 Status bar stat toggles remain on the Terminal page under the Status Bar section.
 
+### Smart Selection Keys
+
+Smart Selection settings live in their own Terminal page section and persist as one global `terminal.smart_selection` payload.
+
+The settings page manages activation (`double_click` or `quad_click`), ordered regex rules, enabled state, precision, and per-rule actions. `terminal.smart_selection.reset` restores the built-in recognizers. The apply path in [[crates/scribe-settings/src/apply.rs#apply_terminal_smart_selection_key]] deserializes the full payload and validates enabled Rust regexes before saving, so bad rules are not written to config.
+
+The frontend rule editor in [[crates/scribe-settings/src/assets/settings.js]] supports add, duplicate, remove, reorder, enable/disable, regex validation, preview text, and action editing for Open File, Open URL, Run Command, Run Coprocess, Send Text, Run Command in Window, and Copy. Smart Selection remains global; there are no profile-specific rule sets.
+
 ### AI Keys
 
 AI page consolidates all AI integration settings including Prompt Bar, Scroll Pin, Preserve AI Scrollback, Indicator Height, and the AI Assistant States table.

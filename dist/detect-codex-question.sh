@@ -11,10 +11,17 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=dist/codex-hook-common.sh
+. "${SCRIPT_DIR}/codex-hook-common.sh"
+
 STATE="idle_prompt"
 
 # Read the full JSON payload from stdin.
-INPUT=$(cat)
+INPUT="$(scribe_codex_read_payload)"
+if ! scribe_codex_owner_allows_payload "$INPUT" 0; then
+    exit 0
+fi
 
 # Extract last_assistant_message via jq (fall back to idle_prompt on failure).
 MSG=$(printf '%s' "$INPUT" | jq -r '.last_assistant_message // ""' 2>/dev/null) || MSG=""

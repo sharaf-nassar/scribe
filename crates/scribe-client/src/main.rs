@@ -21,6 +21,7 @@ mod restore_state;
 mod scrollbar;
 mod search_overlay;
 mod selection;
+mod smart_selection;
 mod splash;
 mod split_scroll;
 mod status_bar;
@@ -46,7 +47,8 @@ use alacritty_terminal::grid::Dimensions as _;
 use scribe_common::ai_state::AiProvider;
 use scribe_common::app::{current_identity, current_state_dir};
 use scribe_common::config::{
-    AiStateStylesConfig, ContentPadding, NotificationsConfig, ScribeConfig, resolve_theme,
+    AiStateStylesConfig, ContentPadding, NotificationsConfig, ScribeConfig,
+    SmartSelectionActionKind, SmartSelectionActivation, resolve_theme,
 };
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
@@ -325,6 +327,7 @@ impl ConfigReloadPlan {
     const TAB_BAR_CHANGED: u8 = 1 << 3;
     const PADDING_CHANGED: u8 = 1 << 4;
     const PROMPT_BAR_CHANGED: u8 = 1 << 5;
+    const SMART_SELECTION_CHANGED: u8 = 1 << 6;
 
     fn analyze(old: &ScribeConfig, new: &ScribeConfig) -> Self {
         let mut plan = Self { changes: 0 };
@@ -339,6 +342,10 @@ impl ConfigReloadPlan {
         plan.set(
             Self::PROMPT_BAR_CHANGED,
             old.terminal.prompt_bar.enabled != new.terminal.prompt_bar.enabled,
+        );
+        plan.set(
+            Self::SMART_SELECTION_CHANGED,
+            old.terminal.smart_selection != new.terminal.smart_selection,
         );
         plan
     }
@@ -367,6 +374,10 @@ impl ConfigReloadPlan {
 
     fn prompt_bar_changed(&self) -> bool {
         self.contains(Self::PROMPT_BAR_CHANGED)
+    }
+
+    fn smart_selection_changed(&self) -> bool {
+        self.contains(Self::SMART_SELECTION_CHANGED)
     }
 
     fn needs_layout_resize(&self) -> bool {
@@ -408,6 +419,48 @@ fn content_padding_changed(old: &ScribeConfig, new: &ScribeConfig) -> bool {
         || (old_pad.right - new_pad.right).abs() > f32::EPSILON
         || (old_pad.bottom - new_pad.bottom).abs() > f32::EPSILON
         || (old_pad.left - new_pad.left).abs() > f32::EPSILON
+}
+
+fn smart_selection_context_action(
+    kind: SmartSelectionActionKind,
+    parameter: String,
+) -> context_menu::ContextMenuAction {
+    match kind {
+        SmartSelectionActionKind::OpenFile => context_menu::ContextMenuAction::OpenFile(parameter),
+        SmartSelectionActionKind::OpenUrl => context_menu::ContextMenuAction::OpenUrl(parameter),
+        SmartSelectionActionKind::RunCommand => {
+            context_menu::ContextMenuAction::RunCommand(parameter)
+        }
+        SmartSelectionActionKind::RunCoprocess => {
+            context_menu::ContextMenuAction::RunCoprocess(parameter)
+        }
+        SmartSelectionActionKind::SendText => context_menu::ContextMenuAction::SendText(parameter),
+        SmartSelectionActionKind::RunCommandInWindow => {
+            context_menu::ContextMenuAction::RunCommandInWindow(parameter)
+        }
+        SmartSelectionActionKind::Copy => context_menu::ContextMenuAction::CopyText(parameter),
+    }
+}
+
+fn smart_selection_menu_item(
+    action: smart_selection::ResolvedSmartSelectionAction,
+) -> Option<context_menu::MenuItem> {
+    if action.parameter.is_empty() {
+        return None;
+    }
+    Some(context_menu::MenuItem {
+        label: action.label,
+        action: smart_selection_context_action(action.kind, action.parameter),
+        enabled: true,
+    })
+}
+
+fn shell_command_binary() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"))
+}
+
+fn shell_command_argv(command: &str) -> Vec<String> {
+    vec![shell_command_binary(), String::from("-lc"), command.to_owned()]
 }
 
 fn shift_tab_selection_for_pane(
@@ -643,6 +696,8 @@ struct App {
     mouse_selecting: bool,
     /// Click state for single/double/triple click classification.
     mouse_click: mouse_state::MouseClickState,
+    /// Compiled Smart Selection rules from the current global config.
+    smart_selection: smart_selection::CompiledSmartSelection,
     /// Word bounds from the initial double-click (for drag-by-word).
     word_drag_anchor: Option<(selection::SelectionPoint, selection::SelectionPoint)>,
     /// Line bounds from the initial triple-click (for drag-by-line).
@@ -864,6 +919,8 @@ impl App {
         let theme = resolve_theme(&config);
         let window_layout = WindowLayout::new(WorkspaceId::new(), Some(theme.chrome.accent));
         let bindings = input::Bindings::parse(&config.keybindings);
+        let smart_selection =
+            smart_selection::CompiledSmartSelection::compile(&config.terminal.smart_selection);
 
         Self {
             window_id: None,
@@ -872,7 +929,7 @@ impl App {
             panes: HashMap::new(), session_to_pane: HashMap::new(), pending_sessions: VecDeque::new(),
             divider_drag: None, workspace_divider_drag: None, scrollbar_drag_pane: None,
             active_selection: None, mouse_selecting: false, mouse_click: mouse_state::MouseClickState::new(),
-            word_drag_anchor: None, line_drag_anchor: None,
+            smart_selection, word_drag_anchor: None, line_drag_anchor: None,
             connection: AppConnectionState { server_connected: false, quit_restore_cleared: false },
             pending_shutdown: None, restore_store: restore_state::RestoreStore::new(), restore_save_pending: None,
             ai_tracker: AiStateTracker::new(AiStateStylesConfig::default()),
@@ -927,6 +984,7 @@ impl App {
         self.sys_stats = startup.sys_stats;
         self.config_watcher_keepalive = startup.config_watcher;
         let _ = self.config_watcher_keepalive.as_ref();
+        self.rebuild_smart_selection_from_config();
     }
 }
 
@@ -3491,8 +3549,31 @@ impl App {
         self.bindings = input::Bindings::parse(&new_config.keybindings);
         self.ai_tracker.reconfigure(new_config.terminal.ai_session.ai_states.clone());
         self.notification_tracker.reconfigure(new_config.notifications.clone());
+        if plan.smart_selection_changed() {
+            self.smart_selection = smart_selection::CompiledSmartSelection::compile(
+                &new_config.terminal.smart_selection,
+            );
+            self.log_smart_selection_errors();
+        }
         self.config = new_config;
         self.finish_config_reload(&plan);
+    }
+
+    fn rebuild_smart_selection_from_config(&mut self) {
+        self.smart_selection =
+            smart_selection::CompiledSmartSelection::compile(&self.config.terminal.smart_selection);
+        self.log_smart_selection_errors();
+    }
+
+    fn log_smart_selection_errors(&self) {
+        for error in &self.smart_selection.errors {
+            tracing::warn!(
+                rule_id = error.rule_id,
+                rule_name = error.rule_name,
+                error = error.message,
+                "smart selection rule failed to compile"
+            );
+        }
     }
 
     fn reload_theme_if_needed(&mut self, new_config: &ScribeConfig, theme_changed: bool) {
@@ -6485,8 +6566,9 @@ impl App {
         self.start_selection(x, y);
         match self.mouse_click.record_press(x, y) {
             mouse_state::ClickKind::Single => {}
-            mouse_state::ClickKind::Double => self.start_selection_word(x, y),
+            mouse_state::ClickKind::Double => self.start_double_click_selection(x, y),
             mouse_state::ClickKind::Triple => self.start_selection_line(x, y),
+            mouse_state::ClickKind::Quadruple => self.start_quad_click_selection(x, y),
         }
     }
 
@@ -7249,6 +7331,44 @@ impl App {
         self.request_redraw();
     }
 
+    fn start_double_click_selection(&mut self, x: f32, y: f32) {
+        if self.config.terminal.smart_selection.activation == SmartSelectionActivation::DoubleClick
+            && self.start_selection_smart(x, y)
+        {
+            return;
+        }
+        self.start_selection_word(x, y);
+    }
+
+    fn start_quad_click_selection(&mut self, x: f32, y: f32) {
+        if self.config.terminal.smart_selection.activation == SmartSelectionActivation::QuadClick
+            && self.start_selection_smart(x, y)
+        {
+            return;
+        }
+        self.start_selection_line(x, y);
+    }
+
+    fn start_selection_smart(&mut self, x: f32, y: f32) -> bool {
+        let Some(point) = self.cursor_to_grid(x, y) else { return false };
+        let pane_id = {
+            let Some(tab) = self.window_layout.active_tab() else { return false };
+            tab.focused_pane
+        };
+        let Some(pane) = self.panes.get(&pane_id) else { return false };
+        let Some(candidate) = self.smart_selection.candidate_at(&pane.term, point) else {
+            return false;
+        };
+
+        self.active_selection =
+            Some(selection::SelectionRange::word(candidate.range_start, candidate.range_end));
+        self.word_drag_anchor = Some((candidate.range_start, candidate.range_end));
+        self.line_drag_anchor = None;
+        self.mouse_selecting = true;
+        self.request_redraw();
+        true
+    }
+
     /// Begin a line-granularity selection (triple-click).
     fn start_selection_line(&mut self, x: f32, y: f32) {
         let Some(point) = self.cursor_to_grid(x, y) else { return };
@@ -7548,15 +7668,55 @@ impl App {
                 url_detect::SpanKind::Url => (Some(span.url.clone()), None),
                 url_detect::SpanKind::Path => (None, Some(span.url.clone())),
             });
+        let smart_actions = self.smart_selection_menu_items(x, y);
         self.context_menu =
-            Some(context_menu::ContextMenu::new(x, y, has_selection, url, file_path));
+            Some(context_menu::ContextMenu::new(context_menu::ContextMenuRequest {
+                x,
+                y,
+                has_selection,
+                url,
+                file_path,
+                smart_actions,
+            }));
         self.request_redraw();
+    }
+
+    fn smart_selection_menu_items(&self, x: f32, y: f32) -> Vec<context_menu::MenuItem> {
+        let Some(point) = self.cursor_to_grid(x, y) else {
+            return Vec::new();
+        };
+        let Some(tab) = self.window_layout.active_tab() else {
+            return Vec::new();
+        };
+        let Some(pane) = self.panes.get(&tab.focused_pane) else {
+            return Vec::new();
+        };
+
+        let cwd_display = pane.cwd.as_ref().map(|cwd| cwd.to_string_lossy().into_owned());
+        let user = std::env::var("USER").unwrap_or_else(|_| String::new());
+        let context = smart_selection::ActionExpansionContext {
+            cwd: cwd_display.as_deref(),
+            user: &user,
+            host: &self.hostname,
+        };
+
+        let mut items = Vec::new();
+        for candidate in self.smart_selection.action_candidates_at(&pane.term, point) {
+            items.extend(
+                candidate
+                    .resolved_actions(&context)
+                    .into_iter()
+                    .filter_map(smart_selection_menu_item),
+            );
+        }
+        items
     }
 
     /// Dispatch an action selected from the context menu.
     fn dispatch_context_menu_action(&mut self, action: context_menu::ContextMenuAction) {
         match action {
             context_menu::ContextMenuAction::Copy => self.finalize_copy(),
+            context_menu::ContextMenuAction::CopyText(text) => self.copy_text_to_clipboard(&text),
             context_menu::ContextMenuAction::Paste => self.perform_paste(),
             context_menu::ContextMenuAction::SelectAll => self.select_all(),
             context_menu::ContextMenuAction::OpenUrl(url) => url_detect::open_url(&url),
@@ -7568,8 +7728,43 @@ impl App {
                     .and_then(|p| p.cwd.as_deref());
                 url_detect::open_path(&path, cwd);
             }
+            context_menu::ContextMenuAction::RunCommand(command) => {
+                self.send_paste_data(&format!("{command}\n"));
+            }
+            context_menu::ContextMenuAction::RunCoprocess(command) => {
+                self.spawn_background_shell_command(&command);
+            }
+            context_menu::ContextMenuAction::SendText(text) => {
+                self.send_bytes_to_focused_pane(text.into_bytes());
+            }
+            context_menu::ContextMenuAction::RunCommandInWindow(command) => {
+                self.create_new_tab(Some(shell_command_argv(&command)), None);
+            }
         }
         self.request_redraw();
+    }
+
+    fn copy_text_to_clipboard(&mut self, text: &str) {
+        let Some(cb) = &mut self.clipboard else { return };
+        if let Err(e) = cb.set_text(text.to_owned()) {
+            tracing::warn!("clipboard write failed: {e}");
+        }
+    }
+
+    fn spawn_background_shell_command(&self, command: &str) {
+        let mut child = std::process::Command::new(shell_command_binary());
+        child.arg("-lc").arg(command);
+        if let Some(cwd) = self
+            .window_layout
+            .active_tab()
+            .and_then(|t| self.panes.get(&t.focused_pane))
+            .and_then(|p| p.cwd.as_deref())
+        {
+            child.current_dir(cwd);
+        }
+        if let Err(e) = child.spawn() {
+            tracing::warn!("smart selection command failed to spawn: {e}");
+        }
     }
 
     /// Select all content in the focused pane (viewport + scrollback).
@@ -10461,6 +10656,7 @@ fn hovered_url_at(
     cache.url_at(point.row, point.col).map(|span| url_detect::UrlSpan {
         row: span.row,
         col_start: span.col_start,
+        row_end: span.row_end,
         col_end: span.col_end,
         url: span.url.clone(),
         kind: span.kind,
@@ -10471,7 +10667,14 @@ fn hovered_url_at(
 fn url_span_changed(old: Option<&url_detect::UrlSpan>, new: Option<&url_detect::UrlSpan>) -> bool {
     match (old, new) {
         (None, None) => false,
-        (Some(prev), Some(next)) => prev.row != next.row || prev.col_start != next.col_start,
+        (Some(prev), Some(next)) => {
+            prev.row != next.row
+                || prev.col_start != next.col_start
+                || prev.row_end != next.row_end
+                || prev.col_end != next.col_end
+                || prev.url != next.url
+                || std::mem::discriminant(&prev.kind) != std::mem::discriminant(&next.kind)
+        }
         _ => true,
     }
 }
@@ -10555,6 +10758,7 @@ fn apply_url_underlines(
     let Some(span) = cache.visible_spans().iter().find(|span| {
         span.row == hovered_url.row
             && span.col_start == hovered_url.col_start
+            && span.row_end == hovered_url.row_end
             && span.col_end == hovered_url.col_end
             && span.url == hovered_url.url
             && std::mem::discriminant(&span.kind) == std::mem::discriminant(&hovered_url.kind)
@@ -10562,26 +10766,40 @@ fn apply_url_underlines(
         return;
     };
 
-    // Convert absolute row to screen row.
-    let screen_row = span.row + display_offset;
-    if screen_row < 0 || span.col_start > span.col_end {
-        return;
-    }
-    let Some(screen_row_f) = nonnegative_i32_to_f32(screen_row) else { return };
-    let y_top = offset.1 + screen_row_f * cell_h + cell_h - ul_h;
-    let span_cols = usize_to_f32(span.col_end - span.col_start + 1);
-    let col_x = usize_to_f32(span.col_start);
-    let x = offset.0 + col_x * cell_w;
+    let last_col = pane.term.grid().columns().saturating_sub(1);
+    let mut row = span.row;
+    while row <= span.row_end {
+        let screen_row = row + display_offset;
+        if screen_row < 0 {
+            row = row.saturating_add(1);
+            continue;
+        }
+        let col_start = if row == span.row { span.col_start } else { 0 };
+        let col_end = if row == span.row_end { span.col_end } else { last_col };
+        if col_start > col_end {
+            row = row.saturating_add(1);
+            continue;
+        }
+        let Some(screen_row_f) = nonnegative_i32_to_f32(screen_row) else {
+            row = row.saturating_add(1);
+            continue;
+        };
+        let y_top = offset.1 + screen_row_f * cell_h + cell_h - ul_h;
+        let span_cols = usize_to_f32(col_end - col_start + 1);
+        let col_x = usize_to_f32(col_start);
+        let x = offset.0 + col_x * cell_w;
 
-    instances.push(scribe_renderer::types::CellInstance {
-        pos: [x, y_top],
-        size: [span_cols * cell_w, ul_h],
-        uv_min: [0.0, 0.0],
-        uv_max: [0.0, 0.0],
-        fg_color: URL_UNDERLINE_ACTIVE_COLOR,
-        bg_color: URL_UNDERLINE_ACTIVE_COLOR,
-        corner_radius: 0.0,
-    });
+        instances.push(scribe_renderer::types::CellInstance {
+            pos: [x, y_top],
+            size: [span_cols * cell_w, ul_h],
+            uv_min: [0.0, 0.0],
+            uv_max: [0.0, 0.0],
+            fg_color: URL_UNDERLINE_ACTIVE_COLOR,
+            bg_color: URL_UNDERLINE_ACTIVE_COLOR,
+            corner_radius: 0.0,
+        });
+        row = row.saturating_add(1);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -7,8 +7,9 @@ use alacritty_terminal::Term;
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::Flags;
 
-use crate::selection::read_cell_char;
+use crate::selection::{read_cell_char, read_cell_flags};
 
 /// Whether a detected span is a URL or a file-system path.
 #[derive(Clone, Copy)]
@@ -25,6 +26,8 @@ pub struct UrlSpan {
     pub row: i32,
     /// Column of the first character of the URL (inclusive).
     pub col_start: usize,
+    /// Absolute grid row containing the last character of the URL.
+    pub row_end: i32,
     /// Column of the last character of the URL (inclusive).
     pub col_end: usize,
     /// The URL or path text.
@@ -66,7 +69,7 @@ impl PaneUrlCache {
 
     /// Return the `UrlSpan` whose column range contains `col` on `row`, if any.
     pub fn url_at(&self, row: i32, col: usize) -> Option<&UrlSpan> {
-        self.spans.iter().find(|s| s.row == row && col >= s.col_start && col <= s.col_end)
+        self.spans.iter().find(|span| span.contains_cell(row, col))
     }
 
     /// All detected URL spans for the current viewport.
@@ -75,8 +78,31 @@ impl PaneUrlCache {
     }
 }
 
+impl UrlSpan {
+    fn contains_cell(&self, row: i32, col: usize) -> bool {
+        if row < self.row || row > self.row_end {
+            return false;
+        }
+
+        if self.row == self.row_end {
+            return col >= self.col_start && col <= self.col_end;
+        }
+
+        if row == self.row {
+            return col >= self.col_start;
+        }
+
+        if row == self.row_end {
+            return col <= self.col_end;
+        }
+
+        true
+    }
+}
+
 /// URL schemes recognised by the scanner.
-const PREFIXES: &[&str] = &["https://", "http://", "ftp://", "file://"];
+const PREFIXES: &[&str] =
+    &["https://", "http://", "ftp://", "file://", "mailto:", "ssh:", "telnet:"];
 
 /// Characters that terminate a URL when encountered (in addition to whitespace).
 const URL_TERMINATORS: &[char] = &['<', '>', '"', '\'', '|'];
@@ -97,6 +123,13 @@ fn grid_index_i32(index: usize) -> i32 {
     i32::try_from(index).unwrap_or(i32::MAX)
 }
 
+#[derive(Clone, Copy)]
+struct LogicalCell {
+    ch: char,
+    row: i32,
+    col: usize,
+}
+
 /// Scan all visible rows of `term` for URLs and return their spans.
 ///
 /// Row indices in the returned spans are **absolute grid lines**: screen row
@@ -107,53 +140,71 @@ fn scan_visible_urls(term: &Term<VoidListener>) -> Vec<UrlSpan> {
     let display_offset = term.grid().display_offset();
 
     let mut spans = Vec::new();
+    if rows == 0 || cols == 0 {
+        return spans;
+    }
 
     let mut screen_row: usize = 0;
     while screen_row < rows {
-        let row_abs = grid_index_i32(screen_row).saturating_sub(grid_index_i32(display_offset));
-        let line = Line(row_abs);
+        let logical_line =
+            collect_wrapped_logical_line(term, screen_row, rows, cols, display_offset);
+        let url_ranges = scan_logical_urls(&logical_line, &mut spans);
+        scan_logical_paths(&logical_line, &url_ranges, &mut spans);
 
-        // Build the row text; each cell contributes exactly one char.
-        let mut row_text = String::with_capacity(cols);
-        let mut col_idx = 0usize;
-        while col_idx < cols {
-            let c = read_cell_char(term, line, Column(col_idx));
-            row_text.push(c);
-            col_idx = col_idx.saturating_add(1);
-        }
-
-        let url_count_before = spans.len();
-        scan_row_urls(&row_text, cols, row_abs, &mut spans);
-        // Collect the URL spans just added into a temporary vec so the path
-        // scanner can reference them without holding an immutable borrow on
-        // `spans` while we also push into it.
-        let row_url_spans: Vec<(usize, usize)> = spans
-            .get(url_count_before..)
-            .unwrap_or(&[])
-            .iter()
-            .map(|s| (s.col_start, s.col_end))
-            .collect();
-        let chars: Vec<char> = row_text.chars().collect();
-        scan_row_paths(&chars, cols, row_abs, &row_url_spans, &mut spans);
-
-        screen_row = screen_row.saturating_add(1);
+        screen_row = logical_line.last().map_or(screen_row.saturating_add(1), |cell| {
+            let row_with_offset = cell.row.saturating_add(grid_index_i32(display_offset)).max(0);
+            usize::try_from(row_with_offset).unwrap_or(usize::MAX).saturating_add(1)
+        });
     }
 
     spans
 }
 
-/// Scan a single row's text for URLs and push found spans into `out`.
+fn collect_wrapped_logical_line(
+    term: &Term<VoidListener>,
+    start_screen_row: usize,
+    rows: usize,
+    cols: usize,
+    display_offset: usize,
+) -> Vec<LogicalCell> {
+    let mut cells = Vec::new();
+    let display_offset_i32 = grid_index_i32(display_offset);
+    let last_col = Column(cols.saturating_sub(1));
+
+    let mut screen_row = start_screen_row;
+    while screen_row < rows {
+        let row_abs = grid_index_i32(screen_row).saturating_sub(display_offset_i32);
+        let line = Line(row_abs);
+
+        let mut col_idx = 0usize;
+        while col_idx < cols {
+            cells.push(LogicalCell {
+                ch: read_cell_char(term, line, Column(col_idx)),
+                row: row_abs,
+                col: col_idx,
+            });
+            col_idx = col_idx.saturating_add(1);
+        }
+
+        if !read_cell_flags(term, line, last_col).contains(Flags::WRAPLINE) {
+            break;
+        }
+        screen_row = screen_row.saturating_add(1);
+    }
+
+    cells
+}
+
+/// Scan a logical line's text for URLs and push found spans into `out`.
 ///
-/// `row_text` contains exactly one `char` per terminal column (as built by
-/// `scan_visible_urls`).  We therefore work exclusively with char indices so
-/// that multi-byte characters (emoji, CJK, box-drawing) never cause a slice
-/// at a non-char-boundary.
-fn scan_row_urls(row_text: &str, cols: usize, row_abs: i32, out: &mut Vec<UrlSpan>) {
-    // Collect into a Vec<char> so we can use char-level indexing without any
-    // byte-offset arithmetic.
-    let chars: Vec<char> = row_text.chars().collect();
+/// `cells` contains exactly one `char` per terminal column, joined across
+/// WRAPLINE-connected rows. We work with char indices so multi-byte characters
+/// never cause a slice at a non-char-boundary.
+fn scan_logical_urls(cells: &[LogicalCell], out: &mut Vec<UrlSpan>) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = cells.iter().map(|cell| cell.ch).collect();
     let char_count = chars.len();
     let mut char_pos = 0usize;
+    let mut ranges = Vec::new();
 
     while char_pos < char_count {
         let Some(prefix_len_chars) = match_prefix_chars(&chars, char_pos) else {
@@ -168,19 +219,30 @@ fn scan_row_urls(row_text: &str, cols: usize, row_abs: i32, out: &mut Vec<UrlSpa
         let url_char_len = url.chars().count();
         let url_col_end = url_col_start + url_char_len;
 
-        if url_char_len > prefix_len_chars && url_col_end <= cols {
-            let col_end = url_col_end.saturating_sub(1);
+        if url_char_len > prefix_len_chars && url_col_end <= char_count {
+            let Some(start) = cells.get(url_col_start) else {
+                char_pos = char_pos.saturating_add(1);
+                continue;
+            };
+            let Some(end) = cells.get(url_col_end.saturating_sub(1)) else {
+                char_pos = char_pos.saturating_add(1);
+                continue;
+            };
             out.push(UrlSpan {
-                row: row_abs,
-                col_start: url_col_start,
-                col_end,
+                row: start.row,
+                col_start: start.col,
+                row_end: end.row,
+                col_end: end.col,
                 url,
                 kind: SpanKind::Url,
             });
+            ranges.push((url_col_start, url_col_end.saturating_sub(1)));
         }
 
         char_pos = url_col_end.max(char_pos.saturating_add(1));
     }
+
+    ranges
 }
 
 /// Match a URL prefix starting at `chars[pos]`, returning the prefix length in
@@ -239,18 +301,17 @@ fn strip_trailing_punct(mut url: String) -> String {
 /// Maximum lookahead for bare relative path detection (e.g. `src/main.rs`).
 const BARE_PATH_LOOKAHEAD: usize = 30;
 
-/// Scan a single row for file-system paths and push found spans into `out`.
+/// Scan a logical line for file-system paths and push found spans into `out`.
 ///
 /// `url_ranges` contains `(col_start, col_end)` pairs for URL spans already
-/// detected on this row; any character position that falls inside one of them
-/// is skipped to avoid overlaps.
-fn scan_row_paths(
-    chars: &[char],
-    cols: usize,
-    row_abs: i32,
+/// detected on this logical line; any character position that falls inside
+/// one of them is skipped to avoid overlaps.
+fn scan_logical_paths(
+    cells: &[LogicalCell],
     url_ranges: &[(usize, usize)],
     out: &mut Vec<UrlSpan>,
 ) {
+    let chars: Vec<char> = cells.iter().map(|cell| cell.ch).collect();
     let char_count = chars.len();
     let mut char_pos = 0usize;
 
@@ -262,14 +323,14 @@ fn scan_row_paths(
         }
 
         // Try to match a path prefix at this position.
-        let Some((prefix_len, is_bare_relative)) = detect_path_prefix(chars, char_pos) else {
+        let Some((prefix_len, is_bare_relative)) = detect_path_prefix(&chars, char_pos) else {
             char_pos = char_pos.saturating_add(1);
             continue;
         };
 
         let path_col_start = char_pos;
         let body_start = char_pos + prefix_len;
-        let raw_end = collect_url_end_chars(chars, body_start);
+        let raw_end = collect_url_end_chars(&chars, body_start);
 
         let raw: String = chars.get(path_col_start..raw_end).unwrap_or(&[]).iter().collect();
         let path = strip_trailing_punct(raw);
@@ -280,15 +341,23 @@ fn scan_row_paths(
         let valid = if is_bare_relative {
             path.contains('/') && path_char_len > prefix_len
         } else {
-            path_char_len > prefix_len && path_col_end_exclusive <= cols
+            path_char_len > prefix_len && path_col_end_exclusive <= char_count
         };
 
-        if valid && path_col_end_exclusive <= cols {
-            let col_end = path_col_end_exclusive.saturating_sub(1);
+        if valid && path_col_end_exclusive <= char_count {
+            let Some(start) = cells.get(path_col_start) else {
+                char_pos = char_pos.saturating_add(1);
+                continue;
+            };
+            let Some(end) = cells.get(path_col_end_exclusive.saturating_sub(1)) else {
+                char_pos = char_pos.saturating_add(1);
+                continue;
+            };
             out.push(UrlSpan {
-                row: row_abs,
-                col_start: path_col_start,
-                col_end,
+                row: start.row,
+                col_start: start.col,
+                row_end: end.row,
+                col_end: end.col,
                 url: path,
                 kind: SpanKind::Path,
             });
@@ -432,11 +501,11 @@ fn parse_path_line_suffix(raw: &str) -> (&str, Option<u32>) {
 
 /// Open a URL in the system default browser.
 ///
-/// Only `http://`, `https://`, `ftp://`, and `file://` URLs are accepted.
+/// Only URL schemes that Scribe recognizes in terminal text are accepted.
 /// The child process is spawned and not awaited (fire-and-forget).
 pub fn open_url(url: &str) {
     if !PREFIXES.iter().any(|p| url.starts_with(p)) {
-        tracing::warn!("open_url: refusing to open non-http(s)/ftp/file URL");
+        tracing::warn!("open_url: refusing to open unsupported URL scheme");
         return;
     }
 

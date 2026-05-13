@@ -185,9 +185,9 @@ The command palette is a GPU-rendered action picker for common window actions, p
 
 Mouse events are processed for text selection, scrollbar interaction, divider drag, tab drag, prompt bar interactions, and context menus.
 
-Selection modes are click-drag for cell, double-click for word, triple-click for line. Scrollbar supports click-to-jump and drag-to-scroll. Divider drag resizes splits with 4px hit tolerance. Tab drag reorders with visual offset.
+Selection modes are click-drag for cell, double-click for word or configured Smart Selection, triple-click for line, and quad-click for Smart Selection when configured that way. Scrollbar supports click-to-jump and drag-to-scroll. Divider drag resizes splits with 4px hit tolerance. Tab drag reorders with visual offset.
 
-Click sequencing is tracked by [[crates/scribe-client/src/mouse_state.rs#MouseClickState]], which records each press time and position to classify the event as [[crates/scribe-client/src/mouse_state.rs#ClickKind]] (Single, Double, or Triple). Multi-click is recognized when a press arrives within 400 ms and 5 px of the previous one. The derived [[crates/scribe-client/src/mouse_state.rs#SelectionMode]] (Cell, Word, or Line) follows directly from the click kind. Auto-scrolling during drag is triggered by `edge_scroll_delta` when the cursor enters the 20 px edge zone at the top or bottom of the content area.
+Click sequencing is tracked by [[crates/scribe-client/src/mouse_state.rs#MouseClickState]], which records each press time and position to classify the event as [[crates/scribe-client/src/mouse_state.rs#ClickKind]] (Single, Double, Triple, or Quadruple). Multi-click is recognized when a press arrives within 400 ms and 5 px of the previous one. The derived [[crates/scribe-client/src/mouse_state.rs#SelectionMode]] (Cell, Word, or Line) follows directly from the click kind. Auto-scrolling during drag is triggered by `edge_scroll_delta` when the cursor enters the 20 px edge zone at the top or bottom of the content area.
 
 OSC 133 `click_events=1` prompt click-to-move is evaluated on mouse release through [[crates/scribe-client/src/main.rs#prompt_click_to_move_displacement]], only when the press/release left an empty selection. Dragging the live prompt row therefore keeps normal text selection, while a plain click can still send arrow-key movement.
 
@@ -232,6 +232,16 @@ On Linux, the client starts the server via `systemctl --user start scribe-server
 Text selection in [[crates/scribe-client/src/selection.rs]] supports three modes: Cell, Word, and Line. Coordinates are absolute grid positions.
 
 Cell selects individual characters. Word boundaries include alphanumeric, underscore, dash, dot, slash, tilde, at, plus, percent, hash, question, ampersand, and equals, and double-click word scans cross WRAPLINE-connected rows so soft-wrapped paths or commands stay contiguous. Line mode follows WRAPLINE flags for logical lines. [[crates/scribe-client/src/selection.rs#pixel_to_grid]] converts mouse pixel coordinates to grid positions, subtracting tab bar height, prompt bar height (position-aware), and content padding before dividing by cell size. During an active drag, [[crates/scribe-client/src/selection.rs#pixel_to_grid_clamped]] clamps points that stray into prompt-bar chrome or outside the pane back to the nearest visible terminal cell so the last visible row still highlights.
+
+### Smart Selection
+
+Smart Selection extends click selection with configurable semantic regex matching over the visible wrapped logical line.
+
+[[crates/scribe-client/src/smart_selection.rs]] compiles the global `terminal.smart_selection` rules and maps regex byte ranges back to terminal grid cells. A candidate must contain the clicked cell. For each rule, the longest containing match is kept; the final selected candidate comes from the highest precision class with any match, then the longest match in that class. [[crates/scribe-client/src/main.rs#App#start_selection_smart]] reuses normal `SelectionRange` highlighting and copy-on-select behavior.
+
+The default activation is quad-click, preserving double-click word and triple-click line selection. When activation is set to double-click, Smart Selection replaces ordinary double-click word selection and falls back to word selection only when no rule matches. Shift still bypasses mouse-reporting applications before local selection starts.
+
+Right-click context menus run Smart Selection at the pointer. Matching rules with actions add explicit menu items; selection alone never executes them. Action parameters support iTerm2-style legacy substitutions (`\0`, `\1`-`\9`, `\d`, `\u`, `\h`, `\n`, and `\\`) and interpolated strings such as `\(matches[0])`, `\(path)`, `\(user)`, and `\(host)`.
 
 ### Scroll Adjustment
 
@@ -384,11 +394,11 @@ Right-click overlay with Copy (if selection active), Paste, Select All, Open URL
 
 ## URL Detection
 
-The [[crates/scribe-client/src/url_detect.rs#PaneUrlCache]] scans visible terminal rows for URLs (https, http, ftp, file protocols) and file-system paths.
+The [[crates/scribe-client/src/url_detect.rs#PaneUrlCache]] scans visible terminal content for URLs (https, http, ftp, file, mailto, ssh, and telnet schemes) and file-system paths.
 
-Trailing punctuation is stripped respecting bracket pairs. Detected spans are cached and invalidated on content change. Each span carries a `SpanKind` (`Url` or `Path`).
+Soft-wrapped rows are joined by `WRAPLINE` before scanning so a link split across terminal rows remains one clickable span. Trailing punctuation is stripped respecting bracket pairs. Detected spans are cached and invalidated on content change. Each span carries a `SpanKind` (`Url` or `Path`).
 
-URL highlighting and the pointer cursor are only shown while the Ctrl modifier is held. The `ModifiersChanged` handler triggers a redraw and cursor update so visual feedback is immediate. Only the clickable span under the cursor is underlined, which keeps the rest of the viewport unchanged until the user targets a specific link or path. Ctrl+click opens the span via `xdg-open` on Linux or `open` on macOS. File paths support an optional `:N` line-number suffix; when present, `code --goto path:N` is tried first and `xdg-open` is the fallback. Relative paths are resolved against the pane's OSC 7 CWD, and `~/` is expanded using `$HOME`.
+URL highlighting and the pointer cursor are only shown while the Ctrl modifier is held. The `ModifiersChanged` handler triggers a redraw and cursor update so visual feedback is immediate. Only the clickable span under the cursor is underlined; wrapped spans draw one underline segment per row. Ctrl+click opens the span via `xdg-open` on Linux or `open` on macOS. File paths support an optional `:N` line-number suffix; when present, `code --goto path:N` is tried first and `xdg-open` is the fallback. Relative paths are resolved against the pane's OSC 7 CWD, and `~/` is expanded using `$HOME`.
 
 ## Clipboard Cleanup
 

@@ -19,6 +19,16 @@ pub enum ContextMenuAction {
     OpenUrl(String),
     /// Open the given file path.
     OpenFile(String),
+    /// Run a shell command from a smart-selection action.
+    RunCommand(String),
+    /// Start a background coprocess command from a smart-selection action.
+    RunCoprocess(String),
+    /// Send text to the focused pane as typed input.
+    SendText(String),
+    /// Run a shell command in a newly created terminal tab.
+    RunCommandInWindow(String),
+    /// Copy specific text to the clipboard.
+    CopyText(String),
 }
 
 /// A single item in the context menu.
@@ -50,6 +60,15 @@ pub struct ContextMenuBuildContext<'a> {
     pub resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
 }
 
+pub struct ContextMenuRequest {
+    pub x: f32,
+    pub y: f32,
+    pub has_selection: bool,
+    pub url: Option<String>,
+    pub file_path: Option<String>,
+    pub smart_actions: Vec<MenuItem>,
+}
+
 fn menu_grid_units(units: usize) -> u16 {
     u16::try_from(units).unwrap_or(u16::MAX)
 }
@@ -76,13 +95,8 @@ impl ContextMenu {
     /// Items are populated based on the current state: `has_selection`
     /// enables Copy, `url` appends an "Open URL" item when present, and
     /// `file_path` appends an "Open File" item when present.
-    pub fn new(
-        x: f32,
-        y: f32,
-        has_selection: bool,
-        url: Option<String>,
-        file_path: Option<String>,
-    ) -> Self {
+    pub fn new(request: ContextMenuRequest) -> Self {
+        let ContextMenuRequest { x, y, has_selection, url, file_path, smart_actions } = request;
         let mut items = vec![
             MenuItem {
                 label: String::from("Copy"),
@@ -116,6 +130,8 @@ impl ContextMenu {
                 enabled: true,
             });
         }
+
+        items.extend(smart_actions);
 
         let item_count = items.len();
         let zero_rect = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
@@ -203,7 +219,13 @@ impl MenuRenderer<'_> {
         for (idx, item) in menu.items.iter().enumerate() {
             let is_open_item = matches!(
                 item.action,
-                ContextMenuAction::OpenUrl(_) | ContextMenuAction::OpenFile(_)
+                ContextMenuAction::OpenUrl(_)
+                    | ContextMenuAction::OpenFile(_)
+                    | ContextMenuAction::RunCommand(_)
+                    | ContextMenuAction::RunCoprocess(_)
+                    | ContextMenuAction::SendText(_)
+                    | ContextMenuAction::RunCommandInWindow(_)
+                    | ContextMenuAction::CopyText(_)
             );
             if is_open_item && self.layout.has_open_item {
                 let sep_y = menu_grid_y(self.layout.menu_rect.y, row, cell_h) + cell_h / 2.0;

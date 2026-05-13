@@ -17,6 +17,7 @@ serde_json.workspace = true
 rmp-serde.workspace = true
 rust-embed.workspace = true
 tracing.workspace = true
+regex.workspace = true
 fontdb = "0.23"
 toml.workspace = true
 nix.workspace = true

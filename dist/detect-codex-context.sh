@@ -2,8 +2,8 @@
 #
 # Scribe — Codex context % producer (PostToolUse / Stop hook)
 #
-# Reads the tail of the most recent rollout JSONL under ~/.codex/sessions/,
-# finds the newest event_msg/token_count record, computes context %, and
+# Reads Codex's hook `transcript_path`, extracts the latest
+# event_msg/token_count record from that rollout JSONL, computes context %, and
 # emits OSC 1337 CodexContext=NN to /dev/tty. The OSC carries no state —
 # Codex's state transitions are owned by detect-codex-question.sh /
 # codex-task-label.sh / setup-codex-hooks.sh emitters; this producer only
@@ -12,29 +12,52 @@
 #
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=dist/codex-hook-common.sh
+. "${SCRIPT_DIR}/codex-hook-common.sh"
+
 # Drain stdin — Codex requires it. Capture to env-var so Python heredoc can
 # own /dev/stdin if it needs to.
-PAYLOAD="$(cat || true)"
+PAYLOAD="$(scribe_codex_read_payload)"
+if ! scribe_codex_owner_allows_payload "$PAYLOAD" 0; then
+    exit 0
+fi
 export PAYLOAD
 
 PAYLOAD="$PAYLOAD" python3 - <<'PY' || exit 0
-import datetime, glob, json, os, sys
-
-# Fallback window — used only when model_context_window is absent or
-# non-positive in the rollout record.  The rollout's own field is authoritative.
-DEFAULT_WINDOW = 200_000
+import json, os, sys
 
 home = os.path.expanduser("~")
-# C1: prefer today's UTC date dir for O(today) scan; fall back to full recursive glob
-today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y/%m/%d")
-fast_pattern = os.path.join(home, ".codex", "sessions", today, "*.jsonl")
-files = sorted(glob.glob(fast_pattern), key=os.path.getmtime)
-if not files:
-    fallback_pattern = os.path.join(home, ".codex", "sessions", "**", "*.jsonl")
-    files = sorted(glob.glob(fallback_pattern, recursive=True), key=os.path.getmtime)
-if not files:
+sessions_root = os.path.join(home, ".codex", "sessions")
+
+try:
+    hook_payload = json.loads(os.environ.get("PAYLOAD", "") or "{}")
+except (json.JSONDecodeError, ValueError):
     sys.exit(0)
-latest = files[-1]
+if not isinstance(hook_payload, dict):
+    sys.exit(0)
+
+transcript_path = hook_payload.get("transcript_path")
+if not isinstance(transcript_path, str) or not transcript_path:
+    sys.exit(0)
+
+
+def safe_transcript_path(path):
+    candidate = os.path.abspath(os.path.expanduser(path))
+    try:
+        root_real = os.path.realpath(sessions_root)
+        candidate_real = os.path.realpath(candidate)
+        if os.path.commonpath([root_real, candidate_real]) != root_real:
+            return None
+        if not candidate_real.endswith(".jsonl") or not os.path.isfile(candidate_real):
+            return None
+        return candidate_real
+    except (OSError, ValueError):
+        return None
+
+latest = safe_transcript_path(transcript_path)
+if latest is None:
+    sys.exit(0)
 
 total = 0
 window = 0
@@ -64,18 +87,9 @@ try:
         info = payload.get("info")
         if not isinstance(info, dict):
             continue
-        # C3: prefer model_context_window from the record itself
         mw = info.get("model_context_window")
         if isinstance(mw, int) and mw > 0:
             window = mw
-        # C2: read total_token_usage.total_tokens (running cumulative sum)
-        ttu = info.get("total_token_usage")
-        if isinstance(ttu, dict):
-            t = ttu.get("total_tokens")
-            if isinstance(t, int) and t > 0:
-                total = t
-                break
-        # fallback: last_token_usage.total_tokens
         ltu = info.get("last_token_usage")
         if isinstance(ltu, dict):
             t = ltu.get("total_tokens")
@@ -85,12 +99,8 @@ try:
 except OSError:
     sys.exit(0)
 
-if total <= 0:
+if total <= 0 or window <= 0:
     sys.exit(0)
-
-# C3: if window not found in record, fall back to default
-if window <= 0:
-    window = DEFAULT_WINDOW
 
 pct = max(0, min(100, round(100 * total / window)))
 try:

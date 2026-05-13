@@ -299,6 +299,9 @@ fn apply_terminal_key(
         | "terminal.prompt_bar_font_size"
         | "terminal.prompt_bar_position"
         | "terminal.indicator_height" => apply_terminal_prompt_key(config, key, value),
+        "terminal.smart_selection" | "terminal.smart_selection.reset" => {
+            apply_terminal_smart_selection_key(config, key, value)
+        }
         "terminal.status_bar_stats.cpu"
         | "terminal.status_bar_stats.memory"
         | "terminal.status_bar_stats.gpu"
@@ -385,6 +388,45 @@ fn apply_terminal_prompt_key(
         _ => return Err(format!("unhandled terminal prompt key: {key}")),
     }
 
+    Ok(())
+}
+
+fn apply_terminal_smart_selection_key(
+    config: &mut scribe_common::config::ScribeConfig,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match key {
+        "terminal.smart_selection" => {
+            let smart_selection: scribe_common::config::SmartSelectionConfig =
+                serde_json::from_value(value.clone())
+                    .map_err(|e| format!("invalid smart_selection payload: {e}"))?;
+            validate_smart_selection_config(&smart_selection)?;
+            config.terminal.smart_selection = smart_selection;
+        }
+        "terminal.smart_selection.reset" => {
+            config.terminal.smart_selection =
+                scribe_common::config::SmartSelectionConfig::default();
+        }
+        _ => return Err(format!("unhandled terminal smart selection key: {key}")),
+    }
+
+    Ok(())
+}
+
+fn validate_smart_selection_config(
+    config: &scribe_common::config::SmartSelectionConfig,
+) -> Result<(), String> {
+    for (idx, rule) in config.rules.iter().enumerate() {
+        if !rule.enabled {
+            continue;
+        }
+        if rule.regex.trim().is_empty() {
+            return Err(format!("smart selection rule {} has an empty regex", idx + 1));
+        }
+        regex::Regex::new(&rule.regex)
+            .map_err(|e| format!("smart selection rule {} regex is invalid: {e}", idx + 1))?;
+    }
     Ok(())
 }
 
