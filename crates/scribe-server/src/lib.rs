@@ -8,10 +8,12 @@
 pub mod attach_flow;
 pub mod config;
 pub mod handoff;
+pub mod hook_ingress;
 pub mod ipc_server;
 pub mod macos_proc;
 pub mod releases;
 pub mod session_manager;
 pub mod shell_integration;
+pub mod stop_classifier;
 pub mod updater;
 pub mod workspace_manager;

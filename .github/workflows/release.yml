@@ -38,6 +38,9 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          cache-bin: "false"
 
       - name: Inject version
         env:
@@ -74,6 +77,7 @@ jobs:
           cp target/${{ matrix.target }}/release/scribe-client   target/release/
           cp target/${{ matrix.target }}/release/scribe-server   target/release/
           cp target/${{ matrix.target }}/release/scribe-settings target/release/
+          cp target/${{ matrix.target }}/release/scribe-hook-helper target/release/
 
       - name: Build DMG
         if: matrix.os == 'macos'

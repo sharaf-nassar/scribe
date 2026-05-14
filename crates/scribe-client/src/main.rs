@@ -2911,6 +2911,11 @@ impl App {
             self.maybe_reset_prompts_on_conversation_change(session_id, new_conv_id);
         }
 
+        // Freeze the prompt-bar timer the moment the LLM transitions out of
+        // `Processing`, so the displayed elapsed value reflects response
+        // duration rather than wall-clock time since the prompt.
+        self.update_prompt_timer_freeze(session_id, &ai_state.state);
+
         let provider_enabled = self.config.terminal.ai_provider_enabled(ai_state.provider);
         tracing::debug!(
             session = %session_id,
@@ -2970,13 +2975,14 @@ impl App {
 
         if let Some(tx) = &self.notification_tx {
             let cfg = self.notification_tracker.config();
-            let req = notification_dispatcher::NotifReq::Show(notification_dispatcher::ShowReq {
-                session_id,
-                summary,
-                body,
-                timeout_mode: cfg.timeout_mode,
-                timeout_secs: cfg.timeout_secs,
-            });
+            let req =
+                notification_dispatcher::NotifReq::Show(notification_dispatcher::ShowReq::new(
+                    session_id,
+                    summary,
+                    body,
+                    cfg.timeout_mode,
+                    cfg.timeout_secs,
+                ));
             if tx.send(req).is_err() {
                 tracing::debug!("notification dispatcher closed");
             }
@@ -3003,7 +3009,7 @@ impl App {
     /// through `notify-rust`.
     fn close_pending_notification(&self, session_id: SessionId) {
         if let Some(tx) = &self.notification_tx {
-            drop(tx.send(notification_dispatcher::NotifReq::Close { session_id }));
+            drop(tx.send(notification_dispatcher::NotifReq::close(session_id)));
         }
     }
 
@@ -3261,6 +3267,12 @@ impl App {
                 continue;
             }
             let Some(since) = pane.latest_prompt_at else { continue };
+            // Frozen panes display a static elapsed value — no redraw needed
+            // until state transitions back to Processing (which clears the
+            // freeze and schedules a fresh wake via request_redraw).
+            if pane.latest_prompt_finished_at.is_some() {
+                continue;
+            }
             let elapsed = now_system.duration_since(since).unwrap_or(Duration::ZERO);
             let elapsed_secs = elapsed.as_secs();
             let elapsed_subsec = elapsed.saturating_sub(Duration::from_secs(elapsed_secs));
@@ -3301,6 +3313,9 @@ impl App {
             pane.latest_prompt = Some(text);
         }
         pane.latest_prompt_at = Some(SystemTime::now());
+        // A fresh prompt starts a new timer interval. Drop any freeze
+        // captured for the previous prompt so the bar ticks again.
+        pane.latest_prompt_finished_at = None;
 
         let new_line_count = prompt_bar_line_count(pane.prompt_count);
 
@@ -3326,12 +3341,44 @@ impl App {
         pane.first_prompt = None;
         pane.latest_prompt = None;
         pane.latest_prompt_at = None;
+        pane.latest_prompt_finished_at = None;
         pane.prompt_count = 0;
         pane.last_conversation_id = None;
         pane.prompt_ui.dismissed = false;
 
         if self.config.terminal.prompt_bar.enabled && (had_prompts || was_dismissed) {
             self.resize_after_prompt_bar_height_change();
+        }
+    }
+
+    /// Freeze or unfreeze the prompt-bar timer for a session's pane based
+    /// on the new AI state. Transitioning to `Processing` clears any
+    /// freeze and the timer resumes ticking; transitioning to any other
+    /// state captures the current wall-clock instant so the displayed
+    /// elapsed value reflects the LLM's response duration rather than
+    /// wall time since the prompt. Already-frozen panes keep their
+    /// original freeze instant on repeated non-Processing transitions
+    /// (e.g. `IdlePrompt` → `PermissionPrompt`).
+    fn update_prompt_timer_freeze(
+        &mut self,
+        session_id: SessionId,
+        new_state: &scribe_common::ai_state::AiState,
+    ) {
+        use scribe_common::ai_state::AiState;
+        let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
+        let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+        match new_state {
+            AiState::Processing => {
+                pane.latest_prompt_finished_at = None;
+            }
+            AiState::IdlePrompt
+            | AiState::WaitingForInput
+            | AiState::PermissionPrompt
+            | AiState::Error => {
+                if pane.latest_prompt_at.is_some() && pane.latest_prompt_finished_at.is_none() {
+                    pane.latest_prompt_finished_at = Some(SystemTime::now());
+                }
+            }
         }
     }
 
@@ -3355,6 +3402,7 @@ impl App {
             pane.first_prompt = None;
             pane.latest_prompt = None;
             pane.latest_prompt_at = None;
+            pane.latest_prompt_finished_at = None;
             pane.prompt_count = 0;
             pane.prompt_ui.dismissed = false;
             if self.config.terminal.prompt_bar.enabled && (old_lines > 0 || was_dismissed) {
@@ -3392,6 +3440,9 @@ impl App {
                         latest_at: record
                             .latest_prompt_at
                             .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+                        finished_at: record
+                            .latest_prompt_finished_at
+                            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
                         count: record.prompt_count,
                     },
                 );
@@ -3412,6 +3463,7 @@ impl App {
             pane.first_prompt = state.first;
             pane.latest_prompt = state.latest;
             pane.latest_prompt_at = state.latest_at;
+            pane.latest_prompt_finished_at = state.finished_at;
             pane.prompt_count = state.count;
             restored_any = true;
         }
@@ -11102,6 +11154,7 @@ struct SnapshotPromptState {
     first: Option<String>,
     latest: Option<String>,
     latest_at: Option<SystemTime>,
+    finished_at: Option<SystemTime>,
     count: u32,
 }
 

@@ -438,6 +438,9 @@ fn snapshot_launches(layout: &WindowLayout, panes: &HashMap<PaneId, Pane>) -> Ve
                     first_prompt: pane.first_prompt.clone(),
                     latest_prompt: pane.latest_prompt.clone(),
                     latest_prompt_at: pane.latest_prompt_at.and_then(system_time_to_unix_seconds),
+                    latest_prompt_finished_at: pane
+                        .latest_prompt_finished_at
+                        .and_then(system_time_to_unix_seconds),
                     prompt_count: pane.prompt_count,
                 })
             }));

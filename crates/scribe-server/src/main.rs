@@ -13,11 +13,13 @@ use scribe_common::socket::server_socket_path;
 mod attach_flow;
 mod config;
 mod handoff;
+mod hook_ingress;
 mod ipc_server;
 mod macos_proc;
 mod releases;
 mod session_manager;
 mod shell_integration;
+mod stop_classifier;
 mod updater;
 mod workspace_manager;
 

@@ -39,6 +39,7 @@ use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
 
 use crate::handoff::HandoffSession;
+use crate::hook_ingress;
 use crate::releases::{ReleaseCatalog, ReleaseFetcher};
 use crate::session_manager::{
     ManagedSession, SessionLaunchRequest, SessionManager, build_term_config, snapshot_term,
@@ -209,7 +210,9 @@ pub struct LiveSession {
     pub(crate) term:
         Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     child_pid: u32,
-    client_writer: ClientWriter,
+    /// `pub(crate)` so `hook_ingress` can clone the writer when routing
+    /// inbound `HookEvent`s through `send_metadata_event`.
+    pub(crate) client_writer: ClientWriter,
     attachment: SessionAttachment,
     workspace_id: WorkspaceId,
     shell_name: String,
@@ -529,6 +532,13 @@ where
             // window opens a fresh socket, sends `ListReleases`, reads one
             // `ReleaseList` reply, closes. No window registration required.
             handle_transient_list_releases(server, writer).await;
+            None
+        }
+        Ok(ClientMessage::HookEvent(event)) => {
+            // Transient one-shot: scribe-hook-helper sends one HookEvent,
+            // server dispatches, connection closes. No Welcome, no reply.
+            // See specs/003-ai-hook-channel/contracts/wire-protocol.md.
+            hook_ingress::handle(server, event).await;
             None
         }
         Ok(msg) => Some(handle_legacy_client(msg, server, writer, attached_ids).await),
@@ -2612,7 +2622,9 @@ async fn update_live_session(
 /// For `CwdChanged`, also notifies the workspace manager and sends git branch.
 /// Workspace naming always runs (even when detached) so names are ready on
 /// reconnect. Client messages are only sent when attached.
-async fn send_metadata_event(
+///
+/// Exposed publicly so `hook_ingress` can feed the same pipeline.
+pub async fn send_metadata_event(
     event: MetadataEvent,
     session_id: SessionId,
     client_writer: &ClientWriter,
@@ -2628,6 +2640,18 @@ async fn send_metadata_event(
         return;
     }
 
+    // PromptStart from shell integration after the AI tool exits means the
+    // pane is back at a plain shell prompt. `update_ai_provider_state`
+    // already drops the server-side ai_provider on this signal (see the
+    // ai_provider lifecycle comment), but without an accompanying
+    // ServerMessage the client keeps its prompt bar, notification tracker,
+    // and cold-restart launch binding pointing at a dead AI tool. Capture
+    // the transition before persistence so the follow-up emission below
+    // brings the client view in line with the server's interpretation.
+    let synthesize_ai_cleared =
+        matches!(&event, MetadataEvent::PromptMark { kind: PromptMarkKind::PromptStart, .. })
+            && live_sessions.read().await.get(&session_id).is_some_and(|s| s.ai_state.is_some());
+
     let Some((mut server_msg, cwd_for_workspace)) = convert_metadata_event(event, session_id)
     else {
         return;
@@ -2638,6 +2662,12 @@ async fn send_metadata_event(
     persist_session_metadata(&server_msg, session_id, live_sessions).await;
 
     send_to_client(client_writer, &server_msg).await;
+
+    if synthesize_ai_cleared {
+        let clear_msg = ServerMessage::AiStateCleared { session_id };
+        persist_session_metadata(&clear_msg, session_id, live_sessions).await;
+        send_to_client(client_writer, &clear_msg).await;
+    }
 
     if let Some(cwd) = cwd_for_workspace {
         // Send git branch information for the new CWD.

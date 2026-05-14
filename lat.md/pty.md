@@ -24,11 +24,13 @@ The `wrap_raw_fd` function wraps a raw file descriptor received via SCM_RIGHTS i
 
 ## OSC Interceptor
 
-The [[crates/scribe-pty/src/osc_interceptor.rs#OscInterceptor]] is a VTE Perform adapter that runs in parallel with alacritty_terminal's own VTE parser. This parallel execution is necessary because alacritty_terminal ignores custom OSC 1337 extensions (Claude AI state).
+The [[crates/scribe-pty/src/osc_interceptor.rs#OscInterceptor]] is a VTE Perform adapter that runs in parallel with alacritty_terminal's own VTE parser.
+
+This parallel execution is necessary because alacritty_terminal ignores custom OSC 1337 extensions (shell-integration session context and the AI-tool pre-arm sentinel).
 
 ### Intercepted Sequences
 
-OSC 0/2 (window title), OSC 7 (current working directory), OSC 1337 (iTerm2 / ClaudeState / CodexState), and BEL (0x07).
+OSC 0/2 (window title), OSC 7 (current working directory), OSC 1337 (`ScribeContext` shell-integration payload and `ScribeAiLaunch` AI pre-arm sentinel only — AI tool state arrives via the hook channel; see [[server#Hook Channel]]), and BEL (0x07).
 
 ### Passed Through
 
@@ -50,39 +52,13 @@ Parses a `file://` URI from the OSC payload, percent-decodes the path, normalize
 
 Extracts the title string from the second parameter, truncated to 4096 characters. Empty titles are ignored.
 
-### OSC 1337 — AI State
-
-Named provider formats plus a Claude-compatible legacy format are supported.
-
-The primary formats are `ClaudeState=<state>[;key=value...]`, `CodexState=<state>[;key=value...]`, and `AuggieState=<state>[;key=value...]`, where state is one of idle_prompt, processing, waiting_for_input, permission_prompt, or error. Additional fields (tool, agent, model, context, conversation_id) arrive in subsequent semicolon-delimited parameters, each capped at 256 characters. Example with context fill: `ClaudeState=processing;context=73`. A legacy format `AiState=state=<state>;key=val...` is also supported and is treated as Claude for compatibility. The special value `<Provider>State=inactive` emits `AiStateCleared`.
-
-The `context` field is parsed as a `u8` representing 0–100% context-window fill. Producers clamp the value to 0–100 before emitting; the parser stores the raw `u8` without re-clamping (any non-`u8` value becomes `None`). The parsed value is forwarded in [[crates/scribe-common/src/ai_state.rs#AiProcessState]]`::context` as `Option<u8>`. See [[common#AI State]] for how producers populate this field and [[common#Configuration#AI Context Thresholds]] for the band classification config.
-
-Codex and Auggie hooks also use OSC 1337 for separate task-label channels. `<Provider>TaskLabel=<label>` sets the short, sanitized task label shown in the tab bar, and `<Provider>TaskLabelCleared` clears it without disturbing the underlying shell title.
-
-### OSC 1337 — AI Context Refresh
-
-`<Provider>Context=<u8>` is a context-only refresh from status-line / usage-poll producers. Only the percentage travels — no state, no other params.
-
-The parser ([[crates/scribe-pty/src/metadata.rs#MetadataParser#parse_named_ai_context]]) clamps to 0..=100 and silently drops non-numeric or out-of-range values, then emits `MetadataEvent::AiContextChanged { provider, context }`.
-
-The server ([[crates/scribe-server/src/ipc_server.rs#send_ai_context_change]]) patches `context` on the live `AiProcessState` for the matching provider and re-broadcasts a full `AiStateChanged`. When no live state has been established yet, or when the live state's provider differs, the refresh is dropped — the producer never synthesizes state. State transitions stay owned by the per-provider hook scripts.
-
-This split exists because `dist/scribe-claude-statusline.sh` previously emitted `ClaudeState=processing;context=NN` on every CC status-line refresh, which clobbered idle/waiting states immediately after the `dist/detect-claude-question.sh` Stop hook fired and left CC panes "stuck in processing".
-
 ### OSC 1337 — Pre-Arm Sentinel
 
 `ScribeAiLaunch=<provider_id>` is a shell-integration sentinel that pre-arms the [[pty#ED 3 Filter]] for an AI binary the shell is about to execute.
 
-`<provider_id>` is one of `claude_code`, `codex_code`, or `auggie` (matched by [[crates/scribe-common/src/ai_state.rs#AiProvider#from_id]]). The shell's preexec hook emits this OSC immediately before invoking `claude`, `codex`, or `auggie` so the PTY reader can set `ai_provider` to the correct value before the AI tool itself starts emitting bytes. Without this pre-arm, `<tool> --resume` would send its initial `\x1b[3J` before identifying via `<Provider>State=...`, slipping through the filter and wiping scrollback. The parser produces an `AiProviderArmed` variant of [[crates/scribe-pty/src/metadata.rs#MetadataEvent]], which is consumed entirely inside the PTY reader and is not forwarded to the client.
+`<provider_id>` is one of `claude_code`, `codex_code`, or `auggie` (matched by [[crates/scribe-common/src/ai_state.rs#AiProvider#from_id]]). The shell's preexec hook emits this OSC immediately before invoking `claude`, `codex`, or `auggie` so the PTY reader can set `ai_provider` to the correct value before the AI tool itself starts emitting bytes. Without this pre-arm, `<tool> --resume` would send its initial `\x1b[3J` before identifying via the hook channel, slipping through the filter and wiping scrollback. The parser produces an `AiProviderArmed` variant of [[crates/scribe-pty/src/metadata.rs#MetadataEvent]], which is consumed entirely inside the PTY reader and is not forwarded to the client.
 
-### OSC 1337 — Prompt Text
-
-`ClaudePrompt=<text>`, `CodexPrompt=<text>`, and `AuggiePrompt=<text>` carry the user's submitted prompt, capped at 256 characters.
-
-Parsed into `MetadataEvent::PromptReceived` with provider and sanitized text. Auggie emits this from Augment's `Stop` hook because `includeConversationData` is only documented for `Stop`, so prompt-bar updates arrive after the response completes.
-
-Empty prompt payloads are silently dropped. The provider is set from the prefix. Text is truncated at 256 bytes to bound IPC message size.
+This is the **only** OSC 1337 AI-related payload parsed from the PTY stream. AI tool state, prompt text, task labels, and context-window fill all arrive via the structured hook channel; see [[server#Hook Channel]].
 
 ### OSC 133 — Prompt Marks
 

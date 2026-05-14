@@ -3,32 +3,18 @@ set -euo pipefail
 #
 # Scribe — Auggie AI indicator hook setup
 #
-# Installs Scribe's Auggie hook helper and configures Augment Code's user
-# settings.json so Scribe receives provider-aware OSC 1337 state updates.
+# Wires Augment Auggie's hook system to call `ai-hook-auggie.sh` for every
+# state / Stop / SessionEnd event, replacing the legacy `auggie-state.sh`
+# OSC-emitter that broke when AI tool hooks lost terminal access.
+# Routes through the structured hook channel; see specs/003-ai-hook-channel/.
 #
-# Idempotent: safe to run multiple times. Only adds/updates Scribe-managed
-# Auggie hook entries and preserves unrelated Augment settings and hooks.
+# Idempotent: safe to run multiple times.
 #
 # Usage:
-#   setup-auggie-hooks.sh [--hook-source DIR]
-#
-#   --hook-source DIR   Directory containing auggie-state.sh.
-#                       Defaults to the same directory as this script.
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HOOK_SOURCE="${SCRIPT_DIR}"
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --hook-source) HOOK_SOURCE="$2"; shift 2 ;;
-        *) echo "Unknown option: $1" >&2; exit 1 ;;
-    esac
-done
+#   setup-auggie-hooks.sh
 
 AUGMENT_DIR="${HOME}/.augment"
-HOOKS_DIR="${AUGMENT_DIR}/hooks"
 SETTINGS="${AUGMENT_DIR}/settings.json"
-HOOK_SCRIPT="auggie-state.sh"
 
 # ── Step 1: Check that Augment/Auggie is installed ───────────────────────
 if [[ ! -d "$AUGMENT_DIR" ]]; then
@@ -37,59 +23,71 @@ if [[ ! -d "$AUGMENT_DIR" ]]; then
     exit 0
 fi
 
-# ── Step 2: Install the hook helper ──────────────────────────────────────
-mkdir -p "$HOOKS_DIR"
-
-SRC="${HOOK_SOURCE}/${HOOK_SCRIPT}"
-DEST="${HOOKS_DIR}/${HOOK_SCRIPT}"
-
-if [[ ! -f "$SRC" ]]; then
-    echo "ERROR: Hook source not found: ${SRC}" >&2
-    exit 1
-fi
-
-cp "$SRC" "$DEST"
-chmod +x "$DEST"
-echo "  Installed ${DEST}"
-
-# ── Step 3: Merge Scribe hooks into settings.json ────────────────────────
+# ── Step 2: Merge Scribe hooks into settings.json ────────────────────────
 python3 << 'PYEOF'
 import json
 import os
 import sys
 
 settings_path = os.path.expanduser("~/.augment/settings.json")
-hooks_dir = os.path.expanduser("~/.augment/hooks")
-state_script = os.path.join(hooks_dir, "auggie-state.sh")
 
+
+def find_scribe_install_prefix():
+    env = os.environ.get("SCRIBE_INSTALL_PREFIX")
+    if env and os.path.isdir(env):
+        return env
+    for p in (
+        "/usr/share/scribe",
+        "/usr/share/scribe-dev",
+        "/usr/local/share/scribe",
+        "/usr/local/share/scribe-dev",
+        "/Applications/Scribe.app/Contents/Resources/dist",
+        "/Applications/Scribe-Dev.app/Contents/Resources/dist",
+    ):
+        if os.path.isfile(os.path.join(p, "ai-hook-auggie.sh")):
+            return p
+    return "/usr/share/scribe"
+
+
+install_prefix = find_scribe_install_prefix()
+adapter = os.path.join(install_prefix, "ai-hook-auggie.sh")
+
+# (event, matcher_or_None, list-of-hook-dicts, metadata_or_None)
 SCRIBE_HOOKS = [
     ("SessionStart", None, [
-        {"type": "command", "command": state_script},
+        {"type": "command", "command": f'{adapter} session_start'},
     ], None),
     ("PreToolUse", ".*", [
-        {"type": "command", "command": state_script},
+        {"type": "command", "command": f'{adapter} processing'},
     ], None),
     ("PostToolUse", ".*", [
-        {"type": "command", "command": state_script},
+        {"type": "command", "command": f'{adapter} processing'},
     ], None),
     ("Stop", None, [
-        {"type": "command", "command": state_script},
+        {"type": "command", "command": f'{adapter} stop'},
     ], {"includeConversationData": True}),
     ("SessionEnd", None, [
-        {"type": "command", "command": state_script},
+        {"type": "command", "command": f'{adapter} session_end'},
     ], None),
 ]
+
 
 def is_scribe_hook(entry):
     for hook in entry.get("hooks", []):
         cmd = hook.get("command", "")
+        # New marker:
+        if "ai-hook-auggie.sh" in cmd:
+            return True
+        # Legacy markers (pre-AI-Hook-Channel install):
         if "AuggieState=" in cmd or "AuggieTaskLabel" in cmd or "auggie-state.sh" in cmd:
             return True
     return False
 
+
 def merge_event_hooks(existing_entries, scribe_entries):
     kept = [entry for entry in existing_entries if not is_scribe_hook(entry)]
     return scribe_entries + kept
+
 
 def strip_json5_comments_and_trailing_commas(text):
     without_comments = []
@@ -190,6 +188,7 @@ def strip_json5_comments_and_trailing_commas(text):
 
     return "".join(without_trailing_commas)
 
+
 def load_settings(path):
     with open(path) as f:
         content = f.read()
@@ -200,6 +199,7 @@ def load_settings(path):
             return json.loads(strip_json5_comments_and_trailing_commas(content))
         except json.JSONDecodeError:
             raise json_error
+
 
 if os.path.isfile(settings_path):
     try:
@@ -245,7 +245,7 @@ with open(tmp_path, "w") as f:
 os.replace(tmp_path, settings_path)
 
 print(f"  Updated {settings_path}")
-print("  Scribe Auggie hooks are configured.")
+print("  Scribe Auggie hooks routed via scribe-hook-helper IPC.")
 PYEOF
 
 echo ""

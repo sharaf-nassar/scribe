@@ -708,9 +708,15 @@ fn elapsed_since(now: SystemTime, since: SystemTime) -> Duration {
 /// been received and a timestamp is recorded. Returns `None` when nothing
 /// should be drawn (no prompt, or restored from a snapshot that predates
 /// the timestamp field).
+///
+/// When `pane.latest_prompt_finished_at` is `Some`, the timer is frozen
+/// at that instant — the displayed elapsed value reflects the time from
+/// prompt submission to LLM finish (or the AI state transition that
+/// captured the freeze) rather than wall-clock time since the prompt.
 fn pane_elapsed_text(pane: &Pane, now: SystemTime) -> Option<String> {
     let since = pane.latest_prompt_at?;
-    Some(format_elapsed(elapsed_since(now, since)))
+    let reference = pane.latest_prompt_finished_at.unwrap_or(now);
+    Some(format_elapsed(elapsed_since(reference, since)))
 }
 
 /// Render the prompt bar for a pane, returning instances to draw.

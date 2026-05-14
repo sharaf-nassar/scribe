@@ -66,18 +66,33 @@ assets = [
     "644",
   ],
   [
+    "target/release/scribe-hook-helper",
+    "usr/share/scribe/scribe-hook-helper",
+    "755",
+  ],
+  [
+    "../../dist/ai-hook-claude.sh",
+    "usr/share/scribe/ai-hook-claude.sh",
+    "755",
+  ],
+  [
+    "../../dist/ai-hook-statusline.sh",
+    "usr/share/scribe/ai-hook-statusline.sh",
+    "755",
+  ],
+  [
     "../../dist/setup-claude-hooks.sh",
     "usr/share/scribe/setup-claude-hooks.sh",
     "755",
   ],
   [
-    "../../dist/scribe-claude-statusline.sh",
-    "usr/share/scribe/scribe-claude-statusline.sh",
+    "../../dist/ai-hook-codex.sh",
+    "usr/share/scribe/ai-hook-codex.sh",
     "755",
   ],
   [
-    "../../dist/detect-claude-question.sh",
-    "usr/share/scribe/detect-claude-question.sh",
+    "../../dist/ai-hook-auggie.sh",
+    "usr/share/scribe/ai-hook-auggie.sh",
     "755",
   ],
   [
@@ -86,28 +101,8 @@ assets = [
     "755",
   ],
   [
-    "../../dist/detect-codex-question.sh",
-    "usr/share/scribe/detect-codex-question.sh",
-    "755",
-  ],
-  [
-    "../../dist/codex-task-label.sh",
-    "usr/share/scribe/codex-task-label.sh",
-    "755",
-  ],
-  [
-    "../../dist/detect-codex-context.sh",
-    "usr/share/scribe/detect-codex-context.sh",
-    "755",
-  ],
-  [
     "../../dist/setup-auggie-hooks.sh",
     "usr/share/scribe/setup-auggie-hooks.sh",
-    "755",
-  ],
-  [
-    "../../dist/auggie-state.sh",
-    "usr/share/scribe/auggie-state.sh",
     "755",
   ],
   [
@@ -182,18 +177,33 @@ assets = [
     "644",
   ],
   [
+    "target/release/scribe-hook-helper",
+    "usr/share/scribe-dev/scribe-hook-helper",
+    "755",
+  ],
+  [
+    "../../dist/ai-hook-claude.sh",
+    "usr/share/scribe-dev/ai-hook-claude.sh",
+    "755",
+  ],
+  [
+    "../../dist/ai-hook-statusline.sh",
+    "usr/share/scribe-dev/ai-hook-statusline.sh",
+    "755",
+  ],
+  [
     "../../dist/setup-claude-hooks.sh",
     "usr/share/scribe-dev/setup-claude-hooks.sh",
     "755",
   ],
   [
-    "../../dist/scribe-claude-statusline.sh",
-    "usr/share/scribe-dev/scribe-claude-statusline.sh",
+    "../../dist/ai-hook-codex.sh",
+    "usr/share/scribe-dev/ai-hook-codex.sh",
     "755",
   ],
   [
-    "../../dist/detect-claude-question.sh",
-    "usr/share/scribe-dev/detect-claude-question.sh",
+    "../../dist/ai-hook-auggie.sh",
+    "usr/share/scribe-dev/ai-hook-auggie.sh",
     "755",
   ],
   [
@@ -202,28 +212,8 @@ assets = [
     "755",
   ],
   [
-    "../../dist/detect-codex-question.sh",
-    "usr/share/scribe-dev/detect-codex-question.sh",
-    "755",
-  ],
-  [
-    "../../dist/codex-task-label.sh",
-    "usr/share/scribe-dev/codex-task-label.sh",
-    "755",
-  ],
-  [
-    "../../dist/detect-codex-context.sh",
-    "usr/share/scribe-dev/detect-codex-context.sh",
-    "755",
-  ],
-  [
     "../../dist/setup-auggie-hooks.sh",
     "usr/share/scribe-dev/setup-auggie-hooks.sh",
-    "755",
-  ],
-  [
-    "../../dist/auggie-state.sh",
-    "usr/share/scribe-dev/auggie-state.sh",
     "755",
   ],
   [
@@ -282,6 +272,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 vte.workspace = true
+regex.workspace = true
 nix.workspace = true
 rustix.workspace = true
 unix-ancillary.workspace = true

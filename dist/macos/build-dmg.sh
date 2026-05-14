@@ -111,24 +111,24 @@ if [[ -n "$VERSION" ]]; then
         "${CONTENTS}/Info.plist"
 fi
 
-# Copy binaries
+# Copy app executables and helper tools.
 cp "${BUILD_DIR}/scribe-client"   "${MACOS_DIR}/"
 cp "${BUILD_DIR}/scribe-server"   "${MACOS_DIR}/"
 cp "${BUILD_DIR}/scribe-settings" "${MACOS_DIR}/"
+cp "${BUILD_DIR}/scribe-hook-helper" "${MACOS_DIR}/"
 
 # Copy icon
 cp "${STAGING_DIR}/Scribe.icns" "${RESOURCES_DIR}/"
 
-# Copy Claude Code hook integration scripts
+# Copy AI tool hook adapter scripts. The Mach-O helper binary lives in
+# Contents/MacOS so notarization treats it as code, not a resource.
+cp "${DIST_DIR}/ai-hook-claude.sh"     "${RESOURCES_DIR}/"
+cp "${DIST_DIR}/ai-hook-statusline.sh" "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/setup-claude-hooks.sh" "${RESOURCES_DIR}/"
-cp "${DIST_DIR}/detect-claude-question.sh" "${RESOURCES_DIR}/"
-cp "${DIST_DIR}/scribe-claude-statusline.sh" "${RESOURCES_DIR}/"
-cp "${DIST_DIR}/setup-codex-hooks.sh" "${RESOURCES_DIR}/"
-cp "${DIST_DIR}/detect-codex-question.sh" "${RESOURCES_DIR}/"
-cp "${DIST_DIR}/detect-codex-context.sh" "${RESOURCES_DIR}/"
-cp "${DIST_DIR}/codex-task-label.sh" "${RESOURCES_DIR}/"
+cp "${DIST_DIR}/ai-hook-codex.sh"      "${RESOURCES_DIR}/"
+cp "${DIST_DIR}/setup-codex-hooks.sh"  "${RESOURCES_DIR}/"
+cp "${DIST_DIR}/ai-hook-auggie.sh"     "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/setup-auggie-hooks.sh" "${RESOURCES_DIR}/"
-cp "${DIST_DIR}/auggie-state.sh" "${RESOURCES_DIR}/"
 cp -R "${DIST_DIR}/shell-integration" "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/macos/com.scribe.server.plist" "${RESOURCES_DIR}/"
 

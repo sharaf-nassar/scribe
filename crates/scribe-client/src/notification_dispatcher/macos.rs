@@ -48,7 +48,7 @@ async fn run(mut rx: mpsc::UnboundedReceiver<NotifReq>) {
             // No-op: NSUserNotification has no client-driven dismiss
             // through `notify-rust`. The system retires toasts on its
             // own timeline.
-            NotifReq::Close { .. } => {}
+            NotifReq::Close => {}
             NotifReq::Shutdown => break,
         }
     }

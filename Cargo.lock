@@ -4062,6 +4062,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scribe-hook-helper"
+version = "0.0.0-dev"
+dependencies = [
+ "clap",
+ "scribe-common",
+ "tokio",
+]
+
+[[package]]
 name = "scribe-pty"
 version = "0.0.0-dev"
 dependencies = [
@@ -4099,6 +4108,7 @@ dependencies = [
  "minisign-verify",
  "nix",
  "pulldown-cmark",
+ "regex",
  "reqwest",
  "rmp-serde",
  "rustix 1.1.4",

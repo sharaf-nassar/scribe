@@ -107,6 +107,14 @@ pub struct LaunchRecord {
     /// written by older clients that predate this field.
     #[serde(default)]
     pub latest_prompt_at: Option<u64>,
+    /// Wall-clock time the LLM finished responding to the most recent
+    /// prompt, encoded as Unix-epoch seconds. When `Some`, the timer
+    /// stays frozen at this instant across cold restarts so the displayed
+    /// elapsed value continues to reflect response duration rather than
+    /// being recomputed from `latest_prompt_at` plus downtime. `None`
+    /// when the LLM was still processing (or in older snapshots).
+    #[serde(default)]
+    pub latest_prompt_finished_at: Option<u64>,
     #[serde(default)]
     pub prompt_count: u32,
 }

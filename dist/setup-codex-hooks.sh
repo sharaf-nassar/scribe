@@ -3,39 +3,43 @@ set -euo pipefail
 #
 # Scribe — Codex Code AI indicator hook setup
 #
-# Installs a Stop-hook helper and configures Codex hooks so Scribe receives
-# provider-aware OSC 1337 state updates from Codex CLI.
+# Wires Codex's hook system to call `ai-hook-codex.sh` for every state /
+# prompt / Stop / context event, replacing the legacy multi-script
+# legacy tty-writing install that broke when AI tool hooks lost terminal
+# access. Routes through the structured hook channel; see
+# specs/003-ai-hook-channel/.
 #
-# Idempotent: safe to run multiple times. Only adds/updates Scribe-managed
-# Codex hook entries and preserves unrelated hooks.
+# Idempotent: safe to run multiple times. Removes Scribe-owned hook entries
+# installed by previous versions before rewriting. Non-Scribe entries are
+# preserved.
 #
 # Usage:
-#   setup-codex-hooks.sh [--hook-source DIR]
-#
-#   --hook-source DIR   Directory containing Scribe's Codex hook scripts.
-#                       Defaults to the same directory as this script.
+#   setup-codex-hooks.sh
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HOOK_SOURCE="${SCRIPT_DIR}"
-
+HOOK_SOURCE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --hook-source) HOOK_SOURCE="$2"; shift 2 ;;
-        *) echo "Unknown option: $1" >&2; exit 1 ;;
+        --hook-source)
+            HOOK_SOURCE="${2:-}"
+            shift 2
+            ;;
+        --hook-source=*)
+            HOOK_SOURCE="${1#--hook-source=}"
+            shift
+            ;;
+        *)
+            shift
+            ;;
     esac
 done
 
+if [[ -n "$HOOK_SOURCE" ]]; then
+    export SCRIBE_INSTALL_PREFIX="$HOOK_SOURCE"
+fi
+
 CODEX_DIR="${HOME}/.codex"
-HOOKS_DIR="${CODEX_DIR}/hooks"
 CONFIG_TOML="${CODEX_DIR}/config.toml"
 HOOKS_JSON="${CODEX_DIR}/hooks.json"
-HOOK_SCRIPTS=(
-    "codex-hook-common.sh"
-    "codex-prompt-state.sh"
-    "detect-codex-question.sh"
-    "codex-task-label.sh"
-    "detect-codex-context.sh"
-)
 
 # ── Step 1: Check that Codex is installed ────────────────────────────────
 if [[ ! -d "$CODEX_DIR" ]]; then
@@ -44,24 +48,7 @@ if [[ ! -d "$CODEX_DIR" ]]; then
     exit 0
 fi
 
-# ── Step 2: Install the hook helper ──────────────────────────────────────
-mkdir -p "$HOOKS_DIR"
-
-for hook_script in "${HOOK_SCRIPTS[@]}"; do
-    SRC="${HOOK_SOURCE}/${hook_script}"
-    DEST="${HOOKS_DIR}/${hook_script}"
-
-    if [[ ! -f "$SRC" ]]; then
-        echo "ERROR: Hook source not found: ${SRC}" >&2
-        exit 1
-    fi
-
-    cp "$SRC" "$DEST"
-    chmod +x "$DEST"
-    echo "  Installed ${DEST}"
-done
-
-# ── Step 3: Enable Codex hooks in config.toml ────────────────────────────
+# ── Step 2: Enable Codex hooks in config.toml ────────────────────────────
 python3 << 'PYEOF'
 import os
 from pathlib import Path
@@ -89,18 +76,25 @@ if features_start is None:
         text += "\n"
     text += "[features]\n"
     text += "hooks = true\n"
+    text += "codex_hooks = true\n"
 else:
-    replaced = False
+    hooks_replaced = False
+    codex_hooks_replaced = False
     next_lines = lines[:features_start + 1]
     for line in lines[features_start + 1:features_end]:
         key = line.split("=", 1)[0].strip()
         if key == "hooks":
             next_lines.append("hooks = true")
-            replaced = True
-        elif key != "codex_hooks":
+            hooks_replaced = True
+        elif key == "codex_hooks":
+            next_lines.append("codex_hooks = true")
+            codex_hooks_replaced = True
+        else:
             next_lines.append(line)
-    if not replaced:
+    if not hooks_replaced:
         next_lines.append("hooks = true")
+    if not codex_hooks_replaced:
+        next_lines.append("codex_hooks = true")
     lines = next_lines + lines[features_end:]
     text = "\n".join(lines)
     if lines:
@@ -109,9 +103,10 @@ else:
 config_path.write_text(text)
 print(f"  Updated {config_path}")
 print("  Enabled [features].hooks = true")
+print("  Enabled [features].codex_hooks = true")
 PYEOF
 
-# ── Step 4: Merge Scribe hooks into hooks.json ───────────────────────────
+# ── Step 3: Merge Scribe hooks into hooks.json or inline TOML ────────────
 python3 << 'PYEOF'
 import hashlib
 import json
@@ -119,12 +114,29 @@ import os
 import re
 
 hooks_path = os.path.expanduser("~/.codex/hooks.json")
-hooks_dir = os.path.expanduser("~/.codex/hooks")
 config_path = os.path.expanduser("~/.codex/config.toml")
-stop_hook_script = os.path.join(hooks_dir, "detect-codex-question.sh")
-task_label_script = os.path.join(hooks_dir, "codex-task-label.sh")
-context_hook_script = os.path.join(hooks_dir, "detect-codex-context.sh")
-prompt_state_script = os.path.join(hooks_dir, "codex-prompt-state.sh")
+
+
+def find_scribe_install_prefix():
+    env = os.environ.get("SCRIBE_INSTALL_PREFIX")
+    if env and os.path.isdir(env):
+        return env
+    for p in (
+        "/usr/share/scribe",
+        "/usr/share/scribe-dev",
+        "/usr/local/share/scribe",
+        "/usr/local/share/scribe-dev",
+        "/Applications/Scribe.app/Contents/Resources/dist",
+        "/Applications/Scribe-Dev.app/Contents/Resources/dist",
+    ):
+        if os.path.isfile(os.path.join(p, "ai-hook-codex.sh")):
+            return p
+    return "/usr/share/scribe"
+
+
+install_prefix = find_scribe_install_prefix()
+adapter = os.path.join(install_prefix, "ai-hook-codex.sh")
+
 HOOK_EVENTS = (
     "PreToolUse",
     "PermissionRequest",
@@ -153,45 +165,65 @@ MATCHER_EVENTS = {
     "PostCompact",
     "SessionStart",
 }
+# Strings that identify a hook entry as Scribe-owned (any version).
+# Includes legacy markers so old installs migrate cleanly.
 SCRIBE_MARKERS = (
-    "CodexState=",
-    "CodexPrompt=",
-    "CodexTaskLabel",
+    "ai-hook-codex.sh",
+    # Legacy (pre-AI-Hook-Channel install) markers:
+    "Codex" "State=",
+    "Codex" "Prompt=",
+    "Codex" "TaskLabel",
     "codex-prompt-state",
     "detect-codex-question",
     "codex-task-label",
     "detect-codex-context",
+    "codex-hook-common",
 )
 
 SCRIBE_HOOKS = [
-    ("SessionStart", "startup|resume", [
-        {"type": "command", "command": f'"{task_label_script}" session-start'},
+    ("SessionStart", "startup|resume|clear", [
+        {"type": "command", "command": f'"{adapter}" session_start'},
     ]),
     ("UserPromptSubmit", None, [
-        {"type": "command", "command": f'"{task_label_script}" user-prompt-submit'},
-        {"type": "command", "command": f'"{prompt_state_script}"'},
+        {"type": "command", "command": f'"{adapter}" user_prompt_submit'},
     ]),
-    ("PreToolUse", "Bash", [
-        {"type": "command", "command": f'"{task_label_script}" tool-processing'},
+    ("PermissionRequest", None, [
+        {"type": "command", "command": f'"{adapter}" permission_request'},
     ]),
-    ("PostToolUse", "Bash", [
-        {"type": "command", "command": f'"{task_label_script}" tool-processing'},
+    ("PreToolUse", None, [
+        {"type": "command", "command": f'"{adapter}" tool_processing'},
+    ]),
+    ("PostToolUse", None, [
+        {"type": "command", "command": f'"{adapter}" tool_processing'},
+    ]),
+    ("Stop", None, [
+        {"type": "command", "command": f'"{adapter}" stop', "timeout": 30},
+    ]),
+    # Context % producer also fires on PostToolUse (no matcher) and Stop.
+    ("PostToolUse", None, [
+        {"type": "command", "command": f'"{adapter}" context', "timeout": 10},
+    ]),
+    ("Stop", None, [
+        {"type": "command", "command": f'"{adapter}" context', "timeout": 10},
     ]),
 ]
+
 
 def command_is_scribe(cmd):
     return any(marker in cmd for marker in SCRIBE_MARKERS)
 
+
 def is_scribe_hook(entry):
     for hook in entry.get("hooks", []):
-        cmd = hook.get("command", "")
-        if command_is_scribe(cmd):
+        if command_is_scribe(hook.get("command", "")):
             return True
     return False
+
 
 def merge_event_hooks(existing_entries, scribe_entries):
     kept = [entry for entry in existing_entries if not is_scribe_hook(entry)]
     return scribe_entries + kept
+
 
 scribe_by_event = {}
 for event, matcher, hook_cmds in SCRIBE_HOOKS:
@@ -200,27 +232,13 @@ for event, matcher, hook_cmds in SCRIBE_HOOKS:
         entry["matcher"] = matcher
     scribe_by_event.setdefault(event, []).append(entry)
 
-stop_entry = {
-    "hooks": [{"type": "command", "command": stop_hook_script, "timeout": 30}],
-}
-scribe_by_event.setdefault("Stop", []).append(stop_entry)
-
-# Context % producer: runs on every PostToolUse (no matcher) and Stop.
-context_post_tool_entry = {
-    "hooks": [{"type": "command", "command": context_hook_script, "timeout": 10}],
-}
-scribe_by_event.setdefault("PostToolUse", []).append(context_post_tool_entry)
-
-context_stop_entry = {
-    "hooks": [{"type": "command", "command": context_hook_script, "timeout": 10}],
-}
-scribe_by_event.setdefault("Stop", []).append(context_stop_entry)
 
 def read_hooks_json():
     if not os.path.isfile(hooks_path):
         return {}
     with open(hooks_path) as f:
         return json.load(f)
+
 
 def write_hooks_json(config):
     tmp_path = hooks_path + ".tmp"
@@ -229,10 +247,12 @@ def write_hooks_json(config):
         f.write("\n")
     os.replace(tmp_path, hooks_path)
 
+
 def inline_hooks_present(text):
     events = "|".join(re.escape(event) for event in HOOK_EVENTS)
     pattern = re.compile(rf"^\s*\[\[hooks\.({events})(?:\.hooks)?\]\]\s*$", re.MULTILINE)
     return bool(pattern.search(text))
+
 
 def hook_group_header(line):
     stripped = line.strip()
@@ -241,12 +261,15 @@ def hook_group_header(line):
             return event
     return None
 
+
 def hook_handler_header(line, event):
     return line.strip() == f"[[hooks.{event}.hooks]]"
+
 
 def any_section_header(line):
     stripped = line.strip()
     return stripped.startswith("[") and stripped.endswith("]")
+
 
 def strip_scribe_inline_hooks(text):
     lines = text.splitlines()
@@ -298,6 +321,7 @@ def strip_scribe_inline_hooks(text):
 
     return "\n".join(output).rstrip() + "\n"
 
+
 def toml_value(value):
     if isinstance(value, str):
         return json.dumps(value)
@@ -312,6 +336,7 @@ def toml_value(value):
     if value is None:
         return '""'
     return json.dumps(str(value))
+
 
 def render_inline_entry(event, entry):
     lines = [f"[[hooks.{event}]]"]
@@ -328,6 +353,7 @@ def render_inline_entry(event, entry):
                 lines.append(f"{key} = {toml_value(value)}")
     return "\n".join(lines)
 
+
 def append_inline_entries(text, entries_by_event):
     chunks = []
     for event in HOOK_EVENTS:
@@ -337,6 +363,7 @@ def append_inline_entries(text, entries_by_event):
         return text
     return text.rstrip() + "\n\n" + "\n\n".join(chunks) + "\n"
 
+
 def count_inline_groups(text):
     counts = {event: 0 for event in HOOK_EVENTS}
     for line in text.splitlines():
@@ -344,6 +371,7 @@ def count_inline_groups(text):
         if event is not None:
             counts[event] += 1
     return counts
+
 
 def parse_toml_scalar(value):
     trimmed = strip_toml_comment(value).strip()
@@ -364,6 +392,7 @@ def parse_toml_scalar(value):
         return float(trimmed)
     except ValueError:
         return trimmed
+
 
 def strip_toml_comment(value):
     in_basic = False
@@ -389,6 +418,7 @@ def strip_toml_comment(value):
         elif char == "#":
             return value[:idx]
     return value
+
 
 def parse_inline_hooks(text):
     hooks_by_event = {event: [] for event in HOOK_EVENTS}
@@ -425,6 +455,7 @@ def parse_inline_hooks(text):
 
     return hooks_by_event
 
+
 def normalized_command_hook(hook):
     normalized = {
         "async": hook.get("async", False),
@@ -436,8 +467,8 @@ def normalized_command_hook(hook):
         normalized["statusMessage"] = hook["statusMessage"]
     return normalized
 
+
 def command_hook_trusted_hash(event, entry, hook):
-    # Match Codex's command-hook trust fingerprint: event label, matcher, and one normalized handler.
     identity = {
         "event_name": HOOK_EVENT_LABELS[event],
         "hooks": [normalized_command_hook(hook)],
@@ -446,6 +477,7 @@ def command_hook_trusted_hash(event, entry, hook):
         identity["matcher"] = entry["matcher"]
     canonical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
 
 def scribe_trust_entries_for(source_path, hooks_by_event, base_indices=None):
     base_indices = base_indices or {}
@@ -466,6 +498,7 @@ def scribe_trust_entries_for(source_path, hooks_by_event, base_indices=None):
                 key = f"{source_path}:{HOOK_EVENT_LABELS[event]}:{group_index}:{hook_index}"
                 trust_entries.append((key, command_hook_trusted_hash(event, entry, hook)))
     return trust_entries
+
 
 def prior_trust_entries_for(source_path, hooks_by_event, existing_state, base_indices=None):
     base_indices = base_indices or {}
@@ -497,6 +530,7 @@ def prior_trust_entries_for(source_path, hooks_by_event, existing_state, base_in
                 trust_entries.append((key, trusted_hash, prior_state.get("enabled", True)))
     return trust_entries
 
+
 def decode_toml_key(raw):
     if raw.startswith('"'):
         return json.loads(raw)
@@ -504,11 +538,13 @@ def decode_toml_key(raw):
         return raw[1:-1]
     return None
 
+
 def hook_state_key(line):
     match = re.match(r"""\s*\[hooks\.state\.((?:"(?:\\.|[^"\\])*")|(?:'[^']*'))\]\s*$""", line)
     if not match:
         return None
     return decode_toml_key(match.group(1))
+
 
 def parse_bool_value(value):
     trimmed = strip_toml_comment(value).strip().lower()
@@ -518,6 +554,7 @@ def parse_bool_value(value):
         return False
     return None
 
+
 def parse_string_value(value):
     trimmed = strip_toml_comment(value).strip()
     if trimmed.startswith('"'):
@@ -526,6 +563,7 @@ def parse_string_value(value):
         end = trimmed.find("'", 1)
         return trimmed[1:end] if end != -1 else trimmed[1:]
     return None
+
 
 def parse_state_lines(lines):
     values = {}
@@ -544,6 +582,7 @@ def parse_state_lines(lines):
                 values["trusted_hash"] = trusted_hash
     return values
 
+
 def collect_hook_state(text):
     states = {}
     lines = text.splitlines()
@@ -560,6 +599,7 @@ def collect_hook_state(text):
             idx += 1
         states[key] = parse_state_lines(state_lines)
     return states
+
 
 def strip_hook_state_blocks(text, keys, trusted_hashes=None):
     trusted_hashes = trusted_hashes or set()
@@ -589,6 +629,7 @@ def strip_hook_state_blocks(text, keys, trusted_hashes=None):
         return ""
     return "\n".join(output).rstrip() + "\n"
 
+
 def append_hook_state_entries(text, trust_entries, existing_state):
     if not trust_entries:
         return text
@@ -605,12 +646,14 @@ def append_hook_state_entries(text, trust_entries, existing_state):
         blocks.append("\n".join(lines))
     return text.rstrip() + "\n\n" + "\n\n".join(blocks) + "\n"
 
+
 def update_hook_trust_state(text, trust_entries):
     existing_state = collect_hook_state(text)
     keys = {entry[0] for entry in trust_entries}
     trusted_hashes = {entry[1] for entry in trust_entries}
     text = strip_hook_state_blocks(text, keys, trusted_hashes)
     return append_hook_state_entries(text, trust_entries, existing_state)
+
 
 config_text = open(config_path).read() if os.path.isfile(config_path) else ""
 if inline_hooks_present(config_text):
@@ -646,7 +689,7 @@ if inline_hooks_present(config_text):
         os.remove(hooks_path)
         print(f"  Removed {hooks_path} after migrating hooks into config.toml")
     print(f"  Updated {config_path}")
-    print("  Scribe Codex hooks are configured inline.")
+    print("  Scribe Codex hooks routed via scribe-hook-helper IPC (inline TOML).")
 else:
     config = read_hooks_json()
     hooks = config.setdefault("hooks", {})
@@ -671,7 +714,7 @@ else:
 
     print(f"  Updated {hooks_path}")
     print(f"  Updated {config_path}")
-    print("  Scribe Codex hooks are configured.")
+    print("  Scribe Codex hooks routed via scribe-hook-helper IPC.")
 PYEOF
 
 echo ""

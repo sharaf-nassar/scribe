@@ -25,6 +25,7 @@ use scribe_common::screen::{
     CellFlags as ScreenCellFlags, CursorStyle as ScreenCursorStyle, ScreenCell, ScreenColor,
     ScreenSnapshot,
 };
+use scribe_common::socket::server_socket_path;
 use scribe_pty::async_fd::AsyncPtyFd;
 use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
 
@@ -337,7 +338,8 @@ impl SessionManager {
         let integration_script = session_integration_script(&shell_binary, integration_enabled);
         let shell =
             build_shell(&shell_binary, request.command, kind, integration_script.as_deref());
-        let pty_options = build_pty_options(shell, request.cwd, &shell_binary, integration_enabled);
+        let pty_options =
+            build_pty_options(session_id, shell, request.cwd, &shell_binary, integration_enabled);
 
         PreparedSessionLaunch {
             session_id,
@@ -530,6 +532,7 @@ fn session_geometry(size: Option<TerminalSize>) -> SessionGeometry {
 }
 
 fn build_pty_options(
+    session_id: SessionId,
     shell: Option<alacritty_terminal::tty::Shell>,
     cwd: Option<std::path::PathBuf>,
     shell_binary: &str,
@@ -540,6 +543,11 @@ fn build_pty_options(
         ("COLORTERM".to_owned(), "truecolor".to_owned()),
         ("TERM_PROGRAM".to_owned(), "Scribe".to_owned()),
         ("TERM_PROGRAM_VERSION".to_owned(), env!("CARGO_PKG_VERSION").to_owned()),
+        // Hook channel discovery — see specs/003-ai-hook-channel/contracts/env-vars.md.
+        // Both vars MUST be set together; absence of either signals "not under
+        // Scribe" to `scribe-hook-helper`, which then exits 0 silently.
+        ("SCRIBE_HOOK_SOCK".to_owned(), server_socket_path().to_string_lossy().into_owned()),
+        ("SCRIBE_SESSION_ID".to_owned(), session_id.to_full_string()),
     ]);
     if integration_enabled {
         inject_shell_integration_env(shell_binary, &mut env);

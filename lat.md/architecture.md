@@ -44,6 +44,12 @@ Stateful actions that need an immediate server-side response (e.g. the Updates p
 
 Thin CLI entry point that launches the client process.
 
+### scribe-hook-helper
+
+Tiny binary invoked by AI-tool hook adapter scripts to emit one [[crates/scribe-common/src/hook.rs#HookEvent]] to the server and exit 0.
+
+Reads `SCRIBE_HOOK_SOCK` and `SCRIBE_SESSION_ID` from env (both injected by Scribe into every PTY it spawns); no-ops silently when either is unset. The per-provider adapters in `dist/ai-hook-*.sh` translate AI tool hook stdin JSON into the helper's argv. See [[server#Hook Channel]] for the full pipeline and `specs/003-ai-hook-channel/` for the design docs.
+
 ### scribe-test
 
 Integration test harness with PTY capture, IPC helpers, and assertion utilities.
@@ -65,6 +71,10 @@ Manual server restarts during active work require explicit user approval because
 The shared `release.sh` wrapper keeps release-note generation noninteractive so terminal probes cannot pollute confirmation prompts.
 
 `tools/release-me/release.sh` invokes Codex with CI/no-colour terminal environment and, when `setsid` is available, runs the background `codex exec` in a fresh session without a controlling terminal. This prevents Codex's `/dev/tty` colour and cursor probes from being answered into the parent script's later `read -rp` prompts.
+
+The macOS release workflow builds target-specific binaries, then stages every executable that `dist/macos/build-dmg.sh` copies from `target/release`, including `scribe-hook-helper`. The DMG script places Mach-O executables under `Contents/MacOS`, keeps shell hook adapters in `Contents/Resources`, signs auxiliary executables before the outer app bundle, and fetches Apple notary logs before failing an invalid submission.
+
+Release CI disables `Swatinem/rust-cache` caching for `~/.cargo/bin` and uses a cache prefix that excludes older bin-cached archives. This prevents restored caches from replacing the runner's `cargo` shim with unrelated binaries before the release build starts.
 
 ### Lint Suppression Guard
 

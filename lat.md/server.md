@@ -224,18 +224,62 @@ Background refreshes scheduled by the Stale branch run on the existing tokio run
 
 Server config in [[crates/scribe-server/src/config.rs#ScribeConfig]] holds workspace roots and scrollback lines. Roots are validated as absolute paths with tilde expansion. Scrollback is clamped to a maximum of 100,000 lines.
 
+## Hook Channel
+
+Structured IPC by which AI-tool hook subprocesses report state to the server, replacing the OSC-over-`/dev/tty` path that Claude Code v2.1.139 made unusable.
+
+CC v2.1.139 (2026-05-11) intentionally detached the controlling TTY from hook subprocesses, breaking every `printf > /dev/tty` Scribe hook. The replacement is a new `ClientMessage::HookEvent` variant carried on the existing IPC socket and consumed by [[crates/scribe-server/src/hook_ingress.rs#handle]]. Claude Code, Codex, Auggie, and the Claude statusline subprocess all route through it. See `specs/003-ai-hook-channel/`.
+
+### Discovery
+
+Scribe injects two env vars into every spawned PTY so hook subprocesses can discover the channel.
+
+The injection site is [[crates/scribe-server/src/session_manager.rs#build_pty_options]]: `SCRIBE_HOOK_SOCK` (absolute path to the existing server socket) and `SCRIBE_SESSION_ID` (per-PTY UUID minted by `SessionManager::create_session`). Both inherit through the user's shell and the AI tool to the hook subprocess. Absence of either signals "not under Scribe" — the helper exits 0 silently (FR-003).
+
+### Emitter
+
+The shared [[crates/scribe-hook-helper/src/main.rs]] binary sends one `HookEvent` per invocation, then exits 0.
+
+CLI parsing via `clap`; both env vars read; payload built; `ClientMessage::HookEvent` length-prefix-msgpack-framed to the socket via the existing `framing::write_message`. A 100 ms `tokio::time::timeout` bounds connect + write + close (FR-012). Provider-specific adapters in `dist/ai-hook-{claude,codex,auggie,statusline}.sh` translate the AI tool's hook stdin JSON into the helper's argv.
+
+Claude Code and Codex `UserPromptSubmit` adapters both emit `StateChanged { Processing }` followed by `PromptReceived` when the hook payload contains prompt text, so the prompt bar is driven by the same structured hook event for both providers. Codex additionally derives a `TaskLabelChanged` event from the first non-empty non-slash prompt line and maps `PermissionRequest` to `PermissionPrompt`.
+
+### Ingress
+
+The server dispatches `ClientMessage::HookEvent` on a transient connection (no `Hello`, no `Welcome`, no reply).
+
+The pattern mirrors `CheckForUpdates` / `ListReleases` at `ipc_server.rs` `establish_client_window`. `hook_ingress::handle` looks up the session in `LiveSessionRegistry`, translates the `HookEventKind` to a `MetadataEvent`, and forwards into [[crates/scribe-server/src/ipc_server.rs#send_metadata_event]] — the same downstream pipeline the deleted OSC parser used, unchanged.
+
+### Stop Classifier
+
+[[crates/scribe-server/src/stop_classifier.rs#classify]] maps a `SessionStopped` event's last-message text to `IdlePrompt` or `WaitingForInput`.
+
+One provider-independent Rust function (with inline `#[cfg(test)]` rule tests) replaces the per-provider shell heuristics in the deleted `detect-claude-question.sh` and `detect-codex-question.sh`. Rules: strip fenced code blocks, take the last ~20 non-empty lines, return `WaitingForInput` on trailing `?`, question phrases (`would you like`, `should i`, …), or approval/review phrases.
+
+### Schema
+
+`HookEvent { session_id, provider, kind }` with seven `kind` variants on the wire.
+
+`StateChanged`, `SessionStopped` (server-classified), `StateCleared`, `PromptReceived`, `TaskLabelChanged`, `TaskLabelCleared`, `ContextChanged`. Server-side caps: prompt and task-label 256 chars, last-message 16 KiB. See [[crates/scribe-common/src/hook.rs#HookEvent]] and `specs/003-ai-hook-channel/data-model.md`.
+
+### Adding a Provider
+
+A new AI tool provider plugs in via one adapter script. No transport, server, or env-var changes.
+
+Concretely: (1) add a variant to `AiProvider` in `crates/scribe-common/src/ai_state.rs` with `id`, `display_name`, and `binary_name`; (2) author `dist/ai-hook-<name>.sh` modeled on `ai-hook-claude.sh` and translate the AI tool's hook stdin JSON to `scribe-hook-helper --provider=<id> --event=…` invocations; (3) write a one-off `dist/setup-<name>-hooks.sh` that registers the adapter in that tool's settings file; (4) add the two new files to the deb-asset and DMG-build tables in `crates/scribe-server/Cargo.toml` and `dist/macos/build-dmg.sh`. The shared helper, env-var injection at `session_manager.rs:538`, server ingress at `hook_ingress.rs`, and the stop classifier require **no** changes. Events from a provider not yet recognized by the running build are dropped silently per FR-014.
+
+### Safety Contract
+
+Hook subprocesses must never break the AI tool — even outside Scribe.
+
+The helper exits 0 in every code path (FR-007), writes nothing to stdout (FR-008) or stderr (FR-009), does not open `/dev/tty` (FR-010), and bounds its connect+write+close to 100 ms (FR-012). Absence of `SCRIBE_HOOK_SOCK` or `SCRIBE_SESSION_ID` is the canonical "not under Scribe" signal — the helper exits 0 silently (FR-003). The same holds for unreachable sockets, dead Scribe servers, malformed args, or any other failure. This contract is what makes the AI tool's view of "is Scribe installed?" identical to "is the channel reachable right now?", so Scribe-installed hooks run safely in cloud sessions, subagents, SSH, and CI (FR-025).
+
 ## Shell Integration
 
 Shell integration detects the user's shell (Bash, Zsh, Fish, Nushell, PowerShell) and injects startup scripts via shell-specific mechanisms.
 
 Bash uses `--rcfile` to load the integration script, which sources startup files itself; on macOS it mirrors Terminal's login-shell behavior by preferring `~/.bash_profile`/`~/.bash_login`/`~/.profile` before falling back to `~/.bashrc`. Zsh uses `ZDOTDIR` wrapping. Fish and Nushell extend `XDG_DATA_DIRS` so vendor autoload directories are discovered. PowerShell starts with `-NoExit -File` so the integration script is dot-sourced into the interactive session. When `SHELL` is missing, Scribe falls back to the account's login shell from the user database, and default sessions spawn that resolved shell explicitly so Finder- and launchd-started macOS installs do not inherit a stale shell choice.
 
-Those prompt hooks also clear any stale Codex or Auggie task label as soon as control returns to the shell. They emit OSC 7 CWD updates, OSC 133 prompt marks, and OSC 1337 `ScribeContext` payloads carrying remote-host and tmux-session labels. Separately, `setup-claude-hooks.sh`, `setup-codex-hooks.sh`, and `setup-auggie-hooks.sh` install provider hooks. `setup-claude-hooks.sh` also injects a `statusLine` entry in `~/.claude/settings.json` pointing at `scribe-claude-statusline.sh`, which reads CC's per-refresh JSON payload, emits a context-only `ClaudeContext=NN` OSC to `/dev/tty`, and writes a `<model> • NN%` banner to stdout that CC renders as the visible status line. The status-line OSC carries no state — state transitions stay owned by Claude's hook scripts (`PreToolUse` / `PostToolUse` / `Stop` / `Notification` / `UserPromptSubmit`) so a CC pane does not get jammed back to `processing` after the Stop hook signals idle. The hook emits task labels from prompt metadata, keeping AI tab names independent from normal OSC 0/2 titles. `setup-codex-hooks.sh` enables Codex's current `[features].hooks = true` flag, registers `detect-codex-context.sh` on Codex `PostToolUse` and `Stop` events, and writes matching `hooks.state` trusted hashes in `~/.codex/config.toml` so installed Scribe command hooks are trusted immediately rather than waiting for interactive approval; the context script reads Codex's hook `transcript_path`, extracts that rollout's latest `last_token_usage.total_tokens` and `model_context_window`, and emits `CodexContext=NN` to `/dev/tty` so Scribe's prompt bar and tab indicators reflect the active Codex tab without overwriting Codex's hook-driven state. When `~/.codex/config.toml` already contains inline Codex hook tables, the installer treats TOML as the canonical representation: it migrates existing `hooks.json` entries into inline tables, appends migrated user hooks before refreshed Scribe-managed inline entries so reruns are stable, re-keys already trusted non-Scribe hooks by trusted hash when group indexes shift, and removes `hooks.json` so Codex does not warn about mixed hook representations.
+Shell prompt hooks emit OSC 7 CWD updates, OSC 133 prompt marks, and OSC 1337 `ScribeContext` payloads carrying remote-host and tmux-session labels. Each shell's preexec hook also emits an OSC 1337 `ScribeAiLaunch=<provider_id>` sentinel (see [[pty#PTY#Metadata Parser#OSC 1337 — Pre-Arm Sentinel]]) when the user runs `claude`, `codex`, or `auggie`, so the [[pty#PTY#ED 3 Filter]] re-arms before the AI tool emits its initial `\x1b[3J`. This is the counterpart to clearing `ai_provider` on `OSC 133;A` (shell-prompt return): plain shell sessions cleanly leave the filter, and `<tool> --resume` cleanly re-enters it without losing scrollback in between. [[crates/scribe-server/src/ipc_server.rs#send_metadata_event]] also synthesizes a follow-up `ServerMessage::AiStateCleared` on this same `OSC 133;A` whenever the session's live `ai_state` was active, so the client clears its [[client#Prompt Bar]], notification tracker, and [[crates/scribe-client/src/restore_state.rs#LaunchRecord]] `LaunchKind::Ai → Shell` binding in lockstep with the server's internal filter — covering the common case where Claude Code or Codex exit without an explicit `StateCleared` hook event. zsh/fish/nushell/powershell detect the AI binary inside their per-command preexec hook; bash uses a `trap … DEBUG` handler gated on `BASH_SUBSHELL == 0` so subshell expansions during `PROMPT_COMMAND`/`PS1` evaluation do not emit spurious sentinels.
 
-Each shell's preexec hook also emits an OSC 1337 `ScribeAiLaunch=<provider_id>` sentinel (see [[pty#PTY#Metadata Parser#OSC 1337 — Pre-Arm Sentinel]]) when the user runs `claude`, `codex`, or `auggie`, so the [[pty#PTY#ED 3 Filter]] re-arms before the AI tool emits its initial `\x1b[3J`. This is the counterpart to clearing `ai_provider` on `OSC 133;A` (shell-prompt return): plain shell sessions cleanly leave the filter, and `<tool> --resume` cleanly re-enters it without losing scrollback in between. zsh/fish/nushell/powershell detect the AI binary inside their per-command preexec hook; bash uses a `trap … DEBUG` handler gated on `BASH_SUBSHELL == 0` so subshell expansions during `PROMPT_COMMAND`/`PS1` evaluation do not emit spurious sentinels.
-
-Because current Codex command hooks always receive a JSON payload on stdin, Scribe's installed Codex hook helpers drain stdin before exiting even when they only emit OSC side effects. They probe `/dev/tty` directly for the controlling terminal instead of checking stdin, which keeps Bash `PreToolUse` and `PostToolUse` state hooks from failing with broken pipes on larger payloads.
-
-Codex hook payloads from spawned subagents share the root Codex process's controlling TTY, so Scribe's Codex hooks keep a per-TTY owner cache keyed by the nearest Codex process and root `session_id`. Prompt, task-label, context, and stop-state hooks ignore later payloads with a different `session_id` while that owner is alive, preventing subagent prompts from replacing the visible prompt bar or tab metadata. `/new` clears the owner cache so the next top-level Codex session can claim the tab cleanly.
-
-Auggie hooks are configured in `~/.augment/settings.json` using documented `SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, and `SessionEnd` events. `setup-auggie-hooks.sh` accepts Augment's JSON5-style comments and trailing commas, writes back valid JSON, and preserves unrelated hook entries. The `Stop` hook opts into `includeConversationData` so Scribe can best-effort emit `AuggiePrompt` and `AuggieTaskLabel`; Augment does not currently document a prompt-submit hook, so those values arrive when Auggie stops responding rather than at prompt submission time. The `SessionEnd` handler emits `AuggieState=inactive` so the server fires `AiStateCleared` and clears `ai_provider` explicitly when a Auggie session ends — covering tool exits that do not pass through the shell prompt yet (e.g. handoff or container teardown). Claude and Codex have no equivalent OSC-emitting `SessionEnd` hook today, so their tabs rely on the `OSC 133;A` shell-prompt-return signal to clear `ai_provider`.
+AI tool state and prompt/task-label/context-fill updates do **not** travel through shell integration. They use the structured hook channel — see [[server#Hook Channel]]. The installer scripts `setup-claude-hooks.sh`, `setup-codex-hooks.sh`, and `setup-auggie-hooks.sh` register thin `dist/ai-hook-{claude,codex,auggie}.sh` adapters that invoke `scribe-hook-helper` for every event. `setup-claude-hooks.sh` additionally points Claude's `statusLine` at `dist/ai-hook-statusline.sh`. `setup-codex-hooks.sh` honors its `--hook-source` install prefix, enables both `[features].hooks = true` and `[features].codex_hooks = true`, and writes Scribe entries to `~/.codex/hooks.json` unless an inline `[hooks]` config already exists; in that case it preserves inline form and migrates non-Scribe `hooks.json` entries into `config.toml`. It adds matching `[hooks.state.…]` trusted-hash entries so Scribe command hooks are trusted immediately. It registers `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PreToolUse`, `PostToolUse`, and `Stop` hooks, with context refreshes on `PostToolUse` and `Stop`. `setup-auggie-hooks.sh` writes `~/.augment/settings.json` with `SessionStart`, `PreToolUse`/`PostToolUse`, `Stop` (with `includeConversationData: true`), and `SessionEnd` entries — Auggie has no documented `UserPromptSubmit` hook, so prompt and task-label data arrive on `Stop`. `SessionEnd` emits a `StateCleared` hook event so `ai_provider` clears explicitly when Auggie exits without passing through the shell prompt (handoff, container teardown).

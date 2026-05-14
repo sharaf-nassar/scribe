@@ -3,6 +3,7 @@ pub mod app;
 pub mod config;
 pub mod error;
 pub mod framing;
+pub mod hook;
 pub mod ids;
 pub mod profiles;
 pub mod protocol;

@@ -36,10 +36,30 @@ pub enum NotifReq {
     /// Best-effort on macOS — `notify-rust` cannot programmatically
     /// dismiss `NSUserNotification`, so the toast remains until the
     /// system retires it.
+    #[cfg(target_os = "linux")]
     Close { session_id: SessionId },
+    #[cfg(not(target_os = "linux"))]
+    Close,
     /// Close every live notification and exit the dispatcher loop.
     /// Like `Close`, the close-all step is a no-op on macOS.
     Shutdown,
+}
+
+impl NotifReq {
+    /// Build a close request without exposing platform-specific payload shape
+    /// to the rest of the client.
+    #[must_use]
+    pub fn close(session_id: SessionId) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::Close { session_id }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = session_id;
+            Self::Close
+        }
+    }
 }
 
 /// Payload for [`NotifReq::Show`]. Bundled into a struct so the
@@ -47,15 +67,41 @@ pub enum NotifReq {
 /// new fields (e.g. icon overrides) can land without churning every
 /// call site.
 pub struct ShowReq {
+    #[cfg(target_os = "linux")]
     pub session_id: SessionId,
     pub summary: String,
     pub body: String,
     /// Linux-only — the freedesktop spec exposes `expire_timeout`.
     /// macOS ignores this field because `notify-rust` cannot set
     /// `NSUserNotification` lifetime.
+    #[cfg(target_os = "linux")]
     pub timeout_mode: NotifyTimeoutMode,
     /// Linux-only — paired with [`NotifyTimeoutMode::Custom`].
+    #[cfg(target_os = "linux")]
     pub timeout_secs: u32,
+}
+
+impl ShowReq {
+    /// Build a show request while keeping Linux-only fields out of
+    /// non-Linux builds.
+    #[must_use]
+    pub fn new(
+        session_id: SessionId,
+        summary: String,
+        body: String,
+        timeout_mode: NotifyTimeoutMode,
+        timeout_secs: u32,
+    ) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self { session_id, summary, body, timeout_mode, timeout_secs }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (session_id, timeout_mode, timeout_secs);
+            Self { summary, body }
+        }
+    }
 }
 
 /// Spawn the platform-appropriate dispatcher on a dedicated thread

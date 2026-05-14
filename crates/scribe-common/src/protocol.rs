@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::ai_state::{AiProcessState, AiProvider};
+use crate::hook;
 use crate::ids::{SessionId, WindowId, WorkspaceId};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -208,6 +209,11 @@ pub enum ClientMessage {
         /// (previous focus is unknown from the first focus event).
         lost: Option<SessionId>,
     },
+    /// Transient one-shot connection from `scribe-hook-helper`. Carries one
+    /// `HookEvent` from an AI tool hook subprocess. The server dispatches via
+    /// `hook_ingress::handle` and closes the connection — no Welcome, no
+    /// window registration, no reply expected.
+    HookEvent(hook::HookEvent),
 }
 
 // ── Server → UI ──────────────────────────────────────────────────

@@ -3,32 +3,26 @@ set -euo pipefail
 #
 # Scribe — Claude Code AI indicator hook setup
 #
-# Installs the question-detection hook script and configures Claude Code
-# settings.json so that Scribe's AI state indicators work out of the box.
+# Wires Claude Code's hook system to call `ai-hook-claude.sh` for every
+# state/prompt/Stop event, and registers `ai-hook-statusline.sh` as the
+# statusLine subprocess. Replaces the OSC-over-/dev/tty hooks that broke
+# in Claude Code v2.1.139 (intentional TTY detachment from hook subprocs).
 #
-# Idempotent: safe to run multiple times. Only adds/updates Scribe-specific
-# hooks; existing hooks (quill, plugins, etc.) are preserved.
+# All Scribe hook commands resolve at runtime to:
+#   <install_prefix>/ai-hook-claude.sh <event-name>
+# where <install_prefix> is /usr/share/scribe, /usr/share/scribe-dev, the
+# macOS bundle Resources/dist directory, or whatever
+# SCRIBE_INSTALL_PREFIX points to.
+#
+# Idempotent: safe to run multiple times. Removes Scribe-owned hooks
+# installed by previous versions before rewriting. Non-Scribe hooks
+# (quill, plugins, the user's own) are preserved untouched.
 #
 # Usage:
-#   setup-claude-hooks.sh [--hook-source DIR]
-#
-#   --hook-source DIR   Directory containing detect-claude-question.sh.
-#                       Defaults to the same directory as this script.
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HOOK_SOURCE="${SCRIPT_DIR}"
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --hook-source) HOOK_SOURCE="$2"; shift 2 ;;
-        *) echo "Unknown option: $1" >&2; exit 1 ;;
-    esac
-done
+#   setup-claude-hooks.sh
 
 CLAUDE_DIR="${HOME}/.claude"
-HOOKS_DIR="${CLAUDE_DIR}/hooks"
 SETTINGS="${CLAUDE_DIR}/settings.json"
-HOOK_SCRIPT="detect-claude-question.sh"
 
 # ── Step 1: Check that Claude Code is installed ─────────────────────────
 if [[ ! -d "$CLAUDE_DIR" ]]; then
@@ -37,28 +31,10 @@ if [[ ! -d "$CLAUDE_DIR" ]]; then
     exit 0
 fi
 
-# ── Step 2: Install the hook script ─────────────────────────────────────
-mkdir -p "$HOOKS_DIR"
-
-SRC="${HOOK_SOURCE}/${HOOK_SCRIPT}"
-DEST="${HOOKS_DIR}/${HOOK_SCRIPT}"
-
-if [[ ! -f "$SRC" ]]; then
-    echo "ERROR: Hook source not found: ${SRC}" >&2
-    exit 1
-fi
-
-cp "$SRC" "$DEST"
-chmod +x "$DEST"
-echo "  Installed ${DEST}"
-
-# ── Step 3: Merge Scribe hooks into settings.json ──────────────────────
-# Uses Python (available on virtually all systems) for safe JSON manipulation.
-# The merge logic:
-#   - For each hook event (Stop, Notification, etc.), find existing Scribe
-#     entries by matching the command path prefix and replace them.
-#   - Non-Scribe entries (quill, plugins) are left untouched.
-#   - If settings.json doesn't exist, create it with just the hooks.
+# ── Step 2: Merge Scribe hooks into settings.json ──────────────────────
+# All hook commands point at ai-hook-claude.sh in the install prefix.
+# Removes legacy `printf > /dev/tty` Scribe hooks and the obsolete
+# detect-claude-question.sh Stop hook before inserting the new entries.
 
 python3 << 'PYEOF'
 import json
@@ -66,96 +42,10 @@ import os
 import sys
 
 settings_path = os.path.expanduser("~/.claude/settings.json")
-hooks_dir = os.path.expanduser("~/.claude/hooks")
-hook_script = os.path.join(hooks_dir, "detect-claude-question.sh")
-
-# The Scribe-specific hooks to install.
-# Each entry: (event, matcher_or_none, hook_commands)
-# matcher_or_none=None means no matcher field (matches everything).
-SCRIBE_HOOKS = [
-    ("Notification", "permission_prompt", [
-        {"type": "command", "command": "printf '\\e]1337;ClaudeState=permission_prompt\\a' > /dev/tty"},
-    ]),
-    ("Notification", "error", [
-        {"type": "command", "command": "printf '\\e]1337;ClaudeState=error\\a' > /dev/tty"},
-    ]),
-    ("PreToolUse", "AskUserQuestion", [
-        {"type": "command", "command": "printf '\\e]1337;ClaudeState=waiting_for_input\\a' > /dev/tty"},
-    ]),
-    ("PostToolUse", "AskUserQuestion", [
-        {"type": "command", "command": "printf '\\e]1337;ClaudeState=processing\\a' > /dev/tty"},
-    ]),
-    ("UserPromptSubmit", None, [
-        {"type": "command", "command": "python3 -c 'import json,sys;d=json.load(sys.stdin);sid=d.get(\"session_id\",\"\");p=d.get(\"prompt\",\"\")[:256].replace(chr(7),\"\").replace(chr(27),\"\");f=open(\"/dev/tty\",\"w\");f.write(f\"\\x1b]1337;ClaudeState=processing;conversation_id={sid}\\x07\" if sid else \"\\x1b]1337;ClaudeState=processing\\x07\");f.write(f\"\\x1b]1337;ClaudePrompt={p}\\x07\") if p else None;f.close()' 2>/dev/null || true"},
-    ]),
-]
-
-# The Stop hook is special: it uses the detection script instead of a
-# hardcoded printf, so we identify it by the script path.
-STOP_HOOK_CMD = hook_script
 
 
-def is_scribe_hook(entry):
-    """Return True if a hook entry was installed by Scribe."""
-    for h in entry.get("hooks", []):
-        cmd = h.get("command", "")
-        if "ClaudeState=" in cmd or "detect-claude-question" in cmd:
-            return True
-    return False
-
-
-def merge_event_hooks(existing_entries, scribe_entries):
-    """Merge Scribe hooks into existing entries for a single event type.
-
-    Removes old Scribe entries and prepends the new ones. Non-Scribe
-    entries are preserved in their original order.
-    """
-    # Keep non-Scribe entries
-    kept = [e for e in existing_entries if not is_scribe_hook(e)]
-    return scribe_entries + kept
-
-
-# Load or create settings
-if os.path.isfile(settings_path):
-    with open(settings_path) as f:
-        settings = json.load(f)
-else:
-    settings = {}
-
-hooks = settings.setdefault("hooks", {})
-
-# ── Build Scribe entries per event type ──────────────────────────────
-scribe_by_event: dict[str, list] = {}
-
-for event, matcher, hook_cmds in SCRIBE_HOOKS:
-    entry: dict = {"hooks": hook_cmds}
-    if matcher is not None:
-        entry["matcher"] = matcher
-    scribe_by_event.setdefault(event, []).append(entry)
-
-# Add the Stop hook with the detection script (no matcher = matches all stop reasons)
-stop_entry = {
-    "hooks": [{"type": "command", "command": hook_script}],
-}
-scribe_by_event.setdefault("Stop", []).append(stop_entry)
-
-# ── Merge into settings ─────────────────────────────────────────────
-for event, scribe_entries in scribe_by_event.items():
-    existing = hooks.get(event, [])
-    hooks[event] = merge_event_hooks(existing, scribe_entries)
-
-settings["hooks"] = hooks
-
-# ── Clean up any Scribe-owned statusLine before re-inserting ─────────────
-# This handles uninstall: if statusLine still points at our shim, remove it.
-existing_sl = settings.get("statusLine")
-if isinstance(existing_sl, dict):
-    cmd = existing_sl.get("command", "")
-    if cmd.endswith("scribe-claude-statusline.sh"):
-        settings.pop("statusLine", None)
-
-# ── Resolve the install prefix so we work on scribe-dev and macOS ────
 def find_scribe_install_prefix():
+    """Locate the directory containing ai-hook-claude.sh and ai-hook-statusline.sh."""
     env = os.environ.get("SCRIBE_INSTALL_PREFIX")
     if env and os.path.isdir(env):
         return env
@@ -164,40 +54,113 @@ def find_scribe_install_prefix():
         "/usr/share/scribe-dev",
         "/usr/local/share/scribe",
         "/usr/local/share/scribe-dev",
-        # macOS app bundle paths:
         "/Applications/Scribe.app/Contents/Resources/dist",
         "/Applications/Scribe-Dev.app/Contents/Resources/dist",
     ):
-        if os.path.isfile(os.path.join(p, "scribe-claude-statusline.sh")):
+        if os.path.isfile(os.path.join(p, "ai-hook-claude.sh")):
             return p
-    return "/usr/share/scribe"  # safe default
+    return "/usr/share/scribe"
+
 
 install_prefix = find_scribe_install_prefix()
+adapter = os.path.join(install_prefix, "ai-hook-claude.sh")
+statusline = os.path.join(install_prefix, "ai-hook-statusline.sh")
 
-# ── Ensure statusLine points at our shim ─────────────────────────────
-shim = os.path.join(install_prefix, "scribe-claude-statusline.sh")
+# Each tuple: (event, matcher_or_None, list-of-hook-command-dicts).
+SCRIBE_HOOKS = [
+    ("Notification", "permission_prompt", [
+        {"type": "command", "command": f"{adapter} permission_prompt"},
+    ]),
+    ("Notification", "error", [
+        {"type": "command", "command": f"{adapter} error"},
+    ]),
+    ("PreToolUse", "AskUserQuestion", [
+        {"type": "command", "command": f"{adapter} pre_ask_user_question"},
+    ]),
+    ("PostToolUse", "AskUserQuestion", [
+        {"type": "command", "command": f"{adapter} post_ask_user_question"},
+    ]),
+    ("UserPromptSubmit", None, [
+        {"type": "command", "command": f"{adapter} user_prompt_submit"},
+    ]),
+    ("Stop", None, [
+        {"type": "command", "command": f"{adapter} stop"},
+    ]),
+]
+
+
+def is_scribe_hook(entry):
+    """Return True if a hook entry was installed by Scribe (any version)."""
+    for h in entry.get("hooks", []):
+        cmd = h.get("command", "")
+        # Legacy markers (pre-AI-Hook-Channel installs):
+        if "ClaudeState=" in cmd or "detect-claude-question" in cmd:
+            return True
+        # Current marker: any path ending in ai-hook-claude.sh.
+        if "ai-hook-claude.sh" in cmd:
+            return True
+    return False
+
+
+def merge_event_hooks(existing_entries, scribe_entries):
+    """Drop any Scribe-owned entries, prepend the new ones."""
+    kept = [e for e in existing_entries if not is_scribe_hook(e)]
+    return scribe_entries + kept
+
+
+if os.path.isfile(settings_path):
+    with open(settings_path) as f:
+        settings = json.load(f)
+else:
+    settings = {}
+
+hooks = settings.setdefault("hooks", {})
+
+scribe_by_event: dict[str, list] = {}
+for event, matcher, hook_cmds in SCRIBE_HOOKS:
+    entry: dict = {"hooks": hook_cmds}
+    if matcher is not None:
+        entry["matcher"] = matcher
+    scribe_by_event.setdefault(event, []).append(entry)
+
+for event, scribe_entries in scribe_by_event.items():
+    existing = hooks.get(event, [])
+    hooks[event] = merge_event_hooks(existing, scribe_entries)
+
+settings["hooks"] = hooks
+
+# ── statusLine ───────────────────────────────────────────────────────
+# Remove any Scribe-owned statusLine before re-inserting so a path move
+# (e.g. switching from scribe-claude-statusline.sh to ai-hook-statusline.sh)
+# updates cleanly.
+existing_sl = settings.get("statusLine")
+if isinstance(existing_sl, dict):
+    cmd = existing_sl.get("command", "")
+    if cmd.endswith("scribe-claude-statusline.sh") or cmd.endswith("ai-hook-statusline.sh"):
+        settings.pop("statusLine", None)
+
 existing_sl = settings.get("statusLine")
 if existing_sl is None:
     settings["statusLine"] = {
         "type": "command",
-        "command": shim,
+        "command": statusline,
         "padding": 0,
     }
-elif isinstance(existing_sl, dict) and existing_sl.get("command", "").endswith("scribe-claude-statusline.sh"):
-    # Already pointing at our shim — refresh path in case of relocation.
-    existing_sl["command"] = shim
+elif isinstance(existing_sl, dict) and existing_sl.get("command", "").endswith(
+    ("scribe-claude-statusline.sh", "ai-hook-statusline.sh")
+):
+    existing_sl["command"] = statusline
     existing_sl.setdefault("type", "command")
     existing_sl.setdefault("padding", 0)
 else:
-    # User has their own statusLine; do not clobber.
     print(
         "scribe: leaving custom statusLine intact; "
         "Claude context % will not be displayed unless you point statusLine at "
-        + shim,
+        + statusline,
         file=sys.stderr,
     )
 
-# Write atomically via tmp + rename
+# Atomic write via tmp + rename.
 tmp_path = settings_path + ".tmp"
 with open(tmp_path, "w") as f:
     json.dump(settings, f, indent=2)
@@ -205,7 +168,7 @@ with open(tmp_path, "w") as f:
 os.replace(tmp_path, settings_path)
 
 print(f"  Updated {settings_path}")
-print("  Scribe Claude Code hooks are configured.")
+print("  Scribe Claude Code hooks now route via scribe-hook-helper IPC.")
 PYEOF
 
 echo ""

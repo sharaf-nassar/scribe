@@ -108,6 +108,13 @@ pub struct Pane {
     /// (not `Instant`) so it can be serialized into the cold-restart
     /// snapshot as Unix-epoch seconds.
     pub latest_prompt_at: Option<SystemTime>,
+    /// Wall-clock time the LLM finished responding to the most recent
+    /// prompt (transitioned out of `Processing`). When `Some`, the prompt
+    /// bar's elapsed-time counter freezes at this instant instead of
+    /// ticking; when `None` the counter is live. Cleared on new prompt,
+    /// `AiStateCleared`, and conversation reset; re-set whenever AI state
+    /// transitions out of `Processing`.
+    pub latest_prompt_finished_at: Option<SystemTime>,
     /// Total number of prompts received in this session.
     pub prompt_count: u32,
     /// Last-seen `conversation_id` for detecting session resets.
@@ -203,6 +210,7 @@ impl Pane {
             first_prompt: None,
             latest_prompt: None,
             latest_prompt_at: None,
+            latest_prompt_finished_at: None,
             prompt_count: 0,
             last_conversation_id: None,
             prompt_ui: PromptUiState::default(),
