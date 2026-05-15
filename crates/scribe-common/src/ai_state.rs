@@ -6,16 +6,13 @@ use serde::{Deserialize, Serialize};
 pub enum AiProvider {
     ClaudeCode,
     CodexCode,
-    #[serde(rename = "auggie", alias = "auggie_code")]
-    Auggie,
 }
 
 fn default_ai_provider() -> AiProvider {
     AiProvider::ClaudeCode
 }
 
-const AI_PROVIDERS: [AiProvider; 3] =
-    [AiProvider::ClaudeCode, AiProvider::CodexCode, AiProvider::Auggie];
+const AI_PROVIDERS: [AiProvider; 2] = [AiProvider::ClaudeCode, AiProvider::CodexCode];
 
 impl AiProvider {
     #[must_use]
@@ -28,7 +25,6 @@ impl AiProvider {
         match self {
             AiProvider::ClaudeCode => "claude_code",
             AiProvider::CodexCode => "codex_code",
-            AiProvider::Auggie => "auggie",
         }
     }
 
@@ -45,7 +41,6 @@ impl AiProvider {
         match self {
             AiProvider::ClaudeCode => "Claude Code",
             AiProvider::CodexCode => "Codex",
-            AiProvider::Auggie => "Auggie",
         }
     }
 
@@ -54,59 +49,19 @@ impl AiProvider {
         match self {
             AiProvider::ClaudeCode => "claude",
             AiProvider::CodexCode => "codex",
-            AiProvider::Auggie => "auggie",
-        }
-    }
-
-    #[must_use]
-    pub fn state_osc_key(self) -> &'static str {
-        match self {
-            AiProvider::ClaudeCode => "ClaudeState",
-            AiProvider::CodexCode => "CodexState",
-            AiProvider::Auggie => "AuggieState",
-        }
-    }
-
-    /// OSC 1337 key for context-only refreshes emitted by status-line /
-    /// usage-poll producers that should never change the AI state.
-    /// Format: `ESC ] 1337 ; <Provider>Context=<u8> ST` (no other params).
-    #[must_use]
-    pub fn context_osc_key(self) -> &'static str {
-        match self {
-            AiProvider::ClaudeCode => "ClaudeContext",
-            AiProvider::CodexCode => "CodexContext",
-            AiProvider::Auggie => "AuggieContext",
-        }
-    }
-
-    #[must_use]
-    pub fn prompt_osc_key(self) -> &'static str {
-        match self {
-            AiProvider::ClaudeCode => "ClaudePrompt",
-            AiProvider::CodexCode => "CodexPrompt",
-            AiProvider::Auggie => "AuggiePrompt",
-        }
-    }
-
-    #[must_use]
-    pub fn task_label_osc_key(self) -> Option<&'static str> {
-        match self {
-            AiProvider::ClaudeCode => None,
-            AiProvider::CodexCode => Some("CodexTaskLabel"),
-            AiProvider::Auggie => Some("AuggieTaskLabel"),
         }
     }
 
     #[must_use]
     pub fn resume_args(self) -> &'static [&'static str] {
         match self {
-            AiProvider::ClaudeCode | AiProvider::Auggie => &["--resume"],
+            AiProvider::ClaudeCode => &["--resume"],
             AiProvider::CodexCode => &["resume"],
         }
     }
 }
 
-/// Core AI process states emitted by AI coding CLIs via OSC 1337 hooks.
+/// Core AI process states emitted by supported AI coding CLIs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiState {
@@ -118,7 +73,6 @@ pub enum AiState {
 }
 
 /// Full AI process state with optional metadata keys.
-/// Parsed from: `ESC ] 1337 ; <Provider>State=<state> [; key=value]... ST`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiProcessState {
     #[serde(default = "default_ai_provider")]

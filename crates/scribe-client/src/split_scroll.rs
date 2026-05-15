@@ -19,7 +19,7 @@ const MIN_PIN_ROWS: usize = 3;
 
 /// Default rows reserved for the AI tool's prompt UI block.
 ///
-/// Claude Code, Codex, and Auggie all render a prompt block several rows
+/// Claude Code and Codex both render a prompt block several rows
 /// tall — a status line, permission/help hints, the input box border, and
 /// the input row. 8 rows fits the typical block without consuming half the
 /// screen, which keeps scrollback readable in the top portion.

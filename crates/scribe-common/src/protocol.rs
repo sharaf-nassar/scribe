@@ -38,8 +38,6 @@ pub enum AutomationAction {
     NewClaudeResumeTab,
     NewCodexTab,
     NewCodexResumeTab,
-    NewAuggieTab,
-    NewAuggieResumeTab,
     SplitVertical,
     SplitHorizontal,
     ClosePane,

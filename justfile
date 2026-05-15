@@ -96,10 +96,6 @@ setup-claude:
 setup-codex:
     bash dist/setup-codex-hooks.sh --hook-source dist
 
-# Set up Auggie AI indicator hooks (run after installing Augment Code)
-setup-auggie:
-    bash dist/setup-auggie-hooks.sh --hook-source dist
-
 # ==================== E2E Testing ====================
 
 # Rebuild functional test container (after cargo build --release)

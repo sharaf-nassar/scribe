@@ -921,8 +921,6 @@ pub struct TerminalAiIntegrationConfig {
     pub claude_code: AiIntegrationToggle,
     #[serde(default, rename = "codex_code_integration")]
     pub codex_code: AiIntegrationToggle,
-    #[serde(default, rename = "auggie_integration")]
-    pub auggie: AiIntegrationToggle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -932,10 +930,6 @@ pub struct TerminalAiSessionConfig {
     /// the sequence is passed through, matching standard terminal behaviour.
     #[serde(default = "default_true")]
     pub preserve_ai_scrollback: bool,
-    /// Compatibility-only state for legacy settings surfaces.
-    /// Runtime AI tab routing uses explicit provider actions.
-    #[serde(default = "default_ai_tab_provider")]
-    pub ai_tab_provider: AiProvider,
     /// Per-state configuration for AI indicators.
     #[serde(default, alias = "claude_states")]
     pub ai_states: AiStateStylesConfig,
@@ -953,7 +947,6 @@ impl Default for TerminalAiSessionConfig {
     fn default() -> Self {
         Self {
             preserve_ai_scrollback: true,
-            ai_tab_provider: default_ai_tab_provider(),
             ai_states: AiStateStylesConfig::default(),
             context_thresholds: AiContextThresholds::default(),
             indicator_height: default_indicator_height(),
@@ -1041,7 +1034,6 @@ impl TerminalConfig {
         match provider {
             AiProvider::ClaudeCode => self.ai_integration.claude_code.enabled(),
             AiProvider::CodexCode => self.ai_integration.codex_code.enabled(),
-            AiProvider::Auggie => self.ai_integration.auggie.enabled(),
         }
     }
 }
@@ -1064,10 +1056,6 @@ impl Default for ShellIntegrationConfig {
 
 fn default_scrollback_lines() -> u32 {
     10_000
-}
-
-fn default_ai_tab_provider() -> AiProvider {
-    AiProvider::ClaudeCode
 }
 
 fn default_indicator_height() -> f32 {
@@ -1127,10 +1115,6 @@ pub struct KeybindingsConfig {
     pub new_codex_tab: KeyComboList,
     #[serde(default = "default_new_codex_resume_tab")]
     pub new_codex_resume_tab: KeyComboList,
-    #[serde(default = "default_new_auggie_tab")]
-    pub new_auggie_tab: KeyComboList,
-    #[serde(default = "default_new_auggie_resume_tab")]
-    pub new_auggie_resume_tab: KeyComboList,
     #[serde(default = "default_close_tab")]
     pub close_tab: KeyComboList,
     #[serde(default = "default_next_tab")]
@@ -1235,8 +1219,6 @@ impl Default for KeybindingsConfig {
             new_claude_resume_tab: default_new_claude_resume_tab(),
             new_codex_tab: default_new_codex_tab(),
             new_codex_resume_tab: default_new_codex_resume_tab(),
-            new_auggie_tab: default_new_auggie_tab(),
-            new_auggie_resume_tab: default_new_auggie_resume_tab(),
             close_tab: default_close_tab(),
             next_tab: default_next_tab(),
             prev_tab: default_prev_tab(),
@@ -1360,14 +1342,6 @@ fn default_new_codex_tab() -> KeyComboList {
 
 fn default_new_codex_resume_tab() -> KeyComboList {
     platform_combo("cmd+alt+e", "ctrl+alt+e")
-}
-
-fn default_new_auggie_tab() -> KeyComboList {
-    platform_combo("cmd+alt+g", "ctrl+alt+g")
-}
-
-fn default_new_auggie_resume_tab() -> KeyComboList {
-    platform_combo("cmd+alt+shift+g", "ctrl+alt+shift+g")
 }
 
 fn default_close_tab() -> KeyComboList {

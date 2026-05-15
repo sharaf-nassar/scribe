@@ -206,7 +206,8 @@ mod tests {
             last_message: "Done. All set.".to_owned(),
             conversation_id: None,
         };
-        let Some(MetadataEvent::AiStateChanged(ai_state)) = translate(AiProvider::Auggie, event)
+        let Some(MetadataEvent::AiStateChanged(ai_state)) =
+            translate(AiProvider::ClaudeCode, event)
         else {
             panic!("expected AiStateChanged");
         };
@@ -217,7 +218,7 @@ mod tests {
     fn translate_state_cleared_yields_ai_state_cleared() {
         let event = HookEventKind::StateCleared;
         assert!(matches!(
-            translate(AiProvider::Auggie, event),
+            translate(AiProvider::ClaudeCode, event),
             Some(MetadataEvent::AiStateCleared)
         ));
     }
@@ -279,11 +280,11 @@ mod tests {
     fn translate_task_label_cleared_preserves_provider() {
         let event = HookEventKind::TaskLabelCleared;
         let Some(MetadataEvent::TaskLabelCleared { provider }) =
-            translate(AiProvider::Auggie, event)
+            translate(AiProvider::CodexCode, event)
         else {
             panic!("expected TaskLabelCleared");
         };
-        assert_eq!(provider, AiProvider::Auggie);
+        assert_eq!(provider, AiProvider::CodexCode);
     }
 
     #[test]
@@ -312,7 +313,7 @@ mod tests {
     #[test]
     fn build_ai_state_strips_newlines_from_conversation_id() {
         let ai_state = build_ai_state(
-            AiProvider::Auggie,
+            AiProvider::ClaudeCode,
             AiState::Processing,
             Some("real-id\nlabel=injected".to_owned()),
         );

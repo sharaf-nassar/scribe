@@ -81,33 +81,31 @@ This is a multi-crate Rust workspace (see [plan.md](./plan.md) Project Structure
 - [x] T026 [US1] Update `lat.md/architecture.md` Crate Map: add new entry for `scribe-hook-helper` after `scribe-cli`. Brief: "Tiny binary invoked by AI-tool-installed hook adapter scripts to emit one `HookEvent` to the running server."
 - [x] T027 [US1] Run `lat check` from repo root; resolve any broken refs introduced by T024–T026.
 
-**Checkpoint**: User Story 1 fully functional. Test independently per quickstart scenario 1 (subscenarios 1a–1d). Codex and Auggie still on the old broken path — that is Phase 4.
+**Checkpoint**: User Story 1 fully functional. Test independently per quickstart scenario 1 (subscenarios 1a–1d). Codex still uses the old broken path — that is Phase 4.
 
 ---
 
-## Phase 4: User Story 2 — Codex and Auggie surface parity (Priority: P2)
+## Phase 4: User Story 2 — Codex surface parity (Priority: P2)
 
-**Goal**: Codex and Auggie sessions in Scribe gain the same tab-indicator and prompt-bar behavior on the new channel, with no per-provider transport divergence.
+**Goal**: Codex sessions in Scribe gain the same tab-indicator and prompt-bar behavior on the new channel, with no per-provider transport divergence.
 
-**Independent Test**: Quickstart scenarios 2a–2c. After this phase: state transitions, prompt bar, and task labels work identically across Claude, Codex, and Auggie sessions.
+**Independent Test**: Quickstart scenarios 2a–2b. After this phase: state transitions, prompt bar, and task labels work identically across Claude and Codex sessions.
 
 ### Tests for User Story 2
 
-- [ ] T028 [P] [US2] Extend `tests/install/ipc-hook-regressions.sh` (created in T014) with cases for `dist/ai-hook-codex.sh` and `dist/ai-hook-auggie.sh`: feed sample Codex hook JSON and Auggie hook JSON, assert the helper mock receives the right flags. Confirm the script still exits 0 on missing fields, missing `python3`, etc.
+- [ ] T028 [P] [US2] Extend `tests/install/ipc-hook-regressions.sh` (created in T014) with cases for `dist/ai-hook-codex.sh`: feed sample Codex hook JSON, assert the helper mock receives the right flags. Confirm the script still exits 0 on missing fields, missing `python3`, etc.
 - [ ] T029 [P] [US2] Add a roundtrip case to `crates/scribe-server/tests/hook_channel_roundtrip.rs` that sends `HookEvent { provider: CodexCode, kind: TaskLabelChanged { … } }` and asserts a `ServerMessage::CodexTaskLabelChanged` arrives (not `TaskLabelChanged` — verifies the provider-aware routing in T016).
 
 ### Implementation for User Story 2
 
 - [x] T030 [P] [US2] Write `dist/ai-hook-codex.sh` modeled on `dist/ai-hook-claude.sh` from T018, but extracting Codex's hook payload fields (different JSON schema — consult `dist/codex-prompt-state.sh`, `dist/detect-codex-question.sh`, `dist/codex-task-label.sh` for the field names before deleting them in T034). Note Codex's task-label flow uses a different event matcher than Claude.
-- [x] T031 [P] [US2] Write `dist/ai-hook-auggie.sh` modeled on the Auggie hook flow (consult `dist/auggie-state.sh` and `dist/setup-auggie-hooks.sh`). Auggie emits prompts from the `Stop` hook (per `includeConversationData` docs) — adapter must call `--event=prompt_received` AND `--event=session_stopped` from the same Stop fire if both apply.
 - [x] T032 [US2] Rewrite `dist/setup-codex-hooks.sh`. Replace all `~/.codex/hooks.json` entries that invoked `codex-hook-common.sh`, `codex-prompt-state.sh`, `detect-codex-question.sh`, `codex-task-label.sh`, `detect-codex-context.sh` with adapter invocations: `/usr/share/scribe/ai-hook-codex.sh <event_name>`. Preserve the `~/.codex/config.toml` `[features].hooks = true` toggle. Depends on T030.
-- [x] T033 [US2] Rewrite `dist/setup-auggie-hooks.sh` analogously. Depends on T031.
-- [x] T034 [US2] Delete the now-obsolete shell scripts: `dist/codex-hook-common.sh`, `dist/codex-prompt-state.sh`, `dist/codex-task-label.sh`, `dist/detect-codex-question.sh`, `dist/detect-codex-context.sh`, `dist/auggie-state.sh`. Remove their entries from `crates/scribe-server/Cargo.toml` deb-asset tables (both stable and dev) and `dist/macos/build-dmg.sh`.
-- [x] T035 [US2] Update `dist/debian/postinst` if any reference to the deleted scripts exists (search for `codex-hook-common`, `codex-prompt-state`, `detect-codex-context`, etc.). The `setup-{claude,codex,auggie}-hooks.sh` invocations at `:680/:698/:716` stay; only auxiliary path references need cleanup.
-- [x] T036 [US2] Update `lat.md/pty.md` "OSC 1337 — AI State" / "Prompt Text" sections were removed in T024; confirm no stale Codex/Auggie OSC references survive. Update `lat.md/common.md` AI State section to note that state now arrives via the hook channel, not OSC, for all three providers.
+- [x] T034 [US2] Delete the now-obsolete shell scripts: `dist/codex-hook-common.sh`, `dist/codex-prompt-state.sh`, `dist/codex-task-label.sh`, `dist/detect-codex-question.sh`, `dist/detect-codex-context.sh`. Remove their entries from `crates/scribe-server/Cargo.toml` deb-asset tables (both stable and dev) and `dist/macos/build-dmg.sh`.
+- [x] T035 [US2] Update `dist/debian/postinst` if any reference to the deleted scripts exists (search for `codex-hook-common`, `codex-prompt-state`, `detect-codex-context`, etc.). The `setup-{claude,codex}-hooks.sh` invocations stay; only auxiliary path references need cleanup.
+- [x] T036 [US2] Update `lat.md/pty.md` "OSC 1337 — AI State" / "Prompt Text" sections were removed in T024; confirm no stale Codex OSC references survive. Update `lat.md/common.md` AI State section to note that state now arrives via the hook channel, not OSC, for both providers.
 - [x] T037 [US2] Re-run `lat check`; resolve broken refs.
 
-**Checkpoint**: User Stories 1 AND 2 both work independently. All three production providers route via the new channel. Quickstart 2a–2c pass.
+**Checkpoint**: User Stories 1 AND 2 both work independently. Both production providers route via the new channel. Quickstart 2a–2b pass.
 
 ---
 
@@ -115,7 +113,7 @@ This is a multi-crate Rust workspace (see [plan.md](./plan.md) Project Structure
 
 **Goal**: Verify FR-018 — the architecture supports a new provider with only a new adapter script. This phase is partly a verification exercise and partly documentation.
 
-**Independent Test**: Quickstart scenario 3a — the manual "Foo" provider walkthrough. The exercise confirms that no transport, helper, env-var, or server-consumer code needs to change to add a fourth provider.
+**Independent Test**: Quickstart scenario 3a — the manual "Foo" provider walkthrough. The exercise confirms that no transport, helper, env-var, or server-consumer code needs to change to add another provider.
 
 ### Tests for User Story 3
 
@@ -138,7 +136,7 @@ This is a multi-crate Rust workspace (see [plan.md](./plan.md) Project Structure
 ### Tests for User Story 4
 
 - [ ] T040 [P] [US4] Extend the unit tests in T012 with explicit cases: helper invoked with `SCRIBE_HOOK_SOCK` set to `/tmp/nonexistent.sock` exits 0 within the 100 ms budget; helper invoked with malformed UUID in `SCRIBE_SESSION_ID` exits 0; helper invoked with both env vars unset exits 0 without touching the args; helper invoked through `sh -c '… helper …'` (one level of subshell) and through `env -i SCRIBE_HOOK_SOCK=… SCRIBE_SESSION_ID=… sh -c '… helper …'` (env scrubbed except for the two Scribe vars) behaves identically — covers FR-024 subshell / wrapper propagation.
-- [ ] T041 [P] [US4] Extend `tests/install/ipc-hook-regressions.sh` (T014) with `unset SCRIBE_HOOK_SOCK SCRIBE_SESSION_ID` cases for every adapter (`ai-hook-claude.sh`, `ai-hook-codex.sh`, `ai-hook-auggie.sh`, `ai-hook-statusline.sh`); assert each exits 0 with empty stdout and empty stderr. Also add a wrapped-invocation case (`sh -c 'env … ai-hook-claude.sh'`) verifying that one level of subshell preserves env-var inheritance — covers FR-024.
+- [ ] T041 [P] [US4] Extend `tests/install/ipc-hook-regressions.sh` (T014) with `unset SCRIBE_HOOK_SOCK SCRIBE_SESSION_ID` cases for every adapter (`ai-hook-claude.sh`, `ai-hook-codex.sh`, `ai-hook-statusline.sh`); assert each exits 0 with empty stdout and empty stderr. Also add a wrapped-invocation case (`sh -c 'env … ai-hook-claude.sh'`) verifying that one level of subshell preserves env-var inheritance — covers FR-024.
 - [ ] T042 [P] [US4] Add a "no stderr" assertion to the integration test in T013: capture stderr of the test's helper invocations (when run in a context with stale env) and assert it is empty bytewise.
 
 ### Implementation for User Story 4
@@ -156,7 +154,7 @@ This is a multi-crate Rust workspace (see [plan.md](./plan.md) Project Structure
 
 - [x] T045 [P] Update `lat.md/protocol.md`: add the new `ClientMessage::HookEvent` variant and the `HookEvent` / `HookEventKind` types to the documented protocol surface. Cross-link to `[[crates/scribe-common/src/hook.rs#HookEvent]]` and `[[crates/scribe-common/src/protocol.rs#ClientMessage]]`.
 - [x] T046 [P] Update `lat.md/test.md`: add new section "Hook Channel Roundtrip Tests" describing the integration test pattern; add entry for `tests/install/ipc-hook-regressions.sh` under "Installer Script Regression Harness".
-- [x] T047 [P] Update `justfile`: if `setup-claude`/`setup-codex`/`setup-auggie` targets reference deleted scripts, update them. Add a `scribe-hook-helper-bin` target if convenient for dev workflow.
+- [x] T047 [P] Update `justfile`: if `setup-claude`/`setup-codex` targets reference deleted scripts, update them. Add a `scribe-hook-helper-bin` target if convenient for dev workflow.
 - [x] T048 Run `cargo clippy --workspace -- -D warnings` and resolve any new lints introduced by this feature. NO new `#[allow]` or `#[expect]` suppressions per `tools/check-no-new-lint-suppressions.sh`.
 - [x] T049 Run `tools/check-no-new-lint-suppressions.sh` and confirm zero new entries.
 - [x] T050 Run `lat check` from repo root; resolve any remaining broken refs across all `lat.md/` updates from T024–T026, T036, T039, T044, T045, T046.
@@ -164,7 +162,7 @@ This is a multi-crate Rust workspace (see [plan.md](./plan.md) Project Structure
 - [x] T052 [P] Run `cargo test --workspace`; confirm all pass.
 - [ ] T053 Measure hook-fire-to-`AiStateChanged` latency under synthetic load (SC-002 enforcement). Spawn `scribe-test ipc-trace --filter AiStateChanged --duration 60` in the background and drive each `HookEventKind` variant via `scribe-hook-helper` at 5-second intervals against an in-process server (reuse the `crates/scribe-server/tests/replay_roundtrip.rs` pattern; gate behind `cargo test --release -- --ignored perf_latency`). Compute p95 from the trace. **Fail the implementation if p95 > 200 ms.** Record the measured value as a comment in `plan.md`'s Performance Goals section or in an implementation summary.
 - [x] T054 Execute every scenario in [quickstart.md](./quickstart.md) manually. Tick off each acceptance check. Treat any failure as blocking.
-- [ ] T055 Confirm SC-007 / FR-022 / SC-008 with three greps: (a) `grep -RIn '> /dev/tty' dist/` returns no matches (SC-007); (b) `grep -nE 'ClaudeState\|CodexState\|AuggieState' crates/scribe-pty/src/metadata.rs` is empty (FR-022); (c) `grep -RInE 'ClaudeState=\|CodexState=\|AuggieState=\|ClaudePrompt=\|CodexPrompt=\|AuggiePrompt=\|ClaudeTaskLabel=\|CodexTaskLabel=' dist/ai-hook-*.sh dist/setup-*-hooks.sh` returns no matches (SC-008 zero-duplication of state-emission strings in adapter / installer scripts). Note: `dist/shell-integration/` may still contain `ScribeAiLaunch=` references per FR-023; that is expected and out of scope.
+- [ ] T055 Confirm SC-007 / FR-022 / SC-008 with three greps: (a) `grep -RIn '> /dev/tty' dist/` returns no matches (SC-007); (b) `grep -nE 'ClaudeState\|CodexState' crates/scribe-pty/src/metadata.rs` is empty (FR-022); (c) `grep -RInE 'ClaudeState=\|CodexState=\|ClaudePrompt=\|CodexPrompt=\|ClaudeTaskLabel=\|CodexTaskLabel=' dist/ai-hook-*.sh dist/setup-*-hooks.sh` returns no matches (SC-008 zero-duplication of state-emission strings in adapter / installer scripts). Note: `dist/shell-integration/` may still contain `ScribeAiLaunch=` references per FR-023; that is expected and out of scope.
 - [ ] T056 Ask the user for explicit approval before `just restart-server` (CLAUDE.md mandates this). If approved, restart and run quickstart scenarios with the fresh server. If not approved, document that the next user restart will pick up the changes.
 
 ---
@@ -185,7 +183,7 @@ This is a multi-crate Rust workspace (see [plan.md](./plan.md) Project Structure
 
 - **Phase 2 (Foundational)**: T003 → T004 (variant depends on types) → T005, T006 [P], T007 (depends on T003, T004), T008 [P], T010 → T009 (dispatch depends on ingress stub + variant).
 - **Phase 3 (US1)**: tests T011–T014 [P] first; then implementation T015 (helper main), T017 (classifier), T016 (ingress) — these three can run in parallel since they're different files. T018, T019 [P] then T020 (setup script depends on adapters). T021 (delete OSC parsing) can run any time after T016. T022, T023 (packaging) after T018–T019. T024–T026 [P] (lat.md updates). T027 (lat check) last.
-- **Phase 4 (US2)**: tests T028, T029 [P] first; T030, T031 [P]; T032 depends on T030; T033 depends on T031; T034 after both; T035 cleanup; T036, T037 lat.
+- **Phase 4 (US2)**: tests T028, T029 [P] first; T030 writes the Codex adapter; T032 depends on T030; T034 deletes obsolete Codex scripts; T035 cleanup; T036, T037 lat.
 - **Phase 5 (US3)**: T038, T039 are independent and can run in either order.
 - **Phase 6 (US4)**: T040, T041, T042 [P] first; T043 if any tests fail; T044 lat.
 - **Phase 7**: T045–T047 [P]; T048, T049 sequential (lint chain); T050 lat; T051, T052 [P]; T053 latency measurement; T054 manual quickstart; T055 final greps; T056 last (requires user approval).
@@ -194,7 +192,7 @@ This is a multi-crate Rust workspace (see [plan.md](./plan.md) Project Structure
 
 - **Foundational**: T003 + T005 + T008 can run together. T006 (env injection) is independent of types and can run in parallel too.
 - **US1**: All four test tasks (T011, T012, T013, T014) parallelizable; helper / ingress / classifier (T015, T016, T017) parallelizable; adapter scripts (T018, T019) parallelizable; lat docs (T024, T025, T026) parallelizable.
-- **US2**: T028 + T029 [P]; T030 + T031 [P].
+- **US2**: T028 + T029 [P].
 - **US4**: T040 + T041 + T042 [P].
 - **Polish**: T045 + T046 + T047 [P]; T051 + T052 [P].
 
@@ -234,13 +232,13 @@ Task T026 — lat.md/architecture.md updates
 2. Phase 2 (Foundational) — wire types, dispatch, env. Verify `cargo check --workspace` passes and env vars reach a child shell.
 3. Phase 3 (US1) — full Claude path: helper + ingress + classifier + adapter + statusline + setup script + OSC parser removal + lat.md sync.
 4. **STOP and VALIDATE**: Run quickstart 1a–1d. Confirm AskUserQuestion succeeds, indicators update, no leakage.
-5. Decision point: ship MVP (Claude only) or proceed to Phase 4 for Codex/Auggie parity.
+5. Decision point: ship MVP (Claude only) or proceed to Phase 4 for Codex parity.
 
 ### Incremental Delivery
 
 1. Phase 1 + Phase 2 → foundation ready.
 2. Phase 3 → **MVP**, quickstart 1 passes.
-3. Phase 4 → quickstart 2 passes; Codex + Auggie back on parity (and now actually using the same channel, not silently no-oping).
+3. Phase 4 → quickstart 2 passes; Codex back on parity (and now actually using the same channel, not silently no-oping).
 4. Phase 6 → safety tests pin FR-025.
 5. Phase 5 → verify extensibility.
 6. Phase 7 → polish + final lat.md sync + manual quickstart sweep.
@@ -250,7 +248,7 @@ Task T026 — lat.md/architecture.md updates
 With multiple developers after Phase 2:
 
 - **Developer A**: Phase 3 US1 (highest priority, MVP).
-- **Developer B**: Phase 4 US2 (Codex + Auggie adapters — can start once helper signature is fixed by Phase 2).
+- **Developer B**: Phase 4 US2 (Codex adapter — can start once helper signature is fixed by Phase 2).
 - **Developer C**: Phase 6 US4 (safety tests — needs helper from US1 to land first; can prepare test scaffolding meanwhile).
 
 US3 (Phase 5) waits until US1 and US2 complete because it verifies their combined surface.

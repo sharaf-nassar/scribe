@@ -11,7 +11,6 @@ cargo build --release --workspace
 # Reinstall hooks (writes new adapter scripts and registers them in the AI tools' settings files).
 just setup-claude   # writes ~/.claude/settings.json, ~/.claude/hooks/...
 just setup-codex    # writes ~/.codex/config.toml, ~/.codex/hooks.json
-just setup-auggie   # writes ~/.augment/...
 
 # Confirm the helper binary is reachable.
 ls -l /usr/share/scribe/scribe-hook-helper
@@ -86,9 +85,9 @@ cat ~/.claude/projects/*/sessions/<latest>.jsonl | jq '.message.content' | grep 
 
 ---
 
-## Scenario 2 — US2: Codex / Auggie surface parity (P2)
+## Scenario 2 — US2: Codex surface parity (P2)
 
-**Goal**: verify Codex and Auggie state, prompt, and task-label flow identically to Claude via the same channel.
+**Goal**: verify Codex state, prompt, and task-label flow identically to Claude via the same channel.
 
 ### 2a. Codex state transitions
 
@@ -105,17 +104,7 @@ codex
 - On task completion, tab strip shows the sanitized task label (e.g. "Add user auth").
 - After Codex idles, label clears and indicator returns to `idle_prompt`.
 
-### 2b. Auggie state transitions
-
-```sh
-# In a fresh Scribe tab:
-auggie
-# Submit a prompt; let it complete.
-```
-
-**Expected**: same indicator + prompt-bar behavior as Codex. The same `scribe-hook-helper` binary handles all three.
-
-### 2c. Context-window indicator (Claude statusline)
+### 2b. Context-window indicator (Claude statusline)
 
 ```sh
 # In a Scribe tab with active Claude session:
@@ -239,7 +228,7 @@ grep -RIn '> /dev/tty' /usr/share/scribe/ ~/.claude/settings.json ~/.codex/hooks
 ### No OSC 1337 AI hook parser code remains
 
 ```sh
-grep -n 'ClaudeState\|CodexState\|AuggieState' crates/scribe-pty/src/metadata.rs
+grep -n 'ClaudeState\|CodexState' crates/scribe-pty/src/metadata.rs
 # Expected: no output. FR-022 holds.
 
 grep -n 'ScribeAiLaunch' crates/scribe-pty/src/metadata.rs

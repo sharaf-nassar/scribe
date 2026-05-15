@@ -84,7 +84,6 @@ function __scribe_fish_prompt --on-event fish_prompt
 
     # Clear any stale provider task label once control returns to the shell.
     printf '\e]1337;CodexTaskLabelCleared\e\\'
-    printf '\e]1337;AuggieTaskLabelCleared\e\\'
 
     # OSC 2 — window title (basename of CWD)
     printf '\e]2;%s\e\\' (basename "$PWD")
@@ -121,8 +120,6 @@ function __scribe_fish_preexec --on-event fish_preexec
             printf '\e]1337;ScribeAiLaunch=claude_code\e\\'
         case codex
             printf '\e]1337;ScribeAiLaunch=codex_code\e\\'
-        case auggie
-            printf '\e]1337;ScribeAiLaunch=auggie\e\\'
     end
 end
 

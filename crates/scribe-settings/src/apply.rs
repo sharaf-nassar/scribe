@@ -292,7 +292,6 @@ fn apply_terminal_key(
         | "terminal.claude_copy_cleanup"
         | "terminal.claude_code_integration"
         | "terminal.codex_code_integration"
-        | "terminal.auggie_integration"
         | "terminal.preserve_ai_scrollback"
         | "terminal.natural_scroll" => apply_terminal_behavior_key(config, key, value),
         "terminal.prompt_bar"
@@ -339,11 +338,6 @@ fn apply_terminal_behavior_key(
                 scribe_common::config::AiIntegrationToggle::new(
                     value.as_bool().ok_or("codex_code_integration must be a boolean")?,
                 );
-        }
-        "terminal.auggie_integration" => {
-            config.terminal.ai_integration.auggie = scribe_common::config::AiIntegrationToggle::new(
-                value.as_bool().ok_or("auggie_integration must be a boolean")?,
-            );
         }
         "terminal.preserve_ai_scrollback" => {
             config.terminal.ai_session.preserve_ai_scrollback =
@@ -696,8 +690,6 @@ fn apply_keybinding_tab_actions(
         "new_claude_resume_tab" => kb.new_claude_resume_tab = list.clone(),
         "new_codex_tab" => kb.new_codex_tab = list.clone(),
         "new_codex_resume_tab" => kb.new_codex_resume_tab = list.clone(),
-        "new_auggie_tab" => kb.new_auggie_tab = list.clone(),
-        "new_auggie_resume_tab" => kb.new_auggie_resume_tab = list.clone(),
         "close_tab" => kb.close_tab = list.clone(),
         "next_tab" => kb.next_tab = list.clone(),
         "prev_tab" => kb.prev_tab = list.clone(),

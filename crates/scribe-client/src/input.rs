@@ -58,8 +58,6 @@ pub struct Bindings {
     pub new_claude_resume_tab: BindingSet,
     pub new_codex_tab: BindingSet,
     pub new_codex_resume_tab: BindingSet,
-    pub new_auggie_tab: BindingSet,
-    pub new_auggie_resume_tab: BindingSet,
     pub close_tab: BindingSet,
     pub next_tab: BindingSet,
     pub prev_tab: BindingSet,
@@ -205,8 +203,6 @@ impl Bindings {
             new_claude_resume_tab: parse_set(&config.new_claude_resume_tab),
             new_codex_tab: parse_set(&config.new_codex_tab),
             new_codex_resume_tab: parse_set(&config.new_codex_resume_tab),
-            new_auggie_tab: parse_set(&config.new_auggie_tab),
-            new_auggie_resume_tab: parse_set(&config.new_auggie_resume_tab),
             close_tab: parse_set(&config.close_tab),
             next_tab: parse_set(&config.next_tab),
             prev_tab: parse_set(&config.prev_tab),
@@ -321,10 +317,6 @@ pub enum LayoutAction {
     NewCodexTab,
     /// Open a new tab resuming Codex in the focused workspace.
     NewCodexResumeTab,
-    /// Open a new tab running Auggie in the focused workspace.
-    NewAuggieTab,
-    /// Open a new tab resuming Auggie in the focused workspace.
-    NewAuggieResumeTab,
     /// Close the active tab in the focused workspace.
     CloseTab,
     /// Switch to the next tab.
@@ -719,7 +711,7 @@ fn workspace_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAct
     ]
 }
 
-fn tab_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 20] {
+fn tab_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 18] {
     [
         BindingAction { bindings: &bindings.new_window, action: LayoutAction::NewWindow },
         BindingAction { bindings: &bindings.new_claude_tab, action: LayoutAction::NewClaudeTab },
@@ -731,11 +723,6 @@ fn tab_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 
         BindingAction {
             bindings: &bindings.new_codex_resume_tab,
             action: LayoutAction::NewCodexResumeTab,
-        },
-        BindingAction { bindings: &bindings.new_auggie_tab, action: LayoutAction::NewAuggieTab },
-        BindingAction {
-            bindings: &bindings.new_auggie_resume_tab,
-            action: LayoutAction::NewAuggieResumeTab,
         },
         BindingAction { bindings: &bindings.new_tab, action: LayoutAction::NewTab },
         BindingAction { bindings: &bindings.close_tab, action: LayoutAction::CloseTab },

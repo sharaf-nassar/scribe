@@ -125,7 +125,6 @@ __scribe_prompt_command() {
 
 	# Clear any stale provider task label once control returns to the shell.
 	printf '\e]1337;CodexTaskLabelCleared\e\\'
-	printf '\e]1337;AuggieTaskLabelCleared\e\\'
 
 	# OSC 2 — window title (basename of CWD)
 	printf '\e]2;%s\e\\' "${PWD##*/}"
@@ -162,7 +161,6 @@ __scribe_emit_ai_launch() {
 	case "$first_word" in
 		claude) printf '\e]1337;ScribeAiLaunch=claude_code\e\\' ;;
 		codex) printf '\e]1337;ScribeAiLaunch=codex_code\e\\' ;;
-		auggie) printf '\e]1337;ScribeAiLaunch=auggie\e\\' ;;
 	esac
 }
 trap '__scribe_emit_ai_launch' DEBUG

@@ -3100,30 +3100,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn auggie_task_label_metadata_uses_generic_wire_variant() {
-        let session_id = SessionId::new();
-        let Some((message, cwd)) = convert_metadata_event(
-            MetadataEvent::TaskLabelChanged {
-                provider: AiProvider::Auggie,
-                label: String::from("wire compatibility"),
-            },
-            session_id,
-        ) else {
-            panic!("convert_metadata_event returned None for TaskLabelChanged");
-        };
-
-        assert!(cwd.is_none());
-        assert!(matches!(
-            message,
-            ServerMessage::TaskLabelChanged {
-                session_id: sid,
-                provider: AiProvider::Auggie,
-                task_label,
-            } if sid == session_id && task_label == "wire compatibility"
-        ));
-    }
-
     #[tokio::test]
     async fn dispatch_action_routes_to_target_and_acknowledges_requester() {
         let connected = new_connected_clients();

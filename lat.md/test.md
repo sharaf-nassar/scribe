@@ -130,18 +130,6 @@ Offline shell harness for Debian `postinst` behavior so packaging regressions ca
 
 `tests/install/postinst-regressions.sh` sources only the variable and function definitions from `dist/debian/postinst` (truncating before the `SERVER_RUNTIME_GENERATION` invocation so the case-statement and trailing `exit 0` cannot terminate the harness) and exercises individual functions against fixtures. A python launcher `os.fork()`s a child that exits immediately and then sleeps to keep the orphan in zombie (`Z`) state, since bash auto-reaps its own backgrounded children. The harness currently asserts that `wait_for_pid_exit`, `stop_client_processes`, and `restart_singleton_binary` all treat a zombie PID as exited rather than blocking the post-upgrade relaunch.
 
-### Claude StatusLine Regressions
-
-Offline regression harness for `dist/scribe-claude-statusline.sh` covering JSON parsing, percentage derivation, clamping, and error paths. Skipped on macOS.
-
-Each case feeds a synthetic CC statusLine JSON under `script(1)` to capture stdout and `/dev/tty` OSC writes. Six cases: `case_used_percentage_present` (JSON has `used_percentage=73` → OSC `context=73` and banner `Sonnet 4.6 • 73%`), `case_fallback_to_tokens` (no `used_percentage`, raw token counts → derived percentage), `case_missing_context_window` (no `context_window` key → no OSC context= emitted), `case_malformed_json` (non-JSON input → no OSC emitted), `case_clamp_overflow` (`used_percentage=150` → clamped to `context=100`), `case_clamp_underflow` (zero/negative tokens → no context emitted or zero).
-
-### Codex Context Regressions
-
-Offline regression harness for `dist/detect-codex-context.sh` covering transcript-path selection, JSONL parsing, strict required fields, clamping, and missing-data paths. Skipped on macOS.
-
-Each case seeds a synthetic `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` in a temp HOME, runs the producer under `script(1)` with a Codex hook JSON payload, and asserts the emitted OSC bytes. Cases cover `last_token_usage.total_tokens/model_context_window`, transcript-path isolation from an unrelated newer rollout, overflow clamping, missing or invalid `transcript_path`, no `token_count` record, missing `last_token_usage`, and missing `model_context_window`.
-
 ## E2E Functional Tests
 
 Functional end-to-end tests that drive real sessions through the `scribe-test` harness and assert rendered output.

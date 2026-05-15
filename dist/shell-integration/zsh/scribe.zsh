@@ -54,7 +54,6 @@ __scribe_precmd() {
 
 	# Clear any stale provider task label once control returns to the shell.
 	printf '\e]1337;CodexTaskLabelCleared\e\\'
-	printf '\e]1337;AuggieTaskLabelCleared\e\\'
 
 	# OSC 2 — window title
 	printf '\e]2;%s\e\\' "${PWD:t}"
@@ -78,7 +77,6 @@ __scribe_preexec() {
 	case "$first_word" in
 		claude) printf '\e]1337;ScribeAiLaunch=claude_code\e\\' ;;
 		codex) printf '\e]1337;ScribeAiLaunch=codex_code\e\\' ;;
-		auggie) printf '\e]1337;ScribeAiLaunch=auggie\e\\' ;;
 	esac
 }
 

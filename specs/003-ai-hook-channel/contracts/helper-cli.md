@@ -6,7 +6,7 @@
 
 ```text
 scribe-hook-helper
-  --provider=<claude_code|codex_code|auggie>
+  --provider=<claude_code|codex_code>
   --event=<state_changed|session_stopped|state_cleared|prompt_received|task_label_changed|task_label_cleared|context_changed>
   [event-specific flags …]
 ```
@@ -17,7 +17,7 @@ The helper is invoked once per event. It always exits with status 0. It never wr
 
 | Flag | Required | Notes |
 |---|---|---|
-| `--provider=<id>` | yes | One of `AiProvider::id()` values: `claude_code`, `codex_code`, `auggie`. Mapped to `AiProvider` via `AiProvider::from_id` (`ai_state.rs:39`). Unknown value → exit 0 silently. |
+| `--provider=<id>` | yes | One of `AiProvider::id()` values: `claude_code`, `codex_code`. Mapped to `AiProvider` via `AiProvider::from_id` (`ai_state.rs:39`). Unknown value → exit 0 silently. |
 | `--event=<id>` | yes | Determines which `HookEventKind` variant to build. See per-event flags below. Unknown value → exit 0 silently. |
 
 ## Per-event flags

@@ -22,7 +22,7 @@ Replace the dead OSC-over-`/dev/tty` signaling path used by AI tool hook subproc
 - Helper MUST NOT open `/dev/tty` (FR-010).
 - Helper emission step (connect + write + close) MUST complete inside a short, bounded budget (FR-012). The plan sets this to 100 ms.
 - No backward compatibility / no fallback channel (Spec Clarifications + FR-020 through FR-022).
-**Scale/Scope**: Three supported providers (Claude Code, Codex, Auggie). Event rate is bounded by hook event frequency: typically 1–20 events per minute per active AI session under interactive use; bursts up to ~100/min during a tool-call-heavy turn. Concurrent active AI sessions: usually 1–4 panes in a single Scribe instance. Total Scribe IPC traffic is dominated by `PtyOutput`, not hook events.
+**Scale/Scope**: Two supported providers (Claude Code and Codex). Event rate is bounded by hook event frequency: typically 1–20 events per minute per active AI session under interactive use; bursts up to ~100/min during a tool-call-heavy turn. Concurrent active AI sessions: usually 1–4 panes in a single Scribe instance. Total Scribe IPC traffic is dominated by `PtyOutput`, not hook events.
 
 ## Constitution Check
 
@@ -85,11 +85,9 @@ crates/
 dist/
 ├── ai-hook-claude.sh                # NEW: thin adapter — read stdin, exec scribe-hook-helper
 ├── ai-hook-codex.sh                 # NEW: thin adapter
-├── ai-hook-auggie.sh                # NEW: thin adapter
 ├── ai-hook-statusline.sh            # NEW: thin adapter replacing scribe-claude-statusline.sh
 ├── setup-claude-hooks.sh            # REWRITE: register the new adapter, remove all printf>/dev/tty
 ├── setup-codex-hooks.sh             # REWRITE
-├── setup-auggie-hooks.sh            # REWRITE
 ├── codex-hook-common.sh             # DELETE
 ├── codex-prompt-state.sh            # DELETE
 ├── codex-task-label.sh              # DELETE (replaced by adapter)
@@ -115,7 +113,7 @@ lat.md/
 └── test.md                          # UPDATE: new regression harness entry
 ```
 
-**Structure Decision**: Multi-crate Rust workspace augmented by a new `scribe-hook-helper` binary crate and four replacement shell adapters. The new code lands in `scribe-server` (ingress + classifier), `scribe-common` (protocol variant), and `scribe-hook-helper` (emitter). The bulk of the diff is **deletions**: six shell scripts removed, OSC 1337 AI-hook parsing removed from `scribe-pty/src/metadata.rs`, the heuristic shell scripts replaced by ~80 lines of Rust. The substantive new surface is one ingress module, one classifier module, one CLI helper, and three (plus one statusline) ~10-line adapter scripts.
+**Structure Decision**: Multi-crate Rust workspace extended with a new `scribe-hook-helper` binary crate and three replacement shell adapters. The new code lands in `scribe-server` (ingress + classifier), `scribe-common` (protocol variant), and `scribe-hook-helper` (emitter). The bulk of the diff is **deletions**: seven shell scripts removed, OSC 1337 AI-hook parsing removed from `scribe-pty/src/metadata.rs`, the heuristic shell scripts replaced by ~80 lines of Rust. The substantive new surface is one ingress module, one classifier module, one CLI helper, and two (plus one statusline) ~10-line adapter scripts.
 
 ## Complexity Tracking
 

@@ -91,18 +91,8 @@ assets = [
     "755",
   ],
   [
-    "../../dist/ai-hook-auggie.sh",
-    "usr/share/scribe/ai-hook-auggie.sh",
-    "755",
-  ],
-  [
     "../../dist/setup-codex-hooks.sh",
     "usr/share/scribe/setup-codex-hooks.sh",
-    "755",
-  ],
-  [
-    "../../dist/setup-auggie-hooks.sh",
-    "usr/share/scribe/setup-auggie-hooks.sh",
     "755",
   ],
   [
@@ -202,18 +192,8 @@ assets = [
     "755",
   ],
   [
-    "../../dist/ai-hook-auggie.sh",
-    "usr/share/scribe-dev/ai-hook-auggie.sh",
-    "755",
-  ],
-  [
     "../../dist/setup-codex-hooks.sh",
     "usr/share/scribe-dev/setup-codex-hooks.sh",
-    "755",
-  ],
-  [
-    "../../dist/setup-auggie-hooks.sh",
-    "usr/share/scribe-dev/setup-auggie-hooks.sh",
     "755",
   ],
   [

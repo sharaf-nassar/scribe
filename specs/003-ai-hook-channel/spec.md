@@ -7,7 +7,7 @@
 
 ## Background
 
-Scribe installs hooks into each supported AI coding tool (Claude Code, Codex, Auggie) so the AI session's state — running, waiting for input, encountering an error, current prompt, task label, context-window fill — can be reflected in Scribe's tab indicators and prompt bar.
+Scribe installs hooks into each supported AI coding tool (Claude Code and Codex) so the AI session's state — running, waiting for input, encountering an error, current prompt, task label, context-window fill — can be reflected in Scribe's tab indicators and prompt bar.
 
 Today every hook signals state by emitting an OSC 1337 escape sequence to `/dev/tty`, where Scribe's PTY interceptor reads it off the wire. This worked while every hook subprocess had a controlling terminal.
 
@@ -16,7 +16,7 @@ On 2026-05-11, Claude Code v2.1.139 shipped this change in its release notes:
 > "Fixed a bug where a hook writing to the terminal could corrupt an on-screen interactive prompt; hooks now run without terminal access."
 > — https://github.com/anthropics/claude-code/releases/tag/v2.1.139
 
-The same direction of travel is plausible for Codex and Auggie. The OSC-over-`/dev/tty` channel is a coincidence of geometry, not a documented contract; it is now dead for Claude Code on every surface, and silently failing on cloud / headless surfaces for the other providers.
+The same direction of travel is plausible for Codex. The OSC-over-`/dev/tty` channel is a coincidence of geometry, not a documented contract; it is now dead for Claude Code on every surface, and silently failing on cloud / headless surfaces for the other provider.
 
 The user-visible regressions on Claude Code today are:
 
@@ -55,18 +55,18 @@ A user running Claude Code inside Scribe gets the same tab-indicator and prompt-
 
 ---
 
-### User Story 2 — Codex and Auggie surface parity (Priority: P2)
+### User Story 2 — Codex surface parity (Priority: P2)
 
-Users running Codex or Auggie inside Scribe get the same state, prompt, and task-label indicators they have today, on a channel that does not depend on `/dev/tty`. This preempts the same breakage if either tool tightens its hook subprocess environment.
+Users running Codex inside Scribe get the same state, prompt, and task-label indicators they have today, on a channel that does not depend on `/dev/tty`. This preempts the same breakage if Codex tightens its hook subprocess environment.
 
-**Why this priority**: Codex and Auggie hooks currently silently no-op on any TTY-less surface (their `2>/dev/null || true` pattern). The behavior happens to look "fine" today on a desktop terminal but is the same architectural bug; the user has no way to tell when an update is silently dropped. Solving it for Claude Code only would leave the codebase in a permanently mixed state.
+**Why this priority**: Codex hooks currently silently no-op on any TTY-less surface (their `2>/dev/null || true` pattern). The behavior happens to look "fine" today on a desktop terminal but is the same architectural bug; the user has no way to tell when an update is silently dropped. Solving it for Claude Code only would leave the codebase in a permanently mixed state.
 
-**Independent Test**: Launch Codex in a Scribe tab. (a) Submit a prompt — verify the prompt bar updates and a task label appears in the tab strip. (b) Trigger an error or permission prompt — verify the tab indicator updates. Repeat for Auggie. All without `/dev/tty`-mediated signals.
+**Independent Test**: Launch Codex in a Scribe tab. (a) Submit a prompt — verify the prompt bar updates and a task label appears in the tab strip. (b) Trigger an error or permission prompt — verify the tab indicator updates. All without `/dev/tty`-mediated signals.
 
 **Acceptance Scenarios**:
 
 1. **Given** a Scribe user on Codex, **When** Codex emits a state transition (processing, waiting_for_input, error, permission_prompt, inactive), **Then** the matching Scribe tab indicator updates within 200 ms.
-2. **Given** a Scribe user on Codex or Auggie, **When** the assistant submits a task label, **Then** the tab strip shows the sanitized label and clears it when the task completes.
+2. **Given** a Scribe user on Codex, **When** the assistant submits a task label, **Then** the tab strip shows the sanitized label and clears it when the task completes.
 3. **Given** a Scribe user on any supported AI tool, **When** the tool emits a context-window percentage, **Then** Scribe's context indicator reflects the percentage within 200 ms.
 
 ---
@@ -75,7 +75,7 @@ Users running Codex or Auggie inside Scribe get the same state, prompt, and task
 
 A Scribe maintainer adds support for a new AI tool by writing one small adapter script. No changes to the transport, the shared event emitter, the env-var injection, the server-side consumer, or any other provider's adapter are required.
 
-**Why this priority**: This is the long-term consistency dividend. The current per-provider duplication (each script inlines its own `printf '\e]1337;<Prefix>State=...\a' > /dev/tty`, each with subtly different error handling) is the root cause of the original asymmetry. The new architecture should make adding a fourth provider trivial; if it does not, the unification was incomplete.
+**Why this priority**: This is the long-term consistency dividend. The current per-provider duplication (each script inlines its own `printf '\e]1337;<Prefix>State=...\a' > /dev/tty`, each with subtly different error handling) is the root cause of the original asymmetry. The new architecture should make adding another provider trivial; if it does not, the unification was incomplete.
 
 **Independent Test**: Add a stub provider "Foo" with one adapter script. Register it via the existing per-provider setup script pattern. Verify that emitting state, prompt, task-label, and context events from the adapter results in Scribe's tab indicator and prompt bar updating identically to existing providers, with no changes to the transport, the helper, the server consumer, or the env-var injection.
 
@@ -96,7 +96,7 @@ A Scribe-installed hook script that ends up running outside a Scribe terminal �
 
 **Acceptance Scenarios**:
 
-1. **Given** Claude Code, Codex, or Auggie is running in a context where `SCRIBE_HOOK_SOCK` is unset, **When** any hook event fires, **Then** the hook subprocess exits with status 0, writes nothing to stdout or stderr, and does not block the AI tool.
+1. **Given** Claude Code or Codex is running in a context where `SCRIBE_HOOK_SOCK` is unset, **When** any hook event fires, **Then** the hook subprocess exits with status 0, writes nothing to stdout or stderr, and does not block the AI tool.
 2. **Given** the same context, **When** the hook is a blocking event type (e.g. `PreToolUse:AskUserQuestion`), **Then** the tool call is **not** denied by the hook.
 3. **Given** `SCRIBE_HOOK_SOCK` is set but the socket file has been removed (server crash, package replacement mid-session), **When** any hook event fires, **Then** the hook subprocess still exits 0 with no noise, the AI tool is unaffected, and Scribe reconnects on the next event after the socket reappears.
 
@@ -156,7 +156,7 @@ A Scribe-installed hook script that ends up running outside a Scribe terminal �
 
 - **FR-017**: The same transport, the same shared emitter helper, and the same server consumer MUST handle all supported AI tool providers.
 - **FR-018**: Adding a new AI tool provider MUST require only a new provider-specific adapter script that translates that tool's hook event JSON into a call to the shared emitter; no changes to the transport, the helper, the env-var injection, the server consumer, or other providers' adapters.
-- **FR-019**: The system MUST support, at minimum, Claude Code, Codex, and Auggie at parity with today's OSC-based pipeline.
+- **FR-019**: The system MUST support, at minimum, Claude Code and Codex at parity with today's OSC-based pipeline.
 
 **Removals (no fallbacks)**
 
@@ -194,7 +194,7 @@ A Scribe-installed hook script that ends up running outside a Scribe terminal �
 
 ## Assumptions
 
-- Hooks for all three currently supported AI tools run with the parent process's environment (so an environment variable injected by Scribe into the PTY reaches the hook subprocess). This is the documented Claude Code hook contract and matches the current behavior of the Codex and Auggie hook integrations Scribe already ships.
+- Hooks for both currently supported AI tools run with the parent process's environment (so an environment variable injected by Scribe into the PTY reaches the hook subprocess). This is the documented Claude Code hook contract and matches the current behavior of the Codex hook integration Scribe already ships.
 - The Scribe server's existing IPC primitive (a Unix domain socket served by `scribe-server`) is the right substrate for the new hook-event ingress. Whether the ingress is a separate socket or a new message variant on the existing one is an implementation decision deferred to planning.
 - OSC 1337 parsing for the shell preexec pre-arm sentinel (`ScribeAiLaunch=<provider_id>`) stays in place. The pre-arm sentinel is fundamentally not a hook subprocess; it is emitted from the user's interactive shell, which has a controlling TTY by construction and is unaffected by Claude Code v2.1.139's hook hardening.
 - Claude Code's "Channels" feature (released in v2.1.80) is the long-term upstream channel for state observation. It is currently research-preview and the protocol may change. The replacement built by this feature is Scribe-private and ships now; migrating to Channels (or layering Channels on top of the Scribe-private channel for two-way capabilities like permission-prompt relay) is tracked as a future direction, not a v1 deliverable.

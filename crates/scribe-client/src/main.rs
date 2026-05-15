@@ -508,14 +508,6 @@ fn base_command_palette_entries() -> Vec<CommandPaletteEntry> {
             action: AutomationAction::NewCodexResumeTab,
         },
         CommandPaletteEntry {
-            label: String::from("New Auggie Tab"),
-            action: AutomationAction::NewAuggieTab,
-        },
-        CommandPaletteEntry {
-            label: String::from("Resume Auggie Tab"),
-            action: AutomationAction::NewAuggieResumeTab,
-        },
-        CommandPaletteEntry {
             label: String::from("Split Pane Vertical"),
             action: AutomationAction::SplitVertical,
         },
@@ -4921,8 +4913,6 @@ impl App {
             LayoutAction::NewClaudeResumeTab => self.handle_new_claude_resume_tab(),
             LayoutAction::NewCodexTab => self.handle_new_codex_tab(),
             LayoutAction::NewCodexResumeTab => self.handle_new_codex_resume_tab(),
-            LayoutAction::NewAuggieTab => self.handle_new_auggie_tab(),
-            LayoutAction::NewAuggieResumeTab => self.handle_new_auggie_resume_tab(),
             LayoutAction::CloseTab => self.handle_close_tab(),
             LayoutAction::NextTab => self.handle_next_tab(),
             LayoutAction::PrevTab => self.handle_prev_tab(),
@@ -4973,8 +4963,6 @@ impl App {
             AutomationAction::NewClaudeResumeTab => self.handle_new_claude_resume_tab(),
             AutomationAction::NewCodexTab => self.handle_new_codex_tab(),
             AutomationAction::NewCodexResumeTab => self.handle_new_codex_resume_tab(),
-            AutomationAction::NewAuggieTab => self.handle_new_auggie_tab(),
-            AutomationAction::NewAuggieResumeTab => self.handle_new_auggie_resume_tab(),
             AutomationAction::SplitVertical => {
                 self.handle_layout_action(LayoutAction::SplitVertical);
             }
@@ -5382,16 +5370,6 @@ impl App {
     fn handle_new_codex_resume_tab(&mut self) {
         let project_root = self.focused_workspace_project_root();
         self.create_new_tab(Some(Self::ai_tab_command(AiProvider::CodexCode, true)), project_root);
-    }
-
-    fn handle_new_auggie_tab(&mut self) {
-        let project_root = self.focused_workspace_project_root();
-        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::Auggie, false)), project_root);
-    }
-
-    fn handle_new_auggie_resume_tab(&mut self) {
-        let project_root = self.focused_workspace_project_root();
-        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::Auggie, true)), project_root);
     }
 
     fn launch_binding_for_command(

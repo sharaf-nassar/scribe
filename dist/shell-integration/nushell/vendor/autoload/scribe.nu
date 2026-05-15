@@ -72,7 +72,6 @@ def __scribe-pre-prompt [] {
     __scribe-osc $"7;file://($host)($encoded_cwd)"
     __scribe-emit-context
     __scribe-osc '1337;CodexTaskLabelCleared'
-    __scribe-osc '1337;AuggieTaskLabelCleared'
     __scribe-osc $"2;(($env.PWD | path basename | into string))"
     __scribe-osc '133;A;click_events=1'
 }
@@ -98,7 +97,6 @@ def __scribe-pre-exec [] {
         match $first_word {
             'claude' => { __scribe-osc '1337;ScribeAiLaunch=claude_code' }
             'codex' => { __scribe-osc '1337;ScribeAiLaunch=codex_code' }
-            'auggie' => { __scribe-osc '1337;ScribeAiLaunch=auggie' }
             _ => {}
         }
     }

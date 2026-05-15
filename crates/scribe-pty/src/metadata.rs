@@ -43,7 +43,7 @@ pub enum MetadataEvent {
     },
     /// Shell-integration sentinel that pre-arms the ED 3 filter for the next
     /// command. Emitted by `__scribe_preexec` (zsh) / DEBUG trap (bash) /
-    /// equivalents when the user runs `claude`, `codex`, or `auggie`. Lets
+    /// equivalents when the user runs `claude` or `codex`. Lets
     /// `<tool> --resume` survive its pre-OSC-1337 ED 3 even after `ai_provider`
     /// has been cleared by an `AiStateCleared` from the previous run.
     AiProviderArmed {
@@ -356,9 +356,6 @@ mod tests {
 
         let codex = parse_iterm2(&[b"1337", b"ScribeAiLaunch=codex_code"]);
         assert_eq!(codex, Some(MetadataEvent::AiProviderArmed { provider: AiProvider::CodexCode }));
-
-        let auggie = parse_iterm2(&[b"1337", b"ScribeAiLaunch=auggie"]);
-        assert_eq!(auggie, Some(MetadataEvent::AiProviderArmed { provider: AiProvider::Auggie }));
     }
 
     #[test]
@@ -375,12 +372,9 @@ mod tests {
         // below would have produced a `MetadataEvent` under the old parser.
         assert!(parse_iterm2(&[b"1337", b"ClaudeState=processing"]).is_none());
         assert!(parse_iterm2(&[b"1337", b"CodexState=processing", b"tool=Bash"]).is_none());
-        assert!(parse_iterm2(&[b"1337", b"AuggieState=waiting_for_input"]).is_none());
         assert!(parse_iterm2(&[b"1337", b"ClaudeState=inactive"]).is_none());
         assert!(parse_iterm2(&[b"1337", b"ClaudePrompt=Fix the login bug"]).is_none());
         assert!(parse_iterm2(&[b"1337", b"CodexPrompt=Add OAuth support"]).is_none());
-        assert!(parse_iterm2(&[b"1337", b"AuggieTaskLabel=Ship JSON5"]).is_none());
-        assert!(parse_iterm2(&[b"1337", b"AuggieTaskLabelCleared"]).is_none());
         assert!(parse_iterm2(&[b"1337", b"ClaudeContext=42"]).is_none());
         assert!(parse_iterm2(&[b"1337", b"AiState=state=processing"]).is_none());
     }

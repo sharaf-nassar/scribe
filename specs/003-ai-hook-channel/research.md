@@ -103,7 +103,7 @@ Shell integration scripts (`dist/shell-integration/*`) propagate these unchanged
 
 - Behavioral parity with today's user experience requires the same heuristics. Differential behavior would be a user-visible regression unrelated to the channel migration.
 - One module, tested in isolation, replaces ~120 lines of duplicated shell + jq + grep. The tests can run as plain `cargo test` instead of bash regression harnesses.
-- Centralizing the heuristic in Rust means Codex, Claude, and Auggie all get the same classification logic for free, satisfying FR-013a's "single, provider-independent classifier" requirement.
+- Centralizing the heuristic in Rust means Codex and Claude both get the same classification logic for free, satisfying FR-013a's "single, provider-independent classifier" requirement.
 
 **Alternatives considered**:
 
@@ -121,7 +121,7 @@ Shell integration scripts (`dist/shell-integration/*`) propagate these unchanged
 2. Decide the `--event` kind and extract any payload fields.
 3. `exec scribe-hook-helper --provider=X --event=Y [--field=value …]`.
 
-Adapter files: `dist/ai-hook-claude.sh`, `dist/ai-hook-codex.sh`, `dist/ai-hook-auggie.sh`, `dist/ai-hook-statusline.sh`. The statusline adapter is for the Claude Code statusline subprocess (FR-021), which is not strictly a hook in CC's vocabulary but follows the same shape.
+Adapter files: `dist/ai-hook-claude.sh`, `dist/ai-hook-codex.sh`, `dist/ai-hook-statusline.sh`. The statusline adapter is for the Claude Code statusline subprocess (FR-021), which is not strictly a hook in CC's vocabulary but follows the same shape.
 
 **Rationale**:
 
@@ -131,8 +131,8 @@ Adapter files: `dist/ai-hook-claude.sh`, `dist/ai-hook-codex.sh`, `dist/ai-hook-
 
 **Alternatives considered**:
 
-- *One adapter binary per provider compiled into Rust*: rejected. Means three binaries instead of three shell scripts plus one binary; loses the lightweight install footprint advantage of shell adapters.
-- *Single mega-adapter with `--provider` selection*: rejected. Hook commands are registered in each AI tool's own settings file; mapping one adapter to many providers means more conditional logic in install scripts. Three small files keep the install logic simple.
+- *One adapter binary per provider compiled into Rust*: rejected. Means separate provider binaries plus a statusline binary instead of small shell adapters plus one shared binary; loses the lightweight install footprint advantage of shell adapters.
+- *Single mega-adapter with `--provider` selection*: rejected. Hook commands are registered in each AI tool's own settings file; mapping one adapter to many providers means more conditional logic in install scripts. Two small provider adapters keep the install logic simple.
 
 ---
 
@@ -197,5 +197,5 @@ Adapter files: `dist/ai-hook-claude.sh`, `dist/ai-hook-codex.sh`, `dist/ai-hook-
 
 None blocking. Two minor implementation refinements are noted for the implementer:
 
-- **Provider-set in `scribe-common::ai_state::AiProvider`** already covers `ClaudeCode`, `CodexCode`, `Auggie`. No new variants needed for the spec's supported providers.
+- **Provider-set in `scribe-common::ai_state::AiProvider`** already covers `ClaudeCode` and `CodexCode`. No new variants needed for the spec's supported providers.
 - The deb asset table gap noted by the landing-zone map (`codex-hook-common.sh` not shipped via stable .deb) becomes moot because that file is deleted by this feature.

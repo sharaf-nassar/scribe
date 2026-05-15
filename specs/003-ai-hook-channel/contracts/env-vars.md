@@ -32,12 +32,12 @@
 Both variables must reach every hook subprocess. The chain is:
 
 ```
-scribe-server  --[fork+exec]-->  user shell  --[fork+exec]-->  AI tool (claude/codex/auggie)  --[fork+exec]-->  hook subprocess
+scribe-server  --[fork+exec]-->  user shell  --[fork+exec]-->  AI tool (claude/codex)  --[fork+exec]-->  hook subprocess
 ```
 
 Each `fork+exec` inherits the env by default on POSIX. Shell integration scripts (`dist/shell-integration/*`) MUST NOT unset, rename, or filter these variables. The existing `dist/shell-integration/zsh/scribe.zsh:1-103`, `dist/shell-integration/bash/scribe.bash:1-20`, `dist/shell-integration/fish/vendor_conf.d/scribe.fish:106-125`, `dist/shell-integration/nushell/vendor/autoload/scribe.nu:86-101`, `dist/shell-integration/powershell/scribe.ps1:115-125` are unaffected because they only add to env, never strip.
 
-AI tools likewise pass env through to their hook subprocesses; this is documented behavior per the Claude Code hooks reference (`docs.claude.com/en/docs/claude-code/hooks`) and matches Codex/Auggie's existing behavior (the OSC hooks today already inherit env to call `printf > /dev/tty`).
+AI tools likewise pass env through to their hook subprocesses; this is documented behavior per the Claude Code hooks reference (`docs.claude.com/en/docs/claude-code/hooks`) and matches Codex's existing behavior (the OSC hooks today already inherit env to call `printf > /dev/tty`).
 
 ## Absence semantics (FR-003, FR-004)
 

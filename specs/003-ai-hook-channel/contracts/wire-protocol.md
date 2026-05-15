@@ -72,7 +72,7 @@ None. Per Spec Clarifications and FR-020 through FR-022, the new channel **repla
 
 - **New `HookEventKind` variants**: serde-msgpack with `#[serde(tag = "type")]` rejects unknown variants by default at deserialization. The server treats deserialization failures as a single dropped event, no panic.
 - **New optional fields**: tolerated via `#[serde(default)]` on the field, following the pattern of `AiProcessState::provider` (`ai_state.rs:124`).
-- **New `AiProvider` values**: the server drops events with unknown providers (FR-014). A future Scribe build adding a fourth provider won't break older helpers; older Scribe builds connected to a helper emitting the new provider just drop those events.
+- **New `AiProvider` values**: the server drops events with unknown providers (FR-014). A future Scribe build adding another provider won't break older helpers; older Scribe builds connected to a helper emitting the new provider just drop those events.
 
 ## Error budget and rate limits
 

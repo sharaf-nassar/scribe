@@ -11,7 +11,7 @@
 | `HookEvent` | `scribe-common::hook` (new module) | Per-event message on the wire | Single struct wrapping routing fields + payload |
 | `HookEventKind` | `scribe-common::hook` (new module) | Variant inside `HookEvent` | One variant per event the helper can emit |
 | `ClientMessage::HookEvent(...)` | `scribe-common::protocol` | Wire frame | New top-level variant on the existing enum |
-| `AiProvider` | `scribe-common::ai_state` (existing) | — | Reused unchanged: `ClaudeCode`, `CodexCode`, `Auggie` |
+| `AiProvider` | `scribe-common::ai_state` (existing) | — | Reused unchanged: `ClaudeCode`, `CodexCode` |
 | `AiState` | `scribe-common::ai_state` (existing) | — | Reused unchanged: `IdlePrompt`, `Processing`, `WaitingForInput`, `PermissionPrompt`, `Error` |
 | `SessionId` | `scribe-common::ids` (existing) | Per PTY | UUID-v4 minted at `session_manager.rs:298`; survives AI-tool restart in same pane |
 | `AiProcessState` | `scribe-common::ai_state` (existing) | Per `SessionId` × provider | Mutated by hook events; broadcast as `ServerMessage::AiStateChanged` |
@@ -223,7 +223,7 @@ The hook ingress translates each `HookEventKind` into the existing `MetadataEven
 | `TaskLabelCleared` (provider == Codex) | `MetadataEvent::CodexTaskLabelCleared` | `ServerMessage::CodexTaskLabelCleared` |
 | `ContextChanged { fill_percent }` | `MetadataEvent::AiContextChanged { provider, context: fill_percent }` then existing `send_ai_context_change` re-broadcast | `ServerMessage::AiStateChanged` (with updated context) |
 
-The dual `TaskLabel` / `CodexTaskLabel` channel mirrors today's PTY parser (`metadata.rs` keeps separate variants for Codex's task-label channel). Once Auggie/Claude task labels and Codex task labels can converge into one channel (out of scope here), the split can collapse.
+The dual `TaskLabel` / `CodexTaskLabel` channel mirrors today's PTY parser (`metadata.rs` keeps separate variants for Codex's task-label channel). Once Claude and Codex task labels can converge into one channel (out of scope here), the split can collapse.
 
 ---
 

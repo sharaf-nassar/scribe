@@ -157,11 +157,11 @@ When a new server binary is available, the running server hands off all PTY file
 
 ### AI / LLM Process Awareness
 
-Scribe natively parses OSC 1337 escape sequences emitted by AI coding tools including Claude Code, Codex, and Auggie. It tracks four AI states: idle/prompt, processing, waiting for permission, and error. Metadata includes the active tool, agent name, model, context window usage percentage, and conversation ID. The prompt bar surfaces context fill in real time, giving developers instant visibility into their AI agent's state without switching windows.
+Scribe tracks AI coding sessions for Claude Code and Codex through structured hook events and shell pre-arm sentinels. It tracks idle/prompt, processing, waiting for input, waiting for permission, and error states. Metadata includes the active tool, agent name, model, context window usage percentage, and conversation ID. The prompt bar surfaces context fill in real time, giving developers instant visibility into their AI agent's state without switching windows.
 
 ### Prompt Bar
 
-A per-pane bar that tracks AI prompts at the top or bottom of the terminal content. Shows the first and latest prompt with icons, and a prompt count. Click a prompt line to copy it; click the dismiss button to hide the bar until a new conversation starts. Font size, position, and colors are all configurable in settings. Auggie prompt text is emitted from Augment's `Stop` hook, so it appears after the response completes until Augment exposes prompt-submit metadata.
+A per-pane bar that tracks AI prompts at the top or bottom of the terminal content. Shows the first and latest prompt with icons, and a prompt count. Click a prompt line to copy it; click the dismiss button to hide the bar until a new conversation starts. Font size, position, and colors are all configurable in settings.
 
 ### Clipboard Cleanup
 
