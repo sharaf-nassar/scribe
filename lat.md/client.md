@@ -138,6 +138,28 @@ Verifies that a registered session with `context=None` returns `None` from `tab_
 
 Verifies that when `warn_color` is set to an unparseable hex string, `tab_context_suffix` still returns `Some` and the color equals the provided `fallback_color` rather than `None`, matching the other context displays' invalid-hex fallback behavior.
 
+## Workspace Notes
+
+Workspace notes are server-backed notes scoped to a workspace badge and rendered by client GPU overlays.
+
+[[crates/scribe-client/src/workspace_notes.rs#WorkspaceNotesStore]] is a non-durable cache of server snapshots. It is populated from `WorkspaceNotesSnapshot` and `WorkspaceNotesChanged` messages, while durable state lives in [[server#Workspaces#Workspace Notes]]. The client no longer writes `workspace_notes.toml`.
+
+Click routing uses [[crates/scribe-client/src/tab_bar.rs#workspace_badge_hit_rect]] to turn the rendered workspace badge/name into a modal target. [[crates/scribe-client/src/main.rs#App#open_workspace_notes_modal]] focuses that workspace, closes transient overlays, and opens [[crates/scribe-client/src/workspace_notes_modal.rs#WorkspaceNotesModal]] with any saved draft. [[crates/scribe-client/src/main.rs#App#handle_workspace_notes_keyboard]] consumes modal keys before PTY translation: Enter inserts a newline, Ctrl+Enter saves, Backspace edits the text, and Escape closes or cancels edits.
+
+Opening a modal or receiving reconnect workspace metadata triggers [[crates/scribe-client/src/main.rs#App#request_workspace_notes_snapshot]]. Snapshot drafts hydrate the modal only while its local draft is pristine; typed text is never overwritten by a late snapshot. User edits are sent through `WorkspaceNotesMutate`; the client updates visible lists only from server broadcasts so multiple windows converge on the server's last accepted mutation.
+
+The active view supports creating notes, editing active notes, and moving done or removed notes to archive. The archive view keeps archived notes separate, supports single archived-note edits, and has an edit-all mode that sends one bulk mutation without touching active notes.
+
+Clicking outside the notes modal closes it through the same draft-preserving path as the explicit close action. Empty modal space remains inert so controls are the only in-modal click targets.
+
+Draft typing is debounced by [[crates/scribe-client/src/main.rs#App#flush_workspace_notes_if_due]], then flushed immediately by [[crates/scribe-client/src/main.rs#App#flush_workspace_notes_now]] on modal close. Update, restart, quit, and window-close actions defer until pending draft or modal mutations receive the server broadcast that proves durability.
+
+The modal renderer keeps terminal-cell geometry while spacing header tabs, note list, New-note editor, bordered input with a visible caret, retryable server-error text, and footer zones with theme-derived surfaces and title-cased actions.
+
+Hover previews are derived from active notes only and rendered by [[crates/scribe-client/src/workspace_notes_preview.rs#build_workspace_notes_preview]]. [[crates/scribe-client/src/main.rs#App#apply_workspace_notes_preview_overlay]] draws the bounded preview above terminal content but before modal overlays, while suppressing it behind the notes modal, context menu, close dialog, and update dialog.
+
+The hover preview stays open while the pointer is over the workspace badge or preview bounds. Visible preview notes highlight on hover, and clicking one sends `ArchiveNote { reason: Done }` so lightweight note cleanup does not require opening the modal.
+
 ## Input
 
 Keybindings are parsed from config into a `Bindings` struct in [[crates/scribe-client/src/input.rs#Bindings]] with over 50 configurable actions.
@@ -271,13 +293,67 @@ Focus borders are rendered as 2px accent-colored quads on the focused pane's lea
 
 The [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker]] tracks per-session AI state with pulsing border animations.
 
-The shared animation loop uses a generation token per spawned thread, so fast stop/start cycles from AI pulses, scrollbar fades, or stalled-sync recovery retire older timer threads instead of letting them keep emitting `AnimationTick`.
+The shared animation loop uses a generation token per spawned thread, so fast stop/start cycles from AI pulses, scrollbar fades, or stalled-sync recovery retire older timer threads instead of letting them keep emitting `AnimationTick`. The AI-pulse contribution is additionally bounded by a [[client#AI Indicator#Pulse Envelope]] so a long-lived AI state cannot keep the loop alive — and the GPU busy — indefinitely.
 
 Priority order: PermissionPrompt > WaitingForInput > IdlePrompt > Error > Processing. Each state has configurable color, pulse frequency, tab indicator, and pane border settings. Error state decays over a timeout. Attention states (IdlePrompt, WaitingForInput, PermissionPrompt) clear on keystroke. Both `IdlePrompt` and `WaitingForInput` share the same `waiting_for_input` indicator config (color, pulse, timeout).
 
 Tab inline context % is gated via [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#tab_context_suffix]]; see [[client#Tab Bar]] for the gating rules and rendering details.
 
 On reconnect, active AI state is populated from `SessionInfo.ai_state` during handle_session_list so indicators appear immediately without waiting for the per-session `AiStateChanged` messages from the server's `send_stored_metadata` path. `SessionInfo.ai_provider_hint` is restored separately so clipboard cleanup and other provider-aware behavior survive reconnect even when no visible indicator should be shown. When available, `SessionInfo.ai_state.conversation_id` is also used to seed per-pane AI resume bindings so restored windows attempt targeted resume of prior provider sessions.
+
+### Pulse Envelope
+
+Pulse lifetime is decoupled from AI-state lifetime so a stuck or idle session cannot pin the shared 30 fps redraw loop — and the GPU — forever.
+
+The policy gate is [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#pulse_is_active]], consulted by both `needs_animation` (whether the shared loop may retire) and `animated_color` (pulsing vs. a steady resting colour). Attention states (`IdlePrompt`/`WaitingForInput`/`PermissionPrompt`) pulse for a bounded window after entry, then rest while still tracked and visible; they still clear instantly on keystroke. `Processing` pulses only while *alive* — within an idle window of the last liveness signal. Liveness is a state edge or fresh PTY output recorded via [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#note_activity]], fed from [[crates/scribe-client/src/main.rs#App#handle_pty_output]].
+
+A genuinely-working session keeps re-arming the envelope across hook-silent tool calls; a hung AI on a still-open PTY goes silent, the pulse rests, and the loop retires to winit `ControlFlow::Wait` at zero GPU. When output resumes for a rested session the loop is restarted from `handle_pty_output`. Envelope durations are `ATTENTION_PULSE_SECS` and `PROCESSING_IDLE_PULSE_SECS` in [[crates/scribe-client/src/ai_indicator.rs]].
+
+#### Stale-State Clear
+
+A rested pulse still shows its state's *colour*. A crashed or killed AI would otherwise show a stale `Processing` border forever: it can never fire its own terminal hook, and the server supervises only the shell.
+
+[[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#clear_stale_processing]] removes any `Processing` state with no liveness (hook edge or PTY output) for `STALE_PROCESSING_CLEAR`. It uses a wall-clock map (`last_activity_instant`) rather than the f32 animation clock, which freezes once the loop retires — the very case this must still catch. The client calls it lazily from [[crates/scribe-client/src/main.rs#App#about_to_wait]]: zero cost until something is stuck, and resolved before the indicator is observed (the user returning wakes the loop). Only `Processing` is cleared — attention states legitimately persist until the human acts — and `detected_providers` is preserved so provider-aware clipboard cleanup survives, mirroring reconnect.
+
+#### Occlusion Gating
+
+A fully hidden window shows nothing, so keeping the pulse — and the redraw loop — alive for it is pure waste.
+
+[[crates/scribe-client/src/main.rs#App#handle_occluded_changed]] tracks winit `WindowEvent::Occluded` in `window_occluded`; `handle_animation_tick` ANDs `!window_occluded` into `ai_animating` so the loop retires while hidden and re-arms on un-occlude.
+
+This is deliberately gated on occlusion, **not** focus: the AI pulse exists to be noticed in a background, unfocused window, so suppressing it on unfocus would defeat its purpose. winit 0.30 only reports `Occluded` on X11/macOS (Wayland/Windows never fire it), so this is a best-effort optimisation; Layer 1's envelope still bounds the loop everywhere regardless.
+
+### processing_pulse_rests_after_idle_window
+
+Verifies the core GPU-bug fix: a `Processing` state pulses when fresh, but after `PROCESSING_IDLE_PULSE_SECS` of no activity `needs_animation` returns false so the shared redraw loop can retire.
+
+### processing_activity_rearms_pulse
+
+Verifies that `note_activity` (the PTY-output liveness signal) re-arms a rested `Processing` pulse, and that it rests again after renewed silence — the genuinely-working vs. hung distinction.
+
+### state_edge_rearms_pulse
+
+Verifies that a repeated `Processing` state edge via `update` re-arms a rested pulse, confirming state edges are a liveness signal alongside PTY output.
+
+### attention_pulse_rests_after_window
+
+Verifies that an attention state (`WaitingForInput`) pulses when fresh and rests after `ATTENTION_PULSE_SECS`, measured from entry rather than from activity.
+
+### stale_processing_is_cleared
+
+Verifies that `clear_stale_processing` removes a `Processing` state with no liveness for `STALE_PROCESSING_CLEAR`, reports the clear, and preserves `detected_providers` so clipboard cleanup survives.
+
+### fresh_processing_not_cleared
+
+Verifies that `clear_stale_processing` does not remove a just-updated `Processing` state and reports no clear.
+
+### stale_attention_state_not_cleared
+
+Verifies that a long-idle attention state (`WaitingForInput`) is not hard-cleared, confirming the clear is scoped to `Processing` so "waiting for you" indicators persist until the human acts.
+
+### activity_rearms_stale_processing
+
+Verifies that `note_activity` resets the wall-clock staleness timer so a Processing state that showed a sign of life before the prune is spared.
 
 ## Desktop Notifications
 
@@ -404,17 +480,19 @@ URL highlighting and the pointer cursor are only shown while the Ctrl modifier i
 
 ## Clipboard Cleanup
 
-When copying from a supported AI coding session, [[crates/scribe-client/src/clipboard_cleanup.rs#prepare_copy_text]] applies dedent, blockquote normalization, then unwrap.
+When copying from a supported AI coding session, [[crates/scribe-client/src/clipboard_cleanup.rs#prepare_copy_text]] applies dedent, blockquote normalization, decorative-prefix stripping, then unwrap.
 
 Copy actions decide whether cleanup is active through [[crates/scribe-client/src/main.rs#ai_provider_for_pane]], which accepts either tracker-detected AI state or an AI launch binding on the pane. This keeps cleanup enabled for newly opened Claude Code and Codex tabs before their first hook event arrives.
 
-Dedent strips minimum shared leading whitespace. Blockquote normalization removes markdown `>` markers and the rendered `▎` gutter used by some AI UIs so quoted prose copies as plain text. Unwrap then joins hard-wrapped prose at auto-detected wrap width. When no dominant width is detected but at least one line exceeds 40 characters, [[crates/scribe-client/src/clipboard_cleanup.rs#join_non_break_runs]] joins consecutive non-break lines as a fallback. Structural breaks like bullets, headings, code blocks, and tables are preserved after quote markers are removed.
+Dedent strips minimum shared leading whitespace. Blockquote normalization removes markdown `>` markers and the rendered `▎` gutter used by some AI UIs so quoted prose copies as plain text. Decorative-prefix stripping removes leading AI status glyphs such as `●` when followed by whitespace. Unwrap then joins hard-wrapped prose at auto-detected wrap width. When no dominant width is detected but at least one line exceeds 40 characters, [[crates/scribe-client/src/clipboard_cleanup.rs#join_non_break_runs]] joins consecutive non-break lines as a fallback. Structural breaks like bullets, headings, code blocks, and tables are preserved after quote markers and decorative prefixes are removed.
 
 ## Window State
 
 Per-window geometry is persisted under the active install flavor's XDG state root via [[crates/scribe-client/src/window_state.rs#WindowRegistry]].
 
 Stable installs use `$XDG_STATE_HOME/scribe/windows/{window_id}.toml`, while `scribe-dev` uses `$XDG_STATE_HOME/scribe-dev/windows/{window_id}.toml`. `Kill Window` and a natural exit of the last remaining terminal both remove the file only after the server confirms the window was destroyed.
+
+Additional windows are separate `scribe-client --window-id` processes spawned by [[crates/scribe-client/src/main.rs#spawn_client_process]]. The parent keeps a lightweight wait thread via [[crates/scribe-client/src/main.rs#reap_spawned_client_child]] so closed child windows do not remain as zombies. Startup timing logs from [[crates/scribe-client/src/main.rs#AppStartup#load]], [[crates/scribe-client/src/main.rs#App#init_gpu_and_terminal]], and session-list handling expose whether delays come from config, window/GPU setup, renderer/font atlas setup, IPC, splash gating, or session creation.
 
 All geometry (position and size) is stored and restored in **logical coordinates** so windows scale correctly on HiDPI/Retina displays. `capture_window_geometry` converts physical pixels to logical using `window.scale_factor()`, and `apply_window_geometry` restores via `LogicalSize`/`LogicalPosition`. Position is stored as Optional since Wayland does not expose window positions. Size is always restored via `request_inner_size` — even for maximized windows — so the GPU surface and pane grids have reasonable pre-configure dimensions on Wayland where `inner_size()` can return a tiny default before the compositor responds. The window is created with an initial 1200×800 logical-pixel hint for the same reason. Maximized state is set after size, and restart-time restore treats size-only or monitor-only records as persisted geometry instead of requiring X11 coordinates.
 

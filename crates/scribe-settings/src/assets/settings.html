@@ -1339,13 +1339,17 @@
         <div class="section-card">
           <div id="workspace-list" class="workspace-list">
             <!-- Items populated by loadConfig -->
-            <button class="workspace-add" type="button">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <form id="workspace-add-form" class="workspace-add-form" autocomplete="off">
+              <button class="workspace-add-submit" type="submit" title="Add workspace root" aria-label="Add workspace root">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <line x1="12" y1="5" x2="12" y2="19"/>
                 <line x1="5" y1="12" x2="19" y2="12"/>
-              </svg>
-              Add workspace root...
-            </button>
+                </svg>
+              </button>
+              <input id="workspace-add-input" class="workspace-add-input" type="text"
+                     placeholder="Add workspace root..." aria-label="Workspace root path"
+                     spellcheck="false">
+            </form>
           </div>
         </div>
       </div>

@@ -68,6 +68,11 @@ impl WorkspaceManager {
         }
     }
 
+    /// Replace workspace roots after a config reload.
+    pub fn set_roots(&mut self, roots: Vec<PathBuf>) {
+        self.roots = roots;
+    }
+
     /// Create a new workspace and assign it the next accent color from the
     /// rotating palette.
     pub fn create_workspace(&mut self) -> WorkspaceId {
@@ -549,6 +554,23 @@ mod tests {
         assert!(matches!(
             msg,
             Some(ServerMessage::WorkspaceNamed { name, .. }) if name == "second"
+        ));
+    }
+
+    #[test]
+    fn reloaded_roots_are_used_for_workspace_naming() {
+        let mut mgr = manager_with_roots(vec![]);
+        let ws_id = mgr.create_workspace();
+        let sess_id = SessionId::new();
+        mgr.add_session(ws_id, sess_id, None);
+
+        mgr.set_roots(vec![PathBuf::from("/home/user/work")]);
+        let msg = mgr.on_cwd_changed(sess_id, Path::new("/home/user/work/scribe"));
+
+        assert!(matches!(
+            msg,
+            Some(ServerMessage::WorkspaceNamed { name, project_root, .. })
+                if name == "scribe" && project_root == Some(PathBuf::from("/home/user/work/scribe"))
         ));
     }
 

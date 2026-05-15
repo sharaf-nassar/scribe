@@ -15,7 +15,7 @@ use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
     AutomationAction, ClientMessage, PromptMarkKind, SearchMatch, ServerMessage, TerminalSize,
-    UpdateProgressState,
+    UpdateProgressState, WorkspaceNotesCollection, WorkspaceNotesMutation,
 };
 use scribe_common::socket::{handoff_socket_path, server_socket_path};
 use tokio::io::AsyncWriteExt as _;
@@ -65,6 +65,10 @@ pub enum ClientCommand {
     FocusChanged { gained: Option<SessionId>, lost: Option<SessionId> },
     /// Search the terminal scrollback/screen.
     SearchRequest { session_id: SessionId, query: String, limit: u32 },
+    /// Request authoritative workspace note collections.
+    WorkspaceNotesGet { workspace_ids: Vec<WorkspaceId> },
+    /// Request a server-side workspace notes mutation.
+    WorkspaceNotesMutate { mutation: WorkspaceNotesMutation },
 }
 
 /// Events forwarded from the IPC background thread to the winit event loop.
@@ -154,6 +158,12 @@ pub enum UiEvent {
     TrimScrollback { session_id: SessionId, history_rows: u32 },
     /// The server suppressed an ED 3 sequence — snap the viewport to bottom.
     ScrollBottom { session_id: SessionId },
+    /// Server-authoritative notes snapshot for requested workspaces.
+    WorkspaceNotesSnapshot { collections: Vec<WorkspaceNotesCollection> },
+    /// Server-authoritative notes collection after a persisted mutation.
+    WorkspaceNotesChanged { collection: WorkspaceNotesCollection },
+    /// Generic server error.
+    ServerError { message: String },
 }
 
 /// Start the IPC client on a background thread.
@@ -380,6 +390,14 @@ fn dispatch_workspace_message(
             send_event(proxy, UiEvent::WorkspaceNamed { workspace_id, name, project_root });
             None
         }
+        ServerMessage::WorkspaceNotesSnapshot { collections } => {
+            send_event(proxy, UiEvent::WorkspaceNotesSnapshot { collections });
+            None
+        }
+        ServerMessage::WorkspaceNotesChanged { collection } => {
+            send_event(proxy, UiEvent::WorkspaceNotesChanged { collection });
+            None
+        }
         ServerMessage::Welcome { window_id, other_windows } => {
             tracing::info!(%window_id, others = other_windows.len(), "received Welcome");
             send_event(proxy, UiEvent::Welcome { window_id, other_windows });
@@ -411,6 +429,11 @@ fn dispatch_control_message(
         }
         ServerMessage::ActionDispatched { window_id } => {
             tracing::debug!(%window_id, "ignoring ActionDispatched on UI client connection");
+            None
+        }
+        ServerMessage::Error { message } => {
+            tracing::warn!(%message, "server error");
+            send_event(proxy, UiEvent::ServerError { message });
             None
         }
         ServerMessage::UpdateAvailable { version, release_url } => {
@@ -493,6 +516,12 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         ClientCommand::SearchRequest { session_id, query, limit } => {
             ClientMessage::SearchRequest { session_id, query, limit }
         }
+        ClientCommand::WorkspaceNotesGet { workspace_ids } => {
+            ClientMessage::WorkspaceNotesGet { workspace_ids }
+        }
+        ClientCommand::WorkspaceNotesMutate { mutation } => {
+            ClientMessage::WorkspaceNotesMutate { mutation }
+        }
     }
 }
 
@@ -558,22 +587,47 @@ fn process_is_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "linux")]
+fn process_is_zombie(pid: u32) -> bool {
+    let path = format!("/proc/{pid}/status");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|status| {
+            status.lines().find(|line| line.starts_with("State:")).map(str::to_owned)
+        })
+        .is_some_and(|line| line.split_whitespace().nth(1) == Some("Z"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_is_zombie(_pid: u32) -> bool {
+    false
+}
+
 fn wait_for_process_exit(pid: u32, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if !process_is_alive(pid) {
+        if !process_is_alive(pid) || process_is_zombie(pid) {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    !process_is_alive(pid)
+    !process_is_alive(pid) || process_is_zombie(pid)
 }
 
-fn wait_for_tracked_clients_to_exit(client_pids: &[u32]) {
+fn wait_for_tracked_clients_to_exit(client_pids: &[u32]) -> Result<(), String> {
+    let mut survivors = Vec::new();
     for pid in client_pids {
-        let _ = wait_for_process_exit(*pid, std::time::Duration::from_secs(5));
+        if !wait_for_process_exit(*pid, std::time::Duration::from_secs(15)) {
+            survivors.push(*pid);
+        }
     }
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    if !survivors.is_empty() {
+        return Err(format!(
+            "old client processes did not exit after server restart: {survivors:?}"
+        ));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    Ok(())
 }
 
 fn spawn_replacement_client(client_exe: &Path) -> Result<(), String> {
@@ -756,7 +810,7 @@ pub fn finish_update_restart() -> Result<(), String> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     return Err(String::from("deferred update restart is only supported on macOS and Linux"));
 
-    wait_for_tracked_clients_to_exit(&client_pids);
+    wait_for_tracked_clients_to_exit(&client_pids)?;
     spawn_replacement_client(&client_exe)
 }
 

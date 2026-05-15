@@ -23,9 +23,21 @@ Add global, iTerm2-style Smart Selection for terminal text. The feature adds con
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-The constitution file still contains template placeholders and defines no enforceable project gates. The effective project gates for this plan come from `AGENTS.md`: use `lat.md` for design context, do not restart the Scribe server, avoid unrelated worktree changes, and run `lat check` before reporting completion.
+Initial gate status: PASS.
 
-Initial gate status: PASS. The plan is spec/documentation only, does not restart the server, and is grounded in relevant `lat.md` sections for settings, selection, mouse handling, and mouse reporting.
+- Code Quality: PASS. The plan keeps persisted data in `scribe-common`, matching
+  logic in a focused client module, and settings updates in the existing
+  `scribe-settings::apply` path.
+- Testing Strategy: PASS. The plan names focused `cargo test` package filters
+  and the feature quickstart as verification paths while respecting the project
+  instruction not to add test code unless explicitly requested.
+- User Experience Consistency: PASS. The plan preserves mouse reporting,
+  copy-on-select, existing selection behavior, and the settings webview
+  structure.
+- Performance: PASS. The plan sets a 100 ms visible-selection target and avoids
+  regex recompilation during click handling.
+- Operational Safety: PASS. The plan does not restart the server, is grounded in
+  relevant `lat.md` sections, and reserves `lat.md` updates for implementation.
 
 ## Project Structure
 
@@ -97,7 +109,11 @@ Key design points:
 
 *GATE: Re-check after Phase 1 design.*
 
-Post-design gate status: PASS. The design remains scoped to existing crates, avoids server restart, preserves the dirty worktree by only adding planning artifacts and AGENTS plan reference, and keeps implementation documentation updates for the implementation phase.
+Post-design gate status: PASS. The design remains scoped to existing crates,
+keeps Smart Selection actions explicit, preserves current mouse and selection
+behavior, keeps performance-sensitive matching out of repeated regex
+compilation, avoids server restart, and keeps implementation documentation
+updates for the implementation phase.
 
 ## Complexity Tracking
 

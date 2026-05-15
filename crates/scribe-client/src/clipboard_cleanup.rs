@@ -1,11 +1,12 @@
 //! Clipboard text cleanup for AI-assisted sessions.
 //!
-//! Three transforms are applied in sequence when the active session is running
+//! Four transforms are applied in sequence when the active session is running
 //! a supported AI coding tool and the user has clipboard cleanup enabled:
 //!
 //! 1. **Dedent** — strip the minimum shared leading whitespace from all lines.
 //! 2. **Normalize blockquotes** — strip markdown and rendered quote markers.
-//! 3. **Unwrap** — rejoin hard-wrapped prose lines into flowing paragraphs.
+//! 3. **Strip decorative prefixes** — remove leading AI status glyphs.
+//! 4. **Unwrap** — rejoin hard-wrapped prose lines into flowing paragraphs.
 
 /// Apply configured cleanup transforms to terminal-selected text.
 ///
@@ -23,7 +24,8 @@ pub fn prepare_copy_text(text: &str, options: CopyTextOptions) -> String {
     }
     let dedented = dedent(text);
     let normalized_blockquotes = normalize_blockquotes(&dedented);
-    unwrap_lines(&normalized_blockquotes)
+    let stripped_decorations = strip_decorative_prefixes(&normalized_blockquotes);
+    unwrap_lines(&stripped_decorations)
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +100,72 @@ fn strip_blockquote_prefix(line: &str) -> &str {
     }
 
     if stripped { rest } else { line }
+}
+
+// ---------------------------------------------------------------------------
+// Decorative prefix cleanup
+// ---------------------------------------------------------------------------
+
+/// Strip leading AI UI/status glyphs from copied lines.
+fn strip_decorative_prefixes(text: &str) -> String {
+    let trailing_newline = text.ends_with('\n');
+    let lines: Vec<&str> = text.lines().collect();
+
+    let mut result =
+        lines.iter().map(|line| strip_decorative_prefix(line)).collect::<Vec<_>>().join("\n");
+    if trailing_newline {
+        result.push('\n');
+    }
+    result
+}
+
+fn strip_decorative_prefix(line: &str) -> &str {
+    let mut rest = line.trim_start();
+    let mut stripped = false;
+
+    while let Some(first) = rest.chars().next() {
+        if !is_decorative_prefix_symbol(first) {
+            break;
+        }
+
+        let after_symbol = &rest[first.len_utf8()..];
+        let Some(next) = after_symbol.chars().next() else { break };
+        if !next.is_whitespace() {
+            break;
+        }
+
+        stripped = true;
+        rest = after_symbol.trim_start();
+    }
+
+    if stripped { rest } else { line }
+}
+
+fn is_decorative_prefix_symbol(ch: char) -> bool {
+    matches!(
+        ch,
+        '●' | '○'
+            | '◯'
+            | '◉'
+            | '◎'
+            | '◌'
+            | '◍'
+            | '◦'
+            | '▪'
+            | '▫'
+            | '◆'
+            | '◇'
+            | '▶'
+            | '▸'
+            | '▹'
+            | '▻'
+            | '›'
+            | '»'
+            | '⏺'
+            | '✻'
+            | '✽'
+            | '✦'
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -54,6 +54,14 @@ The client chunks large pastes into multiple `KeyInput` messages to fit the 4 Ki
 
 `CreateWorkspace` creates a new workspace with the next accent color. `ReportWorkspaceTree` sends the client's current split layout to the server for persistence.
 
+### Workspace Notes
+
+Workspace note messages keep note state server-owned while the client renders only cached snapshots.
+
+`WorkspaceNotesGet` requests authoritative note collections for one or more `WorkspaceId` values. `WorkspaceNotesMutate` carries a [[crates/scribe-common/src/protocol.rs#WorkspaceNotesMutation]] value for saving drafts, creating active notes, editing notes, archiving notes, or bulk-editing archived notes.
+
+The server validates each mutation, persists the resulting store, and only then broadcasts [[protocol#Server Messages#Workspace Notes]] to connected clients.
+
 ### Automation
 
 Window automation messages let the CLI inspect windows and ask a connected client to execute the same actions exposed by keyboard shortcuts and the command palette.
@@ -64,13 +72,13 @@ Window automation messages let the CLI inspect windows and ask a connected clien
 
 `Hello` is the first message sent, carrying an optional window ID for multi-window reconnection. The server responds with [[protocol#Server Messages]] `Welcome`.
 
-If the requested window ID is already connected, the server assigns another unconnected window or a fresh ID instead of replacing the existing owner.
+If the requested window ID is already connected, the server assigns another unconnected window or a fresh ID instead of replacing the existing owner. The check and the registration are performed atomically inside [[crates/scribe-server/src/ipc_server.rs#claim_window]] while holding a single `connected_clients` write lock. A previous read-then-write split was a TOCTOU race: the concurrent-reconnect burst that a server upgrade or client relaunch triggers let two `Hello`s for the same window both observe it unconnected and both register, leaving two live clients bound to one window ID (which then fought, respawned, and churned the session).
 
 Transient actions are an exception: the [[server#Server#Updater#Manual Check]] path lets a non-client process (the standalone settings window) open `server.sock`, send `CheckForUpdates` as the first and only message, read back a single `UpdateCheckResult`, and disconnect — never registering as a connected client and never receiving a `Welcome`.
 
 ### Configuration
 
-`ConfigReloaded` notifies the server that the config file has changed, triggering scrollback limit and shell integration updates across all live sessions.
+`ConfigReloaded` notifies the server that the config file has changed, triggering scrollback limit, shell integration, and workspace-root updates across live sessions.
 
 ### Update Control
 
@@ -121,6 +129,14 @@ Only the bootstrap client (launched without `--window-id`) spawns child processe
 `SessionList` returns all sessions grouped by workspace in response to `ListSessions`. Each [[crates/scribe-common/src/protocol.rs#SessionInfo]] carries the active AI state, AI provider hint, provider task label, legacy Codex task label, shell basename, session context, CWD, and detected git branch — enough for the client to restore provider-aware titles, remote labels, and status-bar branches without any post-attach metadata fan-out. A batched `workspaces: Vec<WorkspaceListEntry>` field delivers per-workspace names, accent colors, split direction, and project root paths alongside the session list. `WorkspaceInfo` messages still exist for non-attach flows (session creation, auto-naming).
 
 When `SessionList` also includes a workspace tree, that tree is the authoritative workspace layout. The `split_direction` field is only needed for the legacy reconnect fallback where older servers omit the tree and the client must repair the linear default layout once during startup.
+
+### Workspace Notes
+
+Workspace notes are delivered as server-authoritative collections, not as client-owned persisted files.
+
+`WorkspaceNotesSnapshot` answers `WorkspaceNotesGet` with `Vec<WorkspaceNotesCollection>`. `WorkspaceNotesChanged` broadcasts one updated [[crates/scribe-common/src/protocol.rs#WorkspaceNotesCollection]] after an accepted mutation has been written to the server-owned note store.
+
+Clients replace their local note cache from these messages. The broadcast also acts as the success acknowledgement for the requester; failed mutations use `Error` and do not update client caches.
 
 ### Automation
 

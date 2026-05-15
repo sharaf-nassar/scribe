@@ -301,6 +301,21 @@ pub struct WorkspaceTabBarData {
     pub active_tab_pixel_range: Option<(f32, f32)>,
 }
 
+/// Clickable rect for the workspace badge/name at the start of the tab bar.
+pub fn workspace_badge_hit_rect(data: &WorkspaceTabBarData, cell_w: f32) -> Option<Rect> {
+    let (name, _) = data.badge.as_ref()?;
+    if cell_w <= 0.0 {
+        return None;
+    }
+    let badge_cols = name.chars().count().saturating_add(2);
+    Some(Rect {
+        x: data.ws_rect.x,
+        y: data.ws_rect.y,
+        width: columns_to_pixels(badge_cols, cell_w),
+        height: data.tab_bar_height,
+    })
+}
+
 /// Parameters for building tab bar text instances.
 pub struct TabBarTextParams<'a> {
     pub rect: Rect,

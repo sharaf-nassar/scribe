@@ -298,6 +298,8 @@ async fn dispatch_server_message(
         | ServerMessage::Error { .. }
         | ServerMessage::SessionList { .. }
         | ServerMessage::SearchResults { .. }
+        | ServerMessage::WorkspaceNotesSnapshot { .. }
+        | ServerMessage::WorkspaceNotesChanged { .. }
         | ServerMessage::PromptMark { .. }
         | ServerMessage::PromptReceived { .. }) => {
             dispatch_notice_message(msg);

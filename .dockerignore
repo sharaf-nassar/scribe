@@ -1,0 +1,11 @@
+.git/
+.dockerignore
+Dockerfile*
+target/
+node_modules/
+*.log
+.env
+.env.*
+coverage/
+.DS_Store
+Thumbs.db

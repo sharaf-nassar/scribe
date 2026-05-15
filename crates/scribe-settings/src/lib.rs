@@ -393,6 +393,23 @@ fn inject_release_list_result(
     }
 }
 
+/// Push a native workspace-root picker result into the webview callback.
+/// Always called on the UI thread for the active platform backend.
+fn inject_workspace_root_choice(
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+    path: &str,
+) {
+    let payload = serde_json::json!({ "path": path });
+    let script = format!(
+        "if (typeof window.SCRIBE_ON_WORKSPACE_ROOT_CHOSEN === 'function') {{ window.SCRIBE_ON_WORKSPACE_ROOT_CHOSEN({payload}); }}"
+    );
+    if let Some(wv) = webview_ref.borrow().as_ref() {
+        if let Err(e) = wv.evaluate_script(&script) {
+            tracing::warn!("failed to inject workspace root choice: {e}");
+        }
+    }
+}
+
 /// Shared cell holding the currently-active glib timeout source for an
 /// in-flight manual update check on Linux. Storing the [`SourceId`] lets the
 /// window-close path explicitly remove the source before the webview is
@@ -530,6 +547,30 @@ fn dispatch_release_list_request_macos(proxy: &tao::event_loop::EventLoopProxy<T
     });
 }
 
+#[cfg(not(target_os = "linux"))]
+fn dispatch_workspace_root_picker_macos(proxy: &tao::event_loop::EventLoopProxy<TaoUserEvent>) {
+    let proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let output = std::process::Command::new("osascript")
+            .args(["-e", r#"POSIX path of (choose folder with prompt "Choose workspace root")"#])
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if !path.is_empty() {
+                    drop(proxy.send_event(TaoUserEvent::WorkspaceRootChosen(path)));
+                }
+            }
+            Ok(output) => {
+                let reason = String::from_utf8_lossy(&output.stderr);
+                tracing::debug!("workspace root picker cancelled or failed: {}", reason.trim());
+            }
+            Err(e) => tracing::warn!("failed to launch workspace root picker: {e}"),
+        }
+    });
+}
+
 #[cfg(target_os = "macos")]
 fn open_macos_notification_settings() {
     let url = "x-apple.systempreferences:com.apple.preference.notifications";
@@ -575,6 +616,15 @@ fn settings_ipc_request_url(body: &str) -> Option<String> {
         .and_then(|v| v.get("url").and_then(|t| t.as_str()).map(str::to_owned))
 }
 
+#[derive(Clone, Copy)]
+struct SettingsIpcHandlers<'a> {
+    webview_ref: &'a std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+    on_change: &'a dyn Fn(String),
+    on_request_update_check: &'a dyn Fn(),
+    on_request_releases: &'a dyn Fn(),
+    on_choose_workspace_root: &'a dyn Fn(),
+}
+
 /// Handle an IPC request from the settings webview.
 ///
 /// Dispatches by `type` field to the appropriate path. The match is structured
@@ -583,32 +633,24 @@ fn settings_ipc_request_url(body: &str) -> Option<String> {
 /// `request_update_check`, and `request_releases` need closures captured in
 /// the calling scope, while `setting_changed` carries the full body, and the
 /// platform-action group is handled by a stateless inner helper.
-fn handle_settings_ipc_request<F, G, H>(
-    body: &str,
-    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
-    on_change: &F,
-    on_request_update_check: &G,
-    on_request_releases: &H,
-) where
-    F: Fn(String),
-    G: Fn(),
-    H: Fn(),
-{
+fn handle_settings_ipc_request(body: &str, handlers: SettingsIpcHandlers<'_>) {
     let Some(kind) = settings_ipc_request_type(body) else {
         tracing::debug!("settings IPC request missing type");
         return;
     };
 
     if kind == "request_fonts" {
-        if let Some(wv) = webview_ref.borrow().as_ref() {
+        if let Some(wv) = handlers.webview_ref.borrow().as_ref() {
             inject_font_list(wv);
         }
     } else if kind == "request_update_check" {
-        on_request_update_check();
+        (handlers.on_request_update_check)();
     } else if kind == "request_releases" {
-        on_request_releases();
+        (handlers.on_request_releases)();
+    } else if kind == "choose_workspace_root" {
+        (handlers.on_choose_workspace_root)();
     } else if kind == "setting_changed" {
-        on_change(body.to_owned());
+        (handlers.on_change)(body.to_owned());
     } else if !handle_settings_ipc_action(&kind, body) {
         tracing::debug!(kind, "unhandled settings IPC request");
     }
@@ -702,7 +744,16 @@ where
         active_check_source: new_active_check_source(),
         active_release_source: new_active_check_source(),
     };
-    let webview = build_linux_webview(&container, &html, &config_json, on_change, &ctx)?;
+    let webview = build_linux_webview(
+        LinuxWebviewBuild {
+            window: &window,
+            container: &container,
+            html: &html,
+            config_json: &config_json,
+            ctx: &ctx,
+        },
+        on_change,
+    )?;
 
     // Store webview in the shared ref so the IPC handler can use it for refresh.
     *ctx.webview_ref.borrow_mut() = Some(webview);
@@ -909,17 +960,25 @@ struct LinuxWebviewContext {
     active_release_source: ActiveCheckSource,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct LinuxWebviewBuild<'a> {
+    window: &'a gtk::Window,
+    container: &'a gtk::Box,
+    html: &'a str,
+    config_json: &'a str,
+    ctx: &'a LinuxWebviewContext,
+}
+
 /// Build the GTK webview and wire the settings IPC handler.
 #[cfg(target_os = "linux")]
 fn build_linux_webview<F: Fn(String) + 'static>(
-    container: &gtk::Box,
-    html: &str,
-    config_json: &str,
+    build: LinuxWebviewBuild<'_>,
     on_change: F,
-    ctx: &LinuxWebviewContext,
 ) -> Result<wry::WebView, String> {
     use wry::WebViewBuilderExtUnix;
 
+    let LinuxWebviewBuild { window, container, html, config_json, ctx } = build;
     let bootstrap = bootstrap_script(env!("CARGO_PKG_VERSION"), current_platform_string());
     let webview = wry::WebViewBuilder::new()
         .with_initialization_script(bootstrap)
@@ -936,13 +995,21 @@ fn build_linux_webview<F: Fn(String) + 'static>(
             let on_request_releases = move || {
                 dispatch_release_list_request_linux(&webview_for_releases, &active_for_releases);
             };
+            let window_for_picker = window.clone();
+            let webview_for_picker = std::rc::Rc::clone(&ctx.webview_ref);
+            let on_choose_workspace_root = move || {
+                dispatch_workspace_root_picker_linux(&window_for_picker, &webview_for_picker);
+            };
             move |request| {
                 handle_settings_ipc_request(
                     request.body(),
-                    &webview_for_ipc,
-                    &on_change,
-                    &on_request_update_check,
-                    &on_request_releases,
+                    SettingsIpcHandlers {
+                        webview_ref: &webview_for_ipc,
+                        on_change: &on_change,
+                        on_request_update_check: &on_request_update_check,
+                        on_request_releases: &on_request_releases,
+                        on_choose_workspace_root: &on_choose_workspace_root,
+                    },
                 );
             }
         })
@@ -951,6 +1018,28 @@ fn build_linux_webview<F: Fn(String) + 'static>(
 
     inject_initial_webview_state(&webview, config_json);
     Ok(webview)
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_workspace_root_picker_linux(
+    window: &gtk::Window,
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+) {
+    use gtk::prelude::*;
+
+    let dialog = gtk::FileChooserDialog::with_buttons(
+        Some("Choose Workspace Root"),
+        Some(window),
+        gtk::FileChooserAction::SelectFolder,
+        &[("Cancel", gtk::ResponseType::Cancel), ("Choose", gtk::ResponseType::Accept)],
+    );
+
+    let selected = if dialog.run() == gtk::ResponseType::Accept { dialog.filename() } else { None };
+    dialog.close();
+
+    if let Some(path) = selected.and_then(|path| path.into_os_string().into_string().ok()) {
+        inject_workspace_root_choice(webview_ref, &path);
+    }
 }
 
 /// Install the Linux singleton watcher and shutdown handlers.
@@ -1045,6 +1134,8 @@ enum TaoUserEvent {
     /// A worker thread finished a manual release-list request; deliver the
     /// result to the webview on the main thread.
     ReleaseListResult(ReleaseListResultState),
+    /// A native directory picker returned a workspace root path.
+    WorkspaceRootChosen(String),
 }
 
 /// Build the tao window with optional saved geometry.
@@ -1235,17 +1326,23 @@ fn build_tao_webview<F: Fn(String) + 'static>(
             let webview_for_ipc = std::rc::Rc::clone(webview_ref);
             let proxy_for_check = event_loop_proxy.clone();
             let proxy_for_releases = event_loop_proxy.clone();
+            let proxy_for_workspace_root = event_loop_proxy.clone();
             let on_request_update_check =
                 move || dispatch_check_for_updates_macos(&proxy_for_check);
             let on_request_releases =
                 move || dispatch_release_list_request_macos(&proxy_for_releases);
+            let on_choose_workspace_root =
+                move || dispatch_workspace_root_picker_macos(&proxy_for_workspace_root);
             move |request| {
                 handle_settings_ipc_request(
                     request.body(),
-                    &webview_for_ipc,
-                    &on_change,
-                    &on_request_update_check,
-                    &on_request_releases,
+                    SettingsIpcHandlers {
+                        webview_ref: &webview_for_ipc,
+                        on_change: &on_change,
+                        on_request_update_check: &on_request_update_check,
+                        on_request_releases: &on_request_releases,
+                        on_choose_workspace_root: &on_choose_workspace_root,
+                    },
                 );
             }
         })
@@ -1314,6 +1411,9 @@ fn handle_tao_event<F: FnOnce(SettingsWindowGeometry)>(
         }
         Event::UserEvent(TaoUserEvent::ReleaseListResult(state)) => {
             inject_release_list_result(webview_ref, &state);
+        }
+        Event::UserEvent(TaoUserEvent::WorkspaceRootChosen(path)) => {
+            inject_workspace_root_choice(webview_ref, &path);
         }
         Event::WindowEvent {
             event: WindowEvent::ModifiersChanged(new_mods),

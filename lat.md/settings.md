@@ -100,6 +100,8 @@ Desktop notification settings cover enablement, focus suppression, and Linux-onl
 
 Add/remove root directories and badge colour customization per index with reset-to-defaults.
 
+The workspace add row in [[crates/scribe-settings/src/assets/settings.js#initWorkspaces]] accepts absolute paths or `~/` roots, updates the displayed list immediately, and sends `workspaces.add_root`. Submitting an empty row asks the host to open a native directory chooser, then the selected path is injected back into the same add flow. The apply path in [[crates/scribe-settings/src/apply.rs#apply_workspace_key]] trims, deduplicates, and persists accepted roots.
+
 ## Releases
 
 Browse historical Scribe releases from inside the settings window. The panel uses a single-content-area layout with a native `<select>` picker, Newer / Older nav buttons, and a "View on GitHub" link, driven by a `selectedReleaseVersion` JS state.

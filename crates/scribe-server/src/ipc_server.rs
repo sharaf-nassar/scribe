@@ -30,7 +30,7 @@ use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
     AutomationAction, ClientMessage, PromptMarkKind, SearchMatch, ServerMessage, SessionInfo,
-    TerminalSize, WindowInfo, WorkspaceListEntry, WorkspaceTreeNode,
+    TerminalSize, WindowInfo, WorkspaceListEntry, WorkspaceNotesMutation, WorkspaceTreeNode,
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
@@ -46,6 +46,7 @@ use crate::session_manager::{
 };
 use crate::updater::UpdaterHandle;
 use crate::workspace_manager::WorkspaceManager;
+use crate::workspace_notes::WorkspaceNotesStore;
 
 /// Buffer size for PTY reads. 64 KiB balances throughput and latency.
 const PTY_READ_BUF_SIZE: usize = 64 * 1024;
@@ -124,6 +125,8 @@ pub struct IpcServerState {
     /// Fetcher used to refresh `release_catalog`. Production wires the real
     /// `GithubReleaseFetcher`; tests may inject deterministic stubs.
     pub release_fetcher: Arc<dyn ReleaseFetcher>,
+    /// Authoritative server-owned workspace notes store.
+    pub workspace_notes: Arc<Mutex<WorkspaceNotesStore>>,
 }
 
 struct ClientDispatchContext<'a> {
@@ -502,6 +505,7 @@ async fn handle_client(stream: tokio::net::UnixStream, server: IpcServerState) {
         &server.live_sessions,
         &server.connected_clients,
         &attached_ids,
+        &writer,
     )
     .await;
 }
@@ -572,18 +576,18 @@ async fn handle_client_hello(
     server: &IpcServerState,
     writer: &SharedWriter,
 ) -> WindowId {
-    let wm = server.workspace_manager.read().await;
-    let all_windows = wm.window_ids_with_sessions();
+    // Snapshot which windows have sessions, then resolve + register the
+    // assignment atomically under a single `connected_clients` write lock
+    // (see `claim_window`). The previous read-then-write split was a TOCTOU
+    // race: a post-update reconnect burst could let two `Hello`s for the
+    // same window both observe it free and both register.
+    let all_windows = {
+        let wm = server.workspace_manager.read().await;
+        wm.window_ids_with_sessions()
+    };
 
-    // Read connected clients first so we can reuse an unconnected window on
-    // fresh-launch restarts (no --window-id).
-    let connected = server.connected_clients.read().await;
     let (assigned, other_windows) =
-        resolve_window_assignment(requested_window_id, &all_windows, &connected);
-    drop(connected);
-    drop(wm);
-
-    register_connected_client(assigned, &server.connected_clients, writer).await;
+        claim_window(&server.connected_clients, requested_window_id, &all_windows, writer).await;
 
     if !other_windows.is_empty() {
         info!(%assigned, other_count = other_windows.len(), "Welcome includes other_windows — client will spawn additional processes");
@@ -602,7 +606,10 @@ async fn handle_legacy_client(
     attached_ids: &AttachedSessionIds,
 ) -> WindowId {
     let window_id = WindowId::new();
-    register_connected_client(window_id, &server.connected_clients, writer).await;
+    // A fresh `WindowId::new()` cannot collide, so a direct insert is safe
+    // here. Any path whose window ID *can* collide must go through
+    // `claim_window` so the check and the insert stay atomic.
+    server.connected_clients.write().await.insert(window_id, Arc::clone(writer));
     info!(%window_id, "legacy client (no Hello), assigned window");
 
     let mut context = ClientDispatchContext { server, writer, attached_ids, window_id };
@@ -610,12 +617,51 @@ async fn handle_legacy_client(
     window_id
 }
 
-async fn register_connected_client(
-    window_id: WindowId,
+/// Atomically resolve a window assignment and register the connecting
+/// client's writer under a single `connected_clients` write lock.
+///
+/// Splitting the "is this window already connected?" check from the
+/// registration (read lock, drop, then write lock) is a TOCTOU race: under
+/// the concurrent-reconnect burst that an update triggers, two `Hello`s for
+/// the same window both observe it free and both register, leaving two live
+/// clients bound to one window ID. Holding the write lock across the check
+/// and the insert makes the claim indivisible.
+///
+/// `other_windows` is filtered against the same write-locked
+/// `connected_clients` map, so it never lists a window whose client is
+/// already or concurrently registered. `all_windows` (which windows have
+/// sessions) is only a brief snapshot taken just before the lock: a window
+/// that gains sessions in that gap may be omitted from one fan-out and is
+/// re-offered on the next reconnect/`Welcome`. That can transiently
+/// under-fan-out but never produces a duplicate window.
+async fn claim_window(
     connected_clients: &ConnectedClients,
+    requested_window_id: Option<WindowId>,
+    all_windows: &HashSet<WindowId>,
     writer: &SharedWriter,
-) {
-    connected_clients.write().await.insert(window_id, Arc::clone(writer));
+) -> (WindowId, Vec<WindowId>) {
+    let mut connected = connected_clients.write().await;
+    let (assigned, other_windows) =
+        resolve_window_assignment(requested_window_id, all_windows, &connected);
+    connected.insert(assigned, Arc::clone(writer));
+    (assigned, other_windows)
+}
+
+/// Release a window's connected-client entry only if it still belongs to
+/// `writer`. The `SharedWriter` Arc is the connection's identity token: a
+/// stale disconnect from a client already superseded by a newer client for
+/// the same window must not evict the new owner — doing so makes the window
+/// look unconnected and triggers a duplicate respawn. Returns whether the
+/// registry is now empty, for settings-shutdown scheduling.
+fn release_window_if_owned(
+    connected: &mut HashMap<WindowId, SharedWriter>,
+    window_id: WindowId,
+    writer: &SharedWriter,
+) -> bool {
+    if connected.get(&window_id).is_some_and(|current| Arc::ptr_eq(current, writer)) {
+        connected.remove(&window_id);
+    }
+    connected.is_empty()
 }
 
 async fn run_client_message_loop<R>(
@@ -650,6 +696,7 @@ async fn detach_client_window(
     live_sessions: &LiveSessionRegistry,
     connected_clients: &ConnectedClients,
     attached_ids: &AttachedSessionIds,
+    writer: &SharedWriter,
 ) {
     let attached_ids = attached_snapshot(attached_ids).await;
     // Detach all sessions — clear the writer so the reader task stops
@@ -657,10 +704,9 @@ async fn detach_client_window(
     detach_sessions(live_sessions, &attached_ids).await;
     let last_client_disconnected = {
         let mut connected = connected_clients.write().await;
-        connected.remove(&window_id);
-        connected.is_empty()
+        release_window_if_owned(&mut connected, window_id, writer)
     };
-    info!(%window_id, "client removed from connected clients");
+    info!(%window_id, "client connection closed; window released if still owned");
     if last_client_disconnected {
         schedule_settings_shutdown_if_no_clients(Arc::clone(connected_clients));
     }
@@ -744,6 +790,8 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::RequestSnapshot { .. }
         | ClientMessage::CreateWorkspace
         | ClientMessage::ListSessions
+        | ClientMessage::WorkspaceNotesGet { .. }
+        | ClientMessage::WorkspaceNotesMutate { .. }
         | ClientMessage::ReportWorkspaceTree { .. }) => {
             dispatch_workspace_message(msg, context).await;
         }
@@ -799,8 +847,12 @@ async fn dispatch_session_message(msg: ClientMessage, context: &mut ClientDispat
             handle_attach_sessions(&session_ids, &dimensions, context).await;
         }
         ClientMessage::ConfigReloaded => {
-            handle_config_reloaded(&context.server.session_manager, &context.server.live_sessions)
-                .await;
+            handle_config_reloaded(
+                &context.server.session_manager,
+                &context.server.workspace_manager,
+                &context.server.live_sessions,
+            )
+            .await;
         }
         ClientMessage::FocusChanged { gained, lost } => {
             handle_focus_changed(gained, lost, &context.server.live_sessions, context.attached_ids)
@@ -845,6 +897,23 @@ async fn dispatch_workspace_message(msg: ClientMessage, context: &mut ClientDisp
                 &context.server.workspace_manager,
                 context.writer,
                 context.window_id,
+            )
+            .await;
+        }
+        ClientMessage::WorkspaceNotesGet { workspace_ids } => {
+            handle_workspace_notes_get(
+                &context.server.workspace_notes,
+                context.writer,
+                &workspace_ids,
+            )
+            .await;
+        }
+        ClientMessage::WorkspaceNotesMutate { mutation } => {
+            handle_workspace_notes_mutate(
+                &context.server.workspace_notes,
+                &context.server.connected_clients,
+                context.writer,
+                mutation,
             )
             .await;
         }
@@ -1632,6 +1701,42 @@ async fn handle_list_sessions(
     send_message(writer, &list_msg).await;
 }
 
+async fn handle_workspace_notes_get(
+    workspace_notes: &Arc<Mutex<WorkspaceNotesStore>>,
+    writer: &SharedWriter,
+    workspace_ids: &[WorkspaceId],
+) {
+    let collections = workspace_notes.lock().await.collections_for(workspace_ids);
+    send_message(writer, &ServerMessage::WorkspaceNotesSnapshot { collections }).await;
+}
+
+async fn handle_workspace_notes_mutate(
+    workspace_notes: &Arc<Mutex<WorkspaceNotesStore>>,
+    connected_clients: &ConnectedClients,
+    writer: &SharedWriter,
+    mutation: WorkspaceNotesMutation,
+) {
+    let collection = match workspace_notes.lock().await.apply_mutation(mutation) {
+        Ok(collection) => collection,
+        Err(error) => {
+            send_error(writer, &format!("workspace note mutation failed: {error}")).await;
+            return;
+        }
+    };
+    broadcast_workspace_notes_changed(connected_clients, collection).await;
+}
+
+async fn broadcast_workspace_notes_changed(
+    connected_clients: &ConnectedClients,
+    collection: scribe_common::protocol::WorkspaceNotesCollection,
+) {
+    let msg = ServerMessage::WorkspaceNotesChanged { collection };
+    let clients = connected_clients.read().await;
+    for writer in clients.values() {
+        send_message(writer, &msg).await;
+    }
+}
+
 /// Handle `AttachSessions` — take ownership of detached sessions, set the
 /// client writer, and send back session + workspace info for each.
 async fn handle_attach_sessions(
@@ -1696,6 +1801,7 @@ async fn filter_attachable_sessions(
 /// Handle `ConfigReloaded` — reload the config file and apply live changes.
 async fn handle_config_reloaded(
     session_manager: &Arc<SessionManager>,
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     live_sessions: &LiveSessionRegistry,
 ) {
     let cfg = match crate::config::load_config() {
@@ -1714,6 +1820,21 @@ async fn handle_config_reloaded(
 
     let term_config = build_term_config(new_scrollback);
     let sessions = live_sessions.read().await;
+    let mut workspace_messages = Vec::new();
+    {
+        let mut wm = workspace_manager.write().await;
+        wm.set_roots(cfg.workspace_roots);
+        for (&session_id, session) in sessions.iter() {
+            let named_msg = if let Some(cwd) = session.cwd.as_deref() {
+                wm.on_cwd_changed(session_id, cwd)
+            } else {
+                wm.check_cwd_fallback(session_id, session.child_pid)
+            };
+            if let Some(msg) = named_msg {
+                workspace_messages.push((Arc::clone(&session.client_writer), msg));
+            }
+        }
+    }
     for session in sessions.values() {
         session.term.lock().await.set_options(term_config.clone());
         session.scrollback_lines.store(new_scrollback, Ordering::Relaxed);
@@ -1721,11 +1842,17 @@ async fn handle_config_reloaded(
             .preserve_ai_scrollback
             .store(cfg.ai_terminal.preserve_ai_scrollback, Ordering::Relaxed);
     }
+    let sessions_len = sessions.len();
+    drop(sessions);
+
+    for (client_writer, msg) in workspace_messages {
+        send_to_client(&client_writer, &msg).await;
+    }
     info!(
         scrollback_lines = new_scrollback,
         preserve_ai_scrollback = cfg.ai_terminal.preserve_ai_scrollback,
-        sessions = sessions.len(),
-        "scrollback updated on live sessions"
+        sessions = sessions_len,
+        "config reload applied to live sessions"
     );
 }
 
@@ -3043,6 +3170,125 @@ mod tests {
 
         assert_eq!(assigned, w1);
         assert_eq!(others, vec![w2], "only the other unconnected window");
+    }
+
+    fn test_writer() -> SharedWriter {
+        let (server, _client) = unix_stream_pair();
+        let (_read, write) = tokio::io::split(server);
+        Arc::new(Mutex::new(write))
+    }
+
+    /// One claim with its own writer — extracted so the concurrency test
+    /// stays flat (no nested async block inside a loop).
+    async fn claim_for(
+        registry: ConnectedClients,
+        all: HashSet<WindowId>,
+        requested: WindowId,
+    ) -> WindowId {
+        let writer = test_writer();
+        let (assigned, _) = claim_window(&registry, Some(requested), &all, &writer).await;
+        assigned
+    }
+
+    /// Defect 1: a window already claimed by one connection must never be
+    /// handed to a second connection, even when the claim+register is the
+    /// only thing serialising them. Sequential form is deterministic.
+    #[tokio::test]
+    async fn claim_window_rejects_already_claimed_window() {
+        let w1 = WindowId::new();
+        let all: HashSet<WindowId> = [w1].into_iter().collect();
+        let registry = new_connected_clients();
+
+        let writer_a = test_writer();
+        let (assigned_a, _) = claim_window(&registry, Some(w1), &all, &writer_a).await;
+        assert_eq!(assigned_a, w1, "first client adopts the requested window");
+
+        let writer_b = test_writer();
+        let (assigned_b, _) = claim_window(&registry, Some(w1), &all, &writer_b).await;
+        assert_ne!(assigned_b, w1, "second client must NOT get the same window");
+
+        let connected = registry.read().await;
+        assert!(
+            Arc::ptr_eq(connected.get(&w1).expect("w1 still owned"), &writer_a),
+            "w1 must still belong to the original writer, not be overwritten",
+        );
+    }
+
+    /// Defect 1 under true concurrency: N simultaneous Hellos for the same
+    /// window ID must each end up owning a distinct window, and exactly one
+    /// must win the requested ID (the rest get fresh IDs).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_claims_for_same_window_never_collide() {
+        let w1 = WindowId::new();
+        let all: HashSet<WindowId> = [w1].into_iter().collect();
+        let registry = new_connected_clients();
+
+        let handles: Vec<_> = (0..16)
+            .map(|_| tokio::spawn(claim_for(Arc::clone(&registry), all.clone(), w1)))
+            .collect();
+
+        let mut assigned: Vec<WindowId> = Vec::new();
+        for h in handles {
+            assigned.push(h.await.unwrap());
+        }
+
+        let unique: HashSet<WindowId> = assigned.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            assigned.len(),
+            "every concurrent claim must get a unique window ID; collision = duplicate window",
+        );
+        assert_eq!(
+            assigned.iter().filter(|&&id| id == w1).count(),
+            1,
+            "exactly one concurrent claim wins the requested window ID",
+        );
+    }
+
+    /// Defect 3: once a window is legitimately re-adopted by a new client,
+    /// a late/duplicate detach carrying the *old* connection's writer must
+    /// not evict the new owner. Driven through the real `claim_window` /
+    /// `release_window_if_owned` path rather than a hand-built map state.
+    #[tokio::test]
+    async fn stale_detach_does_not_evict_new_owner() {
+        let w1 = WindowId::new();
+        let all: HashSet<WindowId> = [w1].into_iter().collect();
+        let registry = new_connected_clients();
+
+        // Client A connects and adopts w1.
+        let writer_a = test_writer();
+        let (a_assigned, _) = claim_window(&registry, Some(w1), &all, &writer_a).await;
+        assert_eq!(a_assigned, w1);
+
+        // A disconnects cleanly — it owns w1, so the entry is released.
+        {
+            let mut connected = registry.write().await;
+            assert!(release_window_if_owned(&mut connected, w1, &writer_a));
+            assert!(!connected.contains_key(&w1), "owner detach frees the window");
+        }
+
+        // Client B reconnects and legitimately re-adopts the now-free w1.
+        let writer_b = test_writer();
+        let (b_assigned, _) = claim_window(&registry, Some(w1), &all, &writer_b).await;
+        assert_eq!(b_assigned, w1, "B adopts w1 once it is free");
+
+        // A late/duplicate detach from A's old writer must NOT evict B.
+        {
+            let mut connected = registry.write().await;
+            let now_empty = release_window_if_owned(&mut connected, w1, &writer_a);
+            assert!(!now_empty, "registry not empty — B still owns w1");
+            assert!(
+                Arc::ptr_eq(connected.get(&w1).expect("w1 retained"), &writer_b),
+                "stale detach from the old writer must not evict the new owner",
+            );
+        }
+
+        // B's own detach releases it.
+        {
+            let mut connected = registry.write().await;
+            assert!(release_window_if_owned(&mut connected, w1, &writer_b));
+            assert!(!connected.contains_key(&w1), "owner detach removes the entry");
+        }
     }
 
     #[test]

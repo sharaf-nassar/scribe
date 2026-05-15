@@ -17,3 +17,4 @@ pub mod shell_integration;
 pub mod stop_classifier;
 pub mod updater;
 pub mod workspace_manager;
+pub mod workspace_notes;

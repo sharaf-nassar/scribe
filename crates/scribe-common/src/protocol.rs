@@ -70,6 +70,63 @@ pub struct SessionContext {
     pub tmux_session: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceNoteStatus {
+    Active,
+    Archived,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveReason {
+    Done,
+    Removed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceNoteEntry {
+    pub note_id: String,
+    pub workspace_id: WorkspaceId,
+    pub text: String,
+    pub status: WorkspaceNoteStatus,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    #[serde(default)]
+    pub archived_at_ms: Option<u64>,
+    #[serde(default)]
+    pub archive_reason: Option<ArchiveReason>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceNoteDraft {
+    pub workspace_id: WorkspaceId,
+    pub text: String,
+    pub updated_at_ms: u64,
+    pub dirty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceNotesCollection {
+    pub workspace_id: WorkspaceId,
+    #[serde(default)]
+    pub active_notes: Vec<WorkspaceNoteEntry>,
+    #[serde(default)]
+    pub archived_notes: Vec<WorkspaceNoteEntry>,
+    #[serde(default)]
+    pub draft: Option<WorkspaceNoteDraft>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WorkspaceNotesMutation {
+    SaveDraft { workspace_id: WorkspaceId, text: String },
+    CreateActiveNote { workspace_id: WorkspaceId, text: String },
+    EditNote { workspace_id: WorkspaceId, note_id: String, text: String },
+    ArchiveNote { workspace_id: WorkspaceId, note_id: String, reason: ArchiveReason },
+    BulkEditArchived { workspace_id: WorkspaceId, updates: Vec<(String, String)> },
+}
+
 // ── UI → Server ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +219,14 @@ pub enum ClientMessage {
         query: String,
         /// Maximum number of matches to return.
         limit: u32,
+    },
+    /// Request authoritative workspace notes for one or more workspaces.
+    WorkspaceNotesGet {
+        workspace_ids: Vec<WorkspaceId>,
+    },
+    /// Request a server-side workspace notes mutation.
+    WorkspaceNotesMutate {
+        mutation: WorkspaceNotesMutation,
     },
     /// First message after connect — identifies this window to the server.
     /// `None` means the client is starting fresh and the server should assign
@@ -334,6 +399,14 @@ pub enum ServerMessage {
         /// Absolute path to the project directory (root + first CWD component).
         #[serde(default)]
         project_root: Option<PathBuf>,
+    },
+    /// Server-authoritative notes snapshot for requested workspaces.
+    WorkspaceNotesSnapshot {
+        collections: Vec<WorkspaceNotesCollection>,
+    },
+    /// Broadcast after one accepted and persisted workspace notes mutation.
+    WorkspaceNotesChanged {
+        collection: WorkspaceNotesCollection,
     },
     /// Search results for a `SearchRequest`.
     SearchResults {

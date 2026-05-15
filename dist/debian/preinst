@@ -15,6 +15,24 @@ fi
 CLIENT_BIN_PATH="/usr/bin/${CLIENT_BIN_NAME}"
 SETTINGS_BIN_PATH="/usr/bin/${SETTINGS_BIN_NAME}"
 
+process_pids_for_binary() {
+    local binary="$1"
+    local pid="" exe=""
+
+    # Seed with pgrep -f because long dev-flavor process names exceed Linux's
+    # 15-byte comm limit, then filter by /proc/$pid/exe so /usr/bin/scribe-dev
+    # does not also match /usr/bin/scribe-dev-server or -settings.
+    pgrep -u "$TARGET_UID" -f "$binary" 2>/dev/null | while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+        case "$exe" in
+            "$binary"|"$binary (deleted)")
+                printf '%s\n' "$pid"
+                ;;
+        esac
+    done
+}
+
 case "$1" in
     upgrade|install)
         TARGET_UID="${PRIVILEGED_USER_UID:-$(id -u)}"
@@ -30,8 +48,8 @@ case "$1" in
         # can detect which processes were replaced and act accordingly.
         # Use -f (full cmdline) — comm is truncated to 15 chars, breaking -x
         # for "scribe-dev-settings" (19 chars).
-        pgrep -u "$TARGET_UID" -f "$CLIENT_BIN_PATH" 2>/dev/null | tr '\n' ' ' > "${STATE_DIR}/upgrade-client-pids" || true
-        pgrep -u "$TARGET_UID" -f "$SETTINGS_BIN_PATH" 2>/dev/null > "${STATE_DIR}/upgrade-settings-pid" || true
+        process_pids_for_binary "$CLIENT_BIN_PATH" | tr '\n' ' ' > "${STATE_DIR}/upgrade-client-pids" || true
+        process_pids_for_binary "$SETTINGS_BIN_PATH" > "${STATE_DIR}/upgrade-settings-pid" || true
         ;;
 esac
 

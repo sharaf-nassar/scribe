@@ -477,9 +477,10 @@ fn apply_workspace_key(
 ) -> Result<(), String> {
     match key {
         "workspaces.add_root" => {
-            // The webview sends an empty string as a placeholder; in a real
-            // implementation a file picker dialog would provide the path.
-            tracing::debug!("workspace add_root requested (file picker not yet implemented)");
+            let root = workspace_root_from_value(value)?;
+            if !config.workspaces.roots.iter().any(|existing| existing == &root) {
+                config.workspaces.roots.push(root);
+            }
         }
         "workspaces.remove_root" => {
             let path = value.as_str().ok_or("remove_root value must be a string")?;
@@ -502,6 +503,17 @@ fn apply_workspace_key(
     }
 
     Ok(())
+}
+
+fn workspace_root_from_value(value: &serde_json::Value) -> Result<String, String> {
+    let root = value.as_str().ok_or("add_root value must be a string")?.trim();
+    if root.is_empty() {
+        return Err(String::from("add_root value must not be empty"));
+    }
+    if !root.starts_with("~/") && !std::path::Path::new(root).is_absolute() {
+        return Err(String::from("workspace root must be absolute or start with ~/"));
+    }
+    Ok(root.to_owned())
 }
 
 fn apply_update_key(
@@ -845,5 +857,19 @@ mod tests {
         .expect("codex toggle should apply");
 
         assert!(!config.terminal.ai_integration.codex_code.enabled());
+    }
+
+    #[test]
+    fn adds_workspace_root_path() {
+        let mut config = scribe_common::config::ScribeConfig::default();
+
+        apply_config_key(
+            &mut config,
+            "workspaces.add_root",
+            &serde_json::Value::String(String::from("/home/user/work")),
+        )
+        .expect("workspace root should apply");
+
+        assert_eq!(config.workspaces.roots, vec![String::from("/home/user/work")]);
     }
 }

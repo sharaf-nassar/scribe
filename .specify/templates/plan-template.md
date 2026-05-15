@@ -31,7 +31,23 @@
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-[Gates determined based on constitution file]
+Document PASS/FAIL for each constitution gate:
+
+- **Code Quality**: Does the plan preserve crate boundaries, typed contracts,
+  specific error handling, and existing abstractions?
+- **Testing Strategy**: Does every user story have independent verification?
+  Are new tests included only when explicitly requested or required by the
+  accepted plan?
+- **User Experience Consistency**: Does the plan preserve established terminal,
+  settings, shortcut, selection, and session-survival behavior?
+- **Performance**: Are measurable budgets stated for render, input, IPC, PTY,
+  settings, startup, or packaging work, or is performance marked N/A?
+- **Operational Safety**: Does the plan avoid live server restarts unless the
+  user has explicitly approved them, preserve worktree changes, and update
+  `lat.md` when behavior or architecture changes?
+
+Any FAIL MUST be recorded in Complexity Tracking with the justification,
+rejected simpler alternative, mitigation, and user-visible impact.
 
 ## Project Structure
 

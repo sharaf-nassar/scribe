@@ -22,6 +22,7 @@ mod shell_integration;
 mod stop_classifier;
 mod updater;
 mod workspace_manager;
+mod workspace_notes;
 
 #[cfg(test)]
 mod handoff_tests;
@@ -152,6 +153,8 @@ async fn run_server_loop(
     let release_catalog = Arc::new(tokio::sync::Mutex::new(releases::ReleaseCatalog::default()));
     let release_fetcher: Arc<dyn releases::ReleaseFetcher> =
         Arc::new(releases::GithubReleaseFetcher::new());
+    let workspace_notes =
+        Arc::new(tokio::sync::Mutex::new(workspace_notes::WorkspaceNotesStore::load()));
 
     let handoff_triggered = tokio::select! {
         result = ipc_server::start_ipc_server(
@@ -164,6 +167,7 @@ async fn run_server_loop(
                 updater_handle: Arc::clone(&updater_handle),
                 release_catalog: Arc::clone(&release_catalog),
                 release_fetcher: Arc::clone(&release_fetcher),
+                workspace_notes: Arc::clone(&workspace_notes),
             },
         ) => {
             result?;

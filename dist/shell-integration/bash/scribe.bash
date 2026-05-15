@@ -154,13 +154,26 @@ fi
 # even after ai_provider was cleared by the previous 133;A. DEBUG trap fires
 # for each top-level command bash is about to execute; subshell expansions
 # during PROMPT_COMMAND/PS1 substitution are skipped via BASH_SUBSHELL.
+#
+# $_ preservation: a DEBUG trap action runs as a command *before* every
+# interactive command, so bash sets $_ to the trap's own last word — the
+# user's next `echo $_` would otherwise see `__scribe_emit_ai_launch`
+# instead of their previous command's last argument. We capture $_ in the
+# trap string (it still holds the previous command's last arg at trap-fire
+# time — the canonical bash-preexec technique) and restore it as the
+# function's final command. $? is unaffected: bash preserves the exit
+# status across DEBUG traps automatically.
 __scribe_emit_ai_launch() {
-	[[ "${BASH_SUBSHELL:-0}" -ne 0 ]] && return
-	local first_word="${BASH_COMMAND%% *}"
-	first_word="${first_word##*/}"
-	case "$first_word" in
-		claude) printf '\e]1337;ScribeAiLaunch=claude_code\e\\' ;;
-		codex) printf '\e]1337;ScribeAiLaunch=codex_code\e\\' ;;
-	esac
+	local __scribe_underscore="$1"
+	if [[ "${BASH_SUBSHELL:-0}" -eq 0 ]]; then
+		local first_word="${BASH_COMMAND%% *}"
+		first_word="${first_word##*/}"
+		case "$first_word" in
+			claude) printf '\e]1337;ScribeAiLaunch=claude_code\e\\' ;;
+			codex) printf '\e]1337;ScribeAiLaunch=codex_code\e\\' ;;
+		esac
+	fi
+	# Restore $_ so interactive `$_` keeps the user's previous last argument.
+	: "$__scribe_underscore"
 }
-trap '__scribe_emit_ai_launch' DEBUG
+trap '__scribe_emit_ai_launch "$_"' DEBUG

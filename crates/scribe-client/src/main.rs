@@ -32,6 +32,9 @@ mod update_dialog;
 mod url_detect;
 mod window_state;
 mod workspace_layout;
+mod workspace_notes;
+mod workspace_notes_modal;
+mod workspace_notes_preview;
 #[cfg(target_os = "linux")]
 mod x11_focus;
 
@@ -74,6 +77,23 @@ use crate::ipc_client::{ClientCommand, UiEvent};
 use crate::layout::{PaneEdges, PaneId, Rect};
 use crate::pane::{FeedOutputResult, Pane};
 use crate::workspace_layout::WindowLayout;
+use crate::workspace_notes::ArchiveReason;
+use crate::workspace_notes_modal::{
+    WorkspaceNotesEditMode, WorkspaceNotesModal, WorkspaceNotesModalAction, WorkspaceNotesView,
+};
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn log_startup_step(phase: &'static str, elapsed: Duration, total: Duration) {
+    tracing::info!(
+        phase,
+        elapsed_ms = duration_ms(elapsed),
+        total_ms = duration_ms(total),
+        "client startup timing"
+    );
+}
 
 #[cfg(target_os = "macos")]
 fn is_macos_close_window_shortcut(
@@ -262,6 +282,23 @@ enum PendingShutdown {
     QuitAll,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingWorkspaceNotesAction {
+    TriggerUpdate,
+    SpawnUpdateRestartHelper,
+    QuitAll,
+    CloseWindow,
+    FinishQuitRequested,
+    FinishWindowClosed { window_id: WindowId },
+}
+
+#[derive(Debug)]
+struct PendingWorkspaceNotesFlush {
+    workspace_id: WorkspaceId,
+    draft_text: String,
+    action: Option<PendingWorkspaceNotesAction>,
+}
+
 struct AppStartup {
     config: ScribeConfig,
     theme: Theme,
@@ -282,37 +319,61 @@ struct AppStartup {
 
 impl AppStartup {
     fn load(proxy: &EventLoopProxy<UiEvent>, window_id: Option<WindowId>) -> Self {
+        let startup_start = Instant::now();
+        let mut step_start = startup_start;
         let config = scribe_common::config::load_config().unwrap_or_else(|error| {
             tracing::warn!("failed to load config: {error}, using defaults");
             ScribeConfig::default()
         });
+        log_startup_step("load_config", step_start.elapsed(), startup_start.elapsed());
+
+        step_start = Instant::now();
         let theme = resolve_theme(&config);
         let window_layout = WindowLayout::new(WorkspaceId::new(), Some(theme.chrome.accent));
         let window_registry = window_state::WindowRegistry::new();
+        let saved_geometry = window_id.map(|wid| window_registry.load(wid));
+        let bindings = input::Bindings::parse(&config.keybindings);
+        let ai_tracker = AiStateTracker::new(config.terminal.ai_session.ai_states.clone());
+        let notification_tracker =
+            notifications::NotificationTracker::new(config.notifications.clone());
+        log_startup_step("load_static_state", step_start.elapsed(), startup_start.elapsed());
 
-        Self {
+        step_start = Instant::now();
+        let clipboard = arboard::Clipboard::new()
+            .map_err(|error| {
+                tracing::warn!("clipboard unavailable: {error}");
+            })
+            .ok();
+        log_startup_step("open_clipboard", step_start.elapsed(), startup_start.elapsed());
+
+        step_start = Instant::now();
+        let hostname = read_hostname();
+        let sys_stats = sys_stats::SystemStatsCollector::new();
+        log_startup_step("load_host_stats", step_start.elapsed(), startup_start.elapsed());
+
+        step_start = Instant::now();
+        let config_watcher = config::start_config_watcher(proxy.clone());
+        log_startup_step("start_config_watcher", step_start.elapsed(), startup_start.elapsed());
+
+        let startup = Self {
             cursor_blink_enabled: config.appearance.cursor_blink,
             opacity: config.appearance.opacity,
             window_transparent: config.appearance.opacity < 1.0,
-            bindings: input::Bindings::parse(&config.keybindings),
-            saved_geometry: window_id.map(|wid| window_registry.load(wid)),
-            ai_tracker: AiStateTracker::new(config.terminal.ai_session.ai_states.clone()),
-            notification_tracker: notifications::NotificationTracker::new(
-                config.notifications.clone(),
-            ),
-            clipboard: arboard::Clipboard::new()
-                .map_err(|error| {
-                    tracing::warn!("clipboard unavailable: {error}");
-                })
-                .ok(),
-            hostname: read_hostname(),
-            sys_stats: sys_stats::SystemStatsCollector::new(),
-            config_watcher: config::start_config_watcher(proxy.clone()),
+            bindings,
+            saved_geometry,
+            ai_tracker,
+            notification_tracker,
+            clipboard,
+            hostname,
+            sys_stats,
+            config_watcher,
             config,
             theme,
             window_layout,
             window_registry,
-        }
+        };
+        log_startup_step("startup_state_loaded", startup_start.elapsed(), startup_start.elapsed());
+        startup
     }
 }
 
@@ -647,9 +708,23 @@ struct AppCursorState {
 
 struct AppWindowFocusState {
     window_focused: bool,
+    /// Set from winit `WindowEvent::Occluded` — the window is fully hidden
+    /// (minimised, covered, or on another workspace). Used only to suppress
+    /// the AI pulse (Layer 3): when nobody can see it, animating it — and
+    /// keeping the redraw loop alive — is pure waste. Deliberately *not*
+    /// gated on focus: the pulse exists to be noticed in a background,
+    /// unfocused window. winit caveat: `Occluded` is X11/macOS only
+    /// (Wayland/Windows report nothing → flag stays false, harmless).
+    window_occluded: bool,
 }
 
 /// Application state for the winit event loop.
+#[derive(Clone)]
+struct WorkspaceNotesPreviewTarget {
+    workspace_id: WorkspaceId,
+    interaction: workspace_notes_preview::WorkspaceNotesPreviewInteraction,
+}
+
 struct App {
     // Window identity
     /// Window ID from CLI arg (if provided) or assigned by the server.
@@ -729,6 +804,18 @@ struct App {
     command_palette: command_palette::CommandPalette,
     command_palette_items: Vec<CommandPaletteEntry>,
     search_overlay: search_overlay::SearchOverlay,
+
+    // Workspace notes
+    workspace_notes: workspace_notes::WorkspaceNotesStore,
+    workspace_notes_modal: WorkspaceNotesModal,
+    workspace_notes_save_pending: Option<Instant>,
+    workspace_notes_pending_draft_flush: Option<PendingWorkspaceNotesFlush>,
+    workspace_notes_pending_modal_mutation: Option<WorkspaceId>,
+    workspace_notes_pending_modal_action: Option<PendingWorkspaceNotesAction>,
+    workspace_notes_hit_targets: Vec<(WorkspaceId, layout::Rect)>,
+    hovered_workspace_notes: Option<WorkspaceId>,
+    hovered_workspace_note_preview_note: Option<String>,
+    workspace_notes_preview_target: Option<WorkspaceNotesPreviewTarget>,
 
     // Close dialog overlay (shown on window close request)
     close_dialog: Option<close_dialog::CloseDialog>,
@@ -860,11 +947,14 @@ impl App {
         window_id: Option<WindowId>,
         restore_spawn_child: bool,
     ) -> Self {
+        let startup_start = Instant::now();
         let startup = AppStartup::load(&proxy, window_id);
+        log_startup_step("app_startup_loaded", startup_start.elapsed(), startup_start.elapsed());
         let animation_proxy = proxy.clone();
         let mut app =
             Self::new_base(wgpu_instance, proxy, animation_proxy, window_id, restore_spawn_child);
         app.apply_startup(startup);
+        log_startup_step("app_constructed", startup_start.elapsed(), startup_start.elapsed());
         app
     }
 
@@ -935,6 +1025,13 @@ impl App {
             bindings, clipboard: None, zoom_level: 0,
             command_palette: command_palette::CommandPalette::new(), command_palette_items: Vec::new(),
             search_overlay: search_overlay::SearchOverlay::new(),
+            workspace_notes: workspace_notes::WorkspaceNotesStore::load(),
+            workspace_notes_modal: WorkspaceNotesModal::new(), workspace_notes_save_pending: None,
+            workspace_notes_pending_draft_flush: None, workspace_notes_pending_modal_mutation: None,
+            workspace_notes_pending_modal_action: None,
+            workspace_notes_hit_targets: Vec::new(), hovered_workspace_notes: None,
+            hovered_workspace_note_preview_note: None,
+            workspace_notes_preview_target: None,
             close_dialog: None, update_available: None, update_progress: None, update_dialog: None,
             status_bar_update_rect: None, context_menu: None,
             splash: AppSplashState { active: true, content_ready: false },
@@ -943,7 +1040,7 @@ impl App {
             wgpu_instance, proxy: Some(proxy), animation_proxy: Some(animation_proxy),
             last_cursor_pos: None, last_tick: Instant::now(),
             cursor: AppCursorState { visible: true, blink_enabled: false },
-            focus: AppWindowFocusState { window_focused: true },
+            focus: AppWindowFocusState { window_focused: true, window_occluded: false },
             #[cfg(target_os = "linux")]
             x11_focus_guard: None,
             blink_timer: Instant::now(), opacity: 1.0, window_transparent: false, scale_factor: 1.0,
@@ -1038,6 +1135,15 @@ impl ApplicationHandler<UiEvent> for App {
         self.flush_geometry_if_due();
         self.flush_resize_if_pending();
         self.flush_restore_if_due();
+        self.flush_workspace_notes_if_due();
+
+        // Layer 2 defence-in-depth: lazily drop any `Processing` state from
+        // a dead/killed AI that can never send a terminal hook. Costs
+        // nothing until something is actually stuck, and resolves before
+        // the indicator is observed (the user returning wakes this loop).
+        if self.ai_tracker.clear_stale_processing() {
+            self.request_redraw();
+        }
     }
 
     fn window_event(
@@ -1190,6 +1296,16 @@ impl App {
                 self.handle_workspace_named(*workspace_id, name, project_root.clone());
                 true
             }
+            UiEvent::WorkspaceNotesSnapshot { collections } => {
+                self.workspace_notes.apply_collections(collections.clone());
+                self.hydrate_workspace_notes_modal_from_collections(collections);
+                self.request_redraw();
+                true
+            }
+            UiEvent::WorkspaceNotesChanged { collection } => {
+                self.handle_workspace_notes_changed(collection.clone(), event_loop);
+                true
+            }
             UiEvent::ConfigChanged => {
                 self.handle_config_changed();
                 true
@@ -1226,6 +1342,14 @@ impl App {
             }
             UiEvent::RunAction { action } => {
                 self.execute_automation_action(action.clone());
+                true
+            }
+            UiEvent::ServerError { message } => {
+                self.workspace_notes.set_error(message.clone());
+                self.workspace_notes_pending_modal_mutation = None;
+                self.workspace_notes_pending_modal_action = None;
+                self.workspace_notes_pending_draft_flush = None;
+                self.request_redraw();
                 true
             }
             _ => false,
@@ -1388,6 +1512,10 @@ impl App {
             self.handle_update_dialog_window_event(event_loop, event);
             return true;
         }
+        if self.workspace_notes_modal.is_open() {
+            self.handle_workspace_notes_window_event(event_loop, event);
+            return true;
+        }
         false
     }
 
@@ -1482,6 +1610,7 @@ impl App {
                 self.handle_cursor_moved();
             }
             WindowEvent::Focused(focused) => self.handle_focus_changed(*focused),
+            WindowEvent::Occluded(occluded) => self.handle_occluded_changed(*occluded),
             _ => {}
         }
     }
@@ -1508,6 +1637,26 @@ impl App {
             self.notify_focus_change(None, session);
         }
         self.request_redraw();
+    }
+
+    /// Layer 3 power optimisation: when the window becomes fully occluded
+    /// (hidden), the AI pulse cannot be seen, so let the shared redraw loop
+    /// retire (`handle_animation_tick` reads `window_occluded`). When it
+    /// becomes visible again, re-arm the loop if any state still needs it
+    /// and repaint so the indicator is immediately correct. Occlusion is
+    /// X11/macOS-only in winit 0.30; elsewhere this never fires and Layer 1
+    /// alone still bounds the loop.
+    fn handle_occluded_changed(&mut self, occluded: bool) {
+        if self.focus.window_occluded == occluded {
+            return;
+        }
+        self.focus.window_occluded = occluded;
+        if !occluded {
+            if self.ai_tracker.needs_animation(&self.config.terminal) && !self.animation.running {
+                self.start_animation_timer();
+            }
+            self.request_redraw();
+        }
     }
 
     fn handle_focus_gained(&mut self) {
@@ -1545,9 +1694,57 @@ impl App {
         }
     }
 
+    /// Build the terminal renderer and capture initial window metrics.
+    /// Extracted from `init_gpu_and_terminal` to keep it within the clippy
+    /// line budget; records `self.scale_factor` and returns the renderer
+    /// plus the initial surface size (also needed by the splash renderer).
+    fn build_terminal_renderer(
+        &mut self,
+        window: &Window,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+    ) -> (TerminalRenderer, winit::dpi::PhysicalSize<u32>) {
+        let size = window.inner_size();
+        let scale = window.scale_factor().cast::<f32>();
+        self.scale_factor = scale;
+        let font_params = scribe_renderer::atlas::FontParams {
+            family: self.config.appearance.font.clone(),
+            size: self.config.appearance.font_size * scale,
+            weight: self.config.appearance.font_weight,
+            weight_bold: self.config.appearance.font_weight_bold,
+            ligatures: self.config.appearance.ligatures,
+            line_padding: self.config.appearance.line_padding,
+        };
+        let mut renderer =
+            TerminalRenderer::new(device, queue, format, &font_params, (size.width, size.height));
+        renderer.set_theme(&self.theme);
+        (renderer, size)
+    }
+
+    /// Build the optional splash renderer. Extracted alongside
+    /// `build_terminal_renderer` so `init_gpu_and_terminal` stays within the
+    /// clippy line budget. A splash failure is non-fatal.
+    fn build_splash_renderer(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> Option<splash::SplashRenderer> {
+        match splash::SplashRenderer::new(device, queue, format, (size.width, size.height)) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(error = %e, "splash screen unavailable; skipping");
+                None
+            }
+        }
+    }
+
     /// Initialise the window, wgpu surface/device/queue, renderer, layout,
     /// and IPC thread.
     fn init_gpu_and_terminal(&mut self, event_loop: &ActiveEventLoop) -> Result<(), InitError> {
+        let startup_start = Instant::now();
+        let mut step_start = startup_start;
         // Set a reasonable initial size so the GPU surface, renderer, and
         // pane grids have usable dimensions even before the compositor sends
         // a configure event.  On Wayland, inner_size() can return a tiny
@@ -1561,74 +1758,65 @@ impl App {
             tracing::info!(opacity = self.opacity, "window transparency enabled");
         }
         let window = Arc::new(event_loop.create_window(attrs).map_err(InitError::Window)?);
+        log_startup_step("create_window", step_start.elapsed(), startup_start.elapsed());
 
         // Restore saved window geometry (position, size, maximized state).
+        step_start = Instant::now();
         if let Some(geom) = self.saved_geometry.take() {
             let _ = window_state::apply_window_geometry(event_loop, &window, &geom);
         }
+        log_startup_step("apply_window_geometry", step_start.elapsed(), startup_start.elapsed());
 
+        step_start = Instant::now();
         let surface =
             self.wgpu_instance.create_surface(Arc::clone(&window)).map_err(InitError::Surface)?;
+        log_startup_step("create_surface", step_start.elapsed(), startup_start.elapsed());
 
+        step_start = Instant::now();
         let (device, queue, surface_config) = configure_device_and_surface(
             &self.wgpu_instance,
             &surface,
             &window,
             self.window_transparent,
         )?;
+        log_startup_step("configure_wgpu", step_start.elapsed(), startup_start.elapsed());
 
-        let size = window.inner_size();
-        let scale = window.scale_factor().cast::<f32>();
-        self.scale_factor = scale;
-        let font_params = scribe_renderer::atlas::FontParams {
-            family: self.config.appearance.font.clone(),
-            size: self.config.appearance.font_size * scale,
-            weight: self.config.appearance.font_weight,
-            weight_bold: self.config.appearance.font_weight_bold,
-            ligatures: self.config.appearance.ligatures,
-            line_padding: self.config.appearance.line_padding,
-        };
-        let mut renderer = TerminalRenderer::new(
-            &device,
-            &queue,
-            surface_config.format,
-            &font_params,
-            (size.width, size.height),
-        );
-
-        renderer.set_theme(&self.theme);
+        step_start = Instant::now();
+        let (renderer, size) =
+            self.build_terminal_renderer(&window, &device, &queue, surface_config.format);
+        log_startup_step("create_terminal_renderer", step_start.elapsed(), startup_start.elapsed());
 
         // Start IPC thread (proxy was created before run_app).
+        step_start = Instant::now();
         let proxy = self.proxy.take().ok_or(InitError::ProxyConsumed)?;
         let cmd_tx = ipc_client::start_ipc_thread(proxy, self.window_id);
+        log_startup_step("start_ipc_thread", step_start.elapsed(), startup_start.elapsed());
 
         // Start the platform notification dispatcher on its own
         // thread — see lat.md/client.md §Desktop Notifications.
+        step_start = Instant::now();
         if let Some(notif_proxy) = self.animation_proxy.clone() {
             self.notification_tx = Some(notification_dispatcher::spawn_dispatcher(notif_proxy));
         }
+        log_startup_step(
+            "start_notification_dispatcher",
+            step_start.elapsed(),
+            startup_start.elapsed(),
+        );
 
         // `ListSessions` is deferred to the first splash frame — see
         // `handle_redraw`.  This guarantees the splash is visible before
         // session content arrives, avoiding a flash of restored content.
 
-        let splash = match splash::SplashRenderer::new(
-            &device,
-            &queue,
-            surface_config.format,
-            (size.width, size.height),
-        ) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(error = %e, "splash screen unavailable; skipping");
-                None
-            }
-        };
+        step_start = Instant::now();
+        let splash = Self::build_splash_renderer(&device, &queue, surface_config.format, size);
+        log_startup_step("create_splash_renderer", step_start.elapsed(), startup_start.elapsed());
 
         self.gpu = Some(GpuContext { surface, device, queue, surface_config, renderer, splash });
         self.cmd_tx = Some(cmd_tx);
 
         // Initialise X11 active-window guard (Linux/X11 only).
+        step_start = Instant::now();
         #[cfg(target_os = "linux")]
         if let Some(wid) = x11_window_id(&window) {
             self.x11_focus_guard = x11_focus::X11FocusGuard::new(wid);
@@ -1636,8 +1824,18 @@ impl App {
                 tracing::debug!("X11 active-window guard initialised");
             }
         }
+        log_startup_step(
+            "init_platform_focus_guard",
+            step_start.elapsed(),
+            startup_start.elapsed(),
+        );
 
         self.window = Some(window);
+        log_startup_step(
+            "init_gpu_and_terminal_done",
+            startup_start.elapsed(),
+            startup_start.elapsed(),
+        );
 
         Ok(())
     }
@@ -1803,6 +2001,18 @@ impl App {
     }
 
     fn handle_pty_output(&mut self, session_id: SessionId, bytes: &[u8]) {
+        // Fresh PTY output is a liveness signal for the Processing pulse
+        // envelope — see ai_indicator.rs §pulse_is_active. Recorded before
+        // the pane lookup so a genuinely-working AI re-arms even if its
+        // pane is not currently mapped.
+        self.ai_tracker.note_activity(session_id);
+        if self.ai_tracker.needs_animation(&self.config.terminal)
+            && !self.animation.running
+            && !self.focus.window_occluded
+        {
+            self.start_animation_timer();
+        }
+
         let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
         self.enqueue_pane_output_frames(pane_id, bytes);
     }
@@ -2023,6 +2233,7 @@ impl App {
         }
         self.splash_load.needs_list_sessions = false;
         if let Some(tx) = &self.cmd_tx {
+            tracing::info!("startup requesting session list after splash frame");
             send_command(tx, ClientCommand::ListSessions);
         }
     }
@@ -2040,12 +2251,19 @@ impl App {
         workspace_tree: Option<&scribe_common::protocol::WorkspaceTreeNode>,
         workspaces: &[scribe_common::protocol::WorkspaceListEntry],
     ) {
+        let startup_start = Instant::now();
         let Some(tx) = self.cmd_tx.clone() else { return };
 
         self.connection.server_connected = true;
         self.legacy_workspace_direction_updates.clear();
         if sessions.is_empty() {
+            tracing::info!("startup received empty session list");
             self.try_cold_restart_or_fresh(event_loop);
+            log_startup_step(
+                "handle_empty_session_list",
+                startup_start.elapsed(),
+                startup_start.elapsed(),
+            );
             return;
         }
 
@@ -2069,6 +2287,7 @@ impl App {
         let metadata = build_session_metadata_map(sessions);
         let groups = group_sessions_by_workspace(sessions);
         let live_workspace_ids: HashSet<WorkspaceId> = groups.keys().copied().collect();
+        self.request_workspace_notes_snapshot(live_workspace_ids.iter().copied().collect());
         let tab_pane_trees = workspace_tree.map_or_else(HashMap::new, extract_tab_pane_trees);
 
         let tabs_by_ws = self.reconstruct_workspaces_for_sessions(
@@ -2096,6 +2315,7 @@ impl App {
         self.mark_reconnected_grids(&codex_sessions);
         send_command(&tx, ClientCommand::Subscribe { session_ids: collect_session_ids(sessions) });
         self.request_redraw();
+        log_startup_step("handle_session_list", startup_start.elapsed(), startup_start.elapsed());
     }
 
     fn reconstruct_workspaces_for_sessions(
@@ -2346,6 +2566,7 @@ impl App {
 
     /// Create the initial session + pane for a fresh start (no existing sessions).
     fn create_initial_session(&mut self) {
+        let startup_start = Instant::now();
         let Some(tx) = &self.cmd_tx else { return };
 
         let workspace_id = self.window_layout.focused_workspace_id();
@@ -2382,6 +2603,11 @@ impl App {
 
         // Seed the server with the initial (single-leaf) tree.
         self.report_workspace_tree();
+        log_startup_step(
+            "create_initial_session",
+            startup_start.elapsed(),
+            startup_start.elapsed(),
+        );
     }
 
     /// Try to restore the previous layout from a cold restart snapshot.
@@ -2926,7 +3152,10 @@ impl App {
             return;
         }
 
-        if self.ai_tracker.needs_animation(&self.config.terminal) && !self.animation.running {
+        if self.ai_tracker.needs_animation(&self.config.terminal)
+            && !self.animation.running
+            && !self.focus.window_occluded
+        {
             self.start_animation_timer();
         }
 
@@ -3139,7 +3368,11 @@ impl App {
         // during a selection drag, even when the mouse is not moving.
         let edge_scrolling = self.maybe_edge_scroll();
 
-        let ai_animating = self.ai_tracker.needs_animation(&self.config.terminal);
+        // Layer 3: a fully-occluded window shows nothing, so the AI pulse
+        // must not keep the loop alive. Other animators (scrollbar/tab/etc.)
+        // are transient and self-decaying, so they need no occlusion gate.
+        let ai_animating =
+            !self.focus.window_occluded && self.ai_tracker.needs_animation(&self.config.terminal);
         let drag_active = self.tab_drag.as_ref().is_some_and(|d| d.dragging);
         if !ai_animating
             && !sync_pending
@@ -3548,6 +3781,7 @@ impl App {
                     .update_split_direction_for(update.workspace_id, from_layout_direction(dir));
             }
         }
+        self.request_workspace_notes_snapshot(vec![update.workspace_id]);
     }
 
     /// Handle workspace auto-naming — update the workspace slot, pane names,
@@ -3689,7 +3923,10 @@ impl App {
     }
 
     fn finish_config_reload(&mut self, plan: &ConfigReloadPlan) {
-        if self.ai_tracker.needs_animation(&self.config.terminal) && !self.animation.running {
+        if self.ai_tracker.needs_animation(&self.config.terminal)
+            && !self.animation.running
+            && !self.focus.window_occluded
+        {
             self.start_animation_timer();
         }
         if let Some(tx) = &self.cmd_tx {
@@ -3916,6 +4153,14 @@ impl App {
         self.tab_close_hit_targets = tab_close_hits;
         self.tab_bar_equalize_targets = tab_eq_hits;
         self.tab_bar_tooltip_targets = tab_tt_hits;
+        self.workspace_notes_hit_targets = prepared
+            .ws_tab_bar_data
+            .iter()
+            .filter_map(|data| {
+                tab_bar::workspace_badge_hit_rect(data, prepared.cell_size.0)
+                    .map(|rect| (data.ws_id, rect))
+            })
+            .collect();
         self.apply_terminal_frame_overlays(
             &prepared,
             &mut all_instances,
@@ -4313,6 +4558,7 @@ impl App {
     ) {
         self.apply_url_underline_overlay(prepared, all_instances);
         *refresh_window_title |= self.apply_status_bar_overlay(prepared, all_instances);
+        self.apply_workspace_notes_preview_overlay(prepared, all_instances);
         self.apply_modal_overlays(prepared, all_instances);
         self.apply_prompt_tooltip_overlay(prepared, all_instances);
         self.apply_active_tooltip_overlay(prepared, all_instances);
@@ -4447,6 +4693,81 @@ impl App {
                 resolve_glyph: &mut context_menu_resolve_glyph,
             });
         }
+        if self.workspace_notes_modal.is_open() {
+            let Some(workspace_id) = self.workspace_notes_modal.workspace_id() else { return };
+            let workspace_rect = prepared
+                .ws_tab_bar_data
+                .iter()
+                .find(|data| data.ws_id == workspace_id)
+                .map_or(prepared.full_viewport, |data| data.ws_rect);
+            let active_notes = self.workspace_notes.active_notes(workspace_id);
+            let archived_notes = self.workspace_notes.archived_notes(workspace_id);
+            let mut workspace_notes_resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            self.workspace_notes_modal.build_instances(
+                workspace_notes_modal::WorkspaceNotesModalBuildContext {
+                    out: all_instances,
+                    workspace_rect,
+                    cell_size: prepared.cell_size,
+                    chrome: &self.theme.chrome,
+                    active_notes: &active_notes,
+                    archived_notes: &archived_notes,
+                    error: self.workspace_notes.last_error(),
+                    resolve_glyph: &mut workspace_notes_resolve_glyph,
+                },
+            );
+        }
+    }
+
+    fn apply_workspace_notes_preview_overlay(
+        &mut self,
+        prepared: &PreparedFrame,
+        all_instances: &mut Vec<CellInstance>,
+    ) {
+        if !self.workspace_notes_preview_allowed() {
+            self.workspace_notes_preview_target = None;
+            return;
+        }
+        let Some(workspace_id) = self.hovered_workspace_notes else {
+            self.workspace_notes_preview_target = None;
+            return;
+        };
+        let Some(anchor) = self
+            .workspace_notes_hit_targets
+            .iter()
+            .find_map(|(candidate, rect)| (*candidate == workspace_id).then_some(*rect))
+        else {
+            self.workspace_notes_preview_target = None;
+            return;
+        };
+        let (summaries, total_count) = self.workspace_notes.hover_summaries(workspace_id, 50, 58);
+        let Some(gpu) = self.gpu.as_mut() else {
+            self.workspace_notes_preview_target = None;
+            return;
+        };
+        let mut resolve_glyph = |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+        self.workspace_notes_preview_target =
+            workspace_notes_preview::build_workspace_notes_preview(
+                workspace_notes_preview::WorkspaceNotesPreviewBuildContext {
+                    out: all_instances,
+                    anchor,
+                    viewport: prepared.full_viewport,
+                    cell_size: prepared.cell_size,
+                    chrome: &self.theme.chrome,
+                    summaries: &summaries,
+                    total_count,
+                    hovered_note_id: self.hovered_workspace_note_preview_note.as_deref(),
+                    resolve_glyph: &mut resolve_glyph,
+                },
+            )
+            .map(|interaction| WorkspaceNotesPreviewTarget { workspace_id, interaction });
+    }
+
+    fn workspace_notes_preview_allowed(&self) -> bool {
+        !self.workspace_notes_modal.is_open()
+            && self.context_menu.is_none()
+            && self.close_dialog.is_none()
+            && self.update_dialog.is_none()
     }
 
     fn prompt_tooltip_anchor(&self, prepared: &PreparedFrame) -> Option<(String, Rect)> {
@@ -6469,7 +6790,8 @@ impl App {
         let Some((x, y)) = self.last_cursor_pos else { return };
         let Some((ws_viewport, ws_rects)) = self.mouse_press_context() else { return };
 
-        if self.handle_status_bar_mouse_press(x, y)
+        if self.handle_workspace_notes_preview_mouse_press(x, y)
+            || self.handle_status_bar_mouse_press(x, y)
             || self.handle_tab_bar_mouse_press(x, y)
             || self.handle_prompt_bar_mouse_press(x, y)
             || self.handle_drag_chrome_mouse_press(x, y, ws_viewport, &ws_rects)
@@ -6508,7 +6830,35 @@ impl App {
         false
     }
 
+    fn handle_workspace_notes_preview_mouse_press(&mut self, x: f32, y: f32) -> bool {
+        if !self.workspace_notes_preview_allowed() {
+            return false;
+        }
+        let Some(target) = self.workspace_notes_preview_target.as_ref() else { return false };
+        if !target.interaction.rect.contains(x, y) {
+            return false;
+        }
+        let workspace_id = target.workspace_id;
+        let note_id = target
+            .interaction
+            .note_targets
+            .iter()
+            .find_map(|note| note.rect.contains(x, y).then(|| note.note_id.clone()));
+        if let Some(note_id) = note_id {
+            self.archive_workspace_note(workspace_id, &note_id, ArchiveReason::Done);
+            self.hovered_workspace_notes = Some(workspace_id);
+            self.hovered_workspace_note_preview_note = None;
+        }
+        true
+    }
+
     fn handle_tab_bar_mouse_press(&mut self, x: f32, y: f32) -> bool {
+        if let Some((ws_id, _)) =
+            self.workspace_notes_hit_targets.iter().find(|(_, rect)| rect.contains(x, y)).copied()
+        {
+            self.open_workspace_notes_modal(ws_id);
+            return true;
+        }
         if let Some((ws_id, _)) =
             self.tab_bar_equalize_targets.iter().find(|(_, rect)| rect.contains(x, y)).copied()
         {
@@ -6936,6 +7286,8 @@ impl App {
             self.request_redraw();
         }
 
+        self.update_workspace_notes_hover(x, y);
+
         // Forward motion events to PTY when mouse motion reporting is active.
         self.maybe_forward_mouse_motion(x, y);
 
@@ -6982,6 +7334,32 @@ impl App {
         };
         if changed {
             self.active_tooltip = new_tooltip;
+            self.request_redraw();
+        }
+    }
+
+    fn update_workspace_notes_hover(&mut self, cursor_x: f32, cursor_y: f32) {
+        let (new_hover, new_preview_note) = if self.workspace_notes_preview_allowed() {
+            let badge_hover = self
+                .workspace_notes_hit_targets
+                .iter()
+                .find_map(|(ws_id, rect)| rect.contains(cursor_x, cursor_y).then_some(*ws_id));
+            let preview_target = self
+                .workspace_notes_preview_target
+                .as_ref()
+                .filter(|target| target.interaction.rect.contains(cursor_x, cursor_y));
+            let preview_hover = preview_target.map(|target| target.workspace_id);
+            let preview_note = preview_target
+                .and_then(|target| preview_target_note_id(target, cursor_x, cursor_y));
+            (badge_hover.or(preview_hover), preview_note)
+        } else {
+            (None, None)
+        };
+        if new_hover != self.hovered_workspace_notes
+            || new_preview_note != self.hovered_workspace_note_preview_note
+        {
+            self.hovered_workspace_notes = new_hover;
+            self.hovered_workspace_note_preview_note = new_preview_note;
             self.request_redraw();
         }
     }
@@ -7214,6 +7592,17 @@ impl App {
                 layout::SplitDirection::Vertical => winit::window::CursorIcon::RowResize,
             };
             window.set_cursor(icon);
+            return;
+        }
+
+        if self.workspace_notes_preview_allowed()
+            && (self.workspace_notes_hit_targets.iter().any(|(_, rect)| rect.contains(x, y))
+                || self
+                    .workspace_notes_preview_target
+                    .as_ref()
+                    .is_some_and(|target| target.interaction.rect.contains(x, y)))
+        {
+            window.set_cursor(winit::window::CursorIcon::Pointer);
             return;
         }
 
@@ -8514,6 +8903,99 @@ impl App {
         self.resize_pending = None;
     }
 
+    fn request_workspace_notes_snapshot(&self, workspace_ids: Vec<WorkspaceId>) {
+        if workspace_ids.is_empty() {
+            return;
+        }
+        if let Some(tx) = &self.cmd_tx {
+            send_command(tx, ClientCommand::WorkspaceNotesGet { workspace_ids });
+        }
+    }
+
+    fn send_workspace_notes_mutation(&self, mutation: workspace_notes::WorkspaceNotesMutation) {
+        if let Some(tx) = &self.cmd_tx {
+            send_command(tx, ClientCommand::WorkspaceNotesMutate { mutation });
+        }
+    }
+
+    fn mark_workspace_notes_dirty(&mut self) {
+        self.workspace_notes_save_pending = Some(Instant::now());
+    }
+
+    fn flush_workspace_notes_if_due(&mut self) {
+        if self
+            .workspace_notes_save_pending
+            .is_some_and(|pending| pending.elapsed() >= WORKSPACE_NOTES_DEBOUNCE)
+        {
+            self.flush_workspace_notes_now();
+        }
+    }
+
+    fn flush_workspace_notes_now(&mut self) {
+        let Some((workspace_id, text)) = self.dirty_workspace_notes_draft() else {
+            self.workspace_notes_save_pending = None;
+            return;
+        };
+        self.queue_workspace_notes_draft_flush(workspace_id, text, None);
+    }
+
+    fn dirty_workspace_notes_draft(&self) -> Option<(WorkspaceId, String)> {
+        let workspace_id = self.workspace_notes_modal.workspace_id()?;
+        if self.workspace_notes_modal.edit_mode() != &WorkspaceNotesEditMode::Draft {
+            return None;
+        }
+        self.workspace_notes_modal
+            .draft_dirty()
+            .then(|| (workspace_id, self.workspace_notes_modal.draft_text().to_owned()))
+    }
+
+    fn queue_workspace_notes_draft_flush(
+        &mut self,
+        workspace_id: WorkspaceId,
+        text: String,
+        action: Option<PendingWorkspaceNotesAction>,
+    ) -> bool {
+        let Some(tx) = &self.cmd_tx else {
+            self.workspace_notes_save_pending = None;
+            return false;
+        };
+        self.workspace_notes_pending_draft_flush =
+            Some(PendingWorkspaceNotesFlush { workspace_id, draft_text: text.clone(), action });
+        send_command(
+            tx,
+            ClientCommand::WorkspaceNotesMutate {
+                mutation: workspace_notes::WorkspaceNotesMutation::SaveDraft { workspace_id, text },
+            },
+        );
+        self.workspace_notes_save_pending = None;
+        true
+    }
+
+    fn defer_workspace_notes_action_until_flush(
+        &mut self,
+        action: PendingWorkspaceNotesAction,
+    ) -> bool {
+        if self.workspace_notes_pending_modal_mutation.is_some() {
+            if self.workspace_notes_pending_modal_action.is_none() {
+                self.workspace_notes_pending_modal_action = Some(action);
+            }
+            return true;
+        }
+
+        if let Some((workspace_id, text)) = self.dirty_workspace_notes_draft() {
+            return self.queue_workspace_notes_draft_flush(workspace_id, text, Some(action));
+        }
+
+        if let Some(pending) = &mut self.workspace_notes_pending_draft_flush {
+            if pending.action.is_none() {
+                pending.action = Some(action);
+            }
+            return true;
+        }
+
+        false
+    }
+
     // ── Multi-window ──────────────────────────────────────────────
 
     /// Handle `Welcome` from the server — store our window ID, apply saved
@@ -8725,12 +9207,10 @@ impl App {
                 update_dialog::UpdateAction::Primary,
             ) => {
                 tracing::info!("user confirmed update");
-                self.update_dialog = None;
-                self.update_available = None;
-                self.status_bar_update_rect = None;
-                self.update_window_title();
-                if let Some(tx) = &self.cmd_tx {
-                    send_command(tx, ClientCommand::TriggerUpdate);
+                if !self.defer_workspace_notes_action_until_flush(
+                    PendingWorkspaceNotesAction::TriggerUpdate,
+                ) {
+                    self.trigger_update_after_notes_flush();
                 }
             }
             (
@@ -8750,17 +9230,13 @@ impl App {
             (
                 update_dialog::UpdateDialogKind::RestartRequired,
                 update_dialog::UpdateAction::Primary,
-            ) => match spawn_update_restart_helper() {
-                Ok(()) => {
-                    tracing::info!("user approved deferred cold restart");
-                    self.update_dialog = None;
-                    self.update_window_title();
+            ) => {
+                if !self.defer_workspace_notes_action_until_flush(
+                    PendingWorkspaceNotesAction::SpawnUpdateRestartHelper,
+                ) {
+                    self.spawn_update_restart_helper_after_notes_flush();
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "failed to spawn deferred update restart helper");
-                    return;
-                }
-            },
+            }
             (
                 update_dialog::UpdateDialogKind::RestartRequired,
                 update_dialog::UpdateAction::Secondary,
@@ -8771,6 +9247,29 @@ impl App {
             }
         }
         self.request_redraw();
+    }
+
+    fn trigger_update_after_notes_flush(&mut self) {
+        self.update_dialog = None;
+        self.update_available = None;
+        self.status_bar_update_rect = None;
+        self.update_window_title();
+        if let Some(tx) = &self.cmd_tx {
+            send_command(tx, ClientCommand::TriggerUpdate);
+        }
+    }
+
+    fn spawn_update_restart_helper_after_notes_flush(&mut self) {
+        match spawn_update_restart_helper() {
+            Ok(()) => {
+                tracing::info!("user approved deferred cold restart");
+                self.update_dialog = None;
+                self.update_window_title();
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to spawn deferred update restart helper");
+            }
+        }
     }
 
     /// Update the compositor window title to reflect the current update state.
@@ -8853,11 +9352,368 @@ impl App {
         self.request_redraw();
     }
 
+    fn handle_workspace_notes_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => self.handle_close_requested(event_loop),
+            WindowEvent::RedrawRequested => self.handle_redraw(),
+            WindowEvent::Resized(size) => self.handle_resize_and_mark_geometry(*size),
+            WindowEvent::Moved(_) => self.mark_geometry_dirty(),
+            WindowEvent::ModifiersChanged(new_mods) => self.modifiers = new_mods.state(),
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if self.handle_native_close_window_shortcut(key_event, event_loop) {
+                    return;
+                }
+                self.handle_workspace_notes_keyboard(key_event);
+            }
+            WindowEvent::MouseInput {
+                state: winit::event::ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => self.handle_workspace_notes_click(),
+            WindowEvent::MouseWheel { delta, .. } => self.handle_workspace_notes_scroll(*delta),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.update_cursor_position(position);
+                self.handle_workspace_notes_hover();
+            }
+            _ => {}
+        }
+    }
+
+    fn open_workspace_notes_modal(&mut self, workspace_id: WorkspaceId) {
+        self.window_layout.set_focused_workspace(workspace_id);
+        self.command_palette.close();
+        self.search_overlay.close();
+        self.context_menu = None;
+        self.active_tooltip = None;
+        self.hovered_workspace_notes = None;
+        self.hovered_workspace_note_preview_note = None;
+        self.workspace_notes_preview_target = None;
+        self.request_workspace_notes_snapshot(vec![workspace_id]);
+        let draft_text = self.workspace_notes.draft_text(workspace_id);
+        self.workspace_notes_modal.open(workspace_id, draft_text);
+        self.request_redraw();
+    }
+
+    fn hydrate_workspace_notes_modal_from_collections(
+        &mut self,
+        collections: &[scribe_common::protocol::WorkspaceNotesCollection],
+    ) {
+        let Some(workspace_id) = self.workspace_notes_modal.workspace_id() else { return };
+        let Some(collection) =
+            collections.iter().find(|collection| collection.workspace_id == workspace_id)
+        else {
+            return;
+        };
+        let draft_text =
+            collection.draft.as_ref().map_or_else(String::new, |draft| draft.text.clone());
+        self.workspace_notes_modal.replace_pristine_draft(draft_text);
+    }
+
+    fn close_workspace_notes_modal(&mut self) {
+        self.flush_workspace_notes_now();
+        self.workspace_notes_modal.close();
+        self.request_redraw();
+    }
+
+    fn sync_workspace_notes_draft(&mut self) {
+        if self.workspace_notes_modal.workspace_id().is_none() {
+            return;
+        }
+        if self.workspace_notes_modal.edit_mode() != &WorkspaceNotesEditMode::Draft {
+            return;
+        }
+        self.mark_workspace_notes_dirty();
+    }
+
+    fn handle_workspace_notes_changed(
+        &mut self,
+        collection: scribe_common::protocol::WorkspaceNotesCollection,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let workspace_id = collection.workspace_id;
+        let draft_text =
+            collection.draft.as_ref().map_or_else(String::new, |draft| draft.text.clone());
+        self.workspace_notes.apply_collection(collection);
+        if self.workspace_notes_modal.workspace_id() == Some(workspace_id)
+            && self.workspace_notes_modal.edit_mode() == &WorkspaceNotesEditMode::Draft
+        {
+            if self.workspace_notes_modal.draft_text() == draft_text {
+                self.workspace_notes_modal.mark_draft_synced();
+            } else {
+                self.workspace_notes_modal.replace_pristine_draft(draft_text.clone());
+            }
+        }
+        if self.complete_workspace_notes_draft_flush(workspace_id, &draft_text, event_loop) {
+            return;
+        }
+        if self.workspace_notes_pending_modal_mutation != Some(workspace_id) {
+            self.request_redraw();
+            return;
+        }
+        self.workspace_notes_pending_modal_mutation = None;
+        if self.workspace_notes_modal.workspace_id() == Some(workspace_id) {
+            self.finish_pending_workspace_notes_modal_mutation(workspace_id);
+        }
+        if let Some(action) = self.workspace_notes_pending_modal_action.take() {
+            self.complete_workspace_notes_action(action, event_loop);
+            return;
+        }
+        self.request_redraw();
+    }
+
+    fn complete_workspace_notes_draft_flush(
+        &mut self,
+        workspace_id: WorkspaceId,
+        draft_text: &str,
+        event_loop: &ActiveEventLoop,
+    ) -> bool {
+        let should_complete =
+            self.workspace_notes_pending_draft_flush.as_ref().is_some_and(|pending| {
+                pending.workspace_id == workspace_id && pending.draft_text == draft_text
+            });
+        if !should_complete {
+            return false;
+        }
+
+        let action =
+            self.workspace_notes_pending_draft_flush.take().and_then(|pending| pending.action);
+        if let Some(action) = action {
+            self.complete_workspace_notes_action(action, event_loop);
+            return true;
+        }
+        false
+    }
+
+    fn complete_workspace_notes_action(
+        &mut self,
+        action: PendingWorkspaceNotesAction,
+        event_loop: &ActiveEventLoop,
+    ) {
+        match action {
+            PendingWorkspaceNotesAction::TriggerUpdate => self.trigger_update_after_notes_flush(),
+            PendingWorkspaceNotesAction::SpawnUpdateRestartHelper => {
+                self.spawn_update_restart_helper_after_notes_flush();
+            }
+            PendingWorkspaceNotesAction::QuitAll => {
+                self.start_quit_all_after_notes_flush(event_loop);
+            }
+            PendingWorkspaceNotesAction::CloseWindow => {
+                self.start_close_window_after_notes_flush(event_loop);
+            }
+            PendingWorkspaceNotesAction::FinishQuitRequested => {
+                self.finish_quit_requested_after_notes_flush(event_loop);
+            }
+            PendingWorkspaceNotesAction::FinishWindowClosed { window_id } => {
+                self.finish_window_closed_after_notes_flush(window_id, event_loop);
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn finish_pending_workspace_notes_modal_mutation(&mut self, workspace_id: WorkspaceId) {
+        match self.workspace_notes_modal.edit_mode().clone() {
+            WorkspaceNotesEditMode::Draft => {
+                let draft_text = self.workspace_notes.draft_text(workspace_id);
+                self.workspace_notes_modal.open(workspace_id, draft_text);
+            }
+            WorkspaceNotesEditMode::ActiveNote { .. }
+            | WorkspaceNotesEditMode::ArchivedNote { .. }
+            | WorkspaceNotesEditMode::ArchiveBulk { .. } => {
+                self.workspace_notes_modal.finish_edit();
+            }
+        }
+    }
+
+    fn handle_workspace_notes_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        if event.state != winit::event::ElementState::Pressed {
+            return;
+        }
+
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                if self.workspace_notes_modal.edit_mode() == &WorkspaceNotesEditMode::Draft {
+                    self.close_workspace_notes_modal();
+                } else {
+                    self.workspace_notes_modal.cancel_edit();
+                    self.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::Enter) if self.modifiers.control_key() => {
+                self.save_workspace_notes_modal();
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.workspace_notes_modal.push_char('\n');
+                self.sync_workspace_notes_draft();
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.workspace_notes_modal.pop_char();
+                self.sync_workspace_notes_draft();
+                self.request_redraw();
+            }
+            Key::Character(text)
+                if !self.modifiers.control_key()
+                    && !self.modifiers.alt_key()
+                    && !self.modifiers.super_key() =>
+            {
+                for ch in text.chars().filter(|ch| !ch.is_control()) {
+                    self.workspace_notes_modal.push_char(ch);
+                }
+                self.sync_workspace_notes_draft();
+                self.request_redraw();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_workspace_notes_click(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        if let Some(action) = self.workspace_notes_modal.click(x, y) {
+            self.handle_workspace_notes_action(action);
+        } else if !self.workspace_notes_modal.contains_point(x, y) {
+            self.close_workspace_notes_modal();
+        }
+    }
+
+    fn handle_workspace_notes_hover(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        if self.workspace_notes_modal.update_hover(x, y) {
+            self.request_redraw();
+        }
+    }
+
+    fn handle_workspace_notes_scroll(&mut self, delta: winit::event::MouseScrollDelta) {
+        let rows = match delta {
+            winit::event::MouseScrollDelta::LineDelta(_, y) if y < 0.0 => 1,
+            winit::event::MouseScrollDelta::LineDelta(_, y) if y > 0.0 => -1,
+            winit::event::MouseScrollDelta::PixelDelta(pos) if pos.y < 0.0 => 1,
+            winit::event::MouseScrollDelta::PixelDelta(pos) if pos.y > 0.0 => -1,
+            _ => 0,
+        };
+        if rows == 0 {
+            return;
+        }
+        let Some(workspace_id) = self.workspace_notes_modal.workspace_id() else { return };
+        let active_count = self.workspace_notes.active_notes(workspace_id).len();
+        let archived_count = self.workspace_notes.archived_notes(workspace_id).len();
+        if self.workspace_notes_modal.scroll_rows(rows, active_count, archived_count) {
+            self.request_redraw();
+        }
+    }
+
+    fn handle_workspace_notes_action(&mut self, action: WorkspaceNotesModalAction) {
+        let Some(workspace_id) = self.workspace_notes_modal.workspace_id() else { return };
+        match action {
+            WorkspaceNotesModalAction::Close => self.close_workspace_notes_modal(),
+            WorkspaceNotesModalAction::Save => self.save_workspace_notes_modal(),
+            WorkspaceNotesModalAction::CancelEdit => {
+                self.workspace_notes_modal.cancel_edit();
+                self.request_redraw();
+            }
+            WorkspaceNotesModalAction::ShowActive => {
+                self.workspace_notes_modal.set_view(WorkspaceNotesView::Active);
+                self.request_redraw();
+            }
+            WorkspaceNotesModalAction::ShowArchive => {
+                self.workspace_notes_modal.set_view(WorkspaceNotesView::Archive);
+                self.request_redraw();
+            }
+            WorkspaceNotesModalAction::EditActive(note_id) => {
+                if let Some(note) = self
+                    .workspace_notes
+                    .active_notes(workspace_id)
+                    .into_iter()
+                    .find(|note| note.note_id == note_id)
+                {
+                    self.workspace_notes_modal.begin_active_edit(&note);
+                    self.request_redraw();
+                }
+            }
+            WorkspaceNotesModalAction::EditArchived(note_id) => {
+                if let Some(note) = self
+                    .workspace_notes
+                    .archived_notes(workspace_id)
+                    .into_iter()
+                    .find(|note| note.note_id == note_id)
+                {
+                    self.workspace_notes_modal.begin_archived_edit(&note);
+                    self.request_redraw();
+                }
+            }
+            WorkspaceNotesModalAction::ArchiveDone(note_id) => {
+                self.archive_workspace_note(workspace_id, &note_id, ArchiveReason::Done);
+            }
+            WorkspaceNotesModalAction::ArchiveRemoved(note_id) => {
+                self.archive_workspace_note(workspace_id, &note_id, ArchiveReason::Removed);
+            }
+            WorkspaceNotesModalAction::EditAllArchive => {
+                let archived_notes = self.workspace_notes.archived_notes(workspace_id);
+                if !archived_notes.is_empty() {
+                    self.workspace_notes_modal.begin_archive_bulk_edit(&archived_notes);
+                    self.request_redraw();
+                }
+            }
+        }
+    }
+
+    fn archive_workspace_note(
+        &mut self,
+        workspace_id: WorkspaceId,
+        note_id: &str,
+        reason: ArchiveReason,
+    ) {
+        self.send_workspace_notes_mutation(workspace_notes::WorkspaceNotesMutation::ArchiveNote {
+            workspace_id,
+            note_id: note_id.to_owned(),
+            reason,
+        });
+    }
+
+    fn save_workspace_notes_modal(&mut self) {
+        let Some(workspace_id) = self.workspace_notes_modal.workspace_id() else { return };
+        let mode = self.workspace_notes_modal.edit_mode().clone();
+        let mutation = match mode {
+            WorkspaceNotesEditMode::Draft => {
+                let text = self.workspace_notes_modal.active_text().to_owned();
+                if text.trim().is_empty() {
+                    tracing::debug!(%workspace_id, "workspace note save ignored because text is empty");
+                    return;
+                }
+                self.workspace_notes_save_pending = None;
+                workspace_notes::WorkspaceNotesMutation::CreateActiveNote { workspace_id, text }
+            }
+            WorkspaceNotesEditMode::ActiveNote { note_id }
+            | WorkspaceNotesEditMode::ArchivedNote { note_id } => {
+                let text = self.workspace_notes_modal.active_text().to_owned();
+                if text.trim().is_empty() {
+                    tracing::debug!(%workspace_id, "workspace note edit ignored because text is empty");
+                    return;
+                }
+                workspace_notes::WorkspaceNotesMutation::EditNote { workspace_id, note_id, text }
+            }
+            WorkspaceNotesEditMode::ArchiveBulk { .. } => {
+                let updates = self.workspace_notes_modal.archive_bulk_updates();
+                if updates.iter().any(|(_, text)| text.trim().is_empty()) {
+                    tracing::debug!(%workspace_id, "workspace archive bulk edit ignored because text is empty");
+                    return;
+                }
+                workspace_notes::WorkspaceNotesMutation::BulkEditArchived { workspace_id, updates }
+            }
+        };
+        self.workspace_notes_pending_modal_mutation = Some(workspace_id);
+        self.send_workspace_notes_mutation(mutation);
+    }
+
     /// Handle `ServerDisconnected` — persist state unless a permanent window
     /// close or quit was already processed, then exit.
     fn handle_server_disconnected(&mut self, event_loop: &ActiveEventLoop) {
         tracing::info!("server disconnected, exiting");
         self.connection.server_connected = false;
+        self.workspace_notes_pending_draft_flush = None;
         if let Some(PendingShutdown::CloseWindow { window_id }) = self.pending_shutdown {
             self.window_registry.remove(window_id);
             self.clear_restore_state();
@@ -8882,6 +9738,15 @@ impl App {
     /// (via `handle_quit_all`) sends that.
     fn handle_quit_requested(&mut self, event_loop: &ActiveEventLoop) {
         tracing::info!("quit requested by server — saving and exiting");
+        if self.defer_workspace_notes_action_until_flush(
+            PendingWorkspaceNotesAction::FinishQuitRequested,
+        ) {
+            return;
+        }
+        self.finish_quit_requested_after_notes_flush(event_loop);
+    }
+
+    fn finish_quit_requested_after_notes_flush(&mut self, event_loop: &ActiveEventLoop) {
         match self.pending_shutdown {
             Some(PendingShutdown::CloseWindow { window_id }) => {
                 self.window_registry.remove(window_id);
@@ -8901,7 +9766,14 @@ impl App {
         if self.pending_shutdown.is_some() {
             return;
         }
+        if self.defer_workspace_notes_action_until_flush(PendingWorkspaceNotesAction::QuitAll) {
+            return;
+        }
 
+        self.start_quit_all_after_notes_flush(event_loop);
+    }
+
+    fn start_quit_all_after_notes_flush(&mut self, event_loop: &ActiveEventLoop) {
         tracing::info!("quit all — awaiting server acknowledgment");
         if let Some(tx) = &self.cmd_tx {
             self.pending_shutdown = Some(PendingShutdown::QuitAll);
@@ -8922,7 +9794,14 @@ impl App {
         if self.pending_shutdown.is_some() {
             return;
         }
+        if self.defer_workspace_notes_action_until_flush(PendingWorkspaceNotesAction::CloseWindow) {
+            return;
+        }
 
+        self.start_close_window_after_notes_flush(event_loop);
+    }
+
+    fn start_close_window_after_notes_flush(&mut self, event_loop: &ActiveEventLoop) {
         tracing::info!("closing window permanently — awaiting server acknowledgment");
         // Tell the server to destroy all sessions owned by this window so
         // they don't get resurrected on the next launch.
@@ -8943,16 +9822,29 @@ impl App {
         match self.pending_shutdown {
             Some(PendingShutdown::CloseWindow { window_id: pending }) if pending == window_id => {
                 tracing::info!(%window_id, "window close acknowledged by server");
-                self.window_registry.remove(window_id);
-                self.clear_restore_state();
-                self.pending_shutdown = None;
-                self.shutdown_notification_dispatcher();
-                event_loop.exit();
+                if self.defer_workspace_notes_action_until_flush(
+                    PendingWorkspaceNotesAction::FinishWindowClosed { window_id },
+                ) {
+                    return;
+                }
+                self.finish_window_closed_after_notes_flush(window_id, event_loop);
             }
             _ => {
                 tracing::debug!(%window_id, "ignoring unexpected WindowClosed ack");
             }
         }
+    }
+
+    fn finish_window_closed_after_notes_flush(
+        &mut self,
+        window_id: WindowId,
+        event_loop: &ActiveEventLoop,
+    ) {
+        self.window_registry.remove(window_id);
+        self.clear_restore_state();
+        self.pending_shutdown = None;
+        self.shutdown_notification_dispatcher();
+        event_loop.exit();
     }
 
     fn flush_geometry_now(&mut self) {
@@ -9333,6 +10225,9 @@ const GEOMETRY_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Debounce interval for restore snapshot saves.
 const RESTORE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Debounce interval for workspace notes saves.
+const WORKSPACE_NOTES_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Dimming factor applied to RGB channels of unfocused pane content.
 const UNFOCUSED_DIM: f32 = 0.50;
@@ -10930,6 +11825,18 @@ enum InitError {
 // Utility
 // ---------------------------------------------------------------------------
 
+fn preview_target_note_id(
+    target: &WorkspaceNotesPreviewTarget,
+    cursor_x: f32,
+    cursor_y: f32,
+) -> Option<String> {
+    target
+        .interaction
+        .note_targets
+        .iter()
+        .find_map(|note| note.rect.contains(cursor_x, cursor_y).then(|| note.note_id.clone()))
+}
+
 fn send_resize(tx: &Sender<ClientCommand>, session_id: SessionId, size: TerminalSize) {
     if tx.send(ClientCommand::Resize { session_id, size }).is_err() {
         tracing::warn!("IPC channel closed; resize dropped");
@@ -11324,15 +12231,39 @@ fn restore_settings_if_open() {
     }
 }
 
+fn reap_spawned_client_child(mut child: std::process::Child, label: &'static str) {
+    let pid = child.id();
+    let thread_name = format!("scribe-{label}-reaper-{pid}");
+    if let Err(error) =
+        std::thread::Builder::new().name(thread_name).spawn(move || match child.wait() {
+            Ok(status) => {
+                tracing::info!(pid, %status, label, "spawned client process exited");
+            }
+            Err(error) => {
+                tracing::warn!(pid, label, "failed to reap spawned client process: {error}");
+            }
+        })
+    {
+        tracing::warn!(pid, label, "failed to start spawned client reaper: {error}");
+    }
+}
+
 /// Spawn a new `scribe-client` process with the given window ID.
 fn spawn_client_process(window_id: WindowId) {
     let exe = std::env::current_exe()
         .unwrap_or_else(|_| std::path::PathBuf::from(current_identity().client_binary_name()));
     let id_str = window_id.to_full_string();
+    let spawn_start = Instant::now();
 
     match std::process::Command::new(&exe).arg("--window-id").arg(&id_str).spawn() {
         Ok(child) => {
-            tracing::info!(pid = child.id(), %window_id, "spawned new window process");
+            tracing::info!(
+                pid = child.id(),
+                %window_id,
+                elapsed_ms = duration_ms(spawn_start.elapsed()),
+                "spawned new window process"
+            );
+            reap_spawned_client_child(child, "window");
         }
         Err(e) => {
             tracing::warn!(exe = %exe.display(), %window_id, "failed to spawn window: {e}");
@@ -11347,10 +12278,16 @@ fn spawn_client_process(window_id: WindowId) {
 fn spawn_fresh_client_process() {
     let exe = std::env::current_exe()
         .unwrap_or_else(|_| std::path::PathBuf::from(current_identity().client_binary_name()));
+    let spawn_start = Instant::now();
 
     match std::process::Command::new(&exe).arg("--restore-child").spawn() {
         Ok(child) => {
-            tracing::info!(pid = child.id(), "spawned restore window process");
+            tracing::info!(
+                pid = child.id(),
+                elapsed_ms = duration_ms(spawn_start.elapsed()),
+                "spawned restore window process"
+            );
+            reap_spawned_client_child(child, "restore-window");
         }
         Err(e) => {
             tracing::warn!(exe = %exe.display(), "failed to spawn restore window: {e}");

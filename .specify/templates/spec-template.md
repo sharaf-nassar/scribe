@@ -95,6 +95,19 @@
 - **FR-006**: System MUST authenticate users via [NEEDS CLARIFICATION: auth method not specified - email/password, SSO, OAuth?]
 - **FR-007**: System MUST retain user data for [NEEDS CLARIFICATION: retention period not specified]
 
+### Quality, UX, and Performance Requirements
+
+- **QR-001**: Implementation MUST preserve existing architecture boundaries and use
+  existing project abstractions unless the spec states why a divergence is required.
+- **QR-002**: Each user story MUST name its independent verification path. New
+  test code MUST be requested explicitly in this spec or deferred to manual
+  quickstart verification with rationale.
+- **UX-001**: User-facing behavior MUST remain consistent with nearby Scribe
+  terminal, settings, shortcut, selection, and session-survival patterns.
+- **PR-001**: Performance-sensitive work MUST define measurable latency,
+  frame-rate, memory, startup, or packaging outcomes, or state why performance
+  is not applicable.
+
 ### Key Entities *(include if feature involves data)*
 
 - **[Entity 1]**: [What it represents, key attributes without implementation]

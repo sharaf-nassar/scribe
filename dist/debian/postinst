@@ -394,9 +394,12 @@ stop_client_processes() {
         fi
     done
 
-    # Give the server a brief moment to observe EOF and clear connected-client
-    # state before the replacement client performs Hello/ListSessions.
-    sleep 0.2
+    # Give the server time to observe EOF and clear connected-client state
+    # before the replacement client performs Hello/ListSessions. If the new
+    # client connects while the old windows still appear connected, the server
+    # assigns a brand-new empty window and the UI comes back without the prior
+    # workspace layout.
+    sleep 1
 }
 
 SERVER_RUNTIME_GENERATION="$(compute_server_runtime_generation)"

@@ -1618,6 +1618,56 @@ function initColorSwatches() {
 
 // ─────────── Workspace Roots ───────────
 
+function workspaceRootPathLooksValid(path) {
+  return path.startsWith("/") || path.startsWith("~/");
+}
+
+function workspaceRootState() {
+  if (!currentConfig.workspaces) {
+    currentConfig.workspaces = {};
+  }
+  if (!Array.isArray(currentConfig.workspaces.roots)) {
+    currentConfig.workspaces.roots = [];
+  }
+  return currentConfig.workspaces.roots;
+}
+
+function clearWorkspaceRootInputInvalid(input) {
+  if (input) {
+    input.removeAttribute("aria-invalid");
+  }
+}
+
+function addWorkspaceRoot(path) {
+  const rootPath = String(path || "").trim();
+  const input = document.getElementById("workspace-add-input");
+  if (!workspaceRootPathLooksValid(rootPath)) {
+    if (input) {
+      input.setAttribute("aria-invalid", "true");
+      input.focus();
+    }
+    return;
+  }
+
+  const roots = workspaceRootState();
+  if (!roots.includes(rootPath)) {
+    roots.push(rootPath);
+    populateWorkspaceRoots(roots);
+    sendChange("workspaces.add_root", rootPath);
+  }
+
+  if (input) {
+    input.value = "";
+    clearWorkspaceRootInputInvalid(input);
+  }
+}
+
+window.SCRIBE_ON_WORKSPACE_ROOT_CHOSEN = function(payload) {
+  if (payload && payload.path) {
+    addWorkspaceRoot(payload.path);
+  }
+};
+
 function initWorkspaces() {
   const list = document.getElementById("workspace-list");
   if (!list) { return; }
@@ -1627,15 +1677,40 @@ function initWorkspaces() {
     if (removeBtn) {
       const item = removeBtn.closest(".workspace-item");
       const path = item.querySelector(".workspace-path").textContent;
+      currentConfig.workspaces.roots = workspaceRootState().filter(function(root) {
+        return root !== path;
+      });
       item.remove();
       sendChange("workspaces.remove_root", path);
       return;
     }
+  });
 
-    const addBtn = e.target.closest(".workspace-add");
-    if (addBtn) {
-      sendChange("workspaces.add_root", "");
+  const form = document.getElementById("workspace-add-form");
+  const input = document.getElementById("workspace-add-input");
+  if (!form || !input) { return; }
+
+  input.addEventListener("input", function() {
+    clearWorkspaceRootInputInvalid(input);
+  });
+
+  form.addEventListener("submit", function(e) {
+    e.preventDefault();
+
+    const path = input.value.trim();
+    if (!path) {
+      clearWorkspaceRootInputInvalid(input);
+      sendHostAction("choose_workspace_root");
+      return;
     }
+
+    if (!workspaceRootPathLooksValid(path)) {
+      input.setAttribute("aria-invalid", "true");
+      input.focus();
+      return;
+    }
+
+    addWorkspaceRoot(path);
   });
 }
 
@@ -2043,8 +2118,8 @@ function populateWorkspaceRoots(roots) {
   var list = document.getElementById("workspace-list");
   if (!list) { return; }
 
-  // Remove existing items but keep the add button
-  var addBtn = list.querySelector(".workspace-add");
+  // Remove existing items but keep the add form
+  var addForm = list.querySelector(".workspace-add-form");
   var items = list.querySelectorAll(".workspace-item");
   items.forEach(function(item) { item.remove(); });
 
@@ -2089,7 +2164,11 @@ function populateWorkspaceRoots(roots) {
     removeButton.appendChild(svg);
     item.appendChild(removeButton);
 
-    list.insertBefore(item, addBtn);
+    if (addForm) {
+      list.insertBefore(item, addForm);
+    } else {
+      list.appendChild(item);
+    }
   });
 }
 
