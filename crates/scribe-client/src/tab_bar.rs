@@ -4,6 +4,8 @@
 //! using the same glyph atlas as the terminal grid. The instances are
 //! collected into the same buffer and drawn in a single render pass.
 
+use std::time::Instant;
+
 use scribe_common::theme::ChromeColors;
 use scribe_renderer::chrome::solid_quad;
 use scribe_renderer::srgb_to_linear_rgba;
@@ -25,6 +27,8 @@ pub struct TabBarColors {
     pub separator: [f32; 4],
     /// Slightly lighter background for the top half of the gradient tab bar.
     pub gradient_top: [f32; 4],
+    /// Theme accent, reused for the transient attention flash (FR-011).
+    pub accent: [f32; 4],
 }
 
 impl From<&ChromeColors> for TabBarColors {
@@ -36,7 +40,43 @@ impl From<&ChromeColors> for TabBarColors {
             active_text: srgb_to_linear_rgba(chrome.tab_text_active),
             separator: srgb_to_linear_rgba(chrome.tab_separator),
             gradient_top: srgb_to_linear_rgba(chrome.tab_bar_gradient_top),
+            accent: srgb_to_linear_rgba(chrome.accent),
         }
+    }
+}
+
+/// Duration (seconds) of the transient tab attention flash (FR-011), with a
+/// brief ease-out so it decays smoothly rather than cutting off.
+pub const TAB_FLASH_SECS: f32 = 0.45;
+
+/// Map elapsed time since a tab-flash started to a 0.0–1.0 intensity.
+///
+/// Returns `None` once the envelope has fully elapsed so the caller can clear
+/// the originating `tab_flash_start` and let the redraw loop rest — the same
+/// self-decaying discipline the scrollbar fade uses. The curve is an ease-out
+/// (`(1 - t)^2`) on the normalised elapsed fraction.
+#[must_use]
+pub fn tab_flash_intensity(elapsed_secs: f32) -> Option<f32> {
+    if !elapsed_secs.is_finite() || !(0.0..TAB_FLASH_SECS).contains(&elapsed_secs) {
+        return None;
+    }
+    let t = (elapsed_secs / TAB_FLASH_SECS).clamp(0.0, 1.0);
+    let remaining = 1.0 - t;
+    Some(remaining * remaining)
+}
+
+/// Advance a pane's tab-flash timer, clearing it once the envelope elapses.
+///
+/// Mirrors [`super::scrollbar::ScrollbarState::tick_fade`]: the timer owns its
+/// own decay and self-clears so it cannot pin the redraw loop. Returns `true`
+/// while the flash is still within its envelope (the loop must keep ticking).
+pub fn tick_tab_flash(flash_start: &mut Option<Instant>) -> bool {
+    let Some(start) = *flash_start else { return false };
+    if tab_flash_intensity(start.elapsed().as_secs_f32()).is_some() {
+        true
+    } else {
+        *flash_start = None;
+        false
     }
 }
 
@@ -55,6 +95,12 @@ pub struct TabData {
     ///
     /// Format: `" NN%"` (single leading space, integer, percent sign).
     pub context_suffix: Option<(String, [f32; 4])>,
+    /// Transient attention-flash intensity (0.0–1.0), set when a
+    /// jump-to-failure found no failed command (FR-011). `None` when no flash
+    /// is active. Computed from the focused pane's `tab_flash_start` via
+    /// [`tab_flash_intensity`]; blended additively over the tab background
+    /// without overriding active-tab or AI-indicator styling.
+    pub tab_flash: Option<f32>,
 }
 
 /// Build cell instances for a pane's tab bar background.
@@ -723,6 +769,23 @@ fn columns_to_pixels(columns: usize, unit: f32) -> f32 {
     f32::from(render_grid_units(columns)) * unit
 }
 
+/// Maximum fraction of the accent mixed into the tab background at the peak
+/// of the attention flash. Kept low so the cue stays non-disruptive.
+const FLASH_MAX_MIX: f32 = 0.45;
+
+/// Blend `base` toward `accent` by the flash intensity, preserving `base`'s
+/// alpha. `None` (or a fully decayed intensity) returns `base` unchanged.
+fn flash_blend(base: [f32; 4], accent: [f32; 4], flash: Option<f32>) -> [f32; 4] {
+    let Some(intensity) = flash else { return base };
+    let mix = (intensity.clamp(0.0, 1.0)) * FLASH_MAX_MIX;
+    [
+        base[0] + (accent[0] - base[0]) * mix,
+        base[1] + (accent[1] - base[1]) * mix,
+        base[2] + (accent[2] - base[2]) * mix,
+        base[3],
+    ]
+}
+
 fn render_tab(ctx: &mut TabRenderContext<'_, '_, '_>, tab_idx: usize, tab: &TabData) {
     if tab_idx > 0 && ctx.col + ctx.tab_w > ctx.max_cols() {
         ctx.row += 1;
@@ -735,13 +798,18 @@ fn render_tab(ctx: &mut TabRenderContext<'_, '_, '_>, tab_idx: usize, tab: &TabD
         ctx.writer.params.colors.text
     };
     let is_hovered = !tab.is_active && ctx.writer.params.hovered_tab == Some(tab_idx);
-    let tab_bg = if tab.is_active {
+    let base_tab_bg = if tab.is_active {
         ctx.writer.params.colors.active_bg
     } else if is_hovered {
         [ctx.bg[0] + 0.04, ctx.bg[1] + 0.04, ctx.bg[2] + 0.04, ctx.bg[3]]
     } else {
         ctx.bg
     };
+    // Additive transient attention flash (FR-011): blend the chosen base
+    // background toward the theme accent. Subtle (capped well below a full
+    // swap) and applied on top of whatever base was selected so active-tab
+    // and hover semantics, plus the AI indicator bar, are preserved.
+    let tab_bg = flash_blend(base_tab_bg, ctx.writer.params.colors.accent, tab.tab_flash);
     let tab_start_col = ctx.col;
     let row_base_y = ctx.base_y + columns_to_pixels(ctx.row, ctx.row_height);
 

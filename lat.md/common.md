@@ -40,7 +40,7 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 ### Terminal
 
-[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, AI toggles, indicator height, shell integration, status bar stats, prompt bar, and scroll pin settings.
+[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, the enhanced keyboard-protocol opt-out, AI toggles, indicator height, shell integration, status bar stats, prompt bar, and scroll pin settings.
 
 `scroll_pin` (bool, default `false`) enables split-scroll in AI panes, but only while the pane is in the normal screen buffer; alternate-screen TUIs fall back to the regular live view. `preserve_ai_scrollback` (bool, default `true`) strips AI-session `CSI 3 J` scrollback clears, resets its trim epoch on prompt/attention boundaries, captures the epoch baseline after the first filtered redraw, and trims later redraw clears back to that baseline so committed transcript history survives without duplicate inline frames piling up.
 
@@ -50,7 +50,7 @@ Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (f32, 8–32, def
 
 ### Keybindings
 
-[[crates/scribe-common/src/config.rs#KeybindingsConfig]] exposes 50+ configurable actions across pane navigation, workspace splits, tab management, clipboard, scrolling, zoom, and terminal word-motion shortcuts, including explicit Claude Code and Codex open/resume shortcuts.
+[[crates/scribe-common/src/config.rs#KeybindingsConfig]] exposes 50+ configurable actions across pane navigation, workspace splits, tab management, clipboard, scrolling, command-jump navigation, zoom, and terminal word-motion shortcuts, including explicit Claude Code and Codex open/resume shortcuts.
 
 Each field uses [[crates/scribe-common/src/config.rs#KeyComboList]], which deserializes from either a bare TOML string (`"ctrl+shift+w"`) or an array (`["ctrl+shift+w", "ctrl+w"]`). Up to [[crates/scribe-common/src/config.rs#MAX_BINDINGS]] (5) combos per action are stored. Default bindings are platform-aware: macOS uses `cmd+`-prefixed combos where they do not collide with standard app shortcuts, with close-pane intentionally on `super+ctrl+w`, while other platforms use `ctrl+shift+`-prefixed equivalents.
 

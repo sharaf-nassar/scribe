@@ -5,10 +5,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WorkspaceId};
@@ -175,8 +175,17 @@ pub async fn run() -> Result<(), ScribeError> {
     let notifiers = Arc::new(WaitNotifiers::new());
 
     let server_conn = crate::ipc::connect().await?;
-    let (server_reader, server_writer) = server_conn.into_split();
-    let server_writer = Arc::new(Mutex::new(server_writer));
+    let (server_reader, mut raw_server_writer) = server_conn.into_split();
+
+    // Send `Hello { window_id: None }` so the server's `resolve_window_assignment`
+    // can adopt an unconnected window-with-sessions. Without this, every fresh
+    // daemon process gets a brand-new `WindowId` via `handle_legacy_client`, and
+    // any `AttachSessions` for sessions whose owning window is the previous
+    // daemon's `WindowId` is denied. That breaks the reconnect flow:
+    // daemon stop → daemon start → session attach.
+    crate::ipc::send(&mut raw_server_writer, &ClientMessage::Hello { window_id: None }).await?;
+
+    let server_writer = Arc::new(Mutex::new(raw_server_writer));
 
     let socket_path = daemon_socket_path();
     cleanup_stale_socket(&socket_path).await;
@@ -884,7 +893,11 @@ async fn handle_wait_output(
     state: &SharedState,
     notifiers: &Arc<WaitNotifiers>,
 ) -> DaemonResponse {
-    let re = match Regex::new(pattern) {
+    // Enable multi-line mode so `^` and `$` match line boundaries within the
+    // session's accumulated output buffer (which is multi-line). Without this,
+    // patterns like `^1$` would only match if the *entire* buffer were `1\n`,
+    // which never happens once a shell prompt is present.
+    let re = match RegexBuilder::new(pattern).multi_line(true).build() {
         Ok(r) => r,
         Err(e) => return DaemonResponse::Error { message: format!("invalid regex: {e}") },
     };
@@ -914,7 +927,37 @@ async fn check_output_match(session_id: SessionId, re: &Regex, state: &SharedSta
     };
     let buf: Vec<u8> = session.output_buffer.iter().copied().collect();
     let text = String::from_utf8_lossy(&buf);
-    re.is_match(&text)
+    // PTYs emit `\r\n` line endings. The `regex` crate's multi-line mode
+    // anchors at `\n` boundaries, leaving the trailing `\r` inside each line
+    // — so `^X$` patterns from test scripts would never match a line whose
+    // raw content is `X\r`. Normalise to `\n`-only lines before matching.
+    // Lone `\r` (rare cursor-return without newline) is preserved.
+    // Strip ANSI/OSC/CSI escape sequences and lone CRs so `wait-output` patterns
+    // match the *visible* terminal content rather than the raw PTY byte stream.
+    // PTYs interleave OSC marks (shell integration), CSI sequences (modes,
+    // colours), and cursor-return CRs with the actual characters; without this
+    // normalisation `^X$`-style patterns can never match because each line's
+    // raw content carries escape bytes around the visible text.
+    let visible = strip_ansi_and_cr(&text);
+    re.is_match(&visible)
+}
+
+/// Strip ANSI/OSC/CSI/DCS escape sequences and lone CRs so regex matching
+/// operates on the visible content of the PTY stream. The pattern covers OSC
+/// terminated by BEL or ST, DCS terminated by ST, CSI with standard parameter/
+/// intermediate/final bytes, and other single-final ESC sequences.
+fn strip_ansi_and_cr(s: &str) -> String {
+    static ANSI: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
+    let built = ANSI.get_or_init(|| {
+        RegexBuilder::new(
+            r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1bP[^\x1b]*\x1b\\|\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\x1b[\x20-\x5f]",
+        )
+        .build()
+    });
+    built
+        .as_ref()
+        .map_or_else(|_| s.to_owned(), |re| re.replace_all(s, "").into_owned())
+        .replace('\r', "")
 }
 
 /// Wait until the session's CWD matches the given path.

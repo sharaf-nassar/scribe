@@ -34,6 +34,36 @@ pub struct PromptUiState {
     pub dismissed: bool,
 }
 
+/// Resolved success/failure outcome of one shell command, derived from the
+/// shell-reported exit status (OSC 133;D).
+///
+/// Invariant: `Unknown` MUST never be rendered with failure styling — an
+/// unreported or absent exit status is distinct from a failure
+/// (FR-012 / SC-006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandStatus {
+    /// Command reported exit code 0.
+    Success,
+    /// Command reported a non-zero exit code.
+    Failure,
+    /// No exit code was resolved before the next prompt (unknown / unreported).
+    Unknown,
+}
+
+/// One shell command's lifecycle anchor and resolved outcome.
+///
+/// `abs_pos` is the absolute scrollback row of the `PromptStart` (OSC 133;A)
+/// mark — the same unit and role as the former `prompt_marks` entries (lines
+/// from the very top of scrollback, 0 = oldest), so jump navigation and
+/// scrollbar indicators stay aligned across trims/shifts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandRecord {
+    /// Absolute scrollback row of the originating `PromptStart` (A) mark.
+    pub abs_pos: usize,
+    /// Resolved outcome of the command.
+    pub status: CommandStatus,
+}
+
 /// State for a single terminal pane.
 pub struct Pane {
     pub session_id: SessionId,
@@ -81,10 +111,16 @@ pub struct Pane {
     /// The grid size last sent to the server via IPC resize.
     /// `None` means a resize has never been sent for this pane.
     pub last_sent_grid: Option<GridSize>,
-    /// Absolute line positions where prompts start (OSC 133;A marks).
-    /// Used for prompt jumping and scrollbar indicators. Stored as
-    /// "lines from the very top of the scrollback" (0 = oldest line).
-    pub prompt_marks: Vec<usize>,
+    /// One [`CommandRecord`] per observed shell command (OSC 133;A opens it,
+    /// OSC 133;D resolves it). `abs_pos` is "lines from the very top of the
+    /// scrollback" (0 = oldest line) and drives prompt jumping plus
+    /// scrollbar indicators. Reset empty on reattach/handoff — `SessionReplay`
+    /// reproduces cell content, not OSC 133 callbacks (non-misleading per
+    /// FR-014).
+    pub command_records: Vec<CommandRecord>,
+    /// Outcome of the most-recently-resolved command, fed to the status bar.
+    /// `None` until the first command end (D) resolves.
+    pub last_command_status: Option<CommandStatus>,
     /// Absolute position where the prompt input starts (OSC 133;B mark).
     /// `Some((absolute_line, column))` while waiting for user input.
     /// Cleared when a command starts or ends (OSC 133;C / D).
@@ -124,6 +160,11 @@ pub struct Pane {
     /// Split-scroll state: `Some` when the pane is scrolled up with the
     /// live-bottom pin active (AI panes with `scroll_pin` enabled).
     pub split_scroll: Option<SplitScrollState>,
+    /// Start instant of a transient tab-flash attention pulse, set when a
+    /// jump-to-failure finds no failed command (FR-011). Mirrors the
+    /// scrollbar's `fade_start`: rendering decays it over a short envelope
+    /// and clears it back to `None` so it never pins the redraw loop.
+    pub tab_flash_start: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -202,7 +243,8 @@ impl Pane {
             last_was_focused: None,
             last_selection: None,
             last_sent_grid: None,
-            prompt_marks: Vec::new(),
+            command_records: Vec::new(),
+            last_command_status: None,
             input_start: None,
             pending_output_frames: VecDeque::new(),
             sync_output_frames: SyncUpdateFrameSplitter::new(),
@@ -215,6 +257,7 @@ impl Pane {
             last_conversation_id: None,
             prompt_ui: PromptUiState::default(),
             split_scroll: None,
+            tab_flash_start: None,
         }
     }
 
@@ -441,26 +484,27 @@ fn grid_from_pixels(width: f32, height: f32, cell_w: f32, cell_h: f32) -> GridSi
 /// Shift stored absolute scrollback positions after a scrollback trim.
 ///
 /// `dropped_rows` is the number of rows dropped from the oldest scrollback by
-/// `alacritty_terminal::grid::Grid::update_history`. Stored absolute positions
-/// in `marks` and `input_start` are stable identifiers from "lines since the
-/// very top of scrollback (0 = oldest)", so a trim of `K` oldest rows shifts
-/// every surviving row's absolute index down by `K`.
+/// `alacritty_terminal::grid::Grid::update_history`. The `abs_pos` of each
+/// [`CommandRecord`] and `input_start` are stable identifiers from "lines
+/// since the very top of scrollback (0 = oldest)", so a trim of `K` oldest
+/// rows shifts every surviving row's absolute index down by `K`.
 ///
-/// Marks whose stored row was inside the trimmed region (`m < dropped_rows`)
-/// are dropped — the row no longer exists. `input_start` is cleared in the
-/// same case so split-scroll falls back to the cursor heuristic instead of
-/// computing pin height against a synthetic row 0.
+/// Records whose anchor row was inside the trimmed region
+/// (`abs_pos < dropped_rows`) are dropped — the row no longer exists.
+/// `input_start` is cleared in the same case so split-scroll falls back to
+/// the cursor heuristic instead of computing pin height against a synthetic
+/// row 0.
 pub fn shift_absolute_marks_after_trim(
-    marks: &mut Vec<usize>,
+    records: &mut Vec<CommandRecord>,
     input_start: &mut Option<(usize, usize)>,
     dropped_rows: usize,
 ) {
     if dropped_rows == 0 {
         return;
     }
-    marks.retain_mut(|m| {
-        if *m >= dropped_rows {
-            *m -= dropped_rows;
+    records.retain_mut(|record| {
+        if record.abs_pos >= dropped_rows {
+            record.abs_pos -= dropped_rows;
             true
         } else {
             false
@@ -473,57 +517,90 @@ pub fn shift_absolute_marks_after_trim(
 
 #[cfg(test)]
 mod tests {
-    use super::shift_absolute_marks_after_trim;
+    use super::{CommandRecord, CommandStatus, shift_absolute_marks_after_trim};
+
+    /// Build records at the given absolute positions with `Unknown` status.
+    fn recs(positions: &[usize]) -> Vec<CommandRecord> {
+        positions
+            .iter()
+            .map(|&abs_pos| CommandRecord { abs_pos, status: CommandStatus::Unknown })
+            .collect()
+    }
+
+    /// Extract the absolute positions from a record list for assertions.
+    fn positions(records: &[CommandRecord]) -> Vec<usize> {
+        records.iter().map(|r| r.abs_pos).collect()
+    }
 
     #[test]
     fn shift_subtracts_delta_from_each_mark() {
-        let mut marks = vec![10, 20, 30];
+        let mut records = recs(&[10, 20, 30]);
         let mut input_start = Some((25, 5));
-        shift_absolute_marks_after_trim(&mut marks, &mut input_start, 5);
-        assert_eq!(marks, vec![5, 15, 25]);
+        shift_absolute_marks_after_trim(&mut records, &mut input_start, 5);
+        assert_eq!(positions(&records), vec![5, 15, 25]);
         assert_eq!(input_start, Some((20, 5)));
     }
 
     #[test]
     fn shift_drops_marks_below_delta() {
-        let mut marks = vec![3, 4, 10, 20];
+        let mut records = recs(&[3, 4, 10, 20]);
         let mut input_start = None;
-        shift_absolute_marks_after_trim(&mut marks, &mut input_start, 5);
-        assert_eq!(marks, vec![5, 15]);
+        shift_absolute_marks_after_trim(&mut records, &mut input_start, 5);
+        assert_eq!(positions(&records), vec![5, 15]);
     }
 
     #[test]
     fn shift_clears_input_start_below_delta() {
-        let mut marks: Vec<usize> = vec![];
+        let mut records: Vec<CommandRecord> = vec![];
         let mut input_start = Some((3, 7));
-        shift_absolute_marks_after_trim(&mut marks, &mut input_start, 5);
+        shift_absolute_marks_after_trim(&mut records, &mut input_start, 5);
         assert_eq!(input_start, None);
     }
 
     #[test]
     fn shift_zero_delta_is_noop() {
-        let mut marks = vec![10, 20];
+        let mut records = recs(&[10, 20]);
         let mut input_start = Some((15, 0));
-        shift_absolute_marks_after_trim(&mut marks, &mut input_start, 0);
-        assert_eq!(marks, vec![10, 20]);
+        shift_absolute_marks_after_trim(&mut records, &mut input_start, 0);
+        assert_eq!(positions(&records), vec![10, 20]);
         assert_eq!(input_start, Some((15, 0)));
     }
 
     #[test]
     fn shift_mark_at_exact_delta_lands_on_oldest_row() {
-        let mut marks = vec![5, 10];
+        let mut records = recs(&[5, 10]);
         let mut input_start = Some((5, 0));
-        shift_absolute_marks_after_trim(&mut marks, &mut input_start, 5);
-        assert_eq!(marks, vec![0, 5]);
+        shift_absolute_marks_after_trim(&mut records, &mut input_start, 5);
+        assert_eq!(positions(&records), vec![0, 5]);
         assert_eq!(input_start, Some((0, 0)));
     }
 
     #[test]
     fn shift_empty_inputs_are_noop() {
-        let mut marks: Vec<usize> = vec![];
+        let mut records: Vec<CommandRecord> = vec![];
         let mut input_start = None;
-        shift_absolute_marks_after_trim(&mut marks, &mut input_start, 10);
-        assert!(marks.is_empty());
+        shift_absolute_marks_after_trim(&mut records, &mut input_start, 10);
+        assert!(records.is_empty());
         assert_eq!(input_start, None);
+    }
+
+    #[test]
+    fn shift_preserves_per_record_status() {
+        let mut records = vec![
+            CommandRecord { abs_pos: 2, status: CommandStatus::Failure },
+            CommandRecord { abs_pos: 10, status: CommandStatus::Success },
+            CommandRecord { abs_pos: 20, status: CommandStatus::Unknown },
+        ];
+        let mut input_start = None;
+        shift_absolute_marks_after_trim(&mut records, &mut input_start, 5);
+        // The record at row 2 is inside the trimmed region and is dropped;
+        // survivors keep their resolved status while their rows shift down.
+        assert_eq!(
+            records,
+            vec![
+                CommandRecord { abs_pos: 5, status: CommandStatus::Success },
+                CommandRecord { abs_pos: 15, status: CommandStatus::Unknown },
+            ]
+        );
     }
 }

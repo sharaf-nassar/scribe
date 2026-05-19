@@ -1011,6 +1011,11 @@ pub struct TerminalConfig {
     pub scroll: TerminalScrollConfig,
     #[serde(default, flatten)]
     pub prompt_bar: TerminalPromptBarConfig,
+    /// Enable the enhanced (Kitty) keyboard protocol when an application
+    /// negotiates it. When `false`, key encoding stays legacy regardless of
+    /// negotiation.
+    #[serde(default = "default_true")]
+    pub keyboard_protocol_enhanced: bool,
 }
 
 impl Default for TerminalConfig {
@@ -1024,6 +1029,7 @@ impl Default for TerminalConfig {
             status_bar_stats: StatusBarStatsConfig::default(),
             scroll: TerminalScrollConfig::default(),
             prompt_bar: TerminalPromptBarConfig::default(),
+            keyboard_protocol_enhanced: true,
         }
     }
 }
@@ -1161,6 +1167,8 @@ pub struct KeybindingsConfig {
     pub prompt_jump_up: KeyComboList,
     #[serde(default = "default_prompt_jump_down")]
     pub prompt_jump_down: KeyComboList,
+    #[serde(default = "default_jump_to_failure")]
+    pub jump_to_failure: KeyComboList,
 
     // View
     #[serde(default = "default_zoom_in")]
@@ -1240,6 +1248,7 @@ impl Default for KeybindingsConfig {
             find: default_find(),
             prompt_jump_up: default_prompt_jump_up(),
             prompt_jump_down: default_prompt_jump_down(),
+            jump_to_failure: default_jump_to_failure(),
             zoom_in: default_zoom_in(),
             zoom_out: default_zoom_out(),
             zoom_reset: default_zoom_reset(),
@@ -1422,6 +1431,10 @@ fn default_prompt_jump_up() -> KeyComboList {
 
 fn default_prompt_jump_down() -> KeyComboList {
     KeyComboList::single("ctrl+shift+x")
+}
+
+fn default_jump_to_failure() -> KeyComboList {
+    KeyComboList::single("ctrl+shift+b")
 }
 
 fn default_find() -> KeyComboList {
