@@ -88,6 +88,14 @@ user_manager_env() {
     run_user_systemctl show-environment | sed -n "s/^${key}=//p" | head -n 1
 }
 
+refresh_service_enablement() {
+    # Previous packages enabled the user service under default.target, which
+    # can start before a display manager publishes DISPLAY/XAUTHORITY. Disable
+    # only removes old .wants symlinks; it does not stop a running service.
+    run_user_systemctl disable "$SERVICE_NAME" || true
+    run_user_systemctl enable "$SERVICE_NAME"
+}
+
 server_runtime_generation_changed() {
     local current=""
     if [ -r "${SERVER_RUNTIME_GENERATION_FILE}" ]; then
@@ -111,6 +119,7 @@ compute_server_runtime_generation() {
         printf 'service-unit-sha256=%s\n' "$(sha256_file_or_missing "$service_unit")"
         emit_function_definition run_user_systemctl
         emit_function_definition user_manager_env
+        emit_function_definition refresh_service_enablement
         emit_function_definition run_user_command
         emit_function_definition launch_user_binary
         emit_function_definition cold_restart_server
@@ -420,6 +429,7 @@ case "$1" in
             migrate_prompt_bar_config "${CONFIG_HOME}/${APP_SLUG}/config.toml" || true
         fi
         run_user_systemctl daemon-reload || true
+        refresh_service_enablement || true
 
         # Check for a running server process, not just a stale socket file.
         # Use -f (full cmdline match) — see cold_restart_server for rationale.
@@ -647,12 +657,12 @@ case "$1" in
 
             if [ -n "$PRIVILEGED_USER_UID" ] && [ -d "$XDG_DIR" ]; then
                 run_user_systemctl daemon-reload && \
-                run_user_systemctl enable "$SERVICE_NAME" && \
+                refresh_service_enablement && \
                 run_user_systemctl start "$SERVICE_NAME" && \
                 STARTED=1
             elif [ -z "$PRIVILEGED_USER_UID" ]; then
                 run_user_systemctl daemon-reload && \
-                run_user_systemctl enable "$SERVICE_NAME" && \
+                refresh_service_enablement && \
                 run_user_systemctl start "$SERVICE_NAME" && \
                 STARTED=1
             fi

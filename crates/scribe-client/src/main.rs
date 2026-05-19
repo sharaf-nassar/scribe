@@ -72,10 +72,10 @@ use winit::window::Window;
 
 use crate::ai_indicator::AiStateTracker;
 use crate::divider::DividerDrag;
-use crate::input::{KeyAction, KeyboardProtocol, LayoutAction};
+use crate::input::{KeyAction, KittyFlags, LayoutAction};
 use crate::ipc_client::{ClientCommand, UiEvent};
 use crate::layout::{PaneEdges, PaneId, Rect};
-use crate::pane::{FeedOutputResult, Pane};
+use crate::pane::{CommandRecord, CommandStatus, FeedOutputResult, Pane};
 use crate::workspace_layout::WindowLayout;
 use crate::workspace_notes::ArchiveReason;
 use crate::workspace_notes_modal::{
@@ -117,12 +117,18 @@ fn is_macos_close_window_shortcut(
     false
 }
 
-fn codex_alt_enter_newline_bytes(keyboard_protocol: KeyboardProtocol) -> Vec<u8> {
-    match keyboard_protocol {
-        // Codex defaults newline to Shift+Enter once kitty keyboard mode is active.
-        KeyboardProtocol::Kitty => b"\x1b[13;2u".to_vec(),
-        // Before negotiation is reflected locally, Ctrl+J is also a Codex newline binding.
-        KeyboardProtocol::Legacy => b"\n".to_vec(),
+fn codex_alt_enter_newline_bytes(flags: KittyFlags) -> Vec<u8> {
+    if flags.is_any() {
+        // Codex defaults newline to Shift+Enter once kitty keyboard mode is
+        // active. This is exactly what the generic encoder produces for
+        // Shift+Enter (codepoint 13, modifier param 2, press) — kept as a
+        // literal so the override stays coherent with, and never double-
+        // encodes against, `translate_key`.
+        b"\x1b[13;2u".to_vec()
+    } else {
+        // Before negotiation is reflected locally, Ctrl+J is also a Codex
+        // newline binding.
+        b"\n".to_vec()
     }
 }
 
@@ -1254,8 +1260,8 @@ impl App {
                 self.handle_ai_state_cleared(*session_id);
                 true
             }
-            UiEvent::PromptMark { session_id, kind, click_events } => {
-                self.handle_prompt_mark(*session_id, *kind, *click_events);
+            UiEvent::PromptMark { session_id, kind, click_events, exit_code } => {
+                self.handle_prompt_mark(*session_id, *kind, *click_events, *exit_code);
                 true
             }
             UiEvent::PromptReceived { session_id, text } => {
@@ -1424,7 +1430,7 @@ impl App {
         // markers) continue to point at the correct rows after each trim.
         let dropped_rows = history_before.saturating_sub(history_after);
         pane::shift_absolute_marks_after_trim(
-            &mut pane.prompt_marks,
+            &mut pane.command_records,
             &mut pane.input_start,
             dropped_rows,
         );
@@ -3332,12 +3338,19 @@ impl App {
         self.ai_tracker.tick(dt);
         let (sync_pending, sync_flushed) = self.flush_expired_sync_updates(now);
 
-        // Tick scrollbar fade for all panes.
+        // Tick scrollbar fade and the transient tab-flash for all panes. The
+        // tab flash mirrors the scrollbar's self-decaying discipline: once the
+        // envelope has fully elapsed, `tab_flash_intensity` returns `None` and
+        // we clear `tab_flash_start` so it stops pinning the redraw loop.
         let mut scrollbar_animating = false;
+        let mut tab_flash_animating = false;
         for pane in self.panes.values_mut() {
             let display_offset = pane.term.grid().display_offset();
             if pane.scrollbar_state.tick_fade(display_offset) {
                 scrollbar_animating = true;
+            }
+            if tab_bar::tick_tab_flash(&mut pane.tab_flash_start) {
+                tab_flash_animating = true;
             }
         }
 
@@ -3377,6 +3390,7 @@ impl App {
         if !ai_animating
             && !sync_pending
             && !scrollbar_animating
+            && !tab_flash_animating
             && !tab_animating
             && !drag_active
             && !edge_scrolling
@@ -3388,6 +3402,7 @@ impl App {
         if ai_animating
             || sync_flushed
             || scrollbar_animating
+            || tab_flash_animating
             || tab_animating
             || drag_active
             || edge_scrolling
@@ -3708,11 +3723,28 @@ impl App {
     }
 
     /// Handle a prompt-mark event (OSC 133).
+    ///
+    /// Drives the per-pane command-record state machine (research D7):
+    ///
+    /// - `A` (`PromptStart`): open a new [`CommandRecord`] anchored at the
+    ///   prompt row with `Unknown` status. A new `A` before a `D` simply
+    ///   leaves the prior record `Unknown` (it is no longer the most-recent
+    ///   open record).
+    /// - `D` (`CommandEnd`): if the most-recent record is still `Unknown`,
+    ///   resolve it from `exit_code` — `Some(0)` → `Success`, `Some(≠0)` →
+    ///   `Failure`, `None` → stays `Unknown` (FR-012/SC-006: unreported is
+    ///   never a failure). A `D` with no open record is ignored. The
+    ///   resolved outcome (including `Unknown`) becomes
+    ///   `last_command_status` so the status bar reflects the most recent
+    ///   completed command.
+    /// - `B` (`PromptEnd`) / `C` (`CommandStart`): only maintain
+    ///   `input_start` (unchanged); no status effect.
     fn handle_prompt_mark(
         &mut self,
         session_id: SessionId,
         kind: PromptMarkKind,
         click_events: bool,
+        exit_code: Option<i32>,
     ) {
         let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
@@ -3722,12 +3754,13 @@ impl App {
                 let screen_lines = pane.term.grid().screen_lines();
                 let cursor_line = pane.term.grid().cursor.point.line.0;
                 let abs_pos = history + usize::try_from(cursor_line.max(0)).unwrap_or(usize::MAX);
-                pane.prompt_marks.push(abs_pos);
-                // Prune marks that have been evicted from scrollback.
+                pane.command_records
+                    .push(CommandRecord { abs_pos, status: CommandStatus::Unknown });
+                // Prune records whose anchor has been evicted from scrollback.
                 // The maximum valid abs_pos is history_size + screen_lines - 1.
-                // Any mark beyond that ceiling no longer exists in the grid.
+                // Any record beyond that ceiling no longer exists in the grid.
                 let max_valid = history + screen_lines;
-                pane.prompt_marks.retain(|&m| m <= max_valid);
+                pane.command_records.retain(|record| record.abs_pos <= max_valid);
                 pane.prompt_ui.click_events = click_events;
                 pane.input_start = None;
             }
@@ -3738,8 +3771,24 @@ impl App {
                 let abs_line = history + usize::try_from(cursor_line.max(0)).unwrap_or(usize::MAX);
                 pane.input_start = Some((abs_line, cursor_col));
             }
-            PromptMarkKind::CommandStart | PromptMarkKind::CommandEnd => {
+            PromptMarkKind::CommandStart => {
                 pane.input_start = None;
+            }
+            PromptMarkKind::CommandEnd => {
+                pane.input_start = None;
+                // Resolve only the most-recent still-open (`Unknown`) record.
+                // `None` exit code keeps `Unknown` — never `Failure`.
+                if let Some(record) = pane.command_records.last_mut()
+                    && record.status == CommandStatus::Unknown
+                {
+                    let resolved = match exit_code {
+                        Some(0) => CommandStatus::Success,
+                        Some(_) => CommandStatus::Failure,
+                        None => CommandStatus::Unknown,
+                    };
+                    record.status = resolved;
+                    pane.last_command_status = Some(resolved);
+                }
             }
         }
     }
@@ -4228,6 +4277,7 @@ impl App {
             focus_border_width: frame_style.focus_border_width,
             scrollbar_width: frame_style.scrollbar_width,
             scrollbar_color: frame_style.scrollbar_color,
+            command_mark_colors: frame_style.command_mark_colors,
             indicator_height: frame_style.indicator_height,
             prompt_bar_colors: frame_style.prompt_bar_colors,
             prompt_context_indicators,
@@ -4279,6 +4329,36 @@ impl App {
         WorkspaceFrameScene { pane_rects, dividers, ws_tab_bar_data, focused_pane }
     }
 
+    /// Build the render data for one tab, including the transient FR-011
+    /// attention flash sourced from the tab's focused pane (`tab_flash_start`).
+    fn build_tab_data(
+        &self,
+        tab_state: &workspace_layout::TabState,
+        index: usize,
+        is_active: bool,
+        ctx: &WorkspaceSceneContext<'_>,
+    ) -> tab_bar::TabData {
+        let pane_count = tab_state.pane_layout.all_pane_ids().len();
+        let title =
+            tab_title(pane_count, index, tab_state.session_id, &self.session_to_pane, &self.panes);
+        let ai_indicator = self.ai_tracker.tab_indicator_color(
+            tab_state.session_id,
+            ctx.ansi_colors,
+            &self.config.terminal,
+        );
+        let context_suffix = self.ai_tracker.tab_context_suffix(
+            tab_state.session_id,
+            &self.config.terminal.ai_session.context_thresholds,
+            scribe_renderer::srgb_to_linear_rgba(self.theme.chrome.tab_text),
+        );
+        let tab_flash = self
+            .panes
+            .get(&tab_state.focused_pane)
+            .and_then(|pane| pane.tab_flash_start)
+            .and_then(|start| tab_bar::tab_flash_intensity(start.elapsed().as_secs_f32()));
+        tab_bar::TabData { title, is_active, ai_indicator, context_suffix, tab_flash }
+    }
+
     fn build_workspace_tab_bar_data(
         &self,
         entry: WorkspaceSceneEntry<'_>,
@@ -4290,30 +4370,7 @@ impl App {
             .iter()
             .enumerate()
             .map(|(index, tab_state)| {
-                let pane_count = tab_state.pane_layout.all_pane_ids().len();
-                let title = tab_title(
-                    pane_count,
-                    index,
-                    tab_state.session_id,
-                    &self.session_to_pane,
-                    &self.panes,
-                );
-                let ai_indicator = self.ai_tracker.tab_indicator_color(
-                    tab_state.session_id,
-                    ctx.ansi_colors,
-                    &self.config.terminal,
-                );
-                let context_suffix = self.ai_tracker.tab_context_suffix(
-                    tab_state.session_id,
-                    &self.config.terminal.ai_session.context_thresholds,
-                    scribe_renderer::srgb_to_linear_rgba(self.theme.chrome.tab_text),
-                );
-                tab_bar::TabData {
-                    title,
-                    is_active: index == entry.ws.active_tab,
-                    ai_indicator,
-                    context_suffix,
-                }
+                self.build_tab_data(tab_state, index, index == entry.ws.active_tab, &ctx)
             })
             .collect();
         let badge_cols = tab_bar::badge_columns(entry.ws.name.as_deref(), ctx.multi_workspace);
@@ -4446,6 +4503,8 @@ impl App {
                     };
                     (host_label, context.tmux_session.clone())
                 }),
+            focused_pane_last_command_status: focused_pane
+                .and_then(|pane| pane.last_command_status),
             focused_ws_name: self.window_layout.focused_workspace().and_then(|ws| ws.name.clone()),
             session_count: self.panes.len(),
         }
@@ -4480,6 +4539,7 @@ impl App {
             scrollbar_width: self.config.appearance.scrollbar_width.clamp(2.0, 20.0)
                 * self.scale_factor,
             scrollbar_color: self.resolve_scrollbar_color(),
+            command_mark_colors: scrollbar::CommandMarkColors::from_ansi(ansi_colors),
             indicator_height: self.config.terminal.ai_session.indicator_height.clamp(1.0, 10.0)
                 * self.scale_factor,
             prompt_bar_colors: self.resolve_prompt_bar_colors(),
@@ -4522,6 +4582,7 @@ impl App {
             focus_border_width: prepared.focus_border_width,
             scrollbar_width: prepared.scrollbar_width,
             scrollbar_color: prepared.scrollbar_color,
+            command_mark_colors: prepared.command_mark_colors,
             indicator_height: prepared.indicator_height,
             prompt_bar_colors: prepared.prompt_bar_colors,
             prompt_context_indicators: &prepared.prompt_context_indicators,
@@ -4626,6 +4687,7 @@ impl App {
             workspace_name: prepared.status.focused_ws_name.as_deref(),
             cwd: prepared.status.focused_pane_cwd.as_deref(),
             git_branch: prepared.status.focused_pane_git.as_deref(),
+            last_command_status: prepared.status.focused_pane_last_command_status,
             session_count: prepared.status.session_count,
             host_label,
             tmux_label,
@@ -5061,9 +5123,9 @@ impl App {
             return;
         }
 
-        let keyboard_protocol = self.focused_keyboard_protocol();
+        let kitty_flags = self.focused_keyboard_protocol();
         let Some(mut action) =
-            input::translate_key_action(event, self.modifiers, &self.bindings, keyboard_protocol)
+            input::translate_key_action(event, self.modifiers, &self.bindings, kitty_flags)
         else {
             return;
         };
@@ -5071,7 +5133,7 @@ impl App {
         if matches!(action, KeyAction::Terminal(_))
             && self.should_send_codex_alt_enter_newline(event)
         {
-            action = KeyAction::Terminal(codex_alt_enter_newline_bytes(keyboard_protocol));
+            action = KeyAction::Terminal(codex_alt_enter_newline_bytes(kitty_flags));
         }
 
         match action {
@@ -5083,19 +5145,29 @@ impl App {
         }
     }
 
-    fn focused_keyboard_protocol(&self) -> KeyboardProtocol {
+    /// Derive the focused pane's negotiated Kitty enhancement flags from its
+    /// terminal mode. Only the focused pane is consulted (per-pane isolation,
+    /// SC-008). Forced all-false when the master config opt-out is disabled
+    /// (FR-006), giving byte-identical legacy encoding regardless of
+    /// negotiation.
+    fn focused_keyboard_protocol(&self) -> KittyFlags {
         use alacritty_terminal::term::TermMode;
 
+        if !self.config.terminal.keyboard_protocol_enhanced {
+            return KittyFlags::legacy_set();
+        }
+
         let Some(pane) = self.focused_pane() else {
-            return KeyboardProtocol::Legacy;
+            return KittyFlags::legacy_set();
         };
 
         let mode = pane.term.mode();
-        if mode.intersects(TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALL_KEYS_AS_ESC) {
-            KeyboardProtocol::Kitty
-        } else {
-            KeyboardProtocol::Legacy
-        }
+        KittyFlags::legacy_set()
+            .with_disambiguate(mode.contains(TermMode::DISAMBIGUATE_ESC_CODES))
+            .with_report_event_types(mode.contains(TermMode::REPORT_EVENT_TYPES))
+            .with_report_alternate_keys(mode.contains(TermMode::REPORT_ALTERNATE_KEYS))
+            .with_report_all_keys(mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC))
+            .with_report_associated_text(mode.contains(TermMode::REPORT_ASSOCIATED_TEXT))
     }
 
     fn should_send_codex_alt_enter_newline(&self, event: &winit::event::KeyEvent) -> bool {
@@ -5260,6 +5332,7 @@ impl App {
             LayoutAction::ScrollBottom => self.handle_scroll_bottom(),
             LayoutAction::PromptJumpUp => self.handle_prompt_jump_up(),
             LayoutAction::PromptJumpDown => self.handle_prompt_jump_down(),
+            LayoutAction::JumpToFailure => self.handle_jump_to_failure(),
             _ => return false,
         }
         true
@@ -6192,7 +6265,12 @@ impl App {
         let history = pane.term.grid().history_size();
         let offset = pane.term.grid().display_offset();
         let viewport_top_abs = history.saturating_sub(offset);
-        let target = pane.prompt_marks.iter().rev().find(|&&mark| mark < viewport_top_abs).copied();
+        let target = pane
+            .command_records
+            .iter()
+            .rev()
+            .map(|record| record.abs_pos)
+            .find(|&abs_pos| abs_pos < viewport_top_abs);
         if let Some(mark_pos) = target {
             let new_offset = history.saturating_sub(mark_pos);
             let delta = history_size_delta(new_offset, offset);
@@ -6218,7 +6296,11 @@ impl App {
         let history = pane.term.grid().history_size();
         let offset = pane.term.grid().display_offset();
         let viewport_top_abs = history.saturating_sub(offset);
-        let target = pane.prompt_marks.iter().find(|&&mark| mark > viewport_top_abs).copied();
+        let target = pane
+            .command_records
+            .iter()
+            .map(|record| record.abs_pos)
+            .find(|&abs_pos| abs_pos > viewport_top_abs);
         if let Some(mark_pos) = target {
             let new_offset = history.saturating_sub(mark_pos);
             let delta = history_size_delta(new_offset, offset);
@@ -6236,6 +6318,69 @@ impl App {
                 self.request_redraw();
             }
         }
+    }
+
+    /// Jump the focused pane's viewport to the most recent failed command.
+    ///
+    /// Reverse-scans `command_records` for the newest
+    /// [`CommandStatus::Failure`] and scrolls to its `abs_pos` using the
+    /// identical mechanism as [`Self::handle_prompt_jump_up`] (anchored on the
+    /// originating `PromptStart` row). When no failed command exists, delegates
+    /// to [`Self::signal_no_failed_command`] and returns without changing the
+    /// view (FR-011).
+    fn handle_jump_to_failure(&mut self) {
+        let Some(tab) = self.window_layout.active_tab() else { return };
+        let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
+        let target = pane
+            .command_records
+            .iter()
+            .rev()
+            .find(|record| record.status == CommandStatus::Failure)
+            .map(|record| record.abs_pos);
+        let Some(mark_pos) = target else {
+            self.signal_no_failed_command();
+            return;
+        };
+        let history = pane.term.grid().history_size();
+        let offset = pane.term.grid().display_offset();
+        let new_offset = history.saturating_sub(mark_pos);
+        let delta = history_size_delta(new_offset, offset);
+        if delta != 0 {
+            pane.term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
+            pane.scrollbar_state.on_scroll_action();
+            pane.content_dirty = true;
+            update_split_scroll(
+                pane,
+                self.config.terminal.scroll.scroll_pin,
+                &self.ai_tracker,
+                &self.config.terminal,
+            );
+            self.ensure_animation_running();
+            self.request_redraw();
+        }
+    }
+
+    /// FR-011 "non-disruptive signal when there is no failed command".
+    ///
+    /// Called by [`Self::handle_jump_to_failure`] on the no-match path. The
+    /// signal is deliberately non-disruptive — the viewport is never moved:
+    /// - the focused pane's overlay scrollbar is pulsed via the same
+    ///   [`ScrollbarState::on_scroll_action`] the scroll/jump handlers call,
+    ///   so it fades in then decays on its existing timer; and
+    /// - the focused pane's tab is given a brief attention flash by stamping
+    ///   `tab_flash_start`, which the tab bar blends toward the theme accent
+    ///   and which [`Self::handle_animation_tick`] decays over
+    ///   [`tab_bar::TAB_FLASH_SECS`] before clearing it back to `None`.
+    ///
+    /// Both cues self-decay; the redraw loop is woken so the fade animates
+    /// and then naturally rests.
+    fn signal_no_failed_command(&mut self) {
+        let Some(tab) = self.window_layout.active_tab() else { return };
+        let Some(pane) = self.panes.get_mut(&tab.focused_pane) else { return };
+        pane.scrollbar_state.on_scroll_action();
+        pane.tab_flash_start = Some(Instant::now());
+        self.ensure_animation_running();
+        self.request_redraw();
     }
 
     fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
@@ -10284,6 +10429,7 @@ struct FrameStyle<'a> {
     focus_border_width: f32,
     scrollbar_width: f32,
     scrollbar_color: [f32; 4],
+    command_mark_colors: scrollbar::CommandMarkColors,
     indicator_height: f32,
     prompt_bar_colors: prompt_bar::PromptBarColors,
     prompt_context_indicators: &'a HashMap<PaneId, prompt_bar::PromptContextIndicator>,
@@ -10306,6 +10452,7 @@ struct FrameStatusSnapshot {
     focused_pane_cwd: Option<std::path::PathBuf>,
     focused_pane_git: Option<String>,
     focused_pane_display_context: Option<(String, Option<String>)>,
+    focused_pane_last_command_status: Option<CommandStatus>,
     focused_ws_name: Option<String>,
     session_count: usize,
 }
@@ -10332,6 +10479,7 @@ struct PreparedFrame {
     focus_border_width: f32,
     scrollbar_width: f32,
     scrollbar_color: [f32; 4],
+    command_mark_colors: scrollbar::CommandMarkColors,
     indicator_height: f32,
     prompt_bar_colors: prompt_bar::PromptBarColors,
     prompt_context_indicators: HashMap<PaneId, prompt_bar::PromptContextIndicator>,
@@ -10372,6 +10520,7 @@ struct PreparedFrameStyle {
     focus_border_width: f32,
     scrollbar_width: f32,
     scrollbar_color: [f32; 4],
+    command_mark_colors: scrollbar::CommandMarkColors,
     indicator_height: f32,
     prompt_bar_colors: prompt_bar::PromptBarColors,
 }
@@ -11215,17 +11364,16 @@ fn build_scrollbar_pass(
     style: &FrameStyle<'_>,
     ws_tab_bar_heights: &HashMap<WorkspaceId, f32>,
 ) {
+    let scrollbar_style = scrollbar::ScrollbarStyle {
+        width: style.scrollbar_width,
+        color: style.scrollbar_color,
+        command_mark_colors: style.command_mark_colors,
+    };
     for (pane_id, _) in layout.pane_rects {
         let Some(pane) = panes.get_mut(pane_id) else { continue };
         let tbh = pane_tab_bar_h(pane.workspace_id, ws_tab_bar_heights, layout.ws_tab_bar_data);
         let eff_tbh = if pane.edges.top() { tbh } else { 0.0 };
-        scrollbar::build_scrollbar_instances(
-            all_instances,
-            pane,
-            style.scrollbar_width,
-            style.scrollbar_color,
-            eff_tbh,
-        );
+        scrollbar::build_scrollbar_instances(all_instances, pane, &scrollbar_style, eff_tbh);
     }
 }
 

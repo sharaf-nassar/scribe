@@ -1798,6 +1798,7 @@ function loadConfig(config) {
   setStepperValue("terminal.scrollback_lines", config.terminal?.scrollback_lines);
   setToggleValue("terminal.natural_scroll", config.terminal?.natural_scroll);
   setToggleValue("terminal.copy_on_select", config.terminal?.copy_on_select);
+  setToggleValue("terminal.keyboard_protocol_enhanced", config.terminal?.keyboard_protocol_enhanced);
   setToggleValue("terminal.claude_copy_cleanup", config.terminal?.claude_copy_cleanup);
   setToggleValue("terminal.claude_code_integration", config.terminal?.claude_code_integration);
   setToggleValue("terminal.codex_code_integration", config.terminal?.codex_code_integration);

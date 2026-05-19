@@ -12,6 +12,7 @@ use scribe_renderer::srgb_to_linear_rgba;
 use scribe_renderer::types::CellInstance;
 
 use crate::layout::Rect;
+use crate::pane::CommandStatus;
 use crate::sys_stats::SystemStats;
 use crate::tooltip::TooltipAnchor;
 
@@ -38,6 +39,10 @@ pub struct StatusBarData<'a> {
     pub cwd: Option<&'a Path>,
     /// Git branch of the focused pane.
     pub git_branch: Option<&'a str>,
+    /// Outcome of the focused pane's most-recently-resolved command.
+    /// `None` ⇒ no resolved command yet, render no indicator. The glyph is
+    /// the authoritative accessible cue (FR-009).
+    pub last_command_status: Option<CommandStatus>,
     /// Total number of active sessions in this window.
     pub session_count: usize,
     /// Remote or local host label for the focused pane.
@@ -414,6 +419,29 @@ fn render_centered_update(
     None
 }
 
+/// Render the focused pane's most-recent-command outcome indicator.
+///
+/// The distinct glyph is the authoritative accessible cue (FR-009); color
+/// is a redundant hint following the existing `connected_dot` pattern.
+/// `None` renders nothing (no indicator until the first command resolves).
+fn render_command_status(
+    w: &mut BarWriter<'_>,
+    colors: &StatusBarColors,
+    status: Option<CommandStatus>,
+    tooltips: &mut Vec<TooltipAnchor>,
+) {
+    let Some(status) = status else { return };
+    let (glyph, color, label) = match status {
+        CommandStatus::Success => ('\u{2713}', colors.connected_dot, "Last command succeeded"),
+        CommandStatus::Failure => ('\u{2717}', colors.disconnected_dot, "Last command failed"),
+        CommandStatus::Unknown => ('?', colors.label, "Last command exit status unknown"),
+    };
+    let glyph_col = w.col;
+    w.put(glyph, color, colors.bg);
+    tooltips.push(TooltipAnchor { text: String::from(label), rect: w.col_rect(glyph_col) });
+    w.put(' ', colors.text, colors.bg);
+}
+
 /// Render the left side: connection dot, workspace name (if multi), CWD.
 fn render_left_side(
     w: &mut BarWriter<'_>,
@@ -432,6 +460,8 @@ fn render_left_side(
     tooltips.push(TooltipAnchor { text: dot_text, rect: w.col_rect(dot_col) });
 
     w.put(' ', colors.text, colors.bg);
+
+    render_command_status(w, colors, data.last_command_status, tooltips);
 
     if let Some(name) = data.workspace_name {
         let ws_col = w.col;

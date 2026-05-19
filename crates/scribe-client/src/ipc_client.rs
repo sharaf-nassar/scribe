@@ -150,8 +150,15 @@ pub enum UiEvent {
     UpdateAvailable { version: String },
     /// Update progress changed.
     UpdateProgress { state: UpdateProgressState },
-    /// A shell prompt-mark event from OSC 133.
-    PromptMark { session_id: SessionId, kind: PromptMarkKind, click_events: bool },
+    /// A shell prompt-mark event from OSC 133. `exit_code` is forwarded from
+    /// the wire `ServerMessage::PromptMark` and is only meaningful on a
+    /// `CommandEnd` (D) mark; `None` means the shell reported no status.
+    PromptMark {
+        session_id: SessionId,
+        kind: PromptMarkKind,
+        click_events: bool,
+        exit_code: Option<i32>,
+    },
     /// Search results for the current query.
     SearchResults { session_id: SessionId, query: String, matches: Vec<SearchMatch> },
     /// The server trimmed duplicate AI redraw scrollback for this session.
@@ -351,7 +358,7 @@ fn dispatch_session_metadata_message(
         }
         ServerMessage::PromptMark { session_id, kind, click_events, exit_code } => {
             tracing::debug!(session = %session_id, ?exit_code, "prompt mark received");
-            send_event(proxy, UiEvent::PromptMark { session_id, kind, click_events });
+            send_event(proxy, UiEvent::PromptMark { session_id, kind, click_events, exit_code });
             None
         }
         other => Some(other),
@@ -1205,8 +1212,7 @@ fn refresh_stale_connected_server(
 #[cfg(target_os = "macos")]
 fn peer_pid_of(stream: &tokio::net::UnixStream) -> Result<i32, String> {
     use nix::sys::socket::{getsockopt, sockopt};
-    getsockopt(stream, sockopt::LocalPeerPid)
-        .map_err(|e| format!("failed to query peer pid: {e}"))
+    getsockopt(stream, sockopt::LocalPeerPid).map_err(|e| format!("failed to query peer pid: {e}"))
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1384,8 +1390,7 @@ async fn wait_for_refreshed_server(
                     format!("cold-restart fallback after handoff timeout failed: {e}").into()
                 },
             )?;
-            return Box::pin(wait_for_server_connection(socket_path, SERVER_STARTUP_TIMEOUT))
-                .await;
+            return Box::pin(wait_for_server_connection(socket_path, SERVER_STARTUP_TIMEOUT)).await;
         }
     }
 }

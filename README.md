@@ -97,6 +97,7 @@ cursor_shape = "block"
 scrollback_lines = 10000
 copy_on_select = true
 claude_code_integration = true
+keyboard_protocol_enhanced = true
 
 [workspaces]
 roots = ["~/work", "~/projects"]
@@ -142,6 +143,7 @@ Open the graphical settings editor with `Ctrl+,` to modify configuration without
 | Zoom in/out/reset | `Ctrl+=/-/0` |
 | Settings | `Ctrl+,` |
 | New window | `Ctrl+Shift+N` |
+| Jump to last failed command | `Ctrl+Shift+B` |
 
 All keybindings are fully configurable in `config.toml` under `[keybindings]`.
 

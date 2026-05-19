@@ -62,7 +62,9 @@ This is the **only** OSC 1337 AI-related payload parsed from the PTY stream. AI 
 
 ### OSC 133 — Prompt Marks
 
-Shell integration prompt marks with optional exit codes. These are forwarded as `PromptMark` events for scrollbar indicators.
+Shell integration prompt marks with optional exit codes, forwarded as `PromptMark` events for scrollbar and command-status indicators.
+
+The exit code now reaches the client, which classifies each command `Success`/`Failure`/`Unknown` and surfaces it as a scrollbar tick colour plus an authoritative non-colour status-bar glyph; see [[client#Client#Scrollbar#Prompt Mark Indicators]].
 
 ## Synchronized Updates
 
@@ -90,7 +92,7 @@ A real ED 3 resets `display_offset` to 0 inside alacritty_terminal's `clear_hist
 
 When a later ED 3 arrives in the same scrollback epoch, the PTY reader trims the server Term back to that epoch baseline and sends [[crates/scribe-common/src/protocol.rs#ServerMessage]]`::TrimScrollback` before forwarding the redraw bytes.
 
-The client flushes any queued PTY output for that pane, trims its own Term back to the same baseline, and then applies the new bytes. This keeps committed AI transcript history while preventing repeated inline redraws from stacking duplicate frames above it. Because [[crates/scribe-client/src/pane.rs#Pane]]`::prompt_marks` and `input_start` store positions as "lines from the very top of scrollback (0 = oldest)", the client also calls [[crates/scribe-client/src/pane.rs#shift_absolute_marks_after_trim]] with the dropped-row count so prompt jump and scrollbar markers continue to point at the right rows after each trim. Split-scroll itself no longer depends on these absolute marks — it sizes the pin from a fixed `AI_PROMPT_BLOCK_ROWS` constant and translates live cells by `cursor_line`, neither of which moves under a trim.
+The client flushes any queued PTY output for that pane, trims its own Term back to the same baseline, and then applies the new bytes. This keeps committed AI transcript history while preventing repeated inline redraws from stacking duplicate frames above it. Because [[crates/scribe-client/src/pane.rs#Pane]]`::command_records` and `input_start` store positions as "lines from the very top of scrollback (0 = oldest)", the client also calls [[crates/scribe-client/src/pane.rs#shift_absolute_marks_after_trim]] with the dropped-row count so prompt jump and scrollbar markers continue to point at the right rows after each trim. Split-scroll itself no longer depends on these absolute marks — it sizes the pin from a fixed `AI_PROMPT_BLOCK_ROWS` constant and translates live cells by `cursor_line`, neither of which moves under a trim.
 
 ### State Machine
 

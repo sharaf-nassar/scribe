@@ -10,7 +10,41 @@ use alacritty_terminal::grid::Dimensions as _;
 use scribe_renderer::chrome::{QuadRect, rounded_quad};
 use scribe_renderer::types::CellInstance;
 
-use crate::pane::Pane;
+use crate::pane::{CommandStatus, Pane};
+
+/// Theme-derived colors for command-status scrollbar ticks.
+///
+/// The scrollbar tick is a redundant secondary cue (the always-visible
+/// status-bar glyph is the authoritative accessible signal, per
+/// FR-008/FR-009). These colors are derived from the active theme's ANSI
+/// palette so accessible / high-contrast themes apply automatically.
+/// `Unknown` is intentionally not represented here — it keeps the existing
+/// neutral tick color unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandMarkColors {
+    /// Success tick color (theme ANSI green, index 2).
+    pub success: [f32; 4],
+    /// Failure tick color (theme ANSI red, index 1).
+    pub failure: [f32; 4],
+}
+
+/// Fallback success color when ANSI index 2 is unavailable.
+const FALLBACK_SUCCESS: [f32; 4] = [0.4, 0.9, 0.5, 1.0];
+/// Fallback failure color when ANSI index 1 is unavailable.
+const FALLBACK_FAILURE: [f32; 4] = [1.0, 0.2, 0.2, 1.0];
+
+impl CommandMarkColors {
+    /// Derive success/failure tick colors from the theme's linearised ANSI
+    /// palette, mirroring how the status bar derives its connected /
+    /// disconnected dot colors (index 2 = green, index 1 = red).
+    #[must_use]
+    pub fn from_ansi(ansi_colors: &[[f32; 4]; 16]) -> Self {
+        Self {
+            success: ansi_colors.get(2).copied().unwrap_or(FALLBACK_SUCCESS),
+            failure: ansi_colors.get(1).copied().unwrap_or(FALLBACK_FAILURE),
+        }
+    }
+}
 
 /// Minimum scrollbar thumb height in physical pixels.
 const MIN_THUMB_HEIGHT: f32 = 20.0;
@@ -237,6 +271,17 @@ fn compute_thumb(pane: &Pane, scrollbar_width: f32, tab_bar_height: f32) -> Opti
     })
 }
 
+/// Theme/config-derived styling for one pane's scrollbar render pass.
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollbarStyle {
+    /// Base scrollbar thumb width in physical pixels.
+    pub width: f32,
+    /// Base scrollbar thumb color (alpha is the resting fade ceiling).
+    pub color: [f32; 4],
+    /// Theme-derived success/failure colors for command-status ticks.
+    pub command_mark_colors: CommandMarkColors,
+}
+
 /// Build scrollbar instances for a single pane and push them into `out`.
 ///
 /// Does nothing if the pane has no scrollback or the scrollbar is invisible.
@@ -244,34 +289,33 @@ fn compute_thumb(pane: &Pane, scrollbar_width: f32, tab_bar_height: f32) -> Opti
 pub fn build_scrollbar_instances(
     out: &mut Vec<CellInstance>,
     pane: &mut Pane,
-    scrollbar_width: f32,
-    scrollbar_color: [f32; 4],
+    style: &ScrollbarStyle,
     tab_bar_height: f32,
 ) {
     // Update width animation targets based on hover state.
-    let hover_width = scrollbar_width + HOVER_EXTRA_WIDTH;
+    let hover_width = style.width + HOVER_EXTRA_WIDTH;
     pane.scrollbar_state.target_width =
-        if pane.scrollbar_state.hover { hover_width } else { scrollbar_width };
+        if pane.scrollbar_state.hover { hover_width } else { style.width };
     if pane.scrollbar_state.display_width <= 0.0 {
-        pane.scrollbar_state.display_width = scrollbar_width;
+        pane.scrollbar_state.display_width = style.width;
     }
 
     if pane.scrollbar_state.opacity <= 0.0 {
         return;
     }
 
-    let animated_width = pane.scrollbar_state.current_width(scrollbar_width);
+    let animated_width = pane.scrollbar_state.current_width(style.width);
 
     let Some(thumb) = compute_thumb(pane, animated_width, tab_bar_height) else {
         return;
     };
 
     // Apply fade opacity to the base scrollbar color alpha.
-    let alpha = scrollbar_color.get(3).copied().unwrap_or(0.4) * pane.scrollbar_state.opacity;
+    let alpha = style.color.get(3).copied().unwrap_or(0.4) * pane.scrollbar_state.opacity;
     let color = [
-        scrollbar_color.first().copied().unwrap_or(0.0),
-        scrollbar_color.get(1).copied().unwrap_or(0.0),
-        scrollbar_color.get(2).copied().unwrap_or(0.0),
+        style.color.first().copied().unwrap_or(0.0),
+        style.color.get(1).copied().unwrap_or(0.0),
+        style.color.get(2).copied().unwrap_or(0.0),
         alpha,
     ];
 
@@ -282,15 +326,33 @@ pub fn build_scrollbar_instances(
         corner_radius,
     ));
 
-    // Render prompt mark indicators on the scrollbar track.
-    if !pane.prompt_marks.is_empty() {
+    // Render command-boundary indicators on the scrollbar track. The tick is
+    // colored by the command's resolved status: `Unknown` keeps the existing
+    // neutral tick color; `Success`/`Failure` use theme-derived ANSI colors
+    // (a redundant secondary cue — the status-bar glyph is authoritative).
+    // The tick alpha is identical across statuses so only the hue changes.
+    if !pane.command_records.is_empty() {
         let history_size = pane.term.grid().history_size();
         let screen_lines = pane.term.grid().screen_lines();
         let total = scroll_units_f32(history_size.saturating_add(screen_lines));
         let mark_height = 2.0_f32;
-        let mark_color = [0.6, 0.6, 0.8, alpha * 0.6];
-        for &mark_abs in &pane.prompt_marks {
-            let ratio = scroll_units_f32(mark_abs) / total;
+        let tick_alpha = alpha * 0.6;
+        let neutral_color = [0.6, 0.6, 0.8, tick_alpha];
+        let status_rgba = |base: [f32; 4]| {
+            [
+                base.first().copied().unwrap_or(0.0),
+                base.get(1).copied().unwrap_or(0.0),
+                base.get(2).copied().unwrap_or(0.0),
+                tick_alpha,
+            ]
+        };
+        for record in &pane.command_records {
+            let mark_color = match record.status {
+                CommandStatus::Unknown => neutral_color,
+                CommandStatus::Success => status_rgba(style.command_mark_colors.success),
+                CommandStatus::Failure => status_rgba(style.command_mark_colors.failure),
+            };
+            let ratio = scroll_units_f32(record.abs_pos) / total;
             // Clamp so that stale abs_pos values (from before a resize shrinks
             // scrollback) cannot produce ratio > 1.0 and render outside the track.
             let mark_y = (thumb.track_top + ratio * thumb.track_height)

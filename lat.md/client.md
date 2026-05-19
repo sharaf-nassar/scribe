@@ -94,7 +94,7 @@ Each tab in a workspace owns a `LayoutTree` for its panes, a focused pane ID, an
 
 GPU-rendered tab bar in [[crates/scribe-client/src/tab_bar.rs]] generating [[crates/scribe-client/src/tab_bar.rs#TabBarColors]] from [[crates/scribe-client/src/tab_bar.rs#TabData]] using the same glyph atlas as the terminal grid.
 
-[[crates/scribe-client/src/tab_bar.rs#TabBarColors]] is derived from `ChromeColors` and holds background, active background, text, separator, gradient-top, and accent color values. [[crates/scribe-client/src/tab_bar.rs#TabData]] carries per-tab title, active flag, and optional AI indicator color. The background is rendered as a two-tone vertical gradient (lighter top half, base bottom half) via `build_tab_bar_bg`. The active tab receives a uniform highlight color and a 2px accent indicator on its bottom edge. An AI state dot (from `TabData.ai_indicator`) is rendered in the tab when a session has an active AI state. For provider task-label sessions, the title prefers the last hook-emitted task label while that label is active, then falls back to the normal shell title. Tab titles are truncated to fit the available column width. In multi-workspace mode, named workspaces display a badge pill with a deterministic accent color; unnamed workspaces show no badge.
+[[crates/scribe-client/src/tab_bar.rs#TabBarColors]] is derived from `ChromeColors` and holds background, active background, text, separator, gradient-top, and accent color values. [[crates/scribe-client/src/tab_bar.rs#TabData]] carries per-tab title, active flag, optional AI indicator color, and an optional transient `tab_flash` intensity (a short theme-accent blend over the tab background that self-decays over `TAB_FLASH_SECS` ≈0.45s via the same animation/redraw envelope as the scrollbar fade, additive over active/hover styling and the AI indicator). The background is rendered as a two-tone vertical gradient (lighter top half, base bottom half) via `build_tab_bar_bg`. The active tab receives a uniform highlight color and a 2px accent indicator on its bottom edge. An AI state dot (from `TabData.ai_indicator`) is rendered in the tab when a session has an active AI state. For provider task-label sessions, the title prefers the last hook-emitted task label while that label is active, then falls back to the normal shell title. Tab titles are truncated to fit the available column width. In multi-workspace mode, named workspaces display a badge pill with a deterministic accent color; unnamed workspaces show no badge.
 
 Tab rows wrap only after subtracting the same rendered badge and right-edge icon reservations used by the text pass. [[crates/scribe-client/src/tab_bar.rs#compute_tab_bar_height]] and active-tab range calculation share that reservation so a narrow workspace cannot allocate a blank extra row while the tabs still fit on one row.
 
@@ -187,15 +187,15 @@ On macOS, bare `cmd+w` is handled before that chain and routed to the same close
 1. Layout shortcuts (configurable keybindings) produce `LayoutAction` enum values
 2. Special commands (command palette, settings, find)
 3. Terminal shortcuts (word navigation, line navigation)
-4. Generic terminal key translation produces PTY bytes with xterm modifier encoding
+4. Generic terminal key translation produces PTY bytes — legacy xterm modifier encoding, or full Kitty CSI-u when the focused application negotiated the keyboard protocol
 
-Pane-local terminals enable kitty keyboard tracking so app-requested disambiguated input affects encoding. [[crates/scribe-client/src/pane.rs#Pane#new]] turns tracking on, [[crates/scribe-client/src/main.rs#App#focused_keyboard_protocol]] reads the focused pane mode, and [[crates/scribe-client/src/input.rs#KeyboardProtocol]] makes modified Enter use CSI-u. Codex panes also map Alt+Enter to Codex's newline binding.
+Pane-local terminals enable kitty keyboard tracking so an application's negotiated progressive-enhancement flags shape encoding. [[crates/scribe-client/src/pane.rs#Pane#new]] turns tracking on; [[crates/scribe-client/src/main.rs#App#focused_keyboard_protocol]] reads all five negotiated flags from the focused pane's `Term` mode into [[crates/scribe-client/src/input.rs#KittyFlags]] (forced all-off when the `[terminal]` `keyboard_protocol_enhanced` opt-out is disabled); the level-4 encoder then emits conformant CSI-u for every key/modifier combination — including modifier and lock keys, and key-repeat/release events when `report_event_types` is negotiated. With no flag negotiated the legacy byte encoding is reproduced byte-identically. Codex panes still map Alt+Enter to Codex's newline binding before the generic path.
 
 ### Layout Actions
 
 Over 50 variants in the `LayoutAction` enum covering pane, workspace, and tab management, clipboard, scrolling, zoom, and more.
 
-Tab actions: new, Claude Code new/resume, Codex new/resume, close, next, prev, select 1-9. The legacy `new_claude_*` action names remain in config and code and map to Claude Code, while `new_codex_*` opens Codex. Those AI-tab shortcuts start the selected CLI through the user's login shell with `-lic` and `exec`, resolving the shell from `SHELL` first and then the account database so Finder-launched macOS apps still inherit the expected PATH and rc files without first rendering a normal shell prompt. Also: pane splits, pane focus/cycling, workspace splits/cycling, copy, paste, settings, find, zoom, and equalize.
+Tab actions: new, Claude Code new/resume, Codex new/resume, close, next, prev, select 1-9. The legacy `new_claude_*` action names remain in config and code and map to Claude Code, while `new_codex_*` opens Codex. Those AI-tab shortcuts start the selected CLI through the user's login shell with `-lic` and `exec`, resolving the shell from `SHELL` first and then the account database so Finder-launched macOS apps still inherit the expected PATH and rc files without first rendering a normal shell prompt. Also: pane splits, pane focus/cycling, workspace splits/cycling, copy, paste, settings, find, zoom, equalize, prompt-jump up/down, and jump-to-failure (scroll to the most recent failed command; when no failed command exists, `signal_no_failed_command` instead fires a non-disruptive scrollbar pulse plus a brief focused-pane tab flash and leaves the viewport unchanged).
 
 ### Command Palette
 
@@ -281,9 +281,11 @@ Width animates on hover via lerp expansion. The hit zone is 3x the visible width
 
 ### Prompt Mark Indicators
 
-Each entry in [[crates/scribe-client/src/pane.rs#Pane]]`::prompt_marks` renders as a 2px horizontal tick on the scrollbar track, positioned by `mark_abs / (history_size + screen_lines)`.
+Each [[crates/scribe-client/src/pane.rs#Pane]]`::command_records` entry renders as a 2px scrollbar tick at `abs_pos / (history_size + screen_lines)`, coloured by command status: neutral for `Unknown`, theme-derived hues for `Success`/`Failure`.
 
-Marks are stored as absolute scrollback positions (lines from the very top of scrollback, 0 = oldest). When scrollback shrinks — via [[crates/scribe-common/src/protocol.rs#ServerMessage]]`::TrimScrollback` during AI redraw epochs, or natural overflow at the configured `scrollback_lines` cap — surviving rows shift down in absolute index. `handle_trim_scrollback_event` calls [[crates/scribe-client/src/pane.rs#shift_absolute_marks_after_trim]] to keep indicators aligned with their original prompt rows; the scrollbar render path additionally clamps any residual stale abs to the track bounds so a mark from a not-yet-shifted shrink path cannot draw outside the track.
+`command_records` (a `Vec<CommandRecord { abs_pos, status }>`) supersedes the old flat prompt-mark list. OSC 133 `D` exit codes now reach the client: [[crates/scribe-client/src/ipc_client.rs#UiEvent]]`::PromptMark` carries `exit_code`, and `handle_prompt_mark` runs the A→D state machine (`A` opens an `Unknown` record; `D` resolves the most-recent open one — exit 0 `Success`, non-zero `Failure`, absent stays `Unknown`, never falsely `Failure`). The authoritative, accessible cue is a non-colour glyph (`✓`/`✗`/`?`) in the [[client#Client#Status Bar]] (`Pane::last_command_status`); the scrollbar colour is a redundant secondary hint.
+
+Records are stored as absolute scrollback positions (lines from the very top of scrollback, 0 = oldest). When scrollback shrinks — via [[crates/scribe-common/src/protocol.rs#ServerMessage]]`::TrimScrollback` during AI redraw epochs, or natural overflow at the configured `scrollback_lines` cap — surviving rows shift down in absolute index. `handle_trim_scrollback_event` calls [[crates/scribe-client/src/pane.rs#shift_absolute_marks_after_trim]] to keep indicators aligned with their original command rows (each record's `abs_pos` shifts; per-record status preserved); the scrollbar render path additionally clamps any residual stale abs to the track bounds so a mark from a not-yet-shifted shrink path cannot draw outside the track. On reattach/cold-restart `command_records` starts empty (replay reproduces cells, not OSC 133 callbacks) — historical rows show no status rather than a fabricated one.
 
 ## Dividers
 
@@ -439,11 +441,11 @@ Typing while split-scrolled sends keystrokes without snapping to bottom. Pressin
 
 ## Status Bar
 
-The status bar is rendered at the bottom of the window with segments for connection status, workspace info, CWD, git branch, session count, time, and system stats.
+The status bar is rendered at the bottom of the window with segments for connection status, command status, workspace info, CWD, git branch, session count, time, and system stats.
 
 Update availability and progress also render here, centered in the empty span between the left and right segments — see [[crates/scribe-client/src/status_bar.rs#centered_start_col]] — so the CTA stays visible on narrow windows and steps down to a shorter `↑ Update` label, then disappears entirely, only when the empty span cannot hold it. Clicking the update segment opens the in-app confirmation dialog.
 
-Connection is indicated by a green/red dot. Workspace name appears when multi-workspace. The focused pane's remote host overrides the local hostname when shell integration emits session context, and tmux session names render as a separate accent segment. Stats include CPU sparkline, memory percentage, GPU sparkline (Linux only), and network sparklines.
+Connection is indicated by a green/red dot. A command-status glyph (`✓`/`✗`/`?`) sits next to it, reflecting the focused pane's most recent command outcome from shell integration (Success/Failure/Unknown); it is the authoritative non-colour cue and stays hidden until the first command resolves. Workspace name appears when multi-workspace. The focused pane's remote host overrides the local hostname when shell integration emits session context, and tmux session names render as a separate accent segment. Stats include CPU sparkline, memory percentage, GPU sparkline (Linux only), and network sparklines.
 
 ## System Stats
 

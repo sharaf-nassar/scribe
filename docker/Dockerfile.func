@@ -8,6 +8,12 @@ RUN apt-get update && \
 
 COPY target/release/scribe-server /usr/local/bin/scribe-server
 COPY target/release/scribe-test /usr/local/bin/scribe-test
+# Shell-integration scripts: scribe-server's `find_scripts_dir()` resolves
+# `<exe_dir>/../share/<flavor>/shell-integration`, i.e. `/usr/local/share/scribe/shell-integration`
+# for this container's `/usr/local/bin/scribe-server` (stable flavor). Without
+# this copy the `shell-integration.sh` e2e test times out at Phase 1 waiting
+# for `SCRIBE_SHELL_INTEGRATION=1`.
+COPY dist/shell-integration /usr/local/share/scribe/shell-integration
 COPY docker/entrypoint-func.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh /usr/local/bin/scribe-server /usr/local/bin/scribe-test

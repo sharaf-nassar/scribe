@@ -2,7 +2,7 @@
 
 use scribe_common::config::{KeyComboList, KeybindingsConfig};
 use winit::event::{ElementState, KeyEvent};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyLocation, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 /// A set of parsed keybindings for a single action (one or more combos).
@@ -83,6 +83,7 @@ pub struct Bindings {
     pub find: BindingSet,
     pub prompt_jump_up: BindingSet,
     pub prompt_jump_down: BindingSet,
+    pub jump_to_failure: BindingSet,
 
     // View
     pub zoom_in: BindingSet,
@@ -228,6 +229,7 @@ impl Bindings {
             find: parse_set(&config.find),
             prompt_jump_up: parse_set(&config.prompt_jump_up),
             prompt_jump_down: parse_set(&config.prompt_jump_down),
+            jump_to_failure: parse_set(&config.jump_to_failure),
 
             // View
             zoom_in: parse_set(&config.zoom_in),
@@ -349,6 +351,8 @@ pub enum LayoutAction {
     PromptJumpUp,
     /// Jump to the next prompt mark.
     PromptJumpDown,
+    /// Jump to the most recent failed command.
+    JumpToFailure,
 
     // View
     /// Increase the font size.
@@ -374,13 +378,126 @@ pub enum KeyAction {
     OpenFind,
 }
 
-/// Keyboard protocol currently requested by the focused terminal application.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyboardProtocol {
-    /// Legacy terminal encoding.
-    Legacy,
-    /// Kitty/CSI-u disambiguated keyboard encoding.
-    Kitty,
+/// The set of Kitty keyboard-protocol progressive-enhancement flags currently
+/// negotiated by the focused terminal application.
+///
+/// This models the five independent flags of the published Kitty keyboard
+/// protocol (`disambiguate escape codes`, `report event types`, `report
+/// alternate keys`, `report all keys as escape codes`, `report associated
+/// text`). Apps negotiate arbitrary subsets, so each flag must be honored
+/// independently; an all-false value means pure legacy encoding.
+///
+/// The five flags are stored as a small bitfield rather than five `bool`
+/// fields purely to satisfy the workspace `clippy::struct_excessive_bools`
+/// gate (`max-struct-bools = 2`); the public surface is the five flag
+/// accessors below plus [`KittyFlags::is_any`]/[`KittyFlags::legacy`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KittyFlags {
+    bits: u8,
+}
+
+impl KittyFlags {
+    /// `CSI = 1 u` — disambiguate escape codes.
+    const DISAMBIGUATE: u8 = 1 << 0;
+    /// `CSI = 2 u` — report event types (press/repeat/release).
+    const REPORT_EVENT_TYPES: u8 = 1 << 1;
+    /// `CSI = 4 u` — report alternate (shifted/base-layout) keys.
+    const REPORT_ALTERNATE_KEYS: u8 = 1 << 2;
+    /// `CSI = 8 u` — report all keys as escape codes.
+    const REPORT_ALL_KEYS: u8 = 1 << 3;
+    /// `CSI = 16 u` — report associated text.
+    const REPORT_ASSOCIATED_TEXT: u8 = 1 << 4;
+
+    /// All flags off — pure legacy encoding (the [`KittyFlags::legacy`] state).
+    ///
+    /// The negotiated flags are layered on with the `with_*` builders, each
+    /// taking a single `bool` so the focused-pane derivation can map the five
+    /// independent `TermMode` bits directly without a wide multi-bool
+    /// constructor.
+    #[must_use]
+    pub const fn legacy_set() -> Self {
+        Self { bits: 0 }
+    }
+
+    #[must_use]
+    const fn with_bit(self, bit: u8, on: bool) -> Self {
+        if on { Self { bits: self.bits | bit } } else { self }
+    }
+
+    /// Set `disambiguate escape codes` (`CSI = 1 u`).
+    #[must_use]
+    pub const fn with_disambiguate(self, on: bool) -> Self {
+        self.with_bit(Self::DISAMBIGUATE, on)
+    }
+
+    /// Set `report event types` (`CSI = 2 u`).
+    #[must_use]
+    pub const fn with_report_event_types(self, on: bool) -> Self {
+        self.with_bit(Self::REPORT_EVENT_TYPES, on)
+    }
+
+    /// Set `report alternate keys` (`CSI = 4 u`).
+    #[must_use]
+    pub const fn with_report_alternate_keys(self, on: bool) -> Self {
+        self.with_bit(Self::REPORT_ALTERNATE_KEYS, on)
+    }
+
+    /// Set `report all keys as escape codes` (`CSI = 8 u`).
+    #[must_use]
+    pub const fn with_report_all_keys(self, on: bool) -> Self {
+        self.with_bit(Self::REPORT_ALL_KEYS, on)
+    }
+
+    /// Set `report associated text` (`CSI = 16 u`).
+    #[must_use]
+    pub const fn with_report_associated_text(self, on: bool) -> Self {
+        self.with_bit(Self::REPORT_ASSOCIATED_TEXT, on)
+    }
+
+    /// `disambiguate escape codes` negotiated.
+    #[must_use]
+    pub const fn disambiguate(self) -> bool {
+        self.bits & Self::DISAMBIGUATE != 0
+    }
+
+    /// `report event types` negotiated.
+    #[must_use]
+    pub const fn report_event_types(self) -> bool {
+        self.bits & Self::REPORT_EVENT_TYPES != 0
+    }
+
+    /// `report alternate keys` negotiated.
+    #[must_use]
+    pub const fn report_alternate_keys(self) -> bool {
+        self.bits & Self::REPORT_ALTERNATE_KEYS != 0
+    }
+
+    /// `report all keys as escape codes` negotiated.
+    #[must_use]
+    pub const fn report_all_keys(self) -> bool {
+        self.bits & Self::REPORT_ALL_KEYS != 0
+    }
+
+    /// `report associated text` negotiated.
+    #[must_use]
+    pub const fn report_associated_text(self) -> bool {
+        self.bits & Self::REPORT_ASSOCIATED_TEXT != 0
+    }
+
+    /// `true` when at least one enhancement flag is negotiated.
+    #[must_use]
+    pub const fn is_any(self) -> bool {
+        self.bits != 0
+    }
+
+    /// `true` when no enhancement flag is negotiated (legacy encoding).
+    ///
+    /// When this holds, every translation path is byte-identical to the
+    /// pre-feature legacy behavior (SC-003).
+    #[must_use]
+    pub const fn legacy(self) -> bool {
+        self.bits == 0
+    }
 }
 
 /// Translate a winit key event into either terminal bytes or a layout command.
@@ -391,36 +508,35 @@ pub fn translate_key_action(
     event: &KeyEvent,
     modifiers: ModifiersState,
     bindings: &Bindings,
-    keyboard_protocol: KeyboardProtocol,
+    flags: KittyFlags,
 ) -> Option<KeyAction> {
-    if event.state != ElementState::Pressed {
-        return None;
+    // Levels 1–3 (layout shortcuts, palette/settings/find, terminal
+    // shortcuts) are press-only and unaffected by the keyboard protocol.
+    if event.state == ElementState::Pressed {
+        if let Some(action) = translate_layout_shortcut(event, modifiers, bindings) {
+            return Some(KeyAction::Layout(action));
+        }
+
+        if any_matches(&bindings.command_palette, event, modifiers) {
+            return Some(KeyAction::OpenCommandPalette);
+        }
+
+        if any_matches(&bindings.settings, event, modifiers) {
+            return Some(KeyAction::OpenSettings);
+        }
+
+        if any_matches(&bindings.find, event, modifiers) {
+            return Some(KeyAction::OpenFind);
+        }
+
+        // Check configurable terminal shortcuts (specific escape sequences).
+        if let Some(bytes) = translate_terminal_shortcut(event, modifiers, bindings) {
+            return Some(KeyAction::Terminal(bytes));
+        }
     }
 
-    // Check for layout shortcuts first.
-    if let Some(action) = translate_layout_shortcut(event, modifiers, bindings) {
-        return Some(KeyAction::Layout(action));
-    }
-
-    if any_matches(&bindings.command_palette, event, modifiers) {
-        return Some(KeyAction::OpenCommandPalette);
-    }
-
-    if any_matches(&bindings.settings, event, modifiers) {
-        return Some(KeyAction::OpenSettings);
-    }
-
-    if any_matches(&bindings.find, event, modifiers) {
-        return Some(KeyAction::OpenFind);
-    }
-
-    // Check configurable terminal shortcuts (specific escape sequences).
-    if let Some(bytes) = translate_terminal_shortcut(event, modifiers, bindings) {
-        return Some(KeyAction::Terminal(bytes));
-    }
-
-    // Fall through to generic terminal key translation with modifier encoding.
-    translate_key(event, modifiers, keyboard_protocol).map(KeyAction::Terminal)
+    // Level 4: generic terminal key translation with modifier encoding.
+    translate_key(event, modifiers, flags).map(KeyAction::Terminal)
 }
 
 /// Translate a winit key event into terminal byte sequences.
@@ -437,17 +553,23 @@ pub fn translate_key_action(
 pub fn translate_key(
     event: &KeyEvent,
     modifiers: ModifiersState,
-    keyboard_protocol: KeyboardProtocol,
+    flags: KittyFlags,
 ) -> Option<Vec<u8>> {
-    if event.state != ElementState::Pressed {
-        return None;
+    // Legacy fast path: when no enhancement flag is negotiated, behavior is
+    // byte-identical to the pre-feature implementation (SC-003 / T011). The
+    // press-only gate and the exact legacy branches below are untouched.
+    if flags.legacy() {
+        if event.state != ElementState::Pressed {
+            return None;
+        }
+        return match &event.logical_key {
+            Key::Character(c) => translate_character_with_modifiers(c, modifiers),
+            Key::Named(named) => translate_named_legacy(*named, modifiers),
+            _ => None,
+        };
     }
 
-    match &event.logical_key {
-        Key::Character(c) => translate_character_with_modifiers(c, modifiers),
-        Key::Named(named) => translate_named_with_modifiers(*named, modifiers, keyboard_protocol),
-        _ => None,
-    }
+    translate_key_kitty(event, modifiers, flags)
 }
 
 /// Check for layout shortcuts using the provided bindings.
@@ -567,18 +689,18 @@ fn char_to_control_byte(c: &str) -> Option<u8> {
 ///
 /// Special cases (Backspace, Space, Enter, Tab, Escape) are handled separately
 /// since they don't all follow the standard CSI modifier encoding.
-fn translate_named_with_modifiers(
-    named: NamedKey,
-    modifiers: ModifiersState,
-    keyboard_protocol: KeyboardProtocol,
-) -> Option<Vec<u8>> {
+/// Legacy named-key translation (byte-identical to the pre-feature path).
+///
+/// Used only when no Kitty enhancement flag is negotiated. The Kitty path
+/// lives in [`translate_named_kitty`].
+fn translate_named_legacy(named: NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
     // Drop Cmd/Super combos that didn't match any binding — on macOS these are
     // OS-level shortcuts and sending wrong PTY sequences would be incorrect.
     if modifiers.super_key() {
         return None;
     }
 
-    if let Some(bytes) = translate_named_special(named, modifiers, keyboard_protocol) {
+    if let Some(bytes) = translate_named_special(named, modifiers) {
         return Some(bytes);
     }
 
@@ -590,11 +712,7 @@ fn translate_named_with_modifiers(
         .or_else(|| translate_named_function_key(named, modifier_param))
 }
 
-fn translate_named_special(
-    named: NamedKey,
-    modifiers: ModifiersState,
-    keyboard_protocol: KeyboardProtocol,
-) -> Option<Vec<u8>> {
+fn translate_named_special(named: NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
     match named {
         NamedKey::Backspace => {
             if modifiers.control_key() && modifiers.alt_key() {
@@ -616,7 +734,13 @@ fn translate_named_special(
                 Some(b" ".to_vec())
             }
         }
-        NamedKey::Enter => translate_enter_with_modifiers(modifiers, keyboard_protocol),
+        NamedKey::Enter => {
+            if modifiers.alt_key() {
+                Some(vec![0x1b, b'\r'])
+            } else {
+                Some(b"\r".to_vec())
+            }
+        }
         NamedKey::Tab => {
             if modifiers.shift_key() {
                 Some(b"\x1b[Z".to_vec())
@@ -627,19 +751,6 @@ fn translate_named_special(
         NamedKey::Escape => Some(b"\x1b".to_vec()),
         _ => None,
     }
-}
-
-fn translate_enter_with_modifiers(
-    modifiers: ModifiersState,
-    keyboard_protocol: KeyboardProtocol,
-) -> Option<Vec<u8>> {
-    if keyboard_protocol == KeyboardProtocol::Kitty
-        && (modifiers.shift_key() || modifiers.alt_key() || modifiers.control_key())
-    {
-        return xterm_modifier_param(modifiers).map(|param| build_csi_u_seq(13, Some(param)));
-    }
-
-    if modifiers.alt_key() { Some(vec![0x1b, b'\r']) } else { Some(b"\r".to_vec()) }
 }
 
 fn translate_named_csi_letter(named: NamedKey, modifier_param: Option<u8>) -> Option<Vec<u8>> {
@@ -740,7 +851,7 @@ fn tab_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 
     ]
 }
 
-fn view_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 11] {
+fn view_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>; 12] {
     [
         BindingAction { bindings: &bindings.copy, action: LayoutAction::CopySelection },
         BindingAction { bindings: &bindings.paste, action: LayoutAction::PasteClipboard },
@@ -753,6 +864,7 @@ fn view_layout_actions(bindings: &Bindings) -> [BindingAction<'_, LayoutAction>;
             bindings: &bindings.prompt_jump_down,
             action: LayoutAction::PromptJumpDown,
         },
+        BindingAction { bindings: &bindings.jump_to_failure, action: LayoutAction::JumpToFailure },
         BindingAction { bindings: &bindings.zoom_in, action: LayoutAction::ZoomIn },
         BindingAction { bindings: &bindings.zoom_out, action: LayoutAction::ZoomOut },
         BindingAction { bindings: &bindings.zoom_reset, action: LayoutAction::ZoomReset },
@@ -872,14 +984,355 @@ fn build_csi_tilde_seq(code: u8, modifier_param: Option<u8>) -> Vec<u8> {
     seq
 }
 
-fn build_csi_u_seq(codepoint: u32, modifier_param: Option<u8>) -> Vec<u8> {
-    let mut seq = Vec::with_capacity(12);
+/// Build a conformant Kitty CSI-u key sequence.
+///
+/// Forms (per the published Kitty keyboard protocol):
+/// - `CSI <cp> u` — no modifiers, no event type;
+/// - `CSI <cp> ; <mods> u` — modifiers present, press (or event type omitted);
+/// - `CSI <cp> ; <mods> : <event-type> u` — modifiers and a non-press event;
+/// - `CSI <cp> ; 1 : <event-type> u` — event type without held modifiers
+///   (the modifier sub-field defaults to `1`, as the protocol requires the
+///   event type to live in the modifiers parameter's second sub-field).
+///
+/// `alternates` (`:shifted[:base]`) is appended to the codepoint field and
+/// `text_codepoints` becomes the trailing `; <text>` field when present.
+fn build_csi_u_seq(
+    codepoint: u32,
+    alternates: &[u32],
+    modifier_param: Option<u8>,
+    event_type: Option<u8>,
+    text_codepoints: &[u32],
+) -> Vec<u8> {
+    let mut seq = Vec::with_capacity(16);
     seq.extend_from_slice(b"\x1b[");
     seq.extend_from_slice(codepoint.to_string().as_bytes());
-    if let Some(param) = modifier_param {
-        seq.push(b';');
-        seq.extend_from_slice(param.to_string().as_bytes());
+    for alt in alternates {
+        seq.push(b':');
+        seq.extend_from_slice(alt.to_string().as_bytes());
     }
+
+    // The modifiers parameter is emitted when modifiers are held OR an event
+    // type must be carried (its sub-field). A press event with no modifiers
+    // omits the whole parameter.
+    if modifier_param.is_some() || event_type.is_some() {
+        seq.push(b';');
+        seq.extend_from_slice(modifier_param.unwrap_or(1).to_string().as_bytes());
+        if let Some(ev) = event_type {
+            seq.push(b':');
+            seq.extend_from_slice(ev.to_string().as_bytes());
+        }
+    }
+
+    if !text_codepoints.is_empty() {
+        seq.push(b';');
+        for (idx, cp) in text_codepoints.iter().enumerate() {
+            if idx > 0 {
+                seq.push(b':');
+            }
+            seq.extend_from_slice(cp.to_string().as_bytes());
+        }
+    }
+
     seq.push(b'u');
     seq
+}
+
+// ---------------------------------------------------------------------------
+// Kitty keyboard protocol (CSI-u) encoding
+//
+// Active only when at least one enhancement flag is negotiated. Faithful to
+// the published Kitty keyboard protocol; only negotiated flags affect output.
+// ---------------------------------------------------------------------------
+
+/// Kitty event type carried in the modifiers parameter's second sub-field.
+///
+/// `1` (press) is represented as `None` so it is omitted from the wire form,
+/// matching the protocol. `2` = repeat, `3` = release.
+fn kitty_event_type(event: &KeyEvent, flags: KittyFlags) -> Option<u8> {
+    if !flags.report_event_types() {
+        return None;
+    }
+    match event.state {
+        ElementState::Released => Some(3),
+        ElementState::Pressed if event.repeat => Some(2),
+        ElementState::Pressed => None,
+    }
+}
+
+/// Level-4 Kitty translation entry point.
+///
+/// Unlike the legacy path this does **not** gate on `ElementState::Pressed`:
+/// release/repeat events are encoded when `report_event_types` is negotiated
+/// (T013). When `report_event_types` is off, release events still produce no
+/// bytes because non-press events only matter to event-type reporting.
+fn translate_key_kitty(
+    event: &KeyEvent,
+    modifiers: ModifiersState,
+    flags: KittyFlags,
+) -> Option<Vec<u8>> {
+    // Without event-type reporting, only key presses generate bytes — a
+    // release/repeat is indistinguishable from a press on the wire, so
+    // emitting it would double-send the key.
+    if !flags.report_event_types() && event.state != ElementState::Pressed {
+        return None;
+    }
+
+    // Drop Super-only combos that matched no binding — on macOS these are
+    // OS-level shortcuts; sending them to the PTY would be wrong. Super
+    // combined with another modifier is still encoded (Super is a valid
+    // Kitty modifier), mirroring the legacy guard's intent.
+    if modifiers.super_key()
+        && !modifiers.control_key()
+        && !modifiers.alt_key()
+        && !modifiers.shift_key()
+    {
+        return None;
+    }
+
+    match &event.logical_key {
+        Key::Character(c) => translate_character_kitty(event, c, modifiers, flags),
+        Key::Named(named) => translate_named_kitty(event, *named, modifiers, flags),
+        _ => None,
+    }
+}
+
+/// Encode a character key as a Kitty CSI-u sequence (or plain text when the
+/// protocol permits it).
+fn translate_character_kitty(
+    event: &KeyEvent,
+    logical: &str,
+    modifiers: ModifiersState,
+    flags: KittyFlags,
+) -> Option<Vec<u8>> {
+    let base = base_codepoint_for_character(event, logical)?;
+    let modifier_param = xterm_modifier_param(modifiers);
+    let event_type = kitty_event_type(event, flags);
+
+    // With only `disambiguate` (and not `report_all_keys`), an unmodified
+    // printable key that produces text is sent as its text — exactly as
+    // legacy — so plain typing is unchanged. Any held modifier (other than a
+    // lone Shift that just selects the shifted glyph) forces CSI-u so that
+    // e.g. Ctrl+I is distinct from Tab.
+    let has_forcing_modifier =
+        modifiers.control_key() || modifiers.alt_key() || modifiers.super_key();
+    let needs_csi = flags.report_all_keys()
+        || has_forcing_modifier
+        || event_type.is_some()
+        || (flags.report_alternate_keys() && modifiers.shift_key());
+
+    if !needs_csi {
+        // Unmodified (or Shift-only) printable key: send associated text,
+        // identical to legacy output.
+        return event
+            .text
+            .as_ref()
+            .map(|t| t.as_bytes().to_vec())
+            .or_else(|| Some(logical.as_bytes().to_vec()));
+    }
+
+    let alternates = alternate_codepoints(logical, base, flags);
+    let text_codepoints = associated_text_codepoints(event, flags);
+    Some(build_csi_u_seq(base, &alternates, modifier_param, event_type, &text_codepoints))
+}
+
+/// Encode a named key as a Kitty CSI-u sequence, falling back to the legacy
+/// named-key forms only when no enhancement requires CSI-u for that key.
+fn translate_named_kitty(
+    event: &KeyEvent,
+    named: NamedKey,
+    modifiers: ModifiersState,
+    flags: KittyFlags,
+) -> Option<Vec<u8>> {
+    let modifier_param = xterm_modifier_param(modifiers);
+    let event_type = kitty_event_type(event, flags);
+
+    if let Some(cp) = kitty_functional_codepoint(named, event.location) {
+        // Modifier/lock keys are reported only when the application asked for
+        // all keys (or event types) — otherwise they are swallowed as today.
+        if is_kitty_modifier_codepoint(cp)
+            && !flags.report_all_keys()
+            && !flags.report_event_types()
+        {
+            return None;
+        }
+
+        // The text-like specials Enter/Tab/Esc/Backspace are emitted as CSI-u
+        // under `disambiguate` per the protocol's functional-key table. Space
+        // is plain text: unmodified Space stays a raw 0x20 (legacy) and only
+        // becomes CSI-u when modified, event-typed, or under
+        // `report_all_keys`. Arrows and the rest also require modifiers, an
+        // event type, or `report_all_keys`.
+        let always_csi = is_kitty_text_special(cp) && flags.disambiguate();
+        let needs_csi = always_csi
+            || flags.report_all_keys()
+            || modifier_param.is_some()
+            || event_type.is_some()
+            || is_kitty_modifier_codepoint(cp);
+
+        if needs_csi {
+            let text_codepoints = associated_text_codepoints(event, flags);
+            return Some(build_csi_u_seq(cp, &[], modifier_param, event_type, &text_codepoints));
+        }
+    }
+
+    // No enhancement forces CSI-u for this key: fall back to the exact legacy
+    // named-key encoding (press-only, like before).
+    if event.state != ElementState::Pressed {
+        return None;
+    }
+    translate_named_legacy(named, modifiers)
+}
+
+/// Resolve the unshifted base Unicode codepoint for a character key.
+///
+/// Prefers the platform `key_without_modifiers()` (the layout's base key);
+/// where that is unavailable or non-character it degrades to the lowercased
+/// logical character (FR per research D-note: platform-gated API must degrade
+/// gracefully).
+fn base_codepoint_for_character(event: &KeyEvent, logical: &str) -> Option<u32> {
+    if let Key::Character(base) = event.key_without_modifiers() {
+        if let Some(ch) = base.chars().next() {
+            return Some(u32::from(ch));
+        }
+    }
+    let ch = logical.chars().next()?;
+    // Lowercase ASCII so the reported key is layout-base, not the shifted
+    // glyph (Kitty reports the unshifted key; Shift is in the modifiers).
+    Some(u32::from(ch.to_ascii_lowercase()))
+}
+
+/// Build the `:shifted` alternate-codepoint list when `report_alternate_keys`
+/// is negotiated and the shifted glyph differs from the base key, else empty.
+///
+/// The primary codepoint already carries the base (unshifted) key, so only
+/// the shifted sub-field adds information here. A distinct base-layout
+/// sub-field is intentionally not emitted: winit exposes only the active
+/// layout's base (`key_without_modifiers`) and the logical glyph — there is
+/// no separate standard-layout mapping to report, and the protocol requires
+/// that absent fields simply be omitted.
+fn alternate_codepoints(logical: &str, base: u32, flags: KittyFlags) -> Vec<u32> {
+    if !flags.report_alternate_keys() {
+        return Vec::new();
+    }
+    let shifted = logical.chars().next().map_or(0, u32::from);
+    if shifted == 0 || shifted == base {
+        return Vec::new();
+    }
+    vec![shifted]
+}
+
+/// Unicode scalar values of the event's associated text, when
+/// `report_associated_text` is negotiated and the event carries text.
+///
+/// Release events carry no associated text.
+fn associated_text_codepoints(event: &KeyEvent, flags: KittyFlags) -> Vec<u32> {
+    if !flags.report_associated_text() || event.state == ElementState::Released {
+        return Vec::new();
+    }
+    event.text.as_ref().map(|t| t.chars().map(u32::from).collect()).unwrap_or_default()
+}
+
+/// Map a `NamedKey` to its Kitty functional-key codepoint.
+///
+/// Covers the protocol's non-modifier functional keys plus the modifier/lock
+/// keys (disambiguated left/right via `KeyLocation`). Returns `None` for keys
+/// that have no dedicated functional number (those use the legacy forms).
+fn kitty_functional_codepoint(named: NamedKey, location: KeyLocation) -> Option<u32> {
+    if let Some(cp) = kitty_modifier_lock_codepoint(named, location) {
+        return Some(cp);
+    }
+    let cp = match named {
+        NamedKey::Escape => 27,
+        NamedKey::Enter => 13,
+        NamedKey::Tab => 9,
+        NamedKey::Backspace => 127,
+        NamedKey::Space => 32,
+        NamedKey::Insert => 57348,
+        NamedKey::Delete => 57349,
+        NamedKey::ArrowLeft => 57350,
+        NamedKey::ArrowRight => 57351,
+        NamedKey::ArrowUp => 57352,
+        NamedKey::ArrowDown => 57353,
+        NamedKey::PageUp => 57354,
+        NamedKey::PageDown => 57355,
+        NamedKey::Home => 57356,
+        NamedKey::End => 57357,
+        NamedKey::F1 => 57364,
+        NamedKey::F2 => 57365,
+        NamedKey::F3 => 57366,
+        NamedKey::F4 => 57367,
+        NamedKey::F5 => 57368,
+        NamedKey::F6 => 57369,
+        NamedKey::F7 => 57370,
+        NamedKey::F8 => 57371,
+        NamedKey::F9 => 57372,
+        NamedKey::F10 => 57373,
+        NamedKey::F11 => 57374,
+        NamedKey::F12 => 57375,
+        NamedKey::F13 => 57376,
+        NamedKey::F14 => 57377,
+        NamedKey::F15 => 57378,
+        NamedKey::F16 => 57379,
+        NamedKey::F17 => 57380,
+        NamedKey::F18 => 57381,
+        NamedKey::F19 => 57382,
+        NamedKey::F20 => 57383,
+        _ => return None,
+    };
+    Some(cp)
+}
+
+/// Modifier/lock key codepoints, with left/right disambiguation by location.
+fn kitty_modifier_lock_codepoint(named: NamedKey, location: KeyLocation) -> Option<u32> {
+    let is_right = location == KeyLocation::Right;
+    let cp = match named {
+        NamedKey::Shift => {
+            if is_right {
+                57447
+            } else {
+                57441
+            }
+        }
+        NamedKey::Control => {
+            if is_right {
+                57448
+            } else {
+                57442
+            }
+        }
+        NamedKey::Alt => {
+            if is_right {
+                57449
+            } else {
+                57443
+            }
+        }
+        NamedKey::Super => {
+            if is_right {
+                57450
+            } else {
+                57444
+            }
+        }
+        NamedKey::CapsLock => 57358,
+        NamedKey::NumLock => 57360,
+        _ => return None,
+    };
+    Some(cp)
+}
+
+/// `true` for the text-like specials that emit CSI-u under `disambiguate`
+/// alone (Esc, Enter, Tab, Backspace). Space (32) is deliberately excluded:
+/// it is plain text and only escalates to CSI-u when modified, event-typed,
+/// or under `report_all_keys`.
+const fn is_kitty_text_special(codepoint: u32) -> bool {
+    matches!(codepoint, 27 | 13 | 9 | 127)
+}
+
+/// `true` for the Kitty modifier/lock-key private-use codepoints.
+const fn is_kitty_modifier_codepoint(codepoint: u32) -> bool {
+    matches!(
+        codepoint,
+        57441 | 57447 | 57442 | 57448 | 57443 | 57449 | 57444 | 57450 | 57358 | 57360
+    )
 }
