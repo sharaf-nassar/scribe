@@ -38,9 +38,22 @@ use crate::workspace_manager::WorkspaceManager;
 
 /// Current handoff protocol version. Bump when the serialised format changes.
 ///
-/// A version mismatch causes the new server to abort the handoff and perform
-/// a full restart instead, so all live sessions are terminated.
-const HANDOFF_VERSION: u32 = 5;
+/// v6 switched the wire from positional (`rmp_serde::to_vec`, `MessagePack`
+/// array) to named (`rmp_serde::to_vec_named`, `MessagePack` map). With named
+/// encoding, additive `#[serde(default)]` fields survive across versions
+/// regardless of position — pre-v6 the wire was positional, so any field
+/// insertion in the middle of `HandoffState`/`HandoffSession` silently
+/// misaligned every later field even when the new field had `#[serde(default)]`
+/// (see commit history for `session_replay` and `task_label`, both of which
+/// were inserted mid-struct without breaking the version number).
+///
+/// Hot-reload from a pre-v6 sender is best-effort: `rmp_serde::from_slice`
+/// can decode either an array or a map, but the pre-v6 struct shape may not
+/// match the current one. When deserialization fails the error is propagated
+/// verbatim (no more "version mismatch" masking) and the scribe-client
+/// `wait_for_refreshed_server` path on macOS detects the stuck old server and
+/// performs a forced cold restart instead of looping until launch times out.
+const HANDOFF_VERSION: u32 = 6;
 
 /// Magic bytes the receiver sends to request an upgrade.
 const UPGRADE_REQUEST: &[u8] = b"SCRIBE_UPGRADE";
@@ -277,7 +290,11 @@ async fn prepare_handoff_payload(
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
 ) -> Result<HandoffPayload, ScribeError> {
     let (state, fds) = serialize_state(live_sessions, workspace_manager).await;
-    let state_bytes = rmp_serde::to_vec(&state).map_err(ScribeError::from)?;
+    // Named-map encoding (since v6) so additive `#[serde(default)]` fields on
+    // the receiver are tolerated regardless of insertion position. Positional
+    // `to_vec` would force append-only discipline that the codebase has not
+    // historically respected.
+    let state_bytes = rmp_serde::to_vec_named(&state).map_err(ScribeError::from)?;
     Ok(HandoffPayload { state_bytes, fds })
 }
 
@@ -606,26 +623,19 @@ pub fn receive_handoff() -> Result<(HandoffState, Vec<OwnedFd>), ScribeError> {
     // Send upgrade request.
     send_upgrade_request(fd)?;
 
-    // Read state (length-prefixed).  A deserialization failure most likely
-    // means the old server uses a different HandoffState layout (field
-    // count changed between versions).  Surface this as a version mismatch
-    // so the postinst script can offer a cold restart.
-    let state = match read_state(fd) {
-        Ok(s) => s,
-        Err(ScribeError::Deserialization { .. }) => {
-            return Err(ScribeError::IpcError {
-                reason: format!(
-                    "handoff version mismatch: incompatible state format \
-                     (expected version {HANDOFF_VERSION})"
-                ),
-            });
-        }
-        Err(e) => return Err(e),
-    };
+    // Read state (length-prefixed).  Deserialization errors usually mean the
+    // old server's HandoffState layout differs from ours (e.g. fields inserted
+    // mid-struct, an enum variant removed). Propagate the underlying rmp_serde
+    // error verbatim so the client log identifies the failing field/type and
+    // future incidents are not misdiagnosed as a generic "version mismatch".
+    let state = read_state(fd)?;
 
     // Accept the current version and the immediately previous version (N-1),
-    // so normal forward upgrades never cold-restart. Everything else (skip
-    // more than one release, downgrade, pre-v4) falls to cold-restart.
+    // so normal forward upgrades never cold-restart. Note that for
+    // cross-encoding cases (pre-v6 senders used positional MessagePack) the
+    // deserialization above usually fails first, and the propagated error
+    // drives the client-side cold-restart fallback. Versions outside this
+    // accepted range hit cold-restart here instead.
     if state.version != HANDOFF_VERSION && state.version != HANDOFF_VERSION.saturating_sub(1) {
         return Err(ScribeError::IpcError {
             reason: format!(

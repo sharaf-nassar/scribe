@@ -1180,9 +1180,16 @@ fn stale_server_reason(
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct StaleRefresh {
+    old_pid: i32,
+    reason: String,
+}
+
+#[cfg(target_os = "macos")]
 fn refresh_stale_connected_server(
     stream: &tokio::net::UnixStream,
-) -> Result<Option<String>, String> {
+) -> Result<Option<StaleRefresh>, String> {
     let bundled_server = bundled_server_exe_path(current_identity())?;
     let running = connected_server_info(stream)?;
     let bundled_modified = file_modified_epoch_secs(&bundled_server);
@@ -1192,7 +1199,14 @@ fn refresh_stale_connected_server(
 
     tracing::info!(pid = running.pid, %reason, "connected scribe-server is stale; requesting refresh");
     restart_server()?;
-    Ok(Some(reason))
+    Ok(Some(StaleRefresh { old_pid: running.pid, reason }))
+}
+
+#[cfg(target_os = "macos")]
+fn peer_pid_of(stream: &tokio::net::UnixStream) -> Result<i32, String> {
+    use nix::sys::socket::{getsockopt, sockopt};
+    getsockopt(stream, sockopt::LocalPeerPid)
+        .map_err(|e| format!("failed to query peer pid: {e}"))
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1289,10 +1303,19 @@ async fn connect_or_start_server(
     if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
         #[cfg(target_os = "macos")]
         match refresh_stale_connected_server(&stream) {
-            Ok(Some(reason)) => {
+            Ok(Some(refresh)) => {
                 drop(stream);
-                tracing::info!(%reason, "waiting for refreshed scribe-server");
-                return wait_for_server_connection(socket_path, SERVER_REFRESH_TIMEOUT).await;
+                tracing::info!(
+                    old_pid = refresh.old_pid,
+                    reason = %refresh.reason,
+                    "waiting for refreshed scribe-server"
+                );
+                return wait_for_refreshed_server(
+                    socket_path,
+                    refresh.old_pid,
+                    SERVER_REFRESH_TIMEOUT,
+                )
+                .await;
             }
             Ok(None) => {}
             Err(e) => {
@@ -1310,6 +1333,63 @@ async fn connect_or_start_server(
     wait_for_server_connection(socket_path, SERVER_STARTUP_TIMEOUT).await
 }
 
+/// Wait for the refreshed server to take over after a hot-reload was requested.
+///
+/// Polls the socket until the connected peer's PID differs from the supplied
+/// `old_pid`, which signals the new server has bound the socket. If `timeout`
+/// elapses without a takeover — usually because the `--upgrade` child failed
+/// internally (e.g. handoff version mismatch) and the old server is still
+/// holding the lock and socket — fall back to `perform_macos_update_restart`,
+/// which force-terminates the old PID, clears stale lock/socket files, and
+/// starts a fresh server. Sessions in the old server are lost, but Scribe
+/// launches instead of timing out and crashing.
+#[cfg(target_os = "macos")]
+async fn wait_for_refreshed_server(
+    socket_path: &Path,
+    old_pid: i32,
+    timeout: std::time::Duration,
+) -> Result<tokio::net::UnixStream, Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(SERVER_RETRY_INTERVAL).await;
+
+        if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
+            match peer_pid_of(&stream) {
+                Ok(pid) if pid != old_pid => {
+                    tracing::info!(new_pid = pid, "connected to refreshed scribe-server");
+                    return Ok(stream);
+                }
+                Ok(_) => {
+                    // Old server still owns the socket — handoff hasn't taken
+                    // over yet. Keep polling until the deadline.
+                    drop(stream);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "could not query peer pid after refresh ({e}); accepting connection"
+                    );
+                    return Ok(stream);
+                }
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                old_pid,
+                "handoff did not take over within {}s; falling back to cold restart",
+                timeout.as_secs()
+            );
+            perform_macos_update_restart().map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("cold-restart fallback after handoff timeout failed: {e}").into()
+                },
+            )?;
+            return Box::pin(wait_for_server_connection(socket_path, SERVER_STARTUP_TIMEOUT))
+                .await;
+        }
+    }
+}
+
 async fn wait_for_server_connection(
     socket_path: &Path,
     timeout: std::time::Duration,
@@ -1321,10 +1401,19 @@ async fn wait_for_server_connection(
         if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
             #[cfg(target_os = "macos")]
             match refresh_stale_connected_server(&stream) {
-                Ok(Some(reason)) => {
-                    tracing::info!(%reason, "stale server reconnected during wait; retrying");
+                Ok(Some(refresh)) => {
+                    tracing::info!(
+                        old_pid = refresh.old_pid,
+                        reason = %refresh.reason,
+                        "stale server reconnected during wait; switching to refresh-wait"
+                    );
                     drop(stream);
-                    continue;
+                    return Box::pin(wait_for_refreshed_server(
+                        socket_path,
+                        refresh.old_pid,
+                        SERVER_REFRESH_TIMEOUT,
+                    ))
+                    .await;
                 }
                 Ok(None) => {}
                 Err(e) => {
