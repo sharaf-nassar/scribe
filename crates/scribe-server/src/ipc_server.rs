@@ -538,6 +538,14 @@ where
             handle_transient_list_releases(server, writer).await;
             None
         }
+        Ok(ClientMessage::TriggerUpdate) => {
+            // Transient install kick-off from the standalone settings
+            // window. The updater's single-slot trigger channel collapses
+            // duplicate requests, so it is safe even if an in-client
+            // overlay is already mid-install. No reply frame.
+            handle_transient_trigger_update(server);
+            None
+        }
         Ok(ClientMessage::HookEvent(event)) => {
             // Transient one-shot: scribe-hook-helper sends one HookEvent,
             // server dispatches, connection closes. No Welcome, no reply.
@@ -561,6 +569,11 @@ async fn handle_transient_check_for_updates(server: &IpcServerState, writer: &Sh
     info!("transient client requested manual update check");
     let state = server.updater_handle.request_check().await;
     send_message(writer, &ServerMessage::UpdateCheckResult { state }).await;
+}
+
+fn handle_transient_trigger_update(server: &IpcServerState) {
+    info!("transient client triggered update");
+    server.updater_handle.trigger();
 }
 
 async fn handle_transient_list_releases(server: &IpcServerState, writer: &SharedWriter) {

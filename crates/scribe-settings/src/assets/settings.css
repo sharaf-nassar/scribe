@@ -340,6 +340,26 @@ body {
   border-color: rgba(255, 255, 255, 0.08);
 }
 
+/* Primary variant of `.action-btn`. Used when the manual update-check row
+   morphs the "Check Now" button into "Update Now" after an UpdateAvailable
+   result, so the install affordance reads as the recommended action.
+   Stays green while disabled in "Installing…" mode for visual continuity. */
+.action-btn.is-primary {
+  background: #16a34a;
+  border-color: rgba(255, 255, 255, 0.16);
+  color: #ffffff;
+}
+
+.action-btn.is-primary:hover {
+  background: #15803d;
+  border-color: rgba(255, 255, 255, 0.24);
+}
+
+.action-btn.is-primary:disabled:hover {
+  background: #16a34a;
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
 /* Inline status text used by the "Check for Updates Now" row.
    Inherits the muted setting-desc color by default; success/error
    variants override it without changing layout. */
@@ -1375,7 +1395,10 @@ input[type="range"]::-webkit-slider-thumb {
   align-items: center;
   justify-content: center;
   gap: 12px;
-  margin-bottom: 8px;
+  /* Matches `.page-header-row { margin-bottom }` above the panel so the nav
+     row reads as vertically centered between the page subtitle and the
+     release-notes article (which sits flush below). */
+  margin-bottom: 16px;
   flex-wrap: wrap;
 }
 
