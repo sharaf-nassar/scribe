@@ -77,10 +77,33 @@ use crate::ipc_client::{ClientCommand, UiEvent};
 use crate::layout::{PaneEdges, PaneId, Rect};
 use crate::pane::{CommandRecord, CommandStatus, FeedOutputResult, Pane};
 use crate::workspace_layout::WindowLayout;
-use crate::workspace_notes::ArchiveReason;
+use crate::workspace_notes::{AddingNoteState, ArchiveReason};
 use crate::workspace_notes_modal::{
     WorkspaceNotesEditMode, WorkspaceNotesModal, WorkspaceNotesModalAction, WorkspaceNotesView,
 };
+
+/// Convert a non-negative finite `f32` to `u16` with saturation. Used by
+/// `App::inline_editor_max_rows` to land a pixel-budget computation into the
+/// `u16`-sized grid-unit space the renderer uses. The float→int cast is the
+/// only `as` conversion that cannot be expressed safely in stable Rust without
+/// `unsafe`; the suppression is registered in
+/// `tools/lint-suppressions-allowlist.txt` deliberately.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "f32->int casts cannot be expressed without `as` in stable Rust; \
+              `value` is bounds-checked above (>=0 and <u16::MAX), so the cast \
+              is exact and saturating"
+)]
+fn f32_to_u16_saturating(value: f32) -> u16 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    if value >= f32::from(u16::MAX) {
+        return u16::MAX;
+    }
+    value.floor() as u16
+}
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -815,6 +838,12 @@ struct App {
     workspace_notes: workspace_notes::WorkspaceNotesStore,
     workspace_notes_modal: WorkspaceNotesModal,
     workspace_notes_save_pending: Option<Instant>,
+    // Per-workspace inline-editor state for the hover preview "+" affordance (FR-021).
+    adding_note_states: HashMap<WorkspaceId, workspace_notes::AddingNoteState>,
+    // Which workspace's preview "+" affordance is currently being hovered (for visual state).
+    affordance_hovered_workspace: Option<WorkspaceId>,
+    // Which workspace currently owns inline-editor keyboard focus (FR-005).
+    focused_inline_editor: Option<WorkspaceId>,
     workspace_notes_pending_draft_flush: Option<PendingWorkspaceNotesFlush>,
     workspace_notes_pending_modal_mutation: Option<WorkspaceId>,
     workspace_notes_pending_modal_action: Option<PendingWorkspaceNotesAction>,
@@ -1033,6 +1062,9 @@ impl App {
             search_overlay: search_overlay::SearchOverlay::new(),
             workspace_notes: workspace_notes::WorkspaceNotesStore::load(),
             workspace_notes_modal: WorkspaceNotesModal::new(), workspace_notes_save_pending: None,
+            adding_note_states: HashMap::new(),
+            affordance_hovered_workspace: None,
+            focused_inline_editor: None,
             workspace_notes_pending_draft_flush: None, workspace_notes_pending_modal_mutation: None,
             workspace_notes_pending_modal_action: None,
             workspace_notes_hit_targets: Vec::new(), hovered_workspace_notes: None,
@@ -1359,6 +1391,15 @@ impl App {
                 self.workspace_notes_pending_modal_mutation = None;
                 self.workspace_notes_pending_modal_action = None;
                 self.workspace_notes_pending_draft_flush = None;
+                // FR-012: any inline editor waiting on a CreateActiveNote
+                // commit retains its typed text but surfaces the error so the
+                // user can retry. Other open editors are unaffected.
+                let pending_editors =
+                    self.adding_note_states.values_mut().filter(|state| state.committed_pending);
+                for state in pending_editors {
+                    state.committed_pending = false;
+                    state.last_server_error = Some(message.clone());
+                }
                 self.request_redraw();
                 true
             }
@@ -4825,10 +4866,20 @@ impl App {
             return;
         };
         let (summaries, total_count) = self.workspace_notes.hover_summaries(workspace_id, 50, 58);
+        let max_editor_rows = self.inline_editor_max_rows(prepared, workspace_id);
+        let affordance_hovered = !self.adding_note_states.contains_key(&workspace_id)
+            && self.affordance_hovered_workspace == Some(workspace_id);
+        let chrome = &self.theme.chrome;
+        let hovered_note_id = self.hovered_workspace_note_preview_note.as_deref();
         let Some(gpu) = self.gpu.as_mut() else {
             self.workspace_notes_preview_target = None;
             return;
         };
+        // FR-022 first input: pass `&mut AddingNoteState` so the renderer can
+        // snap `scroll_offset_rows` using the layout's actual content width.
+        // (Different field from `self.gpu`, so split-borrow rules let this
+        // coexist with the `gpu.as_mut()` above.)
+        let inline_editor = self.adding_note_states.get_mut(&workspace_id);
         let mut resolve_glyph = |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
         self.workspace_notes_preview_target =
             workspace_notes_preview::build_workspace_notes_preview(
@@ -4837,10 +4888,13 @@ impl App {
                     anchor,
                     viewport: prepared.full_viewport,
                     cell_size: prepared.cell_size,
-                    chrome: &self.theme.chrome,
+                    chrome,
                     summaries: &summaries,
                     total_count,
-                    hovered_note_id: self.hovered_workspace_note_preview_note.as_deref(),
+                    hovered_note_id,
+                    inline_editor,
+                    affordance_hovered,
+                    max_editor_rows: Some(max_editor_rows),
                     resolve_glyph: &mut resolve_glyph,
                 },
             )
@@ -4852,6 +4906,8 @@ impl App {
             && self.context_menu.is_none()
             && self.close_dialog.is_none()
             && self.update_dialog.is_none()
+            && !self.command_palette.is_active()
+            && !self.search_overlay.is_active()
     }
 
     fn prompt_tooltip_anchor(&self, prepared: &PreparedFrame) -> Option<(String, Rect)> {
@@ -5142,6 +5198,13 @@ impl App {
 
         if self.handle_command_palette_keyboard(event) || self.handle_search_overlay_keyboard(event)
         {
+            return;
+        }
+
+        // Inline editor in the workspace-notes hover preview (FR-005). Capture
+        // keys before PTY translation when an inline editor currently holds
+        // keyboard focus.
+        if self.try_handle_inline_editor_keyboard(event) {
             return;
         }
 
@@ -6410,6 +6473,12 @@ impl App {
 
     fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
         use alacritty_terminal::term::TermMode;
+        // FR-022 second input: wheel over the inline editor row scrolls the
+        // editor's internal viewport without consuming the wheel for the
+        // terminal beneath. Wheel events outside the editor row fall through.
+        if self.try_inline_editor_mouse_wheel(delta) {
+            return;
+        }
         let natural = self.config.terminal.scroll.natural_scroll;
         let raw_lines = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, y) => {
@@ -6548,6 +6617,11 @@ impl App {
 
     fn handle_open_command_palette(&mut self) {
         self.search_overlay.close();
+        // FR-010: command palette is a higher-priority overlay; flush any
+        // open inline-editor drafts via SaveDraft before taking focus.
+        if !self.adding_note_states.is_empty() {
+            self.dismiss_all_inline_editors();
+        }
         self.command_palette.open();
         self.refresh_command_palette_items();
         self.request_redraw();
@@ -6584,6 +6658,10 @@ impl App {
         }
         self.command_palette.close();
         self.command_palette_items.clear();
+        // FR-010: search overlay is a higher-priority overlay.
+        if !self.adding_note_states.is_empty() {
+            self.dismiss_all_inline_editors();
+        }
         self.search_overlay.open();
         self.request_redraw();
     }
@@ -7009,6 +7087,22 @@ impl App {
             return false;
         }
         let workspace_id = target.workspace_id;
+        // Affordance click → open inline editor (FR-002). Hit-test first so the
+        // affordance doesn't shadow note-row archival.
+        if let Some(aff_rect) = target.interaction.affordance_rect {
+            if aff_rect.contains(x, y) {
+                self.open_inline_note_editor(workspace_id);
+                return true;
+            }
+        }
+        // Editor row click → absorb so it doesn't trigger archival on a note row
+        // behind it; the inline editor is the focused surface (FR-011).
+        if let Some(editor_rect) = target.interaction.editor_rect {
+            if editor_rect.contains(x, y) {
+                self.focused_inline_editor = Some(workspace_id);
+                return true;
+            }
+        }
         let note_id = target
             .interaction
             .note_targets
@@ -7509,27 +7603,42 @@ impl App {
     }
 
     fn update_workspace_notes_hover(&mut self, cursor_x: f32, cursor_y: f32) {
-        let (new_hover, new_preview_note) = if self.workspace_notes_preview_allowed() {
-            let badge_hover = self
-                .workspace_notes_hit_targets
-                .iter()
-                .find_map(|(ws_id, rect)| rect.contains(cursor_x, cursor_y).then_some(*ws_id));
-            let preview_target = self
-                .workspace_notes_preview_target
-                .as_ref()
-                .filter(|target| target.interaction.rect.contains(cursor_x, cursor_y));
-            let preview_hover = preview_target.map(|target| target.workspace_id);
-            let preview_note = preview_target
-                .and_then(|target| preview_target_note_id(target, cursor_x, cursor_y));
-            (badge_hover.or(preview_hover), preview_note)
-        } else {
-            (None, None)
-        };
+        let (new_hover, new_preview_note, affordance_hovered_ws) =
+            if self.workspace_notes_preview_allowed() {
+                let badge_hover = self
+                    .workspace_notes_hit_targets
+                    .iter()
+                    .find_map(|(ws_id, rect)| rect.contains(cursor_x, cursor_y).then_some(*ws_id));
+                let preview_target = self
+                    .workspace_notes_preview_target
+                    .as_ref()
+                    .filter(|target| target.interaction.rect.contains(cursor_x, cursor_y));
+                let preview_hover = preview_target.map(|target| target.workspace_id);
+                let preview_note = preview_target
+                    .and_then(|target| preview_target_note_id(target, cursor_x, cursor_y));
+                let affordance_hovered = preview_target.and_then(|target| {
+                    target
+                        .interaction
+                        .affordance_rect
+                        .filter(|rect| rect.contains(cursor_x, cursor_y))
+                        .map(|_| target.workspace_id)
+                });
+                // FR-003: if pointer leaves badge + preview, keep the inline-editor's
+                // workspace as the hover anchor so the editor stays visible.
+                let hover = badge_hover.or(preview_hover).or_else(|| {
+                    self.focused_inline_editor.filter(|ws| self.adding_note_states.contains_key(ws))
+                });
+                (hover, preview_note, affordance_hovered)
+            } else {
+                (None, None, None)
+            };
         if new_hover != self.hovered_workspace_notes
             || new_preview_note != self.hovered_workspace_note_preview_note
+            || affordance_hovered_ws != self.affordance_hovered_workspace
         {
             self.hovered_workspace_notes = new_hover;
             self.hovered_workspace_note_preview_note = new_preview_note;
+            self.affordance_hovered_workspace = affordance_hovered_ws;
             self.request_redraw();
         }
     }
@@ -8258,6 +8367,11 @@ impl App {
                 url_detect::SpanKind::Path => (None, Some(span.url.clone())),
             });
         let smart_actions = self.smart_selection_menu_items(x, y);
+        // FR-010: context menu is a higher-priority overlay; flush any open
+        // inline-editor drafts via SaveDraft before taking focus.
+        if !self.adding_note_states.is_empty() {
+            self.dismiss_all_inline_editors();
+        }
         self.context_menu =
             Some(context_menu::ContextMenu::new(context_menu::ContextMenuRequest {
                 x,
@@ -9102,11 +9216,301 @@ impl App {
     }
 
     fn flush_workspace_notes_now(&mut self) {
-        let Some((workspace_id, text)) = self.dirty_workspace_notes_draft() else {
-            self.workspace_notes_save_pending = None;
+        // Modal draft (existing behavior).
+        if let Some((workspace_id, text)) = self.dirty_workspace_notes_draft() {
+            self.queue_workspace_notes_draft_flush(workspace_id, text, None);
+        }
+        // Inline-editor drafts (FR-020 shared buffer; PR-002 debounce-bounded bandwidth).
+        self.flush_inline_editor_drafts();
+        // Debounce timer always resets after a flush attempt.
+        self.workspace_notes_save_pending = None;
+    }
+
+    /// Send `SaveDraft` for each workspace whose inline editor has unwritten text
+    /// (FR-020). Used by the debounce path (`flush_workspace_notes_if_due`),
+    /// higher-priority-overlay handoff (FR-010), workspace-switch fallback (FR-013),
+    /// and window-close / app-shutdown (FR-014).
+    fn flush_inline_editor_drafts(&mut self) {
+        let drafts = self.dirty_inline_editor_drafts();
+        for (workspace_id, text) in drafts {
+            self.send_workspace_notes_mutation(
+                workspace_notes::WorkspaceNotesMutation::SaveDraft { workspace_id, text },
+            );
+            if let Some(state) = self.adding_note_states.get_mut(&workspace_id) {
+                state.draft_dirty = false;
+            }
+        }
+    }
+
+    /// Inline-editor entries with unwritten draft text. Used by `flush_inline_editor_drafts`
+    /// and by higher-priority-overlay handoff paths that want to preserve text before
+    /// closing the previews.
+    fn dirty_inline_editor_drafts(&self) -> Vec<(WorkspaceId, String)> {
+        self.adding_note_states
+            .iter()
+            .filter(|(_, state)| state.draft_dirty)
+            .map(|(ws, state)| (*ws, state.draft_text.clone()))
+            .collect()
+    }
+
+    // (free function below the impl handles the f32→u16 saturating conversion
+    //  with one explicit allow-attr that is registered in the project's
+    //  lint-suppressions allowlist.)
+
+    /// Compute the max number of rows the inline editor can grow to per FR-019:
+    /// 3/4 of the focused pane's vertical extent, expressed in cell rows.
+    /// Falls back to a sensible default tied to the full viewport when pane
+    /// metadata is not available in the prepared frame.
+    fn inline_editor_max_rows(&self, prepared: &PreparedFrame, workspace_id: WorkspaceId) -> usize {
+        let cell_h = prepared.cell_size.1;
+        if cell_h <= 0.0 {
+            return 12;
+        }
+        // Prefer the focused pane that owns the workspace; otherwise fall back to
+        // 3/4 of the full viewport so we never grow off-screen.
+        let pane_height = prepared
+            .pane_rects
+            .iter()
+            .find(|(pane_id, _)| {
+                self.panes.get(pane_id).is_some_and(|pane| pane.workspace_id == workspace_id)
+            })
+            .map_or(prepared.full_viewport.height, |(_, rect)| rect.height);
+        // Compute the row cap entirely in f32, then clamp to a finite range
+        // and round to the nearest u16 via `f32::round_ties_even` before
+        // converting through u16 — which is exact in f32 and trivially fits
+        // usize. Avoids the float→int cast lints without `unsafe` or new deps.
+        let rows_f = (pane_height * 0.75 / cell_h).floor().clamp(1.0, f32::from(u16::MAX));
+        let rows_u16 = f32_to_u16_saturating(rows_f);
+        usize::from(rows_u16).max(1)
+    }
+
+    /// Open an inline note editor for `workspace_id`, pre-populating it with the
+    /// workspace's existing saved draft (FR-002 / FR-020).
+    fn open_inline_note_editor(&mut self, workspace_id: WorkspaceId) {
+        if self.adding_note_states.contains_key(&workspace_id) {
             return;
+        }
+        let saved_draft = self.workspace_notes.draft_text(workspace_id);
+        let state = workspace_notes::AddingNoteState::new_from_saved_draft(saved_draft);
+        self.adding_note_states.insert(workspace_id, state);
+        self.focused_inline_editor = Some(workspace_id);
+        self.request_redraw();
+    }
+
+    /// FR-015: when a server snapshot arrives carrying the latest saved draft
+    /// for a workspace, hydrate the local inline-editor copy ONLY when the
+    /// local copy is pristine (no unwritten user edits). Caret is clamped to
+    /// the new text length and walked back to the nearest char boundary.
+    fn hydrate_inline_editor_pristine_draft(
+        &mut self,
+        workspace_id: WorkspaceId,
+        draft_text: &str,
+    ) {
+        let Some(state) = self.adding_note_states.get_mut(&workspace_id) else { return };
+        if state.draft_dirty || state.draft_text == draft_text {
+            return;
+        }
+        state.draft_text.clone_from(&draft_text.to_owned());
+        state.caret_byte = state.caret_byte.min(state.draft_text.len());
+        while state.caret_byte > 0 && !state.draft_text.is_char_boundary(state.caret_byte) {
+            state.caret_byte -= 1;
+        }
+    }
+
+    /// Close the inline editor for `workspace_id` without flushing (used by
+    /// explicit cancel/Escape per FR-008 and by post-commit cleanup).
+    fn close_inline_note_editor(&mut self, workspace_id: WorkspaceId) {
+        self.adding_note_states.remove(&workspace_id);
+        if self.focused_inline_editor == Some(workspace_id) {
+            self.focused_inline_editor = None;
+        }
+        self.request_redraw();
+    }
+
+    /// FR-010 / FR-014: flush every inline-editor draft through `SaveDraft` and
+    /// then clear all `AddingNoteState` entries. Used on higher-priority overlay
+    /// handoff and on window close / app shutdown.
+    fn dismiss_all_inline_editors(&mut self) {
+        self.flush_inline_editor_drafts();
+        self.adding_note_states.clear();
+        self.focused_inline_editor = None;
+    }
+
+    /// FR-022 second input: returns `true` (consuming the wheel event) iff the
+    /// cursor is over the inline editor's row in the hover preview. Updates the
+    /// editor's internal scroll offset without moving the caret.
+    fn try_inline_editor_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) -> bool {
+        let Some((x, y)) = self.last_cursor_pos else { return false };
+        let Some(target) = self.workspace_notes_preview_target.as_ref() else { return false };
+        let Some(editor_rect) = target.interaction.editor_rect else { return false };
+        if !editor_rect.contains(x, y) {
+            return false;
+        }
+        let workspace_id = target.workspace_id;
+        let lines: i32 = match delta {
+            winit::event::MouseScrollDelta::LineDelta(_, dy) if dy > 0.0 => -1,
+            winit::event::MouseScrollDelta::LineDelta(_, dy) if dy < 0.0 => 1,
+            winit::event::MouseScrollDelta::PixelDelta(pos) if pos.y > 0.0 => -1,
+            winit::event::MouseScrollDelta::PixelDelta(pos) if pos.y < 0.0 => 1,
+            _ => 0,
         };
-        self.queue_workspace_notes_draft_flush(workspace_id, text, None);
+        if lines == 0 {
+            return true;
+        }
+        if let Some(state) = self.adding_note_states.get_mut(&workspace_id) {
+            if lines > 0 {
+                let delta_rows = usize::try_from(lines).unwrap_or(0);
+                state.scroll_offset_rows = state.scroll_offset_rows.saturating_add(delta_rows);
+            } else {
+                state.scroll_offset_rows = state
+                    .scroll_offset_rows
+                    .saturating_sub(usize::try_from(lines.unsigned_abs()).unwrap_or(0));
+            }
+            self.request_redraw();
+        }
+        true
+    }
+
+    /// Try to consume `event` for the currently focused inline editor (FR-005).
+    /// Returns `true` when the event was handled and must NOT fall through to
+    /// PTY translation. Keymap mirrors the modal editor after FR-017's flip:
+    /// Enter = save, Ctrl+Enter = newline, Escape = cancel, plus arrow keys /
+    /// Home / End for caret navigation per FR-022.
+    fn try_handle_inline_editor_keyboard(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if event.state != winit::event::ElementState::Pressed {
+            return false;
+        }
+        let Some(workspace_id) = self.focused_inline_editor else {
+            return false;
+        };
+        if !self.adding_note_states.contains_key(&workspace_id) {
+            self.focused_inline_editor = None;
+            return false;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                // FR-008: discard typed text outright, no SaveDraft write.
+                self.close_inline_note_editor(workspace_id);
+                true
+            }
+            Key::Named(NamedKey::Enter) if self.modifiers.control_key() => {
+                // Ctrl+Enter inserts a newline (FR-009).
+                self.mutate_inline_editor(workspace_id, true, |state| state.insert_char('\n'))
+            }
+            Key::Named(NamedKey::Enter) => {
+                // FR-006/007/016: Enter commits non-empty trimmed drafts.
+                self.commit_inline_editor(workspace_id);
+                true
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.mutate_inline_editor_dirty(workspace_id, AddingNoteState::backspace)
+            }
+            Key::Named(NamedKey::Space) => {
+                self.mutate_inline_editor(workspace_id, true, |state| state.insert_char(' '))
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                self.mutate_inline_editor(workspace_id, false, AddingNoteState::move_caret_left)
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                self.mutate_inline_editor(workspace_id, false, AddingNoteState::move_caret_right)
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.mutate_inline_editor(workspace_id, false, AddingNoteState::move_caret_up)
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.mutate_inline_editor(workspace_id, false, AddingNoteState::move_caret_down)
+            }
+            Key::Named(NamedKey::Home) => self.mutate_inline_editor(
+                workspace_id,
+                false,
+                AddingNoteState::move_caret_line_start,
+            ),
+            Key::Named(NamedKey::End) => {
+                self.mutate_inline_editor(workspace_id, false, AddingNoteState::move_caret_line_end)
+            }
+            Key::Character(text)
+                if !self.modifiers.control_key()
+                    && !self.modifiers.alt_key()
+                    && !self.modifiers.super_key() =>
+            {
+                self.insert_inline_editor_chars(workspace_id, text)
+            }
+            _ => false,
+        }
+    }
+
+    /// Apply a non-mutating-or-uniformly-dirty operation to the workspace's
+    /// inline editor; flags the debounce timer when `dirty` is true. Returns
+    /// `true` (event consumed) iff the workspace has an active editor.
+    fn mutate_inline_editor(
+        &mut self,
+        workspace_id: WorkspaceId,
+        dirty: bool,
+        f: impl FnOnce(&mut workspace_notes::AddingNoteState),
+    ) -> bool {
+        let Some(state) = self.adding_note_states.get_mut(&workspace_id) else { return false };
+        f(state);
+        if dirty {
+            self.workspace_notes_save_pending = Some(Instant::now());
+        }
+        self.request_redraw();
+        true
+    }
+
+    /// Same as `mutate_inline_editor` but the closure returns whether it
+    /// dirtied the draft (e.g., Backspace at start-of-buffer doesn't).
+    fn mutate_inline_editor_dirty(
+        &mut self,
+        workspace_id: WorkspaceId,
+        f: impl FnOnce(&mut workspace_notes::AddingNoteState) -> bool,
+    ) -> bool {
+        let Some(state) = self.adding_note_states.get_mut(&workspace_id) else { return false };
+        if f(state) {
+            self.workspace_notes_save_pending = Some(Instant::now());
+        }
+        self.request_redraw();
+        true
+    }
+
+    /// Insert printable characters from a `Key::Character(text)` event,
+    /// filtering control codes. Sets the debounce timer if anything was
+    /// inserted.
+    fn insert_inline_editor_chars(&mut self, workspace_id: WorkspaceId, text: &str) -> bool {
+        let Some(state) = self.adding_note_states.get_mut(&workspace_id) else { return false };
+        let mut dirty = false;
+        for ch in text.chars().filter(|ch| !ch.is_control()) {
+            state.insert_char(ch);
+            dirty = true;
+        }
+        if dirty {
+            self.workspace_notes_save_pending = Some(Instant::now());
+        }
+        self.request_redraw();
+        true
+    }
+
+    /// FR-006 / FR-007 / FR-016: Enter-commit path for the inline editor.
+    /// Empty/whitespace-only drafts close the editor without sending a mutation.
+    /// Duplicate commits while a previous `CreateActiveNote` is still in flight
+    /// are coalesced.
+    fn commit_inline_editor(&mut self, workspace_id: WorkspaceId) {
+        let Some(state_mut) = self.adding_note_states.get_mut(&workspace_id) else { return };
+        if state_mut.committed_pending {
+            return;
+        }
+        if state_mut.is_blank_trimmed() {
+            // FR-007: empty/whitespace-only — close without sending.
+            self.close_inline_note_editor(workspace_id);
+            return;
+        }
+        let text = state_mut.draft_text.clone();
+        state_mut.committed_pending = true;
+        state_mut.draft_dirty = false;
+        state_mut.last_server_error = None;
+        self.send_workspace_notes_mutation(
+            workspace_notes::WorkspaceNotesMutation::CreateActiveNote { workspace_id, text },
+        );
+        self.request_redraw();
     }
 
     fn dirty_workspace_notes_draft(&self) -> Option<(WorkspaceId, String)> {
@@ -9154,6 +9558,14 @@ impl App {
 
         if let Some((workspace_id, text)) = self.dirty_workspace_notes_draft() {
             return self.queue_workspace_notes_draft_flush(workspace_id, text, Some(action));
+        }
+
+        // FR-014: defer shutdown/close while any inline editor still holds a
+        // dirty draft. Flush them through SaveDraft directly (no modal action
+        // gating since these aren't tied to modal close UX) and let the action
+        // proceed.
+        if !self.dirty_inline_editor_drafts().is_empty() {
+            self.flush_inline_editor_drafts();
         }
 
         if let Some(pending) = &mut self.workspace_notes_pending_draft_flush {
@@ -9265,6 +9677,11 @@ impl App {
         }
 
         let session_count = self.panes.len();
+        // FR-010: close dialog is a higher-priority overlay; flush inline-editor
+        // drafts via SaveDraft before taking focus.
+        if !self.adding_note_states.is_empty() {
+            self.dismiss_all_inline_editors();
+        }
         self.close_dialog = Some(close_dialog::CloseDialog::new(session_count));
         self.request_redraw();
     }
@@ -9361,6 +9778,11 @@ impl App {
             (_, Some(version)) => update_dialog::UpdateDialog::new_install(version.clone()),
             _ => return,
         };
+        // FR-010: update dialog is a higher-priority overlay; flush inline
+        // editor drafts via SaveDraft before taking focus.
+        if !self.adding_note_states.is_empty() {
+            self.dismiss_all_inline_editors();
+        }
         self.update_dialog = Some(dialog);
         self.request_redraw();
     }
@@ -9562,8 +9984,21 @@ impl App {
         self.hovered_workspace_notes = None;
         self.hovered_workspace_note_preview_note = None;
         self.workspace_notes_preview_target = None;
+        // FR-010 / FR-020: capture the inline editor's local draft text (if
+        // any) for THIS workspace BEFORE dismissing — the server-side
+        // `SaveDraft` flush is asynchronous, so reading `workspace_notes.draft_text`
+        // would return a stale value until the broadcast arrived. Passing the
+        // captured text directly to the modal keeps the user's most recent
+        // typing visible on open; the dismiss path still sends `SaveDraft` for
+        // cross-window durability.
+        let inline_draft_text =
+            self.adding_note_states.get(&workspace_id).map(|state| state.draft_text.clone());
+        if !self.adding_note_states.is_empty() {
+            self.dismiss_all_inline_editors();
+        }
         self.request_workspace_notes_snapshot(vec![workspace_id]);
-        let draft_text = self.workspace_notes.draft_text(workspace_id);
+        let draft_text =
+            inline_draft_text.unwrap_or_else(|| self.workspace_notes.draft_text(workspace_id));
         self.workspace_notes_modal.open(workspace_id, draft_text);
         self.request_redraw();
     }
@@ -9616,6 +10051,17 @@ impl App {
             } else {
                 self.workspace_notes_modal.replace_pristine_draft(draft_text.clone());
             }
+        }
+        // Inline editor: a Pending CreateActiveNote that this broadcast resolves
+        // means the new note has landed in the active list — close the editor
+        // (FR-006). Otherwise reconcile pristine-state per FR-015 / FR-020.
+        let close_inline =
+            self.adding_note_states.get(&workspace_id).is_some_and(|state| state.committed_pending);
+        if close_inline {
+            self.close_inline_note_editor(workspace_id);
+        } else {
+            // FR-015 pristine-draft hydration from server snapshot.
+            self.hydrate_inline_editor_pristine_draft(workspace_id, &draft_text);
         }
         if self.complete_workspace_notes_draft_flush(workspace_id, &draft_text, event_loop) {
             return;
@@ -9713,10 +10159,15 @@ impl App {
                 }
             }
             Key::Named(NamedKey::Enter) if self.modifiers.control_key() => {
-                self.save_workspace_notes_modal();
+                self.workspace_notes_modal.push_char('\n');
+                self.sync_workspace_notes_draft();
+                self.request_redraw();
             }
             Key::Named(NamedKey::Enter) => {
-                self.workspace_notes_modal.push_char('\n');
+                self.save_workspace_notes_modal();
+            }
+            Key::Named(NamedKey::Space) => {
+                self.workspace_notes_modal.push_char(' ');
                 self.sync_workspace_notes_draft();
                 self.request_redraw();
             }
