@@ -500,6 +500,34 @@ impl KittyFlags {
     }
 }
 
+/// Per-pane terminal protocol state consulted by the level-4 encoder.
+///
+/// Bundles the negotiated Kitty enhancement flags with the two DEC private
+/// modes that change how unmodified cursor and keypad keys are encoded:
+/// DECCKM (`CSI ? 1 h` — "Application Cursor Keys") and DECPAM
+/// (`ESC =` — "Application Keypad"). Apps like `less`, `vim`, `top`,
+/// and `htop` enable DECCKM through terminfo's `smkx` capability; in that
+/// state unmodified arrow / Home / End must be reported as SS3 sequences
+/// (`\x1bOA` etc.) rather than the default CSI form (`\x1b[A`), matching
+/// xterm and alacritty.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TerminalMode {
+    /// Negotiated Kitty progressive-enhancement flags.
+    pub kitty: KittyFlags,
+    /// `true` while DECCKM is set (cursor keys send SS3).
+    pub app_cursor: bool,
+    /// `true` while DECPAM is set (numpad keys send SS3).
+    pub app_keypad: bool,
+}
+
+impl TerminalMode {
+    /// Pure-legacy state: no Kitty flags, no application modes.
+    #[must_use]
+    pub const fn legacy() -> Self {
+        Self { kitty: KittyFlags::legacy_set(), app_cursor: false, app_keypad: false }
+    }
+}
+
 /// Translate a winit key event into either terminal bytes or a layout command.
 ///
 /// Priority: layout shortcuts → settings/find → terminal shortcuts → generic key translation.
@@ -508,7 +536,7 @@ pub fn translate_key_action(
     event: &KeyEvent,
     modifiers: ModifiersState,
     bindings: &Bindings,
-    flags: KittyFlags,
+    mode: TerminalMode,
 ) -> Option<KeyAction> {
     // Levels 1–3 (layout shortcuts, palette/settings/find, terminal
     // shortcuts) are press-only and unaffected by the keyboard protocol.
@@ -536,7 +564,7 @@ pub fn translate_key_action(
     }
 
     // Level 4: generic terminal key translation with modifier encoding.
-    translate_key(event, modifiers, flags).map(KeyAction::Terminal)
+    translate_key(event, modifiers, mode).map(KeyAction::Terminal)
 }
 
 /// Translate a winit key event into terminal byte sequences.
@@ -548,28 +576,45 @@ pub fn translate_key_action(
 /// - Modified Enter in kitty mode → CSI-u sequence
 /// - Modifier+named-key → xterm modifier-encoded escape sequence
 ///
+/// Cursor / keypad encoding follows the DEC private modes carried in `mode`:
+/// when DECCKM is active, unmodified arrows / Home / End use SS3 form
+/// (`\x1bOA`); when DECPAM is active, unmodified numpad-located keys use
+/// SS3 form (`\x1bOp`–`\x1bOy`, `\x1bOM`, …). Modified arrows always use
+/// CSI form because SS3 has no slot for the xterm modifier parameter.
+///
 /// Returns `None` if the key should be ignored (key-up events,
 /// unrecognised keys, or modifier-only keys).
 pub fn translate_key(
     event: &KeyEvent,
     modifiers: ModifiersState,
-    flags: KittyFlags,
+    mode: TerminalMode,
 ) -> Option<Vec<u8>> {
-    // Legacy fast path: when no enhancement flag is negotiated, behavior is
-    // byte-identical to the pre-feature implementation (SC-003 / T011). The
-    // press-only gate and the exact legacy branches below are untouched.
-    if flags.legacy() {
+    // DECPAM-gated SS3 form for numpad keys. Press-only and only when no
+    // modifier is held; modified numpad chords still travel through the
+    // normal Kitty/legacy paths so the user's modifier reporting is
+    // preserved.
+    if mode.app_keypad && event.state == ElementState::Pressed && modifiers.is_empty() {
+        if let Some(bytes) = translate_numpad_app_keypad(event) {
+            return Some(bytes);
+        }
+    }
+
+    // Legacy fast path: when no Kitty enhancement flag is negotiated,
+    // behaviour is byte-identical to the pre-feature implementation
+    // (SC-003 / T011) modulo the DEC private modes above. The press-only
+    // gate and the exact legacy branches below are untouched.
+    if mode.kitty.legacy() {
         if event.state != ElementState::Pressed {
             return None;
         }
         return match &event.logical_key {
             Key::Character(c) => translate_character_with_modifiers(c, modifiers),
-            Key::Named(named) => translate_named_legacy(*named, modifiers),
+            Key::Named(named) => translate_named_legacy(*named, modifiers, mode.app_cursor),
             _ => None,
         };
     }
 
-    translate_key_kitty(event, modifiers, flags)
+    translate_key_kitty(event, modifiers, mode)
 }
 
 /// Check for layout shortcuts using the provided bindings.
@@ -693,7 +738,11 @@ fn char_to_control_byte(c: &str) -> Option<u8> {
 ///
 /// Used only when no Kitty enhancement flag is negotiated. The Kitty path
 /// lives in [`translate_named_kitty`].
-fn translate_named_legacy(named: NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
+fn translate_named_legacy(
+    named: NamedKey,
+    modifiers: ModifiersState,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
     // Drop Cmd/Super combos that didn't match any binding — on macOS these are
     // OS-level shortcuts and sending wrong PTY sequences would be incorrect.
     if modifiers.super_key() {
@@ -707,7 +756,7 @@ fn translate_named_legacy(named: NamedKey, modifiers: ModifiersState) -> Option<
     // Compute xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4).
     let modifier_param = xterm_modifier_param(modifiers);
 
-    translate_named_csi_letter(named, modifier_param)
+    translate_named_csi_letter(named, modifier_param, app_cursor)
         .or_else(|| translate_named_csi_tilde(named, modifier_param))
         .or_else(|| translate_named_function_key(named, modifier_param))
 }
@@ -753,12 +802,76 @@ fn translate_named_special(named: NamedKey, modifiers: ModifiersState) -> Option
     }
 }
 
-fn translate_named_csi_letter(named: NamedKey, modifier_param: Option<u8>) -> Option<Vec<u8>> {
-    csi_letter_for_named(named).map(|letter| build_csi_letter_seq(letter, modifier_param))
+fn translate_named_csi_letter(
+    named: NamedKey,
+    modifier_param: Option<u8>,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
+    csi_letter_for_named(named).map(|letter| {
+        // DECCKM: unmodified arrows / Home / End travel as SS3 (`\x1bO<letter>`).
+        // Modified chords keep the CSI form because SS3 carries no modifier
+        // parameter, matching xterm and alacritty's default bindings.
+        if app_cursor && modifier_param.is_none() {
+            vec![0x1b, b'O', letter]
+        } else {
+            build_csi_letter_seq(letter, modifier_param)
+        }
+    })
 }
 
 fn translate_named_csi_tilde(named: NamedKey, modifier_param: Option<u8>) -> Option<Vec<u8>> {
     csi_tilde_code_for_named(named).map(|code| build_csi_tilde_seq(code, modifier_param))
+}
+
+/// Map a numpad-located key event to its DECPAM SS3 sequence, or `None`
+/// when the event is not a numpad key or has no DECPAM encoding.
+///
+/// xterm/DEC application-keypad table:
+///
+/// | Key             | SS3            |
+/// |-----------------|----------------|
+/// | `0`..`9`        | `\x1bOp`..`\x1bOy` |
+/// | `.`             | `\x1bOn`       |
+/// | `,`             | `\x1bOl`       |
+/// | `-`             | `\x1bOm`       |
+/// | `+`             | `\x1bOk`       |
+/// | `*`             | `\x1bOj`       |
+/// | `/`             | `\x1bOo`       |
+/// | `=`             | `\x1bOX`       |
+/// | Enter (numpad)  | `\x1bOM`       |
+fn translate_numpad_app_keypad(event: &KeyEvent) -> Option<Vec<u8>> {
+    if event.location != KeyLocation::Numpad {
+        return None;
+    }
+    let letter = match &event.logical_key {
+        Key::Character(c) => numpad_char_ss3_letter(c.as_ref())?,
+        Key::Named(NamedKey::Enter) => b'M',
+        _ => return None,
+    };
+    Some(vec![0x1b, b'O', letter])
+}
+
+fn numpad_char_ss3_letter(c: &str) -> Option<u8> {
+    match c {
+        "0" => Some(b'p'),
+        "1" => Some(b'q'),
+        "2" => Some(b'r'),
+        "3" => Some(b's'),
+        "4" => Some(b't'),
+        "5" => Some(b'u'),
+        "6" => Some(b'v'),
+        "7" => Some(b'w'),
+        "8" => Some(b'x'),
+        "9" => Some(b'y'),
+        "." => Some(b'n'),
+        "," => Some(b'l'),
+        "-" => Some(b'm'),
+        "+" => Some(b'k'),
+        "*" => Some(b'j'),
+        "/" => Some(b'o'),
+        "=" => Some(b'X'),
+        _ => None,
+    }
 }
 
 fn translate_named_function_key(named: NamedKey, modifier_param: Option<u8>) -> Option<Vec<u8>> {
@@ -1068,12 +1181,12 @@ fn kitty_event_type(event: &KeyEvent, flags: KittyFlags) -> Option<u8> {
 fn translate_key_kitty(
     event: &KeyEvent,
     modifiers: ModifiersState,
-    flags: KittyFlags,
+    mode: TerminalMode,
 ) -> Option<Vec<u8>> {
     // Without event-type reporting, only key presses generate bytes — a
     // release/repeat is indistinguishable from a press on the wire, so
     // emitting it would double-send the key.
-    if !flags.report_event_types() && event.state != ElementState::Pressed {
+    if !mode.kitty.report_event_types() && event.state != ElementState::Pressed {
         return None;
     }
 
@@ -1090,8 +1203,8 @@ fn translate_key_kitty(
     }
 
     match &event.logical_key {
-        Key::Character(c) => translate_character_kitty(event, c, modifiers, flags),
-        Key::Named(named) => translate_named_kitty(event, *named, modifiers, flags),
+        Key::Character(c) => translate_character_kitty(event, c, modifiers, mode.kitty),
+        Key::Named(named) => translate_named_kitty(event, *named, modifiers, mode),
         _ => None,
     }
 }
@@ -1141,8 +1254,9 @@ fn translate_named_kitty(
     event: &KeyEvent,
     named: NamedKey,
     modifiers: ModifiersState,
-    flags: KittyFlags,
+    mode: TerminalMode,
 ) -> Option<Vec<u8>> {
+    let flags = mode.kitty;
     let modifier_param = xterm_modifier_param(modifiers);
     let event_type = kitty_event_type(event, flags);
 
@@ -1176,11 +1290,12 @@ fn translate_named_kitty(
     }
 
     // No enhancement forces CSI-u for this key: fall back to the exact legacy
-    // named-key encoding (press-only, like before).
+    // named-key encoding (press-only, like before). The legacy encoder still
+    // honours DECCKM for arrows / Home / End via `mode.app_cursor`.
     if event.state != ElementState::Pressed {
         return None;
     }
-    translate_named_legacy(named, modifiers)
+    translate_named_legacy(named, modifiers, mode.app_cursor)
 }
 
 /// Resolve the unshifted base Unicode codepoint for a character key.
@@ -1335,4 +1450,110 @@ const fn is_kitty_modifier_codepoint(codepoint: u32) -> bool {
         codepoint,
         57441 | 57447 | 57442 | 57448 | 57443 | 57449 | 57444 | 57450 | 57358 | 57360
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------------
+    // DECCKM (`APP_CURSOR`) — arrows / Home / End under Application Cursor
+    // Keys mode emit SS3 (`\x1bO<letter>`) instead of CSI (`\x1b[<letter>`)
+    // when no modifier is held. Modified chords always use CSI because SS3
+    // carries no modifier parameter (xterm convention).
+    // ---------------------------------------------------------------------
+
+    fn csi_letter(named: NamedKey, modifier_param: Option<u8>, app_cursor: bool) -> Vec<u8> {
+        translate_named_csi_letter(named, modifier_param, app_cursor).expect("csi-letter key")
+    }
+
+    #[test]
+    fn arrow_keys_emit_csi_form_when_app_cursor_off() {
+        assert_eq!(csi_letter(NamedKey::ArrowUp, None, false), b"\x1b[A");
+        assert_eq!(csi_letter(NamedKey::ArrowDown, None, false), b"\x1b[B");
+        assert_eq!(csi_letter(NamedKey::ArrowRight, None, false), b"\x1b[C");
+        assert_eq!(csi_letter(NamedKey::ArrowLeft, None, false), b"\x1b[D");
+        assert_eq!(csi_letter(NamedKey::Home, None, false), b"\x1b[H");
+        assert_eq!(csi_letter(NamedKey::End, None, false), b"\x1b[F");
+    }
+
+    #[test]
+    fn arrow_keys_emit_ss3_form_when_app_cursor_on_and_unmodified() {
+        // Regression for the `less` / `vim` / `top` arrow-key bug: when
+        // DECCKM is active, bare arrows must travel as SS3 so pagers can
+        // recognise them via terminfo's `kcuu1=\EOA` capability.
+        assert_eq!(csi_letter(NamedKey::ArrowUp, None, true), b"\x1bOA");
+        assert_eq!(csi_letter(NamedKey::ArrowDown, None, true), b"\x1bOB");
+        assert_eq!(csi_letter(NamedKey::ArrowRight, None, true), b"\x1bOC");
+        assert_eq!(csi_letter(NamedKey::ArrowLeft, None, true), b"\x1bOD");
+        assert_eq!(csi_letter(NamedKey::Home, None, true), b"\x1bOH");
+        assert_eq!(csi_letter(NamedKey::End, None, true), b"\x1bOF");
+    }
+
+    #[test]
+    fn modified_arrows_always_use_csi_even_under_app_cursor() {
+        // Shift = param 2, Alt = 3, Ctrl = 5. SS3 has no slot for these,
+        // so xterm-strict behaviour keeps the CSI form regardless of
+        // DECCKM. Any held modifier defeats the SS3 path.
+        for modifier_param in [Some(2u8), Some(3), Some(5), Some(8)] {
+            assert_eq!(
+                csi_letter(NamedKey::ArrowUp, modifier_param, true),
+                csi_letter(NamedKey::ArrowUp, modifier_param, false),
+                "DECCKM must not change the modified-arrow encoding",
+            );
+        }
+        assert_eq!(csi_letter(NamedKey::ArrowUp, Some(2), true), b"\x1b[1;2A");
+        assert_eq!(csi_letter(NamedKey::ArrowDown, Some(5), true), b"\x1b[1;5B");
+        assert_eq!(csi_letter(NamedKey::Home, Some(2), true), b"\x1b[1;2H");
+    }
+
+    // ---------------------------------------------------------------------
+    // DECPAM (`APP_KEYPAD`) — numeric keypad keys emit SS3 forms when the
+    // terminal is in Application Keypad mode, per the xterm/DEC table.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn numpad_app_keypad_letter_table_matches_xterm() {
+        // Digits map onto the SS3 `p`..`y` range.
+        for (digit, expected) in [
+            ("0", b'p'),
+            ("1", b'q'),
+            ("2", b'r'),
+            ("3", b's'),
+            ("4", b't'),
+            ("5", b'u'),
+            ("6", b'v'),
+            ("7", b'w'),
+            ("8", b'x'),
+            ("9", b'y'),
+        ] {
+            assert_eq!(numpad_char_ss3_letter(digit), Some(expected), "digit {digit}");
+        }
+        // Math / decimal punctuation.
+        assert_eq!(numpad_char_ss3_letter("."), Some(b'n'));
+        assert_eq!(numpad_char_ss3_letter(","), Some(b'l'));
+        assert_eq!(numpad_char_ss3_letter("-"), Some(b'm'));
+        assert_eq!(numpad_char_ss3_letter("+"), Some(b'k'));
+        assert_eq!(numpad_char_ss3_letter("*"), Some(b'j'));
+        assert_eq!(numpad_char_ss3_letter("/"), Some(b'o'));
+        assert_eq!(numpad_char_ss3_letter("="), Some(b'X'));
+        // Anything else returns None so the caller falls through to the
+        // generic encoder.
+        assert_eq!(numpad_char_ss3_letter("a"), None);
+        assert_eq!(numpad_char_ss3_letter(""), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // TerminalMode wiring — confirm the legacy default has DECCKM/DECPAM
+    // off, so the SS3 paths only activate when a pane actually negotiates
+    // them.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn terminal_mode_legacy_default_disables_application_modes() {
+        let mode = TerminalMode::legacy();
+        assert!(mode.kitty.legacy());
+        assert!(!mode.app_cursor);
+        assert!(!mode.app_keypad);
+    }
 }

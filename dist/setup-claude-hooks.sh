@@ -11,7 +11,7 @@ set -euo pipefail
 # All Scribe hook commands resolve at runtime to:
 #   <install_prefix>/ai-hook-claude.sh <event-name>
 # where <install_prefix> is /usr/share/scribe, /usr/share/scribe-dev, the
-# macOS bundle Resources/dist directory, or whatever
+# macOS bundle Resources directory, or whatever
 # SCRIBE_INSTALL_PREFIX points to.
 #
 # Idempotent: safe to run multiple times. Removes Scribe-owned hooks
@@ -54,8 +54,8 @@ def find_scribe_install_prefix():
         "/usr/share/scribe-dev",
         "/usr/local/share/scribe",
         "/usr/local/share/scribe-dev",
-        "/Applications/Scribe.app/Contents/Resources/dist",
-        "/Applications/Scribe-Dev.app/Contents/Resources/dist",
+        "/Applications/Scribe.app/Contents/Resources",
+        "/Applications/Scribe-Dev.app/Contents/Resources",
     ):
         if os.path.isfile(os.path.join(p, "ai-hook-claude.sh")):
             return p

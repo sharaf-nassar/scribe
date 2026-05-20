@@ -1509,11 +1509,9 @@ async fn try_cold_restart_recovery(
         ?stale,
         "scribe-server connect timed out with stale server processes still alive; forcing cold restart"
     );
-    perform_macos_update_restart().map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("cold-restart recovery after connect timeout failed: {e}").into()
-        },
-    )?;
+    perform_macos_update_restart().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("cold-restart recovery after connect timeout failed: {e}").into()
+    })?;
 
     let stream = tokio::net::UnixStream::connect(socket_path).await.map_err(
         |e| -> Box<dyn std::error::Error + Send + Sync> {

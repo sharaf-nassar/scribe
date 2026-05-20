@@ -127,6 +127,12 @@ cp "${DIST_DIR}/ai-hook-statusline.sh" "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/setup-claude-hooks.sh" "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/ai-hook-codex.sh"      "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/setup-codex-hooks.sh"  "${RESOURCES_DIR}/"
+chmod 755 \
+    "${RESOURCES_DIR}/ai-hook-claude.sh" \
+    "${RESOURCES_DIR}/ai-hook-statusline.sh" \
+    "${RESOURCES_DIR}/setup-claude-hooks.sh" \
+    "${RESOURCES_DIR}/ai-hook-codex.sh" \
+    "${RESOURCES_DIR}/setup-codex-hooks.sh"
 cp -R "${DIST_DIR}/shell-integration" "${RESOURCES_DIR}/"
 cp "${DIST_DIR}/macos/com.scribe.server.plist" "${RESOURCES_DIR}/"
 

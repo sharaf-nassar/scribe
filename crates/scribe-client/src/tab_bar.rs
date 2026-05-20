@@ -523,7 +523,8 @@ impl TabBarWriter<'_, '_> {
     }
 
     /// Render the workspace badge: accent-coloured cell (leading space + name + trailing space)
-    /// followed by a 16px gap.
+    /// extending through a trailing 16px gap so the accent runs uninterrupted
+    /// up to the next tab's boundary.
     fn render_badge(
         &mut self,
         mut col: usize,
@@ -531,14 +532,20 @@ impl TabBarWriter<'_, '_> {
         accent_color: Option<[f32; 4]>,
     ) -> usize {
         let bg = self.params.colors.bg;
+        let gap = gap_columns(16.0, self.cell_w());
 
         if let Some(accent) = accent_color {
             // Named workspace: render accent-coloured pill with high-contrast text.
+            // The pill quad spans `space + name + space + gap` so the accent
+            // fills the entire `badge_columns` allocation — stopping the fill
+            // at the end of the text leaves a visible uncoloured strip between
+            // the badge and the next tab.
             let pill_start_col = col;
             let pill_char_count = 1 + ws_name.chars().count() + 1;
+            let total_badge_cols = pill_char_count + gap;
             let pill_bg = [accent[0], accent[1], accent[2], 0.25];
 
-            let pill_width = columns_to_pixels(pill_char_count, self.cell_w());
+            let pill_width = columns_to_pixels(total_badge_cols, self.cell_w());
             let pill_x = self.params.rect.x + columns_to_pixels(pill_start_col, self.cell_w());
             self.instances.push(solid_quad(
                 pill_x,
@@ -555,20 +562,23 @@ impl TabBarWriter<'_, '_> {
                 col = self.emit_char(ch, col, text_fg, pill_bg);
             }
             col = self.emit_char(' ', col, text_fg, pill_bg);
+            // Trailing gap cells keep the accent — emit as spaces with
+            // pill_bg so the cell-bg pass doesn't punch through the quad.
+            for _ in 0..gap {
+                col = self.emit_char(' ', col, text_fg, pill_bg);
+            }
         } else {
-            // Unnamed workspace: render plain muted text, no pill background.
+            // Unnamed workspace: render plain muted text, no pill background;
+            // the trailing gap reverts to the normal tab-bar bg.
             let text_fg = self.params.colors.text;
             col = self.emit_char(' ', col, text_fg, bg);
             for ch in ws_name.chars() {
                 col = self.emit_char(ch, col, text_fg, bg);
             }
             col = self.emit_char(' ', col, text_fg, bg);
-        }
-
-        // 16px gap after badge (approximately 2 cell widths), reverting to normal bg.
-        let gap = gap_columns(16.0, self.cell_w());
-        for _ in 0..gap {
-            col = self.emit_char(' ', col, self.params.colors.text, bg);
+            for _ in 0..gap {
+                col = self.emit_char(' ', col, text_fg, bg);
+            }
         }
 
         col

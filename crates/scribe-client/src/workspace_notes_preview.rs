@@ -27,6 +27,15 @@ const AFFORDANCE_RIGHT_INSET: usize = 1;
 const MIN_EDITOR_ROWS: usize = 1;
 /// Maximum cells of error text rendered next to the editor row.
 const MAX_EDITOR_ERROR_CHARS: usize = 64;
+/// Leading indent (in cells) reserved by the inline editor for its accent '›'
+/// prefix glyph + one separating space. The prefix marks the row as a text-
+/// entry zone (Linear/Notion-style prompt indicator). Wrapped continuation
+/// lines inherit the same indent so the caret column aligns across rows.
+const EDITOR_PREFIX_COLS: usize = 2;
+/// Width (in pixels) of the accent bar drawn on the left edge of a hovered
+/// note row. Sits inside `PAD_COLS` of preview padding so it never overlaps
+/// the row's `- text` glyphs.
+const HOVER_ACCENT_BAR_W: f32 = 2.0;
 
 pub struct WorkspaceNotesPreviewBuildContext<'a> {
     pub out: &'a mut Vec<CellInstance>,
@@ -107,7 +116,9 @@ pub fn build_workspace_notes_preview(
     // FR-022 first input: snap scroll-to-caret using the layout's actual content
     // width and editor row budget — not an external estimate — so the caret is
     // always brought into view regardless of how the layout clamped `cols`.
-    let content_cols = layout.cols.saturating_sub(PAD_COLS * 2).max(1);
+    // EDITOR_PREFIX_COLS is subtracted so the wrap geometry matches what
+    // `draw_editor_text` actually renders to the indented text area.
+    let content_cols = layout.cols.saturating_sub(PAD_COLS * 2 + EDITOR_PREFIX_COLS).max(1);
     if let Some(state) = inline_editor.as_deref_mut() {
         state.clamp_scroll_to_caret(content_cols, layout.editor_rows.max(1));
     }
@@ -190,7 +201,7 @@ impl PreviewLayout {
             .unwrap_or("No active notes".chars().count());
         let editor_longest_line =
             inline_editor.map_or(0, |state| longest_visible_line_chars(&state.draft_text));
-        let longest = longest.max(editor_longest_line.saturating_add(2));
+        let longest = longest.max(editor_longest_line.saturating_add(EDITOR_PREFIX_COLS));
         let cols = longest.saturating_add(PAD_COLS * 2).clamp(MIN_PREVIEW_COLS, MAX_PREVIEW_COLS);
         let visible_note_rows =
             if summaries.is_empty() { 0 } else { summaries.len().min(MAX_PREVIEW_ROWS) };
@@ -201,7 +212,7 @@ impl PreviewLayout {
         // Read-only layout reserves: 1 top pad + note_zone + 1 spacer + 1 affordance + 1 bottom pad
         // Editing layout reserves:    1 top pad + note_zone + 1 spacer + editor_rows (+1 if error) + 1 bottom pad
         let editor_rows = inline_editor.map_or(0, |state| {
-            let content_width = cols.saturating_sub(PAD_COLS * 2).max(1);
+            let content_width = cols.saturating_sub(PAD_COLS * 2 + EDITOR_PREFIX_COLS).max(1);
             let needed = wrapped_row_count(&state.draft_text, content_width);
             let cap = max_editor_rows.unwrap_or(MAX_PREVIEW_ROWS).max(MIN_EDITOR_ROWS);
             needed.max(MIN_EDITOR_ROWS).min(cap)
@@ -302,12 +313,15 @@ impl PreviewLayout {
 struct PreviewColors {
     bg: [f32; 4],
     border: [f32; 4],
-    row_hover_bg: [f32; 4],
+    /// Tint fill for the "+" affordance button when hovered. Note rows no
+    /// longer use a row-wide tint (see `draw_row_hover`) — only the
+    /// affordance keeps a small tinted fill so it reads as a clickable
+    /// button-shaped target.
+    affordance_hover_bg: [f32; 4],
     text: [f32; 4],
     hover_text: [f32; 4],
     muted: [f32; 4],
     accent: [f32; 4],
-    editor_bg: [f32; 4],
     error_text: [f32; 4],
 }
 
@@ -316,12 +330,11 @@ impl PreviewColors {
         Self {
             bg: srgb_to_linear_rgba(with_alpha(lighten(chrome.tab_bar_bg, 0.018), 0.96)),
             border: srgb_to_linear_rgba(with_alpha(chrome.tab_separator, 0.92)),
-            row_hover_bg: srgb_to_linear_rgba(with_alpha(chrome.accent, 0.22)),
+            affordance_hover_bg: srgb_to_linear_rgba(with_alpha(chrome.accent, 0.30)),
             text: srgb_to_linear_rgba(chrome.tab_text),
             hover_text: srgb_to_linear_rgba(chrome.tab_text_active),
             muted: srgb_to_linear_rgba(with_alpha(chrome.tab_text, 0.64)),
             accent: srgb_to_linear_rgba(chrome.accent),
-            editor_bg: srgb_to_linear_rgba(with_alpha(lighten(chrome.tab_bar_bg, 0.040), 0.98)),
             error_text: srgb_to_linear_rgba(with_alpha(chrome.accent, 0.92)),
         }
     }
@@ -399,7 +412,7 @@ impl PreviewRenderer<'_, '_> {
         let width = grid_width(AFFORDANCE_COLS, cell_w);
         let height = cell_h;
         let (bg_color, border_color, glyph_fg) = if hovered {
-            (self.colors.row_hover_bg, self.colors.accent, self.colors.hover_text)
+            (self.colors.affordance_hover_bg, self.colors.accent, self.colors.hover_text)
         } else {
             (self.colors.bg, self.colors.border, self.colors.muted)
         };
@@ -425,23 +438,19 @@ impl PreviewRenderer<'_, '_> {
         let editor_w = (self.layout.rect.width - 2.0).max(0.0);
         let editor_h = grid_height(editor_rows, cell_h);
 
-        // Editor background — slightly elevated to read as editable.
+        // Underline-only treatment: a single 1px line directly below the
+        // editor's text cells (in the preview's bottom-pad row, not inside
+        // the cell). Placing it at the very last px of the editor cell would
+        // get punched through by glyph descenders since `emit_text` cells
+        // occupy a full `cell_w × cell_h` rect per the renderer's CellInstance
+        // contract (`size: [0,0]` ⇒ uniform cell size).
         self.push_solid_rect(
-            Rect { x: editor_x, y: editor_y, width: editor_w, height: editor_h },
-            self.colors.editor_bg,
-        );
-        // Editor border (top + bottom edges).
-        self.push_solid_rect(
-            Rect { x: editor_x, y: editor_y, width: editor_w, height: 1.0 },
-            self.colors.border,
-        );
-        self.push_solid_rect(
-            Rect { x: editor_x, y: editor_y + editor_h - 1.0, width: editor_w, height: 1.0 },
+            Rect { x: editor_x, y: editor_y + editor_h, width: editor_w, height: 1.0 },
             self.colors.border,
         );
 
         // Render wrapped lines.
-        let content_cols = self.content_cols().max(1);
+        let content_cols = self.editor_content_cols();
         let wrapped = wrap_text_for_editor(&state.draft_text, content_cols);
         let total_lines = wrapped.len();
         let scroll = state.scroll_offset_rows.min(total_lines.saturating_sub(editor_rows));
@@ -493,16 +502,22 @@ impl PreviewRenderer<'_, '_> {
         } = args;
         let cell_w = self.cell_size.0;
         let cell_h = self.cell_size.1;
+        // Accent '›' prompt on the editor's first visual row only — it is a
+        // fixed prompt indicator, not a per-row bullet. Wrapped continuation
+        // rows inherit the indent (via EDITOR_PREFIX_COLS) so the caret column
+        // stays consistent across rows.
+        self.emit_text("›", start_row, PAD_COLS, self.colors.accent);
+        let text_col = PAD_COLS + EDITOR_PREFIX_COLS;
         for visual_idx in 0..editor_rows {
             let line_index = scroll + visual_idx;
             let Some(line) = wrapped.get(line_index) else { continue };
             let row = start_row + visual_idx;
-            self.emit_text(line, row, PAD_COLS, self.colors.text);
+            self.emit_text(line, row, text_col, self.colors.text);
             if line_index != caret_line_idx {
                 continue;
             }
             let caret_col = caret_visible_col(&state.draft_text, state.caret_byte, content_cols);
-            let caret_x = self.layout.rect.x + grid_width(PAD_COLS + caret_col, cell_w);
+            let caret_x = self.layout.rect.x + grid_width(text_col + caret_col, cell_w);
             let caret_y = self.layout.rect.y + grid_height(row, cell_h);
             self.push_solid_rect(
                 Rect { x: caret_x, y: caret_y, width: 1.5, height: cell_h },
@@ -541,15 +556,21 @@ impl PreviewRenderer<'_, '_> {
         self.layout.cols.saturating_sub(PAD_COLS * 2)
     }
 
+    fn editor_content_cols(&self) -> usize {
+        self.layout.cols.saturating_sub(PAD_COLS * 2 + EDITOR_PREFIX_COLS).max(1)
+    }
+
     fn draw_row_hover(&mut self, row: usize) {
+        let cell_h = self.cell_size.1;
+        let x = self.layout.rect.x + 1.0;
+        let y = self.layout.rect.y + grid_height(row, cell_h);
+        let width = (self.layout.rect.width - 2.0).max(0.0);
+        // Hover signal is the accent bar alone (no row tint) — the bar marks
+        // the row before the "- text" glyphs without changing the row's
+        // background, and brighter `hover_text` carries the contrast cue.
         self.push_solid_rect(
-            Rect {
-                x: self.layout.rect.x + 1.0,
-                y: self.layout.rect.y + grid_height(row, self.cell_size.1),
-                width: (self.layout.rect.width - 2.0).max(0.0),
-                height: self.cell_size.1,
-            },
-            self.colors.row_hover_bg,
+            Rect { x, y, width: HOVER_ACCENT_BAR_W.min(width), height: cell_h },
+            self.colors.accent,
         );
     }
 
