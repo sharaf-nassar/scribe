@@ -754,30 +754,6 @@ fn perform_linux_update_restart(client_exe: &Path) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn connected_server_pid() -> Result<Option<i32>, String> {
-    use nix::sys::socket::{getsockopt, sockopt};
-
-    let stream = match std::os::unix::net::UnixStream::connect(server_socket_path()) {
-        Ok(stream) => stream,
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound
-                    | std::io::ErrorKind::ConnectionRefused
-                    | std::io::ErrorKind::ConnectionReset
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(e) => return Err(format!("failed to connect to server socket: {e}")),
-    };
-
-    getsockopt(&stream, sockopt::LocalPeerPid)
-        .map(Some)
-        .map_err(|e| format!("failed to query running server pid: {e}"))
-}
-
-#[cfg(target_os = "macos")]
 fn terminate_pid(pid: i32, label: &str) -> Result<(), String> {
     let pid_str = pid.to_string();
     let status = std::process::Command::new("kill")
@@ -809,14 +785,36 @@ fn terminate_pid(pid: i32, label: &str) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn perform_macos_update_restart() -> Result<(), String> {
-    if let Some(pid) = connected_server_pid()? {
-        terminate_pid(pid, "scribe-server")?;
+    // Find every scribe-server process other than ourselves and terminate them.
+    // pgrep is the canonical signal because querying the IPC socket can fail
+    // when the old server's accept loop is wedged (process alive but ECONNREFUSED) —
+    // exactly the case this fallback exists to recover from.
+    let identity = current_identity();
+    let current_pid = std::process::id();
+    let server_pids = listed_process_pids(identity.server_binary_name())?
+        .into_iter()
+        .filter(|pid| *pid != current_pid)
+        .collect::<Vec<_>>();
+
+    for pid in &server_pids {
+        if let Err(e) = terminate_pid(*pid as i32, "scribe-server") {
+            tracing::warn!(pid = *pid, "failed to terminate stale scribe-server: {e}");
+        }
     }
 
     let _ = std::fs::remove_file(server_socket_path());
     let _ = std::fs::remove_file(handoff_socket_path());
 
-    platform_start_server()?;
+    // Use `start_server_via_launchctl(true)` (kickstart -k) rather than
+    // `platform_start_server()` so launchctl unconditionally kills any
+    // KeepAlive-respawned instance and starts a fresh one. With `false`,
+    // kickstart is a no-op when launchctl has already restarted the dead
+    // service between our `terminate_pid` calls and now — leaving a server
+    // whose socket file we just removed.
+    start_server_via_launchctl(true).or_else(|e| {
+        tracing::warn!("launchctl kickstart -k failed ({e}), falling back to direct spawn");
+        start_server_directly(false)
+    })?;
     wait_for_server_ready(SERVER_STARTUP_TIMEOUT)
 }
 
@@ -1417,7 +1415,15 @@ async fn wait_for_refreshed_server(
                     format!("cold-restart fallback after handoff timeout failed: {e}").into()
                 },
             )?;
-            return Box::pin(wait_for_server_connection(socket_path, SERVER_STARTUP_TIMEOUT)).await;
+            // perform_macos_update_restart already waited for the new server to
+            // become ready, so a single direct connect should succeed. Skip
+            // wait_for_server_connection so its own timeout-fallback can't try
+            // to cold-restart the server we just spawned.
+            return tokio::net::UnixStream::connect(socket_path).await.map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("connect after handoff cold-restart failed: {e}").into()
+                },
+            );
         }
     }
 }
@@ -1459,6 +1465,10 @@ async fn wait_for_server_connection(
         }
 
         if tokio::time::Instant::now() >= deadline {
+            #[cfg(target_os = "macos")]
+            if let Some(stream) = try_cold_restart_recovery(socket_path).await? {
+                return Ok(stream);
+            }
             return Err(format!(
                 "scribe-server did not become ready within {}s",
                 timeout.as_secs()
@@ -1466,6 +1476,51 @@ async fn wait_for_server_connection(
             .into());
         }
     }
+}
+
+/// Last-ditch recovery when `wait_for_server_connection` times out.
+///
+/// Covers the case where a stuck old scribe-server is alive enough to hold
+/// `server.lock` (blocking fresh starts) but its IPC accept loop has died
+/// (so `connect()` returns ECONNREFUSED). In that state `refresh_stale_connected_server`
+/// never fires — the initial connect fails before the staleness check can run —
+/// and the spawned fresh server crashes on `flock` while the client polls in
+/// vain. Resolution: `pgrep` for any non-current scribe-server, terminate
+/// them, then run `perform_macos_update_restart` to clear sockets and start a
+/// fresh server. Returns `None` when no stale processes exist so legitimate
+/// startup timeouts still surface as errors.
+#[cfg(target_os = "macos")]
+async fn try_cold_restart_recovery(
+    socket_path: &Path,
+) -> Result<Option<tokio::net::UnixStream>, Box<dyn std::error::Error + Send + Sync>> {
+    let identity = current_identity();
+    let current_pid = std::process::id();
+    let stale: Vec<u32> = listed_process_pids(identity.server_binary_name())
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?
+        .into_iter()
+        .filter(|pid| *pid != current_pid)
+        .collect();
+
+    if stale.is_empty() {
+        return Ok(None);
+    }
+
+    tracing::warn!(
+        ?stale,
+        "scribe-server connect timed out with stale server processes still alive; forcing cold restart"
+    );
+    perform_macos_update_restart().map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("cold-restart recovery after connect timeout failed: {e}").into()
+        },
+    )?;
+
+    let stream = tokio::net::UnixStream::connect(socket_path).await.map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("connect after cold-restart recovery failed: {e}").into()
+        },
+    )?;
+    Ok(Some(stream))
 }
 
 async fn ipc_main(
