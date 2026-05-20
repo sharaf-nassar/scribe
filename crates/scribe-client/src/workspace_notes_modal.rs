@@ -505,10 +505,14 @@ impl WorkspaceNotesModal {
                 TextStyle::new(renderer.colors.button_danger_fg, renderer.colors.modal_bg),
             );
         }
+        // FR-017: modal editor keymap is Enter saves / Ctrl+Enter newline (was
+        // the opposite before this feature). Keep this footer text in sync if
+        // the binding changes again.
+        let hint = "Enter save, Ctrl+Enter newline";
         renderer.emit_text(
-            "Enter newline, Ctrl+Enter save",
+            hint,
             FOOTER_ROW,
-            renderer.layout.modal_cols.saturating_sub(34),
+            renderer.layout.modal_cols.saturating_sub(hint.chars().count() + 4),
             TextStyle::new(renderer.colors.muted_fg, renderer.colors.modal_bg),
         );
     }
