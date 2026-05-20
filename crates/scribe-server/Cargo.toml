@@ -267,6 +267,8 @@ semver.workspace = true
 serde_json.workspace = true
 minisign-verify.workspace = true
 sha2 = "0.10"
+keyring = { workspace = true }
+chacha20poly1305 = { workspace = true }
 
 [dev-dependencies]
 # test-util: provides #[tokio::test] macro for async tests.

@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rust_embed::Embed;
 use scribe_common::{
-    protocol::{ReleaseListResultState, UpdateCheckResultState},
+    protocol::{PreflightError, ReleaseListResultState, UpdateCheckResultState},
     settings_window::{SettingsWindowAnchor, centered_settings_position},
 };
 
@@ -30,6 +30,15 @@ const TRIGGER_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// headroom to land while still flipping to `Failed` for genuinely stuck
 /// requests.
 const RELEASE_LIST_TIMEOUT: Duration = Duration::from_secs(7);
+
+/// Maximum time to wait for an `EnvPreflight` response from the server.
+///
+/// Matches [`RELEASE_LIST_TIMEOUT`]. The preflight is a low-cost keystore
+/// probe but the OS may need a one-time unlock prompt on first access (macOS
+/// Keychain, GNOME Keyring / `KWallet` on Linux), so we give the user some
+/// room before timing out and folding the result into
+/// `EnvPreflightOutcome::Err(PreflightError::Unknown(_))`.
+const ENV_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// Embedded web assets (HTML, CSS, JS) for the settings UI.
 #[derive(Embed)]
@@ -398,6 +407,70 @@ fn inject_release_list_result(
     }
 }
 
+/// Build the JSON payload `window.SCRIBE_ON_ENV_PREFLIGHT_RESULT` expects.
+///
+/// Per `contracts/env-preflight.md` the host sends a flat object with a
+/// boolean `ok` discriminator and a conditional `error` sibling whose
+/// `type` matches the snake-case variant name of [`PreflightError`].
+///
+/// Built manually (not via `serde`) because `PreflightError::Unknown(String)`
+/// is a tuple variant with internal `#[serde(tag = "type")]` tagging that
+/// `serde_json` refuses to serialize; the on-wire msgpack codec
+/// (`rmp_serde`) handles the tuple-variant fine, but the webview-bound JSON
+/// needs the flat `{type, reason?}` shape regardless of how serde would
+/// render the same enum.
+fn env_preflight_payload_json(outcome: &server_action::EnvPreflightOutcome) -> Option<String> {
+    use server_action::EnvPreflightOutcome;
+    let value = match outcome {
+        EnvPreflightOutcome::Ok => serde_json::json!({"ok": true}),
+        EnvPreflightOutcome::Err(e) => serde_json::json!({
+            "ok": false,
+            "error": preflight_error_json(e),
+        }),
+    };
+    serde_json::to_string(&value).ok()
+}
+
+/// Render a single [`PreflightError`] as the inner `error` object the
+/// webview's `envPreflightErrorMessage` switch expects. Carried out manually
+/// for the same reason as [`env_preflight_payload_json`].
+fn preflight_error_json(e: &PreflightError) -> serde_json::Value {
+    match e {
+        PreflightError::KeychainLocked => serde_json::json!({"type": "keychain_locked"}),
+        PreflightError::SecretServiceUnavailable => {
+            serde_json::json!({"type": "secret_service_unavailable"})
+        }
+        PreflightError::KeystoreAccessDenied => {
+            serde_json::json!({"type": "keystore_access_denied"})
+        }
+        PreflightError::Unknown(reason) => {
+            serde_json::json!({"type": "unknown", "reason": reason})
+        }
+    }
+}
+
+/// Push an env-preflight outcome into the webview's
+/// `window.SCRIBE_ON_ENV_PREFLIGHT_RESULT` callback. Always called on the UI
+/// thread (GTK main loop on Linux, the tao event loop on macOS) so
+/// `evaluate_script` is safe.
+fn inject_env_preflight_result(
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+    outcome: &server_action::EnvPreflightOutcome,
+) {
+    let Some(payload) = env_preflight_payload_json(outcome) else {
+        tracing::warn!("failed to serialise EnvPreflightOutcome");
+        return;
+    };
+    let script = format!(
+        "if (typeof window.SCRIBE_ON_ENV_PREFLIGHT_RESULT === 'function') {{ window.SCRIBE_ON_ENV_PREFLIGHT_RESULT({payload}); }}"
+    );
+    if let Some(wv) = webview_ref.borrow().as_ref() {
+        if let Err(e) = wv.evaluate_script(&script) {
+            tracing::warn!("failed to inject env preflight result: {e}");
+        }
+    }
+}
+
 /// Push a native workspace-root picker result into the webview callback.
 /// Always called on the UI thread for the active platform backend.
 fn inject_workspace_root_choice(
@@ -548,6 +621,50 @@ fn dispatch_release_list_request_linux(
     *active_source.borrow_mut() = Some(source_id);
 }
 
+/// Linux: spawn a worker thread to issue an `EnvPreflight` request to the
+/// server, then drain the result back to the webview via a `glib` timeout
+/// source on the GTK main loop.
+///
+/// Mirrors [`dispatch_release_list_request_linux`]: the worker thread cannot
+/// touch the webview directly (the `Rc<RefCell<…>>` reference is `!Send`), so
+/// we hand the outcome back over a `mpsc` channel that a 100 ms `glib`
+/// timeout source polls on the UI thread. A second click while a request is
+/// already in flight cancels the prior poll and starts fresh, just like the
+/// update-check and release-list paths.
+#[cfg(target_os = "linux")]
+fn dispatch_env_preflight_request_linux(
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+    active_source: &ActiveCheckSource,
+) {
+    if let Some(prev) = active_source.borrow_mut().take() {
+        prev.remove();
+    }
+
+    let webview_clone = std::rc::Rc::clone(webview_ref);
+    let active_for_closure = std::rc::Rc::clone(active_source);
+    let (tx, rx) = std::sync::mpsc::channel::<server_action::EnvPreflightOutcome>();
+
+    std::thread::spawn(move || {
+        let outcome = server_action::request_env_preflight(ENV_PREFLIGHT_TIMEOUT);
+        drop(tx.send(outcome));
+    });
+
+    let source_id =
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
+            Ok(outcome) => {
+                inject_env_preflight_result(&webview_clone, &outcome);
+                *active_for_closure.borrow_mut() = None;
+                gtk::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                *active_for_closure.borrow_mut() = None;
+                gtk::glib::ControlFlow::Break
+            }
+        });
+    *active_source.borrow_mut() = Some(source_id);
+}
+
 /// macOS: spawn a worker thread to talk to the server, then deliver the result
 /// as a tao user event so the main event loop can call `evaluate_script` on
 /// the UI thread. Mirrors how the existing `FocusWindow` / `QuitWindow` events
@@ -570,6 +687,19 @@ fn dispatch_release_list_request_macos(proxy: &tao::event_loop::EventLoopProxy<T
     std::thread::spawn(move || {
         let state = server_action::request_release_list(RELEASE_LIST_TIMEOUT);
         drop(proxy.send_event(TaoUserEvent::ReleaseListResult(state)));
+    });
+}
+
+/// macOS: spawn a worker thread to issue an `EnvPreflight` request to the
+/// server, then deliver the outcome as a tao user event so the main event
+/// loop can call `evaluate_script` on the UI thread. Mirrors
+/// [`dispatch_release_list_request_macos`].
+#[cfg(not(target_os = "linux"))]
+fn dispatch_env_preflight_request_macos(proxy: &tao::event_loop::EventLoopProxy<TaoUserEvent>) {
+    let proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let outcome = server_action::request_env_preflight(ENV_PREFLIGHT_TIMEOUT);
+        drop(proxy.send_event(TaoUserEvent::EnvPreflightResult(outcome)));
     });
 }
 
@@ -650,6 +780,7 @@ struct SettingsIpcHandlers<'a> {
     on_trigger_update: &'a dyn Fn(),
     on_request_releases: &'a dyn Fn(),
     on_choose_workspace_root: &'a dyn Fn(),
+    on_request_env_preflight: &'a dyn Fn(),
 }
 
 /// Handle an IPC request from the settings webview.
@@ -678,6 +809,8 @@ fn handle_settings_ipc_request(body: &str, handlers: SettingsIpcHandlers<'_>) {
         (handlers.on_request_releases)();
     } else if kind == "choose_workspace_root" {
         (handlers.on_choose_workspace_root)();
+    } else if kind == "env_preflight" {
+        (handlers.on_request_env_preflight)();
     } else if kind == "setting_changed" {
         (handlers.on_change)(body.to_owned());
     } else if !handle_settings_ipc_action(&kind, body) {
@@ -772,6 +905,7 @@ where
         webview_ref: Rc::new(RefCell::new(None)),
         active_check_source: new_active_check_source(),
         active_release_source: new_active_check_source(),
+        active_env_preflight_source: new_active_check_source(),
     };
     let webview = build_linux_webview(
         LinuxWebviewBuild {
@@ -795,11 +929,12 @@ where
 
     gtk::main();
 
-    // Drop any in-flight manual-check or release-list timeout source before
-    // the webview is dropped, so the closure releases its `Rc<WebView>`
-    // before the underlying widget tears down.
+    // Drop any in-flight manual-check, release-list, or env-preflight timeout
+    // source before the webview is dropped, so the closure releases its
+    // `Rc<WebView>` before the underlying widget tears down.
     cancel_active_check_source(&ctx.active_check_source);
     cancel_active_check_source(&ctx.active_release_source);
+    cancel_active_check_source(&ctx.active_env_preflight_source);
 
     Ok(())
 }
@@ -987,6 +1122,7 @@ struct LinuxWebviewContext {
     webview_ref: std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
     active_check_source: ActiveCheckSource,
     active_release_source: ActiveCheckSource,
+    active_env_preflight_source: ActiveCheckSource,
 }
 
 #[cfg(target_os = "linux")]
@@ -1025,6 +1161,11 @@ fn build_linux_webview<F: Fn(String) + 'static>(
             let on_request_releases = move || {
                 dispatch_release_list_request_linux(&webview_for_releases, &active_for_releases);
             };
+            let webview_for_env = std::rc::Rc::clone(&ctx.webview_ref);
+            let active_for_env = std::rc::Rc::clone(&ctx.active_env_preflight_source);
+            let on_request_env_preflight = move || {
+                dispatch_env_preflight_request_linux(&webview_for_env, &active_for_env);
+            };
             let window_for_picker = window.clone();
             let webview_for_picker = std::rc::Rc::clone(&ctx.webview_ref);
             let on_choose_workspace_root = move || {
@@ -1040,6 +1181,7 @@ fn build_linux_webview<F: Fn(String) + 'static>(
                         on_trigger_update: &on_trigger_update,
                         on_request_releases: &on_request_releases,
                         on_choose_workspace_root: &on_choose_workspace_root,
+                        on_request_env_preflight: &on_request_env_preflight,
                     },
                 );
             }
@@ -1165,6 +1307,10 @@ enum TaoUserEvent {
     /// A worker thread finished a manual release-list request; deliver the
     /// result to the webview on the main thread.
     ReleaseListResult(ReleaseListResultState),
+    /// A worker thread finished an env-persistence preflight request;
+    /// deliver the outcome to the webview on the main thread so the toggle
+    /// can commit or surface the inline error.
+    EnvPreflightResult(server_action::EnvPreflightOutcome),
     /// A native directory picker returned a workspace root path.
     WorkspaceRootChosen(String),
 }
@@ -1357,12 +1503,15 @@ fn build_tao_webview<F: Fn(String) + 'static>(
             let webview_for_ipc = std::rc::Rc::clone(webview_ref);
             let proxy_for_check = event_loop_proxy.clone();
             let proxy_for_releases = event_loop_proxy.clone();
+            let proxy_for_env = event_loop_proxy.clone();
             let proxy_for_workspace_root = event_loop_proxy.clone();
             let on_request_update_check =
                 move || dispatch_check_for_updates_macos(&proxy_for_check);
             let on_trigger_update = || dispatch_trigger_update();
             let on_request_releases =
                 move || dispatch_release_list_request_macos(&proxy_for_releases);
+            let on_request_env_preflight =
+                move || dispatch_env_preflight_request_macos(&proxy_for_env);
             let on_choose_workspace_root =
                 move || dispatch_workspace_root_picker_macos(&proxy_for_workspace_root);
             move |request| {
@@ -1375,6 +1524,7 @@ fn build_tao_webview<F: Fn(String) + 'static>(
                         on_trigger_update: &on_trigger_update,
                         on_request_releases: &on_request_releases,
                         on_choose_workspace_root: &on_choose_workspace_root,
+                        on_request_env_preflight: &on_request_env_preflight,
                     },
                 );
             }
@@ -1444,6 +1594,9 @@ fn handle_tao_event<F: FnOnce(SettingsWindowGeometry)>(
         }
         Event::UserEvent(TaoUserEvent::ReleaseListResult(state)) => {
             inject_release_list_result(webview_ref, &state);
+        }
+        Event::UserEvent(TaoUserEvent::EnvPreflightResult(outcome)) => {
+            inject_env_preflight_result(webview_ref, &outcome);
         }
         Event::UserEvent(TaoUserEvent::WorkspaceRootChosen(path)) => {
             inject_workspace_root_choice(webview_ref, &path);
@@ -1675,5 +1828,52 @@ mod tests {
         assert_eq!(failed["reason"], "rate limited");
         assert!(failed.get("releases").is_none(), "Failed must not carry releases");
         assert!(failed.get("fetched_at").is_none(), "Failed must not carry fetched_at");
+    }
+
+    /// The env-preflight payload mirrors the T033 contract: a flat object
+    /// with a boolean `ok` discriminator and a conditional `error` sibling
+    /// whose `type` is the snake-case variant name of `PreflightError`.
+    /// `Unknown` additionally carries a non-empty `reason` string.
+    ///
+    /// Built manually because `PreflightError::Unknown(String)` is a
+    /// tuple-variant carrying free-form text — `serde_json` rejects the
+    /// internally-tagged tuple-variant shape so the host has to render the
+    /// flat `{type, reason?}` JSON itself.
+    #[test]
+    fn env_preflight_payload_json_matches_contract() {
+        // ok=true: no error field at all.
+        let ok = env_preflight_payload_json(&server_action::EnvPreflightOutcome::Ok)
+            .expect("serialise ok");
+        let ok_v: serde_json::Value = serde_json::from_str(&ok).expect("ok payload is JSON");
+        assert_eq!(ok_v["ok"], serde_json::Value::Bool(true));
+        assert!(ok_v.get("error").is_none(), "ok must not carry an error field");
+
+        // ok=false with structured error: matching snake_case type, no reason.
+        for (err, expected_type) in [
+            (PreflightError::KeychainLocked, "keychain_locked"),
+            (PreflightError::SecretServiceUnavailable, "secret_service_unavailable"),
+            (PreflightError::KeystoreAccessDenied, "keystore_access_denied"),
+        ] {
+            let s = env_preflight_payload_json(&server_action::EnvPreflightOutcome::Err(err))
+                .expect("serialise structured err");
+            let v: serde_json::Value =
+                serde_json::from_str(&s).expect("structured err payload is JSON");
+            assert_eq!(v["ok"], serde_json::Value::Bool(false));
+            assert_eq!(v["error"]["type"], serde_json::Value::String(expected_type.into()));
+            assert!(
+                v["error"].get("reason").is_none(),
+                "{expected_type} must not carry a reason field"
+            );
+        }
+
+        // ok=false with Unknown: carries the diagnostic reason verbatim.
+        let s = env_preflight_payload_json(&server_action::EnvPreflightOutcome::Err(
+            PreflightError::Unknown("d-bus down".into()),
+        ))
+        .expect("serialise unknown err");
+        let v: serde_json::Value = serde_json::from_str(&s).expect("unknown err payload is JSON");
+        assert_eq!(v["ok"], serde_json::Value::Bool(false));
+        assert_eq!(v["error"]["type"], serde_json::Value::String("unknown".into()));
+        assert_eq!(v["error"]["reason"], serde_json::Value::String("d-bus down".into()));
     }
 }

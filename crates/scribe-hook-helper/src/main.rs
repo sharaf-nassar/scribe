@@ -28,6 +28,12 @@ const EMIT_BUDGET: Duration = Duration::from_millis(100);
 #[derive(Parser, Debug)]
 #[command(name = "scribe-hook-helper", disable_help_flag = true, disable_version_flag = true)]
 struct Cli {
+    /// AI provider id, one of `claude_code`, `codex_code`, or the
+    /// synthetic `system` value used for non-AI events
+    /// (`--event=env-delta`). Unknown values cause exit 0 silently per
+    /// FR-014. `system` corresponds to [`AiProvider::System`] and is
+    /// intentionally absent from the user-visible
+    /// `AiProvider::all()` listing.
     #[arg(long)]
     provider: String,
 
@@ -51,6 +57,15 @@ struct Cli {
 
     #[arg(long = "fill-percent")]
     fill_percent: Option<u32>,
+
+    #[arg(long = "added-json")]
+    added_json: Option<String>,
+
+    #[arg(long = "removed-json")]
+    removed_json: Option<String>,
+
+    #[arg(long = "baseline-ready", default_value_t = false)]
+    baseline_ready: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -63,6 +78,12 @@ enum EventKind {
     TaskLabelChanged,
     TaskLabelCleared,
     ContextChanged,
+    /// Env-delta variant emitted by shell integration's pre-exec hooks
+    /// (feature 006). Canonical invocation uses `--provider=system` —
+    /// see [`AiProvider::System`] for rationale. `--added-json` /
+    /// `--removed-json` carry the delta; `--baseline-ready` flips the
+    /// server into post-rc baseline-capture mode.
+    EnvDelta,
 }
 
 fn main() {
@@ -151,6 +172,21 @@ fn build_kind(cli: &Cli) -> Result<HookEventKind, ()> {
             let pct: u8 = u8::try_from(pct).unwrap_or(100).min(100);
             Ok(HookEventKind::ContextChanged { fill_percent: pct })
         }
+        EventKind::EnvDelta => {
+            let added: Vec<(String, String)> = match cli.added_json.as_deref() {
+                Some(s) if !s.is_empty() => {
+                    let map: std::collections::BTreeMap<String, String> =
+                        serde_json::from_str(s).map_err(|_| ())?;
+                    map.into_iter().collect()
+                }
+                _ => Vec::new(),
+            };
+            let removed: Vec<String> = match cli.removed_json.as_deref() {
+                Some(s) if !s.is_empty() => serde_json::from_str(s).map_err(|_| ())?,
+                _ => Vec::new(),
+            };
+            Ok(HookEventKind::EnvChanged { added, removed, baseline_ready: cli.baseline_ready })
+        }
     }
 }
 
@@ -195,6 +231,9 @@ mod tests {
             text: None,
             label: None,
             fill_percent: None,
+            added_json: None,
+            removed_json: None,
+            baseline_ready: false,
         }
     }
 

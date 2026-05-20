@@ -859,6 +859,18 @@
               <div class="toggle-knob"></div>
             </div>
           </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Persist Environment</div>
+              <div class="setting-desc">Capture and restore terminal environment across cold restart (requires OS secret store)</div>
+            </div>
+            <div class="toggle off" data-key="terminal.env_persistence.enabled" id="env-persistence-toggle">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row" id="env-persistence-error-row" style="display: none;">
+            <div class="setting-error" id="env-persistence-error"></div>
+          </div>
         </div>
 
         <div class="section-label">Smart Selection</div>
@@ -1242,6 +1254,18 @@
             <div class="setting-info"><div class="setting-label">Find in Terminal</div></div>
             <div class="keybinding-cell" data-action="find">
               <button class="kb-reset-btn" data-action="find" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Jump to Previous Prompt</div></div>
+            <div class="keybinding-cell" data-action="prompt_jump_up">
+              <button class="kb-reset-btn" data-action="prompt_jump_up" title="Reset to default">&#8635;</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info"><div class="setting-label">Jump to Next Prompt</div></div>
+            <div class="keybinding-cell" data-action="prompt_jump_down">
+              <button class="kb-reset-btn" data-action="prompt_jump_down" title="Reset to default">&#8635;</button>
             </div>
           </div>
           <div class="setting-row">

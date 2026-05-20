@@ -294,7 +294,8 @@ fn apply_terminal_key(
         | "terminal.codex_code_integration"
         | "terminal.preserve_ai_scrollback"
         | "terminal.natural_scroll"
-        | "terminal.keyboard_protocol_enhanced" => apply_terminal_behavior_key(config, key, value),
+        | "terminal.keyboard_protocol_enhanced"
+        | "terminal.env_persistence.enabled" => apply_terminal_behavior_key(config, key, value),
         "terminal.prompt_bar"
         | "terminal.prompt_bar_font_size"
         | "terminal.prompt_bar_position"
@@ -351,6 +352,10 @@ fn apply_terminal_behavior_key(
         "terminal.keyboard_protocol_enhanced" => {
             config.terminal.keyboard_protocol_enhanced =
                 value.as_bool().ok_or("keyboard_protocol_enhanced must be a boolean")?;
+        }
+        "terminal.env_persistence.enabled" => {
+            config.terminal.env_persistence.enabled =
+                value.as_bool().ok_or("env_persistence.enabled must be a boolean")?;
         }
         _ => return Err(format!("unhandled terminal key: {key}")),
     }
@@ -738,6 +743,8 @@ fn apply_keybinding_editing_actions(
         "scroll_bottom" => kb.scroll_bottom = list.clone(),
         "find" => kb.find = list.clone(),
         "jump_to_failure" => kb.jump_to_failure = list.clone(),
+        "prompt_jump_up" => kb.prompt_jump_up = list.clone(),
+        "prompt_jump_down" => kb.prompt_jump_down = list.clone(),
         "zoom_in" => kb.zoom_in = list.clone(),
         "zoom_out" => kb.zoom_out = list.clone(),
         "zoom_reset" => kb.zoom_reset = list.clone(),

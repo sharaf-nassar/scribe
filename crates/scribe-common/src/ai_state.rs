@@ -1,20 +1,39 @@
 use serde::{Deserialize, Serialize};
 
 /// Which AI assistant emitted a terminal integration state change.
+///
+/// [`AiProvider::System`] is a sentinel for non-AI hook channel events
+/// (currently env-delta from shell integration; future infrastructure
+/// events). It is intentionally absent from [`AiProvider::all`] so UI
+/// surfaces that list AI providers (pickers, new-tab menus, integration
+/// settings) never display it. Hook ingress on the server is the one place
+/// that may legitimately observe a `System` provider — handlers that route
+/// by provider should pattern-match it explicitly and dispatch to the
+/// non-AI path (e.g. env-store fold) or drop with a debug log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiProvider {
     ClaudeCode,
     CodexCode,
+    /// Non-AI infrastructure events emitted by shell integration or the
+    /// server itself. Carries env-delta hook events today; reserved for
+    /// future structured hook channels that do not represent an AI tool.
+    System,
 }
 
 fn default_ai_provider() -> AiProvider {
     AiProvider::ClaudeCode
 }
 
+/// Iterable set of AI provider variants. Intentionally excludes
+/// [`AiProvider::System`] so UI listings (pickers, settings, new-tab
+/// menus) never surface the synthetic provider.
 const AI_PROVIDERS: [AiProvider; 2] = [AiProvider::ClaudeCode, AiProvider::CodexCode];
 
 impl AiProvider {
+    /// All *user-visible* AI providers. Does NOT include
+    /// [`AiProvider::System`] — that variant is a hook-channel sentinel
+    /// for non-AI events and must not appear in any UI surface.
     #[must_use]
     pub fn all() -> &'static [AiProvider] {
         &AI_PROVIDERS
@@ -25,15 +44,25 @@ impl AiProvider {
         match self {
             AiProvider::ClaudeCode => "claude_code",
             AiProvider::CodexCode => "codex_code",
+            AiProvider::System => "system",
         }
     }
 
     /// Inverse of [`Self::id`]. Used by the OSC 1337 `ScribeAiLaunch=<id>`
     /// pre-arm sentinel so shell integration can re-arm the ED 3 filter
     /// before an AI binary starts emitting bytes.
+    ///
+    /// Also accepts the synthetic `"system"` id used by
+    /// `scribe-hook-helper --provider=system` for env-delta events. Note
+    /// `"system"` is intentionally NOT in [`Self::all`], so callers that
+    /// rely on iteration (e.g. AI-binary detection, integration config)
+    /// will not pick it up.
     #[must_use]
     pub fn from_id(id: &str) -> Option<Self> {
-        Self::all().iter().copied().find(|p| p.id() == id)
+        match id {
+            "system" => Some(AiProvider::System),
+            _ => Self::all().iter().copied().find(|p| p.id() == id),
+        }
     }
 
     #[must_use]
@@ -41,6 +70,7 @@ impl AiProvider {
         match self {
             AiProvider::ClaudeCode => "Claude Code",
             AiProvider::CodexCode => "Codex",
+            AiProvider::System => "System",
         }
     }
 
@@ -49,6 +79,11 @@ impl AiProvider {
         match self {
             AiProvider::ClaudeCode => "claude",
             AiProvider::CodexCode => "codex",
+            // No binary represents the System sentinel. Returning an empty
+            // string is safe because the only callers (AI command
+            // detection, new-tab launchers) iterate [`Self::all`], which
+            // excludes `System`.
+            AiProvider::System => "",
         }
     }
 
@@ -57,6 +92,10 @@ impl AiProvider {
         match self {
             AiProvider::ClaudeCode => &["--resume"],
             AiProvider::CodexCode => &["resume"],
+            // `System` has no resume semantics. Same rationale as
+            // `binary_name`: it isn't in `all()`, so this arm is unreachable
+            // via the normal launcher paths.
+            AiProvider::System => &[],
         }
     }
 }

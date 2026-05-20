@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use scribe_common::framing::MAX_MESSAGE_SIZE;
 use scribe_common::protocol::{
-    ClientMessage, ReleaseListResultState, ServerMessage, UpdateCheckResultState,
+    ClientMessage, PreflightError, ReleaseListResultState, ServerMessage, UpdateCheckResultState,
 };
 use scribe_common::socket::server_socket_path;
 
@@ -125,6 +125,66 @@ fn parse_release_list_response(msg: ServerMessage) -> Result<ReleaseListResultSt
     }
 }
 
+/// Result of an env-persistence preflight request. `Ok` means the server's
+/// keystore probe succeeded; `Err(PreflightError)` is the structured reason
+/// the toggle should refuse to commit. Transport / protocol errors map to
+/// `Err(PreflightError::Unknown(reason))` so the UI always renders a single
+/// shape — same pattern as `UpdateCheckResultState::Failed` and
+/// `ReleaseListResultState::Failed`.
+#[derive(Debug, Clone)]
+pub enum EnvPreflightOutcome {
+    Ok,
+    Err(PreflightError),
+}
+
+/// Send `EnvPreflight` to the server and wait for the matching response.
+///
+/// Any transport or protocol error becomes
+/// `EnvPreflightOutcome::Err(PreflightError::Unknown(reason))` so the UI
+/// always has a single shape to render. A fresh connection is opened per call
+/// so this never reuses sockets from other server actions.
+pub fn request_env_preflight(timeout: Duration) -> EnvPreflightOutcome {
+    match try_request_env_preflight(timeout) {
+        Ok(outcome) => outcome,
+        Err(reason) => {
+            tracing::warn!("env preflight transport error: {reason}");
+            EnvPreflightOutcome::Err(PreflightError::Unknown(reason))
+        }
+    }
+}
+
+fn try_request_env_preflight(timeout: Duration) -> Result<EnvPreflightOutcome, String> {
+    let path = server_socket_path();
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|e| format!("connect to {} failed: {e}", path.display()))?;
+    stream.set_read_timeout(Some(timeout)).map_err(|e| format!("set_read_timeout: {e}"))?;
+    stream.set_write_timeout(Some(timeout)).map_err(|e| format!("set_write_timeout: {e}"))?;
+
+    write_frame(&mut stream, &ClientMessage::EnvPreflight)?;
+
+    parse_env_preflight_response(read_frame(&mut stream)?)
+}
+
+/// Pure helper that maps an arbitrary `ServerMessage` into the outcome
+/// expected by the env-preflight code path. Anything other than
+/// `EnvPreflightResult { .. }` — including the wrong-variant case the server
+/// should never produce — is surfaced as an `Err` so the public entry point
+/// can fold it into `EnvPreflightOutcome::Err(PreflightError::Unknown(_))`.
+fn parse_env_preflight_response(msg: ServerMessage) -> Result<EnvPreflightOutcome, String> {
+    match msg {
+        ServerMessage::EnvPreflightResult { ok: true, error: _ } => Ok(EnvPreflightOutcome::Ok),
+        ServerMessage::EnvPreflightResult { ok: false, error: Some(e) } => {
+            Ok(EnvPreflightOutcome::Err(e))
+        }
+        ServerMessage::EnvPreflightResult { ok: false, error: None } => {
+            Ok(EnvPreflightOutcome::Err(PreflightError::Unknown(String::from(
+                "server reported failure with no reason",
+            ))))
+        }
+        other => Err(format!("unexpected server response: {other:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +238,66 @@ mod tests {
         let parsed =
             parse_release_list_response(msg).expect("ReleaseList variant must parse cleanly");
         assert_eq!(parsed, state);
+    }
+
+    /// A non-`EnvPreflightResult` server response must surface as a non-empty
+    /// `Err` so the public entry point can fold it into
+    /// `EnvPreflightOutcome::Err(PreflightError::Unknown(reason))`.
+    ///
+    /// This is the parser-side proxy for the transport-failure mapping:
+    /// `request_env_preflight` cannot panic on an unexpected variant, and we
+    /// avoid spinning up a real Unix socket (which would require overriding
+    /// `server_socket_path` — there is no test hook today) by aiming the
+    /// assertion at the parser the public entry point delegates to.
+    #[test]
+    fn parse_env_preflight_response_rejects_unexpected_variant() {
+        let wrong_variant =
+            ServerMessage::UpdateCheckResult { state: UpdateCheckResultState::NoUpdate };
+        let err = parse_env_preflight_response(wrong_variant)
+            .expect_err("unexpected variant must be reported as Err");
+        assert!(!err.is_empty(), "error reason must not be empty");
+        assert!(
+            err.contains("unexpected server response"),
+            "error message should describe the wrong-variant case: {err}"
+        );
+
+        // The public entry point folds the same `Err` into an
+        // `Err(PreflightError::Unknown(reason))` with a non-empty reason —
+        // verifying the contract end-to-end without touching the global socket.
+        let mapped = match parse_env_preflight_response(ServerMessage::UpdateCheckResult {
+            state: UpdateCheckResultState::NoUpdate,
+        }) {
+            Ok(outcome) => outcome,
+            Err(reason) => EnvPreflightOutcome::Err(PreflightError::Unknown(reason)),
+        };
+        match mapped {
+            EnvPreflightOutcome::Err(PreflightError::Unknown(reason)) => {
+                assert!(!reason.is_empty(), "Unknown reason must not be empty");
+            }
+            unexpected => panic!("expected Err(Unknown), got {unexpected:?}"),
+        }
+    }
+
+    /// Sanity: real `EnvPreflightResult` payloads round-trip through the
+    /// parser untouched. `ok=true` maps to `Ok` regardless of the (unused)
+    /// `error` slot, and `ok=false` with a structured `error` maps to the
+    /// matching `Err(PreflightError)` so the toggle gets the actionable
+    /// reason it needs to surface inline.
+    #[test]
+    fn parse_env_preflight_response_passes_through_ok_and_error() {
+        let ok_msg = ServerMessage::EnvPreflightResult { ok: true, error: None };
+        match parse_env_preflight_response(ok_msg).expect("ok variant must parse cleanly") {
+            EnvPreflightOutcome::Ok => {}
+            unexpected @ EnvPreflightOutcome::Err(_) => panic!("expected Ok, got {unexpected:?}"),
+        }
+
+        let err_msg = ServerMessage::EnvPreflightResult {
+            ok: false,
+            error: Some(PreflightError::KeychainLocked),
+        };
+        match parse_env_preflight_response(err_msg).expect("err variant must parse cleanly") {
+            EnvPreflightOutcome::Err(PreflightError::KeychainLocked) => {}
+            unexpected => panic!("expected Err(KeychainLocked), got {unexpected:?}"),
+        }
     }
 }

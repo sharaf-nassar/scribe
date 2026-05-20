@@ -1547,6 +1547,13 @@ function initToggles() {
   document.querySelectorAll(".toggle").forEach(function(toggle) {
     const key = toggle.getAttribute("data-key");
 
+    if (toggle.id === "env-persistence-toggle") {
+      toggle.addEventListener("click", function() {
+        handleEnvPersistenceToggleClick(toggle);
+      });
+      return;
+    }
+
     toggle.addEventListener("click", function() {
       const isOn = toggle.classList.contains("on");
 
@@ -1561,6 +1568,121 @@ function initToggles() {
       sendChange(key, !isOn);
     });
   });
+}
+
+// ─────────── Env Persistence Preflight ───────────
+//
+// Special-case interception for the "Persist Environment" toggle:
+//   - OFF → ON: send ClientMessage::EnvPreflight, wait for
+//     ServerMessage::EnvPreflightResult; commit only on ok=true. On ok=false,
+//     keep OFF and show inline error mapped from `error.type`.
+//   - ON  → OFF: unconditional immediate disable (no preflight).
+//
+// Request/response pairing pattern: single in-flight slot + host-injected
+// `window.SCRIBE_ON_ENV_PREFLIGHT_RESULT` callback. Matches the existing
+// SCRIBE_ON_RELEASE_LIST precedent — outbound via sendIpc, inbound via the
+// Rust host calling the global callback through evaluate_script.
+
+var envPreflightPending = null;
+var envPreflightErrorTimer = null;
+
+// Defined early so the host's evaluate_script call can always reach it,
+// even if it fires before this file finishes executing.
+window.SCRIBE_ON_ENV_PREFLIGHT_RESULT = function(payload) {
+  onEnvPreflightResult(payload || {});
+};
+
+function envPreflightErrorMessage(error) {
+  if (!error || typeof error !== "object") {
+    return "Could not access the OS secret store. Try again, or see the docs for troubleshooting.";
+  }
+  switch (error.type) {
+    case "keychain_locked":
+      return "macOS Keychain is locked. Open Keychain Access, unlock the login keychain, then try again.";
+    case "secret_service_unavailable":
+      return "Secret service is not available. Install and start a system keyring (e.g. gnome-keyring or KWallet) and ensure Scribe launched in a graphical session, then try again.";
+    case "keystore_access_denied":
+      return "The OS secret store denied access. Check your keychain permissions for Scribe and try again.";
+    case "unknown":
+      var reason = error.reason || "unknown error";
+      return "Could not access the OS secret store: " + reason + ". Try again, or see the docs for troubleshooting.";
+    default:
+      return "Could not access the OS secret store. Try again, or see the docs for troubleshooting.";
+  }
+}
+
+function hideEnvPersistenceError() {
+  var row = document.getElementById("env-persistence-error-row");
+  var msg = document.getElementById("env-persistence-error");
+  if (row) { row.style.display = "none"; }
+  if (msg) { msg.textContent = ""; }
+  if (envPreflightErrorTimer !== null) {
+    clearTimeout(envPreflightErrorTimer);
+    envPreflightErrorTimer = null;
+  }
+}
+
+function showEnvPersistenceError(text) {
+  var row = document.getElementById("env-persistence-error-row");
+  var msg = document.getElementById("env-persistence-error");
+  if (msg) { msg.textContent = text; }
+  if (row) { row.style.display = ""; }
+  if (envPreflightErrorTimer !== null) {
+    clearTimeout(envPreflightErrorTimer);
+  }
+  envPreflightErrorTimer = setTimeout(function() {
+    hideEnvPersistenceError();
+  }, 6000);
+}
+
+function handleEnvPersistenceToggleClick(toggle) {
+  // Any click dismisses a stale error from a previous failed attempt.
+  hideEnvPersistenceError();
+
+  const isOn = toggle.classList.contains("on");
+
+  if (isOn) {
+    // Disable path: unconditional, no preflight.
+    toggle.classList.remove("on");
+    toggle.classList.add("off");
+    sendChange("terminal.env_persistence.enabled", false);
+    return;
+  }
+
+  // Enable path: preflight first, commit on success only.
+  if (envPreflightPending) {
+    // Already awaiting a result; ignore the click.
+    return;
+  }
+  // Disable further clicks while in flight.
+  toggle.classList.add("env-preflight-busy");
+  toggle.style.pointerEvents = "none";
+
+  envPreflightPending = function(payload) {
+    toggle.classList.remove("env-preflight-busy");
+    toggle.style.pointerEvents = "";
+
+    if (payload && payload.ok === true) {
+      toggle.classList.remove("off");
+      toggle.classList.add("on");
+      hideEnvPersistenceError();
+      sendChange("terminal.env_persistence.enabled", true);
+    } else {
+      // Keep OFF, show actionable inline error.
+      var text = envPreflightErrorMessage(payload && payload.error);
+      showEnvPersistenceError(text);
+    }
+  };
+
+  sendIpc({ type: "env_preflight" });
+}
+
+function onEnvPreflightResult(payload) {
+  var cb = envPreflightPending;
+  envPreflightPending = null;
+  if (typeof cb === "function") {
+    cb(payload);
+  }
 }
 
 // ─────────── Segmented Controls ───────────

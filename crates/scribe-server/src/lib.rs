@@ -7,6 +7,7 @@
 
 pub mod attach_flow;
 pub mod config;
+pub mod env_store;
 pub mod handoff;
 pub mod hook_ingress;
 pub mod ipc_server;

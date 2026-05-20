@@ -57,6 +57,14 @@ tracing-subscriber = { version = "0.3", features = [
 ] }
 bytes = "1"
 
+# OS keystore + crypto (feature 006)
+keyring = { version = "3.6", default-features = false, features = [
+  "apple-native",
+  "sync-secret-service",
+  "crypto-rust",
+] }
+chacha20poly1305 = { version = "0.10", features = ["std", "rand_core"] }
+
 # PTY / OS bindings
 nix = { version = "0.31", features = [
   "term",

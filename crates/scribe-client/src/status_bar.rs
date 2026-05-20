@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use scribe_common::protocol::UpdateProgressState;
+use scribe_common::protocol::{EnvStatusState, UpdateProgressState};
 use scribe_common::theme::ChromeColors;
 use scribe_renderer::srgb_to_linear_rgba;
 use scribe_renderer::types::CellInstance;
@@ -43,6 +43,10 @@ pub struct StatusBarData<'a> {
     /// `None` ⇒ no resolved command yet, render no indicator. The glyph is
     /// the authoritative accessible cue (FR-009).
     pub last_command_status: Option<CommandStatus>,
+    /// Env-capture runtime state for the focused pane (feature 006). `None`
+    /// or `Some(Active)` renders nothing; `Some(Degraded { .. })` draws a
+    /// `⚠` warning glyph immediately right of the command-status indicator.
+    pub env_status: Option<&'a EnvStatusState>,
     /// Total number of active sessions in this window.
     pub session_count: usize,
     /// Remote or local host label for the focused pane.
@@ -442,6 +446,32 @@ fn render_command_status(
     w.put(' ', colors.text, colors.bg);
 }
 
+/// Render the env-capture warning glyph (feature 006).
+///
+/// Emits a single `⚠` (U+26A0) in the existing palette's `warning` slot
+/// (the yellow ANSI-3 color used by the system-stats display). Only fires
+/// when `env_status == Some(Degraded { .. })`; for `None` and
+/// `Some(Active)` this renders nothing — no placeholder, no spacing change.
+/// Called immediately after [`render_command_status`] so the warning sits
+/// directly to its right per the feature-006 status-bar contract.
+fn render_env_status_warning(
+    w: &mut BarWriter<'_>,
+    colors: &StatusBarColors,
+    env_status: Option<&EnvStatusState>,
+    tooltips: &mut Vec<TooltipAnchor>,
+) {
+    let Some(EnvStatusState::Degraded { .. }) = env_status else { return };
+    let glyph_col = w.col;
+    w.put('\u{26A0}', colors.warning, colors.bg);
+    tooltips.push(TooltipAnchor {
+        text: String::from(
+            "Environment capture paused: keystore unavailable. Retry from Settings → Terminal → General.",
+        ),
+        rect: w.col_rect(glyph_col),
+    });
+    w.put(' ', colors.text, colors.bg);
+}
+
 /// Render the left side: connection dot, workspace name (if multi), CWD.
 fn render_left_side(
     w: &mut BarWriter<'_>,
@@ -462,6 +492,7 @@ fn render_left_side(
     w.put(' ', colors.text, colors.bg);
 
     render_command_status(w, colors, data.last_command_status, tooltips);
+    render_env_status_warning(w, colors, data.env_status, tooltips);
 
     if let Some(name) = data.workspace_name {
         let ws_col = w.col;

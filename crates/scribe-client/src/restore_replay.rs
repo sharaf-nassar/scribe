@@ -31,6 +31,12 @@ pub struct ReplayLaunch {
     pub pane_id: PaneId,
     pub cwd: Option<PathBuf>,
     pub command: ReplayCommand,
+    /// Persisted launch identifier from the restored snapshot. During
+    /// cold-restart replay the client forwards this as
+    /// `ClientMessage::CreateSession::env_envelope_id` so the server can
+    /// look up and apply the persisted environment envelope keyed by this
+    /// launch id.
+    pub launch_id: String,
 }
 
 pub struct ReplayState {
@@ -342,6 +348,7 @@ fn queue_from_launch_record(
         pane_id,
         cwd: binding.fallback_cwd.clone(),
         command: replay_command_from_record(record),
+        launch_id: record.launch_id.clone(),
     });
 }
 

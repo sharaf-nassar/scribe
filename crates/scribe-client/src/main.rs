@@ -1226,6 +1226,10 @@ impl App {
                 self.handle_cwd_changed(*session_id, cwd.clone());
                 true
             }
+            UiEvent::EnvStatus { session_id, state } => {
+                self.handle_env_status(*session_id, state.clone());
+                true
+            }
             UiEvent::SessionContextChanged { session_id, context } => {
                 self.handle_session_context_changed(*session_id, context.clone());
                 true
@@ -2600,6 +2604,7 @@ impl App {
                 cwd: None,
                 size: self.terminal_size_for_grid(grid),
                 command: None,
+                env_envelope_id: None,
             },
         );
         self.panes.insert(pane_id, pane);
@@ -2743,6 +2748,7 @@ impl App {
                     cwd: launch.cwd.clone(),
                     size: term_size,
                     command: restore_replay::command_argv(&launch.command),
+                    env_envelope_id: Some(launch.launch_id.clone()),
                 },
             );
         }
@@ -3417,6 +3423,20 @@ impl App {
         let Some(pane) = self.panes.get_mut(&pane_id) else { return };
         tracing::debug!(%session_id, ?cwd, "CWD changed");
         pane.cwd = Some(cwd);
+    }
+
+    /// Mirror per-session env-capture runtime state onto the matching pane
+    /// (feature 006). Drives the status-bar warning glyph when `Degraded`.
+    fn handle_env_status(
+        &mut self,
+        session_id: SessionId,
+        state: scribe_common::protocol::EnvStatusState,
+    ) {
+        let Some(pane_id) = self.session_to_pane.get(&session_id).copied() else { return };
+        let Some(pane) = self.panes.get_mut(&pane_id) else { return };
+        tracing::debug!(%session_id, ?state, "env status changed");
+        pane.env_status = Some(state);
+        self.request_redraw();
     }
 
     fn handle_session_context_changed(
@@ -4505,6 +4525,7 @@ impl App {
                 }),
             focused_pane_last_command_status: focused_pane
                 .and_then(|pane| pane.last_command_status),
+            focused_pane_env_status: focused_pane.and_then(|pane| pane.env_status.clone()),
             focused_ws_name: self.window_layout.focused_workspace().and_then(|ws| ws.name.clone()),
             session_count: self.panes.len(),
         }
@@ -4688,6 +4709,7 @@ impl App {
             cwd: prepared.status.focused_pane_cwd.as_deref(),
             git_branch: prepared.status.focused_pane_git.as_deref(),
             last_command_status: prepared.status.focused_pane_last_command_status,
+            env_status: prepared.status.focused_pane_env_status.as_ref(),
             session_count: prepared.status.session_count,
             host_label,
             tmux_label,
@@ -5504,6 +5526,7 @@ impl App {
                     cwd: plan.inherited_cwd,
                     size: self.terminal_size_for_grid(plan.grid),
                     command: None,
+                    env_envelope_id: None,
                 },
             );
         }
@@ -5577,6 +5600,7 @@ impl App {
                     cwd: None,
                     size: self.terminal_size_for_grid(grid),
                     command: None,
+                    env_envelope_id: None,
                 },
             );
         }
@@ -5852,6 +5876,7 @@ impl App {
                     cwd: inherited_cwd,
                     size: self.terminal_size_for_grid(grid),
                     command,
+                    env_envelope_id: None,
                 },
             );
         }
@@ -10453,6 +10478,10 @@ struct FrameStatusSnapshot {
     focused_pane_git: Option<String>,
     focused_pane_display_context: Option<(String, Option<String>)>,
     focused_pane_last_command_status: Option<CommandStatus>,
+    /// Env-capture runtime state cloned from the focused pane (feature 006).
+    /// Drives the status-bar warning glyph; `None` and `Some(Active)` render
+    /// nothing.
+    focused_pane_env_status: Option<scribe_common::protocol::EnvStatusState>,
     focused_ws_name: Option<String>,
     session_count: usize,
 }

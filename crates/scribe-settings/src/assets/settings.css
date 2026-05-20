@@ -1631,3 +1631,16 @@ input[type="range"]::-webkit-slider-thumb {
   border-color: rgba(239, 68, 68, 0.3);
   color: #f87171;
 }
+
+/* Inline preflight-failure message shown beneath the "Persist Environment"
+   toggle when the OS secret-store preflight rejects an enable attempt.
+   Auto-dismissed after 6s by settings.js; click-again resets state. */
+.setting-error {
+  color: #f87171;
+  font-size: 0.9rem;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: rgba(248, 113, 113, 0.1);
+  border-left: 3px solid #f87171;
+  line-height: 1.4;
+}
