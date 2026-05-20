@@ -90,6 +90,18 @@ The Updates page also exposes a "Check Now" action button that bypasses the peri
 
 The settings binary's transient `server.sock` connection is implemented in [[crates/scribe-settings/src/server_action.rs#request_update_check]] using synchronous std I/O plus the same length-prefixed msgpack framing as the rest of the protocol. Cross-thread delivery of the response back onto the GTK main loop uses `glib::timeout_add_local` polling a `std::sync::mpsc` channel; on macOS it goes through a new `TaoUserEvent::UpdateCheckResult` variant on the existing event-loop proxy. The active glib timeout source is tracked so the window-close path can cancel any in-flight poll before the webview is dropped.
 
+#### Update Now Mode
+
+After a `UpdateAvailable` result the same action button morphs in place to a green `Update Now`, and a module-level `pendingUpdate` flag routes subsequent clicks to install instead of re-running the check.
+
+The button is the single source of truth for state, switched by [[crates/scribe-settings/src/assets/settings.js#setUpdateCheckButtonMode]] across four modes (`check`, `checking`, `update`, `installing`) that map to label + disabled + `is-primary` class. Confirmation uses a native `window.confirm` — the wry webview supports it and the codebase has no in-app modal primitive worth reusing. On confirm the JS dispatches a `trigger_update` IPC, the button flips to disabled `Installing…` (still green), and the status line acknowledges the install is in flight.
+
+The host-side `trigger_update` branch in [[crates/scribe-settings/src/lib.rs#handle_settings_ipc_request]] dispatches to [[crates/scribe-settings/src/lib.rs#dispatch_trigger_update]], which spawns a worker thread that calls [[crates/scribe-settings/src/server_action.rs#request_trigger_update]] — a fire-and-forget `TriggerUpdate` frame on a fresh transient socket. The server accepts it via a sibling first-message arm to `CheckForUpdates` / `ListReleases` (see [[server#Server#Updater#Manual Check]]) and drives the install through the same `UpdaterHandle::trigger()` channel the in-client overlay uses. Install progress is broadcast only to registered clients, so the in-client overlay still owns the live download/verify/install feedback and the restart-required prompt; the settings UI deliberately stays optimistic — `Installing…` until the user re-clicks `Check Now` or reopens settings.
+
+If the server is unreachable when the click lands (daemon stopped, socket path missing), the worker thread logs a `WARN` and the button stays in `Installing…` indefinitely — there is no automatic timeout-back-to-`Update Now` path, since success is unobservable from the transient socket. Recovery requires the user to reopen settings and re-click `Check Now`.
+
+The version text rendered after `Update available:` is an inline link (`.update-check-link`) that does not navigate the OS browser. Instead, [[crates/scribe-settings/src/assets/settings.js#activateReleasesTab]] calls `.click()` on `.nav-item[data-tab="releases"]`, so the existing `initNavigation` handler swaps the active page and lazy-loads the release list. This keeps the user inside the settings window with full notes for every version rather than opening a tag-specific page in the browser.
+
 ### Notification Keys
 
 Desktop notification settings cover enablement, focus suppression, and Linux-only timeout behavior.
@@ -111,6 +123,8 @@ Release data is fetched over IPC from [[server#Releases#Release Catalog]] via a 
 ### Layout
 
 The page header is a flex row: title and subtitle on the left, "View on GitHub" anchor on the right. The panel below centers `[Older]` `[picker]` `[Newer]` as a single flex row.
+
+Vertical rhythm: `.page-header-row` carries a 16px bottom margin into the panel, and `.releases-header` carries a matching 16px bottom margin into the release-notes article — so the nav row reads as vertically centered between the page subtitle above and the article below.
 
 The content area below is a single `<article id="release-notes">` that receives the pre-sanitized HTML for the selected release. Both nav buttons start `disabled`; `updateNavBoundaries()` is the single source of truth that toggles the `disabled` attribute as the selection moves — Newer disables at index 0, Older at index `releases.length - 1` — so the picker and buttons stay in sync.
 

@@ -1297,6 +1297,12 @@ function initNotificationActions() {
 
 var UPDATE_CHECK_DEFAULT_TEXT = "Click to query GitHub releases for the active channel";
 
+// Holds the latest UpdateAvailable payload after a successful manual check.
+// When non-null, the action button is in "Update Now" mode and clicking
+// dispatches `trigger_update`. Reset to null on every fresh Check, NoUpdate,
+// or Failed result so the button reverts to "Check Now".
+var pendingUpdate = null;
+
 function setUpdateCheckStatus(text, variant) {
   var el = document.getElementById("update-check-status");
   if (!el) { return; }
@@ -1308,21 +1314,58 @@ function setUpdateCheckStatus(text, variant) {
   }
 }
 
-function setUpdateCheckButtonBusy(busy) {
+// Single source of truth for the action button's label, disabled state, and
+// visual variant. Modes:
+//   "check"      → "Check Now",    enabled,  default (no update known yet)
+//   "checking"   → "Checking…",    disabled, default (a check is in flight)
+//   "update"     → "Update Now",   enabled,  is-primary (UpdateAvailable held)
+//   "installing" → "Installing…",  disabled, is-primary (TriggerUpdate sent)
+function setUpdateCheckButtonMode(mode) {
   var btn = document.getElementById("update-check-now-btn");
   if (!btn) { return; }
-  btn.disabled = !!busy;
-  btn.textContent = busy ? "Checking…" : "Check Now";
+  btn.classList.toggle("is-primary", mode === "update" || mode === "installing");
+  btn.disabled = mode === "checking" || mode === "installing";
+  if (mode === "checking") {
+    btn.textContent = "Checking…";
+  } else if (mode === "update") {
+    btn.textContent = "Update Now";
+  } else if (mode === "installing") {
+    btn.textContent = "Installing…";
+  } else {
+    btn.textContent = "Check Now";
+  }
 }
 
 function initUpdateActions() {
   var btn = document.getElementById("update-check-now-btn");
   if (!btn) { return; }
   btn.addEventListener("click", function() {
-    setUpdateCheckButtonBusy(true);
-    setUpdateCheckStatus("Checking GitHub for the latest release…", "is-checking");
-    sendHostAction("request_update_check");
+    if (pendingUpdate) {
+      confirmAndTriggerUpdate(pendingUpdate);
+    } else {
+      setUpdateCheckButtonMode("checking");
+      setUpdateCheckStatus("Checking GitHub for the latest release…", "is-checking");
+      sendHostAction("request_update_check");
+    }
   });
+}
+
+// Native confirm before dispatching the install. The settings webview cannot
+// observe `UpdateProgress` (no registered client connection), so the button
+// transitions to "Installing…" optimistically — the in-client overlay still
+// handles the live progress and restart-required prompt.
+function confirmAndTriggerUpdate(payload) {
+  var version = payload && payload.version ? "v" + payload.version : "the latest version";
+  var ok = window.confirm(
+    "Install Scribe " + version + " now? Scribe will prompt you to restart when ready."
+  );
+  if (!ok) { return; }
+  setUpdateCheckButtonMode("installing");
+  setUpdateCheckStatus(
+    "Installing… Scribe will prompt you to restart when ready.",
+    "is-checking"
+  );
+  sendHostAction("trigger_update");
 }
 
 // Called from Rust after a manual check completes. `result` is the JSON form
@@ -1331,25 +1374,31 @@ function initUpdateActions() {
 //   { "UpdateAvailable": { "version": "1.2.3", "release_url": "https://…" } }
 //   { "Failed": { "reason": "…" } }
 function updateCheckResult(result) {
-  setUpdateCheckButtonBusy(false);
-
   if (result === "NoUpdate") {
+    pendingUpdate = null;
+    setUpdateCheckButtonMode("check");
     var channel = currentConfig.update?.channel || "stable";
     setUpdateCheckStatus("You're up to date on the " + channel + " channel", "is-success");
     return;
   }
 
   if (result && typeof result === "object" && result.UpdateAvailable) {
+    pendingUpdate = result.UpdateAvailable;
+    setUpdateCheckButtonMode("update");
     renderUpdateAvailable(result.UpdateAvailable);
     return;
   }
 
   if (result && typeof result === "object" && result.Failed) {
+    pendingUpdate = null;
+    setUpdateCheckButtonMode("check");
     var reason = result.Failed.reason || "unknown error";
     setUpdateCheckStatus("Check failed: " + reason, "is-error");
     return;
   }
 
+  pendingUpdate = null;
+  setUpdateCheckButtonMode("check");
   setUpdateCheckStatus(UPDATE_CHECK_DEFAULT_TEXT, null);
 }
 
@@ -1358,18 +1407,23 @@ function renderUpdateAvailable(payload) {
   var statusEl = document.getElementById("update-check-status");
   if (!statusEl) { return; }
   var version = payload.version || "latest";
-  var url = payload.release_url || "";
-  if (url) {
-    var link = document.createElement("a");
-    link.href = url;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    link.className = "update-check-link";
-    link.textContent = "v" + version;
-    statusEl.appendChild(link);
-  } else {
-    statusEl.appendChild(document.createTextNode("v" + version));
-  }
+  var link = document.createElement("a");
+  link.href = "#";
+  link.className = "update-check-link";
+  link.textContent = "v" + version;
+  link.addEventListener("click", function(e) {
+    e.preventDefault();
+    activateReleasesTab();
+  });
+  statusEl.appendChild(link);
+}
+
+// Programmatically switch to the Releases tab as if the user clicked the
+// sidebar nav. Reuses `initNavigation`'s click handler so the active-class
+// swap and lazy release-list fetch happen on the same code path.
+function activateReleasesTab() {
+  var nav = document.querySelector('.nav-item[data-tab="releases"]');
+  if (nav) { nav.click(); }
 }
 
 // ─────────── Keybinding Defaults (injected by Rust) ───────────

@@ -16,6 +16,11 @@ use scribe_common::{
 /// add headroom for a slow network or a busy updater task. After this elapses
 /// the user sees a "Check failed: …" message and the worker thread aborts.
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Write-only timeout for the fire-and-forget `TriggerUpdate` IPC. There is no
+/// reply, so the value bounds only the `connect` + `write_all` calls in
+/// [`server_action::request_trigger_update`]; matched to the check path so
+/// the two transient IPCs share latency expectations.
+const TRIGGER_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum time to wait for a `ListReleases` response from the server.
 ///
@@ -478,6 +483,27 @@ fn cancel_active_check_source(active_source: &ActiveCheckSource) {
     }
 }
 
+/// Spawn a worker thread that asks the server to start an update install.
+///
+/// Fire-and-forget: the server has no reply for `TriggerUpdate`, and install
+/// progress is broadcast only to registered clients (which the settings
+/// window is not). The in-client overlay still owns the user-facing progress
+/// and restart-required prompt; the settings UI flips its button to
+/// "Installing…" the moment the request is dispatched and stays there until
+/// the user re-checks.
+///
+/// Intentionally not `#[cfg]`-guarded per platform — unlike the check and
+/// release-list dispatchers, this function has no reply to route back onto a
+/// platform-specific event loop, so the same `std::thread::spawn` body works
+/// on both Linux (GTK) and macOS (tao).
+fn dispatch_trigger_update() {
+    std::thread::spawn(|| {
+        if let Err(reason) = server_action::request_trigger_update(TRIGGER_UPDATE_TIMEOUT) {
+            tracing::warn!("trigger update transport error: {reason}");
+        }
+    });
+}
+
 /// Linux: spawn a worker thread to issue a `ListReleases` request to the
 /// server, then drain the result back to the webview via a `glib` timeout
 /// source on the GTK main loop.
@@ -621,6 +647,7 @@ struct SettingsIpcHandlers<'a> {
     webview_ref: &'a std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
     on_change: &'a dyn Fn(String),
     on_request_update_check: &'a dyn Fn(),
+    on_trigger_update: &'a dyn Fn(),
     on_request_releases: &'a dyn Fn(),
     on_choose_workspace_root: &'a dyn Fn(),
 }
@@ -645,6 +672,8 @@ fn handle_settings_ipc_request(body: &str, handlers: SettingsIpcHandlers<'_>) {
         }
     } else if kind == "request_update_check" {
         (handlers.on_request_update_check)();
+    } else if kind == "trigger_update" {
+        (handlers.on_trigger_update)();
     } else if kind == "request_releases" {
         (handlers.on_request_releases)();
     } else if kind == "choose_workspace_root" {
@@ -990,6 +1019,7 @@ fn build_linux_webview<F: Fn(String) + 'static>(
             let on_request_update_check = move || {
                 dispatch_check_for_updates_linux(&webview_for_check, &active_for_check);
             };
+            let on_trigger_update = || dispatch_trigger_update();
             let webview_for_releases = std::rc::Rc::clone(&ctx.webview_ref);
             let active_for_releases = std::rc::Rc::clone(&ctx.active_release_source);
             let on_request_releases = move || {
@@ -1007,6 +1037,7 @@ fn build_linux_webview<F: Fn(String) + 'static>(
                         webview_ref: &webview_for_ipc,
                         on_change: &on_change,
                         on_request_update_check: &on_request_update_check,
+                        on_trigger_update: &on_trigger_update,
                         on_request_releases: &on_request_releases,
                         on_choose_workspace_root: &on_choose_workspace_root,
                     },
@@ -1329,6 +1360,7 @@ fn build_tao_webview<F: Fn(String) + 'static>(
             let proxy_for_workspace_root = event_loop_proxy.clone();
             let on_request_update_check =
                 move || dispatch_check_for_updates_macos(&proxy_for_check);
+            let on_trigger_update = || dispatch_trigger_update();
             let on_request_releases =
                 move || dispatch_release_list_request_macos(&proxy_for_releases);
             let on_choose_workspace_root =
@@ -1340,6 +1372,7 @@ fn build_tao_webview<F: Fn(String) + 'static>(
                         webview_ref: &webview_for_ipc,
                         on_change: &on_change,
                         on_request_update_check: &on_request_update_check,
+                        on_trigger_update: &on_trigger_update,
                         on_request_releases: &on_request_releases,
                         on_choose_workspace_root: &on_choose_workspace_root,
                     },

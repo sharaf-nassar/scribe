@@ -69,6 +69,22 @@ fn read_frame<R: std::io::Read>(reader: &mut R) -> Result<ServerMessage, String>
     rmp_serde::from_slice(&buf).map_err(|e| format!("deserialize ServerMessage failed: {e}"))
 }
 
+/// Send `TriggerUpdate` to the server. Fire-and-forget: the server has no
+/// reply for this message, so we just write the frame and close.
+///
+/// The settings webview kicks the install off this way instead of opening a
+/// registered window connection. Install progress is broadcast only to
+/// registered clients, so the in-client overlay (not the settings window)
+/// owns the user-facing progress and restart-required prompt. The settings
+/// UI just disables its button and waits for the next manual re-check.
+pub fn request_trigger_update(timeout: Duration) -> Result<(), String> {
+    let path = server_socket_path();
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|e| format!("connect to {} failed: {e}", path.display()))?;
+    stream.set_write_timeout(Some(timeout)).map_err(|e| format!("set_write_timeout: {e}"))?;
+    write_frame(&mut stream, &ClientMessage::TriggerUpdate)
+}
+
 /// Send `ListReleases` to the server and wait for the matching response.
 ///
 /// Mirrors [`request_update_check`]: any transport or protocol error becomes

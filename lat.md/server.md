@@ -188,6 +188,8 @@ Unlike the periodic path, it overrides the dismissed-version filter so an explic
 
 The reply channel has capacity 1; concurrent requests fail-fast with `Failed { reason: "already in progress" }` rather than blocking the caller's connection budget. A 20-second internal timeout caps the wait if the select loop is busy installing an update, surfacing a clean "install in progress" message instead of a generic transport timeout.
 
+The standalone settings window can also kick off an install on the same transient first-message path. `ClientMessage::TriggerUpdate` is accepted as a transient action alongside `CheckForUpdates` and `ListReleases` (no `Hello` required, no reply frame) and routes directly to `UpdaterHandle::trigger()`. The trigger channel is single-slot so duplicate requests from the settings window and an in-client overlay collapse safely; `UpdateProgress` is broadcast only to registered clients, so the in-client overlay continues to own the live download/verify/install feedback and the restart-required prompt.
+
 ### Install Flow
 
 Downloads the platform-specific asset via streaming (no full buffering in memory) and fetches its minisig signature in parallel, then verifies with the embedded real minisign public key.
