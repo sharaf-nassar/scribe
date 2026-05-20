@@ -313,6 +313,9 @@ async fn dispatch_server_message(
         | ServerMessage::PromptReceived { .. }) => {
             dispatch_notice_message(msg);
         }
+        ServerMessage::EnvPreflightResult { .. } | ServerMessage::EnvStatus { .. } => {
+            // Test daemon does not exercise env-persistence flows yet (feature 006).
+        }
     }
 }
 
@@ -724,6 +727,7 @@ async fn handle_create_session(
         cwd: None,
         size: None,
         command: None,
+        env_envelope_id: None,
     };
     if let Err(e) = send_to_server(server_writer, &msg).await {
         return DaemonResponse::Error { message: format!("failed to send CreateSession: {e}") };

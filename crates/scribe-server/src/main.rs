@@ -12,6 +12,7 @@ use scribe_common::socket::server_socket_path;
 
 mod attach_flow;
 mod config;
+mod env_store;
 mod handoff;
 mod hook_ingress;
 mod ipc_server;
@@ -155,6 +156,23 @@ async fn run_server_loop(
         Arc::new(releases::GithubReleaseFetcher::new());
     let workspace_notes =
         Arc::new(tokio::sync::Mutex::new(workspace_notes::WorkspaceNotesStore::load()));
+    // The env-store registry holds per-session env-capture state for the
+    // life of the server. `Arc` so the per-session persist tasks spawned
+    // by `schedule_persist` can hold a back-pointer alongside hook ingress.
+    let env_store = Arc::new(env_store::EnvStoreState::default());
+
+    // T035: seed the cached `terminal.env_persistence.enabled` value so
+    // the very first `ConfigReloaded` can compare against the real
+    // startup value (not the `false` default). Load failure fails safe
+    // to `false` — the feature is disabled by default (FR-009).
+    env_store.seed_last_enabled(load_env_persistence_seed());
+
+    // T036: spawn the env-status forwarder before the IPC accept loop so
+    // any pre-attach transitions (e.g. from sessions restored during
+    // `activate_pending_sessions` above) are observed by the broadcast
+    // receiver from the first tick. The forwarder owns its own
+    // `Arc<EnvStoreState>` clone and exits when the channel closes.
+    ipc_server::spawn_env_status_forwarder(&env_store, Arc::clone(&live_sessions));
 
     let handoff_triggered = tokio::select! {
         result = ipc_server::start_ipc_server(
@@ -168,6 +186,7 @@ async fn run_server_loop(
                 release_catalog: Arc::clone(&release_catalog),
                 release_fetcher: Arc::clone(&release_fetcher),
                 workspace_notes: Arc::clone(&workspace_notes),
+                env_store: Arc::clone(&env_store),
             },
         ) => {
             result?;
@@ -215,6 +234,19 @@ fn cleanup_socket(path: &Path) {
     if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             warn!(?path, "failed to remove socket on shutdown: {e}");
+        }
+    }
+}
+
+/// Load the startup value of `terminal.env_persistence.enabled` for the
+/// env-store seed, falling back to `false` (disabled) on load failure so the
+/// feature stays off by default per FR-009.
+fn load_env_persistence_seed() -> bool {
+    match scribe_common::config::load_config() {
+        Ok(cfg) => cfg.terminal.env_persistence.enabled,
+        Err(e) => {
+            warn!(error = %e, "failed to load config for env_persistence seed; defaulting to false");
+            false
         }
     }
 }

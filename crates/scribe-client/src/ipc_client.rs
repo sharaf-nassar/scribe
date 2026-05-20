@@ -14,8 +14,8 @@ use scribe_common::app::current_identity;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    AutomationAction, ClientMessage, PromptMarkKind, SearchMatch, ServerMessage, TerminalSize,
-    UpdateProgressState, WorkspaceNotesCollection, WorkspaceNotesMutation,
+    AutomationAction, ClientMessage, EnvStatusState, PromptMarkKind, SearchMatch, ServerMessage,
+    TerminalSize, UpdateProgressState, WorkspaceNotesCollection, WorkspaceNotesMutation,
 };
 use scribe_common::socket::{handoff_socket_path, server_socket_path};
 use tokio::io::AsyncWriteExt as _;
@@ -32,12 +32,18 @@ pub enum ClientCommand {
     ///
     /// When `split_direction` is `Some`, the server records the layout
     /// direction so it can be sent back on reconnect.
+    ///
+    /// `env_envelope_id` is `Some(launch_id)` only for cold-restart replay
+    /// driven by `restore_replay`; the server uses it to apply the
+    /// persisted environment envelope for that launch. All other
+    /// (non-restore) session creation paths pass `None`.
     CreateSession {
         workspace_id: WorkspaceId,
         split_direction: Option<scribe_common::protocol::LayoutDirection>,
         cwd: Option<std::path::PathBuf>,
         size: Option<TerminalSize>,
         command: Option<Vec<String>>,
+        env_envelope_id: Option<String>,
     },
     /// Close a session.
     CloseSession { session_id: SessionId },
@@ -95,6 +101,11 @@ pub enum UiEvent {
     Bell { session_id: SessionId },
     /// The working directory for a session has changed.
     CwdChanged { session_id: SessionId, cwd: PathBuf },
+    /// Per-session env-capture runtime state changed (feature 006).
+    /// Sent on transitions only; the client mirrors `state` onto the
+    /// matching pane's `env_status` field so the status bar can render
+    /// the warning glyph when `Degraded`.
+    EnvStatus { session_id: SessionId, state: EnvStatusState },
     /// The shell/session context for a session has changed.
     SessionContextChanged {
         session_id: SessionId,
@@ -313,6 +324,10 @@ fn dispatch_session_metadata_message(
             send_event(proxy, UiEvent::CwdChanged { session_id, cwd });
             None
         }
+        ServerMessage::EnvStatus { session_id, state } => {
+            send_event(proxy, UiEvent::EnvStatus { session_id, state });
+            None
+        }
         ServerMessage::SessionContextChanged { session_id, context } => {
             send_event(proxy, UiEvent::SessionContextChanged { session_id, context });
             None
@@ -501,9 +516,21 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
             ClientMessage::KeyInput { session_id, data, dismisses_attention }
         }
         ClientCommand::Resize { session_id, size } => ClientMessage::Resize { session_id, size },
-        ClientCommand::CreateSession { workspace_id, split_direction, cwd, size, command } => {
-            ClientMessage::CreateSession { workspace_id, split_direction, cwd, size, command }
-        }
+        ClientCommand::CreateSession {
+            workspace_id,
+            split_direction,
+            cwd,
+            size,
+            command,
+            env_envelope_id,
+        } => ClientMessage::CreateSession {
+            workspace_id,
+            split_direction,
+            cwd,
+            size,
+            command,
+            env_envelope_id,
+        },
         ClientCommand::CloseSession { session_id } => ClientMessage::CloseSession { session_id },
         ClientCommand::Subscribe { session_ids } => ClientMessage::Subscribe { session_ids },
         ClientCommand::ListSessions => ClientMessage::ListSessions,

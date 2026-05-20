@@ -992,6 +992,14 @@ impl Default for TerminalPromptBarConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TerminalEnvPersistenceConfig {
+    /// Persist exported terminal environment variables across Scribe sessions
+    /// so new shells inherit them. Disabled by default (FR-009).
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalConfig {
     #[serde(default = "default_scrollback_lines")]
@@ -1009,6 +1017,8 @@ pub struct TerminalConfig {
     pub status_bar_stats: StatusBarStatsConfig,
     #[serde(default, flatten)]
     pub scroll: TerminalScrollConfig,
+    #[serde(default)]
+    pub env_persistence: TerminalEnvPersistenceConfig,
     #[serde(default, flatten)]
     pub prompt_bar: TerminalPromptBarConfig,
     /// Enable the enhanced (Kitty) keyboard protocol when an application
@@ -1028,6 +1038,7 @@ impl Default for TerminalConfig {
             ai_session: TerminalAiSessionConfig::default(),
             status_bar_stats: StatusBarStatsConfig::default(),
             scroll: TerminalScrollConfig::default(),
+            env_persistence: TerminalEnvPersistenceConfig::default(),
             prompt_bar: TerminalPromptBarConfig::default(),
             keyboard_protocol_enhanced: true,
         }
@@ -1040,6 +1051,10 @@ impl TerminalConfig {
         match provider {
             AiProvider::ClaudeCode => self.ai_integration.claude_code.enabled(),
             AiProvider::CodexCode => self.ai_integration.codex_code.enabled(),
+            // The synthetic System provider has no AI integration toggle —
+            // env-delta is gated on `terminal.env_persistence.enabled` and
+            // checked at the hook-ingress call site instead.
+            AiProvider::System => false,
         }
     }
 }

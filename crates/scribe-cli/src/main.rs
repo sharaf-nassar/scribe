@@ -178,6 +178,7 @@ async fn interactive_passthrough() -> Result<(), ScribeError> {
         cwd: None,
         size: None,
         command: None,
+        env_envelope_id: None,
     };
     write_message(&mut write_half, &create_msg).await?;
 

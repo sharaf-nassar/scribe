@@ -97,4 +97,25 @@ pub enum HookEventKind {
 
     /// Context-window fill percentage. Server clamps to 0..=100.
     ContextChanged { fill_percent: u8 },
+
+    /// Exported environment variables changed in the shell since its previous
+    /// emit (or, when `baseline_ready` is set, the post-rc snapshot the server
+    /// uses as `StartupBaseline`).
+    ///
+    /// `added`: (name, current value) pairs added or modified since the shell's
+    /// last emit. `removed`: names unset since the shell's last emit. The server
+    /// folds these against the per-session `StartupBaseline` to maintain the
+    /// persisted `TerminalEnvDelta`. The hook channel's existing 100 ms total
+    /// deadline applies; the helper fails open per the existing contract.
+    EnvChanged {
+        #[serde(default)]
+        added: Vec<(String, String)>,
+        #[serde(default)]
+        removed: Vec<String>,
+        /// `true` exactly once per session — on the post-rc tail emit. The server
+        /// records the snapshot in `added` as the session's `StartupBaseline`
+        /// and clears any prior delta. `false` on all subsequent emits.
+        #[serde(default)]
+        baseline_ready: bool,
+    },
 }

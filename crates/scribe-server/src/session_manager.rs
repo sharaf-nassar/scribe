@@ -19,7 +19,7 @@ use vte::ansi::Processor as AnsiProcessor;
 
 use scribe_common::ai_state::{AiProcessState, AiProvider};
 use scribe_common::error::ScribeError;
-use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{SessionContext, TerminalSize};
 use scribe_common::screen::{
     CellFlags as ScreenCellFlags, CursorStyle as ScreenCursorStyle, ScreenCell, ScreenColor,
@@ -152,6 +152,17 @@ pub struct ManagedSession {
     /// Latest known terminal cell size in pixels for PTY winsize replies.
     pub cell_width: u16,
     pub cell_height: u16,
+    /// Launch-record id (== env-envelope id) used to name this session's
+    /// encrypted env envelope on disk. `Some` for cold-restart replays that
+    /// re-issued a `LaunchRecord` via `CreateSession.env_envelope_id`; `None`
+    /// for fresh first-time creations and for handoff-restored sessions
+    /// (handoff keeps env on the existing PTY, no envelope handoff).
+    ///
+    /// Captured so the clean-close path in `ipc_server::handle_close_session`
+    /// can find and delete the matching `<state_dir>/restore/env/<window_id>/
+    /// <launch_id>.envz` file plus its keystore DEK without re-deriving the
+    /// id from any client-supplied input.
+    pub env_envelope_id: Option<String>,
 }
 
 /// Terminal dimensions implementing the `Dimensions` trait from `alacritty_terminal`.
@@ -183,9 +194,19 @@ struct SessionGeometry {
 
 pub struct SessionLaunchRequest {
     pub workspace_id: WorkspaceId,
+    /// The window that requested this session. Used to scope env-envelope
+    /// lookups (envelopes live under `restore/env/<window_id>/`), so the
+    /// restore-apply step can only consume envelopes owned by the
+    /// requesting window per FR-005.
+    pub window_id: WindowId,
     pub cwd: Option<std::path::PathBuf>,
     pub size: Option<TerminalSize>,
     pub command: Option<Vec<String>>,
+    /// Optional launch-record id naming an encrypted env envelope to apply
+    /// to the new PTY (cold-restart replay). `None` for normal first-time
+    /// session creation and for handoff-restored sessions (env stays on the
+    /// existing PTY across handoff).
+    pub env_envelope_id: Option<String>,
 }
 
 struct PreparedSessionLaunch {
@@ -197,6 +218,11 @@ struct PreparedSessionLaunch {
     shell_name: String,
     pty_options: PtyOptions,
     geometry: SessionGeometry,
+    /// Carries the `launch_id` naming the env envelope (cold-restart restore-apply
+    /// payload); `None` when the request did not name an envelope. Forwarded
+    /// onto `ManagedSession` so the clean-close path can locate and delete the
+    /// envelope without re-deriving the id.
+    env_envelope_id: Option<String>,
 }
 
 impl PreparedSessionLaunch {
@@ -246,6 +272,7 @@ impl PreparedSessionLaunch {
             ai_provider_hint: self.ai_provider_hint,
             cell_width: self.geometry.cell_width,
             cell_height: self.geometry.cell_height,
+            env_envelope_id: self.env_envelope_id,
         })
     }
 }
@@ -298,7 +325,20 @@ impl SessionManager {
     ) -> Result<SessionId, ScribeError> {
         let session_id = SessionId::new();
         self.reserve_session_slot().await?;
-        let launch = self.prepare_session_launch(session_id, request);
+
+        // Cold-restart restore-apply (FR-005 / FR-008): if the launch names
+        // an env envelope, decrypt it now and stage a per-spawn temp file
+        // for the shell integration script to source. Fail-safe per FR-016:
+        // any error here returns `None` so the session still spawns with rc
+        // defaults instead of being blocked by the keystore.
+        let restore_env_file = match request.env_envelope_id.as_deref() {
+            Some(envelope_id) => {
+                prepare_restore_env_file(request.window_id, session_id, envelope_id).await
+            }
+            None => None,
+        };
+
+        let launch = self.prepare_session_launch(session_id, request, restore_env_file.as_deref());
         let pty = launch.spawn_pty()?;
         let managed = launch.into_managed_session(pty)?;
         self.sessions.write().await.insert(session_id, managed);
@@ -319,6 +359,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
         request: SessionLaunchRequest,
+        restore_env_file: Option<&std::path::Path>,
     ) -> PreparedSessionLaunch {
         let scrollback_lines = self.scrollback_lines.load(Ordering::Relaxed);
         let ai_provider_hint = command_ai_provider_hint(request.command.as_deref());
@@ -338,8 +379,14 @@ impl SessionManager {
         let integration_script = session_integration_script(&shell_binary, integration_enabled);
         let shell =
             build_shell(&shell_binary, request.command, kind, integration_script.as_deref());
-        let pty_options =
-            build_pty_options(session_id, shell, request.cwd, &shell_binary, integration_enabled);
+        let pty_options = build_pty_options(PtyOptionsBuild {
+            session_id,
+            shell,
+            cwd: request.cwd,
+            shell_binary: &shell_binary,
+            integration_enabled,
+            restore_env_file,
+        });
 
         PreparedSessionLaunch {
             session_id,
@@ -350,6 +397,7 @@ impl SessionManager {
             shell_name,
             pty_options,
             geometry,
+            env_envelope_id: request.env_envelope_id,
         }
     }
 
@@ -465,6 +513,10 @@ impl SessionManager {
                 ai_provider_hint: handoff_session.ai_provider_hint,
                 cell_width: handoff_session.cell_width.max(1),
                 cell_height: handoff_session.cell_height.max(1),
+                // Handoff keeps env on the existing PTY; no envelope is
+                // written for handoff-restored sessions, so close-time
+                // delete has nothing to do.
+                env_envelope_id: None,
             };
 
             sessions_map.insert(handoff_session.session_id, managed);
@@ -531,13 +583,27 @@ fn session_geometry(size: Option<TerminalSize>) -> SessionGeometry {
     SessionGeometry { dimensions, window_size, cell_width, cell_height }
 }
 
-fn build_pty_options(
+/// Inputs to [`build_pty_options`]. Grouped into a struct so the call site
+/// stays under Clippy's `too_many_arguments` threshold and remains readable
+/// alongside the other prepared-launch fields.
+struct PtyOptionsBuild<'a> {
     session_id: SessionId,
     shell: Option<alacritty_terminal::tty::Shell>,
     cwd: Option<std::path::PathBuf>,
-    shell_binary: &str,
+    shell_binary: &'a str,
     integration_enabled: bool,
-) -> PtyOptions {
+    restore_env_file: Option<&'a std::path::Path>,
+}
+
+fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
+    let PtyOptionsBuild {
+        session_id,
+        shell,
+        cwd,
+        shell_binary,
+        integration_enabled,
+        restore_env_file,
+    } = opts;
     let mut env = HashMap::from([
         ("TERM".to_owned(), "xterm-256color".to_owned()),
         ("COLORTERM".to_owned(), "truecolor".to_owned()),
@@ -551,6 +617,14 @@ fn build_pty_options(
     ]);
     if integration_enabled {
         inject_shell_integration_env(shell_binary, &mut env);
+    }
+
+    // Per specs/006-persist-terminal-env/contracts/hook-event-additions.md, when
+    // the spawn is restore-driven and an envelope decrypted successfully, point
+    // the shell at the per-spawn temp file the integration script sources after
+    // rc has run. Absence of the var leaves the shell with rc defaults.
+    if let Some(path) = restore_env_file {
+        env.insert("SCRIBE_RESTORE_ENV_DELTA_FILE".to_owned(), path.to_string_lossy().into_owned());
     }
 
     PtyOptions {
@@ -914,5 +988,217 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn cleanup_temp_home(home: &Path) {
         let _ignore = fs::remove_dir_all(home);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cold-restart env restore-apply (see specs/006-persist-terminal-env/
+// contracts/hook-event-additions.md and research.md::R1.3 / R3.5).
+//
+// The shell integration script sources `SCRIBE_RESTORE_ENV_DELTA_FILE` at
+// the tail of its init — after rc has run, before the baseline-ready emit —
+// then unlinks the file. The contents of that file (which we render here)
+// drive what becomes the post-restore baseline. This step is intentionally
+// skipped for handoff-restored sessions: per R3.5, handoff preserves the
+// PTY's process so env stays intact and no apply is needed.
+// ---------------------------------------------------------------------------
+
+/// Decrypt the per-session env envelope, write a shell-source-compatible
+/// temp file, and return the absolute path. The shell integration script
+/// sources this path after rc has run, applies the deltas, and unlinks the
+/// file.
+///
+/// Returns `None` (via early returns) when:
+///   * persistence is disabled in config;
+///   * no envelope exists for this launch (normal first-time session state);
+///   * the keystore is unavailable / decrypt fails (FR-016 fail-safe);
+///   * `XDG_RUNTIME_DIR` is unavailable; or
+///   * writing the temp file fails.
+///
+/// In every failure case the session still spawns successfully with rc
+/// defaults — graceful degradation per the fail-safe contract.
+async fn prepare_restore_env_file(
+    window_id: WindowId,
+    session_id: SessionId,
+    env_envelope_id: &str,
+) -> Option<std::path::PathBuf> {
+    // Feature-flag gate. Loading config off the hot path is fine here: this
+    // helper only runs when the launch names an envelope (the cold-restart
+    // path), not on every session creation.
+    let enabled = match scribe_common::config::load_config() {
+        Ok(cfg) => cfg.terminal.env_persistence.enabled,
+        Err(e) => {
+            tracing::warn!(
+                target: "scribe_server::session_manager",
+                error = ?e,
+                "load_config failed during env restore; spawning without env apply"
+            );
+            return None;
+        }
+    };
+    if !enabled {
+        return None;
+    }
+
+    let delta = match crate::env_store::store::read_envelope(window_id, env_envelope_id).await {
+        Ok(Some(d)) => d,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                target: "scribe_server::session_manager",
+                error = ?e,
+                ?session_id,
+                window_id = ?window_id,
+                env_envelope_id,
+                "read_envelope failed during restore; spawning without env apply (fail-safe)"
+            );
+            return None;
+        }
+    };
+
+    let Some(runtime_dir) = runtime_dir_for_env_apply() else {
+        tracing::warn!(
+            target: "scribe_server::session_manager",
+            "no XDG_RUNTIME_DIR available; env-restore deferred"
+        );
+        return None;
+    };
+    if let Err(e) = ensure_runtime_subdir(&runtime_dir).await {
+        tracing::warn!(
+            target: "scribe_server::session_manager",
+            error = ?e,
+            "create env-apply dir failed"
+        );
+        return None;
+    }
+
+    let pid = std::process::id();
+    let file_name = format!("{session_id}-{pid}.sh");
+    let path = runtime_dir.join(file_name);
+    let body = render_shell_source(&delta);
+
+    if let Err(e) = write_private_owner_only(&path, &body).await {
+        tracing::warn!(
+            target: "scribe_server::session_manager",
+            error = ?e,
+            "write env-apply file failed"
+        );
+        return None;
+    }
+
+    // Defensive cleanup: if the shell never sources/unlinks the file
+    // (e.g., user pkill'd the shell before integration loaded), remove it
+    // after a generous grace period so the runtime dir doesn't accumulate
+    // cruft. The shell integration itself unlinks on the consume path —
+    // this is only a safety net.
+    let path_for_cleanup = path.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        _ = tokio::fs::remove_file(&path_for_cleanup).await;
+    });
+
+    Some(path)
+}
+
+/// Per-user, per-flavor env-apply staging directory under
+/// `$XDG_RUNTIME_DIR/<flavor>/env-apply/`. Flavor segment matches the
+/// install-flavor slug used elsewhere (e.g. by `env_store::store`), so
+/// stable and `scribe-dev` cannot collide on the same login user.
+fn runtime_dir_for_env_apply() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from)?;
+    let flavor = scribe_common::app::current_identity().slug();
+    Some(base.join(flavor).join("env-apply"))
+}
+
+/// Create the env-apply directory (and any missing parents) with 0o700
+/// perms. Idempotent — re-applies the mode if the dir already existed
+/// with a wider mask.
+async fn ensure_runtime_subdir(p: &std::path::Path) -> std::io::Result<()> {
+    let p = p.to_owned();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        std::fs::create_dir_all(&p)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perms = std::fs::metadata(&p)?.permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&p, perms)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("blocking panic: {e}")))?
+}
+
+/// Write `content` to `path` with create-or-truncate semantics and 0o600
+/// perms (owner-only) on Unix. fsynced before returning so the temp file is
+/// durable before the shell tries to source it.
+async fn write_private_owner_only(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let path_owned = path.to_owned();
+    let body = content.to_owned();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path_owned)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("blocking panic: {e}")))?
+}
+
+/// Render a `TerminalEnvDelta` as a shell-source-compatible script.
+///
+/// Uses POSIX single-quote escaping so the output is safe across bash, zsh,
+/// fish, nu, and pwsh — see `specs/006-persist-terminal-env/contracts/
+/// hook-event-additions.md`. Inside a single-quoted string, single quotes
+/// are escaped by closing the quote, inserting a backslash-quoted single
+/// quote, and reopening — the canonical bash idiom `'\''`. Newlines, tabs,
+/// spaces, slashes, and `$` are all literal inside single quotes and need
+/// no further escaping.
+fn render_shell_source(delta: &crate::env_store::delta::TerminalEnvDelta) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    out.push_str("# Scribe env restore — sourced by shell integration after rc, then unlinked.\n");
+    for (name, value) in &delta.added {
+        let escaped = value.replace('\'', "'\\''");
+        _ = writeln!(out, "export {name}='{escaped}'");
+    }
+    for name in &delta.removed {
+        _ = writeln!(out, "unset {name}");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests_apply {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::env_store::delta::TerminalEnvDelta;
+
+    use super::render_shell_source;
+
+    #[test]
+    fn render_shell_source_quotes_values_correctly() {
+        let mut added = BTreeMap::new();
+        added.insert("FOO".to_owned(), "bar".to_owned());
+        added.insert("PATH".to_owned(), "/a:/b".to_owned());
+        added.insert("WITH_QUOTE".to_owned(), "it's value".to_owned());
+        added.insert("WITH_SPACES".to_owned(), "hello world".to_owned());
+        let mut removed = BTreeSet::new();
+        removed.insert("STALE".to_owned());
+        let delta = TerminalEnvDelta { added, removed };
+        let s = render_shell_source(&delta);
+        assert!(s.contains("export FOO='bar'"), "{s}");
+        assert!(s.contains("export PATH='/a:/b'"), "{s}");
+        assert!(s.contains("export WITH_QUOTE='it'\\''s value'"), "{s}");
+        assert!(s.contains("export WITH_SPACES='hello world'"), "{s}");
+        assert!(s.contains("unset STALE"), "{s}");
     }
 }

@@ -12,7 +12,7 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions as _;
 use scribe_common::config::ContentPadding;
 use scribe_common::ids::{SessionId, WorkspaceId};
-use scribe_common::protocol::SessionContext;
+use scribe_common::protocol::{EnvStatusState, SessionContext};
 use scribe_pty::sync_update_filter::SyncUpdateFrameSplitter;
 use scribe_renderer::types::{CellInstance, GridSize};
 
@@ -165,6 +165,12 @@ pub struct Pane {
     /// scrollbar's `fade_start`: rendering decays it over a short envelope
     /// and clears it back to `None` so it never pins the redraw loop.
     pub tab_flash_start: Option<Instant>,
+    /// Last-known env-capture runtime state for this session, driven by
+    /// `ServerMessage::EnvStatus`. `None` is the quiescent default: the
+    /// server never emitted any `EnvStatus` for this session (feature off,
+    /// or no env activity yet). `Some(Active)` is healthy capture;
+    /// `Some(Degraded { .. })` drives the status-bar warning glyph.
+    pub env_status: Option<EnvStatusState>,
 }
 
 #[derive(Clone, Copy)]
@@ -258,6 +264,7 @@ impl Pane {
             prompt_ui: PromptUiState::default(),
             split_scroll: None,
             tab_flash_start: None,
+            env_status: None,
         }
     }
 

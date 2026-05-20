@@ -165,6 +165,11 @@ pub enum ClientMessage {
         /// The first element is the program, remaining elements are arguments.
         #[serde(default)]
         command: Option<Vec<String>>,
+        /// Cold-restart restore association: the `LaunchRecord.launch_id` whose
+        /// persisted env envelope (if present) should be decrypted and applied
+        /// to this freshly-spawned PTY. `None` for plain new sessions.
+        #[serde(default)]
+        env_envelope_id: Option<String>,
     },
     CloseSession {
         session_id: SessionId,
@@ -277,6 +282,10 @@ pub enum ClientMessage {
     /// `hook_ingress::handle` and closes the connection — no Welcome, no
     /// window registration, no reply expected.
     HookEvent(hook::HookEvent),
+    /// Triggered by the settings UI when the user attempts to enable
+    /// `terminal.env_persistence.enabled`. The server replies with exactly one
+    /// `ServerMessage::EnvPreflightResult`. No fields.
+    EnvPreflight,
 }
 
 // ── Server → UI ──────────────────────────────────────────────────
@@ -486,6 +495,21 @@ pub enum ServerMessage {
     /// side-effect of a real ED 3.
     ScrollBottom {
         session_id: SessionId,
+    },
+    /// Reply to `ClientMessage::EnvPreflight`. `ok = true` ⇒ the OS secret
+    /// store is reachable and usable for our identifier; the settings layer
+    /// commits the toggle. `ok = false` ⇒ `error` carries the actionable
+    /// reason for the UI.
+    EnvPreflightResult {
+        ok: bool,
+        #[serde(default)]
+        error: Option<PreflightError>,
+    },
+    /// Per-session runtime status for env-capture. Sent on transitions only,
+    /// not periodically. Drives the status-bar warning glyph in the client.
+    EnvStatus {
+        session_id: SessionId,
+        state: EnvStatusState,
     },
 }
 
@@ -705,6 +729,35 @@ pub enum UpdateProgressState {
     CompletedRestartRequired { version: String },
     /// An error occurred during the update process.
     Failed { reason: String },
+}
+
+/// Reason the env-persistence preflight failed. Reported back to the settings
+/// UI inside `ServerMessage::EnvPreflightResult` so the toggle can surface an
+/// actionable message instead of committing a setting the keystore can't back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PreflightError {
+    /// macOS: login keychain is locked.
+    KeychainLocked,
+    /// Linux: D-Bus session bus or Secret Service not available.
+    SecretServiceUnavailable,
+    /// Either platform: keystore access denied for our identifier.
+    KeystoreAccessDenied,
+    /// Any other underlying error; the inner string is for diagnostics.
+    Unknown(String),
+}
+
+/// Runtime state of env-capture for a single session, carried in
+/// `ServerMessage::EnvStatus`. Sent only on transitions so the client can
+/// drive its status-bar warning glyph without polling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EnvStatusState {
+    /// Env capture is healthy.
+    Active,
+    /// Keystore became unavailable; persistence has stopped. The on-disk
+    /// envelope (if any) is untouched. No plaintext fallback.
+    Degraded { reason: String },
 }
 
 #[cfg(test)]

@@ -46,9 +46,9 @@ Thin CLI entry point that launches the client process.
 
 ### scribe-hook-helper
 
-Tiny binary invoked by AI-tool hook adapter scripts to emit one [[crates/scribe-common/src/hook.rs#HookEvent]] to the server and exit 0.
+Tiny binary invoked by AI-tool hook adapter scripts and shell-integration scripts to emit one [[crates/scribe-common/src/hook.rs#HookEvent]] to the server and exit 0.
 
-Reads `SCRIBE_HOOK_SOCK` and `SCRIBE_SESSION_ID` from env (both injected by Scribe into every PTY it spawns); no-ops silently when either is unset. The per-provider adapters in `dist/ai-hook-*.sh` translate AI tool hook stdin JSON into the helper's argv. See [[server#Hook Channel]] for the full pipeline and `specs/003-ai-hook-channel/` for the design docs.
+Reads `SCRIBE_HOOK_SOCK` and `SCRIBE_SESSION_ID` from env (both injected by Scribe into every PTY it spawns); no-ops silently when either is unset. The per-provider adapters in `dist/ai-hook-*.sh` translate AI tool hook stdin JSON into the helper's argv. The shell-integration scripts use `--event=env-delta` (with `--added-json`, `--removed-json`, and `--baseline-ready`) to feed `HookEventKind::EnvChanged` into the same channel. See [[server#Hook Channel]] for the full pipeline and `specs/003-ai-hook-channel/` for the design docs.
 
 ### scribe-test
 

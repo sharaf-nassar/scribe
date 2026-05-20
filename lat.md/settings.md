@@ -50,7 +50,9 @@ The Colors page also exposes five prompt bar color overrides labeled First Row, 
 
 ### Terminal Keys
 
-Terminal page general section — scrollback lines, natural scrolling, copy on select, and the enhanced keyboard protocol (Kitty) toggle. AI integration settings moved to the AI page.
+Terminal page general section — scrollback lines, natural scrolling, copy on select, the enhanced keyboard protocol (Kitty) toggle, and the persist-environment toggle. AI integration settings moved to the AI page.
+
+The persist-environment toggle is keyed `terminal.env_persistence.enabled`, defaults OFF, and is gated by an OS-secret-store preflight on enable — see [[server#Env Persistence]].
 
 Status bar stat toggles remain on the Terminal page under the Status Bar section.
 
@@ -80,7 +82,7 @@ Shared indicator settings cover Claude Code and Codex. The persisted key is now 
 
 All keybinding actions accept a string or array of strings (combo list, max 5 per action).
 
-Actions cover: pane splits, focus directions, workspace splits, workspace cycling, tab management (new, Claude Code new/resume, Codex new/resume, close, next, prev, select 1-9), clipboard, scrolling, jump to last failed command, command palette, find, zoom, settings, new window, and terminal shortcuts (word left/right, delete word, line start/end).
+Actions cover: pane splits, focus directions, workspace splits, workspace cycling, tab management (new, Claude Code new/resume, Codex new/resume, close, next, prev, select 1-9), clipboard, scrolling, jump to previous prompt, jump to next prompt, jump to last failed command, command palette, find, zoom, settings, new window, and terminal shortcuts (word left/right, delete word, line start/end).
 
 ### Update Keys
 

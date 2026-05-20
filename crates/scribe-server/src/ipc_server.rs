@@ -127,6 +127,13 @@ pub struct IpcServerState {
     pub release_fetcher: Arc<dyn ReleaseFetcher>,
     /// Authoritative server-owned workspace notes store.
     pub workspace_notes: Arc<Mutex<WorkspaceNotesStore>>,
+    /// Server-wide registry of per-session env-store state (baselines,
+    /// working deltas, status, and per-session persist schedulers). Owned
+    /// here so hook ingress (`crate::hook_ingress`) and the session
+    /// lifecycle paths share one source of truth. See
+    /// `specs/006-persist-terminal-env/data-model.md` for the ownership
+    /// rules.
+    pub env_store: Arc<crate::env_store::EnvStoreState>,
 }
 
 struct ClientDispatchContext<'a> {
@@ -142,6 +149,7 @@ struct CreateSessionRequest {
     cwd: Option<std::path::PathBuf>,
     size: Option<TerminalSize>,
     command: Option<Vec<String>>,
+    env_envelope_id: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -154,6 +162,16 @@ struct SessionRuntimeContext<'a> {
 struct InitialAttachment<'a> {
     writer: Option<&'a SharedWriter>,
     attached_ids: Option<&'a AttachedSessionIds>,
+}
+
+/// Bundle of session/window identifiers passed to [`start_session`]. Grouped
+/// into one struct so the argument count stays under Clippy's
+/// `too_many_arguments` threshold.
+#[derive(Clone, Copy)]
+struct StartSessionIds {
+    session: SessionId,
+    workspace: WorkspaceId,
+    window: WindowId,
 }
 
 /// State needed by the PTY reader task, extracted from `ManagedSession`.
@@ -246,6 +264,25 @@ pub struct LiveSession {
     preserve_ai_scrollback: Arc<AtomicBool>,
     /// Shared runtime scrollback limit updated by config reloads.
     scrollback_lines: Arc<AtomicUsize>,
+    /// The window that requested this session at create time. Stashed on
+    /// the session itself (rather than re-derived from the workspace
+    /// manager) so the clean-close path in [`handle_close_session`] can
+    /// route the env-envelope delete after the session→window mapping has
+    /// been torn down. Stable for the session's lifetime.
+    ///
+    /// `pub(crate)` so [`crate::hook_ingress`] can read it when routing an
+    /// `EnvChanged` event into [`crate::env_store::EnvStoreState::schedule_persist`].
+    pub(crate) env_window_id: WindowId,
+    /// Launch-record id (== env-envelope id) naming this session's
+    /// `<state_dir>/restore/env/<window_id>/<launch_id>.envz` file plus
+    /// its keystore DEK. `Some` only for cold-restart replays that
+    /// re-issued a `LaunchRecord` via `CreateSession.env_envelope_id`;
+    /// `None` for fresh first-time creations and for handoff-restored
+    /// sessions (handoff keeps env on the existing PTY across reload).
+    ///
+    /// `pub(crate)` so [`crate::hook_ingress`] can read it when routing an
+    /// `EnvChanged` event into [`crate::env_store::EnvStoreState::schedule_persist`].
+    pub(crate) env_envelope_id: Option<String>,
 }
 
 pub struct AttachSessionData {
@@ -815,7 +852,8 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::CheckForUpdates
         | ClientMessage::ListReleases
         | ClientMessage::ListWindows
-        | ClientMessage::DispatchAction { .. }) => {
+        | ClientMessage::DispatchAction { .. }
+        | ClientMessage::EnvPreflight) => {
             dispatch_window_message(msg, context).await;
         }
         ClientMessage::Hello { .. } => debug!("unexpected Hello after handshake, ignoring"),
@@ -825,9 +863,23 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
 
 async fn dispatch_session_message(msg: ClientMessage, context: &mut ClientDispatchContext<'_>) {
     match msg {
-        ClientMessage::CreateSession { workspace_id, split_direction, cwd, size, command } => {
+        ClientMessage::CreateSession {
+            workspace_id,
+            split_direction,
+            cwd,
+            size,
+            command,
+            env_envelope_id,
+        } => {
             handle_create_session(
-                CreateSessionRequest { workspace_id, split_direction, cwd, size, command },
+                CreateSessionRequest {
+                    workspace_id,
+                    split_direction,
+                    cwd,
+                    size,
+                    command,
+                    env_envelope_id,
+                },
                 context,
             )
             .await;
@@ -864,6 +916,7 @@ async fn dispatch_session_message(msg: ClientMessage, context: &mut ClientDispat
                 &context.server.session_manager,
                 &context.server.workspace_manager,
                 &context.server.live_sessions,
+                &context.server.env_store,
             )
             .await;
         }
@@ -947,7 +1000,12 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
             handle_close_window(target_window, context).await;
         }
         ClientMessage::QuitAll => {
-            handle_quit_all(context.window_id, &context.server.connected_clients).await;
+            handle_quit_all(
+                context.window_id,
+                &context.server.connected_clients,
+                &context.server.workspace_manager,
+            )
+            .await;
         }
         ClientMessage::TriggerUpdate => {
             info!(window_id = %context.window_id, "client triggered update");
@@ -958,18 +1016,10 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
             context.server.updater_handle.dismiss();
         }
         ClientMessage::CheckForUpdates => {
-            info!(window_id = %context.window_id, "client requested manual update check");
-            let state = context.server.updater_handle.request_check().await;
-            send_message(context.writer, &ServerMessage::UpdateCheckResult { state }).await;
+            handle_check_for_updates(context).await;
         }
         ClientMessage::ListReleases => {
-            info!(window_id = %context.window_id, "client requested release list");
-            let state = crate::releases::handle_list_releases(
-                &context.server.release_catalog,
-                &context.server.release_fetcher,
-            )
-            .await;
-            send_message(context.writer, &ServerMessage::ReleaseList { state }).await;
+            handle_list_releases_msg(context).await;
         }
         ClientMessage::ListWindows => {
             handle_list_windows(
@@ -989,8 +1039,31 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
             )
             .await;
         }
+        ClientMessage::EnvPreflight => {
+            handle_env_preflight(context.writer).await;
+        }
         other => debug!(?other, "ignored non-window client message in window dispatcher"),
     }
+}
+
+/// Helper extracted from [`dispatch_window_message`] to keep the dispatcher's
+/// cognitive complexity under Clippy's threshold.
+async fn handle_check_for_updates(context: &mut ClientDispatchContext<'_>) {
+    info!(window_id = %context.window_id, "client requested manual update check");
+    let state = context.server.updater_handle.request_check().await;
+    send_message(context.writer, &ServerMessage::UpdateCheckResult { state }).await;
+}
+
+/// Helper extracted from [`dispatch_window_message`] to keep the dispatcher's
+/// cognitive complexity under Clippy's threshold.
+async fn handle_list_releases_msg(context: &mut ClientDispatchContext<'_>) {
+    info!(window_id = %context.window_id, "client requested release list");
+    let state = crate::releases::handle_list_releases(
+        &context.server.release_catalog,
+        &context.server.release_fetcher,
+    )
+    .await;
+    send_message(context.writer, &ServerMessage::ReleaseList { state }).await;
 }
 
 /// Create a new PTY session, register it, start the reader task.
@@ -1003,9 +1076,11 @@ async fn handle_create_session(
         .session_manager
         .create_session(SessionLaunchRequest {
             workspace_id: request.workspace_id,
+            window_id: context.window_id,
             cwd: request.cwd,
             size: request.size,
             command: request.command,
+            env_envelope_id: request.env_envelope_id,
         })
         .await
     {
@@ -1055,8 +1130,11 @@ async fn handle_create_session(
     }
 
     start_session(
-        session_id,
-        request.workspace_id,
+        StartSessionIds {
+            session: session_id,
+            workspace: request.workspace_id,
+            window: context.window_id,
+        },
         session,
         InitialAttachment {
             writer: Some(context.writer),
@@ -1080,12 +1158,12 @@ async fn handle_create_session(
 /// task is spawned) to eliminate the race where `CloseSession` could arrive
 /// before the session is visible in the registry.
 async fn start_session(
-    session_id: SessionId,
-    workspace_id: WorkspaceId,
+    ids: StartSessionIds,
     session: ManagedSession,
     initial_attachment: InitialAttachment<'_>,
     runtime: SessionRuntimeContext<'_>,
 ) {
+    let StartSessionIds { session: session_id, workspace: workspace_id, window: window_id } = ids;
     // Extract all fields from session before partial moves.
     let term = session.term;
     let resize_fd = Arc::new(session.resize_fd);
@@ -1103,6 +1181,7 @@ async fn start_session(
     let ai_provider_hint = session.ai_provider_hint;
     let cell_width = session.cell_width;
     let cell_height = session.cell_height;
+    let env_envelope_id = session.env_envelope_id;
 
     let (pty_read, pty_write) = tokio::io::split(session.pty_fd);
     let pty_write = Arc::new(Mutex::new(pty_write));
@@ -1137,6 +1216,8 @@ async fn start_session(
         handoff_snapshot,
         preserve_ai_scrollback: Arc::clone(&preserve_ai_scrollback),
         scrollback_lines: Arc::clone(&scrollback_lines),
+        env_window_id: window_id,
+        env_envelope_id,
     };
 
     // Insert into the registry before spawning the PTY reader task so that
@@ -1311,6 +1392,14 @@ fn signal_if_handoff_session(session_id: SessionId, session: &LiveSession) {
 /// `LiveSession` sends SIGHUP to the child process; for handoff-restored
 /// sessions (`pty: None`) we send SIGHUP explicitly so the child is not
 /// leaked. The PTY reader task exits naturally on EOF once the child dies.
+///
+/// Per T019, on this clean-close path we also delete the session's encrypted
+/// env envelope (`<state_dir>/restore/env/<window_id>/<launch_id>.envz`) plus
+/// its keystore DEK. The PTY-EOF / child-exit path in [`finalize_pty_reader`]
+/// deliberately does NOT delete the envelope: a session that died because the
+/// user typed `exit` (or because the shell crashed) is still eligible for
+/// cold-restart restore, so the envelope must remain on disk until the user
+/// explicitly issues a `CloseSession`.
 async fn handle_close_session(
     session_id: SessionId,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
@@ -1323,6 +1412,13 @@ async fn handle_close_session(
     }
 
     let removed = live_sessions.write().await.remove(&session_id);
+    // Capture envelope coordinates before the session value is dropped so
+    // we can fire the delete after SIGHUP cleanup. Cloned (rather than
+    // moved) to keep the existing `drop(removed)` step that triggers
+    // `Pty::Drop` for fresh sessions.
+    let envelope_coords = removed
+        .as_ref()
+        .and_then(|s| s.env_envelope_id.as_ref().map(|id| (s.env_window_id, id.clone())));
     if let Some(session) = &removed {
         signal_if_handoff_session(session_id, session);
     }
@@ -1330,11 +1426,36 @@ async fn handle_close_session(
     drop(removed);
     workspace_manager.write().await.remove_session(session_id);
     attached_remove(attached_ids, session_id).await;
+
+    // Best-effort envelope + DEK delete. `delete_envelope` is idempotent
+    // and swallows `NotFound`, so it's safe to call when the feature was
+    // off at create time (no envelope ever existed) or when the persist
+    // scheduler had not yet flushed a first write. Failures are logged
+    // but do not block the close.
+    if let Some((window_id, launch_id)) = envelope_coords {
+        if let Err(err) = crate::env_store::store::delete_envelope(window_id, &launch_id).await {
+            warn!(
+                target: "scribe_server::ipc_server",
+                %session_id,
+                %window_id,
+                %launch_id,
+                error = ?err,
+                "env-envelope delete failed during CloseSession"
+            );
+        }
+    }
+
     info!(%session_id, "session closed by client");
 }
 
 /// Close a window: destroy every session it owns and remove the window from
 /// the workspace manager so it won't be resurrected on the next client launch.
+///
+/// Per T019, also sweeps every env envelope under the closing window's
+/// `restore/env/<window_id>/` directory (and the matching keystore DEKs).
+/// This is the "clean close" path; the PTY-EOF / child-exit path in
+/// [`finalize_pty_reader`] deliberately preserves envelopes so they remain
+/// available for cold-restart restore.
 async fn handle_close_window(window_id: WindowId, context: &ClientDispatchContext<'_>) {
     if window_id != context.window_id {
         send_error(context.writer, &format!("cannot close another window: {window_id}")).await;
@@ -1364,6 +1485,18 @@ async fn handle_close_window(window_id: WindowId, context: &ClientDispatchContex
     }
     wm.remove_window(window_id);
     drop(wm);
+
+    // Best-effort envelope sweep for the whole window. Idempotent — a
+    // missing per-window dir is treated as success. Failures are logged
+    // but do not block the WindowClosed reply.
+    if let Err(err) = crate::env_store::store::delete_window_envelopes(window_id).await {
+        warn!(
+            target: "scribe_server::ipc_server",
+            %window_id,
+            error = ?err,
+            "env-envelope window sweep failed during CloseWindow"
+        );
+    }
 
     send_message(context.writer, &ServerMessage::WindowClosed { window_id }).await;
 }
@@ -1816,6 +1949,7 @@ async fn handle_config_reloaded(
     session_manager: &Arc<SessionManager>,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     live_sessions: &LiveSessionRegistry,
+    env_store: &Arc<crate::env_store::EnvStoreState>,
 ) {
     let cfg = match crate::config::load_config() {
         Ok(cfg) => {
@@ -1867,6 +2001,93 @@ async fn handle_config_reloaded(
         sessions = sessions_len,
         "config reload applied to live sessions"
     );
+
+    apply_env_persistence_transition(env_store, live_sessions).await;
+}
+
+/// T035: react to a `terminal.env_persistence.enabled` flip across a
+/// `ConfigReloaded`.
+///
+/// On `false → true`: no proactive action — `hook_ingress` already
+/// lazy-initializes per-session `env_store` machinery on the next
+/// baseline-ready `EnvChanged`. Just emit a marker log.
+///
+/// On `true → false`: stop every per-session persist timer (via
+/// [`EnvStoreState::drop_scheduler`]) and best-effort delete every
+/// envelope under `restore/env/<window_id>/` for every distinct
+/// `env_window_id` in the live-session registry (via
+/// [`env_store::store::delete_window_envelopes`]). Failures are logged at
+/// warn and do not abort the reload — per FR-009 + R4.6 the disable
+/// transition is an explicit user action that fully discards on-disk
+/// state, but a partial-delete failure must not poison the rest of the
+/// reload path.
+///
+/// Reads the freshly-on-disk feature flag via
+/// `scribe_common::config::load_config()` and atomically swaps it into
+/// [`EnvStoreState`]'s cached `last_enabled`. No-op when the flag did
+/// not change.
+async fn apply_env_persistence_transition(
+    env_store: &Arc<crate::env_store::EnvStoreState>,
+    live_sessions: &LiveSessionRegistry,
+) {
+    let new_enabled = match scribe_config::load_config() {
+        Ok(cfg) => cfg.terminal.env_persistence.enabled,
+        Err(e) => {
+            warn!(
+                target: "scribe_server::ipc_server",
+                error = %e,
+                "skipping env-persistence transition check: config load failed"
+            );
+            return;
+        }
+    };
+    let old_enabled = env_store.swap_last_enabled(new_enabled);
+
+    if old_enabled == new_enabled {
+        return;
+    }
+
+    if old_enabled && !new_enabled {
+        // Disable transition: stop schedulers across all sessions and
+        // best-effort delete every envelope under each distinct
+        // `env_window_id`. Snapshot session_ids + window_ids under the
+        // read lock, then drop the lock before doing any async work that
+        // could await for a non-trivial time.
+        let (session_ids, window_ids): (Vec<SessionId>, HashSet<WindowId>) = {
+            let sessions = live_sessions.read().await;
+            let ids: Vec<SessionId> = sessions.keys().copied().collect();
+            let wids: HashSet<WindowId> =
+                sessions.values().map(|live| live.env_window_id).collect();
+            (ids, wids)
+        };
+
+        for sid in &session_ids {
+            env_store.drop_scheduler(*sid).await;
+        }
+
+        for wid in &window_ids {
+            if let Err(e) = crate::env_store::store::delete_window_envelopes(*wid).await {
+                warn!(
+                    target: "scribe_server::ipc_server",
+                    error = ?e,
+                    window_id = %wid,
+                    "delete_window_envelopes failed on env-persistence disable transition"
+                );
+            }
+        }
+
+        info!(
+            target: "scribe_server::ipc_server",
+            sessions = session_ids.len(),
+            windows = window_ids.len(),
+            "env persistence disabled; schedulers dropped and envelopes deleted"
+        );
+    } else {
+        info!(
+            target: "scribe_server::ipc_server",
+            "env persistence enabled; per-session machinery will initialize on next EnvChanged event"
+        );
+    }
 }
 
 fn load_preserve_ai_scrollback_setting() -> bool {
@@ -1890,8 +2111,51 @@ fn load_scrollback_lines_setting() -> usize {
 }
 
 /// Broadcast `QuitRequested` to all connected clients, including the sender.
-async fn handle_quit_all(sender_window_id: WindowId, connected_clients: &ConnectedClients) {
+///
+/// Per T019, also sweeps every env envelope under every live window before
+/// telling clients to shut down. Clients will follow up with their own
+/// `CloseWindow` messages, but a per-window pre-sweep here protects against
+/// clients that fail to ack `QuitRequested` (crash, race, transport drop) —
+/// without it, those envelopes would survive across the quit. The
+/// `delete_window_envelopes` path is idempotent, so the subsequent
+/// `CloseWindow` sweeps are no-ops if they still arrive.
+///
+/// Window enumeration unions `connected_clients` keys and
+/// `workspace_manager::window_ids_with_sessions` (same merge
+/// `handle_list_windows` uses) so disconnected windows that still own live
+/// sessions are not skipped.
+async fn handle_quit_all(
+    sender_window_id: WindowId,
+    connected_clients: &ConnectedClients,
+    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
+) {
     info!(%sender_window_id, "QuitAll requested — broadcasting QuitRequested");
+
+    // Compute the union of live windows before any client teardown can
+    // mutate workspace state. Read locks here only — no async work under
+    // them — so the order matches `handle_list_windows`.
+    let window_ids: HashSet<WindowId> = {
+        let clients = connected_clients.read().await;
+        let wm = workspace_manager.read().await;
+        let mut ids: HashSet<WindowId> = wm.window_ids_with_sessions();
+        ids.extend(clients.keys().copied());
+        ids
+    };
+
+    // Best-effort per-window envelope sweep. Done before broadcasting
+    // `QuitRequested` so the deletes are not racing client-driven
+    // `CloseWindow` traffic.
+    for window_id in &window_ids {
+        if let Err(err) = crate::env_store::store::delete_window_envelopes(*window_id).await {
+            warn!(
+                target: "scribe_server::ipc_server",
+                %window_id,
+                error = ?err,
+                "env-envelope window sweep failed during QuitAll"
+            );
+        }
+    }
+
     let clients = connected_clients.read().await;
     let quit_msg = ServerMessage::QuitRequested;
     for writer in clients.values() {
@@ -1963,6 +2227,32 @@ async fn handle_dispatch_action(
     }
 
     send_message(writer, &ServerMessage::ActionDispatched { window_id: target_window_id }).await;
+}
+
+/// Run the OS keystore preflight probe on behalf of the settings UI and
+/// reply with `ServerMessage::EnvPreflightResult`.
+///
+/// `EnvPreflight` is a user-triggered, infrequent request (toggle in
+/// Settings → Terminal → General). The handler awaits the keystore probe
+/// inline — `keystore::preflight()` already wraps the synchronous keyring
+/// calls in `spawn_blocking`, so the dispatch loop is not stalled. No
+/// retry, throttle, or rate limit is applied here per design.
+async fn handle_env_preflight(writer: &SharedWriter) {
+    let result = match crate::env_store::keystore::preflight().await {
+        Ok(()) => ServerMessage::EnvPreflightResult { ok: true, error: None },
+        Err(e) => {
+            tracing::warn!(
+                target: "scribe_server::ipc_server",
+                error = ?e,
+                "env preflight failed"
+            );
+            ServerMessage::EnvPreflightResult {
+                ok: false,
+                error: Some(crate::env_store::keystore::to_preflight_error(&e)),
+            }
+        }
+    };
+    send_message(writer, &result).await;
 }
 
 /// Send a `ServerMessage` to the client, logging errors.
@@ -2979,9 +3269,18 @@ pub async fn activate_pending_sessions(
 
     for (session_id, workspace_id) in pending {
         if let Some(session) = session_manager.take_session(session_id).await {
+            // Look up the handoff-restored window owner. Falls back to a
+            // fresh window id if the workspace manager somehow lost the
+            // mapping — handoff-restored sessions carry
+            // `env_envelope_id = None`, so close-time envelope delete is a
+            // no-op in that case anyway.
+            let window_id = workspace_manager
+                .read()
+                .await
+                .window_for_session(session_id)
+                .unwrap_or_else(WindowId::new);
             start_session(
-                session_id,
-                workspace_id,
+                StartSessionIds { session: session_id, workspace: workspace_id, window: window_id },
                 session,
                 InitialAttachment { writer: None, attached_ids: None },
                 SessionRuntimeContext { workspace_manager, live_sessions },
@@ -3000,6 +3299,107 @@ pub async fn defuse_for_handoff(live_sessions: &LiveSessionRegistry) {
             // ManuallyDrop does not call the inner type's Drop on scope exit.
             let _defused = std::mem::ManuallyDrop::new(pty);
             info!(%session_id, "defused Pty to prevent SIGHUP on exit");
+        }
+    }
+}
+
+/// Spawn the long-running env-status broadcaster (T036).
+///
+/// Subscribes to the [`crate::env_store::EnvStoreState`]'s status-transition
+/// broadcast channel and, for each `(session_id, internal_state)` tick,
+/// looks up the owning session's [`ClientWriter`] from `live_sessions` and
+/// sends `ServerMessage::EnvStatus` to the client. Mirrors the fail-open
+/// pattern used by [`crate::hook_ingress::handle`]: a missing live-session
+/// entry (session closed between transition and forward) is logged at
+/// debug and the event is dropped.
+///
+/// The task ends only when the broadcast sender is dropped (i.e. the
+/// `EnvStoreState` itself goes away on server shutdown). `Lagged` errors
+/// are also logged at debug and recovery continues — the current status is
+/// always retrievable via [`crate::env_store::EnvStoreState::get_status`],
+/// so a missed broadcast is informational only.
+pub fn spawn_env_status_forwarder(
+    env_store: &Arc<crate::env_store::EnvStoreState>,
+    live_sessions: LiveSessionRegistry,
+) {
+    let mut rx = env_store.subscribe_status();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok((session_id, internal_state)) => {
+                    forward_env_status(&live_sessions, session_id, internal_state).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Subscriber fell behind by more than the channel
+                    // capacity. The current status is recoverable via
+                    // `EnvStoreState::get_status`; we just log and resume.
+                    debug!(
+                        target: "scribe_server::ipc_server",
+                        skipped,
+                        "env-status forwarder lagged; resuming"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    // All senders dropped — the env-store is gone. Server
+                    // is shutting down; exit cleanly.
+                    debug!(
+                        target: "scribe_server::ipc_server",
+                        "env-status broadcast closed; forwarder exiting"
+                    );
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Helper for the env-status forwarder loop: resolves the session's client
+/// writer and forwards one transition. Extracted from
+/// [`spawn_env_status_forwarder`] to flatten the loop body and keep block
+/// nesting under Clippy's `excessive_nesting` threshold.
+async fn forward_env_status(
+    live_sessions: &LiveSessionRegistry,
+    session_id: SessionId,
+    internal_state: crate::env_store::EnvStatusState,
+) {
+    let client_writer = {
+        let sessions = live_sessions.read().await;
+        sessions.get(&session_id).map(|s| Arc::clone(&s.client_writer))
+    };
+    let Some(client_writer) = client_writer else {
+        // Session closed between the persist task's transition emit and
+        // our forward — drop silently. Mirrors `hook_ingress::handle`'s
+        // contract.
+        debug!(
+            target: "scribe_server::ipc_server",
+            ?session_id,
+            "EnvStatus transition for unknown session — dropped"
+        );
+        return;
+    };
+
+    let msg = ServerMessage::EnvStatus { session_id, state: env_status_to_wire(&internal_state) };
+    send_to_client(&client_writer, &msg).await;
+    debug!(
+        target: "scribe_server::ipc_server",
+        ?session_id,
+        ?internal_state,
+        "forwarded EnvStatus transition to client"
+    );
+}
+
+/// Convert the server-internal [`crate::env_store::EnvStatusState`] to its
+/// wire-protocol counterpart for emission on
+/// [`ServerMessage::EnvStatus`]. Kept as a free function so the `env_store`
+/// module stays free of `scribe_common::protocol` imports.
+fn env_status_to_wire(
+    s: &crate::env_store::EnvStatusState,
+) -> scribe_common::protocol::EnvStatusState {
+    use scribe_common::protocol::EnvStatusState as Wire;
+    match s {
+        crate::env_store::EnvStatusState::Active => Wire::Active,
+        crate::env_store::EnvStatusState::Degraded { reason } => {
+            Wire::Degraded { reason: reason.clone() }
         }
     }
 }
