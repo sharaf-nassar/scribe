@@ -86,6 +86,8 @@ Splitting a workspace automatically equalizes all workspace ratios so every regi
 
 On reconnect, a reported workspace tree is authoritative for workspace topology. Only the legacy no-tree fallback applies `WorkspaceInfo.split_direction` patches, and each workspace is patched once during startup so later tab or session updates cannot rearrange the live split tree.
 
+`handle_session_list` must apply per-workspace `WorkspaceListEntry` metadata (name, accent color, project root) *after* `reconstruct_workspaces_for_sessions` runs — the reconstruction path does `self.window_layout = WindowLayout::from_tree(tree)` and replaces the layout wholesale, so any names applied before reconstruction are silently dropped. Post-handoff the preserved shells emit no fresh OSC 7, so SessionList is the only source of workspace names at reconnect.
+
 ### Tab State
 
 Each tab in a workspace owns a `LayoutTree` for its panes, a focused pane ID, and an optional text selection. Tabs are created, removed, and reordered within their workspace slot.
@@ -94,7 +96,7 @@ Each tab in a workspace owns a `LayoutTree` for its panes, a focused pane ID, an
 
 GPU-rendered tab bar in [[crates/scribe-client/src/tab_bar.rs]] generating [[crates/scribe-client/src/tab_bar.rs#TabBarColors]] from [[crates/scribe-client/src/tab_bar.rs#TabData]] using the same glyph atlas as the terminal grid.
 
-[[crates/scribe-client/src/tab_bar.rs#TabBarColors]] is derived from `ChromeColors` and holds background, active background, text, separator, gradient-top, and accent color values. [[crates/scribe-client/src/tab_bar.rs#TabData]] carries per-tab title, active flag, optional AI indicator color, and an optional transient `tab_flash` intensity (a short theme-accent blend over the tab background that self-decays over `TAB_FLASH_SECS` ≈0.45s via the same animation/redraw envelope as the scrollbar fade, additive over active/hover styling and the AI indicator). The background is rendered as a two-tone vertical gradient (lighter top half, base bottom half) via `build_tab_bar_bg`. The active tab receives a uniform highlight color and a 2px accent indicator on its bottom edge. An AI state dot (from `TabData.ai_indicator`) is rendered in the tab when a session has an active AI state. For provider task-label sessions, the title prefers the last hook-emitted task label while that label is active, then falls back to the normal shell title. Tab titles are truncated to fit the available column width. In multi-workspace mode, named workspaces display a badge pill with a deterministic accent color; unnamed workspaces show no badge.
+[[crates/scribe-client/src/tab_bar.rs#TabBarColors]] is derived from `ChromeColors` and holds background, active background, text, separator, gradient-top, and accent color values. [[crates/scribe-client/src/tab_bar.rs#TabData]] carries per-tab title, active flag, optional AI indicator color, and an optional transient `tab_flash` intensity (a short theme-accent blend over the tab background that self-decays over `TAB_FLASH_SECS` ≈0.45s via the same animation/redraw envelope as the scrollbar fade, additive over active/hover styling and the AI indicator). The background is rendered as a two-tone vertical gradient (lighter top half, base bottom half) via `build_tab_bar_bg`. The active tab receives a uniform highlight color and a 2px accent indicator on its bottom edge. An AI state dot (from `TabData.ai_indicator`) is rendered in the tab when a session has an active AI state. For provider task-label sessions, the title prefers the last hook-emitted task label while that label is active, then falls back to the normal shell title. Tab titles are truncated to fit the available column width. In multi-workspace mode, named workspaces display a badge pill with a deterministic accent color; unnamed workspaces show no badge. The pill quad and per-cell backgrounds both span `space + name + space + trailing-gap` so the accent fills the full `badge_columns` allocation up to the next tab boundary — the gap cells are emitted with `pill_bg` rather than the chrome bg, otherwise the cell-bg pass would punch through the underlying quad and leave a visible strip between the badge and the first tab.
 
 Tab rows wrap only after subtracting the same rendered badge and right-edge icon reservations used by the text pass. [[crates/scribe-client/src/tab_bar.rs#compute_tab_bar_height]] and active-tab range calculation share that reservation so a narrow workspace cannot allocate a blank extra row while the tabs still fit on one row.
 
@@ -158,11 +160,13 @@ The modal renderer keeps terminal-cell geometry while spacing header tabs, note 
 
 Hover previews are derived from active notes only and rendered by [[crates/scribe-client/src/workspace_notes_preview.rs#build_workspace_notes_preview]]. [[crates/scribe-client/src/main.rs#App#apply_workspace_notes_preview_overlay]] draws the bounded preview above terminal content but before modal overlays, while suppressing it behind the notes modal, context menu, close dialog, and update dialog.
 
-The hover preview stays open while the pointer is over the workspace badge or preview bounds. Visible preview notes highlight on hover, and clicking one sends `ArchiveNote { reason: Done }` so lightweight note cleanup does not require opening the modal.
+The hover preview stays open while the pointer is over the workspace badge or preview bounds. Visible preview notes highlight on hover with a left accent bar drawn by `draw_row_hover` (no row-wide tint — the bar plus brighter `hover_text` carry the selection signal), and clicking one sends `ArchiveNote { reason: Done }` so lightweight note cleanup does not require opening the modal.
 
 ### Inline Note Editor
 
 The hover preview exposes an inline note-capture affordance — a `~2 col × 1 row` bordered "+" cell — that lets a user create a new active note without opening the modal.
+
+Visual treatment: when the editor is open the row uses an underline-only style (no box fill, no top/side borders) with a leading accent "›" prompt indicator rendered by `draw_editor_text`. An `EDITOR_PREFIX_COLS`-wide indent is reserved across wrapped continuation rows so the caret column stays aligned, and `editor_content_cols` subtracts the prefix from the wrap budget so layout sizing and `clamp_scroll_to_caret` agree with the renderer.
 
 Affordance routing: the read-only preview reserves a bottom row for a bordered "+" cell positioned with one cell of inset from the preview's right and bottom inner borders. Its hit-rect is published on [[crates/scribe-client/src/workspace_notes_preview.rs#WorkspaceNotesPreviewInteraction]]`.affordance_rect`. Hover state is tracked by the new `App` field `affordance_hovered_workspace`. Click routing in [[crates/scribe-client/src/main.rs#App#handle_workspace_notes_preview_mouse_press]] hit-tests the affordance before existing note-row archival, and on hit calls [[crates/scribe-client/src/main.rs#App#open_inline_note_editor]].
 
@@ -215,7 +219,23 @@ The hover-preview inline editor (see [[client#Workspace Notes]]) inserts itself 
 3. Terminal shortcuts (word navigation, line navigation)
 4. Generic terminal key translation produces PTY bytes — legacy xterm modifier encoding, or full Kitty CSI-u when the focused application negotiated the keyboard protocol
 
-Pane-local terminals enable kitty keyboard tracking so an application's negotiated progressive-enhancement flags shape encoding. [[crates/scribe-client/src/pane.rs#Pane#new]] turns tracking on; [[crates/scribe-client/src/main.rs#App#focused_keyboard_protocol]] reads all five negotiated flags from the focused pane's `Term` mode into [[crates/scribe-client/src/input.rs#KittyFlags]] (forced all-off when the `[terminal]` `keyboard_protocol_enhanced` opt-out is disabled); the level-4 encoder then emits conformant CSI-u for every key/modifier combination — including modifier and lock keys, and key-repeat/release events when `report_event_types` is negotiated. With no flag negotiated the legacy byte encoding is reproduced byte-identically. Codex panes still map Alt+Enter to Codex's newline binding before the generic path.
+Pane-local terminals enable kitty keyboard tracking so an application's negotiated progressive-enhancement flags shape encoding. [[crates/scribe-client/src/pane.rs#Pane#new]] turns tracking on; [[crates/scribe-client/src/main.rs#App#focused_terminal_mode]] bundles the five negotiated flags from the focused pane's `Term` mode together with the two DEC private modes (`APP_CURSOR` for DECCKM, `APP_KEYPAD` for DECPAM) into [[crates/scribe-client/src/input.rs#TerminalMode]] — Kitty flags are forced all-off when the `[terminal]` `keyboard_protocol_enhanced` opt-out is disabled, but the DEC modes always reflect the pane so terminfo `smkx` / `rmkx` keeps working. The level-4 encoder then emits conformant CSI-u for every key/modifier combination — including modifier and lock keys, and key-repeat/release events when `report_event_types` is negotiated. With no Kitty flag negotiated the legacy byte encoding is reproduced byte-identically. Codex panes still map Alt+Enter to Codex's newline binding before the generic path.
+
+#### DEC Application Modes
+
+The level-4 encoder consults DECCKM and DECPAM so unmodified arrows and numpad keys switch escape forms in app-cursor / app-keypad mode.
+
+Apps such as `less`, `vim`, `top`, and `htop` enable DECCKM via terminfo's `smkx` capability when they start. If the encoder kept emitting CSI form (`\x1b[A`) instead of SS3 form (`\x1bOA`), those pagers silently swallow cursor keys because their terminfo `kcuu1` describes the SS3 byte sequence.
+
+| Key                       | DECCKM off (default) | DECCKM on    |
+|---------------------------|----------------------|--------------|
+| Bare ArrowUp/Down/Left/Right | `\x1b[A..D`         | `\x1bOA..D`  |
+| Bare Home / End           | `\x1b[H`, `\x1b[F`   | `\x1bOH`, `\x1bOF` |
+| Modified arrow / Home / End | `\x1b[1;<mod><L>` (same regardless of DECCKM) | same |
+
+[[crates/scribe-client/src/input.rs#translate_named_csi_letter]] picks the SS3 form when `app_cursor` is set and no modifier is held; otherwise it emits the modifier-aware CSI form. Modified chords always use CSI because SS3 has no slot for the xterm modifier parameter — this matches alacritty's default bindings and xterm's `modifyCursorKeys=2`.
+
+Numeric-keypad keys (`KeyLocation::Numpad`) emit SS3 sequences when DECPAM is active and no modifier is held: digits `0..9` map to `\x1bOp..\x1bOy`, `.,-+*/=` map to `\x1bOn`/`\x1bOl`/`\x1bOm`/`\x1bOk`/`\x1bOj`/`\x1bOo`/`\x1bOX`, and numpad Enter maps to `\x1bOM`. [[crates/scribe-client/src/input.rs#translate_numpad_app_keypad]] runs ahead of the legacy / Kitty dispatch so the numpad table wins over the generic encoder for those events.
 
 ### Layout Actions
 
@@ -331,7 +351,7 @@ The shared animation loop uses a generation token per spawned thread, so fast st
 
 Priority order: PermissionPrompt > WaitingForInput > IdlePrompt > Error > Processing. Each state has configurable color, pulse frequency, tab indicator, and pane border settings. Error state decays over a timeout. Attention states (IdlePrompt, WaitingForInput, PermissionPrompt) clear on keystroke. Both `IdlePrompt` and `WaitingForInput` share the same `waiting_for_input` indicator config (color, pulse, timeout).
 
-Tab inline context % is gated via [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#tab_context_suffix]]; see [[client#Tab Bar]] for the gating rules and rendering details.
+Tab inline context % is gated via [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#tab_context_suffix]]; see [[client#Tab Bar]] for the gating rules and rendering details. The percent itself lives in a parallel `last_contexts` map alongside `detected_providers`, so a border-clear (stale-Processing prune, attention-state keystroke clear, Error decay) does not drop it — see [[client#AI Indicator#Context Survives State Clears]]. The map is cleared explicitly on session removal and on conversation change via [[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#clear_context]], called from [[crates/scribe-client/src/main.rs#App#maybe_reset_prompts_on_conversation_change]].
 
 On reconnect, active AI state is populated from `SessionInfo.ai_state` during handle_session_list so indicators appear immediately without waiting for the per-session `AiStateChanged` messages from the server's `send_stored_metadata` path. `SessionInfo.ai_provider_hint` is restored separately so clipboard cleanup and other provider-aware behavior survive reconnect even when no visible indicator should be shown. When available, `SessionInfo.ai_state.conversation_id` is also used to seed per-pane AI resume bindings so restored windows attempt targeted resume of prior provider sessions.
 
@@ -347,7 +367,7 @@ A genuinely-working session keeps re-arming the envelope across hook-silent tool
 
 A rested pulse still shows its state's *colour*. A crashed or killed AI would otherwise show a stale `Processing` border forever: it can never fire its own terminal hook, and the server supervises only the shell.
 
-[[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#clear_stale_processing]] removes any `Processing` state with no liveness (hook edge or PTY output) for `STALE_PROCESSING_CLEAR`. It uses a wall-clock map (`last_activity_instant`) rather than the f32 animation clock, which freezes once the loop retires — the very case this must still catch. The client calls it lazily from [[crates/scribe-client/src/main.rs#App#about_to_wait]]: zero cost until something is stuck, and resolved before the indicator is observed (the user returning wakes the loop). Only `Processing` is cleared — attention states legitimately persist until the human acts — and `detected_providers` is preserved so provider-aware clipboard cleanup survives, mirroring reconnect.
+[[crates/scribe-client/src/ai_indicator.rs#AiStateTracker#clear_stale_processing]] removes any `Processing` state with no liveness (hook edge or PTY output) for `STALE_PROCESSING_CLEAR`. It uses a wall-clock map (`last_activity_instant`) rather than the f32 animation clock, which freezes once the loop retires — the very case this must still catch. The client calls it lazily from [[crates/scribe-client/src/main.rs#App#about_to_wait]]: zero cost until something is stuck, and resolved before the indicator is observed (the user returning wakes the loop). Only `Processing` is cleared — attention states legitimately persist until the human acts — and `detected_providers` plus `last_contexts` are preserved so provider-aware clipboard cleanup survives and the context % stays visible in tabs and prompt bars, mirroring reconnect.
 
 #### Occlusion Gating
 
@@ -388,6 +408,26 @@ Verifies that a long-idle attention state (`WaitingForInput`) is not hard-cleare
 ### activity_rearms_stale_processing
 
 Verifies that `note_activity` resets the wall-clock staleness timer so a Processing state that showed a sign of life before the prune is spared.
+
+### Context Survives State Clears
+
+Context-window percentage is tracked separately from transient AI state so UI clears do not hide still-current context pressure.
+
+#### context_survives_stale_processing_clear
+
+Verifies that a stale `Processing` clear removes the transient state while preserving the last context percent for the tab suffix.
+
+#### context_survives_attention_keystroke_clear
+
+Verifies that keystroke-driven attention-state clearing preserves the last context percent and allows the tab suffix to reappear.
+
+#### clear_context_wipes_for_conversation_change
+
+Verifies that an explicit context clear removes the stored percent when the pane moves to a different conversation.
+
+#### context_remove_clears_last_context
+
+Verifies that removing a session also removes its stored context percent so no stale tab suffix survives session teardown.
 
 ## Desktop Notifications
 

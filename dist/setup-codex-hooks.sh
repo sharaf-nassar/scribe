@@ -34,6 +34,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -n "$HOOK_SOURCE" ]]; then
+    if [[ "$HOOK_SOURCE" != /* ]]; then
+        if RESOLVED_HOOK_SOURCE=$(cd "$HOOK_SOURCE" 2>/dev/null && pwd -P); then
+            HOOK_SOURCE="$RESOLVED_HOOK_SOURCE"
+        fi
+    fi
     export SCRIBE_INSTALL_PREFIX="$HOOK_SOURCE"
 fi
 
@@ -76,10 +81,9 @@ if features_start is None:
         text += "\n"
     text += "[features]\n"
     text += "hooks = true\n"
-    text += "codex_hooks = true\n"
 else:
     hooks_replaced = False
-    codex_hooks_replaced = False
+    removed_codex_hooks = False
     next_lines = lines[:features_start + 1]
     for line in lines[features_start + 1:features_end]:
         key = line.split("=", 1)[0].strip()
@@ -87,14 +91,11 @@ else:
             next_lines.append("hooks = true")
             hooks_replaced = True
         elif key == "codex_hooks":
-            next_lines.append("codex_hooks = true")
-            codex_hooks_replaced = True
+            removed_codex_hooks = True
         else:
             next_lines.append(line)
     if not hooks_replaced:
         next_lines.append("hooks = true")
-    if not codex_hooks_replaced:
-        next_lines.append("codex_hooks = true")
     lines = next_lines + lines[features_end:]
     text = "\n".join(lines)
     if lines:
@@ -103,7 +104,8 @@ else:
 config_path.write_text(text)
 print(f"  Updated {config_path}")
 print("  Enabled [features].hooks = true")
-print("  Enabled [features].codex_hooks = true")
+if features_start is not None and removed_codex_hooks:
+    print("  Removed deprecated Codex hook feature alias")
 PYEOF
 
 # ── Step 3: Merge Scribe hooks into hooks.json or inline TOML ────────────
@@ -126,8 +128,8 @@ def find_scribe_install_prefix():
         "/usr/share/scribe-dev",
         "/usr/local/share/scribe",
         "/usr/local/share/scribe-dev",
-        "/Applications/Scribe.app/Contents/Resources/dist",
-        "/Applications/Scribe-Dev.app/Contents/Resources/dist",
+        "/Applications/Scribe.app/Contents/Resources",
+        "/Applications/Scribe-Dev.app/Contents/Resources",
     ):
         if os.path.isfile(os.path.join(p, "ai-hook-codex.sh")):
             return p

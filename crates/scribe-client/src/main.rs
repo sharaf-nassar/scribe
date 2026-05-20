@@ -72,7 +72,7 @@ use winit::window::Window;
 
 use crate::ai_indicator::AiStateTracker;
 use crate::divider::DividerDrag;
-use crate::input::{KeyAction, KittyFlags, LayoutAction};
+use crate::input::{KeyAction, KittyFlags, LayoutAction, TerminalMode};
 use crate::ipc_client::{ClientCommand, UiEvent};
 use crate::layout::{PaneEdges, PaneId, Rect};
 use crate::pane::{CommandRecord, CommandStatus, FeedOutputResult, Pane};
@@ -2320,20 +2320,6 @@ impl App {
 
         tracing::info!(count = sessions.len(), "reattaching to existing sessions");
 
-        // Apply per-workspace metadata (names, accent colors, project roots)
-        // up front so the reconstructed layout carries correct styling before
-        // the first pane is drawn. Replaces the legacy per-session
-        // `WorkspaceInfo` fan-out that used to follow every attach.
-        for entry in workspaces {
-            self.handle_workspace_info(WorkspaceInfoUpdate {
-                workspace_id: entry.workspace_id,
-                name: entry.name.clone(),
-                accent_color: entry.accent_color.clone(),
-                split_direction: entry.split_direction,
-                project_root: entry.project_root.clone(),
-            });
-        }
-
         let attach_ids = collect_session_ids(sessions);
         let metadata = build_session_metadata_map(sessions);
         let groups = group_sessions_by_workspace(sessions);
@@ -2347,6 +2333,23 @@ impl App {
             &groups,
             &live_workspace_ids,
         );
+
+        // Apply per-workspace metadata AFTER the layout is reconstructed —
+        // `reconstruct_from_tree` does `self.window_layout = ::from_tree(...)`
+        // which replaces the layout wholesale, so any pre-reconstruction
+        // updates from `handle_workspace_info` would be silently dropped.
+        // Post-handoff the preserved shells don't print fresh prompts, so
+        // there is no follow-up `WorkspaceNamed` event to fix the badge —
+        // the SessionList entries are the only source of truth here.
+        for entry in workspaces {
+            self.handle_workspace_info(WorkspaceInfoUpdate {
+                workspace_id: entry.workspace_id,
+                name: entry.name.clone(),
+                accent_color: entry.accent_color.clone(),
+                split_direction: entry.split_direction,
+                project_root: entry.project_root.clone(),
+            });
+        }
         let ws_rects_map = self.compute_ws_dim_maps().1;
         let Some(fallback_viewport) = self.fallback_workspace_viewport() else { return };
         let reconnect_context = ReconnectRestoreContext {
@@ -3706,6 +3709,9 @@ impl App {
             pane.latest_prompt_finished_at = None;
             pane.prompt_count = 0;
             pane.prompt_ui.dismissed = false;
+            // New conversation starts a fresh context window; the prior
+            // conversation's percent must not bleed over.
+            self.ai_tracker.clear_context(session_id);
             if self.config.terminal.prompt_bar.enabled && (old_lines > 0 || was_dismissed) {
                 self.resize_after_prompt_bar_height_change();
             }
@@ -5208,9 +5214,9 @@ impl App {
             return;
         }
 
-        let kitty_flags = self.focused_keyboard_protocol();
+        let term_mode = self.focused_terminal_mode();
         let Some(mut action) =
-            input::translate_key_action(event, self.modifiers, &self.bindings, kitty_flags)
+            input::translate_key_action(event, self.modifiers, &self.bindings, term_mode)
         else {
             return;
         };
@@ -5218,7 +5224,7 @@ impl App {
         if matches!(action, KeyAction::Terminal(_))
             && self.should_send_codex_alt_enter_newline(event)
         {
-            action = KeyAction::Terminal(codex_alt_enter_newline_bytes(kitty_flags));
+            action = KeyAction::Terminal(codex_alt_enter_newline_bytes(term_mode.kitty));
         }
 
         match action {
@@ -5230,29 +5236,37 @@ impl App {
         }
     }
 
-    /// Derive the focused pane's negotiated Kitty enhancement flags from its
-    /// terminal mode. Only the focused pane is consulted (per-pane isolation,
-    /// SC-008). Forced all-false when the master config opt-out is disabled
-    /// (FR-006), giving byte-identical legacy encoding regardless of
-    /// negotiation.
-    fn focused_keyboard_protocol(&self) -> KittyFlags {
+    /// Derive the focused pane's full terminal-protocol state for level-4
+    /// encoding: negotiated Kitty enhancement flags plus DECCKM / DECPAM.
+    /// Only the focused pane is consulted (per-pane isolation, SC-008).
+    /// Kitty flags are forced all-false when the master config opt-out is
+    /// disabled (FR-006); DECCKM / DECPAM always reflect the pane's
+    /// `TermMode` so terminfo `smkx` / `rmkx` keep working under that
+    /// opt-out.
+    fn focused_terminal_mode(&self) -> TerminalMode {
         use alacritty_terminal::term::TermMode;
 
-        if !self.config.terminal.keyboard_protocol_enhanced {
-            return KittyFlags::legacy_set();
-        }
-
         let Some(pane) = self.focused_pane() else {
-            return KittyFlags::legacy_set();
+            return TerminalMode::legacy();
         };
 
         let mode = pane.term.mode();
-        KittyFlags::legacy_set()
-            .with_disambiguate(mode.contains(TermMode::DISAMBIGUATE_ESC_CODES))
-            .with_report_event_types(mode.contains(TermMode::REPORT_EVENT_TYPES))
-            .with_report_alternate_keys(mode.contains(TermMode::REPORT_ALTERNATE_KEYS))
-            .with_report_all_keys(mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC))
-            .with_report_associated_text(mode.contains(TermMode::REPORT_ASSOCIATED_TEXT))
+        let kitty = if self.config.terminal.keyboard_protocol_enhanced {
+            KittyFlags::legacy_set()
+                .with_disambiguate(mode.contains(TermMode::DISAMBIGUATE_ESC_CODES))
+                .with_report_event_types(mode.contains(TermMode::REPORT_EVENT_TYPES))
+                .with_report_alternate_keys(mode.contains(TermMode::REPORT_ALTERNATE_KEYS))
+                .with_report_all_keys(mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC))
+                .with_report_associated_text(mode.contains(TermMode::REPORT_ASSOCIATED_TEXT))
+        } else {
+            KittyFlags::legacy_set()
+        };
+
+        TerminalMode {
+            kitty,
+            app_cursor: mode.contains(TermMode::APP_CURSOR),
+            app_keypad: mode.contains(TermMode::APP_KEYPAD),
+        }
     }
 
     fn should_send_codex_alt_enter_newline(&self, event: &winit::event::KeyEvent) -> bool {

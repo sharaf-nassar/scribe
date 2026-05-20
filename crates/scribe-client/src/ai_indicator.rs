@@ -74,6 +74,14 @@ pub struct AiStateTracker {
     /// Unlike `states`, this is not cleared by timeouts or keystrokes — only
     /// by an explicit `AiStateCleared` / session removal.
     detected_providers: HashMap<SessionId, AiProvider>,
+    /// Most recent context-window % per session, decoupled from `states`.
+    ///
+    /// The pane border can rest or be pruned (stale-Processing clear,
+    /// attention-state keystroke clear, Error decay) without dropping the
+    /// percent — those events don't change how full the LLM's window is.
+    /// Cleared on session removal, explicit conversation change, and
+    /// explicit `AiStateCleared`. Mirrors the `detected_providers` lifetime.
+    last_contexts: HashMap<SessionId, u8>,
     /// Monotonically increasing time in seconds, used for pulse animation.
     animation_time: f32,
     /// Time each session entered its current state, for timeout expiry.
@@ -102,6 +110,7 @@ impl AiStateTracker {
         Self {
             states: HashMap::new(),
             detected_providers: HashMap::new(),
+            last_contexts: HashMap::new(),
             animation_time: 0.0,
             state_enter_times: HashMap::new(),
             last_activity_times: HashMap::new(),
@@ -120,6 +129,12 @@ impl AiStateTracker {
     /// States whose per-state `enabled` flag is `false` are silently ignored.
     pub fn update(&mut self, session_id: SessionId, ai_state: AiProcessState) {
         self.detected_providers.insert(session_id, ai_state.provider);
+        // Persist the percent independently of `states` so it survives
+        // pulse pruning. `None` doesn't overwrite — a state edge without
+        // a fresh Context=NN hook keeps the prior value visible.
+        if let Some(ctx) = ai_state.context {
+            self.last_contexts.insert(session_id, ctx);
+        }
         let entry = self.entry_for(&ai_state.state);
         if !entry.tab_indicator && !entry.pane_border {
             return;
@@ -318,6 +333,16 @@ impl AiStateTracker {
         self.last_activity_times.remove(&session_id);
         self.last_activity_instant.remove(&session_id);
         self.detected_providers.remove(&session_id);
+        self.last_contexts.remove(&session_id);
+    }
+
+    /// Drop the stored context % for a session without touching its state.
+    ///
+    /// Called on conversation change: a new conversation starts a fresh
+    /// window, so the prior conversation's percent would be misleading.
+    /// Border lifetime is unaffected.
+    pub fn clear_context(&mut self, session_id: SessionId) {
+        self.last_contexts.remove(&session_id);
     }
 
     /// Whether Claude Code has been detected in this session.
@@ -337,9 +362,13 @@ impl AiStateTracker {
 
     /// Return the latest context-window usage percentage for a session, or
     /// `None` when no context value has been received.
+    ///
+    /// Reads from `last_contexts`, so the percent survives any path that
+    /// prunes `states` (stale-Processing clear, attention-state keystroke
+    /// clear, Error decay).
     #[must_use]
     pub fn context_for(&self, session: SessionId) -> Option<u8> {
-        self.states.get(&session)?.context
+        self.last_contexts.get(&session).copied()
     }
 
     /// Return a colored context-% suffix to append to a tab label, or `None`
@@ -359,14 +388,17 @@ impl AiStateTracker {
         thresholds: &AiContextThresholds,
         fallback_color: [f32; 4],
     ) -> Option<(String, [f32; 4])> {
-        let ps = self.states.get(&session)?;
-        // Suppress suffix when pulsing/attention states are active.
-        if matches!(ps.state, AiState::PermissionPrompt | AiState::WaitingForInput) {
-            return None;
-        }
-        let ctx = ps.context?;
+        let ctx = self.last_contexts.get(&session).copied()?;
         if ctx < thresholds.warn {
             return None;
+        }
+        // Suppress only while a pulsing attention state is active so the
+        // pulse owns the UX. Once the state clears or rests, the suffix
+        // becomes visible again on the same percent.
+        if let Some(ps) = self.states.get(&session) {
+            if matches!(ps.state, AiState::PermissionPrompt | AiState::WaitingForInput) {
+                return None;
+            }
         }
         let hex = thresholds.color_for(ctx);
         let color =
@@ -898,5 +930,69 @@ mod tests {
             !tracker.clear_stale_processing(),
             "activity must reset the wall-clock staleness timer"
         );
+    }
+
+    // @lat: [[client#AI Indicator#Context Survives State Clears#context_survives_stale_processing_clear]]
+    #[test]
+    fn context_survives_stale_processing_clear() {
+        let mut tracker = AiStateTracker::default();
+        let sid = SessionId::new();
+        tracker.update(sid, make_state_with_ctx(AiState::Processing, 85));
+        tracker.last_activity_instant.insert(
+            sid,
+            Instant::now().checked_sub(STALE_PROCESSING_CLEAR + Duration::from_secs(1)).unwrap(),
+        );
+        assert!(tracker.clear_stale_processing(), "stale Processing must clear");
+        assert_eq!(
+            tracker.context_for(sid),
+            Some(85),
+            "context must survive stale-state clear so percent stays visible"
+        );
+        let thresholds = AiContextThresholds::default();
+        let suffix = tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR);
+        assert!(suffix.is_some(), "tab suffix must remain visible after stale clear");
+        assert_eq!(suffix.unwrap().0, " 85%");
+    }
+
+    // @lat: [[client#AI Indicator#Context Survives State Clears#context_survives_attention_keystroke_clear]]
+    #[test]
+    fn context_survives_attention_keystroke_clear() {
+        let mut tracker = AiStateTracker::default();
+        let sid = SessionId::new();
+        tracker.update(sid, make_state_with_ctx(AiState::WaitingForInput, 85));
+        tracker.clear_attention_states(sid);
+        assert_eq!(
+            tracker.context_for(sid),
+            Some(85),
+            "context must survive keystroke-driven attention clear"
+        );
+        let thresholds = AiContextThresholds::default();
+        let suffix = tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR);
+        assert!(suffix.is_some(), "tab suffix must reappear once the attention pulse is cleared");
+        assert_eq!(suffix.unwrap().0, " 85%");
+    }
+
+    // @lat: [[client#AI Indicator#Context Survives State Clears#clear_context_wipes_for_conversation_change]]
+    #[test]
+    fn clear_context_wipes_for_conversation_change() {
+        let mut tracker = AiStateTracker::default();
+        let sid = SessionId::new();
+        tracker.update(sid, make_state_with_ctx(AiState::Processing, 85));
+        tracker.clear_context(sid);
+        assert_eq!(
+            tracker.context_for(sid),
+            None,
+            "conversation change must wipe the prior conversation's percent"
+        );
+    }
+
+    // @lat: [[client#AI Indicator#Context Survives State Clears#context_remove_clears_last_context]]
+    #[test]
+    fn context_remove_clears_last_context() {
+        let mut tracker = AiStateTracker::default();
+        let sid = SessionId::new();
+        tracker.update(sid, make_state_with_ctx(AiState::Processing, 85));
+        tracker.remove(sid);
+        assert_eq!(tracker.context_for(sid), None, "session removal must drop stored context");
     }
 }
