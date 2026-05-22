@@ -196,6 +196,8 @@ Keybindings are parsed from config into a `Bindings` struct in [[crates/scribe-c
 
 Two layers prevent stray key events from compositor overlays (e.g. GNOME Screenshot) from reaching the PTY.
 
+Both layers also drive [[client#Input#IME Composition#Activation Gate]]: window-focus transitions flow through `notify_focus_change` (a single chokepoint reused by every pane / session focus path) which calls `refresh_ime_allowed`, and the per-tick X11 guard poll re-evaluates the gate so a compositor overlay's reactivation debounce also blocks IME until the window is truly active again.
+
 #### Winit Focus
 
 Keyboard events are only processed when the window has focus (`window_focused == true`). This catches overlays that trigger X11 `FocusOut` events.
@@ -213,6 +215,8 @@ Key events are resolved through a four-level priority chain from layout shortcut
 On macOS, bare `cmd+w` is handled before that chain and routed to the same close-request path as the native window close button, so it never falls through to pane bindings or terminal input.
 
 The hover-preview inline editor (see [[client#Workspace Notes]]) inserts itself at level 2: when `focused_inline_editor` is set, [[crates/scribe-client/src/main.rs#App#try_handle_inline_editor_keyboard]] consumes the key before the rest of the chain runs. This is in addition to the existing modal handler, which still receives keys through `handle_workspace_notes_window_event` when the modal is open.
+
+Above the level-4 encoder, [[crates/scribe-client/src/main.rs#App#key_consumed_by_ime]] short-circuits the dispatch at the entry of `handle_keyboard` whenever an OS IME composition is in flight, so synthesized winit key events that the IME is mid-composing never reach the legacy or Kitty encoder. See [[client#Input#IME Composition]] for the state machine that drives that predicate.
 
 1. Layout shortcuts (configurable keybindings) produce `LayoutAction` enum values
 2. Special commands (command palette, settings, find, hover-preview inline editor)
@@ -278,6 +282,30 @@ Window resize coalesces per event-loop tick rather than via a wall-clock debounc
 Every `WindowEvent::Resized` updates the local pane grid and sets `resize_pending`. [[crates/scribe-client/src/main.rs#App#flush_resize_if_pending]] runs in `about_to_wait` (per-tick batching) and from the input call sites — [[crates/scribe-client/src/main.rs#App#handle_terminal_key]], [[crates/scribe-client/src/main.rs#App#send_paste_data]], and [[crates/scribe-client/src/main.rs#App#perform_primary_paste]] — before any `KeyInput` is queued. The shared mpsc `Sender<ClientCommand>` preserves FIFO order, so the server processes `Resize` first; `tcsetwinsize` delivers `SIGWINCH` ahead of the bytes hitting the PTY, and bash updates `COLUMNS` before reading the next command.
 
 This mirrors alacritty/ghostty/wezterm/kitty/vte — none use a wall-clock debounce; all coalesce implicitly per tick or by last-known-size dedup.
+
+### IME Composition
+
+IME is wired via `WindowEvent::Ime` with a per-window `Option<PreeditState>`, gated on focus and surface, suppressing keys only during composition, routing committed text through the existing PTY write path.
+
+The state lives in [[crates/scribe-client/src/preedit.rs#PreeditState]] (composition text, optional caret byte range, and the absolute scrollback row + column where composition started). The state machine: `Enabled` arms the gate; the first non-empty `Ime::Preedit` creates a `PreeditState` anchored at the focused pane's current cursor cell; subsequent `Ime::Preedit` events update the text and caret on the same anchor; `Ime::Commit` clears `PreeditState` before sending the committed bytes through the normal `ClientMessage::KeyInput` path so the preedit overlay disappears in the same frame the PTY echo arrives; an empty-text `Ime::Preedit` or `Ime::Disabled` cancels and clears the state.
+
+#### Activation Gate
+
+The gate predicate is `window_focused && current_surface == TerminalPane`; the result is ANDed with the X11 active-window guard and pushed to `window.set_ime_allowed(...)` whenever it changes.
+
+[[crates/scribe-client/src/main.rs#App#ime_should_be_allowed]] handles the immutable surface check: it returns false when the search overlay, command palette, workspace-notes modal, close / update / context-menu dialogs, or the workspace-notes hover-preview inline editor (FR-005) is active. [[crates/scribe-client/src/main.rs#App#refresh_ime_allowed]] then ANDs that with `!compositor_overlay_active` (the X11 active-window guard, which mutates the post-reactivation debounce) and pushes the result to winit. The pushed value is memoised in `last_ime_allowed` so steady-state ticks (the per-frame `about_to_wait` call on Linux) short-circuit without touching winit IPC; the gate only flips when the computed value differs from the last push. Whenever the gate flips to disallowed, any in-flight `PreeditState` is dropped so focus loss or surface change immediately retires the visual overlay (FR-008) and clears the [[client#Input#Key Translation Priority]] short-circuit.
+
+#### Cursor-Rect Strategy
+
+[[crates/scribe-client/src/main.rs#App#push_ime_cursor_area]] is re-pushed from the redraw path whenever the focused pane's cursor cell coordinates change or the gate state flips, with a memoized last-pushed rect to dedup redundant winit calls.
+
+The cache lives in `last_ime_cursor_area`, so identical frames skip the winit IPC; pushes are suppressed entirely while the window is occluded (mirroring [[client#AI Indicator]]'s occlusion-gate pattern). `WindowEvent::Resized` and `WindowEvent::ScaleFactorChanged` force an immediate fresh push after the resize handler runs, and focused-pane changes invalidate the cache so the popup re-anchors on the new pane.
+
+#### Preedit Rendering
+
+The overlay layers above the terminal grid and below search / dialog overlays — a theme-foreground underline (Alacritty-minimal) anchored at the composition-start cell on a scrollback-stable absolute row, clipped at the pane right edge.
+
+[[crates/scribe-client/src/main.rs#App#preedit_overlay]] computes a `PreeditOverlay { origin_px, cell_px, text, max_cells }` per frame from the saved anchor and the focused pane's current layout, returning `None` while the viewport is scrolled into scrollback (`grid.display_offset() > 0`) so the underline can't render at the wrong visual row. Per-char advances come from `unicode_width::UnicodeWidthChar::width` (matching the renderer's styled-run accumulator), so CJK wide glyphs reserve two cells and zero-width combining marks ride the prior base glyph (a leading combining mark with no base is skipped). [[crates/scribe-client/src/main.rs#App#apply_preedit_overlay]] then emits a background fill behind the preedit cells, one glyph per advance via the existing cosmic-text + atlas path, and a 1px theme-foreground underline (hi-DPI scaled to ≥1 physical pixel) — per `research.md#R4`. Because the anchor uses an absolute scrollback row, terminal scroll keeps the preedit pinned to the originating line.
 
 ## IPC Client
 

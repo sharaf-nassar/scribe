@@ -15,6 +15,7 @@ mod mouse_state;
 mod notification_dispatcher;
 mod notifications;
 mod pane;
+mod preedit;
 mod prompt_bar;
 mod restore_replay;
 mod restore_state;
@@ -65,7 +66,7 @@ use scribe_renderer::types::{CellInstance, GridSize};
 use scribe_renderer::{RenderResources, TerminalRenderOptions, TerminalRenderer};
 use winit::application::ApplicationHandler;
 use winit::dpi::Pixel as _;
-use winit::event::WindowEvent;
+use winit::event::{Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::Window;
@@ -76,6 +77,7 @@ use crate::input::{KeyAction, KittyFlags, LayoutAction, TerminalMode};
 use crate::ipc_client::{ClientCommand, UiEvent};
 use crate::layout::{PaneEdges, PaneId, Rect};
 use crate::pane::{CommandRecord, CommandStatus, FeedOutputResult, Pane};
+use crate::preedit::{PreeditOverlay, PreeditState};
 use crate::workspace_layout::WindowLayout;
 use crate::workspace_notes::{AddingNoteState, ArchiveReason};
 use crate::workspace_notes_modal::{
@@ -754,6 +756,15 @@ struct WorkspaceNotesPreviewTarget {
     interaction: workspace_notes_preview::WorkspaceNotesPreviewInteraction,
 }
 
+/// `((origin_x, origin_y), (width, height))` in logical points, as fed to
+/// `Window::set_ime_cursor_area` via winit's `LogicalPosition` / `LogicalSize`.
+/// Stored on `App::last_ime_cursor_area` for dedupe per T018.
+type ImeCursorAreaLogical = ((f64, f64), (f64, f64));
+
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "App is the top-level event-loop state; bools are independent UI flags, not a state-machine that would be cleaner as an enum."
+)]
 struct App {
     // Window identity
     /// Window ID from CLI arg (if provided) or assigned by the server.
@@ -821,6 +832,34 @@ struct App {
     modifiers: ModifiersState,
     /// Parsed keybindings (hot-reloaded with config).
     bindings: input::Bindings,
+    /// Whether the OS-level IME has reported it is active for this window.
+    /// Set by `WindowEvent::Ime(Ime::Enabled)` and cleared by
+    /// `WindowEvent::Ime(Ime::Disabled)`. Used together with [`Self::preedit`]
+    /// by [`Self::key_consumed_by_ime`] to short-circuit the level-4 key
+    /// encoder while composition is active. Default `false`; the gate
+    /// predicate ([`Self::ime_should_be_allowed`]) controls whether the IME
+    /// is ever enabled.
+    ime_active: bool,
+    /// Current IME composition for the focused pane, or `None` when no
+    /// composition is in flight. Populated by the `WindowEvent::Ime` arm
+    /// (`Preedit` creates/updates, empty `Preedit`/`Commit`/`Disabled` clear)
+    /// and read by [`Self::preedit_overlay`] per frame for the renderer
+    /// hook. See `crate::preedit::PreeditState` and
+    /// `specs/008-ime-composition/data-model.md#PreeditState`.
+    preedit: Option<PreeditState>,
+    /// Most recently pushed IME cursor area as `((x, y), (w, h))` in logical
+    /// points (winit's `LogicalPosition` / `LogicalSize` units). Used by
+    /// [`Self::push_ime_cursor_area`] to dedupe redundant `set_ime_cursor_area`
+    /// calls during steady-state redraws (T018). Invalidated to `None` on
+    /// focus / occlusion / resize transitions so the next push always lands
+    /// fresh (T019 / T020 / T023).
+    last_ime_cursor_area: Option<ImeCursorAreaLogical>,
+    /// Most recent value pushed to `window.set_ime_allowed(_)`, used by
+    /// [`Self::refresh_ime_allowed`] to dedupe redundant winit IPC calls
+    /// during steady-state ticks. `None` means the gate has never been
+    /// pushed; the first invocation always lands fresh. Set to `Some(allow)`
+    /// after each effective push.
+    last_ime_allowed: Option<bool>,
 
     // Clipboard
     clipboard: Option<arboard::Clipboard>,
@@ -1057,7 +1096,9 @@ impl App {
                 generation: Arc::new(AtomicU64::new(0)),
             },
             modifiers: ModifiersState::default(),
-            bindings, clipboard: None, zoom_level: 0,
+            bindings, ime_active: false, preedit: None, last_ime_cursor_area: None,
+            last_ime_allowed: None,
+            clipboard: None, zoom_level: 0,
             command_palette: command_palette::CommandPalette::new(), command_palette_items: Vec::new(),
             search_overlay: search_overlay::SearchOverlay::new(),
             workspace_notes: workspace_notes::WorkspaceNotesStore::load(),
@@ -1168,6 +1209,12 @@ impl ApplicationHandler<UiEvent> for App {
         #[cfg(target_os = "linux")]
         if let Some(guard) = &mut self.x11_focus_guard {
             guard.poll();
+            // T008: any compositor-overlay transition the guard detects must
+            // immediately propagate to `set_ime_allowed`, otherwise IME could
+            // keep delivering preedit while a fullscreen overlay owns the
+            // user's typing. `refresh_ime_allowed` is idempotent so calling
+            // it each iteration is safe.
+            self.refresh_ime_allowed();
         }
 
         self.flush_geometry_if_due();
@@ -1662,6 +1709,59 @@ impl App {
             }
             WindowEvent::Focused(focused) => self.handle_focus_changed(*focused),
             WindowEvent::Occluded(occluded) => self.handle_occluded_changed(*occluded),
+            // Dispatch site for OS-level IME events. Each variant is matched
+            // exhaustively so US1 / US2 / US3 can fill in behavior without
+            // adding a silent catch-all. See `data-model.md#State Machine`.
+            WindowEvent::Ime(ime_event) => match ime_event {
+                // T005: enable the IME-active flag and repaint so the
+                // preedit-gated key short-circuit (T009) takes effect.
+                Ime::Enabled => {
+                    self.ime_active = true;
+                    self.request_redraw();
+                }
+                // T013: drive the `PreeditState` lifecycle per
+                // `data-model.md#PreeditState`. Empty text drops the
+                // composition; the first non-empty preedit after a clear
+                // captures the focused pane's current cursor cell as the
+                // anchor (`start_row`/`start_col`), and subsequent events
+                // refresh `text`/`caret` while keeping the anchor stable.
+                Ime::Preedit(text, caret_range) => {
+                    if text.is_empty() {
+                        self.preedit = None;
+                    } else if let Some(existing) = self.preedit.as_mut() {
+                        existing.text.clone_from(text);
+                        existing.caret = *caret_range;
+                    } else if let Some((start_row, start_col)) = self.focused_cursor_cell() {
+                        self.preedit = Some(PreeditState::new(
+                            text.clone(),
+                            *caret_range,
+                            start_row,
+                            start_col,
+                        ));
+                    }
+                    self.request_redraw();
+                }
+                // T014: drop the preedit FIRST so the overlay disappears in
+                // the same frame as the committed PTY echo arrives (UX-002),
+                // then route the finalized UTF-8 bytes through the existing
+                // `KeyInput` path. The level-4 encoder is intentionally
+                // bypassed (R5).
+                Ime::Commit(text) => {
+                    self.preedit = None;
+                    if !text.is_empty() {
+                        self.handle_terminal_key(text.as_bytes().to_vec());
+                    }
+                    self.request_redraw();
+                }
+                // Clear IME-active and any in-flight composition so the
+                // short-circuit releases and no preedit residue lingers
+                // after the OS disables IME.
+                Ime::Disabled => {
+                    self.ime_active = false;
+                    self.preedit = None;
+                    self.request_redraw();
+                }
+            },
             _ => {}
         }
     }
@@ -1686,6 +1786,13 @@ impl App {
         } else {
             let session = self.focused_session_id();
             self.notify_focus_change(None, session);
+            // T008: cover the `session == None` corner where
+            // `notify_focus_change` early-returns; the window still lost focus
+            // so the IME gate must be re-evaluated to push
+            // `set_ime_allowed(false)` and clear any in-flight preedit
+            // (FR-008). `refresh_ime_allowed` is change-gated, so this is a
+            // no-op when `notify_focus_change` already refreshed.
+            self.refresh_ime_allowed();
         }
         self.request_redraw();
     }
@@ -1706,6 +1813,11 @@ impl App {
             if self.ai_tracker.needs_animation(&self.config.terminal) && !self.animation.running {
                 self.start_animation_timer();
             }
+            // T023: window became visible again — invalidate the memoised IME
+            // cursor area so the next redraw pushes a fresh rect, in case the
+            // caret moved while we were skipping `push_ime_cursor_area` calls
+            // under occlusion. Mirrors the AI-pulse re-arm pattern.
+            self.last_ime_cursor_area = None;
             self.request_redraw();
         }
     }
@@ -1724,6 +1836,199 @@ impl App {
         self.blink_timer = Instant::now();
         let session = self.focused_session_id();
         self.notify_focus_change(session, None);
+        // T008: cover the `session == None` corner where `notify_focus_change`
+        // early-returns (empty workspace, no focused pane); the window still
+        // gained focus so the IME gate must be re-evaluated to potentially
+        // re-arm IME. `refresh_ime_allowed` is change-gated so this is a
+        // no-op when `notify_focus_change` already refreshed.
+        self.refresh_ime_allowed();
+    }
+
+    /// IME activation gate (`data-model.md#ImeActivationGate`).
+    ///
+    /// True when the OS-level IME should be allowed to deliver composition
+    /// events to this window. Combines window-level focus with a check that
+    /// the currently focused UI surface is the terminal pane — overlays
+    /// (search, command palette) and modal dialogs (update / close / context
+    /// menu / workspace notes) opt out of IME in v1 (FR-012).
+    ///
+    // TODO(ime-T022): tighten this further if T022 finds additional surfaces
+    // that should opt out of IME. The X11 `_NET_ACTIVE_WINDOW` clause from
+    // `data-model.md#ImeActivationGate` is intentionally elided here because
+    // `x11_focus::X11FocusGuard::should_suppress_key` requires `&mut self`
+    // (it mutates the post-reactivation debounce). [`Self::refresh_ime_allowed`]
+    // already runs from `&mut self`, so it ANDs this predicate with
+    // `!self.compositor_overlay_active()` at the call site without needing a
+    // parallel immutable accessor on the focus guard.
+    fn ime_should_be_allowed(&self) -> bool {
+        if !self.focus.window_focused {
+            return false;
+        }
+        // Surface gate: only the terminal pane accepts IME in v1. The
+        // workspace-notes inline editor from feature 007 (FR-005) is an
+        // IME-relevant surface that captures keystrokes before PTY
+        // translation, but its v1 input path does not yet route through
+        // `WindowEvent::Ime` — so we opt it out of the OS IME just like
+        // the other modal surfaces.
+        if self.search_overlay.is_active()
+            || self.command_palette.is_active()
+            || self.workspace_notes_modal.is_open()
+            || self.close_dialog.is_some()
+            || self.update_dialog.is_some()
+            || self.context_menu.is_some()
+            || self.focused_inline_editor.is_some()
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Re-evaluate the IME activation gate and push the result to winit on
+    /// every transition.
+    ///
+    /// Combines [`Self::ime_should_be_allowed`] with the X11 active-window
+    /// guard (via [`Self::compositor_overlay_active`], which mutates the
+    /// guard's debounce — that's why this lives on `&mut self`). The pushed
+    /// gate value is memoised in `last_ime_allowed`; steady-state ticks
+    /// (`about_to_wait` runs this ~60×/sec on Linux) short-circuit when the
+    /// computed value matches the last push, so winit `set_ime_allowed`
+    /// IPC fires only on actual flips and the [`Self::last_ime_cursor_area`]
+    /// memo from T018 is preserved across ticks.
+    ///
+    /// On a flip to `!allow` we drop any in-flight `PreeditState` so focus
+    /// loss or surface change immediately releases the key short-circuit and
+    /// removes the visual composition overlay (FR-008). On a flip to `allow`
+    /// we push a fresh cursor anchor so the first composition after focus
+    /// has the correct popup placement without waiting for the next dirty
+    /// redraw (T020). The very first invocation (`last_ime_allowed == None`)
+    /// is treated as a transition so the gate state always lands at startup.
+    fn refresh_ime_allowed(&mut self) {
+        let surface_allows = self.ime_should_be_allowed();
+        let x11_allows = !self.compositor_overlay_active();
+        let allow = surface_allows && x11_allows;
+        if self.last_ime_allowed == Some(allow) {
+            // Steady-state tick: gate hasn't changed since the last push.
+            // The redraw path's own `push_ime_cursor_area` still tracks
+            // cursor-cell movement via the `last_ime_cursor_area` memo, so
+            // we don't need to invalidate it here.
+            return;
+        }
+        self.last_ime_allowed = Some(allow);
+        if !allow {
+            self.preedit = None;
+        }
+        // Invalidate the cached cursor area on every transition so the next
+        // push always lands fresh on the new gate state — relevant for T020
+        // (focused-pane change clears preedit and re-anchors the popup) and
+        // T021 (focus loss).
+        self.last_ime_cursor_area = None;
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(allow);
+        }
+        // T020 transition-to-allowed: push a fresh cursor anchor so the
+        // first composition after focus has the right popup placement
+        // without waiting for the next dirty redraw.
+        if allow {
+            self.push_ime_cursor_area();
+        }
+    }
+
+    /// Compute the focused pane's CURRENT cursor cell window-space rectangle
+    /// in logical points, ready to hand to `Window::set_ime_cursor_area`.
+    ///
+    /// Mirrors the geometry path in [`Self::preedit_overlay`] but reads the
+    /// live cursor (not the preedit anchor): the IME popup should follow the
+    /// caret as the cursor moves, even before composition starts. Returns
+    /// `None` when no GPU / focused pane / valid cell metrics are available.
+    fn current_cursor_cell_logical_rect(&self) -> Option<ImeCursorAreaLogical> {
+        let gpu = self.gpu.as_ref()?;
+        let pane = self.focused_pane()?;
+        let grid = pane.term.grid();
+
+        let cell = gpu.renderer.cell_size();
+        let cell_w = cell.width;
+        let cell_h = cell.height;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+
+        let prompt_bar_font_scale =
+            self.config.terminal.prompt_bar.font_size / self.config.appearance.font_size;
+        let prompt_bar_cell_h = cell_h * prompt_bar_font_scale;
+        let prompt_bar_height =
+            pane.prompt_bar_height(prompt_bar_cell_h, self.config.terminal.prompt_bar.enabled);
+        let prompt_bar_at_top = self.config.terminal.prompt_bar.position
+            == scribe_common::config::PromptBarPosition::Top;
+        let content_prompt_bar_height = if prompt_bar_at_top { prompt_bar_height } else { 0.0 };
+        let tab_bar_height = self.focused_workspace_tab_bar_height();
+        let offset = pane.content_offset(
+            tab_bar_height,
+            content_prompt_bar_height,
+            &self.config.appearance.content_padding,
+            self.scale_factor,
+        );
+
+        let cursor = grid.cursor.point;
+        let screen_line = usize::try_from(cursor.line.0.max(0)).unwrap_or(0);
+        let screen_lines = grid.screen_lines();
+        if screen_line >= screen_lines {
+            return None;
+        }
+        let col = cursor.column.0;
+        let last_col = grid.columns().saturating_sub(1);
+        if col > last_col {
+            return None;
+        }
+        let screen_line_f = u16::try_from(screen_line).unwrap_or(u16::MAX);
+        let col_u16 = u16::try_from(col).unwrap_or(u16::MAX);
+
+        // Physical pixel cell rect (same coord space `solid_quad` consumes).
+        let physical_x = offset.0 + f32::from(col_u16) * cell_w;
+        let physical_y = offset.1 + f32::from(screen_line_f) * cell_h;
+
+        // Convert to logical points so winit's `LogicalPosition`/`LogicalSize`
+        // wrapper does the same conversion every other DPI-aware call site
+        // does (`window_state::expected_physical_size`'s inverse).
+        let scale = f64::from(self.scale_factor.max(f32::EPSILON));
+        let logical_x = f64::from(physical_x) / scale;
+        let logical_y = f64::from(physical_y) / scale;
+        let logical_w = f64::from(cell_w) / scale;
+        let logical_h = f64::from(cell_h) / scale;
+
+        Some(((logical_x, logical_y), (logical_w, logical_h)))
+    }
+
+    /// Push the focused pane's current cursor cell rect to winit via
+    /// `Window::set_ime_cursor_area` (T018 / T019).
+    ///
+    /// Gated to do nothing unless IME is active, the surface gate currently
+    /// allows IME, and the window is not occluded (T023, mirroring the AI
+    /// pulse occlusion convention — no point updating popup geometry for a
+    /// window nobody can see). Memoises the last-pushed rect on
+    /// [`Self::last_ime_cursor_area`] so steady-state redraws skip the winit
+    /// call when nothing moved.
+    fn push_ime_cursor_area(&mut self) {
+        if !self.ime_active || !self.ime_should_be_allowed() || self.focus.window_occluded {
+            return;
+        }
+        let Some((origin, size)) = self.current_cursor_cell_logical_rect() else { return };
+        if self.last_ime_cursor_area == Some((origin, size)) {
+            return;
+        }
+        if let Some(window) = &self.window {
+            window.set_ime_cursor_area(
+                winit::dpi::Position::Logical(winit::dpi::LogicalPosition::new(origin.0, origin.1)),
+                winit::dpi::Size::Logical(winit::dpi::LogicalSize::new(size.0, size.1)),
+            );
+            self.last_ime_cursor_area = Some((origin, size));
+        }
+    }
+
+    /// Whether the current keystroke is consumed by an in-flight IME
+    /// composition. Used at the entry of the keyboard-input dispatch to
+    /// bypass shortcut/encoder layers while preedit is visible (R6).
+    fn key_consumed_by_ime(&self) -> bool {
+        self.ime_active && self.preedit.is_some() && self.ime_should_be_allowed()
     }
 }
 
@@ -4282,6 +4587,14 @@ impl App {
             &mut all_instances,
             &mut refresh_window_title,
         );
+        // T018: push the focused pane's current cursor cell rect to winit so
+        // the OS IME popup tracks the caret on every dirty redraw. Runs
+        // AFTER `apply_terminal_frame_overlays` (so the preedit overlay has
+        // already laid out using the same cell geometry) and BEFORE
+        // `present_terminal_frame` (which calls `pre_present_notify`).
+        // No-ops cheaply when the gate is closed or the cell rect hasn't
+        // changed since the last frame.
+        self.push_ime_cursor_area();
         self.present_terminal_frame(
             frame,
             view,
@@ -4686,6 +4999,11 @@ impl App {
         refresh_window_title: &mut bool,
     ) {
         self.apply_url_underline_overlay(prepared, all_instances);
+        // T016: preedit sits above the terminal grid (so it occludes whatever
+        // cells the IME is hovering) and BELOW chrome — search overlay,
+        // modals, tooltips, and the command palette stay drawable over the
+        // composition.
+        self.apply_preedit_overlay(all_instances);
         *refresh_window_title |= self.apply_status_bar_overlay(prepared, all_instances);
         self.apply_workspace_notes_preview_overlay(prepared, all_instances);
         self.apply_modal_overlays(prepared, all_instances);
@@ -4695,6 +5013,98 @@ impl App {
         if self.opacity < 1.0 {
             apply_opacity_to_instances(all_instances, self.opacity);
         }
+    }
+
+    /// Render the IME preedit overlay above the focused pane's grid.
+    ///
+    /// Three layers, in order:
+    /// 1. Solid-bg quad spanning the preedit cells — hides the underlying
+    ///    grid contents so the composition glyphs read cleanly (FR-006:
+    ///    grid is never mutated, only visually occluded).
+    /// 2. Per-char glyph instances via `resolve_glyph` (same atlas path as
+    ///    other chrome text). Per-char advances come from
+    ///    [`unicode_width::UnicodeWidthChar::width`] so CJK wide glyphs
+    ///    claim two cells and zero-width combining marks ride the prior
+    ///    base glyph without advancing the cursor.
+    /// 3. 1px theme-foreground underline below the preedit cells
+    ///    (hi-DPI scaled to ≥1 physical pixel) — Alacritty-minimal visual
+    ///    treatment per `research.md#R4`.
+    fn apply_preedit_overlay(&mut self, all_instances: &mut Vec<CellInstance>) {
+        let Some(overlay) = self.preedit_overlay() else { return };
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let PreeditOverlay { origin_px, cell_px, text, max_cells } = overlay;
+        let [origin_x, origin_y] = origin_px;
+        let [cell_w, cell_h] = cell_px;
+        if max_cells == 0 || cell_w <= 0.0 || cell_h <= 0.0 {
+            return;
+        }
+        let fg = self.theme.foreground;
+        let bg = self.theme.background;
+        let max_cells_usize = usize::from(max_cells);
+        let span_w = f32::from(max_cells) * cell_w;
+
+        // Layer 1: background fill behind the preedit cells (cumulative
+        // unicode-width span, not the raw char count).
+        all_instances
+            .push(scribe_renderer::chrome::solid_quad(origin_x, origin_y, span_w, cell_h, bg));
+
+        // Layer 2: glyph instances. Per-char advances come from
+        // `unicode_width::UnicodeWidthChar::width`: zero-width combining
+        // marks render at the previous column without advancing; wide
+        // glyphs claim two cells. The budget already accounts for both, so
+        // we just stop once the next visible char would overflow.
+        let mut drawn_cells: usize = 0;
+        for ch in text.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            // A leading combining mark has no base glyph to attach to;
+            // emitting it at column 0 with zero size renders nothing useful.
+            // Skip until the first advancing glyph lands.
+            if w == 0 && drawn_cells == 0 {
+                continue;
+            }
+            if w == 0 {
+                let col = drawn_cells - 1;
+                let col_f = u16::try_from(col).map_or(0.0, f32::from);
+                let (uv_min, uv_max) = gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+                all_instances.push(CellInstance {
+                    pos: [origin_x + col_f * cell_w, origin_y],
+                    size: [0.0, 0.0],
+                    uv_min,
+                    uv_max,
+                    fg_color: fg,
+                    bg_color: bg,
+                    corner_radius: 0.0,
+                });
+                continue;
+            }
+            if drawn_cells + w > max_cells_usize {
+                break;
+            }
+            let col_f = u16::try_from(drawn_cells).map_or(0.0, f32::from);
+            let (uv_min, uv_max) = gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            all_instances.push(CellInstance {
+                pos: [origin_x + col_f * cell_w, origin_y],
+                size: [0.0, 0.0],
+                uv_min,
+                uv_max,
+                fg_color: fg,
+                bg_color: bg,
+                corner_radius: 0.0,
+            });
+            drawn_cells += w;
+        }
+
+        // Layer 3: underline at the bottom of the preedit row, spanning the
+        // cumulative cell width. Hi-DPI scale matches the underline cursor
+        // convention (≥1 physical pixel after `scale_factor`).
+        let underline_h = (self.scale_factor).max(1.0);
+        all_instances.push(scribe_renderer::chrome::solid_quad(
+            origin_x,
+            origin_y + cell_h - underline_h,
+            span_w,
+            underline_h,
+            fg,
+        ));
     }
 
     fn apply_url_underline_overlay(
@@ -5170,6 +5580,13 @@ impl App {
         }
 
         self.resize_all_workspace_panes();
+        // T019: invalidate the cached IME cursor area so the next
+        // `push_ime_cursor_area` call (immediately below, plus the next
+        // redraw) lands a fresh rect that reflects the new viewport / scale
+        // factor. winit 0.30 folds `ScaleFactorChanged` into `Resized`, so
+        // this single hook covers both.
+        self.last_ime_cursor_area = None;
+        self.push_ime_cursor_area();
         self.request_redraw();
     }
 
@@ -5185,6 +5602,16 @@ impl App {
 
     /// Translate a keyboard event and forward it to the correct handler.
     fn handle_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        // T009 / R6: drop key dispatch entirely while the OS IME holds an
+        // in-flight composition. winit delivers `KeyboardInput` for the keys
+        // the IME consumes (Enter to commit, arrows to navigate candidates,
+        // etc.) on the same loop iteration as the `Ime::Preedit` /
+        // `Ime::Commit` event; suppressing here prevents the level-4 encoder
+        // and shortcut layers from double-handling those keys.
+        if self.key_consumed_by_ime() {
+            return;
+        }
+
         // Reset cursor blink on any key-down so the cursor never stays
         // hidden mid-blink, regardless of which handler consumes the event.
         if event.state == winit::event::ElementState::Pressed {
@@ -5287,6 +5714,23 @@ impl App {
     fn focused_pane(&self) -> Option<&Pane> {
         let tab = self.window_layout.active_tab()?;
         self.panes.get(&tab.focused_pane)
+    }
+
+    /// Read the focused pane's current cursor cell as
+    /// `(absolute_row, column)`. `absolute_row` is the scrollback-stable row
+    /// (`history_size + screen_line`) so a `PreeditState` anchor remains
+    /// valid across grid scrolls per `data-model.md#PreeditState`. Returns
+    /// `None` when there is no focused pane (e.g., during startup before
+    /// the first tab exists).
+    fn focused_cursor_cell(&self) -> Option<(usize, usize)> {
+        let pane = self.focused_pane()?;
+        let grid = pane.term.grid();
+        let history = grid.history_size();
+        let cursor = grid.cursor.point;
+        let screen_line = usize::try_from(cursor.line.0.max(0)).unwrap_or(0);
+        let row = history.saturating_add(screen_line);
+        let col = cursor.column.0;
+        Some((row, col))
     }
 
     fn handle_terminal_key(&mut self, bytes: Vec<u8>) {
@@ -5738,13 +6182,20 @@ impl App {
 
     /// Send a focus-change notification to the server so it can relay
     /// CSI focus events (`\x1b[I` / `\x1b[O`) to PTY applications.
-    fn notify_focus_change(&self, gained: Option<SessionId>, lost: Option<SessionId>) {
+    ///
+    /// Also re-evaluates the IME activation gate (T008): every pane- /
+    /// session-focus transition implicitly re-evaluates which surface owns
+    /// the IME, so this is the natural single chokepoint. Mutates because
+    /// the X11 active-window guard inside `refresh_ime_allowed` is
+    /// `&mut self`.
+    fn notify_focus_change(&mut self, gained: Option<SessionId>, lost: Option<SessionId>) {
         if gained.is_none() && lost.is_none() {
             return;
         }
         if let Some(tx) = &self.cmd_tx {
             send_command(tx, ipc_client::ClientCommand::FocusChanged { gained, lost });
         }
+        self.refresh_ime_allowed();
     }
 
     fn handle_focus_next(&mut self) {
@@ -8833,6 +9284,112 @@ impl App {
         let pane_rects = tab.pane_layout.compute_rects(ws_rect);
         let (_, rect, _) = pane_rects.iter().find(|(pid, _, _)| *pid == tab.focused_pane)?;
         Some(*rect)
+    }
+
+    /// Per-frame IME preedit overlay description.
+    ///
+    /// Returns `Some(PreeditOverlay)` when a composition is in flight on the
+    /// focused pane and its anchor cell is still visible. Returns `None` when
+    /// there is no preedit, no focused pane, no GPU yet, or the anchor row
+    /// scrolled out of the visible screen (data-model.md#PreeditState).
+    ///
+    /// The overlay carries the window-space origin of the first preedit
+    /// cell, the focused pane's cell size, the preedit text to shape, and a
+    /// `max_cells` budget so the renderer can truncate at the pane's right
+    /// edge without wrapping or shifting the cursor. Per-char widths come
+    /// from [`unicode_width::UnicodeWidthChar::width`] so CJK wide glyphs
+    /// reserve two cells while combining marks contribute zero.
+    fn preedit_overlay(&self) -> Option<PreeditOverlay> {
+        let preedit = self.preedit.as_ref()?;
+        let gpu = self.gpu.as_ref()?;
+        let pane = self.focused_pane()?;
+        let grid = pane.term.grid();
+
+        // Hide the overlay while the user has scrolled the viewport into
+        // scrollback: the composition anchor is pinned to its absolute row,
+        // but the visible grid no longer maps to it, so the underline would
+        // render at the wrong visual row. The composition itself is still
+        // alive — re-snapping the viewport to bottom restores the overlay.
+        if grid.display_offset() > 0 {
+            return None;
+        }
+
+        // Translate the anchor's absolute scrollback row back to a
+        // screen-relative line. Hide when the anchor has scrolled off the
+        // visible grid (alt-screen toggles or scrollback growth past the
+        // composition start are the practical cases).
+        let history = grid.history_size();
+        let screen_lines = grid.screen_lines();
+        let screen_line = preedit.start_row.checked_sub(history)?;
+        if screen_line >= screen_lines {
+            return None;
+        }
+        let last_col = grid.columns().saturating_sub(1);
+        if preedit.start_col > last_col {
+            return None;
+        }
+
+        let cell = gpu.renderer.cell_size();
+        let cell_w = cell.width;
+        let cell_h = cell.height;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+
+        // Resolve the focused pane's content origin from the same accessors
+        // used by `apply_url_underlines` — the URL overlay path is the
+        // closest analog for "draw something at a grid cell from the apply
+        // overlay phase".
+        let prompt_bar_font_scale =
+            self.config.terminal.prompt_bar.font_size / self.config.appearance.font_size;
+        let prompt_bar_cell_h = cell_h * prompt_bar_font_scale;
+        let prompt_bar_height =
+            pane.prompt_bar_height(prompt_bar_cell_h, self.config.terminal.prompt_bar.enabled);
+        let prompt_bar_at_top = self.config.terminal.prompt_bar.position
+            == scribe_common::config::PromptBarPosition::Top;
+        let content_prompt_bar_height = if prompt_bar_at_top { prompt_bar_height } else { 0.0 };
+        let tab_bar_height = self.focused_workspace_tab_bar_height();
+        let offset = pane.content_offset(
+            tab_bar_height,
+            content_prompt_bar_height,
+            &self.config.appearance.content_padding,
+            self.scale_factor,
+        );
+
+        // Origin = top-left of the anchor cell in window-space pixels.
+        let screen_line_f = u16::try_from(screen_line).unwrap_or(u16::MAX);
+        let start_col_u16 = u16::try_from(preedit.start_col).unwrap_or(u16::MAX);
+        let origin_x = offset.0 + f32::from(start_col_u16) * cell_w;
+        let origin_y = offset.1 + f32::from(screen_line_f) * cell_h;
+
+        // Truncate at the cell-boundary right edge of the pane (no wrap, no
+        // cursor shift). Width per char comes from `unicode-width`, matching
+        // the styled-run accumulator in `scribe-renderer`; zero-width
+        // combining marks contribute nothing and CJK wide glyphs claim two
+        // cells.
+        let remaining_cells = grid.columns().saturating_sub(preedit.start_col);
+        let mut consumed: usize = 0;
+        for c in preedit.text.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if w == 0 {
+                continue;
+            }
+            if consumed + w > remaining_cells {
+                break;
+            }
+            consumed += w;
+        }
+        let max_cells = u16::try_from(consumed).unwrap_or(u16::MAX);
+        if max_cells == 0 {
+            return None;
+        }
+
+        Some(PreeditOverlay {
+            origin_px: [origin_x, origin_y],
+            cell_px: [cell_w, cell_h],
+            text: preedit.text.clone(),
+            max_cells,
+        })
     }
 
     // -----------------------------------------------------------------------
