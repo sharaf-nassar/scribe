@@ -35,6 +35,7 @@ chrono = { version = "0.4", default-features = false, features = [
   "clock",
   "std",
 ] }
+unicode-width = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 notify-rust = "4"

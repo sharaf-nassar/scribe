@@ -125,3 +125,5 @@ ANSI 0-15 are overridable by theme. The 6x6x6 colour cube (indices 16-231) uses 
 UI chrome (tab bars, status bars, dividers, dialogs) is rendered as solid or rounded quads via [[crates/scribe-renderer/src/chrome.rs#solid_quad]].
 
 These produce `CellInstance` objects with zero UV coordinates (transparent-black atlas pixel) so the shader shows only the background colour. Rounded quads set a non-zero `corner_radius` for the shader's SDF rounding.
+
+The IME preedit overlay piggybacks on this same chrome path: [[crates/scribe-client/src/main.rs#App#apply_preedit_overlay]] emits a background-fill quad plus glyph cells plus a 1px theme-foreground underline into the chrome instance buffer above the terminal grid and below search / dialog overlays — no new wgpu pipeline or shader. See [[client#Input#IME Composition]] for the full state machine and activation gate.
