@@ -15,8 +15,16 @@ pub enum ContextMenuAction {
     Paste,
     /// Select all text in the pane.
     SelectAll,
-    /// Open the given URL.
+    /// Open the given heuristic-detected URL (passes through the existing
+    /// `url_detect::open_url` allowlist guard — same behaviour as today).
     OpenUrl(String),
+    /// Open the given OSC 8 URI (spec 009 FR-003 / FR-015). Routed
+    /// through the OSC 8 scheme-allowlist gate so disallowed schemes
+    /// trigger the confirmation dialog; allowed schemes flow through the
+    /// same `url_detect::open_url` path as `OpenUrl`. Distinct from
+    /// `OpenUrl` so the dispatcher can preserve today's silent-drop
+    /// behaviour for heuristic URLs with non-allowlisted schemes.
+    OpenOsc8Url(String),
     /// Open the given file path.
     OpenFile(String),
     /// Run a shell command from a smart-selection action.
@@ -29,6 +37,11 @@ pub enum ContextMenuAction {
     RunCommandInWindow(String),
     /// Copy specific text to the clipboard.
     CopyText(String),
+    /// Copy an OSC 8 hyperlink address verbatim to the clipboard (spec 009
+    /// FR-007). The payload is the URI carried by the cell underneath the
+    /// right-click target, surfaced as a context-menu entry distinct from
+    /// the existing selection-copy path.
+    CopyHyperlinkAddress(String),
 }
 
 /// A single item in the context menu.
@@ -67,6 +80,15 @@ pub struct ContextMenuRequest {
     pub url: Option<String>,
     pub file_path: Option<String>,
     pub smart_actions: Vec<MenuItem>,
+    /// OSC 8 URI present at the right-click target cell, if any (spec 009).
+    ///
+    /// When `Some(uri)`:
+    /// - The "Open URL" item carries this URI verbatim (FR-003) instead of
+    ///   any heuristic-detected URL on the same cell.
+    /// - A new "Copy hyperlink address" item is appended (FR-007).
+    ///
+    /// When `None`, the menu retains today's heuristic-only behaviour.
+    pub osc8_uri: Option<String>,
 }
 
 fn menu_grid_units(units: usize) -> u16 {
@@ -94,9 +116,14 @@ impl ContextMenu {
     ///
     /// Items are populated based on the current state: `has_selection`
     /// enables Copy, `url` appends an "Open URL" item when present, and
-    /// `file_path` appends an "Open File" item when present.
+    /// `file_path` appends an "Open File" item when present. When
+    /// `osc8_uri` is `Some(uri)`, the URI takes precedence over the
+    /// heuristic `url` for the "Open URL" item (spec 009 FR-003) and a new
+    /// "Copy hyperlink address" item is appended after "Open File"
+    /// (FR-007).
     pub fn new(request: ContextMenuRequest) -> Self {
-        let ContextMenuRequest { x, y, has_selection, url, file_path, smart_actions } = request;
+        let ContextMenuRequest { x, y, has_selection, url, file_path, smart_actions, osc8_uri } =
+            request;
         let mut items = vec![
             MenuItem {
                 label: String::from("Copy"),
@@ -115,10 +142,22 @@ impl ContextMenu {
             },
         ];
 
-        if let Some(u) = url {
+        // FR-003 precedence: when an OSC 8 URI is present, the "Open URL"
+        // item carries that URI verbatim via the dedicated `OpenOsc8Url`
+        // variant so the dispatcher can route it through the OSC 8
+        // scheme-allowlist gate. Heuristic URLs continue to use `OpenUrl`
+        // and the existing silent-drop behaviour for non-allowlisted
+        // schemes.
+        if let Some(uri) = osc8_uri.clone() {
             items.push(MenuItem {
                 label: String::from("Open URL"),
-                action: ContextMenuAction::OpenUrl(u),
+                action: ContextMenuAction::OpenOsc8Url(uri),
+                enabled: true,
+            });
+        } else if let Some(url) = url {
+            items.push(MenuItem {
+                label: String::from("Open URL"),
+                action: ContextMenuAction::OpenUrl(url),
                 enabled: true,
             });
         }
@@ -127,6 +166,17 @@ impl ContextMenu {
             items.push(MenuItem {
                 label: String::from("Open File"),
                 action: ContextMenuAction::OpenFile(p),
+                enabled: true,
+            });
+        }
+
+        // FR-007: surface the OSC 8 URI as a dedicated copy entry, placed
+        // after "Open File" (consistent with how the existing menu appends
+        // context-dependent items).
+        if let Some(uri) = osc8_uri {
+            items.push(MenuItem {
+                label: String::from("Copy hyperlink address"),
+                action: ContextMenuAction::CopyHyperlinkAddress(uri),
                 enabled: true,
             });
         }
@@ -220,12 +270,14 @@ impl MenuRenderer<'_> {
             let is_open_item = matches!(
                 item.action,
                 ContextMenuAction::OpenUrl(_)
+                    | ContextMenuAction::OpenOsc8Url(_)
                     | ContextMenuAction::OpenFile(_)
                     | ContextMenuAction::RunCommand(_)
                     | ContextMenuAction::RunCoprocess(_)
                     | ContextMenuAction::SendText(_)
                     | ContextMenuAction::RunCommandInWindow(_)
                     | ContextMenuAction::CopyText(_)
+                    | ContextMenuAction::CopyHyperlinkAddress(_)
             );
             if is_open_item && self.layout.has_open_item {
                 let sep_y = menu_grid_y(self.layout.menu_rect.y, row, cell_h) + cell_h / 2.0;
@@ -315,7 +367,13 @@ impl MenuLayout {
         let menu_cols = label_max + 4;
         let item_rows = 2;
         let has_open_item = menu.items.iter().any(|item| {
-            matches!(item.action, ContextMenuAction::OpenUrl(_) | ContextMenuAction::OpenFile(_))
+            matches!(
+                item.action,
+                ContextMenuAction::OpenUrl(_)
+                    | ContextMenuAction::OpenOsc8Url(_)
+                    | ContextMenuAction::OpenFile(_)
+                    | ContextMenuAction::CopyHyperlinkAddress(_)
+            )
         });
         let total_rows = menu.items.len() * item_rows + usize::from(has_open_item);
 

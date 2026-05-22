@@ -217,6 +217,8 @@ A standalone settings window (`scribe-settings`) opens with `Ctrl+,`. Built as a
 
 Ctrl+click opens URLs (http, https, ftp, file) and file-system paths detected in terminal output. File paths with a `:N` line-number suffix open in VS Code at that line. Relative paths resolve against the pane's working directory. Only the hovered span is underlined, and the pointer cursor appears while Ctrl is held.
 
+OSC 8 explicit hyperlinks emitted by tools like `ls --hyperlink=auto`, `git`, GCC/Clang, and modern build systems are honoured: Ctrl+click opens the URI the tool emitted (not a heuristic guess of the displayed text), hovering a hyperlinked cell shows the real URI in a tooltip, and the right-click menu adds a "Copy hyperlink address" item alongside "Open URL". URIs with disallowed schemes (`javascript:`, `data:`, etc.) require explicit confirmation before opening.
+
 ### Drag and Drop
 
 Drop files or directories onto a pane to insert their paths into the shell. Paths are quoted for the session's actual shell (POSIX, Fish, PowerShell, or Nushell) with a trailing space.
