@@ -6,6 +6,7 @@ mod close_dialog;
 mod command_palette;
 mod config;
 mod context_menu;
+mod disallowed_scheme_dialog;
 mod divider;
 mod input;
 mod ipc_client;
@@ -1009,6 +1010,29 @@ struct App {
     /// The URL span the cursor is currently hovering over, if any.
     hovered_url: Option<url_detect::UrlSpan>,
 
+    // OSC 8 hyperlink hover-tooltip state (spec 009, E3 HoverState).
+    //
+    // The terminal-cell hover dwell is independent of the existing
+    // `active_tooltip` (which serves chrome tooltips on status bar / tab
+    // bar targets). Together with the OSC 8 URL-cache pass these four
+    // fields drive the tooltip-on-dwell tooltip surface (FR-006).
+    /// Cell the cursor currently rests on, if it is inside a terminal pane.
+    /// Used as the dwell-timer key — any change resets the timer.
+    hover_cell: Option<(PaneId, i32, usize)>,
+    /// `Instant` when the cursor first landed on `hover_cell`. Reset on
+    /// every cell change.
+    hover_started_at: Option<Instant>,
+    /// `true` once the dwell threshold has been crossed for the current
+    /// cell and the cell carries an OSC 8 URI; cleared on cell change.
+    hover_tooltip_visible: bool,
+    /// Full OSC 8 URI cached at dwell-threshold time so the per-frame
+    /// render does not re-read `cell.hyperlink()`.
+    hover_tooltip_uri: Option<String>,
+
+    /// Confirmation dialog overlay for activating an OSC 8 URI whose
+    /// scheme is outside the existing outbound allowlist (FR-015).
+    disallowed_scheme_dialog: Option<disallowed_scheme_dialog::DisallowedSchemeDialog>,
+
     /// Config file watcher -- kept alive for its side-effect of sending
     /// `UiEvent::ConfigChanged` events.
     config_watcher_keepalive: Option<notify::RecommendedWatcher>,
@@ -1131,7 +1155,10 @@ impl App {
             status_bar_tooltip_targets: Vec::new(), tab_bar_tooltip_targets: Vec::new(), active_tooltip: None,
             prompt_bar_hover: None, prompt_bar_pressed: None, scroll_pin_hover: None,
             hostname: String::new(), sys_stats: sys_stats::SystemStatsCollector::new(),
-            pending_pty_bytes: HashMap::new(), url_caches: HashMap::new(), hovered_url: None, config_watcher_keepalive: None,
+            pending_pty_bytes: HashMap::new(), url_caches: HashMap::new(), hovered_url: None,
+            hover_cell: None, hover_started_at: None, hover_tooltip_visible: false,
+            hover_tooltip_uri: None, disallowed_scheme_dialog: None,
+            config_watcher_keepalive: None,
         }
     }
 
@@ -1527,6 +1554,12 @@ impl App {
             dropped_rows,
         );
         pane.content_dirty = true;
+        // Spec 009 T022 / FR-002: scrollback trim can drop cells inside an
+        // OSC 8 span, so the URL cache must invalidate to avoid leaving a
+        // stale `Osc8Hyperlink` span pointing at trimmed rows.
+        if let Some(cache) = self.url_caches.get_mut(&pane_id) {
+            cache.mark_dirty();
+        }
         self.request_redraw();
     }
 
@@ -1610,11 +1643,45 @@ impl App {
             self.handle_update_dialog_window_event(event_loop, event);
             return true;
         }
+        if self.disallowed_scheme_dialog.is_some() {
+            self.handle_disallowed_scheme_dialog_window_event(event_loop, event);
+            return true;
+        }
         if self.workspace_notes_modal.is_open() {
             self.handle_workspace_notes_window_event(event_loop, event);
             return true;
         }
         false
+    }
+
+    fn handle_disallowed_scheme_dialog_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => self.handle_close_requested(event_loop),
+            WindowEvent::RedrawRequested => self.handle_redraw(),
+            WindowEvent::Resized(size) => self.handle_resize_and_mark_geometry(*size),
+            WindowEvent::Moved(_) => self.mark_geometry_dirty(),
+            WindowEvent::ModifiersChanged(new_mods) => self.modifiers = new_mods.state(),
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if self.handle_native_close_window_shortcut(key_event, event_loop) {
+                    return;
+                }
+                self.handle_disallowed_scheme_dialog_keyboard(key_event);
+            }
+            WindowEvent::MouseInput {
+                state: winit::event::ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => self.handle_disallowed_scheme_dialog_click(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.update_cursor_position(position);
+                self.handle_disallowed_scheme_dialog_hover();
+            }
+            _ => {}
+        }
     }
 
     fn handle_close_dialog_window_event(
@@ -1875,6 +1942,7 @@ impl App {
             || self.workspace_notes_modal.is_open()
             || self.close_dialog.is_some()
             || self.update_dialog.is_some()
+            || self.disallowed_scheme_dialog.is_some()
             || self.context_menu.is_some()
             || self.focused_inline_editor.is_some()
         {
@@ -5009,6 +5077,9 @@ impl App {
         self.apply_modal_overlays(prepared, all_instances);
         self.apply_prompt_tooltip_overlay(prepared, all_instances);
         self.apply_active_tooltip_overlay(prepared, all_instances);
+        // Spec 009 T017 / FR-006: OSC 8 hover-tooltip rides the same
+        // tooltip renderer as the chrome tooltips above.
+        self.apply_osc8_hover_tooltip_overlay(prepared, all_instances);
         self.apply_palette_or_search_overlay(prepared, all_instances);
         if self.opacity < 1.0 {
             apply_opacity_to_instances(all_instances, self.opacity);
@@ -5223,6 +5294,17 @@ impl App {
                 resolve_glyph: &mut update_dialog_resolve_glyph,
             });
         }
+        if let Some(dialog) = &mut self.disallowed_scheme_dialog {
+            let mut disallowed_dialog_resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            dialog.build_instances(disallowed_scheme_dialog::DisallowedSchemeDialogBuildContext {
+                out: all_instances,
+                viewport: prepared.full_viewport,
+                cell_size: prepared.cell_size,
+                chrome: &self.theme.chrome,
+                resolve_glyph: &mut disallowed_dialog_resolve_glyph,
+            });
+        }
         if let Some(menu) = &mut self.context_menu {
             let mut context_menu_resolve_glyph =
                 |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
@@ -5322,6 +5404,7 @@ impl App {
             && self.context_menu.is_none()
             && self.close_dialog.is_none()
             && self.update_dialog.is_none()
+            && self.disallowed_scheme_dialog.is_none()
             && !self.command_palette.is_active()
             && !self.search_overlay.is_active()
     }
@@ -5415,6 +5498,154 @@ impl App {
             viewport_width: prepared.full_viewport.width,
             resolve_glyph: &mut active_tooltip_resolve_glyph,
         });
+    }
+
+    /// Spec 009 T017 / FR-006: render the OSC 8 hover-tooltip when the
+    /// hover-dwell threshold has elapsed and the underlying cell still
+    /// carries an OSC 8 URI.
+    fn apply_osc8_hover_tooltip_overlay(
+        &mut self,
+        prepared: &PreparedFrame,
+        all_instances: &mut Vec<CellInstance>,
+    ) {
+        // Dwell window: a steady 300 ms mirrors common GUI hover tooltips
+        // and matches the value documented in data-model.md E3.
+        const DWELL_THRESHOLD: Duration = Duration::from_millis(300);
+
+        let Some(started) = self.hover_started_at else { return };
+        let Some(hover_cell) = self.hover_cell else { return };
+        if started.elapsed() < DWELL_THRESHOLD {
+            return;
+        }
+
+        // Data-model E3 contract: fetch + clone the URI once at dwell-
+        // threshold time, then reuse the cached `hover_tooltip_uri` on
+        // every subsequent frame so the per-frame render is allocation-
+        // free. PTY output between mouse-move and PTY feed is handled by
+        // `update_osc8_hover`, which clears the hover state on any cell
+        // change.
+        let (pane_id, row, col) = hover_cell;
+        if self.hover_tooltip_uri.is_none() {
+            let Some(pane) = self.panes.get(&pane_id) else { return };
+            let Some(cache) = self.url_caches.get_mut(&pane_id) else { return };
+            cache.refresh(&pane.term);
+            let Some(span) = cache.url_at(row, col) else { return };
+            if !matches!(span.kind, url_detect::SpanKind::Osc8Hyperlink) {
+                return;
+            }
+            self.hover_tooltip_uri = Some(span.url.clone());
+            self.hover_tooltip_visible = true;
+        }
+        let Some(uri) = self.hover_tooltip_uri.as_deref() else { return };
+
+        let Some(anchor) = self.osc8_cell_anchor_rect(prepared, pane_id, row, col) else {
+            return;
+        };
+        let position = Self::osc8_tooltip_position(prepared, pane_id, anchor);
+        let cols = self.panes.get(&pane_id).map_or(usize::MAX, |p| {
+            use alacritty_terminal::grid::Dimensions as _;
+            p.term.grid().columns()
+        });
+        let display = osc8_tooltip_truncate(uri, cols);
+
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let mut osc8_tooltip_resolve_glyph =
+            |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+        tooltip::render_tooltip(tooltip::TooltipRenderContext {
+            out: all_instances,
+            text: &display,
+            anchor,
+            position,
+            bg_color: prepared.sb_colors.bg,
+            fg_color: prepared.sb_colors.text,
+            border_color: prepared.sb_colors.separator,
+            cell_size: prepared.cell_size,
+            viewport_width: prepared.full_viewport.width,
+            resolve_glyph: &mut osc8_tooltip_resolve_glyph,
+        });
+    }
+
+    /// Compute the screen-pixel rect of the cell at absolute grid
+    /// `(row, col)` within `pane_id`. Returns `None` when the row is
+    /// outside the visible grid (scrolled off, alt-screen swapped, etc.).
+    fn osc8_cell_anchor_rect(
+        &self,
+        prepared: &PreparedFrame,
+        pane_id: PaneId,
+        row: i32,
+        col: usize,
+    ) -> Option<Rect> {
+        use alacritty_terminal::grid::Dimensions as _;
+
+        let pane = self.panes.get(&pane_id)?;
+        let (_, pane_rect) = prepared.pane_rects.iter().find(|(id, _)| *id == pane_id)?;
+        let (cell_w, cell_h) = prepared.cell_size;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+
+        // Convert absolute grid row to a screen-line index via the pane's
+        // display offset (same convention `cursor_to_grid_impl` reads in
+        // the forward direction).
+        let display_offset_i32 = i32::try_from(pane.term.grid().display_offset()).unwrap_or(0);
+        let screen_line = row.saturating_add(display_offset_i32);
+        if screen_line < 0 {
+            return None;
+        }
+        let screen_lines = pane.term.grid().screen_lines();
+        let screen_line_usize = usize::try_from(screen_line).ok()?;
+        if screen_line_usize >= screen_lines {
+            return None;
+        }
+        if col >= pane.term.grid().columns() {
+            return None;
+        }
+
+        let tab_bar_height = if pane.edges.top() {
+            pane_tab_bar_h(
+                pane.workspace_id,
+                &prepared.ws_tab_bar_heights,
+                &prepared.ws_tab_bar_data,
+            )
+        } else {
+            0.0
+        };
+        let pb_height = pane.prompt_bar_height(prepared.prompt_bar_cell_size.1, true);
+        let content_pb_h = if prepared.prompt_bar_at_top { pb_height } else { 0.0 };
+        let padding = pane::effective_padding(
+            &self.config.appearance.content_padding,
+            pane.edges,
+            self.scale_factor,
+        );
+        let offset = pane.content_offset(tab_bar_height, content_pb_h, &padding, self.scale_factor);
+
+        let line_u16 = u16::try_from(screen_line_usize).unwrap_or(u16::MAX);
+        let col_u16 = u16::try_from(col).unwrap_or(u16::MAX);
+        let x = pane_rect.x + offset.0 + f32::from(col_u16) * cell_w;
+        let y = pane_rect.y + offset.1 + f32::from(line_u16) * cell_h;
+        Some(Rect { x, y, width: cell_w, height: cell_h })
+    }
+
+    /// Pick `Below` by default, flipping to `Above` when the hovered cell
+    /// is on the last visible row of the pane so the tooltip stays within
+    /// the pane bounds.
+    fn osc8_tooltip_position(
+        prepared: &PreparedFrame,
+        pane_id: PaneId,
+        anchor: Rect,
+    ) -> tooltip::TooltipPosition {
+        let bottom = prepared
+            .pane_rects
+            .iter()
+            .find(|(id, _)| *id == pane_id)
+            .map_or(prepared.full_viewport.y + prepared.full_viewport.height, |(_, r)| {
+                r.y + r.height
+            });
+        if anchor.y + anchor.height + prepared.cell_size.1 > bottom {
+            tooltip::TooltipPosition::Above
+        } else {
+            tooltip::TooltipPosition::Below
+        }
     }
 
     fn apply_palette_or_search_overlay(
@@ -7011,6 +7242,13 @@ impl App {
             &self.ai_tracker,
             &self.config.terminal,
         );
+        // Spec 009 T022: viewport scroll moves the visible cell window so
+        // the URL-detect cache must refresh — the cells that just scrolled
+        // into view may carry OSC 8 spans that weren't part of the
+        // previous viewport's pass.
+        if let Some(cache) = self.url_caches.get_mut(&pane_id) {
+            cache.mark_dirty();
+        }
         self.ensure_animation_running();
         self.request_redraw();
     }
@@ -8038,6 +8276,63 @@ impl App {
 
         // Update tooltip state: check status bar targets (Above) then tab targets (Below).
         self.update_active_tooltip(x, y);
+
+        // Spec 009 T016 / FR-006: track OSC 8 hover-cell dwell. Anchored
+        // on the focused pane's hit cell; non-OSC-8 cells reset all state.
+        self.update_osc8_hover(x, y);
+    }
+
+    /// Update OSC 8 hover-tooltip state from a cursor position (spec 009
+    /// T016 / FR-006). Cell transitions reset the dwell timer; cells with
+    /// no OSC 8 URI clear all state so the tooltip path stays inert for
+    /// non-OSC-8 cells (no regression on plain-text hover behaviour).
+    fn update_osc8_hover(&mut self, x: f32, y: f32) {
+        // Cheap position-only resolution first: if the cursor is on the
+        // same (pane_id, row, col) as the current `hover_cell`, do nothing
+        // — no cache refresh, no hyperlink lookup. The full validation
+        // only runs when the cell actually changes.
+        let new_position = self.osc8_hover_position(x, y);
+        if new_position == self.hover_cell {
+            return;
+        }
+        let new_cell = match new_position {
+            Some((pane_id, row, col)) if self.cell_has_osc8_hyperlink(pane_id, row, col) => {
+                Some((pane_id, row, col))
+            }
+            _ => None,
+        };
+        if new_cell == self.hover_cell {
+            return;
+        }
+        self.hover_cell = new_cell;
+        self.hover_started_at = new_cell.is_some().then(Instant::now);
+        let was_visible = self.hover_tooltip_visible;
+        self.hover_tooltip_visible = false;
+        self.hover_tooltip_uri = None;
+        if was_visible {
+            self.request_redraw();
+        }
+    }
+
+    /// Resolve the cursor position to a `(pane_id, row, col)` triple
+    /// without touching the URL cache. Uses `pane_id_at_cursor` so the
+    /// hovered pane is the pane the mouse is OVER, not the keyboard-
+    /// focused pane (multi-pane correctness — data-model E3).
+    fn osc8_hover_position(&mut self, x: f32, y: f32) -> Option<(PaneId, i32, usize)> {
+        let point = self.cursor_to_grid(x, y)?;
+        let pane_id = self.pane_id_at_cursor()?;
+        Some((pane_id, point.row, point.col))
+    }
+
+    /// Validate that the cell at `(pane_id, row, col)` currently carries
+    /// an OSC 8 hyperlink. Runs only when the position actually changes.
+    fn cell_has_osc8_hyperlink(&mut self, pane_id: PaneId, row: i32, col: usize) -> bool {
+        let Some(pane) = self.panes.get(&pane_id) else { return false };
+        let Some(cache) = self.url_caches.get_mut(&pane_id) else { return false };
+        cache.refresh(&pane.term);
+        cache
+            .url_at(row, col)
+            .is_some_and(|s| matches!(s.kind, url_detect::SpanKind::Osc8Hyperlink))
     }
 
     /// Check tooltip hover targets and update `active_tooltip`.
@@ -8439,12 +8734,17 @@ impl App {
         }
         if let Some(ref span) = self.hovered_url {
             let kind_str = match span.kind {
+                url_detect::SpanKind::Osc8Hyperlink => "osc8",
                 url_detect::SpanKind::Url => "url",
                 url_detect::SpanKind::Path => "path",
             };
             tracing::debug!(url = %span.url, kind = kind_str, "ctrl+click: opening hovered span");
             let text = span.url.clone();
             match span.kind {
+                // FR-003 + FR-015: OSC 8 URIs route through the
+                // scheme-allowlist gate so disallowed schemes raise the
+                // confirmation dialog instead of opening silently.
+                url_detect::SpanKind::Osc8Hyperlink => self.route_osc8_activation(text),
                 url_detect::SpanKind::Url => url_detect::open_url(&text),
                 url_detect::SpanKind::Path => {
                     let cwd = self
@@ -8463,6 +8763,27 @@ impl App {
             "ctrl+click: no hovered url to open"
         );
         false
+    }
+
+    /// Route activation of an OSC 8 URI through the scheme allowlist gate.
+    ///
+    /// Allowed-scheme URIs hand directly to `url_detect::open_url`
+    /// (preserves common-case latency per SC-006). Disallowed-scheme URIs
+    /// raise the in-app confirmation dialog (FR-015); the dialog's "Open
+    /// Anyway" button later routes back through `open_url`. URIs without a
+    /// recognisable scheme prefix fall back to the dialog so the user can
+    /// inspect the raw target.
+    fn route_osc8_activation(&mut self, uri: String) {
+        let scheme = url_detect::extract_scheme(&uri).unwrap_or_default();
+        if url_detect::is_allowed_scheme(&uri) {
+            tracing::debug!(scheme = %scheme, decision = "allow", "osc8: route_activation");
+            url_detect::open_url(&uri);
+            return;
+        }
+        tracing::info!(scheme = %scheme, decision = "prompt", "osc8: route_activation");
+        self.disallowed_scheme_dialog =
+            Some(disallowed_scheme_dialog::DisallowedSchemeDialog::new(uri, scheme));
+        self.request_redraw();
     }
 
     // -------------------------------------------------------------------
@@ -8826,12 +9147,23 @@ impl App {
         let Some((x, y)) = self.last_cursor_pos else { return };
         let has_selection =
             self.active_selection.is_some_and(|s: selection::SelectionRange| !s.is_empty());
-        let (url, file_path) =
-            self.hovered_url.as_ref().map_or((None, None), |span| match span.kind {
-                url_detect::SpanKind::Url => (Some(span.url.clone()), None),
-                url_detect::SpanKind::Path => (None, Some(span.url.clone())),
+        // Spec 009 FR-003 / FR-007: when the right-click target carries an
+        // OSC 8 URI, surface it as `osc8_uri` so the menu builder uses it
+        // verbatim for "Open URL" and appends "Copy hyperlink address". The
+        // heuristic `url` / `file_path` slots remain populated for non-OSC
+        // cells (FR-014 / SC-004).
+        let (url, file_path, osc8_uri) =
+            self.hovered_url.as_ref().map_or((None, None, None), |span| match span.kind {
+                url_detect::SpanKind::Osc8Hyperlink => (None, None, Some(span.url.clone())),
+                url_detect::SpanKind::Url => (Some(span.url.clone()), None, None),
+                url_detect::SpanKind::Path => (None, Some(span.url.clone()), None),
             });
-        let smart_actions = self.smart_selection_menu_items(x, y);
+        // FR-003 explicit on smart selection (T010): if the hit-tested
+        // cell carries an OSC 8 URI, prefer that URI in any
+        // smart-selection-generated "Open URL" item that targets the same
+        // cell. Smart-selection items only reach the activation path via
+        // this context menu, so this is the single hook needed.
+        let smart_actions = self.smart_selection_menu_items_with_osc8(x, y, osc8_uri.as_deref());
         // FR-010: context menu is a higher-priority overlay; flush any open
         // inline-editor drafts via SaveDraft before taking focus.
         if !self.adding_note_states.is_empty() {
@@ -8845,8 +9177,31 @@ impl App {
                 url,
                 file_path,
                 smart_actions,
+                osc8_uri,
             }));
         self.request_redraw();
+    }
+
+    /// Build smart-selection menu items, swapping any heuristic `OpenUrl`
+    /// action for an `OpenOsc8Url` carrying the OSC 8 URI when the click
+    /// target cell carries one (spec 009 T010 / FR-003). Routing the
+    /// action through the OSC 8 variant ensures the dispatcher applies
+    /// the scheme-allowlist gate just like the right-click "Open URL"
+    /// item does.
+    fn smart_selection_menu_items_with_osc8(
+        &self,
+        x: f32,
+        y: f32,
+        osc8_uri: Option<&str>,
+    ) -> Vec<context_menu::MenuItem> {
+        let mut items = self.smart_selection_menu_items(x, y);
+        let Some(uri) = osc8_uri else { return items };
+        for item in &mut items {
+            if matches!(item.action, context_menu::ContextMenuAction::OpenUrl(_)) {
+                item.action = context_menu::ContextMenuAction::OpenOsc8Url(uri.to_owned());
+            }
+        }
+        items
     }
 
     fn smart_selection_menu_items(&self, x: f32, y: f32) -> Vec<context_menu::MenuItem> {
@@ -8887,7 +9242,24 @@ impl App {
             context_menu::ContextMenuAction::CopyText(text) => self.copy_text_to_clipboard(&text),
             context_menu::ContextMenuAction::Paste => self.perform_paste(),
             context_menu::ContextMenuAction::SelectAll => self.select_all(),
-            context_menu::ContextMenuAction::OpenUrl(url) => url_detect::open_url(&url),
+            context_menu::ContextMenuAction::OpenUrl(url) => {
+                // Heuristic-URL path — unchanged from pre-009 behaviour.
+                // `open_url` silently drops non-allowlisted schemes.
+                url_detect::open_url(&url);
+            }
+            context_menu::ContextMenuAction::OpenOsc8Url(uri) => {
+                // Spec 009 FR-003 / FR-015: route through the OSC 8
+                // scheme-allowlist gate so disallowed schemes pop the
+                // confirmation dialog. Allowed schemes flow through
+                // `open_url` with no added latency.
+                self.route_osc8_activation(uri);
+            }
+            context_menu::ContextMenuAction::CopyHyperlinkAddress(uri) => {
+                // FR-007: copy the OSC 8 URI verbatim through the same
+                // clipboard-write path as `ContextMenuAction::Copy` uses
+                // when copying selection text.
+                self.copy_text_to_clipboard(&uri);
+            }
             context_menu::ContextMenuAction::OpenFile(path) => {
                 let cwd = self
                     .window_layout
@@ -9679,6 +10051,14 @@ impl App {
                 continue;
             };
             pane.resize(ws_rect, ws_grid);
+        }
+        // Spec 009 T022: resize reflows lines and changes which cells are
+        // in the viewport, so every URL cache (active and background)
+        // must invalidate. Without this an OSC 8 span position cached
+        // pre-resize would point at a stale row/col after the grid
+        // reflows.
+        for cache in self.url_caches.values_mut() {
+            cache.mark_dirty();
         }
         self.resize_pending = Some(Instant::now());
     }
@@ -10511,6 +10891,93 @@ impl App {
             dialog.focus_prev();
         } else {
             dialog.focus_next();
+        }
+        self.request_redraw();
+    }
+
+    // -------------------------------------------------------------------
+    // Disallowed-scheme dialog input handlers (spec 009 FR-015)
+    // -------------------------------------------------------------------
+
+    /// Handle keyboard input while the disallowed-scheme dialog is active.
+    fn handle_disallowed_scheme_dialog_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        use winit::keyboard::{Key, NamedKey};
+
+        if event.state != winit::event::ElementState::Pressed {
+            return;
+        }
+
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.handle_disallowed_scheme_action(
+                    disallowed_scheme_dialog::DisallowedSchemeAction::Cancel,
+                );
+            }
+            Key::Named(NamedKey::Enter) => {
+                let action = self.disallowed_scheme_dialog.as_ref().map_or(
+                    disallowed_scheme_dialog::DisallowedSchemeAction::Cancel,
+                    disallowed_scheme_dialog::DisallowedSchemeDialog::confirm,
+                );
+                self.handle_disallowed_scheme_action(action);
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.cycle_disallowed_scheme_dialog_focus();
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a mouse click while the disallowed-scheme dialog is active.
+    fn handle_disallowed_scheme_dialog_click(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        let action = self.disallowed_scheme_dialog.as_ref().and_then(|d| d.click(x, y));
+        if let Some(action) = action {
+            self.handle_disallowed_scheme_action(action);
+        }
+    }
+
+    /// Handle mouse hover while the disallowed-scheme dialog is active.
+    fn handle_disallowed_scheme_dialog_hover(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        if let Some(dialog) = &mut self.disallowed_scheme_dialog {
+            if dialog.update_hover(x, y) {
+                self.request_redraw();
+            }
+        }
+    }
+
+    fn cycle_disallowed_scheme_dialog_focus(&mut self) {
+        let Some(dialog) = &mut self.disallowed_scheme_dialog else { return };
+        if self.modifiers.shift_key() {
+            dialog.focus_prev();
+        } else {
+            dialog.focus_next();
+        }
+        self.request_redraw();
+    }
+
+    /// Dispatch the user's choice from the disallowed-scheme dialog.
+    fn handle_disallowed_scheme_action(
+        &mut self,
+        action: disallowed_scheme_dialog::DisallowedSchemeAction,
+    ) {
+        let Some(dialog) = self.disallowed_scheme_dialog.take() else { return };
+        match action {
+            disallowed_scheme_dialog::DisallowedSchemeAction::OpenAnyway => {
+                let uri = dialog.into_pending_uri();
+                let scheme = url_detect::extract_scheme(&uri).unwrap_or_default();
+                tracing::info!(scheme = %scheme, action = "open_anyway",
+                    "osc8: disallowed-scheme dialog confirmed");
+                // FR-015: hand the verbatim URI to the OS handler. The
+                // standard `open_url` rejects unsupported schemes, so this
+                // path issues the platform open command directly.
+                url_detect::open_uri_unguarded(&uri);
+            }
+            disallowed_scheme_dialog::DisallowedSchemeAction::Cancel => {
+                tracing::debug!(action = "cancel", "osc8: disallowed-scheme dialog dismissed");
+                // Drop the URI; no open happens.
+                drop(dialog);
+            }
         }
         self.request_redraw();
     }
@@ -12785,6 +13252,30 @@ fn hovered_url_at(
         url: span.url.clone(),
         kind: span.kind,
     })
+}
+
+/// Truncate an OSC 8 URI for tooltip display to the pane's column width
+/// (spec 009 T017). Keeps a head slice and a tail slice with `...`
+/// between them so domain-confusion suffixes (e.g.
+/// `https://github.com.evil.com/...`) stay visible to the user — head-
+/// only truncation hides the unsafe tail. The full URI stays in
+/// `App.hover_tooltip_uri` so the activation path still has the verbatim
+/// string.
+fn osc8_tooltip_truncate(uri: &str, max_cols: usize) -> String {
+    let chars: Vec<char> = uri.chars().collect();
+    if chars.len() <= max_cols {
+        return uri.to_owned();
+    }
+    if max_cols <= 3 {
+        return chars.into_iter().take(max_cols).collect();
+    }
+    let budget = max_cols.saturating_sub(3);
+    let head_chars = budget.div_ceil(2);
+    let tail_chars = budget - head_chars;
+    let mut out: String = chars.iter().take(head_chars).collect();
+    out.push_str("...");
+    out.extend(chars.iter().skip(chars.len() - tail_chars));
+    out
 }
 
 /// Return `true` if two `Option<UrlSpan>` values point to different URL spans.

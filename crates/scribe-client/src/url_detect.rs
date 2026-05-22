@@ -6,14 +6,19 @@
 use alacritty_terminal::Term;
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions as _;
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::cell::{Flags, Hyperlink};
 
 use crate::selection::{read_cell_char, read_cell_flags};
 
 /// Whether a detected span is a URL or a file-system path.
 #[derive(Clone, Copy)]
 pub enum SpanKind {
+    /// An OSC 8 explicit hyperlink emitted by the program (spec 009 FR-002).
+    /// Takes precedence over heuristic detection on overlapping cells
+    /// (FR-004) and surfaces the verbatim URI in tooltips and the "Copy
+    /// hyperlink address" context-menu entry (FR-006, FR-007).
+    Osc8Hyperlink,
     /// A recognised URL (`https://`, `http://`, `ftp://`, `file://`).
     Url,
     /// A file-system path (`/abs`, `~/`, `./`, `../`, or bare `word/path`).
@@ -68,7 +73,18 @@ impl PaneUrlCache {
     }
 
     /// Return the `UrlSpan` whose column range contains `col` on `row`, if any.
+    ///
+    /// When multiple spans cover the same cell, `Osc8Hyperlink` wins over
+    /// `Url`/`Path` (FR-004 precedence). The OSC 8 pass in
+    /// `scan_visible_urls` emits its spans first, so a single linear scan
+    /// over `self.spans` naturally honours the precedence without needing
+    /// a secondary index.
     pub fn url_at(&self, row: i32, col: usize) -> Option<&UrlSpan> {
+        if let Some(span) = self.spans.iter().find(|span| {
+            matches!(span.kind, SpanKind::Osc8Hyperlink) && span.contains_cell(row, col)
+        }) {
+            return Some(span);
+        }
         self.spans.iter().find(|span| span.contains_cell(row, col))
     }
 
@@ -130,10 +146,48 @@ struct LogicalCell {
     col: usize,
 }
 
+// ---------------------------------------------------------------------------
+// OSC 8 cell-walk pass — upstream URI-cap finding (spec 009 / T003 + T005)
+// ---------------------------------------------------------------------------
+// Upstream surface verified against the pinned crate source:
+//   * `alacritty_terminal-0.26.0-rc1/src/term/cell.rs:128,202,219` —
+//     `Cell::hyperlink() -> Option<Hyperlink>` and
+//     `Cell::set_hyperlink(Option<Hyperlink>)` are public, ungated by any
+//     feature flag.
+//   * `vte-0.15.0/src/ansi.rs:1392-1419` parses `OSC 8 ; <params> ; <URI>
+//     ST` and forwards the URI verbatim to `Handler::set_hyperlink`
+//     (`alacritty_terminal-0.26.0-rc1/src/term/mod.rs:1873-1877`), which
+//     stores it on each emitted cell.
+//
+// Upstream URI cap finding (FR-010): with `feature = "std"` (alacritty's
+// default and Scribe's dependency edition) the VTE OSC raw buffer is an
+// unbounded `Vec<u8>` (`vte-0.15.0/src/lib.rs:64`). `MAX_OSC_RAW = 1024`
+// applies only to `no_std` builds (line 545-551). No upstream length check
+// rejects long URIs in the std build. Scribe therefore enforces the
+// FR-010 2 KiB cap itself below: URIs whose UTF-8 length exceeds 2048
+// bytes are treated as absent (no `UrlSpan` emitted, the cell carries no
+// OSC 8 URI in the cache, activation falls back to the heuristic
+// detector).
+//
+// Span boundary rule: contiguous cells whose `cell.hyperlink()` share the
+// same `Arc<HyperlinkInner>` (verified via `Arc::ptr_eq`) merge into one
+// `UrlSpan`. Any boundary change (a different `Arc`, or a `None`) closes
+// the active span and starts a new one if applicable. This matches the
+// upstream `Arc<CellExtra>`-shared-per-open-run guarantee so a single
+// `OSC 8 ; ; URI ST` run yields exactly one span.
+
+/// Spec-mandated maximum URI length in bytes (FR-010, kitty-style 2 KiB cap).
+const OSC8_MAX_URI_BYTES: usize = 2048;
+
 /// Scan all visible rows of `term` for URLs and return their spans.
 ///
 /// Row indices in the returned spans are **absolute grid lines**: screen row
 /// minus `display_offset`, matching `alacritty_terminal`'s `Line` convention.
+///
+/// The OSC 8 cell-walk pass runs **first** so its spans take precedence in
+/// the linear-scan `url_at` lookup (FR-004); the heuristic pass that
+/// follows skips any cell already covered by an OSC 8 span (FR-014 — no
+/// regression on cells outside OSC 8 spans).
 fn scan_visible_urls(term: &Term<VoidListener>) -> Vec<UrlSpan> {
     let rows = term.grid().screen_lines();
     let cols = term.grid().columns();
@@ -144,12 +198,19 @@ fn scan_visible_urls(term: &Term<VoidListener>) -> Vec<UrlSpan> {
         return spans;
     }
 
+    // Pass 1: OSC 8 hyperlinks. Runs before the heuristic pass so the
+    // resulting `UrlSpan`s appear earlier in `spans`, which combined with
+    // the precedence branch in `url_at` makes OSC 8 win on overlap.
+    let osc8_ranges = scan_osc8_hyperlinks(term, &mut spans);
+
+    // Pass 2: heuristic URL + path detection, skipping cells already
+    // covered by an OSC 8 span.
     let mut screen_row: usize = 0;
     while screen_row < rows {
         let logical_line =
             collect_wrapped_logical_line(term, screen_row, rows, cols, display_offset);
-        let url_ranges = scan_logical_urls(&logical_line, &mut spans);
-        scan_logical_paths(&logical_line, &url_ranges, &mut spans);
+        let url_ranges = scan_logical_urls(&logical_line, &osc8_ranges, &mut spans);
+        scan_logical_paths(&logical_line, &url_ranges, &osc8_ranges, &mut spans);
 
         screen_row = logical_line.last().map_or(screen_row.saturating_add(1), |cell| {
             let row_with_offset = cell.row.saturating_add(grid_index_i32(display_offset)).max(0);
@@ -158,6 +219,171 @@ fn scan_visible_urls(term: &Term<VoidListener>) -> Vec<UrlSpan> {
     }
 
     spans
+}
+
+/// Inclusive cell range covered by one OSC 8 span (absolute grid coords).
+#[derive(Clone, Copy)]
+struct Osc8CellRange {
+    row_start: i32,
+    col_start: usize,
+    row_end: i32,
+    col_end: usize,
+}
+
+impl Osc8CellRange {
+    /// Test whether `(row, col)` falls inside this span.
+    ///
+    /// Invariant — intermediate rows are always fully covered. Upstream
+    /// VTE emits cells in row-major order through the OSC 8 open/close
+    /// run, so a span that spans rows `row_start..=row_end` covers every
+    /// column on every row in between. Only the start and end rows can be
+    /// partial (start row from `col_start`, end row up to `col_end`).
+    /// Single-row spans live in the first branch; the trailing `true`
+    /// returns "covered" for any middle row position.
+    fn contains(&self, row: i32, col: usize) -> bool {
+        if row < self.row_start || row > self.row_end {
+            return false;
+        }
+        if self.row_start == self.row_end {
+            return col >= self.col_start && col <= self.col_end;
+        }
+        if row == self.row_start {
+            return col >= self.col_start;
+        }
+        if row == self.row_end {
+            return col <= self.col_end;
+        }
+        true
+    }
+}
+
+/// Walk the visible grid via the alacritty display iterator and emit one
+/// `UrlSpan { kind: Osc8Hyperlink, .. }` per contiguous run of cells sharing
+/// the same `Hyperlink`'s `Arc<HyperlinkInner>`.
+///
+/// Returns inclusive cell ranges so the heuristic pass can skip them
+/// (FR-004 precedence). URIs longer than `OSC8_MAX_URI_BYTES` are treated
+/// as absent (FR-010) — the affected cells carry no OSC 8 URI in the cache
+/// and fall through to the heuristic detector.
+fn scan_osc8_hyperlinks(term: &Term<VoidListener>, out: &mut Vec<UrlSpan>) -> Vec<Osc8CellRange> {
+    let mut ranges = Vec::new();
+    let mut active: Option<(Hyperlink, i32, usize, i32, usize)> = None;
+
+    // `display_iter()` yields cells in row-major order across the visible
+    // grid. `point.line.0` carries the same `Line(screen_row -
+    // display_offset)` value the heuristic pass stores via `row_abs` in
+    // `collect_wrapped_logical_line`, so no row-coordinate translation is
+    // needed here.
+    let iter = term.grid().display_iter();
+    {
+        let mut sink = Osc8WalkSink { active: &mut active, out, ranges: &mut ranges };
+        for indexed in iter {
+            let point: Point = indexed.point;
+            let row_for_span = point.line.0;
+            let col_for_span = point.column.0;
+            let cell_link = indexed.cell.hyperlink();
+            process_osc8_cell(&mut sink, cell_link, row_for_span, col_for_span);
+        }
+    }
+    flush_osc8_span(&mut active, out, &mut ranges);
+    tracing::trace!(span_count = ranges.len(), "osc8: scan_visible_urls");
+    ranges
+}
+
+/// Sink for the OSC 8 cell-walk pass — bundles the per-call mutable
+/// references so the boundary handler can stay below clippy's argument
+/// count limit while still threading state across the iteration.
+struct Osc8WalkSink<'a> {
+    active: &'a mut Option<(Hyperlink, i32, usize, i32, usize)>,
+    out: &'a mut Vec<UrlSpan>,
+    ranges: &'a mut Vec<Osc8CellRange>,
+}
+
+/// Update the active-span aggregator with the hyperlink seen on the next
+/// cell. Split out of the display-iter loop body to keep clippy's
+/// excessive-nesting lint happy and to make the boundary rule
+/// (`None ↔ Some` and Arc-change transitions) easy to inspect.
+fn process_osc8_cell(
+    sink: &mut Osc8WalkSink<'_>,
+    cell_link: Option<Hyperlink>,
+    row: i32,
+    col: usize,
+) {
+    // Borrow the active hyperlink (if any) for comparison — avoids the
+    // per-cell `Hyperlink::clone` (one atomic refcount op each) the
+    // previous shape did unconditionally on every grid cell. The borrow
+    // ends before any mutation of `sink.active`.
+    let active_same = matches!((sink.active.as_ref(), cell_link.as_ref()), (Some((a, ..)), Some(b)) if hyperlink_same(a, b));
+    if active_same {
+        if let Some(entry) = sink.active.as_mut() {
+            entry.3 = row;
+            entry.4 = col;
+        }
+        return;
+    }
+    match (sink.active.is_some(), cell_link) {
+        (false, None) => {}
+        (false, Some(link)) => {
+            if hyperlink_uri_is_acceptable(&link) {
+                *sink.active = Some((link, row, col, row, col));
+            }
+        }
+        (true, Some(next)) => {
+            flush_osc8_span(sink.active, sink.out, sink.ranges);
+            if hyperlink_uri_is_acceptable(&next) {
+                *sink.active = Some((next, row, col, row, col));
+            }
+        }
+        (true, None) => {
+            flush_osc8_span(sink.active, sink.out, sink.ranges);
+        }
+    }
+}
+
+/// Hyperlink equivalence used to detect a single OSC 8 open/close run.
+///
+/// Upstream wraps the URI + id pair in `Arc<HyperlinkInner>` so all cells
+/// tagged inside one run share the same Arc identity. `PartialEq` on
+/// `Hyperlink` compares via the inner Arc, so structurally-equal hyperlinks
+/// emitted by two adjacent runs would compare equal too — but the upstream
+/// auto-generated `_alacritty` id suffix increments per anonymous open
+/// (see `term/cell.rs:88-94`), so the IDs differ and `PartialEq` separates
+/// them correctly. For explicit `id=` reuse across non-adjacent runs the
+/// `id` string still appears the same to upstream and they collapse into
+/// one Arc; per FR-005 we treat that as the same span when contiguous,
+/// and the contiguity check (cells must be adjacent in iteration order)
+/// guarantees a later separately-opened run starts a new span anyway.
+fn hyperlink_same(a: &Hyperlink, b: &Hyperlink) -> bool {
+    a == b
+}
+
+fn hyperlink_uri_is_acceptable(link: &Hyperlink) -> bool {
+    let uri = link.uri();
+    !uri.is_empty() && uri.len() <= OSC8_MAX_URI_BYTES
+}
+
+fn flush_osc8_span(
+    active: &mut Option<(Hyperlink, i32, usize, i32, usize)>,
+    out: &mut Vec<UrlSpan>,
+    ranges: &mut Vec<Osc8CellRange>,
+) {
+    let Some((link, row_start, col_start, row_end, col_end)) = active.take() else {
+        return;
+    };
+    out.push(UrlSpan {
+        row: row_start,
+        col_start,
+        row_end,
+        col_end,
+        url: link.uri().to_owned(),
+        kind: SpanKind::Osc8Hyperlink,
+    });
+    ranges.push(Osc8CellRange { row_start, col_start, row_end, col_end });
+}
+
+/// Returns `true` when the cell at `(row, col)` falls inside any OSC 8 span.
+fn cell_in_osc8_range(ranges: &[Osc8CellRange], row: i32, col: usize) -> bool {
+    ranges.iter().any(|r| r.contains(row, col))
 }
 
 fn collect_wrapped_logical_line(
@@ -200,13 +426,25 @@ fn collect_wrapped_logical_line(
 /// `cells` contains exactly one `char` per terminal column, joined across
 /// WRAPLINE-connected rows. We work with char indices so multi-byte characters
 /// never cause a slice at a non-char-boundary.
-fn scan_logical_urls(cells: &[LogicalCell], out: &mut Vec<UrlSpan>) -> Vec<(usize, usize)> {
+///
+/// Cells already covered by an `Osc8Hyperlink` span (per `osc8_ranges`)
+/// are skipped — heuristic URL detection MUST not produce a span over a
+/// cell that already carries an OSC 8 URI (FR-004 precedence).
+fn scan_logical_urls(
+    cells: &[LogicalCell],
+    osc8_ranges: &[Osc8CellRange],
+    out: &mut Vec<UrlSpan>,
+) -> Vec<(usize, usize)> {
     let chars: Vec<char> = cells.iter().map(|cell| cell.ch).collect();
     let char_count = chars.len();
     let mut char_pos = 0usize;
     let mut ranges = Vec::new();
 
     while char_pos < char_count {
+        if cell_is_under_osc8(cells, char_pos, osc8_ranges) {
+            char_pos = char_pos.saturating_add(1);
+            continue;
+        }
         let Some(prefix_len_chars) = match_prefix_chars(&chars, char_pos) else {
             char_pos = char_pos.saturating_add(1);
             continue;
@@ -218,6 +456,15 @@ fn scan_logical_urls(cells: &[LogicalCell], out: &mut Vec<UrlSpan>) -> Vec<(usiz
         let url = strip_trailing_punct(raw);
         let url_char_len = url.chars().count();
         let url_col_end = url_col_start + url_char_len;
+
+        // FR-004: if any cell within the heuristic match falls inside an
+        // OSC 8 span, skip the entire match — OSC 8 wins.
+        let intersects_osc8 =
+            (url_col_start..url_col_end).any(|i| cell_is_under_osc8(cells, i, osc8_ranges));
+        if intersects_osc8 {
+            char_pos = char_pos.saturating_add(1);
+            continue;
+        }
 
         if url_char_len > prefix_len_chars && url_col_end <= char_count {
             let Some(start) = cells.get(url_col_start) else {
@@ -243,6 +490,20 @@ fn scan_logical_urls(cells: &[LogicalCell], out: &mut Vec<UrlSpan>) -> Vec<(usiz
     }
 
     ranges
+}
+
+/// Returns `true` when the logical cell at `char_pos` (a column index into
+/// the WRAPLINE-joined logical line) maps to a grid cell covered by an
+/// OSC 8 span.
+fn cell_is_under_osc8(
+    cells: &[LogicalCell],
+    char_pos: usize,
+    osc8_ranges: &[Osc8CellRange],
+) -> bool {
+    let Some(cell) = cells.get(char_pos) else {
+        return false;
+    };
+    cell_in_osc8_range(osc8_ranges, cell.row, cell.col)
 }
 
 /// Match a URL prefix starting at `chars[pos]`, returning the prefix length in
@@ -305,10 +566,13 @@ const BARE_PATH_LOOKAHEAD: usize = 30;
 ///
 /// `url_ranges` contains `(col_start, col_end)` pairs for URL spans already
 /// detected on this logical line; any character position that falls inside
-/// one of them is skipped to avoid overlaps.
+/// one of them is skipped to avoid overlaps. Cells covered by `osc8_ranges`
+/// are likewise skipped so OSC 8 spans take precedence over heuristic path
+/// detection (FR-004).
 fn scan_logical_paths(
     cells: &[LogicalCell],
     url_ranges: &[(usize, usize)],
+    osc8_ranges: &[Osc8CellRange],
     out: &mut Vec<UrlSpan>,
 ) {
     let chars: Vec<char> = cells.iter().map(|cell| cell.ch).collect();
@@ -318,6 +582,12 @@ fn scan_logical_paths(
     while char_pos < char_count {
         // Skip positions that belong to a URL span.
         if url_ranges.iter().any(|(start, end)| char_pos >= *start && char_pos <= *end) {
+            char_pos = char_pos.saturating_add(1);
+            continue;
+        }
+
+        // Skip positions that belong to an OSC 8 span (FR-004 precedence).
+        if cell_is_under_osc8(cells, char_pos, osc8_ranges) {
             char_pos = char_pos.saturating_add(1);
             continue;
         }
@@ -343,6 +613,15 @@ fn scan_logical_paths(
         } else {
             path_char_len > prefix_len && path_col_end_exclusive <= char_count
         };
+
+        // FR-004: skip the entire path match if any cell inside it lies
+        // inside an OSC 8 span — OSC 8 wins on overlap.
+        let intersects_osc8 = (path_col_start..path_col_end_exclusive)
+            .any(|i| cell_is_under_osc8(cells, i, osc8_ranges));
+        if intersects_osc8 {
+            char_pos = char_pos.saturating_add(1);
+            continue;
+        }
 
         if valid && path_col_end_exclusive <= char_count {
             let Some(start) = cells.get(path_col_start) else {
@@ -499,6 +778,33 @@ fn parse_path_line_suffix(raw: &str) -> (&str, Option<u32>) {
     (raw, None)
 }
 
+/// Returns `true` when `uri` starts with one of the outbound URL
+/// allowlist **prefixes** (`https://`, `http://`, `ftp://`, `file://`,
+/// `mailto:`, `ssh:`, `telnet:`).
+///
+/// Used by the OSC 8 activation router (spec 009 FR-009 / FR-015) to
+/// decide whether an OSC 8 URI may open directly or must first prompt
+/// the user via the disallowed-scheme dialog.
+///
+/// **Note:** despite the name, the check is a prefix match — each entry
+/// in `PREFIXES` includes its scheme delimiter (`://` or `:`). As long as
+/// `PREFIXES` only contains scheme+delimiter entries, this is
+/// functionally identical to a scheme-name check; the short name is kept
+/// to match the call sites.
+pub fn is_allowed_scheme(uri: &str) -> bool {
+    PREFIXES.iter().any(|p| uri.starts_with(p))
+}
+
+/// Extract the URI scheme (everything up to the first `:`) when present.
+///
+/// Returns `None` when `uri` does not contain a `:` or when the substring
+/// before `:` is empty.
+pub fn extract_scheme(uri: &str) -> Option<String> {
+    let colon = uri.find(':')?;
+    let scheme = uri.get(..colon)?;
+    if scheme.is_empty() { None } else { Some(scheme.to_owned()) }
+}
+
 /// Open a URL in the system default browser.
 ///
 /// Only URL schemes that Scribe recognizes in terminal text are accepted.
@@ -508,7 +814,15 @@ pub fn open_url(url: &str) {
         tracing::warn!("open_url: refusing to open unsupported URL scheme");
         return;
     }
+    open_uri_unguarded(url);
+}
 
+/// Open `uri` with the OS handler without the scheme-allowlist guard.
+///
+/// Used by the OSC 8 disallowed-scheme confirmation dialog (spec 009
+/// FR-015) after the user has explicitly chosen "Open Anyway". Allowed
+/// schemes go through `open_url` instead.
+pub fn open_uri_unguarded(uri: &str) {
     #[cfg(target_os = "linux")]
     let cmd = "xdg-open";
     #[cfg(target_os = "macos")]
@@ -516,8 +830,8 @@ pub fn open_url(url: &str) {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let cmd = "xdg-open";
 
-    match std::process::Command::new(cmd).arg(url).spawn() {
+    match std::process::Command::new(cmd).arg(uri).spawn() {
         Ok(_child) => {}
-        Err(e) => tracing::warn!("open_url: failed to spawn {cmd}: {e}"),
+        Err(e) => tracing::warn!("open_uri_unguarded: failed to spawn {cmd}: {e}"),
     }
 }

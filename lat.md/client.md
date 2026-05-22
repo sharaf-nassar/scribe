@@ -576,9 +576,51 @@ Right-click overlay with Copy (if selection active), Paste, Select All, Open URL
 
 The [[crates/scribe-client/src/url_detect.rs#PaneUrlCache]] scans visible terminal content for URLs (https, http, ftp, file, mailto, ssh, and telnet schemes) and file-system paths.
 
-Soft-wrapped rows are joined by `WRAPLINE` before scanning so a link split across terminal rows remains one clickable span. Trailing punctuation is stripped respecting bracket pairs. Detected spans are cached and invalidated on content change. Each span carries a `SpanKind` (`Url` or `Path`).
+Soft-wrapped rows are joined by `WRAPLINE` before scanning so a link split across terminal rows remains one clickable span. Trailing punctuation is stripped respecting bracket pairs. Detected spans are cached and invalidated on content change. Each span carries a `SpanKind` (`Osc8Hyperlink`, `Url`, or `Path`). OSC 8 hyperlinks take precedence over heuristic URL/path detection on overlapping cells (see [[client#URL Detection#Explicit Hyperlinks]] below).
 
 URL highlighting and the pointer cursor are only shown while the Ctrl modifier is held. The `ModifiersChanged` handler triggers a redraw and cursor update so visual feedback is immediate. Only the clickable span under the cursor is underlined; wrapped spans draw one underline segment per row. Ctrl+click opens the span via `xdg-open` on Linux or `open` on macOS. File paths support an optional `:N` line-number suffix; when present, `code --goto path:N` is tried first and `xdg-open` is the fallback. Relative paths are resolved against the pane's OSC 7 CWD, and `~/` is expanded using `$HOME`.
+
+### Explicit Hyperlinks
+
+OSC 8 explicit hyperlinks are surfaced as a distinct `SpanKind::Osc8Hyperlink` so the displayed text can be inspected separately from the destination URI. Parsing lives upstream in `alacritty_terminal`'s VTE Perform impl.
+
+[[crates/scribe-client/src/url_detect.rs#scan_osc8_hyperlinks]] is the client-side discovery pass: it iterates the visible grid and for every contiguous run of cells sharing the same hyperlink Arc emits one `UrlSpan { kind: Osc8Hyperlink, url, .. }`. The pass runs **before** the heuristic pass; the heuristic pass then skips cells already covered by an OSC 8 span (FR-004 precedence) but continues to function unchanged for cells outside one (FR-014). [[crates/scribe-client/src/url_detect.rs#PaneUrlCache#url_at]] returns `Osc8Hyperlink` before `Url` and `Path` on overlap.
+
+The `id=` parameter reconnects multi-segment hyperlinks within the same OSC 8 open/close run, including wrapped lines. A separately-opened later span reusing the same `id` with a different URI starts a new span — there is no retroactive merge across open/close runs.
+
+URI length is capped at 2048 bytes (FR-010). Upstream VTE (in the `std` build Scribe uses) does not cap OSC sequence length, so Scribe applies the cap in `scan_osc8_hyperlinks` itself; URIs longer than the cap are treated as absent and the affected cells fall back to the heuristic detector.
+
+### Hyperlink Hover Tooltip
+
+When the cursor settles on a cell carrying an OSC 8 URI for ≥300 ms with no movement, the verbatim URI is rendered through the existing [[crates/scribe-client/src/tooltip.rs#render_tooltip]] above or below the cell.
+
+[[crates/scribe-client/src/main.rs#App#apply_osc8_hover_tooltip_overlay]] is the render-loop hook. `Position::Below` is preferred and flipped to `Above` when the cell is on the bottom row. The URI is cached on `App.hover_tooltip_uri` at dwell-threshold time so subsequent frames render without re-reading `cell.hyperlink()`. Truncation only affects what is *displayed* — long URIs render with a **head + tail** view (`prefix...suffix`) via `osc8_tooltip_truncate` so domain-confusion suffixes stay visible to the user; the full URI is preserved on the span for activation. The dwell state lives on `App.hover_cell` / `hover_started_at` / `hover_tooltip_visible` / `hover_tooltip_uri` and resets whenever the cursor moves to a different cell or leaves the terminal area.
+
+Cells without an OSC 8 hyperlink never trigger the dwell path, so the tooltip does not surface heuristic URLs (those continue to use the established Ctrl+highlight affordance only).
+
+### Disallowed-Scheme Confirmation
+
+Activation of an OSC 8 hyperlink whose scheme is outside the existing outbound allowlist routes through a confirmation dialog instead of opening unprompted or being silently blocked.
+
+[[crates/scribe-client/src/disallowed_scheme_dialog.rs#DisallowedSchemeDialog]] is a sibling of the close and update dialogs that shows the URI (head+tail truncated for long URIs so the tail stays visible) plus a "scheme normally blocked" warning. **Cancel** (default focus, also bound to Esc) dismisses without opening; **Open Anyway** routes the URI through `url_detect::open_uri_unguarded`. Allowed-scheme hyperlinks bypass the dialog entirely so the common-case activation latency is unchanged.
+
+[[crates/scribe-client/src/main.rs#App#route_osc8_activation]] is the single helper that performs the allowlist branch and emits a `tracing::debug!`/`tracing::info!` line per decision. The OSC-8 activation paths funnel through it via the dedicated `ContextMenuAction::OpenOsc8Url` variant (right-click "Open URL" item and smart-selection `OpenUrl` rewriting) plus the Ctrl+click handler. Heuristic-URL `ContextMenuAction::OpenUrl` actions continue to flow directly through `url_detect::open_url` so the pre-009 silent-drop behaviour for non-allowlisted heuristic schemes is preserved.
+
+### Copy Hyperlink Address
+
+A right-click on an OSC 8 cell adds a "Copy hyperlink address" entry to the context menu — distinct from "Copy" which copies the displayed text selection unchanged.
+
+The new action variant is `ContextMenuAction::CopyHyperlinkAddress(String)` and the dispatch writes the verbatim URI to the system clipboard via the same path `ContextMenuAction::Copy` uses for text selections. The regular "Copy" path on a selection spanning a hyperlink is unchanged — selecting text inside a hyperlink and copying still yields the displayed text, never the URI.
+
+[[crates/scribe-client/src/context_menu.rs#ContextMenuRequest]] gains an `osc8_uri: Option<String>` field that the menu builder uses to decide whether to append the new item and whether the "Open URL" item emits `OpenOsc8Url(uri)` (OSC 8 origin, routes through the allowlist gate) or `OpenUrl(uri)` (heuristic origin, preserves the pre-009 direct-open behaviour).
+
+### Replay-Scrollback Limitation
+
+Hyperlinks reconstructed from `SessionReplay` (zero-downtime hot reattach and cold-restart restore) do **not** carry OSC 8 URIs. *Live* hyperlinks emitted by the PTY after the reattach completes work without regression.
+
+[[crates/scribe-common/src/screen_replay.rs#SessionReplay]]'s `snapshot_to_ansi` emits cell characters and SGR style only, with no OSC 8 open/close around hyperlinked runs. Live (post-reattach) hyperlinks ride the normal PTY-output byte path and reach the client-side VTE which populates cells as usual.
+
+Extending `snapshot_to_ansi` to re-emit OSC 8 open/close around hyperlinked runs is the documented follow-up improvement path; it would require a `SessionReplay` byte-format / version bump and is out of scope for the 009-osc8-hyperlinks spec.
 
 ## Clipboard Cleanup
 
