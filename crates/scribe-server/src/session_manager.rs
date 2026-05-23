@@ -104,6 +104,14 @@ pub fn build_term_config(scrollback_lines: usize) -> TermConfig {
         // Codex probes kitty keyboard mode during startup; enabling support
         // lets alacritty_terminal answer `CSI ? u` queries and mode updates.
         kitty_keyboard: true,
+        // Spec 010: alacritty's default `Osc52::OnlyCopy` silently drops
+        // OSC 52 read sequences inside the terminal core, so the read
+        // never surfaces as a `SessionEvent::ClipboardLoad` and the
+        // policy gating in `ipc_server::handle_clipboard_load` never
+        // runs. Forward both directions to the gating layer and let
+        // `ClipboardPolicyConfig` (FR-001 / FR-004) make the
+        // deny / allow / prompt decision per request.
+        osc52: alacritty_terminal::term::Osc52::CopyPaste,
         ..TermConfig::default()
     }
 }

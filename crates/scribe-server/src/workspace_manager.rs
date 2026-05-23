@@ -625,11 +625,13 @@ mod tests {
                 workspace_id: ws_a,
                 session_ids: vec![],
                 pane_trees: vec![],
+                active_tab_index: 0,
             }),
             second: Box::new(WorkspaceTreeNode::Leaf {
                 workspace_id: ws_b,
                 session_ids: vec![],
                 pane_trees: vec![],
+                active_tab_index: 0,
             }),
         };
         mgr.set_workspace_tree(tree);

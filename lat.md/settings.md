@@ -50,9 +50,11 @@ The Colors page also exposes five prompt bar color overrides labeled First Row, 
 
 ### Terminal Keys
 
-Terminal page general section — scrollback lines, natural scrolling, copy on select, the enhanced keyboard protocol (Kitty) toggle, and the persist-environment toggle. AI integration settings moved to the AI page.
+Terminal page general section — scrollback lines, natural scrolling, copy on select, enhanced keyboard protocol, the persist-environment toggle, and the OSC 52 Clipboard policy subsection. AI integration settings moved to the AI page.
 
 The persist-environment toggle is keyed `terminal.env_persistence.enabled`, defaults OFF, and is gated by an OS-secret-store preflight on enable — see [[server#Env Persistence]].
+
+The Clipboard (OSC 52) subsection exposes the four policy keys defined by spec 010: `terminal.clipboard.read_mode` and `terminal.clipboard.write_mode` (each Deny/Allow/Prompt), `terminal.clipboard.max_write_bytes` (bytes, default 16,777,216, hard ceiling 536,870,912 = 512 MiB), and the FR-019 opt-in `terminal.clipboard.focus_gate_writes` (bool, default false). The keys live under the `[terminal.clipboard]` TOML sub-table (serde-renamed from the Rust field `clipboard_policy` on `TerminalConfig` because the legacy flattened `TerminalClipboardConfig` already owns the unrenamed `clipboard` identifier). The webview ⇄ TOML round-trip is handled by [[crates/scribe-settings/src/apply.rs#apply_terminal_clipboard_key]], which clamps `max_write_bytes` to the public ceiling `CLIPBOARD_MAX_WRITE_BYTES_CEILING` and routes `focus_gate_writes` straight onto `config.terminal.clipboard_policy.focus_gate_writes`. Saving any of the keys triggers the file watcher → `ConfigReloaded` round-trip described in [[lat.md/server#Server#Sessions#Clipboard Gating]] so live PTY readers refresh their per-session policy snapshot without a restart; the client-side focus-gate is read off the same `App::config` snapshot the watcher already refreshes (no dedicated IPC variant).
 
 Status bar stat toggles remain on the Terminal page under the Status Bar section.
 

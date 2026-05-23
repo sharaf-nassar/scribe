@@ -1984,6 +1984,12 @@ function loadConfig(config) {
   setSegmentedValue("terminal.prompt_bar_position", config.terminal?.prompt_bar_position || "top");
   setStepperValue("terminal.prompt_bar_font_size", config.terminal?.prompt_bar_font_size);
   setStepperValue("terminal.indicator_height", config.terminal?.indicator_height);
+  // Spec 010: OSC 52 clipboard policy (terminal.clipboard.* TOML sub-table).
+  setSelectValue("terminal.clipboard.read_mode", config.terminal?.clipboard?.read_mode ?? "prompt");
+  setSelectValue("terminal.clipboard.write_mode", config.terminal?.clipboard?.write_mode ?? "allow");
+  setStepperValue("terminal.clipboard.max_write_bytes", config.terminal?.clipboard?.max_write_bytes ?? 16777216);
+  // Spec 010 / FR-019: opt-in focus gate for OSC 52 writes (default off).
+  setToggleValue("terminal.clipboard.focus_gate_writes", config.terminal?.clipboard?.focus_gate_writes ?? false);
   smartSelectionState = normalizeSmartSelectionConfig(config.terminal?.smart_selection);
   smartSelectionSelectedIndex = 0;
   renderSmartSelection();

@@ -120,6 +120,8 @@ Clipboard pastes follow the same path but may exceed the 4 KiB [[protocol#Client
 
 Shell output flows from the PTY master fd through the server's ANSI processor ([[crates/scribe-pty/src/osc_interceptor.rs#OscInterceptor]]) and metadata parser ([[crates/scribe-pty/src/metadata.rs#MetadataParser]]), then is serialized as a [[protocol#Screen Snapshots]] and sent to the attached client for GPU rendering.
 
+OSC 52 clipboard reads and writes branch off this path through alacritty_terminal's `Event::ClipboardStore` / `Event::ClipboardLoad` callbacks and travel through the server-side policy engine plus a client round-trip to the host clipboard bridge. See [[server#Sessions#Clipboard Gating]] for the policy decision and the new [[protocol#Server Messages#Clipboard Variants]] / [[protocol#Client Messages#Clipboard Variants]] IPC pair.
+
 ### Reconnect Path
 
 When a client reconnects, the server sends a full screen snapshot of every subscribed session. The client rebuilds its terminal grid from this snapshot without any visible gap.

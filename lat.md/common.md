@@ -40,7 +40,9 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 ### Terminal
 
-[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, the enhanced keyboard-protocol opt-out, AI toggles, indicator height, shell integration, status bar stats, prompt bar, and scroll pin settings.
+[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, the enhanced keyboard-protocol opt-out, AI toggles, indicator height, shell integration, status bar stats, prompt bar, scroll pin, and OSC 52 clipboard policy settings.
+
+[[crates/scribe-common/src/config.rs#ClipboardPolicyConfig]] (TOML namespace `terminal.clipboard.*`) carries the OSC 52 read/write policy modes ([[crates/scribe-common/src/config.rs#ClipboardMode]] — `deny`/`allow`/`prompt`), a `max_write_bytes` cap (default 16 MiB, ceiling 512 MiB), a `focus_gate_writes` opt-in toggle, and a `burst_window_ms` reuse window. Wired into the foundational types only as of this checkpoint; the server-side gating engine and client-side prompt dialog land in the OSC 52 clipboard-gating feature work.
 
 `scroll_pin` (bool, default `false`) enables split-scroll in AI panes, but only while the pane is in the normal screen buffer; alternate-screen TUIs fall back to the regular live view. `preserve_ai_scrollback` (bool, default `true`) strips AI-session `CSI 3 J` scrollback clears, resets its trim epoch on prompt/attention boundaries, captures the epoch baseline after the first filtered redraw, and trims later redraw clears back to that baseline so committed transcript history survives without duplicate inline frames piling up.
 

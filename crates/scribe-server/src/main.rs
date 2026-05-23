@@ -11,6 +11,7 @@ use scribe_common::error::ScribeError;
 use scribe_common::socket::server_socket_path;
 
 mod attach_flow;
+mod clipboard_state;
 mod config;
 mod env_store;
 mod handoff;
@@ -124,6 +125,7 @@ async fn run_server_loop(
     let path = server_socket_path();
     let live_sessions = ipc_server::new_live_session_registry();
     let connected_clients = ipc_server::new_connected_clients();
+    let window_clipboard_gating = ipc_server::new_window_clipboard_gating();
 
     // Acquire the server socket with singleton enforcement. The lock guard
     // must live until the server shuts down to hold the advisory flock.
@@ -140,8 +142,13 @@ async fn run_server_loop(
     // Activate sessions restored from a hot-reload handoff. Moves them from
     // SessionManager into the live registry and starts their PTY reader tasks
     // in detached mode. No-op for normal (non-upgrade) startup.
-    ipc_server::activate_pending_sessions(&session_manager, &workspace_manager, &live_sessions)
-        .await;
+    ipc_server::activate_pending_sessions(
+        &session_manager,
+        &workspace_manager,
+        &live_sessions,
+        &window_clipboard_gating,
+    )
+    .await;
 
     // Spawn the background updater. The handle is passed into the IPC server
     // so that TriggerUpdate / DismissUpdate messages can reach it.
@@ -182,6 +189,7 @@ async fn run_server_loop(
                 workspace_manager: Arc::clone(&workspace_manager),
                 live_sessions: Arc::clone(&live_sessions),
                 connected_clients: Arc::clone(&connected_clients),
+                window_clipboard_gating: Arc::clone(&window_clipboard_gating),
                 updater_handle: Arc::clone(&updater_handle),
                 release_catalog: Arc::clone(&release_catalog),
                 release_fetcher: Arc::clone(&release_fetcher),

@@ -36,6 +36,8 @@ OSC 0/2 (window title), OSC 7 (current working directory), OSC 1337 (`ScribeCont
 
 All other VTE events (CSI sequences, ESC dispatch, printable characters, DCS hooks) are intentional no-ops. The interceptor only cares about metadata-bearing sequences.
 
+OSC 52 (clipboard read/write) is **out of scope** for this interceptor — it is parsed and dispatched entirely by upstream `alacritty_terminal`, which surfaces `Event::ClipboardStore` / `Event::ClipboardLoad` to the [[pty#Event Listener]]. The per-session policy engine and host clipboard bridge that gate those events live server-side; see [[server#Sessions#Clipboard Gating]].
+
 ## Metadata Parser
 
 The [[crates/scribe-pty/src/metadata.rs#MetadataParser]] is a stateful parser that classifies OSC sequences into typed events.

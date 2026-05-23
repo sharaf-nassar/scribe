@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
-use scribe_common::config::UpdateConfig;
+use scribe_common::config::{ClipboardPolicyConfig, UpdateConfig};
 use scribe_common::error::ScribeError;
 
 /// Maximum allowed scrollback lines to prevent excessive memory use.
@@ -24,6 +24,11 @@ pub struct ScribeConfig {
     pub shell_integration_enabled: bool,
     pub ai_terminal: AiTerminalConfig,
     pub update: UpdateConfig,
+    /// Spec 010 T036: OSC 52 clipboard policy snapshot exposed on the
+    /// server-local config so [`crate::ipc_server::handle_config_reloaded`]
+    /// can fan it out to every PTY reader's
+    /// [`crate::clipboard_state::ClipboardBurstState`] on each reload.
+    pub clipboard_policy: ClipboardPolicyConfig,
 }
 
 impl Default for ScribeConfig {
@@ -34,6 +39,7 @@ impl Default for ScribeConfig {
             shell_integration_enabled: true,
             ai_terminal: AiTerminalConfig::default(),
             update: UpdateConfig::default(),
+            clipboard_policy: ClipboardPolicyConfig::default(),
         }
     }
 }
@@ -71,11 +77,14 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
         preserve_ai_scrollback: full.terminal.ai_session.preserve_ai_scrollback,
     };
     let update = full.update;
+    let clipboard_policy = full.terminal.clipboard_policy;
 
     info!(
         roots = workspace_roots.len(),
         scrollback_lines,
         preserve_ai_scrollback = ai_terminal.preserve_ai_scrollback,
+        clipboard_read_mode = ?clipboard_policy.read_mode,
+        clipboard_write_mode = ?clipboard_policy.write_mode,
         "server config loaded"
     );
 
@@ -85,6 +94,7 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
         shell_integration_enabled,
         ai_terminal,
         update,
+        clipboard_policy,
     })
 }
 

@@ -54,6 +54,8 @@ The client chunks large pastes into multiple `KeyInput` messages to fit the 4 Ki
 
 `CreateWorkspace` creates a new workspace with the next accent color. `ReportWorkspaceTree` sends the client's current split layout to the server for persistence.
 
+The reported tree's [[crates/scribe-common/src/protocol.rs#WorkspaceTreeNode]] `Leaf` carries per-workspace tab ordering (`session_ids`), per-tab pane layouts (`pane_trees`), and the per-workspace active tab index (`active_tab_index`). Accent colors and names still travel separately in `WorkspaceListEntry` / `WorkspaceNamed`. The active tab index is `#[serde(default)]` so a pre-active-tab-aware handoff envelope degrades to 0 (last-active-tab is then re-asserted on the next client report).
+
 ### Workspace Notes
 
 Workspace note messages keep note state server-owned while the client renders only cached snapshots.
@@ -70,11 +72,21 @@ Window automation messages let the CLI inspect windows and ask a connected clien
 
 ### Connection
 
-`Hello` is the first message sent, carrying an optional window ID for multi-window reconnection. The server responds with [[protocol#Server Messages]] `Welcome`.
+`Hello` is the first message sent, carrying an optional window ID and a `clipboard_gating: bool` capability flag (spec 010 C7). The server responds with [[protocol#Server Messages]] `Welcome`.
+
+Both `Hello.clipboard_gating` and `Welcome.clipboard_gating` default to `false` for backward compatibility. When either side reports `false`, the server treats sessions in that window as headless for OSC 52 prompt and bridge purposes and the client defensively no-ops on receipt of the new clipboard variants.
 
 If the requested window ID is already connected, the server assigns another unconnected window or a fresh ID instead of replacing the existing owner. The check and the registration are performed atomically inside [[crates/scribe-server/src/ipc_server.rs#claim_window]] while holding a single `connected_clients` write lock. A previous read-then-write split was a TOCTOU race: the concurrent-reconnect burst that a server upgrade or client relaunch triggers let two `Hello`s for the same window both observe it unconnected and both register, leaving two live clients bound to one window ID (which then fought, respawned, and churned the session).
 
 Transient actions are an exception: the [[server#Server#Updater#Manual Check]] path lets a non-client process (the standalone settings window) open `server.sock`, send `CheckForUpdates` as the first and only message, read back a single `UpdateCheckResult`, and disconnect — never registering as a connected client and never receiving a `Welcome`.
+
+### Clipboard Variants
+
+Two additive variants drive the OSC 52 gating reply path (spec 010 C3 / [[server#Sessions#Clipboard Gating]]).
+
+`ClipboardPromptResponse { request_id, decision }` echoes the `PromptId` from the matching `ServerMessage::ClipboardPromptRequest` together with a [[crates/scribe-common/src/protocol.rs#ClipboardDecision]] (`AllowOnce` / `DenyOnce` and, in later waves, `AlwaysAllow` / `AlwaysDeny`). The server matches the id against the session's parked prompt and replays the deferred OSC 52 op against the bridge or PTY reply as appropriate.
+
+`ClipboardBridgeReadReply { request_id, payload }` carries the host clipboard content for an allowed OSC 52 read. `payload` is a `Result<String, BridgeError>`; `Err(_)` collapses onto an empty OSC 52 reply per UX-002 so PTY-side programs never observe a distinct error state.
 
 ### Configuration
 
@@ -124,7 +136,21 @@ Carries cols, rows, scrollback rows, cursor position/style/visibility, alt-scree
 
 `Welcome` responds to Hello with the assigned window ID and a list of other unconnected windows that have sessions. `WindowClosed` and `QuitRequested` are shutdown acknowledgments.
 
+`Welcome.clipboard_gating: bool` advertises the server's OSC 52 gating capability (spec 010 C7 — see [[protocol#Client Messages#Connection]] for the matching client-side flag and negotiation semantics).
+
 Only the bootstrap client (launched without `--window-id`) spawns child processes for the other windows in `Welcome`; children ignore the list to prevent fan-out duplication where racing siblings each spawn redundant processes for windows not yet registered in `connected_clients`.
+
+### Clipboard Variants
+
+Three additive variants drive the OSC 52 gating + host clipboard bridge (spec 010 C2 / [[server#Sessions#Clipboard Gating]]).
+
+`ClipboardPromptRequest { session_id, request_id, op, selection, preview }` asks the user to confirm an OSC 52 read or write before the server honours it. `preview` is `Some` only for `op = Write` (head-and-tail truncated payload per FR-006); reads carry no preview. The client renders a [[client#URL Detection#Clipboard Dialog]] and replies with `ClientMessage::ClipboardPromptResponse` carrying the same `request_id`.
+
+`ClipboardBridgeWrite { session_id, selection, payload }` forwards an allowed OSC 52 write payload to the client's host clipboard bridge. No reply is expected (OSC 52 has no write-ack semantic).
+
+`ClipboardBridgeReadRequest { session_id, request_id, selection }` asks the client to read the host clipboard for an allowed OSC 52 read. The client answers with `ClientMessage::ClipboardBridgeReadReply`; the server then runs the parked alacritty formatter against the returned payload and writes the OSC 52 reply back to the PTY.
+
+All three variants honour the attach-time `clipboard_gating` negotiation: the server never emits them when the client failed to advertise support, and the client silently no-ops on receipt when its own cached `Welcome.clipboard_gating` is `false`.
 
 `SessionList` returns all sessions grouped by workspace in response to `ListSessions`. Each [[crates/scribe-common/src/protocol.rs#SessionInfo]] carries the active AI state, AI provider hint, provider task label, legacy Codex task label, shell basename, session context, CWD, and detected git branch — enough for the client to restore provider-aware titles, remote labels, and status-bar branches without any post-attach metadata fan-out. A batched `workspaces: Vec<WorkspaceListEntry>` field delivers per-workspace names, accent colors, split direction, and project root paths alongside the session list. `WorkspaceInfo` messages still exist for non-attach flows (session creation, auto-naming).
 

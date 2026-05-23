@@ -873,6 +873,58 @@
           </div>
         </div>
 
+        <div class="section-label">Clipboard (OSC 52)</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Read Access</div>
+              <div class="setting-desc">How Scribe responds when a PTY-side program reads the clipboard (OSC 52 read). Prompt asks before each access.</div>
+            </div>
+            <div class="select-wrapper">
+              <select class="select-control" data-key="terminal.clipboard.read_mode">
+                <option value="deny">Deny</option>
+                <option value="allow">Allow</option>
+                <option value="prompt" selected>Prompt</option>
+              </select>
+              <span class="select-arrow">&#9662;</span>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Write Access</div>
+              <div class="setting-desc">How Scribe responds when a PTY-side program writes to the clipboard (OSC 52 write).</div>
+            </div>
+            <div class="select-wrapper">
+              <select class="select-control" data-key="terminal.clipboard.write_mode">
+                <option value="deny">Deny</option>
+                <option value="allow" selected>Allow</option>
+                <option value="prompt">Prompt</option>
+              </select>
+              <span class="select-arrow">&#9662;</span>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Maximum Write Size (bytes)</div>
+              <div class="setting-desc">Writes larger than this are silently rejected. Default 16,777,216 bytes (16 MiB); maximum 536,870,912 bytes (512 MiB).</div>
+            </div>
+            <div class="number-control" data-key="terminal.clipboard.max_write_bytes" data-min="0" data-max="536870912" data-step="1048576">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">16777216</div>
+              <div class="number-btn">+</div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Require Window Focus for Writes</div>
+              <div class="setting-desc">When on, OSC 52 writes from PTY-side programs are silently dropped while the Scribe window is not focused. Off by default; opt-in defense-in-depth against background clipboard hijack (FR-019).</div>
+            </div>
+            <div class="toggle off" data-key="terminal.clipboard.focus_gate_writes">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+        </div>
+
         <div class="section-label">Smart Selection</div>
         <div class="section-card smart-selection-card">
           <div class="setting-row">
