@@ -282,8 +282,11 @@ __scribe_build_added_json() {
 
 # Compute the added/changed (object) and removed (array) JSON literals
 # between the current snapshot ($1 nameref) and the cached snapshot ($2
-# nameref), writing two NUL-separated payloads to stdout: added JSON,
-# then NUL, then removed JSON.
+# nameref), writing two payloads to stdout joined by ASCII RS (0x1e): the
+# added JSON, then RS, then the removed JSON. RS is used instead of NUL
+# because bash 5.2+ strips NUL from `$(...)` capture (emitting
+# `warning: command substitution: ignored null byte in input`), which
+# would silently merge the two halves.
 __scribe_diff_env() {
 	local -n __cur="$1"
 	local -n __prev="$2"
@@ -303,7 +306,7 @@ __scribe_diff_env() {
 			printf '"%s":"%s"' "$esc_name" "$esc_value"
 		fi
 	done
-	printf '}\0['
+	printf '}\x1e['
 
 	first=1
 	for name in "${!__prev[@]}"; do
@@ -329,8 +332,8 @@ __scribe_emit_env_delta() {
 
 	local payload added removed
 	payload=$(__scribe_diff_env __scribe_env_now __scribe_env_last)
-	added="${payload%%$'\0'*}"
-	removed="${payload#*$'\0'}"
+	added="${payload%%$'\x1e'*}"
+	removed="${payload#*$'\x1e'}"
 
 	# Skip the helper if both sides are empty literals.
 	if [[ "$added" == '{}' && "$removed" == '[]' ]]; then

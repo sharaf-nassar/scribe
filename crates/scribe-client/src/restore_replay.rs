@@ -374,6 +374,10 @@ fn workspace_tree_from_snapshot(node: &WorkspaceLayoutSnapshot) -> WorkspaceTree
             workspace_id: *workspace_id,
             session_ids: Vec::new(),
             pane_trees: Vec::new(),
+            // Active tab is restored later via `apply_workspace_snapshot` →
+            // `set_active_tab`; this builder only synthesises the structural
+            // tree, so 0 is fine.
+            active_tab_index: 0,
         },
         WorkspaceLayoutSnapshot::Split { direction, ratio, first, second } => {
             WorkspaceTreeNode::Split {

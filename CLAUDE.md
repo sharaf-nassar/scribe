@@ -109,5 +109,5 @@ The second example is invalid because `Bad Section` has no leading paragraph. `l
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-[specs/009-osc8-hyperlinks/plan.md](specs/009-osc8-hyperlinks/plan.md).
+[specs/010-osc52-clipboard-gating/plan.md](specs/010-osc52-clipboard-gating/plan.md).
 <!-- SPECKIT END -->

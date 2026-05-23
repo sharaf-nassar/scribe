@@ -4,8 +4,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -111,12 +110,23 @@ pub type LiveSessionRegistry = Arc<RwLock<HashMap<SessionId, LiveSession>>>;
 /// Used to broadcast `QuitRequested` to all connected clients.
 pub type ConnectedClients = Arc<RwLock<HashMap<WindowId, SharedWriter>>>;
 
+/// Per-window cache of the `clipboard_gating` capability flag advertised at
+/// `ClientMessage::Hello` (spec 010 contract C7). A `true` entry means the
+/// attached client understands the new OSC 52 IPC variants and the server
+/// may emit them for sessions in that window; a missing or `false` entry
+/// makes the server fall back to the headless deny path (research decision
+/// 7). Updated under the same `connected_clients` write-lock the window
+/// attaches under so the flag is always consistent with the writer slot.
+pub type WindowClipboardGating = Arc<RwLock<HashMap<WindowId, bool>>>;
+
 #[derive(Clone)]
 pub struct IpcServerState {
     pub session_manager: Arc<SessionManager>,
     pub workspace_manager: Arc<RwLock<WorkspaceManager>>,
     pub live_sessions: LiveSessionRegistry,
     pub connected_clients: ConnectedClients,
+    /// Spec 010 attach-time clipboard-gating capability bits, keyed by window.
+    pub window_clipboard_gating: WindowClipboardGating,
     pub updater_handle: Arc<UpdaterHandle>,
     /// In-memory cache of GitHub releases populated lazily on the first
     /// `ListReleases` request and refreshed in the background past its TTL.
@@ -156,6 +166,9 @@ struct CreateSessionRequest {
 struct SessionRuntimeContext<'a> {
     workspace_manager: &'a Arc<RwLock<WorkspaceManager>>,
     live_sessions: &'a LiveSessionRegistry,
+    /// Spec 010 C7: per-window clipboard-gating capability map shared with
+    /// the IPC server.
+    window_clipboard_gating: &'a WindowClipboardGating,
 }
 
 #[derive(Clone, Copy)]
@@ -177,6 +190,11 @@ struct StartSessionIds {
 /// State needed by the PTY reader task, extracted from `ManagedSession`.
 struct PtyReaderState {
     session_id: SessionId,
+    /// Window this session belongs to. Used by the OSC 52 gating arms to
+    /// look up the attached client's `clipboard_gating` capability bit
+    /// (spec 010 C7) without re-reading the workspace manager on every
+    /// event.
+    window_id: WindowId,
     child_pid: u32,
     pty_read: ReadHalf<scribe_pty::async_fd::AsyncPtyFd>,
     pty_write: Arc<Mutex<WriteHalf<scribe_pty::async_fd::AsyncPtyFd>>>,
@@ -188,7 +206,31 @@ struct PtyReaderState {
     attachment: SessionAttachment,
     workspace_manager: Arc<RwLock<WorkspaceManager>>,
     live_sessions: LiveSessionRegistry,
-    clipboard: SharedClipboard,
+    /// Per-window clipboard-gating capability map shared with the IPC
+    /// server (spec 010 C7).
+    window_clipboard_gating: WindowClipboardGating,
+    /// Per-session OSC 52 gating state (spec 010 E3). Wave 2 only uses
+    /// `outstanding_prompt` + `policy`; the burst-reuse fields land later.
+    //
+    // @lat: [[server#Sessions#Clipboard Gating]]
+    clipboard_burst: crate::clipboard_state::ClipboardBurstState,
+    /// Pending OSC 52 read requests awaiting the client's
+    /// `ClipboardBridgeReadReply`, keyed by the `PromptId` echoed in the
+    /// bridge request. Each entry holds the formatter alacritty handed us
+    /// so we can rebuild the OSC 52 reply once the host clipboard text
+    /// arrives.
+    pending_clipboard_reads: HashMap<scribe_common::protocol::PromptId, ClipboardReplyFormatter>,
+    /// Most-recently emitted prompt that has yet to be acknowledged.
+    /// Stores both the deferred op so the response handler can replay the
+    /// PTY-side reply (writes: forward bridge; reads: forward bridge or
+    /// reply empty) using the same data the prompt arm captured.
+    pending_clipboard_prompt: Option<PendingClipboardPrompt>,
+    /// Inbound channel for client→PTY-reader OSC 52 control messages
+    /// (`ClipboardPromptResponse`, `ClipboardBridgeReadReply`). The matching
+    /// sender hangs off [`LiveSession::clipboard_command_tx`] and is the
+    /// only path back into the reader task from the client message
+    /// dispatcher.
+    clipboard_command_rx: tokio::sync::mpsc::UnboundedReceiver<ClipboardCommand>,
     /// Reusable buffer for OSC events — cleared between iterations to avoid
     /// allocating a new `Vec` on every PTY read.
     osc_events: Vec<MetadataEvent>,
@@ -283,6 +325,12 @@ pub struct LiveSession {
     /// `pub(crate)` so [`crate::hook_ingress`] can read it when routing an
     /// `EnvChanged` event into [`crate::env_store::EnvStoreState::schedule_persist`].
     pub(crate) env_envelope_id: Option<String>,
+    /// Sender into the PTY reader task's OSC 52 control channel (spec 010
+    /// C4). The client message dispatcher forwards
+    /// `ClipboardPromptResponse` and `ClipboardBridgeReadReply` here so
+    /// they reach `handle_clipboard_prompt_response` /
+    /// `handle_clipboard_bridge_read_reply` on the owning reader task.
+    pub(crate) clipboard_command_tx: tokio::sync::mpsc::UnboundedSender<ClipboardCommand>,
 }
 
 pub struct AttachSessionData {
@@ -326,33 +374,89 @@ impl LiveSession {
     }
 }
 
-type SharedClipboard = Arc<Mutex<ServerClipboard>>;
+/// Closure shape produced by `alacritty_terminal` for OSC 52 read replies.
+/// Defined in [`crate::clipboard_state`] so [`crate::clipboard_state::DeferredRequest`]
+/// can hold a parked formatter while a burst-deferred read waits on a prompt.
+use crate::clipboard_state::ClipboardReplyFormatter;
 
-#[derive(Default)]
-struct ServerClipboard {
-    clipboard: String,
-    selection: String,
+/// Client→PTY-reader control message for OSC 52 prompt resolution and host
+/// clipboard bridge replies. The client dispatch task pushes one of these
+/// onto each session's clipboard channel; the reader task drains them on
+/// every metadata pass.
+pub enum ClipboardCommand {
+    PromptResponse {
+        request_id: scribe_common::protocol::PromptId,
+        decision: scribe_common::protocol::ClipboardDecision,
+    },
+    BridgeReadReply {
+        request_id: scribe_common::protocol::PromptId,
+        payload: Result<String, scribe_common::protocol::BridgeError>,
+    },
+    /// Spec 010 T036: hot-reload the per-session policy snapshot when the
+    /// `ConfigReloaded` handler swaps `terminal.clipboard.*` keys on disk.
+    /// The PTY reader task replaces `ClipboardBurstState.policy` in place so
+    /// the next OSC 52 op sees the new mode without waiting for a server
+    /// restart (FR-010).
+    RefreshPolicy { policy: scribe_common::config::ClipboardPolicyConfig },
 }
 
-impl ServerClipboard {
-    fn store(&mut self, kind: alacritty_terminal::term::ClipboardType, text: String) {
-        match kind {
-            alacritty_terminal::term::ClipboardType::Clipboard => self.clipboard = text,
-            alacritty_terminal::term::ClipboardType::Selection => self.selection = text,
-        }
-    }
+/// State captured when the server emits a `ClipboardPromptRequest` and is
+/// waiting on the user's resolution. On `Allow` the server replays this
+/// against either the bridge (writes; reads stash a fresh read formatter
+/// keyed by `request_id`) or, for headless edges, the deferred PTY-side
+/// empty reply.
+struct PendingClipboardPrompt {
+    request_id: scribe_common::protocol::PromptId,
+    op: scribe_common::protocol::ClipboardOp,
+    selection: scribe_common::protocol::ClipboardSelection,
+    /// `Some` for `op == Write`: the payload accepted at the size-cap check,
+    /// ready to forward to the bridge on Allow.
+    write_payload: Option<String>,
+    /// `Some` for `op == Read`: the alacritty formatter parked for the
+    /// deferred OSC 52 reply (empty on Deny, host clipboard on Allow).
+    read_formatter: Option<ClipboardReplyFormatter>,
+}
 
-    fn load(&self, kind: alacritty_terminal::term::ClipboardType) -> &str {
-        match kind {
-            alacritty_terminal::term::ClipboardType::Clipboard => &self.clipboard,
-            alacritty_terminal::term::ClipboardType::Selection => &self.selection,
+/// Process-wide monotonic `PromptId` allocator (spec 010 contract C3).
+/// One counter for the whole server is sufficient because `PromptId` only
+/// needs to be unique while a prompt is in flight; collisions across
+/// long-running sessions are not observable.
+fn allocate_prompt_id() -> scribe_common::protocol::PromptId {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    scribe_common::protocol::PromptId(COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Map an alacritty `ClipboardType` to its protocol-level
+/// `ClipboardSelection` enum (spec 010 E2).
+fn clipboard_selection_from(
+    kind: alacritty_terminal::term::ClipboardType,
+) -> scribe_common::protocol::ClipboardSelection {
+    match kind {
+        alacritty_terminal::term::ClipboardType::Clipboard => {
+            scribe_common::protocol::ClipboardSelection::Clipboard
+        }
+        alacritty_terminal::term::ClipboardType::Selection => {
+            scribe_common::protocol::ClipboardSelection::Primary
         }
     }
 }
 
-fn shared_clipboard() -> &'static SharedClipboard {
-    static CLIPBOARD: OnceLock<SharedClipboard> = OnceLock::new();
-    CLIPBOARD.get_or_init(|| Arc::new(Mutex::new(ServerClipboard::default())))
+/// Build the head-and-tail truncated preview required by FR-006 for OSC 52
+/// write confirmation prompts. Mirrors the disallowed-scheme dialog's body
+/// truncation rule so the user sees the start and end of the payload.
+fn clipboard_write_preview(text: &str) -> String {
+    const MAX: usize = 96;
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= MAX {
+        return text.to_owned();
+    }
+    let budget = MAX.saturating_sub(3);
+    let head = budget.div_ceil(2);
+    let tail = budget - head;
+    let mut out: String = chars.iter().take(head).collect();
+    out.push_str("...");
+    out.extend(chars.iter().skip(chars.len() - tail));
+    out
 }
 
 async fn attached_contains(attached_ids: &AttachedSessionIds, session_id: SessionId) -> bool {
@@ -537,14 +641,7 @@ async fn handle_client(stream: tokio::net::UnixStream, server: IpcServerState) {
 
     run_client_message_loop(&mut reader, window_id, &server, &writer, &attached_ids).await;
 
-    detach_client_window(
-        window_id,
-        &server.live_sessions,
-        &server.connected_clients,
-        &attached_ids,
-        &writer,
-    )
-    .await;
+    detach_client_window(window_id, &server, &attached_ids, &writer).await;
 }
 
 async fn establish_client_window<R>(
@@ -557,8 +654,8 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     match read_message::<ClientMessage, _>(reader).await {
-        Ok(ClientMessage::Hello { window_id }) => {
-            Some(handle_client_hello(window_id, server, writer).await)
+        Ok(ClientMessage::Hello { window_id, clipboard_gating }) => {
+            Some(handle_client_hello(window_id, clipboard_gating, server, writer).await)
         }
         Ok(ClientMessage::CheckForUpdates) => {
             // Transient action: the caller (e.g. the standalone settings
@@ -623,6 +720,7 @@ async fn handle_transient_list_releases(server: &IpcServerState, writer: &Shared
 
 async fn handle_client_hello(
     requested_window_id: Option<WindowId>,
+    client_clipboard_gating: bool,
     server: &IpcServerState,
     writer: &SharedWriter,
 ) -> WindowId {
@@ -639,13 +737,19 @@ async fn handle_client_hello(
     let (assigned, other_windows) =
         claim_window(&server.connected_clients, requested_window_id, &all_windows, writer).await;
 
+    // Spec 010 C7: record the client's clipboard-gating capability bit so
+    // the OSC 52 dispatcher can short-circuit to the headless deny path
+    // when the attached client does not understand the new variants.
+    server.window_clipboard_gating.write().await.insert(assigned, client_clipboard_gating);
+
     if !other_windows.is_empty() {
         info!(%assigned, other_count = other_windows.len(), "Welcome includes other_windows — client will spawn additional processes");
     }
-    let welcome = ServerMessage::Welcome { window_id: assigned, other_windows };
+    let welcome =
+        ServerMessage::Welcome { window_id: assigned, other_windows, clipboard_gating: true };
     send_message(writer, &welcome).await;
 
-    info!(%assigned, "client identified via Hello");
+    info!(%assigned, client_clipboard_gating, "client identified via Hello");
     assigned
 }
 
@@ -743,22 +847,24 @@ async fn run_client_message_loop<R>(
 
 async fn detach_client_window(
     window_id: WindowId,
-    live_sessions: &LiveSessionRegistry,
-    connected_clients: &ConnectedClients,
+    server: &IpcServerState,
     attached_ids: &AttachedSessionIds,
     writer: &SharedWriter,
 ) {
     let attached_ids = attached_snapshot(attached_ids).await;
     // Detach all sessions — clear the writer so the reader task stops
     // forwarding output, but keep the session alive for reconnection.
-    detach_sessions(live_sessions, &attached_ids).await;
+    detach_sessions(&server.live_sessions, &attached_ids).await;
+    // Spec 010 C7: drop the cached clipboard-gating bit so reconnecting
+    // clients are re-evaluated at next Hello.
+    server.window_clipboard_gating.write().await.remove(&window_id);
     let last_client_disconnected = {
-        let mut connected = connected_clients.write().await;
+        let mut connected = server.connected_clients.write().await;
         release_window_if_owned(&mut connected, window_id, writer)
     };
     info!(%window_id, "client connection closed; window released if still owned");
     if last_client_disconnected {
-        schedule_settings_shutdown_if_no_clients(Arc::clone(connected_clients));
+        schedule_settings_shutdown_if_no_clients(Arc::clone(&server.connected_clients));
     }
 }
 
@@ -857,7 +963,62 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
             dispatch_window_message(msg, context).await;
         }
         ClientMessage::Hello { .. } => debug!("unexpected Hello after handshake, ignoring"),
+        ClientMessage::ClipboardPromptResponse { request_id, decision } => {
+            forward_clipboard_command_to_window(
+                context,
+                ClipboardCommand::PromptResponse { request_id, decision },
+            )
+            .await;
+        }
+        ClientMessage::ClipboardBridgeReadReply { request_id, payload } => {
+            forward_clipboard_command_to_window(
+                context,
+                ClipboardCommand::BridgeReadReply { request_id, payload },
+            )
+            .await;
+        }
         other => debug!(?other, "unhandled client message"),
+    }
+}
+
+/// Route a `ClipboardCommand` to the originating session's PTY reader task.
+/// Spec 010 contract C4: the dispatcher uses the `attached_ids` snapshot to
+/// find the live session(s) belonging to this window — the response is
+/// matched by `request_id` inside the reader task so a stale or rogue reply
+/// is harmless.
+async fn forward_clipboard_command_to_window(
+    context: &mut ClientDispatchContext<'_>,
+    cmd: ClipboardCommand,
+) {
+    let attached = attached_snapshot(context.attached_ids).await;
+    if attached.is_empty() {
+        debug!(window_id = %context.window_id, "clipboard reply dropped: no attached sessions");
+        return;
+    }
+    let sessions = context.server.live_sessions.read().await;
+    // Fan out the command to every session the window is attached to.
+    // Each reader task ignores commands whose `request_id` it never issued
+    // so this fan-out is safe even when the window owns multiple panes.
+    for session_id in &attached {
+        if let Some(session) = sessions.get(session_id)
+            && session.clipboard_command_tx.send(reclone_clipboard_command(&cmd)).is_err()
+        {
+            debug!(%session_id, "clipboard command channel closed");
+        }
+    }
+}
+
+fn reclone_clipboard_command(cmd: &ClipboardCommand) -> ClipboardCommand {
+    match cmd {
+        ClipboardCommand::PromptResponse { request_id, decision } => {
+            ClipboardCommand::PromptResponse { request_id: *request_id, decision: *decision }
+        }
+        ClipboardCommand::BridgeReadReply { request_id, payload } => {
+            ClipboardCommand::BridgeReadReply { request_id: *request_id, payload: payload.clone() }
+        }
+        ClipboardCommand::RefreshPolicy { policy } => {
+            ClipboardCommand::RefreshPolicy { policy: policy.clone() }
+        }
     }
 }
 
@@ -1143,6 +1304,7 @@ async fn handle_create_session(
         SessionRuntimeContext {
             workspace_manager: &context.server.workspace_manager,
             live_sessions: &context.server.live_sessions,
+            window_clipboard_gating: &context.server.window_clipboard_gating,
         },
     )
     .await;
@@ -1164,32 +1326,23 @@ async fn start_session(
     runtime: SessionRuntimeContext<'_>,
 ) {
     let StartSessionIds { session: session_id, workspace: workspace_id, window: window_id } = ids;
-    // Extract all fields from session before partial moves.
-    let term = session.term;
-    let resize_fd = Arc::new(session.resize_fd);
-    let child_pid = session.child_pid;
-    let shell_name = session.shell_name;
-    let pty = session.pty;
-    let handoff_snapshot = session.handoff_snapshot;
-    let ansi_processor = session.ansi_processor;
-    let osc_parser = session.osc_parser;
-    let event_rx = session.event_rx;
-    let task_label = session.task_label;
-    let cwd = session.cwd;
-    let context = session.context;
-    let ai_state = session.ai_state;
-    let ai_provider_hint = session.ai_provider_hint;
-    let cell_width = session.cell_width;
-    let cell_height = session.cell_height;
-    let env_envelope_id = session.env_envelope_id;
-
-    let (pty_read, pty_write) = tokio::io::split(session.pty_fd);
+    #[rustfmt::skip]
+    let ManagedSession {
+        pty_fd, resize_fd, child_pid, term, ansi_processor, osc_parser,
+        event_rx, shell_name, pty, handoff_snapshot, task_label, title, cwd,
+        context, ai_state, ai_provider_hint, cell_width, cell_height,
+        env_envelope_id, ..
+    } = session;
+    let resize_fd = Arc::new(resize_fd);
+    let (pty_read, pty_write) = tokio::io::split(pty_fd);
     let pty_write = Arc::new(Mutex::new(pty_write));
 
     // Wrap the client writer in an optional so the reader task can
     // continue running when the client disconnects.
     let client_writer = Arc::new(Mutex::new(initial_attachment.writer.map(Arc::clone)));
     let attachment = Arc::new(Mutex::new(initial_attachment.attached_ids.map(Arc::clone)));
+
+    let (clipboard_command_tx, clipboard_command_rx) = new_clipboard_command_channel();
 
     let preserve_ai_scrollback = Arc::new(AtomicBool::new(load_preserve_ai_scrollback_setting()));
     let scrollback_lines = Arc::new(AtomicUsize::new(load_scrollback_lines_setting()));
@@ -1204,7 +1357,7 @@ async fn start_session(
         attachment: Arc::clone(&attachment),
         workspace_id,
         shell_name,
-        title: session.title.unwrap_or_else(|| String::from("shell")),
+        title: title.unwrap_or_else(|| String::from("shell")),
         task_label,
         cwd,
         context,
@@ -1218,14 +1371,14 @@ async fn start_session(
         scrollback_lines: Arc::clone(&scrollback_lines),
         env_window_id: window_id,
         env_envelope_id,
+        clipboard_command_tx,
     };
-
-    // Insert into the registry before spawning the PTY reader task so that
-    // any concurrent `CloseSession` message sees the session immediately.
     runtime.live_sessions.write().await.insert(session_id, live);
+    let clipboard_policy = load_clipboard_policy_snapshot();
 
     let state = PtyReaderState {
         session_id,
+        window_id,
         child_pid,
         pty_read,
         pty_write,
@@ -1237,7 +1390,11 @@ async fn start_session(
         attachment,
         workspace_manager: Arc::clone(runtime.workspace_manager),
         live_sessions: Arc::clone(runtime.live_sessions),
-        clipboard: Arc::clone(shared_clipboard()),
+        window_clipboard_gating: Arc::clone(runtime.window_clipboard_gating),
+        clipboard_burst: crate::clipboard_state::ClipboardBurstState::new(clipboard_policy),
+        pending_clipboard_reads: HashMap::new(),
+        pending_clipboard_prompt: None,
+        clipboard_command_rx,
         osc_events: Vec::new(),
         last_proc_cwd: None,
         ed3_filter: Ed3Filter::new(),
@@ -1253,6 +1410,25 @@ async fn start_session(
     };
 
     tokio::spawn(pty_reader_task(state));
+}
+
+/// Spec 010 C4: build the OSC 52 client→PTY-reader control channel.
+/// Unbounded because each session emits at most one prompt-in-flight
+/// at a time and the queue depth is naturally bounded by the burst
+/// guard.
+fn new_clipboard_command_channel() -> (
+    tokio::sync::mpsc::UnboundedSender<ClipboardCommand>,
+    tokio::sync::mpsc::UnboundedReceiver<ClipboardCommand>,
+) {
+    tokio::sync::mpsc::unbounded_channel()
+}
+
+/// Spec 010: snapshot the OSC 52 policy at session-creation time. The
+/// resulting `ClipboardBurstState` is dropped together with the reader
+/// task on session exit; later live reloads land via
+/// `ConfigReloaded` → `ClipboardCommand::RefreshPolicy`.
+fn load_clipboard_policy_snapshot() -> scribe_common::config::ClipboardPolicyConfig {
+    scribe_config::load_config().map(|cfg| cfg.terminal.clipboard_policy).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1970,7 +2146,7 @@ async fn handle_config_reloaded(
     let mut workspace_messages = Vec::new();
     {
         let mut wm = workspace_manager.write().await;
-        wm.set_roots(cfg.workspace_roots);
+        wm.set_roots(cfg.workspace_roots.clone());
         for (&session_id, session) in sessions.iter() {
             let named_msg = if let Some(cwd) = session.cwd.as_deref() {
                 wm.on_cwd_changed(session_id, cwd)
@@ -1982,13 +2158,7 @@ async fn handle_config_reloaded(
             }
         }
     }
-    for session in sessions.values() {
-        session.term.lock().await.set_options(term_config.clone());
-        session.scrollback_lines.store(new_scrollback, Ordering::Relaxed);
-        session
-            .preserve_ai_scrollback
-            .store(cfg.ai_terminal.preserve_ai_scrollback, Ordering::Relaxed);
-    }
+    apply_reload_to_sessions(&sessions, &term_config, new_scrollback, &cfg).await;
     let sessions_len = sessions.len();
     drop(sessions);
 
@@ -2003,6 +2173,37 @@ async fn handle_config_reloaded(
     );
 
     apply_env_persistence_transition(env_store, live_sessions).await;
+}
+
+/// Apply a reloaded server config to every live session: refresh the
+/// alacritty `TermConfig`, the scrollback cap, the AI-scrollback flag, and
+/// the OSC 52 `ClipboardPolicyConfig` snapshot (FR-010). Extracted from
+/// [`handle_config_reloaded`] so the parent stays below the cognitive-
+/// complexity budget while keeping the per-session fan-out in one place.
+async fn apply_reload_to_sessions(
+    sessions: &HashMap<SessionId, LiveSession>,
+    term_config: &alacritty_terminal::term::Config,
+    new_scrollback: usize,
+    cfg: &crate::config::ScribeConfig,
+) {
+    let clipboard_policy = cfg.clipboard_policy.clone();
+    for (session_id, session) in sessions {
+        session.term.lock().await.set_options(term_config.clone());
+        session.scrollback_lines.store(new_scrollback, Ordering::Relaxed);
+        session
+            .preserve_ai_scrollback
+            .store(cfg.ai_terminal.preserve_ai_scrollback, Ordering::Relaxed);
+        if session
+            .clipboard_command_tx
+            .send(ClipboardCommand::RefreshPolicy { policy: clipboard_policy.clone() })
+            .is_err()
+        {
+            debug!(
+                %session_id,
+                "clipboard policy refresh dropped: command channel closed"
+            );
+        }
+    }
 }
 
 /// T035: react to a `terminal.env_persistence.enabled` flip across a
@@ -2320,19 +2521,8 @@ enum PtyReadAction {
 }
 
 async fn next_pty_read_action(state: &mut PtyReaderState, buf: &mut [u8]) -> PtyReadAction {
-    let read_result = if let Some(deadline) = state.ansi_processor.sync_timeout().sync_timeout() {
-        let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
-        tokio::pin!(sleep);
-        tokio::select! {
-            () = &mut sleep => {
-                stop_term_sync(&state.term, &mut state.ansi_processor).await;
-                maybe_capture_preserved_ai_scrollback_baseline(state).await;
-                return PtyReadAction::Continue;
-            }
-            result = read_pty_bytes(&mut state.pty_read, buf) => result,
-        }
-    } else {
-        read_pty_bytes(&mut state.pty_read, buf).await
+    let Some(read_result) = select_pty_read_or_clipboard(state, buf).await else {
+        return PtyReadAction::Continue;
     };
 
     match read_result {
@@ -2343,6 +2533,81 @@ async fn next_pty_read_action(state: &mut PtyReaderState, buf: &mut [u8]) -> Pty
             PtyReadAction::End
         }
     }
+}
+
+/// Race a PTY read against the optional ANSI sync-timeout sleep and the
+/// OSC 52 [`ClipboardCommand`] channel. Returns `Some(read_result)` when
+/// the PTY produced bytes (or an error/EOF), or `None` when either the
+/// sync timeout fired or a clipboard command was consumed — both of those
+/// paths are "continue the outer loop" signals for [`next_pty_read_action`].
+async fn select_pty_read_or_clipboard(
+    state: &mut PtyReaderState,
+    buf: &mut [u8],
+) -> Option<ReadResult> {
+    if let Some(deadline) = state.ansi_processor.sync_timeout().sync_timeout() {
+        let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(sleep);
+        tokio::select! {
+            () = &mut sleep => {
+                stop_term_sync(&state.term, &mut state.ansi_processor).await;
+                maybe_capture_preserved_ai_scrollback_baseline(state).await;
+                None
+            }
+            result = read_pty_bytes(&mut state.pty_read, buf) => Some(result),
+            cmd = state.clipboard_command_rx.recv() => {
+                handle_clipboard_command_option(state, cmd).await;
+                None
+            }
+        }
+    } else {
+        tokio::select! {
+            result = read_pty_bytes(&mut state.pty_read, buf) => Some(result),
+            cmd = state.clipboard_command_rx.recv() => {
+                handle_clipboard_command_option(state, cmd).await;
+                None
+            }
+        }
+    }
+}
+
+/// Apply one `ClipboardCommand` (or no-op on a `None` from a closed
+/// channel). Kept separate so `next_pty_read_action` stays an `async fn`
+/// without polluting the macro selectors with `Option` destructuring.
+async fn handle_clipboard_command_option(
+    state: &mut PtyReaderState,
+    cmd: Option<ClipboardCommand>,
+) {
+    let Some(cmd) = cmd else { return };
+    match cmd {
+        ClipboardCommand::PromptResponse { request_id, decision } => {
+            handle_clipboard_prompt_response(state, request_id, decision).await;
+        }
+        ClipboardCommand::BridgeReadReply { request_id, payload } => {
+            handle_clipboard_bridge_read_reply(state, request_id, payload).await;
+        }
+        ClipboardCommand::RefreshPolicy { policy } => {
+            handle_clipboard_policy_refresh(state, policy);
+        }
+    }
+}
+
+/// Spec 010 T036: replace the per-session policy snapshot in place when
+/// `ConfigReloaded` broadcasts a fresh `terminal.clipboard.*` set. Leaves
+/// `outstanding_prompt` untouched so an in-flight prompt still resolves
+/// against the operation it was opened for; subsequent OSC 52 ops use the
+/// new policy.
+fn handle_clipboard_policy_refresh(
+    state: &mut PtyReaderState,
+    policy: scribe_common::config::ClipboardPolicyConfig,
+) {
+    debug!(
+        session_id = %state.session_id,
+        read_mode = ?policy.read_mode,
+        write_mode = ?policy.write_mode,
+        max_write_bytes = policy.max_write_bytes,
+        "applying OSC 52 policy refresh to live session"
+    );
+    state.clipboard_burst.policy = policy;
 }
 
 async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
@@ -2583,6 +2848,24 @@ async fn process_metadata_events(state: &mut PtyReaderState) {
         handle_session_event(event, state, &mut saw_title_change, &mut saw_cwd_change).await;
     }
 
+    // Spec 010 C4: any OSC 52 client→reader command that arrived during
+    // PTY processing (after the select! in `next_pty_read_action`
+    // returned bytes) gets drained here so the reader stays consistent
+    // with `ClipboardBurstState` / `pending_clipboard_*` between chunks.
+    while let Ok(cmd) = state.clipboard_command_rx.try_recv() {
+        match cmd {
+            ClipboardCommand::PromptResponse { request_id, decision } => {
+                handle_clipboard_prompt_response(state, request_id, decision).await;
+            }
+            ClipboardCommand::BridgeReadReply { request_id, payload } => {
+                handle_clipboard_bridge_read_reply(state, request_id, payload).await;
+            }
+            ClipboardCommand::RefreshPolicy { policy } => {
+                handle_clipboard_policy_refresh(state, policy);
+            }
+        }
+    }
+
     // Fallback: title changed but no OSC 7 → read /proc/pid/cwd.
     if saw_title_change && !saw_cwd_change {
         check_proc_cwd(state).await;
@@ -2615,15 +2898,10 @@ async fn handle_session_event(
             .await;
         }
         SessionEvent::ClipboardStore(kind, text) => {
-            state.clipboard.lock().await.store(kind, text);
+            handle_clipboard_store(state, kind, text).await;
         }
         SessionEvent::ClipboardLoad(kind, format) => {
-            let text = {
-                let clipboard = state.clipboard.lock().await;
-                clipboard.load(kind).to_owned()
-            };
-            let response = format(&text);
-            write_term_response(&state.pty_write, state.session_id, response.as_bytes()).await;
+            handle_clipboard_load(state, kind, format).await;
         }
         SessionEvent::ColorRequest(index, format) => {
             let color = current_term_color(&state.term, index).await;
@@ -2639,6 +2917,521 @@ async fn handle_session_event(
             write_term_response(&state.pty_write, state.session_id, response.as_bytes()).await;
         }
     }
+}
+
+/// Read the cached `clipboard_gating` capability bit for this session's
+/// window (spec 010 C7). Returns `false` when no client is attached or the
+/// attached client did not advertise support; the caller treats that path
+/// as a headless deny per research decision 7.
+async fn client_clipboard_gating(state: &PtyReaderState) -> bool {
+    state.window_clipboard_gating.read().await.get(&state.window_id).copied().unwrap_or(false)
+}
+
+/// Whether *any* client writer is currently attached to this session. Used
+/// in tandem with `client_clipboard_gating` to gate OSC 52 prompt and bridge
+/// dispatch — both checks must succeed before a `ServerMessage::Clipboard*`
+/// variant goes on the wire.
+async fn session_has_attached_client(state: &PtyReaderState) -> bool {
+    state.client_writer.lock().await.is_some()
+}
+
+/// Handle an OSC 52 `ClipboardStore` event (spec 010 contract C4 write arm).
+/// Replaces the legacy in-memory `ServerClipboard` store with a policy
+/// check, size-cap enforcement, and a dispatch onto either the host
+/// clipboard bridge (Allow), the prompt RPC (Prompt — first / cross-op
+/// hit), the deferred queue (Prompt — same-op same-burst), the burst-
+/// reuse fast path (Prompt — cached decision within `burst_window_ms`),
+/// or a silent drop (Deny / headless / oversize / queue-overflow).
+//
+// @lat: [[server#Sessions#Clipboard Gating]]
+async fn handle_clipboard_store(
+    state: &mut PtyReaderState,
+    kind: alacritty_terminal::term::ClipboardType,
+    text: String,
+) {
+    use scribe_common::config::ClipboardMode;
+
+    let policy = state.clipboard_burst.policy.clone();
+    let selection = clipboard_selection_from(kind);
+
+    // FR-009 / FR-015: cap enforcement runs before the policy branch so the
+    // size cap covers every write path uniformly — allow-mode forwards,
+    // prompt-mode prompts, prompt-mode burst-reuse hits, and the deferred-
+    // queue drain on prompt resolution all share this single check (T050).
+    // An oversize write is silently dropped (no host clipboard mutation, no
+    // PTY reply); the debug log lets operators observe the rejection on
+    // demand per UX-002.
+    let payload_len = text.len() as u64;
+    if payload_len > policy.max_write_bytes {
+        debug!(
+            session_id = %state.session_id,
+            bytes = payload_len,
+            cap = policy.max_write_bytes,
+            write_mode = ?policy.write_mode,
+            selection = ?selection,
+            "OSC 52 write rejected: payload exceeds max_write_bytes",
+        );
+        return;
+    }
+
+    let headless =
+        !session_has_attached_client(state).await || !client_clipboard_gating(state).await;
+
+    match policy.write_mode {
+        ClipboardMode::Deny => {}
+        ClipboardMode::Allow => {
+            if headless {
+                return;
+            }
+            send_to_client(
+                &state.client_writer,
+                &ServerMessage::ClipboardBridgeWrite {
+                    session_id: state.session_id,
+                    selection,
+                    payload: text,
+                },
+            )
+            .await;
+        }
+        ClipboardMode::Prompt => {
+            if headless {
+                return;
+            }
+            handle_clipboard_store_prompt(state, selection, text).await;
+        }
+    }
+}
+
+/// Prompt-mode dispatch for an OSC 52 write (spec 010 FR-016 / FR-017):
+/// defer onto the bounded queue when a same-op prompt is open, reuse the
+/// cached decision when still within the burst window, otherwise open a
+/// fresh prompt. Extracted from [`handle_clipboard_store`] to keep both
+/// functions inside the line-count / cognitive-complexity budgets.
+async fn handle_clipboard_store_prompt(
+    state: &mut PtyReaderState,
+    selection: scribe_common::protocol::ClipboardSelection,
+    text: String,
+) {
+    use scribe_common::protocol::ClipboardOp;
+
+    if state.clipboard_burst.outstanding_prompt.is_some() {
+        defer_clipboard_write_during_prompt(state, selection, text);
+        return;
+    }
+    if let Some(cached) = state.clipboard_burst.reusable_decision(ClipboardOp::Write) {
+        apply_clipboard_write_decision(state, cached, selection, text).await;
+        return;
+    }
+    let request_id = allocate_prompt_id();
+    let preview = clipboard_write_preview(&text);
+    state.clipboard_burst.outstanding_prompt = Some(request_id);
+    state.pending_clipboard_prompt = Some(PendingClipboardPrompt {
+        request_id,
+        op: ClipboardOp::Write,
+        selection,
+        write_payload: Some(text),
+        read_formatter: None,
+    });
+    send_to_client(
+        &state.client_writer,
+        &ServerMessage::ClipboardPromptRequest {
+            session_id: state.session_id,
+            request_id,
+            op: ClipboardOp::Write,
+            selection,
+            preview: Some(preview),
+        },
+    )
+    .await;
+}
+
+/// Park an OSC 52 write request behind an open prompt (FR-016). Mismatched
+/// ops and queue overflows fall back to the silent-drop path with a
+/// `debug!` log so operators can observe the cap being hit.
+fn defer_clipboard_write_during_prompt(
+    state: &mut PtyReaderState,
+    selection: scribe_common::protocol::ClipboardSelection,
+    text: String,
+) {
+    use scribe_common::protocol::ClipboardOp;
+
+    if !matches!(state.pending_clipboard_prompt.as_ref().map(|p| p.op), Some(ClipboardOp::Write)) {
+        debug!(
+            session_id = %state.session_id,
+            "OSC 52 write ignored: prompt in flight for different op",
+        );
+        return;
+    }
+    let deferred = crate::clipboard_state::DeferredRequest {
+        request_id: allocate_prompt_id(),
+        op: ClipboardOp::Write,
+        selection,
+        payload_for_write: Some(text),
+        read_formatter: None,
+    };
+    if !state.clipboard_burst.try_defer(deferred) {
+        debug!(
+            session_id = %state.session_id,
+            cap = crate::clipboard_state::MAX_PENDING_FOR_PROMPT,
+            "OSC 52 write dropped: pending_for_prompt cap reached",
+        );
+    }
+}
+
+/// Handle an OSC 52 `ClipboardLoad` event (spec 010 contract C4 read arm).
+//
+// @lat: [[server#Sessions#Clipboard Gating]]
+async fn handle_clipboard_load(
+    state: &mut PtyReaderState,
+    kind: alacritty_terminal::term::ClipboardType,
+    formatter: ClipboardReplyFormatter,
+) {
+    use scribe_common::config::ClipboardMode;
+
+    let policy_read = state.clipboard_burst.policy.read_mode;
+    let selection = clipboard_selection_from(kind);
+
+    // FR-013 / research decision 7: a denied or headless read short-
+    // circuits to an empty OSC 52 reply so the PTY-side program does not
+    // see clipboard contents.
+    let headless =
+        !session_has_attached_client(state).await || !client_clipboard_gating(state).await;
+
+    match policy_read {
+        ClipboardMode::Deny => {
+            spawn_empty_pty_reply(state, &formatter);
+        }
+        ClipboardMode::Allow => {
+            if headless {
+                spawn_empty_pty_reply(state, &formatter);
+                return;
+            }
+            let request_id = allocate_prompt_id();
+            state.pending_clipboard_reads.insert(request_id, formatter);
+            send_to_client(
+                &state.client_writer,
+                &ServerMessage::ClipboardBridgeReadRequest {
+                    session_id: state.session_id,
+                    request_id,
+                    selection,
+                },
+            )
+            .await;
+        }
+        ClipboardMode::Prompt => {
+            if headless {
+                spawn_empty_pty_reply(state, &formatter);
+                return;
+            }
+            handle_clipboard_load_prompt(state, selection, formatter).await;
+        }
+    }
+}
+
+/// Prompt-mode dispatch for an OSC 52 read (spec 010 FR-016 / FR-017):
+/// defer onto the bounded queue when a same-op prompt is open, reuse the
+/// cached decision when still within the burst window, otherwise open a
+/// fresh prompt. Mirror of [`handle_clipboard_store_prompt`].
+async fn handle_clipboard_load_prompt(
+    state: &mut PtyReaderState,
+    selection: scribe_common::protocol::ClipboardSelection,
+    formatter: ClipboardReplyFormatter,
+) {
+    use scribe_common::protocol::ClipboardOp;
+
+    if state.clipboard_burst.outstanding_prompt.is_some() {
+        defer_clipboard_read_during_prompt(state, selection, &formatter);
+        return;
+    }
+    if let Some(cached) = state.clipboard_burst.reusable_decision(ClipboardOp::Read) {
+        apply_clipboard_read_decision(state, cached, selection, formatter).await;
+        return;
+    }
+    let request_id = allocate_prompt_id();
+    state.clipboard_burst.outstanding_prompt = Some(request_id);
+    state.pending_clipboard_prompt = Some(PendingClipboardPrompt {
+        request_id,
+        op: ClipboardOp::Read,
+        selection,
+        write_payload: None,
+        read_formatter: Some(formatter),
+    });
+    send_to_client(
+        &state.client_writer,
+        &ServerMessage::ClipboardPromptRequest {
+            session_id: state.session_id,
+            request_id,
+            op: ClipboardOp::Read,
+            selection,
+            preview: None,
+        },
+    )
+    .await;
+}
+
+/// Park an OSC 52 read request behind an open prompt (FR-016). Mismatched
+/// ops empty-reply to unblock the PTY; queue overflows do the same plus a
+/// `debug!` log.
+fn defer_clipboard_read_during_prompt(
+    state: &mut PtyReaderState,
+    selection: scribe_common::protocol::ClipboardSelection,
+    formatter: &ClipboardReplyFormatter,
+) {
+    use scribe_common::protocol::ClipboardOp;
+
+    if !matches!(state.pending_clipboard_prompt.as_ref().map(|p| p.op), Some(ClipboardOp::Read)) {
+        debug!(
+            session_id = %state.session_id,
+            "OSC 52 read ignored: prompt in flight for different op",
+        );
+        spawn_empty_pty_reply(state, formatter);
+        return;
+    }
+    let deferred = crate::clipboard_state::DeferredRequest {
+        request_id: allocate_prompt_id(),
+        op: ClipboardOp::Read,
+        selection,
+        payload_for_write: None,
+        read_formatter: Some(Arc::clone(formatter)),
+    };
+    if !state.clipboard_burst.try_defer(deferred) {
+        debug!(
+            session_id = %state.session_id,
+            cap = crate::clipboard_state::MAX_PENDING_FOR_PROMPT,
+            "OSC 52 read dropped: pending_for_prompt cap reached",
+        );
+        spawn_empty_pty_reply(state, formatter);
+    }
+}
+
+/// Spawn a fire-and-forget task that delivers an empty OSC 52 reply to the
+/// PTY for the given formatter. Used by deny / headless / overflow paths
+/// where the PTY-side program must not block on a never-emitted reply.
+fn spawn_empty_pty_reply(state: &PtyReaderState, formatter: &ClipboardReplyFormatter) {
+    let response = formatter("");
+    let pty_write = Arc::clone(&state.pty_write);
+    let session_id = state.session_id;
+    let bytes = response.into_bytes();
+    tokio::spawn(async move {
+        write_term_response(&pty_write, session_id, &bytes).await;
+    });
+}
+
+/// Apply a resolved `ClipboardDecision` to a Write request whose payload
+/// already passed the size-cap check. Used by the burst-reuse fast path
+/// and by `handle_clipboard_prompt_response`'s drain loop.
+async fn apply_clipboard_write_decision(
+    state: &mut PtyReaderState,
+    decision: scribe_common::protocol::ClipboardDecision,
+    selection: scribe_common::protocol::ClipboardSelection,
+    payload: String,
+) {
+    use scribe_common::protocol::ClipboardDecision;
+    let allowed = matches!(decision, ClipboardDecision::AllowOnce | ClipboardDecision::AlwaysAllow);
+    if !allowed {
+        // Deny: silent drop (no host clipboard mutation, no PTY reply).
+        return;
+    }
+    send_to_client(
+        &state.client_writer,
+        &ServerMessage::ClipboardBridgeWrite { session_id: state.session_id, selection, payload },
+    )
+    .await;
+}
+
+/// Apply a resolved `ClipboardDecision` to a Read request. On Allow,
+/// forwards a `ClipboardBridgeReadRequest` to the client and stashes the
+/// formatter for the reply fan-in; on Deny, formats an empty OSC 52 reply
+/// inline.
+async fn apply_clipboard_read_decision(
+    state: &mut PtyReaderState,
+    decision: scribe_common::protocol::ClipboardDecision,
+    selection: scribe_common::protocol::ClipboardSelection,
+    formatter: ClipboardReplyFormatter,
+) {
+    use scribe_common::protocol::ClipboardDecision;
+    let allowed = matches!(decision, ClipboardDecision::AllowOnce | ClipboardDecision::AlwaysAllow);
+    if allowed {
+        let bridge_request_id = allocate_prompt_id();
+        state.pending_clipboard_reads.insert(bridge_request_id, formatter);
+        send_to_client(
+            &state.client_writer,
+            &ServerMessage::ClipboardBridgeReadRequest {
+                session_id: state.session_id,
+                request_id: bridge_request_id,
+                selection,
+            },
+        )
+        .await;
+    } else {
+        // Deny: PTY-side program sees an empty OSC 52 reply (UX-002).
+        let response = formatter("");
+        write_term_response(&state.pty_write, state.session_id, response.as_bytes()).await;
+    }
+}
+
+/// Apply the user's `ClipboardPromptResponse` decision (spec 010 C4 prompt
+/// resolution). Clears the in-flight prompt slot, records the decision for
+/// the FR-017 burst-reuse window, drains every deferred same-op request
+/// out of `pending_for_prompt`, and on `AlwaysAllow` / `AlwaysDeny`
+/// mutates the in-memory policy snapshot so the next OSC 52 op outside
+/// the burst window already sees the new mode without waiting for the
+/// `ConfigReloaded` round-trip (T043).
+async fn handle_clipboard_prompt_response(
+    state: &mut PtyReaderState,
+    request_id: scribe_common::protocol::PromptId,
+    decision: scribe_common::protocol::ClipboardDecision,
+) {
+    let Some(pending) = take_matching_pending_prompt(state, request_id) else {
+        return;
+    };
+    state.clipboard_burst.outstanding_prompt = None;
+    state.clipboard_burst.record_decision(pending.op, decision);
+    apply_always_decision_to_policy(state, pending.op, decision);
+
+    // Apply the decision to the originating prompt first, then drain any
+    // requests parked behind it. The same `decision` value flows through
+    // both paths so the burst inherits the user's choice (FR-016).
+    apply_pending_prompt_decision(state, pending, decision).await;
+    drain_pending_for_prompt(state, decision).await;
+}
+
+/// Take the in-flight `pending_clipboard_prompt` only if its `request_id`
+/// matches; otherwise restore the slot so a correctly-tagged reply can
+/// still land. Returns `None` (after logging) when the slot was empty or
+/// the id mismatched.
+fn take_matching_pending_prompt(
+    state: &mut PtyReaderState,
+    request_id: scribe_common::protocol::PromptId,
+) -> Option<PendingClipboardPrompt> {
+    let Some(pending) = state.pending_clipboard_prompt.take() else {
+        debug!(
+            session_id = %state.session_id,
+            ?request_id,
+            "ClipboardPromptResponse with no in-flight prompt — ignoring",
+        );
+        return None;
+    };
+    if pending.request_id != request_id {
+        debug!(
+            session_id = %state.session_id,
+            ?request_id,
+            expected = ?pending.request_id,
+            "ClipboardPromptResponse request_id mismatch — ignoring",
+        );
+        state.pending_clipboard_prompt = Some(pending);
+        return None;
+    }
+    Some(pending)
+}
+
+/// Spec 010 T043: flip the in-memory policy axis when the user picks
+/// `AlwaysAllow` / `AlwaysDeny`. The client writes the change to disk in
+/// parallel; the eventual `ConfigReloaded` round-trip is idempotent
+/// against the same value.
+fn apply_always_decision_to_policy(
+    state: &mut PtyReaderState,
+    op: scribe_common::protocol::ClipboardOp,
+    decision: scribe_common::protocol::ClipboardDecision,
+) {
+    use scribe_common::config::ClipboardMode;
+    use scribe_common::protocol::{ClipboardDecision, ClipboardOp};
+
+    let new_mode = match decision {
+        ClipboardDecision::AlwaysAllow => ClipboardMode::Allow,
+        ClipboardDecision::AlwaysDeny => ClipboardMode::Deny,
+        ClipboardDecision::AllowOnce | ClipboardDecision::DenyOnce => return,
+    };
+    match op {
+        ClipboardOp::Read => state.clipboard_burst.policy.read_mode = new_mode,
+        ClipboardOp::Write => state.clipboard_burst.policy.write_mode = new_mode,
+    }
+}
+
+/// Apply a resolved decision to the originating pending prompt — write
+/// payloads are forwarded via [`apply_clipboard_write_decision`]; reads
+/// are forwarded via [`apply_clipboard_read_decision`] when a formatter
+/// is present.
+async fn apply_pending_prompt_decision(
+    state: &mut PtyReaderState,
+    pending: PendingClipboardPrompt,
+    decision: scribe_common::protocol::ClipboardDecision,
+) {
+    use scribe_common::protocol::ClipboardOp;
+
+    match pending.op {
+        ClipboardOp::Write => {
+            if let Some(payload) = pending.write_payload {
+                apply_clipboard_write_decision(state, decision, pending.selection, payload).await;
+            }
+        }
+        ClipboardOp::Read => {
+            if let Some(formatter) = pending.read_formatter {
+                apply_clipboard_read_decision(state, decision, pending.selection, formatter).await;
+            } else {
+                debug!(
+                    session_id = %state.session_id,
+                    "ClipboardPromptResponse Read path missing formatter — empty reply skipped",
+                );
+            }
+        }
+    }
+}
+
+/// Drain every deferred OSC 52 request out of the burst queue and replay
+/// the same `decision` against each one (FR-016 / T040). The queue is
+/// emptied by [`crate::clipboard_state::ClipboardBurstState::drain_pending`].
+async fn drain_pending_for_prompt(
+    state: &mut PtyReaderState,
+    decision: scribe_common::protocol::ClipboardDecision,
+) {
+    use scribe_common::protocol::ClipboardOp;
+
+    for deferred in state.clipboard_burst.drain_pending() {
+        let request_id = deferred.request_id;
+        debug!(
+            session_id = %state.session_id,
+            ?request_id,
+            op = ?deferred.op,
+            ?decision,
+            "draining deferred OSC 52 request against resolved prompt decision",
+        );
+        match deferred.op {
+            ClipboardOp::Write => {
+                if let Some(payload) = deferred.payload_for_write {
+                    apply_clipboard_write_decision(state, decision, deferred.selection, payload)
+                        .await;
+                }
+            }
+            ClipboardOp::Read => {
+                if let Some(formatter) = deferred.read_formatter {
+                    apply_clipboard_read_decision(state, decision, deferred.selection, formatter)
+                        .await;
+                }
+            }
+        }
+    }
+}
+
+/// Apply the client's `ClipboardBridgeReadReply` (spec 010 C4 read fan-in).
+async fn handle_clipboard_bridge_read_reply(
+    state: &mut PtyReaderState,
+    request_id: scribe_common::protocol::PromptId,
+    payload: Result<String, scribe_common::protocol::BridgeError>,
+) {
+    let Some(formatter) = state.pending_clipboard_reads.remove(&request_id) else {
+        debug!(
+            session_id = %state.session_id,
+            ?request_id,
+            "ClipboardBridgeReadReply with no matching pending read",
+        );
+        return;
+    };
+    // `BridgeError` collapses onto an empty payload per UX-002 and research
+    // decision 7's headless mapping.
+    let text = payload.unwrap_or_default();
+    let response = formatter(&text);
+    write_term_response(&state.pty_write, state.session_id, response.as_bytes()).await;
 }
 
 fn update_ai_provider_state(state: &mut PtyReaderState, event: &MetadataEvent) {
@@ -3184,6 +3977,11 @@ pub fn new_connected_clients() -> ConnectedClients {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
+/// Create a new empty `WindowClipboardGating` registry. Spec 010 C7.
+pub fn new_window_clipboard_gating() -> WindowClipboardGating {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
 /// Serialise all live sessions for a hot-reload handoff.
 ///
 /// Returns `(sessions, fds)` where the fds are in the same order as the
@@ -3264,6 +4062,7 @@ pub async fn activate_pending_sessions(
     session_manager: &SessionManager,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     live_sessions: &LiveSessionRegistry,
+    window_clipboard_gating: &WindowClipboardGating,
 ) {
     let pending = session_manager.pending_session_ids().await;
 
@@ -3283,7 +4082,7 @@ pub async fn activate_pending_sessions(
                 StartSessionIds { session: session_id, workspace: workspace_id, window: window_id },
                 session,
                 InitialAttachment { writer: None, attached_ids: None },
-                SessionRuntimeContext { workspace_manager, live_sessions },
+                SessionRuntimeContext { workspace_manager, live_sessions, window_clipboard_gating },
             )
             .await;
             info!(%session_id, "activated restored session (detached)");

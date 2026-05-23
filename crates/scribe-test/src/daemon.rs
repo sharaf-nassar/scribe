@@ -183,7 +183,11 @@ pub async fn run() -> Result<(), ScribeError> {
     // any `AttachSessions` for sessions whose owning window is the previous
     // daemon's `WindowId` is denied. That breaks the reconnect flow:
     // daemon stop → daemon start → session attach.
-    crate::ipc::send(&mut raw_server_writer, &ClientMessage::Hello { window_id: None }).await?;
+    crate::ipc::send(
+        &mut raw_server_writer,
+        &ClientMessage::Hello { window_id: None, clipboard_gating: false },
+    )
+    .await?;
 
     let server_writer = Arc::new(Mutex::new(raw_server_writer));
 
@@ -313,9 +317,13 @@ async fn dispatch_server_message(
         | ServerMessage::PromptReceived { .. }) => {
             dispatch_notice_message(msg);
         }
-        ServerMessage::EnvPreflightResult { .. } | ServerMessage::EnvStatus { .. } => {
-            // Test daemon does not exercise env-persistence flows yet (feature 006).
-        }
+        // Test daemon does not exercise env-persistence (feature 006) or
+        // OSC 52 clipboard gating (spec 010) flows yet.
+        ServerMessage::EnvPreflightResult { .. }
+        | ServerMessage::EnvStatus { .. }
+        | ServerMessage::ClipboardPromptRequest { .. }
+        | ServerMessage::ClipboardBridgeWrite { .. }
+        | ServerMessage::ClipboardBridgeReadRequest { .. } => {}
     }
 }
 

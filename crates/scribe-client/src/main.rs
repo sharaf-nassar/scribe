@@ -2,6 +2,7 @@
 
 mod ai_indicator;
 mod clipboard_cleanup;
+mod clipboard_dialog;
 mod close_dialog;
 mod command_palette;
 mod config;
@@ -1033,6 +1034,17 @@ struct App {
     /// scheme is outside the existing outbound allowlist (FR-015).
     disallowed_scheme_dialog: Option<disallowed_scheme_dialog::DisallowedSchemeDialog>,
 
+    /// Confirmation dialog overlay for OSC 52 clipboard reads / writes
+    /// (spec 010 FR-005). At most one in-flight; replaced when a new
+    /// `ClipboardPromptRequest` arrives for another pane.
+    clipboard_dialog: Option<clipboard_dialog::ClipboardDialog>,
+
+    /// Cached `Welcome.clipboard_gating` flag from the server (spec 010
+    /// C7). When `false` the client defensively no-ops on receipt of the
+    /// new OSC 52 server variants. Initialised to `false` and flipped to
+    /// `true` on the first `Welcome` from a supporting server.
+    server_clipboard_gating: bool,
+
     /// Config file watcher -- kept alive for its side-effect of sending
     /// `UiEvent::ConfigChanged` events.
     config_watcher_keepalive: Option<notify::RecommendedWatcher>,
@@ -1158,6 +1170,7 @@ impl App {
             pending_pty_bytes: HashMap::new(), url_caches: HashMap::new(), hovered_url: None,
             hover_cell: None, hover_started_at: None, hover_tooltip_visible: false,
             hover_tooltip_uri: None, disallowed_scheme_dialog: None,
+            clipboard_dialog: None, server_clipboard_gating: false,
             config_watcher_keepalive: None,
         }
     }
@@ -1213,7 +1226,8 @@ impl ApplicationHandler<UiEvent> for App {
             || self.handle_ai_prompt_user_event(&event)
             || self.handle_workspace_user_event(event_loop, &event)
             || self.handle_lifecycle_user_event(event_loop, &event)
-            || self.handle_update_user_event(&event);
+            || self.handle_update_user_event(&event)
+            || self.handle_clipboard_user_event(event);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -1495,6 +1509,69 @@ impl App {
         }
     }
 
+    /// Spec 010 C5 / C7: handle the OSC 52 clipboard UI events fanned out
+    /// by `dispatch_clipboard_message` in the IPC thread. Consumes the
+    /// event so the caller can chain `||` against earlier handlers.
+    fn handle_clipboard_user_event(&mut self, event: UiEvent) -> bool {
+        match event {
+            UiEvent::ClipboardGatingNegotiated { server_supports } => {
+                self.server_clipboard_gating = server_supports;
+                tracing::info!(server_supports, "OSC 52 clipboard gating capability negotiated");
+                true
+            }
+            UiEvent::ClipboardPromptRequest { session_id, request_id, op, selection, preview } => {
+                if !self.server_clipboard_gating {
+                    tracing::debug!(
+                        "ClipboardPromptRequest received before gating negotiated; ignoring"
+                    );
+                    return true;
+                }
+                self.clipboard_dialog = Some(clipboard_dialog::ClipboardDialog::new(
+                    request_id, session_id, op, selection, preview,
+                ));
+                self.request_redraw();
+                true
+            }
+            UiEvent::ClipboardBridgeWrite { session_id, selection, payload } => {
+                if !self.server_clipboard_gating {
+                    return true;
+                }
+                tracing::debug!(
+                    ?session_id,
+                    ?selection,
+                    payload_len = payload.len(),
+                    "OSC 52 bridge write dispatched to host clipboard",
+                );
+                // Wave 2: silent failure per UX-002 — ignore the result.
+                // The focus-gate check (FR-019) and X11 primary-selection
+                // branch land with Wave 5 (T045 / T048).
+                _ = self.bridge_write(selection, payload);
+                true
+            }
+            UiEvent::ClipboardBridgeReadRequest { session_id, request_id, selection } => {
+                if !self.server_clipboard_gating {
+                    return true;
+                }
+                tracing::debug!(
+                    ?session_id,
+                    ?request_id,
+                    ?selection,
+                    "OSC 52 bridge read requested from host clipboard",
+                );
+                let payload = self.bridge_read(selection);
+                if let Some(tx) = self.cmd_tx.clone()
+                    && tx
+                        .send(ClientCommand::ClipboardBridgeReadReply { request_id, payload })
+                        .is_err()
+                {
+                    tracing::warn!("IPC channel closed; clipboard bridge read reply dropped");
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn handle_screen_snapshot_event(
         &mut self,
         session_id: SessionId,
@@ -1645,6 +1722,10 @@ impl App {
         }
         if self.disallowed_scheme_dialog.is_some() {
             self.handle_disallowed_scheme_dialog_window_event(event_loop, event);
+            return true;
+        }
+        if self.clipboard_dialog.is_some() {
+            self.handle_clipboard_dialog_window_event(event_loop, event);
             return true;
         }
         if self.workspace_notes_modal.is_open() {
@@ -1943,6 +2024,7 @@ impl App {
             || self.close_dialog.is_some()
             || self.update_dialog.is_some()
             || self.disallowed_scheme_dialog.is_some()
+            || self.clipboard_dialog.is_some()
             || self.context_menu.is_some()
             || self.focused_inline_editor.is_some()
         {
@@ -2732,6 +2814,17 @@ impl App {
             metadata: &metadata,
         };
         self.restore_reconnect_tabs(&tabs_by_ws, &reconnect_context);
+        // `restore_reconnect_tabs` ends with each workspace's active_tab
+        // pointing at the last-pushed tab (because `add_tab_with_pane_tree`
+        // sets it that way for user-initiated tab creation). Reapply the
+        // server-reported active tab indices now that all tabs exist —
+        // `set_active_tab` bounds-checks against `tabs.len()` so stale
+        // indices from a since-shrunk workspace fall back safely.
+        if let Some(tree) = workspace_tree {
+            for (ws_id, idx) in collect_active_tab_indices(tree) {
+                self.window_layout.set_active_tab(ws_id, idx);
+            }
+        }
         self.restore_initial_session_state(sessions);
 
         let (attach_dims, codex_sessions) = self.build_attach_request(sessions);
@@ -3541,6 +3634,11 @@ impl App {
         let empty = self.window_layout.is_workspace_empty(wid);
         if empty && self.window_layout.remove_workspace(wid) {
             self.resize_all_workspace_panes();
+            self.report_workspace_tree();
+        } else {
+            // Tab close (without workspace removal) still mutates the tree's
+            // `session_ids` and may shift `active_tab_index` — sync to the
+            // server so the next handoff/reconnect sees fresh state.
             self.report_workspace_tree();
         }
     }
@@ -5305,6 +5403,17 @@ impl App {
                 resolve_glyph: &mut disallowed_dialog_resolve_glyph,
             });
         }
+        if let Some(dialog) = &mut self.clipboard_dialog {
+            let mut clipboard_dialog_resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            dialog.build_instances(clipboard_dialog::ClipboardDialogBuildContext {
+                out: all_instances,
+                viewport: prepared.full_viewport,
+                cell_size: prepared.cell_size,
+                chrome: &self.theme.chrome,
+                resolve_glyph: &mut clipboard_dialog_resolve_glyph,
+            });
+        }
         if let Some(menu) = &mut self.context_menu {
             let mut context_menu_resolve_glyph =
                 |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
@@ -5405,6 +5514,7 @@ impl App {
             && self.close_dialog.is_none()
             && self.update_dialog.is_none()
             && self.disallowed_scheme_dialog.is_none()
+            && self.clipboard_dialog.is_none()
             && !self.command_palette.is_active()
             && !self.search_overlay.is_active()
     }
@@ -6686,6 +6796,7 @@ impl App {
         self.window_layout.remove_tab(ws_id, session_id);
 
         self.resize_all_workspace_panes();
+        self.report_workspace_tree();
         self.request_redraw();
     }
 
@@ -6726,6 +6837,7 @@ impl App {
 
         self.window_layout.remove_tab(ws_id, session_id);
         self.resize_all_workspace_panes();
+        self.report_workspace_tree();
         self.request_redraw();
     }
 
@@ -6748,6 +6860,11 @@ impl App {
             if let Some(tab) = self.window_layout.active_tab_for_workspace_mut(workspace_id) {
                 self.active_selection = tab.selection.take();
             }
+            // Sync the new active tab to the server so handoff / reconnect
+            // can restore it. `active_tab_index` rides inside the workspace
+            // tree, so we reuse the existing tree-report channel rather than
+            // adding a new IPC variant.
+            self.report_workspace_tree();
         } else {
             // Switch didn't happen — restore selection to original tab.
             if let Some(tab) = self.window_layout.active_tab_for_workspace_mut(workspace_id) {
@@ -9142,6 +9259,90 @@ impl App {
         }
     }
 
+    /// Spec 010 E5 / C6 — host clipboard bridge read. Delegates to the
+    /// existing [`arboard::Clipboard`] handle on `App`. Errors collapse
+    /// onto `BridgeError` so the server can map them onto an empty OSC 52
+    /// reply per UX-002. The bridge does NOT consult `policy.read_mode`;
+    /// that decision lives server-side per research decision 6.
+    ///
+    /// Wave 5 / T045: when `selection == ClipboardSelection::Primary` on
+    /// Linux, route through the X11 primary-selection target via arboard's
+    /// `GetExtLinux::primary_clipboard` extension. On Wayland the X11
+    /// primary fallback inside arboard maps to the system clipboard (spec
+    /// Assumptions defer Wayland primary support); on macOS / Windows the
+    /// extension trait is not available, so primary collapses onto the
+    /// system clipboard with the regular `get_text` call.
+    fn bridge_read(
+        &mut self,
+        selection: scribe_common::protocol::ClipboardSelection,
+    ) -> Result<String, scribe_common::protocol::BridgeError> {
+        let Some(cb) = self.clipboard.as_mut() else {
+            return Err(scribe_common::protocol::BridgeError::Unavailable);
+        };
+        let result = match selection {
+            #[cfg(target_os = "linux")]
+            scribe_common::protocol::ClipboardSelection::Primary => {
+                use arboard::{GetExtLinux, LinuxClipboardKind};
+                cb.get().clipboard(LinuxClipboardKind::Primary).text()
+            }
+            // System clipboard, or Primary on non-Linux (mapped to the
+            // default system pasteboard per spec Assumptions / research
+            // decision 3).
+            _ => cb.get_text(),
+        };
+        result.map_err(|err| {
+            tracing::debug!("OSC 52 bridge read failed: {err}");
+            scribe_common::protocol::BridgeError::Unavailable
+        })
+    }
+
+    /// Spec 010 E5 / C6 — host clipboard bridge write. Ignores the result
+    /// caller-side (silent failure per UX-002) but logs on error for
+    /// operator visibility.
+    ///
+    /// Wave 5 / T048: honour the FR-019 opt-in focus gate. When
+    /// `terminal.clipboard.focus_gate_writes` is true AND the window is
+    /// not focused, the write is silently dropped (no host clipboard
+    /// mutation, no error reply) so a background PTY-side program cannot
+    /// hijack the clipboard while another app holds focus. The check
+    /// lives client-side per research decision 6 because window-focus
+    /// state has no synchronous server-side view.
+    ///
+    /// Wave 5 / T045: when `selection == ClipboardSelection::Primary` on
+    /// Linux, route through arboard's `SetExtLinux::primary_clipboard`.
+    /// Non-X11 platforms map primary to the system clipboard at the
+    /// arboard layer (spec Assumptions / research decision 3).
+    fn bridge_write(
+        &mut self,
+        selection: scribe_common::protocol::ClipboardSelection,
+        payload: String,
+    ) -> Result<(), scribe_common::protocol::BridgeError> {
+        if self.config.terminal.clipboard_policy.focus_gate_writes && !self.focus.window_focused {
+            tracing::debug!(
+                "OSC 52 bridge write dropped: focus_gate_writes enabled and window unfocused"
+            );
+            return Ok(());
+        }
+        let Some(cb) = self.clipboard.as_mut() else {
+            return Err(scribe_common::protocol::BridgeError::Unavailable);
+        };
+        let result = match selection {
+            #[cfg(target_os = "linux")]
+            scribe_common::protocol::ClipboardSelection::Primary => {
+                use arboard::{LinuxClipboardKind, SetExtLinux};
+                cb.set().clipboard(LinuxClipboardKind::Primary).text(payload)
+            }
+            // System clipboard, or Primary on non-Linux (mapped to the
+            // default system pasteboard per spec Assumptions / research
+            // decision 3).
+            _ => cb.set_text(payload),
+        };
+        result.map_err(|err| {
+            tracing::debug!("OSC 52 bridge write failed: {err}");
+            scribe_common::protocol::BridgeError::Unavailable
+        })
+    }
+
     /// Open the right-click context menu at the current cursor position.
     fn open_context_menu(&mut self) {
         let Some((x, y)) = self.last_cursor_pos else { return };
@@ -10952,6 +11153,142 @@ impl App {
             dialog.focus_prev();
         } else {
             dialog.focus_next();
+        }
+        self.request_redraw();
+    }
+
+    // -------------------------------------------------------------------
+    // Clipboard dialog input handlers (spec 010 FR-005 / US1)
+    // -------------------------------------------------------------------
+
+    /// Per-window event dispatch while the OSC 52 confirmation dialog is
+    /// visible. Mirrors `handle_disallowed_scheme_dialog_window_event` so
+    /// the same Esc / Tab / Enter / click discipline applies.
+    fn handle_clipboard_dialog_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => self.handle_close_requested(event_loop),
+            WindowEvent::RedrawRequested => self.handle_redraw(),
+            WindowEvent::Resized(size) => self.handle_resize_and_mark_geometry(*size),
+            WindowEvent::Moved(_) => self.mark_geometry_dirty(),
+            WindowEvent::ModifiersChanged(new_mods) => self.modifiers = new_mods.state(),
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if self.handle_native_close_window_shortcut(key_event, event_loop) {
+                    return;
+                }
+                self.handle_clipboard_dialog_keyboard(key_event);
+            }
+            WindowEvent::MouseInput {
+                state: winit::event::ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => self.handle_clipboard_dialog_click(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.update_cursor_position(position);
+                self.handle_clipboard_dialog_hover();
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle keyboard input while the clipboard dialog is active.
+    fn handle_clipboard_dialog_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        use winit::keyboard::{Key, NamedKey};
+
+        if event.state != winit::event::ElementState::Pressed {
+            return;
+        }
+
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.handle_clipboard_dialog_action(
+                    clipboard_dialog::ClipboardDialogAction::DenyOnce,
+                );
+            }
+            Key::Named(NamedKey::Enter) => {
+                let action = self.clipboard_dialog.as_ref().map_or(
+                    clipboard_dialog::ClipboardDialogAction::DenyOnce,
+                    clipboard_dialog::ClipboardDialog::confirm,
+                );
+                self.handle_clipboard_dialog_action(action);
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.cycle_clipboard_dialog_focus();
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a mouse click while the clipboard dialog is active.
+    fn handle_clipboard_dialog_click(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        let action = self.clipboard_dialog.as_ref().and_then(|d| d.click(x, y));
+        if let Some(action) = action {
+            self.handle_clipboard_dialog_action(action);
+        }
+    }
+
+    /// Handle mouse hover while the clipboard dialog is active.
+    fn handle_clipboard_dialog_hover(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        if let Some(dialog) = &mut self.clipboard_dialog
+            && dialog.update_hover(x, y)
+        {
+            self.request_redraw();
+        }
+    }
+
+    fn cycle_clipboard_dialog_focus(&mut self) {
+        let Some(dialog) = &mut self.clipboard_dialog else { return };
+        if self.modifiers.shift_key() {
+            dialog.focus_prev();
+        } else {
+            dialog.focus_next();
+        }
+        self.request_redraw();
+    }
+
+    /// Dispatch the user's choice from the clipboard dialog — send a
+    /// `ClientMessage::ClipboardPromptResponse` with the matching
+    /// `request_id` and close the overlay. Spec 010 T042: `AlwaysAllow`
+    /// / `AlwaysDeny` additionally persist the matching policy axis
+    /// (`terminal.clipboard.{read,write}_mode`) to the user config so
+    /// every subsequent session — and the file-watcher-driven
+    /// `ConfigReloaded` for the current session — sees the new value.
+    fn handle_clipboard_dialog_action(&mut self, action: clipboard_dialog::ClipboardDialogAction) {
+        let Some(dialog) = self.clipboard_dialog.take() else { return };
+        let request_id = dialog.request_id();
+        let session_id = dialog.session_id();
+        let op = dialog.op();
+        tracing::debug!(?session_id, ?request_id, ?op, ?action, "clipboard dialog resolved",);
+        let decision = match action {
+            clipboard_dialog::ClipboardDialogAction::AllowOnce => {
+                scribe_common::protocol::ClipboardDecision::AllowOnce
+            }
+            clipboard_dialog::ClipboardDialogAction::DenyOnce => {
+                scribe_common::protocol::ClipboardDecision::DenyOnce
+            }
+            clipboard_dialog::ClipboardDialogAction::AlwaysAllow => {
+                scribe_common::protocol::ClipboardDecision::AlwaysAllow
+            }
+            clipboard_dialog::ClipboardDialogAction::AlwaysDeny => {
+                scribe_common::protocol::ClipboardDecision::AlwaysDeny
+            }
+        };
+        if matches!(
+            decision,
+            scribe_common::protocol::ClipboardDecision::AlwaysAllow
+                | scribe_common::protocol::ClipboardDecision::AlwaysDeny
+        ) {
+            persist_clipboard_policy_axis(op, decision);
+        }
+        if let Some(tx) = self.cmd_tx.clone()
+            && tx.send(ClientCommand::ClipboardPromptResponse { request_id, decision }).is_err()
+        {
+            tracing::warn!("IPC channel closed; clipboard prompt response dropped");
         }
         self.request_redraw();
     }
@@ -13834,6 +14171,57 @@ fn quit_settings_process() {
     }
 }
 
+/// Spec 010 T042: persist the user's "Always allow / Always deny" choice
+/// to `terminal.clipboard.{read,write}_mode` in the on-disk Scribe config.
+/// The file-watcher path in `scribe-server` picks up the change and rebroadcasts
+/// the fresh policy snapshot to every live session via `ConfigReloaded`,
+/// which arrives in the PTY-reader task as `ClipboardCommand::RefreshPolicy`.
+/// The same prompt-response also updates the in-memory policy on the server
+/// (spec 010 T043) so the next OSC 52 op in this session sees the new mode
+/// even before the file-watcher round-trip lands. Errors are logged at warn
+/// level and dropped: the `Once` decision still resolved the prompt, so the
+/// user is not left with a stuck UI; only the persistence side-effect is
+/// lost.
+fn persist_clipboard_policy_axis(
+    op: scribe_common::protocol::ClipboardOp,
+    decision: scribe_common::protocol::ClipboardDecision,
+) {
+    use scribe_common::config::ClipboardMode;
+    use scribe_common::protocol::{ClipboardDecision, ClipboardOp};
+
+    let new_mode = match decision {
+        ClipboardDecision::AlwaysAllow => ClipboardMode::Allow,
+        ClipboardDecision::AlwaysDeny => ClipboardMode::Deny,
+        ClipboardDecision::AllowOnce | ClipboardDecision::DenyOnce => {
+            // Caller already filtered these out; defensive no-op.
+            return;
+        }
+    };
+
+    let mut config = match scribe_common::config::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("failed to load config for clipboard policy persistence: {e}");
+            return;
+        }
+    };
+
+    match op {
+        ClipboardOp::Read => {
+            config.terminal.clipboard_policy.read_mode = new_mode;
+        }
+        ClipboardOp::Write => {
+            config.terminal.clipboard_policy.write_mode = new_mode;
+        }
+    }
+
+    if let Err(e) = scribe_common::config::save_config(&config) {
+        tracing::warn!("failed to save config after Always* clipboard decision: {e}");
+    } else {
+        tracing::info!(?op, ?new_mode, "persisted clipboard policy axis from Always* decision",);
+    }
+}
+
 /// Open the settings window or focus it if already running.
 ///
 /// Tries to connect to the settings socket. If connected, sends a focus
@@ -14064,6 +14452,35 @@ fn extract_tab_pane_trees_inner(
         WorkspaceTreeNode::Split { first, second, .. } => {
             extract_tab_pane_trees_inner(first, out);
             extract_tab_pane_trees_inner(second, out);
+        }
+    }
+}
+
+/// Collect each leaf's `(workspace_id, active_tab_index)` from the server's
+/// reconnect tree. Applied after `restore_reconnect_tabs` because the per-tab
+/// `add_tab_with_pane_tree` call inside the restore loop auto-sets
+/// `active_tab` to the last-pushed tab — without this post-pass, every
+/// workspace's active tab would snap to the rightmost on reconnect/handoff.
+fn collect_active_tab_indices(
+    tree: &scribe_common::protocol::WorkspaceTreeNode,
+) -> Vec<(WorkspaceId, usize)> {
+    let mut out = Vec::new();
+    collect_active_tab_indices_inner(tree, &mut out);
+    out
+}
+
+fn collect_active_tab_indices_inner(
+    tree: &scribe_common::protocol::WorkspaceTreeNode,
+    out: &mut Vec<(WorkspaceId, usize)>,
+) {
+    use scribe_common::protocol::WorkspaceTreeNode;
+    match tree {
+        WorkspaceTreeNode::Leaf { workspace_id, active_tab_index, .. } => {
+            out.push((*workspace_id, *active_tab_index));
+        }
+        WorkspaceTreeNode::Split { first, second, .. } => {
+            collect_active_tab_indices_inner(first, out);
+            collect_active_tab_indices_inner(second, out);
         }
     }
 }

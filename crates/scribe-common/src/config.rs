@@ -817,6 +817,13 @@ fn default_smart_selection_rules() -> Vec<SmartSelectionRule> {
             Vec::new(),
         ),
         smart_selection_rule(
+            "word_no_trailing_period",
+            "Word without trailing period",
+            r"[^\s.]+",
+            SmartSelectionPrecision::Low,
+            Vec::new(),
+        ),
+        smart_selection_rule(
             "namespace_identifier",
             "Namespace identifier",
             r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+",
@@ -1000,6 +1007,107 @@ pub struct TerminalEnvPersistenceConfig {
     pub enabled: bool,
 }
 
+/// Per-axis OSC 52 clipboard policy mode (spec 010 E1).
+///
+/// Used by both `read_mode` and `write_mode` of [`ClipboardPolicyConfig`];
+/// applies uniformly to the clipboard and primary selection per FR-004.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardMode {
+    /// Silently deny the OSC 52 op (no prompt, no host clipboard mutation).
+    Deny,
+    /// Silently allow the op (no prompt, host clipboard is mutated / read).
+    Allow,
+    /// Surface a confirmation overlay before honoring the op.
+    #[default]
+    Prompt,
+}
+
+/// OSC 52 clipboard policy (spec 010 E1).
+///
+/// Two policy axes (`read_mode`, `write_mode`) applied uniformly to the
+/// clipboard and primary selection, plus a maximum-write-bytes cap, an
+/// opt-in focus-gate-for-writes toggle, and a burst-decision-reuse window.
+/// Defaults match kitty's `clipboard_control` posture: read = Prompt,
+/// write = Allow, max = 16 MiB, focus-gate = off, burst window = 500 ms.
+//
+// @lat: [[common#Configuration#Terminal]]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClipboardPolicyConfig {
+    pub read_mode: ClipboardMode,
+    pub write_mode: ClipboardMode,
+    pub max_write_bytes: u64,
+    pub focus_gate_writes: bool,
+    pub burst_window_ms: u64,
+}
+
+impl Default for ClipboardPolicyConfig {
+    fn default() -> Self {
+        Self {
+            read_mode: ClipboardMode::Prompt,
+            write_mode: ClipboardMode::Allow,
+            max_write_bytes: default_clipboard_max_write_bytes(),
+            focus_gate_writes: false,
+            burst_window_ms: default_clipboard_burst_window_ms(),
+        }
+    }
+}
+
+/// Maximum permitted value for `max_write_bytes` (512 MiB), matching kitty's
+/// `clipboard_max_size` ceiling so a user migrating from kitty can preserve
+/// their existing limit verbatim. Per FR-009.
+pub const CLIPBOARD_MAX_WRITE_BYTES_CEILING: u64 = 512 * 1024 * 1024;
+
+/// Maximum permitted value for `burst_window_ms` (10 s). Bounds the
+/// decision-reuse window to a sane upper limit per data-model E1.
+pub const CLIPBOARD_BURST_WINDOW_MS_CEILING: u64 = 10_000;
+
+fn default_clipboard_max_write_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_clipboard_burst_window_ms() -> u64 {
+    500
+}
+
+/// Mirror of [`ClipboardPolicyConfig`] used as the serde `from`-target so we
+/// can clamp `max_write_bytes` and `burst_window_ms` at deserialize time.
+#[derive(Deserialize)]
+struct ClipboardPolicyConfigRaw {
+    #[serde(default)]
+    read_mode: Option<ClipboardMode>,
+    #[serde(default)]
+    write_mode: Option<ClipboardMode>,
+    #[serde(default)]
+    max_write_bytes: Option<u64>,
+    #[serde(default)]
+    focus_gate_writes: Option<bool>,
+    #[serde(default)]
+    burst_window_ms: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for ClipboardPolicyConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = ClipboardPolicyConfigRaw::deserialize(deserializer)?;
+        let defaults = ClipboardPolicyConfig::default();
+        let max_write_bytes = raw
+            .max_write_bytes
+            .unwrap_or(defaults.max_write_bytes)
+            .min(CLIPBOARD_MAX_WRITE_BYTES_CEILING);
+        let burst_window_ms = raw
+            .burst_window_ms
+            .unwrap_or(defaults.burst_window_ms)
+            .min(CLIPBOARD_BURST_WINDOW_MS_CEILING);
+        Ok(Self {
+            read_mode: raw.read_mode.unwrap_or(defaults.read_mode),
+            write_mode: raw.write_mode.unwrap_or(defaults.write_mode),
+            max_write_bytes,
+            focus_gate_writes: raw.focus_gate_writes.unwrap_or(defaults.focus_gate_writes),
+            burst_window_ms,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalConfig {
     #[serde(default = "default_scrollback_lines")]
@@ -1026,6 +1134,12 @@ pub struct TerminalConfig {
     /// negotiation.
     #[serde(default = "default_true")]
     pub keyboard_protocol_enhanced: bool,
+    /// OSC 52 clipboard read/write policy (spec 010). Stored under the
+    /// `terminal.clipboard` TOML sub-table; distinct from the flattened
+    /// `TerminalClipboardConfig` above whose fields live as top-level
+    /// `terminal.*` keys for backward compatibility.
+    #[serde(default, rename = "clipboard")]
+    pub clipboard_policy: ClipboardPolicyConfig,
 }
 
 impl Default for TerminalConfig {
@@ -1041,6 +1155,7 @@ impl Default for TerminalConfig {
             env_persistence: TerminalEnvPersistenceConfig::default(),
             prompt_bar: TerminalPromptBarConfig::default(),
             keyboard_protocol_enhanced: true,
+            clipboard_policy: ClipboardPolicyConfig::default(),
         }
     }
 }

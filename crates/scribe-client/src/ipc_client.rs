@@ -14,7 +14,8 @@ use scribe_common::app::current_identity;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    AutomationAction, ClientMessage, EnvStatusState, PromptMarkKind, SearchMatch, ServerMessage,
+    AutomationAction, BridgeError, ClientMessage, ClipboardDecision, ClipboardOp,
+    ClipboardSelection, EnvStatusState, PromptId, PromptMarkKind, SearchMatch, ServerMessage,
     TerminalSize, UpdateProgressState, WorkspaceNotesCollection, WorkspaceNotesMutation,
 };
 use scribe_common::socket::{handoff_socket_path, server_socket_path};
@@ -75,6 +76,13 @@ pub enum ClientCommand {
     WorkspaceNotesGet { workspace_ids: Vec<WorkspaceId> },
     /// Request a server-side workspace notes mutation.
     WorkspaceNotesMutate { mutation: WorkspaceNotesMutation },
+    /// Spec 010: user resolved the OSC 52 confirmation dialog. Forwarded
+    /// to the server as `ClientMessage::ClipboardPromptResponse`.
+    ClipboardPromptResponse { request_id: PromptId, decision: ClipboardDecision },
+    /// Spec 010: reply to a `ServerMessage::ClipboardBridgeReadRequest`
+    /// carrying the host clipboard payload (or a `BridgeError` on arboard
+    /// failure). Forwarded as `ClientMessage::ClipboardBridgeReadReply`.
+    ClipboardBridgeReadReply { request_id: PromptId, payload: Result<String, BridgeError> },
 }
 
 /// Events forwarded from the IPC background thread to the winit event loop.
@@ -182,6 +190,40 @@ pub enum UiEvent {
     WorkspaceNotesChanged { collection: WorkspaceNotesCollection },
     /// Generic server error.
     ServerError { message: String },
+    /// Server confirmed our window identity and recorded the
+    /// `clipboard_gating` capability bit. Spec 010 C7; carries the
+    /// server's flag so the client can defensively no-op on the new
+    /// clipboard variants when `false`.
+    ClipboardGatingNegotiated { server_supports: bool },
+    /// Spec 010: server asks the user to confirm an OSC 52 read or write.
+    /// The client renders a clipboard dialog and replies with
+    /// `ClipboardPromptResponse`.
+    ClipboardPromptRequest {
+        session_id: SessionId,
+        request_id: PromptId,
+        op: ClipboardOp,
+        selection: ClipboardSelection,
+        preview: Option<String>,
+    },
+    /// Spec 010: server forwarded an allowed OSC 52 write payload to be
+    /// written to the host clipboard via the bridge.
+    ClipboardBridgeWrite {
+        /// Wire-side anchor for the originating pane. Wave 2's bridge call
+        /// is window-scoped so the field is logged for diagnostic context;
+        /// Wave 5's primary-selection / focus-gate work routes on it.
+        session_id: SessionId,
+        selection: ClipboardSelection,
+        payload: String,
+    },
+    /// Spec 010: server requests the host clipboard for an allowed OSC 52
+    /// read. The client replies with `ClipboardBridgeReadReply`.
+    ClipboardBridgeReadRequest {
+        /// Wire-side anchor for the originating pane. Logged for diagnostic
+        /// context until Wave 5 introduces per-pane routing.
+        session_id: SessionId,
+        request_id: PromptId,
+        selection: ClipboardSelection,
+    },
 }
 
 /// Start the IPC client on a background thread.
@@ -250,9 +292,46 @@ fn dispatch_server_message(proxy: &EventLoopProxy<UiEvent>, message: ServerMessa
     let message = dispatch_session_message(proxy, message);
     let message = dispatch_workspace_message(proxy, message);
     let message = dispatch_control_message(proxy, message);
+    let message = dispatch_clipboard_message(proxy, message);
 
     if let Some(message) = message {
         tracing::debug!(?message, "unhandled server message");
+    }
+}
+
+/// Spec 010 C5: route the three new OSC 52 server variants into the
+/// matching `UiEvent`s so the main thread can drive the dialog, the host
+/// clipboard bridge, and the read-reply path.
+fn dispatch_clipboard_message(
+    proxy: &EventLoopProxy<UiEvent>,
+    message: Option<ServerMessage>,
+) -> Option<ServerMessage> {
+    match message? {
+        ServerMessage::ClipboardPromptRequest {
+            session_id,
+            request_id,
+            op,
+            selection,
+            preview,
+        } => {
+            send_event(
+                proxy,
+                UiEvent::ClipboardPromptRequest { session_id, request_id, op, selection, preview },
+            );
+            None
+        }
+        ServerMessage::ClipboardBridgeWrite { session_id, selection, payload } => {
+            send_event(proxy, UiEvent::ClipboardBridgeWrite { session_id, selection, payload });
+            None
+        }
+        ServerMessage::ClipboardBridgeReadRequest { session_id, request_id, selection } => {
+            send_event(
+                proxy,
+                UiEvent::ClipboardBridgeReadRequest { session_id, request_id, selection },
+            );
+            None
+        }
+        other => Some(other),
     }
 }
 
@@ -420,8 +499,12 @@ fn dispatch_workspace_message(
             send_event(proxy, UiEvent::WorkspaceNotesChanged { collection });
             None
         }
-        ServerMessage::Welcome { window_id, other_windows } => {
-            tracing::info!(%window_id, others = other_windows.len(), "received Welcome");
+        ServerMessage::Welcome { window_id, other_windows, clipboard_gating } => {
+            tracing::info!(%window_id, others = other_windows.len(), clipboard_gating, "received Welcome");
+            send_event(
+                proxy,
+                UiEvent::ClipboardGatingNegotiated { server_supports: clipboard_gating },
+            );
             send_event(proxy, UiEvent::Welcome { window_id, other_windows });
             None
         }
@@ -539,7 +622,9 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         }
         ClientCommand::ConfigReloaded => ClientMessage::ConfigReloaded,
         ClientCommand::ReportWorkspaceTree { tree } => ClientMessage::ReportWorkspaceTree { tree },
-        ClientCommand::Hello { window_id } => ClientMessage::Hello { window_id },
+        ClientCommand::Hello { window_id } => {
+            ClientMessage::Hello { window_id, clipboard_gating: true }
+        }
         ClientCommand::CloseWindow { window_id } => ClientMessage::CloseWindow { window_id },
         ClientCommand::QuitAll => ClientMessage::QuitAll,
         ClientCommand::TriggerUpdate => ClientMessage::TriggerUpdate,
@@ -555,6 +640,12 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         }
         ClientCommand::WorkspaceNotesMutate { mutation } => {
             ClientMessage::WorkspaceNotesMutate { mutation }
+        }
+        ClientCommand::ClipboardPromptResponse { request_id, decision } => {
+            ClientMessage::ClipboardPromptResponse { request_id, decision }
+        }
+        ClientCommand::ClipboardBridgeReadReply { request_id, payload } => {
+            ClientMessage::ClipboardBridgeReadReply { request_id, payload }
         }
     }
 }

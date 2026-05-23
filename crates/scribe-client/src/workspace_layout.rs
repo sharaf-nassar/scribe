@@ -732,7 +732,12 @@ fn node_to_tree(
                     if matches!(tree, PaneTreeNode::Leaf { .. }) { None } else { Some(tree) }
                 })
                 .collect();
-            WorkspaceTreeNode::Leaf { workspace_id: slot.workspace_id, session_ids, pane_trees }
+            WorkspaceTreeNode::Leaf {
+                workspace_id: slot.workspace_id,
+                session_ids,
+                pane_trees,
+                active_tab_index: slot.active_tab,
+            }
         }
         WindowNode::Split { direction, ratio, first, second } => WorkspaceTreeNode::Split {
             direction: direction_to_protocol(*direction),
@@ -1300,11 +1305,13 @@ mod tests {
                 workspace_id: ws_a,
                 session_ids: vec![],
                 pane_trees: vec![],
+                active_tab_index: 0,
             }),
             second: Box::new(WorkspaceTreeNode::Leaf {
                 workspace_id: WorkspaceId::new(),
                 session_ids: vec![],
                 pane_trees: vec![],
+                active_tab_index: 0,
             }),
         };
 
@@ -1318,6 +1325,62 @@ mod tests {
             }
             WorkspaceTreeNode::Leaf { .. } => panic!("expected Split, got Leaf"),
         }
+    }
+
+    /// `to_tree` carries `active_tab_index` and the client-side restore path
+    /// (`add_tab_with_pane_tree` ×N + `set_active_tab` from the leaf) yields a
+    /// workspace whose `active_tab` matches the originally focused tab —
+    /// not the last-pushed tab, which is `add_tab_with_pane_tree`'s default.
+    #[test]
+    fn roundtrip_active_tab_index() {
+        use scribe_common::protocol::PaneTreeNode;
+
+        let ws_id = WorkspaceId::new();
+        let sid_first = SessionId::new();
+        let sid_middle = SessionId::new();
+        let sid_last = SessionId::new();
+
+        let mut layout = WindowLayout::new(ws_id, None);
+        // Replace the auto-created initial tab with three explicit tabs so
+        // the test reads as "three tabs, middle one active".
+        if let Some(ws) = layout.find_workspace_mut(ws_id) {
+            ws.tabs.clear();
+        }
+        let leaf_pane_tree = |sid| PaneTreeNode::Leaf { session_id: sid };
+        layout.add_tab_with_pane_tree(ws_id, sid_first, &leaf_pane_tree(sid_first));
+        layout.add_tab_with_pane_tree(ws_id, sid_middle, &leaf_pane_tree(sid_middle));
+        layout.add_tab_with_pane_tree(ws_id, sid_last, &leaf_pane_tree(sid_last));
+        assert!(layout.set_active_tab(ws_id, 1), "set active to middle tab");
+
+        let wire = layout.to_tree(&empty_pane_map());
+        let leaf_active = match &wire {
+            WorkspaceTreeNode::Leaf { active_tab_index, session_ids, .. } => {
+                assert_eq!(session_ids.len(), 3, "all three tabs serialised");
+                *active_tab_index
+            }
+            WorkspaceTreeNode::Split { .. } => panic!("expected Leaf"),
+        };
+        assert_eq!(leaf_active, 1, "wire carries active_tab_index");
+
+        // Reconstruct via the client path: from_tree creates the empty slot,
+        // then add_tab_with_pane_tree pushes tabs (each one auto-sets
+        // active_tab = last), then the post-pass restores active_tab_index.
+        let mut restored = WindowLayout::from_tree(&wire);
+        for sid in [sid_first, sid_middle, sid_last] {
+            restored.add_tab_with_pane_tree(ws_id, sid, &leaf_pane_tree(sid));
+        }
+        assert_eq!(
+            restored.find_workspace(ws_id).map(|ws| ws.active_tab),
+            Some(2),
+            "without the post-pass, restore lands on the last-pushed tab — \
+             this asserts the pre-fix symptom for regression coverage",
+        );
+        assert!(restored.set_active_tab(ws_id, leaf_active));
+        assert_eq!(
+            restored.find_workspace(ws_id).map(|ws| ws.active_tab),
+            Some(1),
+            "post-pass restores the originally active tab",
+        );
     }
 
     /// Pane split tree roundtrips through `to_tree` → `from_tree` via `add_tab_with_pane_tree`.
@@ -1368,17 +1431,20 @@ mod tests {
                     workspace_id: ws_a,
                     session_ids: vec![],
                     pane_trees: vec![],
+                    active_tab_index: 0,
                 }),
                 second: Box::new(WorkspaceTreeNode::Leaf {
                     workspace_id: ws_b,
                     session_ids: vec![],
                     pane_trees: vec![],
+                    active_tab_index: 0,
                 }),
             }),
             second: Box::new(WorkspaceTreeNode::Leaf {
                 workspace_id: ws_c,
                 session_ids: vec![],
                 pane_trees: vec![],
+                active_tab_index: 0,
             }),
         };
         (WindowLayout::from_tree(&tree), ws_a, ws_b, ws_c, viewport)

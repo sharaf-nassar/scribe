@@ -6,6 +6,56 @@ use crate::ai_state::{AiProcessState, AiProvider};
 use crate::hook;
 use crate::ids::{SessionId, WindowId, WorkspaceId};
 
+/// OSC 52 operation type (spec 010 E2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardOp {
+    Read,
+    Write,
+}
+
+/// OSC 52 selection target (spec 010 E2). Per FR-004 / FR-011 both axes share
+/// the same policy mode; `Primary` resolves to the system clipboard on
+/// non-X11 platforms at the `arboard` layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardSelection {
+    Clipboard,
+    Primary,
+}
+
+/// User decision returned from the OSC 52 confirmation overlay (spec 010 E2).
+/// `AlwaysAllow` / `AlwaysDeny` trigger a persisted policy update on the
+/// originating axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardDecision {
+    AllowOnce,
+    DenyOnce,
+    AlwaysAllow,
+    AlwaysDeny,
+}
+
+/// Why the client-side OSC 52 host clipboard bridge could not service a
+/// request (spec 010 E2). Mapped server-side onto an empty OSC 52 reply per
+/// UX-002.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeError {
+    /// `arboard` failed to initialize or returned an error (compositor
+    /// restart, X11 selection ownership lost, etc.).
+    Unavailable,
+    /// The host clipboard contained no usable text payload.
+    Empty,
+}
+
+/// Opaque identifier for an in-flight OSC 52 confirmation prompt (spec 010).
+///
+/// Serializes transparently as a `u64`; the server-side issuer is responsible
+/// for monotonic allocation and uniqueness within a session lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PromptId(pub u64);
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalSize {
     pub cols: u16,
@@ -238,6 +288,12 @@ pub enum ClientMessage {
     /// or create a window.
     Hello {
         window_id: Option<WindowId>,
+        /// Spec 010: client advertises OSC 52 clipboard-gating support. When
+        /// `false`, the server treats the session as headless for prompt /
+        /// bridge purposes and never emits the new clipboard variants.
+        /// Defaults to `false` so older clients deserialize cleanly.
+        #[serde(default)]
+        clipboard_gating: bool,
     },
     /// Close this window and destroy all its sessions.  Sent when the user
     /// chooses "Close this window only" from the close dialog.
@@ -286,6 +342,19 @@ pub enum ClientMessage {
     /// `terminal.env_persistence.enabled`. The server replies with exactly one
     /// `ServerMessage::EnvPreflightResult`. No fields.
     EnvPreflight,
+    /// Spec 010: user resolution for a pending OSC 52 confirmation overlay.
+    /// Echoes the `request_id` from the matching
+    /// `ServerMessage::ClipboardPromptRequest`.
+    ClipboardPromptResponse {
+        request_id: PromptId,
+        decision: ClipboardDecision,
+    },
+    /// Spec 010: reply to `ServerMessage::ClipboardBridgeReadRequest` carrying
+    /// the host clipboard payload (or a `BridgeError` if `arboard` failed).
+    ClipboardBridgeReadReply {
+        request_id: PromptId,
+        payload: Result<String, BridgeError>,
+    },
 }
 
 // ── Server → UI ──────────────────────────────────────────────────
@@ -430,6 +499,12 @@ pub enum ServerMessage {
         /// Window IDs that have detached sessions but no connected client.
         /// The receiving client should spawn a new process for each.
         other_windows: Vec<WindowId>,
+        /// Spec 010: server advertises OSC 52 clipboard-gating support. When
+        /// `false`, the client should not expect the new clipboard variants
+        /// and should keep its legacy user-driven paste path. Defaults to
+        /// `false` so older servers deserialize cleanly.
+        #[serde(default)]
+        clipboard_gating: bool,
     },
     /// Confirms that the server permanently removed a window and its sessions.
     WindowClosed {
@@ -511,6 +586,35 @@ pub enum ServerMessage {
         session_id: SessionId,
         state: EnvStatusState,
     },
+    /// Spec 010: server requests user confirmation for an OSC 52 read or write
+    /// originating from `session_id`. The client renders a clipboard prompt
+    /// dialog and replies with `ClientMessage::ClipboardPromptResponse`
+    /// carrying the same `request_id`. `preview` carries a head-and-tail
+    /// truncated write payload preview per FR-006; always `None` for reads.
+    ClipboardPromptRequest {
+        session_id: SessionId,
+        request_id: PromptId,
+        op: ClipboardOp,
+        selection: ClipboardSelection,
+        #[serde(default)]
+        preview: Option<String>,
+    },
+    /// Spec 010: server forwards an allowed OSC 52 write to the client's host
+    /// clipboard bridge. No reply expected (OSC 52 has no write-ack).
+    ClipboardBridgeWrite {
+        session_id: SessionId,
+        selection: ClipboardSelection,
+        payload: String,
+    },
+    /// Spec 010: server requests the client to read the host clipboard for an
+    /// allowed OSC 52 read. The client replies with
+    /// `ClientMessage::ClipboardBridgeReadReply` carrying the matching
+    /// `request_id`.
+    ClipboardBridgeReadRequest {
+        session_id: SessionId,
+        request_id: PromptId,
+        selection: ClipboardSelection,
+    },
 }
 
 // ── Shared types ─────────────────────────────────────────────────
@@ -540,12 +644,12 @@ pub enum LayoutDirection {
 
 /// Serialisable workspace split tree.
 ///
-/// Contains only the structural information the server needs to store and
-/// relay so the client can reconstruct its `WindowNode` tree exactly on
-/// reconnect: split direction, split ratio, and workspace leaf IDs.
+/// Carries everything the server needs to persist and relay so the client can
+/// reconstruct its `WindowNode` tree exactly on reconnect: split topology,
+/// split ratios, per-workspace tab ordering, per-tab pane layouts, and the
+/// per-workspace active tab index.
 ///
-/// Tab/pane state, accent colours, and names are NOT part of this tree —
-/// those travel in `WorkspaceInfo` messages and the flat workspace map.
+/// Accent colours and names still travel in `WorkspaceInfo` / `WorkspaceListEntry`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkspaceTreeNode {
     /// A single workspace occupying its entire region.
@@ -560,6 +664,12 @@ pub enum WorkspaceTreeNode {
         /// Empty vec means all tabs are single-pane (backward compat).
         #[serde(default)]
         pane_trees: Vec<Option<PaneTreeNode>>,
+        /// Index into `session_ids` of the tab that should be active on
+        /// reconnect/handoff. Populated by client when reporting tree;
+        /// defaults to 0 when received from older peers that don't ship it
+        /// (e.g. mid-upgrade handoff envelope from a pre-active-tab server).
+        #[serde(default)]
+        active_tab_index: usize,
     },
     /// A split dividing space between two sub-trees.
     Split {
@@ -908,6 +1018,40 @@ mod tests {
         match decoded {
             ServerMessage::ReleaseList { state: ReleaseListResultState::Fresh { releases } } => {
                 assert_eq!(releases, vec![sample_release()]);
+            }
+            other => panic!("unexpected variant after round-trip: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_message_clipboard_prompt_request_round_trips_through_msgpack_named() {
+        // Spec 010 wire-tag stability check: the new ClipboardPromptRequest
+        // variant must serialize with its PascalCase discriminator under the
+        // ServerMessage `#[serde(tag = "type")]` shape so older peers can
+        // detect-and-skip while newer peers round-trip the payload.
+        let original = ServerMessage::ClipboardPromptRequest {
+            session_id: SessionId::new(),
+            request_id: PromptId(42),
+            op: ClipboardOp::Write,
+            selection: ClipboardSelection::Clipboard,
+            preview: Some("hello world".to_string()),
+        };
+        let bytes = rmp_serde::to_vec_named(&original).expect("serialize ClipboardPromptRequest");
+
+        let tagged: InternalTagOnly =
+            rmp_serde::from_slice(&bytes).expect("decode ClipboardPromptRequest as tag-only");
+        assert_eq!(tagged.tag, "ClipboardPromptRequest");
+
+        let decoded: ServerMessage =
+            rmp_serde::from_slice(&bytes).expect("deserialize ClipboardPromptRequest");
+        match decoded {
+            ServerMessage::ClipboardPromptRequest {
+                request_id, op, selection, preview, ..
+            } => {
+                assert_eq!(request_id, PromptId(42));
+                assert_eq!(op, ClipboardOp::Write);
+                assert_eq!(selection, ClipboardSelection::Clipboard);
+                assert_eq!(preview.as_deref(), Some("hello world"));
             }
             other => panic!("unexpected variant after round-trip: {other:?}"),
         }

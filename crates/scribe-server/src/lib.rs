@@ -6,6 +6,7 @@
 //! through the binary.
 
 pub mod attach_flow;
+pub mod clipboard_state;
 pub mod config;
 pub mod env_store;
 pub mod handoff;

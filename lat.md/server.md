@@ -74,6 +74,26 @@ Resize updates the alacritty_terminal grid and sends `TIOCSWINSZ` via ioctl to n
 
 On CWD change, the server walks up from the working directory (depth limit 50) looking for `.git/HEAD`. It extracts the branch name from `ref: refs/heads/...` or returns the first 8 characters of a detached HEAD commit.
 
+### Clipboard Gating
+
+OSC 52 clipboard reads and writes from PTY-side programs flow through a per-session policy engine before reaching the host clipboard (spec 010). The in-memory `ServerClipboard` buffer is gone; the host clipboard is now the single source of truth.
+
+The session's alacritty `Term` is constructed with [[crates/scribe-server/src/session_manager.rs#build_term_config]] which sets `osc52: Osc52::CopyPaste`; the upstream default (`OnlyCopy`) silently drops OSC 52 read sequences inside the terminal core, so without this override `ClipboardLoad` events would never reach the gating layer and prompt mode would appear broken even though writes still worked. Scribe's own [[crates/scribe-common/src/config.rs#ClipboardPolicyConfig]] is the only policy gate; alacritty is configured as a pass-through forwarder.
+
+Each session's PTY reader holds a [[crates/scribe-server/src/clipboard_state.rs#ClipboardBurstState]] snapshot of `terminal.clipboard.*` (read mode, write mode, max write bytes, focus-gate, burst window). The `SessionEvent::ClipboardStore` / `ClipboardLoad` arms branch on the relevant axis ([[crates/scribe-server/src/ipc_server.rs#handle_clipboard_store]] and [[crates/scribe-server/src/ipc_server.rs#handle_clipboard_load]]): on Allow the server forwards `ServerMessage::ClipboardBridgeWrite` or `ClipboardBridgeReadRequest` to the attached client; on Deny it silently drops writes and replies an empty OSC 52 payload for reads; on Prompt it allocates a monotonic [[crates/scribe-common/src/protocol.rs#PromptId]] and emits `ServerMessage::ClipboardPromptRequest` to the client, parking the pending op in `pending_clipboard_prompt` until the user resolves the overlay. Oversize writes (`text.len() > max_write_bytes`) are silently dropped before any prompt or bridge dispatch (FR-009 / FR-015); the rejection emits a `tracing::debug!` line carrying the payload size, configured cap, write mode, and selection target so operators can observe the cap firing on demand without a PTY-side surface (UX-002). The cap check is positioned ahead of the policy branch, so it covers Allow forwards, Prompt prompts, burst-reuse hits, and the deferred-queue drain uniformly.
+
+The Prompt path implements the full FR-016 / FR-017 burst-state machine. When an OSC 52 event arrives while the [[crates/scribe-server/src/clipboard_state.rs#ClipboardBurstState]]'s `outstanding_prompt` field is set and the in-flight prompt is for the same op, the request is enqueued onto `pending_for_prompt` (a [[crates/scribe-server/src/clipboard_state.rs#DeferredRequest]] vector bounded at `MAX_PENDING_FOR_PROMPT` = 64). Same-op requests beyond the cap, and mismatched-op requests arriving while a prompt is open, fall back to the silent-drop / silent-empty-reply path with a `debug!` log so the cap is observable. With no prompt in flight, the reader consults `last_decision` via [[crates/scribe-server/src/clipboard_state.rs#ClipboardBurstState#reusable_decision]]: when the cached `(op, decision, Instant)` matches the new op and is still within `policy.burst_window_ms` (default 500 ms), the decision is replayed without re-prompting via [[crates/scribe-server/src/ipc_server.rs#apply_clipboard_write_decision]] / [[crates/scribe-server/src/ipc_server.rs#apply_clipboard_read_decision]] (FR-017). Otherwise a fresh prompt opens.
+
+On prompt resolution, [[crates/scribe-server/src/ipc_server.rs#handle_clipboard_prompt_response]] clears `outstanding_prompt`, records `(op, decision, now)` into `last_decision`, applies the decision to the originating pending op, then drains every deferred same-op request out of `pending_for_prompt` and replays the same decision against each one. `AlwaysAllow` / `AlwaysDeny` decisions also mutate the in-memory `policy.{read,write}_mode` on the matching axis so the next OSC 52 op outside the burst window already sees the persisted mode; the eventual `ConfigReloaded` round-trip is idempotent against the same value. `DenyOnce` / `AlwaysDeny` are reused identically to their allow counterparts so a tmux-style "no, deny everything" choice silences the burst rather than re-prompting per op.
+
+Prompt resolutions and host clipboard read replies travel back into the reader task over a per-session [[crates/scribe-server/src/ipc_server.rs#ClipboardCommand]] channel; the client message dispatcher fans `ClientMessage::ClipboardPromptResponse` and `ClipboardBridgeReadReply` onto every session attached to the window, and each reader task matches replies against its own `PromptId` issuance so stale or mis-routed responses are harmless. Reads stash the alacritty `ClipboardFormatter` keyed by request id; the formatter runs once the host clipboard text arrives (or once the user denies) and the resulting OSC 52 reply is written back to the PTY.
+
+The attach-time `clipboard_gating: bool` capability bit on `ClientMessage::Hello` and `ServerMessage::Welcome` ([[protocol#Server Messages#Clipboard Variants]]) is recorded per window in [[crates/scribe-server/src/ipc_server.rs#WindowClipboardGating]]. When the attached client did not advertise gating, or no client is attached, all non-Deny arms short-circuit to the headless deny path (research decision 7): writes drop, prompts deny, reads reply empty.
+
+`ConfigReloaded` ([[crates/scribe-server/src/ipc_server.rs#handle_config_reloaded]]) now snapshots the fresh `terminal.clipboard.*` policy via the server-local [[crates/scribe-server/src/config.rs#ScribeConfig]] and fans a `ClipboardCommand::RefreshPolicy` to every live PTY reader; [[crates/scribe-server/src/ipc_server.rs#handle_clipboard_policy_refresh]] replaces `ClipboardBurstState.policy` in place so the next OSC 52 op resolves against the new mode without a server restart (FR-010). Any prompt that was already in flight when the refresh lands keeps its original op semantics — only subsequent ops see the new policy.
+
+The X11 primary-selection branch and the FR-019 focus-gate-for-writes opt-in land in subsequent waves of the same spec.
+
 ## Workspaces
 
 Managed by [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager]], workspaces group sessions and track per-window split layouts.
@@ -97,6 +117,8 @@ Workspaces cycle through an 8-color palette (indigo, cyan, emerald, rose, amber,
 ### Per-Window Trees
 
 Each connected window can report its workspace split layout via `ReportWorkspaceTree`. The server persists these trees for handoff and reconnection. A legacy global tree is supported for backward compatibility.
+
+The reported tree's leaves carry per-tab `session_ids`, per-tab pane split trees, and the per-workspace `active_tab_index` — the server stores the tree opaquely and ships it back unchanged on the next `SessionList`, so adding new per-leaf fields requires no server-logic changes. Clients are responsible for reporting the tree after every layout-mutating action (split, close, tab switch, divider drag), which guarantees the server's stored tree is fresh enough that the next handoff or reconnect round-trips the user's focused tab.
 
 ### Workspace Notes
 
@@ -127,6 +149,8 @@ The HandoffState contains per-session metadata, per-session replay payload, and 
 Per-session payloads include title, shell basename, remote context, provider task label, CWD, AI state (including optional provider conversation IDs used for resume behavior), and a [[crates/scribe-common/src/screen_replay.rs#SessionReplay]] carrying the zstd-compressed ANSI replay for the session's visible grid plus scrollback. File descriptors are transferred one-for-one with the serialized session list.
 
 Per-workspace payloads include name, accent color, split direction, session list, and project root path. The project root is an additive `#[serde(default)]` field so handoff from older servers defaults to `None`.
+
+The per-window workspace tree rides separately in [[crates/scribe-server/src/workspace_manager.rs#HandoffWindowState]] and carries the per-leaf `active_tab_index` (also `#[serde(default)]` for cross-version compatibility — a pre-active-tab-aware sender degrades to 0, and the next client report restores the correct value). This is why focused-tab state survives `--upgrade` without a dedicated per-window state struct.
 
 Workspace notes are not embedded in handoff state. They are write-through server state, so the replacement server reloads the persisted notes store before answering note snapshots.
 

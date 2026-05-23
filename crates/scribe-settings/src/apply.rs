@@ -307,7 +307,62 @@ fn apply_terminal_key(
         | "terminal.status_bar_stats.memory"
         | "terminal.status_bar_stats.gpu"
         | "terminal.status_bar_stats.network" => apply_terminal_stats_key(config, key, value),
+        "terminal.clipboard.read_mode"
+        | "terminal.clipboard.write_mode"
+        | "terminal.clipboard.max_write_bytes"
+        | "terminal.clipboard.focus_gate_writes" => {
+            apply_terminal_clipboard_key(config, key, value)
+        }
         _ => Err(format!("unhandled terminal key: {key}")),
+    }
+}
+
+/// Spec 010 T035 / T047: apply OSC 52 clipboard policy keys from the
+/// settings webview. The Rust field on `TerminalConfig` is `clipboard_policy`
+/// but the serde-renamed TOML namespace is `terminal.clipboard.*`, so this
+/// handler stores into `config.terminal.clipboard_policy.{read_mode,
+/// write_mode, max_write_bytes, focus_gate_writes}`. `max_write_bytes` is
+/// clamped here to the public ceiling from
+/// [`scribe_common::config::CLIPBOARD_MAX_WRITE_BYTES_CEILING`] (512 MiB) to
+/// match the deserialize-time clamp, so the on-disk config stays in range
+/// even if the webview ever sends an out-of-band value. The
+/// `focus_gate_writes` toggle (FR-019) is a plain bool that the client
+/// consults at bridge-write time; the server never inspects it.
+fn apply_terminal_clipboard_key(
+    config: &mut scribe_common::config::ScribeConfig,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match key {
+        "terminal.clipboard.read_mode" => {
+            let s = value.as_str().ok_or("clipboard.read_mode must be a string")?;
+            config.terminal.clipboard_policy.read_mode = parse_clipboard_mode(s)?;
+        }
+        "terminal.clipboard.write_mode" => {
+            let s = value.as_str().ok_or("clipboard.write_mode must be a string")?;
+            config.terminal.clipboard_policy.write_mode = parse_clipboard_mode(s)?;
+        }
+        "terminal.clipboard.max_write_bytes" => {
+            let v: u64 = parse_number(value, "clipboard.max_write_bytes")?;
+            config.terminal.clipboard_policy.max_write_bytes =
+                v.min(scribe_common::config::CLIPBOARD_MAX_WRITE_BYTES_CEILING);
+        }
+        "terminal.clipboard.focus_gate_writes" => {
+            config.terminal.clipboard_policy.focus_gate_writes =
+                value.as_bool().ok_or("clipboard.focus_gate_writes must be a boolean")?;
+        }
+        _ => return Err(format!("unhandled terminal clipboard key: {key}")),
+    }
+
+    Ok(())
+}
+
+fn parse_clipboard_mode(s: &str) -> Result<scribe_common::config::ClipboardMode, String> {
+    match s {
+        "deny" => Ok(scribe_common::config::ClipboardMode::Deny),
+        "allow" => Ok(scribe_common::config::ClipboardMode::Allow),
+        "prompt" => Ok(scribe_common::config::ClipboardMode::Prompt),
+        _ => Err(format!("invalid clipboard mode: {s}")),
     }
 }
 
