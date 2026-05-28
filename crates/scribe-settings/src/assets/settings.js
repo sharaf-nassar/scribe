@@ -1975,6 +1975,8 @@ function loadConfig(config) {
   setToggleValue("terminal.natural_scroll", config.terminal?.natural_scroll);
   setToggleValue("terminal.copy_on_select", config.terminal?.copy_on_select);
   setToggleValue("terminal.keyboard_protocol_enhanced", config.terminal?.keyboard_protocol_enhanced);
+  // Spec 011: paste confirmation gate (default off).
+  setToggleValue("terminal.paste_confirmation", config.terminal?.paste_confirmation ?? false);
   setToggleValue("terminal.claude_copy_cleanup", config.terminal?.claude_copy_cleanup);
   setToggleValue("terminal.claude_code_integration", config.terminal?.claude_code_integration);
   setToggleValue("terminal.codex_code_integration", config.terminal?.codex_code_integration);

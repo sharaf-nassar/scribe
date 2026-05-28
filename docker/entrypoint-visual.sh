@@ -10,6 +10,7 @@ SERVER_STARTED=0
 
 cleanup() {
     kill "${APP_PID:-}" 2>/dev/null || true
+    kill "${WM_PID:-}" 2>/dev/null || true
     if [ "$DAEMON_STARTED" -eq 1 ]; then
         scribe-test daemon stop >/dev/null 2>&1 || true
     fi
@@ -49,6 +50,13 @@ XVFB_PID=$!
 export DISPLAY=:99
 sleep 0.5
 
+# A window manager must own _NET_ACTIVE_WINDOW. Without one, the client's X11
+# focus guard (crates/scribe-client/src/x11_focus.rs) sees no active window and
+# suppresses ALL synthetic key input, so xdotool-driven visual tests can't type.
+openbox &
+WM_PID=$!
+sleep 0.6
+
 UID_DIR="/run/user/$(id -u)/scribe"
 mkdir -p "$UID_DIR"
 chmod 700 "$UID_DIR"
@@ -64,6 +72,12 @@ case "$VISUAL_APP" in
     client)
         scribe-test daemon start
         DAEMON_STARTED=1
+        # Optional: seed a config.toml before the client starts so tests can
+        # exercise opt-in settings (e.g. terminal.paste_confirmation). No-op
+        # when unset, so existing visual tests are unaffected.
+        if [ -n "${SCRIBE_EXTRA_CONFIG:-}" ]; then
+            printf '%s\n' "$SCRIBE_EXTRA_CONFIG" > "$XDG_CONFIG_HOME/scribe/config.toml"
+        fi
         export WGPU_BACKEND=vulkan
         export LIBGL_ALWAYS_SOFTWARE=1
         scribe-client &

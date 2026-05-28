@@ -295,6 +295,7 @@ fn apply_terminal_key(
         | "terminal.preserve_ai_scrollback"
         | "terminal.natural_scroll"
         | "terminal.keyboard_protocol_enhanced"
+        | "terminal.paste_confirmation"
         | "terminal.env_persistence.enabled" => apply_terminal_behavior_key(config, key, value),
         "terminal.prompt_bar"
         | "terminal.prompt_bar_font_size"
@@ -407,6 +408,10 @@ fn apply_terminal_behavior_key(
         "terminal.keyboard_protocol_enhanced" => {
             config.terminal.keyboard_protocol_enhanced =
                 value.as_bool().ok_or("keyboard_protocol_enhanced must be a boolean")?;
+        }
+        "terminal.paste_confirmation" => {
+            config.terminal.paste_confirmation =
+                value.as_bool().ok_or("paste_confirmation must be a boolean")?;
         }
         "terminal.env_persistence.enabled" => {
             config.terminal.env_persistence.enabled =

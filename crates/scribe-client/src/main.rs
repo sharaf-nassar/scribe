@@ -17,6 +17,7 @@ mod mouse_state;
 mod notification_dispatcher;
 mod notifications;
 mod pane;
+mod paste_confirmation_dialog;
 mod preedit;
 mod prompt_bar;
 mod restore_replay;
@@ -1039,6 +1040,12 @@ struct App {
     /// `ClipboardPromptRequest` arrives for another pane.
     clipboard_dialog: Option<clipboard_dialog::ClipboardDialog>,
 
+    /// Confirmation dialog overlay gating a risky paste — multi-line or
+    /// control/escape content into an app that has not enabled bracketed
+    /// paste (spec 011). Parks the paste content + target while open; on
+    /// confirm the parked bytes are delivered byte-identically.
+    paste_confirmation_dialog: Option<paste_confirmation_dialog::PasteConfirmationDialog>,
+
     /// Cached `Welcome.clipboard_gating` flag from the server (spec 010
     /// C7). When `false` the client defensively no-ops on receipt of the
     /// new OSC 52 server variants. Initialised to `false` and flipped to
@@ -1170,7 +1177,8 @@ impl App {
             pending_pty_bytes: HashMap::new(), url_caches: HashMap::new(), hovered_url: None,
             hover_cell: None, hover_started_at: None, hover_tooltip_visible: false,
             hover_tooltip_uri: None, disallowed_scheme_dialog: None,
-            clipboard_dialog: None, server_clipboard_gating: false,
+            clipboard_dialog: None, paste_confirmation_dialog: None,
+            server_clipboard_gating: false,
             config_watcher_keepalive: None,
         }
     }
@@ -1728,11 +1736,49 @@ impl App {
             self.handle_clipboard_dialog_window_event(event_loop, event);
             return true;
         }
+        if self.paste_confirmation_dialog.is_some() {
+            self.handle_paste_confirmation_dialog_window_event(event_loop, event);
+            return true;
+        }
         if self.workspace_notes_modal.is_open() {
             self.handle_workspace_notes_window_event(event_loop, event);
             return true;
         }
         false
+    }
+
+    /// Per-window event dispatch while the paste-confirmation dialog is
+    /// visible (spec 011). Mirrors `handle_disallowed_scheme_dialog_window_event`
+    /// so the same Esc / Tab / Enter / click discipline applies, and so no
+    /// keystroke leaks to the PTY while the gate is open (FR-010).
+    fn handle_paste_confirmation_dialog_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => self.handle_close_requested(event_loop),
+            WindowEvent::RedrawRequested => self.handle_redraw(),
+            WindowEvent::Resized(size) => self.handle_resize_and_mark_geometry(*size),
+            WindowEvent::Moved(_) => self.mark_geometry_dirty(),
+            WindowEvent::ModifiersChanged(new_mods) => self.modifiers = new_mods.state(),
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if self.handle_native_close_window_shortcut(key_event, event_loop) {
+                    return;
+                }
+                self.handle_paste_confirmation_dialog_keyboard(key_event);
+            }
+            WindowEvent::MouseInput {
+                state: winit::event::ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => self.handle_paste_confirmation_dialog_click(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.update_cursor_position(position);
+                self.handle_paste_confirmation_dialog_hover();
+            }
+            _ => {}
+        }
     }
 
     fn handle_disallowed_scheme_dialog_window_event(
@@ -2025,6 +2071,7 @@ impl App {
             || self.update_dialog.is_some()
             || self.disallowed_scheme_dialog.is_some()
             || self.clipboard_dialog.is_some()
+            || self.paste_confirmation_dialog.is_some()
             || self.context_menu.is_some()
             || self.focused_inline_editor.is_some()
         {
@@ -5173,6 +5220,7 @@ impl App {
         *refresh_window_title |= self.apply_status_bar_overlay(prepared, all_instances);
         self.apply_workspace_notes_preview_overlay(prepared, all_instances);
         self.apply_modal_overlays(prepared, all_instances);
+        self.apply_paste_confirmation_overlay(prepared, all_instances);
         self.apply_prompt_tooltip_overlay(prepared, all_instances);
         self.apply_active_tooltip_overlay(prepared, all_instances);
         // Spec 009 T017 / FR-006: OSC 8 hover-tooltip rides the same
@@ -5451,6 +5499,31 @@ impl App {
         }
     }
 
+    /// Render the spec-011 paste-confirmation dialog overlay, if open. A
+    /// sibling of [`Self::apply_modal_overlays`] in the overlay-composition
+    /// sequence; kept separate so neither function exceeds the line limit.
+    /// Only one modal is ever open at a time, so ordering is cosmetic.
+    fn apply_paste_confirmation_overlay(
+        &mut self,
+        prepared: &PreparedFrame,
+        all_instances: &mut Vec<CellInstance>,
+    ) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        if let Some(dialog) = &mut self.paste_confirmation_dialog {
+            let mut paste_confirmation_dialog_resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            dialog.build_instances(
+                paste_confirmation_dialog::PasteConfirmationDialogBuildContext {
+                    out: all_instances,
+                    viewport: prepared.full_viewport,
+                    cell_size: prepared.cell_size,
+                    chrome: &self.theme.chrome,
+                    resolve_glyph: &mut paste_confirmation_dialog_resolve_glyph,
+                },
+            );
+        }
+    }
+
     fn apply_workspace_notes_preview_overlay(
         &mut self,
         prepared: &PreparedFrame,
@@ -5515,6 +5588,7 @@ impl App {
             && self.update_dialog.is_none()
             && self.disallowed_scheme_dialog.is_none()
             && self.clipboard_dialog.is_none()
+            && self.paste_confirmation_dialog.is_none()
             && !self.command_palette.is_active()
             && !self.search_overlay.is_active()
     }
@@ -6985,6 +7059,12 @@ impl App {
     /// 4 KiB `KeyInput` limit. Bracketed-paste start/end markers are placed
     /// on the first and last chunks only so the shell sees one contiguous
     /// paste region.
+    ///
+    /// When `terminal.paste_confirmation` is enabled and the focused pane has
+    /// NOT enabled bracketed paste, a risky paste (multi-line or containing a
+    /// non-tab control/escape byte) is parked behind a confirmation dialog
+    /// before any byte reaches the PTY (spec 011). The disabled path adds zero
+    /// work: the config check short-circuits before classification runs.
     fn send_paste_data(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -6993,13 +7073,54 @@ impl App {
 
         let Some(tx) = self.cmd_tx.clone() else { return };
         let Some(target) = self.prepare_paste_target() else { return };
-        let raw = text.as_bytes();
 
-        if Self::try_send_single_paste(&tx, &target, raw) {
-            return;
+        // Spec 011 gate (contract C4): only when enabled, unbracketed, and the
+        // content classifies as risky. Short-circuits on the disabled flag so
+        // an off configuration takes the exact prior code path.
+        if self.config.terminal.paste_confirmation && !target.bracketed {
+            if let Some(risk) = paste_confirmation_dialog::classify_paste(text) {
+                self.paste_confirmation_dialog =
+                    Some(paste_confirmation_dialog::PasteConfirmationDialog::new(
+                        text.to_owned(),
+                        target,
+                        risk,
+                    ));
+                self.request_redraw();
+                return;
+            }
         }
 
-        Self::send_chunked_paste(&tx, &target, raw);
+        Self::send_paste_resolved(&tx, &target, text.as_bytes());
+    }
+
+    /// Send paste `text` to the focused pane WITHOUT consulting the spec-011
+    /// confirmation gate.
+    ///
+    /// Used by paste-adjacent insertions that are explicitly out of scope for
+    /// the gate: drag-and-drop file paths (already shell-quoted; FR-013) and
+    /// the context-menu "Run command" action (an explicit user-initiated run,
+    /// not a clipboard/selection paste). Shares the resolve + chunking tail
+    /// with `send_paste_data`.
+    fn send_paste_data_ungated(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.flush_resize_if_pending();
+
+        let Some(tx) = self.cmd_tx.clone() else { return };
+        let Some(target) = self.prepare_paste_target() else { return };
+        Self::send_paste_resolved(&tx, &target, text.as_bytes());
+    }
+
+    /// Deliver `raw` to the parked/resolved `target` via the single-message
+    /// fast path, falling back to chunked delivery. Shared by the gated path,
+    /// the ungated path, and the confirmation-dialog resume so all three apply
+    /// identical bracketed-wrap + chunking and so the resume bypasses the gate.
+    fn send_paste_resolved(tx: &Sender<ClientCommand>, target: &PasteTarget, raw: &[u8]) {
+        if Self::try_send_single_paste(tx, target, raw) {
+            return;
+        }
+        Self::send_chunked_paste(tx, target, raw);
     }
 
     fn prepare_paste_target(&mut self) -> Option<PasteTarget> {
@@ -9160,6 +9281,11 @@ impl App {
     }
 
     /// Paste from the primary selection on Linux (X11/Wayland primary selection).
+    ///
+    /// Funnels through [`Self::send_paste_data`] so middle-click shares the
+    /// keybinding / context-menu paste path: bracketed-paste wrapping, >4 KiB
+    /// chunking (previously missing here — research R1), and the spec-011
+    /// confirmation gate all apply uniformly.
     #[cfg(target_os = "linux")]
     fn perform_primary_paste(&mut self) {
         use arboard::{GetExtLinux, LinuxClipboardKind};
@@ -9176,50 +9302,7 @@ impl App {
                 }
             }
         };
-        if text.is_empty() {
-            return;
-        }
-        self.flush_resize_if_pending();
-        let Some(tx) = self.cmd_tx.clone() else { return };
-        let focused_pane_id = {
-            let Some(tab) = self.window_layout.active_tab() else { return };
-            tab.focused_pane
-        };
-        let scrolled_up = {
-            let Some(pane) = self.panes.get_mut(&focused_pane_id) else { return };
-            let offset = pane.term.grid().display_offset();
-            if offset > 0 {
-                pane.split_scroll = None;
-                pane.term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
-                pane.scrollbar_state.on_scroll_action();
-                pane.content_dirty = true;
-            }
-            offset > 0
-        };
-        if scrolled_up {
-            self.ensure_animation_running();
-        }
-        let Some(pane) = self.panes.get(&focused_pane_id) else { return };
-        let bracketed =
-            pane.term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
-        let data = if bracketed {
-            let mut buf = b"\x1b[200~".to_vec();
-            buf.extend_from_slice(text.as_bytes());
-            buf.extend_from_slice(b"\x1b[201~");
-            buf
-        } else {
-            text.into_bytes()
-        };
-        if tx
-            .send(ClientCommand::KeyInput {
-                session_id: pane.session_id,
-                data,
-                dismisses_attention: false,
-            })
-            .is_err()
-        {
-            tracing::warn!("IPC channel closed; primary paste dropped");
-        }
+        self.send_paste_data(&text);
     }
 
     /// Paste from primary selection on non-Linux (falls back to regular clipboard).
@@ -9470,7 +9553,9 @@ impl App {
                 url_detect::open_path(&path, cwd);
             }
             context_menu::ContextMenuAction::RunCommand(command) => {
-                self.send_paste_data(&format!("{command}\n"));
+                // Explicit user-initiated run, not a clipboard/selection paste:
+                // bypass the spec-011 confirmation gate (T001 finding).
+                self.send_paste_data_ungated(&format!("{command}\n"));
             }
             context_menu::ContextMenuAction::RunCoprocess(command) => {
                 self.spawn_background_shell_command(&command);
@@ -10050,7 +10135,10 @@ impl App {
         let Some(tab) = self.window_layout.active_tab() else { return };
         let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
         let quoted = quote_path_for_shell(path, &pane.shell_name);
-        self.send_paste_data(&format!("{quoted} "));
+        // Drag-and-drop file insertion is out of scope for the spec-011 paste
+        // gate (FR-013); the path is already shell-quoted, so deliver it
+        // directly without confirmation.
+        self.send_paste_data_ungated(&format!("{quoted} "));
     }
 }
 
@@ -11158,6 +11246,66 @@ impl App {
     }
 
     // -------------------------------------------------------------------
+    // Paste-confirmation dialog input handlers (spec 011)
+    // -------------------------------------------------------------------
+
+    fn handle_paste_confirmation_dialog_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        use winit::keyboard::{Key, NamedKey};
+
+        if event.state != winit::event::ElementState::Pressed {
+            return;
+        }
+
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.handle_paste_confirmation_action(
+                    paste_confirmation_dialog::PasteConfirmationAction::Cancel,
+                );
+            }
+            Key::Named(NamedKey::Enter) => {
+                let action = self.paste_confirmation_dialog.as_ref().map_or(
+                    paste_confirmation_dialog::PasteConfirmationAction::Cancel,
+                    paste_confirmation_dialog::PasteConfirmationDialog::confirm,
+                );
+                self.handle_paste_confirmation_action(action);
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.cycle_paste_confirmation_dialog_focus();
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a mouse click while the paste-confirmation dialog is active.
+    fn handle_paste_confirmation_dialog_click(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        let action = self.paste_confirmation_dialog.as_ref().and_then(|d| d.click(x, y));
+        if let Some(action) = action {
+            self.handle_paste_confirmation_action(action);
+        }
+    }
+
+    /// Handle mouse hover while the paste-confirmation dialog is active.
+    fn handle_paste_confirmation_dialog_hover(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        if let Some(dialog) = &mut self.paste_confirmation_dialog {
+            if dialog.update_hover(x, y) {
+                self.request_redraw();
+            }
+        }
+    }
+
+    fn cycle_paste_confirmation_dialog_focus(&mut self) {
+        let Some(dialog) = &mut self.paste_confirmation_dialog else { return };
+        if self.modifiers.shift_key() {
+            dialog.focus_prev();
+        } else {
+            dialog.focus_next();
+        }
+        self.request_redraw();
+    }
+
+    // -------------------------------------------------------------------
     // Clipboard dialog input handlers (spec 010 FR-005 / US1)
     // -------------------------------------------------------------------
 
@@ -11313,6 +11461,43 @@ impl App {
             disallowed_scheme_dialog::DisallowedSchemeAction::Cancel => {
                 tracing::debug!(action = "cancel", "osc8: disallowed-scheme dialog dismissed");
                 // Drop the URI; no open happens.
+                drop(dialog);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Dispatch the user's choice from the paste-confirmation dialog (spec
+    /// 011). On `Paste`, deliver the parked content byte-identically to the
+    /// parked target via the shared send tail, bypassing the gate (the decision
+    /// is already made — honored even if the setting was toggled off while the
+    /// dialog was open). On `Cancel`/Esc, drop the dialog and send nothing.
+    fn handle_paste_confirmation_action(
+        &mut self,
+        action: paste_confirmation_dialog::PasteConfirmationAction,
+    ) {
+        let Some(dialog) = self.paste_confirmation_dialog.take() else { return };
+        match action {
+            paste_confirmation_dialog::PasteConfirmationAction::Paste => {
+                let (content, target) = dialog.into_parked_paste();
+                // Pane-closed-while-open edge case: if the parked session no
+                // longer maps to a live pane, drop the paste rather than risk
+                // delivering it to a different pane.
+                if !self.session_to_pane.contains_key(&target.session_id) {
+                    tracing::debug!(
+                        action = "paste",
+                        "paste-confirmation: parked session gone; dropping paste"
+                    );
+                } else if let Some(tx) = self.cmd_tx.clone() {
+                    tracing::debug!(
+                        action = "paste",
+                        "paste-confirmation: delivering parked paste"
+                    );
+                    Self::send_paste_resolved(&tx, &target, content.as_bytes());
+                }
+            }
+            paste_confirmation_dialog::PasteConfirmationAction::Cancel => {
+                tracing::debug!(action = "cancel", "paste-confirmation: paste dropped");
                 drop(dialog);
             }
         }

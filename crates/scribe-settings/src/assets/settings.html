@@ -861,6 +861,15 @@
           </div>
           <div class="setting-row">
             <div class="setting-info">
+              <div class="setting-label">Confirm risky pastes</div>
+              <div class="setting-desc">Warn before pasting multi-line or control-character text into an app that would run it immediately. Defers to apps that have enabled bracketed paste (modern shells and editors), so it stays silent at a normal prompt.</div>
+            </div>
+            <div class="toggle off" data-key="terminal.paste_confirmation">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
               <div class="setting-label">Persist Environment</div>
               <div class="setting-desc">Capture and restore terminal environment across cold restart (requires OS secret store)</div>
             </div>

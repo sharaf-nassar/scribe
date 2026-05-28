@@ -143,3 +143,13 @@ The `docker/Dockerfile.func` image bundles the workspace's `dist/shell-integrati
 Seven-phase test in `tests/e2e/func/ai-context-thresholds.sh` validating prompt-bar and tab inline % across all threshold bands for Claude and Codex.
 
 Claude phases emit `ClaudeState=processing;context=50/72/91` plus matching `ClaudePrompt=...` OSC payloads so the prompt bar is visible. Phase 1 asserts `50%` appears once in the prompt-bar cluster and Phase 4 confirms the tab inline is suppressed below `warn=70`; phases 2 and 3 assert Warn/Danger values appear at least twice (prompt bar + tab inline). Codex phases repeat the same provider-symmetric checks with `CodexState`/`CodexPrompt` at 51/73/92.
+
+## Visual E2E Tests
+
+Visual end-to-end tests run the real `scribe-client` GPU window headlessly (`docker/Dockerfile.visual`) and assert against screenshots written to `/output`.
+
+`docker/entrypoint-visual.sh` starts Xvfb, an `openbox` window manager, `scribe-server`, the daemon, and the client, then runs the test script. They are launched with `--gpus all` (host Vulkan), drive the client through `xdotool`/`xclip`, and capture frames with `scrot`. An optional `SCRIBE_EXTRA_CONFIG` env var seeds `config.toml` before the client starts so a test can exercise opt-in settings (e.g. `terminal.paste_confirmation`).
+
+`openbox` is required, not cosmetic: the client's [[crates/scribe-client/src/x11_focus.rs#X11FocusGuard]] suppresses synthetic key input whenever `_NET_ACTIVE_WINDOW` does not name the client window, and only a window manager sets that root property under Xvfb. Without a WM, `xdotool`-driven visual tests cannot type.
+
+`tests/e2e/visual/paste-confirmation.sh` verifies the spec-011 paste gate ([[client#Dialogs#Paste Confirmation Dialog]]): a single-line paste carrying control/escape bytes pops the confirmation with a caret-escaped preview (`^[`), while a plain single line and a tab-separated line paste straight through without a dialog.

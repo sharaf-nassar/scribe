@@ -50,7 +50,9 @@ The Colors page also exposes five prompt bar color overrides labeled First Row, 
 
 ### Terminal Keys
 
-Terminal page general section — scrollback lines, natural scrolling, copy on select, enhanced keyboard protocol, the persist-environment toggle, and the OSC 52 Clipboard policy subsection. AI integration settings moved to the AI page.
+Terminal page general section — scrollback lines, natural scrolling, copy on select, enhanced keyboard protocol, the paste-confirmation toggle, the persist-environment toggle, and the OSC 52 Clipboard policy subsection.
+
+AI integration settings moved to the AI page. The paste-confirmation toggle is keyed `terminal.paste_confirmation`, defaults OFF, and routes through [[crates/scribe-settings/src/apply.rs#apply_terminal_behavior_key]] like the other terminal bool toggles. It gates a multi-line or control-character paste client-side — only when the focused app has not enabled bracketed paste — per [[client#Dialogs#Paste Confirmation Dialog]], with no server round-trip.
 
 The persist-environment toggle is keyed `terminal.env_persistence.enabled`, defaults OFF, and is gated by an OS-secret-store preflight on enable — see [[server#Env Persistence]].
 
