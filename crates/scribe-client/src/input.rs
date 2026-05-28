@@ -807,20 +807,39 @@ fn translate_named_csi_letter(
     modifier_param: Option<u8>,
     app_cursor: bool,
 ) -> Option<Vec<u8>> {
+    translate_named_csi_letter_with_event(named, modifier_param, None, app_cursor)
+}
+
+fn translate_named_csi_letter_with_event(
+    named: NamedKey,
+    modifier_param: Option<u8>,
+    event_type: Option<u8>,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
     csi_letter_for_named(named).map(|letter| {
         // DECCKM: unmodified arrows / Home / End travel as SS3 (`\x1bO<letter>`).
         // Modified chords keep the CSI form because SS3 carries no modifier
-        // parameter, matching xterm and alacritty's default bindings.
-        if app_cursor && modifier_param.is_none() {
+        // parameter, matching xterm and alacritty's default bindings. Kitty
+        // event types also force CSI because SS3 has no event-type slot.
+        if app_cursor && modifier_param.is_none() && event_type.is_none() {
             vec![0x1b, b'O', letter]
         } else {
-            build_csi_letter_seq(letter, modifier_param)
+            build_csi_letter_seq(letter, modifier_param, event_type)
         }
     })
 }
 
 fn translate_named_csi_tilde(named: NamedKey, modifier_param: Option<u8>) -> Option<Vec<u8>> {
-    csi_tilde_code_for_named(named).map(|code| build_csi_tilde_seq(code, modifier_param))
+    translate_named_csi_tilde_with_event(named, modifier_param, None)
+}
+
+fn translate_named_csi_tilde_with_event(
+    named: NamedKey,
+    modifier_param: Option<u8>,
+    event_type: Option<u8>,
+) -> Option<Vec<u8>> {
+    csi_tilde_code_for_named(named)
+        .map(|code| build_csi_tilde_seq(code, modifier_param, event_type))
 }
 
 /// Map a numpad-located key event to its DECPAM SS3 sequence, or `None`
@@ -875,14 +894,25 @@ fn numpad_char_ss3_letter(c: &str) -> Option<u8> {
 }
 
 fn translate_named_function_key(named: NamedKey, modifier_param: Option<u8>) -> Option<Vec<u8>> {
+    translate_named_function_key_with_event(named, modifier_param, None)
+}
+
+fn translate_named_function_key_with_event(
+    named: NamedKey,
+    modifier_param: Option<u8>,
+    event_type: Option<u8>,
+) -> Option<Vec<u8>> {
     ss3_letter_for_fkey(named)
         .map(|letter| {
-            modifier_param.map_or_else(
-                || vec![0x1b, b'O', letter],
-                |param| build_csi_letter_seq(letter, Some(param)),
-            )
+            if modifier_param.is_none() && event_type.is_none() {
+                vec![0x1b, b'O', letter]
+            } else {
+                build_csi_letter_seq(letter, modifier_param, event_type)
+            }
         })
-        .or_else(|| fkey_tilde_code(named).map(|code| build_csi_tilde_seq(code, modifier_param)))
+        .or_else(|| {
+            fkey_tilde_code(named).map(|code| build_csi_tilde_seq(code, modifier_param, event_type))
+        })
 }
 
 struct BindingAction<'a, T> {
@@ -1070,28 +1100,51 @@ fn fkey_tilde_code(named: NamedKey) -> Option<u8> {
     }
 }
 
-/// Build a CSI letter sequence: `\x1b[1;{param}{letter}` or `\x1b[{letter}`.
-fn build_csi_letter_seq(letter: u8, modifier_param: Option<u8>) -> Vec<u8> {
-    modifier_param.map_or_else(
-        || vec![0x1b, b'[', letter],
-        |param| {
-            let mut seq = Vec::with_capacity(8);
-            seq.extend_from_slice(b"\x1b[1;");
-            seq.extend_from_slice(param.to_string().as_bytes());
-            seq.push(letter);
-            seq
-        },
-    )
+/// Build a CSI letter sequence.
+///
+/// Forms:
+/// - `\x1b[{letter}` — no modifiers or event type;
+/// - `\x1b[1;{param}{letter}` — modifiers;
+/// - `\x1b[1;{param}:{event}{letter}` — Kitty event type.
+fn build_csi_letter_seq(letter: u8, modifier_param: Option<u8>, event_type: Option<u8>) -> Vec<u8> {
+    if modifier_param.is_none() && event_type.is_none() {
+        return vec![0x1b, b'[', letter];
+    }
+
+    let mut seq = Vec::with_capacity(10);
+    seq.extend_from_slice(b"\x1b[1;");
+    seq.extend_from_slice(modifier_param.unwrap_or(1).to_string().as_bytes());
+    if let Some(ev) = event_type {
+        seq.push(b':');
+        seq.extend_from_slice(ev.to_string().as_bytes());
+    }
+    seq.push(letter);
+    seq
 }
 
-/// Build a CSI tilde sequence: `\x1b[{code};{param}~` or `\x1b[{code}~`.
-fn build_csi_tilde_seq(code: u8, modifier_param: Option<u8>) -> Vec<u8> {
-    let mut seq = Vec::with_capacity(10);
+/// Build a CSI tilde sequence.
+///
+/// Forms:
+/// - `\x1b[{code}~` — no modifiers or event type;
+/// - `\x1b[{code};{param}~` — modifiers;
+/// - `\x1b[{code};{param}:{event}~` — Kitty event type.
+fn build_csi_tilde_seq(code: u8, modifier_param: Option<u8>, event_type: Option<u8>) -> Vec<u8> {
+    if modifier_param.is_none() && event_type.is_none() {
+        let mut seq = Vec::with_capacity(5);
+        seq.extend_from_slice(b"\x1b[");
+        seq.extend_from_slice(code.to_string().as_bytes());
+        seq.push(b'~');
+        return seq;
+    }
+
+    let mut seq = Vec::with_capacity(12);
     seq.extend_from_slice(b"\x1b[");
     seq.extend_from_slice(code.to_string().as_bytes());
-    if let Some(param) = modifier_param {
-        seq.push(b';');
-        seq.extend_from_slice(param.to_string().as_bytes());
+    seq.push(b';');
+    seq.extend_from_slice(modifier_param.unwrap_or(1).to_string().as_bytes());
+    if let Some(ev) = event_type {
+        seq.push(b':');
+        seq.extend_from_slice(ev.to_string().as_bytes());
     }
     seq.push(b'~');
     seq
@@ -1256,11 +1309,54 @@ fn translate_named_kitty(
     modifiers: ModifiersState,
     mode: TerminalMode,
 ) -> Option<Vec<u8>> {
-    let flags = mode.kitty;
-    let modifier_param = xterm_modifier_param(modifiers);
-    let event_type = kitty_event_type(event, flags);
+    let event_type = kitty_event_type(event, mode.kitty);
+    let text_codepoints = associated_text_codepoints(event, mode.kitty);
+    translate_named_kitty_fields(NamedKittyFields {
+        named,
+        location: event.location,
+        modifiers,
+        flags: mode.kitty,
+        app_cursor: mode.app_cursor,
+        event_type,
+        text_codepoints: &text_codepoints,
+        pressed: event.state == ElementState::Pressed,
+    })
+}
 
-    if let Some(cp) = kitty_functional_codepoint(named, event.location) {
+#[derive(Clone, Copy)]
+struct NamedKittyFields<'a> {
+    named: NamedKey,
+    location: KeyLocation,
+    modifiers: ModifiersState,
+    flags: KittyFlags,
+    app_cursor: bool,
+    event_type: Option<u8>,
+    text_codepoints: &'a [u32],
+    pressed: bool,
+}
+
+fn translate_named_kitty_fields(request: NamedKittyFields<'_>) -> Option<Vec<u8>> {
+    let NamedKittyFields {
+        named,
+        location,
+        modifiers,
+        flags,
+        app_cursor,
+        event_type,
+        text_codepoints,
+        pressed,
+    } = request;
+    let modifier_param = xterm_modifier_param(modifiers);
+
+    if event_type.is_some() {
+        if let Some(bytes) =
+            translate_named_kitty_legacy_functional(named, modifier_param, event_type, app_cursor)
+        {
+            return Some(bytes);
+        }
+    }
+
+    if let Some(cp) = kitty_functional_codepoint(named, location) {
         // Modifier/lock keys are reported only when the application asked for
         // all keys (or event types) — otherwise they are swallowed as today.
         if is_kitty_modifier_codepoint(cp)
@@ -1274,8 +1370,7 @@ fn translate_named_kitty(
         // under `disambiguate` per the protocol's functional-key table. Space
         // is plain text: unmodified Space stays a raw 0x20 (legacy) and only
         // becomes CSI-u when modified, event-typed, or under
-        // `report_all_keys`. Arrows and the rest also require modifiers, an
-        // event type, or `report_all_keys`.
+        // `report_all_keys`.
         let always_csi = is_kitty_text_special(cp) && flags.disambiguate();
         let needs_csi = always_csi
             || flags.report_all_keys()
@@ -1284,18 +1379,67 @@ fn translate_named_kitty(
             || is_kitty_modifier_codepoint(cp);
 
         if needs_csi {
-            let text_codepoints = associated_text_codepoints(event, flags);
-            return Some(build_csi_u_seq(cp, &[], modifier_param, event_type, &text_codepoints));
+            return Some(build_csi_u_seq(cp, &[], modifier_param, event_type, text_codepoints));
         }
     }
 
     // No enhancement forces CSI-u for this key: fall back to the exact legacy
     // named-key encoding (press-only, like before). The legacy encoder still
     // honours DECCKM for arrows / Home / End via `mode.app_cursor`.
-    if event.state != ElementState::Pressed {
+    if !pressed {
         return None;
     }
-    translate_named_legacy(named, modifiers, mode.app_cursor)
+    translate_named_legacy(named, modifiers, app_cursor)
+}
+
+fn translate_named_kitty_legacy_functional(
+    named: NamedKey,
+    modifier_param: Option<u8>,
+    event_type: Option<u8>,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
+    translate_named_csi_letter_with_event(named, modifier_param, event_type, app_cursor)
+        .or_else(|| translate_named_csi_tilde_with_event(named, modifier_param, event_type))
+        .or_else(|| {
+            translate_named_kitty_function_key_with_event(named, modifier_param, event_type)
+        })
+}
+
+fn translate_named_kitty_function_key_with_event(
+    named: NamedKey,
+    modifier_param: Option<u8>,
+    event_type: Option<u8>,
+) -> Option<Vec<u8>> {
+    kitty_csi_letter_for_fkey(named)
+        .map(|letter| build_csi_letter_seq(letter, modifier_param, event_type))
+        .or_else(|| {
+            kitty_fkey_tilde_code(named)
+                .map(|code| build_csi_tilde_seq(code, modifier_param, event_type))
+        })
+}
+
+fn kitty_csi_letter_for_fkey(named: NamedKey) -> Option<u8> {
+    match named {
+        NamedKey::F1 => Some(b'P'),
+        NamedKey::F2 => Some(b'Q'),
+        NamedKey::F4 => Some(b'S'),
+        _ => None,
+    }
+}
+
+fn kitty_fkey_tilde_code(named: NamedKey) -> Option<u8> {
+    match named {
+        NamedKey::F3 => Some(13),
+        NamedKey::F5 => Some(15),
+        NamedKey::F6 => Some(17),
+        NamedKey::F7 => Some(18),
+        NamedKey::F8 => Some(19),
+        NamedKey::F9 => Some(20),
+        NamedKey::F10 => Some(21),
+        NamedKey::F11 => Some(23),
+        NamedKey::F12 => Some(24),
+        _ => None,
+    }
 }
 
 /// Resolve the unshifted base Unicode codepoint for a character key.
@@ -1347,11 +1491,12 @@ fn associated_text_codepoints(event: &KeyEvent, flags: KittyFlags) -> Vec<u32> {
     event.text.as_ref().map(|t| t.chars().map(u32::from).collect()).unwrap_or_default()
 }
 
-/// Map a `NamedKey` to its Kitty functional-key codepoint.
+/// Map a `NamedKey` to its Kitty CSI-u functional-key codepoint.
 ///
-/// Covers the protocol's non-modifier functional keys plus the modifier/lock
-/// keys (disambiguated left/right via `KeyLocation`). Returns `None` for keys
-/// that have no dedicated functional number (those use the legacy forms).
+/// Keys whose protocol definitions use CSI letter or CSI tilde forms are
+/// intentionally excluded; those stay on their legacy-shaped sequences, with
+/// modifier and event-type subfields added when needed. Modifier/lock keys are
+/// disambiguated left/right via `KeyLocation`.
 fn kitty_functional_codepoint(named: NamedKey, location: KeyLocation) -> Option<u32> {
     if let Some(cp) = kitty_modifier_lock_codepoint(named, location) {
         return Some(cp);
@@ -1362,28 +1507,6 @@ fn kitty_functional_codepoint(named: NamedKey, location: KeyLocation) -> Option<
         NamedKey::Tab => 9,
         NamedKey::Backspace => 127,
         NamedKey::Space => 32,
-        NamedKey::Insert => 57348,
-        NamedKey::Delete => 57349,
-        NamedKey::ArrowLeft => 57350,
-        NamedKey::ArrowRight => 57351,
-        NamedKey::ArrowUp => 57352,
-        NamedKey::ArrowDown => 57353,
-        NamedKey::PageUp => 57354,
-        NamedKey::PageDown => 57355,
-        NamedKey::Home => 57356,
-        NamedKey::End => 57357,
-        NamedKey::F1 => 57364,
-        NamedKey::F2 => 57365,
-        NamedKey::F3 => 57366,
-        NamedKey::F4 => 57367,
-        NamedKey::F5 => 57368,
-        NamedKey::F6 => 57369,
-        NamedKey::F7 => 57370,
-        NamedKey::F8 => 57371,
-        NamedKey::F9 => 57372,
-        NamedKey::F10 => 57373,
-        NamedKey::F11 => 57374,
-        NamedKey::F12 => 57375,
         NamedKey::F13 => 57376,
         NamedKey::F14 => 57377,
         NamedKey::F15 => 57378,
@@ -1467,6 +1590,25 @@ mod tests {
         translate_named_csi_letter(named, modifier_param, app_cursor).expect("csi-letter key")
     }
 
+    fn kitty_named(
+        named: NamedKey,
+        modifiers: ModifiersState,
+        flags: KittyFlags,
+        event_type: Option<u8>,
+    ) -> Vec<u8> {
+        translate_named_kitty_fields(NamedKittyFields {
+            named,
+            location: KeyLocation::Standard,
+            modifiers,
+            flags,
+            app_cursor: false,
+            event_type,
+            text_codepoints: &[],
+            pressed: true,
+        })
+        .expect("kitty named key")
+    }
+
     #[test]
     fn arrow_keys_emit_csi_form_when_app_cursor_off() {
         assert_eq!(csi_letter(NamedKey::ArrowUp, None, false), b"\x1b[A");
@@ -1505,6 +1647,36 @@ mod tests {
         assert_eq!(csi_letter(NamedKey::ArrowUp, Some(2), true), b"\x1b[1;2A");
         assert_eq!(csi_letter(NamedKey::ArrowDown, Some(5), true), b"\x1b[1;5B");
         assert_eq!(csi_letter(NamedKey::Home, Some(2), true), b"\x1b[1;2H");
+    }
+
+    #[test]
+    fn kitty_repeat_arrows_use_legacy_final_letter_with_event_type() {
+        let flags = KittyFlags::legacy_set().with_report_event_types(true);
+
+        assert_eq!(
+            kitty_named(NamedKey::ArrowLeft, ModifiersState::empty(), flags, Some(2)),
+            b"\x1b[1;1:2D",
+        );
+    }
+
+    #[test]
+    fn kitty_modified_repeat_arrows_keep_legacy_final_letter() {
+        let flags = KittyFlags::legacy_set().with_report_event_types(true);
+
+        assert_eq!(
+            kitty_named(NamedKey::ArrowLeft, ModifiersState::CONTROL, flags, Some(2)),
+            b"\x1b[1;5:2D",
+        );
+    }
+
+    #[test]
+    fn kitty_repeat_f13_uses_functional_codepoint() {
+        let flags = KittyFlags::legacy_set().with_report_event_types(true);
+
+        assert_eq!(
+            kitty_named(NamedKey::F13, ModifiersState::empty(), flags, Some(2)),
+            b"\x1b[57376;1:2u",
+        );
     }
 
     // ---------------------------------------------------------------------

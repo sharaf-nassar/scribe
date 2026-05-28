@@ -817,13 +817,6 @@ fn default_smart_selection_rules() -> Vec<SmartSelectionRule> {
             Vec::new(),
         ),
         smart_selection_rule(
-            "word_no_trailing_period",
-            "Word without trailing period",
-            r"[^\s.]+",
-            SmartSelectionPrecision::Low,
-            Vec::new(),
-        ),
-        smart_selection_rule(
             "namespace_identifier",
             "Namespace identifier",
             r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+",
@@ -1140,6 +1133,12 @@ pub struct TerminalConfig {
     /// `terminal.*` keys for backward compatibility.
     #[serde(default, rename = "clipboard")]
     pub clipboard_policy: ClipboardPolicyConfig,
+    /// Require confirmation before sending a risky paste (multi-line or
+    /// containing control/escape bytes) to the PTY, but only when the focused
+    /// application has not enabled bracketed paste (spec 011). Opt-in; defaults
+    /// off, so absent configs keep today's unconditional paste behavior.
+    #[serde(default)]
+    pub paste_confirmation: bool,
 }
 
 impl Default for TerminalConfig {
@@ -1156,6 +1155,7 @@ impl Default for TerminalConfig {
             prompt_bar: TerminalPromptBarConfig::default(),
             keyboard_protocol_enhanced: true,
             clipboard_policy: ClipboardPolicyConfig::default(),
+            paste_confirmation: false,
         }
     }
 }

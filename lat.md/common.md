@@ -40,7 +40,9 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 ### Terminal
 
-[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, the enhanced keyboard-protocol opt-out, AI toggles, indicator height, shell integration, status bar stats, prompt bar, scroll pin, and OSC 52 clipboard policy settings.
+[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, the enhanced keyboard-protocol opt-out, AI toggles, indicator height, shell integration, status bar stats, prompt bar, scroll pin, paste confirmation, and OSC 52 clipboard policy settings.
+
+`paste_confirmation` (bool, default `false`) gates a multi-line or control-character paste behind a confirmation dialog before it reaches the PTY, but only when the focused application has not enabled bracketed paste (spec 011); see [[client#Dialogs#Paste Confirmation Dialog]].
 
 [[crates/scribe-common/src/config.rs#ClipboardPolicyConfig]] (TOML namespace `terminal.clipboard.*`) carries the OSC 52 read/write policy modes ([[crates/scribe-common/src/config.rs#ClipboardMode]] — `deny`/`allow`/`prompt`), a `max_write_bytes` cap (default 16 MiB, ceiling 512 MiB), a `focus_gate_writes` opt-in toggle, and a `burst_window_ms` reuse window. Wired into the foundational types only as of this checkpoint; the server-side gating engine and client-side prompt dialog land in the OSC 52 clipboard-gating feature work.
 
