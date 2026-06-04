@@ -18,3 +18,4 @@ alacritty_terminal.workspace = true
 tracing.workspace = true
 scribe-common.workspace = true
 unicode-width = "0.2"
+unicode-script = "0.5"
