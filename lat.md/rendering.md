@@ -62,6 +62,14 @@ Characters are shaped with cosmic-text and rasterized via the swash cache, then 
 
 Advanced shaping is used for ligatures, Basic when disabled. Mask images are expanded to RGBA by filling white; Color images are kept as-is. Swash placement offsets position the glyph on the canvas.
 
+### Font Fallbacks
+
+Glyph shaping uses a Scribe-specific cosmic-text fallback list so terminal icon fonts win before generic symbol fonts.
+
+[[crates/scribe-renderer/src/atlas.rs#scribe_font_system]] rebuilds the loaded system font database with [[crates/scribe-renderer/src/atlas.rs#ScribeFontFallback]]. The fallback list prepends common Nerd Font symbol family names before the normal Unix symbol and emoji families. It also forbids `Unifont Sample`, because that font claims private-use codepoints and can render terminal icon glyphs as misleading sample symbols when no Nerd Font is installed.
+
+If no icon font is installed, private-use icons still fall back to the primary font's missing-glyph box; Scribe does not synthesize platform logos.
+
 ### UV Computation
 
 UV coordinates use float cell dimensions matching the GPU quad size, not ceiling-rounded canvas dimensions.

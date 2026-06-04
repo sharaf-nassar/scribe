@@ -16,7 +16,9 @@ use vte::ansi::Processor as AnsiProcessor;
 
 use scribe_common::ids::{SessionId, WorkspaceId};
 use scribe_common::protocol::SessionContext;
-use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor, ScreenSnapshot};
+use scribe_common::screen::{
+    CellFlags, CursorStyle, DecPrivateMode, ScreenCell, ScreenColor, ScreenSnapshot,
+};
 use scribe_common::screen_replay::build_session_replay;
 use scribe_pty::event_listener::ScribeEventListener;
 
@@ -112,6 +114,7 @@ fn dummy_snapshot(cols: u16, rows: u16) -> ScreenSnapshot {
         cursor_style: CursorStyle::Block,
         cursor_visible: false,
         alt_screen: true,
+        active_dec_modes: Vec::new(),
         scrollback: Vec::new(),
         scrollback_rows: 0,
     }
@@ -362,4 +365,79 @@ async fn restore_from_handoff_v5_restored_term_survives_multiple_snapshots() {
 
     assert_eq!(first.cells, src_snap.cells, "first snapshot must match source");
     assert_eq!(first.cells, second.cells, "second snapshot must match first");
+}
+
+#[test]
+fn dec_private_modes_round_trip_through_ansi_into_term() {
+    // F001: a ScreenSnapshot's DEC private mode flags must survive the
+    // snapshot_to_ansi -> feed-into-Term path. The encoder emits DECSET
+    // sequences for the enabled flags; the VTE processor must set the
+    // corresponding TermMode bits on a fresh Term.
+    use alacritty_terminal::term::TermMode;
+    use scribe_common::screen_replay::snapshot_to_ansi;
+
+    let mut snapshot = dummy_snapshot(80, 24);
+    // dummy_snapshot leaves active_dec_modes empty except alt_screen; enable the
+    // three under test and drop alt_screen so we exercise the main screen.
+    snapshot.alt_screen = false;
+    snapshot.active_dec_modes = vec![
+        DecPrivateMode::MouseReportClick, // DECSET 1000 -> MOUSE_REPORT_CLICK
+        DecPrivateMode::SgrMouse,         // DECSET 1006 -> SGR_MOUSE
+        DecPrivateMode::BracketedPaste,   // DECSET 2004 -> BRACKETED_PASTE
+        DecPrivateMode::AppCursor,        // DECCKM (\x1b[?1h) -> APP_CURSOR
+        DecPrivateMode::AppKeypad,        // DECPAM (\x1b=)    -> APP_KEYPAD
+    ];
+
+    let ansi = snapshot_to_ansi(&snapshot);
+    let term = term_with_bytes(&ansi, 80, 24);
+    let mode = term.mode();
+
+    assert!(
+        mode.contains(TermMode::MOUSE_REPORT_CLICK),
+        "restored Term must have MOUSE_REPORT_CLICK set from DECSET 1000"
+    );
+    assert!(
+        mode.contains(TermMode::SGR_MOUSE),
+        "restored Term must have SGR_MOUSE set from DECSET 1006"
+    );
+    assert!(
+        mode.contains(TermMode::BRACKETED_PASTE),
+        "restored Term must have BRACKETED_PASTE set from DECSET 2004"
+    );
+    // The two non-CSI escapes (DECCKM `\x1b[?1h`, DECPAM `\x1b=`) are verified
+    // via Term mode bits rather than a short raw-byte scan, since `\x1b=` has
+    // no disambiguating prefix and is collision-prone in a byte search.
+    assert!(
+        mode.contains(TermMode::APP_CURSOR),
+        "restored Term must have APP_CURSOR set from DECCKM"
+    );
+    assert!(
+        mode.contains(TermMode::APP_KEYPAD),
+        "restored Term must have APP_KEYPAD set from DECPAM"
+    );
+
+    // Cross-check via snapshot_term: re-snapshotting the restored Term must
+    // report the same flags, proving the full snapshot -> ANSI -> Term ->
+    // snapshot round-trip preserves DEC private modes.
+    let restored_snap = snapshot_term(&term);
+    assert!(
+        restored_snap.active_dec_modes.contains(&DecPrivateMode::MouseReportClick),
+        "round-trip lost mouse_report_click"
+    );
+    assert!(
+        restored_snap.active_dec_modes.contains(&DecPrivateMode::SgrMouse),
+        "round-trip lost sgr_mouse"
+    );
+    assert!(
+        restored_snap.active_dec_modes.contains(&DecPrivateMode::BracketedPaste),
+        "round-trip lost bracketed_paste"
+    );
+    assert!(
+        restored_snap.active_dec_modes.contains(&DecPrivateMode::AppCursor),
+        "round-trip lost app_cursor"
+    );
+    assert!(
+        restored_snap.active_dec_modes.contains(&DecPrivateMode::AppKeypad),
+        "round-trip lost app_keypad"
+    );
 }

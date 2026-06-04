@@ -277,7 +277,31 @@ Dropped files and directories are pasted into the focused shell using shell-awar
 
 ### Mouse Reporting
 
-When a terminal application enables mouse mode (SGR 1006 or X10), mouse events are encoded as escape sequences and forwarded to the PTY. Modifier keys are encoded in the xterm Cb field (Shift +1, Alt +2, Ctrl +4).
+When a terminal application enables mouse mode, button, motion, and scroll events are encoded as xterm escape sequences and forwarded to the PTY.
+
+Encoding lives in [[crates/scribe-client/src/mouse_reporting.rs]]; modifiers go in the Cb field (Shift +4, Alt +8, Ctrl +16) and SGR 1006 vs X10 is chosen per the terminal's `SGR_MOUSE` mode.
+
+#### Mode Gate
+
+The mouse-mode gate uses `intersects(MOUSE_MODE)`, not `contains`, because `contains` is always false for enabled mouse modes.
+
+`MOUSE_MODE` is a union of three bits (`MOUSE_REPORT_CLICK | MOUSE_MOTION | MOUSE_DRAG`) that alacritty stores mutually exclusively — each DECSET (1000/1002/1003) clears the union then sets exactly one bit, so requiring all three (`contains`) never matches.
+
+[[crates/scribe-client/src/pane.rs#Pane#has_mouse_mode]] and the wheel-handler mode read both use `intersects`. The other mode reads alongside it (`ALT_SCREEN`, `ALTERNATE_SCROLL`, `SGR_MOUSE`) are single-bit and keep `contains`.
+
+#### Held-Button Tracking And Motion De-Duplication
+
+App-forwarding is tracked separately from native selection so mouse-off behavior is unchanged: `mouse_selecting` still drives native click-drag selection, while `mouse_report_button` records the button currently forwarded to the app.
+
+Drag motion (mode 1002) gates on `mouse_report_button.is_some()`, and the reported Cb carries that exact button rather than a hardcoded Left.
+
+`mouse_report_button` is set when a press is forwarded. [[crates/scribe-client/src/main.rs#App#clear_mouse_report_state]] clears it (and `last_mouse_report_cell`) on **every physical button release** — left, middle, and right — even when the release itself could not be forwarded (mode disabled mid-drag, Shift held), so a button-up always ends a forwarded press.
+
+It is also cleared on **focus and pane transitions** via [[crates/scribe-client/src/main.rs#App#notify_focus_change]], the single chokepoint every pane/session/window focus path routes through. A press forwarded to the previously focused pane never sees its matching release, so dropping the tracked button here prevents phantom drag motion being reported to the newly focused pane or after the window regains focus.
+
+The motion gating and per-cell de-dup themselves live in the pure [[crates/scribe-client/src/mouse_reporting.rs#should_report_mouse_motion]]: it reports motion only when mode 1003 (`any_motion`) is set, or mode 1002 (`drag`) is set and a button is held, and only when the pointer has entered a different cell than `last_reported`. [[crates/scribe-client/src/main.rs#App#maybe_forward_mouse_motion]] supplies the live mode bits, the held-button flag, and `last_mouse_report_cell` to it.
+
+`last_mouse_report_cell` is intentionally seeded to the press cell when a press is forwarded (see [[crates/scribe-client/src/main.rs#App#finish_selection_mouse_press]] and the middle/right press arms). This deliberately suppresses the **first** same-cell motion event so the PTY is not flooded while the pointer sits on the press cell — matching alacritty's `cell_changed` semantics. It is not a bug: motion is reported only once the pointer crosses into a new cell.
 
 ### Resize Coordination
 
@@ -652,7 +676,7 @@ Extending `snapshot_to_ansi` to re-emit OSC 8 open/close around hyperlinked runs
 
 When copying from a supported AI coding session, [[crates/scribe-client/src/clipboard_cleanup.rs#prepare_copy_text]] applies dedent, blockquote normalization, decorative-prefix stripping, then unwrap.
 
-Copy actions decide whether cleanup is active through [[crates/scribe-client/src/main.rs#ai_provider_for_pane]], which accepts either tracker-detected AI state or an AI launch binding on the pane. This keeps cleanup enabled for newly opened Claude Code and Codex tabs before their first hook event arrives.
+Copy actions decide whether cleanup is active through [[crates/scribe-client/src/main.rs#copy_cleanup_active]], which requires both an AI provider — via [[crates/scribe-client/src/main.rs#ai_provider_for_pane]] (tracker-detected AI state or an AI launch binding on the pane) — and that the pane is **not** on the alternate screen. The provider check keeps cleanup enabled for newly opened Claude Code and Codex tabs before their first hook event arrives; the alternate-screen exclusion disables it for fullscreen TUIs (e.g. Claude Code's fullscreen renderer), whose grid is arbitrary content rather than AI-chat markdown, so a `Shift`-selected copy is taken raw instead of being mangled by the cleanup transforms.
 
 Dedent strips minimum shared leading whitespace. Blockquote normalization removes markdown `>` markers and the rendered `▎` gutter used by some AI UIs so quoted prose copies as plain text. Decorative-prefix stripping removes leading AI status glyphs such as `●` when followed by whitespace. Unwrap then joins hard-wrapped prose at auto-detected wrap width. When no dominant width is detected but at least one line exceeds 40 characters, [[crates/scribe-client/src/clipboard_cleanup.rs#join_non_break_runs]] joins consecutive non-break lines as a fallback. Structural breaks like bullets, headings, code blocks, and tables are preserved after quote markers and decorative prefixes are removed.
 

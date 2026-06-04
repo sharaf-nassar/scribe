@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
 use cosmic_text::{
-    Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent,
+    Attrs, Buffer, CacheKey, Fallback, Family, FontSystem, Metrics, PlatformFallback, Shaping,
+    SwashCache, SwashContent,
 };
+use unicode_script::Script;
 use wgpu::{
     Device, Extent3d, FilterMode, Origin3d, Queue, SamplerDescriptor, TexelCopyBufferLayout,
     TexelCopyTextureInfo, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat,
@@ -13,6 +15,24 @@ use crate::types::CellSize;
 
 /// Atlas texture size (width = height).
 const ATLAS_SIZE: u32 = 1024;
+
+const SCRIBE_COMMON_FALLBACKS: &[&str] = &[
+    "Symbols Nerd Font Mono",
+    "Symbols Nerd Font",
+    "Nerd Font Symbols Mono",
+    "Nerd Font Symbols",
+    "Noto Sans",
+    "DejaVu Sans",
+    "FreeSans",
+    "Noto Sans Mono",
+    "DejaVu Sans Mono",
+    "FreeMono",
+    "Noto Sans Symbols",
+    "Noto Sans Symbols2",
+    "Noto Color Emoji",
+];
+
+const SCRIBE_FORBIDDEN_FALLBACKS: &[&str] = &["Unifont Sample"];
 
 fn atlas_units_f32(units: u32) -> f32 {
     f32::from(u16::try_from(units).unwrap_or(u16::MAX))
@@ -139,6 +159,23 @@ pub struct FontParams {
     pub line_padding: u16,
 }
 
+#[derive(Debug)]
+struct ScribeFontFallback;
+
+impl Fallback for ScribeFontFallback {
+    fn common_fallback(&self) -> &[&'static str] {
+        SCRIBE_COMMON_FALLBACKS
+    }
+
+    fn forbidden_fallback(&self) -> &[&'static str] {
+        SCRIBE_FORBIDDEN_FALLBACKS
+    }
+
+    fn script_fallback(&self, script: Script, locale: &str) -> &[&'static str] {
+        <PlatformFallback as Fallback>::script_fallback(&PlatformFallback, script, locale)
+    }
+}
+
 /// Simple shelf-based rectangle packer.
 struct ShelfPacker {
     cursor_x: u32,
@@ -214,7 +251,7 @@ pub struct GlyphAtlas {
 impl GlyphAtlas {
     /// Create a new atlas with the given font parameters.
     pub fn new(device: &Device, queue: &Queue, params: &FontParams) -> Self {
-        let mut font_system = FontSystem::new();
+        let mut font_system = scribe_font_system();
         let swash_cache = SwashCache::new();
 
         // Validate the requested font family against fontdb; fall back to
@@ -717,6 +754,12 @@ impl GlyphAtlas {
 
         true
     }
+}
+
+fn scribe_font_system() -> FontSystem {
+    let base = FontSystem::new();
+    let (locale, db) = base.into_locale_and_db();
+    FontSystem::new_with_locale_and_db_and_fallback(locale, db, ScribeFontFallback)
 }
 
 /// Validate the font family name against the fontdb.

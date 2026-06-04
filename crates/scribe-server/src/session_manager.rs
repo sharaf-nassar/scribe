@@ -22,8 +22,8 @@ use scribe_common::error::ScribeError;
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{SessionContext, TerminalSize};
 use scribe_common::screen::{
-    CellFlags as ScreenCellFlags, CursorStyle as ScreenCursorStyle, ScreenCell, ScreenColor,
-    ScreenSnapshot,
+    CellFlags as ScreenCellFlags, CursorStyle as ScreenCursorStyle, DecPrivateMode, ScreenCell,
+    ScreenColor, ScreenSnapshot,
 };
 use scribe_common::socket::server_socket_path;
 use scribe_pty::async_fd::AsyncPtyFd;
@@ -826,7 +826,15 @@ pub fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
         (scrollback, history)
     };
 
-    tracing::debug!(cols, rows, alt_screen, scrollback_rows = history, "snapshot_term captured");
+    let restore_modes = active_dec_modes(*mode);
+    tracing::debug!(
+        cols,
+        rows,
+        alt_screen,
+        scrollback_rows = history,
+        ?restore_modes,
+        "snapshot_term captured"
+    );
 
     ScreenSnapshot {
         cells,
@@ -837,9 +845,37 @@ pub fn snapshot_term(term: &Term<ScribeEventListener>) -> ScreenSnapshot {
         cursor_style: convert_cursor_style(cursor_style),
         cursor_visible,
         alt_screen,
+        // Capture the DEC private modes so the client can re-emit them on
+        // reattach; otherwise a restored vim/tmux/Claude-Code session silently
+        // loses mouse reporting, bracketed paste, focus reporting, and app
+        // cursor/keypad.
+        active_dec_modes: restore_modes,
         scrollback,
         scrollback_rows: snapshot_u32(history),
     }
+}
+
+/// Map the enabled DEC private modes from a `Term`'s mode flags into the
+/// wire-side [`DecPrivateMode`] list restored on reattach.
+fn active_dec_modes(mode: alacritty_terminal::term::TermMode) -> Vec<DecPrivateMode> {
+    use DecPrivateMode as M;
+    use alacritty_terminal::term::TermMode;
+    [
+        (TermMode::MOUSE_REPORT_CLICK, M::MouseReportClick),
+        (TermMode::MOUSE_DRAG, M::MouseButtonEvent),
+        (TermMode::MOUSE_MOTION, M::MouseAnyMotion),
+        (TermMode::SGR_MOUSE, M::SgrMouse),
+        (TermMode::UTF8_MOUSE, M::Utf8Mouse),
+        (TermMode::ALTERNATE_SCROLL, M::AlternateScroll),
+        (TermMode::BRACKETED_PASTE, M::BracketedPaste),
+        (TermMode::FOCUS_IN_OUT, M::FocusEvent),
+        (TermMode::APP_CURSOR, M::AppCursor),
+        (TermMode::APP_KEYPAD, M::AppKeypad),
+    ]
+    .into_iter()
+    .filter(|(f, _)| mode.contains(*f))
+    .map(|(_, m)| m)
+    .collect()
 }
 
 /// Convert an `alacritty_terminal` `Cell` to our `ScreenCell` wire type.

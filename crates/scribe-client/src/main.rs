@@ -804,6 +804,12 @@ struct App {
     active_selection: Option<selection::SelectionRange>,
     /// Whether the left mouse button is currently held (for drag detection).
     mouse_selecting: bool,
+    /// Button currently forwarded to the focused pane's app while mouse mode is
+    /// active. Distinct from `mouse_selecting`, which drives native selection.
+    mouse_report_button: Option<winit::event::MouseButton>,
+    /// Last terminal cell reported to the app for mouse motion, used to suppress
+    /// duplicate per-cell motion events that would flood the PTY.
+    last_mouse_report_cell: Option<(u16, u16)>,
     /// Click state for single/double/triple click classification.
     mouse_click: mouse_state::MouseClickState,
     /// Compiled Smart Selection rules from the current global config.
@@ -1127,7 +1133,8 @@ impl App {
             config, theme, window: None, gpu: None, cmd_tx: None, window_layout,
             panes: HashMap::new(), session_to_pane: HashMap::new(), pending_sessions: VecDeque::new(),
             divider_drag: None, workspace_divider_drag: None, scrollbar_drag_pane: None,
-            active_selection: None, mouse_selecting: false, mouse_click: mouse_state::MouseClickState::new(),
+            active_selection: None, mouse_selecting: false, mouse_report_button: None,
+            last_mouse_report_cell: None, mouse_click: mouse_state::MouseClickState::new(),
             smart_selection, word_drag_anchor: None, line_drag_anchor: None,
             connection: AppConnectionState { server_connected: false, quit_restore_cleared: false },
             pending_shutdown: None, restore_store: restore_state::RestoreStore::new(), restore_save_pending: None,
@@ -6604,6 +6611,14 @@ impl App {
     /// the X11 active-window guard inside `refresh_ime_allowed` is
     /// `&mut self`.
     fn notify_focus_change(&mut self, gained: Option<SessionId>, lost: Option<SessionId>) {
+        // A pane/session focus transition (including window focus loss) orphans
+        // any in-flight mouse-report button: a press forwarded to the
+        // previously focused pane will never get its matching release here, so
+        // drop the tracked button to avoid phantom drag motion being reported
+        // to the newly focused pane or after the window regains focus. Cleared
+        // before the no-op guard so the reset is unconditional, like every
+        // release path.
+        self.clear_mouse_report_state();
         if gained.is_none() && lost.is_none() {
             return;
         }
@@ -7013,7 +7028,7 @@ impl App {
                 return;
             };
             let text = selection::extract_text(&pane.term, &sel);
-            let cleanup_active = ai_provider_for_pane(pane, &self.ai_tracker).is_some();
+            let cleanup_active = copy_cleanup_active(pane, &self.ai_tracker);
             (text, cleanup_active)
         };
 
@@ -7447,7 +7462,7 @@ impl App {
         let (mouse_mode, alt_screen, alt_scroll, sgr_mode) = {
             let Some(pane) = self.panes.get(&pane_id) else { return };
             (
-                pane.term.mode().contains(TermMode::MOUSE_MODE),
+                pane.term.mode().intersects(TermMode::MOUSE_MODE),
                 pane.term.mode().contains(TermMode::ALT_SCREEN),
                 pane.term.mode().contains(TermMode::ALTERNATE_SCROLL),
                 pane.term.mode().contains(TermMode::SGR_MOUSE),
@@ -7857,28 +7872,59 @@ impl App {
                 } else {
                     self.handle_mouse_release();
                 }
+                // A physical button-up always ends a forwarded press, even when
+                // the release itself could not be forwarded (mode disabled
+                // mid-drag, Shift held).
+                self.clear_mouse_report_state();
                 if had_ws_drag {
                     self.report_workspace_tree();
                 }
             }
             (MouseButton::Middle, ElementState::Pressed) => {
-                if !self.try_forward_mouse_press(MouseButton::Middle) {
+                if self.try_forward_mouse_press(MouseButton::Middle) {
+                    self.mouse_report_button = Some(MouseButton::Middle);
+                    self.last_mouse_report_cell = self.cursor_term_cell();
+                } else {
                     self.perform_primary_paste();
                 }
             }
             (MouseButton::Middle, ElementState::Released) => {
                 self.try_forward_mouse_release(MouseButton::Middle);
+                self.clear_mouse_report_state();
             }
             (MouseButton::Right, ElementState::Pressed) => {
-                if !self.try_forward_mouse_press(MouseButton::Right) {
+                if self.try_forward_mouse_press(MouseButton::Right) {
+                    self.mouse_report_button = Some(MouseButton::Right);
+                    self.last_mouse_report_cell = self.cursor_term_cell();
+                } else {
                     self.open_context_menu();
                 }
             }
             (MouseButton::Right, ElementState::Released) => {
                 self.try_forward_mouse_release(MouseButton::Right);
+                self.clear_mouse_report_state();
             }
             _ => {}
         }
+    }
+
+    /// Drop any in-flight mouse-report button tracking.
+    ///
+    /// Called on every physical button release and on focus transitions: a
+    /// press forwarded to a pane's app may never see its matching release here
+    /// (window/pane focus loss, or the app toggling mouse mode mid-drag), so
+    /// the tracked button must be cleared to avoid a stale button being
+    /// reported on later motion.
+    fn clear_mouse_report_state(&mut self) {
+        self.mouse_report_button = None;
+        self.last_mouse_report_cell = None;
+    }
+
+    /// The terminal cell currently under the pointer, if the cursor position is
+    /// known and maps into a pane's content area.
+    fn cursor_term_cell(&self) -> Option<(u16, u16)> {
+        let (x, y) = self.last_cursor_pos?;
+        self.pixel_to_term_cell(x, y)
     }
 
     /// Try to send a mouse button press to the focused pane's PTY.
@@ -8142,6 +8188,10 @@ impl App {
             return;
         }
         if self.try_forward_mouse_press(winit::event::MouseButton::Left) {
+            // Track the held button and seed the motion dedup cell so drag
+            // reporting (mode 1002) and per-cell de-duplication work.
+            self.mouse_report_button = Some(winit::event::MouseButton::Left);
+            self.last_mouse_report_cell = self.cursor_term_cell();
             return;
         }
         if self.modifiers.shift_key() && self.active_selection.is_some() {
@@ -8822,25 +8872,38 @@ impl App {
     ///
     /// Sends when:
     /// - `MOUSE_MOTION` (mode 1003) is set — all pointer movement is reported.
-    /// - `MOUSE_DRAG` (mode 1002) is set and a button is held (`mouse_selecting`).
-    fn maybe_forward_mouse_motion(&self, x: f32, y: f32) {
+    /// - `MOUSE_DRAG` (mode 1002) is set and a button is forwarded to the app.
+    ///
+    /// Per-cell de-duplication suppresses repeated reports for the same cell so
+    /// the PTY is not flooded as the pointer moves within one terminal cell.
+    fn maybe_forward_mouse_motion(&mut self, x: f32, y: f32) {
         use alacritty_terminal::term::TermMode;
-        let params = {
+        let (reporting, sgr) = {
             let Some(tab) = self.window_layout.active_tab() else { return };
             let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
             let mode = pane.term.mode();
-            let all_motion = mode.contains(TermMode::MOUSE_MOTION);
-            let drag_motion = mode.contains(TermMode::MOUSE_DRAG) && self.mouse_selecting;
-            if !all_motion && !drag_motion {
-                return;
-            }
-            let sgr = mode.contains(TermMode::SGR_MOUSE);
-            let button_held =
-                if self.mouse_selecting { Some(winit::event::MouseButton::Left) } else { None };
-            (sgr, button_held)
+            let reporting = if mode.contains(TermMode::MOUSE_MOTION) {
+                mouse_reporting::MotionReporting::Any
+            } else if mode.contains(TermMode::MOUSE_DRAG) {
+                mouse_reporting::MotionReporting::Drag
+            } else {
+                mouse_reporting::MotionReporting::None
+            };
+            (reporting, mode.contains(TermMode::SGR_MOUSE))
         };
-        let (sgr, button_held) = params;
+        let button_held = self.mouse_report_button;
         let Some((col, row)) = self.pixel_to_term_cell(x, y) else { return };
+        // Gate by mode (1000 = none, 1002 = held button, 1003 = all) and
+        // suppress motion that stays within the previously reported cell.
+        if !mouse_reporting::should_report_mouse_motion(
+            reporting,
+            button_held.is_some(),
+            (col, row),
+            self.last_mouse_report_cell,
+        ) {
+            return;
+        }
+        self.last_mouse_report_cell = Some((col, row));
         let mode = if sgr {
             mouse_reporting::MouseReportMode::Sgr
         } else {
@@ -9323,7 +9386,7 @@ impl App {
             let Some(tab) = self.window_layout.active_tab() else { return };
             let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
             let text = selection::extract_text(&pane.term, &sel);
-            let cleanup_active = ai_provider_for_pane(pane, &self.ai_tracker).is_some();
+            let cleanup_active = copy_cleanup_active(pane, &self.ai_tracker);
             (text, cleanup_active)
         };
         if raw.is_empty() {
@@ -12111,6 +12174,17 @@ fn ai_provider_for_pane(pane: &Pane, ai_tracker: &AiStateTracker) -> Option<AiPr
     })
 }
 
+// @lat: [[client#Client#Clipboard Cleanup]]
+/// Whether AI-session copy cleanup should apply to a copy from this pane.
+///
+/// Gated off on the alternate screen: a fullscreen TUI's grid is arbitrary
+/// content, not AI-chat markdown, so the cleanup transforms (dedent,
+/// decorative-prefix strip, unwrap) would mangle a `Shift`-selected copy.
+fn copy_cleanup_active(pane: &Pane, ai_tracker: &AiStateTracker) -> bool {
+    ai_provider_for_pane(pane, ai_tracker).is_some()
+        && !pane.term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12139,6 +12213,26 @@ mod tests {
         let tracker = AiStateTracker::default();
 
         assert_eq!(ai_provider_for_pane(&pane, &tracker), Some(AiProvider::CodexCode));
+    }
+
+    #[test]
+    fn copy_cleanup_disabled_on_alternate_screen() {
+        let mut pane = test_pane_with_launch_binding(restore_replay::new_ai_binding(
+            AiProvider::ClaudeCode,
+            restore_state::AiResumeMode::New,
+            None,
+            None,
+        ));
+        let tracker = AiStateTracker::default();
+        // AI session on the normal screen -> cleanup applies.
+        assert!(copy_cleanup_active(&pane, &tracker));
+        // Same AI session as a fullscreen (alternate-screen) TUI -> disabled,
+        // so a Shift-selected copy of the raw grid is not mangled.
+        pane.feed_output(b"\x1b[?1049h");
+        assert!(!copy_cleanup_active(&pane, &tracker));
+        // Leaving the alternate screen re-enables it.
+        pane.feed_output(b"\x1b[?1049l");
+        assert!(copy_cleanup_active(&pane, &tracker));
     }
 
     fn prompt_click_request(selection: PromptClickSelection) -> PromptClickToMoveRequest {

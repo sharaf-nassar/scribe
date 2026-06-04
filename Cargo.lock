@@ -4359,6 +4359,7 @@ dependencies = [
  "fontdb",
  "scribe-common",
  "tracing",
+ "unicode-script",
  "unicode-width",
  "wgpu",
 ]

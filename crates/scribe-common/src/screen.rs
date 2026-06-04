@@ -165,6 +165,41 @@ pub enum CursorStyle {
     HollowBlock,
 }
 
+/// A DEC private mode re-asserted on reattach so a TUI keeps its
+/// mouse/paste/focus/app-key behaviour after a session handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DecPrivateMode {
+    MouseReportClick,
+    MouseButtonEvent,
+    MouseAnyMotion,
+    SgrMouse,
+    Utf8Mouse,
+    AlternateScroll,
+    BracketedPaste,
+    FocusEvent,
+    AppCursor,
+    AppKeypad,
+}
+
+impl DecPrivateMode {
+    /// Escape sequence that re-enables this mode on the receiving Term.
+    #[must_use]
+    pub fn set_sequence(self) -> &'static str {
+        match self {
+            Self::MouseReportClick => "\x1b[?1000h",
+            Self::MouseButtonEvent => "\x1b[?1002h",
+            Self::MouseAnyMotion => "\x1b[?1003h",
+            Self::SgrMouse => "\x1b[?1006h",
+            Self::Utf8Mouse => "\x1b[?1005h",
+            Self::AlternateScroll => "\x1b[?1007h",
+            Self::BracketedPaste => "\x1b[?2004h",
+            Self::FocusEvent => "\x1b[?1004h",
+            Self::AppCursor => "\x1b[?1h",
+            Self::AppKeypad => "\x1b=",
+        }
+    }
+}
+
 /// A complete screen snapshot for IPC transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenSnapshot {
@@ -180,6 +215,9 @@ pub struct ScreenSnapshot {
     /// ANSI so that subsequent PTY output lands in the correct buffer.
     #[serde(default)]
     pub alt_screen: bool,
+    /// DEC private modes enabled on the source terminal, restored on reattach.
+    #[serde(default)]
+    pub active_dec_modes: Vec<DecPrivateMode>,
     /// Scrollback lines preceding the visible grid, ordered oldest-first.
     /// Each row contains `cols` cells, same as the visible grid.
     /// On reconnect the client feeds these before the visible content so

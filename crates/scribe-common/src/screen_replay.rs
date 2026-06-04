@@ -149,6 +149,13 @@ pub fn snapshot_to_ansi(snapshot: &ScreenSnapshot) -> Vec<u8> {
         buf.push_str("\x1b[?1049h");
     }
 
+    // Re-assert DEC private modes (mouse, bracketed paste, focus, app
+    // cursor/keypad) so a reattached TUI keeps them; these set Term modes
+    // without altering rendered content.
+    for mode in &snapshot.active_dec_modes {
+        buf.push_str(mode.set_sequence());
+    }
+
     // Hide cursor, move home, clear screen, reset attributes.
     buf.push_str("\x1b[?25l\x1b[H\x1b[2J\x1b[0m");
 
@@ -339,7 +346,9 @@ fn write_string(buf: &mut String, args: std::fmt::Arguments<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor, ScreenSnapshot};
+    use crate::screen::{
+        CellFlags, CursorStyle, DecPrivateMode, ScreenCell, ScreenColor, ScreenSnapshot,
+    };
 
     fn blank_cell() -> ScreenCell {
         ScreenCell {
@@ -369,6 +378,7 @@ mod tests {
             cursor_style: CursorStyle::Block,
             cursor_visible: true,
             alt_screen: false,
+            active_dec_modes: Vec::new(),
             scrollback: Vec::new(),
             scrollback_rows: 0,
         }
@@ -412,5 +422,66 @@ mod tests {
         assert!(matches!(replay.cursor_style, CursorStyle::Beam));
         assert!(replay.alt_screen);
         assert_eq!(replay.scrollback_rows, 7);
+    }
+
+    /// Returns true if `haystack` contains `needle` as a contiguous subslice.
+    fn contains_seq(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Every DEC-private-mode emission the encoder supports, paired with the
+    /// `ScreenSnapshot` flag that gates it. Exercised by the all-on / all-off
+    /// tests below so the full set stays covered.
+    const DEC_PRIVATE_MODE_SEQS: &[&[u8]] = &[
+        b"\x1b[?1000h", // mouse_report_click
+        b"\x1b[?1002h", // mouse_button_event
+        b"\x1b[?1003h", // mouse_any_motion
+        b"\x1b[?1006h", // sgr_mouse
+        b"\x1b[?1005h", // utf8_mouse
+        b"\x1b[?1007h", // alternate_scroll
+        b"\x1b[?2004h", // bracketed_paste
+        b"\x1b[?1004h", // focus_event
+        b"\x1b[?1h",    // app_cursor (DECCKM)
+        b"\x1b=",       // app_keypad (DECPAM)
+    ];
+
+    #[test]
+    fn snapshot_to_ansi_emits_enabled_dec_private_modes() {
+        let mut snapshot = snapshot_with_text("x");
+        // Enable ALL ten DEC private modes.
+        snapshot.active_dec_modes = vec![
+            DecPrivateMode::MouseReportClick,
+            DecPrivateMode::MouseButtonEvent,
+            DecPrivateMode::MouseAnyMotion,
+            DecPrivateMode::SgrMouse,
+            DecPrivateMode::Utf8Mouse,
+            DecPrivateMode::AlternateScroll,
+            DecPrivateMode::BracketedPaste,
+            DecPrivateMode::FocusEvent,
+            DecPrivateMode::AppCursor,
+            DecPrivateMode::AppKeypad,
+        ];
+
+        let ansi = snapshot_to_ansi(&snapshot);
+        for seq in DEC_PRIVATE_MODE_SEQS {
+            assert!(
+                contains_seq(&ansi, seq),
+                "expected DEC private mode sequence {seq:?} when its flag is set"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_to_ansi_omits_disabled_dec_private_modes() {
+        // Default helper leaves `active_dec_modes` empty.
+        let snapshot = snapshot_with_text("x");
+
+        let ansi = snapshot_to_ansi(&snapshot);
+        for seq in DEC_PRIVATE_MODE_SEQS {
+            assert!(
+                !contains_seq(&ansi, seq),
+                "unexpected DEC private mode sequence {seq:?} when all flags are false"
+            );
+        }
     }
 }

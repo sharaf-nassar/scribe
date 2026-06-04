@@ -390,7 +390,7 @@ impl Pane {
 
     /// Return `true` when the running application has requested mouse events.
     pub fn has_mouse_mode(&self) -> bool {
-        self.term.mode().contains(alacritty_terminal::term::TermMode::MOUSE_MODE)
+        self.term.mode().intersects(alacritty_terminal::term::TermMode::MOUSE_MODE)
     }
 
     /// Return the pixel offset where terminal content starts (below tab bar and prompt bar).
@@ -524,7 +524,52 @@ pub fn shift_absolute_marks_after_trim(
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandRecord, CommandStatus, shift_absolute_marks_after_trim};
+    use alacritty_terminal::term::TermMode;
+    use scribe_common::ids::{SessionId, WorkspaceId};
+    use scribe_renderer::types::GridSize;
+
+    use super::{
+        CommandRecord, CommandStatus, Pane, PaneLayoutState, shift_absolute_marks_after_trim,
+    };
+    use crate::layout::{PaneEdges, Rect};
+    use crate::restore_state::{LaunchBinding, LaunchKind};
+
+    /// Build a minimal 80x24 pane for terminal-mode assertions.
+    fn test_pane() -> Pane {
+        Pane::new(
+            PaneLayoutState {
+                rect: Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 },
+                grid: GridSize { cols: 80, rows: 24 },
+                edges: PaneEdges::all_external(),
+            },
+            SessionId::new(),
+            WorkspaceId::new(),
+            LaunchBinding { launch_id: String::new(), kind: LaunchKind::Shell, fallback_cwd: None },
+        )
+    }
+
+    /// Regression: alacritty stores the three mouse-mode bits mutually
+    /// exclusively (each DECSET clears `MOUSE_MODE` then sets ONE bit), so
+    /// `.contains(MOUSE_MODE)` is always false. Enabling any single mouse mode
+    /// must register as mouse mode via `intersects` / `has_mouse_mode`.
+    #[test]
+    fn single_mouse_mode_enable_is_recognized() {
+        // `has_mouse_mode` must mirror `intersects(MOUSE_MODE)` and recognize
+        // any single mouse tracking mode being enabled.
+        fn mouse_mode_after(seq: &[u8]) -> bool {
+            let mut pane = test_pane();
+            pane.feed_output(seq);
+            assert_eq!(pane.has_mouse_mode(), pane.term.mode().intersects(TermMode::MOUSE_MODE));
+            pane.has_mouse_mode()
+        }
+
+        // Modes 1000 / 1002 / 1003 each set a single bit and must register.
+        assert!(mouse_mode_after(b"\x1b[?1000h"));
+        assert!(mouse_mode_after(b"\x1b[?1002h"));
+        assert!(mouse_mode_after(b"\x1b[?1003h"));
+        // Disabling the mode clears it again.
+        assert!(!mouse_mode_after(b"\x1b[?1000h\x1b[?1000l"));
+    }
 
     /// Build records at the given absolute positions with `Unknown` status.
     fn recs(positions: &[usize]) -> Vec<CommandRecord> {
