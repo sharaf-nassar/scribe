@@ -1,25 +1,18 @@
 <!--
 Sync Impact Report
-Version change: unversioned template -> 1.0.0
-Modified principles:
-- Placeholder principle 1 -> I. Code Quality and Clear Boundaries
-- Placeholder principle 2 -> II. Explicit, Risk-Based Testing
-- Placeholder principle 3 -> III. Consistent User Experience
-- Placeholder principle 4 -> IV. Performance Budgets and Measurement
+Version change: 1.0.0 -> 1.1.0
+Modified principles: none reworded
 Added sections:
-- Engineering Constraints
-- Development Workflow
-Removed sections:
-- Placeholder principle 5
-- Template placeholder guidance comments
+- V. Security and Trust Boundaries
+- VI. Local-First Data Locality
+Removed sections: none
 Templates requiring updates:
-- ✅ updated: .specify/templates/plan-template.md
-- ✅ updated: .specify/templates/spec-template.md
-- ✅ updated: .specify/templates/tasks-template.md
-- ✅ checked: .specify/templates/commands/*.md (no command templates present)
+- ✅ no change needed: .specify/templates/plan-template.md (Constitution Check derives gates from this file)
+- ✅ no change needed: .specify/templates/spec-template.md (no enumerated principle list)
+- ✅ no change needed: .specify/templates/tasks-template.md (no enumerated principle list)
 - ✅ checked: README.md, AGENTS.md, CLAUDE.md (no principle references to change)
-- ✅ updated: specs/002-smart-selection/plan.md
-Follow-up TODOs: None
+Follow-up TODOs:
+- Add lat.md design-intent sections for the local voice engine and the OSC 52 / paste policy surface so Principles V and VI trace to documented architecture.
 -->
 # Scribe Constitution
 
@@ -68,6 +61,36 @@ check the stated budget.
 
 Rationale: Terminal latency, frame stability, and upgrade behavior are product
 requirements, not polish. Regressions are visible immediately during normal use.
+
+### V. Security and Trust Boundaries
+PTY-side programs are untrusted. Any escape sequence or terminal capability that
+can move data to the host, inject input, or trigger a host action — clipboard
+access (OSC 52), hyperlink and URL opening (OSC 8), paste injection, and
+equivalents — MUST be gated behind explicit policy and, for risky operations,
+user confirmation. Capabilities that can exfiltrate or inject MUST default to
+the safe posture (off or deny) and act only after the configured policy or a
+confirmation dialog approves them. New escape-sequence or capability handling
+MUST classify whether the sequence can exfiltrate, inject, or invoke a host
+action and route privileged cases through the existing confirmation/policy
+path; confirmation chrome MUST stay consistent with the established dialogs.
+
+Rationale: A terminal renders output from arbitrary, possibly hostile,
+programs. Silent clipboard reads, auto-opened URLs, and injected pastes are
+real attack vectors, so privileged terminal capabilities must be deliberate,
+visible, and default-safe.
+
+### VI. Local-First Data Locality
+Core terminal operation and on-device AI features MUST function without network
+access. Speech and other AI processing run locally through the vendored engines
+(for example `pocket-tts` and `sherpa-onnx`); models are fetched once and
+inference stays on-device. Any network access — auto-update checks, the release
+catalog, and equivalents — MUST be user-configurable and MUST NOT be required
+for core terminal or AI functionality. Terminal contents and captured
+microphone audio MUST NOT leave the device unless the user explicitly opts in.
+
+Rationale: Scribe is a daily-use terminal that handles sensitive command output
+and, with voice enabled, microphone audio. Local-by-default processing protects
+that data and keeps the terminal fully usable offline.
 
 ## Engineering Constraints
 
@@ -120,4 +143,4 @@ with the current constitution. Violations are allowed only when documented in
 Complexity Tracking with the reason, rejected simpler alternative, mitigation,
 and user-visible impact.
 
-**Version**: 1.0.0 | **Ratified**: 2026-05-15 | **Last Amended**: 2026-05-15
+**Version**: 1.1.0 | **Ratified**: 2026-05-15 | **Last Amended**: 2026-06-16
