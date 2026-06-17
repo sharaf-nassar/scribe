@@ -108,6 +108,6 @@ The second example is invalid because `Bad Section` has no leading paragraph. `l
 
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
-shell commands, and other important information, read
-`specs/008-ime-composition/plan.md`
+shell commands, and other important information, read the current plan
+at specs/012-local-voice/plan.md
 <!-- SPECKIT END -->
