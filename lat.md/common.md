@@ -48,6 +48,8 @@ Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto
 
 `scroll_pin` (bool, default `false`) enables split-scroll in AI panes, but only while the pane is in the normal screen buffer; alternate-screen TUIs fall back to the regular live view. `preserve_ai_scrollback` (bool, default `true`) strips AI-session `CSI 3 J` scrollback clears, resets its trim epoch on prompt/attention boundaries, captures the epoch baseline after the first filtered redraw, and trims later redraw clears back to that baseline so committed transcript history survives without duplicate inline frames piling up.
 
+`ai_tab_cwd` ([[crates/scribe-common/src/config.rs#AiTabCwd]]: `pane` (default) or `project_root`) controls where a newly opened Claude/Codex AI tab starts: `pane` inherits the focused pane's CWD like a plain new tab, while `project_root` anchors to the workspace project root when the pane is inside a configured workspace root.
+
 Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (f32, 8–32, default 14), `prompt_bar_position` ([[crates/scribe-common/src/config.rs#PromptBarPosition]]: Top or Bottom), and optional row-surface overrides for the first row, second row, text, first icon, and latest icon.
 
 [[crates/scribe-common/src/config.rs#StatusBarStatsConfig]] independently toggles CPU, memory, GPU, and network display. [[crates/scribe-common/src/config.rs#ShellIntegrationConfig]] wraps a single `enabled` flag for shell prompt marks. [[crates/scribe-common/src/config.rs#TerminalConfig#ai_provider_enabled]] maps an [[crates/scribe-common/src/ai_state.rs#AiProvider]] to the matching integration toggle.

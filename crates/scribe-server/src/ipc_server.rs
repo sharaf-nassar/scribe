@@ -2642,8 +2642,97 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
     feed_term(&state.term, &mut state.ansi_processor, effective.as_ref()).await;
     maybe_capture_preserved_ai_scrollback_baseline(state).await;
 
+    // Step 2b: a prompt returning while mouse-reporting modes are still
+    // active means the foreground program died without cleanup (e.g. a
+    // force-closed SSH session whose remote TUI never sent DECRST) —
+    // inject the reset so client Terms, this Term, and future replay
+    // snapshots all clear together.
+    clear_stale_mouse_modes_at_prompt(state).await;
+
     // Steps 3–5: Metadata uses original bytes (OSC parser doesn't care about CSI ED 3).
     process_metadata_events(state).await;
+}
+
+/// Reset mouse-reporting / focus-event modes left enabled when a shell
+/// prompt returns (OSC 133 `A`), i.e. the foreground program exited or
+/// died without cleaning up. Stale modes turn every mouse movement into
+/// `\x1b[<…M` reports that the shell merely echoes as garbage until the
+/// user runs `reset`; because the modes also live in this Term they would
+/// otherwise even survive reattach via `SessionReplay`.
+///
+/// The DECRST bytes are injected into both consumers of the output
+/// stream — the server Term (mode source for replay snapshots) and the
+/// client-bound `PtyOutput` path (every attached client's Term parses
+/// them and stops forwarding mouse events).
+async fn clear_stale_mouse_modes_at_prompt(state: &mut PtyReaderState) {
+    if !prompt_returned_without_new_command(&state.osc_events) {
+        return;
+    }
+    let resets = {
+        let term_guard = state.term.lock().await;
+        stale_mouse_mode_resets(*term_guard.mode())
+    };
+    let Some(resets) = resets else { return };
+    debug!(
+        session_id = %state.session_id,
+        "prompt returned with mouse-reporting modes active; injecting DECRST"
+    );
+    feed_term(&state.term, &mut state.ansi_processor, &resets).await;
+    send_pty_output(&state.client_writer, state.session_id, &resets).await;
+}
+
+/// `true` when the chunk contains a shell `PromptStart` mark with no
+/// `CommandStart` after it.
+///
+/// The trailing-`CommandStart` guard covers type-ahead: when the user has
+/// already typed the next command before the prompt rendered, one PTY
+/// chunk can carry `133;A … 133;C` plus the new program's own DECSET —
+/// resetting then would break the program that just legitimately enabled
+/// mouse reporting.
+fn prompt_returned_without_new_command(events: &[MetadataEvent]) -> bool {
+    let last_prompt_start = events.iter().rposition(|event| {
+        matches!(event, MetadataEvent::PromptMark { kind: PromptMarkKind::PromptStart, .. })
+    });
+    let Some(idx) = last_prompt_start else {
+        return false;
+    };
+    !events.get(idx..).unwrap_or(&[]).iter().any(|event| {
+        matches!(event, MetadataEvent::PromptMark { kind: PromptMarkKind::CommandStart, .. })
+    })
+}
+
+/// Build the DECRST byte sequence clearing whichever mouse-reporting and
+/// focus-event modes are active, or `None` when none are.
+///
+/// Scope is exactly the garbage-producing set: the mouse protocols
+/// (1000/1002/1003), their encodings (1005/1006), and focus events
+/// (1004). Bracketed paste and application cursor/keypad are deliberately
+/// untouched — shells legitimately manage those across prompts.
+fn stale_mouse_mode_resets(mode: alacritty_terminal::term::TermMode) -> Option<Vec<u8>> {
+    use alacritty_terminal::term::TermMode;
+
+    const MODES: &[(TermMode, u16)] = &[
+        (TermMode::MOUSE_REPORT_CLICK, 1000),
+        (TermMode::MOUSE_DRAG, 1002),
+        (TermMode::MOUSE_MOTION, 1003),
+        (TermMode::FOCUS_IN_OUT, 1004),
+        (TermMode::UTF8_MOUSE, 1005),
+        (TermMode::SGR_MOUSE, 1006),
+    ];
+
+    // Fire only when a report-generating mode is on; a lingering encoding
+    // bit (1005/1006) alone emits nothing and is not worth a reset.
+    if !mode.intersects(TermMode::MOUSE_MODE.union(TermMode::FOCUS_IN_OUT)) {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    for (bit, param) in MODES {
+        if mode.contains(*bit) {
+            bytes.extend_from_slice(format!("\x1b[?{param}l").as_bytes());
+        }
+    }
+    (!bytes.is_empty()).then_some(bytes)
 }
 
 fn apply_pty_filters<'a>(state: &mut PtyReaderState, bytes: &'a [u8]) -> Cow<'a, [u8]> {
