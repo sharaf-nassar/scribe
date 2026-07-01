@@ -6712,9 +6712,16 @@ impl App {
         vec![shell, String::from("-lic"), command]
     }
 
-    /// Return the focused workspace's project root, if the workspace is named
-    /// (i.e. the CWD matched a configured workspace root).
-    fn focused_workspace_project_root(&self) -> Option<std::path::PathBuf> {
+    /// CWD override for a newly opened AI tab.
+    ///
+    /// Returns the focused workspace's project root only when
+    /// `terminal.ai_tab_cwd = project_root` and the workspace is named;
+    /// otherwise `None`, so the tab inherits the focused pane's CWD like a
+    /// plain new tab.
+    fn ai_tab_cwd_override(&self) -> Option<std::path::PathBuf> {
+        if self.config.terminal.ai_tab_cwd != scribe_common::config::AiTabCwd::ProjectRoot {
+            return None;
+        }
         self.window_layout.focused_workspace().and_then(|ws| ws.project_root.clone())
     }
 
@@ -6724,28 +6731,28 @@ impl App {
         // with a minimal service environment, so `-l`/`-i` ensure PATH
         // additions from shell startup files are available before `exec`.
         //
-        // When inside a workspace, start at the project root rather than
-        // inheriting the current tab's CWD.
-        let project_root = self.focused_workspace_project_root();
+        // CWD follows `terminal.ai_tab_cwd`: inherit the focused pane's CWD
+        // by default, or anchor to the workspace project root when configured.
+        let cwd_override = self.ai_tab_cwd_override();
         self.create_new_tab(
             Some(Self::ai_tab_command(AiProvider::ClaudeCode, false)),
-            project_root,
+            cwd_override,
         );
     }
 
     fn handle_new_claude_resume_tab(&mut self) {
-        let project_root = self.focused_workspace_project_root();
-        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::ClaudeCode, true)), project_root);
+        let cwd_override = self.ai_tab_cwd_override();
+        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::ClaudeCode, true)), cwd_override);
     }
 
     fn handle_new_codex_tab(&mut self) {
-        let project_root = self.focused_workspace_project_root();
-        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::CodexCode, false)), project_root);
+        let cwd_override = self.ai_tab_cwd_override();
+        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::CodexCode, false)), cwd_override);
     }
 
     fn handle_new_codex_resume_tab(&mut self) {
-        let project_root = self.focused_workspace_project_root();
-        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::CodexCode, true)), project_root);
+        let cwd_override = self.ai_tab_cwd_override();
+        self.create_new_tab(Some(Self::ai_tab_command(AiProvider::CodexCode, true)), cwd_override);
     }
 
     fn launch_binding_for_command(
@@ -13860,14 +13867,7 @@ fn hovered_url_at(
     let pane = panes.get(&pane_id)?;
     let cache = url_caches.get_mut(&pane_id)?;
     cache.refresh(&pane.term);
-    cache.url_at(point.row, point.col).map(|span| url_detect::UrlSpan {
-        row: span.row,
-        col_start: span.col_start,
-        row_end: span.row_end,
-        col_end: span.col_end,
-        url: span.url.clone(),
-        kind: span.kind,
-    })
+    cache.url_at(point.row, point.col).cloned()
 }
 
 /// Truncate an OSC 8 URI for tooltip display to the pane's column width
@@ -13997,27 +13997,20 @@ fn apply_url_underlines(
         return;
     };
 
-    let last_col = pane.term.grid().columns().saturating_sub(1);
-    let mut row = span.row;
-    while row <= span.row_end {
-        let screen_row = row + display_offset;
+    for seg in &span.segments {
+        let screen_row = seg.row + display_offset;
         if screen_row < 0 {
-            row = row.saturating_add(1);
             continue;
         }
-        let col_start = if row == span.row { span.col_start } else { 0 };
-        let col_end = if row == span.row_end { span.col_end } else { last_col };
-        if col_start > col_end {
-            row = row.saturating_add(1);
+        if seg.col_start > seg.col_end {
             continue;
         }
         let Some(screen_row_f) = nonnegative_i32_to_f32(screen_row) else {
-            row = row.saturating_add(1);
             continue;
         };
         let y_top = offset.1 + screen_row_f * cell_h + cell_h - ul_h;
-        let span_cols = usize_to_f32(col_end - col_start + 1);
-        let col_x = usize_to_f32(col_start);
+        let span_cols = usize_to_f32(seg.col_end - seg.col_start + 1);
+        let col_x = usize_to_f32(seg.col_start);
         let x = offset.0 + col_x * cell_w;
 
         instances.push(scribe_renderer::types::CellInstance {
@@ -14029,7 +14022,6 @@ fn apply_url_underlines(
             bg_color: URL_UNDERLINE_ACTIVE_COLOR,
             corner_radius: 0.0,
         });
-        row = row.saturating_add(1);
     }
 }
 

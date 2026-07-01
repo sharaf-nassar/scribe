@@ -1981,6 +1981,7 @@ function loadConfig(config) {
   setToggleValue("terminal.claude_code_integration", config.terminal?.claude_code_integration);
   setToggleValue("terminal.codex_code_integration", config.terminal?.codex_code_integration);
   setToggleValue("terminal.preserve_ai_scrollback", config.terminal?.preserve_ai_scrollback);
+  setSegmentedValue("terminal.ai_tab_cwd", config.terminal?.ai_tab_cwd || "pane");
   setToggleValue("terminal.prompt_bar", config.terminal?.prompt_bar);
   setToggleValue("terminal.scroll_pin", config.terminal?.scroll_pin);
   setSegmentedValue("terminal.prompt_bar_position", config.terminal?.prompt_bar_position || "top");

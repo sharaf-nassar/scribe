@@ -249,7 +249,7 @@ Numeric-keypad keys (`KeyLocation::Numpad`) emit SS3 sequences when DECPAM is ac
 
 Over 50 variants in the `LayoutAction` enum covering pane, workspace, and tab management, clipboard, scrolling, zoom, and more.
 
-Tab actions: new, Claude Code new/resume, Codex new/resume, close, next, prev, select 1-9. The legacy `new_claude_*` action names remain in config and code and map to Claude Code, while `new_codex_*` opens Codex. Those AI-tab shortcuts start the selected CLI through the user's login shell with `-lic` and `exec`, resolving the shell from `SHELL` first and then the account database so Finder-launched macOS apps still inherit the expected PATH and rc files without first rendering a normal shell prompt. Also: pane splits, pane focus/cycling, workspace splits/cycling, copy, paste, settings, find, zoom, equalize, prompt-jump up/down, and jump-to-failure (scroll to the most recent failed command; when no failed command exists, `signal_no_failed_command` instead fires a non-disruptive scrollbar pulse plus a brief focused-pane tab flash and leaves the viewport unchanged).
+Tab actions: new, Claude Code new/resume, Codex new/resume, close, next, prev, select 1-9. The legacy `new_claude_*` action names remain in config and code and map to Claude Code, while `new_codex_*` opens Codex. Those AI-tab shortcuts start the selected CLI through the user's login shell with `-lic` and `exec`, resolving the shell from `SHELL` first and then the account database so Finder-launched macOS apps still inherit the expected PATH and rc files without first rendering a normal shell prompt. Their working directory follows the `terminal.ai_tab_cwd` setting: the default `pane` inherits the focused pane's CWD like a plain new tab, while `project_root` anchors to the workspace project root when the pane is inside a configured workspace root. Also: pane splits, pane focus/cycling, workspace splits/cycling, copy, paste, settings, find, zoom, equalize, prompt-jump up/down, and jump-to-failure (scroll to the most recent failed command; when no failed command exists, `signal_no_failed_command` instead fires a non-disruptive scrollbar pulse plus a brief focused-pane tab flash and leaves the viewport unchanged).
 
 ### Command Palette
 
@@ -280,6 +280,8 @@ Dropped files and directories are pasted into the focused shell using shell-awar
 When a terminal application enables mouse mode, button, motion, and scroll events are encoded as xterm escape sequences and forwarded to the PTY.
 
 Encoding lives in [[crates/scribe-client/src/mouse_reporting.rs]]; modifiers go in the Cb field (Shift +4, Alt +8, Ctrl +16) and SGR 1006 vs X10 is chosen per the terminal's `SGR_MOUSE` mode.
+
+Stale mouse modes left behind by a dead foreground program (force-closed SSH, killed TUI) are cleared server-side when the shell prompt returns — the client needs no special handling because the injected DECRST arrives through the normal `PtyOutput` stream; see [[server#Sessions#PTY Reader Task]].
 
 #### Mode Gate
 
@@ -616,7 +618,21 @@ The [[crates/scribe-client/src/url_detect.rs#PaneUrlCache]] scans visible termin
 
 Soft-wrapped rows are joined by `WRAPLINE` before scanning so a link split across terminal rows remains one clickable span. Trailing punctuation is stripped respecting bracket pairs. Detected spans are cached and invalidated on content change. Each span carries a `SpanKind` (`Osc8Hyperlink`, `Url`, or `Path`). OSC 8 hyperlinks take precedence over heuristic URL/path detection on overlapping cells (see [[client#URL Detection#Explicit Hyperlinks]] below).
 
-URL highlighting and the pointer cursor are only shown while the Ctrl modifier is held. The `ModifiersChanged` handler triggers a redraw and cursor update so visual feedback is immediate. Only the clickable span under the cursor is underlined; wrapped spans draw one underline segment per row. Ctrl+click opens the span via `xdg-open` on Linux or `open` on macOS. File paths support an optional `:N` line-number suffix; when present, `code --goto path:N` is tried first and `xdg-open` is the fallback. Relative paths are resolved against the pane's OSC 7 CWD, and `~/` is expanded using `$HOME`.
+Every span also carries exact per-row geometry as [[crates/scribe-client/src/url_detect.rs#RowSegment]]s — spans are not rectangles, because a hard-break continuation row starts at its indent rather than column 0. Hit-testing (`contains_cell`) and the hover underline both consume segments; the bounding `row`/`col_start`/`row_end`/`col_end` fields remain for identity comparison and ordering.
+
+URL highlighting and the pointer cursor are only shown while the Ctrl modifier is held. The `ModifiersChanged` handler triggers a redraw and cursor update so visual feedback is immediate. Only the clickable span under the cursor is underlined; wrapped spans draw one underline segment per row (one quad per `RowSegment`). Ctrl+click opens the span via `xdg-open` on Linux or `open` on macOS. File paths support an optional `:N` line-number suffix; when present, `code --goto path:N` is tried first and `xdg-open` is the fallback. Relative paths are resolved against the pane's OSC 7 CWD, and `~/` is expanded using `$HOME`.
+
+### Hard-Break Continuation
+
+Joining a URL split by a program-side line break, where no `WRAPLINE` flag connects the rows and the logical-line join cannot fire.
+
+Programs that lay out their own text (Claude Code's Ink renderer, pagers, shell line editors) hard-wrap long URLs with an explicit newline instead of letting the terminal soft-wrap, so without this pass the URL is detected truncated at the break.
+
+The URL scanner joins across hard breaks: whenever a heuristic URL match is the last content on its row (only blank filler follows it to the end of the logical line), [[crates/scribe-client/src/url_detect.rs#extend_url_across_hard_breaks]] fetches the logical line below and consults [[crates/scribe-client/src/url_detect.rs#hard_break_continuation_start]] — the join policy — with a `HardBreakContext` (the break column vs the grid's last column, the broken row's cells, and the full next line). The policy returns the column where the URL body resumes (cells before it, e.g. a program-drawn gutter indent, stay outside the span) or `None` to refuse. Joins are capped at `MAX_HARD_JOIN_ROWS` explicit breaks; soft-wrapped rows inside a continuation line do not count against the cap. A continuation never absorbs cells covered by an OSC 8 span (FR-004) — the appended run is cut at the first such cell.
+
+The policy is modelled on kitty, the only major terminal that bridges hard breaks by default (its `url_excluded_characters` docs allow newlines "to accommodate programs such as mutt"; mid-row breaks were declined in kitty#2927): a break is bridged only when the URL ran **exactly to the terminal edge** and the next row resumes with URL characters at column 0. iTerm2 offers the same behaviour opt-in (`ignoreHardNewlinesInURLs`, default off); Alacritty, WezTerm, VTE/GNOME Terminal, Windows Terminal, and Konsole all treat a hard end-of-line as an absolute barrier (their search haystacks insert `\n` exactly at non-wrapped row ends), with OSC 8 as the ecosystem's sanctioned producer-side fix. Scribe extends the kitty rule in two guarded directions: a continuation behind a program-drawn gutter (e.g. Claude Code's banner bar `▏ `) is accepted when the broken row carries the identical gutter run ([[crates/scribe-client/src/url_detect.rs#matching_gutter_len]]), and a next row that starts its own scheme prefix is a new link, never a continuation. The admitted false-positive class — a flush-to-edge URL followed by a column-0 word joins — is exactly kitty's default behaviour; kitty's opt-out precedent (`url_excluded_characters "\n"`) is the model if a config toggle is ever wanted.
+
+Cells consumed as continuation tails are masked from later line scans ([[crates/scribe-client/src/url_detect.rs#cell_in_existing_span]]) so a joined tail such as `articles/15424964` is not re-matched as a fresh bare path on its own row.
 
 ### Explicit Hyperlinks
 

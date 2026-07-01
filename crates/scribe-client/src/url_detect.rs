@@ -25,7 +25,24 @@ pub enum SpanKind {
     Path,
 }
 
+/// Inclusive column range a span occupies on one grid row.
+///
+/// Spans are not rectangles: a hard-break continuation row starts at the
+/// continuation indent (e.g. after a program-drawn gutter), not column 0,
+/// so hit-testing and underline drawing consume these per-row segments
+/// instead of deriving geometry from the span's bounding fields.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RowSegment {
+    /// Absolute grid row (0 = viewport top, negative = scrollback).
+    pub row: i32,
+    /// Column of the first span cell on this row (inclusive).
+    pub col_start: usize,
+    /// Column of the last span cell on this row (inclusive).
+    pub col_end: usize,
+}
+
 /// A URL or file path found on the terminal grid.
+#[derive(Clone)]
 pub struct UrlSpan {
     /// Absolute grid row (0 = viewport top, negative = scrollback).
     pub row: i32,
@@ -39,6 +56,9 @@ pub struct UrlSpan {
     pub url: String,
     /// Whether this span is a URL or a file path.
     pub kind: SpanKind,
+    /// Exact per-row cell coverage; `row`/`col_start`/`row_end`/`col_end`
+    /// remain the bounding endpoints for identity comparison and ordering.
+    pub segments: Vec<RowSegment>,
 }
 
 /// Per-pane cache of detected URL spans.
@@ -96,24 +116,51 @@ impl PaneUrlCache {
 
 impl UrlSpan {
     fn contains_cell(&self, row: i32, col: usize) -> bool {
-        if row < self.row || row > self.row_end {
-            return false;
-        }
-
-        if self.row == self.row_end {
-            return col >= self.col_start && col <= self.col_end;
-        }
-
-        if row == self.row {
-            return col >= self.col_start;
-        }
-
-        if row == self.row_end {
-            return col <= self.col_end;
-        }
-
-        true
+        self.segments.iter().any(|seg| seg.row == row && col >= seg.col_start && col <= seg.col_end)
     }
+}
+
+/// Collapse an ordered run of matched logical cells into per-row segments.
+///
+/// Cells arrive in scan order (columns ascending within a row), so a new
+/// segment starts whenever the row changes or a column gap appears.
+fn segments_from_cells(cells: &[LogicalCell]) -> Vec<RowSegment> {
+    let mut segments: Vec<RowSegment> = Vec::new();
+    for cell in cells {
+        if let Some(seg) = segments.last_mut() {
+            if seg.row == cell.row && cell.col == seg.col_end.saturating_add(1) {
+                seg.col_end = cell.col;
+                continue;
+            }
+        }
+        segments.push(RowSegment { row: cell.row, col_start: cell.col, col_end: cell.col });
+    }
+    segments
+}
+
+/// Expand an inclusive cell rectangle (first row from `col_start`, middle
+/// rows full width, last row up to `col_end`) into per-row segments.
+///
+/// Used for OSC 8 spans, whose row-major cell walk guarantees full
+/// coverage of every intermediate row.
+fn rect_segments(
+    row_start: i32,
+    col_start: usize,
+    row_end: i32,
+    col_end: usize,
+    last_col: usize,
+) -> Vec<RowSegment> {
+    let mut segments = Vec::new();
+    let mut row = row_start;
+    while row <= row_end {
+        let seg_start = if row == row_start { col_start } else { 0 };
+        let seg_end = if row == row_end { col_end } else { last_col };
+        if seg_start <= seg_end {
+            segments.push(RowSegment { row, col_start: seg_start, col_end: seg_end });
+        }
+        row = row.saturating_add(1);
+    }
+    segments
 }
 
 /// URL schemes recognised by the scanner.
@@ -205,11 +252,12 @@ fn scan_visible_urls(term: &Term<VoidListener>) -> Vec<UrlSpan> {
 
     // Pass 2: heuristic URL + path detection, skipping cells already
     // covered by an OSC 8 span.
+    let continuation = ContinuationCtx { term, rows, cols, display_offset };
     let mut screen_row: usize = 0;
     while screen_row < rows {
         let logical_line =
             collect_wrapped_logical_line(term, screen_row, rows, cols, display_offset);
-        let url_ranges = scan_logical_urls(&logical_line, &osc8_ranges, &mut spans);
+        let url_ranges = scan_logical_urls(&logical_line, &osc8_ranges, &continuation, &mut spans);
         scan_logical_paths(&logical_line, &url_ranges, &osc8_ranges, &mut spans);
 
         screen_row = logical_line.last().map_or(screen_row.saturating_add(1), |cell| {
@@ -268,6 +316,7 @@ impl Osc8CellRange {
 fn scan_osc8_hyperlinks(term: &Term<VoidListener>, out: &mut Vec<UrlSpan>) -> Vec<Osc8CellRange> {
     let mut ranges = Vec::new();
     let mut active: Option<(Hyperlink, i32, usize, i32, usize)> = None;
+    let last_col = term.grid().columns().saturating_sub(1);
 
     // `display_iter()` yields cells in row-major order across the visible
     // grid. `point.line.0` carries the same `Line(screen_row -
@@ -276,7 +325,7 @@ fn scan_osc8_hyperlinks(term: &Term<VoidListener>, out: &mut Vec<UrlSpan>) -> Ve
     // needed here.
     let iter = term.grid().display_iter();
     {
-        let mut sink = Osc8WalkSink { active: &mut active, out, ranges: &mut ranges };
+        let mut sink = Osc8WalkSink { active: &mut active, out, ranges: &mut ranges, last_col };
         for indexed in iter {
             let point: Point = indexed.point;
             let row_for_span = point.line.0;
@@ -285,7 +334,7 @@ fn scan_osc8_hyperlinks(term: &Term<VoidListener>, out: &mut Vec<UrlSpan>) -> Ve
             process_osc8_cell(&mut sink, cell_link, row_for_span, col_for_span);
         }
     }
-    flush_osc8_span(&mut active, out, &mut ranges);
+    flush_osc8_span(&mut active, out, &mut ranges, last_col);
     tracing::trace!(span_count = ranges.len(), "osc8: scan_visible_urls");
     ranges
 }
@@ -297,6 +346,9 @@ struct Osc8WalkSink<'a> {
     active: &'a mut Option<(Hyperlink, i32, usize, i32, usize)>,
     out: &'a mut Vec<UrlSpan>,
     ranges: &'a mut Vec<Osc8CellRange>,
+    /// Rightmost grid column, needed to expand multi-row spans into
+    /// full-width intermediate `RowSegment`s at flush time.
+    last_col: usize,
 }
 
 /// Update the active-span aggregator with the hyperlink seen on the next
@@ -329,13 +381,13 @@ fn process_osc8_cell(
             }
         }
         (true, Some(next)) => {
-            flush_osc8_span(sink.active, sink.out, sink.ranges);
+            flush_osc8_span(sink.active, sink.out, sink.ranges, sink.last_col);
             if hyperlink_uri_is_acceptable(&next) {
                 *sink.active = Some((next, row, col, row, col));
             }
         }
         (true, None) => {
-            flush_osc8_span(sink.active, sink.out, sink.ranges);
+            flush_osc8_span(sink.active, sink.out, sink.ranges, sink.last_col);
         }
     }
 }
@@ -366,6 +418,7 @@ fn flush_osc8_span(
     active: &mut Option<(Hyperlink, i32, usize, i32, usize)>,
     out: &mut Vec<UrlSpan>,
     ranges: &mut Vec<Osc8CellRange>,
+    last_col: usize,
 ) {
     let Some((link, row_start, col_start, row_end, col_end)) = active.take() else {
         return;
@@ -377,6 +430,7 @@ fn flush_osc8_span(
         col_end,
         url: link.uri().to_owned(),
         kind: SpanKind::Osc8Hyperlink,
+        segments: rect_segments(row_start, col_start, row_end, col_end, last_col),
     });
     ranges.push(Osc8CellRange { row_start, col_start, row_end, col_end });
 }
@@ -384,6 +438,14 @@ fn flush_osc8_span(
 /// Returns `true` when the cell at `(row, col)` falls inside any OSC 8 span.
 fn cell_in_osc8_range(ranges: &[Osc8CellRange], row: i32, col: usize) -> bool {
     ranges.iter().any(|r| r.contains(row, col))
+}
+
+/// Returns `true` when `(row, col)` is already covered by an emitted span —
+/// e.g. the continuation tail of a hard-break join produced while scanning
+/// an earlier logical line. Later line scans must not re-match those cells
+/// as fresh URLs or paths.
+fn cell_in_existing_span(spans: &[UrlSpan], row: i32, col: usize) -> bool {
+    spans.iter().any(|span| span.contains_cell(row, col))
 }
 
 fn collect_wrapped_logical_line(
@@ -421,6 +483,209 @@ fn collect_wrapped_logical_line(
     cells
 }
 
+/// Grid access needed to pull continuation rows for hard-break URL joins.
+///
+/// Programs that lay out their own text (Claude Code, pagers, line
+/// editors) split long URLs with an explicit newline instead of letting
+/// the terminal soft-wrap, so no `WRAPLINE` flag connects the rows. This
+/// context lets the URL scanner fetch the logical line below a match that
+/// ran through the final cell of its own logical line.
+struct ContinuationCtx<'t> {
+    term: &'t Term<VoidListener>,
+    rows: usize,
+    cols: usize,
+    display_offset: usize,
+}
+
+impl ContinuationCtx<'_> {
+    /// The WRAPLINE-joined logical line starting directly below the
+    /// absolute grid row `after_row_abs`, or `None` when that row is
+    /// outside the visible grid.
+    fn logical_line_below(&self, after_row_abs: i32) -> Option<Vec<LogicalCell>> {
+        let screen_row = after_row_abs.saturating_add(grid_index_i32(self.display_offset));
+        let next_screen_row = usize::try_from(screen_row).ok()?.checked_add(1)?;
+        if next_screen_row >= self.rows {
+            return None;
+        }
+        Some(collect_wrapped_logical_line(
+            self.term,
+            next_screen_row,
+            self.rows,
+            self.cols,
+            self.display_offset,
+        ))
+    }
+}
+
+/// Maximum number of hard-broken rows that may be appended to one URL.
+/// Soft-wrapped rows inside a continuation line do not count against
+/// this cap — only explicit line breaks do.
+const MAX_HARD_JOIN_ROWS: usize = 3;
+
+/// Everything the hard-break join policy may inspect for one decision.
+///
+/// The plumbing consults the policy whenever a URL match is the last
+/// content on its row (nothing but blank filler follows it); the policy
+/// decides whether the break was width-forced and the line below truly
+/// continues the URL.
+struct HardBreakContext<'a> {
+    /// Grid column of the URL's last cell on the broken row.
+    url_end_col: usize,
+    /// Rightmost grid column (`columns - 1`), for flush-to-edge checks.
+    last_col: usize,
+    /// Full-width cells of the row the URL broke on, for comparing any
+    /// leading gutter/indent run against the continuation row's.
+    broken_row: &'a [LogicalCell],
+    /// The WRAPLINE-joined logical line directly below the broken row,
+    /// covering the full grid width.
+    next_line: &'a [LogicalCell],
+}
+
+/// Maximum width of a program-drawn gutter/indent that may prefix a
+/// continuation row.
+const MAX_GUTTER_COLS: usize = 8;
+
+/// Characters treated as part of a program-drawn gutter: whitespace,
+/// box-drawing (U+2500–U+257F), block elements (U+2580–U+259F), and the
+/// email/markdown quote marker.
+fn is_gutter_char(ch: char) -> bool {
+    ch.is_whitespace() || ('\u{2500}'..='\u{259F}').contains(&ch) || ch == '>'
+}
+
+/// Decide whether the line below continues a URL across a hard line
+/// break, and where the URL body resumes.
+///
+/// The policy follows kitty — the only major terminal that bridges hard
+/// breaks, and it does so by default (`url_excluded_characters` docs:
+/// newlines are "allowed (but stripped)… to accommodate programs such as
+/// mutt that add hard line breaks even for continued lines"): a break is
+/// bridged only when the URL ran **exactly to the terminal edge** and the
+/// next row resumes with URL characters at column 0. Mid-row hard breaks
+/// are never bridged (kitty#2927: the emulator cannot know whether such a
+/// break is real). Alacritty's searcher, by contrast, hard-stops at
+/// unwrapped row boundaries and its maintainers declined bridging
+/// (alacritty#5453) — kitty's default is the richer standard and matches
+/// Scribe's use case.
+///
+/// Scribe extends kitty in two safe directions:
+/// * a continuation behind a program-drawn gutter (e.g. Claude Code's
+///   banner bar `▏ `) is accepted when the broken row carries the
+///   **identical** gutter run — the gutter cells stay outside the span;
+/// * a next row that starts its own scheme prefix (`https://…`) is a new
+///   link, never a continuation.
+///
+/// Returns the char index into `ctx.next_line` where the URL body
+/// resumes, or `None` to refuse the join.
+fn hard_break_continuation_start(ctx: &HardBreakContext<'_>) -> Option<usize> {
+    // kitty rule: only a break at the terminal edge is width-forced.
+    if ctx.url_end_col != ctx.last_col {
+        return None;
+    }
+
+    let first = ctx.next_line.first()?.ch;
+    let start = if !is_gutter_char(first) && !is_url_terminator(first) {
+        // Continuation resumes at column 0 — the exact case kitty
+        // bridges by default (mutt-style hard wrap).
+        0
+    } else {
+        matching_gutter_len(ctx.broken_row, ctx.next_line)?
+    };
+
+    let resume = ctx.next_line.get(start)?.ch;
+    if is_url_terminator(resume) {
+        return None;
+    }
+    let next_chars: Vec<char> = ctx.next_line.iter().map(|cell| cell.ch).collect();
+    if match_prefix_chars(&next_chars, start).is_some() {
+        return None;
+    }
+    Some(start)
+}
+
+/// Length of the gutter run shared verbatim by the broken row and the
+/// continuation row, when the continuation row starts with one.
+///
+/// Returns `None` when the continuation row has no gutter run, the run
+/// exceeds [`MAX_GUTTER_COLS`], or the broken row's leading cells differ —
+/// differing gutters mean the rows belong to different drawn blocks.
+fn matching_gutter_len(broken_row: &[LogicalCell], next_line: &[LogicalCell]) -> Option<usize> {
+    let run = next_line.iter().take_while(|cell| is_gutter_char(cell.ch)).count();
+    if run == 0 || run > MAX_GUTTER_COLS {
+        return None;
+    }
+    let same = (0..run).all(
+        |i| matches!((broken_row.get(i), next_line.get(i)), (Some(a), Some(b)) if a.ch == b.ch),
+    );
+    if same { Some(run) } else { None }
+}
+
+/// Extend a URL match that ended as the last content on its row across
+/// hard line breaks, as permitted by [`hard_break_continuation_start`].
+///
+/// `raw_end_line` is the line-local char index one past the last raw
+/// match char; the caller guarantees everything from there to the end of
+/// the logical line is blank filler. Returns the owned match cells
+/// (original URL cells plus any joined continuation cells) and the raw
+/// match end index within them. With no join, the result is exactly the
+/// original match and the URL text is unchanged.
+///
+/// OSC 8 precedence (FR-004): a continuation never absorbs cells covered
+/// by an explicit hyperlink — the appended run is cut at the first such
+/// cell, and joining stops there.
+fn extend_url_across_hard_breaks(
+    line_cells: &[LogicalCell],
+    url_col_start: usize,
+    raw_end_line: usize,
+    ctx: &ContinuationCtx<'_>,
+    osc8_ranges: &[Osc8CellRange],
+) -> (Vec<LogicalCell>, usize) {
+    let mut joined: Vec<LogicalCell> =
+        line_cells.get(url_col_start..raw_end_line).unwrap_or(&[]).to_vec();
+    let mut chars: Vec<char> = joined.iter().map(|cell| cell.ch).collect();
+    let mut raw_end = chars.len();
+    let mut hard_joins = 0usize;
+    let last_col = ctx.cols.saturating_sub(1);
+    // The full logical line the URL currently ends on; its final screen
+    // row is the "broken row" the policy compares gutter prefixes against.
+    let mut current_line: Vec<LogicalCell> = line_cells.to_vec();
+
+    while raw_end == chars.len() && hard_joins < MAX_HARD_JOIN_ROWS {
+        let Some(&last) = joined.last() else { break };
+        let Some(next_line) = ctx.logical_line_below(last.row) else { break };
+        let broken_row_start =
+            current_line.iter().position(|cell| cell.row == last.row).unwrap_or(current_line.len());
+        let policy_ctx = HardBreakContext {
+            url_end_col: last.col,
+            last_col,
+            broken_row: current_line.get(broken_row_start..).unwrap_or(&[]),
+            next_line: &next_line,
+        };
+        let Some(start) = hard_break_continuation_start(&policy_ctx) else { break };
+        let tail = next_line.get(start..).unwrap_or(&[]);
+        let osc8_cut = tail
+            .iter()
+            .position(|cell| cell_in_osc8_range(osc8_ranges, cell.row, cell.col))
+            .unwrap_or(tail.len());
+        let Some(tail) = tail.get(..osc8_cut).filter(|cells| !cells.is_empty()) else { break };
+
+        joined.extend_from_slice(tail);
+        chars.extend(tail.iter().map(|cell| cell.ch));
+        raw_end = collect_url_end_chars(&chars, raw_end);
+        current_line = next_line;
+
+        // When the collected URL again runs to the last content cell of
+        // this continuation row, drop the blank filler so the loop
+        // condition sees a flush buffer and can attempt the next join.
+        if chars.get(raw_end..).unwrap_or(&[]).iter().all(|ch| ch.is_whitespace()) {
+            chars.truncate(raw_end);
+            joined.truncate(raw_end);
+        }
+        hard_joins = hard_joins.saturating_add(1);
+    }
+
+    (joined, raw_end)
+}
+
 /// Scan a logical line's text for URLs and push found spans into `out`.
 ///
 /// `cells` contains exactly one `char` per terminal column, joined across
@@ -433,6 +698,7 @@ fn collect_wrapped_logical_line(
 fn scan_logical_urls(
     cells: &[LogicalCell],
     osc8_ranges: &[Osc8CellRange],
+    ctx: &ContinuationCtx<'_>,
     out: &mut Vec<UrlSpan>,
 ) -> Vec<(usize, usize)> {
     let chars: Vec<char> = cells.iter().map(|cell| cell.ch).collect();
@@ -445,48 +711,83 @@ fn scan_logical_urls(
             char_pos = char_pos.saturating_add(1);
             continue;
         }
+        if cells.get(char_pos).is_some_and(|cell| cell_in_existing_span(out, cell.row, cell.col)) {
+            char_pos = char_pos.saturating_add(1);
+            continue;
+        }
         let Some(prefix_len_chars) = match_prefix_chars(&chars, char_pos) else {
             char_pos = char_pos.saturating_add(1);
             continue;
         };
 
         let url_col_start = char_pos;
-        let url_col_end_raw = collect_url_end_chars(&chars, char_pos + prefix_len_chars);
-        let raw: String = chars.get(url_col_start..url_col_end_raw).unwrap_or(&[]).iter().collect();
+        let raw_end_line = collect_url_end_chars(&chars, char_pos + prefix_len_chars);
+
+        // A raw match followed only by blank filler to the end of the
+        // logical line may have been split by a width-forced hard break
+        // (program did its own wrapping — no WRAPLINE flag); try to
+        // continue it on the logical line below.
+        let tail_is_blank =
+            chars.get(raw_end_line..).unwrap_or(&[]).iter().all(|ch| ch.is_whitespace());
+        let (mut match_cells, raw): (Vec<LogicalCell>, String) = if tail_is_blank {
+            let (mut joined, joined_end) =
+                extend_url_across_hard_breaks(cells, url_col_start, raw_end_line, ctx, osc8_ranges);
+            let text: String =
+                joined.get(..joined_end).unwrap_or(&[]).iter().map(|cell| cell.ch).collect();
+            joined.truncate(joined_end);
+            (joined, text)
+        } else {
+            let slice = cells.get(url_col_start..raw_end_line).unwrap_or(&[]);
+            (slice.to_vec(), slice.iter().map(|cell| cell.ch).collect())
+        };
+
         let url = strip_trailing_punct(raw);
         let url_char_len = url.chars().count();
-        let url_col_end = url_col_start + url_char_len;
+        match_cells.truncate(url_char_len);
+
+        // The index one past the last match cell that lies on THIS
+        // logical line — the path-scan exclusion ranges and the scan
+        // cursor both live in line-local char space, so continuation
+        // cells are clamped away.
+        let line_end = url_col_start.saturating_add(url_char_len).min(char_count);
 
         // FR-004: if any cell within the heuristic match falls inside an
-        // OSC 8 span, skip the entire match — OSC 8 wins.
+        // OSC 8 span, skip the entire match — OSC 8 wins. Continuation
+        // cells are pre-cut at the first OSC 8 cell, so this can only
+        // fire on the original line, exactly as before.
         let intersects_osc8 =
-            (url_col_start..url_col_end).any(|i| cell_is_under_osc8(cells, i, osc8_ranges));
+            match_cells.iter().any(|cell| cell_in_osc8_range(osc8_ranges, cell.row, cell.col));
         if intersects_osc8 {
             char_pos = char_pos.saturating_add(1);
             continue;
         }
 
-        if url_char_len > prefix_len_chars && url_col_end <= char_count {
-            let Some(start) = cells.get(url_col_start) else {
-                char_pos = char_pos.saturating_add(1);
-                continue;
-            };
-            let Some(end) = cells.get(url_col_end.saturating_sub(1)) else {
-                char_pos = char_pos.saturating_add(1);
-                continue;
-            };
-            out.push(UrlSpan {
-                row: start.row,
-                col_start: start.col,
-                row_end: end.row,
-                col_end: end.col,
-                url,
-                kind: SpanKind::Url,
-            });
-            ranges.push((url_col_start, url_col_end.saturating_sub(1)));
+        if url_char_len <= prefix_len_chars {
+            char_pos = line_end.max(char_pos.saturating_add(1));
+            continue;
+        }
+        let Some(start) = match_cells.first() else {
+            char_pos = char_pos.saturating_add(1);
+            continue;
+        };
+        let Some(end) = match_cells.last() else {
+            char_pos = char_pos.saturating_add(1);
+            continue;
+        };
+        out.push(UrlSpan {
+            row: start.row,
+            col_start: start.col,
+            row_end: end.row,
+            col_end: end.col,
+            url,
+            kind: SpanKind::Url,
+            segments: segments_from_cells(&match_cells),
+        });
+        if line_end > url_col_start {
+            ranges.push((url_col_start, line_end.saturating_sub(1)));
         }
 
-        char_pos = url_col_end.max(char_pos.saturating_add(1));
+        char_pos = line_end.max(char_pos.saturating_add(1));
     }
 
     ranges
@@ -592,6 +893,13 @@ fn scan_logical_paths(
             continue;
         }
 
+        // Skip positions already consumed by an emitted span (e.g. the
+        // continuation tail of a hard-break join from an earlier line).
+        if cells.get(char_pos).is_some_and(|cell| cell_in_existing_span(out, cell.row, cell.col)) {
+            char_pos = char_pos.saturating_add(1);
+            continue;
+        }
+
         // Try to match a path prefix at this position.
         let Some((prefix_len, is_bare_relative)) = detect_path_prefix(&chars, char_pos) else {
             char_pos = char_pos.saturating_add(1);
@@ -632,6 +940,7 @@ fn scan_logical_paths(
                 char_pos = char_pos.saturating_add(1);
                 continue;
             };
+            let path_cells = cells.get(path_col_start..path_col_end_exclusive).unwrap_or(&[]);
             out.push(UrlSpan {
                 row: start.row,
                 col_start: start.col,
@@ -639,6 +948,7 @@ fn scan_logical_paths(
                 col_end: end.col,
                 url: path,
                 kind: SpanKind::Path,
+                segments: segments_from_cells(path_cells),
             });
             char_pos = path_col_end_exclusive.max(char_pos.saturating_add(1));
         } else {

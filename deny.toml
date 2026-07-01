@@ -50,6 +50,17 @@ ignore = [
   # Owner: Scribe maintainers. Review by 2026-08-01 or when transitive users update.
   # time 0.3.x stack exhaustion DoS — transitive via various crates
   "RUSTSEC-2026-0009",
+  # Owner: Scribe maintainers. Review by 2026-09-01 or when wayland-scanner and
+  # notify-rust move to quick-xml >=0.41 (the fix version; parents pin 0.39/0.37).
+  # quick-xml DoS advisories (quadratic duplicate-attribute check, unbounded NsReader
+  # namespace allocation) — transitive via wayland-scanner (build-time parse of vendored
+  # Wayland protocol XML) and tauri-winrt-notification (Windows-only, parses toast XML
+  # the app generates itself); neither path parses untrusted input
+  "RUSTSEC-2026-0194", # quick-xml
+  "RUSTSEC-2026-0195", # quick-xml
+  # Owner: Scribe maintainers. Review by 2026-08-01 or when cosmic-text/winit update.
+  # ttf-parser unmaintained — transitive via cosmic-text/fontdb & winit/ab_glyph; no safe upgrade
+  "RUSTSEC-2026-0192", # ttf-parser
 ]
 
 [bans]

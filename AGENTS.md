@@ -12,6 +12,7 @@ After EVERY task, before responding to the user:
 - [ ] Update `lat.md/` if you added or changed any functionality, architecture, tests, or behavior
 - [ ] Run `lat check` — all wiki links and code refs must pass
 - [ ] Do not skip these steps. Do not consider your task done until both are complete.
+- [ ] End your reply with the direct answer to the user's request. Keep any lat.md sync note to ONE short trailing line — never end your message on lat.md sync commentary, a drift table, or a checklist. The answer is the last thing the user should read.
 
 ---
 
