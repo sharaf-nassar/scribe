@@ -61,6 +61,9 @@ fn apply_config_key(
         key if key.starts_with("theme.") => {
             apply_theme_color_key(config, key, value)?;
         }
+        key if key.starts_with("remote.") => {
+            apply_remote_key(config, key, value)?;
+        }
         _ => tracing::debug!(key, "unhandled settings key"),
     }
 
@@ -657,6 +660,32 @@ fn apply_notifications_key(
             config.notifications.timeout_secs = parse_number(value, "notifications.timeout_secs")?;
         }
         _ => return Err(format!("unhandled notifications key: {key}")),
+    }
+
+    Ok(())
+}
+
+/// Apply a `remote.<field>` settings change to the `[remote]` TOML table
+/// (feature 013). `remote.enabled` toggles the opt-in Tailscale remote-control
+/// listener (default off); `remote.port` sets the TCP port bound only on the
+/// machine's tailnet addresses. The port is clamped to the same 1024–65535
+/// range the settings webview enforces so a hand-crafted IPC cannot persist an
+/// out-of-range value. The server applies both live on `ConfigReloaded`; it is
+/// never restarted for this.
+fn apply_remote_key(
+    config: &mut scribe_common::config::ScribeConfig,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match key {
+        "remote.enabled" => {
+            config.remote.enabled = value.as_bool().ok_or("remote.enabled must be a boolean")?;
+        }
+        "remote.port" => {
+            let v: u16 = parse_number(value, "remote.port")?;
+            config.remote.port = v.clamp(1024, 65535);
+        }
+        _ => return Err(format!("unhandled remote key: {key}")),
     }
 
     Ok(())

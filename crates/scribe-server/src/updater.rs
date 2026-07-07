@@ -993,12 +993,11 @@ fn current_version() -> Result<semver::Version, ScribeError> {
 // ── Broadcast helper ──────────────────────────────────────────────
 
 async fn broadcast(msg: &ServerMessage, connected_clients: &ConnectedClients) {
-    use scribe_common::framing::write_message;
     let clients = connected_clients.read().await;
     for writer in clients.values() {
-        let mut w = writer.lock().await;
-        if let Err(e) = write_message(&mut *w, msg).await {
-            warn!("failed to broadcast update message to client: {e}");
-        }
+        // Route through the shared send path (`send_message` → `write_to_sink`) so
+        // a remote (feature 013) client receives the broadcast via its bounded
+        // output queue instead of a direct, potentially blocking socket write.
+        crate::ipc_server::send_message(writer, msg).await;
     }
 }

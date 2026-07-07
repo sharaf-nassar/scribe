@@ -108,5 +108,8 @@ The second example is invalid because `Bad Section` has no leading paragraph. `l
 
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
-shell commands, and other important information, read the current plan
+shell commands, and other important information, read the current plan:
+`specs/013-remote-window-control/plan.md` (feature 013, branch
+`013-remote-window-control`; design artifacts live alongside it —
+research.md, data-model.md, contracts/, quickstart.md).
 <!-- SPECKIT END -->

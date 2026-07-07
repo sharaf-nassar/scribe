@@ -40,6 +40,19 @@ const RELEASE_LIST_TIMEOUT: Duration = Duration::from_secs(7);
 /// `EnvPreflightOutcome::Err(PreflightError::Unknown(_))`.
 const ENV_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(7);
 
+/// Maximum time to block window-open on the one-shot `GetRemoteEnv` probe that
+/// fills the Settings → Remote "signed in as <account>" statement and the
+/// "Tailscale not detected" notice.
+///
+/// Unlike the update-check / release-list / preflight probes (user-triggered,
+/// dispatched on worker threads), this one runs synchronously during webview
+/// setup — like [`inject_platform`] — so its bound is how long the settings
+/// window may wait before showing content. Matched to the server's own 5 s
+/// `LocalAPI` round-trip budget so a slow-but-alive tailscaled is still caught,
+/// while a missing daemon fails fast and a wedged one folds to the fail-closed
+/// not-detected default (FR-015) without hanging the window open.
+const REMOTE_ENV_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Embedded web assets (HTML, CSS, JS) for the settings UI.
 #[derive(Embed)]
 #[folder = "src/assets/"]
@@ -192,6 +205,34 @@ fn inject_platform(webview: &wry::WebView) {
     }
 }
 
+/// Inject this machine's remote environment (the signed-in tailnet account name
+/// and whether Tailscale is detected) into the settings webview so the
+/// Settings → Remote section can render the UX-003 "signed in as <account>"
+/// statement and, when Tailscale is absent, the passive "Tailscale not
+/// detected" notice (FR-015).
+///
+/// Like [`inject_platform`], the host owns these runtime facts and pushes them
+/// via `evaluate_script` after the page loads. The argument object is built
+/// with `serde_json` (as in [`inject_theme_colors`]) so an account string
+/// carrying JS-special characters is safely escaped, and its keys match the
+/// `setRemoteEnv` contract exactly (`account`, `tailscale_detected`). Resolving
+/// the value talks to the server over the local socket under a hard timeout;
+/// any timeout or transport error folds to the fail-closed
+/// `{ account: null, tailscale_detected: false }` default, so a missing or
+/// wedged tailscaled never blocks the window from opening.
+fn inject_remote_env(webview: &wry::WebView) {
+    let outcome = server_action::request_remote_env(REMOTE_ENV_TIMEOUT);
+    let arg = serde_json::json!({
+        "account": outcome.account,
+        "tailscale_detected": outcome.tailscale_detected,
+    });
+    let json = serde_json::to_string(&arg).unwrap_or_else(|_| String::from("{}"));
+    let script = format!("if (typeof setRemoteEnv === 'function') {{ setRemoteEnv({json}); }}");
+    if let Err(e) = webview.evaluate_script(&script) {
+        tracing::warn!("failed to inject remote env into settings webview: {e}");
+    }
+}
+
 /// Compile-time platform string used by both the legacy `window.SCRIBE_PLATFORM`
 /// path (`inject_platform`) and the new `window.SCRIBE_BOOTSTRAP.platform` field
 /// passed via the pre-page-load script. Keeping a single function ensures the
@@ -239,6 +280,7 @@ fn inject_initial_webview_state(webview: &wry::WebView, config_json: &str) {
     inject_keybinding_defaults(webview);
     inject_theme_colors(webview);
     inject_font_list(webview);
+    inject_remote_env(webview);
 }
 
 /// Extract the `type` field from a webview IPC request body.

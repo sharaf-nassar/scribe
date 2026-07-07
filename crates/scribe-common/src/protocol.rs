@@ -6,6 +6,13 @@ use crate::ai_state::{AiProcessState, AiProvider};
 use crate::hook;
 use crate::ids::{SessionId, WindowId, WorkspaceId};
 
+/// Version of the remote-only wire protocol (feature 013). Exchanged in the
+/// [`ClientMessage::RemoteHandshake`] preamble and gated by an exact-match
+/// check answered in [`ServerMessage::RemoteHandshakeReply`]; bump on ANY
+/// change to remote-visible message semantics. Never used on the local Unix
+/// socket, where client and server always ship together.
+pub const REMOTE_PROTOCOL_VERSION: u32 = 1;
+
 /// OSC 52 operation type (spec 010 E2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,11 +110,37 @@ pub enum AutomationAction {
     },
 }
 
+/// Feature 013: identity of the controller currently holding a window,
+/// surfaced in window-listing / picker / indicator UIs (FR-005, FR-009b,
+/// SC-006). Present on a [`WindowInfo`] only while a REMOTE tailnet peer
+/// controls the window; a locally-controlled or unconnected window carries
+/// `None` (the owning machine needs no device/account label for itself).
+/// Mirrors the `device_name` / `login_name` pair of
+/// [`ServerMessage::WindowTakenOver`] so the two identity surfaces never drift.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControllerInfo {
+    /// Controller's `MagicDNS` short device name.
+    pub device_name: String,
+    /// Controller's tailnet account display (login) name.
+    pub login_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowInfo {
     pub window_id: WindowId,
     pub session_count: usize,
     pub connected: bool,
+    /// Feature 013: display names of the workspaces in this window, in the
+    /// window's stored session order (deduplicated; unnamed workspaces
+    /// omitted). Feeds the remote connect picker's window list (FR-005).
+    /// Empty from an older server or a window with no named workspaces.
+    #[serde(default)]
+    pub workspace_names: Vec<String>,
+    /// Feature 013: the remote controller currently holding this window, or
+    /// `None` when it is unconnected or controlled locally (FR-009b, SC-006).
+    /// Additive: older servers omit it and it decodes as `None`.
+    #[serde(default)]
+    pub controller: Option<ControllerInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,6 +327,13 @@ pub enum ClientMessage {
         /// Defaults to `false` so older clients deserialize cleanly.
         #[serde(default)]
         clipboard_gating: bool,
+        /// Feature 013: claim a currently-connected window (takeover). Defaults
+        /// to `false` via serde, so every existing local client — which never
+        /// sets it — keeps today's behavior exactly: a connected window is
+        /// never displaced. `true` is an explicit user action (picker attach or
+        /// lost-control reclaim) that atomically swaps the window's writer.
+        #[serde(default)]
+        takeover: bool,
     },
     /// Close this window and destroy all its sessions.  Sent when the user
     /// chooses "Close this window only" from the close dialog.
@@ -355,6 +395,31 @@ pub enum ClientMessage {
         request_id: PromptId,
         payload: Result<String, BridgeError>,
     },
+    /// Feature 013 remote-only preamble — the FIRST frame a remote (TCP) client
+    /// sends. NEVER sent on the local Unix socket. Carries no window or session
+    /// data so identity, authorization, and version can all be checked and a
+    /// typed refusal issued before any window state is revealed (FR-003).
+    RemoteHandshake {
+        /// [`REMOTE_PROTOCOL_VERSION`] of the dialer; gated by exact match.
+        remote_protocol_version: u32,
+        /// Human-readable Scribe version of the dialer, for mismatch copy.
+        scribe_version: String,
+        /// Dialer's short device name, display-only (banner / audit).
+        device_name: String,
+    },
+    /// Feature 013 local-only request: enumerate the user's own online tailnet
+    /// peers for the connect picker. Served from THIS machine's own `LocalAPI`
+    /// view; refused (like any non-`RemoteHandshake` first frame) over TCP so a
+    /// remote peer cannot enumerate a third machine's tailnet view.
+    ListRemotePeers,
+    /// Feature 013 local-only settings request: report this machine's remote
+    /// environment for the Settings → Remote section — the signed-in tailnet
+    /// account name and whether Tailscale is detected at all. The server replies
+    /// with exactly one [`ServerMessage::RemoteEnv`]. Like [`ListRemotePeers`]
+    /// it is served from THIS machine's own `LocalAPI` view and refused as a
+    /// non-`RemoteHandshake` first frame over TCP, so a remote peer can never
+    /// read a third machine's tailnet identity. No fields.
+    GetRemoteEnv,
 }
 
 // ── Server → UI ──────────────────────────────────────────────────
@@ -615,6 +680,53 @@ pub enum ServerMessage {
         request_id: PromptId,
         selection: ClipboardSelection,
     },
+    /// Feature 013 reply to [`ClientMessage::RemoteHandshake`]. Always sent
+    /// after the preamble is read so every refusal reaches the dialer as a
+    /// typed outcome (UX-002). On `accepted = false` the server closes the
+    /// connection after sending this frame.
+    RemoteHandshakeReply {
+        accepted: bool,
+        /// Present iff `!accepted`; names the typed refusal reason.
+        #[serde(default)]
+        refusal: Option<RemoteRefusal>,
+        /// Server's [`REMOTE_PROTOCOL_VERSION`], named for mismatch copy.
+        server_remote_protocol_version: u32,
+        /// Server's human-readable Scribe version, named for mismatch copy.
+        server_scribe_version: String,
+    },
+    /// Feature 013: sent to a client whose window was claimed by another
+    /// controller. The displaced client stops sending input for that window,
+    /// freezes and dims its last frame under a banner naming the new
+    /// controller, and offers one-action reclaim.
+    WindowTakenOver {
+        /// New controller's device name (or "this machine" for a local reclaim).
+        device_name: String,
+        /// New controller's account display name.
+        login_name: String,
+    },
+    /// Feature 013 best-effort final frame before the server closes a remote
+    /// connection for a policy reason (v1: remote access disabled). The close
+    /// follows regardless of whether this frame is delivered.
+    RemoteDisconnect {
+        reason: RemoteRefusal,
+    },
+    /// Feature 013 reply to [`ClientMessage::ListRemotePeers`] — this machine's
+    /// same-account tailnet peers for the connect picker. Local socket only.
+    RemotePeerList {
+        peers: Vec<RemotePeerInfo>,
+    },
+    /// Feature 013 reply to [`ClientMessage::GetRemoteEnv`] — this machine's
+    /// remote environment for the Settings → Remote section (UX-003, FR-015).
+    /// `account` is the signed-in tailnet login name, absent when unknown;
+    /// `tailscale_detected` is `false` when the `LocalAPI` could not be reached
+    /// at all, which drives the passive "Tailscale not detected" notice. Any
+    /// `LocalAPI` error fails closed to `{ account: None, tailscale_detected:
+    /// false }`. Local socket only.
+    RemoteEnv {
+        #[serde(default)]
+        account: Option<String>,
+        tailscale_detected: bool,
+    },
 }
 
 // ── Shared types ─────────────────────────────────────────────────
@@ -868,6 +980,39 @@ pub enum EnvStatusState {
     /// Keystore became unavailable; persistence has stopped. The on-disk
     /// envelope (if any) is untouched. No plaintext fallback.
     Degraded { reason: String },
+}
+
+/// Feature 013: canonical remote-refusal taxonomy. One enum shared by the wire
+/// ([`ServerMessage::RemoteHandshakeReply`] `refusal`,
+/// [`ServerMessage::RemoteDisconnect`] `reason`) and the server audit log, so
+/// refusal reasons never drift between the two surfaces. Each variant maps 1:1
+/// to the distinct UX-002 failure copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteRefusal {
+    /// Remote access is off (races with a live disable).
+    Disabled,
+    /// Wrong tailnet account, a tagged/identity-less node, or unknown identity.
+    Unauthorized,
+    /// tailscaled / `WhoIs` unavailable — fail closed (FR-015).
+    IdentityUnavailable,
+    /// Exact [`REMOTE_PROTOCOL_VERSION`] match failed (both versions in reply).
+    IncompatibleVersion,
+    /// The remote-connection cap (8) is reached.
+    Busy,
+}
+
+/// Feature 013: one same-account tailnet peer for the connect picker, resolved
+/// from THIS machine's own `LocalAPI` status and carried in
+/// [`ServerMessage::RemotePeerList`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemotePeerInfo {
+    /// `MagicDNS` short name; shown in the picker and usable as a dial target.
+    pub name: String,
+    /// Tailnet address to dial (literal IP or MagicDNS-resolvable host).
+    pub addr: String,
+    /// Whether the peer is currently reachable; offline peers are greyed/omitted.
+    pub online: bool,
 }
 
 #[cfg(test)]

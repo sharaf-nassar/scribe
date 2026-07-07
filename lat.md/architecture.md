@@ -24,9 +24,13 @@ Low-level [[pty]] management: async file descriptor wrappers for zero-copy PTY I
 
 Long-running daemon that owns PTY sessions, manages [[server#Workspaces]] with auto-naming and durable [[server#Workspaces#Workspace Notes]], coordinates [[server#Handoff]] for zero-downtime upgrades via SCM_RIGHTS fd passing, and handles software [[server#Updater]]. Also backs the [[settings#Releases]] panel via the [[server#Releases#Release Catalog]] and the new [[protocol#Server Messages#Release List]] message.
 
+Feature 013 adds the owning side of [[server#Remote Control]]: a Tailscale-gated TCP listener ([[crates/scribe-server/src/tailnet.rs]] for LocalAPI identity) that lets another of the user's tailnet machines attach to a window, off by default.
+
 ### scribe-client
 
 GPU frontend that renders [[client#Panes]], handles [[client#Input]], manages [[client#Layout]], renders [[client#Workspace Notes]] from server snapshots, and speaks IPC.
+
+It also owns the connecting side of [[client#Remote Control]] (feature 013): the connect picker, the auto-reconnect state machine, and the displaced/lost-control rendering for a window dialed on another tailnet machine.
 
 ### scribe-renderer
 
@@ -137,3 +141,9 @@ Prompt bar state (`first_prompt`, `latest_prompt`, `prompt_count`) is client-sid
 When the server crashes or is killed and relaunched, all PTY sessions are lost. The client detects a cold restart by receiving an empty `SessionList` while a restore snapshot exists on disk, then replays the previous window layout.
 
 The restore pipeline has three layers: [[crates/scribe-client/src/restore_state.rs#RestoreStore]] persists per-window snapshots and a global index under `$XDG_STATE_HOME/{flavor}/restore/`, [[crates/scribe-client/src/restore_replay.rs#snapshot_window_restore]] captures the current layout, and [[crates/scribe-client/src/restore_replay.rs#prepare_replay]] rebuilds the layout from a snapshot. Snapshots are saved on a debounced timer after every layout change. On explicit close or quit the snapshot is removed; on server crash it is preserved. Multiple windows are restored by having the first client claim the first index entry and spawn `--restore-child` processes for the rest, so only the bootstrap client fans out additional windows. Because a true cold restart connects to a fresh server that already assigned new window IDs in `Welcome`, the client reapplies geometry from the claimed snapshot's original window ID before replaying panes, and feeds that same geometry into the replay so pane grids are sized from the saved logical dimensions instead of `window.inner_size()` — which is unreliable in the same synchronous block because `request_inner_size` and `set_maximized(true)` are async on most compositors and have not yet been acknowledged. The claim step prunes stale index IDs whose per-window snapshot file is missing or unreadable before computing the remaining-window count, which prevents partial restore-state corruption from spawning duplicate fresh windows.
+
+### Remote Control Path
+
+Feature 013 runs the same write/read pipeline between two machines: a connecting client dials the owning machine's tailnet TCP listener instead of the local Unix socket, exchanges the [[protocol#Remote Protocol#Preamble Handshake]], then speaks the ordinary message catalogue.
+
+The PTY still lives only on the owning machine, so `Hello` / `KeyInput` / `PtyOutput` / `SessionReplay` cross the tailnet unchanged once the handshake's WhoIs identity check and version gate pass. The differences from the local path are three: the owning side wraps each remote writer in a bounded [[server#Remote Control#Flow Control]] queue that drops backlog and resyncs via `SessionReplay` rather than stalling the authoritative Term; single-writer window ownership gains [[protocol#Remote Protocol#Takeover]] so a claim can displace the current controller (or land in lost control), a displacement the owner then enforces by barring the lost connection from mutating or re-attaching its old window ([[server#Remote Control#Control Authorization]]); and a dropped link drives the client's [[client#Remote Control#Reconnect State Machine]] instead of the local server-relaunch recovery. Terminal contents leave the device only over the tailnet's encrypted transport to the user's own authenticated machine, and only while `remote.enabled`.

@@ -185,7 +185,7 @@ pub async fn run() -> Result<(), ScribeError> {
     // daemon stop → daemon start → session attach.
     crate::ipc::send(
         &mut raw_server_writer,
-        &ClientMessage::Hello { window_id: None, clipboard_gating: false },
+        &ClientMessage::Hello { window_id: None, clipboard_gating: false, takeover: false },
     )
     .await?;
 
@@ -317,13 +317,19 @@ async fn dispatch_server_message(
         | ServerMessage::PromptReceived { .. }) => {
             dispatch_notice_message(msg);
         }
-        // Test daemon does not exercise env-persistence (feature 006) or
-        // OSC 52 clipboard gating (spec 010) flows yet.
+        // Test daemon does not exercise env-persistence (feature 006), OSC 52
+        // clipboard gating (spec 010), or remote window control (feature 013)
+        // flows yet.
         ServerMessage::EnvPreflightResult { .. }
         | ServerMessage::EnvStatus { .. }
         | ServerMessage::ClipboardPromptRequest { .. }
         | ServerMessage::ClipboardBridgeWrite { .. }
-        | ServerMessage::ClipboardBridgeReadRequest { .. } => {}
+        | ServerMessage::ClipboardBridgeReadRequest { .. }
+        | ServerMessage::RemoteHandshakeReply { .. }
+        | ServerMessage::WindowTakenOver { .. }
+        | ServerMessage::RemoteDisconnect { .. }
+        | ServerMessage::RemotePeerList { .. }
+        | ServerMessage::RemoteEnv { .. } => {}
     }
 }
 

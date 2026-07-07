@@ -1,5 +1,6 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
@@ -12,8 +13,8 @@ use scribe_pty::claude_picker_filter::ClaudePickerTruncationFilter;
 use scribe_pty::ed3_filter::Ed3Filter;
 use scribe_pty::lf_crlf_filter::LfCrlfFilter;
 use tokio::io::{AsyncWriteExt as _, ReadHalf, WriteHalf};
-use tokio::net::UnixListener;
 use tokio::net::unix::UCred;
+use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use vte::Parser as VteParser;
@@ -28,8 +29,9 @@ use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    AutomationAction, ClientMessage, PromptMarkKind, SearchMatch, ServerMessage, SessionInfo,
-    TerminalSize, WindowInfo, WorkspaceListEntry, WorkspaceNotesMutation, WorkspaceTreeNode,
+    AutomationAction, ClientMessage, ControllerInfo, PromptMarkKind, REMOTE_PROTOCOL_VERSION,
+    RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage, SessionInfo, TerminalSize,
+    WindowInfo, WorkspaceListEntry, WorkspaceNotesMutation, WorkspaceTreeNode,
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
@@ -87,8 +89,25 @@ impl PreservedAiScrollback {
     }
 }
 
-/// Shared writer half of the client connection.
-pub type SharedWriter = Arc<Mutex<WriteHalf<tokio::net::UnixStream>>>;
+/// The write side of one client connection. A local Unix-socket connection
+/// writes framed messages straight to the socket — byte-for-byte the pre-013
+/// behavior. A remote (TCP) connection instead enqueues into a bounded
+/// per-connection output queue drained by a dedicated task (feature 013 T029,
+/// research D5), so a slow tailnet link can never block the fan-out hot path
+/// (and thus never stall the server's authoritative `Term` or the other
+/// clients). Boxing the local half lets one `SharedWriter` back either a
+/// `WriteHalf<UnixStream>` or the remote enqueue handle without threading a
+/// stream-type generic through every handler.
+pub enum ClientSink {
+    /// Local Unix-socket writer: framed messages go straight to the socket via
+    /// the stream-generic `write_message`.
+    Local(Box<dyn tokio::io::AsyncWrite + Send + Unpin>),
+    /// Remote (TCP) enqueue handle into the bounded output queue.
+    Remote(RemoteSink),
+}
+
+/// Shared writer half of a client connection.
+pub type SharedWriter = Arc<Mutex<ClientSink>>;
 
 /// Optional client writer: `Some` when a client is attached, `None` when
 /// the session is detached (client disconnected). The PTY reader task
@@ -119,6 +138,71 @@ pub type ConnectedClients = Arc<RwLock<HashMap<WindowId, SharedWriter>>>;
 /// attaches under so the flag is always consistent with the writer slot.
 pub type WindowClipboardGating = Arc<RwLock<HashMap<WindowId, bool>>>;
 
+/// Feature 013: identity of the client currently controlling a window under the
+/// single-writer ownership model. `Local` is a Unix-socket client on this
+/// machine; `Remote` is an authenticated tailnet peer. Tracked per window in
+/// [`WindowControllers`], re-bound under the same claim path as
+/// [`ConnectedClients`] so the two never drift, and consumed by the window-list
+/// controller field (FR-009b) and the `WindowTakenOver` naming (FR-007).
+#[derive(Clone)]
+pub enum ControllerIdentity {
+    /// A local Unix-socket controller (this machine).
+    Local,
+    /// A remote tailnet controller, named by device + account.
+    Remote { device_name: String, login_name: String },
+}
+
+impl ControllerIdentity {
+    /// The window-list / picker view of this controller: `Some` only for a
+    /// remote controller (a local controller needs no device/account label).
+    fn to_controller_info(&self) -> Option<ControllerInfo> {
+        match self {
+            ControllerIdentity::Local => None,
+            ControllerIdentity::Remote { device_name, login_name } => Some(ControllerInfo {
+                device_name: device_name.clone(),
+                login_name: login_name.clone(),
+            }),
+        }
+    }
+
+    /// The `WindowTakenOver` frame naming this controller as the new owner, sent
+    /// to a displaced client (FR-007). A local controller is named "this
+    /// machine" with no account label (the displaced peer already knows the
+    /// account is its own).
+    fn window_taken_over(&self) -> ServerMessage {
+        match self {
+            ControllerIdentity::Local => ServerMessage::WindowTakenOver {
+                device_name: "this machine".to_string(),
+                login_name: String::new(),
+            },
+            ControllerIdentity::Remote { device_name, login_name } => {
+                ServerMessage::WindowTakenOver {
+                    device_name: device_name.clone(),
+                    login_name: login_name.clone(),
+                }
+            }
+        }
+    }
+
+    /// Compact identity label for the feature-013 control-transition traces
+    /// (T027): `local` for a Unix-socket controller, `device (login)` for a
+    /// remote peer. Distinct from the canonical `REMOTE_AUDIT_TARGET` lines —
+    /// this only annotates who holds a window across an ownership transition.
+    fn transition_label(&self) -> Cow<'static, str> {
+        match self {
+            ControllerIdentity::Local => Cow::Borrowed("local"),
+            ControllerIdentity::Remote { device_name, login_name } => {
+                Cow::Owned(format!("{device_name} ({login_name})"))
+            }
+        }
+    }
+}
+
+/// Feature 013: per-window controller identity, parallel to [`ConnectedClients`]
+/// and keyed the same way. An entry exists while a window is connected; it is
+/// re-bound atomically at takeover and dropped when the owning client detaches.
+pub type WindowControllers = Arc<RwLock<HashMap<WindowId, ControllerIdentity>>>;
+
 #[derive(Clone)]
 pub struct IpcServerState {
     pub session_manager: Arc<SessionManager>,
@@ -127,6 +211,10 @@ pub struct IpcServerState {
     pub connected_clients: ConnectedClients,
     /// Spec 010 attach-time clipboard-gating capability bits, keyed by window.
     pub window_clipboard_gating: WindowClipboardGating,
+    /// Feature 013: per-window controller identity (local vs remote peer), kept
+    /// in lock-step with `connected_clients` so window-listing and the takeover
+    /// banner can name the controlling machine (FR-007, FR-009b).
+    pub window_controllers: WindowControllers,
     pub updater_handle: Arc<UpdaterHandle>,
     /// In-memory cache of GitHub releases populated lazily on the first
     /// `ListReleases` request and refreshed in the background past its TTL.
@@ -144,6 +232,11 @@ pub struct IpcServerState {
     /// `specs/006-persist-terminal-env/data-model.md` for the ownership
     /// rules.
     pub env_store: Arc<crate::env_store::EnvStoreState>,
+    /// Feature 013: shared control handle for the remote-control TCP listener.
+    /// Startup and every `ConfigReloaded` call [`RemoteControl::apply`] to
+    /// start, stop, or rebind the listener live; the accept path consults it
+    /// for the disable-race refusal and the 8-connection cap.
+    pub remote_control: Arc<RemoteControl>,
 }
 
 struct ClientDispatchContext<'a> {
@@ -151,6 +244,16 @@ struct ClientDispatchContext<'a> {
     writer: &'a SharedWriter,
     attached_ids: &'a AttachedSessionIds,
     window_id: WindowId,
+}
+
+/// The borrowed per-connection state threaded through the establish + message
+/// read paths. Bundled into one `Copy` handle so both stay under Clippy's
+/// argument threshold (mirrors [`StartSessionIds`]).
+#[derive(Clone, Copy)]
+struct ConnState<'a> {
+    server: &'a IpcServerState,
+    writer: &'a SharedWriter,
+    attached_ids: &'a AttachedSessionIds,
 }
 
 struct CreateSessionRequest {
@@ -526,6 +629,1069 @@ pub async fn start_ipc_server(
     }
 }
 
+// ── Feature 013: remote-control TCP transport ───────────────────────────────
+
+/// Maximum simultaneous REMOTE (TCP) connections, separate from the 32 local
+/// (`MAX_CONNECTIONS`). Excess connections are refused with a typed `Busy` after
+/// the preamble is read (contracts/remote-protocol.md Transport).
+const REMOTE_CONNECTION_CAP: usize = 8;
+
+/// Admission cap on pending (pre-authorization) remote connections, acquired the
+/// instant a TCP stream is accepted — before the handler is spawned — so a flood
+/// of half-open dialers cannot spawn unbounded handshake tasks or allocate
+/// pre-auth (mirrors [`start_ipc_server`]'s pre-spawn `try_acquire_owned`). Kept
+/// generously above [`REMOTE_CONNECTION_CAP`] so in-flight handshakes never
+/// starve the authorized-connection slots; excess dialers are dropped
+/// immediately.
+const REMOTE_PENDING_HANDSHAKE_CAP: usize = 64;
+
+/// Hard size cap on the pre-auth `RemoteHandshake` preamble frame. The preamble
+/// carries only a version number plus two short strings, so a few KiB is ample;
+/// bounding it far below the shared 64 MiB frame budget denies an unauthenticated
+/// dialer a large heap allocation from a forged length prefix.
+const REMOTE_PREAMBLE_MAX_BYTES: u32 = 8 * 1024;
+
+/// Per-remote-connection cap on queued droppable `PtyOutput` payload bytes
+/// (feature 013 T029, research D5, PR-004). When the backlog would exceed this
+/// the whole `PtyOutput` queue is shed and its sessions are marked replay-dirty
+/// for a fresh full replay, so a stalled consumer's memory stays bounded without
+/// ever back-pressuring the PTY. Control/replay frames are never counted here.
+const REMOTE_OUTPUT_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Per-remote-connection cap on TOTAL queued bytes across every frame kind —
+/// including the non-droppable `Keep` lane (`SessionReplay`, `SessionCreated`,
+/// `TitleChanged`, `ClipboardBridgeWrite`, …). Prevents an unbounded `Keep`
+/// backlog on a stalled link: on breach the droppable `PtyOutput` backlog is shed
+/// first, and if the queue is STILL over ceiling (a pure control-frame flood the
+/// link cannot drain) the connection is closed so its memory use stays bounded
+/// (FR-013). Sits above [`REMOTE_OUTPUT_QUEUE_BYTES`] to leave headroom for a
+/// legitimate multi-session initial attach replay.
+const REMOTE_OUTPUT_QUEUE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+
+/// Per-remote-connection cap on the number of queued frames, bounding a flood of
+/// small `Keep` control frames the byte ceiling would under-count. Same
+/// shed-then-close policy as [`REMOTE_OUTPUT_QUEUE_TOTAL_BYTES`].
+const REMOTE_OUTPUT_QUEUE_MAX_FRAMES: usize = 8192;
+
+/// Nominal byte cost charged to a queued control frame whose exact serialized
+/// size is not worth computing. The two high-volume streams are sized precisely
+/// (`PtyOutput` by payload length, `SessionReplay` by its compressed blob); every
+/// other frame is small, so a flat nominal keeps the total-byte accounting cheap
+/// while the frame-count ceiling backstops tiny-frame floods.
+const REMOTE_FRAME_NOMINAL_BYTES: usize = 256;
+
+/// Upper bound on how long a freshly accepted remote connection may take to send
+/// its `RemoteHandshake` preamble before it is dropped, so a silent peer cannot
+/// hold an accept slot open indefinitely.
+const REMOTE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Idle-read timeout for an ESTABLISHED remote connection: if no frame arrives
+/// within this window the connection is treated as dead and its scarce
+/// authorized-connection slot ([`REMOTE_CONNECTION_CAP`]) is reclaimed, so a peer
+/// that vanished without a FIN/RST (laptop sleep, Wi-Fi roam) cannot leak a slot
+/// indefinitely. Deliberately generous — remote input is bursty and a peer that
+/// is only watching output sends nothing — so an idle-but-live viewer is rarely
+/// tripped; when it is, sessions keep running and the client auto-reconnects and
+/// reconverges (FR-011). Applies to remote (TCP) connections ONLY; local
+/// Unix-socket connections keep today's untimed reads. This is the application
+/// backstop for a peer that is TCP-alive but app-silent; a peer whose TCP path
+/// has vanished (no FIN/RST) is reclaimed faster by tuned keepalive (see
+/// [`enable_tcp_keepalive`]).
+const REMOTE_IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Idle time before the OS starts sending TCP keepalive probes on an accepted
+/// remote connection, and the interval between probes. With the OS-default probe
+/// count this drops a vanished (FIN/RST-less) peer — and frees its authorized
+/// slot — in a few minutes instead of waiting out [`REMOTE_IDLE_READ_TIMEOUT`],
+/// with no false positives on a live-but-idle viewer (a live TCP stack ACKs the
+/// probes even when the app sends nothing).
+const REMOTE_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+const REMOTE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Upper bound on the best-effort `ServerMessage::RemoteDisconnect` write when a
+/// remote connection is severed on disable (T023). Each severed connection sends
+/// concurrently on its own task, so this also bounds how long the whole sever
+/// takes — comfortably inside the 2-second disable budget (FR-016).
+const REMOTE_SEVER_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// tracing target for the feature-013 remote audit log lines
+/// (contracts/settings-and-config.md Audit log surface).
+const REMOTE_AUDIT_TARGET: &str = "scribe_server::remote_audit";
+
+/// The tailnet identity of an accepted remote connection, carried into the
+/// shared dispatch so the accepted/disconnect audit lines can name the peer.
+struct RemoteContext {
+    node_name: String,
+    login_name: String,
+    /// Feature 013 (T023): fires when remote access is disabled. The shared read
+    /// paths `select!` on it so a disable drops this connection out of its loop
+    /// and through the normal detach cleanup (owning sessions untouched) before
+    /// the socket closes.
+    sever: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// The display identity of an accepted remote connection, retained after the
+/// sever signal is split off [`RemoteContext`] so the accepted/disconnect audit
+/// lines can still name the peer.
+struct RemoteIdentity {
+    node_name: String,
+    login_name: String,
+}
+
+// ── Feature 013 (T029): bounded per-remote-connection output queue ───────────
+//
+// A slow tailnet link must never block the fan-out hot path (research D5,
+// FR-013). If `send_pty_output` / `send_to_client` wrote straight to a stalled
+// TCP socket, the owning session's `pty_reader_task` would wedge on the write,
+// back-pressuring the PTY and freezing the running program — and, because the
+// authoritative `Term` is shared, stalling every other client with it. So each
+// REMOTE connection interposes this bounded queue: its `SharedWriter` only
+// enqueues (never awaits the socket), and a single drain task owns the write
+// half. When queued `PtyOutput` would exceed the cap the whole backlog is
+// dropped and its sessions are marked replay-dirty; the drain task then sends
+// each a fresh full `SessionReplay` once the link drains (catch-up-to-current,
+// the tmux `%pause`→`capture-pane` model). Local Unix-socket connections never
+// build one — they keep writing inline exactly as before (see `ClientSink` and
+// `handle_client`).
+
+/// Enqueue handle into a remote connection's bounded output queue. Cloneable and
+/// cheap: every `SharedWriter` clone for the connection (the window-registry slot
+/// and each attached session's `client_writer`) holds one, all funneling into the
+/// single queue drained by [`remote_output_drain`].
+#[derive(Clone)]
+pub struct RemoteSink(Arc<RemoteOutputShared>);
+
+/// Shared state between a remote connection's [`RemoteSink`] producers and its
+/// one drain task. The queue is guarded by a *std* mutex: every critical section
+/// is a few non-blocking `VecDeque` / `HashSet` operations and never spans an
+/// `.await`, so producers never park on the link (and the `!Send` guard makes the
+/// compiler enforce that discipline in the spawned drain task).
+struct RemoteOutputShared {
+    inner: std::sync::Mutex<RemoteQueueInner>,
+    /// Wakes the drain task when frames are enqueued, a session goes replay-dirty,
+    /// or the connection is shutting down.
+    notify: tokio::sync::Notify,
+}
+
+struct RemoteQueueInner {
+    /// Frames awaiting the link, in send order.
+    frames: VecDeque<OutFrame>,
+    /// Running total of queued droppable `PtyOutput` payload bytes — the quantity
+    /// the overflow cap ([`REMOTE_OUTPUT_QUEUE_BYTES`]) governs.
+    queued_pty_bytes: usize,
+    /// Running total of queued bytes across EVERY frame kind (droppable and
+    /// `Keep`), governed by [`REMOTE_OUTPUT_QUEUE_TOTAL_BYTES`] so an unbounded
+    /// `Keep` backlog on a stalled link is bounded too, not just `PtyOutput`.
+    queued_total_bytes: usize,
+    /// Sessions whose `PtyOutput` backlog was dropped and that therefore owe a
+    /// fresh full replay. While a session sits here its live `PtyOutput` is
+    /// suppressed (the pending replay supersedes it), which is what lets the queue
+    /// actually drain on a saturated link so the replay can be sent.
+    dirty: HashSet<SessionId>,
+    /// Set at teardown so the drain task flushes what remains and exits.
+    closed: bool,
+}
+
+/// One queued frame. Only [`OutFrame::Pty`] is droppable by the overflow policy;
+/// every other message (takeover notice, session-exit, workspace update, the
+/// initial attach replay, …) is kept so it is never silently lost. Each variant
+/// carries its accounted byte size so both the `PtyOutput` cap and the total-queue
+/// cap can be maintained in O(1) on pop.
+enum OutFrame {
+    Pty { session_id: SessionId, bytes: usize, msg: ServerMessage },
+    Keep { bytes: usize, msg: ServerMessage },
+}
+
+impl RemoteQueueInner {
+    /// Pop the next queued frame's message in send order, decrementing both the
+    /// `PtyOutput` byte total and the whole-queue byte total so the overflow caps
+    /// track what is still buffered.
+    fn pop_message(&mut self) -> Option<ServerMessage> {
+        match self.frames.pop_front()? {
+            OutFrame::Pty { bytes, msg, .. } => {
+                self.queued_pty_bytes = self.queued_pty_bytes.saturating_sub(bytes);
+                self.queued_total_bytes = self.queued_total_bytes.saturating_sub(bytes);
+                Some(msg)
+            }
+            OutFrame::Keep { bytes, msg } => {
+                self.queued_total_bytes = self.queued_total_bytes.saturating_sub(bytes);
+                Some(msg)
+            }
+        }
+    }
+}
+
+impl RemoteOutputShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RemoteQueueInner> {
+        // The only lock holders are the enqueue path and the drain task, both
+        // doing panic-free `VecDeque` / `HashSet` work, so poisoning cannot occur
+        // in practice; recover rather than propagate if it somehow does.
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl RemoteSink {
+    /// Enqueue one `ServerMessage` for the drain task. Never blocks on the link.
+    ///
+    /// `PtyOutput` is the sole droppable, high-volume stream: while its session is
+    /// replay-dirty it is suppressed, and when the queued `PtyOutput` backlog would
+    /// exceed [`REMOTE_OUTPUT_QUEUE_BYTES`] the entire backlog is dropped and every
+    /// affected session (this one included) is marked replay-dirty. Every other
+    /// message is kept in order, but the whole queue is bounded too
+    /// ([`REMOTE_OUTPUT_QUEUE_TOTAL_BYTES`] / [`REMOTE_OUTPUT_QUEUE_MAX_FRAMES`]):
+    /// on breach the droppable backlog is shed, and a queue still over ceiling is
+    /// a hopelessly stalled link, so the connection is closed (bounded resource
+    /// use, FR-013).
+    ///
+    /// The (potentially multi-MB) message clone is built BEFORE the queue lock is
+    /// taken, so the std mutex is only ever held for O(1) `VecDeque`/`HashSet`
+    /// bookkeeping — never for a large `memcpy`.
+    fn enqueue(&self, msg: &ServerMessage) {
+        let bytes = out_frame_bytes(msg);
+        let pty_session = match msg {
+            ServerMessage::PtyOutput { session_id, .. } => Some(*session_id),
+            _ => None,
+        };
+        // Clone off the lock (see doc-comment): the frame is prepared here and
+        // simply discarded if the overflow policy below decides to drop it.
+        let frame = pty_session.map_or_else(
+            || OutFrame::Keep { bytes, msg: msg.clone() },
+            |session_id| OutFrame::Pty { session_id, bytes, msg: msg.clone() },
+        );
+
+        let mut g = self.0.lock();
+        if g.closed {
+            return;
+        }
+        if let Some(session_id) = pty_session {
+            if g.dirty.contains(&session_id) {
+                // A fresh replay is already pending for this session; its live
+                // output is superseded — drop it and skip the wakeup.
+                return;
+            }
+            if g.queued_pty_bytes.saturating_add(bytes) > REMOTE_OUTPUT_QUEUE_BYTES {
+                // Overflow: shed the whole `PtyOutput` backlog and let a fresh
+                // replay catch every affected session (this one too) back up.
+                drop_pty_backlog(&mut g);
+                g.dirty.insert(session_id);
+            } else {
+                g.queued_pty_bytes += bytes;
+                g.queued_total_bytes += bytes;
+                g.frames.push_back(frame);
+            }
+        } else {
+            g.queued_total_bytes += bytes;
+            g.frames.push_back(frame);
+        }
+        enforce_queue_ceiling(&mut g);
+        drop(g);
+        self.0.notify.notify_one();
+    }
+
+    /// Mark the queue closed and wake the drain task so it flushes what remains
+    /// (e.g. a final `RemoteDisconnect`) and exits, dropping the write half and
+    /// closing the socket. Idempotent.
+    fn shutdown(&self) {
+        self.0.lock().closed = true;
+        self.0.notify.notify_one();
+    }
+}
+
+/// Drop every queued `PtyOutput` frame, marking each dropped session replay-dirty
+/// so the drain task sends it a fresh full replay once the link drains. Kept
+/// (control / replay) frames retain their relative order.
+fn drop_pty_backlog(g: &mut RemoteQueueInner) {
+    let mut kept = VecDeque::with_capacity(g.frames.len());
+    for frame in std::mem::take(&mut g.frames) {
+        match frame {
+            OutFrame::Pty { session_id, .. } => {
+                g.dirty.insert(session_id);
+            }
+            keep @ OutFrame::Keep { .. } => kept.push_back(keep),
+        }
+    }
+    g.frames = kept;
+    // Only the droppable `PtyOutput` bytes leave the queue; the `Keep` bytes that
+    // remain still count against the total.
+    g.queued_total_bytes = g.queued_total_bytes.saturating_sub(g.queued_pty_bytes);
+    g.queued_pty_bytes = 0;
+}
+
+/// Byte cost charged to a queued frame. The two high-volume streams are sized
+/// precisely so the total-queue cap tracks real memory; every other (small)
+/// control frame is charged a flat [`REMOTE_FRAME_NOMINAL_BYTES`], with the
+/// frame-count ceiling backstopping tiny-frame floods.
+fn out_frame_bytes(msg: &ServerMessage) -> usize {
+    match msg {
+        ServerMessage::PtyOutput { data, .. } => data.len(),
+        ServerMessage::SessionReplay { replay, .. } => replay.replay_zstd.len(),
+        _ => REMOTE_FRAME_NOMINAL_BYTES,
+    }
+}
+
+/// Bound total queue memory after an enqueue (feature 013 flow-control hardening,
+/// FR-013). When the queue exceeds its total-byte or frame-count ceiling — a
+/// stalled link accumulating `Keep` frames the `PtyOutput` cap does not govern —
+/// shed the droppable backlog first; if it is STILL over ceiling the link cannot
+/// keep up even with output dropped, so mark the connection closed for teardown
+/// (the client auto-reconnects to a fresh replay). A no-op on a healthy queue.
+fn enforce_queue_ceiling(g: &mut RemoteQueueInner) {
+    if g.queued_total_bytes <= REMOTE_OUTPUT_QUEUE_TOTAL_BYTES
+        && g.frames.len() <= REMOTE_OUTPUT_QUEUE_MAX_FRAMES
+    {
+        return;
+    }
+    drop_pty_backlog(g);
+    if g.queued_total_bytes > REMOTE_OUTPUT_QUEUE_TOTAL_BYTES
+        || g.frames.len() > REMOTE_OUTPUT_QUEUE_MAX_FRAMES
+    {
+        warn!(
+            queued_bytes = g.queued_total_bytes,
+            frames = g.frames.len(),
+            "remote output queue over ceiling after shedding backlog; closing stalled connection"
+        );
+        g.closed = true;
+    }
+}
+
+/// Build a remote connection's output queue and spawn its drain task (which owns
+/// the TCP write half). Returns the enqueue handle to install into the
+/// connection's `SharedWriter` plus the drain task's join handle, awaited
+/// (bounded) at teardown by [`shutdown_remote_output`].
+fn spawn_remote_output(
+    write_half: WriteHalf<TcpStream>,
+    server: IpcServerState,
+) -> (RemoteSink, tokio::task::JoinHandle<()>) {
+    let shared = Arc::new(RemoteOutputShared {
+        inner: std::sync::Mutex::new(RemoteQueueInner {
+            frames: VecDeque::new(),
+            queued_pty_bytes: 0,
+            queued_total_bytes: 0,
+            dirty: HashSet::new(),
+            closed: false,
+        }),
+        notify: tokio::sync::Notify::new(),
+    });
+    let drain = tokio::spawn(remote_output_drain(Arc::clone(&shared), write_half, server));
+    (RemoteSink(shared), drain)
+}
+
+/// The single writer for a remote connection: flush queued frames to the socket,
+/// then send a fresh full `SessionReplay` for any replay-dirty session, then park
+/// until more work arrives (or the connection closes). This is the ONLY task that
+/// writes the remote socket, so frame order on the wire is exactly enqueue order.
+async fn remote_output_drain(
+    shared: Arc<RemoteOutputShared>,
+    mut write_half: WriteHalf<TcpStream>,
+    server: IpcServerState,
+) {
+    loop {
+        // 1. Flush every queued frame, in order.
+        loop {
+            let Some(msg) = shared.lock().pop_message() else { break };
+            if write_message(&mut write_half, &msg).await.is_err() {
+                shared.lock().closed = true;
+                return;
+            }
+        }
+
+        // 2. Catch-up: send a fresh full replay for each replay-dirty session.
+        let dirty: Vec<SessionId> = {
+            let g = shared.lock();
+            g.dirty.iter().copied().collect()
+        };
+        for session_id in dirty {
+            if !send_resync_replay(&shared, &mut write_half, &server, session_id).await {
+                return;
+            }
+        }
+
+        // 3. Park until there is more to do, unless we are draining to close. Work
+        //    that arrived during step 2 keeps us looping instead of sleeping.
+        {
+            let g = shared.lock();
+            if !g.frames.is_empty() || !g.dirty.is_empty() {
+                continue;
+            }
+            if g.closed {
+                break;
+            }
+        }
+        shared.notify.notified().await;
+    }
+    // `write_half` drops here → the socket's write side closes.
+}
+
+/// Build and send one replay-dirty session's catch-up replay, reusing the same
+/// `take_session_replay` primitive as reattach. The dirty flag clears right after
+/// the snapshot but before the (possibly slow) socket write, so live output
+/// resumes queuing immediately and lands *after* this full-state replay. Returns
+/// `false` only when the socket write failed (the drain task then stops).
+async fn send_resync_replay(
+    shared: &Arc<RemoteOutputShared>,
+    write_half: &mut WriteHalf<TcpStream>,
+    server: &IpcServerState,
+    session_id: SessionId,
+) -> bool {
+    let term = {
+        let sessions = server.live_sessions.read().await;
+        sessions.get(&session_id).map(|s| Arc::clone(&s.term))
+    };
+    let Some(term) = term else {
+        // Session ended while dirty; nothing to replay.
+        shared.lock().dirty.remove(&session_id);
+        return true;
+    };
+    let replay =
+        match crate::attach_flow::take_session_replay(session_id, &term, &server.live_sessions)
+            .await
+        {
+            Ok(replay) => replay,
+            Err(e) => {
+                warn!(%session_id, "remote resync replay build failed: {e}");
+                shared.lock().dirty.remove(&session_id);
+                return true;
+            }
+        };
+    // Clear dirty after the snapshot, before the write: live `PtyOutput` resumes
+    // queuing now and follows this replay (catch-up-to-current). The brief
+    // snapshot→clear window drops output like the pre-013 reattach window, and this
+    // full-state replay supersedes it anyway.
+    shared.lock().dirty.remove(&session_id);
+    let msg = ServerMessage::SessionReplay { session_id, replay };
+    if write_message(write_half, &msg).await.is_err() {
+        shared.lock().closed = true;
+        return false;
+    }
+    true
+}
+
+/// Stop a remote connection's drain task at teardown, bounded so a wedged link
+/// cannot exceed the disable budget (FR-016). Any already-queued final frame
+/// (e.g. the sever `RemoteDisconnect`) flushes first; then the write half drops
+/// and the socket closes.
+async fn shutdown_remote_output(sink: &RemoteSink, mut drain_task: tokio::task::JoinHandle<()>) {
+    sink.shutdown();
+    if tokio::time::timeout(REMOTE_SEVER_NOTICE_TIMEOUT, &mut drain_task).await.is_err() {
+        drain_task.abort();
+    }
+}
+
+/// Shared control handle for the remote-control TCP listener. Lives in
+/// [`IpcServerState`]. The listener lifecycle itself is owned by a single
+/// [`remote_supervisor`] task (started once at server startup); this handle only
+/// carries the cross-task state the accept path and the dispatch path need:
+/// [`request_reload`](Self::request_reload) pokes the supervisor, `enabled`
+/// answers the disable-race refusal, and `conn_limit` is the 8-connection cap.
+/// Keeping the apply loop off the dispatch call graph is deliberate — it keeps a
+/// wedged tailscaled from stalling client message loops and avoids an async
+/// auto-trait inference cycle (dispatch → apply → accept → dispatch).
+pub struct RemoteControl {
+    /// Poked (synchronously, no await) whenever the config changes so the
+    /// supervisor re-reads and re-applies the `[remote]` table.
+    reload: tokio::sync::Notify,
+    /// Live "remote access is accepting" flag. Read by the accept path to answer
+    /// `Disabled` when a connection races a live disable; written by the
+    /// supervisor. `true` only while at least one listener is bound.
+    enabled: AtomicBool,
+    /// The 8-slot remote connection cap, shared across every bound address and
+    /// held for the life of each accepted connection.
+    conn_limit: Arc<tokio::sync::Semaphore>,
+    /// Admission cap on pending (pre-authorization) connections
+    /// ([`REMOTE_PENDING_HANDSHAKE_CAP`]), acquired the instant a stream is
+    /// accepted — before the handler is spawned — so a flood of half-open dialers
+    /// cannot spawn unbounded handshake tasks. Shared across every bound address;
+    /// held for the handshake's duration, released when the handler task ends.
+    handshake_limit: Arc<tokio::sync::Semaphore>,
+    /// Feature 013 (T023): live accepted remote connections, keyed by a monotonic
+    /// id, each holding the connection's sever channel. Fired on disable to drop
+    /// every remote connection out of its message loop and through the normal
+    /// detach cleanup (owning sessions untouched, FR-016). Populated only past the
+    /// handshake; the rebind path leaves it alone (it keeps live connections).
+    connections: tokio::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+    /// Monotonic allocator for [`connections`](Self::connections) keys.
+    next_conn_id: AtomicU64,
+}
+
+/// The currently-bound remote listener, owned by the [`remote_supervisor`] task.
+struct RemoteListenerState {
+    running: Option<RunningRemoteListener>,
+}
+
+/// One bound listener generation: the port, the tailnet addresses actually
+/// bound, and one accept task per address (aborting them closes the sockets).
+struct RunningRemoteListener {
+    port: u16,
+    addrs: Vec<IpAddr>,
+    accept_tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl RemoteControl {
+    /// Create a fresh, stopped control handle. Pair it with a [`remote_supervisor`]
+    /// task to actually drive the listener.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            reload: tokio::sync::Notify::new(),
+            enabled: AtomicBool::new(false),
+            conn_limit: Arc::new(tokio::sync::Semaphore::new(REMOTE_CONNECTION_CAP)),
+            handshake_limit: Arc::new(tokio::sync::Semaphore::new(REMOTE_PENDING_HANDSHAKE_CAP)),
+            connections: tokio::sync::Mutex::new(HashMap::new()),
+            next_conn_id: AtomicU64::new(0),
+        })
+    }
+
+    /// Ask the supervisor to re-read the config and re-apply the listener state.
+    /// Synchronous (no await) so callers on the per-connection dispatch path stay
+    /// entirely off the apply call graph. Coalesced: bursts collapse to a single
+    /// re-apply against the latest on-disk config.
+    fn request_reload(&self) {
+        self.reload.notify_one();
+    }
+
+    /// Register an accepted remote connection's sever channel, returning its id —
+    /// or `None` if remote access was disabled in the race between authorization
+    /// and here, telling the caller to close instead of serve. The disable path
+    /// fires every registered sever (see
+    /// [`sever_all_connections`](Self::sever_all_connections)) so each live remote
+    /// connection drops out of its message loop and runs the normal detach
+    /// cleanup. Registered before serving begins so even a pre-Hello connection is
+    /// signalable.
+    async fn register_connection(&self, sever: tokio::sync::oneshot::Sender<()>) -> Option<u64> {
+        // Check `enabled` under the same lock `sever_all_connections` drains under.
+        // `disable` clears `enabled` (via `stop`) before it drains, so a connection
+        // that raced a live disable between authorization and here is either drained
+        // by that disable (registered first) or refused registration (registered
+        // after) — it can never linger past a disable.
+        let mut conns = self.connections.lock().await;
+        if !self.enabled.load(Ordering::SeqCst) {
+            return None;
+        }
+        let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
+        conns.insert(id, sever);
+        Some(id)
+    }
+
+    /// Drop a remote connection's sever channel once its task has ended. A no-op
+    /// when the disable path already drained it.
+    async fn deregister_connection(&self, id: u64) {
+        self.connections.lock().await.remove(&id);
+    }
+
+    /// Bring the remote listener into line with `cfg`: start it when enabled
+    /// (bound strictly to this machine's tailnet addresses, never `0.0.0.0`),
+    /// stop it when disabled, or rebind it when the port or address set changed.
+    /// Idempotent when already matching. Fails closed — the listener stays down —
+    /// on any tailnet `LocalAPI` error. Never restarts the server (research D8).
+    /// `state` is the supervisor task's own listener state (no shared lock).
+    async fn apply(
+        self: &Arc<Self>,
+        state: &mut RemoteListenerState,
+        cfg: &scribe_config::RemoteConfig,
+        server: &IpcServerState,
+    ) {
+        if !cfg.enabled {
+            self.disable(state).await;
+            return;
+        }
+
+        // Enabled: enumerate this machine's tailnet bind addresses. Any LocalAPI
+        // failure fails closed — there is no wildcard fallback (FR-002).
+        let addrs = match crate::tailnet::bind_addresses().await {
+            Ok(addrs) => addrs,
+            Err(e) => {
+                warn!(
+                    "remote access enabled but tailnet address lookup failed ({e}); listener not started"
+                );
+                self.stop(state);
+                return;
+            }
+        };
+        if addrs.is_empty() {
+            warn!(
+                "remote access enabled but no tailnet addresses are available; listener not started"
+            );
+            self.stop(state);
+            return;
+        }
+
+        // No-op when already bound to the same port + address set.
+        if let Some(running) = &state.running
+            && running.port == cfg.port
+            && addr_set_matches(&running.addrs, &addrs)
+        {
+            return;
+        }
+
+        // First start, or a port/address change: tear the old listener down and
+        // rebind fresh.
+        self.stop(state);
+        self.start(state, cfg.port, addrs, server).await;
+    }
+
+    /// Bind one listener per address on `port` and spawn its accept task. Sets
+    /// `enabled` only if at least one address bound.
+    async fn start(
+        self: &Arc<Self>,
+        state: &mut RemoteListenerState,
+        port: u16,
+        addrs: Vec<IpAddr>,
+        server: &IpcServerState,
+    ) {
+        let mut accept_tasks = Vec::new();
+        let mut bound_addrs = Vec::new();
+        for ip in addrs {
+            let sockaddr = SocketAddr::new(ip, port);
+            match TcpListener::bind(sockaddr).await {
+                Ok(listener) => {
+                    let server = server.clone();
+                    let control = Arc::clone(self);
+                    accept_tasks.push(tokio::spawn(remote_accept_loop(listener, server, control)));
+                    bound_addrs.push(ip);
+                    info!(%sockaddr, "remote-control listener bound");
+                }
+                Err(e) => {
+                    warn!(%sockaddr, "failed to bind remote-control listener: {e}");
+                }
+            }
+        }
+        if accept_tasks.is_empty() {
+            warn!("remote access enabled but every tailnet bind failed; remote access inactive");
+            return;
+        }
+        // Publish the accepting state only once a listener is actually up, so the
+        // disable-race check never reports `enabled` for a down listener.
+        self.enabled.store(true, Ordering::SeqCst);
+        state.running = Some(RunningRemoteListener { port, addrs: bound_addrs, accept_tasks });
+    }
+
+    /// Stop accepting: clear `enabled` first (so an in-flight handler racing a
+    /// disable answers `Disabled`), then abort every accept task, which drops the
+    /// listeners and closes their sockets. Live remote connections are severed
+    /// separately by [`disable`](Self::disable) via
+    /// [`sever_all_connections`](Self::sever_all_connections); this tears down
+    /// only the accept side (shared with the rebind path, which keeps live
+    /// connections).
+    fn stop(&self, state: &mut RemoteListenerState) {
+        self.enabled.store(false, Ordering::SeqCst);
+        if let Some(running) = state.running.take() {
+            for task in running.accept_tasks {
+                task.abort();
+            }
+            info!(
+                port = running.port,
+                addrs = running.addrs.len(),
+                "remote-control listener stopped"
+            );
+        }
+    }
+
+    /// Disable remote access (research D8, FR-016): tear the listener down, then
+    /// sever every live remote connection and emit the bulk `severed` audit line.
+    /// Idempotent — a redundant disable with nothing live is a silent no-op, so it
+    /// is safe on every `ConfigReloaded` while remote access stays off. Owning-side
+    /// sessions are never touched: each connection is severed through its normal
+    /// detach path (FR-010).
+    async fn disable(&self, state: &mut RemoteListenerState) {
+        // Stop accepting and close the listener sockets first (no new connections),
+        // then sever the connections that are already established.
+        self.stop(state);
+        let severed = self.sever_all_connections().await;
+        if severed > 0 {
+            info!(
+                target: REMOTE_AUDIT_TARGET,
+                "remote: severed reason={}",
+                audit_reason(RemoteRefusal::Disabled)
+            );
+            debug!(count = severed, "severed live remote connections on disable");
+        }
+    }
+
+    /// Fire the sever signal for every registered remote connection. Each signaled
+    /// connection drops out of its message loop, sends its best-effort
+    /// `ServerMessage::RemoteDisconnect`, runs the normal detach cleanup (owning
+    /// sessions untouched, FR-016/FR-010), and closes — all on its own task, so a
+    /// wedged link cannot stall the others or this disable. Returns how many
+    /// connections were signaled (used to gate the bulk `severed` audit line).
+    async fn sever_all_connections(&self) -> usize {
+        // Drain the registry under the lock, then signal with the lock released so
+        // nothing is held across the per-connection sends.
+        let severs: Vec<tokio::sync::oneshot::Sender<()>> = {
+            let mut conns = self.connections.lock().await;
+            std::mem::take(&mut *conns).into_values().collect()
+        };
+        let count = severs.len();
+        for sever in severs {
+            // The receiver lives in the connection's serve task until it tears
+            // down, so this normally delivers; a receiver already gone (task ending
+            // on its own) makes `send` return `Err` — a harmless no-op.
+            if sever.send(()).is_err() {
+                debug!("remote sever target already gone");
+            }
+        }
+        count
+    }
+}
+
+/// Owns the remote-control listener lifecycle off the per-connection dispatch
+/// graph. Spawned once at server startup with its own [`RemoteListenerState`]:
+/// it applies the current `[remote]` config immediately (a no-op when disabled —
+/// the default), then re-applies on every [`RemoteControl::request_reload`]
+/// notification (fired by the `ConfigReloaded` path). Re-reading the config here
+/// serializes every start/stop/rebind through one task in notify order, so the
+/// server is never restarted and concurrent reloads can never race.
+///
+/// Both startup paths — a fresh `run_normal_server` and a post-upgrade
+/// `run_upgrade_receiver` — funnel through the same `run_server_loop`, so this
+/// supervisor also runs after a hot-reload handoff and re-derives the listener
+/// purely from config (feature 013 T032). A handoff carries no remote-listener
+/// or remote-connection state (see [`crate::handoff::HandoffState`]); the old
+/// server's remote TCP connections drop when it exits and the remote client
+/// auto-reconnects to the rebound listener (research D6).
+pub async fn remote_supervisor(control: Arc<RemoteControl>, server: IpcServerState) {
+    let mut state = RemoteListenerState { running: None };
+    loop {
+        match crate::config::load_config() {
+            Ok(cfg) => control.apply(&mut state, &cfg.remote, &server).await,
+            Err(e) => {
+                warn!("remote supervisor: config load failed ({e}); listener left unchanged");
+            }
+        }
+        // Wait for the next config change. `Notify` remembers a poke that arrives
+        // mid-apply, so no reload is missed.
+        control.reload.notified().await;
+    }
+}
+
+/// Whether two tailnet address lists cover the same set (order-independent).
+fn addr_set_matches(a: &[IpAddr], b: &[IpAddr]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let set: HashSet<IpAddr> = a.iter().copied().collect();
+    b.iter().all(|ip| set.contains(ip))
+}
+
+/// Accept loop for one bound tailnet listener. Spawned per address by
+/// [`RemoteControl::start`] and aborted on disable/rebind. Every accepted stream
+/// is handed to [`handle_remote_client`], which runs the preamble.
+async fn remote_accept_loop(
+    listener: TcpListener,
+    server: IpcServerState,
+    control: Arc<RemoteControl>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer_addr)) => {
+                // Admission control (FR-013 hardening): reserve a pending-handshake
+                // permit the instant the stream is accepted — BEFORE spawning any
+                // handler or reading a byte — so a flood of half-open dialers cannot
+                // spawn unbounded pre-auth work (mirrors `start_ipc_server`). Excess
+                // dialers are dropped immediately; the stream closes with the scope.
+                let Ok(handshake_permit) = Arc::clone(&control.handshake_limit).try_acquire_owned()
+                else {
+                    debug!(
+                        %peer_addr,
+                        cap = REMOTE_PENDING_HANDSHAKE_CAP,
+                        "pending-handshake admission cap reached; dropping remote connection"
+                    );
+                    continue;
+                };
+                // Match the local socket's latency profile for keystroke traffic.
+                if let Err(e) = stream.set_nodelay(true) {
+                    debug!(%peer_addr, "failed to set TCP_NODELAY on remote connection: {e}");
+                }
+                // Defense-in-depth: OS keepalive so a vanished peer is eventually
+                // detected at the TCP layer (the app idle-read timeout is the
+                // primary reclamation — see `REMOTE_IDLE_READ_TIMEOUT`).
+                enable_tcp_keepalive(&stream, peer_addr);
+                let server = server.clone();
+                let control = Arc::clone(&control);
+                tokio::spawn(async move {
+                    // `Box::pin` the large handshake future so it lives on the heap
+                    // rather than bloating this spawned task's stack frame.
+                    Box::pin(handle_remote_client(stream, peer_addr, server, control)).await;
+                    drop(handshake_permit);
+                });
+            }
+            Err(e) => {
+                error!("remote accept error: {e}");
+                // A network listener can surface persistent accept errors (e.g.
+                // EMFILE); a brief pause avoids a hot error loop.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+/// Enable TCP keepalive on an accepted remote stream so a peer that vanishes
+/// without a FIN/RST (laptop sleep, Wi-Fi roam) is eventually torn down at the OS
+/// layer, freeing its authorized-connection slot. Sets `SO_KEEPALIVE` plus tuned
+/// idle/interval timers ([`REMOTE_KEEPALIVE_IDLE`]/[`REMOTE_KEEPALIVE_INTERVAL`])
+/// via `socket2`, which maps them to the right per-platform sockopts
+/// (`TCP_KEEPIDLE` on Linux, `TCP_KEEPALIVE` on macOS) so a dead TCP path is
+/// detected in a few minutes rather than waiting out the application idle-read
+/// timeout ([`REMOTE_IDLE_READ_TIMEOUT`]), which remains the backstop for a
+/// TCP-alive but app-silent peer. Best-effort: a failure only forgoes the probe.
+fn enable_tcp_keepalive(stream: &TcpStream, peer_addr: SocketAddr) {
+    let params = socket2::TcpKeepalive::new()
+        .with_time(REMOTE_KEEPALIVE_IDLE)
+        .with_interval(REMOTE_KEEPALIVE_INTERVAL);
+    let sock = socket2::SockRef::from(stream);
+    if let Err(e) = sock.set_keepalive(true) {
+        debug!(%peer_addr, "failed to enable SO_KEEPALIVE on remote connection: {e}");
+        return;
+    }
+    if let Err(e) = sock.set_tcp_keepalive(&params) {
+        debug!(%peer_addr, "failed to tune TCP keepalive on remote connection: {e}");
+    }
+}
+
+/// Handle one accepted remote (TCP) connection per contracts/remote-protocol.md:
+/// read the `RemoteHandshake` preamble FIRST (bounded), resolve + authorize the
+/// tailnet identity, gate the protocol version and the connection cap, ALWAYS
+/// answer a typed `RemoteHandshakeReply`, and — only on acceptance — hand the
+/// stream to the shared per-connection dispatch. A malformed or non-preamble
+/// first frame closes bare (nothing protocol-aware to answer).
+async fn handle_remote_client(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    server: IpcServerState,
+    control: Arc<RemoteControl>,
+) {
+    let (mut reader, mut write_half) = tokio::io::split(stream);
+
+    let Some(client_version) = read_remote_preamble(&mut reader).await else {
+        // Malformed / non-`RemoteHandshake` first frame, timeout, or EOF: bare
+        // close, no reply (FR-003 — nothing protocol-aware to answer).
+        return;
+    };
+
+    match authorize_remote(&control, peer_addr, client_version).await {
+        Ok((identity, permit)) => {
+            // Reserve the sever-channel registration — which re-checks the disable
+            // flag under the same lock `sever_all_connections` drains under — BEFORE
+            // answering the handshake. This closes the disable race: a connection
+            // that raced a live disable between authorization and here is refused
+            // with a typed `Disabled` reply instead of being told `accepted` and
+            // then silently dropped (FR-016; contracts/remote-protocol.md Disable
+            // semantics). Registered before serving so even a pre-Hello connection
+            // is signalable; deregistered once the connection is fully done.
+            let (sever_tx, sever_rx) = tokio::sync::oneshot::channel();
+            let Some(conn_id) = control.register_connection(sever_tx).await else {
+                send_handshake_reply(&mut write_half, Some(RemoteRefusal::Disabled)).await;
+                info!(
+                    target: REMOTE_AUDIT_TARGET,
+                    "remote: refused peer={} reason={}",
+                    identity.node_name,
+                    audit_reason(RemoteRefusal::Disabled)
+                );
+                // The cap permit drops with this scope.
+                return;
+            };
+            send_handshake_reply(&mut write_half, None).await;
+            // Feature 013 (T029, research D5): interpose a bounded per-connection
+            // output queue between the fan-out hot path and this (possibly slow)
+            // tailnet link. The drain task owns the TCP write half; the
+            // `SharedWriter` only enqueues, so a stalled remote consumer can never
+            // block the server's authoritative `Term` or the other clients. Local
+            // Unix-socket connections write inline (see `handle_client`).
+            let (sink, drain_task) = spawn_remote_output(write_half, server.clone());
+            let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Remote(sink.clone())));
+            let ctx = RemoteContext {
+                node_name: identity.node_name,
+                login_name: identity.login_name,
+                sever: sever_rx,
+            };
+            serve_connection(reader, writer, server, Some(ctx)).await;
+            // Flush any final frame (e.g. the sever `RemoteDisconnect`) and stop the
+            // drain task before releasing the connection slot.
+            shutdown_remote_output(&sink, drain_task).await;
+            control.deregister_connection(conn_id).await;
+            // Release the connection-cap slot once the connection is fully done.
+            drop(permit);
+        }
+        Err(reject) => {
+            send_handshake_reply(&mut write_half, Some(reject.refusal)).await;
+            let detail = if reject.tagged { " detail=tagged" } else { "" };
+            info!(
+                target: REMOTE_AUDIT_TARGET,
+                "remote: refused peer={} reason={}{}",
+                reject.peer_label,
+                audit_reason(reject.refusal),
+                detail
+            );
+        }
+    }
+}
+
+/// A typed refusal decided by [`authorize_remote`], with the audit peer label
+/// and the tagged-node qualifier.
+struct RemoteReject {
+    refusal: RemoteRefusal,
+    /// Peer label for the audit line: the tailnet node name when known,
+    /// otherwise the connecting address.
+    peer_label: String,
+    /// Whether an `Unauthorized` refusal was specifically a tagged/identity-less
+    /// node (audit `detail=tagged`).
+    tagged: bool,
+}
+
+/// Resolve and gate an accepted remote connection after its preamble is read:
+/// disable-race → identity/authorization (fail closed) → exact version match →
+/// connection cap. Returns the authorized identity plus the held cap permit, or
+/// a typed [`RemoteReject`].
+async fn authorize_remote(
+    control: &Arc<RemoteControl>,
+    peer_addr: SocketAddr,
+    client_version: u32,
+) -> Result<(crate::tailnet::TailnetIdentity, tokio::sync::OwnedSemaphorePermit), RemoteReject> {
+    // Disable race: `remote.enabled` flipped off between accept and here.
+    if !control.enabled.load(Ordering::SeqCst) {
+        return Err(RemoteReject {
+            refusal: RemoteRefusal::Disabled,
+            peer_label: peer_addr.ip().to_string(),
+            tagged: false,
+        });
+    }
+
+    // Identity + same-account authorization; any LocalAPI failure fails closed.
+    let identity = match crate::tailnet::authorize_peer(peer_addr).await {
+        Ok(identity) => identity,
+        Err(crate::tailnet::PeerAuthError::Unauthorized { identity, tagged }) => {
+            return Err(RemoteReject {
+                refusal: RemoteRefusal::Unauthorized,
+                peer_label: identity.node_name,
+                tagged,
+            });
+        }
+        Err(crate::tailnet::PeerAuthError::IdentityUnavailable(e)) => {
+            debug!(%peer_addr, "remote identity unavailable: {e}");
+            return Err(RemoteReject {
+                refusal: RemoteRefusal::IdentityUnavailable,
+                peer_label: peer_addr.ip().to_string(),
+                tagged: false,
+            });
+        }
+    };
+
+    // Exact protocol-version gate (v1 policy, research D3).
+    if client_version != REMOTE_PROTOCOL_VERSION {
+        return Err(RemoteReject {
+            refusal: RemoteRefusal::IncompatibleVersion,
+            peer_label: identity.node_name,
+            tagged: false,
+        });
+    }
+
+    // Connection cap: reserve a slot, held for the connection's life.
+    match Arc::clone(&control.conn_limit).try_acquire_owned() {
+        Ok(permit) => Ok((identity, permit)),
+        Err(_) => Err(RemoteReject {
+            refusal: RemoteRefusal::Busy,
+            peer_label: identity.node_name,
+            tagged: false,
+        }),
+    }
+}
+
+/// Read the mandatory `RemoteHandshake` preamble as the first frame, bounded in
+/// both size ([`REMOTE_PREAMBLE_MAX_BYTES`], far below the shared 64 MiB frame
+/// budget so a forged length prefix cannot force a large pre-auth allocation) and
+/// time ([`REMOTE_HANDSHAKE_TIMEOUT`]). Returns the dialer's
+/// `remote_protocol_version`, or `None` for any oversized / malformed /
+/// non-preamble / timed-out / EOF first frame (all of which close bare).
+async fn read_remote_preamble<R>(reader: &mut R) -> Option<u32>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let read = read_bounded_handshake(reader);
+    match tokio::time::timeout(REMOTE_HANDSHAKE_TIMEOUT, read).await {
+        Ok(Ok(ClientMessage::RemoteHandshake { remote_protocol_version, .. })) => {
+            Some(remote_protocol_version)
+        }
+        Ok(Ok(other)) => {
+            debug!(?other, "remote first frame was not RemoteHandshake; closing");
+            None
+        }
+        Ok(Err(e)) => {
+            debug!("remote handshake read failed: {e}");
+            None
+        }
+        Err(_) => {
+            debug!("remote handshake preamble timed out; closing");
+            None
+        }
+    }
+}
+
+/// Read one length-prefixed `MessagePack` `ClientMessage` frame under a small
+/// pre-auth size cap ([`REMOTE_PREAMBLE_MAX_BYTES`]) — deliberately NOT the shared
+/// 64 MiB [`read_message`] budget, so an unauthenticated dialer's forged length
+/// prefix cannot make the server allocate a large buffer before identity,
+/// authorization, and version are checked. Same framing/decoding as
+/// [`read_message`], just with the tighter bound.
+async fn read_bounded_handshake<R>(reader: &mut R) -> Result<ClientMessage, ScribeError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let len = reader.read_u32().await.map_err(|e| ScribeError::Io { source: e })?;
+    if len > REMOTE_PREAMBLE_MAX_BYTES {
+        return Err(ScribeError::ProtocolError {
+            reason: format!("remote preamble size {len} exceeds cap {REMOTE_PREAMBLE_MAX_BYTES}"),
+        });
+    }
+    let mut buf = vec![0u8; len as usize];
+    reader.read_exact(&mut buf).await.map_err(|e| ScribeError::Io { source: e })?;
+    rmp_serde::from_slice(&buf).map_err(Into::into)
+}
+
+/// Write the mandatory `RemoteHandshakeReply` (accepted when `refusal` is `None`,
+/// otherwise the typed refusal). Always carries the server's remote-protocol and
+/// Scribe versions for the client's mismatch copy.
+async fn send_handshake_reply<W>(writer: &mut W, refusal: Option<RemoteRefusal>)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let reply = ServerMessage::RemoteHandshakeReply {
+        accepted: refusal.is_none(),
+        refusal,
+        server_remote_protocol_version: REMOTE_PROTOCOL_VERSION,
+        server_scribe_version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    if let Err(e) = write_message(writer, &reply).await {
+        debug!("failed to write remote handshake reply: {e}");
+    }
+}
+
+/// Best-effort, time-bounded final `ServerMessage::RemoteDisconnect` sent to a
+/// remote client the server is severing on disable (T023). The socket closes
+/// immediately afterward whether or not this frame lands; a wedged link is capped
+/// by [`REMOTE_SEVER_NOTICE_TIMEOUT`] so the 2-second disable budget holds. A lost
+/// notice is contract-safe: the client falls back to the reconnect path and the
+/// vanished listener yields the combined connection-failure copy.
+async fn send_remote_disconnect(writer: &SharedWriter, reason: RemoteRefusal) {
+    let msg = ServerMessage::RemoteDisconnect { reason };
+    if tokio::time::timeout(REMOTE_SEVER_NOTICE_TIMEOUT, try_send_message(writer, &msg))
+        .await
+        .is_err()
+    {
+        debug!("best-effort RemoteDisconnect send timed out during sever");
+    }
+}
+
+/// Canonical audit reason token for a refusal, mirroring the wire `RemoteRefusal`
+/// taxonomy exactly (contracts/settings-and-config.md Audit log surface).
+fn audit_reason(refusal: RemoteRefusal) -> &'static str {
+    match refusal {
+        RemoteRefusal::Disabled => "disabled",
+        RemoteRefusal::Unauthorized => "unauthorized",
+        RemoteRefusal::IdentityUnavailable => "identity-unavailable",
+        RemoteRefusal::IncompatibleVersion => "version",
+        RemoteRefusal::Busy => "busy",
+    }
+}
+
 /// Acquire the server socket with singleton enforcement.
 ///
 /// In normal mode, uses an advisory flock on `server.lock` to serialise
@@ -623,41 +1789,226 @@ fn verify_peer_uid(stream: &tokio::net::UnixStream) -> bool {
     true
 }
 
-/// Per-client connection handler. Performs `Hello`/`Welcome` handshake, then
-/// reads `ClientMessage`s and dispatches them.
+/// Per-client connection handler for the local Unix socket. Splits the stream
+/// and drives the shared [`serve_connection`] core (`Hello`/`Welcome` handshake
+/// then message dispatch). Local connections carry no remote context.
 async fn handle_client(stream: tokio::net::UnixStream, server: IpcServerState) {
     let (reader, writer) = tokio::io::split(stream);
-    let writer: SharedWriter = Arc::new(Mutex::new(writer));
-    let mut reader = reader;
+    let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Local(Box::new(writer))));
+    serve_connection(reader, writer, server, None).await;
+}
 
+/// Drive the post-handshake per-connection protocol over any framed stream —
+/// shared verbatim by the local Unix-socket path and the feature-013 remote TCP
+/// path. `remote` is `Some` only for accepted remote connections: it gates the
+/// transient no-Hello actions off (they are local-socket only) and carries the
+/// tailnet identity for the accepted/disconnect audit lines. Local connections
+/// (`None`) behave exactly as before.
+async fn serve_connection<R>(
+    mut reader: R,
+    writer: SharedWriter,
+    server: IpcServerState,
+    remote: Option<RemoteContext>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
     // Track which sessions this client has attached to, for detach on disconnect.
     let attached_ids: AttachedSessionIds = Arc::new(Mutex::new(HashSet::new()));
 
+    // Feature 013: split the remote context into the display identity (kept for
+    // the accepted/disconnect audit lines) and the sever signal (moved into the
+    // read paths so a disable can drop this connection out of its loop). Local
+    // Unix-socket connections carry neither.
+    let (remote_identity, mut sever_rx) = match remote {
+        Some(ctx) => (
+            Some(RemoteIdentity { node_name: ctx.node_name, login_name: ctx.login_name }),
+            Some(ctx.sever),
+        ),
+        None => (None, None),
+    };
+
+    // The connection's controller identity — `Local` for the Unix socket,
+    // `Remote { device, account }` for an authenticated tailnet peer. Threaded
+    // into the claim path so a takeover can name the new controller and the window
+    // list can surface who holds each window (FR-007, FR-009b).
+    let controller = remote_identity.as_ref().map_or(ControllerIdentity::Local, |id| {
+        ControllerIdentity::Remote {
+            device_name: id.node_name.clone(),
+            login_name: id.login_name.clone(),
+        }
+    });
+
+    let conn = ConnState { server: &server, writer: &writer, attached_ids: &attached_ids };
+
     let Some(window_id) =
-        establish_client_window(&mut reader, &server, &writer, &attached_ids).await
+        establish_client_window(&mut reader, conn, &controller, sever_rx.as_mut()).await
     else {
+        // A bare pre-Hello close, or remote access was disabled before Hello
+        // arrived (T023). No window was claimed, so just close.
+        if remote_identity.is_some() {
+            debug!("remote connection closed before establishing a window");
+        }
         return;
     };
 
-    run_client_message_loop(&mut reader, window_id, &server, &writer, &attached_ids).await;
+    if let Some(id) = &remote_identity {
+        info!(
+            target: REMOTE_AUDIT_TARGET,
+            "remote: accepted peer={} user={} window={window_id}", id.node_name, id.login_name
+        );
+    }
 
-    detach_client_window(window_id, &server, &attached_ids, &writer).await;
+    let exit = run_client_message_loop(&mut reader, window_id, conn, sever_rx).await;
+    finish_served_connection(exit, window_id, conn, remote_identity.as_ref()).await;
+}
+
+/// Tear a served connection down after its message loop returns: on a sever, send
+/// the best-effort final `RemoteDisconnect` (T023); always run the detach cleanup
+/// (window ownership released, owning sessions untouched); then, for a remote
+/// connection, log the per-connection `disconnect` audit line — but only for a
+/// genuine peer disconnect, since a sever is covered by the single bulk `severed`
+/// line emitted on disable.
+async fn finish_served_connection(
+    exit: LoopExit,
+    window_id: WindowId,
+    conn: ConnState<'_>,
+    remote_identity: Option<&RemoteIdentity>,
+) {
+    if matches!(exit, LoopExit::Severed) {
+        send_remote_disconnect(conn.writer, RemoteRefusal::Disabled).await;
+    }
+
+    detach_client_window(window_id, conn.server, conn.attached_ids, conn.writer).await;
+
+    if let (Some(id), LoopExit::Disconnected) = (remote_identity, exit) {
+        info!(
+            target: REMOTE_AUDIT_TARGET,
+            "remote: disconnect peer={} window={window_id}", id.node_name
+        );
+    }
 }
 
 async fn establish_client_window<R>(
     reader: &mut R,
-    server: &IpcServerState,
-    writer: &SharedWriter,
-    attached_ids: &AttachedSessionIds,
+    conn: ConnState<'_>,
+    controller: &ControllerIdentity,
+    mut sever_rx: Option<&mut tokio::sync::oneshot::Receiver<()>>,
 ) -> Option<WindowId>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    match read_message::<ClientMessage, _>(reader).await {
-        Ok(ClientMessage::Hello { window_id, clipboard_gating }) => {
-            Some(handle_client_hello(window_id, clipboard_gating, server, writer).await)
+    let is_remote = matches!(controller, ControllerIdentity::Remote { .. });
+    loop {
+        // Race each pre-Hello read against the sever signal so a disable (T023)
+        // closes a remote connection even before it claims a window; the read also
+        // carries the remote idle-read timeout so an abandoned pre-Hello dialer
+        // frees its slot. Local connections pass no sever channel and never time
+        // out, so this degenerates to today's bare read.
+        let first = tokio::select! {
+            biased;
+            () = await_sever(sever_rx.as_deref_mut()) => {
+                debug!("remote access disabled before Hello; closing");
+                return None;
+            }
+            read = read_client_frame(reader, is_remote) => read,
+        };
+        let Some(first) = first else {
+            debug!("remote connection idle before Hello; closing");
+            return None;
+        };
+        match first {
+            Ok(ClientMessage::Hello { window_id, clipboard_gating, takeover }) => {
+                let claim = HelloClaim {
+                    requested_window_id: window_id,
+                    clipboard_gating,
+                    takeover,
+                    controller,
+                };
+                return Some(handle_client_hello(claim, conn.server, conn.writer).await);
+            }
+            // Feature 013 (fix 5): the picker's window-probe. An ALREADY-authorized
+            // remote connection may enumerate this machine's windows read-only
+            // BEFORE `Hello`; reply with `WindowList` and keep reading (the probe
+            // then closes, or — tolerated — a `Hello` follows on the same link). No
+            // window is registered by a bare `ListWindows`. Every OTHER non-Hello
+            // first frame still closes (transient no-Hello actions stay local-only).
+            Ok(ClientMessage::ListWindows) if is_remote => {
+                handle_list_windows(
+                    &conn.server.connected_clients,
+                    &conn.server.window_controllers,
+                    &conn.server.workspace_manager,
+                    conn.writer,
+                )
+                .await;
+                // Fall through to the next loop iteration to read the next frame.
+            }
+            // Remote (TCP) connections: any other first frame after the accepted
+            // handshake MUST be `Hello`. Transient no-Hello actions (update checks,
+            // hook events, `ListRemotePeers`) and legacy no-Hello claims are
+            // local-socket only per contracts/remote-protocol.md, so refuse by
+            // closing.
+            Ok(other) if is_remote => {
+                debug!(
+                    ?other,
+                    "remote connection sent an unexpected non-Hello first frame; closing"
+                );
+                return None;
+            }
+            Ok(msg) => {
+                return establish_local_first_frame(
+                    msg,
+                    conn.server,
+                    conn.writer,
+                    conn.attached_ids,
+                )
+                .await;
+            }
+            Err(ScribeError::Io { .. }) => {
+                debug!("client disconnected before Hello");
+                return None;
+            }
+            Err(e) => {
+                warn!("failed to read Hello message: {e}");
+                return None;
+            }
         }
-        Ok(ClientMessage::CheckForUpdates) => {
+    }
+}
+
+/// Read the next client frame, applying the remote idle-read timeout
+/// ([`REMOTE_IDLE_READ_TIMEOUT`]) ONLY for remote (TCP) connections so an
+/// abandoned peer's scarce connection slot is reclaimed. Returns `None` when the
+/// idle timeout expires (the caller treats that as a disconnect); local
+/// Unix-socket connections (`is_remote == false`) keep today's untimed read and
+/// always return `Some`.
+async fn read_client_frame<R>(
+    reader: &mut R,
+    is_remote: bool,
+) -> Option<Result<ClientMessage, ScribeError>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let read = read_message::<ClientMessage, _>(reader);
+    if is_remote {
+        tokio::time::timeout(REMOTE_IDLE_READ_TIMEOUT, read).await.ok()
+    } else {
+        Some(read.await)
+    }
+}
+
+/// Handle a non-`Hello` first frame on the LOCAL Unix socket: the transient
+/// no-Hello actions (update checks, hook events) that never register a window,
+/// or a legacy client whose first message is not a `Hello`. All are local-socket
+/// only — the remote path refuses them in [`establish_client_window`]. Split out
+/// so the establish path stays under the cognitive-complexity budget.
+async fn establish_local_first_frame(
+    msg: ClientMessage,
+    server: &IpcServerState,
+    writer: &SharedWriter,
+    attached_ids: &AttachedSessionIds,
+) -> Option<WindowId> {
+    match msg {
+        ClientMessage::CheckForUpdates => {
             // Transient action: the caller (e.g. the standalone settings
             // window) does not want a registered window. Run the check, send
             // back a single result, and let the connection close without ever
@@ -665,14 +2016,14 @@ where
             handle_transient_check_for_updates(server, writer).await;
             None
         }
-        Ok(ClientMessage::ListReleases) => {
+        ClientMessage::ListReleases => {
             // Same transient-action shape as `CheckForUpdates`: settings
             // window opens a fresh socket, sends `ListReleases`, reads one
             // `ReleaseList` reply, closes. No window registration required.
             handle_transient_list_releases(server, writer).await;
             None
         }
-        Ok(ClientMessage::TriggerUpdate) => {
+        ClientMessage::TriggerUpdate => {
             // Transient install kick-off from the standalone settings
             // window. The updater's single-slot trigger channel collapses
             // duplicate requests, so it is safe even if an in-client
@@ -680,22 +2031,35 @@ where
             handle_transient_trigger_update(server);
             None
         }
-        Ok(ClientMessage::HookEvent(event)) => {
+        ClientMessage::HookEvent(event) => {
             // Transient one-shot: scribe-hook-helper sends one HookEvent,
             // server dispatches, connection closes. No Welcome, no reply.
             // See specs/003-ai-hook-channel/contracts/wire-protocol.md.
             hook_ingress::handle(server, event).await;
             None
         }
-        Ok(msg) => Some(handle_legacy_client(msg, server, writer, attached_ids).await),
-        Err(ScribeError::Io { .. }) => {
-            debug!("client disconnected before Hello");
+        ClientMessage::ListRemotePeers => {
+            // Feature 013 transient local-only action (contracts/remote-protocol
+            // Local helper messages): enumerate this machine's own same-account
+            // tailnet peers for the connect picker, reply once, close. Local-
+            // socket only by construction — remote (TCP) connections never reach
+            // here because a non-Hello first frame is refused in
+            // `establish_client_window`, satisfying "refused over TCP" (a remote
+            // peer has no business enumerating a third machine's tailnet view).
+            handle_transient_list_remote_peers(writer).await;
             None
         }
-        Err(e) => {
-            warn!("failed to read Hello message: {e}");
+        ClientMessage::GetRemoteEnv => {
+            // Feature 013 transient local-only action: report this machine's
+            // signed-in tailnet account + whether Tailscale is detected for the
+            // Settings → Remote section, reply once, close. Local-socket only by
+            // the same construction as `ListRemotePeers` — a non-Hello first
+            // frame is refused over TCP in `establish_client_window`, so a remote
+            // peer cannot read a third machine's tailnet identity.
+            handle_transient_get_remote_env(writer).await;
             None
         }
+        other => Some(handle_legacy_client(other, server, writer, attached_ids).await),
     }
 }
 
@@ -718,39 +2082,143 @@ async fn handle_transient_list_releases(server: &IpcServerState, writer: &Shared
     send_message(writer, &ServerMessage::ReleaseList { state }).await;
 }
 
-async fn handle_client_hello(
+/// Feature 013: serve a transient `ListRemotePeers` — this machine's own
+/// same-account tailnet peers for the connect picker, resolved from `LocalAPI`
+/// status. Any `LocalAPI` failure yields an empty list (the picker falls back to
+/// manual host entry); the server never blocks local serving on tailscaled.
+/// Offline peers are kept with `online = false` so the picker can grey them.
+async fn handle_transient_list_remote_peers(writer: &SharedWriter) {
+    info!("transient client requested remote peer list");
+    let peers = match crate::tailnet::fetch_status().await {
+        Ok(status) => status
+            .peers
+            .into_iter()
+            .filter(|peer| peer.same_account)
+            .map(|peer| RemotePeerInfo {
+                name: peer.name,
+                addr: peer.addr.to_string(),
+                online: peer.online,
+            })
+            .collect(),
+        Err(e) => {
+            debug!("remote peer list unavailable: {e}");
+            Vec::new()
+        }
+    };
+    send_message(writer, &ServerMessage::RemotePeerList { peers }).await;
+}
+
+/// Feature 013: serve a transient `GetRemoteEnv` — this machine's signed-in
+/// tailnet account name and whether Tailscale is detected at all, for the
+/// Settings → Remote section (UX-003). Resolved from `LocalAPI` status. Any
+/// `LocalAPI` failure fails closed to `{ account: None, tailscale_detected:
+/// false }` (FR-015), which drives the passive "Tailscale not detected" notice;
+/// the server never blocks local serving on tailscaled. An empty login name (a
+/// signed-in node should always carry one) is normalised to `None` so the
+/// statement keeps its generic account placeholder instead of rendering a blank.
+async fn handle_transient_get_remote_env(writer: &SharedWriter) {
+    info!("transient client requested remote env");
+    let (account, tailscale_detected) = match crate::tailnet::fetch_status().await {
+        Ok(status) => {
+            let login = status.self_identity.login_name;
+            ((!login.is_empty()).then_some(login), true)
+        }
+        Err(e) => {
+            debug!("remote env unavailable: {e}");
+            (None, false)
+        }
+    };
+    send_message(writer, &ServerMessage::RemoteEnv { account, tailscale_detected }).await;
+}
+
+/// The connection-level inputs a `Hello` carries into the feature-013 claim
+/// path. Bundled into one value so the handler stays under Clippy's argument /
+/// boolean-parameter thresholds and the claim intent travels as a unit.
+struct HelloClaim<'a> {
     requested_window_id: Option<WindowId>,
-    client_clipboard_gating: bool,
+    /// Spec 010 C7 clipboard-gating capability advertised by this client.
+    clipboard_gating: bool,
+    /// Feature 013: explicit takeover of a currently-connected window.
+    takeover: bool,
+    /// This connection's controller identity (local vs remote peer).
+    controller: &'a ControllerIdentity,
+}
+
+async fn handle_client_hello(
+    claim: HelloClaim<'_>,
     server: &IpcServerState,
     writer: &SharedWriter,
 ) -> WindowId {
     // Snapshot which windows have sessions, then resolve + register the
     // assignment atomically under a single `connected_clients` write lock
-    // (see `claim_window`). The previous read-then-write split was a TOCTOU
-    // race: a post-update reconnect burst could let two `Hello`s for the
-    // same window both observe it free and both register.
+    // (see `resolve_and_register_claim`). The previous read-then-write split
+    // was a TOCTOU race: a post-update reconnect burst could let two `Hello`s
+    // for the same window both observe it free and both register.
     let all_windows = {
         let wm = server.workspace_manager.read().await;
         wm.window_ids_with_sessions()
     };
 
-    let (assigned, other_windows) =
-        claim_window(&server.connected_clients, requested_window_id, &all_windows, writer).await;
+    let outcome = resolve_and_register_claim(
+        WindowOwnership {
+            connected: &server.connected_clients,
+            controllers: &server.window_controllers,
+            gating: &server.window_clipboard_gating,
+        },
+        &claim,
+        &all_windows,
+        writer,
+    )
+    .await;
 
-    // Spec 010 C7: record the client's clipboard-gating capability bit so
-    // the OSC 52 dispatcher can short-circuit to the headless deny path
-    // when the attached client does not understand the new variants.
-    server.window_clipboard_gating.write().await.insert(assigned, client_clipboard_gating);
+    match outcome {
+        ClaimOutcome::Owned { window_id, other_windows, displaced } => {
+            // Feature 013: a takeover swapped out a live controller — notify it so
+            // it freezes its last frame and offers reclaim (FR-007). This send is
+            // the only takeover side effect left outside the claim lock: the
+            // capability bit and controller identity were already re-bound to this
+            // claimant atomically under the lock (see `resolve_and_register_claim`),
+            // so no stale clipboard-gating or policy state can survive the swap
+            // (FR-014), and the transition itself is traced there. The
+            // clipboard-bridge routing then follows automatically — the new
+            // controller's AttachSessions re-points each session's client writer
+            // (T016), and the displaced client's later disconnect can no longer
+            // detach them (see `detach_sessions`' ptr-eq guard).
+            if let Some(displaced_writer) = displaced {
+                send_message(&displaced_writer, &claim.controller.window_taken_over()).await;
+            }
 
-    if !other_windows.is_empty() {
-        info!(%assigned, other_count = other_windows.len(), "Welcome includes other_windows — client will spawn additional processes");
+            if !other_windows.is_empty() {
+                info!(%window_id, other_count = other_windows.len(), "Welcome includes other_windows — client will spawn additional processes");
+            }
+            let welcome =
+                ServerMessage::Welcome { window_id, other_windows, clipboard_gating: true };
+            send_message(writer, &welcome).await;
+
+            info!(%window_id, client_clipboard_gating = claim.clipboard_gating, "client identified via Hello");
+            window_id
+        }
+        ClaimOutcome::LostControl { window_id, controller: current } => {
+            // Feature 013 auto-reconnect lost-control path (contracts/remote-
+            // protocol.md): a remote client re-claimed (takeover = false) a
+            // window another controller now holds. Complete the Welcome for the
+            // requested id, then immediately displace it — no sessions attach and
+            // the current controller keeps the window (never a silent seizure,
+            // never a silent different-window). The client renders the standard
+            // lost-control state and offers explicit reclaim (FR-011). The
+            // connection is intentionally NOT registered, so its later teardown
+            // leaves the current controller's writer + state untouched.
+            let welcome = ServerMessage::Welcome {
+                window_id,
+                other_windows: Vec::new(),
+                clipboard_gating: true,
+            };
+            send_message(writer, &welcome).await;
+            send_message(writer, &current.window_taken_over()).await;
+            info!(%window_id, "remote reconnect landed on a controlled window; sent lost-control");
+            window_id
+        }
     }
-    let welcome =
-        ServerMessage::Welcome { window_id: assigned, other_windows, clipboard_gating: true };
-    send_message(writer, &welcome).await;
-
-    info!(%assigned, client_clipboard_gating, "client identified via Hello");
-    assigned
 }
 
 async fn handle_legacy_client(
@@ -762,8 +2230,12 @@ async fn handle_legacy_client(
     let window_id = WindowId::new();
     // A fresh `WindowId::new()` cannot collide, so a direct insert is safe
     // here. Any path whose window ID *can* collide must go through
-    // `claim_window` so the check and the insert stay atomic.
+    // `resolve_and_register_claim` so the check and the insert stay atomic.
     server.connected_clients.write().await.insert(window_id, Arc::clone(writer));
+    // Feature 013: legacy clients are always local; keep `window_controllers`
+    // in lock-step with `connected_clients` so the window list treats the
+    // window as locally controlled (no remote banner).
+    server.window_controllers.write().await.insert(window_id, ControllerIdentity::Local);
     info!(%window_id, "legacy client (no Hello), assigned window");
 
     let mut context = ClientDispatchContext { server, writer, attached_ids, window_id };
@@ -771,34 +2243,254 @@ async fn handle_legacy_client(
     window_id
 }
 
-/// Atomically resolve a window assignment and register the connecting
-/// client's writer under a single `connected_clients` write lock.
+/// Outcome of resolving + registering a `Hello` window claim (feature 013).
+/// `Owned` covers a fresh window, an adopted restart window, a local
+/// no-takeover assignment, and a takeover swap (the latter carrying the
+/// `displaced` writer to notify). `LostControl` is the remote auto-reconnect
+/// landing on a window another controller still holds.
+enum ClaimOutcome {
+    Owned {
+        window_id: WindowId,
+        other_windows: Vec<WindowId>,
+        /// The previous owner's writer when a takeover swapped it out; `None`
+        /// for a fresh / adopted / first claim.
+        displaced: Option<SharedWriter>,
+    },
+    LostControl {
+        window_id: WindowId,
+        /// Identity of the controller that keeps the window, to name in the
+        /// immediate lost-control `WindowTakenOver` (FR-011).
+        controller: ControllerIdentity,
+    },
+}
+
+/// Pure decision (no locks, no side effects) for how a claim against the current
+/// `connected` map resolves. Split out from [`resolve_and_register_claim`] so the
+/// takeover / lost-control branching can be reasoned about in isolation.
+enum ClaimResolution {
+    /// Register `assigned` normally (fresh, adopted restart window, or a LOCAL
+    /// no-takeover claim of a connected window that yields a different/new
+    /// window — today's behavior, byte-for-byte).
+    Assign { assigned: WindowId, other_windows: Vec<WindowId> },
+    /// Take over a currently-connected window: swap its writer, displacing the
+    /// current owner.
+    Takeover { window_id: WindowId, other_windows: Vec<WindowId> },
+    /// Remote non-takeover claim of a still-connected window: lost-control.
+    LostControl { window_id: WindowId },
+}
+
+/// How a claim should treat a target window that is already connected
+/// (feature 013). Derived from `takeover` + the connection's local/remote
+/// transport so [`resolve_window_claim`] takes one mode instead of two bools.
+#[derive(Clone, Copy)]
+enum ClaimMode {
+    /// Explicit takeover (picker attach or banner reclaim) — swap the writer.
+    Takeover,
+    /// Remote auto-reconnect — lost-control rather than a silent seize.
+    RemoteReconnect,
+    /// Local plain claim — assign a different/new window (today's behavior).
+    LocalPlain,
+}
+
+/// Decide how a `Hello` claim resolves against the current `connected` map.
 ///
-/// Splitting the "is this window already connected?" check from the
-/// registration (read lock, drop, then write lock) is a TOCTOU race: under
-/// the concurrent-reconnect burst that an update triggers, two `Hello`s for
-/// the same window both observe it free and both register, leaving two live
-/// clients bound to one window ID. Holding the write lock across the check
-/// and the insert makes the claim indivisible.
+/// [`ClaimMode::Takeover`] of a connected window swaps the writer;
+/// [`ClaimMode::RemoteReconnect`] onto a connected window is lost-control
+/// (auto-reconnect convergence, never a silent seizure). Every other case —
+/// including [`ClaimMode::LocalPlain`] onto a connected window — falls through to
+/// [`resolve_window_assignment`], preserving today's behavior exactly.
+fn resolve_window_claim<V>(
+    hello_window_id: Option<WindowId>,
+    mode: ClaimMode,
+    windows_with_sessions: &HashSet<WindowId>,
+    connected: &HashMap<WindowId, V>,
+) -> ClaimResolution {
+    if let Some(window_id) = hello_window_id
+        && connected.contains_key(&window_id)
+    {
+        match mode {
+            ClaimMode::Takeover => {
+                // Explicit takeover: swap the connected window's writer.
+                // `other_windows` mirrors an adopt of this window — the other
+                // still-unconnected session windows.
+                let other_windows = windows_with_sessions
+                    .iter()
+                    .filter(|wid| **wid != window_id && !connected.contains_key(wid))
+                    .copied()
+                    .collect();
+                return ClaimResolution::Takeover { window_id, other_windows };
+            }
+            ClaimMode::RemoteReconnect => return ClaimResolution::LostControl { window_id },
+            // Local, no takeover: fall through to the unchanged assignment path,
+            // which assigns a different/new window (never displaces).
+            ClaimMode::LocalPlain => {}
+        }
+    }
+    let (assigned, other_windows) =
+        resolve_window_assignment(hello_window_id, windows_with_sessions, connected);
+    ClaimResolution::Assign { assigned, other_windows }
+}
+
+/// Feature 013: the three per-window ownership maps that move together on every
+/// control transition, bundled into one `Copy` borrow so the claim path stays
+/// under Clippy's argument threshold (mirrors [`ConnState`]). Always write-locked
+/// in field order — `connected` → `controllers` → `gating` — so the nested
+/// acquisition can never deadlock against detach or the window list.
+#[derive(Clone, Copy)]
+struct WindowOwnership<'a> {
+    connected: &'a ConnectedClients,
+    controllers: &'a WindowControllers,
+    gating: &'a WindowClipboardGating,
+}
+
+/// Atomically resolve a window claim and register the connecting client's writer,
+/// controller identity, AND clipboard-gating capability bit under one lock hold.
 ///
-/// `other_windows` is filtered against the same write-locked
-/// `connected_clients` map, so it never lists a window whose client is
-/// already or concurrently registered. `all_windows` (which windows have
-/// sessions) is only a brief snapshot taken just before the lock: a window
-/// that gains sessions in that gap may be omitted from one fan-out and is
-/// re-offered on the next reconnect/`Welcome`. That can transiently
-/// under-fan-out but never produces a duplicate window.
+/// Holding the write locks across the check and the insert makes the claim
+/// indivisible: concurrent `Hello`s for the same window can never both register
+/// (the pre-013 TOCTOU race that a post-update reconnect burst triggers), and a
+/// near-simultaneous takeover burst resolves deterministically to exactly one
+/// controller. All three per-window maps move together so nothing can drift from
+/// the writer slot: `window_controllers` carries the controller identity and
+/// `window_clipboard_gating` the spec-010 capability bit (feature-013 T027). The
+/// capability re-bind was previously done by the caller *after* the lock dropped,
+/// which let a losing takeover overwrite the winner's bit — no stale clipboard
+/// gating may survive a swap (FR-014), so it now happens here under the lock.
+/// Lock order is `connected_clients` → `window_controllers` →
+/// `window_clipboard_gating`, never the reverse (detach and the window list only
+/// ever take these in that order or standalone, so no cycle exists).
+///
+/// - `Assign`: insert the resolved window + controller + capability bit (today's
+///   behavior, now atomic with the capability bit).
+/// - `Takeover`: swap the writer for the connected window, re-bind the controller
+///   identity and capability bit to the new owner, and return the displaced
+///   writer so the caller can send it `WindowTakenOver`.
+/// - `LostControl`: leave the current owner untouched (this connection is NOT
+///   registered, and the current controller's capability bit is preserved) and
+///   report the current controller's identity to name.
+///
+/// Every claim that establishes or transfers ownership is traced after the lock
+/// drops via [`log_control_transition`]; a `LostControl` landing changes no
+/// ownership and is logged by the caller as the reconnect outcome instead.
+///
+/// `other_windows` is filtered against the same write-locked map so it never
+/// lists a concurrently-registered window; `all_windows` is a brief snapshot
+/// (see `resolve_window_assignment`) that can transiently under-fan-out but
+/// never produce a duplicate window.
+async fn resolve_and_register_claim(
+    ownership: WindowOwnership<'_>,
+    claim: &HelloClaim<'_>,
+    all_windows: &HashSet<WindowId>,
+    writer: &SharedWriter,
+) -> ClaimOutcome {
+    let mode = if claim.takeover {
+        ClaimMode::Takeover
+    } else if matches!(claim.controller, ControllerIdentity::Remote { .. }) {
+        ClaimMode::RemoteReconnect
+    } else {
+        ClaimMode::LocalPlain
+    };
+    // Resolve, register the writer/controller, and re-bind the capability bit as
+    // one indivisible transition, capturing the displaced controller (if any) for
+    // the post-lock trace. The trace itself is emitted after the guards drop so a
+    // slow blocking log writer never stalls a concurrent claim/detach/list.
+    let (outcome, displaced_controller) = {
+        let mut connected = ownership.connected.write().await;
+        let mut controllers = ownership.controllers.write().await;
+        let mut gating = ownership.gating.write().await;
+        match resolve_window_claim(claim.requested_window_id, mode, all_windows, &connected) {
+            ClaimResolution::Assign { assigned, other_windows } => {
+                connected.insert(assigned, Arc::clone(writer));
+                controllers.insert(assigned, claim.controller.clone());
+                gating.insert(assigned, claim.clipboard_gating);
+                (ClaimOutcome::Owned { window_id: assigned, other_windows, displaced: None }, None)
+            }
+            ClaimResolution::Takeover { window_id, other_windows } => {
+                let displaced = connected.insert(window_id, Arc::clone(writer));
+                let previous = controllers.insert(window_id, claim.controller.clone());
+                gating.insert(window_id, claim.clipboard_gating);
+                (ClaimOutcome::Owned { window_id, other_windows, displaced }, previous)
+            }
+            ClaimResolution::LostControl { window_id } => {
+                let current =
+                    controllers.get(&window_id).cloned().unwrap_or(ControllerIdentity::Local);
+                (ClaimOutcome::LostControl { window_id, controller: current }, None)
+            }
+        }
+    };
+
+    log_control_transition(&outcome, claim.controller, displaced_controller.as_ref());
+    outcome
+}
+
+/// Trace a resolved control transition (feature-013 T027). Fires for every claim
+/// that establishes or transfers window ownership — a plain claim at `debug` and
+/// a takeover at `info`, both naming the window and the controller identities so
+/// a near-simultaneous claim burst leaves a legible ownership trail. A
+/// `LostControl` landing transfers nothing and is intentionally silent here.
+/// Kept off `REMOTE_AUDIT_TARGET`, whose taxonomy is the four canonical
+/// accepted/refused/disconnect/severed lifecycle lines.
+fn log_control_transition(
+    outcome: &ClaimOutcome,
+    new_controller: &ControllerIdentity,
+    displaced: Option<&ControllerIdentity>,
+) {
+    match outcome {
+        // A takeover is the only `Owned` outcome that displaces a live writer.
+        ClaimOutcome::Owned { window_id, displaced: Some(_), .. } => {
+            info!(
+                %window_id,
+                new_controller = %new_controller.transition_label(),
+                displaced_controller =
+                    %displaced.map_or(Cow::Borrowed("unknown"), ControllerIdentity::transition_label),
+                "control transition: window taken over"
+            );
+        }
+        ClaimOutcome::Owned { window_id, displaced: None, .. } => {
+            debug!(
+                %window_id,
+                controller = %new_controller.transition_label(),
+                "control transition: window claimed"
+            );
+        }
+        ClaimOutcome::LostControl { .. } => {}
+    }
+}
+
+/// Test-only shim preserving the pre-takeover `claim_window` shape so the
+/// existing claim/registration invariant tests need no takeover/controller
+/// plumbing. Production goes through [`resolve_and_register_claim`].
+#[cfg(test)]
 async fn claim_window(
     connected_clients: &ConnectedClients,
     requested_window_id: Option<WindowId>,
     all_windows: &HashSet<WindowId>,
     writer: &SharedWriter,
 ) -> (WindowId, Vec<WindowId>) {
-    let mut connected = connected_clients.write().await;
-    let (assigned, other_windows) =
-        resolve_window_assignment(requested_window_id, all_windows, &connected);
-    connected.insert(assigned, Arc::clone(writer));
-    (assigned, other_windows)
+    let controllers = new_window_controllers();
+    let gating = new_window_clipboard_gating();
+    let local = ControllerIdentity::Local;
+    let claim = HelloClaim {
+        requested_window_id,
+        clipboard_gating: false,
+        takeover: false,
+        controller: &local,
+    };
+    match resolve_and_register_claim(
+        WindowOwnership {
+            connected: connected_clients,
+            controllers: &controllers,
+            gating: &gating,
+        },
+        &claim,
+        all_windows,
+        writer,
+    )
+    .await
+    {
+        ClaimOutcome::Owned { window_id, other_windows, .. } => (window_id, other_windows),
+        ClaimOutcome::LostControl { window_id, .. } => (window_id, Vec::new()),
+    }
 }
 
 /// Release a window's connected-client entry only if it still belongs to
@@ -818,29 +2510,107 @@ fn release_window_if_owned(
     connected.is_empty()
 }
 
+/// Feature 013 takeover-authorization guard: whether `writer` is STILL the
+/// registered controller of `window_id`. The connection's `SharedWriter` is its
+/// identity token (same `Arc::ptr_eq` test as [`release_window_if_owned`] and
+/// [`detach_sessions`]), so a connection that a takeover displaced — its window
+/// re-bound to another controller under the claim lock — fails this and is barred
+/// from mutating the window or re-attaching its sessions, even though its own
+/// never-revoked `attached_ids` still names those sessions. A local Unix-socket
+/// client is always its own window's registered controller (a local no-takeover
+/// claim assigns a *different* window rather than displacing one), so this is a
+/// no-op for the local path; a `LostControl` reconnect (never registered) also
+/// fails it, as intended.
+async fn connection_controls_window(
+    connected: &ConnectedClients,
+    window_id: WindowId,
+    writer: &SharedWriter,
+) -> bool {
+    connected.read().await.get(&window_id).is_some_and(|current| Arc::ptr_eq(current, writer))
+}
+
+/// Whether a client message mutates a window's live session state (or reads its
+/// scrollback) and therefore requires the sender to still be that window's
+/// registered controller (feature 013 takeover authorization). `AttachSessions`
+/// is intentionally excluded — its stricter per-session ownership PLUS controller
+/// check lives in [`filter_attachable_sessions`] so it can deny per session and
+/// reply with an error.
+fn requires_window_control(msg: &ClientMessage) -> bool {
+    matches!(
+        msg,
+        ClientMessage::KeyInput { .. }
+            | ClientMessage::Resize { .. }
+            | ClientMessage::CloseSession { .. }
+            | ClientMessage::CloseWindow { .. }
+            | ClientMessage::FocusChanged { .. }
+            | ClientMessage::SearchRequest { .. }
+    )
+}
+
+/// Await a connection's sever signal, or never resolve when there is none (local
+/// connections). Lets the shared read paths `select!` on severing uniformly.
+async fn await_sever(sever_rx: Option<&mut tokio::sync::oneshot::Receiver<()>>) {
+    match sever_rx {
+        Some(rx) => drop(rx.await),
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Why [`run_client_message_loop`] returned: a normal peer disconnect / read
+/// error, or a feature-013 sever because remote access was disabled (T023). The
+/// caller runs the same detach cleanup for both; only the audit line differs.
+#[derive(Clone, Copy)]
+enum LoopExit {
+    /// The peer closed the connection or the read errored.
+    Disconnected,
+    /// Remote access was disabled; the connection is being severed (FR-016).
+    Severed,
+}
+
 async fn run_client_message_loop<R>(
     reader: &mut R,
     window_id: WindowId,
-    server: &IpcServerState,
-    writer: &SharedWriter,
-    attached_ids: &AttachedSessionIds,
-) where
+    conn: ConnState<'_>,
+    mut sever_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> LoopExit
+where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let is_remote = sever_rx.is_some();
     loop {
-        let msg: ClientMessage = match read_message(reader).await {
-            Ok(msg) => msg,
-            Err(ScribeError::Io { .. }) => {
-                debug!(%window_id, "client disconnected");
-                break;
+        // Race each client-message read against the sever signal so a disable
+        // (T023) drops a remote connection out of its loop; on sever, fall through
+        // to the caller's normal detach cleanup. Local connections pass no sever
+        // channel, so the sever arm never fires. The read also carries the remote
+        // idle-read timeout so a vanished peer's slot is reclaimed (local reads
+        // stay untimed).
+        let read = tokio::select! {
+            biased;
+            () = await_sever(sever_rx.as_mut()) => return LoopExit::Severed,
+            read = read_client_frame(reader, is_remote) => read,
+        };
+        let msg: ClientMessage = match read {
+            Some(Ok(msg)) => msg,
+            None => {
+                debug!(%window_id, "remote connection idle past timeout; disconnecting");
+                return LoopExit::Disconnected;
             }
-            Err(e) => {
+            Some(Err(ScribeError::Io { .. })) => {
+                debug!(%window_id, "client disconnected");
+                return LoopExit::Disconnected;
+            }
+            Some(Err(e)) => {
                 warn!(%window_id, "failed to read client message: {e}");
-                break;
+                return LoopExit::Disconnected;
             }
         };
 
-        let mut context = ClientDispatchContext { server, writer, attached_ids, window_id };
+        let mut context = ClientDispatchContext {
+            server: conn.server,
+            writer: conn.writer,
+            attached_ids: conn.attached_ids,
+            window_id,
+        };
         dispatch_message(msg, &mut context).await;
     }
 }
@@ -852,31 +2622,69 @@ async fn detach_client_window(
     writer: &SharedWriter,
 ) {
     let attached_ids = attached_snapshot(attached_ids).await;
-    // Detach all sessions — clear the writer so the reader task stops
-    // forwarding output, but keep the session alive for reconnection.
-    detach_sessions(&server.live_sessions, &attached_ids).await;
-    // Spec 010 C7: drop the cached clipboard-gating bit so reconnecting
-    // clients are re-evaluated at next Hello.
-    server.window_clipboard_gating.write().await.remove(&window_id);
-    let last_client_disconnected = {
+    // Detach only the sessions still routed to THIS connection. A feature-013
+    // takeover may already have re-pointed them at the new controller, whose
+    // output + clipboard-bridge routing (T016) must survive this old client's
+    // disconnect; the ptr-eq guard inside `detach_sessions` enforces that.
+    detach_sessions(&server.live_sessions, &attached_ids, writer).await;
+
+    // Determine ownership and release under one lock. A stale disconnect from a
+    // client already superseded by a takeover (or a reconnect race) must not
+    // evict the new owner — `release_window_if_owned` re-checks the same
+    // `Arc::ptr_eq` guard.
+    let (still_owned, last_client_disconnected) = {
         let mut connected = server.connected_clients.write().await;
-        release_window_if_owned(&mut connected, window_id, writer)
+        let still_owned =
+            connected.get(&window_id).is_some_and(|current| Arc::ptr_eq(current, writer));
+        let empty = release_window_if_owned(&mut connected, window_id, writer);
+        (still_owned, empty)
     };
-    info!(%window_id, "client connection closed; window released if still owned");
+
+    // Only tear down this window's per-connection state when THIS client still
+    // owned it. After a takeover the window belongs to the new controller, whose
+    // clipboard-gating bit and controller identity must NOT be dropped (FR-014).
+    if still_owned {
+        // Spec 010 C7: drop the cached clipboard-gating bit so a reconnecting
+        // client is re-evaluated at its next Hello.
+        server.window_clipboard_gating.write().await.remove(&window_id);
+        // Feature 013 (T027): trace the Controlled → Unconnected transition,
+        // naming the controller whose window just became reattachable.
+        if let Some(released) = server.window_controllers.write().await.remove(&window_id) {
+            debug!(
+                %window_id,
+                controller = %released.transition_label(),
+                "control transition: window released"
+            );
+        }
+    }
+    info!(%window_id, still_owned, "client connection closed; window released if still owned");
     if last_client_disconnected {
         schedule_settings_shutdown_if_no_clients(Arc::clone(&server.connected_clients));
     }
 }
 
-/// Clear the client writer for each session so output stops being forwarded.
-/// Sessions remain alive in the registry for future client attachment.
-async fn detach_sessions(live_sessions: &LiveSessionRegistry, ids: &HashSet<SessionId>) {
+/// Clear the client writer for each session so output stops being forwarded —
+/// but ONLY for sessions still routed to `writer`. Sessions remain alive in the
+/// registry for future client attachment. The `Arc::ptr_eq` guard is the
+/// session-level analog of `release_window_if_owned`: after a feature-013
+/// takeover a session already points at the new controller, and this old
+/// client's disconnect must not detach it (which would break the new
+/// controller's output + clipboard-bridge routing, FR-014).
+async fn detach_sessions(
+    live_sessions: &LiveSessionRegistry,
+    ids: &HashSet<SessionId>,
+    writer: &SharedWriter,
+) {
     let sessions = live_sessions.read().await;
     for id in ids {
         if let Some(session) = sessions.get(id) {
-            *session.client_writer.lock().await = None;
-            clear_session_attachment(&session.attachment).await;
-            info!(%id, "session detached (client disconnected)");
+            let mut client_writer = session.client_writer.lock().await;
+            if client_writer.as_ref().is_some_and(|current| Arc::ptr_eq(current, writer)) {
+                *client_writer = None;
+                drop(client_writer);
+                clear_session_attachment(&session.attachment).await;
+                info!(%id, "session detached (client disconnected)");
+            }
         }
     }
 }
@@ -931,6 +2739,28 @@ fn apply_tab_order_from_tree(wm: &mut WorkspaceManager, tree: &WorkspaceTreeNode
 
 /// Dispatch a single `ClientMessage` to the appropriate handler.
 async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContext<'_>) {
+    // Feature 013 takeover authorization: a connection displaced by a takeover
+    // keeps its stale, never-revoked `attached_ids`, so the per-session
+    // `attached_contains` gate alone would still let it mutate the window it lost
+    // (KeyInput/Resize/CloseSession/CloseWindow/FocusChanged) or read its
+    // scrollback (SearchRequest). Bar those unless this connection is STILL the
+    // window's registered controller. Local Unix-socket clients always are, so
+    // this never affects the local path; `AttachSessions` is guarded separately in
+    // `filter_attachable_sessions`.
+    if requires_window_control(&msg)
+        && !connection_controls_window(
+            &context.server.connected_clients,
+            context.window_id,
+            context.writer,
+        )
+        .await
+    {
+        debug!(
+            window_id = %context.window_id,
+            "ignoring window-control message from a displaced/non-controller connection"
+        );
+        return;
+    }
     match msg {
         msg @ (ClientMessage::CreateSession { .. }
         | ClientMessage::KeyInput { .. }
@@ -1073,13 +2903,7 @@ async fn dispatch_session_message(msg: ClientMessage, context: &mut ClientDispat
             handle_attach_sessions(&session_ids, &dimensions, context).await;
         }
         ClientMessage::ConfigReloaded => {
-            handle_config_reloaded(
-                &context.server.session_manager,
-                &context.server.workspace_manager,
-                &context.server.live_sessions,
-                &context.server.env_store,
-            )
-            .await;
+            handle_config_reloaded(context.server).await;
         }
         ClientMessage::FocusChanged { gained, lost } => {
             handle_focus_changed(gained, lost, &context.server.live_sessions, context.attached_ids)
@@ -1185,6 +3009,7 @@ async fn dispatch_window_message(msg: ClientMessage, context: &mut ClientDispatc
         ClientMessage::ListWindows => {
             handle_list_windows(
                 &context.server.connected_clients,
+                &context.server.window_controllers,
                 &context.server.workspace_manager,
                 context.writer,
             )
@@ -2090,6 +3915,26 @@ async fn filter_attachable_sessions(
     dimensions: &[TerminalSize],
     context: &ClientDispatchContext<'_>,
 ) -> (Vec<SessionId>, Vec<TerminalSize>) {
+    // Feature 013 takeover authorization: `AttachSessions` re-points each session's
+    // client writer, so a connection displaced by a takeover could otherwise
+    // re-steal the `PtyOutput` stream (and clipboard-bridge routing) by simply
+    // re-sending it — its `attached_ids` and static workspace membership still
+    // match. Deny the whole batch unless this connection is STILL the window's
+    // registered controller. Local clients always are (no-op for the local path).
+    if !connection_controls_window(
+        &context.server.connected_clients,
+        context.window_id,
+        context.writer,
+    )
+    .await
+    {
+        debug!(
+            window_id = %context.window_id,
+            "AttachSessions denied: connection is not the window's current controller"
+        );
+        return (Vec::new(), Vec::new());
+    }
+
     let wm = context.server.workspace_manager.read().await;
     let include_dimensions = !dimensions.is_empty();
     let mut allowed_ids = Vec::with_capacity(session_ids.len());
@@ -2121,12 +3966,12 @@ async fn filter_attachable_sessions(
 }
 
 /// Handle `ConfigReloaded` — reload the config file and apply live changes.
-async fn handle_config_reloaded(
-    session_manager: &Arc<SessionManager>,
-    workspace_manager: &Arc<RwLock<WorkspaceManager>>,
-    live_sessions: &LiveSessionRegistry,
-    env_store: &Arc<crate::env_store::EnvStoreState>,
-) {
+async fn handle_config_reloaded(server: &IpcServerState) {
+    let session_manager = &server.session_manager;
+    let workspace_manager = &server.workspace_manager;
+    let live_sessions = &server.live_sessions;
+    let env_store = &server.env_store;
+
     let cfg = match crate::config::load_config() {
         Ok(cfg) => {
             info!("config reloaded successfully via client request");
@@ -2173,6 +4018,12 @@ async fn handle_config_reloaded(
     );
 
     apply_env_persistence_transition(env_store, live_sessions).await;
+
+    // Feature 013 (T007): poke the remote-control supervisor so it re-reads the
+    // reloaded `[remote]` config and starts, stops, or rebinds the listener live.
+    // Synchronous notify — the actual apply runs on the supervisor task, never on
+    // this dispatch loop, and the server is never restarted.
+    server.remote_control.request_reload();
 }
 
 /// Apply a reloaded server config to every live session: refresh the
@@ -2366,25 +4217,37 @@ async fn handle_quit_all(
 
 async fn handle_list_windows(
     connected_clients: &ConnectedClients,
+    window_controllers: &WindowControllers,
     workspace_manager: &Arc<RwLock<WorkspaceManager>>,
     writer: &SharedWriter,
 ) {
     let connected = connected_clients.read().await;
+    let controllers = window_controllers.read().await;
     let wm = workspace_manager.read().await;
 
     let mut window_ids: HashSet<WindowId> = wm.window_ids_with_sessions();
     window_ids.extend(connected.keys().copied());
 
+    // Feature 013: enrich each entry with the picker/indicator context —
+    // workspace names for the window list (FR-005) and the current remote
+    // controller's device + account when the window is remote-controlled
+    // (FR-009b / SC-006). A locally-controlled or unconnected window carries
+    // `controller = None`.
     let mut windows: Vec<WindowInfo> = window_ids
         .into_iter()
         .map(|window_id| WindowInfo {
             window_id,
             session_count: wm.sessions_for_window(window_id).len(),
             connected: connected.contains_key(&window_id),
+            workspace_names: wm.workspace_names_for_window(window_id),
+            controller: controllers
+                .get(&window_id)
+                .and_then(ControllerIdentity::to_controller_info),
         })
         .collect();
     windows.sort_by_key(|info| info.window_id.to_full_string());
     drop(wm);
+    drop(controllers);
     drop(connected);
 
     send_message(writer, &ServerMessage::WindowList { windows }).await;
@@ -2463,11 +4326,27 @@ pub async fn send_message(writer: &SharedWriter, msg: &ServerMessage) {
 
 async fn try_send_message(writer: &SharedWriter, msg: &ServerMessage) -> bool {
     let mut w = writer.lock().await;
-    match write_message(&mut *w, msg).await {
-        Ok(()) => true,
-        Err(e) => {
-            warn!("failed to send message to client: {e}");
-            false
+    write_to_sink(&mut w, msg).await
+}
+
+/// Write (local) or enqueue (remote) one `ServerMessage` on a client sink. A
+/// local sink writes the framed message straight to its socket — unchanged
+/// pre-013 behavior. A remote sink hands it to the bounded per-connection output
+/// queue (T029), which never blocks on the link; overflow is absorbed inside the
+/// queue, so the enqueue arm always reports success. Returns `false` only on a
+/// local write error (a dead socket).
+async fn write_to_sink(sink: &mut ClientSink, msg: &ServerMessage) -> bool {
+    match sink {
+        ClientSink::Local(w) => match write_message(w, msg).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("failed to send message to client: {e}");
+                false
+            }
+        },
+        ClientSink::Remote(remote) => {
+            remote.enqueue(msg);
+            true
         }
     }
 }
@@ -2478,9 +4357,7 @@ async fn send_to_client(client_writer: &ClientWriter, msg: &ServerMessage) {
     let guard = client_writer.lock().await;
     if let Some(writer) = guard.as_ref() {
         let mut w = writer.lock().await;
-        if let Err(e) = write_message(&mut *w, msg).await {
-            warn!("failed to send message to client: {e}");
-        }
+        write_to_sink(&mut w, msg).await;
     }
 }
 
@@ -4071,6 +5948,11 @@ pub fn new_window_clipboard_gating() -> WindowClipboardGating {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
+/// Create a new empty `WindowControllers` registry. Feature 013.
+pub fn new_window_controllers() -> WindowControllers {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
 /// Serialise all live sessions for a hot-reload handoff.
 ///
 /// Returns `(sessions, fds)` where the fds are in the same order as the
@@ -4353,7 +6235,7 @@ mod tests {
 
         let (server, _client) = unix_stream_pair();
         let (_read, write) = tokio::io::split(server);
-        let writer: SharedWriter = Arc::new(Mutex::new(write));
+        let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Local(Box::new(write))));
         let attached_ids: AttachedSessionIds = Arc::new(Mutex::new(HashSet::new()));
 
         let attached = crate::attach_flow::attach_sessions(
@@ -4476,7 +6358,7 @@ mod tests {
     fn test_writer() -> SharedWriter {
         let (server, _client) = unix_stream_pair();
         let (_read, write) = tokio::io::split(server);
-        Arc::new(Mutex::new(write))
+        Arc::new(Mutex::new(ClientSink::Local(Box::new(write))))
     }
 
     /// One claim with its own writer — extracted so the concurrency test
@@ -4654,11 +6536,13 @@ mod tests {
 
         let (request_server, mut request_client) = unix_stream_pair();
         let (_request_read, request_write) = tokio::io::split(request_server);
-        let request_writer: SharedWriter = Arc::new(Mutex::new(request_write));
+        let request_writer: SharedWriter =
+            Arc::new(Mutex::new(ClientSink::Local(Box::new(request_write))));
 
         let (target_server, mut target_client) = unix_stream_pair();
         let (_target_read, target_write) = tokio::io::split(target_server);
-        let target_writer: SharedWriter = Arc::new(Mutex::new(target_write));
+        let target_writer: SharedWriter =
+            Arc::new(Mutex::new(ClientSink::Local(Box::new(target_write))));
 
         connected.write().await.insert(window_id, Arc::clone(&target_writer));
 
@@ -4690,7 +6574,8 @@ mod tests {
 
         let (request_server, mut request_client) = unix_stream_pair();
         let (_request_read, request_write) = tokio::io::split(request_server);
-        let request_writer: SharedWriter = Arc::new(Mutex::new(request_write));
+        let request_writer: SharedWriter =
+            Arc::new(Mutex::new(ClientSink::Local(Box::new(request_write))));
 
         handle_dispatch_action(
             Some(missing_window),

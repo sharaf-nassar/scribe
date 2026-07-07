@@ -4,8 +4,10 @@
 //! session and route keyboard input independently by session ID.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::UNIX_EPOCH;
 
@@ -15,8 +17,9 @@ use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
     AutomationAction, BridgeError, ClientMessage, ClipboardDecision, ClipboardOp,
-    ClipboardSelection, EnvStatusState, PromptId, PromptMarkKind, SearchMatch, ServerMessage,
-    TerminalSize, UpdateProgressState, WorkspaceNotesCollection, WorkspaceNotesMutation,
+    ClipboardSelection, EnvStatusState, PromptId, PromptMarkKind, REMOTE_PROTOCOL_VERSION,
+    RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage, TerminalSize, UpdateProgressState,
+    WindowInfo, WorkspaceNotesCollection, WorkspaceNotesMutation,
 };
 use scribe_common::socket::{handoff_socket_path, server_socket_path};
 use tokio::io::AsyncWriteExt as _;
@@ -59,7 +62,14 @@ pub enum ClientCommand {
     /// Report the current workspace split tree to the server.
     ReportWorkspaceTree { tree: scribe_common::protocol::WorkspaceTreeNode },
     /// Identify this client window to the server (sent as first message).
-    Hello { window_id: Option<WindowId> },
+    ///
+    /// `takeover` is `false` for every normal attach; it is set `true` only by a
+    /// displaced client reclaiming its window (feature 013, T017): the process is
+    /// spawned fresh with a takeover marker so its first `Hello` atomically swaps
+    /// the writer back. The reclaim is symmetric across transports — the local
+    /// path is marked by the `--reclaim` CLI flag, the remote path sets it in
+    /// [`remote_ipc_main`].
+    Hello { window_id: Option<WindowId>, takeover: bool },
     /// Close this window and destroy all its sessions on the server.
     CloseWindow { window_id: WindowId },
     /// Request all clients to save state and quit.
@@ -83,6 +93,37 @@ pub enum ClientCommand {
     /// carrying the host clipboard payload (or a `BridgeError` on arboard
     /// failure). Forwarded as `ClientMessage::ClipboardBridgeReadReply`.
     ClipboardBridgeReadReply { request_id: PromptId, payload: Result<String, BridgeError> },
+    /// Feature 013 (T014): ask THIS machine's own server for its same-account
+    /// online tailnet peers, to populate the connect picker's device list.
+    /// Local-Unix-socket only; the server refuses it over TCP.
+    ListRemotePeers,
+    /// Feature 013 (T022): ask THIS machine's own server for its window list so
+    /// the owning-machine status bar can surface which windows a remote peer
+    /// controls (FR-009b, SC-006) — including remotely-created windows this
+    /// process never hosted. Polled only while `remote.enabled`; the reply is a
+    /// [`ServerMessage::WindowList`] carrying per-window controller identity.
+    ListWindows,
+}
+
+/// Feature 013 (T009): typed outcome of a remote dial + preamble handshake,
+/// handed to the connect flow (T014) as a [`UiEvent::RemoteDialOutcome`] before
+/// the link either becomes a normal session or is torn down.
+///
+/// `Accepted` transitions the connection into the exact same read/write task
+/// loop a local Unix-socket client uses. `Refused` carries the server's typed
+/// [`RemoteRefusal`] (each variant maps 1:1 to distinct UX-002 copy).
+/// `ConnectionFailure` is the deliberately-merged FR-004 outcome — a refused or
+/// timed-out TCP connect, or a link that closed before the reply — i.e. the
+/// peer is offline, not running Scribe, or has remote access disabled, made
+/// indistinguishable on a cold connect because FR-001 leaves nothing listening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteConnectOutcome {
+    /// Preamble accepted; the connection now behaves exactly like a local one.
+    Accepted,
+    /// The server answered with a typed refusal.
+    Refused(RemoteRefusal),
+    /// Connect refused/timed out, or the link closed before a reply arrived.
+    ConnectionFailure,
 }
 
 /// Events forwarded from the IPC background thread to the winit event loop.
@@ -224,6 +265,90 @@ pub enum UiEvent {
         request_id: PromptId,
         selection: ClipboardSelection,
     },
+    /// Feature 013 (T009): result of a remote dial + preamble handshake,
+    /// delivered exactly once before any session traffic. The connect flow
+    /// (T014) drives the picker's success / typed-failure copy from `outcome`;
+    /// until then the event loop's catch-all ignores it.
+    RemoteDialOutcome { outcome: RemoteConnectOutcome },
+    /// Feature 013 (T009): the peer sent a `RemoteDisconnect` sever notice
+    /// (v1 reason: remote access disabled) just before closing the link. Lets
+    /// the UI state the disable as fact rather than inferring it from the drop.
+    RemoteSevered { reason: RemoteRefusal },
+    /// Feature 013 (T014): reply to a `ListRemotePeers` request — this machine's
+    /// same-account tailnet peers for the connect picker's device list.
+    RemotePeerList { peers: Vec<RemotePeerInfo> },
+    /// Feature 013 (T014): the window list probed from a chosen peer over the
+    /// remote link, carried back with the dial target so the picker can match
+    /// it to the peer it is showing. Emitted by [`start_remote_list_windows_thread`].
+    RemoteWindowList { host: String, port: u16, windows: Vec<WindowInfo> },
+    /// Feature 013 (T022): reply to a [`ClientCommand::ListWindows`] poll on THIS
+    /// machine's own server. Each entry's `controller` names the remote peer
+    /// holding the window (or `None` when locally controlled / unconnected),
+    /// feeding the owning-machine remote status surfaces (FR-009b, SC-006).
+    LocalWindowList { windows: Vec<WindowInfo> },
+    /// Feature 013 (T017): another controller claimed this window. The client
+    /// freezes its last frame, suppresses input, and renders the displaced
+    /// banner naming the new controller, offering one-action reclaim. Drives
+    /// both a local client displaced by a remote peer and a remote client
+    /// displaced by a reclaim (contracts/remote-protocol.md displaced-client
+    /// obligations).
+    WindowTakenOver { device_name: String, login_name: String },
+    /// Feature 013 (T030): the remote link for this controlling-side window
+    /// dropped and the auto-reconnect loop is retrying with capped exponential
+    /// backoff. `attempt` is 1-based and drives the cancelable "Reconnecting to
+    /// <peer>… (attempt n)" overlay (FR-011). Ignored once the overlay has
+    /// settled terminally (cancel / disabled / gave up).
+    RemoteReconnecting { attempt: u32 },
+    /// Feature 013 (T030): the auto-reconnect loop re-established the link and
+    /// re-sent `Hello { takeover: false }`. The UI clears the reconnecting
+    /// overlay and re-requests the session list so a fresh replay rebuilds every
+    /// pane (full convergence, FR-011). If the window was taken over during the
+    /// outage, the immediate `WindowTakenOver` that follows lands the client in
+    /// the lost-control state instead — never a silent seizure.
+    RemoteReconnected,
+    /// Feature 013 (T030): the auto-reconnect loop exhausted its capped backoff
+    /// without reaching the peer. The UI settles into the combined
+    /// connection-failure state (offline / not running / disabled) with a
+    /// one-action reconnect (contracts Disable semantics, FR-004).
+    RemoteReconnectFailed,
+}
+
+/// Cancel switch for a remote window's auto-reconnect loop (feature 013, T030).
+///
+/// Shared between the winit UI thread and the IPC background thread. The UI sets
+/// it when the user cancels the "Reconnecting…" overlay, or when the peer
+/// delivers an authoritative `RemoteDisconnect` sever notice — either way the
+/// loop must stop retrying against a listener that is gone or unwanted rather
+/// than spinning forever (contracts Disable semantics, FR-011). The loop polls
+/// it between attempts and during the cancelable backoff. Only a remote-dialed
+/// process ever has one; the local Unix-socket path returns `None`.
+#[derive(Clone, Default)]
+pub struct RemoteReconnectCancel(Arc<AtomicBool>);
+
+impl RemoteReconnectCancel {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Signal the auto-reconnect loop to stop. Idempotent.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// What [`start_ipc_thread`] hands back: the command sender every UI path uses,
+/// plus — for a remote-dialed process only — the cancel switch for its
+/// auto-reconnect loop (feature 013, T030).
+pub struct IpcHandle {
+    /// Sends [`ClientCommand`]s to the server (local Unix socket or remote TCP).
+    pub commands: mpsc::Sender<ClientCommand>,
+    /// Cancel switch for the remote auto-reconnect loop; `None` on the local path.
+    pub reconnect_cancel: Option<RemoteReconnectCancel>,
 }
 
 /// Start the IPC client on a background thread.
@@ -233,19 +358,51 @@ pub enum UiEvent {
 /// the winit event loop via `proxy`, while routing keyboard / resize /
 /// session commands received on the returned sender to the server.
 ///
-/// Returns an [`mpsc::Sender<ClientCommand>`] that the main thread can
-/// use to forward keyboard input, resize events, and session commands.
-pub fn start_ipc_thread(
-    proxy: EventLoopProxy<UiEvent>,
-    window_id: Option<WindowId>,
-) -> mpsc::Sender<ClientCommand> {
+/// Returns an [`IpcHandle`] carrying the [`mpsc::Sender<ClientCommand>`] the
+/// main thread uses to forward keyboard input, resize events, and session
+/// commands, plus the remote auto-reconnect cancel switch when this process
+/// dialed a peer (feature 013, T030).
+pub fn start_ipc_thread(proxy: EventLoopProxy<UiEvent>, window_id: Option<WindowId>) -> IpcHandle {
+    // Feature 013 (T009) plumbing hook: when `SCRIBE_REMOTE_DIAL` names a
+    // tailnet peer, dial it over TCP instead of the local Unix socket, sharing
+    // the exact read/write task loop below. The connect picker (T014) is the
+    // real entry point; this env hook exists so the remote transport can be
+    // exercised end-to-end before the UI lands. Unset (the default) keeps the
+    // local path byte-for-byte unchanged.
+    if let Some((host, port)) = remote_dial_target_from_env() {
+        // The connect picker (T014) spawns a fresh client process per remote
+        // control window, passing the claim target and takeover flag through the
+        // environment: `SCRIBE_REMOTE_WINDOW` names an existing window to claim
+        // (absent ⇒ a fresh window, T018), and `SCRIBE_REMOTE_TAKEOVER` marks the
+        // explicit-attach path. A process launched by the raw plumbing hook (no
+        // picker) keeps its own `--window-id` and never takes over.
+        let remote_window = remote_dial_window_from_env().or(window_id);
+        let takeover = remote_dial_takeover_from_env();
+        tracing::info!(
+            %host,
+            port,
+            ?remote_window,
+            takeover,
+            "SCRIBE_REMOTE_DIAL set; dialing remote scribe-server"
+        );
+        let reconnect_cancel = RemoteReconnectCancel::new();
+        let dial = RemoteDial { host, port, window_id: remote_window, takeover };
+        let commands = start_remote_ipc_thread(proxy, dial, reconnect_cancel.clone());
+        return IpcHandle { commands, reconnect_cancel: Some(reconnect_cancel) };
+    }
+
     let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCommand>();
     // Wrap cmd_rx in Arc<Mutex<_>> so it can be moved into spawn_blocking
     // closures which require 'static bounds.
     let cmd_rx = Arc::new(Mutex::new(cmd_rx));
 
     // Send Hello as the first command so it's the first message on the wire.
-    if cmd_tx.send(ClientCommand::Hello { window_id }).is_err() {
+    // `takeover` is true only when this local client was launched with
+    // `--reclaim` to reclaim a window it was displaced from (feature 013, T017);
+    // every ordinary launch reads the flag as false and keeps today's
+    // non-displacing behavior.
+    let takeover = local_takeover_requested();
+    if cmd_tx.send(ClientCommand::Hello { window_id, takeover }).is_err() {
         tracing::warn!("IPC channel closed before Hello could be sent");
     }
 
@@ -261,7 +418,146 @@ pub fn start_ipc_thread(
         rt.block_on(ipc_main(proxy, cmd_rx));
     });
 
+    IpcHandle { commands: cmd_tx, reconnect_cancel: None }
+}
+
+/// Bundled parameters for a remote dial: the tailnet address to reach and the
+/// window claim to make once the preamble is accepted. Grouped so
+/// [`start_remote_ipc_thread`] / [`remote_ipc_main`] stay within the
+/// argument-count budget and the dial target travels as one unit.
+pub struct RemoteDial {
+    host: String,
+    port: u16,
+    /// `None` creates a fresh window on the peer; `Some` claims an existing one.
+    window_id: Option<WindowId>,
+    /// Set only for explicit picker attach / lost-control reclaim, never on the
+    /// auto-reconnect path (FR-011).
+    takeover: bool,
+}
+
+/// Start the IPC client against a REMOTE scribe-server over TCP, on a
+/// background thread (feature 013, T009).
+///
+/// Mirrors [`start_ipc_thread`] — same dedicated `std::thread` owning a
+/// single-threaded Tokio runtime, and the same read/write task loop once the
+/// link is established — but dials `host:port` on the peer's tailnet address
+/// and runs the remote preamble first. It is strictly connect-only: unlike the
+/// local path it never starts, refreshes, or upgrades the peer's server (there
+/// is no [`connect_or_start_server`] equivalent). The handshake result and any
+/// later sever notice surface to the UI as [`UiEvent::RemoteDialOutcome`] /
+/// [`UiEvent::RemoteSevered`]; once accepted, every other event is identical to
+/// a local session. `window_id: None` creates a fresh window on the peer;
+/// `takeover` is set only for explicit picker attach / lost-control reclaim.
+pub fn start_remote_ipc_thread(
+    proxy: EventLoopProxy<UiEvent>,
+    dial: RemoteDial,
+    cancel: RemoteReconnectCancel,
+) -> mpsc::Sender<ClientCommand> {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCommand>();
+    // Unlike the local path, `Hello` is NOT pre-queued here: the remote preamble
+    // (`RemoteHandshake`) must be the first frame, and `Hello` is sent only
+    // after the server accepts. `remote_ipc_main` owns that ordering. The raw
+    // receiver is handed straight to `remote_ipc_main`, which owns it for the
+    // whole (multi-attempt) lifetime via a single command bridge (T030) — no
+    // `Arc<Mutex>` sharing, so a dropped link never strands a blocking `recv`.
+
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!(error = %error, "failed to create tokio runtime for remote IPC");
+                send_event(
+                    &proxy,
+                    UiEvent::RemoteDialOutcome { outcome: RemoteConnectOutcome::ConnectionFailure },
+                );
+                return;
+            }
+        };
+        rt.block_on(remote_ipc_main(proxy, cmd_rx, dial, cancel));
+    });
+
     cmd_tx
+}
+
+/// Parse the optional `SCRIBE_REMOTE_DIAL` plumbing hook (`host` or `host:port`,
+/// a `MagicDNS` name or IP). Returns `None` when unset or empty so the default
+/// local Unix-socket path runs. Feature 013 (T009); superseded by the T014
+/// picker.
+fn remote_dial_target_from_env() -> Option<(String, u16)> {
+    let raw = std::env::var("SCRIBE_REMOTE_DIAL").ok()?;
+    let target = raw.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let default_port = scribe_common::config::RemoteConfig::default().port;
+    // Split on the final colon only when the host carries no colon of its own,
+    // so a bare IPv6 literal falls through to the default port and is dialed
+    // verbatim (a `(host, port)` tuple resolves an unbracketed literal fine).
+    let (host, port) = match target.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !host.contains(':') => {
+            (host, port.parse::<u16>().unwrap_or(default_port))
+        }
+        _ => (target, default_port),
+    };
+    Some((host.to_owned(), port))
+}
+
+/// Parse the optional `SCRIBE_REMOTE_WINDOW` claim target set by the connect
+/// picker when it spawns a remote-control client process (feature 013, T014).
+/// `None` (unset, empty, or unparsable) creates a fresh window on the peer
+/// (T018); `Some` claims that existing window.
+fn remote_dial_window_from_env() -> Option<WindowId> {
+    let raw = std::env::var("SCRIBE_REMOTE_WINDOW").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<WindowId>() {
+        Ok(window_id) => Some(window_id),
+        Err(error) => {
+            tracing::warn!(%error, value = %trimmed, "invalid SCRIBE_REMOTE_WINDOW; ignoring");
+            None
+        }
+    }
+}
+
+/// Whether `SCRIBE_REMOTE_TAKEOVER` marks this as the explicit-attach path that
+/// may displace a connected controller (feature 013, T014). Only ever set by the
+/// connect picker's attach action, never on the auto-reconnect path (FR-011).
+fn remote_dial_takeover_from_env() -> bool {
+    env_flag_set("SCRIBE_REMOTE_TAKEOVER")
+}
+
+/// Whether this LOCAL (Unix-socket) client was launched to reclaim a window it
+/// was just displaced from (feature 013, T017): the `--reclaim` CLI flag set by
+/// [`spawn_local_takeover_client_process`](crate::spawn_local_takeover_client_process)
+/// when the displaced-client banner's reclaim action fires. Its first `Hello`
+/// then carries `takeover = true` so the local server swaps the writer back. A
+/// CLI flag rather than an env var so the marker never leaks into unrelated
+/// child processes this client later spawns (e.g. a new window). The remote side
+/// reaches the same claim via `SCRIBE_REMOTE_TAKEOVER`.
+fn local_takeover_requested() -> bool {
+    std::env::args().any(|arg| arg == "--reclaim")
+}
+
+/// Parse a boolean env flag with the `1` / `true` spelling shared by the
+/// feature-013 spawn markers.
+fn env_flag_set(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+/// The tailnet dial target of a remote-control client process, if this process
+/// was launched pointed at a REMOTE scribe-server (feature 013). Reused by the
+/// displaced-client reclaim (T017) to re-dial the same peer with a takeover
+/// claim; `None` on an ordinary local client.
+#[must_use]
+pub fn remote_dial_target() -> Option<(String, u16)> {
+    remote_dial_target_from_env()
 }
 
 /// Send a `UiEvent` via the event loop proxy, logging if the event loop is gone.
@@ -271,17 +567,46 @@ fn send_event(proxy: &EventLoopProxy<UiEvent>, event: UiEvent) {
     }
 }
 
+/// Per-transport behavior for the shared read loop [`run_read_task`]. The local
+/// Unix-socket path reports link loss as [`UiEvent::ServerDisconnected`] and
+/// captures nothing; the remote TCP path (feature 013, T030) suppresses that
+/// event — the reconnect loop owns the link-drop decision — and captures the
+/// server-assigned window id so a reconnect re-claims THAT window.
+struct ReadTaskConfig {
+    /// Emit [`UiEvent::ServerDisconnected`] when the read half ends. True for the
+    /// local socket; false for the remote link (the reconnect loop decides).
+    report_disconnect: bool,
+    /// Remote-only: capture the assigned window id from `Welcome` (T018/T030).
+    assigned_window: Option<Arc<Mutex<Option<WindowId>>>>,
+}
+
 /// Drive the read half: forward server messages to the winit event loop.
-async fn run_read_task(
-    mut reader: tokio::net::unix::OwnedReadHalf,
-    proxy: EventLoopProxy<UiEvent>,
-) {
+/// Generic over the transport so the local Unix socket and the remote TCP path
+/// (feature 013) share one loop; `config` carries the two per-transport deltas.
+async fn run_read_task<R>(mut reader: R, proxy: EventLoopProxy<UiEvent>, config: ReadTaskConfig)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     loop {
         match read_message::<ServerMessage, _>(&mut reader).await {
-            Ok(message) => dispatch_server_message(&proxy, message),
+            Ok(message) => {
+                // Remote path only: capture the assigned window id so a reconnect
+                // re-claims THAT window even when the initial dial created a fresh
+                // one (`window_id: None`, T018).
+                if let Some(assigned_window) = &config.assigned_window {
+                    capture_assigned_window(&message, assigned_window);
+                }
+                dispatch_server_message(&proxy, message);
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "server read error; closing connection");
-                send_event(&proxy, UiEvent::ServerDisconnected);
+                if config.report_disconnect {
+                    tracing::warn!(error = %e, "server read error; closing connection");
+                    send_event(&proxy, UiEvent::ServerDisconnected);
+                } else {
+                    // The reconnect loop owns the link-drop decision (T030), so
+                    // do NOT emit `ServerDisconnected` here.
+                    tracing::warn!(error = %e, "remote server read error; link lost");
+                }
                 break;
             }
         }
@@ -551,17 +876,48 @@ fn dispatch_control_message(
             send_event(proxy, UiEvent::UpdateProgress { state });
             None
         }
+        ServerMessage::WindowTakenOver { device_name, login_name } => {
+            tracing::info!(
+                %device_name,
+                %login_name,
+                "received WindowTakenOver; this client is now displaced"
+            );
+            send_event(proxy, UiEvent::WindowTakenOver { device_name, login_name });
+            None
+        }
+        ServerMessage::RemoteDisconnect { reason } => {
+            tracing::info!(?reason, "received RemoteDisconnect sever notice from remote server");
+            send_event(proxy, UiEvent::RemoteSevered { reason });
+            None
+        }
+        ServerMessage::RemotePeerList { peers } => {
+            tracing::debug!(count = peers.len(), "received RemotePeerList from local server");
+            send_event(proxy, UiEvent::RemotePeerList { peers });
+            None
+        }
+        ServerMessage::WindowList { windows } => {
+            // Feature 013 (T022): the local server's window list, polled by the
+            // owning-machine status bar to surface remote-controlled windows. The
+            // connect picker's probe reads its `WindowList` on a dedicated
+            // connection, so this arm only ever sees the local-server reply.
+            tracing::debug!(count = windows.len(), "received WindowList from local server");
+            send_event(proxy, UiEvent::LocalWindowList { windows });
+            None
+        }
         other => Some(other),
     }
 }
 
 /// Drive the write half: receive commands from the main thread and forward
-/// them to the server.
-async fn run_write_task(
-    mut writer: tokio::net::unix::OwnedWriteHalf,
+/// them to the server. Generic over the transport so the local Unix socket and
+/// the remote TCP path (feature 013) share one loop.
+async fn run_write_task<W>(
+    mut writer: W,
     cmd_rx: Arc<Mutex<mpsc::Receiver<ClientCommand>>>,
     proxy: EventLoopProxy<UiEvent>,
-) {
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     loop {
         // Clone the Arc so the spawn_blocking closure owns its reference.
         let rx_clone = Arc::<Mutex<mpsc::Receiver<ClientCommand>>>::clone(&cmd_rx);
@@ -622,8 +978,14 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         }
         ClientCommand::ConfigReloaded => ClientMessage::ConfigReloaded,
         ClientCommand::ReportWorkspaceTree { tree } => ClientMessage::ReportWorkspaceTree { tree },
-        ClientCommand::Hello { window_id } => {
-            ClientMessage::Hello { window_id, clipboard_gating: true }
+        ClientCommand::Hello { window_id, takeover } => {
+            // A local-socket Hello is non-displacing (`takeover = false`) for
+            // every ordinary launch. The one exception is a displaced client
+            // reclaiming its window (feature 013, T017/T026), spawned with the
+            // `--reclaim` CLI flag so its first Hello carries `takeover = true`
+            // and the local server swaps the writer back. The remote dial path
+            // sets `takeover` directly in `remote_ipc_main`.
+            ClientMessage::Hello { window_id, clipboard_gating: true, takeover }
         }
         ClientCommand::CloseWindow { window_id } => ClientMessage::CloseWindow { window_id },
         ClientCommand::QuitAll => ClientMessage::QuitAll,
@@ -647,6 +1009,8 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         ClientCommand::ClipboardBridgeReadReply { request_id, payload } => {
             ClientMessage::ClipboardBridgeReadReply { request_id, payload }
         }
+        ClientCommand::ListRemotePeers => ClientMessage::ListRemotePeers,
+        ClientCommand::ListWindows => ClientMessage::ListWindows,
     }
 }
 
@@ -1612,6 +1976,560 @@ async fn try_cold_restart_recovery(
     Ok(Some(stream))
 }
 
+/// Maximum time to wait for a remote TCP connect before declaring the peer
+/// unreachable. Bounds the FR-004 combined connection-failure outcome so a
+/// black-holed tailnet address cannot hang the connect flow indefinitely.
+const REMOTE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Dial a remote scribe-server's tailnet address. Connect-only: no server
+/// auto-start, staleness refresh, or upgrade handling (contrast
+/// [`connect_or_start_server`]). A refused connect or an elapsed
+/// [`REMOTE_CONNECT_TIMEOUT`] both surface as an `Err`, which the caller maps to
+/// [`RemoteConnectOutcome::ConnectionFailure`].
+async fn connect_remote(host: &str, port: u16) -> std::io::Result<tokio::net::TcpStream> {
+    let connect = tokio::net::TcpStream::connect((host, port));
+    let stream = match tokio::time::timeout(REMOTE_CONNECT_TIMEOUT, connect).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("remote connect to {host}:{port} timed out"),
+            ));
+        }
+    };
+    // Interactive keystroke traffic must not wait on Nagle coalescing; match the
+    // responsiveness of the local socket. Best-effort — a failure here does not
+    // invalidate the connection.
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(%error, "failed to set TCP_NODELAY on remote connection");
+    }
+    Ok(stream)
+}
+
+/// Run the feature-013 remote preamble on a freshly connected TCP stream: send
+/// [`ClientMessage::RemoteHandshake`] as the first frame, then read the
+/// mandatory [`ServerMessage::RemoteHandshakeReply`]. Every terminal condition
+/// maps to a [`RemoteConnectOutcome`]: an accepted reply, a typed refusal, or —
+/// for an EOF, an I/O error, or any frame other than the reply — the merged
+/// [`RemoteConnectOutcome::ConnectionFailure`] (FR-004).
+async fn remote_handshake(
+    stream: &mut tokio::net::TcpStream,
+    device_name: String,
+) -> RemoteConnectOutcome {
+    let preamble = ClientMessage::RemoteHandshake {
+        remote_protocol_version: REMOTE_PROTOCOL_VERSION,
+        scribe_version: env!("CARGO_PKG_VERSION").to_owned(),
+        device_name,
+    };
+    if let Err(error) = write_message(stream, &preamble).await {
+        tracing::warn!(%error, "failed to send remote handshake preamble");
+        return RemoteConnectOutcome::ConnectionFailure;
+    }
+
+    match read_message::<ServerMessage, _>(stream).await {
+        Ok(ServerMessage::RemoteHandshakeReply {
+            accepted,
+            refusal,
+            server_remote_protocol_version,
+            server_scribe_version,
+        }) => match (accepted, refusal) {
+            (true, _) => {
+                tracing::info!(
+                    server_remote_protocol_version,
+                    %server_scribe_version,
+                    "remote handshake accepted"
+                );
+                RemoteConnectOutcome::Accepted
+            }
+            (false, Some(reason)) => {
+                tracing::info!(
+                    ?reason,
+                    server_remote_protocol_version,
+                    %server_scribe_version,
+                    "remote handshake refused"
+                );
+                RemoteConnectOutcome::Refused(reason)
+            }
+            (false, None) => {
+                // A refusal with no reason is a protocol violation; treat it as
+                // a generic connection failure rather than inventing a cause.
+                tracing::warn!("remote handshake refused without a reason");
+                RemoteConnectOutcome::ConnectionFailure
+            }
+        },
+        Ok(other) => {
+            tracing::warn!(
+                ?other,
+                "unexpected first frame from remote server; expected RemoteHandshakeReply"
+            );
+            RemoteConnectOutcome::ConnectionFailure
+        }
+        Err(error) => {
+            tracing::warn!(%error, "remote server closed before handshake reply");
+            RemoteConnectOutcome::ConnectionFailure
+        }
+    }
+}
+
+/// Async entry point for a REMOTE (TCP) connection, on the background thread's
+/// Tokio runtime (feature 013, T009).
+///
+/// Connect-only: dials `host:port`, runs the remote preamble, reports the typed
+/// outcome to the UI, and — only on acceptance — sends `Hello` and drives the
+/// same read/write task loop as [`ipc_main`]. It never starts or upgrades the
+/// peer's server.
+/// Poll granularity for the command bridge — bounds how quickly it notices the
+/// UI dropped its sender (window closing) so the IPC thread can wind down.
+const REMOTE_BRIDGE_POLL: Duration = Duration::from_millis(200);
+
+/// Base / cap for the remote auto-reconnect backoff, and the attempt ceiling
+/// after which the loop settles into the combined connection-failure state
+/// (feature 013, T030 / research D6). Capped exponential: attempt `n` waits
+/// `min(BASE * 2^(n-1), CAP)`.
+const RECONNECT_BACKOFF_BASE_MS: u64 = 500;
+const RECONNECT_BACKOFF_CAP_MS: u64 = 15_000;
+const RECONNECT_MAX_ATTEMPTS: u32 = 8;
+/// Granularity of the cancelable backoff wait — how promptly a Cancel / sever
+/// stops the loop while it is sleeping between attempts.
+const RECONNECT_CANCEL_POLL: Duration = Duration::from_millis(150);
+
+/// How one connected remote session ended, so the reconnect loop can tell a
+/// recoverable link drop from a deliberate UI shutdown (feature 013, T030).
+enum RemoteSessionEnd {
+    /// The transport failed (read or write error) — retry with backoff.
+    LinkLost,
+    /// The command channel closed (UI window closing) — stop for good.
+    Stopped,
+}
+
+/// Forward the std command channel into an async one for the whole remote
+/// lifetime (feature 013, T030). A single blocking task owns the receiver, so
+/// commands survive reconnects and no per-attempt task is ever left blocked in
+/// `recv` holding it. Ends when the UI drops its sender (window closing) or
+/// `remote_ipc_main` drops the async receiver (loop finished).
+fn spawn_command_bridge(
+    cmd_rx: mpsc::Receiver<ClientCommand>,
+    async_tx: tokio::sync::mpsc::UnboundedSender<ClientCommand>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        while !async_tx.is_closed() {
+            let cmd = match cmd_rx.recv_timeout(REMOTE_BRIDGE_POLL) {
+                Ok(cmd) => cmd,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            if async_tx.send(cmd).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// Drop the async command receiver so the bridge notices and exits, then await
+/// its join to wind the IPC thread down cleanly (feature 013, T030).
+async fn shutdown_command_bridge(
+    async_rx: tokio::sync::mpsc::UnboundedReceiver<ClientCommand>,
+    bridge: tokio::task::JoinHandle<()>,
+) {
+    drop(async_rx);
+    if let Err(error) = bridge.await {
+        tracing::debug!(%error, "remote command bridge join failed");
+    }
+}
+
+/// Capture the server-assigned window id from a `Welcome` so a reconnect can
+/// re-claim the SAME window (feature 013, T030).
+fn capture_assigned_window(message: &ServerMessage, assigned_window: &Mutex<Option<WindowId>>) {
+    if let ServerMessage::Welcome { window_id, .. } = message
+        && let Ok(mut slot) = assigned_window.lock()
+    {
+        *slot = Some(*window_id);
+    }
+}
+
+/// Drive one live remote session until the link drops or the UI closes the
+/// command channel (feature 013, T030). The read half runs on its own task (so
+/// `read_message` is never cancelled mid-frame — it is not cancel-safe); the
+/// write half drains the async command channel inline. `async_rx` is borrowed,
+/// not moved, so it is reused across reconnect attempts.
+async fn run_remote_session(
+    stream: tokio::net::TcpStream,
+    async_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClientCommand>,
+    proxy: &EventLoopProxy<UiEvent>,
+    assigned_window: &Arc<Mutex<Option<WindowId>>>,
+) -> RemoteSessionEnd {
+    let (reader, mut writer) = stream.into_split();
+    // `JoinHandle` is `Unpin`, so `&mut read_task` is a pollable future across
+    // loop iterations without pinning (mirrors the local `ipc_main` join). The
+    // remote config suppresses `ServerDisconnected` (the loop owns link-drop) and
+    // captures the assigned window id for reconnect re-claim.
+    let mut read_task = tokio::spawn(run_read_task(
+        reader,
+        proxy.clone(),
+        ReadTaskConfig {
+            report_disconnect: false,
+            assigned_window: Some(Arc::clone(assigned_window)),
+        },
+    ));
+
+    loop {
+        tokio::select! {
+            _ = &mut read_task => {
+                // The read half ended — the server closed the link.
+                return RemoteSessionEnd::LinkLost;
+            }
+            cmd = async_rx.recv() => {
+                let Some(cmd) = cmd else {
+                    // The command bridge closed: the UI dropped its sender, i.e.
+                    // this window is shutting down. Stop for good.
+                    read_task.abort();
+                    return RemoteSessionEnd::Stopped;
+                };
+                let msg = command_to_message(cmd);
+                // The write completes here (not in a select arm), so it is never
+                // cancelled mid-frame the way a `read_message` arm would be.
+                if let Err(error) = write_message(&mut writer, &msg).await {
+                    tracing::warn!(%error, "remote server write error; link lost");
+                    read_task.abort();
+                    return RemoteSessionEnd::LinkLost;
+                }
+            }
+        }
+    }
+}
+
+/// Run the initial remote connect + preamble + `Hello`, preserving the exact
+/// T009/T014 reporting (`RemoteDialOutcome`, and `ServerDisconnected` if the
+/// accepted link fails on the first `Hello`). Returns the live stream on
+/// success, or `None` when the dial failed / was refused / the Hello write
+/// failed — each already surfaced to the UI.
+async fn connect_and_attach_initial(
+    host: &str,
+    port: u16,
+    window_id: Option<WindowId>,
+    takeover: bool,
+    proxy: &EventLoopProxy<UiEvent>,
+) -> Option<tokio::net::TcpStream> {
+    let mut stream = match connect_remote(host, port).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::warn!(%host, port, %error, "remote dial failed");
+            send_event(
+                proxy,
+                UiEvent::RemoteDialOutcome { outcome: RemoteConnectOutcome::ConnectionFailure },
+            );
+            return None;
+        }
+    };
+
+    let outcome = remote_handshake(&mut stream, crate::read_hostname()).await;
+    send_event(proxy, UiEvent::RemoteDialOutcome { outcome });
+    if outcome != RemoteConnectOutcome::Accepted {
+        // Refused or ConnectionFailure: terminal. No session traffic.
+        return None;
+    }
+
+    let hello = ClientMessage::Hello { window_id, clipboard_gating: true, takeover };
+    if let Err(error) = write_message(&mut stream, &hello).await {
+        tracing::warn!(%error, "failed to send Hello on accepted remote connection");
+        send_event(proxy, UiEvent::ServerDisconnected);
+        return None;
+    }
+    Some(stream)
+}
+
+/// Capped exponential backoff delay for reconnect `attempt` (1-based).
+fn backoff_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(16);
+    let millis =
+        RECONNECT_BACKOFF_BASE_MS.saturating_mul(1u64 << shift).min(RECONNECT_BACKOFF_CAP_MS);
+    Duration::from_millis(millis)
+}
+
+/// Sleep `delay`, polling the cancel switch on a fixed cadence. Returns `true`
+/// if cancellation fired (caller stops), `false` if the full delay elapsed.
+async fn backoff_or_cancel(delay: Duration, cancel: &RemoteReconnectCancel) -> bool {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if cancel.is_cancelled() {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep((deadline - now).min(RECONNECT_CANCEL_POLL)).await;
+    }
+}
+
+/// Resolve once the reconnect cancel switch fires, polling on the shared
+/// [`RECONNECT_CANCEL_POLL`] cadence — the same idiom [`backoff_or_cancel`] uses.
+/// Lets an in-flight connect attempt be raced to a prompt stop so a Cancel (or
+/// delivered sever) abandons it rather than letting it complete and go live
+/// (FR-011).
+async fn wait_for_cancel(cancel: &RemoteReconnectCancel) {
+    while !cancel.is_cancelled() {
+        tokio::time::sleep(RECONNECT_CANCEL_POLL).await;
+    }
+}
+
+/// Outcome of one in-flight reconnect attempt, kept separate from the live
+/// stream so [`reconnect_with_backoff`] can race the whole attempt against a
+/// Cancel and only emit `RemoteReconnected` once cancellation is ruled out
+/// (FR-011).
+enum ReconnectAttempt {
+    /// Handshake accepted and `Hello { takeover: false }` sent — the live stream.
+    Attached(tokio::net::TcpStream),
+    /// The peer refused authoritatively (e.g. disabled, version) — settle.
+    Refused(RemoteRefusal),
+    /// Connect / handshake / `Hello` failed — retry with backoff.
+    Failed,
+}
+
+/// Run one reconnect attempt: connect, run the preamble, and re-claim the SAME
+/// window with `Hello { takeover: false }` — the auto-reconnect path NEVER seizes
+/// control (FR-011). Emits NO UI events, so [`reconnect_with_backoff`] can
+/// discard it on Cancel (dropping the half-open stream) without a spurious
+/// `RemoteReconnected`; the caller decides whether the attempt goes live.
+async fn try_reconnect_attempt(
+    host: &str,
+    port: u16,
+    window_id: Option<WindowId>,
+    attempt: u32,
+) -> ReconnectAttempt {
+    let mut stream = match connect_remote(host, port).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::debug!(%host, port, attempt, %error, "remote reconnect attempt failed");
+            return ReconnectAttempt::Failed;
+        }
+    };
+    match remote_handshake(&mut stream, crate::read_hostname()).await {
+        RemoteConnectOutcome::Accepted => {
+            let hello = ClientMessage::Hello { window_id, clipboard_gating: true, takeover: false };
+            match write_message(&mut stream, &hello).await {
+                Ok(()) => ReconnectAttempt::Attached(stream),
+                Err(error) => {
+                    tracing::warn!(%error, attempt, "reconnect Hello write failed");
+                    ReconnectAttempt::Failed
+                }
+            }
+        }
+        RemoteConnectOutcome::Refused(reason) => ReconnectAttempt::Refused(reason),
+        RemoteConnectOutcome::ConnectionFailure => ReconnectAttempt::Failed,
+    }
+}
+
+/// Retry the remote link with capped exponential backoff until it re-attaches,
+/// the user cancels, the peer refuses, or the attempt ceiling is hit
+/// (feature 013, T030). On success it re-sends `Hello { takeover: false }` — the
+/// auto-reconnect path NEVER seizes control (FR-011); an explicit reclaim is the
+/// only takeover. Returns the live stream, or `None` when the loop should end
+/// (the matching terminal UI event was already emitted, except a plain user
+/// Cancel, which the UI settles itself).
+async fn reconnect_with_backoff(
+    host: &str,
+    port: u16,
+    window_id: Option<WindowId>,
+    proxy: &EventLoopProxy<UiEvent>,
+    cancel: &RemoteReconnectCancel,
+) -> Option<tokio::net::TcpStream> {
+    let mut attempt = 0u32;
+    loop {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        attempt += 1;
+        send_event(proxy, UiEvent::RemoteReconnecting { attempt });
+        if backoff_or_cancel(backoff_delay(attempt), cancel).await {
+            return None;
+        }
+        if cancel.is_cancelled() {
+            return None;
+        }
+
+        // Race the whole connect → handshake → `Hello` sequence against the
+        // cancel switch. A Cancel (or delivered sever) fired while the attempt is
+        // in flight must abandon it — the `select!` drops the attempt future and
+        // its half-open stream — instead of completing and emitting
+        // `RemoteReconnected` to go live over a settled overlay (FR-011: Cancel
+        // settles into a disconnected state). Dropping mid-frame is safe here
+        // precisely because the stream is discarded, never reused.
+        let outcome = tokio::select! {
+            biased;
+            () = wait_for_cancel(cancel) => return None,
+            outcome = try_reconnect_attempt(host, port, window_id, attempt) => outcome,
+        };
+
+        match outcome {
+            ReconnectAttempt::Attached(stream) => {
+                // A Cancel that raced the attempt's completion still wins: never
+                // revive a window the user settled (belt-and-suspenders with the
+                // UI's `is_settled` guard on `RemoteReconnected`).
+                if cancel.is_cancelled() {
+                    return None;
+                }
+                send_event(proxy, UiEvent::RemoteReconnected);
+                return Some(stream);
+            }
+            ReconnectAttempt::Refused(reason) => {
+                // An authoritative refusal on reconnect (e.g. remote access
+                // disabled, version mismatch) is terminal — reuse the sever path
+                // so the UI shows the reason's copy and settles rather than
+                // retrying a listener that is up but refusing us.
+                tracing::info!(?reason, "remote reconnect refused; settling");
+                send_event(proxy, UiEvent::RemoteSevered { reason });
+                return None;
+            }
+            ReconnectAttempt::Failed => {}
+        }
+
+        if attempt >= RECONNECT_MAX_ATTEMPTS {
+            // Give up auto-retrying and settle into the combined
+            // connection-failure copy (offline / not running / disabled). The
+            // UI's one-action reconnect starts a fresh attempt.
+            send_event(proxy, UiEvent::RemoteReconnectFailed);
+            return None;
+        }
+    }
+}
+
+/// Async entry point for a REMOTE (TCP) connection, on the background thread's
+/// Tokio runtime (feature 013, T009/T030).
+///
+/// Connect-only: dials `host:port`, runs the remote preamble, reports the typed
+/// outcome to the UI, and — only on acceptance — sends `Hello` and drives one
+/// live session. When an established session's link drops, it auto-reconnects
+/// with capped exponential backoff (T030), re-claiming the SAME window with
+/// `Hello { takeover: false }` (never seizing control). A clean command-channel
+/// close (window closing), a user Cancel, an authoritative sever, or an
+/// exhausted backoff ends the thread. It never starts or upgrades the peer's
+/// server.
+async fn remote_ipc_main(
+    proxy: EventLoopProxy<UiEvent>,
+    cmd_rx: mpsc::Receiver<ClientCommand>,
+    dial: RemoteDial,
+    cancel: RemoteReconnectCancel,
+) {
+    let RemoteDial { host, port, window_id, takeover } = dial;
+
+    // Bridge the std command channel to an async one for the whole (multi-attempt)
+    // lifetime, so every (re)connect drains commands cancel-safely (T030).
+    let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel::<ClientCommand>();
+    let bridge = spawn_command_bridge(cmd_rx, async_tx);
+
+    // The window a reconnect re-claims: the server-assigned id captured from the
+    // first `Welcome`, falling back to the dial target. Shared with the read task.
+    let assigned_window = Arc::new(Mutex::new(window_id));
+
+    // Initial attempt — preserves the exact T009/T014 dial reporting.
+    let Some(stream) = connect_and_attach_initial(&host, port, window_id, takeover, &proxy).await
+    else {
+        shutdown_command_bridge(async_rx, bridge).await;
+        return;
+    };
+
+    let mut end = run_remote_session(stream, &mut async_rx, &proxy, &assigned_window).await;
+
+    // Auto-reconnect loop: a dropped link is retried; a clean channel close (UI
+    // window closing) or a settled cancel/sever ends the thread.
+    loop {
+        if matches!(end, RemoteSessionEnd::Stopped) || cancel.is_cancelled() {
+            break;
+        }
+        let reclaim_window = assigned_window.lock().ok().and_then(|slot| *slot).or(window_id);
+        match reconnect_with_backoff(&host, port, reclaim_window, &proxy, &cancel).await {
+            Some(next_stream) => {
+                end =
+                    run_remote_session(next_stream, &mut async_rx, &proxy, &assigned_window).await;
+            }
+            None => break,
+        }
+    }
+
+    shutdown_command_bridge(async_rx, bridge).await;
+}
+
+/// Dial a peer over TCP only to enumerate its windows for the connect picker
+/// (feature 013, T014). Runs the remote preamble, sends a single `ListWindows`,
+/// forwards the resulting [`ServerMessage::WindowList`] as
+/// [`UiEvent::RemoteWindowList`], then drops the connection — it never claims a
+/// window. Handshake refusals and connect/EOF errors surface as
+/// [`UiEvent::RemoteDialOutcome`] so the picker renders the same typed copy as a
+/// real attach. Runs on its own short-lived `std::thread` + Tokio runtime,
+/// mirroring [`start_remote_ipc_thread`].
+pub fn start_remote_list_windows_thread(proxy: EventLoopProxy<UiEvent>, host: String, port: u16) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "failed to create tokio runtime for remote window probe"
+                );
+                send_event(
+                    &proxy,
+                    UiEvent::RemoteDialOutcome { outcome: RemoteConnectOutcome::ConnectionFailure },
+                );
+                return;
+            }
+        };
+        rt.block_on(remote_list_windows_main(proxy, host, port));
+    });
+}
+
+/// Body of the window-list probe (feature 013, T014). See
+/// [`start_remote_list_windows_thread`].
+async fn remote_list_windows_main(proxy: EventLoopProxy<UiEvent>, host: String, port: u16) {
+    let mut stream = match connect_remote(&host, port).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::warn!(%host, port, %error, "remote window probe dial failed");
+            send_event(
+                &proxy,
+                UiEvent::RemoteDialOutcome { outcome: RemoteConnectOutcome::ConnectionFailure },
+            );
+            return;
+        }
+    };
+
+    let outcome = remote_handshake(&mut stream, crate::read_hostname()).await;
+    if outcome != RemoteConnectOutcome::Accepted {
+        // Refused or ConnectionFailure: the picker maps it to distinct copy.
+        send_event(&proxy, UiEvent::RemoteDialOutcome { outcome });
+        return;
+    }
+
+    if let Err(error) = write_message(&mut stream, &ClientMessage::ListWindows).await {
+        tracing::warn!(%error, "failed to send ListWindows on remote window probe");
+        send_event(
+            &proxy,
+            UiEvent::RemoteDialOutcome { outcome: RemoteConnectOutcome::ConnectionFailure },
+        );
+        return;
+    }
+
+    // Read until the WindowList arrives, ignoring any other frames the server
+    // may interleave. The connection drops as soon as we have the list.
+    loop {
+        match read_message::<ServerMessage, _>(&mut stream).await {
+            Ok(ServerMessage::WindowList { windows }) => {
+                send_event(&proxy, UiEvent::RemoteWindowList { host, port, windows });
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "remote server closed before window list arrived");
+                send_event(
+                    &proxy,
+                    UiEvent::RemoteDialOutcome { outcome: RemoteConnectOutcome::ConnectionFailure },
+                );
+                return;
+            }
+        }
+    }
+}
+
 async fn ipc_main(
     proxy: EventLoopProxy<UiEvent>,
     cmd_rx: Arc<Mutex<mpsc::Receiver<ClientCommand>>>,
@@ -1631,7 +2549,13 @@ async fn ipc_main(
 
     let read_proxy = proxy.clone();
     let write_proxy = proxy.clone();
-    let read_task = tokio::spawn(run_read_task(reader, read_proxy));
+    // Local socket: report a dropped link as `ServerDisconnected`, capture no
+    // window id (the local client already owns its `--window-id`).
+    let read_task = tokio::spawn(run_read_task(
+        reader,
+        read_proxy,
+        ReadTaskConfig { report_disconnect: true, assigned_window: None },
+    ));
     let write_task = tokio::spawn(run_write_task(writer, cmd_rx, write_proxy));
 
     // When either task finishes, abort the other so the process can exit.

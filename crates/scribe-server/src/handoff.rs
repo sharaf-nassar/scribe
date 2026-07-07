@@ -7,6 +7,18 @@
 //! - **Receiver** (new server launched with `--upgrade`): connects to the
 //!   handoff socket, receives the state + fds, and reconstructs sessions.
 //!
+//! Feature 013 (remote window control) carries NO remote-control state across a
+//! handoff — neither the listener's enabled/bind flag nor any active
+//! remote-connection metadata. The receiver re-derives the `[remote]` listener
+//! purely from on-disk config: `run_normal_server` and `run_upgrade_receiver`
+//! share `run_server_loop`, which spawns the same `remote_supervisor` in both
+//! paths, so only the enabled-state survives an upgrade (via TOML, never the
+//! wire). The old server's remote TCP connections drop when its process exits,
+//! and the remote client auto-reconnects to the rebound listener (research D6).
+//! `HandoffState` and `HANDOFF_VERSION` are therefore unchanged by that feature
+//! (see `specs/013-remote-window-control/contracts/remote-protocol.md`,
+//! Compatibility statement).
+//!
 //! The handoff socket path is platform-specific (see `scribe_common::socket`).
 
 use std::io::{IoSlice, IoSliceMut};
@@ -53,6 +65,12 @@ use crate::workspace_manager::WorkspaceManager;
 /// verbatim (no more "version mismatch" masking) and the scribe-client
 /// `wait_for_refreshed_server` path on macOS detects the stuck old server and
 /// performs a forced cold restart instead of looping until launch times out.
+///
+/// Feature 013 (remote window control) added no fields to the handoff shape —
+/// remote-listener and remote-connection state are re-derived from config by
+/// the receiver rather than carried on the wire (see the module docs and
+/// [`HandoffState`]) — so this stays at v6. Bump ONLY when the serialised shape
+/// actually changes.
 const HANDOFF_VERSION: u32 = 6;
 
 /// Magic bytes the receiver sends to request an upgrade.
@@ -72,6 +90,14 @@ const MAX_STATE_SIZE: u32 = 256 * 1024 * 1024;
 const MAX_FDS: usize = 1024;
 
 /// Complete serialised server state for a handoff.
+///
+/// Feature 013 (remote window control) intentionally adds nothing here: no
+/// remote-listener enabled/bind flag and no active remote-connection metadata.
+/// The receiver re-derives the `[remote]` listener purely from config via the
+/// shared `remote_supervisor` startup, and dropped remote connections recover
+/// through the client's auto-reconnect loop (contracts Compatibility statement;
+/// research D6). Carrying that state would force a `HANDOFF_VERSION` bump for no
+/// benefit.
 #[derive(Serialize, Deserialize)]
 pub struct HandoffState {
     pub version: u32,
