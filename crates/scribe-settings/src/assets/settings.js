@@ -44,6 +44,35 @@ function setPlatform(platform) {
   updateNotificationPlatformRows();
 }
 
+// ─────────── Remote (feature 013) ───────────
+//
+// The "Remote" section's UX-003 statement names the signed-in Tailscale
+// account, and a passive note appears when Tailscale is not detected on this
+// machine. Both are runtime facts the host owns (they derive from the server's
+// tailnet identity), so — like setPlatform / loadFontList — the host injects
+// them by calling setRemoteEnv() via evaluate_script after the page loads.
+// Until then the statement shows a generic account label and the note stays
+// hidden (the passive default).
+//
+// env = { account?: string, tailscale_detected?: boolean }
+function setRemoteEnv(env) {
+  var data = env || {};
+
+  var accountEl = document.getElementById("remote-account-name");
+  if (accountEl && typeof data.account === "string" && data.account.length > 0) {
+    accountEl.textContent = data.account;
+  }
+
+  var noticeRow = document.getElementById("remote-tailscale-notice-row");
+  if (noticeRow) {
+    // Show the passive "not detected" note only when the host explicitly
+    // reports Tailscale is absent; unknown/true keeps it hidden. Toggling a
+    // class (not inline display) keeps the note's state intact across the
+    // global-search show/hide reset.
+    noticeRow.classList.toggle("remote-hidden", data.tailscale_detected !== false);
+  }
+}
+
 function setPlatformVisibility(selector, shouldShow) {
   document.querySelectorAll(selector).forEach(function(el) {
     el.classList.toggle("platform-hidden", !shouldShow);
@@ -2071,6 +2100,10 @@ function loadConfig(config) {
   setSegmentedValue('notifications.timeout_mode', config.notifications?.timeout_mode ?? 'system_default');
   setStepperValue('notifications.timeout_secs', config.notifications?.timeout_secs ?? 10);
   updateNotificationPlatformRows();
+
+  // Remote (feature 013)
+  setToggleValue('remote.enabled', config.remote?.enabled ?? false);
+  setStepperValue('remote.port', config.remote?.port ?? 46061);
 }
 
 // ─────────── Value Setters ───────────

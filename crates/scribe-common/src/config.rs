@@ -99,6 +99,8 @@ pub struct ScribeConfig {
     pub update: UpdateConfig,
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    #[serde(default)]
+    pub remote: RemoteConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -1921,6 +1923,38 @@ impl Default for NotificationsConfig {
             timeout_secs: default_notification_timeout_secs(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Remote (feature 013 — remote window control over Tailscale)
+// ---------------------------------------------------------------------------
+
+/// The `[remote]` TOML table (feature 013). Controls the opt-in Tailscale
+/// remote-control listener. A missing table deserializes to these defaults —
+/// the feature stays fully off — because the field carries `#[serde(default)]`
+/// on [`ScribeConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Whether remote window control is enabled. Default `false`: the TCP
+    /// listener exists only while this is `true` (FR-001), and disabling it
+    /// severs live remote connections within 2 s (FR-016).
+    #[serde(default)]
+    pub enabled: bool,
+    /// TCP port for the remote listener, bound on the machine's tailnet
+    /// addresses only, never `0.0.0.0` (FR-002). Rebound live on change via the
+    /// config-reload path; no server restart.
+    #[serde(default = "default_remote_port")]
+    pub port: u16,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self { enabled: false, port: default_remote_port() }
+    }
+}
+
+fn default_remote_port() -> u16 {
+    46061
 }
 
 // ---------------------------------------------------------------------------

@@ -120,6 +120,12 @@ Add/remove root directories and badge colour customization per index with reset-
 
 The workspace add row in [[crates/scribe-settings/src/assets/settings.js#initWorkspaces]] accepts absolute paths or `~/` roots, updates the displayed list immediately, and sends `workspaces.add_root`. Submitting an empty row asks the host to open a native directory chooser, then the selected path is injected back into the same add flow. The apply path in [[crates/scribe-settings/src/apply.rs#apply_workspace_key]] trims, deduplicates, and persists accepted roots.
 
+### Remote Keys
+
+The "Remote" page controls feature 013's opt-in Tailscale remote-control listener via the `[remote]` TOML table ([[crates/scribe-common/src/config.rs#RemoteConfig]]), off by default. `remote.enabled` is the "Allow remote control from my devices" toggle; `remote.port` is the advanced TCP port.
+
+Both route through [[crates/scribe-settings/src/apply.rs#apply_remote_key]], which clamps the port to 1024–65535 — the same range the webview stepper enforces — so a hand-crafted IPC cannot persist an out-of-range value. Under the toggle sits a permanent plain-language UX-003 statement naming the signed-in Tailscale account; a passive "Tailscale not detected — remote access stays off" notice shows when the host reports Tailscale is absent (both are pushed in by the host, never fetched by the webview: the CSP forbids network calls from settings, so [[crates/scribe-settings/src/lib.rs#inject_remote_env]] resolves them over IPC with a `GetRemoteEnv` probe — [[crates/scribe-settings/src/server_action.rs#request_remote_env]] — and evaluates the page's `setRemoteEnv` bridge, failing closed to no account and "Tailscale not detected" on any error per FR-015). Saving triggers the file-watcher → `ConfigReloaded` round-trip, which starts, stops, or rebinds the listener live ([[server#Remote Control#Listener Lifecycle]]); the server is never restarted.
+
 ## Releases
 
 Browse historical Scribe releases from inside the settings window. The panel uses a single-content-area layout with a native `<select>` picker, Newer / Older nav buttons, and a "View on GitHub" link, driven by a `selectedReleaseVersion` JS state.

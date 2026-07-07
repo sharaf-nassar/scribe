@@ -17,6 +17,7 @@ pub mod releases;
 pub mod session_manager;
 pub mod shell_integration;
 pub mod stop_classifier;
+pub mod tailnet;
 pub mod updater;
 pub mod workspace_manager;
 pub mod workspace_notes;

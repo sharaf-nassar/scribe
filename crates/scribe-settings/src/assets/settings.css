@@ -1644,3 +1644,42 @@ input[type="range"]::-webkit-slider-thumb {
   border-left: 3px solid #f87171;
   line-height: 1.4;
 }
+
+/* ───────── Remote (feature 013) ───────── */
+
+/* Force-hide utility for the passive Tailscale notice. Uses !important so it
+   survives the global-search reset, which clears inline `display` on every
+   `.setting-row` (mirrors how `.platform-hidden` guards the platform rows). */
+.remote-hidden {
+  display: none !important;
+}
+
+/* Permanent UX-003 who-can-connect statement shown beneath the enable toggle.
+   The <span class="remote-account"> is filled by the host via setRemoteEnv()
+   with the signed-in Tailscale account; it falls back to a generic label
+   until injected. */
+.remote-statement {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: #71717a;
+  line-height: 1.5;
+}
+
+.remote-account {
+  color: #a1a1aa;
+}
+
+/* Passive note shown when the host reports Tailscale is not installed or not
+   running. Neutral, low-key styling — informational, not an error. */
+.remote-notice {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: #a1a1aa;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  border-left: 3px solid #52525b;
+  line-height: 1.4;
+}

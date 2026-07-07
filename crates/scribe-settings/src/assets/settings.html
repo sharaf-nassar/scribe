@@ -94,6 +94,15 @@
         </svg>
         Notifications
       </div>
+      <div class="nav-item" data-tab="remote">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 12.55a11 11 0 0 1 14.08 0"/>
+          <path d="M1.42 9a16 16 0 0 1 21.16 0"/>
+          <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+          <line x1="12" y1="20" x2="12.01" y2="20"/>
+        </svg>
+        Remote
+      </div>
     </div>
     <div class="sidebar-footer" id="sidebar-footer"></div>
   </div>
@@ -1624,6 +1633,54 @@
               <div class="setting-desc">Open macOS Notifications settings, select this app, and choose Persistent to keep banners visible until dismissed</div>
             </div>
             <button id="notifications-open-macos-settings" class="action-btn" type="button">Open macOS Settings</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ Remote Page ═══════ -->
+    <div id="page-remote" class="content-page">
+      <div class="page-title">Remote</div>
+      <div class="page-subtitle">Control this machine's windows from your other devices over Tailscale</div>
+
+      <div class="section-group">
+        <div class="section-label">Remote Control</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Allow remote control from my devices</div>
+              <div class="setting-desc">Off by default. The listener runs only while this is on and binds only to your Tailscale addresses.</div>
+            </div>
+            <div class="toggle off" data-key="remote.enabled">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row remote-statement-row">
+            <div class="remote-statement">
+              When on, your own devices on your Tailscale network (signed in as
+              <span class="remote-account" id="remote-account-name">your Tailscale account</span>)
+              can view and control this machine's terminal windows.
+            </div>
+          </div>
+          <div class="setting-row remote-notice-row remote-hidden" id="remote-tailscale-notice-row">
+            <div class="remote-notice" id="remote-tailscale-notice">Tailscale not detected — remote access stays off</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Advanced</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Port</div>
+              <div class="setting-desc">TCP port for the remote listener, bound only on your Tailscale addresses. Default 46061.</div>
+            </div>
+            <div class="number-control" data-key="remote.port" data-min="1024" data-max="65535" data-step="1">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">46061</div>
+              <div class="number-btn">+</div>
+            </div>
           </div>
         </div>
       </div>

@@ -359,6 +359,42 @@ On Linux, the client starts the server via `systemctl --user start scribe-server
 
 The same `perform_macos_update_restart` is invoked from [[crates/scribe-client/src/ipc_client.rs#try_cold_restart_recovery]] when [[crates/scribe-client/src/ipc_client.rs#wait_for_server_connection]] times out and `pgrep` still reports a stale scribe-server. This covers the case where the old server is alive but its IPC accept loop has wedged: `tokio::net::UnixStream::connect` returns `ECONNREFUSED`, so the refresh path never runs; the fresh server spawned by `start_server` then can't acquire `flock` because the stuck old process still holds it. The pgrep-based recovery kills the orphan and restarts cleanly. Recovery only runs when pgrep finds a stale process so legitimate slow-startup timeouts still surface as errors.
 
+## Remote Control
+
+Feature 013's connecting side: a remote-dialed client process attaches to another tailnet machine's window over TCP, auto-reconnects after drops, and renders the displaced state when another controller takes the window.
+
+The owning side is [[server#Remote Control]] and the wire contract is [[protocol#Remote Protocol]]. A remote-control window runs as its own process launched with `SCRIBE_REMOTE_DIAL` (and optional `SCRIBE_REMOTE_WINDOW` / `SCRIBE_REMOTE_TAKEOVER`) in its env, spawned by [[crates/scribe-client/src/main.rs#spawn_remote_client_process]] from the connect picker or a reclaim. The owning machine's own status indicators are separate — see [[client#Status Bar#Remote Control Surfaces]].
+
+### Remote Dial
+
+When `SCRIBE_REMOTE_DIAL` is set, [[crates/scribe-client/src/ipc_client.rs#start_ipc_thread]] dials the peer's `host:port` over TCP via [[crates/scribe-client/src/ipc_client.rs#start_remote_ipc_thread]] instead of the local Unix socket, running the [[protocol#Remote Protocol#Preamble Handshake]] as the first frame before any `Hello`. The dial parameters travel as one [[crates/scribe-client/src/ipc_client.rs#RemoteDial]].
+
+Unlike the local path this is strictly connect-only — it never starts or upgrades the peer's server. [[crates/scribe-client/src/ipc_client.rs#start_ipc_thread]] returns an [[crates/scribe-client/src/ipc_client.rs#IpcHandle]] carrying the command sender plus, for a remote process only, a [[crates/scribe-client/src/ipc_client.rs#RemoteReconnectCancel]] switch. [[crates/scribe-client/src/ipc_client.rs#remote_dial_target]] lets other code (the reclaim path, status suppression) tell whether this process is a controlling-side window and re-dial the same peer.
+
+### Reconnect State Machine
+
+A dropped remote link auto-reconnects with capped exponential backoff (research D6): [[crates/scribe-client/src/ipc_client.rs#reconnect_with_backoff]] retries up to [[crates/scribe-client/src/ipc_client.rs#RECONNECT_MAX_ATTEMPTS]] times, delay from [[crates/scribe-client/src/ipc_client.rs#backoff_delay]] (500 ms base, 15 s cap), re-running the preamble and re-claiming the SAME window with `Hello { takeover: false }` on each attempt.
+
+Each attempt emits `UiEvent::RemoteReconnecting { attempt }`, driving a cancelable [[crates/scribe-client/src/remote_connect.rs#ReconnectOverlay]] ("Reconnecting to `<peer>`… (attempt n)"); success emits `RemoteReconnected` and exhaustion emits `RemoteReconnectFailed` (one-action reconnect). Because reconnect always uses `takeover = false`, a window reclaimed by someone else mid-outage lands the client in lost control rather than silently re-seizing it (FR-011). Cancel — via the overlay ([[crates/scribe-client/src/main.rs#App#handle_reconnect_overlay_key]]) or the `RemoteReconnectCancel` switch — settles into a disconnected state, and a delivered `RemoteDisconnect` sever notice ends the loop and reports the disable as fact.
+
+Each attempt is cancel-aware end to end (FR-011): [[crates/scribe-client/src/ipc_client.rs#reconnect_with_backoff]] races the whole connect → handshake → `Hello` sequence — run as [[crates/scribe-client/src/ipc_client.rs#try_reconnect_attempt]] returning a [[crates/scribe-client/src/ipc_client.rs#ReconnectAttempt]] — against [[crates/scribe-client/src/ipc_client.rs#wait_for_cancel]], so a Cancel or delivered sever fired mid-attempt drops the in-flight (half-open) stream instead of completing and emitting `RemoteReconnected` over a settled overlay. Because `try_reconnect_attempt` emits no UI events the caller alone decides whether the attempt goes live, and [[crates/scribe-client/src/main.rs#App#handle_remote_reconnected]] now carries the same `is_settled()` overlay guard as [[crates/scribe-client/src/main.rs#App#handle_remote_reconnecting]], so a late success never revives a window the user already settled.
+
+The status-bar connection dot reflects the down link (see [[client#Status Bar]]): `server_connected` flips false in `handle_remote_reconnecting` and [[crates/scribe-client/src/main.rs#App#settle_reconnect_terminal]] — the remote read task deliberately emits no `ServerDisconnected`, so nothing else clears it — and is restored true only by a successful [[crates/scribe-client/src/main.rs#App#reattach_sessions_after_reconnect]], so it stays red through every retry, failure, and severed state.
+
+### Connect Picker
+
+The command palette's "Connect to remote machine…" action ([[crates/scribe-client/src/main.rs#App#open_remote_connect]]) opens the GPU-overlay [[crates/scribe-client/src/remote_connect.rs#RemoteConnect]] picker.
+
+It lists same-account online peers — fetched by a local `ListRemotePeers` request ([[crates/scribe-client/src/main.rs#App#request_remote_peers]] → [[crates/scribe-client/src/remote_connect.rs#RemoteConnect#set_peers]]) — with a manual-entry field, then the chosen peer's window list ([[crates/scribe-client/src/remote_connect.rs#RemoteConnect#set_windows]], workspace names and session counts) plus a "New window" option.
+
+Key handling ([[crates/scribe-client/src/remote_connect.rs#RemoteConnect#handle_key]]) returns a [[crates/scribe-client/src/remote_connect.rs#RemoteConnectAction]] that [[crates/scribe-client/src/main.rs#App#apply_remote_connect_action]] turns into a [[crates/scribe-client/src/main.rs#spawn_remote_client_process]] call: attaching an existing window uses `takeover = true`, creating a new one uses `takeover = false`. Each failure class maps to distinct copy per UX-002 (unreachable / disabled / unauthorized / version / busy / taken-over); [[crates/scribe-client/src/remote_connect.rs#RemoteConnect#on_severed]] surfaces a delivered sever notice. The spawn also clears the inheritable takeover markers on the paths that must not use them — [[crates/scribe-client/src/main.rs#spawn_remote_client_process]] `env_remove`s `SCRIBE_REMOTE_WINDOW` / `SCRIBE_REMOTE_TAKEOVER` on the new-window and non-takeover branches — so a child launched from an already-takeover process never inherits a stale marker and silently re-seizes a window (FR-011).
+
+### Displaced and Lost Control
+
+When the server sends `WindowTakenOver`, [[crates/scribe-client/src/main.rs#App#handle_window_taken_over]] builds a [[crates/scribe-client/src/lost_control.rs#LostControlState]]: the last frame is dimmed and frozen (no live fan-out in v1) under a banner naming the new controller's device and account, with one-action reclaim.
+
+Reclaim ([[crates/scribe-client/src/main.rs#App#reclaim_window]]) spawns a fresh client for the same window with `takeover = true` — a remote re-dial when this is a controlling-side process, or a local takeover client otherwise. A short grace timer lets a displacing `WindowTakenOver` land before a raced reconnect clears the state, so a reconnect that lost the race resolves cleanly to lost control instead of flickering back to active.
+
 ## Selection
 
 Text selection in [[crates/scribe-client/src/selection.rs]] supports three modes: Cell, Word, and Line. Coordinates are absolute grid positions.
@@ -576,6 +612,14 @@ The status bar is rendered at the bottom of the window with segments for connect
 Update availability and progress also render here, centered in the empty span between the left and right segments — see [[crates/scribe-client/src/status_bar.rs#centered_start_col]] — so the CTA stays visible on narrow windows and steps down to a shorter `↑ Update` label, then disappears entirely, only when the empty span cannot hold it. Clicking the update segment opens the in-app confirmation dialog.
 
 Connection is indicated by a green/red dot. A command-status glyph (`✓`/`✗`/`?`) sits next to it, reflecting the focused pane's most recent command outcome from shell integration (Success/Failure/Unknown); it is the authoritative non-colour cue and stays hidden until the first command resolves. When env-persistence is enabled and the focused pane's [[crates/scribe-client/src/pane.rs#Pane]]`::env_status` is `Some(Degraded { .. })`, a `⚠` (U+26A0) warning glyph in the palette's warning slot renders immediately to the right of the command-status indicator (see [[crates/scribe-client/src/status_bar.rs#render_env_status_warning]]); `None` and `Some(Active)` render nothing. The glyph's hover tooltip directs the user to retry from Settings → Terminal → General. Workspace name appears when multi-workspace. The focused pane's remote host overrides the local hostname when shell integration emits session context, and tmux session names render as a separate accent segment. Stats include CPU sparkline, memory percentage, GPU sparkline (Linux only), and network sparklines.
+
+### Remote Control Surfaces
+
+Feature 013 (T022) adds two owning-machine remote indicators to the left side, between the env-warning glyph and the workspace name — see [[crates/scribe-client/src/status_bar.rs#render_remote_status]].
+
+A persistent subtle `⇅` (U+21C5, dimmed) shows while this machine allows remote control (`remote.enabled`, FR-009a). While a remote peer controls any window, a prominent accent segment names the controller(s) and window counts (e.g. `laptop-2 controls 1 window`, FR-009b) built by [[crates/scribe-client/src/status_bar.rs#build_remote_control_summary]], with an account-naming tooltip from [[crates/scribe-client/src/status_bar.rs#remote_control_tooltip]]. Both fields live in [[crates/scribe-client/src/status_bar.rs#RemoteStatusData]] on [[crates/scribe-client/src/status_bar.rs#StatusBarData]].
+
+The controller list is fed by polling the local server's window list every [[crates/scribe-client/src/main.rs#WINDOW_LIST_POLL_INTERVAL]] (2s) while `remote.enabled`: [[crates/scribe-client/src/main.rs#App#poll_window_list_if_due]] issues [[crates/scribe-client/src/ipc_client.rs#ClientCommand]]`::ListWindows`, and [[crates/scribe-client/src/main.rs#App#handle_local_window_list]] caches the windows with `controller = Some` from the [[crates/scribe-client/src/ipc_client.rs#UiEvent]]`::LocalWindowList` reply. Because the list comes from the server, it covers remotely-created windows that never had a local client (SC-006). Controlling-side (remote-dialed) windows suppress both surfaces, and disabling remote clears the cache via [[crates/scribe-client/src/main.rs#App#apply_remote_status_config]].
 
 ## System Stats
 

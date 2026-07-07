@@ -5,7 +5,7 @@ use std::sync::Arc;
 use alacritty_terminal::grid::Dimensions;
 use futures_util::future::join_all;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use scribe_common::ids::SessionId;
 use scribe_common::protocol::{ServerMessage, TerminalSize};
@@ -187,9 +187,14 @@ async fn install_client_writer(
 ) {
     let mut client_writer = entry.client_writer.lock().await;
     if client_writer.is_some() {
-        warn!(
+        // Feature 013: an existing writer here is the EXPECTED case on a takeover
+        // (the new controller re-points each session at itself; the displaced
+        // connection can no longer detach them thanks to the ptr-eq guards in
+        // `detach_sessions` / `dispatch_message`). It is therefore no longer a
+        // warning — just a debug breadcrumb of the controller handover.
+        debug!(
             %entry.session_id,
-            "AttachSessions: overwriting existing client writer - previous client may still be connected"
+            "AttachSessions: re-pointing session's client writer to the attaching controller"
         );
     }
     *client_writer = Some(Arc::clone(writer));
@@ -263,6 +268,7 @@ mod tests {
     use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
     use tokio::sync::{Mutex, mpsc};
 
+    use crate::ipc_server::ClientSink;
     use crate::session_manager::build_term_config;
 
     struct TestDimensions;
@@ -321,7 +327,7 @@ mod tests {
         let (server, client) = unix_stream_pair();
         let (_server_read, server_write) = tokio::io::split(server);
         let (mut client_read, _client_write) = tokio::io::split(client);
-        let writer: SharedWriter = Arc::new(Mutex::new(server_write));
+        let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Local(Box::new(server_write))));
 
         send_attach_replay(&entry, &writer, &live_sessions).await;
 
@@ -361,7 +367,7 @@ mod tests {
 
         let (server, _client) = unix_stream_pair();
         let (_read, write) = tokio::io::split(server);
-        let writer: SharedWriter = Arc::new(Mutex::new(write));
+        let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Local(Box::new(write))));
         let attached_ids = Arc::new(Mutex::new(HashSet::new()));
 
         let attached =

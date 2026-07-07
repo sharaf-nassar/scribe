@@ -255,6 +255,7 @@ tracing-subscriber.workspace = true
 vte.workspace = true
 regex.workspace = true
 nix.workspace = true
+socket2.workspace = true
 rustix.workspace = true
 unix-ancillary.workspace = true
 libc.workspace = true

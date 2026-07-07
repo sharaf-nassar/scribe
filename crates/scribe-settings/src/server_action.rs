@@ -185,6 +185,66 @@ fn parse_env_preflight_response(msg: ServerMessage) -> Result<EnvPreflightOutcom
     }
 }
 
+/// Outcome of a `GetRemoteEnv` request: this machine's signed-in tailnet
+/// account name (absent when unknown) and whether Tailscale was detected at
+/// all. Any transport / protocol error — or a timeout — folds into the
+/// fail-closed default `{ account: None, tailscale_detected: false }` so the
+/// settings window always has a single shape to render, never blocks on
+/// tailscaled, and simply shows the passive "Tailscale not detected" notice
+/// (FR-015). `Default` yields exactly that fail-closed shape.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteEnvOutcome {
+    /// Signed-in tailnet login name for the UX-003 statement; `None` keeps the
+    /// generic account placeholder in the webview.
+    pub account: Option<String>,
+    /// Whether the server reached its `LocalAPI` at all; `false` shows the
+    /// passive "Tailscale not detected" notice.
+    pub tailscale_detected: bool,
+}
+
+/// Send `GetRemoteEnv` to the server and wait for the matching response.
+///
+/// Any transport or protocol error — including a timeout — becomes the
+/// fail-closed `RemoteEnvOutcome::default()` (`account: None,
+/// tailscale_detected: false`) so the settings window always has a single shape
+/// to render and never blocks on tailscaled. A fresh connection is opened per
+/// call so this never reuses sockets from other server actions.
+pub fn request_remote_env(timeout: Duration) -> RemoteEnvOutcome {
+    match try_request_remote_env(timeout) {
+        Ok(outcome) => outcome,
+        Err(reason) => {
+            tracing::warn!("remote env transport error: {reason}");
+            RemoteEnvOutcome::default()
+        }
+    }
+}
+
+fn try_request_remote_env(timeout: Duration) -> Result<RemoteEnvOutcome, String> {
+    let path = server_socket_path();
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|e| format!("connect to {} failed: {e}", path.display()))?;
+    stream.set_read_timeout(Some(timeout)).map_err(|e| format!("set_read_timeout: {e}"))?;
+    stream.set_write_timeout(Some(timeout)).map_err(|e| format!("set_write_timeout: {e}"))?;
+
+    write_frame(&mut stream, &ClientMessage::GetRemoteEnv)?;
+
+    parse_remote_env_response(read_frame(&mut stream)?)
+}
+
+/// Pure helper that maps an arbitrary `ServerMessage` into the outcome expected
+/// by the remote-env code path. Anything other than `RemoteEnv { .. }` —
+/// including the wrong-variant case the server should never produce — is
+/// surfaced as an `Err` so the public entry point can fold it into the
+/// fail-closed default.
+fn parse_remote_env_response(msg: ServerMessage) -> Result<RemoteEnvOutcome, String> {
+    match msg {
+        ServerMessage::RemoteEnv { account, tailscale_detected } => {
+            Ok(RemoteEnvOutcome { account, tailscale_detected })
+        }
+        other => Err(format!("unexpected server response: {other:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -68,7 +68,7 @@ The server validates each mutation, persists the resulting store, and only then 
 
 Window automation messages let the CLI inspect windows and ask a connected client to execute the same actions exposed by keyboard shortcuts and the command palette.
 
-`ListWindows` returns every connected window with its ID, session count, and connection status. `DispatchAction` carries an [[crates/scribe-common/src/protocol.rs#AutomationAction]] value such as settings, find, new tab, split, close, new window, profile switch, or focus session, but the server only routes it to the caller's connected window. The server answers each dispatch with either `ActionDispatched` naming the routed window or `Error` when the target is missing or belongs to another connection.
+`ListWindows` returns every connected window with its ID, session count, and connection status, plus the feature-013 workspace names and remote-controller identity per window ([[protocol#Remote Protocol#Window Context Fields]]). `DispatchAction` carries an [[crates/scribe-common/src/protocol.rs#AutomationAction]] value such as settings, find, new tab, split, close, new window, profile switch, or focus session, but the server only routes it to the caller's connected window. The server answers each dispatch with either `ActionDispatched` naming the routed window or `Error` when the target is missing or belongs to another connection.
 
 ### Connection
 
@@ -77,6 +77,8 @@ Window automation messages let the CLI inspect windows and ask a connected clien
 Both `Hello.clipboard_gating` and `Welcome.clipboard_gating` default to `false` for backward compatibility. When either side reports `false`, the server treats sessions in that window as headless for OSC 52 prompt and bridge purposes and the client defensively no-ops on receipt of the new clipboard variants.
 
 If the requested window ID is already connected, the server assigns another unconnected window or a fresh ID instead of replacing the existing owner. The check and the registration are performed atomically inside [[crates/scribe-server/src/ipc_server.rs#claim_window]] while holding a single `connected_clients` write lock. A previous read-then-write split was a TOCTOU race: the concurrent-reconnect burst that a server upgrade or client relaunch triggers let two `Hello`s for the same window both observe it unconnected and both register, leaving two live clients bound to one window ID (which then fought, respawned, and churned the session).
+
+Feature 013 adds a `takeover: bool` to `Hello` (serde-default `false`): a remote client can explicitly claim a connected window and displace its controller, and the same flag reclaims a displaced window from the other side. Local clients never set it, so this paragraph's assign-different-window behavior is exactly the `takeover = false` case — see [[protocol#Remote Protocol#Takeover]].
 
 Transient actions are an exception: the [[server#Server#Updater#Manual Check]] path lets a non-client process (the standalone settings window) open `server.sock`, send `CheckForUpdates` as the first and only message, read back a single `UpdateCheckResult`, and disconnect — never registering as a connected client and never receiving a `Welcome`.
 
@@ -187,6 +189,67 @@ Each [[crates/scribe-common/src/protocol.rs#Release]] carries `version`, `name`,
 ### Error
 
 `Error` carries a human-readable error message string.
+
+## Remote Protocol
+
+Feature 013 carries the existing framed protocol over TCP to another of the user's tailnet machines, layering a remote-only preamble, single-controller takeover, and typed refusals over the local message catalogue.
+
+The full wire contract is `specs/013-remote-window-control/contracts/remote-protocol.md`. The local Unix-socket path is unchanged: the preamble and every remote-only message never appear locally, and the new `Hello.takeover` flag defaults `false` via serde so existing clients keep today's behavior. See [[server#Remote Control]] for the owning-side implementation and [[client#Remote Control]] for the connecting side.
+
+### Remote Transport
+
+A TCP listener bound strictly to the machine's Tailscale addresses (never `0.0.0.0`) on `remote.port` (default 46061), existing only while `remote.enabled`. Frames are identical to the local socket — [[crates/scribe-common/src/framing.rs#read_message]] and the 64 MiB cap are reused unchanged.
+
+The dialer and owner gate compatibility on [[crates/scribe-common/src/protocol.rs#REMOTE_PROTOCOL_VERSION]], a `u32` starting at 1 with an exact-match policy (bump on any change to remote-visible semantics). Up to 8 remote connections are accepted concurrently, separate from the 32 local cap; excess connections are refused `Busy` after the preamble. Everything within an accepted session — `Welcome`, `AttachSessions`, `SessionReplay`, `PtyOutput`, `KeyInput` (4 KiB cap), resize, scroll/search, clipboard, workspace, and notes messages — keeps byte-identical semantics.
+
+### Preamble Handshake
+
+The first frame a remote client sends MUST be `ClientMessage::RemoteHandshake` (protocol version, human Scribe version, device name); it carries no window or session data so the owner can decide before anything is revealed (FR-003).
+
+The owner replies `ServerMessage::RemoteHandshakeReply { accepted, refusal, server versions }`. Between reading the preamble and replying, the owner resolves the peer's tailnet identity, checks the same-account authorization policy, and gates the protocol version — see [[server#Remote Control#Accept Path]]. Every refusal reaches the dialer as a typed [[crates/scribe-common/src/protocol.rs#RemoteRefusal]] so distinct UX-002 copy is possible: `Disabled` (raced a live disable), `Unauthorized` (wrong account, tagged, or unknown identity), `IdentityUnavailable` (tailscaled/WhoIs down — fail closed), `IncompatibleVersion` (both versions named), and `Busy` (connection cap reached). The same enum is the canonical audit taxonomy ([[server#Remote Control#Audit Log]]). Only a malformed or non-`RemoteHandshake` first frame closes bare with nothing to reply to, which is why transient no-`Hello` connections (update checks, hook events) stay local-only over TCP.
+
+### Takeover
+
+`ClientMessage::Hello` gains `takeover: bool` (serde-default `false`) to claim a currently-connected window: `false` never displaces the current controller, `true` atomically swaps the window's writer.
+
+`true` is an explicit user action only — a first attach from the picker or a lost-control reclaim. The four outcomes turn on `takeover` and whether the claimant is local or remote:
+
+- **Local, no takeover, window connected** — today's behavior exactly: a different or fresh window is assigned to the claimant.
+- **Remote, no takeover, window connected** — the owner completes `Welcome` for the requested window then immediately sends `WindowTakenOver` naming the current controller, with no sessions attached. This is the auto-reconnect lost-control path (FR-011): a dropped remote client resumes normally when its window is free (the common case) but lands displaced — never a silent seizure — when someone took the window mid-outage.
+- **Takeover, window connected** — the owner swaps the writer under the claim lock, sends `ServerMessage::WindowTakenOver { device_name, login_name }` to the displaced client, and runs the normal attach flow for the claimant. Reclaim is the same message from the other side, so local and remote claims share one path.
+- `Hello { window_id: None }` over remote creates a fresh window (remote create).
+
+All per-connection state — the `clipboard_gating` capability bit and clipboard-bridge routing — follows the NEW controller's `Hello` from the moment of the swap; no stale capability survives a takeover ([[server#Remote Control#Takeover and Control]]). On `WindowTakenOver` the displaced client stops sending input, dims and freezes its last frame under a banner naming the controller, and offers one-action reclaim; it expects no further `PtyOutput` (no fan-out in v1) — see [[client#Remote Control#Displaced and Lost Control]].
+
+### Disconnect and Sever
+
+`ServerMessage::RemoteDisconnect { reason }` is a best-effort final frame the owner sends before closing a remote connection for a policy reason; v1's only reason is `Disabled` (remote access turned off).
+
+The close follows regardless of whether the frame is delivered. The delivered notice is what lets the connecting side state "remote access was turned off on `<peer>`" as fact rather than inference. If it is lost (crash, dead link) the client falls back to its reconnect path, where the vanished listener yields the combined connection-failure copy — a disabled machine is deliberately indistinguishable from an unreachable one on a cold connect because FR-001 forbids leaving anything listening. Owning-side sessions are untouched. See [[server#Remote Control#Disable and Sever]].
+
+### Peer Discovery
+
+`ClientMessage::ListRemotePeers` / `ServerMessage::RemotePeerList { peers }` feed the connect picker from the connecting machine's OWN local server, the only party that talks to tailscaled.
+
+Each [[crates/scribe-common/src/protocol.rs#RemotePeerInfo]] carries a MagicDNS name, a dial address, and an online flag. These are local-socket-only: over TCP they are refused like any other pre-`RemoteHandshake` frame, so a remote peer cannot enumerate a third machine's tailnet view. The GUI client never speaks LocalAPI directly — the peer list is resolved server-side in [[server#Remote Control#Tailnet Identity]].
+
+### Local Env Query
+
+`ClientMessage::GetRemoteEnv` / `ServerMessage::RemoteEnv { account, tailscale_detected }` report the connecting machine's OWN signed-in tailnet account name and whether Tailscale is detected at all, for the Settings → Remote section (UX-003).
+
+Like [[protocol#Remote Protocol#Peer Discovery|ListRemotePeers]] it is a transient local-socket-only helper resolved from this machine's own LocalAPI view: over TCP it is refused as a non-`RemoteHandshake` first frame, so a remote peer can never read a third machine's identity. Any LocalAPI failure fails closed to `{ account: None, tailscale_detected: false }` (FR-015), which drives the passive "Tailscale not detected" notice. The owning-side resolution lives in [[server#Remote Control#Tailnet Identity]] and the settings-host consumer is [[settings#Config Application#Remote Keys]].
+
+### Window Probe
+
+An already-authorized remote connection may send `ClientMessage::ListWindows` as a read-only frame BEFORE its `Hello`, receiving a `ServerMessage::WindowList` of the peer's windows to populate the connect picker (FR-005).
+
+The probe registers no window and claims no control: [[crates/scribe-server/src/ipc_server.rs#establish_client_window]] is a loop that answers the `WindowList` and keeps reading, so the probe then closes or a `Hello` may follow on the same link. Every OTHER non-`Hello` first frame after an accepted handshake still closes — the transient no-`Hello` helpers (update checks, hook events, `ListRemotePeers`, `GetRemoteEnv`) stay local-socket only over TCP. This is distinct from [[protocol#Remote Protocol#Peer Discovery]], which lists the connecting machine's OWN peers; the probe lists the dialed peer's windows.
+
+### Window Context Fields
+
+[[crates/scribe-common/src/protocol.rs#WindowInfo]] (carried by [[protocol#Server Messages#Automation]] `WindowList` and the `Welcome` unconnected-window list) gains two additive, `#[serde(default)]` fields for feature 013: `workspace_names` and `controller`.
+
+`workspace_names` lists the window's distinct named workspaces in session order, feeding the remote connect picker's window list (FR-005); it is built by [[crates/scribe-server/src/workspace_manager.rs#WorkspaceManager#workspace_names_for_window]]. `controller` is an [[crates/scribe-common/src/protocol.rs#ControllerInfo]] (device + login name) present only while a remote peer holds the window and `None` when it is unconnected or locally controlled — this lets window-listing and status surfaces mark remotely-controlled windows, including remotely-created ones that never had a local client (FR-009b, SC-006). Both are empty or `None` from an older server.
 
 ## Screen Snapshots
 
