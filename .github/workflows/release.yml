@@ -176,7 +176,16 @@ jobs:
           RELEASE_NOTES: ${{ steps.notes.outputs.notes }}
         run: |
           printf '%s\n' "$RELEASE_NOTES" > /tmp/release-notes.md
+          # Prerelease-style tags (containing a hyphen, e.g. v0.0.23-test1)
+          # publish as a hidden draft + prerelease so the in-app updater never
+          # surfaces them (Stable and Beta both filter drafts); plain vX.Y.Z
+          # tags publish a normal release as before.
+          release_flags=()
+          if [[ "$TAG" == *-* ]]; then
+            release_flags=(--draft --prerelease)
+          fi
           gh release create "$TAG" \
+            "${release_flags[@]}" \
             --title "$TAG" \
             --notes-file /tmp/release-notes.md \
             artifacts/*.deb artifacts/*.dmg artifacts/*.minisig
