@@ -647,7 +647,7 @@ impl TerminalRenderer {
         c: char,
         flags: Flags,
     ) -> ([f32; 2], [f32; 2]) {
-        if c == ' ' || c == '\u{0}' {
+        if c == ' ' || c == '\t' || c == '\u{0}' {
             return ([0.0, 0.0], [0.0, 0.0]);
         }
 
@@ -672,7 +672,7 @@ impl TerminalRenderer {
         cell: CollectedCellKey,
         ligature_map: &LigatureMap,
     ) -> ([f32; 2], [f32; 2]) {
-        if cell.c == ' ' || cell.c == '\u{0}' {
+        if cell.c == ' ' || cell.c == '\t' || cell.c == '\u{0}' {
             return ([0.0, 0.0], [0.0, 0.0]);
         }
 
@@ -895,7 +895,8 @@ impl RunAccum {
 /// Group collected cells into contiguous same-styled runs suitable for
 /// ligature shaping.
 ///
-/// Wide-character spacer cells are skipped. Runs spanning a row change or a
+/// Wide-character spacer cells are skipped, and tabs flush the current run
+/// and are excluded rather than shaped. Runs spanning a row change or a
 /// style change (bold, italic, fg, bg) are flushed. Only runs with two or
 /// more characters are returned, since a single character cannot form a
 /// ligature.
@@ -908,6 +909,18 @@ fn detect_styled_runs(cells: &[CollectedCell]) -> Vec<StyledRun> {
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
             || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
         {
+            continue;
+        }
+
+        // Tabs are column separators, not shapeable glyphs, and have zero
+        // `unicode_width`, so `RunAccum::matches` lets one attach to the end
+        // of the preceding run instead of breaking it. Shaping a trailing
+        // tab can then produce a bogus wide advance that gets inserted into
+        // the ligature map, overwriting real characters in the next word.
+        // Flush and exclude tabs entirely rather than let them enter run
+        // text.
+        if cell.c == '\t' {
+            accum.flush(&mut out);
             continue;
         }
 
@@ -1012,7 +1025,10 @@ fn build_ligature_map(runs: &[StyledRun], atlas: &mut GlyphAtlas) -> LigatureMap
             }
 
             // Contextual alternate that fits in a single cell — record it.
-            if atlas.fits_single_cell(glyph.cache_key) {
+            if atlas.fits_single_cell(
+                glyph.cache_key,
+                GlyphStyle { bold: run.bold, italic: run.italic },
+            ) {
                 map.insert(
                     (run.line, col),
                     LigatureCellInfo { cache_key: glyph.cache_key, glyph_span: 1, cell_index: 0 },
@@ -1027,7 +1043,10 @@ fn build_ligature_map(runs: &[StyledRun], atlas: &mut GlyphAtlas) -> LigatureMap
             while shaped.get(i).is_some_and(|g| {
                 g.glyph_span == 1
                     && is_contextual_alternate(atlas, g, run)
-                    && !atlas.fits_single_cell(g.cache_key)
+                    && !atlas.fits_single_cell(
+                        g.cache_key,
+                        GlyphStyle { bold: run.bold, italic: run.italic },
+                    )
             }) {
                 i += 1;
             }
@@ -1060,4 +1079,80 @@ fn build_ligature_map(runs: &[StyledRun], atlas: &mut GlyphAtlas) -> LigatureMap
     }
 
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::index::{Column, Line, Point};
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+
+    use super::*;
+
+    fn cell(line: i32, col: usize, c: char) -> CollectedCell {
+        CollectedCell {
+            point: Point::new(Line(line), Column(col)),
+            c,
+            fg: Color::Named(NamedColor::Foreground),
+            bg: Color::Named(NamedColor::Background),
+            flags: Flags::empty(),
+        }
+    }
+
+    /// Builds one row of cells from `text`, assuming every character is
+    /// single-width (sufficient for the ASCII fixtures used below).
+    fn cells_from_str(line: i32, text: &str) -> Vec<CollectedCell> {
+        text.chars().enumerate().map(|(i, c)| cell(line, i, c)).collect()
+    }
+
+    /// BSD `ls`'s columnar output separates entries with raw tabs, not
+    /// spaces. A tab must never end up inside shaped run text.
+    #[test]
+    fn detect_styled_runs_excludes_tabs_from_run_text() {
+        let cells = cells_from_str(0, "tests\tAGENTS.md");
+        let runs = detect_styled_runs(&cells);
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].text, "tests");
+        assert_eq!(runs[0].start_col, 0);
+        assert_eq!(runs[1].text, "AGENTS.md");
+        assert_eq!(runs[1].start_col, 6);
+        assert!(runs.iter().all(|r| !r.text.contains('\t')));
+    }
+
+    /// A tab has zero `unicode_width`, so naive column tracking lets it
+    /// attach to the end of the preceding run instead of breaking it.
+    /// Runs must still end exactly at the real text, excluding the tab.
+    #[test]
+    fn detect_styled_runs_flushes_run_on_trailing_tab() {
+        let cells = cells_from_str(0, "=>\tvalue");
+        let runs = detect_styled_runs(&cells);
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].text, "=>");
+        assert_eq!(runs[1].text, "value");
+    }
+
+    /// Short names can need multiple tab stops to reach the next column;
+    /// consecutive tabs must not panic or get merged into run text.
+    #[test]
+    fn detect_styled_runs_handles_consecutive_tabs() {
+        let cells = cells_from_str(0, "ab\t\t\tcd");
+        let runs = detect_styled_runs(&cells);
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].text, "ab");
+        assert_eq!(runs[1].text, "cd");
+        assert_eq!(runs[1].start_col, 5);
+    }
+
+    /// A lone tab with no adjacent same-run text on either side must not
+    /// surface as a one-character run (runs require >= 2 chars anyway, but
+    /// this pins down the tab-specific flush path doesn't special-case it).
+    #[test]
+    fn detect_styled_runs_drops_lone_leading_tab() {
+        let cells = cells_from_str(0, "\tx");
+        let runs = detect_styled_runs(&cells);
+
+        assert!(runs.is_empty());
+    }
 }

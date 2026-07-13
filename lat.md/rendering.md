@@ -18,6 +18,12 @@ If a shaped glyph spans more than one terminal column or is a contextual alterna
 
 `col_offset` counts wide characters as multiple grid columns while `chars` indexes them as one entry, so the two diverge after any wide character. Populating `source_char` from cosmic-text's `g.start..g.end` byte range during shaping keeps identity checks correct regardless of grid position — fixing the false-positive contextual-alternate detection that produced blank cells past emoji on the same run.
 
+#### Tab Exclusion From Run Text
+
+Tab characters are excluded from shaped run text entirely — [[crates/scribe-renderer/src/lib.rs#detect_styled_runs]] flushes the accumulator and skips the cell outright when it encounters `\t`, the same way it already skips wide-char spacer cells.
+
+`unicode_width` gives `\t` a width of 0, so [[crates/scribe-renderer/src/lib.rs#RunAccum#matches]]'s column-matching let a tab silently attach to the end of the preceding run instead of breaking it (e.g. a run's text became `"tests\t"`). Shaping that trailing tab through cosmic-text produced an arbitrary, oversized glyph advance, and since any shaped glyph spanning more than one column is inserted into the ligature map as-is (see above), the bogus span got inserted starting at the tab's own column and ran forward into the next word's real characters, silently replacing their rendered glyphs with slices of the tab's texture. This is the mechanism behind BSD `ls`'s columnar output (which separates entries with raw tabs, not spaces) dropping the first few characters of filenames when ligatures are enabled. [[crates/scribe-renderer/src/lib.rs#TerminalRenderer#resolve_glyph_uv_raw]] and [[crates/scribe-renderer/src/lib.rs#TerminalRenderer#resolve_glyph_uv_for_collected_fields]] also treat `\t` as a blank cell (same as space and NUL) as defense in depth, independent of the run-detection fix. The fix lives entirely in `scribe-renderer`, which has no `cfg(target_os)` branches, so it applies identically on macOS and Linux.
+
 ### Cursor Rendering
 
 Block cursor inverts foreground and background colours. Beam cursor renders the normal cell plus a thin vertical bar overlay. Underline cursor renders the normal cell plus a thin horizontal bar at the bottom.
