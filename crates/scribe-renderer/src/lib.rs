@@ -1145,14 +1145,18 @@ mod tests {
         assert_eq!(runs[1].start_col, 5);
     }
 
-    /// A lone tab with no adjacent same-run text on either side must not
-    /// surface as a one-character run (runs require >= 2 chars anyway, but
-    /// this pins down the tab-specific flush path doesn't special-case it).
+    /// A tab must not rescue a lone preceding character into a run by
+    /// attaching to it. The zero-width tab satisfies `RunAccum::matches`
+    /// against the single `a`, so without the flush it would append and
+    /// surface a spurious two-char `"a\t"` run; excluding the tab leaves
+    /// only the following word.
     #[test]
-    fn detect_styled_runs_drops_lone_leading_tab() {
-        let cells = cells_from_str(0, "\tx");
+    fn detect_styled_runs_tab_does_not_rescue_single_char() {
+        let cells = cells_from_str(0, "a\tbc");
         let runs = detect_styled_runs(&cells);
 
-        assert!(runs.is_empty());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "bc");
+        assert_eq!(runs[0].start_col, 2);
     }
 }

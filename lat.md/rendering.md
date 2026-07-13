@@ -68,6 +68,12 @@ Characters are shaped with cosmic-text and rasterized via the swash cache, then 
 
 Advanced shaping is used for ligatures, Basic when disabled. Mask images are expanded to RGBA by filling white; Color images are kept as-is. Swash placement offsets position the glyph on the canvas.
 
+### Weight-Aware Cell Measurement
+
+Bold glyphs are shaped at a heavier weight than regular text, so the atlas measures a separate reference cell width per weight (`cell_size` and `bold_cell_size`) for ligature classification.
+
+[[crates/scribe-renderer/src/atlas.rs#measure_cell]] shapes an "M" at a given `weight` and records its advance; [[crates/scribe-renderer/src/atlas.rs#GlyphAtlas]] stores both the regular and bold results. Ligature classification compares each shaped glyph against the width for its own weight: [[crates/scribe-renderer/src/atlas.rs#GlyphAtlas#shape_run_uncached]] divides a glyph's advance by the matching cell width to derive its column span, and [[crates/scribe-renderer/src/atlas.rs#GlyphAtlas#fits_single_cell]] bounds a glyph's visual extent against it. Both take the glyph's [[crates/scribe-renderer/src/atlas.rs#GlyphStyle]] so the correct width is chosen. Measuring a legitimately wider bold glyph against the narrower regular-weight "M" previously made an ordinary single-cell bold glyph exceed the threshold and get misclassified as a multi-cell ligature, corrupting the ligature map and dropping the following cell's character.
+
 ### Font Fallbacks
 
 Glyph shaping uses a Scribe-specific cosmic-text fallback list so terminal icon fonts win before generic symbol fonts.
