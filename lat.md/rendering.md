@@ -18,6 +18,12 @@ If a shaped glyph spans more than one terminal column or is a contextual alterna
 
 `col_offset` counts wide characters as multiple grid columns while `chars` indexes them as one entry, so the two diverge after any wide character. Populating `source_char` from cosmic-text's `g.start..g.end` byte range during shaping keeps identity checks correct regardless of grid position — fixing the false-positive contextual-alternate detection that produced blank cells past emoji on the same run.
 
+#### Tab Exclusion From Run Text
+
+Tab characters are excluded from shaped run text entirely — [[crates/scribe-renderer/src/lib.rs#detect_styled_runs]] flushes the accumulator and skips the cell outright when it encounters `\t`, the same way it already skips wide-char spacer cells.
+
+`unicode_width` gives `\t` a width of 0, so [[crates/scribe-renderer/src/lib.rs#RunAccum#matches]]'s column-matching let a tab silently attach to the end of the preceding run instead of breaking it (e.g. a run's text became `"tests\t"`). Shaping that trailing tab through cosmic-text produced an arbitrary, oversized glyph advance, and since any shaped glyph spanning more than one column is inserted into the ligature map as-is (see above), the bogus span got inserted starting at the tab's own column and ran forward into the next word's real characters, silently replacing their rendered glyphs with slices of the tab's texture. This is the mechanism behind BSD `ls`'s columnar output (which separates entries with raw tabs, not spaces) dropping the first few characters of filenames when ligatures are enabled. [[crates/scribe-renderer/src/lib.rs#TerminalRenderer#resolve_glyph_uv_raw]] and [[crates/scribe-renderer/src/lib.rs#TerminalRenderer#resolve_glyph_uv_for_collected_fields]] also treat `\t` as a blank cell (same as space and NUL) as defense in depth, independent of the run-detection fix. The fix lives entirely in `scribe-renderer`, which has no `cfg(target_os)` branches, so it applies identically on macOS and Linux.
+
 ### Cursor Rendering
 
 Block cursor inverts foreground and background colours. Beam cursor renders the normal cell plus a thin vertical bar overlay. Underline cursor renders the normal cell plus a thin horizontal bar at the bottom.
@@ -61,6 +67,12 @@ When exceeded, roughly half the entries are evicted using an alternating keep pa
 Characters are shaped with cosmic-text and rasterized via the swash cache, then blitted onto a cell-sized canvas and uploaded to the atlas.
 
 Advanced shaping is used for ligatures, Basic when disabled. Mask images are expanded to RGBA by filling white; Color images are kept as-is. Swash placement offsets position the glyph on the canvas.
+
+### Weight-Aware Cell Measurement
+
+Bold glyphs are shaped at a heavier weight than regular text, so the atlas measures a separate reference cell width per weight (`cell_size` and `bold_cell_size`) for ligature classification.
+
+[[crates/scribe-renderer/src/atlas.rs#measure_cell]] shapes an "M" at a given `weight` and records its advance; [[crates/scribe-renderer/src/atlas.rs#GlyphAtlas]] stores both the regular and bold results. Ligature classification compares each shaped glyph against the width for its own weight: [[crates/scribe-renderer/src/atlas.rs#GlyphAtlas#shape_run_uncached]] divides a glyph's advance by the matching cell width to derive its column span, and [[crates/scribe-renderer/src/atlas.rs#GlyphAtlas#fits_single_cell]] bounds a glyph's visual extent against it. Both take the glyph's [[crates/scribe-renderer/src/atlas.rs#GlyphStyle]] so the correct width is chosen. Measuring a legitimately wider bold glyph against the narrower regular-weight "M" previously made an ordinary single-cell bold glyph exceed the threshold and get misclassified as a multi-cell ligature, corrupting the ligature map and dropping the following cell's character.
 
 ### Font Fallbacks
 
