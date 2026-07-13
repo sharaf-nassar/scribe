@@ -72,6 +72,10 @@ pub enum RemoteConnectAction {
     Attach { host: String, port: u16, window_id: WindowId },
     /// Create a fresh window on the peer (`Hello { window_id: None }`, T018).
     NewWindow { host: String, port: u16 },
+    /// Paste the host clipboard into the manual `host:port` entry. The app layer
+    /// owns the clipboard handle, so it reads the text and calls
+    /// [`RemoteConnect::append_manual`].
+    PasteManual,
 }
 
 /// One selectable window on the chosen peer, or the trailing "New window" row.
@@ -259,6 +263,13 @@ impl RemoteConnect {
                 }
             }
             Key::Character(text)
+                if (modifiers.control_key() || modifiers.super_key())
+                    && !modifiers.alt_key()
+                    && text.eq_ignore_ascii_case("v") =>
+            {
+                RemoteConnectAction::PasteManual
+            }
+            Key::Character(text)
                 if !modifiers.control_key() && !modifiers.alt_key() && !modifiers.super_key() =>
             {
                 let mut changed = false;
@@ -284,6 +295,13 @@ impl RemoteConnect {
         };
         self.enter_windows_stage(host.clone(), port);
         RemoteConnectAction::ProbeWindows { host, port }
+    }
+
+    /// Append pasted text to the manual `host:port` entry, dropping control and
+    /// whitespace characters (a host target never contains them, and this also
+    /// strips the trailing newline a clipboard copy usually carries).
+    pub fn append_manual(&mut self, text: &str) {
+        self.manual.extend(text.chars().filter(|ch| !ch.is_control() && !ch.is_whitespace()));
     }
 
     fn handle_windows_key(&mut self, event: &KeyEvent) -> RemoteConnectAction {

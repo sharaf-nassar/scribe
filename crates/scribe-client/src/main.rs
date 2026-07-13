@@ -6684,6 +6684,12 @@ impl App {
                 self.remote_connect.close();
                 self.request_redraw();
             }
+            Action::PasteManual => {
+                if let Some(text) = self.read_clipboard_text() {
+                    self.remote_connect.append_manual(&text);
+                    self.request_redraw();
+                }
+            }
         }
     }
 
@@ -7733,21 +7739,27 @@ impl App {
         }
     }
 
-    fn perform_paste(&mut self) {
-        let text = {
-            let Some(cb) = &mut self.clipboard else {
-                tracing::debug!("clipboard not available");
-                return;
-            };
-            match cb.get_text() {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::debug!("clipboard read failed: {e}");
-                    return;
-                }
-            }
+    /// Read the host clipboard as text, or `None` when unavailable. Shared by
+    /// the terminal paste path and the in-app text fields (command palette and
+    /// the remote-connect entry).
+    fn read_clipboard_text(&mut self) -> Option<String> {
+        let Some(cb) = &mut self.clipboard else {
+            tracing::debug!("clipboard not available");
+            return None;
         };
-        self.send_paste_data(&text);
+        match cb.get_text() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::debug!("clipboard read failed: {e}");
+                None
+            }
+        }
+    }
+
+    fn perform_paste(&mut self) {
+        if let Some(text) = self.read_clipboard_text() {
+            self.send_paste_data(&text);
+        }
     }
 
     /// Send paste text to the focused pane, wrapping in bracketed-paste
@@ -8353,6 +8365,17 @@ impl App {
                 self.command_palette.clear_query();
                 self.refresh_command_palette_items();
                 self.request_redraw();
+            }
+            Key::Character(text)
+                if (self.modifiers.control_key() || self.modifiers.super_key())
+                    && !self.modifiers.alt_key()
+                    && text.eq_ignore_ascii_case("v") =>
+            {
+                if let Some(clip) = self.read_clipboard_text() {
+                    self.command_palette.push_str(&clip);
+                    self.refresh_command_palette_items();
+                    self.request_redraw();
+                }
             }
             Key::Character(text)
                 if !self.modifiers.control_key()

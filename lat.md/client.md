@@ -257,6 +257,8 @@ The command palette is a GPU-rendered action picker for common window actions, p
 
 [[crates/scribe-client/src/command_palette.rs#CommandPalette]] owns the query string, active state, and selected row. [[crates/scribe-client/src/main.rs#App#handle_open_command_palette]] populates entries for settings, find, tab and pane actions, new windows, every saved profile from [[crates/scribe-common/src/profiles.rs#list_profiles]], and (when available) an "Update Scribe to v{version}" entry. Selecting an entry routes through [[crates/scribe-client/src/main.rs#App#execute_automation_action]], so command-palette actions and server-forwarded automation stay on the same code path.
 
+The query field accepts clipboard paste (`Ctrl+V` / `Cmd+V`), reading the host clipboard through [[crates/scribe-client/src/main.rs#App#read_clipboard_text]] and inserting via [[crates/scribe-client/src/command_palette.rs#CommandPalette#push_str]] (control characters stripped). The [[client#Client#Remote Control#Connect Picker]] manual `host:port` field shares that read path via `RemoteConnectAction::PasteManual` → [[crates/scribe-client/src/remote_connect.rs#RemoteConnect#append_manual]].
+
 ### Mouse Handling
 
 Mouse events are processed for text selection, scrollbar interaction, divider drag, tab drag, prompt bar interactions, and context menus.
