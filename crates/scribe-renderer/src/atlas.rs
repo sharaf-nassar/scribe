@@ -240,6 +240,7 @@ pub struct GlyphAtlas {
     swash_cache: SwashCache,
     metrics: Metrics,
     cell_size: CellSize,
+    bold_cell_size: CellSize,
     atlas_size: u32,
     /// Owned family name; `None` means fall back to system monospace.
     family_name: Option<String>,
@@ -263,8 +264,14 @@ impl GlyphAtlas {
         let metrics = Metrics::new(params.size, line_height);
 
         // Measure the cell size by shaping "M" (a wide capital letter).
+        // Bold text is shaped with a distinct weight (`font_weight_bold`),
+        // which can have different glyph metrics than the regular weight, so
+        // it needs its own reference cell width — see `bold_cell_size`.
         let family = family_name_to_cosmic(family_name.as_deref());
-        let cell_size = measure_cell(&mut font_system, metrics, family, params.ligatures);
+        let cell_size =
+            measure_cell(&mut font_system, metrics, family, params.ligatures, params.weight);
+        let bold_cell_size =
+            measure_cell(&mut font_system, metrics, family, params.ligatures, params.weight_bold);
 
         // Create the atlas texture.
         let texture = device.create_texture(&TextureDescriptor {
@@ -303,6 +310,7 @@ impl GlyphAtlas {
             swash_cache,
             metrics,
             cell_size,
+            bold_cell_size,
             atlas_size: ATLAS_SIZE,
             family_name,
             font_weight: params.weight,
@@ -653,7 +661,9 @@ impl GlyphAtlas {
             Self::build_attrs_from(family_str, self.font_weight, self.font_weight_bold, style);
         buf.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
 
-        let cell_w = self.cell_size.width;
+        // Glyphs in this run were shaped at `style`'s weight, so they must be
+        // measured against the cell width for that same weight.
+        let cell_w = if style.bold { self.bold_cell_size.width } else { self.cell_size.width };
         let mut glyphs = Vec::new();
         // Track column position incrementally instead of dividing g.x by cell_w.
         // The division-based approach accumulates floating-point drift across long
@@ -735,7 +745,13 @@ impl GlyphAtlas {
     /// left bearing.  Both the placeholders and the wide glyph fail this
     /// check, allowing [`build_ligature_map`] to merge them into a proper
     /// multi-cell ligature.
-    pub fn fits_single_cell(&mut self, cache_key: CacheKey) -> bool {
+    ///
+    /// `style` must match the style the glyph was shaped with — a bold glyph
+    /// is compared against `bold_cell_size`, since its metrics only align
+    /// with a cell width measured at the same weight. Comparing it against
+    /// the regular-weight cell width instead can make an ordinary single-cell
+    /// bold glyph spuriously fail this check.
+    pub fn fits_single_cell(&mut self, cache_key: CacheKey, style: GlyphStyle) -> bool {
         let image = self.swash_cache.get_image(&mut self.font_system, cache_key);
         let Some(img) = image.as_ref() else { return false };
 
@@ -743,7 +759,8 @@ impl GlyphAtlas {
             return false;
         }
 
-        let cell_w = i32::from(atlas_ceil_u16(self.cell_size.width));
+        let cell_size = if style.bold { self.bold_cell_size } else { self.cell_size };
+        let cell_w = i32::from(atlas_ceil_u16(cell_size.width));
         let max_left_extension = cell_w / 3;
         if img.placement.left < -max_left_extension {
             return false;
@@ -884,15 +901,24 @@ fn compute_uvs(px: u32, py: u32, uv_width: f32, uv_height: f32, atlas_size: u32)
     }
 }
 
-/// Measure cell dimensions by shaping the capital letter "M".
+/// Measure cell dimensions by shaping the capital letter "M" at `weight`.
+///
+/// Must be called once per distinct weight used for shaping (regular and
+/// bold): a glyph shaped at a given weight is only guaranteed to align with
+/// a cell width measured at that same weight. Reusing the regular-weight
+/// cell width to bound bold glyphs lets a bold glyph's advance legitimately
+/// exceed the regular "M" width, which `shape_run_uncached` and
+/// `fits_single_cell` misread as a multi-cell ligature glyph — corrupting
+/// the ligature map and dropping the following cell's character.
 fn measure_cell(
     font_system: &mut FontSystem,
     metrics: Metrics,
     family: Family<'_>,
     ligatures: bool,
+    weight: u16,
 ) -> CellSize {
     let mut buf = Buffer::new_empty(metrics);
-    let attrs = Attrs::new().family(family);
+    let attrs = Attrs::new().family(family).weight(cosmic_text::Weight(weight));
     let shaping = if ligatures { Shaping::Advanced } else { Shaping::Basic };
     buf.set_text(font_system, "M", &attrs, shaping, None);
 
