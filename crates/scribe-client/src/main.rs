@@ -11,6 +11,7 @@ mod disallowed_scheme_dialog;
 mod divider;
 mod input;
 mod ipc_client;
+mod lan_approval;
 mod layout;
 mod lost_control;
 mod mouse_reporting;
@@ -904,12 +905,21 @@ struct App {
     /// run only on the first one.
     has_welcomed: bool,
 
-    /// Feature 013 (T022): `true` when this process dialed a REMOTE peer
-    /// (`SCRIBE_REMOTE_DIAL`), i.e. it is a controlling-side window rather than a
-    /// local owning window. Captured once at startup because the env is fixed
-    /// for the process lifetime. Gates the owning-machine remote status surfaces
-    /// off for controlling-side windows.
+    /// Feature 013 (T022) + feature 014 (T016): `true` when this process dialed a
+    /// REMOTE peer over either transport — the tailnet path (`SCRIBE_REMOTE_DIAL`,
+    /// 013) or the direct-LAN path (`SCRIBE_LAN_DIAL`, 014) — i.e. it is a
+    /// controlling-side window rather than a local owning window. Derived from
+    /// [`Self::remote_transport`], captured once at startup because the env is
+    /// fixed for the process lifetime. Gates the owning-machine remote status
+    /// surfaces off for controlling-side windows.
     remote_dialed: bool,
+    /// Feature 014 (T016/T025): which transport this controlling-side window
+    /// dialed over — `Some(Tailnet)` for the 013 tailnet path, `Some(Lan)` for the
+    /// 014 direct-LAN path, `None` on an ordinary local window. Drives the status
+    /// bar's transport indicator (T025, FR-009) and routes the reclaim /
+    /// one-action reconnect re-dial over the same transport (T016). Fixed for the
+    /// process lifetime (derived from the launch env).
+    remote_transport: Option<remote_connect::PeerTransport>,
     /// Feature 013 (T022): one entry per window on THIS machine that a remote
     /// peer currently controls (device + account), cached from the local
     /// server's [`ServerMessage::WindowList`]. Drives the status-bar controller
@@ -1091,6 +1101,13 @@ struct App {
     /// confirm the parked bytes are delivered byte-identically.
     paste_confirmation_dialog: Option<paste_confirmation_dialog::PasteConfirmationDialog>,
 
+    /// Feature 014 (T018): owning-side LAN device-approval prompt. Set when the
+    /// local server pushes a `LanApprovalRequest` for an unknown device held
+    /// pending after the mutual-TLS handshake; the user's Approve / Decline
+    /// becomes a `LanApprovalDecision`. At most one in-flight; while open it
+    /// captures all input so nothing reaches the PTY (SEC-001/002, UX-002).
+    lan_approval_dialog: Option<lan_approval::LanApprovalDialog>,
+
     /// Cached `Welcome.clipboard_gating` flag from the server (spec 010
     /// C7). When `false` the client defensively no-ops on receipt of the
     /// new OSC 52 server variants. Initialised to `false` and flipped to
@@ -1165,6 +1182,11 @@ impl App {
         let bindings = input::Bindings::parse(&config.keybindings);
         let smart_selection =
             smart_selection::CompiledSmartSelection::compile(&config.terminal.smart_selection);
+        // Feature 014 (T016/T025): the transport this controlling-side window
+        // dialed over, from the fixed launch env (tailnet `SCRIBE_REMOTE_DIAL` /
+        // LAN `SCRIBE_LAN_DIAL`). `remote_dialed` derives from it so a LAN-attached
+        // window is recognized as controlling-side exactly like a tailnet one.
+        let remote_transport = Self::remote_redial_target().map(|(_, _, transport)| transport);
 
         Self {
             window_id: None,
@@ -1196,7 +1218,8 @@ impl App {
             reconnect_cancel: None,
             reconnect_reattach_at: None,
             has_welcomed: false,
-            remote_dialed: ipc_client::remote_dial_target().is_some(),
+            remote_dialed: remote_transport.is_some(),
+            remote_transport,
             remote_controlled_windows: Vec::new(),
             last_window_list_poll: Instant::now(),
             workspace_notes: workspace_notes::WorkspaceNotesStore::load(),
@@ -1233,6 +1256,7 @@ impl App {
             hover_cell: None, hover_started_at: None, hover_tooltip_visible: false,
             hover_tooltip_uri: None, disallowed_scheme_dialog: None,
             clipboard_dialog: None, paste_confirmation_dialog: None,
+            lan_approval_dialog: None,
             server_clipboard_gating: false,
             config_watcher_keepalive: None,
         }
@@ -1604,6 +1628,12 @@ impl App {
                 self.remote_connect.set_peers(peers.clone());
                 self.request_redraw();
             }
+            UiEvent::LanPeerList { peers } => {
+                // Feature 014 (T014): the local server's mDNS-discovered LAN peers,
+                // merged into the picker's device list by machine name (T024).
+                self.remote_connect.set_lan_peers(peers.clone());
+                self.request_redraw();
+            }
             UiEvent::RemoteWindowList { host, port, windows } => {
                 self.remote_connect.set_windows(host, *port, windows.clone());
                 self.request_redraw();
@@ -1612,6 +1642,55 @@ impl App {
             UiEvent::RemoteReconnecting { attempt } => self.handle_remote_reconnecting(*attempt),
             UiEvent::RemoteReconnected => self.handle_remote_reconnected(),
             UiEvent::RemoteReconnectFailed => self.handle_remote_reconnect_failed(),
+            UiEvent::LanDialOutcome { outcome } => {
+                // Feature 014 (T014): the typed LAN dial outcome (TLS + approval
+                // gate). The "Local network" picker source drives its success /
+                // typed-refusal copy from this on the in-process LAN window probe;
+                // a spawned attach process has no open picker, so this no-ops there
+                // (mirrors the tailnet `RemoteDialOutcome` path).
+                tracing::info!(?outcome, "LAN dial outcome");
+                self.remote_connect.on_lan_dial_outcome(*outcome);
+                self.request_redraw();
+            }
+            UiEvent::LanAwaitingApproval => {
+                // Feature 014 (T019): the LAN link reached the peer but is held
+                // pending the owning user's device approval. Swap the picker's
+                // window-step loading note for the cancelable "Waiting for approval
+                // on <peer>…" overlay; it settles when the window list arrives
+                // (approved) or the dial is refused. A spawned attach process (no
+                // open picker) no-ops.
+                tracing::info!("LAN connection awaiting device approval on peer");
+                self.remote_connect.on_awaiting_approval();
+                self.request_redraw();
+            }
+            UiEvent::LanApprovalRequest {
+                request_id,
+                device_name,
+                fingerprint_words,
+                network_label,
+                name_collision,
+            } => {
+                // Feature 014 (T018): an unknown LAN device is held pending on THIS
+                // machine. Raise the approval prompt; no window or session data has
+                // been revealed and none will until the user approves (SEC-001/002).
+                // A late-arriving request while one is already showing replaces it
+                // (each is answered by its own `request_id`).
+                tracing::info!(
+                    request_id,
+                    %device_name,
+                    %network_label,
+                    name_collision,
+                    "raising LAN device-approval prompt"
+                );
+                self.lan_approval_dialog = Some(lan_approval::LanApprovalDialog::new(
+                    *request_id,
+                    device_name.clone(),
+                    fingerprint_words.clone(),
+                    network_label.clone(),
+                    *name_collision,
+                ));
+                self.request_redraw();
+            }
             _ => return false,
         }
         true
@@ -1835,6 +1914,15 @@ impl App {
             self.handle_reconnect_overlay_window_event(event_loop, event);
             return true;
         }
+        // Feature 014 (T018): the owning-side LAN device-approval prompt is a
+        // full-window modal too — it must capture every event so nothing reaches
+        // the PTY while an unknown device is held pending (SEC-001/002). Checked
+        // ahead of the other dialogs so, in the rare event it co-occurs with one,
+        // the topmost-drawn prompt is also the one receiving input.
+        if self.lan_approval_dialog.is_some() {
+            self.handle_lan_approval_dialog_window_event(event_loop, event);
+            return true;
+        }
         if self.close_dialog.is_some() {
             self.handle_close_dialog_window_event(event_loop, event);
             return true;
@@ -1860,6 +1948,40 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Per-window event dispatch while the LAN device-approval prompt is visible
+    /// (feature 014, T018). Mirrors the sibling dialogs' Esc / Tab / Enter / click
+    /// discipline so no keystroke leaks to the PTY while an unknown device is held
+    /// pending (SEC-001/002); Esc declines (the safe default).
+    fn handle_lan_approval_dialog_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => self.handle_close_requested(event_loop),
+            WindowEvent::RedrawRequested => self.handle_redraw(),
+            WindowEvent::Resized(size) => self.handle_resize_and_mark_geometry(*size),
+            WindowEvent::Moved(_) => self.mark_geometry_dirty(),
+            WindowEvent::ModifiersChanged(new_mods) => self.modifiers = new_mods.state(),
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if self.handle_native_close_window_shortcut(key_event, event_loop) {
+                    return;
+                }
+                self.handle_lan_approval_dialog_keyboard(key_event);
+            }
+            WindowEvent::MouseInput {
+                state: winit::event::ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => self.handle_lan_approval_dialog_click(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.update_cursor_position(position);
+                self.handle_lan_approval_dialog_hover();
+            }
+            _ => {}
+        }
     }
 
     /// Per-window event dispatch while the paste-confirmation dialog is
@@ -2188,6 +2310,7 @@ impl App {
             || self.disallowed_scheme_dialog.is_some()
             || self.clipboard_dialog.is_some()
             || self.paste_confirmation_dialog.is_some()
+            || self.lan_approval_dialog.is_some()
             || self.context_menu.is_some()
             || self.focused_inline_editor.is_some()
         {
@@ -5414,6 +5537,11 @@ impl App {
         self.apply_osc8_hover_tooltip_overlay(prepared, all_instances);
         self.apply_palette_or_search_overlay(prepared, all_instances);
         self.apply_remote_connect_overlay(prepared, all_instances);
+        // Feature 014 (T018): the owning-side LAN approval prompt draws above the
+        // connect picker — the one overlay it can realistically co-occur with
+        // (an inbound approval arriving while the user is dialing out) — matching
+        // its input priority in `handle_modal_window_event`.
+        self.apply_lan_approval_overlay(prepared, all_instances);
         // Feature 013 (T030): the reconnect overlay dims the frozen window while
         // the link is being re-established or has settled disconnected.
         self.apply_reconnect_overlay(prepared, all_instances);
@@ -5586,6 +5714,10 @@ impl App {
                 controllers: &self.remote_controlled_windows,
             },
             host_label,
+            // Feature 014 (T025): the transport this controlling-side window is
+            // driving the remote machine over ("Local network" / "Tailscale");
+            // `None` (renders nothing) on owning / local windows (FR-009).
+            remote_transport: self.remote_transport.map(remote_connect::PeerTransport::label),
             tmux_label,
             time: &time_str,
             update_available: self.update_available.as_deref(),
@@ -5703,6 +5835,27 @@ impl App {
     /// sibling of [`Self::apply_modal_overlays`] in the overlay-composition
     /// sequence; kept separate so neither function exceeds the line limit.
     /// Only one modal is ever open at a time, so ordering is cosmetic.
+    /// Feature 014 (T018): render the owning-side LAN device-approval prompt as
+    /// [`CellInstance`] quads, mirroring `apply_paste_confirmation_overlay`.
+    fn apply_lan_approval_overlay(
+        &mut self,
+        prepared: &PreparedFrame,
+        all_instances: &mut Vec<CellInstance>,
+    ) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        if let Some(dialog) = &mut self.lan_approval_dialog {
+            let mut lan_approval_dialog_resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            dialog.build_instances(lan_approval::LanApprovalDialogBuildContext {
+                out: all_instances,
+                viewport: prepared.full_viewport,
+                cell_size: prepared.cell_size,
+                chrome: &self.theme.chrome,
+                resolve_glyph: &mut lan_approval_dialog_resolve_glyph,
+            });
+        }
+    }
+
     fn apply_paste_confirmation_overlay(
         &mut self,
         prepared: &PreparedFrame,
@@ -5789,6 +5942,7 @@ impl App {
             && self.disallowed_scheme_dialog.is_none()
             && self.clipboard_dialog.is_none()
             && self.paste_confirmation_dialog.is_none()
+            && self.lan_approval_dialog.is_none()
             && !self.command_palette.is_active()
             && !self.search_overlay.is_active()
             && !self.remote_connect.is_active()
@@ -6631,12 +6785,16 @@ impl App {
         self.request_redraw();
     }
 
-    /// Send a `ListRemotePeers` request over the local IPC connection to refresh
-    /// the connect picker's device list.
+    /// Refresh the connect picker's device list over the local IPC connection:
+    /// the 013 tailnet peers (`ListRemotePeers`) and the 014 mDNS-discovered LAN
+    /// peers (`ListLanPeers`), merged by machine name in the picker (T024).
     fn request_remote_peers(&mut self) {
         if let Some(tx) = &self.cmd_tx {
             if tx.send(ClientCommand::ListRemotePeers).is_err() {
                 tracing::warn!("IPC channel closed; could not request remote peer list");
+            }
+            if tx.send(ClientCommand::ListLanPeers).is_err() {
+                tracing::warn!("IPC channel closed; could not request LAN peer list");
             }
         }
     }
@@ -6669,18 +6827,18 @@ impl App {
                 self.request_remote_peers();
                 self.request_redraw();
             }
-            Action::ProbeWindows { host, port } => {
-                self.probe_remote_windows(host, port);
+            Action::ProbeWindows { host, port, transport } => {
+                self.probe_windows(host, port, transport);
                 self.request_redraw();
             }
-            Action::Attach { host, port, window_id } => {
-                spawn_remote_client_process(&host, port, Some(window_id), true);
+            Action::Attach { host, port, window_id, transport } => {
+                spawn_client_for_transport(transport, &host, port, Some(window_id), true);
                 self.remote_connect.close();
                 self.request_redraw();
             }
-            Action::NewWindow { host, port } => {
+            Action::NewWindow { host, port, transport } => {
                 // T018: a fresh window on the peer — Hello { window_id: None }.
-                spawn_remote_client_process(&host, port, None, false);
+                spawn_client_for_transport(transport, &host, port, None, false);
                 self.remote_connect.close();
                 self.request_redraw();
             }
@@ -6709,6 +6867,10 @@ impl App {
         self.clipboard_dialog = None;
         self.paste_confirmation_dialog = None;
         self.disallowed_scheme_dialog = None;
+        // Feature 014 (T018): drop any pending LAN approval prompt too — it cannot
+        // be answered from a displaced window. Nothing was revealed; the server's
+        // bounded approval timeout releases the held connection (deny by default).
+        self.lan_approval_dialog = None;
         self.context_menu = None;
         self.request_redraw();
     }
@@ -6727,11 +6889,28 @@ impl App {
         }
     }
 
-    /// Feature 013 (T030): display label for the peer this controlling-side
-    /// window is reconnecting to — the dial host / `MagicDNS` name.
+    /// The re-dial target of this controlling-side window: the fixed launch-env
+    /// peer plus the transport it must be re-dialed over (feature 014, T016). The
+    /// tailnet path (`SCRIBE_REMOTE_DIAL`, 013) takes precedence over the LAN path
+    /// (`SCRIBE_LAN_DIAL`, 014) — the spawns keep them mutually exclusive, and the
+    /// startup hook already prefers the tailnet env. `None` on an ordinary local
+    /// window. The single source of truth for [`Self::remote_transport`], the
+    /// reclaim, and the one-action reconnect re-dial.
+    fn remote_redial_target() -> Option<(String, u16, remote_connect::PeerTransport)> {
+        if let Some((host, port)) = ipc_client::remote_dial_target() {
+            Some((host, port, remote_connect::PeerTransport::Tailnet))
+        } else {
+            ipc_client::lan_dial_target()
+                .map(|(host, port)| (host, port, remote_connect::PeerTransport::Lan))
+        }
+    }
+
+    /// Feature 013 (T030) + feature 014 (T016): display label for the peer this
+    /// controlling-side window is reconnecting to — the tailnet `MagicDNS` name or
+    /// the LAN dial host.
     fn reconnect_peer_label() -> String {
-        ipc_client::remote_dial_target()
-            .map_or_else(|| String::from("the remote machine"), |(host, _)| host)
+        Self::remote_redial_target()
+            .map_or_else(|| String::from("the remote machine"), |(host, _, _)| host)
     }
 
     /// Feature 013 (T030): the remote link dropped and the loop is retrying.
@@ -6931,16 +7110,18 @@ impl App {
         self.request_redraw();
     }
 
-    /// Feature 013 (T030): one-action reconnect from a settled overlay. Spawns a
-    /// fresh remote client for the SAME window with `takeover = false` (never
-    /// seize) and closes this window, mirroring the lost-control reclaim path.
+    /// Feature 013 (T030) + feature 014 (T016): one-action reconnect from a
+    /// settled overlay. Spawns a fresh remote client for the SAME window with
+    /// `takeover = false` (never seize) over the window's own transport — tailnet
+    /// (013) or LAN (014) — and closes this window, mirroring the lost-control
+    /// reclaim path.
     fn restart_remote_reconnect(&mut self, event_loop: &ActiveEventLoop) {
-        let Some((host, port)) = ipc_client::remote_dial_target() else {
+        let Some((host, port, transport)) = Self::remote_redial_target() else {
             tracing::warn!("reconnect requested but no remote dial target; ignoring");
             return;
         };
-        tracing::info!(%host, port, window = ?self.window_id, "one-action reconnect to remote window");
-        spawn_remote_client_process(&host, port, self.window_id, false);
+        tracing::info!(%host, port, ?transport, window = ?self.window_id, "one-action reconnect to remote window");
+        spawn_client_for_transport(transport, &host, port, self.window_id, false);
         self.flush_geometry_now();
         event_loop.exit();
     }
@@ -6987,11 +7168,12 @@ impl App {
         }
     }
 
-    /// Feature 013 (T017): reclaim a displaced window with one action. Spawns a
-    /// fresh client that claims the same window with `Hello { takeover: true }`
-    /// (contracts/remote-protocol.md: reclaim is a fresh connection), then closes
-    /// this now-orphaned displaced window. The mechanism is symmetric across
-    /// transports: a remote-control client re-dials the same peer; a local client
+    /// Feature 013 (T017) + feature 014 (T016): reclaim a displaced window with one
+    /// action. Spawns a fresh client that claims the same window with `Hello {
+    /// takeover: true }` (contracts/remote-protocol.md: reclaim is a fresh
+    /// connection), then closes this now-orphaned displaced window. The mechanism
+    /// is symmetric across transports: a remote-control client re-dials the same
+    /// peer over its own transport — tailnet (013) or LAN (014); a local client
     /// respawns against its own server with the local takeover marker. The
     /// server-owned sessions are untouched (FR-010) and follow the new
     /// controller.
@@ -7000,9 +7182,9 @@ impl App {
             tracing::warn!("reclaim requested but no window id is known; ignoring");
             return;
         };
-        if let Some((host, port)) = ipc_client::remote_dial_target() {
-            tracing::info!(%host, port, %window_id, "reclaiming displaced remote window");
-            spawn_remote_client_process(&host, port, Some(window_id), true);
+        if let Some((host, port, transport)) = Self::remote_redial_target() {
+            tracing::info!(%host, port, ?transport, %window_id, "reclaiming displaced remote window");
+            spawn_client_for_transport(transport, &host, port, Some(window_id), true);
         } else {
             tracing::info!(%window_id, "reclaiming displaced local window");
             spawn_local_takeover_client_process(window_id);
@@ -7014,13 +7196,22 @@ impl App {
     }
 
     /// Dial the chosen peer on a background thread just to enumerate its windows
-    /// for the picker's second step (feature 013, T014).
-    fn probe_remote_windows(&mut self, host: String, port: u16) {
+    /// for the picker's second step (feature 013 T014; feature 014 T014 adds the
+    /// LAN transport, which runs the full TLS + device-approval gate before the
+    /// window list is revealed).
+    fn probe_windows(&mut self, host: String, port: u16, transport: remote_connect::PeerTransport) {
         let Some(proxy) = self.animation_proxy.clone() else {
             tracing::warn!("no event-loop proxy available; cannot probe remote windows");
             return;
         };
-        ipc_client::start_remote_list_windows_thread(proxy, host, port);
+        match transport {
+            remote_connect::PeerTransport::Tailnet => {
+                ipc_client::start_remote_list_windows_thread(proxy, host, port);
+            }
+            remote_connect::PeerTransport::Lan => {
+                ipc_client::start_lan_list_windows_thread(proxy, host, port);
+            }
+        }
     }
 
     /// Raise the OS window and switch to the tab containing the given session.
@@ -12037,6 +12228,81 @@ impl App {
     // Paste-confirmation dialog input handlers (spec 011)
     // -------------------------------------------------------------------
 
+    /// Keyboard discipline for the LAN device-approval prompt (feature 014,
+    /// T018): Esc declines (the safe default — no data flows on a stray press),
+    /// Enter activates the focused button, Tab cycles focus.
+    fn handle_lan_approval_dialog_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        use winit::keyboard::{Key, NamedKey};
+
+        if event.state != winit::event::ElementState::Pressed {
+            return;
+        }
+
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.handle_lan_approval_action(lan_approval::LanApprovalAction::Decline);
+            }
+            Key::Named(NamedKey::Enter) => {
+                let action = self.lan_approval_dialog.as_ref().map_or(
+                    lan_approval::LanApprovalAction::Decline,
+                    lan_approval::LanApprovalDialog::confirm,
+                );
+                self.handle_lan_approval_action(action);
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.cycle_lan_approval_dialog_focus();
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a mouse click while the LAN approval prompt is active.
+    fn handle_lan_approval_dialog_click(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        let action = self.lan_approval_dialog.as_ref().and_then(|d| d.click(x, y));
+        if let Some(action) = action {
+            self.handle_lan_approval_action(action);
+        }
+    }
+
+    /// Handle mouse hover while the LAN approval prompt is active.
+    fn handle_lan_approval_dialog_hover(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        if let Some(dialog) = &mut self.lan_approval_dialog {
+            if dialog.update_hover(x, y) {
+                self.request_redraw();
+            }
+        }
+    }
+
+    fn cycle_lan_approval_dialog_focus(&mut self) {
+        let Some(dialog) = &mut self.lan_approval_dialog else { return };
+        if self.modifiers.shift_key() {
+            dialog.focus_prev();
+        } else {
+            dialog.focus_next();
+        }
+        self.request_redraw();
+    }
+
+    /// Dispatch the owning user's choice from the LAN approval prompt — send a
+    /// [`ClientCommand::LanApprovalDecision`] echoing the request's `request_id`
+    /// and close the overlay. Approve lets the held connection proceed (the
+    /// server writes the `TrustedDevice`); Decline refuses it and reveals nothing
+    /// (FR-004/006, SEC-001/002).
+    fn handle_lan_approval_action(&mut self, action: lan_approval::LanApprovalAction) {
+        let Some(dialog) = self.lan_approval_dialog.take() else { return };
+        let request_id = dialog.request_id();
+        let approve = matches!(action, lan_approval::LanApprovalAction::Approve);
+        tracing::info!(request_id, approve, "LAN device-approval prompt resolved");
+        if let Some(tx) = self.cmd_tx.clone()
+            && tx.send(ClientCommand::LanApprovalDecision { request_id, approve }).is_err()
+        {
+            tracing::warn!("IPC channel closed; LAN approval decision dropped");
+        }
+        self.request_redraw();
+    }
+
     fn handle_paste_confirmation_dialog_keyboard(&mut self, event: &winit::event::KeyEvent) {
         use winit::keyboard::{Key, NamedKey};
 
@@ -15442,6 +15708,77 @@ fn spawn_remote_client_process(host: &str, port: u16, window_id: Option<WindowId
         }
         Err(e) => {
             tracing::warn!(exe = %exe.display(), %host, port, "failed to spawn remote client: {e}");
+        }
+    }
+}
+
+/// Spawn a fresh client-window process for a connect-picker attach over the
+/// chosen [`PeerTransport`](remote_connect::PeerTransport) (feature 014, T014/T024):
+/// the 013 tailnet path over TCP, or the 014 direct-LAN path over mutual TLS.
+/// Both keep the local window and its sessions untouched by reusing a whole
+/// process; the window claim + takeover markers are transport-agnostic.
+fn spawn_client_for_transport(
+    transport: remote_connect::PeerTransport,
+    host: &str,
+    port: u16,
+    window_id: Option<WindowId>,
+    takeover: bool,
+) {
+    match transport {
+        remote_connect::PeerTransport::Tailnet => {
+            spawn_remote_client_process(host, port, window_id, takeover);
+        }
+        remote_connect::PeerTransport::Lan => {
+            spawn_lan_client_process(host, port, window_id, takeover);
+        }
+    }
+}
+
+/// Spawn a fresh client process pointed at a LAN scribe-server over mutual TLS for
+/// the connect picker's "Local network" source (feature 014, T014) — the LAN
+/// analogue of [`spawn_remote_client_process`].
+///
+/// Sets `SCRIBE_LAN_DIAL` (the T015 LAN dial hook) instead of `SCRIBE_REMOTE_DIAL`
+/// and explicitly removes the latter so a picker opened inside an already
+/// tailnet-dialed window cannot leave both set (the startup hook prefers
+/// `SCRIBE_REMOTE_DIAL`, which would mis-route the LAN attach over the tailnet).
+/// The window claim + takeover reuse the transport-agnostic `SCRIBE_REMOTE_WINDOW`
+/// / `SCRIBE_REMOTE_TAKEOVER` markers (contracts/lan-protocol.md), with the same
+/// env-leak guard as the tailnet spawn.
+fn spawn_lan_client_process(host: &str, port: u16, window_id: Option<WindowId>, takeover: bool) {
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from(current_identity().client_binary_name()));
+    let spawn_start = Instant::now();
+
+    let mut command = std::process::Command::new(&exe);
+    command.env("SCRIBE_LAN_DIAL", format!("{host}:{port}"));
+    command.env_remove("SCRIBE_REMOTE_DIAL");
+    if let Some(window_id) = window_id {
+        command.env("SCRIBE_REMOTE_WINDOW", window_id.to_full_string());
+    } else {
+        command.env_remove("SCRIBE_REMOTE_WINDOW");
+    }
+    if takeover {
+        command.env("SCRIBE_REMOTE_TAKEOVER", "1");
+    } else {
+        command.env_remove("SCRIBE_REMOTE_TAKEOVER");
+    }
+
+    match command.spawn() {
+        Ok(child) => {
+            tracing::info!(
+                pid = child.id(),
+                %host,
+                port,
+                ?window_id,
+                takeover,
+                elapsed_ms = duration_ms(spawn_start.elapsed()),
+                "spawned LAN remote-control client window"
+            );
+            reap_spawned_client_child(child, "lan-window");
+        }
+        Err(e) => {
+            tracing::warn!(exe = %exe.display(), %host, port, "failed to spawn LAN client: {e}");
         }
     }
 }

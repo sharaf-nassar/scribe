@@ -12,6 +12,7 @@ pub mod env_store;
 pub mod handoff;
 pub mod hook_ingress;
 pub mod ipc_server;
+pub mod lan;
 pub mod macos_proc;
 pub mod releases;
 pub mod session_manager;

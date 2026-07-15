@@ -53,6 +53,20 @@ const ENV_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(7);
 /// not-detected default (FR-015) without hanging the window open.
 const REMOTE_ENV_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum time to wait on a LAN "Local network" server action (feature 014):
+/// the `GetLanEnv` / `ListTrustedNetworks` / `ListTrustedDevices` reads that
+/// fill the section, and the `AddCurrentNetworkTrusted` / `RemoveTrustedNetwork`
+/// / `RevokeTrustedDevice` mutations.
+///
+/// These are local Unix-socket round-trips (no tailnet / network I/O), but the
+/// first read may lazily touch the OS keyring for the device identity, so we
+/// keep the same 5 s bound as [`REMOTE_ENV_TIMEOUT`]. Like the remote-env probe
+/// these run synchronously on the UI thread — on window open (the section's
+/// initial fill) and inside the IPC handler (list refresh after a mutation) —
+/// so the bound caps how long the settings window may block; any timeout folds
+/// into the fail-closed empty/`None` outcome so the window never hangs.
+const LAN_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Embedded web assets (HTML, CSS, JS) for the settings UI.
 #[derive(Embed)]
 #[folder = "src/assets/"]
@@ -230,6 +244,63 @@ fn inject_remote_env(webview: &wry::WebView) {
     let script = format!("if (typeof setRemoteEnv === 'function') {{ setRemoteEnv({json}); }}");
     if let Err(e) = webview.evaluate_script(&script) {
         tracing::warn!("failed to inject remote env into settings webview: {e}");
+    }
+}
+
+/// Inject this machine's LAN "Local network" state (feature 014) into the
+/// settings webview: this device's own identity fingerprint plus whether the
+/// current network can be trusted (`setLanEnv`), the trusted-networks list with
+/// whether the current network is trusted (`setTrustedNetworks`, which drives
+/// the active/dormant/off status line, UX-004), and the approved-devices list
+/// (`setTrustedDevices`).
+///
+/// Like [`inject_remote_env`], the host owns these runtime facts and pushes them
+/// via `evaluate_script`. It is NOT part of window-open (unlike the remote-env
+/// probe): the webview requests it lazily via the `lan_refresh` IPC when the
+/// Remote tab is first opened, and the IPC handler calls this again after a
+/// trust mutation to refresh the lists. Each value is built with `serde_json`
+/// so device / network labels and fingerprints carrying JS-special characters
+/// are safely escaped. Every read talks to the server over the local socket
+/// under [`LAN_ACTION_TIMEOUT`]; any timeout or transport error folds to the
+/// fail-closed empty/`None` outcome so a server that does not yet answer these
+/// never blocks the settings window.
+fn inject_lan_state(webview: &wry::WebView) {
+    let env = server_action::request_lan_env(LAN_ACTION_TIMEOUT);
+    let networks = server_action::request_trusted_networks(LAN_ACTION_TIMEOUT);
+    let devices = server_action::request_trusted_devices(LAN_ACTION_TIMEOUT);
+
+    // `TrustedNetworkInfo` / `TrustedDeviceInfo` derive `Serialize`; convert via
+    // `to_value` (not the `json!` value-expression path) and fall back to an
+    // empty array on the impossible serialization error so the setters always
+    // receive a well-formed shape.
+    let networks_value = serde_json::to_value(&networks.networks)
+        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+    let devices_value =
+        serde_json::to_value(&devices).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+
+    let env_arg = serde_json::json!({
+        "device_id_hex": env.device_id_hex,
+        "fingerprint_words": env.fingerprint_words,
+        "current_network_addable": env.current_network_addable,
+        "current_network_reason": env.current_network_reason,
+    });
+    let networks_arg = serde_json::json!({
+        "networks": networks_value,
+        "current_trusted": networks.current_trusted,
+    });
+    let devices_arg = serde_json::json!({ "devices": devices_value });
+
+    let env_json = serde_json::to_string(&env_arg).unwrap_or_else(|_| String::from("{}"));
+    let networks_json = serde_json::to_string(&networks_arg).unwrap_or_else(|_| String::from("{}"));
+    let devices_json = serde_json::to_string(&devices_arg).unwrap_or_else(|_| String::from("{}"));
+
+    let script = format!(
+        "if (typeof setLanEnv === 'function') {{ setLanEnv({env_json}); }}\n\
+         if (typeof setTrustedNetworks === 'function') {{ setTrustedNetworks({networks_json}); }}\n\
+         if (typeof setTrustedDevices === 'function') {{ setTrustedDevices({devices_json}); }}"
+    );
+    if let Err(e) = webview.evaluate_script(&script) {
+        tracing::warn!("failed to inject LAN state into settings webview: {e}");
     }
 }
 
@@ -809,9 +880,18 @@ fn handle_settings_ipc_action(kind: &str, body: &str) -> bool {
 /// when the field is absent or not a string so callers can log and drop the
 /// message instead of dispatching an undefined opener invocation.
 fn settings_ipc_request_url(body: &str) -> Option<String> {
+    settings_ipc_request_field(body, "url")
+}
+
+/// Extract an arbitrary string `field` from a webview IPC request body. Returns
+/// `None` when the field is absent or not a string so callers (e.g. the LAN
+/// `lan_remove_network` / `lan_revoke_device` actions, which carry an `id` /
+/// `device_id`) can log and drop a malformed message instead of dispatching an
+/// action with a missing argument.
+fn settings_ipc_request_field(body: &str, field: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| v.get("url").and_then(|t| t.as_str()).map(str::to_owned))
+        .and_then(|v| v.get(field).and_then(|t| t.as_str()).map(str::to_owned))
 }
 
 #[derive(Clone, Copy)]
@@ -855,8 +935,75 @@ fn handle_settings_ipc_request(body: &str, handlers: SettingsIpcHandlers<'_>) {
         (handlers.on_request_env_preflight)();
     } else if kind == "setting_changed" {
         (handlers.on_change)(body.to_owned());
-    } else if !handle_settings_ipc_action(&kind, body) {
+    } else if !handle_lan_ipc_action(&kind, body, handlers.webview_ref)
+        && !handle_settings_ipc_action(&kind, body)
+    {
         tracing::debug!(kind, "unhandled settings IPC request");
+    }
+}
+
+/// Handle a LAN "Local network" IPC action (feature 014) from the settings
+/// webview.
+///
+/// Returns `true` when `kind` was a recognised LAN action, `false` otherwise so
+/// the caller can keep dispatching. Split out of [`handle_settings_ipc_request`]
+/// to keep that function within the workspace cognitive-complexity budget, and
+/// kept separate from [`handle_settings_ipc_action`] because these actions need
+/// the webview reference to refresh the section after a mutation. Every
+/// recognised action is served synchronously in-handler (fast local socket
+/// reads/writes, like `request_fonts` — not the tailnet probes that use worker
+/// threads) and ends by re-reading and re-injecting the section state.
+fn handle_lan_ipc_action(
+    kind: &str,
+    body: &str,
+    webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>,
+) -> bool {
+    match kind {
+        // The webview requests the section's server-owned state (own fingerprint,
+        // trusted networks + current-network trust, approved devices) when the
+        // Remote tab is opened; the shared refresh below serves it.
+        "lan_refresh" => {}
+        "lan_add_current_network" => {
+            if let Err(e) = server_action::request_add_current_network(LAN_ACTION_TIMEOUT) {
+                tracing::warn!("add current network transport error: {e}");
+            }
+        }
+        "lan_remove_network" => {
+            if let Some(id) = settings_ipc_request_field(body, "id") {
+                if let Err(e) =
+                    server_action::request_remove_trusted_network(id, LAN_ACTION_TIMEOUT)
+                {
+                    tracing::warn!("remove trusted network transport error: {e}");
+                }
+            } else {
+                tracing::warn!("lan_remove_network message missing id field");
+            }
+        }
+        "lan_revoke_device" => {
+            if let Some(device_id) = settings_ipc_request_field(body, "device_id") {
+                if let Err(e) =
+                    server_action::request_revoke_trusted_device(device_id, LAN_ACTION_TIMEOUT)
+                {
+                    tracing::warn!("revoke trusted device transport error: {e}");
+                }
+            } else {
+                tracing::warn!("lan_revoke_device message missing device_id field");
+            }
+        }
+        _ => return false,
+    }
+    // Recognised: reflect the (possibly mutated) trust state back into the
+    // webview — the reads for `lan_refresh`, the refreshed lists after a mutation.
+    refresh_lan_state(webview_ref);
+    true
+}
+
+/// Re-fetch and re-inject the LAN "Local network" state after a trust mutation
+/// (or on the webview's `lan_refresh` request). No-op when the webview has
+/// already been torn down. See [`inject_lan_state`] for the read/inject detail.
+fn refresh_lan_state(webview_ref: &std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>>) {
+    if let Some(wv) = webview_ref.borrow().as_ref() {
+        inject_lan_state(wv);
     }
 }
 

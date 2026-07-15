@@ -30,6 +30,12 @@ mod stop_classifier;
 // dead-code analysis. The library holds one fully-public copy, so this re-export
 // eliminates the double compile AND the dead-code warning — no lint suppression.
 use scribe_server::tailnet;
+// Feature 014: likewise, the per-transport LAN state in `mod ipc_server` reaches
+// the device-trust `DeviceId` type through `crate::lan`. Re-export the LIBRARY
+// crate's `lan` module for the identical reason — a second in-binary `mod lan`
+// would recompile its many `pub` discovery/identity/TLS/trust items (unused by
+// the binary) into dead-code warnings.
+use scribe_server::lan;
 mod updater;
 mod workspace_manager;
 mod workspace_notes;

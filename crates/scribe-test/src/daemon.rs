@@ -318,8 +318,10 @@ async fn dispatch_server_message(
             dispatch_notice_message(msg);
         }
         // Test daemon does not exercise env-persistence (feature 006), OSC 52
-        // clipboard gating (spec 010), or remote window control (feature 013)
-        // flows yet.
+        // clipboard gating (spec 010), remote window control (feature 013), or
+        // LAN remote control (feature 014) flows yet. The feature 014 LAN
+        // messages below are consumed by the client/settings surfaces (tasks
+        // T014/T018/T019/T020/T024); this is a behavior-preserving no-op arm.
         ServerMessage::EnvPreflightResult { .. }
         | ServerMessage::EnvStatus { .. }
         | ServerMessage::ClipboardPromptRequest { .. }
@@ -329,7 +331,14 @@ async fn dispatch_server_message(
         | ServerMessage::WindowTakenOver { .. }
         | ServerMessage::RemoteDisconnect { .. }
         | ServerMessage::RemotePeerList { .. }
-        | ServerMessage::RemoteEnv { .. } => {}
+        | ServerMessage::RemoteEnv { .. }
+        | ServerMessage::LanApprovalPending
+        | ServerMessage::LanApprovalResult { .. }
+        | ServerMessage::LanApprovalRequest { .. }
+        | ServerMessage::LanPeerList { .. }
+        | ServerMessage::TrustedDeviceList { .. }
+        | ServerMessage::TrustedNetworkList { .. }
+        | ServerMessage::LanEnv { .. } => {}
     }
 }
 

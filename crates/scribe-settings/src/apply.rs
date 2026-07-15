@@ -665,13 +665,19 @@ fn apply_notifications_key(
     Ok(())
 }
 
-/// Apply a `remote.<field>` settings change to the `[remote]` TOML table
-/// (feature 013). `remote.enabled` toggles the opt-in Tailscale remote-control
-/// listener (default off); `remote.port` sets the TCP port bound only on the
-/// machine's tailnet addresses. The port is clamped to the same 1024–65535
-/// range the settings webview enforces so a hand-crafted IPC cannot persist an
-/// out-of-range value. The server applies both live on `ConfigReloaded`; it is
-/// never restarted for this.
+/// Apply a `remote.<field>` settings change to the `[remote]` TOML table.
+///
+/// Feature 013 (tailnet): `remote.enabled` toggles the opt-in Tailscale
+/// remote-control listener (default off); `remote.port` sets the TCP port bound
+/// only on the machine's tailnet addresses.
+///
+/// Feature 014 (LAN): `remote.lan.enabled` toggles the separate opt-in LAN
+/// listener (default off; a distinct opt-in from the tailnet listener, FR-012),
+/// and `remote.lan.port` sets the port bound only on the physical LAN address
+/// (default 46062). Both ports are clamped to the same 1024–65535 range the
+/// settings webview enforces so a hand-crafted IPC cannot persist an
+/// out-of-range value. The server applies all four live on `ConfigReloaded`; it
+/// is never restarted for this.
 fn apply_remote_key(
     config: &mut scribe_common::config::ScribeConfig,
     key: &str,
@@ -684,6 +690,14 @@ fn apply_remote_key(
         "remote.port" => {
             let v: u16 = parse_number(value, "remote.port")?;
             config.remote.port = v.clamp(1024, 65535);
+        }
+        "remote.lan.enabled" => {
+            config.remote.lan.enabled =
+                value.as_bool().ok_or("remote.lan.enabled must be a boolean")?;
+        }
+        "remote.lan.port" => {
+            let v: u16 = parse_number(value, "remote.lan.port")?;
+            config.remote.lan.port = v.clamp(1024, 65535);
         }
         _ => return Err(format!("unhandled remote key: {key}")),
     }

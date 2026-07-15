@@ -29,9 +29,10 @@ use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    AutomationAction, ClientMessage, ControllerInfo, PromptMarkKind, REMOTE_PROTOCOL_VERSION,
-    RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage, SessionInfo, TerminalSize,
-    WindowInfo, WorkspaceListEntry, WorkspaceNotesMutation, WorkspaceTreeNode,
+    AutomationAction, ClientMessage, ControllerInfo, LanPeerInfo, LanRefusal, PromptMarkKind,
+    REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage,
+    SessionInfo, TerminalSize, TrustedDeviceInfo, TrustedNetworkInfo, WindowInfo,
+    WorkspaceListEntry, WorkspaceNotesMutation, WorkspaceTreeNode,
 };
 use scribe_common::screen::{ScreenCell, ScreenSnapshot};
 use scribe_common::socket::current_uid;
@@ -41,6 +42,14 @@ use scribe_pty::osc_interceptor::OscInterceptor;
 
 use crate::handoff::HandoffSession;
 use crate::hook_ingress;
+use crate::lan::discovery::{AdvertiseConfig, LanDiscovery, LanPeerHandle, local_hostname};
+use crate::lan::identity::DeviceIdentity;
+use crate::lan::network::{self, SharedTrustedNetworks, TrustedNetworksStore};
+use crate::lan::tls::{DevicePins, LanTls, PeerIdentity, PinDecision};
+use crate::lan::trust::{
+    APPROVAL_TIMEOUT, ApprovalOutcome, ApprovalRequest, DeviceId, PendingApprovals,
+    SharedTrustedDevices, TrustedDevicesStore, decode_device_id_hex,
+};
 use crate::releases::{ReleaseCatalog, ReleaseFetcher};
 use crate::session_manager::{
     ManagedSession, SessionLaunchRequest, SessionManager, build_term_config, snapshot_term,
@@ -232,10 +241,11 @@ pub struct IpcServerState {
     /// `specs/006-persist-terminal-env/data-model.md` for the ownership
     /// rules.
     pub env_store: Arc<crate::env_store::EnvStoreState>,
-    /// Feature 013: shared control handle for the remote-control TCP listener.
-    /// Startup and every `ConfigReloaded` call [`RemoteControl::apply`] to
-    /// start, stop, or rebind the listener live; the accept path consults it
-    /// for the disable-race refusal and the 8-connection cap.
+    /// Feature 013/014: shared control handle for the remote-control listeners.
+    /// Startup and every `ConfigReloaded` reconcile each transport's listener
+    /// live via the supervisor (tailnet + LAN) to start, stop, or rebind it; the
+    /// accept path consults the matching per-transport state for the disable-race
+    /// refusal and the connection cap.
     pub remote_control: Arc<RemoteControl>,
 }
 
@@ -244,6 +254,11 @@ struct ClientDispatchContext<'a> {
     writer: &'a SharedWriter,
     attached_ids: &'a AttachedSessionIds,
     window_id: WindowId,
+    /// Whether this connection arrived over a remote transport (tailnet or LAN)
+    /// rather than the local Unix socket. Gates local-only messages — e.g. the
+    /// feature-014 `LanApprovalDecision`, which only the owning machine's own GUI
+    /// may answer (contracts/lan-protocol.md).
+    is_remote: bool,
 }
 
 /// The borrowed per-connection state threaded through the establish + message
@@ -645,6 +660,20 @@ const REMOTE_CONNECTION_CAP: usize = 8;
 /// immediately.
 const REMOTE_PENDING_HANDSHAKE_CAP: usize = 64;
 
+/// Feature 014: maximum simultaneous LAN (mutual-TLS) connections — the LAN
+/// transport's OWN cap, wholly independent of the tailnet
+/// [`REMOTE_CONNECTION_CAP`] so LAN load can never consume tailnet admission
+/// slots (analysis C4/S1). Mirrors the tailnet budget; excess LAN connections
+/// are refused with `Busy` (feature 014 T011).
+const LAN_CONNECTION_CAP: usize = 8;
+
+/// Feature 014: admission cap on pending (pre-authorization) LAN connections —
+/// the LAN counterpart to [`REMOTE_PENDING_HANDSHAKE_CAP`], acquired the instant
+/// a LAN TCP stream is accepted so a flood of half-open TLS dialers cannot spawn
+/// unbounded handshake work. Independent of the tailnet cap so neither transport
+/// can starve the other.
+const LAN_PENDING_HANDSHAKE_CAP: usize = 64;
+
 /// Hard size cap on the pre-auth `RemoteHandshake` preamble frame. The preamble
 /// carries only a version number plus two short strings, so a few KiB is ample;
 /// bounding it far below the shared 64 MiB frame budget denies an unauthenticated
@@ -718,11 +747,44 @@ const REMOTE_SEVER_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// (contracts/settings-and-config.md Audit log surface).
 const REMOTE_AUDIT_TARGET: &str = "scribe_server::remote_audit";
 
-/// The tailnet identity of an accepted remote connection, carried into the
-/// shared dispatch so the accepted/disconnect audit lines can name the peer.
+/// How an accepted remote connection is named in the audit log. Feature 013's
+/// tailnet path logs `remote: … peer=<node> user=<login>` (kept byte-identical);
+/// feature 014's LAN path logs `lan: … device=<label> id=<short>` per
+/// contracts/settings-and-config.md, so the accepted/disconnect audit lines match
+/// the transport a connection actually arrived on.
+enum RemoteAudit {
+    /// Feature 013 tailnet peer — `remote:` audit lines.
+    Tailnet,
+    /// Feature 014 LAN device — `lan:` audit lines, tagged with the pinned
+    /// device's short id.
+    Lan { device_id_short: String },
+}
+
+/// Why the LAN transport is being taken dormant, for the `lan: dormant …` audit
+/// line (contracts/settings-and-config.md Audit log surface). Only the two
+/// user-meaningful transitions are audited; the fail-closed operational cases
+/// (enabled + trusted but no bindable physical-LAN address, or an unavailable
+/// keyring/identity) are logged at warn level by
+/// [`apply_lan`](RemoteControl::apply_lan) and pass `None`, emitting no line.
+#[derive(Clone, Copy)]
+enum LanDormantReason {
+    /// `remote.lan.enabled` is off.
+    Disabled,
+    /// LAN access is on but the current network is not trusted (FR-018).
+    NetworkUntrusted,
+}
+
+/// The identity of an accepted remote connection, carried into the shared
+/// dispatch so the accepted/disconnect audit lines can name the peer. For a
+/// tailnet peer `node_name`/`login_name` are the tailnet node + account; for a
+/// LAN device `node_name` is the peer's advertised label and `login_name` is
+/// empty (LAN carries no account). [`audit`](Self::audit) selects the audit-line
+/// format.
 struct RemoteContext {
     node_name: String,
     login_name: String,
+    /// Selects the transport-specific audit-line format (feature 014).
+    audit: RemoteAudit,
     /// Feature 013 (T023): fires when remote access is disabled. The shared read
     /// paths `select!` on it so a disable drops this connection out of its loop
     /// and through the normal detach cleanup (owning sessions untouched) before
@@ -736,6 +798,8 @@ struct RemoteContext {
 struct RemoteIdentity {
     node_name: String,
     login_name: String,
+    /// Selects the transport-specific audit-line format (feature 014).
+    audit: RemoteAudit,
 }
 
 // ── Feature 013 (T029): bounded per-remote-connection output queue ───────────
@@ -958,10 +1022,13 @@ fn enforce_queue_ceiling(g: &mut RemoteQueueInner) {
 /// the TCP write half). Returns the enqueue handle to install into the
 /// connection's `SharedWriter` plus the drain task's join handle, awaited
 /// (bounded) at teardown by [`shutdown_remote_output`].
-fn spawn_remote_output(
-    write_half: WriteHalf<TcpStream>,
+fn spawn_remote_output<W>(
+    write_half: W,
     server: IpcServerState,
-) -> (RemoteSink, tokio::task::JoinHandle<()>) {
+) -> (RemoteSink, tokio::task::JoinHandle<()>)
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let shared = Arc::new(RemoteOutputShared {
         inner: std::sync::Mutex::new(RemoteQueueInner {
             frames: VecDeque::new(),
@@ -980,11 +1047,13 @@ fn spawn_remote_output(
 /// then send a fresh full `SessionReplay` for any replay-dirty session, then park
 /// until more work arrives (or the connection closes). This is the ONLY task that
 /// writes the remote socket, so frame order on the wire is exactly enqueue order.
-async fn remote_output_drain(
+async fn remote_output_drain<W>(
     shared: Arc<RemoteOutputShared>,
-    mut write_half: WriteHalf<TcpStream>,
+    mut write_half: W,
     server: IpcServerState,
-) {
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     loop {
         // 1. Flush every queued frame, in order.
         loop {
@@ -1027,12 +1096,15 @@ async fn remote_output_drain(
 /// the snapshot but before the (possibly slow) socket write, so live output
 /// resumes queuing immediately and lands *after* this full-state replay. Returns
 /// `false` only when the socket write failed (the drain task then stops).
-async fn send_resync_replay(
+async fn send_resync_replay<W>(
     shared: &Arc<RemoteOutputShared>,
-    write_half: &mut WriteHalf<TcpStream>,
+    write_half: &mut W,
     server: &IpcServerState,
     session_id: SessionId,
-) -> bool {
+) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let term = {
         let sessions = server.live_sessions.read().await;
         sessions.get(&session_id).map(|s| Arc::clone(&s.term))
@@ -1077,40 +1149,210 @@ async fn shutdown_remote_output(sink: &RemoteSink, mut drain_task: tokio::task::
     }
 }
 
-/// Shared control handle for the remote-control TCP listener. Lives in
-/// [`IpcServerState`]. The listener lifecycle itself is owned by a single
-/// [`remote_supervisor`] task (started once at server startup); this handle only
-/// carries the cross-task state the accept path and the dispatch path need:
-/// [`request_reload`](Self::request_reload) pokes the supervisor, `enabled`
-/// answers the disable-race refusal, and `conn_limit` is the 8-connection cap.
-/// Keeping the apply loop off the dispatch call graph is deliberate — it keeps a
-/// wedged tailscaled from stalling client message loops and avoids an async
-/// auto-trait inference cycle (dispatch → apply → accept → dispatch).
-pub struct RemoteControl {
-    /// Poked (synchronously, no await) whenever the config changes so the
-    /// supervisor re-reads and re-applies the `[remote]` table.
-    reload: tokio::sync::Notify,
-    /// Live "remote access is accepting" flag. Read by the accept path to answer
+/// Which remote transport a listener/connection belongs to (feature 014,
+/// analysis C4/S1). Feature 013's tailnet (Tailscale) path and feature 014's LAN
+/// (mutual-TLS) path each own an independent [`TransportControl`] — their own
+/// `enabled` flag, admission caps, and sever registry — so disabling or going
+/// dormant on one transport severs only that transport's connections and LAN
+/// load can never starve tailnet admission.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Transport {
+    /// Feature 013 tailnet (Tailscale) transport — behavior byte-identical to
+    /// the pre-014 single-transport `RemoteControl`.
+    Tailnet,
+    /// Feature 014 LAN (mutual-TLS) transport.
+    Lan,
+}
+
+/// One live accepted connection's sever handle, plus — for the LAN transport —
+/// the pinned device that owns it, so a per-device revoke can target just its
+/// connections without touching any other (feature 014, FR-010).
+struct SeverHandle {
+    /// Fires this connection out of its message loop and through the normal
+    /// detach cleanup (owning sessions untouched, FR-016/FR-010).
+    sever: tokio::sync::oneshot::Sender<()>,
+    /// The pinned LAN `device_id = SHA-256(SPKI)` this connection authenticated
+    /// as, or `None` for a tailnet connection (which carries no Scribe device
+    /// identity). Drives the LAN `device_id -> connection-id` index.
+    device_id: Option<DeviceId>,
+}
+
+/// A single transport's registry of live accepted connections (feature 013 T023,
+/// generalized per-transport in feature 014). Every connection registers its
+/// sever channel under a process-unique id; firing a sever drops that connection
+/// out of its loop through the normal detach path. For the LAN transport a
+/// secondary `device_id -> {connection ids}` index is maintained so a per-device
+/// revoke can later sever only that device's connections (FR-010); a tailnet
+/// connection has no device identity, so its entries carry `None` and the index
+/// stays empty. Both maps are mutated together under the enclosing `Mutex`, so
+/// they cannot drift. A per-device revoke queries this index by `device_id` via
+/// [`drain_device`](SeverRegistry::drain_device) (feature 014 T027).
+#[derive(Default)]
+struct SeverRegistry {
+    /// connection id → its sever handle.
+    by_conn: HashMap<u64, SeverHandle>,
+    /// device id → the connection ids it currently owns (LAN only; empty for the
+    /// tailnet transport).
+    by_device: HashMap<DeviceId, HashSet<u64>>,
+}
+
+impl SeverRegistry {
+    /// Register a connection's sever channel under `id`, additionally indexing it
+    /// by `device_id` when the connection carries one (LAN).
+    fn insert(
+        &mut self,
+        id: u64,
+        sever: tokio::sync::oneshot::Sender<()>,
+        device_id: Option<DeviceId>,
+    ) {
+        if let Some(device_id) = device_id {
+            self.by_device.entry(device_id).or_default().insert(id);
+        }
+        self.by_conn.insert(id, SeverHandle { sever, device_id });
+    }
+
+    /// Drop a connection's registration once its task ends, keeping the device
+    /// index consistent. A no-op if a sever already drained it.
+    fn remove(&mut self, id: u64) {
+        let Some(handle) = self.by_conn.remove(&id) else {
+            return;
+        };
+        let Some(device_id) = handle.device_id else {
+            return;
+        };
+        let Some(ids) = self.by_device.get_mut(&device_id) else {
+            return;
+        };
+        ids.remove(&id);
+        if ids.is_empty() {
+            self.by_device.remove(&device_id);
+        }
+    }
+
+    /// Take every connection's sever channel, clearing both maps.
+    fn drain_all(&mut self) -> Vec<tokio::sync::oneshot::Sender<()>> {
+        self.by_device.clear();
+        std::mem::take(&mut self.by_conn).into_values().map(|handle| handle.sever).collect()
+    }
+
+    /// Take the sever channels for every live connection owned by `device_id`,
+    /// removing them from BOTH maps so the registry stays consistent. This is the
+    /// per-device revoke consumer of the `device_id -> {connection ids}` index
+    /// (feature 014 T027): a revoked device's own connections are severed while
+    /// every other connection — and the owning sessions — are untouched (FR-010).
+    /// Empty when the device owns no live connection (already gone, or it never
+    /// held one).
+    fn drain_device(&mut self, device_id: &DeviceId) -> Vec<tokio::sync::oneshot::Sender<()>> {
+        let Some(ids) = self.by_device.remove(device_id) else {
+            return Vec::new();
+        };
+        ids.into_iter()
+            .filter_map(|id| self.by_conn.remove(&id))
+            .map(|handle| handle.sever)
+            .collect()
+    }
+}
+
+/// The per-transport admission + sever state hosted inside [`RemoteControl`]
+/// (feature 014, analysis C4/S1). Each transport (tailnet, LAN) owns an
+/// independent instance so its listener can be enabled/disabled and its
+/// connections severed without disturbing the other, and neither transport's
+/// caps can starve the other's admission. The listener lifecycle (bind + accept
+/// tasks) is owned by the [`remote_supervisor`] task; this struct only carries
+/// the cross-task state the accept and dispatch paths read.
+struct TransportControl {
+    /// Live "this transport is accepting" flag. Read by the accept path to answer
     /// `Disabled` when a connection races a live disable; written by the
     /// supervisor. `true` only while at least one listener is bound.
     enabled: AtomicBool,
-    /// The 8-slot remote connection cap, shared across every bound address and
-    /// held for the life of each accepted connection.
+    /// This transport's connection cap, held for the life of each accepted
+    /// connection (tailnet: [`REMOTE_CONNECTION_CAP`]; LAN: [`LAN_CONNECTION_CAP`]).
     conn_limit: Arc<tokio::sync::Semaphore>,
-    /// Admission cap on pending (pre-authorization) connections
-    /// ([`REMOTE_PENDING_HANDSHAKE_CAP`]), acquired the instant a stream is
-    /// accepted — before the handler is spawned — so a flood of half-open dialers
-    /// cannot spawn unbounded handshake tasks. Shared across every bound address;
-    /// held for the handshake's duration, released when the handler task ends.
+    /// This transport's pending (pre-authorization) handshake cap, acquired the
+    /// instant a stream is accepted — before the handler is spawned — so a flood
+    /// of half-open dialers cannot spawn unbounded handshake tasks (tailnet:
+    /// [`REMOTE_PENDING_HANDSHAKE_CAP`]; LAN: [`LAN_PENDING_HANDSHAKE_CAP`]).
     handshake_limit: Arc<tokio::sync::Semaphore>,
-    /// Feature 013 (T023): live accepted remote connections, keyed by a monotonic
-    /// id, each holding the connection's sever channel. Fired on disable to drop
-    /// every remote connection out of its message loop and through the normal
-    /// detach cleanup (owning sessions untouched, FR-016). Populated only past the
-    /// handshake; the rebind path leaves it alone (it keeps live connections).
-    connections: tokio::sync::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<()>>>,
-    /// Monotonic allocator for [`connections`](Self::connections) keys.
+    /// This transport's live-connection sever registry (with the LAN device
+    /// index). Populated only past the handshake; the rebind path leaves it alone.
+    connections: tokio::sync::Mutex<SeverRegistry>,
+}
+
+impl TransportControl {
+    /// Create a stopped transport with its own connection and pending-handshake
+    /// caps and an empty sever registry.
+    fn new(conn_cap: usize, handshake_cap: usize) -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            conn_limit: Arc::new(tokio::sync::Semaphore::new(conn_cap)),
+            handshake_limit: Arc::new(tokio::sync::Semaphore::new(handshake_cap)),
+            connections: tokio::sync::Mutex::new(SeverRegistry::default()),
+        }
+    }
+}
+
+/// Shared control handle for the remote-control listeners. Lives in
+/// [`IpcServerState`]. The listener lifecycle itself is owned by a single
+/// [`remote_supervisor`] task (started once at server startup); this handle only
+/// carries the cross-task state the accept and dispatch paths need:
+/// [`request_reload`](Self::request_reload) pokes the supervisor, and each
+/// transport's [`TransportControl`] answers the disable-race refusal and holds
+/// its admission caps + sever registry. Keeping the apply loop off the dispatch
+/// call graph is deliberate — it keeps a wedged tailscaled from stalling client
+/// message loops and avoids an async auto-trait inference cycle (dispatch →
+/// apply → accept → dispatch).
+///
+/// Feature 014 (analysis C4/S1) split the former single-transport state into
+/// per-transport [`tailnet`](Self::tailnet) and [`lan`](Self::lan) instances so
+/// disabling or going dormant on one transport severs only its own connections,
+/// plus a `device_id -> connection-id` index (inside each transport's
+/// [`SeverRegistry`]) so a per-device revoke and a per-transport disable target
+/// only the right connections (FR-010/FR-012). The tailnet path is preserved
+/// byte-for-byte.
+pub struct RemoteControl {
+    /// Poked (synchronously, no await) whenever the config changes so the
+    /// supervisor re-reads and re-applies the `[remote]` / `[remote.lan]` tables.
+    reload: tokio::sync::Notify,
+    /// Monotonic allocator for sever-registry connection ids, shared across
+    /// transports so every live connection has a process-unique id.
     next_conn_id: AtomicU64,
+    /// Feature 013 tailnet transport (caps [`REMOTE_CONNECTION_CAP`] /
+    /// [`REMOTE_PENDING_HANDSHAKE_CAP`]); behavior byte-identical to the pre-014
+    /// single-transport `RemoteControl`.
+    tailnet: TransportControl,
+    /// Feature 014 LAN transport (its OWN caps [`LAN_CONNECTION_CAP`] /
+    /// [`LAN_PENDING_HANDSHAKE_CAP`], sever registry, and device index),
+    /// independent of tailnet. The LAN listener is wired by feature 014 T010/T011.
+    lan: TransportControl,
+    /// Feature 014 LAN concurrent-pending-approval registry (a separate cap +
+    /// per-hold timeout, analysis S1): correlates a pushed `LanApprovalRequest`
+    /// with the owning client's `LanApprovalDecision` and bounds how many/long
+    /// unapproved dialers may hold. Shared between the LAN accept path (which
+    /// begins + awaits holds) and the local-socket decision handler (which
+    /// resolves them, [`dispatch_message`]).
+    pending_approvals: Arc<PendingApprovals>,
+    /// Feature 014 trusted-device pin store: the strict `device_id` pin check the
+    /// TLS pinning verifier consults and the accept path writes on approval, plus
+    /// the revoke/list surface (T027/T013). Shared behind a `std::sync::Mutex`;
+    /// every critical section is short and off the `.await` path.
+    trusted_devices: SharedTrustedDevices,
+    /// Feature 014 T021 trusted-networks activation store: the add/remove/list
+    /// surface behind the local-only `AddCurrentNetworkTrusted` /
+    /// `RemoveTrustedNetwork` / `ListTrustedNetworks` handlers, AND the very same
+    /// store the supervisor's [`apply_lan`](Self::apply_lan) activation gate and
+    /// the network-change watcher read — held here so a live add/remove and the
+    /// gate observe ONE store, and removing the current network can poke a reload
+    /// that takes the LAN transport dormant (FR-018). Shared behind a
+    /// `std::sync::Mutex`; the `netdev` read + store I/O runs on the blocking pool.
+    trusted_networks: SharedTrustedNetworks,
+    /// Feature 014 T013: the live LAN peer view published by the supervisor's
+    /// `mDNS` browse while the LAN transport is active, read by the local-only
+    /// `ListLanPeers` dispatch handler. `None` while the LAN transport is dormant
+    /// or off, so the handler returns an empty list (fail-closed, mirroring the
+    /// tailnet `ListRemotePeers`). Published by [`start_lan`](Self::start_lan) on
+    /// activation and cleared by [`deactivate_lan`](Self::deactivate_lan); read
+    /// behind a short `std::sync::Mutex` critical section off the `.await` path.
+    lan_peer_handle: std::sync::Mutex<Option<LanPeerHandle>>,
 }
 
 /// The currently-bound remote listener, owned by the [`remote_supervisor`] task.
@@ -1128,16 +1370,27 @@ struct RunningRemoteListener {
 
 impl RemoteControl {
     /// Create a fresh, stopped control handle. Pair it with a [`remote_supervisor`]
-    /// task to actually drive the listener.
+    /// task to actually drive the listeners. Both transports start disabled with
+    /// their own admission caps and empty sever registries.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             reload: tokio::sync::Notify::new(),
-            enabled: AtomicBool::new(false),
-            conn_limit: Arc::new(tokio::sync::Semaphore::new(REMOTE_CONNECTION_CAP)),
-            handshake_limit: Arc::new(tokio::sync::Semaphore::new(REMOTE_PENDING_HANDSHAKE_CAP)),
-            connections: tokio::sync::Mutex::new(HashMap::new()),
             next_conn_id: AtomicU64::new(0),
+            tailnet: TransportControl::new(REMOTE_CONNECTION_CAP, REMOTE_PENDING_HANDSHAKE_CAP),
+            lan: TransportControl::new(LAN_CONNECTION_CAP, LAN_PENDING_HANDSHAKE_CAP),
+            pending_approvals: PendingApprovals::new(),
+            trusted_devices: Arc::new(std::sync::Mutex::new(TrustedDevicesStore::load())),
+            trusted_networks: Arc::new(std::sync::Mutex::new(TrustedNetworksStore::load())),
+            lan_peer_handle: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The per-transport control state for `transport`.
+    fn transport_control(&self, transport: Transport) -> &TransportControl {
+        match transport {
+            Transport::Tailnet => &self.tailnet,
+            Transport::Lan => &self.lan,
+        }
     }
 
     /// Ask the supervisor to re-read the config and re-apply the listener state.
@@ -1148,49 +1401,59 @@ impl RemoteControl {
         self.reload.notify_one();
     }
 
-    /// Register an accepted remote connection's sever channel, returning its id —
-    /// or `None` if remote access was disabled in the race between authorization
-    /// and here, telling the caller to close instead of serve. The disable path
-    /// fires every registered sever (see
-    /// [`sever_all_connections`](Self::sever_all_connections)) so each live remote
+    /// Register an accepted connection's sever channel on `transport`, returning
+    /// its id — or `None` if that transport was disabled in the race between
+    /// authorization and here, telling the caller to close instead of serve. The
+    /// disable path fires every registered sever (see
+    /// [`sever_all_connections`](Self::sever_all_connections)) so each live
     /// connection drops out of its message loop and runs the normal detach
     /// cleanup. Registered before serving begins so even a pre-Hello connection is
-    /// signalable.
-    async fn register_connection(&self, sever: tokio::sync::oneshot::Sender<()>) -> Option<u64> {
-        // Check `enabled` under the same lock `sever_all_connections` drains under.
-        // `disable` clears `enabled` (via `stop`) before it drains, so a connection
-        // that raced a live disable between authorization and here is either drained
-        // by that disable (registered first) or refused registration (registered
-        // after) — it can never linger past a disable.
-        let mut conns = self.connections.lock().await;
-        if !self.enabled.load(Ordering::SeqCst) {
+    /// signalable. A LAN connection passes its pinned `device_id` so a per-device
+    /// revoke can later sever just it (FR-010); a tailnet connection passes `None`.
+    async fn register_connection(
+        &self,
+        transport: Transport,
+        sever: tokio::sync::oneshot::Sender<()>,
+        device_id: Option<DeviceId>,
+    ) -> Option<u64> {
+        // Check the transport's `enabled` flag under the same lock its
+        // `sever_all_connections` drains under. `disable` clears `enabled` (via
+        // `stop`) before it drains, so a connection that raced a live disable
+        // between authorization and here is either drained by that disable
+        // (registered first) or refused registration (registered after) — it can
+        // never linger past a disable.
+        let control = self.transport_control(transport);
+        let mut conns = control.connections.lock().await;
+        if !control.enabled.load(Ordering::SeqCst) {
             return None;
         }
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-        conns.insert(id, sever);
+        conns.insert(id, sever, device_id);
         Some(id)
     }
 
-    /// Drop a remote connection's sever channel once its task has ended. A no-op
-    /// when the disable path already drained it.
-    async fn deregister_connection(&self, id: u64) {
-        self.connections.lock().await.remove(&id);
+    /// Drop a connection's sever channel on `transport` once its task has ended. A
+    /// no-op when the disable path already drained it.
+    async fn deregister_connection(&self, transport: Transport, id: u64) {
+        self.transport_control(transport).connections.lock().await.remove(id);
     }
 
-    /// Bring the remote listener into line with `cfg`: start it when enabled
+    /// Bring the TAILNET listener into line with `cfg`: start it when enabled
     /// (bound strictly to this machine's tailnet addresses, never `0.0.0.0`),
     /// stop it when disabled, or rebind it when the port or address set changed.
     /// Idempotent when already matching. Fails closed — the listener stays down —
     /// on any tailnet `LocalAPI` error. Never restarts the server (research D8).
-    /// `state` is the supervisor task's own listener state (no shared lock).
-    async fn apply(
+    /// `state` is the supervisor task's own tailnet listener state (no shared
+    /// lock). Operates solely on the tailnet transport; the LAN transport is
+    /// reconciled independently by [`apply_lan`](Self::apply_lan).
+    async fn apply_tailnet(
         self: &Arc<Self>,
         state: &mut RemoteListenerState,
         cfg: &scribe_config::RemoteConfig,
         server: &IpcServerState,
     ) {
         if !cfg.enabled {
-            self.disable(state).await;
+            self.disable(Transport::Tailnet, state).await;
             return;
         }
 
@@ -1202,7 +1465,7 @@ impl RemoteControl {
                 warn!(
                     "remote access enabled but tailnet address lookup failed ({e}); listener not started"
                 );
-                self.stop(state);
+                self.stop(Transport::Tailnet, state);
                 return;
             }
         };
@@ -1210,7 +1473,7 @@ impl RemoteControl {
             warn!(
                 "remote access enabled but no tailnet addresses are available; listener not started"
             );
-            self.stop(state);
+            self.stop(Transport::Tailnet, state);
             return;
         }
 
@@ -1224,12 +1487,384 @@ impl RemoteControl {
 
         // First start, or a port/address change: tear the old listener down and
         // rebind fresh.
-        self.stop(state);
+        self.stop(Transport::Tailnet, state);
         self.start(state, cfg.port, addrs, server).await;
     }
 
-    /// Bind one listener per address on `port` and spawn its accept task. Sets
-    /// `enabled` only if at least one address bound.
+    /// Reconcile the LAN transport with the `[remote.lan]` config (feature 014
+    /// T010). The LAN transport is present ONLY while `remote.lan.enabled` AND the
+    /// machine is on a trusted network ([`network::lan_activation_snapshot`],
+    /// FR-018); when active it binds one listener per physical-LAN address on
+    /// `remote.lan.port` and advertises over mDNS, and when dormant (disabled,
+    /// untrusted network, or an unidentifiable/keyring-less state) it tears the
+    /// listener down and sends the mDNS goodbye. Started/stopped/rebound live off
+    /// this path — driven by BOTH the `ConfigReloaded` reload and the network-change
+    /// watcher poke (both funnel through [`request_reload`](Self::request_reload)) —
+    /// never a server restart. Operates solely on the LAN transport; the tailnet
+    /// transport is reconciled independently by [`apply_tailnet`](Self::apply_tailnet).
+    async fn apply_lan(
+        self: &Arc<Self>,
+        state: &mut RemoteListenerState,
+        cfg: &scribe_config::LanRemoteConfig,
+        runtime: &mut LanRuntime,
+        sup: LanSupervise<'_>,
+    ) {
+        // Off (the default): tear any LAN listener + advertising down.
+        if !cfg.enabled {
+            self.deactivate_lan(state, runtime, Some(LanDormantReason::Disabled)).await;
+            return;
+        }
+
+        // Enabled: activate only on a trusted network, bound to that network's
+        // physical-LAN address. Trust and the bind addresses come from ONE netdev
+        // read so a roam can never leave them disagreeing; the blocking read runs
+        // off the async runtime. Fails closed (dormant) when the network is
+        // unidentifiable.
+        let networks_for_snapshot = Arc::clone(sup.networks);
+        let (trusted, addrs) = tokio::task::spawn_blocking(move || {
+            networks_for_snapshot
+                .lock()
+                .ok()
+                .map(|store| network::lan_activation_snapshot(&store))
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+
+        if !trusted {
+            debug!("LAN access enabled but the current network is not trusted; staying dormant");
+            self.deactivate_lan(state, runtime, Some(LanDormantReason::NetworkUntrusted)).await;
+            return;
+        }
+        if addrs.is_empty() {
+            warn!(
+                "LAN access enabled on a trusted network but no physical-LAN address is available; listener not started"
+            );
+            self.deactivate_lan(state, runtime, None).await;
+            return;
+        }
+
+        // Materialize the device identity lazily on first activation; fail closed
+        // (dormant) if the keyring is unavailable — the private key is never written
+        // in the clear and a keyring-less host cannot be an owning-side LAN host in
+        // v1 (analysis I2).
+        if let Err(error) = runtime.ensure_identity().await {
+            warn!(%error, "LAN device identity unavailable; keeping the LAN transport dormant");
+            self.deactivate_lan(state, runtime, None).await;
+            return;
+        }
+
+        // No-op when already bound to the same port + physical-LAN address set —
+        // advertising is already up (mirrors `apply_tailnet`).
+        if let Some(running) = &state.running
+            && running.port == cfg.port
+            && addr_set_matches(&running.addrs, &addrs)
+        {
+            return;
+        }
+
+        // First activation, or a port/address change (a roam or DHCP renew):
+        // rebind fresh and re-advertise. Live LAN connections are kept across a
+        // rebind — only a full disable severs them — matching the tailnet path.
+        // Assemble the per-connection accept context from the now-materialized
+        // identity (a defensive fail-closed if it is somehow still absent).
+        let Some(identity) = runtime.identity.clone() else {
+            warn!("LAN listener start requested without a device identity; staying dormant");
+            self.deactivate_lan(state, runtime, None).await;
+            return;
+        };
+        let accept = self.lan_accept_context(identity, sup);
+        self.stop(Transport::Lan, state);
+        self.start_lan(state, LanBind { port: cfg.port, addrs }, runtime, accept).await;
+    }
+
+    /// Assemble the per-connection LAN accept context (feature 014 T011) from this
+    /// machine's materialized device identity plus the shared trust/network state:
+    /// the mutual-TLS layer (presenting this device's cert, pinning peers against
+    /// the LIVE trusted-device store), the server state threaded into each
+    /// accepted connection's dispatch, and the trusted-networks store (for the
+    /// approval prompt's network label). Cheap to clone per accepted connection.
+    fn lan_accept_context(
+        self: &Arc<Self>,
+        identity: Arc<DeviceIdentity>,
+        sup: LanSupervise<'_>,
+    ) -> LanAccept {
+        let pins: Arc<dyn DevicePins> =
+            Arc::new(TrustedDevicePins(Arc::clone(&self.trusted_devices)));
+        LanAccept {
+            server: sup.server.clone(),
+            control: Arc::clone(self),
+            lan_tls: Arc::new(LanTls::new(identity, pins)),
+            networks: Arc::clone(sup.networks),
+        }
+    }
+
+    /// Take the LAN transport dormant: tear its listener down and sever its live
+    /// connections (via the generalized per-transport [`disable`](Self::disable) —
+    /// only LAN connections, never the tailnet transport's), then stop advertising
+    /// and send the mDNS goodbye. Idempotent — safe on every reload while the
+    /// transport stays off. Emits the bulk `lan: dormant …` audit line
+    /// (contracts/settings-and-config.md) once, only on a genuine active→dormant
+    /// transition (a live listener was actually torn down) and only for the two
+    /// user-meaningful `reason`s; an idempotent no-op reload, or a fail-closed
+    /// operational case that passes `None`, stays silent.
+    async fn deactivate_lan(
+        &self,
+        state: &mut RemoteListenerState,
+        runtime: &mut LanRuntime,
+        reason: Option<LanDormantReason>,
+    ) {
+        let was_active = state.running.is_some();
+        self.disable(Transport::Lan, state).await;
+        runtime.stop_advertising();
+        // Clear the published peer view so a dormant/disabled LAN reports no peers.
+        self.publish_lan_peers(None);
+        // Bulk transition line (the LAN counterpart to the tailnet `remote: severed
+        // …` line `disable` emits): fire only when a live listener was actually torn
+        // down, so a repeated dormant reload never spams it.
+        if let Some(reason) = reason
+            && was_active
+        {
+            info!(
+                target: REMOTE_AUDIT_TARGET,
+                "lan: dormant reason={}",
+                audit_dormant_reason(reason)
+            );
+        }
+    }
+
+    /// Publish (or, with `None`, clear) the LAN peer view the local-only
+    /// `ListLanPeers` handler reads. [`start_lan`](Self::start_lan) publishes the
+    /// active discovery's [`LanPeerHandle`] once browsing is up, and
+    /// [`deactivate_lan`](Self::deactivate_lan) clears it on dormancy so a dormant
+    /// LAN reports no peers. Runs only in the single supervisor task; the sync lock
+    /// is taken and released without an `.await` held.
+    fn publish_lan_peers(&self, handle: Option<LanPeerHandle>) {
+        if let Ok(mut slot) = self.lan_peer_handle.lock() {
+            *slot = handle;
+        }
+    }
+
+    /// A snapshot of the LAN peers currently discovered on the trusted network,
+    /// for the local-only `ListLanPeers` handler. Empty while the LAN transport is
+    /// dormant or off (nothing is being browsed), or on a poisoned lock — the same
+    /// fail-closed empty-on-unavailable behavior as the tailnet `ListRemotePeers`.
+    /// The critical section is a short clone off the `.await` path.
+    fn lan_peers(&self) -> Vec<LanPeerInfo> {
+        match self.lan_peer_handle.lock() {
+            Ok(slot) => slot.as_ref().map_or_else(Vec::new, LanPeerHandle::peers),
+            Err(_poisoned) => Vec::new(),
+        }
+    }
+
+    /// Feature 014 T027: this machine's approved LAN devices for the local-only
+    /// `ListTrustedDevices` handler, read from the shared trusted-device pin store
+    /// (the same store the accept path's approval gate writes and
+    /// [`revoke_trusted_device`](Self::revoke_trusted_device) removes from). A
+    /// short in-memory clone off the `.await` path — the store's `list` touches no
+    /// disk. A poisoned lock recovers the guard (the record set is still
+    /// consistent — every mutation rebuilds the whole document), matching how the
+    /// accept path locks this same store.
+    fn list_trusted_devices(&self) -> Vec<TrustedDeviceInfo> {
+        self.trusted_devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner).list()
+    }
+
+    /// Feature 014 T021: this machine's trusted networks plus whether its CURRENT
+    /// network is one of them, for the local-only `ListTrustedNetworks` handler
+    /// (`current_trusted` drives the Settings active/dormant status line, UX-004).
+    /// The pure list read and the current-network trust check (a blocking `netdev`
+    /// read) run together on the blocking pool under one short store lock — the
+    /// same lock-across-`netdev`-in-`spawn_blocking` shape
+    /// [`apply_lan`](Self::apply_lan) uses for its activation snapshot. Fails closed
+    /// (empty list, untrusted) on a poisoned lock or a join failure.
+    async fn trusted_networks_snapshot(&self) -> (Vec<TrustedNetworkInfo>, bool) {
+        let networks = Arc::clone(&self.trusted_networks);
+        tokio::task::spawn_blocking(move || match networks.lock() {
+            Ok(store) => (store.list(), store.is_current_network_trusted()),
+            Err(_poisoned) => (Vec::new(), false),
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Feature 014 T021: trust the network this machine is currently on, then poke
+    /// the supervisor so [`apply_lan`](Self::apply_lan) re-evaluates trust and the
+    /// (enabled) LAN transport can go ACTIVE now that a matching trusted network
+    /// exists — no config change or server restart. Fingerprinting the current
+    /// network is a blocking `netdev` read and the store rewrite fsyncs to disk, so
+    /// the work runs on the blocking pool. Fire-and-forget on the wire (no reply
+    /// frame): an unidentifiable network, a poisoned lock, or a persist failure is
+    /// logged and no reload is poked — the Settings UI's disabled "Add current
+    /// network" control already pre-empts the unidentifiable case.
+    async fn add_current_trusted_network(&self) {
+        let networks = Arc::clone(&self.trusted_networks);
+        let added = tokio::task::spawn_blocking(move || {
+            let mut store = match networks.lock() {
+                Ok(store) => store,
+                Err(_poisoned) => {
+                    warn!("trusted-networks store lock poisoned; not adding the network");
+                    return false;
+                }
+            };
+            match store.add_current(None) {
+                Ok(_info) => true,
+                Err(error) => {
+                    warn!(%error, "failed to trust the current network");
+                    false
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if added {
+            self.request_reload();
+        }
+    }
+
+    /// Feature 014 T021: remove a trusted network by its record id, then poke the
+    /// supervisor. Removing the CURRENT network must take the LAN surface dormant
+    /// promptly (FR-018): the reload makes [`apply_lan`](Self::apply_lan) re-evaluate
+    /// trust and, when the machine no longer matches any trusted network, tear the
+    /// LAN listener down, send the `mDNS` goodbye, and sever ONLY the LAN transport's
+    /// connections (never the tailnet's). Removing a non-current network changes
+    /// nothing live and the reload is idempotent. The store rewrite fsyncs to disk,
+    /// so it runs on the blocking pool. Fire-and-forget on the wire; a poisoned lock
+    /// or persist failure is logged and no reload is poked.
+    async fn remove_trusted_network(&self, id: String) {
+        let networks = Arc::clone(&self.trusted_networks);
+        let removed = tokio::task::spawn_blocking(move || {
+            let mut store = match networks.lock() {
+                Ok(store) => store,
+                Err(_poisoned) => {
+                    warn!("trusted-networks store lock poisoned; not removing the network");
+                    return false;
+                }
+            };
+            match store.remove(&id) {
+                Ok(removed) => removed,
+                Err(error) => {
+                    warn!(%error, "failed to remove the trusted network");
+                    false
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if removed {
+            self.request_reload();
+        }
+    }
+
+    /// Feature 014 T027: revoke a trusted LAN device by its hex `device_id`, then
+    /// sever ONLY that device's live LAN connection(s) so it loses control at once
+    /// and must re-approve on its next attempt (FR-010, SC-006). Two ordered
+    /// steps, both fail-closed:
+    ///
+    /// 1. Remove the pin from the trusted-device store (a disk fsync, so it runs on
+    ///    the blocking pool). Done FIRST so any reconnect that races the sever is
+    ///    already treated as an unknown device (re-approval required), never
+    ///    silently re-admitted.
+    /// 2. Fire each matched connection's sever oneshot via the T009
+    ///    `device_id -> connection-id` index, dropping it out of its message loop
+    ///    through the normal detach path — the owning sessions and every OTHER
+    ///    device's connections untouched.
+    ///
+    /// A malformed hex id, an unknown/already-revoked device, or a poisoned store
+    /// is a logged no-op for the pin removal; the sever still runs (idempotent, and
+    /// correct even in the rare approved-but-unpersisted race). Fire-and-forget on
+    /// the wire — no reply frame (the Settings UI re-queries the list afterward).
+    async fn revoke_trusted_device(&self, device_id_hex: String) {
+        let Some(device_id) = decode_device_id_hex(&device_id_hex) else {
+            warn!("ignoring RevokeTrustedDevice with a malformed device id");
+            return;
+        };
+
+        // Step 1: remove the pin (blocking fsync off the async runtime), capturing
+        // the device label first for the audit line. `Some(label)` iff a record was
+        // actually removed; `None` on an unknown device or a store failure.
+        let devices = Arc::clone(&self.trusted_devices);
+        let revoked_label = tokio::task::spawn_blocking(move || {
+            let mut store = devices.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let label = store.label_for(&device_id).unwrap_or_default();
+            match store.revoke(&device_id) {
+                Ok(true) => Some(label),
+                Ok(false) => None,
+                Err(error) => {
+                    warn!(%error, "failed to revoke the trusted device");
+                    None
+                }
+            }
+        })
+        .await
+        .unwrap_or(None);
+
+        // Step 2: sever the device's live LAN connection(s) via the T009 device
+        // index so a revoked device drops immediately (SC-006).
+        let severed = self.sever_device_connections(&device_id).await;
+
+        if let Some(label) = revoked_label {
+            info!(
+                target: REMOTE_AUDIT_TARGET,
+                "lan: revoked device={label} id={}",
+                short_device_id(&device_id)
+            );
+        }
+        if severed > 0 {
+            debug!(count = severed, "severed live LAN connections for a revoked device");
+        }
+    }
+
+    /// Bind one LAN listener per physical-LAN address on `port`, spawn its accept
+    /// loop, mark the LAN transport enabled, and advertise over mDNS — the LAN
+    /// counterpart to [`start`](Self::start). Sets the LAN transport's `enabled`
+    /// only if at least one address bound. Feature 014 T010 owns the listener
+    /// lifecycle here; each accepted connection's `tokio-rustls` mutual handshake,
+    /// device-approval gate, and hand-off to [`serve_connection`] run in
+    /// [`lan_accept_loop`] → [`handle_lan_client`] (T011).
+    async fn start_lan(
+        &self,
+        state: &mut RemoteListenerState,
+        bind: LanBind,
+        runtime: &mut LanRuntime,
+        accept: LanAccept,
+    ) {
+        let LanBind { port, addrs } = bind;
+        let mut accept_tasks = Vec::new();
+        let mut bound_addrs = Vec::new();
+        for ip in addrs {
+            let sockaddr = SocketAddr::new(ip, port);
+            match TcpListener::bind(sockaddr).await {
+                Ok(listener) => {
+                    accept_tasks.push(tokio::spawn(lan_accept_loop(listener, accept.clone())));
+                    bound_addrs.push(ip);
+                    info!(%sockaddr, "LAN remote-control listener bound");
+                }
+                Err(e) => {
+                    warn!(%sockaddr, "failed to bind LAN remote-control listener: {e}");
+                }
+            }
+        }
+        if accept_tasks.is_empty() {
+            warn!(
+                "LAN access enabled and trusted but every physical-LAN bind failed; LAN inactive"
+            );
+            return;
+        }
+        // Publish the accepting state only once a listener is actually up, so the
+        // disable-race check never reports `enabled` for a down listener.
+        self.lan.enabled.store(true, Ordering::SeqCst);
+        // Advertise the bound physical-LAN address(es) so peers discover this host
+        // only while the transport is genuinely active (FR-018).
+        runtime.advertise(&bound_addrs, port);
+        // Publish the now-browsing peer view so the local-only `ListLanPeers`
+        // handler reads live discovery; a missing handle (mDNS unavailable) leaves
+        // it cleared, and the handler then reports no peers.
+        self.publish_lan_peers(runtime.peer_handle());
+        state.running = Some(RunningRemoteListener { port, addrs: bound_addrs, accept_tasks });
+    }
+
+    /// Bind one tailnet listener per address on `port` and spawn its accept task.
+    /// Sets the tailnet transport's `enabled` only if at least one address bound.
     async fn start(
         self: &Arc<Self>,
         state: &mut RemoteListenerState,
@@ -1260,19 +1895,21 @@ impl RemoteControl {
         }
         // Publish the accepting state only once a listener is actually up, so the
         // disable-race check never reports `enabled` for a down listener.
-        self.enabled.store(true, Ordering::SeqCst);
+        self.tailnet.enabled.store(true, Ordering::SeqCst);
         state.running = Some(RunningRemoteListener { port, addrs: bound_addrs, accept_tasks });
     }
 
-    /// Stop accepting: clear `enabled` first (so an in-flight handler racing a
-    /// disable answers `Disabled`), then abort every accept task, which drops the
-    /// listeners and closes their sockets. Live remote connections are severed
-    /// separately by [`disable`](Self::disable) via
+    /// Stop accepting on `transport`'s listener: clear that transport's `enabled`
+    /// first (so an in-flight handler racing a disable answers `Disabled`), then
+    /// abort every accept task in `state`, which drops the listeners and closes
+    /// their sockets. Live connections are severed separately by
+    /// [`disable`](Self::disable) via
     /// [`sever_all_connections`](Self::sever_all_connections); this tears down
     /// only the accept side (shared with the rebind path, which keeps live
-    /// connections).
-    fn stop(&self, state: &mut RemoteListenerState) {
-        self.enabled.store(false, Ordering::SeqCst);
+    /// connections). Only the named transport's `enabled` flag and listener state
+    /// are touched.
+    fn stop(&self, transport: Transport, state: &mut RemoteListenerState) {
+        self.transport_control(transport).enabled.store(false, Ordering::SeqCst);
         if let Some(running) = state.running.take() {
             for task in running.accept_tasks {
                 task.abort();
@@ -1285,18 +1922,23 @@ impl RemoteControl {
         }
     }
 
-    /// Disable remote access (research D8, FR-016): tear the listener down, then
-    /// sever every live remote connection and emit the bulk `severed` audit line.
-    /// Idempotent — a redundant disable with nothing live is a silent no-op, so it
-    /// is safe on every `ConfigReloaded` while remote access stays off. Owning-side
-    /// sessions are never touched: each connection is severed through its normal
-    /// detach path (FR-010).
-    async fn disable(&self, state: &mut RemoteListenerState) {
+    /// Disable `transport` (research D8, FR-016): tear its listener down, then
+    /// sever every live connection ON THAT TRANSPORT and emit the bulk `severed`
+    /// audit line. Idempotent — a redundant disable with nothing live is a silent
+    /// no-op, so it is safe on every `ConfigReloaded` while the transport stays
+    /// off. Owning-side sessions are never touched: each connection is severed
+    /// through its normal detach path (FR-010). Only the named transport's
+    /// listener + connections are affected; the other transport is untouched.
+    async fn disable(&self, transport: Transport, state: &mut RemoteListenerState) {
         // Stop accepting and close the listener sockets first (no new connections),
-        // then sever the connections that are already established.
-        self.stop(state);
-        let severed = self.sever_all_connections().await;
-        if severed > 0 {
+        // then sever the connections that are already established — only this
+        // transport's, via its own sever registry.
+        self.stop(transport, state);
+        let severed = self.sever_all_connections(transport).await;
+        // The tailnet `severed` audit line is preserved byte-for-byte (feature
+        // 013); the LAN transport's dormant/disable audit is added with the LAN
+        // audit surface (feature 014 T022).
+        if severed > 0 && transport == Transport::Tailnet {
             info!(
                 target: REMOTE_AUDIT_TARGET,
                 "remote: severed reason={}",
@@ -1306,18 +1948,19 @@ impl RemoteControl {
         }
     }
 
-    /// Fire the sever signal for every registered remote connection. Each signaled
-    /// connection drops out of its message loop, sends its best-effort
+    /// Fire the sever signal for every registered connection on `transport`. Each
+    /// signaled connection drops out of its message loop, sends its best-effort
     /// `ServerMessage::RemoteDisconnect`, runs the normal detach cleanup (owning
     /// sessions untouched, FR-016/FR-010), and closes — all on its own task, so a
-    /// wedged link cannot stall the others or this disable. Returns how many
-    /// connections were signaled (used to gate the bulk `severed` audit line).
-    async fn sever_all_connections(&self) -> usize {
+    /// wedged link cannot stall the others or this disable. Only the named
+    /// transport's connections are touched. Returns how many connections were
+    /// signaled (used to gate the bulk `severed` audit line).
+    async fn sever_all_connections(&self, transport: Transport) -> usize {
         // Drain the registry under the lock, then signal with the lock released so
         // nothing is held across the per-connection sends.
-        let severs: Vec<tokio::sync::oneshot::Sender<()>> = {
-            let mut conns = self.connections.lock().await;
-            std::mem::take(&mut *conns).into_values().collect()
+        let severs = {
+            let mut conns = self.transport_control(transport).connections.lock().await;
+            conns.drain_all()
         };
         let count = severs.len();
         for sever in severs {
@@ -1329,6 +1972,118 @@ impl RemoteControl {
             }
         }
         count
+    }
+
+    /// Fire the sever signal for every live LAN connection owned by `device_id`,
+    /// returning how many were signaled. The per-device counterpart to
+    /// [`sever_all_connections`](Self::sever_all_connections): it drains only the
+    /// matched connections from the LAN transport's `device_id -> connection-id`
+    /// index (T009) so a revoked device drops out of its message loop through the
+    /// normal detach path while every other connection and the owning sessions stay
+    /// live (FR-010, SC-006). Only the LAN transport carries a device index; the
+    /// tailnet transport is never consulted. The registry is drained under its lock
+    /// and each sever is sent with the lock released, mirroring
+    /// [`sever_all_connections`](Self::sever_all_connections).
+    async fn sever_device_connections(&self, device_id: &DeviceId) -> usize {
+        let severs = {
+            let mut conns = self.lan.connections.lock().await;
+            conns.drain_device(device_id)
+        };
+        let count = severs.len();
+        for sever in severs {
+            // Same harmless race as the bulk sever: a receiver whose serve task is
+            // already tearing down makes `send` return `Err`.
+            if sever.send(()).is_err() {
+                debug!("LAN revoke sever target already gone");
+            }
+        }
+        count
+    }
+}
+
+/// The LAN transport's supervisor-owned runtime, built lazily on first
+/// activation and carried across apply cycles (feature 014 T010). It holds the
+/// persistent per-install [`DeviceIdentity`] — materialized only when the LAN
+/// transport actually goes active, since generating/sealing it needs an
+/// interactive keyring (analysis I2) — and the active mDNS [`LanDiscovery`]
+/// handle, which is torn down (sending an mDNS goodbye) whenever the transport
+/// goes dormant. Lives in the [`remote_supervisor`] task, off the shared
+/// [`RemoteControl`], so nothing here is touched by the dispatch or accept paths.
+#[derive(Default)]
+struct LanRuntime {
+    /// The device identity, generated and keyring-sealed on first activation and
+    /// then kept for the process. `None` until the LAN transport first goes
+    /// active. Held in an `Arc` so the per-listener [`LanTls`] can share it
+    /// cheaply across every accepted connection's handshake.
+    identity: Option<Arc<DeviceIdentity>>,
+    /// The mDNS advertise + browse handle, present only while the transport is
+    /// active. Dropping it sends the mDNS goodbye and shuts the daemon down.
+    discovery: Option<LanDiscovery>,
+}
+
+impl LanRuntime {
+    /// Ensure the device identity exists, generating and sealing it on first use.
+    /// Fails closed (leaving `identity` `None`) when the state dir or keyring is
+    /// unavailable, so the caller keeps the LAN transport dormant.
+    async fn ensure_identity(&mut self) -> Result<(), crate::lan::identity::IdentityError> {
+        if self.identity.is_none() {
+            self.identity = Some(Arc::new(crate::lan::identity::load_or_generate().await?));
+        }
+        Ok(())
+    }
+
+    /// Advertise this machine on the LAN over mDNS with the bound physical-LAN
+    /// address(es), creating the discovery daemon on first use. Idempotent:
+    /// re-advertises with the supplied address set/port, so a live rebind refreshes
+    /// the advert. A no-op when the identity is not yet materialized or the mDNS
+    /// daemon cannot be created (logged; the listener still runs, discovery is a
+    /// convenience layer).
+    fn advertise(&mut self, addrs: &[IpAddr], port: u16) {
+        let Some(device_id_hex) = self.identity.as_ref().map(|identity| identity.device_id_hex())
+        else {
+            return;
+        };
+        if self.discovery.is_none() {
+            match LanDiscovery::new(device_id_hex.clone()) {
+                Ok(discovery) => self.discovery = Some(discovery),
+                Err(error) => {
+                    warn!(%error, "LAN mDNS discovery unavailable; not advertising");
+                    return;
+                }
+            }
+        }
+        let Some(discovery) = self.discovery.as_ref() else {
+            return;
+        };
+        let config = AdvertiseConfig {
+            device_id_hex,
+            host: local_hostname(),
+            addrs: addrs.to_vec(),
+            port,
+            protocol_version: scribe_common::protocol::REMOTE_PROTOCOL_VERSION,
+        };
+        if let Err(error) = discovery.start_advertising(&config) {
+            warn!(%error, "failed to advertise Scribe on the LAN");
+        }
+        if let Err(error) = discovery.start_browsing() {
+            warn!(%error, "failed to start LAN peer browsing");
+        }
+    }
+
+    /// Stop advertising and tear the mDNS daemon down when going dormant. Dropping
+    /// [`LanDiscovery`] sends the mDNS goodbye, aborts browsing, and shuts the
+    /// daemon down (see its `Drop`); the persistent device identity is retained for
+    /// the next activation.
+    fn stop_advertising(&mut self) {
+        self.discovery = None;
+    }
+
+    /// A read handle over the live `mDNS` peer table when discovery is active, for
+    /// the supervisor to publish into the shared [`RemoteControl`] (feature 014
+    /// T013). `None` when discovery has not been created (`mDNS` unavailable, or the
+    /// transport is not advertising), so the `ListLanPeers` handler reports no peers.
+    fn peer_handle(&self) -> Option<LanPeerHandle> {
+        self.discovery.as_ref().map(LanDiscovery::peer_handle)
     }
 }
 
@@ -1342,22 +2097,66 @@ impl RemoteControl {
 ///
 /// Both startup paths — a fresh `run_normal_server` and a post-upgrade
 /// `run_upgrade_receiver` — funnel through the same `run_server_loop`, so this
-/// supervisor also runs after a hot-reload handoff and re-derives the listener
-/// purely from config (feature 013 T032). A handoff carries no remote-listener
-/// or remote-connection state (see [`crate::handoff::HandoffState`]); the old
-/// server's remote TCP connections drop when it exits and the remote client
-/// auto-reconnects to the rebound listener (research D6).
+/// supervisor also runs after a hot-reload handoff and re-derives BOTH the
+/// tailnet and LAN listeners purely from config (feature 013 T032; feature 014
+/// T029). A handoff carries no remote/LAN listener or connection state, no
+/// device identity, and no trust stores (see [`crate::handoff::HandoffState`]):
+/// the LAN transport re-materializes its device identity from the keyring/disk
+/// via [`LanRuntime::ensure_identity`] and reads the trust stores that
+/// [`RemoteControl::new`] reloads from disk, so the keypair on disk/keyring need
+/// not cross the wire and the reconstituted server keeps the SAME pinned
+/// identity. The old server's remote/LAN connections drop when it exits and the
+/// client auto-reconnects to the rebound listener (research D6).
 pub async fn remote_supervisor(control: Arc<RemoteControl>, server: IpcServerState) {
-    let mut state = RemoteListenerState { running: None };
+    // One listener state per transport (feature 014): the tailnet and LAN
+    // listeners are reconciled independently each cycle so a change to one never
+    // disturbs the other.
+    let mut tailnet_state = RemoteListenerState { running: None };
+    let mut lan_state = RemoteListenerState { running: None };
+    // The LAN transport's lazily-built runtime (device identity + mDNS handle),
+    // owned by this task so the identity is only materialized once the LAN
+    // transport actually goes active.
+    let mut lan_runtime = LanRuntime::default();
+    // The trusted-networks store backs the LAN activation gate (`apply_lan`), the
+    // network-change watcher, AND the local-only add/remove/list handlers, so it
+    // lives on the shared `RemoteControl` (loaded from disk in `RemoteControl::new`,
+    // re-derived on a post-handoff start): a live add/remove and the gate observe
+    // ONE store, so removing the current network pokes a reload that goes dormant.
+    //
+    // Wire the network-change watcher to the supervisor: when the trusted-network
+    // status flips (a roam), it pokes a reload so `apply_lan` re-evaluates and the
+    // LAN transport goes dormant/active promptly — NOT only on a config reload
+    // (analysis C5, FR-018/SC-007). The `false` baseline is safe: a spurious first
+    // poke coalesces into the next apply, which is idempotent. Held for the life of
+    // the (never-returning) supervisor task.
+    let _network_watcher = {
+        let control_for_poke = Arc::clone(&control);
+        network::spawn_network_watcher(
+            Arc::clone(&control.trusted_networks),
+            network::DEFAULT_NETWORK_POLL_INTERVAL,
+            false,
+            move |_trusted_now| control_for_poke.request_reload(),
+        )
+    };
     loop {
         match crate::config::load_config() {
-            Ok(cfg) => control.apply(&mut state, &cfg.remote, &server).await,
+            Ok(cfg) => {
+                control.apply_tailnet(&mut tailnet_state, &cfg.remote, &server).await;
+                control
+                    .apply_lan(
+                        &mut lan_state,
+                        &cfg.remote.lan,
+                        &mut lan_runtime,
+                        LanSupervise { networks: &control.trusted_networks, server: &server },
+                    )
+                    .await;
+            }
             Err(e) => {
-                warn!("remote supervisor: config load failed ({e}); listener left unchanged");
+                warn!("remote supervisor: config load failed ({e}); listeners left unchanged");
             }
         }
-        // Wait for the next config change. `Notify` remembers a poke that arrives
-        // mid-apply, so no reload is missed.
+        // Wait for the next config change or network-trust flip. `Notify` remembers
+        // a poke that arrives mid-apply, so no reload is missed.
         control.reload.notified().await;
     }
 }
@@ -1387,7 +2186,8 @@ async fn remote_accept_loop(
                 // handler or reading a byte — so a flood of half-open dialers cannot
                 // spawn unbounded pre-auth work (mirrors `start_ipc_server`). Excess
                 // dialers are dropped immediately; the stream closes with the scope.
-                let Ok(handshake_permit) = Arc::clone(&control.handshake_limit).try_acquire_owned()
+                let Ok(handshake_permit) =
+                    Arc::clone(&control.tailnet.handshake_limit).try_acquire_owned()
                 else {
                     debug!(
                         %peer_addr,
@@ -1420,6 +2220,497 @@ async fn remote_accept_loop(
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         }
+    }
+}
+
+/// The supervisor-owned cross-cutting dependencies threaded into the LAN
+/// reconcile path beyond the listener state + config: the shared trusted-networks
+/// store and the IPC server state. Borrowed as one `Copy` handle so
+/// [`RemoteControl::apply_lan`] stays under Clippy's argument threshold (mirrors
+/// [`ConnState`]).
+#[derive(Clone, Copy)]
+struct LanSupervise<'a> {
+    networks: &'a SharedTrustedNetworks,
+    server: &'a IpcServerState,
+}
+
+/// One LAN listener generation's bind target — the port plus the physical-LAN
+/// addresses to bind. Bundled so [`RemoteControl::start_lan`] stays under
+/// Clippy's argument threshold.
+struct LanBind {
+    port: u16,
+    addrs: Vec<IpAddr>,
+}
+
+/// The per-connection LAN accept context (feature 014 T011): everything the
+/// accept loop + handler need to run a mutual-TLS handshake, gate approval, and
+/// hand off to [`serve_connection`]. Built once per listener generation by
+/// [`RemoteControl::lan_accept_context`] and cloned per accepted connection (all
+/// fields are `Arc`/`Clone`, so cloning is cheap). Bundled so the accept loop,
+/// handler, and gate stay under Clippy's argument threshold.
+#[derive(Clone)]
+struct LanAccept {
+    /// IPC server state threaded into the shared 013 dispatch and used to raise
+    /// the approval prompt on the owning machine's own local clients.
+    server: IpcServerState,
+    /// The remote-control supervisor handle: the LAN admission caps, sever
+    /// registry + `device_id` index, and the pending-approval + trusted-device
+    /// stores.
+    control: Arc<RemoteControl>,
+    /// The mutual-TLS layer presenting this device's cert and pinning peers by
+    /// `device_id` against the live trusted-device store.
+    lan_tls: Arc<LanTls>,
+    /// The trusted-networks store, read for the approval prompt's network label.
+    networks: SharedTrustedNetworks,
+}
+
+/// Adapts the shared trusted-device store to the TLS layer's [`DevicePins`]
+/// pin-check trait so the SPKI-pinning verifier classifies each handshaking peer
+/// as known vs. pending against the LIVE store — every approval/revoke visible on
+/// the next handshake with no rebind. The check is a single non-blocking store
+/// lookup that never spans an `.await`, honoring the trait's synchronous-handshake
+/// contract.
+struct TrustedDevicePins(SharedTrustedDevices);
+
+impl DevicePins for TrustedDevicePins {
+    fn is_pinned(&self, device_id: &DeviceId) -> bool {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_trusted(device_id)
+    }
+}
+
+/// Accept loop for one bound LAN (mutual-TLS) listener (feature 014 T011).
+/// Spawned per physical-LAN address by [`RemoteControl::start_lan`] and aborted
+/// on disable/dormancy or a rebind (dropping the listener + closing its socket).
+/// Every accepted stream reserves the LAN transport's OWN pending-handshake
+/// permit the instant it is accepted — before any TLS work — so a flood of
+/// half-open TLS dialers cannot spawn unbounded pre-auth tasks (mirrors the
+/// tailnet [`remote_accept_loop`]); the permit is held for the connection's life.
+async fn lan_accept_loop(listener: TcpListener, accept: LanAccept) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer_addr)) => {
+                // Reserve a LAN pending-handshake permit up front (analysis
+                // C4/S1); excess dialers are dropped as the stream closes.
+                let Ok(handshake_permit) =
+                    Arc::clone(&accept.control.lan.handshake_limit).try_acquire_owned()
+                else {
+                    debug!(
+                        %peer_addr,
+                        cap = LAN_PENDING_HANDSHAKE_CAP,
+                        "LAN pending-handshake admission cap reached; dropping connection"
+                    );
+                    continue;
+                };
+                // Match the local socket's latency profile for keystroke traffic
+                // and enable OS keepalive so a vanished peer is eventually torn
+                // down at the TCP layer (mirrors the tailnet accept loop).
+                if let Err(e) = stream.set_nodelay(true) {
+                    debug!(%peer_addr, "failed to set TCP_NODELAY on LAN connection: {e}");
+                }
+                enable_tcp_keepalive(&stream, peer_addr);
+                let accept = accept.clone();
+                tokio::spawn(async move {
+                    // `Box::pin` the large handshake future so it lives on the heap
+                    // rather than bloating this spawned task's stack frame.
+                    Box::pin(handle_lan_client(stream, peer_addr, accept)).await;
+                    drop(handshake_permit);
+                });
+            }
+            Err(e) => {
+                error!("LAN remote accept error: {e}");
+                // A network listener can surface persistent accept errors (e.g.
+                // EMFILE); a brief pause avoids a hot error loop.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+/// Whether the LAN device-approval gate cleared a connection to proceed to the
+/// version gate + attach, or refused it (the `LanApprovalResult` refusal has
+/// already been written, so the caller just closes).
+enum LanGate {
+    Proceed,
+    Refused,
+}
+
+/// Handle one accepted LAN (mutual-TLS) connection per contracts/lan-protocol.md.
+/// Sequence: `tokio-rustls` mutual handshake (SPKI-pinning verifier) → read the
+/// `LanHello` preamble → device-approval gate (a pinned device proceeds; an
+/// unknown device is held pending the owning user's explicit decision, revealing
+/// NO window/session data) → exact protocol-version gate → hand the encrypted
+/// stream to the shared 013 [`serve_connection`] dispatch with a bounded
+/// `ClientSink::Remote` queue and a `Remote(device label)` controller. The
+/// connection is registered in the LAN sever registry + `device_id` index so a
+/// per-device revoke / per-transport disable can sever just it (FR-010/FR-012). A
+/// failed TLS handshake or a malformed preamble closes bare (no channel to
+/// answer). The `lan: accepted`/`disconnect` audit lines are emitted by
+/// `serve_connection`; refusals log `lan: refused` here.
+async fn handle_lan_client(stream: TcpStream, peer_addr: SocketAddr, accept: LanAccept) {
+    // 1. Mutual-TLS handshake. A failure (reset, unparseable cert, bad handshake
+    //    signature) has no secure channel to answer on — close bare, no audit
+    //    (mirrors the tailnet bare-close on a malformed preamble).
+    let (tls_stream, peer) = match accept.lan_tls.accept(stream).await {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            debug!(%peer_addr, %error, "LAN TLS handshake failed; closing");
+            return;
+        }
+    };
+    let (mut reader, mut write_half) = tokio::io::split(tls_stream);
+
+    // 2. `LanHello` preamble (bounded + timed). A malformed / non-`LanHello` /
+    //    timed-out first frame closes bare.
+    let Some((device_name, client_version)) = read_lan_preamble(&mut reader).await else {
+        return;
+    };
+
+    // 3. Device-approval gate (contract step 4). A pinned device proceeds; an
+    //    unknown device is held pending the owning user's decision, revealing NO
+    //    data (SEC-001). A refusal is already written by the gate.
+    if let LanGate::Refused = lan_approval_gate(&accept, &peer, &device_name, &mut write_half).await
+    {
+        return;
+    }
+
+    // 4. Exact protocol-version gate (contract step 5, research D3).
+    if client_version != REMOTE_PROTOCOL_VERSION {
+        refuse_lan(&mut write_half, &device_name, LanRefusal::IncompatibleVersion).await;
+        return;
+    }
+
+    // 5. Connection cap — the LAN transport's OWN slot, wholly independent of
+    //    tailnet (analysis C4/S1). Held for the connection's life.
+    let Ok(permit) = Arc::clone(&accept.control.lan.conn_limit).try_acquire_owned() else {
+        refuse_lan(&mut write_half, &device_name, LanRefusal::Busy).await;
+        return;
+    };
+
+    // 6. Register the sever channel under the LAN `device_id` index BEFORE
+    //    admitting, re-checking the disable flag under the sever lock so a
+    //    connection that raced a live disable is refused (`Disabled`) instead of
+    //    admitted then silently dropped (FR-016; mirrors the tailnet path).
+    let (sever_tx, sever_rx) = tokio::sync::oneshot::channel();
+    let Some(conn_id) =
+        accept.control.register_connection(Transport::Lan, sever_tx, Some(peer.device_id)).await
+    else {
+        refuse_lan(&mut write_half, &device_name, LanRefusal::Disabled).await;
+        drop(permit);
+        return;
+    };
+
+    // 7. Admit: tell the dialer to proceed to `Hello`, then drive the shared 013
+    //    dispatch over the encrypted stream. The bounded output queue (T029) keeps
+    //    a slow LAN link off the fan-out hot path exactly as for tailnet.
+    if !send_lan_result(&mut write_half, true, None).await {
+        // The dialer vanished before it could be admitted; unwind the slot.
+        accept.control.deregister_connection(Transport::Lan, conn_id).await;
+        drop(permit);
+        return;
+    }
+    let (sink, drain_task) = spawn_remote_output(write_half, accept.server.clone());
+    let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Remote(sink.clone())));
+    let ctx = RemoteContext {
+        node_name: device_name,
+        login_name: String::new(),
+        audit: RemoteAudit::Lan { device_id_short: short_device_id(&peer.device_id) },
+        sever: sever_rx,
+    };
+    // `serve_connection`/`finish_served_connection` emit the `lan: accepted …` and
+    // `lan: disconnect …` audit lines via the `RemoteAudit::Lan` branch.
+    serve_connection(reader, writer, accept.server.clone(), Some(ctx)).await;
+    // Flush any final frame (e.g. the sever `RemoteDisconnect`), stop the drain
+    // task, then release the sever registration + connection slot.
+    shutdown_remote_output(&sink, drain_task).await;
+    accept.control.deregister_connection(Transport::Lan, conn_id).await;
+    drop(permit);
+}
+
+/// The LAN device-approval gate (contract step 4). A pinned device is already
+/// trusted and proceeds immediately. An unknown device reserves a bounded, timed
+/// pending-approval hold, tells the dialer it is waiting (`LanApprovalPending`),
+/// raises the prompt on the owning machine's own local client(s)
+/// (`LanApprovalRequest`), and holds with NO window/session data until the owning
+/// user decides or the hold times out. On approve it persists a `TrustedDevice`
+/// and proceeds; on decline/timeout (or a full pending cap) it writes the
+/// `LanApprovalResult` refusal and returns [`LanGate::Refused`].
+async fn lan_approval_gate<W>(
+    accept: &LanAccept,
+    peer: &PeerIdentity,
+    device_name: &str,
+    write_half: &mut W,
+) -> LanGate
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // A pinned device is already approved — straight to the version gate.
+    if peer.decision == PinDecision::Known {
+        return LanGate::Proceed;
+    }
+
+    // Unknown device: reserve a pending-approval hold. A full cap refuses `Busy`
+    // so unapproved dialers can neither accumulate holds nor occupy a slot across
+    // an unbounded human-decision window (analysis S1).
+    let ticket = match accept.control.pending_approvals.begin() {
+        Ok(ticket) => ticket,
+        Err(_cap_reached) => {
+            refuse_lan(write_half, device_name, LanRefusal::Busy).await;
+            return LanGate::Refused;
+        }
+    };
+    let request_id = ticket.request_id();
+
+    // Assemble the approval request from the completed handshake + advertised
+    // name. The network label is resolved off the async runtime (a rare
+    // first-pairing path); `name_collision` is an informational hint only.
+    let (network_label, network_id) = current_network_label(&accept.networks).await;
+    let name_collision = accept
+        .control
+        .trusted_devices
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .name_collision(device_name);
+    let request = ApprovalRequest {
+        device_id: peer.device_id,
+        cert_der: peer.cert_der.as_ref().to_vec(),
+        device_name: device_name.to_owned(),
+        network_label,
+        network_id,
+        name_collision,
+    };
+
+    // Tell the dialer it is waiting (FR-014, US2.5), then raise the prompt on the
+    // owning machine's own local client(s) — never over a remote transport.
+    if !send_lan_pending(write_half).await {
+        // The dialer vanished; the ticket drops here, releasing the hold.
+        return LanGate::Refused;
+    }
+    push_lan_approval_request(&accept.server, request_id, &request).await;
+
+    // Hold with NO data until the owning user decides or the hold times out.
+    match ticket.wait(APPROVAL_TIMEOUT).await {
+        ApprovalOutcome::Approved => {
+            persist_trusted_device(&accept.control, &request).await;
+            // Decision-axis audit line, paired with the `lan: accepted …` line the
+            // shared dispatch emits once a window is attached
+            // (contracts/settings-and-config.md Audit log surface).
+            info!(
+                target: REMOTE_AUDIT_TARGET,
+                "lan: approved device={device_name} id={} network={}",
+                short_device_id(&peer.device_id),
+                request.network_label
+            );
+            LanGate::Proceed
+        }
+        ApprovalOutcome::Declined | ApprovalOutcome::TimedOut => {
+            // Decision-axis audit line: an approval timeout collapses into the same
+            // `Declined` outcome the data-model state and the wire refusal use, so it
+            // is audited identically. The paired connection-axis line is the
+            // `lan: refused … reason=declined` that `refuse_lan` emits next.
+            info!(
+                target: REMOTE_AUDIT_TARGET,
+                "lan: declined device={device_name} id={}",
+                short_device_id(&peer.device_id)
+            );
+            refuse_lan(write_half, device_name, LanRefusal::Declined).await;
+            LanGate::Refused
+        }
+    }
+}
+
+/// Read the mandatory `LanHello` preamble as the first frame after the mutual-TLS
+/// handshake, bounded in size ([`REMOTE_PREAMBLE_MAX_BYTES`]) and time
+/// ([`REMOTE_HANDSHAKE_TIMEOUT`]) exactly as the tailnet preamble. Returns the
+/// peer's advertised display name + `remote_protocol_version`, or `None` for any
+/// oversized / malformed / non-`LanHello` / timed-out / EOF first frame (all
+/// close bare).
+async fn read_lan_preamble<R>(reader: &mut R) -> Option<(String, u32)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let read = read_bounded_handshake(reader);
+    match tokio::time::timeout(REMOTE_HANDSHAKE_TIMEOUT, read).await {
+        Ok(Ok(ClientMessage::LanHello { device_name, remote_protocol_version })) => {
+            Some((device_name, remote_protocol_version))
+        }
+        Ok(Ok(other)) => {
+            debug!(?other, "LAN first frame was not LanHello; closing");
+            None
+        }
+        Ok(Err(e)) => {
+            debug!("LAN preamble read failed: {e}");
+            None
+        }
+        Err(_) => {
+            debug!("LAN preamble timed out; closing");
+            None
+        }
+    }
+}
+
+/// Write `ServerMessage::LanApprovalPending` to the dialer (owning → connecting)
+/// so it can show a "waiting for approval on <peer>" state before any window data
+/// (FR-014). Returns whether the write landed; a dead link releases the hold.
+async fn send_lan_pending<W>(write_half: &mut W) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match write_message(write_half, &ServerMessage::LanApprovalPending).await {
+        Ok(()) => true,
+        Err(e) => {
+            debug!("failed to write LanApprovalPending: {e}");
+            false
+        }
+    }
+}
+
+/// Write the terminal `ServerMessage::LanApprovalResult` to the dialer: `approved
+/// = true` clears it to send `Hello`, otherwise `refusal` names the typed reason
+/// and the caller closes. Returns whether the write landed.
+async fn send_lan_result<W>(write_half: &mut W, approved: bool, refusal: Option<LanRefusal>) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let msg = ServerMessage::LanApprovalResult { approved, refusal };
+    match write_message(write_half, &msg).await {
+        Ok(()) => true,
+        Err(e) => {
+            debug!("failed to write LanApprovalResult: {e}");
+            false
+        }
+    }
+}
+
+/// Refuse a LAN dialer: write the typed `LanApprovalResult` refusal and emit the
+/// `lan: refused …` audit line (contracts/settings-and-config.md). The caller
+/// closes the connection afterward.
+async fn refuse_lan<W>(write_half: &mut W, device_name: &str, refusal: LanRefusal)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    send_lan_result(write_half, false, Some(refusal)).await;
+    info!(
+        target: REMOTE_AUDIT_TARGET,
+        "lan: refused device={device_name} reason={}",
+        audit_lan_refusal(refusal)
+    );
+}
+
+/// Canonical audit reason token for a LAN refusal, mirroring the wire
+/// [`LanRefusal`] taxonomy exactly (contracts/settings-and-config.md Audit log
+/// surface) so the log and the wire never drift.
+fn audit_lan_refusal(refusal: LanRefusal) -> &'static str {
+    match refusal {
+        LanRefusal::Declined => "declined",
+        LanRefusal::NotTrustedNetwork => "not-trusted-network",
+        LanRefusal::Disabled => "disabled",
+        LanRefusal::IncompatibleVersion => "version",
+        LanRefusal::Busy => "busy",
+    }
+}
+
+/// Canonical audit reason token for a LAN dormancy transition, mirroring the
+/// `lan: dormant reason=<network-untrusted|disabled>` taxonomy exactly
+/// (contracts/settings-and-config.md Audit log surface). Deliberately distinct
+/// from [`audit_lan_refusal`]'s `not-trusted-network` token — a refusal and a
+/// dormancy are different events with different reason vocabularies, so they do
+/// not share a token function and cannot silently drift.
+fn audit_dormant_reason(reason: LanDormantReason) -> &'static str {
+    match reason {
+        LanDormantReason::Disabled => "disabled",
+        LanDormantReason::NetworkUntrusted => "network-untrusted",
+    }
+}
+
+/// A short, log-friendly rendering of a pinned LAN `device_id` (the first 8 bytes
+/// as lowercase hex) for the `id=<short>` audit field — enough to disambiguate a
+/// handful of devices without printing the full 256-bit id.
+fn short_device_id(device_id: &DeviceId) -> String {
+    fn hex_digit(nibble: u8) -> char {
+        char::from(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 })
+    }
+    device_id
+        .iter()
+        .take(8)
+        .flat_map(|&byte| [hex_digit(byte >> 4), hex_digit(byte & 0x0f)])
+        .collect()
+}
+
+/// Resolve the trusted network a LAN request arrived on for the approval prompt
+/// (label + record id). The netdev fingerprint read is blocking, so it runs off
+/// the async runtime; a poisoned store or an unidentifiable network yields an
+/// empty label (the prompt still shows the device + fingerprint words).
+async fn current_network_label(networks: &SharedTrustedNetworks) -> (String, Option<String>) {
+    let networks = Arc::clone(networks);
+    let info = tokio::task::spawn_blocking(move || {
+        networks.lock().ok().and_then(|store| store.current_trusted_network())
+    })
+    .await
+    .ok()
+    .flatten();
+    match info {
+        Some(info) => (info.label, Some(info.id)),
+        None => (String::new(), None),
+    }
+}
+
+/// Persist an approved LAN device as a `TrustedDevice` pin (off the async runtime
+/// — the store write is blocking). A persistence failure is logged, not fatal:
+/// this connection is already approved for its lifetime; the device simply needs
+/// fresh approval next time.
+async fn persist_trusted_device(control: &Arc<RemoteControl>, request: &ApprovalRequest) {
+    let store = Arc::clone(&control.trusted_devices);
+    let request = request.clone();
+    match tokio::task::spawn_blocking(move || {
+        store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).approve(&request)
+    })
+    .await
+    {
+        Ok(Ok(_info)) => {}
+        Ok(Err(error)) => {
+            warn!(%error, "failed to persist approved LAN device; it will need re-approval");
+        }
+        Err(join_error) => warn!(%join_error, "LAN trusted-device persist task panicked"),
+    }
+}
+
+/// Push a `ServerMessage::LanApprovalRequest` to the owning machine's OWN local
+/// client(s) — the GUI answers the prompt, never the remote TLS stream. Only
+/// locally-controlled windows receive it (a remote peer must never see another
+/// device's pending approval), so it is refused over any remote transport by
+/// construction. The eventual `ClientMessage::LanApprovalDecision` correlates back
+/// by `request_id`.
+async fn push_lan_approval_request(
+    server: &IpcServerState,
+    request_id: u64,
+    request: &ApprovalRequest,
+) {
+    let msg = ServerMessage::LanApprovalRequest {
+        request_id,
+        device_name: request.device_name.clone(),
+        fingerprint_words: request.fingerprint_words(),
+        network_label: request.network_label.clone(),
+        name_collision: request.name_collision,
+    };
+    // Snapshot the local windows' writers under the canonical lock order
+    // (connected_clients → window_controllers), then send with no lock held.
+    let local_writers: Vec<SharedWriter> = {
+        let clients = server.connected_clients.read().await;
+        let controllers = server.window_controllers.read().await;
+        clients
+            .iter()
+            .filter(|(window_id, _)| {
+                matches!(controllers.get(window_id), Some(ControllerIdentity::Local))
+            })
+            .map(|(_, writer)| Arc::clone(writer))
+            .collect()
+    };
+    if local_writers.is_empty() {
+        debug!(request_id, "no local client to show the LAN approval prompt; awaiting timeout");
+        return;
+    }
+    for writer in &local_writers {
+        send_message(writer, &msg).await;
     }
 }
 
@@ -1477,7 +2768,9 @@ async fn handle_remote_client(
             // semantics). Registered before serving so even a pre-Hello connection
             // is signalable; deregistered once the connection is fully done.
             let (sever_tx, sever_rx) = tokio::sync::oneshot::channel();
-            let Some(conn_id) = control.register_connection(sever_tx).await else {
+            let Some(conn_id) =
+                control.register_connection(Transport::Tailnet, sever_tx, None).await
+            else {
                 send_handshake_reply(&mut write_half, Some(RemoteRefusal::Disabled)).await;
                 info!(
                     target: REMOTE_AUDIT_TARGET,
@@ -1500,13 +2793,14 @@ async fn handle_remote_client(
             let ctx = RemoteContext {
                 node_name: identity.node_name,
                 login_name: identity.login_name,
+                audit: RemoteAudit::Tailnet,
                 sever: sever_rx,
             };
             serve_connection(reader, writer, server, Some(ctx)).await;
             // Flush any final frame (e.g. the sever `RemoteDisconnect`) and stop the
             // drain task before releasing the connection slot.
             shutdown_remote_output(&sink, drain_task).await;
-            control.deregister_connection(conn_id).await;
+            control.deregister_connection(Transport::Tailnet, conn_id).await;
             // Release the connection-cap slot once the connection is fully done.
             drop(permit);
         }
@@ -1546,7 +2840,7 @@ async fn authorize_remote(
     client_version: u32,
 ) -> Result<(crate::tailnet::TailnetIdentity, tokio::sync::OwnedSemaphorePermit), RemoteReject> {
     // Disable race: `remote.enabled` flipped off between accept and here.
-    if !control.enabled.load(Ordering::SeqCst) {
+    if !control.tailnet.enabled.load(Ordering::SeqCst) {
         return Err(RemoteReject {
             refusal: RemoteRefusal::Disabled,
             peer_label: peer_addr.ip().to_string(),
@@ -1584,7 +2878,7 @@ async fn authorize_remote(
     }
 
     // Connection cap: reserve a slot, held for the connection's life.
-    match Arc::clone(&control.conn_limit).try_acquire_owned() {
+    match Arc::clone(&control.tailnet.conn_limit).try_acquire_owned() {
         Ok(permit) => Ok((identity, permit)),
         Err(_) => Err(RemoteReject {
             refusal: RemoteRefusal::Busy,
@@ -1821,7 +3115,11 @@ async fn serve_connection<R>(
     // Unix-socket connections carry neither.
     let (remote_identity, mut sever_rx) = match remote {
         Some(ctx) => (
-            Some(RemoteIdentity { node_name: ctx.node_name, login_name: ctx.login_name }),
+            Some(RemoteIdentity {
+                node_name: ctx.node_name,
+                login_name: ctx.login_name,
+                audit: ctx.audit,
+            }),
             Some(ctx.sever),
         ),
         None => (None, None),
@@ -1852,10 +3150,18 @@ async fn serve_connection<R>(
     };
 
     if let Some(id) = &remote_identity {
-        info!(
-            target: REMOTE_AUDIT_TARGET,
-            "remote: accepted peer={} user={} window={window_id}", id.node_name, id.login_name
-        );
+        match &id.audit {
+            // Feature 013 tailnet line, preserved byte-for-byte.
+            RemoteAudit::Tailnet => info!(
+                target: REMOTE_AUDIT_TARGET,
+                "remote: accepted peer={} user={} window={window_id}", id.node_name, id.login_name
+            ),
+            // Feature 014 LAN line (contracts/settings-and-config.md).
+            RemoteAudit::Lan { device_id_short } => info!(
+                target: REMOTE_AUDIT_TARGET,
+                "lan: accepted device={} id={device_id_short} window={window_id}", id.node_name
+            ),
+        }
     }
 
     let exit = run_client_message_loop(&mut reader, window_id, conn, sever_rx).await;
@@ -1881,10 +3187,18 @@ async fn finish_served_connection(
     detach_client_window(window_id, conn.server, conn.attached_ids, conn.writer).await;
 
     if let (Some(id), LoopExit::Disconnected) = (remote_identity, exit) {
-        info!(
-            target: REMOTE_AUDIT_TARGET,
-            "remote: disconnect peer={} window={window_id}", id.node_name
-        );
+        match &id.audit {
+            // Feature 013 tailnet line, preserved byte-for-byte.
+            RemoteAudit::Tailnet => info!(
+                target: REMOTE_AUDIT_TARGET,
+                "remote: disconnect peer={} window={window_id}", id.node_name
+            ),
+            // Feature 014 LAN line (contracts/settings-and-config.md).
+            RemoteAudit::Lan { .. } => info!(
+                target: REMOTE_AUDIT_TARGET,
+                "lan: disconnect device={} window={window_id}", id.node_name
+            ),
+        }
     }
 }
 
@@ -2049,6 +3363,17 @@ async fn establish_local_first_frame(
             handle_transient_list_remote_peers(writer).await;
             None
         }
+        ClientMessage::ListLanPeers => {
+            // Feature 014 T013 transient local-only action (contracts/lan-protocol
+            // Local-only helper messages): enumerate this machine's own mDNS-
+            // discovered LAN peers for the connect picker, reply once, close.
+            // Local-socket only by the same construction as `ListRemotePeers` — a
+            // non-Hello first frame is refused over any remote transport in
+            // `establish_client_window`, so a remote peer cannot read a third
+            // machine's LAN discovery view.
+            handle_transient_list_lan_peers(server, writer).await;
+            None
+        }
         ClientMessage::GetRemoteEnv => {
             // Feature 013 transient local-only action: report this machine's
             // signed-in tailnet account + whether Tailscale is detected for the
@@ -2057,6 +3382,68 @@ async fn establish_local_first_frame(
             // frame is refused over TCP in `establish_client_window`, so a remote
             // peer cannot read a third machine's tailnet identity.
             handle_transient_get_remote_env(writer).await;
+            None
+        }
+        ClientMessage::GetLanEnv => {
+            // Feature 014 transient local-only action (the LAN analog of
+            // `GetRemoteEnv`): report this machine's OWN device fingerprint and
+            // whether its current network can be trusted for the Settings → Remote
+            // "Local network" section, reply once, close. Read-only — it never
+            // generates the device identity (that happens on first LAN enable). Local-
+            // socket only by the same construction as `ListLanPeers` — a non-Hello
+            // first frame is refused over any remote transport in
+            // `establish_client_window`, so a remote peer cannot read a third
+            // machine's own identity fingerprint.
+            handle_transient_get_lan_env(writer).await;
+            None
+        }
+        ClientMessage::ListTrustedNetworks => {
+            // Feature 014 T021 transient local-only action (contracts/lan-protocol
+            // Local-only helper messages): report this machine's trusted networks
+            // and whether its current network is trusted, reply once, close. Local-
+            // socket only by the same construction as `ListLanPeers` — a non-Hello
+            // first frame is refused over any remote transport in
+            // `establish_client_window`.
+            handle_transient_list_trusted_networks(server, writer).await;
+            None
+        }
+        ClientMessage::AddCurrentNetworkTrusted => {
+            // Feature 014 T021 transient local-only mutation: trust the network this
+            // machine is currently on, then poke the supervisor so the enabled LAN
+            // transport can activate on the now-trusted network. Fire-and-forget —
+            // no reply frame (the settings UI re-queries the list/env afterward).
+            // Local-socket only by the same construction as `ListLanPeers`.
+            handle_transient_add_current_network(server).await;
+            None
+        }
+        ClientMessage::RemoveTrustedNetwork { id } => {
+            // Feature 014 T021 transient local-only mutation: remove a trusted
+            // network by id, then poke the supervisor so removing the CURRENT
+            // network takes the LAN surface dormant promptly (FR-018). Fire-and-
+            // forget — no reply frame. Local-socket only by the same construction
+            // as `ListLanPeers`.
+            handle_transient_remove_trusted_network(server, id).await;
+            None
+        }
+        ClientMessage::ListTrustedDevices => {
+            // Feature 014 T027 transient local-only action (contracts/lan-protocol
+            // Local-only helper messages): list this machine's approved LAN devices
+            // for the Settings → Remote "Local network" section, reply once, close.
+            // Local-socket only by the same construction as `ListLanPeers` — a
+            // non-Hello first frame is refused over any remote transport in
+            // `establish_client_window`, so a remote peer cannot read a third
+            // machine's trusted-device store.
+            handle_transient_list_trusted_devices(server, writer).await;
+            None
+        }
+        ClientMessage::RevokeTrustedDevice { device_id } => {
+            // Feature 014 T027 transient local-only mutation: revoke a trusted LAN
+            // device by its hex `device_id`, removing the pin and severing only that
+            // device's live LAN connection so it must re-approve next time (FR-010).
+            // Fire-and-forget — no reply frame (the settings UI refreshes the list
+            // afterward). Local-socket only by the same construction as
+            // `ListLanPeers`.
+            handle_transient_revoke_trusted_device(server, device_id).await;
             None
         }
         other => Some(handle_legacy_client(other, server, writer, attached_ids).await),
@@ -2108,6 +3495,77 @@ async fn handle_transient_list_remote_peers(writer: &SharedWriter) {
     send_message(writer, &ServerMessage::RemotePeerList { peers }).await;
 }
 
+/// Feature 014 T013: serve a transient `ListLanPeers` — this machine's own
+/// `mDNS`-discovered LAN peers for the connect picker, read from the supervisor's
+/// live discovery view published on the shared [`RemoteControl`]. Empty while the
+/// LAN transport is dormant or off (nothing is being browsed), so the picker
+/// falls back to manual `host:port` entry — mirroring the tailnet
+/// [`handle_transient_list_remote_peers`] empty-on-unavailable behavior. Never
+/// blocks local serving on discovery.
+async fn handle_transient_list_lan_peers(server: &IpcServerState, writer: &SharedWriter) {
+    info!("transient client requested LAN peer list");
+    let peers = server.remote_control.lan_peers();
+    send_message(writer, &ServerMessage::LanPeerList { peers }).await;
+}
+
+/// Feature 014 T021: serve a transient `ListTrustedNetworks` — this machine's
+/// trusted networks plus whether its CURRENT network is trusted, read from the
+/// shared trusted-networks store on the [`RemoteControl`] (the same store the
+/// supervisor's `apply_lan` gate and network-change watcher read). Local-socket
+/// only by construction — a non-`Hello` first frame is refused over any remote
+/// transport in `establish_client_window`, so a remote peer cannot read a third
+/// machine's trust state. Replies once and closes.
+async fn handle_transient_list_trusted_networks(server: &IpcServerState, writer: &SharedWriter) {
+    info!("transient client requested trusted network list");
+    let (networks, current_trusted) = server.remote_control.trusted_networks_snapshot().await;
+    send_message(writer, &ServerMessage::TrustedNetworkList { networks, current_trusted }).await;
+}
+
+/// Feature 014 T021: serve a transient `AddCurrentNetworkTrusted` — trust the
+/// network this machine is currently on and poke the supervisor so the enabled
+/// LAN transport can activate on the now-trusted network. Fire-and-forget: no
+/// reply frame (the settings UI re-issues the list/env queries afterward); a
+/// failure (an unidentifiable network) is logged server-side and pre-empted by
+/// the disabled "Add current network" control. Local-socket only by construction.
+async fn handle_transient_add_current_network(server: &IpcServerState) {
+    info!("transient client requested to trust the current network");
+    server.remote_control.add_current_trusted_network().await;
+}
+
+/// Feature 014 T021: serve a transient `RemoveTrustedNetwork` — remove a trusted
+/// network by id and poke the supervisor so removing the CURRENT network takes
+/// the LAN surface dormant promptly (tear the listener down, `mDNS` goodbye, sever
+/// only LAN connections; FR-018). Fire-and-forget: no reply frame (the settings
+/// UI refreshes the list afterward). Local-socket only by construction.
+async fn handle_transient_remove_trusted_network(server: &IpcServerState, id: String) {
+    info!("transient client requested to remove a trusted network");
+    server.remote_control.remove_trusted_network(id).await;
+}
+
+/// Feature 014 T027: serve a transient `ListTrustedDevices` — this machine's
+/// approved LAN devices for the Settings "Local network" trusted-devices list,
+/// read from the shared trusted-device pin store on the [`RemoteControl`] (the
+/// same store the accept path's approval gate writes and the revoke handler
+/// removes from). Local-socket only by construction — a non-`Hello` first frame
+/// is refused over any remote transport in `establish_client_window`, so a remote
+/// peer cannot read a third machine's trust state. Replies once and closes.
+async fn handle_transient_list_trusted_devices(server: &IpcServerState, writer: &SharedWriter) {
+    info!("transient client requested trusted device list");
+    let devices = server.remote_control.list_trusted_devices();
+    send_message(writer, &ServerMessage::TrustedDeviceList { devices }).await;
+}
+
+/// Feature 014 T027: serve a transient `RevokeTrustedDevice` — remove the pin for
+/// a trusted LAN device and sever ONLY that device's live LAN connection via the
+/// T009 `device_id -> connection-id` index, so it loses control at once and must
+/// re-approve on its next attempt (FR-010, SC-006). Fire-and-forget: no reply
+/// frame (the settings UI refreshes the list afterward). Local-socket only by
+/// construction.
+async fn handle_transient_revoke_trusted_device(server: &IpcServerState, device_id: String) {
+    info!("transient client requested to revoke a trusted device");
+    server.remote_control.revoke_trusted_device(device_id).await;
+}
+
 /// Feature 013: serve a transient `GetRemoteEnv` — this machine's signed-in
 /// tailnet account name and whether Tailscale is detected at all, for the
 /// Settings → Remote section (UX-003). Resolved from `LocalAPI` status. Any
@@ -2129,6 +3587,77 @@ async fn handle_transient_get_remote_env(writer: &SharedWriter) {
         }
     };
     send_message(writer, &ServerMessage::RemoteEnv { account, tailscale_detected }).await;
+}
+
+/// Feature 014: serve a transient `GetLanEnv` — this machine's OWN LAN identity
+/// fingerprint (Device ID hex + words, both `None` until the identity is
+/// generated on first LAN enable) plus whether the current network can be
+/// fingerprinted as a trusted network, for the Settings → Remote "Local network"
+/// section (FR-006, contracts/settings-and-config.md). READ-ONLY: it never mints
+/// the device identity — merely opening Settings must not create a key. Any local
+/// error (keyring unavailable, unidentifiable network) fails closed to identity
+/// `None` / not-addable so the settings window always renders one shape and never
+/// blocks. Local-socket only by the same construction as `GetRemoteEnv` — a
+/// non-`Hello` first frame is refused over any remote transport in
+/// `establish_client_window`, so a remote peer cannot read a third machine's own
+/// identity fingerprint. Replies once and closes.
+async fn handle_transient_get_lan_env(writer: &SharedWriter) {
+    info!("transient client requested LAN env");
+    let (device_id_hex, fingerprint_words) = match crate::lan::identity::own_fingerprint().await {
+        Ok(Some(fingerprint)) => {
+            (Some(fingerprint.device_id_hex), Some(fingerprint.fingerprint_words))
+        }
+        Ok(None) => (None, None),
+        Err(error) => {
+            debug!(%error, "own LAN fingerprint unavailable; reporting none");
+            (None, None)
+        }
+    };
+    // The `netdev` interface read is blocking, so resolve current-network
+    // addability off the async runtime. An unidentifiable network yields a short
+    // user-facing reason for the disabled "Add current network" control.
+    let (current_network_addable, current_network_reason) =
+        match tokio::task::spawn_blocking(network::current_network_fingerprint).await {
+            Ok(Ok(_fingerprint)) => (true, None),
+            Ok(Err(error)) => (false, Some(lan_network_addable_reason(error))),
+            Err(join_error) => {
+                debug!(%join_error, "LAN network-fingerprint task panicked; reporting not addable");
+                (false, None)
+            }
+        };
+    send_message(
+        writer,
+        &ServerMessage::LanEnv {
+            device_id_hex,
+            fingerprint_words,
+            current_network_addable,
+            current_network_reason,
+        },
+    )
+    .await;
+}
+
+/// Short, user-facing note for the disabled "Add current network" control when
+/// the current network cannot be fingerprinted as a trusted network — one concise
+/// sentence per fail-closed [`network::NetworkFingerprintError`]
+/// (contracts/settings-and-config.md). The settings webview falls back to a
+/// generic note if this is ever absent, so the copy stays a best-effort hint.
+fn lan_network_addable_reason(error: network::NetworkFingerprintError) -> String {
+    match error {
+        network::NetworkFingerprintError::NoDefaultRoute => {
+            "This machine isn't connected to a local network, so it can't be trusted."
+        }
+        network::NetworkFingerprintError::ZeroGatewayMac => {
+            "This network's router can't be identified yet — reconnect, then try again."
+        }
+        network::NetworkFingerprintError::VpnOnly => {
+            "Only a VPN or tunnel is active, not a physical local network, so it can't be trusted."
+        }
+        network::NetworkFingerprintError::NoUsableSubnet => {
+            "This network has no usable local subnet, so it can't be trusted."
+        }
+    }
+    .to_owned()
 }
 
 /// The connection-level inputs a `Hello` carries into the feature-013 claim
@@ -2238,7 +3767,8 @@ async fn handle_legacy_client(
     server.window_controllers.write().await.insert(window_id, ControllerIdentity::Local);
     info!(%window_id, "legacy client (no Hello), assigned window");
 
-    let mut context = ClientDispatchContext { server, writer, attached_ids, window_id };
+    let mut context =
+        ClientDispatchContext { server, writer, attached_ids, window_id, is_remote: false };
     dispatch_message(msg, &mut context).await;
     window_id
 }
@@ -2610,6 +4140,7 @@ where
             writer: conn.writer,
             attached_ids: conn.attached_ids,
             window_id,
+            is_remote,
         };
         dispatch_message(msg, &mut context).await;
     }
@@ -2807,8 +4338,29 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
             )
             .await;
         }
+        ClientMessage::LanApprovalDecision { request_id, approve } => {
+            handle_lan_approval_decision(context, request_id, approve);
+        }
         other => debug!(?other, "unhandled client message"),
     }
+}
+
+/// Deliver the owning user's decision on a pending LAN device approval
+/// (feature 014, contracts/lan-protocol.md). Local-socket only: the GUI answers
+/// the prompt, so a decision arriving over any remote transport (a peer past
+/// `Hello`) is IGNORED — a remote device must never approve another device's
+/// pending connection. Correlates by `request_id` via
+/// [`PendingApprovals::resolve`]; a stale/duplicate id is a harmless no-op.
+fn handle_lan_approval_decision(
+    context: &ClientDispatchContext<'_>,
+    request_id: u64,
+    approve: bool,
+) {
+    if context.is_remote {
+        debug!(request_id, "ignoring LanApprovalDecision from a remote connection");
+        return;
+    }
+    context.server.remote_control.pending_approvals.resolve(request_id, approve);
 }
 
 /// Route a `ClipboardCommand` to the originating session's PTY reader task.

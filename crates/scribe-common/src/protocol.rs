@@ -6,12 +6,19 @@ use crate::ai_state::{AiProcessState, AiProvider};
 use crate::hook;
 use crate::ids::{SessionId, WindowId, WorkspaceId};
 
-/// Version of the remote-only wire protocol (feature 013). Exchanged in the
-/// [`ClientMessage::RemoteHandshake`] preamble and gated by an exact-match
-/// check answered in [`ServerMessage::RemoteHandshakeReply`]; bump on ANY
-/// change to remote-visible message semantics. Never used on the local Unix
-/// socket, where client and server always ship together.
-pub const REMOTE_PROTOCOL_VERSION: u32 = 1;
+/// Version of the remote-only wire protocol. Exchanged in the tailnet
+/// [`ClientMessage::RemoteHandshake`] preamble (feature 013) and the LAN
+/// [`ClientMessage::LanHello`] preamble (feature 014), and gated by an
+/// exact-match check answered in [`ServerMessage::RemoteHandshakeReply`]
+/// (tailnet) or reported as [`LanRefusal::IncompatibleVersion`] inside
+/// [`ServerMessage::LanApprovalResult`] (LAN); bump on ANY change to
+/// remote-visible message semantics. Never used on the local Unix socket, where
+/// client and server always ship together.
+///
+/// Bumped to `2` for feature 014: the LAN device-approval and discovery/trust
+/// messages are additive under the same exact-match policy, so a 013-only peer
+/// and a 013+014 peer never interoperate over a remote transport.
+pub const REMOTE_PROTOCOL_VERSION: u32 = 2;
 
 /// OSC 52 operation type (spec 010 E2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,6 +427,77 @@ pub enum ClientMessage {
     /// non-`RemoteHandshake` first frame over TCP, so a remote peer can never
     /// read a third machine's tailnet identity. No fields.
     GetRemoteEnv,
+    /// Feature 014 LAN preamble — the FIRST frame a LAN (TLS) client sends once
+    /// the mutual-TLS handshake completes, before any `Hello`. NEVER sent on the
+    /// local Unix socket or the tailnet transport. Identity is the pinned TLS
+    /// client certificate (`device_id = SHA-256(SPKI)`), NOT this message; the
+    /// `device_name` is the peer's advertised display label only. Carries no
+    /// window or session data so the owning side can run the device-approval and
+    /// exact-match version gates before any state is revealed (SEC-001,
+    /// contracts/lan-protocol.md).
+    LanHello {
+        /// Peer's advertised display name (banner / approval prompt / audit).
+        device_name: String,
+        /// [`REMOTE_PROTOCOL_VERSION`] of the dialer; gated by exact match.
+        remote_protocol_version: u32,
+    },
+    /// Feature 014 local-only reply carrying the owning user's decision on a
+    /// pending LAN device approval. Sent by the OWNING machine's own local client
+    /// in response to a [`ServerMessage::LanApprovalRequest`], echoing its
+    /// `request_id`. Refused over any remote transport — the GUI, never the
+    /// remote TLS stream, answers the prompt (contracts/lan-protocol.md).
+    LanApprovalDecision {
+        /// Correlates with the originating [`ServerMessage::LanApprovalRequest`].
+        request_id: u64,
+        /// `true` writes a trusted device and proceeds; `false` refuses
+        /// ([`LanRefusal::Declined`]).
+        approve: bool,
+    },
+    /// Feature 014 local-only request: enumerate LAN peers discovered via mDNS on
+    /// the current network for the connect picker. Served from THIS machine's own
+    /// discovery view and refused (like any non-`LanHello` / non-`RemoteHandshake`
+    /// first frame) over a remote transport. Answered with exactly one
+    /// [`ServerMessage::LanPeerList`]. No fields.
+    ListLanPeers,
+    /// Feature 014 local-only request: list this machine's approved LAN devices
+    /// for the Settings → Remote "Local network" section. Answered with exactly
+    /// one [`ServerMessage::TrustedDeviceList`]. Local socket only. No fields.
+    ListTrustedDevices,
+    /// Feature 014 local-only request: revoke a trusted LAN device by its
+    /// hex-encoded `device_id` (the `device_id_hex` from [`TrustedDeviceInfo`]).
+    /// Removes the pin and severs only that device's live LAN connection, forcing
+    /// re-approval on the next attempt (FR-010). Local socket only.
+    RevokeTrustedDevice {
+        /// Lowercase hex of the 32-byte `device_id = SHA-256(SPKI)`.
+        device_id: String,
+    },
+    /// Feature 014 local-only request: list the user's trusted networks and
+    /// whether the current network is among them. Answered with exactly one
+    /// [`ServerMessage::TrustedNetworkList`]. Local socket only. No fields.
+    ListTrustedNetworks,
+    /// Feature 014 local-only request: mark the network the machine is currently
+    /// on as trusted (fingerprinted by gateway MAC + subnet). Acked, or errored
+    /// when the network cannot be fingerprinted (zero gateway MAC / VPN-only).
+    /// Local socket only. No fields.
+    AddCurrentNetworkTrusted,
+    /// Feature 014 local-only request: remove a trusted network by its record
+    /// `id` (the `id` from [`TrustedNetworkInfo`]). Removing the current network
+    /// makes the LAN surface go dormant. Local socket only.
+    RemoveTrustedNetwork {
+        /// The [`TrustedNetworkInfo`] record id to remove.
+        id: String,
+    },
+    /// Feature 014 local-only settings request: report this machine's LAN
+    /// environment for the Settings → Remote "Local network" section — this
+    /// device's OWN identity fingerprint (word list + hex) for the optional
+    /// out-of-band MITM compare (FR-006), and whether the CURRENT network can be
+    /// fingerprinted as a trusted network (drives the "Add current network"
+    /// control's enabled/disabled state and explanatory note). Served from THIS
+    /// machine's own view and refused as a non-`LanHello` / non-`RemoteHandshake`
+    /// first frame over any remote transport, exactly like [`GetRemoteEnv`], so a
+    /// remote peer can never read a third machine's identity. Answered with
+    /// exactly one [`ServerMessage::LanEnv`]. No fields.
+    GetLanEnv,
 }
 
 // ── Server → UI ──────────────────────────────────────────────────
@@ -727,6 +805,83 @@ pub enum ServerMessage {
         account: Option<String>,
         tailscale_detected: bool,
     },
+    /// Feature 014: owning → connecting notice that the LAN connection is held
+    /// pending device approval on the owning machine. MUST be sent before any
+    /// window data so the connecting client can show a "waiting for approval on
+    /// <peer>" state (FR-014, US2.5). No window or session data flows until a
+    /// [`ServerMessage::LanApprovalResult`] with `approved = true`
+    /// (contracts/lan-protocol.md). No fields.
+    LanApprovalPending,
+    /// Feature 014: owning → connecting terminal outcome of the LAN approval
+    /// gate. `approved = true` means proceed to `Hello`; `approved = false` means
+    /// refused, with `refusal` naming the typed [`LanRefusal`] reason (present
+    /// iff `!approved`). On refusal the server closes the connection after this
+    /// frame (contracts/lan-protocol.md).
+    LanApprovalResult {
+        approved: bool,
+        /// Present iff `!approved`; names the typed refusal reason.
+        #[serde(default)]
+        refusal: Option<LanRefusal>,
+    },
+    /// Feature 014: owning server → its OWN local client — an unknown LAN device
+    /// has completed the mutual-TLS handshake and is pending the user's approval.
+    /// Carries the peer's advertised name, identity fingerprint words, and the
+    /// trusted network it arrived on for the approval prompt; `name_collision` is
+    /// an informational hint (never a trust key) that an already-trusted device
+    /// shares this advertised name. Answered with
+    /// [`ClientMessage::LanApprovalDecision`] carrying the same `request_id`.
+    /// Local socket only — never sent over a remote transport.
+    LanApprovalRequest {
+        /// Correlates this push with the [`ClientMessage::LanApprovalDecision`].
+        request_id: u64,
+        /// Requesting device's advertised name (display only).
+        device_name: String,
+        /// The peer's identity fingerprint words (research D8).
+        fingerprint_words: String,
+        /// The trusted network the request arrived on.
+        network_label: String,
+        /// `true` when an already-trusted device shares this advertised name
+        /// (informational hint only).
+        name_collision: bool,
+    },
+    /// Feature 014 reply to [`ClientMessage::ListLanPeers`] — LAN peers discovered
+    /// via mDNS on the current network, for the connect picker. Local socket only.
+    LanPeerList {
+        peers: Vec<LanPeerInfo>,
+    },
+    /// Feature 014 reply to [`ClientMessage::ListTrustedDevices`] — this machine's
+    /// approved LAN devices for the Settings "Local network" section. Local
+    /// socket only.
+    TrustedDeviceList {
+        devices: Vec<TrustedDeviceInfo>,
+    },
+    /// Feature 014 reply to [`ClientMessage::ListTrustedNetworks`] — the user's
+    /// trusted networks and whether the current network is one of them
+    /// (`current_trusted` drives the active/dormant status line, UX-004). Local
+    /// socket only.
+    TrustedNetworkList {
+        networks: Vec<TrustedNetworkInfo>,
+        current_trusted: bool,
+    },
+    /// Feature 014 reply to [`ClientMessage::GetLanEnv`] — this machine's own LAN
+    /// environment for the Settings "Local network" section. `device_id_hex`
+    /// (lowercase hex of `device_id = SHA-256(SPKI)`) and `fingerprint_words`
+    /// are this machine's OWN identity, both absent until the identity has been
+    /// generated (first LAN enable). `current_network_addable` is `true` when the
+    /// network the machine is currently on can be fingerprinted as a trusted
+    /// network (non-zero gateway MAC, physical LAN, not VPN-only); when `false`,
+    /// `current_network_reason` carries the short note for the disabled "Add
+    /// current network" control. Any local error fails closed to identity `None`
+    /// with `current_network_addable = false`. Local socket only.
+    LanEnv {
+        #[serde(default)]
+        device_id_hex: Option<String>,
+        #[serde(default)]
+        fingerprint_words: Option<String>,
+        current_network_addable: bool,
+        #[serde(default)]
+        current_network_reason: Option<String>,
+    },
 }
 
 // ── Shared types ─────────────────────────────────────────────────
@@ -1013,6 +1168,85 @@ pub struct RemotePeerInfo {
     pub addr: String,
     /// Whether the peer is currently reachable; offline peers are greyed/omitted.
     pub online: bool,
+}
+
+/// Feature 014: canonical LAN-refusal taxonomy, mirroring 013's
+/// [`RemoteRefusal`] for the LAN transport. Carried in
+/// [`ServerMessage::LanApprovalResult`] `refusal` and the server audit log so
+/// refusal reasons never drift between the wire and the log. Each variant maps
+/// 1:1 to the distinct failure copy (contracts/settings-and-config.md). There is
+/// deliberately NO `IdentityChanged` variant: trust is keyed by
+/// `device_id = SHA-256(SPKI)`, so a reinstalled/rekeyed peer presents a new,
+/// unpinned `device_id` and is simply an unknown device requiring fresh approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LanRefusal {
+    /// The owning user declined the approval prompt (or it timed out).
+    Declined,
+    /// The owning machine raced leaving a trusted network (now dormant).
+    NotTrustedNetwork,
+    /// LAN access was turned off mid-handshake.
+    Disabled,
+    /// Exact [`REMOTE_PROTOCOL_VERSION`] match failed (both versions named).
+    IncompatibleVersion,
+    /// The LAN connection cap was reached.
+    Busy,
+}
+
+/// Feature 014: one LAN peer discovered via mDNS on the current network,
+/// resolved from THIS machine's own discovery view and carried in
+/// [`ServerMessage::LanPeerList`] for the connect picker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanPeerInfo {
+    /// mDNS instance / display name shown in the picker.
+    pub name: String,
+    /// Peer machine hostname (mDNS TXT `host`); the name-match key for
+    /// LAN↔tailnet dedup against the tailnet `MagicDNS` name.
+    pub host: String,
+    /// Resolved LAN address to dial (filtered to the current subnet).
+    pub addr: String,
+    /// Control port from the SRV record.
+    pub port: u16,
+    /// [`REMOTE_PROTOCOL_VERSION`] from TXT `protovers`; incompatible peers are
+    /// filtered before connecting.
+    pub protovers: u32,
+    /// Whether the peer is currently advertised; evicted peers are greyed/omitted.
+    pub online: bool,
+}
+
+/// Feature 014: one approved LAN device for the Settings "Local network"
+/// trusted-devices list, carried in [`ServerMessage::TrustedDeviceList`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedDeviceInfo {
+    /// Lowercase hex of the 32-byte `device_id = SHA-256(SPKI)`; the revoke key
+    /// echoed back in [`ClientMessage::RevokeTrustedDevice`].
+    pub device_id_hex: String,
+    /// Human label (the peer's advertised name at approval time).
+    pub label: String,
+    /// Word-list fingerprint for the list display (research D8).
+    pub fingerprint_words: String,
+    /// Approval time, Unix epoch milliseconds.
+    pub approved_at: u64,
+}
+
+/// Feature 014: one trusted network for the Settings "Local network"
+/// trusted-networks list, carried in [`ServerMessage::TrustedNetworkList`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedNetworkInfo {
+    /// Record id; the removal key echoed back in
+    /// [`ClientMessage::RemoveTrustedNetwork`].
+    pub id: String,
+    /// User-facing label (SSID when known, else a gateway-derived default).
+    pub label: String,
+    /// Normalized lowercase default-gateway MAC (the primary match anchor).
+    pub gateway_mac: String,
+    /// Local subnet in CIDR form (e.g. `192.168.1.0/24`; secondary corroborator).
+    pub subnet_cidr: String,
+    /// SSID display hint; `None` on wired links or where the OS withholds it.
+    #[serde(default)]
+    pub ssid: Option<String>,
+    /// When the network was trusted, Unix epoch milliseconds.
+    pub added_at: u64,
 }
 
 #[cfg(test)]

@@ -29,9 +29,11 @@ pub struct ScribeConfig {
     /// can fan it out to every PTY reader's
     /// [`crate::clipboard_state::ClipboardBurstState`] on each reload.
     pub clipboard_policy: ClipboardPolicyConfig,
-    /// Feature 013: opt-in Tailscale remote-control listener config. Threaded
-    /// through here so the config-reload path can start, stop, or rebind the
-    /// remote listener live — never a server restart.
+    /// Features 013/014: opt-in remote-control listener config. Carries both
+    /// the Tailscale `[remote]` listener (013) and the nested `[remote.lan]`
+    /// sub-config (014, reachable at `remote.lan`). Threaded through here so the
+    /// config-reload path can start, stop, or rebind each transport's listener
+    /// live — never a server restart.
     pub remote: RemoteConfig,
 }
 

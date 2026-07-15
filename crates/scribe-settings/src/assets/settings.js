@@ -73,6 +73,276 @@ function setRemoteEnv(env) {
   }
 }
 
+// ─────────── Local network (feature 014) ───────────
+//
+// The "Local network" section mirrors the Remote (013) pattern: the host owns
+// the runtime facts — this device's OWN identity fingerprint, the trusted
+// networks plus whether the current network is trusted, and the approved
+// devices — and pushes them by calling the setLan* functions via
+// evaluate_script after the webview requests them with a `lan_refresh` IPC
+// (sent when the Remote tab is opened, and re-sent by the host after a trust
+// mutation). The enable toggle and ports are plain config controls
+// (remote.lan.*) auto-wired by initToggles / initSteppers and rendered by
+// loadConfig.
+
+var lanEnvState = {
+  device_id_hex: null,
+  fingerprint_words: null,
+  current_network_addable: false,
+  current_network_reason: null
+};
+var lanCurrentTrusted = false;
+
+// env = { device_id_hex?, fingerprint_words?, current_network_addable?, current_network_reason? }
+function setLanEnv(env) {
+  var data = env || {};
+  lanEnvState = {
+    device_id_hex: typeof data.device_id_hex === "string" ? data.device_id_hex : null,
+    fingerprint_words: typeof data.fingerprint_words === "string" ? data.fingerprint_words : null,
+    current_network_addable: data.current_network_addable === true,
+    current_network_reason: typeof data.current_network_reason === "string" ? data.current_network_reason : null
+  };
+  renderLanFingerprint();
+  renderLanAddNetworkControl();
+}
+
+// payload = { networks: TrustedNetworkInfo[], current_trusted: boolean }
+function setTrustedNetworks(payload) {
+  var data = payload || {};
+  lanCurrentTrusted = data.current_trusted === true;
+  var networks = Array.isArray(data.networks) ? data.networks : [];
+  renderTrustedNetworks(networks);
+  renderLanAddNetworkControl();
+  updateLanStatusLine();
+}
+
+// payload = { devices: TrustedDeviceInfo[] }
+function setTrustedDevices(payload) {
+  var data = payload || {};
+  var devices = Array.isArray(data.devices) ? data.devices : [];
+  renderTrustedDevices(devices);
+}
+
+function lanIsEnabled() {
+  var toggle = document.querySelector(".toggle[data-key='remote.lan.enabled']");
+  return !!(toggle && toggle.classList.contains("on"));
+}
+
+// UX-004: active (enabled + on a trusted network) / dormant (enabled + network
+// not trusted) / off (disabled).
+function updateLanStatusLine() {
+  var statusEl = document.getElementById("lan-status");
+  var textEl = document.getElementById("lan-status-text");
+  if (!statusEl || !textEl) { return; }
+  statusEl.classList.remove("lan-status-off", "lan-status-dormant", "lan-status-active");
+  if (!lanIsEnabled()) {
+    statusEl.classList.add("lan-status-off");
+    textEl.textContent = "Local network access is off.";
+  } else if (lanCurrentTrusted) {
+    statusEl.classList.add("lan-status-active");
+    textEl.textContent = "Active — approved devices on this network can connect.";
+  } else {
+    statusEl.classList.add("lan-status-dormant");
+    textEl.textContent = "On, but this network isn't trusted — add it to connect locally.";
+  }
+}
+
+function formatLanTimestamp(ms) {
+  var n = Number(ms);
+  if (!isFinite(n) || n <= 0) { return ""; }
+  try {
+    return new Date(n).toLocaleString();
+  } catch (e) {
+    return "";
+  }
+}
+
+// Group a lowercase hex device id into uppercase 4-char blocks for readable
+// out-of-band comparison (contract: word list + grouped hex).
+function formatGroupedHex(hex) {
+  if (typeof hex !== "string" || hex.length === 0) { return ""; }
+  var groups = hex.toUpperCase().match(/.{1,4}/g);
+  return groups ? groups.join(" ") : hex.toUpperCase();
+}
+
+function renderLanFingerprint() {
+  var wordsEl = document.getElementById("lan-fingerprint-words");
+  var hexEl = document.getElementById("lan-fingerprint-hex");
+  if (!wordsEl || !hexEl) { return; }
+  if (lanEnvState.fingerprint_words) {
+    wordsEl.textContent = lanEnvState.fingerprint_words;
+    wordsEl.classList.remove("lan-fingerprint-pending");
+  } else {
+    wordsEl.textContent = "Available once Local network is enabled.";
+    wordsEl.classList.add("lan-fingerprint-pending");
+  }
+  hexEl.textContent = formatGroupedHex(lanEnvState.device_id_hex);
+}
+
+// "Add current network": enabled only when the current network can be
+// fingerprinted and isn't already trusted; otherwise disabled with an
+// explanatory note (contract: disabled + note when unidentifiable).
+function renderLanAddNetworkControl() {
+  var btn = document.getElementById("lan-add-network-btn");
+  var note = document.getElementById("lan-add-network-note");
+  if (!btn || !note) { return; }
+  if (lanCurrentTrusted) {
+    btn.disabled = true;
+    btn.textContent = "Current network already trusted";
+    note.classList.add("remote-hidden");
+    note.textContent = "";
+    return;
+  }
+  btn.textContent = "Add current network";
+  if (lanEnvState.current_network_addable) {
+    btn.disabled = false;
+    note.classList.add("remote-hidden");
+    note.textContent = "";
+  } else {
+    btn.disabled = true;
+    note.classList.remove("remote-hidden");
+    note.textContent = lanEnvState.current_network_reason
+      || "This network can't be identified (no router MAC, or a VPN-only link), so it can't be trusted.";
+  }
+}
+
+function renderTrustedNetworks(networks) {
+  var list = document.getElementById("lan-networks-list");
+  var empty = document.getElementById("lan-networks-empty");
+  if (!list) { return; }
+  // Drop previously-rendered items, keeping the static empty-state node.
+  list.querySelectorAll(".lan-item").forEach(function(el) { el.remove(); });
+  if (networks.length === 0) {
+    if (empty) { empty.classList.remove("remote-hidden"); }
+    return;
+  }
+  if (empty) { empty.classList.add("remote-hidden"); }
+  networks.forEach(function(net) {
+    var item = document.createElement("div");
+    item.className = "lan-item";
+
+    var main = document.createElement("div");
+    main.className = "lan-item-main";
+
+    var label = document.createElement("div");
+    label.className = "lan-item-label";
+    label.textContent = net.ssid ? (net.label + " (" + net.ssid + ")") : (net.label || "Network");
+    main.appendChild(label);
+
+    var meta = document.createElement("div");
+    meta.className = "lan-item-meta";
+    var parts = [];
+    if (net.subnet_cidr) { parts.push(net.subnet_cidr); }
+    var added = formatLanTimestamp(net.added_at);
+    if (added) { parts.push("added " + added); }
+    meta.textContent = parts.join(" · ");
+    main.appendChild(meta);
+
+    item.appendChild(main);
+
+    var remove = document.createElement("button");
+    remove.className = "lan-remove";
+    remove.type = "button";
+    remove.title = "Remove network";
+    remove.setAttribute("aria-label", "Remove network");
+    remove.setAttribute("data-id", net.id);
+    remove.textContent = "Remove";
+    item.appendChild(remove);
+
+    list.appendChild(item);
+  });
+}
+
+function renderTrustedDevices(devices) {
+  var list = document.getElementById("lan-devices-list");
+  var empty = document.getElementById("lan-devices-empty");
+  if (!list) { return; }
+  list.querySelectorAll(".lan-item").forEach(function(el) { el.remove(); });
+  if (devices.length === 0) {
+    if (empty) { empty.classList.remove("remote-hidden"); }
+    return;
+  }
+  if (empty) { empty.classList.add("remote-hidden"); }
+  devices.forEach(function(dev) {
+    var item = document.createElement("div");
+    item.className = "lan-item";
+
+    var main = document.createElement("div");
+    main.className = "lan-item-main";
+
+    var label = document.createElement("div");
+    label.className = "lan-item-label";
+    label.textContent = dev.label || "Unnamed device";
+    main.appendChild(label);
+
+    if (dev.fingerprint_words) {
+      var fp = document.createElement("div");
+      fp.className = "lan-item-fingerprint";
+      fp.textContent = dev.fingerprint_words;
+      main.appendChild(fp);
+    }
+
+    var meta = document.createElement("div");
+    meta.className = "lan-item-meta";
+    var approved = formatLanTimestamp(dev.approved_at);
+    meta.textContent = approved ? ("approved " + approved) : "";
+    main.appendChild(meta);
+
+    item.appendChild(main);
+
+    var revoke = document.createElement("button");
+    revoke.className = "lan-remove lan-revoke";
+    revoke.type = "button";
+    revoke.title = "Revoke device";
+    revoke.setAttribute("aria-label", "Revoke device");
+    revoke.setAttribute("data-device-id", dev.device_id_hex);
+    revoke.textContent = "Revoke";
+    item.appendChild(revoke);
+
+    list.appendChild(item);
+  });
+}
+
+function initLanRemote() {
+  var addBtn = document.getElementById("lan-add-network-btn");
+  if (addBtn) {
+    addBtn.addEventListener("click", function() {
+      if (addBtn.disabled) { return; }
+      sendHostAction("lan_add_current_network");
+    });
+  }
+
+  var networksList = document.getElementById("lan-networks-list");
+  if (networksList) {
+    networksList.addEventListener("click", function(e) {
+      var btn = e.target.closest(".lan-remove");
+      if (!btn) { return; }
+      var id = btn.getAttribute("data-id");
+      if (id) { sendHostAction("lan_remove_network", { id: id }); }
+    });
+  }
+
+  var devicesList = document.getElementById("lan-devices-list");
+  if (devicesList) {
+    devicesList.addEventListener("click", function(e) {
+      var btn = e.target.closest(".lan-revoke");
+      if (!btn) { return; }
+      var deviceId = btn.getAttribute("data-device-id");
+      if (deviceId) { sendHostAction("lan_revoke_device", { device_id: deviceId }); }
+    });
+  }
+
+  // Keep the status line in sync when the enable toggle flips. initToggles adds
+  // its own click listener (class swap + sendChange) first; this one runs after
+  // it and re-derives the status from the post-swap class.
+  var toggle = document.querySelector(".toggle[data-key='remote.lan.enabled']");
+  if (toggle) {
+    toggle.addEventListener("click", function() {
+      updateLanStatusLine();
+    });
+  }
+}
+
 function setPlatformVisibility(selector, shouldShow) {
   document.querySelectorAll(selector).forEach(function(el) {
     el.classList.toggle("platform-hidden", !shouldShow);
@@ -1489,6 +1759,14 @@ function initNavigation() {
           requestReleases();
         }
       }
+
+      // Feature 014: fetch the server-owned "Local network" state each time the
+      // Remote tab is opened so the current-network trust status, own
+      // fingerprint, and lists stay fresh across roaming. The host answers by
+      // calling the setLan* functions via evaluate_script.
+      if (target === "remote") {
+        sendHostAction("lan_refresh");
+      }
     });
   });
 
@@ -2104,6 +2382,11 @@ function loadConfig(config) {
   // Remote (feature 013)
   setToggleValue('remote.enabled', config.remote?.enabled ?? false);
   setStepperValue('remote.port', config.remote?.port ?? 46061);
+
+  // Remote — Local network (feature 014)
+  setToggleValue('remote.lan.enabled', config.remote?.lan?.enabled ?? false);
+  setStepperValue('remote.lan.port', config.remote?.lan?.port ?? 46062);
+  updateLanStatusLine();
 }
 
 // ─────────── Value Setters ───────────
@@ -2960,6 +3243,7 @@ document.addEventListener("DOMContentLoaded", function() {
   initNotificationActions();
   initUpdateActions();
   initReleasesPanel();
+  initLanRemote();
   initGlobalSearch();
   initKeybindingRecorder();
 

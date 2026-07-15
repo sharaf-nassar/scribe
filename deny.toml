@@ -61,6 +61,12 @@ ignore = [
   # Owner: Scribe maintainers. Review by 2026-08-01 or when cosmic-text/winit update.
   # ttf-parser unmaintained — transitive via cosmic-text/fontdb & winit/ab_glyph; no safe upgrade
   "RUSTSEC-2026-0192", # ttf-parser
+  # Owner: Scribe maintainers. Review by 2026-10-01 or when netdev's netlink
+  # backend (netlink-packet-core/netlink-packet-route) moves off the archived
+  # `paste` crate.
+  # paste unmaintained/archived, no safe upgrade — compile-time proc-macro,
+  # transitive via netdev (LAN trusted-network fingerprint, feature 014)
+  "RUSTSEC-2024-0436", # paste
 ]
 
 [bans]

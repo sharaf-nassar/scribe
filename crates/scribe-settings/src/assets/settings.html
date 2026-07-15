@@ -1641,7 +1641,7 @@
     <!-- ═══════ Remote Page ═══════ -->
     <div id="page-remote" class="content-page">
       <div class="page-title">Remote</div>
-      <div class="page-subtitle">Control this machine's windows from your other devices over Tailscale</div>
+      <div class="page-subtitle">Control this machine's windows from your other devices over Tailscale or your local network</div>
 
       <div class="section-group">
         <div class="section-label">Remote Control</div>
@@ -1668,17 +1668,96 @@
         </div>
       </div>
 
+      <!-- ─── Local network (feature 014) ─── -->
+      <div class="section-group">
+        <div class="section-label">Local Network</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Allow control from devices on trusted local networks</div>
+              <div class="setting-desc">Off by default. A separate opt-in from Tailscale, above. Dormant until you're on a trusted network.</div>
+            </div>
+            <div class="toggle off" data-key="remote.lan.enabled">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row remote-statement-row">
+            <div class="remote-statement">
+              When on, and while you're on a network you've marked trusted, your approved
+              devices on that network can find and control this machine's windows — no
+              Tailscale needed.
+            </div>
+          </div>
+          <div class="setting-row lan-status-row">
+            <div class="lan-status lan-status-off" id="lan-status">
+              <span class="lan-status-dot"></span>
+              <span class="lan-status-text" id="lan-status-text">Local network access is off.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Trusted Networks</div>
+        <div class="section-description">Networks where this machine accepts local connections, identified by your router and subnet.</div>
+        <div class="section-card">
+          <div id="lan-networks-list" class="lan-list">
+            <div class="lan-empty" id="lan-networks-empty">No trusted networks yet.</div>
+            <!-- Items populated by setTrustedNetworks -->
+          </div>
+          <div class="lan-add-row">
+            <button class="lan-add-btn" id="lan-add-network-btn" type="button" disabled>Add current network</button>
+            <div class="lan-add-note remote-hidden" id="lan-add-network-note"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Trusted Devices</div>
+        <div class="section-description">Devices you've approved to control this machine over the local network. Revoking ends any live connection and forces re-approval.</div>
+        <div class="section-card">
+          <div id="lan-devices-list" class="lan-list">
+            <div class="lan-empty" id="lan-devices-empty">No approved devices yet.</div>
+            <!-- Items populated by setTrustedDevices -->
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">This Device's Fingerprint</div>
+        <div class="section-description">Read this aloud to compare against the approval prompt shown on another machine — an optional check that the connection is genuine.</div>
+        <div class="section-card">
+          <div class="setting-row lan-fingerprint-row">
+            <div class="lan-fingerprint">
+              <div class="lan-fingerprint-words" id="lan-fingerprint-words">Available once Local network is enabled.</div>
+              <div class="lan-fingerprint-hex" id="lan-fingerprint-hex"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="section-group">
         <div class="section-label">Advanced</div>
         <div class="section-card">
           <div class="setting-row">
             <div class="setting-info">
-              <div class="setting-label">Port</div>
+              <div class="setting-label">Tailscale port</div>
               <div class="setting-desc">TCP port for the remote listener, bound only on your Tailscale addresses. Default 46061.</div>
             </div>
             <div class="number-control" data-key="remote.port" data-min="1024" data-max="65535" data-step="1">
               <div class="number-btn">&minus;</div>
               <div class="number-value">46061</div>
+              <div class="number-btn">+</div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Local network port</div>
+              <div class="setting-desc">TCP port for the local-network listener, bound only on your physical LAN address. Default 46062.</div>
+            </div>
+            <div class="number-control" data-key="remote.lan.port" data-min="1024" data-max="65535" data-step="1">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">46062</div>
               <div class="number-btn">+</div>
             </div>
           </div>

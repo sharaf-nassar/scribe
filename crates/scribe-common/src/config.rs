@@ -1945,16 +1945,53 @@ pub struct RemoteConfig {
     /// config-reload path; no server restart.
     #[serde(default = "default_remote_port")]
     pub port: u16,
+    /// The nested `[remote.lan]` sub-table (feature 014 — LAN remote window
+    /// control without Tailscale). A separate opt-in from the tailnet
+    /// `enabled`/`port` fields above; a missing `[remote.lan]` table
+    /// deserializes to [`LanRemoteConfig`] defaults (the LAN transport stays
+    /// off).
+    #[serde(default)]
+    pub lan: LanRemoteConfig,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
-        Self { enabled: false, port: default_remote_port() }
+        Self { enabled: false, port: default_remote_port(), lan: LanRemoteConfig::default() }
     }
 }
 
 fn default_remote_port() -> u16 {
     46061
+}
+
+/// The `[remote.lan]` TOML sub-table (feature 014 — LAN remote window control
+/// without Tailscale). Nested under [`RemoteConfig`]; a missing table
+/// deserializes to these defaults — the LAN transport stays fully off —
+/// because the field carries `#[serde(default)]` on [`RemoteConfig`]. This is a
+/// separate opt-in from the tailnet `[remote]` listener (FR-012).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanRemoteConfig {
+    /// Whether LAN remote window control is enabled. Default `false`: a
+    /// separate opt-in from the tailnet `[remote]` listener (FR-012). Even when
+    /// `true`, the LAN transport is dormant unless the machine is on a trusted
+    /// network (FR-018).
+    #[serde(default)]
+    pub enabled: bool,
+    /// TCP port for the LAN listener, bound on the physical LAN address only
+    /// (distinct from the tailnet `46061`). Rebound live on change via the
+    /// config-reload path; no server restart.
+    #[serde(default = "default_lan_port")]
+    pub port: u16,
+}
+
+impl Default for LanRemoteConfig {
+    fn default() -> Self {
+        Self { enabled: false, port: default_lan_port() }
+    }
+}
+
+fn default_lan_port() -> u16 {
+    46062
 }
 
 // ---------------------------------------------------------------------------

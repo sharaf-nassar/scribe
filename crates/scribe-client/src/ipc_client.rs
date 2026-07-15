@@ -17,11 +17,18 @@ use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
     AutomationAction, BridgeError, ClientMessage, ClipboardDecision, ClipboardOp,
-    ClipboardSelection, EnvStatusState, PromptId, PromptMarkKind, REMOTE_PROTOCOL_VERSION,
-    RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage, TerminalSize, UpdateProgressState,
-    WindowInfo, WorkspaceNotesCollection, WorkspaceNotesMutation,
+    ClipboardSelection, EnvStatusState, LanPeerInfo, LanRefusal, PromptId, PromptMarkKind,
+    REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal, SearchMatch, ServerMessage,
+    TerminalSize, UpdateProgressState, WindowInfo, WorkspaceNotesCollection,
+    WorkspaceNotesMutation,
 };
 use scribe_common::socket::{handoff_socket_path, server_socket_path};
+// Feature 014 (T015): the connecting client reuses the server's LAN device
+// identity + the SPKI-pinning mutual-TLS dialer rather than duplicating the
+// security-critical verifier. See the module-level follow-up note on
+// `start_lan_ipc_thread` about extracting these into a shared crate.
+use scribe_server::lan::identity;
+use scribe_server::lan::tls::{DeviceId, DevicePins, LanTls};
 use tokio::io::AsyncWriteExt as _;
 use winit::event_loop::EventLoopProxy;
 
@@ -103,6 +110,20 @@ pub enum ClientCommand {
     /// process never hosted. Polled only while `remote.enabled`; the reply is a
     /// [`ServerMessage::WindowList`] carrying per-window controller identity.
     ListWindows,
+    /// Feature 014 (T014): ask THIS machine's own server for the LAN peers it has
+    /// discovered via mDNS on the current network, to populate the connect
+    /// picker's "Local network" source. Local-Unix-socket only; the server refuses
+    /// it over any remote transport, exactly like [`Self::ListRemotePeers`].
+    ListLanPeers,
+    /// Feature 014 (T018): the owning user's decision on a pending LAN device
+    /// approval, echoing the `request_id` of the originating
+    /// [`ServerMessage::LanApprovalRequest`]. `approve = true` writes a
+    /// `TrustedDevice` and lets the held connection proceed; `approve = false`
+    /// refuses it ([`LanRefusal::Declined`](scribe_common::protocol::LanRefusal::Declined)).
+    /// Forwarded to THIS machine's own server as
+    /// [`ClientMessage::LanApprovalDecision`]; the server refuses it over any
+    /// remote transport (the GUI, never the remote TLS stream, answers the prompt).
+    LanApprovalDecision { request_id: u64, approve: bool },
 }
 
 /// Feature 013 (T009): typed outcome of a remote dial + preamble handshake,
@@ -123,6 +144,36 @@ pub enum RemoteConnectOutcome {
     /// The server answered with a typed refusal.
     Refused(RemoteRefusal),
     /// Connect refused/timed out, or the link closed before a reply arrived.
+    ConnectionFailure,
+}
+
+/// Feature 014 (T015): typed outcome of a LAN dial — the mutual-TLS handshake,
+/// the `LanHello` preamble, and the owning side's device-approval gate — handed
+/// to the connect flow as a [`UiEvent::LanDialOutcome`] before the link either
+/// becomes a normal session or is torn down. The LAN analogue of
+/// [`RemoteConnectOutcome`] (tailnet), differing only in that a refusal carries a
+/// [`LanRefusal`] (the LAN taxonomy: `Declined` / `NotTrustedNetwork` /
+/// `Disabled` / `IncompatibleVersion` / `Busy`) rather than a [`RemoteRefusal`].
+///
+/// The interim "held pending device approval" state is NOT an outcome — it is
+/// surfaced separately as [`UiEvent::LanAwaitingApproval`] the moment the peer
+/// sends [`ServerMessage::LanApprovalPending`], because the wait for the owning
+/// user's decision (up to the peer's approval timeout) precedes this terminal
+/// outcome (FR-014, contracts/lan-protocol.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanConnectOutcome {
+    /// Approved (or an already-trusted device): the peer sent
+    /// [`ServerMessage::LanApprovalResult`] with `approved = true`; the
+    /// connection now behaves exactly like any other remote one.
+    Accepted,
+    /// The peer refused with a typed [`LanRefusal`] (each variant maps 1:1 to
+    /// distinct UX-002 copy).
+    Refused(LanRefusal),
+    /// The TCP connect, the TLS handshake, or the framed exchange failed before a
+    /// terminal `LanApprovalResult` arrived — the deliberately-merged connection
+    /// failure (peer offline / asleep / not on this network / LAN disabled),
+    /// indistinguishable on a cold dial because a dormant peer leaves nothing
+    /// listening (contracts/settings-and-config.md).
     ConnectionFailure,
 }
 
@@ -309,8 +360,41 @@ pub enum UiEvent {
     /// Feature 013 (T030): the auto-reconnect loop exhausted its capped backoff
     /// without reaching the peer. The UI settles into the combined
     /// connection-failure state (offline / not running / disabled) with a
-    /// one-action reconnect (contracts Disable semantics, FR-004).
+    /// one-action reconnect (contracts Disable semantics, FR-004). The LAN
+    /// transport (feature 014) reuses this same transport-agnostic settle.
     RemoteReconnectFailed,
+    /// Feature 014 (T015): the LAN dial reached the owning peer over mutual TLS
+    /// but the connection is held pending the owning user's device approval — the
+    /// peer sent [`ServerMessage::LanApprovalPending`]. Drives the connecting
+    /// side's cancelable "Waiting for approval on <peer>…" overlay (FR-014,
+    /// US2.5); the terminal [`UiEvent::LanDialOutcome`] follows once the owning
+    /// user decides or the hold times out. The overlay + cancel wiring lands with
+    /// the picker/pending work (T019); until then the event loop's catch-all
+    /// ignores it.
+    LanAwaitingApproval,
+    /// Feature 014 (T015): terminal outcome of a LAN dial + TLS + approval gate,
+    /// delivered exactly once. The LAN analogue of [`UiEvent::RemoteDialOutcome`];
+    /// the connect flow (T014) drives the picker's success / typed-failure copy
+    /// from `outcome`. Until that lands the event loop's catch-all ignores it.
+    LanDialOutcome { outcome: LanConnectOutcome },
+    /// Feature 014 (T014): reply to a [`ClientCommand::ListLanPeers`] request —
+    /// this machine's mDNS-discovered LAN peers for the connect picker's "Local
+    /// network" source, merged with the tailnet [`Self::RemotePeerList`] by
+    /// machine name (T024). Emitted by the local-server dispatch below.
+    LanPeerList { peers: Vec<LanPeerInfo> },
+    /// Feature 014 (T018): an unknown LAN device has completed the mutual-TLS
+    /// handshake on THIS (owning) machine and is held pending the user's
+    /// approval, carried from [`ServerMessage::LanApprovalRequest`] over the local
+    /// socket. Drives the owning-side approval prompt (`lan_approval`), which
+    /// replies with a [`ClientCommand::LanApprovalDecision`] echoing `request_id`.
+    /// No window or session data flows until the user approves (SEC-001/002).
+    LanApprovalRequest {
+        request_id: u64,
+        device_name: String,
+        fingerprint_words: String,
+        network_label: String,
+        name_collision: bool,
+    },
 }
 
 /// Cancel switch for a remote window's auto-reconnect loop (feature 013, T030).
@@ -388,6 +472,29 @@ pub fn start_ipc_thread(proxy: EventLoopProxy<UiEvent>, window_id: Option<Window
         let reconnect_cancel = RemoteReconnectCancel::new();
         let dial = RemoteDial { host, port, window_id: remote_window, takeover };
         let commands = start_remote_ipc_thread(proxy, dial, reconnect_cancel.clone());
+        return IpcHandle { commands, reconnect_cancel: Some(reconnect_cancel) };
+    }
+
+    // Feature 014 (T015) plumbing hook: when `SCRIBE_LAN_DIAL` names a LAN peer
+    // (the resolved subnet address + LAN port a `ListLanPeers` entry carries),
+    // dial it over mutual TLS instead of the local Unix socket. Mirrors the
+    // `SCRIBE_REMOTE_DIAL` hook above so the LAN transport is exercisable before
+    // the "Local network" picker source (T014) lands; the reclaim/takeover claim
+    // reuses the transport-agnostic `SCRIBE_REMOTE_WINDOW` / `SCRIBE_REMOTE_TAKEOVER`
+    // markers. Unset (the default) keeps the local path byte-for-byte unchanged.
+    if let Some((host, port)) = lan_dial_target_from_env() {
+        let lan_window = remote_dial_window_from_env().or(window_id);
+        let takeover = remote_dial_takeover_from_env();
+        tracing::info!(
+            %host,
+            port,
+            ?lan_window,
+            takeover,
+            "SCRIBE_LAN_DIAL set; dialing LAN scribe-server over mutual TLS"
+        );
+        let reconnect_cancel = RemoteReconnectCancel::new();
+        let dial = LanDial { host, port, window_id: lan_window, takeover };
+        let commands = start_lan_ipc_thread(proxy, dial, reconnect_cancel.clone());
         return IpcHandle { commands, reconnect_cancel: Some(reconnect_cancel) };
     }
 
@@ -485,14 +592,21 @@ pub fn start_remote_ipc_thread(
 /// picker.
 fn remote_dial_target_from_env() -> Option<(String, u16)> {
     let raw = std::env::var("SCRIBE_REMOTE_DIAL").ok()?;
+    let default_port = scribe_common::config::RemoteConfig::default().port;
+    parse_dial_target(&raw, default_port)
+}
+
+/// Parse a `host` / `host:port` dial-target string shared by the plumbing hooks
+/// (`SCRIBE_REMOTE_DIAL`, feature 013; `SCRIBE_LAN_DIAL`, feature 014). Returns
+/// `None` when empty so the caller keeps the default local Unix-socket path.
+/// Splits on the FINAL colon only when the host carries no colon of its own, so a
+/// bare IPv6 literal falls through to `default_port` and is dialed verbatim (a
+/// `(host, port)` tuple resolves an unbracketed literal fine).
+fn parse_dial_target(raw: &str, default_port: u16) -> Option<(String, u16)> {
     let target = raw.trim();
     if target.is_empty() {
         return None;
     }
-    let default_port = scribe_common::config::RemoteConfig::default().port;
-    // Split on the final colon only when the host carries no colon of its own,
-    // so a bare IPv6 literal falls through to the default port and is dialed
-    // verbatim (a `(host, port)` tuple resolves an unbracketed literal fine).
     let (host, port) = match target.rsplit_once(':') {
         Some((host, port)) if !host.is_empty() && !host.contains(':') => {
             (host, port.parse::<u16>().unwrap_or(default_port))
@@ -500,6 +614,17 @@ fn remote_dial_target_from_env() -> Option<(String, u16)> {
         _ => (target, default_port),
     };
     Some((host.to_owned(), port))
+}
+
+/// Parse the optional `SCRIBE_LAN_DIAL` plumbing hook (`host` or `host:port`; the
+/// resolved LAN subnet address a `ListLanPeers` entry carries). Returns `None`
+/// when unset or empty so the default local Unix-socket path runs. The default
+/// port is the LAN listener port (46062), distinct from the tailnet 46061.
+/// Feature 014 (T015); superseded by the T014 "Local network" picker source.
+fn lan_dial_target_from_env() -> Option<(String, u16)> {
+    let raw = std::env::var("SCRIBE_LAN_DIAL").ok()?;
+    let default_port = scribe_common::config::LanRemoteConfig::default().port;
+    parse_dial_target(&raw, default_port)
 }
 
 /// Parse the optional `SCRIBE_REMOTE_WINDOW` claim target set by the connect
@@ -560,6 +685,17 @@ pub fn remote_dial_target() -> Option<(String, u16)> {
     remote_dial_target_from_env()
 }
 
+/// The LAN dial target of a remote-control client process, if this process was
+/// launched pointed at a LAN scribe-server over mutual TLS (feature 014, T015;
+/// `SCRIBE_LAN_DIAL`). The LAN analogue of [`remote_dial_target`], reused by the
+/// controlling-window reclaim / one-action reconnect (T016) so a LAN-attached
+/// window re-dials over the LAN transport, and by the status bar's transport
+/// indicator (T025). `None` on a tailnet-dialed or ordinary local client.
+#[must_use]
+pub fn lan_dial_target() -> Option<(String, u16)> {
+    lan_dial_target_from_env()
+}
+
 /// Send a `UiEvent` via the event loop proxy, logging if the event loop is gone.
 fn send_event(proxy: &EventLoopProxy<UiEvent>, event: UiEvent) {
     if proxy.send_event(event).is_err() {
@@ -617,6 +753,7 @@ fn dispatch_server_message(proxy: &EventLoopProxy<UiEvent>, message: ServerMessa
     let message = dispatch_session_message(proxy, message);
     let message = dispatch_workspace_message(proxy, message);
     let message = dispatch_control_message(proxy, message);
+    let message = dispatch_lan_approval_message(proxy, message);
     let message = dispatch_clipboard_message(proxy, message);
 
     if let Some(message) = message {
@@ -895,6 +1032,11 @@ fn dispatch_control_message(
             send_event(proxy, UiEvent::RemotePeerList { peers });
             None
         }
+        ServerMessage::LanPeerList { peers } => {
+            tracing::debug!(count = peers.len(), "received LanPeerList from local server");
+            send_event(proxy, UiEvent::LanPeerList { peers });
+            None
+        }
         ServerMessage::WindowList { windows } => {
             // Feature 013 (T022): the local server's window list, polled by the
             // owning-machine status bar to surface remote-controlled windows. The
@@ -902,6 +1044,46 @@ fn dispatch_control_message(
             // connection, so this arm only ever sees the local-server reply.
             tracing::debug!(count = windows.len(), "received WindowList from local server");
             send_event(proxy, UiEvent::LocalWindowList { windows });
+            None
+        }
+        other => Some(other),
+    }
+}
+
+/// Feature 014 (T018): route the owning-side LAN device-approval push
+/// ([`ServerMessage::LanApprovalRequest`], local socket only) into
+/// [`UiEvent::LanApprovalRequest`] so the main thread can raise the approval
+/// prompt. Kept out of [`dispatch_control_message`] so that routing function
+/// stays within its line budget.
+fn dispatch_lan_approval_message(
+    proxy: &EventLoopProxy<UiEvent>,
+    message: Option<ServerMessage>,
+) -> Option<ServerMessage> {
+    match message? {
+        ServerMessage::LanApprovalRequest {
+            request_id,
+            device_name,
+            fingerprint_words,
+            network_label,
+            name_collision,
+        } => {
+            tracing::info!(
+                request_id,
+                %device_name,
+                %network_label,
+                name_collision,
+                "received LanApprovalRequest from local server; raising approval prompt"
+            );
+            send_event(
+                proxy,
+                UiEvent::LanApprovalRequest {
+                    request_id,
+                    device_name,
+                    fingerprint_words,
+                    network_label,
+                    name_collision,
+                },
+            );
             None
         }
         other => Some(other),
@@ -1011,6 +1193,10 @@ fn command_to_message(cmd: ClientCommand) -> ClientMessage {
         }
         ClientCommand::ListRemotePeers => ClientMessage::ListRemotePeers,
         ClientCommand::ListWindows => ClientMessage::ListWindows,
+        ClientCommand::ListLanPeers => ClientMessage::ListLanPeers,
+        ClientCommand::LanApprovalDecision { request_id, approve } => {
+            ClientMessage::LanApprovalDecision { request_id, approve }
+        }
     }
 }
 
@@ -2147,22 +2333,45 @@ fn capture_assigned_window(message: &ServerMessage, assigned_window: &Mutex<Opti
     }
 }
 
-/// Drive one live remote session until the link drops or the UI closes the
-/// command channel (feature 013, T030). The read half runs on its own task (so
-/// `read_message` is never cancelled mid-frame — it is not cancel-safe); the
-/// write half drains the async command channel inline. `async_rx` is borrowed,
-/// not moved, so it is reused across reconnect attempts.
+/// Drive one live remote (tailnet TCP) session until the link drops or the UI
+/// closes the command channel (feature 013, T030). Splits the stream into owned
+/// halves and delegates to the transport-agnostic [`run_split_session`] so the
+/// tailnet and LAN (feature 014, T015) paths share one read/write loop.
 async fn run_remote_session(
     stream: tokio::net::TcpStream,
     async_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClientCommand>,
     proxy: &EventLoopProxy<UiEvent>,
     assigned_window: &Arc<Mutex<Option<WindowId>>>,
 ) -> RemoteSessionEnd {
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    run_split_session(reader, writer, async_rx, proxy, assigned_window).await
+}
+
+/// Drive one live remote session over already-split read/write halves — the
+/// shared core of both the tailnet TCP path ([`run_remote_session`]) and the LAN
+/// mutual-TLS path ([`run_lan_session`], feature 014, T015). Generic over the
+/// transport so an established LAN connection behaves byte-identically to a
+/// tailnet one after the preamble.
+///
+/// The read half runs on its own task (so `read_message` is never cancelled
+/// mid-frame — it is not cancel-safe); the write half drains the async command
+/// channel inline. `async_rx` is borrowed, not moved, so it is reused across
+/// reconnect attempts. The read config suppresses `ServerDisconnected` (the
+/// reconnect loop owns the link-drop decision) and captures the assigned window
+/// id for reconnect re-claim.
+async fn run_split_session<R, W>(
+    reader: R,
+    mut writer: W,
+    async_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClientCommand>,
+    proxy: &EventLoopProxy<UiEvent>,
+    assigned_window: &Arc<Mutex<Option<WindowId>>>,
+) -> RemoteSessionEnd
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     // `JoinHandle` is `Unpin`, so `&mut read_task` is a pollable future across
-    // loop iterations without pinning (mirrors the local `ipc_main` join). The
-    // remote config suppresses `ServerDisconnected` (the loop owns link-drop) and
-    // captures the assigned window id for reconnect re-claim.
+    // loop iterations without pinning (mirrors the local `ipc_main` join).
     let mut read_task = tokio::spawn(run_read_task(
         reader,
         proxy.clone(),
@@ -2450,6 +2659,465 @@ async fn remote_ipc_main(
     shutdown_command_bridge(async_rx, bridge).await;
 }
 
+// ── Feature 014 (T015): LAN dial over mutual TLS ─────────────────────────────
+//
+// The LAN transport reuses every transport-agnostic piece of the 013 remote
+// path — the command bridge, the read task, `run_split_session`, the capped
+// backoff/cancel helpers, and the reconnect UI events — and adds only the
+// LAN-specific dial: TCP → pinned mutual TLS → `LanHello` preamble → the owning
+// side's device-approval gate. An established LAN connection therefore behaves
+// byte-identically to a tailnet one after `Hello`.
+
+/// The dialer-side encrypted LAN stream once the mutual-TLS handshake completes.
+type LanStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
+
+/// Bundled parameters for a LAN dial: the peer's resolved LAN subnet address +
+/// LAN port, and the window claim to make once the approval gate admits us. The
+/// LAN analogue of [`RemoteDial`].
+pub struct LanDial {
+    host: String,
+    port: u16,
+    /// `None` creates a fresh window on the peer; `Some` claims an existing one.
+    window_id: Option<WindowId>,
+    /// Set only for explicit picker attach / lost-control reclaim, never on the
+    /// auto-reconnect path (FR-011).
+    takeover: bool,
+}
+
+/// Start the IPC client against a LAN scribe-server over mutual TLS, on a
+/// background thread (feature 014, T015).
+///
+/// The LAN analogue of [`start_remote_ipc_thread`]: same dedicated `std::thread`
+/// owning a single-threaded Tokio runtime, and the same read/write task loop once
+/// the link is established ([`run_split_session`]), but it dials `host:port` on
+/// the peer's LAN subnet address, wraps the TCP stream in pinned mutual TLS
+/// ([`LanTls`]), runs the `LanHello` preamble + owning-side device-approval gate,
+/// and only then sends `Hello`. Strictly connect-only — like the tailnet path it
+/// NEVER starts, refreshes, or upgrades the peer's server. The dial result, the
+/// interim "held pending approval" state, and any reconnect surface to the UI as
+/// [`UiEvent::LanDialOutcome`] / [`UiEvent::LanAwaitingApproval`] / the reused
+/// reconnect events; once accepted every other event is identical to a tailnet
+/// session.
+///
+/// FOLLOW-UP — does the client need its own device-identity module? Effectively
+/// yes. This reuses the SERVER-owned `scribe_server::lan::{identity, tls}` by
+/// depending on the whole `scribe-server` crate: DRY (no duplicated SPKI-pinning
+/// verifier, signature delegation, or keyring sealing) and it gives the dialer a
+/// STABLE `device_id` across dials — the basis for remembered approval (US2) —
+/// but it is architecturally heavy and inverts the client→server layering.
+/// Recommended follow-up (do not block T015): extract `lan::{identity, tls}` (+
+/// the `env_store::keystore` wrapper + `DevicePins` / `DeviceId`) into a shared
+/// crate (e.g. `scribe-lan`) so the client links only the LAN identity/TLS
+/// surface, and decide client key provisioning — direct keyring load (as here)
+/// vs. a local-socket `GetLanIdentity`-style query to this machine's own server,
+/// and whether the connecting side may MINT the identity or must only LOAD one
+/// the (interactive, keyring-backed) owning side already generated.
+pub fn start_lan_ipc_thread(
+    proxy: EventLoopProxy<UiEvent>,
+    dial: LanDial,
+    cancel: RemoteReconnectCancel,
+) -> mpsc::Sender<ClientCommand> {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCommand>();
+    // As on the tailnet path, `Hello` is NOT pre-queued: the `LanHello` preamble
+    // + approval gate must precede it, and `lan_ipc_main` owns that ordering,
+    // draining commands over one bridge for the whole (multi-attempt) lifetime.
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!(error = %error, "failed to create tokio runtime for LAN IPC");
+                send_event(
+                    &proxy,
+                    UiEvent::LanDialOutcome { outcome: LanConnectOutcome::ConnectionFailure },
+                );
+                return;
+            }
+        };
+        rt.block_on(lan_ipc_main(proxy, cmd_rx, dial, cancel));
+    });
+    cmd_tx
+}
+
+/// The connecting side keeps no trusted-*server* pin store in v1: device approval
+/// and trust are owning-side (the LAN listener gates the dialer, not the reverse),
+/// so the dialer's reused [`ServerCertVerifier`](rustls::client::danger::ServerCertVerifier)
+/// only has to encrypt the link and prove the peer holds its key (the delegated,
+/// never-stubbed handshake-signature check in `scribe_server::lan::tls`). This pin
+/// set therefore classifies every server as first-seen; the classification is
+/// recorded by the verifier but unused on the dial side.
+struct NoServerPins;
+
+impl DevicePins for NoServerPins {
+    fn is_pinned(&self, _device_id: &DeviceId) -> bool {
+        false
+    }
+}
+
+/// Load this machine's persistent device identity (the keyring-sealed Ed25519
+/// cert minted on first LAN use) and build the mutual-TLS dialer that presents it
+/// behind the SPKI-pinning verifier (feature 014, T015). Reuses the server's
+/// `load_or_generate` + [`LanTls`] so the connecting side presents a STABLE
+/// `device_id` (remembered approval, US2) and the security-critical verifier lives
+/// in one place. Fails closed (keyring unavailable / no state dir) exactly as the
+/// owning side does; the caller maps that to a `ConnectionFailure` outcome.
+async fn build_lan_tls() -> Result<LanTls, identity::IdentityError> {
+    let device_identity = identity::load_or_generate().await?;
+    Ok(LanTls::new(Arc::new(device_identity), Arc::new(NoServerPins)))
+}
+
+/// The invariant target of a LAN dial for the whole (multi-attempt) lifetime: the
+/// pinned mutual-TLS dialer plus the peer's LAN address. Grouped so the dial /
+/// reconnect helpers stay within the argument budget and the target travels as
+/// one unit (mirrors how [`RemoteDial`] groups the tailnet target).
+struct LanDialer {
+    lan_tls: LanTls,
+    host: String,
+    port: u16,
+}
+
+/// Dial the peer over TCP (reusing [`connect_remote`]'s timeout + `TCP_NODELAY`)
+/// and complete the pinned mutual-TLS handshake. Returns the encrypted stream, or
+/// `None` on any connect / handshake failure (both merge into the connecting
+/// side's `ConnectionFailure` outcome, FR-004).
+async fn lan_tls_connect(dialer: &LanDialer) -> Option<LanStream> {
+    let tcp = match connect_remote(&dialer.host, dialer.port).await {
+        Ok(tcp) => tcp,
+        Err(error) => {
+            tracing::warn!(host = %dialer.host, port = dialer.port, %error, "LAN TCP dial failed");
+            return None;
+        }
+    };
+    match dialer.lan_tls.connect(tcp).await {
+        Ok((stream, _peer)) => {
+            tracing::info!(host = %dialer.host, port = dialer.port, "LAN mutual TLS established");
+            Some(stream)
+        }
+        Err(error) => {
+            tracing::warn!(
+                host = %dialer.host,
+                port = dialer.port,
+                %error,
+                "LAN mutual TLS handshake failed"
+            );
+            None
+        }
+    }
+}
+
+/// Run the LAN preamble on a freshly established mutual-TLS stream: send
+/// [`ClientMessage::LanHello`], then read the owning side's approval-gate frames
+/// until a terminal [`ServerMessage::LanApprovalResult`]. An unknown device is
+/// first told it is waiting ([`ServerMessage::LanApprovalPending`]) — surfaced via
+/// `pending_sink` as [`UiEvent::LanAwaitingApproval`] — and the read blocks (no
+/// timeout of our own) until the owning user decides or the peer's approval hold
+/// times out; an already-trusted device is admitted straight to
+/// `LanApprovalResult { approved: true }` with no pending frame. Every terminal
+/// condition maps to a [`LanConnectOutcome`]: accepted, a typed [`LanRefusal`], or
+/// — for an EOF / I/O error / unexpected frame / reason-less refusal — the merged
+/// [`LanConnectOutcome::ConnectionFailure`]. `pending_sink` is `None` on the
+/// auto-reconnect path (a background reattach never raises the overlay; a trusted
+/// device never gets a pending frame anyway).
+async fn lan_handshake<S>(
+    stream: &mut S,
+    device_name: String,
+    pending_sink: Option<&EventLoopProxy<UiEvent>>,
+) -> LanConnectOutcome
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let preamble =
+        ClientMessage::LanHello { device_name, remote_protocol_version: REMOTE_PROTOCOL_VERSION };
+    if let Err(error) = write_message(stream, &preamble).await {
+        tracing::warn!(%error, "failed to send LAN hello preamble");
+        return LanConnectOutcome::ConnectionFailure;
+    }
+
+    loop {
+        match read_message::<ServerMessage, _>(stream).await {
+            Ok(ServerMessage::LanApprovalPending) => {
+                tracing::info!("LAN connection held pending device approval on peer");
+                if let Some(proxy) = pending_sink {
+                    send_event(proxy, UiEvent::LanAwaitingApproval);
+                }
+                // Keep reading: the terminal `LanApprovalResult` follows the owning
+                // user's decision (or the peer's approval timeout).
+            }
+            Ok(ServerMessage::LanApprovalResult { approved: true, .. }) => {
+                tracing::info!("LAN device approval accepted");
+                return LanConnectOutcome::Accepted;
+            }
+            Ok(ServerMessage::LanApprovalResult { approved: false, refusal: Some(reason) }) => {
+                tracing::info!(?reason, "LAN device approval refused");
+                return LanConnectOutcome::Refused(reason);
+            }
+            Ok(ServerMessage::LanApprovalResult { approved: false, refusal: None }) => {
+                // A refusal with no reason is a protocol violation; treat it as a
+                // generic connection failure rather than inventing a cause.
+                tracing::warn!("LAN approval refused without a reason");
+                return LanConnectOutcome::ConnectionFailure;
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    ?other,
+                    "unexpected frame during LAN approval; expected LanApprovalResult"
+                );
+                return LanConnectOutcome::ConnectionFailure;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "LAN peer closed before an approval result");
+                return LanConnectOutcome::ConnectionFailure;
+            }
+        }
+    }
+}
+
+/// Run the initial LAN connect + TLS + `LanHello` + approval gate + `Hello`,
+/// reporting the typed [`UiEvent::LanDialOutcome`] exactly once. Returns the live
+/// stream on acceptance, or `None` when the dial failed / was refused / the Hello
+/// write failed / the user cancelled — each already surfaced to the UI.
+///
+/// Unlike the tailnet initial dial, the `LanHello`/approval exchange is raced
+/// against a Cancel: the owning user's decision can take up to the peer's approval
+/// timeout, so the "Waiting for approval…" overlay is cancelable. A Cancel drops
+/// the half-open TLS stream and emits no outcome (the UI settles the cancel
+/// itself, mirroring the reconnect race, FR-011).
+async fn connect_and_attach_lan_initial(
+    dialer: &LanDialer,
+    window_id: Option<WindowId>,
+    takeover: bool,
+    proxy: &EventLoopProxy<UiEvent>,
+    cancel: &RemoteReconnectCancel,
+) -> Option<LanStream> {
+    let Some(mut stream) = lan_tls_connect(dialer).await else {
+        send_event(
+            proxy,
+            UiEvent::LanDialOutcome { outcome: LanConnectOutcome::ConnectionFailure },
+        );
+        return None;
+    };
+
+    let outcome = tokio::select! {
+        biased;
+        () = wait_for_cancel(cancel) => return None,
+        outcome = lan_handshake(&mut stream, crate::read_hostname(), Some(proxy)) => outcome,
+    };
+    send_event(proxy, UiEvent::LanDialOutcome { outcome });
+    if outcome != LanConnectOutcome::Accepted {
+        // Refused or ConnectionFailure: terminal. No session traffic.
+        return None;
+    }
+
+    let hello = ClientMessage::Hello { window_id, clipboard_gating: true, takeover };
+    if let Err(error) = write_message(&mut stream, &hello).await {
+        tracing::warn!(%error, "failed to send Hello on accepted LAN connection");
+        send_event(proxy, UiEvent::ServerDisconnected);
+        return None;
+    }
+    Some(stream)
+}
+
+/// Drive one live LAN session: split the TLS stream into read/write halves and
+/// delegate to the shared [`run_split_session`] core (feature 014, T015). The LAN
+/// analogue of [`run_remote_session`].
+async fn run_lan_session(
+    stream: LanStream,
+    async_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClientCommand>,
+    proxy: &EventLoopProxy<UiEvent>,
+    assigned_window: &Arc<Mutex<Option<WindowId>>>,
+) -> RemoteSessionEnd {
+    let (reader, writer) = tokio::io::split(stream);
+    run_split_session(reader, writer, async_rx, proxy, assigned_window).await
+}
+
+/// Outcome of one in-flight LAN reconnect attempt, kept separate from the live
+/// stream so [`lan_reconnect_with_backoff`] can race the whole attempt against a
+/// Cancel. The LAN analogue of [`ReconnectAttempt`].
+enum LanReconnectAttempt {
+    /// Approved (already-trusted device) and `Hello { takeover: false }` sent.
+    /// Boxed because an established [`LanStream`] (a `rustls` connection state) is
+    /// far larger than the other variants (`clippy::large_enum_variant`).
+    Attached(Box<LanStream>),
+    /// The peer refused authoritatively (LAN disabled, revoked, version) — settle.
+    Refused(LanRefusal),
+    /// Connect / TLS / handshake / `Hello` failed — retry with backoff.
+    Failed,
+}
+
+/// Run one LAN reconnect attempt: connect + TLS + `LanHello`, then re-claim the
+/// SAME window with `Hello { takeover: false }` — the auto-reconnect path NEVER
+/// seizes control (FR-011). Emits NO UI events (`pending_sink` is `None`) so
+/// [`lan_reconnect_with_backoff`] can discard it on Cancel. A device that
+/// connected once is already trusted, so the approval gate admits it without a
+/// pending hold. The LAN analogue of [`try_reconnect_attempt`].
+async fn try_lan_reconnect_attempt(
+    dialer: &LanDialer,
+    window_id: Option<WindowId>,
+    attempt: u32,
+) -> LanReconnectAttempt {
+    let Some(mut stream) = lan_tls_connect(dialer).await else {
+        tracing::debug!(
+            host = %dialer.host,
+            port = dialer.port,
+            attempt,
+            "LAN reconnect attempt failed to establish TLS"
+        );
+        return LanReconnectAttempt::Failed;
+    };
+    match lan_handshake(&mut stream, crate::read_hostname(), None).await {
+        LanConnectOutcome::Accepted => {
+            let hello = ClientMessage::Hello { window_id, clipboard_gating: true, takeover: false };
+            match write_message(&mut stream, &hello).await {
+                Ok(()) => LanReconnectAttempt::Attached(Box::new(stream)),
+                Err(error) => {
+                    tracing::warn!(%error, attempt, "LAN reconnect Hello write failed");
+                    LanReconnectAttempt::Failed
+                }
+            }
+        }
+        LanConnectOutcome::Refused(reason) => LanReconnectAttempt::Refused(reason),
+        LanConnectOutcome::ConnectionFailure => LanReconnectAttempt::Failed,
+    }
+}
+
+/// Retry the LAN link with capped exponential backoff until it re-attaches, the
+/// user cancels, the peer refuses, or the attempt ceiling is hit (feature 014,
+/// T015). Reuses the transport-agnostic backoff / cancel helpers and reconnect UI
+/// events; the LAN analogue of [`reconnect_with_backoff`].
+///
+/// An authoritative refusal on reconnect settles into the combined
+/// connection-failure state ([`UiEvent::RemoteReconnectFailed`]) rather than
+/// spinning against a listener that is refusing us. The precise typed
+/// [`LanRefusal`] copy is surfaced on the INITIAL dial's `LanDialOutcome`; the
+/// reconnect path reuses the shared settle so it needs no separate LAN
+/// sever-event plumbing (that UX wiring lands with the picker/pending work,
+/// T014/T019).
+async fn lan_reconnect_with_backoff(
+    dialer: &LanDialer,
+    window_id: Option<WindowId>,
+    proxy: &EventLoopProxy<UiEvent>,
+    cancel: &RemoteReconnectCancel,
+) -> Option<LanStream> {
+    let mut attempt = 0u32;
+    loop {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        attempt += 1;
+        send_event(proxy, UiEvent::RemoteReconnecting { attempt });
+        if backoff_or_cancel(backoff_delay(attempt), cancel).await {
+            return None;
+        }
+        if cancel.is_cancelled() {
+            return None;
+        }
+
+        // Race the whole connect → TLS → handshake → `Hello` sequence against the
+        // cancel switch: a Cancel that fires while an attempt is in flight drops
+        // it (and its half-open stream) instead of completing and going live over
+        // a settled overlay (FR-011).
+        let outcome = tokio::select! {
+            biased;
+            () = wait_for_cancel(cancel) => return None,
+            outcome = try_lan_reconnect_attempt(dialer, window_id, attempt) => outcome,
+        };
+
+        match outcome {
+            LanReconnectAttempt::Attached(stream) => {
+                if cancel.is_cancelled() {
+                    return None;
+                }
+                send_event(proxy, UiEvent::RemoteReconnected);
+                return Some(*stream);
+            }
+            LanReconnectAttempt::Refused(reason) => {
+                tracing::info!(?reason, "LAN reconnect refused; settling");
+                send_event(proxy, UiEvent::RemoteReconnectFailed);
+                return None;
+            }
+            LanReconnectAttempt::Failed => {}
+        }
+
+        if attempt >= RECONNECT_MAX_ATTEMPTS {
+            send_event(proxy, UiEvent::RemoteReconnectFailed);
+            return None;
+        }
+    }
+}
+
+/// Async entry point for a LAN (mutual-TLS) connection, on the background
+/// thread's Tokio runtime (feature 014, T015). The LAN analogue of
+/// [`remote_ipc_main`].
+///
+/// Loads this machine's device identity + builds the pinned TLS dialer (failing
+/// closed to a `ConnectionFailure` outcome if the keyring is unavailable), dials
+/// `host:port`, runs the `LanHello` preamble + approval gate, reports the typed
+/// outcome, and — only on acceptance — sends `Hello` and drives one live session.
+/// When an established session's link drops it auto-reconnects with capped
+/// backoff, re-claiming the SAME window with `Hello { takeover: false }` (never
+/// seizing control). A clean command-channel close (window closing), a user
+/// Cancel, an authoritative refusal, or an exhausted backoff ends the thread. It
+/// never starts or upgrades the peer's server.
+async fn lan_ipc_main(
+    proxy: EventLoopProxy<UiEvent>,
+    cmd_rx: mpsc::Receiver<ClientCommand>,
+    dial: LanDial,
+    cancel: RemoteReconnectCancel,
+) {
+    let LanDial { host, port, window_id, takeover } = dial;
+
+    // Build the pinned mutual-TLS dialer from this machine's device identity. A
+    // fail-closed identity error (keyring unavailable / no state dir) becomes the
+    // combined connection-failure outcome — the connecting side cannot present a
+    // client certificate, so there is nothing to dial with.
+    let lan_tls = match build_lan_tls().await {
+        Ok(lan_tls) => lan_tls,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load LAN device identity; dial failed closed");
+            send_event(
+                &proxy,
+                UiEvent::LanDialOutcome { outcome: LanConnectOutcome::ConnectionFailure },
+            );
+            return;
+        }
+    };
+    // The invariant dial target (pinned TLS dialer + LAN address) for the whole
+    // (multi-attempt) lifetime; borrowed by the initial and reconnect helpers.
+    let dialer = LanDialer { lan_tls, host, port };
+
+    // Bridge the std command channel to an async one for the whole (multi-attempt)
+    // lifetime, so every (re)connect drains commands cancel-safely (as 013).
+    let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel::<ClientCommand>();
+    let bridge = spawn_command_bridge(cmd_rx, async_tx);
+
+    // The window a reconnect re-claims: the server-assigned id captured from the
+    // first `Welcome`, falling back to the dial target. Shared with the read task.
+    let assigned_window = Arc::new(Mutex::new(window_id));
+
+    let Some(stream) =
+        connect_and_attach_lan_initial(&dialer, window_id, takeover, &proxy, &cancel).await
+    else {
+        shutdown_command_bridge(async_rx, bridge).await;
+        return;
+    };
+
+    let mut end = run_lan_session(stream, &mut async_rx, &proxy, &assigned_window).await;
+
+    loop {
+        if matches!(end, RemoteSessionEnd::Stopped) || cancel.is_cancelled() {
+            break;
+        }
+        let reclaim_window = assigned_window.lock().ok().and_then(|slot| *slot).or(window_id);
+        match lan_reconnect_with_backoff(&dialer, reclaim_window, &proxy, &cancel).await {
+            Some(next_stream) => {
+                end = run_lan_session(next_stream, &mut async_rx, &proxy, &assigned_window).await;
+            }
+            None => break,
+        }
+    }
+
+    shutdown_command_bridge(async_rx, bridge).await;
+}
+
 /// Dial a peer over TCP only to enumerate its windows for the connect picker
 /// (feature 013, T014). Runs the remote preamble, sends a single `ListWindows`,
 /// forwards the resulting [`ServerMessage::WindowList`] as
@@ -2523,6 +3191,102 @@ async fn remote_list_windows_main(proxy: EventLoopProxy<UiEvent>, host: String, 
                 send_event(
                     &proxy,
                     UiEvent::RemoteDialOutcome { outcome: RemoteConnectOutcome::ConnectionFailure },
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Dial a LAN peer over mutual TLS only to enumerate its windows for the connect
+/// picker's second step (feature 014, T014) — the LAN analogue of
+/// [`start_remote_list_windows_thread`]. Runs the same TLS + `LanHello` +
+/// device-approval gate as a real LAN attach ([`lan_handshake`], reusing the T015
+/// dial building blocks), sends a single `ListWindows`, forwards the resulting
+/// [`ServerMessage::WindowList`] as [`UiEvent::RemoteWindowList`] (transport-
+/// neutral once past the gate), then drops the connection — it never claims a
+/// window. A held-pending-approval hold surfaces as [`UiEvent::LanAwaitingApproval`]
+/// (as on a real dial); every refusal / connect / TLS / EOF error surfaces as
+/// [`UiEvent::LanDialOutcome`] so the picker renders the same typed LAN copy as a
+/// real attach. Runs on its own short-lived `std::thread` + Tokio runtime.
+pub fn start_lan_list_windows_thread(proxy: EventLoopProxy<UiEvent>, host: String, port: u16) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "failed to create tokio runtime for LAN window probe"
+                );
+                send_event(
+                    &proxy,
+                    UiEvent::LanDialOutcome { outcome: LanConnectOutcome::ConnectionFailure },
+                );
+                return;
+            }
+        };
+        rt.block_on(lan_list_windows_main(proxy, host, port));
+    });
+}
+
+/// Body of the LAN window-list probe (feature 014, T014). See
+/// [`start_lan_list_windows_thread`].
+async fn lan_list_windows_main(proxy: EventLoopProxy<UiEvent>, host: String, port: u16) {
+    let lan_tls = match build_lan_tls().await {
+        Ok(lan_tls) => lan_tls,
+        Err(error) => {
+            tracing::warn!(%error, "LAN window probe could not load device identity");
+            send_event(
+                &proxy,
+                UiEvent::LanDialOutcome { outcome: LanConnectOutcome::ConnectionFailure },
+            );
+            return;
+        }
+    };
+    // Clone `host` into the dialer so the original params stay available for the
+    // `RemoteWindowList` reply below (they match the picker's stored dial target,
+    // so `set_windows` accepts it), avoiding a shadowing rebind.
+    let dialer = LanDialer { lan_tls, host: host.clone(), port };
+    let Some(mut stream) = lan_tls_connect(&dialer).await else {
+        send_event(
+            &proxy,
+            UiEvent::LanDialOutcome { outcome: LanConnectOutcome::ConnectionFailure },
+        );
+        return;
+    };
+
+    // Reuse the real dial's preamble + approval gate so an unknown device is held
+    // pending approval here too (`pending_sink = Some`), and a refusal maps to the
+    // same typed LAN copy in the picker.
+    let outcome = lan_handshake(&mut stream, crate::read_hostname(), Some(&proxy)).await;
+    if outcome != LanConnectOutcome::Accepted {
+        send_event(&proxy, UiEvent::LanDialOutcome { outcome });
+        return;
+    }
+
+    if let Err(error) = write_message(&mut stream, &ClientMessage::ListWindows).await {
+        tracing::warn!(%error, "failed to send ListWindows on LAN window probe");
+        send_event(
+            &proxy,
+            UiEvent::LanDialOutcome { outcome: LanConnectOutcome::ConnectionFailure },
+        );
+        return;
+    }
+
+    // Read until the WindowList arrives, ignoring any other frames the server may
+    // interleave; the connection drops as soon as we have the list.
+    loop {
+        match read_message::<ServerMessage, _>(&mut stream).await {
+            Ok(ServerMessage::WindowList { windows }) => {
+                send_event(&proxy, UiEvent::RemoteWindowList { host, port, windows });
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "LAN server closed before window list arrived");
+                send_event(
+                    &proxy,
+                    UiEvent::LanDialOutcome { outcome: LanConnectOutcome::ConnectionFailure },
                 );
                 return;
             }

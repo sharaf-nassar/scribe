@@ -1,13 +1,17 @@
-//! Feature 013 (T014/T018): the "Connect to remote machine…" flow.
+//! Feature 013 (T014/T018) + feature 014 (T014/T024): the "Connect to remote
+//! machine…" flow.
 //!
 //! Owns the command-palette-launched GPU overlay picker that lets a user reach
-//! a Scribe window on another of their tailnet machines. The flow has two
-//! forward steps plus a terminal failure step:
+//! a Scribe window on another of their machines over either transport — the 013
+//! tailnet path or the 014 direct-LAN path. The flow has two forward steps plus a
+//! terminal failure step:
 //!
-//! 1. **Peers** — same-account online peers reported by THIS machine's own
-//!    server via [`ClientMessage::ListRemotePeers`], shown by short name, plus a
-//!    manual `host:port` entry field (research D7, contracts/remote-protocol.md
-//!    Local helper messages).
+//! 1. **Peers** — the merged device list: same-account online tailnet peers
+//!    ([`ClientMessage::ListRemotePeers`], 013) and mDNS-discovered LAN peers
+//!    ([`ClientMessage::ListLanPeers`], 014), deduped by machine name so a
+//!    dual-reachable machine appears once with the direct LAN path preferred
+//!    (T024, a best-effort UX heuristic — NOT a trust identity), each row
+//!    labeled with its transport, plus a manual `host:port` entry field.
 //! 2. **Windows** — the chosen peer's windows (session counts + in-use marker)
 //!    plus a synthetic "New window" entry. Attaching sends
 //!    `Hello { window_id, takeover: true }`; "New window" sends
@@ -26,14 +30,16 @@
 
 use scribe_common::config::RemoteConfig;
 use scribe_common::ids::WindowId;
-use scribe_common::protocol::{RemotePeerInfo, RemoteRefusal, WindowInfo};
+use scribe_common::protocol::{
+    LanPeerInfo, LanRefusal, REMOTE_PROTOCOL_VERSION, RemotePeerInfo, RemoteRefusal, WindowInfo,
+};
 use scribe_common::theme::ChromeColors;
 use scribe_renderer::srgb_to_linear_rgba;
 use scribe_renderer::types::CellInstance;
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
-use crate::ipc_client::RemoteConnectOutcome;
+use crate::ipc_client::{LanConnectOutcome, RemoteConnectOutcome};
 use crate::layout::Rect;
 
 /// Minimum / maximum overlay width in grid columns; clamps the box to a
@@ -50,11 +56,43 @@ const MAX_GRID_UNITS: usize = 65_535;
 
 type GlyphResolver<'a> = dyn FnMut(char) -> ([f32; 2], [f32; 2]) + 'a;
 
+/// Which transport a merged peer row dials over (feature 014, T024). A UX label
+/// and a routing tag — NOT a trust identity: the LAN (`device_id = SHA-256(SPKI)`)
+/// and tailnet (`MagicDNS`) namespaces are distinct and are matched only
+/// heuristically by machine name (a best-effort convenience, analysis C3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerTransport {
+    /// The feature 013 tailnet path (`MagicDNS` / IP over plain TCP).
+    Tailnet,
+    /// The feature 014 LAN path (mDNS-discovered, mutual TLS + device approval).
+    Lan,
+}
+
+impl PeerTransport {
+    /// Short human label shown on the picker row, the controlled-window transport
+    /// indicator (T025), and failure copy (FR-009).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tailnet => "Tailscale",
+            Self::Lan => "Local network",
+        }
+    }
+
+    /// Stable sort rank so the preferred (LAN) path leads a same-named pair.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Lan => 0,
+            Self::Tailnet => 1,
+        }
+    }
+}
+
 /// Everything the app layer must act on after routing a key into the picker.
 ///
 /// The picker never touches the network itself; it hands one of these back and
-/// the caller performs the side effect (send `ListRemotePeers`, dial a probe,
-/// or spawn a remote-control client process).
+/// the caller performs the side effect (send `ListRemotePeers`/`ListLanPeers`,
+/// dial a probe, or spawn a remote-control client process over the chosen
+/// [`PeerTransport`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteConnectAction {
     /// Nothing changed; no redraw required.
@@ -63,15 +101,17 @@ pub enum RemoteConnectAction {
     Redraw,
     /// The picker was dismissed; the caller should close it and redraw.
     Close,
-    /// Re-request the same-account peer list from the local server.
+    /// Re-request both peer lists (tailnet + LAN) from the local server.
     RequestPeers,
-    /// Dial `host:port` only to enumerate its windows (no window claim yet).
-    ProbeWindows { host: String, port: u16 },
-    /// Attach to an existing window on the peer (`Hello { window_id, takeover:
-    /// true }` — explicit user action).
-    Attach { host: String, port: u16, window_id: WindowId },
-    /// Create a fresh window on the peer (`Hello { window_id: None }`, T018).
-    NewWindow { host: String, port: u16 },
+    /// Dial `host:port` over `transport` only to enumerate its windows (no window
+    /// claim yet). The LAN transport runs the full TLS + device-approval gate.
+    ProbeWindows { host: String, port: u16, transport: PeerTransport },
+    /// Attach to an existing window on the peer over `transport` (`Hello {
+    /// window_id, takeover: true }` — explicit user action).
+    Attach { host: String, port: u16, window_id: WindowId, transport: PeerTransport },
+    /// Create a fresh window on the peer over `transport` (`Hello { window_id:
+    /// None }`, T018).
+    NewWindow { host: String, port: u16, transport: PeerTransport },
     /// Paste the host clipboard into the manual `host:port` entry. The app layer
     /// owns the clipboard handle, so it reads the text and calls
     /// [`RemoteConnect::append_manual`].
@@ -89,13 +129,51 @@ struct WindowRow {
     in_use: bool,
 }
 
-/// Which step the picker is on. Peer-step data (`peers`, `manual`) lives on the
-/// parent so it survives a round-trip into the windows step and back.
+/// One selectable device in the merged peer step (feature 014, T024). Tailnet
+/// peers (013 [`RemotePeerInfo`]) and LAN peers ([`LanPeerInfo`]) are merged by
+/// machine name into these rows; each records the [`PeerTransport`] it dials over
+/// and whether the same machine is also reachable on the other transport
+/// (deduped away, LAN preferred).
+struct PeerRow {
+    /// Display name (device / machine name).
+    name: String,
+    /// Dial host for `transport` (tailnet address or LAN subnet address).
+    host: String,
+    /// Dial port for `transport` (tailnet 46061 / LAN 46062).
+    port: u16,
+    transport: PeerTransport,
+    /// Whether the peer is currently reachable on `transport`.
+    online: bool,
+    /// `Some(other)` when the SAME machine is also reachable on `other` but was
+    /// deduped into this single row (dual-reachable, LAN preferred) — drives an
+    /// "also on …" hint so the user sees the fallback exists (FR-008).
+    also_other: Option<PeerTransport>,
+}
+
+/// Which step the picker is on. Peer-step data (`peers`, `lan_peers`, `rows`,
+/// `manual`) lives on the parent so it survives a round-trip into the windows
+/// step and back.
 enum Stage {
     /// Choosing a peer or typing a manual `host:port` target.
     Peers,
-    /// A peer was chosen; its window list is loading or shown.
-    Windows { host: String, port: u16, label: String, loading: bool, rows: Vec<WindowRow> },
+    /// A peer was chosen; its window list is loading or shown. `transport` records
+    /// which path the probe/attach dials over (feature 014, T024). While `loading`
+    /// over the LAN transport, `awaiting_approval` flips true once the owning peer
+    /// reports the connection is held pending device approval
+    /// ([`LanApprovalPending`](scribe_common::protocol::ServerMessage::LanApprovalPending)),
+    /// swapping the "Loading windows…" note for the cancelable "Waiting for
+    /// approval on <peer>…" overlay (feature 014, T019, FR-014); it clears when the
+    /// window list arrives (approved) and is irrelevant once the stage leaves
+    /// loading.
+    Windows {
+        host: String,
+        port: u16,
+        transport: PeerTransport,
+        label: String,
+        loading: bool,
+        awaiting_approval: bool,
+        rows: Vec<WindowRow>,
+    },
     /// Terminal failure with distinct UX-002 copy. `Enter` returns to the peer
     /// step; `Esc` closes.
     Failed { lines: Vec<String> },
@@ -105,8 +183,14 @@ enum Stage {
 pub struct RemoteConnect {
     active: bool,
     stage: Stage,
-    /// Same-account peers from the local server (online listed first).
+    /// Same-account tailnet peers from the local server (013).
     peers: Vec<RemotePeerInfo>,
+    /// mDNS-discovered LAN peers from the local server (feature 014, T014).
+    lan_peers: Vec<LanPeerInfo>,
+    /// Merged, deduped, sorted device rows built from `peers` + `lan_peers`
+    /// (feature 014, T024); the selectable peer-step list and the `selected`
+    /// index target. Rebuilt on every `set_peers` / `set_lan_peers`.
+    rows: Vec<PeerRow>,
     /// Manual `host:port` entry buffer, used when no peer row is chosen.
     manual: String,
     /// Highlighted row within the current stage's list.
@@ -119,17 +203,22 @@ impl RemoteConnect {
             active: false,
             stage: Stage::Peers,
             peers: Vec::new(),
+            lan_peers: Vec::new(),
+            rows: Vec::new(),
             manual: String::new(),
             selected: 0,
         }
     }
 
-    /// Open the picker on the peer step. Peers are cleared so the caller's fresh
-    /// `ListRemotePeers` response repopulates them (no stale device list).
+    /// Open the picker on the peer step. Both peer sources are cleared so the
+    /// caller's fresh `ListRemotePeers` + `ListLanPeers` responses repopulate them
+    /// (no stale device list).
     pub fn open(&mut self) {
         self.active = true;
         self.stage = Stage::Peers;
         self.peers.clear();
+        self.lan_peers.clear();
+        self.rows.clear();
         self.manual.clear();
         self.selected = 0;
     }
@@ -138,6 +227,8 @@ impl RemoteConnect {
         self.active = false;
         self.stage = Stage::Peers;
         self.peers.clear();
+        self.lan_peers.clear();
+        self.rows.clear();
         self.manual.clear();
         self.selected = 0;
     }
@@ -147,22 +238,92 @@ impl RemoteConnect {
     }
 
     /// Apply the local server's [`RemotePeerList`](scribe_common::protocol::ServerMessage::RemotePeerList)
-    /// reply. Ignored unless the picker is still on the peer step.
-    pub fn set_peers(&mut self, mut peers: Vec<RemotePeerInfo>) {
+    /// reply (013 tailnet peers). Ignored unless the picker is still on the peer
+    /// step; the merged row list is rebuilt (feature 014, T024).
+    pub fn set_peers(&mut self, peers: Vec<RemotePeerInfo>) {
         if !matches!(self.stage, Stage::Peers) {
             return;
         }
-        // Online peers first, then by name, so reachable devices are easiest to
-        // pick; offline peers stay visible but greyed (data-model RemotePeer).
-        peers.sort_by(|a, b| b.online.cmp(&a.online).then_with(|| a.name.cmp(&b.name)));
         self.peers = peers;
+        self.rebuild_rows();
+    }
+
+    /// Apply the local server's [`LanPeerList`](scribe_common::protocol::ServerMessage::LanPeerList)
+    /// reply (feature 014, T014): the mDNS-discovered LAN peers, merged with the
+    /// tailnet peers by machine name (T024). Ignored unless the picker is still on
+    /// the peer step.
+    pub fn set_lan_peers(&mut self, peers: Vec<LanPeerInfo>) {
+        if !matches!(self.stage, Stage::Peers) {
+            return;
+        }
+        self.lan_peers = peers;
+        self.rebuild_rows();
+    }
+
+    /// Rebuild the merged, deduped, sorted peer list from the tailnet + LAN
+    /// sources (feature 014, T024). A LAN peer and a tailnet peer whose machine
+    /// names match confidently collapse to a single LAN-preferred row
+    /// (dual-reachable, FR-008); every other peer keeps its own transport-labeled
+    /// row. Incompatible-version LAN peers are dropped before offering them (the
+    /// exact-match policy would refuse the dial anyway, data-model `LanPeer`).
+    /// Online peers sort first, then by name, then LAN before tailnet.
+    fn rebuild_rows(&mut self) {
+        let tailnet_port = RemoteConfig::default().port;
+        // Pair each tailnet peer with a "claimed by a LAN name match" flag so a
+        // dual-reachable machine is emitted once, LAN preferred (FR-008). A flag
+        // Vec walked with iterators keeps this index-free (repo denies indexing).
+        let mut tailnet: Vec<(&RemotePeerInfo, bool)> =
+            self.peers.iter().map(|peer| (peer, false)).collect();
+
+        let mut rows: Vec<PeerRow> = Vec::new();
+        for lan in &self.lan_peers {
+            if lan.protovers != REMOTE_PROTOCOL_VERSION {
+                continue;
+            }
+            let also_other = claim_tailnet_match(&mut tailnet, &lan.host);
+            rows.push(PeerRow {
+                name: lan.name.clone(),
+                host: lan.addr.clone(),
+                port: lan.port,
+                transport: PeerTransport::Lan,
+                online: lan.online,
+                also_other,
+            });
+        }
+
+        // Remaining (unclaimed) tailnet peers keep their own labeled rows.
+        for (peer, claimed) in &tailnet {
+            if *claimed {
+                continue;
+            }
+            rows.push(PeerRow {
+                name: peer.name.clone(),
+                host: peer.addr.clone(),
+                port: tailnet_port,
+                transport: PeerTransport::Tailnet,
+                online: peer.online,
+                also_other: None,
+            });
+        }
+
+        // Online first (easiest to pick; offline stay greyed), then by name, then
+        // LAN before tailnet so the preferred path leads any same-named pair.
+        rows.sort_by(|a, b| {
+            b.online
+                .cmp(&a.online)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.transport.rank().cmp(&b.transport.rank()))
+        });
+        self.rows = rows;
         self.clamp_selection();
     }
 
     /// Apply a window list probed from the chosen peer. Ignored unless the
     /// picker is on the matching peer's window step.
     pub fn set_windows(&mut self, host: &str, port: u16, windows: Vec<WindowInfo>) {
-        let Stage::Windows { host: cur_host, port: cur_port, loading, rows, .. } = &mut self.stage
+        let Stage::Windows {
+            host: cur_host, port: cur_port, loading, awaiting_approval, rows, ..
+        } = &mut self.stage
         else {
             return;
         };
@@ -188,6 +349,9 @@ impl RemoteConnect {
         });
         *rows = built;
         *loading = false;
+        // The window list only arrives after the owning peer approved this device,
+        // so any "Waiting for approval…" overlay has settled (feature 014, T019).
+        *awaiting_approval = false;
         self.selected = 0;
     }
 
@@ -206,6 +370,48 @@ impl RemoteConnect {
             RemoteConnectOutcome::ConnectionFailure => {
                 self.fail(connection_failure_lines(&self.peer_label()));
             }
+        }
+    }
+
+    /// Fold a LAN dial outcome (TLS + device-approval gate) into the picker
+    /// (feature 014, T014) — the LAN analogue of [`on_dial_outcome`](Self::on_dial_outcome).
+    /// Only failures matter here: an accepted LAN window probe keeps the window
+    /// step loading until [`set_windows`](Self::set_windows) arrives, and an
+    /// accepted attach spawns its own client-window process. Each [`LanRefusal`]
+    /// maps to its distinct UX-002 copy; the merged connection failure is the
+    /// LAN-specific "can't reach on the local network" wording.
+    pub fn on_lan_dial_outcome(&mut self, outcome: LanConnectOutcome) {
+        if !self.active {
+            return;
+        }
+        match outcome {
+            LanConnectOutcome::Accepted => {}
+            LanConnectOutcome::Refused(reason) => {
+                self.fail(lan_refusal_lines(reason, &self.peer_label()));
+            }
+            LanConnectOutcome::ConnectionFailure => {
+                self.fail(lan_connection_failure_lines(&self.peer_label()));
+            }
+        }
+    }
+
+    /// The owning LAN peer is holding this connection pending the user's device
+    /// approval (feature 014, T019): the window probe received
+    /// [`LanApprovalPending`](scribe_common::protocol::ServerMessage::LanApprovalPending).
+    /// Swap the window step's "Loading windows…" note for the cancelable "Waiting
+    /// for approval on <peer>…" overlay (FR-014, US2.5). Only meaningful while the
+    /// window step is still loading; ignored otherwise (a stray pending after the
+    /// list already arrived, or when the picker has moved on / closed), so a late
+    /// event never resurrects the overlay. Settles when the list arrives (approved,
+    /// [`set_windows`](Self::set_windows)) or the dial is refused
+    /// ([`on_lan_dial_outcome`](Self::on_lan_dial_outcome)); Esc cancels by
+    /// stepping back to the peer list.
+    pub fn on_awaiting_approval(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Stage::Windows { loading: true, awaiting_approval, .. } = &mut self.stage {
+            *awaiting_approval = true;
         }
     }
 
@@ -248,11 +454,11 @@ impl RemoteConnect {
             Key::Named(NamedKey::Escape) => RemoteConnectAction::Close,
             Key::Named(NamedKey::Enter) => self.confirm_peer(),
             Key::Named(NamedKey::ArrowDown | NamedKey::Tab) => {
-                self.move_selection(true, self.peers.len());
+                self.move_selection(true, self.rows.len());
                 RemoteConnectAction::Redraw
             }
             Key::Named(NamedKey::ArrowUp) => {
-                self.move_selection(false, self.peers.len());
+                self.move_selection(false, self.rows.len());
                 RemoteConnectAction::Redraw
             }
             Key::Named(NamedKey::Backspace) => {
@@ -284,17 +490,27 @@ impl RemoteConnect {
     }
 
     /// Enter on the peer step: a typed manual target wins over the highlighted
-    /// device, so a user who started typing always reaches what they typed.
+    /// device, so a user who started typing always reaches what they typed. Manual
+    /// entry keeps the 013 tailnet transport (the LAN source is the discovered-peer
+    /// path); a picked row dials over the transport its merge chose (feature 014,
+    /// T024).
     fn confirm_peer(&mut self) -> RemoteConnectAction {
-        let target = parse_host_port(&self.manual).or_else(|| {
-            let peer = self.peers.get(self.selected).filter(|peer| peer.online)?;
-            Some((peer.addr.clone(), RemoteConfig::default().port))
-        });
-        let Some((host, port)) = target else {
+        if let Some((host, port)) = parse_host_port(&self.manual) {
+            self.enter_windows_stage(host.clone(), port, PeerTransport::Tailnet);
+            return RemoteConnectAction::ProbeWindows {
+                host,
+                port,
+                transport: PeerTransport::Tailnet,
+            };
+        }
+        let Some(row) = self.rows.get(self.selected).filter(|row| row.online) else {
             return RemoteConnectAction::None;
         };
-        self.enter_windows_stage(host.clone(), port);
-        RemoteConnectAction::ProbeWindows { host, port }
+        let host = row.host.clone();
+        let port = row.port;
+        let transport = row.transport;
+        self.enter_windows_stage(host.clone(), port, transport);
+        RemoteConnectAction::ProbeWindows { host, port, transport }
     }
 
     /// Append pasted text to the manual `host:port` entry, dropping control and
@@ -329,7 +545,7 @@ impl RemoteConnect {
     }
 
     fn confirm_window(&mut self) -> RemoteConnectAction {
-        let Stage::Windows { host, port, loading, rows, .. } = &self.stage else {
+        let Stage::Windows { host, port, transport, loading, rows, .. } = &self.stage else {
             return RemoteConnectAction::None;
         };
         if *loading {
@@ -340,9 +556,10 @@ impl RemoteConnect {
         };
         let host = host.clone();
         let port = *port;
+        let transport = *transport;
         match row.window_id {
-            Some(window_id) => RemoteConnectAction::Attach { host, port, window_id },
-            None => RemoteConnectAction::NewWindow { host, port },
+            Some(window_id) => RemoteConnectAction::Attach { host, port, window_id, transport },
+            None => RemoteConnectAction::NewWindow { host, port, transport },
         }
     }
 
@@ -358,19 +575,27 @@ impl RemoteConnect {
         }
     }
 
-    fn enter_windows_stage(&mut self, host: String, port: u16) {
+    fn enter_windows_stage(&mut self, host: String, port: u16, transport: PeerTransport) {
         let label = self.dial_label(&host);
-        self.stage = Stage::Windows { host, port, label, loading: true, rows: Vec::new() };
+        self.stage = Stage::Windows {
+            host,
+            port,
+            transport,
+            label,
+            loading: true,
+            awaiting_approval: false,
+            rows: Vec::new(),
+        };
         self.selected = 0;
     }
 
     /// Display label for the peer currently being reached — its device name
     /// when a listed peer matches the dial address, else the raw host.
     fn dial_label(&self, host: &str) -> String {
-        self.peers
+        self.rows
             .iter()
-            .find(|peer| peer.addr == host)
-            .map_or_else(|| host.to_owned(), |peer| peer.name.clone())
+            .find(|row| row.host == host)
+            .map_or_else(|| host.to_owned(), |row| row.name.clone())
     }
 
     /// Best label for the peer in failure copy: the windows-stage label if we
@@ -381,8 +606,8 @@ impl RemoteConnect {
             _ => {
                 if let Some((host, _)) = parse_host_port(&self.manual) {
                     self.dial_label(&host)
-                } else if let Some(peer) = self.peers.get(self.selected) {
-                    peer.name.clone()
+                } else if let Some(row) = self.rows.get(self.selected) {
+                    row.name.clone()
                 } else {
                     String::from("the remote machine")
                 }
@@ -407,7 +632,7 @@ impl RemoteConnect {
 
     fn clamp_selection(&mut self) {
         let count = match &self.stage {
-            Stage::Peers => self.peers.len(),
+            Stage::Peers => self.rows.len(),
             Stage::Windows { rows, .. } => rows.len(),
             Stage::Failed { .. } => 0,
         };
@@ -438,7 +663,7 @@ impl RemoteConnect {
                 } else {
                     format!("> {}", self.manual)
                 };
-                let mut rows: Vec<PickerRow> = self.peers.iter().map(peer_row).collect();
+                let mut rows: Vec<PickerRow> = self.rows.iter().map(peer_row).collect();
                 if rows.is_empty() {
                     rows.push(PickerRow {
                         text: String::from("No devices found - type a host:port above"),
@@ -449,12 +674,29 @@ impl RemoteConnect {
                     title: String::from("Connect to remote machine"),
                     subtitle: Some(subtitle),
                     rows,
-                    selectable: !self.peers.is_empty(),
+                    selectable: !self.rows.is_empty(),
                     selected: self.selected,
                     footer: Some(String::from("Enter connect  Up/Down pick  Esc cancel")),
                 }
             }
-            Stage::Windows { label, loading, rows, .. } => {
+            Stage::Windows { label, loading, awaiting_approval, rows, .. } => {
+                // Held pending device approval on the owning peer (feature 014,
+                // T019): a distinct cancelable overlay rather than the loading note,
+                // shown until the window list arrives (approved) or the dial is
+                // refused. Nothing is selectable while waiting; Esc steps back.
+                if *loading && *awaiting_approval {
+                    return PickerView {
+                        title: format!("Waiting for approval on {label}…"),
+                        subtitle: None,
+                        rows: vec![PickerRow {
+                            text: String::from("Approve this device on that machine to continue."),
+                            dim: true,
+                        }],
+                        selectable: false,
+                        selected: 0,
+                        footer: Some(String::from("Esc cancel")),
+                    };
+                }
                 let mut view_rows: Vec<PickerRow> = if *loading {
                     vec![PickerRow { text: String::from("Loading windows…"), dim: true }]
                 } else {
@@ -909,10 +1151,43 @@ impl PickerColors {
     }
 }
 
-/// Build a peer-step row: an online marker, the device name, and its address.
-fn peer_row(peer: &RemotePeerInfo) -> PickerRow {
-    let marker = if peer.online { "* " } else { "  " };
-    PickerRow { text: format!("{marker}{}  {}", peer.name, peer.addr), dim: !peer.online }
+/// Build a merged peer-step row: an online marker, the device name, its transport
+/// label, and — when the same machine is also reachable on the other transport
+/// but shown once (LAN preferred) — an "also on …" hint (feature 014, T024,
+/// FR-008/009).
+fn peer_row(row: &PeerRow) -> PickerRow {
+    let marker = if row.online { "* " } else { "  " };
+    let label = row.transport.label();
+    let text = row.also_other.map_or_else(
+        || format!("{marker}{}  {label}", row.name),
+        |other| format!("{marker}{}  {label}  (also {})", row.name, other.label()),
+    );
+    PickerRow { text, dim: !row.online }
+}
+
+/// Best-effort machine-name match key for LAN↔tailnet dedup (feature 014, T024):
+/// the first dot-delimited label, trimmed and lowercased. `None` for an empty
+/// name so blank hostnames never match. A UX heuristic, never a trust key
+/// (analysis C3).
+fn name_match_key(name: &str) -> Option<String> {
+    let label = name.trim().split('.').next().unwrap_or("").trim();
+    if label.is_empty() { None } else { Some(label.to_ascii_lowercase()) }
+}
+
+/// Claim the first not-yet-claimed tailnet peer whose machine name matches
+/// `lan_host` (feature 014, T024 dedup), marking it consumed and returning the
+/// "also reachable on Tailscale" hint for the LAN row. `None` when no confident
+/// name match exists, so the tailnet peer keeps its own separate labeled row.
+fn claim_tailnet_match(
+    tailnet: &mut [(&RemotePeerInfo, bool)],
+    lan_host: &str,
+) -> Option<PeerTransport> {
+    let key = name_match_key(lan_host)?;
+    let entry = tailnet.iter_mut().find(|(peer, claimed)| {
+        !*claimed && name_match_key(&peer.name).as_deref() == Some(key.as_str())
+    })?;
+    entry.1 = true;
+    Some(PeerTransport::Tailnet)
 }
 
 /// Build a window-step row: the "New window" entry, or an existing window with
@@ -956,6 +1231,36 @@ fn refusal_lines(reason: RemoteRefusal, peer: &str) -> Vec<String> {
 fn connection_failure_lines(peer: &str) -> Vec<String> {
     vec![format!(
         "Can't reach {peer} — it may be offline, Scribe may not be running, or remote access may be turned off there."
+    )]
+}
+
+/// Map a typed [`LanRefusal`] to its distinct UX-002 failure copy
+/// (contracts/settings-and-config.md, feature 014) — the LAN analogue of
+/// [`refusal_lines`]. `IncompatibleVersion` names this machine's version (the
+/// refusal carries no peer version), mirroring the tailnet wording.
+fn lan_refusal_lines(reason: LanRefusal, peer: &str) -> Vec<String> {
+    match reason {
+        LanRefusal::Declined => vec![format!("{peer} declined this device.")],
+        LanRefusal::NotTrustedNetwork => {
+            vec![format!("{peer} isn't accepting local connections on this network.")]
+        }
+        LanRefusal::Disabled => vec![format!("Local remote access is turned off on {peer}.")],
+        LanRefusal::IncompatibleVersion => vec![format!(
+            "Scribe versions don't match between this machine ({}) and {peer}. Update the older one.",
+            env!("CARGO_PKG_VERSION")
+        )],
+        LanRefusal::Busy => {
+            vec![format!("{peer} has too many remote connections right now.")]
+        }
+    }
+}
+
+/// The LAN connection-failure copy (contracts/settings-and-config.md): a dormant
+/// or absent peer leaves nothing listening, so offline / asleep / off-network are
+/// deliberately indistinguishable on a cold LAN dial (FR-004).
+fn lan_connection_failure_lines(peer: &str) -> Vec<String> {
+    vec![format!(
+        "Can't reach {peer} on the local network — it may be offline, asleep, or not on this network."
     )]
 }
 

@@ -270,6 +270,17 @@ minisign-verify.workspace = true
 sha2 = "0.10"
 keyring = { workspace = true }
 chacha20poly1305 = { workspace = true }
+# LAN remote control (feature 014): mDNS discovery, physical-network
+# fingerprint, self-signed Ed25519 identity cert, and async mutual TLS.
+# rustls is a direct dependency here (default aws-lc-rs provider), no longer
+# only a reqwest transitive. x509-parser extracts a peer certificate's SPKI so
+# the TLS pinning verifier can derive its SHA-256(SPKI) Device ID.
+mdns-sd.workspace = true
+netdev.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
 # test-util: provides #[tokio::test] macro for async tests.

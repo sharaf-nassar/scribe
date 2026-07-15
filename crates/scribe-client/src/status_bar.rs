@@ -55,6 +55,13 @@ pub struct StatusBarData<'a> {
     pub remote: RemoteStatusData<'a>,
     /// Remote or local host label for the focused pane.
     pub host_label: &'a str,
+    /// Feature 014 (T025): which transport this controlling-side window is driving
+    /// the remote machine over — `Some("Local network")` (LAN / mutual TLS) or
+    /// `Some("Tailscale")` (tailnet). `None` on an owning or ordinary local window,
+    /// which renders nothing. Drives the persistent transport indicator beside the
+    /// host label so the user can always see which path a controlled window uses
+    /// (FR-009).
+    pub remote_transport: Option<&'a str>,
     /// tmux session label for the focused pane when present.
     pub tmux_label: Option<&'a str>,
     /// Current time string (e.g. "14:32").
@@ -1024,6 +1031,16 @@ fn build_right_segments(data: &StatusBarData<'_>, colors: &StatusBarColors) -> V
     if let Some(tmux_label) = data.tmux_label {
         push_sep(&mut segs, colors.separator);
         segs.push(RightSegment { text: format!("tmux:{tmux_label}"), color: colors.accent });
+    }
+
+    // Feature 014 (T025): the transport a controlling-side window is driving the
+    // remote machine over ("⇅ Local network" / "⇅ Tailscale"), grouped just left
+    // of the host label. Dimmed like the owning-side "remote control enabled"
+    // indicator (both use ⇅ for the remote link); absent on non-controlling
+    // windows (FR-009).
+    if let Some(transport) = data.remote_transport {
+        push_sep(&mut segs, colors.separator);
+        segs.push(RightSegment { text: format!("\u{21C5} {transport}"), color: colors.label });
     }
 
     if !data.host_label.is_empty() {
