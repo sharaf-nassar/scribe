@@ -498,6 +498,19 @@ pub enum ClientMessage {
     /// remote peer can never read a third machine's identity. Answered with
     /// exactly one [`ServerMessage::LanEnv`]. No fields.
     GetLanEnv,
+    /// Feature 014 (LAN dial-identity fix) local-only request: hand this
+    /// machine's OWN device identity (public certificate DER + sealed `PKCS#8`
+    /// private-key DER) to a co-located connecting `scribe-client` so the dialer
+    /// can build its mutual-TLS identity WITHOUT reading the OS keyring from a
+    /// different binary. On macOS the sealed device key's legacy `SecKeychain`
+    /// per-item ACL trusts ONLY the creating binary (`scribe-server`), so a
+    /// cross-binary read is denied (errSecInteractionNotAllowed) with no usable
+    /// prompt; the server therefore stays the SOLE keychain accessor and serves the
+    /// identity here. Refused as a non-`Hello` first frame over any remote transport
+    /// (exactly like [`GetLanEnv`]), so a remote peer can never exfiltrate this
+    /// machine's private device key. Answered with exactly one
+    /// [`ServerMessage::LanDialIdentity`]. No fields.
+    GetLanDialIdentity,
 }
 
 // ── Server → UI ──────────────────────────────────────────────────
@@ -881,6 +894,22 @@ pub enum ServerMessage {
         current_network_addable: bool,
         #[serde(default)]
         current_network_reason: Option<String>,
+    },
+    /// Feature 014 (LAN dial-identity fix) reply to
+    /// [`ClientMessage::GetLanDialIdentity`] — this machine's OWN device identity
+    /// for a co-located connecting `scribe-client` to build its mutual-TLS dialer
+    /// without touching the OS keyring. `available` is `true` only when the server
+    /// resolved (minting on first use, like the owning side) a usable identity; in
+    /// that case `cert_der` is the public certificate DER and `private_key_pkcs8_der`
+    /// is the sealed `PKCS#8` private-key DER. On any keyring/state-dir error
+    /// `available` is `false` and both byte fields are empty, so the client fails
+    /// closed and never dials without an identity. `private_key_pkcs8_der` is PRIVATE
+    /// key material: this message is local-socket only (never crosses a remote
+    /// transport) and is never logged.
+    LanDialIdentity {
+        available: bool,
+        cert_der: Vec<u8>,
+        private_key_pkcs8_der: Vec<u8>,
     },
 }
 

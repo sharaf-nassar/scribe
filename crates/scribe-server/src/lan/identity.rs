@@ -87,6 +87,14 @@ pub enum IdentityError {
     /// Reading or writing the cached device certificate failed.
     #[error("device certificate I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A co-located connecting client could not obtain this machine's LAN device
+    /// identity from its own local `scribe-server` over the Unix socket (server
+    /// down, identity unavailable, or a malformed reply). The dialer fails closed
+    /// rather than read the keyring from a different binary — on macOS the legacy
+    /// `SecKeychain` per-item ACL trusts only the creating binary, so only the
+    /// server may read the sealed key (see [`DeviceIdentity::from_der`]).
+    #[error("could not obtain the LAN device identity from the local server: {0}")]
+    LocalIdentityUnavailable(String),
 }
 
 /// A loaded per-install device identity: the pinned Device ID, the public
@@ -123,6 +131,26 @@ impl DeviceIdentity {
         Self { device_id, cert_der, key_der, fingerprint_words }
     }
 
+    /// Reconstruct an identity from its public certificate DER and sealed `PKCS#8`
+    /// private-key DER WITHOUT touching the OS keyring — the shape a co-located
+    /// connecting `scribe-client` rebuilds after fetching this machine's OWN
+    /// identity from its local server over `GetLanDialIdentity` (the client binary
+    /// cannot read the keyring itself; see the module docs and
+    /// [`IdentityError::LocalIdentityUnavailable`]). The Device ID and fingerprint
+    /// are re-derived from the keypair's SPKI, so the reconstructed identity pins to
+    /// the exact same `device_id` the keyring-backed [`load_or_generate`] yields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Crypto`] if the key bytes are not a valid `Ed25519`
+    /// `PKCS#8` keypair.
+    pub fn from_der(cert_der: Vec<u8>, key_pkcs8_der: Vec<u8>) -> Result<Self, IdentityError> {
+        let key_der = PrivatePkcs8KeyDer::from(key_pkcs8_der);
+        let key_pair = KeyPair::from_pkcs8_der_and_sign_algo(&key_der, &PKCS_ED25519)?;
+        let cert_der = CertificateDer::from(cert_der);
+        Ok(Self::assemble(&key_pair, key_der, cert_der))
+    }
+
     /// The 32-byte pinned Device ID (`SHA-256`(`SubjectPublicKeyInfo`)) — the
     /// LAN trust anchor and `mDNS` TXT `id`.
     #[must_use]
@@ -154,6 +182,15 @@ impl DeviceIdentity {
     #[must_use]
     pub fn signing_key(&self) -> PrivateKeyDer<'static> {
         PrivateKeyDer::from(self.key_der.clone_key())
+    }
+
+    /// The sealed signing key as raw `PKCS#8` DER bytes, for handing this machine's
+    /// OWN identity to a co-located connecting `scribe-client` over the local socket
+    /// (`GetLanDialIdentity`), which reconstructs it with [`DeviceIdentity::from_der`].
+    /// PRIVATE material — never logged and never sent over a remote transport.
+    #[must_use]
+    pub fn private_key_pkcs8_der(&self) -> Vec<u8> {
+        self.key_der.secret_pkcs8_der().to_vec()
     }
 
     /// The read-aloud fingerprint words shown on the approval prompt and in the

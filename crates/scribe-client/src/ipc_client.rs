@@ -2753,16 +2753,69 @@ impl DevicePins for NoServerPins {
     }
 }
 
-/// Load this machine's persistent device identity (the keyring-sealed Ed25519
-/// cert minted on first LAN use) and build the mutual-TLS dialer that presents it
-/// behind the SPKI-pinning verifier (feature 014, T015). Reuses the server's
-/// `load_or_generate` + [`LanTls`] so the connecting side presents a STABLE
-/// `device_id` (remembered approval, US2) and the security-critical verifier lives
-/// in one place. Fails closed (keyring unavailable / no state dir) exactly as the
-/// owning side does; the caller maps that to a `ConnectionFailure` outcome.
+/// Build the mutual-TLS dialer that presents this machine's persistent device
+/// identity behind the SPKI-pinning verifier (feature 014, T015). The identity is
+/// fetched from this machine's co-located `scribe-server` over the local socket
+/// ([`fetch_lan_dial_identity`]) rather than read from the OS keyring directly: the
+/// keyring-sealed key is granted only to the creating binary (`scribe-server`) by a
+/// per-item ACL on macOS, so this different binary (`scribe-client`) cannot read it.
+/// The client rebuilds a [`DeviceIdentity`] from the returned DER via
+/// [`identity::DeviceIdentity::from_der`], so the connecting side still presents a
+/// STABLE `device_id` (remembered approval, US2) and the security-critical verifier
+/// stays in one place ([`LanTls`]). Fails closed (server down / identity
+/// unavailable) exactly as the owning side does; the caller maps that to a
+/// `ConnectionFailure` outcome.
 async fn build_lan_tls() -> Result<LanTls, identity::IdentityError> {
-    let device_identity = identity::load_or_generate().await?;
+    let (cert_der, key_pkcs8_der) = fetch_lan_dial_identity().await?;
+    let device_identity = identity::DeviceIdentity::from_der(cert_der, key_pkcs8_der)?;
     Ok(LanTls::new(Arc::new(device_identity), Arc::new(NoServerPins)))
+}
+
+/// Fetch this machine's OWN LAN device identity (public certificate DER + sealed
+/// `PKCS#8` private-key DER) from its co-located `scribe-server` over the local
+/// Unix socket, rather than reading the OS keyring directly from this binary. On
+/// macOS the keyring (legacy `SecKeychain`) grants the sealed device key by a
+/// per-item ACL that trusts ONLY the creating binary (`scribe-server`); a different
+/// binary (`scribe-client`) is denied (errSecInteractionNotAllowed) with no usable
+/// prompt, so a direct `identity::load_or_generate()` here fails BEFORE any TCP even
+/// on a reachable peer. The server is the sole keychain accessor and serves the
+/// identity over a local-socket-only [`ClientMessage::GetLanDialIdentity`] first
+/// frame (refused over any remote transport). Used on ALL platforms for uniformity.
+/// Fails closed — returns an [`identity::IdentityError`] the caller maps to a
+/// `ConnectionFailure` outcome — on any transport error or an `available = false`
+/// reply, so the dial never proceeds without a valid identity.
+async fn fetch_lan_dial_identity() -> Result<(Vec<u8>, Vec<u8>), identity::IdentityError> {
+    let socket_path = server_socket_path();
+    let mut stream = tokio::net::UnixStream::connect(&socket_path).await.map_err(|error| {
+        identity::IdentityError::LocalIdentityUnavailable(format!(
+            "connecting to the local server socket failed: {error}"
+        ))
+    })?;
+    write_message(&mut stream, &ClientMessage::GetLanDialIdentity).await.map_err(|error| {
+        identity::IdentityError::LocalIdentityUnavailable(format!(
+            "sending GetLanDialIdentity to the local server failed: {error}"
+        ))
+    })?;
+    // Read until the identity reply arrives, ignoring any interleaved frames; the
+    // connection drops as soon as we have it.
+    loop {
+        match read_message::<ServerMessage, _>(&mut stream).await {
+            Ok(ServerMessage::LanDialIdentity { available, cert_der, private_key_pkcs8_der }) => {
+                if !available || cert_der.is_empty() || private_key_pkcs8_der.is_empty() {
+                    return Err(identity::IdentityError::LocalIdentityUnavailable(
+                        "the local server reported no LAN device identity available".to_owned(),
+                    ));
+                }
+                return Ok((cert_der, private_key_pkcs8_der));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(identity::IdentityError::LocalIdentityUnavailable(format!(
+                    "the local server closed before the LAN dial identity arrived: {error}"
+                )));
+            }
+        }
+    }
 }
 
 /// The invariant target of a LAN dial for the whole (multi-attempt) lifetime: the

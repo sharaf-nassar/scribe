@@ -3363,6 +3363,39 @@ async fn establish_local_first_frame(
             handle_transient_list_remote_peers(writer).await;
             None
         }
+        ClientMessage::GetRemoteEnv => {
+            // Feature 013 transient local-only action: report this machine's
+            // signed-in tailnet account + whether Tailscale is detected for the
+            // Settings → Remote section, reply once, close. Local-socket only by
+            // the same construction as `ListRemotePeers` — a non-Hello first
+            // frame is refused over TCP in `establish_client_window`, so a remote
+            // peer cannot read a third machine's tailnet identity.
+            handle_transient_get_remote_env(writer).await;
+            None
+        }
+        // Feature 014 LAN local-only transient first frames (and the legacy
+        // no-`Hello` claim) are dispatched in a sibling to keep each function under
+        // the cognitive-complexity budget; they remain local-socket only by the
+        // same `establish_client_window` construction.
+        other => establish_local_lan_first_frame(other, server, writer, attached_ids).await,
+    }
+}
+
+/// Feature 014 LAN-surface local-only transient first frames — the LAN analog of
+/// the update/tailnet arms in [`establish_local_first_frame`], split into a sibling
+/// so each stays under the cognitive-complexity budget. Every arm here is
+/// local-socket only by the SAME construction as [`establish_local_first_frame`]:
+/// the remote path refuses a non-`Hello` first frame in [`establish_client_window`]
+/// and never reaches this dispatch, so no remote peer can enumerate a third
+/// machine's LAN view or read/exfiltrate its device identity. A frame that is none
+/// of these falls through to [`handle_legacy_client`] (a legacy no-`Hello` claim).
+async fn establish_local_lan_first_frame(
+    msg: ClientMessage,
+    server: &IpcServerState,
+    writer: &SharedWriter,
+    attached_ids: &AttachedSessionIds,
+) -> Option<WindowId> {
+    match msg {
         ClientMessage::ListLanPeers => {
             // Feature 014 T013 transient local-only action (contracts/lan-protocol
             // Local-only helper messages): enumerate this machine's own mDNS-
@@ -3372,16 +3405,6 @@ async fn establish_local_first_frame(
             // `establish_client_window`, so a remote peer cannot read a third
             // machine's LAN discovery view.
             handle_transient_list_lan_peers(server, writer).await;
-            None
-        }
-        ClientMessage::GetRemoteEnv => {
-            // Feature 013 transient local-only action: report this machine's
-            // signed-in tailnet account + whether Tailscale is detected for the
-            // Settings → Remote section, reply once, close. Local-socket only by
-            // the same construction as `ListRemotePeers` — a non-Hello first
-            // frame is refused over TCP in `establish_client_window`, so a remote
-            // peer cannot read a third machine's tailnet identity.
-            handle_transient_get_remote_env(writer).await;
             None
         }
         ClientMessage::GetLanEnv => {
@@ -3395,6 +3418,20 @@ async fn establish_local_first_frame(
             // `establish_client_window`, so a remote peer cannot read a third
             // machine's own identity fingerprint.
             handle_transient_get_lan_env(writer).await;
+            None
+        }
+        ClientMessage::GetLanDialIdentity => {
+            // Feature 014 (LAN dial-identity fix) transient local-only action: hand
+            // this machine's OWN device identity (cert + sealed key) to a co-located
+            // connecting `scribe-client` so the dialer never reads the OS keyring
+            // from a different binary — on macOS the legacy SecKeychain per-item ACL
+            // trusts only the creating binary (scribe-server), so a cross-binary key
+            // read is denied. The server stays the SOLE keychain accessor; reply
+            // once, close. Local-socket only by the same construction as `GetLanEnv`
+            // — a non-Hello first frame is refused over any remote transport in
+            // `establish_client_window`, so a remote peer can never exfiltrate this
+            // machine's private device key.
+            handle_transient_get_lan_dial_identity(writer).await;
             None
         }
         ClientMessage::ListTrustedNetworks => {
@@ -3635,6 +3672,41 @@ async fn handle_transient_get_lan_env(writer: &SharedWriter) {
         },
     )
     .await;
+}
+
+/// Feature 014 (LAN dial-identity fix): serve a transient `GetLanDialIdentity` —
+/// hand this machine's OWN device identity (public certificate DER + sealed
+/// `PKCS#8` private-key DER) to a co-located connecting `scribe-client` so the
+/// dialer can build its mutual-TLS identity WITHOUT reading the OS keyring from a
+/// different binary. The server is the SOLE keychain accessor: on macOS the sealed
+/// device key's legacy `SecKeychain` per-item ACL trusts only the creating binary,
+/// so a cross-binary read is denied (errSecInteractionNotAllowed) with no usable
+/// prompt. Unlike the read-only `GetLanEnv`, this MINTS the identity on first use
+/// (`load_or_generate`), matching the owning side, so a first-ever dial from a
+/// fresh install still presents a stable key. Fails closed on any keyring /
+/// state-dir error to `available = false` with empty DER so the client aborts the
+/// dial. The reply carries PRIVATE key material and is local-socket only by the
+/// same construction as `GetLanEnv` — a non-`Hello` first frame is refused over any
+/// remote transport in `establish_client_window`, so it never crosses a remote
+/// link. Replies once and closes.
+async fn handle_transient_get_lan_dial_identity(writer: &SharedWriter) {
+    info!("transient client requested LAN dial identity");
+    let reply = match crate::lan::identity::load_or_generate().await {
+        Ok(identity) => ServerMessage::LanDialIdentity {
+            available: true,
+            cert_der: identity.cert_der().as_ref().to_vec(),
+            private_key_pkcs8_der: identity.private_key_pkcs8_der(),
+        },
+        Err(error) => {
+            debug!(%error, "LAN dial identity unavailable; failing closed");
+            ServerMessage::LanDialIdentity {
+                available: false,
+                cert_der: Vec::new(),
+                private_key_pkcs8_der: Vec::new(),
+            }
+        }
+    };
+    send_message(writer, &reply).await;
 }
 
 /// Short, user-facing note for the disabled "Add current network" control when

@@ -338,7 +338,8 @@ async fn dispatch_server_message(
         | ServerMessage::LanPeerList { .. }
         | ServerMessage::TrustedDeviceList { .. }
         | ServerMessage::TrustedNetworkList { .. }
-        | ServerMessage::LanEnv { .. } => {}
+        | ServerMessage::LanEnv { .. }
+        | ServerMessage::LanDialIdentity { .. } => {}
     }
 }
 
