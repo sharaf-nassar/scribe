@@ -4413,7 +4413,35 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         ClientMessage::LanApprovalDecision { request_id, approve } => {
             handle_lan_approval_decision(context, request_id, approve);
         }
+        // The connect picker enumerates peers from within its already-`Hello`ed
+        // session connection (feature 013/014), so the local-only peer-list
+        // queries are answered here too — not only on the pre-`Hello` transient
+        // path. Gated to LOCAL connections: a remote (tailnet/LAN) peer must never
+        // enumerate this machine's tailnet/LAN view, so a remote sender falls
+        // through to the ignore arm (the same guarantee the pre-`Hello` path gets
+        // from `establish_client_window` refusing non-`Hello` frames).
+        msg @ (ClientMessage::ListRemotePeers | ClientMessage::ListLanPeers)
+            if !context.is_remote =>
+        {
+            dispatch_local_query_message(msg, context).await;
+        }
         other => debug!(?other, "unhandled client message"),
+    }
+}
+
+/// Answer the local-only connect-picker peer-list queries — `ListRemotePeers`
+/// (013 tailnet) and `ListLanPeers` (014 LAN) — that arrive on the connecting
+/// client's live post-`Hello` session connection. Split out of
+/// [`dispatch_message`] to keep its match under Clippy's cognitive-complexity
+/// budget; the caller has already gated this to local connections, so both
+/// replies stay local-socket only.
+async fn dispatch_local_query_message(msg: ClientMessage, context: &mut ClientDispatchContext<'_>) {
+    match msg {
+        ClientMessage::ListRemotePeers => handle_transient_list_remote_peers(context.writer).await,
+        ClientMessage::ListLanPeers => {
+            handle_transient_list_lan_peers(context.server, context.writer).await;
+        }
+        other => debug!(?other, "ignored non-query message in local-query dispatcher"),
     }
 }
 
