@@ -31,7 +31,7 @@ pub enum SpanKind {
 /// continuation indent (e.g. after a program-drawn gutter), not column 0,
 /// so hit-testing and underline drawing consume these per-row segments
 /// instead of deriving geometry from the span's bounding fields.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowSegment {
     /// Absolute grid row (0 = viewport top, negative = scrollback).
     pub row: i32,
@@ -127,40 +127,20 @@ impl UrlSpan {
 fn segments_from_cells(cells: &[LogicalCell]) -> Vec<RowSegment> {
     let mut segments: Vec<RowSegment> = Vec::new();
     for cell in cells {
-        if let Some(seg) = segments.last_mut() {
-            if seg.row == cell.row && cell.col == seg.col_end.saturating_add(1) {
-                seg.col_end = cell.col;
-                continue;
-            }
-        }
-        segments.push(RowSegment { row: cell.row, col_start: cell.col, col_end: cell.col });
+        push_segment_cell(&mut segments, cell.row, cell.col);
     }
     segments
 }
 
-/// Expand an inclusive cell rectangle (first row from `col_start`, middle
-/// rows full width, last row up to `col_end`) into per-row segments.
-///
-/// Used for OSC 8 spans, whose row-major cell walk guarantees full
-/// coverage of every intermediate row.
-fn rect_segments(
-    row_start: i32,
-    col_start: usize,
-    row_end: i32,
-    col_end: usize,
-    last_col: usize,
-) -> Vec<RowSegment> {
-    let mut segments = Vec::new();
-    let mut row = row_start;
-    while row <= row_end {
-        let seg_start = if row == row_start { col_start } else { 0 };
-        let seg_end = if row == row_end { col_end } else { last_col };
-        if seg_start <= seg_end {
-            segments.push(RowSegment { row, col_start: seg_start, col_end: seg_end });
+/// Add one scanned cell to its exact per-row coverage segments.
+fn push_segment_cell(segments: &mut Vec<RowSegment>, row: i32, col: usize) {
+    if let Some(seg) = segments.last_mut() {
+        if seg.row == row && col == seg.col_end.saturating_add(1) {
+            seg.col_end = col;
+            return;
         }
-        row = row.saturating_add(1);
     }
-    segments
+    segments.push(RowSegment { row, col_start: col, col_end: col });
 }
 
 /// URL schemes recognised by the scanner.
@@ -270,38 +250,21 @@ fn scan_visible_urls(term: &Term<VoidListener>) -> Vec<UrlSpan> {
 }
 
 /// Inclusive cell range covered by one OSC 8 span (absolute grid coords).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Osc8CellRange {
-    row_start: i32,
-    col_start: usize,
-    row_end: i32,
-    col_end: usize,
+    segments: Vec<RowSegment>,
 }
 
 impl Osc8CellRange {
     /// Test whether `(row, col)` falls inside this span.
     ///
-    /// Invariant — intermediate rows are always fully covered. Upstream
-    /// VTE emits cells in row-major order through the OSC 8 open/close
-    /// run, so a span that spans rows `row_start..=row_end` covers every
-    /// column on every row in between. Only the start and end rows can be
-    /// partial (start row from `col_start`, end row up to `col_end`).
-    /// Single-row spans live in the first branch; the trailing `true`
-    /// returns "covered" for any middle row position.
+    /// Coverage follows the scanned cells rather than a bounding rectangle.
+    /// This keeps heuristic masking consistent with hover hit-testing when a
+    /// merged OSC 8 run has a partial row between its endpoints.
     fn contains(&self, row: i32, col: usize) -> bool {
-        if row < self.row_start || row > self.row_end {
-            return false;
-        }
-        if self.row_start == self.row_end {
-            return col >= self.col_start && col <= self.col_end;
-        }
-        if row == self.row_start {
-            return col >= self.col_start;
-        }
-        if row == self.row_end {
-            return col <= self.col_end;
-        }
-        true
+        self.segments
+            .iter()
+            .any(|segment| segment.row == row && col >= segment.col_start && col <= segment.col_end)
     }
 }
 
@@ -315,8 +278,7 @@ impl Osc8CellRange {
 /// and fall through to the heuristic detector.
 fn scan_osc8_hyperlinks(term: &Term<VoidListener>, out: &mut Vec<UrlSpan>) -> Vec<Osc8CellRange> {
     let mut ranges = Vec::new();
-    let mut active: Option<(Hyperlink, i32, usize, i32, usize)> = None;
-    let last_col = term.grid().columns().saturating_sub(1);
+    let mut active: Option<Osc8SpanBuilder> = None;
 
     // `display_iter()` yields cells in row-major order across the visible
     // grid. `point.line.0` carries the same `Line(screen_row -
@@ -325,7 +287,7 @@ fn scan_osc8_hyperlinks(term: &Term<VoidListener>, out: &mut Vec<UrlSpan>) -> Ve
     // needed here.
     let iter = term.grid().display_iter();
     {
-        let mut sink = Osc8WalkSink { active: &mut active, out, ranges: &mut ranges, last_col };
+        let mut sink = Osc8WalkSink { active: &mut active, out, ranges: &mut ranges };
         for indexed in iter {
             let point: Point = indexed.point;
             let row_for_span = point.line.0;
@@ -334,7 +296,7 @@ fn scan_osc8_hyperlinks(term: &Term<VoidListener>, out: &mut Vec<UrlSpan>) -> Ve
             process_osc8_cell(&mut sink, cell_link, row_for_span, col_for_span);
         }
     }
-    flush_osc8_span(&mut active, out, &mut ranges, last_col);
+    flush_osc8_span(&mut active, out, &mut ranges);
     tracing::trace!(span_count = ranges.len(), "osc8: scan_visible_urls");
     ranges
 }
@@ -343,12 +305,38 @@ fn scan_osc8_hyperlinks(term: &Term<VoidListener>, out: &mut Vec<UrlSpan>) -> Ve
 /// references so the boundary handler can stay below clippy's argument
 /// count limit while still threading state across the iteration.
 struct Osc8WalkSink<'a> {
-    active: &'a mut Option<(Hyperlink, i32, usize, i32, usize)>,
+    active: &'a mut Option<Osc8SpanBuilder>,
     out: &'a mut Vec<UrlSpan>,
     ranges: &'a mut Vec<Osc8CellRange>,
-    /// Rightmost grid column, needed to expand multi-row spans into
-    /// full-width intermediate `RowSegment`s at flush time.
-    last_col: usize,
+}
+
+/// Exact geometry accumulated for an OSC 8 run while scanning the grid.
+struct Osc8SpanBuilder {
+    link: Hyperlink,
+    row_start: i32,
+    col_start: usize,
+    row_end: i32,
+    col_end: usize,
+    segments: Vec<RowSegment>,
+}
+
+impl Osc8SpanBuilder {
+    fn new(link: Hyperlink, row: i32, col: usize) -> Self {
+        Self {
+            link,
+            row_start: row,
+            col_start: col,
+            row_end: row,
+            col_end: col,
+            segments: vec![RowSegment { row, col_start: col, col_end: col }],
+        }
+    }
+
+    fn extend(&mut self, row: i32, col: usize) {
+        self.row_end = row;
+        self.col_end = col;
+        push_segment_cell(&mut self.segments, row, col);
+    }
 }
 
 /// Update the active-span aggregator with the hyperlink seen on the next
@@ -365,11 +353,10 @@ fn process_osc8_cell(
     // per-cell `Hyperlink::clone` (one atomic refcount op each) the
     // previous shape did unconditionally on every grid cell. The borrow
     // ends before any mutation of `sink.active`.
-    let active_same = matches!((sink.active.as_ref(), cell_link.as_ref()), (Some((a, ..)), Some(b)) if hyperlink_same(a, b));
+    let active_same = matches!((sink.active.as_ref(), cell_link.as_ref()), (Some(a), Some(b)) if hyperlink_same(&a.link, b));
     if active_same {
         if let Some(entry) = sink.active.as_mut() {
-            entry.3 = row;
-            entry.4 = col;
+            entry.extend(row, col);
         }
         return;
     }
@@ -377,17 +364,17 @@ fn process_osc8_cell(
         (false, None) => {}
         (false, Some(link)) => {
             if hyperlink_uri_is_acceptable(&link) {
-                *sink.active = Some((link, row, col, row, col));
+                *sink.active = Some(Osc8SpanBuilder::new(link, row, col));
             }
         }
         (true, Some(next)) => {
-            flush_osc8_span(sink.active, sink.out, sink.ranges, sink.last_col);
+            flush_osc8_span(sink.active, sink.out, sink.ranges);
             if hyperlink_uri_is_acceptable(&next) {
-                *sink.active = Some((next, row, col, row, col));
+                *sink.active = Some(Osc8SpanBuilder::new(next, row, col));
             }
         }
         (true, None) => {
-            flush_osc8_span(sink.active, sink.out, sink.ranges, sink.last_col);
+            flush_osc8_span(sink.active, sink.out, sink.ranges);
         }
     }
 }
@@ -415,12 +402,13 @@ fn hyperlink_uri_is_acceptable(link: &Hyperlink) -> bool {
 }
 
 fn flush_osc8_span(
-    active: &mut Option<(Hyperlink, i32, usize, i32, usize)>,
+    active: &mut Option<Osc8SpanBuilder>,
     out: &mut Vec<UrlSpan>,
     ranges: &mut Vec<Osc8CellRange>,
-    last_col: usize,
 ) {
-    let Some((link, row_start, col_start, row_end, col_end)) = active.take() else {
+    let Some(Osc8SpanBuilder { link, row_start, col_start, row_end, col_end, segments }) =
+        active.take()
+    else {
         return;
     };
     out.push(UrlSpan {
@@ -430,9 +418,9 @@ fn flush_osc8_span(
         col_end,
         url: link.uri().to_owned(),
         kind: SpanKind::Osc8Hyperlink,
-        segments: rect_segments(row_start, col_start, row_end, col_end, last_col),
+        segments: segments.clone(),
     });
-    ranges.push(Osc8CellRange { row_start, col_start, row_end, col_end });
+    ranges.push(Osc8CellRange { segments });
 }
 
 /// Returns `true` when the cell at `(row, col)` falls inside any OSC 8 span.
@@ -1177,7 +1165,8 @@ mod tests {
     use vte::ansi::Processor;
 
     use super::{
-        HardBreakContext, LogicalCell, PaneUrlCache, SpanKind, hard_break_continuation_start,
+        HardBreakContext, LogicalCell, Osc8CellRange, PaneUrlCache, RowSegment, SpanKind,
+        hard_break_continuation_start, segments_from_cells,
     };
 
     #[derive(Clone, Copy)]
@@ -1282,5 +1271,44 @@ mod tests {
             }),
             Some(2)
         );
+    }
+
+    // @lat: [[client#Client#URL Detection#Explicit Hyperlinks]]
+    #[test]
+    fn osc8_segments_keep_full_and_partial_middle_rows_exact() {
+        let full_middle = segments_from_cells(&[
+            LogicalCell { ch: 'a', row: 10, col: 6 },
+            LogicalCell { ch: 'b', row: 10, col: 7 },
+            LogicalCell { ch: 'c', row: 10, col: 8 },
+            LogicalCell { ch: 'd', row: 11, col: 0 },
+            LogicalCell { ch: 'e', row: 11, col: 1 },
+            LogicalCell { ch: 'f', row: 11, col: 2 },
+            LogicalCell { ch: 'g', row: 11, col: 3 },
+            LogicalCell { ch: 'h', row: 11, col: 4 },
+            LogicalCell { ch: 'i', row: 11, col: 5 },
+            LogicalCell { ch: 'j', row: 11, col: 6 },
+            LogicalCell { ch: 'k', row: 11, col: 7 },
+            LogicalCell { ch: 'l', row: 12, col: 0 },
+            LogicalCell { ch: 'm', row: 12, col: 1 },
+        ]);
+        assert_eq!(
+            full_middle,
+            vec![
+                RowSegment { row: 10, col_start: 6, col_end: 8 },
+                RowSegment { row: 11, col_start: 0, col_end: 7 },
+                RowSegment { row: 12, col_start: 0, col_end: 1 },
+            ]
+        );
+
+        let partial_middle = Osc8CellRange {
+            segments: vec![
+                RowSegment { row: 20, col_start: 5, col_end: 7 },
+                RowSegment { row: 21, col_start: 2, col_end: 4 },
+                RowSegment { row: 22, col_start: 0, col_end: 1 },
+            ],
+        };
+        assert!(partial_middle.contains(21, 3));
+        assert!(!partial_middle.contains(21, 1));
+        assert!(!partial_middle.contains(21, 5));
     }
 }
