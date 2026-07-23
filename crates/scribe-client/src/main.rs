@@ -11,7 +11,9 @@ mod disallowed_scheme_dialog;
 mod divider;
 mod input;
 mod ipc_client;
+mod lan_approval;
 mod layout;
+mod lost_control;
 mod mouse_reporting;
 mod mouse_state;
 mod notification_dispatcher;
@@ -20,11 +22,13 @@ mod pane;
 mod paste_confirmation_dialog;
 mod preedit;
 mod prompt_bar;
+mod remote_connect;
 mod restore_replay;
 mod restore_state;
 mod scrollbar;
 mod search_overlay;
 mod selection;
+mod share_view;
 mod smart_selection;
 mod splash;
 mod split_scroll;
@@ -59,7 +63,8 @@ use scribe_common::config::{
 };
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{
-    AutomationAction, PromptMarkKind, SearchMatch, TerminalSize, UpdateProgressState,
+    AutomationAction, ControllerInfo, ParticipantInfo, PromptMarkKind, RemoteRefusal, SearchMatch,
+    ShareEndReason, TerminalSize, UpdateProgressState, WindowInfo,
 };
 use scribe_common::settings_window::{
     SETTINGS_WINDOW_ANCHOR_ENV, SettingsWindowAnchor, SettingsWindowCommand,
@@ -304,10 +309,26 @@ type SessionMetadataMap<'a> = HashMap<SessionId, SessionMetadata<'a>>;
 type WorkspaceRects = Vec<(WorkspaceId, Rect)>;
 type MousePressContext = (Rect, WorkspaceRects);
 
+/// What a command-palette row does when confirmed. Most rows dispatch a shared
+/// [`AutomationAction`]; feature 013 adds a client-local action that opens the
+/// remote-connect picker without touching the wire protocol.
+#[derive(Clone)]
+enum PaletteAction {
+    Automation(AutomationAction),
+    OpenRemoteConnect,
+}
+
 #[derive(Clone)]
 struct CommandPaletteEntry {
     label: String,
-    action: AutomationAction,
+    action: PaletteAction,
+}
+
+impl CommandPaletteEntry {
+    /// Build an entry that dispatches a shared [`AutomationAction`].
+    fn automation(label: impl Into<String>, action: AutomationAction) -> Self {
+        Self { label: label.into(), action: PaletteAction::Automation(action) }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -577,50 +598,22 @@ fn shift_tab_selection_for_pane(
 
 fn base_command_palette_entries() -> Vec<CommandPaletteEntry> {
     vec![
+        CommandPaletteEntry::automation("Open Settings", AutomationAction::OpenSettings),
+        CommandPaletteEntry::automation("Find in Scrollback", AutomationAction::OpenFind),
+        CommandPaletteEntry::automation("New Tab", AutomationAction::NewTab),
+        CommandPaletteEntry::automation("New Claude Tab", AutomationAction::NewClaudeTab),
+        CommandPaletteEntry::automation("Resume Claude Tab", AutomationAction::NewClaudeResumeTab),
+        CommandPaletteEntry::automation("New Codex Tab", AutomationAction::NewCodexTab),
+        CommandPaletteEntry::automation("Resume Codex Tab", AutomationAction::NewCodexResumeTab),
+        CommandPaletteEntry::automation("Split Pane Vertical", AutomationAction::SplitVertical),
+        CommandPaletteEntry::automation("Split Pane Horizontal", AutomationAction::SplitHorizontal),
+        CommandPaletteEntry::automation("Close Pane", AutomationAction::ClosePane),
+        CommandPaletteEntry::automation("Close Tab", AutomationAction::CloseTab),
+        CommandPaletteEntry::automation("New Window", AutomationAction::NewWindow),
+        // Feature 013 (T014): client-local action, not an AutomationAction.
         CommandPaletteEntry {
-            label: String::from("Open Settings"),
-            action: AutomationAction::OpenSettings,
-        },
-        CommandPaletteEntry {
-            label: String::from("Find in Scrollback"),
-            action: AutomationAction::OpenFind,
-        },
-        CommandPaletteEntry { label: String::from("New Tab"), action: AutomationAction::NewTab },
-        CommandPaletteEntry {
-            label: String::from("New Claude Tab"),
-            action: AutomationAction::NewClaudeTab,
-        },
-        CommandPaletteEntry {
-            label: String::from("Resume Claude Tab"),
-            action: AutomationAction::NewClaudeResumeTab,
-        },
-        CommandPaletteEntry {
-            label: String::from("New Codex Tab"),
-            action: AutomationAction::NewCodexTab,
-        },
-        CommandPaletteEntry {
-            label: String::from("Resume Codex Tab"),
-            action: AutomationAction::NewCodexResumeTab,
-        },
-        CommandPaletteEntry {
-            label: String::from("Split Pane Vertical"),
-            action: AutomationAction::SplitVertical,
-        },
-        CommandPaletteEntry {
-            label: String::from("Split Pane Horizontal"),
-            action: AutomationAction::SplitHorizontal,
-        },
-        CommandPaletteEntry {
-            label: String::from("Close Pane"),
-            action: AutomationAction::ClosePane,
-        },
-        CommandPaletteEntry {
-            label: String::from("Close Tab"),
-            action: AutomationAction::CloseTab,
-        },
-        CommandPaletteEntry {
-            label: String::from("New Window"),
-            action: AutomationAction::NewWindow,
+            label: String::from("Connect to remote machine…"),
+            action: PaletteAction::OpenRemoteConnect,
         },
     ]
 }
@@ -635,7 +628,7 @@ fn profile_command_palette_entries(active_profile: Option<&str>) -> Vec<CommandP
             if is_active_profile {
                 label.push_str(" (active)");
             }
-            CommandPaletteEntry { label, action: AutomationAction::SwitchProfile { name } }
+            CommandPaletteEntry::automation(label, AutomationAction::SwitchProfile { name })
         })
         .collect()
 }
@@ -882,6 +875,86 @@ struct App {
     command_palette_items: Vec<CommandPaletteEntry>,
     search_overlay: search_overlay::SearchOverlay,
 
+    /// Feature 013 (T014): remote-machine connect picker overlay.
+    remote_connect: remote_connect::RemoteConnect,
+
+    /// Feature 013 (T017): set when another controller has taken over this
+    /// window. While `Some`, the client freezes its last frame, suppresses all
+    /// input, and renders the displaced banner with one-action reclaim. `None`
+    /// during normal control. Drives both a local client displaced by a remote
+    /// peer and a remote client displaced by a reclaim.
+    window_taken_over: Option<lost_control::LostControlState>,
+
+    /// Feature 013 (T030): auto-reconnect overlay for a controlling-side window
+    /// whose remote link dropped. While `Some`, the window is a full-window modal
+    /// — input is suppressed and only Cancel (while retrying) or the one-action
+    /// reconnect (once settled) is honored. `None` during a live link.
+    reconnect_overlay: Option<remote_connect::ReconnectOverlay>,
+    /// Feature 013 (T030): cancel switch for this process's remote auto-reconnect
+    /// loop. `Some` only for a remote-dialed process; fired when the user cancels
+    /// the reconnecting overlay or the peer delivers an authoritative sever.
+    reconnect_cancel: Option<ipc_client::RemoteReconnectCancel>,
+    /// Feature 013 (T030): when set, a reconnect just succeeded and the existing
+    /// panes must be re-attached (fresh replay convergence) once this short grace
+    /// elapses. The grace lets a displacing `WindowTakenOver` land first so a
+    /// reconnect that raced a reclaim never re-points the sessions away from the
+    /// new controller (Scenario 4 step 3). Serviced in `about_to_wait`.
+    reconnect_reattach_at: Option<Instant>,
+    /// Feature 013 (T030): whether a `Welcome` has already been processed. A
+    /// remote reconnect re-issues `Hello`, so the server sends a fresh `Welcome`;
+    /// the one-time startup work (geometry restore, sibling-window fan-out) must
+    /// run only on the first one.
+    has_welcomed: bool,
+
+    /// Feature 013 (T022) + feature 014 (T016): `true` when this process dialed a
+    /// REMOTE peer over either transport — the tailnet path (`SCRIBE_REMOTE_DIAL`,
+    /// 013) or the direct-LAN path (`SCRIBE_LAN_DIAL`, 014) — i.e. it is a
+    /// controlling-side window rather than a local owning window. Derived from
+    /// [`Self::remote_transport`], captured once at startup because the env is
+    /// fixed for the process lifetime. Gates the owning-machine remote status
+    /// surfaces off for controlling-side windows.
+    remote_dialed: bool,
+    /// Feature 014 (T016/T025): which transport this controlling-side window
+    /// dialed over — `Some(Tailnet)` for the 013 tailnet path, `Some(Lan)` for the
+    /// 014 direct-LAN path, `None` on an ordinary local window. Drives the status
+    /// bar's transport indicator (T025, FR-009) and routes the reclaim /
+    /// one-action reconnect re-dial over the same transport (T016). Fixed for the
+    /// process lifetime (derived from the launch env).
+    remote_transport: Option<remote_connect::PeerTransport>,
+    /// Feature 013 (T022): one entry per window on THIS machine that a remote
+    /// peer currently controls (device + account), cached from the local
+    /// server's [`ServerMessage::WindowList`]. Drives the status-bar controller
+    /// segment (FR-009b) and covers remotely-created windows with no local
+    /// client (SC-006). Empty while nothing is remote-controlled.
+    remote_controlled_windows: Vec<ControllerInfo>,
+    /// Feature 013 (T022): last time this process polled the local server for
+    /// its window list. Throttles the poll to [`WINDOW_LIST_POLL_INTERVAL`]
+    /// while `remote.enabled`; unused (and never polled) when the feature is off.
+    last_window_list_poll: Instant,
+
+    /// Feature 015 (T015/T024): latest `ShareRoster` for this window, or `None`
+    /// outside a broadcasting share (`SingleController` / solo). Drives the
+    /// live-viewer input suppression, the claim/request affordances, and the
+    /// presence badge. Cleared on `ShareEnded` or a roster that shrinks to one.
+    share_state: Option<share_view::ShareState>,
+    /// Feature 015 (T015): this client's own participant id within
+    /// [`Self::share_state`], resolved from the roster — the `is_local` entry on
+    /// the owning machine's own client, or a best-effort device-name match on a
+    /// remote-dialed client (see [`Self::resolve_share_self_id`]). Latched so it
+    /// stays stable across roster frames.
+    share_self_id: Option<u64>,
+    /// Feature 015 self-id: this connection's own `participant_id` as reported
+    /// authoritatively in the server's `Welcome`. Preferred over device-name
+    /// matching for a remote-dialed client; `None` from an older server.
+    welcome_participant_id: Option<u64>,
+    /// Feature 015 (T020): transient viewer hint naming the control holder and how
+    /// to take control, shown when a viewer presses a suppressed key. Non-modal —
+    /// live output streams behind it. Cleared on expiry, role change, or take.
+    control_hint: Option<share_view::ControlHint>,
+    /// Feature 015 (T020): an incoming request-and-grant control request awaiting
+    /// this holder/owner's grant-or-deny decision. Modal while set.
+    control_request_prompt: Option<share_view::ControlRequestPrompt>,
+
     // Workspace notes
     workspace_notes: workspace_notes::WorkspaceNotesStore,
     workspace_notes_modal: WorkspaceNotesModal,
@@ -1052,6 +1125,13 @@ struct App {
     /// confirm the parked bytes are delivered byte-identically.
     paste_confirmation_dialog: Option<paste_confirmation_dialog::PasteConfirmationDialog>,
 
+    /// Feature 014 (T018): owning-side LAN device-approval prompt. Set when the
+    /// local server pushes a `LanApprovalRequest` for an unknown device held
+    /// pending after the mutual-TLS handshake; the user's Approve / Decline
+    /// becomes a `LanApprovalDecision`. At most one in-flight; while open it
+    /// captures all input so nothing reaches the PTY (SEC-001/002, UX-002).
+    lan_approval_dialog: Option<lan_approval::LanApprovalDialog>,
+
     /// Cached `Welcome.clipboard_gating` flag from the server (spec 010
     /// C7). When `false` the client defensively no-ops on receipt of the
     /// new OSC 52 server variants. Initialised to `false` and flipped to
@@ -1126,6 +1206,11 @@ impl App {
         let bindings = input::Bindings::parse(&config.keybindings);
         let smart_selection =
             smart_selection::CompiledSmartSelection::compile(&config.terminal.smart_selection);
+        // Feature 014 (T016/T025): the transport this controlling-side window
+        // dialed over, from the fixed launch env (tailnet `SCRIBE_REMOTE_DIAL` /
+        // LAN `SCRIBE_LAN_DIAL`). `remote_dialed` derives from it so a LAN-attached
+        // window is recognized as controlling-side exactly like a tailnet one.
+        let remote_transport = Self::remote_redial_target().map(|(_, _, transport)| transport);
 
         Self {
             window_id: None,
@@ -1151,6 +1236,17 @@ impl App {
             clipboard: None, zoom_level: 0,
             command_palette: command_palette::CommandPalette::new(), command_palette_items: Vec::new(),
             search_overlay: search_overlay::SearchOverlay::new(),
+            remote_connect: remote_connect::RemoteConnect::new(),
+            window_taken_over: None,
+            reconnect_overlay: None, reconnect_cancel: None,
+            reconnect_reattach_at: None,
+            has_welcomed: false,
+            remote_dialed: remote_transport.is_some(),
+            remote_transport,
+            remote_controlled_windows: Vec::new(),
+            last_window_list_poll: Instant::now(),
+            share_state: None, share_self_id: None, welcome_participant_id: None,
+            control_hint: None, control_request_prompt: None,
             workspace_notes: workspace_notes::WorkspaceNotesStore::load(),
             workspace_notes_modal: WorkspaceNotesModal::new(), workspace_notes_save_pending: None,
             adding_note_states: HashMap::new(),
@@ -1185,6 +1281,7 @@ impl App {
             hover_cell: None, hover_started_at: None, hover_tooltip_visible: false,
             hover_tooltip_uri: None, disallowed_scheme_dialog: None,
             clipboard_dialog: None, paste_confirmation_dialog: None,
+            lan_approval_dialog: None,
             server_clipboard_gating: false,
             config_watcher_keepalive: None,
         }
@@ -1242,6 +1339,7 @@ impl ApplicationHandler<UiEvent> for App {
             || self.handle_workspace_user_event(event_loop, &event)
             || self.handle_lifecycle_user_event(event_loop, &event)
             || self.handle_update_user_event(&event)
+            || self.handle_remote_user_event(&event)
             || self.handle_clipboard_user_event(event);
     }
 
@@ -1277,6 +1375,9 @@ impl ApplicationHandler<UiEvent> for App {
         self.flush_resize_if_pending();
         self.flush_restore_if_due();
         self.flush_workspace_notes_if_due();
+        self.poll_window_list_if_due();
+        self.flush_reconnect_reattach_if_due();
+        self.clear_control_hint_if_expired();
 
         // Layer 2 defence-in-depth: lazily drop any `Processing` state from
         // a dead/killed AI that can never send a terminal hook. Costs
@@ -1473,7 +1574,12 @@ impl App {
                 self.handle_animation_tick();
                 true
             }
-            UiEvent::Welcome { window_id, other_windows } => {
+            UiEvent::Welcome { window_id, other_windows, participant_id } => {
+                // Feature 015 self-id: latch the server's authoritative participant
+                // id so roster resolution matches this connection exactly.
+                if participant_id.is_some() {
+                    self.welcome_participant_id = *participant_id;
+                }
                 self.handle_welcome(event_loop, *window_id, other_windows);
                 true
             }
@@ -1487,6 +1593,10 @@ impl App {
             }
             UiEvent::RunAction { action } => {
                 self.execute_automation_action(action.clone());
+                true
+            }
+            UiEvent::WindowTakenOver { device_name, login_name } => {
+                self.handle_window_taken_over(device_name.clone(), login_name.clone());
                 true
             }
             UiEvent::ServerError { message } => {
@@ -1522,6 +1632,111 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// Feature 013: remote connect-flow and auto-reconnect lifecycle events —
+    /// picker dial outcomes / peer + window lists (T014), the owning-machine
+    /// window-list poll (T022), and the auto-reconnect overlay spinner /
+    /// convergence / settled-failure (T030).
+    fn handle_remote_user_event(&mut self, event: &UiEvent) -> bool {
+        match event {
+            UiEvent::RemoteDialOutcome { outcome } => {
+                tracing::info!(?outcome, "remote dial outcome");
+                self.remote_connect.on_dial_outcome(*outcome);
+                self.request_redraw();
+            }
+            UiEvent::RemoteSevered { reason } => {
+                // A delivered sever / reconnect refusal settles the picker (T009)
+                // or the working-window reconnect overlay (T030).
+                tracing::info!(?reason, "remote connection severed by peer");
+                self.remote_connect.on_severed(*reason);
+                if self.remote_dialed {
+                    self.settle_reconnect_terminal(*reason);
+                }
+                self.request_redraw();
+            }
+            UiEvent::RemotePeerList { peers } => {
+                self.remote_connect.set_peers(peers.clone());
+                self.request_redraw();
+            }
+            UiEvent::LanPeerList { peers } => {
+                // Feature 014 (T014): the local server's mDNS-discovered LAN peers,
+                // merged into the picker's device list by machine name (T024).
+                self.remote_connect.set_lan_peers(peers.clone());
+                self.request_redraw();
+            }
+            UiEvent::RemoteWindowList { host, port, windows } => {
+                self.remote_connect.set_windows(host, *port, windows.clone());
+                self.request_redraw();
+            }
+            UiEvent::LocalWindowList { windows } => self.handle_local_window_list(windows.clone()),
+            UiEvent::RemoteReconnecting { attempt } => self.handle_remote_reconnecting(*attempt),
+            UiEvent::RemoteReconnected => self.handle_remote_reconnected(),
+            UiEvent::RemoteReconnectFailed => self.handle_remote_reconnect_failed(),
+            UiEvent::LanDialOutcome { outcome } => {
+                // Feature 014 (T014): the typed LAN dial outcome (TLS + approval
+                // gate). The "Local network" picker source drives its success /
+                // typed-refusal copy from this on the in-process LAN window probe;
+                // a spawned attach process has no open picker, so this no-ops there
+                // (mirrors the tailnet `RemoteDialOutcome` path).
+                tracing::info!(?outcome, "LAN dial outcome");
+                self.remote_connect.on_lan_dial_outcome(*outcome);
+                self.request_redraw();
+            }
+            UiEvent::LanAwaitingApproval => {
+                // Feature 014 (T019): the LAN link reached the peer but is held
+                // pending the owning user's device approval. Swap the picker's
+                // window-step loading note for the cancelable "Waiting for approval
+                // on <peer>…" overlay; it settles when the window list arrives
+                // (approved) or the dial is refused. A spawned attach process (no
+                // open picker) no-ops.
+                tracing::info!("LAN connection awaiting device approval on peer");
+                self.remote_connect.on_awaiting_approval();
+                self.request_redraw();
+            }
+            UiEvent::LanApprovalRequest {
+                request_id,
+                device_name,
+                fingerprint_words,
+                network_label,
+                name_collision,
+            } => {
+                // Feature 014 (T018): an unknown LAN device is held pending on THIS
+                // machine. Raise the approval prompt; no window or session data has
+                // been revealed and none will until the user approves (SEC-001/002).
+                // A late-arriving request while one is already showing replaces it
+                // (each is answered by its own `request_id`).
+                tracing::info!(
+                    request_id,
+                    %device_name,
+                    %network_label,
+                    name_collision,
+                    "raising LAN device-approval prompt"
+                );
+                self.lan_approval_dialog = Some(lan_approval::LanApprovalDialog::new(
+                    *request_id,
+                    device_name.clone(),
+                    fingerprint_words.clone(),
+                    network_label.clone(),
+                    *name_collision,
+                ));
+                self.request_redraw();
+            }
+            UiEvent::ShareRoster { window_id, participants, mode, holder } => {
+                self.handle_share_roster(*window_id, participants.clone(), *mode, *holder);
+            }
+            UiEvent::ControlRequested { window_id, from } => {
+                self.handle_control_requested(*window_id, from);
+            }
+            UiEvent::ControlDenied { window_id } => {
+                self.handle_control_denied(*window_id);
+            }
+            UiEvent::ShareEnded { window_id, reason } => {
+                self.handle_share_ended(*window_id, *reason);
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Spec 010 C5 / C7: handle the OSC 52 clipboard UI events fanned out
@@ -1727,6 +1942,36 @@ impl App {
         event_loop: &ActiveEventLoop,
         event: &WindowEvent,
     ) -> bool {
+        // Feature 013 (T017): a displaced window is a full-window modal — every
+        // input event is intercepted here (so nothing leaks to the PTY) and the
+        // sole affordance is the one-action reclaim. Checked first so it wins
+        // over any dialog that happened to be open at takeover time.
+        if self.window_taken_over.is_some() {
+            self.handle_lost_control_window_event(event_loop, event);
+            return true;
+        }
+        // Feature 013 (T030): a reconnecting / settled-disconnected window is a
+        // full-window modal too — only Cancel or the one-action reconnect / close
+        // are honored; nothing reaches the frozen sessions.
+        if self.reconnect_overlay.is_some() {
+            self.handle_reconnect_overlay_window_event(event_loop, event);
+            return true;
+        }
+        // Feature 014 (T018): the owning-side LAN device-approval prompt is a
+        // full-window modal too — it must capture every event so nothing reaches
+        // the PTY while an unknown device is held pending (SEC-001/002). Checked
+        // ahead of the other dialogs so, in the rare event it co-occurs with one,
+        // the topmost-drawn prompt is also the one receiving input.
+        if self.lan_approval_dialog.is_some() {
+            self.handle_lan_approval_dialog_window_event(event_loop, event);
+            return true;
+        }
+        // Feature 015 (T020): the grant/deny prompt is a full-window modal so the
+        // holder/owner answers a pending control request before typing resumes.
+        if self.control_request_prompt.is_some() {
+            self.handle_control_request_prompt_window_event(event_loop, event);
+            return true;
+        }
         if self.close_dialog.is_some() {
             self.handle_close_dialog_window_event(event_loop, event);
             return true;
@@ -1752,6 +1997,40 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Per-window event dispatch while the LAN device-approval prompt is visible
+    /// (feature 014, T018). Mirrors the sibling dialogs' Esc / Tab / Enter / click
+    /// discipline so no keystroke leaks to the PTY while an unknown device is held
+    /// pending (SEC-001/002); Esc declines (the safe default).
+    fn handle_lan_approval_dialog_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => self.handle_close_requested(event_loop),
+            WindowEvent::RedrawRequested => self.handle_redraw(),
+            WindowEvent::Resized(size) => self.handle_resize_and_mark_geometry(*size),
+            WindowEvent::Moved(_) => self.mark_geometry_dirty(),
+            WindowEvent::ModifiersChanged(new_mods) => self.modifiers = new_mods.state(),
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if self.handle_native_close_window_shortcut(key_event, event_loop) {
+                    return;
+                }
+                self.handle_lan_approval_dialog_keyboard(key_event);
+            }
+            WindowEvent::MouseInput {
+                state: winit::event::ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => self.handle_lan_approval_dialog_click(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.update_cursor_position(position);
+                self.handle_lan_approval_dialog_hover();
+            }
+            _ => {}
+        }
     }
 
     /// Per-window event dispatch while the paste-confirmation dialog is
@@ -2073,12 +2352,14 @@ impl App {
         // the other modal surfaces.
         if self.search_overlay.is_active()
             || self.command_palette.is_active()
+            || self.remote_connect.is_active()
             || self.workspace_notes_modal.is_open()
             || self.close_dialog.is_some()
             || self.update_dialog.is_some()
             || self.disallowed_scheme_dialog.is_some()
             || self.clipboard_dialog.is_some()
             || self.paste_confirmation_dialog.is_some()
+            || self.lan_approval_dialog.is_some()
             || self.context_menu.is_some()
             || self.focused_inline_editor.is_some()
         {
@@ -2349,7 +2630,9 @@ impl App {
         // Start IPC thread (proxy was created before run_app).
         step_start = Instant::now();
         let proxy = self.proxy.take().ok_or(InitError::ProxyConsumed)?;
-        let cmd_tx = ipc_client::start_ipc_thread(proxy, self.window_id);
+        let ipc_client::IpcHandle { commands: cmd_tx, reconnect_cancel } =
+            ipc_client::start_ipc_thread(proxy, self.window_id);
+        self.reconnect_cancel = reconnect_cancel;
         log_startup_step("start_ipc_thread", step_start.elapsed(), startup_start.elapsed());
 
         // Start the platform notification dispatcher on its own
@@ -2551,6 +2834,14 @@ impl App {
     /// decided from pane-local frame queues to preserve synchronized-update
     /// commit boundaries.
     fn drain_pending_pty_output(&mut self) {
+        // Feature 013 (T017): once displaced, freeze the last frame — drop any
+        // buffered PTY output instead of advancing the grids. The server sends
+        // no further `PtyOutput` to a displaced client, so this only guards the
+        // takeover race; the frozen grids read cleanly under the dim banner.
+        if self.window_taken_over.is_some() {
+            self.pending_pty_bytes.clear();
+            return;
+        }
         if self.pending_pty_bytes.is_empty() {
             return;
         }
@@ -4055,11 +4346,47 @@ impl App {
     fn next_idle_wake_deadline(&mut self) -> Option<Instant> {
         let blink = self.next_blink_wake();
         let timer = self.next_prompt_timer_wake();
-        match (blink, timer) {
-            (Some(b), Some(t)) => Some(b.min(t)),
-            (Some(b), None) => Some(b),
-            (None, Some(t)) => Some(t),
-            (None, None) => None,
+        let poll = self.next_window_list_poll_wake();
+        // Feature 013 (T030): wake to service a due post-reconnect re-attach even
+        // when the window is otherwise idle.
+        // Feature 015 (T020): wake to clear an expired viewer control hint.
+        let hint = self.control_hint.as_ref().map(share_view::ControlHint::expires_at);
+        [blink, timer, poll, self.reconnect_reattach_at, hint].into_iter().flatten().min()
+    }
+
+    /// Remote-status-poll contribution to the idle wake deadline (feature 013,
+    /// T022): while `remote.enabled` on this owning-machine client, wake at the
+    /// next poll boundary so the controller segment refreshes even when the
+    /// window is otherwise idle. `None` (no wake scheduled) when the feature is
+    /// off or this is a controlling-side (remote-dialed) window. The actual
+    /// request is issued by [`Self::poll_window_list_if_due`].
+    fn next_window_list_poll_wake(&self) -> Option<Instant> {
+        if self.remote_dialed || !self.config.remote.enabled {
+            return None;
+        }
+        Some(self.last_window_list_poll + WINDOW_LIST_POLL_INTERVAL)
+    }
+
+    /// Issue a window-list poll when one is due (feature 013, T022). Called
+    /// unconditionally from `about_to_wait`; internally throttled to
+    /// [`WINDOW_LIST_POLL_INTERVAL`] and gated to owning-machine windows with
+    /// `remote.enabled`, so it is a no-op (and sends nothing) otherwise.
+    fn poll_window_list_if_due(&mut self) {
+        if self.remote_dialed || !self.config.remote.enabled {
+            return;
+        }
+        if self.last_window_list_poll.elapsed() >= WINDOW_LIST_POLL_INTERVAL {
+            self.request_window_list();
+            self.last_window_list_poll = Instant::now();
+        }
+    }
+
+    /// Ask the local server for its window list so the owning-machine status bar
+    /// can surface remote-controlled windows (feature 013, T022). The reply
+    /// arrives as [`UiEvent::LocalWindowList`].
+    fn request_window_list(&self) {
+        if let Some(tx) = &self.cmd_tx {
+            send_command(tx, ClientCommand::ListWindows);
         }
     }
 
@@ -4460,6 +4787,9 @@ impl App {
             }
         };
         let plan = ConfigReloadPlan::analyze(&self.config, &new_config);
+        // Feature 013 (T022): capture the pre-reload remote-enabled state so the
+        // owning-machine status surfaces can react to a live toggle below.
+        let remote_was_enabled = self.config.remote.enabled;
 
         self.reload_theme_if_needed(&new_config, plan.theme_changed());
         self.reload_fonts_if_needed(&new_config, plan.font_changed());
@@ -4475,7 +4805,30 @@ impl App {
             self.log_smart_selection_errors();
         }
         self.config = new_config;
+        self.apply_remote_status_config(remote_was_enabled);
         self.finish_config_reload(&plan);
+    }
+
+    /// Feature 013 (T022): react to a live `remote.enabled` change for the
+    /// owning-machine status surfaces. On disable, drop any cached controller
+    /// info so the segment clears at once (the server has already severed remote
+    /// connections). On a fresh enable, poll immediately so the periodic refresh
+    /// starts now and repaint so the enabled indicator appears without delay.
+    fn apply_remote_status_config(&mut self, remote_was_enabled: bool) {
+        if self.remote_dialed {
+            return;
+        }
+        let now_enabled = self.config.remote.enabled;
+        if remote_was_enabled && !now_enabled {
+            if !self.remote_controlled_windows.is_empty() {
+                self.remote_controlled_windows.clear();
+            }
+            self.request_redraw();
+        } else if !remote_was_enabled && now_enabled {
+            self.request_window_list();
+            self.last_window_list_poll = Instant::now();
+            self.request_redraw();
+        }
     }
 
     fn rebuild_smart_selection_from_config(&mut self) {
@@ -5234,6 +5587,22 @@ impl App {
         // tooltip renderer as the chrome tooltips above.
         self.apply_osc8_hover_tooltip_overlay(prepared, all_instances);
         self.apply_palette_or_search_overlay(prepared, all_instances);
+        self.apply_remote_connect_overlay(prepared, all_instances);
+        // Feature 014 (T018): the owning-side LAN approval prompt draws above the
+        // connect picker — the one overlay it can realistically co-occur with
+        // (an inbound approval arriving while the user is dialing out) — matching
+        // its input priority in `handle_modal_window_event`.
+        self.apply_lan_approval_overlay(prepared, all_instances);
+        // Feature 015 (T015/T020): the live-viewer control hint and the holder's
+        // grant/deny prompt. Drawn above the terminal (the window stays live) but
+        // below the displaced/reconnect chrome, which fully takes over the window.
+        self.apply_share_overlays(prepared, all_instances);
+        // Feature 013 (T030): the reconnect overlay dims the frozen window while
+        // the link is being re-established or has settled disconnected.
+        self.apply_reconnect_overlay(prepared, all_instances);
+        // Feature 013 (T017): displaced banner is drawn last so its dim + banner
+        // sit above every other overlay while this window is taken over.
+        self.apply_lost_control_overlay(prepared, all_instances);
         if self.opacity < 1.0 {
             apply_opacity_to_instances(all_instances, self.opacity);
         }
@@ -5392,7 +5761,27 @@ impl App {
             last_command_status: prepared.status.focused_pane_last_command_status,
             env_status: prepared.status.focused_pane_env_status.as_ref(),
             session_count: prepared.status.session_count,
+            // Feature 013 (T022): owning-machine remote surfaces only. A
+            // controlling-side (remote-dialed) window shows neither the enabled
+            // indicator nor the controller segment; its cache is never polled.
+            remote: status_bar::RemoteStatusData {
+                enabled: !self.remote_dialed && self.config.remote.enabled,
+                controllers: &self.remote_controlled_windows,
+            },
+            // Feature 015 (T024/T026): the presence badge — participant count and
+            // holder — from the latest roster. Present for every participant,
+            // including the owning machine, whenever more than one is attached.
+            share_presence: self.share_state.as_ref().filter(|s| s.is_multi()).map(|s| {
+                status_bar::SharePresenceData {
+                    participant_count: s.participant_count(),
+                    holder: s.holder_label(),
+                }
+            }),
             host_label,
+            // Feature 014 (T025): the transport this controlling-side window is
+            // driving the remote machine over ("Local network" / "Tailscale");
+            // `None` (renders nothing) on owning / local windows (FR-009).
+            remote_transport: self.remote_transport.map(remote_connect::PeerTransport::label),
             tmux_label,
             time: &time_str,
             update_available: self.update_available.as_deref(),
@@ -5510,6 +5899,27 @@ impl App {
     /// sibling of [`Self::apply_modal_overlays`] in the overlay-composition
     /// sequence; kept separate so neither function exceeds the line limit.
     /// Only one modal is ever open at a time, so ordering is cosmetic.
+    /// Feature 014 (T018): render the owning-side LAN device-approval prompt as
+    /// [`CellInstance`] quads, mirroring `apply_paste_confirmation_overlay`.
+    fn apply_lan_approval_overlay(
+        &mut self,
+        prepared: &PreparedFrame,
+        all_instances: &mut Vec<CellInstance>,
+    ) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        if let Some(dialog) = &mut self.lan_approval_dialog {
+            let mut lan_approval_dialog_resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            dialog.build_instances(lan_approval::LanApprovalDialogBuildContext {
+                out: all_instances,
+                viewport: prepared.full_viewport,
+                cell_size: prepared.cell_size,
+                chrome: &self.theme.chrome,
+                resolve_glyph: &mut lan_approval_dialog_resolve_glyph,
+            });
+        }
+    }
+
     fn apply_paste_confirmation_overlay(
         &mut self,
         prepared: &PreparedFrame,
@@ -5596,8 +6006,10 @@ impl App {
             && self.disallowed_scheme_dialog.is_none()
             && self.clipboard_dialog.is_none()
             && self.paste_confirmation_dialog.is_none()
+            && self.lan_approval_dialog.is_none()
             && !self.command_palette.is_active()
             && !self.search_overlay.is_active()
+            && !self.remote_connect.is_active()
     }
 
     fn prompt_tooltip_anchor(&self, prepared: &PreparedFrame) -> Option<(String, Rect)> {
@@ -5873,6 +6285,102 @@ impl App {
         }
     }
 
+    /// Draw the feature-013 remote-connect picker over the terminal, on the same
+    /// GPU pass as the other overlays.
+    fn apply_remote_connect_overlay(
+        &mut self,
+        prepared: &PreparedFrame,
+        all_instances: &mut Vec<CellInstance>,
+    ) {
+        if !self.remote_connect.is_active() {
+            return;
+        }
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let mut resolve_glyph = |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+        self.remote_connect.build_instances(remote_connect::RemoteConnectBuildContext {
+            out: all_instances,
+            viewport: prepared.full_viewport,
+            cell_size: prepared.cell_size,
+            chrome: &self.theme.chrome,
+            resolve_glyph: &mut resolve_glyph,
+        });
+    }
+
+    /// Feature 013 (T030): draw the auto-reconnect overlay (dim backdrop +
+    /// centered box) over the frozen window. No-op during a live link.
+    fn apply_reconnect_overlay(
+        &mut self,
+        prepared: &PreparedFrame,
+        all_instances: &mut Vec<CellInstance>,
+    ) {
+        let Some(overlay) = self.reconnect_overlay.as_ref() else { return };
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let mut resolve_glyph = |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+        overlay.build_instances(remote_connect::RemoteConnectBuildContext {
+            out: all_instances,
+            viewport: prepared.full_viewport,
+            cell_size: prepared.cell_size,
+            chrome: &self.theme.chrome,
+            resolve_glyph: &mut resolve_glyph,
+        });
+    }
+
+    /// Feature 013 (T017): draw the displaced-client dim backdrop + banner over
+    /// the frozen frame. Drawn last so it dominates any overlay that was open at
+    /// takeover time; a no-op during normal control.
+    fn apply_lost_control_overlay(
+        &mut self,
+        prepared: &PreparedFrame,
+        all_instances: &mut Vec<CellInstance>,
+    ) {
+        let Some(state) = self.window_taken_over.as_ref() else { return };
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let mut resolve_glyph = |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+        state.build_instances(lost_control::LostControlBuildContext {
+            out: all_instances,
+            viewport: prepared.full_viewport,
+            cell_size: prepared.cell_size,
+            chrome: &self.theme.chrome,
+            resolve_glyph: &mut resolve_glyph,
+        });
+    }
+
+    /// Feature 015 (T015/T020): draw the live-viewer control hint and, above it,
+    /// the holder/owner grant-deny prompt. The window stays live behind them (no
+    /// freeze), so a displaced window (`window_taken_over`) never shows these.
+    fn apply_share_overlays(
+        &mut self,
+        prepared: &PreparedFrame,
+        all_instances: &mut Vec<CellInstance>,
+    ) {
+        if self.window_taken_over.is_some() {
+            return;
+        }
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        if let Some(hint) = self.control_hint.as_ref() {
+            let mut resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            hint.build_instances(share_view::ShareOverlayContext {
+                out: all_instances,
+                viewport: prepared.full_viewport,
+                cell_size: prepared.cell_size,
+                chrome: &self.theme.chrome,
+                resolve_glyph: &mut resolve_glyph,
+            });
+        }
+        if let Some(prompt) = self.control_request_prompt.as_ref() {
+            let mut resolve_glyph =
+                |ch: char| gpu.renderer.resolve_glyph(&gpu.device, &gpu.queue, ch);
+            prompt.build_instances(share_view::ShareOverlayContext {
+                out: all_instances,
+                viewport: prepared.full_viewport,
+                cell_size: prepared.cell_size,
+                chrome: &self.theme.chrome,
+                resolve_glyph: &mut resolve_glyph,
+            });
+        }
+    }
+
     fn present_terminal_frame(
         &mut self,
         frame: wgpu::SurfaceTexture,
@@ -6051,7 +6559,9 @@ impl App {
             return;
         }
 
-        if self.handle_command_palette_keyboard(event) || self.handle_search_overlay_keyboard(event)
+        if self.handle_remote_connect_keyboard(event)
+            || self.handle_command_palette_keyboard(event)
+            || self.handle_search_overlay_keyboard(event)
         {
             return;
         }
@@ -6156,6 +6666,13 @@ impl App {
     }
 
     fn handle_terminal_key(&mut self, bytes: Vec<u8>) {
+        // Feature 015 (T015/T020): a live viewer sends no input to the PTY (the
+        // server drops it anyway). Suppress the keystroke locally and instead
+        // surface the "who has control" affordance, so a viewer never leaks dead
+        // keystrokes and can take control from the hint.
+        if self.intercept_viewer_key(&bytes) {
+            return;
+        }
         let Some(tx) = self.cmd_tx.clone() else { return };
         let focused_pane_id = {
             let Some(tab) = self.window_layout.active_tab() else { return };
@@ -6346,6 +6863,728 @@ impl App {
             AutomationAction::OpenUpdateDialog => self.open_update_dialog(),
             AutomationAction::FocusSession { session_id } => {
                 self.handle_focus_session(session_id);
+            }
+        }
+    }
+
+    /// Dispatch a confirmed command-palette row. Shared automation actions run
+    /// through [`Self::execute_automation_action`]; the feature-013 client-local
+    /// action opens the remote-connect picker.
+    fn execute_palette_action(&mut self, action: PaletteAction) {
+        match action {
+            PaletteAction::Automation(action) => self.execute_automation_action(action),
+            PaletteAction::OpenRemoteConnect => self.open_remote_connect(),
+        }
+    }
+
+    /// Open the remote-connect picker (feature 013, T014) and immediately ask
+    /// this machine's own server for its same-account online tailnet peers to
+    /// populate the device list.
+    fn open_remote_connect(&mut self) {
+        self.search_overlay.close();
+        self.command_palette.close();
+        self.command_palette_items.clear();
+        if !self.adding_note_states.is_empty() {
+            self.dismiss_all_inline_editors();
+        }
+        self.remote_connect.open();
+        self.request_remote_peers();
+        self.request_redraw();
+    }
+
+    /// Refresh the connect picker's device list over the local IPC connection:
+    /// the 013 tailnet peers (`ListRemotePeers`) and the 014 mDNS-discovered LAN
+    /// peers (`ListLanPeers`), merged by machine name in the picker (T024).
+    fn request_remote_peers(&mut self) {
+        if let Some(tx) = &self.cmd_tx {
+            if tx.send(ClientCommand::ListRemotePeers).is_err() {
+                tracing::warn!("IPC channel closed; could not request remote peer list");
+            }
+            if tx.send(ClientCommand::ListLanPeers).is_err() {
+                tracing::warn!("IPC channel closed; could not request LAN peer list");
+            }
+        }
+    }
+
+    /// Handle a key press while the remote-connect picker owns the keyboard.
+    /// Returns `true` when the picker consumed the event (feature 013, T014).
+    fn handle_remote_connect_keyboard(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if !self.remote_connect.is_active() {
+            return false;
+        }
+        if event.state != winit::event::ElementState::Pressed {
+            return true;
+        }
+        let action = self.remote_connect.handle_key(event, self.modifiers);
+        self.apply_remote_connect_action(action);
+        true
+    }
+
+    /// Act on the intent the picker produced from a key press.
+    fn apply_remote_connect_action(&mut self, action: remote_connect::RemoteConnectAction) {
+        use remote_connect::RemoteConnectAction as Action;
+        match action {
+            Action::None => {}
+            Action::Redraw => self.request_redraw(),
+            Action::Close => {
+                self.remote_connect.close();
+                self.request_redraw();
+            }
+            Action::RequestPeers => {
+                self.request_remote_peers();
+                self.request_redraw();
+            }
+            Action::ProbeWindows { host, port, transport } => {
+                self.probe_windows(host, port, transport);
+                self.request_redraw();
+            }
+            Action::Attach { host, port, window_id, transport } => {
+                // Feature 015 (picker-join): a default connect dials
+                // `Hello { takeover: false }` and lets the server decide — an
+                // additive share join in a shared mode, or the legacy `LostControl`
+                // (whose banner offers explicit reclaim) in `SingleController`.
+                // Explicit take-over stays on the reclaim path (`reclaim_window`).
+                spawn_client_for_transport(transport, &host, port, Some(window_id), false);
+                self.remote_connect.close();
+                self.request_redraw();
+            }
+            Action::NewWindow { host, port, transport } => {
+                // T018: a fresh window on the peer — Hello { window_id: None }.
+                spawn_client_for_transport(transport, &host, port, None, false);
+                self.remote_connect.close();
+                self.request_redraw();
+            }
+            Action::PasteManual => {
+                if let Some(text) = self.read_clipboard_text() {
+                    self.remote_connect.append_manual(&text);
+                    self.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// Feature 013 (T017): enter the displaced "lost control" state after the
+    /// server reports another controller claimed this window. Freezes the last
+    /// frame (via the [`Self::drain_pending_pty_output`] gate), records the new
+    /// controller's identity for the banner, and repaints. Any transient input
+    /// gate that was open is dismissed so only the displaced banner remains — the
+    /// window is no longer interactive until the user reclaims it.
+    fn handle_window_taken_over(&mut self, device_name: String, login_name: String) {
+        tracing::info!(%device_name, %login_name, "window taken over; entering displaced state");
+        self.window_taken_over = Some(lost_control::LostControlState::new(device_name, login_name));
+        // Drop any buffered PTY output so the frozen frame does not advance.
+        self.pending_pty_bytes.clear();
+        // Clear input-gating overlays that would otherwise linger behind the
+        // dim; the displaced window has no live control path for them.
+        self.clipboard_dialog = None;
+        self.paste_confirmation_dialog = None;
+        self.disallowed_scheme_dialog = None;
+        // Feature 014 (T018): drop any pending LAN approval prompt too — it cannot
+        // be answered from a displaced window. Nothing was revealed; the server's
+        // bounded approval timeout releases the held connection (deny by default).
+        self.lan_approval_dialog = None;
+        self.context_menu = None;
+        self.request_redraw();
+    }
+
+    /// Feature 013 (T022): refresh the cached set of remote-controlled windows
+    /// from the local server's window list and repaint the status bar when it
+    /// changed. Keeps only windows a remote peer holds (`controller = Some`),
+    /// which includes remotely-created windows this process never hosted, so the
+    /// owning-machine controller segment covers them (FR-009b, SC-006).
+    fn handle_local_window_list(&mut self, windows: Vec<WindowInfo>) {
+        let controllers: Vec<ControllerInfo> =
+            windows.into_iter().filter_map(|window| window.controller).collect();
+        if controllers != self.remote_controlled_windows {
+            self.remote_controlled_windows = controllers;
+            self.request_redraw();
+        }
+    }
+
+    /// Feature 015 (T015/T024): mirror a fresh `ShareRoster` into
+    /// [`Self::share_state`], re-resolve this client's own participant id, and
+    /// reconcile the viewer affordances against the new role. A roster that
+    /// shrinks to a single participant (the share drained to just the owner) tears
+    /// the state down so the presence badge and viewer state disappear.
+    fn handle_share_roster(
+        &mut self,
+        window_id: WindowId,
+        participants: Vec<ParticipantInfo>,
+        mode: scribe_common::config::SharingMode,
+        holder: Option<u64>,
+    ) {
+        let state = share_view::ShareState { window_id, participants, mode, holder };
+        if !state.is_multi() {
+            // Only the owner remains (or the mode stopped broadcasting) — no share
+            // to surface. Clear any viewer affordances that were up.
+            self.share_state = None;
+            self.share_self_id = None;
+            self.control_hint = None;
+            self.request_redraw();
+            return;
+        }
+        self.share_self_id = self.resolve_share_self_id(&state);
+        // Once this client holds control again, the "who has control" hint is
+        // stale — drop it so a former viewer's banner clears the moment it types.
+        if self.share_holder_is_me(&state) {
+            self.control_hint = None;
+        }
+        self.share_state = Some(state);
+        self.request_redraw();
+    }
+
+    /// Feature 015 (T020): raise the grant/deny prompt for an incoming
+    /// request-and-grant control request. Only ever delivered by the server to the
+    /// current holder (or the owner when unheld), so no local role check is needed.
+    fn handle_control_requested(&mut self, window_id: WindowId, from: &ParticipantInfo) {
+        self.control_request_prompt = Some(share_view::ControlRequestPrompt::new(window_id, from));
+        self.request_redraw();
+    }
+
+    /// Feature 015 (T020): this client's own control request was denied (or
+    /// cancelled by a holder / mode change). Surface a transient notice.
+    fn handle_control_denied(&mut self, _window_id: WindowId) {
+        self.control_hint =
+            Some(share_view::ControlHint::new(String::from("Control request denied")));
+        self.request_redraw();
+    }
+
+    /// Feature 015 (T020): the shared session ended for this remote participant.
+    /// The mode-neutral roster/notice signal; a `SingleController` flip also sends
+    /// the legacy `WindowTakenOver` that drives the frozen displaced UI, so this
+    /// only clears the share surfaces (the badge / viewer affordances).
+    fn handle_share_ended(&mut self, _window_id: WindowId, reason: ShareEndReason) {
+        tracing::info!(?reason, "share ended; clearing share surfaces");
+        self.share_state = None;
+        self.share_self_id = None;
+        self.control_hint = None;
+        self.control_request_prompt = None;
+        self.request_redraw();
+    }
+
+    /// Feature 015 (T015): resolve this client's own participant id within a
+    /// roster. The owning machine's own local client is the `is_local` entry. A
+    /// remote-dialed client cannot be marked `is_local` (that flag names the
+    /// owner), so it is matched best-effort by its advertised device name; when a
+    /// single unambiguous non-local match exists it is used, otherwise `None`
+    /// (treated conservatively as a viewer — safe, since the server is
+    /// authoritative and drops a non-holder's input regardless).
+    fn resolve_share_self_id(&self, state: &share_view::ShareState) -> Option<u64> {
+        // Feature 015 self-id: prefer the server's authoritative `Welcome`
+        // participant id when present in this roster — an exact self-match with no
+        // device-name ambiguity.
+        if let Some(id) = self.welcome_participant_id
+            && state.participants.iter().any(|p| p.participant_id == id)
+        {
+            return Some(id);
+        }
+        if !self.remote_dialed {
+            return state.participants.iter().find(|p| p.is_local).map(|p| p.participant_id);
+        }
+        // Older server (no `Welcome` id): match the non-local entries by this
+        // machine's device name. Unambiguous single match only — duplicates fall
+        // back to `None`.
+        let mut matches =
+            state.participants.iter().filter(|p| !p.is_local && p.device_name == self.hostname);
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first.participant_id)
+    }
+
+    /// Feature 015 (T015): whether this client currently holds input control of
+    /// its shared window. `true` outside a single-typist share (legacy /
+    /// free-for-all / solo), where the client types normally.
+    fn share_holder_is_me(&self, state: &share_view::ShareState) -> bool {
+        match state.mode {
+            scribe_common::config::SharingMode::SharedSingleTypist => {
+                self.share_self_id.is_some() && state.holder == self.share_self_id
+            }
+            // SingleController never broadcasts a roster; FreeForAll lets everyone
+            // type — neither suppresses input.
+            _ => true,
+        }
+    }
+
+    /// Feature 015 (T015): whether this client is a live viewer whose keystrokes
+    /// must be suppressed locally — attached to a `SharedSingleTypist` share it
+    /// does not currently hold control of. `false` in every other mode / state.
+    fn is_share_viewer(&self) -> bool {
+        let Some(state) = self.share_state.as_ref() else { return false };
+        matches!(state.mode, scribe_common::config::SharingMode::SharedSingleTypist)
+            && !self.share_holder_is_me(state)
+    }
+
+    /// Feature 015 (T015/T020): intercept a keystroke while this client is a
+    /// viewer. Returns `true` when the key was consumed (never reaching the PTY).
+    /// Pressing Enter while the take-control hint is showing claims control;
+    /// any other key (re-)raises the non-intrusive hint.
+    fn intercept_viewer_key(&mut self, bytes: &[u8]) -> bool {
+        if !self.is_share_viewer() {
+            return false;
+        }
+        let hint_active = self.control_hint.as_ref().is_some_and(|hint| !hint.is_expired());
+        if hint_active && bytes == b"\r" {
+            self.claim_control();
+        } else {
+            self.show_control_hint();
+        }
+        true
+    }
+
+    /// Feature 015 (T020): raise the non-intrusive viewer hint naming the current
+    /// control holder and how to take control (FR-006).
+    fn show_control_hint(&mut self) {
+        let Some(state) = self.share_state.as_ref() else { return };
+        let text = state.holder_label().map_or_else(
+            || String::from("No one has control \u{2014} press Enter to take control"),
+            |holder| format!("{holder} has control \u{2014} press Enter to take control"),
+        );
+        self.control_hint = Some(share_view::ControlHint::new(text));
+        self.request_redraw();
+    }
+
+    /// Feature 015 (T020): take input control of the shared window. Sends
+    /// `ControlClaim`; the server applies the owner's `control_acquisition` policy
+    /// (instant under free-claim, a routed request under request-and-grant), so the
+    /// client sends the same message either way and learns the result from the next
+    /// `ShareRoster` (granted) or `ControlDenied`.
+    fn claim_control(&mut self) {
+        let Some(state) = self.share_state.as_ref() else { return };
+        let window_id = state.window_id;
+        if let Some(tx) = self.cmd_tx.clone()
+            && tx.send(ipc_client::ClientCommand::ControlClaim { window_id }).is_err()
+        {
+            tracing::warn!("IPC channel closed; ControlClaim dropped");
+            return;
+        }
+        self.control_hint =
+            Some(share_view::ControlHint::new(String::from("Requesting control\u{2026}")));
+        self.request_redraw();
+    }
+
+    /// Feature 015 (T020): resolve the pending incoming control request — grant
+    /// (`accept = true`) transfers control to the requester; deny sends a
+    /// `ControlDenied`. Answered via `ControlGrant` naming the requester's id.
+    fn resolve_control_request(&mut self, accept: bool) {
+        let Some(prompt) = self.control_request_prompt.take() else { return };
+        if let Some(tx) = self.cmd_tx.clone() {
+            let cmd = ipc_client::ClientCommand::ControlGrant {
+                window_id: prompt.window_id(),
+                participant_id: prompt.requester_id(),
+                accept,
+            };
+            if tx.send(cmd).is_err() {
+                tracing::warn!("IPC channel closed; ControlGrant dropped");
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Feature 015 (T020): full-window modal handling for the grant/deny prompt —
+    /// Enter grants, Esc denies; every other key is swallowed while a decision is
+    /// pending.
+    fn handle_control_request_prompt_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => self.handle_close_requested(event_loop),
+            WindowEvent::RedrawRequested => self.handle_redraw(),
+            WindowEvent::Resized(size) => self.handle_resize_and_mark_geometry(*size),
+            WindowEvent::Moved(_) => self.mark_geometry_dirty(),
+            WindowEvent::ModifiersChanged(new_mods) => self.modifiers = new_mods.state(),
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if key_event.state != winit::event::ElementState::Pressed {
+                    return;
+                }
+                match &key_event.logical_key {
+                    Key::Named(NamedKey::Enter) => self.resolve_control_request(true),
+                    Key::Named(NamedKey::Escape) => self.resolve_control_request(false),
+                    _ => {}
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => self.update_cursor_position(position),
+            WindowEvent::Focused(focused) => self.handle_focus_changed(*focused),
+            WindowEvent::Occluded(occluded) => self.handle_occluded_changed(*occluded),
+            _ => {}
+        }
+    }
+
+    /// Feature 015 (T020): clear an expired viewer control hint on the idle-wake
+    /// boundary so a stale "who has control" banner does not linger.
+    fn clear_control_hint_if_expired(&mut self) {
+        if self.control_hint.as_ref().is_some_and(share_view::ControlHint::is_expired) {
+            self.control_hint = None;
+            self.request_redraw();
+        }
+    }
+
+    /// The re-dial target of this controlling-side window: the fixed launch-env
+    /// peer plus the transport it must be re-dialed over (feature 014, T016). The
+    /// tailnet path (`SCRIBE_REMOTE_DIAL`, 013) takes precedence over the LAN path
+    /// (`SCRIBE_LAN_DIAL`, 014) — the spawns keep them mutually exclusive, and the
+    /// startup hook already prefers the tailnet env. `None` on an ordinary local
+    /// window. The single source of truth for [`Self::remote_transport`], the
+    /// reclaim, and the one-action reconnect re-dial.
+    fn remote_redial_target() -> Option<(String, u16, remote_connect::PeerTransport)> {
+        if let Some((host, port)) = ipc_client::remote_dial_target() {
+            Some((host, port, remote_connect::PeerTransport::Tailnet))
+        } else {
+            ipc_client::lan_dial_target()
+                .map(|(host, port)| (host, port, remote_connect::PeerTransport::Lan))
+        }
+    }
+
+    /// Feature 013 (T030) + feature 014 (T016): display label for the peer this
+    /// controlling-side window is reconnecting to — the tailnet `MagicDNS` name or
+    /// the LAN dial host.
+    fn reconnect_peer_label() -> String {
+        Self::remote_redial_target()
+            .map_or_else(|| String::from("the remote machine"), |(host, _, _)| host)
+    }
+
+    /// Feature 013 (T030): the remote link dropped and the loop is retrying.
+    /// Show / update the cancelable reconnecting overlay unless it has already
+    /// settled terminally (a late in-flight attempt must not revive the spinner
+    /// over a "remote access turned off" message).
+    fn handle_remote_reconnecting(&mut self, attempt: u32) {
+        if self.reconnect_overlay.as_ref().is_some_and(remote_connect::ReconnectOverlay::is_settled)
+        {
+            return;
+        }
+        // The link is down: reflect it in the status-bar connection dot (the
+        // remote read task deliberately does NOT emit `ServerDisconnected`, so
+        // nothing else clears this). It stays false through failure / terminal
+        // settle; only a successful re-attach (`reattach_sessions_after_reconnect`)
+        // flips it back true.
+        self.connection.server_connected = false;
+        // A pending post-reconnect re-attach is stale now the link dropped again.
+        self.reconnect_reattach_at = None;
+        let peer = Self::reconnect_peer_label();
+        match &mut self.reconnect_overlay {
+            Some(overlay) => overlay.set_attempt(attempt),
+            slot => *slot = Some(remote_connect::ReconnectOverlay::reconnecting(peer, attempt)),
+        }
+        self.request_redraw();
+    }
+
+    /// Feature 013 (T030): the link is back. Clear the spinner and schedule a
+    /// re-attach of the existing panes after a short grace, so a displacing
+    /// `WindowTakenOver` can land first (a reconnect that raced a reclaim must
+    /// never re-point the sessions away from the new controller, Scenario 4).
+    fn handle_remote_reconnected(&mut self) {
+        // A Cancel or delivered sever may have settled the overlay while the
+        // winning attempt was still in flight; a late success must NOT revive
+        // the window over that settled state (FR-011 — Cancel settles into a
+        // disconnected state). Mirrors the guard in `handle_remote_reconnecting`.
+        if self.reconnect_overlay.as_ref().is_some_and(remote_connect::ReconnectOverlay::is_settled)
+        {
+            return;
+        }
+        self.reconnect_overlay = None;
+        self.reconnect_reattach_at = Some(Instant::now() + RECONNECT_REATTACH_GRACE);
+        self.request_redraw();
+    }
+
+    /// Feature 013 (T030): the capped backoff was exhausted — settle into the
+    /// combined connection-failure state with a one-action reconnect.
+    fn handle_remote_reconnect_failed(&mut self) {
+        self.reconnect_reattach_at = None;
+        let peer = Self::reconnect_peer_label();
+        self.reconnect_overlay = Some(remote_connect::ReconnectOverlay::settled_unreachable(peer));
+        self.request_redraw();
+    }
+
+    /// Feature 013 (T030): settle the reconnect overlay terminally after an
+    /// authoritative sever / refusal (e.g. remote access disabled) and stop the
+    /// auto-reconnect loop so it never spins against a gone listener.
+    fn settle_reconnect_terminal(&mut self, reason: RemoteRefusal) {
+        if let Some(cancel) = &self.reconnect_cancel {
+            cancel.cancel();
+        }
+        // Reflect the severed link in the status-bar dot. This path is also
+        // reachable directly from a LIVE session (a delivered `RemoteDisconnect`
+        // notice), where `server_connected` is still true, so clear it here as
+        // well as on the reconnecting entry.
+        self.connection.server_connected = false;
+        self.reconnect_reattach_at = None;
+        let peer = Self::reconnect_peer_label();
+        self.reconnect_overlay =
+            Some(remote_connect::ReconnectOverlay::settled_refused(peer, reason));
+    }
+
+    /// Feature 013 (T030): re-attach the existing panes' sessions once the
+    /// post-reconnect grace elapses. Skipped when the window was taken over
+    /// during the outage (never hijack the controller that reclaimed). Serviced
+    /// from `about_to_wait`.
+    fn flush_reconnect_reattach_if_due(&mut self) {
+        let Some(at) = self.reconnect_reattach_at else { return };
+        if Instant::now() < at {
+            return;
+        }
+        self.reconnect_reattach_at = None;
+        if self.window_taken_over.is_some() {
+            return;
+        }
+        self.reattach_sessions_after_reconnect();
+    }
+
+    /// Re-point each known session's server-side writer to the reconnected link
+    /// and pull a fresh replay so every existing pane converges to true current
+    /// state (FR-011). Idempotent: the panes already exist, so this updates them
+    /// in place rather than rebuilding the layout.
+    fn reattach_sessions_after_reconnect(&mut self) {
+        let Some(tx) = self.cmd_tx.clone() else { return };
+        let mut session_ids: Vec<SessionId> = Vec::new();
+        let mut dimensions: Vec<TerminalSize> = Vec::new();
+        for (&session_id, &pane_id) in &self.session_to_pane {
+            let size = self
+                .panes
+                .get(&pane_id)
+                .and_then(|pane| self.terminal_size_for_grid(pane.grid))
+                .unwrap_or_default();
+            session_ids.push(session_id);
+            dimensions.push(size);
+        }
+        if session_ids.is_empty() {
+            return;
+        }
+        self.connection.server_connected = true;
+        // The grids are unchanged across the blip; mark them sent so the reattach
+        // does not spuriously resize the reconnected sessions.
+        for pane in self.panes.values_mut() {
+            pane.last_sent_grid = Some(pane.grid);
+        }
+        send_command(
+            &tx,
+            ClientCommand::AttachSessions { session_ids: session_ids.clone(), dimensions },
+        );
+        send_command(&tx, ClientCommand::Subscribe { session_ids });
+        self.request_redraw();
+    }
+
+    /// Feature 013 (T030): per-window event dispatch while the reconnect overlay
+    /// owns the window. Like the lost-control modal, geometry/redraw pass through
+    /// but no input reaches the frozen sessions — the only affordances are Cancel
+    /// (while retrying) and the one-action reconnect / close (once settled).
+    fn handle_reconnect_overlay_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => self.handle_close_requested(event_loop),
+            WindowEvent::RedrawRequested => self.handle_redraw(),
+            WindowEvent::Resized(size) => self.handle_resize_and_mark_geometry(*size),
+            WindowEvent::Moved(_) => self.mark_geometry_dirty(),
+            WindowEvent::ModifiersChanged(new_mods) => self.modifiers = new_mods.state(),
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if self.handle_native_close_window_shortcut(key_event, event_loop) {
+                    return;
+                }
+                if key_event.state == winit::event::ElementState::Pressed {
+                    self.handle_reconnect_overlay_key(&key_event.logical_key, event_loop);
+                }
+            }
+            WindowEvent::MouseInput { state, .. } => {
+                if *state == winit::event::ElementState::Pressed {
+                    let action = self.reconnect_overlay_click_action();
+                    self.apply_reconnect_action(action, event_loop);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => self.update_cursor_position(position),
+            WindowEvent::Focused(focused) => self.handle_focus_changed(*focused),
+            WindowEvent::Occluded(occluded) => self.handle_occluded_changed(*occluded),
+            _ => {}
+        }
+    }
+
+    fn handle_reconnect_overlay_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
+        let action = self
+            .reconnect_overlay
+            .as_ref()
+            .map_or(remote_connect::ReconnectAction::None, |overlay| overlay.key_action(key));
+        self.apply_reconnect_action(action, event_loop);
+    }
+
+    fn reconnect_overlay_click_action(&self) -> remote_connect::ReconnectAction {
+        self.reconnect_overlay.as_ref().map_or(
+            remote_connect::ReconnectAction::None,
+            remote_connect::ReconnectOverlay::click_action,
+        )
+    }
+
+    fn apply_reconnect_action(
+        &mut self,
+        action: remote_connect::ReconnectAction,
+        event_loop: &ActiveEventLoop,
+    ) {
+        use remote_connect::ReconnectAction as Action;
+        match action {
+            Action::None => {}
+            Action::Cancel => self.cancel_reconnect(),
+            Action::Reconnect => self.restart_remote_reconnect(event_loop),
+            Action::Close => self.handle_close_requested(event_loop),
+        }
+    }
+
+    /// Feature 013 (T030): cancel the in-progress auto-reconnect. Stops the loop
+    /// and settles the overlay into the one-action-reconnect state.
+    fn cancel_reconnect(&mut self) {
+        if let Some(cancel) = &self.reconnect_cancel {
+            cancel.cancel();
+        }
+        self.reconnect_reattach_at = None;
+        let peer = Self::reconnect_peer_label();
+        self.reconnect_overlay = Some(remote_connect::ReconnectOverlay::settled_cancelled(peer));
+        self.request_redraw();
+    }
+
+    /// Feature 013 (T030) + feature 014 (T016): one-action reconnect from a
+    /// settled overlay. Spawns a fresh remote client for the SAME window with
+    /// `takeover = false` (never seize) over the window's own transport — tailnet
+    /// (013) or LAN (014) — and closes this window, mirroring the lost-control
+    /// reclaim path.
+    fn restart_remote_reconnect(&mut self, event_loop: &ActiveEventLoop) {
+        let Some((host, port, transport)) = Self::remote_redial_target() else {
+            tracing::warn!("reconnect requested but no remote dial target; ignoring");
+            return;
+        };
+        tracing::info!(%host, port, ?transport, window = ?self.window_id, "one-action reconnect to remote window");
+        spawn_client_for_transport(transport, &host, port, self.window_id, false);
+        self.flush_geometry_now();
+        event_loop.exit();
+    }
+
+    /// Per-window event dispatch while this window is displaced (feature 013,
+    /// T017). Mirrors the dialog modal handlers: geometry/redraw pass through,
+    /// but no keystroke, click, scroll, or paste reaches the PTY — the only
+    /// affordance is the one-action reclaim (Enter, Space, or a mouse click),
+    /// which reconnects with `Hello { takeover: true }`.
+    fn handle_lost_control_window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => self.handle_close_requested(event_loop),
+            WindowEvent::RedrawRequested => self.handle_redraw(),
+            WindowEvent::Resized(size) => self.handle_resize_and_mark_geometry(*size),
+            WindowEvent::Moved(_) => self.mark_geometry_dirty(),
+            WindowEvent::ModifiersChanged(new_mods) => self.modifiers = new_mods.state(),
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if self.handle_native_close_window_shortcut(key_event, event_loop) {
+                    return;
+                }
+                if key_event.state == winit::event::ElementState::Pressed
+                    && key_event.logical_key == Key::Named(NamedKey::Enter)
+                {
+                    self.reclaim_window(event_loop);
+                }
+                // Every other key is swallowed: a displaced window sends no input
+                // (the banner offers Enter or a click as the sole affordance).
+            }
+            WindowEvent::MouseInput { state, .. } => {
+                if *state == winit::event::ElementState::Pressed {
+                    self.reclaim_window(event_loop);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => self.update_cursor_position(position),
+            WindowEvent::Focused(focused) => self.handle_focus_changed(*focused),
+            WindowEvent::Occluded(occluded) => self.handle_occluded_changed(*occluded),
+            // MouseWheel, DroppedFile, Ime, and the rest are intentionally
+            // ignored so nothing reaches the frozen sessions.
+            _ => {}
+        }
+    }
+
+    /// Feature 013 (T017) + feature 014 (T016) + feature 015: reclaim a displaced
+    /// window with one action. The reclaiming `Hello` carries `takeover = true`
+    /// (contracts/remote-protocol.md: reclaim is a fresh connection) and the
+    /// server-owned sessions are untouched (FR-010) and follow the new controller.
+    /// The LOCAL (owning-machine) branch swaps the connection in place and keeps
+    /// this window, while the REMOTE (controlling-side) branch still re-dials the
+    /// peer in a fresh process and closes this window.
+    fn reclaim_window(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(window_id) = self.window_id else {
+            tracing::warn!("reclaim requested but no window id is known; ignoring");
+            return;
+        };
+        if let Some((host, port, transport)) = Self::remote_redial_target() {
+            // REMOTE reclaim: the auto-reconnect machinery owns the link, so
+            // re-dialing the same peer in a fresh process (which then closes this
+            // window) stays the lower-risk path for now — converting it to an
+            // in-place swap is a documented follow-up. The LOCAL branch below is
+            // in-place.
+            tracing::info!(%host, port, ?transport, %window_id, "reclaiming displaced remote window");
+            spawn_client_for_transport(transport, &host, port, Some(window_id), true);
+            // Close this displaced window — the replacement becomes the
+            // controller. Preserve geometry so the reclaimed window reopens in
+            // place.
+            self.flush_geometry_now();
+            event_loop.exit();
+        } else {
+            self.reclaim_window_local_in_place(window_id);
+        }
+    }
+
+    /// Feature 015: reclaim a displaced LOCAL window IN PLACE — swap the command
+    /// channel to a fresh takeover connection without tearing down the window or
+    /// event loop, so there is no visible close+reopen. The old (displaced)
+    /// connection is dropped cleanly and a new local IPC thread starts whose first
+    /// `Hello` carries `takeover = true`; the server swaps the writer back and the
+    /// scheduled reattach re-points the existing panes once the new `Welcome`
+    /// lands.
+    fn reclaim_window_local_in_place(&mut self, window_id: WindowId) {
+        let Some(proxy) = self.animation_proxy.clone() else {
+            tracing::warn!("no event-loop proxy; cannot reclaim local window in place");
+            return;
+        };
+        tracing::info!(%window_id, "reclaiming displaced local window in place");
+
+        // Drop the current command sender so the old `run_write_task` ends and the
+        // displaced connection closes cleanly. The local `ipc_main` select aborts
+        // the read task once the write task ends first, so this emits no spurious
+        // `ServerDisconnected` (which would otherwise exit the event loop).
+        self.cmd_tx = None;
+
+        // Start a fresh local IPC thread whose first `Hello` takes over the window,
+        // then adopt its command sender + (absent) reconnect cancel.
+        let ipc_client::IpcHandle { commands: cmd_tx, reconnect_cancel } =
+            ipc_client::start_local_takeover_ipc_thread(proxy, Some(window_id));
+        self.cmd_tx = Some(cmd_tx);
+        self.reconnect_cancel = reconnect_cancel;
+
+        // This window is the controller again — clear the lost-control banner.
+        self.window_taken_over = None;
+
+        // Re-attach the existing panes after the standard grace so the new
+        // connection's `Welcome` lands first and a racing `WindowTakenOver` can
+        // still displace us before we re-point sessions (Scenario 4);
+        // `flush_reconnect_reattach_if_due` skips the reattach if that happens.
+        self.reconnect_reattach_at = Some(Instant::now() + RECONNECT_REATTACH_GRACE);
+
+        self.request_redraw();
+    }
+
+    /// Dial the chosen peer on a background thread just to enumerate its windows
+    /// for the picker's second step (feature 013 T014; feature 014 T014 adds the
+    /// LAN transport, which runs the full TLS + device-approval gate before the
+    /// window list is revealed).
+    fn probe_windows(&mut self, host: String, port: u16, transport: remote_connect::PeerTransport) {
+        let Some(proxy) = self.animation_proxy.clone() else {
+            tracing::warn!("no event-loop proxy available; cannot probe remote windows");
+            return;
+        };
+        match transport {
+            remote_connect::PeerTransport::Tailnet => {
+                ipc_client::start_remote_list_windows_thread(proxy, host, port);
+            }
+            remote_connect::PeerTransport::Lan => {
+                ipc_client::start_lan_list_windows_thread(proxy, host, port);
             }
         }
     }
@@ -6622,7 +7861,16 @@ impl App {
         if gained.is_none() && lost.is_none() {
             return;
         }
-        if let Some(tx) = &self.cmd_tx {
+        // Feature 013 (T026): a displaced window must not relay CSI focus events
+        // (`\x1b[I` / `\x1b[O`). Its sessions now belong to the new controller,
+        // and the server still relays focus for this connection's attached ids,
+        // so a `FocusChanged` here would inject focus in/out into the new
+        // controller's live view — a stale-interactive write after displacement.
+        // The OS IME is still re-evaluated below so it turns off for the frozen
+        // window; only the server relay is suppressed.
+        if self.window_taken_over.is_none()
+            && let Some(tx) = &self.cmd_tx
+        {
             send_command(tx, ipc_client::ClientCommand::FocusChanged { gained, lost });
         }
         self.refresh_ime_allowed();
@@ -7057,21 +8305,27 @@ impl App {
         }
     }
 
-    fn perform_paste(&mut self) {
-        let text = {
-            let Some(cb) = &mut self.clipboard else {
-                tracing::debug!("clipboard not available");
-                return;
-            };
-            match cb.get_text() {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::debug!("clipboard read failed: {e}");
-                    return;
-                }
-            }
+    /// Read the host clipboard as text, or `None` when unavailable. Shared by
+    /// the terminal paste path and the in-app text fields (command palette and
+    /// the remote-connect entry).
+    fn read_clipboard_text(&mut self) -> Option<String> {
+        let Some(cb) = &mut self.clipboard else {
+            tracing::debug!("clipboard not available");
+            return None;
         };
-        self.send_paste_data(&text);
+        match cb.get_text() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::debug!("clipboard read failed: {e}");
+                None
+            }
+        }
+    }
+
+    fn perform_paste(&mut self) {
+        if let Some(text) = self.read_clipboard_text() {
+            self.send_paste_data(&text);
+        }
     }
 
     /// Send paste text to the focused pane, wrapping in bracketed-paste
@@ -7089,6 +8343,12 @@ impl App {
     /// work: the config check short-circuits before classification runs.
     fn send_paste_data(&mut self, text: &str) {
         if text.is_empty() {
+            return;
+        }
+        // Feature 015 (T015): a viewer's paste is input too — suppress it and show
+        // the take-control affordance rather than sending bytes the server drops.
+        if self.is_share_viewer() {
+            self.show_control_hint();
             return;
         }
         self.flush_resize_if_pending();
@@ -7594,10 +8854,10 @@ impl App {
         let mut entries = base_command_palette_entries();
 
         if let Some(version) = &self.update_available {
-            entries.push(CommandPaletteEntry {
-                label: format!("Update Scribe to v{version}"),
-                action: AutomationAction::OpenUpdateDialog,
-            });
+            entries.push(CommandPaletteEntry::automation(
+                format!("Update Scribe to v{version}"),
+                AutomationAction::OpenUpdateDialog,
+            ));
         }
 
         let active_profile = scribe_common::profiles::active_profile_name().ok();
@@ -7656,7 +8916,7 @@ impl App {
                 self.command_palette.close();
                 self.command_palette_items.clear();
                 if let Some(action) = action {
-                    self.execute_automation_action(action);
+                    self.execute_palette_action(action);
                 }
                 self.request_redraw();
             }
@@ -7677,6 +8937,17 @@ impl App {
                 self.command_palette.clear_query();
                 self.refresh_command_palette_items();
                 self.request_redraw();
+            }
+            Key::Character(text)
+                if (self.modifiers.control_key() || self.modifiers.super_key())
+                    && !self.modifiers.alt_key()
+                    && text.eq_ignore_ascii_case("v") =>
+            {
+                if let Some(clip) = self.read_clipboard_text() {
+                    self.command_palette.push_str(&clip);
+                    self.refresh_command_palette_items();
+                    self.request_redraw();
+                }
             }
             Key::Character(text)
                 if !self.modifiers.control_key()
@@ -10188,6 +11459,13 @@ impl App {
 
     /// Send raw bytes to the focused pane's PTY session.
     fn send_bytes_to_focused_pane(&self, data: Vec<u8>) {
+        // Feature 015 (T015): a live viewer sends no input to the PTY, including
+        // mouse-reporting sequences and other synthetic bytes (the server drops
+        // them anyway). The keystroke/paste paths surface the take-control hint;
+        // this silent path just suppresses.
+        if self.is_share_viewer() {
+            return;
+        }
         let Some(tx) = self.cmd_tx.clone() else { return };
         let Some(tab) = self.window_layout.active_tab() else { return };
         let Some(pane) = self.panes.get(&tab.focused_pane) else { return };
@@ -10482,6 +11760,15 @@ impl App {
 
     /// Send pending resize IPC messages immediately.
     fn flush_resize_now(&mut self) {
+        // Feature 013 (T017): a displaced window never resizes the server's
+        // sessions — those now belong to the new controller, and a stray
+        // `Resize` would reflow their live view. The local GPU surface is still
+        // reconfigured in `handle_resize`, so the frozen frame and banner stay
+        // correctly laid out.
+        if self.window_taken_over.is_some() {
+            self.resize_pending = None;
+            return;
+        }
         let Some(tx) = &self.cmd_tx else {
             self.resize_pending = None;
             return;
@@ -10898,8 +12185,18 @@ impl App {
         window_id: WindowId,
         other_windows: &[WindowId],
     ) {
+        let first_welcome = !self.has_welcomed;
+        self.has_welcomed = true;
         self.window_id = Some(window_id);
-        tracing::info!(%window_id, others = other_windows.len(), "assigned window ID");
+        tracing::info!(%window_id, others = other_windows.len(), first_welcome, "assigned window ID");
+
+        // Feature 013 (T030): a remote reconnect re-issues `Hello`, so the server
+        // sends a fresh `Welcome`. The one-time startup work below already ran on
+        // the first Welcome — re-applying geometry would move the window and
+        // re-fanning-out would spawn duplicate sibling processes.
+        if !first_welcome {
+            return;
+        }
 
         // If we didn't have a window_id at startup (fresh launch), load
         // geometry now that the server has assigned one. Uses the full
@@ -11318,6 +12615,81 @@ impl App {
     // -------------------------------------------------------------------
     // Paste-confirmation dialog input handlers (spec 011)
     // -------------------------------------------------------------------
+
+    /// Keyboard discipline for the LAN device-approval prompt (feature 014,
+    /// T018): Esc declines (the safe default — no data flows on a stray press),
+    /// Enter activates the focused button, Tab cycles focus.
+    fn handle_lan_approval_dialog_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        use winit::keyboard::{Key, NamedKey};
+
+        if event.state != winit::event::ElementState::Pressed {
+            return;
+        }
+
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.handle_lan_approval_action(lan_approval::LanApprovalAction::Decline);
+            }
+            Key::Named(NamedKey::Enter) => {
+                let action = self.lan_approval_dialog.as_ref().map_or(
+                    lan_approval::LanApprovalAction::Decline,
+                    lan_approval::LanApprovalDialog::confirm,
+                );
+                self.handle_lan_approval_action(action);
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.cycle_lan_approval_dialog_focus();
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a mouse click while the LAN approval prompt is active.
+    fn handle_lan_approval_dialog_click(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        let action = self.lan_approval_dialog.as_ref().and_then(|d| d.click(x, y));
+        if let Some(action) = action {
+            self.handle_lan_approval_action(action);
+        }
+    }
+
+    /// Handle mouse hover while the LAN approval prompt is active.
+    fn handle_lan_approval_dialog_hover(&mut self) {
+        let Some((x, y)) = self.last_cursor_pos else { return };
+        if let Some(dialog) = &mut self.lan_approval_dialog {
+            if dialog.update_hover(x, y) {
+                self.request_redraw();
+            }
+        }
+    }
+
+    fn cycle_lan_approval_dialog_focus(&mut self) {
+        let Some(dialog) = &mut self.lan_approval_dialog else { return };
+        if self.modifiers.shift_key() {
+            dialog.focus_prev();
+        } else {
+            dialog.focus_next();
+        }
+        self.request_redraw();
+    }
+
+    /// Dispatch the owning user's choice from the LAN approval prompt — send a
+    /// [`ClientCommand::LanApprovalDecision`] echoing the request's `request_id`
+    /// and close the overlay. Approve lets the held connection proceed (the
+    /// server writes the `TrustedDevice`); Decline refuses it and reveals nothing
+    /// (FR-004/006, SEC-001/002).
+    fn handle_lan_approval_action(&mut self, action: lan_approval::LanApprovalAction) {
+        let Some(dialog) = self.lan_approval_dialog.take() else { return };
+        let request_id = dialog.request_id();
+        let approve = matches!(action, lan_approval::LanApprovalAction::Approve);
+        tracing::info!(request_id, approve, "LAN device-approval prompt resolved");
+        if let Some(tx) = self.cmd_tx.clone()
+            && tx.send(ClientCommand::LanApprovalDecision { request_id, approve }).is_err()
+        {
+            tracing::warn!("IPC channel closed; LAN approval decision dropped");
+        }
+        self.request_redraw();
+    }
 
     fn handle_paste_confirmation_dialog_keyboard(&mut self, event: &winit::event::KeyEvent) {
         use winit::keyboard::{Key, NamedKey};
@@ -12498,6 +13870,20 @@ const MIN_SPLASH_DURATION: Duration = Duration::from_millis(50);
 
 /// Cursor blink interval (530ms matches xterm/VTE).
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// Feature 013 (T022): how often the owning-machine client polls the local
+/// server for its window list to refresh the remote-control status surfaces
+/// (FR-009b, SC-006). Only runs while `remote.enabled`, so it adds no local IPC
+/// when the feature is off; a status indicator does not need sub-second freshness.
+const WINDOW_LIST_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Feature 013 (T030): grace between a successful remote reconnect and
+/// re-attaching the existing panes. It lets a displacing `WindowTakenOver` land
+/// first so a reconnect that raced a local reclaim never re-points the sessions
+/// away from the new controller (Scenario 4 step 3). `Welcome` and any
+/// `WindowTakenOver` arrive in the same server response burst, so this is far
+/// longer than needed in practice while staying imperceptible.
+const RECONNECT_REATTACH_GRACE: Duration = Duration::from_millis(250);
 
 /// Maximum number of search matches requested per query.
 const SEARCH_RESULT_LIMIT: u32 = 256;
@@ -14616,6 +16002,134 @@ fn spawn_client_process(window_id: WindowId) {
         }
         Err(e) => {
             tracing::warn!(exe = %exe.display(), %window_id, "failed to spawn window: {e}");
+        }
+    }
+}
+
+/// Spawn a fresh client process pointed at a REMOTE scribe-server for the
+/// connect picker (feature 013, T014/T018).
+///
+/// The new process behaves exactly like any other client window except its IPC
+/// thread dials the peer over TCP instead of the local Unix socket — the
+/// existing `SCRIBE_REMOTE_DIAL` startup hook. It carries NO `--window-id`, so
+/// it has no local window identity; its window comes from the remote `Hello`.
+/// `window_id` names an existing window to claim (with `takeover`), or `None`
+/// creates a fresh window on the peer (T018). Reusing a whole client process
+/// keeps the local window and its sessions untouched.
+fn spawn_remote_client_process(host: &str, port: u16, window_id: Option<WindowId>, takeover: bool) {
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from(current_identity().client_binary_name()));
+    let spawn_start = Instant::now();
+
+    let mut command = std::process::Command::new(&exe);
+    command.env("SCRIBE_REMOTE_DIAL", format!("{host}:{port}"));
+    // `std::process::Command` inherits the parent's FULL environment, so the
+    // dial params must be fully (re)determined by THIS call — never inherited.
+    // A client first launched via the picker's Attach action carries
+    // `SCRIBE_REMOTE_WINDOW` / `SCRIBE_REMOTE_TAKEOVER` in its own process env;
+    // if it later spawns a fresh process for a one-action reconnect
+    // (`takeover = false`) or a "New window" (`window_id = None`), the child
+    // would silently inherit those markers and seize a window someone else
+    // legitimately reclaimed during the outage (FR-011). The explicit
+    // `env_remove` else-branches close that leak. (The local reclaim path uses a
+    // `--reclaim` CLI flag rather than an env var for exactly this reason.)
+    if let Some(window_id) = window_id {
+        command.env("SCRIBE_REMOTE_WINDOW", window_id.to_full_string());
+    } else {
+        command.env_remove("SCRIBE_REMOTE_WINDOW");
+    }
+    if takeover {
+        command.env("SCRIBE_REMOTE_TAKEOVER", "1");
+    } else {
+        command.env_remove("SCRIBE_REMOTE_TAKEOVER");
+    }
+
+    match command.spawn() {
+        Ok(child) => {
+            tracing::info!(
+                pid = child.id(),
+                %host,
+                port,
+                ?window_id,
+                takeover,
+                elapsed_ms = duration_ms(spawn_start.elapsed()),
+                "spawned remote-control client window"
+            );
+            reap_spawned_client_child(child, "remote-window");
+        }
+        Err(e) => {
+            tracing::warn!(exe = %exe.display(), %host, port, "failed to spawn remote client: {e}");
+        }
+    }
+}
+
+/// Spawn a fresh client-window process for a connect-picker attach over the
+/// chosen [`PeerTransport`](remote_connect::PeerTransport) (feature 014, T014/T024):
+/// the 013 tailnet path over TCP, or the 014 direct-LAN path over mutual TLS.
+/// Both keep the local window and its sessions untouched by reusing a whole
+/// process; the window claim + takeover markers are transport-agnostic.
+fn spawn_client_for_transport(
+    transport: remote_connect::PeerTransport,
+    host: &str,
+    port: u16,
+    window_id: Option<WindowId>,
+    takeover: bool,
+) {
+    match transport {
+        remote_connect::PeerTransport::Tailnet => {
+            spawn_remote_client_process(host, port, window_id, takeover);
+        }
+        remote_connect::PeerTransport::Lan => {
+            spawn_lan_client_process(host, port, window_id, takeover);
+        }
+    }
+}
+
+/// Spawn a fresh client process pointed at a LAN scribe-server over mutual TLS for
+/// the connect picker's "Local network" source (feature 014, T014) — the LAN
+/// analogue of [`spawn_remote_client_process`].
+///
+/// Sets `SCRIBE_LAN_DIAL` (the T015 LAN dial hook) instead of `SCRIBE_REMOTE_DIAL`
+/// and explicitly removes the latter so a picker opened inside an already
+/// tailnet-dialed window cannot leave both set (the startup hook prefers
+/// `SCRIBE_REMOTE_DIAL`, which would mis-route the LAN attach over the tailnet).
+/// The window claim + takeover reuse the transport-agnostic `SCRIBE_REMOTE_WINDOW`
+/// / `SCRIBE_REMOTE_TAKEOVER` markers (contracts/lan-protocol.md), with the same
+/// env-leak guard as the tailnet spawn.
+fn spawn_lan_client_process(host: &str, port: u16, window_id: Option<WindowId>, takeover: bool) {
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from(current_identity().client_binary_name()));
+    let spawn_start = Instant::now();
+
+    let mut command = std::process::Command::new(&exe);
+    command.env("SCRIBE_LAN_DIAL", format!("{host}:{port}"));
+    command.env_remove("SCRIBE_REMOTE_DIAL");
+    if let Some(window_id) = window_id {
+        command.env("SCRIBE_REMOTE_WINDOW", window_id.to_full_string());
+    } else {
+        command.env_remove("SCRIBE_REMOTE_WINDOW");
+    }
+    if takeover {
+        command.env("SCRIBE_REMOTE_TAKEOVER", "1");
+    } else {
+        command.env_remove("SCRIBE_REMOTE_TAKEOVER");
+    }
+
+    match command.spawn() {
+        Ok(child) => {
+            tracing::info!(
+                pid = child.id(),
+                %host,
+                port,
+                ?window_id,
+                takeover,
+                elapsed_ms = duration_ms(spawn_start.elapsed()),
+                "spawned LAN remote-control client window"
+            );
+            reap_spawned_client_child(child, "lan-window");
+        }
+        Err(e) => {
+            tracing::warn!(exe = %exe.display(), %host, port, "failed to spawn LAN client: {e}");
         }
     }
 }

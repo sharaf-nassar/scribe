@@ -22,6 +22,20 @@ mod releases;
 mod session_manager;
 mod shell_integration;
 mod stop_classifier;
+// Feature 013: the remote accept path (compiled into this binary via `mod
+// ipc_server`) reaches the Tailscale LocalAPI client through `crate::tailnet`.
+// Re-export the LIBRARY crate's module instead of declaring a second, private
+// in-binary `mod tailnet`: that private copy compiles the module a second time,
+// where its `pub` peer-picker fields (unused by the binary's own call sites) trip
+// dead-code analysis. The library holds one fully-public copy, so this re-export
+// eliminates the double compile AND the dead-code warning — no lint suppression.
+use scribe_server::tailnet;
+// Feature 014: likewise, the per-transport LAN state in `mod ipc_server` reaches
+// the device-trust `DeviceId` type through `crate::lan`. Re-export the LIBRARY
+// crate's `lan` module for the identical reason — a second in-binary `mod lan`
+// would recompile its many `pub` discovery/identity/TLS/trust items (unused by
+// the binary) into dead-code warnings.
+use scribe_server::lan;
 mod updater;
 mod workspace_manager;
 mod workspace_notes;
@@ -56,6 +70,15 @@ async fn run_normal_server() -> Result<(), ScribeError> {
     info!("scribe-server starting (normal mode)");
 
     let cfg = config::load_config()?;
+
+    // Feature 013: surface the configured remote-control state at startup. The
+    // listener itself is started, stopped, and rebound live off this config by
+    // the config-reload path (a later task); nothing is bound here.
+    info!(
+        remote_enabled = cfg.remote.enabled,
+        remote_port = cfg.remote.port,
+        "remote window control configuration"
+    );
 
     let session_manager = {
         let sm = session_manager::SessionManager::with_scrollback(
@@ -124,8 +147,7 @@ async fn run_server_loop(
 ) -> Result<(), ScribeError> {
     let path = server_socket_path();
     let live_sessions = ipc_server::new_live_session_registry();
-    let connected_clients = ipc_server::new_connected_clients();
-    let window_clipboard_gating = ipc_server::new_window_clipboard_gating();
+    let window_shares = ipc_server::new_window_shares();
 
     // Acquire the server socket with singleton enforcement. The lock guard
     // must live until the server shuts down to hold the advisory flock.
@@ -146,14 +168,14 @@ async fn run_server_loop(
         &session_manager,
         &workspace_manager,
         &live_sessions,
-        &window_clipboard_gating,
+        &window_shares,
     )
     .await;
 
     // Spawn the background updater. The handle is passed into the IPC server
     // so that TriggerUpdate / DismissUpdate messages can reach it.
     let updater_handle =
-        Arc::new(updater::spawn_updater(Arc::clone(&connected_clients), update_config));
+        Arc::new(updater::spawn_updater(Arc::clone(&window_shares), update_config));
 
     // Build the release catalog + GitHub fetcher used by the Releases settings
     // panel. The catalog is empty until the first `ListReleases` request; the
@@ -181,22 +203,30 @@ async fn run_server_loop(
     // `Arc<EnvStoreState>` clone and exits when the channel closes.
     ipc_server::spawn_env_status_forwarder(&env_store, Arc::clone(&live_sessions));
 
+    // Feature 013: shared remote-control listener handle, threaded into the IPC
+    // server state so the `ConfigReloaded` path can start/stop/rebind it live.
+    let remote_control = ipc_server::RemoteControl::new();
+    let server_state = ipc_server::IpcServerState {
+        session_manager: Arc::clone(&session_manager),
+        workspace_manager: Arc::clone(&workspace_manager),
+        live_sessions: Arc::clone(&live_sessions),
+        window_shares: Arc::clone(&window_shares),
+        updater_handle: Arc::clone(&updater_handle),
+        release_catalog: Arc::clone(&release_catalog),
+        release_fetcher: Arc::clone(&release_fetcher),
+        workspace_notes: Arc::clone(&workspace_notes),
+        env_store: Arc::clone(&env_store),
+        remote_control: Arc::clone(&remote_control),
+    };
+
+    // Start the remote-control supervisor: it applies the current `[remote]`
+    // config (a no-op when disabled — the default) and then rebinds/stops the
+    // listener live on every `ConfigReloaded`. Spawned, not awaited, so a wedged
+    // tailscaled cannot delay local serving; the server is never restarted.
+    tokio::spawn(ipc_server::remote_supervisor(Arc::clone(&remote_control), server_state.clone()));
+
     let handoff_triggered = tokio::select! {
-        result = ipc_server::start_ipc_server(
-            listener,
-            ipc_server::IpcServerState {
-                session_manager: Arc::clone(&session_manager),
-                workspace_manager: Arc::clone(&workspace_manager),
-                live_sessions: Arc::clone(&live_sessions),
-                connected_clients: Arc::clone(&connected_clients),
-                window_clipboard_gating: Arc::clone(&window_clipboard_gating),
-                updater_handle: Arc::clone(&updater_handle),
-                release_catalog: Arc::clone(&release_catalog),
-                release_fetcher: Arc::clone(&release_fetcher),
-                workspace_notes: Arc::clone(&workspace_notes),
-                env_store: Arc::clone(&env_store),
-            },
-        ) => {
+        result = ipc_server::start_ipc_server(listener, server_state) => {
             result?;
             false
         }

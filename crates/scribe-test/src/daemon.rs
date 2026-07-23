@@ -185,7 +185,7 @@ pub async fn run() -> Result<(), ScribeError> {
     // daemon stop → daemon start → session attach.
     crate::ipc::send(
         &mut raw_server_writer,
-        &ClientMessage::Hello { window_id: None, clipboard_gating: false },
+        &ClientMessage::Hello { window_id: None, clipboard_gating: false, takeover: false },
     )
     .await?;
 
@@ -317,13 +317,33 @@ async fn dispatch_server_message(
         | ServerMessage::PromptReceived { .. }) => {
             dispatch_notice_message(msg);
         }
-        // Test daemon does not exercise env-persistence (feature 006) or
-        // OSC 52 clipboard gating (spec 010) flows yet.
+        // Test daemon does not exercise env-persistence (feature 006), OSC 52
+        // clipboard gating (spec 010), remote window control (feature 013), or
+        // LAN remote control (feature 014) flows yet. The feature 014 LAN
+        // messages below are consumed by the client/settings surfaces (tasks
+        // T014/T018/T019/T020/T024); this is a behavior-preserving no-op arm.
         ServerMessage::EnvPreflightResult { .. }
         | ServerMessage::EnvStatus { .. }
         | ServerMessage::ClipboardPromptRequest { .. }
         | ServerMessage::ClipboardBridgeWrite { .. }
-        | ServerMessage::ClipboardBridgeReadRequest { .. } => {}
+        | ServerMessage::ClipboardBridgeReadRequest { .. }
+        | ServerMessage::RemoteHandshakeReply { .. }
+        | ServerMessage::WindowTakenOver { .. }
+        | ServerMessage::RemoteDisconnect { .. }
+        | ServerMessage::RemotePeerList { .. }
+        | ServerMessage::RemoteEnv { .. }
+        | ServerMessage::LanApprovalPending
+        | ServerMessage::LanApprovalResult { .. }
+        | ServerMessage::LanApprovalRequest { .. }
+        | ServerMessage::LanPeerList { .. }
+        | ServerMessage::TrustedDeviceList { .. }
+        | ServerMessage::TrustedNetworkList { .. }
+        | ServerMessage::LanEnv { .. }
+        | ServerMessage::LanDialIdentity { .. }
+        | ServerMessage::ShareRoster { .. }
+        | ServerMessage::ControlRequested { .. }
+        | ServerMessage::ControlDenied { .. }
+        | ServerMessage::ShareEnded { .. } => {}
     }
 }
 

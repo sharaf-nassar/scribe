@@ -76,6 +76,7 @@ nix = { version = "0.31", features = [
   "socket",
   "uio",
 ] }
+socket2 = "0.6"
 rustix = { version = "1.1", features = ["net"] }
 libc = "0.2"
 unix-ancillary = "0.1"
@@ -117,10 +118,25 @@ minisign-verify = "0.2"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# LAN remote control (feature 014) — mDNS discovery, physical-network
+# fingerprint, self-signed Ed25519 identity, and async mutual TLS. rustls is
+# promoted from a reqwest transitive to a direct dependency; default features
+# select the aws-lc-rs crypto provider (shared with rcgen and tokio-rustls).
+# x509-parser (already compiled via rcgen) extracts a presented certificate's
+# SubjectPublicKeyInfo so the TLS pinning verifier can derive the peer's
+# SHA-256(SPKI) Device ID — no rustls/webpki API exposes the SPKI directly.
+mdns-sd = "0.20"
+netdev = "0.45"
+rcgen = "0.14"
+rustls = "0.23"
+tokio-rustls = "0.26"
+x509-parser = "0.18"
+
 # Workspace crates
 scribe-common = { path = "crates/scribe-common" }
 scribe-pty = { path = "crates/scribe-pty" }
 scribe-renderer = { path = "crates/scribe-renderer" }
+scribe-server = { path = "crates/scribe-server" }
 scribe-settings = { path = "crates/scribe-settings" }
 
 [workspace.lints.rust]

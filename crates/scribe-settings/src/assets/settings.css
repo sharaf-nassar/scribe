@@ -1644,3 +1644,219 @@ input[type="range"]::-webkit-slider-thumb {
   border-left: 3px solid #f87171;
   line-height: 1.4;
 }
+
+/* ───────── Remote (feature 013) ───────── */
+
+/* Force-hide utility for the passive Tailscale notice. Uses !important so it
+   survives the global-search reset, which clears inline `display` on every
+   `.setting-row` (mirrors how `.platform-hidden` guards the platform rows). */
+.remote-hidden {
+  display: none !important;
+}
+
+/* Permanent UX-003 who-can-connect statement shown beneath the enable toggle.
+   The <span class="remote-account"> is filled by the host via setRemoteEnv()
+   with the signed-in Tailscale account; it falls back to a generic label
+   until injected. */
+.remote-statement {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: #71717a;
+  line-height: 1.5;
+}
+
+.remote-account {
+  color: #a1a1aa;
+}
+
+/* Passive note shown when the host reports Tailscale is not installed or not
+   running. Neutral, low-key styling — informational, not an error. */
+.remote-notice {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: #a1a1aa;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  border-left: 3px solid #52525b;
+  line-height: 1.4;
+}
+
+/* ───────── Local network (feature 014) ───────── */
+
+/* UX-004 status line: a colored dot + text conveying active / dormant / off. */
+.lan-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.lan-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: #52525b;
+}
+
+.lan-status-text {
+  font-size: 12px;
+  color: #71717a;
+  line-height: 1.4;
+}
+
+.lan-status-off .lan-status-dot { background: #52525b; }
+.lan-status-off .lan-status-text { color: #71717a; }
+.lan-status-dormant .lan-status-dot { background: #f59e0b; }
+.lan-status-dormant .lan-status-text { color: #a1a1aa; }
+.lan-status-active .lan-status-dot { background: #22c55e; }
+.lan-status-active .lan-status-text { color: #a1a1aa; }
+
+/* Trusted networks / devices lists. */
+.lan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.lan-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.lan-item:last-child {
+  border-bottom: none;
+}
+
+.lan-item-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.lan-item-label {
+  font-size: 13px;
+  color: #d4d4d8;
+}
+
+.lan-item-fingerprint {
+  font-size: 11px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  color: #818cf8;
+  word-break: break-word;
+}
+
+.lan-item-meta {
+  font-size: 11px;
+  color: #52525b;
+  line-height: 1.4;
+}
+
+.lan-empty {
+  padding: 10px 16px;
+  font-size: 12px;
+  color: #52525b;
+}
+
+/* Small text button shared by network "Remove" and device "Revoke". */
+.lan-remove {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: transparent;
+  color: #71717a;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.lan-remove:hover {
+  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
+}
+
+.lan-add-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.lan-add-btn {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #a1a1aa;
+  font-size: 12px;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.lan-add-btn:hover:not(:disabled) {
+  border-color: rgba(59, 130, 246, 0.5);
+  color: #e4e4e7;
+}
+
+.lan-add-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Explanatory note when the current network can't be trusted. Mirrors
+   .remote-notice's neutral, informational styling. */
+.lan-add-note {
+  font-size: 11px;
+  color: #a1a1aa;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  border-left: 3px solid #52525b;
+  line-height: 1.4;
+}
+
+/* This device's own fingerprint for the optional out-of-band compare. */
+.lan-fingerprint {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.lan-fingerprint-words {
+  font-size: 15px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  color: #818cf8;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.lan-fingerprint-words.lan-fingerprint-pending {
+  font-family: inherit;
+  font-size: 12px;
+  color: #52525b;
+  font-style: italic;
+}
+
+.lan-fingerprint-hex {
+  font-size: 12px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  color: #71717a;
+  letter-spacing: 0.5px;
+  word-break: break-all;
+  line-height: 1.6;
+}

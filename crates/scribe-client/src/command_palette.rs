@@ -75,6 +75,13 @@ impl CommandPalette {
         self.selected = 0;
     }
 
+    /// Append pasted text to the query, dropping control characters (newlines,
+    /// tabs) so a multi-line clipboard payload collapses into the filter string.
+    pub fn push_str(&mut self, s: &str) {
+        self.query.extend(s.chars().filter(|c| !c.is_control()));
+        self.selected = 0;
+    }
+
     pub fn pop_char(&mut self) {
         self.query.pop();
         self.selected = 0;

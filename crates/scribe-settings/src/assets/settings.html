@@ -94,6 +94,15 @@
         </svg>
         Notifications
       </div>
+      <div class="nav-item" data-tab="remote">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 12.55a11 11 0 0 1 14.08 0"/>
+          <path d="M1.42 9a16 16 0 0 1 21.16 0"/>
+          <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+          <line x1="12" y1="20" x2="12.01" y2="20"/>
+        </svg>
+        Remote
+      </div>
     </div>
     <div class="sidebar-footer" id="sidebar-footer"></div>
   </div>
@@ -1624,6 +1633,172 @@
               <div class="setting-desc">Open macOS Notifications settings, select this app, and choose Persistent to keep banners visible until dismissed</div>
             </div>
             <button id="notifications-open-macos-settings" class="action-btn" type="button">Open macOS Settings</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════ Remote Page ═══════ -->
+    <div id="page-remote" class="content-page">
+      <div class="page-title">Remote</div>
+      <div class="page-subtitle">Control this machine's windows from your other devices over Tailscale or your local network</div>
+
+      <div class="section-group">
+        <div class="section-label">Remote Control</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Allow remote control from my devices</div>
+              <div class="setting-desc">Off by default. The listener runs only while this is on and binds only to your Tailscale addresses.</div>
+            </div>
+            <div class="toggle off" data-key="remote.enabled">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row remote-statement-row">
+            <div class="remote-statement">
+              When on, your own devices on your Tailscale network (signed in as
+              <span class="remote-account" id="remote-account-name">your Tailscale account</span>)
+              can view and control this machine's terminal windows.
+            </div>
+          </div>
+          <div class="setting-row remote-notice-row remote-hidden" id="remote-tailscale-notice-row">
+            <div class="remote-notice" id="remote-tailscale-notice">Tailscale not detected — remote access stays off</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ─── Window sharing (feature 015) ─── -->
+      <div class="section-group">
+        <div class="section-label">Window Sharing</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Sharing mode</div>
+              <div class="setting-desc">Who can type into a shared window: one controller at a time, one typist among many viewers, or everyone at once. Applies to both Tailscale and local-network shares.</div>
+            </div>
+            <div class="segmented-control" data-key="remote.sharing_mode">
+              <div class="segment-opt active" data-value="single_controller">Single controller</div>
+              <div class="segment-opt" data-value="shared_single_typist">Shared view, single typist</div>
+              <div class="segment-opt" data-value="free_for_all">Collaborative (free-for-all)</div>
+            </div>
+          </div>
+          <div class="setting-row remote-hidden" id="remote-control-acquisition-row">
+            <div class="setting-info">
+              <div class="setting-label">Control handoff</div>
+              <div class="setting-desc">In single-typist mode, how a viewer takes over typing: claim it instantly, or request it and wait for the current typist to grant. You can always claim control on this machine.</div>
+            </div>
+            <div class="segmented-control" data-key="remote.control_acquisition">
+              <div class="segment-opt active" data-value="free_claim">Free claim</div>
+              <div class="segment-opt" data-value="request_and_grant">Request and grant</div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Participant limit</div>
+              <div class="setting-desc">Maximum remote participants per shared window. 0 means unlimited. Joins beyond the limit are refused; your own connection is always exempt.</div>
+            </div>
+            <div class="number-control" data-key="remote.participant_limit" data-min="0" data-max="512" data-step="1">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">0</div>
+              <div class="number-btn">+</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ─── Local network (feature 014) ─── -->
+      <div class="section-group">
+        <div class="section-label">Local Network</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Allow control from devices on trusted local networks</div>
+              <div class="setting-desc">Off by default. A separate opt-in from Tailscale, above. Dormant until you're on a trusted network.</div>
+            </div>
+            <div class="toggle off" data-key="remote.lan.enabled">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="setting-row remote-statement-row">
+            <div class="remote-statement">
+              When on, and while you're on a network you've marked trusted, your approved
+              devices on that network can find and control this machine's windows — no
+              Tailscale needed.
+            </div>
+          </div>
+          <div class="setting-row lan-status-row">
+            <div class="lan-status lan-status-off" id="lan-status">
+              <span class="lan-status-dot"></span>
+              <span class="lan-status-text" id="lan-status-text">Local network access is off.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Trusted Networks</div>
+        <div class="section-description">Networks where this machine accepts local connections, identified by your router and subnet.</div>
+        <div class="section-card">
+          <div id="lan-networks-list" class="lan-list">
+            <div class="lan-empty" id="lan-networks-empty">No trusted networks yet.</div>
+            <!-- Items populated by setTrustedNetworks -->
+          </div>
+          <div class="lan-add-row">
+            <button class="lan-add-btn" id="lan-add-network-btn" type="button" disabled>Add current network</button>
+            <div class="lan-add-note remote-hidden" id="lan-add-network-note"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Trusted Devices</div>
+        <div class="section-description">Devices you've approved to control this machine over the local network. Revoking ends any live connection and forces re-approval.</div>
+        <div class="section-card">
+          <div id="lan-devices-list" class="lan-list">
+            <div class="lan-empty" id="lan-devices-empty">No approved devices yet.</div>
+            <!-- Items populated by setTrustedDevices -->
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">This Device's Fingerprint</div>
+        <div class="section-description">Read this aloud to compare against the approval prompt shown on another machine — an optional check that the connection is genuine.</div>
+        <div class="section-card">
+          <div class="setting-row lan-fingerprint-row">
+            <div class="lan-fingerprint">
+              <div class="lan-fingerprint-words" id="lan-fingerprint-words">Available once Local network is enabled.</div>
+              <div class="lan-fingerprint-hex" id="lan-fingerprint-hex"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-group">
+        <div class="section-label">Advanced</div>
+        <div class="section-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Tailscale port</div>
+              <div class="setting-desc">TCP port for the remote listener, bound only on your Tailscale addresses. Default 46061.</div>
+            </div>
+            <div class="number-control" data-key="remote.port" data-min="1024" data-max="65535" data-step="1">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">46061</div>
+              <div class="number-btn">+</div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-label">Local network port</div>
+              <div class="setting-desc">TCP port for the local-network listener, bound only on your physical LAN address. Default 46062.</div>
+            </div>
+            <div class="number-control" data-key="remote.lan.port" data-min="1024" data-max="65535" data-step="1">
+              <div class="number-btn">&minus;</div>
+              <div class="number-value">46062</div>
+              <div class="number-btn">+</div>
+            </div>
           </div>
         </div>
       </div>

@@ -99,6 +99,8 @@ pub struct ScribeConfig {
     pub update: UpdateConfig,
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    #[serde(default)]
+    pub remote: RemoteConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -1921,6 +1923,135 @@ impl Default for NotificationsConfig {
             timeout_secs: default_notification_timeout_secs(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Remote (feature 013 — remote window control over Tailscale)
+// ---------------------------------------------------------------------------
+
+/// The `[remote]` TOML table (feature 013). Controls the opt-in Tailscale
+/// remote-control listener. A missing table deserializes to these defaults —
+/// the feature stays fully off — because the field carries `#[serde(default)]`
+/// on [`ScribeConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Whether remote window control is enabled. Default `false`: the TCP
+    /// listener exists only while this is `true` (FR-001), and disabling it
+    /// severs live remote connections within 2 s (FR-016).
+    #[serde(default)]
+    pub enabled: bool,
+    /// TCP port for the remote listener, bound on the machine's tailnet
+    /// addresses only, never `0.0.0.0` (FR-002). Rebound live on change via the
+    /// config-reload path; no server restart.
+    #[serde(default = "default_remote_port")]
+    pub port: u16,
+    /// The nested `[remote.lan]` sub-table (feature 014 — LAN remote window
+    /// control without Tailscale). A separate opt-in from the tailnet
+    /// `enabled`/`port` fields above; a missing `[remote.lan]` table
+    /// deserializes to [`LanRemoteConfig`] defaults (the LAN transport stays
+    /// off).
+    #[serde(default)]
+    pub lan: LanRemoteConfig,
+    /// Feature 015: how a shared window admits and authorizes remote
+    /// participants (FR-004). Default [`SharingMode::SingleController`] keeps
+    /// feature 013's exclusive single-writer behavior, so an existing config
+    /// file loads with legacy behavior (FR-014). Applied live over the
+    /// config-reload path; no server restart.
+    #[serde(default)]
+    pub sharing_mode: SharingMode,
+    /// Feature 015: how input control is acquired in
+    /// [`SharingMode::SharedSingleTypist`] mode (FR-005). Default
+    /// [`ControlAcquisition::FreeClaim`]; only meaningful in single-typist mode.
+    #[serde(default)]
+    pub control_acquisition: ControlAcquisition,
+    /// Feature 015: maximum number of REMOTE participants a shared window
+    /// admits; the local owner is always exempt (FR-007, FR-018). `None`
+    /// (default) means unlimited; an over-limit join is refused with the
+    /// existing busy-style refusal.
+    #[serde(default)]
+    pub participant_limit: Option<u32>,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_remote_port(),
+            lan: LanRemoteConfig::default(),
+            sharing_mode: SharingMode::default(),
+            control_acquisition: ControlAcquisition::default(),
+            participant_limit: None,
+        }
+    }
+}
+
+fn default_remote_port() -> u16 {
+    46061
+}
+
+/// Feature 015: how a shared window admits and authorizes remote participants
+/// (spec "Sharing Mode", FR-004). The owning machine's [`RemoteConfig`] holds
+/// this; a live share snapshots it at mutation time. Default `SingleController`
+/// preserves feature 013's exclusive single-writer behavior for existing config
+/// files (FR-014).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharingMode {
+    /// Legacy 013 exclusive ownership: at most one controller; a takeover
+    /// displaces the previous holder. No additive sharing.
+    #[default]
+    SingleController,
+    /// Shared view, single typist: many participants view live; at most one
+    /// holds input control, passed via claim or request-and-grant.
+    SharedSingleTypist,
+    /// Collaborative free-for-all: every attached participant may type,
+    /// interleaved in arrival order.
+    FreeForAll,
+}
+
+/// Feature 015: how input control is acquired in
+/// [`SharingMode::SharedSingleTypist`] mode (FR-005). Default `FreeClaim`. Only
+/// meaningful under single-typist sharing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlAcquisition {
+    /// A viewer takes control instantly by claiming it; the previous holder is
+    /// demoted to a still-live viewer.
+    #[default]
+    FreeClaim,
+    /// A viewer must request control and the current holder (or owner) grants
+    /// it before the handoff.
+    RequestAndGrant,
+}
+
+/// The `[remote.lan]` TOML sub-table (feature 014 — LAN remote window control
+/// without Tailscale). Nested under [`RemoteConfig`]; a missing table
+/// deserializes to these defaults — the LAN transport stays fully off —
+/// because the field carries `#[serde(default)]` on [`RemoteConfig`]. This is a
+/// separate opt-in from the tailnet `[remote]` listener (FR-012).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanRemoteConfig {
+    /// Whether LAN remote window control is enabled. Default `false`: a
+    /// separate opt-in from the tailnet `[remote]` listener (FR-012). Even when
+    /// `true`, the LAN transport is dormant unless the machine is on a trusted
+    /// network (FR-018).
+    #[serde(default)]
+    pub enabled: bool,
+    /// TCP port for the LAN listener, bound on the physical LAN address only
+    /// (distinct from the tailnet `46061`). Rebound live on change via the
+    /// config-reload path; no server restart.
+    #[serde(default = "default_lan_port")]
+    pub port: u16,
+}
+
+impl Default for LanRemoteConfig {
+    fn default() -> Self {
+        Self { enabled: false, port: default_lan_port() }
+    }
+}
+
+fn default_lan_port() -> u16 {
+    46062
 }
 
 // ---------------------------------------------------------------------------

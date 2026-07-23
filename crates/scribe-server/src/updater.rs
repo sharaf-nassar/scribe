@@ -12,7 +12,7 @@ use scribe_common::config::{UpdateChannel, UpdateConfig};
 use scribe_common::error::ScribeError;
 use scribe_common::protocol::{ServerMessage, UpdateCheckResultState, UpdateProgressState};
 
-use crate::ipc_server::ConnectedClients;
+use crate::ipc_server::WindowShares;
 
 const INITIAL_DELAY: Duration = Duration::from_secs(30);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -171,13 +171,13 @@ struct UpdaterReceivers {
 }
 
 /// Spawn the background updater task and return a handle for IPC control.
-pub fn spawn_updater(connected_clients: ConnectedClients, config: UpdateConfig) -> UpdaterHandle {
+pub fn spawn_updater(window_shares: WindowShares, config: UpdateConfig) -> UpdaterHandle {
     let (install_tx, install_rx) = tokio::sync::mpsc::channel(1);
     let (dismiss_tx, dismiss_rx) = tokio::sync::mpsc::channel(1);
     let (check_tx, check_rx) = tokio::sync::mpsc::channel(1);
 
     let receivers = UpdaterReceivers { install: install_rx, dismiss: dismiss_rx, check: check_rx };
-    tokio::spawn(run_updater_loop(connected_clients, receivers, config));
+    tokio::spawn(run_updater_loop(window_shares, receivers, config));
 
     UpdaterHandle { install: install_tx, dismiss: dismiss_tx, check: check_tx }
 }
@@ -185,7 +185,7 @@ pub fn spawn_updater(connected_clients: ConnectedClients, config: UpdateConfig) 
 // ── Background loop ───────────────────────────────────────────────
 
 async fn run_updater_loop(
-    connected_clients: ConnectedClients,
+    window_shares: WindowShares,
     receivers: UpdaterReceivers,
     config: UpdateConfig,
 ) {
@@ -195,7 +195,7 @@ async fn run_updater_loop(
 
     let http = http_client().clone();
 
-    run_updater_select_loop(connected_clients, receivers, http, config).await;
+    run_updater_select_loop(window_shares, receivers, http, config).await;
 }
 
 /// Returns the process-wide configured `reqwest::Client` used for all
@@ -227,7 +227,7 @@ pub fn http_client() -> &'static reqwest::Client {
 }
 
 async fn run_updater_select_loop(
-    connected_clients: ConnectedClients,
+    window_shares: WindowShares,
     mut receivers: UpdaterReceivers,
     http: reqwest::Client,
     config: UpdateConfig,
@@ -245,14 +245,14 @@ async fn run_updater_select_loop(
     loop {
         tokio::select! {
             _ = interval.tick(), if config.enabled => {
-                run_check(&http, &connected_clients, &dismissed, config.channel).await;
+                run_check(&http, &window_shares, &dismissed, config.channel).await;
             }
             Some(reply_tx) = receivers.check.recv() => {
-                let state = run_check_now(&http, &connected_clients, &dismissed, config.channel).await;
+                let state = run_check_now(&http, &window_shares, &dismissed, config.channel).await;
                 drop(reply_tx.send(state));
             }
             Some(()) = receivers.install.recv() => {
-                run_install(&http, &connected_clients).await;
+                run_install(&http, &window_shares).await;
             }
             Some(()) = receivers.dismiss.recv() => {
                 info!("update notification dismissed by user");
@@ -279,7 +279,7 @@ async fn check_for_update_with_retry(
 
 async fn run_check(
     client: &reqwest::Client,
-    connected_clients: &ConnectedClients,
+    window_shares: &WindowShares,
     dismissed: &Arc<RwLock<Option<String>>>,
     channel: UpdateChannel,
 ) {
@@ -293,7 +293,7 @@ async fn run_check(
             info!(%version, "update available — notifying clients");
             *dismissed.write().await = Some(version.clone());
             let msg = ServerMessage::UpdateAvailable { version: version.clone(), release_url };
-            broadcast(&msg, connected_clients).await;
+            broadcast(&msg, window_shares).await;
         }
         Ok(None) => {
             info!("no update available");
@@ -312,7 +312,7 @@ async fn run_check(
 /// guard so an explicit click always re-broadcasts a still-relevant update.
 async fn run_check_now(
     client: &reqwest::Client,
-    connected_clients: &ConnectedClients,
+    window_shares: &WindowShares,
     dismissed: &Arc<RwLock<Option<String>>>,
     channel: UpdateChannel,
 ) -> UpdateCheckResultState {
@@ -329,7 +329,7 @@ async fn run_check_now(
                     version: version.clone(),
                     release_url: release_url.clone(),
                 },
-                connected_clients,
+                window_shares,
             )
             .await;
             UpdateCheckResultState::UpdateAvailable { version, release_url }
@@ -345,9 +345,9 @@ async fn run_check_now(
     }
 }
 
-async fn run_install(client: &reqwest::Client, connected_clients: &ConnectedClients) {
+async fn run_install(client: &reqwest::Client, window_shares: &WindowShares) {
     info!("user triggered update — starting download");
-    match try_install(client, connected_clients).await {
+    match try_install(client, window_shares).await {
         Ok((version, hot_reload_succeeded)) => {
             info!(%version, "update installed successfully");
             let state = if hot_reload_succeeded {
@@ -356,14 +356,14 @@ async fn run_install(client: &reqwest::Client, connected_clients: &ConnectedClie
                 UpdateProgressState::CompletedRestartRequired { version }
             };
             let msg = ServerMessage::UpdateProgress { state };
-            broadcast(&msg, connected_clients).await;
+            broadcast(&msg, window_shares).await;
         }
         Err(e) => {
             error!("update install failed: {e}");
             let msg = ServerMessage::UpdateProgress {
                 state: UpdateProgressState::Failed { reason: format!("{e}") },
             };
-            broadcast(&msg, connected_clients).await;
+            broadcast(&msg, window_shares).await;
         }
     }
 }
@@ -373,13 +373,13 @@ async fn run_install(client: &reqwest::Client, connected_clients: &ConnectedClie
 /// but returns errors to the caller.
 async fn try_install(
     client: &reqwest::Client,
-    connected_clients: &ConnectedClients,
+    window_shares: &WindowShares,
 ) -> Result<(String, bool), ScribeError> {
     let (asset_url, sig_url, version) = fetch_asset_urls(client).await?;
 
     broadcast(
         &ServerMessage::UpdateProgress { state: UpdateProgressState::Downloading },
-        connected_clients,
+        window_shares,
     )
     .await;
 
@@ -387,7 +387,7 @@ async fn try_install(
 
     broadcast(
         &ServerMessage::UpdateProgress { state: UpdateProgressState::Verifying },
-        connected_clients,
+        window_shares,
     )
     .await;
 
@@ -395,7 +395,7 @@ async fn try_install(
 
     broadcast(
         &ServerMessage::UpdateProgress { state: UpdateProgressState::Installing },
-        connected_clients,
+        window_shares,
     )
     .await;
 
@@ -992,13 +992,13 @@ fn current_version() -> Result<semver::Version, ScribeError> {
 
 // ── Broadcast helper ──────────────────────────────────────────────
 
-async fn broadcast(msg: &ServerMessage, connected_clients: &ConnectedClients) {
-    use scribe_common::framing::write_message;
-    let clients = connected_clients.read().await;
-    for writer in clients.values() {
-        let mut w = writer.lock().await;
-        if let Err(e) = write_message(&mut *w, msg).await {
-            warn!("failed to broadcast update message to client: {e}");
-        }
+async fn broadcast(msg: &ServerMessage, window_shares: &WindowShares) {
+    // Feature 015 (T006): fan out to every connected window's controller writer
+    // from the consolidated share registry. Route through the shared send path
+    // (`send_message` → `write_to_sink`) so a remote (feature 013) client receives
+    // the broadcast via its bounded output queue instead of a direct, potentially
+    // blocking socket write.
+    for writer in crate::ipc_server::connected_window_writers(window_shares).await {
+        crate::ipc_server::send_message(&writer, msg).await;
     }
 }

@@ -3,8 +3,28 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::ai_state::{AiProcessState, AiProvider};
+use crate::config::SharingMode;
 use crate::hook;
 use crate::ids::{SessionId, WindowId, WorkspaceId};
+
+/// Version of the remote-only wire protocol. Exchanged in the tailnet
+/// [`ClientMessage::RemoteHandshake`] preamble (feature 013) and the LAN
+/// [`ClientMessage::LanHello`] preamble (feature 014), and gated by an
+/// exact-match check answered in [`ServerMessage::RemoteHandshakeReply`]
+/// (tailnet) or reported as [`LanRefusal::IncompatibleVersion`] inside
+/// [`ServerMessage::LanApprovalResult`] (LAN); bump on ANY change to
+/// remote-visible message semantics. Never used on the local Unix socket, where
+/// client and server always ship together.
+///
+/// Bumped to `2` for feature 014: the LAN device-approval and discovery/trust
+/// messages are additive under the same exact-match policy, so a 013-only peer
+/// and a 013+014 peer never interoperate over a remote transport.
+///
+/// Bumped to `3` for feature 015 (multi-machine collaborative window sharing):
+/// the new share-control [`ClientMessage`] variants and roster/notice
+/// [`ServerMessage`] variants are additive under the same exact-match policy, so
+/// a v2 peer and a v3 peer never share a window (FR-014, D4).
+pub const REMOTE_PROTOCOL_VERSION: u32 = 3;
 
 /// OSC 52 operation type (spec 010 E2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,11 +123,72 @@ pub enum AutomationAction {
     },
 }
 
+/// Feature 013: identity of the controller currently holding a window,
+/// surfaced in window-listing / picker / indicator UIs (FR-005, FR-009b,
+/// SC-006). Present on a [`WindowInfo`] only while a REMOTE tailnet peer
+/// controls the window; a locally-controlled or unconnected window carries
+/// `None` (the owning machine needs no device/account label for itself).
+/// Mirrors the `device_name` / `login_name` pair of
+/// [`ServerMessage::WindowTakenOver`] so the two identity surfaces never drift.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControllerInfo {
+    /// Controller's `MagicDNS` short device name.
+    pub device_name: String,
+    /// Controller's tailnet account display (login) name.
+    pub login_name: String,
+}
+
+/// Feature 015: one attached participant in a shared window, as broadcast in a
+/// [`ServerMessage::ShareRoster`] (contracts/remote-protocol-v3.md). Reuses the
+/// `device_name` / `login_name` identity pair of [`ControllerInfo`] so the
+/// identity surface never drifts, plus the roster-only `is_local` / `is_holder`
+/// flags.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParticipantInfo {
+    /// Server-monotonic participant id, stable for the connection's lifetime;
+    /// the target of a [`ClientMessage::ControlGrant`].
+    pub participant_id: u64,
+    /// Participant's short device name.
+    pub device_name: String,
+    /// Participant's account display (login) name.
+    pub login_name: String,
+    /// `true` for the owning (local) machine's own participant.
+    pub is_local: bool,
+    /// `true` for the current input-control holder (single-typist mode).
+    pub is_holder: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowInfo {
     pub window_id: WindowId,
     pub session_count: usize,
     pub connected: bool,
+    /// Feature 013: display names of the workspaces in this window, in the
+    /// window's stored session order (deduplicated; unnamed workspaces
+    /// omitted). Feeds the remote connect picker's window list (FR-005).
+    /// Empty from an older server or a window with no named workspaces.
+    #[serde(default)]
+    pub workspace_names: Vec<String>,
+    /// Feature 013: the remote controller currently holding this window, or
+    /// `None` when it is unconnected or controlled locally (FR-009b, SC-006).
+    /// Additive: older servers omit it and it decodes as `None`. In feature 015
+    /// shared modes this names the current input-control holder (or `None` when
+    /// unheld); in `SingleController` mode it still names the sole holder.
+    #[serde(default)]
+    pub controller: Option<ControllerInfo>,
+    /// Feature 015: remote participants attached to this shared window; empty
+    /// from an older server or a locally-controlled / unconnected window
+    /// (contracts/remote-protocol-v3.md). Reuses [`ControllerInfo`] per entry.
+    #[serde(default)]
+    pub participants: Vec<ControllerInfo>,
+    /// Feature 015: the window's sharing mode; `None` decodes from an older
+    /// server that predates sharing.
+    #[serde(default)]
+    pub mode: Option<SharingMode>,
+    /// Feature 015: number of attached participants, so the connect picker can
+    /// show share occupancy instead of feature 013's binary in-use flag.
+    #[serde(default)]
+    pub participant_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,6 +375,13 @@ pub enum ClientMessage {
         /// Defaults to `false` so older clients deserialize cleanly.
         #[serde(default)]
         clipboard_gating: bool,
+        /// Feature 013: claim a currently-connected window (takeover). Defaults
+        /// to `false` via serde, so every existing local client — which never
+        /// sets it — keeps today's behavior exactly: a connected window is
+        /// never displaced. `true` is an explicit user action (picker attach or
+        /// lost-control reclaim) that atomically swaps the window's writer.
+        #[serde(default)]
+        takeover: bool,
     },
     /// Close this window and destroy all its sessions.  Sent when the user
     /// chooses "Close this window only" from the close dialog.
@@ -354,6 +442,147 @@ pub enum ClientMessage {
     ClipboardBridgeReadReply {
         request_id: PromptId,
         payload: Result<String, BridgeError>,
+    },
+    /// Feature 013 remote-only preamble — the FIRST frame a remote (TCP) client
+    /// sends. NEVER sent on the local Unix socket. Carries no window or session
+    /// data so identity, authorization, and version can all be checked and a
+    /// typed refusal issued before any window state is revealed (FR-003).
+    RemoteHandshake {
+        /// [`REMOTE_PROTOCOL_VERSION`] of the dialer; gated by exact match.
+        remote_protocol_version: u32,
+        /// Human-readable Scribe version of the dialer, for mismatch copy.
+        scribe_version: String,
+        /// Dialer's short device name, display-only (banner / audit).
+        device_name: String,
+    },
+    /// Feature 013 local-only request: enumerate the user's own online tailnet
+    /// peers for the connect picker. Served from THIS machine's own `LocalAPI`
+    /// view; refused (like any non-`RemoteHandshake` first frame) over TCP so a
+    /// remote peer cannot enumerate a third machine's tailnet view.
+    ListRemotePeers,
+    /// Feature 013 local-only settings request: report this machine's remote
+    /// environment for the Settings → Remote section — the signed-in tailnet
+    /// account name and whether Tailscale is detected at all. The server replies
+    /// with exactly one [`ServerMessage::RemoteEnv`]. Like [`ListRemotePeers`]
+    /// it is served from THIS machine's own `LocalAPI` view and refused as a
+    /// non-`RemoteHandshake` first frame over TCP, so a remote peer can never
+    /// read a third machine's tailnet identity. No fields.
+    GetRemoteEnv,
+    /// Feature 014 LAN preamble — the FIRST frame a LAN (TLS) client sends once
+    /// the mutual-TLS handshake completes, before any `Hello`. NEVER sent on the
+    /// local Unix socket or the tailnet transport. Identity is the pinned TLS
+    /// client certificate (`device_id = SHA-256(SPKI)`), NOT this message; the
+    /// `device_name` is the peer's advertised display label only. Carries no
+    /// window or session data so the owning side can run the device-approval and
+    /// exact-match version gates before any state is revealed (SEC-001,
+    /// contracts/lan-protocol.md).
+    LanHello {
+        /// Peer's advertised display name (banner / approval prompt / audit).
+        device_name: String,
+        /// [`REMOTE_PROTOCOL_VERSION`] of the dialer; gated by exact match.
+        remote_protocol_version: u32,
+    },
+    /// Feature 014 local-only reply carrying the owning user's decision on a
+    /// pending LAN device approval. Sent by the OWNING machine's own local client
+    /// in response to a [`ServerMessage::LanApprovalRequest`], echoing its
+    /// `request_id`. Refused over any remote transport — the GUI, never the
+    /// remote TLS stream, answers the prompt (contracts/lan-protocol.md).
+    LanApprovalDecision {
+        /// Correlates with the originating [`ServerMessage::LanApprovalRequest`].
+        request_id: u64,
+        /// `true` writes a trusted device and proceeds; `false` refuses
+        /// ([`LanRefusal::Declined`]).
+        approve: bool,
+    },
+    /// Feature 014 local-only request: enumerate LAN peers discovered via mDNS on
+    /// the current network for the connect picker. Served from THIS machine's own
+    /// discovery view and refused (like any non-`LanHello` / non-`RemoteHandshake`
+    /// first frame) over a remote transport. Answered with exactly one
+    /// [`ServerMessage::LanPeerList`]. No fields.
+    ListLanPeers,
+    /// Feature 014 local-only request: list this machine's approved LAN devices
+    /// for the Settings → Remote "Local network" section. Answered with exactly
+    /// one [`ServerMessage::TrustedDeviceList`]. Local socket only. No fields.
+    ListTrustedDevices,
+    /// Feature 014 local-only request: revoke a trusted LAN device by its
+    /// hex-encoded `device_id` (the `device_id_hex` from [`TrustedDeviceInfo`]).
+    /// Removes the pin and severs only that device's live LAN connection, forcing
+    /// re-approval on the next attempt (FR-010). Local socket only.
+    RevokeTrustedDevice {
+        /// Lowercase hex of the 32-byte `device_id = SHA-256(SPKI)`.
+        device_id: String,
+    },
+    /// Feature 014 local-only request: list the user's trusted networks and
+    /// whether the current network is among them. Answered with exactly one
+    /// [`ServerMessage::TrustedNetworkList`]. Local socket only. No fields.
+    ListTrustedNetworks,
+    /// Feature 014 local-only request: mark the network the machine is currently
+    /// on as trusted (fingerprinted by gateway MAC + subnet). Acked, or errored
+    /// when the network cannot be fingerprinted (zero gateway MAC / VPN-only).
+    /// Local socket only. No fields.
+    AddCurrentNetworkTrusted,
+    /// Feature 014 local-only request: remove a trusted network by its record
+    /// `id` (the `id` from [`TrustedNetworkInfo`]). Removing the current network
+    /// makes the LAN surface go dormant. Local socket only.
+    RemoveTrustedNetwork {
+        /// The [`TrustedNetworkInfo`] record id to remove.
+        id: String,
+    },
+    /// Feature 014 local-only settings request: report this machine's LAN
+    /// environment for the Settings → Remote "Local network" section — this
+    /// device's OWN identity fingerprint (word list + hex) for the optional
+    /// out-of-band MITM compare (FR-006), and whether the CURRENT network can be
+    /// fingerprinted as a trusted network (drives the "Add current network"
+    /// control's enabled/disabled state and explanatory note). Served from THIS
+    /// machine's own view and refused as a non-`LanHello` / non-`RemoteHandshake`
+    /// first frame over any remote transport, exactly like [`GetRemoteEnv`], so a
+    /// remote peer can never read a third machine's identity. Answered with
+    /// exactly one [`ServerMessage::LanEnv`]. No fields.
+    GetLanEnv,
+    /// Feature 014 (LAN dial-identity fix) local-only request: hand this
+    /// machine's OWN device identity (public certificate DER + sealed `PKCS#8`
+    /// private-key DER) to a co-located connecting `scribe-client` so the dialer
+    /// can build its mutual-TLS identity WITHOUT reading the OS keyring from a
+    /// different binary. On macOS the sealed device key's legacy `SecKeychain`
+    /// per-item ACL trusts ONLY the creating binary (`scribe-server`), so a
+    /// cross-binary read is denied (errSecInteractionNotAllowed) with no usable
+    /// prompt; the server therefore stays the SOLE keychain accessor and serves the
+    /// identity here. Refused as a non-`Hello` first frame over any remote transport
+    /// (exactly like [`GetLanEnv`]), so a remote peer can never exfiltrate this
+    /// machine's private device key. Answered with exactly one
+    /// [`ServerMessage::LanDialIdentity`]. No fields.
+    GetLanDialIdentity,
+    /// Feature 015: a participant takes input control of a shared window in
+    /// [`SharingMode::SharedSingleTypist`] mode under
+    /// `control_acquisition = FreeClaim` (default), or the owning machine claims
+    /// regardless of acquisition setting (FR-005, FR-007). The server sets the
+    /// holder, demotes the previous holder to a still-live viewer, and
+    /// broadcasts a fresh [`ServerMessage::ShareRoster`]. No-op in `FreeForAll`;
+    /// not applicable in `SingleController`. Additive v3 variant, never sent by a
+    /// v2 client or on the local Unix socket.
+    ControlClaim {
+        window_id: WindowId,
+    },
+    /// Feature 015: a viewer asks for input control under
+    /// `control_acquisition = RequestAndGrant`. The server records the pending
+    /// request and sends [`ServerMessage::ControlRequested`] to the current
+    /// holder (or the owner if unheld). Cancelled on holder change or mode
+    /// change. Additive v3 variant.
+    ControlRequest {
+        window_id: WindowId,
+    },
+    /// Feature 015: the current holder (or owner) answers a pending
+    /// [`ControlRequest`]. On `accept = true` the server transfers the holder to
+    /// `participant_id` and broadcasts [`ServerMessage::ShareRoster`]; on `false`
+    /// it clears the pending request and sends [`ServerMessage::ControlDenied`]
+    /// to the requester. Only honored from the approver named by the request
+    /// (FR-005). Additive v3 variant.
+    ControlGrant {
+        window_id: WindowId,
+        /// Server-monotonic id of the grant target (the requester).
+        participant_id: u64,
+        /// `true` transfers control; `false` denies the request.
+        accept: bool,
     },
 }
 
@@ -505,6 +734,15 @@ pub enum ServerMessage {
         /// `false` so older servers deserialize cleanly.
         #[serde(default)]
         clipboard_gating: bool,
+        /// Feature 015: this connection's own server-assigned `participant_id`
+        /// in the window's share, so a remote client can match itself in a
+        /// [`ServerMessage::ShareRoster`] exactly (e.g. its own `is_holder`)
+        /// instead of comparing device names. `None` from an older server or
+        /// when the claim did not register a participant (a lost-control
+        /// landing). Additive, `#[serde(default)]` so local / legacy flows are
+        /// unaffected (contracts/remote-protocol-v3.md).
+        #[serde(default)]
+        participant_id: Option<u64>,
     },
     /// Confirms that the server permanently removed a window and its sessions.
     WindowClosed {
@@ -615,6 +853,199 @@ pub enum ServerMessage {
         request_id: PromptId,
         selection: ClipboardSelection,
     },
+    /// Feature 013 reply to [`ClientMessage::RemoteHandshake`]. Always sent
+    /// after the preamble is read so every refusal reaches the dialer as a
+    /// typed outcome (UX-002). On `accepted = false` the server closes the
+    /// connection after sending this frame.
+    RemoteHandshakeReply {
+        accepted: bool,
+        /// Present iff `!accepted`; names the typed refusal reason.
+        #[serde(default)]
+        refusal: Option<RemoteRefusal>,
+        /// Server's [`REMOTE_PROTOCOL_VERSION`], named for mismatch copy.
+        server_remote_protocol_version: u32,
+        /// Server's human-readable Scribe version, named for mismatch copy.
+        server_scribe_version: String,
+    },
+    /// Feature 013: sent to a client whose window was claimed by another
+    /// controller. The displaced client stops sending input for that window,
+    /// freezes and dims its last frame under a banner naming the new
+    /// controller, and offers one-action reclaim.
+    WindowTakenOver {
+        /// New controller's device name (or "this machine" for a local reclaim).
+        device_name: String,
+        /// New controller's account display name.
+        login_name: String,
+    },
+    /// Feature 013 best-effort final frame before the server closes a remote
+    /// connection for a policy reason (v1: remote access disabled). The close
+    /// follows regardless of whether this frame is delivered.
+    RemoteDisconnect {
+        reason: RemoteRefusal,
+    },
+    /// Feature 013 reply to [`ClientMessage::ListRemotePeers`] — this machine's
+    /// same-account tailnet peers for the connect picker. Local socket only.
+    RemotePeerList {
+        peers: Vec<RemotePeerInfo>,
+    },
+    /// Feature 013 reply to [`ClientMessage::GetRemoteEnv`] — this machine's
+    /// remote environment for the Settings → Remote section (UX-003, FR-015).
+    /// `account` is the signed-in tailnet login name, absent when unknown;
+    /// `tailscale_detected` is `false` when the `LocalAPI` could not be reached
+    /// at all, which drives the passive "Tailscale not detected" notice. Any
+    /// `LocalAPI` error fails closed to `{ account: None, tailscale_detected:
+    /// false }`. Local socket only.
+    RemoteEnv {
+        #[serde(default)]
+        account: Option<String>,
+        tailscale_detected: bool,
+    },
+    /// Feature 014: owning → connecting notice that the LAN connection is held
+    /// pending device approval on the owning machine. MUST be sent before any
+    /// window data so the connecting client can show a "waiting for approval on
+    /// <peer>" state (FR-014, US2.5). No window or session data flows until a
+    /// [`ServerMessage::LanApprovalResult`] with `approved = true`
+    /// (contracts/lan-protocol.md). No fields.
+    LanApprovalPending,
+    /// Feature 014: owning → connecting terminal outcome of the LAN approval
+    /// gate. `approved = true` means proceed to `Hello`; `approved = false` means
+    /// refused, with `refusal` naming the typed [`LanRefusal`] reason (present
+    /// iff `!approved`). On refusal the server closes the connection after this
+    /// frame (contracts/lan-protocol.md).
+    LanApprovalResult {
+        approved: bool,
+        /// Present iff `!approved`; names the typed refusal reason.
+        #[serde(default)]
+        refusal: Option<LanRefusal>,
+    },
+    /// Feature 014: owning server → its OWN local client — an unknown LAN device
+    /// has completed the mutual-TLS handshake and is pending the user's approval.
+    /// Carries the peer's advertised name, identity fingerprint words, and the
+    /// trusted network it arrived on for the approval prompt; `name_collision` is
+    /// an informational hint (never a trust key) that an already-trusted device
+    /// shares this advertised name. Answered with
+    /// [`ClientMessage::LanApprovalDecision`] carrying the same `request_id`.
+    /// Local socket only — never sent over a remote transport.
+    LanApprovalRequest {
+        /// Correlates this push with the [`ClientMessage::LanApprovalDecision`].
+        request_id: u64,
+        /// Requesting device's advertised name (display only).
+        device_name: String,
+        /// The peer's identity fingerprint words (research D8).
+        fingerprint_words: String,
+        /// The trusted network the request arrived on.
+        network_label: String,
+        /// `true` when an already-trusted device shares this advertised name
+        /// (informational hint only).
+        name_collision: bool,
+    },
+    /// Feature 014 reply to [`ClientMessage::ListLanPeers`] — LAN peers discovered
+    /// via mDNS on the current network, for the connect picker. Local socket only.
+    LanPeerList {
+        peers: Vec<LanPeerInfo>,
+    },
+    /// Feature 014 reply to [`ClientMessage::ListTrustedDevices`] — this machine's
+    /// approved LAN devices for the Settings "Local network" section. Local
+    /// socket only.
+    TrustedDeviceList {
+        devices: Vec<TrustedDeviceInfo>,
+    },
+    /// Feature 014 reply to [`ClientMessage::ListTrustedNetworks`] — the user's
+    /// trusted networks and whether the current network is one of them
+    /// (`current_trusted` drives the active/dormant status line, UX-004). Local
+    /// socket only.
+    TrustedNetworkList {
+        networks: Vec<TrustedNetworkInfo>,
+        current_trusted: bool,
+    },
+    /// Feature 014 reply to [`ClientMessage::GetLanEnv`] — this machine's own LAN
+    /// environment for the Settings "Local network" section. `device_id_hex`
+    /// (lowercase hex of `device_id = SHA-256(SPKI)`) and `fingerprint_words`
+    /// are this machine's OWN identity, both absent until the identity has been
+    /// generated (first LAN enable). `current_network_addable` is `true` when the
+    /// network the machine is currently on can be fingerprinted as a trusted
+    /// network (non-zero gateway MAC, physical LAN, not VPN-only); when `false`,
+    /// `current_network_reason` carries the short note for the disabled "Add
+    /// current network" control. Any local error fails closed to identity `None`
+    /// with `current_network_addable = false`. Local socket only.
+    LanEnv {
+        #[serde(default)]
+        device_id_hex: Option<String>,
+        #[serde(default)]
+        fingerprint_words: Option<String>,
+        current_network_addable: bool,
+        #[serde(default)]
+        current_network_reason: Option<String>,
+    },
+    /// Feature 014 (LAN dial-identity fix) reply to
+    /// [`ClientMessage::GetLanDialIdentity`] — this machine's OWN device identity
+    /// for a co-located connecting `scribe-client` to build its mutual-TLS dialer
+    /// without touching the OS keyring. `available` is `true` only when the server
+    /// resolved (minting on first use, like the owning side) a usable identity; in
+    /// that case `cert_der` is the public certificate DER and `private_key_pkcs8_der`
+    /// is the sealed `PKCS#8` private-key DER. On any keyring/state-dir error
+    /// `available` is `false` and both byte fields are empty, so the client fails
+    /// closed and never dials without an identity. `private_key_pkcs8_der` is PRIVATE
+    /// key material: this message is local-socket only (never crosses a remote
+    /// transport) and is never logged.
+    LanDialIdentity {
+        available: bool,
+        cert_der: Vec<u8>,
+        private_key_pkcs8_der: Vec<u8>,
+    },
+    /// Feature 015: full-state roster broadcast to every participant of a shared
+    /// window on every join, leave, control transfer, ejection, and mode change
+    /// (FR-008, D8). Never a delta — always the complete current roster
+    /// (contracts/remote-protocol-v3.md). Additive v3 message.
+    ShareRoster {
+        window_id: WindowId,
+        /// The complete current participant list.
+        participants: Vec<ParticipantInfo>,
+        /// The window's active sharing mode.
+        mode: SharingMode,
+        /// The current input-control holder's participant id, or `None` when
+        /// unheld or not applicable to the mode.
+        #[serde(default)]
+        holder: Option<u64>,
+    },
+    /// Feature 015: sent to the current holder (or the owner if unheld) when a
+    /// viewer requests input control under `RequestAndGrant`. The recipient
+    /// answers with [`ClientMessage::ControlGrant`]. Additive v3 message.
+    ControlRequested {
+        window_id: WindowId,
+        /// The requesting participant.
+        from: ParticipantInfo,
+    },
+    /// Feature 015: sent to a requester when a [`ClientMessage::ControlGrant`]
+    /// with `accept = false` denies the request, or the pending request was
+    /// cancelled by a holder change or mode change. Additive v3 message.
+    ControlDenied {
+        window_id: WindowId,
+    },
+    /// Feature 015: sent to every remote participant of a share when the owning
+    /// machine closes the window/session or flips to `SingleController`
+    /// (FR-017). For a `SingleController` flip, remote participants also receive
+    /// the legacy [`ServerMessage::WindowTakenOver`] for the frozen displaced UI;
+    /// `ShareEnded` is the mode-neutral roster/notice signal. Additive v3
+    /// message.
+    ShareEnded {
+        window_id: WindowId,
+        reason: ShareEndReason,
+    },
+}
+
+/// Feature 015: why a shared window's session ended for its remote participants
+/// (contracts/remote-protocol-v3.md, [`ServerMessage::ShareEnded`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareEndReason {
+    /// The owning machine closed the window.
+    OwnerClosed,
+    /// The shared session itself closed.
+    WindowClosed,
+    /// The owner flipped the sharing mode to `SingleController`, ending the
+    /// share for all remote participants.
+    ModeChangedToSingleController,
 }
 
 // ── Shared types ─────────────────────────────────────────────────
@@ -868,6 +1299,118 @@ pub enum EnvStatusState {
     /// Keystore became unavailable; persistence has stopped. The on-disk
     /// envelope (if any) is untouched. No plaintext fallback.
     Degraded { reason: String },
+}
+
+/// Feature 013: canonical remote-refusal taxonomy. One enum shared by the wire
+/// ([`ServerMessage::RemoteHandshakeReply`] `refusal`,
+/// [`ServerMessage::RemoteDisconnect`] `reason`) and the server audit log, so
+/// refusal reasons never drift between the two surfaces. Each variant maps 1:1
+/// to the distinct UX-002 failure copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteRefusal {
+    /// Remote access is off (races with a live disable).
+    Disabled,
+    /// Wrong tailnet account, a tagged/identity-less node, or unknown identity.
+    Unauthorized,
+    /// tailscaled / `WhoIs` unavailable — fail closed (FR-015).
+    IdentityUnavailable,
+    /// Exact [`REMOTE_PROTOCOL_VERSION`] match failed (both versions in reply).
+    IncompatibleVersion,
+    /// The remote-connection cap (8) is reached.
+    Busy,
+}
+
+/// Feature 013: one same-account tailnet peer for the connect picker, resolved
+/// from THIS machine's own `LocalAPI` status and carried in
+/// [`ServerMessage::RemotePeerList`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemotePeerInfo {
+    /// `MagicDNS` short name; shown in the picker and usable as a dial target.
+    pub name: String,
+    /// Tailnet address to dial (literal IP or MagicDNS-resolvable host).
+    pub addr: String,
+    /// Whether the peer is currently reachable; offline peers are greyed/omitted.
+    pub online: bool,
+}
+
+/// Feature 014: canonical LAN-refusal taxonomy, mirroring 013's
+/// [`RemoteRefusal`] for the LAN transport. Carried in
+/// [`ServerMessage::LanApprovalResult`] `refusal` and the server audit log so
+/// refusal reasons never drift between the wire and the log. Each variant maps
+/// 1:1 to the distinct failure copy (contracts/settings-and-config.md). There is
+/// deliberately NO `IdentityChanged` variant: trust is keyed by
+/// `device_id = SHA-256(SPKI)`, so a reinstalled/rekeyed peer presents a new,
+/// unpinned `device_id` and is simply an unknown device requiring fresh approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LanRefusal {
+    /// The owning user declined the approval prompt (or it timed out).
+    Declined,
+    /// The owning machine raced leaving a trusted network (now dormant).
+    NotTrustedNetwork,
+    /// LAN access was turned off mid-handshake.
+    Disabled,
+    /// Exact [`REMOTE_PROTOCOL_VERSION`] match failed (both versions named).
+    IncompatibleVersion,
+    /// The LAN connection cap was reached.
+    Busy,
+}
+
+/// Feature 014: one LAN peer discovered via mDNS on the current network,
+/// resolved from THIS machine's own discovery view and carried in
+/// [`ServerMessage::LanPeerList`] for the connect picker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanPeerInfo {
+    /// mDNS instance / display name shown in the picker.
+    pub name: String,
+    /// Peer machine hostname (mDNS TXT `host`); the name-match key for
+    /// LAN↔tailnet dedup against the tailnet `MagicDNS` name.
+    pub host: String,
+    /// Resolved LAN address to dial (filtered to the current subnet).
+    pub addr: String,
+    /// Control port from the SRV record.
+    pub port: u16,
+    /// [`REMOTE_PROTOCOL_VERSION`] from TXT `protovers`; incompatible peers are
+    /// filtered before connecting.
+    pub protovers: u32,
+    /// Whether the peer is currently advertised; evicted peers are greyed/omitted.
+    pub online: bool,
+}
+
+/// Feature 014: one approved LAN device for the Settings "Local network"
+/// trusted-devices list, carried in [`ServerMessage::TrustedDeviceList`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedDeviceInfo {
+    /// Lowercase hex of the 32-byte `device_id = SHA-256(SPKI)`; the revoke key
+    /// echoed back in [`ClientMessage::RevokeTrustedDevice`].
+    pub device_id_hex: String,
+    /// Human label (the peer's advertised name at approval time).
+    pub label: String,
+    /// Word-list fingerprint for the list display (research D8).
+    pub fingerprint_words: String,
+    /// Approval time, Unix epoch milliseconds.
+    pub approved_at: u64,
+}
+
+/// Feature 014: one trusted network for the Settings "Local network"
+/// trusted-networks list, carried in [`ServerMessage::TrustedNetworkList`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedNetworkInfo {
+    /// Record id; the removal key echoed back in
+    /// [`ClientMessage::RemoveTrustedNetwork`].
+    pub id: String,
+    /// User-facing label (SSID when known, else a gateway-derived default).
+    pub label: String,
+    /// Normalized lowercase default-gateway MAC (the primary match anchor).
+    pub gateway_mac: String,
+    /// Local subnet in CIDR form (e.g. `192.168.1.0/24`; secondary corroborator).
+    pub subnet_cidr: String,
+    /// SSID display hint; `None` on wired links or where the OS withholds it.
+    #[serde(default)]
+    pub ssid: Option<String>,
+    /// When the network was trusted, Unix epoch milliseconds.
+    pub added_at: u64,
 }
 
 #[cfg(test)]
