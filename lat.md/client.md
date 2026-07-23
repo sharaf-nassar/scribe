@@ -30,7 +30,7 @@ Bytes buffered inside a VTE synchronized update (`CSI ? 2026 h/l`) do not mark t
 
 Visible output in the focused pane clears the active selection unless the user is actively dragging, while the shared post-output path still invalidates URL caches and shifts saved selections when scrollback grows.
 
-The cache stores the last-built instances along with cursor blink visibility, terminal cursor hidden state (DECTCEM), focus state, selection range, and sent grid dimensions. If all match, the cached instances are reused without GPU upload. Tracking DECTCEM separately from the blink layer ensures the cache invalidates when a program toggles cursor visibility via `CSI ? 25 h/l` without other content changes.
+The cache stores the last-built instances along with cursor blink visibility, terminal cursor hidden state (DECTCEM), focus state, selection range, and display offset. If all match, the cached instances are reused without GPU upload. Tracking the viewport offset prevents scrollback changes from reusing stale cells, while DECTCEM tracking invalidates when a program toggles cursor visibility via `CSI ? 25 h/l` without other content changes.
 
 ### Synchronized Updates
 
