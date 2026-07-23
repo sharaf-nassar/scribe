@@ -545,6 +545,11 @@ struct HardBreakContext<'a> {
 /// continuation row.
 const MAX_GUTTER_COLS: usize = 8;
 
+/// Maximum pure-space alignment indent accepted after a width-forced hard
+/// break. This is deliberately independent of [`MAX_GUTTER_COLS`]: alignment
+/// indents carry no drawn-block semantics and commonly exceed a small gutter.
+const MAX_ALIGNMENT_INDENT_COLS: usize = 32;
+
 /// Characters treated as part of a program-drawn gutter: whitespace,
 /// box-drawing (U+2500–U+257F), block elements (U+2580–U+259F), and the
 /// email/markdown quote marker.
@@ -587,6 +592,11 @@ fn hard_break_continuation_start(ctx: &HardBreakContext<'_>) -> Option<usize> {
         // Continuation resumes at column 0 — the exact case kitty
         // bridges by default (mutt-style hard wrap).
         0
+    } else if let Some(indent) = whitespace_alignment_indent(ctx.next_line) {
+        // Programs that align table cells often place a continuation under
+        // its column with spaces only. Unlike a drawn gutter this has no
+        // corresponding prefix on the broken row, so do not compare runs.
+        indent
     } else {
         matching_gutter_len(ctx.broken_row, ctx.next_line)?
     };
@@ -600,6 +610,18 @@ fn hard_break_continuation_start(ctx: &HardBreakContext<'_>) -> Option<usize> {
         return None;
     }
     Some(start)
+}
+
+/// Return the length of a safe pure-space alignment indent, if present.
+///
+/// Tabs and other whitespace remain part of the drawn-gutter path: accepting
+/// only literal spaces prevents this relaxed branch from blurring structured
+/// terminal decorations with an ordinary layout indent.
+fn whitespace_alignment_indent(next_line: &[LogicalCell]) -> Option<usize> {
+    let indent = next_line.iter().take_while(|cell| cell.ch == ' ').count();
+    let resume = next_line.get(indent)?.ch;
+    (indent > 0 && indent <= MAX_ALIGNMENT_INDENT_COLS && !is_url_terminator(resume))
+        .then_some(indent)
 }
 
 /// Length of the gutter run shared verbatim by the broken row and the
@@ -1143,5 +1165,122 @@ pub fn open_uri_unguarded(uri: &str) {
     match std::process::Command::new(cmd).arg(uri).spawn() {
         Ok(_child) => {}
         Err(e) => tracing::warn!("open_uri_unguarded: failed to spawn {cmd}: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::Term;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::term::Config;
+    use vte::ansi::Processor;
+
+    use super::{
+        HardBreakContext, LogicalCell, PaneUrlCache, SpanKind, hard_break_continuation_start,
+    };
+
+    #[derive(Clone, Copy)]
+    struct TestDims {
+        cols: usize,
+        rows: usize,
+    }
+
+    impl Dimensions for TestDims {
+        fn total_lines(&self) -> usize {
+            self.rows
+        }
+
+        fn screen_lines(&self) -> usize {
+            self.rows
+        }
+
+        fn columns(&self) -> usize {
+            self.cols
+        }
+    }
+
+    fn term_with_output(cols: usize, rows: usize, output: &[u8]) -> Term<VoidListener> {
+        let mut term = Term::new(Config::default(), &TestDims { cols, rows }, VoidListener);
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, output);
+        term
+    }
+
+    #[test]
+    fn joins_whitespace_indented_table_urls_across_hard_breaks() {
+        let output = concat!(
+            " Links     Durable search (https://www.pathofexile.com/\r\n",
+            "          trade2/search/poe2/Runes%20of%20Aldur/KlOw5Pz\r\n",
+            "          gi5) · Exact item (https://www.pathofexile.co\r\n",
+            "          m/trade2/search/poe2/Runes%20of%20Aldur/KlOw5\r\n",
+            "          odLh5)"
+        );
+        let term = term_with_output(55, 6, output.as_bytes());
+        let mut cache = PaneUrlCache::new();
+        cache.refresh(&term);
+
+        let urls: Vec<_> = cache
+            .visible_spans()
+            .iter()
+            .filter(|span| matches!(span.kind, SpanKind::Url))
+            .collect();
+        assert_eq!(urls.len(), 2);
+        assert_eq!(
+            urls[0].url,
+            "https://www.pathofexile.com/trade2/search/poe2/Runes%20of%20Aldur/KlOw5Pzgi5"
+        );
+        assert_eq!(urls[0].segments.len(), 3);
+        assert_eq!(urls[0].segments[1].col_start, 10);
+        assert_eq!(urls[0].segments[2].col_start, 10);
+        assert_eq!(
+            urls[1].url,
+            "https://www.pathofexile.com/trade2/search/poe2/Runes%20of%20Aldur/KlOw5odLh5"
+        );
+        assert_eq!(urls[1].segments.len(), 3);
+        assert_eq!(urls[1].segments[1].col_start, 10);
+        assert_eq!(urls[1].segments[2].col_start, 10);
+    }
+
+    fn cells(text: &str) -> Vec<LogicalCell> {
+        text.chars().enumerate().map(|(col, ch)| LogicalCell { ch, row: 0, col }).collect()
+    }
+
+    #[test]
+    fn preserves_col_zero_new_scheme_and_drawn_gutter_hard_break_rules() {
+        let broken = cells("https");
+        let col_zero = cells("continuation");
+        assert_eq!(
+            hard_break_continuation_start(&HardBreakContext {
+                url_end_col: 4,
+                last_col: 4,
+                broken_row: &broken,
+                next_line: &col_zero,
+            }),
+            Some(0)
+        );
+
+        let new_link = cells("https://new.example");
+        assert_eq!(
+            hard_break_continuation_start(&HardBreakContext {
+                url_end_col: 4,
+                last_col: 4,
+                broken_row: &broken,
+                next_line: &new_link,
+            }),
+            None
+        );
+
+        let gutter_broken = cells("▏ https");
+        let gutter_next = cells("▏ continuation");
+        assert_eq!(
+            hard_break_continuation_start(&HardBreakContext {
+                url_end_col: 6,
+                last_col: 6,
+                broken_row: &gutter_broken,
+                next_line: &gutter_next,
+            }),
+            Some(2)
+        );
     }
 }
