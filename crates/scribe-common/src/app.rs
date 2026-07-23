@@ -157,7 +157,15 @@ impl AppIdentity {
 
     #[must_use]
     pub fn state_dir(self) -> Option<PathBuf> {
-        dirs::state_dir().map(|dir| dir.join(self.state_dir_name()))
+        // `dirs::state_dir()` follows the XDG base-directory spec and is only
+        // defined on Linux and other non-Apple unixes; on macOS and Windows it
+        // returns `None`. Fall back to the platform data directory there
+        // (`~/Library/Application Support` on macOS, `%APPDATA%` on Windows) so
+        // persisted state — session restore, window geometry, LAN trusted
+        // networks/devices, and the device identity cert — has a real home on
+        // every platform instead of silently failing closed. Mirrors how
+        // `config_dir` already resolves on macOS.
+        dirs::state_dir().or_else(dirs::data_dir).map(|dir| dir.join(self.state_dir_name()))
     }
 
     #[must_use]

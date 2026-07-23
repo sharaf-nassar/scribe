@@ -213,8 +213,8 @@ async fn activate_moves_sessions_to_live_registry() {
     let wm = Arc::new(RwLock::new(WorkspaceManager::new(vec![])));
     let registry = ipc_server::new_live_session_registry();
 
-    let gating = ipc_server::new_window_clipboard_gating();
-    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &gating).await;
+    let shares = ipc_server::new_window_shares();
+    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares).await;
 
     // SessionManager should now be empty.
     assert!(
@@ -240,8 +240,8 @@ async fn serialize_live_returns_activated_sessions() {
     let wm = Arc::new(RwLock::new(WorkspaceManager::new(vec![])));
     let registry = ipc_server::new_live_session_registry();
 
-    let gating = ipc_server::new_window_clipboard_gating();
-    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &gating).await;
+    let shares = ipc_server::new_window_shares();
+    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares).await;
     wait_registry_count(&registry, 1).await;
 
     let (sessions, fds) = ipc_server::serialize_live_for_handoff(&registry).await;
@@ -270,8 +270,8 @@ async fn v4_legacy_handoff_snapshot_is_restored_durably() {
     let wm = Arc::new(RwLock::new(WorkspaceManager::new(vec![])));
     let registry = ipc_server::new_live_session_registry();
 
-    let gating = ipc_server::new_window_clipboard_gating();
-    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &gating).await;
+    let shares = ipc_server::new_window_shares();
+    ipc_server::activate_pending_sessions(&sm, &wm, &registry, &shares).await;
     wait_registry_count(&registry, 1).await;
 
     // The legacy handoff snapshot had alt_screen=true and cursor_visible=false.

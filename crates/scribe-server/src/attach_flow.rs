@@ -5,7 +5,7 @@ use std::sync::Arc;
 use alacritty_terminal::grid::Dimensions;
 use futures_util::future::join_all;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use scribe_common::ids::SessionId;
 use scribe_common::protocol::{ServerMessage, TerminalSize};
@@ -57,6 +57,10 @@ impl From<AttachSessionData> for AttachEntry {
 pub struct AttachClientContext<'a> {
     pub writer: &'a SharedWriter,
     pub attached_ids: &'a AttachedSessionIds,
+    /// Feature 015 (T012): add this connection's sink to each session's set
+    /// additively (a shared-mode viewer joins) rather than replacing it (the
+    /// `SingleController` / legacy takeover re-point).
+    pub additive: bool,
 }
 
 pub async fn attach_sessions(
@@ -66,7 +70,14 @@ pub async fn attach_sessions(
     client: AttachClientContext<'_>,
 ) -> HashSet<SessionId> {
     let entries = prepare_attach_entries(session_ids, dimensions, live_sessions).await;
-    attach_prepared_entries(entries, client.writer, live_sessions, client.attached_ids).await
+    attach_prepared_entries(
+        entries,
+        client.writer,
+        live_sessions,
+        client.attached_ids,
+        client.additive,
+    )
+    .await
 }
 
 async fn prepare_attach_entries(
@@ -103,6 +114,7 @@ async fn attach_prepared_entries(
     writer: &SharedWriter,
     live_sessions: &LiveSessionRegistry,
     attached_ids: &AttachedSessionIds,
+    additive: bool,
 ) -> HashSet<SessionId> {
     let mut handles = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -111,7 +123,7 @@ async fn attach_prepared_entries(
         let attached_ids = Arc::clone(attached_ids);
         handles.push(tokio::spawn(async move {
             let session_id = entry.session_id;
-            attach_one_session(&entry, &writer, &live_sessions, &attached_ids).await;
+            attach_one_session(&entry, &writer, &live_sessions, &attached_ids, additive).await;
             session_id
         }));
     }
@@ -134,9 +146,10 @@ async fn attach_one_session(
     writer: &SharedWriter,
     live_sessions: &LiveSessionRegistry,
     attached_ids: &AttachedSessionIds,
+    additive: bool,
 ) {
     send_attach_replay(entry, writer, live_sessions).await;
-    install_client_writer(entry, writer, attached_ids).await;
+    install_client_writer(entry, writer, attached_ids, additive).await;
 }
 
 async fn send_attach_replay(
@@ -184,15 +197,29 @@ async fn install_client_writer(
     entry: &AttachEntry,
     writer: &SharedWriter,
     attached_ids: &AttachedSessionIds,
+    additive: bool,
 ) {
     let mut client_writer = entry.client_writer.lock().await;
-    if client_writer.is_some() {
-        warn!(
-            %entry.session_id,
-            "AttachSessions: overwriting existing client writer - previous client may still be connected"
-        );
+    if additive {
+        // Feature 015 (T012): a shared-mode participant joins — add its sink to the
+        // set without disturbing the existing participants' sinks, so live output
+        // fans out to every attached machine.
+        client_writer.attach_additive(Arc::clone(writer));
+    } else {
+        if !client_writer.is_empty() {
+            // Feature 013: an existing sink here is the EXPECTED case on a takeover
+            // (the new controller re-points each session at itself; the displaced
+            // connection can no longer detach them thanks to the ptr-eq guards in
+            // `detach_sessions` / `dispatch_message`). Just a debug breadcrumb.
+            debug!(
+                %entry.session_id,
+                "AttachSessions: re-pointing session's client writer to the attaching controller"
+            );
+        }
+        // The SingleController attach / takeover re-point replaces the attached-sink
+        // set with this single sink — byte-identical to the pre-015 `Some(writer)`.
+        client_writer.set_sole(Arc::clone(writer));
     }
-    *client_writer = Some(Arc::clone(writer));
     drop(client_writer);
     *entry.attachment.lock().await = Some(Arc::clone(attached_ids));
 
@@ -263,6 +290,7 @@ mod tests {
     use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
     use tokio::sync::{Mutex, mpsc};
 
+    use crate::ipc_server::ClientSink;
     use crate::session_manager::build_term_config;
 
     struct TestDimensions;
@@ -302,7 +330,7 @@ mod tests {
             session_id,
             workspace_id,
             shell_name: String::from("zsh"),
-            client_writer: Arc::new(Mutex::new(None)),
+            client_writer: Arc::new(Mutex::new(crate::ipc_server::AttachedSinks::default())),
             attachment: Arc::new(Mutex::new(None)),
             term: Arc::new(Mutex::new(make_term(session_id))),
             resize_fd: Arc::new(std::fs::File::open("/dev/null").unwrap().into()),
@@ -321,11 +349,11 @@ mod tests {
         let (server, client) = unix_stream_pair();
         let (_server_read, server_write) = tokio::io::split(server);
         let (mut client_read, _client_write) = tokio::io::split(client);
-        let writer: SharedWriter = Arc::new(Mutex::new(server_write));
+        let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Local(Box::new(server_write))));
 
         send_attach_replay(&entry, &writer, &live_sessions).await;
 
-        assert!(entry.client_writer.lock().await.is_none());
+        assert!(entry.client_writer.lock().await.is_empty());
 
         let msg1 = read_message::<ServerMessage, _>(&mut client_read).await.unwrap();
         let ServerMessage::SessionCreated { session_id: got_id, workspace_id: got_ws, shell_name } =
@@ -361,11 +389,11 @@ mod tests {
 
         let (server, _client) = unix_stream_pair();
         let (_read, write) = tokio::io::split(server);
-        let writer: SharedWriter = Arc::new(Mutex::new(write));
+        let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Local(Box::new(write))));
         let attached_ids = Arc::new(Mutex::new(HashSet::new()));
 
         let attached =
-            attach_prepared_entries(entries, &writer, &live_sessions, &attached_ids).await;
+            attach_prepared_entries(entries, &writer, &live_sessions, &attached_ids, false).await;
 
         assert_eq!(attached, expected_ids);
     }

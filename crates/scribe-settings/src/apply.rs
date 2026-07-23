@@ -61,6 +61,9 @@ fn apply_config_key(
         key if key.starts_with("theme.") => {
             apply_theme_color_key(config, key, value)?;
         }
+        key if key.starts_with("remote.") => {
+            apply_remote_key(config, key, value)?;
+        }
         _ => tracing::debug!(key, "unhandled settings key"),
     }
 
@@ -657,6 +660,70 @@ fn apply_notifications_key(
             config.notifications.timeout_secs = parse_number(value, "notifications.timeout_secs")?;
         }
         _ => return Err(format!("unhandled notifications key: {key}")),
+    }
+
+    Ok(())
+}
+
+/// Apply a `remote.<field>` settings change to the `[remote]` TOML table.
+///
+/// Feature 013 (tailnet): `remote.enabled` toggles the opt-in Tailscale
+/// remote-control listener (default off); `remote.port` sets the TCP port bound
+/// only on the machine's tailnet addresses.
+///
+/// Feature 014 (LAN): `remote.lan.enabled` toggles the separate opt-in LAN
+/// listener (default off; a distinct opt-in from the tailnet listener, FR-012),
+/// and `remote.lan.port` sets the port bound only on the physical LAN address
+/// (default 46062). Both ports are clamped to the same 1024–65535 range the
+/// settings webview enforces so a hand-crafted IPC cannot persist an
+/// out-of-range value. The server applies all four live on `ConfigReloaded`; it
+/// is never restarted for this.
+///
+/// Feature 015 (window sharing): `remote.sharing_mode` selects who may type into
+/// a shared window (`single_controller` default / `shared_single_typist` /
+/// `free_for_all`, FR-004); `remote.control_acquisition` selects how control is
+/// handed off in single-typist mode (`free_claim` default / `request_and_grant`,
+/// FR-005); `remote.participant_limit` caps remote joins per shared window, with
+/// `0` persisted as `None` (unlimited, FR-018). The server reconciles live
+/// shares on `ConfigReloaded`; no restart.
+fn apply_remote_key(
+    config: &mut scribe_common::config::ScribeConfig,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match key {
+        "remote.enabled" => {
+            config.remote.enabled = value.as_bool().ok_or("remote.enabled must be a boolean")?;
+        }
+        "remote.port" => {
+            let v: u16 = parse_number(value, "remote.port")?;
+            config.remote.port = v.clamp(1024, 65535);
+        }
+        "remote.lan.enabled" => {
+            config.remote.lan.enabled =
+                value.as_bool().ok_or("remote.lan.enabled must be a boolean")?;
+        }
+        "remote.lan.port" => {
+            let v: u16 = parse_number(value, "remote.lan.port")?;
+            config.remote.lan.port = v.clamp(1024, 65535);
+        }
+        "remote.sharing_mode" => {
+            let s = value.as_str().ok_or("remote.sharing_mode must be a string")?;
+            config.remote.sharing_mode =
+                serde_json::from_value(serde_json::Value::String(s.to_owned()))
+                    .map_err(|e| format!("invalid sharing mode: {e}"))?;
+        }
+        "remote.control_acquisition" => {
+            let s = value.as_str().ok_or("remote.control_acquisition must be a string")?;
+            config.remote.control_acquisition =
+                serde_json::from_value(serde_json::Value::String(s.to_owned()))
+                    .map_err(|e| format!("invalid control acquisition: {e}"))?;
+        }
+        "remote.participant_limit" => {
+            let v: u32 = parse_number(value, "remote.participant_limit")?;
+            config.remote.participant_limit = if v == 0 { None } else { Some(v) };
+        }
+        _ => return Err(format!("unhandled remote key: {key}")),
     }
 
     Ok(())

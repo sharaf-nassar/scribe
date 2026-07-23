@@ -309,6 +309,25 @@ impl WorkspaceManager {
             .collect()
     }
 
+    /// Distinct display names of the workspaces owning this window's sessions,
+    /// in the window's stored session order. Unnamed workspaces are skipped and
+    /// duplicates removed. Feeds the feature-013 remote connect picker's window
+    /// list (FR-005).
+    #[must_use]
+    pub fn workspace_names_for_window(&self, window_id: WindowId) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for session_id in self.sessions_for_window(window_id) {
+            if let Some(ws_id) = self.session_to_workspace.get(&session_id)
+                && let Some(ws) = self.workspaces.get(ws_id)
+                && let Some(name) = ws.name.as_ref()
+                && !names.iter().any(|existing| existing == name)
+            {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+
     /// Reorder the sessions in a workspace to match the given order.
     ///
     /// Sessions in `ordered` that don't belong to the workspace are ignored.

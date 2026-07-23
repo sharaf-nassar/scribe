@@ -13,6 +13,14 @@ workspace = true
 scribe-common.workspace = true
 scribe-pty.workspace = true
 scribe-renderer.workspace = true
+# Feature 014 LAN remote control: the connecting client reuses the server's
+# device identity (keyring-sealed Ed25519 cert) and the SPKI-pinning mutual-TLS
+# dialer (`LanTls::connect`) so the security-critical verifier + signature
+# delegation live in ONE place rather than being duplicated client-side.
+# tokio-rustls names the dialer-side encrypted stream type. See the follow-up
+# note in `ipc_client.rs` on extracting these into a shared crate.
+scribe-server.workspace = true
+tokio-rustls.workspace = true
 alacritty_terminal.workspace = true
 wgpu.workspace = true
 winit.workspace = true

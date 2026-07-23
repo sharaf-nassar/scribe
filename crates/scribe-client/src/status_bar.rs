@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use scribe_common::protocol::{EnvStatusState, UpdateProgressState};
+use scribe_common::protocol::{ControllerInfo, EnvStatusState, UpdateProgressState};
 use scribe_common::theme::ChromeColors;
 use scribe_renderer::srgb_to_linear_rgba;
 use scribe_renderer::types::CellInstance;
@@ -49,8 +49,23 @@ pub struct StatusBarData<'a> {
     pub env_status: Option<&'a EnvStatusState>,
     /// Total number of active sessions in this window.
     pub session_count: usize,
+    /// Feature 013 (T022): owning-machine remote-control status (enabled flag +
+    /// active controllers). Grouped so its flag does not swell this struct's
+    /// bool count and because both fields render as one left-side region.
+    pub remote: RemoteStatusData<'a>,
+    /// Feature 015 (T024/T026): the active share's presence badge — participant
+    /// count and current control holder. `None` outside a multi-participant share
+    /// (renders nothing). Seen by every participant, including the owning machine.
+    pub share_presence: Option<SharePresenceData>,
     /// Remote or local host label for the focused pane.
     pub host_label: &'a str,
+    /// Feature 014 (T025): which transport this controlling-side window is driving
+    /// the remote machine over — `Some("Local network")` (LAN / mutual TLS) or
+    /// `Some("Tailscale")` (tailnet). `None` on an owning or ordinary local window,
+    /// which renders nothing. Drives the persistent transport indicator beside the
+    /// host label so the user can always see which path a controlled window uses
+    /// (FR-009).
+    pub remote_transport: Option<&'a str>,
     /// tmux session label for the focused pane when present.
     pub tmux_label: Option<&'a str>,
     /// Current time string (e.g. "14:32").
@@ -61,6 +76,31 @@ pub struct StatusBarData<'a> {
     pub update_progress: Option<&'a UpdateProgressState>,
     pub sys_stats: Option<&'a SystemStats>,
     pub stats_config: Option<&'a scribe_common::config::StatusBarStatsConfig>,
+}
+
+/// Feature 015 (T024/T026): the shared-window presence badge inputs. Built once
+/// per frame from the client's latest `ShareRoster`; `None` outside a
+/// multi-participant share.
+pub struct SharePresenceData {
+    /// Total attached participants (owner + remotes), always ≥ 2 when present.
+    pub participant_count: usize,
+    /// Display label of the current control holder, or `None` when unheld.
+    pub holder: Option<String>,
+}
+
+/// Feature 013 (T022): owning-machine remote-control status inputs for the
+/// status bar, grouped into one struct (see [`StatusBarData::remote`]).
+pub struct RemoteStatusData<'a> {
+    /// Whether this machine currently allows remote control (`remote.enabled`).
+    /// Drives the persistent subtle enabled indicator (FR-009a); `false` renders
+    /// nothing.
+    pub enabled: bool,
+    /// One entry per window on this machine a remote peer currently controls
+    /// (device + account), from the local server's window list. Drives the
+    /// "&lt;device&gt; controls N windows" segment (FR-009b) and covers
+    /// remotely-created windows with no local client (SC-006). Empty renders
+    /// nothing.
+    pub controllers: &'a [ControllerInfo],
 }
 
 /// Fallback green when ANSI index 2 is unavailable.
@@ -472,6 +512,131 @@ fn render_env_status_warning(
     w.put(' ', colors.text, colors.bg);
 }
 
+/// Render the owning-machine remote surfaces (feature 013, T022): a persistent
+/// subtle indicator while this machine accepts remote control (FR-009a), then a
+/// prominent "&lt;device&gt; controls N windows" segment while a remote peer holds
+/// any window (FR-009b). The controller segment is fed by the local server's
+/// window list, so it covers remotely-created windows with no local client
+/// (SC-006). Renders immediately after the command-status / env-warning glyphs
+/// so the left side reads status-dot → command → env → remote → workspace.
+fn render_remote_status(
+    w: &mut BarWriter<'_>,
+    colors: &StatusBarColors,
+    data: &StatusBarData<'_>,
+    tooltips: &mut Vec<TooltipAnchor>,
+) {
+    if data.remote.enabled {
+        let glyph_col = w.col;
+        // ⇅ (U+21C5) evokes the bidirectional remote link; dimmed `label`
+        // color keeps it subtle while nothing is actively controlled.
+        w.put('\u{21C5}', colors.label, colors.bg);
+        tooltips.push(TooltipAnchor {
+            text: String::from("Remote control enabled \u{2014} your devices can connect"),
+            rect: w.col_rect(glyph_col),
+        });
+        w.put(' ', colors.text, colors.bg);
+    }
+
+    if let Some(summary) = build_remote_control_summary(data.remote.controllers) {
+        let seg_col = w.col;
+        // Accent color: a remote peer actively driving a window is a signal the
+        // owner should notice, unlike the idle enabled indicator above.
+        w.put_str(&summary, colors.accent, colors.bg);
+        tooltips.push(TooltipAnchor {
+            text: remote_control_tooltip(data.remote.controllers),
+            rect: w.col_rect(seg_col),
+        });
+        w.put_str("  ", colors.text, colors.bg);
+    }
+
+    // Feature 015 (T024/T026): the share presence badge — participant count and
+    // holder — surfaced to every participant (including the owning machine).
+    if let Some(presence) = &data.share_presence {
+        let seg_col = w.col;
+        // ⇅ evokes the shared bidirectional link, matching the remote family.
+        w.put('\u{21C5}', colors.accent, colors.bg);
+        w.put(' ', colors.text, colors.bg);
+        let badge = share_presence_badge(presence);
+        w.put_str(&badge, colors.accent, colors.bg);
+        tooltips.push(TooltipAnchor {
+            text: share_presence_tooltip(presence),
+            rect: w.col_rect(seg_col),
+        });
+        w.put_str("  ", colors.text, colors.bg);
+    }
+}
+
+/// Compact presence-badge text: `N attached`, with `\u{00B7} <holder> has control`
+/// appended when a holder is known (feature 015, T024).
+fn share_presence_badge(presence: &SharePresenceData) -> String {
+    let count = presence.participant_count;
+    presence.holder.as_ref().map_or_else(
+        || format!("{count} attached \u{00B7} no one has control"),
+        |holder| format!("{count} attached \u{00B7} {holder} has control"),
+    )
+}
+
+/// Tooltip for the presence badge, naming the holder explicitly (feature 015,
+/// T024/T026).
+fn share_presence_tooltip(presence: &SharePresenceData) -> String {
+    let count = presence.participant_count;
+    presence.holder.as_ref().map_or_else(
+        || format!("{count} machines attached \u{2014} input control is unheld"),
+        |holder| format!("{count} machines attached \u{2014} {holder} holds input control"),
+    )
+}
+
+/// Aggregate the per-window controller list into the status-bar summary, e.g.
+/// `laptop-2 controls 1 window` or `laptop-2 controls 2 windows, phone controls
+/// 1 window` (FR-009b). Devices appear in first-seen order and are deduplicated
+/// by device name; returns `None` when nothing is remote-controlled.
+fn build_remote_control_summary(controllers: &[ControllerInfo]) -> Option<String> {
+    if controllers.is_empty() {
+        return None;
+    }
+    // Tally windows per device while preserving first-seen order (a small
+    // ordered Vec avoids pulling in a map dependency for a handful of peers).
+    let mut tallies: Vec<(&str, usize)> = Vec::new();
+    for controller in controllers {
+        if let Some(entry) =
+            tallies.iter_mut().find(|(device, _)| *device == controller.device_name.as_str())
+        {
+            entry.1 += 1;
+        } else {
+            tallies.push((controller.device_name.as_str(), 1));
+        }
+    }
+    let parts: Vec<String> = tallies
+        .iter()
+        .map(|(device, count)| {
+            let noun = if *count == 1 { "window" } else { "windows" };
+            format!("{device} controls {count} {noun}")
+        })
+        .collect();
+    Some(parts.join(", "))
+}
+
+/// Tooltip for the remote-control segment: each controlling device with its
+/// tailnet account, so the owner can audit exactly who is connected (FR-009b).
+/// Deduplicated by device name in first-seen order.
+fn remote_control_tooltip(controllers: &[ControllerInfo]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for controller in controllers {
+        if !seen.contains(&controller.device_name.as_str()) {
+            seen.push(controller.device_name.as_str());
+        }
+    }
+    let devices: Vec<String> =
+        seen.iter()
+            .filter_map(|device| {
+                controllers.iter().find(|controller| controller.device_name == *device).map(
+                    |controller| format!("{} ({})", controller.device_name, controller.login_name),
+                )
+            })
+            .collect();
+    format!("Controlled by {}", devices.join(", "))
+}
+
 /// Render the left side: connection dot, workspace name (if multi), CWD.
 fn render_left_side(
     w: &mut BarWriter<'_>,
@@ -493,6 +658,7 @@ fn render_left_side(
 
     render_command_status(w, colors, data.last_command_status, tooltips);
     render_env_status_warning(w, colors, data.env_status, tooltips);
+    render_remote_status(w, colors, data, tooltips);
 
     if let Some(name) = data.workspace_name {
         let ws_col = w.col;
@@ -915,6 +1081,16 @@ fn build_right_segments(data: &StatusBarData<'_>, colors: &StatusBarColors) -> V
     if let Some(tmux_label) = data.tmux_label {
         push_sep(&mut segs, colors.separator);
         segs.push(RightSegment { text: format!("tmux:{tmux_label}"), color: colors.accent });
+    }
+
+    // Feature 014 (T025): the transport a controlling-side window is driving the
+    // remote machine over ("⇅ Local network" / "⇅ Tailscale"), grouped just left
+    // of the host label. Dimmed like the owning-side "remote control enabled"
+    // indicator (both use ⇅ for the remote link); absent on non-controlling
+    // windows (FR-009).
+    if let Some(transport) = data.remote_transport {
+        push_sep(&mut segs, colors.separator);
+        segs.push(RightSegment { text: format!("\u{21C5} {transport}"), color: colors.label });
     }
 
     if !data.host_label.is_empty() {

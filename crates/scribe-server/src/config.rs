@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
-use scribe_common::config::{ClipboardPolicyConfig, UpdateConfig};
+use scribe_common::config::{ClipboardPolicyConfig, RemoteConfig, UpdateConfig};
 use scribe_common::error::ScribeError;
 
 /// Maximum allowed scrollback lines to prevent excessive memory use.
@@ -29,6 +29,12 @@ pub struct ScribeConfig {
     /// can fan it out to every PTY reader's
     /// [`crate::clipboard_state::ClipboardBurstState`] on each reload.
     pub clipboard_policy: ClipboardPolicyConfig,
+    /// Features 013/014: opt-in remote-control listener config. Carries both
+    /// the Tailscale `[remote]` listener (013) and the nested `[remote.lan]`
+    /// sub-config (014, reachable at `remote.lan`). Threaded through here so the
+    /// config-reload path can start, stop, or rebind each transport's listener
+    /// live — never a server restart.
+    pub remote: RemoteConfig,
 }
 
 impl Default for ScribeConfig {
@@ -40,6 +46,7 @@ impl Default for ScribeConfig {
             ai_terminal: AiTerminalConfig::default(),
             update: UpdateConfig::default(),
             clipboard_policy: ClipboardPolicyConfig::default(),
+            remote: RemoteConfig::default(),
         }
     }
 }
@@ -78,6 +85,7 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
     };
     let update = full.update;
     let clipboard_policy = full.terminal.clipboard_policy;
+    let remote = full.remote;
 
     info!(
         roots = workspace_roots.len(),
@@ -95,6 +103,7 @@ pub fn load_config() -> Result<ScribeConfig, ScribeError> {
         ai_terminal,
         update,
         clipboard_policy,
+        remote,
     })
 }
 
