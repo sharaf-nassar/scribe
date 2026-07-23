@@ -2931,11 +2931,7 @@ impl App {
             .is_some_and(|pane| pane.pending_output_frames.len() > OUTPUT_FRAME_CATCH_UP_THRESHOLD);
 
         loop {
-            let bytes = {
-                let pane = self.panes.get_mut(&pane_id)?;
-                pane.pending_output_frames.pop_front()?
-            };
-            let feed = self.apply_pane_output_bytes(pane_id, &bytes)?;
+            let feed = self.apply_next_pane_output_frame(pane_id)?;
             let remaining_frames =
                 self.panes.get(&pane_id).map_or(0, |pane| pane.pending_output_frames.len());
             let has_more = remaining_frames != 0;
@@ -2952,11 +2948,7 @@ impl App {
         }
     }
 
-    fn apply_pane_output_bytes(
-        &mut self,
-        pane_id: PaneId,
-        bytes: &[u8],
-    ) -> Option<FeedOutputResult> {
+    fn apply_next_pane_output_frame(&mut self, pane_id: PaneId) -> Option<FeedOutputResult> {
         let session_id = self.panes.get(&pane_id)?.session_id;
         let split_scroll_eligibility = SplitScrollEligibility::for_session(
             session_id,
@@ -2965,8 +2957,9 @@ impl App {
         );
         let (feed, delta, topmost) = {
             let pane = self.panes.get_mut(&pane_id)?;
+            let bytes = pane.pending_output_frames.pop_front()?;
             let old_history = pane.term.grid().history_size();
-            let feed = pane.feed_output(bytes);
+            let feed = pane.feed_output(&bytes);
             reconcile_split_scroll(pane, split_scroll_eligibility);
             let new_history = pane.term.grid().history_size();
             let delta = history_size_delta(new_history, old_history);

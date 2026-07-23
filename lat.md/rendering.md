@@ -110,6 +110,8 @@ Before presenting a rendered frame, the client calls [[crates/scribe-client/src/
 
 When panes still have queued PTY output frames, [[crates/scribe-client/src/main.rs#App#about_to_wait]] keeps the event loop in `ControlFlow::Poll` and requests another redraw so light bursts can keep animating while larger backlogs still catch up to the latest committed terminal state even if IPC user events keep arriving.
 
+[[crates/scribe-client/src/main.rs#App#drain_pane_output_until_frame]] delegates frame removal to [[crates/scribe-client/src/main.rs#App#apply_next_pane_output_frame]], which first resolves the pane and only then pops its queue. A missing pane therefore cannot consume a queued frame.
+
 ### Bind Group
 
 Three bindings: a uniform buffer (viewport size + cell size as two `vec2<f32>`, 16 bytes total, VERTEX stage), the glyph atlas texture (FRAGMENT stage, floating filterable), and a linear sampler (FRAGMENT stage, filtering).
