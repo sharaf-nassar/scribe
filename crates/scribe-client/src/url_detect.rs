@@ -196,12 +196,11 @@ struct LogicalCell {
 // OSC 8 URI in the cache, activation falls back to the heuristic
 // detector).
 //
-// Span boundary rule: contiguous cells whose `cell.hyperlink()` share the
-// same `Arc<HyperlinkInner>` (verified via `Arc::ptr_eq`) merge into one
-// `UrlSpan`. Any boundary change (a different `Arc`, or a `None`) closes
-// the active span and starts a new one if applicable. This matches the
-// upstream `Arc<CellExtra>`-shared-per-open-run guarantee so a single
-// `OSC 8 ; ; URI ST` run yields exactly one span.
+// Span boundary rule: contiguous cells whose `cell.hyperlink()` compare
+// equal merge into one `UrlSpan`. A later run with the same id + URI also
+// joins that span when it starts no more than one row later, preserving
+// multi-row links around unlinked gutter or filler cells. Other boundaries
+// close the active span and start a new one if applicable.
 
 /// Spec-mandated maximum URI length in bytes (FR-010, kitty-style 2 KiB cap).
 const OSC8_MAX_URI_BYTES: usize = 2048;
@@ -249,15 +248,19 @@ fn scan_visible_urls(term: &Term<VoidListener>) -> Vec<UrlSpan> {
     spans
 }
 
-/// Inclusive cell range covered by one OSC 8 span (absolute grid coords).
+/// Exact cell coverage of one OSC 8 span (absolute grid coords).
+///
+/// A merged span can have unlinked gaps, so segments stay authoritative for
+/// masking and hit-testing.
 #[derive(Clone)]
 struct Osc8CellRange {
+    link: Option<Hyperlink>,
+    row_end: i32,
     segments: Vec<RowSegment>,
 }
 
 impl Osc8CellRange {
     /// Test whether `(row, col)` falls inside this span.
-    ///
     /// Coverage follows the scanned cells rather than a bounding rectangle.
     /// This keeps heuristic masking consistent with hover hit-testing when a
     /// merged OSC 8 run has a partial row between its endpoints.
@@ -270,7 +273,7 @@ impl Osc8CellRange {
 
 /// Walk the visible grid via the alacritty display iterator and emit one
 /// `UrlSpan { kind: Osc8Hyperlink, .. }` per contiguous run of cells sharing
-/// the same `Hyperlink`'s `Arc<HyperlinkInner>`.
+/// the same `Hyperlink`, merging same-link runs separated by at most one row.
 ///
 /// Returns inclusive cell ranges so the heuristic pass can skip them
 /// (FR-004 precedence). URIs longer than `OSC8_MAX_URI_BYTES` are treated
@@ -411,6 +414,19 @@ fn flush_osc8_span(
     else {
         return;
     };
+    if let Some(previous) = ranges.last_mut().filter(|previous| {
+        previous.link.as_ref().is_some_and(|previous_link| hyperlink_same(previous_link, &link))
+            && row_start <= previous.row_end.saturating_add(1)
+    }) {
+        if let Some(span) = out.last_mut() {
+            span.row_end = row_end;
+            span.col_end = col_end;
+            span.segments.extend_from_slice(&segments);
+            previous.row_end = row_end;
+            previous.segments.extend_from_slice(&segments);
+            return;
+        }
+    }
     out.push(UrlSpan {
         row: row_start,
         col_start,
@@ -420,7 +436,7 @@ fn flush_osc8_span(
         kind: SpanKind::Osc8Hyperlink,
         segments: segments.clone(),
     });
-    ranges.push(Osc8CellRange { segments });
+    ranges.push(Osc8CellRange { link: Some(link), row_end, segments });
 }
 
 /// Returns `true` when the cell at `(row, col)` falls inside any OSC 8 span.
@@ -1301,6 +1317,8 @@ mod tests {
         );
 
         let partial_middle = Osc8CellRange {
+            link: None,
+            row_end: 22,
             segments: vec![
                 RowSegment { row: 20, col_start: 5, col_end: 7 },
                 RowSegment { row: 21, col_start: 2, col_end: 4 },
@@ -1310,5 +1328,61 @@ mod tests {
         assert!(partial_middle.contains(21, 3));
         assert!(!partial_middle.contains(21, 1));
         assert!(!partial_middle.contains(21, 5));
+    }
+
+    fn osc8_spans(term: &Term<VoidListener>) -> Vec<(String, Vec<RowSegment>)> {
+        let mut cache = PaneUrlCache::new();
+        cache.refresh(term);
+        cache
+            .visible_spans()
+            .iter()
+            .filter(|span| matches!(span.kind, SpanKind::Osc8Hyperlink))
+            .map(|span| (span.url.clone(), span.segments.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn merges_gutter_split_osc8_runs_with_the_same_id_and_uri() {
+        let output = concat!(
+            "\x1b]8;id=split;https://example.com/target\x1b\\FIRST\x1b]8;;\x1b\\\r\n",
+            "GUTTER \x1b]8;id=split;https://example.com/target\x1b\\SECOND\x1b]8;;\x1b\\"
+        );
+        let term = term_with_output(20, 2, output.as_bytes());
+        let spans = osc8_spans(&term);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].0, "https://example.com/target");
+        assert_eq!(spans[0].1.len(), 2);
+        assert_eq!(spans[0].1[0].row, 0);
+        assert_eq!(spans[0].1[1].row, 1);
+        assert_eq!(spans[0].1[1].col_start, 7);
+    }
+
+    #[test]
+    fn merges_hard_wrap_split_osc8_runs_around_blank_filler() {
+        let output = concat!(
+            "\x1b]8;id=split;https://example.com/target\x1b\\FIRST\r\n",
+            "SECOND\x1b]8;;\x1b\\"
+        );
+        let term = term_with_output(20, 2, output.as_bytes());
+        let spans = osc8_spans(&term);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].1.len(), 2);
+        assert_eq!(spans[0].1[0].col_start, 0);
+        assert_eq!(spans[0].1[1].col_start, 0);
+    }
+
+    #[test]
+    fn keeps_distant_same_uri_anonymous_osc8_links_separate() {
+        let output = concat!(
+            "\x1b]8;;https://example.com/target\x1b\\FIRST\x1b]8;;\x1b\\\r\n\r\n\r\n",
+            "\x1b]8;;https://example.com/target\x1b\\SECOND\x1b]8;;\x1b\\"
+        );
+        let term = term_with_output(20, 4, output.as_bytes());
+        let spans = osc8_spans(&term);
+
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|span| span.0 == "https://example.com/target"));
     }
 }
