@@ -108,6 +108,9 @@ pub struct Pane {
     pub last_term_cursor_hidden: Option<bool>,
     /// The selection rendered when `last_instances` was built, or `None`.
     pub last_selection: Option<SelectionRange>,
+    /// The terminal viewport offset used when `last_instances` was built.
+    /// `None` means instances have never been built.
+    pub last_display_offset: Option<usize>,
     /// The grid size last sent to the server via IPC resize.
     /// `None` means a resize has never been sent for this pane.
     pub last_sent_grid: Option<GridSize>,
@@ -248,6 +251,7 @@ impl Pane {
             last_term_cursor_hidden: None,
             last_was_focused: None,
             last_selection: None,
+            last_display_offset: None,
             last_sent_grid: None,
             command_records: Vec::new(),
             last_command_status: None,

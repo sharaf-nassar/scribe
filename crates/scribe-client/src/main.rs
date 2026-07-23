@@ -13632,6 +13632,28 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn pane_content_rebuilds_when_display_offset_changes_without_dirty_flag() {
+        let mut pane = test_pane_with_launch_binding(restore_replay::new_shell_binding(None));
+        pane.content_dirty = false;
+        pane.last_cursor_visible = Some(false);
+        pane.last_term_cursor_hidden = Some(false);
+        pane.last_was_focused = Some(false);
+        pane.last_selection = None;
+        pane.last_display_offset = Some(0);
+
+        assert!(pane_content_needs_rebuild(
+            &pane,
+            PaneContentCacheKey {
+                focus: PaneFocusState::UnfocusedDimmed,
+                term_cursor_hidden: false,
+                selection: None,
+                display_offset: 1,
+                mode: PaneRenderMode::Normal,
+            },
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -14168,6 +14190,15 @@ struct PreparedPaneContentState<'a, 'frame> {
     term_cursor_hidden: bool,
 }
 
+#[derive(Clone, Copy)]
+struct PaneContentCacheKey {
+    focus: PaneFocusState,
+    term_cursor_hidden: bool,
+    selection: Option<selection::SelectionRange>,
+    display_offset: usize,
+    mode: PaneRenderMode,
+}
+
 fn focused_workspace_rect(
     ws_rects: &WorkspaceRects,
     focused_ws_id: WorkspaceId,
@@ -14355,12 +14386,13 @@ fn build_terminal_content_for_pane(
 ) {
     let prepared = prepare_pane_content_state(pane_id, pane, context);
     push_pane_bg_fill(all_instances, pane, prepared.background);
-    let needs_rebuild = pane_content_needs_rebuild(pane, prepared);
+    let cache_key = pane_content_cache_key(prepared);
+    let needs_rebuild = pane_content_needs_rebuild(pane, cache_key);
     let instance_start = all_instances.len();
 
     if needs_rebuild {
         rebuild_pane_content(all_instances, backend, pane, prepared.render);
-        cache_pane_content_state(pane, prepared);
+        cache_pane_content_state(pane, cache_key);
     } else {
         all_instances.extend_from_slice(&pane.last_instances);
     }
@@ -14436,21 +14468,33 @@ fn prepare_pane_content_state<'a, 'frame>(
     }
 }
 
-fn pane_content_needs_rebuild(pane: &Pane, prepared: PreparedPaneContentState<'_, '_>) -> bool {
-    pane.content_dirty
-        || pane.last_cursor_visible != Some(prepared.render.focus.cursor_visible())
-        || pane.last_term_cursor_hidden != Some(prepared.term_cursor_hidden)
-        || pane.last_was_focused != Some(prepared.render.focus.is_focused())
-        || pane.last_selection != prepared.pane_sel
-        || matches!(prepared.render.mode, PaneRenderMode::SplitScroll)
+fn pane_content_cache_key(prepared: PreparedPaneContentState<'_, '_>) -> PaneContentCacheKey {
+    PaneContentCacheKey {
+        focus: prepared.render.focus,
+        term_cursor_hidden: prepared.term_cursor_hidden,
+        selection: prepared.pane_sel,
+        display_offset: prepared.render.selection.display_offset,
+        mode: prepared.render.mode,
+    }
 }
 
-fn cache_pane_content_state(pane: &mut Pane, prepared: PreparedPaneContentState<'_, '_>) {
+fn pane_content_needs_rebuild(pane: &Pane, cache_key: PaneContentCacheKey) -> bool {
+    pane.content_dirty
+        || pane.last_cursor_visible != Some(cache_key.focus.cursor_visible())
+        || pane.last_term_cursor_hidden != Some(cache_key.term_cursor_hidden)
+        || pane.last_was_focused != Some(cache_key.focus.is_focused())
+        || pane.last_selection != cache_key.selection
+        || pane.last_display_offset != Some(cache_key.display_offset)
+        || matches!(cache_key.mode, PaneRenderMode::SplitScroll)
+}
+
+fn cache_pane_content_state(pane: &mut Pane, cache_key: PaneContentCacheKey) {
     pane.content_dirty = false;
-    pane.last_cursor_visible = Some(prepared.render.focus.cursor_visible());
-    pane.last_term_cursor_hidden = Some(prepared.term_cursor_hidden);
-    pane.last_was_focused = Some(prepared.render.focus.is_focused());
-    pane.last_selection = prepared.pane_sel;
+    pane.last_cursor_visible = Some(cache_key.focus.cursor_visible());
+    pane.last_term_cursor_hidden = Some(cache_key.term_cursor_hidden);
+    pane.last_was_focused = Some(cache_key.focus.is_focused());
+    pane.last_selection = cache_key.selection;
+    pane.last_display_offset = Some(cache_key.display_offset);
 }
 
 fn apply_pane_search_highlights(
