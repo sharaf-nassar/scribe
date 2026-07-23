@@ -186,12 +186,18 @@ pub struct SyncUpdateFrameSplitter {
     pending: Vec<u8>,
     current: Vec<u8>,
     inside_sync: bool,
+    opened_sync_update: bool,
 }
 
 impl SyncUpdateFrameSplitter {
     #[must_use]
     pub fn new() -> Self {
-        Self { pending: Vec::with_capacity(BSU_CSI.len()), current: Vec::new(), inside_sync: false }
+        Self {
+            pending: Vec::with_capacity(BSU_CSI.len()),
+            current: Vec::new(),
+            inside_sync: false,
+            opened_sync_update: false,
+        }
     }
 
     /// Preserve sync markers in `input`, returning one raw frame per
@@ -200,6 +206,7 @@ impl SyncUpdateFrameSplitter {
     #[must_use]
     pub fn split_frames(&mut self, input: &[u8]) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
+        self.opened_sync_update = false;
 
         for &byte in input {
             self.pending.push(byte);
@@ -211,6 +218,7 @@ impl SyncUpdateFrameSplitter {
             if self.pending == BSU_CSI {
                 self.current.extend_from_slice(&BSU_CSI);
                 self.pending.clear();
+                self.opened_sync_update = !self.inside_sync;
                 self.inside_sync = true;
                 continue;
             }
@@ -234,6 +242,13 @@ impl SyncUpdateFrameSplitter {
     #[must_use]
     pub fn inside_sync(&self) -> bool {
         self.inside_sync
+    }
+
+    /// Whether the most recent [`Self::split_frames`] call opened a new
+    /// synchronized update block.
+    #[must_use]
+    pub fn opened_sync_update(&self) -> bool {
+        self.opened_sync_update
     }
 
     /// Flush any pending partial escape bytes plus buffered raw content.
@@ -292,4 +307,44 @@ fn is_sync_prefix(bytes: &[u8]) -> bool {
 
 fn is_complete_sync_escape(bytes: &[u8]) -> bool {
     bytes == BSU_CSI || bytes == ESU_CSI
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SyncUpdateFrameSplitter;
+
+    const BSU: &[u8] = b"\x1b[?2026h";
+    const ESU: &[u8] = b"\x1b[?2026l";
+
+    #[test]
+    fn splitter_preserves_escape_split_across_chunks() {
+        let mut splitter = SyncUpdateFrameSplitter::new();
+        assert!(splitter.split_frames(b"\x1b[?20").is_empty());
+        assert_eq!(
+            splitter.split_frames(b"26hbody\x1b[?2026l"),
+            vec![b"\x1b[?2026hbody\x1b[?2026l"]
+        );
+    }
+
+    #[test]
+    fn splitter_keeps_prefix_sharing_non_sync_sequences() {
+        let mut splitter = SyncUpdateFrameSplitter::new();
+        assert_eq!(splitter.split_frames(b"before\x1b[?2027"), vec![b"before\x1b[?2027"]);
+        assert_eq!(splitter.split_frames(b"hafter"), vec![b"hafter"]);
+    }
+
+    #[test]
+    fn splitter_emits_lone_esu_as_regular_output() {
+        let mut splitter = SyncUpdateFrameSplitter::new();
+        assert_eq!(splitter.split_frames(ESU), vec![ESU.to_vec()]);
+        assert!(!splitter.inside_sync());
+    }
+
+    #[test]
+    fn timed_out_flush_keeps_continuation_as_later_output() {
+        let mut splitter = SyncUpdateFrameSplitter::new();
+        assert!(splitter.split_frames(&[BSU, b"partial"].concat()).is_empty());
+        assert_eq!(splitter.flush_timed_out(), Some(b"partial".to_vec()));
+        assert_eq!(splitter.split_frames(b"continuation"), vec![b"continuation".to_vec()]);
+    }
 }

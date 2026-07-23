@@ -276,9 +276,15 @@ impl Pane {
     /// boundaries across IPC message splits.
     pub fn queue_output_frames(&mut self, bytes: &[u8]) -> bool {
         let frames = self.sync_output_frames.split_frames(bytes);
-        self.sync_output_deadline = self.sync_output_frames.inside_sync().then(|| {
-            self.sync_output_deadline.unwrap_or_else(|| Instant::now() + RAW_SYNC_TIMEOUT)
-        });
+        self.sync_output_deadline = if self.sync_output_frames.inside_sync() {
+            if self.sync_output_frames.opened_sync_update() {
+                Some(Instant::now() + RAW_SYNC_TIMEOUT)
+            } else {
+                self.sync_output_deadline
+            }
+        } else {
+            None
+        };
         if frames.is_empty() {
             return false;
         }
@@ -316,7 +322,7 @@ impl Pane {
         if raw_timed_out {
             self.sync_output_deadline = None;
             if let Some(bytes) = self.sync_output_frames.flush_timed_out() {
-                self.feed_output(&bytes);
+                self.pending_output_frames.push_back(bytes);
                 flushed_any = true;
             }
         }
@@ -573,6 +579,34 @@ mod tests {
         assert!(mouse_mode_after(b"\x1b[?1003h"));
         // Disabling the mode clears it again.
         assert!(!mouse_mode_after(b"\x1b[?1000h\x1b[?1000l"));
+    }
+
+    #[test]
+    fn fresh_sync_block_refreshes_raw_timeout_after_previous_commit() {
+        let mut pane = test_pane();
+        pane.queue_output_frames(b"\x1b[?2026hold\x1b[?2026l\x1b[?2026hnew");
+        let old_deadline = pane.sync_output_deadline.expect("new block has a timeout");
+
+        pane.queue_output_frames(b"\x1b[?2026l\x1b[?2026hfresh");
+
+        assert!(!pane.flush_sync_timeout(old_deadline));
+        assert_eq!(pane.pending_output_frames.len(), 2);
+        assert!(pane.sync_output_frames.inside_sync());
+    }
+
+    #[test]
+    fn timed_out_raw_sync_output_stays_after_committed_frames() {
+        let mut pane = test_pane();
+        pane.queue_output_frames(b"\x1b[?2026holder\x1b[?2026l");
+        pane.queue_output_frames(b"\x1b[?2026htimed-out");
+        let deadline = pane.sync_output_deadline.expect("open block has a timeout");
+
+        assert!(pane.flush_sync_timeout(deadline));
+        assert_eq!(
+            pane.pending_output_frames.pop_front(),
+            Some(b"\x1b[?2026holder\x1b[?2026l".to_vec())
+        );
+        assert_eq!(pane.pending_output_frames.pop_front(), Some(b"timed-out".to_vec()));
     }
 
     /// Build records at the given absolute positions with `Unknown` status.
