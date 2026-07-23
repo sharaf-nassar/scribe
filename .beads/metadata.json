@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "scribe",
+  "project_id": "e96d6cdd-5e24-4378-b05f-08d4830fc802"
+}
