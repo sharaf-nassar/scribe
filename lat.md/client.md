@@ -474,6 +474,48 @@ Verifies [[crates/scribe-client-gpui/src/dialog.rs#DialogView#focus_next]] follo
 
 Verifies [[crates/scribe-client-gpui/src/dialog.rs#DialogView#activate]] emits the clicked button's outcome regardless of focus, and that [[crates/scribe-client-gpui/src/dialog.rs#DialogView#dismiss]] emits the safe cancel outcome for an Esc or backdrop click.
 
+## GPUI Workspace Notes
+
+The GPUI rebuild ports the per-workspace notes modal and its hover preview as `gpui::Entity` views, replacing the winit `CellInstance` painters while keeping the state machines and geometry verbatim.
+
+[[crates/scribe-client-gpui/src/workspace_notes.rs#WorkspaceNotesStore]] caches the server-owned [[crates/scribe-common/src/protocol.rs#WorkspaceNotesCollection]] per workspace and projects [[crates/scribe-client-gpui/src/workspace_notes.rs#WorkspaceNoteSummary]] rows for the preview; [[crates/scribe-client-gpui/src/workspace_notes.rs#AddingNoteState]] is the shared inline-editor buffer (FR-020) whose caret-motion and scroll helpers are byte-for-byte ports.
+
+[[crates/scribe-client-gpui/src/workspace_notes_modal.rs#WorkspaceNotesModalView]] folds the active/archive/editor state machine (the [[crates/scribe-client-gpui/src/workspace_notes_modal.rs#WorkspaceNotesView]] toggle, the [[crates/scribe-client-gpui/src/workspace_notes_modal.rs#WorkspaceNotesEditMode]] target, draft dirty flag, and `\n---\n` bulk splitter) into one entity, painting the panel, nav, note rows, and editor with GPUI elements. Clicking a control emits a [[crates/scribe-client-gpui/src/workspace_notes_modal.rs#WorkspaceNotesModalAction]]; [[crates/scribe-client-gpui/src/workspace_notes_modal.rs#WorkspaceNotesModalView#save_mutation]] and [[crates/scribe-client-gpui/src/workspace_notes_modal.rs#WorkspaceNotesModalView#archive_mutation]] turn the current state into a frozen [[crates/scribe-common/src/protocol.rs#WorkspaceNotesMutation]] for the shell to send.
+
+[[crates/scribe-client-gpui/src/workspace_notes_modal.rs#DraftDebounce]] ports the winit `WORKSPACE_NOTES_DEBOUNCE` timer: each edit restarts a 250 ms window via a cancel-on-drop `gpui::Task`, so a typing burst collapses to one [[crates/scribe-client-gpui/src/workspace_notes_modal.rs#DraftDebounceEvent]] flush, and workspace-switch / close paths force one with [[crates/scribe-client-gpui/src/workspace_notes_modal.rs#DraftDebounce#flush_now]].
+
+[[crates/scribe-client-gpui/src/workspace_notes_preview.rs#WorkspaceNotesPreviewView]] paints the hover preview in two modes — a read-only list with a "+N more" overflow row plus a "+" affordance (FR-001), or the inline editor (FR-002) with a caret, error row, and scroll clamp. The pure sizing/wrap helpers ([[crates/scribe-client-gpui/src/workspace_notes_preview.rs#preview_cols]], [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#wrap_text_for_editor]], [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#caret_line_index]]) stay testable; clicks emit a [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#WorkspaceNotesPreviewAction]].
+
+The shell wires both over the frozen protocol through [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#workspace_notes_get]] and [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#workspace_notes_mutate]]; the `main.rs` spike opens the modal on Ctrl+Shift+N and routes its actions so the visual E2E can exercise every surface.
+
+### Inline editor caret motion
+
+Verifies [[crates/scribe-client-gpui/src/workspace_notes.rs#AddingNoteState]] inserts and backspaces on char boundaries and that horizontal, line-edge, and vertical caret motion preserve the character column across multi-byte text.
+
+### Store projects summaries
+
+Verifies [[crates/scribe-client-gpui/src/workspace_notes.rs#WorkspaceNotesStore#hover_summaries]] flattens whitespace, caps each summary length, and reports the total active count so the preview can show overflow.
+
+### Modal view and edit-mode state machine
+
+Verifies [[crates/scribe-client-gpui/src/workspace_notes_modal.rs#WorkspaceNotesModalView]] open seeds the draft, close resets the editor, switching views cancels a non-draft edit, and draft typing marks the buffer dirty while editing an existing note does not.
+
+### Modal save maps to a mutation
+
+Verifies [[crates/scribe-client-gpui/src/workspace_notes_modal.rs#WorkspaceNotesModalView#save_mutation]] maps each edit mode to the right [[crates/scribe-common/src/protocol.rs#WorkspaceNotesMutation]] (blank draft yields none), and that archive controls carry the correct reason.
+
+### Draft debounce coalesces and fires once
+
+Verifies [[crates/scribe-client-gpui/src/workspace_notes_modal.rs#DraftDebounce]] emits no flush before the 250 ms window, exactly one flush after it, coalesces a typing burst into a single flush, and that [[crates/scribe-client-gpui/src/workspace_notes_modal.rs#DraftDebounce#flush_now]] forces one immediately while cancelling the pending timer.
+
+### Preview sizing and wrap geometry
+
+Verifies the preview's pure geometry: [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#preview_cols]] sizes to the longest note or editor line and clamps, [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#wrap_text_for_editor]] splits on hard and soft breaks, and the caret line/column helpers track the wrapped position.
+
+### Preview inline and editor modes
+
+Verifies [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#WorkspaceNotesPreviewView]] toggles between the read-only affordance and the inline editor as its [[crates/scribe-client-gpui/src/workspace_notes.rs#AddingNoteState]] buffer is set and cleared.
+
 ## App State
 
 The master application state lives in the App struct in [[crates/scribe-client/src/main.rs]]. It holds all panes, the window layout, IPC sender, input bindings, theme, AI tracker, GPU context, and UI overlay state. The event loop is driven by winit's `ApplicationHandler` trait.
