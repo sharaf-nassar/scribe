@@ -32,7 +32,9 @@ pub mod bell;
 pub mod box_drawing;
 pub mod color;
 pub mod config;
+pub mod divider;
 pub mod drag_drop;
+pub mod focus_border;
 pub mod input;
 pub mod keybindings;
 pub mod lan_approval;
@@ -51,6 +53,7 @@ pub mod selection;
 pub mod server_lifecycle;
 pub mod share;
 pub mod smart_selection;
+pub mod split_scroll;
 pub mod url_detect;
 pub mod vi_mode;
 pub mod window_state;
@@ -58,6 +61,7 @@ pub mod workspace_layout;
 pub mod workspace_tree;
 #[cfg(target_os = "linux")]
 pub mod x11_focus;
+pub mod zoom;
 
 /// Assert two linear RGBA colours are bit-for-bit identical.
 ///
