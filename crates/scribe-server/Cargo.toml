@@ -120,6 +120,10 @@ maintainer-scripts = "../../dist/debian/"
 
 [package.metadata.deb.variants.dev]
 name = "scribe-dev"
+# The dev flavor ships the GPUI client (blade/gpui) instead of the old gtk
+# client, so it drops libgtk-4-1 and depends on the GPU/windowing runtime the
+# new client links (xcb/xkbcommon) plus the vulkan/wayland stacks it dlopens.
+depends = "libvulkan1, mesa-vulkan-drivers, libwayland-client0, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1"
 assets = [
   [
     "target/release/scribe-server",
@@ -127,7 +131,7 @@ assets = [
     "755",
   ],
   [
-    "target/release/scribe-client",
+    "target/release/scribe-client-gpui",
     "usr/bin/scribe-dev",
     "755",
   ],
