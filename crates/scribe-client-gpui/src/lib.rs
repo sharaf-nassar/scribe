@@ -69,6 +69,8 @@ pub mod preedit;
 pub mod prompt_bar;
 pub mod remote;
 pub mod remote_handshake;
+pub mod restore_replay;
+pub mod restore_state;
 pub mod search;
 pub mod selection;
 pub mod server_lifecycle;
