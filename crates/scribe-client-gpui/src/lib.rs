@@ -72,6 +72,8 @@ pub mod smart_selection;
 pub mod split_scroll;
 pub mod status_bar;
 pub mod sys_stats;
+pub mod tab_bar;
+pub mod titlebar;
 pub mod url_detect;
 pub mod vi_mode;
 pub mod window_state;

@@ -13,13 +13,18 @@ use std::{
 };
 
 use gpui::{
-    App, AsyncApp, Bounds, Context, FocusHandle, KeyDownEvent, Render, Task, TitlebarOptions,
-    WeakEntity, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, Render, Task,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb,
+    size,
 };
 use gpui_platform::application;
 use scribe_client_gpui::animation::AnimationSettings;
 use scribe_client_gpui::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
 use scribe_client_gpui::sys_stats::SystemStatsCollector;
+use scribe_client_gpui::{
+    tab_bar::{TabBarColors, TabData},
+    titlebar::TitlebarView,
+};
 use scribe_common::{
     config::{StatusBarStatsConfig, load_config, resolve_theme},
     framing::{read_message, write_message},
@@ -27,6 +32,7 @@ use scribe_common::{
     protocol::{ClientMessage, ServerMessage, SessionInfo, TerminalSize},
     screen_replay::{decompress_session_replay, snapshot_to_ansi},
     socket::server_socket_path,
+    theme::minimal_dark,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -102,6 +108,8 @@ struct TerminalView {
     status_colors: StatusBarColors,
     /// Which system-stat segments the status bar shows, from config.
     stats_config: StatusBarStatsConfig,
+    // The custom titlebar + integrated tab bar drawn above the terminal grid.
+    titlebar: Entity<TitlebarView>,
     // Held to keep the redraw poll alive; dropping the view cancels the task.
     _refresh_task: Task<()>,
 }
@@ -114,6 +122,14 @@ impl TerminalView {
         let config = load_config().unwrap_or_default();
         let theme = resolve_theme(&config);
         let status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
+        let colors = TabBarColors::from(&minimal_dark().chrome);
+        let titlebar = cx.new(|cx| {
+            let mut bar = TitlebarView::new(colors, cx);
+            let mut tab = TabData::new("shell");
+            tab.is_active = true;
+            bar.set_tabs(vec![tab], cx);
+            bar
+        });
         Self {
             shared,
             sink,
@@ -121,6 +137,7 @@ impl TerminalView {
             stats: SystemStatsCollector::new(),
             status_colors,
             stats_config: config.terminal.status_bar_stats,
+            titlebar,
             _refresh_task: refresh_task,
         }
     }
@@ -241,6 +258,7 @@ impl Render for TerminalView {
             .flex()
             .flex_col()
             .bg(rgb(0x0010_1318))
+            .child(self.titlebar.clone())
             .child(TerminalElement::new(content).paint())
             .child(
                 div()

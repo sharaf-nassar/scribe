@@ -142,6 +142,57 @@ The GPUI rebuild ports the winit client's window-level status bar so every ambie
 The legacy [[crates/scribe-client/src/status_bar.rs#build_status_bar]] emitted `CellInstance` quads into the terminal grid buffer at hand-placed columns. The rebuild splits layout from paint: [[crates/scribe-client-gpui/src/status_bar.rs#build_model]] is a pure function turning [[crates/scribe-client-gpui/src/status_bar.rs#StatusBarData]] into a [[crates/scribe-client-gpui/src/status_bar.rs#StatusBarModel]] of coloured [[crates/scribe-client-gpui/src/status_bar.rs#Span]] groups — left ([[crates/scribe-client-gpui/src/status_bar.rs#build_left]]: connection dot, command/env glyphs, 013/015 remote-control and share-presence surfaces, workspace, CWD), a centred update CTA ([[crates/scribe-client-gpui/src/status_bar.rs#build_center]]), and right ([[crates/scribe-client-gpui/src/status_bar.rs#build_right]]: CPU/MEM/NET/GPU sparklines, git branch, session count, tmux, transport, host, clock). [[crates/scribe-client-gpui/src/status_bar.rs#render]] maps that model onto GPUI elements, letting flex-grown centre space keep the CTA centred instead of the legacy column arithmetic. Colours stay in sRGB via [[crates/scribe-client-gpui/src/status_bar.rs#StatusBarColors#from_theme]] because GPUI does its own linear conversion, unlike the raw-pipeline legacy renderer.
 
 The sparklines are fed by [[crates/scribe-client-gpui/src/sys_stats.rs#SystemStatsCollector]], a verbatim port of the winit CPU/memory/network/GPU sampler that caches readings on a 2 s interval with rolling history buffers. The `scribe-client-gpui` binary wires the bar into its live view from [[crates/scribe-client-gpui/src/main.rs#TerminalView#render]], driving the connection dot from a shared connected flag and the sparklines from the sampler; the workspace/CWD/git/command/update inputs light up as the shell and IPC-state beads land.
+## GPUI Titlebar
+
+The GPUI rebuild replaces native window decorations with a custom titlebar that also hosts the integrated tab bar. The pure layout/decay math is ported into a testable module; the interactive chrome is a `gpui::Entity`.
+
+[[crates/scribe-client-gpui/src/tab_bar.rs]] holds the display-independent logic ported from the winit [[crates/scribe-client/src/tab_bar.rs]] — the self-decaying attention-flash envelope ([[crates/scribe-client-gpui/src/tab_bar.rs#tab_flash_intensity]], additively blended by [[crates/scribe-client-gpui/src/tab_bar.rs#flash_blend]] without touching alpha), fixed-width title truncation ([[crates/scribe-client-gpui/src/tab_bar.rs#tab_display_title]]), the colored context-% suffix banding with pulse suppression ([[crates/scribe-client-gpui/src/tab_bar.rs#context_suffix]]), the workspace-badge gate ([[crates/scribe-client-gpui/src/tab_bar.rs#badge_label]]), and the drag-reorder slot math ([[crates/scribe-client-gpui/src/tab_bar.rs#reorder_target_index]], walking tab edges rather than an `f32`→`usize` cast). Colors stay sRGB in [[crates/scribe-client-gpui/src/tab_bar.rs#TabBarColors]] because GPUI performs its own sRGB→linear conversion at paint time.
+
+[[crates/scribe-client-gpui/src/titlebar.rs#TitlebarView]] is the `gpui::Entity` that assembles the chrome as `div` elements: a `WindowControlArea::Drag` move region, the workspace-badge pill, the tab strip (active accent underline, per-tab close button revealed on hover, AI activity dot, context-% suffix, and drag-reorder slide), the equalize and gear icons, and the min/maximize/close window controls. Each interaction mutates state and emits a [[crates/scribe-client-gpui/src/titlebar.rs#TitlebarEvent]] the shell acts on; [[crates/scribe-client-gpui/src/titlebar.rs#TitlebarView#update_drag]] reorders tabs live as the cursor crosses a neighbour, and the window controls drive the platform window through GPUI's `WindowControlArea` hit regions. [[crates/scribe-client-gpui/src/titlebar.rs#pane_title_pill]] builds the semi-transparent per-pane title pill the shell overlays on a split pane; [[crates/scribe-client-gpui/src/titlebar.rs#WindowControlKind]] names the three window-control buttons. The spike wires the titlebar above the terminal grid in [[crates/scribe-client-gpui/src/main.rs#TerminalView]] so the visual E2E harness (`tests/e2e/visual/titlebar.sh`) can screenshot the assembled bar and its interaction checklist.
+
+### Tab flash envelope self-decays
+
+Verifies [[crates/scribe-client-gpui/src/tab_bar.rs#tab_flash_intensity]] peaks at 1.0, eases down mid-envelope, and returns `None` at or past `TAB_FLASH_SECS` (and for negative/NaN inputs) so the flash self-clears and cannot pin the redraw loop.
+
+### Flash blends accent without touching alpha
+
+Verifies [[crates/scribe-client-gpui/src/tab_bar.rs#flash_blend]] returns the base color unchanged for `None`, mixes toward the accent by `FLASH_MAX_MIX` at peak intensity, and preserves the base alpha channel.
+
+### Titles truncate with an ellipsis
+
+Verifies [[crates/scribe-client-gpui/src/tab_bar.rs#tab_display_title]] leaves short titles intact, truncates an overflowing title to exactly the available columns ending in an ellipsis, and flags truncation (driving the tooltip hover target).
+
+### Context suffix bands and suppression
+
+Verifies [[crates/scribe-client-gpui/src/tab_bar.rs#context_suffix]] returns `None` below the warn threshold, the warn color at the threshold, the danger color above the danger threshold, and `None` while the session is pulsing so it never competes with the attention pulse.
+
+### Badge shown only for named multi-workspace
+
+Verifies [[crates/scribe-client-gpui/src/tab_bar.rs#badge_label]] shows a badge only for a named workspace in multi-workspace mode, and hides it for a single workspace or an empty name.
+
+### Drag reorder resolves the target slot
+
+Verifies [[crates/scribe-client-gpui/src/tab_bar.rs#reorder_target_index]] walks tab edges to the hovered slot, clamps below the first and past the last tab, and treats an empty tab list as a no-op.
+
+### Column-to-pixel conversion saturates
+
+Verifies [[crates/scribe-client-gpui/src/tab_bar.rs#px_units]] converts small counts exactly and saturates at `u16::MAX` for pathological inputs, keeping the strict cast lints satisfied without an `as` cast.
+
+### Selecting a tab activates it and emits
+
+Verifies [[crates/scribe-client-gpui/src/titlebar.rs#TitlebarView#select]] marks the clicked tab active (clearing the others) and emits `TitlebarEvent::SelectTab`.
+
+### Closing a tab removes it and reactivates
+
+Verifies [[crates/scribe-client-gpui/src/titlebar.rs#TitlebarView#close]] removes the tab, keeps exactly one tab active when the active tab is closed, and emits `TitlebarEvent::CloseTab`.
+
+### Drag reorder moves the tab and emits
+
+Verifies a `begin_drag`/`update_drag`/`end_drag` sequence on [[crates/scribe-client-gpui/src/titlebar.rs#TitlebarView]] moves the dragged tab to the hovered slot and emits `TitlebarEvent::ReorderTab`.
+
+### Out-of-range interactions are no-ops
+
+Verifies that select, close, and begin-drag on out-of-range indices leave the tab list unchanged and emit no events, so stray hit targets cannot corrupt state.
 
 ## App State
 
