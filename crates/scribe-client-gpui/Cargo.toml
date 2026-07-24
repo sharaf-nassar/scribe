@@ -35,9 +35,18 @@ unicode-width = "0.2"
 vte.workspace = true
 
 # X11 focus guard: reads GPUI's Xcb/Xlib window id and polls _NET_ACTIVE_WINDOW.
+# Clipboard bridge (arboard) and the zbus-backed notification dispatcher.
 [target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3", default-features = false, features = [
+  "wayland-data-control",
+] }
+futures-util.workspace = true
 raw-window-handle.workspace = true
 x11rb.workspace = true
+zbus.workspace = true
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+arboard = { version = "3", default-features = false }
 
 [dev-dependencies]
 # Pulls in gpui's headless TestAppContext / #[gpui::test] harness for the
