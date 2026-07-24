@@ -144,6 +144,26 @@ Seven-phase test in `tests/e2e/func/ai-context-thresholds.sh` validating prompt-
 
 Claude phases emit `ClaudeState=processing;context=50/72/91` plus matching `ClaudePrompt=...` OSC payloads so the prompt bar is visible. Phase 1 asserts `50%` appears once in the prompt-bar cluster and Phase 4 confirms the tab inline is suppressed below `warn=70`; phases 2 and 3 assert Warn/Danger values appear at least twice (prompt bar + tab inline). Codex phases repeat the same provider-symmetric checks with `CodexState`/`CodexPrompt` at 51/73/92.
 
+### Session Lifecycle E2E
+
+Scripted lifecycle coverage proving the GPUI client survives detach, hot-reload, and full cold restart against a disposable test server — never the user's live server (the CLAUDE.md invariant), as the harness runs its own `scribe-test server`.
+
+In every script the `scribe-test` daemon is the client stand-in: `daemon stop` is the client going away and `daemon start` is a fresh client that must re-attach. [[crates/scribe-test/src/daemon.rs#run]] sends `Hello { window_id: None }` so [[crates/scribe-server/src/ipc_server.rs#resolve_window_assignment]] adopts the unconnected window-with-sessions, which is what makes every re-attach flow below possible.
+
+`tests/e2e/func/reconnect.sh` covers plain detach/reattach: run a command, start a background job, `daemon stop`, `daemon start`, `session attach`, then assert fresh input works and the background job survived the disconnect.
+
+`tests/e2e/func/hot-reload.sh` covers server `--upgrade` under a live client: it snapshots a session, stops the daemon, runs [[crates/scribe-test/src/server.rs#upgrade]] (fd handoff to the new server), then reconnects and asserts the session, its background job, and its on-screen scrollback all survived the graceful handoff.
+
+`tests/e2e/func/cold-restart.sh` covers cold-restart restore fan-out plus geometry-compat restore. It opens three sessions with distinct markers, resizes one to 132x50, starts a background job, then fully cold-quits the client (`daemon stop`) while the server keeps the sessions. A fresh `daemon start` must fan out and re-attach all three panes; the script asserts each pane replayed and accepts input, the resized pane still reports 132 cols, and the background job survived the restart.
+
+### Failure-Path E2E
+
+Scripted degraded-path coverage proving the client fails loudly (never hangs) when the server is unavailable or vanishes mid-session, and recovers cleanly once it returns. Both scripts drive the disposable test server only.
+
+`tests/e2e/func/failure-server-down.sh` covers server-down-at-launch and adoption failure. With the server stopped, `daemon start` must return non-zero within its bounded socket wait rather than block, because [[crates/scribe-test/src/daemon.rs#run]] fails its initial `ipc::connect()` and the client socket never appears. It then recovers, and — on a fresh daemon with no cached `SessionCreated` — asserts that adopting a nonexistent session id errors (server denies, [[crates/scribe-test/src/daemon.rs#handle_attach_session]] times out) without crashing the still-usable client.
+
+`tests/e2e/func/failure-socket-loss.sh` covers a mid-session server crash. A SIGTERM `server stop` drops the client's IPC with no upgrade handoff; the daemon's server-reader loop ends, so it tears down and removes its command socket. The script polls until commands fail (proving loss detection, not a hang), reconnects to a freshly started server, asserts the crashed session is gone (PTYs died with the server, so re-adopt fails — the deliberate contrast with hot-reload), and confirms a fresh session works end to end.
+
 ## Visual E2E Tests
 
 Visual end-to-end tests run the real `scribe-client-gpui` window headlessly (`docker/Dockerfile.visual`) and assert against screenshots written to `/output`.
