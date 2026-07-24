@@ -385,7 +385,10 @@ impl TerminalView {
         // Ctrl+Shift+P opens the palette; Ctrl+Shift+U toggles the tooltip demo;
         // Ctrl+Shift+Q opens the close dialog; Ctrl+Shift+K opens the clipboard
         // dialog; Ctrl+Shift+N opens the workspace-notes modal.
-        if mods.control && mods.shift && self.dialog.is_none() && self.workspace_notes_modal.is_none()
+        if mods.control
+            && mods.shift
+            && self.dialog.is_none()
+            && self.workspace_notes_modal.is_none()
         {
             match event.keystroke.key.as_str() {
                 "p" => {

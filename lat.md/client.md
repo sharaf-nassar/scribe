@@ -78,6 +78,50 @@ When the pending input-start row falls inside the trimmed region it is cleared, 
 
 A takeover `Hello`'s `Welcome` records the adopted window id on the registry.
 
+### Cold Restart Restore
+
+The GPUI client ports cold-restart recovery: after a server crash the bootstrap window rebuilds its windows, workspaces, tabs, and panes from persisted snapshots and re-creates each saved session at the correct geometry.
+
+[[crates/scribe-client-gpui/src/restore_state.rs#RestoreStore]] persists one TOML snapshot per window under `$XDG_STATE_HOME/scribe/restore/windows/<window_id>.toml` plus a shared `index.toml`, all hardened to `0700`/`0600` because launch bindings can carry prompt text and provider conversation IDs. A bootstrap lock serialises multi-process index mutations and stale locks (>30 s) are reclaimed. [[crates/scribe-client-gpui/src/restore_state.rs#RestoreStore#claim_first_window]] atomically claims the first replayable [[crates/scribe-client-gpui/src/restore_state.rs#WindowRestoreState]] entry, skips non-replayable and unreadable entries, and reports how many windows remain so the caller fans out `--restore-child` processes via [[crates/scribe-client-gpui/src/restore_replay.rs#spawn_restore_children]] — each child claims exactly one more entry and, gated by [[crates/scribe-client-gpui/src/restore_replay.rs#is_restore_child]], never fans out again.
+
+[[crates/scribe-client-gpui/src/restore_replay.rs#prepare_replay]] rebuilds a [[crates/scribe-client-gpui/src/restore_replay.rs#RebuiltWindow]] — the [[crates/scribe-client-gpui/src/workspace_layout.rs#WindowLayout]], a [[crates/scribe-client-gpui/src/restore_replay.rs#PaneRestore]] map (standing in for the legacy `Pane` struct the display-only spike lacks), and the ordered [[crates/scribe-client-gpui/src/restore_replay.rs#ReplayLaunch]] queue that re-creates each session. Before the launches dispatch, [[crates/scribe-client-gpui/src/restore_replay.rs#size_replay_pane_grids]] sizes every pane grid from the re-applied window geometry (not the pre-restore hint) so maximized windows do not create PTYs at the startup size and stay undersized. [[crates/scribe-client-gpui/src/restore_replay.rs#attach_dimensions_for_session]] preserves the Codex 0x0 exception: reattaching a Codex session sends a zero-sized `TerminalSize` so the server does not pre-size its Ink-rendered PTY. [[crates/scribe-client-gpui/src/restore_replay.rs#snapshot_window_restore]] serialises the live layout and pane metadata back into a `WindowRestoreState` for the next save.
+
+#### Snapshot round-trips through disk
+
+A saved [[crates/scribe-client-gpui/src/restore_state.rs#WindowRestoreState]] loads back with its window, focused workspace, workspace name, and launch records intact and reports as replayable.
+
+#### Claim skips non-replayable and remaining count
+
+`claim_first_window` drops a blank (non-replayable) entry, claims the first replayable window while removing its file, and reports the remaining count so the caller knows how many `--restore-child` windows to spawn.
+
+#### Stale lock reclaimed
+
+`RestoreStore::lock_is_stale` treats a bootstrap lock older than the 30 s window as stale (reclaimable) and a freshly stamped one as live.
+
+#### Replay rebuilds layout and queue
+
+`prepare_replay` reconstructs the window layout, focused workspace, and accent colour, and produces one `ReplayLaunch` per saved pane carrying the workspace, launch id, cwd, and command, with pane metadata keyed by the same pane id.
+
+#### Snapshot survives rebuild round trip
+
+Serialising a rebuilt window with `snapshot_window_restore` reproduces the original window, focused workspace, tabs, focused launch id, and launch records, and the result is replayable.
+
+#### Grid sized before launch
+
+`size_replay_pane_grids` computes each pane's terminal grid from the restored viewport and cell size and writes it back onto the pane before any launch dispatches.
+
+#### Codex reattach sends zero size
+
+`attach_dimensions_for_session` returns the sized grid for a normal session but a zero-sized `TerminalSize` for a Codex session, preserving the exception that leaves Codex PTY sizing to its own SIGWINCH.
+
+#### Restore child never fans out
+
+`is_restore_child` detects the `--restore-child` flag so a fanned-out child passes count 0 to `spawn_restore_children` and never spawns further windows.
+
+#### AI command detection
+
+An AI resume launch record expands to a shell argv that single-quotes the conversation id after the provider's resume args, and `detect_ai_command` recognises the provider's binary invocation.
+
 ### GPUI Layout Entities
 
 The GPUI rebuild ports the two-level split tree into a `lib` target alongside the scaffold binary, so the pure trees and their entity wrappers are library API covered by `#[gpui::test]` headless suites.
