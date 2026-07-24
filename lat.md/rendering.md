@@ -154,6 +154,30 @@ The [[crates/scribe-renderer/src/palette.rs#ColorPalette]] provides the xterm-25
 
 ANSI 0-15 are overridable by theme. The 6x6x6 colour cube (indices 16-231) uses intensity steps 0/95/135/175/215/255. The 24-step greyscale ramp (indices 232-255) spans values from 8 to 238 in steps of 10. Out-of-range named colours fall back to opaque magenta as an unmistakeable "missing colour" sentinel.
 
+## GPUI Ported Rendering Logic
+
+The GPUI client rebuild ports the renderer's pure colour and box-drawing logic into the `scribe-client-gpui` library crate so terminal output stays byte-for-byte identical across the cutover, independent of the wgpu pipeline.
+
+These modules are display-independent: they own no GPU resources and are exercised by byte/colour-exact unit tests that lock the legacy renderer's output. The GPUI paint path (a later bead) consumes them.
+
+### GPUI Colour Palette
+
+[[crates/scribe-client-gpui/src/palette.rs#ColorPalette]] is a verbatim port of the xterm-256 palette, resolving the shared `vte::ansi::Color` values the Zed alacritty fork produces.
+
+It reproduces the standard/bright ANSI entries, the 6×6×6 colour cube, and the greyscale ramp, all linearised at construction, with theme override of entries 0-15 and the opaque-magenta sentinel for out-of-table named colours.
+
+### GPUI Colour Semantics
+
+[[crates/scribe-client-gpui/src/color.rs#TerminalColors]] holds the theme-derived default colours plus the palette and resolves a cell's raw fg/bg fields to linear RGBA, mirroring the legacy `resolve_cell_colors_raw`.
+
+It applies bold→bright promotion via [[crates/scribe-client-gpui/src/color.rs#bold_to_bright]], the DIM 0.67 sRGB round-trip via [[crates/scribe-client-gpui/src/color.rs#apply_dim]], the `BrightForeground` boost via [[crates/scribe-client-gpui/src/color.rs#boost_srgb_brightness]], and INVERSE/HIDDEN handling. Theme colours are linearised through [[crates/scribe-client-gpui/src/color.rs#srgb_to_linear_rgba]].
+
+### GPUI Box-Drawing Rasterizer
+
+[[crates/scribe-client-gpui/src/box_drawing.rs#render]] ports the procedural rasterizer that emits a cell-sized RGBA alpha mask for U+2500–U+259F; [[crates/scribe-client-gpui/src/box_drawing.rs#is_box_drawing]] selects those codepoints.
+
+Per the [[rendering#Glyph Atlas#GPUI Box-Drawing Overlay]] capability spike, `TerminalElement` paints this mask as a foreground-coloured quad overlay after cell backgrounds and before shaped text, keeping edge-to-edge coverage regardless of font availability.
+
 ## Chrome Rendering
 
 UI chrome (tab bars, status bars, dividers, dialogs) is rendered as solid or rounded quads via [[crates/scribe-renderer/src/chrome.rs#solid_quad]].
