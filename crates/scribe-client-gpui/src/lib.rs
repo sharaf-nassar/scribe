@@ -29,6 +29,12 @@
 //! (the zbus `replaces_id` coalescing state machine and freedesktop timeout
 //! mapping, with click-to-focus emitted on a runtime-agnostic channel).
 //!
+//! The window chrome starts with the [`status_bar`]: a pure segment model
+//! (connection dot, command/env glyphs, workspace/CWD/git/host labels, tmux and
+//! session badges, clock, the centred update CTA, and the 013/015 remote-control
+//! and share-presence surfaces) lowered onto a GPUI flex row, fed by the
+//! [`sys_stats`] CPU/memory/network/GPU sampler that drives its sparklines.
+//!
 //! Consumers that wire these into the live GPUI view (IPC sink, keybinding
 //! dispatch, window shell) land in later beads of the `gpui-client-rebuild`
 //! epic; the `scribe-client-gpui` binary (`main.rs`) remains the display-only
@@ -64,6 +70,8 @@ pub mod server_lifecycle;
 pub mod share;
 pub mod smart_selection;
 pub mod split_scroll;
+pub mod status_bar;
+pub mod sys_stats;
 pub mod url_detect;
 pub mod vi_mode;
 pub mod window_state;

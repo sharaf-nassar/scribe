@@ -18,8 +18,10 @@ use gpui::{
 };
 use gpui_platform::application;
 use scribe_client_gpui::animation::AnimationSettings;
+use scribe_client_gpui::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
+use scribe_client_gpui::sys_stats::SystemStatsCollector;
 use scribe_common::{
-    config::load_config,
+    config::{StatusBarStatsConfig, load_config, resolve_theme},
     framing::{read_message, write_message},
     ids::SessionId,
     protocol::{ClientMessage, ServerMessage, SessionInfo, TerminalSize},
@@ -86,12 +88,20 @@ struct Shared {
     status: Arc<Mutex<String>>,
     generation: Arc<AtomicU64>,
     active_session: Arc<Mutex<Option<SessionId>>>,
+    /// Server-connection flag driving the status bar's connection dot.
+    connected: Arc<AtomicBool>,
 }
 
 struct TerminalView {
     shared: Shared,
     sink: IpcSink,
     focus_handle: FocusHandle,
+    /// System-stats sampler feeding the status bar's CPU/MEM/NET/GPU sparklines.
+    stats: SystemStatsCollector,
+    /// Theme-derived status-bar palette, resolved once at view creation.
+    status_colors: StatusBarColors,
+    /// Which system-stat segments the status bar shows, from config.
+    stats_config: StatusBarStatsConfig,
     // Held to keep the redraw poll alive; dropping the view cancels the task.
     _refresh_task: Task<()>,
 }
@@ -101,7 +111,18 @@ impl TerminalView {
         let generation = Arc::clone(&shared.generation);
         let refresh_task =
             cx.spawn(async move |view, app| drive_redraws(view, app, generation).await);
-        Self { shared, sink, focus_handle: cx.focus_handle(), _refresh_task: refresh_task }
+        let config = load_config().unwrap_or_default();
+        let theme = resolve_theme(&config);
+        let status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
+        Self {
+            shared,
+            sink,
+            focus_handle: cx.focus_handle(),
+            stats: SystemStatsCollector::new(),
+            status_colors,
+            stats_config: config.terminal.status_bar_stats,
+            _refresh_task: refresh_task,
+        }
     }
 
     /// Encodes a keystroke and enqueues it as `KeyInput` for the attached pane.
@@ -182,6 +203,35 @@ impl Render for TerminalView {
             .lock()
             .map_or_else(|_| "terminal state unavailable".to_owned(), |guard| guard.clone());
 
+        let connected = self.shared.connected.load(Ordering::Acquire);
+        let session_count =
+            usize::from(self.shared.active_session.lock().ok().and_then(|guard| *guard).is_some());
+        // Refresh the sparkline sampler (internally rate-limited to 2 s) and
+        // build the full segment model from the live data available so far.
+        let sys_stats = self.stats.maybe_refresh();
+        let model = status_bar::build_model(
+            &StatusBarData {
+                connected,
+                workspace_name: None,
+                cwd: None,
+                git_branch: None,
+                last_command_status: None,
+                env_status: None,
+                session_count,
+                remote: RemoteStatusData { enabled: false, controllers: &[] },
+                share_presence: None,
+                host_label: "local",
+                remote_transport: None,
+                tmux_label: None,
+                time: "",
+                update_available: None,
+                update_progress: None,
+                sys_stats: Some(sys_stats),
+                stats_config: Some(&self.stats_config),
+            },
+            &self.status_colors,
+        );
+
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, _cx| {
@@ -203,6 +253,7 @@ impl Render for TerminalView {
                     .text_xs()
                     .child(status),
             )
+            .child(status_bar::render(&model, 24., &self.status_colors))
     }
 }
 
@@ -216,6 +267,7 @@ fn main() {
         status: Arc::new(Mutex::new("connecting to Scribe server…".to_owned())),
         generation: Arc::new(AtomicU64::new(0)),
         active_session: Arc::new(Mutex::new(None)),
+        connected: Arc::new(AtomicBool::new(false)),
     };
     let terminal_size = TerminalSize {
         cols: COLUMNS,
@@ -296,7 +348,9 @@ fn start_ipc_thread(ctx: IpcThread) {
         runtime.block_on(async move {
             let status = Arc::clone(&ctx.shared.status);
             let generation = Arc::clone(&ctx.shared.generation);
+            let connected = Arc::clone(&ctx.shared.connected);
             if let Err(error) = run_connection(ctx).await {
+                connected.store(false, Ordering::Release);
                 set_status(&status, &generation, format!("server connection failed: {error}"));
             }
         });
@@ -307,6 +361,8 @@ async fn run_connection(ctx: IpcThread) -> Result<(), String> {
     let stream = tokio::net::UnixStream::connect(server_socket_path())
         .await
         .map_err(|error| error.to_string())?;
+    // Socket is up: light the status-bar connection dot green.
+    ctx.shared.connected.store(true, Ordering::Release);
     let (reader, writer) = stream.into_split();
 
     // Handshake is queued ahead of any sink traffic on the same ordered channel.

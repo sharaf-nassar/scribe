@@ -704,3 +704,55 @@ Repeated [[crates/scribe-client-gpui/src/zoom.rs#ZoomState#zoom_in]] and [[crate
 ### Effective size applies the delta and honors the floor
 
 `effective_font_size` adds the zoom delta to the base size and floors the result at the 6pt minimum so extreme zoom-out still renders legible cells.
+
+## GPUI Status Bar
+
+Unit tests for [[crates/scribe-client-gpui/src/status_bar.rs#build_model]], the ported window-status-bar segment model, proving every parity segment (connection, command/env glyphs, sparklines, labels, remote/share surfaces, update CTA) builds with the right text and colour without a live window.
+
+### Connection dot reflects connection state
+
+[[crates/scribe-client-gpui/src/status_bar.rs#build_left]] paints the connection dot with the connected (ANSI green) colour when attached and the disconnected (ANSI red) colour otherwise.
+
+### Command status glyphs distinguish outcomes
+
+[[crates/scribe-client-gpui/src/status_bar.rs#CommandStatus]] maps Success to a check, Failure to a cross, and Unknown to a dimmed `?` that is never failure-styled, while an absent status renders no glyph.
+
+### Env warning fires only when degraded
+
+The feature-006 env-capture warning glyph is emitted only for `EnvStatusState::Degraded`; `Active` and absent states render nothing.
+
+### Sparkline maps percentage to block height
+
+[[crates/scribe-client-gpui/src/status_bar.rs#sparkline_char]] maps 0–100% onto the eight block glyphs, clamps non-finite input to the lowest bar, and the network variant saturates at 100 MB/s.
+
+### Usage color escalates with load
+
+[[crates/scribe-client-gpui/src/status_bar.rs#usage_color]] returns green below 60%, yellow from 60–85%, and red at or above 85%.
+
+### Network rate formats to four columns
+
+[[crates/scribe-client-gpui/src/status_bar.rs#format_bytes_rate_fixed]] renders byte rates right-aligned in exactly four columns across the B/K/M and `>1G` ranges.
+
+### CWD shortens home to tilde
+
+[[crates/scribe-client-gpui/src/status_bar.rs#shorten_cwd]] replaces a `$HOME` prefix with `~` and leaves paths outside home untouched.
+
+### Right side stitches enabled segments in order
+
+[[crates/scribe-client-gpui/src/status_bar.rs#build_right]] emits git branch, session count (singular/plural), tmux, host, and clock segments in order, each gated on its input being present.
+
+### Remote control summary tallies windows per device
+
+[[crates/scribe-client-gpui/src/status_bar.rs#build_remote_control_summary]] deduplicates controllers by device in first-seen order and pluralises the per-device window count (FR-009b).
+
+### Share presence badge names the control holder
+
+The feature-015 presence badge reports the attached-participant count and names the current control holder, or states no one holds control when unheld.
+
+### Centered update CTA reflects progress state
+
+[[crates/scribe-client-gpui/src/status_bar.rs#build_center]] resolves the centred CTA label and clickability from the update-available version and each `UpdateProgressState`, returning nothing when no update is pending.
+
+### Sparklines pad short history to fixed width
+
+[[crates/scribe-client-gpui/src/status_bar.rs#build_right]] left-pads a short CPU/GPU history to the fixed eight-bar width and renders the CPU, MEM, GPU, and network groups when their config flags are on.
