@@ -217,3 +217,37 @@ The GPUI client times startup-to-first-frame only when the `SCRIBE_GPUI_STARTUP_
 While the client remains a display-only scaffold spike, input latency, firehose throughput, memory at 10 tabs, and scroll fps are reported `DEFERRED` rather than measured.
 
 The spike has no stable input encoder with echo instrumentation, no multi-tab support, and no scroll frame counter, so those workloads cannot be driven yet. The rig records the exact live method for each so the launch gate (`scribe-38e.42`) can re-run it at cutover and enforce every threshold; a `FAIL` reopens the perf-rig bead.
+
+## GPUI Client Headless Suites
+
+The `#[gpui::test]` and golden suites in `scribe-client-gpui` are the primary correctness oracle for client-internal logic. They need no display server and every landed suite maps to a `parity-inventory.md` verification row.
+
+These suites run under `just test` (and the `Dockerfile.func` image's Rust toolchain). This section consolidates the headless coverage the `gpui-client-rebuild` epic (`scribe-38e`) accumulates: each row of the map below ties a suite to the parity-inventory verification row it satisfies, and the coverage frontier lists the parity rows whose suites unblock as their feature beads land.
+
+| Headless suite | Spec section | Parity-inventory row(s) |
+| --- | --- | --- |
+| Pane tree entity ops | [[client#GPUI Client Spike#GPUI Layout Entities#Pane Tree Model]] | Input/keybinding "Pane layout" (gpui-test) |
+| Pane split-tree logic | [[test#GPUI Client Headless Suites#Pane split-tree logic]] | Input/keybinding "Pane layout" (gpui-test) |
+| Workspace tree entity ops | [[client#GPUI Client Spike#GPUI Layout Entities#Workspace Tree Model]] | `CreateWorkspace`, `MoveSession`, `ReportWorkspaceTree` (gpui-test) |
+| Input byte encoder golden | [[client#Input#GPUI Input Encoder Port]] | `KeyInput`, Terminal shortcuts (golden) |
+| URL/OSC8 detection | [[test#GPUI URL Detection]] | hover/dwell/open surface (gpui-test) |
+| IPC bridge ordering | [[test#GPUI IPC Bridge]] | Executor-model ordering risk (gpui-test) |
+
+### Coverage frontier
+
+Testing-Strategy suites not yet consolidated are blocked on their feature beads landing in `scribe-38e`. Each is tracked here against its parity row so the launch-gate bead (`scribe-38e.42`) can confirm the headless oracle is complete before cutover.
+
+Pending headless suites and the parity rows they will satisfy:
+
+- Selection model (cell/word/line, WRAPLINE) — terminal selection surface.
+- Sync-frame queueing + 150 ms expiry — CSI-2026 burst preservation.
+- Replay application — `SessionReplay` reconnect restore.
+- Config load with removed keys — the "Removed configuration keys" rows (`appearance.splash`, `scrollbar_*`, `prompt_bar_*`; silently ignored).
+- Reconnect topology rebuild — `WorkspaceInfo` layout restore beyond the existing [[client#GPUI Client Spike#GPUI Layout Entities#Workspace Tree Model]] `from_tree` path.
+- Degraded/failure paths — server-down at launch, socket vanish mid-session, adoption failure, replay decode failure (pane error state, no crash), reconnect retry/timeout.
+
+### Pane split-tree logic
+
+The pure [[crates/scribe-client-gpui/src/layout.rs#LayoutTree]] split-tree drives the "Pane layout" keybinding actions (`close_pane`, `cycle_pane`, `focus_left`/`right`/`up`/`down`) beneath the [[client#GPUI Client Spike#GPUI Layout Entities#Pane Tree Model]] entity wrapper, so its navigation and mutation logic is asserted directly without a GPUI context.
+
+Over a 2x2 pane grid the suite exercises the surface the entity tests do not reach directly: [[crates/scribe-client-gpui/src/layout.rs#LayoutTree#find_pane_in_direction]] resolves a direct neighbor on all four axes and wraps to the opposite edge along the same column when none exists; [[crates/scribe-client-gpui/src/layout.rs#LayoutTree#next_pane]] cycles panes in depth-first order and wraps past the last leaf; [[crates/scribe-client-gpui/src/layout.rs#LayoutTree#swap_panes]] exchanges two leaf positions; and [[crates/scribe-client-gpui/src/layout.rs#LayoutTree#close_pane]] promotes a closed pane's sibling while refusing to remove the sole remaining leaf.
