@@ -6940,6 +6940,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "notify",
+ "regex",
  "scribe-common",
  "serde",
  "serde_json",

@@ -198,6 +198,98 @@ Unit tests for the GPUI client's ported [[client#GPUI Client Spike#GPUI URL Dete
 
 [[crates/scribe-client-gpui/src/url_detect.rs#segments_from_cells]] collapses a multi-row OSC 8 run into exact per-row [[crates/scribe-client-gpui/src/url_detect.rs#RowSegment]]s, and `Osc8CellRange::contains` hit-tests a partial middle row by its own segment bounds rather than a bounding rectangle, so hover coverage stays exact.
 
+## GPUI Terminal Selection
+
+Unit tests for the ported [[client#GPUI Client Spike#GPUI Terminal Selection Port]] state — [[crates/scribe-client-gpui/src/selection.rs]] and its vi-mode wrapper — proving cell/word/line granularity, `WRAPLINE`-aware extraction, and copy-on-select over Zed's Alacritty fork.
+
+### Cell selection extracts a substring
+
+[[crates/scribe-client-gpui/src/selection.rs#extract_text]] over a single-row cell range returns exactly the covered characters.
+
+### Reversed cell selection normalizes
+
+A range whose start is after its end extracts the same text as the forward range, because [[crates/scribe-client-gpui/src/selection.rs#SelectionRange#normalized]] orders the endpoints first.
+
+### Word bounds snap to word characters
+
+[[crates/scribe-client-gpui/src/selection.rs#word_bounds_at]] expands a cursor inside a token to the full word, treating `_` and other identifier punctuation as word characters.
+
+### Word bounds on a delimiter select one cell
+
+A cursor resting on a whitespace delimiter yields a single-cell word range rather than swallowing an adjacent word.
+
+### Line bounds span the full row
+
+[[crates/scribe-client-gpui/src/selection.rs#line_bounds_at]] returns the first through last column of the logical line for a non-wrapped row.
+
+### WRAPLINE joins a wrapped row without a newline
+
+[[crates/scribe-client-gpui/src/selection.rs#extract_text]] joins a row that ends with the `WRAPLINE` flag to its continuation row without inserting a newline.
+
+### Hard line break inserts a newline
+
+A selection spanning two rows separated by a hard line break (no `WRAPLINE`) is extracted with a `\n` between them.
+
+### Word bounds follow a wrapped line
+
+[[crates/scribe-client-gpui/src/selection.rs#word_bounds_at]] crosses a `WRAPLINE` boundary so a word split across two screen rows selects as one token.
+
+### Line bounds span a wrapped logical line
+
+[[crates/scribe-client-gpui/src/selection.rs#line_bounds_at]] follows `WRAPLINE` flags to cover every screen row of a wrapped logical line.
+
+### Contains-cell honors selection shape
+
+[[crates/scribe-client-gpui/src/selection.rs#SelectionRange#contains_cell]] includes only the partial first/last rows and every full middle row of a multi-row selection.
+
+### Selection state copies on select
+
+[[crates/scribe-client-gpui/src/selection.rs#SelectionState#copy_text]] returns the selected text after a cell/word/line gesture and `None` for an empty selection.
+
+### Word drag extends by whole words
+
+[[crates/scribe-client-gpui/src/selection.rs#SelectionState#drag_to]] in word mode extends the range by whole words from the double-click anchor to the drag point.
+
+### Pixel mapping resolves grid cells
+
+[[crates/scribe-client-gpui/src/selection.rs#pixel_to_grid]] maps a pointer pixel inside the content area to the correct grid cell and rejects pixels above the content area.
+
+### Vi mode toggles and moves the cursor
+
+[[crates/scribe-client-gpui/src/vi_mode.rs#toggle_vi_mode]] enters copy mode, [[crates/scribe-client-gpui/src/vi_mode.rs#vi_motion]] moves the vi cursor, and motions are no-ops while vi mode is inactive.
+
+## GPUI Terminal Search
+
+Unit tests for [[crates/scribe-client-gpui/src/search.rs#TerminalSearch]], the ported regex find-in-terminal state, proving whole-grid match collection and forward/backward cycling with wraparound.
+
+### Cycles matches with wraparound
+
+[[crates/scribe-client-gpui/src/search.rs#TerminalSearch#select_next]] and `select_prev` advance the highlighted match in reading order and wrap at both ends of the match list.
+
+### Match endpoints cover the whole hit
+
+A collected [[crates/scribe-client-gpui/src/search.rs#SearchMatch]] reports inclusive start and end cells that span the entire matched run.
+
+### Empty and unmatched queries stay valid
+
+An empty query, a valid regex with no matches, and an invalid regex are handled without panicking — the first two yield an empty search and the last returns `None`.
+
+## GPUI Smart Selection
+
+Unit tests for [[crates/scribe-client-gpui/src/smart_selection.rs#CompiledSmartSelection]], the ported iTerm2-style regex matcher, proving precision ranking, capture-parameter expansion, and rule-compilation errors.
+
+### Highest-precision rule wins
+
+[[crates/scribe-client-gpui/src/smart_selection.rs#CompiledSmartSelection#candidate_at]] returns the highest-precision rule's match when several rules overlap the cursor.
+
+### Legacy capture parameters expand
+
+[[crates/scribe-client-gpui/src/smart_selection.rs#SmartSelectionCandidate#resolved_actions]] expands a legacy `\0` parameter to the full matched text and labels the action by rule and kind.
+
+### Invalid regex reports an error
+
+A rule whose regex fails to compile is recorded in [[crates/scribe-client-gpui/src/smart_selection.rs#CompiledSmartSelection]]'s `errors` rather than aborting compilation.
+
 ## GPUI Perf A/B Gate
 
 The launch-blocking performance comparison for the GPUI client rebuild. The `tools/perf-ab-rig/run-perf-ab.sh` rig compares the new client against the recorded old-client baselines and writes a per-metric pass/fail report.

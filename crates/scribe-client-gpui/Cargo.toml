@@ -22,6 +22,7 @@ alacritty_terminal_gpui = { package = "alacritty_terminal", git = "https://githu
 gpui.workspace = true
 gpui_platform.workspace = true
 notify.workspace = true
+regex.workspace = true
 scribe-common.workspace = true
 tokio.workspace = true
 tracing.workspace = true

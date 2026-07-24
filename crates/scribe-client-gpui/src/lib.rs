@@ -41,7 +41,11 @@ pub mod palette;
 pub mod pane_tree;
 pub mod paste;
 pub mod preedit;
+pub mod search;
+pub mod selection;
+pub mod smart_selection;
 pub mod url_detect;
+pub mod vi_mode;
 pub mod workspace_layout;
 pub mod workspace_tree;
 
