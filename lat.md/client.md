@@ -14,7 +14,7 @@ The scaffold spike (`crates/scribe-client-gpui`) proves GPUI can render a live S
 
 The spike adopts Zed's display-only terminal model: [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal]] owns an alacritty `Term` plus a VTE `Processor` and holds no PTY. Server bytes enter through [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#write_output]], which advances the processor and rebuilds an immutable `Content` grid snapshot. [[crates/scribe-client-gpui/src/terminal_element.rs#TerminalElement]] paints that snapshot as fixed-width GPUI rows.
 
-A background thread runs [[crates/scribe-client-gpui/src/main.rs#run_connection]]: it connects to the live server socket, splits it into read/write halves, and queues `Hello` + `ListSessions`. [[crates/scribe-client-gpui/src/main.rs#run_reader]] attaches the first live session, then normalises `PtyOutput` / `SessionReplay` / `ScreenSnapshot` into raw output bytes (decompressing replays and converting snapshots off the drain) and forwards them as [[crates/scribe-client-gpui/src/ipc_bridge.rs#InboundEvent]]. Each coalesced batch bumps a shared generation counter; [[crates/scribe-client-gpui/src/main.rs#drive_redraws]] polls it on the GPUI foreground and calls `notify()` so the window repaints.
+A background thread runs [[crates/scribe-client-gpui/src/main.rs#run_connection]]: it connects to the live server socket, splits it into read/write halves, and queues `Hello` + `ListSessions`. [[crates/scribe-client-gpui/src/main.rs#run_reader]] attaches the first live session, then normalises `PtyOutput` / `SessionReplay` / `ScreenSnapshot` into raw output bytes (via the [[client#GPUI Client Spike#Session Lifecycle]] helpers, off the drain) and forwards them as [[crates/scribe-client-gpui/src/ipc_bridge.rs#InboundEvent]]. Each coalesced batch bumps a shared generation counter; [[crates/scribe-client-gpui/src/main.rs#drive_redraws]] polls it on the GPUI foreground and calls `notify()` so the window repaints.
 
 ### IPC Bridge
 
@@ -23,6 +23,52 @@ The [[crates/scribe-client-gpui/src/ipc_bridge.rs]] module carries bytes both di
 Inbound: [[crates/scribe-client-gpui/src/ipc_bridge.rs#run_drain]] drains the [[crates/scribe-client-gpui/src/ipc_bridge.rs#InboundEvent]] channel with 4 ms / 100-event coalescing. [[crates/scribe-client-gpui/src/ipc_bridge.rs#coalesce]] collapses a drained run into one per-pane byte buffer in first-seen order ([[crates/scribe-client-gpui/src/ipc_bridge.rs#CoalescedBatch]]), so [[crates/scribe-client-gpui/src/main.rs#spawn_drain]] runs exactly one `write_output` and one repaint per dirty pane. Because output is normalised to bytes before it enters the channel, coalescing only ever concatenates.
 
 Outbound: [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink]] replaces Zed's `write_to_pty` path, enqueuing `ClientMessage::KeyInput` / `Resize` onto the ordered IPC-writer channel drained by [[crates/scribe-client-gpui/src/main.rs#run_writer]]. The sink is independent of the inbound drain, so a keystroke is never queued behind an output firehose; because the channel is a single FIFO, a `Resize` enqueued before a `KeyInput` reaches the server first. The GPUI view feeds the sink from [[crates/scribe-client-gpui/src/main.rs#TerminalView#on_key_down]] through an interim passthrough [[crates/scribe-client-gpui/src/main.rs#encode_key]] (superseded by the input-encoder port).
+
+### Session Lifecycle
+
+[[crates/scribe-client-gpui/src/session_lifecycle.rs]] ports the legacy client's reattach, reconnect, and scrollback-trim semantics onto the display-only terminal. Decode and snapshot conversion stay pure and run in [[crates/scribe-client-gpui/src/main.rs#run_reader]] ahead of the drain, so a corrupt replay degrades to pane status without crashing.
+
+[[crates/scribe-client-gpui/src/session_lifecycle.rs#decode_replay]] zstd-decompresses a `SessionReplay` (rejecting zero-dimension or corrupt streams as a [[crates/scribe-client-gpui/src/session_lifecycle.rs#ReplayDecodeError]]); [[crates/scribe-client-gpui/src/session_lifecycle.rs#snapshot_reset_bytes]] prefixes RIS so a `ScreenSnapshot` resets the terminal before replaying `snapshot_to_ansi`. [[crates/scribe-client-gpui/src/session_lifecycle.rs#SessionRegistry]] tracks live sessions, rebuilds the reconnect topology from `SessionList`, applies `SessionCreated` / `SessionExited`, and adopts the window id from a takeover `Welcome`. [[crates/scribe-client-gpui/src/session_lifecycle.rs#shift_absolute_marks_after_trim]] shifts stored absolute [[crates/scribe-client-gpui/src/session_lifecycle.rs#CommandMark]] rows after a `TrimScrollback`.
+
+#### Replay reattach applies
+
+A decoded `SessionReplay` reattach frame reproduces the session grid when written to a fresh terminal.
+
+#### Replay decode failure
+
+A `SessionReplay` with a corrupt zstd payload yields a `ReplayDecodeError` and leaves the terminal untouched and still usable, so the pane surfaces an error without crashing the reader.
+
+#### Snapshot resets before replay
+
+`snapshot_reset_bytes` clears prior pane content before replaying, so a tooling `ScreenSnapshot` replaces rather than appends onto the terminal.
+
+#### Zero-dimension replay rejected
+
+A replay reporting zero rows or columns is rejected up front rather than fed through the VTE pipeline.
+
+#### Trim shifts marks
+
+A `TrimScrollback` shifts surviving absolute marks down by the dropped-row count and drops marks anchored inside the trimmed region.
+
+#### Trim clears input below delta
+
+When the pending input-start row falls inside the trimmed region it is cleared, and a zero-row trim is a no-op.
+
+#### Reconnect topology rebuild
+
+`SessionList` rebuilds the session-to-workspace topology grouped by workspace in first-seen order, pruning workspaces without live sessions.
+
+#### Created and exited transitions
+
+`SessionCreated` registers a pane in arrival order without duplicating re-announcements, and `SessionExited` retires it and reports whether it was tracked.
+
+#### Registry trims marks
+
+`SessionRegistry::on_trim_scrollback` shifts a session's stored marks by the drop between successive server history sizes and clears that state when the session exits.
+
+#### Takeover adoption
+
+A takeover `Hello`'s `Welcome` records the adopted window id on the registry.
 
 ### GPUI Layout Entities
 
