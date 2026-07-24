@@ -2,6 +2,8 @@
 
 The scribe-client is a GPU-accelerated terminal frontend built with winit for windowing and wgpu for rendering.
 
+The GPUI rebuild keeps `appearance.opacity`: [[tools/gpui-window-opacity-spike/src/main.rs]] proves that the pinned GPUI revision opens a transparent Wayland/X11 surface and repaints root alpha live. The decision is recorded in `specs/016-gpui-client-rebuild/spikes/window-opacity-wayland-x11.md`.
+
 ## App State
 
 The master application state lives in the App struct in [[crates/scribe-client/src/main.rs]]. It holds all panes, the window layout, IPC sender, input bindings, theme, AI tracker, GPU context, and UI overlay state. The event loop is driven by winit's `ApplicationHandler` trait.
