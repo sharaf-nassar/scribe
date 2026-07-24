@@ -9,6 +9,14 @@ description = "GPUI display-only client spike for Scribe"
 [lints]
 workspace = true
 
+[lib]
+name = "scribe_client_gpui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scribe-client-gpui"
+path = "src/main.rs"
+
 [dependencies]
 alacritty_terminal_gpui = { package = "alacritty_terminal", git = "https://github.com/zed-industries/alacritty.git", rev = "4c129667" }
 gpui.workspace = true
