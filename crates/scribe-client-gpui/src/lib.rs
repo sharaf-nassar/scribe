@@ -71,6 +71,7 @@ pub mod remote;
 pub mod remote_handshake;
 pub mod restore_replay;
 pub mod restore_state;
+pub mod scrollbar;
 pub mod search;
 pub mod selection;
 pub mod server_lifecycle;
