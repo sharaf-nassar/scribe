@@ -181,3 +181,23 @@ That same socket also accepts a `quit` command from the client and server shutdo
 Window geometry and open state are saved to the active flavor's state root, using `$XDG_STATE_HOME/scribe/settings_state.toml` for stable installs and `$XDG_STATE_HOME/scribe-dev/settings_state.toml` for `scribe-dev`, via [[crates/scribe-settings/src/state.rs]].
 
 On GTK/X11, saved settings geometry is restored only when it intersects a currently connected monitor work area. Explicit open/focus requests with an anchor override saved position and clamp the settings window to the anchor monitor work area.
+
+## GPUI Settings Window
+
+The GPUI rebuild reproduces the deleted `scribe-settings` webview app as a window in the client process (`scribe-client --settings`), keeping the config-write and singleton logic 1:1 while replacing the HTML/CSS/JS surface with GPUI elements.
+
+The webview delivery is gone; its feature set lives in [[crates/scribe-client-gpui/src/settings/mod.rs]]. The config-apply path is ported verbatim as [[crates/scribe-client-gpui/src/settings/apply.rs#apply_settings_change]] (routing every `{key, value}` edit through [[crates/scribe-client-gpui/src/settings/apply.rs#apply_config_key]]), so the [[settings#Config Application]] semantics — clamps, enum parsing, keybinding routing, theme seeding — are unchanged. The one-shot server-action client is ported as [[crates/scribe-client-gpui/src/settings/server_action.rs#request_update_check]] and its release/env/remote siblings.
+
+### Page model
+
+The ten settings pages are described in [[crates/scribe-client-gpui/src/settings/model.rs#page_controls]]: each owns an ordered control list keyed by the dotted config key the apply path understands.
+
+The pages are appearance, colors, AI, terminal, keybindings, workspaces, updates, releases, notifications, and remote.
+
+[[crates/scribe-client-gpui/src/settings/window.rs#SettingsWindow]] renders that model generically — toggles flip, choices cycle, and numeric steppers increment through [[crates/scribe-client-gpui/src/settings/apply.rs#apply_settings_change]], committing immediately like the old live-apply webview. Current values are read back by [[crates/scribe-client-gpui/src/settings/values.rs#current_value]]. Color and free-text controls render their current value read-only, and keybinding rows list every action's combos via [[crates/scribe-client-gpui/src/settings/values.rs#keybinding_combos]]; inline hex/text/path entry is a tracked follow-on.
+
+### Singleton and launch
+
+[[crates/scribe-client-gpui/src/settings/singleton.rs#acquire]] absorbs the `settings.lock`/`settings.sock` singleton unchanged; [[crates/scribe-client-gpui/src/settings/singleton.rs#acquire_at]] splits the path resolution out so a second `--settings` launch hands focus (with the launcher anchor) to the running window instead of opening a duplicate.
+
+Window geometry persists via [[crates/scribe-client-gpui/src/settings/state.rs]]. During side-by-side development the old GTK app stays the sole live-config writer; this window is pointed at a separate dev config via the `SCRIBE_CONFIG_DIR` override that [[crates/scribe-common/src/config.rs#load_config]] already honours, so the two never race on `config.toml`.

@@ -788,3 +788,21 @@ The feature-015 presence badge reports the attached-participant count and names 
 ### Sparklines pad short history to fixed width
 
 [[crates/scribe-client-gpui/src/status_bar.rs#build_right]] left-pads a short CPU/GPU history to the fixed eight-bar width and renders the CPU, MEM, GPU, and network groups when their config flags are on.
+
+## GPUI Settings Window
+
+Unit tests for the GPUI settings window that replaces the deleted `scribe-settings` GTK/wry app, proving the rebuilt surface stays 1:1 with the old page inventory and that a second launch hands off focus rather than opening a duplicate. See [[settings#GPUI Settings Window]].
+
+### Per-page parity checklist
+
+Every page in [[crates/scribe-client-gpui/src/settings/model.rs#page_controls]] exposes controls, and every config-backed control routes cleanly through the ported [[crates/scribe-client-gpui/src/settings/apply.rs#apply_config_key]] with the value the window reads for it, so no editable setting regresses versus `settings.html/js`.
+
+### Keybinding coverage
+
+The keybindings page lists every action the apply path routes under `keybindings.*` (the full 50+ set), and each action's current combos read back through [[crates/scribe-client-gpui/src/settings/values.rs#keybinding_combos]] without panicking, so no shortcut silently disappears.
+
+### Singleton focus handoff
+
+[[crates/scribe-client-gpui/src/settings/singleton.rs#acquire_at]] makes the first launch the primary; a second launch against the same paths sends a `focus` command with the anchor and returns `AlreadyRunning`.
+
+The primary then accepts the handoff connection, verifies the peer UID, and reads back that exact focus command — proving the second launch focuses the running window instead of opening a duplicate.

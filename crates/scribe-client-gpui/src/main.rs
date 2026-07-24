@@ -662,6 +662,16 @@ impl Render for TerminalView {
 
 fn main() {
     PROCESS_START.get_or_init(Instant::now);
+
+    // `scribe-client --settings` opens (or focuses) the settings window instead
+    // of the terminal shell. The singleton absorbs the old scribe-settings
+    // `settings.lock`/`settings.sock`: a second launch hands focus to the
+    // running window and exits here.
+    if std::env::args().skip(1).any(|arg| arg == "--settings") {
+        run_settings();
+        return;
+    }
+
     let shared = Shared {
         terminal: Arc::new(Mutex::new(DisplayOnlyTerminal::new(
             usize::from(COLUMNS),
@@ -702,6 +712,40 @@ fn main() {
         open_window(cx, &shared, &sink);
         cx.activate(true);
     });
+}
+
+/// Run the settings-only flow for `--settings`: enforce the singleton, then
+/// open the GPUI settings window. When another instance already holds the
+/// socket, [`singleton::acquire`] hands it focus and we exit without opening a
+/// duplicate window.
+fn run_settings() {
+    use scribe_client_gpui::settings::singleton::{self, SingletonResult};
+
+    let (listener, socket_path, lock_file) = match singleton::acquire(None) {
+        Ok(SingletonResult::Primary { listener, socket_path, lock_file }) => {
+            (listener, socket_path, lock_file)
+        }
+        Ok(SingletonResult::AlreadyRunning) => {
+            tracing::info!("settings window already running; sent focus and exiting");
+            return;
+        }
+        Err(e) => {
+            tracing::error!("failed to acquire settings singleton: {e}");
+            return;
+        }
+    };
+
+    application().run(move |cx: &mut App| {
+        let animations = load_config().map_or(true, |config| config.appearance.animations);
+        AnimationSettings::resolve(animations).apply_to_app(cx);
+        scribe_client_gpui::settings::open_settings_window(cx);
+        cx.activate(true);
+    });
+
+    // Hold the singleton guards for the window's lifetime, then clean up.
+    singleton::cleanup_socket(&socket_path);
+    drop(listener);
+    drop(lock_file);
 }
 
 fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink) {

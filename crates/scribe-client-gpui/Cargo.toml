@@ -23,7 +23,12 @@ gpui.workspace = true
 gpui_platform.workspace = true
 notify.workspace = true
 regex.workspace = true
+# Settings window: singleton socket peer-cred/flock, one-shot server-action
+# framing, and the {key,value} config-apply payloads.
+nix.workspace = true
+rmp-serde.workspace = true
 scribe-common.workspace = true
+serde_json.workspace = true
 # Window geometry persistence (window_state) serializes WindowGeometry to the
 # per-window state.toml files.
 serde.workspace = true
