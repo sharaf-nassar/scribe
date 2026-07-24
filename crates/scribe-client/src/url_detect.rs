@@ -134,11 +134,12 @@ fn segments_from_cells(cells: &[LogicalCell]) -> Vec<RowSegment> {
 
 /// Add one scanned cell to its exact per-row coverage segments.
 fn push_segment_cell(segments: &mut Vec<RowSegment>, row: i32, col: usize) {
-    if let Some(seg) = segments.last_mut() {
-        if seg.row == row && col == seg.col_end.saturating_add(1) {
-            seg.col_end = col;
-            return;
-        }
+    if let Some(seg) = segments.last_mut()
+        && seg.row == row
+        && col == seg.col_end.saturating_add(1)
+    {
+        seg.col_end = col;
+        return;
     }
     segments.push(RowSegment { row, col_start: col, col_end: col });
 }
@@ -417,15 +418,14 @@ fn flush_osc8_span(
     if let Some(previous) = ranges.last_mut().filter(|previous| {
         previous.link.as_ref().is_some_and(|previous_link| hyperlink_same(previous_link, &link))
             && row_start <= previous.row_end.saturating_add(1)
-    }) {
-        if let Some(span) = out.last_mut() {
-            span.row_end = row_end;
-            span.col_end = col_end;
-            span.segments.extend_from_slice(&segments);
-            previous.row_end = row_end;
-            previous.segments.extend_from_slice(&segments);
-            return;
-        }
+    }) && let Some(span) = out.last_mut()
+    {
+        span.row_end = row_end;
+        span.col_end = col_end;
+        span.segments.extend_from_slice(&segments);
+        previous.row_end = row_end;
+        previous.segments.extend_from_slice(&segments);
+        return;
     }
     out.push(UrlSpan {
         row: row_start,
@@ -1105,10 +1105,11 @@ pub fn open_path(raw: &str, cwd: Option<&std::path::Path>) {
 fn parse_path_line_suffix(raw: &str) -> (&str, Option<u32>) {
     if let Some(colon) = raw.rfind(':') {
         let suffix = &raw[colon + 1..];
-        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(n) = suffix.parse::<u32>() {
-                return (&raw[..colon], Some(n));
-            }
+        if !suffix.is_empty()
+            && suffix.chars().all(|c| c.is_ascii_digit())
+            && let Ok(n) = suffix.parse::<u32>()
+        {
+            return (&raw[..colon], Some(n));
         }
     }
     (raw, None)

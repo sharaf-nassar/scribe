@@ -746,12 +746,10 @@ fn local_takeover_requested() -> bool {
 /// Parse a boolean env flag with the `1` / `true` spelling shared by the
 /// feature-013 spawn markers.
 fn env_flag_set(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            let value = value.trim();
-            value == "1" || value.eq_ignore_ascii_case("true")
-        })
-        .unwrap_or(false)
+    std::env::var(name).is_ok_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true")
+    })
 }
 
 /// The tailnet dial target of a remote-control client process, if this process
@@ -1373,8 +1371,7 @@ fn process_is_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(target_os = "linux")]

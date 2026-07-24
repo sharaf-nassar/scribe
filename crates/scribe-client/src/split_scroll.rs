@@ -394,7 +394,7 @@ mod tests {
         // Cursor at line 5 of a 30-row screen, cell_h = 16.0.
         // The cursor row should be shifted by (30 - 1 - 5) = 24 rows.
         let shift = live_cell_y_translation(5, 30, 16.0);
-        assert!((shift - 24.0 * 16.0).abs() < f32::EPSILON, "expected 24*16 = 384.0, got {shift}",);
+        assert!((shift - 24.0 * 16.0).abs() < f32::EPSILON, "expected 24*16 = 384.0, got {shift}");
     }
 
     #[test]
@@ -410,7 +410,7 @@ mod tests {
         // Cursor at line 28 of 30 → shift cells down 1 row so cursor lands
         // at the last screen row.
         let shift = live_cell_y_translation(28, 30, 16.0);
-        assert!((shift - 16.0).abs() < f32::EPSILON, "expected one row (16.0), got {shift}",);
+        assert!((shift - 16.0).abs() < f32::EPSILON, "expected one row (16.0), got {shift}");
     }
 
     #[test]
@@ -425,6 +425,6 @@ mod tests {
     fn translation_handles_cursor_at_top_of_screen() {
         // Cursor at line 0 → shift = 29 rows down.
         let shift = live_cell_y_translation(0, 30, 16.0);
-        assert!((shift - 29.0 * 16.0).abs() < f32::EPSILON, "expected 29*16 = 464.0, got {shift}",);
+        assert!((shift - 29.0 * 16.0).abs() < f32::EPSILON, "expected 29*16 = 464.0, got {shift}");
     }
 }

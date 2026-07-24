@@ -377,10 +377,10 @@ fn inject_update_check_result(
     };
     let script =
         format!("if (typeof updateCheckResult === 'function') {{ updateCheckResult({json}); }}");
-    if let Some(wv) = webview_ref.borrow().as_ref() {
-        if let Err(e) = wv.evaluate_script(&script) {
-            tracing::warn!("failed to inject update check result: {e}");
-        }
+    if let Some(wv) = webview_ref.borrow().as_ref()
+        && let Err(e) = wv.evaluate_script(&script)
+    {
+        tracing::warn!("failed to inject update check result: {e}");
     }
 }
 
@@ -513,10 +513,10 @@ fn inject_release_list_result(
     let script = format!(
         "if (typeof window.SCRIBE_ON_RELEASE_LIST === 'function') {{ window.SCRIBE_ON_RELEASE_LIST({payload}); }}"
     );
-    if let Some(wv) = webview_ref.borrow().as_ref() {
-        if let Err(e) = wv.evaluate_script(&script) {
-            tracing::warn!("failed to inject release list result: {e}");
-        }
+    if let Some(wv) = webview_ref.borrow().as_ref()
+        && let Err(e) = wv.evaluate_script(&script)
+    {
+        tracing::warn!("failed to inject release list result: {e}");
     }
 }
 
@@ -577,10 +577,10 @@ fn inject_env_preflight_result(
     let script = format!(
         "if (typeof window.SCRIBE_ON_ENV_PREFLIGHT_RESULT === 'function') {{ window.SCRIBE_ON_ENV_PREFLIGHT_RESULT({payload}); }}"
     );
-    if let Some(wv) = webview_ref.borrow().as_ref() {
-        if let Err(e) = wv.evaluate_script(&script) {
-            tracing::warn!("failed to inject env preflight result: {e}");
-        }
+    if let Some(wv) = webview_ref.borrow().as_ref()
+        && let Err(e) = wv.evaluate_script(&script)
+    {
+        tracing::warn!("failed to inject env preflight result: {e}");
     }
 }
 
@@ -594,10 +594,10 @@ fn inject_workspace_root_choice(
     let script = format!(
         "if (typeof window.SCRIBE_ON_WORKSPACE_ROOT_CHOSEN === 'function') {{ window.SCRIBE_ON_WORKSPACE_ROOT_CHOSEN({payload}); }}"
     );
-    if let Some(wv) = webview_ref.borrow().as_ref() {
-        if let Err(e) = wv.evaluate_script(&script) {
-            tracing::warn!("failed to inject workspace root choice: {e}");
-        }
+    if let Some(wv) = webview_ref.borrow().as_ref()
+        && let Err(e) = wv.evaluate_script(&script)
+    {
+        tracing::warn!("failed to inject workspace root choice: {e}");
     }
 }
 
@@ -1955,7 +1955,7 @@ mod tests {
     #[test]
     fn format_iso_utc_handles_epoch_and_leap_day() {
         assert_eq!(format_iso_utc(UNIX_EPOCH), "1970-01-01T00:00:00Z");
-        let leap = UNIX_EPOCH + Duration::from_secs(1_582_934_400);
+        let leap = UNIX_EPOCH + Duration::from_hours(439_704);
         assert_eq!(format_iso_utc(leap), "2020-02-29T00:00:00Z");
     }
 

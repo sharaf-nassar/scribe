@@ -62,6 +62,15 @@ Integration test harness with PTY capture, IPC helpers, and assertion utilities.
 
 Scripts and helpers used during local development builds.
 
+### Rust Toolchain and CI Images
+
+Scribe pins Rust 1.95 for local builds, release CI, and the functional and visual test images so GPUI builds use one supported compiler and native dependency set.
+
+The Docker test images install GPUI's font, TLS, Vulkan, Wayland, X11/XKB,
+zstd, and Clang prerequisites. The visual image also selects lavapipe's
+software Vulkan ICD, keeping rendering tests usable on CI runners without a
+hardware Vulkan driver.
+
 ### Restart Recipes
 
 `just restart-server` and `just restart-server-release` invoke the server binary directly with `--upgrade` to trigger a zero-downtime hot-reload of the running server without rebuilding.

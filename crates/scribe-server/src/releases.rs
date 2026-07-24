@@ -172,7 +172,7 @@ pub struct ReleaseCatalog {
 impl ReleaseCatalog {
     /// Default TTL per research R4 (1 hour balances rate-limit safety and
     /// post-release freshness).
-    pub const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
+    pub const DEFAULT_TTL: Duration = Duration::from_hours(1);
 
     /// Construct an empty catalog with the given TTL.
     #[must_use]
@@ -436,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_fresh_within_ttl() {
-        let mut catalog = ReleaseCatalog::new(Duration::from_secs(3600));
+        let mut catalog = ReleaseCatalog::new(Duration::from_hours(1));
         catalog.value = Some(vec![fixture_release()]);
         catalog.last_fetched_at = Some(Instant::now());
         catalog.last_fetch_was_success = true;
@@ -454,7 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn transitions_to_failed_when_no_cache_and_fetch_errs() {
-        let catalog = make_catalog_arc(ReleaseCatalog::new(Duration::from_secs(3600)));
+        let catalog = make_catalog_arc(ReleaseCatalog::new(Duration::from_hours(1)));
         let fetcher =
             static_fetcher(Err(ScribeError::UpdateCheckFailed { reason: "boom".to_owned() }));
 
@@ -473,7 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn populates_cache_on_first_successful_fetch() {
-        let catalog = make_catalog_arc(ReleaseCatalog::new(Duration::from_secs(3600)));
+        let catalog = make_catalog_arc(ReleaseCatalog::new(Duration::from_hours(1)));
         let success_fetcher = static_fetcher(Ok(vec![fixture_release()]));
 
         let first = handle_list_releases(&catalog, &success_fetcher).await;
@@ -497,10 +497,10 @@ mod tests {
 
     #[tokio::test]
     async fn does_not_thundering_herd_during_inflight_refresh() {
-        let mut catalog = ReleaseCatalog::new(Duration::from_secs(60));
+        let mut catalog = ReleaseCatalog::new(Duration::from_mins(1));
         catalog.value = Some(vec![fixture_release()]);
         // Last fetch is intentionally well past TTL so the path is "stale".
-        catalog.last_fetched_at = Instant::now().checked_sub(Duration::from_secs(3600));
+        catalog.last_fetched_at = Instant::now().checked_sub(Duration::from_hours(1));
         catalog.last_fetch_was_success = false;
         catalog.inflight_refresh = true; // simulate an already-running refresh
         let catalog = make_catalog_arc(catalog);
@@ -527,9 +527,9 @@ mod tests {
     /// the cached releases preserved) and NEVER downgrade to `Failed`. T020.
     #[tokio::test]
     async fn returns_stale_when_cache_exists_but_refresh_fails() {
-        let mut catalog = ReleaseCatalog::new(Duration::from_secs(60));
+        let mut catalog = ReleaseCatalog::new(Duration::from_mins(1));
         catalog.value = Some(vec![fixture_release()]);
-        catalog.last_fetched_at = Instant::now().checked_sub(Duration::from_secs(3600));
+        catalog.last_fetched_at = Instant::now().checked_sub(Duration::from_hours(1));
         catalog.last_fetch_was_success = true;
         catalog.last_refresh_error = Some("network down".to_owned());
         let catalog = make_catalog_arc(catalog);

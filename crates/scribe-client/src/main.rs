@@ -4175,10 +4175,10 @@ impl App {
 
         if let restore_state::LaunchKind::Ai { provider, conversation_id, .. } =
             &pane.launch_binding.kind
+            && *provider == ai_state.provider
+            && *conversation_id == effective_conversation_id
         {
-            if *provider == ai_state.provider && *conversation_id == effective_conversation_id {
-                return;
-            }
+            return;
         }
 
         pane.launch_binding.kind = restore_state::LaunchKind::Ai {
@@ -4736,11 +4736,11 @@ impl App {
         // fallback layout is a linear chain that needs a one-time direction
         // patch per workspace. Routine WorkspaceInfo updates after startup
         // must not rewrite the live split topology.
-        if self.legacy_workspace_direction_updates.remove(&update.workspace_id) {
-            if let Some(dir) = update.split_direction {
-                self.window_layout
-                    .update_split_direction_for(update.workspace_id, from_layout_direction(dir));
-            }
+        if self.legacy_workspace_direction_updates.remove(&update.workspace_id)
+            && let Some(dir) = update.split_direction
+        {
+            self.window_layout
+                .update_split_direction_for(update.workspace_id, from_layout_direction(dir));
         }
         self.request_workspace_notes_snapshot(vec![update.workspace_id]);
     }
@@ -7382,11 +7382,11 @@ impl App {
                     self.handle_reconnect_overlay_key(&key_event.logical_key, event_loop);
                 }
             }
-            WindowEvent::MouseInput { state, .. } => {
-                if *state == winit::event::ElementState::Pressed {
-                    let action = self.reconnect_overlay_click_action();
-                    self.apply_reconnect_action(action, event_loop);
-                }
+            WindowEvent::MouseInput { state, .. }
+                if *state == winit::event::ElementState::Pressed =>
+            {
+                let action = self.reconnect_overlay_click_action();
+                self.apply_reconnect_action(action, event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => self.update_cursor_position(position),
             WindowEvent::Focused(focused) => self.handle_focus_changed(*focused),
@@ -7480,10 +7480,10 @@ impl App {
                 // Every other key is swallowed: a displaced window sends no input
                 // (the banner offers Enter or a click as the sole affordance).
             }
-            WindowEvent::MouseInput { state, .. } => {
-                if *state == winit::event::ElementState::Pressed {
-                    self.reclaim_window(event_loop);
-                }
+            WindowEvent::MouseInput { state, .. }
+                if *state == winit::event::ElementState::Pressed =>
+            {
+                self.reclaim_window(event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => self.update_cursor_position(position),
             WindowEvent::Focused(focused) => self.handle_focus_changed(*focused),
@@ -8352,17 +8352,18 @@ impl App {
         // Spec 011 gate (contract C4): only when enabled, unbracketed, and the
         // content classifies as risky. Short-circuits on the disabled flag so
         // an off configuration takes the exact prior code path.
-        if self.config.terminal.paste_confirmation && !target.bracketed {
-            if let Some(risk) = paste_confirmation_dialog::classify_paste(text) {
-                self.paste_confirmation_dialog =
-                    Some(paste_confirmation_dialog::PasteConfirmationDialog::new(
-                        text.to_owned(),
-                        target,
-                        risk,
-                    ));
-                self.request_redraw();
-                return;
-            }
+        if self.config.terminal.paste_confirmation
+            && !target.bracketed
+            && let Some(risk) = paste_confirmation_dialog::classify_paste(text)
+        {
+            self.paste_confirmation_dialog =
+                Some(paste_confirmation_dialog::PasteConfirmationDialog::new(
+                    text.to_owned(),
+                    target,
+                    risk,
+                ));
+            self.request_redraw();
+            return;
         }
 
         Self::send_paste_resolved(&tx, &target, text.as_bytes());
@@ -9347,19 +9348,19 @@ impl App {
         let workspace_id = target.workspace_id;
         // Affordance click → open inline editor (FR-002). Hit-test first so the
         // affordance doesn't shadow note-row archival.
-        if let Some(aff_rect) = target.interaction.affordance_rect {
-            if aff_rect.contains(x, y) {
-                self.open_inline_note_editor(workspace_id);
-                return true;
-            }
+        if let Some(aff_rect) = target.interaction.affordance_rect
+            && aff_rect.contains(x, y)
+        {
+            self.open_inline_note_editor(workspace_id);
+            return true;
         }
         // Editor row click → absorb so it doesn't trigger archival on a note row
         // behind it; the inline editor is the focused surface (FR-011).
-        if let Some(editor_rect) = target.interaction.editor_rect {
-            if editor_rect.contains(x, y) {
-                self.focused_inline_editor = Some(workspace_id);
-                return true;
-            }
+        if let Some(editor_rect) = target.interaction.editor_rect
+            && editor_rect.contains(x, y)
+        {
+            self.focused_inline_editor = Some(workspace_id);
+            return true;
         }
         let note_id = target
             .interaction
@@ -10130,10 +10131,10 @@ impl App {
         });
 
         let Some(text) = text else { return false };
-        if let Some(cb) = self.clipboard.as_mut() {
-            if let Err(e) = cb.set_text(text) {
-                tracing::warn!("clipboard write failed: {e}");
-            }
+        if let Some(cb) = self.clipboard.as_mut()
+            && let Err(e) = cb.set_text(text)
+        {
+            tracing::warn!("clipboard write failed: {e}");
         }
         true
     }
@@ -10542,10 +10543,10 @@ impl App {
         }
         if let (Some((x, y)), Some((_, prompt_bar::PromptBarHover::DismissButton))) =
             (self.last_cursor_pos, pressed_prompt_bar)
+            && released_prompt_bar == pressed_prompt_bar
+            && self.try_dismiss_prompt_bar(x, y)
         {
-            if released_prompt_bar == pressed_prompt_bar && self.try_dismiss_prompt_bar(x, y) {
-                return;
-            }
+            return;
         }
         let was_text_selecting = self.mouse_selecting;
         let selection_is_empty = self.active_selection.is_some_and(|sel| sel.is_empty());
@@ -11050,10 +11051,10 @@ impl App {
             .iter()
             .find(|(ws, idx, _)| *ws == drag.workspace_id && *idx == drag.tab_index)
             .map(|(_, _, rect)| drag.cursor_x - drag.grab_offset_x - rect.x);
-        if let Some(offset_val) = release_offset {
-            if let Some(offset) = self.tab_drag_offsets.get_mut(drag.tab_index) {
-                *offset = offset_val;
-            }
+        if let Some(offset_val) = release_offset
+            && let Some(offset) = self.tab_drag_offsets.get_mut(drag.tab_index)
+        {
+            *offset = offset_val;
         }
     }
 
@@ -11156,10 +11157,11 @@ impl App {
             }
             (was, drag.dragging)
         };
-        if !was_dragging && now_dragging {
-            if let Some(window) = &self.window {
-                window.set_cursor(winit::window::CursorIcon::Grabbing);
-            }
+        if !was_dragging
+            && now_dragging
+            && let Some(window) = &self.window
+        {
+            window.set_cursor(winit::window::CursorIcon::Grabbing);
         }
     }
 
@@ -12347,10 +12349,10 @@ impl App {
     /// Handle mouse hover while the close dialog is active.
     fn handle_dialog_hover(&mut self) {
         let Some((x, y)) = self.last_cursor_pos else { return };
-        if let Some(dialog) = &mut self.close_dialog {
-            if dialog.update_hover(x, y) {
-                self.request_redraw();
-            }
+        if let Some(dialog) = &mut self.close_dialog
+            && dialog.update_hover(x, y)
+        {
+            self.request_redraw();
         }
     }
 
@@ -12526,10 +12528,10 @@ impl App {
     /// Handle mouse hover while the update dialog is active.
     fn handle_update_dialog_hover(&mut self) {
         let Some((x, y)) = self.last_cursor_pos else { return };
-        if let Some(dialog) = &mut self.update_dialog {
-            if dialog.update_hover(x, y) {
-                self.request_redraw();
-            }
+        if let Some(dialog) = &mut self.update_dialog
+            && dialog.update_hover(x, y)
+        {
+            self.request_redraw();
         }
     }
 
@@ -12588,10 +12590,10 @@ impl App {
     /// Handle mouse hover while the disallowed-scheme dialog is active.
     fn handle_disallowed_scheme_dialog_hover(&mut self) {
         let Some((x, y)) = self.last_cursor_pos else { return };
-        if let Some(dialog) = &mut self.disallowed_scheme_dialog {
-            if dialog.update_hover(x, y) {
-                self.request_redraw();
-            }
+        if let Some(dialog) = &mut self.disallowed_scheme_dialog
+            && dialog.update_hover(x, y)
+        {
+            self.request_redraw();
         }
     }
 
@@ -12649,10 +12651,10 @@ impl App {
     /// Handle mouse hover while the LAN approval prompt is active.
     fn handle_lan_approval_dialog_hover(&mut self) {
         let Some((x, y)) = self.last_cursor_pos else { return };
-        if let Some(dialog) = &mut self.lan_approval_dialog {
-            if dialog.update_hover(x, y) {
-                self.request_redraw();
-            }
+        if let Some(dialog) = &mut self.lan_approval_dialog
+            && dialog.update_hover(x, y)
+        {
+            self.request_redraw();
         }
     }
 
@@ -12723,10 +12725,10 @@ impl App {
     /// Handle mouse hover while the paste-confirmation dialog is active.
     fn handle_paste_confirmation_dialog_hover(&mut self) {
         let Some((x, y)) = self.last_cursor_pos else { return };
-        if let Some(dialog) = &mut self.paste_confirmation_dialog {
-            if dialog.update_hover(x, y) {
-                self.request_redraw();
-            }
+        if let Some(dialog) = &mut self.paste_confirmation_dialog
+            && dialog.update_hover(x, y)
+        {
+            self.request_redraw();
         }
     }
 
@@ -13755,15 +13757,15 @@ fn apply_session_metadata(pane: &mut Pane, metadata: &SessionMetadataMap<'_>) {
     if let Some(&(title, task_label, cwd, context, shell_name, _provider, _conversation_id)) =
         metadata.get(&pane.session_id)
     {
-        if let Some(title) = title {
-            if !title.trim().is_empty() {
-                title.clone_into(&mut pane.title);
-            }
+        if let Some(title) = title
+            && !title.trim().is_empty()
+        {
+            title.clone_into(&mut pane.title);
         }
-        if let Some(task_label) = task_label {
-            if !task_label.trim().is_empty() {
-                pane.task_label = Some(task_label.to_owned());
-            }
+        if let Some(task_label) = task_label
+            && !task_label.trim().is_empty()
+        {
+            pane.task_label = Some(task_label.to_owned());
         }
         if let Some(cwd) = cwd {
             pane.cwd = Some((*cwd).clone());
@@ -13771,10 +13773,10 @@ fn apply_session_metadata(pane: &mut Pane, metadata: &SessionMetadataMap<'_>) {
         if let Some(context) = context {
             pane.session_context = Some((*context).clone());
         }
-        if let Some(shell_name) = shell_name {
-            if !shell_name.trim().is_empty() {
-                shell_name.clone_into(&mut pane.shell_name);
-            }
+        if let Some(shell_name) = shell_name
+            && !shell_name.trim().is_empty()
+        {
+            shell_name.clone_into(&mut pane.shell_name);
         }
     }
 }
@@ -15987,19 +15989,19 @@ fn restore_settings_if_open() {
         return;
     };
 
-    if let Ok(state) = toml::from_str::<SettingsOpenCheck>(&content) {
-        if state.open {
-            // Kill any stale settings process so the newly-installed binary
-            // is used (e.g. after dpkg upgrade + server handoff).
-            let socket_path = scribe_common::socket::settings_socket_path();
-            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
-                drop(write_settings_window_command(&mut stream, &SettingsWindowCommand::quit()));
-                drop(stream);
-                // Brief pause for the old process to exit and release the socket.
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            spawn_settings_process(None);
+    if let Ok(state) = toml::from_str::<SettingsOpenCheck>(&content)
+        && state.open
+    {
+        // Kill any stale settings process so the newly-installed binary
+        // is used (e.g. after dpkg upgrade + server handoff).
+        let socket_path = scribe_common::socket::settings_socket_path();
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
+            drop(write_settings_window_command(&mut stream, &SettingsWindowCommand::quit()));
+            drop(stream);
+            // Brief pause for the old process to exit and release the socket.
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
+        spawn_settings_process(None);
     }
 }
 
@@ -16227,10 +16229,10 @@ fn parse_window_id() -> Option<WindowId> {
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
-        if args.get(i).map(String::as_str) == Some("--window-id") {
-            if let Some(val) = args.get(i + 1) {
-                return val.parse::<WindowId>().ok();
-            }
+        if args.get(i).map(String::as_str) == Some("--window-id")
+            && let Some(val) = args.get(i + 1)
+        {
+            return val.parse::<WindowId>().ok();
         }
         i += 1;
     }

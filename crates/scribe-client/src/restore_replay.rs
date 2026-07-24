@@ -270,9 +270,7 @@ fn restore_tab_snapshot(
     let mut launch_ids = Vec::new();
     collect_launch_ids_from_pane_snapshot(&tab.pane_tree, &mut launch_ids);
 
-    for (launch_id, (placeholder_session_id, pane_id)) in
-        launch_ids.into_iter().zip(pane_pairs.into_iter())
-    {
+    for (launch_id, (placeholder_session_id, pane_id)) in launch_ids.into_iter().zip(pane_pairs) {
         if let Some(record) = context.records.iter().find(|record| record.launch_id == launch_id) {
             if launch_id == tab.focused_launch_id {
                 focused_pane_id = Some(pane_id);

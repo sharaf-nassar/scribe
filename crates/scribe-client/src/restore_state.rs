@@ -235,10 +235,10 @@ impl RestoreStore {
     fn ensure_restore_parent(&self, path: &Path) -> Result<(), crate::window_state::StateError> {
         let root = self.root.as_ref().ok_or(crate::window_state::StateError::NoStateDir)?;
         ensure_private_dir(root)?;
-        if let Some(parent) = path.parent() {
-            if parent != root {
-                ensure_private_dir(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && parent != root
+        {
+            ensure_private_dir(parent)?;
         }
         Ok(())
     }
@@ -317,10 +317,10 @@ impl RestoreStore {
     pub fn remove_window(&self, window_id: WindowId) {
         let Some(path) = self.window_path(window_id) else { return };
         let result = std::fs::remove_file(path);
-        if let Err(error) = result {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(%window_id, error = %error, "failed to remove restore window state");
-            }
+        if let Err(error) = result
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%window_id, error = %error, "failed to remove restore window state");
         }
     }
 

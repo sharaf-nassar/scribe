@@ -142,11 +142,11 @@ impl WorkspaceManager {
 
     /// Remove a session from its workspace.
     pub fn remove_session(&mut self, session_id: SessionId) {
-        if let Some(workspace_id) = self.session_to_workspace.remove(&session_id) {
-            if let Some(ws) = self.workspaces.get_mut(&workspace_id) {
-                ws.sessions.retain(|&s| s != session_id);
-                debug!(%session_id, %workspace_id, "removed session from workspace");
-            }
+        if let Some(workspace_id) = self.session_to_workspace.remove(&session_id)
+            && let Some(ws) = self.workspaces.get_mut(&workspace_id)
+        {
+            ws.sessions.retain(|&s| s != session_id);
+            debug!(%session_id, %workspace_id, "removed session from workspace");
         }
     }
 

@@ -140,7 +140,7 @@ fn caret_escape(c: char) -> String {
         0x7F => String::from("^?"),
         0x00..=0x1F => {
             // `byte ^ 0x40` maps C0 onto the printable caret range `@A..._`.
-            let caret = u8::try_from(code).map(|b| b ^ 0x40).unwrap_or(b'?');
+            let caret = u8::try_from(code).map_or(b'?', |b| b ^ 0x40);
             format!("^{}", caret as char)
         }
         _ => format!("\\u{{{code:02X}}}"),

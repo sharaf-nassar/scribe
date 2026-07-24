@@ -269,10 +269,10 @@ async fn run_server_loop(
 
 /// Remove the IPC socket file, ignoring "not found" errors.
 fn cleanup_socket(path: &Path) {
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            warn!(?path, "failed to remove socket on shutdown: {e}");
-        }
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(?path, "failed to remove socket on shutdown: {e}");
     }
 }
 

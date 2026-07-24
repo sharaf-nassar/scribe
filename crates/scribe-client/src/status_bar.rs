@@ -762,11 +762,11 @@ fn build_segment_groups(data: &StatusBarData<'_>) -> Vec<(String, usize)> {
         groups.push((String::from("Active sessions"), sep + 1));
     }
 
-    if let Some(tmux_label) = data.tmux_label {
-        if !tmux_label.is_empty() {
-            let sep = usize::from(!groups.is_empty());
-            groups.push((String::from("tmux session"), sep + 1));
-        }
+    if let Some(tmux_label) = data.tmux_label
+        && !tmux_label.is_empty()
+    {
+        let sep = usize::from(!groups.is_empty());
+        groups.push((String::from("tmux session"), sep + 1));
     }
 
     if !data.host_label.is_empty() {

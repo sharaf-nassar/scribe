@@ -48,11 +48,11 @@ pub fn save(state: &SettingsState) {
         tracing::warn!("no XDG state directory, cannot save settings state");
         return;
     };
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::warn!(path = %parent.display(), "failed to create state dir: {e}");
-            return;
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(path = %parent.display(), "failed to create state dir: {e}");
+        return;
     }
     match toml::to_string_pretty(state) {
         Ok(content) => {

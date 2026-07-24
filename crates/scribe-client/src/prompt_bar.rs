@@ -1175,6 +1175,6 @@ mod tests {
         assert_eq!(elapsed_since(now, since), Duration::ZERO);
         // since in the past → straightforward subtraction.
         let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(40);
-        assert_eq!(elapsed_since(now, earlier), Duration::from_secs(60));
+        assert_eq!(elapsed_since(now, earlier), Duration::from_mins(1));
     }
 }

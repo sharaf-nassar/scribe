@@ -189,10 +189,10 @@ fn net_delta_for_interfaces(
         if name == "lo" {
             continue;
         }
-        if let Some(allowed) = allowed_interfaces {
-            if !allowed.contains(name) {
-                continue;
-            }
+        if let Some(allowed) = allowed_interfaces
+            && !allowed.contains(name)
+        {
+            continue;
         }
         up = up.saturating_add(data.transmitted());
         down = down.saturating_add(data.received());

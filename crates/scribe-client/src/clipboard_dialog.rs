@@ -353,10 +353,10 @@ impl ClipboardDialog {
         };
         let intro = match self.op {
             ClipboardOp::Read => {
-                format!("A program in this terminal wants to read the {selection_word}.",)
+                format!("A program in this terminal wants to read the {selection_word}.")
             }
             ClipboardOp::Write => {
-                format!("A program in this terminal wants to overwrite the {selection_word}.",)
+                format!("A program in this terminal wants to overwrite the {selection_word}.")
             }
         };
 

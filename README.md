@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="#license"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later" /></a>
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.87%2B-orange" alt="Rust: 1.87+" /></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.95%2B-orange" alt="Rust: 1.95+" /></a>
 </p>
 
 ---
@@ -50,7 +50,7 @@ Crash your terminal, lose every shell. Update it, same story. Scribe splits the 
 
 ### Prerequisites
 
-- Rust 1.87+
+- Rust 1.95+
 - Linux: `libgtk-4-dev`, `libvulkan-dev`
 - macOS: Xcode Command Line Tools
 

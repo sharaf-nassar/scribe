@@ -1137,7 +1137,7 @@ async fn prepare_restore_env_file(
     // this is only a safety net.
     let path_for_cleanup = path.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::time::sleep(std::time::Duration::from_mins(1)).await;
         _ = tokio::fs::remove_file(&path_for_cleanup).await;
     });
 

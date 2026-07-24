@@ -1194,7 +1194,7 @@ async fn handle_assert_snapshot_match(
             let row = i / cols;
             let col = i % cols;
             return DaemonResponse::AssertFailed {
-                message: format!("cell ({row},{col}): expected '{}' but found '{}'", refr.c, cur.c,),
+                message: format!("cell ({row},{col}): expected '{}' but found '{}'", refr.c, cur.c),
             };
         }
     }
