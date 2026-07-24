@@ -50,6 +50,7 @@ pub mod color;
 pub mod command_palette;
 pub mod config;
 pub mod context_menu;
+pub mod dialog;
 pub mod divider;
 pub mod drag_drop;
 pub mod focus_border;
