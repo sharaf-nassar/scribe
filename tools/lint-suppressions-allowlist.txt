@@ -2,5 +2,6 @@ crates/scribe-client/src/main.rs|#[allow(clippy::cast_possible_truncation,clippy
 crates/scribe-client/src/main.rs|#[allow(clippy::struct_excessive_bools)]
 crates/scribe-client/src/notification_dispatcher/linux.rs|#[allow(clippy::too_many_arguments)]
 crates/scribe-client/src/selection.rs|#[allow(clippy::indexing_slicing)]
+crates/scribe-common/src/config.rs|#[allow(clippy::struct_excessive_bools)]
 crates/scribe-client/src/split_scroll.rs|#[allow(clippy::indexing_slicing)]
 crates/scribe-server/src/macos_proc.rs|#[allow(unsafe_code)]

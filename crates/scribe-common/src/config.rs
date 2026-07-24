@@ -107,6 +107,10 @@ pub struct ScribeConfig {
 // Appearance
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Appearance groups independent user-facing on/off toggles (ligatures, cursor blink, animations), not a state machine that would be cleaner as an enum."
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppearanceConfig {
     #[serde(default = "default_font")]
@@ -119,6 +123,12 @@ pub struct AppearanceConfig {
     pub font_weight_bold: u16,
     #[serde(default = "default_true")]
     pub ligatures: bool,
+    /// Whether the GPUI client plays UI transitions and smooth scrolling.
+    /// Doubles as the reduce-motion user setting; the GPUI client's
+    /// `SCRIBE_DISABLE_ANIMATIONS` env override force-disables it for E2E
+    /// determinism. Ignored by the legacy client.
+    #[serde(default = "default_true")]
+    pub animations: bool,
     #[serde(default)]
     pub line_padding: u16,
     #[serde(default)]
@@ -175,6 +185,7 @@ impl Default for AppearanceConfig {
             font_weight: default_font_weight(),
             font_weight_bold: default_font_weight_bold(),
             ligatures: true,
+            animations: true,
             line_padding: 0,
             cursor_shape: CursorShape::default(),
             cursor_blink: true,

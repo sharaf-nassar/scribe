@@ -17,7 +17,9 @@ use gpui::{
     WeakEntity, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
+use scribe_client_gpui::animation::AnimationSettings;
 use scribe_common::{
+    config::load_config,
     framing::{read_message, write_message},
     ids::SessionId,
     protocol::{ClientMessage, ServerMessage, SessionInfo, TerminalSize},
@@ -236,6 +238,12 @@ fn main() {
     });
 
     application().run(move |cx: &mut App| {
+        // Resolve the motion policy from `appearance.animations` (default true)
+        // and the SCRIBE_DISABLE_ANIMATIONS override, then mirror it onto GPUI's
+        // global reduce-motion flag so any UI transitions stay off — and
+        // screenshots stay byte-identical — under the E2E determinism path.
+        let animations = load_config().map_or(true, |config| config.appearance.animations);
+        AnimationSettings::resolve(animations).apply_to_app(cx);
         open_window(cx, &shared, &sink);
         cx.activate(true);
     });
