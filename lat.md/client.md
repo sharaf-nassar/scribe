@@ -212,6 +212,14 @@ Keyboard events are only processed when the window has focus (`window_focused ==
 
 Compositor overlays (e.g. GNOME Shell screenshot) clear or change this EWMH property without sending `FocusOut`. The guard polls in `about_to_wait` and on each key press. A `was_inactive` flag tracks whether the window has been obscured; when `should_suppress_key` or `poll` first sees the window become active again, a `reactivated_at` timestamp is set and keys are suppressed for 300ms from that transition. The debounce is cleared on `Focused(true)` so it only applies to compositor overlay dismissals — not normal focus transitions — preventing the first keystroke from being swallowed when the user alt-tabs or clicks to Scribe.
 
+#### GPUI X11 Handle
+
+Pinned GPUI exposes the X11 XID as `RawWindowHandle::Xcb`, so the rebuild keeps
+the guard's direct EWMH comparison without title/PID lookup.
+
+The non-zero `window` field initializes `X11FocusGuard`; the decision and
+integration probe are recorded in `specs/016-gpui-client-rebuild/x11-xid-spike.md`.
+
 ### Key Translation Priority
 
 Key events are resolved through a four-level priority chain from layout shortcuts down to raw terminal byte encoding.
