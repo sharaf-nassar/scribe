@@ -6947,6 +6947,7 @@ dependencies = [
  "scribe-common",
  "serde",
  "serde_json",
+ "sysinfo 0.35.2",
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",

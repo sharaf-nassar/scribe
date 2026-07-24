@@ -27,6 +27,8 @@ scribe-common.workspace = true
 # Window geometry persistence (window_state) serializes WindowGeometry to the
 # per-window state.toml files.
 serde.workspace = true
+# System resource sampling (sys_stats): CPU/memory/network/GPU sparkline feeds.
+sysinfo.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
