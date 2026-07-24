@@ -1,0 +1,30 @@
+{
+  "format": 1,
+  "source": "crates/scribe-client/src/input.rs at f407b286f923844f520decf7d60a893ec07c30ed",
+  "encoding": "Each `bytes` value is lowercase hexadecimal without separators.",
+  "cases": [
+    { "name": "legacy-printable-a", "input": "a", "bytes": "61" },
+    { "name": "legacy-ctrl-c", "input": "Ctrl+C", "bytes": "03" },
+    { "name": "legacy-alt-c", "input": "Alt+C", "bytes": "1b63" },
+    { "name": "legacy-ctrl-alt-c", "input": "Ctrl+Alt+C", "bytes": "1b03" },
+    { "name": "legacy-shift-tab", "input": "Shift+Tab", "bytes": "1b5b5a" },
+    { "name": "legacy-ctrl-page-down", "input": "Ctrl+PageDown", "bytes": "1b5b363b357e" },
+    { "name": "legacy-f1", "input": "F1", "bytes": "1b4f50" },
+    { "name": "legacy-arrow-up", "input": "ArrowUp", "bytes": "1b5b41" },
+    { "name": "legacy-shift-left", "input": "Shift+ArrowLeft", "bytes": "1b5b313b3244" },
+    { "name": "decckm-arrow-up", "input": "ArrowUp; DECCKM", "bytes": "1b4f41" },
+    { "name": "decckm-home", "input": "Home; DECCKM", "bytes": "1b4f48" },
+    { "name": "decckm-ctrl-down", "input": "Ctrl+ArrowDown; DECCKM", "bytes": "1b5b313b3542" },
+    { "name": "dec-pam-numpad-0", "input": "Numpad0; DECPAM", "bytes": "1b4f70" },
+    { "name": "dec-pam-numpad-9", "input": "Numpad9; DECPAM", "bytes": "1b4f79" },
+    { "name": "dec-pam-numpad-decimal", "input": "NumpadDecimal; DECPAM", "bytes": "1b4f6e" },
+    { "name": "dec-pam-numpad-enter", "input": "NumpadEnter; DECPAM", "bytes": "1b4f4d" },
+    { "name": "kitty-disambiguate-enter", "input": "Enter; kitty=1", "bytes": "1b5b313375" },
+    { "name": "kitty-disambiguate-ctrl-i", "input": "Ctrl+I; kitty=1", "bytes": "1b5b3130353b3575" },
+    { "name": "kitty-all-keys-a", "input": "a; kitty=8", "bytes": "1b5b393775" },
+    { "name": "kitty-alternate-shift-a", "input": "Shift+A; kitty=4", "bytes": "1b5b39373a36353b3275" },
+    { "name": "kitty-repeat-arrow-left", "input": "ArrowLeft repeat; kitty=2", "bytes": "1b5b313b313a3244" },
+    { "name": "kitty-repeat-ctrl-arrow-left", "input": "Ctrl+ArrowLeft repeat; kitty=2", "bytes": "1b5b313b353a3244" },
+    { "name": "kitty-repeat-f13", "input": "F13 repeat; kitty=2", "bytes": "1b5b35373337363b313a3275" }
+  ]
+}
