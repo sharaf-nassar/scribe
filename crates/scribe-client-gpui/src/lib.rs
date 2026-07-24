@@ -4,7 +4,10 @@
 //! — the xterm-256 [`palette`], terminal cell [`color`] semantics, and the
 //! procedural [`box_drawing`] rasterizer — alongside the terminal [`input`]
 //! byte encoder. Each of those modules is ported byte-for-byte from the legacy
-//! client so terminal output stays identical across the cutover.
+//! client so terminal output stays identical across the cutover. The
+//! [`mouse_reporting`] byte encoder (X10 / SGR-1006, modes 1000/1002/1003) and
+//! the [`mouse_state`] click-count / selection-mode classifier are ported the
+//! same way.
 //!
 //! It also hosts the ported pane/workspace split trees and their GPUI entity
 //! wrappers. The pure split-tree logic lives in [`layout`] and
@@ -22,6 +25,8 @@ pub mod box_drawing;
 pub mod color;
 pub mod input;
 pub mod layout;
+pub mod mouse_reporting;
+pub mod mouse_state;
 pub mod palette;
 pub mod pane_tree;
 pub mod url_detect;
