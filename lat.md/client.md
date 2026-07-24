@@ -24,6 +24,26 @@ Inbound: [[crates/scribe-client-gpui/src/ipc_bridge.rs#run_drain]] drains the [[
 
 Outbound: [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink]] replaces Zed's `write_to_pty` path, enqueuing `ClientMessage::KeyInput` / `Resize` onto the ordered IPC-writer channel drained by [[crates/scribe-client-gpui/src/main.rs#run_writer]]. The sink is independent of the inbound drain, so a keystroke is never queued behind an output firehose; because the channel is a single FIFO, a `Resize` enqueued before a `KeyInput` reaches the server first. The GPUI view feeds the sink from [[crates/scribe-client-gpui/src/main.rs#TerminalView#on_key_down]] through an interim passthrough [[crates/scribe-client-gpui/src/main.rs#encode_key]] (superseded by the input-encoder port).
 
+### GPUI Layout Entities
+
+The GPUI rebuild ports the two-level split tree into a `lib` target alongside the scaffold binary, so the pure trees and their entity wrappers are library API covered by `#[gpui::test]` headless suites.
+
+The pane split tree is [[crates/scribe-client-gpui/src/layout.rs#LayoutTree]] (binary `Leaf`/`Split` nodes, ratios clamped 0.1-0.9, spatial-overlap directional focus with edge wrap). The workspace split tree is [[crates/scribe-client-gpui/src/workspace_layout.rs#WindowLayout]], whose `WorkspaceSlot` carries tabs, active tab index, accent color, name, and project root. `TabState` drops the winit client's `selection` field until terminal selection is ported in Phase B.
+
+#### Pane Tree Model
+
+[[crates/scribe-client-gpui/src/pane_tree.rs#PaneTree]] is a `gpui::Entity` wrapping a `LayoutTree`. Every structural mutation emits `PaneTreeEvent::Changed` and calls `notify()`.
+
+[[crates/scribe-client-gpui/src/pane_tree.rs#PaneTree#split]] and [[crates/scribe-client-gpui/src/pane_tree.rs#PaneTree#close]] both auto-equalize the surviving ratios so sibling panes stay evenly sized; `close` refuses to remove the sole root leaf. [[crates/scribe-client-gpui/src/pane_tree.rs#PaneTree#set_ratio]] clamps to 0.1-0.9, and `find_pane_in_direction` resolves directional focus (with edge wrap) without mutating or emitting.
+
+#### Workspace Tree Model
+
+[[crates/scribe-client-gpui/src/workspace_tree.rs#WorkspaceTree]] is a `gpui::Entity` wrapping a `WindowLayout` plus the running `PaneId -> SessionId` map. Every mutation re-serializes the tree and emits `WorkspaceTreeEvent::Report`.
+
+The event payload is the exact `WorkspaceTreeNode` the client forwards to the server as [[crates/scribe-common/src/protocol.rs#ClientMessage]] `ReportWorkspaceTree`.
+
+Reported mutations include workspace split, tab add/remove, [[crates/scribe-client-gpui/src/workspace_tree.rs#WorkspaceTree#set_active_tab]], workspace ratio change (clamped 0.1-0.9), and in-place slot edits via `update_slot`. On reconnect the restore path pushes tabs (each auto-activating the last) and then replays `active_tab_index` through `set_active_tab` to restore the originally focused tab, matching the winit client's post-pass.
+
 ## App State
 
 The master application state lives in the App struct in [[crates/scribe-client/src/main.rs]]. It holds all panes, the window layout, IPC sender, input bindings, theme, AI tracker, GPU context, and UI overlay state. The event loop is driven by winit's `ApplicationHandler` trait.
