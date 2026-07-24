@@ -194,6 +194,124 @@ Verifies a `begin_drag`/`update_drag`/`end_drag` sequence on [[crates/scribe-cli
 
 Verifies that select, close, and begin-drag on out-of-range indices leave the tab list unchanged and emit no events, so stray hit targets cannot corrupt state.
 
+## GPUI AI Indicator
+
+The GPUI rebuild ports the winit client's per-session AI state machine so pulsing pane borders, tab indicators, and the context store behave identically across the cutover. The state machine is pure and covered by `#[gpui::test]`.
+
+[[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker]] is a byte-for-byte port of the winit [[crates/scribe-client/src/ai_indicator.rs]] tracker. It keeps the Layer-1 pulse envelope (attention states pulse for a bounded window from entry; `Processing` pulses only while alive, re-armed by state edges and PTY output via [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#note_activity]]) so a hung AI stops pinning the redraw loop ([[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#needs_animation]]), the Layer-2 wall-clock [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#clear_stale_processing]] that removes a dead `Processing` state entirely, the keystroke-driven [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#clear_attention_states]], and the workspace-level priority aggregation ([[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#workspace_border_color]], `PermissionPrompt > WaitingForInput > IdlePrompt > Error > Processing`).
+
+The context-window percent is stored independently of the visible state ([[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#context_for]]) so it survives every state-pruning path; the pulse-suppression predicate ([[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#context_suffix_suppressed]]) is the `pulsing` argument for the tab suffix banding that now lives in [[crates/scribe-client-gpui/src/tab_bar.rs#context_suffix]]. The pulsing border geometry is [[crates/scribe-client-gpui/src/ai_indicator.rs#pane_border_edges]], which excludes the tab bar and reuses the shared [[crates/scribe-client-gpui/src/focus_border.rs#border_edges]] strip math; the GPUI paint path fills those rects with the aggregated colour. `AiStateChanged`/`AiStateCleared` are verified by the visual-E2E harness.
+
+### Provider toggle gates the indicator
+
+Verifies [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#tab_indicator_color]] returns `None` for a provider disabled in `TerminalConfig`, so a toggled-off tool shows no indicator.
+
+### Provider memory survives clears
+
+Verifies a Codex session is remembered as a Codex provider (not Claude) so provider-aware clipboard cleanup never mistakes it for Claude Code.
+
+### Processing pulse rests after idle window
+
+Verifies a fresh `Processing` state pulses, then after `PROCESSING_IDLE_PULSE_SECS` of silence [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#needs_animation]] reports idle so the shared redraw loop retires — the GPU-drain fix.
+
+### Activity re-arms the processing pulse
+
+Verifies fresh PTY output via [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#note_activity]] re-arms a rested `Processing` pulse, which rests again after renewed silence.
+
+### A state edge re-arms the pulse
+
+Verifies a repeated `Processing` state edge (an `update`) is treated as a sign of life and re-arms a rested pulse.
+
+### Attention pulse rests after its window
+
+Verifies an attention state (`WaitingForInput`) pulses for a bounded window measured from entry, then rests without being extended by later activity.
+
+### Stale processing is cleared
+
+Verifies [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#clear_stale_processing]] removes a `Processing` state with no liveness for `STALE_PROCESSING_CLEAR`, while preserving provider memory for clipboard cleanup.
+
+### Fresh processing is not cleared
+
+Verifies a just-updated `Processing` state is not treated as stale and stays tracked.
+
+### Only processing is hard-cleared
+
+Verifies an idle attention state is never hard-cleared by [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#clear_stale_processing]] — it must persist until the human acts.
+
+### Activity re-arms the stale-clear timer
+
+Verifies [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#note_activity]] resets the wall-clock staleness timer so a sign of life before the prune spares the state.
+
+### Workspace border takes the highest-priority state
+
+Verifies [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#workspace_border_color]] aggregates several sessions to the highest-priority state's colour (`PermissionPrompt` over `WaitingForInput` and `Processing`).
+
+### Border colour drops decayed sessions
+
+Verifies [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#workspace_border_color]] returns `None` when no tracked session drives a border.
+
+### Context survives the stale-processing clear
+
+Verifies [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#context_for]] still returns the percent after a stale-`Processing` clear removes the visible state.
+
+### Context suffix suppressed during attention pulse
+
+Verifies [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#context_suffix_suppressed]] is true for `PermissionPrompt`/`WaitingForInput` and false for `Processing`, so the tab suffix yields to a pulsing attention state.
+
+### Conversation change wipes the context
+
+Verifies [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#clear_context]] drops the stored percent so a new conversation does not show the prior window's usage.
+
+### Session removal drops the context
+
+Verifies [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#remove]] clears the stored context percent for a closed session.
+
+### Pane border edges exclude the tab bar
+
+Verifies [[crates/scribe-client-gpui/src/ai_indicator.rs#pane_border_edges]] offsets the border below the tab bar and produces corner-safe top/bottom/left/right strips.
+
+## GPUI Prompt Bar
+
+The GPUI rebuild ports the winit prompt bar's display-independent logic — elapsed-timer formatting with freeze-on-AI-stop, the segmented context meter, the `#N` count, strip height, and truncation — and lowers the visuals onto a GPUI flex strip.
+
+[[crates/scribe-client-gpui/src/prompt_bar.rs#build_model]] turns a [[crates/scribe-client-gpui/src/prompt_bar.rs#PromptBarData]] snapshot into a pure [[crates/scribe-client-gpui/src/prompt_bar.rs#PromptBarModel]] (first/latest rows, count, elapsed, optional meter); [[crates/scribe-client-gpui/src/prompt_bar.rs#render]] lowers it onto div rows (timer on row 1 with count/context on row 2 in the two-prompt state, everything on row 1 otherwise, plus the hover dismiss overlay). The elapsed timer is computed by [[crates/scribe-client-gpui/src/prompt_bar.rs#elapsed_text]], which freezes at `latest_prompt_finished_at` when the AI stops and clamps a backwards wall clock; the reference clock is threaded in so the freeze is `#[gpui::test]`-verifiable without a live window. [[crates/scribe-client-gpui/src/prompt_bar.rs#is_prompt_truncated]] gates the hover tooltip and [[crates/scribe-client-gpui/src/prompt_bar.rs#prompt_bar_height]] sizes the strip. The rendered strip is a visual-E2E surface.
+
+### Elapsed formats span sec, minute, and hour bands
+
+Verifies [[crates/scribe-client-gpui/src/prompt_bar.rs#format_elapsed]] renders `"X sec"` under a minute, `"Xm YYs"` under an hour, and `"Xh YYm"` beyond, with zero-padded trailing units.
+
+### Elapsed timer tracks now until the AI stops
+
+Verifies [[crates/scribe-client-gpui/src/prompt_bar.rs#elapsed_text]] advances with `now` while `latest_prompt_finished_at` is unset.
+
+### Elapsed timer freezes when the AI stops
+
+Verifies [[crates/scribe-client-gpui/src/prompt_bar.rs#elapsed_text]] holds at the prompt-to-finish duration once `latest_prompt_finished_at` is set, regardless of how far `now` advances.
+
+### Elapsed clamps a backwards wall clock
+
+Verifies [[crates/scribe-client-gpui/src/prompt_bar.rs#elapsed_text]] clamps to `0 sec` when `now` precedes the prompt timestamp (DST/NTP skew) rather than underflowing.
+
+### No timer without a prompt timestamp
+
+Verifies [[crates/scribe-client-gpui/src/prompt_bar.rs#elapsed_text]] returns `None` when no prompt timestamp is recorded, so nothing is drawn.
+
+### Context meter fills and clamps
+
+Verifies [[crates/scribe-client-gpui/src/prompt_bar.rs#format_context_label]] fills the three-segment meter proportionally and clamps above 100%.
+
+### Strip height tracks the prompt count
+
+Verifies [[crates/scribe-client-gpui/src/prompt_bar.rs#prompt_bar_height]] is zero for no prompts or a non-positive cell height, one row for one prompt, and two rows plus a seam for two or more.
+
+### Model shows one row for one prompt, two for many
+
+Verifies [[crates/scribe-client-gpui/src/prompt_bar.rs#build_model]] emits only the first row for a single prompt and both rows (with the `#N` count) for multiple, and `None` for zero prompts.
+
+### Truncation predicate gates the hover tooltip
+
+Verifies [[crates/scribe-client-gpui/src/prompt_bar.rs#is_prompt_truncated]] reports a short prompt as fitting a wide bar and a long prompt as overflowing a narrow one.
+
 ## App State
 
 The master application state lives in the App struct in [[crates/scribe-client/src/main.rs]]. It holds all panes, the window layout, IPC sender, input bindings, theme, AI tracker, GPU context, and UI overlay state. The event loop is driven by winit's `ApplicationHandler` trait.
