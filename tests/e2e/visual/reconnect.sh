@@ -33,10 +33,9 @@ sleep 1
 echo "PHASE 2 PASS: client closed"
 
 # --- Phase 3: Restart the client (reconnects to server) ---
-# Vulkan device is lost after the first client exits (container graphics stack
-# limitation). Reset the instance by unsetting the cached device.
-export WGPU_BACKEND=vulkan
-scribe-client &
+# The GPUI client renders through blade/Vulkan on the lavapipe software ICD
+# pinned by the image (VK_ICD_FILENAMES), so relaunch needs no GPU reset.
+scribe-client-gpui &
 sleep 2
 
 # Wait for the window to appear and give it time to render the snapshot.

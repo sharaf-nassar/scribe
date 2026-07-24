@@ -50,9 +50,11 @@ XVFB_PID=$!
 export DISPLAY=:99
 sleep 0.5
 
-# A window manager must own _NET_ACTIVE_WINDOW. Without one, the client's X11
-# focus guard (crates/scribe-client/src/x11_focus.rs) sees no active window and
-# suppresses ALL synthetic key input, so xdotool-driven visual tests can't type.
+# A window manager must own _NET_ACTIVE_WINDOW: the GPUI client's active-window
+# guard (mirroring crates/scribe-client/src/x11_focus.rs) suppresses synthetic
+# key input whenever that root property does not name our window, and only a WM
+# sets it under Xvfb. openbox also gives xdotool a real window to focus and
+# raise before scrot captures the frame.
 openbox &
 WM_PID=$!
 sleep 0.6
@@ -78,9 +80,11 @@ case "$VISUAL_APP" in
         if [ -n "${SCRIBE_EXTRA_CONFIG:-}" ]; then
             printf '%s\n' "$SCRIBE_EXTRA_CONFIG" > "$XDG_CONFIG_HOME/scribe/config.toml"
         fi
-        export WGPU_BACKEND=vulkan
+        # GPUI renders through blade/Vulkan; the Dockerfile pins
+        # VK_ICD_FILENAMES to lavapipe (software) so no GPU is required.
+        # LIBGL_ALWAYS_SOFTWARE keeps any GL fallback off hardware too.
         export LIBGL_ALWAYS_SOFTWARE=1
-        scribe-client &
+        scribe-client-gpui &
         APP_PID=$!
         wait_for_window "Scribe" 15 || true
         SESSION=$(scribe-test session create)
