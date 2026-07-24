@@ -21,6 +21,7 @@ path = "src/main.rs"
 alacritty_terminal_gpui = { package = "alacritty_terminal", git = "https://github.com/zed-industries/alacritty.git", rev = "4c129667" }
 gpui.workspace = true
 gpui_platform.workspace = true
+notify.workspace = true
 scribe-common.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -33,3 +34,4 @@ vte.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true

@@ -361,6 +361,12 @@ Because GPUI's `Keystroke` drops numeric-keypad location and a distinct unshifte
 
 IPC-sink and keybinding dispatch wiring land in later epic beads, so the encoder lives behind the crate's library surface (`lib.rs`) until then; the display-only binary spike does not yet consume it. The port is verified against the committed oracle (see [[client#Input#Mouse Reporting#GPUI Rebuild Golden Oracle]]) by a golden byte-capture test that replays every case in `tests/fixtures/gpui-client/keyboard-byte-golden.json`.
 
+### GPUI Keybindings Port
+
+The GPUI rebuild ports the keybinding parser and layout-action dispatch from the winit client, retargeted at GPUI's `Keystroke`/`Modifiers` via the intermediate [[crates/scribe-client-gpui/src/input.rs#KeyInput]], so no configured shortcut regresses at cutover.
+
+[[crates/scribe-client-gpui/src/keybindings.rs#Bindings]] parses every configurable action from [[crates/scribe-common/src/config.rs#KeybindingsConfig]] (invalid combos skipped with a warning). [[crates/scribe-client-gpui/src/keybindings.rs#Keybinding#parse]] reads the same combo vocabulary as [[crates/scribe-client/src/input.rs#Keybinding#parse]], mapping `cmd`/`super` onto GPUI's platform modifier, and [[crates/scribe-client-gpui/src/keybindings.rs#Keybinding#matches]] requires an exact modifier match (ignoring the GPUI function flag) on a key-down event, comparing characters against the unshifted base case-insensitively. [[crates/scribe-client-gpui/src/keybindings.rs#translate_key_action]] runs the legacy three-level intercept order — layout shortcuts, then command-palette/settings/find, then the seven fixed terminal-shortcut escape sequences — returning a [[crates/scribe-client-gpui/src/keybindings.rs#KeyAction]]; the generic byte encoder handles level 4 when it returns `None`. All 50+ [[crates/scribe-client-gpui/src/keybindings.rs#LayoutAction]] variants are enumerated one-for-one against the legacy tables.
+
 ### Layout Actions
 
 Over 50 variants in the `LayoutAction` enum covering pane, workspace, and tab management, clipboard, scrolling, zoom, and more.
@@ -927,6 +933,14 @@ AI panes persist `conversation_id` via hook events that include provider convers
 A file watcher in [[crates/scribe-client/src/config.rs#start_config_watcher]] monitors the active install flavor's config root.
 
 Stable installs watch `$XDG_CONFIG_HOME/scribe/` on Linux and `~/Library/Application Support/Scribe/` on macOS; `scribe-dev` uses the corresponding flavor-specific directory. The watcher forwards `ConfigChanged` through the event loop proxy for `config.toml`, theme changes, and on macOS the watched root directory itself, because the `notify` FSEvents backend may report only the directory that must be rescanned after a save. On reload the client reapplies the renderer theme when the preset name changes, when the inline `[theme]` values change under `custom`, and while an external theme file is selected so file edits repaint immediately.
+
+### GPUI Config Port
+
+The GPUI rebuild reproduces the config watcher and runtime-reload semantics against the frozen `scribe-common` config surface, keeping TOML format, flavor config dirs, inline `[theme]`, and removed-key tolerance identical to the winit client.
+
+[[crates/scribe-client-gpui/src/config.rs#start_config_watcher]] watches the active flavor's [[crates/scribe-common/src/app.rs#current_config_dir]] and invokes a caller-supplied closure (instead of a winit `EventLoopProxy`) on each relevant modify/create event; relevance is decided by [[crates/scribe-client-gpui/src/config.rs#is_relevant_config_event_path]], a byte-for-byte port of the legacy filter (`config.toml`, `themes/`, and the macOS FSEvents directory rescan). [[crates/scribe-client-gpui/src/config.rs#ClientConfig]] bundles the parsed [[crates/scribe-common/src/config.rs#ScribeConfig]], the resolved [[crates/scribe-common/src/theme.rs#Theme]] and its derived [[crates/scribe-common/src/theme.rs#ChromeColors]] (via [[crates/scribe-common/src/config.rs#resolve_theme]]), and the parsed [[crates/scribe-client-gpui/src/keybindings.rs#Bindings]].
+
+[[crates/scribe-client-gpui/src/config.rs#ClientConfig#reload]] swaps in a freshly parsed config and returns a [[crates/scribe-client-gpui/src/config.rs#ConfigReloadPlan]] naming which live surfaces changed — theme, font metrics, or opacity — mirroring the legacy `ConfigReloadPlan` heuristics ([[crates/scribe-client/src/main.rs#theme_reload_needed]], `font_params_changed`). Theme, chrome colors, and keybindings are always recomputed so a saved edit reapplies without a restart; the plan lets the caller skip redundant reapply work. Removed appearance keys deserialize inertly because `ScribeConfig` uses serde defaults and models no `deny_unknown_fields`, so the GPUI paint path never observes them.
 
 ## Search Overlay
 

@@ -31,7 +31,9 @@
 pub mod bell;
 pub mod box_drawing;
 pub mod color;
+pub mod config;
 pub mod input;
+pub mod keybindings;
 pub mod layout;
 pub mod mouse_reporting;
 pub mod mouse_state;
