@@ -53,12 +53,6 @@ impl CoalescedBatch {
         self.entries.is_empty()
     }
 
-    /// Number of distinct dirty panes in the batch.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     /// Iterates dirty panes in first-seen order with their concatenated bytes.
     pub fn iter(&self) -> impl Iterator<Item = (SessionId, &[u8])> {
         self.entries.iter().map(|(id, bytes)| (*id, bytes.as_slice()))
@@ -125,25 +119,45 @@ where
         let Some(first) = rx.recv().await else {
             return;
         };
-        let mut batch = Vec::with_capacity(MAX_BATCH_EVENTS);
-        batch.push(first);
-        let deadline = Instant::now() + BATCH_WINDOW;
-        while batch.len() < MAX_BATCH_EVENTS {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match timeout(remaining, rx.recv()).await {
-                Ok(Some(event)) => batch.push(event),
-                Ok(None) => {
-                    apply(coalesce(batch));
-                    return;
-                }
-                Err(_) => break,
-            }
-        }
+        let BatchWindow { batch, channel_closed } = collect_batch(first, &mut rx).await;
         apply(coalesce(batch));
+        if channel_closed {
+            return;
+        }
     }
+}
+
+/// A drained batch together with whether the channel closed while collecting it.
+pub struct BatchWindow {
+    /// Events folded into this batch, ready for [`coalesce`].
+    pub batch: Vec<InboundEvent>,
+    /// `true` when `rx` closed mid-collection, so the caller must stop after
+    /// applying this final batch.
+    pub channel_closed: bool,
+}
+
+/// Accumulates events into one 4 ms / 100-event batch window starting with
+/// `first`, so the coalescing bound is shared between [`run_drain`] and the
+/// synchronized-frame drain in `main.rs` rather than duplicated.
+pub async fn collect_batch(
+    first: InboundEvent,
+    rx: &mut UnboundedReceiver<InboundEvent>,
+) -> BatchWindow {
+    let mut batch = Vec::with_capacity(MAX_BATCH_EVENTS);
+    batch.push(first);
+    let deadline = Instant::now() + BATCH_WINDOW;
+    while batch.len() < MAX_BATCH_EVENTS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, rx.recv()).await {
+            Ok(Some(event)) => batch.push(event),
+            Ok(None) => return BatchWindow { batch, channel_closed: true },
+            Err(_) => break,
+        }
+    }
+    BatchWindow { batch, channel_closed: false }
 }
 
 /// The outbound writer channel closed before a message could be enqueued.

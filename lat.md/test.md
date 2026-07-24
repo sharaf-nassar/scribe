@@ -190,6 +190,38 @@ A `Resize` enqueued on the sink before a `KeyInput` is delivered first, since th
 
 `IpcSink::key_input` returns [[crates/scribe-client-gpui/src/ipc_bridge.rs#SinkClosed]] rather than panicking when the writer task has dropped its receiver.
 
+## GPUI Sync Frame Queue
+
+Unit tests for the ported [[client#GPUI Client Spike#IPC Bridge#Sync Frame Queueing]] — [[crates/scribe-client-gpui/src/sync_frames.rs#SyncFrameQueue]] sitting in front of [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#feed_output]] — proving `CSI ? 2026` commit boundaries survive IPC chunking and that expiry and catch-up match the winit client.
+
+### Splits committed burst across IPC boundaries
+
+A synchronized-update frame chunked across four IPC messages (BSU split mid-escape, body in two parts, ESU last) is reassembled by [[crates/scribe-client-gpui/src/sync_frames.rs#SyncFrameQueue#queue_output_frames]] into exactly one committed burst, so a single [[crates/scribe-client-gpui/src/sync_frames.rs#drain_all_committed]] hands the terminal the whole frame with its original markers intact.
+
+### Preserves per-commit boundaries
+
+A tail frame followed by two distinct sync commits drains as three separate frames, so each `CSI ? 2026` commit reaches `feed_output` as its own burst rather than being concatenated.
+
+### Presents one burst per redraw when caught up
+
+With a backlog below [[crates/scribe-client-gpui/src/sync_frames.rs#OUTPUT_FRAME_CATCH_UP_THRESHOLD]], [[crates/scribe-client-gpui/src/sync_frames.rs#drain_until_frame]] applies one committed burst then stops with [[crates/scribe-client-gpui/src/sync_frames.rs#QueueState]] `HasMore`, so light traffic animates incrementally one frame per redraw.
+
+### Drains through backlog past threshold
+
+Once the queue depth exceeds the catch-up threshold, a single `drain_until_frame` replays every backlogged burst to the latest frame and reports `Drained`, so stale frames never pile up under a firehose.
+
+### Flushes raw sync update on expiry
+
+An unterminated `CSI ? 2026 h` arms a 150 ms raw deadline via [[crates/scribe-client-gpui/src/sync_frames.rs#RAW_SYNC_TIMEOUT]]; [[crates/scribe-client-gpui/src/sync_frames.rs#SyncFrameQueue#flush_raw_timeout]] commits nothing before the deadline and, at it, appends the BSU-stripped bytes as a frame so the buffered output still reaches the terminal.
+
+### Flushes parser sync update on expiry
+
+A committed frame that opens but never closes a synchronized update arms the VTE parser's own timeout; [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#flush_parser_sync_timeout]] commits the held bytes at the deadline and clears the parser timeout.
+
+### Split sync frame reaches terminal whole
+
+Driving a four-way-split synchronized frame through the queue into a real [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal]] renders the committed content, proving the queue never advances the VTE processor with a torn frame.
+
 ## GPUI URL Detection
 
 Unit tests for the GPUI client's ported [[client#GPUI Client Spike#GPUI URL Detection Port]] scanner — [[crates/scribe-client-gpui/src/url_detect.rs#PaneUrlCache]] over Zed's Alacritty fork — proving byte-for-byte parity with the winit detector across hard-break joins and OSC 8 handling.
