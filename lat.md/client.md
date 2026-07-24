@@ -14,7 +14,15 @@ The scaffold spike (`crates/scribe-client-gpui`) proves GPUI can render a live S
 
 The spike adopts Zed's display-only terminal model: [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal]] owns an alacritty `Term` plus a VTE `Processor` and holds no PTY. Server bytes enter through [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#write_output]], which advances the processor and rebuilds an immutable `Content` grid snapshot. [[crates/scribe-client-gpui/src/terminal_element.rs#TerminalElement]] paints that snapshot as fixed-width GPUI rows.
 
-A background thread runs [[crates/scribe-client-gpui/src/main.rs#receive_one_pane]]: it connects to the live server socket, sends `Hello` + `ListSessions`, attaches the first live session, and feeds `PtyOutput` / `SessionReplay` / `ScreenSnapshot` bytes into the terminal. Each write bumps a shared generation counter; [[crates/scribe-client-gpui/src/main.rs#drive_redraws]] polls it on the GPUI foreground and calls `notify()` so the window repaints.
+A background thread runs [[crates/scribe-client-gpui/src/main.rs#run_connection]]: it connects to the live server socket, splits it into read/write halves, and queues `Hello` + `ListSessions`. [[crates/scribe-client-gpui/src/main.rs#run_reader]] attaches the first live session, then normalises `PtyOutput` / `SessionReplay` / `ScreenSnapshot` into raw output bytes (decompressing replays and converting snapshots off the drain) and forwards them as [[crates/scribe-client-gpui/src/ipc_bridge.rs#InboundEvent]]. Each coalesced batch bumps a shared generation counter; [[crates/scribe-client-gpui/src/main.rs#drive_redraws]] polls it on the GPUI foreground and calls `notify()` so the window repaints.
+
+### IPC Bridge
+
+The [[crates/scribe-client-gpui/src/ipc_bridge.rs]] module carries bytes both directions over the frozen IPC protocol without adding keystroke latency or frame tearing, mirroring Zed's terminal wakeup coalescing.
+
+Inbound: [[crates/scribe-client-gpui/src/ipc_bridge.rs#run_drain]] drains the [[crates/scribe-client-gpui/src/ipc_bridge.rs#InboundEvent]] channel with 4 ms / 100-event coalescing. [[crates/scribe-client-gpui/src/ipc_bridge.rs#coalesce]] collapses a drained run into one per-pane byte buffer in first-seen order ([[crates/scribe-client-gpui/src/ipc_bridge.rs#CoalescedBatch]]), so [[crates/scribe-client-gpui/src/main.rs#spawn_drain]] runs exactly one `write_output` and one repaint per dirty pane. Because output is normalised to bytes before it enters the channel, coalescing only ever concatenates.
+
+Outbound: [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink]] replaces Zed's `write_to_pty` path, enqueuing `ClientMessage::KeyInput` / `Resize` onto the ordered IPC-writer channel drained by [[crates/scribe-client-gpui/src/main.rs#run_writer]]. The sink is independent of the inbound drain, so a keystroke is never queued behind an output firehose; because the channel is a single FIFO, a `Resize` enqueued before a `KeyInput` reaches the server first. The GPUI view feeds the sink from [[crates/scribe-client-gpui/src/main.rs#TerminalView#on_key_down]] through an interim passthrough [[crates/scribe-client-gpui/src/main.rs#encode_key]] (superseded by the input-encoder port).
 
 ## App State
 
