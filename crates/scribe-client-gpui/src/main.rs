@@ -28,6 +28,9 @@ use scribe_client_gpui::command_palette::{
 use scribe_client_gpui::context_menu::{
     ContextMenuColors, ContextMenuEvent, ContextMenuRequest, ContextMenuView,
 };
+use scribe_client_gpui::dialog::{
+    AnyDialog, ClipboardDialog, CloseDialog, DialogColors, DialogEvent, DialogView,
+};
 use scribe_client_gpui::layout::Rect;
 use scribe_client_gpui::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
 use scribe_client_gpui::sys_stats::SystemStatsCollector;
@@ -131,6 +134,10 @@ struct TerminalView {
     command_palette: Option<Entity<CommandPaletteView>>,
     /// The right-click context menu overlay, present only while open.
     context_menu: Option<Entity<ContextMenuView>>,
+    /// The modal dialog overlay, present only while a modal is open. The spike
+    /// wires two representative dialogs (close + clipboard) so the visual E2E
+    /// can screenshot the ported modal chrome and its focus/button behaviour.
+    dialog: Option<Entity<DialogView>>,
     /// Demo toggle: when set, an OSC 8-style hover tooltip is drawn over a fixed
     /// anchor so the visual E2E can exercise tooltip clamping + URL truncation.
     tooltip_demo: bool,
@@ -166,6 +173,7 @@ impl TerminalView {
             chrome,
             command_palette: None,
             context_menu: None,
+            dialog: None,
             tooltip_demo: false,
             _refresh_task: refresh_task,
         }
@@ -214,12 +222,32 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Open a modal dialog, subscribing so a choice or a backdrop click tears the
+    /// overlay down. The other overlays are dismissed so only one modal is up.
+    fn open_dialog(&mut self, dialog: AnyDialog, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.context_menu = None;
+        let colors = DialogColors::from(&self.chrome);
+        let view = cx.new(|cx| DialogView::new(dialog, colors, cx));
+        cx.subscribe(&view, |this, _view, event: &DialogEvent, ctx| match event {
+            DialogEvent::Chosen(_) => {
+                this.dialog = None;
+                ctx.notify();
+            }
+        })
+        .detach();
+        self.dialog = Some(view);
+        cx.notify();
+    }
+
     /// Route a keystroke while an overlay owns the keyboard. Returns `true` when
     /// the key was consumed by an overlay (and must not reach the PTY).
     fn handle_overlay_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let mods = &event.keystroke.modifiers;
-        // Ctrl+Shift+P opens the palette; Ctrl+Shift+U toggles the tooltip demo.
-        if mods.control && mods.shift {
+        // Ctrl+Shift+P opens the palette; Ctrl+Shift+U toggles the tooltip demo;
+        // Ctrl+Shift+Q opens the close dialog; Ctrl+Shift+K opens the clipboard
+        // dialog (the two representative modals the visual E2E screenshots).
+        if mods.control && mods.shift && self.dialog.is_none() {
             match event.keystroke.key.as_str() {
                 "p" => {
                     self.open_command_palette(cx);
@@ -230,8 +258,38 @@ impl TerminalView {
                     cx.notify();
                     return true;
                 }
+                "q" => {
+                    self.open_dialog(AnyDialog::Close(CloseDialog::new(1)), cx);
+                    return true;
+                }
+                "k" => {
+                    self.open_dialog(
+                        AnyDialog::Clipboard(ClipboardDialog::new(
+                            scribe_common::protocol::PromptId(1),
+                            scribe_common::protocol::ClipboardOp::Write,
+                            scribe_common::protocol::ClipboardSelection::Clipboard,
+                            Some("export TOKEN=hunter2".to_owned()),
+                        )),
+                        cx,
+                    );
+                    return true;
+                }
                 _ => {}
             }
+        }
+
+        // A modal dialog owns the keyboard while it is up: Tab/Shift+Tab cycle
+        // focus, Enter activates the focused button, Esc dismisses (safe action).
+        if let Some(dialog) = self.dialog.clone() {
+            match event.keystroke.key.as_str() {
+                "escape" => dialog.update(cx, DialogView::dismiss),
+                "enter" => dialog.update(cx, DialogView::confirm),
+                "tab" if mods.shift => dialog.update(cx, DialogView::focus_prev),
+                "tab" | "right" => dialog.update(cx, DialogView::focus_next),
+                "left" => dialog.update(cx, DialogView::focus_prev),
+                _ => {}
+            }
+            return true;
         }
 
         let Some(palette) = self.command_palette.clone() else {
@@ -429,6 +487,7 @@ impl Render for TerminalView {
             .child(status_bar::render(&model, 24., &self.status_colors))
             .children(self.command_palette.clone())
             .children(self.context_menu.clone())
+            .children(self.dialog.clone())
             .children(tooltip)
     }
 }

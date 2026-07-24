@@ -428,6 +428,52 @@ Verifies [[crates/scribe-client-gpui/src/tooltip.rs#tooltip_y]] returns the anch
 
 Verifies [[crates/scribe-client-gpui/src/tooltip.rs#truncate_url]] returns short URIs unchanged, head+tail-elides an overflowing URI to exactly the budget with a middle `...`, falls back to a plain head cut at tiny budgets, and never splits a multibyte codepoint.
 
+## GPUI Dialogs
+
+The GPUI rebuild ports the winit client's five GPU-painted modals into display-independent state models plus one generic [[crates/scribe-client-gpui/src/dialog.rs#DialogView]] entity, replacing the winit `CellInstance` quad painters and pixel hit-testing with GPUI flex layout and `on_click` listeners.
+
+Each modal is one variant of [[crates/scribe-client-gpui/src/dialog.rs#AnyDialog]] — [[crates/scribe-client-gpui/src/dialog.rs#CloseDialog]] (quit / kill / cancel, warning about active sessions), [[crates/scribe-client-gpui/src/dialog.rs#UpdateDialog]] (install-available live-reload plus the restart-required helper cold-restart, built by [[crates/scribe-client-gpui/src/dialog.rs#UpdateDialog#new_install]] / [[crates/scribe-client-gpui/src/dialog.rs#UpdateDialog#new_restart_required]]), [[crates/scribe-client-gpui/src/dialog.rs#PasteConfirmationDialog]] (the spec-011 risky-paste gate), [[crates/scribe-client-gpui/src/dialog.rs#ClipboardDialog]] (the OSC 52 four-button policy prompt), and [[crates/scribe-client-gpui/src/dialog.rs#DisallowedSchemeDialog]] (the spec-009 OSC 8 out-of-allowlist prompt). Every model lowers to a [[crates/scribe-client-gpui/src/dialog.rs#DialogSpec]] (title, body lines, tone-tagged buttons, focused index) so parity is asserted without a live window, and keeps the winit **safe default focus** — Cancel / Later / Deny once — so [[crates/scribe-client-gpui/src/dialog.rs#AnyDialog#confirm]] on an unexpected prompt never performs the risky action.
+
+[[crates/scribe-client-gpui/src/dialog.rs#DialogView]] renders any spec onto a dimmed backdrop and a rounded, drop-shadowed box with a centred title, body, separator rule, and a button row whose accent / warm-red-destructive / subtle tones come from [[crates/scribe-client-gpui/src/dialog.rs#ButtonTone]] resolved against a theme-derived [[crates/scribe-client-gpui/src/dialog.rs#DialogColors]]. [[crates/scribe-client-gpui/src/dialog.rs#DialogView#focus_next]] / [[crates/scribe-client-gpui/src/dialog.rs#DialogView#focus_prev]] cycle focus, [[crates/scribe-client-gpui/src/dialog.rs#DialogView#confirm]] activates the focused button, [[crates/scribe-client-gpui/src/dialog.rs#DialogView#activate]] activates a clicked button, and [[crates/scribe-client-gpui/src/dialog.rs#DialogView#dismiss]] (Esc / backdrop) resolves to the safe [[crates/scribe-client-gpui/src/dialog.rs#AnyDialog#cancel]] action — each emitting a tagged [[crates/scribe-client-gpui/src/dialog.rs#DialogOutcome]] on [[crates/scribe-client-gpui/src/dialog.rs#DialogEvent]] for the shell to route. The paste gate reuses [[crates/scribe-client-gpui/src/paste.rs#classify_paste]] and renders the parked [[crates/scribe-client-gpui/src/paste.rs#ParkedPaste]] in caret notation so a control sequence in the preview can never drive the terminal (FR-005), returning it verbatim via [[crates/scribe-client-gpui/src/dialog.rs#PasteConfirmationDialog#into_parked_paste]] for byte-identical delivery.
+
+The spike wires two representative modals into [[crates/scribe-client-gpui/src/main.rs#TerminalView]] — Ctrl+Shift+Q opens the close dialog and Ctrl+Shift+K opens the clipboard dialog — so the visual E2E harness (`tests/e2e/visual/dialogs.sh`) can screenshot the modal chrome, the focus ring, and the tone-tagged buttons across the three- and four-button layouts.
+
+### Close dialog buttons and safe default
+
+Verifies [[crates/scribe-client-gpui/src/dialog.rs#CloseDialog]] renders Quit Scribe / Kill Window / Cancel with accent / danger / normal tones, focuses the safe Cancel by default, and shows the active-session-loss warning only when sessions are open.
+
+### Close dialog focus cycling maps to actions
+
+Verifies [[crates/scribe-client-gpui/src/dialog.rs#AnyDialog#focus_next]] / [[crates/scribe-client-gpui/src/dialog.rs#AnyDialog#focus_prev]] wrap across the three close buttons, that [[crates/scribe-client-gpui/src/dialog.rs#AnyDialog#action_at]] maps each index to its `CloseAction`, and that dismissal always resolves to Cancel.
+
+### Update dialog install and restart flows
+
+Verifies the install-available dialog titles "Update Available", defaults focus to the accent Update Now, and keeps live-reload copy, while the restart-required helper cold-restart titles "Restart Required" and offers Continue / Cancel.
+
+### Paste gate reason line distinguishes risk
+
+Verifies [[crates/scribe-client-gpui/src/dialog.rs#PasteConfirmationDialog]] derives the reason line for the multiline-only, control-only, and combined cases, defaults focus to Cancel, and offers Cancel / Paste.
+
+### Paste preview is caret-escaped
+
+Verifies the paste dialog body never contains a raw control byte (ESC renders as `^[`) and that [[crates/scribe-client-gpui/src/dialog.rs#PasteConfirmationDialog#into_parked_paste]] returns the parked text verbatim for byte-identical delivery.
+
+### Clipboard dialog four-button policy
+
+Verifies [[crates/scribe-client-gpui/src/dialog.rs#ClipboardDialog]] renders Deny once / Always deny / Allow once / Always allow with the two Allow variants tinted destructive, focuses the safe Deny once, maps each index to its policy action, and shows the write payload preview.
+
+### Disallowed scheme dialog truncation
+
+Verifies [[crates/scribe-client-gpui/src/dialog.rs#DisallowedSchemeDialog]] names the blocked scheme, head-and-tail-truncates a long URI while keeping both ends visible, defaults focus to Cancel, and preserves the full URI verbatim via [[crates/scribe-client-gpui/src/dialog.rs#DisallowedSchemeDialog#into_pending_uri]].
+
+### Dialog view confirms the focused button
+
+Verifies [[crates/scribe-client-gpui/src/dialog.rs#DialogView#focus_next]] followed by [[crates/scribe-client-gpui/src/dialog.rs#DialogView#confirm]] emits the newly focused button's [[crates/scribe-client-gpui/src/dialog.rs#DialogOutcome]] on [[crates/scribe-client-gpui/src/dialog.rs#DialogEvent]].
+
+### Dialog view click and dismissal resolve
+
+Verifies [[crates/scribe-client-gpui/src/dialog.rs#DialogView#activate]] emits the clicked button's outcome regardless of focus, and that [[crates/scribe-client-gpui/src/dialog.rs#DialogView#dismiss]] emits the safe cancel outcome for an Esc or backdrop click.
+
 ## App State
 
 The master application state lives in the App struct in [[crates/scribe-client/src/main.rs]]. It holds all panes, the window layout, IPC sender, input bindings, theme, AI tracker, GPU context, and UI overlay state. The event loop is driven by winit's `ApplicationHandler` trait.
