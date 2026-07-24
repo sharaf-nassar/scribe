@@ -6940,15 +6940,18 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "notify",
+ "raw-window-handle",
  "regex",
  "scribe-common",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
  "tracing",
  "unicode-width",
  "vte",
+ "x11rb",
 ]
 
 [[package]]

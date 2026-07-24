@@ -99,6 +99,18 @@ The GPUI rebuild ports the winit client's terminal interaction state — mouse s
 
 [[crates/scribe-client-gpui/src/search.rs#TerminalSearch]] cribs Zed's regex search: it collects every match across scrollback and the viewport through the fork's `RegexIter` and cycles a highlighted match forward ([[crates/scribe-client-gpui/src/search.rs#TerminalSearch#select_next]]) and backward ([[crates/scribe-client-gpui/src/search.rs#TerminalSearch#select_prev]]) with wraparound. [[crates/scribe-client-gpui/src/vi_mode.rs]] wraps the fork's built-in vi mode — [[crates/scribe-client-gpui/src/vi_mode.rs#toggle_vi_mode]], [[crates/scribe-client-gpui/src/vi_mode.rs#vi_motion]], and [[crates/scribe-client-gpui/src/vi_mode.rs#vi_cursor]] — so keyboard copy-mode navigation shares the selection coordinate space.
 
+### GPUI Platform Integrations Port
+
+OS-integration surfaces the GPUI client owns beyond the terminal grid: local server lifecycle, window geometry persistence, the X11 focus guard, and drag-drop path insertion — each a faithful port of the winit helper with a GPUI-native entry point.
+
+[[crates/scribe-client-gpui/src/server_lifecycle.rs#connect_or_start_server]] connects to the frozen local IPC socket, starting the systemd user service ([[crates/scribe-client-gpui/src/server_lifecycle.rs#platform_start_server]], which first syncs the GUI environment into the user manager) and waiting for it to accept. [[crates/scribe-client-gpui/src/server_lifecycle.rs#stale_server_reason]] is the pure decision that flags a connected server whose binary drifted (different path, or rebuilt after the process started); [[crates/scribe-client-gpui/src/server_lifecycle.rs#perform_linux_cold_restart]] is the last-ditch recovery that force-stops the unit and any surviving process, clears the stale IPC and handoff sockets, and starts a fresh server. macOS launchd support is deferred with the rest of the macOS port.
+
+[[crates/scribe-client-gpui/src/window_state.rs#WindowRegistry]] persists one [[crates/scribe-client-gpui/src/window_state.rs#WindowGeometry]] per window under `$XDG_STATE_HOME/scribe/windows/<id>.toml`. [[crates/scribe-client-gpui/src/window_state.rs#normalize_legacy_geometry]] is the first-launch geometry-compat step: geometry saved by the OS-decorated old client would restore mis-inset under the new custom titlebar, so it clamps the size and grows a non-maximized window's height by [[crates/scribe-client-gpui/src/window_state.rs#CUSTOM_TITLEBAR_HEIGHT]] once, recording `titlebar_normalized` so it never runs twice.
+
+[[crates/scribe-client-gpui/src/x11_focus.rs#X11FocusGuard]] polls `_NET_ACTIVE_WINDOW` and suppresses keystrokes while a compositor overlay obscures the window, reading GPUI's Xcb/Xlib window id via [[crates/scribe-client-gpui/src/x11_focus.rs#xcb_window_id]] (per the XID capability spike); non-X11 backends yield no id and leave the guard off. Its suppression timing lives in the pure [[crates/scribe-client-gpui/src/x11_focus.rs#ReactivationDebounce]] so it is testable without a display server.
+
+[[crates/scribe-client-gpui/src/drag_drop.rs#dropped_path_insertion]] quotes a dropped file path for the focused pane's shell via [[crates/scribe-client-gpui/src/drag_drop.rs#quote_path_for_shell]] (POSIX, fish, PowerShell, or nushell) and appends a trailing space; per FR-013 it bypasses the paste-confirmation gate because the path is already quoted.
+
 ## App State
 
 The master application state lives in the App struct in [[crates/scribe-client/src/main.rs]]. It holds all panes, the window layout, IPC sender, input bindings, theme, AI tracker, GPU context, and UI overlay state. The event loop is driven by winit's `ApplicationHandler` trait.

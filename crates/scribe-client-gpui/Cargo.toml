@@ -24,15 +24,23 @@ gpui_platform.workspace = true
 notify.workspace = true
 regex.workspace = true
 scribe-common.workspace = true
+# Window geometry persistence (window_state) serializes WindowGeometry to the
+# per-window state.toml files.
+serde.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tracing.workspace = true
 unicode-width = "0.2"
 vte.workspace = true
+
+# X11 focus guard: reads GPUI's Xcb/Xlib window id and polls _NET_ACTIVE_WINDOW.
+[target.'cfg(target_os = "linux")'.dependencies]
+raw-window-handle.workspace = true
+x11rb.workspace = true
 
 [dev-dependencies]
 # Pulls in gpui's headless TestAppContext / #[gpui::test] harness for the
 # layout entity suites without affecting the shipped client build.
 gpui = { workspace = true, features = ["test-support"] }
-serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true

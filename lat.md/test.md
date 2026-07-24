@@ -290,6 +290,110 @@ Unit tests for [[crates/scribe-client-gpui/src/smart_selection.rs#CompiledSmartS
 
 A rule whose regex fails to compile is recorded in [[crates/scribe-client-gpui/src/smart_selection.rs#CompiledSmartSelection]]'s `errors` rather than aborting compilation.
 
+## Drag-drop path insertion
+
+Unit tests for [[crates/scribe-client-gpui/src/drag_drop.rs#quote_path_for_shell]], the ported shell-aware quoting for dropped file paths, proving each shell's escaping and the trailing-space insertion payload match the legacy client byte-for-byte.
+
+### POSIX quoting escapes single quotes
+
+[[crates/scribe-client-gpui/src/drag_drop.rs#quote_posix_string]] wraps the path in single quotes and rewrites embedded quotes as `'"'"'`, leaving quote-free paths simply single-quoted.
+
+### Fish quoting escapes backslash and quote
+
+[[crates/scribe-client-gpui/src/drag_drop.rs#quote_fish_string]] escapes backslash and single-quote with a backslash inside the single-quoted string, matching fish's quoting rules.
+
+### PowerShell quoting doubles single quotes
+
+[[crates/scribe-client-gpui/src/drag_drop.rs#quote_powershell_string]] doubles each single quote inside the single-quoted string, the only escape PowerShell needs.
+
+### Nushell raw-string fencing
+
+[[crates/scribe-client-gpui/src/drag_drop.rs#quote_nushell_string]] uses a plain single-quoted string when no quote is present and otherwise emits a raw string, widening the `#` fence until it no longer collides with the path.
+
+### Shell dispatch selects quoter
+
+[[crates/scribe-client-gpui/src/drag_drop.rs#quote_path_for_shell]] routes to the fish, PowerShell, or nushell quoter by shell name and falls back to POSIX quoting for anything else.
+
+### Insertion appends trailing space
+
+[[crates/scribe-client-gpui/src/drag_drop.rs#dropped_path_insertion]] appends a single trailing space to the quoted path so the shell treats it as a complete, separated argument.
+
+## Window geometry compat
+
+Unit tests for [[crates/scribe-client-gpui/src/window_state.rs#normalize_legacy_geometry]], the first-launch geometry-compat normalization proving old-client window geometry restores correctly inset under the new custom titlebar. This is the scripted assertion required by the lifecycle acceptance criteria.
+
+### Legacy geometry gains titlebar inset
+
+An unnormalized legacy geometry grows in height by [[crates/scribe-client-gpui/src/window_state.rs#CUSTOM_TITLEBAR_HEIGHT]] so the terminal area below the in-window titlebar keeps its old size, while position and monitor survive unchanged.
+
+### Normalization is idempotent
+
+Running [[crates/scribe-client-gpui/src/window_state.rs#normalize_legacy_geometry]] a second time on already-normalized geometry returns it unchanged, so a save-and-reload never insets twice.
+
+### Maximized geometry keeps its size
+
+A maximized legacy geometry keeps its stored size (the compositor overrides it on restore) but is still marked normalized.
+
+### Out-of-range legacy size is clamped
+
+A hostile or corrupt oversized geometry is clamped into the accepted range so the restored window stays usable, satisfying [[crates/scribe-client-gpui/src/window_state.rs#geometry_size_is_sane]].
+
+### Default geometry is already normalized
+
+A freshly-created [[crates/scribe-client-gpui/src/window_state.rs#WindowGeometry]] is already in the new coordinate system, so normalization is a no-op on it.
+
+### Legacy TOML lacks the normalized flag
+
+A `state.toml` written by the old client has no `titlebar_normalized` key; it deserializes to `false` (via `serde(default)`) and therefore triggers the one-time normalization.
+
+### Sanity range rejects extremes
+
+[[crates/scribe-client-gpui/src/window_state.rs#geometry_size_is_sane]] rejects zero, too-small, and too-large edges and accepts the range boundaries.
+
+## X11 focus guard
+
+Unit tests for [[crates/scribe-client-gpui/src/x11_focus.rs#ReactivationDebounce]], the pure reactivation state machine backing the ported X11 focus guard, proving the suppression semantics that the visual E2E exercises against the live `_NET_ACTIVE_WINDOW`.
+
+### Inactive window suppresses input
+
+[[crates/scribe-client-gpui/src/x11_focus.rs#ReactivationDebounce#observe]] suppresses keyboard input whenever our window is not the active window (a compositor overlay is up).
+
+### Reactivation debounce suppresses stray keys
+
+After an inactive→active transition, `observe` keeps suppressing for [[crates/scribe-client-gpui/src/x11_focus.rs#REACTIVATION_DEBOUNCE]] so a stray keystroke that arrives as the overlay closes is caught, then resumes passing input once the window elapses.
+
+### Steady active window allows input
+
+A window that has been continuously active is never suppressed by `observe`.
+
+### Genuine focus event clears debounce
+
+[[crates/scribe-client-gpui/src/x11_focus.rs#ReactivationDebounce#clear]] drops the debounce on a real focus event (which overlays never send), so input flows immediately after a genuine refocus.
+
+### Poll transition arms debounce
+
+[[crates/scribe-client-gpui/src/x11_focus.rs#ReactivationDebounce#note_active]] arms the debounce when the periodic poll observes the inactive→active transition, so a key seen just afterward is still suppressed.
+
+## Server lifecycle
+
+Unit tests for [[crates/scribe-client-gpui/src/server_lifecycle.rs#stale_server_reason]], the pure staleness decision behind the ported local-server refresh path, proving path drift and rebuild detection without a live socket.
+
+### Path drift marks server stale
+
+A running server whose executable path differs from the installed binary is reported stale so the caller refreshes it.
+
+### Newer installed binary marks server stale
+
+A running server that started before the installed binary's modification time is reported stale (an in-place rebuild landed).
+
+### Matching fresh server is not stale
+
+A running server at the same path that started after the installed binary's modification time is not stale.
+
+### Unknown timestamps are not stale
+
+When neither the process start time nor the installed modification time is known, the server is treated as fresh rather than force-refreshed.
+
 ## GPUI Perf A/B Gate
 
 The launch-blocking performance comparison for the GPUI client rebuild. The `tools/perf-ab-rig/run-perf-ab.sh` rig compares the new client against the recorded old-client baselines and writes a per-metric pass/fail report.
