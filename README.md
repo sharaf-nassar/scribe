@@ -5,7 +5,7 @@
 <p align="center">A GPU-accelerated terminal emulator with a client-server architecture and first-class AI awareness.</p>
 
 <p align="center">
-  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0" /></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later" /></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.87%2B-orange" alt="Rust: 1.87+" /></a>
 </p>
 
@@ -257,4 +257,6 @@ The client sends `ClientMessage` (key input, resize, session operations) seriali
 
 ## License
 
-Scribe is dual-licensed under [MIT](https://opensource.org/licenses/MIT) and [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+Scribe is licensed under the [GNU General Public License, version 3 or
+later](LICENSE). See [NOTICE](NOTICE) for project, Zed, and GPUI
+attributions.
