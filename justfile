@@ -120,3 +120,7 @@ e2e: build-release docker-func
     just e2e-func func/reconnect.sh
     just e2e-func func/workspace-split.sh
     just e2e-func func/shell-integration.sh
+    just e2e-func func/hot-reload.sh
+    just e2e-func func/cold-restart.sh
+    just e2e-func func/failure-server-down.sh
+    just e2e-func func/failure-socket-loss.sh
