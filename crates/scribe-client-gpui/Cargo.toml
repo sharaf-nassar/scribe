@@ -27,5 +27,8 @@ tracing.workspace = true
 vte.workspace = true
 
 [dev-dependencies]
+# Pulls in gpui's headless TestAppContext / #[gpui::test] harness for the
+# layout entity suites without affecting the shipped client build.
+gpui = { workspace = true, features = ["test-support"] }
 serde.workspace = true
 serde_json.workspace = true

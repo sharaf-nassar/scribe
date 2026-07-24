@@ -102,6 +102,12 @@ deny = [
 unknown-registry = "deny"
 unknown-git = "deny"
 
+# gpui's `test-support` feature (dev-dependency of the GPUI client rebuild, used
+# by the layout `#[gpui::test]` suites) pulls a pinned proptest fork from the
+# proptest-rs org. The rev is locked in Cargo.lock; allow just this repo rather
+# than the whole org.
+allow-git = ["https://github.com/proptest-rs/proptest"]
+
 # The GPUI client rebuild consumes gpui (pinned zed rev) and its display-only
 # alacritty fork as git dependencies; gpui in turn pulls several Zed-maintained
 # forks (font-kit, scap, xim-rs) from the same org. Revisions are pinned in
