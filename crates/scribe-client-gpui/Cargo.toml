@@ -24,6 +24,7 @@ gpui_platform.workspace = true
 scribe-common.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+unicode-width = "0.2"
 vte.workspace = true
 
 [dev-dependencies]
