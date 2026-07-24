@@ -327,6 +327,11 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Config live reload | [[test#GPUI Client Headless Suites#Config live reload]] | `ConfigReloaded` live reload (scripted-E2E) |
 | URL/OSC8 detection | [[test#GPUI URL Detection]] | hover/dwell/open surface (gpui-test) |
 | IPC bridge ordering | [[test#GPUI IPC Bridge]] | Executor-model ordering risk (gpui-test) |
+| Remote connect picker | [[test#GPUI Client Headless Suites#GPUI remote connect picker]] | `ListRemotePeers`, `ListLanPeers`, `RemotePeerList` remote connect picker (gpui-test) |
+| Remote handshake | [[test#GPUI Client Headless Suites#GPUI remote handshake]] | `RemoteHandshake` preamble + dial-env spawn (gpui-test) |
+| Lost control banner | [[test#GPUI Client Headless Suites#GPUI lost control banner]] | `WindowTakenOver` displaced-client reclaim (gpui-test) |
+| LAN device approval | [[test#GPUI Client Headless Suites#GPUI LAN device approval]] | `LanApprovalRequest`/`LanApprovalDecision` prompt (gpui-test) |
+| Window sharing | [[test#GPUI Client Headless Suites#GPUI window sharing]] | `ShareRoster`, `ControlClaim`/`ControlRequest`/`ControlGrant` (gpui-test) |
 
 ### Coverage frontier
 
@@ -363,3 +368,33 @@ The test parses the removed-keys TOML into [[crates/scribe-common/src/config.rs#
 A scripted reload confirms that edits to theme, font, and keybindings reapply live without a restart, backing the `ConfigReloaded` parity row.
 
 Building a [[crates/scribe-client-gpui/src/config.rs#ClientConfig]] from an initial config and calling [[crates/scribe-client-gpui/src/config.rs#ClientConfig#reload]] with an edited config, the test asserts the returned [[crates/scribe-client-gpui/src/config.rs#ConfigReloadPlan]] flags the theme and font as changed, the resolved theme/chrome and font metrics actually updated, and the re-parsed [[crates/scribe-client-gpui/src/keybindings.rs#Bindings]] reflect the new combo. Companion cases assert an opacity-only edit is scoped to `opacity_changed` and an identical config reports no change.
+
+### GPUI remote connect picker
+
+Verifies the ported [[crates/scribe-client-gpui/src/remote.rs#RemoteConnect]] picker state machine — the transport-free core of the winit [[crates/scribe-client/src/remote_connect.rs#RemoteConnect]] — so the multi-machine connect flow behaves identically over the frozen IPC protocol.
+
+The suite drives [[crates/scribe-client-gpui/src/remote.rs#RemoteConnect#set_peers]] and [[crates/scribe-client-gpui/src/remote.rs#RemoteConnect#set_lan_peers]] to assert the tailnet/LAN merge: a dual-reachable machine collapses to one LAN-preferred row with an "also Tailscale" hint, an incompatible-version LAN peer is dropped, and online peers sort before offline. It then walks the step transitions through [[crates/scribe-client-gpui/src/remote.rs#RemoteConnect#handle_key]] — a manual `host:port` entry winning over the highlighted peer, a probe dialing over the row's transport, and the window step producing `Attach`/`NewWindow` [[crates/scribe-client-gpui/src/remote.rs#RemoteConnectAction]] intents with feature-015 share occupancy. Finally it checks the typed failure copy for tailnet/LAN refusals, the awaiting-approval overlay swap, and the [[crates/scribe-client-gpui/src/remote.rs#ReconnectOverlay]] key/click actions, all read back through the flattened [[crates/scribe-client-gpui/src/remote.rs#PickerView]].
+
+### GPUI remote handshake
+
+Exercises the ported dial preamble [[crates/scribe-client-gpui/src/remote_handshake.rs#perform_remote_handshake]] over an in-memory `tokio::io::duplex` pair against a scripted fake server, proving the frozen `RemoteHandshake` / `RemoteHandshakeReply` exchange maps to the right [[crates/scribe-client-gpui/src/remote.rs#RemoteConnectOutcome]].
+
+The scripted server reads the client's first frame, asserts it is a well-formed [[crates/scribe-common/src/protocol.rs#ClientMessage]] `RemoteHandshake` at the negotiated version, then replies: an accepted reply yields `Accepted`, a typed refusal propagates, a reason-less refusal and any non-reply frame and an EOF all merge into `ConnectionFailure`. Companion parser cases lock the [[crates/scribe-client-gpui/src/remote_handshake.rs#parse_dial_target]] grammar (`host`, `host:port`, bad-port fallback, bare IPv6 literal) and the `SCRIBE_REMOTE_WINDOW` / takeover-flag parsing without mutating process env.
+
+### GPUI lost control banner
+
+Confirms the ported [[crates/scribe-client-gpui/src/lost_control.rs#LostControlState]] — the transport-agnostic displaced-client state from the winit [[crates/scribe-client/src/lost_control.rs#LostControlState]] — names the new controller and gates reclaim to Enter only.
+
+The suite asserts [[crates/scribe-client-gpui/src/lost_control.rs#LostControlState#headline]] renders `Controlled by <device> (<account>)` and that reclaim fires on `Enter` while every other key stays suppressed, matching the FR-009b banner copy and one-action reclaim obligation.
+
+### GPUI LAN device approval
+
+Confirms the ported [[crates/scribe-client-gpui/src/lan_approval.rs#LanApprovalDialog]] state — the model half of the winit [[crates/scribe-client/src/lan_approval.rs#LanApprovalDialog]] — keeps the safe Decline-default focus and word-wraps the approval body.
+
+The suite asserts Decline is the initial focus (so an unexpected prompt never silently grants trust), that focus cycles between the two buttons, and that [[crates/scribe-client-gpui/src/lan_approval.rs#LanApprovalDialog#body_lines]] lists the requesting device, its trusted network, and its fingerprint words wrapped within the dialog width, adding the name-collision hint only when flagged.
+
+### GPUI window sharing
+
+Confirms the ported feature-015 sharing surfaces — [[crates/scribe-client-gpui/src/share.rs#ShareState]] and the control overlays from the winit [[crates/scribe-client/src/share_view.rs#ShareState]] — derive roster roles correctly and lower control passing onto the frozen v3 protocol.
+
+The suite checks roster-derived multi/holder/label state and [[crates/scribe-client-gpui/src/share.rs#participant_label]] formatting, the [[crates/scribe-client-gpui/src/share.rs#ControlHint]] expiry window, and that a viewer's take-control and a [[crates/scribe-client-gpui/src/share.rs#ControlRequestPrompt]] answer lower through [[crates/scribe-client-gpui/src/share.rs#ControlIntent]] to `ControlClaim` / `ControlRequest` / `ControlGrant` [[crates/scribe-common/src/protocol.rs#ClientMessage]] messages.
