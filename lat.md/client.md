@@ -280,6 +280,14 @@ Apps such as `less`, `vim`, `top`, and `htop` enable DECCKM via terminfo's `smkx
 
 Numeric-keypad keys (`KeyLocation::Numpad`) emit SS3 sequences when DECPAM is active and no modifier is held: digits `0..9` map to `\x1bOp..\x1bOy`, `.,-+*/=` map to `\x1bOn`/`\x1bOl`/`\x1bOm`/`\x1bOk`/`\x1bOj`/`\x1bOo`/`\x1bOX`, and numpad Enter maps to `\x1bOM`. [[crates/scribe-client/src/input.rs#translate_numpad_app_keypad]] runs ahead of the legacy / Kitty dispatch so the numpad table wins over the generic encoder for those events.
 
+### GPUI Input Encoder Port
+
+The GPUI rebuild reproduces the level-4 terminal byte encoder in [[crates/scribe-client-gpui/src/input.rs#encode]], byte-identical to the winit client's [[crates/scribe-client/src/input.rs#translate_key]] across legacy xterm, Kitty CSI-u, DECCKM, and DECPAM output.
+
+Because GPUI's `Keystroke` drops numeric-keypad location and a distinct unshifted base vs shifted glyph, the encoder consumes an intermediate [[crates/scribe-client-gpui/src/input.rs#KeyInput]] carrying the key token, base character, associated text, modifiers, [[crates/scribe-client-gpui/src/input.rs#KeyLocation]], and press/repeat/release state. [[crates/scribe-client-gpui/src/input.rs#KeyInput#from_key_down]] lowers a GPUI `KeyDownEvent` into that shape — numpad location is unavailable on that path, so callers with richer platform data set it directly. Negotiated Kitty flags travel through [[crates/scribe-client-gpui/src/input.rs#KittyFlags]] and the two DEC modes through [[crates/scribe-client-gpui/src/input.rs#TerminalMode]], mirroring the winit encoder's [[crates/scribe-client/src/input.rs#TerminalMode]].
+
+IPC-sink and keybinding dispatch wiring land in later epic beads, so the encoder lives behind the crate's library surface (`lib.rs`) until then; the display-only binary spike does not yet consume it. The port is verified against the committed oracle (see [[client#Input#Mouse Reporting#GPUI Rebuild Golden Oracle]]) by a golden byte-capture test that replays every case in `tests/fixtures/gpui-client/keyboard-byte-golden.json`.
+
 ### Layout Actions
 
 Over 50 variants in the `LayoutAction` enum covering pane, workspace, and tab management, clipboard, scrolling, zoom, and more.

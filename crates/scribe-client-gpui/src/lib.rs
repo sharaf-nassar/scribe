@@ -1,14 +1,17 @@
-//! Pure rendering logic for the GPUI Scribe client.
+//! Library surface of the GPUI Scribe client rebuild.
 //!
-//! This library crate holds the display-independent building blocks the GPUI
-//! paint path consumes: the xterm-256 [`palette`], terminal cell [`color`]
-//! semantics, and the procedural [`box_drawing`] rasterizer. Each module is
-//! ported byte-for-byte from the legacy `scribe-renderer` so terminal output
-//! stays identical across the cutover. The `scribe-client-gpui` binary
-//! (`main.rs`) owns the live IPC attach and GPUI window.
+//! Holds the display-independent building blocks the GPUI paint path consumes
+//! — the xterm-256 [`palette`], terminal cell [`color`] semantics, and the
+//! procedural [`box_drawing`] rasterizer — alongside the terminal [`input`]
+//! byte encoder. Each module is ported byte-for-byte from the legacy client so
+//! terminal output stays identical across the cutover. Consumers that wire
+//! these into the live GPUI view (IPC sink, keybinding dispatch) land in later
+//! beads of the `gpui-client-rebuild` epic; the `scribe-client-gpui` binary
+//! (`main.rs`) remains the display-only scaffold spike until then.
 
 pub mod box_drawing;
 pub mod color;
+pub mod input;
 pub mod palette;
 
 /// Assert two linear RGBA colours are bit-for-bit identical.
