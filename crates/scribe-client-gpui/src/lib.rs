@@ -40,6 +40,7 @@
 //! epic; the `scribe-client-gpui` binary (`main.rs`) remains the display-only
 //! scaffold spike until then.
 
+pub mod ai_indicator;
 pub mod animation;
 pub mod bell;
 pub mod box_drawing;
@@ -62,6 +63,7 @@ pub mod palette;
 pub mod pane_tree;
 pub mod paste;
 pub mod preedit;
+pub mod prompt_bar;
 pub mod remote;
 pub mod remote_handshake;
 pub mod search;
