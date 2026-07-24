@@ -106,6 +106,12 @@ Line segments are decoded into four directional segments (up, down, left, right)
 
 Block elements use direct rectangle fills for halves, eighths, quarters, and shade characters with variable alpha.
 
+### GPUI Box-Drawing Overlay
+
+The GPUI client rebuild will render procedural box drawing through a paint-quad overlay rather than the text system, retaining edge-to-edge coverage regardless of font availability.
+
+[[crates/scribe-renderer/src/box_drawing.rs#is_box_drawing]] selects U+2500–U+259F cells for the overlay. `TerminalElement` will convert the existing rasterizer alpha mask into foreground-coloured quads after cell backgrounds and before normal shaped text; `specs/016-gpui-client-rebuild/spikes/box-drawing-rendering.md` records the capability spike.
+
 ## Render Pipeline
 
 The [[crates/scribe-renderer/src/pipeline.rs#TerminalPipeline]] is a wgpu render pipeline drawing instanced quads.
