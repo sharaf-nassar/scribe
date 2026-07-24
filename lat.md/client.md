@@ -2,7 +2,19 @@
 
 The scribe-client is a GPU-accelerated terminal frontend built with winit for windowing and wgpu for rendering.
 
+The parallel [[crates/scribe-client-gpui/src/main.rs]] spike opens one GPUI
+window and renders one live display-only terminal from the unchanged local IPC
+protocol. It remains separate until the GPUI rebuild launch gate.
+
 The GPUI rebuild keeps `appearance.opacity`: [[tools/gpui-window-opacity-spike/src/main.rs]] proves that the pinned GPUI revision opens a transparent Wayland/X11 surface and repaints root alpha live. The decision is recorded in `specs/016-gpui-client-rebuild/spikes/window-opacity-wayland-x11.md`.
+
+## GPUI Client Spike
+
+The scaffold spike (`crates/scribe-client-gpui`) proves GPUI can render a live Scribe pane over the frozen IPC protocol. It builds against the pinned gpui/alacritty revisions and stays a separate crate until the rebuild launch gate.
+
+The spike adopts Zed's display-only terminal model: [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal]] owns an alacritty `Term` plus a VTE `Processor` and holds no PTY. Server bytes enter through [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#write_output]], which advances the processor and rebuilds an immutable `Content` grid snapshot. [[crates/scribe-client-gpui/src/terminal_element.rs#TerminalElement]] paints that snapshot as fixed-width GPUI rows.
+
+A background thread runs [[crates/scribe-client-gpui/src/main.rs#receive_one_pane]]: it connects to the live server socket, sends `Hello` + `ListSessions`, attaches the first live session, and feeds `PtyOutput` / `SessionReplay` / `ScreenSnapshot` bytes into the terminal. Each write bumps a shared generation counter; [[crates/scribe-client-gpui/src/main.rs#drive_redraws]] polls it on the GPUI foreground and calls `notify()` so the window repaints.
 
 ## App State
 

@@ -22,6 +22,9 @@ allow = [
   "CC0-1.0",
   "MPL-2.0",
   "BSL-1.0",
+  # libbz2-rs-sys (pure-Rust libbz2) ships the permissive bzip2/libbzip2 license;
+  # pulled transitively via bzip2 -> compression-codecs by gpui's http_client.
+  "bzip2-1.0.6",
 ]
 
 [licenses.private]
@@ -68,6 +71,19 @@ ignore = [
   # paste unmaintained/archived, no safe upgrade — compile-time proc-macro,
   # transitive via netdev (LAN trusted-network fingerprint, feature 014)
   "RUSTSEC-2024-0436", # paste
+  # Owner: Scribe maintainers. Review by 2026-10-01 or when gpui's usvg/resvg
+  # (SVG icon rasterization) move off rustybuzz to harfrust.
+  # rustybuzz unmaintained, no safe upgrade — transitive via gpui (usvg/resvg)
+  # for the pinned zed revision; used only for static SVG shaping, not untrusted
+  # input.
+  "RUSTSEC-2026-0206", # rustybuzz
+  # Owner: Scribe maintainers. Review by 2026-10-01 or when the gpui pin moves to
+  # patched transitive versions.
+  # The following are all pulled transitively by the pinned gpui git dependency
+  # for the scribe-client-gpui rebuild spike:
+  "RUSTSEC-2026-0190", # anyhow — Error::downcast_mut() unsoundness (via gpui)
+  "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained (build-time proc-macro)
+  "RUSTSEC-2026-0097", # rand — unsoundness with a custom logger using rng()
 ]
 
 [bans]
@@ -85,3 +101,11 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+# The GPUI client rebuild consumes gpui (pinned zed rev) and its display-only
+# alacritty fork as git dependencies; gpui in turn pulls several Zed-maintained
+# forks (font-kit, scap, xim-rs) from the same org. Revisions are pinned in
+# Cargo.toml / the crate manifest and Cargo.lock. Allow the zed-industries org
+# rather than enumerating each fork so a gpui-pin bump does not silently break.
+[sources.allow-org]
+github = ["zed-industries"]
