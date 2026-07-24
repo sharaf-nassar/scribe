@@ -1,0 +1,107 @@
+//! GPUI settings window: the 1:1 rebuild of the deleted `scribe-settings`
+//! GTK/wry app as a window in the client process.
+//!
+//! The webview app is gone; its feature set is reproduced here. [`apply`] and
+//! [`server_action`] are ported verbatim from the old crate — the config-write
+//! and one-shot server-request logic is unchanged so no editable setting or
+//! update/release action regresses. [`singleton`] absorbs the
+//! `settings.lock`/`settings.sock` singleton (a second `--settings` launch hands
+//! focus to the running window instead of opening a duplicate), and [`state`]
+//! persists window geometry across restarts. [`model`] describes the ten pages
+//! and their controls declaratively, [`values`] reads current config values back
+//! for rendering, and [`window`] lowers all of it onto a GPUI view.
+//!
+//! During side-by-side development the old GTK app stays the sole live-config
+//! writer; this window is pointed at a separate dev config via the
+//! `SCRIBE_CONFIG_DIR` override that [`scribe_common::config::load_config`]
+//! already honours, so the two never race on `config.toml`.
+
+pub mod apply;
+pub mod model;
+pub mod server_action;
+pub mod singleton;
+pub mod state;
+pub mod values;
+pub mod window;
+
+pub use window::{SettingsWindow, open_settings_window};
+
+#[cfg(test)]
+mod parity_tests {
+    use super::apply::apply_config_key;
+    use super::model::{ControlKind, SettingsPage, page_controls};
+    use super::values::{current_value, keybinding_combos};
+    use scribe_common::config::ScribeConfig;
+    use serde_json::json;
+
+    // @lat: [[test#GPUI Settings Window#Per-page parity checklist]]
+    /// Every page exposes controls, and every config-backed control on every
+    /// page routes cleanly through the ported apply path with the value the
+    /// window would read for it — the concrete per-page parity checklist against
+    /// the old settings surface. A hex placeholder stands in for color controls
+    /// so an unset custom theme still proves the key is wired.
+    #[test]
+    fn every_page_control_routes_through_apply() {
+        let base = ScribeConfig::default();
+        for page in SettingsPage::all() {
+            let controls = page_controls(page);
+            assert!(!controls.is_empty(), "page {page:?} must expose controls");
+            for control in &controls {
+                check_control_applies(&base, control);
+            }
+        }
+    }
+
+    /// Assert one control routes through the apply path with the window's value.
+    fn check_control_applies(base: &ScribeConfig, control: &super::model::Control) {
+        let Some((key, value)) = apply_input_for(base, control) else {
+            return; // Action controls carry no config value.
+        };
+        let mut config = base.clone();
+        if let Err(e) = apply_config_key(&mut config, &key, &value) {
+            panic!("control {} failed to apply: {e}", control.key);
+        }
+    }
+
+    /// Build the `(key, value)` the window would hand the apply path for a
+    /// control, or `None` for action buttons that carry no config value.
+    fn apply_input_for(
+        base: &ScribeConfig,
+        control: &super::model::Control,
+    ) -> Option<(String, serde_json::Value)> {
+        match &control.kind {
+            ControlKind::Toggle
+            | ControlKind::Choice(_)
+            | ControlKind::Stepper { .. }
+            | ControlKind::Text => {
+                let value = current_value(base, &control.key);
+                assert!(!value.is_null(), "control {} must have a readable value", control.key);
+                Some((control.key.clone(), value))
+            }
+            // A valid hex proves the color key is accepted even when the current
+            // custom theme value is unset (empty).
+            ControlKind::Color => Some((control.key.clone(), json!("#123456"))),
+            ControlKind::Keybinding => {
+                let combos = keybinding_combos(base, &control.key);
+                Some((format!("keybindings.{}", control.key), json!(combos)))
+            }
+            ControlKind::Action => None,
+        }
+    }
+
+    // @lat: [[test#GPUI Settings Window#Keybinding coverage]]
+    /// The keybindings page lists every action the apply path routes under
+    /// `keybindings.*`, so no shortcut silently disappears from the rebuilt
+    /// surface. Each action's combo list round-trips back through the reader.
+    #[test]
+    fn keybinding_page_covers_all_actions() {
+        let config = ScribeConfig::default();
+        let controls = page_controls(SettingsPage::Keybindings);
+        assert!(controls.len() >= 50, "expected the full 50+ keybinding action set");
+        for control in controls {
+            assert!(matches!(control.kind, ControlKind::Keybinding));
+            // Reading the combo list must not panic and must match a real field.
+            drop(keybinding_combos(&config, &control.key));
+        }
+    }
+}

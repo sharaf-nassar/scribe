@@ -1,0 +1,260 @@
+//! Settings process singleton enforcement.
+//!
+//! Uses a Unix domain socket for singleton detection and a `flock` advisory
+//! lock to prevent TOCTOU races during the bind-or-connect sequence.
+
+use std::io::{BufRead as _, Read as _, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+
+use scribe_common::settings_window::{SettingsWindowAnchor, SettingsWindowCommand};
+use scribe_common::socket::{settings_lock_path, settings_socket_path};
+
+const MAX_COMMAND_LINE_BYTES: usize = 4096;
+
+/// Result of attempting to become the singleton settings process.
+pub enum SingletonResult {
+    /// We are the singleton. The listener is ready to accept focus commands.
+    /// The caller must keep the `lock_file` guard alive to hold the flock.
+    Primary {
+        listener: UnixListener,
+        socket_path: PathBuf,
+        lock_file: nix::fcntl::Flock<std::fs::File>,
+    },
+    /// Another instance is already running and was told to focus.
+    AlreadyRunning,
+}
+
+/// Attempt to become the singleton settings process.
+///
+/// Acquires an advisory flock, then tries to bind the socket. If another
+/// instance holds the socket, sends it a focus command and returns
+/// `AlreadyRunning`.
+pub fn acquire(anchor: Option<SettingsWindowAnchor>) -> Result<SingletonResult, String> {
+    acquire_at(&settings_lock_path(), settings_socket_path(), anchor)
+}
+
+/// Core singleton acquisition against explicit lock/socket paths.
+///
+/// [`acquire`] delegates here with the real
+/// [`settings_lock_path`]/[`settings_socket_path`]. Splitting the path
+/// resolution out lets the focus-handoff test drive the bind-or-connect
+/// sequence against a throwaway temp socket instead of the live per-user
+/// runtime socket, so it stays deterministic and never collides with a running
+/// client.
+pub fn acquire_at(
+    lock_path: &Path,
+    socket_path: PathBuf,
+    anchor: Option<SettingsWindowAnchor>,
+) -> Result<SingletonResult, String> {
+    // Ensure the parent directory exists with 0o700 permissions.
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create socket dir: {e}"))?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("failed to set socket dir permissions: {e}"))?;
+    }
+
+    // Acquire advisory flock to serialise the bind-or-connect sequence.
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|e| format!("failed to open lock file: {e}"))?;
+
+    let lock_file = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, e)| format!("flock failed: {e}"))?;
+
+    // Try to bind the socket.
+    match try_bind(&socket_path) {
+        Ok(listener) => Ok(SingletonResult::Primary { listener, socket_path, lock_file }),
+        Err(_bind_err) => {
+            // Socket exists — try to connect and send focus.
+            if send_focus_to_existing(&socket_path, anchor) {
+                Ok(SingletonResult::AlreadyRunning)
+            } else {
+                // Stale socket — remove and retry.
+                drop(std::fs::remove_file(&socket_path));
+                let listener = try_bind(&socket_path)
+                    .map_err(|e| format!("failed to bind after stale removal: {e}"))?;
+                Ok(SingletonResult::Primary { listener, socket_path, lock_file })
+            }
+        }
+    }
+}
+
+/// Try to bind the Unix socket. Sets permissions to 0o600.
+fn try_bind(socket_path: &std::path::Path) -> Result<UnixListener, std::io::Error> {
+    let listener = UnixListener::bind(socket_path)?;
+    listener.set_nonblocking(true)?;
+
+    // Set socket file permissions to 0o600 (defense-in-depth).
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+
+    Ok(listener)
+}
+
+/// Try to connect to an existing settings process and send focus command.
+fn send_focus_to_existing(
+    socket_path: &std::path::Path,
+    anchor: Option<SettingsWindowAnchor>,
+) -> bool {
+    let Ok(mut stream) = UnixStream::connect(socket_path) else {
+        return false;
+    };
+    write_command(&mut stream, &SettingsWindowCommand::focus(anchor)).is_ok()
+}
+
+/// Write a singleton command as a newline-terminated JSON payload.
+pub fn write_command(
+    stream: &mut UnixStream,
+    command: &SettingsWindowCommand,
+) -> std::io::Result<()> {
+    let payload = serde_json::to_vec(command)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    stream.write_all(&payload)?;
+    stream.write_all(b"\n")
+}
+
+/// Check if an incoming connection is from the same UID.
+///
+/// Linux: `SO_PEERCRED` via nix. macOS: `getpeereid()` via nix.
+/// Returns `false` if credentials cannot be retrieved or the UID does not match.
+pub fn verify_peer_uid(stream: &UnixStream) -> bool {
+    let peer_uid = match get_peer_uid(stream) {
+        Ok(uid) => uid,
+        Err(e) => {
+            tracing::warn!("failed to get peer credentials: {e}");
+            return false;
+        }
+    };
+    let expected = scribe_common::socket::current_uid();
+    if peer_uid != expected {
+        tracing::warn!(peer_uid, expected, "rejected settings connection from different UID");
+        return false;
+    }
+    true
+}
+
+/// Linux: use `SO_PEERCRED` via nix `getsockopt`.
+#[cfg(target_os = "linux")]
+fn get_peer_uid(stream: &UnixStream) -> Result<u32, String> {
+    let cred = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map_err(|e| format!("getsockopt(SO_PEERCRED) failed: {e}"))?;
+    Ok(cred.uid())
+}
+
+/// macOS: use nix's safe `getpeereid()` wrapper.
+#[cfg(not(target_os = "linux"))]
+fn get_peer_uid(stream: &UnixStream) -> Result<u32, String> {
+    nix::unistd::getpeereid(stream)
+        .map(|(uid, _gid)| uid.as_raw())
+        .map_err(|e| format!("getpeereid failed: {e}"))
+}
+
+/// Parse a command from a connected client.
+///
+/// Reads a single newline-terminated JSON line and returns the `cmd` field.
+pub fn read_command(stream: &UnixStream) -> Option<SettingsWindowCommand> {
+    // Set a short read timeout to avoid blocking the GTK loop.
+    drop(stream.set_read_timeout(Some(std::time::Duration::from_millis(100))));
+
+    let mut reader = std::io::BufReader::new(stream.take((MAX_COMMAND_LINE_BYTES + 1) as u64));
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return None;
+    }
+    if line.len() > MAX_COMMAND_LINE_BYTES {
+        tracing::warn!("settings singleton command exceeded size limit");
+        return None;
+    }
+
+    serde_json::from_str::<SettingsWindowCommand>(line.trim()).ok()
+}
+
+/// Cleanup: remove the socket file.
+pub fn cleanup_socket(socket_path: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(socket_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %socket_path.display(), "failed to remove settings socket: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The singleton focus-handoff contract: the first `acquire_at` becomes the
+    /// `Primary` and binds the socket; a second `acquire_at` against the same
+    /// paths finds the live socket, sends a `focus` command carrying the launch
+    /// anchor, and returns `AlreadyRunning`. The primary then accepts the
+    /// connection, verifies the peer UID, and reads back exactly that focus
+    /// command — proving the second launch hands focus to the running window
+    /// instead of opening a duplicate.
+    #[test]
+    fn focus_handoff_routes_second_launch_to_primary() {
+        let dir = std::env::temp_dir()
+            .join(format!("scribe-gpui-settings-singleton-{}", std::process::id()));
+        drop(std::fs::create_dir_all(&dir));
+        let lock_path = dir.join("settings.lock");
+        let socket_path = dir.join("settings.sock");
+        drop(std::fs::remove_file(&socket_path));
+
+        let anchor = SettingsWindowAnchor { x: 12, y: 34, width: 800, height: 600 };
+
+        let primary = acquire_at(&lock_path, socket_path.clone(), None)
+            .expect("first acquire should become primary");
+        let listener = match primary {
+            SingletonResult::Primary { listener, lock_file, .. } => {
+                // The exclusive flock only serialises the bind-or-connect race;
+                // the bound socket is the real singleton guard. Release it here
+                // so the second in-process acquire does not block on the
+                // exclusive lock the primary would otherwise hold for its
+                // lifetime (two separate open descriptions cannot both hold
+                // LOCK_EX). The listener keeps the socket bound.
+                drop(lock_file);
+                listener
+            }
+            SingletonResult::AlreadyRunning => panic!("first acquire must be primary"),
+        };
+
+        // A second launch must detect the live socket and hand off focus.
+        let second = acquire_at(&lock_path, socket_path.clone(), Some(anchor))
+            .expect("second acquire should succeed");
+        assert!(
+            matches!(second, SingletonResult::AlreadyRunning),
+            "second acquire must return AlreadyRunning after sending focus"
+        );
+
+        // The primary accepts the handoff connection and reads the focus command.
+        // The listener is non-blocking; spin briefly for the pending connection.
+        let mut accepted = None;
+        for _ in 0..100 {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accepted = Some(stream);
+                    break;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        }
+        let stream = accepted.expect("primary should accept the handoff connection");
+        assert!(verify_peer_uid(&stream), "handoff peer must be the same UID");
+
+        let command = read_command(&stream).expect("primary should read a focus command");
+        assert_eq!(command.cmd, "focus", "handoff command must be a focus request");
+        let received = command.anchor.expect("focus command must carry the launch anchor");
+        assert_eq!(received.x, anchor.x);
+        assert_eq!(received.y, anchor.y);
+        assert_eq!(received.width, anchor.width);
+        assert_eq!(received.height, anchor.height);
+
+        cleanup_socket(&socket_path);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+}
