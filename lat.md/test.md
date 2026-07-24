@@ -230,6 +230,9 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Pane split-tree logic | [[test#GPUI Client Headless Suites#Pane split-tree logic]] | Input/keybinding "Pane layout" (gpui-test) |
 | Workspace tree entity ops | [[client#GPUI Client Spike#GPUI Layout Entities#Workspace Tree Model]] | `CreateWorkspace`, `MoveSession`, `ReportWorkspaceTree` (gpui-test) |
 | Input byte encoder golden | [[client#Input#GPUI Input Encoder Port]] | `KeyInput`, Terminal shortcuts (golden) |
+| Keybindings dispatch | [[test#GPUI Client Headless Suites#GPUI keybindings dispatch]] | Pane/Workspace/Tab/Navigation/View keybinding actions (gpui-test) |
+| Config load with removed keys | [[test#GPUI Client Headless Suites#Config load with removed keys]] | "Removed configuration keys" rows (gpui-test) |
+| Config live reload | [[test#GPUI Client Headless Suites#Config live reload]] | `ConfigReloaded` live reload (scripted-E2E) |
 | URL/OSC8 detection | [[test#GPUI URL Detection]] | hover/dwell/open surface (gpui-test) |
 | IPC bridge ordering | [[test#GPUI IPC Bridge]] | Executor-model ordering risk (gpui-test) |
 
@@ -242,7 +245,6 @@ Pending headless suites and the parity rows they will satisfy:
 - Selection model (cell/word/line, WRAPLINE) — terminal selection surface.
 - Sync-frame queueing + 150 ms expiry — CSI-2026 burst preservation.
 - Replay application — `SessionReplay` reconnect restore.
-- Config load with removed keys — the "Removed configuration keys" rows (`appearance.splash`, `scrollbar_*`, `prompt_bar_*`; silently ignored).
 - Reconnect topology rebuild — `WorkspaceInfo` layout restore beyond the existing [[client#GPUI Client Spike#GPUI Layout Entities#Workspace Tree Model]] `from_tree` path.
 - Degraded/failure paths — server-down at launch, socket vanish mid-session, adoption failure, replay decode failure (pane error state, no crash), reconnect retry/timeout.
 
@@ -251,3 +253,21 @@ Pending headless suites and the parity rows they will satisfy:
 The pure [[crates/scribe-client-gpui/src/layout.rs#LayoutTree]] split-tree drives the "Pane layout" keybinding actions (`close_pane`, `cycle_pane`, `focus_left`/`right`/`up`/`down`) beneath the [[client#GPUI Client Spike#GPUI Layout Entities#Pane Tree Model]] entity wrapper, so its navigation and mutation logic is asserted directly without a GPUI context.
 
 Over a 2x2 pane grid the suite exercises the surface the entity tests do not reach directly: [[crates/scribe-client-gpui/src/layout.rs#LayoutTree#find_pane_in_direction]] resolves a direct neighbor on all four axes and wraps to the opposite edge along the same column when none exists; [[crates/scribe-client-gpui/src/layout.rs#LayoutTree#next_pane]] cycles panes in depth-first order and wraps past the last leaf; [[crates/scribe-client-gpui/src/layout.rs#LayoutTree#swap_panes]] exchanges two leaf positions; and [[crates/scribe-client-gpui/src/layout.rs#LayoutTree#close_pane]] promotes a closed pane's sibling while refusing to remove the sole remaining leaf.
+
+### GPUI keybindings dispatch
+
+Verifies the ported [[crates/scribe-client-gpui/src/keybindings.rs#Bindings]] parser and [[crates/scribe-client-gpui/src/keybindings.rs#translate_key_action]] dispatch so no configured shortcut regresses across the GPUI cutover.
+
+Driving each action from its default binding, the suite asserts every one of the 50+ [[crates/scribe-client-gpui/src/keybindings.rs#LayoutAction]] variants resolves to its named value, that command-palette/settings/find produce the right [[crates/scribe-client-gpui/src/keybindings.rs#KeyAction]], and that the seven terminal shortcuts emit their fixed escape sequences. It also checks combo parsing (`cmd`/`super` → platform modifier, named keys, rejected garbage), exact-modifier matching that ignores the GPUI function flag and is case-insensitive on the base character, key-down-only gating (press and repeat match, release does not), and that invalid combos are skipped without aborting the parse.
+
+### Config load with removed keys
+
+Confirms a config carrying every removed appearance key deserializes without error and leaves the GPUI-consumed surface intact, satisfying the parity inventory's "Removed configuration keys" rows.
+
+The test parses the removed-keys TOML into [[crates/scribe-common/src/config.rs#ScribeConfig]], asserts the live appearance fields (font, font size, theme) parsed correctly, then resolves the full [[crates/scribe-client-gpui/src/config.rs#ClientConfig]] snapshot and checks the theme, derived chrome colors, and parsed bindings all populate — proving the removed keys are inert and never reach the paint path.
+
+### Config live reload
+
+A scripted reload confirms that edits to theme, font, and keybindings reapply live without a restart, backing the `ConfigReloaded` parity row.
+
+Building a [[crates/scribe-client-gpui/src/config.rs#ClientConfig]] from an initial config and calling [[crates/scribe-client-gpui/src/config.rs#ClientConfig#reload]] with an edited config, the test asserts the returned [[crates/scribe-client-gpui/src/config.rs#ConfigReloadPlan]] flags the theme and font as changed, the resolved theme/chrome and font metrics actually updated, and the re-parsed [[crates/scribe-client-gpui/src/keybindings.rs#Bindings]] reflect the new combo. Companion cases assert an opacity-only edit is scoped to `opacity_changed` and an identical config reports no change.
