@@ -111,6 +111,14 @@ OS-integration surfaces the GPUI client owns beyond the terminal grid: local ser
 
 [[crates/scribe-client-gpui/src/drag_drop.rs#dropped_path_insertion]] quotes a dropped file path for the focused pane's shell via [[crates/scribe-client-gpui/src/drag_drop.rs#quote_path_for_shell]] (POSIX, fish, PowerShell, or nushell) and appends a trailing space; per FR-013 it bypasses the paste-confirmation gate because the path is already quoted.
 
+### GPUI Animation System
+
+The GPUI client centralises UI motion policy so every shell transition (tab, focus, overlay) and smooth scroll resolves from one place, with a sanctioned off switch for latency purists and deterministic screenshots.
+
+[[crates/scribe-client-gpui/src/animation.rs#AnimationSettings]] resolves the policy from two inputs: the `appearance.animations` config bool (default `true`, added to the frozen [[crates/scribe-common/src/config.rs#AppearanceConfig]], doubling as the reduce-motion user setting) and the `SCRIBE_DISABLE_ANIMATIONS` environment override, which wins when truthy so E2E runs can force motion off. This is the sanctioned exception to the "no new end-user features" Non-Goal, per `specs/016-gpui-client-rebuild/plan.md`.
+
+When motion is enabled, [[crates/scribe-client-gpui/src/animation.rs#AnimationSettings#transition]] builds a `gpui::Animation` clamped to the 150 ms `MAX_TRANSITION` budget with an ease-out curve; GPUI's `AnimationElement` re-reads the animation when a new transition starts mid-flight, so transitions stay interruptible. When motion is disabled, [[crates/scribe-client-gpui/src/animation.rs#AnimationSettings#apply_to_app]] flips GPUI's global `App::set_reduce_motion`, which makes every `with_animation` render its static end state and schedule no frames — the byte-identical-screenshot determinism path. The `scribe-client-gpui` binary resolves and applies the policy at startup; the concrete tab/focus/overlay/scroll surfaces that consume `transition` land with the shell beads.
+
 ## App State
 
 The master application state lives in the App struct in [[crates/scribe-client/src/main.rs]]. It holds all panes, the window layout, IPC sender, input bindings, theme, AI tracker, GPU context, and UI overlay state. The event loop is driven by winit's `ApplicationHandler` trait.

@@ -258,6 +258,34 @@ A selection spanning two rows separated by a hard line break (no `WRAPLINE`) is 
 
 [[crates/scribe-client-gpui/src/vi_mode.rs#toggle_vi_mode]] enters copy mode, [[crates/scribe-client-gpui/src/vi_mode.rs#vi_motion]] moves the vi cursor, and motions are no-ops while vi mode is inactive.
 
+## GPUI Animation Policy
+
+Unit tests for [[client#GPUI Client Spike#GPUI Animation System]] — [[crates/scribe-client-gpui/src/animation.rs#AnimationSettings]] — proving the config/override motion policy resolves correctly, transitions clamp to the 150 ms budget, and the disabled path yields a zero duration for byte-identical screenshots.
+
+### Config default enables motion
+
+With `appearance.animations` true and no environment override, [[crates/scribe-client-gpui/src/animation.rs#AnimationSettings#resolve_with_env]] leaves motion enabled.
+
+### Config false disables motion
+
+Setting `appearance.animations` to false disables motion even without the environment override, so the config key alone acts as the reduce-motion user setting.
+
+### Truthy env override forces motion off
+
+A truthy `SCRIBE_DISABLE_ANIMATIONS` value (`1`, `true`, `yes`, `on`, case- and whitespace-insensitive) force-disables motion even when the config bool is true, the E2E determinism hook.
+
+### Falsy env value leaves config in charge
+
+A falsy, empty, or unparseable override value leaves the config bool in charge, so a stray `SCRIBE_DISABLE_ANIMATIONS=` never silently kills motion.
+
+### Enabled duration clamps to 150 ms
+
+[[crates/scribe-client-gpui/src/animation.rs#AnimationSettings#duration]] clamps an over-budget request to the 150 ms `MAX_TRANSITION` cap and passes a within-budget request through unchanged.
+
+### Disabled duration is zero
+
+When motion is disabled, `duration` returns `Duration::ZERO` and [[crates/scribe-client-gpui/src/animation.rs#AnimationSettings#transition]] builds a zero-length animation, so GPUI paints the end state on the first frame.
+
 ## GPUI Terminal Search
 
 Unit tests for [[crates/scribe-client-gpui/src/search.rs#TerminalSearch]], the ported regex find-in-terminal state, proving whole-grid match collection and forward/backward cycling with wraparound.
