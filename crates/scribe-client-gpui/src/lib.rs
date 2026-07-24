@@ -23,6 +23,12 @@
 //! bell). The pure classifiers are unit-tested and the entity gates are covered
 //! by `#[gpui::test]`; IME is verified by the manual parity procedure.
 //!
+//! The OS-integration ports live here too: [`clipboard`] (arboard handle, the
+//! OSC 52 read/write bridge, Linux primary selection) with its
+//! [`clipboard_cleanup`] AI copy transforms, and [`notification_dispatcher`]
+//! (the zbus `replaces_id` coalescing state machine and freedesktop timeout
+//! mapping, with click-to-focus emitted on a runtime-agnostic channel).
+//!
 //! Consumers that wire these into the live GPUI view (IPC sink, keybinding
 //! dispatch, window shell) land in later beads of the `gpui-client-rebuild`
 //! epic; the `scribe-client-gpui` binary (`main.rs`) remains the display-only
@@ -31,6 +37,8 @@
 pub mod animation;
 pub mod bell;
 pub mod box_drawing;
+pub mod clipboard;
+pub mod clipboard_cleanup;
 pub mod color;
 pub mod config;
 pub mod divider;
@@ -43,6 +51,7 @@ pub mod layout;
 pub mod lost_control;
 pub mod mouse_reporting;
 pub mod mouse_state;
+pub mod notification_dispatcher;
 pub mod palette;
 pub mod pane_tree;
 pub mod paste;

@@ -6937,6 +6937,8 @@ name = "scribe-client-gpui"
 version = "0.0.0-dev"
 dependencies = [
  "alacritty_terminal 0.26.1-dev",
+ "arboard",
+ "futures-util",
  "gpui",
  "gpui_platform",
  "notify",
@@ -6952,6 +6954,7 @@ dependencies = [
  "unicode-width",
  "vte",
  "x11rb",
+ "zbus 5.14.0",
 ]
 
 [[package]]

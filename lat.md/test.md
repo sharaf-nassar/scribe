@@ -422,6 +422,86 @@ A running server at the same path that started after the installed binary's modi
 
 When neither the process start time nor the installed modification time is known, the server is treated as fresh rather than force-refreshed.
 
+## GPUI OSC 52 Clipboard Bridge
+
+Unit coverage for the ported host clipboard bridge ([[client#GPUI Client Spike#GPUI Platform Integrations Port#GPUI Clipboard and OSC 52 Bridge]]): OSC 52 routing, the FR-019 focus gate, primary-selection read/write with AI cleanup, and reply-message construction.
+
+An in-memory `FakeClipboard` stands in for the live arboard handle so the read+write roundtrip runs without a display server; the arboard-backed E2E stays a manual / launch-gate parity item.
+
+### Write-read roundtrip on the system clipboard
+
+A payload written through [[crates/scribe-client-gpui/src/clipboard.rs#bridge_write]] to the system clipboard reads back verbatim through [[crates/scribe-client-gpui/src/clipboard.rs#bridge_read]] — the scripted OSC 52 bridge roundtrip at the unit level.
+
+### Primary and system selections stay independent
+
+Writes to `ClipboardSelection::Primary` and `ClipboardSelection::Clipboard` land in separate buffers and each reads back its own value, proving the per-selection routing.
+
+### Unavailable backend reports a bridge error
+
+Both [[crates/scribe-client-gpui/src/clipboard.rs#bridge_read]] and [[crates/scribe-client-gpui/src/clipboard.rs#bridge_write]] collapse a dead backend onto `BridgeError::Unavailable` so the server maps it to an empty OSC 52 reply.
+
+### Focus gate drops only enabled unfocused writes
+
+[[crates/scribe-client-gpui/src/clipboard.rs#FocusGate#drops_write]] returns true only when `focus_gate_writes` is enabled and the window is unfocused, and false for the other three combinations.
+
+### Gated write is a silent no-op
+
+A gated write on an unfocused window returns `Ok(())` without mutating the clipboard, while the same write on a focused window goes through — the FR-019 anti-hijack behavior.
+
+### Read reply wraps the payload
+
+[[crates/scribe-client-gpui/src/clipboard.rs#read_reply]] performs the host read and wraps the value in `ClientMessage::ClipboardBridgeReadReply` under the originating `request_id`.
+
+### Read reply forwards a bridge error
+
+When the backend is unavailable, [[crates/scribe-client-gpui/src/clipboard.rs#read_reply]] still emits a `ClipboardBridgeReadReply` carrying the `Err(BridgeError)` payload rather than dropping the request.
+
+### Prompt response echoes id and decision
+
+[[crates/scribe-client-gpui/src/clipboard.rs#prompt_response]] builds `ClientMessage::ClipboardPromptResponse` echoing the prompt's `request_id` and the user's decision.
+
+### Primary read skips empty content
+
+[[crates/scribe-client-gpui/src/clipboard.rs#read_primary]] returns `None` for an absent or empty primary selection so a middle-click paste is skipped, and `Some(text)` when content is present.
+
+### Primary write applies cleanup
+
+[[crates/scribe-client-gpui/src/clipboard.rs#set_primary]] runs the AI copy-cleanup transforms (dedent, unwrap) before writing to the primary selection when cleanup is enabled.
+
+### Primary write is verbatim when cleanup off
+
+[[crates/scribe-client-gpui/src/clipboard.rs#set_primary]] skips empty input entirely and writes the raw text unchanged when cleanup is disabled.
+
+## GPUI Notification Dispatcher
+
+Unit coverage for the platform-independent notification dispatcher logic ([[client#GPUI Client Spike#GPUI Platform Integrations Port#GPUI Notification Dispatcher]]): the `replaces_id` coalescing state machine and the freedesktop `expire_timeout` mapping.
+
+The zbus transport and click-to-focus wiring are verified by the manual parity checklist.
+
+### Timeout mode maps to expire_timeout
+
+[[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#expire_timeout_millis]] maps `SystemDefault` to `-1`, `Never` to `0`, and `Custom` to `timeout_secs * 1000` (saturating on overflow).
+
+### Same session reuses replaces_id
+
+Repeated shows for one session reuse the live notification id via [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#replaces_for]] and [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#record_shown]], keeping exactly one live toast.
+
+### Expired toast reallocation drops stale mapping
+
+When the daemon allocates a fresh id despite a non-zero `replaces` (the prior toast expired), `record_shown` drops the stale reverse mapping so a later click cannot mis-route.
+
+### Session close removes both mappings
+
+[[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#take_session]] returns and clears the session's id once, then `None` thereafter, leaving no dangling id.
+
+### Daemon closed signal clears mappings
+
+[[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#on_closed]] drops both mappings for a closed notification id and no-ops on an unknown id.
+
+### Shutdown closes every live toast
+
+[[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#live_ids]] enumerates every live id for the shutdown close-all and [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#clear]] empties the state afterward.
+
 ## GPUI Perf A/B Gate
 
 The launch-blocking performance comparison for the GPUI client rebuild. The `tools/perf-ab-rig/run-perf-ab.sh` rig compares the new client against the recorded old-client baselines and writes a per-metric pass/fail report.
@@ -468,6 +548,8 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Focus borders | [[test#GPUI Focus Borders]] | "Focused pane/workspace border" chrome (manual + gpui-test) |
 | Split-scroll | [[test#GPUI Split-Scroll]] | "Split-scroll live-bottom pin" AI-pane chrome (gpui-test) |
 | Font zoom | [[test#GPUI Font Zoom]] | "Zoom in/out/reset" View keybinding actions (gpui-test) |
+| OSC 52 clipboard bridge | [[test#GPUI OSC 52 Clipboard Bridge]] | `ClipboardPromptResponse`, `ClipboardBridgeReadReply`, `ClipboardBridgeWrite`, `ClipboardBridgeReadRequest` OSC 52 bridge (scripted-E2E) |
+| Notification dispatcher | [[test#GPUI Notification Dispatcher]] | Notification `replaces_id` coalescing + click-to-focus (gpui-test + manual) |
 
 ### Coverage frontier
 
