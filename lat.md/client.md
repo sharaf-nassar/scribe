@@ -358,6 +358,68 @@ Verifies [[crates/scribe-client-gpui/src/prompt_bar.rs#build_model]] emits only 
 
 Verifies [[crates/scribe-client-gpui/src/prompt_bar.rs#is_prompt_truncated]] reports a short prompt as fitting a wide bar and a long prompt as overflowing a narrow one.
 
+## GPUI Overlays
+
+The GPUI rebuild ports the three interactive overlays — command palette, right-click context menu, and hover tooltip — as `gpui::Entity` views with rounded corners, drop shadows, and hover/pressed states, replacing the winit quad painters.
+
+[[crates/scribe-client-gpui/src/command_palette.rs#CommandPaletteView]] folds the winit palette state and the `main.rs` entry machinery into one entity. The pure assembly stays testable: [[crates/scribe-client-gpui/src/command_palette.rs#base_entries]] holds the fixed action rows (including the feature-013 client-local "Connect to remote machine…" row), [[crates/scribe-client-gpui/src/command_palette.rs#profile_entries]] builds the "Switch Profile" rows tagging the active one, [[crates/scribe-client-gpui/src/command_palette.rs#build_entries]] appends the conditional update row, and [[crates/scribe-client-gpui/src/command_palette.rs#filter_entries]] applies the case-insensitive substring filter. Typing and [[crates/scribe-client-gpui/src/command_palette.rs#CommandPaletteView#push_str]] paste (control characters stripped) drive the filter; the wrapping selection and [[crates/scribe-client-gpui/src/command_palette.rs#CommandPaletteView#confirm]] emit a [[crates/scribe-client-gpui/src/command_palette.rs#PaletteAction]] via [[crates/scribe-client-gpui/src/command_palette.rs#CommandPaletteEvent]] for the shell to route (the winit `execute_automation_action` seam).
+
+[[crates/scribe-client-gpui/src/context_menu.rs#ContextMenuView]] ports the right-click menu. [[crates/scribe-client-gpui/src/context_menu.rs#build_menu_items]] assembles the ordered rows verbatim: the Copy/Paste/Select-All head (Copy gated on a selection), the OSC 8 "Open URL" precedence and appended "Copy hyperlink address" entry (spec 009 FR-003 / FR-007), the file row, and the smart-selection actions resolved through [[crates/scribe-client-gpui/src/context_menu.rs#smart_selection_menu_item]]. Clicking an enabled row runs [[crates/scribe-client-gpui/src/context_menu.rs#ContextMenuView#activate]] (emitting a [[crates/scribe-client-gpui/src/context_menu.rs#ContextMenuAction]] on [[crates/scribe-client-gpui/src/context_menu.rs#ContextMenuEvent]]); Escape or a backdrop click runs [[crates/scribe-client-gpui/src/context_menu.rs#ContextMenuView#dismiss]].
+
+[[crates/scribe-client-gpui/src/tooltip.rs#tooltip_element]] draws the hover tooltip, sizing and positioning it from the pure geometry ports: [[crates/scribe-client-gpui/src/tooltip.rs#clamp_tooltip_x]] centres the box on the anchor and clamps it inside the viewport, [[crates/scribe-client-gpui/src/tooltip.rs#tooltip_y]] picks above/below, and [[crates/scribe-client-gpui/src/tooltip.rs#truncate_url]] head+tail-elides a long URI (spec 009 FR-006). The spike wires all three into [[crates/scribe-client-gpui/src/main.rs#TerminalView]] — Ctrl+Shift+P opens the palette, a right-click opens the menu, Ctrl+Shift+U toggles the tooltip demo — so the visual E2E harness (`tests/e2e/visual/overlays.sh`) can screenshot each overlay and its interaction checklist.
+
+### Palette base entries and update row
+
+Verifies [[crates/scribe-client-gpui/src/command_palette.rs#base_entries]] leads with "Open Settings" and ends with the remote-connect row, and that [[crates/scribe-client-gpui/src/command_palette.rs#build_entries]] appends the "Update Scribe to v{version}" row only when an update is available.
+
+### Palette profile rows tag the active profile
+
+Verifies [[crates/scribe-client-gpui/src/command_palette.rs#profile_entries]] emits one "Switch Profile: {name}" row per profile and suffixes " (active)" onto the currently active profile, wiring each row to a `SwitchProfile` action.
+
+### Palette query filters case-insensitively
+
+Verifies [[crates/scribe-client-gpui/src/command_palette.rs#filter_entries]] keeps every entry for a blank/whitespace query and otherwise retains only rows whose label contains the trimmed, lowercased needle.
+
+### Palette typing and paste drive the filter
+
+Verifies typing characters and [[crates/scribe-client-gpui/src/command_palette.rs#CommandPaletteView#push_str]] paste both extend the query (paste dropping control characters so a multi-line payload collapses) and narrow the filtered list.
+
+### Palette selection wraps and confirms an action
+
+Verifies the palette selection wraps with `next_item`/`prev_item`, [[crates/scribe-client-gpui/src/command_palette.rs#CommandPaletteView#confirm]] emits the highlighted row's [[crates/scribe-client-gpui/src/command_palette.rs#PaletteAction]], and confirming an empty filter is a no-op.
+
+### Context menu head reflects selection state
+
+Verifies [[crates/scribe-client-gpui/src/context_menu.rs#build_menu_items]] always leads with Copy / Paste / Select All and enables Copy only when a selection exists.
+
+### Context menu OSC 8 precedence and copy entry
+
+Verifies an OSC 8 URI takes "Open URL" precedence over a heuristic URL (via `OpenOsc8Url`) and appends a "Copy hyperlink address" row, while a heuristic-only right-click keeps the plain `OpenUrl` row and no copy entry (spec 009 FR-003 / FR-007).
+
+### Context menu appends smart-selection actions
+
+Verifies [[crates/scribe-client-gpui/src/context_menu.rs#smart_selection_menu_item]] drops actions with an empty expanded parameter and that surviving smart actions append after the file entry.
+
+### Context menu click dispatches or dismisses
+
+Verifies [[crates/scribe-client-gpui/src/context_menu.rs#ContextMenuView#activate]] emits an enabled row's action, that a disabled row is a no-op, and that [[crates/scribe-client-gpui/src/context_menu.rs#ContextMenuView#dismiss]] emits `Dismissed`.
+
+### Tooltip centres on its anchor
+
+Verifies [[crates/scribe-client-gpui/src/tooltip.rs#clamp_tooltip_x]] centres a box that fits horizontally on the middle of its anchor rect.
+
+### Tooltip clamps to the viewport edges
+
+Verifies [[crates/scribe-client-gpui/src/tooltip.rs#clamp_tooltip_x]] pins a box against the right edge when the anchor is near it and to `x=0` at the left edge, so an edge-anchored tooltip slides inward instead of clipping.
+
+### Tooltip picks above or below the anchor
+
+Verifies [[crates/scribe-client-gpui/src/tooltip.rs#tooltip_y]] returns the anchor-top-minus-height for `Above` and the anchor-bottom for `Below`.
+
+### Tooltip truncates a long URL head and tail
+
+Verifies [[crates/scribe-client-gpui/src/tooltip.rs#truncate_url]] returns short URIs unchanged, head+tail-elides an overflowing URI to exactly the budget with a middle `...`, falls back to a plain head cut at tiny budgets, and never splits a multibyte codepoint.
+
 ## App State
 
 The master application state lives in the App struct in [[crates/scribe-client/src/main.rs]]. It holds all panes, the window layout, IPC sender, input bindings, theme, AI tracker, GPU context, and UI overlay state. The event loop is driven by winit's `ApplicationHandler` trait.

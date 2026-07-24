@@ -14,18 +14,27 @@ use std::{
 };
 
 use gpui::{
-    App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, Render, Task,
-    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb,
-    size,
+    App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
+    Point, Render, Task, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div,
+    prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use scribe_client_gpui::animation::AnimationSettings;
+use scribe_client_gpui::command_palette::{
+    CommandPaletteColors, CommandPaletteEvent, CommandPaletteView, build_entries,
+};
+use scribe_client_gpui::context_menu::{
+    ContextMenuColors, ContextMenuEvent, ContextMenuRequest, ContextMenuView,
+};
+use scribe_client_gpui::layout::Rect;
 use scribe_client_gpui::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
 use scribe_client_gpui::sys_stats::SystemStatsCollector;
+use scribe_client_gpui::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
 use scribe_client_gpui::{
     tab_bar::{TabBarColors, TabData},
     titlebar::TitlebarView,
 };
+use scribe_common::theme::ChromeColors;
 use scribe_common::{
     config::{StatusBarStatsConfig, load_config, resolve_theme},
     framing::{read_message, write_message},
@@ -110,6 +119,15 @@ struct TerminalView {
     stats_config: StatusBarStatsConfig,
     // The custom titlebar + integrated tab bar drawn above the terminal grid.
     titlebar: Entity<TitlebarView>,
+    /// Theme chrome, retained to build the overlay palettes on demand.
+    chrome: ChromeColors,
+    /// The command palette overlay, present only while open.
+    command_palette: Option<Entity<CommandPaletteView>>,
+    /// The right-click context menu overlay, present only while open.
+    context_menu: Option<Entity<ContextMenuView>>,
+    /// Demo toggle: when set, an OSC 8-style hover tooltip is drawn over a fixed
+    /// anchor so the visual E2E can exercise tooltip clamping + URL truncation.
+    tooltip_demo: bool,
     // Held to keep the redraw poll alive; dropping the view cancels the task.
     _refresh_task: Task<()>,
 }
@@ -122,6 +140,7 @@ impl TerminalView {
         let config = load_config().unwrap_or_default();
         let theme = resolve_theme(&config);
         let status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
+        let chrome = theme.chrome;
         let colors = TabBarColors::from(&minimal_dark().chrome);
         let titlebar = cx.new(|cx| {
             let mut bar = TitlebarView::new(colors, cx);
@@ -138,8 +157,95 @@ impl TerminalView {
             status_colors,
             stats_config: config.terminal.status_bar_stats,
             titlebar,
+            chrome,
+            command_palette: None,
+            context_menu: None,
+            tooltip_demo: false,
             _refresh_task: refresh_task,
         }
+    }
+
+    /// Open the command palette, building its entry list from the live update /
+    /// profile state, and subscribe to its confirm/dismiss events so a choice or
+    /// an outside click tears the overlay down.
+    fn open_command_palette(&mut self, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        let profile_names = scribe_common::profiles::list_profiles().unwrap_or_default();
+        let active = scribe_common::profiles::active_profile_name().ok();
+        let entries = build_entries(None, &profile_names, active.as_deref());
+        let colors = CommandPaletteColors::from(&self.chrome);
+        let palette = cx.new(|cx| CommandPaletteView::new(colors, entries, cx));
+        cx.subscribe(&palette, |this, _palette, event: &CommandPaletteEvent, ctx| match event {
+            CommandPaletteEvent::Execute(_) | CommandPaletteEvent::Dismissed => {
+                this.command_palette = None;
+                ctx.notify();
+            }
+        })
+        .detach();
+        self.command_palette = Some(palette);
+        cx.notify();
+    }
+
+    /// Open the right-click context menu at `position` with a representative item
+    /// set (selection + OSC 8 URL), subscribing so a choice or dismiss closes it.
+    fn open_context_menu(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        let colors = ContextMenuColors::from(&self.chrome);
+        let request = ContextMenuRequest {
+            has_selection: true,
+            osc8_uri: Some("https://example.com/spec".into()),
+            ..Default::default()
+        };
+        let menu = cx.new(|cx| ContextMenuView::new(colors, request, position, cx));
+        cx.subscribe(&menu, |this, _menu, event: &ContextMenuEvent, ctx| match event {
+            ContextMenuEvent::Selected(_) | ContextMenuEvent::Dismissed => {
+                this.context_menu = None;
+                ctx.notify();
+            }
+        })
+        .detach();
+        self.context_menu = Some(menu);
+        cx.notify();
+    }
+
+    /// Route a keystroke while an overlay owns the keyboard. Returns `true` when
+    /// the key was consumed by an overlay (and must not reach the PTY).
+    fn handle_overlay_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let mods = &event.keystroke.modifiers;
+        // Ctrl+Shift+P opens the palette; Ctrl+Shift+U toggles the tooltip demo.
+        if mods.control && mods.shift {
+            match event.keystroke.key.as_str() {
+                "p" => {
+                    self.open_command_palette(cx);
+                    return true;
+                }
+                "u" => {
+                    self.tooltip_demo = !self.tooltip_demo;
+                    cx.notify();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        let Some(palette) = self.command_palette.clone() else {
+            return false;
+        };
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" => palette.update(cx, CommandPaletteView::dismiss),
+            "enter" => palette.update(cx, CommandPaletteView::confirm),
+            "backspace" => palette.update(cx, CommandPaletteView::pop_char),
+            "up" => palette.update(cx, CommandPaletteView::prev_item),
+            "down" => palette.update(cx, CommandPaletteView::next_item),
+            _ => {
+                if let Some(text) = event.keystroke.key_char.as_ref().filter(|t| !t.is_empty()) {
+                    let text = text.clone();
+                    palette.update(cx, |p, ctx| p.push_str(&text, ctx));
+                }
+            }
+        }
+        true
     }
 
     /// Encodes a keystroke and enqueues it as `KeyInput` for the attached pane.
@@ -203,30 +309,16 @@ async fn drive_redraws(
     }
 }
 
-impl Render for TerminalView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        log_first_frame_timing();
-        if !self.focus_handle.is_focused(window) {
-            window.focus(&self.focus_handle, cx);
-        }
-        let content = self
-            .shared
-            .terminal
-            .lock()
-            .map_or_else(|_| Content::default(), |guard| guard.content());
-        let status = self
-            .shared
-            .status
-            .lock()
-            .map_or_else(|_| "terminal state unavailable".to_owned(), |guard| guard.clone());
-
+impl TerminalView {
+    /// Build the status-bar segment model from the live connection / stats state.
+    fn build_status_model(&mut self) -> status_bar::StatusBarModel {
         let connected = self.shared.connected.load(Ordering::Acquire);
         let session_count =
             usize::from(self.shared.active_session.lock().ok().and_then(|guard| *guard).is_some());
         // Refresh the sparkline sampler (internally rate-limited to 2 s) and
         // build the full segment model from the live data available so far.
         let sys_stats = self.stats.maybe_refresh();
-        let model = status_bar::build_model(
+        status_bar::build_model(
             &StatusBarData {
                 connected,
                 workspace_name: None,
@@ -247,19 +339,76 @@ impl Render for TerminalView {
                 stats_config: Some(&self.stats_config),
             },
             &self.status_colors,
-        );
+        )
+    }
+
+    /// Build the demo hover tooltip when the `tooltip_demo` toggle is on: a long
+    /// URI anchored near the right edge, exercising both the head+tail truncation
+    /// and the viewport clamp.
+    fn build_tooltip_demo(&self) -> Option<gpui::AnyElement> {
+        self.tooltip_demo.then(|| {
+            let colors = TooltipColors::from(&self.chrome);
+            let anchor = Rect { x: 780.0, y: 120.0, width: 120.0, height: 18.0 };
+            let display = scribe_client_gpui::tooltip::truncate_url(
+                "https://example.com/very/long/path/that/overflows/the/box",
+                48,
+            );
+            tooltip_element(&TooltipRender {
+                text: &display,
+                anchor,
+                position: TooltipPosition::Below,
+                viewport_width: f32::from(CELL_WIDTH) * f32::from(COLUMNS),
+                colors: &colors,
+                char_width: f32::from(CELL_WIDTH),
+                line_height: f32::from(CELL_HEIGHT),
+            })
+        })
+    }
+}
+
+impl Render for TerminalView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        log_first_frame_timing();
+        if !self.focus_handle.is_focused(window) {
+            window.focus(&self.focus_handle, cx);
+        }
+        let content = self
+            .shared
+            .terminal
+            .lock()
+            .map_or_else(|_| Content::default(), |guard| guard.content());
+        let status = self
+            .shared
+            .status
+            .lock()
+            .map_or_else(|_| "terminal state unavailable".to_owned(), |guard| guard.clone());
+
+        let model = self.build_status_model();
+        let tooltip = self.build_tooltip_demo();
 
         div()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, _cx| {
-                view.on_key_down(event);
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, ctx| {
+                if !view.handle_overlay_key(event, ctx) {
+                    view.on_key_down(event);
+                }
             }))
+            .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(0x0010_1318))
             .child(self.titlebar.clone())
-            .child(TerminalElement::new(content).paint())
+            .child(
+                // Wrap the terminal grid so a right-click opens the context menu
+                // at the cursor without disturbing the display-only element.
+                div().flex_1().child(TerminalElement::new(content).paint()).on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
+                        view.open_context_menu(event.position, ctx);
+                    }),
+                ),
+            )
             .child(
                 div()
                     .h(px(26.))
@@ -272,6 +421,9 @@ impl Render for TerminalView {
                     .child(status),
             )
             .child(status_bar::render(&model, 24., &self.status_colors))
+            .children(self.command_palette.clone())
+            .children(self.context_menu.clone())
+            .children(tooltip)
     }
 }
 
