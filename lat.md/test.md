@@ -436,6 +436,10 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Lost control banner | [[test#GPUI Client Headless Suites#GPUI lost control banner]] | `WindowTakenOver` displaced-client reclaim (gpui-test) |
 | LAN device approval | [[test#GPUI Client Headless Suites#GPUI LAN device approval]] | `LanApprovalRequest`/`LanApprovalDecision` prompt (gpui-test) |
 | Window sharing | [[test#GPUI Client Headless Suites#GPUI window sharing]] | `ShareRoster`, `ControlClaim`/`ControlRequest`/`ControlGrant` (gpui-test) |
+| Pane dividers | [[test#GPUI Pane Dividers]] | "Pane divider drag-resize" chrome (gpui-test) |
+| Focus borders | [[test#GPUI Focus Borders]] | "Focused pane/workspace border" chrome (manual + gpui-test) |
+| Split-scroll | [[test#GPUI Split-Scroll]] | "Split-scroll live-bottom pin" AI-pane chrome (gpui-test) |
+| Font zoom | [[test#GPUI Font Zoom]] | "Zoom in/out/reset" View keybinding actions (gpui-test) |
 
 ### Coverage frontier
 
@@ -502,3 +506,91 @@ The suite asserts Decline is the initial focus (so an unexpected prompt never si
 Confirms the ported feature-015 sharing surfaces — [[crates/scribe-client-gpui/src/share.rs#ShareState]] and the control overlays from the winit [[crates/scribe-client/src/share_view.rs#ShareState]] — derive roster roles correctly and lower control passing onto the frozen v3 protocol.
 
 The suite checks roster-derived multi/holder/label state and [[crates/scribe-client-gpui/src/share.rs#participant_label]] formatting, the [[crates/scribe-client-gpui/src/share.rs#ControlHint]] expiry window, and that a viewer's take-control and a [[crates/scribe-client-gpui/src/share.rs#ControlRequestPrompt]] answer lower through [[crates/scribe-client-gpui/src/share.rs#ControlIntent]] to `ControlClaim` / `ControlRequest` / `ControlGrant` [[crates/scribe-common/src/protocol.rs#ClientMessage]] messages.
+
+## GPUI Pane Dividers
+
+Covers the pure divider geometry in [[crates/scribe-client-gpui/src/divider.rs#collect_dividers]] and its drag-resize math — the renderer-independent core the GPUI solid-quad overlay consumes so pane resize handles behave identically to the winit client.
+
+### Horizontal split divider is a centered vertical line
+
+A side-by-side (`SplitDirection::Horizontal`) split produces one 1px-wide vertical divider centered on the boundary between the two child rects, carrying the first subtree's leaf as its `first_pane`.
+
+### Vertical split divider is a centered horizontal line
+
+A stacked (`SplitDirection::Vertical`) split produces one 1px-tall horizontal divider centered on the boundary, spanning the full width and honoring the split ratio.
+
+### Nested splits yield one divider per split node
+
+A tree with an outer split whose second child is itself a split emits exactly one divider per internal split node, so every resize boundary is hittable.
+
+### Hit test honors 4px tolerance
+
+[[crates/scribe-client-gpui/src/divider.rs#hit_test_divider]] matches a mouse within the [[crates/scribe-client-gpui/src/divider.rs#HIT_TOLERANCE]] 4px band around a 1px line and misses beyond it, so thin dividers stay easy to grab.
+
+### Drag maps position to clamped ratio
+
+[[crates/scribe-client-gpui/src/divider.rs#start_drag]] captures the parent extent and origin, and [[crates/scribe-client-gpui/src/divider.rs#drag_ratio]] maps a drag position to a `[0.1, 0.9]`-clamped ratio so a resize can never collapse a pane.
+
+### Drag on degenerate parent extent falls back to half
+
+A drag whose captured parent extent is zero returns a neutral 0.5 ratio instead of dividing by zero, keeping the layout stable during a zero-area transient.
+
+### Viewport insets clip vertical dividers below the tab bar
+
+[[crates/scribe-client-gpui/src/divider.rs#apply_viewport_insets]] clips a vertical divider below the tab bar and insets its top/bottom edges by the content padding when they touch the viewport boundary.
+
+## GPUI Focus Borders
+
+Covers the focus-border edge geometry in [[crates/scribe-client-gpui/src/focus_border.rs#border_edges]] — the four accent strips the GPUI paint path fills for a focused pane or workspace, kept pure so the corner-overlap math is verifiable without a window.
+
+### Border edges frame the rect without corner overlap
+
+`border_edges` returns full-width top/bottom strips and vertically inset left/right strips at the [[crates/scribe-client-gpui/src/focus_border.rs#FOCUS_BORDER_WIDTH]] 2px width, so the four quads frame the rect without double-painting the corners.
+
+### Border side strips clamp on tiny rects
+
+On a rect shorter than twice the border width, the left/right strip heights clamp to zero instead of going negative, so a tiny pane never produces an inverted quad.
+
+## GPUI Split-Scroll
+
+Covers the split-scroll live-bottom logic in [[crates/scribe-client-gpui/src/split_scroll.rs#split_scroll_eligible]] — eligibility, pin sizing, cursor-anchored translation, logical-line alignment, and viewport geometry — the AI-pane pinned-prompt behavior ported renderer-independent from the winit client.
+
+### Eligible only for scrolled AI panes on the normal screen
+
+[[crates/scribe-client-gpui/src/split_scroll.rs#split_scroll_eligible]] activates only when the pin is enabled, the pane runs a supported AI provider, the view is scrolled up, and the pane is on the normal screen — never on the alternate screen, encoding the alt-screen exclusion.
+
+### Pin rows fit the AI prompt block or clamp on tiny screens
+
+[[crates/scribe-client-gpui/src/split_scroll.rs#compute_pin_rows]] reserves the AI prompt block height when the screen has room and clamps to a `MIN_PIN_ROWS` floor and `screen - MIN_PIN_ROWS` ceiling on small screens so the top portion never vanishes.
+
+### Cursor-anchored translation keeps the prompt visible
+
+[[crates/scribe-client-gpui/src/split_scroll.rs#live_cell_y_translation]] shifts live cells so the cursor row lands on the last screen row, keeping an AI tool's prompt visible in the pin even when it draws in the upper half, and saturating to zero when the cursor is already at or past the bottom.
+
+### Geometry stacks top divider and pinned bottom
+
+[[crates/scribe-client-gpui/src/split_scroll.rs#compute_geometry]] stacks a scrollback top portion, a 1px divider, and a pinned bottom of the requested height, docking the jump-to-bottom chip inside the top portion where [[crates/scribe-client-gpui/src/split_scroll.rs#hit_test_jump_btn]] resolves it.
+
+### Pin height clamps to the content rect
+
+A pin height larger than the content rect collapses the top portion to zero rather than overflowing, so an oversized pin request stays inside the pane.
+
+### Pin alignment absorbs soft-wrapped logical lines
+
+[[crates/scribe-client-gpui/src/split_scroll.rs#align_pin_rows_to_logical_lines]] expands the pin upward across `WRAPLINE`-flagged rows so the split never starts mid-way through a soft-wrapped logical line, and leaves the requested rows unchanged when there is no wrap.
+
+## GPUI Font Zoom
+
+Covers the runtime font-zoom math in [[crates/scribe-client-gpui/src/zoom.rs#ZoomState]] — the in/out/reset point delta the GPUI shell applies over the configured font size, isolated so clamping and the size floor are verifiable without a window.
+
+### Zoom steps clamp to the point range
+
+Repeated [[crates/scribe-client-gpui/src/zoom.rs#ZoomState#zoom_in]] and [[crates/scribe-client-gpui/src/zoom.rs#ZoomState#zoom_out]] calls saturate at the `+7` / `-7` point bounds rather than overflowing the level.
+
+### Reset returns to the configured size
+
+[[crates/scribe-client-gpui/src/zoom.rs#ZoomState#reset]] returns the level to zero so [[crates/scribe-client-gpui/src/zoom.rs#ZoomState#effective_font_size]] yields the unmodified configured size.
+
+### Effective size applies the delta and honors the floor
+
+`effective_font_size` adds the zoom delta to the base size and floors the result at the 6pt minimum so extreme zoom-out still renders legible cells.
