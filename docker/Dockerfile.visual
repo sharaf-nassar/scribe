@@ -3,6 +3,7 @@ FROM rust:1.95-trixie
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         fonts-jetbrains-mono \
+        fonts-noto-color-emoji \
         ca-certificates \
         clang \
         git \
@@ -17,8 +18,16 @@ RUN apt-get update && \
         libgbm1 \
         libvulkan1 \
         libwayland-dev \
+        libwayland-client0 \
         libx11-xcb-dev \
+        libxcb1 \
+        libxcb-render0 \
+        libxcb-shape0 \
+        libxcb-xfixes0 \
+        libxcb-cursor0 \
+        libxkbcommon-x11-0 \
         libxkbcommon-x11-dev \
+        xkb-data \
         libzstd-dev \
         libssl-dev \
         mesa-vulkan-drivers \
@@ -31,17 +40,24 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # Force visual E2E onto lavapipe's software Vulkan ICD for deterministic
-# rendering on CI runners without a usable hardware driver.
+# rendering on CI runners without a usable hardware driver. lavapipe ships in
+# mesa-vulkan-drivers; pinning VK_ICD_FILENAMES skips any hardware ICD probe so
+# the GPUI client renders identically across runs and machines.
 ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
 
+# Silence GPUI open/close and cursor-blink animations so consecutive
+# screenshots are byte-identical. Harmless on the current display-only spike
+# (no animations yet); forward-compatible with the animated client.
+ENV SCRIBE_DISABLE_ANIMATIONS=1
+
 COPY target/release/scribe-server /usr/local/bin/scribe-server
-COPY target/release/scribe-client /usr/local/bin/scribe-client
+COPY target/release/scribe-client-gpui /usr/local/bin/scribe-client-gpui
 COPY target/release/scribe-test /usr/local/bin/scribe-test
 COPY docker/entrypoint-visual.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh \
     /usr/local/bin/scribe-server \
-    /usr/local/bin/scribe-client \
+    /usr/local/bin/scribe-client-gpui \
     /usr/local/bin/scribe-test
 
 RUN mkdir -p /output

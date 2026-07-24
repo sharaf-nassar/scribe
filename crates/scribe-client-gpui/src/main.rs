@@ -13,8 +13,8 @@ use std::{
 };
 
 use gpui::{
-    App, AsyncApp, Bounds, Context, FocusHandle, KeyDownEvent, Render, Task, WeakEntity, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    App, AsyncApp, Bounds, Context, FocusHandle, KeyDownEvent, Render, Task, TitlebarOptions,
+    WeakEntity, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 use scribe_common::{
@@ -208,7 +208,15 @@ fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink) {
     let shared = shared.clone();
     let sink = sink.clone();
     if let Err(error) = cx.open_window(
-        WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // Set WM_NAME/_NET_WM_NAME to "Scribe" so the X11 visual-E2E harness
+            // (`docker/entrypoint-visual.sh`) can locate the window with
+            // `xdotool search --name "Scribe"` for focus and screenshot capture.
+            titlebar: Some(TitlebarOptions { title: Some("Scribe".into()), ..Default::default() }),
+            app_id: Some("scribe".to_owned()),
+            ..Default::default()
+        },
         |_, cx| cx.new(|cx| TerminalView::new(shared, sink, cx)),
     ) {
         tracing::error!(%error, "failed to open GPUI window");
