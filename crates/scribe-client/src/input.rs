@@ -593,10 +593,12 @@ pub fn translate_key(
     // modifier is held; modified numpad chords still travel through the
     // normal Kitty/legacy paths so the user's modifier reporting is
     // preserved.
-    if mode.app_keypad && event.state == ElementState::Pressed && modifiers.is_empty() {
-        if let Some(bytes) = translate_numpad_app_keypad(event) {
-            return Some(bytes);
-        }
+    if mode.app_keypad
+        && event.state == ElementState::Pressed
+        && modifiers.is_empty()
+        && let Some(bytes) = translate_numpad_app_keypad(event)
+    {
+        return Some(bytes);
     }
 
     // Legacy fast path: when no Kitty enhancement flag is negotiated,
@@ -1348,12 +1350,11 @@ fn translate_named_kitty_fields(request: NamedKittyFields<'_>) -> Option<Vec<u8>
     } = request;
     let modifier_param = xterm_modifier_param(modifiers);
 
-    if event_type.is_some() {
-        if let Some(bytes) =
+    if event_type.is_some()
+        && let Some(bytes) =
             translate_named_kitty_legacy_functional(named, modifier_param, event_type, app_cursor)
-        {
-            return Some(bytes);
-        }
+    {
+        return Some(bytes);
     }
 
     if let Some(cp) = kitty_functional_codepoint(named, location) {
@@ -1449,10 +1450,10 @@ fn kitty_fkey_tilde_code(named: NamedKey) -> Option<u8> {
 /// logical character (FR per research D-note: platform-gated API must degrade
 /// gracefully).
 fn base_codepoint_for_character(event: &KeyEvent, logical: &str) -> Option<u32> {
-    if let Key::Character(base) = event.key_without_modifiers() {
-        if let Some(ch) = base.chars().next() {
-            return Some(u32::from(ch));
-        }
+    if let Key::Character(base) = event.key_without_modifiers()
+        && let Some(ch) = base.chars().next()
+    {
+        return Some(u32::from(ch));
     }
     let ch = logical.chars().next()?;
     // Lowercase ASCII so the reported key is layout-base, not the shifted

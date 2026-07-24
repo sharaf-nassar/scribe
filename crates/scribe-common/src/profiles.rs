@@ -78,10 +78,10 @@ fn normalize_store(store: &mut ProfileStore) -> Result<(), ScribeError> {
         store.active_profile = default_profile_name();
     }
 
-    if !store.profiles.contains_key(&store.active_profile) {
-        if let Some(first) = store.profiles.keys().next().cloned() {
-            store.active_profile = first;
-        }
+    if !store.profiles.contains_key(&store.active_profile)
+        && let Some(first) = store.profiles.keys().next().cloned()
+    {
+        store.active_profile = first;
     }
 
     Ok(())

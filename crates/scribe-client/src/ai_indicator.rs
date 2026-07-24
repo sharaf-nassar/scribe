@@ -64,7 +64,7 @@ const PROCESSING_IDLE_PULSE_SECS: f32 = 8.0;
 /// genuinely-dead session is silent this long, and a wrongly-cleared one
 /// self-heals on its next hook/output. Wall-clock, evaluated lazily — see
 /// [`AiStateTracker::clear_stale_processing`].
-const STALE_PROCESSING_CLEAR: Duration = Duration::from_secs(300);
+const STALE_PROCESSING_CLEAR: Duration = Duration::from_mins(5);
 
 /// Tracks AI state for all sessions and drives border / indicator colours.
 pub struct AiStateTracker {
@@ -202,16 +202,16 @@ impl AiStateTracker {
     /// `PermissionPrompt`) for a session, typically in response to user
     /// keystrokes. Other states (`Processing`, `Error`) are left untouched.
     pub fn clear_attention_states(&mut self, session_id: SessionId) {
-        if let Some(state) = self.states.get(&session_id) {
-            if matches!(
+        if let Some(state) = self.states.get(&session_id)
+            && matches!(
                 state.state,
                 AiState::IdlePrompt | AiState::WaitingForInput | AiState::PermissionPrompt
-            ) {
-                self.states.remove(&session_id);
-                self.state_enter_times.remove(&session_id);
-                self.last_activity_times.remove(&session_id);
-                self.last_activity_instant.remove(&session_id);
-            }
+            )
+        {
+            self.states.remove(&session_id);
+            self.state_enter_times.remove(&session_id);
+            self.last_activity_times.remove(&session_id);
+            self.last_activity_instant.remove(&session_id);
         }
     }
 
@@ -395,14 +395,13 @@ impl AiStateTracker {
         // Suppress only while a pulsing attention state is active so the
         // pulse owns the UX. Once the state clears or rests, the suffix
         // becomes visible again on the same percent.
-        if let Some(ps) = self.states.get(&session) {
-            if matches!(ps.state, AiState::PermissionPrompt | AiState::WaitingForInput) {
-                return None;
-            }
+        if let Some(ps) = self.states.get(&session)
+            && matches!(ps.state, AiState::PermissionPrompt | AiState::WaitingForInput)
+        {
+            return None;
         }
         let hex = thresholds.color_for(ctx);
-        let color =
-            hex_to_rgba(hex).map(scribe_renderer::srgb_to_linear_rgba).unwrap_or(fallback_color);
+        let color = hex_to_rgba(hex).map_or(fallback_color, scribe_renderer::srgb_to_linear_rgba);
         Some((format!(" {ctx}%"), color))
     }
 

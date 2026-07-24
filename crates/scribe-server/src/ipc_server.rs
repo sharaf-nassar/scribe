@@ -1158,7 +1158,7 @@ const REMOTE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// backstop for a peer that is TCP-alive but app-silent; a peer whose TCP path
 /// has vanished (no FIN/RST) is reclaimed faster by tuned keepalive (see
 /// [`enable_tcp_keepalive`]).
-const REMOTE_IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const REMOTE_IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(30);
 
 /// Idle time before the OS starts sending TCP keepalive probes on an accepted
 /// remote connection, and the interval between probes. With the OS-default probe
@@ -1166,7 +1166,7 @@ const REMOTE_IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// slot — in a few minutes instead of waiting out [`REMOTE_IDLE_READ_TIMEOUT`],
 /// with no false positives on a live-but-idle viewer (a live TCP stack ACKs the
 /// probes even when the app sends nothing).
-const REMOTE_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+const REMOTE_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_mins(1);
 const REMOTE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Upper bound on the best-effort `ServerMessage::RemoteDisconnect` write when a
@@ -5777,19 +5777,17 @@ async fn handle_focus_changed(
     attached_ids: &AttachedSessionIds,
 ) {
     let sessions = live_sessions.read().await;
-    if let Some(lost_id) = lost {
-        if attached_contains(attached_ids, lost_id).await {
-            if let Some(session) = sessions.get(&lost_id) {
-                send_focus_event(session, b"\x1b[O").await;
-            }
-        }
+    if let Some(lost_id) = lost
+        && attached_contains(attached_ids, lost_id).await
+        && let Some(session) = sessions.get(&lost_id)
+    {
+        send_focus_event(session, b"\x1b[O").await;
     }
-    if let Some(gained_id) = gained {
-        if attached_contains(attached_ids, gained_id).await {
-            if let Some(session) = sessions.get(&gained_id) {
-                send_focus_event(session, b"\x1b[I").await;
-            }
-        }
+    if let Some(gained_id) = gained
+        && attached_contains(attached_ids, gained_id).await
+        && let Some(session) = sessions.get(&gained_id)
+    {
+        send_focus_event(session, b"\x1b[I").await;
     }
 }
 
@@ -5855,17 +5853,17 @@ async fn handle_close_session(
     // off at create time (no envelope ever existed) or when the persist
     // scheduler had not yet flushed a first write. Failures are logged
     // but do not block the close.
-    if let Some((window_id, launch_id)) = envelope_coords {
-        if let Err(err) = crate::env_store::store::delete_envelope(window_id, &launch_id).await {
-            warn!(
-                target: "scribe_server::ipc_server",
-                %session_id,
-                %window_id,
-                %launch_id,
-                error = ?err,
-                "env-envelope delete failed during CloseSession"
-            );
-        }
+    if let Some((window_id, launch_id)) = envelope_coords
+        && let Err(err) = crate::env_store::store::delete_envelope(window_id, &launch_id).await
+    {
+        warn!(
+            target: "scribe_server::ipc_server",
+            %session_id,
+            %window_id,
+            %launch_id,
+            error = ?err,
+            "env-envelope delete failed during CloseSession"
+        );
     }
 
     info!(%session_id, "session closed by client");
@@ -7167,12 +7165,11 @@ async fn handle_dispatch_action(
     sender_window_id: WindowId,
     writer: &SharedWriter,
 ) {
-    if let Some(window_id) = requested_window_id {
-        if window_id != sender_window_id {
-            send_error(writer, &format!("cannot dispatch action to another window: {window_id}"))
-                .await;
-            return;
-        }
+    if let Some(window_id) = requested_window_id
+        && window_id != sender_window_id
+    {
+        send_error(writer, &format!("cannot dispatch action to another window: {window_id}")).await;
+        return;
     }
 
     let shares = window_shares.read().await;

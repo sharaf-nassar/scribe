@@ -241,10 +241,11 @@ pub fn build_tab_bar_separator(ctx: TabBarSeparatorContext<'_>) {
 
     for col_idx in 0..cols {
         let x = rect.x + columns_to_pixels(col_idx, cell_w);
-        if let Some((xa, xb)) = skip_range {
-            if x + cell_w > xa && x < xb {
-                continue;
-            }
+        if let Some((xa, xb)) = skip_range
+            && x + cell_w > xa
+            && x < xb
+        {
+            continue;
         }
         out.push(CellInstance {
             pos: [x, separator_y],

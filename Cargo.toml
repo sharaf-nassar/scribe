@@ -7,7 +7,7 @@ resolver = "3"
 version = "0.0.0-dev"
 edition = "2024"
 license = "GPL-3.0-or-later"
-rust-version = "1.87"
+rust-version = "1.95"
 description = "Scribe terminal emulator"
 repository = "https://github.com/scribe-terminal/scribe"
 readme = "README.md"
@@ -195,6 +195,11 @@ cargo_common_metadata = "allow"
 opt-level = 3
 lto = "thin"
 strip = true
+
+# GPUI's hot rendering paths need optimized dev builds for responsive local
+# iteration. Keep this package override when the GPUI client is added.
+[profile.dev.package.gpui]
+opt-level = 3
 
 # Local fork of unix-ancillary 0.1.0 — upstream 0.1.0 fails to compile on Apple
 # targets because `set_cloexec` references `io::Result` without importing

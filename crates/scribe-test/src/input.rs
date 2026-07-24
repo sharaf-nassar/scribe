@@ -14,10 +14,7 @@ pub fn parse_escapes(input: &str) -> Vec<u8> {
     let mut result = Vec::with_capacity(input.len());
     let mut chars = input.chars();
 
-    loop {
-        let Some(c) = chars.next() else {
-            break;
-        };
+    while let Some(c) = chars.next() {
         if c != '\\' {
             let mut buf = [0u8; 4];
             result.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());

@@ -309,7 +309,7 @@ pub const MAX_PENDING_APPROVALS: usize = 4;
 /// an unapproved dialer holding a scarce pending-approval slot across an
 /// unbounded human-decision window, yet generous enough for the owning user to
 /// notice the prompt and decide.
-pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// A first-time LAN connection awaiting the owning user's decision (data-model
 /// `ApprovalRequest`). Assembled by the accept path from the completed

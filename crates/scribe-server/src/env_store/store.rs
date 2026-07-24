@@ -166,16 +166,16 @@ pub async fn delete_envelope(window_id: WindowId, launch_id: &str) -> Result<(),
     // Best-effort DEK delete — log on failure, don't propagate (the disk
     // entry is gone, which is the user-visible state).
     let launch_id_owned = launch_id.to_owned();
-    if let Err(e) = keystore::delete_dek(window_id, &launch_id_owned).await {
-        if !matches!(e, KeystoreError::NotFound) {
-            tracing::warn!(
-                target: "scribe_server::env_store::store",
-                error = ?e,
-                window_id = ?window_id,
-                launch_id = %launch_id_owned,
-                "delete_dek failed during envelope deletion"
-            );
-        }
+    if let Err(e) = keystore::delete_dek(window_id, &launch_id_owned).await
+        && !matches!(e, KeystoreError::NotFound)
+    {
+        tracing::warn!(
+            target: "scribe_server::env_store::store",
+            error = ?e,
+            window_id = ?window_id,
+            launch_id = %launch_id_owned,
+            "delete_dek failed during envelope deletion"
+        );
     }
     Ok(())
 }
@@ -245,8 +245,7 @@ fn write_private_temp_file(final_path: &Path, content: &[u8]) -> io::Result<Path
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
 
     for attempt in 0u32..TEMP_FILE_ATTEMPTS {
         let stem = final_path.file_name().and_then(|s| s.to_str()).unwrap_or("envelope");

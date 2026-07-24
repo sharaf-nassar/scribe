@@ -163,10 +163,10 @@ impl LanDiscovery {
             Ok(mut slot) => slot.take(),
             Err(_poisoned) => None,
         };
-        if let Some(fullname) = fullname {
-            if let Err(error) = self.daemon.unregister(&fullname) {
-                tracing::debug!(%error, %fullname, "mDNS unregister failed");
-            }
+        if let Some(fullname) = fullname
+            && let Err(error) = self.daemon.unregister(&fullname)
+        {
+            tracing::debug!(%error, %fullname, "mDNS unregister failed");
         }
     }
 
@@ -221,10 +221,10 @@ impl LanDiscovery {
 impl Drop for LanDiscovery {
     fn drop(&mut self) {
         self.stop_advertising();
-        if let Ok(mut slot) = self.browse_task.lock() {
-            if let Some(task) = slot.take() {
-                task.abort();
-            }
+        if let Ok(mut slot) = self.browse_task.lock()
+            && let Some(task) = slot.take()
+        {
+            task.abort();
         }
         if let Err(error) = self.daemon.shutdown() {
             tracing::debug!(%error, "mDNS daemon shutdown failed");

@@ -162,9 +162,9 @@ pub fn read_command(stream: &UnixStream) -> Option<SettingsWindowCommand> {
 
 /// Cleanup: remove the socket file.
 pub fn cleanup_socket(socket_path: &std::path::Path) {
-    if let Err(e) = std::fs::remove_file(socket_path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(path = %socket_path.display(), "failed to remove settings socket: {e}");
-        }
+    if let Err(e) = std::fs::remove_file(socket_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %socket_path.display(), "failed to remove settings socket: {e}");
     }
 }

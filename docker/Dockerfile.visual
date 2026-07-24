@@ -1,10 +1,12 @@
-FROM ubuntu:24.04
+FROM rust:1.95-trixie
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         fonts-jetbrains-mono \
         ca-certificates \
+        clang \
         git \
+        libfontconfig-dev \
         python3 \
         sqlite3 \
         xvfb \
@@ -14,6 +16,12 @@ RUN apt-get update && \
         libgles2 \
         libgbm1 \
         libvulkan1 \
+        libwayland-dev \
+        libx11-xcb-dev \
+        libxkbcommon-x11-dev \
+        libzstd-dev \
+        libssl-dev \
+        mesa-vulkan-drivers \
         scrot \
         imagemagick \
         xdotool \
@@ -21,6 +29,10 @@ RUN apt-get update && \
         openbox \
         libwebkit2gtk-4.1-0 \
     && rm -rf /var/lib/apt/lists/*
+
+# Force visual E2E onto lavapipe's software Vulkan ICD for deterministic
+# rendering on CI runners without a usable hardware driver.
+ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
 
 COPY target/release/scribe-server /usr/local/bin/scribe-server
 COPY target/release/scribe-client /usr/local/bin/scribe-client

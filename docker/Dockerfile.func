@@ -1,9 +1,17 @@
-FROM ubuntu:24.04
+FROM rust:1.95-trixie
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         fonts-jetbrains-mono \
         ca-certificates \
+        clang \
+        libfontconfig-dev \
+        libssl-dev \
+        libvulkan1 \
+        libwayland-dev \
+        libx11-xcb-dev \
+        libxkbcommon-x11-dev \
+        libzstd-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY target/release/scribe-server /usr/local/bin/scribe-server

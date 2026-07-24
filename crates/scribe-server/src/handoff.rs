@@ -369,19 +369,19 @@ fn receive_handoff_ack(raw_peer: RawFd) -> Result<(), ScribeError> {
 }
 
 fn cleanup_handoff_socket(path: &PathBuf) {
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            warn!(?path, "failed to remove handoff socket: {e}");
-        }
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(?path, "failed to remove handoff socket: {e}");
     }
 }
 
 /// Prepare the handoff socket path: create parent dirs, remove stale socket.
 fn prepare_handoff_socket(path: &PathBuf) -> Result<(), ScribeError> {
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(ScribeError::Io { source: e });
-        }
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(ScribeError::Io { source: e });
     }
 
     if let Some(parent) = path.parent() {

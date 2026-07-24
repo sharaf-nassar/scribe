@@ -66,10 +66,10 @@ struct UpdateDownloadStage {
 
 impl Drop for UpdateDownloadStage {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!(path = %self.path.display(), "failed to remove update staging dir: {e}");
-            }
+        if let Err(e) = std::fs::remove_dir_all(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %self.path.display(), "failed to remove update staging dir: {e}");
         }
     }
 }
@@ -545,12 +545,12 @@ async fn download_asset(
         .error_for_status()
         .map_err(|e| ScribeError::UpdateInstallFailed { reason: format!("{e}") })?;
 
-    if let Some(len) = response.content_length() {
-        if len > max_bytes {
-            return Err(ScribeError::UpdateInstallFailed {
-                reason: format!("update asset too large: {len} bytes (max {max_bytes})"),
-            });
-        }
+    if let Some(len) = response.content_length()
+        && len > max_bytes
+    {
+        return Err(ScribeError::UpdateInstallFailed {
+            reason: format!("update asset too large: {len} bytes (max {max_bytes})"),
+        });
     }
 
     let std_file = std::fs::OpenOptions::new()

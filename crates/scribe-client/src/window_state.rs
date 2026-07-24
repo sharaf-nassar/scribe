@@ -109,10 +109,10 @@ impl WindowRegistry {
     pub fn remove(&self, window_id: scribe_common::ids::WindowId) {
         let Some(path) = self.window_path(window_id) else { return };
         let result = std::fs::remove_file(&path);
-        if let Err(e) = result {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %path.display(), "failed to remove window state: {e}");
-            }
+        if let Err(e) = result
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), "failed to remove window state: {e}");
         }
     }
 

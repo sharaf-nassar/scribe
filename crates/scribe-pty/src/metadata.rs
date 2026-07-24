@@ -143,11 +143,12 @@ impl MetadataParser {
         }
 
         // For D mark, the exit code may also be a bare number in params[2].
-        if kind == PromptMarkKind::CommandEnd && exit_code.is_none() {
-            if let Some(raw) = params.get(2) {
-                let s = String::from_utf8_lossy(raw);
-                exit_code = s.parse().ok();
-            }
+        if kind == PromptMarkKind::CommandEnd
+            && exit_code.is_none()
+            && let Some(raw) = params.get(2)
+        {
+            let s = String::from_utf8_lossy(raw);
+            exit_code = s.parse().ok();
         }
 
         Some(MetadataEvent::PromptMark { kind, click_events, exit_code })
@@ -267,14 +268,13 @@ fn percent_decode_path(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let Some(&b) = bytes.get(i) else { break };
-        if b == b'%' {
-            if let Some(decoded) =
+        if b == b'%'
+            && let Some(decoded) =
                 decode_percent_pair(bytes.get(i + 1).copied(), bytes.get(i + 2).copied())
-            {
-                out.push(decoded);
-                i += 3;
-                continue;
-            }
+        {
+            out.push(decoded);
+            i += 3;
+            continue;
         }
         out.push(b);
         i += 1;
