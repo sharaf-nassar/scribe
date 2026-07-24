@@ -1,6 +1,7 @@
 //! One-pane GPUI client spike over Scribe's frozen local IPC protocol.
 
 mod ipc_bridge;
+mod session_lifecycle;
 mod terminal;
 mod terminal_element;
 
@@ -30,7 +31,6 @@ use scribe_common::{
     framing::{read_message, write_message},
     ids::SessionId,
     protocol::{ClientMessage, ServerMessage, SessionInfo, TerminalSize},
-    screen_replay::{decompress_session_replay, snapshot_to_ansi},
     socket::server_socket_path,
     theme::minimal_dark,
 };
@@ -459,25 +459,67 @@ where
     R: AsyncReadExt + Unpin,
 {
     let mut attached: Option<SessionId> = None;
+    let mut registry = session_lifecycle::SessionRegistry::new();
     loop {
         let message: ServerMessage =
             read_message(&mut reader).await.map_err(|error| error.to_string())?;
         match message {
-            ServerMessage::SessionList { sessions, .. } if attached.is_none() => {
-                attach_first(&ctx, &sessions, &mut attached)?;
+            ServerMessage::Welcome { window_id, .. } => {
+                // A takeover Hello's Welcome hands back the adopted window id.
+                registry.adopt_window(window_id);
+                tracing::debug!(adopted = ?registry.adopted_window(), "welcome: adopted window");
+            }
+            ServerMessage::SessionList { sessions, .. } => {
+                // Rebuild the reconnect topology from the authoritative list,
+                // then (on the first list) attach the single spike pane.
+                registry.rebuild_from_session_list(&sessions);
+                tracing::debug!(
+                    sessions = registry.len(),
+                    workspaces = registry.reconnect_topology().len(),
+                    "rebuilt reconnect topology"
+                );
+                if attached.is_none() {
+                    attach_first(&ctx, &sessions, &mut attached)?;
+                }
+            }
+            ServerMessage::SessionCreated { session_id, workspace_id, .. } => {
+                registry.on_session_created(session_id, workspace_id);
+            }
+            ServerMessage::SessionExited { session_id, .. } => {
+                let existed = registry.on_session_exited(session_id);
+                if existed && Some(session_id) == attached {
+                    set_status(&ctx.status, &ctx.generation, "attached pane exited".to_owned());
+                }
+            }
+            ServerMessage::TrimScrollback { session_id, history_rows } => {
+                // Track the server's scrollback trim so stored prompt marks stay
+                // anchored to the right rows once command-mark tracking lands.
+                let dropped = registry.on_trim_scrollback(session_id, history_rows);
+                tracing::trace!(%session_id, dropped, "trimmed scrollback marks");
             }
             ServerMessage::PtyOutput { session_id, data } if Some(session_id) == attached => {
                 forward_output(&ctx.in_tx, session_id, data);
             }
             ServerMessage::SessionReplay { session_id, replay } if Some(session_id) == attached => {
-                let bytes =
-                    decompress_session_replay(&replay).map_err(|error| error.to_string())?;
-                forward_output(&ctx.in_tx, session_id, bytes);
+                // A corrupt reattach stream must not tear down the reader: show
+                // an error on the pane and keep the connection alive.
+                match session_lifecycle::decode_replay(session_id, &replay) {
+                    Ok(bytes) => forward_output(&ctx.in_tx, session_id, bytes),
+                    Err(error) => {
+                        set_status(&ctx.status, &ctx.generation, error.to_string());
+                    }
+                }
             }
             ServerMessage::ScreenSnapshot { session_id, snapshot }
                 if Some(session_id) == attached =>
             {
-                forward_output(&ctx.in_tx, session_id, snapshot_to_ansi(&snapshot));
+                // Reset before replaying so the tooling snapshot replaces, never
+                // appends onto, the pane's current content.
+                forward_output(
+                    &ctx.in_tx,
+                    session_id,
+                    session_lifecycle::snapshot_reset_bytes(&snapshot),
+                );
             }
             ServerMessage::Error { message } => set_status(&ctx.status, &ctx.generation, message),
             _ => {}
