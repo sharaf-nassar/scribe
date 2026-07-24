@@ -25,9 +25,12 @@ relicense is step-0, so code is copied, not reimplemented):
   `ClientMessage::KeyInput` / mouse-report bytes onto the existing
   IPC-writer command channel.
 - `TerminalElement` (cribbed from Zed's `terminal_element.rs`) paints from
-  the `Content` snapshot: merged background quads + `shape_line` glyph runs
-  with forced `cell_width`, underline/undercurl/strikethrough from cell
-  flags, minimum-contrast adjustment. Also cribbed: Zed's `alacritty.rs`
+  the `Content` snapshot: merged background quads, then a procedural
+  paint-quad overlay for U+2500–U+259F, then `shape_line` glyph runs with
+  forced `cell_width` and Scribe-ordered `FontFallbacks`. The glyph path uses
+  `FontFeatures::disable_ligatures()` only when `appearance.ligatures` is
+  false; it also renders underline/undercurl/strikethrough from cell flags
+  and applies minimum-contrast adjustment. Also cribbed: Zed's `alacritty.rs`
   glue (`make_content`, cell/selection/mode conversions, listener) and
   `mappings/colors.rs`; `mappings/keys.rs`/`mouse.rs` serve as the shape
   for the ported Scribe encoders, which supersede them (Scribe's kitty
@@ -119,10 +122,13 @@ No server-side or protocol data changes. Client-internal:
   `WorkspaceTree` (port of `WindowLayout`: slots, tabs, accents, names),
   `AppState` (connection, dialogs, share/remote state). Each maps to a GPUI
   `Entity<T>` with views subscribing to wakeups.
-- **Config:** same TOML files, same watcher semantics. Removed appearance
+- **Config:** same TOML files, same watcher semantics. `appearance.ligatures`
+  remains a boolean terminal-run shaping control and `appearance.opacity`
+  remains a live `0.0..=1.0` root-background alpha control on a transparent
+  GPUI surface. Removed appearance
   keys (splash-related; any pipeline-specific constants) are silently
   ignored on load (no hard error), documented in a "removed keys" table in
-  the parity inventory. `opacity` fate decided by spike (OQ12).
+  the parity inventory.
   New key: `animations` (bool, default true) — doubles as the reduce-motion
   user setting and the E2E determinism hook (env
   `SCRIBE_DISABLE_ANIMATIONS=1` overrides). This is a sanctioned exception
@@ -184,8 +190,9 @@ No server-side or protocol data changes. Client-internal:
 - **Visual E2E (US6):** `Dockerfile.visual` updated: Xvfb + lavapipe
   (`VK_ICD_FILENAMES` → lvp), Rust 1.95 image, GPUI system deps;
   `SCRIBE_DISABLE_ANIMATIONS=1` for deterministic screenshots; xdotool
-  drive + scrot capture as today; X11 active-window guard semantics
-  preserved (spike verifies XID access).
+  drive + scrot capture as today. The X11 focus guard extracts GPUI's Xcb XID
+  and preserves the direct `_NET_ACTIVE_WINDOW` comparison; non-X11 backends
+  do not enable it.
 - **Perf gate (US* launch):** scripted A/B on the same machine: input
   latency (typometer-style or instrumented echo round-trip), `cat`
   firehose throughput, memory at 10 tabs, startup-to-first-frame, scroll
@@ -220,7 +227,7 @@ No server-side or protocol data changes. Client-internal:
 
 | Risk | Mitigation |
 |---|---|
-| A capability spike fails (box drawing, fallback ordering, ligatures, opacity, X11 XID) | Spikes run first with authority to rewrite US3 criteria (Clarification Q7). Fallbacks per spike: box drawing → paint-quad overlay in TerminalElement keyed on codepoints (works regardless of text-system hooks); fallback ordering → explicit font-stack list per run if GPUI honors per-run fonts, else accept regression + document; ligatures → drop `ligatures` key; opacity → drop `opacity` key; XID → poll via `xdotool`-style EWMH from the guard's own connection using the window title/PID instead of XID. |
+| Capability mechanisms regress at a later GPUI pin | The Phase A probes resolved the current pin: paint-quad overlay for box drawing, ordered `FontFallbacks`, forced-width `shape_line` ligatures, transparent-surface alpha repaint for opacity, and direct Xcb XID access. Any pin move reruns those probes before criteria change. |
 | GPUI pin has a blocking bug; upstream fix requires moving the pin | Contingency: vendor the 11 gpui crates into `third_party/` (existing convention) and cherry-pick; only move the pin deliberately as its own bead. |
 | Perf regression vs old client (GPUI is heavier than a bespoke quad pipeline) | Perf gate with recorded baselines is launch-blocking; Zed proves the ceiling is high enough; profile with wgpu tools before optimizing. |
 | The parity tail (remote/LAN, restore, notifications) drags | Parity inventory makes the tail visible and countable from day one; phases C–E are parallelizable across agents; launch gate excludes US3 cosmetics so the tail is correctness-only. |
@@ -257,11 +264,12 @@ path.
   window, connects to live server, renders one pane's grid via cribbed
   display-only Terminal + TerminalElement.** Proves the whole bet; blocks
   all of phases B–F.
-- Capability spikes (parallel, each may rewrite US3 criteria): box-drawing
-  entry point; Nerd-Font fallback ordering; ligatures via `shape_line`;
-  window opacity Wayland/X11; X11 window-handle/XID access for the focus
-  guard. A closing "criteria reconciliation" bead folds results into
-  spec.md + parity inventory.
+- Capability spikes are resolved at the pinned GPUI revision: box drawing
+  uses a `TerminalElement` paint-quad overlay; terminal runs carry ordered
+  Nerd-Font-first `FontFallbacks`; ligatures use forced-width `shape_line`;
+  opacity uses transparent-surface alpha repaint on Wayland/X11; and the X11
+  focus guard uses the raw Xcb XID. Their criteria are reconciled in the spec
+  and parity inventory before Phase B fans out.
 
 **Phase B — Terminal core (depends on: scaffold spike):**
 - IPC bridge: UiEvent drain task with 4 ms/100-event coalescing +
@@ -274,10 +282,12 @@ path.
   bracketed paste detection, IME wiring, bell.
 - Ported pure logic: xterm-256 palette, color semantics (bold→bright, DIM
   0.67, minimum-contrast, sRGB↔linear conversions, BrightForeground
-  boost), box-drawing. **Dependency edge: the box-drawing bead depends on
-  the box-drawing capability spike; the glyph-run painting bead depends on
-  the ligature + fallback-ordering spikes and the criteria-reconciliation
-  bead** — not just the scaffold spike.
+  boost), box-drawing. The box-drawing renderer emits a paint-quad alpha-mask
+  overlay for U+2500–U+259F, while normal terminal runs use ordered fallbacks
+  and forced-width ligature shaping. **Dependency edge: the box-drawing bead
+  depends on the box-drawing capability spike; the glyph-run painting bead
+  depends on the ligature + fallback-ordering spikes and the
+  criteria-reconciliation bead** — not just the scaffold spike.
 - Session lifecycle: replay, snapshot, reconnect rebuild, adoption,
   TrimScrollback mark shifting.
 
@@ -302,7 +312,7 @@ depend on: 015 landed):**
 - Config watcher + runtime reload; keybindings parser + actions.
 - Clipboard (arboard + OSC52 bridge + primary selection), notifications
   (zbus/notify-rust), server lifecycle (systemctl/launchd), window
-  geometry persistence, X11 focus guard (per spike), drag-drop paths.
+  geometry persistence, X11 focus guard using GPUI's Xcb XID, drag-drop paths.
 - Cold-restart restore (RestoreStore + `--restore-child`).
 - Remote/LAN/share surfaces (per 015 final form): connect picker, LAN
   approval, lost control, share roster, control passing.

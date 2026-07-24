@@ -132,8 +132,15 @@ As a Scribe user, I want the client to look and feel like a current-
 generation terminal, so that the UI no longer reads as dated.
 
 **Acceptance criteria:**
-- Emoji render in color in the grid; Nerd Font glyphs resolve before generic
-  symbol fonts (current fallback ordering preserved).
+- Emoji render in color in the grid. Every terminal glyph run supplies
+  `FontFallbacks::from_fonts` with Scribe's Nerd Font entries before generic
+  symbol and emoji fallbacks, preserving the current fallback ordering.
+- Procedural box drawing for U+2500–U+259F remains independent of terminal
+  font coverage: those cells bypass text shaping and paint alpha-mask quads
+  after backgrounds and before text glyphs.
+- Terminal ligatures honor `appearance.ligatures`: same-style runs use
+  `shape_line` with the grid `cell_width`, and disable `calt` only when the
+  setting is false, so later cell origins stay aligned.
 - Undercurl (wavy, colored), underline, double underline, strikethrough
   render from cell flags.
 - Every overlay (command palette, context menu, all dialogs, tooltips) has
@@ -142,7 +149,11 @@ generation terminal, so that the UI no longer reads as dated.
   interruptible easing; no animation exceeds 150 ms).
 - Scrolling is pixel-smooth (wheel and touchpad), including scrollback.
 - The window uses a custom titlebar with the tab bar integrated; native
-  decorations are gone on Linux; opacity changes apply live without restart.
+  decorations are gone on Linux. `appearance.opacity` updates live on Wayland
+  and X11 by repainting alpha-aware terminal and chrome backgrounds on a
+  transparent GPUI surface; text and controls stay opaque.
+- On X11, the focus guard retains its exact EWMH comparison by extracting the
+  GPUI `Xcb` raw-window-handle XID and comparing it with `_NET_ACTIVE_WINDOW`.
 
 ### US4 — Differentiating features preserved
 As an AI-workflow user, I want Scribe's differentiators intact, so the

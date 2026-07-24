@@ -164,12 +164,26 @@ fixtures when it emits terminal bytes; otherwise it has a headless GPUI test.
 (golden), `Layout` (gpui-test), `OpenSettings` (gpui-test),
 `OpenCommandPalette` (gpui-test), and `OpenFind` (gpui-test).
 
+## Rendering and window checklist
+
+These spike-resolved rendering and native-window requirements preserve the
+legacy terminal's output and platform behavior through the GPUI cutover.
+
+| Surface | Required behavior | Verification method | Status |
+| --- | --- | --- | --- |
+| Box drawing | U+2500–U+259F cells bypass text shaping and use the existing procedural alpha-mask rasterizer through a `TerminalElement` paint-quad overlay after backgrounds and before text. | visual-E2E | required |
+| Font fallback | Every terminal run uses `FontFallbacks::from_fonts` with `Symbols Nerd Font Mono`, `Symbols Nerd Font`, `Nerd Font Symbols Mono`, and `Nerd Font Symbols` before existing generic fallbacks; `Unifont Sample` remains excluded. | gpui-test | required |
+| Ligatures | `appearance.ligatures` keeps its semantics: same-style runs call `shape_line` with `Some(cell_width)` and disable `calt` only when false, without drifting later cell origins. | visual-E2E | required |
+| Opacity | `appearance.opacity` is clamped to `0.0..=1.0`; Wayland and composited X11 repaint alpha-aware terminal and chrome backgrounds live on a transparent surface, without restart. | manual | required |
+| X11 focus guard | The guard reads GPUI's `RawWindowHandle::Xcb` XID and compares it directly with `_NET_ACTIVE_WINDOW`; non-X11 backends do not enable the guard. | scripted-E2E | required |
+
 ## Removed configuration keys
 
 These legacy appearance keys must deserialize harmlessly at cutover but have no
 GPUI behavior. The table is intentionally narrow: only splash and bespoke
-renderer-pipeline controls are removed; surviving settings retain their current
-semantics.
+renderer-pipeline controls are removed. The spikes retain
+`appearance.ligatures` and `appearance.opacity` with their current semantics,
+so neither belongs in this table.
 
 | Legacy TOML key | Reason removed | Load behavior | Verification method |
 | --- | --- | --- | --- |
