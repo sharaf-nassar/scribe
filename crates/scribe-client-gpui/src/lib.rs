@@ -16,11 +16,19 @@
 //! model emits the `ReportWorkspaceTree` payload) on every mutation so the
 //! chrome and IPC layers can react.
 //!
+//! Alongside those it hosts the ported terminal-interaction pieces: [`preedit`]
+//! (IME composition state, overlay geometry, and a `gpui::EntityInputHandler`),
+//! [`paste`] (bracketed-paste detection gating the confirmation dialog), and
+//! [`bell`] (routing the terminal bell to a tab attention badge plus the system
+//! bell). The pure classifiers are unit-tested and the entity gates are covered
+//! by `#[gpui::test]`; IME is verified by the manual parity procedure.
+//!
 //! Consumers that wire these into the live GPUI view (IPC sink, keybinding
 //! dispatch, window shell) land in later beads of the `gpui-client-rebuild`
 //! epic; the `scribe-client-gpui` binary (`main.rs`) remains the display-only
 //! scaffold spike until then.
 
+pub mod bell;
 pub mod box_drawing;
 pub mod color;
 pub mod input;
@@ -29,6 +37,8 @@ pub mod mouse_reporting;
 pub mod mouse_state;
 pub mod palette;
 pub mod pane_tree;
+pub mod paste;
+pub mod preedit;
 pub mod url_detect;
 pub mod workspace_layout;
 pub mod workspace_tree;

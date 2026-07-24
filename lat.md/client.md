@@ -52,6 +52,43 @@ The GPUI rebuild ports the URL and OSC 8 scanner into the `lib` target so hover,
 
 Activation is ported alongside detection: [[crates/scribe-client-gpui/src/url_detect.rs#open_path]] (with the `:N` line-number suffix and `code --goto` fallback), [[crates/scribe-client-gpui/src/url_detect.rs#open_url]], and the disallowed-scheme gate hook ([[crates/scribe-client-gpui/src/url_detect.rs#is_allowed_scheme]], [[crates/scribe-client-gpui/src/url_detect.rs#open_uri_unguarded]]). The view-side hover/dwell/Ctrl-highlight wiring lands in a later GPUI phase.
 
+### GPUI IME Composition
+
+The GPUI rebuild ports the winit [[client#Input#IME Composition]] preedit semantics onto GPUI's IME plumbing so composition anchors on an absolute scrollback row with an underline overlay. IME needs a real compositor, so it is a manual parity item, not a `#[gpui::test]`.
+
+[[crates/scribe-client-gpui/src/preedit.rs#PreeditState]] is the verbatim data port (redacted-`Debug` composition text, optional caret hint, absolute start row + column). [[crates/scribe-client-gpui/src/preedit.rs#PreeditMachine]] is a GPUI-free state machine mirroring the winit `WindowEvent::Ime` arm: a non-empty `mark` arms/updates the composition anchored at the last `set_anchor` cell, an empty `mark` clears it, and `commit` clears and returns the committed text. The in-flight anchor stays fixed while a later `set_anchor` only affects the next composition.
+
+[[crates/scribe-client-gpui/src/preedit.rs#Ime]] wraps the machine in a `gpui::Entity` and implements `gpui::EntityInputHandler`: GPUI routes marked (composing) text through `replace_and_mark_text_in_range` and committed text through `replace_text_in_range`, which re-emits [[crates/scribe-client-gpui/src/preedit.rs#ImeEvent]] `Commit` so the view sends it through the normal `KeyInput` path. The terminal owns no editable document, so the text-query methods report an empty buffer and candidate placement follows the composition anchor.
+
+#### Preedit Overlay Geometry
+
+[[crates/scribe-client-gpui/src/preedit.rs#compute_overlay]] recomputes the [[crates/scribe-client-gpui/src/preedit.rs#PreeditOverlay]] each frame from the anchor and the live [[crates/scribe-client-gpui/src/preedit.rs#PreeditGeometry]], returning `None` while scrolled into scrollback so the underline never renders at the wrong visual row.
+
+The absolute [[crates/scribe-client-gpui/src/preedit.rs#PreeditState]] `start_row` minus `viewport_top_abs_row` resolves the on-screen line, so terminal scroll keeps the underline pinned to the originating line; a row above or below the visible window, a non-zero `display_offset`, or an anchor column past the right edge all yield `None`. [[crates/scribe-client-gpui/src/preedit.rs#preedit_cell_width]] sizes the underline via `unicode_width` advances (wide CJK glyphs reserve two cells, zero-width marks ride the base glyph, a leading combining mark is skipped), matching the renderer's styled-run accumulator.
+
+#### IME Parity Procedure
+
+IME is verified manually on both display servers because it depends on a live input-method engine the headless test harness cannot drive. The procedure exercises compose, update, commit, cancel, and the scrollback-stable anchor.
+
+1. **X11 + ibus/fcitx**: start an IME engine (`ibus-daemon -drx` or `fcitx5`), select a CJK input method, run `scribe-client-gpui` under X11, focus a pane, and type a multi-key composition (e.g. Japanese `nihongo`). Verify the underlined preedit appears at the cursor cell, updates in place as keys arrive, the OS candidate window anchors under the composition, Enter commits the selected text to the PTY (preedit clears the same frame the echo lands), and Escape cancels with no bytes sent.
+2. **Wayland**: repeat under a Wayland compositor with `text-input-v3` (e.g. GNOME/Mutter or Sway with `fcitx5`), confirming identical compose/commit/cancel behaviour and candidate placement.
+3. **Scrollback anchor**: begin a composition, scroll the viewport up into scrollback, and confirm the preedit overlay disappears while scrolled and reappears pinned to the originating line on return to the bottom.
+4. **Focus loss**: switch window focus mid-composition and confirm the preedit retires immediately with no committed bytes.
+
+### Bracketed Paste Gate
+
+The GPUI rebuild ports the winit [[client#Dialogs#Paste Confirmation Dialog]] spec-011 gate so a risky paste is parked behind a confirmation before any byte reaches the PTY. The pure classifier and the entity gate are covered by `#[gpui::test]`.
+
+[[crates/scribe-client-gpui/src/paste.rs#classify_paste]] is the byte-for-byte classifier port: it returns [[crates/scribe-client-gpui/src/paste.rs#PasteRisk]] iff the content has a line break (`\n`/`\r`) or a non-tab control/escape character. [[crates/scribe-client-gpui/src/paste.rs#PasteGate]] is a `gpui::Entity` whose `request` emits [[crates/scribe-client-gpui/src/paste.rs#PasteGateEvent]] `Confirm` (and parks a [[crates/scribe-client-gpui/src/paste.rs#ParkedPaste]]) only when the `terminal.paste_confirmation` config is on, the focused pane has NOT enabled bracketed paste, and the content classifies as risky; otherwise it emits `Send`. The enabled and bracketed checks short-circuit before classification so the common path adds no work.
+
+On the user's answer, `confirm` re-emits `Send` on the exact parked bytes — bypassing the gate, matching the winit resume path — while `cancel` drops the parked paste without sending anything.
+
+### Bell Routing
+
+The GPUI rebuild ports the winit `handle_bell_event` suppression gate onto an entity that routes a terminal bell to a per-tab attention badge plus the system bell, covered by `#[gpui::test]`.
+
+[[crates/scribe-client-gpui/src/bell.rs#BellController]] is a `gpui::Entity` tracking window focus, the focused session, and whether an update is in progress. `on_bell` records an attention badge and emits [[crates/scribe-client-gpui/src/bell.rs#BellEvent]] `Signal` (the view rings the OS bell / requests window attention) only when the bell targets a session other than the focused foreground pane — or the window is unfocused — and no update is in progress; a bell to the already-focused foreground pane is suppressed, exactly like the winit client. `focus_session` retires that session's badge.
+
 ## App State
 
 The master application state lives in the App struct in [[crates/scribe-client/src/main.rs]]. It holds all panes, the window layout, IPC sender, input bindings, theme, AI tracker, GPU context, and UI overlay state. The event loop is driven by winit's `ApplicationHandler` trait.
