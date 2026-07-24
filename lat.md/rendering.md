@@ -82,6 +82,12 @@ Glyph shaping uses a Scribe-specific cosmic-text fallback list so terminal icon 
 
 If no icon font is installed, private-use icons still fall back to the primary font's missing-glyph box; Scribe does not synthesize platform logos.
 
+### GPUI Fallback-Ordering Spike
+
+The GPUI migration preserves this ordering by attaching the same list to each glyph run through `FontFallbacks`.
+
+[[tools/gpui-font-fallback-spike/src/main.rs#verify_nerd_font_precedes_generic_symbols]] demonstrates the pinned GPUI backend preserving `Symbols Nerd Font Mono` before `Unifont Sample` for U+E0B0. The decision and US3 impact are recorded in `specs/016-gpui-client-rebuild/spikes/nerd-font-fallback-ordering.md`.
+
 ### UV Computation
 
 UV coordinates use float cell dimensions matching the GPU quad size, not ceiling-rounded canvas dimensions.
