@@ -51,19 +51,19 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `RemoteHandshake` | tailnet connect | scripted-E2E | required |
 | `ListRemotePeers` | remote connect picker | scripted-E2E | required |
 | `GetRemoteEnv` | remote settings | gpui-test | required |
-| `LanHello` | LAN connect | scripted-E2E | provisional — 015 reconcile |
-| `LanApprovalDecision` | LAN approval dialog | scripted-E2E | provisional — 015 reconcile |
-| `ListLanPeers` | LAN connect picker | scripted-E2E | provisional — 015 reconcile |
-| `ListTrustedDevices` | LAN settings | gpui-test | provisional — 015 reconcile |
-| `RevokeTrustedDevice` | LAN settings | scripted-E2E | provisional — 015 reconcile |
-| `ListTrustedNetworks` | LAN settings | gpui-test | provisional — 015 reconcile |
-| `AddCurrentNetworkTrusted` | LAN settings | scripted-E2E | provisional — 015 reconcile |
-| `RemoveTrustedNetwork` | LAN settings | scripted-E2E | provisional — 015 reconcile |
-| `GetLanEnv` | LAN settings | gpui-test | provisional — 015 reconcile |
-| `GetLanDialIdentity` | LAN dialing | scripted-E2E | provisional — 015 reconcile |
-| `ControlClaim` | shared-window control | scripted-E2E | provisional — 015 reconcile |
-| `ControlRequest` | shared-window control | scripted-E2E | provisional — 015 reconcile |
-| `ControlGrant` | shared-window control | scripted-E2E | provisional — 015 reconcile |
+| `LanHello` | mTLS LAN-dial preamble before session attachment | scripted-E2E | required |
+| `LanApprovalDecision` | owner-side fingerprint approval overlay | scripted-E2E | required |
+| `ListLanPeers` | merged Local network source in remote connect picker | scripted-E2E | required |
+| `ListTrustedDevices` | Remote settings trusted-device list | gpui-test | required |
+| `RevokeTrustedDevice` | Remote settings device-revocation action | scripted-E2E | required |
+| `ListTrustedNetworks` | Remote settings trusted-network list | gpui-test | required |
+| `AddCurrentNetworkTrusted` | Remote settings trust-current-network action | scripted-E2E | required |
+| `RemoveTrustedNetwork` | Remote settings trusted-network removal action | scripted-E2E | required |
+| `GetLanEnv` | Remote settings LAN listener/environment summary | gpui-test | required |
+| `GetLanDialIdentity` | local-server identity fetch before mTLS dialing | scripted-E2E | required |
+| `ControlClaim` | viewer claim/request affordance for a shared window | scripted-E2E | required |
+| `ControlRequest` | v3 compatibility alias; the client emits `ControlClaim` | golden | required |
+| `ControlGrant` | holder grant/deny prompt for a control request | scripted-E2E | required |
 
 ## Server messages (59 handled)
 
@@ -123,18 +123,18 @@ additive sharing variant is omitted.
 | `RemoteDisconnect` | remote-control landing | visual-E2E | required |
 | `RemotePeerList` | remote connect picker | visual-E2E | required |
 | `RemoteEnv` | remote settings | gpui-test | required |
-| `LanApprovalPending` | LAN approval dialog | visual-E2E | provisional — 015 reconcile |
-| `LanApprovalResult` | LAN approval dialog | visual-E2E | provisional — 015 reconcile |
-| `LanApprovalRequest` | LAN approval dialog | visual-E2E | provisional — 015 reconcile |
-| `LanPeerList` | LAN connect picker | visual-E2E | provisional — 015 reconcile |
-| `TrustedDeviceList` | LAN settings | gpui-test | provisional — 015 reconcile |
-| `TrustedNetworkList` | LAN settings | gpui-test | provisional — 015 reconcile |
-| `LanEnv` | LAN settings | gpui-test | provisional — 015 reconcile |
-| `LanDialIdentity` | LAN dialing | scripted-E2E | provisional — 015 reconcile |
-| `ShareRoster` | shared-window roster | visual-E2E | provisional — 015 reconcile |
-| `ControlRequested` | control request dialog | visual-E2E | provisional — 015 reconcile |
-| `ControlDenied` | control request dialog | visual-E2E | provisional — 015 reconcile |
-| `ShareEnded` | shared-window landing | visual-E2E | provisional — 015 reconcile |
+| `LanApprovalPending` | cancelable connecting-side waiting-for-approval overlay | visual-E2E | required |
+| `LanApprovalResult` | terminal LAN dial acceptance/refusal outcome | visual-E2E | required |
+| `LanApprovalRequest` | owner-side device fingerprint approval overlay | visual-E2E | required |
+| `LanPeerList` | Local network entries merged into remote connect picker | visual-E2E | required |
+| `TrustedDeviceList` | Remote settings trusted-device rows | gpui-test | required |
+| `TrustedNetworkList` | Remote settings trusted-network rows | gpui-test | required |
+| `LanEnv` | Remote settings LAN listener/environment summary | gpui-test | required |
+| `LanDialIdentity` | client mTLS identity returned by the local server | scripted-E2E | required |
+| `ShareRoster` | presence badge and live-viewer role/claim state | visual-E2E | required |
+| `ControlRequested` | holder or owner grant/deny control prompt | visual-E2E | required |
+| `ControlDenied` | requester control-denied notice | visual-E2E | required |
+| `ShareEnded` | shared-viewer end landing and state cleanup | visual-E2E | required |
 
 ## Input and keybinding checklist
 
@@ -183,9 +183,12 @@ semantics.
 | `appearance.prompt_bar_icon_first` | Bespoke prompt-bar pipeline colour override. | Silently ignored. | gpui-test |
 | `appearance.prompt_bar_icon_latest` | Bespoke prompt-bar pipeline colour override. | Silently ignored. | gpui-test |
 
-## 015-derived provisional boundary
+## LAN and sharing boundary
 
-All rows labeled **provisional — 015 reconcile** cover feature 015 sharing
-(roster and control passing) or its feature-014 LAN dialogs/settings. The
-separate 015-reconcile bead owns their final semantics and removes this marker;
-this inventory only preserves their current protocol and surface coverage.
+Feature 015 is present in `fd04540` (`feat: remote window control and
+multi-machine sharing`). The rows above follow its final client dispatch:
+`ipc_client.rs` performs the LAN handshake and maps its outcomes, `main.rs`
+renders the LAN and sharing states, and `share_view.rs` supplies the roster and
+control UI. `ControlRequest` remains a serializable protocol alias because the
+server handles it as `ControlClaim`; the client deliberately emits only the
+latter.
