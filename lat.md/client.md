@@ -220,6 +220,19 @@ the guard's direct EWMH comparison without title/PID lookup.
 The non-zero `window` field initializes `X11FocusGuard`; the decision and
 integration probe are recorded in `specs/016-gpui-client-rebuild/x11-xid-spike.md`.
 
+#### GPUI Terminal Ligatures
+
+Pinned GPUI keeps multi-cell terminal ligatures grid-aligned when its terminal
+run is shaped with `shape_line(..., Some(cell_width))`, so the rebuild retains
+the `appearance.ligatures` key.
+
+The port batches equal-style cells and uses the forced cell width while
+painting. GPUI preserves a zero-advance glyph's offset from its base glyph,
+then assigns each advancing glyph to the next grid cell; disabling `calt`
+through `FontFeatures::disable_ligatures()` provides the false-setting path.
+The demo and source evidence are recorded in
+`specs/016-gpui-client-rebuild/ligatures-spike.md`.
+
 ### Key Translation Priority
 
 Key events are resolved through a four-level priority chain from layout shortcuts down to raw terminal byte encoding.
