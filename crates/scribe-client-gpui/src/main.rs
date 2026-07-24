@@ -2,10 +2,12 @@
 
 mod ipc_bridge;
 mod session_lifecycle;
+mod sync_frames;
 mod terminal;
 mod terminal_element;
 
 use std::{
+    collections::HashMap,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -45,11 +47,15 @@ use scribe_common::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    sync::{
+        Notify,
+        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    },
 };
 
 use crate::{
     ipc_bridge::{InboundEvent, IpcSink, run_drain},
+    sync_frames::{SyncFrameQueue, drain_all_committed},
     terminal::{Content, DisplayOnlyTerminal},
     terminal_element::TerminalElement,
 };
@@ -572,27 +578,118 @@ where
     }
 }
 
-/// Spawns the coalescing drain: batched `write_output` + one repaint per dirty
-/// pane, mirroring Zed's terminal wakeup coalescing.
+/// Per-session synchronized-output frame queues shared between the coalescing
+/// drain (which enqueues committed bursts) and the expiry flusher.
+type SyncFrameQueues = Arc<Mutex<HashMap<SessionId, SyncFrameQueue>>>;
+
+/// Spawns the coalescing drain with synchronized-frame queueing in front of
+/// `write_output`. A first task drains the inbound channel with Zed's
+/// 4 ms / 100-event coalescing ([`run_drain`]), splits each pane's bytes into
+/// committed `CSI ? 2026` bursts via a per-session [`SyncFrameQueue`], and
+/// replays one burst per redraw so no frame tears across IPC message
+/// boundaries. A second task waits on the nearest raw-frame or parser sync
+/// deadline and flushes a 150 ms-expired update whose terminating `CSI ? 2026 l`
+/// never arrived.
 fn spawn_drain(
     in_rx: UnboundedReceiver<InboundEvent>,
     terminal: Arc<Mutex<DisplayOnlyTerminal>>,
     generation: Arc<AtomicU64>,
 ) {
+    let queues: SyncFrameQueues = Arc::new(Mutex::new(HashMap::new()));
+    let expiry_wake = Arc::new(Notify::new());
+
+    let queue_task = Arc::clone(&queues);
+    let terminal_task = Arc::clone(&terminal);
+    let generation_task = Arc::clone(&generation);
+    let wake_task = Arc::clone(&expiry_wake);
     tokio::spawn(run_drain(in_rx, move |batch| {
         if batch.is_empty() {
             return;
         }
-        let dirty = batch.len();
-        if let Ok(mut guard) = terminal.lock() {
-            for (_session, bytes) in batch.iter() {
-                guard.write_output(bytes);
+        let mut redraws = 0usize;
+        let mut sync_armed = false;
+        if let (Ok(mut session_queues), Ok(mut guard)) = (queue_task.lock(), terminal_task.lock()) {
+            for (session, bytes) in batch.iter() {
+                let queue = session_queues.entry(session).or_default();
+                queue.queue_output_frames(bytes);
+                redraws += usize::from(drain_all_committed(queue, &mut *guard).needs_redraw);
+                sync_armed |= queue.raw_sync_deadline().is_some();
             }
+            sync_armed |= guard.parser_sync_deadline().is_some();
         }
-        for _ in 0..dirty {
-            generation.fetch_add(1, Ordering::Release);
+        for _ in 0..redraws {
+            generation_task.fetch_add(1, Ordering::Release);
+        }
+        if sync_armed {
+            wake_task.notify_one();
         }
     }));
+
+    tokio::spawn(run_sync_expiry(queues, terminal, generation, expiry_wake));
+}
+
+/// Waits on the nearest synchronized-update deadline and commits it once it
+/// expires, so an unterminated `CSI ? 2026 h` still flushes after 150 ms even
+/// while the inbound channel is idle. When nothing is buffering, it parks until
+/// the drain task arms a fresh deadline.
+async fn run_sync_expiry(
+    queues: SyncFrameQueues,
+    terminal: Arc<Mutex<DisplayOnlyTerminal>>,
+    generation: Arc<AtomicU64>,
+    wake: Arc<Notify>,
+) {
+    loop {
+        match next_sync_deadline(&queues, &terminal) {
+            None => wake.notified().await,
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                tokio::select! {
+                    () = tokio::time::sleep(remaining) => flush_expired_sync(&queues, &terminal, &generation),
+                    () = wake.notified() => {}
+                }
+            }
+        }
+    }
+}
+
+/// Commits every raw-frame and parser synchronized update whose deadline has
+/// passed, bumping the redraw generation once per committed burst.
+fn flush_expired_sync(
+    queues: &SyncFrameQueues,
+    terminal: &Arc<Mutex<DisplayOnlyTerminal>>,
+    generation: &Arc<AtomicU64>,
+) {
+    let now = Instant::now();
+    let mut redraws = 0usize;
+    if let (Ok(mut session_queues), Ok(mut guard)) = (queues.lock(), terminal.lock()) {
+        redraws += usize::from(guard.flush_parser_sync_timeout(now));
+        for queue in session_queues.values_mut() {
+            let flushed = queue.flush_raw_timeout(now)
+                && drain_all_committed(queue, &mut *guard).needs_redraw;
+            redraws += usize::from(flushed);
+        }
+    }
+    for _ in 0..redraws {
+        generation.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Nearest synchronized-update deadline across every pane's raw-frame queue and
+/// the shared parser, or `None` when nothing is buffering.
+fn next_sync_deadline(
+    queues: &SyncFrameQueues,
+    terminal: &Arc<Mutex<DisplayOnlyTerminal>>,
+) -> Option<Instant> {
+    let parser = terminal.lock().ok().and_then(|guard| guard.parser_sync_deadline());
+    let raw = queues
+        .lock()
+        .ok()
+        .and_then(|queues| queues.values().filter_map(SyncFrameQueue::raw_sync_deadline).min());
+    match (parser, raw) {
+        (Some(parser), Some(raw)) => Some(parser.min(raw)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
 }
 
 /// Handles owned by the inbound read loop.

@@ -2,7 +2,7 @@
 //! reconnect paths onto the display-only GPUI terminal.
 //!
 //! Five frozen-protocol server messages drive a pane's lifecycle after attach:
-//! `SessionReplay` (zstd-decompress the reattach ANSI, then `write_output`),
+//! `SessionReplay` (zstd-decompress the reattach ANSI, then `feed_output`),
 //! `ScreenSnapshot` (reset the terminal, then replay the `snapshot_to_ansi`
 //! output), `TrimScrollback` (shift stored absolute prompt marks to track the
 //! dropped scrollback rows), and `SessionCreated` / `SessionExited` (register
@@ -44,7 +44,7 @@ impl std::fmt::Display for ReplayDecodeError {
     }
 }
 
-/// Decompress a `SessionReplay` into the ANSI byte stream fed to `write_output`.
+/// Decompress a `SessionReplay` into the ANSI byte stream fed to `feed_output`.
 ///
 /// Zero-dimension replays are rejected up front (the legacy client skips them),
 /// and a corrupt zstd stream is reported as a [`ReplayDecodeError`] rather than
@@ -330,7 +330,7 @@ mod tests {
         let replay = build_session_replay(&snapshot_with_text("hello reattach")).unwrap();
 
         let bytes = decode_replay(session, &replay).expect("valid replay decodes");
-        terminal.write_output(&bytes);
+        terminal.feed_output(&bytes);
 
         assert_eq!(first_row(&terminal), "hello reattach");
     }
@@ -339,7 +339,7 @@ mod tests {
     #[gpui::test]
     fn replay_decode_failure_shows_error_without_crashing(_cx: &mut gpui::TestAppContext) {
         let mut terminal = DisplayOnlyTerminal::new(80, 24);
-        terminal.write_output(b"live content");
+        terminal.feed_output(b"live content");
         let session = SessionId::new();
 
         // A valid replay header with a corrupt zstd payload.
@@ -352,7 +352,7 @@ mod tests {
         assert!(error.to_string().contains("replay decode failed"));
         // Terminal is untouched and still usable — no panic, no poisoned state.
         assert_eq!(first_row(&terminal), "live content");
-        terminal.write_output(b"\r\nmore output");
+        terminal.feed_output(b"\r\nmore output");
         assert_eq!(first_row(&terminal), "live content");
     }
 
@@ -360,9 +360,9 @@ mod tests {
     #[gpui::test]
     fn screen_snapshot_resets_before_replaying(_cx: &mut gpui::TestAppContext) {
         let mut terminal = DisplayOnlyTerminal::new(80, 24);
-        terminal.write_output(b"stale pane content that must be gone");
+        terminal.feed_output(b"stale pane content that must be gone");
 
-        terminal.write_output(&snapshot_reset_bytes(&snapshot_with_text("fresh snapshot")));
+        terminal.feed_output(&snapshot_reset_bytes(&snapshot_with_text("fresh snapshot")));
 
         assert_eq!(first_row(&terminal), "fresh snapshot");
     }
