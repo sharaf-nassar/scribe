@@ -12,8 +12,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use scribe_common::{
-    ids::SessionId,
-    protocol::{ClientMessage, TerminalSize},
+    ids::{SessionId, WorkspaceId},
+    protocol::{ClientMessage, TerminalSize, WorkspaceNotesMutation},
 };
 use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
@@ -207,6 +207,28 @@ impl IpcSink {
     /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
     pub fn resize(&self, session_id: SessionId, size: TerminalSize) -> Result<(), SinkClosed> {
         self.enqueue(ClientMessage::Resize { session_id, size })
+    }
+
+    /// Requests the authoritative workspace notes for `workspace_ids` so the
+    /// modal and hover preview can render server-owned state.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn workspace_notes_get(&self, workspace_ids: Vec<WorkspaceId>) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::WorkspaceNotesGet { workspace_ids })
+    }
+
+    /// Requests a server-side workspace-notes mutation (draft save, note
+    /// create/edit, archive, or bulk archive edit) built by the modal or
+    /// preview from the current editor state.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn workspace_notes_mutate(
+        &self,
+        mutation: WorkspaceNotesMutation,
+    ) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::WorkspaceNotesMutate { mutation })
     }
 
     fn enqueue(&self, message: ClientMessage) -> Result<(), SinkClosed> {

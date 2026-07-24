@@ -35,6 +35,10 @@ use scribe_client_gpui::layout::Rect;
 use scribe_client_gpui::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
 use scribe_client_gpui::sys_stats::SystemStatsCollector;
 use scribe_client_gpui::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
+use scribe_client_gpui::workspace_notes::WorkspaceNoteEntry;
+use scribe_client_gpui::workspace_notes_modal::{
+    WorkspaceNotesModalAction, WorkspaceNotesModalColors, WorkspaceNotesModalView,
+};
 use scribe_client_gpui::{
     tab_bar::{TabBarColors, TabData},
     titlebar::TitlebarView,
@@ -43,8 +47,10 @@ use scribe_common::theme::ChromeColors;
 use scribe_common::{
     config::{StatusBarStatsConfig, load_config, resolve_theme},
     framing::{read_message, write_message},
-    ids::SessionId,
-    protocol::{ClientMessage, ServerMessage, SessionInfo, TerminalSize},
+    ids::{SessionId, WorkspaceId},
+    protocol::{
+        ArchiveReason, ClientMessage, ServerMessage, SessionInfo, TerminalSize, WorkspaceNoteStatus,
+    },
     socket::server_socket_path,
     theme::minimal_dark,
 };
@@ -138,6 +144,8 @@ struct TerminalView {
     /// wires two representative dialogs (close + clipboard) so the visual E2E
     /// can screenshot the ported modal chrome and its focus/button behaviour.
     dialog: Option<Entity<DialogView>>,
+    /// The per-workspace notes modal overlay, present only while open.
+    workspace_notes_modal: Option<Entity<WorkspaceNotesModalView>>,
     /// Demo toggle: when set, an OSC 8-style hover tooltip is drawn over a fixed
     /// anchor so the visual E2E can exercise tooltip clamping + URL truncation.
     tooltip_demo: bool,
@@ -174,6 +182,7 @@ impl TerminalView {
             command_palette: None,
             context_menu: None,
             dialog: None,
+            workspace_notes_modal: None,
             tooltip_demo: false,
             _refresh_task: refresh_task,
         }
@@ -240,14 +249,144 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Open the workspace-notes modal for a demo workspace, request its
+    /// authoritative notes over the frozen IPC protocol, seed a representative
+    /// note set, and subscribe so the shell routes each control — Save/archive
+    /// become `WorkspaceNotesMutate`, Close tears the overlay down. Proves the
+    /// modal surface plus the `WorkspaceNotesGet`/`WorkspaceNotesMutate` sink
+    /// path end to end for the visual E2E, mirroring the other overlay demos.
+    fn open_workspace_notes_modal(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.context_menu = None;
+        let workspace_id = WorkspaceId::new();
+        let colors = WorkspaceNotesModalColors::from(&self.chrome);
+        let notes = demo_workspace_notes(workspace_id);
+        let modal = cx.new(|cx| {
+            let mut view = WorkspaceNotesModalView::new(&colors, cx);
+            view.open(workspace_id, String::new(), cx);
+            view.set_notes(notes, Vec::new(), cx);
+            view
+        });
+        // Request the server's authoritative copy; the reply hydrates the modal
+        // through `set_notes` once the shell's inbound wiring lands.
+        if let Err(error) = self.sink.workspace_notes_get(vec![workspace_id]) {
+            tracing::warn!(%error, "workspace notes get dropped: IPC writer closed");
+        }
+        cx.subscribe(&modal, |this, modal, action, ctx| {
+            this.route_workspace_notes_action(&modal, action, ctx);
+        })
+        .detach();
+        self.workspace_notes_modal = Some(modal);
+        cx.notify();
+    }
+
+    /// Route one modal control to its side effect: state transitions update the
+    /// modal, Save/archive emit a `WorkspaceNotesMutate`, and Close clears it.
+    fn route_workspace_notes_action(
+        &mut self,
+        modal: &Entity<WorkspaceNotesModalView>,
+        action: &WorkspaceNotesModalAction,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            WorkspaceNotesModalAction::Close => {
+                self.workspace_notes_modal = None;
+                cx.notify();
+            }
+            WorkspaceNotesModalAction::Save => {
+                if let Some(mutation) = modal.read(cx).save_mutation() {
+                    self.send_workspace_notes_mutation(mutation);
+                }
+            }
+            WorkspaceNotesModalAction::CancelEdit => {
+                modal.update(cx, |m, ctx| {
+                    m.cancel_edit();
+                    ctx.notify();
+                });
+            }
+            WorkspaceNotesModalAction::ShowActive => {
+                modal.update(cx, |m, ctx| {
+                    m.set_view(
+                        scribe_client_gpui::workspace_notes_modal::WorkspaceNotesView::Active,
+                        ctx,
+                    );
+                });
+            }
+            WorkspaceNotesModalAction::ShowArchive => {
+                modal.update(cx, |m, ctx| {
+                    m.set_view(
+                        scribe_client_gpui::workspace_notes_modal::WorkspaceNotesView::Archive,
+                        ctx,
+                    );
+                });
+            }
+            WorkspaceNotesModalAction::EditActive(note_id) => {
+                let note_id = note_id.clone();
+                modal.update(cx, |m, ctx| m.begin_active_edit_by_id(&note_id, ctx));
+            }
+            WorkspaceNotesModalAction::EditArchived(note_id) => {
+                let note_id = note_id.clone();
+                modal.update(cx, |m, ctx| m.begin_archived_edit_by_id(&note_id, ctx));
+            }
+            WorkspaceNotesModalAction::EditAllArchive => {
+                modal.update(cx, WorkspaceNotesModalView::begin_archive_bulk_edit_all);
+            }
+            WorkspaceNotesModalAction::ArchiveDone(note_id) => {
+                if let Some(mutation) =
+                    modal.read(cx).archive_mutation(note_id, ArchiveReason::Done)
+                {
+                    self.send_workspace_notes_mutation(mutation);
+                }
+            }
+            WorkspaceNotesModalAction::ArchiveRemoved(note_id) => {
+                if let Some(mutation) =
+                    modal.read(cx).archive_mutation(note_id, ArchiveReason::Removed)
+                {
+                    self.send_workspace_notes_mutation(mutation);
+                }
+            }
+        }
+    }
+
+    /// Enqueue a workspace-notes mutation on the outbound sink.
+    fn send_workspace_notes_mutation(
+        &self,
+        mutation: scribe_common::protocol::WorkspaceNotesMutation,
+    ) {
+        if let Err(error) = self.sink.workspace_notes_mutate(mutation) {
+            tracing::warn!(%error, "workspace notes mutation dropped: IPC writer closed");
+        }
+    }
+
+    /// Apply one keystroke to the open workspace-notes modal: Escape/Enter emit
+    /// Close/Save, Backspace deletes, and printable input types into the buffer.
+    fn handle_notes_modal_key(
+        modal: &Entity<WorkspaceNotesModalView>,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let typed = event.keystroke.key_char.as_ref().filter(|t| !t.is_empty()).cloned();
+        match event.keystroke.key.as_str() {
+            "escape" => modal.update(cx, |_, ctx| ctx.emit(WorkspaceNotesModalAction::Close)),
+            "enter" => modal.update(cx, |_, ctx| ctx.emit(WorkspaceNotesModalAction::Save)),
+            "backspace" => modal.update(cx, WorkspaceNotesModalView::pop_char),
+            _ => {
+                if let Some(text) = typed {
+                    modal.update(cx, |m, ctx| text.chars().for_each(|ch| m.push_char(ch, ctx)));
+                }
+            }
+        }
+    }
+
     /// Route a keystroke while an overlay owns the keyboard. Returns `true` when
     /// the key was consumed by an overlay (and must not reach the PTY).
     fn handle_overlay_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let mods = &event.keystroke.modifiers;
         // Ctrl+Shift+P opens the palette; Ctrl+Shift+U toggles the tooltip demo;
         // Ctrl+Shift+Q opens the close dialog; Ctrl+Shift+K opens the clipboard
-        // dialog (the two representative modals the visual E2E screenshots).
-        if mods.control && mods.shift && self.dialog.is_none() {
+        // dialog; Ctrl+Shift+N opens the workspace-notes modal.
+        if mods.control && mods.shift && self.dialog.is_none() && self.workspace_notes_modal.is_none()
+        {
             match event.keystroke.key.as_str() {
                 "p" => {
                     self.open_command_palette(cx);
@@ -274,6 +413,10 @@ impl TerminalView {
                     );
                     return true;
                 }
+                "n" => {
+                    self.open_workspace_notes_modal(cx);
+                    return true;
+                }
                 _ => {}
             }
         }
@@ -289,6 +432,11 @@ impl TerminalView {
                 "left" => dialog.update(cx, DialogView::focus_prev),
                 _ => {}
             }
+            return true;
+        }
+
+        if let Some(modal) = self.workspace_notes_modal.clone() {
+            Self::handle_notes_modal_key(&modal, event, cx);
             return true;
         }
 
@@ -329,6 +477,25 @@ impl TerminalView {
             tracing::warn!(%error, "dropped keystroke: IPC writer closed");
         }
     }
+}
+
+/// Representative active notes seeding the workspace-notes modal demo so the
+/// visual E2E can exercise the list, per-row actions, and editor surfaces.
+fn demo_workspace_notes(workspace_id: WorkspaceId) -> Vec<WorkspaceNoteEntry> {
+    ["Wire up the release checklist", "Follow up on the perf gate numbers"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| WorkspaceNoteEntry {
+            note_id: format!("demo-{index}"),
+            workspace_id,
+            text: text.to_owned(),
+            status: WorkspaceNoteStatus::Active,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            archived_at_ms: None,
+            archive_reason: None,
+        })
+        .collect()
 }
 
 /// Interim keystroke encoder feeding the outbound [`IpcSink`] (see
@@ -488,6 +655,7 @@ impl Render for TerminalView {
             .children(self.command_palette.clone())
             .children(self.context_menu.clone())
             .children(self.dialog.clone())
+            .children(self.workspace_notes_modal.clone())
             .children(tooltip)
     }
 }
