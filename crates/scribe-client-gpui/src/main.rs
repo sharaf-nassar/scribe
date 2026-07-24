@@ -6,10 +6,10 @@ mod terminal_element;
 
 use std::{
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui::{
@@ -34,6 +34,42 @@ use crate::{
     terminal::{Content, DisplayOnlyTerminal},
     terminal_element::TerminalElement,
 };
+
+/// Wall-clock origin captured at the very top of `main`, used to time
+/// startup-to-first-frame for the perf A/B rig (`tools/perf-ab-rig`).
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+/// Latches once the first frame has emitted its startup-timing marker so the
+/// per-frame `render` hook only measures the initial paint.
+static FIRST_FRAME_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Env var that opts the client into the perf-rig startup marker. Its value is
+/// a file path; when set to a non-empty path, the first `render` writes a
+/// machine-parseable `first_frame_ms=<n>` marker to that file. The rig reads it
+/// and gates it against the 500 ms Clarification-Q3 budget. Unset by default so
+/// normal runs write nothing.
+const STARTUP_TIMING_ENV: &str = "SCRIBE_GPUI_STARTUP_TIMING";
+
+/// Writes the startup-to-first-frame marker exactly once, on the first painted
+/// frame, when [`STARTUP_TIMING_ENV`] names an output file. The elapsed time is
+/// measured from [`PROCESS_START`] so it captures the full window from process
+/// launch through GPU-ready first paint, mirroring the old client's
+/// `init_gpu_and_terminal_done` method that produced the recorded baseline.
+fn log_first_frame_timing() {
+    if FIRST_FRAME_LOGGED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(path) = std::env::var_os(STARTUP_TIMING_ENV).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let Some(start) = PROCESS_START.get() else {
+        return;
+    };
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if let Err(error) = std::fs::write(&path, format!("first_frame_ms={elapsed_ms:.3}\n")) {
+        tracing::warn!(%error, "failed to write startup-timing marker");
+    }
+}
 
 const COLUMNS: u16 = 120;
 const ROWS: u16 = 36;
@@ -129,6 +165,7 @@ async fn drive_redraws(
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        log_first_frame_timing();
         if !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle, cx);
         }
@@ -168,6 +205,7 @@ impl Render for TerminalView {
 }
 
 fn main() {
+    PROCESS_START.get_or_init(Instant::now);
     let shared = Shared {
         terminal: Arc::new(Mutex::new(DisplayOnlyTerminal::new(
             usize::from(COLUMNS),

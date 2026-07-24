@@ -197,3 +197,23 @@ Unit tests for the GPUI client's ported [[client#GPUI Client Spike#GPUI URL Dete
 ### Explicit hyperlink segment geometry
 
 [[crates/scribe-client-gpui/src/url_detect.rs#segments_from_cells]] collapses a multi-row OSC 8 run into exact per-row [[crates/scribe-client-gpui/src/url_detect.rs#RowSegment]]s, and `Osc8CellRange::contains` hit-tests a partial middle row by its own segment bounds rather than a bounding rectangle, so hover coverage stays exact.
+
+## GPUI Perf A/B Gate
+
+The launch-blocking performance comparison for the GPUI client rebuild. The `tools/perf-ab-rig/run-perf-ab.sh` rig compares the new client against the recorded old-client baselines and writes a per-metric pass/fail report.
+
+The five metrics and thresholds are: startup-to-first-frame (`<= 500 ms` absolute, also gating splash deletion), input latency (no worse than old client), cat-firehose throughput (no worse than old client), memory at 10 tabs (`<= old + 20%`), and scroll (sustained 60 fps with `< 1%` dropped frames). Old-client baselines live in `specs/016-gpui-client-rebuild/perf-baseline.md`; the generated report is `specs/016-gpui-client-rebuild/perf-ab-report.md`.
+
+The rig has two modes. `assess` (default) generates the current-state report from the committed baseline plus a static capability check without launching any GUI or touching the live server. `--live` is the launch-gate mode: it launches the target client on the same machine/session, drives each workload, and enforces the thresholds; it attaches to the already-running server and never restarts it.
+
+### Startup instrumentation
+
+The GPUI client times startup-to-first-frame only when the `SCRIBE_GPUI_STARTUP_TIMING` env var is set, printing a machine-readable marker the rig parses.
+
+[[crates/scribe-client-gpui/src/main.rs#log_first_frame_timing]] latches on the first painted frame and writes a `first_frame_ms=<n>` marker to the file the env var names, timed from the `PROCESS_START` origin captured at the top of `main`, mirroring the old client's `init_gpu_and_terminal_done` method that produced the recorded baseline.
+
+### Deferred runtime metrics
+
+While the client remains a display-only scaffold spike, input latency, firehose throughput, memory at 10 tabs, and scroll fps are reported `DEFERRED` rather than measured.
+
+The spike has no stable input encoder with echo instrumentation, no multi-tab support, and no scroll frame counter, so those workloads cannot be driven yet. The rig records the exact live method for each so the launch gate (`scribe-38e.42`) can re-run it at cutover and enforce every threshold; a `FAIL` reopens the perf-rig bead.
