@@ -764,4 +764,103 @@ mod tests {
             Some(pane_c)
         );
     }
+
+    /// A 2x2 grid: A top-left, B top-right, C bottom-left, D bottom-right.
+    ///
+    /// Depth-first leaf order is `[A, B, C, D]`. Over a 100x100 viewport each
+    /// pane occupies a 50x50 quadrant, giving the four focus directions a
+    /// well-defined direct neighbor and a defined opposite-edge wrap target.
+    type GridPanes = (LayoutTree, PaneId, PaneId, PaneId, PaneId, Vec<PaneRect>);
+
+    fn two_by_two_grid() -> GridPanes {
+        let pane_a = PaneId::from_raw(11);
+        let pane_b = PaneId::from_raw(12);
+        let pane_c = PaneId::from_raw(13);
+        let pane_d = PaneId::from_raw(14);
+        let layout = LayoutTree::from_root(
+            LayoutNode::Split {
+                direction: SplitDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(LayoutNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(LayoutNode::Leaf(pane_a)),
+                    second: Box::new(LayoutNode::Leaf(pane_b)),
+                }),
+                second: Box::new(LayoutNode::Split {
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(LayoutNode::Leaf(pane_c)),
+                    second: Box::new(LayoutNode::Leaf(pane_d)),
+                }),
+            },
+            pane_a,
+        );
+        let rects = layout.compute_rects(Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 });
+        (layout, pane_a, pane_b, pane_c, pane_d, rects)
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Pane split-tree logic]]
+    #[test]
+    fn directional_focus_covers_all_four_axes() {
+        let (layout, pane_a, pane_b, pane_c, pane_d, rects) = two_by_two_grid();
+        // Direct neighbors around the grid.
+        assert_eq!(
+            layout.find_pane_in_direction(pane_a, FocusDirection::Right, &rects),
+            Some(pane_b)
+        );
+        assert_eq!(
+            layout.find_pane_in_direction(pane_b, FocusDirection::Left, &rects),
+            Some(pane_a)
+        );
+        assert_eq!(
+            layout.find_pane_in_direction(pane_a, FocusDirection::Down, &rects),
+            Some(pane_c)
+        );
+        assert_eq!(layout.find_pane_in_direction(pane_c, FocusDirection::Up, &rects), Some(pane_a));
+        assert_eq!(
+            layout.find_pane_in_direction(pane_d, FocusDirection::Left, &rects),
+            Some(pane_c)
+        );
+        assert_eq!(layout.find_pane_in_direction(pane_d, FocusDirection::Up, &rects), Some(pane_b));
+    }
+
+    #[test]
+    fn directional_focus_wraps_up_to_the_bottom_of_its_column() {
+        let (layout, pane_a, _, pane_c, _, rects) = two_by_two_grid();
+        // Nothing sits above A, so moving up wraps to the same-column bottom.
+        assert_eq!(layout.find_pane_in_direction(pane_a, FocusDirection::Up, &rects), Some(pane_c));
+    }
+
+    #[test]
+    fn next_pane_cycles_depth_first_and_wraps() {
+        let (layout, pane_a, pane_b, pane_c, pane_d, _) = two_by_two_grid();
+        assert_eq!(layout.next_pane(pane_a), pane_b);
+        assert_eq!(layout.next_pane(pane_b), pane_c);
+        assert_eq!(layout.next_pane(pane_c), pane_d);
+        // Last pane in depth-first order wraps back to the first.
+        assert_eq!(layout.next_pane(pane_d), pane_a);
+    }
+
+    #[test]
+    fn swap_panes_exchanges_leaf_positions() {
+        let (mut layout, pane_a, pane_b, pane_c, pane_d, _) = two_by_two_grid();
+        assert!(layout.swap_panes(pane_a, pane_d));
+        // A and D trade slots; depth-first order reflects the exchange.
+        assert_eq!(layout.all_pane_ids(), vec![pane_d, pane_b, pane_c, pane_a]);
+    }
+
+    #[test]
+    fn close_pane_promotes_sibling_but_keeps_sole_root() {
+        let (mut layout, pane_a, pane_b, pane_c, pane_d, _) = two_by_two_grid();
+        assert!(layout.close_pane(pane_b));
+        assert_eq!(layout.all_pane_ids(), vec![pane_a, pane_c, pane_d]);
+        // Collapse the remaining panes down to a single leaf.
+        assert!(layout.close_pane(pane_c));
+        assert!(layout.close_pane(pane_d));
+        assert_eq!(layout.all_pane_ids(), vec![pane_a]);
+        // The last surviving pane cannot be closed.
+        assert!(!layout.close_pane(pane_a));
+        assert_eq!(layout.all_pane_ids(), vec![pane_a]);
+    }
 }
