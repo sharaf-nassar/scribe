@@ -44,6 +44,14 @@ The event payload is the exact `WorkspaceTreeNode` the client forwards to the se
 
 Reported mutations include workspace split, tab add/remove, [[crates/scribe-client-gpui/src/workspace_tree.rs#WorkspaceTree#set_active_tab]], workspace ratio change (clamped 0.1-0.9), and in-place slot edits via `update_slot`. On reconnect the restore path pushes tabs (each auto-activating the last) and then replays `active_tab_index` through `set_active_tab` to restore the originally focused tab, matching the winit client's post-pass.
 
+### GPUI URL Detection Port
+
+The GPUI rebuild ports the URL and OSC 8 scanner into the `lib` target so hover, Ctrl-highlight, and open affordances reuse the same [[client#URL Detection]] logic byte-for-byte across the cutover.
+
+[[crates/scribe-client-gpui/src/url_detect.rs#PaneUrlCache]] is a verbatim port of the winit [[crates/scribe-client/src/url_detect.rs#PaneUrlCache]] onto Zed's Alacritty fork: the same scheme list (https/http/ftp/file/mailto/ssh/telnet), `WRAPLINE` join, trailing-punctuation stripping, per-row [[crates/scribe-client-gpui/src/url_detect.rs#RowSegment]] geometry, hard-break continuation ([[crates/scribe-client-gpui/src/url_detect.rs#hard_break_continuation_start]]), and OSC 8 precedence with `id=` reconnection and the 2048-byte URI cap ([[crates/scribe-client-gpui/src/url_detect.rs#scan_osc8_hyperlinks]]). Because the selection port lands in a separate bead, the two grid cell readers ([[crates/scribe-client-gpui/src/url_detect.rs#read_cell_char]], [[crates/scribe-client-gpui/src/url_detect.rs#read_cell_flags]]) are defined locally instead of imported from `selection`.
+
+Activation is ported alongside detection: [[crates/scribe-client-gpui/src/url_detect.rs#open_path]] (with the `:N` line-number suffix and `code --goto` fallback), [[crates/scribe-client-gpui/src/url_detect.rs#open_url]], and the disallowed-scheme gate hook ([[crates/scribe-client-gpui/src/url_detect.rs#is_allowed_scheme]], [[crates/scribe-client-gpui/src/url_detect.rs#open_uri_unguarded]]). The view-side hover/dwell/Ctrl-highlight wiring lands in a later GPUI phase.
+
 ## App State
 
 The master application state lives in the App struct in [[crates/scribe-client/src/main.rs]]. It holds all panes, the window layout, IPC sender, input bindings, theme, AI tracker, GPU context, and UI overlay state. The event loop is driven by winit's `ApplicationHandler` trait.

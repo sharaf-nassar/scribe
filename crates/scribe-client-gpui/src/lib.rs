@@ -24,6 +24,7 @@ pub mod input;
 pub mod layout;
 pub mod palette;
 pub mod pane_tree;
+pub mod url_detect;
 pub mod workspace_layout;
 pub mod workspace_tree;
 
