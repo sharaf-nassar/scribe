@@ -1,0 +1,23 @@
+{
+  "format": 1,
+  "source": "crates/scribe-client/src/mouse_reporting.rs at f407b286f923844f520decf7d60a893ec07c30ed",
+  "encoding": "Each `bytes` value is lowercase hexadecimal without separators. Coordinates are zero-indexed input cells.",
+  "cases": [
+    { "name": "sgr-1006-left-press", "input": "left press at 0,0", "bytes": "1b5b3c303b313b314d" },
+    { "name": "sgr-1006-right-release-shift", "input": "right release + Shift at 3,5", "bytes": "1b5b3c363b343b366d" },
+    { "name": "sgr-1006-scroll-down-ctrl", "input": "scroll down + Ctrl at 11,7", "bytes": "1b5b3c38313b31323b384d" },
+    { "name": "sgr-1006-drag-right-alt", "input": "right drag + Alt at 4,7", "bytes": "1b5b3c34323b353b384d" },
+    { "name": "x10-left-press", "input": "left press at 0,0", "bytes": "1b5b4d202121" },
+    { "name": "x10-release", "input": "right release at 4,6", "bytes": "1b5b4d232527" },
+    { "name": "x10-middle-drag", "input": "middle drag at 0,0", "bytes": "1b5b4d412121" },
+    { "name": "x10-coordinate-clamp", "input": "left press at 999,999", "bytes": "1b5b4d20ffff" }
+  ],
+  "motion-gates": [
+    { "mode": "1000", "button_held": false, "cell_changed": true, "report": false },
+    { "mode": "1000", "button_held": true, "cell_changed": true, "report": false },
+    { "mode": "1002", "button_held": false, "cell_changed": true, "report": false },
+    { "mode": "1002", "button_held": true, "cell_changed": true, "report": true },
+    { "mode": "1003", "button_held": false, "cell_changed": true, "report": true },
+    { "mode": "1003", "button_held": true, "cell_changed": false, "report": false }
+  ]
+}

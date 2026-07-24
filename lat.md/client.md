@@ -281,6 +281,12 @@ Dropped files and directories are pasted into the focused shell using shell-awar
 
 When a terminal application enables mouse mode, button, motion, and scroll events are encoded as xterm escape sequences and forwarded to the PTY.
 
+#### GPUI Rebuild Golden Oracle
+
+The future GPUI client ports input byte-for-byte from committed old-client captures before this implementation is deleted.
+
+`tests/fixtures/gpui-client/keyboard-byte-golden.json` captures legacy xterm, Kitty CSI-u, DECCKM, and DECPAM bytes. `mouse-byte-golden.json` captures X10, SGR-1006, and the 1000/1002/1003 motion gate. The root test-fixture location survives old-client deletion and is copied into the new crate when that scaffold exists; porting beads load the captures rather than recreate expected strings by hand.
+
 Encoding lives in [[crates/scribe-client/src/mouse_reporting.rs]]; modifiers go in the Cb field (Shift +4, Alt +8, Ctrl +16) and SGR 1006 vs X10 is chosen per the terminal's `SGR_MOUSE` mode.
 
 Stale mouse modes left behind by a dead foreground program (force-closed SSH, killed TUI) are cleared server-side when the shell prompt returns — the client needs no special handling because the injected DECRST arrives through the normal `PtyOutput` stream; see [[server#Sessions#PTY Reader Task]].
