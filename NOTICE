@@ -1,0 +1,27 @@
+Scribe attribution and license notice
+====================================
+
+Copyright 2026 Scribe Team.
+
+Scribe is licensed under the GNU General Public License, version 3 or later.
+The full license text is in LICENSE.
+
+Project contributor acknowledgement
+-----------------------------------
+
+Scribe acknowledges Vishal Shah as the project's sole co-contributor at the
+time of this relicensing. The contributors have not assigned copyright or
+required a contributor license agreement; the prior permissive contributions
+are compatible with this one-way GPL-3.0-or-later relicensing.
+
+Third-party attribution
+-----------------------
+
+Zed terminal and element code copied into Scribe is derived from Zed,
+copyright Zed Industries, Inc. and contributors. Zed is licensed under the
+GNU General Public License, version 3 or later. Its source and license are
+available at https://github.com/zed-industries/zed.
+
+GPUI is consumed as a git dependency from the Zed project. GPUI is licensed
+under the Apache License, Version 2.0. Its source and license are available
+at https://github.com/zed-industries/zed.

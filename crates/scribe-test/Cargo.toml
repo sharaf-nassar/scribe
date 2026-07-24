@@ -2,6 +2,7 @@
 name = "scribe-test"
 version.workspace = true
 edition.workspace = true
+license = "GPL-3.0-or-later"
 rust-version.workspace = true
 description = "E2E test harness for Scribe terminal emulator"
 publish = false
