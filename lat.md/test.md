@@ -721,6 +721,58 @@ A pin height larger than the content rect collapses the top portion to zero rath
 
 [[crates/scribe-client-gpui/src/split_scroll.rs#align_pin_rows_to_logical_lines]] expands the pin upward across `WRAPLINE`-flagged rows so the split never starts mid-way through a soft-wrapped logical line, and leaves the requested rows unchanged when there is no wrap.
 
+## GPUI Command Scrollbar
+
+Covers the bespoke command-mark scrollbar in [[crates/scribe-client-gpui/src/scrollbar.rs#build_scrollbar_render]] — thumb geometry, fade/hover-widen animation, click/drag scroll math, and command-status tick placement with trim-shift — the renderer-independent core the GPUI paint path lowers onto quads.
+
+### No scrollback yields no thumb
+
+[[crates/scribe-client-gpui/src/scrollbar.rs#compute_thumb]] returns nothing and [[crates/scribe-client-gpui/src/scrollbar.rs#hit_test_scrollbar]] never matches when the pane has zero scrollback rows, so an unscrolled pane shows no overlay.
+
+### Thumb sizes and positions from the viewport
+
+`compute_thumb` sizes the thumb from the visible-to-total row ratio (floored at [[crates/scribe-client-gpui/src/scrollbar.rs#MIN_THUMB_HEIGHT]]) and positions it down the track from the display offset, right-aligned inside the pane with the fixed inset.
+
+### Track click maps to a scroll offset
+
+[[crates/scribe-client-gpui/src/scrollbar.rs#offset_from_track_click]] maps a click at the track top to the oldest scrollback and a click at the bottom to the live view, with mid-track clicks landing part-way up the history.
+
+### Drag maps vertical delta to offset
+
+[[crates/scribe-client-gpui/src/scrollbar.rs#offset_from_drag]] converts the vertical drag delta from the captured start into a new display offset — dragging down scrolls toward the live bottom and dragging up toward the top of history.
+
+### Hit zone widens the right edge threefold
+
+`hit_test_scrollbar` accepts points inside a `3x`-width band anchored to the pane's right edge (the [[crates/scribe-client-gpui/src/scrollbar.rs#HIT_ZONE_MULTIPLIER]] padding) and rejects points left of the band or above the track top.
+
+### Thumb hit test tracks the thumb rect
+
+[[crates/scribe-client-gpui/src/scrollbar.rs#hit_test_thumb]] matches only points inside the computed thumb rectangle, so a point elsewhere on the track (for click-to-jump) is distinguished from a point on the thumb (for drag).
+
+### Command ticks colour by status and shift with trim
+
+`build_scrollbar_render` colours each tick by its [[crates/scribe-client-gpui/src/scrollbar.rs#CommandStatus]] — theme green for success, red for failure, neutral for unknown — orders them by `abs_pos`, and re-places them after a trim shifts positions.
+
+### Stale mark position clamps inside the track
+
+A mark whose `abs_pos` is stale (larger than the post-resize history) clamps to the track bounds so it never renders outside the scrollbar, absorbing the transient between a resize and the next trim shift.
+
+### Invisible scrollbar renders nothing
+
+`build_scrollbar_render` returns `None` while the fade opacity is zero, so a rested scrollbar emits no thumb or ticks even with scrollback and marks present.
+
+### Fade idles then fades over the configured windows
+
+[[crates/scribe-client-gpui/src/scrollbar.rs#ScrollbarState#tick_fade_at]] holds full opacity through the 1.5s idle delay after a scroll, ramps opacity down across the 0.3s fade window, and settles to invisible past it.
+
+### Hover holds opacity and widens the thumb
+
+`on_hover_enter` pins full opacity and clears the fade timer; `build_scrollbar_render` retargets the width wider and `tick_fade_at` lerps the display width toward it, while `on_hover_leave` re-arms the fade and relaxes the target.
+
+### Mark colours fall back without an ANSI palette
+
+[[crates/scribe-client-gpui/src/scrollbar.rs#CommandMarkColors#from_ansi]] reads the theme's ANSI green (index 2) and red (index 1) for the success/failure tick hues, so themed palettes drive the tick colours directly.
+
 ## GPUI Font Zoom
 
 Covers the runtime font-zoom math in [[crates/scribe-client-gpui/src/zoom.rs#ZoomState]] — the in/out/reset point delta the GPUI shell applies over the configured font size, isolated so clamping and the size floor are verifiable without a window.
