@@ -8,8 +8,9 @@
 # instrumentation, and writes a markdown report with a per-metric pass/fail
 # verdict.
 #
-# The Q3 budget:
-#   1. startup-to-first-frame   : <= 500 ms absolute (also gates splash deletion)
+# The Q3 budget (startup re-scoped 2026-07-24, see spec.md "Q3 re-scope"):
+#   1. startup-to-first-frame   : no worse than the old client, both measured
+#                                 end-to-end on the same host/session
 #   2. input latency            : no worse than the old client
 #   3. cat-firehose throughput  : no worse than the old client
 #   4. memory at 10 tabs        : <= old client + 20%
@@ -36,15 +37,20 @@
 # was already open. The rig closes the tabs it opened when it is done.
 #
 # Usage:
-#   tools/perf-ab-rig/run-perf-ab.sh [--live] [--out PATH]
+#   tools/perf-ab-rig/run-perf-ab.sh [--live] [--startup-only] [--out PATH]
 #       [--new-client PATH] [--old-client PATH] [--baseline PATH]
 #       [--record-baseline] [--samples N] [--firehose-mib N] [--tabs N]
+#
+# --startup-only limits a --live run to metric 1 (no tabs are opened and no
+# keys are typed); metrics 2-5 report NOT-MEASURED. This is the fast loop for
+# the startup perf bead.
 #
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 MODE="assess"
+STARTUP_ONLY=0
 OUT="${REPO_ROOT}/specs/016-gpui-client-rebuild/perf-ab-report.md"
 NEW_CLIENT=""
 OLD_CLIENT=""
@@ -55,7 +61,13 @@ RECORD_BASELINE=0
 SCRIBE_TEST_BIN="scribe-test"
 
 # --- Q3 thresholds --------------------------------------------------------
-STARTUP_BUDGET_MS=500          # absolute ceiling to first frame
+# Startup is a same-host A/B against the old client (re-scoped from the
+# original absolute 500 ms on 2026-07-24: the recorded 190 ms old-client
+# "baseline" was a phase-scoped GPU-init timer, not process-start-to-first-
+# frame, and the GPU bring-up floor alone exceeds 500 ms on the reference
+# host; see spec.md "Q3 re-scope" and perf-baseline.md). Both clients are
+# measured end-to-end and compared with the shared noise allowance.
+STARTUP_SAMPLES=3              # startup runs per client; the median is scored
 MEM_REGRESSION_MAX_PCT=20      # memory may exceed old client by at most 20%
 SCROLL_TARGET_FPS=60           # sustained scroll target
 SCROLL_DROPPED_MAX_PCT=1       # dropped-frame ceiling
@@ -82,6 +94,7 @@ SCROLL_ADVANCE_KEY=space
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --live) MODE="live"; shift ;;
+    --startup-only) STARTUP_ONLY=1; shift ;;
     --out) OUT="$2"; shift 2 ;;
     --new-client) NEW_CLIENT="$2"; shift 2 ;;
     --old-client) OLD_CLIENT="$2"; shift 2 ;;
@@ -91,7 +104,7 @@ while [[ $# -gt 0 ]]; do
     --firehose-mib) FIREHOSE_MIB="$2"; shift 2 ;;
     --tabs) MEMORY_TABS="$2"; shift 2 ;;
     --scribe-test) SCRIBE_TEST_BIN="$2"; shift 2 ;;
-    -h|--help) sed -n '2,42p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,48p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -425,21 +438,94 @@ rss_kb() {
 }
 
 # --------------------------------------------------------------------------
-# Metric 1: startup to first frame (GPUI client only; absolute budget)
+# Metric 1: startup to first frame (same-host A/B, both clients end-to-end)
 # --------------------------------------------------------------------------
 
-measure_startup_first_frame() {
+# Median of a space-separated list of numbers (even count: lower middle).
+median() {
+  printf '%s\n' "$@" | sort -n | awk '{ v[NR] = $0 } END { if (NR) print v[int((NR + 1) / 2)] }'
+}
+
+# Wait until FILE (ANSI-stripped) matches PATTERN or PID exits; then kill PID.
+# Returns 0 when the pattern appeared within 20s.
+wait_marker_then_kill() {
+  local pid="$1" file="$2" pattern="$3" waited=0 found=1
+  while [[ $waited -lt 200 ]]; do
+    if [[ -f "$file" ]] \
+      && sed 's/\x1b\[[0-9;]*m//g' "$file" | grep -qE "$pattern"; then
+      found=0
+      break
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return "$found"
+}
+
+# One GPUI-client startup sample: process start to first painted frame, from
+# the client's own SCRIBE_GPUI_STARTUP_TIMING marker. Prints ms or nothing.
+startup_sample_new() {
   local bin="$1"
-  [[ -x "$bin" ]] || { echo ""; return; }
   local marker="$WORK_DIR/startup.txt"
   rm -f "$marker"
-  SCRIBE_GPUI_STARTUP_TIMING="$marker" timeout 20s "$bin" >/dev/null 2>&1 || true
-  local ms=""
-  if [[ -f "$marker" ]]; then
-    ms="$(grep -oE 'first_frame_ms=[0-9.]+' "$marker" | head -n1 | cut -d= -f2 || true)"
+  SCRIBE_GPUI_STARTUP_TIMING="$marker" "$bin" >/dev/null 2>&1 &
+  local pid=$!
+  echo "$pid" >>"$WORK_DIR/pids"
+  if wait_marker_then_kill "$pid" "$marker" 'first_frame_ms=[0-9.]+'; then
+    grep -oE 'first_frame_ms=[0-9.]+' "$marker" | head -n1 | cut -d= -f2
   fi
   rm -f "$marker"
-  echo "$ms"
+}
+
+# One old-client startup sample, measured with the SAME definition: launch to
+# GPU-ready. The old client has no first-frame marker, but it logs
+# `client startup timing` lines at info level from its first startup step
+# through `init_gpu_and_terminal_done` (after which the first frame paints),
+# so the wall-clock delta between the first log line's timestamp and that
+# line's timestamp is the end-to-end number. The phase-scoped `total_ms` on
+# the line itself only times the GPU-init phase and is NOT comparable.
+# Prints ms or nothing.
+startup_sample_old() {
+  local bin="$1"
+  local log="$WORK_DIR/old-startup.log"
+  rm -f "$log"
+  "$bin" >"$log" 2>&1 &
+  local pid=$!
+  echo "$pid" >>"$WORK_DIR/pids"
+  if wait_marker_then_kill "$pid" "$log" 'init_gpu_and_terminal_done'; then
+    sed 's/\x1b\[[0-9;]*m//g' "$log" | awk '
+      NR == 1 { first = $1 }
+      /init_gpu_and_terminal_done/ { last = $1; exit }
+      END {
+        if (first == "" || last == "") exit
+        print (secs(last) - secs(first)) * 1000
+      }
+      function secs(ts,    t, parts) {
+        # 2026-07-25T06:04:46.632959Z -> seconds of day (same-day samples)
+        t = substr(ts, index(ts, "T") + 1)
+        sub(/Z$/, "", t)
+        split(t, parts, ":")
+        return parts[1] * 3600 + parts[2] * 60 + parts[3]
+      }' | awk '{ printf "%.0f\n", $1 }'
+  fi
+  rm -f "$log"
+}
+
+# Median-of-N startup for one client. Args: sample_fn bin. Prints ms or "".
+measure_startup() {
+  local fn="$1" bin="$2" i ms
+  [[ -x "$bin" ]] || { echo ""; return; }
+  local samples=()
+  for ((i = 0; i < STARTUP_SAMPLES; i++)); do
+    ms="$($fn "$bin")"
+    [[ -n "$ms" ]] && samples+=("$ms")
+    sleep 1
+  done
+  [[ ${#samples[@]} -gt 0 ]] || { echo ""; return; }
+  median "${samples[@]}"
 }
 
 # --------------------------------------------------------------------------
@@ -637,9 +723,19 @@ live_ready() {
 eval_startup() {
   local measured=""
   if live_ready && [[ -n "$NEW_CLIENT" ]]; then
-    log "measuring startup: new client"
-    measured="$(measure_startup_first_frame "$NEW_CLIENT")"
+    log "measuring startup: new client (median of ${STARTUP_SAMPLES})"
+    measured="$(measure_startup startup_sample_new "$NEW_CLIENT")"
   fi
+  if live_ready && [[ -n "$OLD_CLIENT" ]]; then
+    log "measuring startup: old client (median of ${STARTUP_SAMPLES})"
+    local old_measured
+    old_measured="$(measure_startup startup_sample_old "$OLD_CLIENT")"
+    if [[ -n "$old_measured" ]]; then
+      OLD_STARTUP_MS="$old_measured"
+      record_baseline startup_first_frame_ms "$old_measured"
+    fi
+  fi
+  STARTUP_NOTE="Same-host A/B (Q3 re-scope 2026-07-24): PASS when the new client's median startup is within ${NOISE_TOLERANCE_PCT}% of the old client's, both measured end-to-end (process start / first startup log to first painted frame or GPU-ready, median of ${STARTUP_SAMPLES}). Splash deletion (OQ8) stays authorized while this PASSes. Old client: ${OLD_STARTUP_MS:-unrecorded} ms."
   if [[ -z "$measured" ]]; then
     STARTUP_STATUS="NOT-MEASURED"
     STARTUP_VALUE="not captured"
@@ -647,12 +743,17 @@ eval_startup() {
     return
   fi
   STARTUP_VALUE="${measured} ms"
-  if float_cmp "$measured" "<=" "$STARTUP_BUDGET_MS"; then
+  if [[ -z "$OLD_STARTUP_MS" ]]; then
+    STARTUP_STATUS="NO-BASELINE"
+    return
+  fi
+  local ceiling
+  ceiling="$(calc "old * (1 + pct / 100)" "old=$OLD_STARTUP_MS" "pct=$NOISE_TOLERANCE_PCT")"
+  if float_cmp "$measured" "<=" "$ceiling"; then
     STARTUP_STATUS="PASS"
   else
     STARTUP_STATUS="FAIL"
   fi
-  STARTUP_NOTE="Budget ${STARTUP_BUDGET_MS} ms; old-client baseline ${OLD_STARTUP_MS:-unrecorded} ms. Splash deletion is authorized only when this PASSes. Method: first painted frame minus process start, from the client's own marker."
 }
 
 # Shared shape for the three comparative metrics: measure the new client,
@@ -662,11 +763,11 @@ eval_startup() {
 eval_pair() {
   local metric="$1" fn="$2" key="$3"
   local new_value="" old_value=""
-  if live_ready && [[ -n "$NEW_CLIENT" ]]; then
+  if live_ready && [[ "$STARTUP_ONLY" -eq 0 && -n "$NEW_CLIENT" ]]; then
     log "measuring ${metric}: new client"
     new_value="$($fn "$NEW_CLIENT")"
   fi
-  if live_ready && [[ -n "$OLD_CLIENT" ]]; then
+  if live_ready && [[ "$STARTUP_ONLY" -eq 0 && -n "$OLD_CLIENT" ]]; then
     log "measuring ${metric}: old client"
     old_value="$($fn "$OLD_CLIENT")"
   fi
@@ -742,7 +843,7 @@ eval_memory() {
 
 eval_scroll() {
   local measured="" fps="" dropped=""
-  if live_ready && [[ -n "$NEW_CLIENT" ]]; then
+  if live_ready && [[ "$STARTUP_ONLY" -eq 0 && -n "$NEW_CLIENT" ]]; then
     log "measuring scroll-fps: new client"
     measured="$(measure_scroll "$NEW_CLIENT")"
     fps="${measured%%|*}"
@@ -786,7 +887,8 @@ emit_report() {
     LIVE_BLOCKER="$(live_blocker)"
     if [[ -n "$LIVE_BLOCKER" ]]; then
       log "live mode blocked: $LIVE_BLOCKER"
-    else
+    elif [[ "$STARTUP_ONLY" -eq 0 ]]; then
+      # Startup-only runs open no tabs, so they need no seeded session.
       seed_session || log "continuing without a seeded session"
     fi
   else
@@ -820,11 +922,11 @@ This is the launch-blocking performance comparison for the GPUI client rebuild
 (beads scribe-38e.41 / scribe-38e.51), gating cutover in the launch go/no-go
 (scribe-38e.42).
 
-## Thresholds (Clarification Q3)
+## Thresholds (Clarification Q3, startup re-scoped 2026-07-24)
 
 | Metric | Threshold |
 |---|---|
-| Startup to first frame | <= ${STARTUP_BUDGET_MS} ms absolute |
+| Startup to first frame | no worse than old client end-to-end (${NOISE_TOLERANCE_PCT}% noise allowance, median of ${STARTUP_SAMPLES}) |
 | Input latency | no worse than old client (${NOISE_TOLERANCE_PCT}% noise allowance) |
 | cat-firehose throughput | no worse than old client (${NOISE_TOLERANCE_PCT}% noise allowance) |
 | Memory at ${MEMORY_TABS} tabs | <= old client + ${MEM_REGRESSION_MAX_PCT}% |
@@ -838,7 +940,7 @@ re-measures them with the same probe in the same session, and
 
 | Metric | New client | Old client | Verdict |
 |---|---|---|---|
-| Startup to first frame | ${STARTUP_VALUE} | ${OLD_STARTUP_MS:-unrecorded} ms | ${STARTUP_STATUS} |
+| Startup to first frame (end-to-end) | ${STARTUP_VALUE} | ${OLD_STARTUP_MS:-unrecorded} ms | ${STARTUP_STATUS} |
 | Input latency (p50 echo) | ${LAT_VALUE} | ${old_lat} | ${LAT_STATUS} |
 | cat-firehose throughput | ${FIRE_VALUE} | ${old_fire} | ${FIRE_STATUS} |
 | Memory at ${MEMORY_TABS} tabs | ${MEM_VALUE} | ${old_mem} | ${MEM_STATUS} |
