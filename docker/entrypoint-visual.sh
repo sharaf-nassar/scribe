@@ -10,6 +10,7 @@ SERVER_STARTED=0
 
 cleanup() {
     kill "${APP_PID:-}" 2>/dev/null || true
+    kill "${TAP_PID:-}" 2>/dev/null || true
     kill "${WM_PID:-}" 2>/dev/null || true
     if [ "$DAEMON_STARTED" -eq 1 ]; then
         scribe-test daemon stop >/dev/null 2>&1 || true
@@ -74,6 +75,30 @@ case "$VISUAL_APP" in
     client)
         scribe-test daemon start
         DAEMON_STARTED=1
+        # Feature 015 sharing needs a second machine, which a single container
+        # cannot supply. SCRIBE_SHARE_TAP=1 instead interposes a transparent
+        # relay on the server socket: the client still handshakes with the real
+        # server over the real framed protocol, every frame is recorded for
+        # on-the-wire assertions, and the four share notices a remote peer would
+        # have caused are injected through the tap's control socket. The daemon
+        # has already connected directly, so the client is the tap's newest
+        # connection and therefore the injection target.
+        if [ "${SCRIBE_SHARE_TAP:-0}" = "1" ]; then
+            mv "$UID_DIR/server.sock" "$UID_DIR/server-upstream.sock"
+            SHARE_WIRE_RECORD=/output/share-wire.jsonl
+            SHARE_TAP_CONTROL="$UID_DIR/share-tap.sock"
+            export SHARE_WIRE_RECORD SHARE_TAP_CONTROL
+            scribe-test share-tap \
+                --listen "$UID_DIR/server.sock" \
+                --upstream "$UID_DIR/server-upstream.sock" \
+                --record "$SHARE_WIRE_RECORD" \
+                --control "$SHARE_TAP_CONTROL" >/output/share-tap.log 2>&1 &
+            TAP_PID=$!
+            for _ in $(seq 1 50); do
+                [ -S "$SHARE_TAP_CONTROL" ] && break
+                sleep 0.1
+            done
+        fi
         # Optional: seed a config.toml before the client starts so tests can
         # exercise opt-in settings (e.g. terminal.paste_confirmation). No-op
         # when unset, so existing visual tests are unaffected.

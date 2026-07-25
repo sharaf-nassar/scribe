@@ -413,7 +413,12 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
   settings pages need controls that call them.
 - **FU-19 Sharing and control.** Rows: `ControlClaim`, `ControlRequest`,
   `ControlGrant`, `ShareRoster`, `ControlRequested`, `ControlDenied`,
-  `ShareEnded`.
+  `ShareEnded`. **Landed.** `share.rs` is now imported by `main.rs` and
+  `ipc_bridge.rs`; the four inbound notices have explicit arms in
+  `dispatch_server_message`, and the claim/grant frames leave through
+  `IpcSink::control_intent` from the viewer hint and the modal grant/deny
+  prompt. Verified on the wire and on screen by
+  `tests/e2e/visual/share-control.sh`.
 
 ### P2 — session lifecycle gaps
 

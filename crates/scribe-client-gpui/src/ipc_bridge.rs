@@ -5,14 +5,16 @@
 //! Zed-style 4 ms / 100-event coalescing. Per-pane output is collapsed so each
 //! batch runs one `write_output` and one repaint per dirty pane. Outbound:
 //! [`IpcSink`] replaces Zed's `write_to_pty`, enqueuing `ClientMessage::KeyInput`,
-//! `Resize`, and the session-lifecycle messages the tab shortcuts drive
-//! (`CreateSession` / `AttachSessions` / `CloseSession`) onto the ordered
-//! IPC-writer channel. The outbound path never
+//! `Resize`, the session-lifecycle messages the tab shortcuts drive
+//! (`CreateSession` / `AttachSessions` / `CloseSession`), and the feature-015
+//! control-passing frames (`ControlClaim` / `ControlGrant`) the share surfaces
+//! raise, onto the ordered IPC-writer channel. The outbound path never
 //! traverses the inbound drain, so keystrokes are never queued behind an output
 //! firehose and `Resize` is always flushed ahead of the `KeyInput` that follows.
 
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
+use scribe_client_gpui::share::ControlIntent;
 use scribe_common::{
     ids::{SessionId, WorkspaceId},
     protocol::{ClientMessage, TerminalSize, WorkspaceNotesMutation},
@@ -280,6 +282,20 @@ impl IpcSink {
     /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
     pub fn workspace_notes_get(&self, workspace_ids: Vec<WorkspaceId>) -> Result<(), SinkClosed> {
         self.enqueue(ClientMessage::WorkspaceNotesGet { workspace_ids })
+    }
+
+    /// Sends a feature-015 control-passing intent for a shared window: the
+    /// viewer's take-control affordance lowers to `ControlClaim`, and the
+    /// grant/deny prompt's answer lowers to `ControlGrant`.
+    ///
+    /// The intent is lowered here rather than in the view so the shell never
+    /// hand-builds a v3 control frame; the mapping lives once in
+    /// [`ControlIntent::into_message`].
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn control_intent(&self, intent: ControlIntent) -> Result<(), SinkClosed> {
+        self.enqueue(intent.into_message())
     }
 
     /// Requests a server-side workspace-notes mutation (draft save, note

@@ -25,9 +25,9 @@
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
 counts modules-total 57
-counts modules-wired 23
+counts modules-wired 24
 counts server-messages-total 59
-counts server-messages-handled 18
+counts server-messages-handled 22
 counts layout-actions-total 36
 counts layout-actions-handled 9
 
@@ -55,7 +55,6 @@ unwired-module scrollbar
 unwired-module search
 unwired-module selection
 unwired-module server_lifecycle
-unwired-module share
 unwired-module smart_selection
 unwired-module split_scroll
 unwired-module url_detect
@@ -73,8 +72,6 @@ unhandled-server-message ClipboardBridgeWrite
 unhandled-server-message ClipboardPromptRequest
 unhandled-server-message CodexTaskLabelChanged
 unhandled-server-message CodexTaskLabelCleared
-unhandled-server-message ControlDenied
-unhandled-server-message ControlRequested
 unhandled-server-message EnvPreflightResult
 unhandled-server-message LanApprovalPending
 unhandled-server-message LanApprovalRequest
@@ -92,8 +89,6 @@ unhandled-server-message RemotePeerList
 unhandled-server-message RunAction
 unhandled-server-message ScrollBottom
 unhandled-server-message SearchResults
-unhandled-server-message ShareEnded
-unhandled-server-message ShareRoster
 unhandled-server-message TaskLabelChanged
 unhandled-server-message TaskLabelCleared
 unhandled-server-message TrustedDeviceList
