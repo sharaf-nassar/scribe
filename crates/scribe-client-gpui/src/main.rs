@@ -1328,7 +1328,28 @@ impl TerminalView {
         };
         if let Err(error) = self.sink.key_input(session_id, bytes, true) {
             tracing::warn!(%error, "dropped keystroke: IPC writer closed");
+            return;
         }
+        // Perf gate: start the echo round-trip clock the PTY-output path stops.
+        scribe_common::perf_probe::record_input_sent();
+    }
+
+    /// Publish this frame to the perf rig's probe, along with the tab sessions
+    /// and focused session the rig uses as its "only type into a pane I opened"
+    /// interlock. Both are no-ops outside a rig run.
+    fn report_perf_frame(&self) {
+        scribe_common::perf_probe::record_frame();
+        if !scribe_common::perf_probe::is_active() {
+            return;
+        }
+        let sessions = self
+            .shared
+            .tabs
+            .lock()
+            .map(|tabs| tabs.tabs().iter().map(|entry| entry.session_id).collect())
+            .unwrap_or_default();
+        let focused = self.shared.active_session.lock().ok().and_then(|guard| *guard);
+        scribe_common::perf_probe::record_sessions(sessions, focused);
     }
 }
 
@@ -1674,6 +1695,7 @@ impl TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         log_first_frame_timing();
+        self.report_perf_frame();
         if !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle, cx);
         }
@@ -1781,6 +1803,9 @@ fn init_tracing() {
 
 fn main() {
     PROCESS_START.get_or_init(Instant::now);
+    // Arm the perf rig's runtime probe before anything can paint or type; it
+    // stays inert unless `SCRIBE_PERF_PROBE` names a report path.
+    scribe_common::perf_probe::init_from_env();
     init_tracing();
 
     // `scribe-client --settings` opens (or focuses) the settings window instead
@@ -2425,6 +2450,9 @@ fn dispatch_server_message(
         }
         ServerMessage::PtyOutput { session_id, data } => {
             if Some(session_id) == attached {
+                // Perf gate: count drained bytes and close the echo round-trip
+                // clock before the frame queue takes ownership of the payload.
+                scribe_common::perf_probe::record_pty_output(data.len());
                 forward_output(&ctx.in_tx, session_id, data);
             }
         }

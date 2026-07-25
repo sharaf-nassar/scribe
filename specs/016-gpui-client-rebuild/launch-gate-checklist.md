@@ -29,11 +29,18 @@ fails on scripted-E2E (AI indicator), perf, and unverifiable manual rows.
 ## Blockers (each NO-GO on its own)
 
 - **B1 — Perf gate FAIL.** Startup-to-first-frame measured 2030–2350 ms across
-  5 samples vs the 500 ms budget (~4×; old baseline 190 ms). The rig's other
-  four metrics (input latency, cat-firehose throughput, memory@10 tabs, scroll
-  fps) are unmeasurable by the current rig and were DEFERRED — the rig still
-  treats the client as the display-only spike. → beads `scribe-38e.50`,
-  `scribe-38e.51`.
+  5 samples vs the 500 ms budget (~4×; old baseline 190 ms). → bead
+  `scribe-38e.50`.
+
+  The other four metrics (input latency, cat-firehose throughput,
+  memory@10 tabs, scroll fps) were originally recorded as DEFERRED because the
+  rig still treated the client as the display-only spike. `scribe-38e.51` has
+  since removed that limitation: both clients carry the shared probe
+  (`crates/scribe-common/src/perf_probe.rs`) and `--live` drives and thresholds
+  all five metrics. The three comparative metrics need a `--live --old-client
+  <bin> --record-baseline` run to fill the machine-readable baseline block in
+  `perf-baseline.md`; until then they report `NO-BASELINE` and the gate stays
+  `INCOMPLETE` rather than `DEFERRED`.
 - **B2 — Func-E2E FAIL ×2.** `ai-state-indicator` and `ai-context-thresholds`
   fail: a context value of 50 is not rendered as `50%` in the prompt bar. AI
   indicator / prompt-bar parity (`.33`) is not met. → bead `scribe-38e.52`.

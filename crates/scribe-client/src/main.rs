@@ -1406,6 +1406,9 @@ impl App {
     fn handle_stream_user_event(&mut self, event: &UiEvent) -> bool {
         match event {
             UiEvent::PtyOutput { session_id, data } => {
+                // Perf gate: count drained bytes and close the echo round-trip
+                // clock opened by the keystroke that produced this output.
+                scribe_common::perf_probe::record_pty_output(data.len());
                 self.pending_pty_bytes.entry(*session_id).or_default().extend_from_slice(data);
                 true
             }
@@ -5049,6 +5052,7 @@ impl App {
 
     /// Render one frame: splash while waiting for PTY output, terminal after.
     fn handle_redraw(&mut self) {
+        self.report_perf_frame();
         self.sync_surface_to_window();
         let request_redraw = self.drain_pending_output_frames();
         let Some((frame, view)) = self.acquire_surface_frame() else { return };
@@ -5060,6 +5064,19 @@ impl App {
         }
 
         self.render_terminal_frame(frame, &view, request_redraw);
+    }
+
+    /// Publish this frame to the perf rig's probe, along with the sessions this
+    /// client renders and the focused one, so the rig can pace frames and use
+    /// the same "only type into a pane I opened" interlock it uses for the GPUI
+    /// client. Every call is a no-op outside a rig run.
+    fn report_perf_frame(&self) {
+        scribe_common::perf_probe::record_frame();
+        if !scribe_common::perf_probe::is_active() {
+            return;
+        }
+        let sessions = self.session_to_pane.keys().copied().collect();
+        scribe_common::perf_probe::record_sessions(sessions, self.focused_session_id());
     }
 
     fn acquire_surface_frame(&mut self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
@@ -6709,6 +6726,10 @@ impl App {
             .is_err()
         {
             tracing::warn!("IPC channel closed; keyboard input dropped");
+        } else {
+            // Perf gate: start the echo round-trip clock the PTY-output path
+            // stops, matching the GPUI client's measurement point.
+            scribe_common::perf_probe::record_input_sent();
         }
 
         // Clear "waiting for input / permission" indicators on real keystrokes.
@@ -16310,6 +16331,10 @@ fn collect_active_tab_indices_inner(
 }
 
 fn main() -> Result<(), String> {
+    // Arm the perf rig's runtime probe. It stays inert unless
+    // `SCRIBE_PERF_PROBE` names a report path, and it is the same
+    // instrumentation the GPUI client calls so the A/B compares like with like.
+    scribe_common::perf_probe::init_from_env();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

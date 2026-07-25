@@ -620,11 +620,13 @@ When the daemon allocates a fresh id despite a non-zero `replaces` (the prior to
 
 ## GPUI Perf A/B Gate
 
-The launch-blocking performance comparison for the GPUI client rebuild. The `tools/perf-ab-rig/run-perf-ab.sh` rig compares the new client against the recorded old-client baselines and writes a per-metric pass/fail report.
+The launch-blocking performance comparison for the GPUI client rebuild. The `tools/perf-ab-rig/run-perf-ab.sh` rig drives all five Clarification-Q3 metrics on both clients and writes a per-metric pass/fail report.
 
-The five metrics and thresholds are: startup-to-first-frame (`<= 500 ms` absolute, also gating splash deletion), input latency (no worse than old client), cat-firehose throughput (no worse than old client), memory at 10 tabs (`<= old + 20%`), and scroll (sustained 60 fps with `< 1%` dropped frames). Old-client baselines live in `specs/016-gpui-client-rebuild/perf-baseline.md`; the generated report is `specs/016-gpui-client-rebuild/perf-ab-report.md`.
+The five metrics and thresholds are: startup-to-first-frame (`<= 500 ms` absolute, also gating splash deletion), input latency (no worse than old client), cat-firehose throughput (no worse than old client), memory at 10 tabs (`<= old + 20%`), and scroll (sustained 60 fps with `< 1%` dropped frames). Old-client baselines live in `specs/016-gpui-client-rebuild/perf-baseline.md` as a machine-readable `perf_baseline_<key>=<value>` block that `--record-baseline` rewrites in place; the generated report is `specs/016-gpui-client-rebuild/perf-ab-report.md`.
 
-The rig has two modes. `assess` (default) generates the current-state report from the committed baseline plus a static capability check without launching any GUI or touching the live server. `--live` is the launch-gate mode: it launches the target client on the same machine/session, drives each workload, and enforces the thresholds; it attaches to the already-running server and never restarts it.
+The rig has two modes. `assess` (default) generates the current-state report from the committed baseline plus a static capability check without launching any GUI or touching the live server, marking every live-only metric `NOT-MEASURED`. `--live` is the launch-gate mode: it launches each target client on the same machine/session, drives every workload through `xdotool`, and enforces the thresholds; it attaches to the already-running server and never restarts it.
+
+The three comparative metrics are enforced with a 10% run-to-run noise allowance, which is the repeatability of these measurements on a loaded desktop rather than extra headroom. A comparative metric with no committed baseline reads `NO-BASELINE`, and the overall verdict is `INCOMPLETE` unless all five metrics are measured and inside their thresholds; a `FAIL` on any metric fails the gate and reopens the perf bead.
 
 ### Startup instrumentation
 
@@ -632,11 +634,47 @@ The GPUI client times startup-to-first-frame only when the `SCRIBE_GPUI_STARTUP_
 
 [[crates/scribe-client-gpui/src/main.rs#log_first_frame_timing]] latches on the first painted frame and writes a `first_frame_ms=<n>` marker to the file the env var names, timed from the `PROCESS_START` origin captured at the top of `main`, mirroring the old client's `init_gpu_and_terminal_done` method that produced the recorded baseline.
 
-### Deferred runtime metrics
+### Driving the workloads
 
-While the client remains a display-only scaffold spike, input latency, firehose throughput, memory at 10 tabs, and scroll fps are reported `DEFERRED` rather than measured.
+Live mode drives both clients with `xdotool`, and three delivery details are load-bearing because getting any of them wrong makes a workload measure nothing at all rather than fail loudly.
 
-The spike has no stable input encoder with echo instrumentation, no multi-tab support, and no scroll frame counter, so those workloads cannot be driven yet. The rig records the exact live method for each so the launch gate (`scribe-38e.42`) can re-run it at cutover and enforce every threshold; a `FAIL` reopens the perf-rig bead.
+Enter is always sent as its own key event: `xdotool type` does not deliver a trailing newline as `Return` to either client, so a command typed with `\n` appended echoes onto the command line and never runs — which silently zeroed the firehose and scroll metrics until the rig started submitting with an explicit `Return`. The scroll workload advances `less` with `space` rather than PageDown for the same class of reason: a synthetic `Next` reaches the client's own `ctrl+Next` next-tab binding but is dropped before the PTY, so it drove no repaint at all. Key delivery also falls back: window-targeted synthetic events are preferred because a stray keystroke cannot then escape into another application, but a toolkit reading keys through XInput2 ignores them, so a new-tab attempt that produces no tab is retried with XTEST and the mode that worked sticks for the run.
+
+Live mode consequently needs a window-managed display. Under a bare `Xvfb` the winit-based old client receives neither delivery mode, and its half of the A/B reports `NOT-MEASURED` rather than a fabricated number.
+
+### Runtime probe instrumentation
+
+Four of the five metrics are only observable from inside a running client, so both clients link the same probe and the A/B compares identical measurement points rather than two different instrumentations.
+
+[[crates/scribe-common/src/perf_probe.rs#PerfProbe]] activates only when [[crates/scribe-common/src/perf_probe.rs#PERF_PROBE_ENV]] (`SCRIBE_PERF_PROBE`) names a report path, so a normal run costs one atomic load per call site and writes nothing. [[crates/scribe-common/src/perf_probe.rs#record_frame]] counts painted frames and scores gap-derived dropped frames, [[crates/scribe-common/src/perf_probe.rs#record_input_sent]] opens the echo round-trip clock that [[crates/scribe-common/src/perf_probe.rs#record_pty_output]] closes while also counting drained PTY bytes, and [[crates/scribe-common/src/perf_probe.rs#record_sessions]] publishes the client's tab session list and focused session. Memory is the exception: the rig samples `VmRSS` from `/proc` externally, using the probe's session count only to know when 10 tabs are actually open.
+
+The report is a flat `key=value` file rewritten at most every 200 ms with cumulative counters plus an `uptime_ms` stamp, so the rig derives a per-workload number from before/after deltas and the client needs no window bookkeeping. The session list doubles as the rig's safety interlock: a typing workload only runs in a tab the rig opened and watched appear as focused, so it can never type into a pane that was already open.
+
+Both clients call the probe from the same three places. The GPUI client reports frames from [[crates/scribe-client-gpui/src/main.rs#TerminalView#report_perf_frame]] on render, stamps keystrokes in its key handler, and counts PTY bytes in `dispatch_server_message`; the old client reports frames from [[crates/scribe-client/src/main.rs#App#report_perf_frame]] on redraw and counts PTY bytes in `handle_stream_user_event`.
+
+#### Frame gaps score missed 60 fps slots
+
+A gap between painted frames is converted into the number of 60 fps slots it skipped, so a stall during a driven scroll is charged against the `< 1%` dropped-frame budget rather than being invisible.
+
+#### Idle gaps are not dropped frames
+
+A client sitting idle between workloads paints nothing, and without a ceiling every pause would be scored as thousands of drops, so gaps past the idle threshold count as zero missed frames.
+
+#### Latency statistics summarise samples
+
+The report carries the median and mean of the echo round-trip samples, including the empty-sample and even-length cases, because the gate compares medians across clients.
+
+#### Report renders every rig key
+
+The rig parses the report by key, so serialisation must emit every key it reads — counters, uptime, latency statistics, session list and focused session — in the exact `key=value` shape.
+
+#### Probe stays inert without the env var
+
+With `SCRIBE_PERF_PROBE` unset every entry point must be a no-op that neither writes a file nor panics, since both clients call them on every frame and every keystroke in normal use.
+
+#### Counters pair input with its echo
+
+A keystroke sent while another is still unmatched must not restart the clock, so each recorded latency is an unambiguous key-to-echo pair and the byte counter accumulates independently.
 
 ## GPUI Client Headless Suites
 
