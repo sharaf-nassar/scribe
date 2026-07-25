@@ -161,6 +161,13 @@ e2e-visual-update:
     docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_UPDATE_API_URL=http://127.0.0.1:8099/releases/latest -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/update-config.toml)" -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/update-trigger.sh
     docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_UPDATE_API_URL=http://127.0.0.1:8099/releases/latest -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/update-config.toml)" -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/update-dismiss.sh
 
+# Run the window-chrome band visual E2E: the derived window size, the whole
+# terminal grid, and the prompt/status bands all on screen. Uses the shared-pane
+# rig so `scribe-test send` fills the very pane being measured, and the AI hook
+# channel to raise a real prompt strip.
+e2e-visual-chrome-bands:
+    docker run --rm --gpus all -e SCRIBE_SHARED_PANE=1 -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/window-chrome-bands.sh
+
 # Run the AI task-label visual E2E. It relaunches the client to adopt the
 # harness session before it can assert anything, so it needs more than the
 # default 60 s budget.

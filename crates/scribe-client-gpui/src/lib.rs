@@ -98,6 +98,7 @@ pub mod tooltip;
 pub mod update;
 pub mod url_detect;
 pub mod vi_mode;
+pub mod window_chrome;
 pub mod window_lifecycle;
 pub mod window_state;
 pub mod workspace_layout;

@@ -451,6 +451,9 @@ impl Render for TitlebarView {
             .flex()
             .items_center()
             .w_full()
+            // Fixed-height band above the flex-grown terminal grid; see
+            // [`crate::window_chrome`] for why none of the bands may shrink.
+            .flex_none()
             .h(px(TITLEBAR_HEIGHT))
             .bg(self.colors.bg)
             .border_b_1()

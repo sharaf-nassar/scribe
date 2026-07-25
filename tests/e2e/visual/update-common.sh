@@ -18,10 +18,11 @@ CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 SERVER_LOG="${SCRIBE_SERVER_LOG:-/output/server.log}"
 API_PID=""
 
-# Window size the rig drives. The spike's terminal grid is a fixed 36 x 18 px
-# block, so at the default 960 x 680 window the two bottom bands (pane status
-# and status bar) fall below the window edge and no status-bar test can see
-# anything. Growing the window puts them on screen.
+# Window size the rig drives. Both bottom bands are on screen at the default
+# window size now that it is derived from the grid plus the chrome bands (see
+# crates/scribe-client-gpui/src/window_chrome.rs); the rig still grows the
+# window so the status bar's left and right groups spread apart and leave the
+# centred CTA — the only band these tests diff — clear space of its own.
 WINDOW_W=1280
 WINDOW_H=860
 
