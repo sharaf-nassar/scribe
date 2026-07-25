@@ -99,15 +99,15 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `CheckForUpdates` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
 | `ListReleases` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
 | `ListWindows` | window management | scripted-E2E | `main.rs::TerminalView::poll_window_list` → `ipc_bridge::IpcSink::list_windows`, on the lifecycle tick while `remote.enabled` | required |
-| `DispatchAction` | remote automation | scripted-E2E | — (missing, FU-16) — `scribe-cli` is the only sender | required |
+| `DispatchAction` | remote automation | scripted-E2E | `main.rs::TerminalView::offer_action_to_controller` → `ipc_bridge::IpcSink::dispatch_action`, for a feature-015 viewer's window-mutating palette row | required |
 | `FocusChanged` | focus reporting | scripted-E2E | `main.rs::TerminalView::report_focus` → `ipc_bridge::IpcSink::focus_changed`, from the window activation observer and the pane-focus reconciliation | required |
 | `HookEvent` | hook helper ingress | scripted-E2E | `crates/scribe-hook-helper/src/main.rs::main` — out-of-client by design | required |
 | `EnvPreflight` | environment persistence | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` (`action.env_preflight`) and `SettingsWindow::enable_env_persistence`, the toggle's gated ON transition — settings-window row (in-app since bead .82) | required |
 | `ClipboardPromptResponse` | OSC 52 prompt | scripted-E2E | — (unwired, FU-8) — `clipboard.rs` outside the import closure | required |
 | `ClipboardBridgeReadReply` | OSC 52 bridge | scripted-E2E | — (unwired, FU-8) — `clipboard.rs` outside the import closure | required |
-| `RemoteHandshake` | tailnet connect | scripted-E2E | — (unwired, FU-16) — `remote_handshake.rs` outside the import closure | required |
-| `ListRemotePeers` | remote connect picker | scripted-E2E | — (missing, FU-16) | required |
-| `GetRemoteEnv` | remote settings | scripted-E2E | — (unwired, FU-16) — `settings/server_action.rs::request_remote_env` has no caller | required |
+| `RemoteHandshake` | tailnet connect | scripted-E2E | `main.rs::run_remote_connection` → `remote_handshake.rs::perform_remote_handshake` | required |
+| `ListRemotePeers` | remote connect picker | scripted-E2E | `main.rs::adopt_remote_surface` and `TerminalView::refresh_remote_peers` → `ipc_bridge::IpcSink::list_remote_peers` | required |
+| `GetRemoteEnv` | remote settings | scripted-E2E | `main.rs::probe_remote_env` on the startup transient socket, and `settings/window.rs::SettingsWindow::refresh_trust` → `settings/server_action.rs::request_remote_env` | required |
 | `LanHello` | mTLS LAN-dial preamble before session attachment | scripted-E2E | `main.rs::run_lan_connection` → `lan_dial.rs::handshake` | required |
 | `LanApprovalDecision` | owner-side fingerprint approval overlay | scripted-E2E | `main.rs::TerminalView::route_lan_approval_action` → `ipc_bridge.rs::IpcSink::lan_approval_decision` | required |
 | `ListLanPeers` | merged Local network source in remote connect picker | scripted-E2E | `main.rs::adopt_lan_surface` → `ipc_bridge.rs::IpcSink::list_lan_peers` | required |
@@ -169,8 +169,8 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `Welcome` | registration/adoption | scripted-E2E | `main.rs::run_reader` arm → `session_lifecycle::SessionRegistry::adopt_window` | required |
 | `WindowClosed` | close lifecycle | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_window_closed` → the shell's lifecycle tick quits the app | required |
 | `WindowList` | window management | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::set_windows` → `StatusBarData.remote` | required |
-| `RunAction` | remote automation | scripted-E2E | — (missing, FU-16) | required |
-| `ActionDispatched` | remote automation | scripted-E2E | — (missing, FU-16) | required |
+| `RunAction` | remote automation | scripted-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::queue_action` → `TerminalView::poll_remote_actions` runs it on the lifecycle tick | required |
+| `ActionDispatched` | remote automation | scripted-E2E | `main.rs::on_remote_message` arm — the routing ack for a dispatch this client sent | required |
 | `QuitRequested` | quit dialog | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_quit_requested` → the shell's lifecycle tick quits the app | required |
 | `UpdateAvailable` | update dialog | visual-E2E | `main.rs::dispatch_server_message` arm → `update::UpdateState::on_available` → `StatusBarData.update_available` | required |
 | `UpdateProgress` | update dialog | visual-E2E | `main.rs::dispatch_server_message` arm → `update::UpdateState::on_progress` → `StatusBarData.update_progress` | required |
@@ -184,11 +184,11 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `ClipboardPromptRequest` | OSC 52 dialog | visual-E2E | — (missing, FU-8) — the `ClipboardDialog` demo is built from literals | required |
 | `ClipboardBridgeWrite` | OSC 52 bridge | scripted-E2E | — (unwired, FU-8) — handled in `clipboard.rs`, outside the import closure | required |
 | `ClipboardBridgeReadRequest` | OSC 52 bridge | scripted-E2E | — (unwired, FU-8) — handled in `clipboard.rs`, outside the import closure | required |
-| `RemoteHandshakeReply` | tailnet connect | scripted-E2E | — (unwired, FU-16) — handled in `remote_handshake.rs`, outside the import closure | required |
-| `WindowTakenOver` | remote-control landing | visual-E2E | — (unwired, FU-16) — handled in `lost_control.rs`, outside the import closure | required |
-| `RemoteDisconnect` | remote-control landing | visual-E2E | — (missing, FU-16) | required |
-| `RemotePeerList` | remote connect picker | visual-E2E | — (missing, FU-16) | required |
-| `RemoteEnv` | remote settings | scripted-E2E | — (unwired, FU-16) — parsed in `settings/server_action.rs`; its request function has no caller | required |
+| `RemoteHandshakeReply` | tailnet connect | scripted-E2E | `remote_handshake.rs::perform_remote_handshake` during the preamble; `main.rs::on_remote_message` on the live reader | required |
+| `WindowTakenOver` | remote-control landing | visual-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::displace` → `lost_control.rs::lost_control_overlay` freezes the window under the reclaim banner | required |
+| `RemoteDisconnect` | remote-control landing | visual-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::sever` → the status strip's typed reason | required |
+| `RemotePeerList` | remote connect picker | visual-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::set_peers` → the status strip's online-peer count (the picker overlay is a tracked follow-on) | required |
+| `RemoteEnv` | remote settings | scripted-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::set_env`; also parsed in `settings/server_action.rs` for the Remote page's Tailscale note | required |
 | `LanApprovalPending` | cancelable connecting-side waiting-for-approval overlay | visual-E2E | `lan_dial.rs::handshake` during the preamble; `main.rs::on_lan_message` on the live reader | required |
 | `LanApprovalResult` | terminal LAN dial acceptance/refusal outcome | visual-E2E | `lan_dial.rs::handshake` during the preamble; `main.rs::on_lan_message` on the live reader | required |
 | `LanApprovalRequest` | owner-side device fingerprint approval overlay | visual-E2E | `main.rs::on_lan_message` → `lan.rs::LanChrome::park_approval` → `main.rs::TerminalView::poll_lan_approval` | required |
@@ -379,8 +379,14 @@ server handles it as `ControlClaim`; the client deliberately emits only the
 latter.
 
 That describes the *legacy* client's dispatch, which is what these rows were
-written against. In the GPUI client the LAN and remote surface is still
-unreachable (FU-16 through FU-18). The 015 sharing rows are no longer: FU-19
-put `share.rs` on the live path, so the roster, the control notices, and the
-claim/grant frames are wired end to end and verified against the running app by
-`tests/e2e/visual/share-control.sh`.
+written against. The GPUI client has since caught up on all three: FU-19 put
+`share.rs` on the live path (roster, control notices, claim/grant frames,
+verified by `tests/e2e/visual/share-control.sh`), FU-17 and FU-18 wired the
+feature-014 LAN dial, approval prompt and trust settings
+(`tests/e2e/visual/lan-approval.sh`, `tests/e2e/visual/settings-trust.sh`), and
+FU-16 wired the feature-013 tailnet handshake, peer/environment probe, displaced
+banner and automation round trip
+(`tests/e2e/visual/remote-control.sh`). The only remaining gap in this family is
+the connect-picker overlay itself: `remote.rs::RemoteConnect` is ported and
+unit-tested but has no GPUI view, so the peer lists it would render surface on
+the status strip instead.

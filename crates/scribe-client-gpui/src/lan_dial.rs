@@ -36,11 +36,10 @@ use std::time::Duration;
 
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::protocol::{ClientMessage, REMOTE_PROTOCOL_VERSION, ServerMessage};
-use scribe_common::socket::server_socket_path;
 use scribe_server::lan::identity::{self, DeviceIdentity};
 use scribe_server::lan::tls::{DeviceId, DevicePins, LanTls};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
 
 use crate::remote::LanConnectOutcome;
 use crate::remote_handshake::lan_dial_target_from_env;
@@ -49,11 +48,6 @@ use crate::remote_handshake::lan_dial_target_from_env;
 /// Matches the tailnet dial's budget: a peer on the same subnet either answers
 /// promptly or is not there.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long the transient local-socket probes (`GetLanDialIdentity`,
-/// `GetLanEnv`) wait for their single reply. The server answers from in-memory
-/// state, so anything slower is a wedged server rather than a slow one.
-const LOCAL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The dialer-side encrypted LAN stream once the mutual-TLS handshake completes.
 pub type LanStream = tokio_rustls::client::TlsStream<TcpStream>;
@@ -271,22 +265,12 @@ async fn fetch_dial_identity() -> Result<(Vec<u8>, Vec<u8>), LanDialError> {
 /// The server serves `GetLanEnv` / `GetLanDialIdentity` as pre-`Hello` first
 /// frames and closes afterwards, so a fresh socket per call is the protocol, not
 /// a convenience — and it keeps these off the session connection whose ordering
-/// keystrokes depend on.
+/// keystrokes depend on. The transport itself lives in
+/// [`crate::remote_handshake::transient_local_request`], shared with feature
+/// 013's `GetRemoteEnv` probe so both open their sockets identically; only the
+/// error shape is this module's.
 async fn transient_local_request(request: ClientMessage) -> Result<ServerMessage, LanDialError> {
-    let path = server_socket_path();
-    let mut stream = tokio::time::timeout(LOCAL_PROBE_TIMEOUT, UnixStream::connect(&path))
-        .await
-        .map_err(|_| LanDialError(format!("connecting to {} timed out", path.display())))?
-        .map_err(|error| {
-            LanDialError(format!("connecting to {} failed: {error}", path.display()))
-        })?;
-    write_message(&mut stream, &request)
-        .await
-        .map_err(|error| LanDialError(format!("sending the local LAN request failed: {error}")))?;
-    tokio::time::timeout(LOCAL_PROBE_TIMEOUT, read_message::<ServerMessage, _>(&mut stream))
-        .await
-        .map_err(|_| LanDialError(String::from("the local server did not answer in time")))?
-        .map_err(|error| LanDialError(format!("the local server closed before answering: {error}")))
+    crate::remote_handshake::transient_local_request(request).await.map_err(LanDialError)
 }
 
 /// Name a [`ServerMessage`] for an error string without formatting its payload

@@ -18,4 +18,9 @@ fn headline_names_controller_and_account() {
 fn only_enter_reclaims_control() {
     assert!(LostControlState::reclaim_requested(ReclaimKey::Enter));
     assert!(!LostControlState::reclaim_requested(ReclaimKey::Other));
+    // The live key path lowers a GPUI keystroke name here, so the same
+    // Enter-only rule has to survive that translation.
+    assert_eq!(ReclaimKey::from_keystroke("enter"), ReclaimKey::Enter);
+    assert_eq!(ReclaimKey::from_keystroke("escape"), ReclaimKey::Other);
+    assert_eq!(ReclaimKey::from_keystroke("q"), ReclaimKey::Other);
 }

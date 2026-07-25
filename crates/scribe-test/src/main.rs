@@ -5,6 +5,7 @@ mod daemon;
 mod input;
 mod ipc;
 mod lan_peer;
+mod remote_peer;
 mod render;
 mod server;
 mod session;
@@ -206,6 +207,11 @@ enum Command {
     /// device-approval gate, and splice an approved connection to the local
     /// server.
     LanPeer(LanPeerArgs),
+    /// Stand in for a second machine's feature-013 tailnet listener: read the
+    /// client's `RemoteHandshake`, record it, answer the mandatory
+    /// `RemoteHandshakeReply`, and splice an accepted connection to the local
+    /// server.
+    RemotePeer(RemotePeerArgs),
     /// Send one JSON-encoded `ServerMessage` to a running `share-tap`, which
     /// frames it to the client as if the server had sent it.
     ShareInject {
@@ -353,12 +359,8 @@ fn run(cli: Cli) -> Result<(), TestError> {
                 .map_err(|e| TestError::InfraError(e.to_string()))
         }
         Command::LanPeer(args) => run_lan_peer(args),
-        Command::ShareInject { control, message } => {
-            let rt =
-                tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
-            rt.block_on(share_tap::inject(&control, &message))
-                .map_err(|e| TestError::InfraError(e.to_string()))
-        }
+        Command::RemotePeer(args) => run_remote_peer(args),
+        Command::ShareInject { control, message } => run_share_inject(&control, &message),
     }
 }
 
@@ -404,6 +406,75 @@ fn run_lan_peer(args: LanPeerArgs) -> Result<(), TestError> {
         hold: std::time::Duration::from_millis(args.hold_ms),
     }))
     .map_err(|e| TestError::InfraError(e.to_string()))
+}
+
+/// Command-line shape of the tailnet peer stand-in, grouped for the same reason
+/// [`LanPeerArgs`] is: the dispatcher passes one value rather than five
+/// positional flags.
+#[derive(clap::Args)]
+struct RemotePeerArgs {
+    /// `host:port` to bind the tailnet listener on.
+    #[arg(long, default_value = "127.0.0.1:46061")]
+    listen: String,
+    /// Local server socket an accepted connection is spliced to.
+    #[arg(long)]
+    upstream: PathBuf,
+    /// JSONL file every framed message in both directions is appended to.
+    #[arg(long)]
+    record: PathBuf,
+    /// Refuse the handshake with this typed reason instead of accepting it.
+    /// One of `disabled`, `unauthorized`, `identity_unavailable`,
+    /// `incompatible_version`, `busy`.
+    #[arg(long)]
+    refuse: Option<String>,
+    /// Milliseconds to hold before the mandatory handshake reply.
+    #[arg(long, default_value_t = 0)]
+    hold_ms: u64,
+}
+
+/// Run the feature-013 tailnet peer stand-in until it is killed.
+///
+/// Split out of [`run`] so the dispatcher stays a table of one-line routes; the
+/// stand-in owns its own Tokio runtime exactly as `lan-peer` does.
+fn run_remote_peer(args: RemotePeerArgs) -> Result<(), TestError> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
+    let verdict = match args.refuse.as_deref() {
+        None => remote_peer::Verdict::Accept,
+        Some(reason) => remote_peer::Verdict::Refuse(parse_refusal(reason)?),
+    };
+    rt.block_on(remote_peer::run(remote_peer::RemotePeerConfig {
+        listen: args.listen,
+        upstream: args.upstream,
+        record: args.record,
+        verdict,
+        hold: std::time::Duration::from_millis(args.hold_ms),
+    }))
+    .map_err(|e| TestError::InfraError(e.to_string()))
+}
+
+/// Parse a `--refuse` value into the wire's typed refusal taxonomy. Spelled with
+/// the same `snake_case` the protocol serializes, so a script names the reason
+/// exactly as it will appear in the wire record.
+fn parse_refusal(reason: &str) -> Result<scribe_common::protocol::RemoteRefusal, TestError> {
+    use scribe_common::protocol::RemoteRefusal;
+    match reason {
+        "disabled" => Ok(RemoteRefusal::Disabled),
+        "unauthorized" => Ok(RemoteRefusal::Unauthorized),
+        "identity_unavailable" => Ok(RemoteRefusal::IdentityUnavailable),
+        "incompatible_version" => Ok(RemoteRefusal::IncompatibleVersion),
+        "busy" => Ok(RemoteRefusal::Busy),
+        other => Err(TestError::InfraError(format!("unknown refusal reason: {other}"))),
+    }
+}
+
+/// Frame one JSON-encoded `ServerMessage` to a running tap's control socket.
+///
+/// Split out of [`run`] for the same reason the two peer stand-ins are: the
+/// dispatcher stays a table of one-line routes.
+fn run_share_inject(control: &std::path::Path, message: &str) -> Result<(), TestError> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
+    rt.block_on(share_tap::inject(control, message))
+        .map_err(|e| TestError::InfraError(e.to_string()))
 }
 
 /// Extract a single character from the expected string.

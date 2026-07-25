@@ -371,6 +371,18 @@ Four phases run after the same daemon-stop-and-relaunch preamble [[test#Visual E
 
 Phase 1's baselines are sampled before the relaunch, because the LAN probe runs as part of connecting; sampling afterwards would race the frames the phase waits for. The dial phase skips loudly rather than passing silently when the stand-in cannot borrow an identity, so a container without a keyring reports a gap instead of a green run.
 
+### Tailnet remote control
+
+`tests/e2e/visual/remote-control.sh` is the app-level oracle for the eleven feature-013 tailnet rows: it drives the real client against the real server and asserts both the pixels and two separate wires.
+
+[[crates/scribe-client-gpui/src/remote_handshake.rs#perform_remote_handshake]] and [[crates/scribe-client-gpui/src/lost_control.rs#LostControlState]] passed their headless suites for months while both modules sat outside `main.rs`'s import closure, which is exactly the failure mode this script exists to catch — so every assertion is either a frame recorded leaving the real client or a pixel change in the real window.
+
+Two rigs stand in for what one machine cannot supply. The [[crates/scribe-test/src/share_tap.rs#run]] wire tap (`SCRIBE_SHARE_TAP=1`) relays the Unix socket, recording every frame in both directions; `WindowTakenOver`, `RemoteDisconnect` and the viewer `ShareRoster` are injected through it because the owning server only produces them for a real second machine. [[crates/scribe-test/src/remote_peer.rs#run]] (`scribe-test remote-peer`) stands in for the second machine's tailnet listener — a much smaller rig than its LAN twin, because the tailnet transport is plain TCP and identity is `tailscaled`'s `WhoIs` on the owning side, so there is nothing to borrow and nothing to pin. It refuses any first frame but `RemoteHandshake`, answers the mandatory reply, and splices an accepted connection to the real local server.
+
+Five phases run after the same daemon-stop-and-relaunch preamble [[test#Visual E2E Tests#Overlay actions run for real]] documents. The startup probe's `GetRemoteEnv` and `ListRemotePeers` are asserted on the wire together with the real server's `RemoteEnv` and `RemotePeerList` answers — no injection is involved, and a container with no tailnet legitimately produces the fail-closed `tailscale_detected = false` and an empty peer list, which is precisely why the phase asserts the client's own log lines rather than the payloads. An injected `WindowTakenOver` must then change the window's body pixels, a plain letter must add no `KeyInput` to the wire while the window is frozen, and Enter must put `ControlClaim` on it and repaint. An injected `RemoteDisconnect` must surface its typed reason. A viewer roster then makes a palette "New Tab" row leave as `DispatchAction` and come back as `ActionDispatched`, and an injected `RunAction` must open a real tab. Finally a client launched with `SCRIBE_REMOTE_DIAL` must land a real `RemoteHandshake` on the stand-in peer's TCP wire, accept its reply, and send `Hello` over the tailnet link.
+
+Phase 1's baselines are sampled before the relaunch, for the same reason the LAN script's are: the remote probe runs as part of connecting. The suppressed-keystroke assertion is a *count* on the recorded wire rather than a screenshot, because "nothing happened" is exactly what a screenshot cannot distinguish from an idle pane.
+
 ### Settings trust and preflight controls
 
 `tests/e2e/visual/settings-trust.sh` is the app-level oracle for the feature-014 trust rows and the env-preflight row: it drives the real settings window against the real server and asserts each control's frame on the wire.
@@ -930,6 +942,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | LAN device approval | [[test#GPUI Client Headless Suites#GPUI LAN device approval]] | `LanApprovalRequest`/`LanApprovalDecision` prompt |
 | LAN chrome | [[test#GPUI Client Headless Suites#GPUI LAN chrome]] | `LanApprovalRequest`, `LanPeerList`, `LanEnv` shared state |
 | LAN dial preamble | [[test#GPUI Client Headless Suites#GPUI LAN dial]] | `LanHello`, `LanApprovalPending`, `LanApprovalResult` |
+| Remote chrome | [[test#GPUI Client Headless Suites#GPUI remote chrome]] | `RemoteEnv`, `RemotePeerList`, `WindowTakenOver`, `RunAction` shared state |
 | Window sharing | [[test#GPUI Client Headless Suites#GPUI window sharing]] | `ShareRoster`, `ControlClaim`/`ControlRequest`/`ControlGrant` |
 | Local share join | [[test#GPUI Client Headless Suites#GPUI local share join]] | `Hello` window claim (harness plumbing, no parity row) |
 | Pane dividers | [[test#GPUI Pane Dividers]] | "Pane divider drag-resize" chrome |
@@ -1274,6 +1287,28 @@ An unprobed environment yields no line; an unfingerprintable network yields the 
 #### Dial status outranks the environment
 
 A client waiting on — or refused by — a peer reports that instead of the local peer count, and each typed [[crates/scribe-common/src/protocol.rs#LanRefusal]] maps to its own copy.
+
+### GPUI remote chrome
+
+Confirms [[crates/scribe-client-gpui/src/remote_chrome.rs#RemoteChrome]] — the state the IPC reader folds every feature-013 answer into and the window renders from — derives the right status line, freezes and reclaims exactly once, and bounds its automation queue.
+
+The suite is the headless half of two cross-thread hand-offs. The displacement one is asserted hardest: a window is frozen until [[crates/scribe-client-gpui/src/remote_chrome.rs#RemoteChrome#reclaim]] returns `true` exactly once, so the key path can never put a second `ControlClaim` on the wire for a banner that is already gone, and it returns `false` when nothing was displaced so an Enter on a normal window is not mistaken for a reclaim. The automation one asserts FIFO order and the overflow rule: past the bound the OLDEST request is dropped, because the newest is the one the user just typed and a wedged window must not replay a minute of stale actions. It also asserts the derived line's precedence — nothing at all before the environment is probed, the passive "not detected" note when `tailscaled` was unreachable, the online-only peer count otherwise, and displacement outranking even a severed link.
+
+#### Status line reports the tailnet account
+
+An unprobed environment yields no line; a fail-closed reply yields the passive "not detected" note; otherwise the line names the signed-in account and counts only online peers.
+
+#### Dial and severance outrank the environment
+
+A client refused by — or connected to — a peer reports that instead of the local peer count, each typed [[crates/scribe-common/src/protocol.rs#RemoteRefusal]] maps to its own copy, and a severed link outranks the dial that established it. Only an accepted dial lights the transport indicator.
+
+#### Displacement freezes and reclaims once
+
+A `WindowTakenOver` stores the banner headline and outranks every other status; the reclaim clears it exactly once and is a no-op on a window that was never displaced.
+
+#### Automation queue is bounded and FIFO
+
+Queued `RunAction`s drain in arrival order, and an overflow drops the oldest rather than the newest.
 
 ### GPUI LAN dial
 

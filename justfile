@@ -167,6 +167,13 @@ e2e-visual-find:
 e2e-visual-lan-approval:
     docker run --rm --gpus all -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_KEYRING=1 -e SCRIBE_SEED_TRUST=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/lan-approval-config.toml)" -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/lan-approval.sh
 
+# Run the feature-013 tailnet remote-control visual E2E. The wire tap records
+# the Unix socket (the startup remote probe and the reclaim leave on it) and
+# injects the takeover / severance notices a second machine would have caused;
+# `scribe-test remote-peer` terminates the TCP dial for the handshake half.
+e2e-visual-remote-control:
+    docker run --rm --gpus all -e TEST_TIMEOUT=300 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/remote-control-config.toml)" -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/remote-control.sh
+
 # Run the update-surface visual E2E pair. The server polls a fake releases API
 # inside the container, so it needs a longer budget than the default 60 s.
 e2e-visual-update:

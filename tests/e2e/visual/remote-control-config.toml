@@ -1,0 +1,6 @@
+[remote]
+enabled = true
+sharing_mode = "shared_single_typist"
+
+[remote.lan]
+enabled = false

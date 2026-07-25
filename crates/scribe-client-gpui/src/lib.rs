@@ -46,9 +46,14 @@
 //! surface follows the same split: [`lan`] is the shared chrome the reader
 //! folds every LAN answer into, [`lan_approval`] is the owning-side prompt it
 //! parks for the window to raise, and [`lan_dial`] is the connecting side's
-//! identity fetch, mutual-TLS dial, and approval-gate preamble. The remaining
-//! consumers (pane splits, scrollback navigation, zoom) land in later beads of
-//! the `gpui-client-rebuild` epic.
+//! identity fetch, mutual-TLS dial, and approval-gate preamble. The feature-013
+//! tailnet surface mirrors that split one more time: [`remote_chrome`] is the
+//! shared state every remote answer folds into (peers, environment, the dial
+//! outcome, the displaced freeze, and the queued automation actions),
+//! [`remote_handshake`] is the plain-TCP dial and its mandatory preamble, and
+//! [`lost_control`] renders the frozen displaced banner. The remaining consumers
+//! (pane splits, scrollback navigation, zoom) land in later beads of the
+//! `gpui-client-rebuild` epic.
 
 pub mod ai_indicator;
 pub mod animation;
@@ -83,6 +88,7 @@ pub mod paste;
 pub mod preedit;
 pub mod prompt_bar;
 pub mod remote;
+pub mod remote_chrome;
 pub mod remote_handshake;
 pub mod restore_replay;
 pub mod restore_state;

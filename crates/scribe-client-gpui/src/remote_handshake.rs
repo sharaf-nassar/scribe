@@ -16,12 +16,27 @@
 //! [`RemoteHandshakeReply`](scribe_common::protocol::ServerMessage::RemoteHandshakeReply),
 //! and maps every terminal condition to a [`RemoteConnectOutcome`].
 
+use std::time::Duration;
+
 use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::WindowId;
 use scribe_common::protocol::{ClientMessage, REMOTE_PROTOCOL_VERSION, ServerMessage};
+use scribe_common::socket::server_socket_path;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, UnixStream};
 
 use crate::remote::RemoteConnectOutcome;
+
+/// How long a TCP connect to a tailnet peer may take before it is abandoned.
+/// A `MagicDNS` name either resolves and answers promptly or the peer is not
+/// reachable; anything slower is indistinguishable from unreachable to a user
+/// waiting on a window.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a transient local-socket probe (`GetRemoteEnv`) waits for its single
+/// reply. The server answers from its own `LocalAPI` view with its own fail-closed
+/// timeout, so anything slower is a wedged server rather than a slow tailnet.
+const LOCAL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The tailnet dial hook env var: `host` or `host:port`, a `MagicDNS` name or IP.
 pub const REMOTE_DIAL_ENV: &str = "SCRIBE_REMOTE_DIAL";
@@ -66,6 +81,17 @@ pub fn parse_dial_target(raw: &str, default_port: u16) -> Option<(String, u16)> 
         _ => (target, default_port),
     };
     Some((host.to_owned(), port))
+}
+
+/// The `host:port` of the tailnet peer to dial, from the `SCRIBE_REMOTE_DIAL`
+/// plumbing hook. `None` — the normal case — keeps the client on its local Unix
+/// socket.
+///
+/// Named to match [`crate::lan_dial::target_from_env`] so the shell's transport
+/// selection reads as one table of two identically-shaped hooks.
+#[must_use]
+pub fn target_from_env() -> Option<(String, u16)> {
+    remote_dial_target_from_env()
 }
 
 /// Parse the optional `SCRIBE_REMOTE_DIAL` plumbing hook. `None` when unset or
@@ -201,6 +227,121 @@ fn map_reply(
             RemoteConnectOutcome::ConnectionFailure
         }
     }
+}
+
+/// Why a tailnet dial could not be started or completed, in the shape the shell
+/// surfaces on the status bar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDialError(String);
+
+impl std::fmt::Display for RemoteDialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A ready-to-use tailnet dialer: the peer's `MagicDNS` name or IP plus its
+/// control port. Unlike the LAN dialer there is no identity to build — the
+/// tailnet transport is plain TCP and identity is `tailscaled`'s `WhoIs` on the
+/// far side (FR-003), never a certificate this process holds.
+pub struct RemoteDialer {
+    host: String,
+    port: u16,
+}
+
+impl RemoteDialer {
+    /// A dialer for `host:port`.
+    #[must_use]
+    pub fn new(host: String, port: u16) -> Self {
+        Self { host, port }
+    }
+
+    /// The peer this dialer targets, for logging and status copy.
+    #[must_use]
+    pub fn target(&self) -> (&str, u16) {
+        (&self.host, self.port)
+    }
+
+    /// Dial the peer over plain TCP.
+    ///
+    /// # Errors
+    /// Returns [`RemoteDialError`] on a connect timeout or a refused/unresolvable
+    /// address. Both are the connecting side's single
+    /// [`RemoteConnectOutcome::ConnectionFailure`] (FR-004); the message
+    /// distinguishes them for the log without inventing new UX states.
+    pub async fn connect(&self) -> Result<TcpStream, RemoteDialError> {
+        let address = format!("{}:{}", self.host, self.port);
+        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&address))
+            .await
+            .map_err(|_| RemoteDialError(format!("tailnet dial to {address} timed out")))?
+            .map_err(|error| {
+                RemoteDialError(format!("tailnet dial to {address} failed: {error}"))
+            })?;
+        // Nagle would coalesce keystroke frames into the previous packet, which
+        // is exactly the latency the local socket never has.
+        if let Err(error) = tcp.set_nodelay(true) {
+            tracing::debug!(%error, "failed to set TCP_NODELAY on the tailnet connection");
+        }
+        tracing::info!(host = %self.host, port = self.port, "tailnet TCP connection established");
+        Ok(tcp)
+    }
+}
+
+/// This machine's advertised short device name in the `RemoteHandshake`
+/// preamble.
+///
+/// Display only — never a trust key. The owning side resolves the real identity
+/// from `tailscaled`'s `WhoIs` on the connection's source address, so this is
+/// only what the peer's banner and audit log show.
+#[must_use]
+pub fn local_device_name() -> String {
+    nix::unistd::gethostname()
+        .map_or_else(|_| String::from("localhost"), |name| name.to_string_lossy().into_owned())
+}
+
+/// Ask this machine's own server, on a transient local socket, for its tailnet
+/// environment ([`ClientMessage::GetRemoteEnv`]) and return the raw reply.
+///
+/// The raw [`ServerMessage`] is returned rather than a parsed summary so the
+/// caller folds it through the SAME handler the live reader uses — the reply is
+/// a `RemoteEnv` either way, and there is exactly one place that knows what to
+/// do with one.
+///
+/// # Errors
+/// Returns [`RemoteDialError`] when the local server is unreachable, silent, or
+/// closes before answering.
+pub async fn probe_remote_env() -> Result<ServerMessage, RemoteDialError> {
+    transient_local_request(ClientMessage::GetRemoteEnv).await.map_err(RemoteDialError)
+}
+
+/// Send one local-only first frame on a fresh Unix socket and read its single
+/// reply, then drop the connection.
+///
+/// The server serves the local-only helper queries (`GetRemoteEnv`, and
+/// feature 014's `GetLanEnv` / `GetLanDialIdentity`) as pre-`Hello` first frames
+/// and closes afterwards, so a fresh socket per call is the protocol, not a
+/// convenience — and it keeps these off the session connection whose ordering
+/// keystrokes depend on. Shared with [`crate::lan_dial`] so both features open
+/// their transient sockets exactly the same way.
+///
+/// # Errors
+/// Returns the human-readable reason the round trip failed: the connect timed
+/// out or was refused, the write failed, or the server did not answer in time.
+pub(crate) async fn transient_local_request(
+    request: ClientMessage,
+) -> Result<ServerMessage, String> {
+    let path = server_socket_path();
+    let mut stream = tokio::time::timeout(LOCAL_PROBE_TIMEOUT, UnixStream::connect(&path))
+        .await
+        .map_err(|_| format!("connecting to {} timed out", path.display()))?
+        .map_err(|error| format!("connecting to {} failed: {error}", path.display()))?;
+    write_message(&mut stream, &request)
+        .await
+        .map_err(|error| format!("sending the local request failed: {error}"))?;
+    tokio::time::timeout(LOCAL_PROBE_TIMEOUT, read_message::<ServerMessage, _>(&mut stream))
+        .await
+        .map_err(|_| String::from("the local server did not answer in time"))?
+        .map_err(|error| format!("the local server closed before answering: {error}"))
 }
 
 #[cfg(test)]
