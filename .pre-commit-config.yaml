@@ -23,6 +23,13 @@ repos:
         types: [rust]
         pass_filenames: false
 
+      - id: reachability-baseline
+        name: gpui client reachability baseline
+        entry: tools/check-reachability.sh --staged
+        language: system
+        files: ^(crates/scribe-client-gpui/src/.*\.rs|crates/scribe-common/src/protocol\.rs|tools/check-reachability\.sh|tools/reachability-baseline\.txt)$
+        pass_filenames: false
+
       - id: cargo-fmt
         name: cargo fmt
         entry: cargo fmt --all -- --check
