@@ -83,7 +83,7 @@ use scribe_client_gpui::url_detect;
 use scribe_client_gpui::vi_mode::ViMotion;
 use scribe_client_gpui::window_chrome;
 use scribe_client_gpui::window_lifecycle::{ExitReason, FocusReport, WindowLifecycle};
-use scribe_client_gpui::workspace_notes::WorkspaceNoteEntry;
+use scribe_client_gpui::workspace_notes::WorkspaceNotesStore;
 use scribe_client_gpui::workspace_notes_modal::{
     WorkspaceNotesModalAction, WorkspaceNotesModalColors, WorkspaceNotesModalView,
 };
@@ -106,7 +106,7 @@ use scribe_common::{
     ids::{SessionId, WorkspaceId},
     protocol::{
         ArchiveReason, AutomationAction, ClientMessage, ClipboardSelection, PromptMarkKind,
-        ServerMessage, SessionInfo, TerminalSize, WindowInfo, WorkspaceNoteStatus,
+        ServerMessage, SessionInfo, TerminalSize, WindowInfo,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -319,6 +319,11 @@ struct Shared {
     /// the server's answer and the next reconcile pass applies it on the thread
     /// that owns the layout.
     workspaces: Arc<Mutex<Vec<WorkspaceInfo>>>,
+    /// Server-owned workspace notes. The IPC reader folds every
+    /// `WorkspaceNotesSnapshot` reply and `WorkspaceNotesChanged` broadcast into
+    /// this cache; the open notes modal adopts it on the next redraw, because a
+    /// modal is a GPUI entity the reader thread must not touch.
+    notes: Arc<Mutex<WorkspaceNotesStore>>,
     /// Spec-010 OSC 52 state. The IPC reader records the negotiated gating bit,
     /// parks a confirmation request, and queues the host clipboard jobs the
     /// server forwards; the view's lifecycle tick raises the prompt as a modal
@@ -518,6 +523,10 @@ struct TerminalView {
     update_dialog_kind: Option<UpdateDialogKind>,
     /// The per-workspace notes modal overlay, present only while open.
     workspace_notes_modal: Option<Entity<WorkspaceNotesModalView>>,
+    /// The `WorkspaceNotesStore` version the open modal is already showing, so
+    /// a redraw only re-hydrates it when the reader has folded in a newer
+    /// snapshot or change broadcast.
+    workspace_notes_adopted: u64,
     /// OSC 8 URI held while the disallowed-scheme dialog is up, so an "Open
     /// Anyway" choice can activate the verbatim URI (spec 009 FR-015). The
     /// dialog view owns its own copy for display; this is the activation copy
@@ -679,6 +688,7 @@ impl TerminalView {
             dialog: None,
             update_dialog_kind: None,
             workspace_notes_modal: None,
+            workspace_notes_adopted: 0,
             pending_osc8_uri: None,
             pending_lan_approval: None,
             clipboard: ClipboardSurfaces::new(gate),
@@ -2843,26 +2853,64 @@ impl TerminalView {
         mutate(&mut guard);
     }
 
-    /// Open the workspace-notes modal for a demo workspace, request its
-    /// authoritative notes over the frozen IPC protocol, seed a representative
-    /// note set, and subscribe so the shell routes each control — Save/archive
-    /// become `WorkspaceNotesMutate`, Close tears the overlay down. Proves the
-    /// modal surface plus the `WorkspaceNotesGet`/`WorkspaceNotesMutate` sink
-    /// path end to end for the visual E2E, mirroring the other overlay demos.
+    /// The workspace the notes surface belongs to: the one the user is in.
+    ///
+    /// The focused region wins whenever the server itself minted its id, which
+    /// is what makes a split window open notes for the region under the cursor
+    /// rather than for the window as a whole. A region the client opened but
+    /// the server has not answered for yet is not a workspace the server can
+    /// look notes up by, so the fallback is the focused tab's workspace — the
+    /// id `SessionList` / `SessionCreated` filed that session under.
+    ///
+    /// `None` means the client has not yet learned any server workspace, and
+    /// the callers treat that as "nothing to ask about" instead of inventing an
+    /// id the server has never seen.
+    fn notes_workspace_id(&self, cx: &App) -> Option<WorkspaceId> {
+        let focused = self.shell.focused_workspace_id(cx);
+        if self.shell.is_server_workspace(focused) {
+            return Some(focused);
+        }
+        self.shared.tabs.lock().ok().and_then(|tabs| tabs.active_workspace())
+    }
+
+    /// Open the workspace-notes modal on the focused workspace, seeded from the
+    /// cache the reader keeps, and ask the server for its authoritative copy.
+    ///
+    /// Nothing is fabricated here: the modal is bound to the very
+    /// [`WorkspaceId`] the server knows the focused pane by, so the
+    /// `WorkspaceNotesGet` it puts on the wire names a workspace the server can
+    /// answer for, and the `WorkspaceNotesMutate` a save produces is filed
+    /// against real notes. The reply lands on the reader thread and is folded
+    /// in by [`Self::sync_workspace_notes`] on the next redraw.
     fn open_workspace_notes_modal(&mut self, cx: &mut Context<Self>) {
         self.command_palette = None;
         self.context_menu = None;
-        let workspace_id = WorkspaceId::new();
+        let Some(workspace_id) = self.notes_workspace_id(cx) else {
+            tracing::warn!("workspace notes requested before any server workspace is known");
+            return;
+        };
         let colors = WorkspaceNotesModalColors::from(&self.chrome);
-        let notes = demo_workspace_notes(workspace_id);
+        let (draft, active, archived, cached_error, adopted) =
+            self.shared.notes.lock().map_or_else(
+                |_| (String::new(), Vec::new(), Vec::new(), None, 0),
+                |store| {
+                    (
+                        store.draft_text(workspace_id),
+                        store.active_notes(workspace_id),
+                        store.archived_notes(workspace_id),
+                        store.last_error().map(str::to_owned),
+                        store.version(),
+                    )
+                },
+            );
+        self.workspace_notes_adopted = adopted;
         let modal = cx.new(|cx| {
             let mut view = WorkspaceNotesModalView::new(&colors, cx);
-            view.open(workspace_id, String::new(), cx);
-            view.set_notes(notes, Vec::new(), cx);
+            view.open(workspace_id, draft, cx);
+            view.set_notes(active, archived, cx);
+            view.set_error(cached_error, cx);
             view
         });
-        // Request the server's authoritative copy; the reply hydrates the modal
-        // through `set_notes` once the shell's inbound wiring lands.
         if let Err(error) = self.sink.workspace_notes_get(vec![workspace_id]) {
             tracing::warn!(%error, "workspace notes get dropped: IPC writer closed");
         }
@@ -2871,7 +2919,44 @@ impl TerminalView {
         })
         .detach();
         self.workspace_notes_modal = Some(modal);
+        tracing::info!(%workspace_id, "opened the workspace notes modal");
         cx.notify();
+    }
+
+    /// Fold the newest server notes into the open modal.
+    ///
+    /// Runs on every redraw for the same reason [`Self::sync_find_results`]
+    /// does: the snapshot reply and the change broadcast both arrive on the IPC
+    /// reader thread, which cannot touch a GPUI entity. The store's version is
+    /// the gate, so an unchanged cache costs one comparison and never clobbers
+    /// what the user is typing; the draft is only replaced while it is pristine
+    /// ([`WorkspaceNotesModalView::replace_pristine_draft`]), which is what
+    /// keeps a late snapshot from eating typed text.
+    fn sync_workspace_notes(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.workspace_notes_modal.clone() else {
+            return;
+        };
+        let Some(workspace_id) = modal.read(cx).workspace_id() else {
+            return;
+        };
+        let Ok(store) = self.shared.notes.lock() else {
+            return;
+        };
+        if store.version() == self.workspace_notes_adopted {
+            return;
+        }
+        self.workspace_notes_adopted = store.version();
+        let active = store.active_notes(workspace_id);
+        let archived = store.archived_notes(workspace_id);
+        let draft = store.draft_text(workspace_id);
+        let error = store.last_error().map(str::to_owned);
+        drop(store);
+        modal.update(cx, |view, ctx| {
+            view.set_notes(active, archived, ctx);
+            view.replace_pristine_draft(draft, ctx);
+            view.set_error(error, ctx);
+        });
+        tracing::debug!(%workspace_id, "workspace notes modal adopted a server answer");
     }
 
     /// Route one modal control to its side effect: state transitions update the
@@ -3455,25 +3540,6 @@ fn smart_selection_action(action: ResolvedSmartSelectionAction) -> ContextMenuAc
     }
 }
 
-/// Representative active notes seeding the workspace-notes modal demo so the
-/// visual E2E can exercise the list, per-row actions, and editor surfaces.
-fn demo_workspace_notes(workspace_id: WorkspaceId) -> Vec<WorkspaceNoteEntry> {
-    ["Wire up the release checklist", "Follow up on the perf gate numbers"]
-        .into_iter()
-        .enumerate()
-        .map(|(index, text)| WorkspaceNoteEntry {
-            note_id: format!("demo-{index}"),
-            workspace_id,
-            text: text.to_owned(),
-            status: WorkspaceNoteStatus::Active,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            archived_at_ms: None,
-            archive_reason: None,
-        })
-        .collect()
-}
-
 /// Build the spawn command for an AI tab, matching the legacy client.
 ///
 /// The CLI starts through the user's login shell (`-lic` + `exec`) so it
@@ -3894,6 +3960,7 @@ impl Render for TerminalView {
         }
         self.sync_tabs(cx);
         self.sync_find_results(cx);
+        self.sync_workspace_notes(cx);
         self.reconcile_panes(cx);
         self.sync_grid_geometry(cx);
         let grid = self.render_grid(cx);
@@ -4053,6 +4120,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         lan: Arc::new(Mutex::new(LanChrome::new())),
         prompt_marks: Arc::new(Mutex::new(PromptMarks::new())),
         workspaces: Arc::new(Mutex::new(Vec::new())),
+        notes: Arc::new(Mutex::new(WorkspaceNotesStore::new())),
         clipboard: Arc::new(Mutex::new(ClipboardBridge::default())),
     };
     let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
@@ -4389,6 +4457,7 @@ where
         lan: ctx.shared.lan,
         prompt_marks: ctx.shared.prompt_marks,
         workspaces: ctx.shared.workspaces,
+        notes: ctx.shared.notes,
         clipboard: ctx.shared.clipboard,
         out_tx: ctx.out_tx,
         in_tx: ctx.in_tx,
@@ -4657,6 +4726,9 @@ struct ReaderCtx {
     /// `WorkspaceInfo` answers the reader parks for the shell's reconcile pass;
     /// see the `workspaces` field of `Shared`.
     workspaces: Arc<Mutex<Vec<WorkspaceInfo>>>,
+    /// Server-owned workspace notes the reader folds snapshots and change
+    /// broadcasts into; see the `notes` field of `Shared`.
+    notes: Arc<Mutex<WorkspaceNotesStore>>,
     /// Spec-010 OSC 52 state the reader records gating on, parks confirmation
     /// requests in, and queues host clipboard jobs onto.
     clipboard: Arc<Mutex<ClipboardBridge>>,
@@ -5067,7 +5139,14 @@ fn dispatch_server_message(
         ServerMessage::SearchResults { session_id, query, matches } => {
             on_search_results(ctx, session_id, query, matches, attached);
         }
-        ServerMessage::Error { message } => set_status(&ctx.status, &ctx.generation, message),
+        // The snapshot answers a `WorkspaceNotesGet`; the change broadcast is
+        // pushed to every connected window after one accepted mutation. Both
+        // carry the same server-owned collection shape and both land in the one
+        // cache the open modal reads, so they are named here and routed as one
+        // to [`on_workspace_notes_message`].
+        notes @ (ServerMessage::WorkspaceNotesSnapshot { .. }
+        | ServerMessage::WorkspaceNotesChanged { .. }) => on_workspace_notes_message(ctx, notes),
+        ServerMessage::Error { message } => on_server_error(ctx, message),
         // Feature 015: the four share/control notices are routed as one group so
         // this table stays a screen of routing decisions; the arm names each
         // variant, so none of them can fall through to the drop counter.
@@ -5157,6 +5236,65 @@ fn on_search_results(
     results.accept(query, matches);
     drop(results);
     ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// The prefix the server puts on a rejected workspace-notes mutation.
+///
+/// `ServerMessage::Error` is one flat channel for every rejection, so this is
+/// what separates a notes rejection from an unrelated one and lets it surface
+/// in the modal's own footer instead of only in the status line.
+const WORKSPACE_NOTES_ERROR_PREFIX: &str = "workspace note mutation failed";
+
+/// Fold one server notes answer into the client-side cache.
+///
+/// `WorkspaceNotesSnapshot` is the reply to the `WorkspaceNotesGet` the modal
+/// sends when it opens; `WorkspaceNotesChanged` is what the server fans out to
+/// every connected window after it has persisted an accepted mutation. The
+/// broadcast is the *only* thing that moves the rendered lists — the modal
+/// never optimistically applies its own edit — which is what keeps two windows
+/// converged on the server's last accepted state.
+///
+/// The reader cannot touch the modal, which is a GPUI entity owned by the
+/// window thread, so it writes the cache, bumps its version, and bumps the
+/// repaint generation; [`TerminalView::sync_workspace_notes`] adopts it on the
+/// next frame.
+fn on_workspace_notes_message(ctx: &ReaderCtx, message: ServerMessage) {
+    let Ok(mut store) = ctx.notes.lock() else {
+        tracing::warn!("workspace notes mutex poisoned; dropping a notes answer");
+        return;
+    };
+    match message {
+        ServerMessage::WorkspaceNotesSnapshot { collections } => {
+            tracing::info!(collections = collections.len(), "workspace notes snapshot received");
+            store.apply_collections(collections);
+        }
+        ServerMessage::WorkspaceNotesChanged { collection } => {
+            tracing::info!(
+                workspace_id = %collection.workspace_id,
+                active = collection.active_notes.len(),
+                archived = collection.archived_notes.len(),
+                "workspace notes changed",
+            );
+            store.apply_collection(collection);
+        }
+        // Unreachable: the caller only routes the two notes variants here.
+        other => tracing::warn!(kind = server_message_variant(&other), "not a notes message"),
+    }
+    drop(store);
+    ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Surface one server rejection: always on the status line, and additionally in
+/// the notes modal's footer when the rejection is about a notes mutation.
+fn on_server_error(ctx: &ReaderCtx, message: String) {
+    if message.starts_with(WORKSPACE_NOTES_ERROR_PREFIX) {
+        if let Ok(mut store) = ctx.notes.lock() {
+            store.set_error(message.clone());
+        } else {
+            tracing::warn!("workspace notes mutex poisoned; dropping a notes error");
+        }
+    }
+    set_status(&ctx.status, &ctx.generation, message);
 }
 
 /// Fold one `WorkspaceInfo` onto the window's chrome and park it for the shell.

@@ -212,17 +212,34 @@ fn visual_line_of(text: &str, caret_byte: usize, cols: usize) -> usize {
 }
 
 /// Client-side cache of server-owned workspace notes keyed by workspace id.
+///
+/// The IPC reader owns the write side (a `WorkspaceNotesSnapshot` reply or a
+/// `WorkspaceNotesChanged` broadcast), and the GPUI thread owns the read side.
+/// The two are decoupled by [`WorkspaceNotesStore::version`]: every accepted
+/// write bumps it, so the open modal can tell a fresh server answer from the
+/// copy it already adopted instead of re-hydrating itself on every frame.
 #[derive(Debug, Default)]
 pub struct WorkspaceNotesStore {
     collections: BTreeMap<String, WorkspaceNotesCollection>,
     last_error: Option<String>,
+    version: u64,
 }
 
 impl WorkspaceNotesStore {
     /// Build an empty store.
     #[must_use]
     pub fn new() -> Self {
-        Self { collections: BTreeMap::new(), last_error: None }
+        Self { collections: BTreeMap::new(), last_error: None, version: 0 }
+    }
+
+    /// Monotonic counter identifying the currently cached state.
+    ///
+    /// Starts at 0, which is the version an as-yet-unanswered modal adopts, so
+    /// the very first server answer always reads as newer than what is on
+    /// screen.
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
     }
 
     /// Apply a batch of server collections, replacing any cached copies.
@@ -230,17 +247,23 @@ impl WorkspaceNotesStore {
         for collection in collections {
             self.apply_collection(collection);
         }
+        // A snapshot answering a workspace the server has no notes for carries
+        // an empty batch; it is still an answer, so it must move the version or
+        // the modal would wait forever for one that never comes.
+        self.version += 1;
     }
 
     /// Apply one server collection, clearing any surfaced error.
     pub fn apply_collection(&mut self, collection: WorkspaceNotesCollection) {
         self.collections.insert(workspace_key(collection.workspace_id), collection);
         self.last_error = None;
+        self.version += 1;
     }
 
     /// Record a server error message for the modal footer.
     pub fn set_error(&mut self, message: String) {
         self.last_error = Some(message);
+        self.version += 1;
     }
 
     /// The most recent server error, if any.
