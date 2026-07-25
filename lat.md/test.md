@@ -310,9 +310,17 @@ Exiting is asserted as process death rather than as a screenshot, because the wh
 
 Nothing is stubbed on the client side. `tests/e2e/visual/fake-update-api.py` stands in for GitHub's releases API and the container is started with `SCRIBE_UPDATE_API_URL` pointing at it, so `scribe-server` decides on its own that a newer version exists and broadcasts `UpdateAvailable` on its normal 30 s startup check. `tests/e2e/visual/update-config.toml` is seeded through `SCRIBE_EXTRA_CONFIG` to turn the status bar's sparklines off, because they resample every 2 s and would swamp the one band the tests diff.
 
-Both scripts share `tests/e2e/visual/update-common.sh`, which grows the window first — the spike's terminal grid is a fixed 36 × 18 px block, so at the default 960 × 680 window both bottom bands fall below the window edge — then diffs the centred status-bar band before and after the broadcast. A non-zero delta proves the CTA rendered; the bounding box of the changed pixels is where the script actually moves the pointer and clicks, so the click cannot silently miss.
+Both scripts share `tests/e2e/visual/update-common.sh`, which grows the window first — both bottom bands are on screen at the default size now that it is derived (see [[client#GPUI Window Chrome Layout]]), but a wider window spreads the status bar's left and right groups apart and leaves the centred CTA clear space of its own — then diffs the centred status-bar band before and after the broadcast. A non-zero delta proves the CTA rendered; the bounding box of the changed pixels is where the script actually moves the pointer and clicks, so the click cannot silently miss.
 
 `update-trigger.sh` then presses Enter on the default "Update Now" and waits for the server's `client triggered update window_id=…` line — the server only logs that on receiving `TriggerUpdate` from that window — before capturing the CTA relabelled "Downloading..." and then "Update failed" as the server's real download and (deliberately invalid) signature check drive `UpdateProgress`. `update-dismiss.sh` Tabs onto "Later" instead, waits for `client dismissed update notification window_id=…`, and asserts the CTA band is once again pixel-identical to the no-update baseline.
+
+### Window chrome bands stay on screen
+
+`tests/e2e/visual/window-chrome-bands.sh` (`just e2e-visual-chrome-bands`) is the app-level oracle for [[client#GPUI Window Chrome Layout]]: it measures, on the running client, that the derived window size really does fit the whole terminal grid *and* every chrome band.
+
+The measurement is geometric rather than golden-image. Phase 1 reads the client window's own size with `xdotool getwindowgeometry` and asserts it is the derived 1008x765 — the same arithmetic the crate does, restated in the script so a drift fails here instead of silently clipping pixels — then confirms the whole window is on the Xvfb screen by trimming a full-screen capture. Phases 2-4 crop window-relative bands out of `import -window` captures, so no WM decoration can shift an offset.
+
+Phase 2 fills the pane with `seq 1 40` through the shared-pane rig (`SCRIBE_SHARED_PANE=1`, so `scribe-test send` writes to the very pane on screen) and asserts the *last* grid row carries ink: at the old 960x680 the bottom five rows fell outside the 596 px viewport, and this is the assertion that catches it. Phase 3 asserts the pane status strip and the window status bar each carry ink in their own band at the window bottom. Phase 4 posts a real `prompt_received` event down the AI hook channel and asserts the band above the strip *repaints* — ink alone would prove nothing there, since it held grid rows a moment earlier — while both status bands below it keep their ink, which is what the bands' `flex_none` layout guarantees.
 
 ## GPUI IPC Bridge
 
@@ -769,6 +777,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Keybindings dispatch | [[test#GPUI Client Headless Suites#GPUI keybindings dispatch]] | Pane/Workspace/Tab/Navigation/View keybinding actions |
 | Config load with removed keys | [[test#GPUI Client Headless Suites#Config load with removed keys]] | "Removed configuration keys" rows |
 | Config live reload | [[test#GPUI Client Headless Suites#Config live reload]] | `ConfigReloaded` live reload |
+| Window chrome geometry | [[test#GPUI Client Headless Suites#Window chrome geometry]] | Rendering/window status-bar and prompt-bar chrome |
 | Window opacity | [[test#GPUI Client Headless Suites#Window opacity]] | Rendering/window `appearance.opacity` |
 | Update surfaces | [[test#GPUI Client Headless Suites#GPUI Update Surfaces]] | `UpdateAvailable`, `UpdateProgress`, `TriggerUpdate`, `DismissUpdate` |
 | Cell-accurate paint path | [[test#GPUI Client Headless Suites#Cell-accurate paint path]] | Box drawing, Font fallback, Ligatures |
@@ -968,6 +977,24 @@ Parsing [[crates/scribe-client-gpui/src/fonts.rs#SYMBOLS_NERD_FONT_MONO]], the t
 Pins the substitution that makes the overlay authoritative: a box-drawing codepoint must not also be shaped from the font, or the glyph's bearing gaps reappear on top of the quads.
 
 The test asserts box-drawing and block codepoints become spaces before shaping while ordinary and Nerd Font codepoints pass through, that a control character is blanked so `shape_line` can never see a newline, and that a row's blank tail is trimmed except where an underline or strikeout must still be drawn.
+
+### Window chrome geometry
+
+Locks the arithmetic behind the derived startup window size, so the terminal grid and the chrome bands can never again be sized to overlap. See [[client#GPUI Window Chrome Layout]].
+
+These cases cover the derivation only. That the running window really shows its last grid row and all three bands is a display-server property, verified by [[test#Visual E2E Tests#Window chrome bands stay on screen]].
+
+#### Default window size clears every chrome band
+
+Confirms [[crates/scribe-client-gpui/src/window_chrome.rs#default_window_size]] leaves the whole grid *and* [[crates/scribe-client-gpui/src/window_chrome.rs#chrome_height]] room, which the old hardcoded 960x680 did not.
+
+At the shipped 120x36 grid and font size 14 the derived height minus the chrome must still cover 36 rows of 18.9 px and the width must cover 120 cells of 8.4 px. The test also pins the exact shipped answer, because `120 * (14.0 * 0.6)` lands a hair above 1008.0 in `f32` and a naive `ceil()` would spend a whole extra pixel on that float noise. A degenerate font metric (zero cell width, negative line height) must collapse the grid to the minimum edge rather than producing a zero-size or negative window.
+
+#### Startup size never exceeds the display
+
+Verifies [[crates/scribe-client-gpui/src/window_chrome.rs#clamp_to_display]] shrinks an oversized request to the screen, because a window taller than the display moves the status bar off the desktop instead of off the window.
+
+A `font_size = 72` grid asks for a window far past 1920x1080 and must come back clamped to exactly that; a window that already fits must pass through untouched; and a nonsense display report must not clamp the window below the minimum edge.
 
 ### Window opacity
 

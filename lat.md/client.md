@@ -324,6 +324,20 @@ The window-list poll rounds it out: [[crates/scribe-client-gpui/src/main.rs#Term
 
 The whole surface is verified against the running app, not headlessly: see [[test#Visual E2E Tests#Window lifecycle over the wire]].
 
+## GPUI Window Chrome Layout
+
+The terminal window is a flex column of chrome bands around one flex-grown grid, and its startup size is derived from that stack rather than hardcoded — so the whole grid and every band land on screen at once.
+
+[[crates/scribe-client-gpui/src/main.rs#TerminalView#render]] stacks, top to bottom: the [[client#GPUI Titlebar|titlebar]], the terminal grid, the optional [[client#Client#GPUI Prompt Bar|prompt strip]], the one-line pane status strip, and the window [[client#Client#GPUI Client Spike#GPUI Status Bar Port|status bar]]. Only the grid is flex-grown, so every pixel the chrome takes is a pixel the grid does not get.
+
+The window used to open at a hardcoded 960x680, which was the painted height of the 36-row grid (36 x 18.9 px) and nothing else. The 84 px of titlebar, status strip and status bar therefore came out of the grid: the bottom five rows were clipped away, and because each band was flex-*shrinkable* under a flex-grown grid, a shorter window would have squeezed the bands themselves rather than the grid.
+
+[[crates/scribe-client-gpui/src/window_chrome.rs]] is now the single place the band heights are stated. [[crates/scribe-client-gpui/src/window_chrome.rs#chrome_height]] sums the titlebar, [[crates/scribe-client-gpui/src/window_chrome.rs#STATUS_STRIP_HEIGHT]] and [[crates/scribe-client-gpui/src/window_chrome.rs#STATUS_BAR_HEIGHT]] (GPUI lays divs out border-box, so each band's hairline is inside its own number), and [[crates/scribe-client-gpui/src/window_chrome.rs#default_window_size]] adds the grid's own extent at the metrics it is *painted* with — the live `GridFont`, not the integer cell size reported to the server, because the painted metrics decide where the last row lands. [[crates/scribe-client-gpui/src/main.rs#startup_window_size]] resolves that from the live `[appearance]` config and hands it to `Bounds::centered`, so a font-size change moves the default window instead of silently clipping more rows. At the shipped defaults that is 1008x765 rather than 960x680.
+
+Two guards keep the derivation honest. [[crates/scribe-client-gpui/src/window_chrome.rs#clamp_to_display]] shrinks the request to the primary display, because a `font_size = 72` window taller than the screen would move the status bar off the *desktop* instead of off the window — the same defect one level up. And every band now carries `flex_none` ([[crates/scribe-client-gpui/src/titlebar.rs#TitlebarView#render]], the status strip in `render`, [[crates/scribe-client-gpui/src/status_bar.rs#render]], [[crates/scribe-client-gpui/src/prompt_bar.rs#render]]), so a user-shrunk window clips the grid — the surface that can afford it — instead of squeezing the status surfaces away.
+
+The prompt strip is deliberately excluded from the reserved height: it exists only while the attached pane has prompts, so reserving its rows up front would leave a permanent dead band under the grid. When it appears it takes its rows from the grid and the bands below it stay put. Verified on the running app by [[test#Visual E2E Tests#Window chrome bands stay on screen]].
+
 ## GPUI Titlebar
 
 The GPUI rebuild replaces native window decorations with a custom titlebar that also hosts the integrated tab bar. The pure layout/decay math is ported into a testable module; the interactive chrome is a `gpui::Entity`.

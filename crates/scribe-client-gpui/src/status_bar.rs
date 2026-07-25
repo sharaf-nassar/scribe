@@ -645,6 +645,10 @@ pub fn render(
         .map(|span| center_cta(span, model.center_clickable, colors, on_update_click));
     div()
         .w_full()
+        // A fixed-height band, never a flexible one: the shell stacks it under
+        // a flex-grown terminal grid, and a shrinkable band is what lets a
+        // short window squeeze the bar off screen instead of clipping the grid.
+        .flex_none()
         .h(px(height_px))
         .flex()
         .flex_row()

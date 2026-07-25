@@ -17,7 +17,7 @@ use std::{
 
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    Point, Render, Subscription, Task, TitlebarOptions, WeakEntity, Window,
+    Pixels, Point, Render, Size, Subscription, Task, TitlebarOptions, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use gpui_platform::application;
@@ -61,6 +61,7 @@ use scribe_client_gpui::sys_stats::SystemStatsCollector;
 use scribe_client_gpui::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
 use scribe_client_gpui::update::UpdateState;
 use scribe_client_gpui::url_detect;
+use scribe_client_gpui::window_chrome;
 use scribe_client_gpui::window_lifecycle::{ExitReason, FocusReport, WindowLifecycle};
 use scribe_client_gpui::workspace_notes::WorkspaceNoteEntry;
 use scribe_client_gpui::workspace_notes_modal::{
@@ -2179,7 +2180,7 @@ impl TerminalView {
         let colors = self.status_colors.with_opacity(self.opacity);
         status_bar::render(
             &model,
-            24.,
+            window_chrome::STATUS_BAR_HEIGHT,
             &colors,
             Some(Box::new(cx.listener(|view, _event, _window, ctx| {
                 view.open_update_dialog(ctx);
@@ -2373,8 +2374,13 @@ impl Render for TerminalView {
             .child(grid)
             .children(prompt_strip)
             .child(
+                // `flex_none` on every band below the grid: the grid is the one
+                // flex-grown child, so without it a window shorter than the
+                // grid's painted height would shrink the bands away instead of
+                // clipping the grid, taking the status surfaces off screen.
                 div()
-                    .h(px(26.))
+                    .flex_none()
+                    .h(px(window_chrome::STATUS_STRIP_HEIGHT))
                     .px_2()
                     .flex()
                     .items_center()
@@ -2410,6 +2416,35 @@ fn init_tracing() {
 /// The startup grid geometry every terminal window is created with.
 fn default_terminal_size() -> TerminalSize {
     TerminalSize { cols: COLUMNS, rows: ROWS, cell_width: CELL_WIDTH, cell_height: CELL_HEIGHT }
+}
+
+/// The inner size a new terminal window opens at.
+///
+/// Derived rather than hardcoded: the window has to fit the whole
+/// [`COLUMNS`]x[`ROWS`] grid *at the metrics the grid is painted with* plus
+/// every chrome band, otherwise the flex column silently clips whichever comes
+/// last. The old fixed 960x680 was the grid's painted height alone (36 rows x
+/// 18.9 px) with nothing left for the 84 px of titlebar, status strip and
+/// status bar, so the bottom five rows were cut off and a slightly smaller
+/// window would have taken the bands with them. The result is clamped to the
+/// display so a large `appearance.font_size` cannot push the status bar off the
+/// screen instead of off the window.
+fn startup_window_size(cx: &App) -> Size<Pixels> {
+    let appearance = load_config().unwrap_or_default().appearance;
+    let font = GridFont::from_appearance(&appearance);
+    let wanted =
+        window_chrome::default_window_size(COLUMNS, ROWS, font.cell_width(), font.line_height);
+    let wanted = cx.primary_display().map_or(wanted, |display| {
+        let bounds = display.bounds().size;
+        window_chrome::clamp_to_display(
+            wanted,
+            window_chrome::WindowSize {
+                width: f32::from(bounds.width),
+                height: f32::from(bounds.height),
+            },
+        )
+    });
+    size(px(wanted.width), px(wanted.height))
 }
 
 /// Build one terminal window's backend: fresh shared state plus its own IPC
@@ -2532,7 +2567,7 @@ fn run_settings() {
 }
 
 fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink, terminal_size: TerminalSize) {
-    let bounds = Bounds::centered(None, size(px(960.), px(680.)), cx);
+    let bounds = Bounds::centered(None, startup_window_size(cx), cx);
     let shared = shared.clone();
     let sink = sink.clone();
     // Everything between here and the root-view builder below happens inside

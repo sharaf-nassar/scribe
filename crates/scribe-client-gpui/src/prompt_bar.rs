@@ -393,7 +393,11 @@ pub fn render(
     hover: Option<PromptBarHover>,
 ) -> impl IntoElement {
     let row_h = prompt_bar_row_height(cell_height);
-    let mut strip = div().flex().flex_col().w_full().font_family("monospace").text_xs().relative();
+    // `flex_none` for the same reason the status bar carries it: the strip is a
+    // fixed-height band stacked under the flex-grown terminal grid, and a
+    // shrinkable band would be squeezed away rather than clipping the grid.
+    let mut strip =
+        div().flex().flex_col().flex_none().w_full().font_family("monospace").text_xs().relative();
 
     let first_style = RowStyle {
         icon_color: colors.icon_first,
