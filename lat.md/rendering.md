@@ -108,9 +108,9 @@ Block elements use direct rectangle fills for halves, eighths, quarters, and sha
 
 ### GPUI Box-Drawing Overlay
 
-The GPUI client rebuild will render procedural box drawing through a paint-quad overlay rather than the text system, retaining edge-to-edge coverage regardless of font availability.
+The GPUI client renders procedural box drawing through a paint-quad overlay rather than the text system, retaining edge-to-edge coverage regardless of font availability.
 
-[[crates/scribe-renderer/src/box_drawing.rs#is_box_drawing]] selects U+2500–U+259F cells for the overlay. `TerminalElement` will convert the existing rasterizer alpha mask into foreground-coloured quads after cell backgrounds and before normal shaped text; `specs/016-gpui-client-rebuild/spikes/box-drawing-rendering.md` records the capability spike.
+[[crates/scribe-renderer/src/box_drawing.rs#is_box_drawing]] selects U+2500–U+259F cells for the overlay. The GPUI port converts the same rasterizer alpha mask into foreground-coloured quads after cell backgrounds and before normal shaped text; see [[rendering#Rendering#GPUI Ported Rendering Logic#GPUI Box-Drawing Rasterizer]] for the shipped seam and `specs/016-gpui-client-rebuild/spikes/box-drawing-rendering.md` for the capability spike.
 
 ## Render Pipeline
 
@@ -158,7 +158,7 @@ ANSI 0-15 are overridable by theme. The 6x6x6 colour cube (indices 16-231) uses 
 
 The GPUI client rebuild ports the renderer's pure colour and box-drawing logic into the `scribe-client-gpui` library crate so terminal output stays byte-for-byte identical across the cutover, independent of the wgpu pipeline.
 
-These modules are display-independent: they own no GPU resources and are exercised by byte/colour-exact unit tests that lock the legacy renderer's output. The GPUI paint path (a later bead) consumes them.
+These modules are display-independent: they own no GPU resources and are exercised by byte/colour-exact unit tests that lock the legacy renderer's output. [[rendering#Rendering#GPUI Cell-Accurate Paint Path]] is the consumer that puts them on the live paint call.
 
 ### GPUI Colour Palette
 
@@ -172,11 +172,15 @@ It reproduces the standard/bright ANSI entries, the 6×6×6 colour cube, and the
 
 It applies bold→bright promotion via [[crates/scribe-client-gpui/src/color.rs#bold_to_bright]], the DIM 0.67 sRGB round-trip via [[crates/scribe-client-gpui/src/color.rs#apply_dim]], the `BrightForeground` boost via [[crates/scribe-client-gpui/src/color.rs#boost_srgb_brightness]], and INVERSE/HIDDEN handling. Theme colours are linearised through [[crates/scribe-client-gpui/src/color.rs#srgb_to_linear_rgba]].
 
+GPUI's `Rgba` is already sRGB, so the paint path calls [[crates/scribe-client-gpui/src/color.rs#TerminalColors#resolve_cell_colors_srgb]], which runs the identical rules and converts the result back with [[crates/scribe-client-gpui/src/color.rs#linear_to_srgb_rgba]]. Keeping one resolver and converting at the boundary is deliberate: duplicating the bold-bright / INVERSE / HIDDEN / DIM ordering in a second colour space is exactly how the two clients would drift.
+
 ### GPUI Box-Drawing Rasterizer
 
 [[crates/scribe-client-gpui/src/box_drawing.rs#render]] ports the procedural rasterizer that emits a cell-sized RGBA alpha mask for U+2500–U+259F; [[crates/scribe-client-gpui/src/box_drawing.rs#is_box_drawing]] selects those codepoints.
 
 Per the [[rendering#Glyph Atlas#GPUI Box-Drawing Overlay]] capability spike, `TerminalElement` paints this mask as a foreground-coloured quad overlay after cell backgrounds and before shaped text, keeping edge-to-edge coverage regardless of font availability.
+
+GPUI cannot upload a per-cell RGBA texture the way the wgpu atlas did, so [[crates/scribe-client-gpui/src/box_drawing.rs#mask_quads]] reduces the mask to the smallest set of uniform-alpha [[crates/scribe-client-gpui/src/box_drawing.rs#MaskQuad]] rectangles that reproduces it exactly — horizontal runs first, then merged vertically. That reduction is what makes the overlay affordable: a full block becomes one quad instead of one per scanline, so a screen of box drawing costs a handful of quads per cell rather than hundreds.
 
 ### GPUI Window Opacity
 
@@ -187,6 +191,52 @@ Per the [[rendering#Glyph Atlas#GPUI Box-Drawing Overlay]] capability spike, `Te
 Two rules make the result equal the configured number rather than an accumulation of it. First, the window is opened with `WindowBackgroundAppearance::Transparent` unconditionally, even at opacity 1.0: surface capability is fixed at creation, so deriving it from the startup value would force a restart to ever go translucent — the legacy client's `window_transparent` flag had exactly that wart and refused live changes ([[crates/scribe-client/src/main.rs#App#apply_opacity_change]]). At 1.0 every painted background is alpha 1.0 and the window is pixel-identical to an opaque one. Second, the root element paints nothing at all. The titlebar, terminal grid and status bands tile the window edge to edge, so each pixel carries the opacity alpha exactly once; filling the root as well would composite a translucent band over a translucent root and land at 0.98 for a configured 0.85.
 
 The alpha-aware surfaces are the terminal grid ([[crates/scribe-client-gpui/src/terminal_element.rs#GridColors]]), the titlebar and tab bar ([[crates/scribe-client-gpui/src/tab_bar.rs#TabBarColors#from_chrome]]), the prompt bar ([[crates/scribe-client-gpui/src/prompt_bar.rs#PromptBarColors#with_opacity]]), the terminal-status strip, and the window status bar ([[crates/scribe-client-gpui/src/status_bar.rs#StatusBarColors#with_opacity]]). Their colours come from the resolved theme rather than the literals the spike hardcoded, so a `theme` edit now repaints the grid and the strip too.
+
+## GPUI Cell-Accurate Paint Path
+
+The GPUI terminal grid resolves every visible property of a cell — colour, attributes, glyph coverage, and shaping — on the live paint call, so the ported rendering logic above reaches real pixels instead of only unit tests.
+
+`Content` carries a `Cell` per grid position (character, raw `vte::ansi::Color` foreground and background, and the alacritty `Flags` bitset) rather than a `String` per row. The colours stay unresolved in the snapshot on purpose: a theme edit then repaints existing scrollback without re-running the parser, because `TerminalElement` resolves against the current theme every frame.
+
+`TerminalElement::paint` lowers that snapshot onto one `gpui::canvas` rather than a div per row, because the three passes below must land in one paint call in order. A styled-div tree can express none of them.
+
+### Paint Order
+
+Each row paints cell backgrounds, then the box-drawing overlay, then shaped glyph runs — the same order the legacy wgpu renderer used.
+
+Backgrounds come first so the overlay and the glyphs sit on top of them. Adjacent cells resolving to the same colour merge into one quad, and a cell whose resolved background equals the theme default paints nothing at all, so the window's own (possibly translucent) fill shows through instead of being painted over — that is what keeps [[rendering#Rendering#GPUI Ported Rendering Logic#GPUI Window Opacity]] correct per cell. Only backgrounds are scaled by `appearance.opacity`; glyphs never are.
+
+Box-drawing cells are then overlaid from [[crates/scribe-client-gpui/src/box_drawing.rs#mask_quads]] and replaced by a space in the shaped text, so the overlay is the only thing that draws them. The quads are rasterized in integer mask pixels and scaled onto the cell's exact fractional rect, which is what makes a stroke land precisely on the neighbouring cell's edge at any font size instead of leaving the rounding seam a whole-pixel mask would.
+
+### Glyph Runs
+
+A whole row is shaped as one `shape_line` call with a `TextRun` per style change, and `force_width` set to the cell advance.
+
+Shaping the row rather than the cell is what allows a contextual ligature to form across cells; `force_width` then pins every advancing glyph to the next grid column, so the ligature keeps its multi-cell outline while later cells stay on the grid. Adjacent cells with identical style merge into one run, which matters for correctness and not just cost: shaping only forms a ligature within a single run.
+
+Each run carries `FontWeight` from `appearance.font_weight` / `font_weight_bold` (BOLD selects the bold weight), `FontStyle::Italic` for ITALIC, and underline / strikethrough decorations for the `ALL_UNDERLINES` and `STRIKEOUT` flags. Control characters are blanked before shaping, since `shape_line` rejects a newline outright.
+
+### Font Fallbacks
+
+Every run carries an explicit ordered fallback chain, Nerd Font symbol families first, so GPUI's platform text system cannot substitute its own ordering.
+
+The list mirrors the legacy cosmic-text atlas (`SCRIBE_COMMON_FALLBACKS` in `crates/scribe-renderer/src/atlas.rs`): `Symbols Nerd Font Mono`, `Symbols Nerd Font`, `Nerd Font Symbols Mono`, `Nerd Font Symbols`, then the generic sans / mono / symbol / emoji families. `Unifont Sample` is deliberately excluded — its private-use mappings turn an unavailable icon into an unrelated sample glyph, which is worse than a visible tofu box. `specs/016-gpui-client-rebuild/spikes/nerd-font-fallback-ordering.md` records the capability spike.
+
+#### Embedded Symbols Font Defeats GPUI Face Eviction
+
+Carrying the chain is necessary but not sufficient on this GPUI revision: a stock symbols-only family can never enter it, so the client embeds a patched `Symbols Nerd Font Mono` that can.
+
+`CosmicTextSystem::load_family` (gpui rev `f96212f`, `crates/gpui_wgpu/src/cosmic_text_system.rs`) drops any face whose charmap has no `'m'` glyph and calls `db_mut().remove_face` on it. Every stock `Symbols Nerd Font*` face fails that test, so each chain entry resolves to nothing and the face is evicted from the font database outright. Omitting the families does not help either: GPUI builds its `FontSystem` with cosmic-text's default `PlatformFallback` and exposes no equivalent of the legacy [[crates/scribe-renderer/src/atlas.rs#ScribeFontFallback]] `forbidden_fallback`, so automatic fallback picks `Unifont Sample` — the exact font the legacy renderer bans.
+
+[[crates/scribe-client-gpui/src/fonts.rs#register_embedded_fonts]] therefore registers [[crates/scribe-client-gpui/src/fonts.rs#SYMBOLS_NERD_FONT_MONO]] — the upstream binary with a `U+006D` cmap alias added by `tools/patch-nerd-symbols-font.py` — with GPUI's text system before the first frame is shaped. The face passes the `'m'` check, keeps its upstream family name so the chain resolves it, and covers the icon ranges even on hosts with no Nerd Fonts installed. The alias never leaks into visible text: the chain is only consulted for codepoints the primary font lacks, and every terminal font covers `m`.
+
+Live capture on the real client confirms the chain is live: `U+F09B` and `U+F121` — absent from the primary JetBrains Mono — render as the octocat and code icons from the embedded face instead of `Unifont Sample` hex boxes, alongside the `U+E0B0`/`U+E0B2`/`U+E0A0` powerline glyphs.
+
+### Ligature Toggle
+
+`appearance.ligatures` selects the OpenType features the runs are shaped with: `FontFeatures::disable_ligatures()` (`calt` off) when false, the font's own defaults when true.
+
+The setting is read by [[crates/scribe-client-gpui/src/terminal_element.rs#GridFont#from_appearance]] on the live config-load path, and `font_params_changed` already counts it as a font metric, so saving the edit repaints the grid without a restart — the same reload seam as `font` and `font_size`. `specs/016-gpui-client-rebuild/ligatures-spike.md` records the capability spike.
 
 ## Chrome Rendering
 

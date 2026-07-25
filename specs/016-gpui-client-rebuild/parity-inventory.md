@@ -297,17 +297,18 @@ the remaining 26 reach the catch-all. `KeyAction` variants are `Terminal`
 These spike-resolved rendering and native-window requirements preserve the
 legacy terminal's output and platform behavior through the GPUI cutover.
 
-`terminal_element.rs::TerminalElement::paint` renders `terminal.rs::Content`'s
-`rows: Vec<String>` as plain text in one foreground colour on one background.
-There is **no per-cell colour, no glyph overlay, and no fallback or shaping
-configuration in the paint path at all**, so the rendering rows below are
-blocked on FU-1 rebuilding `Content` to carry per-cell fg/bg/attrs.
+`terminal_element.rs::TerminalElement::paint` resolves every visible cell
+property on the live paint call: `terminal.rs::Content` carries a `Cell` per
+grid position (character, raw `vte::ansi::Color` fg/bg, alacritty `Flags`), and
+one `gpui::canvas` paints background quads, then the `box_drawing::mask_quads`
+overlay, then `shape_line` runs. FU-1 (bead `.63`) landed that rebuild, so the
+first three rows below are reachable rather than blocked.
 
 | Surface | Required behavior | Verification method | Reachable from | Status |
 | --- | --- | --- | --- | --- |
-| Box drawing | U+2500–U+259F cells bypass text shaping and use the existing procedural alpha-mask rasterizer through a `TerminalElement` paint-quad overlay after backgrounds and before text. | visual-E2E | — (unwired, FU-1) — `box_drawing.rs` is referenced only by `lib.rs`; no paint-quad overlay exists in `TerminalElement::paint` | required |
-| Font fallback | Every terminal run uses `FontFallbacks::from_fonts` with `Symbols Nerd Font Mono`, `Symbols Nerd Font`, `Nerd Font Symbols Mono`, and `Nerd Font Symbols` before existing generic fallbacks; `Unifont Sample` remains excluded. | visual-E2E | — (missing, FU-1) — `FontFallbacks` appears nowhere in the crate; the paint path sets a bare `.font_family(...)` | required |
-| Ligatures | `appearance.ligatures` keeps its semantics: same-style runs call `shape_line` with `Some(cell_width)` and disable `calt` only when false, without drifting later cell origins. | visual-E2E | — (missing, FU-1) — `shape_line` and `calt` appear nowhere in the crate; `appearance.ligatures` is never read by the client | required |
+| Box drawing | U+2500–U+259F cells bypass text shaping and use the existing procedural alpha-mask rasterizer through a `TerminalElement` paint-quad overlay after backgrounds and before text. | visual-E2E | `main` → `open_window` → `TerminalView::render` → `TerminalElement::paint` → `TerminalElement::paint_grid` → `paint_box_drawing` → `box_drawing::mask_quads` | required |
+| Font fallback | Every terminal run uses `FontFallbacks::from_fonts` with `Symbols Nerd Font Mono`, `Symbols Nerd Font`, `Nerd Font Symbols Mono`, and `Nerd Font Symbols` before existing generic fallbacks; `Unifont Sample` remains excluded. | visual-E2E | `TerminalElement::paint_grid` → `FontVariants::new` → `GridFont::font_for` → `GridFont::fallbacks`, carried on every `TextRun` handed to `shape_line`. The chain resolves because `fonts::register_embedded_fonts` registers an embedded `Symbols Nerd Font Mono` whose cmap maps `U+006D` (see `tools/patch-nerd-symbols-font.py`), surviving gpui `f96212f` `CosmicTextSystem::load_family`'s `'m'`-glyph face eviction that silently dropped every stock symbols-only font. Live capture: `U+F09B`/`U+F121` render as the octocat/code icons, not `Unifont Sample` hex boxes | required |
+| Ligatures | `appearance.ligatures` keeps its semantics: same-style runs call `shape_line` with `Some(cell_width)` and disable `calt` only when false, without drifting later cell origins. | visual-E2E | `ConfigRuntime` → `GridFont::from_appearance` → `GridFont::features` on every run; `paint_row_text` shapes each row with `Some(cell_width)` | required |
 | Opacity | `appearance.opacity` is clamped to `0.0..=1.0`; Wayland and composited X11 repaint alpha-aware terminal and chrome backgrounds live on a transparent surface, without restart. | manual | — (unwired at the audit baseline `f56ef95`, FU-4) — bead `.56` landed afterwards (`771794d`); the cell stays a marker until `.53` re-verifies it against the running client | required |
 | X11 focus guard | The guard reads GPUI's `RawWindowHandle::Xcb` XID and compares it directly with `_NET_ACTIVE_WINDOW`; non-X11 backends do not enable the guard. | scripted-E2E | `main.rs::open_window` → `TerminalView::new` (FU-15) — starts the guard from the live `Window`, polls it from `drive_x11_focus_polls`, clears the debounce in `TerminalView::on_activation`, and gates the key path in `TerminalView::compositor_overlay_active`; scripted oracle `tests/e2e/visual/x11-focus-guard.sh` | required |
 

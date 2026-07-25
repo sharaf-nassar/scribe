@@ -1,9 +1,28 @@
 //! GPUI paint path for a display-only terminal [`Content`](crate::terminal::Content) snapshot.
+//!
+//! Every visible property of a terminal cell is resolved here, on the live
+//! paint call, in the order the legacy wgpu renderer used: cell backgrounds
+//! first, then the procedural box-drawing overlay, then shaped glyph runs.
+//! Colours come from the ported `TerminalColors` SGR semantics, glyph coverage
+//! from an explicit Nerd-Font-first fallback chain, and ligatures from the
+//! `calt` OpenType feature gated on `appearance.ligatures`.
 
-use gpui::{Rgba, div, prelude::*, px};
+use std::sync::Arc;
+
+use gpui::{
+    App, Bounds, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Pixels, Rgba,
+    StrikethroughStyle, TextAlign, TextRun, UnderlineStyle, Window, canvas, div, fill, point,
+    prelude::*, px, size,
+};
+use scribe_client_gpui::{
+    box_drawing,
+    color::{TerminalColors, linear_to_srgb_rgba},
+    opacity::{opaque_slot, scale_alpha},
+    restore_replay::round_positive_f32_to_u16,
+};
 use scribe_common::config::AppearanceConfig;
 
-use crate::terminal::Content;
+use crate::terminal::{Cell, Content, Flags};
 
 /// Smallest font size the grid will paint at, so a bad `appearance.font_size`
 /// edit (0, negative) can never collapse the grid to nothing.
@@ -18,11 +37,40 @@ const LINE_HEIGHT_RATIO: f32 = 1.35;
 /// approximates it so a live font-size edit still moves the reported cell size.
 const CELL_WIDTH_RATIO: f32 = 0.6;
 
+/// The glyph fallback chain, in the order the legacy cosmic-text atlas used
+/// (`SCRIBE_COMMON_FALLBACKS` in `crates/scribe-renderer/src/atlas.rs`).
+///
+/// Nerd Font symbol families come first so a powerline or devicon codepoint
+/// resolves to the icon the user installed rather than to whatever generic
+/// symbol font the platform happens to rank higher. `Unifont Sample` is
+/// deliberately absent: its private-use mappings turn an unavailable icon into
+/// an unrelated sample glyph, which is worse than a visible tofu box.
+const FONT_FALLBACKS: &[&str] = &[
+    "Symbols Nerd Font Mono",
+    "Symbols Nerd Font",
+    "Nerd Font Symbols Mono",
+    "Nerd Font Symbols",
+    "Noto Sans",
+    "DejaVu Sans",
+    "FreeSans",
+    "Noto Sans Mono",
+    "DejaVu Sans Mono",
+    "FreeMono",
+    "Noto Sans Symbols",
+    "Noto Sans Symbols2",
+    "Noto Color Emoji",
+];
+
+/// Thickness of the underline and strikethrough rules, as a fraction of the
+/// font size, floored at one pixel so they never vanish at small sizes.
+const DECORATION_RATIO: f32 = 1.0 / 14.0;
+
 /// The font metrics the terminal grid paints with.
 ///
 /// Derived from the live `[appearance]` config on every config reload, so a
-/// saved `font` / `font_size` / `line_padding` edit repaints the grid without a
-/// restart instead of staying frozen at the value read during startup.
+/// saved `font` / `font_size` / `line_padding` / `ligatures` / `font_weight`
+/// edit repaints the grid without a restart instead of staying frozen at the
+/// value read during startup.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GridFont {
     /// Font family passed to GPUI's text system.
@@ -31,6 +79,13 @@ pub struct GridFont {
     pub size: f32,
     /// Row height in pixels, including `appearance.line_padding`.
     pub line_height: f32,
+    /// Whether contextual alternates (`calt`) stay enabled, from
+    /// `appearance.ligatures`.
+    pub ligatures: bool,
+    /// Weight for normal cells, from `appearance.font_weight`.
+    pub weight: u16,
+    /// Weight for BOLD cells, from `appearance.font_weight_bold`.
+    pub weight_bold: u16,
 }
 
 impl GridFont {
@@ -42,6 +97,9 @@ impl GridFont {
             family: appearance.font.clone(),
             size,
             line_height: size.mul_add(LINE_HEIGHT_RATIO, f32::from(appearance.line_padding)),
+            ligatures: appearance.ligatures,
+            weight: appearance.font_weight,
+            weight_bold: appearance.font_weight_bold,
         }
     }
 
@@ -49,6 +107,45 @@ impl GridFont {
     #[must_use]
     pub fn cell_width(&self) -> f32 {
         self.size * CELL_WIDTH_RATIO
+    }
+
+    /// The OpenType features every terminal run is shaped with.
+    ///
+    /// `appearance.ligatures = false` disables `calt`, the feature that
+    /// produces the contextual multi-cell forms (`=>`, `!=`) in programming
+    /// fonts; nothing else about shaping changes.
+    #[must_use]
+    pub fn features(&self) -> FontFeatures {
+        if self.ligatures { FontFeatures::default() } else { FontFeatures::disable_ligatures() }
+    }
+
+    /// The ordered [`FONT_FALLBACKS`] chain, carried on every run so GPUI's
+    /// platform text system cannot substitute its own ordering.
+    #[must_use]
+    pub fn fallbacks() -> FontFallbacks {
+        FontFallbacks::from_fonts(FONT_FALLBACKS.iter().map(|name| (*name).to_owned()).collect())
+    }
+
+    /// The [`Font`] a cell with these attributes is shaped with.
+    #[must_use]
+    pub fn font_for(&self, flags: Flags) -> Font {
+        let weight = if flags.contains(Flags::BOLD) { self.weight_bold } else { self.weight };
+        Font {
+            family: self.family.clone().into(),
+            features: self.features(),
+            fallbacks: Some(Self::fallbacks()),
+            weight: FontWeight(f32::from(weight)),
+            style: if flags.contains(Flags::ITALIC) {
+                FontStyle::Italic
+            } else {
+                FontStyle::Normal
+            },
+        }
+    }
+
+    /// Underline / strikethrough rule thickness for this font size.
+    fn decoration_thickness(&self) -> Pixels {
+        px((self.size * DECORATION_RATIO).max(1.0))
     }
 }
 
@@ -58,19 +155,54 @@ impl Default for GridFont {
     }
 }
 
+/// The four style variants a row's runs are shaped with, built once per frame.
+///
+/// Cloning a [`Font`] clones four `Arc`s, so materialising the variants up
+/// front keeps the per-cell run construction to reference bumps.
+struct FontVariants {
+    regular: Font,
+    bold: Font,
+    italic: Font,
+    bold_italic: Font,
+}
+
+impl FontVariants {
+    fn new(font: &GridFont) -> Self {
+        Self {
+            regular: font.font_for(Flags::empty()),
+            bold: font.font_for(Flags::BOLD),
+            italic: font.font_for(Flags::ITALIC),
+            bold_italic: font.font_for(Flags::BOLD | Flags::ITALIC),
+        }
+    }
+
+    fn select(&self, flags: Flags) -> &Font {
+        match (flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC)) {
+            (true, true) => &self.bold_italic,
+            (true, false) => &self.bold,
+            (false, true) => &self.italic,
+            (false, false) => &self.regular,
+        }
+    }
+}
+
 /// The theme colours the terminal grid paints with.
 ///
-/// Derived on every render from the live theme, so a saved `theme` edit
-/// repaints the grid instead of leaving it on a hardcoded palette. `background`
-/// already carries the `appearance.opacity` alpha; `foreground` is deliberately
-/// left at the theme's own alpha so glyphs stay readable through a translucent
-/// window.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// `background` is the window-level fill, already carrying the
+/// `appearance.opacity` alpha. `cells` is the ported SGR resolver that turns
+/// each cell's raw colour fields — including the theme's default foreground —
+/// into the colour actually painted, and `opacity` is folded into per-cell
+/// backgrounds only, exactly as the legacy renderer's
+/// `apply_opacity_to_instances` did; glyph colours are never scaled, so text
+/// stays readable through a translucent window.
+#[derive(Clone)]
 pub struct GridColors {
     /// Grid background, alpha-scaled by `appearance.opacity`.
     pub background: Rgba,
-    /// Default glyph colour, never scaled by opacity.
-    pub foreground: Rgba,
+    /// Theme-derived palette resolving each cell's raw fg/bg/attrs.
+    pub cells: Arc<TerminalColors>,
+    /// Live `appearance.opacity`, applied to painted cell backgrounds.
+    pub opacity: f32,
 }
 
 /// Paints the current terminal grid with fixed-width rows.
@@ -88,28 +220,303 @@ impl TerminalElement {
     }
 
     /// Builds the GPUI element tree for the visible terminal grid.
+    ///
+    /// The grid itself is one low-level canvas rather than a div per row: a
+    /// cell-accurate terminal needs background quads, the box-drawing overlay,
+    /// and shaped glyph runs painted in that order into the same pass, which a
+    /// styled-div tree cannot express.
     pub fn paint(self) -> impl IntoElement {
-        let line_height = px(self.font.line_height);
-        div()
-            .size_full()
-            .overflow_hidden()
-            .bg(self.colors.background)
-            .text_color(self.colors.foreground)
-            .font_family(self.font.family)
-            .text_size(px(self.font.size))
-            .line_height(line_height)
-            .child(
-                div().flex().flex_col().children(
-                    self.content.rows.into_iter().map(|row| div().h(line_height).child(row)),
-                ),
+        let background = self.colors.background;
+        div().size_full().overflow_hidden().bg(background).child(
+            canvas(
+                |_bounds, _window, _cx| (),
+                move |bounds, (), window, cx| self.paint_grid(bounds, window, cx),
             )
+            .size_full(),
+        )
     }
+
+    /// Paint one terminal snapshot into `bounds`.
+    ///
+    /// Order matters and mirrors the legacy renderer: cell backgrounds, then
+    /// the procedural box-drawing overlay, then shaped text. Box-drawing cells
+    /// are blanked out of the shaped text so the overlay is the only thing that
+    /// draws them — that is what removes the font's sub-pixel bearing gaps.
+    fn paint_grid(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        let cell_width = self.font.cell_width();
+        let line_height = px(self.font.line_height);
+        if cell_width <= 0.0 || line_height <= px(0.0) {
+            return;
+        }
+        let default_bg = linear_to_srgb_rgba(self.colors.cells.default_bg());
+        let variants = FontVariants::new(&self.font);
+        let thickness = self.font.decoration_thickness();
+        let mut resolved: Vec<ResolvedCell> = Vec::new();
+
+        for (row_index, row) in self.content.rows.iter().enumerate() {
+            let top = bounds.top() + line_height * grid_f32(row_index);
+            if top >= bounds.bottom() {
+                break;
+            }
+            let geometry =
+                CellGeometry { left: bounds.left(), top, width: cell_width, height: line_height };
+
+            resolved.clear();
+            resolved.extend(row.iter().map(|cell| {
+                let (fg, bg) =
+                    self.colors.cells.resolve_cell_colors_srgb(cell.fg, cell.bg, cell.flags);
+                let painted_bg = (!slots_equal(bg, default_bg))
+                    .then(|| scale_alpha(opaque_slot(bg), self.colors.opacity));
+                ResolvedCell { fg: opaque_slot(fg), bg: painted_bg, flags: cell.flags }
+            }));
+
+            paint_cell_backgrounds(&resolved, geometry, window);
+            paint_box_drawing(row, &resolved, geometry, window);
+            paint_row_text(
+                &RowPaint {
+                    cells: row,
+                    resolved: &resolved,
+                    font: &self.font,
+                    variants: &variants,
+                    thickness,
+                    geometry,
+                },
+                window,
+                cx,
+            );
+        }
+    }
+}
+
+/// Whether two theme slots are the same colour, compared by bit pattern.
+///
+/// Both sides come out of the same resolver, so equal colours are bit-for-bit
+/// equal; an epsilon would risk collapsing two genuinely distinct palette
+/// entries into "keeps the window background".
+fn slots_equal(a: [f32; 4], b: [f32; 4]) -> bool {
+    a.iter().zip(b).all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
+/// The per-cell colours and style the paint path resolved for one cell.
+#[derive(Clone, Copy)]
+struct ResolvedCell {
+    fg: Rgba,
+    /// `None` when the cell keeps the window background, so the grid's own
+    /// (possibly translucent) fill shows through instead of being painted over.
+    bg: Option<Rgba>,
+    flags: Flags,
+}
+
+/// Geometry shared by every cell of one painted frame.
+#[derive(Clone, Copy)]
+struct CellGeometry {
+    left: Pixels,
+    top: Pixels,
+    width: f32,
+    height: Pixels,
+}
+
+impl CellGeometry {
+    /// Left edge of `column`, in window space.
+    fn column_left(self, column: usize) -> Pixels {
+        self.left + px(self.width * grid_f32(column))
+    }
+}
+
+/// Fill the background of every cell that does not keep the window background,
+/// merging horizontally adjacent cells of the same colour into one quad.
+fn paint_cell_backgrounds(resolved: &[ResolvedCell], geometry: CellGeometry, window: &mut Window) {
+    let mut column = 0;
+    while column < resolved.len() {
+        let Some(bg) = resolved.get(column).and_then(|cell| cell.bg) else {
+            column += 1;
+            continue;
+        };
+        let start = column;
+        column += 1;
+        while resolved.get(column).and_then(|cell| cell.bg).is_some_and(|next| next == bg) {
+            column += 1;
+        }
+        window.paint_quad(fill(
+            Bounds::new(
+                point(geometry.column_left(start), geometry.top),
+                size(px(geometry.width * grid_f32(column - start)), geometry.height),
+            ),
+            bg,
+        ));
+    }
+}
+
+/// Overlay the procedural box-drawing mask for every cell that carries one.
+///
+/// The mask is rasterized in integer pixels and its quads are then scaled onto
+/// the cell's exact fractional rect, so a full-cell stroke lands precisely on
+/// the neighbouring cell's edge and a run of box characters tiles with no seam
+/// regardless of font size.
+fn paint_box_drawing(
+    row: &[Cell],
+    resolved: &[ResolvedCell],
+    geometry: CellGeometry,
+    window: &mut Window,
+) {
+    let mask_w = mask_extent(geometry.width);
+    let mask_h = mask_extent(f32::from(geometry.height));
+    let scale_x = geometry.width / mask_f32(mask_w);
+    let scale_y = f32::from(geometry.height) / mask_f32(mask_h);
+
+    for (column, cell) in row.iter().enumerate() {
+        if !box_drawing::is_box_drawing(cell.c) {
+            continue;
+        }
+        let (Some(quads), Some(fg)) = (
+            box_drawing::mask_quads(cell.c, mask_w, mask_h),
+            resolved.get(column).map(|resolved| resolved.fg),
+        ) else {
+            continue;
+        };
+        let origin_x = geometry.column_left(column);
+        for quad in quads {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(
+                        origin_x + px(mask_f32(quad.x) * scale_x),
+                        geometry.top + px(mask_f32(quad.y) * scale_y),
+                    ),
+                    size(px(mask_f32(quad.width) * scale_x), px(mask_f32(quad.height) * scale_y)),
+                ),
+                Rgba { a: fg.a * (f32::from(quad.alpha) / f32::from(u8::MAX)), ..fg },
+            ));
+        }
+    }
+}
+
+/// Everything one row's glyph pass needs, gathered so the shared per-frame
+/// state (fonts, decoration thickness) is built once and borrowed per row.
+struct RowPaint<'a> {
+    cells: &'a [Cell],
+    resolved: &'a [ResolvedCell],
+    font: &'a GridFont,
+    variants: &'a FontVariants,
+    thickness: Pixels,
+    geometry: CellGeometry,
+}
+
+/// Shape and paint one row's glyphs.
+///
+/// The whole row is shaped as a single line so contextual ligatures can form
+/// across cells, with `force_width` pinning every advancing glyph to the next
+/// grid column — that combination keeps a multi-cell ligature's outline intact
+/// without letting the row drift off the grid.
+fn paint_row_text(row: &RowPaint<'_>, window: &mut Window, cx: &mut App) {
+    let Some(last) = row.cells.iter().rposition(is_painted_cell) else {
+        return;
+    };
+
+    let mut text = String::with_capacity(last + 1);
+    let mut runs: Vec<TextRun> = Vec::new();
+    let thickness = row.thickness;
+
+    for (column, cell) in row.cells.iter().take(last + 1).enumerate() {
+        let Some(style) = row.resolved.get(column).copied() else {
+            continue;
+        };
+        let start = text.len();
+        text.push(shaped_char(cell.c));
+        let len = text.len() - start;
+        let color = style.fg.into();
+        let run = TextRun {
+            len,
+            font: row.variants.select(style.flags).clone(),
+            color,
+            background_color: None,
+            underline: style.flags.intersects(Flags::ALL_UNDERLINES).then(|| UnderlineStyle {
+                thickness,
+                color: Some(color),
+                wavy: style.flags.contains(Flags::UNDERCURL),
+            }),
+            strikethrough: style
+                .flags
+                .contains(Flags::STRIKEOUT)
+                .then_some(StrikethroughStyle { thickness, color: Some(color) }),
+        };
+        match runs.last_mut() {
+            Some(previous) if run_matches(previous, &run) => previous.len += len,
+            _ => runs.push(run),
+        }
+    }
+
+    let geometry = row.geometry;
+    window
+        .text_system()
+        .shape_line(text.into(), px(row.font.size), &runs, Some(px(geometry.width)))
+        .paint(
+            point(geometry.left, geometry.top),
+            geometry.height,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .ok();
+}
+
+/// Whether two adjacent runs are stylistically identical and can be merged.
+///
+/// Merging matters for more than run count: shaping only forms a ligature
+/// within a single run, so `!=` written in one SGR state must stay one run.
+fn run_matches(a: &TextRun, b: &TextRun) -> bool {
+    a.font == b.font
+        && a.color == b.color
+        && a.underline == b.underline
+        && a.strikethrough == b.strikethrough
+}
+
+/// Whether a cell contributes anything to the shaped line, used to trim a
+/// row's blank tail before shaping it. A blank cell still counts when it
+/// carries an underline or strikethrough, which TUIs use to draw rules.
+fn is_painted_cell(cell: &Cell) -> bool {
+    !matches!(cell.c, ' ' | '\0') || cell.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+}
+
+/// The character handed to the shaper for one cell.
+///
+/// Box-drawing codepoints become spaces because the overlay already painted
+/// them, and the space keeps every following cell on its own grid column.
+/// Stray control characters are blanked so a malformed stream can never make
+/// `shape_line` see a newline.
+fn shaped_char(c: char) -> char {
+    if box_drawing::is_box_drawing(c) || c.is_control() { ' ' } else { c }
+}
+
+/// The integer mask resolution used to rasterize one cell of box drawing.
+///
+/// Floored at two pixels so a degenerate cell size still produces a mask the
+/// rasterizer can draw into. The rounding goes through the shared
+/// [`round_positive_f32_to_u16`] conversion rather than a float-to-int cast.
+fn mask_extent(pixels: f32) -> u32 {
+    u32::from(round_positive_f32_to_u16(pixels).max(2))
+}
+
+/// Widen a grid index for pixel arithmetic without a lossy cast.
+fn grid_f32(value: usize) -> f32 {
+    f32::from(u16::try_from(value).unwrap_or(u16::MAX))
+}
+
+/// Widen a mask coordinate for pixel arithmetic without a lossy cast.
+fn mask_f32(value: u32) -> f32 {
+    f32::from(u16::try_from(value).unwrap_or(u16::MAX))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CELL_WIDTH_RATIO, GridFont, MIN_FONT_SIZE};
+    use super::{
+        CELL_WIDTH_RATIO, FONT_FALLBACKS, FontVariants, GridFont, MIN_FONT_SIZE, is_painted_cell,
+        shaped_char,
+    };
+    use gpui::{FontStyle, FontWeight};
     use scribe_common::config::AppearanceConfig;
+
+    use crate::terminal::{Cell, Flags};
 
     // @lat: [[test#GPUI Client Headless Suites#Config live reload#Grid font tracks the live appearance config]]
     #[test]
@@ -130,5 +537,79 @@ mod tests {
         appearance.font_size = 0.0;
         let clamped = GridFont::from_appearance(&appearance);
         assert!((clamped.size - MIN_FONT_SIZE).abs() < f32::EPSILON);
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Cell-accurate paint path#Ligature shaping follows appearance.ligatures]]
+    #[test]
+    fn ligature_setting_drives_the_calt_feature() {
+        let mut appearance = AppearanceConfig { ligatures: true, ..AppearanceConfig::default() };
+        let on = GridFont::from_appearance(&appearance);
+        assert!(on.ligatures);
+        assert_eq!(on.features().is_calt_enabled(), None, "calt stays at the font default");
+
+        appearance.ligatures = false;
+        let off = GridFont::from_appearance(&appearance);
+        assert!(!off.ligatures);
+        assert_eq!(off.features().is_calt_enabled(), Some(false), "calt is explicitly disabled");
+
+        // The feature must travel on the run the paint path shapes with, not
+        // just on the metrics struct.
+        assert_eq!(off.font_for(Flags::empty()).features.is_calt_enabled(), Some(false));
+        assert_eq!(
+            FontVariants::new(&off).select(Flags::BOLD).features.is_calt_enabled(),
+            Some(false)
+        );
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Cell-accurate paint path#Every run carries the Nerd Font fallback chain]]
+    #[test]
+    fn runs_carry_the_nerd_font_fallback_chain() {
+        let appearance = AppearanceConfig {
+            font: "JetBrains Mono".to_owned(),
+            font_weight: 400,
+            font_weight_bold: 700,
+            ..AppearanceConfig::default()
+        };
+        let font = GridFont::from_appearance(&appearance);
+        let variants = FontVariants::new(&font);
+
+        for flags in [Flags::empty(), Flags::BOLD, Flags::ITALIC, Flags::BOLD | Flags::ITALIC] {
+            let run_font = variants.select(flags);
+            assert_eq!(run_font.family.as_ref(), "JetBrains Mono");
+            let fallbacks = run_font.fallbacks.clone().expect("every run carries fallbacks");
+            assert_eq!(fallbacks.fallback_list(), FONT_FALLBACKS);
+            // Nerd Font symbol families outrank the generic symbol fonts, and
+            // the private-use `Unifont Sample` never appears.
+            assert_eq!(
+                fallbacks.fallback_list().first().map(String::as_str),
+                Some("Symbols Nerd Font Mono")
+            );
+            assert!(!fallbacks.fallback_list().iter().any(|name| name == "Unifont Sample"));
+        }
+
+        assert_eq!(variants.select(Flags::BOLD).weight, FontWeight(700.0));
+        assert_eq!(variants.select(Flags::empty()).weight, FontWeight(400.0));
+        assert_eq!(variants.select(Flags::ITALIC).style, FontStyle::Italic);
+        assert_eq!(variants.select(Flags::empty()).style, FontStyle::Normal);
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Cell-accurate paint path#Box-drawing cells leave the shaped text]]
+    #[test]
+    fn box_drawing_cells_are_blanked_before_shaping() {
+        // The overlay owns these codepoints; a space holds their grid column so
+        // the glyphs after them keep their cell origins.
+        assert_eq!(shaped_char('\u{2500}'), ' ');
+        assert_eq!(shaped_char('\u{2588}'), ' ');
+        // A stray control byte can never reach `shape_line`, which panics on a
+        // newline in debug builds.
+        assert_eq!(shaped_char('\n'), ' ');
+        assert_eq!(shaped_char('a'), 'a');
+        assert_eq!(shaped_char('\u{e0b0}'), '\u{e0b0}', "Nerd Font glyphs still shape");
+
+        // Row trimming keeps decorated blanks so an underline rule survives.
+        let blank = Cell::default();
+        assert!(!is_painted_cell(&blank));
+        assert!(is_painted_cell(&Cell { c: 'x', ..blank }));
+        assert!(is_painted_cell(&Cell { flags: Flags::UNDERLINE, ..blank }));
     }
 }

@@ -5,20 +5,71 @@
 
 use std::time::Instant;
 
+pub use alacritty_terminal_gpui::term::cell::Flags;
 use alacritty_terminal_gpui::{
     event::VoidListener,
     grid::Dimensions as _,
     index::{Column, Line},
     term::{Config, Osc52, Term},
 };
+use vte::ansi::Color;
 
 use crate::sync_frames::{FeedOutputResult, OutputTarget};
+
+/// One rendered terminal cell: its character plus the raw SGR state the paint
+/// path needs to colour and decorate it.
+///
+/// The colour fields stay in alacritty's own `Color` space rather than being
+/// resolved here, so a live theme edit repaints existing content without
+/// re-running the parser: [`crate::terminal_element::TerminalElement`] resolves
+/// them against the current theme on every frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Cell {
+    /// The character in this cell (a blank cell holds a space).
+    pub c: char,
+    /// Raw foreground colour before bold-bright / INVERSE / DIM are applied.
+    pub fg: Color,
+    /// Raw background colour before INVERSE is applied.
+    pub bg: Color,
+    /// SGR attributes: BOLD, ITALIC, UNDERLINE, STRIKEOUT, INVERSE, DIM,
+    /// HIDDEN, and the wide-char bookkeeping flags.
+    pub flags: Flags,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Self {
+            c: ' ',
+            fg: Color::Named(vte::ansi::NamedColor::Foreground),
+            bg: Color::Named(vte::ansi::NamedColor::Background),
+            flags: Flags::empty(),
+        }
+    }
+}
 
 /// Immutable grid snapshot consumed by [`crate::terminal_element::TerminalElement`].
 #[derive(Clone, Default)]
 pub struct Content {
     /// Visible rows, including blank cells so every row keeps terminal width.
-    pub rows: Vec<String>,
+    pub rows: Vec<Vec<Cell>>,
+}
+
+/// Plain-text views of a snapshot. The paint path consumes cells directly, so
+/// these exist for assertions that only care about what the grid says.
+#[cfg(test)]
+impl Content {
+    /// The plain text of one visible row.
+    pub fn row_text(&self, row: usize) -> String {
+        self.rows
+            .get(row)
+            .map(|cells| cells.iter().map(|cell| cell.c).collect())
+            .unwrap_or_default()
+    }
+
+    /// The whole viewport as newline-joined plain text.
+    pub fn text(&self) -> String {
+        (0..self.rows.len()).map(|row| self.row_text(row)).collect::<Vec<_>>().join("\n")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -102,10 +153,11 @@ impl DisplayOnlyTerminal {
 
     #[cfg(test)]
     fn visible_text(&self) -> String {
-        self.content.rows.join("\n")
+        self.content.text()
     }
 
-    /// Converts the Alacritty active viewport into fixed-width display rows.
+    /// Converts the Alacritty active viewport into fixed-width display rows,
+    /// carrying each cell's colour and attribute state to the paint path.
     fn make_content(&mut self) {
         let lines = self.term.screen_lines();
         let columns = self.term.columns();
@@ -114,7 +166,10 @@ impl DisplayOnlyTerminal {
                 let line = i32::try_from(line).ok()?;
                 Some(
                     (0..columns)
-                        .map(|column| self.term.grid()[Line(line)][Column(column)].c)
+                        .map(|column| {
+                            let cell = &self.term.grid()[Line(line)][Column(column)];
+                            Cell { c: cell.c, fg: cell.fg, bg: cell.bg, flags: cell.flags }
+                        })
                         .collect(),
                 )
             })
@@ -151,6 +206,40 @@ mod tests {
         assert!(summary.needs_redraw);
         assert!(terminal.visible_text().starts_with("hello world"));
         assert!(terminal.parser_sync_deadline().is_none());
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Cell-accurate paint path#Snapshot carries per-cell colour and attributes]]
+    #[gpui::test]
+    fn content_snapshot_carries_sgr_state() {
+        use vte::ansi::NamedColor;
+
+        let mut terminal = DisplayOnlyTerminal::new(20, 2);
+        // Bold red on blue, then a true-colour underlined run, then a reset.
+        terminal.feed_output(b"\x1b[1;31;44mA\x1b[0m\x1b[4;38;2;10;20;30mB\x1b[0mC");
+
+        let content = terminal.content();
+        let row = content.rows.first().expect("first row");
+        let a = row.first().copied().expect("cell A");
+        assert_eq!(a.c, 'A');
+        assert_eq!(a.fg, Color::Named(NamedColor::Red));
+        assert_eq!(a.bg, Color::Named(NamedColor::Blue));
+        assert!(a.flags.contains(Flags::BOLD));
+
+        let b = row.get(1).copied().expect("cell B");
+        assert_eq!(b.c, 'B');
+        assert_eq!(b.fg, Color::Spec(vte::ansi::Rgb { r: 10, g: 20, b: 30 }));
+        assert!(b.flags.contains(Flags::UNDERLINE));
+        assert!(!b.flags.contains(Flags::BOLD));
+
+        let c = row.get(2).copied().expect("cell C");
+        assert_eq!(c.c, 'C');
+        assert_eq!(c.fg, Color::Named(NamedColor::Foreground));
+        assert_eq!(c.bg, Color::Named(NamedColor::Background));
+        assert!(c.flags.is_empty());
+
+        // Blank cells still fill the row so every row keeps terminal width.
+        assert_eq!(row.len(), 20);
+        assert_eq!(content.row_text(0).trim_end(), "ABC");
     }
 
     // @lat: [[test#GPUI Sync Frame Queue#Flushes parser sync update on expiry]]

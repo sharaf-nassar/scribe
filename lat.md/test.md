@@ -705,6 +705,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Config live reload | [[test#GPUI Client Headless Suites#Config live reload]] | `ConfigReloaded` live reload |
 | Window opacity | [[test#GPUI Client Headless Suites#Window opacity]] | Rendering/window `appearance.opacity` |
 | Update surfaces | [[test#GPUI Client Headless Suites#GPUI Update Surfaces]] | `UpdateAvailable`, `UpdateProgress`, `TriggerUpdate`, `DismissUpdate` |
+| Cell-accurate paint path | [[test#GPUI Client Headless Suites#Cell-accurate paint path]] | Box drawing, Font fallback, Ligatures |
 | URL/OSC8 detection | [[test#GPUI URL Detection]] | hover/dwell/open surface |
 | IPC bridge ordering | [[test#GPUI IPC Bridge]] | Executor-model ordering risk |
 | Remote connect picker | [[test#GPUI Client Headless Suites#GPUI remote connect picker]] | `ListRemotePeers`, `ListLanPeers`, `RemotePeerList` remote connect picker |
@@ -813,6 +814,48 @@ The test builds metrics from an edited appearance block and asserts the family, 
 Backs the `ConfigReloaded` parity row at the protocol boundary: the reload path must put the message on the wire, ordered ahead of whatever the user types next.
 
 Driving [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#config_reloaded]] followed by a `KeyInput` on the same ordered writer channel, the test asserts a `ClientMessage::ConfigReloaded` is dequeued first. Ordering is the point: the server must have re-read the config before it interprets the next keystroke, otherwise a policy edit applies a keypress late.
+
+### Cell-accurate paint path
+
+Locks the pieces of [[rendering#Rendering#GPUI Cell-Accurate Paint Path]] that can be asserted without a display server: the snapshot's per-cell state, the box-drawing quad reduction, and the font configuration each shaped run carries.
+
+None of these prove the running client paints anything — a headless case passes identically whether or not the app constructs `TerminalElement`. They exist to pin the pure inputs the paint call consumes, so a regression shows up as a failing assertion rather than as a wrong screenshot. The painted result is a visual-E2E property: bead `scribe-38e.63` confirmed per-cell SGR colours, seamless box joins, a live `appearance.ligatures` flip, and `U+F09B`/`U+F121` resolving through the embedded fallback face against a real X11 window, per [[rendering#Rendering#GPUI Cell-Accurate Paint Path#Font Fallbacks#Embedded Symbols Font Defeats GPUI Face Eviction]].
+
+#### Snapshot carries per-cell colour and attributes
+
+Verifies the parser-to-paint boundary: `Content` must carry each cell's raw colour fields and SGR flags, because a snapshot of plain strings can only ever be painted in one colour.
+
+Feeding a bold-red-on-blue run, a true-colour underlined run, and a reset through [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#feed_output]], the test asserts each cell's `fg`, `bg`, and `flags` survive into the snapshot — named colours as named, a 24-bit colour as `Color::Spec`, and BOLD/UNDERLINE set only on the cells that carry them. It also checks blank cells still pad the row to terminal width, since the paint path indexes cells by grid column.
+
+#### Box-drawing quads reproduce the mask
+
+Confirms the quad reduction the GPUI overlay depends on is lossless, because a paint path that draws rectangles instead of a texture is only correct if the rectangles are the texture.
+
+For a spread of strokes, corners, crosses, shades, and blocks, the test rasterizes [[crates/scribe-client-gpui/src/box_drawing.rs#mask_quads]] back into a flat alpha buffer and asserts it equals [[crates/scribe-client-gpui/src/box_drawing.rs#render]]'s mask pixel for pixel, with no empty, transparent, or overlapping rectangle. It also pins the full block to exactly one edge-to-edge quad — the property that keeps a screen of box drawing affordable and its tiling seamless — and checks an unhandled character still falls through to the font.
+
+#### Ligature shaping follows appearance.ligatures
+
+Backs the Ligatures parity row at the configuration boundary: the setting must reach the `Font` the paint path actually shapes with, not merely a metrics struct.
+
+The test builds [[crates/scribe-client-gpui/src/terminal_element.rs#GridFont]] from an appearance block with ligatures on and off, asserting `calt` is left at the font default in the first case and explicitly disabled in the second, then checks the same feature travels on the run font for both plain and bold cells.
+
+#### Every run carries the Nerd Font fallback chain
+
+Backs the Font fallback parity row: omitting the chain silently falls back to GPUI's own platform font selection, which does not preserve Scribe's ordering.
+
+Across plain, bold, italic, and bold-italic cells the test asserts every run carries the full ordered fallback list with `Symbols Nerd Font Mono` first and `Unifont Sample` absent, and that the configured `font_weight` / `font_weight_bold` and the italic style select the right variant.
+
+#### Embedded Nerd Font survives GPUI face eviction
+
+Backs the other half of the Font fallback row: naming the chain is useless if GPUI's `load_family` evicts the face, so the embedded asset must keep the exact shape the eviction check and the chain resolution depend on.
+
+Parsing [[crates/scribe-client-gpui/src/fonts.rs#SYMBOLS_NERD_FONT_MONO]], the test asserts the family name is exactly `Symbols Nerd Font Mono` (the chain's first entry), that `U+006D` maps to a glyph — the property gpui `f96212f` requires to keep a face at all, added by `tools/patch-nerd-symbols-font.py` — and that the powerline and Font Awesome codepoints the visual capture relies on (`U+E0A0`, `U+E0B0`, `U+E0B2`, `U+F09B`, `U+F121`) are all covered.
+
+#### Box-drawing cells leave the shaped text
+
+Pins the substitution that makes the overlay authoritative: a box-drawing codepoint must not also be shaped from the font, or the glyph's bearing gaps reappear on top of the quads.
+
+The test asserts box-drawing and block codepoints become spaces before shaping while ordinary and Nerd Font codepoints pass through, that a control character is blanked so `shape_line` can never see a newline, and that a row's blank tail is trimmed except where an underline or strikeout must still be drawn.
 
 ### Window opacity
 
