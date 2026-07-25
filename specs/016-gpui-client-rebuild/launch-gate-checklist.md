@@ -77,11 +77,14 @@ fails on scripted-E2E (AI indicator), perf, and unverifiable manual rows.
   Vulkan, and the client demonstrably renders on the 3090. The libEGL/DRI2
   warnings come from an unused Mesa EGL side path and are harmless. Perf and
   opacity results are therefore attributable to the client, not the host.
-- **D4 — No config watcher in the GPUI terminal window.** `load_config()` runs
-  once at startup and `ConfigStore::reload_from_disk` is never called from the
-  terminal window; only the settings window re-reads config. Live config reload
-  parity (and the `ConfigReloaded` row) is unproven, despite task `.16` being
-  closed as complete. → bead `scribe-38e.57`.
+- **D4 — RESOLVED (was: no config watcher in the GPUI terminal window).** The
+  terminal window now owns a `ConfigRuntime` that keeps the `notify` watcher
+  alive and reloads on the GPUI foreground; theme, chrome, grid font, cell
+  metrics, and keybindings reapply live and every reload emits
+  `ClientMessage::ConfigReloaded`. Proven against the dev server with no
+  restart (same pid, same X window, theme accent repainted). Covered by
+  headless suites plus `tests/e2e/visual/config-reload.sh`. → bead
+  `scribe-38e.57`.
 
 ## Green (verified) surface
 

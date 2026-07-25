@@ -13,8 +13,21 @@
 //! swaps in a freshly loaded config and returns a [`ConfigReloadPlan`] naming
 //! which live surfaces (theme, font metrics, opacity) must be reapplied — so a
 //! saved edit to theme, font, or keybindings takes effect without a restart.
+//!
+//! [`ConfigRuntime`] is the piece the terminal window actually owns: it holds
+//! the snapshot, keeps the `notify` watcher alive, and hands the foreground a
+//! [`ConfigChangeSignal`] it can poll from a GPUI task. The watcher callback
+//! runs on notify's own thread and must never touch GPUI state, so it only
+//! bumps an atomic generation; the UI thread drains it with
+//! [`ConfigRuntime::poll_reload`] and reapplies the returned plan.
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use scribe_common::app::current_config_dir;
 use scribe_common::config::{ScribeConfig, load_config, resolve_theme};
@@ -227,6 +240,149 @@ impl ClientConfig {
             self.config.clone()
         });
         self.reload(new_config)
+    }
+}
+
+/// A cross-thread "the config file changed" flag.
+///
+/// The `notify` watcher callback runs on its own thread and must not touch GPUI
+/// state, so it only calls [`ConfigChangeSignal::signal`], which bumps an atomic
+/// generation. The GPUI foreground polls with [`ConfigChangeSignal::take_change`],
+/// which collapses any number of events fired since the last poll into a single
+/// reload — editors that save by delete-and-recreate emit several events per
+/// save, and the reload is idempotent, so collapsing them is both correct and
+/// cheaper than reloading once per event.
+#[derive(Clone, Debug, Default)]
+pub struct ConfigChangeSignal {
+    generation: Arc<AtomicU64>,
+}
+
+impl ConfigChangeSignal {
+    /// A fresh signal with no pending change.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that the on-disk config changed. Callable from any thread.
+    pub fn signal(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// The current change generation.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Consume any change recorded since `seen`, advancing `seen` to the
+    /// current generation. Returns `true` when a reload is due.
+    pub fn take_change(&self, seen: &mut u64) -> bool {
+        let current = self.generation();
+        if current == *seen {
+            return false;
+        }
+        *seen = current;
+        true
+    }
+}
+
+/// The terminal window's live config: the resolved snapshot, the file watcher
+/// keeping it fresh, and the change signal the GPUI foreground polls.
+///
+/// Dropping this stops the watcher, so the window must hold it for its whole
+/// lifetime. [`ConfigRuntime::poll_reload`] is the single entry point the UI
+/// thread calls: it returns `None` when nothing changed and otherwise reloads
+/// from disk and hands back the [`ConfigReloadPlan`] to reapply.
+pub struct ConfigRuntime {
+    config: ClientConfig,
+    signal: ConfigChangeSignal,
+    /// Kept alive for its side effect: dropping it stops the file watcher.
+    _watcher: Option<RecommendedWatcher>,
+    seen: u64,
+}
+
+impl ConfigRuntime {
+    /// Load the active config and start watching its directory for edits.
+    ///
+    /// A watcher that fails to start (missing config dir, inotify exhaustion)
+    /// is logged and left as `None`: the window still runs, it just will not
+    /// live-reload, exactly as the legacy client behaves.
+    #[must_use]
+    pub fn start() -> Self {
+        let signal = ConfigChangeSignal::new();
+        let watcher_signal = signal.clone();
+        let watcher = start_config_watcher(move || watcher_signal.signal());
+        if watcher.is_none() {
+            tracing::warn!("config file watcher unavailable; live reload disabled");
+        }
+        Self { config: ClientConfig::load(), signal, _watcher: watcher, seen: 0 }
+    }
+
+    /// Build a runtime around an already-resolved snapshot with no watcher.
+    ///
+    /// Used by headless tests (and any caller driving reloads itself) so the
+    /// full poll/reload/apply path can run without touching the real config
+    /// directory.
+    #[must_use]
+    pub fn detached(config: ClientConfig) -> Self {
+        Self { config, signal: ConfigChangeSignal::new(), _watcher: None, seen: 0 }
+    }
+
+    /// The signal the watcher bumps; clone it to drive reloads by hand.
+    #[must_use]
+    pub fn signal(&self) -> ConfigChangeSignal {
+        self.signal.clone()
+    }
+
+    /// The current resolved snapshot (config, theme, chrome, bindings).
+    #[must_use]
+    pub const fn config(&self) -> &ClientConfig {
+        &self.config
+    }
+
+    /// The parsed keybindings currently in force.
+    ///
+    /// [`ClientConfig::reload`] re-parses these on every reload, so a saved
+    /// keybinding edit is live the moment the caller reads them again.
+    #[must_use]
+    pub const fn bindings(&self) -> &Bindings {
+        &self.config.bindings
+    }
+
+    /// The root-background opacity from the live config.
+    ///
+    /// This is the delivery point for the reload plan's `opacity_changed()`
+    /// signal: the window's opacity hook reads it whenever the plan flags a
+    /// change, so wiring the value into the actual GPUI root background is a
+    /// pure rendering change with no plumbing left to do.
+    #[must_use]
+    pub const fn opacity(&self) -> f32 {
+        self.config.config.appearance.opacity
+    }
+
+    /// Consume a pending change without reloading. Returns `true` when the
+    /// watcher signalled since the last poll.
+    pub fn take_pending(&mut self) -> bool {
+        self.signal.take_change(&mut self.seen)
+    }
+
+    /// Poll the watcher and, when a change is pending, reload from disk.
+    ///
+    /// Returns the [`ConfigReloadPlan`] for the reload, or `None` when nothing
+    /// changed. A failed parse keeps the current config (see
+    /// [`ClientConfig::reload_from_disk`]) and reports an empty plan, so a
+    /// half-written file mid-save never blanks the window.
+    pub fn poll_reload(&mut self) -> Option<ConfigReloadPlan> {
+        self.take_pending().then(|| self.config.reload_from_disk())
+    }
+
+    /// Apply an explicit config as if it had just been read from disk.
+    ///
+    /// The test seam behind [`Self::poll_reload`]: it runs the same
+    /// [`ClientConfig::reload`] bookkeeping without any filesystem access.
+    pub fn reload(&mut self, new_config: ScribeConfig) -> ConfigReloadPlan {
+        self.config.reload(new_config)
     }
 }
 

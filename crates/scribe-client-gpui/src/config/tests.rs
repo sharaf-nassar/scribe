@@ -10,7 +10,7 @@ use std::path::Path;
 
 use scribe_common::config::ScribeConfig;
 
-use super::{ClientConfig, is_relevant_config_event_path};
+use super::{ClientConfig, ConfigChangeSignal, ConfigRuntime, is_relevant_config_event_path};
 
 fn parse(toml_src: &str) -> ScribeConfig {
     toml::from_str(toml_src).expect("config TOML parses")
@@ -136,4 +136,79 @@ fn watcher_relevance_matches_config_and_theme_paths() {
     assert!(is_relevant_config_event_path(dir, &dir.join("config.toml")));
     assert!(is_relevant_config_event_path(dir, &dir.join("themes/my-theme.toml")));
     assert!(!is_relevant_config_event_path(dir, &dir.join("other.txt")));
+}
+
+// @lat: [[test#GPUI Client Headless Suites#Config live reload#Watcher signal collapses a burst]]
+#[test]
+fn change_signal_collapses_a_save_burst_into_one_reload() {
+    let signal = ConfigChangeSignal::new();
+    let mut seen = signal.generation();
+
+    // Nothing written yet: no reload is due.
+    assert!(!signal.take_change(&mut seen));
+
+    // One editor save fires several notify events (delete, create, modify).
+    signal.signal();
+    signal.signal();
+    signal.signal();
+
+    // They collapse into exactly one reload, and the flag then clears.
+    assert!(signal.take_change(&mut seen));
+    assert!(!signal.take_change(&mut seen));
+}
+
+// @lat: [[test#GPUI Client Headless Suites#Config live reload#Runtime applies a watcher-signalled edit]]
+#[test]
+fn runtime_reloads_only_after_the_watcher_signals() {
+    let initial = parse(
+        r#"
+[appearance]
+font = "JetBrains Mono"
+font_size = 14.0
+theme = "minimal-dark"
+opacity = 1.0
+
+[keybindings]
+command_palette = ["ctrl+shift+p"]
+"#,
+    );
+    let mut runtime = ConfigRuntime::detached(ClientConfig::from_config(initial));
+    assert_eq!(runtime.config().theme.name, "minimal-dark");
+
+    // No watcher event yet, so the foreground poll must not reload.
+    assert!(!runtime.take_pending());
+
+    // The watcher fires; the foreground now has a reload to run.
+    let signal = runtime.signal();
+    signal.signal();
+    assert!(runtime.take_pending());
+
+    // Applying the edited file swaps every live surface in one step.
+    let plan = runtime.reload(parse(
+        r#"
+[appearance]
+font = "Fira Code"
+font_size = 18.0
+theme = "dracula"
+opacity = 0.85
+
+[keybindings]
+command_palette = ["ctrl+shift+o"]
+"#,
+    ));
+
+    assert!(plan.theme_changed());
+    assert!(plan.font_changed());
+    assert!(plan.opacity_changed());
+    assert_eq!(runtime.config().theme.name, "dracula");
+    assert_eq!(runtime.config().config.appearance.font, "Fira Code");
+    assert!((runtime.opacity() - 0.85).abs() < f32::EPSILON);
+
+    // Keybindings are re-parsed unconditionally, so the new palette combo is
+    // live without a restart and the old one no longer matches.
+    let combo = runtime.bindings().command_palette.first().expect("palette combo parsed");
+    assert_eq!(combo.key, crate::keybindings::KeyMatch::Character('o'));
+
+    // The signal was consumed by the earlier poll: no second reload is queued.
+    assert!(!runtime.take_pending());
 }

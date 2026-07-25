@@ -209,6 +209,20 @@ impl IpcSink {
         self.enqueue(ClientMessage::Resize { session_id, size })
     }
 
+    /// Announces that the client reapplied an on-disk config edit, so the
+    /// server re-reads the same file and swaps its own live surfaces (clipboard
+    /// policy, env store, remote/share listeners) in the same round trip.
+    ///
+    /// Emitted on every accepted reload, matching the legacy client's
+    /// unconditional `finish_config_reload` send: the server decides for itself
+    /// which of its surfaces actually changed.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn config_reloaded(&self) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::ConfigReloaded)
+    }
+
     /// Requests the authoritative workspace notes for `workspace_ids` so the
     /// modal and hover preview can render server-owned state.
     ///
@@ -414,6 +428,22 @@ mod tests {
         sink.key_input(pane, b"a".to_vec(), true).unwrap();
 
         assert!(matches!(out_rx.recv().await.unwrap(), ClientMessage::Resize { .. }));
+        assert!(matches!(out_rx.recv().await.unwrap(), ClientMessage::KeyInput { .. }));
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Config live reload#Reload announces ConfigReloaded]]
+    #[tokio::test]
+    async fn config_reloaded_is_enqueued_on_the_ordered_writer_channel() {
+        let pane = SessionId::new();
+        let (out_tx, mut out_rx) = unbounded_channel::<ClientMessage>();
+        let sink = IpcSink::new(out_tx);
+
+        sink.config_reloaded().unwrap();
+        // Ordering matters: the server must have re-read the config before it
+        // interprets whatever the user types next.
+        sink.key_input(pane, b"a".to_vec(), true).unwrap();
+
+        assert!(matches!(out_rx.recv().await.unwrap(), ClientMessage::ConfigReloaded));
         assert!(matches!(out_rx.recv().await.unwrap(), ClientMessage::KeyInput { .. }));
     }
 

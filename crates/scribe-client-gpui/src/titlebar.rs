@@ -99,6 +99,17 @@ impl TitlebarView {
         }
     }
 
+    /// Swap the chrome palette, e.g. after a live theme edit is hot-reloaded.
+    pub fn set_colors(&mut self, colors: TabBarColors, cx: &mut Context<Self>) {
+        self.colors = colors;
+        cx.notify();
+    }
+
+    /// The chrome palette currently painted.
+    pub const fn colors(&self) -> &TabBarColors {
+        &self.colors
+    }
+
     /// Replace the tab strip.
     pub fn set_tabs(&mut self, tabs: Vec<TabData>, cx: &mut Context<Self>) {
         self.tabs = tabs;

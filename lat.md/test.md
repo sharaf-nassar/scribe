@@ -170,6 +170,8 @@ Visual end-to-end tests run the real `scribe-client-gpui` window headlessly (`do
 
 `docker/entrypoint-visual.sh` starts Xvfb, an `openbox` window manager, `scribe-server`, the daemon, and the GPUI client, then runs the test script. The image pins `VK_ICD_FILENAMES` to lavapipe's software Vulkan ICD (shipped in `mesa-vulkan-drivers`) so the client renders deterministically with no GPU, and sets `SCRIBE_DISABLE_ANIMATIONS=1` so consecutive frames are byte-identical. Tests drive the client through `xdotool`/`xclip` and capture frames with `scrot`. An optional `SCRIBE_EXTRA_CONFIG` env var seeds `config.toml` before the client starts so a test can exercise opt-in settings (e.g. `terminal.paste_confirmation`).
 
+The client's stderr is redirected to `/output/client.log` and its pid and log path are exported as `SCRIBE_CLIENT_PID` / `SCRIBE_CLIENT_LOG`, so a script can assert on runtime behaviour that leaves no pixels behind and can prove the process never restarted. `RUST_LOG` defaults to `scribe_server=info,scribe_client_gpui=info` so those client lines are actually emitted.
+
 The GPUI client sets its X11 `WM_NAME`/`_NET_WM_NAME` to `Scribe` via [[crates/scribe-client-gpui/src/main.rs#open_window]] so `xdotool search --name "Scribe"` can locate the window for focus and capture.
 
 `openbox` is required, not cosmetic: the active-window guard (mirroring [[crates/scribe-client/src/x11_focus.rs#X11FocusGuard]]) suppresses synthetic key input whenever `_NET_ACTIVE_WINDOW` does not name the client window, and only a window manager sets that root property under Xvfb. Without a WM, `xdotool`-driven visual tests cannot type.
@@ -181,6 +183,14 @@ The GPUI client sets its X11 `WM_NAME`/`_NET_WM_NAME` to `Scribe` via [[crates/s
 It prints a grid of solid color-block and pictographic emoji, screenshots the frame, and asserts via ImageMagick's HSL saturation channel that a strongly-saturated pixel count clears a floor. A monochrome/tinted fallback tints every glyph the pale foreground color, so its saturated-pixel count collapses to near zero.
 
 `tests/e2e/visual/paste-confirmation.sh` verifies the spec-011 paste gate ([[client#Dialogs#Paste Confirmation Dialog]]): a single-line paste carrying control/escape bytes pops the confirmation with a caret-escaped preview (`^[`), while a plain single line and a tab-separated line paste straight through without a dialog.
+
+### Config live reload
+
+`tests/e2e/visual/config-reload.sh` is the scripted oracle for the `ConfigReloaded` parity row: it edits `config.toml` under an already-running client, the user-visible scenario the headless suites cannot reach.
+
+The script screenshots the baseline window, rewrites the config with a new theme, font size, `line_padding`, opacity, and command-palette combo in one save, then asserts four things in order: the client logged a `config hot-reloaded` line it had not logged before (the watcher fired and [[client#Client#Config Watching#GPUI Config Port#Terminal Window Reload Wiring]] ran), the client pid is unchanged (a reload, not a restart), the captured frame is no longer pixel-identical (the new theme and font actually reached the paint path), and the newly bound `ctrl+shift+o` opens the command palette even though that combo did not exist when the window started.
+
+Asserting on the log rather than on pixels alone is deliberate: the status bar's sparklines resample on a timer, so a screenshot diff on its own could pass without any reload having happened.
 
 ## GPUI IPC Bridge
 
@@ -638,6 +648,32 @@ The test parses the removed-keys TOML into [[crates/scribe-common/src/config.rs#
 A scripted reload confirms that edits to theme, font, and keybindings reapply live without a restart, backing the `ConfigReloaded` parity row.
 
 Building a [[crates/scribe-client-gpui/src/config.rs#ClientConfig]] from an initial config and calling [[crates/scribe-client-gpui/src/config.rs#ClientConfig#reload]] with an edited config, the test asserts the returned [[crates/scribe-client-gpui/src/config.rs#ConfigReloadPlan]] flags the theme and font as changed, the resolved theme/chrome and font metrics actually updated, and the re-parsed [[crates/scribe-client-gpui/src/keybindings.rs#Bindings]] reflect the new combo. Companion cases assert an opacity-only edit is scoped to `opacity_changed` and an identical config reports no change.
+
+Those cases prove the plan is computed correctly, but not that a running window ever asks for one. The child cases below cover the runtime path that closes that gap — watcher signal, foreground poll, painted font, and the outbound `ConfigReloaded` — and [[test#Visual E2E Tests#Config live reload]] drives the whole chain against a real window.
+
+#### Watcher signal collapses a burst
+
+Confirms [[crates/scribe-client-gpui/src/config.rs#ConfigChangeSignal]] turns the several `notify` events one editor save emits into exactly one reload, and reports nothing when the file is untouched.
+
+The test polls a fresh signal (no reload due), fires three `signal()` calls to stand in for the delete/create/modify sequence a save-by-rename produces, and asserts a single [[crates/scribe-client-gpui/src/config.rs#ConfigChangeSignal#take_change]] consumes all three and the next poll is clean. This is the property that lets the foreground poll on a timer instead of waking per filesystem event without either missing a save or reloading three times per save.
+
+#### Runtime applies a watcher-signalled edit
+
+Drives the full foreground path — signal, poll, reload, read back — over [[crates/scribe-client-gpui/src/config.rs#ConfigRuntime]], proving a window only reloads when the watcher fires and that every live surface swaps in one step.
+
+Using [[crates/scribe-client-gpui/src/config.rs#ConfigRuntime#detached]] so no real config directory is touched, the test asserts an unsignalled poll does not reload, then signals and applies an edit changing theme, font, opacity, and the command-palette combo at once. It checks the plan flags all three surfaces, the resolved theme and font actually updated, [[crates/scribe-client-gpui/src/config.rs#ConfigRuntime#opacity]] carries the new value to the opacity hook, the re-parsed [[crates/scribe-client-gpui/src/config.rs#ConfigRuntime#bindings]] expose the new palette key, and the consumed signal leaves no second reload queued.
+
+#### Grid font tracks the live appearance config
+
+Verifies [[crates/scribe-client-gpui/src/terminal_element.rs#GridFont]] derives the grid's painted metrics from `[appearance]` so a font edit changes pixels rather than only the stored config.
+
+The test builds metrics from an edited appearance block and asserts the family, size, `line_padding`-inclusive row height, and the cell advance reported to the server all follow the config. A companion assertion drives `font_size = 0` and checks the value is clamped to the floor, so a bad edit degrades to a small grid instead of collapsing the window to nothing.
+
+#### Reload announces ConfigReloaded
+
+Backs the `ConfigReloaded` parity row at the protocol boundary: the reload path must put the message on the wire, ordered ahead of whatever the user types next.
+
+Driving [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#config_reloaded]] followed by a `KeyInput` on the same ordered writer channel, the test asserts a `ClientMessage::ConfigReloaded` is dequeued first. Ordering is the point: the server must have re-read the config before it interprets the next keystroke, otherwise a policy edit applies a keypress late.
 
 ### GPUI remote connect picker
 
