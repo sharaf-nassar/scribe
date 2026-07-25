@@ -4,12 +4,14 @@
 //! Inbound: server output events arrive on an mpsc channel and are drained with
 //! Zed-style 4 ms / 100-event coalescing. Per-pane output is collapsed so each
 //! batch runs one `write_output` and one repaint per dirty pane. Outbound:
-//! [`IpcSink`] replaces Zed's `write_to_pty`, enqueuing `ClientMessage::KeyInput`
-//! and `Resize` onto the ordered IPC-writer channel. The outbound path never
+//! [`IpcSink`] replaces Zed's `write_to_pty`, enqueuing `ClientMessage::KeyInput`,
+//! `Resize`, and the session-lifecycle messages the tab shortcuts drive
+//! (`CreateSession` / `AttachSessions` / `CloseSession`) onto the ordered
+//! IPC-writer channel. The outbound path never
 //! traverses the inbound drain, so keystrokes are never queued behind an output
 //! firehose and `Resize` is always flushed ahead of the `KeyInput` that follows.
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use scribe_common::{
     ids::{SessionId, WorkspaceId},
@@ -221,6 +223,54 @@ impl IpcSink {
     /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
     pub fn config_reloaded(&self) -> Result<(), SinkClosed> {
         self.enqueue(ClientMessage::ConfigReloaded)
+    }
+
+    /// Requests a new session (tab) in `workspace_id`.
+    ///
+    /// `command` spawns an explicit program instead of the login shell, which
+    /// is how the AI-tab shortcuts open Claude Code / Codex; `cwd` inherits the
+    /// active pane's directory. `split_direction` stays `None` because the tab
+    /// shortcuts add to the existing workspace rather than dividing the window.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn create_session(
+        &self,
+        workspace_id: WorkspaceId,
+        size: TerminalSize,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+    ) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::CreateSession {
+            workspace_id,
+            split_direction: None,
+            cwd,
+            size: Some(size),
+            command,
+            env_envelope_id: None,
+        })
+    }
+
+    /// Attaches `session_ids` at `dimensions`, switching which sessions stream
+    /// `PtyOutput`. Used when a tab shortcut changes the focused tab.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn attach_sessions(
+        &self,
+        session_ids: Vec<SessionId>,
+        dimensions: Vec<TerminalSize>,
+    ) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::AttachSessions { session_ids, dimensions })
+    }
+
+    /// Asks the server to terminate `session_id`, backing the `close_tab`
+    /// shortcut. The tab leaves the strip once `SessionExited` arrives.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn close_session(&self, session_id: SessionId) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::CloseSession { session_id })
     }
 
     /// Requests the authoritative workspace notes for `workspace_ids` so the

@@ -34,7 +34,7 @@ use scribe_client_gpui::dialog::{
     AnyDialog, ClipboardDialog, CloseDialog, DialogColors, DialogEvent, DialogView,
 };
 use scribe_client_gpui::input::KeyInput;
-use scribe_client_gpui::keybindings::{KeyAction, translate_key_action};
+use scribe_client_gpui::keybindings::{KeyAction, LayoutAction, translate_key_action};
 use scribe_client_gpui::layout::Rect;
 use scribe_client_gpui::prompt_bar::{
     self, PromptBarColors, PromptBarData, PromptContextIndicator,
@@ -48,9 +48,11 @@ use scribe_client_gpui::workspace_notes_modal::{
     WorkspaceNotesModalAction, WorkspaceNotesModalColors, WorkspaceNotesModalView,
 };
 use scribe_client_gpui::{
-    tab_bar::{TabBarColors, TabData, context_suffix},
+    tab_bar::{TabBarColors, context_suffix},
+    tab_session::{TabEntry, TabSessions},
     titlebar::TitlebarView,
 };
+use scribe_common::ai_state::AiProvider;
 use scribe_common::theme::ChromeColors;
 use scribe_common::{
     config::{AiContextThresholds, StatusBarStatsConfig, load_config},
@@ -167,6 +169,10 @@ struct Shared {
     status: Arc<Mutex<String>>,
     generation: Arc<AtomicU64>,
     active_session: Arc<Mutex<Option<SessionId>>>,
+    /// Ordered tab strip. The IPC reader rebuilds it from `SessionList` /
+    /// `SessionCreated` / `SessionExited`; the key-dispatch path moves its
+    /// selection for the `next_tab` / `prev_tab` / `select_tab_N` shortcuts.
+    tabs: Arc<Mutex<TabSessions>>,
     /// Server-connection flag driving the status bar's connection dot.
     connected: Arc<AtomicBool>,
     /// AI state + prompt history driving the prompt bar and the tab context %.
@@ -203,6 +209,11 @@ struct TerminalView {
     titlebar: Entity<TitlebarView>,
     /// Theme chrome, retained to build the overlay palettes on demand.
     chrome: ChromeColors,
+    /// Terminal dimensions announced to the server for newly created sessions.
+    terminal_size: TerminalSize,
+    /// Last tab strip pushed into the titlebar, so a redraw only re-renders the
+    /// tab row when the shared model actually changed.
+    rendered_tabs: TabSessions,
     /// The command palette overlay, present only while open.
     command_palette: Option<Entity<CommandPaletteView>>,
     /// The right-click context menu overlay, present only while open.
@@ -223,7 +234,12 @@ struct TerminalView {
 }
 
 impl TerminalView {
-    fn new(shared: Shared, sink: IpcSink, cx: &mut Context<Self>) -> Self {
+    fn new(
+        shared: Shared,
+        sink: IpcSink,
+        terminal_size: TerminalSize,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let generation = Arc::clone(&shared.generation);
         let refresh_task =
             cx.spawn(async move |view, app| drive_redraws(view, app, generation).await);
@@ -243,11 +259,13 @@ impl TerminalView {
         let prompt_bar_enabled = terminal.prompt_bar.enabled;
         let prompt_colors = PromptBarColors::from(&chrome);
         let colors = TabBarColors::from(&chrome);
+        // The strip starts empty and is filled by the reader's first
+        // `SessionList`; `sync_tabs` pushes it into the titlebar on the next
+        // redraw so the tab row always mirrors live server state.
+        let rendered_tabs = TabSessions::new();
         let titlebar = cx.new(|cx| {
             let mut bar = TitlebarView::new(colors, cx);
-            let mut tab = TabData::new("shell");
-            tab.is_active = true;
-            bar.set_tabs(vec![tab], cx);
+            bar.set_tabs(rendered_tabs.to_tab_data(), cx);
             bar
         });
         Self {
@@ -264,6 +282,8 @@ impl TerminalView {
             prompt_bar_enabled,
             titlebar,
             chrome,
+            terminal_size,
+            rendered_tabs,
             command_palette: None,
             context_menu: None,
             dialog: None,
@@ -289,8 +309,9 @@ impl TerminalView {
     /// the opacity hook, then announce the reload to the server.
     ///
     /// Keybindings need no branch here — [`ConfigRuntime`] re-parses them on
-    /// every reload and `handle_overlay_key` reads them fresh on each keystroke,
-    /// so a saved shortcut edit is live immediately.
+    /// every reload and both `handle_overlay_key` and [`Self::handle_binding`]
+    /// read them fresh on each keystroke, so a saved shortcut edit is live
+    /// immediately.
     fn apply_config_reload(&mut self, plan: ConfigReloadPlan, cx: &mut Context<Self>) {
         if plan.theme_changed() {
             let theme = self.config.config().theme.clone();
@@ -362,6 +383,109 @@ impl TerminalView {
     /// needs — the change signal and the new value — arrives through this hook.
     fn apply_opacity_change(&mut self) {
         tracing::info!(opacity = self.config.opacity(), "config reload: opacity changed");
+    }
+
+    /// Mirror the shared tab strip into the titlebar when it changed.
+    ///
+    /// The strip is mutated off the GPUI thread by the IPC reader, so the view
+    /// reconciles it on each redraw rather than being pushed to.
+    fn sync_tabs(&mut self, cx: &mut Context<Self>) {
+        let Ok(tabs) = self.shared.tabs.lock() else { return };
+        if *tabs == self.rendered_tabs {
+            return;
+        }
+        self.rendered_tabs = tabs.clone();
+        drop(tabs);
+        let data = self.rendered_tabs.to_tab_data();
+        self.titlebar.update(cx, |bar, ctx| bar.set_tabs(data, ctx));
+    }
+
+    /// Run one [`LayoutAction`] intercepted from the key path.
+    ///
+    /// Tab creation, selection, and closing are wired to the IPC sink; the
+    /// pane/workspace/navigation families are still swallowed (never forwarded
+    /// to the PTY) because the shell has no pane tree yet, matching the legacy
+    /// client's behaviour of never leaking a bound shortcut as terminal bytes.
+    fn handle_layout_action(&mut self, action: LayoutAction, cx: &mut Context<Self>) {
+        match action {
+            LayoutAction::NewTab => self.create_tab(None),
+            LayoutAction::NewClaudeTab => {
+                self.create_tab(Some(ai_tab_command(AiProvider::ClaudeCode, false)));
+            }
+            LayoutAction::NewClaudeResumeTab => {
+                self.create_tab(Some(ai_tab_command(AiProvider::ClaudeCode, true)));
+            }
+            LayoutAction::NewCodexTab => {
+                self.create_tab(Some(ai_tab_command(AiProvider::CodexCode, false)));
+            }
+            LayoutAction::NewCodexResumeTab => {
+                self.create_tab(Some(ai_tab_command(AiProvider::CodexCode, true)));
+            }
+            LayoutAction::NextTab => self.switch_tab(TabSessions::focus_next, cx),
+            LayoutAction::PrevTab => self.switch_tab(TabSessions::focus_prev, cx),
+            LayoutAction::SelectTab(index) => {
+                self.switch_tab(move |tabs| tabs.select(index), cx);
+            }
+            LayoutAction::CloseTab => self.close_active_tab(),
+            _ => tracing::debug!(?action, "layout action not yet wired in the GPUI shell"),
+        }
+    }
+
+    /// Ask the server for a new session in the active workspace.
+    ///
+    /// The tab appears once the server answers with `SessionCreated`, so the
+    /// strip never shows a tab whose PTY failed to spawn.
+    fn create_tab(&self, command: Option<Vec<String>>) {
+        let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
+        else {
+            tracing::warn!("new tab ignored: no workspace is attached yet");
+            return;
+        };
+        if let Err(error) =
+            self.sink.create_session(workspace_id, self.terminal_size, None, command)
+        {
+            tracing::warn!(%error, "new tab dropped: IPC writer closed");
+        }
+    }
+
+    /// Move the tab selection with `move_selection` and attach whatever it
+    /// lands on. A `None` result means the selection did not move.
+    fn switch_tab(
+        &mut self,
+        move_selection: impl FnOnce(&mut TabSessions) -> Option<SessionId>,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(mut tabs) = self.shared.tabs.lock() else { return };
+        let Some(session_id) = move_selection(&mut tabs) else { return };
+        drop(tabs);
+        self.attach(session_id);
+        self.sync_tabs(cx);
+    }
+
+    /// Point the client at `session_id`: attach it, announce the client size,
+    /// and ask for a fresh screen so the switched-to tab paints immediately.
+    fn attach(&self, session_id: SessionId) {
+        if let Ok(mut guard) = self.shared.active_session.lock() {
+            *guard = Some(session_id);
+        }
+        let size = self.terminal_size;
+        let result = self
+            .sink
+            .attach_sessions(vec![session_id], vec![size])
+            .and_then(|()| self.sink.resize(session_id, size));
+        if let Err(error) = result {
+            tracing::warn!(%error, "tab switch dropped: IPC writer closed");
+        }
+    }
+
+    /// Close the focused tab's session. The strip updates on `SessionExited`.
+    fn close_active_tab(&self) {
+        let Some(session_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_session()) else {
+            return;
+        };
+        if let Err(error) = self.sink.close_session(session_id) {
+            tracing::warn!(%error, "close tab dropped: IPC writer closed");
+        }
     }
 
     /// Open the command palette, building its entry list from the live update /
@@ -651,6 +775,34 @@ impl TerminalView {
         true
     }
 
+    /// Run a keystroke through the configured bindings before the PTY encoder.
+    ///
+    /// This is the level 1–3 intercept the legacy client ran ahead of its byte
+    /// encoder: a bound layout/tab shortcut is executed here and never reaches
+    /// the terminal, a bound palette shortcut opens the overlay, and a bound
+    /// terminal shortcut sends its fixed escape sequence. Returns `true` when
+    /// the key was consumed, leaving level 4 ([`Self::on_key_down`]) for
+    /// everything else.
+    fn handle_binding(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let Some(input) = KeyInput::from_key_down(event) else {
+            return false;
+        };
+        let Some(action) = translate_key_action(&input, self.config.bindings()) else {
+            return false;
+        };
+        match action {
+            KeyAction::Layout(layout) => self.handle_layout_action(layout, cx),
+            KeyAction::Terminal(bytes) => self.send_key_bytes(bytes),
+            // The palette is claimed earlier by `handle_overlay_key`; the
+            // settings window and find overlay are separate beads. All three
+            // are still swallowed so they cannot reach the PTY.
+            KeyAction::OpenCommandPalette | KeyAction::OpenSettings | KeyAction::OpenFind => {
+                tracing::debug!(?action, "key action not yet wired in the GPUI shell");
+            }
+        }
+        true
+    }
+
     /// Encodes a keystroke and enqueues it as `KeyInput` for the attached pane.
     ///
     /// Interim passthrough encoder: printable characters plus a handful of
@@ -660,6 +812,11 @@ impl TerminalView {
         let Some(bytes) = encode_key(event) else {
             return;
         };
+        self.send_key_bytes(bytes);
+    }
+
+    /// Enqueue already-encoded bytes for the attached pane.
+    fn send_key_bytes(&self, bytes: Vec<u8>) {
         let session_id = self.shared.active_session.lock().ok().and_then(|guard| *guard);
         let Some(session_id) = session_id else {
             return;
@@ -687,6 +844,22 @@ fn demo_workspace_notes(workspace_id: WorkspaceId) -> Vec<WorkspaceNoteEntry> {
             archive_reason: None,
         })
         .collect()
+}
+
+/// Build the spawn command for an AI tab, matching the legacy client.
+///
+/// The CLI starts through the user's login shell (`-lic` + `exec`) so it
+/// inherits the same PATH and rc files a normal tab would, without first
+/// rendering a shell prompt.
+fn ai_tab_command(provider: AiProvider, resume: bool) -> Vec<String> {
+    let shell = scribe_common::shell::default_shell_program();
+    let binary = provider.binary_name();
+    let command = if resume {
+        format!("exec {binary} {}", provider.resume_args().join(" "))
+    } else {
+        format!("exec {binary}")
+    };
+    vec![shell, String::from("-lic"), command]
 }
 
 /// Interim keystroke encoder feeding the outbound [`IpcSink`] (see
@@ -817,7 +990,10 @@ impl TerminalView {
         let suffix = self.active_tab_context_suffix();
         self.titlebar.update(cx, |bar, ctx| {
             let mut tabs = bar.tabs().to_vec();
-            let Some(tab) = tabs.first_mut() else {
+            // The suffix belongs to the pane the meter was read from, which is
+            // the focused tab — not necessarily the first one now that the tab
+            // shortcuts can open and select several.
+            let Some(tab) = tabs.iter_mut().find(|tab| tab.is_active) else {
                 return;
             };
             if tab.context_suffix == suffix {
@@ -872,6 +1048,7 @@ impl Render for TerminalView {
         if !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle, cx);
         }
+        self.sync_tabs(cx);
         let content = self
             .shared
             .terminal
@@ -896,9 +1073,12 @@ impl Render for TerminalView {
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, ctx| {
-                if !view.handle_overlay_key(event, ctx) {
-                    view.on_key_down(event);
+                // Overlays own the keyboard first, then the configured
+                // bindings, and only then the generic PTY byte encoder.
+                if view.handle_overlay_key(event, ctx) || view.handle_binding(event, ctx) {
+                    return;
                 }
+                view.on_key_down(event);
             }))
             .relative()
             .size_full()
@@ -974,6 +1154,7 @@ fn main() {
         status: Arc::new(Mutex::new("connecting to Scribe server…".to_owned())),
         generation: Arc::new(AtomicU64::new(0)),
         active_session: Arc::new(Mutex::new(None)),
+        tabs: Arc::new(Mutex::new(TabSessions::new())),
         connected: Arc::new(AtomicBool::new(false)),
         ai: Arc::new(Mutex::new(AiChrome::new(
             load_config().unwrap_or_default().terminal.ai_session.ai_states,
@@ -1006,7 +1187,7 @@ fn main() {
         // screenshots stay byte-identical — under the E2E determinism path.
         let animations = load_config().map_or(true, |config| config.appearance.animations);
         AnimationSettings::resolve(animations).apply_to_app(cx);
-        open_window(cx, &shared, &sink);
+        open_window(cx, &shared, &sink, terminal_size);
         cx.activate(true);
     });
 }
@@ -1045,7 +1226,7 @@ fn run_settings() {
     drop(lock_file);
 }
 
-fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink) {
+fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink, terminal_size: TerminalSize) {
     let bounds = Bounds::centered(None, size(px(960.), px(680.)), cx);
     let shared = shared.clone();
     let sink = sink.clone();
@@ -1059,7 +1240,7 @@ fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink) {
             app_id: Some("scribe".to_owned()),
             ..Default::default()
         },
-        |_, cx| cx.new(|cx| TerminalView::new(shared, sink, cx)),
+        |_, cx| cx.new(|cx| TerminalView::new(shared, sink, terminal_size, cx)),
     ) {
         tracing::error!(%error, "failed to open GPUI window");
     }
@@ -1125,6 +1306,7 @@ async fn run_connection(ctx: IpcThread) -> Result<(), String> {
             generation: ctx.shared.generation,
             active_session: ctx.shared.active_session,
             ai: ctx.shared.ai,
+            tabs: ctx.shared.tabs,
             out_tx: ctx.out_tx,
             in_tx: ctx.in_tx,
             sink: ctx.sink,
@@ -1268,6 +1450,8 @@ struct ReaderCtx {
     active_session: Arc<Mutex<Option<SessionId>>>,
     /// AI state + prompt history the chrome renders from.
     ai: Arc<Mutex<AiChrome>>,
+    /// Ordered tab strip the reader rebuilds from server session traffic.
+    tabs: Arc<Mutex<TabSessions>>,
     out_tx: UnboundedSender<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
@@ -1293,11 +1477,14 @@ async fn run_reader<R>(mut reader: R, ctx: ReaderCtx) -> Result<(), String>
 where
     R: AsyncReadExt + Unpin,
 {
-    let mut attached: Option<SessionId> = None;
     let mut registry = session_lifecycle::SessionRegistry::new();
     loop {
         let message: ServerMessage =
             read_message(&mut reader).await.map_err(|error| error.to_string())?;
+        // The focused tab is shared state: the view moves it for `next_tab` /
+        // `select_tab_N`, so output gating reads it fresh on every message
+        // rather than caching a local `attached`.
+        let attached = ctx.active_session.lock().ok().and_then(|guard| *guard);
         match message {
             ServerMessage::Welcome { window_id, .. } => {
                 // A takeover Hello's Welcome hands back the adopted window id.
@@ -1305,24 +1492,25 @@ where
                 tracing::debug!(adopted = ?registry.adopted_window(), "welcome: adopted window");
             }
             ServerMessage::SessionList { sessions, .. } => {
-                // Rebuild the reconnect topology from the authoritative list,
-                // then (on the first list) attach the single spike pane.
                 registry.rebuild_from_session_list(&sessions);
                 tracing::debug!(
                     sessions = registry.len(),
                     workspaces = registry.reconnect_topology().len(),
                     "rebuilt reconnect topology"
                 );
-                if attached.is_none() {
-                    attach_first(&ctx, &sessions, &mut attached)?;
-                }
+                sync_tab_strip(&ctx, &sessions, attached)?;
             }
-            ServerMessage::SessionCreated { session_id, workspace_id, .. } => {
+            ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
                 registry.on_session_created(session_id, workspace_id);
+                open_created_tab(&ctx, session_id, workspace_id, shell_name)?;
             }
             ServerMessage::SessionExited { session_id, .. } => {
                 let existed = registry.on_session_exited(session_id);
                 update_ai_chrome(&ctx, |ai| ai.forget(session_id));
+                let refocused = ctx.tabs.lock().ok().and_then(|mut tabs| tabs.remove(session_id));
+                if let Some(next) = refocused {
+                    attach_session(&ctx, next)?;
+                }
                 if existed && Some(session_id) == attached {
                     set_status(&ctx.status, &ctx.generation, "attached pane exited".to_owned());
                 }
@@ -1378,16 +1566,78 @@ where
     }
 }
 
-fn attach_first(
+/// Add a freshly created session to the tab strip, focus it, and attach.
+///
+/// The server also re-announces `SessionCreated` to acknowledge every
+/// `AttachSessions`, so only a genuine insert counts as a new tab — attaching
+/// on the echo would attach in an unbounded loop.
+fn open_created_tab(
+    ctx: &ReaderCtx,
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    shell_name: String,
+) -> Result<(), String> {
+    let entry = TabEntry { session_id, workspace_id, title: shell_name };
+    let added = ctx.tabs.lock().is_ok_and(|mut tabs| tabs.insert_active(entry));
+    if added {
+        attach_session(ctx, session_id)?;
+        set_status(&ctx.status, &ctx.generation, "opened a new tab".to_owned());
+    }
+    Ok(())
+}
+
+/// Rebuild the tab strip from an authoritative `SessionList` and attach
+/// whichever tab ends up focused.
+///
+/// A reconnect keeps the previously focused session when it survived, so the
+/// pane the user was typing into does not jump on every list refresh.
+fn sync_tab_strip(
     ctx: &ReaderCtx,
     sessions: &[SessionInfo],
-    attached: &mut Option<SessionId>,
+    attached: Option<SessionId>,
 ) -> Result<(), String> {
-    let Some(session) = sessions.first() else {
-        set_status(&ctx.status, &ctx.generation, "connected; server has no live panes".to_owned());
-        return Ok(());
-    };
-    let session_id = session.session_id;
+    let entries = sessions.iter().map(tab_entry_for).collect();
+    let focused = ctx.tabs.lock().ok().and_then(|mut tabs| tabs.replace_all(entries));
+    match focused {
+        Some(session_id) if Some(session_id) != attached => {
+            attach_session(ctx, session_id)?;
+            set_status(
+                &ctx.status,
+                &ctx.generation,
+                format!("attached; {} live pane(s)", sessions.len()),
+            );
+        }
+        // Already attached to the focused tab; just repaint so any label change
+        // carried by the list lands in the tab row.
+        Some(_) => {
+            ctx.generation.fetch_add(1, Ordering::Release);
+        }
+        None => set_status(
+            &ctx.status,
+            &ctx.generation,
+            "connected; server has no live panes".to_owned(),
+        ),
+    }
+    Ok(())
+}
+
+/// Lower a server [`SessionInfo`] into a tab strip entry.
+///
+/// The label prefers the session's live terminal title (OSC 0/2) and falls back
+/// to the shell basename, matching what the legacy tab bar rendered.
+fn tab_entry_for(info: &SessionInfo) -> TabEntry {
+    TabEntry {
+        session_id: info.session_id,
+        workspace_id: info.workspace_id,
+        title: info.title.clone().unwrap_or_else(|| info.shell_name.clone()),
+    }
+}
+
+/// Attach `session_id` and make it the pane the view renders and types into.
+///
+/// The server answers with a `SessionReplay` for the newly attached session,
+/// which repaints the pane, so no extra snapshot request is needed.
+fn attach_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> {
     ctx.out_tx
         .send(ClientMessage::AttachSessions {
             session_ids: vec![session_id],
@@ -1396,11 +1646,9 @@ fn attach_first(
         .map_err(|_| "writer channel closed".to_owned())?;
     // Announce the client size through the sink, ahead of any KeyInput.
     ctx.sink.resize(session_id, ctx.size).map_err(|error| error.to_string())?;
-    *attached = Some(session_id);
     if let Ok(mut guard) = ctx.active_session.lock() {
         *guard = Some(session_id);
     }
-    set_status(&ctx.status, &ctx.generation, "attached to one live pane".to_owned());
     Ok(())
 }
 
