@@ -7,6 +7,7 @@ mod ipc;
 mod render;
 mod server;
 mod session;
+mod share_tap;
 mod wait;
 
 use std::fmt;
@@ -179,6 +180,35 @@ enum Command {
         /// Path to a reference snapshot JSON file (from `snapshot` command).
         reference: PathBuf,
     },
+    /// Relay the client socket through a wire tap that records every outbound
+    /// `ClientMessage` and can inject `ServerMessage`s toward the client.
+    ///
+    /// Stands in for the second machine a feature-015 share needs, without
+    /// faking either end: the client under test still handshakes with the real
+    /// server over the real framed protocol.
+    ShareTap {
+        /// Socket path the client connects to (normally the server socket).
+        #[arg(long)]
+        listen: PathBuf,
+        /// The real server socket the tap relays to.
+        #[arg(long)]
+        upstream: PathBuf,
+        /// JSONL file every outbound `ClientMessage` is appended to.
+        #[arg(long)]
+        record: PathBuf,
+        /// Injection socket served for `share-inject`.
+        #[arg(long)]
+        control: PathBuf,
+    },
+    /// Send one JSON-encoded `ServerMessage` to a running `share-tap`, which
+    /// frames it to the client as if the server had sent it.
+    ShareInject {
+        /// Injection socket of the running tap.
+        #[arg(long)]
+        control: PathBuf,
+        /// JSON-encoded `ServerMessage` (serde-tagged by `type`).
+        message: String,
+    },
     /// Assert that a session exits with a specific exit code.
     AssertExit {
         /// Target session ID.
@@ -302,6 +332,18 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::AssertExit { session_id, code, timeout } => {
             assert::assert_exit(&session_id, code, timeout)
+        }
+        Command::ShareTap { listen, upstream, record, control } => {
+            let rt =
+                tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
+            rt.block_on(share_tap::run(&listen, &upstream, &record, &control))
+                .map_err(|e| TestError::InfraError(e.to_string()))
+        }
+        Command::ShareInject { control, message } => {
+            let rt =
+                tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
+            rt.block_on(share_tap::inject(&control, &message))
+                .map_err(|e| TestError::InfraError(e.to_string()))
         }
     }
 }

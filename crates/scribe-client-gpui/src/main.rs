@@ -42,6 +42,10 @@ use scribe_client_gpui::prompt_bar::{
     self, PromptBarColors, PromptBarData, PromptContextIndicator,
 };
 use scribe_client_gpui::restore_replay::round_positive_f32_to_u16;
+use scribe_client_gpui::share::{
+    ControlRequestPrompt, ShareChrome, ShareKey, ShareKeyOutcome, ShareOverlayColors, ShareState,
+    share_overlay,
+};
 use scribe_client_gpui::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
 use scribe_client_gpui::sys_stats::SystemStatsCollector;
 use scribe_client_gpui::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
@@ -184,6 +188,10 @@ struct Shared {
     /// Server-reported terminal chrome (CWD, git branch, session context, env
     /// health, workspace names) driving the status bar's metadata segments.
     chrome_metadata: Arc<Mutex<ChromeMetadata>>,
+    /// Feature-015 share state. The IPC reader folds the roster and the control
+    /// notices into it; the key path answers a pending request from it and the
+    /// render pass draws its overlays and presence badge.
+    share: Arc<Mutex<ShareChrome>>,
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -797,6 +805,12 @@ impl TerminalView {
     /// the key was consumed by an overlay (and must not reach the PTY).
     fn handle_overlay_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let mods = &event.keystroke.modifiers;
+        // Feature 015 (T020): a pending control request is a full-window modal —
+        // the holder (or the owner while control is unheld) answers it before
+        // anything else reaches a binding, an overlay, or the PTY.
+        if self.share_prompt_pending() && self.run_share_key(event, cx) {
+            return true;
+        }
         let overlay_free = self.dialog.is_none() && self.workspace_notes_modal.is_none();
 
         // Config-driven shortcuts are matched against the live bindings, which
@@ -966,11 +980,67 @@ impl TerminalView {
     /// Interim passthrough encoder: printable characters plus a handful of
     /// control keys. The full kitty/CSI-u encoder lands with the input-encoder
     /// port; this only proves the outbound [`IpcSink`] path end to end.
-    fn on_key_down(&self, event: &KeyDownEvent) {
+    ///
+    /// A live share viewer never reaches the encoder: its keystroke is consumed
+    /// by [`Self::run_share_key`], which raises the take-control affordance
+    /// instead of leaking a keystroke the server would drop anyway.
+    fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.run_share_key(event, cx) {
+            return;
+        }
         let Some(bytes) = encode_key(event) else {
             return;
         };
         self.send_key_bytes(bytes);
+    }
+
+    /// Whether a `ControlRequested` grant/deny prompt is currently modal.
+    fn share_prompt_pending(&self) -> bool {
+        self.shared.share.lock().is_ok_and(|share| share.has_prompt())
+    }
+
+    /// Run a keystroke through the feature-015 share surfaces, returning `true`
+    /// when they consumed it.
+    ///
+    /// The decision table itself lives in
+    /// [`ShareChrome::intercept_key`](scribe_client_gpui::share::ShareChrome::intercept_key);
+    /// this is the shell half that lowers the GPUI key, sends any resulting
+    /// `ControlClaim` / `ControlGrant` through the [`IpcSink`], and repaints.
+    fn run_share_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let key = match event.keystroke.key.as_str() {
+            "enter" => ShareKey::Enter,
+            "escape" => ShareKey::Escape,
+            _ => ShareKey::Other,
+        };
+        let Ok(outcome) = self.shared.share.lock().map(|mut share| share.intercept_key(key)) else {
+            return false;
+        };
+        match outcome {
+            ShareKeyOutcome::Passthrough => return false,
+            // Logged, not silent: a swallowed keystroke is invisible on the wire
+            // (nothing is sent) and near-invisible on screen, so this line is
+            // what the app-level test asserts suppression from.
+            ShareKeyOutcome::Suppressed => {
+                tracing::info!(key = %event.keystroke.key, "share surfaces swallowed a keystroke");
+            }
+            ShareKeyOutcome::Emit(intent) => {
+                if let Err(error) = self.sink.control_intent(intent) {
+                    tracing::warn!(%error, "dropped control intent: IPC writer closed");
+                } else {
+                    tracing::info!(?intent, "sent share control intent");
+                }
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// Clear an expired control hint so a stale banner never lingers on a window
+    /// that has stopped repainting for any other reason.
+    fn expire_share_hint(&mut self, cx: &mut Context<Self>) {
+        if self.shared.share.lock().is_ok_and(|mut share| share.expire_hint()) {
+            cx.notify();
+        }
     }
 
     /// Enqueue already-encoded bytes for the attached pane.
@@ -1081,6 +1151,10 @@ async fn drive_x11_focus_polls(view: WeakEntity<TerminalView>, app: &mut AsyncAp
 }
 
 /// Repaints the view whenever the IPC drain bumps the shared generation counter.
+///
+/// The same 16 ms tick is the idle-wake boundary the feature-015 control hint
+/// expires on: a hint set five seconds ago must clear even on a window whose
+/// output has gone quiet, which by definition never bumps the generation.
 async fn drive_redraws(
     view: WeakEntity<TerminalView>,
     app: &mut AsyncApp,
@@ -1091,6 +1165,9 @@ async fn drive_redraws(
         app.background_executor().timer(Duration::from_millis(16)).await;
         let current = generation.load(Ordering::Acquire);
         if current == rendered {
+            if view.update(app, TerminalView::expire_share_hint).is_err() {
+                return;
+            }
             continue;
         }
         rendered = current;
@@ -1140,7 +1217,7 @@ impl TerminalView {
                 env_status: session.and_then(|chrome| chrome.env_status.as_ref()),
                 session_count,
                 remote: RemoteStatusData { enabled: false, controllers: &[] },
-                share_presence: None,
+                share_presence: self.shared.share.lock().ok().and_then(|share| share.presence()),
                 // A remote shell's own host wins; a local pane keeps the
                 // placeholder until the hostname surface lands.
                 host_label: session.and_then(SessionChrome::host_label).unwrap_or("local"),
@@ -1214,6 +1291,14 @@ impl TerminalView {
         )
     }
 
+    /// Lower the live share state onto the overlay layer: the presence roster,
+    /// the transient control hint, and the modal grant/deny prompt.
+    fn build_share_overlay(&self) -> Option<gpui::AnyElement> {
+        let colors = ShareOverlayColors::from(&self.chrome);
+        let share = self.shared.share.lock().ok()?;
+        share_overlay(&share, &colors)
+    }
+
     /// Build the demo hover tooltip when the `tooltip_demo` toggle is on: a long
     /// URI anchored near the right edge, exercising both the head+tail truncation
     /// and the viewport clamp.
@@ -1265,6 +1350,7 @@ impl Render for TerminalView {
                 .into_any_element()
         });
         let tooltip = self.build_tooltip_demo();
+        let share = self.build_share_overlay();
 
         let opacity = self.opacity;
         let grid_colors = GridColors {
@@ -1294,7 +1380,7 @@ impl Render for TerminalView {
                 if view.handle_overlay_key(event, ctx) || view.handle_binding(event, ctx) {
                     return;
                 }
-                view.on_key_down(event);
+                view.on_key_down(event, ctx);
             }))
             .relative()
             .size_full()
@@ -1331,6 +1417,7 @@ impl Render for TerminalView {
             .children(self.context_menu.clone())
             .children(self.dialog.clone())
             .children(self.workspace_notes_modal.clone())
+            .children(share)
             .children(tooltip)
     }
 }
@@ -1375,6 +1462,7 @@ fn main() {
             load_config().unwrap_or_default().terminal.ai_session.ai_states,
         ))),
         chrome_metadata: Arc::new(Mutex::new(ChromeMetadata::new())),
+        share: Arc::new(Mutex::new(ShareChrome::new())),
     };
     let terminal_size = TerminalSize {
         cols: COLUMNS,
@@ -1532,6 +1620,7 @@ async fn run_connection(ctx: IpcThread) -> Result<(), String> {
             ai: ctx.shared.ai,
             chrome_metadata: ctx.shared.chrome_metadata,
             tabs: ctx.shared.tabs,
+            share: ctx.shared.share,
             out_tx: ctx.out_tx,
             in_tx: ctx.in_tx,
             sink: ctx.sink,
@@ -1679,6 +1768,8 @@ struct ReaderCtx {
     chrome_metadata: Arc<Mutex<ChromeMetadata>>,
     /// Ordered tab strip the reader rebuilds from server session traffic.
     tabs: Arc<Mutex<TabSessions>>,
+    /// Feature-015 share state the reader folds roster and control notices into.
+    share: Arc<Mutex<ShareChrome>>,
     out_tx: UnboundedSender<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
@@ -1707,6 +1798,20 @@ fn update_ai_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut AiChrome)) {
 fn update_chrome_metadata(ctx: &ReaderCtx, mutate: impl FnOnce(&mut ChromeMetadata)) {
     let Ok(mut guard) = ctx.chrome_metadata.lock() else {
         tracing::warn!("chrome metadata mutex poisoned; dropping update");
+        return;
+    };
+    mutate(&mut guard);
+    drop(guard);
+    ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Apply `mutate` to the shared feature-015 share chrome and request a repaint.
+///
+/// Like [`update_ai_chrome`], a poisoned mutex is dropped silently: losing a
+/// roster update must never tear down the reader and with it the pane's output.
+fn update_share_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut ShareChrome)) {
+    let Ok(mut guard) = ctx.share.lock() else {
+        tracing::warn!("share chrome mutex poisoned; dropping update");
         return;
     };
     mutate(&mut guard);
@@ -1884,10 +1989,17 @@ fn dispatch_server_message(
     attached: Option<SessionId>,
 ) -> Result<(), String> {
     match message {
-        ServerMessage::Welcome { window_id, .. } => {
-            // A takeover Hello's Welcome hands back the adopted window id.
+        ServerMessage::Welcome { window_id, participant_id, .. } => {
+            // A takeover Hello's Welcome hands back the adopted window id, and
+            // the additive v3 field names this connection's own share seat so a
+            // later roster matches it exactly instead of by device name.
             registry.adopt_window(window_id);
-            tracing::debug!(adopted = ?registry.adopted_window(), "welcome: adopted window");
+            update_share_chrome(ctx, |share| share.set_self_id(participant_id));
+            tracing::debug!(
+                adopted = ?registry.adopted_window(),
+                ?participant_id,
+                "welcome: adopted window"
+            );
         }
         ServerMessage::SessionList { sessions, workspaces, .. } => {
             registry.rebuild_from_session_list(&sessions);
@@ -1960,6 +2072,13 @@ fn dispatch_server_message(
         | ServerMessage::EnvStatus { .. }
         | ServerMessage::WorkspaceNamed { .. }) => on_chrome_message(ctx, chrome),
         ServerMessage::Error { message } => set_status(&ctx.status, &ctx.generation, message),
+        // Feature 015: the four share/control notices are routed as one group so
+        // this table stays a screen of routing decisions; the arm names each
+        // variant, so none of them can fall through to the drop counter.
+        share @ (ServerMessage::ShareRoster { .. }
+        | ServerMessage::ControlRequested { .. }
+        | ServerMessage::ControlDenied { .. }
+        | ServerMessage::ShareEnded { .. }) => dispatch_share_message(share, ctx),
         other => unhandled_server_message(&other),
     }
     Ok(())
@@ -2003,6 +2122,41 @@ fn on_chrome_message(ctx: &ReaderCtx, message: ServerMessage) {
         ServerMessage::WorkspaceNamed { workspace_id, name, .. } => {
             update_chrome_metadata(ctx, |store| store.name_workspace(workspace_id, name));
         }
+        // Unreachable: the caller only routes the chrome family here.
+        other => unhandled_server_message(&other),
+    }
+}
+
+/// Fold one feature-015 share notice into the shared [`ShareChrome`].
+///
+/// A `ShareRoster` replaces the mirrored roster (and tears the surfaces down
+/// once the share drains back to one participant); `ControlRequested` raises the
+/// modal grant/deny prompt; `ControlDenied` and `ShareEnded` leave a transient
+/// notice, the latter after clearing the share. Every arm repaints through
+/// [`update_share_chrome`].
+fn dispatch_share_message(message: ServerMessage, ctx: &ReaderCtx) {
+    match message {
+        ServerMessage::ShareRoster { window_id, participants, mode, holder } => {
+            tracing::info!(%window_id, count = participants.len(), ?mode, ?holder, "share roster");
+            update_share_chrome(ctx, |share| {
+                share.apply_roster(ShareState { window_id, participants, mode, holder });
+            });
+        }
+        ServerMessage::ControlRequested { window_id, from } => {
+            tracing::info!(%window_id, requester = from.participant_id, "control requested");
+            update_share_chrome(ctx, |share| {
+                share.request(ControlRequestPrompt::new(window_id, &from));
+            });
+        }
+        ServerMessage::ControlDenied { window_id } => {
+            tracing::info!(%window_id, "control request denied");
+            update_share_chrome(ctx, ShareChrome::deny);
+        }
+        ServerMessage::ShareEnded { window_id, reason } => {
+            tracing::info!(%window_id, ?reason, "share ended");
+            update_share_chrome(ctx, |share| share.end(reason));
+        }
+        // Unreachable: the caller only routes the four variants above here.
         other => unhandled_server_message(&other),
     }
 }

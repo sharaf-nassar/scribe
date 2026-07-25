@@ -6,10 +6,11 @@
 
 use scribe_common::config::SharingMode;
 use scribe_common::ids::WindowId;
-use scribe_common::protocol::{ClientMessage, ParticipantInfo};
+use scribe_common::protocol::{ClientMessage, ParticipantInfo, ShareEndReason};
 
 use super::{
-    ControlHint, ControlIntent, ControlRequestPrompt, HINT_DURATION, ShareState, participant_label,
+    ControlHint, ControlIntent, ControlRequestPrompt, HINT_DURATION, ShareChrome, ShareKey,
+    ShareKeyOutcome, ShareState, participant_label,
 };
 
 /// Build a non-local, non-holder participant. Roster-role flags are set by the
@@ -113,4 +114,115 @@ fn request_intent_lowers_to_control_request() {
     let window_id = WindowId::new();
     let intent = ControlIntent::Request { window_id };
     assert!(matches!(intent.into_message(), ClientMessage::ControlRequest { .. }));
+}
+
+// @lat: [[test#GPUI Client Headless Suites#GPUI window sharing#Roster drives the presence surfaces]]
+#[test]
+fn roster_drives_presence_and_drains_to_solo() {
+    let mut chrome = ShareChrome::new();
+    assert!(chrome.presence().is_none());
+
+    chrome.apply_roster(shared_state(Some(2)));
+    let presence = chrome.presence().expect("a multi-participant roster raises the badge");
+    assert_eq!(presence.participant_count, 2);
+    assert_eq!(presence.holder.as_deref(), Some("laptop (alex)"));
+
+    let rows = shared_state(Some(2)).roster_rows();
+    // The owner's own entry is already named "this machine" server-side, so the
+    // row does not repeat the marker; a differently named local entry gets it.
+    assert_eq!(rows[0].text(), "this machine");
+    assert_eq!(rows[1].text(), "laptop (alex) \u{00B7} has control");
+    let mut renamed = shared_state(Some(1));
+    renamed.participants[0].device_name = "desktop".to_owned();
+    assert_eq!(
+        renamed.roster_rows()[0].text(),
+        "desktop \u{00B7} this machine \u{00B7} has control"
+    );
+
+    // The share drained back to just the owner: no badge, no viewer affordances.
+    let mut solo = shared_state(Some(1));
+    solo.participants.truncate(1);
+    chrome.apply_roster(solo);
+    assert!(chrome.presence().is_none());
+    assert!(!chrome.is_viewer());
+}
+
+// @lat: [[test#GPUI Client Headless Suites#GPUI window sharing#Viewer keystrokes claim control]]
+#[test]
+fn viewer_keystroke_hints_then_claims_control() {
+    let state = shared_state(Some(2));
+    let window_id = state.window_id;
+    let mut chrome = ShareChrome::new();
+    chrome.apply_roster(state);
+    assert!(chrome.is_viewer());
+
+    // The first keystroke is swallowed and raises the take-control hint.
+    assert_eq!(chrome.intercept_key(ShareKey::Other), ShareKeyOutcome::Suppressed);
+    // Enter while the hint is up claims control on the wire.
+    assert_eq!(
+        chrome.intercept_key(ShareKey::Enter),
+        ShareKeyOutcome::Emit(ControlIntent::Claim { window_id })
+    );
+
+    // Once this machine holds control again, keys reach the terminal untouched.
+    chrome.apply_roster(shared_state(Some(1)));
+    assert!(!chrome.is_viewer());
+    assert_eq!(chrome.intercept_key(ShareKey::Other), ShareKeyOutcome::Passthrough);
+}
+
+// @lat: [[test#GPUI Client Headless Suites#GPUI window sharing#Prompt is modal until answered]]
+#[test]
+fn control_request_prompt_is_modal_until_answered() {
+    let state = shared_state(Some(1));
+    let window_id = state.window_id;
+    let mut chrome = ShareChrome::new();
+    chrome.apply_roster(state);
+
+    let requester = participant(2, "laptop", "alex");
+    chrome.request(ControlRequestPrompt::new(window_id, &requester));
+    assert!(chrome.has_prompt());
+    // Every other key is swallowed while the decision is open.
+    assert_eq!(chrome.intercept_key(ShareKey::Other), ShareKeyOutcome::Suppressed);
+    assert!(chrome.has_prompt());
+
+    let granted = ControlIntent::Grant { window_id, participant_id: 2, accept: true };
+    assert_eq!(chrome.intercept_key(ShareKey::Enter), ShareKeyOutcome::Emit(granted));
+    assert!(!chrome.has_prompt());
+
+    // Esc denies the next request instead.
+    chrome.request(ControlRequestPrompt::new(window_id, &requester));
+    let denied = ControlIntent::Grant { window_id, participant_id: 2, accept: false };
+    assert_eq!(chrome.intercept_key(ShareKey::Escape), ShareKeyOutcome::Emit(denied));
+}
+
+// @lat: [[test#GPUI Client Headless Suites#GPUI window sharing#Denied and ended notices]]
+#[test]
+fn denied_and_ended_leave_a_transient_notice() {
+    let mut chrome = ShareChrome::new();
+    chrome.apply_roster(shared_state(Some(2)));
+
+    chrome.deny();
+    assert!(chrome.presence().is_some(), "a denial leaves the share itself intact");
+
+    chrome.end(ShareEndReason::OwnerClosed);
+    assert!(chrome.presence().is_none());
+    assert!(!chrome.is_viewer());
+    assert!(!chrome.has_prompt());
+    // The notice is transient, not sticky, but has not aged out yet.
+    assert!(!chrome.expire_hint());
+}
+
+// @lat: [[test#GPUI Client Headless Suites#GPUI window sharing#Self id resolves the local seat]]
+#[test]
+fn welcome_participant_id_resolves_the_local_seat() {
+    // The roster marks participant 1 as the owner's `is_local` entry, but this
+    // connection is seated as participant 2 — the id from `Welcome` wins, so the
+    // client reads itself as the holder rather than as a viewer.
+    let mut chrome = ShareChrome::new();
+    chrome.set_self_id(Some(2));
+    chrome.apply_roster(shared_state(Some(2)));
+    assert!(!chrome.is_viewer());
+
+    chrome.apply_roster(shared_state(Some(1)));
+    assert!(chrome.is_viewer());
 }

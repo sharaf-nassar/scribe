@@ -115,11 +115,11 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `RemoveTrustedNetwork` | Remote settings trusted-network removal action | scripted-E2E | — (unwired, FU-18) — `request_remove_trusted_network` has no caller | required |
 | `GetLanEnv` | Remote settings LAN listener/environment summary | scripted-E2E | — (unwired, FU-17) — `settings/server_action.rs::request_lan_env` has no caller | required |
 | `GetLanDialIdentity` | local-server identity fetch before mTLS dialing | scripted-E2E | — (missing, FU-17) | required |
-| `ControlClaim` | viewer claim/request affordance for a shared window | scripted-E2E | — (unwired, FU-19) — `share.rs` outside the import closure | required |
-| `ControlRequest` | v3 compatibility alias; the client emits `ControlClaim` | golden | — (unwired, FU-19) — not emitting it is by design, but its live substitute `ControlClaim` is itself unwired | required |
-| `ControlGrant` | holder grant/deny prompt for a control request | scripted-E2E | — (unwired, FU-19) — `share.rs` outside the import closure | required |
+| `ControlClaim` | viewer claim/request affordance for a shared window | scripted-E2E | `main.rs::TerminalView::run_share_key` → `share.rs::ShareChrome::intercept_key` → `ipc_bridge.rs::IpcSink::control_intent` | required |
+| `ControlRequest` | v3 compatibility alias; the client emits `ControlClaim` | golden | not emitted by design; its live substitute `ControlClaim` is wired through `ipc_bridge.rs::IpcSink::control_intent` | required |
+| `ControlGrant` | holder grant/deny prompt for a control request | scripted-E2E | `main.rs::TerminalView::handle_overlay_key` → `share.rs::ShareChrome::intercept_key` → `ipc_bridge.rs::IpcSink::control_intent` | required |
 
-**Reachability:** 13 of 46 rows name a live-path symbol; 17 are unwired and 16
+**Reachability:** 16 of 46 rows name a live-path symbol; 14 are unwired and 16
 are missing.
 
 ## Server messages (59 handled)
@@ -194,12 +194,12 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `TrustedNetworkList` | Remote settings trusted-network rows | scripted-E2E | — (unwired, FU-18) — parsed but its request function has no caller | required |
 | `LanEnv` | Remote settings LAN listener/environment summary | scripted-E2E | — (unwired, FU-17) — parsed but its request function has no caller | required |
 | `LanDialIdentity` | client mTLS identity returned by the local server | scripted-E2E | — (missing, FU-17) | required |
-| `ShareRoster` | presence badge and live-viewer role/claim state | visual-E2E | — (unwired, FU-19) — handled in `share.rs`, outside the import closure | required |
-| `ControlRequested` | holder or owner grant/deny control prompt | visual-E2E | — (unwired, FU-19) — handled in `share.rs`, outside the import closure | required |
-| `ControlDenied` | requester control-denied notice | visual-E2E | — (missing, FU-19) | required |
-| `ShareEnded` | shared-viewer end landing and state cleanup | visual-E2E | — (missing, FU-19) | required |
+| `ShareRoster` | presence badge and live-viewer role/claim state | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::apply_roster` | required |
+| `ControlRequested` | holder or owner grant/deny control prompt | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::request` | required |
+| `ControlDenied` | requester control-denied notice | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::deny` | required |
+| `ShareEnded` | shared-viewer end landing and state cleanup | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::end` | required |
 
-**Reachability:** 14 of 59 rows name a live-path symbol; 13 are unwired and 32
+**Reachability:** 18 of 59 rows name a live-path symbol; 11 are unwired and 30
 are missing.
 
 ## Input and keybinding checklist (54 named actions)
@@ -373,6 +373,8 @@ server handles it as `ControlClaim`; the client deliberately emits only the
 latter.
 
 That describes the *legacy* client's dispatch, which is what these rows were
-written against. In the GPUI client the entire 013/014/015 surface is
-unreachable: every LAN, remote, and sharing row above is unwired or missing
-(FU-16 through FU-19).
+written against. In the GPUI client the LAN and remote surface is still
+unreachable (FU-16 through FU-18). The 015 sharing rows are no longer: FU-19
+put `share.rs` on the live path, so the roster, the control notices, and the
+claim/grant frames are wired end to end and verified against the running app by
+`tests/e2e/visual/share-control.sh`.

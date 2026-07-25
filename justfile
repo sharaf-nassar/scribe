@@ -119,6 +119,10 @@ e2e-func script:
 e2e-visual script:
     docker run --rm --gpus all -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/{{script}}
 
+# Run the feature-015 sharing/control E2E through the wire tap
+e2e-visual-share:
+    docker run --rm --gpus all -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/share-control.sh
+
 # Full functional E2E suite: build, containerise, run all tests
 e2e: build-release docker-func
     just e2e-func func/smoke.sh

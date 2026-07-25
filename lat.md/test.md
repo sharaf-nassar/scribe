@@ -214,6 +214,16 @@ The probe keystroke is Ctrl+Shift+U, the client-local tooltip-demo toggle, so th
 
 The crop excludes the status bar deliberately — its sparklines resample every two seconds, so a whole-window comparison could never assert pixel identity.
 
+### Window sharing and control handoff
+
+`tests/e2e/visual/share-control.sh` is the app-level oracle for the feature-015 share rows: it drives the real client against the real server and asserts both the pixels and the wire.
+
+Multi-machine sharing needs a second machine, so the run interposes [[crates/scribe-test/src/share_tap.rs#run]] (`scribe-test share-tap`, enabled with `SCRIBE_SHARE_TAP=1`) between the client and `scribe-server`: the entrypoint renames the real socket to `server-upstream.sock` and the tap binds the original path, so the client's `Hello` handshake, its `SessionList`, and every byte of pane output still come from the real server over the real framed protocol. The tap records every frame in both directions to `/output/share-wire.jsonl` and injects the four notices a remote participant would have caused via [[crates/scribe-test/src/share_tap.rs#inject]] (`scribe-test share-inject`). The daemon connects before the tap is interposed, so the client under test is the tap's newest connection and therefore the injection target.
+
+The script walks the surface in five phases, screenshotting each: a `ShareRoster` raises the roster panel and the presence badge; a `ControlRequested` opens the modal prompt, swallows an ordinary keystroke, and Esc puts `ControlGrant { accept: false }` on the wire; a roster handing control to the remote peer makes the client a viewer, whose keystroke is swallowed and raises the take-control hint from which Enter puts `ControlClaim` on the wire; `ControlDenied` posts its notice; and `ShareEnded` tears the surfaces down. The wire assertions read the recorded JSONL, so they prove the client emitted the frames rather than that a test constructed them.
+
+Keystroke *suppression* is asserted from the client log rather than from an absent `KeyInput`: the GPUI client cannot create its own first session yet (`CreateWorkspace` is missing, FU-6), so its window holds no PTY in this rig and would emit no `KeyInput` either way. `run_share_key` logs every swallowed key for exactly that reason, and the absent-`KeyInput` check is kept alongside it as a regression guard.
+
 ## GPUI IPC Bridge
 
 Unit tests for the GPUI client's [[client#GPUI Client Spike#IPC Bridge]] — the inbound coalescing drain and the outbound [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink]] — proving keystroke-before-output ordering and Zed-style 4 ms / 100-event coalescing over the frozen IPC protocol.
@@ -792,6 +802,28 @@ The suite asserts Decline is the initial focus (so an unexpected prompt never si
 Confirms the ported feature-015 sharing surfaces — [[crates/scribe-client-gpui/src/share.rs#ShareState]] and the control overlays from the winit [[crates/scribe-client/src/share_view.rs#ShareState]] — derive roster roles correctly and lower control passing onto the frozen v3 protocol.
 
 The suite checks roster-derived multi/holder/label state and [[crates/scribe-client-gpui/src/share.rs#participant_label]] formatting, the [[crates/scribe-client-gpui/src/share.rs#ControlHint]] expiry window, and that a viewer's take-control and a [[crates/scribe-client-gpui/src/share.rs#ControlRequestPrompt]] answer lower through [[crates/scribe-client-gpui/src/share.rs#ControlIntent]] to `ControlClaim` / `ControlRequest` / `ControlGrant` [[crates/scribe-common/src/protocol.rs#ClientMessage]] messages.
+
+The live-path aggregate [[crates/scribe-client-gpui/src/share.rs#ShareChrome]] is covered below. Its user-visible half — that the running client actually renders and sends any of this — is proven separately by [[test#Visual E2E Tests#Window sharing and control handoff]], not here.
+
+#### Roster drives the presence surfaces
+
+A multi-participant `ShareRoster` raises the status-bar presence badge and the roster rows (holder marked, local machine named); a roster that drains back to one participant tears the badge and the viewer affordances down again.
+
+#### Viewer keystrokes claim control
+
+A viewer's first keystroke is swallowed and raises the take-control hint; pressing Enter while that hint is up emits `ControlClaim`. Once the roster returns control to this machine, keys pass straight through to the terminal.
+
+#### Prompt is modal until answered
+
+While a `ControlRequested` prompt is pending every other key is swallowed, so no keystroke leaks to the PTY mid-decision; Enter emits `ControlGrant { accept: true }` and Esc emits `ControlGrant { accept: false }`, each clearing the prompt.
+
+#### Denied and ended notices
+
+`ControlDenied` leaves the share intact and only posts a transient notice, while `ShareEnded` clears the roster, any pending prompt, and the viewer state, leaving the reason notice behind.
+
+#### Self id resolves the local seat
+
+The `participant_id` carried by `Welcome` wins over the roster's `is_local` flag when resolving which seat is this connection, so a client seated as a non-local participant still reads its own holder state correctly.
 
 ## GPUI Pane Dividers
 
