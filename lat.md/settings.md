@@ -190,11 +190,27 @@ The webview delivery is gone; its feature set lives in [[crates/scribe-client-gp
 
 ### Page model
 
-The ten settings pages are described in [[crates/scribe-client-gpui/src/settings/model.rs#page_controls]]: each owns an ordered control list keyed by the dotted config key the apply path understands.
+The eleven settings pages are described in [[crates/scribe-client-gpui/src/settings/model.rs#page_controls]]: each owns an ordered control list keyed by the dotted config key the apply path understands.
 
-The pages are appearance, colors, AI, terminal, keybindings, workspaces, updates, releases, notifications, and remote.
+The pages are appearance, colors, AI, terminal, environment, keybindings, workspaces, updates, releases, notifications, and remote. The first ten mirror the old `settings.html` nav; environment splits the env-persistence opt-in out of terminal because enabling it needs a live server round-trip rather than a plain config write.
 
 [[crates/scribe-client-gpui/src/settings/window.rs#SettingsWindow]] renders that model generically — toggles flip, choices cycle, and numeric steppers increment through [[crates/scribe-client-gpui/src/settings/apply.rs#apply_settings_change]], committing immediately like the old live-apply webview. Current values are read back by [[crates/scribe-client-gpui/src/settings/values.rs#current_value]]. Color and free-text controls render their current value read-only, and keybinding rows list every action's combos via [[crates/scribe-client-gpui/src/settings/values.rs#keybinding_combos]]; inline hex/text/path entry is a tracked follow-on.
+
+Action controls route through [[crates/scribe-client-gpui/src/settings/window.rs#SettingsWindow#run_action]], which is the single live entry point into [[crates/scribe-client-gpui/src/settings/server_action.rs]] — the update check, the release list, the keystore preflight, and the whole LAN trust surface below.
+
+### Environment preflight
+
+The environment page pairs the `terminal.env_persistence.enabled` toggle with a manual "Check keystore availability" action; both reach [[crates/scribe-client-gpui/src/settings/server_action.rs#request_env_preflight]].
+
+Turning the toggle ON is gated: [[crates/scribe-client-gpui/src/settings/window.rs#SettingsWindow#enable_env_persistence]] sends `EnvPreflight` first and commits the config edit only when the server answers `ok`, matching the webview-era rule that persistence is never enabled behind an unreachable keystore ([[server#Env Persistence]]). A failing probe leaves the config untouched and renders the structured `PreflightError` as plain language; turning the toggle OFF is an ungated plain write. The standalone action re-runs the same probe without touching the setting, so a locked keychain can be diagnosed and retried in place.
+
+### Local network trust
+
+The remote page leads with a runtime "Local network" section — the GPUI port of the webview's `setLanEnv` / `setTrustedNetworks` / `setTrustedDevices` bridges described in [[settings#Config Application#Local Network Keys]].
+
+[[crates/scribe-client-gpui/src/settings/window.rs#SettingsWindow#refresh_trust]] resolves the whole section in one pass: [[crates/scribe-client-gpui/src/settings/server_action.rs#request_lan_env]] for this machine's own fingerprint and whether the current network is addable, [[crates/scribe-client-gpui/src/settings/server_action.rs#request_trusted_networks]] for the list plus the current-network trust flag (UX-004), and [[crates/scribe-client-gpui/src/settings/server_action.rs#request_trusted_devices]] for the approved-device list. It runs on the first visit to the page (the analog of the webview's load-time injection) and on the section's Refresh action.
+
+The section's mutations are the three fire-and-forget frames, each followed by a refresh so the lists re-render from the server rather than from a local guess: [[crates/scribe-client-gpui/src/settings/server_action.rs#request_add_current_network]] behind "Trust it", [[crates/scribe-client-gpui/src/settings/server_action.rs#request_remove_trusted_network]] behind each network row's Remove, and [[crates/scribe-client-gpui/src/settings/server_action.rs#request_revoke_trusted_device]] behind each device row's Revoke. Per-row buttons carry their record key in the action id (`action.remove_trusted_network:<id>`, `action.revoke_trusted_device:<hex>`) so they still route through the single `run_action` entry point. Because the section renders server replies rather than config keys it is built in the window, not listed in `page_controls`, and it is rendered above the page's config controls so the lists stay above the fold.
 
 ### Singleton and launch
 

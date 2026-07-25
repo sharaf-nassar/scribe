@@ -136,6 +136,12 @@ e2e-visual-share:
 e2e-visual-session-tooling:
     docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/session-tooling.sh
 
+# Run the feature-014 settings trust/preflight E2E. Drives the real settings
+# window (`--settings`) against the real server through the wire tap, with one
+# trusted network and one approved device seeded into the server's stores.
+e2e-visual-settings-trust:
+    docker run --rm --gpus all -e SCRIBE_VISUAL_APP=settings -e SCRIBE_SHARE_TAP=1 -e SCRIBE_SEED_TRUST=1 -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/settings-trust.sh
+
 # Run the update-surface visual E2E pair. The server polls a fake releases API
 # inside the container, so it needs a longer budget than the default 60 s.
 e2e-visual-update:

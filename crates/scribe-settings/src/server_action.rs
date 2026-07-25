@@ -129,7 +129,7 @@ fn parse_release_list_response(msg: ServerMessage) -> Result<ReleaseListResultSt
 /// Result of an env-persistence preflight request. `Ok` means the server's
 /// keystore probe succeeded; `Err(PreflightError)` is the structured reason
 /// the toggle should refuse to commit. Transport / protocol errors map to
-/// `Err(PreflightError::Unknown(reason))` so the UI always renders a single
+/// `Err(PreflightError::Unknown { reason })` so the UI always renders a single
 /// shape — same pattern as `UpdateCheckResultState::Failed` and
 /// `ReleaseListResultState::Failed`.
 #[derive(Debug, Clone)]
@@ -141,7 +141,7 @@ pub enum EnvPreflightOutcome {
 /// Send `EnvPreflight` to the server and wait for the matching response.
 ///
 /// Any transport or protocol error becomes
-/// `EnvPreflightOutcome::Err(PreflightError::Unknown(reason))` so the UI
+/// `EnvPreflightOutcome::Err(PreflightError::Unknown { reason })` so the UI
 /// always has a single shape to render. A fresh connection is opened per call
 /// so this never reuses sockets from other server actions.
 pub fn request_env_preflight(timeout: Duration) -> EnvPreflightOutcome {
@@ -149,7 +149,7 @@ pub fn request_env_preflight(timeout: Duration) -> EnvPreflightOutcome {
         Ok(outcome) => outcome,
         Err(reason) => {
             tracing::warn!("env preflight transport error: {reason}");
-            EnvPreflightOutcome::Err(PreflightError::Unknown(reason))
+            EnvPreflightOutcome::Err(PreflightError::Unknown { reason })
         }
     }
 }
@@ -170,7 +170,7 @@ fn try_request_env_preflight(timeout: Duration) -> Result<EnvPreflightOutcome, S
 /// expected by the env-preflight code path. Anything other than
 /// `EnvPreflightResult { .. }` — including the wrong-variant case the server
 /// should never produce — is surfaced as an `Err` so the public entry point
-/// can fold it into `EnvPreflightOutcome::Err(PreflightError::Unknown(_))`.
+/// can fold it into `EnvPreflightOutcome::Err(PreflightError::Unknown { .. })`.
 fn parse_env_preflight_response(msg: ServerMessage) -> Result<EnvPreflightOutcome, String> {
     match msg {
         ServerMessage::EnvPreflightResult { ok: true, error: _ } => Ok(EnvPreflightOutcome::Ok),
@@ -178,9 +178,9 @@ fn parse_env_preflight_response(msg: ServerMessage) -> Result<EnvPreflightOutcom
             Ok(EnvPreflightOutcome::Err(e))
         }
         ServerMessage::EnvPreflightResult { ok: false, error: None } => {
-            Ok(EnvPreflightOutcome::Err(PreflightError::Unknown(String::from(
-                "server reported failure with no reason",
-            ))))
+            Ok(EnvPreflightOutcome::Err(PreflightError::Unknown {
+                reason: String::from("server reported failure with no reason"),
+            }))
         }
         other => Err(format!("unexpected server response: {other:?}")),
     }
@@ -504,7 +504,7 @@ mod tests {
 
     /// A non-`EnvPreflightResult` server response must surface as a non-empty
     /// `Err` so the public entry point can fold it into
-    /// `EnvPreflightOutcome::Err(PreflightError::Unknown(reason))`.
+    /// `EnvPreflightOutcome::Err(PreflightError::Unknown { reason })`.
     ///
     /// This is the parser-side proxy for the transport-failure mapping:
     /// `request_env_preflight` cannot panic on an unexpected variant, and we
@@ -524,16 +524,16 @@ mod tests {
         );
 
         // The public entry point folds the same `Err` into an
-        // `Err(PreflightError::Unknown(reason))` with a non-empty reason —
+        // `Err(PreflightError::Unknown { reason })` with a non-empty reason —
         // verifying the contract end-to-end without touching the global socket.
         let mapped = match parse_env_preflight_response(ServerMessage::UpdateCheckResult {
             state: UpdateCheckResultState::NoUpdate,
         }) {
             Ok(outcome) => outcome,
-            Err(reason) => EnvPreflightOutcome::Err(PreflightError::Unknown(reason)),
+            Err(reason) => EnvPreflightOutcome::Err(PreflightError::Unknown { reason }),
         };
         match mapped {
-            EnvPreflightOutcome::Err(PreflightError::Unknown(reason)) => {
+            EnvPreflightOutcome::Err(PreflightError::Unknown { reason }) => {
                 assert!(!reason.is_empty(), "Unknown reason must not be empty");
             }
             unexpected => panic!("expected Err(Unknown), got {unexpected:?}"),

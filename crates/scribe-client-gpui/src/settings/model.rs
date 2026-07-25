@@ -10,13 +10,17 @@
 //! namespace is represented, so the port stays 1:1 with the deleted surface
 //! without hand-transcribing 3000 lines of HTML.
 
-/// The ten settings pages, in the nav order the old `settings.html` used.
+/// The eleven settings pages, in nav order. The first ten are the pages the old
+/// `settings.html` used; `Environment` splits the env-persistence surface out of
+/// the Terminal page because enabling it is gated on a live server round-trip
+/// (`EnvPreflight`) rather than a plain config write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsPage {
     Appearance,
     Colors,
     Ai,
     Terminal,
+    Environment,
     Keybindings,
     Workspaces,
     Updates,
@@ -28,12 +32,13 @@ pub enum SettingsPage {
 impl SettingsPage {
     /// Every page, in nav order.
     #[must_use]
-    pub fn all() -> [SettingsPage; 10] {
+    pub fn all() -> [SettingsPage; 11] {
         [
             SettingsPage::Appearance,
             SettingsPage::Colors,
             SettingsPage::Ai,
             SettingsPage::Terminal,
+            SettingsPage::Environment,
             SettingsPage::Keybindings,
             SettingsPage::Workspaces,
             SettingsPage::Updates,
@@ -51,6 +56,7 @@ impl SettingsPage {
             SettingsPage::Colors => "Colors",
             SettingsPage::Ai => "AI",
             SettingsPage::Terminal => "Terminal",
+            SettingsPage::Environment => "Environment",
             SettingsPage::Keybindings => "Keybindings",
             SettingsPage::Workspaces => "Workspaces",
             SettingsPage::Updates => "Updates",
@@ -60,6 +66,31 @@ impl SettingsPage {
         }
     }
 }
+
+/// Config key of the env-persistence toggle, whose ON transition is gated on an
+/// `EnvPreflight` round-trip in [`crate::settings::window::SettingsWindow`].
+pub const ENV_PERSISTENCE_KEY: &str = "terminal.env_persistence.enabled";
+
+/// Action key: re-probe the OS keystore without changing the toggle.
+pub const ENV_PREFLIGHT_ACTION: &str = "action.env_preflight";
+
+/// Action key: re-read the LAN trust state (`GetLanEnv`, `ListTrustedNetworks`,
+/// `ListTrustedDevices`) from the local server. Rendered by the window inside
+/// the Remote page's runtime "Local network" section rather than listed in
+/// [`page_controls`], because the whole section is server state, not config.
+pub const REFRESH_TRUST_ACTION: &str = "action.refresh_trust";
+
+/// Action key: `AddCurrentNetworkTrusted`. Rendered alongside
+/// [`REFRESH_TRUST_ACTION`] in the Remote page's runtime section.
+pub const ADD_CURRENT_NETWORK_ACTION: &str = "action.add_current_network";
+
+/// Action-key prefix for a per-row `RemoveTrustedNetwork`; the trusted-network
+/// record id is appended after the colon.
+pub const REMOVE_TRUSTED_NETWORK_PREFIX: &str = "action.remove_trusted_network:";
+
+/// Action-key prefix for a per-row `RevokeTrustedDevice`; the device's lowercase
+/// hex `device_id` is appended after the colon.
+pub const REVOKE_TRUSTED_DEVICE_PREFIX: &str = "action.revoke_trusted_device:";
 
 /// How a [`Control`] is edited. Interactive kinds map to a concrete gesture the
 /// GPUI window wires to [`crate::settings::apply::apply_settings_change`];
@@ -211,6 +242,7 @@ pub fn page_controls(page: SettingsPage) -> Vec<Control> {
         SettingsPage::Colors => colors_controls(),
         SettingsPage::Ai => ai_controls(),
         SettingsPage::Terminal => terminal_controls(),
+        SettingsPage::Environment => environment_controls(),
         SettingsPage::Keybindings => keybinding_controls(),
         SettingsPage::Workspaces => workspace_controls(),
         SettingsPage::Updates => update_controls(),
@@ -334,7 +366,6 @@ fn terminal_controls() -> Vec<Control> {
         toggle("terminal.natural_scroll", "Natural scroll"),
         toggle("terminal.keyboard_protocol_enhanced", "Enhanced keyboard protocol"),
         toggle("terminal.paste_confirmation", "Paste confirmation"),
-        toggle("terminal.env_persistence.enabled", "Persist environment"),
         choice(
             "terminal.clipboard.read_mode",
             "Clipboard read (OSC 52)",
@@ -356,6 +387,18 @@ fn terminal_controls() -> Vec<Control> {
         toggle("terminal.status_bar_stats.gpu", "Status bar: GPU"),
         toggle("terminal.status_bar_stats.network", "Status bar: network"),
         action("terminal.smart_selection.reset", "Reset smart selection rules"),
+    ]
+}
+
+/// The Environment page: the env-persistence opt-in plus the manual keystore
+/// probe. Both reach `ClientMessage::EnvPreflight` — the toggle gates its ON
+/// transition on a passing probe (the server's keystore round-trip), and the
+/// action re-runs the probe on its own so a user can diagnose a locked keychain
+/// without flipping the setting.
+fn environment_controls() -> Vec<Control> {
+    vec![
+        toggle(ENV_PERSISTENCE_KEY, "Persist environment"),
+        action(ENV_PREFLIGHT_ACTION, "Check keystore availability"),
     ]
 }
 

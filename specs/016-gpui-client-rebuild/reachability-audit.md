@@ -113,7 +113,7 @@ Determination techniques, in order of authority:
 | `DispatchAction` | scripted-E2E | MISSING | not in the GPUI client; `scribe-cli` is the only sender |
 | `FocusChanged` | scripted-E2E | MISSING | never constructed; the client never reports focus |
 | `HookEvent` | scripted-E2E | WIRED | out-of-client by design: `crates/scribe-hook-helper/src/main.rs:119` |
-| `EnvPreflight` | scripted-E2E | UNWIRED | `settings/server_action.rs:147` `request_env_preflight` has no caller |
+| `EnvPreflight` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.env_preflight`) and the gated `enable_env_persistence` ON transition; same `--settings`-only caveat. Asserted on the wire by `tests/e2e/visual/settings-trust.sh` |
 | `ClipboardPromptResponse` | scripted-E2E | UNWIRED | built in `clipboard.rs`; module not imported by `main.rs` |
 | `ClipboardBridgeReadReply` | scripted-E2E | UNWIRED | built in `clipboard.rs`; module not imported by `main.rs` |
 | `RemoteHandshake` | scripted-E2E | UNWIRED | built in `remote_handshake.rs`; module not imported by `main.rs` |
@@ -122,12 +122,12 @@ Determination techniques, in order of authority:
 | `LanHello` | scripted-E2E | MISSING | never constructed anywhere in the crate |
 | `LanApprovalDecision` | scripted-E2E | UNWIRED | built in `lan_approval.rs`; module not imported by `main.rs` |
 | `ListLanPeers` | scripted-E2E | MISSING | never constructed anywhere in the crate |
-| `ListTrustedDevices` | gpui-test | UNWIRED | `settings/server_action.rs:373` `request_trusted_devices` has no caller |
-| `RevokeTrustedDevice` | scripted-E2E | UNWIRED | `settings/server_action.rs:442` has no caller |
-| `ListTrustedNetworks` | gpui-test | UNWIRED | `settings/server_action.rs:339` has no caller |
-| `AddCurrentNetworkTrusted` | scripted-E2E | UNWIRED | `settings/server_action.rs:416` has no caller |
-| `RemoveTrustedNetwork` | scripted-E2E | UNWIRED | `settings/server_action.rs:429` has no caller |
-| `GetLanEnv` | gpui-test | UNWIRED | `settings/server_action.rs:280` `request_lan_env` has no caller |
+| `ListTrustedDevices` | scripted-E2E | WIRED | `settings/window.rs` `refresh_trust`, reached from `run_action` (`action.refresh_trust`) and the first visit to the Remote page; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `RevokeTrustedDevice` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.revoke_trusted_device:<hex>` from each approved-device row); same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `ListTrustedNetworks` | scripted-E2E | WIRED | `settings/window.rs` `refresh_trust`, same callers as `ListTrustedDevices`; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `AddCurrentNetworkTrusted` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.add_current_network`); same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `RemoveTrustedNetwork` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.remove_trusted_network:<id>` from each trusted-network row); same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `GetLanEnv` | scripted-E2E | WIRED | `settings/window.rs` `refresh_trust`, alongside the two trust list queries; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
 | `GetLanDialIdentity` | scripted-E2E | MISSING | never constructed anywhere in the crate |
 | `ControlClaim` | scripted-E2E | UNWIRED | built in `share.rs`; module not imported by `main.rs` |
 | `ControlRequest` | golden | UNWIRED | built in `share.rs`, unimported. Not emitting it is by design, but its live substitute `ControlClaim` is itself UNWIRED, so the sharing surface is unreachable either way |
@@ -183,7 +183,7 @@ Everything else is silently discarded on the wire.
 | `PromptMark` | gpui-test | MISSING | no reference. `session_lifecycle` tracks trim offsets but no marks are ever ingested |
 | `TrimScrollback` | golden | WIRED | `run_reader` arm → `SessionRegistry::on_trim_scrollback` |
 | `ScrollBottom` | gpui-test | MISSING | no `ServerMessage::ScrollBottom` reference (the `keybindings.rs` hit is `LayoutAction::ScrollBottom`) |
-| `EnvPreflightResult` | gpui-test | UNWIRED | parsed at `settings/server_action.rs:176` but its request function has no caller |
+| `EnvPreflightResult` | scripted-E2E | WIRED | parsed by `parse_env_preflight_response` and rendered into the Environment page's status line; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
 | `EnvStatus` | visual-E2E | MISSING | no reference; `StatusBarData.env_status` hardcoded `None` |
 | `ClipboardPromptRequest` | visual-E2E | MISSING | no reference. The `ClipboardDialog` demo is built from literals at `main.rs:721` |
 | `ClipboardBridgeWrite` | scripted-E2E | UNWIRED | handled in `clipboard.rs`; module not imported by `main.rs` |
@@ -197,9 +197,9 @@ Everything else is silently discarded on the wire.
 | `LanApprovalResult` | visual-E2E | MISSING | no reference in the crate |
 | `LanApprovalRequest` | visual-E2E | UNWIRED | handled in `lan_approval.rs`; module not imported by `main.rs` |
 | `LanPeerList` | visual-E2E | MISSING | no reference in the crate |
-| `TrustedDeviceList` | gpui-test | UNWIRED | parsed at `settings/server_action.rs:404`; request function has no caller |
-| `TrustedNetworkList` | gpui-test | UNWIRED | parsed at `settings/server_action.rs:366`; request function has no caller |
-| `LanEnv` | gpui-test | UNWIRED | parsed at `settings/server_action.rs:307`; request function has no caller |
+| `TrustedDeviceList` | scripted-E2E | WIRED | parsed by `parse_trusted_devices_response` and rendered as the Remote page's approved-device rows; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `TrustedNetworkList` | scripted-E2E | WIRED | parsed by `parse_trusted_networks_response` and rendered as the Remote page's trusted-network rows; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `LanEnv` | scripted-E2E | WIRED | parsed by `parse_lan_env_response` and rendered as the Remote page's own-fingerprint / addability notes; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
 | `LanDialIdentity` | scripted-E2E | MISSING | no reference in the crate |
 | `ShareRoster` | visual-E2E | UNWIRED | handled in `share.rs`; module not imported by `main.rs` |
 | `ControlRequested` | visual-E2E | UNWIRED | handled in `share.rs`; module not imported by `main.rs` |
@@ -437,9 +437,17 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
 - **FU-18 Trusted devices and networks in the settings window.** Rows:
   `ListTrustedDevices`, `RevokeTrustedDevice`, `ListTrustedNetworks`,
   `AddCurrentNetworkTrusted`, `RemoveTrustedNetwork`, `TrustedDeviceList`,
-  `TrustedNetworkList`, `EnvPreflight`, `EnvPreflightResult`. All the transport
-  helpers exist in `settings/server_action.rs`; only the Remote/Environment
-  settings pages need controls that call them.
+  `TrustedNetworkList`, `EnvPreflight`, `EnvPreflightResult`. **Landed.** The
+  Remote page now leads with a runtime "Local network" section and a new
+  Environment page owns the env-persistence opt-in; every one of those transport
+  helpers is reached from `settings/window.rs::run_action`, the same live path
+  that already served `CheckForUpdates` / `ListReleases`. `GetLanEnv` / `LanEnv`
+  came along with the section, so FU-17 is down to the dial/approval rows.
+  Wiring the path also surfaced a latent protocol defect: `PreflightError`'s
+  `Unknown` variant was a newtype under `#[serde(tag = "type")]`, which msgpack
+  cannot encode, so every failing `EnvPreflightResult` was dropped before it
+  left the server. It is now a struct variant. Verified on the wire and on
+  screen by `tests/e2e/visual/settings-trust.sh`.
 - **FU-19 Sharing and control.** Rows: `ControlClaim`, `ControlRequest`,
   `ControlGrant`, `ShareRoster`, `ControlRequested`, `ControlDenied`,
   `ShareEnded`. **Landed.** `share.rs` is now imported by `main.rs` and
@@ -475,6 +483,7 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
 | .58 (pane/workspace) | 8 pane-layout actions, 6 workspace-layout actions (not the 4 workspace IPC rows) |
 | .59 (vi/smart-selection/split-scroll) | `scroll_up/down/top/bottom`; selection groundwork for `copy` |
 | .61 (close_tab/new_window) | `close_tab`, `new_window` |
+| .77 (FU-18 settings trust) | the nine FU-18 rows plus `GetLanEnv` / `LanEnv` |
 
 Everything else in the fix units above is currently unfiled.
 
@@ -518,7 +527,9 @@ the app constructs the entity:
 - **To `scripted-E2E`** (a real client + real server, asserting on the wire):
   `CreateWorkspace`, `MoveSession`, `ReportWorkspaceTree`, `SearchRequest`,
   `WorkspaceNotesGet`, `WorkspaceNotesMutate`, `GetRemoteEnv`,
-  `ListTrustedDevices`, `ListTrustedNetworks`, `GetLanEnv`, `DismissUpdate`;
+  `ListTrustedDevices`, `ListTrustedNetworks`, `GetLanEnv`, `DismissUpdate`
+  (the three trust queries have since been moved and are covered by
+  `tests/e2e/visual/settings-trust.sh`);
   and inbound `CwdChanged`, `SessionContextChanged`, `WorkspaceInfo`,
   `WorkspaceNotesSnapshot`, `WorkspaceNotesChanged`, `SearchResults`,
   `EnvPreflightResult`, `PromptMark`, `ScrollBottom`, `TrustedDeviceList`,
