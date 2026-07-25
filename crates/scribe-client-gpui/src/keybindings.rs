@@ -182,14 +182,75 @@ impl Keybinding {
         if !input.is_down() {
             return false;
         }
-        if !modifiers_match(self.modifiers, input.modifiers) {
-            return false;
-        }
         match self.key {
-            KeyMatch::Character(c) => input.base.is_some_and(|base| base.eq_ignore_ascii_case(&c)),
-            KeyMatch::Named(named) => input.token == KeyToken::Named(named),
+            KeyMatch::Character(c) => self.character_matches(c, input),
+            KeyMatch::Named(named) => {
+                modifiers_match(self.modifiers, input.modifiers)
+                    && input.token == KeyToken::Named(named)
+            }
         }
     }
+
+    /// Match a character binding, allowing for GPUI's shifted-symbol spelling.
+    ///
+    /// GPUI's Linux backends name a key by the keysym the *current* modifier
+    /// level resolves to and then drop the shift flag for single-character
+    /// non-letter keys, so pressing `ctrl+shift+\` arrives as control plus the
+    /// key `|` with shift clear — nothing like the `ctrl+shift+\` the config
+    /// (and the legacy winit client, which read `key_without_modifiers`)
+    /// spells it as. Every shifted-symbol default binding — `split_vertical`,
+    /// `split_horizontal`, `zoom_in` — is unreachable without accepting that
+    /// second spelling, so a shift-carrying character binding also matches its
+    /// US-layout shifted glyph arriving with shift already folded in.
+    fn character_matches(&self, target: char, input: &KeyInput) -> bool {
+        let Some(base) = input.base else {
+            return false;
+        };
+        if modifiers_match(self.modifiers, input.modifiers) && base.eq_ignore_ascii_case(&target) {
+            return true;
+        }
+        if !self.modifiers.shift || input.modifiers.shift {
+            return false;
+        }
+        let Some(shifted) = shifted_ascii(target) else {
+            return false;
+        };
+        let folded = Modifiers { shift: false, ..self.modifiers };
+        modifiers_match(folded, input.modifiers) && base == shifted
+    }
+}
+
+/// The glyph a US-layout key produces with Shift held, for the keys whose
+/// shifted form is a distinct symbol.
+///
+/// Letters are absent on purpose: GPUI already reports them by their own
+/// lowercase key and keeps the shift flag, so they match the ordinary way.
+const fn shifted_ascii(key: char) -> Option<char> {
+    let shifted = match key {
+        '`' => '~',
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        _ => return None,
+    };
+    Some(shifted)
 }
 
 /// Compare two modifier states on the four real modifiers, ignoring the GPUI

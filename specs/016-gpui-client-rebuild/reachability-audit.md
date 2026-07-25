@@ -219,20 +219,20 @@ also never executed).
 
 | Action | Subsystem | Verdict | Evidence |
 | --- | --- | --- | --- |
-| `split_vertical` | Pane layout | UNWIRED | `LayoutAction::SplitVertical` hits `main.rs:430`; `layout.rs`/`pane_tree.rs` unimported |
-| `split_horizontal` | Pane layout | UNWIRED | as above |
-| `close_pane` | Pane layout | UNWIRED | as above |
-| `cycle_pane` | Pane layout | UNWIRED | `LayoutAction::FocusNext` hits `main.rs:430` |
-| `focus_left` | Pane layout | UNWIRED | hits `main.rs:430` |
-| `focus_right` | Pane layout | UNWIRED | hits `main.rs:430` |
-| `focus_up` | Pane layout | UNWIRED | hits `main.rs:430` |
-| `focus_down` | Pane layout | UNWIRED | hits `main.rs:430` |
-| `workspace_split_vertical` | Workspace layout | UNWIRED | hits `main.rs:430`; `workspace_layout.rs`/`workspace_tree.rs` unimported |
-| `workspace_split_horizontal` | Workspace layout | UNWIRED | as above |
-| `workspace_focus_left` | Workspace layout | UNWIRED | as above |
-| `workspace_focus_right` | Workspace layout | UNWIRED | as above |
-| `workspace_focus_up` | Workspace layout | UNWIRED | as above |
-| `workspace_focus_down` | Workspace layout | UNWIRED | as above |
+| `split_vertical` | Pane layout | WIRED | `handle_layout_action` `SplitVertical` arm -> `TerminalView::split_pane` -> `PaneShell::split_focused_pane` + `CreateSession` (bead .58) |
+| `split_horizontal` | Pane layout | WIRED | as above, with `SplitDirection::Vertical` |
+| `close_pane` | Pane layout | WIRED | `TerminalView::close_pane` -> `PaneShell::close_focused_pane`; falls back to `close_active_tab` on the last pane (bead .58) |
+| `cycle_pane` | Pane layout | WIRED | `TerminalView::focus_next_pane` -> `PaneShell::focus_next_pane` (bead .58) |
+| `focus_left` | Pane layout | WIRED | `TerminalView::focus_pane` -> `PaneShell::focus_pane_in_direction` (bead .58) |
+| `focus_right` | Pane layout | WIRED | as above |
+| `focus_up` | Pane layout | WIRED | as above |
+| `focus_down` | Pane layout | WIRED | as above |
+| `workspace_split_vertical` | Workspace layout | WIRED | `TerminalView::split_workspace` -> `PaneShell::split_workspace` -> `WorkspaceTree::split_workspace` (bead .58) |
+| `workspace_split_horizontal` | Workspace layout | WIRED | as above, with `SplitDirection::Vertical` |
+| `workspace_focus_left` | Workspace layout | WIRED | `TerminalView::focus_workspace` -> `PaneShell::focus_workspace_in_direction` (bead .58) |
+| `workspace_focus_right` | Workspace layout | WIRED | as above |
+| `workspace_focus_up` | Workspace layout | WIRED | as above |
+| `workspace_focus_down` | Workspace layout | WIRED | as above |
 | `new_tab` | Tabs and windows | WIRED | `main.rs:410` → `create_tab` → `CreateSession` |
 | `new_claude_tab` | Tabs and windows | WIRED | `main.rs:411` → `ai_tab_command(ClaudeCode, false)` |
 | `new_claude_resume_tab` | Tabs and windows | WIRED | `main.rs:414` |
@@ -383,13 +383,18 @@ and blocks every `visual-E2E` row.
 ### P1 — core interaction
 
 - **FU-5 Pane tree.** Rows: `split_vertical`, `split_horizontal`, `close_pane`,
-  `cycle_pane`, `focus_left/right/up/down`. **Covered by bead .58.**
+  `cycle_pane`, `focus_left/right/up/down`. **Closed by bead .58.** `PaneShell`
+  (`pane_shell.rs`) owns one `WorkspaceTree` and one `PaneTree` per region on
+  the live path, `PaneGrids` gives every pane its own display grid, and all
+  eight rows are WIRED above.
 - **FU-6 Workspace tree.** Rows: `workspace_split_vertical`,
   `workspace_split_horizontal`, `workspace_focus_left/right/up/down`,
   `CreateWorkspace`, `CloseWorkspace`, `MoveSession`, `ReportWorkspaceTree`,
-  `WorkspaceInfo`. **Partly covered by bead .58** (which is scoped to
-  `pane_tree`/`workspace_layout` wiring); the four `ClientMessage`/`ServerMessage`
-  rows are *not* named in .58 and need a follow-on.
+  `WorkspaceInfo`. **Partly closed by bead .58**: the six workspace key actions
+  are WIRED above through `PaneShell`, and regions beyond the first are
+  client-local layout because the server still owns one workspace per window.
+  The four `ClientMessage`/`ServerMessage` rows were not in .58's scope and
+  remain open (bead .66).
 - **FU-7 Scrollback navigation and marks.** Rows: `scroll_up`, `scroll_down`,
   `scroll_top`, `scroll_bottom`, `prompt_jump_up`, `prompt_jump_down`,
   `jump_to_failure`, `PromptMark`, `ScrollBottom`. **The four `scroll_*` rows

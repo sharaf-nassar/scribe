@@ -10,8 +10,16 @@
 //! split-scroll pin is folded into the snapshot through
 //! [`scribe_client_gpui::split_scroll`], and a click resolves its
 //! [`scribe_client_gpui::smart_selection`] candidates here.
+//!
+//! A window shows one grid per pane, so [`PaneGrids`] keys a
+//! [`DisplayOnlyTerminal`] per session: the coalescing drain already carries a
+//! `SessionId` with every batch, and the paint path asks for the grid belonging
+//! to the session each pane is showing.
 
+use std::collections::HashMap;
 use std::time::Instant;
+
+use scribe_common::ids::SessionId;
 
 pub use alacritty_terminal_gpui::grid::Scroll;
 pub use alacritty_terminal_gpui::term::cell::Flags;
@@ -186,6 +194,22 @@ impl DisplayOnlyTerminal {
     /// Returns the content captured after the most recent output frame.
     pub fn content(&self) -> Content {
         self.content.clone()
+    }
+
+    /// Reshape the display grid to `columns` x `lines`.
+    ///
+    /// A pane split changes how much of the window a session owns, so the
+    /// display grid has to follow the `Resize` the client sends the server:
+    /// alacritty reflows its own rows here, and the authoritative repaint
+    /// arrives right after as the `ScreenSnapshot` the caller requests. The
+    /// content snapshot is rebuilt immediately so the very next frame paints at
+    /// the new geometry instead of a grid the pane can no longer hold.
+    pub fn resize(&mut self, columns: usize, lines: usize) {
+        if columns == 0 || lines == 0 {
+            return;
+        }
+        self.term.resize(TerminalDimensions { columns, lines });
+        self.make_content();
     }
 
     #[cfg(test)]
@@ -376,6 +400,63 @@ fn grid_i32(value: usize) -> i32 {
 impl OutputTarget for DisplayOnlyTerminal {
     fn feed_output(&mut self, bytes: &[u8]) -> FeedOutputResult {
         DisplayOnlyTerminal::feed_output(self, bytes)
+    }
+}
+
+/// One display grid per session, so a split window paints each pane from its
+/// own terminal state instead of interleaving every pane into one grid.
+///
+/// Grids are created lazily: the first output batch for a session mints one at
+/// the window's default geometry, and the pane layout resizes it as soon as it
+/// knows how much of the window that session owns.
+pub struct PaneGrids {
+    /// Geometry a freshly minted grid starts at, before the pane layout has
+    /// published a per-pane size for its session.
+    default_columns: usize,
+    default_lines: usize,
+    grids: HashMap<SessionId, DisplayOnlyTerminal>,
+}
+
+impl PaneGrids {
+    /// Create an empty set whose grids default to `columns` x `lines`.
+    pub fn new(columns: usize, lines: usize) -> Self {
+        Self { default_columns: columns, default_lines: lines, grids: HashMap::new() }
+    }
+
+    /// Borrow `session_id`'s grid, creating it at the default geometry.
+    pub fn grid_mut(&mut self, session_id: SessionId) -> &mut DisplayOnlyTerminal {
+        let (columns, lines) = (self.default_columns, self.default_lines);
+        self.grids.entry(session_id).or_insert_with(|| DisplayOnlyTerminal::new(columns, lines))
+    }
+
+    /// The most recent frame for `session_id`, or `None` when no output has
+    /// ever reached that session's pane.
+    pub fn content(&self, session_id: SessionId) -> Option<Content> {
+        self.grids.get(&session_id).map(DisplayOnlyTerminal::content)
+    }
+
+    /// Reshape `session_id`'s grid, creating it first when needed.
+    pub fn resize(&mut self, session_id: SessionId, columns: usize, lines: usize) {
+        self.grid_mut(session_id).resize(columns, lines);
+    }
+
+    /// Drop an exited session's grid.
+    pub fn forget(&mut self, session_id: SessionId) {
+        self.grids.remove(&session_id);
+    }
+
+    /// The nearest open parser-side synchronized-update deadline across grids.
+    pub fn parser_sync_deadline(&self) -> Option<Instant> {
+        self.grids.values().filter_map(DisplayOnlyTerminal::parser_sync_deadline).min()
+    }
+
+    /// Commit every grid's expired parser-side synchronized update, returning
+    /// how many grids actually flushed one.
+    pub fn flush_parser_sync_timeouts(&mut self, now: Instant) -> usize {
+        self.grids
+            .values_mut()
+            .filter(|grid| grid.parser_sync_deadline().is_some())
+            .fold(0, |flushed, grid| flushed + usize::from(grid.flush_parser_sync_timeout(now)))
     }
 }
 

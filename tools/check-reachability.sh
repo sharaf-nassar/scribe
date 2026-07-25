@@ -132,10 +132,16 @@ sub slurp {
     return $text;
 }
 
-# Strip line comments and string literals so brace/paren counting is not thrown
-# off by punctuation inside doc comments or format strings.
+# Strip character literals, string literals and line comments so brace/paren
+# counting is not thrown off by punctuation inside doc comments or format
+# strings.
+#
+# Character literals go first and on their own: a `'"'` literal carries a lone
+# double quote, which would otherwise open a string the string-literal pass
+# then closes somewhere far away, swallowing whole declarations.
 sub strip_noise {
     my ($text) = @_;
+    $text =~ s{'(?:[^'\\]|\\.)'}{''}gs;
     $text =~ s{"(?:[^"\\]|\\.)*"}{""}gs;
     $text =~ s{//[^\n]*}{}g;
     return $text;

@@ -25,11 +25,11 @@
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
 counts modules-total 64
-counts modules-wired 42
+counts modules-wired 45
 counts server-messages-total 59
 counts server-messages-handled 39
 counts layout-actions-total 36
-counts layout-actions-handled 17
+counts layout-actions-handled 31
 
 unwired-module clipboard
 unwired-module clipboard_cleanup
@@ -41,7 +41,6 @@ unwired-module mouse_reporting
 unwired-module mouse_state
 unwired-module notification_dispatcher
 unwired-module palette
-unwired-module pane_tree
 unwired-module paste
 unwired-module preedit
 unwired-module remote
@@ -50,9 +49,7 @@ unwired-module restore_state
 unwired-module scrollbar
 unwired-module server_lifecycle
 unwired-module window_state
-unwired-module workspace_layout
 unwired-module workspace_notes_preview
-unwired-module workspace_tree
 
 unhandled-server-message ActionDispatched
 unhandled-server-message ClipboardBridgeReadRequest
@@ -75,22 +72,8 @@ unhandled-server-message WorkspaceInfo
 unhandled-server-message WorkspaceNotesChanged
 unhandled-server-message WorkspaceNotesSnapshot
 
-unhandled-layout-action ClosePane
 unhandled-layout-action CopySelection
-unhandled-layout-action FocusDown
-unhandled-layout-action FocusLeft
-unhandled-layout-action FocusNext
-unhandled-layout-action FocusRight
-unhandled-layout-action FocusUp
 unhandled-layout-action JumpToFailure
 unhandled-layout-action PasteClipboard
 unhandled-layout-action PromptJumpDown
 unhandled-layout-action PromptJumpUp
-unhandled-layout-action SplitHorizontal
-unhandled-layout-action SplitVertical
-unhandled-layout-action WorkspaceFocusDown
-unhandled-layout-action WorkspaceFocusLeft
-unhandled-layout-action WorkspaceFocusRight
-unhandled-layout-action WorkspaceFocusUp
-unhandled-layout-action WorkspaceSplitHorizontal
-unhandled-layout-action WorkspaceSplitVertical
