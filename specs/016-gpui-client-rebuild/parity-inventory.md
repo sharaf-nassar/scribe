@@ -79,8 +79,8 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `CreateWorkspace` | workspace creation | scripted-E2E | — (missing, FU-6) | required |
 | `CloseWorkspace` | workspace close | scripted-E2E | — (missing, FU-6) | required |
 | `MoveSession` | session relocation | scripted-E2E | — (missing, FU-6) | required |
-| `Subscribe` | session stream subscription | scripted-E2E | — (missing, FU-20) | required |
-| `RequestSnapshot` | snapshot tooling | scripted-E2E | — (missing, FU-20) | required |
+| `Subscribe` | session stream subscription | scripted-E2E | `main.rs::attach_session` / `TerminalView::attach` → `IpcSink::subscribe` | required |
+| `RequestSnapshot` | snapshot tooling | scripted-E2E | `main.rs::report_cell_metrics` / `forward_replay` → `IpcSink::request_snapshot` | required |
 | `ListSessions` | startup/reconnect | scripted-E2E | `main.rs::run_connection` (sent on every connect) | required |
 | `AttachSessions` | reconnect restore | scripted-E2E | `main.rs::attach_session` → `IpcSink::attach_sessions` | required |
 | `ConfigReloaded` | live config reload | scripted-E2E | `main.rs::apply_config_reload` → `IpcSink::config_reloaded` | required |

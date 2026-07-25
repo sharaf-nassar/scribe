@@ -93,8 +93,8 @@ Determination techniques, in order of authority:
 | `CreateWorkspace` | gpui-test | MISSING | no `ClientMessage::CreateWorkspace` anywhere in the crate |
 | `CloseWorkspace` | scripted-E2E | MISSING | no `ClientMessage::CloseWorkspace` anywhere in the crate |
 | `MoveSession` | gpui-test | MISSING | no `ClientMessage::MoveSession` anywhere in the crate |
-| `Subscribe` | scripted-E2E | MISSING | no `ClientMessage::Subscribe` anywhere in the crate |
-| `RequestSnapshot` | scripted-E2E | MISSING | no `ClientMessage::RequestSnapshot` anywhere in the crate |
+| `Subscribe` | scripted-E2E | WIRED | `main.rs` `attach_session` and `TerminalView::attach` → `IpcSink::subscribe`, behind the `AttachSessions` on the same ordered channel; wired by bead .79 |
+| `RequestSnapshot` | scripted-E2E | WIRED | `main.rs` `report_cell_metrics` (after the post-font-reload `Resize`) and `forward_replay` (replay-decode fallback) → `IpcSink::request_snapshot`; wired by bead .79 |
 | `ListSessions` | scripted-E2E | WIRED | `main.rs:1297`, sent on every connect |
 | `AttachSessions` | scripted-E2E | WIRED | `main.rs:1640` `attach_session`; `ipc_bridge.rs:259` from `attach` |
 | `ConfigReloaded` | scripted-E2E | WIRED | `main.rs:347` in `apply_config_reload`; watcher wired by bead .57 (`a50a5f2`) |
@@ -133,7 +133,9 @@ Determination techniques, in order of authority:
 | `ControlRequest` | golden | UNWIRED | built in `share.rs`, unimported. Not emitting it is by design, but its live substitute `ControlClaim` is itself UNWIRED, so the sharing surface is unreachable either way |
 | `ControlGrant` | scripted-E2E | UNWIRED | built in `share.rs`; module not imported by `main.rs` |
 
-**Client-message subtotals:** WIRED 13 · UNWIRED 17 · MISSING 16 · UNKNOWN 0.
+**Client-message subtotals:** WIRED 15 · UNWIRED 17 · MISSING 14 · UNKNOWN 0.
+(Was WIRED 13 · MISSING 16 at `f56ef95`; bead `.79` moved `Subscribe` and
+`RequestSnapshot` from MISSING to WIRED.)
 
 ## Server messages (59)
 
@@ -447,6 +449,13 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
 ### P2 — session lifecycle gaps
 
 - **FU-20 Subscribe / snapshot tooling.** Rows: `Subscribe`, `RequestSnapshot`.
+  **Landed.** Both frames now leave through `IpcSink`: `Subscribe` rides every
+  attach (reader `attach_session` and the tab-switch `TerminalView::attach`),
+  and `RequestSnapshot` is the display-only client's resync — sent after the
+  post-font-reload `Resize` and as the fallback when a reattach replay fails to
+  decode. The reply is consumed by the existing `ScreenSnapshot` arm, now
+  `apply_screen_snapshot`. Verified on the wire and on screen by
+  `tests/e2e/visual/session-tooling.sh`.
 - **FU-21 Workspace notes on a real workspace.** Rows: `WorkspaceNotesSnapshot`,
   `WorkspaceNotesChanged`, plus de-demoing `WorkspaceNotesGet` /
   `WorkspaceNotesMutate` (fabricated `WorkspaceId` at `main.rs:561`, reply
