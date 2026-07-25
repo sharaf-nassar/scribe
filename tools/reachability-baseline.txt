@@ -27,7 +27,7 @@
 counts modules-total 58
 counts modules-wired 26
 counts server-messages-total 59
-counts server-messages-handled 24
+counts server-messages-handled 28
 counts layout-actions-total 36
 counts layout-actions-handled 9
 
@@ -69,8 +69,6 @@ unhandled-server-message Bell
 unhandled-server-message ClipboardBridgeReadRequest
 unhandled-server-message ClipboardBridgeWrite
 unhandled-server-message ClipboardPromptRequest
-unhandled-server-message CodexTaskLabelChanged
-unhandled-server-message CodexTaskLabelCleared
 unhandled-server-message EnvPreflightResult
 unhandled-server-message LanApprovalPending
 unhandled-server-message LanApprovalRequest
@@ -88,8 +86,6 @@ unhandled-server-message RemotePeerList
 unhandled-server-message RunAction
 unhandled-server-message ScrollBottom
 unhandled-server-message SearchResults
-unhandled-server-message TaskLabelChanged
-unhandled-server-message TaskLabelCleared
 unhandled-server-message TrustedDeviceList
 unhandled-server-message TrustedNetworkList
 unhandled-server-message UpdateCheckResult
