@@ -68,6 +68,14 @@ prepare_xdg_dirs
 export PATH="/tests/bin:$PATH"
 export RUST_LOG="${RUST_LOG:-scribe_server=info,scribe_client_gpui=info}"
 
+# Persist the server's tracing output for the same reason the client's is
+# persisted below: some behaviour under test leaves no pixels behind and has no
+# client-side proxy (e.g. "the server received TriggerUpdate and started an
+# install"), so the script asserts on the server log instead of guessing.
+export SCRIBE_TEST_SERVER_LOG=/output/server.log
+export SCRIBE_SERVER_LOG=/output/server.log
+: >"$SCRIBE_SERVER_LOG"
+
 scribe-test server start
 SERVER_STARTED=1
 

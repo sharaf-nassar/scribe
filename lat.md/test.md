@@ -186,6 +186,8 @@ Visual end-to-end tests run the real `scribe-client-gpui` window headlessly (`do
 
 The client's stderr is redirected to `/output/client.log` and its pid and log path are exported as `SCRIBE_CLIENT_PID` / `SCRIBE_CLIENT_LOG`, so a script can assert on runtime behaviour that leaves no pixels behind and can prove the process never restarted. `RUST_LOG` defaults to `scribe_server=info,scribe_client_gpui=info` so those client lines are actually emitted.
 
+The server's output is captured the same way: the entrypoint exports `SCRIBE_TEST_SERVER_LOG=/output/server.log`, which [[crates/scribe-test/src/server.rs#start]] honours when it spawns `scribe-server`, and re-exports it as `SCRIBE_SERVER_LOG` for scripts. That is how a test proves a *client-to-server* message crossed the wire — the server logs the window id it received it on — rather than trusting the client's own "I sent it" line.
+
 The GPUI client sets its X11 `WM_NAME`/`_NET_WM_NAME` to `Scribe` via [[crates/scribe-client-gpui/src/main.rs#open_window]] so `xdotool search --name "Scribe"` can locate the window for focus and capture.
 
 `openbox` is required, not cosmetic: [[crates/scribe-client-gpui/src/x11_focus.rs#X11FocusGuard]] runs on the client's live key path and suppresses synthetic key input whenever `_NET_ACTIVE_WINDOW` does not name the client window, and only a window manager sets that root property under Xvfb. Without a WM, `xdotool`-driven visual tests cannot type.
@@ -223,6 +225,16 @@ Multi-machine sharing needs a second machine, so the run interposes [[crates/scr
 The script walks the surface in five phases, screenshotting each: a `ShareRoster` raises the roster panel and the presence badge; a `ControlRequested` opens the modal prompt, swallows an ordinary keystroke, and Esc puts `ControlGrant { accept: false }` on the wire; a roster handing control to the remote peer makes the client a viewer, whose keystroke is swallowed and raises the take-control hint from which Enter puts `ControlClaim` on the wire; `ControlDenied` posts its notice; and `ShareEnded` tears the surfaces down. The wire assertions read the recorded JSONL, so they prove the client emitted the frames rather than that a test constructed them.
 
 Keystroke *suppression* is asserted from the client log rather than from an absent `KeyInput`: the GPUI client cannot create its own first session yet (`CreateWorkspace` is missing, FU-6), so its window holds no PTY in this rig and would emit no `KeyInput` either way. `run_share_key` logs every swallowed key for exactly that reason, and the absent-`KeyInput` check is kept alongside it as a regression guard.
+
+### Update surfaces
+
+`tests/e2e/visual/update-trigger.sh` and `tests/e2e/visual/update-dismiss.sh` are the scripted oracle for the `UpdateAvailable` / `UpdateProgress` / `TriggerUpdate` / `DismissUpdate` parity rows, driving a real server end to end (see [[client#GPUI Update Surfaces]]).
+
+Nothing is stubbed on the client side. `tests/e2e/visual/fake-update-api.py` stands in for GitHub's releases API and the container is started with `SCRIBE_UPDATE_API_URL` pointing at it, so `scribe-server` decides on its own that a newer version exists and broadcasts `UpdateAvailable` on its normal 30 s startup check. `tests/e2e/visual/update-config.toml` is seeded through `SCRIBE_EXTRA_CONFIG` to turn the status bar's sparklines off, because they resample every 2 s and would swamp the one band the tests diff.
+
+Both scripts share `tests/e2e/visual/update-common.sh`, which grows the window first — the spike's terminal grid is a fixed 36 × 18 px block, so at the default 960 × 680 window both bottom bands fall below the window edge — then diffs the centred status-bar band before and after the broadcast. A non-zero delta proves the CTA rendered; the bounding box of the changed pixels is where the script actually moves the pointer and clicks, so the click cannot silently miss.
+
+`update-trigger.sh` then presses Enter on the default "Update Now" and waits for the server's `client triggered update window_id=…` line — the server only logs that on receiving `TriggerUpdate` from that window — before capturing the CTA relabelled "Downloading..." and then "Update failed" as the server's real download and (deliberately invalid) signature check drive `UpdateProgress`. `update-dismiss.sh` Tabs onto "Later" instead, waits for `client dismissed update notification window_id=…`, and asserts the CTA band is once again pixel-identical to the no-update baseline.
 
 ## GPUI IPC Bridge
 
@@ -634,6 +646,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Config load with removed keys | [[test#GPUI Client Headless Suites#Config load with removed keys]] | "Removed configuration keys" rows |
 | Config live reload | [[test#GPUI Client Headless Suites#Config live reload]] | `ConfigReloaded` live reload |
 | Window opacity | [[test#GPUI Client Headless Suites#Window opacity]] | Rendering/window `appearance.opacity` |
+| Update surfaces | [[test#GPUI Client Headless Suites#GPUI Update Surfaces]] | `UpdateAvailable`, `UpdateProgress`, `TriggerUpdate`, `DismissUpdate` |
 | URL/OSC8 detection | [[test#GPUI URL Detection]] | hover/dwell/open surface |
 | IPC bridge ordering | [[test#GPUI IPC Bridge]] | Executor-model ordering risk |
 | Remote connect picker | [[test#GPUI Client Headless Suites#GPUI remote connect picker]] | `ListRemotePeers`, `ListLanPeers`, `RemotePeerList` remote connect picker |
@@ -772,6 +785,30 @@ Building the palette at `1.0` and `0.85` from a real theme, the test asserts the
 Verifies [[crates/scribe-client-gpui/src/status_bar.rs#StatusBarColors#with_opacity]] scales only the filled band, keeping every readable element at full strength.
 
 The test compares a theme-derived palette against its scaled copy and asserts the background alpha follows the opacity while the text, top hairline and dimmed stat-label alphas do not, then drives `1.5` and `-0.2` through the same clamp.
+
+### GPUI Update Surfaces
+
+Locks the transition table of [[crates/scribe-client-gpui/src/update.rs#UpdateState]] — what the server's broadcasts arm, which confirmation the CTA opens, and what the user's decision clears. See [[client#Client#GPUI Update Surfaces]].
+
+These cases cover the state holder only. That the running window actually receives a real `UpdateAvailable`, paints the CTA, and puts `TriggerUpdate` / `DismissUpdate` on the wire is a whole-app property, verified by [[test#Visual E2E Tests#Update surfaces]].
+
+#### Server broadcasts arm the status bar CTA
+
+Confirms an untouched state offers nothing and that [[crates/scribe-client-gpui/src/update.rs#UpdateState#on_available]] is what arms the CTA, so a client that never heard from the server cannot invent an update.
+
+The test asserts the default state has no version, no progress and no confirmation, then feeds one announcement and checks the version and release URL read back and the confirmation is the install variant. It then feeds `Downloading` progress and a *second* announcement, asserting the in-flight progress survives — the winit client keeps it because the server only re-announces a version it still considers installable.
+
+#### Restart-required outranks a pending version
+
+Verifies [[crates/scribe-client-gpui/src/update.rs#UpdateState#confirmation]] raises the cold-restart modal ahead of an install offer when both apply, matching the winit `open_update_dialog` precedence.
+
+With both an announced version and a `CompletedRestartRequired` progress state present, the resolved dialog is the restart-required kind, so the user is asked about the restart they already paid for rather than about downloading again. The test also asserts the dialog's cancel action is the secondary one, which is what makes Esc and a backdrop click safe: neither can cold-restart the machine.
+
+#### Trigger and dismiss clear the CTA
+
+Checks that both terminal decisions retire the CTA, so a confirmed or declined update cannot keep re-offering itself on every repaint.
+
+[[crates/scribe-client-gpui/src/update.rs#UpdateState#on_triggered]] clears the version and release URL but is deliberately narrower than [[crates/scribe-client-gpui/src/update.rs#UpdateState#on_dismissed]], which also drops progress: after a trigger the server's own `UpdateProgress` takes over the label, whereas after a dismissal the server suppresses the version entirely and even a stale `Failed` state must not linger.
 
 ### GPUI remote connect picker
 
