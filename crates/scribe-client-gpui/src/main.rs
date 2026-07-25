@@ -103,18 +103,35 @@ static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 /// per-frame `render` hook only measures the initial paint.
 static FIRST_FRAME_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// Sentinel held by [`WINDOW_BRINGUP_MS_BITS`] until `cx.open_window` hands
+/// control back to Scribe code. It is a NaN bit pattern, so it can never collide
+/// with the [`f64::to_bits`] encoding of a real measurement.
+const BRINGUP_UNSET: u64 = u64::MAX;
+
+/// Milliseconds spent inside `cx.open_window` before the root-view builder runs,
+/// as [`f64::to_bits`] — i.e. gpui's window creation plus wgpu adapter
+/// enumeration, device creation and surface configure. No Scribe code executes
+/// in that span, so it is the platform GPU bring-up floor the startup gate has
+/// to account for separately from work this repo controls. See
+/// `specs/016-gpui-client-rebuild/spec.md` Clarification Q3.
+static WINDOW_BRINGUP_MS_BITS: AtomicU64 = AtomicU64::new(BRINGUP_UNSET);
+
 /// Env var that opts the client into the perf-rig startup marker. Its value is
-/// a file path; when set to a non-empty path, the first `render` writes a
-/// machine-parseable `first_frame_ms=<n>` marker to that file. The rig reads it
-/// and gates it against the 500 ms Clarification-Q3 budget. Unset by default so
-/// normal runs write nothing.
+/// a file path; when set to a non-empty path, the first `render` writes the
+/// machine-parseable `first_frame_ms`, `gpu_bringup_ms` and `scribe_startup_ms`
+/// markers to that file. The rig reads them and gates them against the
+/// re-scoped Clarification-Q3 startup budget. Unset by default so normal runs
+/// write nothing.
 const STARTUP_TIMING_ENV: &str = "SCRIBE_GPUI_STARTUP_TIMING";
 
-/// Writes the startup-to-first-frame marker exactly once, on the first painted
-/// frame, when [`STARTUP_TIMING_ENV`] names an output file. The elapsed time is
-/// measured from [`PROCESS_START`] so it captures the full window from process
-/// launch through GPU-ready first paint, mirroring the old client's
-/// `init_gpu_and_terminal_done` method that produced the recorded baseline.
+/// Writes the startup-timing markers exactly once, on the first painted frame,
+/// when [`STARTUP_TIMING_ENV`] names an output file.
+///
+/// `first_frame_ms` is measured from [`PROCESS_START`], so it captures the full
+/// window from process launch through GPU-ready first paint — the same span the
+/// old client reports through the shared probe. `gpu_bringup_ms` is the slice of
+/// that span spent inside `cx.open_window` (see [`WINDOW_BRINGUP_US`]), and
+/// `scribe_startup_ms` is the remainder: everything this repo actually controls.
 fn log_first_frame_timing() {
     if FIRST_FRAME_LOGGED.swap(true, Ordering::AcqRel) {
         return;
@@ -126,8 +143,22 @@ fn log_first_frame_timing() {
         return;
     };
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    if let Err(error) = std::fs::write(&path, format!("first_frame_ms={elapsed_ms:.3}\n")) {
+    let split = window_bringup_ms().map_or_else(String::new, |bringup_ms| {
+        let scribe_ms = (elapsed_ms - bringup_ms).max(0.0);
+        format!("gpu_bringup_ms={bringup_ms:.3}\nscribe_startup_ms={scribe_ms:.3}\n")
+    });
+    let marker = format!("first_frame_ms={elapsed_ms:.3}\n{split}");
+    if let Err(error) = std::fs::write(&path, marker) {
         tracing::warn!(%error, "failed to write startup-timing marker");
+    }
+}
+
+/// The recorded `cx.open_window` duration in milliseconds, or `None` when the
+/// root view was built outside the instrumented path.
+fn window_bringup_ms() -> Option<f64> {
+    match WINDOW_BRINGUP_MS_BITS.load(Ordering::Acquire) {
+        BRINGUP_UNSET => None,
+        bits => Some(f64::from_bits(bits)),
     }
 }
 
@@ -2018,6 +2049,11 @@ fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink, terminal_size: Ter
     let bounds = Bounds::centered(None, size(px(960.), px(680.)), cx);
     let shared = shared.clone();
     let sink = sink.clone();
+    // Everything between here and the root-view builder below happens inside
+    // gpui: window creation, wgpu adapter enumeration, device creation and
+    // surface configure. Timing it separates the platform GPU bring-up floor
+    // from Scribe's own startup work for the perf gate.
+    let bringup_start = Instant::now();
     if let Err(error) = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -2036,7 +2072,11 @@ fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink, terminal_size: Ter
             window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
         },
-        |window, cx| cx.new(|cx| TerminalView::new(shared, sink, terminal_size, window, cx)),
+        |window, cx| {
+            let bringup_ms = bringup_start.elapsed().as_secs_f64() * 1000.0;
+            WINDOW_BRINGUP_MS_BITS.store(bringup_ms.to_bits(), Ordering::Release);
+            cx.new(|cx| TerminalView::new(shared, sink, terminal_size, window, cx))
+        },
     ) {
         tracing::error!(%error, "failed to open GPUI window");
     }

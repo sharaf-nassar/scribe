@@ -8,18 +8,24 @@
 # instrumentation, and writes a markdown report with a per-metric pass/fail
 # verdict.
 #
-# The Q3 budget (startup re-scoped 2026-07-24, see spec.md "Q3 re-scope"):
-#   1. startup-to-first-frame   : no worse than the old client, both measured
-#                                 end-to-end on the same host/session
-#   2. input latency            : no worse than the old client
-#   3. cat-firehose throughput  : no worse than the old client
-#   4. memory at 10 tabs        : <= old client + 20%
-#   5. scroll fps / dropped     : sustained 60 fps with < 1% dropped frames
+# The Q3 budget (startup re-scoped 2026-07-24, amended 2026-07-25 by bead
+# scribe-38e.83; see spec.md "Q3 re-scope"):
+#   1a. Scribe-attributable startup : <= 150 ms absolute (everything outside
+#                                     gpui's window/GPU bring-up)
+#   1b. startup-to-first-frame      : no worse than the old client, both
+#                                     measured end-to-end on the same
+#                                     host/session
+#   2.  input latency               : no worse than the old client
+#   3.  cat-firehose throughput     : no worse than the old client
+#   4.  memory at 10 tabs           : <= old client + 20%
+#   5.  scroll fps / dropped        : sustained 60 fps with < 1% dropped frames
 #
-# Metrics 2-5 are read from the shared runtime probe both clients link
-# (crates/scribe-common/src/perf_probe.rs), armed by SCRIBE_PERF_PROBE. Metric 1
-# is read from the GPUI client's first-frame marker (SCRIBE_GPUI_STARTUP_TIMING).
-# Memory is sampled externally from /proc so it is client-agnostic.
+# Every metric is read from the shared runtime probe both clients link
+# (crates/scribe-common/src/perf_probe.rs), armed by SCRIBE_PERF_PROBE, so both
+# halves of the A/B are measured by identical code. The GPUI client additionally
+# writes SCRIBE_GPUI_STARTUP_TIMING, which splits its first-frame time into the
+# gpui GPU bring-up floor and the Scribe-attributable remainder that metric 1a
+# gates. Memory is sampled externally from /proc so it is client-agnostic.
 #
 # Two modes:
 #   assess (default) -- generate the current-state report from the committed
@@ -67,7 +73,14 @@ SCRIBE_TEST_BIN="scribe-test"
 # frame, and the GPU bring-up floor alone exceeds 500 ms on the reference
 # host; see spec.md "Q3 re-scope" and perf-baseline.md). Both clients are
 # measured end-to-end and compared with the shared noise allowance.
+#
+# The 2026-07-25 amendment (bead scribe-38e.83) adds the absolute half: gpui
+# spends 610-1315 ms inside `cx.open_window` (wgpu adapter enumeration, device
+# creation, surface configure) before any Scribe code runs, so the total is
+# dominated by a platform floor this repo cannot move. What it can move is the
+# remainder, and that is capped absolutely.
 STARTUP_SAMPLES=3              # startup runs per client; the median is scored
+SCRIBE_STARTUP_BUDGET_MS=150   # absolute ceiling on Scribe-attributable startup
 MEM_REGRESSION_MAX_PCT=20      # memory may exceed old client by at most 20%
 SCROLL_TARGET_FPS=60           # sustained scroll target
 SCROLL_DROPPED_MAX_PCT=1       # dropped-frame ceiling
@@ -104,7 +117,7 @@ while [[ $# -gt 0 ]]; do
     --firehose-mib) FIREHOSE_MIB="$2"; shift 2 ;;
     --tabs) MEMORY_TABS="$2"; shift 2 ;;
     --scribe-test) SCRIBE_TEST_BIN="$2"; shift 2 ;;
-    -h|--help) sed -n '2,48p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,53p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -446,86 +459,108 @@ median() {
   printf '%s\n' "$@" | sort -n | awk '{ v[NR] = $0 } END { if (NR) print v[int((NR + 1) / 2)] }'
 }
 
-# Wait until FILE (ANSI-stripped) matches PATTERN or PID exits; then kill PID.
-# Returns 0 when the pattern appeared within 20s.
-wait_marker_then_kill() {
-  local pid="$1" file="$2" pattern="$3" waited=0 found=1
-  while [[ $waited -lt 200 ]]; do
-    if [[ -f "$file" ]] \
-      && sed 's/\x1b\[[0-9;]*m//g' "$file" | grep -qE "$pattern"; then
-      found=0
-      break
+# End-to-end startup in ms from an old-client log, for binaries built before
+# the shared probe carried `startup_first_frame_ms`.
+#
+# The old client logs `client startup timing` lines at info level from its
+# first startup step through `init_gpu_and_terminal_done` (after which the
+# first frame paints), so the wall-clock delta between the first line's
+# timestamp and that line's timestamp is the end-to-end number. It stops at
+# GPU-ready rather than first paint, so it slightly understates the client. The
+# phase-scoped `total_ms` printed on the line itself only times the GPU-init
+# phase and is NOT comparable to anything. Prints ms or nothing.
+startup_ms_from_log() {
+  local log="$1"
+  [[ -f "$log" ]] || return 0
+  sed 's/\x1b\[[0-9;]*m//g' "$log" | awk '
+    NR == 1 { first = $1 }
+    /init_gpu_and_terminal_done/ { last = $1; exit }
+    END {
+      if (first == "" || last == "") exit
+      print (secs(last) - secs(first)) * 1000
+    }
+    function secs(ts,    t, parts) {
+      # 2026-07-25T06:04:46.632959Z -> seconds of day (same-day samples)
+      t = substr(ts, index(ts, "T") + 1)
+      sub(/Z$/, "", t)
+      split(t, parts, ":")
+      return parts[1] * 3600 + parts[2] * 60 + parts[3]
+    }' | awk '{ printf "%.0f\n", $1 }'
+}
+
+# One startup sample for either client, launched cold and killed once it has
+# reported.
+#
+# The total comes from the shared probe's `startup_first_frame_ms`, which both
+# clients latch on their first render from the instant the probe is armed (the
+# first statement of `main` in each), so the two halves of the A/B are the same
+# measurement rather than two different sub-spans. A binary without that key
+# falls back to `startup_ms_from_log`. The GPUI client additionally writes the
+# SCRIBE_GPUI_STARTUP_TIMING marker, which attributes its total to gpui's
+# `cx.open_window` bring-up versus Scribe's own work.
+#
+# Echoes `total|bringup|scribe`; the last two are empty for a client that does
+# not write the marker.
+startup_sample() {
+  local bin="$1"
+  local marker="$WORK_DIR/startup-marker.txt"
+  local probe="$WORK_DIR/startup-probe.txt"
+  local log="$WORK_DIR/startup-client.log"
+  rm -f "$marker" "$probe" "$log"
+  SCRIBE_PERF_PROBE="$probe" SCRIBE_GPUI_STARTUP_TIMING="$marker" \
+    SCRIBE_DISABLE_ANIMATIONS=1 "$bin" >"$log" 2>&1 &
+  local pid=$!
+  echo "$pid" >>"$WORK_DIR/pids"
+  # Wait for the probe key. A probe-less client never writes one, so its
+  # GPU-ready log line arms a short grace window and then ends the sample
+  # instead of burning the full timeout on every run.
+  local waited=0 grace=-1
+  while [[ $waited -lt 250 ]]; do
+    if [[ -s "$probe" ]] && grep -q '^startup_first_frame_ms=' "$probe"; then break; fi
+    if [[ $grace -lt 0 ]] && [[ -f "$log" ]] \
+      && grep -q 'init_gpu_and_terminal_done' "$log"; then
+      grace=$waited
     fi
+    [[ $grace -ge 0 && $((waited - grace)) -ge 30 ]] && break
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
     waited=$((waited + 1))
   done
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  return "$found"
+  local total bringup scribe
+  total="$(probe_value "$probe" startup_first_frame_ms)"
+  [[ -n "$total" ]] || total="$(startup_ms_from_log "$log")"
+  bringup="$(probe_value "$marker" gpu_bringup_ms)"
+  scribe="$(probe_value "$marker" scribe_startup_ms)"
+  rm -f "$marker" "$probe" "$log"
+  echo "${total}|${bringup}|${scribe}"
 }
 
-# One GPUI-client startup sample: process start to first painted frame, from
-# the client's own SCRIBE_GPUI_STARTUP_TIMING marker. Prints ms or nothing.
-startup_sample_new() {
-  local bin="$1"
-  local marker="$WORK_DIR/startup.txt"
-  rm -f "$marker"
-  SCRIBE_GPUI_STARTUP_TIMING="$marker" "$bin" >/dev/null 2>&1 &
-  local pid=$!
-  echo "$pid" >>"$WORK_DIR/pids"
-  if wait_marker_then_kill "$pid" "$marker" 'first_frame_ms=[0-9.]+'; then
-    grep -oE 'first_frame_ms=[0-9.]+' "$marker" | head -n1 | cut -d= -f2
-  fi
-  rm -f "$marker"
-}
-
-# One old-client startup sample, measured with the SAME definition: launch to
-# GPU-ready. The old client has no first-frame marker, but it logs
-# `client startup timing` lines at info level from its first startup step
-# through `init_gpu_and_terminal_done` (after which the first frame paints),
-# so the wall-clock delta between the first log line's timestamp and that
-# line's timestamp is the end-to-end number. The phase-scoped `total_ms` on
-# the line itself only times the GPU-init phase and is NOT comparable.
-# Prints ms or nothing.
-startup_sample_old() {
-  local bin="$1"
-  local log="$WORK_DIR/old-startup.log"
-  rm -f "$log"
-  "$bin" >"$log" 2>&1 &
-  local pid=$!
-  echo "$pid" >>"$WORK_DIR/pids"
-  if wait_marker_then_kill "$pid" "$log" 'init_gpu_and_terminal_done'; then
-    sed 's/\x1b\[[0-9;]*m//g' "$log" | awk '
-      NR == 1 { first = $1 }
-      /init_gpu_and_terminal_done/ { last = $1; exit }
-      END {
-        if (first == "" || last == "") exit
-        print (secs(last) - secs(first)) * 1000
-      }
-      function secs(ts,    t, parts) {
-        # 2026-07-25T06:04:46.632959Z -> seconds of day (same-day samples)
-        t = substr(ts, index(ts, "T") + 1)
-        sub(/Z$/, "", t)
-        split(t, parts, ":")
-        return parts[1] * 3600 + parts[2] * 60 + parts[3]
-      }' | awk '{ printf "%.0f\n", $1 }'
-  fi
-  rm -f "$log"
-}
-
-# Median-of-N startup for one client. Args: sample_fn bin. Prints ms or "".
+# Median-of-N startup for one client. Echoes `total|bringup|scribe`, each the
+# median of the samples that produced it, or `||` when nothing was measured.
 measure_startup() {
-  local fn="$1" bin="$2" i ms
-  [[ -x "$bin" ]] || { echo ""; return; }
-  local samples=()
+  local bin="$1" i sample one_total one_bringup one_scribe
+  [[ -x "$bin" ]] || { echo "||"; return; }
+  local totals=() bringups=() scribes=()
   for ((i = 0; i < STARTUP_SAMPLES; i++)); do
-    ms="$($fn "$bin")"
-    [[ -n "$ms" ]] && samples+=("$ms")
+    sample="$(startup_sample "$bin")"
+    IFS='|' read -r one_total one_bringup one_scribe <<<"$sample"
+    [[ -n "$one_total" ]] && totals+=("$one_total")
+    [[ -n "$one_bringup" ]] && bringups+=("$one_bringup")
+    [[ -n "$one_scribe" ]] && scribes+=("$one_scribe")
     sleep 1
   done
-  [[ ${#samples[@]} -gt 0 ]] || { echo ""; return; }
-  median "${samples[@]}"
+  if [[ ${#totals[@]} -eq 0 ]]; then
+    log "startup: ${bin} never reported a first frame"
+    echo "||"
+    return
+  fi
+  local med_total med_bringup="" med_scribe=""
+  med_total="$(median "${totals[@]}")"
+  [[ ${#bringups[@]} -gt 0 ]] && med_bringup="$(median "${bringups[@]}")"
+  [[ ${#scribes[@]} -gt 0 ]] && med_scribe="$(median "${scribes[@]}")"
+  echo "${med_total}|${med_bringup}|${med_scribe}"
 }
 
 # --------------------------------------------------------------------------
@@ -721,39 +756,76 @@ live_ready() {
 }
 
 eval_startup() {
-  local measured=""
+  local new_split="" old_split=""
   if live_ready && [[ -n "$NEW_CLIENT" ]]; then
     log "measuring startup: new client (median of ${STARTUP_SAMPLES})"
-    measured="$(measure_startup startup_sample_new "$NEW_CLIENT")"
+    new_split="$(measure_startup "$NEW_CLIENT")"
+  fi
+  local new_total="" bringup="" scribe_ms=""
+  if [[ -n "$new_split" ]]; then
+    IFS='|' read -r new_total bringup scribe_ms <<<"$new_split"
   fi
   if live_ready && [[ -n "$OLD_CLIENT" ]]; then
     log "measuring startup: old client (median of ${STARTUP_SAMPLES})"
-    local old_measured
-    old_measured="$(measure_startup startup_sample_old "$OLD_CLIENT")"
-    if [[ -n "$old_measured" ]]; then
-      OLD_STARTUP_MS="$old_measured"
-      record_baseline startup_first_frame_ms "$old_measured"
+    old_split="$(measure_startup "$OLD_CLIENT")"
+    local old_total="${old_split%%|*}"
+    if [[ -n "$old_total" ]]; then
+      OLD_STARTUP_MS="$old_total"
+      record_baseline startup_first_frame_ms "$old_total"
     fi
   fi
-  STARTUP_NOTE="Same-host A/B (Q3 re-scope 2026-07-24): PASS when the new client's median startup is within ${NOISE_TOLERANCE_PCT}% of the old client's, both measured end-to-end (process start / first startup log to first painted frame or GPU-ready, median of ${STARTUP_SAMPLES}). Splash deletion (OQ8) stays authorized while this PASSes. Old client: ${OLD_STARTUP_MS:-unrecorded} ms."
-  if [[ -z "$measured" ]]; then
+
+  if [[ -z "$new_total" ]]; then
     STARTUP_STATUS="NOT-MEASURED"
     STARTUP_VALUE="not captured"
-    STARTUP_NOTE="Not captured: ${LIVE_BLOCKER:-run with --live --new-client <bin>.} The client writes the first-frame marker only when SCRIBE_GPUI_STARTUP_TIMING names a path."
+    STARTUP_NOTE="Not captured: ${LIVE_BLOCKER:-run with --live --new-client <bin>.} A client reports the span through SCRIBE_PERF_PROBE, or through its startup log when the binary predates that probe key."
     return
   fi
-  STARTUP_VALUE="${measured} ms"
-  if [[ -z "$OLD_STARTUP_MS" ]]; then
-    STARTUP_STATUS="NO-BASELINE"
-    return
-  fi
-  local ceiling
-  ceiling="$(calc "old * (1 + pct / 100)" "old=$OLD_STARTUP_MS" "pct=$NOISE_TOLERANCE_PCT")"
-  if float_cmp "$measured" "<=" "$ceiling"; then
-    STARTUP_STATUS="PASS"
+
+  STARTUP_VALUE="${new_total} ms total"
+  [[ -n "$scribe_ms" ]] && STARTUP_VALUE="${STARTUP_VALUE} (${scribe_ms} ms Scribe + ${bringup} ms gpui GPU bring-up)"
+
+  # 1a: the part this repo controls, gated absolutely. Worst status wins, so a
+  # metric that could not be attributed can never leave the gate at PASS.
+  local scribe_verdict scribe_status
+  if [[ -z "$scribe_ms" ]]; then
+    scribe_verdict="not attributed: the client wrote no gpu_bringup_ms marker"
+    scribe_status="NOT-MEASURED"
+  elif float_cmp "$scribe_ms" "<=" "$SCRIBE_STARTUP_BUDGET_MS"; then
+    scribe_verdict="PASS (<= ${SCRIBE_STARTUP_BUDGET_MS} ms)"
+    scribe_status="PASS"
   else
-    STARTUP_STATUS="FAIL"
+    scribe_verdict="FAIL (> ${SCRIBE_STARTUP_BUDGET_MS} ms)"
+    scribe_status="FAIL"
   fi
+
+  # 1b: the whole span, compared against the old client measured the same way.
+  local total_verdict total_status ceiling
+  if [[ -z "${OLD_STARTUP_MS:-}" ]]; then
+    total_verdict="no baseline to compare against"
+    total_status="NO-BASELINE"
+  else
+    ceiling="$(calc "old * (1 + pct / 100)" "old=$OLD_STARTUP_MS" "pct=$NOISE_TOLERANCE_PCT")"
+    if float_cmp "$new_total" "<=" "$ceiling"; then
+      total_verdict="PASS (<= ${ceiling} ms)"
+      total_status="PASS"
+    else
+      total_verdict="FAIL (> ${ceiling} ms)"
+      total_status="FAIL"
+    fi
+  fi
+
+  if [[ "$scribe_status" == "FAIL" || "$total_status" == "FAIL" ]]; then
+    STARTUP_STATUS="FAIL"
+  elif [[ "$scribe_status" == "PASS" && "$total_status" == "PASS" ]]; then
+    STARTUP_STATUS="PASS"
+  elif [[ "$total_status" == "NO-BASELINE" ]]; then
+    STARTUP_STATUS="NO-BASELINE"
+  else
+    STARTUP_STATUS="NOT-MEASURED"
+  fi
+
+  STARTUP_NOTE="Q3 re-scope (2026-07-24) plus its absolute half (2026-07-25, bead scribe-38e.83); the retired 500 ms ceiling is below this platform's GPU bring-up floor for both clients. (1a) Scribe-attributable startup ${scribe_ms:-n/a} ms against a ${SCRIBE_STARTUP_BUDGET_MS} ms budget: ${scribe_verdict}. (1b) Total first frame ${new_total} ms against the old client's ${OLD_STARTUP_MS:-unrecorded} ms with the ${NOISE_TOLERANCE_PCT}% noise allowance: ${total_verdict}. Method: median of ${STARTUP_SAMPLES} cold launches per client; the span is the first painted frame minus the probe arm (the first statement of each client's main), falling back to the startup-log wall clock for a binary without that probe key. The gpui split comes from the client's SCRIBE_GPUI_STARTUP_TIMING marker, which times \`cx.open_window\` — the span in which no Scribe code runs. Splash deletion (OQ8) stays authorized while this PASSes."
 }
 
 # Shared shape for the three comparative metrics: measure the new client,
@@ -926,11 +998,18 @@ This is the launch-blocking performance comparison for the GPUI client rebuild
 
 | Metric | Threshold |
 |---|---|
-| Startup to first frame | no worse than old client end-to-end (${NOISE_TOLERANCE_PCT}% noise allowance, median of ${STARTUP_SAMPLES}) |
+| Scribe-attributable startup | <= ${SCRIBE_STARTUP_BUDGET_MS} ms absolute |
+| Startup to first frame (total) | no worse than old client end-to-end (${NOISE_TOLERANCE_PCT}% noise allowance, median of ${STARTUP_SAMPLES}) |
 | Input latency | no worse than old client (${NOISE_TOLERANCE_PCT}% noise allowance) |
 | cat-firehose throughput | no worse than old client (${NOISE_TOLERANCE_PCT}% noise allowance) |
 | Memory at ${MEMORY_TABS} tabs | <= old client + ${MEM_REGRESSION_MAX_PCT}% |
 | Scroll | sustained ${SCROLL_TARGET_FPS} fps, < ${SCROLL_DROPPED_MAX_PCT}% dropped |
+
+The startup threshold was re-scoped on 2026-07-24 and amended by bead
+scribe-38e.83: the original 500 ms absolute ceiling to first frame is below the
+GPU bring-up floor of the host for *both* clients, so it is replaced by an
+absolute budget on the startup work this repo controls plus a like-for-like
+comparison of the whole span.
 
 Old-client baselines come from \`${BASELINE#"$REPO_ROOT/"}\`. \`--live --old-client <bin>\`
 re-measures them with the same probe in the same session, and

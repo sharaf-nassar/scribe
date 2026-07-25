@@ -662,7 +662,7 @@ When the daemon allocates a fresh id despite a non-zero `replaces` (the prior to
 
 The launch-blocking performance comparison for the GPUI client rebuild. The `tools/perf-ab-rig/run-perf-ab.sh` rig drives all five Clarification-Q3 metrics on both clients and writes a per-metric pass/fail report.
 
-The five metrics and thresholds are: startup-to-first-frame (no worse than the old client end-to-end, median of 3 samples per client, also gating splash deletion — re-scoped 2026-07-24 from the original `<= 500 ms` absolute budget, see the spec's "Q3 re-scope": the 190 ms figure the absolute budget was anchored to was the old client's phase-scoped GPU-init timer, not process-start-to-first-frame, and the GPU bring-up floor alone exceeds 500 ms on the reference host), input latency (no worse than old client), cat-firehose throughput (no worse than old client), memory at 10 tabs (`<= old + 20%`), and scroll (sustained 60 fps with `< 1%` dropped frames). Old-client baselines live in `specs/016-gpui-client-rebuild/perf-baseline.md` as a machine-readable `perf_baseline_<key>=<value>` block that `--record-baseline` rewrites in place; the generated report is `specs/016-gpui-client-rebuild/perf-ab-report.md`. A `--live --startup-only` run scores metric 1 alone without opening tabs or typing keys — the fast loop for the startup perf bead.
+The five metrics and thresholds are: startup-to-first-frame (no worse than the old client end-to-end, median of 3 samples per client, also gating splash deletion — re-scoped 2026-07-24 from the original `<= 500 ms` absolute budget, see the spec's "Q3 re-scope": the 190 ms figure the absolute budget was anchored to was the old client's phase-scoped GPU-init timer, not process-start-to-first-frame, and the GPU bring-up floor alone exceeds 500 ms on the reference host; amended 2026-07-25 with an absolute `<= 150 ms` cap on Scribe-attributable startup, the part of the span outside gpui's `cx.open_window`), input latency (no worse than old client), cat-firehose throughput (no worse than old client), memory at 10 tabs (`<= old + 20%`), and scroll (sustained 60 fps with `< 1%` dropped frames). Old-client baselines live in `specs/016-gpui-client-rebuild/perf-baseline.md` as a machine-readable `perf_baseline_<key>=<value>` block that `--record-baseline` rewrites in place; the generated report is `specs/016-gpui-client-rebuild/perf-ab-report.md`. A `--live --startup-only` run scores metric 1 alone without opening tabs or typing keys — the fast loop for the startup perf bead.
 
 The rig has two modes. `assess` (default) generates the current-state report from the committed baseline plus a static capability check without launching any GUI or touching the live server, marking every live-only metric `NOT-MEASURED`. `--live` is the launch-gate mode: it launches each target client on the same machine/session, drives every workload through `xdotool`, and enforces the thresholds; it attaches to the already-running server and never restarts it.
 
@@ -670,9 +670,13 @@ The three comparative metrics are enforced with a 10% run-to-run noise allowance
 
 ### Startup instrumentation
 
-The GPUI client times startup-to-first-frame only when the `SCRIBE_GPUI_STARTUP_TIMING` env var is set, printing a machine-readable marker the rig parses.
+Startup is gated in two parts because the platform, not the client, owns most of the span: Scribe-attributable startup must be `<= 150 ms` absolute, and total startup-to-first-frame must be no worse than the old client measured the same way.
 
-[[crates/scribe-client-gpui/src/main.rs#log_first_frame_timing]] latches on the first painted frame and writes a `first_frame_ms=<n>` marker to the file the env var names, timed from the `PROCESS_START` origin captured at the top of `main`. The old client has no such marker, so the rig measures it with the same end-to-end definition from its startup logs: the wall-clock delta between its first `client startup timing` line and the `init_gpu_and_terminal_done` line. The phase-scoped `total_ms` value printed on that line only times the GPU-init phase (it starts after config load, the host-stats walk, and app construction) and is never compared against the GPUI marker — doing exactly that is what produced the unreproducible 190 ms "baseline" the original absolute budget was anchored to.
+Both clients report the total through the shared probe's `startup_first_frame_ms`, latched by [[crates/scribe-common/src/perf_probe.rs#PerfProbe#latch_first_frame]] on the first painted frame and timed from the probe arm — the first statement of each client's `main` — so the two halves of the A/B are the same measurement rather than two different sub-spans. The rig launches each client cold, waits for that key, and kills it. A binary built before the probe carried that key (the installed old client) falls back to the startup-log method: the wall-clock delta between its first `client startup timing` line and the `init_gpu_and_terminal_done` line. That fallback stops at GPU-ready rather than first paint, so it slightly understates the old client, and the phase-scoped `total_ms` printed on that line — GPU-init only, after config load, the host-stats walk and app construction — is never compared against the GPUI marker; doing exactly that is what produced the unreproducible 190 ms "baseline" the original absolute budget was anchored to.
+
+The GPUI client additionally writes the marker named by `SCRIBE_GPUI_STARTUP_TIMING`. [[crates/scribe-client-gpui/src/main.rs#log_first_frame_timing]] latches on the first painted frame and writes `first_frame_ms`, `gpu_bringup_ms` and `scribe_startup_ms`, all timed from the `PROCESS_START` origin captured at the top of `main`. The bring-up figure comes from [[crates/scribe-client-gpui/src/main.rs#WINDOW_BRINGUP_MS_BITS]], stamped by the root-view builder that GPUI invokes at the end of `cx.open_window`; that span is wgpu adapter enumeration, device creation and surface configure, and no Scribe code runs inside it. `scribe_startup_ms` is the remainder and is what the absolute half of the gate caps.
+
+On the reference host `cx.open_window` alone costs 610–751 ms and the old client's own `configure_wgpu` costs 464–561 ms, so no client can paint inside 500 ms there. Measured like-for-like through the probe, the old client reaches its first frame in 3401–4682 ms against the GPUI client's 634–780 ms, of which only 24–29 ms is Scribe's own.
 
 ### Driving the workloads
 
@@ -715,6 +719,10 @@ With `SCRIBE_PERF_PROBE` unset every entry point must be a no-op that neither wr
 #### Counters pair input with its echo
 
 A keystroke sent while another is still unmatched must not restart the clock, so each recorded latency is an unambiguous key-to-echo pair and the byte counter accumulates independently.
+
+#### First frame latches the startup span
+
+The startup metric is reported by a probe the rig reads long after launch, so the first painted frame must latch the span once and every later frame must leave it alone; before any frame the report omits the key entirely rather than claiming a zero.
 
 ## GPUI Client Headless Suites
 

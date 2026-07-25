@@ -64,10 +64,16 @@ struct ProbeState {
     focused: Option<SessionId>,
 }
 
+/// Sentinel held by [`PerfProbe::first_frame_ms_bits`] until the first frame is
+/// painted. It is a NaN bit pattern, so it can never collide with the
+/// [`f64::to_bits`] encoding of a real elapsed-millisecond value.
+const FIRST_FRAME_UNSET: u64 = u64::MAX;
+
 /// Cumulative counters plus the derived values written to the report.
 struct Snapshot {
     pid: u32,
     uptime_ms: f64,
+    startup_first_frame_ms: Option<f64>,
     frames: u64,
     dropped_frames: u64,
     pty_bytes: u64,
@@ -82,6 +88,12 @@ struct Snapshot {
 pub struct PerfProbe {
     path: PathBuf,
     start: Instant,
+    /// Milliseconds from [`Self::start`] to the first painted frame as
+    /// [`f64::to_bits`], or [`FIRST_FRAME_UNSET`] while nothing has been painted
+    /// yet. This is the startup-to-first-frame metric, and both clients arm the
+    /// probe as the first statement of `main`, so the two halves of the A/B
+    /// measure the same span with the same code.
+    first_frame_ms_bits: AtomicU64,
     frames: AtomicU64,
     dropped_frames: AtomicU64,
     pty_bytes: AtomicU64,
@@ -95,6 +107,7 @@ impl PerfProbe {
         Self {
             path,
             start: now,
+            first_frame_ms_bits: AtomicU64::new(FIRST_FRAME_UNSET),
             frames: AtomicU64::new(0),
             dropped_frames: AtomicU64::new(0),
             pty_bytes: AtomicU64::new(0),
@@ -111,6 +124,7 @@ impl PerfProbe {
 
     /// Count one painted frame and the frames its gap implies were missed.
     fn frame(&self, now: Instant) {
+        self.latch_first_frame(now);
         self.frames.fetch_add(1, Ordering::Relaxed);
         let missed = {
             let Ok(mut state) = self.state.lock() else {
@@ -124,6 +138,37 @@ impl PerfProbe {
             self.dropped_frames.fetch_add(missed, Ordering::Relaxed);
         }
         self.maybe_flush(now);
+    }
+
+    /// Record the startup-to-first-frame span, once, on the first painted frame.
+    ///
+    /// Later frames leave the latch alone, so the reported value is always the
+    /// initial paint even though the rig reads the report long afterwards.
+    fn latch_first_frame(&self, now: Instant) {
+        let elapsed_ms = now.saturating_duration_since(self.start).as_secs_f64() * 1000.0;
+        // An `Err` just means a frame already latched the span, which is the
+        // whole point of the compare-exchange.
+        let latched = self
+            .first_frame_ms_bits
+            .compare_exchange(
+                FIRST_FRAME_UNSET,
+                elapsed_ms.to_bits(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok();
+        if latched {
+            tracing::debug!(elapsed_ms, "perf probe latched startup-to-first-frame");
+        }
+    }
+
+    /// The startup-to-first-frame span in milliseconds, or `None` before the
+    /// first paint.
+    fn first_frame_ms(&self) -> Option<f64> {
+        match self.first_frame_ms_bits.load(Ordering::Relaxed) {
+            FIRST_FRAME_UNSET => None,
+            bits => Some(f64::from_bits(bits)),
+        }
     }
 
     /// Stamp a keystroke as awaiting its echo. A keystroke sent while another is
@@ -212,6 +257,7 @@ impl PerfProbe {
         Snapshot {
             pid: std::process::id(),
             uptime_ms: now.saturating_duration_since(self.start).as_secs_f64() * 1000.0,
+            startup_first_frame_ms: self.first_frame_ms(),
             frames: self.frames.load(Ordering::Relaxed),
             dropped_frames: self.dropped_frames.load(Ordering::Relaxed),
             pty_bytes: self.pty_bytes.load(Ordering::Relaxed),
@@ -276,6 +322,9 @@ fn render_report(snapshot: &Snapshot) -> String {
         format!("pty_bytes={}", snapshot.pty_bytes),
         format!("input_samples={}", snapshot.latency_samples),
     ];
+    if let Some(first_frame) = snapshot.startup_first_frame_ms {
+        lines.push(format!("startup_first_frame_ms={first_frame:.3}"));
+    }
     if let Some(p50) = snapshot.latency_p50_ms {
         lines.push(format!("input_latency_p50_ms={p50:.3}"));
     }
@@ -379,6 +428,7 @@ mod tests {
         let snapshot = Snapshot {
             pid: 42,
             uptime_ms: 1000.0,
+            startup_first_frame_ms: Some(612.5),
             frames: 120,
             dropped_frames: 3,
             pty_bytes: 4096,
@@ -396,6 +446,7 @@ mod tests {
             "dropped_frames=3",
             "pty_bytes=4096",
             "input_samples=2",
+            "startup_first_frame_ms=612.500",
             "input_latency_p50_ms=7.500",
             "input_latency_mean_ms=8.000",
             "sessions=1",
@@ -435,5 +486,22 @@ mod tests {
         assert_eq!(snapshot.latency_samples, 1);
         assert_eq!(snapshot.latency_p50_ms, Some(10.0));
         drop(std::fs::remove_file(&dir));
+    }
+
+    // @lat: [[test#Test Harness#GPUI Perf A/B Gate#Runtime probe instrumentation#First frame latches the startup span]]
+    #[test]
+    fn first_frame_latches_the_startup_span() {
+        let path = std::env::temp_dir().join(format!("scribe-perf-startup-{}", SessionId::new()));
+        let probe = PerfProbe::new(path.clone());
+        let start = probe.start;
+        assert_eq!(probe.snapshot(start).startup_first_frame_ms, None);
+        probe.frame(start + Duration::from_millis(640));
+        // Every later frame leaves the latch alone, so the report keeps naming
+        // the initial paint no matter when the rig reads it.
+        probe.frame(start + Duration::from_secs(5));
+        let snapshot = probe.snapshot(start + Duration::from_secs(6));
+        assert_eq!(snapshot.startup_first_frame_ms, Some(640.0));
+        assert_eq!(snapshot.frames, 2);
+        drop(std::fs::remove_file(&path));
     }
 }
