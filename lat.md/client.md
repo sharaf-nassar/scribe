@@ -480,6 +480,44 @@ With `SCRIBE_LAN_DIAL` set, [[crates/scribe-client-gpui/src/main.rs#run_connecti
 
 The whole surface is verified against the running app, not headlessly: see [[test#Visual E2E Tests#LAN approval and mutual-TLS dial]].
 
+## GPUI Remote Tailnet Surface
+
+The feature-013 tailnet surface is live in the terminal window: the account and peers are probed, a displaced window freezes under a reclaim banner, `SCRIBE_REMOTE_DIAL` reaches a peer, and automation actions round trip.
+
+[[crates/scribe-client-gpui/src/remote_chrome.rs#RemoteChrome]] is the one piece of state the IPC reader and the GPUI view share for all of it, the tailnet twin of [[crates/scribe-client-gpui/src/lan.rs#LanChrome]]. It holds the last `RemotePeerList`, the [[crates/scribe-client-gpui/src/remote_chrome.rs#RemoteEnvSummary]] from the last `RemoteEnv`, this client's own [[crates/scribe-client-gpui/src/remote_chrome.rs#RemoteDialStatus]], the displaced [[crates/scribe-client-gpui/src/lost_control.rs#LostControlState]], the typed severance reason, and the queue of inbound automation actions — and derives the one-line [[crates/scribe-client-gpui/src/remote_chrome.rs#RemoteChrome#status_line]] the status strip shows.
+
+### Startup probe: account and peers
+
+At startup the client asks its own server which tailnet account it is signed in to and which same-account peers are online.
+
+[[crates/scribe-client-gpui/src/main.rs#probe_remote_env]] runs before the session connection is opened, for the same reason the LAN probe does: `GetRemoteEnv` is a pre-`Hello` first frame answered on its own transient socket. [[crates/scribe-client-gpui/src/main.rs#adopt_remote_surface]] folds the reply through the same [[crates/scribe-client-gpui/src/main.rs#on_remote_message]] the live reader uses and sends [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#list_remote_peers]] on the session connection, which the server answers only for a local one. Both are gated on `remote.enabled`, exactly as the window-list poll is. The same pair is re-requested by the command palette's Remote Connect row through [[crates/scribe-client-gpui/src/main.rs#TerminalView#refresh_remote_peers]], which ports the winit `request_remote_peers` seam so the picker overlay bead only has to add rendering. The Settings → Remote page reaches `GetRemoteEnv` independently, on its own transient socket, from [[crates/scribe-client-gpui/src/settings/window.rs#SettingsWindow#refresh_trust]].
+
+### Displacement: the frozen reclaim banner
+
+`WindowTakenOver` means another controller now drives this window. The client stops expecting output, suppresses every keystroke, and offers one action.
+
+[[crates/scribe-client-gpui/src/main.rs#on_remote_message]] stores the ported [[crates/scribe-client-gpui/src/lost_control.rs#LostControlState]]; the render pass hangs [[crates/scribe-client-gpui/src/lost_control.rs#lost_control_overlay]] as the LAST child of the root, so the dimmed backdrop and its centred banner cover every other overlay — while the window is frozen there is nothing else to interact with. The key path checks [[crates/scribe-client-gpui/src/main.rs#TerminalView#window_displaced]] before the share prompt, before the shell chords, and before any binding: everything is swallowed except Enter, which [[crates/scribe-client-gpui/src/lost_control.rs#ReclaimKey#from_keystroke]] lowers onto the ported Enter-only gate. A click anywhere on the backdrop is the mouse half of the same affordance.
+
+[[crates/scribe-client-gpui/src/main.rs#TerminalView#reclaim_window]] clears the banner optimistically — matching the winit client, which drops the displaced connection and clears the state before its reclaiming `Hello` is answered — and puts the frozen v3 [[crates/scribe-client-gpui/src/share.rs#ControlIntent]]`::Claim` on the wire. Claiming rather than re-dialing is what makes the reclaim in-place: the GPUI client's connection is never torn down, so there is no visible close-and-reopen. A server that refuses the claim simply displaces this client again, which re-raises the banner.
+
+`RemoteDisconnect` is the peer's best-effort final frame before it closes a link for a policy reason. Recording its typed reason is the only chance the window has to say *why* the connection went away instead of just dying, so it outranks the dial status on the status strip.
+
+### Connecting side: the tailnet dial
+
+With `SCRIBE_REMOTE_DIAL` set, [[crates/scribe-client-gpui/src/main.rs#run_connection]] reaches a peer over plain TCP instead of the local Unix socket. LAN wins a double-set, because the encrypted device-approved link is the preferred transport for the same machine.
+
+[[crates/scribe-client-gpui/src/remote_handshake.rs#RemoteDialer#connect]] opens the TCP connection with `TCP_NODELAY` (Nagle would coalesce keystrokes into the previous packet) and [[crates/scribe-client-gpui/src/remote_handshake.rs#perform_remote_handshake]] runs the mandatory preamble. Unlike the LAN dial there is no identity to build: identity is `tailscaled`'s `WhoIs` on the owning side, never a certificate this process holds. Anything short of acceptance ends the process rather than falling back to the local server. Past the gate the stream is interchangeable with the Unix socket, so all three transports converge on [[crates/scribe-client-gpui/src/main.rs#serve_connection]] — which is also where the picker's window claim and its explicit-attach `takeover` ride the ordinary `Hello`. An accepted tailnet dial lights the status bar's controlling-side transport indicator through [[crates/scribe-client-gpui/src/remote_chrome.rs#RemoteChrome#transport_label]].
+
+### Automation round trip
+
+`scribe action …` reaches a window as `RunAction`, and a client that cannot run a window mutation itself asks the server to route it.
+
+An inbound `RunAction` is *queued* rather than executed by the reader, because the action it names opens tabs, splits panes and moves focus — all GPUI entities only the window's own thread may touch. [[crates/scribe-client-gpui/src/main.rs#TerminalView#poll_remote_actions]] drains the whole queue on the same 200 ms lifecycle tick that raises a LAN approval, marking each action [[crates/scribe-client-gpui/src/main.rs#ActionOrigin]]`::Server`.
+
+The outbound half exists for one concrete case: a feature-015 **viewer**. Its keystrokes are already suppressed locally, and the window mutations a layout row would make are refused by the server for a non-controller, so running them locally would fail silently. [[crates/scribe-client-gpui/src/main.rs#TerminalView#execute_automation_action]] routes exactly those rows out as [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#dispatch_action]] with `window_id: None` (the server refuses any other id from a registered connection) and the server answers `ActionDispatched` naming the window it reached. Client-local rows — the find overlay, the settings window, a profile switch, tab focus, the update dialog — are never routed: they change this process, not the shared window. `ActionOrigin` closes the loop that would otherwise open, because an action the server delivered is already at the controller.
+
+The whole surface is verified against the running app, not headlessly: see [[test#Visual E2E Tests#Tailnet remote control]].
+
 ## GPUI Titlebar
 
 The GPUI rebuild replaces native window decorations with a custom titlebar that also hosts the integrated tab bar. The pure layout/decay math is ported into a testable module; the interactive chrome is a `gpui::Entity`.
@@ -1727,7 +1765,7 @@ Each is the transport-free core of a winit [[client#Remote Control]] module with
 
 [[crates/scribe-client-gpui/src/remote_handshake.rs#perform_remote_handshake]] ports the winit dial preamble ([[crates/scribe-client/src/ipc_client.rs#remote_handshake]]): it sends [[crates/scribe-common/src/protocol.rs#ClientMessage]] `RemoteHandshake` as the first frame over any framed async stream and maps the mandatory `RemoteHandshakeReply` to a [[crates/scribe-client-gpui/src/remote.rs#RemoteConnectOutcome]]. The `SCRIBE_REMOTE_DIAL` / `SCRIBE_LAN_DIAL` / `SCRIBE_REMOTE_WINDOW` dial-env spawn hooks port as [[crates/scribe-client-gpui/src/remote_handshake.rs#parse_dial_target]] and its env wrappers, split from the env read so the grammar stays testable without mutating process env.
 
-The connect picker and the dial-env grammar are still library-only; the LAN half of that surface is live and documented in [[client#Client#GPUI LAN Surface]].
+The connect picker overlay is still library-only; the dial-env grammar, the handshake preamble and the displaced banner are live, documented in [[client#Client#GPUI Remote Tailnet Surface]], alongside the LAN half in [[client#Client#GPUI LAN Surface]].
 
 The displaced-client [[crates/scribe-client-gpui/src/lost_control.rs#LostControlState]] (from [[crates/scribe-client/src/lost_control.rs#LostControlState]]) keeps the `Controlled by <device> (<account>)` headline and Enter-only reclaim; [[crates/scribe-client-gpui/src/lan_approval.rs#LanApprovalDialog]] (from [[crates/scribe-client/src/lan_approval.rs#LanApprovalDialog]]) keeps the Decline-default focus, fingerprint-word body, and name-collision hint. The feature 015 sharing surfaces port into [[crates/scribe-client-gpui/src/share.rs#ShareState]] (roster roles, holder derivation), the transient [[crates/scribe-client-gpui/src/share.rs#ControlHint]], and the [[crates/scribe-client-gpui/src/share.rs#ControlRequestPrompt]] — with control passing expressed as a [[crates/scribe-client-gpui/src/share.rs#ControlIntent]] that lowers to the frozen v3 `ControlClaim` / `ControlRequest` / `ControlGrant` messages the winit [[crates/scribe-client/src/share_view.rs#ShareState]] emits.
 

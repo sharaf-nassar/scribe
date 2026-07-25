@@ -55,12 +55,18 @@ use scribe_client_gpui::lan::{LanChrome, LanConnectOutcome, LanEnvSummary};
 use scribe_client_gpui::lan_approval::{LanApprovalAction, LanApprovalDialog};
 use scribe_client_gpui::lan_dial::{self, LanDialer};
 use scribe_client_gpui::layout::{FocusDirection, PaneId, Rect, SplitDirection};
+use scribe_client_gpui::lost_control::{
+    LostControlColors, LostControlState, ReclaimKey, lost_control_overlay,
+};
 use scribe_client_gpui::mouse_state::{ClickKind, MouseClickState};
 use scribe_client_gpui::opacity::{clamp_opacity, opaque_slot, surface};
 use scribe_client_gpui::paste::{PasteGate, PasteGateEvent, paste_chunks};
 use scribe_client_gpui::prompt_bar::{
     self, PromptBarColors, PromptBarData, PromptContextIndicator,
 };
+use scribe_client_gpui::remote::RemoteConnectOutcome;
+use scribe_client_gpui::remote_chrome::{RemoteChrome, RemoteEnvSummary};
+use scribe_client_gpui::remote_handshake::{self, RemoteDialer};
 use scribe_client_gpui::restore_replay::round_positive_f32_to_u16;
 use scribe_client_gpui::search::{
     FindOverlayColors, FindOverlayEvent, FindOverlayView, FindResults, MatchHighlightColors,
@@ -69,8 +75,8 @@ use scribe_client_gpui::search::{
 use scribe_client_gpui::selection::{SelectionMode, SelectionSpan};
 use scribe_client_gpui::settings::{SettingsWindow, open_settings_window};
 use scribe_client_gpui::share::{
-    ControlRequestPrompt, ShareChrome, ShareKey, ShareKeyOutcome, ShareOverlayColors, ShareState,
-    share_overlay,
+    ControlIntent, ControlRequestPrompt, ShareChrome, ShareKey, ShareKeyOutcome,
+    ShareOverlayColors, ShareState, share_overlay,
 };
 use scribe_client_gpui::smart_selection::{
     ActionExpansionContext, ResolvedSmartSelectionAction, SmartSelectionCandidate,
@@ -331,6 +337,12 @@ struct Shared {
     /// and performs the queued jobs, because arboard and the FR-019 focus gate
     /// both belong to the thread that owns the window.
     clipboard: Arc<Mutex<ClipboardBridge>>,
+    /// Feature-013 tailnet state. The IPC reader folds the peer-list,
+    /// environment, dial-outcome, displacement and severance answers into it and
+    /// queues inbound automation actions here; the view renders the displaced
+    /// banner from it, suppresses input while that banner is up, and drains the
+    /// automation queue on its lifecycle tick.
+    remote: Arc<Mutex<RemoteChrome>>,
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -1191,11 +1203,26 @@ impl TerminalView {
     fn execute_palette_action(&mut self, action: PaletteAction, cx: &mut Context<Self>) {
         match action {
             PaletteAction::Automation(automation) => {
-                self.execute_automation_action(automation, cx);
+                self.execute_automation_action(automation, ActionOrigin::Local, cx);
             }
-            PaletteAction::OpenRemoteConnect => {
-                unroutable_action("OpenRemoteConnect", "the remote-connect picker is not ported");
-            }
+            PaletteAction::OpenRemoteConnect => self.refresh_remote_peers(),
+        }
+    }
+
+    /// Re-request both connect-picker device lists from the local server: the
+    /// 013 tailnet peers (`ListRemotePeers`) and the 014 mDNS-discovered LAN
+    /// peers (`ListLanPeers`).
+    ///
+    /// Both replies fold into their shared chrome and mirror onto the status
+    /// line, which is where the counts are visible until the picker overlay
+    /// itself is ported. Ports the winit `request_remote_peers` seam exactly, so
+    /// the overlay bead only has to add rendering.
+    fn refresh_remote_peers(&mut self) {
+        if let Err(error) = self.sink.list_remote_peers() {
+            tracing::warn!(%error, "tailnet peer list request dropped: IPC writer closed");
+        }
+        if let Err(error) = self.sink.list_lan_peers() {
+            tracing::warn!(%error, "LAN peer list request dropped: IPC writer closed");
         }
     }
 
@@ -1204,22 +1231,63 @@ impl TerminalView {
     /// Most rows have an exact [`KeyAction`] twin, so they are lowered by
     /// [`key_action_for_automation`] and handed to [`Self::dispatch_key_action`]
     /// — the same call the keybinding path makes. The three actions with no
-    /// bindable chord are handled here: a profile switch reloads the live
-    /// config in place, session focus moves the tab selection, and the update
-    /// dialog waits on the update surfaces (FU-14).
-    fn execute_automation_action(&mut self, action: AutomationAction, cx: &mut Context<Self>) {
+    /// bindable chord are handled here: a profile switch reloads the live config
+    /// in place, session focus moves the tab selection, and the update row opens
+    /// the same confirmation the status-bar CTA does.
+    ///
+    /// The one exception is a feature-015 VIEWER. Its keystrokes are already
+    /// suppressed locally, and the window mutations a layout row would make —
+    /// `CreateSession`, `CloseSession`, `CloseWindow` — are refused by the server
+    /// for a non-controller, so running them here would fail silently. Those rows
+    /// go out as [`ClientMessage::DispatchAction`] instead, which the server
+    /// routes to whoever currently holds the window. Client-local rows (the find
+    /// overlay, the settings window, a profile switch, tab focus) are NOT routed:
+    /// they change this process, not the shared window.
+    ///
+    /// `origin` closes the loop that would otherwise open: an action the server
+    /// delivered as a `RunAction` is already at the controller, so it is never
+    /// dispatched back.
+    fn execute_automation_action(
+        &mut self,
+        action: AutomationAction,
+        origin: ActionOrigin,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(key_action) = key_action_for_automation(&action) {
+            if origin == ActionOrigin::Local
+                && matches!(key_action, KeyAction::Layout(_))
+                && self.share_is_viewer()
+            {
+                self.offer_action_to_controller(action);
+                return;
+            }
             self.dispatch_key_action(key_action, cx);
             return;
         }
         match action {
             AutomationAction::SwitchProfile { name } => self.switch_profile(&name, cx),
             AutomationAction::FocusSession { session_id } => self.focus_session(session_id, cx),
-            AutomationAction::OpenUpdateDialog => {
-                unroutable_action("OpenUpdateDialog", "update state is not tracked in the client");
-            }
+            AutomationAction::OpenUpdateDialog => self.open_update_dialog(cx),
             // Everything else was lowered onto a `KeyAction` above.
             other => unroutable_action(&format!("{other:?}"), "no automation handler"),
+        }
+    }
+
+    /// Whether this client is a share viewer whose window mutations the server
+    /// would refuse.
+    fn share_is_viewer(&self) -> bool {
+        self.shared.share.lock().is_ok_and(|share| share.is_viewer())
+    }
+
+    /// Ask the server to route a window-mutating action to whoever holds this
+    /// window, because this client does not.
+    fn offer_action_to_controller(&self, action: AutomationAction) {
+        tracing::info!(?action, "routing a viewer's automation row to the control holder");
+        // `None` names this connection's own window: the server refuses any
+        // other id from a registered connection, and answers with the
+        // `ActionDispatched` the reader logs.
+        if let Err(error) = self.sink.dispatch_action(None, action) {
+            tracing::warn!(%error, "automation dispatch dropped: IPC writer closed");
         }
     }
 
@@ -1825,14 +1893,15 @@ impl TerminalView {
 
     /// Run one window-lifecycle tick on the GPUI thread.
     ///
-    /// Five jobs, all of which need the foreground: the queued terminal bells
+    /// Six jobs, all of which need the foreground: the queued terminal bells
     /// are gated and signalled here (the attention request is a window call), a
     /// server-acknowledged exit can only be performed here, a focus transition
     /// the IPC reader caused (a reattach moves the focused pane with no UI event
     /// behind it) is reconciled here, the window-list poll sends from the
-    /// view's own sink, and the OSC 52 clipboard work the reader parked runs
+    /// view's own sink, the OSC 52 clipboard work the reader parked runs
     /// here because arboard and the confirmation modal both belong to this
-    /// thread.
+    /// thread, and the automation actions a `RunAction` queued are executed here
+    /// because the entities they drive are owned by this thread too.
     fn poll_window_lifecycle(&mut self, cx: &mut Context<Self>) {
         self.poll_bells(cx);
         let exit = self.shared.lifecycle.lock().ok().and_then(|mut l| l.take_exit());
@@ -1852,6 +1921,78 @@ impl TerminalView {
         self.poll_window_list();
         self.poll_lan_approval(cx);
         self.poll_clipboard(cx);
+        self.poll_remote_actions(cx);
+    }
+
+    /// Run every automation action the reader queued from a `RunAction`.
+    ///
+    /// The whole queue is drained per tick rather than one item per tick: two
+    /// `scribe action` invocations a fifth of a second apart are a single user
+    /// intent, and running the second one 200 ms late would look like a dropped
+    /// command. Each action is marked [`ActionOrigin::Server`] so an action this
+    /// shell cannot run is reported rather than bounced back to the server that
+    /// just sent it.
+    fn poll_remote_actions(&mut self, cx: &mut Context<Self>) {
+        loop {
+            let Some(action) = self.shared.remote.lock().ok().and_then(|mut r| r.take_action())
+            else {
+                return;
+            };
+            tracing::info!(?action, "running a server-dispatched automation action");
+            self.execute_automation_action(action, ActionOrigin::Server, cx);
+        }
+    }
+
+    /// Take back a window a remote controller displaced.
+    ///
+    /// The banner clears optimistically — matching the winit client, which drops
+    /// the displaced connection and clears the state before the reclaiming
+    /// `Hello` is even answered — and the claim goes out as the frozen v3
+    /// [`ControlIntent::Claim`], which is how a participant takes input control
+    /// of a window it is already attached to. A server that refuses the claim
+    /// simply displaces this client again, which re-raises the banner.
+    fn reclaim_window(&mut self, cx: &mut Context<Self>) {
+        let reclaimed = self.shared.remote.lock().ok().is_some_and(|mut remote| remote.reclaim());
+        if !reclaimed {
+            return;
+        }
+        let window_id = self.shared.lifecycle.lock().ok().and_then(|l| l.window_id());
+        let Some(window_id) = window_id else {
+            tracing::warn!("reclaim requested before this connection adopted a window");
+            cx.notify();
+            return;
+        };
+        tracing::info!(%window_id, "reclaiming a displaced window");
+        if let Err(error) = self.sink.control_intent(ControlIntent::Claim { window_id }) {
+            tracing::warn!(%error, "reclaim dropped: IPC writer closed");
+        }
+        cx.notify();
+    }
+
+    /// The displaced banner over the frozen grid, when a remote controller holds
+    /// this window.
+    ///
+    /// Hung last in the render tree so it covers every other overlay: while the
+    /// window is frozen there is nothing else to interact with. A click anywhere
+    /// on the backdrop reclaims, which is the mouse half of the one-action
+    /// affordance the key path serves with Enter.
+    fn build_lost_control_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let state = self.shared.remote.lock().ok()?.displaced().cloned()?;
+        let colors = LostControlColors::from(&self.chrome);
+        Some(
+            div()
+                .id("lost-control")
+                .absolute()
+                .inset_0()
+                .on_click(cx.listener(|view, _event, _window, ctx| view.reclaim_window(ctx)))
+                .child(lost_control_overlay(&state, &colors))
+                .into_any_element(),
+        )
+    }
+
+    /// Whether a remote controller currently holds this window.
+    fn window_displaced(&self) -> bool {
+        self.shared.remote.lock().is_ok_and(|remote| remote.displaced().is_some())
     }
 
     /// Re-poll the server's window list when it is due.
@@ -2522,7 +2663,12 @@ impl TerminalView {
         self.context_menu = None;
         let profile_names = scribe_common::profiles::list_profiles().unwrap_or_default();
         let active = scribe_common::profiles::active_profile_name().ok();
-        let entries = build_entries(None, &profile_names, active.as_deref());
+        // The conditional "Update Scribe to vX" row reads the SAME
+        // `UpdateAvailable` broadcast the centred status-bar CTA does, so the two
+        // affordances can never disagree about whether an update is offered.
+        let update_version =
+            self.shared.update.lock().ok().and_then(|state| state.version().map(str::to_owned));
+        let entries = build_entries(update_version.as_deref(), &profile_names, active.as_deref());
         let colors = CommandPaletteColors::from(&self.chrome);
         let palette = cx.new(|cx| CommandPaletteView::new(colors, entries, cx));
         cx.subscribe(&palette, |this, _palette, event: &CommandPaletteEvent, ctx| {
@@ -3220,6 +3366,19 @@ impl TerminalView {
     /// the key was consumed by an overlay (and must not reach the PTY).
     fn handle_overlay_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let mods = &event.keystroke.modifiers;
+        // Feature 013 (T017): a displaced window is frozen. Checked before
+        // everything else — including the share prompt and the shell chords —
+        // because ALL input is suppressed while another controller holds the
+        // window; Enter is its one affordance and every other key is swallowed
+        // rather than reaching a binding, an overlay, or the PTY.
+        if self.window_displaced() {
+            if LostControlState::reclaim_requested(ReclaimKey::from_keystroke(
+                event.keystroke.key.as_str(),
+            )) {
+                self.reclaim_window(cx);
+            }
+            return true;
+        }
         // Feature 015 (T020): a pending control request is a full-window modal —
         // the holder (or the owner while control is unheld) answers it before
         // anything else reaches a binding, an overlay, or the PTY.
@@ -3596,6 +3755,20 @@ fn smart_selection_action(action: ResolvedSmartSelectionAction) -> ContextMenuAc
 /// The CLI starts through the user's login shell (`-lic` + `exec`) so it
 /// inherits the same PATH and rc files a normal tab would, without first
 /// rendering a shell prompt.
+/// Where an [`AutomationAction`] came from, which decides what happens to one
+/// this shell cannot run.
+///
+/// A LOCAL action (a command-palette row) may be offered to the window's
+/// controller with `DispatchAction`; a SERVER one arrived as the `RunAction`
+/// that dispatch produces, so bouncing it back would loop forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionOrigin {
+    /// Raised by this window's own UI.
+    Local,
+    /// Delivered by the server as a `RunAction`.
+    Server,
+}
+
 /// Lower a shared [`AutomationAction`] onto the [`KeyAction`] the keybinding
 /// path already dispatches, so the command palette and a bound chord converge
 /// on one handler.
@@ -3787,6 +3960,11 @@ impl TerminalView {
             let entry = tabs.tabs().iter().find(|tab| tab.session_id == session_id)?;
             Some(entry.workspace_id)
         });
+        // Feature 013/014: the transport label is a `&'static str`, so the
+        // tailnet chrome lock is released before `build_model` borrows anything
+        // else rather than being held across the whole build.
+        let remote_transport =
+            self.shared.remote.lock().ok().and_then(|remote| remote.transport_label());
         // Refresh the sparkline sampler (internally rate-limited to 2 s) and
         // build the full segment model from the live data available so far.
         let sys_stats = self.stats.maybe_refresh();
@@ -3821,7 +3999,10 @@ impl TerminalView {
                 // A remote shell's own host wins; a local pane keeps the
                 // placeholder until the hostname surface lands.
                 host_label: session.and_then(SessionChrome::host_label).unwrap_or("local"),
-                remote_transport: None,
+                // Feature 014 (T025): the controlling-side transport indicator,
+                // present only on a client that itself reached its window over a
+                // remote transport.
+                remote_transport,
                 tmux_label: session.and_then(SessionChrome::tmux_label),
                 time: "",
                 update_available,
@@ -4031,6 +4212,7 @@ impl Render for TerminalView {
         });
         let tooltip = self.build_tooltip_demo();
         let share = self.build_share_overlay();
+        let displaced = self.build_lost_control_overlay(cx);
 
         let opacity = self.opacity;
         // The root itself paints nothing. Every band below fills the window
@@ -4088,6 +4270,10 @@ impl Render for TerminalView {
             .children(self.workspace_notes_modal.clone())
             .children(share)
             .children(tooltip)
+            // Last child, so the frozen banner covers every other overlay: while
+            // a remote controller holds this window there is nothing else to
+            // interact with.
+            .children(displaced)
     }
 }
 
@@ -4173,6 +4359,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         workspaces: Arc::new(Mutex::new(Vec::new())),
         notes: Arc::new(Mutex::new(WorkspaceNotesStore::new())),
         clipboard: Arc::new(Mutex::new(ClipboardBridge::default())),
+        remote: Arc::new(Mutex::new(RemoteChrome::new())),
     };
     let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
     let (in_tx, in_rx) = unbounded_channel::<InboundEvent>();
@@ -4337,36 +4524,115 @@ fn start_ipc_thread(ctx: IpcThread) {
 
 /// Establish this client's one connection and serve it until it closes.
 ///
-/// Two transports reach the same server-side protocol. The default is the local
-/// Unix socket; `SCRIBE_LAN_DIAL` instead points the client at a peer on the
-/// local network, which is reached over TCP + pinned mutual TLS and gated by the
-/// owning side's device approval before a single byte of window state flows
-/// (feature 014). Past that gate the streams are interchangeable, so both paths
-/// converge on [`serve_connection`].
+/// Three transports reach the same server-side protocol. The default is the
+/// local Unix socket; `SCRIBE_LAN_DIAL` instead points the client at a peer on
+/// the local network, which is reached over TCP + pinned mutual TLS and gated by
+/// the owning side's device approval before a single byte of window state flows
+/// (feature 014); `SCRIBE_REMOTE_DIAL` points it at a peer on the tailnet, which
+/// is reached over plain TCP and gated by the mandatory `RemoteHandshake`
+/// preamble (feature 013). Past those gates the streams are interchangeable, so
+/// all three paths converge on [`serve_connection`].
+///
+/// LAN wins a double-set: it is the preferred transport for the same machine
+/// (research C3), so a peer reachable both ways is dialed over the encrypted,
+/// device-approved link rather than the tailnet.
 async fn run_connection(ctx: IpcThread) -> Result<(), String> {
-    match lan_dial::target_from_env() {
-        Some((host, port)) => run_lan_connection(ctx, host, port).await,
-        None => run_local_connection(ctx).await,
+    if let Some((host, port)) = lan_dial::target_from_env() {
+        return run_lan_connection(ctx, host, port).await;
     }
+    if let Some((host, port)) = remote_handshake::target_from_env() {
+        return run_remote_connection(ctx, host, port).await;
+    }
+    run_local_connection(ctx).await
 }
 
 /// Connect to this machine's own server over the local Unix socket.
 ///
-/// The LAN environment is probed FIRST, before the session connection exists.
-/// `GetLanEnv` is a pre-`Hello` first frame the server answers on its own
-/// transient socket, so it has to be a separate connection either way; running
-/// it up front means the window has its LAN summary before the first frame
-/// paints, and it leaves the session connection as the last socket this process
-/// opened, which is what the E2E wire tap addresses the client by.
+/// Both local-only environments are probed FIRST, before the session connection
+/// exists. `GetLanEnv` and `GetRemoteEnv` are pre-`Hello` first frames the server
+/// answers on their own transient sockets, so they have to be separate
+/// connections either way; running them up front means the window has both
+/// summaries before the first frame paints, and it leaves the session connection
+/// as the last socket this process opened, which is what the E2E wire tap
+/// addresses the client by.
 async fn run_local_connection(ctx: IpcThread) -> Result<(), String> {
-    let lan_env = probe_lan_env().await;
+    let probes = Box::new(LocalProbes {
+        lan_env: probe_lan_env().await,
+        remote_env: probe_remote_env().await,
+    });
     let stream = tokio::net::UnixStream::connect(server_socket_path())
         .await
         .map_err(|error| error.to_string())?;
     // Socket is up: light the status-bar connection dot green.
     ctx.shared.connected.store(true, Ordering::Release);
     let (reader, writer) = stream.into_split();
-    serve_connection(ctx, reader, writer, Transport::Local(lan_env)).await
+    serve_connection(ctx, reader, writer, Transport::Local(probes)).await
+}
+
+/// Dial a tailnet peer over plain TCP, run the mandatory `RemoteHandshake`
+/// preamble, and only then serve the connection.
+///
+/// Every failure short of acceptance is terminal for this process, for the same
+/// reason the LAN dial's is: the client was launched to control that peer, so
+/// falling back to the local server would silently attach the user to the wrong
+/// machine. The typed refusal is published to the window before the process
+/// gives up, so the last thing on screen names why (UX-002).
+async fn run_remote_connection(ctx: IpcThread, host: String, port: u16) -> Result<(), String> {
+    let remote = Arc::clone(&ctx.shared.remote);
+    let status = Arc::clone(&ctx.shared.status);
+    let generation = Arc::clone(&ctx.shared.generation);
+    tracing::info!(%host, port, "dialing a tailnet peer instead of the local socket");
+
+    let dialer = RemoteDialer::new(host, port);
+    let mut stream = dialer.connect().await.map_err(|error| error.to_string())?;
+    let outcome = remote_handshake::perform_remote_handshake(
+        &mut stream,
+        remote_handshake::local_device_name(),
+    )
+    .await;
+    publish_remote_status(&remote, &status, &generation, |chrome| chrome.settle_dial(outcome));
+    if outcome != RemoteConnectOutcome::Accepted {
+        let (peer_host, peer_port) = dialer.target();
+        return Err(format!("tailnet dial to {peer_host}:{peer_port} was not accepted"));
+    }
+
+    // Accepted: the tailnet link now behaves exactly like the local socket, and
+    // the claim the picker asked for rides the ordinary `Hello`.
+    ctx.shared.connected.store(true, Ordering::Release);
+    let (reader, writer) = tokio::io::split(stream);
+    serve_connection(
+        ctx,
+        reader,
+        writer,
+        Transport::Remote {
+            window_id: remote_handshake::remote_dial_window_from_env(),
+            takeover: remote_handshake::remote_dial_takeover_from_env(),
+        },
+    )
+    .await
+}
+
+/// Apply `mutate` to the tailnet chrome and mirror the resulting summary onto
+/// the status bar.
+///
+/// The dial path runs before any [`ReaderCtx`] exists, so it holds the three
+/// shared handles directly rather than going through [`update_remote_chrome`].
+fn publish_remote_status(
+    remote: &Arc<Mutex<RemoteChrome>>,
+    status: &Arc<Mutex<String>>,
+    generation: &Arc<AtomicU64>,
+    mutate: impl FnOnce(&mut RemoteChrome),
+) {
+    let Ok(mut guard) = remote.lock() else {
+        tracing::warn!("remote chrome mutex poisoned; dropping dial update");
+        return;
+    };
+    mutate(&mut guard);
+    let line = guard.status_line();
+    drop(guard);
+    if let Some(line) = line {
+        set_status(status, generation, line);
+    }
 }
 
 /// Dial a LAN peer over TCP + pinned mutual TLS, run the `LanHello` preamble and
@@ -4435,16 +4701,37 @@ fn publish_lan_status(
     }
 }
 
-/// Which transport carried this connection, gating the local-only LAN queries.
-/// A remote peer must never be asked to enumerate this machine's LAN view — the
-/// server refuses it, and asking would put a pointless frame on the wire.
+/// The pre-`Hello` environment answers a LOCAL connection carries in from its
+/// transient probe sockets. Each is `None` when the matching surface is disabled
+/// in config or the probe failed, and the raw [`ServerMessage`] is kept so the
+/// reply folds through the same handler the live reader uses.
+struct LocalProbes {
+    /// The feature-014 `LanEnv` reply, when `remote.lan.enabled`.
+    lan_env: Option<ServerMessage>,
+    /// The feature-013 `RemoteEnv` reply, when `remote.enabled`.
+    remote_env: Option<ServerMessage>,
+}
+
+/// Which transport carried this connection, gating the local-only LAN/tailnet
+/// queries and naming the window claim the `Hello` makes. A remote peer must
+/// never be asked to enumerate this machine's LAN or tailnet view — the server
+/// refuses it, and asking would put a pointless frame on the wire.
 enum Transport {
-    /// This machine's own server over the Unix socket, carrying the `LanEnv`
-    /// answer probed before the connection was opened. `None` when LAN access is
-    /// off or the probe failed.
-    Local(Option<ServerMessage>),
+    /// This machine's own server over the Unix socket, carrying the environment
+    /// answers probed before the connection was opened. Boxed because a raw
+    /// [`ServerMessage`] is far larger than the other variants' payloads and this
+    /// value is moved once per process.
+    Local(Box<LocalProbes>),
     /// A LAN peer over mutual TLS.
     Lan,
+    /// A tailnet peer over plain TCP, past an accepted `RemoteHandshake`.
+    Remote {
+        /// The window to claim on the peer; `None` opens a fresh one.
+        window_id: Option<scribe_common::ids::WindowId>,
+        /// Whether this is the explicit-attach path that may displace a
+        /// connected controller (FR-011); never set on auto-reconnect.
+        takeover: bool,
+    },
 }
 
 /// Send the handshake, start the writer and the drain, run the local-only LAN
@@ -4467,20 +4754,27 @@ where
     // another local process already holds: the server resolves that non-takeover
     // claim as an additive share join under any non-`single_controller` sharing
     // mode, so this client renders and types into the SAME panes instead of
-    // opening an empty window of its own.
-    let join_window = scribe_client_gpui::share_join::join_window_from_env();
-    if let Some(window_id) = join_window {
-        tracing::info!(%window_id, "joining an existing window's share");
+    // opening an empty window of its own. A tailnet dial instead carries the
+    // claim the connect picker made, including the explicit-attach takeover that
+    // may displace a connected controller.
+    let (claim_window, takeover) = match &transport {
+        Transport::Local(_) | Transport::Lan => {
+            (scribe_client_gpui::share_join::join_window_from_env(), false)
+        }
+        Transport::Remote { window_id, takeover } => (*window_id, *takeover),
+    };
+    if let Some(window_id) = claim_window {
+        tracing::info!(%window_id, takeover, "claiming an existing window");
     }
     ctx.out_tx
         .send(ClientMessage::Hello {
-            window_id: join_window,
+            window_id: claim_window,
             // Spec 010 C7: this client owns a host clipboard and a confirmation
             // modal, so it opts into OSC 52 gating. With the bit clear the
             // server takes the headless deny path and never sends a single
             // Clipboard* frame, which is what made the whole surface dead.
             clipboard_gating: true,
-            takeover: false,
+            takeover,
         })
         .map_err(|_| "writer channel closed".to_owned())?;
     ctx.out_tx.send(ClientMessage::ListSessions).map_err(|_| "writer channel closed".to_owned())?;
@@ -4512,13 +4806,15 @@ where
         workspaces: ctx.shared.workspaces,
         notes: ctx.shared.notes,
         clipboard: ctx.shared.clipboard,
+        remote: ctx.shared.remote,
         out_tx: ctx.out_tx,
         in_tx: ctx.in_tx,
         sink: ctx.sink,
         size: ctx.size,
     };
-    if let Transport::Local(lan_env) = transport {
-        adopt_lan_surface(&reader_ctx, lan_env);
+    if let Transport::Local(probes) = transport {
+        adopt_lan_surface(&reader_ctx, probes.lan_env);
+        adopt_remote_surface(&reader_ctx, probes.remote_env);
     }
     run_reader(reader, reader_ctx).await
 }
@@ -4552,6 +4848,40 @@ fn adopt_lan_surface(ctx: &ReaderCtx, lan_env: Option<ServerMessage>) {
     on_lan_message(ctx, lan_env);
     if let Err(error) = ctx.sink.list_lan_peers() {
         tracing::warn!(%error, "LAN peer list request dropped: IPC writer closed");
+    }
+}
+
+/// Ask this machine's own server for its tailnet environment on a transient
+/// socket.
+///
+/// Gated on `remote.enabled` exactly as the window-list poll is: with remote
+/// access off there is no account to report and no peer a picker could offer, so
+/// the frame would be pure noise. The raw reply travels back so it can be folded
+/// through the same [`on_remote_message`] the live reader uses rather than a
+/// second, divergent parser.
+async fn probe_remote_env() -> Option<ServerMessage> {
+    if !load_config().is_ok_and(|config| config.remote.enabled) {
+        return None;
+    }
+    match remote_handshake::probe_remote_env().await {
+        Ok(message) => Some(message),
+        Err(error) => {
+            tracing::warn!(%error, "remote environment probe failed");
+            None
+        }
+    }
+}
+
+/// Fold the pre-probed `RemoteEnv` and ask the session connection for the
+/// same-account tailnet peer list, which the server answers only for a LOCAL
+/// connection.
+fn adopt_remote_surface(ctx: &ReaderCtx, remote_env: Option<ServerMessage>) {
+    let Some(remote_env) = remote_env else {
+        return;
+    };
+    on_remote_message(ctx, remote_env);
+    if let Err(error) = ctx.sink.list_remote_peers() {
+        tracing::warn!(%error, "remote peer list request dropped: IPC writer closed");
     }
 }
 
@@ -4785,6 +5115,9 @@ struct ReaderCtx {
     /// Spec-010 OSC 52 state the reader records gating on, parks confirmation
     /// requests in, and queues host clipboard jobs onto.
     clipboard: Arc<Mutex<ClipboardBridge>>,
+    /// Feature-013 tailnet state the reader folds every remote answer onto and
+    /// queues inbound automation actions in.
+    remote: Arc<Mutex<RemoteChrome>>,
     out_tx: UnboundedSender<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
@@ -4804,6 +5137,33 @@ fn update_ai_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut AiChrome)) {
     mutate(&mut guard);
     drop(guard);
     ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Fold one AI notice onto the shared [`AiChrome`].
+///
+/// Extracted from [`dispatch_server_message`] so that table stays a screen of
+/// routing decisions. The caller only ever hands over the three variants named
+/// here; anything else is a routing bug and is reported as an unhandled
+/// message rather than silently ignored.
+fn on_ai_message(ctx: &ReaderCtx, message: ServerMessage) {
+    match message {
+        // The server has already merged partial OSC events onto the stored
+        // state, so the percent that arrives here is the live one.
+        ServerMessage::AiStateChanged { session_id, ai_state } => {
+            update_ai_chrome(ctx, |ai| ai.tracker.update(session_id, ai_state));
+        }
+        ServerMessage::AiStateCleared { session_id } => {
+            update_ai_chrome(ctx, |ai| {
+                ai.tracker.remove(session_id);
+                ai.tracker.clear_context(session_id);
+            });
+        }
+        ServerMessage::PromptReceived { session_id, text, .. } => {
+            let at = std::time::SystemTime::now();
+            update_ai_chrome(ctx, |ai| ai.record_prompt(session_id, text, at));
+        }
+        other => unhandled_server_message(&other),
+    }
 }
 
 /// Apply `mutate` to the shared terminal-chrome metadata and request a repaint.
@@ -4885,6 +5245,32 @@ fn update_lan_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut LanChrome)) {
 fn update_lan_chrome_and_status(ctx: &ReaderCtx, mutate: impl FnOnce(&mut LanChrome)) {
     update_lan_chrome(ctx, mutate);
     let line = ctx.lan.lock().ok().and_then(|lan| lan.status_line());
+    if let Some(line) = line {
+        set_status(&ctx.status, &ctx.generation, line);
+    }
+}
+
+/// Apply `mutate` to the shared tailnet chrome and request a repaint.
+///
+/// Poisoning is dropped silently for the same reason it is on the AI chrome:
+/// losing one remote update must never tear the reader down and with it the
+/// pane's terminal output.
+fn update_remote_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut RemoteChrome)) {
+    let Ok(mut guard) = ctx.remote.lock() else {
+        tracing::warn!("remote chrome mutex poisoned; dropping update");
+        return;
+    };
+    mutate(&mut guard);
+    drop(guard);
+    ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Fold a tailnet change and mirror the resulting one-line summary onto the
+/// status bar, so every remote transition the reader applies is also visible on
+/// screen.
+fn update_remote_chrome_and_status(ctx: &ReaderCtx, mutate: impl FnOnce(&mut RemoteChrome)) {
+    update_remote_chrome(ctx, mutate);
+    let line = ctx.remote.lock().ok().and_then(|remote| remote.status_line());
     if let Some(line) = line {
         set_status(&ctx.status, &ctx.generation, line);
     }
@@ -5133,21 +5519,12 @@ fn dispatch_server_message(
         ServerMessage::SessionExited { session_id, .. } => {
             on_session_exited(ctx, registry, session_id, attached)?;
         }
-        ServerMessage::AiStateChanged { session_id, ai_state } => {
-            // The server has already merged partial OSC events onto the
-            // stored state, so the percent that arrives here is the live one.
-            update_ai_chrome(ctx, |ai| ai.tracker.update(session_id, ai_state));
-        }
-        ServerMessage::AiStateCleared { session_id } => {
-            update_ai_chrome(ctx, |ai| {
-                ai.tracker.remove(session_id);
-                ai.tracker.clear_context(session_id);
-            });
-        }
-        ServerMessage::PromptReceived { session_id, text, .. } => {
-            let at = std::time::SystemTime::now();
-            update_ai_chrome(ctx, |ai| ai.record_prompt(session_id, text, at));
-        }
+        // The three AI notices all land in the one shared [`AiChrome`] the
+        // status bar and the prompt bar render from, so they are named here and
+        // routed as one to [`on_ai_message`].
+        ai @ (ServerMessage::AiStateChanged { .. }
+        | ServerMessage::AiStateCleared { .. }
+        | ServerMessage::PromptReceived { .. }) => on_ai_message(ctx, ai),
         ServerMessage::TrimScrollback { session_id, history_rows } => {
             on_trim_scrollback(ctx, registry, session_id, history_rows);
         }
@@ -5233,6 +5610,21 @@ fn dispatch_server_message(
         | ServerMessage::ClipboardBridgeReadRequest { .. }) => {
             on_clipboard_message(ctx, clipboard);
         }
+        // Feature 013: every tailnet answer — the dial preamble's reply, the
+        // discovery/environment replies the startup probe asks for, the
+        // displacement and severance notices, and the automation round trip —
+        // lands in the one shared [`RemoteChrome`], so they are named here and
+        // routed as one to [`on_remote_message`]. Naming them is what keeps the
+        // remote surface reachable: unnamed, a `WindowTakenOver` reaches the drop
+        // counter and the user keeps typing into a window someone else is
+        // driving.
+        remote @ (ServerMessage::RemoteHandshakeReply { .. }
+        | ServerMessage::RemotePeerList { .. }
+        | ServerMessage::RemoteEnv { .. }
+        | ServerMessage::RemoteDisconnect { .. }
+        | ServerMessage::WindowTakenOver { .. }
+        | ServerMessage::RunAction { .. }
+        | ServerMessage::ActionDispatched { .. }) => on_remote_message(ctx, remote),
         other => unhandled_server_message(&other),
     }
     Ok(())
@@ -5724,6 +6116,105 @@ fn lan_approval_outcome(
         (true, _) => LanConnectOutcome::Accepted,
         (false, Some(reason)) => LanConnectOutcome::Refused(reason),
         (false, None) => LanConnectOutcome::ConnectionFailure,
+    }
+}
+
+/// Fold one feature-013 tailnet answer into the shared [`RemoteChrome`].
+///
+/// Seven variants, three jobs. The environment/peer pair is passive chrome. The
+/// displacement pair is not: a `WindowTakenOver` freezes the window under the
+/// reclaim banner and a `RemoteDisconnect` records why the peer severed the
+/// link, and both must be visible before the user's next keystroke goes
+/// somewhere it no longer belongs. The automation pair is the `scribe action …`
+/// round trip: `RunAction` is queued for the foreground (the action it names may
+/// only run on the thread that owns the window) and `ActionDispatched`
+/// acknowledges a dispatch this client sent.
+///
+/// Anything other than the remote family is a programming error in
+/// [`dispatch_server_message`]'s routing, not a protocol event, so it is counted
+/// as unhandled rather than silently dropped.
+fn on_remote_message(ctx: &ReaderCtx, message: ServerMessage) {
+    match message {
+        ServerMessage::RemoteEnv { account, tailscale_detected } => {
+            tracing::info!(
+                identified = account.is_some(),
+                tailscale_detected,
+                "server tailnet environment"
+            );
+            update_remote_chrome_and_status(ctx, |remote| {
+                remote.set_env(RemoteEnvSummary { account, tailscale_detected });
+            });
+        }
+        ServerMessage::RemotePeerList { peers } => {
+            tracing::info!(count = peers.len(), "server tailnet peer list");
+            update_remote_chrome_and_status(ctx, |remote| remote.set_peers(peers));
+        }
+        ServerMessage::RemoteHandshakeReply {
+            accepted,
+            refusal,
+            server_remote_protocol_version,
+            server_scribe_version,
+        } => {
+            // Normally consumed by `remote_handshake::perform_remote_handshake`
+            // before this reader exists; one arriving afterwards still means the
+            // same thing, so it settles the dial identically rather than being
+            // dropped as out of sequence.
+            tracing::info!(
+                accepted,
+                ?refusal,
+                server_remote_protocol_version,
+                %server_scribe_version,
+                "remote handshake reply"
+            );
+            let outcome = remote_handshake_outcome(accepted, refusal);
+            update_remote_chrome_and_status(ctx, |remote| remote.settle_dial(outcome));
+        }
+        ServerMessage::RemoteDisconnect { reason } => {
+            // Best-effort final frame: the peer closes the link right after it,
+            // so recording the typed reason here is the only chance the window
+            // has to say why the connection went away instead of just dying.
+            tracing::info!(?reason, "remote peer severed the connection");
+            update_remote_chrome_and_status(ctx, |remote| remote.sever(reason));
+        }
+        ServerMessage::WindowTakenOver { device_name, login_name } => {
+            // Logged because the banner is pixels only: a scripted E2E can then
+            // prove the notice reached the chrome and not just the socket.
+            tracing::info!(%device_name, %login_name, "window taken over by another controller");
+            update_remote_chrome_and_status(ctx, |remote| {
+                remote.displace(LostControlState::new(device_name, login_name));
+            });
+        }
+        ServerMessage::RunAction { action } => {
+            // Queued rather than executed: the action opens tabs, splits panes,
+            // and moves focus, all of which are GPUI entities only the window's
+            // own thread may touch. The lifecycle tick drains the queue.
+            tracing::info!(?action, "automation action received");
+            update_remote_chrome(ctx, |remote| remote.queue_action(action));
+        }
+        ServerMessage::ActionDispatched { window_id } => {
+            // The ack for a `DispatchAction` this client sent. There is nothing
+            // to render — the effect arrives separately as the `RunAction` the
+            // server routed to the window's controller — so it is logged as the
+            // routing confirmation it is.
+            tracing::info!(%window_id, "automation action routed by the server");
+        }
+        // Unreachable: the caller only routes the remote family here.
+        other => unhandled_server_message(&other),
+    }
+}
+
+/// Map a decoded `RemoteHandshakeReply` onto the typed dial outcome. A refusal
+/// with no reason is a protocol violation, reported as a generic connection
+/// failure rather than inventing a cause — the same rule
+/// [`remote_handshake::perform_remote_handshake`] applies during the preamble.
+fn remote_handshake_outcome(
+    accepted: bool,
+    refusal: Option<scribe_common::protocol::RemoteRefusal>,
+) -> RemoteConnectOutcome {
+    match (accepted, refusal) {
+        (true, _) => RemoteConnectOutcome::Accepted,
+        (false, Some(reason)) => RemoteConnectOutcome::Refused(reason),
+        (false, None) => RemoteConnectOutcome::ConnectionFailure,
     }
 }
 

@@ -17,7 +17,8 @@
 //! toggle on an `EnvPreflight` probe, and `Remote` renders the feature-014 LAN
 //! trust surface (`GetLanEnv`, `ListTrustedNetworks`, `ListTrustedDevices`) with
 //! `AddCurrentNetworkTrusted` / `RemoveTrustedNetwork` / `RevokeTrustedDevice`
-//! mutations. Every one of those calls is reached from [`SettingsWindow::run_action`].
+//! mutations, plus the feature-013 tailnet summary (`GetRemoteEnv`). Every one
+//! of those calls is reached from [`SettingsWindow::run_action`].
 
 use std::time::Duration;
 
@@ -34,7 +35,7 @@ use crate::settings::model::{
     REFRESH_TRUST_ACTION, REMOVE_TRUSTED_NETWORK_PREFIX, REVOKE_TRUSTED_DEVICE_PREFIX,
     SettingsPage, page_controls,
 };
-use crate::settings::server_action::{self, EnvPreflightOutcome, LanEnvOutcome};
+use crate::settings::server_action::{self, EnvPreflightOutcome, LanEnvOutcome, RemoteEnvOutcome};
 use crate::settings::values::{current_value, keybinding_combos};
 use crate::tab_bar::srgba;
 
@@ -55,6 +56,9 @@ struct TrustState {
     /// This machine's own LAN identity plus whether the current network is
     /// addable, from `GetLanEnv`.
     lan: LanEnvOutcome,
+    /// This machine's signed-in tailnet account and whether Tailscale was
+    /// detected at all, from `GetRemoteEnv` (feature 013, UX-003 / FR-015).
+    remote: RemoteEnvOutcome,
     /// Trusted networks from `ListTrustedNetworks`.
     networks: Vec<TrustedNetworkInfo>,
     /// Whether the network this machine is on right now is trusted (UX-004).
@@ -257,18 +261,21 @@ impl SettingsWindow {
         self.commit(key, value, cx);
     }
 
-    /// Re-read the whole feature-014 LAN trust surface from the local server:
-    /// this machine's own identity/addability (`GetLanEnv`), the trusted networks
-    /// plus current-network trust flag (`ListTrustedNetworks`), and the approved
-    /// devices (`ListTrustedDevices`). Every helper folds its own failures into a
+    /// Re-read the whole Remote page's runtime surface from the local server:
+    /// the feature-014 LAN identity/addability (`GetLanEnv`), the trusted
+    /// networks plus current-network trust flag (`ListTrustedNetworks`), the
+    /// approved devices (`ListTrustedDevices`), and the feature-013 tailnet
+    /// environment (`GetRemoteEnv`). Every helper folds its own failures into a
     /// fail-closed default, so this always leaves one renderable shape behind.
     fn refresh_trust(&mut self) {
         let lan = server_action::request_lan_env(SERVER_ACTION_TIMEOUT);
         let networks = server_action::request_trusted_networks(SERVER_ACTION_TIMEOUT);
         let devices = server_action::request_trusted_devices(SERVER_ACTION_TIMEOUT);
+        let remote = server_action::request_remote_env(SERVER_ACTION_TIMEOUT);
         self.trust = TrustState {
             loaded: true,
             lan,
+            remote,
             networks: networks.networks,
             current_trusted: networks.current_trusted,
             devices,
@@ -517,7 +524,31 @@ impl SettingsWindow {
         out.extend(self.trusted_network_rows(cx));
         out.push(self.section_heading("Approved devices"));
         out.extend(self.trusted_device_rows(cx));
+        // The feature-013 tailnet summary is APPENDED, never interleaved: the
+        // rows above are addressed by stable window-relative offsets in
+        // `tests/e2e/visual/settings-trust.sh`, so anything new has to land past
+        // the last of them.
+        out.push(self.section_heading("Tailscale"));
+        out.push(self.note_row(&self.tailnet_note()));
         out
+    }
+
+    /// The read-only tailnet line under the Remote page (UX-003, FR-015).
+    ///
+    /// `GetRemoteEnv` fails closed to `{ account: None, tailscale_detected:
+    /// false }` on any transport error, which is exactly the shape that drives
+    /// the passive "not detected" copy — so an unreachable server and an absent
+    /// `tailscaled` say the same true thing rather than showing a spinner.
+    fn tailnet_note(&self) -> String {
+        let remote = &self.trust.remote;
+        if !remote.tailscale_detected {
+            return "Tailscale not detected — remote control over the tailnet is unavailable."
+                .to_owned();
+        }
+        remote.account.as_ref().map_or_else(
+            || "Tailscale detected; the signed-in account is unknown.".to_owned(),
+            |account| format!("Signed in to Tailscale as {account}."),
+        )
     }
 
     /// The three read-only status lines under the trust actions: whether the

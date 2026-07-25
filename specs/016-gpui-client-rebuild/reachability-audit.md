@@ -110,15 +110,15 @@ Determination techniques, in order of authority:
 | `CheckForUpdates` | scripted-E2E | WIRED | `settings/window.rs:161` from `action.check_for_updates` (`settings/model.rs:386`). Reached through the settings window, which bead .82 made reachable from inside the running client (settings chord, palette row, titlebar gear) as well as via `scribe-client-gpui --settings` |
 | `ListReleases` | scripted-E2E | WIRED | `settings/window.rs:165` from `action.list_releases` (`settings/model.rs:387`); same settings-window reachability |
 | `ListWindows` | scripted-E2E | WIRED (bead .72) | `TerminalView::poll_window_list` → `IpcSink::list_windows` |
-| `DispatchAction` | scripted-E2E | MISSING | not in the GPUI client; `scribe-cli` is the only sender |
+| `DispatchAction` | scripted-E2E | WIRED | `IpcSink::dispatch_action`, from a viewer's window-mutating palette row |
 | `FocusChanged` | scripted-E2E | WIRED (bead .72) | `TerminalView::report_focus` → `IpcSink::focus_changed` |
 | `HookEvent` | scripted-E2E | WIRED | out-of-client by design: `crates/scribe-hook-helper/src/main.rs:119` |
 | `EnvPreflight` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.env_preflight`) and the gated `enable_env_persistence` ON transition; same settings-window reachability. Asserted on the wire by `tests/e2e/visual/settings-trust.sh` |
 | `ClipboardPromptResponse` | scripted-E2E | UNWIRED | built in `clipboard.rs`; module not imported by `main.rs` |
 | `ClipboardBridgeReadReply` | scripted-E2E | UNWIRED | built in `clipboard.rs`; module not imported by `main.rs` |
-| `RemoteHandshake` | scripted-E2E | UNWIRED | built in `remote_handshake.rs`; module not imported by `main.rs` |
-| `ListRemotePeers` | scripted-E2E | MISSING | never constructed anywhere in the crate |
-| `GetRemoteEnv` | gpui-test | UNWIRED | `settings/server_action.rs:213` `request_remote_env` has no caller |
+| `RemoteHandshake` | scripted-E2E | WIRED | `run_remote_connection` → `remote_handshake::perform_remote_handshake` |
+| `ListRemotePeers` | scripted-E2E | WIRED | `adopt_remote_surface` and `refresh_remote_peers` → `IpcSink::list_remote_peers` |
+| `GetRemoteEnv` | gpui-test | WIRED | `probe_remote_env` at startup; `SettingsWindow::refresh_trust` on the Remote page |
 | `LanHello` | scripted-E2E | MISSING | never constructed anywhere in the crate |
 | `LanApprovalDecision` | scripted-E2E | UNWIRED | built in `lan_approval.rs`; module not imported by `main.rs` |
 | `ListLanPeers` | scripted-E2E | MISSING | never constructed anywhere in the crate |
@@ -133,9 +133,12 @@ Determination techniques, in order of authority:
 | `ControlRequest` | golden | UNWIRED | built in `share.rs`, unimported. Not emitting it is by design, but its live substitute `ControlClaim` is itself UNWIRED, so the sharing surface is unreachable either way |
 | `ControlGrant` | scripted-E2E | UNWIRED | built in `share.rs`; module not imported by `main.rs` |
 
-**Client-message subtotals:** WIRED 15 · UNWIRED 17 · MISSING 14 · UNKNOWN 0.
+**Client-message subtotals:** WIRED 19 · UNWIRED 15 · MISSING 12 · UNKNOWN 0.
 (Was WIRED 13 · MISSING 16 at `f56ef95`; bead `.79` moved `Subscribe` and
-`RequestSnapshot` from MISSING to WIRED.)
+`RequestSnapshot` from MISSING to WIRED, and bead `.75` moved `RemoteHandshake`,
+`ListRemotePeers`, `GetRemoteEnv` and `DispatchAction`. Rows landed by FU-17 /
+FU-18 / FU-19 are recorded in the fix-unit list below rather than restated here;
+`tools/reachability-baseline.txt` is the authoritative live count.)
 
 ## Server messages (59)
 
@@ -175,8 +178,8 @@ Everything else is silently discarded on the wire.
 | `Welcome` | scripted-E2E | WIRED | `run_reader` arm → `SessionRegistry::adopt_window` |
 | `WindowClosed` | scripted-E2E | WIRED (bead .72) | `on_window_lifecycle_message` → `WindowLifecycle::on_window_closed` |
 | `WindowList` | scripted-E2E | WIRED (bead .72) | `on_window_lifecycle_message` → `WindowLifecycle::set_windows` |
-| `RunAction` | scripted-E2E | MISSING | no reference in the crate |
-| `ActionDispatched` | scripted-E2E | MISSING | no reference in the crate |
+| `RunAction` | scripted-E2E | WIRED | queued by `on_remote_message`, run by `poll_remote_actions` |
+| `ActionDispatched` | scripted-E2E | WIRED | `on_remote_message` — the routing ack for a dispatch this client sent |
 | `QuitRequested` | scripted-E2E | WIRED (bead .72) | `on_window_lifecycle_message` → `WindowLifecycle::on_quit_requested` |
 | `UpdateAvailable` | visual-E2E | MISSING | no reference; `StatusBarData.update_available` hardcoded `None` |
 | `UpdateProgress` | visual-E2E | MISSING | no reference; `StatusBarData.update_progress` hardcoded `None` |
@@ -190,11 +193,11 @@ Everything else is silently discarded on the wire.
 | `ClipboardPromptRequest` | visual-E2E | MISSING | no reference. The `ClipboardDialog` demo is built from literals at `main.rs:721` |
 | `ClipboardBridgeWrite` | scripted-E2E | UNWIRED | handled in `clipboard.rs`; module not imported by `main.rs` |
 | `ClipboardBridgeReadRequest` | scripted-E2E | UNWIRED | handled in `clipboard.rs`; module not imported by `main.rs` |
-| `RemoteHandshakeReply` | scripted-E2E | UNWIRED | handled in `remote_handshake.rs`; module not imported by `main.rs` |
-| `WindowTakenOver` | visual-E2E | UNWIRED | handled in `lost_control.rs`; module not imported by `main.rs` |
-| `RemoteDisconnect` | visual-E2E | MISSING | no reference in the crate |
-| `RemotePeerList` | visual-E2E | MISSING | no reference in the crate |
-| `RemoteEnv` | gpui-test | UNWIRED | parsed at `settings/server_action.rs:242`; request function has no caller |
+| `RemoteHandshakeReply` | scripted-E2E | WIRED | `perform_remote_handshake` during the preamble; `on_remote_message` on the live reader |
+| `WindowTakenOver` | visual-E2E | WIRED | `on_remote_message` → `RemoteChrome::displace` → `lost_control_overlay` |
+| `RemoteDisconnect` | visual-E2E | WIRED | `on_remote_message` → `RemoteChrome::sever` → the status strip |
+| `RemotePeerList` | visual-E2E | WIRED | `on_remote_message` → `RemoteChrome::set_peers` → the status strip |
+| `RemoteEnv` | gpui-test | WIRED | `on_remote_message` → `RemoteChrome::set_env`; also parsed by `settings/server_action.rs` |
 | `LanApprovalPending` | visual-E2E | MISSING | no reference in the crate |
 | `LanApprovalResult` | visual-E2E | MISSING | no reference in the crate |
 | `LanApprovalRequest` | visual-E2E | UNWIRED | handled in `lan_approval.rs`; module not imported by `main.rs` |
@@ -208,7 +211,11 @@ Everything else is silently discarded on the wire.
 | `ControlDenied` | visual-E2E | MISSING | no reference in the crate |
 | `ShareEnded` | visual-E2E | MISSING | no reference in the crate |
 
-**Server-message subtotals:** WIRED 14 · UNWIRED 13 · MISSING 32 · UNKNOWN 0.
+**Server-message subtotals:** WIRED 21 · UNWIRED 10 · MISSING 28 · UNKNOWN 0.
+(Bead `.75` moved the seven feature-013 rows — `RemoteHandshakeReply`,
+`WindowTakenOver`, `RemoteDisconnect`, `RemotePeerList`, `RemoteEnv`,
+`RunAction`, `ActionDispatched` — to WIRED. As above, rows landed by FU-17 /
+FU-18 / FU-19 are recorded in the fix-unit list rather than restated here.)
 
 ## Input and keybinding actions (54 named actions)
 
@@ -462,7 +469,27 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
 - **FU-16 Remote (tailnet).** Rows: `RemoteHandshake`, `ListRemotePeers`,
   `GetRemoteEnv`, `RemoteHandshakeReply`, `RemotePeerList`, `RemoteEnv`,
   `RemoteDisconnect`, `WindowTakenOver`, `DispatchAction`, `RunAction`,
-  `ActionDispatched`.
+  `ActionDispatched`. **Landed.** `remote_handshake.rs` and `lost_control.rs`
+  are now in `main.rs`'s import closure, and all seven inbound variants have
+  explicit arms in `dispatch_server_message`, routed to `on_remote_message` and
+  folded into a new shared `remote_chrome.rs::RemoteChrome`. The startup probe
+  puts `GetRemoteEnv` (transient socket) and `ListRemotePeers` (session
+  connection) on the wire when `remote.enabled`, and the Settings → Remote page
+  reaches `GetRemoteEnv` a second way through `SettingsWindow::refresh_trust`.
+  `SCRIBE_REMOTE_DIAL` reaches a tailnet peer over plain TCP and the mandatory
+  `RemoteHandshake` preamble, with the picker's window claim and explicit-attach
+  `takeover` riding the ordinary `Hello`. A `WindowTakenOver` freezes the window
+  under `lost_control.rs::lost_control_overlay` — every keystroke suppressed but
+  the Enter/click reclaim, which leaves as the v3 `ControlClaim` — and a
+  `RemoteDisconnect` names its typed reason on the status strip. `RunAction` is
+  queued for the foreground's lifecycle tick because the actions it names touch
+  GPUI entities; `DispatchAction` is its outbound twin, sent when a feature-015
+  viewer picks a window-mutating palette row the server would refuse from a
+  non-controller. Verified on two wires and on screen by
+  `tests/e2e/visual/remote-control.sh`, whose `scribe-test remote-peer` stand-in
+  terminates the real TCP dial. The connect-picker OVERLAY remains unported:
+  `remote.rs::RemoteConnect` has no GPUI view, so the peer lists it would render
+  surface on the status strip instead.
 - **FU-17 LAN (mTLS) dial and approval.** Rows: `LanHello`,
   `LanApprovalDecision`, `ListLanPeers`, `GetLanDialIdentity`,
   `LanApprovalPending`, `LanApprovalResult`, `LanApprovalRequest`, `LanPeerList`,

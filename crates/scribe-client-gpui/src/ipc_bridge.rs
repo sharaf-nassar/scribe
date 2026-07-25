@@ -18,9 +18,11 @@
 //! window-list poll and the focus observer raise (`CloseWindow` / `QuitAll` /
 //! `ListWindows` / `FocusChanged`), the feature-014 LAN frames the approval
 //! prompt and the startup LAN probe raise (`LanApprovalDecision` /
-//! `ListLanPeers`), and the workspace frames the window's split shell raises
+//! `ListLanPeers`), the workspace frames the window's split shell raises
 //! (`CreateWorkspace` / `CloseWorkspace` / `MoveSession` /
-//! `ReportWorkspaceTree`), onto the ordered IPC-writer channel. The
+//! `ReportWorkspaceTree`), and the feature-013 tailnet frames the startup
+//! remote probe and the automation fallback raise (`ListRemotePeers` /
+//! `DispatchAction`), onto the ordered IPC-writer channel. The
 //! outbound path never traverses the inbound drain, so keystrokes are never
 //! queued behind an output firehose and `Resize` is always flushed ahead of the
 //! `KeyInput` that follows.
@@ -31,7 +33,8 @@ use scribe_client_gpui::share::ControlIntent;
 use scribe_common::{
     ids::{SessionId, WindowId, WorkspaceId},
     protocol::{
-        ClientMessage, PromptMarkKind, TerminalSize, WorkspaceNotesMutation, WorkspaceTreeNode,
+        AutomationAction, ClientMessage, PromptMarkKind, TerminalSize, WorkspaceNotesMutation,
+        WorkspaceTreeNode,
     },
 };
 use tokio::{
@@ -581,6 +584,41 @@ impl IpcSink {
             "clipboard_answer takes only the two spec-010 client answers",
         );
         self.enqueue(message)
+    }
+
+    /// Asks the local server which same-account tailnet peers are online,
+    /// answered with a single `RemotePeerList` (feature 013).
+    ///
+    /// Served from THIS machine's own `LocalAPI` view and refused over any
+    /// remote transport, so it is only sent while the client is on its local
+    /// socket and `remote.enabled` makes the answer meaningful.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn list_remote_peers(&self) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::ListRemotePeers)
+    }
+
+    /// Asks the server to route one automation action to the window's registered
+    /// controller, answered with a single `ActionDispatched` naming the window it
+    /// reached (feature 013 automation).
+    ///
+    /// `window_id: None` means "the window this connection registered"; the
+    /// server refuses any other id from a registered connection, so that is the
+    /// only value the client ever sends. The controller the server forwards the
+    /// resulting `RunAction` to is not necessarily this process: under a share or
+    /// a remote takeover it is whichever client currently drives the window,
+    /// which is exactly why an action this shell cannot run locally is offered to
+    /// it rather than dropped.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn dispatch_action(
+        &self,
+        window_id: Option<WindowId>,
+        action: AutomationAction,
+    ) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::DispatchAction { window_id, action })
     }
 
     /// Reports a pane focus transition so the server can relay CSI focus events
