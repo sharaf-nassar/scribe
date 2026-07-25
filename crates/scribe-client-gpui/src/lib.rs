@@ -33,7 +33,10 @@
 //! (connection dot, command/env glyphs, workspace/CWD/git/host labels, tmux and
 //! session badges, clock, the centred update CTA, and the 013/015 remote-control
 //! and share-presence surfaces) lowered onto a GPUI flex row, fed by the
-//! [`sys_stats`] CPU/memory/network/GPU sampler that drives its sparklines.
+//! [`sys_stats`] CPU/memory/network/GPU sampler that drives its sparklines. The
+//! CTA's own inputs come from [`update`], which holds the server's latest
+//! `UpdateAvailable` / `UpdateProgress` broadcast and resolves the confirmation
+//! modal a click on the CTA opens.
 //!
 //! The binary shell consumes a growing slice of this surface directly: the
 //! [`keybindings`] parser now drives the live key path, and [`tab_session`]
@@ -88,6 +91,7 @@ pub mod tab_bar;
 pub mod tab_session;
 pub mod titlebar;
 pub mod tooltip;
+pub mod update;
 pub mod url_detect;
 pub mod vi_mode;
 pub mod window_state;

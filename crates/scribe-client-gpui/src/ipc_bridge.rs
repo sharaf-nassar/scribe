@@ -6,9 +6,10 @@
 //! batch runs one `write_output` and one repaint per dirty pane. Outbound:
 //! [`IpcSink`] replaces Zed's `write_to_pty`, enqueuing `ClientMessage::KeyInput`,
 //! `Resize`, the session-lifecycle messages the tab shortcuts drive
-//! (`CreateSession` / `AttachSessions` / `CloseSession`), and the feature-015
+//! (`CreateSession` / `AttachSessions` / `CloseSession`), the feature-015
 //! control-passing frames (`ControlClaim` / `ControlGrant`) the share surfaces
-//! raise, onto the ordered IPC-writer channel. The outbound path never
+//! raise, and the update decisions the status-bar CTA drives (`TriggerUpdate` /
+//! `DismissUpdate`), onto the ordered IPC-writer channel. The outbound path never
 //! traverses the inbound drain, so keystrokes are never queued behind an output
 //! firehose and `Resize` is always flushed ahead of the `KeyInput` that follows.
 
@@ -309,6 +310,26 @@ impl IpcSink {
         mutation: WorkspaceNotesMutation,
     ) -> Result<(), SinkClosed> {
         self.enqueue(ClientMessage::WorkspaceNotesMutate { mutation })
+    }
+
+    /// Confirms the pending update, so the server downloads, verifies, and
+    /// installs it and reports each step back as `UpdateProgress`. Sent when the
+    /// user picks "Update Now" in the centred status-bar CTA's confirmation.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn trigger_update(&self) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::TriggerUpdate)
+    }
+
+    /// Dismisses the pending update, so the server stops re-notifying about
+    /// this version. Sent when the user picks "Later" (or presses Esc) in the
+    /// centred status-bar CTA's confirmation.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn dismiss_update(&self) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::DismissUpdate)
     }
 
     fn enqueue(&self, message: ClientMessage) -> Result<(), SinkClosed> {

@@ -32,7 +32,8 @@ use scribe_client_gpui::context_menu::{
     ContextMenuColors, ContextMenuEvent, ContextMenuRequest, ContextMenuView,
 };
 use scribe_client_gpui::dialog::{
-    AnyDialog, ClipboardDialog, CloseDialog, DialogColors, DialogEvent, DialogView,
+    AnyDialog, ClipboardDialog, CloseDialog, DialogColors, DialogEvent, DialogOutcome, DialogView,
+    UpdateAction, UpdateDialogKind,
 };
 use scribe_client_gpui::input::KeyInput;
 use scribe_client_gpui::keybindings::{KeyAction, LayoutAction, translate_key_action};
@@ -49,6 +50,7 @@ use scribe_client_gpui::share::{
 use scribe_client_gpui::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
 use scribe_client_gpui::sys_stats::SystemStatsCollector;
 use scribe_client_gpui::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
+use scribe_client_gpui::update::UpdateState;
 use scribe_client_gpui::workspace_notes::WorkspaceNoteEntry;
 use scribe_client_gpui::workspace_notes_modal::{
     WorkspaceNotesModalAction, WorkspaceNotesModalColors, WorkspaceNotesModalView,
@@ -192,6 +194,10 @@ struct Shared {
     /// notices into it; the key path answers a pending request from it and the
     /// render pass draws its overlays and presence badge.
     share: Arc<Mutex<ShareChrome>>,
+    /// Latest `UpdateAvailable` / `UpdateProgress` broadcast. The IPC reader
+    /// writes it; the view renders the centred status-bar CTA from it and opens
+    /// the confirmation modal a click on that CTA resolves to.
+    update: Arc<Mutex<UpdateState>>,
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -263,8 +269,13 @@ struct TerminalView {
     context_menu: Option<Entity<ContextMenuView>>,
     /// The modal dialog overlay, present only while a modal is open. The spike
     /// wires two representative dialogs (close + clipboard) so the visual E2E
-    /// can screenshot the ported modal chrome and its focus/button behaviour.
+    /// can screenshot the ported modal chrome and its focus/button behaviour;
+    /// the update confirmation on top of them is a live surface.
     dialog: Option<Entity<DialogView>>,
+    /// Which update flow the open modal is confirming, so the resolved
+    /// [`UpdateAction`] routes to install-vs-restart. `None` whenever the open
+    /// modal is not an update confirmation.
+    update_dialog_kind: Option<UpdateDialogKind>,
     /// The per-workspace notes modal overlay, present only while open.
     workspace_notes_modal: Option<Entity<WorkspaceNotesModalView>>,
     /// Demo toggle: when set, an OSC 8-style hover tooltip is drawn over a fixed
@@ -363,6 +374,7 @@ impl TerminalView {
             command_palette: None,
             context_menu: None,
             dialog: None,
+            update_dialog_kind: None,
             workspace_notes_modal: None,
             tooltip_demo: false,
             x11_focus,
@@ -656,20 +668,87 @@ impl TerminalView {
 
     /// Open a modal dialog, subscribing so a choice or a backdrop click tears the
     /// overlay down. The other overlays are dismissed so only one modal is up.
+    ///
+    /// The resolved [`DialogOutcome`] is routed before the overlay is dropped,
+    /// so a modal that owns a side effect — today the update confirmation —
+    /// performs it. Modals whose outcome is not wired yet simply close.
     fn open_dialog(&mut self, dialog: AnyDialog, cx: &mut Context<Self>) {
         self.command_palette = None;
         self.context_menu = None;
         let colors = DialogColors::from(&self.chrome);
         let view = cx.new(|cx| DialogView::new(dialog, colors, cx));
-        cx.subscribe(&view, |this, _view, event: &DialogEvent, ctx| match event {
-            DialogEvent::Chosen(_) => {
-                this.dialog = None;
-                ctx.notify();
+        cx.subscribe(&view, |this, _view, event: &DialogEvent, ctx| {
+            let DialogEvent::Chosen(outcome) = event;
+            if let DialogOutcome::Update(action) = outcome {
+                this.route_update_action(*action);
             }
+            this.dialog = None;
+            this.update_dialog_kind = None;
+            ctx.notify();
         })
         .detach();
         self.dialog = Some(view);
         cx.notify();
+    }
+
+    /// Open the update confirmation the centred status-bar CTA resolves to.
+    ///
+    /// Nothing opens when the CTA is purely informational ("Downloading...",
+    /// "Update failed") because [`UpdateState::confirmation`] has no dialog for
+    /// those states.
+    fn open_update_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.shared.update.lock().ok().and_then(|state| state.confirmation())
+        else {
+            return;
+        };
+        let kind = match &dialog {
+            AnyDialog::Update(update) => Some(update.kind()),
+            _ => None,
+        };
+        self.open_dialog(dialog, cx);
+        self.update_dialog_kind = kind;
+    }
+
+    /// Route the update confirmation's choice onto the wire.
+    ///
+    /// Confirming an available install sends `TriggerUpdate` and clears the
+    /// pending version so the CTA stops offering it; declining sends
+    /// `DismissUpdate` so the server stops re-notifying about this version.
+    /// The restart-required flow only closes: its "Continue" spawns the
+    /// platform cold-restart helper, which the GPUI shell does not host yet, so
+    /// it is logged rather than silently swallowed.
+    fn route_update_action(&mut self, action: UpdateAction) {
+        let kind = self.update_dialog_kind;
+        match (kind, action) {
+            (Some(UpdateDialogKind::InstallAvailable), UpdateAction::Primary) => {
+                self.mutate_update_state(UpdateState::on_triggered);
+                if let Err(error) = self.sink.trigger_update() {
+                    tracing::warn!(%error, "dropped TriggerUpdate: IPC writer closed");
+                }
+            }
+            (Some(UpdateDialogKind::InstallAvailable), UpdateAction::Secondary) => {
+                self.mutate_update_state(UpdateState::on_dismissed);
+                if let Err(error) = self.sink.dismiss_update() {
+                    tracing::warn!(%error, "dropped DismissUpdate: IPC writer closed");
+                }
+            }
+            (Some(UpdateDialogKind::RestartRequired), UpdateAction::Primary) => {
+                tracing::warn!("deferred cold restart helper is not wired in the GPUI shell");
+            }
+            (Some(UpdateDialogKind::RestartRequired), UpdateAction::Secondary) => {
+                tracing::info!("user postponed the deferred cold restart");
+            }
+            (None, _) => tracing::warn!("update action without an open update dialog"),
+        }
+    }
+
+    /// Apply `mutate` to the shared update state from the GPUI thread.
+    fn mutate_update_state(&self, mutate: impl FnOnce(&mut UpdateState)) {
+        let Ok(mut guard) = self.shared.update.lock() else {
+            tracing::warn!("update state mutex poisoned; dropping update decision");
+            return;
+        };
+        mutate(&mut guard);
     }
 
     /// Open the workspace-notes modal for a demo workspace, request its
@@ -1205,6 +1284,11 @@ impl TerminalView {
         let metadata = metadata.as_deref();
         let session =
             active_session.zip(metadata).and_then(|(session_id, store)| store.session(session_id));
+        // Hold the update guard across `build_model`: `StatusBarData` borrows
+        // the version and progress state rather than cloning them per frame.
+        let update = self.shared.update.lock().ok();
+        let update_available = update.as_ref().and_then(|state| state.version());
+        let update_progress = update.as_ref().and_then(|state| state.progress());
         status_bar::build_model(
             &StatusBarData {
                 connected,
@@ -1224,13 +1308,32 @@ impl TerminalView {
                 remote_transport: None,
                 tmux_label: session.and_then(SessionChrome::tmux_label),
                 time: "",
-                update_available: None,
-                update_progress: None,
+                update_available,
+                update_progress,
                 sys_stats: Some(sys_stats),
                 stats_config: Some(&self.stats_config),
             },
             &self.status_colors,
         )
+    }
+
+    /// Build the status-bar band, wiring the centred update CTA's click to the
+    /// confirmation modal.
+    ///
+    /// The palette is cached across renders, so the live opacity is folded into
+    /// the filled band here rather than at theme-reload time.
+    fn render_status_bar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let model = self.build_status_model();
+        let colors = self.status_colors.with_opacity(self.opacity);
+        status_bar::render(
+            &model,
+            24.,
+            &colors,
+            Some(Box::new(cx.listener(|view, _event, _window, ctx| {
+                view.open_update_dialog(ctx);
+            }))),
+        )
+        .into_any_element()
     }
 
     /// Build the attached pane's prompt-bar model, or `None` when the bar is
@@ -1341,7 +1444,7 @@ impl Render for TerminalView {
             .lock()
             .map_or_else(|_| "terminal state unavailable".to_owned(), |guard| guard.clone());
 
-        let model = self.build_status_model();
+        let status_bar = self.render_status_bar(cx);
         let prompt_model = self.build_prompt_model();
         self.sync_tab_context_suffix(cx);
         let prompt_colors = self.prompt_colors.with_opacity(self.opacity);
@@ -1357,10 +1460,6 @@ impl Render for TerminalView {
             background: surface(self.terminal_colors.background, opacity),
             foreground: opaque_slot(self.terminal_colors.foreground),
         };
-        // The status bar caches its palette across renders, so fold the live
-        // opacity into the filled band here rather than at theme-reload time.
-        let status_colors = self.status_colors.with_opacity(opacity);
-
         // The root itself paints nothing. Every band below fills the window
         // edge to edge, so leaving the root unfilled guarantees each pixel
         // carries the opacity alpha exactly once instead of compositing a
@@ -1412,7 +1511,7 @@ impl Render for TerminalView {
                     .text_xs()
                     .child(status),
             )
-            .child(status_bar::render(&model, 24., &status_colors))
+            .child(status_bar)
             .children(self.command_palette.clone())
             .children(self.context_menu.clone())
             .children(self.dialog.clone())
@@ -1463,6 +1562,7 @@ fn main() {
         ))),
         chrome_metadata: Arc::new(Mutex::new(ChromeMetadata::new())),
         share: Arc::new(Mutex::new(ShareChrome::new())),
+        update: Arc::new(Mutex::new(UpdateState::default())),
     };
     let terminal_size = TerminalSize {
         cols: COLUMNS,
@@ -1621,6 +1721,7 @@ async fn run_connection(ctx: IpcThread) -> Result<(), String> {
             chrome_metadata: ctx.shared.chrome_metadata,
             tabs: ctx.shared.tabs,
             share: ctx.shared.share,
+            update: ctx.shared.update,
             out_tx: ctx.out_tx,
             in_tx: ctx.in_tx,
             sink: ctx.sink,
@@ -1770,6 +1871,8 @@ struct ReaderCtx {
     tabs: Arc<Mutex<TabSessions>>,
     /// Feature-015 share state the reader folds roster and control notices into.
     share: Arc<Mutex<ShareChrome>>,
+    /// Update availability / progress the centred status-bar CTA renders from.
+    update: Arc<Mutex<UpdateState>>,
     out_tx: UnboundedSender<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
@@ -1812,6 +1915,21 @@ fn update_chrome_metadata(ctx: &ReaderCtx, mutate: impl FnOnce(&mut ChromeMetada
 fn update_share_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut ShareChrome)) {
     let Ok(mut guard) = ctx.share.lock() else {
         tracing::warn!("share chrome mutex poisoned; dropping update");
+        return;
+    };
+    mutate(&mut guard);
+    drop(guard);
+    ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Apply `mutate` to the shared update state and request a repaint.
+///
+/// Poisoning is dropped silently for the same reason the AI chrome drops it:
+/// losing an update banner must never tear down the reader and with it every
+/// attached pane's output.
+fn update_update_state(ctx: &ReaderCtx, mutate: impl FnOnce(&mut UpdateState)) {
+    let Ok(mut guard) = ctx.update.lock() else {
+        tracing::warn!("update state mutex poisoned; dropping update");
         return;
     };
     mutate(&mut guard);
@@ -2071,6 +2189,12 @@ fn dispatch_server_message(
         | ServerMessage::SessionContextChanged { .. }
         | ServerMessage::EnvStatus { .. }
         | ServerMessage::WorkspaceNamed { .. }) => on_chrome_message(ctx, chrome),
+        // Both update broadcasts land in the same shared state behind the
+        // centred status-bar CTA, so they are named here and routed as one to
+        // [`on_update_message`].
+        update @ (ServerMessage::UpdateAvailable { .. } | ServerMessage::UpdateProgress { .. }) => {
+            on_update_message(ctx, update);
+        }
         ServerMessage::Error { message } => set_status(&ctx.status, &ctx.generation, message),
         // Feature 015: the four share/control notices are routed as one group so
         // this table stays a screen of routing decisions; the arm names each
@@ -2123,6 +2247,28 @@ fn on_chrome_message(ctx: &ReaderCtx, message: ServerMessage) {
             update_chrome_metadata(ctx, |store| store.name_workspace(workspace_id, name));
         }
         // Unreachable: the caller only routes the chrome family here.
+        other => unhandled_server_message(&other),
+    }
+}
+
+/// Fold one update broadcast onto the state the centred status-bar CTA renders
+/// from.
+///
+/// These two variants are the server's only channel for update availability and
+/// install progress. Before they were wired the matching [`StatusBarData`]
+/// fields were hardcoded `None`, so the terminal window could neither show an
+/// update nor offer one — that only worked in the `--settings` window.
+fn on_update_message(ctx: &ReaderCtx, message: ServerMessage) {
+    match message {
+        ServerMessage::UpdateAvailable { version, release_url } => {
+            tracing::info!(%version, "update available");
+            update_update_state(ctx, |update| update.on_available(version, release_url));
+        }
+        ServerMessage::UpdateProgress { state } => {
+            tracing::info!(?state, "update progress");
+            update_update_state(ctx, |update| update.on_progress(state));
+        }
+        // Unreachable: the caller only routes the two update variants here.
         other => unhandled_server_message(&other),
     }
 }

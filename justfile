@@ -123,6 +123,12 @@ e2e-visual script:
 e2e-visual-share:
     docker run --rm --gpus all -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/share-control.sh
 
+# Run the update-surface visual E2E pair. The server polls a fake releases API
+# inside the container, so it needs a longer budget than the default 60 s.
+e2e-visual-update:
+    docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_UPDATE_API_URL=http://127.0.0.1:8099/releases/latest -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/update-config.toml)" -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/update-trigger.sh
+    docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_UPDATE_API_URL=http://127.0.0.1:8099/releases/latest -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/update-config.toml)" -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/update-dismiss.sh
+
 # Full functional E2E suite: build, containerise, run all tests
 e2e: build-release docker-func
     just e2e-func func/smoke.sh

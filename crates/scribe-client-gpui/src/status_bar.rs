@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use gpui::{Rgba, div, prelude::*, px};
+use gpui::{App, ClickEvent, Rgba, Window, div, prelude::*, px};
 use scribe_common::config::StatusBarStatsConfig;
 use scribe_common::protocol::{ControllerInfo, EnvStatusState, UpdateProgressState};
 use scribe_common::theme::ChromeColors;
@@ -598,6 +598,35 @@ fn span_row(spans: &[Span]) -> impl IntoElement {
     )
 }
 
+/// Click listener for the centred update CTA, boxed so [`render`] can stay a
+/// plain function while the caller supplies a `cx.listener(..)` closure bound to
+/// its own view.
+pub type UpdateClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+
+/// Render the centred CTA, wiring the click listener when the model says the
+/// update is actionable and the caller supplied one.
+///
+/// An actionable CTA gets a pointer cursor and an accent hover tint so it reads
+/// as a control, matching the legacy client's hit-tested update rect; a purely
+/// informational label ("Downloading...", "Update failed") stays inert.
+fn center_cta(
+    span: &Span,
+    clickable: bool,
+    colors: &StatusBarColors,
+    on_click: Option<UpdateClickHandler>,
+) -> gpui::AnyElement {
+    let base = div().px_2().text_color(rgba(span.color)).child(span.text.clone());
+    match on_click.filter(|_| clickable) {
+        Some(listener) => base
+            .id("status-bar-update-cta")
+            .cursor_pointer()
+            .hover(|style| style.text_color(rgba(colors.accent)))
+            .on_click(listener)
+            .into_any_element(),
+        None => base.into_any_element(),
+    }
+}
+
 /// Render the status bar model onto a full-width GPUI flex row.
 ///
 /// The bar is a monospace `height_px`-tall band anchored at the window bottom
@@ -608,7 +637,12 @@ pub fn render(
     model: &StatusBarModel,
     height_px: f32,
     colors: &StatusBarColors,
+    on_update_click: Option<UpdateClickHandler>,
 ) -> impl IntoElement {
+    let center = model
+        .center
+        .as_ref()
+        .map(|span| center_cta(span, model.center_clickable, colors, on_update_click));
     div()
         .w_full()
         .h(px(height_px))
@@ -623,14 +657,7 @@ pub fn render(
         .text_xs()
         .text_color(rgba(colors.text))
         .child(span_row(&model.left))
-        .child(
-            div().flex_1().flex().flex_row().justify_center().children(
-                model
-                    .center
-                    .as_ref()
-                    .map(|span| div().text_color(rgba(span.color)).child(span.text.clone())),
-            ),
-        )
+        .child(div().flex_1().flex().flex_row().justify_center().children(center))
         .child(span_row(&model.right))
 }
 

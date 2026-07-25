@@ -89,10 +89,10 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `WorkspaceNotesGet` | workspace notes | scripted-E2E | `main.rs::open_workspace_notes_modal` → `IpcSink::workspace_notes_get` — **degenerate** (demo chord, fabricated `WorkspaceId`, reply dropped by the reader catch-all); FU-21 | required |
 | `WorkspaceNotesMutate` | workspace notes | scripted-E2E | `main.rs::route_workspace_notes_action` → `IpcSink::workspace_notes_mutate` — same demo caveat; FU-21 | required |
 | `Hello` | registration/adoption | scripted-E2E | `main.rs::run_connection` (sent on every connect) | required |
-| `CloseWindow` | close dialog | scripted-E2E | — (missing, FU-13) — `DialogEvent::Chosen(_)` is discarded | required |
+| `CloseWindow` | close dialog | scripted-E2E | — (missing, FU-13) — `main.rs::TerminalView::open_dialog` routes `DialogOutcome`, but only its `Update` variant is acted on | required |
 | `QuitAll` | quit-all dialog | scripted-E2E | — (missing, FU-13) | required |
-| `TriggerUpdate` | update dialog | scripted-E2E | — (unwired, FU-14) — `settings/server_action.rs::request_trigger_update` has no caller | required |
-| `DismissUpdate` | update dialog | scripted-E2E | — (missing, FU-14) | required |
+| `TriggerUpdate` | update dialog | scripted-E2E | `main.rs::TerminalView::route_update_action` → `ipc_bridge::IpcSink::trigger_update`, from the status-bar CTA's confirmation | required |
+| `DismissUpdate` | update dialog | scripted-E2E | `main.rs::TerminalView::route_update_action` → `ipc_bridge::IpcSink::dismiss_update`, from the status-bar CTA's confirmation | required |
 | `CheckForUpdates` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — `--settings` window only, not the terminal window | required |
 | `ListReleases` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — `--settings` window only | required |
 | `ListWindows` | window management | scripted-E2E | — (missing, FU-13) — `scribe-cli` is the only sender | required |
@@ -169,8 +169,8 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `RunAction` | remote automation | scripted-E2E | — (missing, FU-16) | required |
 | `ActionDispatched` | remote automation | scripted-E2E | — (missing, FU-16) | required |
 | `QuitRequested` | quit dialog | scripted-E2E | — (missing, FU-13) | required |
-| `UpdateAvailable` | update dialog | visual-E2E | — (missing, FU-14) — `StatusBarData.update_available` hardcoded `None` | required |
-| `UpdateProgress` | update dialog | visual-E2E | — (missing, FU-14) — `StatusBarData.update_progress` hardcoded `None` | required |
+| `UpdateAvailable` | update dialog | visual-E2E | `main.rs::dispatch_server_message` arm → `update::UpdateState::on_available` → `StatusBarData.update_available` | required |
+| `UpdateProgress` | update dialog | visual-E2E | `main.rs::dispatch_server_message` arm → `update::UpdateState::on_progress` → `StatusBarData.update_progress` | required |
 | `UpdateCheckResult` | release settings | scripted-E2E | `settings/server_action.rs::request_update_check`, reached from `SettingsWindow::run_action` — `--settings` window only | required |
 | `ReleaseList` | release settings | scripted-E2E | `settings/server_action.rs::request_release_list`, reached from `SettingsWindow::run_action` — `--settings` window only | required |
 | `PromptMark` | prompt navigation | scripted-E2E | — (missing, FU-7) — `session_lifecycle` tracks trim offsets but no marks are ingested | required |

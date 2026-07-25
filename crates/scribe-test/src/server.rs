@@ -31,14 +31,36 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Maximum time to wait for the old server to exit during a hot-reload upgrade.
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Env var naming a file the spawned server's stdout/stderr is appended to.
+///
+/// Unset by default, so a normal run still discards server output. E2E scripts
+/// that need to assert on server-side behaviour with no pixels and no client
+/// state behind it — "the server received `TriggerUpdate` and started an
+/// install" — point this at a file under `/output` and grep it, mirroring how
+/// `docker/entrypoint-visual.sh` already persists the client's tracing output.
+const SERVER_LOG_ENV: &str = "SCRIBE_TEST_SERVER_LOG";
+
+/// Redirect target for the spawned server's stdout and stderr.
+fn server_log_stdio() -> Result<Stdio, ScribeError> {
+    let Some(path) = std::env::var_os(SERVER_LOG_ENV).filter(|value| !value.is_empty()) else {
+        return Ok(Stdio::null());
+    };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| ScribeError::Io { source: e })?;
+    Ok(Stdio::from(file))
+}
+
 /// Start the scribe-server process in the background.
 ///
 /// Spawns `scribe-server` as a detached child process, writes its PID to a
 /// file, then polls until the server socket appears (or a timeout is reached).
 pub async fn start() -> Result<(), ScribeError> {
     let child = std::process::Command::new("scribe-server")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(server_log_stdio()?)
+        .stderr(server_log_stdio()?)
         .spawn()
         .map_err(|e| ScribeError::IpcError {
             reason: format!("failed to spawn scribe-server: {e}"),
