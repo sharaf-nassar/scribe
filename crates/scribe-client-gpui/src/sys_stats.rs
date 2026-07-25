@@ -1,13 +1,18 @@
 //! System resource statistics collection (CPU, memory, network, GPU).
 //!
-//! [`SystemStatsCollector`] wraps `sysinfo` to provide cached, rate-limited
-//! readings refreshed at most every 2 seconds, with rolling history buffers
-//! for sparkline rendering.
+//! [`SystemStatsCollector`] hands the status bar a cached snapshot that a
+//! background thread refreshes every 2 seconds, with rolling history buffers
+//! for sparkline rendering. Sampling never runs on the UI thread: the readings
+//! feed decorative sparklines, but the underlying `sysinfo` and GPU probes are
+//! slow enough to blow the startup-to-first-frame budget if the window waits
+//! on them.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sysinfo::{Networks, System};
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, Networks, RefreshKind, System};
 
 /// Maximum number of CPU/GPU history entries.
 const CPU_HISTORY_CAP: usize = 8;
@@ -18,6 +23,11 @@ const NET_HISTORY_CAP: usize = 4;
 /// Minimum elapsed time between refreshes.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long the sampler thread sleeps between checks of its stop flag while
+/// idling out [`REFRESH_INTERVAL`]. Short slices let a dropped collector tear
+/// the thread down promptly instead of waiting out the full interval.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Bytes per gibibyte.
 const BYTES_PER_GIB: u64 = 1_073_741_824;
 /// Bytes per mebibyte.
@@ -26,6 +36,7 @@ const BYTES_PER_MIB: u64 = 1_048_576;
 const MIB_PER_GIB: u16 = 1024;
 
 /// Cached snapshot of system resource usage.
+#[derive(Clone)]
 pub struct SystemStats {
     /// Total CPU utilisation, 0–100.
     pub cpu_percent: f32,
@@ -66,52 +77,141 @@ impl SystemStats {
     }
 }
 
-/// Collects and caches system resource statistics at a 2-second interval.
+/// Publishes system resource statistics sampled off the UI thread.
+///
+/// Construction is non-blocking: it spawns a sampler thread and returns an
+/// all-zero snapshot immediately, so opening a window never waits on `sysinfo`
+/// or on a GPU probe. The status bar simply shows zeroed segments until the
+/// first background sample lands a few milliseconds later.
 pub struct SystemStatsCollector {
+    /// Newest sample published by the sampler thread.
+    shared: Arc<Mutex<SystemStats>>,
+    /// UI-thread copy of the last sample read out of `shared`, so callers keep
+    /// borrowing a plain `&SystemStats` and never hold the lock across a frame.
+    snapshot: SystemStats,
+    /// Cleared on drop to stop the sampler thread.
+    running: Arc<AtomicBool>,
+}
+
+impl SystemStatsCollector {
+    /// Create a collector and start its background sampler.
+    pub fn new() -> Self {
+        let shared = Arc::new(Mutex::new(SystemStats::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        spawn_sampler(Arc::clone(&shared), Arc::clone(&running));
+        Self { shared, snapshot: SystemStats::new(), running }
+    }
+
+    /// Adopt the newest background sample and return it.
+    ///
+    /// Cheap enough for every frame: it takes an uncontended lock and clones a
+    /// handful of scalars plus two short history buffers. All the expensive
+    /// probing already happened on the sampler thread.
+    pub fn maybe_refresh(&mut self) -> &SystemStats {
+        if let Ok(latest) = self.shared.lock() {
+            self.snapshot.clone_from(&latest);
+        }
+        &self.snapshot
+    }
+
+    /// Return the last adopted sample without touching the shared slot.
+    pub fn stats(&self) -> &SystemStats {
+        &self.snapshot
+    }
+}
+
+impl Drop for SystemStatsCollector {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+    }
+}
+
+impl Default for SystemStatsCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background sampler
+// ---------------------------------------------------------------------------
+
+/// Start the sampler thread, degrading to permanently-zero stats if the thread
+/// cannot be spawned. A missing sparkline is never worth failing a window over.
+fn spawn_sampler(shared: Arc<Mutex<SystemStats>>, running: Arc<AtomicBool>) {
+    let spawned = std::thread::Builder::new()
+        .name("scribe-sys-stats".to_owned())
+        .spawn(move || run_sampler(&shared, &running));
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "system-stats sampler unavailable; status-bar stats stay at zero");
+    }
+}
+
+/// Sample on [`REFRESH_INTERVAL`] until the owning collector is dropped.
+fn run_sampler(shared: &Mutex<SystemStats>, running: &AtomicBool) {
+    let mut sampler = Sampler::new();
+    while running.load(Ordering::Acquire) {
+        sampler.refresh();
+        if let Ok(mut slot) = shared.lock() {
+            slot.clone_from(&sampler.stats);
+        }
+        if !sleep_until_next_sample(running) {
+            return;
+        }
+    }
+}
+
+/// Idle out one refresh interval, waking every [`STOP_POLL_INTERVAL`] to notice
+/// a stop request. Returns `false` when the collector was dropped mid-sleep.
+fn sleep_until_next_sample(running: &AtomicBool) -> bool {
+    let deadline = Instant::now() + REFRESH_INTERVAL;
+    loop {
+        if !running.load(Ordering::Acquire) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        std::thread::sleep(remaining.min(STOP_POLL_INTERVAL));
+    }
+}
+
+/// Refresh selectors that keep `sysinfo` off the process table.
+///
+/// `System::new_all` walks every entry in `/proc` and cost ~1.7 s on a busy
+/// host, which by itself blew the 500 ms startup-to-first-frame budget. The
+/// status bar only ever reads global CPU usage and RAM totals, so the sampler
+/// asks for exactly those and never enumerates processes.
+fn stats_refresh_kind() -> RefreshKind {
+    RefreshKind::nothing()
+        .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+        .with_memory(MemoryRefreshKind::nothing().with_ram())
+}
+
+/// The sampler thread's private state: the `sysinfo` handles plus the stats it
+/// accumulates between publishes.
+struct Sampler {
     sys: System,
     networks: Networks,
     stats: SystemStats,
     last_refresh: Instant,
 }
 
-impl SystemStatsCollector {
-    /// Create a new collector and perform an initial refresh.
-    pub fn new() -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_cpu_all();
-        sys.refresh_memory();
+impl Sampler {
+    fn new() -> Self {
+        let sys = System::new_with_specifics(stats_refresh_kind());
         let mut networks = Networks::new_with_refreshed_list();
         networks.refresh(false);
-
-        let mut collector =
-            Self { sys, networks, stats: SystemStats::new(), last_refresh: Instant::now() };
-        collector.do_refresh();
-        collector
+        Self { sys, networks, stats: SystemStats::new(), last_refresh: Instant::now() }
     }
 
-    /// Return a reference to cached stats, refreshing if 2 s have elapsed.
-    pub fn maybe_refresh(&mut self) -> &SystemStats {
-        if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
-            self.do_refresh();
-        }
-        &self.stats
-    }
-
-    /// Return cached stats without triggering a refresh.
-    pub fn stats(&self) -> &SystemStats {
-        &self.stats
-    }
-
-    // -----------------------------------------------------------------------
-    // Internals
-    // -----------------------------------------------------------------------
-
-    fn do_refresh(&mut self) {
+    fn refresh(&mut self) {
         let elapsed = self.last_refresh.elapsed().max(Duration::from_nanos(1));
         self.last_refresh = Instant::now();
 
-        self.sys.refresh_cpu_all();
-        self.sys.refresh_memory();
+        self.sys.refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
+        self.sys.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
         self.networks.refresh(false);
 
         let cpu = self.sys.global_cpu_usage();
@@ -134,12 +234,6 @@ impl SystemStatsCollector {
         if let Some(g) = gpu {
             push_capped(&mut self.stats.gpu_history, g, CPU_HISTORY_CAP);
         }
-    }
-}
-
-impl Default for SystemStatsCollector {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
