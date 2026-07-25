@@ -119,6 +119,15 @@ e2e-func script:
 e2e-visual script:
     docker run --rm --gpus all -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/{{script}}
 
+# Run a visual E2E test that needs a live pane BOTH the GPUI client and
+# scribe-test can see (SCRIBE_SHARED_PANE=1). The entrypoint creates the session
+# first and hands the client the daemon's window id, so the client joins that
+# window's share additively instead of opening an empty window of its own — the
+# only arrangement in which a pixel assertion and `scribe-test wait-output` are
+# talking about the same pane.
+e2e-visual-shared script:
+    docker run --rm --gpus all -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/{{script}}
+
 # Run the feature-015 sharing/control E2E through the wire tap
 e2e-visual-share:
     docker run --rm --gpus all -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/share-control.sh

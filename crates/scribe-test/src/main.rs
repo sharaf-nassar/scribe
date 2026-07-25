@@ -237,6 +237,9 @@ enum DaemonAction {
     Start,
     /// Stop a running test daemon.
     Stop,
+    /// Print the window ID the server assigned the daemon. Pass it to a client
+    /// as `SCRIBE_JOIN_WINDOW` so it joins the daemon's window share.
+    WindowId,
     /// Internal: run the daemon in the foreground (not user-facing).
     Run,
 }
@@ -296,6 +299,10 @@ fn run(cli: Cli) -> Result<(), TestError> {
                 }
                 DaemonAction::Stop => {
                     rt.block_on(daemon::stop()).map_err(|e| TestError::InfraError(e.to_string()))
+                }
+                DaemonAction::WindowId => {
+                    drop(rt);
+                    session::print_window_id()
                 }
                 DaemonAction::Run => {
                     rt.block_on(daemon::run()).map_err(|e| TestError::InfraError(e.to_string()))

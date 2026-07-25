@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
-use scribe_common::ids::SessionId;
+use scribe_common::ids::{SessionId, WindowId};
 use scribe_common::screen::ScreenSnapshot;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
@@ -79,6 +79,11 @@ pub enum DaemonRequest {
     RequestAiChrome {
         session_id: SessionId,
     },
+    /// Ask for the `WindowId` the server assigned this daemon in its `Welcome`.
+    /// The visual E2E rig passes it to a GPUI client as `SCRIBE_JOIN_WINDOW` so
+    /// the client joins the daemon's window share instead of opening an empty
+    /// window of its own.
+    WindowId,
     Shutdown,
 }
 
@@ -99,6 +104,11 @@ pub enum DaemonResponse {
     AiChrome {
         prompt_bar: Option<String>,
         tab: Option<String>,
+    },
+    /// The window id the server assigned the daemon (`Welcome`), or an error
+    /// when no `Welcome` has arrived yet.
+    WindowId {
+        window_id: WindowId,
     },
     AssertFailed {
         message: String,

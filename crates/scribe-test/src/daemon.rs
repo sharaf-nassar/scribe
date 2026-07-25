@@ -11,7 +11,7 @@ use std::time::Duration;
 use regex::{Regex, RegexBuilder};
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
-use scribe_common::ids::{SessionId, WorkspaceId};
+use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{ClientMessage, ServerMessage, TerminalSize};
 use scribe_common::screen::ScreenSnapshot;
 use tokio::net::unix::OwnedWriteHalf;
@@ -96,11 +96,20 @@ struct DaemonState {
     last_workspace_id: Option<WorkspaceId>,
     /// Last session ID received from a `SessionCreated` message.
     last_session_created: Option<SessionId>,
+    /// Window ID the server assigned this daemon in its `Welcome`. Surfaced by
+    /// `scribe-test window-id` so a second local process — the visual rig's GPUI
+    /// client — can join this window's share instead of claiming its own.
+    window_id: Option<WindowId>,
 }
 
 impl DaemonState {
     fn new() -> Self {
-        Self { sessions: HashMap::new(), last_workspace_id: None, last_session_created: None }
+        Self {
+            sessions: HashMap::new(),
+            last_workspace_id: None,
+            last_session_created: None,
+            window_id: None,
+        }
     }
 }
 
@@ -422,7 +431,8 @@ async fn dispatch_window_message(
             debug!(%workspace_id, %name, "workspace named");
         }
         ServerMessage::Welcome { window_id, .. } => {
-            debug!(%window_id, "welcome (ignored by test daemon)");
+            debug!(%window_id, "welcome; recording the daemon's window id");
+            state.lock().await.window_id = Some(window_id);
         }
         ServerMessage::WindowClosed { window_id } => {
             debug!(%window_id, "window closed (ignored by test daemon)");
@@ -765,6 +775,7 @@ async fn process_request(
         DaemonRequest::RequestAiChrome { session_id } => {
             handle_request_ai_chrome(session_id, state).await
         }
+        DaemonRequest::WindowId => handle_window_id(state).await,
         DaemonRequest::Shutdown => {
             handle_shutdown(shutdown);
             DaemonResponse::Ok
@@ -1435,6 +1446,21 @@ async fn check_exit_status(session_id: SessionId, state: &SharedState) -> Option
 fn handle_shutdown(shutdown: &Arc<Notify>) {
     info!("shutdown requested");
     shutdown.notify_one();
+}
+
+/// Report the window id the server assigned this daemon.
+///
+/// The `Welcome` arrives on the reader task immediately after the daemon's
+/// `Hello`, before its socket is bound, so a caller that reached the daemon at
+/// all normally sees it. An absent id is an error rather than a placeholder: a
+/// caller (the visual rig's entrypoint) is about to hand it to a client as a
+/// join target, and joining "no window" silently would reintroduce the empty
+/// window this whole path exists to avoid.
+async fn handle_window_id(state: &SharedState) -> DaemonResponse {
+    state.lock().await.window_id.map_or_else(
+        || DaemonResponse::Error { message: "daemon has not received a Welcome yet".to_owned() },
+        |window_id| DaemonResponse::WindowId { window_id },
+    )
 }
 
 // ---------------------------------------------------------------------------

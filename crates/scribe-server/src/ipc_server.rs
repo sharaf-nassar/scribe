@@ -4409,26 +4409,65 @@ enum ClaimResolution {
     Takeover { window_id: WindowId, other_windows: Vec<WindowId> },
     /// Remote non-takeover claim of a still-connected window: lost-control.
     LostControl { window_id: WindowId },
-    /// Feature 015 (T010): a remote non-takeover claim of a still-connected window
-    /// while sharing is enabled — register additively rather than lost-control.
+    /// Feature 015 (T010): a non-takeover claim of a still-connected window while
+    /// sharing is enabled — register additively rather than lost-control.
     AdditiveJoin { window_id: WindowId },
 }
 
 /// How a claim should treat a target window that is already connected
-/// (feature 013). Derived from `takeover` + the connection's local/remote
-/// transport so [`resolve_window_claim`] takes one mode instead of two bools.
+/// (feature 013). Derived from `takeover` + the window share's sharing mode +
+/// the connection's local/remote transport so [`resolve_window_claim`] takes one
+/// mode instead of three bools.
 #[derive(Clone, Copy)]
 enum ClaimMode {
     /// Explicit takeover (picker attach or banner reclaim) — swap the writer.
     Takeover,
-    /// Feature 015 (T010): remote non-takeover claim while sharing is enabled —
-    /// join the connected window's share additively instead of lost-control.
-    RemoteShareJoin,
+    /// Feature 015 (T010): a non-takeover claim naming a connected window while
+    /// sharing is enabled — join that window's share additively instead of
+    /// lost-control (remote) or a fresh window (local). The local half is what
+    /// lets a second process on the OWNING machine — a second client, or the
+    /// visual E2E rig's `scribe-test` daemon and GPUI client — view and type into
+    /// one window's panes at once, which is the whole point of a shared mode; the
+    /// remote half is feature 015's original tailnet join.
+    ShareJoin,
     /// Remote auto-reconnect (sharing off) — lost-control rather than a silent
     /// seize.
     RemoteReconnect,
-    /// Local plain claim — assign a different/new window (today's behavior).
+    /// Local plain claim, sharing off — assign a different/new window (today's
+    /// behavior).
     LocalPlain,
+}
+
+/// Pick the [`ClaimMode`] a `Hello` claim resolves under (feature 015 T010,
+/// extended by 016 for the local path).
+///
+/// An explicit takeover always wins. With sharing OFF the two legacy arms stand:
+/// a remote reconnect is lost-control, a local plain claim gets a different/new
+/// window. With sharing ON a non-takeover claim naming a connected window joins
+/// that window's share additively **regardless of transport** — the mode is a
+/// property of the window being shared, not of how the participant reached it,
+/// and a shared window whose second viewer happens to live on the owning machine
+/// is exactly the single-machine case the visual E2E rig needs (`scribe-test`
+/// holding the pane while the GPUI client renders and types into it).
+///
+/// A client that sends `Hello { window_id: None }` — every stock local client —
+/// never reaches the connected-window branch in [`resolve_window_claim`], so the
+/// local arm only fires for a claim that deliberately names a live window.
+fn claim_mode_for(
+    takeover: bool,
+    controller: &ControllerIdentity,
+    sharing_mode: scribe_config::SharingMode,
+) -> ClaimMode {
+    if takeover {
+        return ClaimMode::Takeover;
+    }
+    if matches!(sharing_mode, scribe_config::SharingMode::SingleController) {
+        if matches!(controller, ControllerIdentity::Remote { .. }) {
+            return ClaimMode::RemoteReconnect;
+        }
+        return ClaimMode::LocalPlain;
+    }
+    ClaimMode::ShareJoin
 }
 
 /// Decide how a `Hello` claim resolves against the current `connected` map.
@@ -4459,12 +4498,13 @@ fn resolve_window_claim<V>(
                     .collect();
                 return ClaimResolution::Takeover { window_id, other_windows };
             }
-            ClaimMode::RemoteShareJoin => {
+            ClaimMode::ShareJoin => {
                 return ClaimResolution::AdditiveJoin { window_id };
             }
             ClaimMode::RemoteReconnect => return ClaimResolution::LostControl { window_id },
-            // Local, no takeover: fall through to the unchanged assignment path,
-            // which assigns a different/new window (never displaces).
+            // Local, no takeover, sharing off: fall through to the unchanged
+            // assignment path, which assigns a different/new window (never
+            // displaces).
             ClaimMode::LocalPlain => {}
         }
     }
@@ -4509,17 +4549,7 @@ async fn resolve_and_register_claim(
     writer: &SharedWriter,
     sharing: SharingSnapshot,
 ) -> ClaimOutcome {
-    let mode = if claim.takeover {
-        ClaimMode::Takeover
-    } else if !matches!(claim.controller, ControllerIdentity::Remote { .. }) {
-        ClaimMode::LocalPlain
-    } else if matches!(sharing.mode, scribe_config::SharingMode::SingleController) {
-        ClaimMode::RemoteReconnect
-    } else {
-        // Feature 015 (T010): sharing enabled — a remote non-takeover claim of a
-        // connected window joins its share additively instead of lost-control.
-        ClaimMode::RemoteShareJoin
-    };
+    let mode = claim_mode_for(claim.takeover, claim.controller, sharing.mode);
     // Resolve and register the participant as one indivisible transition under the
     // single share lock, capturing the displaced controller (if any) for the
     // post-lock trace. The trace is emitted after the guard drops so a slow
@@ -4604,7 +4634,11 @@ fn register_additive_join(
         return (ClaimOutcome::LostControl { window_id, controller: current }, None);
     }
     share.add_participant(Participant::from_claim(claim, writer));
-    info!(%window_id, "remote participant joined share additively");
+    let locality = match claim.controller {
+        ControllerIdentity::Local => "local",
+        ControllerIdentity::Remote { .. } => "remote",
+    };
+    info!(%window_id, locality, "participant joined share additively");
     (ClaimOutcome::Owned { window_id, other_windows: Vec::new(), displaced: Vec::new() }, None)
 }
 
@@ -9657,5 +9691,98 @@ mod tests {
             Some(cursor),
             "OSC 12 must resolve to theme.cursor, not the black fallback"
         );
+    }
+
+    /// Resolve a `Hello` claim against a map holding exactly `window` as a
+    /// connected window, with no windows carrying sessions.
+    fn resolve_claim_against_connected(
+        requested: Option<WindowId>,
+        window: WindowId,
+        takeover: bool,
+        controller: &ControllerIdentity,
+        sharing_mode: scribe_config::SharingMode,
+    ) -> ClaimResolution {
+        // The value type is irrelevant to `resolve_window_claim` (it only asks
+        // whether a window is connected), but a zero-sized one trips a lint, so
+        // the map carries the window id again.
+        let connected: HashMap<WindowId, WindowId> = HashMap::from([(window, window)]);
+        let mode = claim_mode_for(takeover, controller, sharing_mode);
+        resolve_window_claim(requested, mode, &HashSet::new(), &connected)
+    }
+
+    // @lat: [[server#Remote Control#Sharing#Local Additive Join]]
+    #[test]
+    fn local_claim_of_a_connected_window_joins_its_share_only_when_sharing_is_on() {
+        let window = WindowId::new();
+
+        // Sharing off: unchanged: a local claim gets a window of its own, and a
+        // remote non-takeover claim is still lost-control.
+        assert!(matches!(
+            resolve_claim_against_connected(
+                Some(window),
+                window,
+                false,
+                &ControllerIdentity::Local,
+                scribe_config::SharingMode::SingleController,
+            ),
+            ClaimResolution::Assign { assigned, .. } if assigned != window
+        ));
+        assert!(matches!(
+            resolve_claim_against_connected(
+                Some(window),
+                window,
+                false,
+                &ControllerIdentity::Remote {
+                    device_name: "peer".to_owned(),
+                    login_name: "someone".to_owned(),
+                },
+                scribe_config::SharingMode::SingleController,
+            ),
+            ClaimResolution::LostControl { .. }
+        ));
+
+        // Sharing on: a LOCAL non-takeover claim naming the connected window
+        // joins its share additively — the visual rig's second process (the
+        // GPUI client) landing in the `scribe-test` daemon's window.
+        for mode in
+            [scribe_config::SharingMode::SharedSingleTypist, scribe_config::SharingMode::FreeForAll]
+        {
+            assert!(
+                matches!(
+                    resolve_claim_against_connected(
+                        Some(window),
+                        window,
+                        false,
+                        &ControllerIdentity::Local,
+                        mode,
+                    ),
+                    ClaimResolution::AdditiveJoin { window_id } if window_id == window
+                ),
+                "{mode:?} must admit a local additive join"
+            );
+        }
+
+        // A takeover still displaces, and a claim that names no window still
+        // gets its own — the stock local client's handshake is untouched.
+        assert!(matches!(
+            resolve_claim_against_connected(
+                Some(window),
+                window,
+                true,
+                &ControllerIdentity::Local,
+                scribe_config::SharingMode::FreeForAll,
+            ),
+            ClaimResolution::Takeover { .. }
+        ));
+        assert!(matches!(
+            resolve_claim_against_connected(
+                None,
+                window,
+                false,
+                &ControllerIdentity::Local,
+                scribe_config::SharingMode::FreeForAll,
+            ),
+            ClaimResolution::Assign { assigned, .. } if assigned != window
+        ));
     }
 }
