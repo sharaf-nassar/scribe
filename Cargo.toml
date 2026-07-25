@@ -124,8 +124,21 @@ reqwest = { version = "0.12", default-features = false, features = [
 semver = "1.0"
 minisign-verify = "0.2"
 
-# Linux desktop notification dispatcher
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+# Linux desktop notification dispatcher.
+#
+# Deliberately NOT built with the `tokio` feature. Cargo unifies features
+# across the whole graph, and GPUI's Linux platform layer pulls the same
+# `zbus` build through accesskit_unix (AT-SPI), ashpd (XDG portals), and
+# oo7 (secret service). zbus's `tokio` feature is compile-time exclusive:
+# it routes every internal `Task::spawn_blocking` through
+# `tokio::task::spawn_blocking`, which panics with "there is no reactor
+# running" when polled off a Tokio runtime. GPUI drives its zbus
+# connections on its own non-Tokio worker threads, so enabling `tokio`
+# here crashed those background threads on every client launch. The
+# default async-io backend is runtime-agnostic — zbus spawns its own
+# internal executor thread — so it works from GPUI's workers and from our
+# notification dispatcher's Tokio runtime alike.
+zbus = { version = "5" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # LAN remote control (feature 014) — mDNS discovery, physical-network
