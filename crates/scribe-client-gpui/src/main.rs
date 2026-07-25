@@ -42,6 +42,9 @@ use scribe_client_gpui::input::{self, KeyInput, TerminalMode};
 use scribe_client_gpui::keybindings::{
     KeyAction, LayoutAction, OverlayChord, translate_key_action, translate_overlay_chord,
 };
+use scribe_client_gpui::lan::{LanChrome, LanConnectOutcome, LanEnvSummary};
+use scribe_client_gpui::lan_approval::{LanApprovalAction, LanApprovalDialog};
+use scribe_client_gpui::lan_dial::{self, LanDialer};
 use scribe_client_gpui::layout::Rect;
 use scribe_client_gpui::opacity::{clamp_opacity, opaque_slot, surface};
 use scribe_client_gpui::prompt_bar::{
@@ -266,6 +269,11 @@ struct Shared {
     /// overlay adopts it on the next redraw and the paint path highlights the
     /// on-screen spans it names.
     find: Arc<Mutex<FindResults>>,
+    /// Feature-014 LAN state. The IPC reader parks an inbound device-approval
+    /// request here and folds the peer-list, environment, and dial-gate answers
+    /// into it; the view's lifecycle tick raises the parked prompt as a modal
+    /// and its answer leaves through `IpcSink::lan_approval_decision`.
+    lan: Arc<Mutex<LanChrome>>,
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -281,8 +289,9 @@ const X11_FOCUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How often the foreground runs the window-lifecycle tick: draining a
 /// server-acknowledged exit, reporting a focus transition the reader caused
-/// (a reattach moves the focused pane without any UI event), and re-polling the
-/// window list when it is due.
+/// (a reattach moves the focused pane without any UI event), re-polling the
+/// window list when it is due, and raising a LAN device-approval prompt the
+/// reader parked.
 const WINDOW_LIFECYCLE_TICK: Duration = Duration::from_millis(200);
 
 /// How often the client re-polls the server's window list. Mirrors the winit
@@ -375,6 +384,10 @@ struct TerminalView {
     /// dialog view owns its own copy for display; this is the activation copy
     /// the shell needs after the modal resolves.
     pending_osc8_uri: Option<String>,
+    /// `request_id` of the LAN device approval the open modal is answering, so
+    /// the resolved choice can be correlated back to the held connection. The
+    /// dialog owns its own copy for display; this is the reply copy.
+    pending_lan_approval: Option<u64>,
     /// Demo toggle: when set, an OSC 8-style hover tooltip is drawn over a fixed
     /// anchor so the visual E2E can exercise tooltip clamping + URL truncation.
     tooltip_demo: bool,
@@ -498,6 +511,7 @@ impl TerminalView {
             update_dialog_kind: None,
             workspace_notes_modal: None,
             pending_osc8_uri: None,
+            pending_lan_approval: None,
             tooltip_demo: false,
             x11_focus,
             bell,
@@ -898,21 +912,28 @@ impl TerminalView {
 
     /// Route a resolved modal choice.
     ///
-    /// Three outcomes have a live consumer: an update decision goes to
+    /// Four outcomes have a live consumer: an update decision goes to
     /// [`Self::route_update_action`], a close decision to
-    /// [`Self::route_close_action`], and a disallowed-scheme "Open Anyway"
-    /// activates the parked URI without the allowlist guard. The paste and
-    /// clipboard modals answer server prompts and are wired with those
+    /// [`Self::route_close_action`], a LAN device-approval decision to
+    /// [`Self::route_lan_approval_action`], and a disallowed-scheme "Open
+    /// Anyway" activates the parked URI without the allowlist guard. The paste
+    /// and clipboard modals answer server prompts and are wired with those
     /// surfaces; Escape / backdrop resolves to each modal's safe action, which
-    /// for the close dialog is Cancel and therefore a deliberate no-op.
+    /// for the close dialog is Cancel and therefore a deliberate no-op — but for
+    /// the approval prompt is an explicit Decline that still has to reach the
+    /// server, because a peer is being held open waiting for it.
     fn route_dialog_outcome(&mut self, outcome: DialogOutcome) {
-        // Both consumers read state the dialog parked on the view, so take the
-        // pending URI up front and clear the update kind only once the update
-        // route (which reads it) has run.
+        // Three consumers read state the dialog parked on the view, so take the
+        // pending URI and the pending approval id up front and clear the update
+        // kind only once the update route (which reads it) has run.
         let pending = self.pending_osc8_uri.take();
+        let approval = self.pending_lan_approval.take();
         match outcome {
             DialogOutcome::Update(action) => self.route_update_action(action),
             DialogOutcome::Close(action) => self.route_close_action(action),
+            DialogOutcome::LanApproval(action) => {
+                self.route_lan_approval_action(approval, action);
+            }
             DialogOutcome::DisallowedScheme(DisallowedSchemeAction::OpenAnyway) => {
                 if let Some(uri) = pending {
                     url_detect::open_uri_unguarded(&uri);
@@ -924,6 +945,44 @@ impl TerminalView {
         }
         // The dialog is gone either way, so its kind must not outlive it.
         self.update_dialog_kind = None;
+    }
+
+    /// Raise the LAN device-approval prompt the IPC reader parked, if any.
+    ///
+    /// Runs on the foreground tick rather than from the reader thread: the
+    /// prompt is a GPUI entity and only the thread that owns the window may
+    /// build one. A modal already being up defers the prompt to a later tick
+    /// instead of stacking two — the peer is held either way.
+    fn poll_lan_approval(&mut self, cx: &mut Context<Self>) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let Some(request) = self.shared.lan.lock().ok().and_then(|mut lan| lan.take_approval())
+        else {
+            return;
+        };
+        let request_id = request.request_id();
+        self.pending_lan_approval = Some(request_id);
+        tracing::info!(request_id, "raising the LAN device-approval prompt");
+        self.open_dialog(AnyDialog::LanApproval(request), cx);
+    }
+
+    /// Answer a pending LAN device approval on the wire.
+    ///
+    /// The reply is not optional: the server holds the peer's connection open —
+    /// revealing nothing — until this `request_id` is resolved, so Decline is
+    /// sent just as deliberately as Approve. A missing id means the prompt was
+    /// resolved twice, which the server treats as a harmless no-op anyway.
+    fn route_lan_approval_action(&mut self, request_id: Option<u64>, action: LanApprovalAction) {
+        let Some(request_id) = request_id else {
+            tracing::warn!("LAN approval answered with no pending request id");
+            return;
+        };
+        let approve = matches!(action, LanApprovalAction::Approve);
+        tracing::info!(request_id, approve, "answering the LAN device-approval prompt");
+        if let Err(error) = self.sink.lan_approval_decision(request_id, approve) {
+            tracing::warn!(%error, "LAN approval decision dropped: IPC writer closed");
+        }
     }
 
     /// Raise the close confirmation for a window-close request.
@@ -1096,6 +1155,7 @@ impl TerminalView {
         }
         self.report_focus();
         self.poll_window_list();
+        self.poll_lan_approval(cx);
     }
 
     /// Re-poll the server's window list when it is due.
@@ -2479,6 +2539,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         lifecycle: Arc::new(Mutex::new(WindowLifecycle::new())),
         bells: Arc::new(Mutex::new(Vec::new())),
         find: Arc::new(Mutex::new(FindResults::default())),
+        lan: Arc::new(Mutex::new(LanChrome::new())),
     };
     let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
     let (in_tx, in_rx) = unbounded_channel::<InboundEvent>();
@@ -2639,14 +2700,133 @@ fn start_ipc_thread(ctx: IpcThread) {
     });
 }
 
+/// Establish this client's one connection and serve it until it closes.
+///
+/// Two transports reach the same server-side protocol. The default is the local
+/// Unix socket; `SCRIBE_LAN_DIAL` instead points the client at a peer on the
+/// local network, which is reached over TCP + pinned mutual TLS and gated by the
+/// owning side's device approval before a single byte of window state flows
+/// (feature 014). Past that gate the streams are interchangeable, so both paths
+/// converge on [`serve_connection`].
 async fn run_connection(ctx: IpcThread) -> Result<(), String> {
+    match lan_dial::target_from_env() {
+        Some((host, port)) => run_lan_connection(ctx, host, port).await,
+        None => run_local_connection(ctx).await,
+    }
+}
+
+/// Connect to this machine's own server over the local Unix socket.
+///
+/// The LAN environment is probed FIRST, before the session connection exists.
+/// `GetLanEnv` is a pre-`Hello` first frame the server answers on its own
+/// transient socket, so it has to be a separate connection either way; running
+/// it up front means the window has its LAN summary before the first frame
+/// paints, and it leaves the session connection as the last socket this process
+/// opened, which is what the E2E wire tap addresses the client by.
+async fn run_local_connection(ctx: IpcThread) -> Result<(), String> {
+    let lan_env = probe_lan_env().await;
     let stream = tokio::net::UnixStream::connect(server_socket_path())
         .await
         .map_err(|error| error.to_string())?;
     // Socket is up: light the status-bar connection dot green.
     ctx.shared.connected.store(true, Ordering::Release);
     let (reader, writer) = stream.into_split();
+    serve_connection(ctx, reader, writer, Transport::Local(lan_env)).await
+}
 
+/// Dial a LAN peer over TCP + pinned mutual TLS, run the `LanHello` preamble and
+/// the owning side's device-approval gate, and only then serve the connection.
+///
+/// Every failure short of acceptance is terminal for this process: the client
+/// was launched to control that peer, so falling back to the local server would
+/// silently attach the user to the wrong machine.
+async fn run_lan_connection(ctx: IpcThread, host: String, port: u16) -> Result<(), String> {
+    let lan = Arc::clone(&ctx.shared.lan);
+    let status = Arc::clone(&ctx.shared.status);
+    let generation = Arc::clone(&ctx.shared.generation);
+    tracing::info!(%host, port, "dialing a LAN peer instead of the local socket");
+
+    let dialer = LanDialer::build(host, port).await.map_err(|error| error.to_string())?;
+    let mut stream = dialer.connect().await.map_err(|error| error.to_string())?;
+
+    // The gate can block on a human for as long as the peer's approval hold
+    // allows, so the interim "waiting" state is pushed to the window the moment
+    // the peer reports it rather than after the decision.
+    let pending_lan = Arc::clone(&lan);
+    let pending_status = Arc::clone(&status);
+    let pending_generation = Arc::clone(&generation);
+    let outcome = lan_dial::handshake(&mut stream, lan_dial::local_device_name(), move || {
+        publish_lan_status(
+            &pending_lan,
+            &pending_status,
+            &pending_generation,
+            LanChrome::awaiting_approval,
+        );
+    })
+    .await;
+
+    publish_lan_status(&lan, &status, &generation, |chrome| chrome.settle_dial(outcome));
+    if outcome != LanConnectOutcome::Accepted {
+        let (peer_host, peer_port) = dialer.target();
+        return Err(format!("LAN dial to {peer_host}:{peer_port} was not accepted"));
+    }
+
+    // Approved: the encrypted link now behaves exactly like the local socket.
+    ctx.shared.connected.store(true, Ordering::Release);
+    let (reader, writer) = tokio::io::split(stream);
+    serve_connection(ctx, reader, writer, Transport::Lan).await
+}
+
+/// Apply `mutate` to the LAN chrome and mirror the resulting summary onto the
+/// status bar.
+///
+/// The dial path runs before any [`ReaderCtx`] exists, so it holds the three
+/// shared handles directly rather than going through [`update_lan_chrome`].
+fn publish_lan_status(
+    lan: &Arc<Mutex<LanChrome>>,
+    status: &Arc<Mutex<String>>,
+    generation: &Arc<AtomicU64>,
+    mutate: impl FnOnce(&mut LanChrome),
+) {
+    let Ok(mut guard) = lan.lock() else {
+        tracing::warn!("LAN chrome mutex poisoned; dropping dial update");
+        return;
+    };
+    mutate(&mut guard);
+    let line = guard.status_line();
+    drop(guard);
+    if let Some(line) = line {
+        set_status(status, generation, line);
+    }
+}
+
+/// Which transport carried this connection, gating the local-only LAN queries.
+/// A remote peer must never be asked to enumerate this machine's LAN view — the
+/// server refuses it, and asking would put a pointless frame on the wire.
+enum Transport {
+    /// This machine's own server over the Unix socket, carrying the `LanEnv`
+    /// answer probed before the connection was opened. `None` when LAN access is
+    /// off or the probe failed.
+    Local(Option<ServerMessage>),
+    /// A LAN peer over mutual TLS.
+    Lan,
+}
+
+/// Send the handshake, start the writer and the drain, run the local-only LAN
+/// startup probes, and hand the read half to the live reader.
+///
+/// Shared by both transports so the LAN path can never drift from the local one
+/// in what it announces or which state it wires up.
+async fn serve_connection<R, W>(
+    ctx: IpcThread,
+    reader: R,
+    writer: W,
+    transport: Transport,
+) -> Result<(), String>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
     // Handshake is queued ahead of any sink traffic on the same ordered channel.
     // `SCRIBE_JOIN_WINDOW` (unset for a user-launched client) names a window
     // another local process already holds: the server resolves that non-takeover
@@ -2669,27 +2849,60 @@ async fn run_connection(ctx: IpcThread) -> Result<(), String> {
     tokio::spawn(run_writer(writer, ctx.out_rx));
     spawn_drain(ctx.in_rx, Arc::clone(&ctx.shared.terminal), Arc::clone(&ctx.shared.generation));
 
-    run_reader(
-        reader,
-        ReaderCtx {
-            status: ctx.shared.status,
-            generation: ctx.shared.generation,
-            active_session: ctx.shared.active_session,
-            ai: ctx.shared.ai,
-            chrome_metadata: ctx.shared.chrome_metadata,
-            tabs: ctx.shared.tabs,
-            share: ctx.shared.share,
-            update: ctx.shared.update,
-            lifecycle: ctx.shared.lifecycle,
-            bells: ctx.shared.bells,
-            find: ctx.shared.find,
-            out_tx: ctx.out_tx,
-            in_tx: ctx.in_tx,
-            sink: ctx.sink,
-            size: ctx.size,
-        },
-    )
-    .await
+    let reader_ctx = ReaderCtx {
+        status: ctx.shared.status,
+        generation: ctx.shared.generation,
+        active_session: ctx.shared.active_session,
+        ai: ctx.shared.ai,
+        chrome_metadata: ctx.shared.chrome_metadata,
+        tabs: ctx.shared.tabs,
+        share: ctx.shared.share,
+        update: ctx.shared.update,
+        lifecycle: ctx.shared.lifecycle,
+        bells: ctx.shared.bells,
+        find: ctx.shared.find,
+        lan: ctx.shared.lan,
+        out_tx: ctx.out_tx,
+        in_tx: ctx.in_tx,
+        sink: ctx.sink,
+        size: ctx.size,
+    };
+    if let Transport::Local(lan_env) = transport {
+        adopt_lan_surface(&reader_ctx, lan_env);
+    }
+    run_reader(reader, reader_ctx).await
+}
+
+/// Ask this machine's own server for its LAN environment on a transient socket.
+///
+/// Gated on `remote.lan.enabled` exactly as the window-list poll is gated on
+/// `remote.enabled`: with LAN access off there is no identity to report and no
+/// discovery running, so the frame would be pure noise. The raw reply travels
+/// back so it can be folded through the same [`on_lan_message`] the live reader
+/// uses rather than a second, divergent parser.
+async fn probe_lan_env() -> Option<ServerMessage> {
+    if !load_config().is_ok_and(|config| config.remote.lan.enabled) {
+        return None;
+    }
+    match lan_dial::probe_lan_env().await {
+        Ok(message) => Some(message),
+        Err(error) => {
+            tracing::warn!(%error, "LAN environment probe failed");
+            None
+        }
+    }
+}
+
+/// Fold the pre-probed `LanEnv` and ask the session connection for the peer
+/// list, which the server answers only for a LOCAL connection.
+fn adopt_lan_surface(ctx: &ReaderCtx, lan_env: Option<ServerMessage>) {
+    let Some(lan_env) = lan_env else {
+        return;
+    };
+    on_lan_message(ctx, lan_env);
+    if let Err(error) = ctx.sink.list_lan_peers() {
+        tracing::warn!(%error, "LAN peer list request dropped: IPC writer closed");
+    }
 }
 
 /// Drains the IPC-writer channel to the socket in FIFO order.
@@ -2842,6 +3055,9 @@ struct ReaderCtx {
     bells: Arc<Mutex<Vec<SessionId>>>,
     /// Latest `SearchResults` reply the find overlay renders and highlights.
     find: Arc<Mutex<FindResults>>,
+    /// Feature-014 LAN state the reader parks approval requests in and folds the
+    /// peer-list, environment, and dial-gate answers onto.
+    lan: Arc<Mutex<LanChrome>>,
     out_tx: UnboundedSender<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
@@ -2920,6 +3136,31 @@ fn update_lifecycle(ctx: &ReaderCtx, mutate: impl FnOnce(&mut WindowLifecycle)) 
     mutate(&mut guard);
     drop(guard);
     ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Apply `mutate` to the shared feature-014 LAN chrome and request a repaint.
+///
+/// Same failure contract as [`update_ai_chrome`]. The repaint matters here for
+/// the same reason it does for the lifecycle state: the foreground's tick is
+/// what turns a parked approval request into a real modal on screen.
+fn update_lan_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut LanChrome)) {
+    let Ok(mut guard) = ctx.lan.lock() else {
+        tracing::warn!("LAN chrome mutex poisoned; dropping update");
+        return;
+    };
+    mutate(&mut guard);
+    drop(guard);
+    ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Fold a LAN change and mirror the resulting one-line summary onto the status
+/// bar, so every LAN transition the reader applies is also visible on screen.
+fn update_lan_chrome_and_status(ctx: &ReaderCtx, mutate: impl FnOnce(&mut LanChrome)) {
+    update_lan_chrome(ctx, mutate);
+    let line = ctx.lan.lock().ok().and_then(|lan| lan.status_line());
+    if let Some(line) = line {
+        set_status(&ctx.status, &ctx.generation, line);
+    }
 }
 
 /// Running total of inbound [`ServerMessage`]s the live reader dropped.
@@ -3232,6 +3473,19 @@ fn dispatch_server_message(
         lifecycle @ (ServerMessage::WindowClosed { .. }
         | ServerMessage::WindowList { .. }
         | ServerMessage::QuitRequested) => on_window_lifecycle_message(ctx, lifecycle),
+        // Feature 014: every LAN answer — the owning side's approval push, the
+        // discovery/environment replies the startup probe asks for, and the
+        // connecting side's approval-gate frames — lands in the one shared
+        // [`LanChrome`], so they are named here and routed as one to
+        // [`on_lan_message`]. Naming them is what keeps the LAN surface
+        // reachable: unnamed, an approval request reaches the drop counter and
+        // the peer waits for a decision that can never be made.
+        lan @ (ServerMessage::LanApprovalRequest { .. }
+        | ServerMessage::LanApprovalPending
+        | ServerMessage::LanApprovalResult { .. }
+        | ServerMessage::LanPeerList { .. }
+        | ServerMessage::LanEnv { .. }
+        | ServerMessage::LanDialIdentity { .. }) => on_lan_message(ctx, lan),
         other => unhandled_server_message(&other),
     }
     Ok(())
@@ -3431,6 +3685,120 @@ fn on_bell_message(ctx: &ReaderCtx, session_id: SessionId) {
     drop(queued);
     tracing::info!(%session_id, "terminal bell received");
     ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Fold one feature-014 LAN answer onto the shared [`LanChrome`].
+///
+/// This is the whole LAN surface of the live reader, and it spans both roles the
+/// client can be in. As the OWNING machine it receives `LanApprovalRequest` —
+/// pushed by this machine's own server when an unknown device finishes the
+/// mutual-TLS handshake — and parks the ported prompt for the foreground tick to
+/// raise; nothing about the peer is revealed until the user answers. As the
+/// CONNECTING machine it receives the approval gate's `LanApprovalPending` /
+/// `LanApprovalResult` and moves the dial state, which is what turns "the window
+/// is just blank" into "waiting for approval on the peer". `LanPeerList` and
+/// `LanEnv` answer the startup LAN probe on either role.
+///
+/// Anything other than the LAN family is a programming error in
+/// [`dispatch_server_message`]'s routing, not a protocol event, so it is counted
+/// as unhandled rather than silently dropped.
+fn on_lan_message(ctx: &ReaderCtx, message: ServerMessage) {
+    match message {
+        ServerMessage::LanApprovalRequest {
+            request_id,
+            device_name,
+            fingerprint_words,
+            network_label,
+            name_collision,
+        } => {
+            // Logged because the prompt is pixels only: a scripted E2E can then
+            // prove the request reached the chrome and not just the socket.
+            tracing::info!(
+                request_id,
+                %device_name,
+                %network_label,
+                name_collision,
+                "LAN device approval requested"
+            );
+            update_lan_chrome(ctx, |lan| {
+                lan.park_approval(LanApprovalDialog::new(
+                    request_id,
+                    device_name,
+                    fingerprint_words,
+                    network_label,
+                    name_collision,
+                ));
+            });
+            set_status(
+                &ctx.status,
+                &ctx.generation,
+                "a device on your local network wants to connect".to_owned(),
+            );
+        }
+        ServerMessage::LanPeerList { peers } => {
+            tracing::info!(count = peers.len(), "server LAN peer list");
+            update_lan_chrome_and_status(ctx, |lan| lan.set_peers(peers));
+        }
+        ServerMessage::LanEnv {
+            device_id_hex,
+            fingerprint_words,
+            current_network_addable,
+            current_network_reason,
+        } => {
+            tracing::info!(
+                identified = device_id_hex.is_some(),
+                current_network_addable,
+                "server LAN environment"
+            );
+            update_lan_chrome_and_status(ctx, |lan| {
+                lan.set_env(LanEnvSummary {
+                    device_id_hex,
+                    fingerprint_words,
+                    current_network_addable,
+                    current_network_reason,
+                });
+            });
+        }
+        ServerMessage::LanApprovalPending => {
+            // Normally consumed by `lan_dial::handshake` before this reader
+            // exists; one arriving afterwards still means the same thing, so it
+            // folds identically rather than being dropped as out of sequence.
+            tracing::info!("LAN connection held pending approval on the peer");
+            update_lan_chrome_and_status(ctx, LanChrome::awaiting_approval);
+        }
+        ServerMessage::LanApprovalResult { approved, refusal } => {
+            tracing::info!(approved, ?refusal, "LAN approval result");
+            let outcome = lan_approval_outcome(approved, refusal);
+            update_lan_chrome_and_status(ctx, |lan| lan.settle_dial(outcome));
+        }
+        ServerMessage::LanDialIdentity { available, .. } => {
+            // PRIVATE key material. The dialer fetches it on its own transient
+            // socket before this reader exists, so one arriving on the session
+            // connection is out of band: it is neither stored nor forwarded, and
+            // only the presence flag is logged — never the bytes.
+            tracing::warn!(
+                available,
+                "ignoring an out-of-band LanDialIdentity on the session connection"
+            );
+        }
+        // Unreachable: the caller only routes the LAN family here.
+        other => unhandled_server_message(&other),
+    }
+}
+
+/// Map an approval gate's `approved` / `refusal` pair onto the typed dial
+/// outcome. A refusal with no reason is a protocol violation, reported as a
+/// generic connection failure rather than inventing a cause — the same rule
+/// [`lan_dial::handshake`] applies during the preamble.
+fn lan_approval_outcome(
+    approved: bool,
+    refusal: Option<scribe_common::protocol::LanRefusal>,
+) -> LanConnectOutcome {
+    match (approved, refusal) {
+        (true, _) => LanConnectOutcome::Accepted,
+        (false, Some(reason)) => LanConnectOutcome::Refused(reason),
+        (false, None) => LanConnectOutcome::ConnectionFailure,
+    }
 }
 
 /// Adopt everything the server's `Welcome` hands this connection.

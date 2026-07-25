@@ -283,6 +283,18 @@ The module's own `#[gpui::test]`s were green the whole time the client did nothi
 
 The routed behaviour is asserted as a window property rather than as pixels. `Window::request_attention` sets the `WM_HINTS` urgency flag on X11, and `xprop` prints its urgency line only when the flag is set, so the presence of that line is the assertion and its absence is the suppressed case — which is why the image installs `x11-utils`. Three phases separate ingestion from routing: a bell to the focused foreground pane must log `terminal bell received` and yet leave no urgency flag and no `terminal bell requested window attention`; the same bell with the window iconified must produce both; and refocusing must make the pane silent again, which is what proves the middle phase was the gate opening rather than the routing merely having warmed up.
 
+### LAN approval and mutual-TLS dial
+
+`tests/e2e/visual/lan-approval.sh` is the app-level oracle for the eleven feature-014 LAN rows: it drives the real client against the real server and asserts both the pixels and two separate wires.
+
+[[crates/scribe-client-gpui/src/lan_approval.rs#LanApprovalDialog]] passed its headless suite for months while `lan_approval.rs` was outside `main.rs`'s import closure, which is exactly the failure mode this script exists to catch — so every assertion is either a frame recorded leaving the real client or a pixel change in the real window.
+
+Two rigs stand in for what one machine cannot supply, and neither fakes the client or the protocol. The [[crates/scribe-test/src/share_tap.rs#run]] wire tap (`SCRIBE_SHARE_TAP=1`) relays the Unix socket, recording every frame in both directions; `LanApprovalRequest` is injected through it because the owning server only pushes one for a real unknown device. [[crates/scribe-test/src/lan_peer.rs#run]] (`scribe-test lan-peer`) stands in for the second machine's LAN listener: it borrows this machine's own device identity over `GetLanDialIdentity` and terminates a REAL mutual-TLS handshake with the same `LanTls` builder the shipped listener uses, so the `LanHello` it records is the one the client actually put on the encrypted wire. `SCRIBE_KEYRING=1` starts a session D-Bus and an unlocked gnome-keyring in the entrypoint, because the LAN device key is keyring-sealed and `scribe-server` fails closed without one — every other visual test keeps the lighter, keyring-free container.
+
+Four phases run after the same daemon-stop-and-relaunch preamble [[test#Visual E2E Tests#Overlay actions run for real]] documents. The startup probe's `GetLanEnv` and `ListLanPeers` are asserted on the wire together with the real server's `LanEnv` and `LanPeerList` answers and the client's own log lines proving it acted on them — no injection is involved, and the peer list is legitimately empty in a container with no mDNS. An injected `LanApprovalRequest` must then change the window's body pixels, and a bare Enter on the default focus must put `LanApprovalDecision { approve: false }` on the wire; a second request with `name_collision` set, Tab, and Enter must put `approve: true` on it. Finally a client launched with `SCRIBE_LAN_DIAL` must fetch its dial identity from the real server, land a `LanHello` on the stand-in peer's encrypted wire, show "Waiting for approval on the peer…" while the peer holds the gate, and send `Hello` over the LAN link once the gate approves.
+
+Phase 1's baselines are sampled before the relaunch, because the LAN probe runs as part of connecting; sampling afterwards would race the frames the phase waits for. The dial phase skips loudly rather than passing silently when the stand-in cannot borrow an identity, so a container without a keyring reports a gap instead of a green run.
+
 ### Settings trust and preflight controls
 
 `tests/e2e/visual/settings-trust.sh` is the app-level oracle for the feature-014 trust rows and the env-preflight row: it drives the real settings window against the real server and asserts each control's frame on the wire.
@@ -788,6 +800,8 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Remote handshake | [[test#GPUI Client Headless Suites#GPUI remote handshake]] | `RemoteHandshake` preamble + dial-env spawn |
 | Lost control banner | [[test#GPUI Client Headless Suites#GPUI lost control banner]] | `WindowTakenOver` displaced-client reclaim |
 | LAN device approval | [[test#GPUI Client Headless Suites#GPUI LAN device approval]] | `LanApprovalRequest`/`LanApprovalDecision` prompt |
+| LAN chrome | [[test#GPUI Client Headless Suites#GPUI LAN chrome]] | `LanApprovalRequest`, `LanPeerList`, `LanEnv` shared state |
+| LAN dial preamble | [[test#GPUI Client Headless Suites#GPUI LAN dial]] | `LanHello`, `LanApprovalPending`, `LanApprovalResult` |
 | Window sharing | [[test#GPUI Client Headless Suites#GPUI window sharing]] | `ShareRoster`, `ControlClaim`/`ControlRequest`/`ControlGrant` |
 | Local share join | [[test#GPUI Client Headless Suites#GPUI local share join]] | `Hello` window claim (harness plumbing, no parity row) |
 | Pane dividers | [[test#GPUI Pane Dividers]] | "Pane divider drag-resize" chrome |
@@ -1109,6 +1123,46 @@ The suite asserts [[crates/scribe-client-gpui/src/lost_control.rs#LostControlSta
 Confirms the ported [[crates/scribe-client-gpui/src/lan_approval.rs#LanApprovalDialog]] state — the model half of the winit [[crates/scribe-client/src/lan_approval.rs#LanApprovalDialog]] — keeps the safe Decline-default focus and word-wraps the approval body.
 
 The suite asserts Decline is the initial focus (so an unexpected prompt never silently grants trust), that focus cycles between the two buttons, and that [[crates/scribe-client-gpui/src/lan_approval.rs#LanApprovalDialog#body_lines]] lists the requesting device, its trusted network, and its fingerprint words wrapped within the dialog width, adding the name-collision hint only when flagged.
+
+### GPUI LAN chrome
+
+Confirms [[crates/scribe-client-gpui/src/lan.rs#LanChrome]] — the state the IPC reader folds every feature-014 answer into and the window renders from — hands an approval prompt to the foreground exactly once and derives the right status line.
+
+The suite is the headless half of a hand-off that spans two threads, so the take-once rule is what it asserts hardest: a parked prompt is returned by the first [[crates/scribe-client-gpui/src/lan.rs#LanChrome#take_approval]] and never again, so a later tick cannot raise a duplicate modal for a `request_id` already being answered, and a second request arriving before the first is raised replaces it rather than stacking. It also asserts the derived line: nothing at all before the environment is probed (rather than a misleading "0 peers"), the dormancy note with the server's own reason when the current network cannot be fingerprinted, the online-only peer count otherwise, and that a non-idle [[crates/scribe-client-gpui/src/lan.rs#LanDialStatus]] outranks all of it.
+
+#### Approval hand-off is take-once
+
+A parked prompt is returned once and then gone, so the foreground tick cannot raise the same `request_id` twice.
+
+#### A second request replaces an unraised one
+
+A second `LanApprovalRequest` arriving before the first was raised replaces it, keeping at most one modal; the displaced peer is still held by the server until its own approval timeout.
+
+#### Status line reports peers and dormancy
+
+An unprobed environment yields no line; an unfingerprintable network yields the server's dormancy reason; otherwise the line counts only currently-advertised peers.
+
+#### Dial status outranks the environment
+
+A client waiting on — or refused by — a peer reports that instead of the local peer count, and each typed [[crates/scribe-common/src/protocol.rs#LanRefusal]] maps to its own copy.
+
+### GPUI LAN dial
+
+Confirms [[crates/scribe-client-gpui/src/lan_dial.rs#handshake]] — the connecting side's `LanHello` preamble and approval gate — settles on the right [[crates/scribe-client-gpui/src/remote.rs#LanConnectOutcome]] and fails closed on every malformed answer.
+
+The TCP and mutual-TLS half needs a real peer and is covered by [[test#Visual E2E Tests#LAN approval and mutual-TLS dial]]; what is testable without one is the framed exchange, so these drive the preamble over an in-memory duplex. The waiting-state callback is asserted by count, because reporting it for an already-trusted device would show a "waiting for approval" state that never existed.
+
+#### Trusted device is admitted without a pending frame
+
+A peer that answers `LanApprovalResult { approved: true }` straight away is accepted and the waiting callback never fires.
+
+#### Unknown device waits then settles
+
+A peer that answers `LanApprovalPending` first reports the waiting state exactly once and then settles on the typed refusal that follows.
+
+#### Malformed gate answers fail closed
+
+A refusal with no reason, a frame that is not the gate at all, and a peer that hangs up before answering all collapse to `ConnectionFailure`, so no window data is ever trusted from a connection that skipped the gate.
 
 ### GPUI window sharing
 

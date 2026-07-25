@@ -24,10 +24,10 @@
 # Wiring one of these up means deleting its line here and bumping the matching
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
-counts modules-total 62
-counts modules-wired 34
+counts modules-total 64
+counts modules-wired 37
 counts server-messages-total 59
-counts server-messages-handled 33
+counts server-messages-handled 39
 counts layout-actions-total 36
 counts layout-actions-handled 10
 
@@ -36,7 +36,6 @@ unwired-module clipboard_cleanup
 unwired-module divider
 unwired-module drag_drop
 unwired-module focus_border
-unwired-module lan_approval
 unwired-module lost_control
 unwired-module mouse_reporting
 unwired-module mouse_state
@@ -65,12 +64,6 @@ unhandled-server-message ClipboardBridgeReadRequest
 unhandled-server-message ClipboardBridgeWrite
 unhandled-server-message ClipboardPromptRequest
 unhandled-server-message EnvPreflightResult
-unhandled-server-message LanApprovalPending
-unhandled-server-message LanApprovalRequest
-unhandled-server-message LanApprovalResult
-unhandled-server-message LanDialIdentity
-unhandled-server-message LanEnv
-unhandled-server-message LanPeerList
 unhandled-server-message PromptMark
 unhandled-server-message ReleaseList
 unhandled-server-message RemoteDisconnect

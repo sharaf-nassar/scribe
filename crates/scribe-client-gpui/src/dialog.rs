@@ -1,6 +1,6 @@
 //! Modal dialog suite for the GPUI client rebuild.
 //!
-//! Ports the winit client's five GPU-painted modals —
+//! Ports the winit client's GPU-painted modals —
 //! [`crate::close_dialog`](../../scribe-client/src/close_dialog.rs) equivalent
 //! ([`CloseDialog`]), the update-confirmation dialog ([`UpdateDialog`]), the
 //! risky-paste gate ([`PasteConfirmationDialog`]), the OSC 52 clipboard-policy
@@ -8,7 +8,13 @@
 //! ([`DisallowedSchemeDialog`]) — into display-independent state models plus a
 //! single GPUI [`DialogView`] entity that lowers any of them onto a themed,
 //! rounded, drop-shadowed modal (the same split the [`crate::command_palette`]
-//! and [`crate::lan_approval`] ports use).
+//! port uses).
+//!
+//! The feature-014 LAN device-approval prompt joins them as a sixth model. Its
+//! state lives in [`crate::lan_approval`] rather than here — the request's
+//! display fields and the Decline-default focus are ported from the winit
+//! overlay — and [`AnyDialog::LanApproval`] wraps it so it inherits this modal's
+//! backdrop, focus cycling, and click activation unchanged.
 //!
 //! Each model keeps the winit dialog's parity-critical behaviour byte-for-byte:
 //! the button set and their labels, the **safe default focus** (Cancel / Deny /
@@ -24,6 +30,7 @@ use gpui::{Context, EventEmitter, FocusHandle, Rgba, div, prelude::*, px};
 use scribe_common::protocol::{ClipboardOp, ClipboardSelection, PromptId};
 use scribe_common::theme::ChromeColors;
 
+use crate::lan_approval::{LanApprovalAction, LanApprovalDialog};
 use crate::paste::ParkedPaste;
 use crate::tab_bar::srgba;
 
@@ -564,7 +571,33 @@ impl DisallowedSchemeDialog {
 }
 
 // ---------------------------------------------------------------------------
-// AnyDialog / DialogOutcome (uniform driver over the five models).
+// LAN device-approval prompt (feature 014, owning side).
+// ---------------------------------------------------------------------------
+
+/// Resolve the ported [`LanApprovalDialog`] state into the shape this view
+/// renders from.
+///
+/// The model owns the parity-critical parts — the Decline-default focus, the
+/// word-wrapped "who wants control" / fingerprint / name-collision copy — so all
+/// that is added here is the button emphasis: Approve carries the destructive
+/// tone because it writes a `TrustedDevice` and admits a machine that has so far
+/// been shown nothing (SEC-001/002), exactly like "Allow" on the clipboard
+/// prompt.
+fn lan_approval_spec(dialog: &LanApprovalDialog) -> DialogSpec {
+    let [decline, approve] = LanApprovalDialog::button_labels();
+    DialogSpec {
+        title: LanApprovalDialog::title().to_owned(),
+        body: dialog.body_lines(),
+        buttons: vec![
+            DialogButton::new(decline, ButtonTone::Normal),
+            DialogButton::new(approve, ButtonTone::Danger),
+        ],
+        focused: dialog.focused_index(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AnyDialog / DialogOutcome (uniform driver over the six models).
 // ---------------------------------------------------------------------------
 
 /// The resolved choice from any modal, tagged by dialog so the shell routes it
@@ -581,9 +614,11 @@ pub enum DialogOutcome {
     Clipboard(ClipboardDialogAction),
     /// The disallowed-scheme dialog's choice.
     DisallowedScheme(DisallowedSchemeAction),
+    /// The feature-014 LAN device-approval prompt's choice.
+    LanApproval(LanApprovalAction),
 }
 
-/// One of the five modal state models, wrapped so a single [`DialogView`] can
+/// One of the six modal state models, wrapped so a single [`DialogView`] can
 /// drive focus, rendering, and activation uniformly.
 pub enum AnyDialog {
     /// Quit / kill / cancel.
@@ -596,6 +631,8 @@ pub enum AnyDialog {
     Clipboard(ClipboardDialog),
     /// Disallowed OSC 8 scheme.
     DisallowedScheme(DisallowedSchemeDialog),
+    /// Feature-014 LAN device approval, pushed by this machine's own server.
+    LanApproval(LanApprovalDialog),
 }
 
 impl AnyDialog {
@@ -608,6 +645,7 @@ impl AnyDialog {
             Self::Paste(d) => d.spec(),
             Self::Clipboard(d) => d.spec(),
             Self::DisallowedScheme(d) => d.spec(),
+            Self::LanApproval(d) => lan_approval_spec(d),
         }
     }
 
@@ -618,6 +656,7 @@ impl AnyDialog {
             Self::Paste(d) => d.focused,
             Self::Clipboard(d) => d.focused,
             Self::DisallowedScheme(d) => d.focused,
+            Self::LanApproval(d) => d.focused_index(),
         }
     }
 
@@ -628,6 +667,7 @@ impl AnyDialog {
             Self::Paste(_) => PasteConfirmationDialog::ACTIONS.len(),
             Self::Clipboard(_) => ClipboardDialog::ACTIONS.len(),
             Self::DisallowedScheme(_) => DisallowedSchemeDialog::ACTIONS.len(),
+            Self::LanApproval(_) => LanApprovalDialog::ACTIONS.len(),
         }
     }
 
@@ -638,6 +678,7 @@ impl AnyDialog {
             Self::Paste(d) => d.focused = idx,
             Self::Clipboard(d) => d.focused = idx,
             Self::DisallowedScheme(d) => d.focused = idx,
+            Self::LanApproval(d) => d.set_focused_index(idx),
         }
     }
 
@@ -669,6 +710,9 @@ impl AnyDialog {
                 .get(idx)
                 .copied()
                 .map(DialogOutcome::DisallowedScheme),
+            Self::LanApproval(_) => {
+                LanApprovalDialog::ACTIONS.get(idx).copied().map(DialogOutcome::LanApproval)
+            }
         }
     }
 
@@ -692,6 +736,10 @@ impl AnyDialog {
             Self::DisallowedScheme(_) => {
                 DialogOutcome::DisallowedScheme(DisallowedSchemeAction::Cancel)
             }
+            // Esc / a backdrop click on an approval prompt is a REFUSAL, not a
+            // dismissal: the connection is held open on the server until this
+            // reply arrives, so walking away must reveal nothing (FR-004/006).
+            Self::LanApproval(_) => DialogOutcome::LanApproval(LanApprovalAction::Decline),
         }
     }
 }

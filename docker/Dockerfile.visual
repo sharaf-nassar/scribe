@@ -38,6 +38,8 @@ RUN apt-get update && \
         xclip \
         openbox \
         libwebkit2gtk-4.1-0 \
+        dbus-x11 \
+        gnome-keyring \
     && rm -rf /var/lib/apt/lists/*
 
 # Force visual E2E onto lavapipe's software Vulkan ICD for deterministic
