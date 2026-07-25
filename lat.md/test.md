@@ -772,6 +772,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Window opacity | [[test#GPUI Client Headless Suites#Window opacity]] | Rendering/window `appearance.opacity` |
 | Update surfaces | [[test#GPUI Client Headless Suites#GPUI Update Surfaces]] | `UpdateAvailable`, `UpdateProgress`, `TriggerUpdate`, `DismissUpdate` |
 | Cell-accurate paint path | [[test#GPUI Client Headless Suites#Cell-accurate paint path]] | Box drawing, Font fallback, Ligatures |
+| Find overlay | [[test#GPUI Client Headless Suites#Find overlay]] | `SearchRequest`, `SearchResults`, `find` keybinding |
 | URL/OSC8 detection | [[test#GPUI URL Detection]] | hover/dwell/open surface |
 | IPC bridge ordering | [[test#GPUI IPC Bridge]] | Executor-model ordering risk |
 | Remote connect picker | [[test#GPUI Client Headless Suites#GPUI remote connect picker]] | `ListRemotePeers`, `ListLanPeers`, `RemotePeerList` remote connect picker |
@@ -883,6 +884,48 @@ The test builds metrics from an edited appearance block and asserts the family, 
 Backs the `ConfigReloaded` parity row at the protocol boundary: the reload path must put the message on the wire, ordered ahead of whatever the user types next.
 
 Driving [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#config_reloaded]] followed by a `KeyInput` on the same ordered writer channel, the test asserts a `ClientMessage::ConfigReloaded` is dequeued first. Ordering is the point: the server must have re-read the config before it interprets the next keystroke, otherwise a policy edit applies a keypress late.
+
+### Find overlay
+
+Covers the pure halves of [[client#GPUI Find Overlay]]: the query/reply state machine, the viewport projection of the server's absolute grid rows, and the recolouring that turns a match into painted cells.
+
+None of these prove the running client finds anything — the round trip they stand in for is a wire property, verified end to end by `tests/e2e/visual/find-overlay.sh` (`just e2e-visual-find`), which asserts `SearchRequest` leaving the real client and `SearchResults` coming back from the real server while screenshotting the overlay and its highlights.
+
+#### Every query edit asks the server again
+
+The overlay holds no scrollback, so a query edit that does not reach the server produces a stale or empty result set; this pins that every kind of edit re-asks, and that a no-op edit does not.
+
+Typing, pasting, Backspace and Delete each emit one [[crates/scribe-client-gpui/src/search.rs#FindOverlayEvent]]`::QueryChanged` carrying the new query, while popping an already-empty query, clearing an already-empty query, and a control character emit nothing.
+
+#### A stale reply never replaces live matches
+
+Requests go out per keystroke, so several replies can be in flight at once and the answer to an abandoned prefix must never be shown.
+
+[[crates/scribe-client-gpui/src/search.rs#FindOverlayView#adopt_results]] ignores a [[crates/scribe-client-gpui/src/search.rs#FindResults]] answering an earlier query, adopts the one answering the typed query, and adopts any given reply exactly once — so a redraw cannot reset the match the user has cycled to.
+
+#### Cycling wraps and drives the counter
+
+The `n/m` header is the only feedback the overlay gives about where in the match list the user is, so the cycling and the counter have to stay in step.
+
+`next_match` and `prev_match` wrap in both directions, the header reads `Find  1/3` at the top of a three-match list, a query with no matches reads `Find  no matches` instead of a zeroed counter, and cycling an empty match set is a no-op.
+
+#### Only on-screen matches are highlighted
+
+The server reports absolute grid rows including negative scrollback rows, while this client paints the active viewport only; clamping an off-screen match onto a visible row would highlight text that does not match.
+
+[[crates/scribe-client-gpui/src/search.rs#visible_highlights]] drops matches above and below the viewport, clamps a span to the last painted column, marks exactly the current index, and yields nothing for a degenerate grid.
+
+#### Matches recolour the cells they cover
+
+Highlighting has to go through the per-cell resolve step rather than being drawn over the finished grid, because the current match inverts its foreground for contrast.
+
+Applying spans to one resolved row leaves every cell outside them untouched, gives the current match the opaque accent plus its contrast foreground, and gives a passive match its own background blended towards the accent with its text colour preserved.
+
+#### The overlay's query reaches the wire
+
+The overlay can only ask; the sink is what turns the ask into a frame, so the lowering is asserted on the outbound channel.
+
+[[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#search_request]] enqueues a `ClientMessage::SearchRequest` naming the session, the query verbatim, and the 256-match limit.
 
 ### Cell-accurate paint path
 

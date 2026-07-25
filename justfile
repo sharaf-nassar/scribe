@@ -148,6 +148,13 @@ e2e-visual-settings-trust:
 e2e-visual-window-lifecycle:
     docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/window-lifecycle-config.toml)" -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/window-lifecycle.sh
 
+# Run the find-overlay E2E. It needs the shared pane (so the harness can put
+# the searched text on the real PTY the client renders) AND the wire tap (so
+# SearchRequest leaving the client and SearchResults coming back can both be
+# asserted as real frames).
+e2e-visual-find:
+    docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/find-overlay.sh
+
 # Run the update-surface visual E2E pair. The server polls a fake releases API
 # inside the container, so it needs a longer budget than the default 60 s.
 e2e-visual-update:

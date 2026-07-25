@@ -9,7 +9,8 @@
 //! (`CreateSession` / `AttachSessions` / `Subscribe` / `RequestSnapshot` /
 //! `CloseSession`), the feature-015
 //! control-passing frames (`ControlClaim` / `ControlGrant`) the share surfaces
-//! raise, the update decisions the status-bar CTA drives (`TriggerUpdate` /
+//! raise, the `SearchRequest` the find overlay issues on every query edit,
+//! the update decisions the status-bar CTA drives (`TriggerUpdate` /
 //! `DismissUpdate`), and the window-lifecycle frames the close dialog, the
 //! window-list poll and the focus observer raise (`CloseWindow` / `QuitAll` /
 //! `ListWindows` / `FocusChanged`), onto the ordered IPC-writer channel. The
@@ -311,6 +312,26 @@ impl IpcSink {
     /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
     pub fn close_session(&self, session_id: SessionId) -> Result<(), SinkClosed> {
         self.enqueue(ClientMessage::CloseSession { session_id })
+    }
+
+    /// Asks the server to find `query` in `session_id`'s screen and scrollback,
+    /// answered with a single `SearchResults` carrying up to `limit` spans.
+    ///
+    /// The search runs server-side for the same reason the snapshot does: this
+    /// client is display-only and holds only the visible viewport, so it cannot
+    /// match against the scrollback the user is actually searching. Sent on
+    /// every edit of the find overlay's query, which is why the reply carries
+    /// the query back — a stale answer is dropped rather than shown.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn search_request(
+        &self,
+        session_id: SessionId,
+        query: String,
+        limit: u32,
+    ) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::SearchRequest { session_id, query, limit })
     }
 
     /// Requests the authoritative workspace notes for `workspace_ids` so the
@@ -619,6 +640,25 @@ mod tests {
 
         assert!(matches!(out_rx.recv().await.unwrap(), ClientMessage::ConfigReloaded));
         assert!(matches!(out_rx.recv().await.unwrap(), ClientMessage::KeyInput { .. }));
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#The overlay's query reaches the wire]]
+    #[tokio::test]
+    async fn search_request_carries_the_query_and_the_result_limit() {
+        let pane = SessionId::new();
+        let (out_tx, mut out_rx) = unbounded_channel::<ClientMessage>();
+        let sink = IpcSink::new(out_tx);
+
+        sink.search_request(pane, "error".to_owned(), 256).unwrap();
+
+        match out_rx.recv().await.unwrap() {
+            ClientMessage::SearchRequest { session_id, query, limit } => {
+                assert_eq!(session_id, pane);
+                assert_eq!(query, "error");
+                assert_eq!(limit, 256);
+            }
+            other => panic!("expected SearchRequest, got {other:?}"),
+        }
     }
 
     // @lat: [[test#GPUI IPC Bridge#Sink reports closed writer]]
