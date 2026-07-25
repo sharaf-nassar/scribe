@@ -17,8 +17,8 @@ use std::{
 
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    Point, Render, Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, div, prelude::*, px, size,
+    Point, Render, Subscription, Task, TitlebarOptions, WeakEntity, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use gpui_platform::application;
 use scribe_client_gpui::ai_indicator::AiStateTracker;
@@ -48,6 +48,7 @@ use scribe_client_gpui::workspace_notes::WorkspaceNoteEntry;
 use scribe_client_gpui::workspace_notes_modal::{
     WorkspaceNotesModalAction, WorkspaceNotesModalColors, WorkspaceNotesModalView,
 };
+use scribe_client_gpui::x11_focus::X11FocusGuard;
 use scribe_client_gpui::{
     tab_bar::{TabBarColors, context_suffix},
     tab_session::{TabEntry, TabSessions},
@@ -186,6 +187,12 @@ struct Shared {
 /// delete-and-recreate save collapses into a single reload.
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
+/// How often the foreground refreshes the X11 active-window guard. Short enough
+/// that a compositor overlay opening while the user is idle is noticed before
+/// their next keystroke, long enough that the `_NET_ACTIVE_WINDOW` round-trip
+/// stays off the hot path.
+const X11_FOCUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// The terminal grid's theme slots, kept in sRGB `[f32; 4]` theme space until
 /// the render pass folds `appearance.opacity` into the background alpha.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -251,10 +258,20 @@ struct TerminalView {
     /// Demo toggle: when set, an OSC 8-style hover tooltip is drawn over a fixed
     /// anchor so the visual E2E can exercise tooltip clamping + URL truncation.
     tooltip_demo: bool,
+    /// X11 active-window guard, present only when this window has an Xcb/Xlib
+    /// window id (so: X11 sessions only). Suppresses keystrokes while a
+    /// compositor overlay covers the window without sending a focus event.
+    x11_focus: Option<X11FocusGuard>,
     // Held to keep the redraw poll alive; dropping the view cancels the task.
     _refresh_task: Task<()>,
     /// Held to keep the config-reload poll alive; dropping the view cancels it.
     _config_task: Task<()>,
+    /// Held to keep the `_NET_ACTIVE_WINDOW` poll alive; dropping the view
+    /// cancels it. `None` when the focus guard is not enabled.
+    _x11_focus_task: Option<Task<()>>,
+    /// Held to keep the window-activation observer alive, which clears the
+    /// guard's reactivation debounce on a genuine focus event.
+    _activation_observer: Option<Subscription>,
 }
 
 impl TerminalView {
@@ -262,8 +279,27 @@ impl TerminalView {
         shared: Shared,
         sink: IpcSink,
         terminal_size: TerminalSize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Start the X11 active-window guard from the live window: the Xcb/Xlib
+        // window id only exists once the platform window has been created, and
+        // `open_window` builds the root view with the real `Window` in hand.
+        // Non-X11 backends yield no id, leaving `x11_focus` `None` and every
+        // guard call below an explicit no-op.
+        let x11_focus = X11FocusGuard::from_window_handle(&*window);
+        let (x11_focus_task, activation_observer) = if x11_focus.is_some() {
+            tracing::info!(
+                window = scribe_client_gpui::x11_focus::xcb_window_id(&*window),
+                "X11 active-window guard enabled"
+            );
+            let task = cx.spawn(async move |view, app| drive_x11_focus_polls(view, app).await);
+            let observer =
+                cx.observe_window_activation(window, |view, window, _| view.on_activation(window));
+            (Some(task), Some(observer))
+        } else {
+            (None, None)
+        };
         let generation = Arc::clone(&shared.generation);
         let refresh_task =
             cx.spawn(async move |view, app| drive_redraws(view, app, generation).await);
@@ -317,8 +353,11 @@ impl TerminalView {
             dialog: None,
             workspace_notes_modal: None,
             tooltip_demo: false,
+            x11_focus,
             _refresh_task: refresh_task,
             _config_task: config_task,
+            _x11_focus_task: x11_focus_task,
+            _activation_observer: activation_observer,
         }
     }
 
@@ -875,6 +914,49 @@ impl TerminalView {
         true
     }
 
+    /// Handle a window activation change from the platform.
+    ///
+    /// Compositor overlays never send focus events, so a genuine activation
+    /// means the user really is back: drop the guard's reactivation debounce
+    /// rather than eating the keystroke that follows a real refocus.
+    fn on_activation(&mut self, window: &Window) {
+        if !window.is_window_active() {
+            return;
+        }
+        if let Some(guard) = self.x11_focus.as_mut() {
+            guard.clear_reactivation_debounce();
+        }
+    }
+
+    /// Refresh the X11 active-window guard's cached state (no-op off X11).
+    ///
+    /// Driven by [`drive_x11_focus_polls`] so an overlay that opens and closes
+    /// between keystrokes still arms the reactivation debounce.
+    fn poll_x11_focus(&mut self, _cx: &mut Context<Self>) {
+        if let Some(guard) = self.x11_focus.as_mut() {
+            guard.poll();
+        }
+    }
+
+    /// Returns `true` when a compositor overlay (e.g. a screenshot tool) is
+    /// covering the window, so `event` must not reach any keyboard consumer.
+    ///
+    /// This is the first gate on the key path — ahead of overlays, bindings,
+    /// and the PTY encoder — because a keystroke the user aimed at the overlay
+    /// (Enter to confirm a screenshot) must not land anywhere in the client.
+    fn compositor_overlay_active(&mut self, event: &KeyDownEvent) -> bool {
+        let Some(guard) = self.x11_focus.as_mut() else {
+            return false;
+        };
+        if !guard.should_suppress_key() {
+            return false;
+        }
+        // Input vanishing is exactly the symptom this guard produces, so say so
+        // once per dropped keystroke rather than leaving it silent.
+        tracing::info!(key = %event.keystroke.key, "x11 focus guard suppressed keystroke");
+        true
+    }
+
     /// Encodes a keystroke and enqueues it as `KeyInput` for the attached pane.
     ///
     /// Interim passthrough encoder: printable characters plus a handful of
@@ -974,6 +1056,21 @@ async fn drive_config_reloads(
             continue;
         }
         if view.update(app, TerminalView::reload_config).is_err() {
+            return;
+        }
+    }
+}
+
+/// Refreshes the X11 active-window guard on a timer.
+///
+/// The legacy winit client polled `_NET_ACTIVE_WINDOW` from its event loop so
+/// the guard noticed a compositor overlay even while no key events arrived; the
+/// GPUI client has no such tick, so the poll gets its own task. It only updates
+/// the guard's cached state — suppression is still decided on the key path.
+async fn drive_x11_focus_polls(view: WeakEntity<TerminalView>, app: &mut AsyncApp) {
+    loop {
+        app.background_executor().timer(X11_FOCUS_POLL_INTERVAL).await;
+        if view.update(app, TerminalView::poll_x11_focus).is_err() {
             return;
         }
     }
@@ -1159,6 +1256,12 @@ impl Render for TerminalView {
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, ctx| {
+                // The X11 active-window guard gates everything: while a
+                // compositor overlay owns the screen the keystroke was never
+                // meant for this window, so it reaches no consumer at all.
+                if view.compositor_overlay_active(event) {
+                    return;
+                }
                 // Overlays own the keyboard first, then the configured
                 // bindings, and only then the generic PTY byte encoder.
                 if view.handle_overlay_key(event, ctx) || view.handle_binding(event, ctx) {
@@ -1333,7 +1436,7 @@ fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink, terminal_size: Ter
             window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
         },
-        |_, cx| cx.new(|cx| TerminalView::new(shared, sink, terminal_size, cx)),
+        |window, cx| cx.new(|cx| TerminalView::new(shared, sink, terminal_size, window, cx)),
     ) {
         tracing::error!(%error, "failed to open GPUI window");
     }

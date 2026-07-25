@@ -6,6 +6,7 @@ target/*
 target/release/*
 !target/release/scribe-server
 !target/release/scribe-client
+!target/release/scribe-client-gpui
 !target/release/scribe-test
 !target/release/scribe-hook-helper
 node_modules/
