@@ -408,7 +408,13 @@ pub fn attach_dimensions_for_session(
     grid.map_or_else(TerminalSize::default, |grid| terminal_size_for_grid(grid, cell_size))
 }
 
-fn round_positive_f32_to_u16(value: f32) -> u16 {
+/// Round a positive pixel measurement to a `u16` protocol field.
+///
+/// Returns 0 for anything non-finite or non-positive. Shared with the client
+/// binary so cell metrics reported after a live font reload use the same
+/// conversion as the ones reported during restore replay.
+#[must_use]
+pub fn round_positive_f32_to_u16(value: f32) -> u16 {
     if !value.is_finite() || value <= 0.0 {
         return 0;
     }

@@ -25,13 +25,17 @@ use scribe_client_gpui::animation::AnimationSettings;
 use scribe_client_gpui::command_palette::{
     CommandPaletteColors, CommandPaletteEvent, CommandPaletteView, build_entries,
 };
+use scribe_client_gpui::config::{ConfigChangeSignal, ConfigReloadPlan, ConfigRuntime};
 use scribe_client_gpui::context_menu::{
     ContextMenuColors, ContextMenuEvent, ContextMenuRequest, ContextMenuView,
 };
 use scribe_client_gpui::dialog::{
     AnyDialog, ClipboardDialog, CloseDialog, DialogColors, DialogEvent, DialogView,
 };
+use scribe_client_gpui::input::KeyInput;
+use scribe_client_gpui::keybindings::{KeyAction, translate_key_action};
 use scribe_client_gpui::layout::Rect;
+use scribe_client_gpui::restore_replay::round_positive_f32_to_u16;
 use scribe_client_gpui::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
 use scribe_client_gpui::sys_stats::SystemStatsCollector;
 use scribe_client_gpui::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
@@ -45,14 +49,13 @@ use scribe_client_gpui::{
 };
 use scribe_common::theme::ChromeColors;
 use scribe_common::{
-    config::{StatusBarStatsConfig, load_config, resolve_theme},
+    config::{StatusBarStatsConfig, load_config},
     framing::{read_message, write_message},
     ids::{SessionId, WorkspaceId},
     protocol::{
         ArchiveReason, ClientMessage, ServerMessage, SessionInfo, TerminalSize, WorkspaceNoteStatus,
     },
     socket::server_socket_path,
-    theme::minimal_dark,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -66,7 +69,7 @@ use crate::{
     ipc_bridge::{InboundEvent, IpcSink, run_drain},
     sync_frames::{SyncFrameQueue, drain_all_committed},
     terminal::{Content, DisplayOnlyTerminal},
-    terminal_element::TerminalElement,
+    terminal_element::{GridFont, TerminalElement},
 };
 
 /// Wall-clock origin captured at the very top of `main`, used to time
@@ -122,16 +125,26 @@ struct Shared {
     connected: Arc<AtomicBool>,
 }
 
+/// How often the foreground drains the config watcher's change signal. Short
+/// enough that a saved edit lands within a frame or two, long enough that a
+/// delete-and-recreate save collapses into a single reload.
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(120);
+
 struct TerminalView {
     shared: Shared,
     sink: IpcSink,
     focus_handle: FocusHandle,
+    /// Live config: the resolved snapshot plus the file watcher that keeps it
+    /// fresh. Held for the window's lifetime — dropping it stops the watcher.
+    config: ConfigRuntime,
     /// System-stats sampler feeding the status bar's CPU/MEM/NET/GPU sparklines.
     stats: SystemStatsCollector,
-    /// Theme-derived status-bar palette, resolved once at view creation.
+    /// Theme-derived status-bar palette, rebuilt on every theme reload.
     status_colors: StatusBarColors,
     /// Which system-stat segments the status bar shows, from config.
     stats_config: StatusBarStatsConfig,
+    /// Font metrics the terminal grid paints with, rebuilt on a font reload.
+    font: GridFont,
     // The custom titlebar + integrated tab bar drawn above the terminal grid.
     titlebar: Entity<TitlebarView>,
     /// Theme chrome, retained to build the overlay palettes on demand.
@@ -151,6 +164,8 @@ struct TerminalView {
     tooltip_demo: bool,
     // Held to keep the redraw poll alive; dropping the view cancels the task.
     _refresh_task: Task<()>,
+    /// Held to keep the config-reload poll alive; dropping the view cancels it.
+    _config_task: Task<()>,
 }
 
 impl TerminalView {
@@ -158,11 +173,18 @@ impl TerminalView {
         let generation = Arc::clone(&shared.generation);
         let refresh_task =
             cx.spawn(async move |view, app| drive_redraws(view, app, generation).await);
-        let config = load_config().unwrap_or_default();
-        let theme = resolve_theme(&config);
+        // Load the config and start the file watcher in one step so an edit
+        // saved after this point reaches the window without a restart.
+        let config = ConfigRuntime::start();
+        let config_signal = config.signal();
+        let config_task =
+            cx.spawn(async move |view, app| drive_config_reloads(view, app, config_signal).await);
+        let theme = &config.config().theme;
         let status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
-        let chrome = theme.chrome;
-        let colors = TabBarColors::from(&minimal_dark().chrome);
+        let chrome = config.config().chrome;
+        let font = GridFont::from_appearance(&config.config().config.appearance);
+        let stats_config = config.config().config.terminal.status_bar_stats.clone();
+        let colors = TabBarColors::from(&chrome);
         let titlebar = cx.new(|cx| {
             let mut bar = TitlebarView::new(colors, cx);
             let mut tab = TabData::new("shell");
@@ -174,9 +196,11 @@ impl TerminalView {
             shared,
             sink,
             focus_handle: cx.focus_handle(),
+            config,
             stats: SystemStatsCollector::new(),
             status_colors,
-            stats_config: config.terminal.status_bar_stats,
+            stats_config,
+            font,
             titlebar,
             chrome,
             command_palette: None,
@@ -185,7 +209,93 @@ impl TerminalView {
             workspace_notes_modal: None,
             tooltip_demo: false,
             _refresh_task: refresh_task,
+            _config_task: config_task,
         }
+    }
+
+    /// Drain a pending config-file change and reapply it to the live window.
+    ///
+    /// Runs on the GPUI foreground (the watcher thread only bumps an atomic),
+    /// so every surface below is touched from the thread that owns it.
+    fn reload_config(&mut self, cx: &mut Context<Self>) {
+        let Some(plan) = self.config.poll_reload() else {
+            return;
+        };
+        self.apply_config_reload(plan, cx);
+    }
+
+    /// Reapply one reload plan: theme-derived palettes, grid font metrics, and
+    /// the opacity hook, then announce the reload to the server.
+    ///
+    /// Keybindings need no branch here — [`ConfigRuntime`] re-parses them on
+    /// every reload and `handle_overlay_key` reads them fresh on each keystroke,
+    /// so a saved shortcut edit is live immediately.
+    fn apply_config_reload(&mut self, plan: ConfigReloadPlan, cx: &mut Context<Self>) {
+        if plan.theme_changed() {
+            let theme = self.config.config().theme.clone();
+            self.status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
+            self.chrome = theme.chrome;
+            let tab_colors = TabBarColors::from(&self.chrome);
+            self.titlebar.update(cx, |bar, ctx| bar.set_colors(tab_colors, ctx));
+            // Open overlays captured the old palette when they were built; drop
+            // them so a live theme edit never leaves stale colours on screen.
+            self.command_palette = None;
+            self.context_menu = None;
+        }
+
+        if plan.font_changed() {
+            self.font = GridFont::from_appearance(&self.config.config().config.appearance);
+            self.report_cell_metrics();
+        }
+
+        if plan.opacity_changed() {
+            self.apply_opacity_change();
+        }
+
+        // Status-bar stat selection is cheap to swap and has no plan flag.
+        self.stats_config = self.config.config().config.terminal.status_bar_stats.clone();
+
+        // Tell the server to re-read the same file so its own live surfaces
+        // (clipboard policy, env store, remote/share listeners) follow.
+        if let Err(error) = self.sink.config_reloaded() {
+            tracing::warn!(%error, "ConfigReloaded dropped: IPC writer closed");
+        }
+
+        tracing::info!(
+            theme = plan.theme_changed(),
+            font = plan.font_changed(),
+            opacity = plan.opacity_changed(),
+            "config hot-reloaded"
+        );
+        cx.notify();
+    }
+
+    /// Republish the cell grid's size after a font edit changed cell metrics.
+    fn report_cell_metrics(&self) {
+        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
+        else {
+            return;
+        };
+        let size = TerminalSize {
+            cols: COLUMNS,
+            rows: ROWS,
+            cell_width: round_positive_f32_to_u16(self.font.cell_width()).max(1),
+            cell_height: round_positive_f32_to_u16(self.font.line_height).max(1),
+        };
+        if let Err(error) = self.sink.resize(session_id, size) {
+            tracing::warn!(%error, "resize after font reload dropped: IPC writer closed");
+        }
+    }
+
+    /// Delivery point for the reload plan's `opacity_changed()` signal.
+    ///
+    /// The live value is already swapped in on [`ConfigRuntime`]; painting it
+    /// onto the GPUI root background (and deciding whether the window was
+    /// created transparent enough to honour it) is owned by the root-background
+    /// opacity work and is deliberately not done here. Everything that path
+    /// needs — the change signal and the new value — arrives through this hook.
+    fn apply_opacity_change(&mut self) {
+        tracing::info!(opacity = self.config.opacity(), "config reload: opacity changed");
     }
 
     /// Open the command palette, building its entry list from the live update /
@@ -382,19 +492,31 @@ impl TerminalView {
     /// the key was consumed by an overlay (and must not reach the PTY).
     fn handle_overlay_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let mods = &event.keystroke.modifiers;
-        // Ctrl+Shift+P opens the palette; Ctrl+Shift+U toggles the tooltip demo;
-        // Ctrl+Shift+Q opens the close dialog; Ctrl+Shift+K opens the clipboard
-        // dialog; Ctrl+Shift+N opens the workspace-notes modal.
-        if mods.control
-            && mods.shift
-            && self.dialog.is_none()
-            && self.workspace_notes_modal.is_none()
-        {
+        let overlay_free = self.dialog.is_none() && self.workspace_notes_modal.is_none();
+
+        // Config-driven shortcuts are matched against the live bindings, which
+        // the config watcher re-parses on every reload — so a saved keybinding
+        // edit takes effect on the very next keystroke, with no restart. Only
+        // the palette intercept is claimed here; every other translation falls
+        // through to the demo keys and the terminal encoder below.
+        if overlay_free {
+            let opens_palette = KeyInput::from_key_down(event).is_some_and(|input| {
+                matches!(
+                    translate_key_action(&input, self.config.bindings()),
+                    Some(KeyAction::OpenCommandPalette)
+                )
+            });
+            if opens_palette {
+                self.open_command_palette(cx);
+                return true;
+            }
+        }
+
+        // Ctrl+Shift+U toggles the tooltip demo; Ctrl+Shift+Q opens the close
+        // dialog; Ctrl+Shift+K opens the clipboard dialog; Ctrl+Shift+N opens
+        // the workspace-notes modal.
+        if mods.control && mods.shift && overlay_free {
             match event.keystroke.key.as_str() {
-                "p" => {
-                    self.open_command_palette(cx);
-                    return true;
-                }
                 "u" => {
                     self.tooltip_demo = !self.tooltip_demo;
                     cx.notify();
@@ -523,6 +645,29 @@ fn encode_key(event: &KeyDownEvent) -> Option<Vec<u8>> {
     Some(bytes.to_vec())
 }
 
+/// Drains the config watcher's change signal on the GPUI foreground.
+///
+/// The `notify` callback runs on its own thread and only bumps the shared
+/// atomic; this task is the hop back onto the thread that owns the view, where
+/// the reload can safely touch entities and request a repaint. It exits when the
+/// window is gone.
+async fn drive_config_reloads(
+    view: WeakEntity<TerminalView>,
+    app: &mut AsyncApp,
+    signal: ConfigChangeSignal,
+) {
+    let mut seen = signal.generation();
+    loop {
+        app.background_executor().timer(CONFIG_POLL_INTERVAL).await;
+        if !signal.take_change(&mut seen) {
+            continue;
+        }
+        if view.update(app, TerminalView::reload_config).is_err() {
+            return;
+        }
+    }
+}
+
 /// Repaints the view whenever the IPC drain bumps the shared generation counter.
 async fn drive_redraws(
     view: WeakEntity<TerminalView>,
@@ -636,12 +781,15 @@ impl Render for TerminalView {
             .child(
                 // Wrap the terminal grid so a right-click opens the context menu
                 // at the cursor without disturbing the display-only element.
-                div().flex_1().child(TerminalElement::new(content).paint()).on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
-                        view.open_context_menu(event.position, ctx);
-                    }),
-                ),
+                div()
+                    .flex_1()
+                    .child(TerminalElement::new(content, self.font.clone()).paint())
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
+                            view.open_context_menu(event.position, ctx);
+                        }),
+                    ),
             )
             .child(
                 div()
@@ -663,8 +811,22 @@ impl Render for TerminalView {
     }
 }
 
+/// Install the `tracing` subscriber, mirroring the legacy client's setup so the
+/// GPUI client's diagnostics (config hot-reload, dropped IPC sends, watcher
+/// failures) actually reach stderr instead of being discarded. `RUST_LOG`
+/// overrides the default `info` filter.
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+}
+
 fn main() {
     PROCESS_START.get_or_init(Instant::now);
+    init_tracing();
 
     // `scribe-client --settings` opens (or focuses) the settings window instead
     // of the terminal shell. The singleton absorbs the old scribe-settings

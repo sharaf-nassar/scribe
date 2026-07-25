@@ -65,7 +65,7 @@ chmod 700 "$UID_DIR"
 
 prepare_xdg_dirs
 export PATH="/tests/bin:$PATH"
-export RUST_LOG="${RUST_LOG:-scribe_server=info}"
+export RUST_LOG="${RUST_LOG:-scribe_server=info,scribe_client_gpui=info}"
 
 scribe-test server start
 SERVER_STARTED=1
@@ -84,8 +84,14 @@ case "$VISUAL_APP" in
         # VK_ICD_FILENAMES to lavapipe (software) so no GPU is required.
         # LIBGL_ALWAYS_SOFTWARE keeps any GL fallback off hardware too.
         export LIBGL_ALWAYS_SOFTWARE=1
-        scribe-client-gpui &
+        # Persist the client's tracing output so scripted tests can assert on
+        # runtime behaviour that leaves no pixels behind (e.g. the config
+        # watcher's "config hot-reloaded" line) instead of guessing from a
+        # screenshot diff.
+        scribe-client-gpui >/output/client.log 2>&1 &
         APP_PID=$!
+        export SCRIBE_CLIENT_PID="$APP_PID"
+        export SCRIBE_CLIENT_LOG=/output/client.log
         wait_for_window "Scribe" 15 || true
         SESSION=$(scribe-test session create)
         export SESSION
