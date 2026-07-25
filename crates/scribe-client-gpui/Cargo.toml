@@ -28,7 +28,15 @@ regex.workspace = true
 nix.workspace = true
 rmp-serde.workspace = true
 scribe-common.workspace = true
+# Feature 014 LAN remote control: the connecting client reuses the server's
+# device identity (keyring-sealed cert) and the SPKI-pinning mutual-TLS dialer
+# (`LanTls::connect`), so the security-critical verifier and its signature
+# delegation live in ONE place instead of being duplicated client-side — the
+# same dependency, for the same reason, that `scribe-client` takes.
+# tokio-rustls names the dialer-side encrypted stream type.
+scribe-server.workspace = true
 serde_json.workspace = true
+tokio-rustls.workspace = true
 # Window geometry persistence (window_state) serializes WindowGeometry to the
 # per-window state.toml files.
 serde.workspace = true

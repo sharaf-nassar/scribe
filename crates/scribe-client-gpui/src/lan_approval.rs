@@ -34,7 +34,7 @@ pub const BODY_WRAP_COLS: usize = 54;
 /// focus so the safe choice is pre-selected — pressing Enter on an unexpected
 /// prompt never silently grants trust (mirrors the deny-default of the paste,
 /// disallowed-scheme, and clipboard dialogs).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ButtonIndex {
     Decline = 0,
     Approve = 1,
@@ -59,6 +59,7 @@ impl ButtonIndex {
 /// State for the in-app LAN device-approval overlay. Holds the pending request's
 /// display fields plus the `request_id` that correlates the user's decision back
 /// to the held connection (data-model `ApprovalRequest`).
+#[derive(Debug)]
 pub struct LanApprovalDialog {
     /// Correlates the decision reply with the held connection.
     request_id: u64,
@@ -127,6 +128,31 @@ impl LanApprovalDialog {
     #[must_use]
     pub fn button_labels() -> [&'static str; 2] {
         ["Decline", "Approve"]
+    }
+
+    /// The two actions in render order, matching [`button_labels`](Self::button_labels).
+    ///
+    /// This is the index space the generic [`crate::dialog::DialogView`] drives
+    /// focus and mouse activation in, so the prompt reuses the same modal chrome
+    /// (backdrop, Tab cycling, Esc-is-the-safe-answer) as every other dialog
+    /// instead of growing a second one.
+    pub const ACTIONS: [LanApprovalAction; 2] =
+        [LanApprovalAction::Decline, LanApprovalAction::Approve];
+
+    /// Index of the focused button within [`ACTIONS`](Self::ACTIONS).
+    pub(crate) fn focused_index(&self) -> usize {
+        self.focused as usize
+    }
+
+    /// Move focus to `index` within [`ACTIONS`](Self::ACTIONS). Anything other
+    /// than Approve's index resolves to the safe `Decline`, so an out-of-range
+    /// value can never pre-select granting trust.
+    pub(crate) fn set_focused_index(&mut self, index: usize) {
+        self.focused = if index == ButtonIndex::Approve as usize {
+            ButtonIndex::Approve
+        } else {
+            ButtonIndex::Decline
+        };
     }
 
     /// The dialog title.

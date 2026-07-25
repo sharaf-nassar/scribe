@@ -42,7 +42,11 @@
 //! [`keybindings`] parser now drives the live key path, [`tab_session`]
 //! holds the ordered tab strip those tab shortcuts mutate, and
 //! [`window_lifecycle`] is the close / quit / window-list / focus-report state
-//! the IPC reader and the GPUI view share across threads. The remaining
+//! the IPC reader and the GPUI view share across threads. The feature-014 LAN
+//! surface follows the same split: [`lan`] is the shared chrome the reader
+//! folds every LAN answer into, [`lan_approval`] is the owning-side prompt it
+//! parks for the window to raise, and [`lan_dial`] is the connecting side's
+//! identity fetch, mutual-TLS dial, and approval-gate preamble. The remaining
 //! consumers (pane splits, scrollback navigation, zoom) land in later beads of
 //! the `gpui-client-rebuild` epic.
 
@@ -64,7 +68,9 @@ pub mod focus_border;
 pub mod fonts;
 pub mod input;
 pub mod keybindings;
+pub mod lan;
 pub mod lan_approval;
+pub mod lan_dial;
 pub mod layout;
 pub mod lost_control;
 pub mod mouse_reporting;

@@ -12,8 +12,12 @@
 //! raise, the `SearchRequest` the find overlay issues on every query edit,
 //! the update decisions the status-bar CTA drives (`TriggerUpdate` /
 //! `DismissUpdate`), and the window-lifecycle frames the close dialog, the
+//! raise, the update decisions the status-bar CTA drives (`TriggerUpdate` /
+//! `DismissUpdate`), the window-lifecycle frames the close dialog, the
 //! window-list poll and the focus observer raise (`CloseWindow` / `QuitAll` /
-//! `ListWindows` / `FocusChanged`), onto the ordered IPC-writer channel. The
+//! `ListWindows` / `FocusChanged`), and the feature-014 LAN frames the approval
+//! prompt and the startup LAN probe raise (`LanApprovalDecision` /
+//! `ListLanPeers`), onto the ordered IPC-writer channel. The
 //! outbound path never traverses the inbound drain, so keystrokes are never
 //! queued behind an output firehose and `Resize` is always flushed ahead of the
 //! `KeyInput` that follows.
@@ -422,6 +426,34 @@ impl IpcSink {
     /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
     pub fn list_windows(&self) -> Result<(), SinkClosed> {
         self.enqueue(ClientMessage::ListWindows)
+    }
+
+    /// Answers a pending feature-014 LAN device approval with the owning user's
+    /// decision, echoing the `request_id` the server's `LanApprovalRequest`
+    /// correlated the held connection by.
+    ///
+    /// `approve` writes a `TrustedDevice` and lets the peer attach; `false`
+    /// refuses and reveals nothing. This is deliberately the ONLY way a decision
+    /// leaves the client: the server ignores a decision arriving over any remote
+    /// transport, so it must ride this local session connection.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn lan_approval_decision(&self, request_id: u64, approve: bool) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::LanApprovalDecision { request_id, approve })
+    }
+
+    /// Asks the local server which LAN peers it has discovered over mDNS on the
+    /// current network, answered with a single `LanPeerList`.
+    ///
+    /// Served from THIS machine's own discovery view and refused over any remote
+    /// transport, so it is only sent while the client is on its local socket and
+    /// `remote.lan.enabled` makes the answer meaningful.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn list_lan_peers(&self) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::ListLanPeers)
     }
 
     /// Reports a pane focus transition so the server can relay CSI focus events

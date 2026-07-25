@@ -4,6 +4,7 @@ mod cmd_socket;
 mod daemon;
 mod input;
 mod ipc;
+mod lan_peer;
 mod render;
 mod server;
 mod session;
@@ -200,6 +201,11 @@ enum Command {
         #[arg(long)]
         control: PathBuf,
     },
+    /// Stand in for a second machine's feature-014 LAN listener: terminate a
+    /// real mutual-TLS handshake, record the client's `LanHello`, run the
+    /// device-approval gate, and splice an approved connection to the local
+    /// server.
+    LanPeer(LanPeerArgs),
     /// Send one JSON-encoded `ServerMessage` to a running `share-tap`, which
     /// frames it to the client as if the server had sent it.
     ShareInject {
@@ -346,6 +352,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
             rt.block_on(share_tap::run(&listen, &upstream, &record, &control))
                 .map_err(|e| TestError::InfraError(e.to_string()))
         }
+        Command::LanPeer(args) => run_lan_peer(args),
         Command::ShareInject { control, message } => {
             let rt =
                 tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
@@ -353,6 +360,50 @@ fn run(cli: Cli) -> Result<(), TestError> {
                 .map_err(|e| TestError::InfraError(e.to_string()))
         }
     }
+}
+
+/// Command-line shape of the LAN peer stand-in, grouped so the dispatcher passes
+/// one value rather than six positional flags.
+#[derive(clap::Args)]
+struct LanPeerArgs {
+    /// `host:port` to bind the LAN listener on.
+    #[arg(long, default_value = "127.0.0.1:46062")]
+    listen: String,
+    /// Local server socket the device identity is borrowed from and an approved
+    /// connection is spliced to.
+    #[arg(long)]
+    upstream: PathBuf,
+    /// JSONL file every framed message in both directions is appended to.
+    #[arg(long)]
+    record: PathBuf,
+    /// Decline instead of approving the device.
+    #[arg(long)]
+    decline: bool,
+    /// Answer `LanApprovalPending` first, as an unknown device would see.
+    #[arg(long)]
+    pending: bool,
+    /// Milliseconds to hold before the terminal approval result.
+    #[arg(long, default_value_t = 0)]
+    hold_ms: u64,
+}
+
+/// Run the feature-014 LAN peer stand-in until it is killed.
+///
+/// Split out of [`run`] so the dispatcher stays a table of one-line routes; the
+/// stand-in owns its own Tokio runtime exactly as `share-tap` does.
+fn run_lan_peer(args: LanPeerArgs) -> Result<(), TestError> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| TestError::InfraError(e.to_string()))?;
+    let verdict =
+        if args.decline { lan_peer::Verdict::Decline } else { lan_peer::Verdict::Approve };
+    rt.block_on(lan_peer::run(lan_peer::LanPeerConfig {
+        listen: args.listen,
+        upstream: args.upstream,
+        record: args.record,
+        verdict,
+        pending: args.pending,
+        hold: std::time::Duration::from_millis(args.hold_ms),
+    }))
+    .map_err(|e| TestError::InfraError(e.to_string()))
 }
 
 /// Extract a single character from the expected string.

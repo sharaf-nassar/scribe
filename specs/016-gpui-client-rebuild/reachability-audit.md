@@ -441,7 +441,19 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
 - **FU-17 LAN (mTLS) dial and approval.** Rows: `LanHello`,
   `LanApprovalDecision`, `ListLanPeers`, `GetLanDialIdentity`,
   `LanApprovalPending`, `LanApprovalResult`, `LanApprovalRequest`, `LanPeerList`,
-  `LanDialIdentity`, `LanEnv`, `GetLanEnv`.
+  `LanDialIdentity`, `LanEnv`, `GetLanEnv`. **Landed.** `lan_approval.rs` is now
+  imported by `main.rs` and wrapped as `AnyDialog::LanApproval`, so the owning
+  side's prompt is raised from a new shared `lan.rs::LanChrome` by the
+  foreground tick and answered through `IpcSink::lan_approval_decision`. The six
+  inbound LAN variants have explicit arms in `dispatch_server_message`, routed to
+  `on_lan_message`; the startup probe puts `GetLanEnv` (transient socket) and
+  `ListLanPeers` (session connection) on the wire when `remote.lan.enabled`. A
+  new `lan_dial.rs` reaches a peer over TCP + pinned mutual TLS behind
+  `SCRIBE_LAN_DIAL`, fetching the dial identity over `GetLanDialIdentity` and
+  running the `LanHello` preamble and approval gate. Verified on two wires and
+  on screen by `tests/e2e/visual/lan-approval.sh`, whose `scribe-test lan-peer`
+  stand-in terminates a real mutual-TLS handshake with the server-owned
+  `LanTls`.
 - **FU-18 Trusted devices and networks in the settings window.** Rows:
   `ListTrustedDevices`, `RevokeTrustedDevice`, `ListTrustedNetworks`,
   `AddCurrentNetworkTrusted`, `RemoveTrustedNetwork`, `TrustedDeviceList`,
@@ -450,7 +462,8 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
   Environment page owns the env-persistence opt-in; every one of those transport
   helpers is reached from `settings/window.rs::run_action`, the same live path
   that already served `CheckForUpdates` / `ListReleases`. `GetLanEnv` / `LanEnv`
-  came along with the section, so FU-17 is down to the dial/approval rows.
+  came along with the section; FU-17 has since wired the dial/approval rows and
+  put both on the terminal window's live path as well.
   Wiring the path also surfaced a latent protocol defect: `PreflightError`'s
   `Unknown` variant was a newtype under `#[serde(tag = "type")]`, which msgpack
   cannot encode, so every failing `EnvPreflightResult` was dropped before it
@@ -499,6 +512,7 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
 | .59 (vi/smart-selection/split-scroll) | `scroll_up/down/top/bottom`; selection groundwork for `copy` |
 | .61 (close_tab/new_window) | `close_tab`, `new_window` |
 | .77 (FU-18 settings trust) | the nine FU-18 rows plus `GetLanEnv` / `LanEnv` |
+| .76 (FU-17 LAN dial and approval) | all eleven FU-17 rows |
 
 Everything else in the fix units above is currently unfiled.
 

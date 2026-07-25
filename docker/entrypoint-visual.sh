@@ -100,6 +100,24 @@ TOML
         "$XDG_STATE_HOME/scribe/lan_trusted_devices.toml"
 }
 
+# Start a session D-Bus and an unlocked gnome-keyring, then re-exec.
+#
+# The feature-014 LAN device key is sealed in the OS keyring (Secret Service on
+# Linux), and `scribe-server` fails closed without one — so `GetLanDialIdentity`
+# reports `available = false` and no mutual-TLS dial can happen at all. Only the
+# LAN dial test needs this, so it is opt-in: every other visual test keeps the
+# lighter, keyring-free container.
+start_session_keyring() {
+    if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        return 0
+    fi
+    export $(dbus-launch)
+    # `--unlock` reads the (empty) password on stdin and prints the environment
+    # of the daemon it started; only the secrets component is needed.
+    eval "$(printf '\n' | gnome-keyring-daemon --unlock --components=secrets)"
+    export GNOME_KEYRING_CONTROL
+}
+
 # Interpose the recording relay on the server socket. Used by the sharing E2E to
 # inject the notices a second machine would have produced, and by the settings
 # trust E2E purely for its wire record — the settings window's one-shot server
@@ -121,6 +139,10 @@ start_share_tap() {
         sleep 0.1
     done
 }
+
+if [ "${SCRIBE_KEYRING:-0}" = "1" ]; then
+    start_session_keyring
+fi
 
 Xvfb :99 -screen 0 "${RESOLUTION}x24" &
 XVFB_PID=$!

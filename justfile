@@ -155,6 +155,12 @@ e2e-visual-window-lifecycle:
 e2e-visual-find:
     docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/find-overlay.sh
 
+# Run the feature-014 LAN approval + dial visual E2E. The wire tap records the
+# Unix socket (the approval decision leaves on it) and SCRIBE_KEYRING=1 starts a
+# session keyring so the server can seal a LAN device identity for the dial half.
+e2e-visual-lan-approval:
+    docker run --rm --gpus all -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_KEYRING=1 -e SCRIBE_SEED_TRUST=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/lan-approval-config.toml)" -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/lan-approval.sh
+
 # Run the update-surface visual E2E pair. The server polls a fake releases API
 # inside the container, so it needs a longer budget than the default 60 s.
 e2e-visual-update:
