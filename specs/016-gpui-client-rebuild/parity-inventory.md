@@ -21,9 +21,10 @@ A parity row is done only when **both** hold:
    `on_key_down`), outbound IPC (`ipc_bridge::IpcSink`, plus the raw sends in
    `main.rs::run_connection`), or inbound IPC (`main.rs::run_reader`). The
    settings window's `settings/window.rs::SettingsWindow::run_action` is a
-   fifth, narrower entry point reachable only via `scribe-client-gpui
-   --settings`; rows resting on it are flagged inline because they are not
-   reachable from the terminal window.
+   fifth, narrower entry point. Bead .82 gave it an in-app trigger, so it is now
+   reached from the terminal window (settings chord, palette row, titlebar gear)
+   as well as from `scribe-client-gpui --settings`; rows resting on it are
+   flagged inline as settings-window rows.
 2. **Verified against the running app.** Its verification method (below, as
    upgraded) passes while driving the real client, not a directly constructed
    entity.
@@ -95,13 +96,13 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `QuitAll` | quit-all dialog | scripted-E2E | `main.rs::TerminalView::route_close_action` → `ipc_bridge::IpcSink::quit_all`, from the same close dialog | required |
 | `TriggerUpdate` | update dialog | scripted-E2E | `main.rs::TerminalView::route_update_action` → `ipc_bridge::IpcSink::trigger_update`, from the status-bar CTA's confirmation | required |
 | `DismissUpdate` | update dialog | scripted-E2E | `main.rs::TerminalView::route_update_action` → `ipc_bridge::IpcSink::dismiss_update`, from the status-bar CTA's confirmation | required |
-| `CheckForUpdates` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — `--settings` window only, not the terminal window | required |
-| `ListReleases` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — `--settings` window only | required |
+| `CheckForUpdates` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
+| `ListReleases` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
 | `ListWindows` | window management | scripted-E2E | `main.rs::TerminalView::poll_window_list` → `ipc_bridge::IpcSink::list_windows`, on the lifecycle tick while `remote.enabled` | required |
 | `DispatchAction` | remote automation | scripted-E2E | — (missing, FU-16) — `scribe-cli` is the only sender | required |
 | `FocusChanged` | focus reporting | scripted-E2E | `main.rs::TerminalView::report_focus` → `ipc_bridge::IpcSink::focus_changed`, from the window activation observer and the pane-focus reconciliation | required |
 | `HookEvent` | hook helper ingress | scripted-E2E | `crates/scribe-hook-helper/src/main.rs::main` — out-of-client by design | required |
-| `EnvPreflight` | environment persistence | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` (`action.env_preflight`) and `SettingsWindow::enable_env_persistence`, the toggle's gated ON transition — `--settings` window only | required |
+| `EnvPreflight` | environment persistence | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` (`action.env_preflight`) and `SettingsWindow::enable_env_persistence`, the toggle's gated ON transition — settings-window row (in-app since bead .82) | required |
 | `ClipboardPromptResponse` | OSC 52 prompt | scripted-E2E | — (unwired, FU-8) — `clipboard.rs` outside the import closure | required |
 | `ClipboardBridgeReadReply` | OSC 52 bridge | scripted-E2E | — (unwired, FU-8) — `clipboard.rs` outside the import closure | required |
 | `RemoteHandshake` | tailnet connect | scripted-E2E | — (unwired, FU-16) — `remote_handshake.rs` outside the import closure | required |
@@ -110,11 +111,11 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `LanHello` | mTLS LAN-dial preamble before session attachment | scripted-E2E | `main.rs::run_lan_connection` → `lan_dial.rs::handshake` | required |
 | `LanApprovalDecision` | owner-side fingerprint approval overlay | scripted-E2E | `main.rs::TerminalView::route_lan_approval_action` → `ipc_bridge.rs::IpcSink::lan_approval_decision` | required |
 | `ListLanPeers` | merged Local network source in remote connect picker | scripted-E2E | `main.rs::adopt_lan_surface` → `ipc_bridge.rs::IpcSink::list_lan_peers` | required |
-| `ListTrustedDevices` | Remote settings trusted-device list | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` → `SettingsWindow::refresh_trust` — `--settings` window only | required |
-| `RevokeTrustedDevice` | Remote settings device-revocation action | scripted-E2E | `settings/window.rs::SettingsWindow::run_action`, per approved-device row — `--settings` window only | required |
-| `ListTrustedNetworks` | Remote settings trusted-network list | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` → `SettingsWindow::refresh_trust` — `--settings` window only | required |
-| `AddCurrentNetworkTrusted` | Remote settings trust-current-network action | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` (`action.add_current_network`) — `--settings` window only | required |
-| `RemoveTrustedNetwork` | Remote settings trusted-network removal action | scripted-E2E | `settings/window.rs::SettingsWindow::run_action`, per trusted-network row — `--settings` window only | required |
+| `ListTrustedDevices` | Remote settings trusted-device list | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` → `SettingsWindow::refresh_trust` — settings-window row (in-app since bead .82) | required |
+| `RevokeTrustedDevice` | Remote settings device-revocation action | scripted-E2E | `settings/window.rs::SettingsWindow::run_action`, per approved-device row — settings-window row (in-app since bead .82) | required |
+| `ListTrustedNetworks` | Remote settings trusted-network list | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` → `SettingsWindow::refresh_trust` — settings-window row (in-app since bead .82) | required |
+| `AddCurrentNetworkTrusted` | Remote settings trust-current-network action | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` (`action.add_current_network`) — settings-window row (in-app since bead .82) | required |
+| `RemoveTrustedNetwork` | Remote settings trusted-network removal action | scripted-E2E | `settings/window.rs::SettingsWindow::run_action`, per trusted-network row — settings-window row (in-app since bead .82) | required |
 | `GetLanEnv` | Remote settings LAN listener/environment summary | scripted-E2E | `settings/window.rs::SettingsWindow::refresh_trust`; also `main.rs::probe_lan_env` → `lan_dial.rs::probe_lan_env` in the terminal window | required |
 | `GetLanDialIdentity` | local-server identity fetch before mTLS dialing | scripted-E2E | `main.rs::run_lan_connection` → `lan_dial.rs::LanDialer::build` | required |
 | `ControlClaim` | viewer claim/request affordance for a shared window | scripted-E2E | `main.rs::TerminalView::run_share_key` → `share.rs::ShareChrome::intercept_key` → `ipc_bridge.rs::IpcSink::control_intent` | required |
@@ -135,7 +136,7 @@ additive sharing variant is omitted.
 
 The live reader `main.rs::run_reader` matches exactly twelve variants and ends
 in a `_ => {}` catch-all; two more (`UpdateCheckResult`, `ReleaseList`) are
-consumed by the `--settings` window's synchronous request/reply helper.
+consumed by the settings window's synchronous request/reply helper.
 Everything else is silently discarded on the wire, so a variant absent from the
 reader is definitively unreachable — there is no ambiguity in this column.
 
@@ -173,12 +174,12 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `QuitRequested` | quit dialog | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_quit_requested` → the shell's lifecycle tick quits the app | required |
 | `UpdateAvailable` | update dialog | visual-E2E | `main.rs::dispatch_server_message` arm → `update::UpdateState::on_available` → `StatusBarData.update_available` | required |
 | `UpdateProgress` | update dialog | visual-E2E | `main.rs::dispatch_server_message` arm → `update::UpdateState::on_progress` → `StatusBarData.update_progress` | required |
-| `UpdateCheckResult` | release settings | scripted-E2E | `settings/server_action.rs::request_update_check`, reached from `SettingsWindow::run_action` — `--settings` window only | required |
-| `ReleaseList` | release settings | scripted-E2E | `settings/server_action.rs::request_release_list`, reached from `SettingsWindow::run_action` — `--settings` window only | required |
+| `UpdateCheckResult` | release settings | scripted-E2E | `settings/server_action.rs::request_update_check`, reached from `SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
+| `ReleaseList` | release settings | scripted-E2E | `settings/server_action.rs::request_release_list`, reached from `SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
 | `PromptMark` | prompt navigation | scripted-E2E | — (missing, FU-7) — `session_lifecycle` tracks trim offsets but no marks are ingested | required |
 | `TrimScrollback` | terminal history | golden | `main.rs::run_reader` arm → `session_lifecycle::SessionRegistry::on_trim_scrollback` | required |
 | `ScrollBottom` | terminal viewport | scripted-E2E | — (missing, FU-7) | required |
-| `EnvPreflightResult` | environment settings | scripted-E2E | `settings/server_action.rs::parse_env_preflight_response`, rendered into the Environment page's status line — `--settings` window only | required |
+| `EnvPreflightResult` | environment settings | scripted-E2E | `settings/server_action.rs::parse_env_preflight_response`, rendered into the Environment page's status line — settings-window row (in-app since bead .82) | required |
 | `EnvStatus` | environment status | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_env_status` → `StatusBarData.env_status` | required |
 | `ClipboardPromptRequest` | OSC 52 dialog | visual-E2E | — (missing, FU-8) — the `ClipboardDialog` demo is built from literals | required |
 | `ClipboardBridgeWrite` | OSC 52 bridge | scripted-E2E | — (unwired, FU-8) — handled in `clipboard.rs`, outside the import closure | required |
@@ -192,8 +193,8 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `LanApprovalResult` | terminal LAN dial acceptance/refusal outcome | visual-E2E | `lan_dial.rs::handshake` during the preamble; `main.rs::on_lan_message` on the live reader | required |
 | `LanApprovalRequest` | owner-side device fingerprint approval overlay | visual-E2E | `main.rs::on_lan_message` → `lan.rs::LanChrome::park_approval` → `main.rs::TerminalView::poll_lan_approval` | required |
 | `LanPeerList` | Local network entries merged into remote connect picker | visual-E2E | `main.rs::on_lan_message` → `lan.rs::LanChrome::set_peers` | required |
-| `TrustedDeviceList` | Remote settings trusted-device rows | scripted-E2E | `settings/server_action.rs::parse_trusted_devices_response`, rendered by `SettingsWindow::trusted_device_rows` — `--settings` window only | required |
-| `TrustedNetworkList` | Remote settings trusted-network rows | scripted-E2E | `settings/server_action.rs::parse_trusted_networks_response`, rendered by `SettingsWindow::trusted_network_rows` — `--settings` window only | required |
+| `TrustedDeviceList` | Remote settings trusted-device rows | scripted-E2E | `settings/server_action.rs::parse_trusted_devices_response`, rendered by `SettingsWindow::trusted_device_rows` — settings-window row (in-app since bead .82) | required |
+| `TrustedNetworkList` | Remote settings trusted-network rows | scripted-E2E | `settings/server_action.rs::parse_trusted_networks_response`, rendered by `SettingsWindow::trusted_network_rows` — settings-window row (in-app since bead .82) | required |
 | `LanEnv` | Remote settings LAN listener/environment summary | scripted-E2E | `settings/server_action.rs::parse_lan_env_response` in the settings window; `main.rs::on_lan_message` → `lan.rs::LanChrome::set_env` in the terminal window | required |
 | `LanDialIdentity` | client mTLS identity returned by the local server | scripted-E2E | `lan_dial.rs::fetch_dial_identity`; named (never stored or logged) by `main.rs::on_lan_message` | required |
 | `ShareRoster` | presence badge and live-viewer role/claim state | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::apply_roster` | required |
@@ -267,7 +268,7 @@ Every row's method is `visual-E2E`: each action must be driven through
 | `zoom_out` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (beads .59, .70) — `tests/e2e/visual/terminal-zoom.sh` | required |
 | `zoom_reset` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (beads .59, .70) — `tests/e2e/visual/terminal-zoom.sh` | required |
 | `command_palette` | View and overlays | visual-E2E | `main.rs::handle_overlay_key` opens the overlay — **degenerate**: `CommandPaletteEvent::Execute(_)` is discarded, so no palette entry does anything; FU-12 | required |
-| `settings` | View and overlays | visual-E2E | — (unwired, FU-23) — `KeyAction::OpenSettings` is swallowed in `handle_binding`; the settings window opens only via the `--settings` CLI flag | required |
+| `settings` | View and overlays | visual-E2E | `main.rs::TerminalView::dispatch_key_action` → `TerminalView::open_or_focus_settings` → `settings::open_settings_window` (bead .82) — also from the palette row and the titlebar gear; `tests/e2e/visual/settings-entry.sh` | required |
 | `word_left` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |
 | `word_right` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |
 | `delete_word_backward` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |
@@ -292,7 +293,8 @@ action parses and translates, so the gap is entirely dispatch.
 the remaining 26 reach the catch-all. `KeyAction` variants are `Terminal`
 (reachable via `main.rs::send_key_bytes`), `Layout` (partially, per the above),
 `OpenCommandPalette` (reachable via `main.rs::handle_overlay_key`),
-`OpenSettings` (unwired), and `OpenFind` (unwired).
+`OpenSettings` (reachable via `main.rs::TerminalView::open_or_focus_settings`),
+and `OpenFind` (reachable via `main.rs::TerminalView::open_find_overlay`).
 
 ## Rendering and window checklist
 

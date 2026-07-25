@@ -22,8 +22,8 @@
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, FocusHandle, Rgba, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    div, prelude::*, px, size,
+    App, Bounds, Context, FocusHandle, Rgba, TitlebarOptions, Window, WindowBounds, WindowHandle,
+    WindowOptions, div, prelude::*, px, size,
 };
 use scribe_common::config::{ScribeConfig, load_config, resolve_theme};
 use scribe_common::protocol::{PreflightError, TrustedDeviceInfo, TrustedNetworkInfo};
@@ -846,9 +846,15 @@ fn key_hash(key: &str) -> u64 {
 /// The caller is responsible for the singleton handshake (see
 /// [`crate::settings::singleton`]) before invoking this — a second launch should
 /// hand focus to the existing window rather than open a duplicate.
-pub fn open_settings_window(cx: &mut App) {
+///
+/// The handle comes back so an in-process caller can keep it and raise the very
+/// same window on the next request instead of stacking duplicates: the terminal
+/// shell's settings entry point ([`crate::settings`] is a window in the client
+/// process, not a separate binary) holds it for exactly that. `None` means the
+/// platform refused the window, which is already logged here.
+pub fn open_settings_window(cx: &mut App) -> Option<WindowHandle<SettingsWindow>> {
     let bounds = Bounds::centered(None, size(px(820.0), px(620.0)), cx);
-    if let Err(error) = cx.open_window(
+    match cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
@@ -860,6 +866,10 @@ pub fn open_settings_window(cx: &mut App) {
         },
         |_, cx| cx.new(SettingsWindow::new),
     ) {
-        tracing::error!(%error, "failed to open GPUI settings window");
+        Ok(handle) => Some(handle),
+        Err(error) => {
+            tracing::error!(%error, "failed to open GPUI settings window");
+            None
+        }
     }
 }

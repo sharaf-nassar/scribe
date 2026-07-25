@@ -20,8 +20,8 @@ use std::{
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Size, Subscription, Task, TitlebarOptions,
-    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, canvas, div,
-    prelude::*, px, relative, size,
+    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions,
+    canvas, div, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use scribe_client_gpui::ai_indicator::AiStateTracker;
@@ -67,6 +67,7 @@ use scribe_client_gpui::search::{
     SEARCH_RESULT_LIMIT,
 };
 use scribe_client_gpui::selection::{SelectionMode, SelectionSpan};
+use scribe_client_gpui::settings::{SettingsWindow, open_settings_window};
 use scribe_client_gpui::share::{
     ControlRequestPrompt, ShareChrome, ShareKey, ShareKeyOutcome, ShareOverlayColors, ShareState,
     share_overlay,
@@ -93,7 +94,7 @@ use scribe_client_gpui::{
     smart_selection::CompiledSmartSelection,
     tab_bar::{TabBarColors, context_suffix},
     tab_session::{TabEntry, TabSessions},
-    titlebar::TitlebarView,
+    titlebar::{TitlebarEvent, TitlebarView},
 };
 use scribe_common::ai_state::AiProvider;
 use scribe_common::theme::ChromeColors;
@@ -503,6 +504,11 @@ struct TerminalView {
     /// window paints scales its alpha by this, so lowering it lets the desktop
     /// show through without recreating the (always transparent) window.
     opacity: f32,
+    /// The settings window this shell opened, kept so the next settings request
+    /// raises that window instead of stacking a second copy of the same
+    /// surface. It is a sibling top-level window in this process, not an
+    /// overlay, so it outlives any single dispatch.
+    settings_window: Option<WindowHandle<SettingsWindow>>,
     /// The command palette overlay, present only while open.
     command_palette: Option<Entity<CommandPaletteView>>,
     /// The find-in-scrollback overlay, present only while open. While it is up
@@ -682,6 +688,7 @@ impl TerminalView {
             terminal_colors,
             opacity,
             highlight_colors: MatchHighlightColors::from_chrome(&chrome),
+            settings_window: None,
             command_palette: None,
             find_overlay: None,
             context_menu: None,
@@ -759,11 +766,16 @@ impl TerminalView {
         (bell, subscription)
     }
 
-    /// Build the custom titlebar seeded with `tabs`.
+    /// Build the custom titlebar seeded with `tabs`, and subscribe to it.
     ///
     /// Split out of [`Self::new`] so the constructor stays a list of the
     /// window's collaborators rather than also being the place one of them is
     /// assembled.
+    ///
+    /// The gear button is the pointer half of the settings entry point: it has
+    /// always been painted, but its [`TitlebarEvent::OpenSettings`] had no
+    /// subscriber, so clicking it did nothing. It now lands on the same
+    /// [`Self::open_or_focus_settings`] the chord and the palette row use.
     fn build_titlebar(
         chrome: &ChromeColors,
         opacity: f32,
@@ -772,11 +784,25 @@ impl TerminalView {
     ) -> Entity<TitlebarView> {
         let colors = TabBarColors::from_chrome(chrome, opacity);
         let data = tabs.to_tab_data();
-        cx.new(|cx| {
+        let bar = cx.new(|cx| {
             let mut bar = TitlebarView::new(colors, cx);
             bar.set_tabs(data, cx);
             bar
+        });
+        cx.subscribe(&bar, |this, _bar, event: &TitlebarEvent, ctx| match event {
+            TitlebarEvent::OpenSettings => this.open_or_focus_settings(ctx),
+            // The tab-strip and window-control events come from the same view
+            // but are their own reachability rows, outside this entry point.
+            // They are named rather than folded into a `_` arm so a new
+            // titlebar event fails to compile here.
+            TitlebarEvent::SelectTab(_)
+            | TitlebarEvent::CloseTab(_)
+            | TitlebarEvent::ReorderTab { .. }
+            | TitlebarEvent::WindowControl(_)
+            | TitlebarEvent::Equalize => {}
         })
+        .detach();
+        bar
     }
 
     /// Drain a pending config-file change and reapply it to the live window.
@@ -1113,22 +1139,47 @@ impl TerminalView {
     /// Every producer funnels through here — the keybinding path
     /// ([`Self::handle_binding`]) and the command palette
     /// ([`Self::execute_automation_action`]) — so a palette row and its bound
-    /// chord can never drift apart, and wiring one surface wires both. The
-    /// still-unwired family (`OpenSettings`) is named here rather than folded
-    /// into a `_` arm, so a new [`KeyAction`] fails to compile instead of
-    /// silently joining the dropped set.
+    /// chord can never drift apart, and wiring one surface wires both. Every
+    /// variant is named rather than folded into a `_` arm, so a new
+    /// [`KeyAction`] fails to compile instead of silently joining a dropped set.
     fn dispatch_key_action(&mut self, action: KeyAction, cx: &mut Context<Self>) {
         match action {
             KeyAction::Layout(layout) => self.handle_layout_action(layout, cx),
             KeyAction::Terminal(bytes) => self.send_key_bytes(bytes),
             KeyAction::OpenCommandPalette => self.open_command_palette(cx),
             KeyAction::OpenFind => self.open_find_overlay(cx),
-            // The settings window (FU-23) is a separate bead. It is still
-            // swallowed so it cannot reach the PTY, and counted so the drop is
-            // visible in the log.
-            KeyAction::OpenSettings => {
-                unroutable_action(&format!("{action:?}"), "no handler in the GPUI shell yet");
-            }
+            KeyAction::OpenSettings => self.open_or_focus_settings(cx),
+        }
+    }
+
+    /// Open the settings window from inside the running terminal window, or
+    /// raise the one this shell already opened.
+    ///
+    /// This is the in-app twin of the `--settings` entry point: both end at
+    /// [`open_settings_window`], so the chord, the palette row, and the
+    /// titlebar gear all land on the same surface the CLI flag opens. GPUI is
+    /// multi-window in one process, so unlike the winit client — which had to
+    /// spawn the separate `scribe-settings` binary and hand focus over a Unix
+    /// socket — the window is opened here and its [`WindowHandle`] retained.
+    /// That handle *is* the deduplication: a second request updates it, which
+    /// fails only once the window has been closed, and a live update activates
+    /// the existing window instead of stacking a duplicate.
+    ///
+    /// The cross-process singleton ([`scribe_client_gpui::settings::singleton`])
+    /// is deliberately not consulted here. It is the `--settings` launch path's
+    /// guard, and its primary holds an exclusive `flock` for the whole window
+    /// lifetime, so acquiring it from the terminal window would park the live
+    /// shell on a lock rather than answer a keystroke.
+    fn open_or_focus_settings(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.settings_window
+            && handle.update(cx, |_, window, _| window.activate_window()).is_ok()
+        {
+            tracing::info!("focused the open settings window");
+            return;
+        }
+        self.settings_window = open_settings_window(cx);
+        if self.settings_window.is_some() {
+            tracing::info!("opened the settings window");
         }
     }
 
@@ -4199,7 +4250,9 @@ fn run_settings() {
     application().run(move |cx: &mut App| {
         let animations = load_config().map_or(true, |config| config.appearance.animations);
         AnimationSettings::resolve(animations).apply_to_app(cx);
-        scribe_client_gpui::settings::open_settings_window(cx);
+        // The handle is only useful to a caller that can be asked twice; this
+        // process exists to show one settings window and exit with it.
+        open_settings_window(cx);
         cx.activate(true);
     });
 

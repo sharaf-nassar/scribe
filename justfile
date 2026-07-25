@@ -142,6 +142,12 @@ e2e-visual-session-tooling:
 e2e-visual-settings-trust:
     docker run --rm --gpus all -e SCRIBE_VISUAL_APP=settings -e SCRIBE_SHARE_TAP=1 -e SCRIBE_SEED_TRUST=1 -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/settings-trust.sh
 
+# Run the in-app settings entry-point E2E. Drives the running terminal window
+# with the settings chord, the palette row, and the titlebar gear, and asserts
+# the "Scribe Settings" window maps exactly once.
+e2e-visual-settings-entry:
+    docker run --rm --gpus all -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/settings-entry.sh
+
 # Run the window-lifecycle E2E through the wire tap. The tap only records here
 # (nothing is injected); the seeded config turns the client's window-list poll
 # on, and the run relaunches the client twice so it needs a longer budget.

@@ -184,7 +184,9 @@ On GTK/X11, saved settings geometry is restored only when it intersects a curren
 
 ## GPUI Settings Window
 
-The GPUI rebuild reproduces the deleted `scribe-settings` webview app as a window in the client process (`scribe-client --settings`), keeping the config-write and singleton logic 1:1 while replacing the HTML/CSS/JS surface with GPUI elements.
+The GPUI rebuild reproduces the deleted `scribe-settings` webview app as a window in the client process, opened from a running terminal window or from `scribe-client --settings`.
+
+The config-write and singleton logic stay 1:1 with the old app; only the HTML/CSS/JS surface is replaced with GPUI elements.
 
 The webview delivery is gone; its feature set lives in [[crates/scribe-client-gpui/src/settings/mod.rs]]. The config-apply path is ported verbatim as [[crates/scribe-client-gpui/src/settings/apply.rs#apply_settings_change]] (routing every `{key, value}` edit through [[crates/scribe-client-gpui/src/settings/apply.rs#apply_config_key]]), so the [[settings#Config Application]] semantics — clamps, enum parsing, keybinding routing, theme seeding — are unchanged. The one-shot server-action client is ported as [[crates/scribe-client-gpui/src/settings/server_action.rs#request_update_check]] and its release/env/remote siblings.
 
@@ -211,6 +213,14 @@ The remote page leads with a runtime "Local network" section — the GPUI port o
 [[crates/scribe-client-gpui/src/settings/window.rs#SettingsWindow#refresh_trust]] resolves the whole section in one pass: [[crates/scribe-client-gpui/src/settings/server_action.rs#request_lan_env]] for this machine's own fingerprint and whether the current network is addable, [[crates/scribe-client-gpui/src/settings/server_action.rs#request_trusted_networks]] for the list plus the current-network trust flag (UX-004), and [[crates/scribe-client-gpui/src/settings/server_action.rs#request_trusted_devices]] for the approved-device list. It runs on the first visit to the page (the analog of the webview's load-time injection) and on the section's Refresh action.
 
 The section's mutations are the three fire-and-forget frames, each followed by a refresh so the lists re-render from the server rather than from a local guess: [[crates/scribe-client-gpui/src/settings/server_action.rs#request_add_current_network]] behind "Trust it", [[crates/scribe-client-gpui/src/settings/server_action.rs#request_remove_trusted_network]] behind each network row's Remove, and [[crates/scribe-client-gpui/src/settings/server_action.rs#request_revoke_trusted_device]] behind each device row's Revoke. Per-row buttons carry their record key in the action id (`action.remove_trusted_network:<id>`, `action.revoke_trusted_device:<hex>`) so they still route through the single `run_action` entry point. Because the section renders server replies rather than config keys it is built in the window, not listed in `page_controls`, and it is rendered above the page's config controls so the lists stay above the fold.
+
+### In-app entry points
+
+Three surfaces in the running terminal window open the settings window, and all three end at [[crates/scribe-client-gpui/src/settings/window.rs#open_settings_window]] — the same call the `--settings` launch makes.
+
+[[crates/scribe-client-gpui/src/main.rs#TerminalView#open_or_focus_settings]] is that single handler. The `settings` keybinding reaches it through [[crates/scribe-client-gpui/src/main.rs#TerminalView#dispatch_key_action]]; the palette's "Open Settings" row lowers onto the same [[crates/scribe-client-gpui/src/keybindings.rs#KeyAction]] via [[crates/scribe-client-gpui/src/main.rs#key_action_for_automation]]; and the titlebar gear's `TitlebarEvent::OpenSettings` is subscribed in [[crates/scribe-client-gpui/src/main.rs#TerminalView#build_titlebar]]. Because GPUI is multi-window in one process, the window is opened in place rather than by spawning a second binary the way the winit client had to.
+
+The handle the open returns is retained on the view, and that handle *is* the deduplication: a later request updates it, which fails once the window has been closed, and a live update activates the existing window instead of stacking a duplicate. The cross-process singleton below is deliberately not consulted from this path — its primary holds an exclusive `flock` for the settings window's whole lifetime, so acquiring it from the terminal window would park the live shell on a lock rather than answer a keystroke.
 
 ### Singleton and launch
 
