@@ -7,6 +7,7 @@
 //! from an explicit Nerd-Font-first fallback chain, and ligatures from the
 //! `calt` OpenType feature gated on `appearance.ligatures`.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
@@ -17,13 +18,15 @@ use gpui::{
 use scribe_client_gpui::{
     box_drawing,
     color::{TerminalColors, linear_to_srgb_rgba},
+    layout::Rect,
     opacity::{opaque_slot, scale_alpha},
     restore_replay::round_positive_f32_to_u16,
     search::{MatchHighlight, MatchHighlightColors},
+    split_scroll,
 };
 use scribe_common::config::AppearanceConfig;
 
-use crate::terminal::{Cell, Content, Flags};
+use crate::terminal::{Cell, Content, Flags, ViewportPoint};
 
 /// Smallest font size the grid will paint at, so a bad `appearance.font_size`
 /// edit (0, negative) can never collapse the grid to nothing.
@@ -206,6 +209,16 @@ pub struct GridColors {
     pub opacity: f32,
 }
 
+/// Where the last painted frame put the terminal grid, in window coordinates.
+///
+/// The shell needs this to answer a mouse event: a right-click resolves to a
+/// grid cell (smart selection) and a left-click may land on the split-scroll
+/// jump chip, and neither can be derived from the event alone because the grid
+/// sits under a titlebar of theme-dependent height. The canvas records its own
+/// bounds on every frame instead, and both live on the GPUI thread so a plain
+/// `Cell` is the whole synchronisation story.
+pub type GridBounds = Rc<std::cell::Cell<Option<Bounds<Pixels>>>>;
+
 /// Paints the current terminal grid with fixed-width rows.
 pub struct TerminalElement {
     content: Content,
@@ -217,18 +230,22 @@ pub struct TerminalElement {
     highlights: Vec<MatchHighlight>,
     /// Accent colours a highlighted span is painted with.
     highlight_colors: MatchHighlightColors,
+    bounds_sink: GridBounds,
 }
 
 impl TerminalElement {
     /// Captures one stable terminal snapshot for this render pass, painted with
     /// the font metrics and theme colours resolved from the live config.
-    pub const fn new(
+    ///
+    /// `bounds_sink` receives the grid's window-space rect on every frame.
+    pub fn new(
         content: Content,
         font: GridFont,
         colors: GridColors,
         highlight_colors: MatchHighlightColors,
+        bounds_sink: GridBounds,
     ) -> Self {
-        Self { content, font, colors, highlights: Vec::new(), highlight_colors }
+        Self { content, font, colors, highlights: Vec::new(), highlight_colors, bounds_sink }
     }
 
     /// Highlight `highlights` as find matches on top of the resolved cells.
@@ -251,9 +268,10 @@ impl TerminalElement {
     /// styled-div tree cannot express.
     pub fn paint(self) -> impl IntoElement {
         let background = self.colors.background;
+        let bounds_sink = Rc::clone(&self.bounds_sink);
         div().size_full().overflow_hidden().bg(background).child(
             canvas(
-                |_bounds, _window, _cx| (),
+                move |bounds, _window, _cx| bounds_sink.set(Some(bounds)),
                 move |bounds, (), window, cx| self.paint_grid(bounds, window, cx),
             )
             .size_full(),
@@ -310,6 +328,19 @@ impl TerminalElement {
                 cx,
             );
         }
+
+        let overlay = OverlayGeometry {
+            bounds,
+            cell_width,
+            line_height,
+            accent: opaque_slot(linear_to_srgb_rgba(
+                self.colors
+                    .cells
+                    .resolve_color(vte::ansi::Color::Named(vte::ansi::NamedColor::Cursor)),
+            )),
+        };
+        self.paint_vi_cursor(overlay, window);
+        self.paint_split_scroll(overlay, window);
     }
 
     /// Recolour the cells of `row_index` that a find match covers.
@@ -349,6 +380,167 @@ impl TerminalElement {
         }
         cell.bg = Some(self.highlight_colors.blend_passive(cell.bg.unwrap_or(window_bg)));
     }
+
+    /// Outline the vi / copy-mode cursor so the keyboard cursor is visible
+    /// while it moves independently of the shell cursor.
+    ///
+    /// It is drawn as a hollow box rather than a filled block: the cell under
+    /// it still has to be readable, and a filled block would hide exactly the
+    /// character the user navigated to.
+    fn paint_vi_cursor(&self, overlay: OverlayGeometry, window: &mut Window) {
+        let Some(cursor) = self.content.vi_cursor else {
+            return;
+        };
+        let OverlayGeometry { bounds, cell_width, line_height, accent } = overlay;
+        let left = bounds.left() + px(cell_width * grid_f32(cursor.col));
+        let top = bounds.top() + line_height * grid_f32(cursor.row);
+        if top >= bounds.bottom() {
+            return;
+        }
+        let thickness = px(VI_CURSOR_THICKNESS);
+        let width = px(cell_width);
+        for edge in [
+            Bounds::new(point(left, top), size(width, thickness)),
+            Bounds::new(point(left, top + line_height - thickness), size(width, thickness)),
+            Bounds::new(point(left, top), size(thickness, line_height)),
+            Bounds::new(point(left + width - thickness, top), size(thickness, line_height)),
+        ] {
+            window.paint_quad(fill(edge, accent));
+        }
+    }
+
+    /// Draw the split-scroll divider and the jump-to-bottom chip.
+    ///
+    /// The rows themselves already carry the split — the snapshot's trailing
+    /// [`Content::pin_rows`] come from the live screen — so all that is left to
+    /// paint is the seam between the two regions and the affordance that
+    /// collapses it.
+    fn paint_split_scroll(&self, overlay: OverlayGeometry, window: &mut Window) {
+        if self.content.pin_rows == 0 {
+            return;
+        }
+        let OverlayGeometry { bounds, cell_width, line_height, accent } = overlay;
+        let geometry = split_scroll::compute_geometry(
+            content_rect(bounds, self.content.rows.len(), line_height),
+            f32::from(line_height) * grid_f32(self.content.pin_rows),
+        );
+        window.paint_quad(fill(to_bounds(geometry.divider), accent));
+
+        let chip = to_bounds(geometry.jump_button);
+        window.paint_quad(fill(chip, Rgba { a: accent.a * CHIP_BACKDROP_ALPHA, ..accent }));
+        // A down chevron built from two strokes: the chip has to read as "jump
+        // to the bottom" without pulling a glyph run into the canvas pass.
+        let arm = px(cell_width.max(MIN_CHEVRON_ARM));
+        let mid_x = chip.left() + chip.size.width / 2.;
+        let mid_y = chip.top() + chip.size.height / 2.;
+        let thickness = px(VI_CURSOR_THICKNESS);
+        for stroke in [
+            Bounds::new(point(mid_x - arm, mid_y - thickness), size(arm, thickness * 2.)),
+            Bounds::new(point(mid_x, mid_y - thickness), size(arm, thickness * 2.)),
+        ] {
+            window.paint_quad(fill(stroke, accent));
+        }
+    }
+}
+
+/// The per-frame geometry and palette the two grid overlays share.
+#[derive(Clone, Copy)]
+struct OverlayGeometry {
+    bounds: Bounds<Pixels>,
+    cell_width: f32,
+    line_height: Pixels,
+    accent: Rgba,
+}
+
+/// Line thickness for the vi-cursor box and the jump chip's chevron.
+const VI_CURSOR_THICKNESS: f32 = 1.5;
+
+/// How much of the accent colour the jump chip's backdrop keeps, so the chip
+/// reads as a control rather than as a solid block of foreground.
+const CHIP_BACKDROP_ALPHA: f32 = 0.35;
+
+/// Floor for the chevron's arm length, so the chip stays legible at small
+/// font sizes where the cell advance shrinks below it.
+const MIN_CHEVRON_ARM: f32 = 5.0;
+
+/// The rect the painted rows occupy, in the same f32 window space
+/// [`split_scroll`] computes its geometry in.
+fn content_rect(bounds: Bounds<Pixels>, rows: usize, line_height: Pixels) -> Rect {
+    Rect {
+        x: f32::from(bounds.left()),
+        y: f32::from(bounds.top()),
+        width: f32::from(bounds.size.width),
+        height: f32::from(line_height) * grid_f32(rows),
+    }
+}
+
+/// Lower a [`Rect`] back onto GPUI's typed pixel bounds.
+fn to_bounds(rect: Rect) -> Bounds<Pixels> {
+    Bounds::new(point(px(rect.x), px(rect.y)), size(px(rect.width), px(rect.height)))
+}
+
+/// The grid cell a window-space pointer position falls on.
+///
+/// Returns `None` when the pointer is outside the grid or the metrics are
+/// degenerate, so a click on the titlebar or the status bar can never be
+/// mistaken for a click on row 0.
+#[must_use]
+pub fn cell_at(
+    bounds: Bounds<Pixels>,
+    font: &GridFont,
+    position: gpui::Point<Pixels>,
+) -> Option<ViewportPoint> {
+    let cell_width = font.cell_width();
+    if cell_width <= 0.0 || font.line_height <= 0.0 || !bounds.contains(&position) {
+        return None;
+    }
+    Some(ViewportPoint {
+        row: cell_index(f32::from(position.y - bounds.top()), font.line_height),
+        col: cell_index(f32::from(position.x - bounds.left()), cell_width),
+    })
+}
+
+/// Which cell an axis offset falls in, resolved by binary search so no
+/// float-to-int cast is needed (the workspace denies the lossy-cast lints).
+fn cell_index(offset: f32, cell_size: f32) -> usize {
+    if cell_size <= 0.0 || !offset.is_finite() || offset <= 0.0 {
+        return 0;
+    }
+    let mut low = 0u16;
+    let mut high = u16::MAX;
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if f32::from(mid) * cell_size <= offset {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+    usize::from(low)
+}
+
+/// Whether a window-space position lands on the split-scroll jump chip.
+///
+/// The chip is painted inside the grid canvas, so the shell cannot hit-test it
+/// with a GPUI child element; it re-derives the same geometry the paint pass
+/// used and asks [`split_scroll::hit_test_jump_btn`].
+#[must_use]
+pub fn hits_jump_chip(
+    bounds: Bounds<Pixels>,
+    font: &GridFont,
+    rows: usize,
+    pin_rows: usize,
+    position: gpui::Point<Pixels>,
+) -> bool {
+    if pin_rows == 0 || font.line_height <= 0.0 {
+        return false;
+    }
+    let line_height = px(font.line_height);
+    let geometry = split_scroll::compute_geometry(
+        content_rect(bounds, rows, line_height),
+        font.line_height * grid_f32(pin_rows),
+    );
+    split_scroll::hit_test_jump_btn(&geometry, f32::from(position.x), f32::from(position.y))
 }
 
 /// Whether two theme slots are the same colour, compared by bit pattern.
@@ -575,16 +767,67 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        CELL_WIDTH_RATIO, FONT_FALLBACKS, FontVariants, GridColors, GridFont, MIN_FONT_SIZE,
-        ResolvedCell, TerminalElement, is_painted_cell, shaped_char,
+        CELL_WIDTH_RATIO, FONT_FALLBACKS, FontVariants, GridBounds, GridColors, GridFont,
+        MIN_FONT_SIZE, ResolvedCell, TerminalElement, cell_at, hits_jump_chip, is_painted_cell,
+        shaped_char,
     };
-    use gpui::{FontStyle, FontWeight, Rgba};
+    use gpui::{Bounds, FontStyle, FontWeight, Rgba, point, px, size};
     use scribe_client_gpui::color::TerminalColors;
     use scribe_client_gpui::search::{MatchHighlight, MatchHighlightColors};
     use scribe_common::config::AppearanceConfig;
     use scribe_common::theme::minimal_dark;
 
-    use crate::terminal::{Cell, Content, Flags};
+    use crate::terminal::{Cell, Content, Flags, ViewportPoint};
+
+    /// A 400x300 grid at (10, 20), the shape the shell hands the paint path.
+    fn grid_bounds() -> Bounds<gpui::Pixels> {
+        Bounds::new(point(px(10.), px(20.)), size(px(400.), px(300.)))
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#Pointer positions lower onto grid cells]]
+    #[test]
+    fn pointer_positions_lower_onto_grid_cells() {
+        let font = GridFont::from_appearance(&AppearanceConfig {
+            font_size: 10.0,
+            line_padding: 0,
+            ..AppearanceConfig::default()
+        });
+        let bounds = grid_bounds();
+        // 10pt: 6px advance, 13.5px rows.
+        assert_eq!(
+            cell_at(bounds, &font, point(px(10.), px(20.))),
+            Some(ViewportPoint { row: 0, col: 0 })
+        );
+        assert_eq!(
+            cell_at(bounds, &font, point(px(10. + 18.5), px(20. + 27.5))),
+            Some(ViewportPoint { row: 2, col: 3 })
+        );
+        // Outside the grid the answer is "no cell", not row 0 — a click on the
+        // titlebar must never resolve to the first terminal row.
+        assert!(cell_at(bounds, &font, point(px(9.), px(20.))).is_none());
+        assert!(cell_at(bounds, &font, point(px(10.), px(321.))).is_none());
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#The jump chip is only hit while the pin is up]]
+    #[test]
+    fn jump_chip_is_only_hit_while_the_pin_is_up() {
+        let font = GridFont::from_appearance(&AppearanceConfig {
+            font_size: 10.0,
+            line_padding: 0,
+            ..AppearanceConfig::default()
+        });
+        let bounds = grid_bounds();
+        // 20 rows of 13.5px with a 5-row pin: the divider sits at y = 20 + 202.5
+        // - 1, and the chip is docked just above it at the right edge.
+        let chip_x = 10. + 400. - 6. - 14.;
+        let chip_y = 20. + (13.5 * 15.) - 1. - 4. - 12.;
+        assert!(hits_jump_chip(bounds, &font, 20, 5, point(px(chip_x), px(chip_y))));
+        // The same point is inert without a pin, so an unsplit grid passes the
+        // click through to the terminal.
+        assert!(!hits_jump_chip(bounds, &font, 20, 0, point(px(chip_x), px(chip_y))));
+        // A point in the middle of the scrollback portion misses the chip.
+        assert!(!hits_jump_chip(bounds, &font, 20, 5, point(px(200.), px(100.))));
+    }
 
     // @lat: [[test#GPUI Client Headless Suites#Config live reload#Grid font tracks the live appearance config]]
     #[test]
@@ -691,12 +934,13 @@ mod tests {
             cells: Arc::new(cells),
             opacity: 1.0,
         };
-        let content = Content { rows: vec![vec![Cell::default(); 8]] };
+        let content = Content { rows: vec![vec![Cell::default(); 8]], ..Content::default() };
         TerminalElement::new(
             content,
             GridFont::default(),
             colors,
             MatchHighlightColors::from_chrome(&theme.chrome),
+            GridBounds::default(),
         )
         .with_highlights(highlights)
     }
