@@ -202,6 +202,14 @@ e2e-visual-prompt-marks:
 e2e-visual-ai-task-label:
     docker run --rm --gpus all -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/ai-task-label.sh
 
+# Run the workspace-IPC visual E2E: CreateWorkspace / ReportWorkspaceTree /
+# MoveSession / CloseWorkspace leaving the client on the wire, and an injected
+# WorkspaceInfo repainting the status bar. Needs the wire tap (frames are the
+# evidence) and a longer budget than the default 60 s because it relaunches the
+# client to adopt the harness session first.
+e2e-visual-workspace-ipc:
+    docker run --rm --gpus all -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/workspace-ipc.sh
+
 # Run the terminal-bell visual E2E. It needs the shared-pane rig so a real shell
 # can write the BEL byte into the very pane the client renders, and it minimizes
 # and restores the window between phases, so it needs more than the default 60 s.

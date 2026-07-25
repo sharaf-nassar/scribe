@@ -27,7 +27,7 @@
 counts modules-total 64
 counts modules-wired 45
 counts server-messages-total 59
-counts server-messages-handled 41
+counts server-messages-handled 42
 counts layout-actions-total 36
 counts layout-actions-handled 34
 
@@ -66,7 +66,6 @@ unhandled-server-message TrustedDeviceList
 unhandled-server-message TrustedNetworkList
 unhandled-server-message UpdateCheckResult
 unhandled-server-message WindowTakenOver
-unhandled-server-message WorkspaceInfo
 unhandled-server-message WorkspaceNotesChanged
 unhandled-server-message WorkspaceNotesSnapshot
 

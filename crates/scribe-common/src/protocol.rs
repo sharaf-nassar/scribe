@@ -1081,7 +1081,7 @@ pub enum LayoutDirection {
 /// per-workspace active tab index.
 ///
 /// Accent colours and names still travel in `WorkspaceInfo` / `WorkspaceListEntry`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WorkspaceTreeNode {
     /// A single workspace occupying its entire region.
     Leaf {
@@ -1116,7 +1116,7 @@ pub enum WorkspaceTreeNode {
 ///
 /// Each leaf holds the session ID of the pane's PTY session. Split nodes
 /// describe how the tab's content area is divided.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PaneTreeNode {
     /// A single pane occupying the full tab content area.
     Leaf { session_id: SessionId },

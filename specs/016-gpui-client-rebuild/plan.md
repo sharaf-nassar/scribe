@@ -433,7 +433,8 @@ before Phase H. Nothing here touches the server, the IPC protocol, or
 - FU-5 Pane tree — 8 pane-layout actions. **Covered by bead `.58`.**
 - FU-6 Workspace tree — 6 workspace-layout actions **(covered by `.58`)** plus
   `CreateWorkspace`, `CloseWorkspace`, `MoveSession`, `ReportWorkspaceTree`,
-  `WorkspaceInfo`, which `.58` does **not** name and which need a follow-on.
+  `WorkspaceInfo`, which `.58` does **not** name. **Covered by bead `.66`**,
+  asserted on the wire by `tests/e2e/visual/workspace-ipc.sh`.
 - FU-7 Scrollback navigation and marks — `scroll_up/down/top/bottom`
   **(covered by bead `.59`)** plus `prompt_jump_up/down`, `jump_to_failure`,
   `PromptMark`, `ScrollBottom`, which are not covered.
@@ -471,6 +472,7 @@ sharing tail, which is the largest single block of unreachable rows:
 | --- | --- | --- |
 | `.56` (opacity) | FU-4 | Opacity — landed `771794d`, re-verify via `.53` |
 | `.58` (pane/workspace) | FU-5, part of FU-6 | 8 pane-layout + 6 workspace-layout actions; **not** `CreateWorkspace`, `CloseWorkspace`, `MoveSession`, `ReportWorkspaceTree`, `WorkspaceInfo` |
+| `.66` (workspace IPC) | rest of FU-6 | `CreateWorkspace`, `CloseWorkspace`, `MoveSession`, `ReportWorkspaceTree`, `WorkspaceInfo` |
 | `.59` (vi / smart-selection / split-scroll) | part of FU-7, FU-8 | `scroll_up/down/top/bottom`; selection groundwork for `copy` |
 | `.61` (close_tab / new_window) | FU-11 | `close_tab`, `new_window` |
 | `.62` (status-band layout) | supports FU-2 | status-band chrome the FU-2 metadata rows render into. Not named by the audit (filed after it); it lands the surface, not the server-metadata ingestion |

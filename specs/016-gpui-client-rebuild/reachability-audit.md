@@ -90,15 +90,15 @@ Determination techniques, in order of authority:
 | `Resize` | scripted-E2E | WIRED | `main.rs:361` `report_cell_metrics`, `:467` `attach`, `:1640` `attach_session` → `ipc_bridge.rs:210` |
 | `CreateSession` | scripted-E2E | WIRED | `main.rs:438` `create_tab` → `ipc_bridge.rs:237`; wired by bead .55 (`f56ef95`) |
 | `CloseSession` | scripted-E2E | WIRED | `main.rs:482` `close_active_tab` → `ipc_bridge.rs:272`; the `close_tab` chord that reaches it was unshadowed by bead .61 |
-| `CreateWorkspace` | gpui-test | MISSING | no `ClientMessage::CreateWorkspace` anywhere in the crate |
-| `CloseWorkspace` | scripted-E2E | MISSING | no `ClientMessage::CloseWorkspace` anywhere in the crate |
-| `MoveSession` | gpui-test | MISSING | no `ClientMessage::MoveSession` anywhere in the crate |
+| `CreateWorkspace` | scripted-E2E | WIRED (bead .66) | `TerminalView::split_workspace` → `IpcSink::create_workspace`; the answering `WorkspaceInfo` re-keys the region |
+| `CloseWorkspace` | scripted-E2E | WIRED (bead .66) | `TerminalView::close_pane` and `reconcile_panes` → `TerminalView::close_workspace` → `IpcSink::close_workspace`, for server-minted regions only |
+| `MoveSession` | scripted-E2E | WIRED (bead .66) | `TerminalView::follow_session_to_region` → `IpcSink::move_session`, when an adopting pane sits in another region |
 | `Subscribe` | scripted-E2E | WIRED | `main.rs` `attach_session` and `TerminalView::attach` → `IpcSink::subscribe`, behind the `AttachSessions` on the same ordered channel; wired by bead .79 |
 | `RequestSnapshot` | scripted-E2E | WIRED | `main.rs` `report_cell_metrics` (after the post-font-reload `Resize`) and `forward_replay` (replay-decode fallback) → `IpcSink::request_snapshot`; wired by bead .79 |
 | `ListSessions` | scripted-E2E | WIRED | `main.rs:1297`, sent on every connect |
 | `AttachSessions` | scripted-E2E | WIRED | `main.rs:1640` `attach_session`; `ipc_bridge.rs:259` from `attach` |
 | `ConfigReloaded` | scripted-E2E | WIRED | `main.rs:347` in `apply_config_reload`; watcher wired by bead .57 (`a50a5f2`) |
-| `ReportWorkspaceTree` | gpui-test | UNWIRED | built only in `workspace_tree.rs`; module not imported by `main.rs` |
+| `ReportWorkspaceTree` | scripted-E2E | WIRED (bead .66) | `TerminalView::report_workspace_tree` → `PaneShell::wire_tree` → `IpcSink::report_workspace_tree`, after every layout mutation |
 | `SearchRequest` | scripted-E2E | WIRED (bead .69) | `TerminalView::send_search_request` → `IpcSink::search_request`, on every find-overlay query edit |
 | `WorkspaceNotesGet` | gpui-test | WIRED | `main.rs:558` `open_workspace_notes_modal` → `ipc_bridge.rs:281`. Demo-only: Ctrl+Shift+N, fabricated `WorkspaceId::new()` (`main.rs:561`), and the reply is dropped by the reader catch-all |
 | `WorkspaceNotesMutate` | gpui-test | WIRED | `main.rs` `route_workspace_notes_action` → `ipc_bridge.rs:291`; same demo caveat |
@@ -166,7 +166,7 @@ Everything else is silently discarded on the wire.
 | `Error` | visual-E2E | WIRED | `run_reader` arm → `set_status` |
 | `GitBranch` | visual-E2E | MISSING | no reference; `StatusBarData.git_branch` hardcoded `None` |
 | `SessionList` | scripted-E2E | WIRED | `run_reader` arm → `sync_tab_strip` |
-| `WorkspaceInfo` | gpui-test | MISSING | only a doc-comment mention at `workspace_layout.rs:92`; never matched |
+| `WorkspaceInfo` | scripted-E2E | WIRED (bead .66) | `dispatch_server_message` arm → `on_workspace_info` → `ChromeMetadata::name_workspace` (status bar) and parked for `TerminalView::adopt_workspace_info` → `PaneShell::apply_workspace_info` |
 | `WorkspaceNotesSnapshot` | gpui-test | MISSING | no reference. The modal sends `WorkspaceNotesGet` and never receives a reply |
 | `WorkspaceNotesChanged` | gpui-test | MISSING | no reference in the crate |
 | `SearchResults` | scripted-E2E | WIRED (bead .69) | `on_search_results` → `FindResults` → `FindOverlayView::adopt_results` → `TerminalElement::with_highlights` |
@@ -390,11 +390,12 @@ and blocks every `visual-E2E` row.
 - **FU-6 Workspace tree.** Rows: `workspace_split_vertical`,
   `workspace_split_horizontal`, `workspace_focus_left/right/up/down`,
   `CreateWorkspace`, `CloseWorkspace`, `MoveSession`, `ReportWorkspaceTree`,
-  `WorkspaceInfo`. **Partly closed by bead .58**: the six workspace key actions
-  are WIRED above through `PaneShell`, and regions beyond the first are
-  client-local layout because the server still owns one workspace per window.
-  The four `ClientMessage`/`ServerMessage` rows were not in .58's scope and
-  remain open (bead .66).
+  `WorkspaceInfo`. **Closed by beads .58 and .66.** .58 wired the six workspace
+  key actions through `PaneShell`; .66 wired the workspace IPC, so a split now
+  asks the server for a real workspace, adopts the `WorkspaceInfo` it answers
+  with, re-files the seeded session with `MoveSession`, reports the tree after
+  every mutation, and closes the workspace when a region collapses. Asserted on
+  the wire by `tests/e2e/visual/workspace-ipc.sh`.
 - **FU-7 Scrollback navigation and marks.** Rows: `scroll_up`, `scroll_down`,
   `scroll_top`, `scroll_bottom`, `prompt_jump_up`, `prompt_jump_down`,
   `jump_to_failure`, `PromptMark`, `ScrollBottom`. **The four `scroll_*` rows
@@ -579,7 +580,8 @@ the app constructs the entity:
   `WorkspaceNotesGet`, `WorkspaceNotesMutate`, `GetRemoteEnv`,
   `ListTrustedDevices`, `ListTrustedNetworks`, `GetLanEnv`, `DismissUpdate`
   (the three trust queries have since been moved and are covered by
-  `tests/e2e/visual/settings-trust.sh`);
+  `tests/e2e/visual/settings-trust.sh`; the outbound workspace frames and the
+  inbound `WorkspaceInfo` by `tests/e2e/visual/workspace-ipc.sh`);
   and inbound `CwdChanged`, `SessionContextChanged`, `WorkspaceInfo`,
   `WorkspaceNotesSnapshot`, `WorkspaceNotesChanged`, `SearchResults`,
   `EnvPreflightResult`, `PromptMark`, `ScrollBottom`, `TrustedDeviceList`,

@@ -14,13 +14,13 @@
 //! control-passing frames (`ControlClaim` / `ControlGrant`) the share surfaces
 //! raise, the `SearchRequest` the find overlay issues on every query edit,
 //! the update decisions the status-bar CTA drives (`TriggerUpdate` /
-//! `DismissUpdate`), and the window-lifecycle frames the close dialog, the
-//! raise, the update decisions the status-bar CTA drives (`TriggerUpdate` /
 //! `DismissUpdate`), the window-lifecycle frames the close dialog, the
 //! window-list poll and the focus observer raise (`CloseWindow` / `QuitAll` /
-//! `ListWindows` / `FocusChanged`), and the feature-014 LAN frames the approval
+//! `ListWindows` / `FocusChanged`), the feature-014 LAN frames the approval
 //! prompt and the startup LAN probe raise (`LanApprovalDecision` /
-//! `ListLanPeers`), onto the ordered IPC-writer channel. The
+//! `ListLanPeers`), and the workspace frames the window's split shell raises
+//! (`CreateWorkspace` / `CloseWorkspace` / `MoveSession` /
+//! `ReportWorkspaceTree`), onto the ordered IPC-writer channel. The
 //! outbound path never traverses the inbound drain, so keystrokes are never
 //! queued behind an output firehose and `Resize` is always flushed ahead of the
 //! `KeyInput` that follows.
@@ -30,7 +30,9 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 use scribe_client_gpui::share::ControlIntent;
 use scribe_common::{
     ids::{SessionId, WindowId, WorkspaceId},
-    protocol::{ClientMessage, PromptMarkKind, TerminalSize, WorkspaceNotesMutation},
+    protocol::{
+        ClientMessage, PromptMarkKind, TerminalSize, WorkspaceNotesMutation, WorkspaceTreeNode,
+    },
 };
 use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
@@ -384,6 +386,68 @@ impl IpcSink {
     /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
     pub fn workspace_notes_get(&self, workspace_ids: Vec<WorkspaceId>) -> Result<(), SinkClosed> {
         self.enqueue(ClientMessage::WorkspaceNotesGet { workspace_ids })
+    }
+
+    /// Asks the server to mint a workspace for the window region the
+    /// `workspace_split_*` chords just opened.
+    ///
+    /// A workspace region is a *server* concept — it owns the accent colour,
+    /// the auto-derived name and the notes collection — so a region the client
+    /// invents locally is a layout box with nothing behind it. The reply is a
+    /// single `WorkspaceInfo` carrying the real [`WorkspaceId`], which the shell
+    /// adopts onto the region that asked (see `PaneShell::adopt_pending_workspace`).
+    /// No id is sent because only the server may allocate one.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn create_workspace(&self) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::CreateWorkspace)
+    }
+
+    /// Tells the server that `workspace_id`'s region collapsed, so it can drop
+    /// the workspace the client no longer shows.
+    ///
+    /// Sent only for a region the server actually minted: a region still
+    /// waiting for its `WorkspaceInfo` names an id the server has never seen,
+    /// and closing it would be a lie about state that never existed.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn close_workspace(&self, workspace_id: WorkspaceId) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::CloseWorkspace { workspace_id })
+    }
+
+    /// Reports that `session_id` now lives in `target_workspace`.
+    ///
+    /// A session and a region are independent axes: a split seeds its session
+    /// through the workspace the tab strip was pointing at, and the pane that
+    /// adopts it may belong to a different region entirely. This is the frame
+    /// that reconciles the two, so the server's session→workspace map matches
+    /// what the window shows.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn move_session(
+        &self,
+        session_id: SessionId,
+        target_workspace: WorkspaceId,
+    ) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::MoveSession { session_id, target_workspace })
+    }
+
+    /// Publishes the window's current workspace/pane split tree so the server
+    /// can persist it for reconnect and handoff.
+    ///
+    /// Sent after every tree mutation — a pane split or close, a workspace
+    /// split or collapse, and the session adoption that fills a fresh pane —
+    /// because the server stores the last tree it was told about and replays it
+    /// in `SessionList`. A client that never reports leaves that store empty and
+    /// every reconnect rebuilds a single flat pane.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn report_workspace_tree(&self, tree: WorkspaceTreeNode) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::ReportWorkspaceTree { tree })
     }
 
     /// Sends a feature-015 control-passing intent for a shared window: the
