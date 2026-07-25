@@ -99,7 +99,7 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `DispatchAction` | remote automation | scripted-E2E | — (missing, FU-16) — `scribe-cli` is the only sender | required |
 | `FocusChanged` | focus reporting | scripted-E2E | — (missing, FU-13) | required |
 | `HookEvent` | hook helper ingress | scripted-E2E | `crates/scribe-hook-helper/src/main.rs::main` — out-of-client by design | required |
-| `EnvPreflight` | environment persistence | scripted-E2E | — (unwired, FU-18) — `settings/server_action.rs::request_env_preflight` has no caller | required |
+| `EnvPreflight` | environment persistence | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` (`action.env_preflight`) and `SettingsWindow::enable_env_persistence`, the toggle's gated ON transition — `--settings` window only | required |
 | `ClipboardPromptResponse` | OSC 52 prompt | scripted-E2E | — (unwired, FU-8) — `clipboard.rs` outside the import closure | required |
 | `ClipboardBridgeReadReply` | OSC 52 bridge | scripted-E2E | — (unwired, FU-8) — `clipboard.rs` outside the import closure | required |
 | `RemoteHandshake` | tailnet connect | scripted-E2E | — (unwired, FU-16) — `remote_handshake.rs` outside the import closure | required |
@@ -108,12 +108,12 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `LanHello` | mTLS LAN-dial preamble before session attachment | scripted-E2E | — (missing, FU-17) | required |
 | `LanApprovalDecision` | owner-side fingerprint approval overlay | scripted-E2E | — (unwired, FU-17) — `lan_approval.rs` outside the import closure | required |
 | `ListLanPeers` | merged Local network source in remote connect picker | scripted-E2E | — (missing, FU-17) | required |
-| `ListTrustedDevices` | Remote settings trusted-device list | scripted-E2E | — (unwired, FU-18) — `request_trusted_devices` has no caller | required |
-| `RevokeTrustedDevice` | Remote settings device-revocation action | scripted-E2E | — (unwired, FU-18) — `request_revoke_trusted_device` has no caller | required |
-| `ListTrustedNetworks` | Remote settings trusted-network list | scripted-E2E | — (unwired, FU-18) — `request_trusted_networks` has no caller | required |
-| `AddCurrentNetworkTrusted` | Remote settings trust-current-network action | scripted-E2E | — (unwired, FU-18) — `request_add_current_network` has no caller | required |
-| `RemoveTrustedNetwork` | Remote settings trusted-network removal action | scripted-E2E | — (unwired, FU-18) — `request_remove_trusted_network` has no caller | required |
-| `GetLanEnv` | Remote settings LAN listener/environment summary | scripted-E2E | — (unwired, FU-17) — `settings/server_action.rs::request_lan_env` has no caller | required |
+| `ListTrustedDevices` | Remote settings trusted-device list | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` → `SettingsWindow::refresh_trust` — `--settings` window only | required |
+| `RevokeTrustedDevice` | Remote settings device-revocation action | scripted-E2E | `settings/window.rs::SettingsWindow::run_action`, per approved-device row — `--settings` window only | required |
+| `ListTrustedNetworks` | Remote settings trusted-network list | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` → `SettingsWindow::refresh_trust` — `--settings` window only | required |
+| `AddCurrentNetworkTrusted` | Remote settings trust-current-network action | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` (`action.add_current_network`) — `--settings` window only | required |
+| `RemoveTrustedNetwork` | Remote settings trusted-network removal action | scripted-E2E | `settings/window.rs::SettingsWindow::run_action`, per trusted-network row — `--settings` window only | required |
+| `GetLanEnv` | Remote settings LAN listener/environment summary | scripted-E2E | `settings/window.rs::SettingsWindow::refresh_trust` — `--settings` window only | required |
 | `GetLanDialIdentity` | local-server identity fetch before mTLS dialing | scripted-E2E | — (missing, FU-17) | required |
 | `ControlClaim` | viewer claim/request affordance for a shared window | scripted-E2E | `main.rs::TerminalView::run_share_key` → `share.rs::ShareChrome::intercept_key` → `ipc_bridge.rs::IpcSink::control_intent` | required |
 | `ControlRequest` | v3 compatibility alias; the client emits `ControlClaim` | golden | not emitted by design; its live substitute `ControlClaim` is wired through `ipc_bridge.rs::IpcSink::control_intent` | required |
@@ -176,7 +176,7 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `PromptMark` | prompt navigation | scripted-E2E | — (missing, FU-7) — `session_lifecycle` tracks trim offsets but no marks are ingested | required |
 | `TrimScrollback` | terminal history | golden | `main.rs::run_reader` arm → `session_lifecycle::SessionRegistry::on_trim_scrollback` | required |
 | `ScrollBottom` | terminal viewport | scripted-E2E | — (missing, FU-7) | required |
-| `EnvPreflightResult` | environment settings | scripted-E2E | — (unwired, FU-18) — parsed in `settings/server_action.rs`, but its request function has no caller | required |
+| `EnvPreflightResult` | environment settings | scripted-E2E | `settings/server_action.rs::parse_env_preflight_response`, rendered into the Environment page's status line — `--settings` window only | required |
 | `EnvStatus` | environment status | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_env_status` → `StatusBarData.env_status` | required |
 | `ClipboardPromptRequest` | OSC 52 dialog | visual-E2E | — (missing, FU-8) — the `ClipboardDialog` demo is built from literals | required |
 | `ClipboardBridgeWrite` | OSC 52 bridge | scripted-E2E | — (unwired, FU-8) — handled in `clipboard.rs`, outside the import closure | required |
@@ -190,9 +190,9 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `LanApprovalResult` | terminal LAN dial acceptance/refusal outcome | visual-E2E | — (missing, FU-17) | required |
 | `LanApprovalRequest` | owner-side device fingerprint approval overlay | visual-E2E | — (unwired, FU-17) — handled in `lan_approval.rs`, outside the import closure | required |
 | `LanPeerList` | Local network entries merged into remote connect picker | visual-E2E | — (missing, FU-17) | required |
-| `TrustedDeviceList` | Remote settings trusted-device rows | scripted-E2E | — (unwired, FU-18) — parsed but its request function has no caller | required |
-| `TrustedNetworkList` | Remote settings trusted-network rows | scripted-E2E | — (unwired, FU-18) — parsed but its request function has no caller | required |
-| `LanEnv` | Remote settings LAN listener/environment summary | scripted-E2E | — (unwired, FU-17) — parsed but its request function has no caller | required |
+| `TrustedDeviceList` | Remote settings trusted-device rows | scripted-E2E | `settings/server_action.rs::parse_trusted_devices_response`, rendered by `SettingsWindow::trusted_device_rows` — `--settings` window only | required |
+| `TrustedNetworkList` | Remote settings trusted-network rows | scripted-E2E | `settings/server_action.rs::parse_trusted_networks_response`, rendered by `SettingsWindow::trusted_network_rows` — `--settings` window only | required |
+| `LanEnv` | Remote settings LAN listener/environment summary | scripted-E2E | `settings/server_action.rs::parse_lan_env_response`, rendered by `SettingsWindow::trust_status_notes` — `--settings` window only | required |
 | `LanDialIdentity` | client mTLS identity returned by the local server | scripted-E2E | — (missing, FU-17) | required |
 | `ShareRoster` | presence badge and live-viewer role/claim state | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::apply_roster` | required |
 | `ControlRequested` | holder or owner grant/deny control prompt | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::request` | required |

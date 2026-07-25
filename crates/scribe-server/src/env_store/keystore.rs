@@ -135,8 +135,8 @@ pub fn to_preflight_error(e: &KeystoreError) -> scribe_common::protocol::Preflig
         KeystoreError::KeychainLocked => P::KeychainLocked,
         KeystoreError::SecretServiceUnavailable => P::SecretServiceUnavailable,
         KeystoreError::AccessDenied => P::KeystoreAccessDenied,
-        KeystoreError::NotFound => P::Unknown("dek not found".to_owned()),
-        KeystoreError::Other(s) => P::Unknown(s.clone()),
+        KeystoreError::NotFound => P::Unknown { reason: "dek not found".to_owned() },
+        KeystoreError::Other(s) => P::Unknown { reason: s.clone() },
     }
 }
 
@@ -315,14 +315,14 @@ mod tests {
     #[test]
     fn maps_not_found_to_unknown() {
         let mapped = to_preflight_error(&KeystoreError::NotFound);
-        assert!(matches!(mapped, P::Unknown(_)));
+        assert!(matches!(mapped, P::Unknown { .. }));
     }
 
     #[test]
     fn maps_other_to_unknown_with_message() {
         let mapped = to_preflight_error(&KeystoreError::Other("d-bus down".into()));
         let msg = match mapped {
-            P::Unknown(s) => s,
+            P::Unknown { reason } => reason,
             other => panic!("expected Unknown, got {other:?}"),
         };
         assert!(msg.contains("d-bus down"));

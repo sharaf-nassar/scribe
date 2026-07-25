@@ -63,6 +63,65 @@ prepare_xdg_dirs() {
     mkdir -p "$XDG_CONFIG_HOME/scribe" "$XDG_DATA_HOME/scribe" "$XDG_STATE_HOME/scribe"
 }
 
+# Seed the feature-014 LAN trust stores before the server starts.
+#
+# `IpcServerState` loads both TOML stores once at startup, and a single container
+# has no second machine to approve and no fingerprintable Wi-Fi to trust — so the
+# only way to exercise `RemoveTrustedNetwork` / `RevokeTrustedDevice` against a
+# real server is to plant one record of each up front. The documents are the real
+# on-disk shape (`version`/`owner` are validated on load), so the server treats
+# them exactly like records it wrote itself.
+seed_trust_stores() {
+    cat >"$XDG_STATE_HOME/scribe/lan_trusted_networks.toml" <<'TOML'
+version = 1
+owner = "server"
+updated_at_ms = 1750000000000
+
+[[networks]]
+id = "seeded-network-1"
+label = "Seeded Lab Network"
+gateway_mac = "aa:bb:cc:dd:ee:01"
+subnet_cidr = "10.77.0.0/24"
+ssid = "scribe-e2e"
+added_at = 1750000000000
+TOML
+    cat >"$XDG_STATE_HOME/scribe/lan_trusted_devices.toml" <<'TOML'
+version = 1
+owner = "server"
+updated_at_ms = 1750000000000
+
+[[devices]]
+device_id = "1f2e3d4c5b6a798877665544332211000f1e2d3c4b5a69788796a5b4c3d2e1f0"
+cert_der = "30820122"
+label = "seeded-laptop"
+first_seen = 1750000000000
+TOML
+    chmod 600 "$XDG_STATE_HOME/scribe/lan_trusted_networks.toml" \
+        "$XDG_STATE_HOME/scribe/lan_trusted_devices.toml"
+}
+
+# Interpose the recording relay on the server socket. Used by the sharing E2E to
+# inject the notices a second machine would have produced, and by the settings
+# trust E2E purely for its wire record — the settings window's one-shot server
+# actions are transient connections, and the record is the only place their
+# frames can be observed leaving the process.
+start_share_tap() {
+    mv "$UID_DIR/server.sock" "$UID_DIR/server-upstream.sock"
+    SHARE_WIRE_RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
+    SHARE_TAP_CONTROL="$UID_DIR/share-tap.sock"
+    export SHARE_WIRE_RECORD SHARE_TAP_CONTROL
+    scribe-test share-tap \
+        --listen "$UID_DIR/server.sock" \
+        --upstream "$UID_DIR/server-upstream.sock" \
+        --record "$SHARE_WIRE_RECORD" \
+        --control "$SHARE_TAP_CONTROL" >/output/share-tap.log 2>&1 &
+    TAP_PID=$!
+    for _ in $(seq 1 50); do
+        [ -S "$SHARE_TAP_CONTROL" ] && break
+        sleep 0.1
+    done
+}
+
 Xvfb :99 -screen 0 "${RESOLUTION}x24" &
 XVFB_PID=$!
 export DISPLAY=:99
@@ -86,6 +145,9 @@ chmod 700 "$UID_DIR"
 export SCRIBE_RUNTIME_DIR="$UID_DIR"
 
 prepare_xdg_dirs
+if [ "${SCRIBE_SEED_TRUST:-0}" = "1" ]; then
+    seed_trust_stores
+fi
 export PATH="/tests/bin:$PATH"
 export RUST_LOG="${RUST_LOG:-scribe_server=info,scribe_client_gpui=info}"
 
@@ -131,20 +193,7 @@ case "$VISUAL_APP" in
         # has already connected directly, so the client is the tap's newest
         # connection and therefore the injection target.
         if [ "${SCRIBE_SHARE_TAP:-0}" = "1" ]; then
-            mv "$UID_DIR/server.sock" "$UID_DIR/server-upstream.sock"
-            SHARE_WIRE_RECORD=/output/share-wire.jsonl
-            SHARE_TAP_CONTROL="$UID_DIR/share-tap.sock"
-            export SHARE_WIRE_RECORD SHARE_TAP_CONTROL
-            scribe-test share-tap \
-                --listen "$UID_DIR/server.sock" \
-                --upstream "$UID_DIR/server-upstream.sock" \
-                --record "$SHARE_WIRE_RECORD" \
-                --control "$SHARE_TAP_CONTROL" >/output/share-tap.log 2>&1 &
-            TAP_PID=$!
-            for _ in $(seq 1 50); do
-                [ -S "$SHARE_TAP_CONTROL" ] && break
-                sleep 0.1
-            done
+            start_share_tap
         fi
         # GPUI renders through blade/Vulkan; the Dockerfile pins
         # VK_ICD_FILENAMES to lavapipe (software) so no GPU is required.
@@ -191,6 +240,22 @@ case "$VISUAL_APP" in
             SESSION=$(scribe-test session create)
             export SESSION
         fi
+        ;;
+    settings)
+        # The settings window is its own top-level surface (`--settings`,
+        # main.rs `run_settings`) and does not register a client connection: every
+        # server round-trip it makes is a one-shot transient socket. The tap is
+        # therefore mandatory here — it is the only way a script can see which
+        # `ClientMessage`s the window actually put on the wire.
+        if [ "${SCRIBE_SHARE_TAP:-0}" = "1" ]; then
+            start_share_tap
+        fi
+        export LIBGL_ALWAYS_SOFTWARE=1
+        scribe-client-gpui --settings >/output/settings.log 2>&1 &
+        APP_PID=$!
+        export SCRIBE_SETTINGS_PID="$APP_PID"
+        export SCRIBE_SETTINGS_LOG=/output/settings.log
+        wait_for_window "Scribe Settings" 20 || true
         ;;
     *)
         echo "Unsupported SCRIBE_VISUAL_APP value: $VISUAL_APP" >&2

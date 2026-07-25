@@ -37,7 +37,7 @@ const RELEASE_LIST_TIMEOUT: Duration = Duration::from_secs(7);
 /// probe but the OS may need a one-time unlock prompt on first access (macOS
 /// Keychain, GNOME Keyring / `KWallet` on Linux), so we give the user some
 /// room before timing out and folding the result into
-/// `EnvPreflightOutcome::Err(PreflightError::Unknown(_))`.
+/// `EnvPreflightOutcome::Err(PreflightError::Unknown { .. })`.
 const ENV_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// Maximum time to block window-open on the one-shot `GetRemoteEnv` probe that
@@ -526,12 +526,9 @@ fn inject_release_list_result(
 /// boolean `ok` discriminator and a conditional `error` sibling whose
 /// `type` matches the snake-case variant name of [`PreflightError`].
 ///
-/// Built manually (not via `serde`) because `PreflightError::Unknown(String)`
-/// is a tuple variant with internal `#[serde(tag = "type")]` tagging that
-/// `serde_json` refuses to serialize; the on-wire msgpack codec
-/// (`rmp_serde`) handles the tuple-variant fine, but the webview-bound JSON
-/// needs the flat `{type, reason?}` shape regardless of how serde would
-/// render the same enum.
+/// Built manually (not via `serde`) so the webview-bound JSON keeps the flat
+/// `{ok, error: {type, reason?}}` shape the page's switch expects, independent
+/// of how serde would render the same enum.
 fn env_preflight_payload_json(outcome: &server_action::EnvPreflightOutcome) -> Option<String> {
     use server_action::EnvPreflightOutcome;
     let value = match outcome {
@@ -556,7 +553,7 @@ fn preflight_error_json(e: &PreflightError) -> serde_json::Value {
         PreflightError::KeystoreAccessDenied => {
             serde_json::json!({"type": "keystore_access_denied"})
         }
-        PreflightError::Unknown(reason) => {
+        PreflightError::Unknown { reason } => {
             serde_json::json!({"type": "unknown", "reason": reason})
         }
     }
@@ -2024,7 +2021,7 @@ mod tests {
     /// whose `type` is the snake-case variant name of `PreflightError`.
     /// `Unknown` additionally carries a non-empty `reason` string.
     ///
-    /// Built manually because `PreflightError::Unknown(String)` is a
+    /// Built manually because `PreflightError::Unknown` is a
     /// tuple-variant carrying free-form text — `serde_json` rejects the
     /// internally-tagged tuple-variant shape so the host has to render the
     /// flat `{type, reason?}` JSON itself.
@@ -2057,7 +2054,7 @@ mod tests {
 
         // ok=false with Unknown: carries the diagnostic reason verbatim.
         let s = env_preflight_payload_json(&server_action::EnvPreflightOutcome::Err(
-            PreflightError::Unknown("d-bus down".into()),
+            PreflightError::Unknown { reason: "d-bus down".into() },
         ))
         .expect("serialise unknown err");
         let v: serde_json::Value = serde_json::from_str(&s).expect("unknown err payload is JSON");

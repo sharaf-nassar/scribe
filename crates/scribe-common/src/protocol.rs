@@ -1284,8 +1284,13 @@ pub enum PreflightError {
     SecretServiceUnavailable,
     /// Either platform: keystore access denied for our identifier.
     KeystoreAccessDenied,
-    /// Any other underlying error; the inner string is for diagnostics.
-    Unknown(String),
+    /// Any other underlying error; `reason` is for diagnostics.
+    ///
+    /// A struct variant, not a newtype: `#[serde(tag = "type")]` is internal
+    /// tagging, and a newtype variant wrapping a `String` cannot be serialized
+    /// under it at all — every `EnvPreflightResult` carrying this variant failed
+    /// to encode and was dropped before it reached the client.
+    Unknown { reason: String },
 }
 
 /// Runtime state of env-capture for a single session, carried in

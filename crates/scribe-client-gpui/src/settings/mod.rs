@@ -7,7 +7,7 @@
 //! update/release action regresses. [`singleton`] absorbs the
 //! `settings.lock`/`settings.sock` singleton (a second `--settings` launch hands
 //! focus to the running window instead of opening a duplicate), and [`state`]
-//! persists window geometry across restarts. [`model`] describes the ten pages
+//! persists window geometry across restarts. [`model`] describes the eleven pages
 //! and their controls declaratively, [`values`] reads current config values back
 //! for rendering, and [`window`] lowers all of it onto a GPUI view.
 //!
