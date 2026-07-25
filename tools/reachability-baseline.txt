@@ -25,7 +25,7 @@
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
 counts modules-total 58
-counts modules-wired 25
+counts modules-wired 26
 counts server-messages-total 59
 counts server-messages-handled 24
 counts layout-actions-total 36
@@ -57,7 +57,6 @@ unwired-module selection
 unwired-module server_lifecycle
 unwired-module smart_selection
 unwired-module split_scroll
-unwired-module url_detect
 unwired-module vi_mode
 unwired-module window_state
 unwired-module workspace_layout
