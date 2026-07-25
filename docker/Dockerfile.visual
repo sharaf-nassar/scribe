@@ -34,6 +34,7 @@ RUN apt-get update && \
         scrot \
         imagemagick \
         xdotool \
+        x11-utils \
         xclip \
         openbox \
         libwebkit2gtk-4.1-0 \

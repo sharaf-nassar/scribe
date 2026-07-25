@@ -60,10 +60,12 @@ Every other row moved:
   reaches it.
 
 Where the audit named specific rows, this table follows it exactly. Where it
-did not — the `manual` Bell and Opacity rows, and the `golden`/`visual-E2E`
-rows that were never headless-only — the method is unchanged, because those
-oracles already require the running app and so satisfy the principle without
-an upgrade.
+did not — the `manual` Opacity row, and the `golden`/`visual-E2E` rows that
+were never headless-only — the method is unchanged, because those oracles
+already require the running app and so satisfy the principle without an
+upgrade. The `Bell` row was `manual` for the same reason and has since been
+upgraded to `scripted-E2E`: FU-22 found the routed behaviour lands on the
+window's `WM_HINTS` urgency flag, which a script can read directly.
 
 ## Client messages (46 sent)
 
@@ -155,7 +157,7 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `WorkspaceNamed` | workspace chrome | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::name_workspace` → `StatusBarData.workspace_name` | required |
 | `SessionCreated` | pane lifecycle | scripted-E2E | `main.rs::run_reader` arm → `main.rs::open_created_tab` | required |
 | `SessionExited` | pane lifecycle | scripted-E2E | `main.rs::run_reader` arm → tab removal + `AiChrome::forget` | required |
-| `Bell` | terminal bell | manual | — (unwired, FU-22) — `bell.rs` outside the import closure | required |
+| `Bell` | terminal bell | scripted-E2E | `main.rs::on_bell_message` queue → `main.rs::TerminalView::poll_bells` → `BellController::on_bell` → `Window::request_attention` | required |
 | `Error` | error presentation | visual-E2E | `main.rs::run_reader` arm → `main.rs::set_status` | required |
 | `GitBranch` | status/tab metadata | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_git_branch` → `StatusBarData.git_branch` | required |
 | `SessionList` | startup/reconnect | scripted-E2E | `main.rs::run_reader` arm → `main.rs::sync_tab_strip` | required |

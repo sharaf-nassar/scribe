@@ -86,7 +86,7 @@ fails on scripted-E2E (AI indicator), perf, and unverifiable manual rows.
 | Item | Verdict | Evidence |
 | --- | --- | --- |
 | Dialogs | ✅ VERIFIED | Close-Scribe modal renders (Quit / Kill / Cancel; Cancel safe-default), Esc dismisses; visual dialog suite also green |
-| Bell | ⚠️ PARTIAL | BEL ingested cleanly, correct focused-pane suppression, no crash/garbage. Unfocused attention badge not shown; audible ring unconfirmable (no audio) |
+| Bell | ✅ RESOLVED (was ⚠️ PARTIAL) | The original run saw only ingestion and focused-pane suppression, because the bell was unwired: `bell.rs` was outside the import closure and `Bell` fell into the reader's catch-all. Bead `scribe-38e.81` wired it, and the unfocused case is now asserted automatically — `tests/e2e/visual/bell.sh` rings a real BEL and reads the `WM_HINTS` urgency flag the attention request sets, so this row is no longer `manual` |
 | Opacity | ❌ FAILED (corrected) | Pixel-identical at 1.0 vs 0.85 on the real RTX 3090 → feature unimplemented, not environment-masked. See B3 and bead `.56` |
 | IME | ⛔ NEEDS HUMAN | No IME engine installed; 6 preedit-model unit tests pass as automated proxy |
 

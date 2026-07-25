@@ -160,6 +160,12 @@ e2e-visual-update:
 e2e-visual-ai-task-label:
     docker run --rm --gpus all -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/ai-task-label.sh
 
+# Run the terminal-bell visual E2E. It needs the shared-pane rig so a real shell
+# can write the BEL byte into the very pane the client renders, and it minimizes
+# and restores the window between phases, so it needs more than the default 60 s.
+e2e-visual-bell:
+    docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/bell.sh
+
 # Full functional E2E suite: build, containerise, run all tests
 e2e: build-release docker-func
     just e2e-func func/smoke.sh
