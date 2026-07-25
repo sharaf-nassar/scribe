@@ -288,6 +288,14 @@ The vi-mode phase asserts three things, because the mode is only correct if all 
 
 Split-scroll needs both halves of its gate, so the phase posts a real `state_changed` event through `scribe-hook-helper` to make the client believe the pane is a Claude Code session, then pages up and requires the reported `pin_rows` to be non-zero. Finally a right-click over a viewport filled with URLs must log `smart selection matched` naming the `URI` rule, which only the live context-menu path can write.
 
+### Font zoom re-lays the grid
+
+`tests/e2e/visual/terminal-zoom.sh` is the app-level oracle for the `zoom_in` / `zoom_out` / `zoom_reset` parity rows: it drives the three chords against the real window and asserts both what changed on screen and what left on the wire.
+
+`zoom.rs` is arithmetic over an integer point delta, so a headless test over it says nothing about whether the running binary can reach it — which is exactly how the three rows came to be audited as unreachable while their unit suite stayed green. The run therefore uses the [[test#Visual E2E Tests#Shared-pane rig]] plus the [[crates/scribe-test/src/share_tap.rs#run]] wire tap (`SCRIBE_SHARE_TAP=1`), and every phase needs a screenshot diff *and* a recorded `Resize` before it passes.
+
+`ctrl+-` must log `level=-1`, repaint the grid, and publish a smaller cell box with *more* columns; two `ctrl+=` presses must reach `level=1` with a bigger cell box and fewer columns than both the zoomed-out grid and the baseline. The column assertions are the point: a client that rescales glyphs inside a frozen `cols`x`rows` box also repaints and also emits a `Resize`, so pixels and frame counts alone cannot tell a real zoom from a cosmetic one. `ctrl+0` must return `level=0`, republish the pre-zoom geometry field for field, and leave a frame within a few hundred pixels of the pre-zoom capture — the seeded rows are short enough that no zoom level wraps them, so a restored grid is a restored image.
+
 ### Subscribe and snapshot session tooling
 
 `tests/e2e/visual/session-tooling.sh` is the app-level oracle for the `Subscribe` and `RequestSnapshot` parity rows: it drives the real client against the real server and asserts both frames on the wire at the lifecycle points that produce them.

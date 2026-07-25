@@ -253,7 +253,7 @@ also never executed).
 | `prompt_jump_up` | Navigation | UNWIRED | hits `main.rs:430`; no prompt marks are ingested |
 | `prompt_jump_down` | Navigation | UNWIRED | as above |
 | `jump_to_failure` | Navigation | UNWIRED | as above |
-| `zoom_in` | View and overlays | WIRED | `handle_layout_action` `ZoomIn` arm → `TerminalView::apply_zoom` → `ZoomState::zoom_in`, rebuilding `GridFont` through `rebuild_font` (bead .59) |
+| `zoom_in` | View and overlays | WIRED | `handle_layout_action` `ZoomIn` arm → `TerminalView::apply_zoom` → `ZoomState::zoom_in`, rebuilding `GridFont` through `rebuild_font` (bead .59) and re-laying the grid into the measured window area (bead .70) |
 | `zoom_out` | View and overlays | WIRED | as above, `ZoomState::zoom_out` |
 | `zoom_reset` | View and overlays | WIRED | as above, `ZoomState::reset` |
 | `command_palette` | View and overlays | WIRED | `main.rs:700` opens the overlay. Degenerate: `CommandPaletteEvent::Execute(_)` is discarded at `main.rs:502`, so no palette entry does anything |
@@ -416,11 +416,17 @@ and blocks every `visual-E2E` row.
   each query edit sends a real `SearchRequest`, and the `SearchResults` arm in
   `dispatch_server_message` drives per-cell highlights through
   `TerminalElement::paint`. All three rows are WIRED above.
-- **FU-10 Zoom.** Rows: `zoom_in`, `zoom_out`, `zoom_reset`. **Closed by bead
-  .59.** `ZoomState` is folded into `GridFont` by `TerminalView::rebuild_font`,
-  the one place a zoom step and a config font reload share, so a saved
-  font-size edit rebases the zoom instead of discarding it. Verified on screen
-  by `tests/e2e/visual/terminal-viewport.sh`.
+- **FU-10 Zoom.** Rows: `zoom_in`, `zoom_out`, `zoom_reset`. **Dispatch wired
+  by bead .59, completed by bead .70.** `ZoomState` is folded into `GridFont`
+  by `TerminalView::rebuild_font`, the one place a zoom step and a config font
+  reload share, so a saved font-size edit rebases the zoom instead of
+  discarding it. Bead .70 found the rescale stopped at the glyphs: pane
+  geometry was resolved against a viewport stated in the font's own cells, so
+  every zoom level published the same `cols`x`rows` and the freed pixels stayed
+  dead. `TerminalView::pane_viewport` now returns the grid area's measured
+  pixel rect and `sync_grid_geometry` republishes when it moves. Verified on
+  screen and on the wire by `tests/e2e/visual/terminal-zoom.sh`, with the
+  coarser zoom phase of `tests/e2e/visual/terminal-viewport.sh` alongside it.
 - **FU-11 close_tab chord and new_window.** Rows: `close_tab`, `new_window`.
   **Closed by bead .61.** The overlay chords now yield to the configured
   bindings (`translate_overlay_chord`), the close dialog and notes modal moved

@@ -263,9 +263,9 @@ Every row's method is `visual-E2E`: each action must be driven through
 | `prompt_jump_up` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; no prompt marks are ingested | required |
 | `prompt_jump_down` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; no prompt marks are ingested | required |
 | `jump_to_failure` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; no prompt marks are ingested | required |
-| `zoom_in` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (bead .59) — `tests/e2e/visual/terminal-viewport.sh` | required |
-| `zoom_out` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (bead .59) — `tests/e2e/visual/terminal-viewport.sh` | required |
-| `zoom_reset` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (bead .59) — `tests/e2e/visual/terminal-viewport.sh` | required |
+| `zoom_in` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (beads .59, .70) — `tests/e2e/visual/terminal-zoom.sh` | required |
+| `zoom_out` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (beads .59, .70) — `tests/e2e/visual/terminal-zoom.sh` | required |
+| `zoom_reset` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (beads .59, .70) — `tests/e2e/visual/terminal-zoom.sh` | required |
 | `command_palette` | View and overlays | visual-E2E | `main.rs::handle_overlay_key` opens the overlay — **degenerate**: `CommandPaletteEvent::Execute(_)` is discarded, so no palette entry does anything; FU-12 | required |
 | `settings` | View and overlays | visual-E2E | — (unwired, FU-23) — `KeyAction::OpenSettings` is swallowed in `handle_binding`; the settings window opens only via the `--settings` CLI flag | required |
 | `word_left` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |
