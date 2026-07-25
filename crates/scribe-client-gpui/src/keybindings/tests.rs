@@ -9,8 +9,8 @@ use gpui::Modifiers;
 use scribe_common::config::KeybindingsConfig;
 
 use super::{
-    Bindings, KeyAction, Keybinding, LayoutAction, translate_key_action, translate_layout_shortcut,
-    translate_terminal_shortcut,
+    Bindings, KeyAction, Keybinding, LayoutAction, OVERLAY_CHORDS, translate_key_action,
+    translate_layout_shortcut, translate_overlay_chord, translate_terminal_shortcut,
 };
 use crate::input::{KeyInput, KeyLocation, KeyState, KeyToken, NamedKey};
 
@@ -237,6 +237,69 @@ fn non_binding_key_falls_through() {
         state: KeyState::Pressed,
     };
     assert_eq!(translate_key_action(&input, &bindings), None);
+}
+
+/// Build a pressed `KeyInput` for a literal combo string.
+fn pressed_combo(combo: &str) -> KeyInput {
+    input_for(&Keybinding::parse(combo).expect("valid combo"), KeyState::Pressed)
+}
+
+#[test]
+fn overlay_chords_stay_clear_of_the_default_bindings() {
+    let bindings = Bindings::parse(&KeybindingsConfig::default());
+
+    for (combo, chord) in OVERLAY_CHORDS {
+        let input = pressed_combo(combo);
+        assert_eq!(
+            translate_key_action(&input, &bindings),
+            None,
+            "{combo} collides with a default binding, so overlay {chord:?} is unreachable",
+        );
+        assert_eq!(translate_overlay_chord(&input, &bindings), Some(chord));
+    }
+}
+
+#[test]
+fn tab_and_window_chords_are_never_claimed_by_an_overlay() {
+    let bindings = Bindings::parse(&KeybindingsConfig::default());
+
+    let cases: &[(&[Keybinding], LayoutAction)] = &[
+        (&bindings.close_tab, LayoutAction::CloseTab),
+        (&bindings.new_window, LayoutAction::NewWindow),
+    ];
+
+    for (set, expected) in cases {
+        let input = pressed_first(set);
+        assert_eq!(
+            translate_overlay_chord(&input, &bindings),
+            None,
+            "the {expected:?} chord is swallowed by a shell overlay before it can dispatch",
+        );
+        assert_eq!(translate_key_action(&input, &bindings), Some(KeyAction::Layout(*expected)));
+    }
+}
+
+#[test]
+fn a_rebind_onto_an_overlay_chord_wins() {
+    let mut config = KeybindingsConfig::default();
+    // Move `close_tab` onto the close-dialog overlay's own chord.
+    config.close_tab = scribe_common::config::KeyComboList(vec!["ctrl+shift+d".to_string()]);
+    let bindings = Bindings::parse(&config);
+
+    let input = pressed_combo("ctrl+shift+d");
+    assert_eq!(translate_overlay_chord(&input, &bindings), None);
+    assert_eq!(
+        translate_key_action(&input, &bindings),
+        Some(KeyAction::Layout(LayoutAction::CloseTab)),
+    );
+}
+
+#[test]
+fn overlay_chords_ignore_key_release() {
+    let bindings = Bindings::parse(&KeybindingsConfig::default());
+    let binding = Keybinding::parse("ctrl+shift+d").expect("valid combo");
+    let released = input_for(&binding, KeyState::Released);
+    assert_eq!(translate_overlay_chord(&released, &bindings), None);
 }
 
 #[test]

@@ -210,6 +210,12 @@ The context-menu row is clicked at a pixel offset calibrated against the capture
 
 A phase 0 preamble exists because the harness cannot otherwise give the client a pane to act in. `docker/entrypoint-visual.sh` creates `$SESSION` through `scribe-test` *after* launching the client, the server answers `SessionCreated` only on the connection that asked, and [[crates/scribe-server/src/ipc_server.rs#handle_list_sessions]] hides sessions owned by another window — so the running client never learns the session exists and a plain relaunch still sees nothing. Stopping the test daemon releases that window ownership, after which a relaunched client picks the session up over the normal `ListSessions` path. The trade is that `scribe-test` can no longer observe the session either, which is why the pane assertions read pixels rather than server-side output.
 
+### Tab and window chords reach their actions
+
+`tests/e2e/visual/tab-window-chords.sh` is the scripted oracle for the `close_tab` and `new_window` parity rows, which were unreachable in the running client while their headless coverage stayed green.
+
+Both chords were claimed by [[crates/scribe-client-gpui/src/main.rs#TerminalView#handle_overlay_key]] before the binding dispatcher ever saw them, so only the live window can prove the fix. The script presses `ctrl+shift+q` and waits for the `closing the active tab` line that [[crates/scribe-client-gpui/src/main.rs#TerminalView#close_active_tab]] alone writes, then presses `ctrl+shift+n` and requires both the `opened a new terminal window` line and a second mapped X11 window — a log line alone would not distinguish "the action ran" from "a window actually appeared". A third phase opens the close dialog on its relocated `ctrl+shift+d` and asserts the frame really repainted, so moving the overlay off `close_tab`'s default did not strand the surface. It reuses the session-adoption preamble documented under [[test#Visual E2E Tests#Overlay actions run for real]].
+
 ### Config live reload
 
 `tests/e2e/visual/config-reload.sh` is the scripted oracle for the `ConfigReloaded` parity row: it edits `config.toml` under an already-running client, the user-visible scenario the headless suites cannot reach.
@@ -754,6 +760,8 @@ Over a 2x2 pane grid the suite exercises the surface the entity tests do not rea
 Verifies the ported [[crates/scribe-client-gpui/src/keybindings.rs#Bindings]] parser and [[crates/scribe-client-gpui/src/keybindings.rs#translate_key_action]] dispatch so no configured shortcut regresses across the GPUI cutover.
 
 Driving each action from its default binding, the suite asserts every one of the 50+ [[crates/scribe-client-gpui/src/keybindings.rs#LayoutAction]] variants resolves to its named value, that command-palette/settings/find produce the right [[crates/scribe-client-gpui/src/keybindings.rs#KeyAction]], and that the seven terminal shortcuts emit their fixed escape sequences. It also checks combo parsing (`cmd`/`super` → platform modifier, named keys, rejected garbage), exact-modifier matching that ignores the GPUI function flag and is case-insensitive on the base character, key-down-only gating (press and repeat match, release does not), and that invalid combos are skipped without aborting the parse.
+
+Four cases lock [[client#GPUI Overlays#Overlay Chords Yield To Bindings]], the rule that kept `close_tab` and `new_window` unreachable until it existed. Every entry in [[crates/scribe-client-gpui/src/keybindings.rs#OVERLAY_CHORDS]] must resolve to its overlay *and* match no default binding, so a future overlay chord cannot quietly land on a user action; the `close_tab` and `new_window` defaults must resolve to their `LayoutAction` and be declined by [[crates/scribe-client-gpui/src/keybindings.rs#translate_overlay_chord]]; a config that rebinds `close_tab` onto an overlay's own chord must still reach the action; and a key release matches no overlay chord.
 
 ### GPUI tab session strip
 

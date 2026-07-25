@@ -29,7 +29,7 @@ counts modules-wired 29
 counts server-messages-total 59
 counts server-messages-handled 28
 counts layout-actions-total 36
-counts layout-actions-handled 9
+counts layout-actions-handled 10
 
 unwired-module bell
 unwired-module clipboard
@@ -102,7 +102,6 @@ unhandled-layout-action FocusNext
 unhandled-layout-action FocusRight
 unhandled-layout-action FocusUp
 unhandled-layout-action JumpToFailure
-unhandled-layout-action NewWindow
 unhandled-layout-action PasteClipboard
 unhandled-layout-action PromptJumpDown
 unhandled-layout-action PromptJumpUp
