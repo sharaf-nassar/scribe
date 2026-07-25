@@ -24,10 +24,10 @@
 # Wiring one of these up means deleting its line here and bumping the matching
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
-counts modules-total 56
-counts modules-wired 22
+counts modules-total 57
+counts modules-wired 23
 counts server-messages-total 59
-counts server-messages-handled 12
+counts server-messages-handled 18
 counts layout-actions-total 36
 counts layout-actions-handled 9
 
@@ -75,10 +75,7 @@ unhandled-server-message CodexTaskLabelChanged
 unhandled-server-message CodexTaskLabelCleared
 unhandled-server-message ControlDenied
 unhandled-server-message ControlRequested
-unhandled-server-message CwdChanged
 unhandled-server-message EnvPreflightResult
-unhandled-server-message EnvStatus
-unhandled-server-message GitBranch
 unhandled-server-message LanApprovalPending
 unhandled-server-message LanApprovalRequest
 unhandled-server-message LanApprovalResult
@@ -95,12 +92,10 @@ unhandled-server-message RemotePeerList
 unhandled-server-message RunAction
 unhandled-server-message ScrollBottom
 unhandled-server-message SearchResults
-unhandled-server-message SessionContextChanged
 unhandled-server-message ShareEnded
 unhandled-server-message ShareRoster
 unhandled-server-message TaskLabelChanged
 unhandled-server-message TaskLabelCleared
-unhandled-server-message TitleChanged
 unhandled-server-message TrustedDeviceList
 unhandled-server-message TrustedNetworkList
 unhandled-server-message UpdateAvailable
@@ -110,7 +105,6 @@ unhandled-server-message WindowClosed
 unhandled-server-message WindowList
 unhandled-server-message WindowTakenOver
 unhandled-server-message WorkspaceInfo
-unhandled-server-message WorkspaceNamed
 unhandled-server-message WorkspaceNotesChanged
 unhandled-server-message WorkspaceNotesSnapshot
 
