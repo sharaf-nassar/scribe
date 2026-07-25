@@ -19,15 +19,20 @@ use std::{
 
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    Pixels, Point, Render, Size, Subscription, Task, TitlebarOptions, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, canvas, div, prelude::*, px, relative,
-    size,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Size, Subscription, Task, TitlebarOptions,
+    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, canvas, div,
+    prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use scribe_client_gpui::ai_indicator::AiStateTracker;
 use scribe_client_gpui::animation::AnimationSettings;
 use scribe_client_gpui::bell::{BellController, BellEvent};
 use scribe_client_gpui::chrome_metadata::{ChromeMetadata, SessionChrome};
+use scribe_client_gpui::clipboard::{
+    self, ArboardClipboard, BridgeJob, ClipboardBackend as _, ClipboardBridge, ClipboardPrompt,
+    FocusGate,
+};
+use scribe_client_gpui::clipboard_cleanup::{self, CopyTextOptions};
 use scribe_client_gpui::color::TerminalColors as CellColors;
 use scribe_client_gpui::command_palette::{
     CommandPaletteColors, CommandPaletteEvent, CommandPaletteView, PaletteAction, build_entries,
@@ -38,8 +43,9 @@ use scribe_client_gpui::context_menu::{
     MenuItem,
 };
 use scribe_client_gpui::dialog::{
-    AnyDialog, ClipboardDialog, CloseAction, CloseDialog, DialogColors, DialogEvent, DialogOutcome,
-    DialogView, DisallowedSchemeAction, DisallowedSchemeDialog, UpdateAction, UpdateDialogKind,
+    AnyDialog, ClipboardDialog, ClipboardDialogAction, CloseAction, CloseDialog, DialogColors,
+    DialogEvent, DialogOutcome, DialogView, DisallowedSchemeAction, DisallowedSchemeDialog,
+    PasteConfirmationAction, PasteConfirmationDialog, UpdateAction, UpdateDialogKind,
 };
 use scribe_client_gpui::input::{self, KeyInput, TerminalMode};
 use scribe_client_gpui::keybindings::{
@@ -49,7 +55,9 @@ use scribe_client_gpui::lan::{LanChrome, LanConnectOutcome, LanEnvSummary};
 use scribe_client_gpui::lan_approval::{LanApprovalAction, LanApprovalDialog};
 use scribe_client_gpui::lan_dial::{self, LanDialer};
 use scribe_client_gpui::layout::{FocusDirection, PaneId, Rect, SplitDirection};
+use scribe_client_gpui::mouse_state::{ClickKind, MouseClickState};
 use scribe_client_gpui::opacity::{clamp_opacity, opaque_slot, surface};
+use scribe_client_gpui::paste::{PasteGate, PasteGateEvent, paste_chunks};
 use scribe_client_gpui::prompt_bar::{
     self, PromptBarColors, PromptBarData, PromptContextIndicator,
 };
@@ -58,6 +66,7 @@ use scribe_client_gpui::search::{
     FindOverlayColors, FindOverlayEvent, FindOverlayView, FindResults, MatchHighlightColors,
     SEARCH_RESULT_LIMIT,
 };
+use scribe_client_gpui::selection::{SelectionMode, SelectionSpan};
 use scribe_client_gpui::share::{
     ControlRequestPrompt, ShareChrome, ShareKey, ShareKeyOutcome, ShareOverlayColors, ShareState,
     share_overlay,
@@ -96,8 +105,8 @@ use scribe_common::{
     framing::{read_message, write_message},
     ids::{SessionId, WorkspaceId},
     protocol::{
-        ArchiveReason, AutomationAction, ClientMessage, PromptMarkKind, ServerMessage, SessionInfo,
-        TerminalSize, WindowInfo, WorkspaceNoteStatus,
+        ArchiveReason, AutomationAction, ClientMessage, ClipboardSelection, PromptMarkKind,
+        ServerMessage, SessionInfo, TerminalSize, WindowInfo, WorkspaceNoteStatus,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -310,6 +319,12 @@ struct Shared {
     /// the server's answer and the next reconcile pass applies it on the thread
     /// that owns the layout.
     workspaces: Arc<Mutex<Vec<WorkspaceInfo>>>,
+    /// Spec-010 OSC 52 state. The IPC reader records the negotiated gating bit,
+    /// parks a confirmation request, and queues the host clipboard jobs the
+    /// server forwards; the view's lifecycle tick raises the prompt as a modal
+    /// and performs the queued jobs, because arboard and the FR-019 focus gate
+    /// both belong to the thread that owns the window.
+    clipboard: Arc<Mutex<ClipboardBridge>>,
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -326,8 +341,8 @@ const X11_FOCUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the foreground runs the window-lifecycle tick: draining a
 /// server-acknowledged exit, reporting a focus transition the reader caused
 /// (a reattach moves the focused pane without any UI event), re-polling the
-/// window list when it is due, and raising a LAN device-approval prompt the
-/// reader parked.
+/// window list when it is due, raising a LAN device-approval prompt the reader
+/// parked, and performing the OSC 52 clipboard work it queued.
 const WINDOW_LIFECYCLE_TICK: Duration = Duration::from_millis(200);
 
 /// How often the client re-polls the server's window list. Mirrors the winit
@@ -355,6 +370,59 @@ impl GridPalette {
         let mut cells = CellColors::new();
         cells.set_theme(theme);
         Self { background: theme.background, cells: Arc::new(cells) }
+    }
+}
+
+/// Whether the pointer is currently dragging out a selection over the grid.
+///
+/// A two-variant enum rather than a bool because the view already carries the
+/// `prompt_bar` and tooltip-demo flags, and a third loose bool is exactly the
+/// shape that stops reading as a state machine.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GridDrag {
+    /// No button is down over the grid; pointer motion is just a hover.
+    Idle,
+    /// The left button is down; pointer motion extends the selection.
+    Selecting,
+}
+
+/// The window's clipboard surfaces, grouped because they are always used
+/// together: nothing copies without the handle, nothing pastes without the
+/// gate, and no OSC 52 prompt can be answered without the request it is
+/// answering.
+struct ClipboardSurfaces {
+    /// The live host clipboard. Owned by the view rather than the IPC reader
+    /// because arboard is a window-thread resource: every copy, paste, and
+    /// server-forwarded OSC 52 bridge op goes through this one handle.
+    handle: ArboardClipboard,
+    /// Spec-011 risky-paste gate. Every paste — chord, middle click, or context
+    /// menu — is requested through it, and it decides whether the bytes go
+    /// straight to the pane or park behind the confirmation modal.
+    gate: Entity<PasteGate>,
+    /// The OSC 52 request the open clipboard modal is answering, so its choice
+    /// can be correlated back to the `request_id` the server is holding. The
+    /// dialog owns its own copy for display; this is the reply copy.
+    pending_prompt: Option<ClipboardPrompt>,
+}
+
+/// Pointer state behind a selection gesture: the click-count classifier that
+/// picks cell / word / line granularity, and whether a drag is under way.
+struct PointerState {
+    clicks: MouseClickState,
+    drag: GridDrag,
+}
+
+impl ClipboardSurfaces {
+    /// Open a live host clipboard handle around an already-subscribed paste
+    /// gate, with no OSC 52 prompt in flight.
+    fn new(gate: Entity<PasteGate>) -> Self {
+        Self { handle: ArboardClipboard::new(), gate, pending_prompt: None }
+    }
+}
+
+impl Default for PointerState {
+    fn default() -> Self {
+        Self { clicks: MouseClickState::new(), drag: GridDrag::Idle }
     }
 }
 
@@ -459,6 +527,10 @@ struct TerminalView {
     /// the resolved choice can be correlated back to the held connection. The
     /// dialog owns its own copy for display; this is the reply copy.
     pending_lan_approval: Option<u64>,
+    /// Host clipboard handle, paste gate, and the OSC 52 prompt in flight.
+    clipboard: ClipboardSurfaces,
+    /// Click classification and drag state behind terminal text selection.
+    pointer: PointerState,
     /// Demo toggle: when set, an OSC 8-style hover tooltip is drawn over a fixed
     /// anchor so the visual E2E can exercise tooltip clamping + URL truncation.
     tooltip_demo: bool,
@@ -553,9 +625,7 @@ impl TerminalView {
         let config_signal = config.signal();
         let config_task =
             cx.spawn(async move |view, app| drive_config_reloads(view, app, config_signal).await);
-        let theme = &config.config().theme;
-        let status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
-        let terminal_colors = GridPalette::from_theme(theme);
+        let (status_colors, terminal_colors) = Self::theme_palettes(&config);
         let chrome = config.config().chrome;
         let opacity = clamp_opacity(config.opacity());
         let font = GridFont::from_appearance(&config.config().config.appearance);
@@ -564,13 +634,13 @@ impl TerminalView {
         let smart_selection = compile_smart_selection(&terminal.smart_selection);
         let context_thresholds = terminal.ai_session.context_thresholds.clone();
         let prompt_bar_enabled = terminal.prompt_bar.enabled;
+        let gate = Self::start_paste_gate(terminal.paste_confirmation, cx);
         let prompt_colors = PromptBarColors::from(&chrome);
-        let colors = TabBarColors::from_chrome(&chrome, opacity);
         // The strip starts empty and is filled by the reader's first
         // `SessionList`; `sync_tabs` pushes it into the titlebar on the next
         // redraw so the tab row always mirrors live server state.
         let rendered_tabs = TabSessions::new();
-        let titlebar = Self::build_titlebar(colors, &rendered_tabs, cx);
+        let titlebar = Self::build_titlebar(&chrome, opacity, &rendered_tabs, cx);
         // One workspace region holding one pane: the shape the window has
         // before the first split, and the shape every split grows out of.
         let shell = PaneShell::new(chrome.accent, cx);
@@ -611,6 +681,8 @@ impl TerminalView {
             workspace_notes_modal: None,
             pending_osc8_uri: None,
             pending_lan_approval: None,
+            clipboard: ClipboardSurfaces::new(gate),
+            pointer: PointerState::default(),
             tooltip_demo: false,
             x11_focus,
             bell,
@@ -622,6 +694,35 @@ impl TerminalView {
             _activation_observer: activation_observer,
             _bell_subscription: bell_subscription,
         }
+    }
+
+    /// The two theme-derived palettes the window paints from: the status bar's
+    /// segment colours, and the terminal grid's background plus its resolved
+    /// per-cell palette.
+    ///
+    /// Split out of [`Self::new`] so the constructor stays a list of the
+    /// window's collaborators rather than also being where two of them are
+    /// derived.
+    fn theme_palettes(config: &ConfigRuntime) -> (StatusBarColors, GridPalette) {
+        let theme = &config.config().theme;
+        (
+            StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors),
+            GridPalette::from_theme(theme),
+        )
+    }
+
+    /// Create the spec-011 paste gate and subscribe to its decisions.
+    ///
+    /// The gate is an entity so a parked paste survives the modal round trip
+    /// and resumes on the exact original bytes; the view only ever sees the two
+    /// outcomes it emits.
+    fn start_paste_gate(confirmation_enabled: bool, cx: &mut Context<Self>) -> Entity<PasteGate> {
+        let gate = cx.new(|_| PasteGate::new(confirmation_enabled));
+        cx.subscribe(&gate, |view, _gate, event: &PasteGateEvent, ctx| {
+            view.on_paste_gate_event(event.clone(), ctx);
+        })
+        .detach();
+        gate
     }
 
     /// Create the terminal-bell suppression gate and wire its signal to the
@@ -654,10 +755,12 @@ impl TerminalView {
     /// window's collaborators rather than also being the place one of them is
     /// assembled.
     fn build_titlebar(
-        colors: TabBarColors,
+        chrome: &ChromeColors,
+        opacity: f32,
         tabs: &TabSessions,
         cx: &mut Context<Self>,
     ) -> Entity<TitlebarView> {
+        let colors = TabBarColors::from_chrome(chrome, opacity);
         let data = tabs.to_tab_data();
         cx.new(|cx| {
             let mut bar = TitlebarView::new(colors, cx);
@@ -717,6 +820,8 @@ impl TerminalView {
         self.context_thresholds = terminal.ai_session.context_thresholds.clone();
         self.prompt_bar_enabled = terminal.prompt_bar.enabled;
         self.smart_selection = compile_smart_selection(&terminal.smart_selection);
+        let paste_confirmation = terminal.paste_confirmation;
+        self.clipboard.gate.update(cx, |gate, _| gate.set_confirmation_enabled(paste_confirmation));
 
         // Tell the server to re-read the same file so its own live surfaces
         // (clipboard policy, env store, remote/share listeners) follow.
@@ -799,14 +904,15 @@ impl TerminalView {
     /// creation opens a second top-level window, the four scrollback actions
     /// move the display viewport, the three zoom actions rescale the grid font,
     /// and the pane and workspace families drive the window's [`PaneShell`].
-    /// The remaining clipboard and prompt-jump families are still swallowed
-    /// (never forwarded to the PTY), matching the legacy client's behaviour of
-    /// never leaking a bound shortcut as terminal bytes.
+    /// The clipboard family serialises the focused pane's selection to the host
+    /// clipboard and runs a paste back through the spec-011 gate, and the
+    /// prompt-jump family moves the viewport between OSC 133 marks — so every
+    /// variant now reaches a real handler.
     ///
-    /// The match is exhaustive and the swallowed variants are named one by one
-    /// rather than folded into a `_` arm: a new [`LayoutAction`] then fails to
-    /// compile here instead of silently joining the dropped set, and every drop
-    /// that does happen is counted and warned by [`unhandled_layout_action`].
+    /// The match is exhaustive and deliberately not shortened with a `_` arm: a
+    /// new [`LayoutAction`] then fails to compile here instead of silently
+    /// joining a dropped set, which is the compile-time half of the
+    /// reachability gate.
     ///
     /// The two split families follow the legacy client's naming: a "vertical"
     /// split draws a vertical divider and therefore places the new pane beside
@@ -862,9 +968,8 @@ impl TerminalView {
             LayoutAction::PromptJumpUp => self.jump_to_prompt(JumpDirection::Up, cx),
             LayoutAction::PromptJumpDown => self.jump_to_prompt(JumpDirection::Down, cx),
             LayoutAction::JumpToFailure => self.jump_to_failure(cx),
-            LayoutAction::CopySelection | LayoutAction::PasteClipboard => {
-                unhandled_layout_action(action);
-            }
+            LayoutAction::CopySelection => self.copy_selection(),
+            LayoutAction::PasteClipboard => self.paste_clipboard(cx),
         }
     }
 
@@ -1110,12 +1215,16 @@ impl TerminalView {
                 self.create_tab(Some(shell_command_argv(&command)));
             }
             ContextMenuAction::RunCoprocess(command) => spawn_background_command(&command),
-            ContextMenuAction::Copy
-            | ContextMenuAction::Paste
-            | ContextMenuAction::SelectAll
-            | ContextMenuAction::CopyText(_)
-            | ContextMenuAction::CopyHyperlinkAddress(_) => {
-                unroutable_action(&format!("{action:?}"), "clipboard and selection are not wired");
+            ContextMenuAction::Copy => self.copy_selection(),
+            ContextMenuAction::Paste => self.paste_clipboard(cx),
+            ContextMenuAction::CopyText(text) | ContextMenuAction::CopyHyperlinkAddress(text) => {
+                self.write_clipboard(text);
+            }
+            // Select All would have to span the whole server-owned scrollback,
+            // which this display-only client does not hold; it is counted until
+            // a server-side selection request exists to ask for it.
+            ContextMenuAction::SelectAll => {
+                unroutable_action("SelectAll", "the scrollback lives server-side");
             }
         }
         cx.notify();
@@ -1148,12 +1257,14 @@ impl TerminalView {
     /// for the close dialog is Cancel and therefore a deliberate no-op — but for
     /// the approval prompt is an explicit Decline that still has to reach the
     /// server, because a peer is being held open waiting for it.
-    fn route_dialog_outcome(&mut self, outcome: DialogOutcome) {
-        // Three consumers read state the dialog parked on the view, so take the
-        // pending URI and the pending approval id up front and clear the update
-        // kind only once the update route (which reads it) has run.
+    fn route_dialog_outcome(&mut self, outcome: DialogOutcome, cx: &mut Context<Self>) {
+        // Four consumers read state the dialog parked on the view, so take the
+        // pending URI, the pending approval id and the pending clipboard prompt
+        // up front and clear the update kind only once the update route (which
+        // reads it) has run.
         let pending = self.pending_osc8_uri.take();
         let approval = self.pending_lan_approval.take();
+        let clipboard_prompt = self.clipboard.pending_prompt.take();
         match outcome {
             DialogOutcome::Update(action) => self.route_update_action(action),
             DialogOutcome::Close(action) => self.route_close_action(action),
@@ -1165,12 +1276,307 @@ impl TerminalView {
                     url_detect::open_uri_unguarded(&uri);
                 }
             }
-            DialogOutcome::Paste(_)
-            | DialogOutcome::Clipboard(_)
-            | DialogOutcome::DisallowedScheme(_) => {}
+            // The gate still holds the exact bytes, so confirming resumes on
+            // them rather than on anything re-read from the clipboard since.
+            DialogOutcome::Paste(PasteConfirmationAction::Paste) => {
+                self.clipboard.gate.update(cx, PasteGate::confirm);
+            }
+            DialogOutcome::Paste(PasteConfirmationAction::Cancel) => {
+                tracing::info!("paste dropped at the confirmation");
+                self.clipboard.gate.update(cx, |gate, _| gate.cancel());
+            }
+            DialogOutcome::Clipboard(action) => {
+                self.answer_clipboard_prompt(clipboard_prompt, action);
+            }
+            DialogOutcome::DisallowedScheme(_) => {}
         }
         // The dialog is gone either way, so its kind must not outlive it.
         self.update_dialog_kind = None;
+    }
+
+    /// Copy the focused pane's selection to the host clipboard.
+    ///
+    /// Reached by the `copy` chord and by the context menu's Copy row. Nothing
+    /// happens without a selection, which is what makes the chord safe to press
+    /// on an empty grid: an empty copy would otherwise wipe whatever the user
+    /// had on the clipboard already.
+    fn copy_selection(&mut self) {
+        let Some(text) = self.selection_copy_text() else {
+            tracing::debug!("copy ignored: the focused pane has no selection");
+            return;
+        };
+        self.write_clipboard(text);
+    }
+
+    /// Put `text` on the system clipboard, reporting a dead handle rather than
+    /// failing silently. Shared by every copy surface.
+    fn write_clipboard(&mut self, text: String) {
+        let bytes = text.len();
+        if let Err(error) = self.clipboard.handle.write(ClipboardSelection::Clipboard, text) {
+            tracing::warn!(?error, "copy failed: the host clipboard is unavailable");
+            return;
+        }
+        tracing::info!(bytes, "copied to the host clipboard");
+    }
+
+    /// The focused pane's selection, after the AI copy-cleanup transforms.
+    ///
+    /// `None` for an absent or empty selection, so every caller can treat a
+    /// missing selection and an all-blank one identically.
+    fn selection_copy_text(&self) -> Option<String> {
+        let raw = self.with_focused_grid(|terminal| terminal.selection_text())??;
+        if raw.is_empty() {
+            return None;
+        }
+        Some(clipboard_cleanup::prepare_copy_text(&raw, self.copy_text_options()))
+    }
+
+    /// Inputs to the AI copy-cleanup transforms: the `claude_copy_cleanup`
+    /// config flag plus whether the focused pane is running an AI provider at
+    /// all. Copying from a plain shell pane is never rewritten.
+    fn copy_text_options(&self) -> CopyTextOptions {
+        let ai_session_active = self
+            .shared
+            .active_session
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .and_then(|session_id| {
+                let ai = self.shared.ai.lock().ok()?;
+                ai.tracker.provider_for_session(session_id)
+            })
+            .is_some();
+        CopyTextOptions {
+            ai_session_active,
+            cleanup_enabled: self.config.config().config.terminal.clipboard.claude_copy_cleanup,
+        }
+    }
+
+    /// Paste the system clipboard into the focused pane (the `paste` chord and
+    /// the context menu's Paste row).
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        match self.clipboard.handle.read(ClipboardSelection::Clipboard) {
+            Ok(text) => self.request_paste(&text, cx),
+            Err(error) => tracing::debug!(?error, "paste ignored: host clipboard unavailable"),
+        }
+    }
+
+    /// Paste the X11 primary selection, which is what a middle click does.
+    ///
+    /// An empty or unavailable primary selection is skipped rather than pasted
+    /// as nothing, so a stray middle click over a pane cannot deliver stale
+    /// text from an unrelated app.
+    fn paste_primary(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = clipboard::read_primary(&mut self.clipboard.handle) else {
+            return;
+        };
+        self.request_paste(&text, cx);
+    }
+
+    /// Run `text` through the spec-011 confirmation gate on its way to the pane.
+    ///
+    /// The pane's bracketed-paste mode is read here rather than inside the gate
+    /// because it is a property of the live `Term`: an application that opted
+    /// into DEC 2004 can already tell pasted bytes from typed ones, so the gate
+    /// stands down and the markers are added instead.
+    fn request_paste(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        let bracketed =
+            self.with_focused_grid(|terminal| terminal.bracketed_paste()).unwrap_or(false);
+        self.clipboard.gate.update(cx, |gate, ctx| gate.request(text, bracketed, ctx));
+    }
+
+    /// Route the paste gate's decision: deliver now, or raise the confirmation.
+    fn on_paste_gate_event(&mut self, event: PasteGateEvent, cx: &mut Context<Self>) {
+        match event {
+            PasteGateEvent::Send { text, bracketed } => {
+                tracing::info!(bytes = text.len(), bracketed, "delivering a paste to the pane");
+                self.deliver_paste(&text, bracketed);
+            }
+            PasteGateEvent::Confirm(parked) => {
+                tracing::info!(bytes = parked.text.len(), "paste parked behind the confirmation");
+                self.open_dialog(AnyDialog::Paste(PasteConfirmationDialog::new(parked)), cx);
+            }
+        }
+    }
+
+    /// Send resolved paste bytes to the focused pane, split into frames the
+    /// server's `KeyInput` size limit accepts and wrapped in the DEC 2004
+    /// markers when the application asked for them.
+    fn deliver_paste(&self, text: &str, bracketed: bool) {
+        for chunk in paste_chunks(text, bracketed) {
+            self.send_key_bytes(chunk);
+        }
+    }
+
+    /// Drain the OSC 52 work the IPC reader parked, on the thread that owns the
+    /// window.
+    ///
+    /// Two jobs, both of which need the foreground: the queued host clipboard
+    /// ops run here because arboard belongs to this thread and the FR-019 focus
+    /// gate can only be judged against a live window, and a parked confirmation
+    /// request is raised here because the modal is a GPUI entity. A modal
+    /// already being up defers the prompt to a later tick instead of stacking
+    /// two — the server holds the PTY-side request either way.
+    fn poll_clipboard(&mut self, cx: &mut Context<Self>) {
+        let (jobs, prompt) = {
+            let Ok(mut bridge) = self.shared.clipboard.lock() else {
+                tracing::warn!("clipboard bridge mutex poisoned; skipping the tick");
+                return;
+            };
+            let prompt = if self.dialog.is_none() { bridge.take_prompt() } else { None };
+            (bridge.drain_jobs(), prompt)
+        };
+        for job in jobs {
+            self.run_bridge_job(job);
+        }
+        let Some(prompt) = prompt else {
+            return;
+        };
+        tracing::info!(
+            request_id = prompt.request_id.0,
+            op = ?prompt.op,
+            selection = ?prompt.selection,
+            "raising the OSC 52 confirmation prompt",
+        );
+        let dialog = ClipboardDialog::new(
+            prompt.request_id,
+            prompt.op,
+            prompt.selection,
+            prompt.preview.clone(),
+        );
+        self.clipboard.pending_prompt = Some(prompt);
+        self.open_dialog(AnyDialog::Clipboard(dialog), cx);
+    }
+
+    /// Perform one server-forwarded host clipboard job.
+    ///
+    /// A write is fire-and-forget (OSC 52 has no write ack) and a failure is
+    /// silent per UX-002; a read always answers, carrying the `BridgeError` on
+    /// the wire so the server can collapse it onto the empty OSC 52 reply the
+    /// PTY-side program expects rather than waiting forever.
+    fn run_bridge_job(&mut self, job: BridgeJob) {
+        match job {
+            BridgeJob::Write { selection, payload } => {
+                let gate = self.write_focus_gate();
+                let written =
+                    clipboard::bridge_write(&mut self.clipboard.handle, selection, payload, gate);
+                if let Err(error) = written {
+                    tracing::debug!(?error, "OSC 52 bridge write failed");
+                }
+            }
+            BridgeJob::Read { request_id, selection } => {
+                let reply =
+                    clipboard::read_reply(&mut self.clipboard.handle, request_id, selection);
+                if let Err(error) = self.sink.clipboard_answer(reply) {
+                    tracing::warn!(%error, "clipboard read reply dropped: IPC writer closed");
+                }
+            }
+        }
+    }
+
+    /// The FR-019 focus-gate inputs for an OSC 52 write: the opt-in config flag
+    /// and whether this window currently holds focus.
+    fn write_focus_gate(&self) -> FocusGate {
+        let window_focused =
+            self.shared.lifecycle.lock().is_ok_and(|lifecycle| lifecycle.window_active());
+        let focus_gate_writes =
+            self.config.config().config.terminal.clipboard_policy.focus_gate_writes;
+        FocusGate { focus_gate_writes, window_focused }
+    }
+
+    /// Answer a pending OSC 52 confirmation on the wire.
+    ///
+    /// The reply is not optional: the server parked the PTY-side program's
+    /// request and holds it until this `request_id` resolves, so a Deny —
+    /// including the Esc / backdrop default — is sent just as deliberately as
+    /// an Allow. An `Always*` choice also persists the matching policy axis, so
+    /// the answer outlives this session exactly as it does in the winit client.
+    fn answer_clipboard_prompt(
+        &mut self,
+        prompt: Option<ClipboardPrompt>,
+        action: ClipboardDialogAction,
+    ) {
+        let Some(prompt) = prompt else {
+            tracing::warn!("clipboard prompt answered with no pending request");
+            return;
+        };
+        let decision = action.decision();
+        tracing::info!(
+            request_id = prompt.request_id.0,
+            op = ?prompt.op,
+            ?decision,
+            "answering the OSC 52 confirmation prompt",
+        );
+        clipboard::persist_policy_axis(prompt.op, decision);
+        let response = clipboard::prompt_response(prompt.request_id, decision);
+        if let Err(error) = self.sink.clipboard_answer(response) {
+            tracing::warn!(%error, "clipboard prompt response dropped: IPC writer closed");
+        }
+    }
+
+    /// Begin a selection under the pointer, at the granularity the click count
+    /// names: a single click selects cells, a double selects words, and a
+    /// triple or quadruple click selects whole logical lines.
+    fn begin_selection(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let kind = self.pointer.clicks.record_press(f32::from(position.x), f32::from(position.y));
+        let Some(bounds) = self.grid_bounds.get() else {
+            return;
+        };
+        let Some(cell) = cell_at(bounds, &self.font, position) else {
+            return;
+        };
+        let mode = match kind {
+            ClickKind::Single => SelectionMode::Cell,
+            ClickKind::Double => SelectionMode::Word,
+            ClickKind::Triple | ClickKind::Quadruple => SelectionMode::Line,
+        };
+        self.with_focused_grid(|terminal| terminal.begin_selection(cell, mode));
+        self.pointer.drag = GridDrag::Selecting;
+        cx.notify();
+    }
+
+    /// Extend the in-progress selection to the pointer. A no-op unless the left
+    /// button is still down, so ordinary hovering costs one boolean test.
+    fn extend_selection(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        if self.pointer.drag == GridDrag::Idle {
+            return;
+        }
+        let Some(bounds) = self.grid_bounds.get() else {
+            return;
+        };
+        let Some(cell) = cell_at(bounds, &self.font, position) else {
+            return;
+        };
+        self.with_focused_grid(|terminal| terminal.extend_selection(cell));
+        cx.notify();
+    }
+
+    /// Settle a selection drag: copy-on-select publishes the result to the X11
+    /// primary selection so a middle click in any app pastes it, matching the
+    /// winit client's `set_primary_selection`.
+    fn finish_selection(&mut self, cx: &mut Context<Self>) {
+        if self.pointer.drag == GridDrag::Idle {
+            return;
+        }
+        self.pointer.drag = GridDrag::Idle;
+        if !self.config.config().config.terminal.clipboard.copy_on_select {
+            return;
+        }
+        let Some(raw) = self.with_focused_grid(|terminal| terminal.selection_text()).flatten()
+        else {
+            return;
+        };
+        let options = self.copy_text_options();
+        clipboard::set_primary(&mut self.clipboard.handle, &raw, options);
+        cx.notify();
+    }
+
+    /// The focused pane's selection projected onto the painted viewport.
+    fn selection_spans(&self) -> Vec<SelectionSpan> {
+        self.with_focused_grid(|terminal| terminal.selection_spans()).unwrap_or_default()
     }
 
     /// Raise the LAN device-approval prompt the IPC reader parked, if any.
@@ -1358,12 +1764,14 @@ impl TerminalView {
 
     /// Run one window-lifecycle tick on the GPUI thread.
     ///
-    /// Four jobs, all of which need the foreground: the queued terminal bells
+    /// Five jobs, all of which need the foreground: the queued terminal bells
     /// are gated and signalled here (the attention request is a window call), a
     /// server-acknowledged exit can only be performed here, a focus transition
     /// the IPC reader caused (a reattach moves the focused pane with no UI event
-    /// behind it) is reconciled here, and the window-list poll sends from the
-    /// view's own sink.
+    /// behind it) is reconciled here, the window-list poll sends from the
+    /// view's own sink, and the OSC 52 clipboard work the reader parked runs
+    /// here because arboard and the confirmation modal both belong to this
+    /// thread.
     fn poll_window_lifecycle(&mut self, cx: &mut Context<Self>) {
         self.poll_bells(cx);
         let exit = self.shared.lifecycle.lock().ok().and_then(|mut l| l.take_exit());
@@ -1382,6 +1790,7 @@ impl TerminalView {
         self.report_focus();
         self.poll_window_list();
         self.poll_lan_approval(cx);
+        self.poll_clipboard(cx);
     }
 
     /// Re-poll the server's window list when it is due.
@@ -1986,6 +2395,7 @@ impl TerminalView {
         }
         let placements = self.shell.placements(viewport, cx);
         let split = placements.len() > 1;
+        let selection_spans = self.selection_spans();
         let opacity = self.opacity;
         let background = surface(self.terminal_colors.background, opacity);
         let idle_border = surface(self.chrome.divider, opacity);
@@ -2022,6 +2432,11 @@ impl TerminalView {
                 } else {
                     (Vec::new(), GridBounds::default())
                 };
+                // Selection lives on the focused pane only, for the same reason
+                // the bounds do: it is driven by a pointer this window resolves
+                // against that one pane.
+                let selection =
+                    if placement.focused { selection_spans.clone() } else { Vec::new() };
                 pane.child(
                     TerminalElement::new(
                         content,
@@ -2031,6 +2446,7 @@ impl TerminalView {
                         bounds,
                     )
                     .with_highlights(highlights)
+                    .with_selection(selection)
                     .paint(),
                 )
                 .into_any_element()
@@ -2200,7 +2616,9 @@ impl TerminalView {
         }];
         smart_actions.extend(self.smart_selection_rows(position));
         let request = ContextMenuRequest {
-            has_selection: true,
+            has_selection: self
+                .with_focused_grid(|terminal| terminal.has_selection())
+                .unwrap_or(false),
             osc8_uri: Some("https://example.com/spec".into()),
             smart_actions,
             ..Default::default()
@@ -2261,20 +2679,28 @@ impl TerminalView {
     /// which is painted inside the canvas and so cannot be a GPUI child
     /// element; everything else falls through untouched.
     fn click_grid(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
-        if self.split_scroll.pin_height <= 0.0 {
+        if self.hits_split_scroll_chip(position) {
+            tracing::info!("split-scroll jump chip clicked");
+            self.scroll_terminal(Scroll::Bottom, cx);
             return;
         }
+        self.begin_selection(position, cx);
+    }
+
+    /// Whether `position` landed on the docked split-scroll jump chip, which
+    /// owns the click ahead of the selection gesture because it is a control
+    /// drawn over the grid rather than content in it.
+    fn hits_split_scroll_chip(&self, position: Point<gpui::Pixels>) -> bool {
+        if self.split_scroll.pin_height <= 0.0 {
+            return false;
+        }
         let Some(bounds) = self.grid_bounds.get() else {
-            return;
+            return false;
         };
         let (rows, pin_rows) = self
             .with_focused_grid(|terminal| (terminal.content().rows.len(), terminal.pin_rows()))
             .unwrap_or((0, 0));
-        if !hits_jump_chip(bounds, &self.font, rows, pin_rows, position) {
-            return;
-        }
-        tracing::info!("split-scroll jump chip clicked");
-        self.scroll_terminal(Scroll::Bottom, cx);
+        hits_jump_chip(bounds, &self.font, rows, pin_rows, position)
     }
 
     /// The live smart-selection rows for the grid cell under `position`.
@@ -2350,7 +2776,7 @@ impl TerminalView {
             // overlay, and clearing afterwards would wipe it out.
             this.dialog = None;
             ctx.notify();
-            this.route_dialog_outcome(*outcome);
+            this.route_dialog_outcome(*outcome, ctx);
         })
         .detach();
         self.dialog = Some(view);
@@ -2825,6 +3251,12 @@ impl TerminalView {
         let Some(bytes) = encode_key(event) else {
             return;
         };
+        // Typing dismisses a selection, exactly as it does in the winit client:
+        // the highlighted region describes content the shell is about to
+        // overwrite, so leaving it up would highlight the wrong cells.
+        if self.with_focused_grid(DisplayOnlyTerminal::clear_selection) == Some(true) {
+            cx.notify();
+        }
         self.send_key_bytes(bytes);
     }
 
@@ -3394,6 +3826,24 @@ impl TerminalView {
                     view.click_grid(event.position, ctx);
                 }),
             )
+            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _window, ctx| {
+                view.extend_selection(event.position, ctx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _event: &MouseUpEvent, _window, ctx| {
+                    view.finish_selection(ctx);
+                }),
+            )
+            // Middle click is the X11 primary-selection paste, and it is a
+            // paste like any other: it goes through the same spec-011 gate the
+            // chord uses rather than straight to the PTY.
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|view, _event: &MouseDownEvent, _window, ctx| {
+                    view.paste_primary(ctx);
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
@@ -3603,6 +4053,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         lan: Arc::new(Mutex::new(LanChrome::new())),
         prompt_marks: Arc::new(Mutex::new(PromptMarks::new())),
         workspaces: Arc::new(Mutex::new(Vec::new())),
+        clipboard: Arc::new(Mutex::new(ClipboardBridge::default())),
     };
     let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
     let (in_tx, in_rx) = unbounded_channel::<InboundEvent>();
@@ -3903,7 +4354,11 @@ where
     ctx.out_tx
         .send(ClientMessage::Hello {
             window_id: join_window,
-            clipboard_gating: false,
+            // Spec 010 C7: this client owns a host clipboard and a confirmation
+            // modal, so it opts into OSC 52 gating. With the bit clear the
+            // server takes the headless deny path and never sends a single
+            // Clipboard* frame, which is what made the whole surface dead.
+            clipboard_gating: true,
             takeover: false,
         })
         .map_err(|_| "writer channel closed".to_owned())?;
@@ -3934,6 +4389,7 @@ where
         lan: ctx.shared.lan,
         prompt_marks: ctx.shared.prompt_marks,
         workspaces: ctx.shared.workspaces,
+        clipboard: ctx.shared.clipboard,
         out_tx: ctx.out_tx,
         in_tx: ctx.in_tx,
         sink: ctx.sink,
@@ -4201,6 +4657,9 @@ struct ReaderCtx {
     /// `WorkspaceInfo` answers the reader parks for the shell's reconcile pass;
     /// see the `workspaces` field of `Shared`.
     workspaces: Arc<Mutex<Vec<WorkspaceInfo>>>,
+    /// Spec-010 OSC 52 state the reader records gating on, parks confirmation
+    /// requests in, and queues host clipboard jobs onto.
+    clipboard: Arc<Mutex<ClipboardBridge>>,
     out_tx: UnboundedSender<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
@@ -4315,13 +4774,6 @@ fn update_lan_chrome_and_status(ctx: &ReaderCtx, mutate: impl FnOnce(&mut LanChr
 /// feature is present on the wire and absent from the client.
 static UNHANDLED_SERVER_MESSAGES: AtomicU64 = AtomicU64::new(0);
 
-/// Running total of [`LayoutAction`]s the shell intercepted but cannot run.
-///
-/// Incremented by [`unhandled_layout_action`]. The key path claims a bound
-/// chord before it can reach the PTY, so a swallowed action is invisible to the
-/// user: nothing happens and nothing is typed.
-static UNHANDLED_LAYOUT_ACTIONS: AtomicU64 = AtomicU64::new(0);
-
 /// Name, count, and warn about an inbound message the live reader drops.
 fn unhandled_server_message(message: &ServerMessage) {
     let dropped = UNHANDLED_SERVER_MESSAGES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4332,20 +4784,14 @@ fn unhandled_server_message(message: &ServerMessage) {
     );
 }
 
-/// Count and warn about a bound layout action the shell cannot execute.
-fn unhandled_layout_action(action: LayoutAction) {
-    let dropped = UNHANDLED_LAYOUT_ACTIONS.fetch_add(1, Ordering::Relaxed) + 1;
-    tracing::warn!(?action, dropped, "layout action not wired into the GPUI shell");
-}
-
 /// Running total of overlay-originated actions that reached a dispatcher with
 /// no live handler behind it.
 ///
-/// Distinct from [`UNHANDLED_LAYOUT_ACTIONS`]: those are chords the key path
-/// swallowed, these are palette rows, context-menu rows, and key actions whose
-/// destination surface (settings window, find overlay, remote picker, update
-/// dialog, clipboard) is not ported yet. Both are user-invisible without a log
-/// line, which is why every drop is named and counted here.
+/// Distinct from [`UNHANDLED_SERVER_MESSAGES`]: those are inbound frames the
+/// reader dropped, these are palette rows, context-menu rows, and key actions
+/// whose destination surface (the settings window, the remote picker, a
+/// server-side select-all) is not ported yet. Both are user-invisible without a
+/// log line, which is why every drop is named and counted here.
 static UNROUTABLE_ACTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// The ring a pane is drawn with: the owning region's accent when it has focus,
@@ -4549,23 +4995,11 @@ fn dispatch_server_message(
     attached: Option<SessionId>,
 ) -> Result<(), String> {
     match message {
-        ServerMessage::Welcome { window_id, participant_id, .. } => {
-            on_welcome(ctx, registry, window_id, participant_id);
+        ServerMessage::Welcome { window_id, participant_id, clipboard_gating, .. } => {
+            on_welcome(ctx, registry, window_id, participant_id, clipboard_gating);
         }
         ServerMessage::SessionList { sessions, workspaces, .. } => {
-            registry.rebuild_from_session_list(&sessions);
-            tracing::debug!(
-                sessions = registry.len(),
-                workspaces = registry.reconnect_topology().len(),
-                "rebuilt reconnect topology"
-            );
-            // The list replays each pane's last-known CWD, branch and context,
-            // so a reattach restores the status bar without waiting for the
-            // next shell prompt to re-emit them.
-            update_chrome_metadata(ctx, |metadata| {
-                metadata.seed_from_session_list(&sessions, &workspaces);
-            });
-            sync_tab_strip(ctx, &sessions, attached)?;
+            on_session_list(ctx, registry, &sessions, &workspaces, attached)?;
         }
         ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
             registry.on_session_created(session_id, workspace_id);
@@ -4660,9 +5094,41 @@ fn dispatch_server_message(
         | ServerMessage::LanPeerList { .. }
         | ServerMessage::LanEnv { .. }
         | ServerMessage::LanDialIdentity { .. }) => on_lan_message(ctx, lan),
+        // Spec 010: the three OSC 52 frames land in one shared [`ClipboardBridge`]
+        // the GPUI thread drains, so they route as one to [`on_clipboard_message`].
+        clipboard @ (ServerMessage::ClipboardPromptRequest { .. }
+        | ServerMessage::ClipboardBridgeWrite { .. }
+        | ServerMessage::ClipboardBridgeReadRequest { .. }) => {
+            on_clipboard_message(ctx, clipboard);
+        }
         other => unhandled_server_message(&other),
     }
     Ok(())
+}
+
+/// Adopt the server's session inventory: rebuild the reconnect topology, seed
+/// the chrome metadata, and reconcile the tab strip.
+///
+/// The list replays each pane's last-known CWD, branch and context, so a
+/// reattach restores the status bar without waiting for the next shell prompt
+/// to re-emit them.
+fn on_session_list(
+    ctx: &ReaderCtx,
+    registry: &mut session_lifecycle::SessionRegistry,
+    sessions: &[SessionInfo],
+    workspaces: &[scribe_common::protocol::WorkspaceListEntry],
+    attached: Option<SessionId>,
+) -> Result<(), String> {
+    registry.rebuild_from_session_list(sessions);
+    tracing::debug!(
+        sessions = registry.len(),
+        workspaces = registry.reconnect_topology().len(),
+        "rebuilt reconnect topology"
+    );
+    update_chrome_metadata(ctx, |metadata| {
+        metadata.seed_from_session_list(sessions, workspaces);
+    });
+    sync_tab_strip(ctx, sessions, attached)
 }
 
 /// Store one `SearchResults` reply for the find overlay and the paint path.
@@ -5083,15 +5549,81 @@ fn on_welcome(
     registry: &mut session_lifecycle::SessionRegistry,
     window_id: scribe_common::ids::WindowId,
     participant_id: Option<u64>,
+    clipboard_gating: bool,
 ) {
     registry.adopt_window(window_id);
     update_lifecycle(ctx, |lifecycle| lifecycle.adopt_window(window_id));
     update_share_chrome(ctx, |share| share.set_self_id(participant_id));
-    tracing::debug!(
+    // Spec 010 C7: the server echoes back whether it will route OSC 52 through
+    // this client. Recording it here is what lets the clipboard arms below
+    // refuse to act on a frame that arrived without a negotiated capability.
+    if let Ok(mut bridge) = ctx.clipboard.lock() {
+        bridge.set_gating(clipboard_gating);
+    }
+    tracing::info!(
         adopted = ?registry.adopted_window(),
         ?participant_id,
+        clipboard_gating,
         "welcome: adopted window"
     );
+}
+
+/// Fold one spec-010 OSC 52 frame into the shared [`ClipboardBridge`].
+///
+/// Nothing is performed here. The reader thread owns neither the modal (a GPUI
+/// entity) nor the host clipboard (arboard plus the FR-019 focus gate, both
+/// window-thread resources), so a prompt is parked and a bridge op is queued
+/// for [`TerminalView::poll_clipboard`] to run on the next foreground tick.
+/// Frames arriving before the `clipboard_gating` capability was negotiated are
+/// dropped, matching the winit client: without that bit the server should not
+/// have sent them, and acting on one would touch the host clipboard on the say
+/// so of a peer that never agreed to gate.
+fn on_clipboard_message(ctx: &ReaderCtx, message: ServerMessage) {
+    let Ok(mut bridge) = ctx.clipboard.lock() else {
+        tracing::warn!("clipboard bridge mutex poisoned; dropping the OSC 52 message");
+        return;
+    };
+    if !bridge.gating() {
+        tracing::debug!("OSC 52 message received before gating was negotiated; ignoring");
+        return;
+    }
+    match message {
+        ServerMessage::ClipboardPromptRequest {
+            session_id,
+            request_id,
+            op,
+            selection,
+            preview,
+        } => {
+            tracing::info!(%session_id, ?request_id, ?op, ?selection, "OSC 52 prompt requested");
+            bridge.park_prompt(ClipboardPrompt { request_id, op, selection, preview });
+        }
+        ServerMessage::ClipboardBridgeWrite { session_id, selection, payload } => {
+            tracing::debug!(
+                %session_id,
+                ?selection,
+                payload_len = payload.len(),
+                "OSC 52 bridge write queued for the host clipboard",
+            );
+            if bridge.push_job(BridgeJob::Write { selection, payload }) {
+                tracing::warn!("OSC 52 bridge queue full; dropped the oldest job");
+            }
+        }
+        ServerMessage::ClipboardBridgeReadRequest { session_id, request_id, selection } => {
+            tracing::debug!(
+                %session_id,
+                ?request_id,
+                ?selection,
+                "OSC 52 bridge read queued for the host clipboard",
+            );
+            if bridge.push_job(BridgeJob::Read { request_id, selection }) {
+                tracing::warn!("OSC 52 bridge queue full; dropped the oldest job");
+            }
+        }
+        other => unhandled_server_message(&other),
+    }
+    drop(bridge);
+    ctx.generation.fetch_add(1, Ordering::Release);
 }
 
 /// Fold one window-lifecycle answer into the shared [`WindowLifecycle`].

@@ -212,3 +212,78 @@ fn set_primary_writes_verbatim_when_cleanup_disabled_and_skips_empty() {
     set_primary(&mut cb, raw, CopyTextOptions { ai_session_active: false, cleanup_enabled: true });
     assert_eq!(cb.primary.as_deref(), Some("    keep indent"));
 }
+
+/// A prompt request with the given id, standing in for one the server parked.
+fn prompt(id: u64) -> ClipboardPrompt {
+    ClipboardPrompt {
+        request_id: PromptId(id),
+        op: scribe_common::protocol::ClipboardOp::Write,
+        selection: ClipboardSelection::Clipboard,
+        preview: Some("export TOKEN=hunter2".to_owned()),
+    }
+}
+
+// @lat: [[test#GPUI OSC 52 Clipboard Bridge#Bridge starts ungated]]
+#[test]
+fn bridge_starts_ungated_and_adopts_the_welcome_bit() {
+    let mut bridge = ClipboardBridge::default();
+    assert!(!bridge.gating());
+    bridge.set_gating(true);
+    assert!(bridge.gating());
+}
+
+// @lat: [[test#GPUI OSC 52 Clipboard Bridge#Parked prompt is taken once]]
+#[test]
+fn parked_prompt_is_taken_exactly_once() {
+    let mut bridge = ClipboardBridge::default();
+    assert_eq!(bridge.take_prompt(), None);
+    bridge.park_prompt(prompt(7));
+    assert_eq!(bridge.take_prompt(), Some(prompt(7)));
+    assert_eq!(bridge.take_prompt(), None);
+}
+
+// @lat: [[test#GPUI OSC 52 Clipboard Bridge#Bridge jobs drain in arrival order]]
+#[test]
+fn bridge_jobs_drain_in_arrival_order() {
+    let mut bridge = ClipboardBridge::default();
+    assert!(!bridge.push_job(BridgeJob::Write {
+        selection: ClipboardSelection::Clipboard,
+        payload: "first".to_owned(),
+    }));
+    assert!(!bridge.push_job(BridgeJob::Read {
+        request_id: PromptId(1),
+        selection: ClipboardSelection::Primary,
+    }));
+    let drained = bridge.drain_jobs();
+    assert_eq!(drained.len(), 2);
+    assert!(matches!(drained[0], BridgeJob::Write { .. }));
+    assert!(matches!(drained[1], BridgeJob::Read { .. }));
+    assert!(bridge.drain_jobs().is_empty());
+}
+
+// @lat: [[test#GPUI OSC 52 Clipboard Bridge#Bridge queue is bounded]]
+#[test]
+fn bridge_queue_drops_the_oldest_job_when_full() {
+    let mut bridge = ClipboardBridge::default();
+    for index in 0..MAX_PENDING_BRIDGE_JOBS {
+        assert!(!bridge.push_job(BridgeJob::Read {
+            request_id: PromptId(index as u64),
+            selection: ClipboardSelection::Clipboard,
+        }));
+    }
+    assert!(bridge.push_job(BridgeJob::Read {
+        request_id: PromptId(999),
+        selection: ClipboardSelection::Clipboard,
+    }));
+    let drained = bridge.drain_jobs();
+    assert_eq!(drained.len(), MAX_PENDING_BRIDGE_JOBS);
+    // The oldest went, the newest stayed.
+    assert_eq!(
+        drained[0],
+        BridgeJob::Read { request_id: PromptId(1), selection: ClipboardSelection::Clipboard }
+    );
+    assert_eq!(
+        drained[MAX_PENDING_BRIDGE_JOBS - 1],
+        BridgeJob::Read { request_id: PromptId(999), selection: ClipboardSelection::Clipboard }
+    );
+}

@@ -31,7 +31,9 @@ use alacritty_terminal_gpui::{
     index::{Column, Line},
     term::{Config, Osc52, Term, TermMode},
 };
-use scribe_client_gpui::selection::SelectionPoint;
+use scribe_client_gpui::selection::{
+    SelectionMode, SelectionPoint, SelectionSpan, SelectionState, viewport_spans,
+};
 use scribe_client_gpui::smart_selection::{CompiledSmartSelection, SmartSelectionCandidate};
 use scribe_client_gpui::split_scroll::{
     SplitScrollEligibility, align_pin_rows_to_logical_lines, compute_pin_rows,
@@ -144,6 +146,10 @@ pub struct DisplayOnlyTerminal {
     /// every frame. The live half of the decision (scrolled up, normal screen)
     /// is read off the terminal itself in [`Self::active_pin_rows`].
     split_scroll: SplitScrollEligibility,
+    /// Live mouse-drag selection over this pane's grid. Ranges are absolute
+    /// grid lines, so scrolling moves the highlight with the content rather
+    /// than leaving it pinned to the screen.
+    selection: SelectionState,
 }
 
 impl DisplayOnlyTerminal {
@@ -157,6 +163,7 @@ impl DisplayOnlyTerminal {
             output_processor: vte::ansi::Processor::new(),
             content: Content::default(),
             split_scroll: SplitScrollEligibility::default(),
+            selection: SelectionState::new(),
         };
         terminal.make_content();
         terminal
@@ -328,6 +335,79 @@ impl DisplayOnlyTerminal {
         vi_mode::is_vi_mode(&self.term)
     }
 
+    /// Whether the pane's application has enabled bracketed paste (DEC 2004).
+    ///
+    /// A paste is wrapped in the DEC 2004 markers only when this is set, and
+    /// the spec-011 confirmation gate defers to the application entirely when
+    /// it is: a program that opted into bracketed paste is already able to tell
+    /// pasted bytes from typed ones.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Begin a mouse selection at a viewport cell with the given granularity.
+    ///
+    /// Cell granularity anchors on the exact cell; word and line granularity
+    /// resolve their bounds off the live `Term` immediately, so a double- or
+    /// triple-click selects something before the pointer has moved at all.
+    pub fn begin_selection(&mut self, at: ViewportPoint, mode: SelectionMode) {
+        let point = self.selection_point(at);
+        match mode {
+            SelectionMode::Cell => self.selection.start_cell(point),
+            SelectionMode::Word => self.selection.start_word(&self.term, point),
+            SelectionMode::Line => self.selection.start_line(&self.term, point),
+        }
+    }
+
+    /// Extend the active selection to a viewport cell as the pointer drags,
+    /// keeping whichever granularity began the gesture. A no-op with no active
+    /// selection, so a drag that started off the grid cannot start one.
+    pub fn extend_selection(&mut self, at: ViewportPoint) {
+        let point = self.selection_point(at);
+        self.selection.drag_to(&self.term, point);
+    }
+
+    /// Drop the active selection. Returns `true` when there was one to drop, so
+    /// the caller can skip a repaint that would change nothing.
+    pub fn clear_selection(&mut self) -> bool {
+        let had = self.selection.range().is_some();
+        self.selection.clear();
+        had
+    }
+
+    /// Whether a non-empty selection is active on this pane.
+    #[must_use]
+    pub fn has_selection(&self) -> bool {
+        self.selection.range().is_some_and(|range| !range.is_empty())
+    }
+
+    /// The selected text, `WRAPLINE`-joined and trailing-space trimmed, or
+    /// `None` when nothing is selected.
+    #[must_use]
+    pub fn selection_text(&self) -> Option<String> {
+        self.selection.copy_text(&self.term)
+    }
+
+    /// The active selection projected onto the painted viewport, one span per
+    /// visible row. Empty when nothing is selected or the selection scrolled
+    /// off screen.
+    #[must_use]
+    pub fn selection_spans(&self) -> Vec<SelectionSpan> {
+        let Some(range) = self.selection.range() else {
+            return Vec::new();
+        };
+        viewport_spans(&range, self.display_offset(), self.content.rows.len(), self.term.columns())
+    }
+
+    /// Resolve a viewport cell onto the absolute grid line it reads from, which
+    /// is the coordinate space every [`scribe_client_gpui::selection`] API
+    /// speaks. Shared by the selection gestures and the smart-selection lookup
+    /// so a click means the same cell to both.
+    fn selection_point(&self, at: ViewportPoint) -> SelectionPoint {
+        SelectionPoint { row: self.grid_line_for_viewport_row(at.row), col: at.col }
+    }
+
     /// The smart-selection rules that match at a viewport cell, richest first.
     ///
     /// Only rules that carry at least one action are returned, because the
@@ -338,8 +418,7 @@ impl DisplayOnlyTerminal {
         rules: &CompiledSmartSelection,
         at: ViewportPoint,
     ) -> Vec<SmartSelectionCandidate> {
-        let point = SelectionPoint { row: self.grid_line_for_viewport_row(at.row), col: at.col };
-        rules.action_candidates_at(&self.term, point)
+        rules.action_candidates_at(&self.term, self.selection_point(at))
     }
 
     /// The grid line a viewport row reads from.

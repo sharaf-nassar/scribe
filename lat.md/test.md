@@ -286,6 +286,16 @@ Phase 0 borrows `overlay-actions.sh`'s trick for handing the client a pane: the 
 
 Each provider runs a set/clear cycle asserted twice over: the client's own `tab task label updated` line must appear with the label text (proving the notice reached the reader, not just the socket), the left half of the window's top band must differ from the pre-label capture by at least 40 pixels (proving the strip repainted), and after the clear that same band must be pixel-identical to the baseline again (proving the shell title came back rather than the label merely being overwritten).
 
+### Clipboard and OSC 52 bridge
+
+`tests/e2e/visual/clipboard-osc52.sh` is the app-level oracle for [[client#GPUI Client Spike#GPUI Platform Integrations Port#GPUI Clipboard and OSC 52 Bridge]]: the two-hop OSC 52 bridge, the confirmation modal, and the copy / paste chords, none of which a headless test can show.
+
+It runs through the recording wire tap ([[crates/scribe-test/src/share_tap.rs#run]] with `SCRIBE_SHARE_TAP=1`, described under [[test#Visual E2E Tests#Window sharing and control handoff]]) with `terminal.clipboard.{read,write}_mode = "prompt"` and a 1 ms burst window seeded through `SCRIBE_EXTRA_CONFIG`, so each phase raises its own modal instead of inheriting the previous decision. Phase 0 relaunches the client after stopping the test daemon, which both hands it the harness session and makes it the window's only participant — the server routes an OSC 52 prompt to the window's *controller*, so a client sharing the window with the daemon might never see one.
+
+The OSC 52 phases drive the escape from inside the real pane (`printf '\033]52;c;<base64>\a'` typed through XTEST), because only a PTY-side emission reaches the server's policy engine. Each asserts three things: the client raised a modal, the answer left as a `ClipboardPromptResponse` frame on the wire, and the effect landed — the allowed write shows up in `xclip -o -selection clipboard`, and the allowed read comes back as a `ClipboardBridgeReadReply` whose `Ok` payload carries what was on the host clipboard.
+
+The copy phase drags a real mouse selection across the pane and presses the `copy` chord, then requires the X11 clipboard to hold the selected needle — a chord that reached only the drop counter leaves the clipboard at its seeded value. The paste phase seeds the clipboard, presses the `paste` chord, and asserts the pasted bytes appear inside a `KeyInput` frame on the wire and that the shell's echo repaints the grid.
+
 ### Terminal viewport navigation
 
 `tests/e2e/visual/terminal-viewport.sh` is the app-level oracle for [[client#GPUI Client Spike#GPUI Terminal Viewport Wiring]]: scrollback paging, font zoom, vi / copy mode, split-scroll, and the smart-selection context menu, each of which shipped as a unit-tested module with no caller.
@@ -516,6 +526,20 @@ A selection spanning two rows separated by a hard line break (no `WRAPLINE`) is 
 
 [[crates/scribe-client-gpui/src/vi_mode.rs#toggle_vi_mode]] enters copy mode, [[crates/scribe-client-gpui/src/vi_mode.rs#vi_motion]] moves the vi cursor, and motions are no-ops while vi mode is inactive.
 
+### Selection projects onto visible rows
+
+[[crates/scribe-client-gpui/src/selection.rs#viewport_spans]] turns a multi-row selection into one inclusive span per painted row: the first row starts at the anchor column, middle rows span the full width, and the last row stops at the drag column.
+
+### Scrollback selection follows the offset
+
+A selection anchored in the scrollback paints nothing at the live bottom and lands on the matching screen row once the viewport scrolls onto it.
+
+That is what keeps the highlight attached to content rather than to a screen position.
+
+### Empty selection paints nothing
+
+An empty range (a plain click), a zero-row viewport, and a zero-column viewport all yield no spans, so the paint path never has to guard against a degenerate highlight.
+
 ## GPUI Animation Policy
 
 Unit tests for [[client#GPUI Client Spike#GPUI Animation System]] — [[crates/scribe-client-gpui/src/animation.rs#AnimationSettings]] — proving the config/override motion policy resolves correctly, transitions clamp to the 150 ms budget, and the disabled path yields a zero duration for byte-identical screenshots.
@@ -729,6 +753,38 @@ When the backend is unavailable, [[crates/scribe-client-gpui/src/clipboard.rs#re
 ### Primary write is verbatim when cleanup off
 
 [[crates/scribe-client-gpui/src/clipboard.rs#set_primary]] skips empty input entirely and writes the raw text unchanged when cleanup is disabled.
+
+### Bridge starts ungated
+
+[[crates/scribe-client-gpui/src/clipboard.rs#ClipboardBridge]] reports no gating until [[crates/scribe-client-gpui/src/clipboard.rs#ClipboardBridge#set_gating]] adopts the `Welcome` capability bit, so a frame arriving before negotiation is refused rather than acted on.
+
+### Parked prompt is taken once
+
+[[crates/scribe-client-gpui/src/clipboard.rs#ClipboardBridge#take_prompt]] hands the parked request to the foreground exactly once and reports `None` afterwards, so one server prompt can never raise two modals.
+
+### Bridge jobs drain in arrival order
+
+[[crates/scribe-client-gpui/src/clipboard.rs#ClipboardBridge#drain_jobs]] returns queued writes and reads in the order the reader saw them and leaves the queue empty, because OSC 52 ordering is what a PTY-side program observes.
+
+### Bridge queue is bounded
+
+Pushing past [[crates/scribe-client-gpui/src/clipboard.rs#MAX_PENDING_BRIDGE_JOBS]] evicts the oldest job and reports the eviction, so an OSC 52 firehose cannot grow the queue without bound between foreground ticks.
+
+## GPUI Paste Chunking
+
+Unit coverage for [[crates/scribe-client-gpui/src/paste.rs#paste_chunks]], the split that keeps a paste inside the server's `KeyInput` size limit while the shell still sees one bracketed-paste region.
+
+### Small paste is one frame
+
+A paste that fits the limit becomes a single frame, wrapped in the DEC 2004 markers only when the pane enabled bracketed paste, and empty input yields no frames at all.
+
+### Large paste splits under the limit
+
+A paste larger than [[crates/scribe-client-gpui/src/paste.rs#MAX_KEY_INPUT_CHUNK]] splits into several frames, each within the limit, whose concatenation is the original bytes.
+
+### Markers ride the first and last frame
+
+A large bracketed paste carries the start marker only on the first frame and the end marker only on the last, so exactly one marker pair spans the whole paste.
 
 ## GPUI Notification Dispatcher
 

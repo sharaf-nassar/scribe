@@ -445,6 +445,62 @@ pub fn read_cell_flags(term: &Term<VoidListener>, line: Line, col: Column) -> Fl
     read_cell(term, line, col).flags
 }
 
+/// One run of selected cells on a single *visible* row, ready to paint.
+///
+/// Columns are inclusive on both ends, matching the find overlay's
+/// [`crate::search::MatchHighlight`], so the paint path treats a selection run
+/// and a match run identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionSpan {
+    /// Row index into the painted viewport (0 = top row on screen).
+    pub row: usize,
+    /// First selected column, inclusive.
+    pub start_col: usize,
+    /// Last selected column, inclusive.
+    pub end_col: usize,
+}
+
+/// Project a selection onto the painted viewport as one span per visible row.
+///
+/// `range` is in absolute grid lines (0 = viewport top at offset 0, negative =
+/// scrollback), so a viewport scrolled `display_offset` rows into the
+/// scrollback shows grid line `row - display_offset` at screen row `row`. Rows
+/// outside the `rows` x `cols` viewport are dropped rather than clamped: a
+/// selection that scrolled off screen must paint nothing, not a stripe at the
+/// edge. Returns no spans for an empty selection.
+#[must_use]
+pub fn viewport_spans(
+    range: &SelectionRange,
+    display_offset: usize,
+    rows: usize,
+    cols: usize,
+) -> Vec<SelectionSpan> {
+    if range.is_empty() || rows == 0 || cols == 0 {
+        return Vec::new();
+    }
+    let (lo, hi) = range.normalized();
+    let offset = selection_grid_i32(display_offset);
+    let last_col = cols.saturating_sub(1);
+    let mut spans = Vec::new();
+    for row in lo.row..=hi.row {
+        let screen = row + offset;
+        if screen < 0 {
+            continue;
+        }
+        let Ok(screen) = usize::try_from(screen) else { continue };
+        if screen >= rows {
+            break;
+        }
+        let start_col = if row == lo.row { lo.col } else { 0 };
+        let end_col = if row == hi.row { hi.col } else { last_col };
+        if start_col > last_col {
+            continue;
+        }
+        spans.push(SelectionSpan { row: screen, start_col, end_col: end_col.min(last_col) });
+    }
+    spans
+}
+
 /// Return the previous logical neighbor for word scanning, crossing into the
 /// wrapped row above when the current row is a continuation.
 fn previous_cell_point(term: &Term<VoidListener>, point: SelectionPoint) -> Option<SelectionPoint> {
@@ -636,8 +692,9 @@ mod tests {
     use vte::ansi::Processor;
 
     use super::{
-        PixelToGridRequest, SelectionMode, SelectionPoint, SelectionRange, SelectionState,
-        extract_text, line_bounds_at, pixel_to_grid, word_bounds_at,
+        PixelToGridRequest, SelectionMode, SelectionPoint, SelectionRange, SelectionSpan,
+        SelectionState, extract_text, line_bounds_at, pixel_to_grid, viewport_spans,
+        word_bounds_at,
     };
     use crate::layout::Rect;
 
@@ -830,5 +887,43 @@ mod tests {
         let mut outside = request;
         outside.y = -5.0;
         assert_eq!(pixel_to_grid(outside), None);
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Selection projects onto visible rows]]
+    #[test]
+    fn selection_projects_one_span_per_visible_row() {
+        // Rows 0..=2 of a 5-row, 10-column viewport at offset 0.
+        let range = SelectionRange::cell(point(0, 3), point(2, 4));
+        assert_eq!(
+            viewport_spans(&range, 0, 5, 10),
+            vec![
+                SelectionSpan { row: 0, start_col: 3, end_col: 9 },
+                SelectionSpan { row: 1, start_col: 0, end_col: 9 },
+                SelectionSpan { row: 2, start_col: 0, end_col: 4 },
+            ]
+        );
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Scrollback selection follows the offset]]
+    #[test]
+    fn scrollback_selection_moves_with_the_display_offset() {
+        // A selection two lines into the scrollback paints nothing at offset 0
+        // and lands on the top rows once the viewport is scrolled onto it.
+        let range = SelectionRange::cell(point(-2, 0), point(-2, 3));
+        assert!(viewport_spans(&range, 0, 5, 10).is_empty());
+        assert_eq!(
+            viewport_spans(&range, 2, 5, 10),
+            vec![SelectionSpan { row: 0, start_col: 0, end_col: 3 }]
+        );
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Empty selection paints nothing]]
+    #[test]
+    fn empty_selection_and_empty_viewport_paint_nothing() {
+        let empty = SelectionRange::cell(point(1, 4), point(1, 4));
+        assert!(viewport_spans(&empty, 0, 5, 10).is_empty());
+        let real = SelectionRange::cell(point(0, 0), point(0, 4));
+        assert!(viewport_spans(&real, 0, 0, 10).is_empty());
+        assert!(viewport_spans(&real, 0, 5, 0).is_empty());
     }
 }

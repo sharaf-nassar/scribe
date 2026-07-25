@@ -209,6 +209,13 @@ e2e-visual-ai-task-label:
 # client to adopt the harness session first.
 e2e-visual-workspace-ipc:
     docker run --rm --gpus all -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/workspace-ipc.sh
+# Run the clipboard / OSC 52 visual E2E. The wire tap records the prompt
+# response and the bridge read reply leaving the client, and the seeded config
+# puts both OSC 52 policy axes in prompt mode so the modal is exercised. The run
+# relaunches the client to adopt the harness session, so it needs a longer
+# budget than the default 60 s.
+e2e-visual-clipboard:
+    docker run --rm --gpus all -e TEST_TIMEOUT=240 -e SCRIBE_SHARE_TAP=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/clipboard-config.toml)" -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/clipboard-osc52.sh
 
 # Run the terminal-bell visual E2E. It needs the shared-pane rig so a real shell
 # can write the BEL byte into the very pane the client renders, and it minimizes

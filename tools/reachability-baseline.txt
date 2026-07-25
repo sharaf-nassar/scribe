@@ -25,23 +25,19 @@
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
 counts modules-total 64
-counts modules-wired 45
+counts modules-wired 49
 counts server-messages-total 59
-counts server-messages-handled 42
+counts server-messages-handled 45
 counts layout-actions-total 36
-counts layout-actions-handled 34
+counts layout-actions-handled 36
 
-unwired-module clipboard
-unwired-module clipboard_cleanup
 unwired-module divider
 unwired-module drag_drop
 unwired-module focus_border
 unwired-module lost_control
 unwired-module mouse_reporting
-unwired-module mouse_state
 unwired-module notification_dispatcher
 unwired-module palette
-unwired-module paste
 unwired-module preedit
 unwired-module remote
 unwired-module remote_handshake
@@ -52,9 +48,6 @@ unwired-module window_state
 unwired-module workspace_notes_preview
 
 unhandled-server-message ActionDispatched
-unhandled-server-message ClipboardBridgeReadRequest
-unhandled-server-message ClipboardBridgeWrite
-unhandled-server-message ClipboardPromptRequest
 unhandled-server-message EnvPreflightResult
 unhandled-server-message ReleaseList
 unhandled-server-message RemoteDisconnect
@@ -68,6 +61,3 @@ unhandled-server-message UpdateCheckResult
 unhandled-server-message WindowTakenOver
 unhandled-server-message WorkspaceNotesChanged
 unhandled-server-message WorkspaceNotesSnapshot
-
-unhandled-layout-action CopySelection
-unhandled-layout-action PasteClipboard
