@@ -45,6 +45,7 @@ pub mod ai_indicator;
 pub mod animation;
 pub mod bell;
 pub mod box_drawing;
+pub mod chrome_metadata;
 pub mod clipboard;
 pub mod clipboard_cleanup;
 pub mod color;

@@ -23,6 +23,7 @@ use gpui::{
 use gpui_platform::application;
 use scribe_client_gpui::ai_indicator::AiStateTracker;
 use scribe_client_gpui::animation::AnimationSettings;
+use scribe_client_gpui::chrome_metadata::{ChromeMetadata, SessionChrome};
 use scribe_client_gpui::command_palette::{
     CommandPaletteColors, CommandPaletteEvent, CommandPaletteView, build_entries,
 };
@@ -180,6 +181,9 @@ struct Shared {
     connected: Arc<AtomicBool>,
     /// AI state + prompt history driving the prompt bar and the tab context %.
     ai: Arc<Mutex<AiChrome>>,
+    /// Server-reported terminal chrome (CWD, git branch, session context, env
+    /// health, workspace names) driving the status bar's metadata segments.
+    chrome_metadata: Arc<Mutex<ChromeMetadata>>,
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -1097,28 +1101,51 @@ async fn drive_redraws(
 }
 
 impl TerminalView {
-    /// Build the status-bar segment model from the live connection / stats state.
+    /// Build the status-bar segment model from the live connection / stats
+    /// state and the server-reported chrome metadata for the attached pane.
+    ///
+    /// The metadata segments (workspace, CWD, git branch, env warning, tmux and
+    /// host labels) all read from the shared [`ChromeMetadata`] the IPC reader
+    /// fills from `CwdChanged` / `GitBranch` / `SessionContextChanged` /
+    /// `EnvStatus` / `WorkspaceNamed` and the `SessionList` snapshot, so a
+    /// segment is absent only when the server has nothing to report.
     fn build_status_model(&mut self) -> status_bar::StatusBarModel {
         let connected = self.shared.connected.load(Ordering::Acquire);
-        let session_count =
-            usize::from(self.shared.active_session.lock().ok().and_then(|guard| *guard).is_some());
+        let active_session = self.shared.active_session.lock().ok().and_then(|guard| *guard);
+        let session_count = usize::from(active_session.is_some());
+        // The strip is the only place the attached pane's workspace is known,
+        // and it is a different lock from the metadata store, so resolve the id
+        // (a `Copy`) and release it before reading the names.
+        let workspace_id = active_session.and_then(|session_id| {
+            let tabs = self.shared.tabs.lock().ok()?;
+            let entry = tabs.tabs().iter().find(|tab| tab.session_id == session_id)?;
+            Some(entry.workspace_id)
+        });
         // Refresh the sparkline sampler (internally rate-limited to 2 s) and
         // build the full segment model from the live data available so far.
         let sys_stats = self.stats.maybe_refresh();
+        let metadata = self.shared.chrome_metadata.lock().ok();
+        let metadata = metadata.as_deref();
+        let session =
+            active_session.zip(metadata).and_then(|(session_id, store)| store.session(session_id));
         status_bar::build_model(
             &StatusBarData {
                 connected,
-                workspace_name: None,
-                cwd: None,
-                git_branch: None,
+                workspace_name: workspace_id
+                    .zip(metadata)
+                    .and_then(|(id, store)| store.workspace_name(id)),
+                cwd: session.and_then(|chrome| chrome.cwd.as_deref()),
+                git_branch: session.and_then(|chrome| chrome.git_branch.as_deref()),
                 last_command_status: None,
-                env_status: None,
+                env_status: session.and_then(|chrome| chrome.env_status.as_ref()),
                 session_count,
                 remote: RemoteStatusData { enabled: false, controllers: &[] },
                 share_presence: None,
-                host_label: "local",
+                // A remote shell's own host wins; a local pane keeps the
+                // placeholder until the hostname surface lands.
+                host_label: session.and_then(SessionChrome::host_label).unwrap_or("local"),
                 remote_transport: None,
-                tmux_label: None,
+                tmux_label: session.and_then(SessionChrome::tmux_label),
                 time: "",
                 update_available: None,
                 update_progress: None,
@@ -1347,6 +1374,7 @@ fn main() {
         ai: Arc::new(Mutex::new(AiChrome::new(
             load_config().unwrap_or_default().terminal.ai_session.ai_states,
         ))),
+        chrome_metadata: Arc::new(Mutex::new(ChromeMetadata::new())),
     };
     let terminal_size = TerminalSize {
         cols: COLUMNS,
@@ -1502,6 +1530,7 @@ async fn run_connection(ctx: IpcThread) -> Result<(), String> {
             generation: ctx.shared.generation,
             active_session: ctx.shared.active_session,
             ai: ctx.shared.ai,
+            chrome_metadata: ctx.shared.chrome_metadata,
             tabs: ctx.shared.tabs,
             out_tx: ctx.out_tx,
             in_tx: ctx.in_tx,
@@ -1646,6 +1675,8 @@ struct ReaderCtx {
     active_session: Arc<Mutex<Option<SessionId>>>,
     /// AI state + prompt history the chrome renders from.
     ai: Arc<Mutex<AiChrome>>,
+    /// Server-reported terminal chrome the status bar renders from.
+    chrome_metadata: Arc<Mutex<ChromeMetadata>>,
     /// Ordered tab strip the reader rebuilds from server session traffic.
     tabs: Arc<Mutex<TabSessions>>,
     out_tx: UnboundedSender<ClientMessage>,
@@ -1662,6 +1693,20 @@ struct ReaderCtx {
 fn update_ai_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut AiChrome)) {
     let Ok(mut guard) = ctx.ai.lock() else {
         tracing::warn!("AI chrome mutex poisoned; dropping update");
+        return;
+    };
+    mutate(&mut guard);
+    drop(guard);
+    ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Apply `mutate` to the shared terminal-chrome metadata and request a repaint.
+///
+/// Same failure contract as [`update_ai_chrome`]: a poisoned mutex costs one
+/// status-bar segment update, never the pane's output stream.
+fn update_chrome_metadata(ctx: &ReaderCtx, mutate: impl FnOnce(&mut ChromeMetadata)) {
+    let Ok(mut guard) = ctx.chrome_metadata.lock() else {
+        tracing::warn!("chrome metadata mutex poisoned; dropping update");
         return;
     };
     mutate(&mut guard);
@@ -1784,6 +1829,7 @@ fn on_session_exited(
 ) -> Result<(), String> {
     let existed = registry.on_session_exited(session_id);
     update_ai_chrome(ctx, |ai| ai.forget(session_id));
+    update_chrome_metadata(ctx, |metadata| metadata.forget_session(session_id));
     let refocused = ctx.tabs.lock().ok().and_then(|mut tabs| tabs.remove(session_id));
     if let Some(next) = refocused {
         attach_session(ctx, next)?;
@@ -1829,7 +1875,8 @@ where
 /// the drop instead of discarding it in silence. Session-scoped output arms
 /// gate on `attached` inside the arm rather than in a match guard, so a frame
 /// for a background pane stays a deliberate no-op instead of being reported as
-/// an unhandled message.
+/// an unhandled message. The terminal-chrome family is named here but handled
+/// in [`on_chrome_message`], so this stays a table of routing decisions.
 fn dispatch_server_message(
     message: ServerMessage,
     ctx: &ReaderCtx,
@@ -1842,13 +1889,19 @@ fn dispatch_server_message(
             registry.adopt_window(window_id);
             tracing::debug!(adopted = ?registry.adopted_window(), "welcome: adopted window");
         }
-        ServerMessage::SessionList { sessions, .. } => {
+        ServerMessage::SessionList { sessions, workspaces, .. } => {
             registry.rebuild_from_session_list(&sessions);
             tracing::debug!(
                 sessions = registry.len(),
                 workspaces = registry.reconnect_topology().len(),
                 "rebuilt reconnect topology"
             );
+            // The list replays each pane's last-known CWD, branch and context,
+            // so a reattach restores the status bar without waiting for the
+            // next shell prompt to re-emit them.
+            update_chrome_metadata(ctx, |metadata| {
+                metadata.seed_from_session_list(&sessions, &workspaces);
+            });
             sync_tab_strip(ctx, &sessions, attached)?;
         }
         ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
@@ -1897,10 +1950,61 @@ fn dispatch_server_message(
                 forward_output(&ctx.in_tx, session_id, bytes);
             }
         }
+        // The terminal-chrome family all lands in the same two stores (the tab
+        // strip's labels and the shared metadata), so it is named here and
+        // routed as one to [`on_chrome_message`].
+        chrome @ (ServerMessage::TitleChanged { .. }
+        | ServerMessage::CwdChanged { .. }
+        | ServerMessage::GitBranch { .. }
+        | ServerMessage::SessionContextChanged { .. }
+        | ServerMessage::EnvStatus { .. }
+        | ServerMessage::WorkspaceNamed { .. }) => on_chrome_message(ctx, chrome),
         ServerMessage::Error { message } => set_status(&ctx.status, &ctx.generation, message),
         other => unhandled_server_message(&other),
     }
     Ok(())
+}
+
+/// Fold one terminal-chrome message onto the state the status bar and the tab
+/// strip render from.
+///
+/// These six variants are the server's only channel for a pane's title,
+/// working directory, git branch, shell/session context and env-capture
+/// health, and for a workspace's display name. Before they were wired the
+/// matching [`StatusBarData`] fields were hardcoded `None`, so every segment
+/// but the connection dot and the sparklines was dead.
+///
+/// Anything other than the chrome family is a programming error in
+/// [`dispatch_server_message`]'s routing, not a protocol event, so it is
+/// counted as unhandled rather than silently dropped.
+fn on_chrome_message(ctx: &ReaderCtx, message: ServerMessage) {
+    match message {
+        ServerMessage::TitleChanged { session_id, title } => {
+            // OSC 0/2 is the pane's own label; an empty title is the shell
+            // clearing it, which must not blank the tab down to nothing.
+            if !title.trim().is_empty()
+                && ctx.tabs.lock().is_ok_and(|mut tabs| tabs.set_title(session_id, title))
+            {
+                ctx.generation.fetch_add(1, Ordering::Release);
+            }
+        }
+        ServerMessage::CwdChanged { session_id, cwd } => {
+            update_chrome_metadata(ctx, |store| store.set_cwd(session_id, cwd));
+        }
+        ServerMessage::GitBranch { session_id, branch } => {
+            update_chrome_metadata(ctx, |store| store.set_git_branch(session_id, branch));
+        }
+        ServerMessage::SessionContextChanged { session_id, context } => {
+            update_chrome_metadata(ctx, |store| store.set_context(session_id, context));
+        }
+        ServerMessage::EnvStatus { session_id, state } => {
+            update_chrome_metadata(ctx, |store| store.set_env_status(session_id, state));
+        }
+        ServerMessage::WorkspaceNamed { workspace_id, name, .. } => {
+            update_chrome_metadata(ctx, |store| store.name_workspace(workspace_id, name));
+        }
+        other => unhandled_server_message(&other),
+    }
 }
 
 /// Add a freshly created session to the tab strip, focus it, and attach.

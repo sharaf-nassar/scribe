@@ -144,20 +144,20 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `SessionReplay` | reconnect replay | scripted-E2E | `main.rs::run_reader` arm → `session_lifecycle::decode_replay` | required |
 | `AiStateChanged` | AI indicator | visual-E2E | `main.rs::run_reader` arm → `ai_indicator::AiStateTracker::update` | required |
 | `AiStateCleared` | AI indicator | visual-E2E | `main.rs::run_reader` arm → `AiStateTracker::remove` + `AiStateTracker::clear_context` | required |
-| `CwdChanged` | tab metadata | scripted-E2E | — (missing, FU-2) — `StatusBarData.cwd` hardcoded `None` in `main.rs::build_status_model` | required |
-| `SessionContextChanged` | session metadata | scripted-E2E | — (missing, FU-2) | required |
-| `TitleChanged` | tab title | visual-E2E | — (missing, FU-2) — tab titles only ever come from `SessionList`/`SessionCreated` | required |
+| `CwdChanged` | tab metadata | scripted-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_cwd` → `StatusBarData.cwd` | required |
+| `SessionContextChanged` | session metadata | scripted-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_context` → `SessionChrome::host_label` / `SessionChrome::tmux_label` | required |
+| `TitleChanged` | tab title | visual-E2E | `main.rs::on_chrome_message` arm → `TabSessions::set_title` | required |
 | `CodexTaskLabelChanged` | Codex tab label | visual-E2E | — (missing, FU-3) | required |
 | `CodexTaskLabelCleared` | Codex tab label | visual-E2E | — (missing, FU-3) | required |
 | `TaskLabelChanged` | AI tab label | visual-E2E | — (missing, FU-3) | required |
 | `TaskLabelCleared` | AI tab label | visual-E2E | — (missing, FU-3) | required |
 | `PromptReceived` | prompt history | scripted-E2E | `main.rs::run_reader` arm → `AiChrome::record_prompt` | required |
-| `WorkspaceNamed` | workspace chrome | visual-E2E | — (missing, FU-2) — `StatusBarData.workspace_name` hardcoded `None` | required |
+| `WorkspaceNamed` | workspace chrome | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::name_workspace` → `StatusBarData.workspace_name` | required |
 | `SessionCreated` | pane lifecycle | scripted-E2E | `main.rs::run_reader` arm → `main.rs::open_created_tab` | required |
 | `SessionExited` | pane lifecycle | scripted-E2E | `main.rs::run_reader` arm → tab removal + `AiChrome::forget` | required |
 | `Bell` | terminal bell | manual | — (unwired, FU-22) — `bell.rs` outside the import closure | required |
 | `Error` | error presentation | visual-E2E | `main.rs::run_reader` arm → `main.rs::set_status` | required |
-| `GitBranch` | status/tab metadata | visual-E2E | — (missing, FU-2) — `StatusBarData.git_branch` hardcoded `None` | required |
+| `GitBranch` | status/tab metadata | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_git_branch` → `StatusBarData.git_branch` | required |
 | `SessionList` | startup/reconnect | scripted-E2E | `main.rs::run_reader` arm → `main.rs::sync_tab_strip` | required |
 | `WorkspaceInfo` | workspace layout | scripted-E2E | — (missing, FU-6) — only a doc-comment mention in `workspace_layout.rs` | required |
 | `WorkspaceNotesSnapshot` | workspace notes | scripted-E2E | — (missing, FU-21) — the modal sends `WorkspaceNotesGet` and never receives a reply | required |
@@ -177,7 +177,7 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `TrimScrollback` | terminal history | golden | `main.rs::run_reader` arm → `session_lifecycle::SessionRegistry::on_trim_scrollback` | required |
 | `ScrollBottom` | terminal viewport | scripted-E2E | — (missing, FU-7) | required |
 | `EnvPreflightResult` | environment settings | scripted-E2E | — (unwired, FU-18) — parsed in `settings/server_action.rs`, but its request function has no caller | required |
-| `EnvStatus` | environment status | visual-E2E | — (missing, FU-2) — `StatusBarData.env_status` hardcoded `None` | required |
+| `EnvStatus` | environment status | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_env_status` → `StatusBarData.env_status` | required |
 | `ClipboardPromptRequest` | OSC 52 dialog | visual-E2E | — (missing, FU-8) — the `ClipboardDialog` demo is built from literals | required |
 | `ClipboardBridgeWrite` | OSC 52 bridge | scripted-E2E | — (unwired, FU-8) — handled in `clipboard.rs`, outside the import closure | required |
 | `ClipboardBridgeReadRequest` | OSC 52 bridge | scripted-E2E | — (unwired, FU-8) — handled in `clipboard.rs`, outside the import closure | required |

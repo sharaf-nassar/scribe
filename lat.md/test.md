@@ -637,6 +637,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Font zoom | [[test#GPUI Font Zoom]] | "Zoom in/out/reset" View keybinding actions |
 | OSC 52 clipboard bridge | [[test#GPUI OSC 52 Clipboard Bridge]] | `ClipboardPromptResponse`, `ClipboardBridgeReadReply`, `ClipboardBridgeWrite`, `ClipboardBridgeReadRequest` OSC 52 bridge |
 | Notification dispatcher | [[test#GPUI Notification Dispatcher]] | Notification `replaces_id` coalescing + click-to-focus |
+| Terminal chrome metadata | [[test#GPUI Client Headless Suites#GPUI terminal chrome metadata]] | `CwdChanged`, `GitBranch`, `EnvStatus`, `SessionContextChanged`, `WorkspaceNamed` status-bar segments |
 
 ### Coverage frontier
 
@@ -669,6 +670,24 @@ Driving each action from its default binding, the suite asserts every one of the
 Locks the selection rules of [[crates/scribe-client-gpui/src/tab_session.rs#TabSessions]], the ordered strip the shell's tab shortcuts and the IPC reader both mutate, so a tab's label and the attached session can never disagree.
 
 The suite drives the shortcut side — [[crates/scribe-client-gpui/src/tab_session.rs#TabSessions#insert_active]] appends and focuses a new tab, `focus_next`/`focus_prev` wrap in both directions, `select` jumps by index and reports no change for an out-of-range or already-active position — and the server side, where [[crates/scribe-client-gpui/src/tab_session.rs#TabSessions#replace_all]] preserves the focused session across a `SessionList` rebuild (falling back to the first tab when it is gone) and `remove` clamps the cursor as tabs exit. One case guards the attach feedback loop: because the server re-announces `SessionCreated` to acknowledge every `AttachSessions`, `insert_active` must report a known session as "not added" and leave the selection untouched.
+
+### GPUI terminal chrome metadata
+
+Locks the per-session merge rules of [[crates/scribe-client-gpui/src/chrome_metadata.rs#ChromeMetadata]], the store the IPC reader fills from the terminal-chrome messages and the status bar reads once per frame.
+
+The suite writes a CWD, branch and env status for one session and a CWD for another, then asserts the fields land independently, that a sibling pane's update never leaks across, that `set_git_branch(None)` really clears the segment (the server sends it when the CWD leaves a repository, so treating `None` as a no-op would strand a stale branch), and that [[crates/scribe-client-gpui/src/chrome_metadata.rs#ChromeMetadata#forget_session]] drops only the exited session.
+
+### GPUI terminal chrome labels
+
+Verifies that [[crates/scribe-client-gpui/src/chrome_metadata.rs#SessionChrome#host_label]] and [[crates/scribe-client-gpui/src/chrome_metadata.rs#SessionChrome#tmux_label]] lower a `SessionContext` onto the status bar the way the legacy client's `frame_status_snapshot` did.
+
+A context with `remote: false` yields no host label — a local pane must keep this machine's own name — while still exposing its tmux session, a remote context yields the host, and a remote context with an empty host falls back to the local label rather than rendering a blank segment.
+
+### GPUI workspace naming and reseed
+
+Covers [[crates/scribe-client-gpui/src/chrome_metadata.rs#ChromeMetadata#seed_from_session_list]] and [[crates/scribe-client-gpui/src/chrome_metadata.rs#ChromeMetadata#name_workspace]], the two paths that repopulate the chrome after a reattach instead of waiting for the next shell prompt.
+
+Seeding from an authoritative `SessionList` adopts the listed CWD and context, leaves a live branch the list omits untouched (the list is a snapshot, not a transition), prunes any session missing from it, and takes each workspace name from the batched `workspaces` entries. A rename to whitespace clears the workspace segment rather than rendering an empty one.
 
 ### Config load with removed keys
 
