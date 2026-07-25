@@ -84,6 +84,7 @@ pub mod selection;
 pub mod server_lifecycle;
 pub mod settings;
 pub mod share;
+pub mod share_join;
 pub mod smart_selection;
 pub mod split_scroll;
 pub mod status_bar;

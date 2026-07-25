@@ -2087,8 +2087,21 @@ async fn run_connection(ctx: IpcThread) -> Result<(), String> {
     let (reader, writer) = stream.into_split();
 
     // Handshake is queued ahead of any sink traffic on the same ordered channel.
+    // `SCRIBE_JOIN_WINDOW` (unset for a user-launched client) names a window
+    // another local process already holds: the server resolves that non-takeover
+    // claim as an additive share join under any non-`single_controller` sharing
+    // mode, so this client renders and types into the SAME panes instead of
+    // opening an empty window of its own.
+    let join_window = scribe_client_gpui::share_join::join_window_from_env();
+    if let Some(window_id) = join_window {
+        tracing::info!(%window_id, "joining an existing window's share");
+    }
     ctx.out_tx
-        .send(ClientMessage::Hello { window_id: None, clipboard_gating: false, takeover: false })
+        .send(ClientMessage::Hello {
+            window_id: join_window,
+            clipboard_gating: false,
+            takeover: false,
+        })
         .map_err(|_| "writer channel closed".to_owned())?;
     ctx.out_tx.send(ClientMessage::ListSessions).map_err(|_| "writer channel closed".to_owned())?;
 
@@ -2905,6 +2918,11 @@ fn tab_entry_for(info: &SessionInfo) -> TabEntry {
 /// a subscription for an unattached session, which the shared ordered writer
 /// channel makes impossible by construction.
 fn attach_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> {
+    // Logged (not just surfaced in the status bar) because "the client is
+    // showing a live pane" is the readiness gate the visual E2E rig waits on
+    // before it drives the window; a screenshot cannot tell an unattached
+    // client from an idle one.
+    tracing::info!(%session_id, "attaching to session");
     ctx.out_tx
         .send(ClientMessage::AttachSessions {
             session_ids: vec![session_id],

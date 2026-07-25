@@ -39,6 +39,23 @@ wait_for_window() {
     done
 }
 
+wait_for_log() {
+    local pattern="$1"
+    local timeout_secs="${2:-15}"
+    local started
+    started=$(date +%s)
+    while true; do
+        if grep -qF "$pattern" "$SCRIBE_CLIENT_LOG" 2>/dev/null; then
+            return 0
+        fi
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            echo "Timed out waiting for client log line: $pattern" >&2
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
 prepare_xdg_dirs() {
     export XDG_CONFIG_HOME="$TEST_HOME/.config"
     export XDG_DATA_HOME="$TEST_HOME/.local/share"
@@ -80,6 +97,24 @@ export SCRIBE_TEST_SERVER_LOG=/output/server.log
 export SCRIBE_SERVER_LOG=/output/server.log
 : >"$SCRIBE_SERVER_LOG"
 
+# Config is assembled BEFORE the server starts, because both processes read the
+# same file and only one of them re-reads it: the client picks its keys up at
+# launch (and again through its watcher), while `[remote].sharing_mode` is read
+# by the server's remote supervisor on startup.
+#
+#   SCRIBE_EXTRA_CONFIG — opt-in client settings for a single test
+#                         (e.g. terminal.paste_confirmation).
+#   SCRIBE_SHARED_PANE  — the shared-pane rig (see below). Appended last so its
+#                         `[remote]` header can never swallow keys that belong
+#                         to a table SCRIBE_EXTRA_CONFIG opened.
+CONFIG_FILE="$XDG_CONFIG_HOME/scribe/config.toml"
+if [ -n "${SCRIBE_EXTRA_CONFIG:-}" ]; then
+    printf '%s\n' "$SCRIBE_EXTRA_CONFIG" > "$CONFIG_FILE"
+fi
+if [ "${SCRIBE_SHARED_PANE:-0}" = "1" ]; then
+    printf '\n[remote]\nsharing_mode = "free_for_all"\n' >> "$CONFIG_FILE"
+fi
+
 scribe-test server start
 SERVER_STARTED=1
 
@@ -111,27 +146,51 @@ case "$VISUAL_APP" in
                 sleep 0.1
             done
         fi
-        # Optional: seed a config.toml before the client starts so tests can
-        # exercise opt-in settings (e.g. terminal.paste_confirmation). No-op
-        # when unset, so existing visual tests are unaffected.
-        if [ -n "${SCRIBE_EXTRA_CONFIG:-}" ]; then
-            printf '%s\n' "$SCRIBE_EXTRA_CONFIG" > "$XDG_CONFIG_HOME/scribe/config.toml"
-        fi
         # GPUI renders through blade/Vulkan; the Dockerfile pins
         # VK_ICD_FILENAMES to lavapipe (software) so no GPU is required.
         # LIBGL_ALWAYS_SOFTWARE keeps any GL fallback off hardware too.
         export LIBGL_ALWAYS_SOFTWARE=1
+        export SCRIBE_CLIENT_LOG=/output/client.log
+        # Shared-pane rig: create the session FIRST, then start the client as a
+        # second participant in the daemon's window.
+        #
+        # The default order below (client first, session second) leaves the
+        # client blind: the server sends `SessionCreated` only to the connection
+        # that asked for it, and `ListSessions` answers a window with its OWN
+        # sessions, so a client that got its own window renders an empty grid
+        # while the daemon's pane runs untouched. Handing the client the
+        # daemon's window id closes that gap without evicting the daemon: under
+        # `sharing_mode = "free_for_all"` the server resolves a non-takeover
+        # claim of a connected window as an ADDITIVE join, so both processes
+        # stay attached to the same pane — the client renders and types into it,
+        # and `scribe-test send` / `wait-output` / `snapshot` keep working
+        # against the very pane on screen.
+        if [ "${SCRIBE_SHARED_PANE:-0}" = "1" ]; then
+            SESSION=$(scribe-test session create)
+            export SESSION
+            SCRIBE_JOIN_WINDOW=$(scribe-test daemon window-id)
+            export SCRIBE_JOIN_WINDOW
+        fi
         # Persist the client's tracing output so scripted tests can assert on
         # runtime behaviour that leaves no pixels behind (e.g. the config
         # watcher's "config hot-reloaded" line) instead of guessing from a
         # screenshot diff.
-        scribe-client-gpui >/output/client.log 2>&1 &
+        scribe-client-gpui >"$SCRIBE_CLIENT_LOG" 2>&1 &
         APP_PID=$!
         export SCRIBE_CLIENT_PID="$APP_PID"
-        export SCRIBE_CLIENT_LOG=/output/client.log
         wait_for_window "Scribe" 15 || true
-        SESSION=$(scribe-test session create)
-        export SESSION
+        if [ "${SCRIBE_SHARED_PANE:-0}" = "1" ]; then
+            # Attaching is a full Hello / ListSessions / AttachSessions /
+            # SessionReplay round trip. Gate on the client's own "attaching to
+            # session" line so the test body never drives a window that is still
+            # an empty grid — a failure mode a screenshot cannot distinguish
+            # from an idle pane.
+            wait_for_log "attaching to session" 20 \
+                || echo "WARNING: client never logged an attach" >&2
+        else
+            SESSION=$(scribe-test session create)
+            export SESSION
+        fi
         ;;
     *)
         echo "Unsupported SCRIBE_VISUAL_APP value: $VISUAL_APP" >&2

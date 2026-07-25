@@ -24,7 +24,7 @@ After connecting to scribe-server, the daemon sends `ClientMessage::Hello { wind
 
 Per-session data buffered in [[crates/scribe-test/src/daemon.rs#SessionState]]: 65 KB output ring buffer, `latest_snapshot` with 100 ms TTL, `last_output_at` for idle detection, `cwd`, `title`, and `SessionStatus` (`Running` or `Exited`).
 
-All sessions are keyed by `SessionId` inside [[crates/scribe-test/src/daemon.rs#DaemonState]], which also tracks `last_workspace_id` and `last_session_created` for workspace and session-create responses.
+All sessions are keyed by `SessionId` inside [[crates/scribe-test/src/daemon.rs#DaemonState]], which also tracks `last_workspace_id` and `last_session_created` for workspace and session-create responses, plus the `window_id` the server assigned in its `Welcome`.
 
 ### Request Handling
 
@@ -42,9 +42,11 @@ Request/response protocol between the CLI and daemon over a Unix socket at `/run
 
 The socket path is returned by [[crates/scribe-test/src/cmd_socket.rs#daemon_socket_path]]. The helper [[crates/scribe-test/src/cmd_socket.rs#send_request]] creates a short-lived tokio runtime, connects, sends one [[crates/scribe-test/src/cmd_socket.rs#DaemonRequest]], and receives one [[crates/scribe-test/src/cmd_socket.rs#DaemonResponse]].
 
-Key request variants: `CreateSession`, `AttachSession`, `CloseSession`, `Send`, `Resize`, `RequestScreenshot`, `RequestSnapshot`, `WaitOutput`, `WaitCwd`, `WaitIdle`, `AssertCell`, `AssertCursor`, `AssertExit`, `AssertSnapshotMatch`, and `Shutdown`.
+Key request variants: `CreateSession`, `AttachSession`, `CloseSession`, `Send`, `Resize`, `RequestScreenshot`, `RequestSnapshot`, `WaitOutput`, `WaitCwd`, `WaitIdle`, `AssertCell`, `AssertCursor`, `AssertExit`, `AssertSnapshotMatch`, `WindowId`, and `Shutdown`.
 
-Key response variants: `Ok`, `SessionCreated { session_id }`, `ScreenshotData { snapshot }`, `AssertFailed { message }`, and `Error { message }`.
+Key response variants: `Ok`, `SessionCreated { session_id }`, `ScreenshotData { snapshot }`, `WindowId { window_id }`, `AssertFailed { message }`, and `Error { message }`.
+
+`WindowId` (surfaced as `scribe-test daemon window-id`, printed by [[crates/scribe-test/src/session.rs#print_window_id]]) exists so a second process can be pointed at the daemon's window instead of claiming one of its own — the join target the shared-pane visual rig passes to the GPUI client as `SCRIBE_JOIN_WINDOW` ([[test#Visual E2E Tests#Shared-pane rig]]). It errors rather than returning a placeholder when no `Welcome` has arrived, because joining "no window" would silently reproduce the empty-window bug it exists to prevent.
 
 ## Session Management
 
@@ -182,7 +184,7 @@ Scripted degraded-path coverage proving the client fails loudly (never hangs) wh
 
 Visual end-to-end tests run the real `scribe-client-gpui` window headlessly (`docker/Dockerfile.visual`) and assert against screenshots written to `/output`.
 
-`docker/entrypoint-visual.sh` starts Xvfb, an `openbox` window manager, `scribe-server`, the daemon, and the GPUI client, then runs the test script. The image also ships `scribe-hook-helper` and the entrypoint exports `SCRIBE_RUNTIME_DIR`, so a test that needs a provider event (task label, AI state, context %) drives the real hook channel instead of forging a frame. The image pins `VK_ICD_FILENAMES` to lavapipe's software Vulkan ICD (shipped in `mesa-vulkan-drivers`) so the client renders deterministically with no GPU, and sets `SCRIBE_DISABLE_ANIMATIONS=1` so consecutive frames are byte-identical. Tests drive the client through `xdotool`/`xclip` and capture frames with `scrot`. An optional `SCRIBE_EXTRA_CONFIG` env var seeds `config.toml` before the client starts so a test can exercise opt-in settings (e.g. `terminal.paste_confirmation`).
+`docker/entrypoint-visual.sh` starts Xvfb, an `openbox` window manager, `scribe-server`, the daemon, and the GPUI client, then runs the test script. The image also ships `scribe-hook-helper` and the entrypoint exports `SCRIBE_RUNTIME_DIR`, so a test that needs a provider event (task label, AI state, context %) drives the real hook channel instead of forging a frame. The image pins `VK_ICD_FILENAMES` to lavapipe's software Vulkan ICD (shipped in `mesa-vulkan-drivers`) so the client renders deterministically with no GPU, and sets `SCRIBE_DISABLE_ANIMATIONS=1` so consecutive frames are byte-identical. Tests drive the client through `xdotool`/`xclip` and capture frames with `scrot`. An optional `SCRIBE_EXTRA_CONFIG` env var seeds `config.toml` before the *server* starts so a test can exercise opt-in settings (e.g. `terminal.paste_confirmation`); the shared-pane rig appends to the same file, which is why both are written up front rather than one clobbering the other.
 
 The client's stderr is redirected to `/output/client.log` and its pid and log path are exported as `SCRIBE_CLIENT_PID` / `SCRIBE_CLIENT_LOG`, so a script can assert on runtime behaviour that leaves no pixels behind and can prove the process never restarted. `RUST_LOG` defaults to `scribe_server=info,scribe_client_gpui=info` so those client lines are actually emitted.
 
@@ -192,11 +194,25 @@ The GPUI client sets its X11 `WM_NAME`/`_NET_WM_NAME` to `Scribe` via [[crates/s
 
 `openbox` is required, not cosmetic: [[crates/scribe-client-gpui/src/x11_focus.rs#X11FocusGuard]] runs on the client's live key path and suppresses synthetic key input whenever `_NET_ACTIVE_WINDOW` does not name the client window, and only a window manager sets that root property under Xvfb. Without a WM, `xdotool`-driven visual tests cannot type.
 
+Screenshots are taken full-screen because a Vulkan surface may not be readable per-window, so any test that measures pixels must crop to the client window first. The WM title bar is a saturated light blue that on its own clears a "hundreds of colored pixels" threshold — an uncropped measurement passed for months over a completely black grid.
+
+### Shared-pane rig
+
+`SCRIBE_SHARED_PANE=1` (`just e2e-visual-shared <script>`) is how a visual test gets a live pane that BOTH the GPUI client and `scribe-test` can see. Without it the client is blind to the harness's session and the harness is blind to the client's.
+
+By default `docker/entrypoint-visual.sh` launches the client and only then runs `scribe-test session create`. The server sends `SessionCreated` solely to the connection that asked for it, and [[crates/scribe-server/src/ipc_server.rs#handle_list_sessions]] answers a window with its OWN sessions (falling back to unowned ones), so the running client never learns the daemon's session exists — it renders an empty grid while the pane the test drives runs untouched. That is what made the emoji check a false pass and left the reconnect capture unasserted.
+
+Under `SCRIBE_SHARED_PANE=1` the entrypoint instead seeds `[remote] sharing_mode = "free_for_all"` into `config.toml` *before* the server starts, creates the session first, reads the daemon's window id with `scribe-test daemon window-id`, and passes it to the client as `SCRIBE_JOIN_WINDOW`. The client's `Hello` names that window, the server resolves it as a local additive share join ([[server#Remote Control#Sharing#Local Additive Join]]), and the client's `AttachSessions` ADDS its sink alongside the daemon's. Both stay attached: the window under the camera shows the pane, and `scribe-test send` / `wait-output` / `snapshot` still work against it. `free_for_all` (rather than `shared_single_typist`) is the mode because both participants must be able to type — the harness through `KeyInput`, the user's simulated input through the client.
+
+The entrypoint gates on the client's own `attaching to session` line before running the test body, so a script never drives a window that is still an empty grid — a state no screenshot can distinguish from an idle pane.
+
 ### Color emoji renders in color
 
 `tests/e2e/visual/color-emoji.sh` proves color emoji render in color rather than as monochrome/tinted glyphs — the US3 headline parity item promoted to an automated visual check.
 
-It prints a grid of solid color-block and pictographic emoji, screenshots the frame, and asserts via ImageMagick's HSL saturation channel that a strongly-saturated pixel count clears a floor. A monochrome/tinted fallback tints every glyph the pale foreground color, so its saturated-pixel count collapses to near zero.
+It runs on the [[test#Visual E2E Tests#Shared-pane rig]], so the emoji it sends through `scribe-test` reach the window it photographs. It prints a grid of solid color-block and pictographic emoji, waits for the sentinel to echo back on the PTY, crops the capture to the client window, and asserts via ImageMagick's HSL saturation channel that a strongly-saturated pixel count clears a floor. A monochrome/tinted fallback tints every glyph the pale foreground color, so its saturated-pixel count collapses to near zero.
+
+A lit-pixel phase runs first and fails separately when the window holds no pane content at all. Both guards exist because this script previously reported ~980 saturated pixels — comfortably over its 300 floor — against a completely black grid: the client was attached to nothing, and every one of those pixels came from the openbox title bar outside the window crop.
 
 `tests/e2e/visual/paste-confirmation.sh` verifies the spec-011 paste gate ([[client#Dialogs#Paste Confirmation Dialog]]): a single-line paste carrying control/escape bytes pops the confirmation with a caret-escaped preview (`^[`), while a plain single line and a tab-separated line paste straight through without a dialog.
 
@@ -204,11 +220,11 @@ It prints a grid of solid color-block and pictographic emoji, screenshots the fr
 
 `tests/e2e/visual/overlay-actions.sh` is the scripted oracle for [[client#GPUI Overlays#Overlay Action Routing]]: it asserts the *effect* of a chosen palette or context-menu row, which no headless test over the overlay models can reach.
 
-The overlay models passed their unit suites the whole time the shell was dropping their events, so a green `#[gpui::test]` proves nothing about reachability here. The script instead drives the live window once per action class. It right-clicks the grid and clicks the smart-selection row, then asserts that the echoed command and the shell's answer appear as new lit pixels in the window — the row reached the attached pane's PTY. It opens the palette, filters to "New Tab", confirms, and waits for a new `opened a new tab` line, which the client only ever writes after `CreateSession` comes back as `SessionCreated`. Finally it confirms "Open Settings", whose destination window is not ported yet, and asserts the named `action not wired into the GPUI shell` warning appears: the row reached the shared dispatcher instead of dying at the subscription.
+The overlay models passed their unit suites the whole time the shell was dropping their events, so a green `#[gpui::test]` proves nothing about reachability here. The script instead drives the live window once per action class. It right-clicks the grid and clicks the smart-selection row, then asserts the row's exact payload lands on the session's PTY (`scribe-test wait-output`) AND that the echoed command and the shell's answer appear as new lit pixels — the first names the bytes, the second proves they also reached the window on screen. It opens the palette, filters to "New Tab", confirms, and waits for a new `opened a new tab` line, which the client only ever writes after `CreateSession` comes back as `SessionCreated`. Finally it confirms "Open Settings", whose destination window is not ported yet, and asserts the named `action not wired into the GPUI shell` warning appears: the row reached the shared dispatcher instead of dying at the subscription.
 
 The context-menu row is clicked at a pixel offset calibrated against the captured frame, so a layout change to the menu box shows up as a failing phase rather than a silent miss.
 
-A phase 0 preamble exists because the harness cannot otherwise give the client a pane to act in. `docker/entrypoint-visual.sh` creates `$SESSION` through `scribe-test` *after* launching the client, the server answers `SessionCreated` only on the connection that asked, and [[crates/scribe-server/src/ipc_server.rs#handle_list_sessions]] hides sessions owned by another window — so the running client never learns the session exists and a plain relaunch still sees nothing. Stopping the test daemon releases that window ownership, after which a relaunched client picks the session up over the normal `ListSessions` path. The trade is that `scribe-test` can no longer observe the session either, which is why the pane assertions read pixels rather than server-side output.
+It runs on the [[test#Visual E2E Tests#Shared-pane rig]]. The script used to open with a phase 0 that killed the client, ran `scribe-test daemon stop` to release the window ownership hiding the session, and relaunched — the only way to get a pane in front of the camera before that rig existed, and one that cost every server-side assertion because `wait-output` needs the daemon it had just stopped. That preamble is gone; phase 0 now only confirms the shared pane is painted before any action is driven at it.
 
 ### Tab and window chords reach their actions
 
@@ -727,6 +743,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Lost control banner | [[test#GPUI Client Headless Suites#GPUI lost control banner]] | `WindowTakenOver` displaced-client reclaim |
 | LAN device approval | [[test#GPUI Client Headless Suites#GPUI LAN device approval]] | `LanApprovalRequest`/`LanApprovalDecision` prompt |
 | Window sharing | [[test#GPUI Client Headless Suites#GPUI window sharing]] | `ShareRoster`, `ControlClaim`/`ControlRequest`/`ControlGrant` |
+| Local share join | [[test#GPUI Client Headless Suites#GPUI local share join]] | `Hello` window claim (harness plumbing, no parity row) |
 | Pane dividers | [[test#GPUI Pane Dividers]] | "Pane divider drag-resize" chrome |
 | Focus borders | [[test#GPUI Focus Borders]] | "Focused pane/workspace border" chrome |
 | Split-scroll | [[test#GPUI Split-Scroll]] | "Split-scroll live-bottom pin" AI-pane chrome |
@@ -984,6 +1001,12 @@ While a `ControlRequested` prompt is pending every other key is swallowed, so no
 #### Self id resolves the local seat
 
 The `participant_id` carried by `Welcome` wins over the roster's `is_local` flag when resolving which seat is this connection, so a client seated as a non-local participant still reads its own holder state correctly.
+
+### GPUI local share join
+
+Locks the [[crates/scribe-client-gpui/src/share_join.rs#parse_join_window]] hook that decides whether this client claims a window of its own or joins one another local process already holds — the client half of the shared-pane rig ([[test#Visual E2E Tests#Shared-pane rig]]).
+
+A full UUID (with or without surrounding whitespace) parses to that `WindowId`; empty, blank, non-UUID, and the short `Display` label (`win-1234abcd`) all yield `None`, which leaves the stock `Hello { window_id: None }` handshake in place rather than failing the launch. The env read itself is not exercised — the workspace lints ban `set_var` — so the parser is called directly.
 
 ## GPUI Pane Dividers
 
