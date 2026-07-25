@@ -23,6 +23,10 @@ check:
 lint-suppressions:
     tools/check-no-new-lint-suppressions.sh --working-tree
 
+# Ratchet how much of the GPUI client the running binary can actually reach.
+reachability:
+    tools/check-reachability.sh --working-tree
+
 # Lint (strict clippy config)
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -38,6 +42,7 @@ test:
 # Pre-commit gate: fmt, lint, test
 ready:
     just lint-suppressions
+    just reachability
     just fmt
     just clippy
     just test

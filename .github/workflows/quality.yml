@@ -41,3 +41,8 @@ jobs:
         run: |
           tools/check-no-new-lint-suppressions.sh \
             --range "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"
+
+      - name: Check GPUI client reachability
+        run: |
+          tools/check-reachability.sh \
+            --range "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"

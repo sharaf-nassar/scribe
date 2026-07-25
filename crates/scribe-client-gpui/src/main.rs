@@ -62,6 +62,7 @@ use scribe_common::{
     protocol::{
         ArchiveReason, ClientMessage, ServerMessage, SessionInfo, TerminalSize, WorkspaceNoteStatus,
     },
+    screen_replay::SessionReplay,
     socket::server_socket_path,
 };
 use tokio::{
@@ -446,6 +447,11 @@ impl TerminalView {
     /// pane/workspace/navigation families are still swallowed (never forwarded
     /// to the PTY) because the shell has no pane tree yet, matching the legacy
     /// client's behaviour of never leaking a bound shortcut as terminal bytes.
+    ///
+    /// The match is exhaustive and the swallowed variants are named one by one
+    /// rather than folded into a `_` arm: a new [`LayoutAction`] then fails to
+    /// compile here instead of silently joining the dropped set, and every drop
+    /// that does happen is counted and warned by [`unhandled_layout_action`].
     fn handle_layout_action(&mut self, action: LayoutAction, cx: &mut Context<Self>) {
         match action {
             LayoutAction::NewTab => self.create_tab(None),
@@ -467,7 +473,33 @@ impl TerminalView {
                 self.switch_tab(move |tabs| tabs.select(index), cx);
             }
             LayoutAction::CloseTab => self.close_active_tab(),
-            _ => tracing::debug!(?action, "layout action not yet wired in the GPUI shell"),
+            LayoutAction::SplitVertical
+            | LayoutAction::SplitHorizontal
+            | LayoutAction::ClosePane
+            | LayoutAction::FocusNext
+            | LayoutAction::FocusLeft
+            | LayoutAction::FocusRight
+            | LayoutAction::FocusUp
+            | LayoutAction::FocusDown
+            | LayoutAction::WorkspaceSplitVertical
+            | LayoutAction::WorkspaceSplitHorizontal
+            | LayoutAction::WorkspaceFocusLeft
+            | LayoutAction::WorkspaceFocusRight
+            | LayoutAction::WorkspaceFocusUp
+            | LayoutAction::WorkspaceFocusDown
+            | LayoutAction::NewWindow
+            | LayoutAction::CopySelection
+            | LayoutAction::PasteClipboard
+            | LayoutAction::ScrollUp
+            | LayoutAction::ScrollDown
+            | LayoutAction::ScrollTop
+            | LayoutAction::ScrollBottom
+            | LayoutAction::PromptJumpUp
+            | LayoutAction::PromptJumpDown
+            | LayoutAction::JumpToFailure
+            | LayoutAction::ZoomIn
+            | LayoutAction::ZoomOut
+            | LayoutAction::ZoomReset => unhandled_layout_action(action),
         }
     }
 
@@ -1534,6 +1566,142 @@ fn update_ai_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut AiChrome)) {
     ctx.generation.fetch_add(1, Ordering::Release);
 }
 
+/// Running total of inbound [`ServerMessage`]s the live reader dropped.
+///
+/// Incremented by [`unhandled_server_message`]. The GPUI client acts on a
+/// minority of the protocol, and before this counter existed the rest vanished
+/// into a `_ => {}` arm, so an unimplemented surface was indistinguishable from
+/// a working one. A non-zero value after an end-to-end run is the signal that a
+/// feature is present on the wire and absent from the client.
+static UNHANDLED_SERVER_MESSAGES: AtomicU64 = AtomicU64::new(0);
+
+/// Running total of [`LayoutAction`]s the shell intercepted but cannot run.
+///
+/// Incremented by [`unhandled_layout_action`]. The key path claims a bound
+/// chord before it can reach the PTY, so a swallowed action is invisible to the
+/// user: nothing happens and nothing is typed.
+static UNHANDLED_LAYOUT_ACTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Name, count, and warn about an inbound message the live reader drops.
+fn unhandled_server_message(message: &ServerMessage) {
+    let dropped = UNHANDLED_SERVER_MESSAGES.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!(
+        variant = server_message_variant(message),
+        dropped,
+        "server message not wired into the GPUI client"
+    );
+}
+
+/// Count and warn about a bound layout action the shell cannot execute.
+fn unhandled_layout_action(action: LayoutAction) {
+    let dropped = UNHANDLED_LAYOUT_ACTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!(?action, dropped, "layout action not wired into the GPUI shell");
+}
+
+/// Wire name of a [`ServerMessage`] variant, for the unhandled-message warning.
+///
+/// The match is deliberately exhaustive and deliberately not shortened with a
+/// `_` arm: it is the compile-time half of the reachability gate. Adding a
+/// protocol variant breaks this build until someone names it, at which point
+/// `tools/check-reachability.sh` requires the variant to be either handled by
+/// [`dispatch_server_message`] or recorded in the unhandled baseline.
+fn server_message_variant(message: &ServerMessage) -> &'static str {
+    match message {
+        ServerMessage::PtyOutput { .. } => "PtyOutput",
+        ServerMessage::ScreenSnapshot { .. } => "ScreenSnapshot",
+        ServerMessage::SessionReplay { .. } => "SessionReplay",
+        ServerMessage::AiStateChanged { .. } => "AiStateChanged",
+        ServerMessage::AiStateCleared { .. } => "AiStateCleared",
+        ServerMessage::CwdChanged { .. } => "CwdChanged",
+        ServerMessage::SessionContextChanged { .. } => "SessionContextChanged",
+        ServerMessage::TitleChanged { .. } => "TitleChanged",
+        ServerMessage::CodexTaskLabelChanged { .. } => "CodexTaskLabelChanged",
+        ServerMessage::CodexTaskLabelCleared { .. } => "CodexTaskLabelCleared",
+        ServerMessage::TaskLabelChanged { .. } => "TaskLabelChanged",
+        ServerMessage::TaskLabelCleared { .. } => "TaskLabelCleared",
+        ServerMessage::PromptReceived { .. } => "PromptReceived",
+        ServerMessage::WorkspaceNamed { .. } => "WorkspaceNamed",
+        ServerMessage::SessionCreated { .. } => "SessionCreated",
+        ServerMessage::SessionExited { .. } => "SessionExited",
+        ServerMessage::Bell { .. } => "Bell",
+        ServerMessage::Error { .. } => "Error",
+        ServerMessage::GitBranch { .. } => "GitBranch",
+        ServerMessage::SessionList { .. } => "SessionList",
+        ServerMessage::WorkspaceInfo { .. } => "WorkspaceInfo",
+        ServerMessage::WorkspaceNotesSnapshot { .. } => "WorkspaceNotesSnapshot",
+        ServerMessage::WorkspaceNotesChanged { .. } => "WorkspaceNotesChanged",
+        ServerMessage::SearchResults { .. } => "SearchResults",
+        ServerMessage::Welcome { .. } => "Welcome",
+        ServerMessage::WindowClosed { .. } => "WindowClosed",
+        ServerMessage::WindowList { .. } => "WindowList",
+        ServerMessage::RunAction { .. } => "RunAction",
+        ServerMessage::ActionDispatched { .. } => "ActionDispatched",
+        ServerMessage::QuitRequested => "QuitRequested",
+        ServerMessage::UpdateAvailable { .. } => "UpdateAvailable",
+        ServerMessage::UpdateProgress { .. } => "UpdateProgress",
+        ServerMessage::UpdateCheckResult { .. } => "UpdateCheckResult",
+        ServerMessage::ReleaseList { .. } => "ReleaseList",
+        ServerMessage::PromptMark { .. } => "PromptMark",
+        ServerMessage::TrimScrollback { .. } => "TrimScrollback",
+        ServerMessage::ScrollBottom { .. } => "ScrollBottom",
+        ServerMessage::EnvPreflightResult { .. } => "EnvPreflightResult",
+        ServerMessage::EnvStatus { .. } => "EnvStatus",
+        ServerMessage::ClipboardPromptRequest { .. } => "ClipboardPromptRequest",
+        ServerMessage::ClipboardBridgeWrite { .. } => "ClipboardBridgeWrite",
+        ServerMessage::ClipboardBridgeReadRequest { .. } => "ClipboardBridgeReadRequest",
+        ServerMessage::RemoteHandshakeReply { .. } => "RemoteHandshakeReply",
+        ServerMessage::WindowTakenOver { .. } => "WindowTakenOver",
+        ServerMessage::RemoteDisconnect { .. } => "RemoteDisconnect",
+        ServerMessage::RemotePeerList { .. } => "RemotePeerList",
+        ServerMessage::RemoteEnv { .. } => "RemoteEnv",
+        ServerMessage::LanApprovalPending => "LanApprovalPending",
+        ServerMessage::LanApprovalResult { .. } => "LanApprovalResult",
+        ServerMessage::LanApprovalRequest { .. } => "LanApprovalRequest",
+        ServerMessage::LanPeerList { .. } => "LanPeerList",
+        ServerMessage::TrustedDeviceList { .. } => "TrustedDeviceList",
+        ServerMessage::TrustedNetworkList { .. } => "TrustedNetworkList",
+        ServerMessage::LanEnv { .. } => "LanEnv",
+        ServerMessage::LanDialIdentity { .. } => "LanDialIdentity",
+        ServerMessage::ShareRoster { .. } => "ShareRoster",
+        ServerMessage::ControlRequested { .. } => "ControlRequested",
+        ServerMessage::ControlDenied { .. } => "ControlDenied",
+        ServerMessage::ShareEnded { .. } => "ShareEnded",
+    }
+}
+
+/// Drop an exited session from the registry, the AI chrome, and the tab strip.
+///
+/// Split out of [`dispatch_server_message`] so the dispatch table reads as one
+/// screen of routing decisions rather than of session bookkeeping.
+fn on_session_exited(
+    ctx: &ReaderCtx,
+    registry: &mut session_lifecycle::SessionRegistry,
+    session_id: SessionId,
+    attached: Option<SessionId>,
+) -> Result<(), String> {
+    let existed = registry.on_session_exited(session_id);
+    update_ai_chrome(ctx, |ai| ai.forget(session_id));
+    let refocused = ctx.tabs.lock().ok().and_then(|mut tabs| tabs.remove(session_id));
+    if let Some(next) = refocused {
+        attach_session(ctx, next)?;
+    }
+    if existed && Some(session_id) == attached {
+        set_status(&ctx.status, &ctx.generation, "attached pane exited".to_owned());
+    }
+    Ok(())
+}
+
+/// Decode a reattach replay onto the pane, or surface the decode failure.
+///
+/// A corrupt reattach stream must not tear down the reader: show an error on
+/// the pane and keep the connection alive.
+fn forward_replay(ctx: &ReaderCtx, session_id: SessionId, replay: &SessionReplay) {
+    match session_lifecycle::decode_replay(session_id, replay) {
+        Ok(bytes) => forward_output(&ctx.in_tx, session_id, bytes),
+        Err(error) => set_status(&ctx.status, &ctx.generation, error.to_string()),
+    }
+}
+
 async fn run_reader<R>(mut reader: R, ctx: ReaderCtx) -> Result<(), String>
 where
     R: AsyncReadExt + Unpin,
@@ -1546,85 +1714,90 @@ where
         // `select_tab_N`, so output gating reads it fresh on every message
         // rather than caching a local `attached`.
         let attached = ctx.active_session.lock().ok().and_then(|guard| *guard);
-        match message {
-            ServerMessage::Welcome { window_id, .. } => {
-                // A takeover Hello's Welcome hands back the adopted window id.
-                registry.adopt_window(window_id);
-                tracing::debug!(adopted = ?registry.adopted_window(), "welcome: adopted window");
-            }
-            ServerMessage::SessionList { sessions, .. } => {
-                registry.rebuild_from_session_list(&sessions);
-                tracing::debug!(
-                    sessions = registry.len(),
-                    workspaces = registry.reconnect_topology().len(),
-                    "rebuilt reconnect topology"
-                );
-                sync_tab_strip(&ctx, &sessions, attached)?;
-            }
-            ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
-                registry.on_session_created(session_id, workspace_id);
-                open_created_tab(&ctx, session_id, workspace_id, shell_name)?;
-            }
-            ServerMessage::SessionExited { session_id, .. } => {
-                let existed = registry.on_session_exited(session_id);
-                update_ai_chrome(&ctx, |ai| ai.forget(session_id));
-                let refocused = ctx.tabs.lock().ok().and_then(|mut tabs| tabs.remove(session_id));
-                if let Some(next) = refocused {
-                    attach_session(&ctx, next)?;
-                }
-                if existed && Some(session_id) == attached {
-                    set_status(&ctx.status, &ctx.generation, "attached pane exited".to_owned());
-                }
-            }
-            ServerMessage::AiStateChanged { session_id, ai_state } => {
-                // The server has already merged partial OSC events onto the
-                // stored state, so the percent that arrives here is the live one.
-                update_ai_chrome(&ctx, |ai| ai.tracker.update(session_id, ai_state));
-            }
-            ServerMessage::AiStateCleared { session_id } => {
-                update_ai_chrome(&ctx, |ai| {
-                    ai.tracker.remove(session_id);
-                    ai.tracker.clear_context(session_id);
-                });
-            }
-            ServerMessage::PromptReceived { session_id, text, .. } => {
-                let at = std::time::SystemTime::now();
-                update_ai_chrome(&ctx, |ai| ai.record_prompt(session_id, text, at));
-            }
-            ServerMessage::TrimScrollback { session_id, history_rows } => {
-                // Track the server's scrollback trim so stored prompt marks stay
-                // anchored to the right rows once command-mark tracking lands.
-                let dropped = registry.on_trim_scrollback(session_id, history_rows);
-                tracing::trace!(%session_id, dropped, "trimmed scrollback marks");
-            }
-            ServerMessage::PtyOutput { session_id, data } if Some(session_id) == attached => {
+        dispatch_server_message(message, &ctx, &mut registry, attached)?;
+    }
+}
+
+/// Route one inbound message onto the live client state.
+///
+/// Every arm below is a variant this client actually implements; the trailing
+/// arm hands everything else to [`unhandled_server_message`], which names the
+/// variant from the exhaustive table in [`server_message_variant`] and counts
+/// the drop instead of discarding it in silence. Session-scoped output arms
+/// gate on `attached` inside the arm rather than in a match guard, so a frame
+/// for a background pane stays a deliberate no-op instead of being reported as
+/// an unhandled message.
+fn dispatch_server_message(
+    message: ServerMessage,
+    ctx: &ReaderCtx,
+    registry: &mut session_lifecycle::SessionRegistry,
+    attached: Option<SessionId>,
+) -> Result<(), String> {
+    match message {
+        ServerMessage::Welcome { window_id, .. } => {
+            // A takeover Hello's Welcome hands back the adopted window id.
+            registry.adopt_window(window_id);
+            tracing::debug!(adopted = ?registry.adopted_window(), "welcome: adopted window");
+        }
+        ServerMessage::SessionList { sessions, .. } => {
+            registry.rebuild_from_session_list(&sessions);
+            tracing::debug!(
+                sessions = registry.len(),
+                workspaces = registry.reconnect_topology().len(),
+                "rebuilt reconnect topology"
+            );
+            sync_tab_strip(ctx, &sessions, attached)?;
+        }
+        ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
+            registry.on_session_created(session_id, workspace_id);
+            open_created_tab(ctx, session_id, workspace_id, shell_name)?;
+        }
+        ServerMessage::SessionExited { session_id, .. } => {
+            on_session_exited(ctx, registry, session_id, attached)?;
+        }
+        ServerMessage::AiStateChanged { session_id, ai_state } => {
+            // The server has already merged partial OSC events onto the
+            // stored state, so the percent that arrives here is the live one.
+            update_ai_chrome(ctx, |ai| ai.tracker.update(session_id, ai_state));
+        }
+        ServerMessage::AiStateCleared { session_id } => {
+            update_ai_chrome(ctx, |ai| {
+                ai.tracker.remove(session_id);
+                ai.tracker.clear_context(session_id);
+            });
+        }
+        ServerMessage::PromptReceived { session_id, text, .. } => {
+            let at = std::time::SystemTime::now();
+            update_ai_chrome(ctx, |ai| ai.record_prompt(session_id, text, at));
+        }
+        ServerMessage::TrimScrollback { session_id, history_rows } => {
+            // Track the server's scrollback trim so stored prompt marks stay
+            // anchored to the right rows once command-mark tracking lands.
+            let dropped = registry.on_trim_scrollback(session_id, history_rows);
+            tracing::trace!(%session_id, dropped, "trimmed scrollback marks");
+        }
+        ServerMessage::PtyOutput { session_id, data } => {
+            if Some(session_id) == attached {
                 forward_output(&ctx.in_tx, session_id, data);
             }
-            ServerMessage::SessionReplay { session_id, replay } if Some(session_id) == attached => {
-                // A corrupt reattach stream must not tear down the reader: show
-                // an error on the pane and keep the connection alive.
-                match session_lifecycle::decode_replay(session_id, &replay) {
-                    Ok(bytes) => forward_output(&ctx.in_tx, session_id, bytes),
-                    Err(error) => {
-                        set_status(&ctx.status, &ctx.generation, error.to_string());
-                    }
-                }
-            }
-            ServerMessage::ScreenSnapshot { session_id, snapshot }
-                if Some(session_id) == attached =>
-            {
-                // Reset before replaying so the tooling snapshot replaces, never
-                // appends onto, the pane's current content.
-                forward_output(
-                    &ctx.in_tx,
-                    session_id,
-                    session_lifecycle::snapshot_reset_bytes(&snapshot),
-                );
-            }
-            ServerMessage::Error { message } => set_status(&ctx.status, &ctx.generation, message),
-            _ => {}
         }
+        ServerMessage::SessionReplay { session_id, replay } => {
+            if Some(session_id) == attached {
+                forward_replay(ctx, session_id, &replay);
+            }
+        }
+        ServerMessage::ScreenSnapshot { session_id, snapshot } => {
+            if Some(session_id) == attached {
+                // Reset before replaying so the tooling snapshot replaces,
+                // never appends onto, the pane's current content.
+                let bytes = session_lifecycle::snapshot_reset_bytes(&snapshot);
+                forward_output(&ctx.in_tx, session_id, bytes);
+            }
+        }
+        ServerMessage::Error { message } => set_status(&ctx.status, &ctx.generation, message),
+        other => unhandled_server_message(&other),
     }
+    Ok(())
 }
 
 /// Add a freshly created session to the tab strip, focus it, and attach.

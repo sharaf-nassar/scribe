@@ -95,6 +95,14 @@ New Rust lint suppressions are blocked by a committed baseline so contributors m
 
 `tools/check-no-new-lint-suppressions.sh` scans the staged, working, or CI target tree and compares the discovered suppression inventory against `tools/lint-suppressions-allowlist.txt`. That keeps the repo's three narrowly scoped unavoidable suppressions explicit while rejecting any drift. The guard runs in pre-commit, `just lint-suppressions`, and the normal pull-request quality workflow. `third_party/` is pruned from the scan so vendored upstream suppressions do not need allowlist entries.
 
+### Reachability Gate
+
+The GPUI client's unreachable surface is pinned by a committed baseline, so a feature that compiles and passes unit tests but is never constructed by the running binary shows up as a number instead of hiding behind a green test run.
+
+The 016 reachability audit (`specs/016-gpui-client-rebuild/reachability-audit.md`) found the crate shipping far more implemented surface than `main.rs` could reach: most library modules were never imported, most `ServerMessage` variants fell into a `_ => {}` arm, and most `LayoutAction` variants fell into a `_ => tracing::debug!` arm. Both catch-alls are gone. Inbound messages the client does not act on now go through [[crates/scribe-client-gpui/src/main.rs#unhandled_server_message]] and swallowed key actions through [[crates/scribe-client-gpui/src/main.rs#unhandled_layout_action]]; each names the variant, increments a process counter, and logs at `warn`, so an unimplemented surface is observable at runtime rather than silent. [[crates/scribe-client-gpui/src/main.rs#server_message_variant]] holds the exhaustive variant table that supplies those names, which makes adding a protocol variant a compile error until someone decides what the client does with it.
+
+`tools/check-reachability.sh` re-derives the three metrics from source — library modules against `main.rs`'s import closure, `ServerMessage` variants against [[crates/scribe-client-gpui/src/main.rs#dispatch_server_message]], and `LayoutAction` variants against [[crates/scribe-client-gpui/src/main.rs#TerminalView#handle_layout_action]] — prints them as one `reachability: …` line, and compares the unreachable sets against `tools/reachability-baseline.txt`. The check fails when the unreachable set grows *and* when a baseline entry has become reachable, so the baseline can only shrink and every wiring bead has to record its progress. It runs in pre-commit (`reachability-baseline`) and in `just reachability`, which `just ready` invokes alongside the lint-suppression guard.
+
 ### Vendored Third-Party Dependencies
 
 The `third_party/` directory holds path-patched copies of external crates with outstanding upstream bugs, wired in via `[patch.crates-io]` in the root `Cargo.toml`.

@@ -1,0 +1,144 @@
+# GPUI client reachability baseline.
+#
+# Generated from the 016 reachability audit
+# (specs/016-gpui-client-rebuild/reachability-audit.md), which found that the
+# crate ships far more implemented-and-unit-tested surface than the running
+# binary can reach. tools/check-reachability.sh re-derives the numbers below
+# from the source on every run and fails when they get worse.
+#
+# `counts` lines are the launch-gate metric. The `-total` numbers track the
+# protocol and the module list; the `-wired` / `-handled` numbers track what the
+# live binary reaches and may only go up.
+#
+# The remaining lines name every surface that exists in the crate but is not on
+# a live path:
+#
+#   unwired-module            a `pub mod` in lib.rs that main.rs and its binary
+#                             submodules never import
+#   unhandled-server-message  a ServerMessage variant that reaches
+#                             main.rs `dispatch_server_message` only to be
+#                             counted and warned by `unhandled_server_message`
+#   unhandled-layout-action   a LayoutAction variant the key path intercepts and
+#                             hands to `unhandled_layout_action`
+#
+# Wiring one of these up means deleting its line here and bumping the matching
+# count. Adding a line is a deliberate act that needs a bead to justify it.
+
+counts modules-total 56
+counts modules-wired 21
+counts server-messages-total 59
+counts server-messages-handled 12
+counts layout-actions-total 36
+counts layout-actions-handled 9
+
+unwired-module bell
+unwired-module box_drawing
+unwired-module clipboard
+unwired-module clipboard_cleanup
+unwired-module color
+unwired-module divider
+unwired-module drag_drop
+unwired-module focus_border
+unwired-module lan_approval
+unwired-module lost_control
+unwired-module mouse_reporting
+unwired-module mouse_state
+unwired-module notification_dispatcher
+unwired-module palette
+unwired-module pane_tree
+unwired-module paste
+unwired-module preedit
+unwired-module remote
+unwired-module remote_handshake
+unwired-module restore_state
+unwired-module scrollbar
+unwired-module search
+unwired-module selection
+unwired-module server_lifecycle
+unwired-module share
+unwired-module smart_selection
+unwired-module split_scroll
+unwired-module url_detect
+unwired-module vi_mode
+unwired-module window_state
+unwired-module workspace_layout
+unwired-module workspace_notes_preview
+unwired-module workspace_tree
+unwired-module x11_focus
+unwired-module zoom
+
+unhandled-server-message ActionDispatched
+unhandled-server-message Bell
+unhandled-server-message ClipboardBridgeReadRequest
+unhandled-server-message ClipboardBridgeWrite
+unhandled-server-message ClipboardPromptRequest
+unhandled-server-message CodexTaskLabelChanged
+unhandled-server-message CodexTaskLabelCleared
+unhandled-server-message ControlDenied
+unhandled-server-message ControlRequested
+unhandled-server-message CwdChanged
+unhandled-server-message EnvPreflightResult
+unhandled-server-message EnvStatus
+unhandled-server-message GitBranch
+unhandled-server-message LanApprovalPending
+unhandled-server-message LanApprovalRequest
+unhandled-server-message LanApprovalResult
+unhandled-server-message LanDialIdentity
+unhandled-server-message LanEnv
+unhandled-server-message LanPeerList
+unhandled-server-message PromptMark
+unhandled-server-message QuitRequested
+unhandled-server-message ReleaseList
+unhandled-server-message RemoteDisconnect
+unhandled-server-message RemoteEnv
+unhandled-server-message RemoteHandshakeReply
+unhandled-server-message RemotePeerList
+unhandled-server-message RunAction
+unhandled-server-message ScrollBottom
+unhandled-server-message SearchResults
+unhandled-server-message SessionContextChanged
+unhandled-server-message ShareEnded
+unhandled-server-message ShareRoster
+unhandled-server-message TaskLabelChanged
+unhandled-server-message TaskLabelCleared
+unhandled-server-message TitleChanged
+unhandled-server-message TrustedDeviceList
+unhandled-server-message TrustedNetworkList
+unhandled-server-message UpdateAvailable
+unhandled-server-message UpdateCheckResult
+unhandled-server-message UpdateProgress
+unhandled-server-message WindowClosed
+unhandled-server-message WindowList
+unhandled-server-message WindowTakenOver
+unhandled-server-message WorkspaceInfo
+unhandled-server-message WorkspaceNamed
+unhandled-server-message WorkspaceNotesChanged
+unhandled-server-message WorkspaceNotesSnapshot
+
+unhandled-layout-action ClosePane
+unhandled-layout-action CopySelection
+unhandled-layout-action FocusDown
+unhandled-layout-action FocusLeft
+unhandled-layout-action FocusNext
+unhandled-layout-action FocusRight
+unhandled-layout-action FocusUp
+unhandled-layout-action JumpToFailure
+unhandled-layout-action NewWindow
+unhandled-layout-action PasteClipboard
+unhandled-layout-action PromptJumpDown
+unhandled-layout-action PromptJumpUp
+unhandled-layout-action ScrollBottom
+unhandled-layout-action ScrollDown
+unhandled-layout-action ScrollTop
+unhandled-layout-action ScrollUp
+unhandled-layout-action SplitHorizontal
+unhandled-layout-action SplitVertical
+unhandled-layout-action WorkspaceFocusDown
+unhandled-layout-action WorkspaceFocusLeft
+unhandled-layout-action WorkspaceFocusRight
+unhandled-layout-action WorkspaceFocusUp
+unhandled-layout-action WorkspaceSplitHorizontal
+unhandled-layout-action WorkspaceSplitVertical
+unhandled-layout-action ZoomIn
+unhandled-layout-action ZoomOut
+unhandled-layout-action ZoomReset
