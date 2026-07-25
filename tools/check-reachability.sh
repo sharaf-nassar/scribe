@@ -234,7 +234,11 @@ my %named_in_dispatch = map { $_ => 1 } ($dispatch =~ /LayoutAction::(\w+)/g);
 my @unmatched = grep { !$named_in_dispatch{$_} } @layout_actions;
 die "reachability: handle_layout_action does not name: @unmatched\n" if @unmatched;
 
-my ($before) = $dispatch =~ /(.*?)=>\s*unhandled_layout_action/s;
+# The swallow arm's body is a bare call when the pattern chain is long enough
+# that rustfmt splits it, and a braced block once the chain shrinks enough for
+# the one-line form to be tried and rejected on width. Accept either shape, so
+# wiring a variant up cannot break the gate on formatting alone.
+my ($before) = $dispatch =~ /(.*?)=>\s*\{?\s*unhandled_layout_action/s;
 die "reachability: handle_layout_action has no unhandled_layout_action arm\n"
     unless defined $before;
 my ($chain) = $before =~ /((?:LayoutAction::\w+\s*\|\s*)*LayoutAction::\w+\s*)\z/s;

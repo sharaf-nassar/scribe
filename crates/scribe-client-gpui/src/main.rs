@@ -96,8 +96,8 @@ use scribe_common::{
     framing::{read_message, write_message},
     ids::{SessionId, WorkspaceId},
     protocol::{
-        ArchiveReason, AutomationAction, ClientMessage, ServerMessage, SessionInfo, TerminalSize,
-        WindowInfo, WorkspaceNoteStatus,
+        ArchiveReason, AutomationAction, ClientMessage, PromptMarkKind, ServerMessage, SessionInfo,
+        TerminalSize, WindowInfo, WorkspaceNoteStatus,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -112,8 +112,9 @@ use tokio::{
 };
 
 use crate::{
-    ipc_bridge::{InboundEvent, IpcSink, run_drain},
+    ipc_bridge::{InboundEvent, IpcSink, PaneOp, run_drain},
     pane_shell::{ClosedPane, PaneShell},
+    session_lifecycle::{JumpDirection, PromptMarks},
     sync_frames::{SyncFrameQueue, drain_all_committed},
     terminal::{Content, DisplayOnlyTerminal, PaneGrids, Scroll},
     terminal_element::{
@@ -299,6 +300,10 @@ struct Shared {
     /// into it; the view's lifecycle tick raises the parked prompt as a modal
     /// and its answer leaves through `IpcSink::lan_approval_decision`.
     lan: Arc<Mutex<LanChrome>>,
+    /// Per-session OSC 133 command records. The coalescing drain anchors each
+    /// `PromptMark` against the grid it has just advanced; the key path reads
+    /// them back to resolve the three mark-relative jumps.
+    prompt_marks: Arc<Mutex<PromptMarks>>,
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -838,11 +843,12 @@ impl TerminalView {
             LayoutAction::ZoomIn => self.apply_zoom(ZoomState::zoom_in, cx),
             LayoutAction::ZoomOut => self.apply_zoom(ZoomState::zoom_out, cx),
             LayoutAction::ZoomReset => self.apply_zoom(ZoomState::reset, cx),
-            LayoutAction::CopySelection
-            | LayoutAction::PasteClipboard
-            | LayoutAction::PromptJumpUp
-            | LayoutAction::PromptJumpDown
-            | LayoutAction::JumpToFailure => unhandled_layout_action(action),
+            LayoutAction::PromptJumpUp => self.jump_to_prompt(JumpDirection::Up, cx),
+            LayoutAction::PromptJumpDown => self.jump_to_prompt(JumpDirection::Down, cx),
+            LayoutAction::JumpToFailure => self.jump_to_failure(cx),
+            LayoutAction::CopySelection | LayoutAction::PasteClipboard => {
+                unhandled_layout_action(action);
+            }
         }
     }
 
@@ -878,6 +884,73 @@ impl TerminalView {
             return;
         };
         tracing::info!(?scroll, moved, offset, pin_rows, "terminal scrollback moved");
+        cx.notify();
+    }
+
+    /// Move the focused pane's viewport to the neighbouring prompt mark.
+    ///
+    /// The marks come from the server's OSC 133 stream, anchored by the drain
+    /// against the grid as it stood when each mark arrived, so a jump lands on
+    /// the row the shell drew that prompt on rather than on a guess derived
+    /// from the current screen.
+    fn jump_to_prompt(&mut self, direction: JumpDirection, cx: &mut Context<Self>) {
+        self.jump_to_mark(
+            |marks, session, viewport_top_abs| {
+                marks.jump_target(session, viewport_top_abs, direction)
+            },
+            &format!("prompt_jump_{}", if direction == JumpDirection::Up { "up" } else { "down" }),
+            cx,
+        );
+    }
+
+    /// Move the focused pane's viewport to the most recent failed command.
+    ///
+    /// A command whose shell reported no exit code stays `Unknown` and is never
+    /// treated as a failure (FR-012), and when there is no failure at all the
+    /// viewport is deliberately left alone (FR-011) — the jump is a navigation
+    /// aid, not a mode.
+    fn jump_to_failure(&mut self, cx: &mut Context<Self>) {
+        self.jump_to_mark(|marks, session, _| marks.failure_target(session), "jump_to_failure", cx);
+    }
+
+    /// Shared body of the three mark-relative jumps.
+    ///
+    /// `pick` chooses the absolute row to land on from the focused session's
+    /// marks and the viewport's current top row; everything else — resolving
+    /// the focused session, dissolving the split-scroll pin the landing would
+    /// otherwise outlive, moving the viewport, and logging the outcome — is
+    /// identical across the three actions and lives here so they cannot drift.
+    fn jump_to_mark(
+        &mut self,
+        pick: impl FnOnce(&PromptMarks, SessionId, usize) -> Option<usize>,
+        action: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
+        else {
+            return;
+        };
+        let Ok(marks) = self.shared.prompt_marks.lock() else {
+            tracing::warn!("prompt-mark mutex poisoned; dropping jump");
+            return;
+        };
+        let Ok(mut grids) = self.shared.panes.lock() else { return };
+        let terminal = grids.grid_mut(session_id);
+        let viewport_top_abs = terminal.viewport_top_abs();
+        let total = marks.marks(session_id).len();
+        let Some(target) = pick(&marks, session_id, viewport_top_abs) else {
+            // FR-011: no candidate is a no-op, not a jump to the nearest thing.
+            tracing::info!(action, marks = total, viewport_top_abs, "prompt jump found no mark");
+            return;
+        };
+        // Landing on a mark is a deliberate scroll, so the pin is cleared for
+        // the same reason `scroll_terminal` clears it on `Scroll::Bottom`.
+        terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
+        let moved = terminal.scroll_to_abs(target);
+        let offset = terminal.display_offset();
+        drop(grids);
+        drop(marks);
+        tracing::info!(action, target, moved, offset, marks = total, "prompt jump moved");
         cx.notify();
     }
 
@@ -3381,6 +3454,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         bells: Arc::new(Mutex::new(Vec::new())),
         find: Arc::new(Mutex::new(FindResults::default())),
         lan: Arc::new(Mutex::new(LanChrome::new())),
+        prompt_marks: Arc::new(Mutex::new(PromptMarks::new())),
     };
     let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
     let (in_tx, in_rx) = unbounded_channel::<InboundEvent>();
@@ -3688,7 +3762,12 @@ where
     ctx.out_tx.send(ClientMessage::ListSessions).map_err(|_| "writer channel closed".to_owned())?;
 
     tokio::spawn(run_writer(writer, ctx.out_rx));
-    spawn_drain(ctx.in_rx, Arc::clone(&ctx.shared.panes), Arc::clone(&ctx.shared.generation));
+    spawn_drain(
+        ctx.in_rx,
+        Arc::clone(&ctx.shared.panes),
+        Arc::clone(&ctx.shared.generation),
+        Arc::clone(&ctx.shared.prompt_marks),
+    );
 
     let reader_ctx = ReaderCtx {
         panes: ctx.shared.panes,
@@ -3705,6 +3784,7 @@ where
         bells: ctx.shared.bells,
         find: ctx.shared.find,
         lan: ctx.shared.lan,
+        prompt_marks: ctx.shared.prompt_marks,
         out_tx: ctx.out_tx,
         in_tx: ctx.in_tx,
         sink: ctx.sink,
@@ -3777,6 +3857,7 @@ fn spawn_drain(
     in_rx: UnboundedReceiver<InboundEvent>,
     panes: Arc<Mutex<PaneGrids>>,
     generation: Arc<AtomicU64>,
+    prompt_marks: Arc<Mutex<PromptMarks>>,
 ) {
     let queues: SyncFrameQueues = Arc::new(Mutex::new(HashMap::new()));
     let expiry_wake = Arc::new(Notify::new());
@@ -3792,13 +3873,12 @@ fn spawn_drain(
         let mut redraws = 0usize;
         let mut sync_armed = false;
         if let (Ok(mut session_queues), Ok(mut grids)) = (queue_task.lock(), panes_task.lock()) {
-            for (session, bytes) in batch.iter() {
-                let queue = session_queues.entry(session).or_default();
-                queue.queue_output_frames(bytes);
+            for (session, op) in batch.iter() {
                 // Each pane advances its own grid, so a background pane's burst
                 // can never land in the focused pane's scrollback.
+                let queue = session_queues.entry(session).or_default();
                 let grid = grids.grid_mut(session);
-                redraws += usize::from(drain_all_committed(queue, grid).needs_redraw);
+                redraws += apply_pane_op(op, session, queue, grid, &prompt_marks);
                 sync_armed |= grid.parser_sync_deadline().is_some();
                 sync_armed |= queue.raw_sync_deadline().is_some();
             }
@@ -3812,6 +3892,67 @@ fn spawn_drain(
     }));
 
     tokio::spawn(run_sync_expiry(queues, panes, generation, expiry_wake));
+}
+
+/// Apply one drained operation to a pane, reporting how many repaints it owes.
+///
+/// The three arms share the grid because they are ordered against each other:
+/// output advances it, a prompt mark reads the row the output left the cursor
+/// on, and the suppressed-ED-3 snap resets the offset the output scrolled.
+fn apply_pane_op(
+    op: &PaneOp,
+    session: SessionId,
+    queue: &mut SyncFrameQueue,
+    grid: &mut DisplayOnlyTerminal,
+    prompt_marks: &Arc<Mutex<PromptMarks>>,
+) -> usize {
+    match op {
+        PaneOp::Output(bytes) => {
+            queue.queue_output_frames(bytes);
+            usize::from(drain_all_committed(queue, grid).needs_redraw)
+        }
+        PaneOp::PromptMark { kind, exit_code } => {
+            apply_prompt_mark(prompt_marks, session, *kind, *exit_code, grid);
+            0
+        }
+        PaneOp::ScrollBottom => {
+            // A real ED 3 resets the display offset inside `clear_history`; the
+            // server stripped the sequence, so the snap is replayed here.
+            grid.set_split_scroll_eligibility(SplitScrollEligibility::default());
+            let moved = grid.scroll(Scroll::Bottom);
+            tracing::info!(%session, moved, "server snapped the pane to the live bottom");
+            usize::from(moved)
+        }
+    }
+}
+
+/// Anchor one OSC 133 mark against the pane grid the drain has just written to.
+///
+/// The anchor is read here, not in the reader, because absolute row positions
+/// only mean anything once the output that moved the cursor has been applied —
+/// and the drain is the only place that has both the grid and the batch order.
+fn apply_prompt_mark(
+    prompt_marks: &Arc<Mutex<PromptMarks>>,
+    session: SessionId,
+    kind: PromptMarkKind,
+    exit_code: Option<i32>,
+    grid: &DisplayOnlyTerminal,
+) {
+    let Ok(mut marks) = prompt_marks.lock() else {
+        tracing::warn!("prompt-mark mutex poisoned; dropping mark");
+        return;
+    };
+    let anchor = grid.prompt_anchor();
+    let total = marks.record(session, kind, exit_code, anchor);
+    tracing::info!(
+        %session,
+        ?kind,
+        ?exit_code,
+        history = anchor.history,
+        cursor_row = anchor.cursor_row,
+        marks = total,
+        "prompt mark recorded"
+    );
 }
 
 /// Waits on the nearest synchronized-update deadline and commits it once it
@@ -3905,6 +4046,9 @@ struct ReaderCtx {
     /// Feature-014 LAN state the reader parks approval requests in and folds the
     /// peer-list, environment, and dial-gate answers onto.
     lan: Arc<Mutex<LanChrome>>,
+    /// Per-session OSC 133 command records. The reader shifts them on a
+    /// `TrimScrollback`; the drain anchors new marks into them.
+    prompt_marks: Arc<Mutex<PromptMarks>>,
     out_tx: UnboundedSender<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
@@ -4165,6 +4309,9 @@ fn on_session_exited(
     if let Ok(mut grids) = ctx.panes.lock() {
         grids.forget(session_id);
     }
+    if let Ok(mut marks) = ctx.prompt_marks.lock() {
+        marks.forget(session_id);
+    }
     let refocused = ctx.tabs.lock().ok().and_then(|mut tabs| tabs.remove(session_id));
     if let Some(next) = refocused {
         attach_session(ctx, next)?;
@@ -4291,10 +4438,14 @@ fn dispatch_server_message(
             update_ai_chrome(ctx, |ai| ai.record_prompt(session_id, text, at));
         }
         ServerMessage::TrimScrollback { session_id, history_rows } => {
-            // Track the server's scrollback trim so stored prompt marks stay
-            // anchored to the right rows once command-mark tracking lands.
-            let dropped = registry.on_trim_scrollback(session_id, history_rows);
-            tracing::trace!(%session_id, dropped, "trimmed scrollback marks");
+            on_trim_scrollback(ctx, registry, session_id, history_rows);
+        }
+        // OSC 133 marks and the suppressed-ED-3 snap are both positional: each
+        // describes where the cursor is *after* output the server has already
+        // sent, so they are routed as one onto the same ordered inbound channel
+        // as that output rather than applied here.
+        positional @ (ServerMessage::PromptMark { .. } | ServerMessage::ScrollBottom { .. }) => {
+            on_positional_pane_message(ctx, positional);
         }
         // The three pane-content variants are all gated on the attached pane
         // and all end in the frame queue, so they are named here and routed as
@@ -4465,6 +4616,52 @@ fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage) {
         }
         // Unreachable: the caller only routes the pane-content family here.
         other => unhandled_server_message(&other),
+    }
+}
+
+/// Shift a session's stored prompt marks past the scrollback the server just
+/// trimmed, so every anchor keeps naming the row it originally did.
+///
+/// The registry only measures the drop (the decrease from the previously
+/// reported history size); the marks it applies to live in the shared store the
+/// drain writes and the key path reads.
+fn on_trim_scrollback(
+    ctx: &ReaderCtx,
+    registry: &mut session_lifecycle::SessionRegistry,
+    session_id: SessionId,
+    history_rows: u32,
+) {
+    let dropped = registry.on_trim_scrollback(session_id, history_rows);
+    if dropped > 0
+        && let Ok(mut marks) = ctx.prompt_marks.lock()
+    {
+        marks.on_trim(session_id, dropped);
+    }
+    tracing::trace!(%session_id, dropped, "trimmed scrollback marks");
+}
+
+/// Forward one positional pane event onto the ordered inbound channel.
+///
+/// A prompt mark's anchor row and a suppressed-ED-3 snap only mean anything
+/// relative to the output around them, so both travel the same FIFO the pane's
+/// bytes do and are applied by the drain, not here. Anything other than those
+/// two variants is a routing error in [`dispatch_server_message`], not a
+/// protocol event, so it is counted as unhandled rather than silently dropped.
+fn on_positional_pane_message(ctx: &ReaderCtx, message: ServerMessage) {
+    let (session_id, event) = match message {
+        ServerMessage::PromptMark { session_id, kind, exit_code, .. } => {
+            (session_id, InboundEvent::PromptMark { session_id, kind, exit_code })
+        }
+        ServerMessage::ScrollBottom { session_id } => {
+            (session_id, InboundEvent::ScrollBottom { session_id })
+        }
+        other => {
+            unhandled_server_message(&other);
+            return;
+        }
+    };
+    if is_attached(ctx, session_id) {
+        forward_inbound(&ctx.in_tx, event);
     }
 }
 
@@ -4892,8 +5089,17 @@ fn attach_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> 
 }
 
 fn forward_output(in_tx: &UnboundedSender<InboundEvent>, session_id: SessionId, bytes: Vec<u8>) {
-    if in_tx.send(InboundEvent::PaneOutput { session_id, bytes }).is_err() {
-        tracing::warn!("inbound drain closed; dropping pane output");
+    forward_inbound(in_tx, InboundEvent::PaneOutput { session_id, bytes });
+}
+
+/// Hand one event to the coalescing drain, preserving arrival order.
+///
+/// Every pane-affecting message goes through here so output and the positional
+/// events interleaved with it (prompt marks, the suppressed-ED-3 snap) cannot
+/// be reordered relative to each other.
+fn forward_inbound(in_tx: &UnboundedSender<InboundEvent>, event: InboundEvent) {
+    if in_tx.send(event).is_err() {
+        tracing::warn!("inbound drain closed; dropping pane event");
     }
 }
 

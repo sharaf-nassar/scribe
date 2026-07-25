@@ -1,14 +1,20 @@
 //! Session-lifecycle handling ported from the legacy client's reattach and
 //! reconnect paths onto the display-only GPUI terminal.
 //!
-//! Five frozen-protocol server messages drive a pane's lifecycle after attach:
+//! Six frozen-protocol server messages drive a pane's lifecycle after attach:
 //! `SessionReplay` (zstd-decompress the reattach ANSI, then `feed_output`),
 //! `ScreenSnapshot` (reset the terminal, then replay the `snapshot_to_ansi`
 //! output), `TrimScrollback` (shift stored absolute prompt marks to track the
-//! dropped scrollback rows), and `SessionCreated` / `SessionExited` (register
+//! dropped scrollback rows), `PromptMark` (fold one OSC 133 mark into the
+//! session's command records), and `SessionCreated` / `SessionExited` (register
 //! and retire panes). `SessionList` rebuilds the reconnect topology — sessions
 //! grouped by workspace in first-seen order — and a takeover `Hello`'s
 //! `Welcome` adopts the returned window id.
+//!
+//! Prompt marks live in [`PromptMarks`] rather than on the registry, because
+//! two threads need them: the IPC drain anchors each mark against the live grid
+//! it has just written output into, and the GPUI key path reads them back to
+//! resolve `prompt_jump_up` / `prompt_jump_down` / `jump_to_failure`.
 //!
 //! Decompression and snapshot-to-ANSI conversion stay pure and happen in the
 //! reader ahead of the coalescing drain (the drain only ever concatenates
@@ -22,7 +28,7 @@ use std::collections::HashMap;
 
 use scribe_common::{
     ids::{SessionId, WindowId, WorkspaceId},
-    protocol::SessionInfo,
+    protocol::{PromptMarkKind, SessionInfo},
     screen::ScreenSnapshot,
     screen_replay::{self, SessionReplay},
 };
@@ -80,17 +86,59 @@ pub fn snapshot_reset_bytes(snapshot: &ScreenSnapshot) -> Vec<u8> {
     bytes
 }
 
+/// How a command anchored by a prompt mark ended.
+///
+/// Ported from the legacy client's `CommandStatus`. `Unknown` is both the
+/// initial state of an open record and the resting state of a command whose
+/// shell reported no exit code — FR-012/SC-006: an unreported exit is never a
+/// failure, so `jump_to_failure` skips it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandStatus {
+    /// Still running, or finished without a reported exit code.
+    Unknown,
+    /// OSC 133;D reported exit code 0.
+    Success,
+    /// OSC 133;D reported a non-zero exit code.
+    Failure,
+}
+
 /// A prompt / command anchor stored as an absolute scrollback row.
 ///
 /// `abs_pos` is "lines since the very top of scrollback" (0 = oldest), the
 /// stable identifier a `TrimScrollback` shifts. Ported from the legacy
-/// `CommandRecord`; only the anchor row matters for mark tracking here. The
-/// scrollbar command-mark bead (scribe-38e.15, blocked on this one) populates
-/// these from OSC 133; until then the [`SessionRegistry`] tracks an empty set
-/// per session and still shifts it on every trim.
+/// `CommandRecord`: the anchor row is the prompt row the command started at and
+/// `status` is resolved when its `CommandEnd` mark arrives. [`PromptMarks`]
+/// populates these from the server's OSC 133 `PromptMark` messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandMark {
     pub abs_pos: usize,
+    pub status: CommandStatus,
+}
+
+/// The grid geometry a prompt mark is anchored against.
+///
+/// Read off the live [`crate::terminal::DisplayOnlyTerminal`] at the moment the
+/// mark is applied, which is after every output byte the server sent ahead of
+/// it, so the anchor names the row the shell actually drew the prompt on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PromptAnchor {
+    /// Rows of scrollback above the live screen.
+    pub history: usize,
+    /// Rows in the live screen.
+    pub screen_lines: usize,
+    /// The cursor's row within the live screen.
+    pub cursor_row: usize,
+    /// The cursor's column.
+    pub cursor_col: usize,
+}
+
+/// Which way a prompt jump walks the mark list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JumpDirection {
+    /// Toward older scrollback: the newest mark strictly above the viewport top.
+    Up,
+    /// Toward the live bottom: the oldest mark strictly below the viewport top.
+    Down,
 }
 
 /// Shift stored absolute scrollback positions after a `TrimScrollback` drops the
@@ -102,7 +150,8 @@ pub struct CommandMark {
 /// same case so downstream pin-height math falls back to the cursor heuristic
 /// instead of pointing at a synthetic row 0. Ported byte-for-byte from the
 /// legacy client's `shift_absolute_marks_after_trim`; driven by
-/// [`SessionRegistry::on_trim_scrollback`].
+/// [`PromptMarks::on_trim`] with the drop count
+/// [`SessionRegistry::on_trim_scrollback`] measures.
 pub fn shift_absolute_marks_after_trim(
     marks: &mut Vec<CommandMark>,
     input_start: &mut Option<(usize, usize)>,
@@ -121,6 +170,147 @@ pub fn shift_absolute_marks_after_trim(
     });
     if let Some((line, col)) = *input_start {
         *input_start = if line >= dropped_rows { Some((line - dropped_rows, col)) } else { None };
+    }
+}
+
+/// Per-session prompt-mark state, shared between the IPC drain that ingests
+/// OSC 133 marks and the GPUI thread that jumps between them.
+///
+/// The legacy client kept this on each `Pane`; the display-only client has no
+/// pane struct, so the same state lives here behind the one mutex both the
+/// drain and the key path already have to cross. Every position is absolute
+/// ("rows since the oldest scrollback row"), which is what makes a
+/// `TrimScrollback` a pure subtraction instead of a re-scan.
+#[derive(Debug, Default)]
+pub struct PromptMarks {
+    panes: HashMap<SessionId, PaneMarks>,
+}
+
+/// One session's prompt-mark state: the command records plus the pending input
+/// row/column the `PromptEnd` mark records and a `TrimScrollback` shifts.
+#[derive(Debug, Default)]
+struct PaneMarks {
+    marks: Vec<CommandMark>,
+    input_start: Option<(usize, usize)>,
+}
+
+impl PromptMarks {
+    /// Creates an empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one OSC 133 mark into `session_id`'s command records.
+    ///
+    /// Ported from the legacy client's `handle_prompt_mark` (research D7):
+    ///
+    /// - `A` (`PromptStart`) opens a new [`CommandMark`] anchored at the prompt
+    ///   row with [`CommandStatus::Unknown`], then prunes records whose anchor
+    ///   has fallen out of the grid. A second `A` before a `D` simply leaves the
+    ///   earlier record `Unknown`.
+    /// - `B` (`PromptEnd`) records the input start row/column.
+    /// - `C` (`CommandStart`) clears it.
+    /// - `D` (`CommandEnd`) clears it and resolves the most-recent still-open
+    ///   record from `exit_code`: `Some(0)` → `Success`, `Some(≠0)` →
+    ///   `Failure`, `None` stays `Unknown`. A `D` with no open record is
+    ///   ignored.
+    ///
+    /// Returns how many records the session holds afterwards, which the caller
+    /// logs so the E2E can assert ingestion happened at all.
+    pub fn record(
+        &mut self,
+        session_id: SessionId,
+        kind: PromptMarkKind,
+        exit_code: Option<i32>,
+        anchor: PromptAnchor,
+    ) -> usize {
+        let pane = self.panes.entry(session_id).or_default();
+        match kind {
+            PromptMarkKind::PromptStart => {
+                let abs_pos = anchor.history.saturating_add(anchor.cursor_row);
+                pane.marks.push(CommandMark { abs_pos, status: CommandStatus::Unknown });
+                // The highest addressable absolute row is history + screen_lines
+                // - 1; anything past that ceiling names a row the grid no longer
+                // holds, so it is dropped rather than jumped to.
+                let max_valid = anchor.history.saturating_add(anchor.screen_lines);
+                pane.marks.retain(|mark| mark.abs_pos <= max_valid);
+                pane.input_start = None;
+            }
+            PromptMarkKind::PromptEnd => {
+                pane.input_start =
+                    Some((anchor.history.saturating_add(anchor.cursor_row), anchor.cursor_col));
+            }
+            PromptMarkKind::CommandStart => pane.input_start = None,
+            PromptMarkKind::CommandEnd => {
+                pane.input_start = None;
+                if let Some(record) = pane.marks.last_mut()
+                    && record.status == CommandStatus::Unknown
+                {
+                    record.status = match exit_code {
+                        Some(0) => CommandStatus::Success,
+                        Some(_) => CommandStatus::Failure,
+                        None => CommandStatus::Unknown,
+                    };
+                }
+            }
+        }
+        pane.marks.len()
+    }
+
+    /// Shift `session_id`'s marks after a `TrimScrollback` dropped
+    /// `dropped_rows` of the oldest scrollback.
+    pub fn on_trim(&mut self, session_id: SessionId, dropped_rows: usize) {
+        if dropped_rows == 0 {
+            return;
+        }
+        let pane = self.panes.entry(session_id).or_default();
+        shift_absolute_marks_after_trim(&mut pane.marks, &mut pane.input_start, dropped_rows);
+    }
+
+    /// Drop everything tracked for a session that exited.
+    pub fn forget(&mut self, session_id: SessionId) {
+        self.panes.remove(&session_id);
+    }
+
+    /// The session's command records, oldest first.
+    #[must_use]
+    pub fn marks(&self, session_id: SessionId) -> &[CommandMark] {
+        self.panes.get(&session_id).map_or(&[], |pane| pane.marks.as_slice())
+    }
+
+    /// The absolute row a prompt jump from `viewport_top_abs` should land on.
+    ///
+    /// `Up` takes the newest mark strictly above the current viewport top and
+    /// `Down` the oldest strictly below it, so repeated presses walk the prompt
+    /// list one command at a time and neither direction can re-select the mark
+    /// the viewport is already parked on.
+    #[must_use]
+    pub fn jump_target(
+        &self,
+        session_id: SessionId,
+        viewport_top_abs: usize,
+        direction: JumpDirection,
+    ) -> Option<usize> {
+        let marks = self.marks(session_id);
+        match direction {
+            JumpDirection::Up => {
+                marks.iter().rev().map(|mark| mark.abs_pos).find(|&pos| pos < viewport_top_abs)
+            }
+            JumpDirection::Down => {
+                marks.iter().map(|mark| mark.abs_pos).find(|&pos| pos > viewport_top_abs)
+            }
+        }
+    }
+
+    /// The absolute row of the most recent failed command, if any.
+    #[must_use]
+    pub fn failure_target(&self, session_id: SessionId) -> Option<usize> {
+        self.marks(session_id)
+            .iter()
+            .rev()
+            .find(|mark| mark.status == CommandStatus::Failure)
+            .map(|mark| mark.abs_pos)
     }
 }
 
@@ -154,18 +344,6 @@ pub struct SessionRegistry {
     workspace: HashMap<SessionId, WorkspaceId>,
     adopted_window: Option<WindowId>,
     last_history: HashMap<SessionId, u32>,
-    pane_marks: HashMap<SessionId, PaneMarks>,
-}
-
-/// Per-session prompt-mark state a `TrimScrollback` shifts.
-///
-/// `marks` are absolute scrollback anchors and `input_start` is the pending
-/// input row/column; both stay empty until OSC 133 tracking lands, but the trim
-/// handler shifts whatever is present.
-#[derive(Debug, Default)]
-struct PaneMarks {
-    marks: Vec<CommandMark>,
-    input_start: Option<(usize, usize)>,
 }
 
 impl SessionRegistry {
@@ -200,23 +378,20 @@ impl SessionRegistry {
         let existed = self.workspace.remove(&session_id).is_some();
         self.session_order.retain(|id| *id != session_id);
         self.last_history.remove(&session_id);
-        self.pane_marks.remove(&session_id);
         existed
     }
 
-    /// Handle a `TrimScrollback` for `session_id`, shifting the session's stored
-    /// absolute marks to track the rows the server dropped. Returns the
-    /// dropped-row count.
+    /// Measure a `TrimScrollback` for `session_id`, returning how many of the
+    /// oldest scrollback rows the server dropped.
     ///
     /// `history_rows` is the server's post-trim scrollback size; the drop is the
     /// decrease from the previously-reported size (0 on the first report), which
     /// a display-only client mirrors as the number of oldest rows to shift past.
+    /// The caller feeds the result to [`PromptMarks::on_trim`], which owns the
+    /// marks the shift applies to.
     pub fn on_trim_scrollback(&mut self, session_id: SessionId, history_rows: u32) -> usize {
         let previous = self.last_history.insert(session_id, history_rows).unwrap_or(history_rows);
-        let dropped = usize::try_from(previous.saturating_sub(history_rows)).unwrap_or(usize::MAX);
-        let entry = self.pane_marks.entry(session_id).or_default();
-        shift_absolute_marks_after_trim(&mut entry.marks, &mut entry.input_start, dropped);
-        dropped
+        usize::try_from(previous.saturating_sub(history_rows)).unwrap_or(usize::MAX)
     }
 
     /// Record the window id a takeover `Hello`'s `Welcome` adopted.
@@ -376,36 +551,143 @@ mod tests {
         assert!(error.reason.contains("zero dimensions"));
     }
 
+    fn mark(abs_pos: usize) -> CommandMark {
+        CommandMark { abs_pos, status: CommandStatus::Unknown }
+    }
+
+    /// A prompt anchor at `cursor_row` on an 80x24 grid with `history` rows of
+    /// scrollback behind it.
+    fn anchor_at(history: usize, cursor_row: usize) -> PromptAnchor {
+        PromptAnchor { history, screen_lines: 24, cursor_row, cursor_col: 0 }
+    }
+
     // @lat: [[client#GPUI Client Spike#Session Lifecycle#Trim shifts marks]]
     #[test]
     fn trim_shifts_and_drops_absolute_marks() {
-        let mut marks = vec![
-            CommandMark { abs_pos: 3 },
-            CommandMark { abs_pos: 10 },
-            CommandMark { abs_pos: 25 },
-        ];
+        let mut marks = vec![mark(3), mark(10), mark(25)];
         let mut input_start = Some((25, 5));
 
         shift_absolute_marks_after_trim(&mut marks, &mut input_start, 5);
 
-        assert_eq!(marks, vec![CommandMark { abs_pos: 5 }, CommandMark { abs_pos: 20 }]);
+        assert_eq!(marks, vec![mark(5), mark(20)]);
         assert_eq!(input_start, Some((20, 5)));
     }
 
     // @lat: [[client#GPUI Client Spike#Session Lifecycle#Trim clears input below delta]]
     #[test]
     fn trim_clears_input_start_below_delta() {
-        let mut marks = vec![CommandMark { abs_pos: 2 }];
+        let mut marks = vec![mark(2)];
         let mut input_start = Some((3, 1));
         shift_absolute_marks_after_trim(&mut marks, &mut input_start, 5);
         assert!(marks.is_empty());
         assert_eq!(input_start, None);
         // A zero-row trim is a no-op.
-        let mut untouched = vec![CommandMark { abs_pos: 4 }];
+        let mut untouched = vec![mark(4)];
         let mut start = Some((4, 0));
         shift_absolute_marks_after_trim(&mut untouched, &mut start, 0);
-        assert_eq!(untouched, vec![CommandMark { abs_pos: 4 }]);
+        assert_eq!(untouched, vec![mark(4)]);
         assert_eq!(start, Some((4, 0)));
+    }
+
+    // @lat: [[client#GPUI Client Spike#Prompt Marks And Jumps#Mark state machine resolves exits]]
+    #[test]
+    fn prompt_mark_state_machine_resolves_exit_codes() {
+        let mut marks = PromptMarks::new();
+        let session = SessionId::new();
+
+        // A: opens a record anchored at history + cursor row.
+        assert_eq!(marks.record(session, PromptMarkKind::PromptStart, None, anchor_at(100, 4)), 1);
+        assert_eq!(marks.marks(session), [mark(104)]);
+
+        // B and C only move the pending input start, leaving the record open.
+        marks.record(
+            session,
+            PromptMarkKind::PromptEnd,
+            None,
+            PromptAnchor { history: 100, screen_lines: 24, cursor_row: 4, cursor_col: 7 },
+        );
+        marks.record(session, PromptMarkKind::CommandStart, None, anchor_at(100, 5));
+        assert_eq!(marks.marks(session)[0].status, CommandStatus::Unknown);
+
+        // D with a non-zero exit resolves the open record as a failure.
+        marks.record(session, PromptMarkKind::CommandEnd, Some(1), anchor_at(100, 6));
+        assert_eq!(marks.marks(session)[0].status, CommandStatus::Failure);
+
+        // A second command that exits 0 resolves as a success…
+        marks.record(session, PromptMarkKind::PromptStart, None, anchor_at(100, 8));
+        marks.record(session, PromptMarkKind::CommandEnd, Some(0), anchor_at(100, 9));
+        assert_eq!(marks.marks(session)[1].status, CommandStatus::Success);
+
+        // …and a third whose shell reported no exit code stays Unknown, so it
+        // is never mistaken for a failure.
+        marks.record(session, PromptMarkKind::PromptStart, None, anchor_at(100, 10));
+        marks.record(session, PromptMarkKind::CommandEnd, None, anchor_at(100, 11));
+        assert_eq!(marks.marks(session)[2].status, CommandStatus::Unknown);
+
+        // A D that arrives once every record is resolved cannot rewrite one: it
+        // only ever touches a still-open record, so the success above survives.
+        marks.record(session, PromptMarkKind::CommandEnd, Some(3), anchor_at(100, 12));
+        marks.record(session, PromptMarkKind::CommandEnd, Some(0), anchor_at(100, 13));
+        assert_eq!(marks.marks(session)[1].status, CommandStatus::Success);
+        assert_eq!(marks.marks(session)[2].status, CommandStatus::Failure);
+    }
+
+    // @lat: [[client#GPUI Client Spike#Prompt Marks And Jumps#Jump picks the neighbouring mark]]
+    #[test]
+    fn jump_targets_walk_marks_one_at_a_time() {
+        let mut marks = PromptMarks::new();
+        let session = SessionId::new();
+        for row in [10_usize, 40, 70] {
+            marks.record(session, PromptMarkKind::PromptStart, None, anchor_at(row, 0));
+        }
+
+        // From the live bottom (viewport top at 70) the first jump up lands on
+        // 40, then 10, then reports nothing left.
+        assert_eq!(marks.jump_target(session, 70, JumpDirection::Up), Some(40));
+        assert_eq!(marks.jump_target(session, 40, JumpDirection::Up), Some(10));
+        assert_eq!(marks.jump_target(session, 10, JumpDirection::Up), None);
+        // Down walks the same list back toward the live bottom.
+        assert_eq!(marks.jump_target(session, 10, JumpDirection::Down), Some(40));
+        assert_eq!(marks.jump_target(session, 40, JumpDirection::Down), Some(70));
+        assert_eq!(marks.jump_target(session, 70, JumpDirection::Down), None);
+        // An unknown session has nothing to jump to.
+        assert_eq!(marks.jump_target(SessionId::new(), 0, JumpDirection::Down), None);
+    }
+
+    // @lat: [[client#GPUI Client Spike#Prompt Marks And Jumps#Failure jump picks the newest failure]]
+    #[test]
+    fn failure_target_picks_the_newest_failure() {
+        let mut marks = PromptMarks::new();
+        let session = SessionId::new();
+        assert_eq!(marks.failure_target(session), None);
+
+        for (row, exit) in [(10_usize, Some(1)), (40, Some(0)), (70, Some(2)), (100, None)] {
+            marks.record(session, PromptMarkKind::PromptStart, None, anchor_at(row, 0));
+            marks.record(session, PromptMarkKind::CommandEnd, exit, anchor_at(row, 1));
+        }
+
+        assert_eq!(marks.failure_target(session), Some(70));
+        // A trim that drops the oldest 50 rows re-anchors the survivor.
+        marks.on_trim(session, 50);
+        assert_eq!(marks.failure_target(session), Some(20));
+        // An exited session forgets everything.
+        marks.forget(session);
+        assert_eq!(marks.failure_target(session), None);
+    }
+
+    // @lat: [[client#GPUI Client Spike#Prompt Marks And Jumps#Evicted anchors are pruned]]
+    #[test]
+    fn marks_past_the_grid_ceiling_are_pruned() {
+        let mut marks = PromptMarks::new();
+        let session = SessionId::new();
+        // Two marks anchored high in a long scrollback…
+        marks.record(session, PromptMarkKind::PromptStart, None, anchor_at(900, 3));
+        marks.record(session, PromptMarkKind::PromptStart, None, anchor_at(910, 3));
+        assert_eq!(marks.marks(session).len(), 2);
+        // …then the grid shrinks to 20 rows of history, so both old anchors sit
+        // past `history + screen_lines` and only the new one survives.
+        marks.record(session, PromptMarkKind::PromptStart, None, anchor_at(20, 2));
+        assert_eq!(marks.marks(session), [mark(22)]);
     }
 
     // @lat: [[client#GPUI Client Spike#Session Lifecycle#Reconnect topology rebuild]]
@@ -459,22 +741,24 @@ mod tests {
     #[test]
     fn registry_trim_shifts_session_marks() {
         let mut registry = SessionRegistry::new();
+        let mut marks = PromptMarks::new();
         let session = SessionId::new();
         registry.on_session_created(session, WorkspaceId::new());
         // First report establishes the baseline history with no drop.
         assert_eq!(registry.on_trim_scrollback(session, 100), 0);
 
         // Seed a mark, then a trim that drops 40 rows shifts it down.
-        registry.pane_marks.entry(session).or_default().marks.push(CommandMark { abs_pos: 50 });
-        assert_eq!(registry.on_trim_scrollback(session, 60), 40);
-        assert_eq!(
-            registry.pane_marks.get(&session).unwrap().marks,
-            vec![CommandMark { abs_pos: 10 }]
-        );
+        marks.record(session, PromptMarkKind::PromptStart, None, anchor_at(50, 0));
+        let dropped = registry.on_trim_scrollback(session, 60);
+        assert_eq!(dropped, 40);
+        marks.on_trim(session, dropped);
+        assert_eq!(marks.marks(session), [mark(10)]);
 
-        // Exiting the session clears its mark and history state.
+        // Exiting the session clears its history baseline, and the store forgets
+        // its marks alongside it.
         assert!(registry.on_session_exited(session));
-        assert!(!registry.pane_marks.contains_key(&session));
+        marks.forget(session);
+        assert!(marks.marks(session).is_empty());
     }
 
     // @lat: [[client#GPUI Client Spike#Session Lifecycle#Takeover adoption]]

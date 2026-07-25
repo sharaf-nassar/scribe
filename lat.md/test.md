@@ -296,6 +296,16 @@ Split-scroll needs both halves of its gate, so the phase posts a real `state_cha
 
 `ctrl+-` must log `level=-1`, repaint the grid, and publish a smaller cell box with *more* columns; two `ctrl+=` presses must reach `level=1` with a bigger cell box and fewer columns than both the zoomed-out grid and the baseline. The column assertions are the point: a client that rescales glyphs inside a frozen `cols`x`rows` box also repaints and also emits a `Resize`, so pixels and frame counts alone cannot tell a real zoom from a cosmetic one. `ctrl+0` must return `level=0`, republish the pre-zoom geometry field for field, and leave a frame within a few hundred pixels of the pre-zoom capture — the seeded rows are short enough that no zoom level wraps them, so a restored grid is a restored image.
 
+### Prompt marks and mark-relative jumps
+
+`tests/e2e/visual/prompt-marks.sh` is the app-level oracle for [[client#GPUI Client Spike#Prompt Marks And Jumps]]: OSC 133 ingestion, the three mark-relative jumps, and the server's `ScrollBottom` snap, none of which the client could reach before.
+
+It runs on the [[test#Visual E2E Tests#Shared-pane rig]] so a real shell writes real OSC 133 bytes into the very pane the window renders — the server's OSC interceptor and its `PromptMark` emission are therefore on trial alongside the client. Three commands are recorded with the middle one exiting non-zero, and each block's filler rows carry a bar that grows at a per-block rate, so two viewports parked on different marks are visibly different frames rather than near-identical walls of text.
+
+The expected landing rows are read back out of the client's own `prompt mark recorded` lines rather than hard-coded, which keeps the assertions independent of how many rows the window happens to have. Pressing `ctrl+shift+b` before any mark exists must log `prompt jump found no mark` and leave the frame alone (FR-011) — a different observation from the chord being swallowed, which produces no line at all. `ctrl+shift+z` twice must walk to two successively older marks, `ctrl+shift+x` must land back on the first of them, and `ctrl+shift+b` must land on the *middle* command's row, which separates the wired behaviour from both the newest mark (what a plain jump-up reaches) and the oldest.
+
+The final phase scrolls away from the bottom, then arms the pane as an AI session and emits a real ED 3 so the server suppresses it and sends `ScrollBottom`. The snap is asserted twice: the client logs it with `moved=true`, and a following `scroll_bottom` chord must report `moved=false offset=0`, which is the only way to show the viewport genuinely ended at the live tail.
+
 ### Subscribe and snapshot session tooling
 
 `tests/e2e/visual/session-tooling.sh` is the app-level oracle for the `Subscribe` and `RequestSnapshot` parity rows: it drives the real client against the real server and asserts both frames on the wire at the lifecycle points that produce them.
@@ -369,6 +379,12 @@ Unit tests for the GPUI client's [[client#GPUI Client Spike#IPC Bridge]] — the
 ### Coalesce collapses per pane
 
 [[crates/scribe-client-gpui/src/ipc_bridge.rs#coalesce]] folds an interleaved two-pane run into one buffer per pane, preserving first-seen pane order and byte order within each pane; an empty run yields an empty batch.
+
+### Prompt marks split a pane's output run
+
+A prompt mark or a suppressed-ED-3 snap closes the pane's open output entry, so [[crates/scribe-client-gpui/src/ipc_bridge.rs#coalesce]] emits the bytes before it, then the event, then the bytes after it.
+
+That ordering is what lets the drain anchor a mark against a grid holding exactly the output that preceded it.
 
 ### Drain coalesces firehose
 
@@ -1308,6 +1324,10 @@ These are the reachability tests for [[client#GPUI Client Spike#GPUI Terminal Vi
 ### Scrolling paints scrollback and returns to the live bottom
 
 [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#scroll]] moves the display offset and rebuilds the snapshot from it, so a paged-up viewport paints scrollback rows; scrolling past the oldest row reports no movement, and `Scroll::Bottom` restores the live tail.
+
+### Prompt marks anchor and scroll in absolute rows
+
+[[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#prompt_anchor]] reports the history size, screen height, and cursor cell a mark is anchored by, [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#viewport_top_abs]] names the viewport's top row in the same absolute space, and [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#scroll_to_abs]] lands on a given row, reporting no movement when it is already there.
 
 ### Split-scroll pins the live rows under the scrollback
 

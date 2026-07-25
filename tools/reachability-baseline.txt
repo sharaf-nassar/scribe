@@ -27,9 +27,9 @@
 counts modules-total 64
 counts modules-wired 45
 counts server-messages-total 59
-counts server-messages-handled 39
+counts server-messages-handled 41
 counts layout-actions-total 36
-counts layout-actions-handled 31
+counts layout-actions-handled 34
 
 unwired-module clipboard
 unwired-module clipboard_cleanup
@@ -56,14 +56,12 @@ unhandled-server-message ClipboardBridgeReadRequest
 unhandled-server-message ClipboardBridgeWrite
 unhandled-server-message ClipboardPromptRequest
 unhandled-server-message EnvPreflightResult
-unhandled-server-message PromptMark
 unhandled-server-message ReleaseList
 unhandled-server-message RemoteDisconnect
 unhandled-server-message RemoteEnv
 unhandled-server-message RemoteHandshakeReply
 unhandled-server-message RemotePeerList
 unhandled-server-message RunAction
-unhandled-server-message ScrollBottom
 unhandled-server-message TrustedDeviceList
 unhandled-server-message TrustedNetworkList
 unhandled-server-message UpdateCheckResult
@@ -73,7 +71,4 @@ unhandled-server-message WorkspaceNotesChanged
 unhandled-server-message WorkspaceNotesSnapshot
 
 unhandled-layout-action CopySelection
-unhandled-layout-action JumpToFailure
 unhandled-layout-action PasteClipboard
-unhandled-layout-action PromptJumpDown
-unhandled-layout-action PromptJumpUp
