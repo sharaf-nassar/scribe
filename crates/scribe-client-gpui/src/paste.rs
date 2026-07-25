@@ -17,6 +17,77 @@
 
 use gpui::{Context, EventEmitter};
 
+/// Bracketed-paste mode start marker (DEC 2004).
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+/// Bracketed-paste mode end marker (DEC 2004).
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Largest payload one `ClientMessage::KeyInput` may carry. The server rejects
+/// anything above it, so a paste bigger than this has to be split.
+pub const MAX_KEY_INPUT_CHUNK: usize = 4 * 1024;
+
+/// Split `text` into `KeyInput`-sized payloads for the focused pane.
+///
+/// When `bracketed` is set the DEC 2004 start marker rides on the FIRST chunk
+/// and the end marker on the LAST, so the shell sees one contiguous paste
+/// region no matter how many frames carried it; the markers are budgeted out
+/// of those chunks' payloads so no frame can exceed
+/// [`MAX_KEY_INPUT_CHUNK`]. Ported from the winit client's
+/// `try_send_single_paste` / `send_chunked_paste` pair, whose fast path is the
+/// single-chunk case this function returns as a one-element vector. Empty
+/// input yields no chunks, so a caller never sends an empty `KeyInput`.
+#[must_use]
+pub fn paste_chunks(text: &str, bracketed: bool) -> Vec<Vec<u8>> {
+    let raw = text.as_bytes();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let markers =
+        if bracketed { BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len() } else { 0 };
+    if raw.len() + markers <= MAX_KEY_INPUT_CHUNK {
+        let mut chunk = Vec::with_capacity(raw.len() + markers);
+        if bracketed {
+            chunk.extend_from_slice(BRACKETED_PASTE_START);
+        }
+        chunk.extend_from_slice(raw);
+        if bracketed {
+            chunk.extend_from_slice(BRACKETED_PASTE_END);
+        }
+        return vec![chunk];
+    }
+
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    let mut first = true;
+    while offset < raw.len() {
+        let mut budget = MAX_KEY_INPUT_CHUNK;
+        if first && bracketed {
+            budget -= BRACKETED_PASTE_START.len();
+        }
+        let reaches_end = offset + budget >= raw.len();
+        if reaches_end && bracketed {
+            budget = budget.saturating_sub(BRACKETED_PASTE_END.len());
+        }
+        let payload_len = (raw.len() - offset).min(budget);
+        let last = offset + payload_len >= raw.len();
+
+        let mut chunk = Vec::with_capacity(MAX_KEY_INPUT_CHUNK);
+        if first && bracketed {
+            chunk.extend_from_slice(BRACKETED_PASTE_START);
+        }
+        if let Some(slice) = raw.get(offset..offset + payload_len) {
+            chunk.extend_from_slice(slice);
+        }
+        if last && bracketed {
+            chunk.extend_from_slice(BRACKETED_PASTE_END);
+        }
+        chunks.push(chunk);
+        offset += payload_len;
+        first = false;
+    }
+    chunks
+}
+
 /// Result of classifying paste content for the confirmation gate.
 ///
 /// At least one flag is always set when this is produced by [`classify_paste`];
@@ -99,6 +170,15 @@ impl PasteGate {
         Self { confirmation_enabled, parked: None }
     }
 
+    /// Swap the `terminal.paste_confirmation` setting after a config reload.
+    ///
+    /// A paste already parked is deliberately left alone: the user is looking
+    /// at a modal about specific bytes, and the answer they give must resolve
+    /// those bytes whichever way the setting moved underneath.
+    pub const fn set_confirmation_enabled(&mut self, enabled: bool) {
+        self.confirmation_enabled = enabled;
+    }
+
     /// Whether a paste is currently parked behind the confirmation dialog.
     #[must_use]
     pub const fn is_parked(&self) -> bool {
@@ -152,6 +232,39 @@ mod tests {
     use gpui::{AppContext as _, Entity, TestAppContext};
 
     use super::{PasteGate, PasteGateEvent, classify_paste};
+
+    // @lat: [[test#GPUI Paste Chunking#Small paste is one frame]]
+    #[test]
+    fn small_paste_is_one_frame_wrapped_only_when_bracketed() {
+        assert_eq!(super::paste_chunks("hello", false), vec![b"hello".to_vec()]);
+        assert_eq!(super::paste_chunks("hello", true), vec![b"\x1b[200~hello\x1b[201~".to_vec()]);
+        assert!(super::paste_chunks("", true).is_empty());
+    }
+
+    // @lat: [[test#GPUI Paste Chunking#Large paste splits under the limit]]
+    #[test]
+    fn large_paste_splits_into_frames_the_server_accepts() {
+        let text = "x".repeat(super::MAX_KEY_INPUT_CHUNK * 2 + 17);
+        let chunks = super::paste_chunks(&text, false);
+        assert!(chunks.len() > 2);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= super::MAX_KEY_INPUT_CHUNK));
+        assert_eq!(chunks.concat(), text.as_bytes());
+    }
+
+    // @lat: [[test#GPUI Paste Chunking#Markers ride the first and last frame]]
+    #[test]
+    fn bracketed_markers_ride_only_the_first_and_last_frame() {
+        let text = "y".repeat(super::MAX_KEY_INPUT_CHUNK * 2);
+        let chunks = super::paste_chunks(&text, true);
+        assert!(chunks.len() >= 3);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= super::MAX_KEY_INPUT_CHUNK));
+        let joined = chunks.concat();
+        assert!(joined.starts_with(b"\x1b[200~"));
+        assert!(joined.ends_with(b"\x1b[201~"));
+        // Exactly one marker pair across the whole paste, so the shell sees one
+        // contiguous region rather than one per frame.
+        assert_eq!(joined.len(), text.len() + 12);
+    }
 
     // @lat: [[client#GPUI Client Spike#Bracketed Paste Gate]]
     #[test]

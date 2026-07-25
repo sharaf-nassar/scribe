@@ -1,0 +1,14 @@
+[terminal]
+# The paste under test is a single line with no control bytes, so the spec-011
+# gate would not fire anyway; keeping it off states that intent explicitly.
+paste_confirmation = false
+
+[terminal.clipboard]
+# Both OSC 52 axes in prompt mode so the confirmation modal — and therefore
+# ClipboardPromptResponse on the wire — is exercised for a write and a read.
+read_mode = "prompt"
+write_mode = "prompt"
+# The burst-reuse window would replay the first Allow onto the next request
+# without a second prompt, which would hide the read prompt entirely. Shrink it
+# so each phase raises its own modal.
+burst_window_ms = 1

@@ -27,7 +27,7 @@
 //! GPUI flex layout and `on_click` listeners.
 
 use gpui::{Context, EventEmitter, FocusHandle, Rgba, div, prelude::*, px};
-use scribe_common::protocol::{ClipboardOp, ClipboardSelection, PromptId};
+use scribe_common::protocol::{ClipboardDecision, ClipboardOp, ClipboardSelection, PromptId};
 use scribe_common::theme::ChromeColors;
 
 use crate::lan_approval::{LanApprovalAction, LanApprovalDialog};
@@ -432,6 +432,23 @@ pub enum ClipboardDialogAction {
     AlwaysAllow,
     /// Deny this request and persist the matching axis to `"deny"`.
     AlwaysDeny,
+}
+
+impl ClipboardDialogAction {
+    /// The wire decision this button sends back as
+    /// `ClientMessage::ClipboardPromptResponse`.
+    ///
+    /// The mapping lives here rather than at the shell's routing site so the
+    /// button order and the protocol enum can only ever be paired in one place.
+    #[must_use]
+    pub const fn decision(self) -> ClipboardDecision {
+        match self {
+            Self::AllowOnce => ClipboardDecision::AllowOnce,
+            Self::DenyOnce => ClipboardDecision::DenyOnce,
+            Self::AlwaysAllow => ClipboardDecision::AlwaysAllow,
+            Self::AlwaysDeny => ClipboardDecision::AlwaysDeny,
+        }
+    }
 }
 
 /// Clipboard-dialog state for one OSC 52 request. `Deny once` is the default

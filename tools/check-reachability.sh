@@ -238,12 +238,16 @@ die "reachability: handle_layout_action does not name: @unmatched\n" if @unmatch
 # that rustfmt splits it, and a braced block once the chain shrinks enough for
 # the one-line form to be tried and rejected on width. Accept either shape, so
 # wiring a variant up cannot break the gate on formatting alone.
-my ($before) = $dispatch =~ /(.*?)=>\s*\{?\s*unhandled_layout_action/s;
-die "reachability: handle_layout_action has no unhandled_layout_action arm\n"
-    unless defined $before;
-my ($chain) = $before =~ /((?:LayoutAction::\w+\s*\|\s*)*LayoutAction::\w+\s*)\z/s;
-die "reachability: could not read the unhandled LayoutAction arm\n" unless defined $chain;
-my %unhandled_action = map { $_ => 1 } ($chain =~ /LayoutAction::(\w+)/g);
+#
+# Its absence is the goal state, not an error: once every LayoutAction has a
+# real handler there is nothing left to swallow and the arm is deleted along
+# with its counter, so a missing arm means the unhandled set is empty.
+my %unhandled_action;
+if (my ($before) = $dispatch =~ /(.*?)=>\s*\{?\s*unhandled_layout_action/s) {
+    my ($chain) = $before =~ /((?:LayoutAction::\w+\s*\|\s*)*LayoutAction::\w+\s*)\z/s;
+    die "reachability: could not read the unhandled LayoutAction arm\n" unless defined $chain;
+    %unhandled_action = map { $_ => 1 } ($chain =~ /LayoutAction::(\w+)/g);
+}
 for my $variant (@layout_actions) {
     printf "layout-action\t%s\t%s\n", $variant,
         ($unhandled_action{$variant} ? 'unhandled' : 'handled');

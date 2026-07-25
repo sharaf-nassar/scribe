@@ -559,6 +559,30 @@ impl IpcSink {
         self.enqueue(ClientMessage::ListLanPeers)
     }
 
+    /// Answers a spec-010 OSC 52 message the server sent this client.
+    ///
+    /// The two answers — `ClipboardPromptResponse` for a confirmation overlay
+    /// and `ClipboardBridgeReadReply` for a host clipboard read — are built by
+    /// [`scribe_client_gpui::clipboard`] from the parked request, because only
+    /// that module knows how a `BridgeError` collapses onto the reply. This
+    /// method is the seam that puts the finished frame on the ordered writer
+    /// channel; anything else is refused rather than sent, so the clipboard
+    /// path cannot become a generic escape hatch onto the wire.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn clipboard_answer(&self, message: ClientMessage) -> Result<(), SinkClosed> {
+        debug_assert!(
+            matches!(
+                message,
+                ClientMessage::ClipboardPromptResponse { .. }
+                    | ClientMessage::ClipboardBridgeReadReply { .. }
+            ),
+            "clipboard_answer takes only the two spec-010 client answers",
+        );
+        self.enqueue(message)
+    }
+
     /// Reports a pane focus transition so the server can relay CSI focus events
     /// (`\x1b[I` / `\x1b[O`) to PTY applications that enabled DECSET 1004.
     ///

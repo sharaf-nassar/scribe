@@ -22,11 +22,119 @@
 //! [`ServerMessage::ClipboardBridgeReadRequest`]: scribe_common::protocol::ServerMessage
 //! [`ServerMessage::ClipboardBridgeWrite`]: scribe_common::protocol::ServerMessage
 
+use std::collections::VecDeque;
+
 use scribe_common::protocol::{
-    BridgeError, ClientMessage, ClipboardDecision, ClipboardSelection, PromptId,
+    BridgeError, ClientMessage, ClipboardDecision, ClipboardOp, ClipboardSelection, PromptId,
 };
 
 use crate::clipboard_cleanup::{self, CopyTextOptions};
+
+/// Upper bound on server-initiated bridge jobs parked for the foreground.
+///
+/// The reader thread cannot touch the host clipboard itself (arboard is not
+/// thread-safe and the FR-019 focus gate only has a meaning on the window
+/// thread), so every bridge message is queued for the next foreground tick. A
+/// PTY program can emit OSC 52 far faster than that tick drains, so the queue
+/// is bounded and the oldest job is dropped once it is full — the same
+/// bounded-queue posture the server takes with `MAX_PENDING_FOR_PROMPT`.
+pub const MAX_PENDING_BRIDGE_JOBS: usize = 64;
+
+/// One server-initiated host clipboard job the IPC reader parked for the GPUI
+/// foreground to perform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeJob {
+    /// `ServerMessage::ClipboardBridgeWrite` — overwrite `selection` with
+    /// `payload`. No reply is expected (OSC 52 has no write ack).
+    Write {
+        /// Which pasteboard the write targets.
+        selection: ClipboardSelection,
+        /// Text the PTY-side program asked to place on the clipboard.
+        payload: String,
+    },
+    /// `ServerMessage::ClipboardBridgeReadRequest` — read `selection` and
+    /// answer with `ClientMessage::ClipboardBridgeReadReply`.
+    Read {
+        /// Correlation id the reply must echo.
+        request_id: PromptId,
+        /// Which pasteboard to read.
+        selection: ClipboardSelection,
+    },
+}
+
+/// A parked `ServerMessage::ClipboardPromptRequest` awaiting a confirmation
+/// overlay, kept whole so the raised dialog and its answer share one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardPrompt {
+    /// Correlation id the `ClipboardPromptResponse` must echo.
+    pub request_id: PromptId,
+    /// Whether the PTY program asked to read or to write.
+    pub op: ClipboardOp,
+    /// Which pasteboard the request targets.
+    pub selection: ClipboardSelection,
+    /// Head-and-tail truncated write payload preview; always `None` for reads.
+    pub preview: Option<String>,
+}
+
+/// Cross-thread OSC 52 state shared by the IPC reader and the GPUI window.
+///
+/// The reader owns none of the surfaces an OSC 52 message needs — the modal is
+/// a GPUI entity and the host clipboard is a window-thread resource — so it
+/// folds every clipboard message into this aggregate and the foreground tick
+/// drains it. `gating` mirrors the `clipboard_gating` bit the server echoed in
+/// `Welcome`: until it is on, the server has not agreed to route OSC 52 through
+/// this client at all, and any clipboard message that still arrives is dropped
+/// rather than acted on (the winit client's identical guard).
+#[derive(Debug, Default)]
+pub struct ClipboardBridge {
+    gating: bool,
+    prompt: Option<ClipboardPrompt>,
+    jobs: VecDeque<BridgeJob>,
+}
+
+impl ClipboardBridge {
+    /// Record the `clipboard_gating` capability the server echoed in `Welcome`.
+    pub const fn set_gating(&mut self, gating: bool) {
+        self.gating = gating;
+    }
+
+    /// Whether the server agreed to gate OSC 52 through this client.
+    #[must_use]
+    pub const fn gating(&self) -> bool {
+        self.gating
+    }
+
+    /// Park a confirmation request for the window to raise.
+    ///
+    /// A second prompt cannot be outstanding — the server keeps exactly one
+    /// per session and defers the rest — so a replacement simply overwrites,
+    /// which also means a prompt that arrived while the window was tearing down
+    /// can never wedge the slot.
+    pub fn park_prompt(&mut self, prompt: ClipboardPrompt) {
+        self.prompt = Some(prompt);
+    }
+
+    /// Take the parked confirmation request, if any.
+    pub fn take_prompt(&mut self) -> Option<ClipboardPrompt> {
+        self.prompt.take()
+    }
+
+    /// Queue a host clipboard job for the foreground, dropping the oldest when
+    /// the bound is reached. Returns `true` when a job was evicted.
+    pub fn push_job(&mut self, job: BridgeJob) -> bool {
+        let evicted = self.jobs.len() >= MAX_PENDING_BRIDGE_JOBS;
+        if evicted {
+            self.jobs.pop_front();
+        }
+        self.jobs.push_back(job);
+        evicted
+    }
+
+    /// Take every queued job in arrival order, leaving the queue empty.
+    pub fn drain_jobs(&mut self) -> Vec<BridgeJob> {
+        self.jobs.drain(..).collect()
+    }
+}
 
 /// Host clipboard I/O abstraction behind the OSC 52 bridge.
 ///
@@ -120,6 +228,39 @@ pub fn read_reply<B: ClipboardBackend>(
 #[must_use]
 pub fn prompt_response(request_id: PromptId, decision: ClipboardDecision) -> ClientMessage {
     ClientMessage::ClipboardPromptResponse { request_id, decision }
+}
+
+/// Spec 010 T042 — persist the policy axis an `Always*` decision settled.
+///
+/// `AllowOnce` / `DenyOnce` are a no-op: only the sticky choices write config.
+/// The server flips its own in-memory snapshot the moment the response lands,
+/// so this write is what makes the choice survive a restart — and the config
+/// watcher's `ConfigReloaded` round trip re-applies the identical value, which
+/// is why a failed save is a warning rather than an error.
+pub fn persist_policy_axis(op: ClipboardOp, decision: ClipboardDecision) {
+    use scribe_common::config::{ClipboardMode, load_config, save_config};
+
+    let new_mode = match decision {
+        ClipboardDecision::AlwaysAllow => ClipboardMode::Allow,
+        ClipboardDecision::AlwaysDeny => ClipboardMode::Deny,
+        ClipboardDecision::AllowOnce | ClipboardDecision::DenyOnce => return,
+    };
+    let mut config = match load_config() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(%error, "clipboard policy not persisted: config unreadable");
+            return;
+        }
+    };
+    match op {
+        ClipboardOp::Read => config.terminal.clipboard_policy.read_mode = new_mode,
+        ClipboardOp::Write => config.terminal.clipboard_policy.write_mode = new_mode,
+    }
+    if let Err(error) = save_config(&config) {
+        tracing::warn!(%error, "clipboard policy not persisted: config unwritable");
+    } else {
+        tracing::info!(?op, ?new_mode, "persisted the clipboard policy axis");
+    }
 }
 
 /// Read the Linux primary selection for a middle-click paste.

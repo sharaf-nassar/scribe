@@ -22,6 +22,7 @@ use scribe_client_gpui::{
     opacity::{opaque_slot, scale_alpha},
     restore_replay::round_positive_f32_to_u16,
     search::{MatchHighlight, MatchHighlightColors},
+    selection::SelectionSpan,
     split_scroll,
 };
 use scribe_common::config::AppearanceConfig;
@@ -230,6 +231,9 @@ pub struct TerminalElement {
     highlights: Vec<MatchHighlight>,
     /// Accent colours a highlighted span is painted with.
     highlight_colors: MatchHighlightColors,
+    /// Mouse-selection runs for this frame, already projected onto the visible
+    /// viewport. Empty whenever the pane holds no selection.
+    selection: Vec<SelectionSpan>,
     bounds_sink: GridBounds,
 }
 
@@ -245,7 +249,15 @@ impl TerminalElement {
         highlight_colors: MatchHighlightColors,
         bounds_sink: GridBounds,
     ) -> Self {
-        Self { content, font, colors, highlights: Vec::new(), highlight_colors, bounds_sink }
+        Self {
+            content,
+            font,
+            colors,
+            highlights: Vec::new(),
+            highlight_colors,
+            selection: Vec::new(),
+            bounds_sink,
+        }
     }
 
     /// Highlight `highlights` as find matches on top of the resolved cells.
@@ -257,6 +269,18 @@ impl TerminalElement {
     #[must_use]
     pub fn with_highlights(mut self, highlights: Vec<MatchHighlight>) -> Self {
         self.highlights = highlights;
+        self
+    }
+
+    /// Paint `selection` as the active mouse selection under the find matches.
+    ///
+    /// Selection is folded into the same per-cell resolve the find highlights
+    /// use, and applied first, so a find match inside a selection still reads
+    /// as a match — the search accent wins the overlap, exactly as it does in
+    /// the winit client.
+    #[must_use]
+    pub fn with_selection(mut self, selection: Vec<SelectionSpan>) -> Self {
+        self.selection = selection;
         self
     }
 
@@ -311,6 +335,7 @@ impl TerminalElement {
                     .then(|| scale_alpha(opaque_slot(bg), self.colors.opacity));
                 ResolvedCell { fg: opaque_slot(fg), bg: painted_bg, flags: cell.flags }
             }));
+            self.apply_selection(row_index, &mut resolved);
             self.apply_highlights(row_index, default_bg, &mut resolved);
 
             paint_cell_backgrounds(&resolved, geometry, window);
@@ -367,6 +392,30 @@ impl TerminalElement {
             };
             for cell in cells {
                 self.highlight_cell(cell, span.current, window_bg);
+            }
+        }
+    }
+
+    /// Recolour the cells of `row_index` that the mouse selection covers.
+    ///
+    /// Both channels come from the theme's `selection` / `selection_foreground`
+    /// keys rather than from a blend, so selected text keeps a single, uniform
+    /// look across coloured shell output — which is what makes a selection
+    /// readable as one contiguous region.
+    fn apply_selection(&self, row_index: usize, resolved: &mut [ResolvedCell]) {
+        if self.selection.is_empty() {
+            return;
+        }
+        let cells_theme = &self.colors.cells;
+        let bg = opaque_slot(linear_to_srgb_rgba(cells_theme.selection_bg()));
+        let fg = opaque_slot(linear_to_srgb_rgba(cells_theme.selection_fg()));
+        for span in self.selection.iter().filter(|span| span.row == row_index) {
+            let Some(cells) = resolved.get_mut(span.start_col..=span.end_col) else {
+                continue;
+            };
+            for cell in cells {
+                cell.bg = Some(scale_alpha(bg, self.colors.opacity));
+                cell.fg = fg;
             }
         }
     }
