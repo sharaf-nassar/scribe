@@ -4,6 +4,17 @@ Every row of [`parity-inventory.md`](parity-inventory.md) carries a verdict on
 whether the feature is reachable by a user of the running GPUI client, rather
 than merely implemented and unit-tested. Audited at `f56ef95`.
 
+> **Line-number anchors are as of `f56ef95` and have since shifted.** In
+> particular the two catch-alls this audit cites as evidence — `_ => {}` at
+> `main.rs:1564` and `_ => tracing::debug!` at `main.rs:430` — no longer exist:
+> `e0d47c1` replaced them with `dispatch_server_message` /
+> `unhandled_server_message`, an exhaustive `server_message_variant` table, and
+> an exhaustive `handle_layout_action` routing to `unhandled_layout_action`.
+> The verdicts and counts below remain accurate; only the anchors are stale.
+> The live metric is now produced mechanically by `tools/check-reachability.sh`
+> against `tools/reachability-baseline.txt`, which is the authoritative,
+> ratcheted source going forward.
+
 ## Why this audit exists
 
 The 016 launch gate treated a green `cargo test` as proof of parity. It is not.
