@@ -162,7 +162,7 @@ Everything else is silently discarded on the wire.
 | `WorkspaceNamed` | visual-E2E | MISSING | no reference; `StatusBarData.workspace_name` hardcoded `None` |
 | `SessionCreated` | scripted-E2E | WIRED | `run_reader` arm → `open_created_tab` |
 | `SessionExited` | scripted-E2E | WIRED | `run_reader` arm → tab removal + `AiChrome::forget` |
-| `Bell` | manual | UNWIRED | `bell.rs` implements the routing; module not imported by `main.rs` |
+| `Bell` | scripted-E2E | WIRED | `run_reader` arm → `on_bell_message` queue → `TerminalView::poll_bells` → `BellController` gate → `Window::request_attention`; wired by bead .81 |
 | `Error` | visual-E2E | WIRED | `run_reader` arm → `set_status` |
 | `GitBranch` | visual-E2E | MISSING | no reference; `StatusBarData.git_branch` hardcoded `None` |
 | `SessionList` | scripted-E2E | WIRED | `run_reader` arm → `sync_tab_strip` |
@@ -474,7 +474,14 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
   `WorkspaceNotesChanged`, plus de-demoing `WorkspaceNotesGet` /
   `WorkspaceNotesMutate` (fabricated `WorkspaceId` at `main.rs:561`, reply
   dropped by the reader catch-all).
-- **FU-22 Bell.** Row: `Bell`.
+- **FU-22 Bell.** Row: `Bell`. **Landed.** `bell.rs` is now in `main.rs`'s
+  import closure and `ServerMessage::Bell` has its own reader arm. The reader
+  queues the belling session; the window-lifecycle tick refreshes the gate's
+  focus / focused-pane / update-in-flight inputs and drains the queue through
+  `BellController`, and a surviving bell calls `Window::request_attention` —
+  GPUI's equivalent of the winit client's `request_user_attention`. Verified on
+  a real BEL byte and on the resulting `WM_HINTS` urgency flag by
+  `tests/e2e/visual/bell.sh`.
 - **FU-23 In-app settings entry point.** Row: `settings` action. The settings
   window exists and works but has no in-app trigger.
 

@@ -25,13 +25,12 @@
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
 counts modules-total 61
-counts modules-wired 31
+counts modules-wired 32
 counts server-messages-total 59
-counts server-messages-handled 31
+counts server-messages-handled 32
 counts layout-actions-total 36
 counts layout-actions-handled 10
 
-unwired-module bell
 unwired-module clipboard
 unwired-module clipboard_cleanup
 unwired-module divider
@@ -63,7 +62,6 @@ unwired-module workspace_tree
 unwired-module zoom
 
 unhandled-server-message ActionDispatched
-unhandled-server-message Bell
 unhandled-server-message ClipboardBridgeReadRequest
 unhandled-server-message ClipboardBridgeWrite
 unhandled-server-message ClipboardPromptRequest

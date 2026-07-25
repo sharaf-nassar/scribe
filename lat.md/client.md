@@ -221,9 +221,13 @@ On the user's answer, `confirm` re-emits `Send` on the exact parked bytes — by
 
 ### Bell Routing
 
-The GPUI rebuild ports the winit `handle_bell_event` suppression gate onto an entity that routes a terminal bell to a per-tab attention badge plus the system bell, covered by `#[gpui::test]`.
+The GPUI rebuild ports the winit `handle_bell_event` suppression gate onto an entity that routes a terminal bell to a per-tab attention badge plus the system bell, wired end to end from the live IPC reader to the window's attention request.
 
 [[crates/scribe-client-gpui/src/bell.rs#BellController]] is a `gpui::Entity` tracking window focus, the focused session, and whether an update is in progress. `on_bell` records an attention badge and emits [[crates/scribe-client-gpui/src/bell.rs#BellEvent]] `Signal` (the view rings the OS bell / requests window attention) only when the bell targets a session other than the focused foreground pane — or the window is unfocused — and no update is in progress; a bell to the already-focused foreground pane is suppressed, exactly like the winit client. `focus_session` retires that session's badge.
+
+The gate cannot run on the IPC reader thread: it is a GPUI entity and the action it authorises is a window-level call. [[crates/scribe-client-gpui/src/main.rs#on_bell_message]] therefore only records which session belled, onto a queue shared with the foreground, and bumps the redraw generation. [[crates/scribe-client-gpui/src/main.rs#TerminalView#poll_bells]] drains that queue on the window-lifecycle tick, refreshing the gate's three inputs from where they actually live first — the focused pane from the shared `active_session`, the in-flight update from the shared [[crates/scribe-client-gpui/src/update.rs#UpdateState]] (the winit client read `update_available.is_none()` at the same point), and window focus from [[crates/scribe-client-gpui/src/main.rs#TerminalView#on_activation]]. A queued bell is therefore judged against the focus state it is delivered under, not the one it arrived under.
+
+[[crates/scribe-client-gpui/src/main.rs#TerminalView#start_bell_gate]] subscribes the view to the controller *in* the window, so a `Signal` arrives with the `Window` that [[crates/scribe-client-gpui/src/main.rs#TerminalView#on_bell_signal]] needs: it calls `Window::request_attention`, GPUI's equivalent of the winit client's `request_user_attention(Informational)`. On X11 that sets the `WM_HINTS` urgency flag, which is what makes the routed bell observable from outside the process — see [[test#Visual E2E Tests#Terminal bell attention routing]].
 
 ### GPUI Terminal Selection Port
 

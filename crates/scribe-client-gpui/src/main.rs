@@ -23,6 +23,7 @@ use gpui::{
 use gpui_platform::application;
 use scribe_client_gpui::ai_indicator::AiStateTracker;
 use scribe_client_gpui::animation::AnimationSettings;
+use scribe_client_gpui::bell::{BellController, BellEvent};
 use scribe_client_gpui::chrome_metadata::{ChromeMetadata, SessionChrome};
 use scribe_client_gpui::color::TerminalColors as CellColors;
 use scribe_client_gpui::command_palette::{
@@ -250,6 +251,12 @@ struct Shared {
     /// the server's `WindowClosed` / `QuitRequested` / `WindowList` answer back
     /// into it; the view's lifecycle tick drains the acknowledged exit.
     lifecycle: Arc<Mutex<WindowLifecycle>>,
+    /// Terminal bells the IPC reader has taken off the wire and the foreground
+    /// has not yet run through the [`BellController`] gate. The reader cannot
+    /// touch the gate itself: it is a GPUI entity whose signal is a window-level
+    /// attention request, so the reader only records the session that belled and
+    /// the lifecycle tick drains the queue on the thread that owns the window.
+    bells: Arc<Mutex<Vec<SessionId>>>,
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -361,6 +368,10 @@ struct TerminalView {
     /// window id (so: X11 sessions only). Suppresses keystrokes while a
     /// compositor overlay covers the window without sending a focus event.
     x11_focus: Option<X11FocusGuard>,
+    /// Terminal-bell suppression gate. The lifecycle tick feeds it the bells the
+    /// IPC reader queued plus the focus context the gate reads, and the gate
+    /// decides which of them are worth an attention request.
+    bell: Entity<BellController>,
     /// When the window list was last polled, throttling the `ListWindows` send
     /// to [`WINDOW_LIST_POLL_INTERVAL`].
     last_window_list_poll: Instant,
@@ -378,6 +389,9 @@ struct TerminalView {
     /// the server on every activation change and clears the X11 guard's
     /// reactivation debounce on a genuine focus event.
     _activation_observer: Subscription,
+    /// Held to keep the bell signal subscription alive. Registered with the
+    /// window so a signal arrives with the `Window` its attention request needs.
+    _bell_subscription: Subscription,
 }
 
 impl TerminalView {
@@ -408,6 +422,7 @@ impl TerminalView {
         // guard is only one of the two things an activation change drives.
         let activation_observer = cx
             .observe_window_activation(window, |view, window, ctx| view.on_activation(window, ctx));
+        let (bell, bell_subscription) = Self::start_bell_gate(window, cx);
         // The WM's close button must raise the in-app close dialog instead of
         // destroying the window behind the server's back, so the platform close
         // is always vetoed and the dialog decides what to ask the server for.
@@ -473,13 +488,39 @@ impl TerminalView {
             pending_osc8_uri: None,
             tooltip_demo: false,
             x11_focus,
+            bell,
             last_window_list_poll: Instant::now(),
             _refresh_task: refresh_task,
             _config_task: config_task,
             _x11_focus_task: x11_focus_task,
             _lifecycle_task: lifecycle_task,
             _activation_observer: activation_observer,
+            _bell_subscription: bell_subscription,
         }
+    }
+
+    /// Create the terminal-bell suppression gate and wire its signal to the
+    /// window's attention request.
+    ///
+    /// The gate is seeded with the window's real focus state rather than the
+    /// entity default, so a bell that arrives before the first activation change
+    /// is judged against reality. The subscription is registered *in* the window
+    /// because the only thing a signal does is call `Window::request_attention`,
+    /// and `subscribe_in` is what hands the handler that window.
+    fn start_bell_gate(
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<BellController>, Subscription) {
+        let active = window.is_window_active();
+        let bell = cx.new(|_| {
+            let mut controller = BellController::new();
+            controller.set_window_focused(active);
+            controller
+        });
+        let subscription = cx.subscribe_in(&bell, window, |_, _, event, window, _| {
+            Self::on_bell_signal(*event, window);
+        });
+        (bell, subscription)
     }
 
     /// Drain a pending config-file change and reapply it to the live window.
@@ -949,13 +990,64 @@ impl TerminalView {
         }
     }
 
+    /// Run every terminal bell the IPC reader queued through the suppression
+    /// gate, on the thread that owns the window.
+    ///
+    /// The gate's inputs are refreshed first because all three live outside it:
+    /// the focused pane is the shared `active_session` the reader and the tab
+    /// shortcuts both move, and an update in flight is the shared
+    /// [`UpdateState`] — the winit client read `update_available.is_none()` at
+    /// exactly this point. Refreshing them before the drain is what makes a
+    /// queued bell judged against the focus state it is actually delivered
+    /// under, so a bell that arrived while a background tab was selected is
+    /// still suppressed if that tab is the foreground pane by the time it lands.
+    fn poll_bells(&mut self, cx: &mut Context<Self>) {
+        let Ok(mut queued) = self.shared.bells.lock() else {
+            tracing::warn!("bell queue mutex poisoned; dropping queued bells");
+            return;
+        };
+        if queued.is_empty() {
+            return;
+        }
+        let bells = std::mem::take(&mut *queued);
+        drop(queued);
+        let focused = self.shared.active_session.lock().ok().and_then(|guard| *guard);
+        let updating = self.shared.update.lock().is_ok_and(|update| update.version().is_some());
+        self.bell.update(cx, |controller, ctx| {
+            if let Some(session_id) = focused {
+                controller.focus_session(session_id, ctx);
+            }
+            controller.set_update_in_progress(updating);
+            for session_id in bells {
+                controller.on_bell(session_id, ctx);
+            }
+        });
+    }
+
+    /// Perform a bell the gate let through: ask the OS to draw attention to this
+    /// window.
+    ///
+    /// This is the winit client's `handle_bell_event` tail — it called
+    /// `request_user_attention(Informational)` on exactly the same condition —
+    /// lowered onto GPUI's platform equivalent. On X11 that sets the `WM_HINTS`
+    /// urgency flag, which is why the attention request is observable from
+    /// outside the process even where no audible bell exists.
+    fn on_bell_signal(event: BellEvent, window: &mut Window) {
+        let BellEvent::Signal { session_id } = event;
+        window.request_attention();
+        tracing::info!(%session_id, "terminal bell requested window attention");
+    }
+
     /// Run one window-lifecycle tick on the GPUI thread.
     ///
-    /// Three jobs, all of which need the foreground: a server-acknowledged exit
-    /// can only be performed here, a focus transition the IPC reader caused
-    /// (a reattach moves the focused pane with no UI event behind it) is
-    /// reconciled here, and the window-list poll sends from the view's own sink.
+    /// Four jobs, all of which need the foreground: the queued terminal bells
+    /// are gated and signalled here (the attention request is a window call), a
+    /// server-acknowledged exit can only be performed here, a focus transition
+    /// the IPC reader caused (a reattach moves the focused pane with no UI event
+    /// behind it) is reconciled here, and the window-list poll sends from the
+    /// view's own sink.
     fn poll_window_lifecycle(&mut self, cx: &mut Context<Self>) {
+        self.poll_bells(cx);
         let exit = self.shared.lifecycle.lock().ok().and_then(|mut l| l.take_exit());
         if let Some(reason) = exit {
             match reason {
@@ -1511,11 +1603,15 @@ impl TerminalView {
     /// Compositor overlays never send focus events, so a genuine activation
     /// also means the user really is back: drop the guard's reactivation
     /// debounce rather than eating the keystroke that follows a real refocus.
-    fn on_activation(&mut self, window: &Window, _cx: &mut Context<Self>) {
+    fn on_activation(&mut self, window: &Window, cx: &mut Context<Self>) {
         let active = window.is_window_active();
         if let Ok(mut lifecycle) = self.shared.lifecycle.lock() {
             lifecycle.set_window_active(active);
         }
+        // A blurred window makes every pane a background pane as far as the bell
+        // gate is concerned, which is the half of the winit condition that has
+        // nothing to do with which tab is selected.
+        self.bell.update(cx, |controller, _| controller.set_window_focused(active));
         self.report_focus();
         if !active {
             return;
@@ -2170,6 +2266,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         share: Arc::new(Mutex::new(ShareChrome::new())),
         update: Arc::new(Mutex::new(UpdateState::default())),
         lifecycle: Arc::new(Mutex::new(WindowLifecycle::new())),
+        bells: Arc::new(Mutex::new(Vec::new())),
     };
     let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
     let (in_tx, in_rx) = unbounded_channel::<InboundEvent>();
@@ -2372,6 +2469,7 @@ async fn run_connection(ctx: IpcThread) -> Result<(), String> {
             share: ctx.shared.share,
             update: ctx.shared.update,
             lifecycle: ctx.shared.lifecycle,
+            bells: ctx.shared.bells,
             out_tx: ctx.out_tx,
             in_tx: ctx.in_tx,
             sink: ctx.sink,
@@ -2526,6 +2624,9 @@ struct ReaderCtx {
     /// Window-lifecycle state the reader adopts a window id into and folds the
     /// server's close / quit / window-list answers onto.
     lifecycle: Arc<Mutex<WindowLifecycle>>,
+    /// Bell queue the reader appends to and the foreground's [`BellController`]
+    /// drains; see the `bells` field of `Shared`.
+    bells: Arc<Mutex<Vec<SessionId>>>,
     out_tx: UnboundedSender<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
@@ -2898,6 +2999,7 @@ fn dispatch_server_message(
         update @ (ServerMessage::UpdateAvailable { .. } | ServerMessage::UpdateProgress { .. }) => {
             on_update_message(ctx, update);
         }
+        ServerMessage::Bell { session_id } => on_bell_message(ctx, session_id),
         ServerMessage::Error { message } => set_status(&ctx.status, &ctx.generation, message),
         // Feature 015: the four share/control notices are routed as one group so
         // this table stays a screen of routing decisions; the arm names each
@@ -3064,6 +3166,25 @@ fn on_update_message(ctx: &ReaderCtx, message: ServerMessage) {
         // Unreachable: the caller only routes the two update variants here.
         other => unhandled_server_message(&other),
     }
+}
+
+/// Queue a terminal bell for the foreground's [`BellController`] gate.
+///
+/// The suppression gate itself cannot run here. It is a GPUI entity, and the
+/// action it authorises — a window-level attention request — belongs to the
+/// thread that owns the window, so the reader records only which session belled
+/// and bumps the generation so the next tick both drains the queue and repaints.
+/// Recording it unconditionally is deliberate: whether this bell is suppressed
+/// depends on the focus state at drain time, not at arrival time.
+fn on_bell_message(ctx: &ReaderCtx, session_id: SessionId) {
+    let Ok(mut queued) = ctx.bells.lock() else {
+        tracing::warn!("bell queue mutex poisoned; dropping bell");
+        return;
+    };
+    queued.push(session_id);
+    drop(queued);
+    tracing::info!(%session_id, "terminal bell received");
+    ctx.generation.fetch_add(1, Ordering::Release);
 }
 
 /// Adopt everything the server's `Welcome` hands this connection.
