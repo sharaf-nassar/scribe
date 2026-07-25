@@ -12,9 +12,9 @@
 #   * a palette row that creates a tab produces a real server round trip,
 #     asserted through the client's own "opened a new tab" line, which the
 #     server only ever answers with after `CreateSession`;
-#   * a palette row whose destination surface is not ported yet still reaches
-#     the shared dispatcher, asserted through the named "action not wired"
-#     warning rather than a silent drop.
+#   * a palette row whose destination is another top-level window ("Open
+#     Settings") reaches the shared dispatcher and puts that window on screen,
+#     asserted through the client's own line and the mapped X11 window.
 #
 # The client is handed a live pane by the shared-pane rig (SCRIBE_SHARED_PANE=1,
 # see docker/entrypoint-visual.sh): `scribe-test` creates the session and the
@@ -226,21 +226,25 @@ fi
 shot /output/04-palette-tab-created.png
 echo "PHASE 3 PASS: the palette 'New Tab' row round-tripped a real session"
 
-# ── Phase 4: an unported row still reaches the dispatcher ─────────
-# "Open Settings" has no destination surface in this client yet. The point of
-# this phase is that the row is *routed*: it lands on the shared dispatcher and
-# is named and counted there, instead of being discarded at the subscription
-# before any handler sees it.
-UNWIRED_BEFORE=$(count_log "action not wired into the GPUI shell")
+# ── Phase 4: a row whose surface is another window ────────────────
+# "Open Settings" does not act on the grid at all: it lowers onto
+# `KeyAction::OpenSettings` and opens a second top-level window. It is kept here
+# as the palette's non-terminal row — proof that a routed row reaches a handler
+# that lives outside this window — while `visual/settings-entry.sh` owns the
+# full entry-point matrix (chord, palette, gear, and the no-duplicate rule).
+SETTINGS_BEFORE=$(count_log "opened the settings window")
 focus
 send_keys ctrl+shift+p
 type_text "Open Settings"
 send_keys Return
-if ! wait_for_log_growth "action not wired into the GPUI shell" "$UNWIRED_BEFORE" 10; then
-    fail "PHASE 4 FAIL: the 'Open Settings' row was dropped before the dispatcher"
+if ! wait_for_log_growth "opened the settings window" "$SETTINGS_BEFORE" 15; then
+    fail "PHASE 4 FAIL: the 'Open Settings' row never opened the settings window"
 fi
-shot /output/05-palette-unported-row.png
-echo "PHASE 4 PASS: an unported palette row reaches the shared dispatcher"
+if ! xdotool search --name '^Scribe Settings$' >/dev/null 2>&1; then
+    fail "PHASE 4 FAIL: no settings window mapped after the 'Open Settings' row"
+fi
+shot /output/05-palette-settings-row.png
+echo "PHASE 4 PASS: the 'Open Settings' row opened the settings window"
 
 echo ""
 echo "PASS: visual overlay-actions test"
@@ -250,4 +254,4 @@ echo "    01-context-menu-open.png       — menu open at the cursor"
 echo "    02-context-menu-dispatched.png — the sent text echoed in the pane"
 echo "    03-palette-new-tab.png         — palette filtered to 'New Tab'"
 echo "    04-palette-tab-created.png     — the new tab in the strip"
-echo "    05-palette-unported-row.png    — palette after an unported row"
+echo "    05-palette-settings-row.png    — the settings window the row opened"

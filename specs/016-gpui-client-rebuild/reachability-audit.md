@@ -107,13 +107,13 @@ Determination techniques, in order of authority:
 | `QuitAll` | scripted-E2E | WIRED (bead .72) | `TerminalView::route_close_action` → `IpcSink::quit_all` |
 | `TriggerUpdate` | scripted-E2E | UNWIRED | `settings/server_action.rs:81` `request_trigger_update` has no caller |
 | `DismissUpdate` | gpui-test | MISSING | never constructed anywhere in the crate |
-| `CheckForUpdates` | scripted-E2E | WIRED | `settings/window.rs:161` from `action.check_for_updates` (`settings/model.rs:386`). Reachable only via `scribe-client-gpui --settings`; the in-app `settings` shortcut is swallowed |
-| `ListReleases` | scripted-E2E | WIRED | `settings/window.rs:165` from `action.list_releases` (`settings/model.rs:387`); same `--settings`-only caveat |
+| `CheckForUpdates` | scripted-E2E | WIRED | `settings/window.rs:161` from `action.check_for_updates` (`settings/model.rs:386`). Reached through the settings window, which bead .82 made reachable from inside the running client (settings chord, palette row, titlebar gear) as well as via `scribe-client-gpui --settings` |
+| `ListReleases` | scripted-E2E | WIRED | `settings/window.rs:165` from `action.list_releases` (`settings/model.rs:387`); same settings-window reachability |
 | `ListWindows` | scripted-E2E | WIRED (bead .72) | `TerminalView::poll_window_list` → `IpcSink::list_windows` |
 | `DispatchAction` | scripted-E2E | MISSING | not in the GPUI client; `scribe-cli` is the only sender |
 | `FocusChanged` | scripted-E2E | WIRED (bead .72) | `TerminalView::report_focus` → `IpcSink::focus_changed` |
 | `HookEvent` | scripted-E2E | WIRED | out-of-client by design: `crates/scribe-hook-helper/src/main.rs:119` |
-| `EnvPreflight` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.env_preflight`) and the gated `enable_env_persistence` ON transition; same `--settings`-only caveat. Asserted on the wire by `tests/e2e/visual/settings-trust.sh` |
+| `EnvPreflight` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.env_preflight`) and the gated `enable_env_persistence` ON transition; same settings-window reachability. Asserted on the wire by `tests/e2e/visual/settings-trust.sh` |
 | `ClipboardPromptResponse` | scripted-E2E | UNWIRED | built in `clipboard.rs`; module not imported by `main.rs` |
 | `ClipboardBridgeReadReply` | scripted-E2E | UNWIRED | built in `clipboard.rs`; module not imported by `main.rs` |
 | `RemoteHandshake` | scripted-E2E | UNWIRED | built in `remote_handshake.rs`; module not imported by `main.rs` |
@@ -122,12 +122,12 @@ Determination techniques, in order of authority:
 | `LanHello` | scripted-E2E | MISSING | never constructed anywhere in the crate |
 | `LanApprovalDecision` | scripted-E2E | UNWIRED | built in `lan_approval.rs`; module not imported by `main.rs` |
 | `ListLanPeers` | scripted-E2E | MISSING | never constructed anywhere in the crate |
-| `ListTrustedDevices` | scripted-E2E | WIRED | `settings/window.rs` `refresh_trust`, reached from `run_action` (`action.refresh_trust`) and the first visit to the Remote page; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
-| `RevokeTrustedDevice` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.revoke_trusted_device:<hex>` from each approved-device row); same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
-| `ListTrustedNetworks` | scripted-E2E | WIRED | `settings/window.rs` `refresh_trust`, same callers as `ListTrustedDevices`; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
-| `AddCurrentNetworkTrusted` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.add_current_network`); same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
-| `RemoveTrustedNetwork` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.remove_trusted_network:<id>` from each trusted-network row); same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
-| `GetLanEnv` | scripted-E2E | WIRED | `settings/window.rs` `refresh_trust`, alongside the two trust list queries; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `ListTrustedDevices` | scripted-E2E | WIRED | `settings/window.rs` `refresh_trust`, reached from `run_action` (`action.refresh_trust`) and the first visit to the Remote page; same settings-window reachability. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `RevokeTrustedDevice` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.revoke_trusted_device:<hex>` from each approved-device row); same settings-window reachability. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `ListTrustedNetworks` | scripted-E2E | WIRED | `settings/window.rs` `refresh_trust`, same callers as `ListTrustedDevices`; same settings-window reachability. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `AddCurrentNetworkTrusted` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.add_current_network`); same settings-window reachability. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `RemoveTrustedNetwork` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.remove_trusted_network:<id>` from each trusted-network row); same settings-window reachability. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `GetLanEnv` | scripted-E2E | WIRED | `settings/window.rs` `refresh_trust`, alongside the two trust list queries; same settings-window reachability. Asserted by `tests/e2e/visual/settings-trust.sh` |
 | `GetLanDialIdentity` | scripted-E2E | MISSING | never constructed anywhere in the crate |
 | `ControlClaim` | scripted-E2E | UNWIRED | built in `share.rs`; module not imported by `main.rs` |
 | `ControlRequest` | golden | UNWIRED | built in `share.rs`, unimported. Not emitting it is by design, but its live substitute `ControlClaim` is itself UNWIRED, so the sharing surface is unreachable either way |
@@ -141,7 +141,9 @@ Determination techniques, in order of authority:
 
 The live reader (`main.rs:1476`) matches exactly twelve variants and ends in
 `_ => {}` at `main.rs:1564`. Two more (`UpdateCheckResult`, `ReleaseList`) are
-consumed by the separate `--settings` window's synchronous request/reply helper.
+consumed by the settings window's synchronous request/reply helper (bead .82
+made that window reachable from inside the running client, not only via
+`--settings`).
 Everything else is silently discarded on the wire.
 
 | Variant | Verification method | Verdict | Evidence |
@@ -178,12 +180,12 @@ Everything else is silently discarded on the wire.
 | `QuitRequested` | scripted-E2E | WIRED (bead .72) | `on_window_lifecycle_message` → `WindowLifecycle::on_quit_requested` |
 | `UpdateAvailable` | visual-E2E | MISSING | no reference; `StatusBarData.update_available` hardcoded `None` |
 | `UpdateProgress` | visual-E2E | MISSING | no reference; `StatusBarData.update_progress` hardcoded `None` |
-| `UpdateCheckResult` | gpui-test | WIRED | `settings/server_action.rs:46`, reached from `settings/window.rs:161` (`--settings` only) |
-| `ReleaseList` | gpui-test | WIRED | `settings/server_action.rs:124`, reached from `settings/window.rs:165` (`--settings` only) |
+| `UpdateCheckResult` | gpui-test | WIRED | `settings/server_action.rs:46`, reached from `settings/window.rs:161` in the settings window |
+| `ReleaseList` | gpui-test | WIRED | `settings/server_action.rs:124`, reached from `settings/window.rs:165` in the settings window |
 | `PromptMark` | gpui-test | MISSING | no reference. `session_lifecycle` tracks trim offsets but no marks are ever ingested |
 | `TrimScrollback` | golden | WIRED | `run_reader` arm → `SessionRegistry::on_trim_scrollback` |
 | `ScrollBottom` | gpui-test | MISSING | no `ServerMessage::ScrollBottom` reference (the `keybindings.rs` hit is `LayoutAction::ScrollBottom`) |
-| `EnvPreflightResult` | scripted-E2E | WIRED | parsed by `parse_env_preflight_response` and rendered into the Environment page's status line; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `EnvPreflightResult` | scripted-E2E | WIRED | parsed by `parse_env_preflight_response` and rendered into the Environment page's status line; same settings-window reachability. Asserted by `tests/e2e/visual/settings-trust.sh` |
 | `EnvStatus` | visual-E2E | MISSING | no reference; `StatusBarData.env_status` hardcoded `None` |
 | `ClipboardPromptRequest` | visual-E2E | MISSING | no reference. The `ClipboardDialog` demo is built from literals at `main.rs:721` |
 | `ClipboardBridgeWrite` | scripted-E2E | UNWIRED | handled in `clipboard.rs`; module not imported by `main.rs` |
@@ -197,9 +199,9 @@ Everything else is silently discarded on the wire.
 | `LanApprovalResult` | visual-E2E | MISSING | no reference in the crate |
 | `LanApprovalRequest` | visual-E2E | UNWIRED | handled in `lan_approval.rs`; module not imported by `main.rs` |
 | `LanPeerList` | visual-E2E | MISSING | no reference in the crate |
-| `TrustedDeviceList` | scripted-E2E | WIRED | parsed by `parse_trusted_devices_response` and rendered as the Remote page's approved-device rows; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
-| `TrustedNetworkList` | scripted-E2E | WIRED | parsed by `parse_trusted_networks_response` and rendered as the Remote page's trusted-network rows; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
-| `LanEnv` | scripted-E2E | WIRED | parsed by `parse_lan_env_response` and rendered as the Remote page's own-fingerprint / addability notes; same `--settings`-only caveat. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `TrustedDeviceList` | scripted-E2E | WIRED | parsed by `parse_trusted_devices_response` and rendered as the Remote page's approved-device rows; same settings-window reachability. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `TrustedNetworkList` | scripted-E2E | WIRED | parsed by `parse_trusted_networks_response` and rendered as the Remote page's trusted-network rows; same settings-window reachability. Asserted by `tests/e2e/visual/settings-trust.sh` |
+| `LanEnv` | scripted-E2E | WIRED | parsed by `parse_lan_env_response` and rendered as the Remote page's own-fingerprint / addability notes; same settings-window reachability. Asserted by `tests/e2e/visual/settings-trust.sh` |
 | `LanDialIdentity` | scripted-E2E | MISSING | no reference in the crate |
 | `ShareRoster` | visual-E2E | UNWIRED | handled in `share.rs`; module not imported by `main.rs` |
 | `ControlRequested` | visual-E2E | UNWIRED | handled in `share.rs`; module not imported by `main.rs` |
@@ -257,7 +259,7 @@ also never executed).
 | `zoom_out` | View and overlays | WIRED | as above, `ZoomState::zoom_out` |
 | `zoom_reset` | View and overlays | WIRED | as above, `ZoomState::reset` |
 | `command_palette` | View and overlays | WIRED | `main.rs:700` opens the overlay. Degenerate: `CommandPaletteEvent::Execute(_)` is discarded at `main.rs:502`, so no palette entry does anything |
-| `settings` | View and overlays | UNWIRED | `KeyAction::OpenSettings` swallowed at `main.rs:799`; the settings window opens only via the `--settings` CLI flag (`main.rs:1199` `run_settings`) |
+| `settings` | View and overlays | WIRED (bead .82) | `dispatch_key_action` → `TerminalView::open_or_focus_settings` → `settings::open_settings_window`, the same window `run_settings` opens for `--settings`. The palette row and the titlebar gear (`TitlebarEvent::OpenSettings`) land on the same handler; the retained `WindowHandle` raises the open window instead of opening a second one. Asserted on the mapped X11 window by `tests/e2e/visual/settings-entry.sh` |
 | `word_left` | Terminal shortcuts | WIRED | `keybindings.rs:477` → `KeyAction::Terminal` → `main.rs:795` `send_key_bytes` |
 | `word_right` | Terminal shortcuts | WIRED | `keybindings.rs:478` → same path |
 | `delete_word_backward` | Terminal shortcuts | WIRED | `keybindings.rs:479` → same path |
@@ -269,7 +271,7 @@ also never executed).
 `KeyAction` variants: `Terminal` WIRED (`main.rs:795`), `Layout` partially wired
 (9 of 35 `LayoutAction` variants), `OpenCommandPalette` WIRED (claimed earlier in
 `handle_overlay_key`, `main.rs:700`), `OpenFind` WIRED (bead .69), `OpenSettings`
-UNWIRED.
+WIRED (bead .82).
 
 **Input subtotals:** WIRED 24 · UNWIRED 30 · MISSING 0 · UNKNOWN 0.
 
@@ -447,8 +449,9 @@ and blocks every `visual-E2E` row.
   `tests/e2e/visual/window-lifecycle.sh`.
 - **FU-14 Update surfaces in the terminal window.** Rows: `TriggerUpdate`,
   `DismissUpdate`, `UpdateAvailable`, `UpdateProgress`. (`CheckForUpdates` /
-  `ListReleases` / `UpdateCheckResult` / `ReleaseList` are reachable, but only
-  from the `--settings` window.)
+  `ListReleases` / `UpdateCheckResult` / `ReleaseList` are reachable from the
+  settings window, which bead .82 made openable from inside the running
+  client.)
 - **FU-15 X11 focus guard.** Row: X11 focus guard. `x11_focus.rs` needs starting
   from `open_window`.
 
@@ -530,8 +533,15 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
   GPUI's equivalent of the winit client's `request_user_attention`. Verified on
   a real BEL byte and on the resulting `WM_HINTS` urgency flag by
   `tests/e2e/visual/bell.sh`.
-- **FU-23 In-app settings entry point.** Row: `settings` action. The settings
-  window exists and works but has no in-app trigger.
+- **FU-23 In-app settings entry point.** Row: `settings` action. **Closed by
+  bead .82 — do not re-file.** `KeyAction::OpenSettings` now reaches
+  `TerminalView::open_or_focus_settings`, which opens the same window
+  `run_settings` opens for `--settings`; the palette row lowers onto the same
+  key action, and the titlebar gear's `TitlebarEvent::OpenSettings` — emitted
+  since the titlebar landed and never subscribed to — reaches it too. The
+  retained `WindowHandle` raises the open window instead of stacking a second
+  one. All three entry points and the no-duplicate rule are asserted against the
+  mapped X11 window by `tests/e2e/visual/settings-entry.sh`.
 
 ### In-flight bead coverage map
 
@@ -543,6 +553,7 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
 | .61 (close_tab/new_window) | `close_tab`, `new_window` |
 | .77 (FU-18 settings trust) | the nine FU-18 rows plus `GetLanEnv` / `LanEnv` |
 | .76 (FU-17 LAN dial and approval) | all eleven FU-17 rows |
+| .82 (FU-23 in-app settings entry) | the `settings` action, and the in-app reach of every settings-window row |
 
 Everything else in the fix units above is currently unfiled.
 
