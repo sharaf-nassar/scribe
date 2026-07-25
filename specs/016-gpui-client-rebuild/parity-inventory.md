@@ -255,17 +255,17 @@ Every row's method is `visual-E2E`: each action must be driven through
 | `new_window` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewWindow` arm → `open_new_window` → `start_window_backend` + `open_window` (`tests/e2e/visual/tab-window-chords.sh` phase 2) | required |
 | `copy` | Clipboard | visual-E2E | — (unwired, FU-8) — `CopySelection` hits the catch-all; `clipboard.rs`/`selection.rs` outside the import closure | required |
 | `paste` | Clipboard | visual-E2E | — (unwired, FU-8) — `PasteClipboard` hits the catch-all; `paste.rs` outside the import closure | required |
-| `scroll_up` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; `split_scroll.rs` outside the import closure | required |
-| `scroll_down` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; `split_scroll.rs` outside the import closure | required |
-| `scroll_top` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; `split_scroll.rs` outside the import closure | required |
-| `scroll_bottom` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; `split_scroll.rs` outside the import closure | required |
+| `scroll_up` | Navigation | visual-E2E | `TerminalView::scroll_terminal` (bead .59) — `tests/e2e/visual/terminal-viewport.sh` | required |
+| `scroll_down` | Navigation | visual-E2E | `TerminalView::scroll_terminal` (bead .59) | required |
+| `scroll_top` | Navigation | visual-E2E | `TerminalView::scroll_terminal` (bead .59) | required |
+| `scroll_bottom` | Navigation | visual-E2E | `TerminalView::scroll_terminal` (bead .59) — `tests/e2e/visual/terminal-viewport.sh` | required |
 | `find` | Navigation | visual-E2E | `main.rs::TerminalView::dispatch_key_action` → `TerminalView::open_find_overlay` → `search::FindOverlayView` | required |
 | `prompt_jump_up` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; no prompt marks are ingested | required |
 | `prompt_jump_down` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; no prompt marks are ingested | required |
 | `jump_to_failure` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; no prompt marks are ingested | required |
-| `zoom_in` | View and overlays | visual-E2E | — (unwired, FU-10) — hits the catch-all; `zoom.rs` outside the import closure | required |
-| `zoom_out` | View and overlays | visual-E2E | — (unwired, FU-10) — hits the catch-all; `zoom.rs` outside the import closure | required |
-| `zoom_reset` | View and overlays | visual-E2E | — (unwired, FU-10) — hits the catch-all; `zoom.rs` outside the import closure | required |
+| `zoom_in` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (bead .59) — `tests/e2e/visual/terminal-viewport.sh` | required |
+| `zoom_out` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (bead .59) — `tests/e2e/visual/terminal-viewport.sh` | required |
+| `zoom_reset` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (bead .59) — `tests/e2e/visual/terminal-viewport.sh` | required |
 | `command_palette` | View and overlays | visual-E2E | `main.rs::handle_overlay_key` opens the overlay — **degenerate**: `CommandPaletteEvent::Execute(_)` is discarded, so no palette entry does anything; FU-12 | required |
 | `settings` | View and overlays | visual-E2E | — (unwired, FU-23) — `KeyAction::OpenSettings` is swallowed in `handle_binding`; the settings window opens only via the `--settings` CLI flag | required |
 | `word_left` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |

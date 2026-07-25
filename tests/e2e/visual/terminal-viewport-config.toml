@@ -1,0 +1,4 @@
+[terminal]
+# Split-scroll is opt-in (`scroll_pin` defaults to false), so the pin can only
+# be exercised against a client whose config asked for it.
+scroll_pin = true

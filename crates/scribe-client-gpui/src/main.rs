@@ -8,6 +8,7 @@ mod terminal_element;
 
 use std::{
     collections::HashMap,
+    rc::Rc,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -59,11 +60,16 @@ use scribe_client_gpui::share::{
     ControlRequestPrompt, ShareChrome, ShareKey, ShareKeyOutcome, ShareOverlayColors, ShareState,
     share_overlay,
 };
+use scribe_client_gpui::smart_selection::{
+    ActionExpansionContext, ResolvedSmartSelectionAction, SmartSelectionCandidate,
+};
+use scribe_client_gpui::split_scroll::{SplitScrollEligibility, SplitScrollState};
 use scribe_client_gpui::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
 use scribe_client_gpui::sys_stats::SystemStatsCollector;
 use scribe_client_gpui::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
 use scribe_client_gpui::update::UpdateState;
 use scribe_client_gpui::url_detect;
+use scribe_client_gpui::vi_mode::ViMotion;
 use scribe_client_gpui::window_chrome;
 use scribe_client_gpui::window_lifecycle::{ExitReason, FocusReport, WindowLifecycle};
 use scribe_client_gpui::workspace_notes::WorkspaceNoteEntry;
@@ -71,7 +77,9 @@ use scribe_client_gpui::workspace_notes_modal::{
     WorkspaceNotesModalAction, WorkspaceNotesModalColors, WorkspaceNotesModalView,
 };
 use scribe_client_gpui::x11_focus::X11FocusGuard;
+use scribe_client_gpui::zoom::ZoomState;
 use scribe_client_gpui::{
+    smart_selection::CompiledSmartSelection,
     tab_bar::{TabBarColors, context_suffix},
     tab_session::{TabEntry, TabSessions},
     titlebar::TitlebarView,
@@ -79,7 +87,10 @@ use scribe_client_gpui::{
 use scribe_common::ai_state::AiProvider;
 use scribe_common::theme::ChromeColors;
 use scribe_common::{
-    config::{AiContextThresholds, StatusBarStatsConfig, load_config},
+    config::{
+        AiContextThresholds, SmartSelectionActionKind, SmartSelectionConfig, StatusBarStatsConfig,
+        load_config,
+    },
     framing::{read_message, write_message},
     ids::{SessionId, WorkspaceId},
     protocol::{
@@ -101,8 +112,10 @@ use tokio::{
 use crate::{
     ipc_bridge::{InboundEvent, IpcSink, run_drain},
     sync_frames::{SyncFrameQueue, drain_all_committed},
-    terminal::{Content, DisplayOnlyTerminal},
-    terminal_element::{GridColors, GridFont, TerminalElement},
+    terminal::{Content, DisplayOnlyTerminal, Scroll},
+    terminal_element::{
+        GridBounds, GridColors, GridFont, TerminalElement, cell_at, hits_jump_chip,
+    },
 };
 
 /// Wall-clock origin captured at the very top of `main`, used to time
@@ -335,8 +348,21 @@ struct TerminalView {
     status_colors: StatusBarColors,
     /// Which system-stat segments the status bar shows, from config.
     stats_config: StatusBarStatsConfig,
-    /// Font metrics the terminal grid paints with, rebuilt on a font reload.
+    /// Font metrics the terminal grid paints with, rebuilt on a font reload
+    /// and on every zoom step.
     font: GridFont,
+    /// Live font-scale step from the `zoom_in` / `zoom_out` / `zoom_reset`
+    /// chords, folded into [`Self::font`] on top of `appearance.font_size`.
+    zoom: ZoomState,
+    /// Compiled `terminal.smart_selection` rules, rebuilt on a config reload.
+    /// A right-click resolves its menu rows against these.
+    smart_selection: CompiledSmartSelection,
+    /// Pixel height of the split-scroll pin as of the last frame, so a click
+    /// can be hit-tested against the jump chip the paint pass drew.
+    split_scroll: SplitScrollState,
+    /// Where the terminal grid was painted last frame, filled in by the grid
+    /// canvas so a pointer position can be lowered onto a cell.
+    grid_bounds: GridBounds,
     /// Theme-derived prompt-bar palette, resolved once at view creation.
     prompt_colors: PromptBarColors,
     /// Warn/danger bands and per-band colours for the AI context-window meter.
@@ -422,6 +448,28 @@ struct TerminalView {
 }
 
 impl TerminalView {
+    /// Start the X11 active-window guard from the live window.
+    ///
+    /// The Xcb/Xlib window id only exists once the platform window has been
+    /// created, and `open_window` builds the root view with the real `Window`
+    /// in hand. Non-X11 backends yield no id, leaving the guard `None` and
+    /// every guard call an explicit no-op.
+    fn start_x11_focus_guard(
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> (Option<X11FocusGuard>, Option<Task<()>>) {
+        let guard = X11FocusGuard::from_window_handle(window);
+        if guard.is_none() {
+            return (None, None);
+        }
+        tracing::info!(
+            window = scribe_client_gpui::x11_focus::xcb_window_id(window),
+            "X11 active-window guard enabled"
+        );
+        let task = cx.spawn(async move |view, app| drive_x11_focus_polls(view, app).await);
+        (guard, Some(task))
+    }
+
     fn new(
         shared: Shared,
         sink: IpcSink,
@@ -429,21 +477,7 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Start the X11 active-window guard from the live window: the Xcb/Xlib
-        // window id only exists once the platform window has been created, and
-        // `open_window` builds the root view with the real `Window` in hand.
-        // Non-X11 backends yield no id, leaving `x11_focus` `None` and every
-        // guard call below an explicit no-op.
-        let x11_focus = X11FocusGuard::from_window_handle(&*window);
-        let x11_focus_task = if x11_focus.is_some() {
-            tracing::info!(
-                window = scribe_client_gpui::x11_focus::xcb_window_id(&*window),
-                "X11 active-window guard enabled"
-            );
-            Some(cx.spawn(async move |view, app| drive_x11_focus_polls(view, app).await))
-        } else {
-            None
-        };
+        let (x11_focus, x11_focus_task) = Self::start_x11_focus_guard(window, cx);
         // The focus observer is registered unconditionally: reporting focus to
         // the server is a protocol obligation on every backend, and the X11
         // guard is only one of the two things an activation change drives.
@@ -476,6 +510,7 @@ impl TerminalView {
         let font = GridFont::from_appearance(&config.config().config.appearance);
         let stats_config = config.config().config.terminal.status_bar_stats.clone();
         let terminal = &config.config().config.terminal;
+        let smart_selection = compile_smart_selection(&terminal.smart_selection);
         let context_thresholds = terminal.ai_session.context_thresholds.clone();
         let prompt_bar_enabled = terminal.prompt_bar.enabled;
         let prompt_colors = PromptBarColors::from(&chrome);
@@ -494,6 +529,10 @@ impl TerminalView {
             status_colors,
             stats_config,
             font,
+            zoom: ZoomState::new(),
+            smart_selection,
+            split_scroll: SplitScrollState::new(),
+            grid_bounds: GridBounds::default(),
             prompt_colors,
             context_thresholds,
             prompt_bar_enabled,
@@ -602,8 +641,9 @@ impl TerminalView {
         }
 
         if plan.font_changed() {
-            self.font = GridFont::from_appearance(&self.config.config().config.appearance);
-            self.report_cell_metrics();
+            // Rebuilt through the zoom step so a saved font-size edit rebases
+            // the live zoom instead of silently discarding it.
+            self.rebuild_font(cx);
         }
 
         if plan.opacity_changed() {
@@ -616,6 +656,7 @@ impl TerminalView {
         self.stats_config = terminal.status_bar_stats.clone();
         self.context_thresholds = terminal.ai_session.context_thresholds.clone();
         self.prompt_bar_enabled = terminal.prompt_bar.enabled;
+        self.smart_selection = compile_smart_selection(&terminal.smart_selection);
 
         // Tell the server to re-read the same file so its own live surfaces
         // (clipboard policy, env store, remote/share listeners) follow.
@@ -706,9 +747,10 @@ impl TerminalView {
 
     /// Run one [`LayoutAction`] intercepted from the key path.
     ///
-    /// Tab creation, selection, and closing are wired to the IPC sink, and
-    /// window creation opens a second top-level window; the
-    /// pane/workspace/navigation families are still swallowed (never forwarded
+    /// Tab creation, selection, and closing are wired to the IPC sink, window
+    /// creation opens a second top-level window, the four scrollback actions
+    /// move the display viewport, and the three zoom actions rescale the grid
+    /// font. The pane/workspace families are still swallowed (never forwarded
     /// to the PTY) because the shell has no pane tree yet, matching the legacy
     /// client's behaviour of never leaking a bound shortcut as terminal bytes.
     ///
@@ -738,6 +780,13 @@ impl TerminalView {
             }
             LayoutAction::CloseTab => self.close_active_tab(),
             LayoutAction::NewWindow => self.open_new_window(cx),
+            LayoutAction::ScrollUp => self.scroll_terminal(Scroll::PageUp, cx),
+            LayoutAction::ScrollDown => self.scroll_terminal(Scroll::PageDown, cx),
+            LayoutAction::ScrollTop => self.scroll_terminal(Scroll::Top, cx),
+            LayoutAction::ScrollBottom => self.scroll_terminal(Scroll::Bottom, cx),
+            LayoutAction::ZoomIn => self.apply_zoom(ZoomState::zoom_in, cx),
+            LayoutAction::ZoomOut => self.apply_zoom(ZoomState::zoom_out, cx),
+            LayoutAction::ZoomReset => self.apply_zoom(ZoomState::reset, cx),
             LayoutAction::SplitVertical
             | LayoutAction::SplitHorizontal
             | LayoutAction::ClosePane
@@ -754,17 +803,55 @@ impl TerminalView {
             | LayoutAction::WorkspaceFocusDown
             | LayoutAction::CopySelection
             | LayoutAction::PasteClipboard
-            | LayoutAction::ScrollUp
-            | LayoutAction::ScrollDown
-            | LayoutAction::ScrollTop
-            | LayoutAction::ScrollBottom
             | LayoutAction::PromptJumpUp
             | LayoutAction::PromptJumpDown
-            | LayoutAction::JumpToFailure
-            | LayoutAction::ZoomIn
-            | LayoutAction::ZoomOut
-            | LayoutAction::ZoomReset => unhandled_layout_action(action),
+            | LayoutAction::JumpToFailure => unhandled_layout_action(action),
         }
+    }
+
+    /// Move the display viewport and repaint.
+    ///
+    /// A scroll away from the bottom re-evaluates the split-scroll gate, so an
+    /// eligible AI pane grows its pinned live region on the very first page-up
+    /// rather than a frame later.
+    fn scroll_terminal(&mut self, scroll: Scroll, cx: &mut Context<Self>) {
+        let Ok(mut terminal) = self.shared.terminal.lock() else {
+            return;
+        };
+        if matches!(scroll, Scroll::Bottom) {
+            // Landing at the bottom dissolves the split by definition; clearing
+            // the gate first keeps the pin from surviving one extra frame.
+            terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
+        }
+        let moved = terminal.scroll(scroll);
+        let offset = terminal.display_offset();
+        let pin_rows = terminal.pin_rows();
+        drop(terminal);
+        tracing::info!(?scroll, moved, offset, pin_rows, "terminal scrollback moved");
+        cx.notify();
+    }
+
+    /// Apply one zoom step and republish the resulting cell metrics.
+    ///
+    /// The step is folded into the grid font rather than into the config, so a
+    /// later config reload rebases the zoom on the new `appearance.font_size`
+    /// instead of discarding it.
+    fn apply_zoom(&mut self, step: impl FnOnce(&mut ZoomState), cx: &mut Context<Self>) {
+        step(&mut self.zoom);
+        self.rebuild_font(cx);
+        tracing::info!(level = self.zoom.level(), size = self.font.size, "terminal zoom changed");
+    }
+
+    /// Rebuild the grid font from the live appearance config plus the current
+    /// zoom step, then tell the server what the new cell box measures.
+    fn rebuild_font(&mut self, cx: &mut Context<Self>) {
+        let appearance = self.config.config().config.appearance.clone();
+        self.font = GridFont::from_appearance(&scribe_common::config::AppearanceConfig {
+            font_size: self.zoom.effective_font_size(appearance.font_size),
+            ..appearance
+        });
+        self.report_cell_metrics();
+        cx.notify();
     }
 
     /// The single live dispatch point for a resolved [`KeyAction`].
@@ -1418,14 +1505,19 @@ impl TerminalView {
     fn open_context_menu(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
         self.command_palette = None;
         let colors = ContextMenuColors::from(&self.chrome);
+        // The demo row stays first so the fixed-offset row assertions in the
+        // overlay E2E keep addressing the same row; the live smart-selection
+        // rows for the cell under the pointer are appended after it.
+        let mut smart_actions = vec![MenuItem {
+            label: DEMO_SMART_ACTION_LABEL.to_owned(),
+            action: ContextMenuAction::SendText(format!("{DEMO_SMART_ACTION_TEXT}\n")),
+            enabled: true,
+        }];
+        smart_actions.extend(self.smart_selection_rows(position));
         let request = ContextMenuRequest {
             has_selection: true,
             osc8_uri: Some("https://example.com/spec".into()),
-            smart_actions: vec![MenuItem {
-                label: DEMO_SMART_ACTION_LABEL.to_owned(),
-                action: ContextMenuAction::SendText(format!("{DEMO_SMART_ACTION_TEXT}\n")),
-                enabled: true,
-            }],
+            smart_actions,
             ..Default::default()
         };
         let menu = cx.new(|cx| ContextMenuView::new(colors, request, position, cx));
@@ -1439,6 +1531,123 @@ impl TerminalView {
         .detach();
         self.context_menu = Some(menu);
         cx.notify();
+    }
+
+    /// Push this frame's split-scroll gate into the terminal and take the
+    /// resulting snapshot.
+    ///
+    /// The config toggle and the AI-provider check are shell state, but the
+    /// scroll position and the alternate-screen flag are terminal state, so the
+    /// decision is split across the boundary: the shell hands over what it
+    /// knows and reads back how many rows the pin ended up taking.
+    fn sync_split_scroll(&mut self) -> Content {
+        let eligibility = self.split_scroll_eligibility();
+        let Ok(mut terminal) = self.shared.terminal.lock() else {
+            return Content::default();
+        };
+        terminal.set_split_scroll_eligibility(eligibility);
+        let content = terminal.content();
+        drop(terminal);
+        self.split_scroll.pin_height = self.font.line_height * pin_rows_f32(content.pin_rows);
+        content
+    }
+
+    /// Whether config and the focused session's AI provider permit a split.
+    fn split_scroll_eligibility(&self) -> SplitScrollEligibility {
+        let terminal_config = &self.config.config().config.terminal;
+        let scroll_pin_enabled = terminal_config.scroll.scroll_pin;
+        let ai_provider_enabled = self
+            .shared
+            .active_session
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .and_then(|session_id| {
+                let ai = self.shared.ai.lock().ok()?;
+                ai.tracker.provider_for_session(session_id)
+            })
+            .is_some_and(|provider| terminal_config.ai_provider_enabled(provider));
+        SplitScrollEligibility { scroll_pin_enabled, ai_provider_enabled }
+    }
+
+    /// Route a left click on the terminal grid.
+    ///
+    /// The only click target the grid owns today is the split-scroll jump chip,
+    /// which is painted inside the canvas and so cannot be a GPUI child
+    /// element; everything else falls through untouched.
+    fn click_grid(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        if self.split_scroll.pin_height <= 0.0 {
+            return;
+        }
+        let Some(bounds) = self.grid_bounds.get() else {
+            return;
+        };
+        let (rows, pin_rows) = self
+            .shared
+            .terminal
+            .lock()
+            .map_or((0, 0), |terminal| (terminal.content().rows.len(), terminal.pin_rows()));
+        if !hits_jump_chip(bounds, &self.font, rows, pin_rows, position) {
+            return;
+        }
+        tracing::info!("split-scroll jump chip clicked");
+        self.scroll_terminal(Scroll::Bottom, cx);
+    }
+
+    /// The live smart-selection rows for the grid cell under `position`.
+    ///
+    /// Empty whenever the pointer is off the grid, no rule matched, or the
+    /// matched rules carry no actions — which is the ordinary case over blank
+    /// space, so an ordinary right-click still gets the plain menu.
+    fn smart_selection_rows(&self, position: Point<gpui::Pixels>) -> Vec<MenuItem> {
+        let Some(bounds) = self.grid_bounds.get() else {
+            return Vec::new();
+        };
+        let Some(cell) = cell_at(bounds, &self.font, position) else {
+            return Vec::new();
+        };
+        let Ok(terminal) = self.shared.terminal.lock() else {
+            return Vec::new();
+        };
+        let candidates = terminal.smart_selection_actions(&self.smart_selection, cell);
+        drop(terminal);
+        let expansion = self.action_expansion_values();
+        let context = ActionExpansionContext {
+            cwd: expansion.cwd.as_deref(),
+            user: &expansion.user,
+            host: &expansion.host,
+        };
+        candidates
+            .iter()
+            .inspect(|candidate: &&SmartSelectionCandidate| {
+                tracing::info!(
+                    rule = %candidate.rule_name,
+                    text = %candidate.text,
+                    row = cell.row,
+                    col = cell.col,
+                    "smart selection matched",
+                );
+            })
+            .flat_map(|candidate| candidate.resolved_actions(&context))
+            .map(smart_selection_menu_item)
+            .collect()
+    }
+
+    /// The `\(path)` / `\(user)` / `\(host)` values a smart-selection action
+    /// parameter interpolates against, read from the server-reported chrome.
+    fn action_expansion_values(&self) -> ActionExpansionValues {
+        let cwd = self.shared.active_session.lock().ok().and_then(|guard| *guard).and_then(
+            |session_id| {
+                let metadata = self.shared.chrome_metadata.lock().ok()?;
+                let cwd = metadata.session(session_id)?.cwd.as_ref()?;
+                Some(cwd.to_string_lossy().into_owned())
+            },
+        );
+        ActionExpansionValues {
+            cwd,
+            user: std::env::var("USER").unwrap_or_default(),
+            host: read_hostname(),
+        }
     }
 
     /// Open a modal dialog, subscribing so a choice or a backdrop click tears the
@@ -1710,7 +1919,60 @@ impl TerminalView {
                 );
             }
             OverlayChord::WorkspaceNotes => self.open_workspace_notes_modal(cx),
+            OverlayChord::ViMode => self.toggle_vi_mode(cx),
         }
+    }
+
+    /// Enter or leave vi / copy mode over the terminal grid.
+    fn toggle_vi_mode(&mut self, cx: &mut Context<Self>) {
+        let Ok(mut terminal) = self.shared.terminal.lock() else {
+            return;
+        };
+        terminal.toggle_vi_mode();
+        let active = terminal.is_vi_mode();
+        drop(terminal);
+        tracing::info!(active, "vi mode toggled");
+        cx.notify();
+    }
+
+    /// Route a keystroke while vi / copy mode owns the keyboard.
+    ///
+    /// Vi mode is a *mode*, not an overlay: it sits between the shell-owned
+    /// chords and the configured bindings so a bound chord (a new tab, a zoom
+    /// step) still works while navigating, but a bare motion key moves the vi
+    /// cursor instead of reaching the PTY. Any other bare key is swallowed —
+    /// leaking `j` into the shell while the user is reading scrollback is
+    /// exactly the failure copy mode exists to prevent.
+    fn handle_vi_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if !self.shared.terminal.lock().is_ok_and(|terminal| terminal.is_vi_mode()) {
+            return false;
+        }
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform {
+            return false;
+        }
+        // A configured binding always wins, the same precedence
+        // `translate_overlay_chord` applies: `shift+pageup` has to keep paging
+        // the scrollback while the vi cursor is up.
+        let yields_to_binding = KeyInput::from_key_down(event)
+            .is_some_and(|input| translate_key_action(&input, self.config.bindings()).is_some());
+        if yields_to_binding {
+            return false;
+        }
+        let key = event.keystroke.key.as_str();
+        if matches!(key, "escape" | "q") {
+            self.toggle_vi_mode(cx);
+            return true;
+        }
+        if let Some(motion) = vi_motion_for_key(key, modifiers.shift) {
+            let Ok(mut terminal) = self.shared.terminal.lock() else {
+                return true;
+            };
+            terminal.vi_motion(motion);
+            drop(terminal);
+            cx.notify();
+        }
+        true
     }
 
     /// Route a keystroke while an overlay owns the keyboard. Returns `true` when
@@ -1936,12 +2198,38 @@ impl TerminalView {
         }
     }
 
+    /// Snap a scrolled viewport back to the live bottom before a keystroke.
+    ///
+    /// Typing into a pane you are reading scrollback in should show you what
+    /// you typed, so the ordinary case jumps to the bottom. The exception is
+    /// the split-scroll pin: it already shows the live prompt, so it survives
+    /// every keystroke except `Enter`, which submits and therefore ends the
+    /// "compose while reading" session. Ported one-for-one from the winit
+    /// client's `send_key_bytes` seam.
+    fn snap_to_bottom_for_input(&self, bytes: &[u8]) {
+        let Ok(mut terminal) = self.shared.terminal.lock() else {
+            return;
+        };
+        if terminal.display_offset() == 0 {
+            return;
+        }
+        let pinned = terminal.pin_rows() > 0;
+        if pinned && bytes != b"\r" {
+            return;
+        }
+        terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
+        terminal.scroll(Scroll::Bottom);
+        drop(terminal);
+        tracing::info!(pinned, "snapped the viewport to the live bottom for input");
+    }
+
     /// Enqueue already-encoded bytes for the attached pane.
     fn send_key_bytes(&self, bytes: Vec<u8>) {
         let session_id = self.shared.active_session.lock().ok().and_then(|guard| *guard);
         let Some(session_id) = session_id else {
             return;
         };
+        self.snap_to_bottom_for_input(&bytes);
         if let Err(error) = self.sink.key_input(session_id, bytes, true) {
             tracing::warn!(%error, "dropped keystroke: IPC writer closed");
             return;
@@ -1966,6 +2254,92 @@ impl TerminalView {
             .unwrap_or_default();
         let focused = self.shared.active_session.lock().ok().and_then(|guard| *guard);
         scribe_common::perf_probe::record_sessions(sessions, focused);
+    }
+}
+
+/// Owned backing store for an [`ActionExpansionContext`], which borrows every
+/// field it interpolates.
+struct ActionExpansionValues {
+    cwd: Option<String>,
+    user: String,
+    host: String,
+}
+
+/// Widen a pin-row count for pixel arithmetic without a lossy cast.
+fn pin_rows_f32(rows: usize) -> f32 {
+    f32::from(u16::try_from(rows).unwrap_or(u16::MAX))
+}
+
+/// This machine's hostname, for `\(host)` in a smart-selection parameter.
+fn read_hostname() -> String {
+    nix::unistd::gethostname().map_or_else(
+        |_| String::from("localhost"),
+        |hostname| hostname.to_string_lossy().into_owned(),
+    )
+}
+
+/// The vi motion a bare key requests, or `None` when the key is not a motion.
+///
+/// The vocabulary is the subset of Alacritty's motions a terminal copy mode
+/// actually needs: `hjkl` plus the arrows for cells, `w` / `b` for words, `0`
+/// / `$` for line ends, and `H` / `L` for the viewport edges.
+fn vi_motion_for_key(key: &str, shift: bool) -> Option<ViMotion> {
+    match key {
+        "h" | "left" => Some(ViMotion::Left),
+        "j" | "down" => Some(ViMotion::Down),
+        "k" | "up" => Some(ViMotion::Up),
+        "l" | "right" => Some(ViMotion::Right),
+        "w" => Some(ViMotion::WordRight),
+        "b" => Some(ViMotion::WordLeft),
+        "0" | "home" => Some(ViMotion::First),
+        "$" | "end" => Some(ViMotion::Last),
+        "^" => Some(ViMotion::FirstOccupied),
+        "g" if shift => Some(ViMotion::Low),
+        "g" => Some(ViMotion::High),
+        _ => None,
+    }
+}
+
+/// Compile the configured smart-selection rules, warning about the rejects.
+///
+/// A bad regex is a user-authored mistake that silently removes a context-menu
+/// row, so it is surfaced in the log rather than swallowed by the compiler.
+fn compile_smart_selection(config: &SmartSelectionConfig) -> CompiledSmartSelection {
+    let rules = CompiledSmartSelection::compile(config);
+    for error in &rules.errors {
+        tracing::warn!(
+            rule = %error.rule_id,
+            name = %error.rule_name,
+            message = %error.message,
+            "smart-selection rule rejected",
+        );
+    }
+    rules
+}
+
+/// Lower one resolved smart-selection action onto a context-menu row.
+fn smart_selection_menu_item(action: ResolvedSmartSelectionAction) -> MenuItem {
+    let enabled = !action.parameter.is_empty();
+    let label = action.label.clone();
+    MenuItem { label, action: smart_selection_action(action), enabled }
+}
+
+/// Map a smart-selection action kind onto the context-menu action that runs it.
+///
+/// One-for-one with the winit client's `smart_selection_context_action`, so a
+/// rule authored against the legacy client behaves identically here.
+fn smart_selection_action(action: ResolvedSmartSelectionAction) -> ContextMenuAction {
+    let parameter = action.parameter;
+    match action.kind {
+        SmartSelectionActionKind::OpenFile => ContextMenuAction::OpenFile(parameter),
+        SmartSelectionActionKind::OpenUrl => ContextMenuAction::OpenUrl(parameter),
+        SmartSelectionActionKind::RunCommand => ContextMenuAction::RunCommand(parameter),
+        SmartSelectionActionKind::RunCoprocess => ContextMenuAction::RunCoprocess(parameter),
+        SmartSelectionActionKind::SendText => ContextMenuAction::SendText(parameter),
+        SmartSelectionActionKind::RunCommandInWindow => {
+            ContextMenuAction::RunCommandInWindow(parameter)
+        }
+        SmartSelectionActionKind::Copy => ContextMenuAction::CopyText(parameter),
     }
 }
 
@@ -2314,11 +2688,7 @@ impl TerminalView {
     /// right-click opens the context menu at the cursor without disturbing the
     /// display-only element.
     fn render_grid(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let content = self
-            .shared
-            .terminal
-            .lock()
-            .map_or_else(|_| Content::default(), |guard| guard.content());
+        let content = self.sync_split_scroll();
         let highlights = self.find_highlights(&content, cx);
         let opacity = self.opacity;
         let grid_colors = GridColors {
@@ -2334,9 +2704,16 @@ impl TerminalView {
                     self.font.clone(),
                     grid_colors,
                     self.highlight_colors,
+                    Rc::clone(&self.grid_bounds),
                 )
                 .with_highlights(highlights)
                 .paint(),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
+                    view.click_grid(event.position, ctx);
+                }),
             )
             .on_mouse_down(
                 MouseButton::Right,
@@ -2421,7 +2798,10 @@ impl Render for TerminalView {
                 }
                 // Overlays own the keyboard first, then the configured
                 // bindings, and only then the generic PTY byte encoder.
-                if view.handle_overlay_key(event, ctx) || view.handle_binding(event, ctx) {
+                if view.handle_overlay_key(event, ctx)
+                    || view.handle_vi_key(event, ctx)
+                    || view.handle_binding(event, ctx)
+                {
                     return;
                 }
                 view.on_key_down(event, ctx);

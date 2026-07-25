@@ -6,8 +6,14 @@
 //! reading earlier output. This module ports the pure logic from the legacy
 //! client: eligibility (AI provider + scrolled + normal screen), pin-row
 //! sizing, cursor-anchored cell translation, logical-line alignment, and the
-//! top/divider/bottom/jump-chip geometry. The GPUI dual-render and jump-chip
-//! paint wire these in a later bead.
+//! top/divider/bottom/jump-chip geometry.
+//!
+//! The GPUI shell consumes all of it: `terminal.rs` folds the eligibility and
+//! the aligned pin-row count into every content snapshot (the pinned rows are
+//! read from the live screen rather than the scrolled viewport, which is the
+//! cursor-anchored translation expressed in row space), `terminal_element.rs`
+//! paints the divider and the jump chip from [`compute_geometry`], and the
+//! shell hit-tests a click against that chip with [`hit_test_jump_btn`].
 
 use alacritty_terminal_gpui::event::VoidListener;
 use alacritty_terminal_gpui::grid::Dimensions as _;
@@ -75,7 +81,7 @@ pub struct SplitScrollGeometry {
 /// Separates the two "does the environment allow it" flags — the config toggle
 /// and whether the pane runs a supported AI provider — from the live terminal
 /// state ([`split_scroll_eligible`] adds the scrolled/normal-screen checks).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SplitScrollEligibility {
     /// The `scroll_pin` config key is enabled.
     pub scroll_pin_enabled: bool,

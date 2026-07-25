@@ -268,6 +268,18 @@ Phase 0 borrows `overlay-actions.sh`'s trick for handing the client a pane: the 
 
 Each provider runs a set/clear cycle asserted twice over: the client's own `tab task label updated` line must appear with the label text (proving the notice reached the reader, not just the socket), the left half of the window's top band must differ from the pre-label capture by at least 40 pixels (proving the strip repainted), and after the clear that same band must be pixel-identical to the baseline again (proving the shell title came back rather than the label merely being overwritten).
 
+### Terminal viewport navigation
+
+`tests/e2e/visual/terminal-viewport.sh` is the app-level oracle for [[client#GPUI Client Spike#GPUI Terminal Viewport Wiring]]: scrollback paging, font zoom, vi / copy mode, split-scroll, and the smart-selection context menu, each of which shipped as a unit-tested module with no caller.
+
+It runs on the [[test#Visual E2E Tests#Shared-pane rig]] with `terminal.scroll_pin = true` seeded through `SCRIBE_EXTRA_CONFIG`, because split-scroll is opt-in and the pin can only appear in a client whose config asked for it. Every phase asserts a log line the wired path alone writes *and* a pixel effect, because either alone is weak: a log line does not prove the frame changed, and a screenshot diff does not prove which code produced it.
+
+`shift+PageUp` must produce a `terminal scrollback moved` line with a non-zero offset and repaint the whole viewport — the second half is what would have caught the original defect, where the snapshot read the live screen and ignored the display offset entirely, so scrolling logged fine and changed nothing on screen. `shift+End` must report offset 0 again. `ctrl+-` must step the zoom level to `-1` and rescale the grid; `ctrl+0` must return it to `0`.
+
+The vi-mode phase asserts three things, because the mode is only correct if all three hold: `ctrl+shift+space` logs `active=true`, three `k` presses add the hollow cursor box to the frame, and the daemon's own screen snapshot contains no `kkk` — a copy mode that leaks its motions into the shell is worse than no copy mode. `Escape` must log `active=false`.
+
+Split-scroll needs both halves of its gate, so the phase posts a real `state_changed` event through `scribe-hook-helper` to make the client believe the pane is a Claude Code session, then pages up and requires the reported `pin_rows` to be non-zero. Finally a right-click over a viewport filled with URLs must log `smart selection matched` naming the `URI` rule, which only the live context-menu path can write.
+
 ### Subscribe and snapshot session tooling
 
 `tests/e2e/visual/session-tooling.sh` is the app-level oracle for the `Subscribe` and `RequestSnapshot` parity rows: it drives the real client against the real server and asserts both frames on the wire at the lifecycle points that produce them.
@@ -807,6 +819,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Pane dividers | [[test#GPUI Pane Dividers]] | "Pane divider drag-resize" chrome |
 | Focus borders | [[test#GPUI Focus Borders]] | "Focused pane/workspace border" chrome |
 | Split-scroll | [[test#GPUI Split-Scroll]] | "Split-scroll live-bottom pin" AI-pane chrome |
+| Terminal viewport | [[test#GPUI Terminal Viewport]] | `scroll_up`/`scroll_down`/`scroll_top`/`scroll_bottom`, vi mode, smart selection reachability |
 | Font zoom | [[test#GPUI Font Zoom]] | "Zoom in/out/reset" View keybinding actions |
 | OSC 52 clipboard bridge | [[test#GPUI OSC 52 Clipboard Bridge]] | `ClipboardPromptResponse`, `ClipboardBridgeReadReply`, `ClipboardBridgeWrite`, `ClipboardBridgeReadRequest` OSC 52 bridge |
 | Notification dispatcher | [[test#GPUI Notification Dispatcher]] | Notification `replaces_id` coalescing + click-to-focus |
@@ -1269,6 +1282,36 @@ A pin height larger than the content rect collapses the top portion to zero rath
 ### Pin alignment absorbs soft-wrapped logical lines
 
 [[crates/scribe-client-gpui/src/split_scroll.rs#align_pin_rows_to_logical_lines]] expands the pin upward across `WRAPLINE`-flagged rows so the split never starts mid-way through a soft-wrapped logical line, and leaves the requested rows unchanged when there is no wrap.
+
+## GPUI Terminal Viewport
+
+Unit tests for the live client's terminal viewport — [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal]] and the pointer mapping in [[crates/scribe-client-gpui/src/terminal_element.rs#cell_at]] — proving the snapshot honours the display offset, the split-scroll pin, the vi cursor, and click-to-cell resolution.
+
+These are the reachability tests for [[client#GPUI Client Spike#GPUI Terminal Viewport Wiring]]: the pure modules already had unit tests, so what is asserted here is that the *running* client's snapshot and pointer path actually consume them.
+
+### Scrolling paints scrollback and returns to the live bottom
+
+[[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#scroll]] moves the display offset and rebuilds the snapshot from it, so a paged-up viewport paints scrollback rows; scrolling past the oldest row reports no movement, and `Scroll::Bottom` restores the live tail.
+
+### Split-scroll pins the live rows under the scrollback
+
+With the eligibility gate open, [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#set_split_scroll_eligibility]] makes the snapshot's trailing rows read the live screen anchored on the shell cursor while the rows above stay at the scrolled offset; closing the gate restores one contiguous region.
+
+### Vi mode publishes a cursor the paint path can draw
+
+Toggling vi mode publishes a viewport-space cursor on the snapshot, a motion moves it a row, and leaving vi mode clears it — which is what makes the keyboard cursor visible to [[crates/scribe-client-gpui/src/terminal_element.rs#TerminalElement#paint_vi_cursor]].
+
+### Smart selection resolves through the scrolled viewport
+
+[[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#smart_selection_actions]] resolves a viewport cell against the display offset before matching, so a rule still matches text that has scrolled into history; blank space yields no actionable candidate.
+
+### Pointer positions lower onto grid cells
+
+`cell_at` divides the pointer offset by the live cell metrics to name a row and column, and returns nothing outside the grid rect so a click on the titlebar or status bar can never resolve to row 0.
+
+### The jump chip is only hit while the pin is up
+
+[[crates/scribe-client-gpui/src/terminal_element.rs#hits_jump_chip]] re-derives the paint pass's split geometry and matches only points inside the docked chip, and matches nothing at all when there is no pin, so an unsplit grid passes every click through.
 
 ## GPUI Command Scrollbar
 

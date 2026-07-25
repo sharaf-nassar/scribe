@@ -245,17 +245,17 @@ also never executed).
 | `new_window` | Tabs and windows | WIRED | `handle_layout_action` `NewWindow` arm → `open_new_window`, which builds a second window's `Shared` + IPC connection through `start_window_backend` and opens it with `open_window` (bead .61) |
 | `copy` | Clipboard | UNWIRED | `LayoutAction::CopySelection` hits `main.rs:430`; `clipboard.rs`/`selection.rs` unimported |
 | `paste` | Clipboard | UNWIRED | `LayoutAction::PasteClipboard` hits `main.rs:430`; `paste.rs` unimported |
-| `scroll_up` | Navigation | UNWIRED | hits `main.rs:430`; `split_scroll.rs` unimported |
-| `scroll_down` | Navigation | UNWIRED | as above |
-| `scroll_top` | Navigation | UNWIRED | as above |
-| `scroll_bottom` | Navigation | UNWIRED | as above |
+| `scroll_up` | Navigation | WIRED | `handle_layout_action` `ScrollUp` arm → `TerminalView::scroll_terminal` → `DisplayOnlyTerminal::scroll`; the snapshot now reads the viewport through the grid's display offset (bead .59) |
+| `scroll_down` | Navigation | WIRED | as above, `Scroll::PageDown` |
+| `scroll_top` | Navigation | WIRED | as above, `Scroll::Top` |
+| `scroll_bottom` | Navigation | WIRED | as above, `Scroll::Bottom`; also the snap-to-bottom a keystroke performs in `snap_to_bottom_for_input` |
 | `find` | Navigation | WIRED (bead .69) | `dispatch_key_action` → `TerminalView::open_find_overlay`; `search.rs` is on the import closure |
 | `prompt_jump_up` | Navigation | UNWIRED | hits `main.rs:430`; no prompt marks are ingested |
 | `prompt_jump_down` | Navigation | UNWIRED | as above |
 | `jump_to_failure` | Navigation | UNWIRED | as above |
-| `zoom_in` | View and overlays | UNWIRED | hits `main.rs:430`; `zoom.rs` unimported |
-| `zoom_out` | View and overlays | UNWIRED | as above |
-| `zoom_reset` | View and overlays | UNWIRED | as above |
+| `zoom_in` | View and overlays | WIRED | `handle_layout_action` `ZoomIn` arm → `TerminalView::apply_zoom` → `ZoomState::zoom_in`, rebuilding `GridFont` through `rebuild_font` (bead .59) |
+| `zoom_out` | View and overlays | WIRED | as above, `ZoomState::zoom_out` |
+| `zoom_reset` | View and overlays | WIRED | as above, `ZoomState::reset` |
 | `command_palette` | View and overlays | WIRED | `main.rs:700` opens the overlay. Degenerate: `CommandPaletteEvent::Execute(_)` is discarded at `main.rs:502`, so no palette entry does anything |
 | `settings` | View and overlays | UNWIRED | `KeyAction::OpenSettings` swallowed at `main.rs:799`; the settings window opens only via the `--settings` CLI flag (`main.rs:1199` `run_settings`) |
 | `word_left` | Terminal shortcuts | WIRED | `keybindings.rs:477` → `KeyAction::Terminal` → `main.rs:795` `send_key_bytes` |
@@ -392,20 +392,30 @@ and blocks every `visual-E2E` row.
   rows are *not* named in .58 and need a follow-on.
 - **FU-7 Scrollback navigation and marks.** Rows: `scroll_up`, `scroll_down`,
   `scroll_top`, `scroll_bottom`, `prompt_jump_up`, `prompt_jump_down`,
-  `jump_to_failure`, `PromptMark`, `ScrollBottom`. **Partly covered by bead .59**
-  (`split_scroll`); the prompt-mark ingestion rows are not.
+  `jump_to_failure`, `PromptMark`, `ScrollBottom`. **The four `scroll_*` rows
+  are closed by bead .59**, which also fixed the underlying defect: the content
+  snapshot read the live screen and ignored the grid's display offset, so no
+  scroll could have changed a pixel even once dispatched. The prompt-mark
+  ingestion rows are not covered.
 - **FU-8 Clipboard and selection.** Rows: `copy`, `paste`,
   `ClipboardPromptResponse`, `ClipboardBridgeReadReply`,
   `ClipboardPromptRequest`, `ClipboardBridgeWrite`,
   `ClipboardBridgeReadRequest`. Requires wiring `clipboard.rs`, `selection.rs`,
   `paste.rs`, and routing `DialogEvent::Chosen` (`main.rs:542`) to a real
-  response. **Selection is partly covered by bead .59** (`smart_selection`).
+  response. **Selection groundwork is landed by bead .59**: `selection.rs` and
+  `smart_selection.rs` are in the import closure and a right-click resolves live
+  smart-selection rows, so what remains is mouse-drag selection and the
+  clipboard itself.
 - **FU-9 Find overlay.** Rows: `find`, `SearchRequest`, `SearchResults`.
   **Closed by bead .69.** `KeyAction::OpenFind` opens `search::FindOverlayView`,
   each query edit sends a real `SearchRequest`, and the `SearchResults` arm in
   `dispatch_server_message` drives per-cell highlights through
   `TerminalElement::paint`. All three rows are WIRED above.
-- **FU-10 Zoom.** Rows: `zoom_in`, `zoom_out`, `zoom_reset`.
+- **FU-10 Zoom.** Rows: `zoom_in`, `zoom_out`, `zoom_reset`. **Closed by bead
+  .59.** `ZoomState` is folded into `GridFont` by `TerminalView::rebuild_font`,
+  the one place a zoom step and a config font reload share, so a saved
+  font-size edit rebases the zoom instead of discarding it. Verified on screen
+  by `tests/e2e/visual/terminal-viewport.sh`.
 - **FU-11 close_tab chord and new_window.** Rows: `close_tab`, `new_window`.
   **Closed by bead .61.** The overlay chords now yield to the configured
   bindings (`translate_overlay_chord`), the close dialog and notes modal moved
@@ -509,7 +519,7 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
 | --- | --- |
 | .56 (opacity) | Opacity |
 | .58 (pane/workspace) | 8 pane-layout actions, 6 workspace-layout actions (not the 4 workspace IPC rows) |
-| .59 (vi/smart-selection/split-scroll) | `scroll_up/down/top/bottom`; selection groundwork for `copy` |
+| .59 (vi/smart-selection/split-scroll/zoom) | `scroll_up/down/top/bottom`, `zoom_in/out/reset`; vi mode, split-scroll, and the smart-selection context menu made reachable (selection groundwork for `copy`) |
 | .61 (close_tab/new_window) | `close_tab`, `new_window` |
 | .77 (FU-18 settings trust) | the nine FU-18 rows plus `GetLanEnv` / `LanEnv` |
 | .76 (FU-17 LAN dial and approval) | all eleven FU-17 rows |

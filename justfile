@@ -174,6 +174,13 @@ e2e-visual-update:
 e2e-visual-chrome-bands:
     docker run --rm --gpus all -e SCRIBE_SHARED_PANE=1 -e TEST_TIMEOUT=180 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/window-chrome-bands.sh
 
+# Run the terminal-viewport E2E: scrollback paging, zoom, vi mode, split-scroll,
+# and the smart-selection context menu, all against the real window. Needs the
+# shared-pane rig (so `scribe-test` and the client see one pane), the
+# `scroll_pin` opt-in, and a longer budget than the default 60 s for its phases.
+e2e-visual-terminal-viewport:
+    docker run --rm --gpus all -e TEST_TIMEOUT=240 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/terminal-viewport-config.toml)" -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/terminal-viewport.sh
+
 # Run the AI task-label visual E2E. It relaunches the client to adopt the
 # harness session before it can assert anything, so it needs more than the
 # default 60 s budget.

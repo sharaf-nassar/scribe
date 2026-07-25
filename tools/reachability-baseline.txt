@@ -25,11 +25,11 @@
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
 counts modules-total 64
-counts modules-wired 37
+counts modules-wired 42
 counts server-messages-total 59
 counts server-messages-handled 39
 counts layout-actions-total 36
-counts layout-actions-handled 10
+counts layout-actions-handled 17
 
 unwired-module clipboard
 unwired-module clipboard_cleanup
@@ -48,16 +48,11 @@ unwired-module remote
 unwired-module remote_handshake
 unwired-module restore_state
 unwired-module scrollbar
-unwired-module selection
 unwired-module server_lifecycle
-unwired-module smart_selection
-unwired-module split_scroll
-unwired-module vi_mode
 unwired-module window_state
 unwired-module workspace_layout
 unwired-module workspace_notes_preview
 unwired-module workspace_tree
-unwired-module zoom
 
 unhandled-server-message ActionDispatched
 unhandled-server-message ClipboardBridgeReadRequest
@@ -91,10 +86,6 @@ unhandled-layout-action JumpToFailure
 unhandled-layout-action PasteClipboard
 unhandled-layout-action PromptJumpDown
 unhandled-layout-action PromptJumpUp
-unhandled-layout-action ScrollBottom
-unhandled-layout-action ScrollDown
-unhandled-layout-action ScrollTop
-unhandled-layout-action ScrollUp
 unhandled-layout-action SplitHorizontal
 unhandled-layout-action SplitVertical
 unhandled-layout-action WorkspaceFocusDown
@@ -103,6 +94,3 @@ unhandled-layout-action WorkspaceFocusRight
 unhandled-layout-action WorkspaceFocusUp
 unhandled-layout-action WorkspaceSplitHorizontal
 unhandled-layout-action WorkspaceSplitVertical
-unhandled-layout-action ZoomIn
-unhandled-layout-action ZoomOut
-unhandled-layout-action ZoomReset
