@@ -30,7 +30,7 @@ Between the coalescing drain and `feed_output`, a per-session [[crates/scribe-cl
 
 A companion [[crates/scribe-client-gpui/src/main.rs#run_sync_expiry]] task waits on the nearest raw-frame ([[crates/scribe-client-gpui/src/sync_frames.rs#RAW_SYNC_TIMEOUT]]) or parser deadline and commits a 150 ms-expired update whose closing `l` never arrived, via [[crates/scribe-client-gpui/src/sync_frames.rs#SyncFrameQueue#flush_raw_timeout]] and [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#flush_parser_sync_timeout]]. The drain task wakes it whenever a fresh sync update arms a deadline, and each committed burst bumps the shared redraw generation.
 
-Outbound: [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink]] replaces Zed's `write_to_pty` path, enqueuing `ClientMessage::KeyInput` / `Resize` onto the ordered IPC-writer channel drained by [[crates/scribe-client-gpui/src/main.rs#run_writer]]. The sink is independent of the inbound drain, so a keystroke is never queued behind an output firehose; because the channel is a single FIFO, a `Resize` enqueued before a `KeyInput` reaches the server first. The GPUI view feeds the sink from [[crates/scribe-client-gpui/src/main.rs#TerminalView#on_key_down]] through an interim passthrough [[crates/scribe-client-gpui/src/main.rs#encode_key]] (superseded by the input-encoder port).
+Outbound: [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink]] replaces Zed's `write_to_pty` path, enqueuing `ClientMessage::KeyInput` / `Resize` plus the session-lifecycle messages the tab shortcuts drive (`CreateSession` / `AttachSessions` / `CloseSession`) onto the ordered IPC-writer channel drained by [[crates/scribe-client-gpui/src/main.rs#run_writer]]. The sink is independent of the inbound drain, so a keystroke is never queued behind an output firehose; because the channel is a single FIFO, a `Resize` enqueued before a `KeyInput` reaches the server first. The GPUI view feeds the sink from [[crates/scribe-client-gpui/src/main.rs#TerminalView#on_key_down]] through an interim passthrough [[crates/scribe-client-gpui/src/main.rs#encode_key]] (superseded by the input-encoder port).
 
 ### Session Lifecycle
 
@@ -77,6 +77,16 @@ When the pending input-start row falls inside the trimmed region it is cleared, 
 #### Takeover adoption
 
 A takeover `Hello`'s `Welcome` records the adopted window id on the registry.
+
+### Tab Strip And Key Dispatch
+
+The shell's live key path runs the configured bindings before the PTY encoder, so tab shortcuts open, switch, and close real server sessions instead of leaking their chord as terminal bytes.
+
+[[crates/scribe-client-gpui/src/main.rs#TerminalView#handle_binding]] lowers each `KeyDownEvent` through [[crates/scribe-client-gpui/src/input.rs#KeyInput#from_key_down]] and [[crates/scribe-client-gpui/src/keybindings.rs#translate_key_action]], and is consulted after the overlays own the keyboard but before [[crates/scribe-client-gpui/src/main.rs#encode_key]]. A matched [[crates/scribe-client-gpui/src/keybindings.rs#LayoutAction]] reaches [[crates/scribe-client-gpui/src/main.rs#TerminalView#handle_layout_action]]; the pane, workspace, and navigation families are still swallowed (no pane tree yet) rather than forwarded, matching the legacy client's rule that a bound shortcut never reaches the PTY.
+
+The tab actions drive the IPC sink: `new_tab` and the four AI-tab shortcuts send [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#create_session]] into the focused workspace (the AI variants through [[crates/scribe-client-gpui/src/main.rs#ai_tab_command]], which execs the CLI under the login shell exactly like the winit client), `next_tab` / `prev_tab` / `select_tab_N` move the selection and re-[[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#attach_sessions]], and `close_tab` sends [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#close_session]].
+
+[[crates/scribe-client-gpui/src/tab_session.rs#TabSessions]] is the ordered strip both sides share behind a mutex. [[crates/scribe-client-gpui/src/main.rs#run_reader]] rebuilds it from `SessionList`, appends focused tabs on `SessionCreated`, and drops them on `SessionExited`; [[crates/scribe-client-gpui/src/main.rs#TerminalView#sync_tabs]] mirrors it into the titlebar on redraw. Because the server re-announces `SessionCreated` as its acknowledgement of every `AttachSessions`, only a genuine insert by [[crates/scribe-client-gpui/src/tab_session.rs#TabSessions#insert_active]] triggers an attach — treating the echo as a new tab would attach in an unbounded loop. [[crates/scribe-client-gpui/src/main.rs#attach_session]] then points `active_session` at the focused tab, and the reader reads that shared value on every message so output gating follows a switch made on the GPUI thread.
 
 ### Cold Restart Restore
 
@@ -840,7 +850,7 @@ The GPUI rebuild reproduces the level-4 terminal byte encoder in [[crates/scribe
 
 Because GPUI's `Keystroke` drops numeric-keypad location and a distinct unshifted base vs shifted glyph, the encoder consumes an intermediate [[crates/scribe-client-gpui/src/input.rs#KeyInput]] carrying the key token, base character, associated text, modifiers, [[crates/scribe-client-gpui/src/input.rs#KeyLocation]], and press/repeat/release state. [[crates/scribe-client-gpui/src/input.rs#KeyInput#from_key_down]] lowers a GPUI `KeyDownEvent` into that shape — numpad location is unavailable on that path, so callers with richer platform data set it directly. Negotiated Kitty flags travel through [[crates/scribe-client-gpui/src/input.rs#KittyFlags]] and the two DEC modes through [[crates/scribe-client-gpui/src/input.rs#TerminalMode]], mirroring the winit encoder's [[crates/scribe-client/src/input.rs#TerminalMode]].
 
-IPC-sink and keybinding dispatch wiring land in later epic beads, so the encoder lives behind the crate's library surface (`lib.rs`) until then; the display-only binary spike does not yet consume it. The port is verified against the committed oracle (see [[client#Input#Mouse Reporting#GPUI Rebuild Golden Oracle]]) by a golden byte-capture test that replays every case in `tests/fixtures/gpui-client/keyboard-byte-golden.json`.
+The keybinding dispatch above this encoder is now wired into the shell (see [[client#GPUI Client Spike#Tab Strip And Key Dispatch]]); the level-4 byte encoder itself still lives behind the crate's library surface (`lib.rs`) while the binary uses its interim passthrough encoder. The port is verified against the committed oracle (see [[client#Input#Mouse Reporting#GPUI Rebuild Golden Oracle]]) by a golden byte-capture test that replays every case in `tests/fixtures/gpui-client/keyboard-byte-golden.json`.
 
 ### GPUI Keybindings Port
 

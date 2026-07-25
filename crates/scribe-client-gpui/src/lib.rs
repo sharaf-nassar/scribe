@@ -35,10 +35,11 @@
 //! and share-presence surfaces) lowered onto a GPUI flex row, fed by the
 //! [`sys_stats`] CPU/memory/network/GPU sampler that drives its sparklines.
 //!
-//! Consumers that wire these into the live GPUI view (IPC sink, keybinding
-//! dispatch, window shell) land in later beads of the `gpui-client-rebuild`
-//! epic; the `scribe-client-gpui` binary (`main.rs`) remains the display-only
-//! scaffold spike until then.
+//! The binary shell consumes a growing slice of this surface directly: the
+//! [`keybindings`] parser now drives the live key path, and [`tab_session`]
+//! holds the ordered tab strip those tab shortcuts mutate. The remaining
+//! consumers (pane splits, scrollback navigation, zoom) land in later beads of
+//! the `gpui-client-rebuild` epic.
 
 pub mod ai_indicator;
 pub mod animation;
@@ -82,6 +83,7 @@ pub mod split_scroll;
 pub mod status_bar;
 pub mod sys_stats;
 pub mod tab_bar;
+pub mod tab_session;
 pub mod titlebar;
 pub mod tooltip;
 pub mod url_detect;

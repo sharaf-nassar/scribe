@@ -651,6 +651,12 @@ Verifies the ported [[crates/scribe-client-gpui/src/keybindings.rs#Bindings]] pa
 
 Driving each action from its default binding, the suite asserts every one of the 50+ [[crates/scribe-client-gpui/src/keybindings.rs#LayoutAction]] variants resolves to its named value, that command-palette/settings/find produce the right [[crates/scribe-client-gpui/src/keybindings.rs#KeyAction]], and that the seven terminal shortcuts emit their fixed escape sequences. It also checks combo parsing (`cmd`/`super` → platform modifier, named keys, rejected garbage), exact-modifier matching that ignores the GPUI function flag and is case-insensitive on the base character, key-down-only gating (press and repeat match, release does not), and that invalid combos are skipped without aborting the parse.
 
+### GPUI tab session strip
+
+Locks the selection rules of [[crates/scribe-client-gpui/src/tab_session.rs#TabSessions]], the ordered strip the shell's tab shortcuts and the IPC reader both mutate, so a tab's label and the attached session can never disagree.
+
+The suite drives the shortcut side — [[crates/scribe-client-gpui/src/tab_session.rs#TabSessions#insert_active]] appends and focuses a new tab, `focus_next`/`focus_prev` wrap in both directions, `select` jumps by index and reports no change for an out-of-range or already-active position — and the server side, where [[crates/scribe-client-gpui/src/tab_session.rs#TabSessions#replace_all]] preserves the focused session across a `SessionList` rebuild (falling back to the first tab when it is gone) and `remove` clamps the cursor as tabs exit. One case guards the attach feedback loop: because the server re-announces `SessionCreated` to acknowledge every `AttachSessions`, `insert_active` must report a known session as "not added" and leave the selection untouched.
+
 ### Config load with removed keys
 
 Confirms a config carrying every removed appearance key deserializes without error and leaves the GPUI-consumed surface intact, satisfying the parity inventory's "Removed configuration keys" rows.
