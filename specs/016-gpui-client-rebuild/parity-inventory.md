@@ -89,15 +89,15 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `WorkspaceNotesGet` | workspace notes | scripted-E2E | `main.rs::open_workspace_notes_modal` → `IpcSink::workspace_notes_get` — **degenerate** (demo chord, fabricated `WorkspaceId`, reply dropped by the reader catch-all); FU-21 | required |
 | `WorkspaceNotesMutate` | workspace notes | scripted-E2E | `main.rs::route_workspace_notes_action` → `IpcSink::workspace_notes_mutate` — same demo caveat; FU-21 | required |
 | `Hello` | registration/adoption | scripted-E2E | `main.rs::run_connection` (sent on every connect) | required |
-| `CloseWindow` | close dialog | scripted-E2E | — (missing, FU-13) — `main.rs::TerminalView::open_dialog` routes `DialogOutcome`, but only its `Update` variant is acted on | required |
-| `QuitAll` | quit-all dialog | scripted-E2E | — (missing, FU-13) | required |
+| `CloseWindow` | close dialog | scripted-E2E | `main.rs::TerminalView::route_close_action` → `ipc_bridge::IpcSink::close_window`, from the close dialog the WM close request and the quit chord raise | required |
+| `QuitAll` | quit-all dialog | scripted-E2E | `main.rs::TerminalView::route_close_action` → `ipc_bridge::IpcSink::quit_all`, from the same close dialog | required |
 | `TriggerUpdate` | update dialog | scripted-E2E | `main.rs::TerminalView::route_update_action` → `ipc_bridge::IpcSink::trigger_update`, from the status-bar CTA's confirmation | required |
 | `DismissUpdate` | update dialog | scripted-E2E | `main.rs::TerminalView::route_update_action` → `ipc_bridge::IpcSink::dismiss_update`, from the status-bar CTA's confirmation | required |
 | `CheckForUpdates` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — `--settings` window only, not the terminal window | required |
 | `ListReleases` | release settings | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` — `--settings` window only | required |
-| `ListWindows` | window management | scripted-E2E | — (missing, FU-13) — `scribe-cli` is the only sender | required |
+| `ListWindows` | window management | scripted-E2E | `main.rs::TerminalView::poll_window_list` → `ipc_bridge::IpcSink::list_windows`, on the lifecycle tick while `remote.enabled` | required |
 | `DispatchAction` | remote automation | scripted-E2E | — (missing, FU-16) — `scribe-cli` is the only sender | required |
-| `FocusChanged` | focus reporting | scripted-E2E | — (missing, FU-13) | required |
+| `FocusChanged` | focus reporting | scripted-E2E | `main.rs::TerminalView::report_focus` → `ipc_bridge::IpcSink::focus_changed`, from the window activation observer and the pane-focus reconciliation | required |
 | `HookEvent` | hook helper ingress | scripted-E2E | `crates/scribe-hook-helper/src/main.rs::main` — out-of-client by design | required |
 | `EnvPreflight` | environment persistence | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` (`action.env_preflight`) and `SettingsWindow::enable_env_persistence`, the toggle's gated ON transition — `--settings` window only | required |
 | `ClipboardPromptResponse` | OSC 52 prompt | scripted-E2E | — (unwired, FU-8) — `clipboard.rs` outside the import closure | required |
@@ -164,11 +164,11 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `WorkspaceNotesChanged` | workspace notes | scripted-E2E | — (missing, FU-21) | required |
 | `SearchResults` | find overlay | scripted-E2E | — (missing, FU-9) | required |
 | `Welcome` | registration/adoption | scripted-E2E | `main.rs::run_reader` arm → `session_lifecycle::SessionRegistry::adopt_window` | required |
-| `WindowClosed` | close lifecycle | scripted-E2E | — (missing, FU-13) | required |
-| `WindowList` | window management | scripted-E2E | — (missing, FU-13) | required |
+| `WindowClosed` | close lifecycle | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_window_closed` → the shell's lifecycle tick quits the app | required |
+| `WindowList` | window management | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::set_windows` → `StatusBarData.remote` | required |
 | `RunAction` | remote automation | scripted-E2E | — (missing, FU-16) | required |
 | `ActionDispatched` | remote automation | scripted-E2E | — (missing, FU-16) | required |
-| `QuitRequested` | quit dialog | scripted-E2E | — (missing, FU-13) | required |
+| `QuitRequested` | quit dialog | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_quit_requested` → the shell's lifecycle tick quits the app | required |
 | `UpdateAvailable` | update dialog | visual-E2E | `main.rs::dispatch_server_message` arm → `update::UpdateState::on_available` → `StatusBarData.update_available` | required |
 | `UpdateProgress` | update dialog | visual-E2E | `main.rs::dispatch_server_message` arm → `update::UpdateState::on_progress` → `StatusBarData.update_progress` | required |
 | `UpdateCheckResult` | release settings | scripted-E2E | `settings/server_action.rs::request_update_check`, reached from `SettingsWindow::run_action` — `--settings` window only | required |

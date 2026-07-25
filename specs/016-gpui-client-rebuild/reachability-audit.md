@@ -103,15 +103,15 @@ Determination techniques, in order of authority:
 | `WorkspaceNotesGet` | gpui-test | WIRED | `main.rs:558` `open_workspace_notes_modal` → `ipc_bridge.rs:281`. Demo-only: Ctrl+Shift+N, fabricated `WorkspaceId::new()` (`main.rs:561`), and the reply is dropped by the reader catch-all |
 | `WorkspaceNotesMutate` | gpui-test | WIRED | `main.rs` `route_workspace_notes_action` → `ipc_bridge.rs:291`; same demo caveat |
 | `Hello` | scripted-E2E | WIRED | `main.rs:1295`, sent on every connect |
-| `CloseWindow` | scripted-E2E | MISSING | never constructed. `DialogEvent::Chosen(_)` is discarded at `main.rs:542` |
-| `QuitAll` | scripted-E2E | MISSING | never constructed; no quit-all dialog on a live path |
+| `CloseWindow` | scripted-E2E | WIRED (bead .72) | `TerminalView::route_close_action` → `IpcSink::close_window` |
+| `QuitAll` | scripted-E2E | WIRED (bead .72) | `TerminalView::route_close_action` → `IpcSink::quit_all` |
 | `TriggerUpdate` | scripted-E2E | UNWIRED | `settings/server_action.rs:81` `request_trigger_update` has no caller |
 | `DismissUpdate` | gpui-test | MISSING | never constructed anywhere in the crate |
 | `CheckForUpdates` | scripted-E2E | WIRED | `settings/window.rs:161` from `action.check_for_updates` (`settings/model.rs:386`). Reachable only via `scribe-client-gpui --settings`; the in-app `settings` shortcut is swallowed |
 | `ListReleases` | scripted-E2E | WIRED | `settings/window.rs:165` from `action.list_releases` (`settings/model.rs:387`); same `--settings`-only caveat |
-| `ListWindows` | scripted-E2E | MISSING | not in the GPUI client; `scribe-cli` is the only sender |
+| `ListWindows` | scripted-E2E | WIRED (bead .72) | `TerminalView::poll_window_list` → `IpcSink::list_windows` |
 | `DispatchAction` | scripted-E2E | MISSING | not in the GPUI client; `scribe-cli` is the only sender |
-| `FocusChanged` | scripted-E2E | MISSING | never constructed; the client never reports focus |
+| `FocusChanged` | scripted-E2E | WIRED (bead .72) | `TerminalView::report_focus` → `IpcSink::focus_changed` |
 | `HookEvent` | scripted-E2E | WIRED | out-of-client by design: `crates/scribe-hook-helper/src/main.rs:119` |
 | `EnvPreflight` | scripted-E2E | WIRED | `settings/window.rs` `run_action` (`action.env_preflight`) and the gated `enable_env_persistence` ON transition; same `--settings`-only caveat. Asserted on the wire by `tests/e2e/visual/settings-trust.sh` |
 | `ClipboardPromptResponse` | scripted-E2E | UNWIRED | built in `clipboard.rs`; module not imported by `main.rs` |
@@ -171,11 +171,11 @@ Everything else is silently discarded on the wire.
 | `WorkspaceNotesChanged` | gpui-test | MISSING | no reference in the crate |
 | `SearchResults` | gpui-test | MISSING | no reference in the crate |
 | `Welcome` | scripted-E2E | WIRED | `run_reader` arm → `SessionRegistry::adopt_window` |
-| `WindowClosed` | scripted-E2E | MISSING | no reference in the crate |
-| `WindowList` | scripted-E2E | MISSING | no reference in the crate |
+| `WindowClosed` | scripted-E2E | WIRED (bead .72) | `on_window_lifecycle_message` → `WindowLifecycle::on_window_closed` |
+| `WindowList` | scripted-E2E | WIRED (bead .72) | `on_window_lifecycle_message` → `WindowLifecycle::set_windows` |
 | `RunAction` | scripted-E2E | MISSING | no reference in the crate |
 | `ActionDispatched` | scripted-E2E | MISSING | no reference in the crate |
-| `QuitRequested` | scripted-E2E | MISSING | no reference in the crate |
+| `QuitRequested` | scripted-E2E | WIRED (bead .72) | `on_window_lifecycle_message` → `WindowLifecycle::on_quit_requested` |
 | `UpdateAvailable` | visual-E2E | MISSING | no reference; `StatusBarData.update_available` hardcoded `None` |
 | `UpdateProgress` | visual-E2E | MISSING | no reference; `StatusBarData.update_progress` hardcoded `None` |
 | `UpdateCheckResult` | gpui-test | WIRED | `settings/server_action.rs:46`, reached from `settings/window.rs:161` (`--settings` only) |
@@ -415,6 +415,9 @@ and blocks every `visual-E2E` row.
 
 - **FU-13 Window lifecycle.** Rows: `CloseWindow`, `QuitAll`, `WindowClosed`,
   `QuitRequested`, `ListWindows`, `WindowList`, `FocusChanged`.
+  **Covered by bead .72 — do not re-file.** All seven are wired through
+  `window_lifecycle.rs` and asserted on the wire by
+  `tests/e2e/visual/window-lifecycle.sh`.
 - **FU-14 Update surfaces in the terminal window.** Rows: `TriggerUpdate`,
   `DismissUpdate`, `UpdateAvailable`, `UpdateProgress`. (`CheckForUpdates` /
   `ListReleases` / `UpdateCheckResult` / `ReleaseList` are reachable, but only

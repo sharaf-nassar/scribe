@@ -1,0 +1,376 @@
+#!/bin/bash
+# Scripted E2E: the GPUI client's window lifecycle, asserted on the real wire.
+#
+# Seven protocol messages make up a window's own lifecycle and none of them can
+# be shown by a headless test: `CloseWindow`, `QuitAll`, `ListWindows` and
+# `FocusChanged` only exist if the running window emits them, and `WindowClosed`
+# / `QuitRequested` / `WindowList` only matter if the running window acts on
+# them. So this test drives the real client against the real `scribe-server`
+# and reads the frames off the wire.
+#
+# The wire tap (`scribe-test share-tap`, SCRIBE_SHARE_TAP=1) is interposed on
+# the server socket purely as a recorder here — nothing is injected. Every
+# server frame this test asserts on is one the real server chose to send in
+# answer to something the real client sent, so a passing run is an end-to-end
+# round trip, not a replay.
+#
+# Phases:
+#   0. hand the client a live pane (see the preamble note below);
+#   1. the window-list poll leaves the client and the reply is acted on;
+#   2. an OS focus change and a new tab each put a `FocusChanged` on the wire;
+#   3. the WM's close button raises the close dialog, "Quit Scribe" puts
+#      `QuitAll` on the wire, and the server's `QuitRequested` exits the client;
+#   4. a relaunched client's "Kill Window" puts `CloseWindow` on the wire and
+#      the server's `WindowClosed` exits it.
+#
+# Phase 0 exists for the same reason it does in overlay-actions.sh: the
+# entrypoint creates $SESSION through `scribe-test` *after* launching the
+# client, the server sends `SessionCreated` only to the connection that asked,
+# and `handle_list_sessions` hides sessions owned by another window — so the
+# running client never learns the session exists. Stopping the test daemon
+# releases that ownership, after which a relaunched client picks the session up
+# over the normal `ListSessions` path.
+#
+# `remote.enabled = true` is seeded through SCRIBE_EXTRA_CONFIG because the
+# window-list poll is gated on it, exactly as the winit client gates it: the
+# reply's only rendered consumer is the status bar's owning-machine
+# remote-control summary, which is not drawn while remote control is off. The
+# server is already running by the time that file is written, so nothing on the
+# server side is remote-enabled — this only turns the client's poll on.
+#
+# Input is driven through XTEST (plain `xdotool key`, no `--window`), matching
+# overlay-actions.sh.
+#
+# Requires: visual container with SCRIBE_SHARE_TAP=1 and SCRIBE_EXTRA_CONFIG
+# seeding `[remote] enabled = true`; xdotool, scrot, python3.
+set -e
+
+RECORD="${SHARE_WIRE_RECORD:-/output/share-wire.jsonl}"
+CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
+SESSION="${SESSION:?the entrypoint must export a created SESSION}"
+
+fail() {
+    echo "FAIL: $1" >&2
+    echo "--- client log tail ---" >&2
+    tail -40 "$CLIENT_LOG" >&2 || true
+    exit 1
+}
+
+# Count recorded frames of `type` in `dir` matching every key=value pair. A
+# value that parses as JSON is compared as JSON (so `gained=null` matches a
+# JSON null and a bare uuid matches the string), which is how the focus and
+# window-id assertions below can be exact.
+count_frames() {
+    python3 - "$RECORD" "$@" <<'PY'
+import json, sys
+
+path, direction, wanted = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def norm(value):
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+pairs = [(k, norm(v)) for k, v in (p.split("=", 1) for p in sys.argv[4:])]
+total = 0
+try:
+    handle = open(path)
+except OSError:
+    print(0)
+    sys.exit(0)
+with handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("dir") != direction:
+            continue
+        message = row.get("message", {})
+        if message.get("type") != wanted:
+            continue
+        if all(message.get(key) == value for key, value in pairs):
+            total += 1
+print(total)
+PY
+}
+
+count_client() { count_frames client "$@"; }
+count_server() { count_frames server "$@"; }
+
+# Wait until the recorded frame count for a matcher exceeds `baseline`.
+wait_for_frames() {
+    local direction="$1" baseline="$2" timeout_secs="$3"
+    shift 3
+    local started now
+    started=$(date +%s)
+    while true; do
+        now=$(count_frames "$direction" "$@")
+        if [ "$now" -gt "$baseline" ]; then
+            return 0
+        fi
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            return 1
+        fi
+        sleep 0.3
+    done
+}
+
+# The window id the server handed the *newest* client connection in its
+# `Welcome`. A `CloseWindow` must name exactly this id or the server refuses it,
+# and the test relaunches the client, so the last one recorded is the live one.
+last_welcome_window() {
+    python3 - "$RECORD" <<'PY'
+import json, sys
+
+found = None
+with open(sys.argv[1]) as handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        message = row.get("message", {})
+        if row.get("dir") == "server" and message.get("type") == "Welcome":
+            found = message.get("window_id")
+if found is None:
+    sys.exit(1)
+print(found)
+PY
+}
+
+# A `FocusChanged` that moved focus off `$SESSION` onto some *other* pane. The
+# new session's id is minted by the server when the tab is created, so it
+# cannot be spelled out in advance — only its shape can.
+count_focus_moved_off_session() {
+    python3 - "$RECORD" "$SESSION" <<'PY'
+import json, sys
+
+path, session = sys.argv[1], sys.argv[2]
+total = 0
+with open(path) as handle:
+    for line in handle:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        message = row.get("message", {})
+        if row.get("dir") != "client" or message.get("type") != "FocusChanged":
+            continue
+        gained = message.get("gained")
+        if message.get("lost") == session and gained not in (None, session):
+            total += 1
+print(total)
+PY
+}
+
+find_window() {
+    local wid
+    wid=$(xdotool search --class '[Ss]cribe' 2>/dev/null | tail -1)
+    [ -z "$wid" ] && wid=$(xdotool search --name '[Ss]cribe' 2>/dev/null | tail -1)
+    printf '%s' "$wid"
+}
+
+focus() {
+    local wid
+    wid=$(find_window)
+    [ -n "$wid" ] || fail "no Scribe window found"
+    xdotool windowactivate --sync "$wid" 2>/dev/null \
+        || xdotool windowfocus --sync "$wid" 2>/dev/null || true
+    # Past the X11 focus guard's 300 ms reactivation debounce, so a keystroke
+    # sent right after a re-activation is not swallowed by the guard.
+    sleep 0.8
+}
+
+shot() {
+    sleep 0.3
+    scrot -o "$1"
+    echo "captured $1"
+}
+
+WIN_X=0
+WIN_Y=0
+WIN_W=0
+WIN_H=0
+
+# Cache the client window's on-screen geometry so a full-screen capture can be
+# cropped down to just its body.
+measure_window() {
+    local wid
+    wid=$(find_window)
+    [ -n "$wid" ] || fail "no Scribe window found"
+    eval "$(xdotool getwindowgeometry --shell "$wid")"
+    WIN_X="$X"
+    WIN_Y="$Y"
+    WIN_W="$WIDTH"
+    WIN_H="$HEIGHT"
+}
+
+# Crop a full-screen capture to the window minus its bottom band, because the
+# status bar's sparklines resample every 2 s and would move pixels on their own.
+crop_body() {
+    convert "$1" -crop "${WIN_W}x$(( WIN_H - 60 ))+${WIN_X}+${WIN_Y}" +repage "$2"
+}
+
+send_keys() {
+    xdotool key --clearmodifiers "$@"
+    sleep 0.5
+}
+
+# Wait for every scribe-client-gpui process to be gone.
+wait_for_client_exit() {
+    local timeout_secs="$1" started
+    started=$(date +%s)
+    while pgrep -f 'scribe-client-gpui' >/dev/null 2>&1; do
+        if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
+            return 1
+        fi
+        sleep 0.3
+    done
+    return 0
+}
+
+launch_client() {
+    scribe-client-gpui >>"$CLIENT_LOG" 2>&1 &
+    xdotool search --sync --name "Scribe" >/dev/null 2>&1 || true
+    sleep 2
+}
+
+# ── Phase 0: hand the client a live pane to act in ────────────────
+sleep 1.0
+kill "${SCRIBE_CLIENT_PID:-0}" 2>/dev/null || true
+wait_for_client_exit 15 || fail "PHASE 0: the original client did not exit"
+scribe-test daemon stop >/dev/null 2>&1 || true
+sleep 1.0
+ATTACHED_BEFORE=$(count_client AttachSessions "session_ids=[\"$SESSION\"]")
+launch_client
+wait_for_frames client "$ATTACHED_BEFORE" 30 AttachSessions "session_ids=[\"$SESSION\"]" \
+    || fail "PHASE 0: the relaunched client never attached to $SESSION"
+focus
+shot /output/00-attached.png
+echo "PHASE 0 PASS: the client attached to session $SESSION"
+
+# ── Phase 1: the window-list poll round trips ─────────────────────
+# `ListWindows` is throttled to one send every 2 s and is answered by exactly
+# one `WindowList`, so a growing pair proves the poll is live on both ends.
+LIST_BEFORE=$(count_client ListWindows)
+REPLY_BEFORE=$(count_server WindowList)
+LOG_BEFORE=$(grep -c "server window list" "$CLIENT_LOG" || true)
+wait_for_frames client "$LIST_BEFORE" 20 ListWindows \
+    || fail "PHASE 1: the client never sent ListWindows"
+wait_for_frames server "$REPLY_BEFORE" 20 WindowList \
+    || fail "PHASE 1: the server never answered with WindowList"
+LOG_AFTER=$(grep -c "server window list" "$CLIENT_LOG" || true)
+[ "$LOG_AFTER" -gt "$LOG_BEFORE" ] \
+    || fail "PHASE 1: the client never acted on the WindowList reply"
+if grep -E "server message not wired into the GPUI client.*variant=WindowList" "$CLIENT_LOG"; then
+    fail "PHASE 1: WindowList still fell through to the unhandled counter"
+fi
+echo "PHASE 1 PASS: ListWindows left the client and its WindowList reply was handled"
+
+# ── Phase 2a: an OS focus change is reported ──────────────────────
+# Iconifying the window makes openbox take X input focus away from it, which is
+# the FocusOut the client's activation observer reports as a focus loss; mapping
+# and re-activating it reports the matching gain.
+BLUR_BEFORE=$(count_client FocusChanged "gained=null" "lost=$SESSION")
+WID=$(find_window)
+xdotool windowminimize "$WID"
+wait_for_frames client "$BLUR_BEFORE" 15 FocusChanged "gained=null" "lost=$SESSION" \
+    || fail "PHASE 2a: losing OS focus put no FocusChanged on the wire"
+GAIN_BEFORE=$(count_client FocusChanged "gained=$SESSION" "lost=null")
+xdotool windowmap "$WID" 2>/dev/null || true
+focus
+wait_for_frames client "$GAIN_BEFORE" 15 FocusChanged "gained=$SESSION" "lost=null" \
+    || fail "PHASE 2a: regaining OS focus put no FocusChanged on the wire"
+shot /output/01-refocused.png
+echo "PHASE 2a PASS: both edges of an OS focus change reached the server"
+
+# ── Phase 2b: switching panes is reported ─────────────────────────
+# Ctrl+Shift+T creates a real session; the client focuses and attaches the new
+# tab, which moves the focused pane and therefore reports a gain *and* a loss.
+MOVED_BEFORE=$(count_focus_moved_off_session)
+send_keys ctrl+shift+t
+started=$(date +%s)
+while [ "$(count_focus_moved_off_session)" -le "$MOVED_BEFORE" ]; do
+    if [ $(( "$(date +%s)" - started )) -ge 20 ]; then
+        fail "PHASE 2b: a new tab moved focus without reporting FocusChanged"
+    fi
+    sleep 0.3
+done
+shot /output/02-second-tab.png
+echo "PHASE 2b PASS: moving the focused pane reported gained and lost together"
+
+# ── Phase 3: the close dialog's Quit Scribe quits every window ────
+# Alt+F4 is openbox's Close action, which sends WM_DELETE_WINDOW — the same
+# message the decoration's close button sends, and the one GPUI turns into the
+# client's `on_window_should_close` hook. (`xdotool windowclose` is *not* used:
+# it calls XDestroyWindow and bypasses the WM protocol entirely.) The client
+# must veto that close and raise its own dialog instead, because the server owns
+# this window's sessions.
+focus
+measure_window
+shot /output/03a-before-close.png
+crop_body /output/03a-before-close.png /output/03a-body.png
+send_keys alt+F4
+sleep 1.0
+shot /output/03-close-dialog.png
+pgrep -f 'scribe-client-gpui' >/dev/null 2>&1 \
+    || fail "PHASE 3: the client closed on WM_DELETE_WINDOW instead of asking"
+# The modal dims and covers the grid, so a changed body crop is the dialog and
+# nothing else; the crop excludes the status bar, whose sparklines resample
+# every 2 s and would change pixels on their own.
+crop_body /output/03-close-dialog.png /output/03-body.png
+DIALOG_DIFF=$(compare -metric AE /output/03a-body.png /output/03-body.png null: 2>&1 || true)
+[ "${DIALOG_DIFF%% *}" != "0" ] \
+    || fail "PHASE 3: WM_DELETE_WINDOW painted no close dialog"
+QUIT_BEFORE=$(count_client QuitAll)
+ACK_BEFORE=$(count_server QuitRequested)
+# Cancel holds default focus, so one Tab lands on the accent Quit Scribe button.
+send_keys Tab
+shot /output/04-quit-focused.png
+send_keys Return
+wait_for_frames client "$QUIT_BEFORE" 15 QuitAll \
+    || fail "PHASE 3: Quit Scribe put no QuitAll on the wire"
+wait_for_frames server "$ACK_BEFORE" 15 QuitRequested \
+    || fail "PHASE 3: the server never broadcast QuitRequested"
+wait_for_client_exit 20 || fail "PHASE 3: the client ignored QuitRequested and stayed up"
+echo "PHASE 3 PASS: WM close raised the dialog, Quit Scribe sent QuitAll, the ack exited the app"
+
+# ── Phase 4: Kill Window closes this window only ──────────────────
+# Sessions survived the quit-all, but this phase needs no pane: `CloseWindow`
+# names the window the fresh `Welcome` assigns and destroys whatever it owns.
+launch_client
+WIN=$(last_welcome_window) || fail "PHASE 4: the relaunched client never got a Welcome"
+echo "relaunched client window id: $WIN"
+focus
+CLOSE_BEFORE=$(count_client CloseWindow "window_id=$WIN")
+CLOSED_BEFORE=$(count_server WindowClosed "window_id=$WIN")
+send_keys ctrl+shift+d
+shot /output/05-close-dialog-again.png
+# Cancel -> Quit Scribe -> Kill Window.
+send_keys Tab
+send_keys Tab
+shot /output/06-kill-window-focused.png
+send_keys Return
+wait_for_frames client "$CLOSE_BEFORE" 15 CloseWindow "window_id=$WIN" \
+    || fail "PHASE 4: Kill Window put no CloseWindow for $WIN on the wire"
+wait_for_frames server "$CLOSED_BEFORE" 15 WindowClosed "window_id=$WIN" \
+    || fail "PHASE 4: the server never acknowledged with WindowClosed"
+wait_for_client_exit 20 || fail "PHASE 4: the client ignored WindowClosed and stayed up"
+echo "PHASE 4 PASS: Kill Window sent CloseWindow and its ack exited the app"
+
+echo ""
+echo "PASS: visual window-lifecycle test"
+echo "  Inspect screenshots in test-output/:"
+echo "    00-attached.png            — the adopted pane before any action"
+echo "    01-refocused.png           — the window after a blur/focus round trip"
+echo "    02-second-tab.png          — the second tab that moved pane focus"
+echo "    03a-before-close.png       — the window just before the close request"
+echo "    03-close-dialog.png        — WM close raised the in-app dialog"
+echo "    04-quit-focused.png        — Tab moved focus onto Quit Scribe"
+echo "    05-close-dialog-again.png  — the close chord raised it on a fresh window"
+echo "    06-kill-window-focused.png — Tab twice landed on Kill Window"
+echo "  Wire record: test-output/share-wire.jsonl"
