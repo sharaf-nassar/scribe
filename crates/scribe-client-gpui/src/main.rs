@@ -25,15 +25,16 @@ use scribe_client_gpui::ai_indicator::AiStateTracker;
 use scribe_client_gpui::animation::AnimationSettings;
 use scribe_client_gpui::chrome_metadata::{ChromeMetadata, SessionChrome};
 use scribe_client_gpui::command_palette::{
-    CommandPaletteColors, CommandPaletteEvent, CommandPaletteView, build_entries,
+    CommandPaletteColors, CommandPaletteEvent, CommandPaletteView, PaletteAction, build_entries,
 };
 use scribe_client_gpui::config::{ConfigChangeSignal, ConfigReloadPlan, ConfigRuntime};
 use scribe_client_gpui::context_menu::{
-    ContextMenuColors, ContextMenuEvent, ContextMenuRequest, ContextMenuView,
+    ContextMenuAction, ContextMenuColors, ContextMenuEvent, ContextMenuRequest, ContextMenuView,
+    MenuItem,
 };
 use scribe_client_gpui::dialog::{
     AnyDialog, ClipboardDialog, CloseDialog, DialogColors, DialogEvent, DialogOutcome, DialogView,
-    UpdateAction, UpdateDialogKind,
+    DisallowedSchemeAction, DisallowedSchemeDialog, UpdateAction, UpdateDialogKind,
 };
 use scribe_client_gpui::input::KeyInput;
 use scribe_client_gpui::keybindings::{KeyAction, LayoutAction, translate_key_action};
@@ -51,6 +52,7 @@ use scribe_client_gpui::status_bar::{self, RemoteStatusData, StatusBarColors, St
 use scribe_client_gpui::sys_stats::SystemStatsCollector;
 use scribe_client_gpui::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
 use scribe_client_gpui::update::UpdateState;
+use scribe_client_gpui::url_detect;
 use scribe_client_gpui::workspace_notes::WorkspaceNoteEntry;
 use scribe_client_gpui::workspace_notes_modal::{
     WorkspaceNotesModalAction, WorkspaceNotesModalColors, WorkspaceNotesModalView,
@@ -68,7 +70,8 @@ use scribe_common::{
     framing::{read_message, write_message},
     ids::{SessionId, WorkspaceId},
     protocol::{
-        ArchiveReason, ClientMessage, ServerMessage, SessionInfo, TerminalSize, WorkspaceNoteStatus,
+        ArchiveReason, AutomationAction, ClientMessage, ServerMessage, SessionInfo, TerminalSize,
+        WorkspaceNoteStatus,
     },
     screen_replay::SessionReplay,
     socket::server_socket_path,
@@ -126,6 +129,14 @@ fn log_first_frame_timing() {
 
 const COLUMNS: u16 = 120;
 const ROWS: u16 = 36;
+
+/// Label of the demo smart-selection row in the right-click context menu.
+const DEMO_SMART_ACTION_LABEL: &str = "Send Text: scribe-context-menu";
+
+/// Text the demo smart-selection row types into the attached pane. Chosen to be
+/// a harmless, greppable marker so the scripted E2E can assert the click
+/// actually reached the PTY.
+const DEMO_SMART_ACTION_TEXT: &str = "scribe-context-menu";
 const CELL_WIDTH: u16 = 8;
 const CELL_HEIGHT: u16 = 18;
 
@@ -278,6 +289,11 @@ struct TerminalView {
     update_dialog_kind: Option<UpdateDialogKind>,
     /// The per-workspace notes modal overlay, present only while open.
     workspace_notes_modal: Option<Entity<WorkspaceNotesModalView>>,
+    /// OSC 8 URI held while the disallowed-scheme dialog is up, so an "Open
+    /// Anyway" choice can activate the verbatim URI (spec 009 FR-015). The
+    /// dialog view owns its own copy for display; this is the activation copy
+    /// the shell needs after the modal resolves.
+    pending_osc8_uri: Option<String>,
     /// Demo toggle: when set, an OSC 8-style hover tooltip is drawn over a fixed
     /// anchor so the visual E2E can exercise tooltip clamping + URL truncation.
     tooltip_demo: bool,
@@ -376,6 +392,7 @@ impl TerminalView {
             dialog: None,
             update_dialog_kind: None,
             workspace_notes_modal: None,
+            pending_osc8_uri: None,
             tooltip_demo: false,
             x11_focus,
             _refresh_task: refresh_task,
@@ -566,6 +583,177 @@ impl TerminalView {
         }
     }
 
+    /// The single live dispatch point for a resolved [`KeyAction`].
+    ///
+    /// Every producer funnels through here — the keybinding path
+    /// ([`Self::handle_binding`]) and the command palette
+    /// ([`Self::execute_automation_action`]) — so a palette row and its bound
+    /// chord can never drift apart, and wiring one surface wires both. The
+    /// still-unwired families (`OpenSettings`, `OpenFind`) are named here
+    /// rather than folded into a `_` arm, so a new [`KeyAction`] fails to
+    /// compile instead of silently joining the dropped set.
+    fn dispatch_key_action(&mut self, action: KeyAction, cx: &mut Context<Self>) {
+        match action {
+            KeyAction::Layout(layout) => self.handle_layout_action(layout, cx),
+            KeyAction::Terminal(bytes) => self.send_key_bytes(bytes),
+            KeyAction::OpenCommandPalette => self.open_command_palette(cx),
+            // The settings window (FU-23) and the find overlay (FU-9) are
+            // separate beads. Both are still swallowed so they cannot reach the
+            // PTY, and both are counted so the drop is visible in the log.
+            KeyAction::OpenSettings | KeyAction::OpenFind => {
+                unroutable_action(&format!("{action:?}"), "no handler in the GPUI shell yet");
+            }
+        }
+    }
+
+    /// Dispatch a confirmed command-palette row.
+    ///
+    /// Ports the winit `execute_palette_action` seam: shared automation actions
+    /// run through [`Self::execute_automation_action`], and the feature-013
+    /// client-local remote-connect row is client-only (FU-16).
+    fn execute_palette_action(&mut self, action: PaletteAction, cx: &mut Context<Self>) {
+        match action {
+            PaletteAction::Automation(automation) => {
+                self.execute_automation_action(automation, cx);
+            }
+            PaletteAction::OpenRemoteConnect => {
+                unroutable_action("OpenRemoteConnect", "the remote-connect picker is not ported");
+            }
+        }
+    }
+
+    /// Run one shared [`AutomationAction`].
+    ///
+    /// Most rows have an exact [`KeyAction`] twin, so they are lowered by
+    /// [`key_action_for_automation`] and handed to [`Self::dispatch_key_action`]
+    /// — the same call the keybinding path makes. The three actions with no
+    /// bindable chord are handled here: a profile switch reloads the live
+    /// config in place, session focus moves the tab selection, and the update
+    /// dialog waits on the update surfaces (FU-14).
+    fn execute_automation_action(&mut self, action: AutomationAction, cx: &mut Context<Self>) {
+        if let Some(key_action) = key_action_for_automation(&action) {
+            self.dispatch_key_action(key_action, cx);
+            return;
+        }
+        match action {
+            AutomationAction::SwitchProfile { name } => self.switch_profile(&name, cx),
+            AutomationAction::FocusSession { session_id } => self.focus_session(session_id, cx),
+            AutomationAction::OpenUpdateDialog => {
+                unroutable_action("OpenUpdateDialog", "update state is not tracked in the client");
+            }
+            // Everything else was lowered onto a `KeyAction` above.
+            other => unroutable_action(&format!("{other:?}"), "no automation handler"),
+        }
+    }
+
+    /// Activate `name` as the current profile and apply the config it wrote.
+    ///
+    /// [`scribe_common::profiles::switch_profile`] copies the stored profile
+    /// over `config.toml` and hands back the parsed result, so the live window
+    /// is reloaded from that value directly instead of racing the file watcher
+    /// against its own write.
+    fn switch_profile(&mut self, name: &str, cx: &mut Context<Self>) {
+        match scribe_common::profiles::switch_profile(name) {
+            Ok(config) => {
+                let plan = self.config.reload(config);
+                self.apply_config_reload(plan, cx);
+                tracing::info!(profile = %name, "switched profile");
+            }
+            Err(error) => tracing::warn!(profile = %name, %error, "failed to switch profile"),
+        }
+    }
+
+    /// Raise the tab hosting `session_id` and attach it.
+    fn focus_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        self.switch_tab(
+            move |tabs| {
+                let index = tabs.tabs().iter().position(|tab| tab.session_id == session_id)?;
+                tabs.select(index)
+            },
+            cx,
+        );
+    }
+
+    /// Dispatch an action chosen from the right-click context menu.
+    ///
+    /// Ports the winit `dispatch_context_menu_action` routing for the open/run
+    /// group: heuristic URLs keep the silent scheme-allowlist drop, an OSC 8
+    /// URI goes through [`Self::route_osc8_activation`] so a disallowed scheme
+    /// prompts first (spec 009 FR-003 / FR-015), file paths open with the OS
+    /// handler, and the smart-selection run/send actions reach the attached
+    /// pane or a fresh tab. The clipboard trio (Copy / Paste / Select All and
+    /// the copy-text rows) needs the host clipboard and a live selection model,
+    /// which is a separate bead; those rows are counted rather than dropped.
+    fn dispatch_context_menu_action(&mut self, action: ContextMenuAction, cx: &mut Context<Self>) {
+        match action {
+            ContextMenuAction::OpenUrl(url) => url_detect::open_url(&url),
+            ContextMenuAction::OpenOsc8Url(uri) => self.route_osc8_activation(uri, cx),
+            ContextMenuAction::OpenFile(path) => url_detect::open_path(&path, None),
+            // An explicit user-initiated run, not a clipboard paste: it bypasses
+            // the paste-confirmation gate exactly as the legacy client does.
+            ContextMenuAction::RunCommand(command) => {
+                self.send_key_bytes(format!("{command}\n").into_bytes());
+            }
+            ContextMenuAction::SendText(text) => self.send_key_bytes(text.into_bytes()),
+            ContextMenuAction::RunCommandInWindow(command) => {
+                self.create_tab(Some(shell_command_argv(&command)));
+            }
+            ContextMenuAction::RunCoprocess(command) => spawn_background_command(&command),
+            ContextMenuAction::Copy
+            | ContextMenuAction::Paste
+            | ContextMenuAction::SelectAll
+            | ContextMenuAction::CopyText(_)
+            | ContextMenuAction::CopyHyperlinkAddress(_) => {
+                unroutable_action(&format!("{action:?}"), "clipboard and selection are not wired");
+            }
+        }
+        cx.notify();
+    }
+
+    /// Route an OSC 8 activation through the scheme-allowlist gate.
+    ///
+    /// An allowlisted scheme opens straight away with no added latency; any
+    /// other scheme raises the disallowed-scheme confirmation and parks the
+    /// verbatim URI on [`Self::pending_osc8_uri`] until the modal resolves.
+    fn route_osc8_activation(&mut self, uri: String, cx: &mut Context<Self>) {
+        if url_detect::is_allowed_scheme(&uri) {
+            url_detect::open_url(&uri);
+            return;
+        }
+        let scheme = url_detect::extract_scheme(&uri).unwrap_or_default();
+        self.pending_osc8_uri = Some(uri.clone());
+        self.open_dialog(AnyDialog::DisallowedScheme(DisallowedSchemeDialog::new(uri, scheme)), cx);
+    }
+
+    /// Route a resolved modal choice.
+    ///
+    /// Two outcomes have a live consumer: an update decision goes to
+    /// [`Self::route_update_action`], and a disallowed-scheme "Open Anyway"
+    /// activates the parked URI without the allowlist guard. Every other
+    /// resolution — including Escape / backdrop, which resolves to the safe
+    /// action — drops it; the close, paste and clipboard modals answer server
+    /// prompts and are wired with those surfaces.
+    fn route_dialog_outcome(&mut self, outcome: DialogOutcome) {
+        // Both consumers read state the dialog parked on the view, so take the
+        // pending URI up front and clear the update kind only once the update
+        // route (which reads it) has run.
+        let pending = self.pending_osc8_uri.take();
+        match outcome {
+            DialogOutcome::Update(action) => self.route_update_action(action),
+            DialogOutcome::DisallowedScheme(DisallowedSchemeAction::OpenAnyway) => {
+                if let Some(uri) = pending {
+                    url_detect::open_uri_unguarded(&uri);
+                }
+            }
+            DialogOutcome::Close(_)
+            | DialogOutcome::Paste(_)
+            | DialogOutcome::Clipboard(_)
+            | DialogOutcome::DisallowedScheme(_) => {}
+        }
+        // The dialog is gone either way, so its kind must not outlive it.
+        self.update_dialog_kind = None;
+    }
+
     /// Ask the server for a new session in the active workspace.
     ///
     /// The tab appears once the server answers with `SessionCreated`, so the
@@ -633,10 +821,14 @@ impl TerminalView {
         let entries = build_entries(None, &profile_names, active.as_deref());
         let colors = CommandPaletteColors::from(&self.chrome);
         let palette = cx.new(|cx| CommandPaletteView::new(colors, entries, cx));
-        cx.subscribe(&palette, |this, _palette, event: &CommandPaletteEvent, ctx| match event {
-            CommandPaletteEvent::Execute(_) | CommandPaletteEvent::Dismissed => {
-                this.command_palette = None;
-                ctx.notify();
+        cx.subscribe(&palette, |this, _palette, event: &CommandPaletteEvent, ctx| {
+            // Tear the overlay down first: a routed action may raise another
+            // overlay (a dialog, the palette again), and clearing afterwards
+            // would wipe it out.
+            this.command_palette = None;
+            ctx.notify();
+            if let CommandPaletteEvent::Execute(action) = event {
+                this.execute_palette_action(action.clone(), ctx);
             }
         })
         .detach();
@@ -645,20 +837,33 @@ impl TerminalView {
     }
 
     /// Open the right-click context menu at `position` with a representative item
-    /// set (selection + OSC 8 URL), subscribing so a choice or dismiss closes it.
+    /// set (selection + OSC 8 URL + one smart-selection row), subscribing so a
+    /// choice runs through [`Self::dispatch_context_menu_action`] and a dismiss
+    /// closes the overlay.
+    ///
+    /// The smart-selection row is a demo stand-in until the rule engine is on a
+    /// live path: it is the menu's one entry whose effect lands in the attached
+    /// pane, so the scripted E2E can assert that a clicked row actually reached
+    /// the PTY rather than only that the overlay closed.
     fn open_context_menu(&mut self, position: Point<gpui::Pixels>, cx: &mut Context<Self>) {
         self.command_palette = None;
         let colors = ContextMenuColors::from(&self.chrome);
         let request = ContextMenuRequest {
             has_selection: true,
             osc8_uri: Some("https://example.com/spec".into()),
+            smart_actions: vec![MenuItem {
+                label: DEMO_SMART_ACTION_LABEL.to_owned(),
+                action: ContextMenuAction::SendText(format!("{DEMO_SMART_ACTION_TEXT}\n")),
+                enabled: true,
+            }],
             ..Default::default()
         };
         let menu = cx.new(|cx| ContextMenuView::new(colors, request, position, cx));
-        cx.subscribe(&menu, |this, _menu, event: &ContextMenuEvent, ctx| match event {
-            ContextMenuEvent::Selected(_) | ContextMenuEvent::Dismissed => {
-                this.context_menu = None;
-                ctx.notify();
+        cx.subscribe(&menu, |this, _menu, event: &ContextMenuEvent, ctx| {
+            this.context_menu = None;
+            ctx.notify();
+            if let ContextMenuEvent::Selected(action) = event {
+                this.dispatch_context_menu_action(action.clone(), ctx);
             }
         })
         .detach();
@@ -679,12 +884,11 @@ impl TerminalView {
         let view = cx.new(|cx| DialogView::new(dialog, colors, cx));
         cx.subscribe(&view, |this, _view, event: &DialogEvent, ctx| {
             let DialogEvent::Chosen(outcome) = event;
-            if let DialogOutcome::Update(action) = outcome {
-                this.route_update_action(*action);
-            }
+            // Tear the overlay down first: a routed action may raise another
+            // overlay, and clearing afterwards would wipe it out.
             this.dialog = None;
-            this.update_dialog_kind = None;
             ctx.notify();
+            this.route_dialog_outcome(*outcome);
         })
         .detach();
         self.dialog = Some(view);
@@ -998,16 +1202,10 @@ impl TerminalView {
         let Some(action) = translate_key_action(&input, self.config.bindings()) else {
             return false;
         };
-        match action {
-            KeyAction::Layout(layout) => self.handle_layout_action(layout, cx),
-            KeyAction::Terminal(bytes) => self.send_key_bytes(bytes),
-            // The palette is claimed earlier by `handle_overlay_key`; the
-            // settings window and find overlay are separate beads. All three
-            // are still swallowed so they cannot reach the PTY.
-            KeyAction::OpenCommandPalette | KeyAction::OpenSettings | KeyAction::OpenFind => {
-                tracing::debug!(?action, "key action not yet wired in the GPUI shell");
-            }
-        }
+        // One dispatcher for chords and palette rows alike; the palette chord
+        // is normally claimed earlier by `handle_overlay_key`, and reaching it
+        // here simply opens the overlay.
+        self.dispatch_key_action(action, cx);
         true
     }
 
@@ -1158,6 +1356,53 @@ fn demo_workspace_notes(workspace_id: WorkspaceId) -> Vec<WorkspaceNoteEntry> {
 /// The CLI starts through the user's login shell (`-lic` + `exec`) so it
 /// inherits the same PATH and rc files a normal tab would, without first
 /// rendering a shell prompt.
+/// Lower a shared [`AutomationAction`] onto the [`KeyAction`] the keybinding
+/// path already dispatches, so the command palette and a bound chord converge
+/// on one handler.
+///
+/// `None` marks the three actions with no bindable chord — a profile switch,
+/// the update dialog, and session focus — which
+/// [`TerminalView::execute_automation_action`] handles directly. The match is
+/// exhaustive so a new automation action fails to compile here instead of
+/// quietly becoming unroutable.
+fn key_action_for_automation(action: &AutomationAction) -> Option<KeyAction> {
+    let layout = match action {
+        AutomationAction::OpenSettings => return Some(KeyAction::OpenSettings),
+        AutomationAction::OpenFind => return Some(KeyAction::OpenFind),
+        AutomationAction::NewTab => LayoutAction::NewTab,
+        AutomationAction::NewClaudeTab => LayoutAction::NewClaudeTab,
+        AutomationAction::NewClaudeResumeTab => LayoutAction::NewClaudeResumeTab,
+        AutomationAction::NewCodexTab => LayoutAction::NewCodexTab,
+        AutomationAction::NewCodexResumeTab => LayoutAction::NewCodexResumeTab,
+        AutomationAction::SplitVertical => LayoutAction::SplitVertical,
+        AutomationAction::SplitHorizontal => LayoutAction::SplitHorizontal,
+        AutomationAction::ClosePane => LayoutAction::ClosePane,
+        AutomationAction::CloseTab => LayoutAction::CloseTab,
+        AutomationAction::NewWindow => LayoutAction::NewWindow,
+        AutomationAction::SwitchProfile { .. }
+        | AutomationAction::OpenUpdateDialog
+        | AutomationAction::FocusSession { .. } => return None,
+    };
+    Some(KeyAction::Layout(layout))
+}
+
+/// Login-shell argv for a context-menu "run in a new window" action, matching
+/// the legacy client's `shell_command_argv`.
+fn shell_command_argv(command: &str) -> Vec<String> {
+    vec![scribe_common::shell::default_shell_program(), String::from("-lc"), command.to_owned()]
+}
+
+/// Spawn a detached background shell command for a smart-selection coprocess
+/// action. Fire-and-forget: the child is never awaited, matching the legacy
+/// `spawn_background_shell_command`.
+fn spawn_background_command(command: &str) {
+    let mut child = std::process::Command::new(scribe_common::shell::default_shell_program());
+    child.arg("-lc").arg(command);
+    if let Err(error) = child.spawn() {
+        tracing::warn!(%error, "smart selection command failed to spawn");
+    }
+}
+
 fn ai_tab_command(provider: AiProvider, resume: bool) -> Vec<String> {
     let shell = scribe_common::shell::default_shell_program();
     let binary = provider.binary_name();
@@ -1969,6 +2214,22 @@ fn unhandled_layout_action(action: LayoutAction) {
     tracing::warn!(?action, dropped, "layout action not wired into the GPUI shell");
 }
 
+/// Running total of overlay-originated actions that reached a dispatcher with
+/// no live handler behind it.
+///
+/// Distinct from [`UNHANDLED_LAYOUT_ACTIONS`]: those are chords the key path
+/// swallowed, these are palette rows, context-menu rows, and key actions whose
+/// destination surface (settings window, find overlay, remote picker, update
+/// dialog, clipboard) is not ported yet. Both are user-invisible without a log
+/// line, which is why every drop is named and counted here.
+static UNROUTABLE_ACTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Name, count, and warn about an action that was routed but has no handler.
+fn unroutable_action(action: &str, reason: &str) {
+    let dropped = UNROUTABLE_ACTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!(action, reason, dropped, "action not wired into the GPUI shell");
+}
+
 /// Wire name of a [`ServerMessage`] variant, for the unhandled-message warning.
 ///
 /// The match is deliberately exhaustive and deliberately not shortened with a
@@ -2323,6 +2584,9 @@ fn open_created_tab(
     if added {
         attach_session(ctx, session_id)?;
         set_status(&ctx.status, &ctx.generation, "opened a new tab".to_owned());
+        // The tab strip is pixels only; log the insert so a scripted E2E can
+        // assert that an action really produced a session round trip.
+        tracing::info!(session = %session_id, "opened a new tab");
     }
     Ok(())
 }

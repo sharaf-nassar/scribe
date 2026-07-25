@@ -200,6 +200,16 @@ It prints a grid of solid color-block and pictographic emoji, screenshots the fr
 
 `tests/e2e/visual/paste-confirmation.sh` verifies the spec-011 paste gate ([[client#Dialogs#Paste Confirmation Dialog]]): a single-line paste carrying control/escape bytes pops the confirmation with a caret-escaped preview (`^[`), while a plain single line and a tab-separated line paste straight through without a dialog.
 
+### Overlay actions run for real
+
+`tests/e2e/visual/overlay-actions.sh` is the scripted oracle for [[client#GPUI Overlays#Overlay Action Routing]]: it asserts the *effect* of a chosen palette or context-menu row, which no headless test over the overlay models can reach.
+
+The overlay models passed their unit suites the whole time the shell was dropping their events, so a green `#[gpui::test]` proves nothing about reachability here. The script instead drives the live window once per action class. It right-clicks the grid and clicks the smart-selection row, then asserts that the echoed command and the shell's answer appear as new lit pixels in the window — the row reached the attached pane's PTY. It opens the palette, filters to "New Tab", confirms, and waits for a new `opened a new tab` line, which the client only ever writes after `CreateSession` comes back as `SessionCreated`. Finally it confirms "Open Settings", whose destination window is not ported yet, and asserts the named `action not wired into the GPUI shell` warning appears: the row reached the shared dispatcher instead of dying at the subscription.
+
+The context-menu row is clicked at a pixel offset calibrated against the captured frame, so a layout change to the menu box shows up as a failing phase rather than a silent miss.
+
+A phase 0 preamble exists because the harness cannot otherwise give the client a pane to act in. `docker/entrypoint-visual.sh` creates `$SESSION` through `scribe-test` *after* launching the client, the server answers `SessionCreated` only on the connection that asked, and [[crates/scribe-server/src/ipc_server.rs#handle_list_sessions]] hides sessions owned by another window — so the running client never learns the session exists and a plain relaunch still sees nothing. Stopping the test daemon releases that window ownership, after which a relaunched client picks the session up over the normal `ListSessions` path. The trade is that `scribe-test` can no longer observe the session either, which is why the pane assertions read pixels rather than server-side output.
+
 ### Config live reload
 
 `tests/e2e/visual/config-reload.sh` is the scripted oracle for the `ConfigReloaded` parity row: it edits `config.toml` under an already-running client, the user-visible scenario the headless suites cannot reach.
