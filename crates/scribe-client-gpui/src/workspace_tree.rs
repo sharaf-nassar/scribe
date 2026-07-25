@@ -82,6 +82,39 @@ impl WorkspaceTree {
         self.report(cx);
     }
 
+    /// Rename an existing workspace region, then report the tree.
+    ///
+    /// The shell builds its first region before the server has answered with a
+    /// `Welcome` / `SessionList`, so the root region starts on a client-minted
+    /// ID and adopts the server's real [`WorkspaceId`] here as soon as one is
+    /// known. Returns `false` (without reporting) when `old_id` is not present.
+    pub fn set_workspace_id(
+        &mut self,
+        old_id: WorkspaceId,
+        new_id: WorkspaceId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.layout.set_workspace_id(old_id, new_id) {
+            return false;
+        }
+        self.report(cx);
+        true
+    }
+
+    /// Remove a workspace region, promoting its sibling, then report the tree.
+    ///
+    /// Returns `false` (without reporting) when the region is the last one in
+    /// the window — a window always has at least one workspace region. Callers
+    /// must drop the region's tabs with [`Self::remove_tab`] first, so the
+    /// pane→session map does not outlive the panes it names.
+    pub fn remove_workspace(&mut self, workspace_id: WorkspaceId, cx: &mut Context<Self>) -> bool {
+        if !self.layout.remove_workspace(workspace_id) {
+            return false;
+        }
+        self.report(cx);
+        true
+    }
+
     /// Split the focused workspace, then report the tree.
     ///
     /// Returns the new workspace ID, or `None` when the focused workspace was

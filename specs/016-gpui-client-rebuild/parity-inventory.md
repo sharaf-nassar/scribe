@@ -221,20 +221,20 @@ Every row's method is `visual-E2E`: each action must be driven through
 
 | Action | Subsystem | Verification method | Reachable from | Status |
 | --- | --- | --- | --- | --- |
-| `split_vertical` | Pane layout | visual-E2E | — (unwired, FU-5) — `LayoutAction::SplitVertical` hits the `handle_layout_action` catch-all | required |
-| `split_horizontal` | Pane layout | visual-E2E | — (unwired, FU-5) — hits the `handle_layout_action` catch-all | required |
-| `close_pane` | Pane layout | visual-E2E | — (unwired, FU-5) — hits the `handle_layout_action` catch-all | required |
-| `cycle_pane` | Pane layout | visual-E2E | — (unwired, FU-5) — `LayoutAction::FocusNext` hits the catch-all | required |
-| `focus_left` | Pane layout | visual-E2E | — (unwired, FU-5) — hits the `handle_layout_action` catch-all | required |
-| `focus_right` | Pane layout | visual-E2E | — (unwired, FU-5) — hits the `handle_layout_action` catch-all | required |
-| `focus_up` | Pane layout | visual-E2E | — (unwired, FU-5) — hits the `handle_layout_action` catch-all | required |
-| `focus_down` | Pane layout | visual-E2E | — (unwired, FU-5) — hits the `handle_layout_action` catch-all | required |
-| `workspace_split_vertical` | Workspace layout | visual-E2E | — (unwired, FU-6) — hits the catch-all; `workspace_layout.rs`/`workspace_tree.rs` outside the import closure | required |
-| `workspace_split_horizontal` | Workspace layout | visual-E2E | — (unwired, FU-6) — hits the catch-all; modules outside the import closure | required |
-| `workspace_focus_left` | Workspace layout | visual-E2E | — (unwired, FU-6) — hits the catch-all; modules outside the import closure | required |
-| `workspace_focus_right` | Workspace layout | visual-E2E | — (unwired, FU-6) — hits the catch-all; modules outside the import closure | required |
-| `workspace_focus_up` | Workspace layout | visual-E2E | — (unwired, FU-6) — hits the catch-all; modules outside the import closure | required |
-| `workspace_focus_down` | Workspace layout | visual-E2E | — (unwired, FU-6) — hits the catch-all; modules outside the import closure | required |
+| `split_vertical` | Pane layout | visual-E2E | `main.rs::handle_layout_action` `SplitVertical` arm → `TerminalView::split_pane` → `PaneShell::split_focused_pane` (`tests/e2e/visual/pane-workspace-layout.sh` phase 1) | required |
+| `split_horizontal` | Pane layout | visual-E2E | as `split_vertical`, with `SplitDirection::Vertical` | required |
+| `close_pane` | Pane layout | visual-E2E | `TerminalView::close_pane` → `PaneShell::close_focused_pane`, falling back to `close_active_tab` on the last pane (`tests/e2e/visual/pane-workspace-layout.sh` phase 5) | required |
+| `cycle_pane` | Pane layout | visual-E2E | `TerminalView::focus_next_pane` → `PaneShell::focus_next_pane` (`tests/e2e/visual/pane-workspace-layout.sh` phase 4) | required |
+| `focus_left` | Pane layout | visual-E2E | `TerminalView::focus_pane` → `PaneShell::focus_pane_in_direction` (`tests/e2e/visual/pane-workspace-layout.sh` phase 3) | required |
+| `focus_right` | Pane layout | visual-E2E | as `focus_left`, `FocusDirection::Right` | required |
+| `focus_up` | Pane layout | visual-E2E | as `focus_left`, `FocusDirection::Up` | required |
+| `focus_down` | Pane layout | visual-E2E | as `focus_left`, `FocusDirection::Down` | required |
+| `workspace_split_vertical` | Workspace layout | visual-E2E | `TerminalView::split_workspace` → `PaneShell::split_workspace` → `WorkspaceTree::split_workspace` (`tests/e2e/visual/pane-workspace-layout.sh` phase 6) | required |
+| `workspace_split_horizontal` | Workspace layout | visual-E2E | as `workspace_split_vertical`, with `SplitDirection::Vertical` | required |
+| `workspace_focus_left` | Workspace layout | visual-E2E | `TerminalView::focus_workspace` → `PaneShell::focus_workspace_in_direction` (`tests/e2e/visual/pane-workspace-layout.sh` phase 7, on a rebound chord: openbox grabs the `ctrl+alt+arrow` default) | required |
+| `workspace_focus_right` | Workspace layout | visual-E2E | as `workspace_focus_left`, `FocusDirection::Right` | required |
+| `workspace_focus_up` | Workspace layout | visual-E2E | as `workspace_focus_left`, `FocusDirection::Up` | required |
+| `workspace_focus_down` | Workspace layout | visual-E2E | as `workspace_focus_left`, `FocusDirection::Down` | required |
 | `new_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewTab` arm → `main.rs::create_tab` | required |
 | `new_claude_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewClaudeTab` arm → `ai_tab_command` | required |
 | `new_claude_resume_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewClaudeResumeTab` arm → `ai_tab_command` | required |

@@ -1,13 +1,14 @@
-//! One-pane GPUI client spike over Scribe's frozen local IPC protocol.
+//! GPUI Scribe client over Scribe's frozen local IPC protocol.
 
 mod ipc_bridge;
+mod pane_shell;
 mod session_lifecycle;
 mod sync_frames;
 mod terminal;
 mod terminal_element;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::Rc,
     sync::{
         Arc, Mutex, OnceLock,
@@ -19,7 +20,7 @@ use std::{
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
     Pixels, Point, Render, Size, Subscription, Task, TitlebarOptions, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, div, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use scribe_client_gpui::ai_indicator::AiStateTracker;
@@ -46,7 +47,7 @@ use scribe_client_gpui::keybindings::{
 use scribe_client_gpui::lan::{LanChrome, LanConnectOutcome, LanEnvSummary};
 use scribe_client_gpui::lan_approval::{LanApprovalAction, LanApprovalDialog};
 use scribe_client_gpui::lan_dial::{self, LanDialer};
-use scribe_client_gpui::layout::Rect;
+use scribe_client_gpui::layout::{FocusDirection, PaneId, Rect, SplitDirection};
 use scribe_client_gpui::opacity::{clamp_opacity, opaque_slot, surface};
 use scribe_client_gpui::prompt_bar::{
     self, PromptBarColors, PromptBarData, PromptContextIndicator,
@@ -111,8 +112,9 @@ use tokio::{
 
 use crate::{
     ipc_bridge::{InboundEvent, IpcSink, run_drain},
+    pane_shell::{ClosedPane, PaneShell},
     sync_frames::{SyncFrameQueue, drain_all_committed},
-    terminal::{Content, DisplayOnlyTerminal, Scroll},
+    terminal::{Content, DisplayOnlyTerminal, PaneGrids, Scroll},
     terminal_element::{
         GridBounds, GridColors, GridFont, TerminalElement, cell_at, hits_jump_chip,
     },
@@ -244,9 +246,18 @@ impl AiChrome {
 /// the foreground GPUI view.
 #[derive(Clone)]
 struct Shared {
-    terminal: Arc<Mutex<DisplayOnlyTerminal>>,
+    /// One display grid per session the window shows in a pane. The IPC drain
+    /// writes each batch into the grid of the session it names; the render pass
+    /// reads back the grid belonging to each pane's session.
+    panes: Arc<Mutex<PaneGrids>>,
+    /// Every session the client has attached, and therefore the set whose
+    /// `PtyOutput` the reader lets through. A split window streams several
+    /// panes at once, so this replaces the single-attached-session gate.
+    attached: Arc<Mutex<HashSet<SessionId>>>,
     status: Arc<Mutex<String>>,
     generation: Arc<AtomicU64>,
+    /// The session in the focused pane: what keystrokes reach and what the
+    /// status bar, prompt bar, and tab-context suffix describe.
     active_session: Arc<Mutex<Option<SessionId>>>,
     /// Ordered tab strip. The IPC reader rebuilds it from `SessionList` /
     /// `SessionCreated` / `SessionExited`; the key-dispatch path moves its
@@ -369,6 +380,16 @@ struct TerminalView {
     context_thresholds: AiContextThresholds,
     /// Whether `terminal.prompt_bar` is enabled in config.
     prompt_bar_enabled: bool,
+    /// The window's live pane and workspace split layout. Every pane action
+    /// mutates it and the render pass resolves it into the grid area's panes.
+    shell: PaneShell,
+    /// The grid geometry last published to the server for each pane's session,
+    /// so a redraw only re-sends `Resize` when a split actually changed a
+    /// pane's size.
+    pane_sizes: HashMap<SessionId, TerminalSize>,
+    /// Geometry of the focused pane, which is where a new tab or a split's
+    /// session opens. Starts at the whole window and shrinks with the layout.
+    focused_pane_size: TerminalSize,
     // The custom titlebar + integrated tab bar drawn above the terminal grid.
     titlebar: Entity<TitlebarView>,
     /// Theme chrome, retained to build the overlay palettes on demand.
@@ -520,6 +541,9 @@ impl TerminalView {
         // redraw so the tab row always mirrors live server state.
         let rendered_tabs = TabSessions::new();
         let titlebar = Self::build_titlebar(colors, &rendered_tabs, cx);
+        // One workspace region holding one pane: the shape the window has
+        // before the first split, and the shape every split grows out of.
+        let shell = PaneShell::new(chrome.accent, cx);
         Self {
             shared,
             sink,
@@ -536,6 +560,9 @@ impl TerminalView {
             prompt_colors,
             context_thresholds,
             prompt_bar_enabled,
+            shell,
+            pane_sizes: HashMap::new(),
+            focused_pane_size: terminal_size,
             titlebar,
             chrome,
             terminal_size,
@@ -673,8 +700,8 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Republish the cell grid's size after a font edit changed cell metrics,
-    /// then resync the pane from the server's authoritative screen.
+    /// Republish every pane's grid size after a font edit changed cell metrics,
+    /// then resync each pane from the server's authoritative screen.
     ///
     /// The `Resize` re-runs `TIOCSWINSZ` on the server's PTY, which raises
     /// `SIGWINCH` in the foreground process; a full-screen app answers by
@@ -686,24 +713,12 @@ impl TerminalView {
     /// and [`dispatch_server_message`]'s `ScreenSnapshot` arm resets the pane
     /// and replays it, so the window repaints from server state instead of
     /// waiting for the next prompt.
-    fn report_cell_metrics(&self) {
-        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
-        else {
-            return;
-        };
-        let size = TerminalSize {
-            cols: COLUMNS,
-            rows: ROWS,
-            cell_width: round_positive_f32_to_u16(self.font.cell_width()).max(1),
-            cell_height: round_positive_f32_to_u16(self.font.line_height).max(1),
-        };
-        let result = self
-            .sink
-            .resize(session_id, size)
-            .and_then(|()| self.sink.request_snapshot(session_id));
-        if let Err(error) = result {
-            tracing::warn!(%error, "resize after font reload dropped: IPC writer closed");
-        }
+    ///
+    /// The cached sizes are cleared first, because new cell metrics change
+    /// every pane's cell count even though no split moved.
+    fn report_cell_metrics(&mut self, cx: &mut Context<Self>) {
+        self.pane_sizes.clear();
+        self.publish_pane_sizes(cx);
     }
 
     /// Delivery point for the reload plan's `opacity_changed()` signal.
@@ -749,17 +764,41 @@ impl TerminalView {
     ///
     /// Tab creation, selection, and closing are wired to the IPC sink, window
     /// creation opens a second top-level window, the four scrollback actions
-    /// move the display viewport, and the three zoom actions rescale the grid
-    /// font. The pane/workspace families are still swallowed (never forwarded
-    /// to the PTY) because the shell has no pane tree yet, matching the legacy
-    /// client's behaviour of never leaking a bound shortcut as terminal bytes.
+    /// move the display viewport, the three zoom actions rescale the grid font,
+    /// and the pane and workspace families drive the window's [`PaneShell`].
+    /// The remaining clipboard and prompt-jump families are still swallowed
+    /// (never forwarded to the PTY), matching the legacy client's behaviour of
+    /// never leaking a bound shortcut as terminal bytes.
     ///
     /// The match is exhaustive and the swallowed variants are named one by one
     /// rather than folded into a `_` arm: a new [`LayoutAction`] then fails to
     /// compile here instead of silently joining the dropped set, and every drop
     /// that does happen is counted and warned by [`unhandled_layout_action`].
+    ///
+    /// The two split families follow the legacy client's naming: a "vertical"
+    /// split draws a vertical divider and therefore places the new pane beside
+    /// the old one ([`SplitDirection::Horizontal`]), and a "horizontal" split
+    /// stacks them.
     fn handle_layout_action(&mut self, action: LayoutAction, cx: &mut Context<Self>) {
         match action {
+            LayoutAction::SplitVertical => self.split_pane(SplitDirection::Horizontal, cx),
+            LayoutAction::SplitHorizontal => self.split_pane(SplitDirection::Vertical, cx),
+            LayoutAction::ClosePane => self.close_pane(cx),
+            LayoutAction::FocusNext => self.focus_next_pane(cx),
+            LayoutAction::FocusLeft => self.focus_pane(FocusDirection::Left, cx),
+            LayoutAction::FocusRight => self.focus_pane(FocusDirection::Right, cx),
+            LayoutAction::FocusUp => self.focus_pane(FocusDirection::Up, cx),
+            LayoutAction::FocusDown => self.focus_pane(FocusDirection::Down, cx),
+            LayoutAction::WorkspaceSplitVertical => {
+                self.split_workspace(SplitDirection::Horizontal, cx);
+            }
+            LayoutAction::WorkspaceSplitHorizontal => {
+                self.split_workspace(SplitDirection::Vertical, cx);
+            }
+            LayoutAction::WorkspaceFocusLeft => self.focus_workspace(FocusDirection::Left, cx),
+            LayoutAction::WorkspaceFocusRight => self.focus_workspace(FocusDirection::Right, cx),
+            LayoutAction::WorkspaceFocusUp => self.focus_workspace(FocusDirection::Up, cx),
+            LayoutAction::WorkspaceFocusDown => self.focus_workspace(FocusDirection::Down, cx),
             LayoutAction::NewTab => self.create_tab(None),
             LayoutAction::NewClaudeTab => {
                 self.create_tab(Some(ai_tab_command(AiProvider::ClaudeCode, false)));
@@ -787,26 +826,25 @@ impl TerminalView {
             LayoutAction::ZoomIn => self.apply_zoom(ZoomState::zoom_in, cx),
             LayoutAction::ZoomOut => self.apply_zoom(ZoomState::zoom_out, cx),
             LayoutAction::ZoomReset => self.apply_zoom(ZoomState::reset, cx),
-            LayoutAction::SplitVertical
-            | LayoutAction::SplitHorizontal
-            | LayoutAction::ClosePane
-            | LayoutAction::FocusNext
-            | LayoutAction::FocusLeft
-            | LayoutAction::FocusRight
-            | LayoutAction::FocusUp
-            | LayoutAction::FocusDown
-            | LayoutAction::WorkspaceSplitVertical
-            | LayoutAction::WorkspaceSplitHorizontal
-            | LayoutAction::WorkspaceFocusLeft
-            | LayoutAction::WorkspaceFocusRight
-            | LayoutAction::WorkspaceFocusUp
-            | LayoutAction::WorkspaceFocusDown
-            | LayoutAction::CopySelection
+            LayoutAction::CopySelection
             | LayoutAction::PasteClipboard
             | LayoutAction::PromptJumpUp
             | LayoutAction::PromptJumpDown
             | LayoutAction::JumpToFailure => unhandled_layout_action(action),
         }
+    }
+
+    /// Run `edit` against the focused pane's display grid.
+    ///
+    /// Every terminal-navigation surface — scrollback, vi/copy mode, the
+    /// split-scroll pin, smart selection — acts on the pane the user is in,
+    /// and `active_session` names that pane's session by construction: both
+    /// [`Self::focus_pane_session`] and the reader's attach path re-point it
+    /// on every focus move. Returns `None` when no pane is attached yet.
+    fn with_focused_grid<R>(&self, edit: impl FnOnce(&mut DisplayOnlyTerminal) -> R) -> Option<R> {
+        let session_id = (*self.shared.active_session.lock().ok()?)?;
+        let mut grids = self.shared.panes.lock().ok()?;
+        Some(edit(grids.grid_mut(session_id)))
     }
 
     /// Move the display viewport and repaint.
@@ -815,18 +853,18 @@ impl TerminalView {
     /// eligible AI pane grows its pinned live region on the very first page-up
     /// rather than a frame later.
     fn scroll_terminal(&mut self, scroll: Scroll, cx: &mut Context<Self>) {
-        let Ok(mut terminal) = self.shared.terminal.lock() else {
+        let Some((moved, offset, pin_rows)) = self.with_focused_grid(|terminal| {
+            if matches!(scroll, Scroll::Bottom) {
+                // Landing at the bottom dissolves the split by definition;
+                // clearing the gate first keeps the pin from surviving one
+                // extra frame.
+                terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
+            }
+            let moved = terminal.scroll(scroll);
+            (moved, terminal.display_offset(), terminal.pin_rows())
+        }) else {
             return;
         };
-        if matches!(scroll, Scroll::Bottom) {
-            // Landing at the bottom dissolves the split by definition; clearing
-            // the gate first keeps the pin from surviving one extra frame.
-            terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
-        }
-        let moved = terminal.scroll(scroll);
-        let offset = terminal.display_offset();
-        let pin_rows = terminal.pin_rows();
-        drop(terminal);
         tracing::info!(?scroll, moved, offset, pin_rows, "terminal scrollback moved");
         cx.notify();
     }
@@ -850,7 +888,7 @@ impl TerminalView {
             font_size: self.zoom.effective_font_size(appearance.font_size),
             ..appearance
         });
-        self.report_cell_metrics();
+        self.report_cell_metrics(cx);
         cx.notify();
     }
 
@@ -1274,7 +1312,7 @@ impl TerminalView {
             return;
         };
         if let Err(error) =
-            self.sink.create_session(workspace_id, self.terminal_size, None, command)
+            self.sink.create_session(workspace_id, self.focused_pane_size, None, command)
         {
             tracing::warn!(%error, "new tab dropped: IPC writer closed");
         }
@@ -1282,6 +1320,11 @@ impl TerminalView {
 
     /// Move the tab selection with `move_selection` and attach whatever it
     /// lands on. A `None` result means the selection did not move.
+    ///
+    /// A tab and a pane are different axes of the same window, so the switch
+    /// resolves against the layout first: a session that is already on screen
+    /// in some pane wins focus rather than being duplicated into the focused
+    /// pane, and anything else takes over the pane the user is looking at.
     fn switch_tab(
         &mut self,
         move_selection: impl FnOnce(&mut TabSessions) -> Option<SessionId>,
@@ -1290,6 +1333,12 @@ impl TerminalView {
         let Ok(mut tabs) = self.shared.tabs.lock() else { return };
         let Some(session_id) = move_selection(&mut tabs) else { return };
         drop(tabs);
+        if let Some((workspace_id, pane)) = self.shell.pane_for_session(session_id, cx) {
+            self.shell.focus_pane(workspace_id, pane, cx);
+        } else if let Some(pane) = self.shell.focused_pane(cx) {
+            self.adopt_session(pane, session_id);
+            self.publish_pane_sizes(cx);
+        }
         self.attach(session_id);
         // A tab switch moves the focused pane, which the server relays to PTY
         // applications as a CSI focus event — reported here rather than on the
@@ -1311,7 +1360,12 @@ impl TerminalView {
         if let Ok(mut guard) = self.shared.active_session.lock() {
             *guard = Some(session_id);
         }
-        let size = self.terminal_size;
+        if let Ok(mut attached) = self.shared.attached.lock() {
+            attached.insert(session_id);
+        }
+        // A pane owns only its slice of the window, so the size announced here
+        // is the one the layout published for this session, not the window's.
+        let size = self.pane_sizes.get(&session_id).copied().unwrap_or(self.terminal_size);
         let result = self
             .sink
             .attach_sessions(vec![session_id], vec![size])
@@ -1351,6 +1405,374 @@ impl TerminalView {
         let (shared, sink) = start_window_backend(terminal_size);
         open_window(cx, &shared, &sink, terminal_size);
         tracing::info!("opened a new terminal window");
+    }
+
+    /// The grid area expressed in the window's nominal cell metrics.
+    ///
+    /// Pane geometry is resolved against this rather than against real device
+    /// pixels: the paint path positions every pane as a *fraction* of the grid
+    /// area, so the only thing the layout has to agree on is proportions, and
+    /// the per-pane `Resize` needs exactly the cell counts this viewport
+    /// yields. It follows a live `appearance.font_size` edit for free, because
+    /// both axes are derived from the current [`GridFont`].
+    fn pane_viewport(&self) -> Rect {
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            width: self.font.cell_width() * f32::from(COLUMNS),
+            height: self.font.line_height * f32::from(ROWS),
+        }
+    }
+
+    /// Split the focused pane and ask the server for the session it will host.
+    fn split_pane(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
+        if self.shell.split_focused_pane(direction, cx).is_none() {
+            tracing::warn!(?direction, "split ignored: the window has no focused pane");
+            return;
+        }
+        tracing::info!(?direction, panes = self.shell.pane_count(cx), "split the focused pane");
+        self.request_pane_session();
+        self.after_layout_change(cx);
+    }
+
+    /// Close the focused pane, falling back to closing the tab when the window
+    /// is down to a single pane in a single workspace region.
+    fn close_pane(&mut self, cx: &mut Context<Self>) {
+        match self.shell.close_focused_pane(cx) {
+            ClosedPane::Removed(sessions) => {
+                for session_id in &sessions {
+                    self.close_pane_session(*session_id);
+                }
+                tracing::info!(
+                    closed = sessions.len(),
+                    panes = self.shell.pane_count(cx),
+                    "closed the focused pane"
+                );
+                self.focus_pane_session(cx);
+                self.after_layout_change(cx);
+            }
+            ClosedPane::LastPane => {
+                tracing::info!("close pane fell through to closing the last tab");
+                self.close_active_tab();
+            }
+        }
+    }
+
+    /// Stop streaming a closed pane's session and tell the server to end it.
+    fn close_pane_session(&mut self, session_id: SessionId) {
+        self.detach_session(session_id);
+        if let Err(error) = self.sink.close_session(session_id) {
+            tracing::warn!(%error, "close pane dropped: IPC writer closed");
+        }
+    }
+
+    /// Cycle focus to the next pane of the focused region.
+    fn focus_next_pane(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self.shell.focus_next_pane(cx) else {
+            tracing::debug!("cycle pane ignored: the region has a single pane");
+            return;
+        };
+        tracing::info!(pane = pane.raw(), "focused pane moved");
+        self.focus_pane_session(cx);
+    }
+
+    /// Move pane focus spatially inside the focused region.
+    fn focus_pane(&mut self, direction: FocusDirection, cx: &mut Context<Self>) {
+        let viewport = self.pane_viewport();
+        let Some(pane) = self.shell.focus_pane_in_direction(direction, viewport, cx) else {
+            tracing::debug!(?direction, "pane focus ignored: no pane in that direction");
+            return;
+        };
+        tracing::info!(?direction, pane = pane.raw(), "focused pane moved");
+        self.focus_pane_session(cx);
+    }
+
+    /// Split the window into another workspace region and seed it with a
+    /// session.
+    ///
+    /// The region itself is client-local: the server still owns exactly one
+    /// workspace for this window, so the seeded session is created in that
+    /// workspace and the region is a layout construct until
+    /// `ClientMessage::CreateWorkspace` is wired (bead .66).
+    fn split_workspace(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
+        let accent = self.next_region_accent(cx);
+        let Some(workspace_id) = self.shell.split_workspace(direction, accent, cx) else {
+            tracing::warn!(?direction, "workspace split ignored: no focused region");
+            return;
+        };
+        tracing::info!(
+            ?direction,
+            %workspace_id,
+            regions = self.shell.region_count(cx),
+            "split the window into a new workspace region"
+        );
+        self.request_pane_session();
+        self.after_layout_change(cx);
+    }
+
+    /// Move focus to the neighbouring workspace region.
+    fn focus_workspace(&mut self, direction: FocusDirection, cx: &mut Context<Self>) {
+        let viewport = self.pane_viewport();
+        let Some(workspace_id) = self.shell.focus_workspace_in_direction(direction, viewport, cx)
+        else {
+            tracing::debug!(?direction, "workspace focus ignored: no region in that direction");
+            return;
+        };
+        tracing::info!(?direction, %workspace_id, "focused workspace moved");
+        self.focus_pane_session(cx);
+    }
+
+    /// A saturated, theme-derived accent for the next workspace region, so two
+    /// regions never share a focus-ring colour at a glance.
+    fn next_region_accent(&self, cx: &App) -> [f32; 4] {
+        // The six bright ANSI slots after bright-red are the theme's own
+        // high-chroma hues; cycling them keeps the accent inside the palette.
+        let index = 9 + self.shell.region_count(cx) % 6;
+        self.config.config().theme.ansi_colors.get(index).copied().unwrap_or(self.chrome.accent)
+    }
+
+    /// Ask the server for a session to fill the pane that just appeared.
+    ///
+    /// The pane was queued by the split, so the reconcile pass hands it the
+    /// session as soon as `SessionCreated` lands.
+    fn request_pane_session(&self) {
+        let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
+        else {
+            tracing::warn!("pane session ignored: no workspace is attached yet");
+            return;
+        };
+        if let Err(error) =
+            self.sink.create_session(workspace_id, self.focused_pane_size, None, None)
+        {
+            tracing::warn!(%error, "pane session dropped: IPC writer closed");
+        }
+    }
+
+    /// Point the client at whatever session the focused pane now holds.
+    ///
+    /// A pane focus change is a tab selection change too: the strip keeps
+    /// naming the pane the user types into, the server is told which pane has
+    /// focus, and the attach makes the switched-to pane stream.
+    fn focus_pane_session(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.shell.focused_session(cx) else {
+            cx.notify();
+            return;
+        };
+        if let Ok(mut tabs) = self.shared.tabs.lock() {
+            let index = tabs.tabs().iter().position(|tab| tab.session_id == session_id);
+            if let Some(index) = index {
+                tabs.select(index);
+            }
+        }
+        self.attach(session_id);
+        self.report_focus();
+        self.sync_tabs(cx);
+        cx.notify();
+    }
+
+    /// Republish pane geometry after the layout moved, then repaint.
+    fn after_layout_change(&mut self, cx: &mut Context<Self>) {
+        self.publish_pane_sizes(cx);
+        cx.notify();
+    }
+
+    /// Stop streaming `session_id` and drop the state its pane owned.
+    fn detach_session(&mut self, session_id: SessionId) {
+        self.pane_sizes.remove(&session_id);
+        if let Ok(mut attached) = self.shared.attached.lock() {
+            attached.remove(&session_id);
+        }
+        if let Ok(mut grids) = self.shared.panes.lock() {
+            grids.forget(session_id);
+        }
+    }
+
+    /// Tell the server (and each local grid) how big every pane now is.
+    ///
+    /// A `Resize` alone would leave the pane showing a grid it can no longer
+    /// hold, because this client owns no PTY and never reflows locally, so each
+    /// changed pane also reshapes its display grid and asks for the
+    /// authoritative screen back. Unchanged panes are skipped, so a redraw
+    /// storm never turns into a `RequestSnapshot` storm.
+    fn publish_pane_sizes(&mut self, cx: &mut Context<Self>) {
+        let viewport = self.pane_viewport();
+        let cell_width = self.font.cell_width();
+        let line_height = self.font.line_height;
+        if cell_width <= 0.0 || line_height <= 0.0 {
+            return;
+        }
+        let reported_width = round_positive_f32_to_u16(cell_width).max(1);
+        let reported_height = round_positive_f32_to_u16(line_height).max(1);
+        let placements = self.shell.placements(viewport, cx);
+        let live: HashSet<SessionId> =
+            placements.iter().filter_map(|placement| placement.session_id).collect();
+        self.pane_sizes.retain(|session, _| live.contains(session));
+        for placement in placements {
+            let size = TerminalSize {
+                cols: round_positive_f32_to_u16((placement.rect.width / cell_width).floor()).max(1),
+                rows: round_positive_f32_to_u16((placement.rect.height / line_height).floor())
+                    .max(1),
+                cell_width: reported_width,
+                cell_height: reported_height,
+            };
+            if placement.focused {
+                // A new tab and a split both open into the focused pane, so the
+                // size they announce has to be that pane's, not the window's.
+                self.focused_pane_size = size;
+            }
+            let Some(session_id) = placement.session_id else { continue };
+            if self.pane_sizes.get(&session_id) == Some(&size) {
+                continue;
+            }
+            self.pane_sizes.insert(session_id, size);
+            if let Ok(mut grids) = self.shared.panes.lock() {
+                grids.resize(session_id, usize::from(size.cols), usize::from(size.rows));
+            }
+            let result = self
+                .sink
+                .resize(session_id, size)
+                .and_then(|()| self.sink.request_snapshot(session_id));
+            if let Err(error) = result {
+                tracing::warn!(%error, "pane resize dropped: IPC writer closed");
+            }
+            tracing::info!(
+                %session_id,
+                %placement.workspace_id,
+                pane = placement.pane_id.raw(),
+                cols = size.cols,
+                rows = size.rows,
+                "published a pane's grid size"
+            );
+        }
+    }
+
+    /// Reconcile the pane layout with the sessions the server actually has.
+    ///
+    /// Runs once per frame because both halves of the truth move on their own
+    /// threads: the reader owns the session list and the focused session, the
+    /// GPUI thread owns the split trees. Three things can be out of step —
+    /// the root region's workspace ID before the first `SessionList`, a pane
+    /// whose session exited, and a freshly created session that has no pane
+    /// yet — and each is settled here rather than from the reader, which must
+    /// never touch GPUI entities.
+    fn reconcile_panes(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
+        {
+            changed |= self.shell.adopt_server_workspace(workspace_id, cx);
+        }
+        let live: HashSet<SessionId> = self.shared.tabs.lock().map_or_else(
+            |_| HashSet::new(),
+            |tabs| tabs.tabs().iter().map(|tab| tab.session_id).collect(),
+        );
+        if !live.is_empty() {
+            changed |= self.shell.retain_sessions(&live, cx);
+        }
+        let active = self.shared.active_session.lock().ok().and_then(|guard| *guard);
+        if let Some(session_id) =
+            active.filter(|session| !self.shell.shown_sessions().contains(session))
+        {
+            // A split queued the pane that asked for this session; anything
+            // else (a new tab, a reattach, a refocus after an exit) belongs in
+            // the pane the user is looking at.
+            let target = self.shell.take_pending(cx).or_else(|| self.shell.focused_pane(cx));
+            if let Some(pane) = target {
+                self.adopt_session(pane, session_id);
+                changed = true;
+            }
+        }
+        if changed {
+            self.publish_pane_sizes(cx);
+        }
+    }
+
+    /// Show `session_id` in `pane`, streaming it from now on.
+    fn adopt_session(&mut self, pane: PaneId, session_id: SessionId) {
+        if let Some(displaced) = self.shell.assign_session(pane, session_id) {
+            tracing::debug!(%displaced, pane = pane.raw(), "pane switched session");
+        }
+        if let Ok(mut attached) = self.shared.attached.lock() {
+            attached.insert(session_id);
+        }
+        tracing::info!(%session_id, pane = pane.raw(), "pane adopted a session");
+    }
+
+    /// The last painted frame of `session_id`'s grid, or `None` when nothing
+    /// has ever reached that pane.
+    fn pane_content(&self, session_id: SessionId) -> Option<Content> {
+        self.shared.panes.lock().ok()?.content(session_id)
+    }
+
+    /// Lower the pane layout onto absolutely positioned grid elements.
+    ///
+    /// Positions are fractions of the grid area, so the split ratios the pure
+    /// tree computed survive any window size without the view having to measure
+    /// device pixels. The focus ring is only drawn once a window actually has
+    /// more than one pane, so an unsplit window paints exactly as before.
+    ///
+    /// Find matches, the split-scroll pin and the recorded grid bounds all
+    /// belong to the focused pane: the overlay searched the pane the query was
+    /// typed against, the pin follows that pane's viewport, and the bounds are
+    /// what the mouse path hit-tests against. `focused` is therefore the
+    /// snapshot [`Self::sync_split_scroll`] already pinned, and every other
+    /// pane paints its own untouched grid.
+    fn render_panes(&self, focused: Content, cx: &App) -> Vec<gpui::AnyElement> {
+        let viewport = self.pane_viewport();
+        if viewport.width <= 0.0 || viewport.height <= 0.0 {
+            return Vec::new();
+        }
+        let placements = self.shell.placements(viewport, cx);
+        let split = placements.len() > 1;
+        let opacity = self.opacity;
+        let background = surface(self.terminal_colors.background, opacity);
+        let idle_border = surface(self.chrome.divider, opacity);
+        let mut focused = Some(focused);
+        placements
+            .into_iter()
+            .map(|placement| {
+                let content = if placement.focused {
+                    focused.take().unwrap_or_default()
+                } else {
+                    placement.session_id.and_then(|s| self.pane_content(s)).unwrap_or_default()
+                };
+                let colors = GridColors {
+                    background,
+                    cells: Arc::clone(&self.terminal_colors.cells),
+                    opacity,
+                };
+                let mut pane = div()
+                    .absolute()
+                    .left(relative(placement.rect.x / viewport.width))
+                    .top(relative(placement.rect.y / viewport.height))
+                    .w(relative(placement.rect.width / viewport.width))
+                    .h(relative(placement.rect.height / viewport.height))
+                    .overflow_hidden();
+                if split {
+                    pane =
+                        pane.border_1().border_color(pane_border(&placement, idle_border, opacity));
+                }
+                // Only the focused pane publishes its painted bounds: they are
+                // what `cell_at` resolves a pointer against, and the mouse
+                // path acts on the focused pane.
+                let (highlights, bounds) = if placement.focused {
+                    (self.find_highlights(&content, cx), Rc::clone(&self.grid_bounds))
+                } else {
+                    (Vec::new(), GridBounds::default())
+                };
+                pane.child(
+                    TerminalElement::new(
+                        content,
+                        self.font.clone(),
+                        colors,
+                        self.highlight_colors,
+                        bounds,
+                    )
+                    .with_highlights(highlights)
+                    .paint(),
+                )
+                .into_any_element()
+            })
+            .collect()
     }
 
     /// Open the command palette, building its entry list from the live update /
@@ -1542,12 +1964,12 @@ impl TerminalView {
     /// knows and reads back how many rows the pin ended up taking.
     fn sync_split_scroll(&mut self) -> Content {
         let eligibility = self.split_scroll_eligibility();
-        let Ok(mut terminal) = self.shared.terminal.lock() else {
-            return Content::default();
-        };
-        terminal.set_split_scroll_eligibility(eligibility);
-        let content = terminal.content();
-        drop(terminal);
+        let content = self
+            .with_focused_grid(|terminal| {
+                terminal.set_split_scroll_eligibility(eligibility);
+                terminal.content()
+            })
+            .unwrap_or_default();
         self.split_scroll.pin_height = self.font.line_height * pin_rows_f32(content.pin_rows);
         content
     }
@@ -1583,10 +2005,8 @@ impl TerminalView {
             return;
         };
         let (rows, pin_rows) = self
-            .shared
-            .terminal
-            .lock()
-            .map_or((0, 0), |terminal| (terminal.content().rows.len(), terminal.pin_rows()));
+            .with_focused_grid(|terminal| (terminal.content().rows.len(), terminal.pin_rows()))
+            .unwrap_or((0, 0));
         if !hits_jump_chip(bounds, &self.font, rows, pin_rows, position) {
             return;
         }
@@ -1606,11 +2026,11 @@ impl TerminalView {
         let Some(cell) = cell_at(bounds, &self.font, position) else {
             return Vec::new();
         };
-        let Ok(terminal) = self.shared.terminal.lock() else {
+        let Some(candidates) = self.with_focused_grid(|terminal| {
+            terminal.smart_selection_actions(&self.smart_selection, cell)
+        }) else {
             return Vec::new();
         };
-        let candidates = terminal.smart_selection_actions(&self.smart_selection, cell);
-        drop(terminal);
         let expansion = self.action_expansion_values();
         let context = ActionExpansionContext {
             cwd: expansion.cwd.as_deref(),
@@ -1925,12 +2345,12 @@ impl TerminalView {
 
     /// Enter or leave vi / copy mode over the terminal grid.
     fn toggle_vi_mode(&mut self, cx: &mut Context<Self>) {
-        let Ok(mut terminal) = self.shared.terminal.lock() else {
+        let Some(active) = self.with_focused_grid(|terminal| {
+            terminal.toggle_vi_mode();
+            terminal.is_vi_mode()
+        }) else {
             return;
         };
-        terminal.toggle_vi_mode();
-        let active = terminal.is_vi_mode();
-        drop(terminal);
         tracing::info!(active, "vi mode toggled");
         cx.notify();
     }
@@ -1944,7 +2364,7 @@ impl TerminalView {
     /// leaking `j` into the shell while the user is reading scrollback is
     /// exactly the failure copy mode exists to prevent.
     fn handle_vi_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        if !self.shared.terminal.lock().is_ok_and(|terminal| terminal.is_vi_mode()) {
+        if self.with_focused_grid(|terminal| terminal.is_vi_mode()) != Some(true) {
             return false;
         }
         let modifiers = event.keystroke.modifiers;
@@ -1965,11 +2385,7 @@ impl TerminalView {
             return true;
         }
         if let Some(motion) = vi_motion_for_key(key, modifiers.shift) {
-            let Ok(mut terminal) = self.shared.terminal.lock() else {
-                return true;
-            };
-            terminal.vi_motion(motion);
-            drop(terminal);
+            self.with_focused_grid(|terminal| terminal.vi_motion(motion));
             cx.notify();
         }
         true
@@ -2207,20 +2623,21 @@ impl TerminalView {
     /// "compose while reading" session. Ported one-for-one from the winit
     /// client's `send_key_bytes` seam.
     fn snap_to_bottom_for_input(&self, bytes: &[u8]) {
-        let Ok(mut terminal) = self.shared.terminal.lock() else {
-            return;
-        };
-        if terminal.display_offset() == 0 {
-            return;
+        let snapped = self.with_focused_grid(|terminal| {
+            if terminal.display_offset() == 0 {
+                return None;
+            }
+            let pinned = terminal.pin_rows() > 0;
+            if pinned && bytes != b"\r" {
+                return None;
+            }
+            terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
+            terminal.scroll(Scroll::Bottom);
+            Some(pinned)
+        });
+        if let Some(Some(pinned)) = snapped {
+            tracing::info!(pinned, "snapped the viewport to the live bottom for input");
         }
-        let pinned = terminal.pin_rows() > 0;
-        if pinned && bytes != b"\r" {
-            return;
-        }
-        terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
-        terminal.scroll(Scroll::Bottom);
-        drop(terminal);
-        tracing::info!(pinned, "snapped the viewport to the live bottom for input");
     }
 
     /// Enqueue already-encoded bytes for the attached pane.
@@ -2683,32 +3100,20 @@ impl TerminalView {
 
     /// Lower the live share state onto the overlay layer: the presence roster,
     /// the transient control hint, and the modal grant/deny prompt.
-    /// Build the terminal-grid band: one cell-accurate paint of the current
-    /// snapshot, carrying the find overlay's on-screen match spans, wrapped so a
-    /// right-click opens the context menu at the cursor without disturbing the
-    /// display-only element.
+    /// Build the terminal-grid band: the pane layout's canvas.
+    ///
+    /// Every pane is positioned inside it as a fraction of its size, so the
+    /// split ratios need no device-pixel measurement, and the band itself
+    /// carries the right-click that opens the context menu at the cursor
+    /// without disturbing the display-only elements inside it.
     fn render_grid(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let content = self.sync_split_scroll();
-        let highlights = self.find_highlights(&content, cx);
-        let opacity = self.opacity;
-        let grid_colors = GridColors {
-            background: surface(self.terminal_colors.background, opacity),
-            cells: Arc::clone(&self.terminal_colors.cells),
-            opacity,
-        };
+        let focused = self.sync_split_scroll();
+        let panes = self.render_panes(focused, cx);
         div()
             .flex_1()
-            .child(
-                TerminalElement::new(
-                    content,
-                    self.font.clone(),
-                    grid_colors,
-                    self.highlight_colors,
-                    Rc::clone(&self.grid_bounds),
-                )
-                .with_highlights(highlights)
-                .paint(),
-            )
+            .relative()
+            .bg(surface(self.terminal_colors.background, self.opacity))
+            .children(panes)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
@@ -2724,6 +3129,8 @@ impl TerminalView {
             .into_any_element()
     }
 
+    /// Lower the live share state onto the overlay layer: the presence roster,
+    /// the transient control hint, and the modal grant/deny prompt.
     fn build_share_overlay(&self) -> Option<gpui::AnyElement> {
         let colors = ShareOverlayColors::from(&self.chrome);
         let share = self.shared.share.lock().ok()?;
@@ -2763,6 +3170,7 @@ impl Render for TerminalView {
         }
         self.sync_tabs(cx);
         self.sync_find_results(cx);
+        self.reconcile_panes(cx);
         let grid = self.render_grid(cx);
         let status = self
             .shared
@@ -2901,10 +3309,8 @@ fn startup_window_size(cx: &App) -> Size<Pixels> {
 /// [`LayoutAction::NewWindow`], so the two paths cannot drift.
 fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
     let shared = Shared {
-        terminal: Arc::new(Mutex::new(DisplayOnlyTerminal::new(
-            usize::from(COLUMNS),
-            usize::from(ROWS),
-        ))),
+        panes: Arc::new(Mutex::new(PaneGrids::new(usize::from(COLUMNS), usize::from(ROWS)))),
+        attached: Arc::new(Mutex::new(HashSet::new())),
         status: Arc::new(Mutex::new("connecting to Scribe server…".to_owned())),
         generation: Arc::new(AtomicU64::new(0)),
         active_session: Arc::new(Mutex::new(None)),
@@ -3227,9 +3633,11 @@ where
     ctx.out_tx.send(ClientMessage::ListSessions).map_err(|_| "writer channel closed".to_owned())?;
 
     tokio::spawn(run_writer(writer, ctx.out_rx));
-    spawn_drain(ctx.in_rx, Arc::clone(&ctx.shared.terminal), Arc::clone(&ctx.shared.generation));
+    spawn_drain(ctx.in_rx, Arc::clone(&ctx.shared.panes), Arc::clone(&ctx.shared.generation));
 
     let reader_ctx = ReaderCtx {
+        panes: ctx.shared.panes,
+        attached: ctx.shared.attached,
         status: ctx.shared.status,
         generation: ctx.shared.generation,
         active_session: ctx.shared.active_session,
@@ -3312,14 +3720,14 @@ type SyncFrameQueues = Arc<Mutex<HashMap<SessionId, SyncFrameQueue>>>;
 /// never arrived.
 fn spawn_drain(
     in_rx: UnboundedReceiver<InboundEvent>,
-    terminal: Arc<Mutex<DisplayOnlyTerminal>>,
+    panes: Arc<Mutex<PaneGrids>>,
     generation: Arc<AtomicU64>,
 ) {
     let queues: SyncFrameQueues = Arc::new(Mutex::new(HashMap::new()));
     let expiry_wake = Arc::new(Notify::new());
 
     let queue_task = Arc::clone(&queues);
-    let terminal_task = Arc::clone(&terminal);
+    let panes_task = Arc::clone(&panes);
     let generation_task = Arc::clone(&generation);
     let wake_task = Arc::clone(&expiry_wake);
     tokio::spawn(run_drain(in_rx, move |batch| {
@@ -3328,14 +3736,17 @@ fn spawn_drain(
         }
         let mut redraws = 0usize;
         let mut sync_armed = false;
-        if let (Ok(mut session_queues), Ok(mut guard)) = (queue_task.lock(), terminal_task.lock()) {
+        if let (Ok(mut session_queues), Ok(mut grids)) = (queue_task.lock(), panes_task.lock()) {
             for (session, bytes) in batch.iter() {
                 let queue = session_queues.entry(session).or_default();
                 queue.queue_output_frames(bytes);
-                redraws += usize::from(drain_all_committed(queue, &mut *guard).needs_redraw);
+                // Each pane advances its own grid, so a background pane's burst
+                // can never land in the focused pane's scrollback.
+                let grid = grids.grid_mut(session);
+                redraws += usize::from(drain_all_committed(queue, grid).needs_redraw);
+                sync_armed |= grid.parser_sync_deadline().is_some();
                 sync_armed |= queue.raw_sync_deadline().is_some();
             }
-            sync_armed |= guard.parser_sync_deadline().is_some();
         }
         for _ in 0..redraws {
             generation_task.fetch_add(1, Ordering::Release);
@@ -3345,7 +3756,7 @@ fn spawn_drain(
         }
     }));
 
-    tokio::spawn(run_sync_expiry(queues, terminal, generation, expiry_wake));
+    tokio::spawn(run_sync_expiry(queues, panes, generation, expiry_wake));
 }
 
 /// Waits on the nearest synchronized-update deadline and commits it once it
@@ -3354,17 +3765,17 @@ fn spawn_drain(
 /// the drain task arms a fresh deadline.
 async fn run_sync_expiry(
     queues: SyncFrameQueues,
-    terminal: Arc<Mutex<DisplayOnlyTerminal>>,
+    panes: Arc<Mutex<PaneGrids>>,
     generation: Arc<AtomicU64>,
     wake: Arc<Notify>,
 ) {
     loop {
-        match next_sync_deadline(&queues, &terminal) {
+        match next_sync_deadline(&queues, &panes) {
             None => wake.notified().await,
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 tokio::select! {
-                    () = tokio::time::sleep(remaining) => flush_expired_sync(&queues, &terminal, &generation),
+                    () = tokio::time::sleep(remaining) => flush_expired_sync(&queues, &panes, &generation),
                     () = wake.notified() => {}
                 }
             }
@@ -3376,16 +3787,16 @@ async fn run_sync_expiry(
 /// passed, bumping the redraw generation once per committed burst.
 fn flush_expired_sync(
     queues: &SyncFrameQueues,
-    terminal: &Arc<Mutex<DisplayOnlyTerminal>>,
+    panes: &Arc<Mutex<PaneGrids>>,
     generation: &Arc<AtomicU64>,
 ) {
     let now = Instant::now();
     let mut redraws = 0usize;
-    if let (Ok(mut session_queues), Ok(mut guard)) = (queues.lock(), terminal.lock()) {
-        redraws += usize::from(guard.flush_parser_sync_timeout(now));
-        for queue in session_queues.values_mut() {
+    if let (Ok(mut session_queues), Ok(mut grids)) = (queues.lock(), panes.lock()) {
+        redraws += grids.flush_parser_sync_timeouts(now);
+        for (session, queue) in session_queues.iter_mut() {
             let flushed = queue.flush_raw_timeout(now)
-                && drain_all_committed(queue, &mut *guard).needs_redraw;
+                && drain_all_committed(queue, grids.grid_mut(*session)).needs_redraw;
             redraws += usize::from(flushed);
         }
     }
@@ -3395,12 +3806,9 @@ fn flush_expired_sync(
 }
 
 /// Nearest synchronized-update deadline across every pane's raw-frame queue and
-/// the shared parser, or `None` when nothing is buffering.
-fn next_sync_deadline(
-    queues: &SyncFrameQueues,
-    terminal: &Arc<Mutex<DisplayOnlyTerminal>>,
-) -> Option<Instant> {
-    let parser = terminal.lock().ok().and_then(|guard| guard.parser_sync_deadline());
+/// every pane's parser, or `None` when nothing is buffering.
+fn next_sync_deadline(queues: &SyncFrameQueues, panes: &Arc<Mutex<PaneGrids>>) -> Option<Instant> {
+    let parser = panes.lock().ok().and_then(|grids| grids.parser_sync_deadline());
     let raw = queues
         .lock()
         .ok()
@@ -3414,6 +3822,10 @@ fn next_sync_deadline(
 
 /// Handles owned by the inbound read loop.
 struct ReaderCtx {
+    /// Per-session display grids, so an exited session's grid can be dropped.
+    panes: Arc<Mutex<PaneGrids>>,
+    /// Sessions the client has attached; the pane-output gate reads it.
+    attached: Arc<Mutex<HashSet<SessionId>>>,
     status: Arc<Mutex<String>>,
     generation: Arc<AtomicU64>,
     active_session: Arc<Mutex<Option<SessionId>>>,
@@ -3585,6 +3997,20 @@ fn unhandled_layout_action(action: LayoutAction) {
 /// line, which is why every drop is named and counted here.
 static UNROUTABLE_ACTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// The ring a pane is drawn with: the owning region's accent when it has focus,
+/// the theme's divider otherwise.
+///
+/// Tinting the focused pane with its *region's* accent is what makes a
+/// two-region window readable at a glance: the ring says both which pane types
+/// go to and which region that pane belongs to.
+fn pane_border(
+    placement: &pane_shell::PanePlacement,
+    idle: gpui::Rgba,
+    opacity: f32,
+) -> gpui::Rgba {
+    if placement.focused { surface(placement.accent, opacity) } else { idle }
+}
+
 /// Name, count, and warn about an action that was routed but has no handler.
 fn unroutable_action(action: &str, reason: &str) {
     let dropped = UNROUTABLE_ACTIONS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3675,6 +4101,15 @@ fn on_session_exited(
     let existed = registry.on_session_exited(session_id);
     update_ai_chrome(ctx, |ai| ai.forget(session_id));
     update_chrome_metadata(ctx, |metadata| metadata.forget_session(session_id));
+    // The pane that showed it is retired by the view's reconcile pass; the
+    // grid and the output gate are dropped here so a recycled session id can
+    // never inherit the dead pane's scrollback.
+    if let Ok(mut streaming) = ctx.attached.lock() {
+        streaming.remove(&session_id);
+    }
+    if let Ok(mut grids) = ctx.panes.lock() {
+        grids.forget(session_id);
+    }
     let refocused = ctx.tabs.lock().ok().and_then(|mut tabs| tabs.remove(session_id));
     if let Some(next) = refocused {
         attach_session(ctx, next)?;
@@ -3811,7 +4246,7 @@ fn dispatch_server_message(
         // one to [`on_pane_output_message`].
         output @ (ServerMessage::PtyOutput { .. }
         | ServerMessage::SessionReplay { .. }
-        | ServerMessage::ScreenSnapshot { .. }) => on_pane_output_message(ctx, output, attached),
+        | ServerMessage::ScreenSnapshot { .. }) => on_pane_output_message(ctx, output),
         // The terminal-chrome family all lands in the same two stores (the tab
         // strip's labels and the shared metadata), so it is named here and
         // routed as one to [`on_chrome_message`].
@@ -3944,17 +4379,19 @@ fn on_chrome_message(ctx: &ReaderCtx, message: ServerMessage) {
 
 /// Forward one pane-content message into the frame queue.
 ///
-/// All three variants are session-scoped, so each gates on `attached` inside
-/// this function rather than in a match guard: a frame for a background pane
-/// stays a deliberate no-op instead of being reported as an unhandled message.
+/// All three variants are session-scoped, so each gates on the attached set
+/// inside this function rather than in a match guard: a frame for a session
+/// this window is not showing stays a deliberate no-op instead of being
+/// reported as an unhandled message. The gate is a set rather than the single
+/// focused session because a split window streams one pane per split at once.
 ///
 /// Anything other than the pane-content family is a programming error in
 /// [`dispatch_server_message`]'s routing, not a protocol event, so it is
 /// counted as unhandled rather than silently dropped.
-fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage, attached: Option<SessionId>) {
+fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage) {
     match message {
         ServerMessage::PtyOutput { session_id, data } => {
-            if Some(session_id) == attached {
+            if is_attached(ctx, session_id) {
                 // Perf gate: count drained bytes and close the echo round-trip
                 // clock before the frame queue takes ownership of the payload.
                 scribe_common::perf_probe::record_pty_output(data.len());
@@ -3962,18 +4399,23 @@ fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage, attached: Opt
             }
         }
         ServerMessage::SessionReplay { session_id, replay } => {
-            if Some(session_id) == attached {
+            if is_attached(ctx, session_id) {
                 forward_replay(ctx, session_id, &replay);
             }
         }
         ServerMessage::ScreenSnapshot { session_id, snapshot } => {
-            if Some(session_id) == attached {
+            if is_attached(ctx, session_id) {
                 apply_screen_snapshot(ctx, session_id, &snapshot);
             }
         }
         // Unreachable: the caller only routes the pane-content family here.
         other => unhandled_server_message(&other),
     }
+}
+
+/// Whether this window has a pane streaming `session_id`.
+fn is_attached(ctx: &ReaderCtx, session_id: SessionId) -> bool {
+    ctx.attached.lock().is_ok_and(|attached| attached.contains(&session_id))
 }
 
 /// Fold one provider task-label notice onto the tab strip.
@@ -4385,6 +4827,9 @@ fn attach_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> 
     // Announce the client size through the sink, ahead of any KeyInput.
     ctx.sink.resize(session_id, ctx.size).map_err(|error| error.to_string())?;
     ctx.sink.subscribe(vec![session_id]).map_err(|error| error.to_string())?;
+    if let Ok(mut attached) = ctx.attached.lock() {
+        attached.insert(session_id);
+    }
     if let Ok(mut guard) = ctx.active_session.lock() {
         *guard = Some(session_id);
     }

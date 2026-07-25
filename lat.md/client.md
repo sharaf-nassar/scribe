@@ -106,7 +106,9 @@ A tab's label has two sources. `TitleChanged` sets the OSC 0/2 title through [[c
 
 ### GPUI Terminal Viewport Wiring
 
-The running client reaches the ported viewport modules — scrollback navigation, vi / copy mode, split-scroll, smart selection, and font zoom — through [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal]], the one place that owns the live `Term`.
+The running client reaches the ported viewport modules — scrollback navigation, vi / copy mode, split-scroll, smart selection, and font zoom — through [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal]], the one type that owns a live `Term`.
+
+A split window holds one of those per pane, so every surface below acts on the focused pane, reached through [[crates/scribe-client-gpui/src/main.rs#TerminalView#with_focused_grid]].
 
 Before this, [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#make_content]] read the *screen* rows and ignored the grid's display offset, so the pure modules were untestable in the product: no scroll could change a pixel. It now reads the viewport through the offset, which is what makes `scroll_up` / `scroll_down` / `scroll_top` / `scroll_bottom` real. [[crates/scribe-client-gpui/src/main.rs#TerminalView#scroll_terminal]] runs each of the four [[crates/scribe-client-gpui/src/keybindings.rs#LayoutAction]] variants through [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#scroll]], and [[crates/scribe-client-gpui/src/main.rs#TerminalView#snap_to_bottom_for_input]] ports the winit rule that typing into a scrolled pane jumps back to the live bottom.
 
@@ -195,6 +197,36 @@ The pane split tree is [[crates/scribe-client-gpui/src/layout.rs#LayoutTree]] (b
 The event payload is the exact `WorkspaceTreeNode` the client forwards to the server as [[crates/scribe-common/src/protocol.rs#ClientMessage]] `ReportWorkspaceTree`.
 
 Reported mutations include workspace split, tab add/remove, [[crates/scribe-client-gpui/src/workspace_tree.rs#WorkspaceTree#set_active_tab]], workspace ratio change (clamped 0.1-0.9), and in-place slot edits via `update_slot`. On reconnect the restore path pushes tabs (each auto-activating the last) and then replays `active_tab_index` through `set_active_tab` to restore the originally focused tab, matching the winit client's post-pass.
+
+[[crates/scribe-client-gpui/src/workspace_tree.rs#WorkspaceTree#set_workspace_id]] renames a region and [[crates/scribe-client-gpui/src/workspace_tree.rs#WorkspaceTree#remove_workspace]] drops one, both reporting like every other mutation. The shell needs the first because it builds its region before the server has named a workspace, and the second when a region's last pane closes.
+
+### GPUI Pane And Workspace Shell
+
+[[crates/scribe-client-gpui/src/pane_shell.rs#PaneShell]] is what makes the two split trees above reachable from the running binary: it owns the window's one [[crates/scribe-client-gpui/src/workspace_tree.rs#WorkspaceTree]] plus one [[crates/scribe-client-gpui/src/pane_tree.rs#PaneTree]] per workspace region.
+
+Two layers, matching the chrome Scribe has always had. A workspace region is a slice of the window with its own accent colour; panes are the splits inside one region. `workspace_split_*` moves the outer divider and `split_*` the inner one, and each focus family moves within its own layer. Every pane hosts at most one session, and the focused pane of the focused region is the pane keystrokes, the status bar, and the tab strip follow — [[crates/scribe-client-gpui/src/main.rs#TerminalView#focus_pane_session]] is the single place that alignment is re-established after any focus move.
+
+The shell holds no pixel state. Callers pass a viewport rect derived from the live [[crates/scribe-client-gpui/src/terminal_element.rs#GridFont]] ([[crates/scribe-client-gpui/src/main.rs#TerminalView#pane_viewport]]), so the layout stays a pure function of the trees plus the current cell metrics, and a font-size edit re-derives it for free. [[crates/scribe-client-gpui/src/pane_shell.rs#PaneShell#placements]] resolves that viewport into one [[crates/scribe-client-gpui/src/pane_shell.rs#PanePlacement]] per leaf, which [[crates/scribe-client-gpui/src/main.rs#TerminalView#render_panes]] lowers onto absolutely positioned children whose offsets and sizes are *fractions* of the grid area — so the ratios survive any window size without the view measuring device pixels. The focus ring is drawn only once a window actually has more than one pane, and takes the owning region's accent, so an unsplit window paints exactly as before.
+
+[[crates/scribe-client-gpui/src/pane_shell.rs#PaneShell#close_focused_pane]] closes a pane, or the whole region when it was the region's last one and other regions remain; when the window is down to a single pane in a single region it answers [[crates/scribe-client-gpui/src/pane_shell.rs#ClosedPane]] `LastPane` and the caller closes the tab instead. [[crates/scribe-client-gpui/src/pane_shell.rs#PaneShell#retire_pane]] is the shared removal path, so an exited session's pane collapses the same way a deliberate close does.
+
+#### Pane Session Reconciliation
+
+The two halves of the truth move on different threads — the IPC reader owns the session list and the focused session, the GPUI thread owns the split trees — so [[crates/scribe-client-gpui/src/main.rs#TerminalView#reconcile_panes]] settles them once per frame rather than letting the reader touch GPUI entities.
+
+Three things can be out of step. The root region starts on a client-minted `WorkspaceId` because the shell exists before the first `Welcome`, and adopts the server's through [[crates/scribe-client-gpui/src/pane_shell.rs#PaneShell#adopt_server_workspace]] once a `SessionList` names one. A pane whose session exited is retired by [[crates/scribe-client-gpui/src/pane_shell.rs#PaneShell#retain_sessions]]. And a session the server has just created has no pane yet: a split queues the pane that asked for it ([[crates/scribe-client-gpui/src/pane_shell.rs#PaneShell#take_pending]]), and anything else — a new tab, a reattach, a refocus after an exit — lands in the pane the user is looking at.
+
+Workspace regions beyond the first are client-local layout: the server still owns exactly one workspace for this window, so a region's seeded session is created in that workspace. `ClientMessage::CreateWorkspace` and the rest of the workspace IPC are a separate bead.
+
+#### Per-Pane Grids And Sizing
+
+A split window shows several live terminals at once, so [[crates/scribe-client-gpui/src/terminal.rs#PaneGrids]] keys one [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal]] per session instead of folding every pane into a single grid.
+
+The coalescing drain already carries a `SessionId` with every batch, so [[crates/scribe-client-gpui/src/main.rs#spawn_drain]] advances the grid the batch names and a background pane's burst can never land in the focused pane's scrollback. `PtyOutput` / `SessionReplay` / `ScreenSnapshot` are gated on the set of attached sessions ([[crates/scribe-client-gpui/src/main.rs#is_attached]]) rather than on the single focused one, because every pane streams.
+
+[[crates/scribe-client-gpui/src/main.rs#TerminalView#publish_pane_sizes]] runs after any layout change: each pane's rect yields a cell count, which is reshaped locally through [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#resize]] and announced to the server as `Resize` followed by `RequestSnapshot` — the client owns no PTY and never reflows locally, so the authoritative grid has to come back from the server. Unchanged panes are skipped, so a redraw storm never becomes a `RequestSnapshot` storm.
+
+Because the terminal-navigation surfaces ([[client#GPUI Client Spike#GPUI Terminal Viewport Wiring]]) all act on the live `Term`, they reach it through [[crates/scribe-client-gpui/src/main.rs#TerminalView#with_focused_grid]] rather than a window-wide terminal: scrollback, vi/copy mode, the split-scroll pin, the jump chip and smart selection all resolve against the pane the user is in. `active_session` names that pane's session by construction, since both [[crates/scribe-client-gpui/src/main.rs#TerminalView#focus_pane_session]] and the reader's attach path re-point it on every focus move. For the same reason only the focused pane publishes its painted [[crates/scribe-client-gpui/src/terminal_element.rs#GridBounds]] and its find-match spans; a background pane paints its own untouched grid.
 
 ### GPUI URL Detection Port
 
@@ -1021,6 +1053,8 @@ The one piece still missing is the per-pane mode: the binary always passes [[cra
 ### GPUI Keybindings Port
 
 The GPUI rebuild ports the keybinding parser and layout-action dispatch from the winit client, retargeted at GPUI's `Keystroke`/`Modifiers` via the intermediate [[crates/scribe-client-gpui/src/input.rs#KeyInput]], so no configured shortcut regresses at cutover.
+
+GPUI's Linux backends name a key by the keysym the *current* modifier level resolves to and then drop the shift flag for single-character non-letter keys, so `ctrl+shift+\` arrives as control plus the key `|` with shift clear — nothing like the combo the config spells. Every shifted-symbol default (`split_vertical`, `split_horizontal`, `zoom_in`) was therefore unreachable in the running client, so [[crates/scribe-client-gpui/src/keybindings.rs#Keybinding#character_matches]] also accepts a binding's US-layout shifted glyph ([[crates/scribe-client-gpui/src/keybindings.rs#shifted_ascii]]) arriving with shift already folded in. Letters are absent from that table on purpose: the backends already report them by their own lowercase key and keep the shift flag.
 
 [[crates/scribe-client-gpui/src/keybindings.rs#Bindings]] parses every configurable action from [[crates/scribe-common/src/config.rs#KeybindingsConfig]] (invalid combos skipped with a warning). [[crates/scribe-client-gpui/src/keybindings.rs#Keybinding#parse]] reads the same combo vocabulary as [[crates/scribe-client/src/input.rs#Keybinding#parse]], mapping `cmd`/`super` onto GPUI's platform modifier, and [[crates/scribe-client-gpui/src/keybindings.rs#Keybinding#matches]] requires an exact modifier match (ignoring the GPUI function flag) on a key-down event, comparing characters against the unshifted base case-insensitively. [[crates/scribe-client-gpui/src/keybindings.rs#translate_key_action]] runs the legacy three-level intercept order — layout shortcuts, then command-palette/settings/find, then the seven fixed terminal-shortcut escape sequences — returning a [[crates/scribe-client-gpui/src/keybindings.rs#KeyAction]]; the generic byte encoder handles level 4 when it returns `None`. All 50+ [[crates/scribe-client-gpui/src/keybindings.rs#LayoutAction]] variants are enumerated one-for-one against the legacy tables. The module also owns the shell's fixed overlay chords, so that the "a configured binding always wins" rule lives next to the table it outranks — see [[client#GPUI Overlays#Overlay Chords Yield To Bindings]].
 
