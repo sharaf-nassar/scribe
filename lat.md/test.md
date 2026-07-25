@@ -600,37 +600,41 @@ The spike has no stable input encoder with echo instrumentation, no multi-tab su
 
 ## GPUI Client Headless Suites
 
-The `#[gpui::test]` and golden suites in `scribe-client-gpui` are the primary correctness oracle for client-internal logic. They need no display server and every landed suite maps to a `parity-inventory.md` verification row.
+The `#[gpui::test]` and golden suites in `scribe-client-gpui` are the primary correctness oracle for client-internal *logic*. They need no display server, and each landed suite maps to the `parity-inventory.md` row whose logic it exercises.
 
-These suites run under `just test` (and the `Dockerfile.func` image's Rust toolchain). This section consolidates the headless coverage the `gpui-client-rebuild` epic (`scribe-38e`) accumulates: each row of the map below ties a suite to the parity-inventory verification row it satisfies, and the coverage frontier lists the parity rows whose suites unblock as their feature beads land.
+**A headless suite does not satisfy a parity row.** It proves the module behaves correctly when constructed; it says nothing about whether the running client ever constructs it. The 016 reachability audit found 113 of 164 user-facing parity rows unreachable while their suites were green, so `parity-inventory.md` now carries a mandatory "Reachable from" column and retains `gpui-test` as the row-level method only for the nine removed-configuration-key rows. Read the map below as *logic coverage*; the row's own verification method and reachable-from symbol live in the inventory and are authoritative.
 
-| Headless suite | Spec section | Parity-inventory row(s) |
+These suites run under `just test` (and the `Dockerfile.func` image's Rust toolchain). This section consolidates the headless coverage the `gpui-client-rebuild` epic (`scribe-38e`) accumulates, and the coverage frontier lists the parity rows whose suites unblock as their feature beads land.
+
+| Headless suite | Spec section | Parity-inventory row(s) whose logic it covers |
 | --- | --- | --- |
-| Pane tree entity ops | [[client#GPUI Client Spike#GPUI Layout Entities#Pane Tree Model]] | Input/keybinding "Pane layout" (gpui-test) |
-| Pane split-tree logic | [[test#GPUI Client Headless Suites#Pane split-tree logic]] | Input/keybinding "Pane layout" (gpui-test) |
-| Workspace tree entity ops | [[client#GPUI Client Spike#GPUI Layout Entities#Workspace Tree Model]] | `CreateWorkspace`, `MoveSession`, `ReportWorkspaceTree` (gpui-test) |
-| Input byte encoder golden | [[client#Input#GPUI Input Encoder Port]] | `KeyInput`, Terminal shortcuts (golden) |
-| Keybindings dispatch | [[test#GPUI Client Headless Suites#GPUI keybindings dispatch]] | Pane/Workspace/Tab/Navigation/View keybinding actions (gpui-test) |
-| Config load with removed keys | [[test#GPUI Client Headless Suites#Config load with removed keys]] | "Removed configuration keys" rows (gpui-test) |
-| Config live reload | [[test#GPUI Client Headless Suites#Config live reload]] | `ConfigReloaded` live reload (scripted-E2E) |
-| Window opacity | [[test#GPUI Client Headless Suites#Window opacity]] | Rendering/window `appearance.opacity` (gpui-test) |
-| URL/OSC8 detection | [[test#GPUI URL Detection]] | hover/dwell/open surface (gpui-test) |
-| IPC bridge ordering | [[test#GPUI IPC Bridge]] | Executor-model ordering risk (gpui-test) |
-| Remote connect picker | [[test#GPUI Client Headless Suites#GPUI remote connect picker]] | `ListRemotePeers`, `ListLanPeers`, `RemotePeerList` remote connect picker (gpui-test) |
-| Remote handshake | [[test#GPUI Client Headless Suites#GPUI remote handshake]] | `RemoteHandshake` preamble + dial-env spawn (gpui-test) |
-| Lost control banner | [[test#GPUI Client Headless Suites#GPUI lost control banner]] | `WindowTakenOver` displaced-client reclaim (gpui-test) |
-| LAN device approval | [[test#GPUI Client Headless Suites#GPUI LAN device approval]] | `LanApprovalRequest`/`LanApprovalDecision` prompt (gpui-test) |
-| Window sharing | [[test#GPUI Client Headless Suites#GPUI window sharing]] | `ShareRoster`, `ControlClaim`/`ControlRequest`/`ControlGrant` (gpui-test) |
-| Pane dividers | [[test#GPUI Pane Dividers]] | "Pane divider drag-resize" chrome (gpui-test) |
-| Focus borders | [[test#GPUI Focus Borders]] | "Focused pane/workspace border" chrome (manual + gpui-test) |
-| Split-scroll | [[test#GPUI Split-Scroll]] | "Split-scroll live-bottom pin" AI-pane chrome (gpui-test) |
-| Font zoom | [[test#GPUI Font Zoom]] | "Zoom in/out/reset" View keybinding actions (gpui-test) |
-| OSC 52 clipboard bridge | [[test#GPUI OSC 52 Clipboard Bridge]] | `ClipboardPromptResponse`, `ClipboardBridgeReadReply`, `ClipboardBridgeWrite`, `ClipboardBridgeReadRequest` OSC 52 bridge (scripted-E2E) |
-| Notification dispatcher | [[test#GPUI Notification Dispatcher]] | Notification `replaces_id` coalescing + click-to-focus (gpui-test + manual) |
+| Pane tree entity ops | [[client#GPUI Client Spike#GPUI Layout Entities#Pane Tree Model]] | Input/keybinding "Pane layout" |
+| Pane split-tree logic | [[test#GPUI Client Headless Suites#Pane split-tree logic]] | Input/keybinding "Pane layout" |
+| Workspace tree entity ops | [[client#GPUI Client Spike#GPUI Layout Entities#Workspace Tree Model]] | `CreateWorkspace`, `MoveSession`, `ReportWorkspaceTree` |
+| Input byte encoder golden | [[client#Input#GPUI Input Encoder Port]] | `KeyInput`, Terminal shortcuts |
+| Keybindings dispatch | [[test#GPUI Client Headless Suites#GPUI keybindings dispatch]] | Pane/Workspace/Tab/Navigation/View keybinding actions |
+| Config load with removed keys | [[test#GPUI Client Headless Suites#Config load with removed keys]] | "Removed configuration keys" rows |
+| Config live reload | [[test#GPUI Client Headless Suites#Config live reload]] | `ConfigReloaded` live reload |
+| Window opacity | [[test#GPUI Client Headless Suites#Window opacity]] | Rendering/window `appearance.opacity` |
+| URL/OSC8 detection | [[test#GPUI URL Detection]] | hover/dwell/open surface |
+| IPC bridge ordering | [[test#GPUI IPC Bridge]] | Executor-model ordering risk |
+| Remote connect picker | [[test#GPUI Client Headless Suites#GPUI remote connect picker]] | `ListRemotePeers`, `ListLanPeers`, `RemotePeerList` remote connect picker |
+| Remote handshake | [[test#GPUI Client Headless Suites#GPUI remote handshake]] | `RemoteHandshake` preamble + dial-env spawn |
+| Lost control banner | [[test#GPUI Client Headless Suites#GPUI lost control banner]] | `WindowTakenOver` displaced-client reclaim |
+| LAN device approval | [[test#GPUI Client Headless Suites#GPUI LAN device approval]] | `LanApprovalRequest`/`LanApprovalDecision` prompt |
+| Window sharing | [[test#GPUI Client Headless Suites#GPUI window sharing]] | `ShareRoster`, `ControlClaim`/`ControlRequest`/`ControlGrant` |
+| Pane dividers | [[test#GPUI Pane Dividers]] | "Pane divider drag-resize" chrome |
+| Focus borders | [[test#GPUI Focus Borders]] | "Focused pane/workspace border" chrome |
+| Split-scroll | [[test#GPUI Split-Scroll]] | "Split-scroll live-bottom pin" AI-pane chrome |
+| Font zoom | [[test#GPUI Font Zoom]] | "Zoom in/out/reset" View keybinding actions |
+| OSC 52 clipboard bridge | [[test#GPUI OSC 52 Clipboard Bridge]] | `ClipboardPromptResponse`, `ClipboardBridgeReadReply`, `ClipboardBridgeWrite`, `ClipboardBridgeReadRequest` OSC 52 bridge |
+| Notification dispatcher | [[test#GPUI Notification Dispatcher]] | Notification `replaces_id` coalescing + click-to-focus |
 
 ### Coverage frontier
 
-Testing-Strategy suites not yet consolidated are blocked on their feature beads landing in `scribe-38e`. Each is tracked here against its parity row so the launch-gate bead (`scribe-38e.42`) can confirm the headless oracle is complete before cutover.
+Testing-Strategy suites not yet consolidated are blocked on their feature beads landing in `scribe-38e`. Each is tracked here against the parity row whose logic it will cover.
+
+Completing this frontier closes the headless oracle, which is a prerequisite for the launch-gate bead (`scribe-38e.42`) but not its metric — that is the reachable-row count in `parity-inventory.md`.
 
 Pending headless suites and the parity rows they will satisfy:
 

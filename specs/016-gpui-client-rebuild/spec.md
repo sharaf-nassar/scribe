@@ -31,12 +31,63 @@ at cutover, along with all code that only existed to serve them.
   renderer, published pin, verified local build); the project accepted
   GPL-3.0 relicensing, unlocking direct reuse of Zed's terminal code.
 
+## Re-scope — reachability re-baseline (2026-07-24)
+
+**This feature is re-scoped in place. It is not superseded by a new feature.**
+
+The 016 task list is ~87% closed, but what it completed is the **library
+port**, not the product. `crates/scribe-client-gpui` ships 54 library modules
+(~35k lines) with a green workspace unit-test suite (850 tests at the gate run,
+more on current `main`); the live binary — `main.rs` plus
+`ipc_bridge`, `session_lifecycle`, `sync_frames`, `terminal`,
+`terminal_element` (~3.4k lines) — imports only 19 of them. The other 35
+compile, pass their `#[gpui::test]` suites, and are never constructed by the
+running application. Several parity rows were signed off on exactly that
+evidence.
+
+The reachability audit (`reachability-audit.md`, bead `scribe-38e.60`,
+measured at `f56ef95`) quantified it across all 173 parity rows:
+
+| Verdict | Count | Share |
+| --- | --- | --- |
+| WIRED (reachable in the running app) | 60 | 34.7% |
+| UNWIRED (logic exists, nothing on a live path calls it) | 63 | 36.4% |
+| MISSING (no implementation anywhere in the crate) | 50 | 28.9% |
+
+Excluding the nine removed-configuration-key rows, which are satisfied by the
+*absence* of behaviour, the user-facing parity surface is **164 rows of which
+51 are reachable — 31%**.
+
+**What this changes:**
+
+- **"Done" means reachable.** A row is done only when `parity-inventory.md`'s
+  mandatory "Reachable from" column names a live-path symbol *and* its
+  verification method passes against the running app. See that document's
+  "Definition of done".
+- **The remaining work is integration/wiring plus genuinely missing
+  features** — not new library modules. 63 UNWIRED rows need a call site on a
+  live path; 50 MISSING rows need an implementation *and* a call site. The
+  audit groups both into fix units FU-1 through FU-23; `plan.md` sequences the
+  remaining phases around them, P0 first.
+- **The launch gate (`scribe-38e.42`) re-baselines on reachable-row count**,
+  not the unit-test count. The unit-test suite is green and proves logic; it
+  proves nothing about reachability and must not be quoted as parity evidence
+  again.
+- **The frozen surfaces are untouched by this re-scope.** No server, protocol,
+  or `scribe-common` change is implied — every fix unit is client-internal
+  wiring. That is precisely why the work stays inside 016 rather than becoming
+  a new feature.
+
 ## Goals
 
-1. **Full feature parity** with the current client per the parity inventory
-   (46 `ClientMessage` variants sent, 57 `ServerMessage` variants handled, all
-   subsystems in the inventory: terminal core, layout, chrome, dialogs,
-   config, integrations). No user-visible regression in functionality.
+1. **Full, reachable feature parity** with the current client per the parity
+   inventory (46 `ClientMessage` variants sent, 59 `ServerMessage` variants
+   handled, 54 named keybinding actions, and the rendering/window and
+   removed-config-key rows: terminal core, layout, chrome, dialogs, config,
+   integrations). Parity means *reachable from a named live-path symbol*, not
+   *implemented and unit-tested*: a module that no code path in the shipped
+   binary constructs does not count toward this goal. No user-visible
+   regression in functionality.
 2. **Modern UI capabilities from day one of cutover:**
    - Color emoji rendered in the grid (not tinted silhouettes).
    - Underline, double underline, colored undercurl, strikethrough.
@@ -210,6 +261,16 @@ so regressions are caught during the rebuild, not after cutover.
 - Client logic tests exist as `#[gpui::test]` headless tests for: layout
   tree operations, workspace tree, selection model, input encoding tables,
   sync-frame queueing, URL detection.
+- **Headless tests never stand alone for a user-facing row.** Per the
+  reachability re-baseline, `gpui-test` is retained only for the nine
+  removed-configuration-key rows (which assert absence of behaviour); every
+  other row's oracle drives the running app. CI additionally enforces
+  reachability mechanically: the `run_reader` arm set must match the
+  inventory's reachable `ServerMessage` rows, every reachable `ClientMessage`
+  row must be constructed inside `main.rs`'s import closure, and every
+  `lib.rs` module outside that closure must carry an explicit unwired marker
+  naming its fix bead. The unimplemented-dispatch catch-alls become a
+  `warn`-level counter that a scripted run asserts is zero.
 
 ## Constraints
 

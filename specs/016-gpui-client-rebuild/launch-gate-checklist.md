@@ -120,11 +120,37 @@ reconnect, hot-reload, multi-window isolation, workspace-split,
 shell-integration, terminal-shortcuts, keybindings-validation) — these drive the
 real app and therefore do prove reachability for what they cover.
 
+## Re-scope pointer
+
+Feature 016 was re-scoped in place on the strength of the retraction above —
+see `spec.md` § "Re-scope — reachability re-baseline" and `plan.md`
+§ "Re-sequenced remaining phases (post-reachability-audit)". The 016 task list
+completed the *library port*; the remaining work is integration/wiring plus the
+genuinely missing features, sequenced around the audit's fix units FU-1..FU-23
+with FU-1 (cell-accurate paint path) first.
+
+Two consequences bind this gate:
+
+- **The parity metric is the reachable-row count**, regenerated from
+  `parity-inventory.md`'s roll-up (currently **51 of 164** user-facing rows) by
+  mechanical CI checks — never a green unit-test run.
+- **Verification methods were upgraded** so no user-facing row can pass on
+  headless unit tests alone: 27 IPC rows moved `gpui-test` → `scripted-E2E`;
+  font fallback and all 54 named keybinding actions moved to `visual-E2E`
+  driven by `xdotool`. `gpui-test` now applies only to the nine
+  removed-config-key rows. The "Parity-inventory results by verification
+  method" table above records the methods **as they stood at the gate run** and
+  is superseded by `parity-inventory.md` for any re-gate.
+
 ## Re-gate criteria
 
 Re-run this gate when all of the following are resolved: `.50` (startup
 ≤500 ms), `.51` (rig drives all five metrics), `.52` (AI-indicator func green),
 `.56` (opacity implemented) followed by `.53` (opacity re-verified), and `.57`
 (config watcher wired, live reload proven). The IME manual procedure still
-requires a human on a host with an input-method engine. Only then does `.42`
-flip to GO and unblock cutover `.43`.
+requires a human on a host with an input-method engine.
+
+Post-re-scope, those are necessary but no longer sufficient: the re-gate also
+requires the reachable-row count to meet its explicit go threshold, with the
+FU-1..FU-23 fix units closed to that threshold and the mechanical reachability
+checks green. Only then does `.42` flip to GO and unblock cutover `.43`.
