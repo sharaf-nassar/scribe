@@ -113,7 +113,7 @@ use tokio::{
 
 use crate::{
     ipc_bridge::{InboundEvent, IpcSink, PaneOp, run_drain},
-    pane_shell::{ClosedPane, PaneShell},
+    pane_shell::{ClosedPane, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
     session_lifecycle::{JumpDirection, PromptMarks},
     sync_frames::{SyncFrameQueue, drain_all_committed},
     terminal::{Content, DisplayOnlyTerminal, PaneGrids, Scroll},
@@ -304,6 +304,12 @@ struct Shared {
     /// `PromptMark` against the grid it has just advanced; the key path reads
     /// them back to resolve the three mark-relative jumps.
     prompt_marks: Arc<Mutex<PromptMarks>>,
+    /// `WorkspaceInfo` updates the reader has taken off the wire and the GPUI
+    /// thread has not yet folded onto the window's regions. The reader cannot
+    /// touch them itself: a region is a GPUI entity, so the reader only parks
+    /// the server's answer and the next reconcile pass applies it on the thread
+    /// that owns the layout.
+    workspaces: Arc<Mutex<Vec<WorkspaceInfo>>>,
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -405,6 +411,9 @@ struct TerminalView {
     /// Geometry of the focused pane, which is where a new tab or a split's
     /// session opens. Starts at the whole window and shrinks with the layout.
     focused_pane_size: TerminalSize,
+    /// The split tree last put on the wire, so a repaint that left the topology
+    /// alone does not re-report it. `None` until the first report.
+    last_reported_tree: Option<scribe_common::protocol::WorkspaceTreeNode>,
     // The custom titlebar + integrated tab bar drawn above the terminal grid.
     titlebar: Entity<TitlebarView>,
     /// Theme chrome, retained to build the overlay palettes on demand.
@@ -506,6 +515,18 @@ impl TerminalView {
         (guard, Some(task))
     }
 
+    /// Veto every platform close so the in-app dialog decides what happens.
+    ///
+    /// The WM's close button must raise the close dialog instead of destroying
+    /// the window behind the server's back: the server owns this window's
+    /// sessions and has to be told whether to end them or keep them detached.
+    fn register_close_veto(window: &mut Window, cx: &mut Context<Self>) {
+        let close_requester = cx.weak_entity();
+        window.on_window_should_close(cx, move |_window, app| {
+            close_requester.update(app, TerminalView::request_window_close).unwrap_or(true)
+        });
+    }
+
     fn new(
         shared: Shared,
         sink: IpcSink,
@@ -520,13 +541,7 @@ impl TerminalView {
         let activation_observer = cx
             .observe_window_activation(window, |view, window, ctx| view.on_activation(window, ctx));
         let (bell, bell_subscription) = Self::start_bell_gate(window, cx);
-        // The WM's close button must raise the in-app close dialog instead of
-        // destroying the window behind the server's back, so the platform close
-        // is always vetoed and the dialog decides what to ask the server for.
-        let close_requester = cx.weak_entity();
-        window.on_window_should_close(cx, move |_window, app| {
-            close_requester.update(app, TerminalView::request_window_close).unwrap_or(true)
-        });
+        Self::register_close_veto(window, cx);
         let generation = Arc::clone(&shared.generation);
         let lifecycle_task =
             cx.spawn(async move |view, app| drive_window_lifecycle(view, app).await);
@@ -580,6 +595,7 @@ impl TerminalView {
             shell,
             pane_sizes: HashMap::new(),
             focused_pane_size: terminal_size,
+            last_reported_tree: None,
             titlebar,
             chrome,
             terminal_size,
@@ -1555,9 +1571,12 @@ impl TerminalView {
     /// is down to a single pane in a single workspace region.
     fn close_pane(&mut self, cx: &mut Context<Self>) {
         match self.shell.close_focused_pane(cx) {
-            ClosedPane::Removed(sessions) => {
+            ClosedPane::Removed { sessions, closed_region } => {
                 for session_id in &sessions {
                     self.close_pane_session(*session_id);
+                }
+                if let Some(workspace_id) = closed_region {
+                    self.close_workspace(workspace_id);
                 }
                 tracing::info!(
                     closed = sessions.len(),
@@ -1582,6 +1601,18 @@ impl TerminalView {
         }
     }
 
+    /// Tell the server a workspace region collapsed with its last pane.
+    ///
+    /// The shell only ever hands over regions the server itself minted, so this
+    /// never names a client-local id.
+    fn close_workspace(&self, workspace_id: WorkspaceId) {
+        if let Err(error) = self.sink.close_workspace(workspace_id) {
+            tracing::warn!(%error, "close workspace dropped: IPC writer closed");
+            return;
+        }
+        tracing::info!(%workspace_id, "closed a workspace region on the server");
+    }
+
     /// Cycle focus to the next pane of the focused region.
     fn focus_next_pane(&mut self, cx: &mut Context<Self>) {
         let Some(pane) = self.shell.focus_next_pane(cx) else {
@@ -1603,19 +1634,27 @@ impl TerminalView {
         self.focus_pane_session(cx);
     }
 
-    /// Split the window into another workspace region and seed it with a
-    /// session.
+    /// Split the window into another workspace region, ask the server for the
+    /// workspace behind it, and seed it with a session.
     ///
-    /// The region itself is client-local: the server still owns exactly one
-    /// workspace for this window, so the seeded session is created in that
-    /// workspace and the region is a layout construct until
-    /// `ClientMessage::CreateWorkspace` is wired (bead .66).
+    /// The region is minted client-local because only the server may allocate a
+    /// [`WorkspaceId`], and `CreateWorkspace` carries none: the answering
+    /// `WorkspaceInfo` is what re-keys the region and hands it the server's own
+    /// accent colour, one round trip later. The placeholder accent below is what
+    /// the focus ring is tinted with until then.
+    ///
+    /// The seeded session is still created through the tab strip's workspace,
+    /// because the new one does not exist yet; the `MoveSession` raised when the
+    /// pane adopts it is what tells the server the session changed regions.
     fn split_workspace(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
         let accent = self.next_region_accent(cx);
         let Some(workspace_id) = self.shell.split_workspace(direction, accent, cx) else {
             tracing::warn!(?direction, "workspace split ignored: no focused region");
             return;
         };
+        if let Err(error) = self.sink.create_workspace() {
+            tracing::warn!(%error, "workspace creation dropped: IPC writer closed");
+        }
         tracing::info!(
             ?direction,
             %workspace_id,
@@ -1686,10 +1725,41 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Republish pane geometry after the layout moved, then repaint.
+    /// Republish pane geometry after the layout moved, report the new tree to
+    /// the server, then repaint.
     fn after_layout_change(&mut self, cx: &mut Context<Self>) {
         self.publish_pane_sizes(cx);
+        self.report_workspace_tree(cx);
         cx.notify();
+    }
+
+    /// Send the window's split tree to the server, unless it is the tree the
+    /// server was last told about.
+    ///
+    /// The server stores the last reported tree per window and replays it on
+    /// reconnect and handoff, so this is what makes a split survive a restart.
+    /// It is called from every mutation path — a pane split or close, a
+    /// workspace split or collapse, and the reconcile pass that fills a fresh
+    /// pane with its session — which is far more often than the tree actually
+    /// changes: the whole point of a pane resize or a repaint is that the
+    /// topology did not move. The equality check is therefore the throttle, and
+    /// it is exact rather than heuristic because the reported value *is* the
+    /// wire payload.
+    fn report_workspace_tree(&mut self, cx: &mut Context<Self>) {
+        let tree = self.shell.wire_tree(cx);
+        if self.last_reported_tree.as_ref() == Some(&tree) {
+            return;
+        }
+        if let Err(error) = self.sink.report_workspace_tree(tree.clone()) {
+            tracing::warn!(%error, "workspace tree report dropped: IPC writer closed");
+            return;
+        }
+        self.last_reported_tree = Some(tree);
+        tracing::info!(
+            regions = self.shell.region_count(cx),
+            panes = self.shell.pane_count(cx),
+            "reported the workspace tree to the server"
+        );
     }
 
     /// Stop streaming `session_id` and drop the state its pane owned.
@@ -1772,7 +1842,11 @@ impl TerminalView {
     /// yet — and each is settled here rather than from the reader, which must
     /// never touch GPUI entities.
     fn reconcile_panes(&mut self, cx: &mut Context<Self>) {
-        let mut changed = false;
+        // Ahead of everything else: a `WorkspaceInfo` is the answer to the
+        // `CreateWorkspace` a split sent, and the session that split asked for
+        // is adopted below. Applying it first is what lets the adoption see the
+        // region's real workspace and raise a `MoveSession` for it.
+        let mut changed = self.adopt_workspace_info(cx);
         if let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
         {
             changed |= self.shell.adopt_server_workspace(workspace_id, cx);
@@ -1782,7 +1856,11 @@ impl TerminalView {
             |tabs| tabs.tabs().iter().map(|tab| tab.session_id).collect(),
         );
         if !live.is_empty() {
-            changed |= self.shell.retain_sessions(&live, cx);
+            let retired = self.shell.retain_sessions(&live, cx);
+            for workspace_id in retired.closed_regions {
+                self.close_workspace(workspace_id);
+            }
+            changed |= retired.changed;
         }
         let active = self.shared.active_session.lock().ok().and_then(|guard| *guard);
         if let Some(session_id) =
@@ -1794,12 +1872,46 @@ impl TerminalView {
             let target = self.shell.take_pending(cx).or_else(|| self.shell.focused_pane(cx));
             if let Some(pane) = target {
                 self.adopt_session(pane, session_id);
+                self.follow_session_to_region(pane, session_id, cx);
                 changed = true;
             }
         }
         if changed {
             self.publish_pane_sizes(cx);
+            self.report_workspace_tree(cx);
         }
+    }
+
+    /// Fold every parked `WorkspaceInfo` onto the region it names.
+    ///
+    /// Returns whether the layout changed, which it does when a region that was
+    /// waiting for a server workspace adopted one — a rename that moves the
+    /// region's id and therefore the workspace every later frame reports.
+    fn adopt_workspace_info(&mut self, cx: &mut Context<Self>) -> bool {
+        let Ok(mut guard) = self.shared.workspaces.lock() else {
+            tracing::warn!("workspace info mutex poisoned; skipping this pass");
+            return false;
+        };
+        let parked: Vec<WorkspaceInfo> = std::mem::take(&mut *guard);
+        drop(guard);
+        let mut changed = false;
+        for info in parked {
+            let workspace_id = info.workspace_id;
+            match self.shell.apply_workspace_info(&info, cx) {
+                WorkspaceInfoOutcome::Adopted => {
+                    tracing::info!(%workspace_id, "a workspace region adopted a server workspace");
+                    changed = true;
+                }
+                WorkspaceInfoOutcome::Updated => {
+                    tracing::debug!(%workspace_id, "refreshed a workspace region's metadata");
+                    changed = true;
+                }
+                WorkspaceInfoOutcome::Unclaimed => {
+                    tracing::debug!(%workspace_id, "no region claimed this workspace");
+                }
+            }
+        }
+        changed
     }
 
     /// Show `session_id` in `pane`, streaming it from now on.
@@ -1811,6 +1923,41 @@ impl TerminalView {
             attached.insert(session_id);
         }
         tracing::info!(%session_id, pane = pane.raw(), "pane adopted a session");
+    }
+
+    /// Tell the server a session changed workspace regions.
+    ///
+    /// A pane and a workspace move on different axes: a `workspace_split_*`
+    /// opens a region *before* the server has minted its workspace, so the
+    /// session it seeds is necessarily created through the workspace the tab
+    /// strip was pointing at. Once the pane that adopts it turns out to sit in
+    /// a different region, this is the frame that reconciles the two — without
+    /// it the server keeps every session filed under the window's first
+    /// workspace no matter which region the user put it in.
+    ///
+    /// Only regions the server minted are named, and the strip is re-filed
+    /// optimistically so a later split seeds its session in the region the user
+    /// is actually looking at.
+    fn follow_session_to_region(
+        &mut self,
+        pane: PaneId,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.shell.region_for_pane(pane, cx) else { return };
+        if !self.shell.is_server_workspace(target) {
+            return;
+        }
+        let Ok(mut tabs) = self.shared.tabs.lock() else { return };
+        if !tabs.set_workspace(session_id, target) {
+            return;
+        }
+        drop(tabs);
+        if let Err(error) = self.sink.move_session(session_id, target) {
+            tracing::warn!(%error, "session move dropped: IPC writer closed");
+            return;
+        }
+        tracing::info!(%session_id, %target, "moved a session into another workspace region");
     }
 
     /// The last painted frame of `session_id`'s grid, or `None` when nothing
@@ -3455,6 +3602,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         find: Arc::new(Mutex::new(FindResults::default())),
         lan: Arc::new(Mutex::new(LanChrome::new())),
         prompt_marks: Arc::new(Mutex::new(PromptMarks::new())),
+        workspaces: Arc::new(Mutex::new(Vec::new())),
     };
     let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
     let (in_tx, in_rx) = unbounded_channel::<InboundEvent>();
@@ -3785,6 +3933,7 @@ where
         find: ctx.shared.find,
         lan: ctx.shared.lan,
         prompt_marks: ctx.shared.prompt_marks,
+        workspaces: ctx.shared.workspaces,
         out_tx: ctx.out_tx,
         in_tx: ctx.in_tx,
         sink: ctx.sink,
@@ -4049,6 +4198,9 @@ struct ReaderCtx {
     /// Per-session OSC 133 command records. The reader shifts them on a
     /// `TrimScrollback`; the drain anchors new marks into them.
     prompt_marks: Arc<Mutex<PromptMarks>>,
+    /// `WorkspaceInfo` answers the reader parks for the shell's reconcile pass;
+    /// see the `workspaces` field of `Shared`.
+    workspaces: Arc<Mutex<Vec<WorkspaceInfo>>>,
     out_tx: UnboundedSender<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
@@ -4462,6 +4614,7 @@ fn dispatch_server_message(
         | ServerMessage::SessionContextChanged { .. }
         | ServerMessage::EnvStatus { .. }
         | ServerMessage::WorkspaceNamed { .. }) => on_chrome_message(ctx, chrome),
+        info @ ServerMessage::WorkspaceInfo { .. } => on_workspace_info(ctx, info),
         // The four provider task-label notices all land in the tab strip's
         // label column, so they are named here and routed as one to
         // [`on_task_label_message`]. Naming them is what keeps an AI tab's
@@ -4537,6 +4690,48 @@ fn on_search_results(
     tracing::info!(%session_id, %query, matches = matches.len(), "search results received");
     results.accept(query, matches);
     drop(results);
+    ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Fold one `WorkspaceInfo` onto the window's chrome and park it for the shell.
+///
+/// This is the server's authoritative description of a workspace: its display
+/// name, the accent colour from its rotating palette, and the project root it
+/// was derived from. Two surfaces consume it and they live on different
+/// threads, so it is split here rather than in the view. The name goes straight
+/// into the shared [`ChromeMetadata`] the status bar renders its workspace
+/// segment from — the same store `WorkspaceNamed` writes, so the two channels
+/// cannot disagree. The accent and the id itself belong to a [`PaneShell`]
+/// region, which is a GPUI entity the reader must never touch, so the whole
+/// update is parked for the next reconcile pass.
+///
+/// Parking the id is what makes `ClientMessage::CreateWorkspace` complete: the
+/// region a `workspace_split_*` opened is client-local until this reply re-keys
+/// it onto the workspace the server actually minted.
+fn on_workspace_info(ctx: &ReaderCtx, message: ServerMessage) {
+    let ServerMessage::WorkspaceInfo { workspace_id, name, accent_color, project_root, .. } =
+        message
+    else {
+        // Unreachable: the caller only routes `WorkspaceInfo` here.
+        unhandled_server_message(&message);
+        return;
+    };
+    let accent = scribe_common::theme::hex_to_rgba(&accent_color).ok();
+    if accent.is_none() {
+        tracing::warn!(%workspace_id, accent_color, "workspace accent is not a #rrggbb colour");
+    }
+    // An absent name is the server saying the workspace is outside every
+    // configured root, which must clear a name the status bar is still showing.
+    update_chrome_metadata(ctx, |store| {
+        store.name_workspace(workspace_id, name.clone().unwrap_or_default());
+    });
+    let Ok(mut parked) = ctx.workspaces.lock() else {
+        tracing::warn!("workspace info mutex poisoned; dropping WorkspaceInfo");
+        return;
+    };
+    tracing::info!(%workspace_id, ?name, accent_color, "workspace info received");
+    parked.push(WorkspaceInfo { workspace_id, name, accent, project_root });
+    drop(parked);
     ctx.generation.fetch_add(1, Ordering::Release);
 }
 

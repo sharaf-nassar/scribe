@@ -64,8 +64,8 @@ inject() {
 # How many keystrokes the client's share surfaces have swallowed so far.
 #
 # This is a log assertion rather than an absence-of-`KeyInput` assertion because
-# the GPUI client cannot yet create its own first session (`CreateWorkspace` is
-# missing, FU-6), so its window holds no PTY in this rig and would emit no
+# the GPUI client does not create a first session of its own — it adopts one the
+# server already has — so its window holds no PTY in this rig and would emit no
 # `KeyInput` either way. The `KeyInput` check below is kept as a regression
 # guard; the log line is the load-bearing evidence.
 count_swallowed() {

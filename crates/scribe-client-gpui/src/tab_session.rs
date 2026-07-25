@@ -189,6 +189,27 @@ impl TabSessions {
         true
     }
 
+    /// Re-file a session under another workspace, returning `true` when the
+    /// entry moved.
+    ///
+    /// A session's workspace is the server's to own, but the client learns of a
+    /// move first: a pane in a freshly split region adopts a session that was
+    /// created through the previous region's workspace, and the client sends
+    /// `ClientMessage::MoveSession` to say so. Recording it here keeps the strip
+    /// (and therefore the workspace a later `new_tab` targets) in step with the
+    /// region the user is actually in, instead of pinning every later session to
+    /// the window's first workspace.
+    pub fn set_workspace(&mut self, session_id: SessionId, workspace_id: WorkspaceId) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.session_id == session_id) else {
+            return false;
+        };
+        if tab.workspace_id == workspace_id {
+            return false;
+        }
+        tab.workspace_id = workspace_id;
+        true
+    }
+
     /// Set or clear a session's provider task label, returning `true` when the
     /// strip changed.
     ///

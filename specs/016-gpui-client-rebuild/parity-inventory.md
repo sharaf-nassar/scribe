@@ -78,15 +78,15 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `Resize` | terminal resize | scripted-E2E | `main.rs::report_cell_metrics`, `main.rs::attach_session` → `IpcSink::resize` | required |
 | `CreateSession` | tabs, panes, and AI tabs | scripted-E2E | `main.rs::create_tab` → `IpcSink::create_session` | required |
 | `CloseSession` | pane/tab close | scripted-E2E | `main.rs::close_active_tab` → `IpcSink::close_session` | required |
-| `CreateWorkspace` | workspace creation | scripted-E2E | — (missing, FU-6) | required |
-| `CloseWorkspace` | workspace close | scripted-E2E | — (missing, FU-6) | required |
-| `MoveSession` | session relocation | scripted-E2E | — (missing, FU-6) | required |
+| `CreateWorkspace` | workspace creation | scripted-E2E | `main.rs::TerminalView::split_workspace` → `IpcSink::create_workspace` | required |
+| `CloseWorkspace` | workspace close | scripted-E2E | `main.rs::TerminalView::close_pane` / `reconcile_panes` → `TerminalView::close_workspace` → `IpcSink::close_workspace` | required |
+| `MoveSession` | session relocation | scripted-E2E | `main.rs::TerminalView::follow_session_to_region` → `IpcSink::move_session` | required |
 | `Subscribe` | session stream subscription | scripted-E2E | `main.rs::attach_session` / `TerminalView::attach` → `IpcSink::subscribe` | required |
 | `RequestSnapshot` | snapshot tooling | scripted-E2E | `main.rs::report_cell_metrics` / `forward_replay` → `IpcSink::request_snapshot` | required |
 | `ListSessions` | startup/reconnect | scripted-E2E | `main.rs::run_connection` (sent on every connect) | required |
 | `AttachSessions` | reconnect restore | scripted-E2E | `main.rs::attach_session` → `IpcSink::attach_sessions` | required |
 | `ConfigReloaded` | live config reload | scripted-E2E | `main.rs::apply_config_reload` → `IpcSink::config_reloaded` | required |
-| `ReportWorkspaceTree` | layout persistence | scripted-E2E | — (unwired, FU-6) — built only in `workspace_tree.rs`, outside `main.rs`'s import closure | required |
+| `ReportWorkspaceTree` | layout persistence | scripted-E2E | `main.rs::TerminalView::report_workspace_tree` → `PaneShell::wire_tree` → `IpcSink::report_workspace_tree`, after every layout mutation | required |
 | `SearchRequest` | find overlay | scripted-E2E | `main.rs::TerminalView::send_search_request` → `ipc_bridge::IpcSink::search_request`, from every find-overlay query edit | required |
 | `WorkspaceNotesGet` | workspace notes | scripted-E2E | `main.rs::open_workspace_notes_modal` → `IpcSink::workspace_notes_get` — **degenerate** (demo chord, fabricated `WorkspaceId`, reply dropped by the reader catch-all); FU-21 | required |
 | `WorkspaceNotesMutate` | workspace notes | scripted-E2E | `main.rs::route_workspace_notes_action` → `IpcSink::workspace_notes_mutate` — same demo caveat; FU-21 | required |
@@ -161,7 +161,7 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `Error` | error presentation | visual-E2E | `main.rs::run_reader` arm → `main.rs::set_status` | required |
 | `GitBranch` | status/tab metadata | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_git_branch` → `StatusBarData.git_branch` | required |
 | `SessionList` | startup/reconnect | scripted-E2E | `main.rs::run_reader` arm → `main.rs::sync_tab_strip` | required |
-| `WorkspaceInfo` | workspace layout | scripted-E2E | — (missing, FU-6) — only a doc-comment mention in `workspace_layout.rs` | required |
+| `WorkspaceInfo` | workspace layout | scripted-E2E | `main.rs::on_workspace_info` → `ChromeMetadata::name_workspace` + parked for `TerminalView::adopt_workspace_info` → `PaneShell::apply_workspace_info` | required |
 | `WorkspaceNotesSnapshot` | workspace notes | scripted-E2E | — (missing, FU-21) — the modal sends `WorkspaceNotesGet` and never receives a reply | required |
 | `WorkspaceNotesChanged` | workspace notes | scripted-E2E | — (missing, FU-21) | required |
 | `SearchResults` | find overlay | scripted-E2E | `main.rs::on_search_results` → `search::FindResults` → `search::FindOverlayView::adopt_results` → `terminal_element::TerminalElement::with_highlights` | required |
