@@ -59,6 +59,7 @@ pub mod dialog;
 pub mod divider;
 pub mod drag_drop;
 pub mod focus_border;
+pub mod fonts;
 pub mod input;
 pub mod keybindings;
 pub mod lan_approval;

@@ -288,6 +288,30 @@ at all.
 
 **Rendering subtotals:** WIRED 0 · UNWIRED 3 · MISSING 2 · UNKNOWN 0.
 
+**Post-audit:** bead `.63` (FU-1) landed the cell-accurate paint path after this
+baseline, closing Box drawing and Ligatures. `Content` now carries a `Cell` per
+grid position, and `TerminalElement::paint` resolves it on one `gpui::canvas` —
+background quads, then `box_drawing::mask_quads` overlay quads, then
+`shape_line` runs carrying the ordered `FontFallbacks` chain and `calt` gated on
+`appearance.ligatures`. `box_drawing` and `color` left
+`tools/reachability-baseline.txt` as a result (`modules-wired` 21 → 23). Bead
+`.56` had already closed Opacity (`771794d`). The verdicts above are preserved
+as the `f56ef95` record and are not restated per bead.
+
+Font fallback closed with the same bead. The chain wired onto every run was
+initially inert on gpui `f96212f`: `CosmicTextSystem::load_family` removes any
+face whose charmap lacks an `'m'` glyph — which is every stock symbols-only
+Nerd Font — and GPUI exposes no counterpart to the legacy `forbidden_fallback`
+that bans `Unifont Sample`, so `U+F09B`/`U+F121` rendered as hex boxes whether
+or not the Nerd Font families were named. The client now embeds
+`Symbols Nerd Font Mono` with a `U+006D` cmap alias
+(`tools/patch-nerd-symbols-font.py`, registered by
+`fonts::register_embedded_fonts` before the first frame), so the face survives
+eviction and the user chain resolves it ahead of cosmic-text's platform
+fallback. Live capture shows `U+F09B`/`U+F121` as the octocat/code icons. The
+new `fonts` module is imported on the live path, so it enters
+`tools/reachability-baseline.txt` as wired, never as an unwired entry.
+
 ## Removed configuration keys (9)
 
 All nine behave correctly in the running client. `crates/scribe-common/src/config.rs`

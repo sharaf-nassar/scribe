@@ -6955,6 +6955,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "ttf-parser",
  "unicode-width",
  "vte",
  "x11rb",

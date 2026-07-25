@@ -303,7 +303,7 @@ mod tests {
     }
 
     fn first_row(terminal: &DisplayOnlyTerminal) -> String {
-        terminal.content().rows.first().cloned().unwrap_or_default().trim_end().to_owned()
+        terminal.content().row_text(0).trim_end().to_owned()
     }
 
     fn session_info(workspace_id: WorkspaceId) -> SessionInfo {

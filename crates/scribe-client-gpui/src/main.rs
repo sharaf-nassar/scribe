@@ -24,6 +24,7 @@ use gpui_platform::application;
 use scribe_client_gpui::ai_indicator::AiStateTracker;
 use scribe_client_gpui::animation::AnimationSettings;
 use scribe_client_gpui::chrome_metadata::{ChromeMetadata, SessionChrome};
+use scribe_client_gpui::color::TerminalColors as CellColors;
 use scribe_client_gpui::command_palette::{
     CommandPaletteColors, CommandPaletteEvent, CommandPaletteView, PaletteAction, build_entries,
 };
@@ -222,18 +223,26 @@ const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(120);
 /// stays off the hot path.
 const X11_FOCUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The terminal grid's theme slots, kept in sRGB `[f32; 4]` theme space until
-/// the render pass folds `appearance.opacity` into the background alpha.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct TerminalColors {
+/// The terminal grid's window-level background, kept in sRGB `[f32; 4]` theme
+/// space until the render pass folds `appearance.opacity` into its alpha,
+/// alongside the ported per-cell SGR resolver the paint path uses for every
+/// colour a cell can carry.
+///
+/// [`CellColors`] is built once per theme rather than per frame: it linearises
+/// the whole xterm-256 palette on construction, and every render hands the
+/// paint path a cheap `Arc` clone of the result.
+#[derive(Clone)]
+struct GridPalette {
     background: [f32; 4],
-    foreground: [f32; 4],
+    cells: Arc<CellColors>,
 }
 
-impl TerminalColors {
+impl GridPalette {
     /// Read the grid's colours out of a resolved theme.
     fn from_theme(theme: &scribe_common::theme::Theme) -> Self {
-        Self { background: theme.background, foreground: theme.foreground }
+        let mut cells = CellColors::new();
+        cells.set_theme(theme);
+        Self { background: theme.background, cells: Arc::new(cells) }
     }
 }
 
@@ -269,7 +278,7 @@ struct TerminalView {
     rendered_tabs: TabSessions,
     /// Terminal background/foreground from the live theme, rebuilt on a theme
     /// reload. Replaces the hardcoded palette the spike painted with.
-    terminal_colors: TerminalColors,
+    terminal_colors: GridPalette,
     /// Live `appearance.opacity`, clamped to `0.0..=1.0`. Every background this
     /// window paints scales its alpha by this, so lowering it lets the desktop
     /// show through without recreating the (always transparent) window.
@@ -350,7 +359,7 @@ impl TerminalView {
             cx.spawn(async move |view, app| drive_config_reloads(view, app, config_signal).await);
         let theme = &config.config().theme;
         let status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
-        let terminal_colors = TerminalColors::from_theme(theme);
+        let terminal_colors = GridPalette::from_theme(theme);
         let chrome = config.config().chrome;
         let opacity = clamp_opacity(config.opacity());
         let font = GridFont::from_appearance(&config.config().config.appearance);
@@ -424,7 +433,7 @@ impl TerminalView {
         if plan.theme_changed() {
             let theme = self.config.config().theme.clone();
             self.status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
-            self.terminal_colors = TerminalColors::from_theme(&theme);
+            self.terminal_colors = GridPalette::from_theme(&theme);
             self.chrome = theme.chrome;
             self.prompt_colors = PromptBarColors::from(&self.chrome);
             self.push_tab_bar_colors(cx);
@@ -1735,7 +1744,8 @@ impl Render for TerminalView {
         let opacity = self.opacity;
         let grid_colors = GridColors {
             background: surface(self.terminal_colors.background, opacity),
-            foreground: opaque_slot(self.terminal_colors.foreground),
+            cells: Arc::clone(&self.terminal_colors.cells),
+            opacity,
         };
         // The root itself paints nothing. Every band below fills the window
         // edge to edge, so leaving the root unfilled guarantees each pixel
@@ -1865,6 +1875,10 @@ fn main() {
     });
 
     application().run(move |cx: &mut App| {
+        // Register the embedded Symbols Nerd Font before anything shapes a
+        // line: `load_family` caches per-family lookups, so a later add could
+        // never displace a cached miss for the fallback chain's first entry.
+        scribe_client_gpui::fonts::register_embedded_fonts(cx);
         // Resolve the motion policy from `appearance.animations` (default true)
         // and the SCRIBE_DISABLE_ANIMATIONS override, then mirror it onto GPUI's
         // global reduce-motion flag so any UI transitions stay off — and

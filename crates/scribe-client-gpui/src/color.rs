@@ -44,6 +44,21 @@ pub fn srgb_to_linear_rgba(c: [f32; 4]) -> [f32; 4] {
     ]
 }
 
+/// Convert a linear `[f32; 4]` colour back to sRGB space (alpha unchanged).
+///
+/// The inverse of [`srgb_to_linear_rgba`]. The legacy renderer kept everything
+/// linear because its wgpu pipeline wrote into an sRGB framebuffer; GPUI's
+/// `Rgba` is already sRGB, so the paint path converts back at the boundary
+/// rather than duplicating the SGR resolution rules in a second colour space.
+pub fn linear_to_srgb_rgba(c: [f32; 4]) -> [f32; 4] {
+    [
+        linear_to_srgb_channel(c.first().copied().unwrap_or(0.0)),
+        linear_to_srgb_channel(c.get(1).copied().unwrap_or(0.0)),
+        linear_to_srgb_channel(c.get(2).copied().unwrap_or(0.0)),
+        c.get(3).copied().unwrap_or(1.0),
+    ]
+}
+
 /// Boost an sRGB colour toward full brightness for the bold-bright foreground.
 ///
 /// Each channel is pushed 30 % of the way toward 1.0, so dim themes gain a
@@ -212,6 +227,22 @@ impl TerminalColors {
         }
 
         (fg, bg)
+    }
+
+    /// Resolve foreground and background colours for one cell in sRGB space,
+    /// ready to hand straight to GPUI.
+    ///
+    /// Identical rules to [`Self::resolve_cell_colors`] — the SGR semantics
+    /// live in exactly one place — with the result converted out of the linear
+    /// space the legacy wgpu pipeline needed.
+    pub fn resolve_cell_colors_srgb(
+        &self,
+        fg_color: Color,
+        bg_color: Color,
+        flags: Flags,
+    ) -> ([f32; 4], [f32; 4]) {
+        let (fg, bg) = self.resolve_cell_colors(fg_color, bg_color, flags);
+        (linear_to_srgb_rgba(fg), linear_to_srgb_rgba(bg))
     }
 
     /// Resolve an alacritty colour to RGBA floats, using sensible defaults for

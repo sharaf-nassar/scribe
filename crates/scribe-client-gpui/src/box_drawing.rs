@@ -19,6 +19,89 @@ pub const fn is_box_drawing(c: char) -> bool {
     )
 }
 
+/// One axis-aligned rectangle of the procedural mask, in mask pixel space.
+///
+/// The GPUI paint path cannot upload a per-cell RGBA texture the way the wgpu
+/// atlas did, so the mask is reduced to the smallest set of uniform-alpha
+/// rectangles that reproduces it exactly and each one is emitted as a paint
+/// quad. `alpha` is the mask coverage (255 for a solid stroke, 64/128/192 for
+/// the shade characters), which the caller multiplies into the cell's
+/// foreground colour — the same `mix(bg, fg, alpha)` the fragment shader did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaskQuad {
+    /// Left edge in mask pixels.
+    pub x: u32,
+    /// Top edge in mask pixels.
+    pub y: u32,
+    /// Width in mask pixels; always non-zero.
+    pub width: u32,
+    /// Height in mask pixels; always non-zero.
+    pub height: u32,
+    /// Mask coverage of every pixel in the rectangle.
+    pub alpha: u8,
+}
+
+/// Reduce a character's procedural mask to paint quads covering exactly its
+/// non-transparent pixels.
+///
+/// Returns `None` for characters [`render`] does not handle, so the caller
+/// falls back to the font. The rectangles are expressed in a `cell_w × cell_h`
+/// mask space; the caller scales them onto the real (fractional) cell rect so
+/// adjacent cells still tile edge to edge at any font size.
+pub fn mask_quads(c: char, cell_w: u32, cell_h: u32) -> Option<Vec<MaskQuad>> {
+    let (width, height, mask) = render(c, cell_w, cell_h)?;
+    Some(coalesce_mask(&mask, width, height))
+}
+
+/// Merge a mask's opaque pixels into rectangles: horizontal runs first, then
+/// vertically, so a full block collapses to one quad instead of `cell_h`.
+fn coalesce_mask(mask: &[u8], width: u32, height: u32) -> Vec<MaskQuad> {
+    let mut done: Vec<MaskQuad> = Vec::new();
+    // Rectangles still growing downward, keyed by their x span and alpha.
+    let mut open: Vec<MaskQuad> = Vec::new();
+    let mut next_open: Vec<MaskQuad> = Vec::new();
+
+    for y in 0..height {
+        let mut x = 0;
+        while x < width {
+            let alpha = alpha_at(mask, width, x, y);
+            if alpha == 0 {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            x += 1;
+            while x < width && alpha_at(mask, width, x, y) == alpha {
+                x += 1;
+            }
+            let run = MaskQuad { x: start, y, width: x - start, height: 1, alpha };
+            // Extend the rectangle directly above when it has the same span
+            // and coverage; otherwise start a new one on this row.
+            if let Some(index) = open.iter().position(|quad| {
+                quad.x == run.x && quad.width == run.width && quad.alpha == run.alpha
+            }) {
+                let mut grown = open.remove(index);
+                grown.height += 1;
+                next_open.push(grown);
+            } else {
+                next_open.push(run);
+            }
+        }
+        // Anything left in `open` had no matching run on this row, so it is
+        // finished; whatever survived moves on to the next row.
+        done.append(&mut open);
+        std::mem::swap(&mut open, &mut next_open);
+    }
+    done.append(&mut open);
+    done
+}
+
+/// Read the alpha channel of pixel `(col, row)` from an RGBA mask.
+fn alpha_at(mask: &[u8], stride: u32, col: u32, row: u32) -> u8 {
+    let index = ((row * stride + col) * 4 + 3) as usize;
+    mask.get(index).copied().unwrap_or(0)
+}
+
 /// Render a box-drawing or block-element character into an RGBA canvas.
 ///
 /// Returns `Some((width, height, rgba))` or `None` if the character is not
@@ -581,6 +664,59 @@ mod tests {
         assert!((0..ch).all(|row| alpha_at(&rgba, cw, cw - 1, row) == 0));
         let mid = cw / 2;
         assert!((0..ch).all(|row| alpha_at(&rgba, cw, mid, row) == 255));
+    }
+
+    /// The quad reduction reproduces the mask exactly: every opaque pixel is
+    /// covered once with its own alpha, and no transparent pixel is touched.
+    /// A full block collapses to a single rectangle rather than one per row,
+    /// which is what keeps a screen full of box drawing paintable as quads.
+    /// Rasterize `quads` into a flat alpha buffer, asserting no rectangle is
+    /// empty, transparent, or overlapping another.
+    fn rasterize_quads(quads: &[MaskQuad], cw: u32, ch: u32, label: char) -> Vec<u8> {
+        let mut painted = vec![0u8; (cw * ch) as usize];
+        for quad in quads {
+            assert!(quad.width > 0 && quad.height > 0, "{label:?} emitted an empty quad");
+            assert_ne!(quad.alpha, 0, "{label:?} emitted a transparent quad");
+            let pixels = (quad.y..quad.y + quad.height)
+                .flat_map(|row| (quad.x..quad.x + quad.width).map(move |col| (col, row)));
+            for (col, row) in pixels {
+                let index = (row * cw + col) as usize;
+                assert_eq!(painted[index], 0, "{label:?} covers ({col},{row}) twice");
+                painted[index] = quad.alpha;
+            }
+        }
+        painted
+    }
+
+    /// The quad reduction reproduces the mask exactly: every opaque pixel is
+    /// covered once with its own alpha, and no transparent pixel is touched.
+    /// A full block collapses to a single rectangle rather than one per row,
+    /// which is what keeps a screen full of box drawing paintable as quads.
+    // @lat: [[test#GPUI Client Headless Suites#Cell-accurate paint path#Box-drawing quads reproduce the mask]]
+    #[test]
+    fn mask_quads_reproduce_the_rasterized_mask() {
+        let (cw, ch) = (16, 16);
+        for c in
+            ['\u{2588}', '\u{2500}', '\u{2502}', '\u{253C}', '\u{2554}', '\u{2592}', '\u{2596}']
+        {
+            let (_, _, mask) = render(c, cw, ch).expect("rasterizes");
+            let quads = mask_quads(c, cw, ch).expect("reduces to quads");
+            let painted = rasterize_quads(&quads, cw, ch, c);
+            let expected: Vec<u8> = (0..ch)
+                .flat_map(|row| (0..cw).map(move |col| (col, row)))
+                .map(|(col, row)| alpha_at(&mask, cw, col, row))
+                .collect();
+            assert_eq!(painted, expected, "{c:?} quads differ from the rasterized mask");
+        }
+
+        // The full block is one edge-to-edge rectangle, so a solid run of them
+        // tiles without a seam and costs one quad per cell.
+        assert_eq!(
+            mask_quads('\u{2588}', 16, 16).expect("full block"),
+            vec![MaskQuad { x: 0, y: 0, width: 16, height: 16, alpha: 255 }]
+        );
+        // Characters the rasterizer does not handle fall through to the font.
+        assert!(mask_quads('A', 16, 16).is_none());
     }
 
     /// The lower-left quadrant (▖, U+2596) fills only that quadrant. Its
