@@ -12,6 +12,22 @@ The `context` field (`Option<u8>`) carries the AI tool's context-window fill per
 
 State transitions are owned by the per-provider hook adapters. Claude Code hooks report tool, notification, stop, and prompt-submit events through `dist/ai-hook-claude.sh`; Codex reports prompt, permission, tool, stop, and context events through `dist/ai-hook-codex.sh`. Each state-only event would otherwise carry `None` for `context`, `model`, `tool`, `agent`, and `conversation_id`, clobbering values set by an earlier same-provider event. [[crates/scribe-common/src/ai_state.rs#AiProcessState#merge_partial_from_previous]] carries those optional fields forward from the previously stored state when the new event leaves them unset and the provider matches, so a state-only hook firing between context refreshes does not erase the live percentage. Switching providers (e.g. Claude → Codex) skips the merge so cross-provider state does not bleed. The dedicated `ContextChanged` hook event applied by [[crates/scribe-server/src/ipc_server.rs#send_ai_context_change]] keeps the producer/state separation honest: a status-line refresh patches only the percentage and re-broadcasts the existing state, never replacing it.
 
+## AI Context Chrome
+
+Single source of truth for how a context-window fill percentage is spelled on screen, shared by every surface that displays one.
+
+Two surfaces show the percentage and they disagree on both shape and gating: the per-pane prompt bar draws a segmented meter (`▰▰▱ 72%`) in every band, while the tab label appends a bare suffix (` 72%`) only from the warn band up. [[crates/scribe-common/src/ai_chrome.rs#context_meter_label]] and [[crates/scribe-common/src/ai_chrome.rs#tab_context_suffix_text]] own those two strings and the suffix's gating, so the GPUI prompt bar ([[client#GPUI Prompt Bar]]), the GPUI tab bar ([[client#GPUI Titlebar#Context suffix bands and suppression]]), and the E2E harness that asserts on them ([[test#E2E Functional Tests#AI Indicator E2E]]) cannot drift apart.
+
+Only text is shared. Band colors stay with each surface because they resolve through different palettes — the prompt bar reads the configured [[common#Configuration#AI Context Thresholds]] hex colors while the tab bar uses its own fixed band colors.
+
+### Meter label fills and clamps
+
+Verifies [[crates/scribe-common/src/ai_chrome.rs#context_meter_label]] lights segments by `div_ceil` (any non-zero percentage fills at least one) and clamps above 100%.
+
+### Tab suffix is gated on the warn band
+
+Verifies [[crates/scribe-common/src/ai_chrome.rs#tab_context_suffix_text]] returns `None` below `warn` and while a pulsing attention state owns the UX, and the bare ` NN%` suffix otherwise.
+
 ## Configuration
 
 Unified TOML config for server and client, deserialized from the active install flavor's XDG config root into [[crates/scribe-common/src/config.rs#ScribeConfig]].

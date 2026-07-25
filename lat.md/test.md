@@ -138,11 +138,25 @@ Functional end-to-end tests that drive real sessions through the `scribe-test` h
 
 The `docker/Dockerfile.func` image bundles the workspace's `dist/shell-integration` tree at `/usr/local/share/scribe/shell-integration` so the in-container `scribe-server`'s [[crates/scribe-server/src/shell_integration.rs#find_scripts_dir]] resolves them and injects `SCRIBE_SHELL_INTEGRATION=1` plus the per-shell rcfile/ZDOTDIR/XDG plumbing into every spawned PTY. Without this copy, the `shell-integration.sh` e2e test never sees the env var or the OSC marks the integration scripts emit.
 
-### AI Context Thresholds E2E
+### AI Indicator E2E
+
+Two scripts covering the AI state indicator and its context-window percentage, both driving the [[server#Hook Channel]] rather than OSC 1337 and reading the result back through [[crates/scribe-test/src/capture.rs#ai_chrome]].
+
+Transport and readback are the two things these scripts get right that a naive version cannot. AI state, prompt text, and context % travel over the hook channel — OSC 1337 parsing for them was removed by spec 003 FR-022 — so the scripts run `scribe-hook-helper` inside the session shell, where the server exports `SCRIBE_HOOK_SOCK` and `SCRIBE_SESSION_ID`. Readback cannot use a screen snapshot: [[crates/scribe-test/src/capture.rs#snapshot]] returns the server's PTY grid, and the prompt bar and tab label are client chrome that never appears in it. `scribe-test ai-chrome` renders the session's live AI state through [[common#AI Context Chrome]] instead, emitting one `prompt-bar:` line whenever a percentage exists and one `tab:` line only from the warn band up.
+
+Both scripts park the shell in `read` after firing hook events. A returning shell prompt (OSC 133;A) tells the server the AI tool exited, and [[crates/scribe-server/src/ipc_server.rs#send_metadata_event]] then synthesizes an `AiStateCleared` that would wipe the state the helper just set. Parking the shell reproduces production, where hooks fire while the AI tool owns the foreground; releasing the parked shell is how each phase resets to a clean slate.
+
+#### AI Context Thresholds E2E
 
 Seven-phase test in `tests/e2e/func/ai-context-thresholds.sh` validating prompt-bar and tab inline % across all threshold bands for Claude and Codex.
 
-Claude phases emit `ClaudeState=processing;context=50/72/91` plus matching `ClaudePrompt=...` OSC payloads so the prompt bar is visible. Phase 1 asserts `50%` appears once in the prompt-bar cluster and Phase 4 confirms the tab inline is suppressed below `warn=70`; phases 2 and 3 assert Warn/Danger values appear at least twice (prompt bar + tab inline). Codex phases repeat the same provider-symmetric checks with `CodexState`/`CodexPrompt` at 51/73/92.
+Claude phases set `processing` plus a prompt and a context refresh of 50/72/91. Phase 1 asserts `50%` renders on exactly one chrome surface and Phase 4 reads that as the tab inline being suppressed below `warn=70`; phases 2 and 3 assert the Warn/Danger values render on two surfaces (prompt bar + tab inline). Codex phases repeat the same provider-symmetric checks at 51/73/92.
+
+#### AI State Indicator E2E
+
+Seven-phase test in `tests/e2e/func/ai-state-indicator.sh` covering the state machine end of the same channel.
+
+It cycles all five `AiState` variants without corrupting the grid, asserts a context refresh of 42 reaches the AI chrome, confirms a legacy OSC 1337 payload is still consumed silently with the text on either side of it preserved, drives rapid transitions without deadlock, asserts `state_cleared` empties the chrome, and closes a session while an AI state is active.
 
 ### Session Lifecycle E2E
 
