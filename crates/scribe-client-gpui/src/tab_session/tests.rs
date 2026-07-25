@@ -17,7 +17,7 @@ fn strip(count: usize) -> (TabSessions, WorkspaceId, Vec<SessionId>) {
     let entries = ids
         .iter()
         .enumerate()
-        .map(|(i, id)| TabEntry { session_id: *id, workspace_id, title: format!("shell{i}") })
+        .map(|(i, id)| TabEntry::new(*id, workspace_id, format!("shell{i}")))
         .collect();
     tabs.replace_all(entries);
     (tabs, workspace_id, ids)
@@ -30,11 +30,7 @@ fn new_tab_appends_and_focuses() {
     assert_eq!(tabs.active_session(), Some(ids[0]));
 
     let created = SessionId::new();
-    let added = tabs.insert_active(TabEntry {
-        session_id: created,
-        workspace_id,
-        title: "shell".to_owned(),
-    });
+    let added = tabs.insert_active(TabEntry::new(created, workspace_id, "shell".to_owned()));
 
     assert!(added);
     assert_eq!(tabs.len(), 2);
@@ -55,7 +51,7 @@ fn attach_acknowledgement_is_not_a_new_tab() {
     let (mut tabs, workspace_id, ids) = strip(2);
     tabs.select(0);
 
-    let echo = TabEntry { session_id: ids[1], workspace_id, title: "shell1".to_owned() };
+    let echo = TabEntry::new(ids[1], workspace_id, "shell1".to_owned());
     assert!(!tabs.insert_active(echo), "a re-announced session is not a new tab");
 
     assert_eq!(tabs.len(), 2, "a duplicate SessionCreated must not add a tab");
@@ -117,15 +113,15 @@ fn session_list_rebuild_preserves_active_session() {
 
     // A reconnect re-lists the same sessions in a different order.
     let reordered = vec![
-        TabEntry { session_id: ids[2], workspace_id, title: "shell2".to_owned() },
-        TabEntry { session_id: ids[1], workspace_id, title: "shell1".to_owned() },
-        TabEntry { session_id: ids[0], workspace_id, title: "shell0".to_owned() },
+        TabEntry::new(ids[2], workspace_id, "shell2".to_owned()),
+        TabEntry::new(ids[1], workspace_id, "shell1".to_owned()),
+        TabEntry::new(ids[0], workspace_id, "shell0".to_owned()),
     ];
     assert_eq!(tabs.replace_all(reordered), Some(ids[1]));
     assert_eq!(tabs.active_session(), Some(ids[1]));
 
     // When the active session is gone the strip falls back to the first tab.
-    let survivors = vec![TabEntry { session_id: ids[0], workspace_id, title: "shell0".to_owned() }];
+    let survivors = vec![TabEntry::new(ids[0], workspace_id, "shell0".to_owned())];
     assert_eq!(tabs.replace_all(survivors), Some(ids[0]));
 }
 
@@ -133,6 +129,32 @@ fn session_list_rebuild_preserves_active_session() {
 fn new_tab_targets_the_active_workspace() {
     let (tabs, workspace_id, _) = strip(2);
     assert_eq!(tabs.active_workspace(), Some(workspace_id));
+}
+
+// @lat: [[test#GPUI Client Headless Suites#GPUI tab task labels]]
+#[test]
+fn task_label_outranks_the_title_until_cleared() {
+    let (mut tabs, _, ids) = strip(2);
+    assert!(tabs.set_title(ids[0], "zsh".to_owned()));
+
+    assert!(tabs.set_task_label(ids[0], Some("Ship the tab labels")));
+    assert_eq!(tabs.to_tab_data()[0].title, "Ship the tab labels");
+    assert_eq!(tabs.to_tab_data()[1].title, "shell1", "siblings are untouched");
+    assert!(!tabs.set_task_label(ids[0], Some("Ship the tab labels")), "identical is no change");
+
+    // A title arriving mid-task is stored but stays behind the label.
+    assert!(tabs.set_title(ids[0], "bash".to_owned()));
+    assert_eq!(tabs.to_tab_data()[0].title, "Ship the tab labels");
+
+    // A blank label is the provider clearing it, never a blank tab.
+    assert!(tabs.set_task_label(ids[0], Some("   ")));
+    assert_eq!(tabs.to_tab_data()[0].title, "bash");
+
+    assert!(tabs.set_task_label(ids[0], Some("Second task")));
+    assert!(tabs.set_task_label(ids[0], None));
+    assert_eq!(tabs.to_tab_data()[0].title, "bash");
+    assert!(!tabs.set_task_label(ids[0], None), "already cleared is no change");
+    assert!(!tabs.set_task_label(SessionId::new(), Some("ghost")));
 }
 
 #[test]

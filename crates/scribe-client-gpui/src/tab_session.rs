@@ -25,6 +25,28 @@ pub struct TabEntry {
     pub workspace_id: WorkspaceId,
     /// Tab label (shell basename, or the session title once one arrives).
     pub title: String,
+    /// Provider task label, set while an AI tool is working on a named task.
+    /// It outranks `title` in the rendered strip and is dropped again when the
+    /// provider clears it.
+    pub task_label: Option<String>,
+}
+
+impl TabEntry {
+    /// A tab with no provider task label yet.
+    #[must_use]
+    pub fn new(session_id: SessionId, workspace_id: WorkspaceId, title: String) -> Self {
+        Self { session_id, workspace_id, title, task_label: None }
+    }
+
+    /// The label the strip renders: the provider task label while one is
+    /// active, otherwise the session title.
+    ///
+    /// Mirrors the winit client's `Pane::preferred_tab_title` so a pane's label
+    /// does not change meaning across the cutover.
+    #[must_use]
+    pub fn display_title(&self) -> &str {
+        self.task_label.as_deref().unwrap_or(&self.title)
+    }
 }
 
 /// Ordered tab strip plus the index of the active tab.
@@ -167,6 +189,23 @@ impl TabSessions {
         true
     }
 
+    /// Set or clear a session's provider task label, returning `true` when the
+    /// strip changed.
+    ///
+    /// A blank label is treated as no label at all, matching the winit client's
+    /// rule that a provider must not be able to blank a tab down to nothing.
+    pub fn set_task_label(&mut self, session_id: SessionId, label: Option<&str>) -> bool {
+        let label = label.map(str::trim).filter(|label| !label.is_empty());
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.session_id == session_id) else {
+            return false;
+        };
+        if tab.task_label.as_deref() == label {
+            return false;
+        }
+        tab.task_label = label.map(ToOwned::to_owned);
+        true
+    }
+
     /// Lower the strip into the titlebar's render model.
     #[must_use]
     pub fn to_tab_data(&self) -> Vec<TabData> {
@@ -174,7 +213,7 @@ impl TabSessions {
             .iter()
             .enumerate()
             .map(|(index, tab)| {
-                let mut data = TabData::new(tab.title.clone());
+                let mut data = TabData::new(tab.display_title().to_owned());
                 data.is_active = index == self.active;
                 data
             })

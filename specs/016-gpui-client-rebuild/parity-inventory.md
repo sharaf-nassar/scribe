@@ -147,10 +147,10 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `CwdChanged` | tab metadata | scripted-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_cwd` → `StatusBarData.cwd` | required |
 | `SessionContextChanged` | session metadata | scripted-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_context` → `SessionChrome::host_label` / `SessionChrome::tmux_label` | required |
 | `TitleChanged` | tab title | visual-E2E | `main.rs::on_chrome_message` arm → `TabSessions::set_title` | required |
-| `CodexTaskLabelChanged` | Codex tab label | visual-E2E | — (missing, FU-3) | required |
-| `CodexTaskLabelCleared` | Codex tab label | visual-E2E | — (missing, FU-3) | required |
-| `TaskLabelChanged` | AI tab label | visual-E2E | — (missing, FU-3) | required |
-| `TaskLabelCleared` | AI tab label | visual-E2E | — (missing, FU-3) | required |
+| `CodexTaskLabelChanged` | Codex tab label | visual-E2E | `main.rs::on_task_label_message` arm → `TabSessions::set_task_label` → `TabEntry::display_title` | required |
+| `CodexTaskLabelCleared` | Codex tab label | visual-E2E | `main.rs::on_task_label_message` arm → `TabSessions::set_task_label` → `TabEntry::display_title` | required |
+| `TaskLabelChanged` | AI tab label | visual-E2E | `main.rs::on_task_label_message` arm → `TabSessions::set_task_label` → `TabEntry::display_title` | required |
+| `TaskLabelCleared` | AI tab label | visual-E2E | `main.rs::on_task_label_message` arm → `TabSessions::set_task_label` → `TabEntry::display_title` | required |
 | `PromptReceived` | prompt history | scripted-E2E | `main.rs::run_reader` arm → `AiChrome::record_prompt` | required |
 | `WorkspaceNamed` | workspace chrome | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::name_workspace` → `StatusBarData.workspace_name` | required |
 | `SessionCreated` | pane lifecycle | scripted-E2E | `main.rs::run_reader` arm → `main.rs::open_created_tab` | required |
@@ -199,8 +199,9 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `ControlDenied` | requester control-denied notice | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::deny` | required |
 | `ShareEnded` | shared-viewer end landing and state cleanup | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::end` | required |
 
-**Reachability:** 18 of 59 rows name a live-path symbol; 11 are unwired and 30
-are missing.
+**Reachability:** 30 of 59 rows name a live-path symbol; 11 are unwired and 18
+are missing. (Recounted from the table above after the task-label rows landed;
+the audit's original figures were 18 / 11 / 30.)
 
 ## Input and keybinding checklist (54 named actions)
 

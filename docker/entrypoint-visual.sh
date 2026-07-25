@@ -63,6 +63,10 @@ sleep 0.6
 UID_DIR="/run/user/$(id -u)/scribe"
 mkdir -p "$UID_DIR"
 chmod 700 "$UID_DIR"
+# Exported so a test can address the server socket directly — that path is also
+# the AI hook channel's endpoint (`SCRIBE_HOOK_SOCK`), which is how a scripted
+# provider event reaches the server without going through the test daemon.
+export SCRIBE_RUNTIME_DIR="$UID_DIR"
 
 prepare_xdg_dirs
 export PATH="/tests/bin:$PATH"

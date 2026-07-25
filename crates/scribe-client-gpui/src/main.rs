@@ -2458,27 +2458,12 @@ fn dispatch_server_message(
             let dropped = registry.on_trim_scrollback(session_id, history_rows);
             tracing::trace!(%session_id, dropped, "trimmed scrollback marks");
         }
-        ServerMessage::PtyOutput { session_id, data } => {
-            if Some(session_id) == attached {
-                // Perf gate: count drained bytes and close the echo round-trip
-                // clock before the frame queue takes ownership of the payload.
-                scribe_common::perf_probe::record_pty_output(data.len());
-                forward_output(&ctx.in_tx, session_id, data);
-            }
-        }
-        ServerMessage::SessionReplay { session_id, replay } => {
-            if Some(session_id) == attached {
-                forward_replay(ctx, session_id, &replay);
-            }
-        }
-        ServerMessage::ScreenSnapshot { session_id, snapshot } => {
-            if Some(session_id) == attached {
-                // Reset before replaying so the tooling snapshot replaces,
-                // never appends onto, the pane's current content.
-                let bytes = session_lifecycle::snapshot_reset_bytes(&snapshot);
-                forward_output(&ctx.in_tx, session_id, bytes);
-            }
-        }
+        // The three pane-content variants are all gated on the attached pane
+        // and all end in the frame queue, so they are named here and routed as
+        // one to [`on_pane_output_message`].
+        output @ (ServerMessage::PtyOutput { .. }
+        | ServerMessage::SessionReplay { .. }
+        | ServerMessage::ScreenSnapshot { .. }) => on_pane_output_message(ctx, output, attached),
         // The terminal-chrome family all lands in the same two stores (the tab
         // strip's labels and the shared metadata), so it is named here and
         // routed as one to [`on_chrome_message`].
@@ -2488,6 +2473,14 @@ fn dispatch_server_message(
         | ServerMessage::SessionContextChanged { .. }
         | ServerMessage::EnvStatus { .. }
         | ServerMessage::WorkspaceNamed { .. }) => on_chrome_message(ctx, chrome),
+        // The four provider task-label notices all land in the tab strip's
+        // label column, so they are named here and routed as one to
+        // [`on_task_label_message`]. Naming them is what keeps an AI tab's
+        // label live: unnamed, they reach the drop counter below.
+        label @ (ServerMessage::TaskLabelChanged { .. }
+        | ServerMessage::TaskLabelCleared { .. }
+        | ServerMessage::CodexTaskLabelChanged { .. }
+        | ServerMessage::CodexTaskLabelCleared { .. }) => on_task_label_message(ctx, label),
         // Both update broadcasts land in the same shared state behind the
         // centred status-bar CTA, so they are named here and routed as one to
         // [`on_update_message`].
@@ -2548,6 +2541,93 @@ fn on_chrome_message(ctx: &ReaderCtx, message: ServerMessage) {
         // Unreachable: the caller only routes the chrome family here.
         other => unhandled_server_message(&other),
     }
+}
+
+/// Forward one pane-content message into the frame queue.
+///
+/// All three variants are session-scoped, so each gates on `attached` inside
+/// this function rather than in a match guard: a frame for a background pane
+/// stays a deliberate no-op instead of being reported as an unhandled message.
+///
+/// Anything other than the pane-content family is a programming error in
+/// [`dispatch_server_message`]'s routing, not a protocol event, so it is
+/// counted as unhandled rather than silently dropped.
+fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage, attached: Option<SessionId>) {
+    match message {
+        ServerMessage::PtyOutput { session_id, data } => {
+            if Some(session_id) == attached {
+                // Perf gate: count drained bytes and close the echo round-trip
+                // clock before the frame queue takes ownership of the payload.
+                scribe_common::perf_probe::record_pty_output(data.len());
+                forward_output(&ctx.in_tx, session_id, data);
+            }
+        }
+        ServerMessage::SessionReplay { session_id, replay } => {
+            if Some(session_id) == attached {
+                forward_replay(ctx, session_id, &replay);
+            }
+        }
+        ServerMessage::ScreenSnapshot { session_id, snapshot } => {
+            if Some(session_id) == attached {
+                // Reset before replaying so the tooling snapshot replaces,
+                // never appends onto, the pane's current content.
+                let bytes = session_lifecycle::snapshot_reset_bytes(&snapshot);
+                forward_output(&ctx.in_tx, session_id, bytes);
+            }
+        }
+        // Unreachable: the caller only routes the pane-content family here.
+        other => unhandled_server_message(&other),
+    }
+}
+
+/// Fold one provider task-label notice onto the tab strip.
+///
+/// While an AI tool is working on a named task the server pushes that task's
+/// label as the pane's preferred tab title and clears it again when the tool
+/// stops, exactly as the winit client's `handle_task_label_changed` /
+/// `handle_task_label_cleared` pair did. `CodexTaskLabelChanged` /
+/// `CodexTaskLabelCleared` are the pre-provider wire spelling the server still
+/// emits for Codex sessions, so they carry the same meaning with the provider
+/// implied.
+///
+/// The provider only identifies who set the label — one label per session wins,
+/// so a clear from any provider drops it, matching the legacy client.
+///
+/// Anything other than the four label variants is a programming error in
+/// [`dispatch_server_message`]'s routing, not a protocol event, so it is
+/// counted as unhandled rather than silently dropped.
+fn on_task_label_message(ctx: &ReaderCtx, message: ServerMessage) {
+    let (session_id, provider, label) = match message {
+        ServerMessage::TaskLabelChanged { session_id, provider, task_label } => {
+            (session_id, provider, Some(task_label))
+        }
+        ServerMessage::TaskLabelCleared { session_id, provider } => (session_id, provider, None),
+        ServerMessage::CodexTaskLabelChanged { session_id, task_label } => {
+            (session_id, AiProvider::CodexCode, Some(task_label))
+        }
+        ServerMessage::CodexTaskLabelCleared { session_id } => {
+            (session_id, AiProvider::CodexCode, None)
+        }
+        // Unreachable: the caller only routes the four label variants here.
+        other => {
+            unhandled_server_message(&other);
+            return;
+        }
+    };
+    let changed =
+        ctx.tabs.lock().is_ok_and(|mut tabs| tabs.set_task_label(session_id, label.as_deref()));
+    if changed {
+        ctx.generation.fetch_add(1, Ordering::Release);
+    }
+    // The tab strip is pixels only, so log the transition: a scripted E2E can
+    // then prove the label reached the strip and not just the socket.
+    tracing::info!(
+        %session_id,
+        ?provider,
+        label = label.as_deref().unwrap_or(""),
+        changed,
+        "tab task label updated"
+    );
 }
 
 /// Fold one update broadcast onto the state the centred status-bar CTA renders
@@ -2617,7 +2697,7 @@ fn open_created_tab(
     workspace_id: WorkspaceId,
     shell_name: String,
 ) -> Result<(), String> {
-    let entry = TabEntry { session_id, workspace_id, title: shell_name };
+    let entry = TabEntry::new(session_id, workspace_id, shell_name);
     let added = ctx.tabs.lock().is_ok_and(|mut tabs| tabs.insert_active(entry));
     if added {
         attach_session(ctx, session_id)?;
@@ -2667,13 +2747,20 @@ fn sync_tab_strip(
 /// Lower a server [`SessionInfo`] into a tab strip entry.
 ///
 /// The label prefers the session's live terminal title (OSC 0/2) and falls back
-/// to the shell basename, matching what the legacy tab bar rendered.
+/// to the shell basename, matching what the legacy tab bar rendered. A session
+/// that is mid-task when the list arrives also replays its provider task label,
+/// so a reattach restores the AI tab's name instead of waiting for the provider
+/// to emit the next one.
 fn tab_entry_for(info: &SessionInfo) -> TabEntry {
-    TabEntry {
-        session_id: info.session_id,
-        workspace_id: info.workspace_id,
-        title: info.title.clone().unwrap_or_else(|| info.shell_name.clone()),
-    }
+    let mut entry = TabEntry::new(
+        info.session_id,
+        info.workspace_id,
+        info.title.clone().unwrap_or_else(|| info.shell_name.clone()),
+    );
+    let label = info.task_label.as_deref().or(info.codex_task_label.as_deref());
+    entry.task_label =
+        label.map(str::trim).filter(|label| !label.is_empty()).map(ToOwned::to_owned);
+    entry
 }
 
 /// Attach `session_id` and make it the pane the view renders and types into.

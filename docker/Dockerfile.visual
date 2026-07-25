@@ -53,12 +53,17 @@ ENV SCRIBE_DISABLE_ANIMATIONS=1
 COPY target/release/scribe-server /usr/local/bin/scribe-server
 COPY target/release/scribe-client-gpui /usr/local/bin/scribe-client-gpui
 COPY target/release/scribe-test /usr/local/bin/scribe-test
+# The AI hook channel is the only way a provider event (task label, state,
+# context %) reaches the server, so a visual test that needs one drives the real
+# helper instead of hand-forging a frame.
+COPY target/release/scribe-hook-helper /usr/local/bin/scribe-hook-helper
 COPY docker/entrypoint-visual.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh \
     /usr/local/bin/scribe-server \
     /usr/local/bin/scribe-client-gpui \
-    /usr/local/bin/scribe-test
+    /usr/local/bin/scribe-test \
+    /usr/local/bin/scribe-hook-helper
 
 RUN mkdir -p /output
 
