@@ -20,7 +20,8 @@ use std::{
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
     Pixels, Point, Render, Size, Subscription, Task, TitlebarOptions, WeakEntity, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, div, prelude::*, px, relative, size,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, canvas, div, prelude::*, px, relative,
+    size,
 };
 use gpui_platform::application;
 use scribe_client_gpui::ai_indicator::AiStateTracker;
@@ -374,6 +375,15 @@ struct TerminalView {
     /// Where the terminal grid was painted last frame, filled in by the grid
     /// canvas so a pointer position can be lowered onto a cell.
     grid_bounds: GridBounds,
+    /// Pixel rect of the whole grid *area* — every pane plus the dividers
+    /// between them — as of the last painted frame, recorded by the measuring
+    /// canvas in [`Self::render_grid`]. This is what a pane's cell count is
+    /// divided out of, so a font change re-lays the grid into the window it
+    /// actually has instead of a box derived from the font itself.
+    grid_area: GridBounds,
+    /// Grid-area size the pane geometry was last published for, so a window
+    /// resize (or a chrome band appearing) republishes exactly once.
+    published_grid_area: Option<(f32, f32)>,
     /// Theme-derived prompt-bar palette, resolved once at view creation.
     prompt_colors: PromptBarColors,
     /// Warn/danger bands and per-band colours for the AI context-window meter.
@@ -557,6 +567,8 @@ impl TerminalView {
             smart_selection,
             split_scroll: SplitScrollState::new(),
             grid_bounds: GridBounds::default(),
+            grid_area: GridBounds::default(),
+            published_grid_area: None,
             prompt_colors,
             context_thresholds,
             prompt_bar_enabled,
@@ -1407,21 +1419,52 @@ impl TerminalView {
         tracing::info!("opened a new terminal window");
     }
 
-    /// The grid area expressed in the window's nominal cell metrics.
+    /// The grid area every pane rect is resolved against, in real pixels.
     ///
-    /// Pane geometry is resolved against this rather than against real device
-    /// pixels: the paint path positions every pane as a *fraction* of the grid
-    /// area, so the only thing the layout has to agree on is proportions, and
-    /// the per-pane `Resize` needs exactly the cell counts this viewport
-    /// yields. It follows a live `appearance.font_size` edit for free, because
-    /// both axes are derived from the current [`GridFont`].
+    /// The paint path positions each pane as a *fraction* of this rect, so the
+    /// layout only ever needs proportions — but the per-pane `Resize` divides
+    /// the rect by the live cell box, which makes the units matter: measured in
+    /// the font's own cells, a zoom step would move both the numerator and the
+    /// denominator and the server would be told the same `cols`x`rows` at every
+    /// font size, leaving the freed pixels dead. The measured area is therefore
+    /// the source of truth, and a zoom (or any window resize) re-lays the grid
+    /// into the window it actually has.
+    ///
+    /// The fallback is the nominal [`COLUMNS`]x[`ROWS`] box at the current
+    /// metrics, which is exactly the size [`startup_window_size`] opens the
+    /// window at — it stands in only for the frames before the grid canvas has
+    /// reported its bounds for the first time.
     fn pane_viewport(&self) -> Rect {
+        if let Some(bounds) = self.grid_area.get() {
+            let width = f32::from(bounds.size.width);
+            let height = f32::from(bounds.size.height);
+            if width > 0.0 && height > 0.0 {
+                return Rect { x: 0.0, y: 0.0, width, height };
+            }
+        }
         Rect {
             x: 0.0,
             y: 0.0,
             width: self.font.cell_width() * f32::from(COLUMNS),
             height: self.font.line_height * f32::from(ROWS),
         }
+    }
+
+    /// Republish the pane geometry when the measured grid area changed.
+    ///
+    /// The area is reported by the paint pass, so it lands one frame after the
+    /// change that caused it — a window resize, a chrome band appearing, or the
+    /// very first frame. Publishing from here (rather than from the canvas
+    /// closure, which runs mid-paint) keeps every `Resize` on the render path
+    /// the rest of the pane geometry already goes out on.
+    fn sync_grid_geometry(&mut self, cx: &mut Context<Self>) {
+        let viewport = self.pane_viewport();
+        let measured = (viewport.width, viewport.height);
+        if self.published_grid_area == Some(measured) {
+            return;
+        }
+        self.published_grid_area = Some(measured);
+        self.publish_pane_sizes(cx);
     }
 
     /// Split the focused pane and ask the server for the session it will host.
@@ -3109,10 +3152,21 @@ impl TerminalView {
     fn render_grid(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let focused = self.sync_split_scroll();
         let panes = self.render_panes(focused, cx);
+        // Measure the flex-grown grid band. Its height is whatever the chrome
+        // bands leave over, which no arithmetic on the window size can predict
+        // (the prompt strip comes and goes with the pane's prompts), so the
+        // painted rect is the only honest source for the cell counts the server
+        // is told about.
+        let area = Rc::clone(&self.grid_area);
         div()
             .flex_1()
             .relative()
             .bg(surface(self.terminal_colors.background, self.opacity))
+            .child(
+                canvas(move |bounds, _window, _cx| area.set(Some(bounds)), |_, (), _, _| {})
+                    .absolute()
+                    .size_full(),
+            )
             .children(panes)
             .on_mouse_down(
                 MouseButton::Left,
@@ -3171,6 +3225,7 @@ impl Render for TerminalView {
         self.sync_tabs(cx);
         self.sync_find_results(cx);
         self.reconcile_panes(cx);
+        self.sync_grid_geometry(cx);
         let grid = self.render_grid(cx);
         let status = self
             .shared

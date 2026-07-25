@@ -181,6 +181,13 @@ e2e-visual-chrome-bands:
 e2e-visual-terminal-viewport:
     docker run --rm --gpus all -e TEST_TIMEOUT=240 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_EXTRA_CONFIG="$(cat tests/e2e/visual/terminal-viewport-config.toml)" -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/terminal-viewport.sh
 
+# Run the terminal-zoom E2E: the three zoom chords against the real window, with
+# the wire tap recording the `Resize` each font rescale republishes. Needs the
+# shared-pane rig (so `scribe-test` seeds the very pane being measured) and
+# SCRIBE_SHARE_TAP=1 for the on-the-wire half.
+e2e-visual-terminal-zoom:
+    docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/terminal-zoom.sh
+
 # Run the AI task-label visual E2E. It relaunches the client to adopt the
 # harness session before it can assert anything, so it needs more than the
 # default 60 s budget.
