@@ -3,7 +3,10 @@
 //!
 //! Inbound: server output events arrive on an mpsc channel and are drained with
 //! Zed-style 4 ms / 100-event coalescing. Per-pane output is collapsed so each
-//! batch runs one `write_output` and one repaint per dirty pane. Outbound:
+//! batch runs one `write_output` and one repaint per dirty pane. The positional
+//! events interleaved with that output — OSC 133 prompt marks and the
+//! suppressed-ED-3 viewport snap — ride the same channel so they keep their
+//! place in the pane's byte stream instead of racing it. Outbound:
 //! [`IpcSink`] replaces Zed's `write_to_pty`, enqueuing `ClientMessage::KeyInput`,
 //! `Resize`, the session-lifecycle messages the tab shortcuts drive
 //! (`CreateSession` / `AttachSessions` / `Subscribe` / `RequestSnapshot` /
@@ -27,7 +30,7 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 use scribe_client_gpui::share::ControlIntent;
 use scribe_common::{
     ids::{SessionId, WindowId, WorkspaceId},
-    protocol::{ClientMessage, TerminalSize, WorkspaceNotesMutation},
+    protocol::{ClientMessage, PromptMarkKind, TerminalSize, WorkspaceNotesMutation},
 };
 use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
@@ -43,21 +46,48 @@ pub const MAX_BATCH_EVENTS: usize = 100;
 pub const BATCH_WINDOW: Duration = Duration::from_millis(4);
 
 /// One inbound event handed to the drain. Every server message that mutates a
-/// pane's terminal state is normalised to raw output bytes before it enters the
-/// channel, so replay decompression and snapshot-to-ANSI conversion happen off
-/// the drain and coalescing only ever concatenates bytes.
+/// pane's terminal state is normalised before it enters the channel, so replay
+/// decompression and snapshot-to-ANSI conversion happen off the drain and
+/// coalescing only ever concatenates bytes.
+///
+/// The two non-output variants are here rather than applied straight from the
+/// reader because both are *positional*: an OSC 133 mark names the row the
+/// cursor is on and a suppressed-ED-3 `ScrollBottom` names the moment the
+/// viewport must snap. The server emits each of them after the `PtyOutput`
+/// chunk that moved the cursor, and the reader forwards messages in arrival
+/// order, so routing them down the same FIFO is what makes them land against a
+/// grid that already holds the output they describe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundEvent {
     /// Output bytes destined for the named pane's `write_output`.
     PaneOutput { session_id: SessionId, bytes: Vec<u8> },
+    /// An OSC 133 prompt mark for the named pane. The wire message's
+    /// `click_events` flag is dropped at the reader: click-to-move has no
+    /// surface in this client, so carrying it here would be dead state.
+    PromptMark { session_id: SessionId, kind: PromptMarkKind, exit_code: Option<i32> },
+    /// The server suppressed an ED 3 for the named pane, so its viewport must
+    /// snap to the live bottom the way a real ED 3 would have left it.
+    ScrollBottom { session_id: SessionId },
 }
 
-/// A drained, per-pane-collapsed batch of output. Panes appear in first-seen
-/// order and each pane's bytes are concatenated in arrival order, so applying
-/// the batch is exactly one `write_output` and one repaint per dirty pane.
+/// One operation a drained batch applies to a pane, in arrival order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneOp {
+    /// Concatenated output bytes for one `write_output`.
+    Output(Vec<u8>),
+    /// An OSC 133 mark to anchor against the grid as it stands after every
+    /// preceding [`PaneOp::Output`] in this batch.
+    PromptMark { kind: PromptMarkKind, exit_code: Option<i32> },
+    /// Snap the pane's viewport to the live bottom.
+    ScrollBottom,
+}
+
+/// A drained, per-pane-collapsed batch. A pane's consecutive output runs are
+/// concatenated so applying the batch is one `write_output` per run, and the
+/// positional events that interrupt a run keep their place in it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CoalescedBatch {
-    entries: Vec<(SessionId, Vec<u8>)>,
+    entries: Vec<(SessionId, PaneOp)>,
 }
 
 impl CoalescedBatch {
@@ -67,56 +97,65 @@ impl CoalescedBatch {
         self.entries.is_empty()
     }
 
-    /// Iterates dirty panes in first-seen order with their concatenated bytes.
-    pub fn iter(&self) -> impl Iterator<Item = (SessionId, &[u8])> {
-        self.entries.iter().map(|(id, bytes)| (*id, bytes.as_slice()))
+    /// Iterates the batch's operations in apply order.
+    pub fn iter(&self) -> impl Iterator<Item = (SessionId, &PaneOp)> {
+        self.entries.iter().map(|(id, op)| (*id, op))
     }
 }
 
 impl IntoIterator for CoalescedBatch {
-    type Item = (SessionId, Vec<u8>);
-    type IntoIter = std::vec::IntoIter<(SessionId, Vec<u8>)>;
+    type Item = (SessionId, PaneOp);
+    type IntoIter = std::vec::IntoIter<(SessionId, PaneOp)>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.entries.into_iter()
     }
 }
 
-/// Collapses a drained run of events into per-pane concatenated output.
+/// Collapses a drained run of events into per-pane operations.
 ///
-/// Panes keep first-seen order and each pane's bytes are appended in arrival
-/// order, so no output is reordered within a pane and redundant per-pane
-/// wakeups collapse to a single entry.
+/// Output for a pane is appended to that pane's open entry, so an all-output
+/// batch still collapses to exactly one entry per pane in first-seen order. A
+/// positional event closes the pane's open entry: output that arrives after a
+/// prompt mark starts a fresh run, which is what keeps the mark anchored
+/// between the bytes that preceded it and the bytes that followed.
 #[must_use]
 pub fn coalesce(events: impl IntoIterator<Item = InboundEvent>) -> CoalescedBatch {
-    let mut index: HashMap<SessionId, usize> = HashMap::new();
-    let mut entries: Vec<(SessionId, Vec<u8>)> = Vec::new();
+    let mut open: HashMap<SessionId, usize> = HashMap::new();
+    let mut entries: Vec<(SessionId, PaneOp)> = Vec::new();
     for event in events {
         match event {
             InboundEvent::PaneOutput { session_id, bytes } => {
-                append_pane_output(&mut index, &mut entries, session_id, bytes);
+                append_pane_output(&mut open, &mut entries, session_id, bytes);
+            }
+            InboundEvent::PromptMark { session_id, kind, exit_code } => {
+                open.remove(&session_id);
+                entries.push((session_id, PaneOp::PromptMark { kind, exit_code }));
+            }
+            InboundEvent::ScrollBottom { session_id } => {
+                open.remove(&session_id);
+                entries.push((session_id, PaneOp::ScrollBottom));
             }
         }
     }
     CoalescedBatch { entries }
 }
 
-/// Appends `bytes` to `session_id`'s buffer, extending an existing entry or
-/// starting a new one in first-seen order.
+/// Appends `bytes` to `session_id`'s open output entry, or starts a new one.
 fn append_pane_output(
-    index: &mut HashMap<SessionId, usize>,
-    entries: &mut Vec<(SessionId, Vec<u8>)>,
+    open: &mut HashMap<SessionId, usize>,
+    entries: &mut Vec<(SessionId, PaneOp)>,
     session_id: SessionId,
     bytes: Vec<u8>,
 ) {
-    if let Some(&slot) = index.get(&session_id) {
-        if let Some((_, buffered)) = entries.get_mut(slot) {
-            buffered.extend_from_slice(&bytes);
-        }
+    if let Some(&slot) = open.get(&session_id)
+        && let Some((_, PaneOp::Output(buffered))) = entries.get_mut(slot)
+    {
+        buffered.extend_from_slice(&bytes);
         return;
     }
-    index.insert(session_id, entries.len());
-    entries.push((session_id, bytes));
+    open.insert(session_id, entries.len());
+    entries.push((session_id, PaneOp::Output(bytes)));
 }
 
 /// Drains `rx` with 4 ms / 100-event coalescing, invoking `apply` once per
@@ -493,7 +532,15 @@ mod tests {
 
     fn push_batch(recorded: &RecordedBatches, batch: CoalescedBatch) {
         if let Ok(mut guard) = recorded.lock() {
-            guard.push(batch.into_iter().collect());
+            guard.push(
+                batch
+                    .into_iter()
+                    .filter_map(|(id, op)| match op {
+                        PaneOp::Output(bytes) => Some((id, bytes)),
+                        PaneOp::PromptMark { .. } | PaneOp::ScrollBottom => None,
+                    })
+                    .collect(),
+            );
         }
     }
 
@@ -567,9 +614,44 @@ mod tests {
 
         assert!(!batch.is_empty());
         assert!(coalesce(std::iter::empty()).is_empty());
-        let collected: Vec<(SessionId, Vec<u8>)> =
-            batch.iter().map(|(id, bytes)| (id, bytes.to_vec())).collect();
-        assert_eq!(collected, vec![(first, b"123".to_vec()), (second, b"xy".to_vec())]);
+        assert_eq!(
+            batch.into_iter().collect::<Vec<_>>(),
+            vec![
+                (first, PaneOp::Output(b"123".to_vec())),
+                (second, PaneOp::Output(b"xy".to_vec())),
+            ]
+        );
+    }
+
+    // @lat: [[test#GPUI IPC Bridge#Prompt marks split a pane's output run]]
+    #[test]
+    fn coalesce_keeps_positional_events_between_output_runs() {
+        let pane = SessionId::new();
+        let other = SessionId::new();
+        let batch = coalesce([
+            output(pane, b"before"),
+            output(other, b"bg"),
+            InboundEvent::PromptMark {
+                session_id: pane,
+                kind: PromptMarkKind::PromptStart,
+                exit_code: None,
+            },
+            output(pane, b"after"),
+            InboundEvent::ScrollBottom { session_id: pane },
+            output(pane, b"tail"),
+        ]);
+
+        assert_eq!(
+            batch.into_iter().collect::<Vec<_>>(),
+            vec![
+                (pane, PaneOp::Output(b"before".to_vec())),
+                (other, PaneOp::Output(b"bg".to_vec())),
+                (pane, PaneOp::PromptMark { kind: PromptMarkKind::PromptStart, exit_code: None }),
+                (pane, PaneOp::Output(b"after".to_vec())),
+                (pane, PaneOp::ScrollBottom),
+                (pane, PaneOp::Output(b"tail".to_vec())),
+            ]
+        );
     }
 
     // @lat: [[test#GPUI IPC Bridge#Drain coalesces firehose]]

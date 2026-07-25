@@ -188,6 +188,14 @@ e2e-visual-terminal-viewport:
 e2e-visual-terminal-zoom:
     docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/terminal-zoom.sh
 
+# Run the prompt-mark E2E: OSC 133 ingestion plus prompt_jump_up /
+# prompt_jump_down / jump_to_failure and the server's ScrollBottom snap, all
+# against the real window. Needs the shared-pane rig (so `scribe-test` writes
+# the OSC 133 bytes into the very pane the client renders) and a longer budget
+# than the default 60 s for its six phases.
+e2e-visual-prompt-marks:
+    docker run --rm --gpus all -e TEST_TIMEOUT=300 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/prompt-marks.sh
+
 # Run the AI task-label visual E2E. It relaunches the client to adopt the
 # harness session before it can assert anything, so it needs more than the
 # default 60 s budget.

@@ -8,8 +8,10 @@
 //! is scrolled here ([`DisplayOnlyTerminal::scroll`]), vi / copy mode is
 //! toggled and driven here through [`scribe_client_gpui::vi_mode`], the
 //! split-scroll pin is folded into the snapshot through
-//! [`scribe_client_gpui::split_scroll`], and a click resolves its
-//! [`scribe_client_gpui::smart_selection`] candidates here.
+//! [`scribe_client_gpui::split_scroll`], a click resolves its
+//! [`scribe_client_gpui::smart_selection`] candidates here, and an OSC 133 mark
+//! reads its anchor row — and a mark-relative jump lands on one — through the
+//! absolute-row helpers this type exposes.
 //!
 //! A window shows one grid per pane, so [`PaneGrids`] keys a
 //! [`DisplayOnlyTerminal`] per session: the coalescing drain already carries a
@@ -38,6 +40,7 @@ use scribe_client_gpui::split_scroll::{
 use scribe_client_gpui::vi_mode::{self, ViMotion};
 use vte::ansi::Color;
 
+use crate::session_lifecycle::PromptAnchor;
 use crate::sync_frames::{FeedOutputResult, OutputTarget};
 
 /// One rendered terminal cell: its character plus the raw SGR state the paint
@@ -236,6 +239,51 @@ impl DisplayOnlyTerminal {
     #[must_use]
     pub fn display_offset(&self) -> usize {
         self.term.grid().display_offset()
+    }
+
+    /// Rows of committed scrollback above the live screen.
+    #[must_use]
+    pub fn history_size(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    /// The absolute scrollback row the top of the viewport is showing.
+    ///
+    /// Absolute rows count from the oldest surviving scrollback line, which is
+    /// the space [`crate::session_lifecycle::PromptMarks`] anchors marks in, so
+    /// a jump is a comparison in one coordinate system rather than a conversion.
+    #[must_use]
+    pub fn viewport_top_abs(&self) -> usize {
+        self.history_size().saturating_sub(self.display_offset())
+    }
+
+    /// The grid geometry a prompt mark anchors against right now.
+    ///
+    /// Read after the mark's preceding output has been applied, so the cursor
+    /// row is the row the shell drew the prompt on.
+    #[must_use]
+    pub fn prompt_anchor(&self) -> PromptAnchor {
+        PromptAnchor {
+            history: self.history_size(),
+            screen_lines: self.term.screen_lines(),
+            cursor_row: self.cursor_line(),
+            cursor_col: self.term.grid().cursor.point.column.0,
+        }
+    }
+
+    /// Scroll the viewport so `abs_pos` becomes its top row.
+    ///
+    /// Returns `true` when the viewport actually moved. Both prompt jumps and
+    /// the failure jump land here, so they cannot drift from each other or from
+    /// [`Self::scroll`]'s snapshot bookkeeping.
+    pub fn scroll_to_abs(&mut self, abs_pos: usize) -> bool {
+        let offset = self.display_offset();
+        let target_offset = self.history_size().saturating_sub(abs_pos);
+        let delta = grid_i32(target_offset).saturating_sub(grid_i32(offset));
+        if delta == 0 {
+            return false;
+        }
+        self.scroll(Scroll::Delta(delta))
     }
 
     /// Push the config + AI-provider half of the split-scroll decision in.
@@ -503,6 +551,30 @@ mod tests {
 
         assert!(terminal.scroll(Scroll::Bottom));
         assert_eq!(terminal.display_offset(), 0);
+        assert_eq!(terminal.content().row_text(0).trim_end(), "l03");
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#Prompt marks anchor and scroll in absolute rows]]
+    #[gpui::test]
+    fn prompt_marks_anchor_and_scroll_in_absolute_rows() {
+        let mut terminal = terminal_with_numbered_lines(20, 3, 5);
+        // Five lines through a three-row screen leaves two rows of history and
+        // the cursor on the last screen row.
+        let anchor = terminal.prompt_anchor();
+        assert_eq!(anchor.history, 2);
+        assert_eq!(anchor.screen_lines, 3);
+        assert_eq!(anchor.history + anchor.cursor_row, 4);
+        // At the live bottom the viewport top is the first row after history.
+        assert_eq!(terminal.viewport_top_abs(), 2);
+
+        // Jumping to the absolute row of the oldest line puts it on top.
+        assert!(terminal.scroll_to_abs(0));
+        assert_eq!(terminal.viewport_top_abs(), 0);
+        assert_eq!(terminal.content().row_text(0).trim_end(), "l01");
+        // Re-issuing the same jump is a no-op rather than a redundant repaint.
+        assert!(!terminal.scroll_to_abs(0));
+        // And jumping back down lands on the row that mark named.
+        assert!(terminal.scroll_to_abs(2));
         assert_eq!(terminal.content().row_text(0).trim_end(), "l03");
     }
 
