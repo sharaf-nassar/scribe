@@ -19,6 +19,7 @@ use scribe_client_gpui::{
     color::{TerminalColors, linear_to_srgb_rgba},
     opacity::{opaque_slot, scale_alpha},
     restore_replay::round_positive_f32_to_u16,
+    search::{MatchHighlight, MatchHighlightColors},
 };
 use scribe_common::config::AppearanceConfig;
 
@@ -210,13 +211,36 @@ pub struct TerminalElement {
     content: Content,
     font: GridFont,
     colors: GridColors,
+    /// Find-overlay match spans for this frame, already projected onto the
+    /// visible viewport. Empty whenever the overlay is closed or the server
+    /// reported no on-screen match.
+    highlights: Vec<MatchHighlight>,
+    /// Accent colours a highlighted span is painted with.
+    highlight_colors: MatchHighlightColors,
 }
 
 impl TerminalElement {
     /// Captures one stable terminal snapshot for this render pass, painted with
     /// the font metrics and theme colours resolved from the live config.
-    pub const fn new(content: Content, font: GridFont, colors: GridColors) -> Self {
-        Self { content, font, colors }
+    pub const fn new(
+        content: Content,
+        font: GridFont,
+        colors: GridColors,
+        highlight_colors: MatchHighlightColors,
+    ) -> Self {
+        Self { content, font, colors, highlights: Vec::new(), highlight_colors }
+    }
+
+    /// Highlight `highlights` as find matches on top of the resolved cells.
+    ///
+    /// The spans are folded into the per-cell colours the paint path already
+    /// resolves, rather than drawn as separate quads over the finished grid:
+    /// the current match has to invert its foreground for contrast, which only
+    /// the cell-accurate resolve step can do.
+    #[must_use]
+    pub fn with_highlights(mut self, highlights: Vec<MatchHighlight>) -> Self {
+        self.highlights = highlights;
+        self
     }
 
     /// Builds the GPUI element tree for the visible terminal grid.
@@ -269,6 +293,7 @@ impl TerminalElement {
                     .then(|| scale_alpha(opaque_slot(bg), self.colors.opacity));
                 ResolvedCell { fg: opaque_slot(fg), bg: painted_bg, flags: cell.flags }
             }));
+            self.apply_highlights(row_index, default_bg, &mut resolved);
 
             paint_cell_backgrounds(&resolved, geometry, window);
             paint_box_drawing(row, &resolved, geometry, window);
@@ -285,6 +310,44 @@ impl TerminalElement {
                 cx,
             );
         }
+    }
+
+    /// Recolour the cells of `row_index` that a find match covers.
+    ///
+    /// The current match takes the opaque accent with a contrast foreground so
+    /// it reads as the cursor of the match list; every other match blends the
+    /// accent into whatever background that cell already had, which keeps a
+    /// match legible on top of coloured shell output. A highlighted cell always
+    /// paints a background, even where the cell was keeping the window's own
+    /// fill, or the match would be invisible on an untouched row.
+    fn apply_highlights(
+        &self,
+        row_index: usize,
+        default_bg: [f32; 4],
+        resolved: &mut [ResolvedCell],
+    ) {
+        if self.highlights.is_empty() {
+            return;
+        }
+        let window_bg = scale_alpha(opaque_slot(default_bg), self.colors.opacity);
+        for span in self.highlights.iter().filter(|span| span.row == row_index) {
+            let Some(cells) = resolved.get_mut(span.start_col..=span.end_col) else {
+                continue;
+            };
+            for cell in cells {
+                self.highlight_cell(cell, span.current, window_bg);
+            }
+        }
+    }
+
+    /// Recolour one cell covered by a find match.
+    fn highlight_cell(&self, cell: &mut ResolvedCell, current: bool, window_bg: Rgba) {
+        if current {
+            cell.bg = Some(self.highlight_colors.current_bg);
+            cell.fg = self.highlight_colors.current_fg;
+            return;
+        }
+        cell.bg = Some(self.highlight_colors.blend_passive(cell.bg.unwrap_or(window_bg)));
     }
 }
 
@@ -509,14 +572,19 @@ fn mask_f32(value: u32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CELL_WIDTH_RATIO, FONT_FALLBACKS, FontVariants, GridFont, MIN_FONT_SIZE, is_painted_cell,
-        shaped_char,
-    };
-    use gpui::{FontStyle, FontWeight};
-    use scribe_common::config::AppearanceConfig;
+    use std::sync::Arc;
 
-    use crate::terminal::{Cell, Flags};
+    use super::{
+        CELL_WIDTH_RATIO, FONT_FALLBACKS, FontVariants, GridColors, GridFont, MIN_FONT_SIZE,
+        ResolvedCell, TerminalElement, is_painted_cell, shaped_char,
+    };
+    use gpui::{FontStyle, FontWeight, Rgba};
+    use scribe_client_gpui::color::TerminalColors;
+    use scribe_client_gpui::search::{MatchHighlight, MatchHighlightColors};
+    use scribe_common::config::AppearanceConfig;
+    use scribe_common::theme::minimal_dark;
+
+    use crate::terminal::{Cell, Content, Flags};
 
     // @lat: [[test#GPUI Client Headless Suites#Config live reload#Grid font tracks the live appearance config]]
     #[test]
@@ -611,5 +679,59 @@ mod tests {
         assert!(!is_painted_cell(&blank));
         assert!(is_painted_cell(&Cell { c: 'x', ..blank }));
         assert!(is_painted_cell(&Cell { flags: Flags::UNDERLINE, ..blank }));
+    }
+
+    /// Build a one-row element whose cells all keep the window background.
+    fn element_with_highlights(highlights: Vec<MatchHighlight>) -> TerminalElement {
+        let theme = minimal_dark();
+        let mut cells = TerminalColors::new();
+        cells.set_theme(&theme);
+        let colors = GridColors {
+            background: Rgba { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+            cells: Arc::new(cells),
+            opacity: 1.0,
+        };
+        let content = Content { rows: vec![vec![Cell::default(); 8]] };
+        TerminalElement::new(
+            content,
+            GridFont::default(),
+            colors,
+            MatchHighlightColors::from_chrome(&theme.chrome),
+        )
+        .with_highlights(highlights)
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#Matches recolour the cells they cover]]
+    #[test]
+    fn find_matches_recolour_only_the_cells_they_cover() {
+        let element = element_with_highlights(vec![
+            MatchHighlight { row: 0, start_col: 1, end_col: 2, current: true },
+            MatchHighlight { row: 0, start_col: 5, end_col: 5, current: false },
+            MatchHighlight { row: 1, start_col: 0, end_col: 7, current: false },
+        ]);
+        let default_bg = [0.0, 0.0, 0.0, 1.0];
+        let plain = ResolvedCell {
+            fg: Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+            bg: None,
+            flags: Flags::empty(),
+        };
+        let mut resolved = vec![plain; 8];
+        element.apply_highlights(0, default_bg, &mut resolved);
+
+        let accent = MatchHighlightColors::from_chrome(&minimal_dark().chrome);
+        // The current match takes the opaque accent plus its contrast text.
+        for cell in resolved.iter().skip(1).take(2) {
+            assert_eq!(cell.bg, Some(accent.current_bg));
+            assert_eq!(cell.fg, accent.current_fg);
+        }
+        // A non-current match tints its own background and keeps its text.
+        let window_bg = super::opaque_slot(default_bg);
+        assert_eq!(resolved[5].bg, Some(accent.blend_passive(window_bg)));
+        assert_eq!(resolved[5].fg, plain.fg);
+        // Everything outside a span, and every span on another row, is untouched.
+        for column in [0, 3, 4, 6, 7] {
+            assert!(resolved[column].bg.is_none());
+            assert_eq!(resolved[column].fg, plain.fg);
+        }
     }
 }

@@ -48,6 +48,10 @@ use scribe_client_gpui::prompt_bar::{
     self, PromptBarColors, PromptBarData, PromptContextIndicator,
 };
 use scribe_client_gpui::restore_replay::round_positive_f32_to_u16;
+use scribe_client_gpui::search::{
+    FindOverlayColors, FindOverlayEvent, FindOverlayView, FindResults, MatchHighlightColors,
+    SEARCH_RESULT_LIMIT,
+};
 use scribe_client_gpui::share::{
     ControlRequestPrompt, ShareChrome, ShareKey, ShareKeyOutcome, ShareOverlayColors, ShareState,
     share_overlay,
@@ -257,6 +261,10 @@ struct Shared {
     /// attention request, so the reader only records the session that belled and
     /// the lifecycle tick drains the queue on the thread that owns the window.
     bells: Arc<Mutex<Vec<SessionId>>>,
+    /// Latest `SearchResults` reply. The IPC reader stores it; the find
+    /// overlay adopts it on the next redraw and the paint path highlights the
+    /// on-screen spans it names.
+    find: Arc<Mutex<FindResults>>,
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -343,6 +351,11 @@ struct TerminalView {
     opacity: f32,
     /// The command palette overlay, present only while open.
     command_palette: Option<Entity<CommandPaletteView>>,
+    /// The find-in-scrollback overlay, present only while open. While it is up
+    /// it owns the keyboard and its match set drives the grid's highlights.
+    find_overlay: Option<Entity<FindOverlayView>>,
+    /// Theme-derived find-match highlight colours, rebuilt on a theme reload.
+    highlight_colors: MatchHighlightColors,
     /// The right-click context menu overlay, present only while open.
     context_menu: Option<Entity<ContextMenuView>>,
     /// The modal dialog overlay, present only while a modal is open. The spike
@@ -457,11 +470,7 @@ impl TerminalView {
         // `SessionList`; `sync_tabs` pushes it into the titlebar on the next
         // redraw so the tab row always mirrors live server state.
         let rendered_tabs = TabSessions::new();
-        let titlebar = cx.new(|cx| {
-            let mut bar = TitlebarView::new(colors, cx);
-            bar.set_tabs(rendered_tabs.to_tab_data(), cx);
-            bar
-        });
+        let titlebar = Self::build_titlebar(colors, &rendered_tabs, cx);
         Self {
             shared,
             sink,
@@ -480,7 +489,9 @@ impl TerminalView {
             rendered_tabs,
             terminal_colors,
             opacity,
+            highlight_colors: MatchHighlightColors::from_chrome(&chrome),
             command_palette: None,
+            find_overlay: None,
             context_menu: None,
             dialog: None,
             update_dialog_kind: None,
@@ -523,6 +534,24 @@ impl TerminalView {
         (bell, subscription)
     }
 
+    /// Build the custom titlebar seeded with `tabs`.
+    ///
+    /// Split out of [`Self::new`] so the constructor stays a list of the
+    /// window's collaborators rather than also being the place one of them is
+    /// assembled.
+    fn build_titlebar(
+        colors: TabBarColors,
+        tabs: &TabSessions,
+        cx: &mut Context<Self>,
+    ) -> Entity<TitlebarView> {
+        let data = tabs.to_tab_data();
+        cx.new(|cx| {
+            let mut bar = TitlebarView::new(colors, cx);
+            bar.set_tabs(data, cx);
+            bar
+        })
+    }
+
     /// Drain a pending config-file change and reapply it to the live window.
     ///
     /// Runs on the GPUI foreground (the watcher thread only bumps an atomic),
@@ -548,10 +577,12 @@ impl TerminalView {
             self.terminal_colors = GridPalette::from_theme(&theme);
             self.chrome = theme.chrome;
             self.prompt_colors = PromptBarColors::from(&self.chrome);
+            self.highlight_colors = MatchHighlightColors::from_chrome(&self.chrome);
             self.push_tab_bar_colors(cx);
             // Open overlays captured the old palette when they were built; drop
             // them so a live theme edit never leaves stale colours on screen.
             self.command_palette = None;
+            self.find_overlay = None;
             self.context_menu = None;
         }
 
@@ -727,18 +758,19 @@ impl TerminalView {
     /// ([`Self::handle_binding`]) and the command palette
     /// ([`Self::execute_automation_action`]) — so a palette row and its bound
     /// chord can never drift apart, and wiring one surface wires both. The
-    /// still-unwired families (`OpenSettings`, `OpenFind`) are named here
-    /// rather than folded into a `_` arm, so a new [`KeyAction`] fails to
-    /// compile instead of silently joining the dropped set.
+    /// still-unwired family (`OpenSettings`) is named here rather than folded
+    /// into a `_` arm, so a new [`KeyAction`] fails to compile instead of
+    /// silently joining the dropped set.
     fn dispatch_key_action(&mut self, action: KeyAction, cx: &mut Context<Self>) {
         match action {
             KeyAction::Layout(layout) => self.handle_layout_action(layout, cx),
             KeyAction::Terminal(bytes) => self.send_key_bytes(bytes),
             KeyAction::OpenCommandPalette => self.open_command_palette(cx),
-            // The settings window (FU-23) and the find overlay (FU-9) are
-            // separate beads. Both are still swallowed so they cannot reach the
-            // PTY, and both are counted so the drop is visible in the log.
-            KeyAction::OpenSettings | KeyAction::OpenFind => {
+            KeyAction::OpenFind => self.open_find_overlay(cx),
+            // The settings window (FU-23) is a separate bead. It is still
+            // swallowed so it cannot reach the PTY, and counted so the drop is
+            // visible in the log.
+            KeyAction::OpenSettings => {
                 unroutable_action(&format!("{action:?}"), "no handler in the GPUI shell yet");
             }
         }
@@ -1198,6 +1230,121 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Open the find-in-scrollback overlay and subscribe to its query edits.
+    ///
+    /// The overlay owns no session and no sink, so every query edit comes back
+    /// here as a [`FindOverlayEvent::QueryChanged`] and is lowered onto a real
+    /// `SearchRequest` for the attached pane. It starts from the current
+    /// [`FindResults`] version so a reply left over from a previous find is
+    /// never adopted as an answer to the fresh, empty query.
+    fn open_find_overlay(&mut self, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        self.command_palette = None;
+        let adopted = self.shared.find.lock().map_or(0, |results| results.version());
+        let colors = FindOverlayColors::from(&self.chrome);
+        let overlay = cx.new(|cx| FindOverlayView::new(colors, adopted, cx));
+        cx.subscribe(&overlay, |this, _overlay, event: &FindOverlayEvent, ctx| match event {
+            FindOverlayEvent::QueryChanged(query) => this.send_search_request(query),
+            FindOverlayEvent::Dismissed => {
+                this.find_overlay = None;
+                ctx.notify();
+            }
+        })
+        .detach();
+        self.find_overlay = Some(overlay);
+        tracing::info!("opened the find overlay");
+        cx.notify();
+    }
+
+    /// Put one `SearchRequest` for `query` on the wire for the attached pane.
+    ///
+    /// An empty query sends nothing: the overlay has already dropped its
+    /// matches, and asking the server to search for "" would only cost a round
+    /// trip to be told there are no matches.
+    fn send_search_request(&self, query: &str) {
+        if query.is_empty() {
+            return;
+        }
+        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
+        else {
+            tracing::debug!("find query typed with no attached pane; nothing to search");
+            return;
+        };
+        match self.sink.search_request(session_id, query.to_owned(), SEARCH_RESULT_LIMIT) {
+            Ok(()) => tracing::info!(%session_id, %query, "sent search request"),
+            Err(error) => tracing::warn!(%error, "search request dropped: IPC writer closed"),
+        }
+    }
+
+    /// Fold the newest `SearchResults` reply into the open find overlay.
+    ///
+    /// Runs on every redraw because the reply arrives on the IPC reader thread,
+    /// which cannot touch a GPUI entity; the reader bumps the repaint
+    /// generation and this is where the result crosses into the view.
+    fn sync_find_results(&mut self, cx: &mut Context<Self>) {
+        let Some(overlay) = self.find_overlay.clone() else {
+            return;
+        };
+        let Ok(results) = self.shared.find.lock() else {
+            return;
+        };
+        overlay.update(cx, |view, ctx| view.adopt_results(&results, ctx));
+    }
+
+    /// The find-match spans to highlight on this frame's grid.
+    fn find_highlights(
+        &self,
+        content: &Content,
+        cx: &App,
+    ) -> Vec<scribe_client_gpui::search::MatchHighlight> {
+        let Some(overlay) = self.find_overlay.as_ref() else {
+            return Vec::new();
+        };
+        let rows = content.rows.len();
+        let cols = content.rows.first().map_or(0, Vec::len);
+        overlay.read(cx).highlights(rows, cols)
+    }
+
+    /// Route a keystroke into the open find overlay.
+    ///
+    /// Ports the winit `handle_search_overlay_keyboard` table: Escape closes,
+    /// Enter / Shift+Enter and the arrow keys cycle the highlighted match,
+    /// Backspace and Delete edit the query, and any printable character extends
+    /// it. Every key is consumed while the overlay is up — including the find
+    /// chord itself, which must not reopen the overlay underneath itself.
+    fn handle_find_overlay_key(
+        overlay: &Entity<FindOverlayView>,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let shift = event.keystroke.modifiers.shift;
+        let claimed_by_modifier = event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
+            || event.keystroke.modifiers.platform;
+        match event.keystroke.key.as_str() {
+            "escape" => overlay.update(cx, FindOverlayView::dismiss),
+            "enter" if shift => overlay.update(cx, FindOverlayView::prev_match),
+            "enter" | "down" => overlay.update(cx, FindOverlayView::next_match),
+            "up" => overlay.update(cx, FindOverlayView::prev_match),
+            "backspace" => overlay.update(cx, FindOverlayView::pop_char),
+            "delete" => overlay.update(cx, FindOverlayView::clear_query),
+            _ => {
+                if claimed_by_modifier {
+                    return;
+                }
+                if let Some(text) = event.keystroke.key_char.as_ref().filter(|t| !t.is_empty()) {
+                    let text = text.clone();
+                    overlay.update(cx, |view, ctx| view.push_str(&text, ctx));
+                }
+            }
+        }
+        // The match highlights are painted by *this* view, not by the overlay
+        // entity, so cycling the current match has to dirty the grid too — a
+        // notify on the overlay alone would move the `n/m` counter while the
+        // accent stayed on the previous match until the next server frame.
+        cx.notify();
+    }
+
     /// Open the right-click context menu at `position` with a representative item
     /// set (selection + OSC 8 URL + one smart-selection row), subscribing so a
     /// choice runs through [`Self::dispatch_context_menu_action`] and a dismiss
@@ -1515,7 +1662,9 @@ impl TerminalView {
         if self.share_prompt_pending() && self.run_share_key(event, cx) {
             return true;
         }
-        let overlay_free = self.dialog.is_none() && self.workspace_notes_modal.is_none();
+        let overlay_free = self.dialog.is_none()
+            && self.workspace_notes_modal.is_none()
+            && self.find_overlay.is_none();
 
         // Config-driven shortcuts are matched against the live bindings, which
         // the config watcher re-parses on every reload — so a saved keybinding
@@ -1549,6 +1698,14 @@ impl TerminalView {
 
         if let Some(modal) = self.workspace_notes_modal.clone() {
             Self::handle_notes_modal_key(&modal, event, cx);
+            return true;
+        }
+
+        // The find overlay is a text field over the grid: while it is up every
+        // keystroke belongs to it, so nothing here can leak to the PTY or
+        // reopen the overlay through its own chord.
+        if let Some(overlay) = self.find_overlay.clone() {
+            Self::handle_find_overlay_key(&overlay, event, cx);
             return true;
         }
 
@@ -2091,6 +2248,44 @@ impl TerminalView {
 
     /// Lower the live share state onto the overlay layer: the presence roster,
     /// the transient control hint, and the modal grant/deny prompt.
+    /// Build the terminal-grid band: one cell-accurate paint of the current
+    /// snapshot, carrying the find overlay's on-screen match spans, wrapped so a
+    /// right-click opens the context menu at the cursor without disturbing the
+    /// display-only element.
+    fn render_grid(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let content = self
+            .shared
+            .terminal
+            .lock()
+            .map_or_else(|_| Content::default(), |guard| guard.content());
+        let highlights = self.find_highlights(&content, cx);
+        let opacity = self.opacity;
+        let grid_colors = GridColors {
+            background: surface(self.terminal_colors.background, opacity),
+            cells: Arc::clone(&self.terminal_colors.cells),
+            opacity,
+        };
+        div()
+            .flex_1()
+            .child(
+                TerminalElement::new(
+                    content,
+                    self.font.clone(),
+                    grid_colors,
+                    self.highlight_colors,
+                )
+                .with_highlights(highlights)
+                .paint(),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
+                    view.open_context_menu(event.position, ctx);
+                }),
+            )
+            .into_any_element()
+    }
+
     fn build_share_overlay(&self) -> Option<gpui::AnyElement> {
         let colors = ShareOverlayColors::from(&self.chrome);
         let share = self.shared.share.lock().ok()?;
@@ -2129,11 +2324,8 @@ impl Render for TerminalView {
             window.focus(&self.focus_handle, cx);
         }
         self.sync_tabs(cx);
-        let content = self
-            .shared
-            .terminal
-            .lock()
-            .map_or_else(|_| Content::default(), |guard| guard.content());
+        self.sync_find_results(cx);
+        let grid = self.render_grid(cx);
         let status = self
             .shared
             .status
@@ -2152,11 +2344,6 @@ impl Render for TerminalView {
         let share = self.build_share_overlay();
 
         let opacity = self.opacity;
-        let grid_colors = GridColors {
-            background: surface(self.terminal_colors.background, opacity),
-            cells: Arc::clone(&self.terminal_colors.cells),
-            opacity,
-        };
         // The root itself paints nothing. Every band below fills the window
         // edge to edge, so leaving the root unfilled guarantees each pixel
         // carries the opacity alpha exactly once instead of compositing a
@@ -2183,19 +2370,7 @@ impl Render for TerminalView {
             .flex()
             .flex_col()
             .child(self.titlebar.clone())
-            .child(
-                // Wrap the terminal grid so a right-click opens the context menu
-                // at the cursor without disturbing the display-only element.
-                div()
-                    .flex_1()
-                    .child(TerminalElement::new(content, self.font.clone(), grid_colors).paint())
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
-                            view.open_context_menu(event.position, ctx);
-                        }),
-                    ),
-            )
+            .child(grid)
             .children(prompt_strip)
             .child(
                 div()
@@ -2210,6 +2385,7 @@ impl Render for TerminalView {
             )
             .child(status_bar)
             .children(self.command_palette.clone())
+            .children(self.find_overlay.clone())
             .children(self.context_menu.clone())
             .children(self.dialog.clone())
             .children(self.workspace_notes_modal.clone())
@@ -2267,6 +2443,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         update: Arc::new(Mutex::new(UpdateState::default())),
         lifecycle: Arc::new(Mutex::new(WindowLifecycle::new())),
         bells: Arc::new(Mutex::new(Vec::new())),
+        find: Arc::new(Mutex::new(FindResults::default())),
     };
     let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
     let (in_tx, in_rx) = unbounded_channel::<InboundEvent>();
@@ -2470,6 +2647,7 @@ async fn run_connection(ctx: IpcThread) -> Result<(), String> {
             update: ctx.shared.update,
             lifecycle: ctx.shared.lifecycle,
             bells: ctx.shared.bells,
+            find: ctx.shared.find,
             out_tx: ctx.out_tx,
             in_tx: ctx.in_tx,
             sink: ctx.sink,
@@ -2627,6 +2805,8 @@ struct ReaderCtx {
     /// Bell queue the reader appends to and the foreground's [`BellController`]
     /// drains; see the `bells` field of `Shared`.
     bells: Arc<Mutex<Vec<SessionId>>>,
+    /// Latest `SearchResults` reply the find overlay renders and highlights.
+    find: Arc<Mutex<FindResults>>,
     out_tx: UnboundedSender<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
@@ -3000,6 +3180,9 @@ fn dispatch_server_message(
             on_update_message(ctx, update);
         }
         ServerMessage::Bell { session_id } => on_bell_message(ctx, session_id),
+        ServerMessage::SearchResults { session_id, query, matches } => {
+            on_search_results(ctx, session_id, query, matches, attached);
+        }
         ServerMessage::Error { message } => set_status(&ctx.status, &ctx.generation, message),
         // Feature 015: the four share/control notices are routed as one group so
         // this table stays a screen of routing decisions; the arm names each
@@ -3017,6 +3200,34 @@ fn dispatch_server_message(
         other => unhandled_server_message(&other),
     }
     Ok(())
+}
+
+/// Store one `SearchResults` reply for the find overlay and the paint path.
+///
+/// The reply is gated on the attached pane for the same reason `PtyOutput` is:
+/// the overlay searches the pane the user is looking at, and an answer for a
+/// background pane would highlight cells that pane does not own. The stored
+/// reply carries its query, so the overlay can drop an answer the user has
+/// already typed past instead of flashing stale matches.
+fn on_search_results(
+    ctx: &ReaderCtx,
+    session_id: SessionId,
+    query: String,
+    matches: Vec<scribe_common::protocol::SearchMatch>,
+    attached: Option<SessionId>,
+) {
+    if Some(session_id) != attached {
+        tracing::debug!(%session_id, "dropped SearchResults for a background pane");
+        return;
+    }
+    let Ok(mut results) = ctx.find.lock() else {
+        tracing::warn!("find results mutex poisoned; dropping SearchResults");
+        return;
+    };
+    tracing::info!(%session_id, %query, matches = matches.len(), "search results received");
+    results.accept(query, matches);
+    drop(results);
+    ctx.generation.fetch_add(1, Ordering::Release);
 }
 
 /// Fold one terminal-chrome message onto the state the status bar and the tab

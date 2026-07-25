@@ -25,9 +25,9 @@
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
 counts modules-total 61
-counts modules-wired 32
+counts modules-wired 33
 counts server-messages-total 59
-counts server-messages-handled 32
+counts server-messages-handled 33
 counts layout-actions-total 36
 counts layout-actions-handled 10
 
@@ -49,7 +49,6 @@ unwired-module remote
 unwired-module remote_handshake
 unwired-module restore_state
 unwired-module scrollbar
-unwired-module search
 unwired-module selection
 unwired-module server_lifecycle
 unwired-module smart_selection
@@ -80,7 +79,6 @@ unhandled-server-message RemoteHandshakeReply
 unhandled-server-message RemotePeerList
 unhandled-server-message RunAction
 unhandled-server-message ScrollBottom
-unhandled-server-message SearchResults
 unhandled-server-message TrustedDeviceList
 unhandled-server-message TrustedNetworkList
 unhandled-server-message UpdateCheckResult

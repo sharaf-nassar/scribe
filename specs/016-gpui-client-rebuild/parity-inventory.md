@@ -87,7 +87,7 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `AttachSessions` | reconnect restore | scripted-E2E | `main.rs::attach_session` → `IpcSink::attach_sessions` | required |
 | `ConfigReloaded` | live config reload | scripted-E2E | `main.rs::apply_config_reload` → `IpcSink::config_reloaded` | required |
 | `ReportWorkspaceTree` | layout persistence | scripted-E2E | — (unwired, FU-6) — built only in `workspace_tree.rs`, outside `main.rs`'s import closure | required |
-| `SearchRequest` | find overlay | scripted-E2E | — (missing, FU-9) | required |
+| `SearchRequest` | find overlay | scripted-E2E | `main.rs::TerminalView::send_search_request` → `ipc_bridge::IpcSink::search_request`, from every find-overlay query edit | required |
 | `WorkspaceNotesGet` | workspace notes | scripted-E2E | `main.rs::open_workspace_notes_modal` → `IpcSink::workspace_notes_get` — **degenerate** (demo chord, fabricated `WorkspaceId`, reply dropped by the reader catch-all); FU-21 | required |
 | `WorkspaceNotesMutate` | workspace notes | scripted-E2E | `main.rs::route_workspace_notes_action` → `IpcSink::workspace_notes_mutate` — same demo caveat; FU-21 | required |
 | `Hello` | registration/adoption | scripted-E2E | `main.rs::run_connection` (sent on every connect) | required |
@@ -164,7 +164,7 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `WorkspaceInfo` | workspace layout | scripted-E2E | — (missing, FU-6) — only a doc-comment mention in `workspace_layout.rs` | required |
 | `WorkspaceNotesSnapshot` | workspace notes | scripted-E2E | — (missing, FU-21) — the modal sends `WorkspaceNotesGet` and never receives a reply | required |
 | `WorkspaceNotesChanged` | workspace notes | scripted-E2E | — (missing, FU-21) | required |
-| `SearchResults` | find overlay | scripted-E2E | — (missing, FU-9) | required |
+| `SearchResults` | find overlay | scripted-E2E | `main.rs::on_search_results` → `search::FindResults` → `search::FindOverlayView::adopt_results` → `terminal_element::TerminalElement::with_highlights` | required |
 | `Welcome` | registration/adoption | scripted-E2E | `main.rs::run_reader` arm → `session_lifecycle::SessionRegistry::adopt_window` | required |
 | `WindowClosed` | close lifecycle | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_window_closed` → the shell's lifecycle tick quits the app | required |
 | `WindowList` | window management | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::set_windows` → `StatusBarData.remote` | required |
@@ -259,7 +259,7 @@ Every row's method is `visual-E2E`: each action must be driven through
 | `scroll_down` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; `split_scroll.rs` outside the import closure | required |
 | `scroll_top` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; `split_scroll.rs` outside the import closure | required |
 | `scroll_bottom` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; `split_scroll.rs` outside the import closure | required |
-| `find` | Navigation | visual-E2E | — (unwired, FU-9) — `KeyAction::OpenFind` is swallowed in `handle_binding`; `search.rs` outside the import closure | required |
+| `find` | Navigation | visual-E2E | `main.rs::TerminalView::dispatch_key_action` → `TerminalView::open_find_overlay` → `search::FindOverlayView` | required |
 | `prompt_jump_up` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; no prompt marks are ingested | required |
 | `prompt_jump_down` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; no prompt marks are ingested | required |
 | `jump_to_failure` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; no prompt marks are ingested | required |

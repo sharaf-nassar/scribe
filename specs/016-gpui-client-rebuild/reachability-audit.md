@@ -99,7 +99,7 @@ Determination techniques, in order of authority:
 | `AttachSessions` | scripted-E2E | WIRED | `main.rs:1640` `attach_session`; `ipc_bridge.rs:259` from `attach` |
 | `ConfigReloaded` | scripted-E2E | WIRED | `main.rs:347` in `apply_config_reload`; watcher wired by bead .57 (`a50a5f2`) |
 | `ReportWorkspaceTree` | gpui-test | UNWIRED | built only in `workspace_tree.rs`; module not imported by `main.rs` |
-| `SearchRequest` | gpui-test | MISSING | `search.rs` is a pure matcher; the message is never constructed |
+| `SearchRequest` | scripted-E2E | WIRED (bead .69) | `TerminalView::send_search_request` → `IpcSink::search_request`, on every find-overlay query edit |
 | `WorkspaceNotesGet` | gpui-test | WIRED | `main.rs:558` `open_workspace_notes_modal` → `ipc_bridge.rs:281`. Demo-only: Ctrl+Shift+N, fabricated `WorkspaceId::new()` (`main.rs:561`), and the reply is dropped by the reader catch-all |
 | `WorkspaceNotesMutate` | gpui-test | WIRED | `main.rs` `route_workspace_notes_action` → `ipc_bridge.rs:291`; same demo caveat |
 | `Hello` | scripted-E2E | WIRED | `main.rs:1295`, sent on every connect |
@@ -169,7 +169,7 @@ Everything else is silently discarded on the wire.
 | `WorkspaceInfo` | gpui-test | MISSING | only a doc-comment mention at `workspace_layout.rs:92`; never matched |
 | `WorkspaceNotesSnapshot` | gpui-test | MISSING | no reference. The modal sends `WorkspaceNotesGet` and never receives a reply |
 | `WorkspaceNotesChanged` | gpui-test | MISSING | no reference in the crate |
-| `SearchResults` | gpui-test | MISSING | no reference in the crate |
+| `SearchResults` | scripted-E2E | WIRED (bead .69) | `on_search_results` → `FindResults` → `FindOverlayView::adopt_results` → `TerminalElement::with_highlights` |
 | `Welcome` | scripted-E2E | WIRED | `run_reader` arm → `SessionRegistry::adopt_window` |
 | `WindowClosed` | scripted-E2E | WIRED (bead .72) | `on_window_lifecycle_message` → `WindowLifecycle::on_window_closed` |
 | `WindowList` | scripted-E2E | WIRED (bead .72) | `on_window_lifecycle_message` → `WindowLifecycle::set_windows` |
@@ -249,7 +249,7 @@ also never executed).
 | `scroll_down` | Navigation | UNWIRED | as above |
 | `scroll_top` | Navigation | UNWIRED | as above |
 | `scroll_bottom` | Navigation | UNWIRED | as above |
-| `find` | Navigation | UNWIRED | `KeyAction::OpenFind` swallowed at `main.rs:799`; `search.rs` unimported |
+| `find` | Navigation | WIRED (bead .69) | `dispatch_key_action` → `TerminalView::open_find_overlay`; `search.rs` is on the import closure |
 | `prompt_jump_up` | Navigation | UNWIRED | hits `main.rs:430`; no prompt marks are ingested |
 | `prompt_jump_down` | Navigation | UNWIRED | as above |
 | `jump_to_failure` | Navigation | UNWIRED | as above |
@@ -268,7 +268,8 @@ also never executed).
 
 `KeyAction` variants: `Terminal` WIRED (`main.rs:795`), `Layout` partially wired
 (9 of 35 `LayoutAction` variants), `OpenCommandPalette` WIRED (claimed earlier in
-`handle_overlay_key`, `main.rs:700`), `OpenSettings` UNWIRED, `OpenFind` UNWIRED.
+`handle_overlay_key`, `main.rs:700`), `OpenFind` WIRED (bead .69), `OpenSettings`
+UNWIRED.
 
 **Input subtotals:** WIRED 24 · UNWIRED 30 · MISSING 0 · UNKNOWN 0.
 
@@ -400,6 +401,10 @@ and blocks every `visual-E2E` row.
   `paste.rs`, and routing `DialogEvent::Chosen` (`main.rs:542`) to a real
   response. **Selection is partly covered by bead .59** (`smart_selection`).
 - **FU-9 Find overlay.** Rows: `find`, `SearchRequest`, `SearchResults`.
+  **Closed by bead .69.** `KeyAction::OpenFind` opens `search::FindOverlayView`,
+  each query edit sends a real `SearchRequest`, and the `SearchResults` arm in
+  `dispatch_server_message` drives per-cell highlights through
+  `TerminalElement::paint`. All three rows are WIRED above.
 - **FU-10 Zoom.** Rows: `zoom_in`, `zoom_out`, `zoom_reset`.
 - **FU-11 close_tab chord and new_window.** Rows: `close_tab`, `new_window`.
   **Closed by bead .61.** The overlay chords now yield to the configured
