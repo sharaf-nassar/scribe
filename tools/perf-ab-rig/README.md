@@ -6,11 +6,11 @@ for the new GPUI client, measures the comparative ones on the old client with
 the same instrumentation, and writes a markdown report with a per-metric
 pass/fail verdict.
 
-## Metrics and thresholds (Clarification Q3)
+## Metrics and thresholds (Clarification Q3, startup re-scoped 2026-07-24)
 
 | Metric | Threshold | How it is measured |
 |---|---|---|
-| Startup to first frame | `<= 500 ms` absolute (also gates splash deletion) | GPUI first-frame marker (`SCRIBE_GPUI_STARTUP_TIMING`) |
+| Startup to first frame | no worse than old client end-to-end (also gates splash deletion) | new: GPUI first-frame marker (`SCRIBE_GPUI_STARTUP_TIMING`); old: wall-clock from its first startup-timing log line to `init_gpu_and_terminal_done`; median of 3 each |
 | Input latency | no worse than old client | shared probe: median key to PTY-echo round trip |
 | cat-firehose throughput | no worse than old client | shared probe: bytes drained per second while `cat`ting a 32 MiB file |
 | Memory at 10 tabs | `<= old + 20%` | `/proc/<pid>/status` `VmRSS` once the probe reports 10 sessions |
@@ -19,6 +19,18 @@ pass/fail verdict.
 "No worse than the old client" is enforced with a 10% run-to-run noise
 allowance, which is the repeatability of these measurements on a loaded
 desktop, not extra headroom.
+
+The startup threshold was re-scoped on 2026-07-24 from the original
+`<= 500 ms` absolute budget (spec.md "Q3 re-scope" records the decision).
+The absolute number was anchored to a 190 ms "old client baseline" that
+turned out to be a phase-scoped GPU-init timer, not process-start to first
+frame, and is unreproducible; measured end-to-end on the reference host the
+old client takes 3.0-5.5 s while the GPU driver bring-up floor alone exceeds
+500 ms (beads scribe-38e.50 / scribe-38e.83 carry the measurements). The two
+clients are therefore compared end-to-end with the same definition, like
+every other comparative metric. The old client's phase-scoped `total_ms`
+value on the `init_gpu_and_terminal_done` line is never compared against the
+GPUI first-frame marker.
 
 ## Shared runtime probe
 

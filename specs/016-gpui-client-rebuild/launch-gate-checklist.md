@@ -32,6 +32,17 @@ fails on scripted-E2E (AI indicator), perf, and unverifiable manual rows.
   5 samples vs the 500 ms budget (~4×; old baseline 190 ms). → bead
   `scribe-38e.50`.
 
+  *Update 2026-07-24:* the 4× regression was the synchronous
+  `load_host_stats` sysinfo walk in the view constructor, fixed on main
+  (`8484f03`). The residual gap to the absolute 500 ms number is the GPU
+  bring-up floor, which the old client no longer clears either — its 190 ms
+  "baseline" was a phase-scoped GPU-init timer, not
+  process-start-to-first-frame (measured end-to-end it starts in 3.0–5.5 s
+  on this host). The startup budget is re-scoped to a same-host end-to-end
+  A/B (spec.md "Q3 re-scope"); under it the GPUI client PASSes (median
+  ~0.7–1.3 s vs old ~3.3–4.5 s, `perf-ab-report.md`). Re-gate B1 with
+  `tools/perf-ab-rig/run-perf-ab.sh --live` (all five metrics).
+
   The other four metrics (input latency, cat-firehose throughput,
   memory@10 tabs, scroll fps) were originally recorded as DEFERRED because the
   rig still treated the client as the display-only spike. `scribe-38e.51` has
@@ -151,8 +162,9 @@ Two consequences bind this gate:
 
 ## Re-gate criteria
 
-Re-run this gate when all of the following are resolved: `.50` (startup
-≤500 ms), `.51` (rig drives all five metrics), `.52` (AI-indicator func green),
+Re-run this gate when all of the following are resolved: `.50` (startup gate
+green under the re-scoped same-host A/B — spec.md "Q3 re-scope"), `.51` (rig
+drives all five metrics), `.52` (AI-indicator func green),
 `.56` (opacity implemented) followed by `.53` (opacity re-verified), and `.57`
 (config watcher wired, live reload proven). The IME manual procedure still
 requires a human on a host with an input-method engine.

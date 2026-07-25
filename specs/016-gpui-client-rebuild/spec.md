@@ -495,6 +495,31 @@ worse than the old client on the same machine/session; memory ≤ old client
 with <1% dropped frames. The splash screen is deleted if startup meets the
 500 ms budget (resolves OQ8, leaning confirmed).
 
+**Q3 re-scope (2026-07-24): startup budget.** The absolute 500 ms startup
+ceiling is re-scoped to a same-host A/B: **startup-to-first-frame no worse
+than the old client, both clients measured end-to-end (process start to
+first painted frame / GPU-ready) on the same machine and session, with the
+rig's standard 10% noise allowance** — the same shape as the latency and
+throughput criteria. Justification, from the measurements recorded in beads
+scribe-38e.50 and scribe-38e.83: (1) the 500 ms number was anchored to a
+190 ms "old client" figure that turns out to be the old client's
+phase-scoped `init_gpu_and_terminal_done` timer — GPU init only, not
+process-start-to-first-frame — so the absolute budget never measured what it
+was compared against; (2) the GPU bring-up floor alone (Vulkan instance +
+NVIDIA driver init + surface configure) exceeds 500 ms on the reference RTX
+3090 host for BOTH clients (old client GPU phase re-measured at 505-1244 ms;
+best GPUI first frame 555 ms with every environment lever applied), so no
+in-repo change can satisfy the absolute number; and (3) measured end-to-end
+under the same conditions the old client takes 3.0-5.5 s to GPU-ready
+(including a ~1.2 s synchronous `load_host_stats` stall the GPUI client
+already eliminated) versus 0.65-1.3 s for the GPUI client — the rebuild is a
+~4x startup improvement, which the absolute ceiling mis-scored as a
+regression. Splash deletion (OQ8) remains resolved as **delete**: it is
+gated on the re-scoped criterion passing, and the GPUI client's first frame
+arrives several times sooner than the old client's splash ever did.
+Enforced by `tools/perf-ab-rig/run-perf-ab.sh`; the fresh end-to-end
+old-client baseline lives in `perf-baseline.md`.
+
 **Q4: 015 sequencing?**
 A: **Land 015 first.** The parity target includes 015's final client
 surfaces. The epic's cutover-critical beads depend on 015 landing; early

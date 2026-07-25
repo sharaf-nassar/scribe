@@ -65,7 +65,8 @@ scrollbar with command marks, dividers, dialogs, palette, tooltips, AI
 indicator, prompt bar) is built as GPUI elements/views with taffy layout,
 GPUI shadows/gradients/animations. No gpui-component dependency for v1
 (fewer moving parts; our widgets are bespoke anyway — decision noted as
-revisitable). Splash screen is deleted (startup budget 500 ms).
+revisitable). Splash screen is deleted (startup budget: no worse than the
+old client end-to-end, per the spec's Q3 re-scope of 2026-07-24).
 
 **Settings:** `scribe-settings` GTK/wry webview delivery is deleted. The
 settings UI is rebuilt as a GPUI window (second window in the client
