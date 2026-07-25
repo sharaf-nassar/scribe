@@ -6,7 +6,8 @@
 //! batch runs one `write_output` and one repaint per dirty pane. Outbound:
 //! [`IpcSink`] replaces Zed's `write_to_pty`, enqueuing `ClientMessage::KeyInput`,
 //! `Resize`, the session-lifecycle messages the tab shortcuts drive
-//! (`CreateSession` / `AttachSessions` / `CloseSession`), the feature-015
+//! (`CreateSession` / `AttachSessions` / `Subscribe` / `RequestSnapshot` /
+//! `CloseSession`), the feature-015
 //! control-passing frames (`ControlClaim` / `ControlGrant`) the share surfaces
 //! raise, and the update decisions the status-bar CTA drives (`TriggerUpdate` /
 //! `DismissUpdate`), onto the ordered IPC-writer channel. The outbound path never
@@ -265,6 +266,39 @@ impl IpcSink {
         dimensions: Vec<TerminalSize>,
     ) -> Result<(), SinkClosed> {
         self.enqueue(ClientMessage::AttachSessions { session_ids, dimensions })
+    }
+
+    /// Subscribes to `session_ids` immediately after the `AttachSessions` that
+    /// made them visible.
+    ///
+    /// The server only honours a subscription for a session this connection is
+    /// already attached to, so this must stay on the same ordered channel and
+    /// behind the attach — the writer FIFO guarantees both. Subscribing makes
+    /// the server run its CWD-fallback check for the newly visible panes, which
+    /// is how a reattached tab gets its working directory (and the workspace
+    /// name derived from it) without waiting for the next shell prompt.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn subscribe(&self, session_ids: Vec<SessionId>) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::Subscribe { session_ids })
+    }
+
+    /// Asks the server for `session_id`'s authoritative per-cell screen.
+    ///
+    /// This client is display-only: it owns no PTY and cannot re-derive a
+    /// pane's grid locally, so whenever the pane may have drifted from the
+    /// server's `Term` — after a cell-metric change raises `SIGWINCH` on the
+    /// PTY, or
+    /// after a reattach replay failed to decode — the only way back to a
+    /// correct pane is to ask for the server's current state. The reply is a
+    /// `ScreenSnapshot` carrying the visible grid *and* the scrollback, which
+    /// the reader applies through `session_lifecycle::snapshot_reset_bytes`.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn request_snapshot(&self, session_id: SessionId) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::RequestSnapshot { session_id })
     }
 
     /// Asks the server to terminate `session_id`, backing the `close_tab`

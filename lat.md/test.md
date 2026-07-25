@@ -246,6 +246,14 @@ Phase 0 borrows `overlay-actions.sh`'s trick for handing the client a pane: the 
 
 Each provider runs a set/clear cycle asserted twice over: the client's own `tab task label updated` line must appear with the label text (proving the notice reached the reader, not just the socket), the left half of the window's top band must differ from the pre-label capture by at least 40 pixels (proving the strip repainted), and after the clear that same band must be pixel-identical to the baseline again (proving the shell title came back rather than the label merely being overwritten).
 
+### Subscribe and snapshot session tooling
+
+`tests/e2e/visual/session-tooling.sh` is the app-level oracle for the `Subscribe` and `RequestSnapshot` parity rows: it drives the real client against the real server and asserts both frames on the wire at the lifecycle points that produce them.
+
+Neither message could be proven by a headless test, because the gap was reachability — the frames existed in the frozen protocol and nowhere in the client. The run therefore reuses the [[crates/scribe-test/src/share_tap.rs#run]] wire tap (`SCRIBE_SHARE_TAP=1`) purely as a recorder, truncating `/output/share-wire.jsonl` at each phase boundary so a frame found afterwards can only have come from the action that phase performed. Phase 0 is the same daemon-stop-and-relaunch preamble as `overlay-actions.sh`, which is what puts the client on the `ListSessions` → [[crates/scribe-client-gpui/src/main.rs#attach_session]] path.
+
+The `Subscribe` half asserts a client frame naming the attached session, that its record line follows the `AttachSessions` that authorises it, and that `scribe-server` logged no `Subscribe denied for unattached session`. The `RequestSnapshot` half types a marker into the pane, edits `appearance.font_size` under the running window so [[crates/scribe-client-gpui/src/main.rs#TerminalView#report_cell_metrics]] fires, then asserts the request follows its `Resize`, that the server answered with a `ScreenSnapshot` whose per-cell grid contains the marker, and that the client logged `repainted pane from server screen snapshot` with the same `cols`/`rows` the recorded frame carried — tying the repaint to that exact reply rather than to some other snapshot.
+
 ### Update surfaces
 
 `tests/e2e/visual/update-trigger.sh` and `tests/e2e/visual/update-dismiss.sh` are the scripted oracle for the `UpdateAvailable` / `UpdateProgress` / `TriggerUpdate` / `DismissUpdate` parity rows, driving a real server end to end (see [[client#GPUI Update Surfaces]]).

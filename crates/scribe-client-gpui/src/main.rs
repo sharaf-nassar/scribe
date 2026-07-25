@@ -74,6 +74,7 @@ use scribe_common::{
         ArchiveReason, AutomationAction, ClientMessage, ServerMessage, SessionInfo, TerminalSize,
         WorkspaceNoteStatus,
     },
+    screen::ScreenSnapshot,
     screen_replay::SessionReplay,
     socket::server_socket_path,
 };
@@ -474,7 +475,19 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Republish the cell grid's size after a font edit changed cell metrics.
+    /// Republish the cell grid's size after a font edit changed cell metrics,
+    /// then resync the pane from the server's authoritative screen.
+    ///
+    /// The `Resize` re-runs `TIOCSWINSZ` on the server's PTY, which raises
+    /// `SIGWINCH` in the foreground process; a full-screen app answers by
+    /// redrawing against the new metrics and a line-oriented shell answers with
+    /// nothing at all. Either way this display-only client cannot re-derive the
+    /// resulting grid — it owns no PTY and never replays locally — so the
+    /// `Resize` is followed by a `RequestSnapshot` on the same ordered channel.
+    /// The server answers with the post-resize per-cell grid plus scrollback,
+    /// and [`dispatch_server_message`]'s `ScreenSnapshot` arm resets the pane
+    /// and replays it, so the window repaints from server state instead of
+    /// waiting for the next prompt.
     fn report_cell_metrics(&self) {
         let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
         else {
@@ -486,7 +499,11 @@ impl TerminalView {
             cell_width: round_positive_f32_to_u16(self.font.cell_width()).max(1),
             cell_height: round_positive_f32_to_u16(self.font.line_height).max(1),
         };
-        if let Err(error) = self.sink.resize(session_id, size) {
+        let result = self
+            .sink
+            .resize(session_id, size)
+            .and_then(|()| self.sink.request_snapshot(session_id));
+        if let Err(error) = result {
             tracing::warn!(%error, "resize after font reload dropped: IPC writer closed");
         }
     }
@@ -795,7 +812,14 @@ impl TerminalView {
     }
 
     /// Point the client at `session_id`: attach it, announce the client size,
-    /// and ask for a fresh screen so the switched-to tab paints immediately.
+    /// and subscribe so the switched-to tab streams and reports its own state.
+    ///
+    /// The three frames go out on the one ordered writer channel and the server
+    /// dispatches them in that order, so the `Subscribe` always lands after the
+    /// attach that authorises it. The attach itself answers with a
+    /// `SessionReplay` that repaints the tab; the subscription is what makes the
+    /// server re-check the pane's working directory, so the status bar follows
+    /// the switch instead of keeping the previous tab's chrome.
     fn attach(&self, session_id: SessionId) {
         if let Ok(mut guard) = self.shared.active_session.lock() {
             *guard = Some(session_id);
@@ -804,7 +828,8 @@ impl TerminalView {
         let result = self
             .sink
             .attach_sessions(vec![session_id], vec![size])
-            .and_then(|()| self.sink.resize(session_id, size));
+            .and_then(|()| self.sink.resize(session_id, size))
+            .and_then(|()| self.sink.subscribe(vec![session_id]));
         if let Err(error) = result {
             tracing::warn!(%error, "tab switch dropped: IPC writer closed");
         }
@@ -2373,14 +2398,45 @@ fn on_session_exited(
     Ok(())
 }
 
-/// Decode a reattach replay onto the pane, or surface the decode failure.
+/// Repaint the attached pane from a `ScreenSnapshot` the client asked for.
+///
+/// The bytes are RIS followed by the snapshot's own ANSI, so the pane is
+/// replaced rather than appended onto — everything on screen afterwards came
+/// out of this snapshot. That is also what makes the repaint assertable from
+/// outside the process, which the `RequestSnapshot` E2E relies on, so the
+/// applied grid's dimensions are logged alongside the session.
+fn apply_screen_snapshot(ctx: &ReaderCtx, session_id: SessionId, snapshot: &ScreenSnapshot) {
+    let bytes = session_lifecycle::snapshot_reset_bytes(snapshot);
+    forward_output(&ctx.in_tx, session_id, bytes);
+    tracing::info!(
+        %session_id,
+        cols = snapshot.cols,
+        rows = snapshot.rows,
+        "repainted pane from server screen snapshot"
+    );
+}
+
+/// Decode a reattach replay onto the pane, or surface the decode failure and
+/// fall back to the per-cell snapshot path.
 ///
 /// A corrupt reattach stream must not tear down the reader: show an error on
-/// the pane and keep the connection alive.
+/// the pane and keep the connection alive. The attach still succeeded on the
+/// server, so the pane is attached but showing stale content — exactly the case
+/// `RequestSnapshot` exists for. Asking for the authoritative grid turns a
+/// decode failure into a repaint instead of a permanently stale tab; if that
+/// request cannot be enqueued the error banner is all the user gets, which is
+/// the pre-existing behaviour.
 fn forward_replay(ctx: &ReaderCtx, session_id: SessionId, replay: &SessionReplay) {
     match session_lifecycle::decode_replay(session_id, replay) {
         Ok(bytes) => forward_output(&ctx.in_tx, session_id, bytes),
-        Err(error) => set_status(&ctx.status, &ctx.generation, error.to_string()),
+        Err(error) => {
+            set_status(&ctx.status, &ctx.generation, error.to_string());
+            if let Err(sink_error) = ctx.sink.request_snapshot(session_id) {
+                tracing::warn!(%sink_error, "replay-failure snapshot request dropped");
+            } else {
+                tracing::info!(%session_id, "requested screen snapshot after replay decode failure");
+            }
+        }
     }
 }
 
@@ -2583,10 +2639,7 @@ fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage, attached: Opt
         }
         ServerMessage::ScreenSnapshot { session_id, snapshot } => {
             if Some(session_id) == attached {
-                // Reset before replaying so the tooling snapshot replaces,
-                // never appends onto, the pane's current content.
-                let bytes = session_lifecycle::snapshot_reset_bytes(&snapshot);
-                forward_output(&ctx.in_tx, session_id, bytes);
+                apply_screen_snapshot(ctx, session_id, &snapshot);
             }
         }
         // Unreachable: the caller only routes the pane-content family here.
@@ -2780,7 +2833,12 @@ fn tab_entry_for(info: &SessionInfo) -> TabEntry {
 /// Attach `session_id` and make it the pane the view renders and types into.
 ///
 /// The server answers with a `SessionReplay` for the newly attached session,
-/// which repaints the pane, so no extra snapshot request is needed.
+/// which repaints the pane, so no extra snapshot request is needed here. The
+/// trailing `Subscribe` is what registers the pane for the server's
+/// CWD-fallback check, so a reconnect restores the status bar's directory and
+/// workspace name without waiting for the next shell prompt; the server rejects
+/// a subscription for an unattached session, which the shared ordered writer
+/// channel makes impossible by construction.
 fn attach_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> {
     ctx.out_tx
         .send(ClientMessage::AttachSessions {
@@ -2790,6 +2848,7 @@ fn attach_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> 
         .map_err(|_| "writer channel closed".to_owned())?;
     // Announce the client size through the sink, ahead of any KeyInput.
     ctx.sink.resize(session_id, ctx.size).map_err(|error| error.to_string())?;
+    ctx.sink.subscribe(vec![session_id]).map_err(|error| error.to_string())?;
     if let Ok(mut guard) = ctx.active_session.lock() {
         *guard = Some(session_id);
     }
