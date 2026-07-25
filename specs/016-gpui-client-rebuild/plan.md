@@ -76,7 +76,10 @@ rejected: separate GPUI settings binary — doubles GPUI link time and binary
 size for no isolation benefit.)
 
 **Cutover mechanics:** launch gate = parity checklist (US1/US2 + core
-chrome) + perf budget met + visual E2E green. At cutover the new crate is
+chrome) + perf budget met + visual E2E green. **Re-baselined post-audit:** the
+parity half of that gate is measured as the *reachable*-row count from
+`parity-inventory.md`, not as a green unit-test run — see "Re-sequenced
+remaining phases (post-reachability-audit)" below. At cutover the new crate is
 renamed `scribe-client` (binary name unchanged for packaging/postinst),
 old `crates/scribe-client` and `crates/scribe-renderer` are deleted, and
 the deletion sweep + lat.md rewrite follow as their own phase.
@@ -110,7 +113,7 @@ rollback for non-Vulkan cutover failures.
 | `dist/debian/*`, deb metadata | New Depends (`libvulkan1, mesa-vulkan-drivers, libwayland-client0, libxkbcommon-x11-0`, xcb libs; − `libgtk-4-1` at cutover), postinst Vulkan guard. |
 | `LICENSE-*`, README, all `Cargo.toml` license fields | GPL-3.0-or-later migration (step-0), attribution notices for Zed (GPL) and GPUI (Apache-2.0). |
 | `lat.md/` | client.md, rendering.md, settings.md, architecture.md rewritten post-cutover; test.md updated for new harness details. |
-| `specs/016-gpui-client-rebuild/parity-inventory.md` (NEW) | The committed parity oracle (46 ClientMessage / 57 ServerMessage / subsystem checklist). |
+| `specs/016-gpui-client-rebuild/parity-inventory.md` (NEW) | The committed parity oracle (46 ClientMessage / 59 ServerMessage / 54 named keybinding actions / rendering + removed-key rows), each row carrying a mandatory "Reachable from" live-path symbol. |
 
 ## Data Model
 
@@ -221,7 +224,13 @@ No server-side or protocol data changes. Client-internal:
 - **Parity checklist:** every `parity-inventory.md` item gets a
   verification column (golden / gpui-test / visual-E2E / scripted-E2E /
   manual) — no item ships unverified; manual items require a checked-off
-  review pass before cutover.
+  review pass before cutover. **Re-baselined post-audit:** every item also
+  carries a mandatory "Reachable from" column naming the live-path symbol that
+  calls it, and an item with no such symbol cannot be marked done however many
+  tests pass. `gpui-test` is retained only for the nine removed-config-key
+  rows; the 27 headless-only IPC rows moved to `scripted-E2E`, and font
+  fallback plus all 54 named keybinding actions moved to `visual-E2E` driven by
+  `xdotool` against the real window.
 
 ## Risks
 
@@ -356,6 +365,127 @@ checklist green):**
 - US3 cosmetics that trailed cutover (if any) close here; follow-on
   register (image protocols, gpui-component adoption, macOS) filed as
   future feature stubs, not left as TODOs.
+
+## Re-sequenced remaining phases (post-reachability-audit)
+
+**Status of the original sequencing: Phases 0 through G delivered the library
+port, not the product.** Their beads are closed and the code they produced is
+real and unit-tested, but 35 of the crate's 54 library modules are outside
+`main.rs`'s import closure and are never constructed by the running client. The
+reachability audit (`reachability-audit.md`, at `f56ef95`) measured 173 parity
+rows as 60 WIRED / 63 UNWIRED / 50 MISSING — **51 of 164 user-facing rows
+reachable (31%)**.
+
+The remaining work is therefore **integration/wiring plus the genuinely missing
+features**, sequenced around the audit's fix units FU-1..FU-23 rather than
+around new subsystems. Phases R0–R2 below replace what is left of B–G and run
+before Phase H. Nothing here touches the server, the IPC protocol, or
+`scribe-common` — those freezes stand unchanged.
+
+### Structural causes being fixed
+
+1. `main.rs` imports 19 of 54 library modules; the rest are reachable only from
+   `lib.rs` and their own tests.
+2. `main.rs::run_reader` matches 12 of 59 `ServerMessage` variants and ends in
+   `_ => {}`; everything else is silently dropped on the wire.
+3. `main.rs::handle_layout_action` executes 9 of 35 `LayoutAction` variants and
+   sends the other 26 to a `tracing::debug!` catch-all.
+4. `terminal.rs::Content` carries `rows: Vec<String>`, so the paint path has
+   **no per-cell colour at all**.
+5. Overlay events (`CommandPaletteEvent::Execute`, `ContextMenuEvent::Selected`,
+   `DialogEvent::Chosen`) are discarded, so those surfaces open but do nothing.
+
+### Phase R0 — reachable paint path and terminal chrome (P0)
+
+- **FU-1 Cell-accurate paint path — first, and blocking.** `Content` must carry
+  per-cell fg/bg/attrs instead of `Vec<String>`, and `TerminalElement::paint`
+  must paint them. Every other rendering unit depends on this: box drawing
+  (paint-quad overlay), ligatures (`shape_line` runs), and font fallback
+  (`FontFallbacks` per run) all need per-cell style before they have anywhere
+  to attach. Rows: Box drawing, Font fallback, Ligatures. **Do not start the
+  other rendering units before FU-1 lands.**
+- FU-2 Terminal chrome from server metadata — `TitleChanged`, `CwdChanged`,
+  `GitBranch`, `WorkspaceNamed`, `SessionContextChanged`, `EnvStatus`, and the
+  hardcoded `None`s in `main.rs::build_status_model`. Parallel to FU-3.
+- FU-3 AI tab labels — `TaskLabelChanged`/`Cleared`,
+  `CodexTaskLabelChanged`/`Cleared`. Parallel to FU-2.
+- FU-4 Opacity — **already covered by bead `.56`**, which landed at `771794d`
+  *after* the audit baseline. Do not re-file; re-verify through bead `.53`
+  before flipping the row's "Reachable from" cell.
+- **Gate-methodology beads run alongside R0**, because they are the drift
+  guard for everything after: replace `run_reader`'s `_ => {}` with an explicit
+  `warn`-level arm; add the three mechanical CI greps (reader arm set vs the
+  inventory, `ClientMessage` construction inside `main.rs`'s import closure,
+  `lib.rs` modules either in the closure or carrying an unwired marker naming
+  their bead); and replace the dispatch catch-alls with an
+  `unimplemented_action(action)` helper that warns and increments a counter a
+  scripted run asserts is zero.
+
+### Phase R1 — core interaction (P1, depends on: R0 gate-methodology beads)
+
+- **FU-12 Command palette / context menu action delivery — first within R1.**
+  `CommandPaletteEvent::Execute(_)` and `ContextMenuEvent::Selected(_)` are
+  discarded, so both overlays are inert. Several later units assume this
+  delivery mechanism exists. No parity row names it directly; it is
+  nonetheless a prerequisite.
+- FU-5 Pane tree — 8 pane-layout actions. **Covered by bead `.58`.**
+- FU-6 Workspace tree — 6 workspace-layout actions **(covered by `.58`)** plus
+  `CreateWorkspace`, `CloseWorkspace`, `MoveSession`, `ReportWorkspaceTree`,
+  `WorkspaceInfo`, which `.58` does **not** name and which need a follow-on.
+- FU-7 Scrollback navigation and marks — `scroll_up/down/top/bottom`
+  **(covered by bead `.59`)** plus `prompt_jump_up/down`, `jump_to_failure`,
+  `PromptMark`, `ScrollBottom`, which are not covered.
+- FU-8 Clipboard and selection — `copy`, `paste`, the four OSC 52 bridge/prompt
+  rows, and routing `DialogEvent::Chosen` to a real response. Selection
+  groundwork is **partly covered by bead `.59`** (`smart_selection`).
+- FU-9 Find overlay — `find`, `SearchRequest`, `SearchResults`.
+- FU-10 Zoom — `zoom_in`, `zoom_out`, `zoom_reset`.
+- FU-11 close_tab chord and new_window. **Covered by bead `.61`.**
+
+### Phase R2 — window, lifecycle, and the unreachable 013/014/015 surface (P2)
+
+Window and lifecycle first (they gate cutover behaviour), then the remote/LAN/
+sharing tail, which is the largest single block of unreachable rows:
+
+- FU-13 Window lifecycle — `CloseWindow`, `QuitAll`, `WindowClosed`,
+  `QuitRequested`, `ListWindows`, `WindowList`, `FocusChanged`.
+- FU-14 Update surfaces in the terminal window — `TriggerUpdate`,
+  `DismissUpdate`, `UpdateAvailable`, `UpdateProgress`. (`CheckForUpdates`,
+  `ListReleases`, `UpdateCheckResult`, `ReleaseList` are already reachable, but
+  only from the `--settings` window.)
+- FU-15 X11 focus guard — start `x11_focus.rs` from `open_window`.
+- FU-20 Subscribe / snapshot tooling; FU-21 workspace notes on a real
+  workspace (de-demo the fabricated `WorkspaceId` and route the reply);
+  FU-22 Bell; FU-23 in-app settings entry point.
+- FU-16 Remote (tailnet), FU-17 LAN (mTLS) dial and approval, FU-18 trusted
+  devices/networks in the settings window, FU-19 sharing and control. The whole
+  of features 013/014/015 is currently unreachable from the GPUI client;
+  FU-18's transport helpers already exist in `settings/server_action.rs` and
+  only need settings-page controls that call them.
+
+### In-flight bead coverage (do not double-count or re-file)
+
+| Bead | Fix unit | Rows already claimed |
+| --- | --- | --- |
+| `.56` (opacity) | FU-4 | Opacity — landed `771794d`, re-verify via `.53` |
+| `.58` (pane/workspace) | FU-5, part of FU-6 | 8 pane-layout + 6 workspace-layout actions; **not** `CreateWorkspace`, `CloseWorkspace`, `MoveSession`, `ReportWorkspaceTree`, `WorkspaceInfo` |
+| `.59` (vi / smart-selection / split-scroll) | part of FU-7, FU-8 | `scroll_up/down/top/bottom`; selection groundwork for `copy` |
+| `.61` (close_tab / new_window) | FU-11 | `close_tab`, `new_window` |
+| `.62` (status-band layout) | supports FU-2 | status-band chrome the FU-2 metadata rows render into. Not named by the audit (filed after it); it lands the surface, not the server-metadata ingestion |
+
+Everything else in FU-1..FU-23 is currently unfiled.
+
+### Phase H re-baseline
+
+The launch gate `scribe-38e.42` is re-baselined on **reachable-row count**, not
+the unit-test count. The green workspace unit-test suite (850 tests at the gate run) proves logic; it
+proved nothing about whether the running client constructs the tested modules,
+which is how the original gate produced a false parity reading. The gate metric
+is the reachable-row total from `parity-inventory.md`'s roll-up (currently
+51/164 user-facing rows), regenerated mechanically by the R0 CI checks, with an
+explicit go threshold. Cutover (`scribe-38e.43`+) stays blocked until that
+threshold is met alongside the existing perf and manual re-gate criteria in
+`launch-gate-checklist.md`.
 
 ## Alignment fixes applied
 
