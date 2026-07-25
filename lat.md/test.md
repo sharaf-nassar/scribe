@@ -613,6 +613,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Keybindings dispatch | [[test#GPUI Client Headless Suites#GPUI keybindings dispatch]] | Pane/Workspace/Tab/Navigation/View keybinding actions (gpui-test) |
 | Config load with removed keys | [[test#GPUI Client Headless Suites#Config load with removed keys]] | "Removed configuration keys" rows (gpui-test) |
 | Config live reload | [[test#GPUI Client Headless Suites#Config live reload]] | `ConfigReloaded` live reload (scripted-E2E) |
+| Window opacity | [[test#GPUI Client Headless Suites#Window opacity]] | Rendering/window `appearance.opacity` (gpui-test) |
 | URL/OSC8 detection | [[test#GPUI URL Detection]] | hover/dwell/open surface (gpui-test) |
 | IPC bridge ordering | [[test#GPUI IPC Bridge]] | Executor-model ordering risk (gpui-test) |
 | Remote connect picker | [[test#GPUI Client Headless Suites#GPUI remote connect picker]] | `ListRemotePeers`, `ListLanPeers`, `RemotePeerList` remote connect picker (gpui-test) |
@@ -694,6 +695,42 @@ The test builds metrics from an edited appearance block and asserts the family, 
 Backs the `ConfigReloaded` parity row at the protocol boundary: the reload path must put the message on the wire, ordered ahead of whatever the user types next.
 
 Driving [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#config_reloaded]] followed by a `KeyInput` on the same ordered writer channel, the test asserts a `ClientMessage::ConfigReloaded` is dequeued first. Ordering is the point: the server must have re-read the config before it interprets the next keystroke, otherwise a policy edit applies a keypress late.
+
+### Window opacity
+
+Locks the `appearance.opacity` paint model — clamping, which surfaces scale, and which deliberately do not — so the launch gate's live-translucency row cannot regress into the hardcoded-opaque state that bead `scribe-38e.56` fixed. See [[rendering#Rendering#GPUI Ported Rendering Logic#GPUI Window Opacity]].
+
+These cases cover the derivation only. The composited result — an opacity edit shifting real pixels toward the desktop behind the window, live and without a restart — is a display-server property and is verified against a running window on a composited host.
+
+#### Clamps configured opacity
+
+Confirms [[crates/scribe-client-gpui/src/opacity.rs#clamp_opacity]] saturates out-of-range values instead of producing an invalid colour, because the config file is never validated on load.
+
+The test drives an in-range value through unchanged, checks `1.5` and `-0.2` saturate to `1.0` and `0.0`, and checks NaN falls back to fully opaque so a malformed edit degrades to a normal window rather than an invisible one.
+
+#### Backgrounds carry the opacity alpha
+
+Verifies [[crates/scribe-client-gpui/src/opacity.rs#surface]] folds the configured opacity into a theme slot's alpha and touches nothing else.
+
+Painting a theme slot at `1.0` leaves it opaque; at `0.85` only the alpha moves while the RGB channels stay at the theme's colour, so a composited desktop blends toward the backdrop instead of shifting hue. Out-of-range values saturate through the same clamp.
+
+#### Already-translucent chrome multiplies
+
+Checks that a colour which is already partly transparent keeps its relative translucency when opacity scales it, and that foreground slots are exempt.
+
+[[crates/scribe-client-gpui/src/opacity.rs#scale_alpha]] and [[crates/scribe-client-gpui/src/opacity.rs#scale_slot]] multiply a half-alpha colour at half opacity down to a quarter, matching the legacy renderer's per-cell background scaling, while [[crates/scribe-client-gpui/src/opacity.rs#opaque_slot]] returns a foreground colour's own alpha untouched.
+
+#### Chrome backgrounds scale, chrome content does not
+
+Proves [[crates/scribe-client-gpui/src/tab_bar.rs#TabBarColors#from_chrome]] makes the titlebar alpha-aware without dimming its text, satisfying the parity row's requirement that chrome backgrounds repaint alpha-aware.
+
+Building the palette at `1.0` and `0.85` from a real theme, the test asserts the bar background, active-tab background and gradient top each scale by the opacity while their RGB stays put, and that text, separator and accent alphas are identical at both values. Out-of-range opacities clamp rather than overshooting or inverting the bar.
+
+#### Status bar band scales with opacity
+
+Verifies [[crates/scribe-client-gpui/src/status_bar.rs#StatusBarColors#with_opacity]] scales only the filled band, keeping every readable element at full strength.
+
+The test compares a theme-derived palette against its scaled copy and asserts the background alpha follows the opacity while the text, top hairline and dimmed stat-label alphas do not, then drives `1.5` and `-0.2` through the same clamp.
 
 ### GPUI remote connect picker
 

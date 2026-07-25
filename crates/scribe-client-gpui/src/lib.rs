@@ -63,6 +63,7 @@ pub mod lost_control;
 pub mod mouse_reporting;
 pub mod mouse_state;
 pub mod notification_dispatcher;
+pub mod opacity;
 pub mod palette;
 pub mod pane_tree;
 pub mod paste;

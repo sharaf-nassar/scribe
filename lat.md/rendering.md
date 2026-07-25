@@ -178,6 +178,16 @@ It applies bold→bright promotion via [[crates/scribe-client-gpui/src/color.rs#
 
 Per the [[rendering#Glyph Atlas#GPUI Box-Drawing Overlay]] capability spike, `TerminalElement` paints this mask as a foreground-coloured quad overlay after cell backgrounds and before shaped text, keeping edge-to-edge coverage regardless of font availability.
 
+### GPUI Window Opacity
+
+`appearance.opacity` is a pure repaint in the GPUI client: the native surface is always alpha-capable and the configured value only scales the alpha of the backgrounds Scribe paints into it. See [[client#Client#Config Watching#GPUI Config Port#Terminal Window Reload Wiring]] for the reload seam.
+
+[[crates/scribe-client-gpui/src/opacity.rs]] owns the derivation. [[crates/scribe-client-gpui/src/opacity.rs#clamp_opacity]] saturates out-of-range values into `0.0..=1.0` and maps NaN to fully opaque, so a malformed config degrades to a normal window instead of an invisible one — the config file itself is never validated on load, so every consumer clamps. [[crates/scribe-client-gpui/src/opacity.rs#surface]] and [[crates/scribe-client-gpui/src/opacity.rs#scale_slot]] fold that value into a background's alpha, while [[crates/scribe-client-gpui/src/opacity.rs#opaque_slot]] passes foreground colours through untouched. That split mirrors the legacy renderer's [[crates/scribe-client/src/main.rs#apply_opacity_to_instances]], which scaled each cell's background alpha and never its glyphs, so text stays readable over whatever the desktop shows through.
+
+Two rules make the result equal the configured number rather than an accumulation of it. First, the window is opened with `WindowBackgroundAppearance::Transparent` unconditionally, even at opacity 1.0: surface capability is fixed at creation, so deriving it from the startup value would force a restart to ever go translucent — the legacy client's `window_transparent` flag had exactly that wart and refused live changes ([[crates/scribe-client/src/main.rs#App#apply_opacity_change]]). At 1.0 every painted background is alpha 1.0 and the window is pixel-identical to an opaque one. Second, the root element paints nothing at all. The titlebar, terminal grid and status bands tile the window edge to edge, so each pixel carries the opacity alpha exactly once; filling the root as well would composite a translucent band over a translucent root and land at 0.98 for a configured 0.85.
+
+The alpha-aware surfaces are the terminal grid ([[crates/scribe-client-gpui/src/terminal_element.rs#GridColors]]), the titlebar and tab bar ([[crates/scribe-client-gpui/src/tab_bar.rs#TabBarColors#from_chrome]]), the prompt bar ([[crates/scribe-client-gpui/src/prompt_bar.rs#PromptBarColors#with_opacity]]), the terminal-status strip, and the window status bar ([[crates/scribe-client-gpui/src/status_bar.rs#StatusBarColors#with_opacity]]). Their colours come from the resolved theme rather than the literals the spike hardcoded, so a `theme` edit now repaints the grid and the strip too.
+
 ## Chrome Rendering
 
 UI chrome (tab bars, status bars, dividers, dialogs) is rendered as solid or rounded quads via [[crates/scribe-renderer/src/chrome.rs#solid_quad]].
