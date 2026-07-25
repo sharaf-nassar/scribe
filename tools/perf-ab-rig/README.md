@@ -65,12 +65,14 @@ silently zeroed a metric:
   then sits there unexecuted — so every command goes out as `type` followed by
   `key Return`. Without this the firehose and scroll workloads silently measure
   nothing.
-- **The pager is advanced with `space`, not PageDown.** A synthetic `Next` is
-  dropped between the X event and the PTY on the GPUI client — it drives no
-  bytes and no repaint, even though `ctrl+Next` still reaches the client's own
-  next-tab binding — so driving the scroll workload with it scores "the client
-  painted nothing" instead of a frame rate. `space` is `less`'s canonical
-  page-forward key and a plain printable character both clients encode.
+- **The pager is advanced with `space`, not PageDown.** `space` is `less`'s
+  canonical page-forward key and a plain printable character both clients
+  encode through their simplest path, so the scroll metric measures paint
+  rather than key encoding. This started as a workaround: a synthetic `Next`
+  was dropped between the X event and the PTY on the GPUI client, scoring the
+  workload as "the client painted nothing". `scribe-38e.84` fixed that by
+  wiring the ported encoder into the live key path, but `space` stays the drive
+  key because it depends on the least machinery.
 - **Key delivery falls back.** The rig prefers window-targeted synthetic events
   (`xdotool key --window`) because a stray keystroke then cannot escape into
   another application. A toolkit that reads keys through XInput2 ignores those

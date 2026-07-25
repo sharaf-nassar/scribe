@@ -36,7 +36,7 @@ use scribe_client_gpui::dialog::{
     AnyDialog, ClipboardDialog, CloseDialog, DialogColors, DialogEvent, DialogOutcome, DialogView,
     DisallowedSchemeAction, DisallowedSchemeDialog, UpdateAction, UpdateDialogKind,
 };
-use scribe_client_gpui::input::KeyInput;
+use scribe_client_gpui::input::{self, KeyInput, TerminalMode};
 use scribe_client_gpui::keybindings::{KeyAction, LayoutAction, translate_key_action};
 use scribe_client_gpui::layout::Rect;
 use scribe_client_gpui::opacity::{clamp_opacity, opaque_slot, surface};
@@ -1435,26 +1435,36 @@ fn ai_tab_command(provider: AiProvider, resume: bool) -> Vec<String> {
     vec![shell, String::from("-lic"), command]
 }
 
-/// Interim keystroke encoder feeding the outbound [`IpcSink`] (see
+/// Keystroke encoder feeding the outbound [`IpcSink`] (see
 /// [`TerminalView::on_key_down`]).
+///
+/// This is the live entry point of the ported terminal encoder: the GPUI event
+/// is lowered by [`KeyInput::from_key_down`] and handed to
+/// [`input::encode`](scribe_client_gpui::input::encode), the same function the
+/// golden byte fixtures pin. It replaced an interim passthrough table that only
+/// knew Enter/Tab/Backspace/Escape and the four arrows, so every other named
+/// key — PageUp/PageDown, Home/End, Insert/Delete, the function keys — was
+/// silently dropped before the PTY even though the encoder had always mapped
+/// them (`CSI 5~` / `CSI 6~` and friends).
+///
+/// The mode is [`TerminalMode::legacy`] because this client tracks no per-pane
+/// DECCKM/DECPAM or Kitty negotiation yet; that state lands with the terminal
+/// mode plumbing and is the only thing standing between here and full parity.
 fn encode_key(event: &KeyDownEvent) -> Option<Vec<u8>> {
-    if let Some(text) = event.keystroke.key_char.as_ref()
-        && !text.is_empty()
+    let text = event.keystroke.key_char.as_deref().filter(|text| !text.is_empty());
+    // Multi-codepoint text has no single-key encoder form (the encoder works on
+    // one logical key), so forward it verbatim as the interim table did.
+    if let Some(text) = text
+        && text.chars().count() > 1
     {
-        return Some(text.clone().into_bytes());
+        return Some(text.as_bytes().to_vec());
     }
-    let bytes: &[u8] = match event.keystroke.key.as_str() {
-        "enter" => b"\r",
-        "tab" => b"\t",
-        "backspace" => b"\x7f",
-        "escape" => b"\x1b",
-        "up" => b"\x1b[A",
-        "down" => b"\x1b[B",
-        "right" => b"\x1b[C",
-        "left" => b"\x1b[D",
-        _ => return None,
-    };
-    Some(bytes.to_vec())
+    if let Some(key_input) = KeyInput::from_key_down(event) {
+        return input::encode(&key_input, TerminalMode::legacy());
+    }
+    // The keystroke names no key the encoder knows; if the platform still
+    // produced text, that text is the best available encoding.
+    text.map(|text| text.as_bytes().to_vec())
 }
 
 /// Drains the config watcher's change signal on the GPUI foreground.

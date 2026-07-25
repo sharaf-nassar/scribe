@@ -71,10 +71,12 @@ MEMORY_TABS=10                 # tab count for the memory metric
 SCROLL_SECONDS=8               # sustained scroll drive time
 SCROLL_KEY_DELAY_MS=8          # spacing between synthetic page-forward events
 # The pager is advanced with `space`, not `Next`. `space` is `less`'s canonical
-# page-forward key and a plain printable character, so both clients encode it;
-# a synthetic PageDown is dropped somewhere between the X event and the PTY on
-# the GPUI client and drives no repaint at all, which would silently score the
-# scroll metric as "the client painted nothing".
+# page-forward key and a plain printable character, so both clients encode it
+# through their simplest path, which keeps the scroll metric measuring paint
+# rather than key encoding. `Next` is no longer wrong — the GPUI client dropped
+# a bare PageDown before its encoder until `scribe-38e.84` wired the ported
+# encoder into the live key path — but `space` stays the drive key because it
+# depends on the least machinery.
 SCROLL_ADVANCE_KEY=space
 
 while [[ $# -gt 0 ]]; do
