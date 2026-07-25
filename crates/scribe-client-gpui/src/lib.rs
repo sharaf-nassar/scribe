@@ -39,8 +39,10 @@
 //! modal a click on the CTA opens.
 //!
 //! The binary shell consumes a growing slice of this surface directly: the
-//! [`keybindings`] parser now drives the live key path, and [`tab_session`]
-//! holds the ordered tab strip those tab shortcuts mutate. The remaining
+//! [`keybindings`] parser now drives the live key path, [`tab_session`]
+//! holds the ordered tab strip those tab shortcuts mutate, and
+//! [`window_lifecycle`] is the close / quit / window-list / focus-report state
+//! the IPC reader and the GPUI view share across threads. The remaining
 //! consumers (pane splits, scrollback navigation, zoom) land in later beads of
 //! the `gpui-client-rebuild` epic.
 
@@ -96,6 +98,7 @@ pub mod tooltip;
 pub mod update;
 pub mod url_detect;
 pub mod vi_mode;
+pub mod window_lifecycle;
 pub mod window_state;
 pub mod workspace_layout;
 pub mod workspace_notes;

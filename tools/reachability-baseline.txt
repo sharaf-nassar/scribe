@@ -24,10 +24,10 @@
 # Wiring one of these up means deleting its line here and bumping the matching
 # count. Adding a line is a deliberate act that needs a bead to justify it.
 
-counts modules-total 60
-counts modules-wired 30
+counts modules-total 61
+counts modules-wired 31
 counts server-messages-total 59
-counts server-messages-handled 28
+counts server-messages-handled 31
 counts layout-actions-total 36
 counts layout-actions-handled 10
 
@@ -75,7 +75,6 @@ unhandled-server-message LanDialIdentity
 unhandled-server-message LanEnv
 unhandled-server-message LanPeerList
 unhandled-server-message PromptMark
-unhandled-server-message QuitRequested
 unhandled-server-message ReleaseList
 unhandled-server-message RemoteDisconnect
 unhandled-server-message RemoteEnv
@@ -87,8 +86,6 @@ unhandled-server-message SearchResults
 unhandled-server-message TrustedDeviceList
 unhandled-server-message TrustedNetworkList
 unhandled-server-message UpdateCheckResult
-unhandled-server-message WindowClosed
-unhandled-server-message WindowList
 unhandled-server-message WindowTakenOver
 unhandled-server-message WorkspaceInfo
 unhandled-server-message WorkspaceNotesChanged

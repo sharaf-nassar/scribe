@@ -1,0 +1,13 @@
+# Client config seeded through SCRIBE_EXTRA_CONFIG for
+# tests/e2e/visual/window-lifecycle.sh.
+#
+# The window-list poll is gated on `remote.enabled` exactly as the winit client
+# gates it — the reply's only rendered consumer is the status bar's
+# owning-machine remote-control summary, which is not drawn while remote control
+# is off — so the test has to opt in for `ListWindows` to leave the client.
+#
+# The entrypoint writes this file *after* `scribe-test server start`, so the
+# already-running server never reads it: nothing is remote-enabled on the server
+# side and no TCP listener is bound. It only turns the client's poll on.
+[remote]
+enabled = true

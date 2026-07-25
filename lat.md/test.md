@@ -286,6 +286,15 @@ A green unit test over [[crates/scribe-client-gpui/src/settings/server_action.rs
 The script walks seven phases, screenshotting each: opening the remote page puts `GetLanEnv`, `ListTrustedNetworks`, and `ListTrustedDevices` on the wire and renders both list replies; the Refresh control re-issues them; the seeded network's Remove sends `RemoveTrustedNetwork` carrying that record id and the list re-renders as empty; the seeded device's Revoke sends `RevokeTrustedDevice` carrying that device id; "Trust it" sends `AddCurrentNetworkTrusted` (last of the remote-page phases, because a fingerprintable network would add a row and no later click may depend on the list length); the environment page's keystore action sends `EnvPreflight` and gets an `EnvPreflightResult` back; and flipping the env-persistence toggle ON runs the same gate before committing.
 
 Clicks are placed at window-relative offsets derived from the fixed GPUI row heights ([[settings#GPUI Settings Window#Page model]]), and the trust section is rendered above the remote page's config controls so every row stays above the fold. A layout change therefore surfaces as a failing phase rather than a silent miss.
+### Window lifecycle over the wire
+
+`tests/e2e/visual/window-lifecycle.sh` is the app-level oracle for the seven window-lifecycle parity rows: it drives the real client against the real server and reads every frame off the recorded wire (see [[client#Client#GPUI Window Lifecycle]]).
+
+Nothing is stubbed and nothing is injected. The wire tap ([[crates/scribe-test/src/share_tap.rs#run]], `SCRIBE_SHARE_TAP=1`) is interposed purely as a recorder, so every server frame the script asserts on is one the real `scribe-server` chose to send in answer to something the real client sent. `tests/e2e/visual/window-lifecycle-config.toml` is seeded through `SCRIBE_EXTRA_CONFIG` to turn `remote.enabled` on, because the window-list poll is gated on it exactly as the winit client gates it; the entrypoint writes that file after the server has already started, so only the client's poll is affected and no remote listener is bound.
+
+The five phases each assert a different half of the conversation. A phase-0 preamble hands the client a live pane through the same daemon-stop-and-relaunch trick [[test#Visual E2E Tests#Overlay actions run for real]] documents, asserted on the client's own `AttachSessions` frame. Phase 1 waits for a `ListWindows` and its `WindowList` answer to both appear and for the client to log the reply's shape, so a dropped reply cannot pass. Phase 2 iconifies and re-activates the window and asserts the exact `FocusChanged { gained: null, lost: <session> }` and its mirror image, then creates a second tab and asserts a report that names a gain *and* a loss. Phase 3 sends WM_DELETE_WINDOW through openbox's Alt+F4 (`xdotool windowclose` is deliberately not used — it calls `XDestroyWindow` and bypasses the protocol), asserts the client vetoed the close and painted its dialog instead of dying, and then that "Quit Scribe" put `QuitAll` on the wire, that the server broadcast `QuitRequested`, and that the process exited on it. Phase 4 relaunches, reads the window id out of the fresh `Welcome`, and asserts "Kill Window" sent `CloseWindow` naming that id, that the server answered `WindowClosed`, and that the client exited.
+
+Exiting is asserted as process death rather than as a screenshot, because the whole point of the acknowledgement is that the app goes away; a pixel check could not tell a torn-down window from a hung one.
 
 ### Update surfaces
 
@@ -968,6 +977,36 @@ With both an announced version and a `CompletedRestartRequired` progress state p
 Checks that both terminal decisions retire the CTA, so a confirmed or declined update cannot keep re-offering itself on every repaint.
 
 [[crates/scribe-client-gpui/src/update.rs#UpdateState#on_triggered]] clears the version and release URL but is deliberately narrower than [[crates/scribe-client-gpui/src/update.rs#UpdateState#on_dismissed]], which also drops progress: after a trigger the server's own `UpdateProgress` takes over the label, whereas after a dismissal the server suppresses the version entirely and even a stale `Failed` state must not linger.
+
+### GPUI Window Lifecycle
+
+Locks the decision table of [[crates/scribe-client-gpui/src/window_lifecycle.rs#WindowLifecycle]] — when a close or quit may be sent, which acknowledgement ends the window, what a focus transition reports, and how a window list projects. See [[client#Client#GPUI Window Lifecycle]].
+
+These cases cover the shared state machine only. That the running window actually emits `CloseWindow` / `QuitAll` / `ListWindows` / `FocusChanged` and acts on the server's answers is a whole-app property, verified by [[test#Visual E2E Tests#Window lifecycle over the wire]].
+
+#### Close and quit wait for their acknowledgement
+
+Confirms both shutdown requests are one-shot and that neither of them, on its own, ends the window — only the server's answer does.
+
+"Kill Window" is inert until a `Welcome` names this connection's window, because the server refuses a `CloseWindow` that names any other one. Once claimed, [[crates/scribe-client-gpui/src/window_lifecycle.rs#WindowLifecycle#begin_close_window]] and [[crates/scribe-client-gpui/src/window_lifecycle.rs#WindowLifecycle#begin_quit_all]] both refuse a second request, so a repeated Enter on the dialog cannot put a second frame on the wire. [[crates/scribe-client-gpui/src/window_lifecycle.rs#WindowLifecycle#take_exit]] stays empty until the matching acknowledgement arrives and yields the exit exactly once, and a `QuitRequested` caused by a *different* window still exits this one.
+
+#### An unrelated close ack is ignored
+
+Verifies [[crates/scribe-client-gpui/src/window_lifecycle.rs#WindowLifecycle#on_window_closed]] only obeys an acknowledgement naming the window this client asked to close.
+
+A `WindowClosed` arriving with no pending close, or naming somebody else's window while ours is still pending, must leave the window running and the pending close intact — closing a live window on another window's ack is the failure this guard exists for, and it mirrors the winit client's "ignoring unexpected `WindowClosed` ack" branch.
+
+#### Focus reports collapse window and session state
+
+Checks that OS activation and pane selection collapse into a single reported value, so every kind of focus movement produces the one gained/lost pair the server expects.
+
+A window that is active but showing no pane reports nothing; focusing a pane reports a gain; re-asking with the same pane reports nothing, which is what keeps the lifecycle tick from re-sending on every poll; a tab switch reports the gain and the loss together; and a blur reports the loss even though the tab did not change. A tab switch made *while* blurred stays silent, and the following re-focus reports the pane that is actually on screen rather than the one that was focused before the blur.
+
+#### Window list projects remote controllers
+
+Verifies [[crates/scribe-client-gpui/src/window_lifecycle.rs#WindowLifecycle#set_windows]] keeps only the windows a remote peer controls and reports whether the summary changed.
+
+Locally-controlled windows carry no controller and contribute nothing, so an all-local reply leaves the status-bar summary empty and returns `false` — no repaint. A reply that adds a controller changes the summary; an identical follow-up reply does not, which is what stops a 2 s poll from repainting the bar forever.
 
 ### GPUI remote connect picker
 

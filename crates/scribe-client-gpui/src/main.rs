@@ -34,8 +34,8 @@ use scribe_client_gpui::context_menu::{
     MenuItem,
 };
 use scribe_client_gpui::dialog::{
-    AnyDialog, ClipboardDialog, CloseDialog, DialogColors, DialogEvent, DialogOutcome, DialogView,
-    DisallowedSchemeAction, DisallowedSchemeDialog, UpdateAction, UpdateDialogKind,
+    AnyDialog, ClipboardDialog, CloseAction, CloseDialog, DialogColors, DialogEvent, DialogOutcome,
+    DialogView, DisallowedSchemeAction, DisallowedSchemeDialog, UpdateAction, UpdateDialogKind,
 };
 use scribe_client_gpui::input::{self, KeyInput, TerminalMode};
 use scribe_client_gpui::keybindings::{
@@ -56,6 +56,7 @@ use scribe_client_gpui::sys_stats::SystemStatsCollector;
 use scribe_client_gpui::tooltip::{TooltipColors, TooltipPosition, TooltipRender, tooltip_element};
 use scribe_client_gpui::update::UpdateState;
 use scribe_client_gpui::url_detect;
+use scribe_client_gpui::window_lifecycle::{ExitReason, FocusReport, WindowLifecycle};
 use scribe_client_gpui::workspace_notes::WorkspaceNoteEntry;
 use scribe_client_gpui::workspace_notes_modal::{
     WorkspaceNotesModalAction, WorkspaceNotesModalColors, WorkspaceNotesModalView,
@@ -74,7 +75,7 @@ use scribe_common::{
     ids::{SessionId, WorkspaceId},
     protocol::{
         ArchiveReason, AutomationAction, ClientMessage, ServerMessage, SessionInfo, TerminalSize,
-        WorkspaceNoteStatus,
+        WindowInfo, WorkspaceNoteStatus,
     },
     screen::ScreenSnapshot,
     screen_replay::SessionReplay,
@@ -244,6 +245,11 @@ struct Shared {
     /// writes it; the view renders the centred status-bar CTA from it and opens
     /// the confirmation modal a click on that CTA resolves to.
     update: Arc<Mutex<UpdateState>>,
+    /// Window close / quit / focus-report state. The view raises a close, a
+    /// quit, or a focus change here from a real UI event and the reader folds
+    /// the server's `WindowClosed` / `QuitRequested` / `WindowList` answer back
+    /// into it; the view's lifecycle tick drains the acknowledged exit.
+    lifecycle: Arc<Mutex<WindowLifecycle>>,
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -256,6 +262,17 @@ const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(120);
 /// their next keystroke, long enough that the `_NET_ACTIVE_WINDOW` round-trip
 /// stays off the hot path.
 const X11_FOCUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often the foreground runs the window-lifecycle tick: draining a
+/// server-acknowledged exit, reporting a focus transition the reader caused
+/// (a reattach moves the focused pane without any UI event), and re-polling the
+/// window list when it is due.
+const WINDOW_LIFECYCLE_TICK: Duration = Duration::from_millis(200);
+
+/// How often the client re-polls the server's window list. Mirrors the winit
+/// client's throttle: the reply only feeds the status bar's remote-control
+/// summary, so it is refreshed on a human timescale rather than per frame.
+const WINDOW_LIST_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The terminal grid's window-level background, kept in sRGB `[f32; 4]` theme
 /// space until the render pass folds `appearance.opacity` into its alpha,
@@ -344,6 +361,9 @@ struct TerminalView {
     /// window id (so: X11 sessions only). Suppresses keystrokes while a
     /// compositor overlay covers the window without sending a focus event.
     x11_focus: Option<X11FocusGuard>,
+    /// When the window list was last polled, throttling the `ListWindows` send
+    /// to [`WINDOW_LIST_POLL_INTERVAL`].
+    last_window_list_poll: Instant,
     // Held to keep the redraw poll alive; dropping the view cancels the task.
     _refresh_task: Task<()>,
     /// Held to keep the config-reload poll alive; dropping the view cancels it.
@@ -351,9 +371,13 @@ struct TerminalView {
     /// Held to keep the `_NET_ACTIVE_WINDOW` poll alive; dropping the view
     /// cancels it. `None` when the focus guard is not enabled.
     _x11_focus_task: Option<Task<()>>,
-    /// Held to keep the window-activation observer alive, which clears the
-    /// guard's reactivation debounce on a genuine focus event.
-    _activation_observer: Option<Subscription>,
+    /// Held to keep the window-lifecycle tick alive; dropping the view cancels
+    /// the exit drain, the focus reconciliation, and the window-list poll.
+    _lifecycle_task: Task<()>,
+    /// Held to keep the window-activation observer alive. It reports focus to
+    /// the server on every activation change and clears the X11 guard's
+    /// reactivation debounce on a genuine focus event.
+    _activation_observer: Subscription,
 }
 
 impl TerminalView {
@@ -370,19 +394,30 @@ impl TerminalView {
         // Non-X11 backends yield no id, leaving `x11_focus` `None` and every
         // guard call below an explicit no-op.
         let x11_focus = X11FocusGuard::from_window_handle(&*window);
-        let (x11_focus_task, activation_observer) = if x11_focus.is_some() {
+        let x11_focus_task = if x11_focus.is_some() {
             tracing::info!(
                 window = scribe_client_gpui::x11_focus::xcb_window_id(&*window),
                 "X11 active-window guard enabled"
             );
-            let task = cx.spawn(async move |view, app| drive_x11_focus_polls(view, app).await);
-            let observer =
-                cx.observe_window_activation(window, |view, window, _| view.on_activation(window));
-            (Some(task), Some(observer))
+            Some(cx.spawn(async move |view, app| drive_x11_focus_polls(view, app).await))
         } else {
-            (None, None)
+            None
         };
+        // The focus observer is registered unconditionally: reporting focus to
+        // the server is a protocol obligation on every backend, and the X11
+        // guard is only one of the two things an activation change drives.
+        let activation_observer = cx
+            .observe_window_activation(window, |view, window, ctx| view.on_activation(window, ctx));
+        // The WM's close button must raise the in-app close dialog instead of
+        // destroying the window behind the server's back, so the platform close
+        // is always vetoed and the dialog decides what to ask the server for.
+        let close_requester = cx.weak_entity();
+        window.on_window_should_close(cx, move |_window, app| {
+            close_requester.update(app, TerminalView::request_window_close).unwrap_or(true)
+        });
         let generation = Arc::clone(&shared.generation);
+        let lifecycle_task =
+            cx.spawn(async move |view, app| drive_window_lifecycle(view, app).await);
         let refresh_task =
             cx.spawn(async move |view, app| drive_redraws(view, app, generation).await);
         // Load the config and start the file watcher in one step so an edit
@@ -438,9 +473,11 @@ impl TerminalView {
             pending_osc8_uri: None,
             tooltip_demo: false,
             x11_focus,
+            last_window_list_poll: Instant::now(),
             _refresh_task: refresh_task,
             _config_task: config_task,
             _x11_focus_task: x11_focus_task,
+            _lifecycle_task: lifecycle_task,
             _activation_observer: activation_observer,
         }
     }
@@ -787,12 +824,13 @@ impl TerminalView {
 
     /// Route a resolved modal choice.
     ///
-    /// Two outcomes have a live consumer: an update decision goes to
-    /// [`Self::route_update_action`], and a disallowed-scheme "Open Anyway"
-    /// activates the parked URI without the allowlist guard. Every other
-    /// resolution — including Escape / backdrop, which resolves to the safe
-    /// action — drops it; the close, paste and clipboard modals answer server
-    /// prompts and are wired with those surfaces.
+    /// Three outcomes have a live consumer: an update decision goes to
+    /// [`Self::route_update_action`], a close decision to
+    /// [`Self::route_close_action`], and a disallowed-scheme "Open Anyway"
+    /// activates the parked URI without the allowlist guard. The paste and
+    /// clipboard modals answer server prompts and are wired with those
+    /// surfaces; Escape / backdrop resolves to each modal's safe action, which
+    /// for the close dialog is Cancel and therefore a deliberate no-op.
     fn route_dialog_outcome(&mut self, outcome: DialogOutcome) {
         // Both consumers read state the dialog parked on the view, so take the
         // pending URI up front and clear the update kind only once the update
@@ -800,18 +838,157 @@ impl TerminalView {
         let pending = self.pending_osc8_uri.take();
         match outcome {
             DialogOutcome::Update(action) => self.route_update_action(action),
+            DialogOutcome::Close(action) => self.route_close_action(action),
             DialogOutcome::DisallowedScheme(DisallowedSchemeAction::OpenAnyway) => {
                 if let Some(uri) = pending {
                     url_detect::open_uri_unguarded(&uri);
                 }
             }
-            DialogOutcome::Close(_)
-            | DialogOutcome::Paste(_)
+            DialogOutcome::Paste(_)
             | DialogOutcome::Clipboard(_)
             | DialogOutcome::DisallowedScheme(_) => {}
         }
         // The dialog is gone either way, so its kind must not outlive it.
         self.update_dialog_kind = None;
+    }
+
+    /// Raise the close confirmation for a window-close request.
+    ///
+    /// Returns whether the platform may destroy the window: always `false`,
+    /// because the server owns this window's sessions and has to be told what
+    /// to do with them. The WM's close button, the quit chord, and a palette
+    /// row all land here, so there is exactly one place a close is decided.
+    fn request_window_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.dialog.is_some() {
+            return false;
+        }
+        let session_count = self.shared.tabs.lock().map_or(0, |tabs| tabs.tabs().len());
+        self.open_dialog(AnyDialog::Close(CloseDialog::new(session_count)), cx);
+        false
+    }
+
+    /// Act on the close dialog's answer.
+    ///
+    /// "Quit Scribe" and "Kill Window" each put one frame on the wire and then
+    /// wait: the window only goes away when the server acknowledges, so a
+    /// server that never answers leaves a usable window rather than a
+    /// half-closed one. Cancel — which Escape and a backdrop click also resolve
+    /// to — does nothing at all.
+    fn route_close_action(&mut self, action: CloseAction) {
+        match action {
+            CloseAction::QuitAll => self.request_quit_all(),
+            CloseAction::CloseWindow => self.request_close_window(),
+            CloseAction::Cancel => {}
+        }
+    }
+
+    /// Ask the server to bring every window down, and wait for `QuitRequested`.
+    fn request_quit_all(&self) {
+        let Ok(mut lifecycle) = self.shared.lifecycle.lock() else {
+            tracing::warn!("quit all dropped: window lifecycle mutex poisoned");
+            return;
+        };
+        if !lifecycle.begin_quit_all() {
+            tracing::debug!("quit all ignored: a shutdown is already in flight");
+            return;
+        }
+        drop(lifecycle);
+        tracing::info!("quit all — awaiting server acknowledgment");
+        if let Err(error) = self.sink.quit_all() {
+            tracing::warn!(%error, "quit all dropped: IPC writer closed");
+            self.abandon_shutdown();
+        }
+    }
+
+    /// Ask the server to destroy this window and its sessions, then wait for
+    /// the matching `WindowClosed`.
+    fn request_close_window(&self) {
+        let Ok(mut lifecycle) = self.shared.lifecycle.lock() else {
+            tracing::warn!("close window dropped: window lifecycle mutex poisoned");
+            return;
+        };
+        let Some(window_id) = lifecycle.begin_close_window() else {
+            tracing::warn!(
+                "close window ignored: no window id from Welcome yet, or a shutdown is in flight"
+            );
+            return;
+        };
+        drop(lifecycle);
+        tracing::info!(%window_id, "closing window permanently — awaiting server acknowledgment");
+        if let Err(error) = self.sink.close_window(window_id) {
+            tracing::warn!(%error, "close window dropped: IPC writer closed");
+            self.abandon_shutdown();
+        }
+    }
+
+    /// Release the shutdown slot after a request that never reached the wire.
+    fn abandon_shutdown(&self) {
+        if let Ok(mut lifecycle) = self.shared.lifecycle.lock() {
+            lifecycle.abandon_shutdown();
+        }
+    }
+
+    /// Report the window's current focus to the server, if it moved.
+    ///
+    /// Both producers converge here — the activation observer for an OS focus
+    /// change, the lifecycle tick for a pane change the reader caused — and
+    /// [`WindowLifecycle::focus_change`] collapses them into one gained/lost
+    /// pair, dropping the report entirely when nothing actually moved.
+    fn report_focus(&mut self) {
+        let session = self.shared.active_session.lock().ok().and_then(|guard| *guard);
+        let Ok(mut lifecycle) = self.shared.lifecycle.lock() else {
+            return;
+        };
+        let Some(FocusReport { gained, lost }) = lifecycle.focus_change(session) else {
+            return;
+        };
+        drop(lifecycle);
+        tracing::debug!(?gained, ?lost, "reporting focus change");
+        if let Err(error) = self.sink.focus_changed(gained, lost) {
+            tracing::warn!(%error, "focus report dropped: IPC writer closed");
+        }
+    }
+
+    /// Run one window-lifecycle tick on the GPUI thread.
+    ///
+    /// Three jobs, all of which need the foreground: a server-acknowledged exit
+    /// can only be performed here, a focus transition the IPC reader caused
+    /// (a reattach moves the focused pane with no UI event behind it) is
+    /// reconciled here, and the window-list poll sends from the view's own sink.
+    fn poll_window_lifecycle(&mut self, cx: &mut Context<Self>) {
+        let exit = self.shared.lifecycle.lock().ok().and_then(|mut l| l.take_exit());
+        if let Some(reason) = exit {
+            match reason {
+                ExitReason::QuitRequested => {
+                    tracing::info!("quit requested by server — exiting");
+                }
+                ExitReason::WindowClosed => {
+                    tracing::info!("window close acknowledged by server — exiting");
+                }
+            }
+            cx.quit();
+            return;
+        }
+        self.report_focus();
+        self.poll_window_list();
+    }
+
+    /// Re-poll the server's window list when it is due.
+    ///
+    /// Gated on `remote.enabled` exactly like the winit client: the reply only
+    /// feeds the status bar's owning-machine remote-control summary, which is
+    /// not rendered at all while remote control is off.
+    fn poll_window_list(&mut self) {
+        if !self.config.config().config.remote.enabled {
+            return;
+        }
+        if self.last_window_list_poll.elapsed() < WINDOW_LIST_POLL_INTERVAL {
+            return;
+        }
+        self.last_window_list_poll = Instant::now();
+        if let Err(error) = self.sink.list_windows() {
+            tracing::warn!(%error, "window list poll dropped: IPC writer closed");
+        }
     }
 
     /// Ask the server for a new session in the active workspace.
@@ -842,6 +1019,10 @@ impl TerminalView {
         let Some(session_id) = move_selection(&mut tabs) else { return };
         drop(tabs);
         self.attach(session_id);
+        // A tab switch moves the focused pane, which the server relays to PTY
+        // applications as a CSI focus event — reported here rather than on the
+        // next tick so the switched-to pane learns about it immediately.
+        self.report_focus();
         self.sync_tabs(cx);
     }
 
@@ -1215,7 +1396,7 @@ impl TerminalView {
                 cx.notify();
             }
             OverlayChord::CloseDialog => {
-                self.open_dialog(AnyDialog::Close(CloseDialog::new(1)), cx);
+                self.request_window_close(cx);
             }
             OverlayChord::ClipboardDialog => {
                 self.open_dialog(
@@ -1323,11 +1504,20 @@ impl TerminalView {
 
     /// Handle a window activation change from the platform.
     ///
+    /// This is the client's focus observer: the server relays CSI focus events
+    /// (`\x1b[I` / `\x1b[O`) to PTY applications that enabled DECSET 1004, so
+    /// both edges are reported — a blurred window focuses no pane.
+    ///
     /// Compositor overlays never send focus events, so a genuine activation
-    /// means the user really is back: drop the guard's reactivation debounce
-    /// rather than eating the keystroke that follows a real refocus.
-    fn on_activation(&mut self, window: &Window) {
-        if !window.is_window_active() {
+    /// also means the user really is back: drop the guard's reactivation
+    /// debounce rather than eating the keystroke that follows a real refocus.
+    fn on_activation(&mut self, window: &Window, _cx: &mut Context<Self>) {
+        let active = window.is_window_active();
+        if let Ok(mut lifecycle) = self.shared.lifecycle.lock() {
+            lifecycle.set_window_active(active);
+        }
+        self.report_focus();
+        if !active {
             return;
         }
         if let Some(guard) = self.x11_focus.as_mut() {
@@ -1617,6 +1807,21 @@ async fn drive_x11_focus_polls(view: WeakEntity<TerminalView>, app: &mut AsyncAp
     }
 }
 
+/// Runs the window-lifecycle tick on the GPUI foreground.
+///
+/// The IPC reader learns that the server acknowledged a close or a quit, and
+/// moves the focused pane on a reattach, but it owns neither the app nor the
+/// sink's UI-side callers. This task is where those cross-thread facts become
+/// actions: quitting the app, reporting focus, and re-polling the window list.
+async fn drive_window_lifecycle(view: WeakEntity<TerminalView>, app: &mut AsyncApp) {
+    loop {
+        app.background_executor().timer(WINDOW_LIFECYCLE_TICK).await;
+        if view.update(app, TerminalView::poll_window_lifecycle).is_err() {
+            return;
+        }
+    }
+}
+
 /// Repaints the view whenever the IPC drain bumps the shared generation counter.
 ///
 /// The same 16 ms tick is the idle-wake boundary the feature-015 control hint
@@ -1677,6 +1882,12 @@ impl TerminalView {
         let update = self.shared.update.lock().ok();
         let update_available = update.as_ref().and_then(|state| state.version());
         let update_progress = update.as_ref().and_then(|state| state.progress());
+        // Same borrow discipline as the update guard: the remote-control
+        // summary is rendered from the controller list the last `WindowList`
+        // reply left behind, so the lock is held across `build_model`.
+        let remote_enabled = self.config.config().config.remote.enabled;
+        let lifecycle = self.shared.lifecycle.lock().ok();
+        let controllers = lifecycle.as_ref().map_or(&[][..], |state| state.controllers());
         status_bar::build_model(
             &StatusBarData {
                 connected,
@@ -1688,7 +1899,7 @@ impl TerminalView {
                 last_command_status: None,
                 env_status: session.and_then(|chrome| chrome.env_status.as_ref()),
                 session_count,
-                remote: RemoteStatusData { enabled: false, controllers: &[] },
+                remote: RemoteStatusData { enabled: remote_enabled, controllers },
                 share_presence: self.shared.share.lock().ok().and_then(|share| share.presence()),
                 // A remote shell's own host wins; a local pane keeps the
                 // placeholder until the hostname surface lands.
@@ -1958,6 +2169,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         chrome_metadata: Arc::new(Mutex::new(ChromeMetadata::new())),
         share: Arc::new(Mutex::new(ShareChrome::new())),
         update: Arc::new(Mutex::new(UpdateState::default())),
+        lifecycle: Arc::new(Mutex::new(WindowLifecycle::new())),
     };
     let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
     let (in_tx, in_rx) = unbounded_channel::<InboundEvent>();
@@ -2159,6 +2371,7 @@ async fn run_connection(ctx: IpcThread) -> Result<(), String> {
             tabs: ctx.shared.tabs,
             share: ctx.shared.share,
             update: ctx.shared.update,
+            lifecycle: ctx.shared.lifecycle,
             out_tx: ctx.out_tx,
             in_tx: ctx.in_tx,
             sink: ctx.sink,
@@ -2310,6 +2523,9 @@ struct ReaderCtx {
     share: Arc<Mutex<ShareChrome>>,
     /// Update availability / progress the centred status-bar CTA renders from.
     update: Arc<Mutex<UpdateState>>,
+    /// Window-lifecycle state the reader adopts a window id into and folds the
+    /// server's close / quit / window-list answers onto.
+    lifecycle: Arc<Mutex<WindowLifecycle>>,
     out_tx: UnboundedSender<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
@@ -2367,6 +2583,22 @@ fn update_share_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut ShareChrome)) {
 fn update_update_state(ctx: &ReaderCtx, mutate: impl FnOnce(&mut UpdateState)) {
     let Ok(mut guard) = ctx.update.lock() else {
         tracing::warn!("update state mutex poisoned; dropping update");
+        return;
+    };
+    mutate(&mut guard);
+    drop(guard);
+    ctx.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Apply `mutate` to the shared window-lifecycle state and request a repaint.
+///
+/// Same failure contract as [`update_ai_chrome`]: a poisoned mutex costs one
+/// lifecycle update rather than the reader and every pane's output with it. The
+/// repaint matters even for the shutdown arms, because the foreground's
+/// lifecycle tick is what turns an acknowledged exit into a real quit.
+fn update_lifecycle(ctx: &ReaderCtx, mutate: impl FnOnce(&mut WindowLifecycle)) {
+    let Ok(mut guard) = ctx.lifecycle.lock() else {
+        tracing::warn!("window lifecycle mutex poisoned; dropping update");
         return;
     };
     mutate(&mut guard);
@@ -2592,16 +2824,7 @@ fn dispatch_server_message(
 ) -> Result<(), String> {
     match message {
         ServerMessage::Welcome { window_id, participant_id, .. } => {
-            // A takeover Hello's Welcome hands back the adopted window id, and
-            // the additive v3 field names this connection's own share seat so a
-            // later roster matches it exactly instead of by device name.
-            registry.adopt_window(window_id);
-            update_share_chrome(ctx, |share| share.set_self_id(participant_id));
-            tracing::debug!(
-                adopted = ?registry.adopted_window(),
-                ?participant_id,
-                "welcome: adopted window"
-            );
+            on_welcome(ctx, registry, window_id, participant_id);
         }
         ServerMessage::SessionList { sessions, workspaces, .. } => {
             registry.rebuild_from_session_list(&sessions);
@@ -2683,6 +2906,12 @@ fn dispatch_server_message(
         | ServerMessage::ControlRequested { .. }
         | ServerMessage::ControlDenied { .. }
         | ServerMessage::ShareEnded { .. }) => dispatch_share_message(share, ctx),
+        // The three window-lifecycle answers all land in the same shared state
+        // the GPUI thread's lifecycle tick drains, so they are named here and
+        // routed as one to [`on_window_lifecycle_message`].
+        lifecycle @ (ServerMessage::WindowClosed { .. }
+        | ServerMessage::WindowList { .. }
+        | ServerMessage::QuitRequested) => on_window_lifecycle_message(ctx, lifecycle),
         other => unhandled_server_message(&other),
     }
     Ok(())
@@ -2835,6 +3064,75 @@ fn on_update_message(ctx: &ReaderCtx, message: ServerMessage) {
         // Unreachable: the caller only routes the two update variants here.
         other => unhandled_server_message(&other),
     }
+}
+
+/// Adopt everything the server's `Welcome` hands this connection.
+///
+/// The window id lands in two places on purpose: the reader's registry uses it
+/// for a takeover's reattach topology, and the shell's [`WindowLifecycle`] copy
+/// is what a `CloseWindow` must name — copying it here keeps the GPUI thread
+/// out of the reader's registry. The additive v3 `participant_id` names this
+/// connection's own share seat so a later roster matches it exactly rather than
+/// by device name.
+fn on_welcome(
+    ctx: &ReaderCtx,
+    registry: &mut session_lifecycle::SessionRegistry,
+    window_id: scribe_common::ids::WindowId,
+    participant_id: Option<u64>,
+) {
+    registry.adopt_window(window_id);
+    update_lifecycle(ctx, |lifecycle| lifecycle.adopt_window(window_id));
+    update_share_chrome(ctx, |share| share.set_self_id(participant_id));
+    tracing::debug!(
+        adopted = ?registry.adopted_window(),
+        ?participant_id,
+        "welcome: adopted window"
+    );
+}
+
+/// Fold one window-lifecycle answer into the shared [`WindowLifecycle`].
+///
+/// These three variants are the server's whole side of the window's own
+/// lifecycle. `QuitRequested` and a matching `WindowClosed` each arm the exit
+/// the foreground's lifecycle tick performs — the reader deliberately does not
+/// exit the process itself, so the window comes down through GPUI rather than
+/// from an IPC thread. A `WindowClosed` naming a window this client never asked
+/// to close is ignored, matching the winit client. `WindowList` refreshes the
+/// status bar's owning-machine remote-control summary.
+fn on_window_lifecycle_message(ctx: &ReaderCtx, message: ServerMessage) {
+    match message {
+        ServerMessage::QuitRequested => {
+            tracing::info!("server requested quit — saving and exiting");
+            update_lifecycle(ctx, WindowLifecycle::on_quit_requested);
+        }
+        ServerMessage::WindowClosed { window_id } => {
+            update_lifecycle(ctx, |lifecycle| {
+                if lifecycle.on_window_closed(window_id) {
+                    tracing::info!(%window_id, "window close acknowledged by server");
+                } else {
+                    tracing::debug!(%window_id, "ignoring unexpected WindowClosed ack");
+                }
+            });
+        }
+        ServerMessage::WindowList { windows } => {
+            log_window_list(&windows);
+            update_lifecycle(ctx, |lifecycle| {
+                lifecycle.set_windows(windows);
+            });
+        }
+        // Unreachable: the caller only routes the three variants above here.
+        other => unhandled_server_message(&other),
+    }
+}
+
+/// Log a `WindowList` reply's shape.
+///
+/// The reply's only rendered consumer is a status-bar segment that shows
+/// nothing at all while no window is remote-controlled, so without this line a
+/// working poll and a dropped one look identical from outside the process.
+fn log_window_list(windows: &[WindowInfo]) {
+    let controlled = windows.iter().filter(|window| window.controller.is_some()).count();
+    tracing::info!(windows = windows.len(), controlled, "server window list");
 }
 
 /// Fold one feature-015 share notice into the shared [`ShareChrome`].

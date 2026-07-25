@@ -9,16 +9,19 @@
 //! (`CreateSession` / `AttachSessions` / `Subscribe` / `RequestSnapshot` /
 //! `CloseSession`), the feature-015
 //! control-passing frames (`ControlClaim` / `ControlGrant`) the share surfaces
-//! raise, and the update decisions the status-bar CTA drives (`TriggerUpdate` /
-//! `DismissUpdate`), onto the ordered IPC-writer channel. The outbound path never
-//! traverses the inbound drain, so keystrokes are never queued behind an output
-//! firehose and `Resize` is always flushed ahead of the `KeyInput` that follows.
+//! raise, the update decisions the status-bar CTA drives (`TriggerUpdate` /
+//! `DismissUpdate`), and the window-lifecycle frames the close dialog, the
+//! window-list poll and the focus observer raise (`CloseWindow` / `QuitAll` /
+//! `ListWindows` / `FocusChanged`), onto the ordered IPC-writer channel. The
+//! outbound path never traverses the inbound drain, so keystrokes are never
+//! queued behind an output firehose and `Resize` is always flushed ahead of the
+//! `KeyInput` that follows.
 
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use scribe_client_gpui::share::ControlIntent;
 use scribe_common::{
-    ids::{SessionId, WorkspaceId},
+    ids::{SessionId, WindowId, WorkspaceId},
     protocol::{ClientMessage, TerminalSize, WorkspaceNotesMutation},
 };
 use tokio::{
@@ -364,6 +367,56 @@ impl IpcSink {
     /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
     pub fn dismiss_update(&self) -> Result<(), SinkClosed> {
         self.enqueue(ClientMessage::DismissUpdate)
+    }
+
+    /// Asks the server to destroy `window_id` and every session it owns, which
+    /// is the close dialog's "Kill Window". The server answers `WindowClosed`
+    /// and the shell exits on that acknowledgement, never on this send.
+    ///
+    /// The id is the one `Welcome` handed this connection: the server refuses a
+    /// `CloseWindow` naming any other window.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn close_window(&self, window_id: WindowId) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::CloseWindow { window_id })
+    }
+
+    /// Asks the server to bring every window down gracefully, which is the
+    /// close dialog's "Quit Scribe". The server answers every connected client
+    /// — this one included — with `QuitRequested`; sessions are preserved.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn quit_all(&self) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::QuitAll)
+    }
+
+    /// Polls the server for the windows it knows about, answered with a single
+    /// `WindowList`. Drives the status bar's owning-machine remote-control
+    /// summary, so it is only sent while `remote.enabled` makes that summary
+    /// meaningful.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn list_windows(&self) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::ListWindows)
+    }
+
+    /// Reports a pane focus transition so the server can relay CSI focus events
+    /// (`\x1b[I` / `\x1b[O`) to PTY applications that enabled DECSET 1004.
+    ///
+    /// Sent for a window activation change and for a tab switch alike: both
+    /// collapse to the same gained/lost pair before they reach the sink.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn focus_changed(
+        &self,
+        gained: Option<SessionId>,
+        lost: Option<SessionId>,
+    ) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::FocusChanged { gained, lost })
     }
 
     fn enqueue(&self, message: ClientMessage) -> Result<(), SinkClosed> {
