@@ -88,8 +88,8 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `ConfigReloaded` | live config reload | scripted-E2E | `main.rs::apply_config_reload` → `IpcSink::config_reloaded` | required |
 | `ReportWorkspaceTree` | layout persistence | scripted-E2E | `main.rs::TerminalView::report_workspace_tree` → `PaneShell::wire_tree` → `IpcSink::report_workspace_tree`, after every layout mutation | required |
 | `SearchRequest` | find overlay | scripted-E2E | `main.rs::TerminalView::send_search_request` → `ipc_bridge::IpcSink::search_request`, from every find-overlay query edit | required |
-| `WorkspaceNotesGet` | workspace notes | scripted-E2E | `main.rs::open_workspace_notes_modal` → `IpcSink::workspace_notes_get` — **degenerate** (demo chord, fabricated `WorkspaceId`, reply dropped by the reader catch-all); FU-21 | required |
-| `WorkspaceNotesMutate` | workspace notes | scripted-E2E | `main.rs::route_workspace_notes_action` → `IpcSink::workspace_notes_mutate` — same demo caveat; FU-21 | required |
+| `WorkspaceNotesGet` | workspace notes | scripted-E2E | `main.rs::TerminalView::open_workspace_notes_modal` → `IpcSink::workspace_notes_get`, on the workspace `TerminalView::notes_workspace_id` resolves | required |
+| `WorkspaceNotesMutate` | workspace notes | scripted-E2E | `main.rs::TerminalView::route_workspace_notes_action` → `IpcSink::workspace_notes_mutate` | required |
 | `Hello` | registration/adoption | scripted-E2E | `main.rs::run_connection` (sent on every connect) | required |
 | `CloseWindow` | close dialog | scripted-E2E | `main.rs::TerminalView::route_close_action` → `ipc_bridge::IpcSink::close_window`, from the close dialog the WM close request and the quit chord raise | required |
 | `QuitAll` | quit-all dialog | scripted-E2E | `main.rs::TerminalView::route_close_action` → `ipc_bridge::IpcSink::quit_all`, from the same close dialog | required |
@@ -162,8 +162,8 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `GitBranch` | status/tab metadata | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_git_branch` → `StatusBarData.git_branch` | required |
 | `SessionList` | startup/reconnect | scripted-E2E | `main.rs::run_reader` arm → `main.rs::sync_tab_strip` | required |
 | `WorkspaceInfo` | workspace layout | scripted-E2E | `main.rs::on_workspace_info` → `ChromeMetadata::name_workspace` + parked for `TerminalView::adopt_workspace_info` → `PaneShell::apply_workspace_info` | required |
-| `WorkspaceNotesSnapshot` | workspace notes | scripted-E2E | — (missing, FU-21) — the modal sends `WorkspaceNotesGet` and never receives a reply | required |
-| `WorkspaceNotesChanged` | workspace notes | scripted-E2E | — (missing, FU-21) | required |
+| `WorkspaceNotesSnapshot` | workspace notes | scripted-E2E | `main.rs::on_workspace_notes_message` → `WorkspaceNotesStore::apply_collections` → `TerminalView::sync_workspace_notes` | required |
+| `WorkspaceNotesChanged` | workspace notes | scripted-E2E | `main.rs::on_workspace_notes_message` → `WorkspaceNotesStore::apply_collection` → `TerminalView::sync_workspace_notes` | required |
 | `SearchResults` | find overlay | scripted-E2E | `main.rs::on_search_results` → `search::FindResults` → `search::FindOverlayView::adopt_results` → `terminal_element::TerminalElement::with_highlights` | required |
 | `Welcome` | registration/adoption | scripted-E2E | `main.rs::run_reader` arm → `session_lifecycle::SessionRegistry::adopt_window` | required |
 | `WindowClosed` | close lifecycle | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_window_closed` → the shell's lifecycle tick quits the app | required |

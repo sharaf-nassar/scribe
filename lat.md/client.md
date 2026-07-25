@@ -808,7 +808,17 @@ The GPUI rebuild ports the per-workspace notes modal and its hover preview as `g
 
 [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#WorkspaceNotesPreviewView]] paints the hover preview in two modes — a read-only list with a "+N more" overflow row plus a "+" affordance (FR-001), or the inline editor (FR-002) with a caret, error row, and scroll clamp. The pure sizing/wrap helpers ([[crates/scribe-client-gpui/src/workspace_notes_preview.rs#preview_cols]], [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#wrap_text_for_editor]], [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#caret_line_index]]) stay testable; clicks emit a [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#WorkspaceNotesPreviewAction]].
 
-The shell wires both over the frozen protocol through [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#workspace_notes_get]] and [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#workspace_notes_mutate]]; the `main.rs` spike opens the modal on Ctrl+Shift+N and routes its actions so the visual E2E can exercise every surface.
+The shell wires both over the frozen protocol through [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#workspace_notes_get]] and [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#workspace_notes_mutate]]; Ctrl+Shift+M opens the modal and routes its actions.
+
+### GPUI Workspace Notes IPC
+
+The notes surface is bound to the workspace the user is actually in, and every list it paints comes from the server: nothing is fabricated client-side and nothing is applied optimistically.
+
+[[crates/scribe-client-gpui/src/main.rs#TerminalView#notes_workspace_id]] resolves the target `WorkspaceId` before anything opens: the focused region when the server itself minted its id (`PaneShell::is_server_workspace`), otherwise the focused tab's workspace — the id `SessionList` / `SessionCreated` filed that session under. When the client has learned no server workspace yet, [[crates/scribe-client-gpui/src/main.rs#TerminalView#open_workspace_notes_modal]] declines to open rather than inventing an id the server has never seen. That is what makes the `WorkspaceNotesGet` it sends answerable and the `WorkspaceNotesMutate` a save produces land on real notes.
+
+The inbound half lands on the IPC reader thread, which must never touch a GPUI entity, so [[crates/scribe-client-gpui/src/main.rs#on_workspace_notes_message]] folds both `WorkspaceNotesSnapshot` (the answer to the modal's own request) and `WorkspaceNotesChanged` (the broadcast the server fans out after each accepted mutation) into the shared [[crates/scribe-client-gpui/src/workspace_notes.rs#WorkspaceNotesStore]] and bumps the repaint generation. [[crates/scribe-client-gpui/src/main.rs#TerminalView#sync_workspace_notes]] adopts it on the next redraw, gated on [[crates/scribe-client-gpui/src/workspace_notes.rs#WorkspaceNotesStore#version]] so an unchanged cache costs one comparison; the draft is only replaced while pristine ([[crates/scribe-client-gpui/src/workspace_notes_modal.rs#WorkspaceNotesModalView#replace_pristine_draft]]), so a late snapshot never eats typed text. Because the broadcast is the only thing that moves the rendered lists, two windows converge on the server's last accepted mutation.
+
+A rejected mutation arrives as the flat `ServerMessage::Error` channel, so [[crates/scribe-client-gpui/src/main.rs#on_server_error]] matches the server's `workspace note mutation failed` prefix and mirrors that one class of error into the store's `last_error`, where the modal footer renders it, in addition to the status line every error reaches.
 
 ### Inline editor caret motion
 
