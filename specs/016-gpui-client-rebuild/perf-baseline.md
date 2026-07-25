@@ -37,6 +37,57 @@ tables). The Q3 startup budget was re-scoped accordingly (spec.md,
 same host, and this file's machine-readable slot below now stores the old
 client's end-to-end number.
 
+## 2026-07-25 re-capture: first *painted* frame, shared probe
+
+The 2026-07-24 capture above measures the old client's startup from its logs,
+which stop at GPU-ready. Bead `scribe-38e.83` re-captured both clients through
+the shared runtime probe (`crates/scribe-common/src/perf_probe.rs`), whose
+`startup_first_frame_ms` is latched on the first *painted frame* and timed from
+the first statement of each client's `main` — identical code on both sides of
+the A/B. Both binaries were built from this tree at `target/release/` and
+launched cold five times each against the already-running local server, which
+was never restarted.
+
+| Client | Samples (ms) | Median |
+|---|---|---:|
+| Old (`scribe-client`, winit) | 3400.7 / 3401.8 / 3502.8 / 3598.6 / 4681.8 | 3502.8 ms |
+| New (`scribe-client-gpui`) | 633.8 / 752.1 / 760.6 / 763.0 / 780.2 | 760.6 ms |
+
+An interleaved second batch under desktop load reproduced the ratio: old
+3688 / 3919 / 5465 / 5869 ms against new 721 / 789 / 887 / 1418 ms. A later
+`--live --startup-only --record-baseline` rig run scored medians of 3334.4 ms
+(old) against 621.4 ms (new), of which 27.1 ms was Scribe's. The old
+client's total is dominated by pre-window work its GPU timings never covered —
+`load_host_stats` alone is ~1234 ms and `app_constructed` reaches ~2465 ms
+before the window is created.
+
+### Startup composition (new client)
+
+From the GPUI client's `SCRIBE_GPUI_STARTUP_TIMING` marker, which times
+`cx.open_window` — the span in which no Scribe code runs.
+
+| Span | Samples (ms) | Median |
+|---|---|---:|
+| `gpu_bringup_ms` (inside `cx.open_window`) | 609.6 / 727.9 / 733.6 / 733.9 / 751.5 | 733.6 ms |
+| `scribe_startup_ms` (everything else) | 24.0 / 24.1 / 26.6 / 28.7 / 29.4 | 26.6 ms |
+
+This is the GPU bring-up floor that justifies the Q3 startup re-scope in
+`spec.md`, and `scribe_startup_ms` is what the re-scope's absolute 150 ms
+budget gates.
+
+### Old-client component timings (log method, retained)
+
+Structured `client startup timing` log lines from the old client. These remain
+useful as component references but are **not** first-frame baselines.
+
+| Metric | Value | Method |
+|---|---:|---|
+| Window + GPU init | 190 ms (2026-07-24), 642 ms (2026-07-25) | `init_gpu_and_terminal_done` total time |
+| Config and static-state load | 81 ms (2026-07-24), 1236 ms (2026-07-25) | `startup_state_loaded` total time |
+| GPU surface configure | 138 ms (2026-07-24), 464–561 ms (2026-07-25) | `configure_wgpu` total time |
+| Terminal renderer construction | 171 ms | `create_terminal_renderer` total time |
+| First initial-session creation | 2 ms | `handle_empty_session_list` total time |
+
 ## Machine-readable baselines
 
 The A/B rig (`tools/perf-ab-rig/run-perf-ab.sh`) reads the block below and
@@ -46,9 +97,12 @@ rig reports the metric as `NO-BASELINE` rather than passing it. Running the
 rig with `--live --old-client <bin> --record-baseline` re-measures the old
 client with the same probe in the same session and writes the values back
 here. `startup_first_frame_ms` is end-to-end (see above), median of the rig's
-startup samples.
+startup samples. The recorded 3334.415 ms is the probe method (first painted
+frame) against an old client rebuilt from this tree; the log method against the
+installed binary scored 3697 ms on the same host. The rig prefers the probe
+whenever the launched binary reports it and falls back to the log otherwise.
 
-    perf_baseline_startup_first_frame_ms=3697
+    perf_baseline_startup_first_frame_ms=3334.415
     perf_baseline_input_latency_p50_ms=
     perf_baseline_firehose_bytes_per_sec=
     perf_baseline_memory_rss_kb=

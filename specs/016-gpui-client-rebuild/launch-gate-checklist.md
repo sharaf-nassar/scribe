@@ -43,6 +43,15 @@ fails on scripted-E2E (AI indicator), perf, and unverifiable manual rows.
   ~0.7–1.3 s vs old ~3.3–4.5 s, `perf-ab-report.md`). Re-gate B1 with
   `tools/perf-ab-rig/run-perf-ab.sh --live` (all five metrics).
 
+  *Update 2026-07-25 (`scribe-38e.83`):* the re-scope gained a second,
+  absolute half. Both clients now report the first painted frame through the
+  shared probe, and the GPUI client splits its own span: 610–751 ms is spent
+  inside `cx.open_window` (wgpu adapter enumeration and device creation, no
+  Scribe code running) and only 24–29 ms is Scribe's. The gate therefore caps
+  Scribe-attributable startup at 150 ms absolute on top of the end-to-end
+  comparison, so a future regression in client code still fails even though
+  the platform floor dominates the total.
+
   The other four metrics (input latency, cat-firehose throughput,
   memory@10 tabs, scroll fps) were originally recorded as DEFERRED because the
   rig still treated the client as the display-only spike. `scribe-38e.51` has
@@ -162,9 +171,11 @@ Two consequences bind this gate:
 
 ## Re-gate criteria
 
-Re-run this gate when all of the following are resolved: `.50` (startup gate
-green under the re-scoped same-host A/B — spec.md "Q3 re-scope"), `.51` (rig
-drives all five metrics), `.52` (AI-indicator func green),
+Re-run this gate when all of the following are resolved: `.50`/`.83` (startup
+gate green under the re-scoped Q3 budget — Scribe-attributable startup
+≤150 ms and total first frame no worse than the old client, spec.md
+"Q3 re-scope"), `.51` (rig drives all five metrics), `.52` (AI-indicator func
+green),
 `.56` (opacity implemented) followed by `.53` (opacity re-verified), and `.57`
 (config watcher wired, live reload proven). The IME manual procedure still
 requires a human on a host with an input-method engine.

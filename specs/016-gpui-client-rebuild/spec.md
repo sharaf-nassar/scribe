@@ -520,6 +520,57 @@ arrives several times sooner than the old client's splash ever did.
 Enforced by `tools/perf-ab-rig/run-perf-ab.sh`; the fresh end-to-end
 old-client baseline lives in `perf-baseline.md`.
 
+**Q3 startup amendment (2026-07-25, bead `scribe-38e.83`): the absolute
+half.** The same-host A/B above stays as stated, and a second, absolute
+criterion is added alongside it so a regression in client code still fails
+the gate even though the platform floor dominates the total.
+
+1. **Scribe-attributable startup ≤ 150 ms, absolute.** This is
+   startup-to-first-frame minus the span inside gpui's `cx.open_window`, i.e.
+   every millisecond the client itself is responsible for. Enforced by
+   `tools/perf-ab-rig/run-perf-ab.sh` from the client's
+   `SCRIBE_GPUI_STARTUP_TIMING` marker (`scribe_startup_ms`).
+2. **Total startup-to-first-frame no worse than the old client**, unchanged
+   from the 2026-07-24 re-scope, but now measured through the shared probe
+   (`crates/scribe-common/src/perf_probe.rs`, key `startup_first_frame_ms`)
+   whenever a client reports it: the span is latched on the first *painted
+   frame* and timed from the first statement of each client's `main`, so both
+   halves of the A/B run the same code. The old client's startup-log wall
+   clock remains the fallback for binaries built before the probe key, and it
+   stops at GPU-ready rather than first paint, so it slightly understates the
+   old client.
+
+Splash deletion (OQ8) stays authorized on the re-scoped gate passing.
+
+*Justification — the gpui GPU bring-up floor.* Measured on the reference
+RTX 3090 host (2026-07-25, release builds from this tree, live server, five
+samples each; see `perf-baseline.md`):
+
+| Span | GPUI client | Old client |
+|---|---:|---:|
+| Inside `cx.open_window` / `configure_wgpu` | 610–751 ms | 464–561 ms |
+| Scribe-attributable startup | 24–29 ms | — |
+| Total process start → first painted frame | 634–780 ms | 3401–4682 ms |
+
+No Scribe code runs inside `cx.open_window`: vendored `gpui_wgpu`'s
+`WgpuContext::select_adapter_and_device` builds its instance over
+`Backends::VULKAN | GL`, calls `enumerate_adapters(Backends::all())` and then
+creates a device per candidate until a surface configures. That walk alone
+(PCI/DRM enumeration over both cards, the EGL/Mesa GL backend, nvidia device
+creation) is 610–751 ms here, which is why no client on this host can paint a
+first frame within 500 ms.
+
+Nothing confined to this repository removes the floor. Measured and rejected
+in `scribe-38e.50`/`.83`: restricting Vulkan ICDs (~60 ms), suppressing the GL
+backend via `__EGL_VENDOR_LIBRARY_FILENAMES` (~130 ms, and it deletes the
+software-rendering fallback Q1 depends on), `WindowBackgroundAppearance::
+Opaque` (no change, and it would regress window opacity), and dropping the
+wgpu `gles` feature (impossible — zed pins `wgpu = "29.0.4"` with default
+features and cargo feature unification is additive). Even a perfect patch of
+`gpui_wgpu` behind a `[patch]` fork lands around 550–600 ms, still over the
+retired ceiling. The remaining lever is upstream, so the gate measures what
+this repo controls absolutely and compares the rest like-for-like.
+
 **Q4: 015 sequencing?**
 A: **Land 015 first.** The parity target includes 015's final client
 surfaces. The epic's cutover-critical beads depend on 015 landing; early
