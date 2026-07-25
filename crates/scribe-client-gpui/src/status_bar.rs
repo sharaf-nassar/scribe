@@ -22,6 +22,7 @@ use scribe_common::config::StatusBarStatsConfig;
 use scribe_common::protocol::{ControllerInfo, EnvStatusState, UpdateProgressState};
 use scribe_common::theme::ChromeColors;
 
+use crate::opacity::scale_slot;
 use crate::sys_stats::SystemStats;
 
 /// Outcome of a focused pane's most-recently-resolved command.
@@ -107,6 +108,7 @@ pub struct StatusBarData<'a> {
 /// sRGB colours for the status bar, derived from the theme's [`ChromeColors`]
 /// and ANSI palette. Unlike the legacy renderer these stay in sRGB space; GPUI
 /// converts to linear when it paints.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StatusBarColors {
     pub bg: [f32; 4],
     pub text: [f32; 4],
@@ -149,6 +151,17 @@ impl StatusBarColors {
             ],
             top_border: chrome.status_bar_separator,
         }
+    }
+
+    /// Return this palette with `appearance.opacity` folded into the filled
+    /// band background.
+    ///
+    /// Only `bg` scales: the band is a window background, while the text,
+    /// sparkline and hairline colours are content that must stay legible over
+    /// whatever the translucent window reveals.
+    #[must_use]
+    pub fn with_opacity(self, opacity: f32) -> Self {
+        Self { bg: scale_slot(self.bg, opacity), ..self }
     }
 }
 
@@ -623,6 +636,23 @@ pub fn render(
 
 #[cfg(test)]
 mod tests {
+    // @lat: [[test#GPUI Client Headless Suites#Window opacity#Status bar band scales with opacity]]
+    #[test]
+    fn status_bar_band_scales_with_opacity() {
+        let theme = scribe_common::theme::minimal_dark();
+        let base = super::StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
+        let dimmed = base.with_opacity(0.85);
+
+        assert!((dimmed.bg[3] - base.bg[3] * 0.85).abs() < 1e-6);
+        // Text, hairline and stat colours stay fully legible.
+        assert!((dimmed.text[3] - base.text[3]).abs() < 1e-6);
+        assert!((dimmed.top_border[3] - base.top_border[3]).abs() < 1e-6);
+        assert!((dimmed.label[3] - base.label[3]).abs() < 1e-6);
+        // Clamping: a nonsense value saturates rather than inverting the band.
+        assert!((base.with_opacity(1.5).bg[3] - base.bg[3]).abs() < 1e-6);
+        assert!(base.with_opacity(-0.2).bg[3].abs() < 1e-6);
+    }
+
     use super::*;
     use scribe_common::config::{StatusBarComputeStatsConfig, StatusBarUsageStatsConfig};
     use std::collections::VecDeque;

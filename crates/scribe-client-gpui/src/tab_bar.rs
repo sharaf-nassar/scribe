@@ -14,6 +14,8 @@ use std::time::Instant;
 use gpui::Rgba;
 use scribe_common::theme::ChromeColors;
 
+use crate::opacity::scale_alpha;
+
 /// Duration (seconds) of the transient tab attention flash, with a brief
 /// ease-out so it decays smoothly rather than cutting off.
 pub const TAB_FLASH_SECS: f32 = 0.45;
@@ -114,6 +116,27 @@ impl From<&ChromeColors> for TabBarColors {
             separator: srgba(chrome.tab_separator),
             gradient_top: srgba(chrome.tab_bar_gradient_top),
             accent: srgba(chrome.accent),
+        }
+    }
+}
+
+impl TabBarColors {
+    /// Build the palette with `appearance.opacity` folded into the filled
+    /// surfaces only.
+    ///
+    /// The bar background, the active-tab background and the gradient top are
+    /// window backgrounds, so they scale with opacity and let the desktop show
+    /// through. Text, separators and the accent underline are content and keep
+    /// the theme's own alpha, matching the legacy renderer which scaled cell
+    /// background alpha but never foreground glyphs.
+    #[must_use]
+    pub fn from_chrome(chrome: &ChromeColors, opacity: f32) -> Self {
+        let base = Self::from(chrome);
+        Self {
+            bg: scale_alpha(base.bg, opacity),
+            active_bg: scale_alpha(base.active_bg, opacity),
+            gradient_top: scale_alpha(base.gradient_top, opacity),
+            ..base
         }
     }
 }
@@ -245,10 +268,35 @@ pub fn reorder_target_index(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_DANGER_COLOR, CONTEXT_WARN_COLOR, TAB_FLASH_SECS, badge_label, context_suffix,
-        flash_blend, px_units, reorder_target_index, tab_display_title, tab_flash_intensity,
+        CONTEXT_DANGER_COLOR, CONTEXT_WARN_COLOR, TAB_FLASH_SECS, TabBarColors, badge_label,
+        context_suffix, flash_blend, px_units, reorder_target_index, tab_display_title,
+        tab_flash_intensity,
     };
     use gpui::Rgba;
+
+    // @lat: [[test#GPUI Client Headless Suites#Window opacity#Chrome backgrounds scale, chrome content does not]]
+    #[test]
+    fn chrome_backgrounds_scale_but_content_does_not() {
+        let chrome = scribe_common::theme::minimal_dark().chrome;
+        let opaque = TabBarColors::from_chrome(&chrome, 1.0);
+        let translucent = TabBarColors::from_chrome(&chrome, 0.85);
+
+        // Filled surfaces let the desktop through.
+        assert!((translucent.bg.a - opaque.bg.a * 0.85).abs() < 1e-6);
+        assert!((translucent.active_bg.a - opaque.active_bg.a * 0.85).abs() < 1e-6);
+        assert!((translucent.gradient_top.a - opaque.gradient_top.a * 0.85).abs() < 1e-6);
+        // Colour itself is untouched, so only translucency changes.
+        assert!((translucent.bg.r - opaque.bg.r).abs() < 1e-6);
+
+        // Content keeps the theme's own alpha at any opacity.
+        assert!((translucent.text.a - opaque.text.a).abs() < 1e-6);
+        assert!((translucent.separator.a - opaque.separator.a).abs() < 1e-6);
+        assert!((translucent.accent.a - opaque.accent.a).abs() < 1e-6);
+
+        // An out-of-range config value clamps instead of overshooting.
+        assert!((TabBarColors::from_chrome(&chrome, 1.5).bg.a - opaque.bg.a).abs() < 1e-6);
+        assert!(TabBarColors::from_chrome(&chrome, -0.2).bg.a.abs() < 1e-6);
+    }
 
     // @lat: [[client#GPUI Titlebar#Tab flash envelope self-decays]]
     #[test]

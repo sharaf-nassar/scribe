@@ -19,6 +19,8 @@ use std::time::{Duration, SystemTime};
 
 use gpui::{Rgba, div, prelude::*, px};
 
+use crate::opacity::scale_slot;
+
 /// Minimum prompt-row height in pixels.
 pub const ROW_MIN_HEIGHT: f32 = 28.0;
 /// Height of the seam between the two prompt rows.
@@ -76,6 +78,24 @@ impl From<&scribe_common::theme::ChromeColors> for PromptBarColors {
             text: chrome.prompt_bar_text,
             icon_first: chrome.prompt_bar_icon_first,
             icon_latest: chrome.prompt_bar_icon_latest,
+        }
+    }
+}
+
+impl PromptBarColors {
+    /// Return this palette with `appearance.opacity` folded into the two filled
+    /// row backgrounds.
+    ///
+    /// The prompt bar is one of the bands that tiles the window, so it has to
+    /// scale with the terminal grid and the status bar or it would read as an
+    /// opaque stripe across a translucent window. Text and icons keep the
+    /// theme's own alpha.
+    #[must_use]
+    pub fn with_opacity(self, opacity: f32) -> Self {
+        Self {
+            first_row_bg: scale_slot(self.first_row_bg, opacity),
+            second_row_bg: scale_slot(self.second_row_bg, opacity),
+            ..self
         }
     }
 }

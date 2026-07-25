@@ -17,8 +17,8 @@ use std::{
 
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    Point, Render, Task, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, rgb, size,
+    Point, Render, Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use gpui_platform::application;
 use scribe_client_gpui::ai_indicator::AiStateTracker;
@@ -36,6 +36,7 @@ use scribe_client_gpui::dialog::{
 use scribe_client_gpui::input::KeyInput;
 use scribe_client_gpui::keybindings::{KeyAction, LayoutAction, translate_key_action};
 use scribe_client_gpui::layout::Rect;
+use scribe_client_gpui::opacity::{clamp_opacity, opaque_slot, surface};
 use scribe_client_gpui::prompt_bar::{
     self, PromptBarColors, PromptBarData, PromptContextIndicator,
 };
@@ -75,7 +76,7 @@ use crate::{
     ipc_bridge::{InboundEvent, IpcSink, run_drain},
     sync_frames::{SyncFrameQueue, drain_all_committed},
     terminal::{Content, DisplayOnlyTerminal},
-    terminal_element::{GridFont, TerminalElement},
+    terminal_element::{GridColors, GridFont, TerminalElement},
 };
 
 /// Wall-clock origin captured at the very top of `main`, used to time
@@ -184,6 +185,21 @@ struct Shared {
 /// delete-and-recreate save collapses into a single reload.
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
+/// The terminal grid's theme slots, kept in sRGB `[f32; 4]` theme space until
+/// the render pass folds `appearance.opacity` into the background alpha.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TerminalColors {
+    background: [f32; 4],
+    foreground: [f32; 4],
+}
+
+impl TerminalColors {
+    /// Read the grid's colours out of a resolved theme.
+    fn from_theme(theme: &scribe_common::theme::Theme) -> Self {
+        Self { background: theme.background, foreground: theme.foreground }
+    }
+}
+
 struct TerminalView {
     shared: Shared,
     sink: IpcSink,
@@ -214,6 +230,13 @@ struct TerminalView {
     /// Last tab strip pushed into the titlebar, so a redraw only re-renders the
     /// tab row when the shared model actually changed.
     rendered_tabs: TabSessions,
+    /// Terminal background/foreground from the live theme, rebuilt on a theme
+    /// reload. Replaces the hardcoded palette the spike painted with.
+    terminal_colors: TerminalColors,
+    /// Live `appearance.opacity`, clamped to `0.0..=1.0`. Every background this
+    /// window paints scales its alpha by this, so lowering it lets the desktop
+    /// show through without recreating the (always transparent) window.
+    opacity: f32,
     /// The command palette overlay, present only while open.
     command_palette: Option<Entity<CommandPaletteView>>,
     /// The right-click context menu overlay, present only while open.
@@ -251,14 +274,16 @@ impl TerminalView {
             cx.spawn(async move |view, app| drive_config_reloads(view, app, config_signal).await);
         let theme = &config.config().theme;
         let status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
+        let terminal_colors = TerminalColors::from_theme(theme);
         let chrome = config.config().chrome;
+        let opacity = clamp_opacity(config.opacity());
         let font = GridFont::from_appearance(&config.config().config.appearance);
         let stats_config = config.config().config.terminal.status_bar_stats.clone();
         let terminal = &config.config().config.terminal;
         let context_thresholds = terminal.ai_session.context_thresholds.clone();
         let prompt_bar_enabled = terminal.prompt_bar.enabled;
         let prompt_colors = PromptBarColors::from(&chrome);
-        let colors = TabBarColors::from(&chrome);
+        let colors = TabBarColors::from_chrome(&chrome, opacity);
         // The strip starts empty and is filled by the reader's first
         // `SessionList`; `sync_tabs` pushes it into the titlebar on the next
         // redraw so the tab row always mirrors live server state.
@@ -284,6 +309,8 @@ impl TerminalView {
             chrome,
             terminal_size,
             rendered_tabs,
+            terminal_colors,
+            opacity,
             command_palette: None,
             context_menu: None,
             dialog: None,
@@ -316,10 +343,10 @@ impl TerminalView {
         if plan.theme_changed() {
             let theme = self.config.config().theme.clone();
             self.status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
+            self.terminal_colors = TerminalColors::from_theme(&theme);
             self.chrome = theme.chrome;
-            let tab_colors = TabBarColors::from(&self.chrome);
             self.prompt_colors = PromptBarColors::from(&self.chrome);
-            self.titlebar.update(cx, |bar, ctx| bar.set_colors(tab_colors, ctx));
+            self.push_tab_bar_colors(cx);
             // Open overlays captured the old palette when they were built; drop
             // them so a live theme edit never leaves stale colours on screen.
             self.command_palette = None;
@@ -332,7 +359,7 @@ impl TerminalView {
         }
 
         if plan.opacity_changed() {
-            self.apply_opacity_change();
+            self.apply_opacity_change(cx);
         }
 
         // Status-bar stat selection and the prompt-bar toggles are cheap to swap
@@ -376,13 +403,26 @@ impl TerminalView {
 
     /// Delivery point for the reload plan's `opacity_changed()` signal.
     ///
-    /// The live value is already swapped in on [`ConfigRuntime`]; painting it
-    /// onto the GPUI root background (and deciding whether the window was
-    /// created transparent enough to honour it) is owned by the root-background
-    /// opacity work and is deliberately not done here. Everything that path
-    /// needs — the change signal and the new value — arrives through this hook.
-    fn apply_opacity_change(&mut self) {
-        tracing::info!(opacity = self.config.opacity(), "config reload: opacity changed");
+    /// The window's native surface is always transparent (see [`open_window`]),
+    /// so honouring a new opacity is purely a repaint: cache the clamped value,
+    /// push it into the titlebar's cached palette, and let the `cx.notify()` at
+    /// the end of the reload redraw every alpha-aware background. No restart and
+    /// no window recreation is involved, unlike the legacy client which had to
+    /// refuse a live change when the window was created opaque.
+    fn apply_opacity_change(&mut self, cx: &mut Context<Self>) {
+        self.opacity = clamp_opacity(self.config.opacity());
+        self.push_tab_bar_colors(cx);
+        tracing::info!(opacity = self.opacity, "config reload: opacity applied");
+    }
+
+    /// Rebuild the titlebar's cached palette from the live chrome and opacity.
+    ///
+    /// [`TitlebarView`] owns its colours, so both a theme edit and an opacity
+    /// edit have to push a fresh palette rather than relying on the root
+    /// render pass.
+    fn push_tab_bar_colors(&mut self, cx: &mut Context<Self>) {
+        let colors = TabBarColors::from_chrome(&self.chrome, self.opacity);
+        self.titlebar.update(cx, |bar, ctx| bar.set_colors(colors, ctx));
     }
 
     /// Mirror the shared tab strip into the titlebar when it changed.
@@ -1063,13 +1103,27 @@ impl Render for TerminalView {
         let model = self.build_status_model();
         let prompt_model = self.build_prompt_model();
         self.sync_tab_context_suffix(cx);
-        let prompt_colors = self.prompt_colors;
+        let prompt_colors = self.prompt_colors.with_opacity(self.opacity);
         let prompt_strip = prompt_model.map(|prompt| {
             prompt_bar::render(&prompt, &prompt_colors, f32::from(CELL_HEIGHT), None)
                 .into_any_element()
         });
         let tooltip = self.build_tooltip_demo();
 
+        let opacity = self.opacity;
+        let grid_colors = GridColors {
+            background: surface(self.terminal_colors.background, opacity),
+            foreground: opaque_slot(self.terminal_colors.foreground),
+        };
+        // The status bar caches its palette across renders, so fold the live
+        // opacity into the filled band here rather than at theme-reload time.
+        let status_colors = self.status_colors.with_opacity(opacity);
+
+        // The root itself paints nothing. Every band below fills the window
+        // edge to edge, so leaving the root unfilled guarantees each pixel
+        // carries the opacity alpha exactly once instead of compositing a
+        // translucent band over a translucent root and coming out more opaque
+        // than the configured value.
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, ctx| {
@@ -1084,14 +1138,13 @@ impl Render for TerminalView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x0010_1318))
             .child(self.titlebar.clone())
             .child(
                 // Wrap the terminal grid so a right-click opens the context menu
                 // at the cursor without disturbing the display-only element.
                 div()
                     .flex_1()
-                    .child(TerminalElement::new(content, self.font.clone()).paint())
+                    .child(TerminalElement::new(content, self.font.clone(), grid_colors).paint())
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
@@ -1106,12 +1159,12 @@ impl Render for TerminalView {
                     .px_2()
                     .flex()
                     .items_center()
-                    .bg(rgb(0x001b_2230))
-                    .text_color(rgb(0x009f_b0c5))
+                    .bg(surface(self.chrome.status_bar_bg, opacity))
+                    .text_color(opaque_slot(self.chrome.status_bar_text))
                     .text_xs()
                     .child(status),
             )
-            .child(status_bar::render(&model, 24., &self.status_colors))
+            .child(status_bar::render(&model, 24., &status_colors))
             .children(self.command_palette.clone())
             .children(self.context_menu.clone())
             .children(self.dialog.clone())
@@ -1238,6 +1291,14 @@ fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink, terminal_size: Ter
             // `xdotool search --name "Scribe"` for focus and screenshot capture.
             titlebar: Some(TitlebarOptions { title: Some("Scribe".into()), ..Default::default() }),
             app_id: Some("scribe".to_owned()),
+            // Always ask for an alpha-capable surface, even at opacity 1.0.
+            // Surface capability is fixed when the window is created, so
+            // choosing it from the startup opacity would force a restart to
+            // ever go translucent — the legacy client's `window_transparent`
+            // wart. Requesting it unconditionally keeps `appearance.opacity`
+            // a pure repaint; at 1.0 every painted background is alpha 1.0
+            // and the window is pixel-identical to an opaque one.
+            window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
         },
         |_, cx| cx.new(|cx| TerminalView::new(shared, sink, terminal_size, cx)),

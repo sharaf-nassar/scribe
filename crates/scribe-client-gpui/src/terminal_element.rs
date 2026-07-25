@@ -1,6 +1,6 @@
 //! GPUI paint path for a display-only terminal [`Content`](crate::terminal::Content) snapshot.
 
-use gpui::{div, prelude::*, px, rgb};
+use gpui::{Rgba, div, prelude::*, px};
 use scribe_common::config::AppearanceConfig;
 
 use crate::terminal::Content;
@@ -58,17 +58,33 @@ impl Default for GridFont {
     }
 }
 
+/// The theme colours the terminal grid paints with.
+///
+/// Derived on every render from the live theme, so a saved `theme` edit
+/// repaints the grid instead of leaving it on a hardcoded palette. `background`
+/// already carries the `appearance.opacity` alpha; `foreground` is deliberately
+/// left at the theme's own alpha so glyphs stay readable through a translucent
+/// window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridColors {
+    /// Grid background, alpha-scaled by `appearance.opacity`.
+    pub background: Rgba,
+    /// Default glyph colour, never scaled by opacity.
+    pub foreground: Rgba,
+}
+
 /// Paints the current terminal grid with fixed-width rows.
 pub struct TerminalElement {
     content: Content,
     font: GridFont,
+    colors: GridColors,
 }
 
 impl TerminalElement {
     /// Captures one stable terminal snapshot for this render pass, painted with
-    /// the font metrics resolved from the live config.
-    pub const fn new(content: Content, font: GridFont) -> Self {
-        Self { content, font }
+    /// the font metrics and theme colours resolved from the live config.
+    pub const fn new(content: Content, font: GridFont, colors: GridColors) -> Self {
+        Self { content, font, colors }
     }
 
     /// Builds the GPUI element tree for the visible terminal grid.
@@ -77,8 +93,8 @@ impl TerminalElement {
         div()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(0x0010_1318))
-            .text_color(rgb(0x00d9_dde3))
+            .bg(self.colors.background)
+            .text_color(self.colors.foreground)
             .font_family(self.font.family)
             .text_size(px(self.font.size))
             .line_height(line_height)

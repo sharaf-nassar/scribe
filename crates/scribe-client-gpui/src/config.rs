@@ -350,12 +350,13 @@ impl ConfigRuntime {
         &self.config.bindings
     }
 
-    /// The root-background opacity from the live config.
+    /// The root-background opacity from the live config, exactly as written.
     ///
     /// This is the delivery point for the reload plan's `opacity_changed()`
     /// signal: the window's opacity hook reads it whenever the plan flags a
-    /// change, so wiring the value into the actual GPUI root background is a
-    /// pure rendering change with no plumbing left to do.
+    /// change. The value is returned unclamped — the config file is not
+    /// validated on load — so every consumer runs it through
+    /// [`clamp_opacity`](crate::opacity::clamp_opacity) before painting with it.
     #[must_use]
     pub const fn opacity(&self) -> f32 {
         self.config.config.appearance.opacity
