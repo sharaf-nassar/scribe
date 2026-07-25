@@ -57,6 +57,16 @@ struct SessionState {
     cwd: Option<PathBuf>,
     title: Option<String>,
     status: SessionStatus,
+    /// Latest AI context-window fill percentage, from `AiStateChanged`.
+    ///
+    /// Held independently of the AI state itself, mirroring the clients'
+    /// decoupled context store: a state edge without a fresh `context=NN`
+    /// keeps the previous percentage visible.
+    ai_context: Option<u8>,
+    /// Whether the session's current AI state pulses for attention
+    /// (`PermissionPrompt` / `WaitingForInput`), which suppresses the tab
+    /// context suffix so the pulse owns the UX.
+    ai_pulsing: bool,
 }
 
 impl SessionState {
@@ -69,6 +79,8 @@ impl SessionState {
             cwd: None,
             title: None,
             status: SessionStatus::Running,
+            ai_context: None,
+            ai_pulsing: false,
         }
     }
 }
@@ -283,7 +295,9 @@ async fn dispatch_server_message(
         | ServerMessage::SessionExited { .. }
         | ServerMessage::SessionContextChanged { .. }
         | ServerMessage::TrimScrollback { .. }
-        | ServerMessage::ScrollBottom { .. }) => {
+        | ServerMessage::ScrollBottom { .. }
+        | ServerMessage::AiStateChanged { .. }
+        | ServerMessage::AiStateCleared { .. }) => {
             dispatch_session_message(msg, state, notifiers).await;
         }
         msg @ (ServerMessage::WorkspaceInfo { .. }
@@ -304,8 +318,6 @@ async fn dispatch_server_message(
         | ServerMessage::CodexTaskLabelCleared { .. }
         | ServerMessage::TaskLabelChanged { .. }
         | ServerMessage::TaskLabelCleared { .. }
-        | ServerMessage::AiStateChanged { .. }
-        | ServerMessage::AiStateCleared { .. }
         | ServerMessage::GitBranch { .. }
         | ServerMessage::Bell { .. }
         | ServerMessage::Error { .. }
@@ -387,6 +399,12 @@ async fn dispatch_session_message(
         ServerMessage::ScrollBottom { session_id } => {
             debug!(%session_id, "scroll bottom (ignored by test daemon)");
         }
+        ServerMessage::AiStateChanged { session_id, ai_state } => {
+            handle_ai_state_changed(session_id, &ai_state, state).await;
+        }
+        ServerMessage::AiStateCleared { session_id } => {
+            handle_ai_state_cleared(session_id, state).await;
+        }
         other => debug!(?other, "ignored non-session server message in session dispatcher"),
     }
 }
@@ -440,12 +458,6 @@ fn dispatch_notice_message(msg: ServerMessage) {
     }
 
     match msg {
-        ServerMessage::AiStateChanged { session_id, ai_state } => {
-            debug!(%session_id, ?ai_state, "AI state changed");
-        }
-        ServerMessage::AiStateCleared { session_id } => {
-            debug!(%session_id, "AI state cleared (ignored by test daemon)");
-        }
         ServerMessage::GitBranch { session_id, branch } => {
             debug!(%session_id, ?branch, "git branch updated");
         }
@@ -536,6 +548,42 @@ async fn handle_screen_snapshot(
         session.latest_snapshot = Some(snapshot);
         session.snapshot_time = Some(tokio::time::Instant::now());
     }
+}
+
+/// Record the AI context percentage and pulse state a client would render for
+/// this session.
+///
+/// A `context` of `None` is *not* written back: the server only merges a fresh
+/// `context=NN` when a producer emits one, and the clients keep showing the last
+/// known percentage across state-only edges. Mirroring that here keeps
+/// `RequestAiChrome` honest about what the chrome displays.
+async fn handle_ai_state_changed(
+    session_id: SessionId,
+    ai_state: &scribe_common::ai_state::AiProcessState,
+    state: &SharedState,
+) {
+    use scribe_common::ai_state::AiState;
+
+    let mut guard = state.lock().await;
+    if let Some(session) = guard.sessions.get_mut(&session_id) {
+        if let Some(context) = ai_state.context {
+            session.ai_context = Some(context);
+        }
+        session.ai_pulsing =
+            matches!(ai_state.state, AiState::PermissionPrompt | AiState::WaitingForInput);
+        debug!(%session_id, ?ai_state.state, context = ?session.ai_context, "AI state changed");
+    }
+}
+
+/// Drop a session's AI chrome so a cleared indicator stops reporting a stale
+/// percentage.
+async fn handle_ai_state_cleared(session_id: SessionId, state: &SharedState) {
+    let mut guard = state.lock().await;
+    if let Some(session) = guard.sessions.get_mut(&session_id) {
+        session.ai_context = None;
+        session.ai_pulsing = false;
+    }
+    debug!(%session_id, "AI state cleared");
 }
 
 async fn handle_cwd_changed(
@@ -713,6 +761,9 @@ async fn process_request(
         }
         DaemonRequest::AssertSnapshotMatch { session_id, reference } => {
             handle_assert_snapshot_match(session_id, &reference, state, server_writer).await
+        }
+        DaemonRequest::RequestAiChrome { session_id } => {
+            handle_request_ai_chrome(session_id, state).await
         }
         DaemonRequest::Shutdown => {
             handle_shutdown(shutdown);
@@ -908,6 +959,35 @@ async fn handle_request_snapshot(
             return DaemonResponse::Error { message: "timed out waiting for snapshot".to_owned() };
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Render the AI chrome text for a session from its last `AiStateChanged`.
+///
+/// The strings come from [`scribe_common::ai_chrome`], the same module the
+/// clients' prompt bar and tab bar format through, so an assertion here is an
+/// assertion about what the chrome spells — not a second implementation of it.
+/// Warn/danger bands come from the loaded config, matching how a client resolves
+/// them.
+async fn handle_request_ai_chrome(session_id: SessionId, state: &SharedState) -> DaemonResponse {
+    let (context, pulsing) = {
+        let guard = state.lock().await;
+        let Some(session) = guard.sessions.get(&session_id) else {
+            return DaemonResponse::Error { message: format!("unknown session: {session_id}") };
+        };
+        (session.ai_context, session.ai_pulsing)
+    };
+    let Some(percent) = context else {
+        return DaemonResponse::AiChrome { prompt_bar: None, tab: None };
+    };
+    let thresholds = scribe_common::config::load_config()
+        .unwrap_or_default()
+        .terminal
+        .ai_session
+        .context_thresholds;
+    DaemonResponse::AiChrome {
+        prompt_bar: Some(scribe_common::ai_chrome::context_meter_label(percent)),
+        tab: scribe_common::ai_chrome::tab_context_suffix_text(percent, thresholds.warn, pulsing),
     }
 }
 

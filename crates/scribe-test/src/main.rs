@@ -115,6 +115,12 @@ enum Command {
         /// Output file path.
         path: PathBuf,
     },
+    /// Print the AI chrome (prompt-bar context meter, tab context suffix) a
+    /// client would draw for a session.
+    AiChrome {
+        /// Target session ID.
+        session_id: String,
+    },
     /// Wait until output matching a regex pattern appears.
     WaitOutput {
         /// Target session ID.
@@ -275,6 +281,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::Resize { session_id, cols, rows } => input::resize(&session_id, cols, rows),
         Command::Screenshot { session_id, path } => capture::screenshot(&session_id, &path),
         Command::Snapshot { session_id, path } => capture::snapshot(&session_id, &path),
+        Command::AiChrome { session_id } => capture::ai_chrome(&session_id),
         Command::WaitOutput { session_id, pattern, timeout } => {
             wait::wait_output(&session_id, &pattern, timeout)
         }

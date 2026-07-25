@@ -30,13 +30,6 @@ const ROW_SIDE_PAD: f32 = 14.0;
 /// Gap between icon and text in pixels.
 const ICON_TEXT_GAP: f32 = 10.0;
 
-/// Number of segments in the context level meter.
-const CONTEXT_BAR_SEGMENTS: usize = 3;
-/// Filled segment of the context-window level meter (BLACK PARALLELOGRAM).
-const BAR_FULL: char = '\u{25B0}';
-/// Empty segment of the context-window level meter (WHITE PARALLELOGRAM).
-const BAR_EMPTY: char = '\u{25B1}';
-
 /// Unicode for the circle-dot (origin) icon on the first-prompt row.
 pub const ICON_FIRST: char = '⊙';
 /// Unicode for the right-arrow (latest) icon on the latest-prompt row.
@@ -75,11 +68,39 @@ pub struct PromptBarColors {
     pub icon_latest: [f32; 4],
 }
 
+impl From<&scribe_common::theme::ChromeColors> for PromptBarColors {
+    fn from(chrome: &scribe_common::theme::ChromeColors) -> Self {
+        Self {
+            first_row_bg: chrome.prompt_bar_first_row_bg,
+            second_row_bg: chrome.prompt_bar_second_row_bg,
+            text: chrome.prompt_bar_text,
+            icon_first: chrome.prompt_bar_icon_first,
+            icon_latest: chrome.prompt_bar_icon_latest,
+        }
+    }
+}
+
 /// Optional AI context-window indicator appended to the right cluster.
 #[derive(Clone, Copy, Debug)]
 pub struct PromptContextIndicator {
     pub percent: u8,
     pub color: [f32; 4],
+}
+
+impl PromptContextIndicator {
+    /// Build the indicator for `percent`, colouring it by the configured
+    /// threshold band. A malformed band hex falls back to `fallback`, so a bad
+    /// config degrades the colour rather than hiding the percentage.
+    #[must_use]
+    pub fn from_thresholds(
+        percent: u8,
+        thresholds: &scribe_common::config::AiContextThresholds,
+        fallback: [f32; 4],
+    ) -> Self {
+        let color =
+            scribe_common::theme::hex_to_rgba(thresholds.color_for(percent)).unwrap_or(fallback);
+        Self { percent, color }
+    }
 }
 
 /// Which prompt-bar element the mouse is hovering over, if any.
@@ -158,22 +179,12 @@ pub fn format_elapsed(elapsed: Duration) -> String {
 }
 
 /// Format the segmented context-window meter label (`▰▰▱ 66%`), clamped to 100%.
+///
+/// Delegates to [`scribe_common::ai_chrome::context_meter_label`] so the meter,
+/// the tab suffix, and the E2E harness that asserts on them share one spelling.
 #[must_use]
 pub fn format_context_label(percent: u8) -> String {
-    let percent = percent.min(100);
-    let filled =
-        (usize::from(percent) * CONTEXT_BAR_SEGMENTS).div_ceil(100).min(CONTEXT_BAR_SEGMENTS);
-    let mut label = String::with_capacity(CONTEXT_BAR_SEGMENTS + 5);
-    for _ in 0..filled {
-        label.push(BAR_FULL);
-    }
-    for _ in filled..CONTEXT_BAR_SEGMENTS {
-        label.push(BAR_EMPTY);
-    }
-    label.push(' ');
-    label.push_str(&percent.to_string());
-    label.push('%');
-    label
+    scribe_common::ai_chrome::context_meter_label(percent)
 }
 
 /// Compute elapsed `now - since`, clamped to zero when the wall clock has moved

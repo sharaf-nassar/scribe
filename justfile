@@ -124,3 +124,5 @@ e2e: build-release docker-func
     just e2e-func func/cold-restart.sh
     just e2e-func func/failure-server-down.sh
     just e2e-func func/failure-socket-loss.sh
+    just e2e-func func/ai-state-indicator.sh
+    just e2e-func func/ai-context-thresholds.sh

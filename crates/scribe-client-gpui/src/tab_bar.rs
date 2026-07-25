@@ -136,11 +136,9 @@ pub struct ContextSuffix {
 /// band; between `warn` and `danger` it is the warn band.
 #[must_use]
 pub fn context_suffix(percent: u8, warn: u8, danger: u8, pulsing: bool) -> Option<ContextSuffix> {
-    if pulsing || percent < warn {
-        return None;
-    }
+    let text = scribe_common::ai_chrome::tab_context_suffix_text(percent, warn, pulsing)?;
     let color = if percent >= danger { CONTEXT_DANGER_COLOR } else { CONTEXT_WARN_COLOR };
-    Some(ContextSuffix { text: format!(" {percent}%"), color })
+    Some(ContextSuffix { text, color })
 }
 
 /// Per-tab data the titlebar renders.

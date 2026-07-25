@@ -7,133 +7,109 @@ set -euo pipefail
 # Validates that the prompt-bar right cluster and tab-inline % display
 # correctly across the three context threshold bands:
 #   Ok     (< 70)  — only prompt bar shows %, tab suppresses it
-#   Warn   (>= 70) — both prompt bar and tab show %, count >= 2
-#   Danger (>= 90) — both prompt bar and tab show %, count >= 2
+#   Warn   (>= 70) — both prompt bar and tab show %
+#   Danger (>= 90) — both prompt bar and tab show %
+#
+# Transport: AI state, prompt text, and context-window % reach the server over
+# the hook channel (spec 003, FR-020..FR-022) — `scribe-hook-helper` invoked
+# inside the session shell, where scribe-server exports SCRIBE_HOOK_SOCK and
+# SCRIBE_SESSION_ID. OSC 1337 no longer carries any of it.
+#
+# Readback: `scribe-test ai-chrome` renders the session's live AI state through
+# `scribe_common::ai_chrome`, the module the clients' prompt bar and tab bar
+# format through. A terminal screen snapshot cannot be used: it carries the
+# server's PTY grid only, and client chrome is never part of it.
 # =============================================================================
+
+HELPER=scribe-hook-helper
+
+# Fire hook events in the session shell, then park the shell in `read` so it
+# never prints a new prompt. A prompt (OSC 133;A) tells the server the AI tool
+# exited, which clears the live AI state — exactly what the helper just set.
+# This mirrors production, where hooks fire while the AI tool owns the
+# foreground and the shell prompt is not being redrawn.
+hold_ai_state() {
+    local provider="$1" percent="$2" label="$3"
+    scribe-test send "$SESSION" "$HELPER --provider=$provider --event=state_changed --state=processing; $HELPER --provider=$provider --event=prompt_received --text=$label; $HELPER --provider=$provider --event=context_changed --fill-percent=$percent; read -r\n"
+}
+
+# Release the parked shell; the returning prompt clears the AI state, so each
+# phase starts from a clean slate.
+release_ai_state() {
+    scribe-test send "$SESSION" '\n'
+    sleep 0.3
+}
+
+# Poll the AI chrome until `$1` appears, leaving the last reading in $CHROME.
+chrome_wait() {
+    local needle="$1" attempt=0
+    while [ "$attempt" -lt 80 ]; do
+        CHROME=$(scribe-test ai-chrome "$SESSION" 2>/dev/null || true)
+        if printf '%s\n' "$CHROME" | grep -q -- "$needle"; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+    return 1
+}
+
+# Assert a percentage renders on exactly the surfaces its band calls for:
+# $2 = expected number of chrome lines mentioning it (1 = prompt bar only,
+# 2 = prompt bar + tab).
+assert_band() {
+    local pct="$1" want="$2" phase="$3" count
+    if ! chrome_wait "$pct"; then
+        echo "$phase FAIL: context not rendered as $pct in the AI chrome"
+        printf 'chrome was:\n%s\n' "$CHROME"
+        exit 1
+    fi
+    count=$(printf '%s\n' "$CHROME" | grep -c -- "$pct" || true)
+    if [ "$count" -ne "$want" ]; then
+        echo "$phase FAIL: $pct on ${count} surface(s) — expected ${want}"
+        printf 'chrome was:\n%s\n' "$CHROME"
+        exit 1
+    fi
+}
 
 # ── Phase 1 + 4: Ok band (50%) — prompt bar only ─────────────────────────────
 # At 50% (below warn=70) the prompt bar renders "50%" but the tab-inline
-# suppresses it, so "50%" should appear exactly once in the snapshot.
-scribe-test send "$SESSION" 'printf "\\033]1337;ClaudeState=processing;context=50\\033\\\\\\033]1337;ClaudePrompt=phase-one\\033\\\\"; echo ctx-phase1-ok\n'
-scribe-test wait-output "$SESSION" "ctx-phase1-ok"
-
-SNAP1=$(scribe-test snapshot "$SESSION" /dev/stdout 2>/dev/null)
-if ! echo "$SNAP1" | grep -q "50%"; then
-    echo "PHASE 1 FAIL: context=50 not rendered as 50% in prompt bar"
-    exit 1
-fi
+# suppresses it, so "50%" appears on exactly one chrome surface.
+hold_ai_state claude_code 50 phase-one
+assert_band "50%" 1 "PHASE 1"
+release_ai_state
 echo "PHASE 1 PASS: context=50 (Ok band) rendered as 50% in prompt bar"
-
-# Phase 4 assertion: tab suppression — 50% should appear at most once.
-# (Tab-inline only activates at >= warn threshold; prompt bar always shows it.)
-COUNT1=$(echo "$SNAP1" | grep -c "50%" || true)
-if [ "$COUNT1" -le 1 ]; then
-    echo "PHASE 4 PASS: 50% count=${COUNT1} (tab suppressed below warn threshold)"
-else
-    # Tolerate >1 only if a CWD or other harness artifact happens to contain "50%".
-    # The invariant is that the TAB should not add a second mention; if this fires
-    # it likely means tab-inline is not correctly gated on the warn threshold.
-    echo "PHASE 4 FAIL: 50% count=${COUNT1} — expected <= 1 (tab should suppress below warn)"
-    exit 1
-fi
+echo "PHASE 4 PASS: 50% on 1 surface (tab suppressed below warn threshold)"
 
 # ── Phase 2: Warn band (72%) — prompt bar + tab ───────────────────────────────
-# At 72% (>= warn=70) both the prompt-bar segment AND the tab inline label
-# should render "72%", so it should appear at least twice.
-scribe-test send "$SESSION" 'printf "\\033]1337;ClaudeState=processing;context=72\\033\\\\\\033]1337;ClaudePrompt=phase-two\\033\\\\"; echo ctx-phase2-ok\n'
-scribe-test wait-output "$SESSION" "ctx-phase2-ok"
-
-SNAP2=$(scribe-test snapshot "$SESSION" /dev/stdout 2>/dev/null)
-if ! echo "$SNAP2" | grep -q "72%"; then
-    echo "PHASE 2 FAIL: context=72 not rendered as 72% anywhere in snapshot"
-    exit 1
-fi
-COUNT2=$(echo "$SNAP2" | grep -c "72%" || true)
-if [ "$COUNT2" -ge 2 ]; then
-    echo "PHASE 2 PASS: 72% count=${COUNT2} >= 2 (prompt bar + tab both rendered)"
-else
-    echo "PHASE 2 FAIL: 72% count=${COUNT2} — expected >= 2 (prompt bar + tab inline)"
-    exit 1
-fi
+hold_ai_state claude_code 72 phase-two
+assert_band "72%" 2 "PHASE 2"
+release_ai_state
+echo "PHASE 2 PASS: 72% on 2 surfaces (prompt bar + tab both rendered)"
 
 # ── Phase 3: Danger band (91%) — prompt bar + tab ────────────────────────────
-# At 91% (>= danger=90) both the prompt-bar segment AND the tab inline label
-# should render "91%", so it should appear at least twice.
-scribe-test send "$SESSION" 'printf "\\033]1337;ClaudeState=processing;context=91\\033\\\\\\033]1337;ClaudePrompt=phase-three\\033\\\\"; echo ctx-phase3-ok\n'
-scribe-test wait-output "$SESSION" "ctx-phase3-ok"
-
-SNAP3=$(scribe-test snapshot "$SESSION" /dev/stdout 2>/dev/null)
-if ! echo "$SNAP3" | grep -q "91%"; then
-    echo "PHASE 3 FAIL: context=91 not rendered as 91% anywhere in snapshot"
-    exit 1
-fi
-COUNT3=$(echo "$SNAP3" | grep -c "91%" || true)
-if [ "$COUNT3" -ge 2 ]; then
-    echo "PHASE 3 PASS: 91% count=${COUNT3} >= 2 (prompt bar + tab both rendered)"
-else
-    echo "PHASE 3 FAIL: 91% count=${COUNT3} — expected >= 2 (prompt bar + tab inline)"
-    exit 1
-fi
+hold_ai_state claude_code 91 phase-three
+assert_band "91%" 2 "PHASE 3"
+release_ai_state
+echo "PHASE 3 PASS: 91% on 2 surfaces (prompt bar + tab both rendered)"
 
 # ── Phase 5: Codex Ok band (51%) — prompt bar only ────────────────────────────
-# Codex provider-symmetric test: send CodexState instead of ClaudeState.
-# At 51% (below warn=70) the prompt bar renders "51%" but the tab-inline
-# suppresses it, so "51%" should appear exactly once in the snapshot.
-# (Use 51 instead of 50 to avoid collision with Phase 1's prior "50%" in scrollback.)
-scribe-test send "$SESSION" 'printf "\\033]1337;CodexState=processing;context=51\\033\\\\\\033]1337;CodexPrompt=phase-five\\033\\\\"; echo ctx-phase5-ok\n'
-scribe-test wait-output "$SESSION" "ctx-phase5-ok"
-
-SNAP5=$(scribe-test snapshot "$SESSION" /dev/stdout 2>/dev/null)
-if ! echo "$SNAP5" | grep -q "51%"; then
-    echo "PHASE 5 FAIL: CodexState with context=51 not rendered as 51% in prompt bar"
-    exit 1
-fi
-COUNT5=$(echo "$SNAP5" | grep -c "51%" || true)
-if [ "$COUNT5" -le 1 ]; then
-    echo "PHASE 5 PASS: CodexState context=51 (Ok band) rendered as 51% in prompt bar"
-else
-    echo "PHASE 5 FAIL: 51% count=${COUNT5} — expected <= 1 (tab should suppress below warn)"
-    exit 1
-fi
+# Provider-symmetric: the same bands must hold for Codex.
+hold_ai_state codex_code 51 phase-five
+assert_band "51%" 1 "PHASE 5"
+release_ai_state
+echo "PHASE 5 PASS: Codex context=51 (Ok band) rendered as 51% in prompt bar"
 
 # ── Phase 6: Codex Warn band (73%) — prompt bar + tab ──────────────────────────
-# Codex provider-symmetric test: at 73% (>= warn=70) both the prompt-bar segment
-# AND the tab inline label should render "73%", so it should appear at least twice.
-# (Use 73 instead of 72 to avoid collision with Phase 2's prior "72%" in scrollback.)
-scribe-test send "$SESSION" 'printf "\\033]1337;CodexState=processing;context=73\\033\\\\\\033]1337;CodexPrompt=phase-six\\033\\\\"; echo ctx-phase6-ok\n'
-scribe-test wait-output "$SESSION" "ctx-phase6-ok"
-
-SNAP6=$(scribe-test snapshot "$SESSION" /dev/stdout 2>/dev/null)
-if ! echo "$SNAP6" | grep -q "73%"; then
-    echo "PHASE 6 FAIL: CodexState with context=73 not rendered as 73% anywhere in snapshot"
-    exit 1
-fi
-COUNT6=$(echo "$SNAP6" | grep -c "73%" || true)
-if [ "$COUNT6" -ge 2 ]; then
-    echo "PHASE 6 PASS: CodexState 73% count=${COUNT6} >= 2 (prompt bar + tab both rendered)"
-else
-    echo "PHASE 6 FAIL: 73% count=${COUNT6} — expected >= 2 (prompt bar + tab inline)"
-    exit 1
-fi
+hold_ai_state codex_code 73 phase-six
+assert_band "73%" 2 "PHASE 6"
+release_ai_state
+echo "PHASE 6 PASS: Codex 73% on 2 surfaces (prompt bar + tab both rendered)"
 
 # ── Phase 7: Codex Danger band (92%) — prompt bar + tab ─────────────────────────
-# Codex provider-symmetric test: at 92% (>= danger=90) both the prompt-bar segment
-# AND the tab inline label should render "92%", so it should appear at least twice.
-# (Use 92 instead of 91 to avoid collision with Phase 3's prior "91%" in scrollback.)
-scribe-test send "$SESSION" 'printf "\\033]1337;CodexState=processing;context=92\\033\\\\\\033]1337;CodexPrompt=phase-seven\\033\\\\"; echo ctx-phase7-ok\n'
-scribe-test wait-output "$SESSION" "ctx-phase7-ok"
-
-SNAP7=$(scribe-test snapshot "$SESSION" /dev/stdout 2>/dev/null)
-if ! echo "$SNAP7" | grep -q "92%"; then
-    echo "PHASE 7 FAIL: CodexState with context=92 not rendered as 92% anywhere in snapshot"
-    exit 1
-fi
-COUNT7=$(echo "$SNAP7" | grep -c "92%" || true)
-if [ "$COUNT7" -ge 2 ]; then
-    echo "PHASE 7 PASS: CodexState 92% count=${COUNT7} >= 2 (prompt bar + tab both rendered)"
-else
-    echo "PHASE 7 FAIL: 92% count=${COUNT7} — expected >= 2 (prompt bar + tab inline)"
-    exit 1
-fi
+hold_ai_state codex_code 92 phase-seven
+assert_band "92%" 2 "PHASE 7"
+release_ai_state
+echo "PHASE 7 PASS: Codex 92% on 2 surfaces (prompt bar + tab both rendered)"
 
 echo "ai-context-thresholds: all phases passed"

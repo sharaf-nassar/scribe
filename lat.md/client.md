@@ -376,6 +376,14 @@ The GPUI rebuild ports the winit prompt bar's display-independent logic — elap
 
 [[crates/scribe-client-gpui/src/prompt_bar.rs#build_model]] turns a [[crates/scribe-client-gpui/src/prompt_bar.rs#PromptBarData]] snapshot into a pure [[crates/scribe-client-gpui/src/prompt_bar.rs#PromptBarModel]] (first/latest rows, count, elapsed, optional meter); [[crates/scribe-client-gpui/src/prompt_bar.rs#render]] lowers it onto div rows (timer on row 1 with count/context on row 2 in the two-prompt state, everything on row 1 otherwise, plus the hover dismiss overlay). The elapsed timer is computed by [[crates/scribe-client-gpui/src/prompt_bar.rs#elapsed_text]], which freezes at `latest_prompt_finished_at` when the AI stops and clamps a backwards wall clock; the reference clock is threaded in so the freeze is `#[gpui::test]`-verifiable without a live window. [[crates/scribe-client-gpui/src/prompt_bar.rs#is_prompt_truncated]] gates the hover tooltip and [[crates/scribe-client-gpui/src/prompt_bar.rs#prompt_bar_height]] sizes the strip. The rendered strip is a visual-E2E surface.
 
+The meter text itself comes from [[common#AI Context Chrome]] so the prompt bar, the tab suffix, and the E2E assertions share one spelling; [[crates/scribe-client-gpui/src/prompt_bar.rs#PromptContextIndicator#from_thresholds]] colors it by the configured band and falls back to the bar's text color when a band hex fails to parse, degrading the color rather than hiding the percentage.
+
+### Live AI wiring
+
+The GPUI client feeds the bar from the IPC reader: `AiStateChanged`, `AiStateCleared`, and `PromptReceived` land in a shared AI chrome record that the view reads on every frame.
+
+`AiStateChanged` updates an [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker]] (whose decoupled context store keeps the percentage alive across pulse pruning), `PromptReceived` appends to the pane's [[crates/scribe-client-gpui/src/prompt_bar.rs#PromptBarData]], and `AiStateCleared` plus `SessionExited` drop both so a closed pane leaves no stale percentage behind. Each mutation bumps the redraw generation, so the strip repaints without polling. On render the view builds the model with a context indicator whenever the tracker holds a percentage — the prompt bar is the surface that always shows the Ok band — and separately pushes the warn-and-above tab suffix from [[crates/scribe-client-gpui/src/tab_bar.rs#context_suffix]] onto the active tab. A poisoned chrome mutex is dropped with a warning rather than propagated, because losing an indicator update must never tear down the reader and with it the pane's terminal output.
+
 ### Elapsed formats span sec, minute, and hour bands
 
 Verifies [[crates/scribe-client-gpui/src/prompt_bar.rs#format_elapsed]] renders `"X sec"` under a minute, `"Xm YYs"` under an hour, and `"Xh YYm"` beyond, with zero-padded trailing units.

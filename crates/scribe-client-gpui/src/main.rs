@@ -21,6 +21,7 @@ use gpui::{
     prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
+use scribe_client_gpui::ai_indicator::AiStateTracker;
 use scribe_client_gpui::animation::AnimationSettings;
 use scribe_client_gpui::command_palette::{
     CommandPaletteColors, CommandPaletteEvent, CommandPaletteView, build_entries,
@@ -35,6 +36,9 @@ use scribe_client_gpui::dialog::{
 use scribe_client_gpui::input::KeyInput;
 use scribe_client_gpui::keybindings::{KeyAction, translate_key_action};
 use scribe_client_gpui::layout::Rect;
+use scribe_client_gpui::prompt_bar::{
+    self, PromptBarColors, PromptBarData, PromptContextIndicator,
+};
 use scribe_client_gpui::restore_replay::round_positive_f32_to_u16;
 use scribe_client_gpui::status_bar::{self, RemoteStatusData, StatusBarColors, StatusBarData};
 use scribe_client_gpui::sys_stats::SystemStatsCollector;
@@ -44,12 +48,12 @@ use scribe_client_gpui::workspace_notes_modal::{
     WorkspaceNotesModalAction, WorkspaceNotesModalColors, WorkspaceNotesModalView,
 };
 use scribe_client_gpui::{
-    tab_bar::{TabBarColors, TabData},
+    tab_bar::{TabBarColors, TabData, context_suffix},
     titlebar::TitlebarView,
 };
 use scribe_common::theme::ChromeColors;
 use scribe_common::{
-    config::{StatusBarStatsConfig, load_config},
+    config::{AiContextThresholds, StatusBarStatsConfig, load_config},
     framing::{read_message, write_message},
     ids::{SessionId, WorkspaceId},
     protocol::{
@@ -113,6 +117,48 @@ const ROWS: u16 = 36;
 const CELL_WIDTH: u16 = 8;
 const CELL_HEIGHT: u16 = 18;
 
+/// Client-side AI chrome state, written by the IPC reader and read by the GPUI
+/// view on every frame.
+///
+/// The tracker owns the ported AI-state machine and the decoupled per-session
+/// context-window store that feeds both the prompt-bar meter and the tab
+/// suffix; `prompts` accumulates the `PromptReceived` history the prompt bar
+/// renders. Both live behind one mutex so a frame never mixes a fresh percent
+/// with a stale prompt count.
+struct AiChrome {
+    tracker: AiStateTracker,
+    prompts: HashMap<SessionId, PromptBarData>,
+}
+
+impl AiChrome {
+    /// Build the chrome state from the per-state style config that governs
+    /// which AI states are tracked at all.
+    fn new(styles: scribe_common::config::AiStateStylesConfig) -> Self {
+        Self { tracker: AiStateTracker::new(styles), prompts: HashMap::new() }
+    }
+
+    /// Record a prompt submission for `session_id`, seeding the first-prompt row
+    /// and restarting the elapsed timer on the latest row.
+    fn record_prompt(&mut self, session_id: SessionId, text: String, at: std::time::SystemTime) {
+        let data = self.prompts.entry(session_id).or_default();
+        data.prompt_count = data.prompt_count.saturating_add(1);
+        if data.first_prompt.is_none() {
+            data.first_prompt = Some(text.clone());
+        }
+        data.latest_prompt = Some(text);
+        data.latest_prompt_at = Some(at);
+        data.latest_prompt_finished_at = None;
+    }
+
+    /// Drop every trace of a session, so a closed pane leaves no orphaned
+    /// percentage or prompt history behind.
+    fn forget(&mut self, session_id: SessionId) {
+        self.tracker.remove(session_id);
+        self.tracker.clear_context(session_id);
+        self.prompts.remove(&session_id);
+    }
+}
+
 /// Shared handles threaded from the app entry into the background IPC thread and
 /// the foreground GPUI view.
 #[derive(Clone)]
@@ -123,6 +169,8 @@ struct Shared {
     active_session: Arc<Mutex<Option<SessionId>>>,
     /// Server-connection flag driving the status bar's connection dot.
     connected: Arc<AtomicBool>,
+    /// AI state + prompt history driving the prompt bar and the tab context %.
+    ai: Arc<Mutex<AiChrome>>,
 }
 
 /// How often the foreground drains the config watcher's change signal. Short
@@ -145,6 +193,12 @@ struct TerminalView {
     stats_config: StatusBarStatsConfig,
     /// Font metrics the terminal grid paints with, rebuilt on a font reload.
     font: GridFont,
+    /// Theme-derived prompt-bar palette, resolved once at view creation.
+    prompt_colors: PromptBarColors,
+    /// Warn/danger bands and per-band colours for the AI context-window meter.
+    context_thresholds: AiContextThresholds,
+    /// Whether `terminal.prompt_bar` is enabled in config.
+    prompt_bar_enabled: bool,
     // The custom titlebar + integrated tab bar drawn above the terminal grid.
     titlebar: Entity<TitlebarView>,
     /// Theme chrome, retained to build the overlay palettes on demand.
@@ -184,6 +238,10 @@ impl TerminalView {
         let chrome = config.config().chrome;
         let font = GridFont::from_appearance(&config.config().config.appearance);
         let stats_config = config.config().config.terminal.status_bar_stats.clone();
+        let terminal = &config.config().config.terminal;
+        let context_thresholds = terminal.ai_session.context_thresholds.clone();
+        let prompt_bar_enabled = terminal.prompt_bar.enabled;
+        let prompt_colors = PromptBarColors::from(&chrome);
         let colors = TabBarColors::from(&chrome);
         let titlebar = cx.new(|cx| {
             let mut bar = TitlebarView::new(colors, cx);
@@ -201,6 +259,9 @@ impl TerminalView {
             status_colors,
             stats_config,
             font,
+            prompt_colors,
+            context_thresholds,
+            prompt_bar_enabled,
             titlebar,
             chrome,
             command_palette: None,
@@ -236,6 +297,7 @@ impl TerminalView {
             self.status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
             self.chrome = theme.chrome;
             let tab_colors = TabBarColors::from(&self.chrome);
+            self.prompt_colors = PromptBarColors::from(&self.chrome);
             self.titlebar.update(cx, |bar, ctx| bar.set_colors(tab_colors, ctx));
             // Open overlays captured the old palette when they were built; drop
             // them so a live theme edit never leaves stale colours on screen.
@@ -252,8 +314,12 @@ impl TerminalView {
             self.apply_opacity_change();
         }
 
-        // Status-bar stat selection is cheap to swap and has no plan flag.
-        self.stats_config = self.config.config().config.terminal.status_bar_stats.clone();
+        // Status-bar stat selection and the prompt-bar toggles are cheap to swap
+        // and have no plan flag.
+        let terminal = &self.config.config().config.terminal;
+        self.stats_config = terminal.status_bar_stats.clone();
+        self.context_thresholds = terminal.ai_session.context_thresholds.clone();
+        self.prompt_bar_enabled = terminal.prompt_bar.enabled;
 
         // Tell the server to re-read the same file so its own live surfaces
         // (clipboard policy, env store, remote/share listeners) follow.
@@ -721,6 +787,61 @@ impl TerminalView {
         )
     }
 
+    /// Build the attached pane's prompt-bar model, or `None` when the bar is
+    /// disabled, no pane is attached, or that pane has no prompts yet.
+    ///
+    /// The context meter is attached whenever the tracker holds a percentage for
+    /// the pane, independent of the warn band — the prompt bar is the surface
+    /// that always shows the Ok band, while the tab suffix suppresses it (see
+    /// [`Self::sync_tab_context_suffix`]).
+    fn build_prompt_model(&self) -> Option<prompt_bar::PromptBarModel> {
+        if !self.prompt_bar_enabled {
+            return None;
+        }
+        let session_id = (*self.shared.active_session.lock().ok()?)?;
+        let ai = self.shared.ai.lock().ok()?;
+        let data = ai.prompts.get(&session_id)?;
+        let indicator = ai.tracker.context_for(session_id).map(|percent| {
+            PromptContextIndicator::from_thresholds(
+                percent,
+                &self.context_thresholds,
+                self.prompt_colors.text,
+            )
+        });
+        prompt_bar::build_model(data, std::time::SystemTime::now(), indicator)
+    }
+
+    /// Push the attached pane's context-% suffix onto its tab, so the warn and
+    /// danger bands surface on the tab label as well as in the prompt bar.
+    fn sync_tab_context_suffix(&mut self, cx: &mut Context<Self>) {
+        let suffix = self.active_tab_context_suffix();
+        self.titlebar.update(cx, |bar, ctx| {
+            let mut tabs = bar.tabs().to_vec();
+            let Some(tab) = tabs.first_mut() else {
+                return;
+            };
+            if tab.context_suffix == suffix {
+                return;
+            }
+            tab.context_suffix = suffix;
+            bar.set_tabs(tabs, ctx);
+        });
+    }
+
+    /// The context-% suffix for the attached pane's tab, or `None` below the
+    /// warn band / while a pulsing attention state owns the UX.
+    fn active_tab_context_suffix(&self) -> Option<scribe_client_gpui::tab_bar::ContextSuffix> {
+        let session_id = (*self.shared.active_session.lock().ok()?)?;
+        let ai = self.shared.ai.lock().ok()?;
+        let percent = ai.tracker.context_for(session_id)?;
+        context_suffix(
+            percent,
+            self.context_thresholds.warn,
+            self.context_thresholds.danger,
+            ai.tracker.context_suffix_suppressed(session_id),
+        )
+    }
+
     /// Build the demo hover tooltip when the `tooltip_demo` toggle is on: a long
     /// URI anchored near the right edge, exercising both the head+tail truncation
     /// and the viewport clamp.
@@ -763,6 +884,13 @@ impl Render for TerminalView {
             .map_or_else(|_| "terminal state unavailable".to_owned(), |guard| guard.clone());
 
         let model = self.build_status_model();
+        let prompt_model = self.build_prompt_model();
+        self.sync_tab_context_suffix(cx);
+        let prompt_colors = self.prompt_colors;
+        let prompt_strip = prompt_model.map(|prompt| {
+            prompt_bar::render(&prompt, &prompt_colors, f32::from(CELL_HEIGHT), None)
+                .into_any_element()
+        });
         let tooltip = self.build_tooltip_demo();
 
         div()
@@ -791,6 +919,7 @@ impl Render for TerminalView {
                         }),
                     ),
             )
+            .children(prompt_strip)
             .child(
                 div()
                     .h(px(26.))
@@ -846,6 +975,9 @@ fn main() {
         generation: Arc::new(AtomicU64::new(0)),
         active_session: Arc::new(Mutex::new(None)),
         connected: Arc::new(AtomicBool::new(false)),
+        ai: Arc::new(Mutex::new(AiChrome::new(
+            load_config().unwrap_or_default().terminal.ai_session.ai_states,
+        ))),
     };
     let terminal_size = TerminalSize {
         cols: COLUMNS,
@@ -992,6 +1124,7 @@ async fn run_connection(ctx: IpcThread) -> Result<(), String> {
             status: ctx.shared.status,
             generation: ctx.shared.generation,
             active_session: ctx.shared.active_session,
+            ai: ctx.shared.ai,
             out_tx: ctx.out_tx,
             in_tx: ctx.in_tx,
             sink: ctx.sink,
@@ -1133,10 +1266,27 @@ struct ReaderCtx {
     status: Arc<Mutex<String>>,
     generation: Arc<AtomicU64>,
     active_session: Arc<Mutex<Option<SessionId>>>,
+    /// AI state + prompt history the chrome renders from.
+    ai: Arc<Mutex<AiChrome>>,
     out_tx: UnboundedSender<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
     size: TerminalSize,
+}
+
+/// Apply `mutate` to the shared AI chrome and request a repaint.
+///
+/// A poisoned mutex is dropped silently rather than propagated: losing an AI
+/// indicator update must never tear down the reader and with it the pane's
+/// terminal output.
+fn update_ai_chrome(ctx: &ReaderCtx, mutate: impl FnOnce(&mut AiChrome)) {
+    let Ok(mut guard) = ctx.ai.lock() else {
+        tracing::warn!("AI chrome mutex poisoned; dropping update");
+        return;
+    };
+    mutate(&mut guard);
+    drop(guard);
+    ctx.generation.fetch_add(1, Ordering::Release);
 }
 
 async fn run_reader<R>(mut reader: R, ctx: ReaderCtx) -> Result<(), String>
@@ -1172,9 +1322,25 @@ where
             }
             ServerMessage::SessionExited { session_id, .. } => {
                 let existed = registry.on_session_exited(session_id);
+                update_ai_chrome(&ctx, |ai| ai.forget(session_id));
                 if existed && Some(session_id) == attached {
                     set_status(&ctx.status, &ctx.generation, "attached pane exited".to_owned());
                 }
+            }
+            ServerMessage::AiStateChanged { session_id, ai_state } => {
+                // The server has already merged partial OSC events onto the
+                // stored state, so the percent that arrives here is the live one.
+                update_ai_chrome(&ctx, |ai| ai.tracker.update(session_id, ai_state));
+            }
+            ServerMessage::AiStateCleared { session_id } => {
+                update_ai_chrome(&ctx, |ai| {
+                    ai.tracker.remove(session_id);
+                    ai.tracker.clear_context(session_id);
+                });
+            }
+            ServerMessage::PromptReceived { session_id, text, .. } => {
+                let at = std::time::SystemTime::now();
+                update_ai_chrome(&ctx, |ai| ai.record_prompt(session_id, text, at));
             }
             ServerMessage::TrimScrollback { session_id, history_rows } => {
                 // Track the server's scrollback trim so stored prompt marks stay

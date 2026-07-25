@@ -74,6 +74,11 @@ pub enum DaemonRequest {
         session_id: SessionId,
         reference: Box<ScreenSnapshot>,
     },
+    /// Ask for the client chrome text a session's AI state produces (the
+    /// prompt-bar context meter and the tab-inline context suffix).
+    RequestAiChrome {
+        session_id: SessionId,
+    },
     Shutdown,
 }
 
@@ -82,10 +87,25 @@ pub enum DaemonRequest {
 #[serde(tag = "type")]
 pub enum DaemonResponse {
     Ok,
-    SessionCreated { session_id: SessionId },
-    ScreenshotData { snapshot: Box<ScreenSnapshot> },
-    AssertFailed { message: String },
-    Error { message: String },
+    SessionCreated {
+        session_id: SessionId,
+    },
+    ScreenshotData {
+        snapshot: Box<ScreenSnapshot>,
+    },
+    /// The AI chrome a client would draw for a session. `prompt_bar` carries the
+    /// segmented context meter (present in every band, including Ok); `tab`
+    /// carries the tab-inline suffix (present only from the warn band up).
+    AiChrome {
+        prompt_bar: Option<String>,
+        tab: Option<String>,
+    },
+    AssertFailed {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
