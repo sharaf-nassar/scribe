@@ -5,11 +5,15 @@
 # buttons: Deny once / Always deny / Allow once / Always allow, Deny once default
 # focus, with a payload preview).
 #
-# Drives the live Scribe window: Ctrl+Shift+Q opens the close dialog and
-# Ctrl+Shift+K opens the clipboard dialog. Tab cycles the focused button, Enter
-# activates it, Esc dismisses with the safe action. Every modal is drawn with a
-# dimmed backdrop, a rounded drop-shadowed box, a centred title, the body copy,
-# a separator rule, and accent/destructive button tones.
+# Drives the live Scribe window: Ctrl+Shift+D opens the close dialog and
+# Ctrl+Shift+K opens the clipboard dialog. The close dialog moved off
+# Ctrl+Shift+Q, which is the Linux default for `close_tab` and now reaches that
+# action instead (see tests/e2e/visual/tab-window-chords.sh).
+#
+# Tab cycles the focused button, Enter activates it, Esc dismisses with the safe
+# action. Every modal is drawn with a dimmed backdrop, a rounded drop-shadowed
+# box, a centred title, the body copy, a separator rule, and accent/destructive
+# button tones.
 #
 # Requires: visual container with --gpus all, xdotool, scrot.
 set -e
@@ -48,9 +52,15 @@ send_keys() {
 }
 
 # ── Phase 1: close dialog opens with Cancel default focus ─────────
-sleep 0.8
+# Wait for the window to be mapped *and* genuinely active before typing:
+# X11FocusGuard drops every keystroke while `_NET_ACTIVE_WINDOW` names someone
+# else, so a chord sent too early is swallowed and phase 1 captures a black
+# frame instead of the dialog.
+xdotool search --sync --name "Scribe" >/dev/null 2>&1 || true
+sleep 1.5
 focus
-send_keys ctrl+shift+q
+sleep 0.5
+send_keys ctrl+shift+d
 shot /output/01-close-dialog.png
 echo "PHASE 1 PASS: close dialog opens — Quit/Kill/Cancel, Cancel focused, backdrop dim"
 

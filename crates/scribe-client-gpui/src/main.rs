@@ -38,7 +38,9 @@ use scribe_client_gpui::dialog::{
     DisallowedSchemeAction, DisallowedSchemeDialog, UpdateAction, UpdateDialogKind,
 };
 use scribe_client_gpui::input::{self, KeyInput, TerminalMode};
-use scribe_client_gpui::keybindings::{KeyAction, LayoutAction, translate_key_action};
+use scribe_client_gpui::keybindings::{
+    KeyAction, LayoutAction, OverlayChord, translate_key_action, translate_overlay_chord,
+};
 use scribe_client_gpui::layout::Rect;
 use scribe_client_gpui::opacity::{clamp_opacity, opaque_slot, surface};
 use scribe_client_gpui::prompt_bar::{
@@ -549,7 +551,8 @@ impl TerminalView {
 
     /// Run one [`LayoutAction`] intercepted from the key path.
     ///
-    /// Tab creation, selection, and closing are wired to the IPC sink; the
+    /// Tab creation, selection, and closing are wired to the IPC sink, and
+    /// window creation opens a second top-level window; the
     /// pane/workspace/navigation families are still swallowed (never forwarded
     /// to the PTY) because the shell has no pane tree yet, matching the legacy
     /// client's behaviour of never leaking a bound shortcut as terminal bytes.
@@ -579,6 +582,7 @@ impl TerminalView {
                 self.switch_tab(move |tabs| tabs.select(index), cx);
             }
             LayoutAction::CloseTab => self.close_active_tab(),
+            LayoutAction::NewWindow => self.open_new_window(cx),
             LayoutAction::SplitVertical
             | LayoutAction::SplitHorizontal
             | LayoutAction::ClosePane
@@ -593,7 +597,6 @@ impl TerminalView {
             | LayoutAction::WorkspaceFocusRight
             | LayoutAction::WorkspaceFocusUp
             | LayoutAction::WorkspaceFocusDown
-            | LayoutAction::NewWindow
             | LayoutAction::CopySelection
             | LayoutAction::PasteClipboard
             | LayoutAction::ScrollUp
@@ -842,7 +845,28 @@ impl TerminalView {
         };
         if let Err(error) = self.sink.close_session(session_id) {
             tracing::warn!(%error, "close tab dropped: IPC writer closed");
+            return;
         }
+        // The strip is pixels only, and the chord that gets here was shadowed
+        // by an overlay for the whole of the rebuild; log the request so a
+        // scripted E2E can assert the chord reached this action at all.
+        tracing::info!(session = %session_id, "closing the active tab");
+    }
+
+    /// Open a second top-level terminal window.
+    ///
+    /// GPUI is multi-window in one process (the settings window already proves
+    /// the pattern), so this stays in-process rather than re-spawning the
+    /// binary the way the winit client's `spawn_client_process` had to. The new
+    /// window gets its own [`Shared`] and its own IPC connection from
+    /// [`start_window_backend`], so it is a genuinely separate client: the
+    /// server registers a fresh window for it and its tab strip, status line,
+    /// and grid are independent of this one's.
+    fn open_new_window(&mut self, cx: &mut Context<Self>) {
+        let terminal_size = self.terminal_size;
+        let (shared, sink) = start_window_backend(terminal_size);
+        open_window(cx, &shared, &sink, terminal_size);
+        tracing::info!("opened a new terminal window");
     }
 
     /// Open the command palette, building its entry list from the live update /
@@ -1118,6 +1142,65 @@ impl TerminalView {
         }
     }
 
+    /// Claim a keystroke for a shell-owned overlay, with no overlay up yet.
+    ///
+    /// Two things are claimed ahead of the PTY here: the configured
+    /// command-palette chord, and the fixed [`OverlayChord`] table. Both
+    /// decisions are read off the live bindings before anything is opened, so
+    /// a saved keybinding edit takes effect on the very next keystroke.
+    ///
+    /// Returns `false` for everything else — including a chord
+    /// [`translate_overlay_chord`] declined because a configured binding claims
+    /// it — so the keystroke goes on to [`Self::handle_binding`].
+    fn claim_shell_chord(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let Some(input) = KeyInput::from_key_down(event) else {
+            return false;
+        };
+        let bindings = self.config.bindings();
+        let opens_palette =
+            matches!(translate_key_action(&input, bindings), Some(KeyAction::OpenCommandPalette));
+        let chord = translate_overlay_chord(&input, bindings);
+
+        if opens_palette {
+            self.open_command_palette(cx);
+            return true;
+        }
+        let Some(chord) = chord else {
+            return false;
+        };
+        self.open_overlay_chord(chord, cx);
+        true
+    }
+
+    /// Open the surface a shell-owned [`OverlayChord`] names.
+    ///
+    /// Split out from the key path so the chord table and the surfaces it opens
+    /// stay in one place; the chord-versus-binding precedence itself lives in
+    /// [`translate_overlay_chord`] and is unit-tested there.
+    fn open_overlay_chord(&mut self, chord: OverlayChord, cx: &mut Context<Self>) {
+        match chord {
+            OverlayChord::TooltipDemo => {
+                self.tooltip_demo = !self.tooltip_demo;
+                cx.notify();
+            }
+            OverlayChord::CloseDialog => {
+                self.open_dialog(AnyDialog::Close(CloseDialog::new(1)), cx);
+            }
+            OverlayChord::ClipboardDialog => {
+                self.open_dialog(
+                    AnyDialog::Clipboard(ClipboardDialog::new(
+                        scribe_common::protocol::PromptId(1),
+                        scribe_common::protocol::ClipboardOp::Write,
+                        scribe_common::protocol::ClipboardSelection::Clipboard,
+                        Some("export TOKEN=hunter2".to_owned()),
+                    )),
+                    cx,
+                );
+            }
+            OverlayChord::WorkspaceNotes => self.open_workspace_notes_modal(cx),
+        }
+    }
+
     /// Route a keystroke while an overlay owns the keyboard. Returns `true` when
     /// the key was consumed by an overlay (and must not reach the PTY).
     fn handle_overlay_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
@@ -1133,53 +1216,17 @@ impl TerminalView {
         // Config-driven shortcuts are matched against the live bindings, which
         // the config watcher re-parses on every reload — so a saved keybinding
         // edit takes effect on the very next keystroke, with no restart. Only
-        // the palette intercept is claimed here; every other translation falls
-        // through to the demo keys and the terminal encoder below.
-        if overlay_free {
-            let opens_palette = KeyInput::from_key_down(event).is_some_and(|input| {
-                matches!(
-                    translate_key_action(&input, self.config.bindings()),
-                    Some(KeyAction::OpenCommandPalette)
-                )
-            });
-            if opens_palette {
-                self.open_command_palette(cx);
-                return true;
-            }
-        }
-
-        // Ctrl+Shift+U toggles the tooltip demo; Ctrl+Shift+Q opens the close
-        // dialog; Ctrl+Shift+K opens the clipboard dialog; Ctrl+Shift+N opens
-        // the workspace-notes modal.
-        if mods.control && mods.shift && overlay_free {
-            match event.keystroke.key.as_str() {
-                "u" => {
-                    self.tooltip_demo = !self.tooltip_demo;
-                    cx.notify();
-                    return true;
-                }
-                "q" => {
-                    self.open_dialog(AnyDialog::Close(CloseDialog::new(1)), cx);
-                    return true;
-                }
-                "k" => {
-                    self.open_dialog(
-                        AnyDialog::Clipboard(ClipboardDialog::new(
-                            scribe_common::protocol::PromptId(1),
-                            scribe_common::protocol::ClipboardOp::Write,
-                            scribe_common::protocol::ClipboardSelection::Clipboard,
-                            Some("export TOKEN=hunter2".to_owned()),
-                        )),
-                        cx,
-                    );
-                    return true;
-                }
-                "n" => {
-                    self.open_workspace_notes_modal(cx);
-                    return true;
-                }
-                _ => {}
-            }
+        // the palette intercept and the shell-owned overlay chords are claimed
+        // here; every other translation falls through to `handle_binding` and
+        // the terminal encoder below.
+        //
+        // The overlay chords are resolved by `translate_overlay_chord`, which
+        // yields to any configured binding. That precedence is load-bearing: a
+        // chord claimed here never reaches `handle_binding`, so without it a
+        // hard-coded overlay chord silently shadows a bound action (the
+        // `close_tab` / `ctrl+shift+q` collision).
+        if overlay_free && self.claim_shell_chord(event, cx) {
+            return true;
         }
 
         // A modal dialog owns the keyboard while it is up: Tab/Shift+Tab cycle
@@ -1846,22 +1893,24 @@ fn init_tracing() {
         .init();
 }
 
-fn main() {
-    PROCESS_START.get_or_init(Instant::now);
-    // Arm the perf rig's runtime probe before anything can paint or type; it
-    // stays inert unless `SCRIBE_PERF_PROBE` names a report path.
-    scribe_common::perf_probe::init_from_env();
-    init_tracing();
+/// The startup grid geometry every terminal window is created with.
+fn default_terminal_size() -> TerminalSize {
+    TerminalSize { cols: COLUMNS, rows: ROWS, cell_width: CELL_WIDTH, cell_height: CELL_HEIGHT }
+}
 
-    // `scribe-client --settings` opens (or focuses) the settings window instead
-    // of the terminal shell. The singleton absorbs the old scribe-settings
-    // `settings.lock`/`settings.sock`: a second launch hands focus to the
-    // running window and exits here.
-    if std::env::args().skip(1).any(|arg| arg == "--settings") {
-        run_settings();
-        return;
-    }
-
+/// Build one terminal window's backend: fresh shared state plus its own IPC
+/// connection to the server, with the reader/writer thread already running.
+///
+/// Every window owns an independent [`Shared`] — its own grid, status line, tab
+/// strip, and chrome — because a window is a separate client from the server's
+/// point of view: the `Hello` this connection sends carries no `window_id`, so
+/// the server registers a *new* window and attaches its own sessions to it.
+/// Sharing one `Shared` between windows would instead mirror a single session
+/// strip into both, which is not what "new window" means.
+///
+/// Called once from [`main`] for the startup window and again for every
+/// [`LayoutAction::NewWindow`], so the two paths cannot drift.
+fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
     let shared = Shared {
         terminal: Arc::new(Mutex::new(DisplayOnlyTerminal::new(
             usize::from(COLUMNS),
@@ -1879,12 +1928,6 @@ fn main() {
         share: Arc::new(Mutex::new(ShareChrome::new())),
         update: Arc::new(Mutex::new(UpdateState::default())),
     };
-    let terminal_size = TerminalSize {
-        cols: COLUMNS,
-        rows: ROWS,
-        cell_width: CELL_WIDTH,
-        cell_height: CELL_HEIGHT,
-    };
     let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
     let (in_tx, in_rx) = unbounded_channel::<InboundEvent>();
     let sink = IpcSink::new(out_tx.clone());
@@ -1898,6 +1941,28 @@ fn main() {
         in_rx,
         size: terminal_size,
     });
+
+    (shared, sink)
+}
+
+fn main() {
+    PROCESS_START.get_or_init(Instant::now);
+    // Arm the perf rig's runtime probe before anything can paint or type; it
+    // stays inert unless `SCRIBE_PERF_PROBE` names a report path.
+    scribe_common::perf_probe::init_from_env();
+    init_tracing();
+
+    // `scribe-client --settings` opens (or focuses) the settings window instead
+    // of the terminal shell. The singleton absorbs the old scribe-settings
+    // `settings.lock`/`settings.sock`: a second launch hands focus to the
+    // running window and exits here.
+    if std::env::args().skip(1).any(|arg| arg == "--settings") {
+        run_settings();
+        return;
+    }
+
+    let terminal_size = default_terminal_size();
+    let (shared, sink) = start_window_backend(terminal_size);
 
     application().run(move |cx: &mut App| {
         // Register the embedded Symbols Nerd Font before anything shapes a

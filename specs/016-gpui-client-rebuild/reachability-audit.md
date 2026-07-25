@@ -89,7 +89,7 @@ Determination techniques, in order of authority:
 | `KeyInput` | golden | WIRED | `main.rs:819` `send_key_bytes` → `ipc_bridge.rs:197`; reached from the render key listener |
 | `Resize` | scripted-E2E | WIRED | `main.rs:361` `report_cell_metrics`, `:467` `attach`, `:1640` `attach_session` → `ipc_bridge.rs:210` |
 | `CreateSession` | scripted-E2E | WIRED | `main.rs:438` `create_tab` → `ipc_bridge.rs:237`; wired by bead .55 (`f56ef95`) |
-| `CloseSession` | scripted-E2E | WIRED | `main.rs:482` `close_active_tab` → `ipc_bridge.rs:272` (but see `close_tab` chord below) |
+| `CloseSession` | scripted-E2E | WIRED | `main.rs:482` `close_active_tab` → `ipc_bridge.rs:272`; the `close_tab` chord that reaches it was unshadowed by bead .61 |
 | `CreateWorkspace` | gpui-test | MISSING | no `ClientMessage::CreateWorkspace` anywhere in the crate |
 | `CloseWorkspace` | scripted-E2E | MISSING | no `ClientMessage::CloseWorkspace` anywhere in the crate |
 | `MoveSession` | gpui-test | MISSING | no `ClientMessage::MoveSession` anywhere in the crate |
@@ -238,11 +238,11 @@ also never executed).
 | `new_claude_resume_tab` | Tabs and windows | WIRED | `main.rs:414` |
 | `new_codex_tab` | Tabs and windows | WIRED | `main.rs:417` |
 | `new_codex_resume_tab` | Tabs and windows | WIRED | `main.rs:420` |
-| `close_tab` | Tabs and windows | UNWIRED | action implemented (`main.rs:429` → `close_active_tab`) but the Linux default chord `ctrl+shift+q` is consumed by the close-dialog demo at `main.rs:715` before `handle_binding` runs. Unreachable with default config (bead .61) |
+| `close_tab` | Tabs and windows | WIRED | `handle_layout_action` `CloseTab` arm → `close_active_tab`. The Linux default chord `ctrl+shift+q` used to be consumed by the close-dialog demo before `handle_binding` ran; `translate_overlay_chord` now yields to any configured binding and the demo moved to `ctrl+shift+d` (bead .61) |
 | `next_tab` | Tabs and windows | WIRED | `main.rs:423` → `TabSessions::focus_next` |
 | `prev_tab` | Tabs and windows | WIRED | `main.rs:424` → `TabSessions::focus_prev` |
 | `select_tab_1`…`select_tab_9` | Tabs and windows | WIRED (9 rows) | `main.rs:425` → `TabSessions::select`; bindings at `keybindings.rs:561-569` |
-| `new_window` | Tabs and windows | UNWIRED | `LayoutAction::NewWindow` hits `main.rs:430`; no second-window code path (bead .61) |
+| `new_window` | Tabs and windows | WIRED | `handle_layout_action` `NewWindow` arm → `open_new_window`, which builds a second window's `Shared` + IPC connection through `start_window_backend` and opens it with `open_window` (bead .61) |
 | `copy` | Clipboard | UNWIRED | `LayoutAction::CopySelection` hits `main.rs:430`; `clipboard.rs`/`selection.rs` unimported |
 | `paste` | Clipboard | UNWIRED | `LayoutAction::PasteClipboard` hits `main.rs:430`; `paste.rs` unimported |
 | `scroll_up` | Navigation | UNWIRED | hits `main.rs:430`; `split_scroll.rs` unimported |
@@ -402,7 +402,10 @@ and blocks every `visual-E2E` row.
 - **FU-9 Find overlay.** Rows: `find`, `SearchRequest`, `SearchResults`.
 - **FU-10 Zoom.** Rows: `zoom_in`, `zoom_out`, `zoom_reset`.
 - **FU-11 close_tab chord and new_window.** Rows: `close_tab`, `new_window`.
-  **Covered by bead .61 — do not re-file.**
+  **Closed by bead .61.** The overlay chords now yield to the configured
+  bindings (`translate_overlay_chord`), the close dialog and notes modal moved
+  off `ctrl+shift+q` / `ctrl+shift+n`, and `NewWindow` opens a second window
+  with its own IPC backend. Both rows are WIRED above.
 - **FU-12 Command palette and context menu actions.** No parity row names them
   directly, but `CommandPaletteEvent::Execute(_)` (`main.rs:502`) and
   `ContextMenuEvent::Selected(_)` (`main.rs:524`) are discarded, so both

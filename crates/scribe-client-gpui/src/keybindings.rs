@@ -394,6 +394,60 @@ pub enum LayoutAction {
     ZoomReset,
 }
 
+/// A shell-owned overlay the client opens from a fixed, non-configurable chord.
+///
+/// These are the surfaces that have no `KeybindingsConfig` field yet, so the
+/// shell hard-codes a chord for them. Because they are not in the binding
+/// tables, nothing stops a hard-coded chord from colliding with a user-facing
+/// action — which is exactly how the Linux `close_tab` default (`ctrl+shift+q`)
+/// became unreachable. [`translate_overlay_chord`] resolves that collision in
+/// one place, in favour of the configured binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayChord {
+    /// Toggle the tooltip demo overlay.
+    TooltipDemo,
+    /// Open the close-confirmation dialog.
+    CloseDialog,
+    /// Open the clipboard-confirmation dialog.
+    ClipboardDialog,
+    /// Open the workspace-notes modal.
+    WorkspaceNotes,
+}
+
+/// The fixed chord for each [`OverlayChord`].
+///
+/// Every entry is deliberately kept off the default binding table so the
+/// overlays stay reachable out of the box: `ctrl+shift+q` (`close_tab`) and
+/// `ctrl+shift+n` (`new_window`) are user actions and are therefore NOT used
+/// here. A rebind can still move a user action onto one of these chords, which
+/// [`translate_overlay_chord`] resolves in the user's favour.
+pub const OVERLAY_CHORDS: [(&str, OverlayChord); 4] = [
+    ("ctrl+shift+u", OverlayChord::TooltipDemo),
+    ("ctrl+shift+d", OverlayChord::CloseDialog),
+    ("ctrl+shift+k", OverlayChord::ClipboardDialog),
+    ("ctrl+shift+m", OverlayChord::WorkspaceNotes),
+];
+
+/// Match a key event against the shell-owned overlay chords.
+///
+/// A configured binding always wins: when `input` resolves to any
+/// [`KeyAction`], this returns `None` so the caller falls through to the
+/// binding dispatcher instead of swallowing the keystroke. That precedence is
+/// what keeps every bound action reachable no matter which chord the shell
+/// hard-codes, and it survives a rebind in either direction.
+#[must_use]
+pub fn translate_overlay_chord(input: &KeyInput, bindings: &Bindings) -> Option<OverlayChord> {
+    if !input.is_down() {
+        return None;
+    }
+    if translate_key_action(input, bindings).is_some() {
+        return None;
+    }
+    OVERLAY_CHORDS.iter().find_map(|(combo, chord)| {
+        Keybinding::parse(combo).is_some_and(|binding| binding.matches(input)).then_some(*chord)
+    })
+}
+
 /// Result of translating a key event against the bindings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyAction {

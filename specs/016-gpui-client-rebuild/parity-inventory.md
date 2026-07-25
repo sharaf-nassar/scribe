@@ -238,7 +238,7 @@ Every row's method is `visual-E2E`: each action must be driven through
 | `new_claude_resume_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewClaudeResumeTab` arm → `ai_tab_command` | required |
 | `new_codex_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewCodexTab` arm → `ai_tab_command` | required |
 | `new_codex_resume_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewCodexResumeTab` arm → `ai_tab_command` | required |
-| `close_tab` | Tabs and windows | visual-E2E | — (unwired, FU-11) — the `CloseTab` arm exists, but the Linux default chord `ctrl+shift+q` is consumed by the close-dialog demo in `handle_overlay_key` before `handle_binding` runs | required |
+| `close_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `CloseTab` arm → `close_active_tab`; the chord now outranks the close-dialog overlay via `translate_overlay_chord` (`tests/e2e/visual/tab-window-chords.sh` phase 1) | required |
 | `next_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NextTab` arm → `TabSessions::focus_next` | required |
 | `prev_tab` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `PrevTab` arm → `TabSessions::focus_prev` | required |
 | `select_tab_1` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `SelectTab` arm → `TabSessions::select` | required |
@@ -250,7 +250,7 @@ Every row's method is `visual-E2E`: each action must be driven through
 | `select_tab_7` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `SelectTab` arm → `TabSessions::select` | required |
 | `select_tab_8` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `SelectTab` arm → `TabSessions::select` | required |
 | `select_tab_9` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `SelectTab` arm → `TabSessions::select` | required |
-| `new_window` | Tabs and windows | visual-E2E | — (unwired, FU-11) — `LayoutAction::NewWindow` hits the catch-all; no second-window code path exists | required |
+| `new_window` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewWindow` arm → `open_new_window` → `start_window_backend` + `open_window` (`tests/e2e/visual/tab-window-chords.sh` phase 2) | required |
 | `copy` | Clipboard | visual-E2E | — (unwired, FU-8) — `CopySelection` hits the catch-all; `clipboard.rs`/`selection.rs` outside the import closure | required |
 | `paste` | Clipboard | visual-E2E | — (unwired, FU-8) — `PasteClipboard` hits the catch-all; `paste.rs` outside the import closure | required |
 | `scroll_up` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; `split_scroll.rs` outside the import closure | required |
