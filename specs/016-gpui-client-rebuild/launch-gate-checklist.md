@@ -86,15 +86,39 @@ fails on scripted-E2E (AI indicator), perf, and unverifiable manual rows.
   headless suites plus `tests/e2e/visual/config-reload.sh`. → bead
   `scribe-38e.57`.
 
-## Green (verified) surface
+## ⚠️ RETRACTED: "green surface" claim (corrected 2026-07-24)
 
-- All 46 client-message and 59 server-message rows whose method is
-  golden/gpui-test/visual-E2E: covered and passing.
-- Input/keybinding golden + gpui-test rows: passing.
-- Removed config keys (9): deserialize-and-ignore behavior passing (gpui-test).
-- Lifecycle & failure paths (cold-restart, server-down, socket-loss, reconnect,
-  hot-reload, multi-window isolation, workspace-split, shell-integration,
-  terminal-shortcuts, keybindings): green.
+This section previously asserted that all client/server-message rows with
+`golden`/`gpui-test`/`visual-E2E` methods were "covered and passing", implying
+parity. **That claim was wrong and is withdrawn.** Those suites validate pure
+functions, not reachability: a module can pass every test while the running
+client never calls it.
+
+The reachability audit (`reachability-audit.md`, bead `scribe-38e.60`) measured
+the truth across 173 rows:
+
+| Verdict | Count | Share |
+| --- | --- | --- |
+| WIRED (reachable in the app) | 60 | 34.7% |
+| UNWIRED (logic exists, nothing calls it) | 63 | 36.4% |
+| MISSING (no implementation) | 50 | 28.9% |
+
+Excluding the 9 removed-config-key rows (which assert *absence* of behavior),
+**51 of 164 user-facing rows are reachable — 31%.**
+
+Structural causes: `main.rs` imports 19 of 54 library modules; `run_reader`
+handles 12 of 59 `ServerMessage` variants and ends in `_ => {}`;
+`handle_layout_action` executes 9 of 35 `LayoutAction` variants; and
+`Content.rows` is `Vec<String>` — the paint path has **no per-cell color**, so
+box drawing, ligatures, and font fallback are all unreachable. Command palette,
+context-menu, and dialog *events* are discarded, so those surfaces open but
+their actions do nothing.
+
+What genuinely IS verified green: the 9 removed-config-key rows, and the
+lifecycle/failure-path scripted E2Es (cold-restart, server-down, socket-loss,
+reconnect, hot-reload, multi-window isolation, workspace-split,
+shell-integration, terminal-shortcuts, keybindings-validation) — these drive the
+real app and therefore do prove reachability for what they cover.
 
 ## Re-gate criteria
 
