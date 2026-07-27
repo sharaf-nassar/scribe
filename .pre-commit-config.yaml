@@ -34,7 +34,7 @@ repos:
         name: 016 parity inventory counts
         entry: tools/check-parity-inventory.sh --staged
         language: system
-        files: ^(specs/016-gpui-client-rebuild/parity-inventory\.md|crates/scribe-client-gpui/src/main\.rs|crates/scribe-common/src/protocol\.rs|crates/scribe-client/src/input\.rs|tools/check-parity-inventory\.sh)$
+        files: ^(specs/016-gpui-client-rebuild/(parity-inventory|spec)\.md|crates/scribe-client-gpui/src/main\.rs|crates/scribe-common/src/protocol\.rs|crates/scribe-client/src/input\.rs|tools/check-parity-inventory\.sh)$
         pass_filenames: false
 
       - id: cargo-fmt

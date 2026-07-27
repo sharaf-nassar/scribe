@@ -1,8 +1,18 @@
 # GPUI client parity inventory
 
 This committed oracle enumerates the frozen IPC, input, and UI surface the GPUI
-client must preserve before cutover. It is derived from the legacy client and
-`scribe-common` at the 016 planning baseline.
+client must preserve before cutover, plus every behaviour requirement in
+[`spec.md`](spec.md)'s requirement register. The message, keybinding and
+removed-key tables are derived from the legacy client and `scribe-common` at the
+016 planning baseline; the rendering and spec-behaviour tables are derived from
+the register.
+
+**Both derivations are load-bearing.** Until 2026-07-27 the row set came only
+from the legacy client's IPC and keybinding surface, so nine spec requirements
+had no row, no oracle scored them, and the reachable-row count measured the
+tabulated subset rather than parity. `tools/check-parity-inventory.sh` now fails
+when a register id in `spec.md` has no carrying row, which is what makes the
+total a parity measure.
 
 Every row carries a **Reachable from** cell naming the live-path symbol that
 must call the feature. The cells were first populated from the per-row evidence
@@ -353,6 +363,62 @@ beads `.56` and `.53`), the command-mark scrollbar (bead `.88`), and the X11
 focus guard (FU-15). The audit's figure at `f56ef95` was 0 of 5, with 3 unwired
 and 2 missing; the scrollbar row was added afterwards with bead `.88`.
 
+## Spec behaviour requirements (29)
+
+These rows are derived from [`spec.md`](spec.md)'s requirement register rather
+than from the legacy client's IPC surface: every acceptance criterion and
+porting obligation that no message, keybinding, rendering or removed-key row
+already carries gets a row here. The "spec.md" column names the register ids the
+row satisfies, and `tools/check-parity-inventory.sh` fails when a register id
+has no carrying row.
+
+This table exists because the 2026-07-27 launch gate found nine spec
+requirements — mouse reporting, mouse-wheel scrolling, IME composition,
+cold-restart restore, the command-mark scrollbar, window geometry persistence,
+the desktop notification dispatcher, server lifecycle management, and file
+drag-and-drop — that had never been tabulated at all. A requirement with no row
+is scored by no oracle, so the reachable-row count measured the tabulated subset
+rather than parity. Enumerating the register closed that gap and surfaced five
+further requirements that are not reachable today.
+
+| Requirement | spec.md | Surface | Verification method | Reachable from | Status |
+| --- | --- | --- | --- | --- | --- |
+| Mouse reporting | `US1-2` | terminal pointer input | visual-E2E | `main.rs::TerminalView::forward_mouse_press` / `forward_mouse_release` / `forward_mouse_motion` → `mouse_reporting::encode_mouse_press` / `encode_mouse_release` / `encode_mouse_motion` → `main.rs::send_key_bytes`, gated by `mouse_reporting::should_report_mouse_motion` against the pane's live DEC modes — `tests/e2e/visual/mouse-reporting.sh` | required |
+| Mouse-wheel and touchpad scrolling | `US1-4`, `US3-7` | wheel routing and viewport scroll | visual-E2E | `main.rs::TerminalView::scroll_wheel` → `mouse_reporting::wheel_lines` + `mouse_reporting::wheel_action`, which routes each notch to `encode_mouse_scroll` (tracking app), `alternate_scroll_keys` (mode 1007 alt screen) or `TerminalView::scroll_terminal` (client viewport) — `tests/e2e/visual/mouse-reporting.sh`, `tests/e2e/visual/terminal-viewport.sh` | required |
+| Selection and copy-on-select | `US1-3` | cell/word/line selection | visual-E2E | `main.rs::TerminalView::press_grid` → `selection::SelectionMode` / `selection::SelectionSpan` → `TerminalView::selection_copy_text` → `TerminalView::write_clipboard` → `clipboard::ArboardClipboard` — `tests/e2e/visual/clipboard-osc52.sh` | required |
+| Smart-selection actions | `US1-3` | context-menu smart actions | visual-E2E | `main.rs::TerminalView::open_context_menu` → `smart_selection::CompiledSmartSelection` → `smart_selection::ResolvedSmartSelectionAction` → `main.rs::TerminalView::dispatch_context_menu_action` — `tests/e2e/visual/overlays.sh` | required |
+| URL, path, and OSC 8 hyperlink handling | `US1-3` | Ctrl+click open, hover tooltip, scheme gate | visual-E2E | `main.rs::TerminalView::dispatch_context_menu_action` and `TerminalView::route_osc8_activation` → `url_detect::is_allowed_scheme` → `url_detect::open_url` / `url_detect::open_path`, with a rejected scheme raised as `dialog::DisallowedSchemeDialog` and the hover label painted by `tooltip::tooltip_element` — `tests/e2e/visual/overlays.sh` | required |
+| Split-scroll | `US1-4` | pinned live bottom in AI panes | visual-E2E | `main.rs::TerminalView::sync_split_scroll` → `split_scroll::SplitScrollState`, re-armed per pane by `TerminalView::set_split_scroll_eligibility` — `tests/e2e/visual/terminal-viewport.sh` | required |
+| IME preedit composition | `US1-6` | Wayland and X11 composition | visual-E2E | `main.rs::TerminalView::start_ime` registers `preedit::Ime` as the window's input handler, `TerminalView::sync_ime` paints the in-flight composition over the grid, and `TerminalView::clear_preedit` retires it on focus loss or any encoded keystroke — `tests/e2e/visual/ime-preedit.sh` | required |
+| Sync-update frames (CSI ?2026) | `US1-7`, `PO-6` | tear-free output bursts | scripted-E2E | `main.rs::forward_output` → `main.rs::forward_inbound` → `main.rs::spawn_drain` → `main.rs::apply_pane_op` → `sync_frames::SyncFrameQueue`, committed by `sync_frames::drain_all_committed` and expiry-flushed by `main.rs::run_sync_expiry` → `main.rs::flush_expired_sync` | required |
+| File drag-and-drop | `US1-8` | dropped path insertion | visual-E2E | `main.rs::TerminalView::handle_dropped_paths`, registered as the window root's `ExternalPaths` drop handler → `drag_drop::dropped_path_insertion` quoted for the shell `ChromeMetadata` recorded for that session → `send_key_bytes` — `tests/e2e/visual/drag-drop.sh` | required |
+| Cold-restart restore | `US2-3` | window, workspace, tab and pane replay | visual-E2E | `main.rs::ColdStart::resolve` → `restore_state::RestoreStore::claim_first_window` plus the `--restore-child` fan-out, replayed by `main.rs::TerminalView::poll_restore` → `restore_replay::prepare_replay`; the snapshot is written back by `TerminalView::flush_snapshot_now` → `RestoreStore::save_window` / `RestoreStore::upsert_index` — `tests/e2e/visual/cold-restart.sh` | required |
+| Server-upgrade reattach | `US2-4` | zero-downtime `--upgrade` handoff | scripted-E2E | — (missing) `main.rs::start_ipc_thread` awaits `main.rs::run_connection` exactly once and, when it returns, only publishes a status line; no path redials, so a server handoff leaves the window attached to nothing. `tests/e2e/visual/reconnect.sh` relaunches the *client process* and therefore does not cover this. | required |
+| Colour emoji in the grid | `US3-1` | colour emoji glyphs | visual-E2E | `terminal_element.rs::TerminalElement::paint_grid` → `GridFont::fallbacks`, which names `Noto Color Emoji` after the Nerd Font entries on every `TextRun` handed to `shape_line` — `tests/e2e/visual/color-emoji.sh` | required |
+| Cell text decorations | `US3-4` | underline, undercurl, strikethrough | visual-E2E | `terminal_element.rs::TerminalElement::paint_grid` builds each `TextRun` with `UnderlineStyle { wavy: Flags::UNDERCURL }` from `Flags::ALL_UNDERLINES` and `StrikethroughStyle` from `Flags::STRIKEOUT`. Fidelity gap flagged: gpui's `UnderlineStyle` has no double-underline variant, so `Flags::DOUBLE_UNDERLINE` currently paints a single rule | required |
+| Overlay chrome polish | `US3-5` | rounded corners, drop shadow, hover/pressed | visual-E2E | `command_palette::CommandPaletteView::render`, `dialog::DialogView::render`, `context_menu::ContextMenuView::render` and `tooltip::tooltip_element`, each applying `.rounded_*()` + `.shadow_*()` on the live overlay layer — `tests/e2e/visual/overlays.sh`, `tests/e2e/visual/dialogs.sh` | required |
+| Overlay and focus animations | `US3-6` | ≤150 ms interruptible easing | visual-E2E | `main.rs::main` and `main.rs::run_settings` → `animation::AnimationSettings::resolve` → `AnimationSettings::apply_to_app`, which installs the reduce-motion-aware durations every overlay animates against | required |
+| Custom titlebar with integrated tab bar | `US3-8` | window chrome | visual-E2E | `main.rs::TerminalView::build_titlebar` → `titlebar::TitlebarView`, rendered above the grid with `window_chrome` supplying the client-side decoration geometry — `tests/e2e/visual/titlebar.sh` | required |
+| Pane dividers and drag-resize | `US3-10` | divider paint and split resize | visual-E2E | — (unwired) `divider.rs` has no reference anywhere outside `lib.rs` and its own tests, so neither the divider quads nor drag-resize exist in the running app; `main.rs` only tints pane gaps with `chrome.divider`. Recorded as `unwired-module divider` in `tools/reachability-baseline.txt` | required |
+| Focused pane and workspace accent border | `US3-10` | focus indication | visual-E2E | `main.rs::TerminalView::render_panes` → `main.rs::pane_border` → the pane element's border colour, using the owning region's accent when focused. Note: the shared strip math in `focus_border::border_edges` is reached only from `ai_indicator::pane_border_edges`, which has no live caller — see the AI-indicator row | required |
+| AI indicator borders and tab tint | `US4-1` | pulsing borders, tab tint, stale-clear | visual-E2E | — (unwired) `ai_indicator::AiStateTracker::tab_indicator_color`, `workspace_border_color`, `tick`, `needs_animation`, `clear_stale_processing`, `note_activity`, `remember_provider`, `clear_attention_states` and `ai_indicator::pane_border_edges` have no caller outside `ai_indicator.rs`. `main.rs` reaches only `update`, `remove`, `clear_context`, `provider_for_session` and `context_for`, so AI state is tracked and never painted as a border or tab tint | required |
+| Prompt bar and tab context meter | `US4-1` | elapsed timer, context meter, dismiss/copy, `%` suffix | visual-E2E | `main.rs::TerminalView::build_prompt_model` → `prompt_bar::build_model` → `prompt_bar::render`; the tab suffix via `main.rs::TerminalView::sync_tab_context_suffix` → `tab_bar::context_suffix`, both fed by `ai_indicator::AiStateTracker::context_for` | required |
+| Workspace accent colours and badges | `US4-3` | region accents and status badges | visual-E2E | `main.rs::TerminalView::next_region_accent` → `PaneShell::split_workspace`, painted through `main.rs::pane_border`; the tmux/session/share badges via `status_bar::build_model` — `tests/e2e/visual/workspace-split.sh` | required |
+| Workspace notes hover preview | `US4-3` | hover preview over the notes affordance | visual-E2E | — (unwired) `workspace_notes_preview.rs` has no reference outside `lib.rs` and its own tests. The notes *modal* is wired (`workspace_notes_modal`), the hover preview is not. Recorded as `unwired-module workspace_notes_preview` in `tools/reachability-baseline.txt` | required |
+| Remote connect picker overlay | `US4-4` | peer picker UI | visual-E2E | — (missing) `remote::RemoteConnect` models the picker but no GPUI view renders it; `main.rs::TerminalView::refresh_remote_peers` surfaces the peer count on the status strip instead. Same gap the "LAN and sharing boundary" section records | required |
+| Status bar segments | `US4-5` | full segment set | visual-E2E | `main.rs::TerminalView::build_status_model` → `status_bar::build_model` → `status_bar::render`, with the CPU/mem/GPU/net sparklines fed by `sys_stats::SystemStatsCollector` — `tests/e2e/visual/window-chrome-bands.sh` | required |
+| xterm-256 palette | `PO-1` | indexed colour resolution | golden | `main.rs` builds one `color::TerminalColors` per theme, which owns `palette::ColorPalette`; `TerminalColors::resolve_color` resolves every indexed cell on the paint path. `tools/reachability-baseline.txt` lists `palette` as an unwired *module* because that ratchet counts only `main.rs`'s direct import closure — the module is reached transitively through `color` | required |
+| Colour semantics (bold→bright, DIM, sRGB) | `PO-3` | per-cell colour resolution | golden | `terminal_element.rs::TerminalElement::paint_grid` → `color::TerminalColors::resolve_cell_colors` → `color::bold_to_bright`, `color::apply_dim`, `color::srgb_to_linear_rgba`, `color::boost_srgb_brightness` | required |
+| Window geometry persistence | `PO-8` | size and position across restarts | visual-E2E | `main.rs::TerminalView::start_geometry_tracking` (window-bounds subscription) → `TerminalView::capture_geometry` → `window_state::geometry_from_bounds`, debounce-flushed by `TerminalView::flush_geometry_now` → `window_state::WindowRegistry::save`; read back by `main.rs::open_window` → `window_state::window_bounds_for` — `tests/e2e/visual/cold-restart.sh` | required |
+| Desktop notification dispatcher | `PO-9` | AI attention notifications | visual-E2E | `main.rs::TerminalView::start_notifications` → `notification_dispatcher::spawn_dispatcher` (the one D-Bus connection), gated by `notifications::NotificationCenter::on_ai_state_changed` against the live config and focus position; a reported click routes back to select the session's tab and raise the window — `tests/e2e/visual/notifications.sh` | required |
+| Server lifecycle management | `PO-10` | autostart, stale socket, staleness check | scripted-E2E | `main.rs::run_local_connection` → `server_lifecycle::connect_or_start_server`, which names a missing socket apart from a stale one and carries the diagnosis into the status line, then `server_lifecycle::connected_server_staleness` holds the connected server up against the installed binary — `tests/e2e/visual/server-lifecycle.sh` | required |
+
+**Reachability:** 24 of 29 rows name a live-path symbol; 3 are unwired and 2 are
+missing. The unwired three are pane dividers, the AI indicator's painted half
+and the workspace-notes hover preview; the missing two are server-upgrade
+reattach and the remote connect picker overlay. None of the five had a row
+before 2026-07-27, so none was scored by the gate.
+
 ## Removed configuration keys
 
 These legacy appearance keys must deserialize harmlessly at cutover but have no
@@ -393,14 +459,20 @@ with them. They are the launch gate's metric — not the unit-test count.
 | Server messages | 59 | 59 | 0 | 0 |
 | Input and keybinding actions | 54 | 54 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
+| Spec behaviour requirements | 29 | 24 | 3 | 2 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **174** | **174** | **0** | **0** |
+| **Total** | **203** | **198** | **3** | **2** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **165 rows, of which 165 are
-reachable (100%)** and 0 are not. **1 of those 165** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **194 rows, of which 189 are
+reachable (97%)** and 5 are not. **1 of those 194** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **164 of 165**.
+the in-client figure is **188 of 194**.
+
+The five unreachable rows are all in the spec-behaviour table and all were
+invisible to the gate before 2026-07-27, because none of them had a row:
+server-upgrade reattach, the remote connect picker overlay, pane dividers, the
+AI indicator's painted half, and the workspace-notes hover preview.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth
@@ -410,6 +482,70 @@ Fix units FU-1..FU-23 are defined in
 sequenced around them, P0 first. Every fix unit that owns a row in the tables
 above has landed — that is what a zero unwired/missing column means — so the
 audit's per-FU notes are now history rather than a work queue.
+
+## Spec requirement coverage
+
+Every register id in [`spec.md`](spec.md) maps to the row or rows that carry it.
+`tools/check-parity-inventory.sh` fails when an id is absent, duplicated,
+unknown, or points at a row that no table contains — that check is what makes
+the reachable-row total a parity measure instead of a measure of whichever
+surface happened to be tabulated.
+
+A carrier is written as a row name in backticks, as `§` plus a table label when
+a whole table carries the requirement, or as `not a parity row` for the tree,
+licensing and CI requirements that are gated by the launch-gate checklist rather
+than by a reachable client symbol.
+
+| spec.md requirement | Carried by |
+| --- | --- |
+| `US1-1` | §Input and keybinding actions (the seven terminal shortcuts and their golden fixtures) plus `KeyInput` |
+| `US1-2` | `Mouse reporting` |
+| `US1-3` | `Selection and copy-on-select`, `Smart-selection actions`, `URL, path, and OSC 8 hyperlink handling`, `find`, `SearchRequest`, `SearchResults` |
+| `US1-4` | `TrimScrollback`, `scroll_up`, `scroll_bottom`, `Mouse-wheel and touchpad scrolling`, `Split-scroll` |
+| `US1-5` | `paste`, `ClipboardPromptRequest`, `ClipboardPromptResponse` |
+| `US1-6` | `IME preedit composition` |
+| `US1-7` | `Sync-update frames (CSI ?2026)` |
+| `US1-8` | `File drag-and-drop` |
+| `US2-1` | `SessionReplay` |
+| `US2-2` | `ScreenSnapshot`, `SessionList`, `Hello`, `Welcome` |
+| `US2-3` | `Cold-restart restore` |
+| `US2-4` | `Server-upgrade reattach` |
+| `US3-1` | `Font fallback`, `Colour emoji in the grid` |
+| `US3-2` | `Box drawing` |
+| `US3-3` | `Ligatures` |
+| `US3-4` | `Cell text decorations` |
+| `US3-5` | `Overlay chrome polish` |
+| `US3-6` | `Overlay and focus animations` |
+| `US3-7` | `Mouse-wheel and touchpad scrolling` |
+| `US3-8` | `Custom titlebar with integrated tab bar`, `Opacity` |
+| `US3-9` | `X11 focus guard` |
+| `US3-10` | `Pane dividers and drag-resize`, `Focused pane and workspace accent border` |
+| `US4-1` | `AI indicator borders and tab tint`, `Prompt bar and tab context meter`, `AiStateChanged`, `TaskLabelChanged` |
+| `US4-2` | `Command-mark scrollbar` |
+| `US4-3` | `Workspace accent colours and badges`, `Workspace notes hover preview`, `WorkspaceNotesSnapshot`, `workspace_split_vertical` |
+| `US4-4` | `Remote connect picker overlay`, `LanApprovalRequest`, `WindowTakenOver`, `ShareRoster`, `ControlRequested` |
+| `US4-5` | `Status bar segments` |
+| `US5-1` | not a parity row — deletion sweep, gated by bead `scribe-38e.45` |
+| `US5-2` | not a parity row — deletion sweep, gated by bead `scribe-38e.45`; the ported feature set is covered by the settings-window rows |
+| `US5-3` | not a parity row — dead-code and dependency audit, gated by bead `scribe-38e.46` and `tools/check-reachability.sh` |
+| `US5-4` | not a parity row as a whole; its named logic is carried by `xterm-256 palette`, `Box drawing` and `Colour semantics (bold→bright, DIM, sRGB)` |
+| `US5-5` | not a parity row — `lat check` runs in CI, gated by bead `scribe-38e.47` |
+| `US5-6` | not a parity row — licensing, gated by the launch-gate checklist |
+| `US6-1` | not a parity row — `scribe-test` is a frozen server-only suite |
+| `US6-2` | not a parity row — harness capability; every `visual-E2E` row depends on it |
+| `US6-3` | not a parity row — headless logic coverage, explicitly insufficient on its own |
+| `US6-4` | not a parity row — the gate rule this document implements; enforced by `tools/check-reachability.sh` and `tools/check-parity-inventory.sh` |
+| `PO-1` | `xterm-256 palette` |
+| `PO-2` | `Box drawing` |
+| `PO-3` | `Colour semantics (bold→bright, DIM, sRGB)` |
+| `PO-4` | `Font fallback` |
+| `PO-5` | `Command-mark scrollbar` |
+| `PO-6` | `Sync-update frames (CSI ?2026)` |
+| `PO-7` | `X11 focus guard` |
+| `PO-8` | `Window geometry persistence` |
+| `PO-9` | `Desktop notification dispatcher` |
+| `PO-10` | `Server lifecycle management` |
+| `PO-11` | `RemoteHandshake`, `LanHello`, `GetLanDialIdentity` |
 
 ## LAN and sharing boundary
 

@@ -139,6 +139,27 @@ Excluding the nine removed-configuration-key rows, which are satisfied by the
   the current client supports them. (Open Question: current macOS status
   must be confirmed and matched, not extended.)
 
+## Requirement register
+
+Every acceptance criterion below and every porting obligation in Constraints
+carries a stable id (`US<story>-<n>`, `PO-<n>`). Those ids are the requirement
+set: `parity-inventory.md` must account for each one, and
+`tools/check-parity-inventory.sh` fails when an id here has no carrying row.
+
+The ids were added on 2026-07-27 by bead `scribe-38e.94`, after the launch gate
+found nine spec requirements — mouse reporting, mouse-wheel scrolling, IME
+composition, cold-restart restore, the command-mark scrollbar, window geometry
+persistence, the desktop notification dispatcher, server lifecycle management,
+and file drag-and-drop — that the parity inventory had never enumerated. The
+inventory had been derived from the legacy client's IPC and keybinding surface,
+so its reachable-row count measured the tabulated subset rather than parity.
+Numbering is append-only: an id is never reused or renumbered, so a row can
+cite it permanently.
+
+Two criteria (`US1-8`, `US3-10`) were added by the same bead. They describe
+legacy-client behaviour that the rebuild must preserve and that the original
+spec never wrote down; they are marked inline.
+
 ## User Stories
 
 ### US1 — Terminal parity for the daily driver
@@ -146,22 +167,28 @@ As a Scribe user, I want the new client to behave identically to the old one
 for core terminal work, so that cutover is invisible to my muscle memory.
 
 **Acceptance criteria:**
-- All key input paths produce byte-identical sequences to the old client:
-  kitty keyboard protocol (4-level priority chain, CSI-u), legacy xterm
-  fallback, DECCKM/DECPAM application modes, numpad SS3 table.
-- Mouse reporting (X10/SGR-1006, modes 1000/1002/1003) byte-identical.
-- Selection (cell/word/line, copy-on-select), smart selection actions,
-  search overlay with match cycling, URL/path detection with Ctrl+click
-  open, OSC 8 hyperlinks with hover tooltip and disallowed-scheme gate all
+- **US1-1** All key input paths produce byte-identical sequences to the old
+  client: kitty keyboard protocol (4-level priority chain, CSI-u), legacy
+  xterm fallback, DECCKM/DECPAM application modes, numpad SS3 table.
+- **US1-2** Mouse reporting (X10/SGR-1006, modes 1000/1002/1003)
+  byte-identical.
+- **US1-3** Selection (cell/word/line, copy-on-select), smart selection
+  actions, search overlay with match cycling, URL/path detection with
+  Ctrl+click open, OSC 8 hyperlinks with hover tooltip and disallowed-scheme
+  gate all work as today.
+- **US1-4** Scrollback, viewport scrolling, `TrimScrollback` mark shifting,
+  mouse-wheel scrolling, and split-scroll (pinned live bottom in AI panes)
   work as today.
-- Scrollback, viewport scrolling, `TrimScrollback` mark shifting, split-
-  scroll (pinned live bottom in AI panes) work as today.
-- Bracketed paste, paste confirmation, OSC 52 clipboard gating dialogs work
-  as today.
-- IME/preedit composition works on Wayland and X11.
-- Sync-update frames (CSI ?2026) never tear: one committed burst per redraw,
-  150 ms expiry flush, catch-up drain — matching current
+- **US1-5** Bracketed paste, paste confirmation, OSC 52 clipboard gating
+  dialogs work as today.
+- **US1-6** IME/preedit composition works on Wayland and X11.
+- **US1-7** Sync-update frames (CSI ?2026) never tear: one committed burst
+  per redraw, 150 ms expiry flush, catch-up drain — matching current
   `queue_output_frames` semantics.
+- **US1-8** *(added 2026-07-27, bead `scribe-38e.94`)* A file dropped on the
+  window inserts its path into the focused pane, quoted for the shell the
+  server reported for that session — legacy behaviour the original spec never
+  wrote down.
 
 ### US2 — Session lifecycle parity
 As a Scribe user, I want reattach, reconnect, cold-restart restore, and
@@ -169,99 +196,108 @@ server upgrades to work exactly as today, so that the multiplexer promise
 (sessions outlive clients) holds.
 
 **Acceptance criteria:**
-- `SessionReplay` (zstd ANSI) rebuilds panes correctly on reattach via the
-  display-only `write_output` path.
-- `ScreenSnapshot` handling, reconnect topology reconstruction from
+- **US2-1** `SessionReplay` (zstd ANSI) rebuilds panes correctly on reattach
+  via the display-only `write_output` path.
+- **US2-2** `ScreenSnapshot` handling, reconnect topology reconstruction from
   `SessionList`, and window adoption (`Hello { takeover }`) work as today.
-- Cold-restart restore (`RestoreStore`, `--restore-child` fan-out) restores
-  windows, workspaces, tabs, and pane trees.
-- Zero-downtime server upgrade (`--upgrade` handoff) leaves the new client
-  attached and rendering.
+- **US2-3** Cold-restart restore (`RestoreStore`, `--restore-child` fan-out)
+  restores windows, workspaces, tabs, and pane trees.
+- **US2-4** Zero-downtime server upgrade (`--upgrade` handoff) leaves the new
+  client attached and rendering.
 
 ### US3 — Modern visual polish
 As a Scribe user, I want the client to look and feel like a current-
 generation terminal, so that the UI no longer reads as dated.
 
 **Acceptance criteria:**
-- Emoji render in color in the grid. Every terminal glyph run supplies
-  `FontFallbacks::from_fonts` with Scribe's Nerd Font entries before generic
-  symbol and emoji fallbacks, preserving the current fallback ordering.
-- Procedural box drawing for U+2500–U+259F remains independent of terminal
-  font coverage: those cells bypass text shaping and paint alpha-mask quads
-  after backgrounds and before text glyphs.
-- Terminal ligatures honor `appearance.ligatures`: same-style runs use
-  `shape_line` with the grid `cell_width`, and disable `calt` only when the
-  setting is false, so later cell origins stay aligned.
-- Undercurl (wavy, colored), underline, double underline, strikethrough
-  render from cell flags.
-- Every overlay (command palette, context menu, all dialogs, tooltips) has
-  rounded corners, a drop shadow, and hover + pressed states on buttons.
-- Tab switches, overlay open/close, and focus changes animate (fast,
-  interruptible easing; no animation exceeds 150 ms).
-- Scrolling is pixel-smooth (wheel and touchpad), including scrollback.
-- The window uses a custom titlebar with the tab bar integrated; native
-  decorations are gone on Linux. `appearance.opacity` updates live on Wayland
-  and X11 by repainting alpha-aware terminal and chrome backgrounds on a
-  transparent GPUI surface; text and controls stay opaque.
-- On X11, the focus guard retains its exact EWMH comparison by extracting the
-  GPUI `Xcb` raw-window-handle XID and comparing it with `_NET_ACTIVE_WINDOW`.
+- **US3-1** Emoji render in color in the grid. Every terminal glyph run
+  supplies `FontFallbacks::from_fonts` with Scribe's Nerd Font entries before
+  generic symbol and emoji fallbacks, preserving the current fallback
+  ordering.
+- **US3-2** Procedural box drawing for U+2500–U+259F remains independent of
+  terminal font coverage: those cells bypass text shaping and paint
+  alpha-mask quads after backgrounds and before text glyphs.
+- **US3-3** Terminal ligatures honor `appearance.ligatures`: same-style runs
+  use `shape_line` with the grid `cell_width`, and disable `calt` only when
+  the setting is false, so later cell origins stay aligned.
+- **US3-4** Undercurl (wavy, colored), underline, double underline,
+  strikethrough render from cell flags.
+- **US3-5** Every overlay (command palette, context menu, all dialogs,
+  tooltips) has rounded corners, a drop shadow, and hover + pressed states on
+  buttons.
+- **US3-6** Tab switches, overlay open/close, and focus changes animate
+  (fast, interruptible easing; no animation exceeds 150 ms).
+- **US3-7** Scrolling is pixel-smooth (wheel and touchpad), including
+  scrollback.
+- **US3-8** The window uses a custom titlebar with the tab bar integrated;
+  native decorations are gone on Linux. `appearance.opacity` updates live on
+  Wayland and X11 by repainting alpha-aware terminal and chrome backgrounds
+  on a transparent GPUI surface; text and controls stay opaque.
+- **US3-9** On X11, the focus guard retains its exact EWMH comparison by
+  extracting the GPUI `Xcb` raw-window-handle XID and comparing it with
+  `_NET_ACTIVE_WINDOW`.
+- **US3-10** *(added 2026-07-27, bead `scribe-38e.94`)* The focused pane and
+  focused workspace draw their accent border, and pane dividers are painted
+  and drag-resizable — legacy chrome the original spec never wrote down.
 
 ### US4 — Differentiating features preserved
 As an AI-workflow user, I want Scribe's differentiators intact, so the
 rebuild doesn't trade identity for polish.
 
 **Acceptance criteria:**
-- AI indicator (pulsing borders, priority ordering, stale-clear), prompt bar
-  (elapsed timer, context meter, dismiss/copy), task labels in tabs, tab
-  context-% suffix all work as today.
-- Command-boundary marks render on the scrollbar (success/failure ticks,
-  absolute-position shift on trim) — built as a custom GPUI scrollbar
+- **US4-1** AI indicator (pulsing borders, priority ordering, stale-clear),
+  prompt bar (elapsed timer, context meter, dismiss/copy), task labels in
+  tabs, tab context-% suffix all work as today.
+- **US4-2** Command-boundary marks render on the scrollbar (success/failure
+  ticks, absolute-position shift on trim) — built as a custom GPUI scrollbar
   element (Zed has no equivalent).
-- Workspace system (accent colors, badges, notes modal + hover preview,
-  workspace splits) works as today.
-- Remote/LAN: remote connect picker, LAN approval dialog (fingerprint
-  words), lost-control banner, share roster/control passing all work as
-  today.
-- Status bar segments (connection, command status, env warning, CWD, git
-  branch, session count, time, CPU/mem/GPU/net sparklines, update CTA)
-  present.
+- **US4-3** Workspace system (accent colors, badges, notes modal + hover
+  preview, workspace splits) works as today.
+- **US4-4** Remote/LAN: remote connect picker, LAN approval dialog
+  (fingerprint words), lost-control banner, share roster/control passing all
+  work as today.
+- **US4-5** Status bar segments (connection, command status, env warning,
+  CWD, git branch, session count, time, CPU/mem/GPU/net sparklines, update
+  CTA) present.
 
 ### US5 — Clean tree for the maintainer
 As the maintainer, I want the old rendering stack fully excised, so that no
 dead code, unused deps, or stale docs remain.
 
 **Acceptance criteria:**
-- `crates/scribe-renderer` no longer exists; `winit`, `wgpu`, `cosmic-text`,
-  and other old-client-only deps are gone from the workspace `Cargo.toml`
-  (except where GPUI transitively provides its own).
-- `scribe-settings`' GTK/wry webview delivery (GTK dep, HTML/CSS/JS assets)
-  no longer exists; settings ship as a GPUI window with the same feature
-  set (Clarification Q6).
-- No module in the new client is unreferenced; `cargo udeps`-style check (or
-  equivalent) is clean; grep for old-pipeline identifiers
+- **US5-1** `crates/scribe-renderer` no longer exists; `winit`, `wgpu`,
+  `cosmic-text`, and other old-client-only deps are gone from the workspace
+  `Cargo.toml` (except where GPUI transitively provides its own).
+- **US5-2** `scribe-settings`' GTK/wry webview delivery (GTK dep, HTML/CSS/JS
+  assets) no longer exists; settings ship as a GPUI window with the same
+  feature set (Clarification Q6).
+- **US5-3** No module in the new client is unreferenced; `cargo udeps`-style
+  check (or equivalent) is clean; grep for old-pipeline identifiers
   (`CellInstance`, `solid_quad`, `terminal.wgsl`) returns nothing.
-- Ported pure logic (xterm-256 palette, procedural box-drawing, color
-  semantics: bold→bright, DIM 0.67, contrast rules) lives in clearly named
-  new-client modules with their old tests carried over.
-- `lat.md/` fully reflects the new architecture (client.md, rendering.md,
-  architecture.md rewritten; stale sections deleted); `lat check` passes.
-- LICENSE files, every `Cargo.toml` license field, and README reflect
-  GPL-3.0-or-later; vendored Zed code carries its attribution.
+- **US5-4** Ported pure logic (xterm-256 palette, procedural box-drawing,
+  color semantics: bold→bright, DIM 0.67, contrast rules) lives in clearly
+  named new-client modules with their old tests carried over.
+- **US5-5** `lat.md/` fully reflects the new architecture (client.md,
+  rendering.md, architecture.md rewritten; stale sections deleted); `lat
+  check` passes.
+- **US5-6** LICENSE files, every `Cargo.toml` license field, and README
+  reflect GPL-3.0-or-later; vendored Zed code carries its attribution.
 
 ### US6 — Testing continuity for CI
 As the maintainer, I want CI to keep meaningful coverage through the swap,
 so regressions are caught during the rebuild, not after cutover.
 
 **Acceptance criteria:**
-- `scribe-test` functional E2E suite passes unchanged (server-only).
-- Visual E2E: the GPUI client runs headlessly in Docker (Xvfb or headless
-  Wayland + lavapipe software Vulkan), is drivable by `xdotool`, honors the
-  active-window guard semantics, and produces deterministic screenshots to
-  `/output`.
-- Client logic tests exist as `#[gpui::test]` headless tests for: layout
-  tree operations, workspace tree, selection model, input encoding tables,
-  sync-frame queueing, URL detection.
-- **Headless tests never stand alone for a user-facing row.** Per the
+- **US6-1** `scribe-test` functional E2E suite passes unchanged
+  (server-only).
+- **US6-2** Visual E2E: the GPUI client runs headlessly in Docker (Xvfb or
+  headless Wayland + lavapipe software Vulkan), is drivable by `xdotool`,
+  honors the active-window guard semantics, and produces deterministic
+  screenshots to `/output`.
+- **US6-3** Client logic tests exist as `#[gpui::test]` headless tests for:
+  layout tree operations, workspace tree, selection model, input encoding
+  tables, sync-frame queueing, URL detection.
+- **US6-4** **Headless tests never stand alone for a user-facing row.** Per the
   reachability re-baseline, `gpui-test` is retained only for the nine
   removed-configuration-key rows (which assert absence of behaviour); every
   other row's oracle drives the running app. CI additionally enforces
@@ -312,15 +348,23 @@ so regressions are caught during the rebuild, not after cutover.
   - Kitty keyboard protocol is ported from Scribe's `input.rs` (Zed lacks
     it; GPUI exposes raw key + modifiers + repeat + IME, which is
     sufficient).
-- **Porting obligations (framework-independent logic that must survive):**
-  xterm-256 palette (~200 LoC), procedural box-drawing rasterizer (~480 LoC
-  — Zed relies on fonts; Scribe's edge-to-edge rasterizer is a quality
-  feature to keep — see Open Questions for the GPUI integration mechanism),
-  bold→bright promotion / DIM factor / sRGB-linear conversions / brightness
-  boost, Scribe font fallback ordering, command-mark scrollbar, sync-frame
-  splitter client logic, X11 active-window guard, window geometry
-  persistence, desktop notification dispatcher, server lifecycle management
-  (`systemctl --user` / launchd), remote & LAN dial subprocess spawning.
+- **Porting obligations (framework-independent logic that must survive).**
+  Each carries a register id, because the launch gate found several of them
+  had never reached a parity row:
+  - **PO-1** xterm-256 palette (~200 LoC).
+  - **PO-2** Procedural box-drawing rasterizer (~480 LoC — Zed relies on
+    fonts; Scribe's edge-to-edge rasterizer is a quality feature to keep —
+    see Open Questions for the GPUI integration mechanism).
+  - **PO-3** bold→bright promotion / DIM factor / sRGB-linear conversions /
+    brightness boost.
+  - **PO-4** Scribe font fallback ordering.
+  - **PO-5** Command-mark scrollbar.
+  - **PO-6** Sync-frame splitter client logic.
+  - **PO-7** X11 active-window guard.
+  - **PO-8** Window geometry persistence.
+  - **PO-9** Desktop notification dispatcher.
+  - **PO-10** Server lifecycle management (`systemctl --user` / launchd).
+  - **PO-11** Remote & LAN dial subprocess spawning.
 - **Parallel feature in flight:** `specs/015-multi-machine-sharing` (branch
   `015-multi-machine-sharing`) touches server + client. Sequencing risk is
   real: parity inventory includes 015's client surfaces (share roster,

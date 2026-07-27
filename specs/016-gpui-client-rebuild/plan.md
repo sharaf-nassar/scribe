@@ -115,7 +115,7 @@ rollback for non-Vulkan cutover failures.
 | `dist/debian/*`, deb metadata | New Depends (`libvulkan1, mesa-vulkan-drivers, libwayland-client0, libxkbcommon-x11-0`, xcb libs; − `libgtk-4-1` at cutover), postinst Vulkan guard. |
 | `LICENSE-*`, README, all `Cargo.toml` license fields | GPL-3.0-or-later migration (step-0), attribution notices for Zed (GPL) and GPUI (Apache-2.0). |
 | `lat.md/` | client.md, rendering.md, settings.md, architecture.md rewritten post-cutover; test.md updated for new harness details. |
-| `specs/016-gpui-client-rebuild/parity-inventory.md` (NEW) | The committed parity oracle (46 ClientMessage / 59 ServerMessage / 54 named keybinding actions / rendering + removed-key rows), each row carrying a mandatory "Reachable from" live-path symbol. |
+| `specs/016-gpui-client-rebuild/parity-inventory.md` (NEW) | The committed parity oracle (46 ClientMessage / 59 ServerMessage / 54 named keybinding actions / rendering + spec-behaviour + removed-key rows), each row carrying a mandatory "Reachable from" live-path symbol, plus a coverage index binding every `spec.md` requirement-register id to a carrying row. |
 
 ## Data Model
 
@@ -491,8 +491,17 @@ parity-inventory` (`tools/check-parity-inventory.sh`, also a pre-commit hook
 and a quality-workflow step) re-derives every count in the file from its
 per-row marker cells and cross-checks the tables against the protocol enums and
 the live dispatcher, so reading the number off the file is safe. It stood at
-51/164 user-facing rows when this gate was written and is 164/165 in-client
-today. Cutover (`scribe-38e.43`+) stays blocked until that
+51/164 user-facing rows when this gate was written.
+
+**The denominator is derived from `spec.md`, not from the legacy client's IPC
+surface** (bead `scribe-38e.94`, 2026-07-27). Every acceptance criterion and
+porting obligation carries a stable register id, the inventory carries a
+coverage index over those ids, and the same check fails when an id has no
+carrying row — so a requirement can no longer be absent from the metric. Adding
+that derivation grew the inventory from 174 to 203 rows (194 user-facing) and
+moved the figure to 188/194 in-client, 189/194 reachable, because five
+requirements that had never been tabulated turn out not to be reachable
+(FU-24..FU-28 in `reachability-audit.md`). Cutover (`scribe-38e.43`+) stays blocked until that
 threshold is met alongside the existing perf and manual re-gate criteria in
 `launch-gate-checklist.md`.
 
