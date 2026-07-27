@@ -47,6 +47,7 @@ use scribe_client_gpui::dialog::{
     DialogEvent, DialogOutcome, DialogView, DisallowedSchemeAction, DisallowedSchemeDialog,
     PasteConfirmationAction, PasteConfirmationDialog, UpdateAction, UpdateDialogKind,
 };
+use scribe_client_gpui::drag_drop::dropped_path_insertion;
 use scribe_client_gpui::input::{self, KeyInput, TerminalMode};
 use scribe_client_gpui::keybindings::{
     KeyAction, LayoutAction, OverlayChord, translate_key_action, translate_overlay_chord,
@@ -60,6 +61,11 @@ use scribe_client_gpui::lost_control::{
 };
 use scribe_client_gpui::mouse_reporting::{self, MouseModes, ScrollDirection, WheelAction};
 use scribe_client_gpui::mouse_state::{ClickKind, MouseClickState};
+use scribe_client_gpui::notification_dispatcher::{self, NotifOutput, NotifReq, ShowReq};
+use scribe_client_gpui::notifications::{
+    AiNotice, FocusPosition, NotificationCenter, NotificationEvent, NotificationPayload,
+    state_label,
+};
 use scribe_client_gpui::opacity::{clamp_opacity, opaque_slot, surface};
 use scribe_client_gpui::paste::{PasteGate, PasteGateEvent, paste_chunks};
 use scribe_client_gpui::preedit::{Ime, ImeEvent};
@@ -80,6 +86,7 @@ use scribe_client_gpui::search::{
     SEARCH_RESULT_LIMIT,
 };
 use scribe_client_gpui::selection::{SelectionMode, SelectionSpan};
+use scribe_client_gpui::server_lifecycle;
 use scribe_client_gpui::settings::{SettingsWindow, open_settings_window};
 use scribe_client_gpui::share::{
     ControlIntent, ControlRequestPrompt, ShareChrome, ShareKey, ShareKeyOutcome,
@@ -113,7 +120,7 @@ use scribe_client_gpui::{
     tab_session::{TabEntry, TabSessions},
     titlebar::{TitlebarEvent, TitlebarView},
 };
-use scribe_common::ai_state::AiProvider;
+use scribe_common::ai_state::{AiProvider, AiState};
 use scribe_common::theme::ChromeColors;
 use scribe_common::{
     config::{
@@ -324,6 +331,16 @@ struct Shared {
     /// attention request, so the reader only records the session that belled and
     /// the lifecycle tick drains the queue on the thread that owns the window.
     bells: Arc<Mutex<Vec<SessionId>>>,
+    /// AI transitions the IPC reader has taken off the wire and the foreground
+    /// has not yet run through the [`NotificationCenter`] gate. Queued for the
+    /// same reason bells are: the decision needs the window's focus state and
+    /// the live config, and the delivery needs the dispatcher handle the
+    /// foreground owns.
+    ai_notices: Arc<Mutex<Vec<AiNotice>>>,
+    /// Sessions whose desktop notification the user clicked. Written by the
+    /// dispatcher's own output thread, drained by the lifecycle tick — raising
+    /// the window and selecting a tab are both foreground-only.
+    notification_focus: Arc<Mutex<Vec<SessionId>>>,
     /// Latest `SearchResults` reply. The IPC reader stores it; the find
     /// overlay adopts it on the next redraw and the paint path highlights the
     /// on-screen spans it names.
@@ -593,6 +610,21 @@ struct ClipboardSurfaces {
     pending_prompt: Option<ClipboardPrompt>,
 }
 
+/// The window's desktop-notification surfaces, grouped because neither half is
+/// useful alone: the gate decides but cannot deliver, and the dispatcher
+/// delivers but knows nothing about focus, config, or which pane belongs to
+/// which workspace.
+struct NotificationSurfaces {
+    /// The decision gate. The lifecycle tick feeds it the AI transitions the IPC
+    /// reader queued plus the focus context, and it decides which of them are
+    /// worth a toast.
+    center: Entity<NotificationCenter>,
+    /// Handle to the [`notification_dispatcher`] thread that owns the one D-Bus
+    /// connection. `None` once the shutdown request has been sent, which is what
+    /// makes the shutdown idempotent across the exit paths.
+    tx: Option<UnboundedSender<NotifReq>>,
+}
+
 /// Pointer state behind a selection gesture: the click-count classifier that
 /// picks cell / word / line granularity, and whether a drag is under way.
 ///
@@ -761,6 +793,8 @@ struct TerminalView {
     /// IPC reader queued plus the focus context the gate reads, and the gate
     /// decides which of them are worth an attention request.
     bell: Entity<BellController>,
+    /// Desktop-notification gate plus the dispatcher handle behind it.
+    notifications: NotificationSurfaces,
     /// When the window list was last polled, throttling the `ListWindows` send
     /// to [`WINDOW_LIST_POLL_INTERVAL`].
     last_window_list_poll: Instant,
@@ -890,6 +924,7 @@ impl TerminalView {
         // Load the config and start the file watcher in one step so an edit
         // saved after this point reaches the window without a restart.
         let config = ConfigRuntime::start();
+        let notifications = Self::start_notifications(&shared, &config, window, cx);
         let (lifecycle_task, refresh_task, config_task) =
             Self::start_drivers(Arc::clone(&shared.generation), config.signal(), cx);
         let (status_colors, terminal_colors) = Self::theme_palettes(&config);
@@ -955,6 +990,7 @@ impl TerminalView {
             x11_focus,
             ime: Self::start_ime(cx),
             bell,
+            notifications,
             last_window_list_poll: Instant::now(),
             _refresh_task: refresh_task,
             _config_task: config_task,
@@ -1090,6 +1126,51 @@ impl TerminalView {
         (bell, subscription)
     }
 
+    /// Start the desktop-notification gate and the dispatcher thread behind it.
+    ///
+    /// Three pieces are assembled here because they only make sense together:
+    /// the [`NotificationCenter`] that decides, the
+    /// [`notification_dispatcher`] thread that owns the one D-Bus connection
+    /// and delivers, and the relay that turns the dispatcher's click reports
+    /// back into work for the foreground.
+    ///
+    /// The relay is a plain thread rather than a GPUI task because the
+    /// dispatcher's output channel is a tokio channel owned by a non-GPUI
+    /// thread; it parks the clicked session in the shared queue the lifecycle
+    /// tick already drains, which is the same hand-off the bells use.
+    fn start_notifications(
+        shared: &Shared,
+        config: &ConfigRuntime,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> NotificationSurfaces {
+        let policy = config.config().config.notifications.clone();
+        let center = cx.new(|_| NotificationCenter::new(policy));
+        // Detached for the same reason the titlebar's subscription is: it lives
+        // exactly as long as the view, and there is nothing to unsubscribe from
+        // early.
+        cx.subscribe_in(&center, window, |view, _, event, window, ctx| {
+            let NotificationEvent::FocusSession { session_id } = *event;
+            view.focus_notified_session(session_id, window, ctx);
+        })
+        .detach();
+
+        let (out_tx, mut out_rx) = unbounded_channel::<NotifOutput>();
+        let clicks = Arc::clone(&shared.notification_focus);
+        let relay =
+            std::thread::Builder::new().name("scribe-notif-clicks".to_owned()).spawn(move || {
+                while let Some(NotifOutput::FocusSession { session_id }) = out_rx.blocking_recv() {
+                    tracing::info!(%session_id, "notification click asked to focus a session");
+                    record_notification_click(&clicks, session_id);
+                }
+            });
+        if let Err(error) = relay {
+            tracing::warn!(%error, "could not start the notification click relay");
+        }
+
+        NotificationSurfaces { center, tx: Some(notification_dispatcher::spawn_dispatcher(out_tx)) }
+    }
+
     /// Build the custom titlebar seeded with `tabs`, and subscribe to it.
     ///
     /// Split out of [`Self::new`] so the constructor stays a list of the
@@ -1182,6 +1263,11 @@ impl TerminalView {
         self.smart_selection = compile_smart_selection(&terminal.smart_selection);
         let paste_confirmation = terminal.paste_confirmation;
         self.clipboard.gate.update(cx, |gate, _| gate.set_confirmation_enabled(paste_confirmation));
+        // The notification gate reads `enabled`, `condition`, and the two
+        // timeout fields on every decision, so an edit to `[notifications]` has
+        // to reach it or the window keeps firing on the old policy.
+        let notifications = self.config.config().config.notifications.clone();
+        self.notifications.center.update(cx, |center, _| center.reconfigure(notifications));
 
         // Tell the server to re-read the same file so its own live surfaces
         // (clipboard policy, env store, remote/share listeners) follow.
@@ -1843,6 +1929,42 @@ impl TerminalView {
         }
     }
 
+    /// Insert every file the compositor dropped on the window into the focused
+    /// pane, quoted for that pane's shell.
+    ///
+    /// Deliberately outside the spec-011 paste confirmation gate (FR-013): the
+    /// path is machine-generated and already shell-quoted, so there is nothing
+    /// for a confirmation to protect against, and the winit client delivered it
+    /// ungated for the same reason. Bracketed-paste markers are honoured so an
+    /// editor that asked for them still sees the drop as pasted text.
+    fn handle_dropped_paths(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
+        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
+        else {
+            tracing::debug!("a file was dropped on a window with no focused pane");
+            return;
+        };
+        let shell_name = self
+            .shared
+            .chrome_metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.shell_name(session_id).map(ToOwned::to_owned))
+            .unwrap_or_else(|| "sh".to_owned());
+        let bracketed =
+            self.with_focused_grid(|terminal| terminal.bracketed_paste()).unwrap_or(false);
+        for path in paths {
+            let insertion = dropped_path_insertion(path, &shell_name);
+            tracing::info!(
+                %session_id,
+                shell = %shell_name,
+                bytes = insertion.len(),
+                "inserting a dropped file path into the focused pane"
+            );
+            self.deliver_paste(&insertion, bracketed);
+        }
+        cx.notify();
+    }
+
     /// Send resolved paste bytes to the focused pane, split into frames the
     /// server's `KeyInput` size limit accepts and wrapped in the DEC 2004
     /// markers when the application asked for them.
@@ -2364,6 +2486,197 @@ impl TerminalView {
         });
     }
 
+    /// Run every AI transition the IPC reader queued through the notification
+    /// gate, on the thread that owns the window.
+    ///
+    /// Both of the gate's inputs live outside it and are refreshed per drain,
+    /// for the same reason [`Self::poll_bells`] refreshes its own: a transition
+    /// is judged against the focus state it is actually delivered under, not the
+    /// one it arrived in.
+    fn poll_notifications(&mut self, cx: &mut Context<Self>) {
+        let notices = {
+            let Ok(mut queued) = self.shared.ai_notices.lock() else {
+                tracing::warn!("AI notice queue mutex poisoned; dropping queued notices");
+                return;
+            };
+            if queued.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *queued)
+        };
+        let focused_session = self.shared.active_session.lock().ok().and_then(|guard| *guard);
+        let window_focused =
+            self.shared.lifecycle.lock().is_ok_and(|lifecycle| lifecycle.window_active());
+
+        for notice in notices {
+            match notice {
+                AiNotice::StateChanged { session_id, state } => {
+                    let position =
+                        FocusPosition::resolve(window_focused, focused_session, session_id);
+                    self.on_ai_transition(session_id, &state, position, cx);
+                }
+                AiNotice::Cleared { session_id } => {
+                    self.notifications.center.update(cx, |center, _| center.remove(session_id));
+                    self.close_notification(session_id);
+                }
+            }
+        }
+    }
+
+    /// Judge one AI transition and fire the notification it earns.
+    ///
+    /// Two separate gates, in this order: the tracker decides whether the
+    /// transition is notification-worthy at all (`Processing → attention`), and
+    /// only then does the configured focus condition get to suppress it. The
+    /// tracker still sees every transition either way, so a suppressed
+    /// notification does not desynchronise the state machine.
+    fn on_ai_transition(
+        &mut self,
+        session_id: SessionId,
+        state: &AiState,
+        position: FocusPosition,
+        cx: &mut Context<Self>,
+    ) {
+        let payload = self
+            .notifications
+            .center
+            .update(cx, |center, _| center.on_ai_state_changed(session_id, state));
+        let Some(payload) = payload else { return };
+        if self.notifications.center.read(cx).suppresses(position) {
+            tracing::debug!(%session_id, "notification suppressed by the focus policy");
+            return;
+        }
+        self.fire_notification(&payload, cx);
+    }
+
+    /// Hand one cleared notification decision to the dispatcher.
+    ///
+    /// The summary names the workspace the pane belongs to and the state it
+    /// reached; the body is the pane's most recent prompt, which is what makes
+    /// two toasts from different sessions tellable apart at a glance. Both come
+    /// straight from the shared chrome the status bar already renders, so a
+    /// notification can never describe a pane differently from the window.
+    fn fire_notification(&mut self, payload: &NotificationPayload, cx: &mut Context<Self>) {
+        let session_id = payload.session_id;
+        let summary = format!(
+            "{} — {}",
+            self.notification_workspace_label(session_id),
+            state_label(&payload.state)
+        );
+        let body = self
+            .shared
+            .ai
+            .lock()
+            .ok()
+            .and_then(|ai| {
+                ai.prompts.get(&session_id).and_then(|data| {
+                    data.latest_prompt.clone().or_else(|| data.first_prompt.clone())
+                })
+            })
+            .unwrap_or_default();
+
+        // Recorded before the send: the focus-on-activate fallback is what makes
+        // a click land on the right tab on platforms whose notification service
+        // activates the app without naming the toast.
+        self.notifications.center.update(cx, |center, _| center.set_last_notified(session_id));
+
+        let Some(tx) = self.notifications.tx.as_ref() else {
+            return;
+        };
+        let config = self.notifications.center.read(cx).config();
+        let request = NotifReq::Show(ShowReq::new(
+            session_id,
+            summary.clone(),
+            body,
+            config.timeout_mode,
+            config.timeout_secs,
+        ));
+        if tx.send(request).is_err() {
+            tracing::debug!("notification dispatcher closed; dropping a notification");
+            return;
+        }
+        tracing::info!(%session_id, %summary, "fired a desktop notification");
+    }
+
+    /// The label a notification names a pane by: the server's workspace name
+    /// when it has one, and the app name otherwise.
+    fn notification_workspace_label(&self, session_id: SessionId) -> String {
+        let workspace_id = self.shared.tabs.lock().ok().and_then(|tabs| {
+            tabs.tabs().iter().find(|tab| tab.session_id == session_id).map(|tab| tab.workspace_id)
+        });
+        workspace_id
+            .and_then(|workspace_id| {
+                let metadata = self.shared.chrome_metadata.lock().ok()?;
+                metadata.workspace_name(workspace_id).map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| scribe_common::app::current_identity().display_name().to_owned())
+    }
+
+    /// Retire the toast a session owns, if any.
+    fn close_notification(&self, session_id: SessionId) {
+        if let Some(tx) = self.notifications.tx.as_ref() {
+            drop(tx.send(NotifReq::close(session_id)));
+        }
+    }
+
+    /// Close every live toast and stop the dispatcher thread.
+    fn shutdown_notifications(&mut self) {
+        if let Some(tx) = self.notifications.tx.take() {
+            drop(tx.send(NotifReq::Shutdown));
+            tracing::info!("asked the notification dispatcher to close every live toast");
+        }
+    }
+
+    /// Drain the clicks the dispatcher relay parked and act on them.
+    ///
+    /// Routed through the entity rather than called directly so the focus
+    /// switch and the focus-on-activate fallback are consumed together: the
+    /// raise this causes fires an activation, and without consuming the
+    /// fallback that activation would dispatch the very same switch again.
+    fn poll_notification_clicks(&mut self, cx: &mut Context<Self>) {
+        let clicked = {
+            let Ok(mut queue) = self.shared.notification_focus.lock() else {
+                tracing::warn!("notification click queue poisoned; dropping clicks");
+                return;
+            };
+            if queue.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *queue)
+        };
+        for session_id in clicked {
+            self.notifications
+                .center
+                .update(cx, |center, ctx| center.request_focus(session_id, ctx));
+        }
+    }
+
+    /// Select the clicked session's tab and raise the window.
+    ///
+    /// A session with no tab (it exited between the toast and the click) still
+    /// raises the window: the user asked for this window, and refusing to show
+    /// it would make the click look broken.
+    fn focus_notified_session(
+        &mut self,
+        session_id: SessionId,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self
+            .shared
+            .tabs
+            .lock()
+            .ok()
+            .and_then(|tabs| tabs.tabs().iter().position(|tab| tab.session_id == session_id));
+        if let Some(index) = index {
+            self.switch_tab(move |tabs| tabs.select(index), cx);
+        }
+        window.activate_window();
+        self.close_notification(session_id);
+        tracing::info!(%session_id, "focused a session from a notification click");
+        cx.notify();
+    }
+
     /// Perform a bell the gate let through: ask the OS to draw attention to this
     /// window.
     ///
@@ -2391,6 +2704,8 @@ impl TerminalView {
     /// because the entities they drive are owned by this thread too.
     fn poll_window_lifecycle(&mut self, cx: &mut Context<Self>) {
         self.poll_bells(cx);
+        self.poll_notifications(cx);
+        self.poll_notification_clicks(cx);
         let exit = self.shared.lifecycle.lock().ok().and_then(|mut l| l.take_exit());
         if let Some(reason) = exit {
             match reason {
@@ -2407,6 +2722,10 @@ impl TerminalView {
                     self.clear_restore_state(true);
                 }
             }
+            // Toasts outlive the process that raised them, and a fresh client
+            // cannot manage ids it never allocated — so the dispatcher closes
+            // every live one before the app goes away.
+            self.shutdown_notifications();
             cx.quit();
             return;
         }
@@ -4288,6 +4607,16 @@ impl TerminalView {
         if let Some(guard) = self.x11_focus.as_mut() {
             guard.clear_reactivation_debounce();
         }
+        // Focus-on-activate fallback: a notification service that activates the
+        // app without reporting which toast was clicked leaves this as the only
+        // link between the click and the pane that asked for attention. The
+        // click-reporting path consumes the same token, so a dispatcher that
+        // does report the click never double-switches.
+        if let Some(session_id) =
+            self.notifications.center.update(cx, |center, _| center.take_pending_focus())
+        {
+            self.focus_notified_session(session_id, window, cx);
+        }
     }
 
     /// Refresh the X11 active-window guard's cached state (no-op off X11).
@@ -5141,6 +5470,13 @@ impl Render for TerminalView {
                 }
                 view.on_key_down(event, ctx);
             }))
+            // File drop from the compositor. GPUI lowers an external file drop
+            // onto an ordinary drag whose payload is `ExternalPaths`, so the
+            // drop listener goes on the root — the whole window is a valid drop
+            // target, exactly as it was under winit's `DroppedFile`.
+            .on_drop(cx.listener(|view, paths: &gpui::ExternalPaths, _window, ctx| {
+                view.handle_dropped_paths(paths.paths(), ctx);
+            }))
             .relative()
             .size_full()
             .flex()
@@ -5256,6 +5592,8 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         update: Arc::new(Mutex::new(UpdateState::default())),
         lifecycle: Arc::new(Mutex::new(WindowLifecycle::new())),
         bells: Arc::new(Mutex::new(Vec::new())),
+        ai_notices: Arc::new(Mutex::new(Vec::new())),
+        notification_focus: Arc::new(Mutex::new(Vec::new())),
         find: Arc::new(Mutex::new(FindResults::default())),
         lan: Arc::new(Mutex::new(LanChrome::new())),
         prompt_marks: Arc::new(Mutex::new(PromptMarks::new())),
@@ -5448,6 +5786,11 @@ fn start_ipc_thread(ctx: IpcThread) {
             let connected = Arc::clone(&ctx.shared.connected);
             if let Err(error) = run_connection(ctx).await {
                 connected.store(false, Ordering::Release);
+                // Logged as well as published: the status line is one line wide
+                // and the reason a connect failed — a stale socket, a refused
+                // autostart, a rejected dial — is the first thing anyone
+                // diagnosing a dead window needs, long after the window is gone.
+                tracing::warn!(%error, "server connection failed");
                 set_status(&status, &generation, format!("server connection failed: {error}"));
             }
         });
@@ -5492,9 +5835,26 @@ async fn run_local_connection(ctx: IpcThread) -> Result<(), String> {
         lan_env: probe_lan_env().await,
         remote_env: probe_remote_env().await,
     });
-    let stream = tokio::net::UnixStream::connect(server_socket_path())
+    // Autostart, not a bare connect: a client launched from a desktop entry is
+    // routinely the first thing to want a server, so a refused socket starts the
+    // per-user service and waits for it rather than failing the window. The
+    // refusal is diagnosed on the way through, which is what turns a leftover
+    // socket file from "connection refused" into a named stale socket.
+    let socket_path = server_socket_path();
+    let stream = server_lifecycle::connect_or_start_server(&socket_path)
         .await
         .map_err(|error| error.to_string())?;
+    // Connected — but possibly to a server older than the installed binary
+    // (a package upgrade or a local rebuild landed under a live process). Say so
+    // on the status bar instead of leaving the mismatch to surface as a protocol
+    // oddity later.
+    if let Some(reason) = server_lifecycle::connected_server_staleness(&stream) {
+        set_status(
+            &ctx.shared.status,
+            &ctx.shared.generation,
+            format!("stale scribe-server: {reason}"),
+        );
+    }
     // Socket is up: light the status-bar connection dot green.
     ctx.shared.connected.store(true, Ordering::Release);
     let (reader, writer) = stream.into_split();
@@ -5733,6 +6093,7 @@ where
         update: ctx.shared.update,
         lifecycle: ctx.shared.lifecycle,
         bells: ctx.shared.bells,
+        ai_notices: ctx.shared.ai_notices,
         find: ctx.shared.find,
         lan: ctx.shared.lan,
         prompt_marks: ctx.shared.prompt_marks,
@@ -6034,6 +6395,9 @@ struct ReaderCtx {
     /// Bell queue the reader appends to and the foreground's [`BellController`]
     /// drains; see the `bells` field of `Shared`.
     bells: Arc<Mutex<Vec<SessionId>>>,
+    /// AI transitions queued for the foreground's notification gate; see the
+    /// `ai_notices` field of `Shared`.
+    ai_notices: Arc<Mutex<Vec<AiNotice>>>,
     /// Latest `SearchResults` reply the find overlay renders and highlights.
     find: Arc<Mutex<FindResults>>,
     /// Feature-014 LAN state the reader parks approval requests in and folds the
@@ -6058,6 +6422,33 @@ struct ReaderCtx {
     in_tx: UnboundedSender<InboundEvent>,
     sink: IpcSink,
     size: TerminalSize,
+}
+
+/// Park a clicked notification's session for the foreground's lifecycle tick.
+///
+/// Free-standing because it runs on the dispatcher's own relay thread, which
+/// holds no view and no GPUI context — only the shared queue.
+fn record_notification_click(clicks: &Mutex<Vec<SessionId>>, session_id: SessionId) {
+    if let Ok(mut queue) = clicks.lock() {
+        queue.push(session_id);
+    } else {
+        tracing::warn!("notification click queue poisoned; dropping a click");
+    }
+}
+
+/// Queue one AI transition for the foreground's notification gate.
+///
+/// The reader deliberately makes no decision here: whether a transition
+/// notifies depends on the live `[notifications]` config and the window's focus
+/// state, neither of which this thread can see, and delivery needs the
+/// dispatcher handle the view owns. A poisoned queue costs notifications, never
+/// the pane's output stream.
+fn queue_ai_notice(ctx: &ReaderCtx, notice: AiNotice) {
+    if let Ok(mut queue) = ctx.ai_notices.lock() {
+        queue.push(notice);
+    } else {
+        tracing::warn!("AI notice queue mutex poisoned; dropping notice");
+    }
 }
 
 /// Apply `mutate` to the shared AI chrome and request a repaint.
@@ -6086,9 +6477,14 @@ fn on_ai_message(ctx: &ReaderCtx, message: ServerMessage) {
         // The server has already merged partial OSC events onto the stored
         // state, so the percent that arrives here is the live one.
         ServerMessage::AiStateChanged { session_id, ai_state } => {
+            queue_ai_notice(
+                ctx,
+                AiNotice::StateChanged { session_id, state: ai_state.state.clone() },
+            );
             update_ai_chrome(ctx, |ai| ai.tracker.update(session_id, ai_state));
         }
         ServerMessage::AiStateCleared { session_id } => {
+            queue_ai_notice(ctx, AiNotice::Cleared { session_id });
             update_ai_chrome(ctx, |ai| {
                 ai.tracker.remove(session_id);
                 ai.tracker.clear_context(session_id);
@@ -6345,6 +6741,9 @@ fn on_session_exited(
     let existed = registry.on_session_exited(session_id);
     update_ai_chrome(ctx, |ai| ai.forget(session_id));
     update_chrome_metadata(ctx, |metadata| metadata.forget_session(session_id));
+    // A toast outliving the pane it points at is a click that can only land
+    // nowhere, so the exit retires it on the same path that forgets the chrome.
+    queue_ai_notice(ctx, AiNotice::Cleared { session_id });
     // The pane that showed it is retired by the view's reconcile pass; the
     // grid and the output gate are dropped here so a recycled session id can
     // never inherit the dead pane's scrollback.
@@ -7338,6 +7737,12 @@ fn open_created_tab(
     workspace_id: WorkspaceId,
     shell_name: String,
 ) -> Result<(), String> {
+    // The tab's label tracks the OSC 0/2 title once one arrives, so the shell a
+    // pane actually runs is recorded separately — that, not the label, is what a
+    // dropped file path has to be quoted for.
+    update_chrome_metadata(ctx, |metadata| {
+        metadata.set_shell_name(session_id, shell_name.clone());
+    });
     let entry = TabEntry::new(session_id, workspace_id, shell_name);
     let added = ctx.tabs.lock().is_ok_and(|mut tabs| tabs.insert_active(entry));
     if added {

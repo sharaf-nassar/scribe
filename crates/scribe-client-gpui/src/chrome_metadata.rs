@@ -36,6 +36,12 @@ pub struct SessionChrome {
     pub context: Option<SessionContext>,
     /// Env-capture runtime health (`EnvStatus`), driving the `⚠` glyph.
     pub env_status: Option<EnvStatusState>,
+    /// Basename of the session's shell (`SessionCreated` / `SessionList`).
+    ///
+    /// Unlike the tab title — which the server overwrites with the OSC 0/2
+    /// terminal title as soon as one arrives — this stays the shell the pane is
+    /// actually running, which is what a dropped path has to be quoted for.
+    pub shell_name: Option<String>,
 }
 
 impl SessionChrome {
@@ -113,6 +119,17 @@ impl ChromeMetadata {
         self.sessions.entry(session_id).or_default().env_status = Some(state);
     }
 
+    /// Record the shell a session is running (`SessionCreated`).
+    pub fn set_shell_name(&mut self, session_id: SessionId, shell_name: String) {
+        self.sessions.entry(session_id).or_default().shell_name = Some(shell_name);
+    }
+
+    /// The shell a session runs, as last reported by the server.
+    #[must_use]
+    pub fn shell_name(&self, session_id: SessionId) -> Option<&str> {
+        self.sessions.get(&session_id)?.shell_name.as_deref()
+    }
+
     /// Record a workspace's display name (`WorkspaceNamed`).
     ///
     /// An empty name clears the entry so the status bar drops the segment
@@ -156,6 +173,10 @@ impl ChromeMetadata {
             if let Some(context) = info.context.clone() {
                 entry.context = Some(context);
             }
+            // The shell name is not optional on the wire, so the list always
+            // carries it and a reattached pane knows its shell before the first
+            // dropped path arrives.
+            entry.shell_name = Some(info.shell_name.clone());
         }
         for workspace in workspaces {
             if let Some(name) = workspace.name.clone() {

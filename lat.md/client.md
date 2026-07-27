@@ -397,6 +397,26 @@ OS-integration surfaces the GPUI client owns beyond the terminal grid: local ser
 
 [[crates/scribe-client-gpui/src/drag_drop.rs#dropped_path_insertion]] quotes a dropped file path for the focused pane's shell via [[crates/scribe-client-gpui/src/drag_drop.rs#quote_path_for_shell]] (POSIX, fish, PowerShell, or nushell) and appends a trailing space; per FR-013 it bypasses the paste-confirmation gate because the path is already quoted.
 
+#### Server Lifecycle Wiring
+
+The running client reaches the lifecycle port: [[crates/scribe-client-gpui/src/main.rs#run_local_connection]] opens its one local connection through [[crates/scribe-client-gpui/src/server_lifecycle.rs#connect_or_start_server]] rather than a bare `UnixStream::connect`, so a client launched with no server running starts one instead of failing the window.
+
+A refused connect is diagnosed before the autostart is attempted. [[crates/scribe-client-gpui/src/server_lifecycle.rs#socket_failure_reason]] separates the two cases that look identical at the syscall: no socket file at all means no server has ever run for this user, while a socket file that refuses connections is the residue of a server that died without unlinking it. That sentence is carried into the error the autostart failure returns, so the status line names the stale socket instead of showing a bare `systemctl` exit code, and [[crates/scribe-client-gpui/src/main.rs#start_ipc_thread]] logs it as well — the window is one line wide and outlives nothing.
+
+Once connected, [[crates/scribe-client-gpui/src/server_lifecycle.rs#connected_server_staleness]] holds the server on the far end up against the binary installed beside this client. The peer PID comes from the kernel (`SO_PEERCRED`) through [[crates/scribe-client-gpui/src/server_lifecycle.rs#connected_server_info]], so it names the process actually serving this connection; [[crates/scribe-client-gpui/src/server_lifecycle.rs#installed_server_exe]] resolves the sibling binary, and the pure [[crates/scribe-client-gpui/src/server_lifecycle.rs#stale_server_reason]] decides. A drift publishes a status line rather than forcing a restart: a package upgrade or a local rebuild under a live process is worth naming, not worth killing the user's panes over.
+
+Verified against the running app rather than headlessly: see [[test#Visual E2E Tests#Server autostart and stale-socket diagnosis]].
+
+#### Drag-Drop Wiring
+
+A file dropped on the window reaches the pane. [[crates/scribe-client-gpui/src/main.rs#TerminalView#render]] registers `on_drop` for GPUI's `ExternalPaths` on the root element, so the whole window is a drop target.
+
+GPUI lowers a compositor file drop onto an ordinary drag whose payload is that type, which is why the listener goes on the root rather than on the grid — exactly the coverage winit's `DroppedFile` had.
+
+[[crates/scribe-client-gpui/src/main.rs#TerminalView#handle_dropped_paths]] quotes each path for the focused pane's shell and delivers it. The shell it quotes for is the server's own `shell_name`, recorded per session on [[crates/scribe-client-gpui/src/chrome_metadata.rs#SessionChrome]] by `SessionCreated` and by the authoritative `SessionList` — deliberately not the tab label, which the server overwrites with the OSC 0/2 terminal title as soon as one arrives. Delivery reuses [[crates/scribe-client-gpui/src/main.rs#TerminalView#deliver_paste]] so the bytes are chunked to the server's `KeyInput` limit and wrapped in DEC 2004 markers when the application asked for them, but bypasses the spec-011 paste gate per FR-013: the path is machine-generated and already quoted, so there is nothing for a confirmation to protect against.
+
+Verified against the running app rather than headlessly: see [[test#Visual E2E Tests#Dropped file paths insert into the pane]].
+
 #### GPUI Clipboard and OSC 52 Bridge
 
 The GPUI rebuild ports the host clipboard integration — arboard handle, two-hop OSC 52 bridge, Linux primary selection, AI copy-cleanup — into the `lib` target, unit-tested off any display server.
@@ -428,6 +448,20 @@ The GPUI rebuild ports the desktop notification dispatcher so one thread owns on
 The `replaces_id` coalescing lives in the pure [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState]]: it tracks the daemon id both ways so [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#replaces_for]] reuses a session's live toast, [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#record_shown]] drops a stale reverse mapping when the daemon reallocates, an `ActionInvoked` click routes through [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#session_for_id]], and `NotificationClosed`/session-exit/shutdown clear state via `on_closed`, `take_session`, and `live_ids`. [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#expire_timeout_millis]] maps the config [[crates/scribe-common/src/config.rs#NotifyTimeoutMode]] onto the freedesktop `expire_timeout`. The zbus proxy signature keeps the freedesktop-spec argument count, the sole approved `clippy::too_many_arguments` suppression in the crate.
 
 Unlike the winit client, the GPUI client shares its `zbus` build with GPUI's own Linux platform layer — `accesskit_unix` (AT-SPI), `ashpd` (XDG portals), and `oo7` (secret service) all resolve to the same crate version. Cargo unifies features across the whole graph and zbus's `tokio` feature is compile-time exclusive: with it on, every internal `Task::spawn_blocking` routes through `tokio::task::spawn_blocking`, which panics with "there is no reactor running" when polled outside a Tokio runtime. GPUI drives its zbus connections on its own non-Tokio worker threads, so enabling `tokio` crashed those background threads on every client launch. The workspace `zbus` dependency therefore keeps the default async-io backend, where zbus spawns its own internal executor thread and is runtime-agnostic. The dispatcher thread still builds a single-threaded Tokio runtime for its `tokio::select!` loop and `tokio::sync::mpsc` channels, neither of which requires the zbus transport itself to be Tokio-backed.
+
+##### Notification Wiring
+
+The running client fires desktop notifications, split between the IPC reader and the foreground exactly as the terminal bell is.
+
+The reader can judge neither focus nor config and owns no dispatcher handle, so [[crates/scribe-client-gpui/src/main.rs#queue_ai_notice]] records each AI transition verbatim as an [[crates/scribe-client-gpui/src/notifications.rs#AiNotice]] and the foreground decides on its lifecycle tick.
+
+[[crates/scribe-client-gpui/src/notifications.rs#NotificationCenter]] is the decision gate, ported from the winit [[crates/scribe-client/src/notifications.rs]]. [[crates/scribe-client-gpui/src/notifications.rs#NotificationCenter#on_ai_state_changed]] fires only on the `Processing → attention` transition, so a session already sitting in an attention state does not re-notify and a replayed `SessionList` does not notify on first sight; [[crates/scribe-client-gpui/src/notifications.rs#NotificationCenter#suppresses]] then applies the configured [[crates/scribe-common/src/config.rs#NotifyCondition]] against a [[crates/scribe-client-gpui/src/notifications.rs#FocusPosition]] resolved per drain, so a transition is judged against the focus state it is actually delivered under rather than the one it arrived in.
+
+[[crates/scribe-client-gpui/src/main.rs#TerminalView#poll_notifications]] drains the queue and [[crates/scribe-client-gpui/src/main.rs#TerminalView#fire_notification]] builds the payload: the summary names the workspace and the state ([[crates/scribe-client-gpui/src/notifications.rs#state_label]]), the body is the pane's most recent prompt, and both come from the shared chrome the status bar already renders so a toast can never describe a pane differently from the window. `AiStateCleared` and session exit both queue a `Cleared` notice, which retires the toast — one that outlives its pane is a click that can only land nowhere — and the exit paths send `NotifReq::Shutdown` through [[crates/scribe-client-gpui/src/main.rs#TerminalView#shutdown_notifications]] so a fresh process does not inherit ids it cannot manage.
+
+Click-to-focus closes the loop. [[crates/scribe-client-gpui/src/main.rs#TerminalView#start_notifications]] hands the dispatcher an output channel drained by a relay thread that parks the clicked session for the foreground; [[crates/scribe-client-gpui/src/main.rs#TerminalView#poll_notification_clicks]] routes it through the entity so [[crates/scribe-client-gpui/src/notifications.rs#NotificationCenter#request_focus]] consumes the focus-on-activate fallback in the same breath, and the window-bound subscription runs [[crates/scribe-client-gpui/src/main.rs#TerminalView#focus_notified_session]] — selecting the session's tab and raising the window. The fallback exists for services that activate the app without naming the toast: [[crates/scribe-client-gpui/src/main.rs#TerminalView#on_activation]] consumes it, and because both paths take the same token a dispatcher that does report the click never double-switches.
+
+Verified against the running app rather than headlessly: see [[test#Visual E2E Tests#Desktop notifications fire, coalesce, and focus on click]].
 
 ### GPUI Animation System
 

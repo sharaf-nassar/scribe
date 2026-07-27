@@ -10,6 +10,16 @@ RUN apt-get update && \
         git \
         libfontconfig-dev \
         python3 \
+        # The notification E2E stands a real freedesktop notification service on
+        # the session bus (tests/e2e/visual/notify-daemon.py) so the client's
+        # zbus dispatcher is talking to an actual D-Bus name, and the drag-drop
+        # E2E drives a real XDND source (tests/e2e/visual/xdnd-drop.py) so the
+        # client's drop handler is fed by the X server rather than a synthetic
+        # event. Those two need python's D-Bus/GLib and Xlib bindings.
+        python3-dbus \
+        python3-gi \
+        python3-xlib \
+        gir1.2-glib-2.0 \
         sqlite3 \
         xvfb \
         mesa-utils \

@@ -13,6 +13,7 @@ cleanup() {
     kill "${TAIL_PID:-}" 2>/dev/null || true
     kill "${TAP_PID:-}" 2>/dev/null || true
     kill "${WM_PID:-}" 2>/dev/null || true
+    kill "${NOTIFYD_PID:-}" 2>/dev/null || true
     pkill -f ibus-daemon 2>/dev/null || true
     if [ "$DAEMON_STARTED" -eq 1 ]; then
         scribe-test daemon stop >/dev/null 2>&1 || true
@@ -118,6 +119,30 @@ start_session_keyring() {
     # of the daemon it started; only the secrets component is needed.
     eval "$(printf '\n' | gnome-keyring-daemon --unlock --components=secrets)"
     export GNOME_KEYRING_CONTROL
+}
+
+# Start a session D-Bus and a REAL freedesktop notification service on it.
+#
+# The client's dispatcher talks raw zbus to `org.freedesktop.Notifications`; with
+# nothing owning that name its `Notify` call fails at the bus and the delivery
+# half of the feature leaves no trace at all — indistinguishable from the unwired
+# client. `notify-daemon.py` claims the name for real, records every call, and
+# can emit `ActionInvoked` on demand, which is what makes click-to-focus
+# assertable. Opt-in: every other visual test keeps the lighter container.
+start_notification_daemon() {
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        export $(dbus-launch)
+    fi
+    export SCRIBE_NOTIFY_RECORD="${SCRIBE_NOTIFY_RECORD:-/output/notifications.jsonl}"
+    export SCRIBE_NOTIFY_CONTROL="${SCRIBE_NOTIFY_CONTROL:-/tmp/scribe-notify.ctl}"
+    python3 /tests/visual/notify-daemon.py \
+        --record "$SCRIBE_NOTIFY_RECORD" \
+        --control "$SCRIBE_NOTIFY_CONTROL" >/output/notify-daemon.log 2>&1 &
+    NOTIFYD_PID=$!
+    for _ in $(seq 1 60); do
+        [ -p "$SCRIBE_NOTIFY_CONTROL" ] && [ -f "$SCRIBE_NOTIFY_RECORD" ] && break
+        sleep 0.1
+    done
 }
 
 # Start a real input-method engine so the IME/preedit E2E can compose text.
@@ -271,6 +296,12 @@ case "$VISUAL_APP" in
         # client builds its XIM connection.
         if [ "${SCRIBE_IME:-0}" = "1" ]; then
             start_input_method
+        fi
+        # Before the client starts: the dispatcher opens its one session-bus
+        # connection at window construction, so the service has to already own
+        # the name by then.
+        if [ "${SCRIBE_NOTIFY:-0}" = "1" ]; then
+            start_notification_daemon
         fi
         export SCRIBE_CLIENT_LOG=/output/client.log
         # Shared-pane rig: create the session FIRST, then start the client as a
