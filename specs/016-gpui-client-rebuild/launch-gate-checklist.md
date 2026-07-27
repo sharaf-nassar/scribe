@@ -43,6 +43,7 @@ do not cover the failures, exactly as the 2026-07-24 retraction warned:
 | Perf A/B rig | `run-perf-ab.sh --live --record-baseline`, both clients probe-instrumented, same host and session | ❌ **FAIL** — 2 of 5 metrics (B3) |
 | Reachability ratchet | `tools/check-reachability.sh --working-tree` | ✅ **PASS** — 53/65 modules wired, 54/59 server messages handled, 36/36 layout actions handled |
 | Parity rows | all 173 rows re-verified against the source at HEAD | ⚠️ 163/164 reachable, but the artifact is stale (B4) and the denominator is incomplete (B5). Both since fixed: the inventory now enumerates 203 rows / 194 user-facing, of which 189 (97%) are reachable |
+| Parity go threshold | `just parity-gate` (`tools/check-parity-inventory.sh --gate`) | ❌ **NO-GO** — 189 of 194 user-facing rows reachable against a threshold of 194 of 194 (B6) |
 | Manual rows | live driving of `scribe-dev` on `:0` | ⚠️ Opacity **PASS**; IME **FAIL** (B2) |
 
 ### Prior blockers — all four confirmed resolved
@@ -248,6 +249,35 @@ threshold is stated in `plan.md`, `spec.md`, `parity-inventory.md`, or
 `reachability-audit.md`. A criterion that names no number cannot be evaluated;
 one must be set before the next run.
 
+**Resolved 2026-07-27 (bead `scribe-38e.95`).** `plan.md` § "Phase H
+re-baseline" → "The go threshold" now states it: **go requires every
+user-facing row to be reachable — `Unwired = 0` and `Missing = 0` on the
+roll-up's Total row, 194 of 194 user-facing rows (100%) at the register's
+current size, 203 of 203 including the removed-configuration-key rows.**
+
+The number is derived, not chosen. `spec.md` Goal 1 is "full, reachable feature
+parity … no user-visible regression in functionality", and
+`parity-inventory.md`'s "Definition of done" makes a row done only when its
+"Reachable from" cell names a live-path symbol *and* its method passes, so an
+unreachable user-facing row is a user-visible regression. The spec grants no
+regression budget, so no sub-100% figure is derivable from it, and choosing one
+here would amend Goal 1 by the back door. The relief valve is descoping a
+requirement in `spec.md` with a recorded decision (re-gate criterion B1), which
+deletes its register id and its row and therefore shrinks the denominator
+instead of lowering the bar. The denominator itself moves as the register
+grows, so the criterion is the ratio, not the literal 194.
+
+Score it mechanically: `just parity-gate`
+(`tools/check-parity-inventory.sh --gate`) re-derives the counts exactly as the
+pre-commit drift check does, then exits non-zero while any row is unreachable
+and prints each offending row. It is deliberately out of `just ready` and out
+of pre-commit, so it does not block the wiring beads it is measuring.
+
+**This run scores NO-GO on the criterion: 189 of 194 (97%), five rows short** —
+FU-24..FU-28. Meeting it is necessary, not sufficient: each row's own
+verification method must also pass, alongside the perf, IME and manual criteria
+below.
+
 ## Parity-inventory results by verification method
 
 Methods are as they now stand in `parity-inventory.md` (post method-upgrade).
@@ -356,8 +386,14 @@ Re-run this gate when all of the following hold:
    when a register id has no carrying row, so the reachable-row count measures
    parity rather than the tabulated subset. It also exposed five newly-scored
    unreachable requirements (FU-24..FU-28), which the next run must judge.
-6. **B6** — a numeric go threshold for the reachable-row count written into
-   `plan.md`.
+6. **B6** — ✅ **resolved 2026-07-27 (bead `scribe-38e.95`).** The threshold is
+   written into `plan.md` § "Phase H re-baseline" → "The go threshold": every
+   user-facing row reachable, zero unwired and zero missing, 194 of 194 at the
+   register's current size. It is now a criterion in its own right, scored by
+   `just parity-gate`, and it is **not met** (189 of 194). Criteria 1 and 5 are
+   the work that closes it: wiring the nine B1 capabilities and FU-24..FU-28,
+   or descoping a requirement in `spec.md` with a recorded decision, which
+   removes its row from the denominator.
 
 The already-green evidence (947 unit/golden/gpui-test, 31/31 visual, 13/13 func,
 the reachability ratchet, startup/throughput/memory perf, opacity) must stay
