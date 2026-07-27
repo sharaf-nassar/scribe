@@ -10,6 +10,7 @@ SERVER_STARTED=0
 
 cleanup() {
     kill "${APP_PID:-}" 2>/dev/null || true
+    kill "${TAIL_PID:-}" 2>/dev/null || true
     kill "${TAP_PID:-}" 2>/dev/null || true
     kill "${WM_PID:-}" 2>/dev/null || true
     if [ "$DAEMON_STARTED" -eq 1 ]; then
@@ -285,7 +286,30 @@ case "$VISUAL_APP" in
         ;;
 esac
 
+# Run the test with its output on a FILE, never on a pipe.
+#
+# The test's stdout is inherited by every process it backgrounds. While that
+# stdout was `| tee /output/result.log`, a single orphan the script left running
+# (a relaunched `scribe-client-gpui`, say) held the write end of that pipe open,
+# so `tee` never saw EOF and the container hung forever AFTER the test had
+# printed PASS. `TEST_TIMEOUT` cannot break the deadlock: it governs the test
+# process, which has already exited. Writing to the log and streaming it with a
+# `tail` we own makes an orphan harmless — it inherits a file descriptor nothing
+# waits on.
+: >/output/result.log
+tail -n +1 -f /output/result.log &
+TAIL_PID=$!
+
 EXIT_CODE=0
-timeout "$TEST_TIMEOUT" "$1" 2>&1 | tee /output/result.log || EXIT_CODE=$?
+timeout "$TEST_TIMEOUT" "$1" >>/output/result.log 2>&1 || EXIT_CODE=$?
+
+# Give tail a moment to flush the final lines, then stop streaming.
+sleep 0.5
+kill "$TAIL_PID" 2>/dev/null || true
+wait "$TAIL_PID" 2>/dev/null || true
+TAIL_PID=""
+
+# Reap anything the test left behind so cleanup has nothing to race with.
+pkill -f 'scribe-client-gpui' 2>/dev/null || true
 
 exit $EXIT_CODE
