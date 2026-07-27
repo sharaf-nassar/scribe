@@ -100,8 +100,9 @@ here. `startup_first_frame_ms` is end-to-end (see above), median of the rig's
 startup samples. The rig prefers the probe whenever the launched binary reports
 it and falls back to the log otherwise.
 
-All four slots were captured on 2026-07-27 by the `scribe-38e.42` launch-gate
-run, from an old client **rebuilt from this tree** (`target/release/scribe-client`).
+The first four slots were captured on 2026-07-27 by the `scribe-38e.42`
+launch-gate run, from an old client **rebuilt from this tree**
+(`target/release/scribe-client`).
 That detail is load-bearing: the *installed* `/usr/bin/scribe-client` predates
 the shared probe, so with it the rig's `start_client` never sees a probe report
 and every workload phase gives up with "client … never reached a first frame",
@@ -120,19 +121,71 @@ continues without one. The command that produced these values:
     perf_baseline_input_latency_p50_ms=0.032
     perf_baseline_firehose_bytes_per_sec=243217.780
     perf_baseline_memory_rss_kb=476916
+    perf_baseline_scroll_fps=41.480
+    perf_baseline_scroll_dropped_pct=8.101
+
+The two `scroll_*` slots were added on 2026-07-27 by bead `scribe-38e.91` and
+recorded by a `--live --scroll-only --record-baseline` run against the isolated
+`scribe-dev` server. Scroll is an absolute threshold, so these are not a
+comparison input: they are the attribution that tells a client regression apart
+from an unreachable target, which is what the metric lacked. See the section
+below.
+
+## 2026-07-27: the scroll metric was measuring the rig
+
+Metric 5 reproducibly read ~29 fps with 13-16% dropped frames against a target
+of sustained 60 fps with `< 1%` dropped, and the rig had no old-client arm to
+attribute it with. Bead `scribe-38e.91` added the arm and measured both clients
+under the identical workload. Neither the target nor the client turned out to be
+the problem: two independent defects in the rig were, and both understated the
+new client specifically.
+
+**The measurement window was inflated by the client's own idle.** The window is
+derived from the shared probe's `uptime_ms` stamps, and the probe rewrites its
+report only when the client paints or drains PTY bytes. After the rig's
+four-second wait for `less` to settle, a client that had gone quiet still
+carried the stamp from whenever it last drew, so the frame counts were right
+while the elapsed time was four seconds too long — an fps understated by roughly
+45%. It understated the client that idles *best* the most: traced at 50 ms
+resolution, the GPUI client's report was 4.1 s stale at the start of the drive
+because it stops painting entirely, against 0.5 s for the old client, which kept
+draining bytes. The A/B read that difference as a paint-path regression. The rig
+now waits for a report rewrite before opening the window.
+
+**The workload could not demand 60 fps.** It paged `less` with synthetic `space`
+events, and each page-forward produces exactly one repaint — so the frame rate
+was pinned to the rate at which `xdotool` could deliver synthetic keys. Measured
+directly, `xdotool key --repeat 60 --repeat-delay 8` takes 1262-1284 ms per
+batch, i.e. **21 ms per key**, not the requested 8 ms: a hard ceiling near
+47 fps. Both clients sat exactly on it, painting one frame per delivered key at
+a steady 21 ms interval and 5-10% of one CPU core — the signature of a workload
+bottleneck rather than a renderer one.
+
+Driving the scroll from an unpaced writer inside the pane (`seq 1 100000000`,
+no keys sent while the window is open) removes the rig from the loop. Measured
+that way on the reference host, release builds from this tree, against the
+`scribe-dev` server:
+
+| Run | New (`scribe-client-gpui`) | Old (`scribe-client`) |
+|---|---|---|
+| 1 | 59.942 fps, 0.000% dropped | 50.575 fps, 5.841% dropped |
+| 2 | 59.597 fps, 0.416% dropped | 48.770 fps, 6.601% dropped |
+| 3 | 60.064 fps, 0.000% dropped | 41.480 fps, 8.101% dropped |
+
+The GPUI client sustains the display's full 60 Hz with no dropped frames; the
+old client reaches 41-51 fps with 6-8% dropped and does not meet the target on
+the same workload. The absolute Clarification-Q3 threshold therefore stands
+unchanged — it is both reachable and not free — and the metric now discriminates
+between the two clients instead of reporting the rig's synthetic-input rate for
+both. No client code changed: a candidate fix to the GPUI redraw pump's sampling
+interval was measured at 59.9 fps against 60.0 fps for the unmodified client and
+dropped as unjustified.
 
 ## Remaining gate measurements
 
 Input echo latency, `cat` firehose throughput, and memory at ten tabs are
 captured live by the rig, not inferred from a sandboxed launch: both clients
 carry the same probe (`crates/scribe-common/src/perf_probe.rs`), so the A/B
-compares identical measurement points under an identical workload. All three
+compares identical measurement points under an identical workload. All those
 slots are now filled (see above), so the gate scores them rather than reporting
-`NO-BASELINE`. Scroll fps is an absolute target (sustained 60 fps, `< 1%`
-dropped) and needs no old-client baseline.
-
-Scroll is measured for the **new client only** — `run-perf-ab.sh` calls
-`measure_scroll "$NEW_CLIENT"` and has no old-client arm — so a scroll failure
-cannot currently be attributed between a client regression and an unreachable
-absolute target. Pointing `--new-client` at the old binary with `--out` to a
-scratch path is the way to get that comparison.
+`NO-BASELINE`.

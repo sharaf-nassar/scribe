@@ -42,15 +42,23 @@
 # or focus is not on it, the workload aborts rather than typing into a pane that
 # was already open. The rig closes the tabs it opened when it is done.
 #
+# Live mode drives the isolated `scribe-dev` install, never the stable one. See
+# `stage_dev_binary`: every binary the rig launches is copied to a staging path
+# named `scribe-dev`, which is what `AppIdentity::detect_from_path` keys off, so
+# the sockets, config and state the run touches all live under the `scribe-dev`
+# slug. Without that a gate run seeds sessions, opens ten tabs and types `exit`
+# into the developer's own live terminal.
+#
 # Usage:
-#   tools/perf-ab-rig/run-perf-ab.sh [--live] [--startup-only] [--out PATH]
-#       [--new-client PATH] [--old-client PATH] [--baseline PATH]
+#   tools/perf-ab-rig/run-perf-ab.sh [--live] [--startup-only] [--scroll-only]
+#       [--out PATH] [--new-client PATH] [--old-client PATH] [--baseline PATH]
 #       [--record-baseline] [--samples N] [--firehose-mib N] [--tabs N]
 #       [--scribe-test PATH]
 #
 # --startup-only limits a --live run to metric 1 (no tabs are opened and no
 # keys are typed); metrics 2-5 report NOT-MEASURED. This is the fast loop for
-# the startup perf bead.
+# the startup perf bead. --scroll-only is the same idea for metric 5, which is
+# the one metric measured on both clients purely to attribute a failure.
 #
 # A full --live run has two hard prerequisites, both checked up front and both
 # fatal rather than degraded (see `live_preflight`): the `scribe-test` helper
@@ -64,7 +72,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 MODE="assess"
-STARTUP_ONLY=0
+# Empty means "score all five metrics"; otherwise the single metric a --live run
+# is limited to. `metric_enabled` is the only reader.
+ONLY_METRIC=""
 OUT="${REPO_ROOT}/specs/016-gpui-client-rebuild/perf-ab-report.md"
 NEW_CLIENT=""
 OLD_CLIENT=""
@@ -77,6 +87,12 @@ SCRIBE_TEST_BIN="scribe-test"
 # inside a client binary is what tells the rig that binary can be measured at
 # all; see `client_has_probe`.
 PROBE_ENV_KEY="SCRIBE_PERF_PROBE"
+# File stem that selects the isolated dev install. `AppIdentity::detect_from_path`
+# (crates/scribe-common/src/app.rs) derives the whole runtime identity — socket
+# directory, config directory, state directory — from the running executable's
+# stem, so staging a binary under this name is what keeps a live gate run off the
+# developer's stable server. There is no env override to use instead.
+DEV_EXE_STEM="scribe-dev"
 
 # --- Q3 thresholds --------------------------------------------------------
 # Startup is a same-host A/B against the old client (re-scoped from the
@@ -106,20 +122,25 @@ LATENCY_SAMPLES=25             # keystrokes echoed per latency run
 FIREHOSE_MIB=32                # size of the file `cat`ted for throughput
 MEMORY_TABS=10                 # tab count for the memory metric
 SCROLL_SECONDS=8               # sustained scroll drive time
-SCROLL_KEY_DELAY_MS=8          # spacing between synthetic page-forward events
-# The pager is advanced with `space`, not `Next`. `space` is `less`'s canonical
-# page-forward key and a plain printable character, so both clients encode it
-# through their simplest path, which keeps the scroll metric measuring paint
-# rather than key encoding. `Next` is no longer wrong — the GPUI client dropped
-# a bare PageDown before its encoder until `scribe-38e.84` wired the ported
-# encoder into the live key path — but `space` stays the drive key because it
-# depends on the least machinery.
-SCROLL_ADVANCE_KEY=space
+SCROLL_SETTLE_SECONDS=2        # time the scroll reaches steady state before it is measured
+# The scroll workload scrolls the live grid from a command running INSIDE the
+# pane, and sends no keys at all while it is measured.
+#
+# It used to page `less` with synthetic `space` events, and that made the metric
+# measure the rig instead of the client (bead scribe-38e.91). Every page-forward
+# produces exactly one repaint, so the frame rate was pinned to the rate at which
+# `xdotool` could deliver synthetic keys — measured at 21 ms per key on the
+# reference host, i.e. a hard ceiling of ~47 fps, against a 60 fps target.
+# BOTH clients sat on that ceiling, which is what made a workload artefact look
+# like a paint-path regression. An unpaced writer instead asks the client for
+# every frame the display can show, which is what "sustained 60 fps" means.
+SCROLL_COMMAND="seq 1 100000000"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --live) MODE="live"; shift ;;
-    --startup-only) STARTUP_ONLY=1; shift ;;
+    --startup-only) ONLY_METRIC="startup"; shift ;;
+    --scroll-only) ONLY_METRIC="scroll"; shift ;;
     --out) OUT="$2"; shift 2 ;;
     --new-client) NEW_CLIENT="$2"; shift 2 ;;
     --old-client) OLD_CLIENT="$2"; shift 2 ;;
@@ -129,7 +150,7 @@ while [[ $# -gt 0 ]]; do
     --firehose-mib) FIREHOSE_MIB="$2"; shift 2 ;;
     --tabs) MEMORY_TABS="$2"; shift 2 ;;
     --scribe-test) SCRIBE_TEST_BIN="$2"; shift 2 ;;
-    -h|--help) sed -n '2,61p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,68p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -154,6 +175,12 @@ MEASURED_TABS=""
 # --------------------------------------------------------------------------
 
 log() { echo "[perf-ab] $*" >&2; }
+
+# Whether the named metric is scored on this run. Empty ONLY_METRIC scores all
+# five; --startup-only and --scroll-only narrow it to one.
+metric_enabled() {
+  [[ -z "$ONLY_METRIC" || "$ONLY_METRIC" == "$1" ]]
+}
 
 # Abort the run with a diagnosis. Used only for conditions under which a --live
 # gate run cannot produce valid numbers at all, so that it fails loudly instead
@@ -222,6 +249,53 @@ record_baseline() {
 }
 
 # --------------------------------------------------------------------------
+# Dev-flavor isolation
+# --------------------------------------------------------------------------
+#
+# A live run creates sessions, opens ten tabs, types shell commands into them
+# and then types `exit` to close them again. Pointed at the stable install that
+# all lands in whatever terminal the developer is actually using, so the rig
+# never runs against it.
+#
+# Scribe derives its whole runtime identity from the running executable's file
+# stem (`AppIdentity::detect_from_path`): a binary called `scribe-dev` uses
+# `/run/user/<uid>/scribe-dev/server.sock`, `~/.config/scribe-dev` and
+# `~/.local/state/scribe-dev`, while anything else uses the stable slug. There
+# is no environment override, so the only way to retarget a binary is to run it
+# from a path with that stem — which is exactly what this does. The copy is
+# byte-identical to what was passed in, so the numbers still describe the
+# binary under test.
+
+# Copy one binary into the run's staging area under the dev stem and echo the
+# staged path. `role` only keeps the copies in separate directories, since they
+# all end up with the same file name.
+stage_dev_binary() {
+  local role="$1" src="$2"
+  local dir="$WORK_DIR/dev/$role"
+  local staged="$dir/$DEV_EXE_STEM"
+  mkdir -p "$dir"
+  cp -f "$src" "$staged" || return 1
+  chmod +x "$staged"
+  echo "$staged"
+}
+
+# Restage every binary a live run launches, rewriting the globals in place so no
+# call site can accidentally reach for the original path.
+stage_live_binaries() {
+  local resolved
+  if [[ -n "$NEW_CLIENT" ]]; then
+    NEW_CLIENT="$(stage_dev_binary new-client "$NEW_CLIENT")"
+  fi
+  if [[ -n "$OLD_CLIENT" ]]; then
+    OLD_CLIENT="$(stage_dev_binary old-client "$OLD_CLIENT")"
+  fi
+  if resolved="$(command -v "$SCRIBE_TEST_BIN" 2>/dev/null)"; then
+    SCRIBE_TEST_BIN="$(stage_dev_binary scribe-test "$resolved")"
+  fi
+  log "staged under the ${DEV_EXE_STEM} runtime slug: $WORK_DIR/dev"
+}
+
+# --------------------------------------------------------------------------
 # Live-mode plumbing: launch, drive and tear down a client
 # --------------------------------------------------------------------------
 
@@ -284,11 +358,14 @@ close_seeded_sessions() {
 
 # Prerequisites for any live workload. Echoes a reason when live mode cannot
 # run, empty when it can.
+#
+# The server it looks for is the isolated dev one, because that is the only
+# server a live run is allowed to drive; see the dev-flavor isolation block.
 live_blocker() {
   [[ -n "${DISPLAY:-}" ]] || { echo "no DISPLAY is set, so no client can be driven."; return; }
   command -v xdotool >/dev/null 2>&1 || { echo "xdotool is not installed, so no workload can be driven."; return; }
-  local socket="/run/user/$(id -u)/scribe/server.sock"
-  [[ -S "$socket" ]] || { echo "no running server at ${socket} to attach to."; return; }
+  local socket="/run/user/$(id -u)/${DEV_EXE_STEM}/server.sock"
+  [[ -S "$socket" ]] || { echo "no running ${DEV_EXE_STEM} server at ${socket} to attach to; install and start one with \`just install-dev\` (the rig never drives the stable server)."; return; }
   echo ""
 }
 
@@ -326,9 +403,9 @@ live_preflight() {
       "path under target/release."
     client_has_probe "$bin" && continue
     # Metric 1 has a documented fallback to the startup-log method for a
-    # probe-less binary, so a --startup-only run stays valid; metrics 2-4 have
+    # probe-less binary, so a --startup-only run stays valid; metrics 2-5 have
     # no fallback and would time out instead.
-    if [[ "$STARTUP_ONLY" -eq 1 ]]; then
+    if [[ "$ONLY_METRIC" == "startup" ]]; then
       log "--${label}-client ${bin} carries no ${PROBE_ENV_KEY}; startup will fall back to its startup log"
       continue
     fi
@@ -343,7 +420,10 @@ live_preflight() {
   done
 
   # Startup-only runs open no tabs, so they need no seeded session.
-  [[ "$STARTUP_ONLY" -eq 0 ]] || return 0
+  if [[ "$ONLY_METRIC" == "startup" ]]; then
+    stage_live_binaries
+    return 0
+  fi
 
   command -v "$SCRIBE_TEST_BIN" >/dev/null 2>&1 || die \
     "no usable ${SCRIBE_TEST_BIN}: the rig needs it to seed the detached session" \
@@ -352,6 +432,9 @@ live_preflight() {
     "Pass --scribe-test target/release/scribe-test (build it with" \
     "\`cargo build --release -p scribe-test\`), or re-run with --startup-only," \
     "which opens no tabs."
+  # Everything the run launches from here on is the staged dev-slug copy, so the
+  # seeded session and every tab land in the isolated dev server.
+  stage_live_binaries
   seed_session || die \
     "${SCRIBE_TEST_BIN} could not seed a session for the client to attach to." \
     "Check that the server socket is healthy and re-run; --startup-only skips" \
@@ -788,55 +871,99 @@ measure_memory() {
 # Metric 5: scroll frame pacing (fps and dropped-frame percentage)
 # --------------------------------------------------------------------------
 
+# Copy the live probe report so every key of one snapshot is read from the same
+# revision of the file. The rig reads three counters per boundary and the client
+# rewrites the report underneath it, so reading the live file three times can
+# pair a frame count with an uptime stamp from a different flush.
+snapshot_probe() {
+  local dest="$1"
+  [[ -f "$PROBE_FILE" ]] || return 1
+  cp -f "$PROBE_FILE" "$dest" 2>/dev/null || return 1
+}
+
+# Block until the probe report carries an uptime stamp newer than `$1`.
+#
+# The report is only rewritten when the client paints or drains PTY bytes, so a
+# quiet client leaves one stamped whenever it last had something to do. Waiting
+# for a rewrite is what makes a snapshot describe *now* rather than then.
+wait_for_probe_rewrite() {
+  local before="$1" waited=0 now
+  while [[ $waited -lt 20 ]]; do
+    now="$(probe_value "$PROBE_FILE" uptime_ms)"
+    [[ -n "$now" && "$now" != "$before" ]] && return 0
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+# Drive the scroll workload on one client and echo `<fps>#<dropped_pct>`, or an
+# empty string when the workload could not be measured. The compound value is
+# the same shape `measure_memory` uses, so `eval_pair` can carry it.
 measure_scroll() {
   local bin="$1"
-  start_client "$bin" || { echo "|"; return; }
+  start_client "$bin" || { echo ""; return; }
   if ! open_owned_tab; then
     stop_client
-    echo "|"
+    echo ""
     return
   fi
-  # Scrolling is driven INSIDE the pane, with `less` paging a long file, rather
-  # than through a client-side scrollback binding. The pager makes the workload
-  # identical for both clients (it is just PTY output that repaints the grid)
-  # and independent of which client has wired its own scroll actions.
+  # Scrolling is driven INSIDE the pane, by a writer the rig starts once and then
+  # leaves alone, rather than through a client-side scrollback binding or a
+  # stream of synthetic keys. Both clients then see the same thing — PTY output
+  # scrolling the grid — independently of which one has wired its own scroll
+  # actions, and nothing between the shell and the renderer paces the frames.
   focus_client
-  run_command "seq 1 400000 | less" || true
-  sleep 4
+  run_command "$SCROLL_COMMAND" || true
+  sleep "$SCROLL_SETTLE_SECONDS"
+  # The window is derived from the probe's own uptime stamps, so both edges have
+  # to name a moment the client was actually busy: the report is rewritten when
+  # the client paints or drains bytes and at no other time, so a snapshot taken
+  # while it is quiet carries a stamp from whenever it last had work. Waiting for
+  # a rewrite before opening the window is also the check that the writer is
+  # actually running — if it never started, there is nothing to measure.
+  local stale_stamp
+  stale_stamp="$(probe_value "$PROBE_FILE" uptime_ms)"
+  if ! wait_for_probe_rewrite "$stale_stamp"; then
+    log "scroll: the pane produced no output, so there was no scrolling to measure"
+    close_owned_tabs
+    stop_client
+    echo ""
+    return
+  fi
+  local before_snap="$WORK_DIR/scroll-before.txt"
+  snapshot_probe "$before_snap" || { stop_client; echo ""; return; }
   local frames_before dropped_before uptime_before
-  frames_before="$(probe_value "$PROBE_FILE" frames)"
-  dropped_before="$(probe_value "$PROBE_FILE" dropped_frames)"
-  uptime_before="$(probe_value "$PROBE_FILE" uptime_ms)"
-  local deadline
-  deadline=$((SECONDS + SCROLL_SECONDS))
-  while [[ $SECONDS -lt $deadline ]]; do
-    focus_client 0.05
-    send_keys --repeat 60 --repeat-delay "$SCROLL_KEY_DELAY_MS" "$SCROLL_ADVANCE_KEY" || break
-  done
-  sleep 0.5
+  frames_before="$(probe_value "$before_snap" frames)"
+  dropped_before="$(probe_value "$before_snap" dropped_frames)"
+  uptime_before="$(probe_value "$before_snap" uptime_ms)"
+  sleep "$SCROLL_SECONDS"
+  local after_snap="$WORK_DIR/scroll-after.txt"
+  snapshot_probe "$after_snap" || { stop_client; echo ""; return; }
   local frames_after dropped_after uptime_after
-  frames_after="$(probe_value "$PROBE_FILE" frames)"
-  dropped_after="$(probe_value "$PROBE_FILE" dropped_frames)"
-  uptime_after="$(probe_value "$PROBE_FILE" uptime_ms)"
-  # Leave the pager before the tab is closed, so `exit` reaches the shell.
-  send_keys q || true
+  frames_after="$(probe_value "$after_snap" frames)"
+  dropped_after="$(probe_value "$after_snap" dropped_frames)"
+  uptime_after="$(probe_value "$after_snap" uptime_ms)"
+  # Stop the writer before the tab is closed, so `exit` reaches the shell.
+  focus_client 0.1
+  send_keys ctrl+c || true
   sleep 0.5
   close_owned_tabs
   stop_client
-  if [[ -z "$frames_after" || -z "$uptime_after" ]]; then echo "|"; return; fi
+  if [[ -z "$frames_after" || -z "$uptime_after" ]]; then echo ""; return; fi
   local delta_frames delta_dropped delta_ms
   delta_frames="$(calc "b - a" "a=${frames_before:-0}" "b=${frames_after}")"
   delta_dropped="$(calc "b - a" "a=${dropped_before:-0}" "b=${dropped_after}")"
   delta_ms="$(calc "b - a" "a=${uptime_before:-0}" "b=${uptime_after}")"
   if float_cmp "$delta_ms" "<=" 0 || float_cmp "$delta_frames" "<=" 0; then
-    log "scroll: the client painted no frames while the pager was driven (${delta_frames} frames over ${delta_ms} ms)"
-    echo "|"
+    log "scroll: the client painted no frames while the grid was scrolling (${delta_frames} frames over ${delta_ms} ms)"
+    echo ""
     return
   fi
   local fps dropped_pct
   fps="$(calc "f / (ms / 1000)" "f=$delta_frames" "ms=$delta_ms")"
   dropped_pct="$(calc "d * 100 / (f + d)" "d=$delta_dropped" "f=$delta_frames")"
-  echo "${fps}|${dropped_pct}"
+  echo "${fps}#${dropped_pct}"
 }
 
 # --------------------------------------------------------------------------
@@ -851,7 +978,7 @@ live_ready() {
 
 eval_startup() {
   local new_split="" old_split=""
-  if live_ready && [[ -n "$NEW_CLIENT" ]]; then
+  if live_ready && metric_enabled startup && [[ -n "$NEW_CLIENT" ]]; then
     log "measuring startup: new client (median of ${STARTUP_SAMPLES})"
     new_split="$(measure_startup "$NEW_CLIENT")"
   fi
@@ -859,7 +986,7 @@ eval_startup() {
   if [[ -n "$new_split" ]]; then
     IFS='|' read -r new_total bringup scribe_ms <<<"$new_split"
   fi
-  if live_ready && [[ -n "$OLD_CLIENT" ]]; then
+  if live_ready && metric_enabled startup && [[ -n "$OLD_CLIENT" ]]; then
     log "measuring startup: old client (median of ${STARTUP_SAMPLES})"
     old_split="$(measure_startup "$OLD_CLIENT")"
     local old_total="${old_split%%|*}"
@@ -922,18 +1049,18 @@ eval_startup() {
   STARTUP_NOTE="Q3 re-scope (2026-07-24) plus its absolute half (2026-07-25, bead scribe-38e.83); the retired 500 ms ceiling is below this platform's GPU bring-up floor for both clients. (1a) Scribe-attributable startup ${scribe_ms:-n/a} ms against a ${SCRIBE_STARTUP_BUDGET_MS} ms budget: ${scribe_verdict}. (1b) Total first frame ${new_total} ms against the old client's ${OLD_STARTUP_MS:-unrecorded} ms with the ${NOISE_TOLERANCE_PCT}% noise allowance: ${total_verdict}. Method: median of ${STARTUP_SAMPLES} cold launches per client; the span is the first painted frame minus the probe arm (the first statement of each client's main), falling back to the startup-log wall clock for a binary without that probe key. The gpui split comes from the client's SCRIBE_GPUI_STARTUP_TIMING marker, which times \`cx.open_window\` — the span in which no Scribe code runs. Splash deletion (OQ8) stays authorized while this PASSes."
 }
 
-# Shared shape for the three comparative metrics: measure the new client,
+# Shared shape for the metrics measured on both clients: measure the new client,
 # measure (or read) the old client, then hand both back as `new|old`.
 #
-# Args: label measure_fn baseline_key
+# Args: label measure_fn baseline_key only_metric_name
 eval_pair() {
-  local metric="$1" fn="$2" key="$3"
+  local metric="$1" fn="$2" key="$3" only="$4"
   local new_value="" old_value=""
-  if live_ready && [[ "$STARTUP_ONLY" -eq 0 && -n "$NEW_CLIENT" ]]; then
+  if live_ready && metric_enabled "$only" && [[ -n "$NEW_CLIENT" ]]; then
     log "measuring ${metric}: new client"
     new_value="$($fn "$NEW_CLIENT")"
   fi
-  if live_ready && [[ "$STARTUP_ONLY" -eq 0 && -n "$OLD_CLIENT" ]]; then
+  if live_ready && metric_enabled "$only" && [[ -n "$OLD_CLIENT" ]]; then
     log "measuring ${metric}: old client"
     old_value="$($fn "$OLD_CLIENT")"
   fi
@@ -947,7 +1074,7 @@ eval_pair() {
 
 eval_latency() {
   local pair
-  pair="$(eval_pair input-latency measure_input_latency input_latency_p50_ms)"
+  pair="$(eval_pair input-latency measure_input_latency input_latency_p50_ms latency)"
   LAT_NEW="${pair%%|*}"
   LAT_OLD="${pair##*|}"
   LAT_METHOD="Median of ${LATENCY_SAMPLES} instrumented key -> PTY-echo round trips in a rig-owned tab, both clients measured by the shared probe. PASS when the new median is within ${NOISE_TOLERANCE_PCT}% of the old one."
@@ -966,7 +1093,7 @@ eval_latency() {
 
 eval_firehose() {
   local pair
-  pair="$(eval_pair firehose-throughput measure_firehose firehose_bytes_per_sec)"
+  pair="$(eval_pair firehose-throughput measure_firehose firehose_bytes_per_sec firehose)"
   FIRE_NEW="${pair%%|*}"
   FIRE_OLD="${pair##*|}"
   FIRE_METHOD="Sustained bytes/sec the client drains while \`cat\`ting a ${FIREHOSE_MIB} MiB file in a rig-owned tab, counted at each client's PTY-output entry point. PASS when the new rate is within ${NOISE_TOLERANCE_PCT}% of the old rate."
@@ -985,7 +1112,7 @@ eval_firehose() {
 
 eval_memory() {
   local pair new_raw old_raw
-  pair="$(eval_pair memory-${MEMORY_TABS}-tabs measure_memory memory_rss_kb)"
+  pair="$(eval_pair memory-${MEMORY_TABS}-tabs measure_memory memory_rss_kb memory)"
   new_raw="${pair%%|*}"
   old_raw="${pair##*|}"
   # measure_memory returns `<rss_kb>#<tabs>`; a committed baseline is bare kB.
@@ -1007,23 +1134,42 @@ eval_memory() {
   if float_cmp "$MEM_NEW" "<=" "$ceiling"; then MEM_STATUS="PASS"; else MEM_STATUS="FAIL"; fi
 }
 
+# Metric 5. The threshold is absolute, so unlike the other four the old client's
+# number is not a comparison input — it is the attribution: a frame-pacing target
+# the old client also misses on the same workload is a property of the workload
+# rather than of the client under test, and the rig used to have no way to tell
+# those apart (bead scribe-38e.91).
 eval_scroll() {
-  local measured="" fps="" dropped=""
-  if live_ready && [[ "$STARTUP_ONLY" -eq 0 && -n "$NEW_CLIENT" ]]; then
-    log "measuring scroll-fps: new client"
-    measured="$(measure_scroll "$NEW_CLIENT")"
-    fps="${measured%%|*}"
-    dropped="${measured##*|}"
+  local pair new_raw old_raw
+  pair="$(eval_pair scroll-fps measure_scroll scroll_fps scroll)"
+  new_raw="${pair%%|*}"
+  old_raw="${pair##*|}"
+  # `measure_scroll` returns `<fps>#<dropped_pct>`; a committed baseline stores
+  # the two halves in separate slots, so a bare value came from the file.
+  SCROLL_NEW_FPS="${new_raw%%#*}"
+  SCROLL_NEW_DROPPED="${new_raw##*#}"
+  [[ "$SCROLL_NEW_DROPPED" == "$new_raw" ]] && SCROLL_NEW_DROPPED=""
+  SCROLL_OLD_FPS="${old_raw%%#*}"
+  SCROLL_OLD_DROPPED="${old_raw##*#}"
+  if [[ "$SCROLL_OLD_DROPPED" == "$old_raw" ]]; then
+    SCROLL_OLD_DROPPED="$(baseline_value scroll_dropped_pct)"
+  else
+    record_baseline scroll_dropped_pct "$SCROLL_OLD_DROPPED"
   fi
-  SCROLL_METHOD="Sustained paging driven for ${SCROLL_SECONDS}s inside the pane (\`seq | less\` advanced with synthetic \`${SCROLL_ADVANCE_KEY}\`), so the workload is identical on both clients and independent of client-side scrollback bindings; fps and dropped frames come from the shared probe's frame-gap accounting. PASS at sustained ${SCROLL_TARGET_FPS} fps (within ${NOISE_TOLERANCE_PCT}%) with < ${SCROLL_DROPPED_MAX_PCT}% dropped."
+
+  SCROLL_OLD_VALUE="unrecorded"
+  [[ -n "$SCROLL_OLD_FPS" ]] && SCROLL_OLD_VALUE="${SCROLL_OLD_FPS} fps, ${SCROLL_OLD_DROPPED:-?}% dropped"
+
+  SCROLL_METHOD="The grid is scrolled for ${SCROLL_SECONDS}s by an unpaced writer running inside a rig-owned pane (\`${SCROLL_COMMAND}\`, measured after a ${SCROLL_SETTLE_SECONDS}s settle), so the workload is identical on both clients, independent of client-side scrollback bindings, and paced by nothing between the shell and the renderer; fps and dropped frames come from the shared probe's frame-gap accounting over that window. PASS at sustained ${SCROLL_TARGET_FPS} fps (within ${NOISE_TOLERANCE_PCT}%) with < ${SCROLL_DROPPED_MAX_PCT}% dropped. The old client's number is the attribution for a failure, not a threshold: the target is absolute."
   SCROLL_VALUE="not captured"
-  if [[ -z "$fps" || -z "$dropped" ]]; then
+  if [[ -z "$SCROLL_NEW_FPS" || -z "$SCROLL_NEW_DROPPED" ]]; then
     SCROLL_STATUS="NOT-MEASURED"; return
   fi
-  SCROLL_VALUE="${fps} fps, ${dropped}% dropped"
+  SCROLL_VALUE="${SCROLL_NEW_FPS} fps, ${SCROLL_NEW_DROPPED}% dropped"
   local floor
   floor="$(calc "target * (1 - pct / 100)" "target=$SCROLL_TARGET_FPS" "pct=$NOISE_TOLERANCE_PCT")"
-  if float_cmp "$fps" ">=" "$floor" && float_cmp "$dropped" "<" "$SCROLL_DROPPED_MAX_PCT"; then
+  if float_cmp "$SCROLL_NEW_FPS" ">=" "$floor" \
+    && float_cmp "$SCROLL_NEW_DROPPED" "<" "$SCROLL_DROPPED_MAX_PCT"; then
     SCROLL_STATUS="PASS"
   else
     SCROLL_STATUS="FAIL"
@@ -1119,7 +1265,7 @@ re-measures them with the same probe in the same session, and
 | Input latency (p50 echo) | ${LAT_VALUE} | ${old_lat} | ${LAT_STATUS} |
 | cat-firehose throughput | ${FIRE_VALUE} | ${old_fire} | ${FIRE_STATUS} |
 | Memory at ${MEMORY_TABS} tabs | ${MEM_VALUE} | ${old_mem} | ${MEM_STATUS} |
-| Scroll fps / dropped frames | ${SCROLL_VALUE} | n/a (absolute target) | ${SCROLL_STATUS} |
+| Scroll fps / dropped frames | ${SCROLL_VALUE} | ${SCROLL_OLD_VALUE} | ${SCROLL_STATUS} |
 
 **Overall gate verdict: ${overall}.** \`PASS\` requires all five metrics
 measured and inside their thresholds. \`INCOMPLETE\` means at least one metric
@@ -1151,7 +1297,7 @@ Assess (safe, no GUI, current-state report):
     tools/perf-ab-rig/run-perf-ab.sh
 
 Launch gate (full A/B on the same machine/session, attaches to the running
-server, never restarts it):
+\`${DEV_EXE_STEM}\` server, never restarts it):
 
     tools/perf-ab-rig/run-perf-ab.sh --live \\
       --new-client target/release/scribe-client-gpui \\
@@ -1163,6 +1309,12 @@ Every binary above must come from this tree. The installed
 report, so a run pointed at it aborts in the preflight instead of timing out
 each workload; \`scribe-test\` seeds the session the client attaches to and a
 full \`--live\` run refuses to start without it.
+
+A live run seeds sessions, opens tabs and types into them, so it is staged onto
+the isolated \`${DEV_EXE_STEM}\` install and never touches the stable server:
+every binary it launches is copied to a path whose file stem is
+\`${DEV_EXE_STEM}\`, which is what selects that runtime slug. Install and start
+that server once with \`just install-dev\`.
 
 Both clients are instrumented by the shared runtime probe
 (\`crates/scribe-common/src/perf_probe.rs\`), armed by \`${PROBE_ENV_KEY}\`;
