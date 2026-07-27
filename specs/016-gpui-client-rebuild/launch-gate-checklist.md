@@ -1,186 +1,338 @@
 # GPUI client launch gate — go/no-go checklist (scribe-38e.42)
 
-Decision date: 2026-07-24. Evaluated against final `main` (post Tier-4:
-`67c10e8`, plus dev-packaging fix `cb872dc`). Driven by orchestrated
-verification: the workspace unit/golden/gpui-test oracle, the visual-E2E and
-func/lifecycle scripted-E2E Docker suites, the perf A/B rig (`tools/perf-ab-rig`),
-and live manual driving of the new GPUI client (`/usr/bin/scribe-dev`, repackaged
-to ship `scribe-client-gpui`) against the isolated `scribe-dev` server sandbox.
+Decision date: 2026-07-27. Evaluated against `main` at `394ce63`. Driven by the
+workspace unit/golden/gpui-test oracle, the visual-E2E and func/lifecycle
+scripted-E2E Docker suites (both images rebuilt from this tree), the perf A/B
+rig (`tools/perf-ab-rig`), the mechanical reachability ratchet
+(`tools/check-reachability.sh`), a per-row re-verification of
+`parity-inventory.md` against the source, and live manual driving of the new
+GPUI client against the isolated `scribe-dev` server sandbox.
+
+`/usr/bin/scribe-dev` was confirmed byte-identical (`md5sum`) to
+`target/release/scribe-client-gpui` built from this tree, so the manual rows
+were driven against exactly the code under gate. The production server
+(pid 492537) was never restarted, stopped, or upgraded.
+
+This run supersedes the 2026-07-24 NO-GO. **All four blockers named there are
+confirmed resolved.** The gate nevertheless fails again, on different ground
+that no previous run had measured.
 
 ## Decision: 🔴 NO-GO
 
-Cutover (`scribe-38e.43`+) must NOT begin. The client is functionally close —
-the entire golden/gpui-test oracle and the visual-E2E suite are green — but three
-hard gates fail and two parity rows could not be verified in this environment.
+Cutover (`scribe-38e.43`+) must NOT begin.
 
-## Parity-inventory results by verification method
+Every suite the gate has historically relied on is green — 947 unit/golden/
+gpui-test assertions, 31 of 31 visual-E2E scripts, 13 of 13 func/lifecycle
+scripts, and a green reachability ratchet. The gate fails because those suites
+do not cover the failures, exactly as the 2026-07-24 retraction warned:
 
-| Method | Rows | Oracle | Result |
-| --- | --- | --- | --- |
-| `golden` | KeyInput, ControlRequest, PtyOutput, TrimScrollback, terminal-shortcut bytes | workspace golden suite (part of 850 tests) | ✅ PASS (0 failures) |
-| `gpui-test` | ~50 client/server/input/removed-key rows | headless `#[gpui::test]` suites (part of 850 tests) | ✅ PASS (0 failures) |
-| `visual-E2E` | AI indicator, titles, dialogs, clipboard prompt, share roster, LAN overlays, box drawing, ligatures | visual-E2E Docker suite | ✅ PASS (all completed suites green: dialogs, overlays, command-palette, tooltips, paste-confirmation, color-emoji, reconnect) |
-| `scripted-E2E` | session/window/remote/LAN/clipboard lifecycle, resize, focus guard | func + lifecycle Docker scripts | ⚠️ 11/13 PASS — **2 FAIL** (see B2) |
-| `manual` | Bell, Opacity (+ bead-called-out IME, dialogs) | live driving of `scribe-dev` on `:0` | ⚠️ Dialogs PASS; Bell/Opacity PARTIAL; IME human-required (see below) |
+- **Nine `spec.md` requirements are implemented, unit-tested, and unreachable
+  in the running client** — and not one of them was ever enumerated as a
+  `parity-inventory.md` row, so no oracle scores them (B1). The IME half of
+  this is now *empirically* demonstrated, not merely inferred (B2).
+- **Two of five perf metrics FAIL** against baselines that were, for the first
+  time, actually captured from a probe-instrumented old client (B3).
 
-Total: golden + gpui-test (850 tests) and visual-E2E rows fully green. The gate
-fails on scripted-E2E (AI indicator), perf, and unverifiable manual rows.
+## Oracle results
+
+| Oracle | How driven | Result |
+| --- | --- | --- |
+| Unit / golden / `#[gpui::test]` | `cargo test --workspace --no-fail-fast` | ✅ **947 passed, 0 failed, 0 ignored** across 20 suites (850 at the prior gate) |
+| Visual E2E | every `tests/e2e/visual/*.sh` in a rebuilt `scribe-test-visual` image, each with the env its `just` recipe specifies | ✅ **31 / 31 PASS, 0 FAIL** |
+| Func / lifecycle scripted E2E | every `tests/e2e/func/*.sh` in a rebuilt `scribe-test-func` image | ✅ **13 / 13 PASS, 0 FAIL** |
+| Perf A/B rig | `run-perf-ab.sh --live --record-baseline`, both clients probe-instrumented, same host and session | ❌ **FAIL** — 2 of 5 metrics (B3) |
+| Reachability ratchet | `tools/check-reachability.sh --working-tree` | ✅ **PASS** — 53/65 modules wired, 54/59 server messages handled, 36/36 layout actions handled |
+| Parity rows | all 173 rows re-verified against the source at HEAD | ⚠️ 163/164 reachable, but the artifact is stale (B4) and the denominator is incomplete (B5) |
+| Manual rows | live driving of `scribe-dev` on `:0` | ⚠️ Opacity **PASS**; IME **FAIL** (B2) |
+
+### Prior blockers — all four confirmed resolved
+
+| Prior blocker | Status | Evidence from this run |
+| --- | --- | --- |
+| B1 — startup perf (`.50`, `.83`) | ✅ RESOLVED | Scribe-attributable startup **26.8 ms** vs the 150 ms absolute budget; total first frame **615.2 ms** vs the old client's **4572.0 ms**. Metric verdict PASS. |
+| B1 — perf-rig completeness (`.51`) | ✅ RESOLVED | The rig drove and thresholded **all five** Q3 metrics, and `--record-baseline` filled every previously empty slot in `perf-baseline.md`. |
+| B2 — AI indicator context % (`.52`) | ✅ RESOLVED | `func/ai-state-indicator.sh` and `func/ai-context-thresholds.sh` both PASS (they were the two failures at the prior gate). |
+| B3 — opacity (`.56`, then `.53`) | ✅ RESOLVED | Re-driven live this run — see "Manual item detail". |
+| D4 — config watcher (`.57`) | ✅ RESOLVED | `visual/config-reload.sh` PASS. |
 
 ## Blockers (each NO-GO on its own)
 
-- **B1 — Perf gate FAIL.** Startup-to-first-frame measured 2030–2350 ms across
-  5 samples vs the 500 ms budget (~4×; old baseline 190 ms). → bead
-  `scribe-38e.50`.
+### B1 — Nine `spec.md` requirements are unreachable in the running client
 
-  *Update 2026-07-24:* the 4× regression was the synchronous
-  `load_host_stats` sysinfo walk in the view constructor, fixed on main
-  (`8484f03`). The residual gap to the absolute 500 ms number is the GPU
-  bring-up floor, which the old client no longer clears either — its 190 ms
-  "baseline" was a phase-scoped GPU-init timer, not
-  process-start-to-first-frame (measured end-to-end it starts in 3.0–5.5 s
-  on this host). The startup budget is re-scoped to a same-host end-to-end
-  A/B (spec.md "Q3 re-scope"); under it the GPUI client PASSes (median
-  ~0.7–1.3 s vs old ~3.3–4.5 s, `perf-ab-report.md`). Re-gate B1 with
-  `tools/perf-ab-rig/run-perf-ab.sh --live` (all five metrics).
+Each capability below is a numbered `spec.md` requirement with a complete,
+unit-tested implementation in `crates/scribe-client-gpui/src/`. Each is
+referenced by **nothing** on any live path of the shipped binary, so no user can
+reach it. None is a `parity-inventory.md` row, which is why every oracle is
+green.
 
-  *Update 2026-07-25 (`scribe-38e.83`):* the re-scope gained a second,
-  absolute half. Both clients now report the first painted frame through the
-  shared probe, and the GPUI client splits its own span: 610–751 ms is spent
-  inside `cx.open_window` (wgpu adapter enumeration and device creation, no
-  Scribe code running) and only 24–29 ms is Scribe's. The gate therefore caps
-  Scribe-attributable startup at 150 ms absolute on top of the end-to-end
-  comparison, so a future regression in client code still fails even though
-  the platform floor dominates the total.
+| Lost capability | `spec.md` | Module | Live-path callers | Old client |
+| --- | --- | --- | --- | --- |
+| Mouse reporting (X10/SGR-1006, modes 1000/1002/1003) | :152 | `mouse_reporting.rs` | 0 — no `encode_mouse*` in `main.rs` or any binary submodule | wired |
+| Mouse-wheel scrolling | :152 | — | **0 — `ScrollWheel`/`ScrollDelta`/`scroll_wheel` appear zero times in the whole crate**; `main.rs` registers only `on_mouse_down`/`on_mouse_move`/`on_mouse_up`/`on_key_down` | `main.rs:2188` → `handle_mouse_wheel` |
+| IME / preedit composition | :161 | `preedit.rs` (507 lines, full `gpui::EntityInputHandler`) | 0 — `set_input_handler` is called nowhere in the crate | `preedit.rs` wired |
+| Cold-restart restore (`RestoreStore`, `--restore-child` fan-out) | :176 | `restore_state.rs` | 0 on a live path — only `restore_replay.rs` refers to it, for one rounding helper | 25 call sites |
+| Command-mark scrollbar | :217–218 | `scrollbar.rs` | 0 — zero `scrollbar` references outside the module | wired |
+| Window geometry persistence | :321 | `window_state.rs` | 0 on a live path — its only caller is `restore_state.rs`, itself unwired | 14 call sites |
+| Desktop notification dispatcher | :322 | `notification_dispatcher.rs` | 0 — no `spawn_dispatcher`/`NotifReq` on a live path | `notifications::NotificationTracker` → `maybe_fire_notification` |
+| Server lifecycle management | :322 | `server_lifecycle.rs` | 0 — `main.rs:4563` connects directly via `UnixStream::connect(server_socket_path())`, with no autostart and no stale-socket diagnosis | wired |
+| File drag-and-drop | — | `drag_drop.rs` | 0 — no `on_drop`/`ExternalPaths` handler | n/a |
 
-  The other four metrics (input latency, cat-firehose throughput,
-  memory@10 tabs, scroll fps) were originally recorded as DEFERRED because the
-  rig still treated the client as the display-only spike. `scribe-38e.51` has
-  since removed that limitation: both clients carry the shared probe
-  (`crates/scribe-common/src/perf_probe.rs`) and `--live` drives and thresholds
-  all five metrics. The three comparative metrics need a `--live --old-client
-  <bin> --record-baseline` run to fill the machine-readable baseline block in
-  `perf-baseline.md`; until then they report `NO-BASELINE` and the gate stays
-  `INCOMPLETE` rather than `DEFERRED`.
-- **B2 — Func-E2E FAIL ×2.** `ai-state-indicator` and `ai-context-thresholds`
-  fail: a context value of 50 is not rendered as `50%` in the prompt bar. AI
-  indicator / prompt-bar parity (`.33`) is not met. → bead `scribe-38e.52`.
-- **B3 — Manual rows not fully verified.**
-  - *Opacity* (`manual`): **CORRECTED 2026-07-24** — originally recorded as
-    inconclusive/environment-masked. Re-verification on the real GPU (bead
-    `scribe-38e.53`) disproves that: the client runs on the NVIDIA RTX 3090
-    (confirmed via `nvidia-smi` and `/dev/nvidia*` mappings), the libEGL/DRI2
-    warnings are harmless Mesa side-path noise, and `opacity = 1.0` vs `0.85`
-    renders **byte-identical** (full-window diff bbox `None`, max channel delta
-    0). `appearance.opacity` is simply **UNIMPLEMENTED** in the GPUI client:
-    the root background is a hardcoded opaque `rgb(0x101318)`, `WindowOptions`
-    never sets `WindowBackgroundAppearance::Transparent`, and
-    `opacity_changed()` has no consumer. → fix bead `scribe-38e.56`;
-    re-verify via `scribe-38e.53`.
-  - *IME* (bead-called-out manual): no input-method engine on this host, so
-    end-to-end CJK preedit/commit could not be exercised. The preedit *model*
-    passes its 6 unit tests, but the manual procedure is unverified and requires
-    a human on a machine with an IME.
+`window_state.rs` → `restore_state.rs` → `restore_replay.rs` is a closed island:
+nothing in it is reachable from `main.rs`.
+
+The mechanical ratchet already lists all of these as unwired modules in
+`tools/reachability-baseline.txt`. Of the twelve entries there, four are
+harmless dead duplicates whose behaviour was re-implemented inline on the live
+path — `divider` and `focus_border` → `main.rs::pane_border`; `palette` →
+`color.rs::TerminalColors`; `workspace_notes_preview` →
+`workspace_notes_modal::WorkspaceNotesModalView`. The other eight are the
+capability losses above.
+
+**Why the ratchet passes anyway:** it is a *ratchet*, not a threshold. It fails
+only when the unreachable set grows, and is satisfied while each entry stays
+listed. It was never a parity gate, and no parity gate caught these because
+they are absent from the inventory (B5).
+
+Several of these sit under beads that closed on the *port* rather than the
+wiring: `.15` (scrollbar), `.17` (notifications), `.23` (mouse reporting),
+`.26` (IME preedit), `.30` (server lifecycle, geometry, drag-drop), `.31`
+(cold-restart restore).
+
+### B2 — IME manual gate item FAILS (no longer merely unverifiable)
+
+`plan.md`:223 designates IME an explicit manual gate item with a written
+procedure ("compose text via ibus/fcitx on X11 and a Wayland compositor"), and
+`spec.md`:161 requires it. The 2026-07-24 run recorded ⛔ NEEDS HUMAN because
+the host had no input-method engine.
+
+That is no longer the case: the host now runs `ibus-daemon --panel disable
+--xim` with `table:cangjie3`, `table:cangjie5` and `table:cangjie-big`
+installed, so the procedure is drivable. **It was driven, and it fails.**
+
+Procedure and observation: launched `/usr/bin/scribe-dev` on `:0`, located its
+window by PID (the host has 15+ pre-existing windows named `Scribe`, so a
+name-based lookup is unsafe here), activated it, echoed a marker to get a clean
+prompt, switched the engine with `ibus engine table:cangjie3` (confirmed
+active), then sent `a`, `b`, `c` through XTEST with 0.4 s spacing.
+
+A working CangJie integration intercepts those keystrokes into a composition
+buffer and shows preedit plus a candidate list; the raw letters never reach the
+PTY. The captured frame instead shows the shell prompt with a literal **`abc`**
+on the command line — the keys bypassed the input method entirely. No preedit
+overlay, no candidate window, and zero IME/preedit lines in the client log.
+
+This matches the source exactly: `preedit.rs` ships a complete
+`gpui::EntityInputHandler` (`Ime`, `PreeditMachine`, `compute_overlay`,
+`replace_text_in_range`, `replace_and_mark_text_in_range`) and
+`set_input_handler` is never called, so GPUI has no route by which to deliver
+marked or committed text. `preedit.rs` has exactly one commit in its history
+(`70953cc`, bead `.26` "port IME preedit, bracketed paste, and bell") and has
+never acquired a referent.
+
+The verdict moved from "unverifiable" to "fails" because the host gained an IME,
+not because the code changed.
+
+### B3 — Perf: two of five metrics FAIL
+
+Measured live, both clients probe-instrumented and built from this tree, same
+host and session, `--record-baseline`. This is the first run in which the three
+comparative metrics had real baselines (see D2 for why earlier runs did not).
+
+| Metric | New client | Old client | Budget | Verdict |
+| --- | --- | --- | --- | --- |
+| Scribe-attributable startup | **26.814 ms** | n/a | ≤ 150 ms absolute | ✅ PASS |
+| Startup to first frame (total) | **615.175 ms** (26.8 Scribe + 589.0 gpui bring-up) | **4571.975 ms** | no worse than old, +10% allowance | ✅ PASS |
+| Input latency (p50 echo) | **0.209 ms** | **0.032 ms** | no worse than old, +10% allowance | ❌ **FAIL (~6.5×)** |
+| cat-firehose throughput | **17.623 MiB/s** | **0.232 MiB/s** | no worse than old, −10% allowance | ✅ PASS (~76×) |
+| Memory at 10 tabs | **237.934 MiB** | **465.738 MiB** | ≤ old + 20% | ✅ PASS |
+| Scroll fps / dropped | **29.364 fps, 13.592 % dropped** | n/a (absolute target) | 60 fps, < 1 % dropped | ❌ **FAIL** |
+
+Recorded baselines now in `perf-baseline.md`:
+`startup_first_frame_ms=4571.975`, `input_latency_p50_ms=0.032`,
+`firehose_bytes_per_sec=243217.780`, `memory_rss_kb=476916`.
+
+**Scroll** is an absolute target with no baseline dependency, so its FAIL is
+unambiguous: under an 8 s driven paging workload the client sustains under half
+the target frame rate and drops 13–16× the permitted share. Reproduced across
+three independent runs (29.322 / 14.217 %, 29.207 / 15.851 %, 29.364 /
+13.592 %). Note the rig scores scroll for the **new client only**
+(`measure_scroll "$NEW_CLIENT"`), so it is not yet established whether the old
+client clears 60 fps under the identical workload — that is the first
+investigation step, not a reason to discount the FAIL.
+
+**Input latency** regressed ~6.5× against the old client measured through the
+same probe at the same points. Both absolute numbers are sub-millisecond, so
+this is unlikely to be perceptible, but the Q3 criterion is comparative and it
+is missed by a wide margin.
+
+Startup, throughput, and memory are all comfortable passes — the rebuild is
+dramatically better on those three.
+
+### B4 — `parity-inventory.md` no longer describes the binary
+
+The gate's parity metric is defined (`plan.md` § "Phase H re-baseline") as the
+reachable-row count read off `parity-inventory.md`. That number cannot currently
+be read from the file:
+
+- **13 rows still carry `— (unwired)` / `— (missing)` markers, all stale.** All
+  13 verify as reachable at HEAD: `ClipboardPromptResponse` and
+  `ClipboardBridgeReadReply` (via `IpcSink::clipboard_answer`, called from
+  `run_bridge_job` / `answer_clipboard_prompt`); `PromptMark`, `ScrollBottom`,
+  `ClipboardPromptRequest`, `ClipboardBridgeWrite`, `ClipboardBridgeReadRequest`
+  (named arms in `dispatch_server_message`); `copy`, `paste`, `prompt_jump_up`,
+  `prompt_jump_down`, `jump_to_failure` (`handle_layout_action` is now
+  exhaustive over all 36 variants — no catch-all remains); and `Opacity`
+  (`opacity::{clamp_opacity, opaque_slot, surface}`, 13 uses on the render path).
+- **The roll-up table still reports the `f56ef95` figures** — 60/173 reachable,
+  "51 of 164 user-facing rows (31%)". Re-measured against the source at HEAD the
+  true figure is **163 of 164**. The sole exception is `HookEvent`, whose named
+  symbol lives in `scribe-hook-helper` and is out-of-client by design.
+- **All five per-section `**Reachability:**` footers are stale.** The Rendering
+  and window footer still reads "0 of 5 rows name a live-path symbol; 3 are
+  unwired and 2 are missing"; four of five now do.
+- **The reader prose (≈ lines 137–141) is stale**: it claims the live reader
+  "matches exactly twelve variants and ends in a `_ => {}` catch-all".
+  `dispatch_server_message` now names 54 of 59 and routes the rest to
+  `unhandled_server_message`.
+- Two inline annotations are stale: `command_palette` is described as
+  "degenerate: `CommandPaletteEvent::Execute(_)` is discarded" (it is routed to
+  `TerminalView::execute_palette_action`), and the LAN/sharing boundary note
+  describes the legacy client's dispatch.
+
+This is documentation drift, not missing wiring — but the gate metric is a
+number read from this file, and that number is wrong by 112 rows.
+
+### B5 — The parity denominator omits nine spec requirements
+
+B4 is fixable by editing. B5 is not. `parity-inventory.md` enumerates 173 rows
+across client messages, server messages, keybinding actions, rendering/window
+surfaces, and removed configuration keys. It never enumerated mouse reporting,
+mouse-wheel scrolling, IME composition, the command-mark scrollbar, cold-restart
+restore, window geometry persistence, the desktop notification dispatcher,
+server lifecycle management, or drag-and-drop — every one a `spec.md`
+requirement (B1).
+
+`reachability-audit.md` inherited the same blind spot: it audited "every row of
+`parity-inventory.md`", so a requirement with no row could not surface in its
+173-row census. **"163 of 164 rows reachable" is therefore a measure of the
+tabulated subset, not of parity.** Both artifacts must be extended to the full
+`spec.md` requirement set before the reachable-row count means what the gate
+needs it to mean.
+
+### B6 — The go threshold is undefined
+
+`plan.md` § "Phase H re-baseline" re-baselines the gate on reachable-row count
+"with an explicit go threshold", and the prior revision of this checklist
+required "the reachable-row count to meet its explicit go threshold". No numeric
+threshold is stated in `plan.md`, `spec.md`, `parity-inventory.md`, or
+`reachability-audit.md`. A criterion that names no number cannot be evaluated;
+one must be set before the next run.
+
+## Parity-inventory results by verification method
+
+Methods are as they now stand in `parity-inventory.md` (post method-upgrade).
+Every row's own stated method was exercised this run.
+
+| Method | Rows | Oracle | Result |
+| --- | --- | --- | --- |
+| `scripted-E2E` | 77 | func + visual Docker scripts driving the real client and server | ✅ all driving suites green (13/13 func, 31/31 visual) |
+| `visual-E2E` | 75 | visual Docker suite, `xdotool` against the real window | ✅ 31/31 scripts PASS |
+| `visual-E2E (+ golden bytes)` | 7 | as above, plus the retained encoder fixtures | ✅ PASS |
+| `gpui-test` | 9 | the nine removed-configuration-key rows only | ✅ PASS (within the 947) |
+| `golden` | 4 | captured byte/serialization fixtures | ✅ PASS (within the 947) |
+| `manual` | 1 | Opacity, driven live against `scribe-dev` | ✅ PASS |
+
+Reachability was additionally re-verified per row against the source at HEAD:
+163 of 164 user-facing rows name a symbol genuinely on a live path — subject to
+B4 (the file does not say so) and B5 (the row set is incomplete).
+
+## Visual E2E detail — 31/31 PASS
+
+`ai-task-label`, `bell`, `clipboard-osc52`, `color-emoji`, `config-reload`,
+`dialogs`, `find-overlay`, `lan-approval`, `overlay-actions`, `overlays`,
+`pane-workspace-layout`, `paste-confirmation`, `prompt-marks`, `reconnect`,
+`remote-control`, `session-tooling`, `settings-entry`, `settings-trust`,
+`share-control`, `tab-window-chords`, `terminal-viewport`, `terminal-zoom`,
+`titlebar`, `update-trigger`, `update-dismiss`, `window-chrome-bands`,
+`window-lifecycle`, `workspace-ipc`, `workspace-notes`, `workspace-split`,
+`x11-focus-guard`. (`update-common.sh` is a helper, not a test.)
+
+`reconnect` passed all four phases but required manual intervention to finish —
+see D1.
+
+## Func / lifecycle E2E detail — 13/13 PASS
+
+`ai-context-thresholds`, `ai-state-indicator`, `cold-restart`,
+`failure-server-down`, `failure-socket-loss`, `hot-reload`,
+`keybindings-validation`, `multi-window`, `reconnect`, `shell-integration`,
+`smoke`, `terminal-shortcuts`, `workspace-split`.
+
+The first two were the prior gate's two failures and are now green.
+`cold-restart` passes but does not exercise the client — see D3.
 
 ## Manual item detail
 
 | Item | Verdict | Evidence |
 | --- | --- | --- |
-| Dialogs | ✅ VERIFIED | Close-Scribe modal renders (Quit / Kill / Cancel; Cancel safe-default), Esc dismisses; visual dialog suite also green |
-| Bell | ✅ RESOLVED (was ⚠️ PARTIAL) | The original run saw only ingestion and focused-pane suppression, because the bell was unwired: `bell.rs` was outside the import closure and `Bell` fell into the reader's catch-all. Bead `scribe-38e.81` wired it, and the unfocused case is now asserted automatically — `tests/e2e/visual/bell.sh` rings a real BEL and reads the `WM_HINTS` urgency flag the attention request sets, so this row is no longer `manual` |
-| Opacity | ❌ FAILED (corrected) | Pixel-identical at 1.0 vs 0.85 on the real RTX 3090 → feature unimplemented, not environment-masked. See B3 and bead `.56` |
-| IME | ⛔ NEEDS HUMAN | No IME engine installed; 6 preedit-model unit tests pass as automated proxy |
+| Opacity | ✅ **PASS** | Driven live against `scribe-dev`. A magenta backdrop window was placed behind the client (ImageMagick `display`; `xsetroot` was deliberately avoided so the user's desktop root was untouched), the client window located by PID, and the screen captured cropped to the window geometry. `opacity = 1.0` → `srgb(30,30,30)`; `0.85` → `srgb(35,29,35)` at the same three sample points, i.e. magenta bleeding through, with 484 811 differing pixels and a max channel delta of 138. Clamping is correct and harmless: `1.5` → `srgb(30,30,30)` (opaque), `-0.2` → `srgb(255,0,255)` (fully transparent, pure backdrop). All four edits applied **live at the same pid and the same X window id**, proving reload without restart. |
+| IME | ❌ **FAIL** | See B2 — literal `abc` reached the shell with CangJie active. |
+| Dialogs | ✅ PASS | Now automated: `visual/dialogs.sh` PASS (close dialog Quit/Kill/Cancel with Cancel default; OSC 52 clipboard dialog with payload preview). No longer a manual row. |
+| Bell | ✅ PASS | Now automated: `visual/bell.sh` PASS, asserting the `WM_HINTS` urgency flag. No longer a manual row. |
 
 ## Additional defects found during gate driving (not parity rows)
 
-- **D1 — zbus background panics.** Every client launch throws two non-fatal
-  `zbus … no reactor running, must be called from the context of a Tokio 1.x
-  runtime` background-thread panics. Window still renders. → bead
-  `scribe-38e.54`.
-- **D2 — new_tab no-op.** `ctrl+shift+t` did not spawn a second tab/session in
-  the running client. Needs confirmation (may overlap B2's `.33` surface). →
-  bead `scribe-38e.55`.
-- **D3 — WITHDRAWN (was: local GPU/EGL broken).** Re-verification proved the
-  host GPU stack is healthy: dual RTX 3090, driver 580.142, native NVIDIA
-  Vulkan, and the client demonstrably renders on the 3090. The libEGL/DRI2
-  warnings come from an unused Mesa EGL side path and are harmless. Perf and
-  opacity results are therefore attributable to the client, not the host.
-- **D4 — RESOLVED (was: no config watcher in the GPUI terminal window).** The
-  terminal window now owns a `ConfigRuntime` that keeps the `notify` watcher
-  alive and reloads on the GPUI foreground; theme, chrome, grid font, cell
-  metrics, and keybindings reapply live and every reload emits
-  `ClientMessage::ConfigReloaded`. Proven against the dev server with no
-  restart (same pid, same X window, theme accent repainted). Covered by
-  headless suites plus `tests/e2e/visual/config-reload.sh`. → bead
-  `scribe-38e.57`.
-
-## ⚠️ RETRACTED: "green surface" claim (corrected 2026-07-24)
-
-This section previously asserted that all client/server-message rows with
-`golden`/`gpui-test`/`visual-E2E` methods were "covered and passing", implying
-parity. **That claim was wrong and is withdrawn.** Those suites validate pure
-functions, not reachability: a module can pass every test while the running
-client never calls it.
-
-The reachability audit (`reachability-audit.md`, bead `scribe-38e.60`) measured
-the truth across 173 rows:
-
-| Verdict | Count | Share |
-| --- | --- | --- |
-| WIRED (reachable in the app) | 60 | 34.7% |
-| UNWIRED (logic exists, nothing calls it) | 63 | 36.4% |
-| MISSING (no implementation) | 50 | 28.9% |
-
-Excluding the 9 removed-config-key rows (which assert *absence* of behavior),
-**51 of 164 user-facing rows are reachable — 31%.**
-
-Structural causes: `main.rs` imports 19 of 54 library modules; `run_reader`
-handles 12 of 59 `ServerMessage` variants and ends in `_ => {}`;
-`handle_layout_action` executes 9 of 35 `LayoutAction` variants; and
-`Content.rows` is `Vec<String>` — the paint path has **no per-cell color**, so
-box drawing, ligatures, and font fallback are all unreachable. Command palette,
-context-menu, and dialog *events* are discarded, so those surfaces open but
-their actions do nothing.
-
-What genuinely IS verified green: the 9 removed-config-key rows, and the
-lifecycle/failure-path scripted E2Es (cold-restart, server-down, socket-loss,
-reconnect, hot-reload, multi-window isolation, workspace-split,
-shell-integration, terminal-shortcuts, keybindings-validation) — these drive the
-real app and therefore do prove reachability for what they cover.
-
-## Re-scope pointer
-
-Feature 016 was re-scoped in place on the strength of the retraction above —
-see `spec.md` § "Re-scope — reachability re-baseline" and `plan.md`
-§ "Re-sequenced remaining phases (post-reachability-audit)". The 016 task list
-completed the *library port*; the remaining work is integration/wiring plus the
-genuinely missing features, sequenced around the audit's fix units FU-1..FU-23
-with FU-1 (cell-accurate paint path) first.
-
-Two consequences bind this gate:
-
-- **The parity metric is the reachable-row count**, regenerated from
-  `parity-inventory.md`'s roll-up (currently **51 of 164** user-facing rows) by
-  mechanical CI checks — never a green unit-test run.
-- **Verification methods were upgraded** so no user-facing row can pass on
-  headless unit tests alone: 27 IPC rows moved `gpui-test` → `scripted-E2E`;
-  font fallback and all 54 named keybinding actions moved to `visual-E2E`
-  driven by `xdotool`. `gpui-test` now applies only to the nine
-  removed-config-key rows. The "Parity-inventory results by verification
-  method" table above records the methods **as they stood at the gate run** and
-  is superseded by `parity-inventory.md` for any re-gate.
+- **D1 — `tests/e2e/visual/reconnect.sh` hangs the harness after passing.** All
+  four phases report PASS, then the container never exits: the script relaunches
+  its client with `scribe-client-gpui &` and never kills it, so the orphan holds
+  the entrypoint's `tee /output/result.log` pipe open indefinitely
+  (`entrypoint-visual.sh`: `timeout "$TEST_TIMEOUT" "$1" 2>&1 | tee
+  /output/result.log`). `TEST_TIMEOUT` governs the script, which has already
+  exited, so nothing ever breaks the pipe. Every other relaunching script
+  (`tab-window-chords.sh`, `pane-workspace-layout.sh`) ends with
+  `kill "$SCRIBE_CLIENT_PID"`. The 153 s recorded above includes ~140 s of hang
+  ended by killing the orphan by hand. This blocks unattended CI runs.
+- **D2 — the perf rig silently degrades, producing three misleading
+  `NO-BASELINE` verdicts.** Two independent causes. (a) Without `scribe-test` on
+  `PATH` the rig logs "cannot seed a session for the client" and continues
+  anyway. (b) The report's own "Reproducing" section documents
+  `--old-client /usr/bin/scribe-client`, but the **installed** old client
+  predates the shared probe (`strings /usr/bin/scribe-client | grep
+  SCRIBE_PERF_PROBE` is empty), so `start_client`'s `[[ -s "$PROBE_FILE" ]]`
+  guard never fires and every workload phase reports "client … never reached a
+  first frame". Only `target/release/scribe-client` carries the probe. Both
+  failures present as missing baselines rather than as a missing prerequisite.
+  Re-running with `--scribe-test target/release/scribe-test --old-client
+  target/release/scribe-client` produced all four baselines on the first try.
+- **D3 — `func/cold-restart.sh` does not exercise the client.** It states
+  plainly that "the daemon is the client stand-in", using `scribe-test daemon
+  stop`/`start` for the cold quit and relaunch. It therefore passes while
+  `restore_state.rs` is unreachable (B1), proving the server's session survival
+  rather than the client's restore path.
 
 ## Re-gate criteria
 
-Re-run this gate when all of the following are resolved: `.50`/`.83` (startup
-gate green under the re-scoped Q3 budget — Scribe-attributable startup
-≤150 ms and total first frame no worse than the old client, spec.md
-"Q3 re-scope"), `.51` (rig drives all five metrics), `.52` (AI-indicator func
-green),
-`.56` (opacity implemented) followed by `.53` (opacity re-verified), and `.57`
-(config watcher wired, live reload proven). The IME manual procedure still
-requires a human on a host with an input-method engine.
+Re-run this gate when all of the following hold:
 
-Post-re-scope, those are necessary but no longer sufficient: the re-gate also
-requires the reachable-row count to meet its explicit go threshold, with the
-FU-1..FU-23 fix units closed to that threshold and the mechanical reachability
-checks green. Only then does `.42` flip to GO and unblock cutover `.43`.
+1. **B1** — each of the nine unreachable capabilities is either wired to a live
+   path with an oracle that drives the running app, or explicitly descoped in
+   `spec.md` with a recorded decision. Wiring one means deleting its line from
+   `tools/reachability-baseline.txt` and bumping the matching count.
+2. **B2** — `set_input_handler` is called on the live window, and the
+   ibus/CangJie procedure composes and commits CJK text into a pane instead of
+   leaking raw letters to the PTY.
+3. **B3** — scroll sustains 60 fps with < 1 % dropped under the rig's 8 s paging
+   workload, and input-latency p50 returns to within 10 % of the old client.
+4. **B4** — `parity-inventory.md` regenerated so its cells, footers, roll-up,
+   and prose match the binary.
+5. **B5** — `parity-inventory.md` and `reachability-audit.md` extended to the
+   full `spec.md` requirement set, so the reachable-row count measures parity
+   rather than the tabulated subset.
+6. **B6** — a numeric go threshold for the reachable-row count written into
+   `plan.md`.
+
+The already-green evidence (947 unit/golden/gpui-test, 31/31 visual, 13/13 func,
+the reachability ratchet, startup/throughput/memory perf, opacity) must stay
+green. But — as the 2026-07-24 retraction established and this run confirms
+again — green suites are necessary and never sufficient. The decisive question
+is whether a user of the running client can reach each `spec.md` requirement,
+and for nine of them the answer is still no.
