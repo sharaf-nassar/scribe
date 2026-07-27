@@ -103,6 +103,14 @@ The 016 reachability audit (`specs/016-gpui-client-rebuild/reachability-audit.md
 
 `tools/check-reachability.sh` re-derives the three metrics from source — library modules against `main.rs`'s import closure, `ServerMessage` variants against [[crates/scribe-client-gpui/src/main.rs#dispatch_server_message]], and `LayoutAction` variants against [[crates/scribe-client-gpui/src/main.rs#TerminalView#handle_layout_action]] — prints them as one `reachability: …` line, and compares the unreachable sets against `tools/reachability-baseline.txt`. The check fails when the unreachable set grows *and* when a baseline entry has become reachable, so the baseline can only shrink and every wiring bead has to record its progress. It runs in pre-commit (`reachability-baseline`) and in `just reachability`, which `just ready` invokes alongside the lint-suppression guard.
 
+### Parity Inventory Gate
+
+The 016 launch gate's parity metric is a row count read off `specs/016-gpui-client-rebuild/parity-inventory.md`, so every number in that document is derived from its own tables rather than typed, and a check fails the build when the two disagree.
+
+The inventory gives each of the 174 rows a "Reachable from" cell that either names a live-path symbol or carries an em-dash `— (unwired …)` / `— (missing …)` marker. `tools/check-parity-inventory.sh` recounts all five tables from those cells and verifies the section headings' declared row counts, the five `**Reachability:**` footers, the roll-up table including its Total row, and the user-facing sentence with its percentage and its in-client figure. Before this gate the file had drifted 112 rows behind the binary — it still read 51 of 164 user-facing rows reachable while the true figure was 164 of 165 — because roughly 29 wiring beads had landed since the counts were written.
+
+The same check cross-references the source, so the document cannot describe a client that does not exist: the two message tables must enumerate exactly the `ClientMessage` and `ServerMessage` variants of `crates/scribe-common/src/protocol.rs`, the keybinding table exactly the `Bindings` actions of `crates/scribe-client/src/input.rs`, and any `ServerMessage` row [[crates/scribe-client-gpui/src/main.rs#dispatch_server_message]] does not handle must be annotated a settings-window row (the five variants the settings window's synchronous request/reply helper consumes). It runs in pre-commit (`parity-inventory`), in `just parity-inventory` which `just ready` invokes, and in the pull-request quality workflow.
+
 ### Vendored Third-Party Dependencies
 
 The `third_party/` directory holds path-patched copies of external crates with outstanding upstream bugs, wired in via `[patch.crates-io]` in the root `Cargo.toml`.

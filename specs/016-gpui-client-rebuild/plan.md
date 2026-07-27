@@ -485,9 +485,14 @@ The launch gate `scribe-38e.42` is re-baselined on **reachable-row count**, not
 the unit-test count. The green workspace unit-test suite (850 tests at the gate run) proves logic; it
 proved nothing about whether the running client constructs the tested modules,
 which is how the original gate produced a false parity reading. The gate metric
-is the reachable-row total from `parity-inventory.md`'s roll-up (currently
-51/164 user-facing rows), regenerated mechanically by the R0 CI checks, with an
-explicit go threshold. Cutover (`scribe-38e.43`+) stays blocked until that
+is the reachable-row total from `parity-inventory.md`'s roll-up, with an
+explicit go threshold. That total is not typed into the document: `just
+parity-inventory` (`tools/check-parity-inventory.sh`, also a pre-commit hook
+and a quality-workflow step) re-derives every count in the file from its
+per-row marker cells and cross-checks the tables against the protocol enums and
+the live dispatcher, so reading the number off the file is safe. It stood at
+51/164 user-facing rows when this gate was written and is 164/165 in-client
+today. Cutover (`scribe-38e.43`+) stays blocked until that
 threshold is met alongside the existing perf and manual re-gate criteria in
 `launch-gate-checklist.md`.
 
