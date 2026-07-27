@@ -505,6 +505,47 @@ requirements that had never been tabulated turn out not to be reachable
 threshold is met alongside the existing perf and manual re-gate criteria in
 `launch-gate-checklist.md`.
 
+#### The go threshold
+
+**Go requires every user-facing row to be reachable: `Unwired = 0` and
+`Missing = 0` on the roll-up's Total row — 194 of 194 user-facing rows (100%)
+at the register's current size, 203 of 203 including the removed-configuration-
+key rows.** Anything less is a NO-GO on this criterion. Score it mechanically
+with `just parity-gate` (`tools/check-parity-inventory.sh --gate`), which
+re-derives the counts exactly as the pre-commit check does and then exits
+non-zero while any user-facing row is unreachable. At the 2026-07-27 gate the
+score was 189/194, five rows short.
+
+The number is derived, not chosen. Goal 1 of `spec.md` is "full, reachable
+feature parity … no user-visible regression in functionality", and
+`parity-inventory.md`'s "Definition of done" makes a row done only when its
+"Reachable from" cell names a live-path symbol *and* its verification method
+passes. An unreachable user-facing row is therefore a user-visible regression
+by definition, so the only threshold consistent with the spec is all of them.
+No sub-100% figure is derivable: the spec grants no regression budget, and
+picking one would be a silent amendment of Goal 1.
+
+Two clarifications keep the bar honest rather than merely strict:
+
+- **The denominator moves; the bar does not.** 194 is today's count, not a
+  constant. Adding a requirement to `spec.md`'s register adds a row and raises
+  the denominator (the check fails until it does), and the threshold stays
+  "all of them". Cite the ratio, not the literal, when the register grows.
+- **Descoping is the only relief valve, and it shrinks the denominator instead
+  of lowering the bar.** Re-gate criterion B1 already allows a capability to be
+  "explicitly descoped in `spec.md` with a recorded decision"; that deletes the
+  register id and its row, so the surviving rows must still all be reachable.
+  A descope is a human decision recorded in the spec — never a threshold
+  adjustment made at gate time.
+
+Meeting the threshold is necessary, not sufficient: reachability is a
+per-row structural fact, and the gate still requires each row's own
+verification method to pass plus the perf, IME and manual criteria in
+`launch-gate-checklist.md`. `tools/check-reachability.sh` remains a ratchet
+below this threshold — it fails only when the unreachable set grows, and it
+scores modules rather than requirements, so it can pass while a requirement
+row is unreachable (`ai_indicator` did exactly that).
+
 ## Alignment fixes applied
 
 - (B, must) Fixed the impossible postinst rollback: dpkg replaces the

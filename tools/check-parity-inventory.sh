@@ -7,6 +7,7 @@ Usage:
   tools/check-parity-inventory.sh --staged
   tools/check-parity-inventory.sh --working-tree
   tools/check-parity-inventory.sh --range <base> <head>
+  tools/check-parity-inventory.sh --gate
 
 Re-derive the 016 launch gate's parity metric from
 specs/016-gpui-client-rebuild/parity-inventory.md and fail when the document
@@ -31,6 +32,14 @@ table from the marker cells and then verifies:
 
 Nothing here is hand-maintained, so the numbers cannot go stale while beads
 land.
+
+`--gate` scores the launch gate's go threshold on the working tree: the same
+derivation, and then a non-zero exit while any row is unreachable. The
+threshold is every user-facing row reachable — zero unwired, zero missing —
+because spec.md Goal 1 requires full reachable parity with no user-visible
+regression, so an unreachable row is a regression. See plan.md § "Phase H
+re-baseline" → "The go threshold". This mode is deliberately not part of
+pre-commit: the drift check must stay green while the wiring beads land.
 EOF
 }
 
@@ -48,6 +57,7 @@ mode=""
 base_ref=""
 head_ref=""
 temp_dir=""
+gate=""
 
 cleanup() {
     if [[ -n "$temp_dir" && -d "$temp_dir" ]]; then
@@ -70,6 +80,14 @@ case "$1" in
             exit 2
         fi
         mode="working-tree"
+        ;;
+    --gate)
+        if [[ $# -ne 1 ]]; then
+            usage >&2
+            exit 2
+        fi
+        mode="working-tree"
+        gate="1"
         ;;
     --range)
         if [[ $# -ne 3 ]]; then
@@ -111,7 +129,7 @@ case "$mode" in
         ;;
 esac
 
-SCAN_ROOT="$scan_root" CONTEXT="$context" perl <<'PERL'
+SCAN_ROOT="$scan_root" CONTEXT="$context" GATE="$gate" perl <<'PERL'
 use strict;
 use warnings;
 
@@ -528,5 +546,44 @@ if (@errors) {
     print STDERR "errors below name:\n\n";
     print STDERR "  $_\n" for @errors;
     exit 1;
+}
+
+# ── The launch gate's go threshold ──────────────────────────────────────
+#
+# plan.md § "Phase H re-baseline" → "The go threshold": go requires every
+# user-facing row to be reachable, because spec.md Goal 1 is full reachable
+# parity with no user-visible regression, so an unreachable row is a
+# regression. The bar is the ratio, not the literal 194 — the denominator
+# grows with spec.md's requirement register.
+if ($ENV{GATE}) {
+    # The heredoc is not `use utf8`, so a literal em dash in this source would
+    # be re-encoded by the UTF-8 output layer and print as mojibake. Every
+    # dash this block emits comes from \x{2014} or from an already-decoded
+    # cell.
+    my $em = "\x{2014}";
+    my @unreachable;
+    for my $spec (@sections) {
+        for my $row (@{ $rows{ $spec->{label} } // [] }) {
+            next unless $row->{cell} =~ /^\x{2014}/;
+            push @unreachable, "$spec->{label}: $row->{name} $row->{cell}";
+        }
+    }
+
+    if (@unreachable) {
+        printf STDERR
+            "\nparity gate: NO-GO %s %d of %d user-facing rows reachable (%d%%);"
+            . " the threshold is %d of %d.\n\n",
+            $em, $user_reachable, $user_rows, $user_percent, $user_rows, $user_rows;
+        print STDERR "Unreachable rows:\n\n";
+        print STDERR "  $_\n" for @unreachable;
+        print STDERR "\nWire each row to a live path, or descope its requirement in"
+            . " spec.md\nwith a recorded decision $em which deletes its register id and"
+            . " its row.\n";
+        exit 1;
+    }
+
+    printf "parity gate: GO %s %d of %d user-facing rows reachable (100%%),"
+        . " 0 unwired, 0 missing\n",
+        $em, $user_reachable, $user_rows;
 }
 PERL

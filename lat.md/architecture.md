@@ -121,6 +121,14 @@ This closed the systemic hole behind the 2026-07-27 NO-GO: nine spec requirement
 
 Widening the census surfaced five requirements that are not reachable today — server-upgrade reattach and the remote connect picker overlay are missing, pane dividers, the AI indicator's painted half and the workspace-notes hover preview are unwired — filed as fix units FU-24 through FU-28 in `reachability-audit.md`. Two of them were invisible to the module ratchet as well: `ai_indicator` is imported by `main.rs`, so `tools/check-reachability.sh` scores the module wired while its painting half has no call site. Module-level reachability is a floor, not a substitute for a per-requirement row.
 
+#### Go Threshold
+
+Cutover requires every user-facing row to be reachable — zero unwired and zero missing — so the gate criterion is a ratio, not a tolerance, and `just parity-gate` scores it mechanically.
+
+`tools/check-parity-inventory.sh --gate` runs the same derivation as the drift check and then exits non-zero while any row carries an unreachable marker, printing each offending row. It stays out of pre-commit and out of `just ready`, because it is meant to fail until the wiring beads it measures have landed; the drift check must stay green throughout. At the 2026-07-27 gate it scored 189 of 194 user-facing rows.
+
+The threshold is derived rather than picked: `spec.md` Goal 1 is full reachable parity with no user-visible regression, and the inventory's definition of done makes a row done only when it names a live-path symbol and its verification method passes — so an unreachable row is a regression and the spec grants no budget for one. The denominator moves with the requirement register, and the only relief valve is descoping a requirement in `spec.md` with a recorded decision, which deletes its row and shrinks the denominator instead of lowering the bar. `plan.md` § "Phase H re-baseline" holds the statement of record.
+
 ### Vendored Third-Party Dependencies
 
 The `third_party/` directory holds path-patched copies of external crates with outstanding upstream bugs, wired in via `[patch.crates-io]` in the root `Cargo.toml`.

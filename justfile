@@ -31,6 +31,11 @@ reachability:
 parity-inventory:
     tools/check-parity-inventory.sh --working-tree
 
+# Score the 016 launch gate's go threshold: every user-facing row reachable.
+# Fails while any row is unreachable, so it is not part of `just ready`.
+parity-gate:
+    tools/check-parity-inventory.sh --gate
+
 # Lint (strict clippy config)
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
