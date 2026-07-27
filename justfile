@@ -208,6 +208,13 @@ e2e-visual-terminal-viewport:
 e2e-visual-terminal-zoom:
     docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/terminal-zoom.sh
 
+# Run the window-resize E2E: the window manager resizes the real window and the
+# wire tap records the `Resize` each new grid band republishes, with `stty size`
+# inside the PTY as the end-to-end oracle. Needs the shared-pane rig (so
+# `scribe-test` owns the very pane being measured) and SCRIBE_SHARE_TAP=1.
+e2e-visual-window-resize:
+    docker run --rm --gpus all -e TEST_TIMEOUT=240 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/window-resize.sh
+
 # Run the mouse-reporting E2E: the wheel over the grid, and the X10 / SGR-1006
 # reports a mouse-tracking application receives. Needs the shared-pane rig (a
 # real `cat -v` behind the DEC modes echoes the reports back), the wire tap
