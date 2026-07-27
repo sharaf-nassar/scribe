@@ -360,6 +360,16 @@ Phases 2 and 3 require a wheel notch to log `action=Scrollback` with `rows=3`, m
 
 `ctrl+-` must log `level=-1`, repaint the grid, and publish a smaller cell box with *more* columns; two `ctrl+=` presses must reach `level=1` with a bigger cell box and fewer columns than both the zoomed-out grid and the baseline. The column assertions are the point: a client that rescales glyphs inside a frozen `cols`x`rows` box also repaints and also emits a `Resize`, so pixels and frame counts alone cannot tell a real zoom from a cosmetic one. `ctrl+0` must return `level=0`, republish the pre-zoom geometry field for field, and leave a frame within a few hundred pixels of the pre-zoom capture — the seeded rows are short enough that no zoom level wraps them, so a restored grid is a restored image.
 
+### A live window resize republishes every pane
+
+`tests/e2e/visual/window-resize.sh` is the app-level oracle for [[client#GPUI Client Spike#GPUI Pane And Workspace Shell#Per-Pane Grids And Sizing]] under a window-manager resize: the window is resized the way a user's drag resizes it, and the pane geometry has to reach the server and the PTY.
+
+Nothing headless could have caught the defect it covers. The cell arithmetic was always right; what was missing was the *frame* that observes the new grid band, because the band's rect is written during prepaint and the one repaint a bounds change buys still reads the previous rect. So the client re-laid its panes on screen while every PTY kept its pre-resize size — visible only as an application wrapping at the old column count. The run therefore uses the [[test#Visual E2E Tests#Shared-pane rig]] plus the [[crates/scribe-test/src/share_tap.rs#run]] wire tap (`SCRIBE_SHARE_TAP=1`).
+
+Each resize phase needs three independent things before it passes: a screenshot that differs from the previous shape by thousands of pixels, a recorded `Resize` whose `cols`x`rows` moved in the right direction (up when the window grows to 1700x1000, back down when it shrinks to 900x600), and `stty size` inside the pane reporting exactly those cell counts. The last one is the end-to-end oracle — the kernel's window size is set by the server, so a client that only wrote a frame to a socket cannot satisfy it.
+
+A final phase watches an idle window for several seconds and requires *zero* further `Resize` frames. The republish is scheduled from the measuring write, so a gate that fired on every frame rather than on a moved rect would turn a redraw into a `Resize` storm; that regression looks identical to a correct fix in every other assertion here.
+
 ### Prompt marks and mark-relative jumps
 
 `tests/e2e/visual/prompt-marks.sh` is the app-level oracle for [[client#GPUI Client Spike#Prompt Marks And Jumps]]: OSC 133 ingestion, the three mark-relative jumps, and the server's `ScrollBottom` snap, none of which the client could reach before.
@@ -1522,6 +1532,12 @@ Toggling vi mode publishes a viewport-space cursor on the snapshot, a motion mov
 ### Smart selection resolves through the scrolled viewport
 
 [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#smart_selection_actions]] resolves a viewport cell against the display offset before matching, so a rule still matches text that has scrolled into history; blank space yields no actionable candidate.
+
+### A moved grid area asks for a republish
+
+[[crates/scribe-client-gpui/src/terminal_element.rs#record_grid_area]] reports `true` for the first measurement and for every rect that moved or resized, and `false` for an idle repaint of the same rect.
+
+That is the gate which turns a measured band into exactly one deferred republish — never none (the stale-render defect) and never one per frame (a `Resize` storm).
 
 ### Pointer positions lower onto grid cells
 

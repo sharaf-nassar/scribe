@@ -146,6 +146,7 @@ use crate::{
     terminal::{Content, DisplayOnlyTerminal, PaneGrids, Scroll},
     terminal_element::{
         GridBounds, GridColors, GridFont, ImePaint, TerminalElement, cell_at, hits_jump_chip,
+        record_grid_area,
     },
 };
 
@@ -2878,9 +2879,12 @@ impl TerminalView {
     ///
     /// The area is reported by the paint pass, so it lands one frame after the
     /// change that caused it — a window resize, a chrome band appearing, or the
-    /// very first frame. Publishing from here (rather than from the canvas
-    /// closure, which runs mid-paint) keeps every `Resize` on the render path
-    /// the rest of the pane geometry already goes out on.
+    /// very first frame. Running it from `render` alone would therefore never
+    /// see a resize: the one repaint a bounds change buys still reads the old
+    /// area, and nothing asks for another. The measuring canvas in
+    /// [`Self::render_grid`] closes that gap by deferring a call back here
+    /// whenever the rect it wrote actually moved, so the publish still happens
+    /// on the view (never mid-paint) but always against a measured area.
     fn sync_grid_geometry(&mut self, cx: &mut Context<Self>) {
         let viewport = self.pane_viewport();
         let measured = (viewport.width, viewport.height);
@@ -4907,6 +4911,41 @@ impl TerminalView {
         )
     }
 
+    /// The invisible canvas that measures the grid band and republishes the
+    /// pane geometry whenever the band moved.
+    ///
+    /// The band's height is whatever the chrome bands leave over, which no
+    /// arithmetic on the window size can predict (the prompt strip comes and
+    /// goes with the pane's prompts), so the painted rect is the only honest
+    /// source for the cell counts the server is told about.
+    ///
+    /// The rect lands during prepaint, i.e. *after* the `render` that built
+    /// this canvas already ran [`Self::sync_grid_geometry`] against the
+    /// previous frame's area. A window resize repaints exactly once, so on the
+    /// render path alone nothing would ever compare the new area against the
+    /// published one: the panes would be re-laid locally while every PTY kept
+    /// its pre-resize size. The measuring write is therefore what asks for the
+    /// follow-up, deferred so the publish still runs on the view rather than
+    /// mid-paint, and only on the frame the band actually moved.
+    fn grid_area_probe(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let area = Rc::clone(&self.grid_area);
+        let handle = cx.weak_entity();
+        canvas(
+            move |bounds, _window, app| {
+                if !record_grid_area(&area, bounds) {
+                    return;
+                }
+                app.defer(move |app| {
+                    handle.update(app, TerminalView::sync_grid_geometry).ok();
+                });
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .size_full()
+        .into_any_element()
+    }
+
     /// Lower the live share state onto the overlay layer: the presence roster,
     /// the transient control hint, and the modal grant/deny prompt.
     /// Build the terminal-grid band: the pane layout's canvas.
@@ -4918,21 +4957,11 @@ impl TerminalView {
     fn render_grid(&mut self, ime: ImePaint, cx: &mut Context<Self>) -> gpui::AnyElement {
         let focused = self.sync_split_scroll();
         let panes = self.render_panes(focused, ime, cx);
-        // Measure the flex-grown grid band. Its height is whatever the chrome
-        // bands leave over, which no arithmetic on the window size can predict
-        // (the prompt strip comes and goes with the pane's prompts), so the
-        // painted rect is the only honest source for the cell counts the server
-        // is told about.
-        let area = Rc::clone(&self.grid_area);
         div()
             .flex_1()
             .relative()
             .bg(surface(self.terminal_colors.background, self.opacity))
-            .child(
-                canvas(move |bounds, _window, _cx| area.set(Some(bounds)), |_, (), _, _| {})
-                    .absolute()
-                    .size_full(),
-            )
+            .child(self.grid_area_probe(cx))
             .children(panes)
             // The wheel is claimed by the application when it tracks the mouse,
             // by the alternate screen's 1007 fallback, or — the ordinary case —

@@ -221,6 +221,21 @@ pub struct GridColors {
 /// `Cell` is the whole synchronisation story.
 pub type GridBounds = Rc<std::cell::Cell<Option<Bounds<Pixels>>>>;
 
+/// Record a freshly measured rect into a [`GridBounds`] cell and report whether
+/// it moved.
+///
+/// A measuring canvas learns its rect during *prepaint*, which runs after the
+/// `render` that produced it — so the render pass reacting to a window resize
+/// still reads the pre-resize rect, and nothing schedules another one. The
+/// callers that publish geometry off the measured area therefore need the write
+/// itself to tell them the area changed, so they can ask for the follow-up
+/// frame that observes it.
+pub fn record_grid_area(area: &GridBounds, bounds: Bounds<Pixels>) -> bool {
+    let moved = area.get() != Some(bounds);
+    area.set(Some(bounds));
+    moved
+}
+
 /// Everything the focused pane's paint pass needs to serve the OS input method.
 ///
 /// GPUI only accepts an input handler *during paint* and only for the frame it
@@ -1015,7 +1030,7 @@ mod tests {
     use super::{
         CELL_WIDTH_RATIO, FONT_FALLBACKS, FontVariants, GridBounds, GridColors, GridFont,
         MIN_FONT_SIZE, ResolvedCell, TerminalElement, cell_at, hits_jump_chip, is_painted_cell,
-        shaped_char,
+        record_grid_area, shaped_char,
     };
     use gpui::{Bounds, FontStyle, FontWeight, Rgba, point, px, size};
     use scribe_client_gpui::color::TerminalColors;
@@ -1028,6 +1043,27 @@ mod tests {
     /// A 400x300 grid at (10, 20), the shape the shell hands the paint path.
     fn grid_bounds() -> Bounds<gpui::Pixels> {
         Bounds::new(point(px(10.), px(20.)), size(px(400.), px(300.)))
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#A moved grid area asks for a republish]]
+    #[test]
+    fn a_moved_grid_area_asks_for_a_republish() {
+        let area = GridBounds::default();
+        // The very first measurement is a move: nothing has been published yet.
+        assert!(record_grid_area(&area, grid_bounds()));
+        assert_eq!(area.get(), Some(grid_bounds()));
+        // An idle repaint measures the same rect and must not schedule work —
+        // every frame would otherwise defer a republish forever.
+        assert!(!record_grid_area(&area, grid_bounds()));
+        // A resize (or a chrome band appearing) is the case the render path
+        // cannot see for itself, because it reads the area one frame stale.
+        let resized = Bounds::new(point(px(10.), px(20.)), size(px(720.), px(300.)));
+        assert!(record_grid_area(&area, resized));
+        assert_eq!(area.get(), Some(resized));
+        // A pure move with an unchanged size still counts: the recorded rect is
+        // also what a pointer position is lowered through.
+        let moved = Bounds::new(point(px(0.), px(0.)), size(px(720.), px(300.)));
+        assert!(record_grid_area(&area, moved));
     }
 
     // @lat: [[test#GPUI Terminal Viewport#Pointer positions lower onto grid cells]]

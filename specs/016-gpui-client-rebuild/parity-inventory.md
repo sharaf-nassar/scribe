@@ -76,7 +76,7 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | Variant | Surface | Verification method | Reachable from | Status |
 | --- | --- | --- | --- | --- |
 | `KeyInput` | terminal input | golden | `main.rs::send_key_bytes` → `ipc_bridge::IpcSink::key_input` | required |
-| `Resize` | terminal resize | scripted-E2E | `main.rs::report_cell_metrics`, `main.rs::attach_session` → `IpcSink::resize` | required |
+| `Resize` | terminal resize | visual-E2E | `main.rs::report_cell_metrics`, `main.rs::attach_session`, `TerminalView::grid_area_probe` → `sync_grid_geometry` (bead .98) → `IpcSink::resize` — `tests/e2e/visual/window-resize.sh` | required |
 | `CreateSession` | tabs, panes, and AI tabs | scripted-E2E | `main.rs::create_tab` → `IpcSink::create_session` | required |
 | `CloseSession` | pane/tab close | scripted-E2E | `main.rs::close_active_tab` → `IpcSink::close_session` | required |
 | `CreateWorkspace` | workspace creation | scripted-E2E | `main.rs::TerminalView::split_workspace` → `IpcSink::create_workspace` | required |
