@@ -267,6 +267,25 @@ e2e-visual-clipboard:
 e2e-visual-bell:
     docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/bell.sh
 
+# Run the desktop-notification visual E2E. SCRIBE_NOTIFY=1 stands a real
+# `org.freedesktop.Notifications` service on a session bus so the client's zbus
+# dispatcher has something to deliver to and something to be clicked from; the
+# shared-pane rig is what makes the AI hook events reach the client's own window.
+e2e-visual-notifications:
+    docker run --rm --gpus all -e TEST_TIMEOUT=240 -e SCRIBE_NOTIFY=1 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/notifications.sh
+
+# Run the drag-and-drop visual E2E. A real XDND drag source on the same X server
+# hands the client a file; the shared-pane rig is what lets `scribe-test` read
+# the quoted path back off the very PTY the client typed it into.
+e2e-visual-drag-drop:
+    docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/drag-drop.sh
+
+# Run the server-lifecycle visual E2E: a stale socket diagnosed by name, and an
+# autostart that ends in a painting window. The run stops the server and
+# relaunches the client twice, so it needs a longer budget than the default 60 s.
+e2e-visual-server-lifecycle:
+    docker run --rm --gpus all -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/server-lifecycle.sh
+
 # Run the IME/preedit visual E2E. SCRIBE_IME=1 starts ibus with an XIM server
 # and exports XMODIFIERS before the client launches, so a real input method
 # owns the keyboard; the shared-pane rig is what lets `scribe-test` prove the

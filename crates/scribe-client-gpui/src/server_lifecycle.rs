@@ -86,8 +86,39 @@ pub fn stale_server_reason(
     }
 }
 
+/// Explain why connecting to `socket_path` failed, in the terms the user has to
+/// act on.
+///
+/// The distinction that matters is *missing* versus *stale*: no socket file at
+/// all means no server has ever run for this user, while a socket file that
+/// refuses connections is the leftover of a server that died without unlinking
+/// it — the case that used to present as an unexplained "connection refused".
+/// Pure so both branches are unit-tested without a live socket.
+#[must_use]
+pub fn socket_failure_reason(socket_path: &Path, error: &std::io::Error) -> String {
+    let path = socket_path.display();
+    match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            format!("no server socket at {path}; no scribe-server is running for this user")
+        }
+        std::io::ErrorKind::ConnectionRefused => format!(
+            "stale server socket at {path}: the file exists but nothing is listening on it \
+             (a previous scribe-server exited without removing it)"
+        ),
+        std::io::ErrorKind::PermissionDenied => {
+            format!("no permission to connect to the server socket at {path}")
+        }
+        _ => format!("cannot connect to the server socket at {path}: {error}"),
+    }
+}
+
 /// Connect to the local server socket, starting the server if it is not yet
 /// running and waiting up to [`SERVER_STARTUP_TIMEOUT`] for it to accept.
+///
+/// A failed first connect is diagnosed through [`socket_failure_reason`] before
+/// the autostart is attempted, and that diagnosis is carried into the returned
+/// error when the autostart itself fails — so a wedged socket is named on the
+/// status bar rather than surfacing as a bare `systemctl` exit code.
 ///
 /// # Errors
 /// Returns an error when the server cannot be started or does not become
@@ -95,15 +126,86 @@ pub fn stale_server_reason(
 pub async fn connect_or_start_server(
     socket_path: &Path,
 ) -> Result<tokio::net::UnixStream, Box<dyn std::error::Error + Send + Sync>> {
-    if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
-        return Ok(stream);
-    }
+    let refusal = match tokio::net::UnixStream::connect(socket_path).await {
+        Ok(stream) => return Ok(stream),
+        Err(error) => socket_failure_reason(socket_path, &error),
+    };
 
-    tracing::info!("server not running, starting scribe-server");
-    platform_start_server()
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    tracing::info!(%refusal, "server not running, starting scribe-server");
+    platform_start_server().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("{refusal}; autostart failed: {e}").into()
+    })?;
 
-    wait_for_server_connection(socket_path, SERVER_STARTUP_TIMEOUT).await
+    wait_for_server_connection(socket_path, SERVER_STARTUP_TIMEOUT).await.map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("{refusal}; after autostart: {e}").into()
+        },
+    )
+}
+
+/// Snapshot the server process on the far end of a connected socket.
+///
+/// The peer PID comes from the kernel (`SO_PEERCRED` on Linux, `getpeereid`'s
+/// PID equivalent elsewhere via `sysinfo`), so it names the process actually
+/// serving this connection rather than whatever the pid file claims.
+///
+/// # Errors
+/// Returns an error when the peer credentials cannot be read.
+pub fn connected_server_info(
+    stream: &tokio::net::UnixStream,
+) -> Result<ConnectedServerInfo, String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let cred = stream.peer_cred().map_err(|e| format!("failed to read server peer cred: {e}"))?;
+    let pid = cred.pid().ok_or_else(|| String::from("server peer cred carried no pid"))?;
+
+    let sys_pid = Pid::from(usize::try_from(pid).unwrap_or(0));
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sys_pid]),
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    );
+    let process = system.process(sys_pid);
+    Ok(ConnectedServerInfo {
+        pid,
+        exe_path: process.and_then(|proc| proc.exe()).map(Path::to_path_buf),
+        start_time_secs: process.map(sysinfo::Process::start_time),
+    })
+}
+
+/// The `scribe-server` binary installed next to this client executable.
+///
+/// The client and the server ship in the same package, so the sibling path is
+/// the installed server by construction — that is what a running server is held
+/// up against by [`stale_server_reason`].
+///
+/// # Errors
+/// Returns an error when this process's own executable path is unknown.
+pub fn installed_server_exe() -> Result<PathBuf, String> {
+    let client_exe =
+        std::env::current_exe().map_err(|e| format!("cannot resolve client exe: {e}"))?;
+    Ok(client_exe.with_file_name(current_identity().server_binary_name()))
+}
+
+/// Diagnose the server on the far end of a live connection.
+///
+/// Returns the human-readable staleness reason when the connected server no
+/// longer matches the installed binary, and `None` when it is current or the
+/// comparison cannot be made. Never fails the caller: a client that cannot read
+/// `/proc` still works, it just cannot warn.
+#[must_use]
+pub fn connected_server_staleness(stream: &tokio::net::UnixStream) -> Option<String> {
+    let installed = installed_server_exe()
+        .inspect_err(|error| tracing::debug!(%error, "cannot locate the installed server binary"))
+        .ok()?;
+    let running = connected_server_info(stream)
+        .inspect_err(|error| tracing::debug!(%error, "cannot inspect the connected server"))
+        .ok()?;
+    let installed_modified = file_modified_epoch_secs(&installed);
+    let reason = stale_server_reason(&running, &installed, installed_modified)?;
+    tracing::warn!(pid = running.pid, %reason, "connected scribe-server is stale");
+    Some(reason)
 }
 
 /// Poll the socket until it accepts a connection or `timeout` elapses.
@@ -353,5 +455,35 @@ mod tests {
         let info = running("/usr/bin/scribe-server", None);
         let reason = stale_server_reason(&info, Path::new("/usr/bin/scribe-server"), None);
         assert!(reason.is_none());
+    }
+
+    // @lat: [[test#Server lifecycle#Missing socket is named as no server]]
+    #[test]
+    fn missing_socket_is_reported_as_no_server() {
+        let error = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let reason = socket_failure_reason(Path::new("/run/user/1000/scribe/server.sock"), &error);
+        assert!(reason.contains("no server socket at /run/user/1000/scribe/server.sock"));
+        assert!(!reason.contains("stale"));
+    }
+
+    // @lat: [[test#Server lifecycle#Refused socket is named as stale]]
+    #[test]
+    fn refused_socket_is_reported_as_stale() {
+        let error = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let reason = socket_failure_reason(Path::new("/run/user/1000/scribe/server.sock"), &error);
+        assert!(reason.contains("stale server socket"));
+        assert!(reason.contains("nothing is listening"));
+    }
+
+    // @lat: [[test#Server lifecycle#Other connect failures keep the OS error]]
+    #[test]
+    fn other_connect_failures_keep_the_os_error() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let denied_reason = socket_failure_reason(Path::new("/tmp/s.sock"), &denied);
+        assert!(denied_reason.contains("no permission"));
+
+        let other = std::io::Error::other("boom");
+        let other_reason = socket_failure_reason(Path::new("/tmp/s.sock"), &other);
+        assert!(other_reason.contains("boom"));
     }
 }

@@ -460,6 +460,30 @@ Both scripts share `tests/e2e/visual/update-common.sh`, which grows the window f
 
 `update-trigger.sh` then presses Enter on the default "Update Now" and waits for the server's `client triggered update window_id=…` line — the server only logs that on receiving `TriggerUpdate` from that window — before capturing the CTA relabelled "Downloading..." and then "Update failed" as the server's real download and (deliberately invalid) signature check drive `UpdateProgress`. `update-dismiss.sh` Tabs onto "Later" instead, waits for `client dismissed update notification window_id=…`, and asserts the CTA band is once again pixel-identical to the no-update baseline.
 
+### Desktop notifications fire, coalesce, and focus on click
+
+`tests/e2e/visual/notifications.sh` (`just e2e-visual-notifications`) is the app-level oracle for [[client#GPUI Client Spike#GPUI Platform Integrations Port#GPUI Notification Dispatcher#Notification Wiring]]. The Bell parity row does not cover it: a bell reaches `Window::request_attention`, an entirely different mechanism.
+
+Nothing is stubbed on either side. `scribe-hook-helper` posts real provider hook events to the real server, which broadcasts `AiStateChanged` to the window; delivery lands on `tests/e2e/visual/notify-daemon.py`, an actual `org.freedesktop.Notifications` service claiming the well-known name on a session bus started by the entrypoint under `SCRIBE_NOTIFY=1`. A recorded `Notify` call is therefore proof the client's zbus dispatcher ran, and the service records every call to a JSONL file the script asserts against.
+
+Phase 1 minimizes the window (the lever on the default `when_unfocused` condition) and asserts a `Notify` arrives with `replaces_id = 0` and a summary naming the state. Phase 2 runs a second attention cycle on the same session and asserts the call carried `replaces_id` equal to the first id *and* that the service answered with that same id — the `replaces_id` contract, which a client that stacked toasts would fail. Phase 3 writes to the service's control FIFO to emit a real `ActionInvoked`, and asserts the client both reports the click and raises its window, observable from outside the process through `_NET_ACTIVE_WINDOW`. Phase 4 refocuses and asserts a further transition on the focused foreground pane fires nothing, which is what proves phase 1 was the gate opening rather than the path merely warming up.
+
+### Dropped file paths insert into the pane
+
+`tests/e2e/visual/drag-drop.sh` (`just e2e-visual-drag-drop`) is the app-level oracle for [[client#GPUI Client Spike#GPUI Platform Integrations Port#Drag-Drop Wiring]], driving a real XDND drag source against the running window.
+
+`xdotool` cannot do this: a file drop is not pointer input but the XDND protocol — a ClientMessage handshake plus an X selection transfer. `tests/e2e/visual/xdnd-drop.py` is a genuine drag source on the same X server: it owns `XdndSelection`, walks the client's X11 backend through `XdndEnter` / `XdndPosition` / `XdndDrop`, and answers the client's own `text/uri-list` selection conversion.
+
+The dropped path deliberately holds a space and a single quote, because surviving as ONE argument is the whole point of the ported quoting. The pane is parked at `cat` under the shared-pane rig, so the PTY echo is a byte-level oracle: phase 1 asserts `scribe-test wait-output` sees exactly the POSIX-quoted form, and phase 2 types a marker straight after the drop and asserts it arrives separated, which is the trailing space.
+
+### Server autostart and stale-socket diagnosis
+
+`tests/e2e/visual/server-lifecycle.sh` (`just e2e-visual-server-lifecycle`) is the app-level oracle for [[client#GPUI Client Spike#GPUI Platform Integrations Port#Server Lifecycle Wiring]]. The two halves are asserted separately because they fail separately.
+
+Phase 1 plants a bound-but-unlistened socket — exactly what a crashed server leaves, so `connect` gets `ECONNREFUSED` rather than `ENOENT` — with no `systemctl` on `PATH`, so the autostart cannot succeed and the diagnosis is what the client is left holding. It asserts the client names the stale socket, tries the autostart anyway, and carries the diagnosis into the status-line failure rather than reporting a bare exit code.
+
+Phase 2 replants the same stale socket and puts a `systemctl` shim on `PATH` that starts the real `scribe-server`. The shim stands in for the service manager only — systemd does not exist in a container — while the refused connect, the decision to start, the retry loop, the handshake and the mapped window are all the shipped code path. It asserts the client reaches `connected to scribe-server`, completes a `Welcome` handshake with the server it just started, and maps a painting window.
+
 ### Window chrome bands stay on screen
 
 `tests/e2e/visual/window-chrome-bands.sh` (`just e2e-visual-chrome-bands`) is the app-level oracle for [[client#GPUI Window Chrome Layout]]: it measures, on the running client, that the derived window size really does fit the whole terminal grid *and* every chrome band.
@@ -796,6 +820,18 @@ A running server at the same path that started after the installed binary's modi
 
 When neither the process start time nor the installed modification time is known, the server is treated as fresh rather than force-refreshed.
 
+### Missing socket is named as no server
+
+[[crates/scribe-client-gpui/src/server_lifecycle.rs#socket_failure_reason]] reports an absent socket file as "no scribe-server is running for this user" rather than as a stale one, because nothing was left behind to clean up.
+
+### Refused socket is named as stale
+
+A socket file that exists but refuses connections is reported as a stale socket left by a server that exited without unlinking it — the case that otherwise surfaces as a bare "connection refused".
+
+### Other connect failures keep the OS error
+
+Permission denied gets its own sentence, and any other `io::Error` is passed through verbatim so an unanticipated failure is not mislabelled as one of the two known shapes.
+
 ## GPUI OSC 52 Clipboard Bridge
 
 Unit coverage for the ported host clipboard bridge ([[client#GPUI Client Spike#GPUI Platform Integrations Port#GPUI Clipboard and OSC 52 Bridge]]): OSC 52 routing, the FR-019 focus gate, primary-selection read/write with AI cleanup, and reply-message construction.
@@ -907,6 +943,34 @@ When the daemon allocates a fresh id despite a non-zero `replaces` (the prior to
 ### Shutdown closes every live toast
 
 [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#live_ids]] enumerates every live id for the shutdown close-all and [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#clear]] empties the state afterward.
+
+## GPUI Notification Gate
+
+Unit coverage for the decision half of desktop notifications ([[client#GPUI Client Spike#GPUI Platform Integrations Port#GPUI Notification Dispatcher#Notification Wiring]]): which AI transitions earn a toast, which focus states suppress one, and the focus-on-activate fallback. The zbus delivery half is proven by the scripted E2E.
+
+### Processing to attention fires once
+
+[[crates/scribe-client-gpui/src/notifications.rs#NotificationCenter#on_ai_state_changed]] fires only on `Processing → attention`: a first observed state does not notify (nothing was processing before it) and sitting in the same attention state is not a new transition.
+
+### Non-attention states never fire
+
+`Processing` and `Error` are not attention states, so reaching them never produces a payload even under `NotifyCondition::Always`, while the following `Processing → PermissionPrompt` cycle still does.
+
+### Disabled notifications never fire
+
+With `enabled = false` the tracker still folds every transition in but produces no payload, so re-enabling it mid-session picks the state machine up where it left off instead of needing a fresh `Processing` cycle to re-seed.
+
+### Focus conditions gate delivery
+
+[[crates/scribe-client-gpui/src/notifications.rs#NotificationCenter#suppresses]] reproduces the winit gate over [[crates/scribe-client-gpui/src/notifications.rs#FocusPosition]]: `when_unfocused` suppresses any focused window, `when_unfocused_or_background_tab` suppresses only the focused foreground pane, and `always` suppresses nothing.
+
+### Pending focus is consumed once
+
+[[crates/scribe-client-gpui/src/notifications.rs#NotificationCenter#take_pending_focus]] yields the recently notified session exactly once, and [[crates/scribe-client-gpui/src/notifications.rs#NotificationCenter#remove]] clears it so an exited session cannot be focused by a late activation.
+
+### State labels name the attention state
+
+[[crates/scribe-client-gpui/src/notifications.rs#state_label]] maps the three attention states onto "Ready", "Waiting for input" and "Permission required", and degrades any other state to a generic "Attention" rather than failing to build a summary.
 
 ## GPUI Perf A/B Gate
 
