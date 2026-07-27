@@ -35,7 +35,16 @@ echo "PHASE 2 PASS: client closed"
 # --- Phase 3: Restart the client (reconnects to server) ---
 # The GPUI client renders through blade/Vulkan on the lavapipe software ICD
 # pinned by the image (VK_ICD_FILENAMES), so relaunch needs no GPU reset.
-scribe-client-gpui &
+#
+# The relaunched client MUST get its own log file and MUST be killed before this
+# script exits. A client that inherits the script's stdout and outlives it keeps
+# the harness's output plumbing open long after "PASS" is printed, which used to
+# wedge the container for the rest of its life: TEST_TIMEOUT governs the test
+# process, not whatever that process leaves running.
+CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
+scribe-client-gpui >>"$CLIENT_LOG" 2>&1 &
+RELAUNCHED_CLIENT_PID=$!
+trap 'kill "${RELAUNCHED_CLIENT_PID:-0}" 2>/dev/null || true' EXIT
 sleep 2
 
 # Wait for the window to appear and give it time to render the snapshot.
@@ -48,5 +57,21 @@ echo "PHASE 3 PASS: client restarted"
 # "BEFORE_DISCONNECT" and "visual-test-line-two" should be visible.
 capture_window /output/02-after-reconnect.png
 echo "PHASE 4 PASS: after-reconnect screenshot captured"
+
+# Tear the relaunched client down and wait for it to actually go, the same way
+# every other relaunching visual script ends. Leaving it running is what made
+# this test pass and then hang its container.
+# The check is on this pid, not on `pgrep scribe-client-gpui`: the client the
+# entrypoint launched survives phase 2's `windowclose` and is the entrypoint's
+# own APP_PID to reap.
+kill "$RELAUNCHED_CLIENT_PID" 2>/dev/null || true
+for _ in $(seq 1 40); do
+    kill -0 "$RELAUNCHED_CLIENT_PID" 2>/dev/null || break
+    sleep 0.25
+done
+if kill -0 "$RELAUNCHED_CLIENT_PID" 2>/dev/null; then
+    echo "WARNING: relaunched client ignored SIGTERM; killing it" >&2
+    kill -9 "$RELAUNCHED_CLIENT_PID" 2>/dev/null || true
+fi
 
 echo "PASS: visual reconnect test — compare 01-before.png and 02-after-reconnect.png in test-output/"
