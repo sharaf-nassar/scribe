@@ -328,6 +328,16 @@ The vi-mode phase asserts three things, because the mode is only correct if all 
 
 Split-scroll needs both halves of its gate, so the phase posts a real `state_changed` event through `scribe-hook-helper` to make the client believe the pane is a Claude Code session, then pages up and requires the reported `pin_rows` to be non-zero. Finally a right-click over a viewport filled with URLs must log `smart selection matched` naming the `URI` rule, which only the live context-menu path can write.
 
+### The wheel scrolls and mouse reports reach the PTY
+
+`tests/e2e/visual/mouse-reporting.sh` is the app-level oracle for [[client#GPUI Client Spike#GPUI Mouse Wheel And Reporting]]: the wheel over the terminal grid, and the X10 / SGR-1006 reports a mouse-tracking application receives.
+
+Both halves were invisible to every headless test. The crate contained no scroll-wheel handling at all, and `mouse_reporting.rs` was an unwired module with a green golden-byte suite — a suite that cannot tell a wired encoder from an unwired one, which is exactly how the pair survived to the launch gate. The run therefore uses the [[test#Visual E2E Tests#Shared-pane rig]] plus the [[crates/scribe-test/src/share_tap.rs#run]] wire tap (`SCRIBE_SHARE_TAP=1`), and asserts against three independent oracles: the client's own log lines, the recorded `KeyInput` bytes, and the pane's own screen.
+
+The third oracle is what makes the run end-to-end. Each tracking phase starts a real `cat -v` in the pane behind the DEC modes under test and a non-canonical, non-echoing line discipline, so every byte the client forwards is printed straight back onto the pane as visible text (`^[[<0;12;5M`) — proof that the report completed the client → server → PTY round trip rather than merely leaving the client. The daemon answers a snapshot request from its cached copy before replacing it with the one it just requested, so each screen read polls until the expected text appears.
+
+Phases 2 and 3 require a wheel notch to log `action=Scrollback` with `rows=3`, move the display offset off the live bottom, repaint the whole viewport, and walk back to offset 0 — the direction assertion is the point, since a client that scrolls the wrong way also logs and also repaints. Phase 4 has an application enable 1000 + 1006 and requires the *same* wheel to start logging `action=Report`. Phase 5 then requires button-64 and button-65 reports on the wire and on the pane, and requires the viewport *not* to move. Phase 6 asserts the button and modifier bits (left 0, right 2, ctrl +16), the matching release with its `m` terminator, and that two clicks 330 px apart report different cells — a constant would satisfy every other check. Phase 7 requires shift+click to reach no encoder at all, phase 8 requires DECRST 1006 to fall back to the six-byte X10 form, and phase 9 requires DECRST 1000 to give the wheel back to the scrollback.
+
 ### Font zoom re-lays the grid
 
 `tests/e2e/visual/terminal-zoom.sh` is the app-level oracle for the `zoom_in` / `zoom_out` / `zoom_reset` parity rows: it drives the three chords against the real window and asserts both what changed on screen and what left on the wire.
@@ -962,6 +972,7 @@ These suites run under `just test` (and the `Dockerfile.func` image's Rust toolc
 | Split-scroll | [[test#GPUI Split-Scroll]] | "Split-scroll live-bottom pin" AI-pane chrome |
 | Terminal viewport | [[test#GPUI Terminal Viewport]] | `scroll_up`/`scroll_down`/`scroll_top`/`scroll_bottom`, vi mode, smart selection reachability |
 | Font zoom | [[test#GPUI Font Zoom]] | "Zoom in/out/reset" View keybinding actions |
+| Mouse reporting | [[test#GPUI Mouse Reporting]] | "Mouse reporting (X10/SGR-1006, modes 1000/1002/1003)", mouse-wheel scrolling |
 | OSC 52 clipboard bridge | [[test#GPUI OSC 52 Clipboard Bridge]] | `ClipboardPromptResponse`, `ClipboardBridgeReadReply`, `ClipboardBridgeWrite`, `ClipboardBridgeReadRequest` OSC 52 bridge |
 | Notification dispatcher | [[test#GPUI Notification Dispatcher]] | Notification `replaces_id` coalescing + click-to-focus |
 | Terminal chrome metadata | [[test#GPUI Client Headless Suites#GPUI terminal chrome metadata]] | `CwdChanged`, `GitBranch`, `EnvStatus`, `SessionContextChanged`, `WorkspaceNamed` status-bar segments |
@@ -1479,6 +1490,36 @@ Toggling vi mode publishes a viewport-space cursor on the snapshot, a motion mov
 ### The jump chip is only hit while the pin is up
 
 [[crates/scribe-client-gpui/src/terminal_element.rs#hits_jump_chip]] re-derives the paint pass's split geometry and matches only points inside the docked chip, and matches nothing at all when there is no pin, so an unsplit grid passes every click through.
+
+## GPUI Mouse Reporting
+
+Golden byte-capture and decision tests for [[crates/scribe-client-gpui/src/mouse_reporting.rs]] — the X10 / SGR-1006 encoders against the captured legacy fixture, and the pure gates the live pointer path consults around them.
+
+The encoder half is the US1 correctness oracle described in [[client#Input#Mouse Reporting#GPUI Rebuild Golden Oracle]]. The decision half exists because the shell's event handlers hold no policy of their own: everything they branch on is one of the functions below, so a wrong branch is a failing unit test rather than a silent behaviour change nobody can see without a mouse.
+
+### Wheel routing orders its three consumers
+
+[[crates/scribe-client-gpui/src/mouse_reporting.rs#wheel_action]] gives the wheel to a mouse-tracking application first, on either screen buffer, and otherwise to the client's own scrollback.
+
+Mode-1007 cursor keys are the fallback only on the alternate screen with alternate scroll on — the winit client's priority order exactly.
+
+### Wheel deltas convert to signed rows
+
+[[crates/scribe-client-gpui/src/mouse_reporting.rs#wheel_lines]] passes GPUI's already-scaled `Lines` notch through as three rows and divides a trackpad's `Pixels` delta by the row height.
+
+Sub-row travel rounds to zero rather than to a phantom row, a degenerate row height drops the event entirely, and the sign inverts only when `natural_scroll` is on.
+
+### Alternate scroll sends one cursor key per row
+
+[[crates/scribe-client-gpui/src/mouse_reporting.rs#alternate_scroll_keys]] emits one CUU per row backwards and one CUD per row forwards, and nothing at all for a zero delta, so a pager under mode 1007 scrolls by the same amount the viewport would have.
+
+### Shift takes the pointer back from a tracking application
+
+[[crates/scribe-client-gpui/src/mouse_reporting.rs#MouseModes#forwards_buttons]] forwards a button event only while the application tracks the mouse and Shift is not held, so the universal text-selection override works inside vim and tmux and an untracking pane never forwards anything.
+
+### Scroll direction follows the signed row delta
+
+[[crates/scribe-client-gpui/src/mouse_reporting.rs#ScrollDirection#from_rows]] maps a positive row delta to button 64 and a negative one to button 65, and the resulting SGR sequences match the golden fixture's, so a wired wheel is byte-identical to the winit client's.
 
 ## GPUI Command Scrollbar
 

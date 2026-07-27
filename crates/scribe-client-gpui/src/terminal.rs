@@ -31,6 +31,7 @@ use alacritty_terminal_gpui::{
     index::{Column, Line},
     term::{Config, Osc52, Term, TermMode},
 };
+use scribe_client_gpui::mouse_reporting::{MotionReporting, MouseModes, MouseReportMode};
 use scribe_client_gpui::selection::{
     SelectionMode, SelectionPoint, SelectionSpan, SelectionState, viewport_spans,
 };
@@ -344,6 +345,35 @@ impl DisplayOnlyTerminal {
     #[must_use]
     pub fn bracketed_paste(&self) -> bool {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// The mouse-related DEC private modes this pane's application has enabled.
+    ///
+    /// `MOUSE_MODE` is a *union* of three bits (1000 / 1002 / 1003) that
+    /// alacritty stores mutually exclusively — each DECSET clears the union and
+    /// sets exactly one bit — so the tracking test has to be `intersects`;
+    /// `contains` would require all three and never match. Every other flag
+    /// here is a single bit and keeps `contains`.
+    #[must_use]
+    pub fn mouse_modes(&self) -> MouseModes {
+        let mode = self.term.mode();
+        let motion = if mode.contains(TermMode::MOUSE_MOTION) {
+            MotionReporting::Any
+        } else if mode.contains(TermMode::MOUSE_DRAG) {
+            MotionReporting::Drag
+        } else {
+            MotionReporting::None
+        };
+        MouseModes {
+            tracking: mode.intersects(TermMode::MOUSE_MODE).then_some(motion),
+            encoding: if mode.contains(TermMode::SGR_MOUSE) {
+                MouseReportMode::Sgr
+            } else {
+                MouseReportMode::X10
+            },
+            alt_screen: mode.contains(TermMode::ALT_SCREEN),
+            alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
+        }
     }
 
     /// Begin a mouse selection at a viewport cell with the given granularity.

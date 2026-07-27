@@ -19,9 +19,9 @@ use std::{
 
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Size, Subscription, Task, TitlebarOptions,
-    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions,
-    canvas, div, prelude::*, px, relative, size,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, Size, Subscription,
+    Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowOptions, canvas, div, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use scribe_client_gpui::ai_indicator::AiStateTracker;
@@ -58,6 +58,7 @@ use scribe_client_gpui::layout::{FocusDirection, PaneId, Rect, SplitDirection};
 use scribe_client_gpui::lost_control::{
     LostControlColors, LostControlState, ReclaimKey, lost_control_overlay,
 };
+use scribe_client_gpui::mouse_reporting::{self, MouseModes, ScrollDirection, WheelAction};
 use scribe_client_gpui::mouse_state::{ClickKind, MouseClickState};
 use scribe_client_gpui::opacity::{clamp_opacity, opaque_slot, surface};
 use scribe_client_gpui::paste::{PasteGate, PasteGateEvent, paste_chunks};
@@ -425,9 +426,21 @@ struct ClipboardSurfaces {
 
 /// Pointer state behind a selection gesture: the click-count classifier that
 /// picks cell / word / line granularity, and whether a drag is under way.
+///
+/// The two mouse-reporting fields sit beside them rather than inside `drag`, so
+/// forwarding a press to a mouse-tracking application leaves the client's own
+/// selection state untouched — exactly the separation the winit client kept
+/// between `mouse_selecting` and `mouse_report_button`.
 struct PointerState {
     clicks: MouseClickState,
     drag: GridDrag,
+    /// The button currently forwarded to the application, or `None` when no
+    /// forwarded press is outstanding. Mode 1002 gates drag motion on it, and
+    /// the reported Cb carries this exact button rather than a hardcoded Left.
+    report_button: Option<MouseButton>,
+    /// The cell the last motion report named, for xterm's "reported only if the
+    /// pointer has moved to a different character cell" de-duplication.
+    report_cell: Option<(u16, u16)>,
 }
 
 impl ClipboardSurfaces {
@@ -440,7 +453,12 @@ impl ClipboardSurfaces {
 
 impl Default for PointerState {
     fn default() -> Self {
-        Self { clicks: MouseClickState::new(), drag: GridDrag::Idle }
+        Self {
+            clicks: MouseClickState::new(),
+            drag: GridDrag::Idle,
+            report_button: None,
+            report_cell: None,
+        }
     }
 }
 
@@ -1706,6 +1724,181 @@ impl TerminalView {
     /// The focused pane's selection projected onto the painted viewport.
     fn selection_spans(&self) -> Vec<SelectionSpan> {
         self.with_focused_grid(|terminal| terminal.selection_spans()).unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
+    // Mouse reporting and the wheel
+    // -----------------------------------------------------------------------
+
+    /// The mouse-related DEC modes the focused pane's application has enabled.
+    ///
+    /// Defaults to "nothing enabled" with no pane attached, so every decision
+    /// below falls back to the client owning the pointer.
+    fn focused_mouse_modes(&self) -> MouseModes {
+        self.with_focused_grid(|terminal| terminal.mouse_modes()).unwrap_or_default()
+    }
+
+    /// The grid cell under `position` in the `(col, row)` viewport coordinates
+    /// a mouse report carries, or `None` when the pointer is off the grid.
+    fn report_cell(&self, position: Point<gpui::Pixels>) -> Option<(u16, u16)> {
+        let bounds = self.grid_bounds.get()?;
+        let cell = cell_at(bounds, &self.font, position)?;
+        Some((report_axis(cell.col), report_axis(cell.row)))
+    }
+
+    /// Send already-encoded application-bound bytes to the attached pane.
+    ///
+    /// Deliberately *not* [`Self::send_key_bytes`]: a mouse report is not a
+    /// keystroke, so it must neither snap a scrolled viewport back to the live
+    /// bottom nor dismiss an AI attention state. A live share viewer sends
+    /// nothing at all — the server drops its input anyway, and unlike a
+    /// keystroke there is no take-control affordance to raise for a mouse move.
+    fn send_pty_bytes(&self, kind: &'static str, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.shared.share.lock().is_ok_and(|share| share.is_viewer()) {
+            return;
+        }
+        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
+        else {
+            return;
+        };
+        // The escaped payload is the scripted E2E's oracle: it is the only way
+        // to tell a wired encoder from an unwired one without reading the wire.
+        tracing::info!(kind, bytes = %escape_report_bytes(&bytes), "mouse input forwarded");
+        if let Err(error) = self.sink.key_input(session_id, bytes, false) {
+            tracing::warn!(%error, kind, "dropped mouse input: IPC writer closed");
+        }
+    }
+
+    /// Forward a button press to a mouse-tracking application.
+    ///
+    /// Returns `true` when the application claimed the press, so the caller
+    /// leaves the client's own gesture — selection, primary-selection paste,
+    /// context menu — alone.
+    fn forward_mouse_press(&mut self, event: &MouseDownEvent) -> bool {
+        let modes = self.focused_mouse_modes();
+        if !modes.forwards_buttons(event.modifiers.shift) {
+            return false;
+        }
+        let Some((col, row)) = self.report_cell(event.position) else {
+            return false;
+        };
+        let bytes = mouse_reporting::encode_mouse_press(
+            event.button,
+            col,
+            row,
+            event.modifiers,
+            modes.encoding,
+        );
+        if bytes.is_empty() {
+            return false;
+        }
+        self.pointer.report_button = Some(event.button);
+        self.pointer.report_cell = Some((col, row));
+        self.send_pty_bytes("press", bytes);
+        true
+    }
+
+    /// Forward a button release to a mouse-tracking application.
+    ///
+    /// A physical button-up always ends the forwarded press, even when the
+    /// release itself cannot be forwarded (the application turned tracking off
+    /// mid-drag, or Shift is held now) — otherwise the next pointer move would
+    /// report a phantom drag with a button the user is no longer holding.
+    fn forward_mouse_release(&mut self, event: &MouseUpEvent) -> bool {
+        let modes = self.focused_mouse_modes();
+        let was_forwarded = self.pointer.report_button.take().is_some();
+        self.pointer.report_cell = None;
+        if !modes.forwards_buttons(event.modifiers.shift) {
+            return false;
+        }
+        let Some((col, row)) = self.report_cell(event.position) else {
+            return was_forwarded;
+        };
+        let bytes = mouse_reporting::encode_mouse_release(
+            event.button,
+            col,
+            row,
+            event.modifiers,
+            modes.encoding,
+        );
+        if bytes.is_empty() {
+            return was_forwarded;
+        }
+        self.send_pty_bytes("release", bytes);
+        true
+    }
+
+    /// Forward pointer motion to a mouse-tracking application.
+    ///
+    /// Returns `true` whenever the application owns the pointer, including for
+    /// the moves its motion level suppresses: mode 1000 reports nothing, but it
+    /// still must not hand the drag back to the client's selection.
+    fn forward_mouse_motion(&mut self, event: &MouseMoveEvent) -> bool {
+        let modes = self.focused_mouse_modes();
+        if !modes.forwards_buttons(event.modifiers.shift) {
+            return false;
+        }
+        let Some(cell) = self.report_cell(event.position) else {
+            return false;
+        };
+        let held = self.pointer.report_button;
+        if !mouse_reporting::should_report_mouse_motion(
+            modes.motion(),
+            held.is_some(),
+            cell,
+            self.pointer.report_cell,
+        ) {
+            return true;
+        }
+        self.pointer.report_cell = Some(cell);
+        let bytes = mouse_reporting::encode_mouse_motion(
+            cell.0,
+            cell.1,
+            held,
+            event.modifiers,
+            modes.encoding,
+        );
+        self.send_pty_bytes("motion", bytes);
+        true
+    }
+
+    /// Route one wheel event to whichever of the three consumers claims it.
+    ///
+    /// A mouse-tracking application gets a button 64 / 65 report, an alternate
+    /// screen that asked for alternate scroll (1007) gets cursor keys, and
+    /// anything else moves this client's own scrollback viewport.
+    fn scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let natural = self.config.config().config.terminal.scroll.natural_scroll;
+        let rows = mouse_reporting::wheel_lines(event.delta, self.font.line_height, natural);
+        if rows == 0 {
+            return;
+        }
+        let modes = self.focused_mouse_modes();
+        let action = mouse_reporting::wheel_action(modes);
+        tracing::info!(rows, ?action, "mouse wheel");
+        match action {
+            WheelAction::Report => {
+                let Some((col, row)) = self.report_cell(event.position) else {
+                    return;
+                };
+                let bytes = mouse_reporting::encode_mouse_scroll(
+                    ScrollDirection::from_rows(rows),
+                    col,
+                    row,
+                    event.modifiers,
+                    modes.encoding,
+                );
+                self.send_pty_bytes("scroll", bytes);
+            }
+            WheelAction::CursorKeys => {
+                let bytes = mouse_reporting::alternate_scroll_keys(rows);
+                self.send_pty_bytes("alternate-scroll", bytes);
+            }
+            WheelAction::Scrollback => self.scroll_terminal(Scroll::Delta(rows), cx),
+        }
     }
 
     /// Raise the LAN device-approval prompt the IPC reader parked, if any.
@@ -3827,6 +4020,30 @@ fn ai_tab_command(provider: AiProvider, resume: bool) -> Vec<String> {
     vec![shell, String::from("-lic"), command]
 }
 
+/// Narrow a viewport cell index to the `u16` axis a mouse report carries.
+///
+/// The protocol's own X10 form cannot address past 223 columns anyway, and the
+/// encoders clamp there themselves, so saturating at `u16::MAX` is a formality
+/// that keeps the conversion lossless-by-construction rather than a cast.
+fn report_axis(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+/// Render report bytes for the log with the control bytes escaped.
+///
+/// A mouse report is almost entirely unprintable, so the raw bytes would reach
+/// the log as invisible escape sequences that reprogram whatever terminal is
+/// tailing it. Escaping keeps the exact sequence assertable from a script.
+fn escape_report_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| match byte {
+            0x20..=0x7e => char::from(*byte).to_string(),
+            other => format!("\\x{other:02x}"),
+        })
+        .collect()
+}
+
 /// Keystroke encoder feeding the outbound [`IpcSink`] (see
 /// [`TerminalView::on_key_down`]).
 ///
@@ -4118,18 +4335,37 @@ impl TerminalView {
                     .size_full(),
             )
             .children(panes)
+            // The wheel is claimed by the application when it tracks the mouse,
+            // by the alternate screen's 1007 fallback, or — the ordinary case —
+            // by this client's own scrollback viewport.
+            .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _window, ctx| {
+                view.scroll_wheel(event, ctx);
+            }))
+            // Every button gesture below asks the mouse reporter first: an
+            // application that enabled tracking owns the pointer, and only when
+            // it declines (or Shift takes the pointer back) does the click mean
+            // selection / primary paste / context menu.
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
+                    if view.forward_mouse_press(event) {
+                        return;
+                    }
                     view.click_grid(event.position, ctx);
                 }),
             )
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _window, ctx| {
+                if view.forward_mouse_motion(event) {
+                    return;
+                }
                 view.extend_selection(event.position, ctx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|view, _event: &MouseUpEvent, _window, ctx| {
+                cx.listener(|view, event: &MouseUpEvent, _window, ctx| {
+                    if view.forward_mouse_release(event) {
+                        return;
+                    }
                     view.finish_selection(ctx);
                 }),
             )
@@ -4138,14 +4374,36 @@ impl TerminalView {
             // chord uses rather than straight to the PTY.
             .on_mouse_down(
                 MouseButton::Middle,
-                cx.listener(|view, _event: &MouseDownEvent, _window, ctx| {
+                cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
+                    if view.forward_mouse_press(event) {
+                        return;
+                    }
                     view.paste_primary(ctx);
                 }),
             )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
+                    if view.forward_mouse_press(event) {
+                        return;
+                    }
                     view.open_context_menu(event.position, ctx);
+                }),
+            )
+            // Middle and right releases exist only for the reporter: they carry
+            // no client-side gesture, but an application in mode 1002 needs the
+            // button-up that ends its drag, and the tracked button has to be
+            // dropped either way.
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|view, event: &MouseUpEvent, _window, _ctx| {
+                    view.forward_mouse_release(event);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|view, event: &MouseUpEvent, _window, _ctx| {
+                    view.forward_mouse_release(event);
                 }),
             )
             .into_any_element()

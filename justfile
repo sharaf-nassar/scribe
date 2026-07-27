@@ -201,6 +201,14 @@ e2e-visual-terminal-viewport:
 e2e-visual-terminal-zoom:
     docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/terminal-zoom.sh
 
+# Run the mouse-reporting E2E: the wheel over the grid, and the X10 / SGR-1006
+# reports a mouse-tracking application receives. Needs the shared-pane rig (a
+# real `cat -v` behind the DEC modes echoes the reports back), the wire tap
+# (the recorded `KeyInput` bytes are the byte-identical oracle), and a longer
+# budget than the default 60 s for its ten phases.
+e2e-visual-mouse-reporting:
+    docker run --rm --gpus all -e TEST_TIMEOUT=300 -e SCRIBE_SHARED_PANE=1 -e SCRIBE_SHARE_TAP=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/mouse-reporting.sh
+
 # Run the prompt-mark E2E: OSC 133 ingestion plus prompt_jump_up /
 # prompt_jump_down / jump_to_failure and the server's ScrollBottom snap, all
 # against the real window. Needs the shared-pane rig (so `scribe-test` writes

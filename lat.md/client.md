@@ -154,6 +154,20 @@ A zoom step therefore re-lays the grid, not just the glyphs: the pane geometry i
 
 Covered headlessly by [[test#GPUI Terminal Viewport]] and against the running app by [[test#Visual E2E Tests#Terminal viewport navigation]] and [[test#Visual E2E Tests#Font zoom re-lays the grid]].
 
+### GPUI Mouse Wheel And Reporting
+
+The grid band carries the pointer surfaces the running client had none of: a scroll-wheel listener, and the xterm mouse reporter every button gesture now asks before claiming the click for itself.
+
+The crate previously contained no wheel handling of any kind, and `mouse_reporting.rs` shipped with a green golden-byte suite and zero live callers — the two losses [[client#Input#Mouse Reporting#Live-Path Decisions]] now closes. [[crates/scribe-client-gpui/src/main.rs#TerminalView#scroll_wheel]] is the wheel's single entry point: it converts the event to rows, asks [[crates/scribe-client-gpui/src/mouse_reporting.rs#wheel_action]] who claims them, and then either encodes a button 64 / 65 report, sends the mode-1007 cursor keys, or moves the viewport through the same [[crates/scribe-client-gpui/src/main.rs#TerminalView#scroll_terminal]] the paging chords use.
+
+The button paths are a chain of first-refusal. [[crates/scribe-client-gpui/src/main.rs#TerminalView#forward_mouse_press]], [[crates/scribe-client-gpui/src/main.rs#TerminalView#forward_mouse_release]] and [[crates/scribe-client-gpui/src/main.rs#TerminalView#forward_mouse_motion]] each return whether the application claimed the event; only when they decline does the click mean selection, primary-selection paste, or the context menu. Middle and right releases exist purely for the reporter — they carry no client-side gesture, but a mode-1002 drag needs its button-up.
+
+The held button and the last reported cell live on `PointerState` beside the selection classifier rather than inside it, mirroring the winit split between `mouse_selecting` and `mouse_report_button`. A physical button-up always drops the tracked button, even when the release itself cannot be forwarded (tracking turned off mid-drag, or Shift held now), so the next pointer move cannot report a phantom drag.
+
+Reports go out through [[crates/scribe-client-gpui/src/main.rs#TerminalView#send_pty_bytes]], deliberately *not* the keystroke path: a mouse report must neither snap a scrolled viewport back to the live bottom nor dismiss an AI attention state, and a live share viewer sends nothing at all. Each forwarded payload is logged with its control bytes escaped, which is what lets a scripted run assert the exact sequence.
+
+Covered headlessly by [[test#GPUI Mouse Reporting]] and against the running app by [[test#Visual E2E Tests#The wheel scrolls and mouse reports reach the PTY]].
+
 ### Share And Control Handoff
 
 The feature-015 sharing surface is live in the GPUI shell: the reader mirrors the server's roster and control notices, the key path answers them, and the render pass draws the presence panel, the transient hint, and the modal grant/deny prompt.
@@ -1237,6 +1251,16 @@ It is also cleared on **focus and pane transitions** via [[crates/scribe-client/
 The motion gating and per-cell de-dup themselves live in the pure [[crates/scribe-client/src/mouse_reporting.rs#should_report_mouse_motion]]: it reports motion only when mode 1003 (`any_motion`) is set, or mode 1002 (`drag`) is set and a button is held, and only when the pointer has entered a different cell than `last_reported`. [[crates/scribe-client/src/main.rs#App#maybe_forward_mouse_motion]] supplies the live mode bits, the held-button flag, and `last_mouse_report_cell` to it.
 
 `last_mouse_report_cell` is intentionally seeded to the press cell when a press is forwarded (see [[crates/scribe-client/src/main.rs#App#finish_selection_mouse_press]] and the middle/right press arms). This deliberately suppresses the **first** same-cell motion event so the PTY is not flooded while the pointer sits on the press cell — matching alacritty's `cell_changed` semantics. It is not a bug: motion is reported only once the pointer crosses into a new cell.
+
+#### Live-Path Decisions
+
+The GPUI reporter owns the *decisions* around the encoders as pure functions too, so the shell's event handlers hold no policy of their own and the whole gate is unit-testable.
+
+[[crates/scribe-client-gpui/src/mouse_reporting.rs#MouseModes]] is the pane's mouse-related DEC private modes, read off the live `Term` once per event by [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#mouse_modes]] and then passed by value. Tracking and its motion level are one `Option<MotionReporting>` field rather than two, because a motion level means nothing while the application tracks the mouse not at all; the encoding is a [[crates/scribe-client-gpui/src/mouse_reporting.rs#MouseReportMode]] rather than an `sgr` flag, which also keeps the struct under the workspace's bool-count lint.
+
+[[crates/scribe-client-gpui/src/mouse_reporting.rs#MouseModes#forwards_buttons]] is the one gate every button path asks: an application that enabled tracking owns the pointer unless Shift is held, which is the universal override that lets a user still select text inside vim or tmux. [[crates/scribe-client-gpui/src/mouse_reporting.rs#wheel_action]] orders the three wheel consumers — a tracking application first, then the alternate screen's mode-1007 cursor-key fallback ([[crates/scribe-client-gpui/src/mouse_reporting.rs#alternate_scroll_keys]]), then this client's own scrollback — matching the winit client's priority exactly.
+
+[[crates/scribe-client-gpui/src/mouse_reporting.rs#wheel_lines]] converts one GPUI wheel event into signed terminal rows, positive meaning "backwards into the scrollback". GPUI already scales a notched wheel to three rows in its `ScrollDelta::Lines` form (the same factor the winit client multiplied in by hand), so that form passes through and only a trackpad's `ScrollDelta::Pixels` is divided by the row height. The platform sign is "positive `y` reveals the content above", which is traditional terminal behaviour, so `terminal.scroll.natural_scroll` — off by default — is the branch that inverts.
 
 ### Resize Coordination
 
