@@ -303,6 +303,12 @@ The first two were the prior gate's two failures and are now green.
   failures present as missing baselines rather than as a missing prerequisite.
   Re-running with `--scribe-test target/release/scribe-test --old-client
   target/release/scribe-client` produced all four baselines on the first try.
+  *Fixed by `scribe-38e.97`:* a `--live` run now runs a preflight before it
+  launches anything and aborts with the diagnosis when a named client binary
+  carries no `SCRIBE_PERF_PROBE` string or when `scribe-test` is unusable, and
+  the generated "Reproducing" section names `target/release/scribe-client` and
+  passes `--scribe-test`. `--startup-only` still accepts a probe-less binary,
+  because metric 1 has a documented startup-log fallback and opens no tabs.
 - **D3 — `func/cold-restart.sh` does not exercise the client.** It states
   plainly that "the daemon is the client stand-in", using `scribe-test daemon
   stop`/`start` for the cold quit and relaunch. It therefore passes while

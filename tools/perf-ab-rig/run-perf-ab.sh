@@ -46,10 +46,18 @@
 #   tools/perf-ab-rig/run-perf-ab.sh [--live] [--startup-only] [--out PATH]
 #       [--new-client PATH] [--old-client PATH] [--baseline PATH]
 #       [--record-baseline] [--samples N] [--firehose-mib N] [--tabs N]
+#       [--scribe-test PATH]
 #
 # --startup-only limits a --live run to metric 1 (no tabs are opened and no
 # keys are typed); metrics 2-5 report NOT-MEASURED. This is the fast loop for
 # the startup perf bead.
+#
+# A full --live run has two hard prerequisites, both checked up front and both
+# fatal rather than degraded (see `live_preflight`): the `scribe-test` helper
+# that seeds the session the client attaches to, and client binaries that
+# actually carry the shared probe. Point --scribe-test and the client flags at
+# binaries built from this tree; an installed client from an older release
+# predates the probe and cannot be measured.
 #
 set -euo pipefail
 
@@ -65,6 +73,10 @@ RECORD_BASELINE=0
 # Helper used to seed (and later close) the detached session the client attaches
 # to. Same binary the visual E2E entrypoint drives.
 SCRIBE_TEST_BIN="scribe-test"
+# Env var that arms the shared runtime probe. Its presence as a literal string
+# inside a client binary is what tells the rig that binary can be measured at
+# all; see `client_has_probe`.
+PROBE_ENV_KEY="SCRIBE_PERF_PROBE"
 
 # --- Q3 thresholds --------------------------------------------------------
 # Startup is a same-host A/B against the old client (re-scoped from the
@@ -117,7 +129,7 @@ while [[ $# -gt 0 ]]; do
     --firehose-mib) FIREHOSE_MIB="$2"; shift 2 ;;
     --tabs) MEMORY_TABS="$2"; shift 2 ;;
     --scribe-test) SCRIBE_TEST_BIN="$2"; shift 2 ;;
-    -h|--help) sed -n '2,53p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,61p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -142,6 +154,22 @@ MEASURED_TABS=""
 # --------------------------------------------------------------------------
 
 log() { echo "[perf-ab] $*" >&2; }
+
+# Abort the run with a diagnosis. Used only for conditions under which a --live
+# gate run cannot produce valid numbers at all, so that it fails loudly instead
+# of emitting a report full of NO-BASELINE rows that read as "nobody has
+# captured baselines yet" (bead scribe-38e.97).
+# The first argument is the headline; any further arguments are logged as
+# indented continuation lines so the remedy stays next to the diagnosis.
+die() {
+  log "fatal: $1"
+  shift
+  local line
+  for line in "$@"; do
+    log "       $line"
+  done
+  exit 3
+}
 
 # Compare two numbers with awk (float-safe). Args: a op b -> exit 0 when true.
 float_cmp() {
@@ -262,6 +290,72 @@ live_blocker() {
   local socket="/run/user/$(id -u)/scribe/server.sock"
   [[ -S "$socket" ]] || { echo "no running server at ${socket} to attach to."; return; }
   echo ""
+}
+
+# True when a client binary carries the shared runtime probe.
+#
+# The probe is armed through an environment variable, so its name is a literal
+# string in any binary that links `crates/scribe-common/src/perf_probe.rs`. A
+# client built before that landed — notably an installed `/usr/bin/scribe-client`
+# from an older release — simply never writes a probe report, and every rig wait
+# that keys off the report file then burns its full timeout.
+client_has_probe() {
+  local bin="$1"
+  [[ -r "$bin" ]] || return 1
+  grep -qa -- "$PROBE_ENV_KEY" "$bin" 2>/dev/null
+}
+
+# Fatal preflight for a --live run, checked before any client is launched.
+#
+# Both conditions here used to degrade silently: a missing `scribe-test` logged
+# "continuing without a seeded session" and left the client with no workspace to
+# open tabs in, and a probe-less client binary was only noticed 30 s later as
+# "never reached a first frame". Either way the three workload metrics came out
+# NO-BASELINE, which reads as "no baselines have been captured yet" rather than
+# "the run was handed inputs it cannot measure" — the misdiagnosis that cost two
+# full gate runs in scribe-38e.42. A launch gate that cannot produce valid
+# numbers now says so and stops.
+live_preflight() {
+  local bin label
+  for label in new old; do
+    if [[ "$label" == new ]]; then bin="$NEW_CLIENT"; else bin="$OLD_CLIENT"; fi
+    [[ -n "$bin" ]] || continue
+    [[ -x "$bin" ]] || die \
+      "--${label}-client ${bin} is not an executable file." \
+      "Build it from this tree, e.g. \`cargo build --release\`, and pass the" \
+      "path under target/release."
+    client_has_probe "$bin" && continue
+    # Metric 1 has a documented fallback to the startup-log method for a
+    # probe-less binary, so a --startup-only run stays valid; metrics 2-4 have
+    # no fallback and would time out instead.
+    if [[ "$STARTUP_ONLY" -eq 1 ]]; then
+      log "--${label}-client ${bin} carries no ${PROBE_ENV_KEY}; startup will fall back to its startup log"
+      continue
+    fi
+    die \
+      "--${label}-client ${bin} was built without the shared perf probe: the" \
+      "binary contains no ${PROBE_ENV_KEY} string, so it can never write a probe" \
+      "report and the input-latency, firehose and memory workloads would each" \
+      "time out as \"never reached a first frame\"." \
+      "Pass a client built from this tree, e.g." \
+      "--${label}-client target/release/scribe-client, or re-run with" \
+      "--startup-only, whose startup-log fallback does not need the probe."
+  done
+
+  # Startup-only runs open no tabs, so they need no seeded session.
+  [[ "$STARTUP_ONLY" -eq 0 ]] || return 0
+
+  command -v "$SCRIBE_TEST_BIN" >/dev/null 2>&1 || die \
+    "no usable ${SCRIBE_TEST_BIN}: the rig needs it to seed the detached session" \
+    "the client attaches to, and without a workspace both clients refuse to open" \
+    "a tab, leaving every workload metric unmeasurable." \
+    "Pass --scribe-test target/release/scribe-test (build it with" \
+    "\`cargo build --release -p scribe-test\`), or re-run with --startup-only," \
+    "which opens no tabs."
+  seed_session || die \
+    "${SCRIBE_TEST_BIN} could not seed a session for the client to attach to." \
+    "Check that the server socket is healthy and re-run; --startup-only skips" \
+    "this step entirely."
 }
 
 # The X11 window id owned by $CLIENT_PID, or empty.
@@ -958,10 +1052,12 @@ emit_report() {
   if [[ "$MODE" == "live" ]]; then
     LIVE_BLOCKER="$(live_blocker)"
     if [[ -n "$LIVE_BLOCKER" ]]; then
+      # An environment that cannot host a GUI client at all (CI, no server) is
+      # reported as NOT-MEASURED rather than being fatal; unusable *inputs* are
+      # fatal, and that is what live_preflight checks.
       log "live mode blocked: $LIVE_BLOCKER"
-    elif [[ "$STARTUP_ONLY" -eq 0 ]]; then
-      # Startup-only runs open no tabs, so they need no seeded session.
-      seed_session || log "continuing without a seeded session"
+    else
+      live_preflight
     fi
   else
     LIVE_BLOCKER="assess mode never launches a GUI; re-run with --live."
@@ -1059,10 +1155,17 @@ server, never restarts it):
 
     tools/perf-ab-rig/run-perf-ab.sh --live \\
       --new-client target/release/scribe-client-gpui \\
-      --old-client /usr/bin/scribe-client --record-baseline
+      --old-client target/release/scribe-client \\
+      --scribe-test target/release/scribe-test --record-baseline
+
+Every binary above must come from this tree. The installed
+\`/usr/bin/scribe-client\` predates the shared probe and can never write a probe
+report, so a run pointed at it aborts in the preflight instead of timing out
+each workload; \`scribe-test\` seeds the session the client attaches to and a
+full \`--live\` run refuses to start without it.
 
 Both clients are instrumented by the shared runtime probe
-(\`crates/scribe-common/src/perf_probe.rs\`), armed by \`SCRIBE_PERF_PROBE\`;
+(\`crates/scribe-common/src/perf_probe.rs\`), armed by \`${PROBE_ENV_KEY}\`;
 the GPUI client additionally writes the first-frame marker named by
 \`SCRIBE_GPUI_STARTUP_TIMING\`. Every typing workload runs in a tab the rig
 opened and verified through the probe's session list, so it never types into a
