@@ -10,12 +10,13 @@
 
 use std::collections::BTreeMap;
 
-use gpui::{Modifiers, MouseButton};
+use gpui::{Modifiers, MouseButton, ScrollDelta, point, px};
 use serde::Deserialize;
 
 use super::{
-    MotionReporting, MouseReportMode, ScrollDirection, encode_mouse_motion, encode_mouse_press,
-    encode_mouse_release, encode_mouse_scroll, should_report_mouse_motion,
+    MotionReporting, MouseModes, MouseReportMode, ScrollDirection, WheelAction,
+    alternate_scroll_keys, encode_mouse_motion, encode_mouse_press, encode_mouse_release,
+    encode_mouse_scroll, should_report_mouse_motion, wheel_action, wheel_lines,
 };
 
 #[derive(Deserialize)]
@@ -141,4 +142,85 @@ fn mouse_motion_gate_matches_golden_fixtures() {
             "mode {mode} held={button_held} cell_changed={cell_changed}: expected report={expected}"
         );
     }
+}
+
+/// Modes with mouse tracking on at the given motion level and SGR encoding.
+fn tracking(motion: MotionReporting) -> MouseModes {
+    MouseModes { tracking: Some(motion), encoding: MouseReportMode::Sgr, ..MouseModes::default() }
+}
+
+// @lat: [[client#Input#Mouse Reporting#Live-Path Decisions]]
+#[test]
+fn wheel_action_orders_its_three_consumers() {
+    // Mouse tracking wins outright, on either screen buffer.
+    assert_eq!(wheel_action(tracking(MotionReporting::None)), WheelAction::Report);
+    let alt_tracking =
+        MouseModes { alt_screen: true, alternate_scroll: true, ..tracking(MotionReporting::Any) };
+    assert_eq!(wheel_action(alt_tracking), WheelAction::Report);
+
+    // Alternate scroll is the alternate screen's fallback, and only there.
+    let alt_scroll =
+        MouseModes { alt_screen: true, alternate_scroll: true, ..MouseModes::default() };
+    assert_eq!(wheel_action(alt_scroll), WheelAction::CursorKeys);
+    assert_eq!(
+        wheel_action(MouseModes { alt_screen: false, ..alt_scroll }),
+        WheelAction::Scrollback
+    );
+    assert_eq!(
+        wheel_action(MouseModes { alternate_scroll: false, ..alt_scroll }),
+        WheelAction::Scrollback
+    );
+
+    // Nothing enabled at all is the ordinary shell prompt.
+    assert_eq!(wheel_action(MouseModes::default()), WheelAction::Scrollback);
+}
+
+#[test]
+fn wheel_lines_reads_both_delta_forms_and_honours_natural_scroll() {
+    // GPUI already scales a notch to three rows, so the line form passes
+    // through. Traditional (the default) keeps the platform sign, where a
+    // wheel-up notch is positive and walks into the scrollback.
+    let notch_up = ScrollDelta::Lines(point(0.0, 3.0));
+    let notch_down = ScrollDelta::Lines(point(0.0, -3.0));
+    assert_eq!(wheel_lines(notch_up, 18.0, false), 3);
+    assert_eq!(wheel_lines(notch_down, 18.0, false), -3);
+    assert_eq!(wheel_lines(notch_up, 18.0, true), -3);
+
+    // A trackpad's pixel delta is divided by the row height and rounded.
+    assert_eq!(wheel_lines(ScrollDelta::Pixels(point(px(0.0), px(36.0))), 18.0, false), 2);
+    assert_eq!(wheel_lines(ScrollDelta::Pixels(point(px(0.0), px(-45.0))), 18.0, false), -3);
+    // Sub-row travel rounds to nothing rather than to a phantom row.
+    assert_eq!(wheel_lines(ScrollDelta::Pixels(point(px(0.0), px(4.0))), 18.0, false), 0);
+    // A degenerate row height cannot divide, so the event is dropped.
+    assert_eq!(wheel_lines(ScrollDelta::Pixels(point(px(0.0), px(36.0))), 0.0, false), 0);
+}
+
+#[test]
+fn alternate_scroll_sends_one_cursor_key_per_row() {
+    assert_eq!(alternate_scroll_keys(2), b"\x1b[A\x1b[A".to_vec());
+    assert_eq!(alternate_scroll_keys(-3), b"\x1b[B\x1b[B\x1b[B".to_vec());
+    assert_eq!(alternate_scroll_keys(0), Vec::<u8>::new());
+}
+
+#[test]
+fn shift_takes_the_pointer_back_from_a_tracking_application() {
+    let modes = tracking(MotionReporting::Any);
+    assert!(modes.forwards_buttons(false));
+    assert!(!modes.forwards_buttons(true));
+    // With no tracking at all the pointer is always the client's.
+    assert!(!MouseModes::default().forwards_buttons(false));
+}
+
+#[test]
+fn scroll_direction_follows_the_signed_row_delta() {
+    assert!(matches!(ScrollDirection::from_rows(3), ScrollDirection::Up));
+    assert!(matches!(ScrollDirection::from_rows(-3), ScrollDirection::Down));
+    // The encoding of each direction is the golden fixture's, so a wired wheel
+    // is byte-identical to the winit client's.
+    let up =
+        encode_mouse_scroll(ScrollDirection::from_rows(1), 0, 0, no_mods(), MouseReportMode::Sgr);
+    assert_eq!(up, b"\x1b[<64;1;1M".to_vec());
+    let down =
+        encode_mouse_scroll(ScrollDirection::from_rows(-1), 0, 0, no_mods(), MouseReportMode::Sgr);
+    assert_eq!(down, b"\x1b[<65;1;1M".to_vec());
 }
