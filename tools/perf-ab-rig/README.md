@@ -14,11 +14,12 @@ pass/fail verdict.
 | Input latency | no worse than old client | shared probe: median key to PTY-echo round trip |
 | cat-firehose throughput | no worse than old client | shared probe: bytes drained per second while `cat`ting a 32 MiB file |
 | Memory at 10 tabs | `<= old + 20%` | `/proc/<pid>/status` `VmRSS` once the probe reports 10 sessions |
-| Scroll | sustained 60 fps, `< 1%` dropped | shared probe: frame count and frame-gap drop accounting over a driven scroll |
+| Scroll | sustained 60 fps, `< 1%` dropped | shared probe: frame count and frame-gap drop accounting while an unpaced writer scrolls the grid; measured on both clients |
 
 "No worse than the old client" is enforced with a 10% run-to-run noise
 allowance, which is the repeatability of these measurements on a loaded
-desktop, not extra headroom.
+desktop, not extra headroom. Scroll is the one absolute threshold, so the old
+client's number there is attribution rather than a comparison input.
 
 The startup threshold was re-scoped on 2026-07-24 from the original
 `<= 500 ms` absolute budget (spec.md "Q3 re-scope" records the decision).
@@ -47,6 +48,14 @@ Because the counters are cumulative, the rig derives a per-workload number by
 reading the file before and after a workload and dividing the deltas, so the
 client needs no window bookkeeping.
 
+The report is only rewritten when the client paints or drains PTY bytes, which
+makes `uptime_ms` a stamp of the client's last activity rather than of now. A
+before-snapshot taken while the client is quiet therefore names a moment
+arbitrarily far in the past, and the window derived from it is that much too
+long. The scroll workload is the one that waits for its workload to settle, so
+it waits for a rewrite before it snapshots; see
+[The scroll metric measures the renderer, not the rig](#the-scroll-metric-measures-the-renderer-not-the-rig).
+
 ## Modes
 
 - **assess** (default): generates the current-state report from the committed
@@ -57,6 +66,29 @@ client needs no window bookkeeping.
   machine/session, drives every workload with `xdotool`, captures the numbers,
   and enforces the thresholds. It attaches to the already-running server and
   **never restarts it**.
+
+`--startup-only` and `--scroll-only` each limit a `--live` run to one metric;
+the others report `NOT-MEASURED`. They are the fast iteration loops for the
+startup and scroll perf beads.
+
+## Live mode never drives the stable server
+
+A live run seeds sessions, opens ten tabs, types shell commands into them and
+types `exit` to close them again. Against the stable install all of that lands
+in whatever terminal the developer is actually using, so the rig runs against
+the isolated `scribe-dev` install instead, and `--live` refuses to start when
+that server is not up.
+
+Scribe derives its whole runtime identity from the running executable's file
+stem (`AppIdentity::detect_from_path` in `crates/scribe-common/src/app.rs`): a
+binary named `scribe-dev` uses `/run/user/<uid>/scribe-dev/server.sock`,
+`~/.config/scribe-dev` and `~/.local/state/scribe-dev`; anything else uses the
+stable slug. There is no environment override, so the rig copies every binary it
+launches — both clients and `scribe-test` — into its work directory under that
+name and runs the copies. The copies are byte-identical to the binaries passed
+in, so the numbers still describe the binaries under test.
+
+Install and start the dev server once with `just install-dev`.
 
 ## Live-mode prerequisites
 
@@ -102,21 +134,18 @@ watched itself create.
 ## Driving input
 
 Three `xdotool` details are load-bearing, each established empirically after it
-silently zeroed a metric:
+silently corrupted a metric rather than failing:
 
 - **Enter is always its own key event.** `xdotool type` does not deliver a
   trailing newline as `Return` to either client — the command line echoes and
   then sits there unexecuted — so every command goes out as `type` followed by
   `key Return`. Without this the firehose and scroll workloads silently measure
   nothing.
-- **The pager is advanced with `space`, not PageDown.** `space` is `less`'s
-  canonical page-forward key and a plain printable character both clients
-  encode through their simplest path, so the scroll metric measures paint
-  rather than key encoding. This started as a workaround: a synthetic `Next`
-  was dropped between the X event and the PTY on the GPUI client, scoring the
-  workload as "the client painted nothing". `scribe-38e.84` fixed that by
-  wiring the ported encoder into the live key path, but `space` stays the drive
-  key because it depends on the least machinery.
+- **Synthetic keys cannot pace a frame-rate workload.** `xdotool` delivers about
+  one key per 21 ms on the reference host regardless of `--repeat-delay`, so any
+  metric whose unit of work is one keystroke is capped at ~47 Hz. That is why
+  the scroll workload no longer types at all; see
+  [The scroll metric measures the renderer, not the rig](#the-scroll-metric-measures-the-renderer-not-the-rig).
 - **Key delivery falls back.** The rig prefers window-targeted synthetic events
   (`xdotool key --window`) because a stray keystroke then cannot escape into
   another application. A toolkit that reads keys through XInput2 ignores those
@@ -129,6 +158,39 @@ synthetic keys. A bare `Xvfb` with no window manager is not sufficient for the
 old client: it advertises no `_NET_ACTIVE_WINDOW`, and the winit-based client
 receives neither delivery mode there, so its half of the A/B reports
 `NOT-MEASURED`. Run the gate on a window-managed display.
+
+## The scroll metric measures the renderer, not the rig
+
+Metric 5 used to run on the new client only and read `29 fps, 14% dropped`
+against a 60 fps target, with no way to tell a paint-path regression from a
+target the workload could not reach. Bead `scribe-38e.91` added the old-client
+arm; the comparison showed the old client pinned at the same ceiling, and both
+halves of the shortfall turned out to be in the rig.
+
+**The window was inflated by the client's own idle.** It is derived from the
+probe's `uptime_ms` stamps, and the report is only rewritten when the client
+paints or drains PTY bytes — so after the wait for the workload to settle, a
+client that had gone quiet still carried the stamp from whenever it last drew.
+The frame counts were right and the elapsed time was seconds too long, which
+understated every fps by roughly 45%, and understated it *most* for the client
+that idles best: the GPUI client stops painting entirely and its report went
+4.1 s stale, while the old client kept draining bytes and its went 0.5 s stale.
+The A/B read that difference as a paint-path regression. The rig now waits for
+the report to be rewritten before it opens the window, so both edges name a
+moment the client was busy.
+
+**The workload could not ask for 60 fps.** It paged `less` with synthetic
+`space` events, and each page-forward produces exactly one repaint — so the
+measured frame rate was the rate at which `xdotool` could deliver synthetic
+keys. That is 21 ms per key on the reference host (60 keys with
+`--repeat-delay 8` take 1262 ms, not 480 ms), a hard ceiling of ~47 fps against
+a 60 fps target, and *both* clients sat on it: a steady 21 ms between painted
+frames at 5-10% CPU. Driving the scroll from an unpaced writer inside the pane
+instead removes the rig from the loop, and the GPUI client then sustains 60 fps
+with no dropped frames.
+
+The threshold never needed re-scoping — see `perf-baseline.md` for the numbers
+that establish it is both reachable and not free.
 
 ## Usage
 

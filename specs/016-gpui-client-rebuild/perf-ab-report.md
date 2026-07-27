@@ -5,6 +5,14 @@ This is the launch-blocking performance comparison for the GPUI client rebuild
 (beads scribe-38e.41 / scribe-38e.51), gating cutover in the launch go/no-go
 (scribe-38e.42).
 
+The **scroll** row and its per-metric detail were replaced later the same day
+from a `--live --scroll-only --record-baseline` re-run under bead
+`scribe-38e.91`, which fixed two defects in how the rig measured that metric —
+see `perf-baseline.md`, "the scroll metric was measuring the rig". The other
+four rows are as the `scribe-38e.42` gate run produced them, and the overall
+verdict is unchanged because input latency still fails. The next full `--live`
+run regenerates the whole file.
+
 ## Thresholds (Clarification Q3, startup re-scoped 2026-07-24)
 
 | Metric | Threshold |
@@ -34,7 +42,7 @@ re-measures them with the same probe in the same session, and
 | Input latency (p50 echo) | 0.209 ms | 0.032 ms | FAIL |
 | cat-firehose throughput | 17.623 MiB/s | 0.232 MiB/s | PASS |
 | Memory at 10 tabs | 237.934 MiB | 465.738 MiB | PASS |
-| Scroll fps / dropped frames | 29.364 fps, 13.592% dropped | n/a (absolute target) | FAIL |
+| Scroll fps / dropped frames | 60.064 fps, 0.000% dropped | 41.480 fps, 8.101% dropped | PASS |
 
 **Overall gate verdict: FAIL.** `PASS` requires all five metrics
 measured and inside their thresholds. `INCOMPLETE` means at least one metric
@@ -56,8 +64,8 @@ Sustained bytes/sec the client drains while `cat`ting a 32 MiB file in a rig-own
 ### Memory at 10 tabs -- PASS
 Steady-state VmRSS from /proc once the rig has opened tabs up to 10, sampled identically for both clients. PASS when the new RSS is at most old + 20%. Reached 10 tabs.
 
-### Scroll fps / dropped frames -- FAIL
-Sustained paging driven for 8s inside the pane (`seq | less` advanced with synthetic `space`), so the workload is identical on both clients and independent of client-side scrollback bindings; fps and dropped frames come from the shared probe's frame-gap accounting. PASS at sustained 60 fps (within 10%) with < 1% dropped.
+### Scroll fps / dropped frames -- PASS
+The grid is scrolled for 8s by an unpaced writer running inside a rig-owned pane (`seq 1 100000000`, measured after a 2s settle), so the workload is identical on both clients, independent of client-side scrollback bindings, and paced by nothing between the shell and the renderer; fps and dropped frames come from the shared probe's frame-gap accounting over that window. PASS at sustained 60 fps (within 10%) with < 1% dropped. The old client's number is the attribution for a failure, not a threshold: the target is absolute.
 
 ## Reproducing
 
