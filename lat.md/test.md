@@ -380,6 +380,20 @@ The expected landing rows are read back out of the client's own `prompt mark rec
 
 The final phase scrolls away from the bottom, then arms the pane as an AI session and emits a real ED 3 so the server suppresses it and sends `ScrollBottom`. The snap is asserted twice: the client logs it with `moved=true`, and a following `scroll_bottom` chord must report `moved=false offset=0`, which is the only way to show the viewport genuinely ended at the live tail.
 
+### The command-mark scrollbar paints its thumb and ticks
+
+`tests/e2e/visual/scrollbar.sh` is the app-level oracle for [[client#GPUI Client Spike#GPUI Command-Mark Scrollbar]]: the overlay thumb, its success/failure command ticks, the shift a scrollback trim causes, and the idle fade.
+
+None of that reached a pixel before, because `scrollbar.rs` shipped with a green unit suite and no caller at all.
+
+Every assertion is made in a 24 px strip cropped from the pane's right edge, which is the only region the overlay writes into. It runs on the [[test#Visual E2E Tests#Shared-pane rig]] so a real shell writes the OSC 133 bytes into the very pane being measured, and the filler rows are kept short so no glyph ever reaches the strip.
+
+Hover is what makes the run deterministic instead of a race: parking the pointer in the hit zone pins the overlay fully opaque and clears the idle timer, so the strip can be captured and compared without the 1.5 s delay expiring between screenshots. The control is a rested capture taken twice with the pointer parked away from the edge; it must be byte-identical to itself, or a later "the thumb painted" diff would prove nothing.
+
+The ticks are asserted by hue rather than by position: a pixel counts as a success tick when its green channel leads the other two, and as a failure tick when its red does. A strip holding both is what separates a wired paint path from one that renders neutral marks, because it also requires the OSC 133 `A` → `D` exit codes to have been resolved.
+
+The trim phase drives the server's real AI path — arm the pane with `ScribeAiLaunch`, emit an ED 3 to set the preserved-scrollback baseline, grow the history with plain output, then emit a second ED 3. The filler between the two carries no OSC 133 deliberately: a `PromptStart` tells the server the AI tool exited, which clears the provider and the baseline with it, and the second ED 3 would never be filtered. The trim is then asserted twice over — the client logs the rows its own grid dropped and how many marks survived, and the topmost success tick has to sit on a different row than before.
+
 ### Subscribe and snapshot session tooling
 
 `tests/e2e/visual/session-tooling.sh` is the app-level oracle for the `Subscribe` and `RequestSnapshot` parity rows: it drives the real client against the real server and asserts both frames on the wire at the lifecycle points that produce them.
@@ -1617,6 +1631,12 @@ These are the reachability tests for [[client#GPUI Client Spike#GPUI Terminal Vi
 
 [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#prompt_anchor]] reports the history size, screen height, and cursor cell a mark is anchored by, [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#viewport_top_abs]] names the viewport's top row in the same absolute space, and [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#scroll_to_abs]] lands on a given row, reporting no movement when it is already there.
 
+### Scrollback trim drops rows and shifts marks
+
+[[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#trim_history]] really removes the display grid's oldest rows and reports the drop, and [[crates/scribe-client-gpui/src/session_lifecycle.rs#PromptMarks#on_trim]] applies it to the marks.
+
+The surviving top row is the one after the cut rather than a renumbered original, anchors below the cut shift down, anchors inside it are retired, and a trim that keeps everything the grid already holds is a no-op.
+
 ### Split-scroll pins the live rows under the scrollback
 
 With the eligibility gate open, [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#set_split_scroll_eligibility]] makes the snapshot's trailing rows read the live screen anchored on the shell cursor while the rows above stay at the scrolled offset; closing the gate restores one contiguous region.
@@ -1676,6 +1696,8 @@ Sub-row travel rounds to zero rather than to a phantom row, a degenerate row hei
 ## GPUI Command Scrollbar
 
 Covers the bespoke command-mark scrollbar in [[crates/scribe-client-gpui/src/scrollbar.rs#build_scrollbar_render]] — thumb geometry, fade/hover-widen animation, click/drag scroll math, and command-status tick placement with trim-shift — the renderer-independent core the GPUI paint path lowers onto quads.
+
+The running client's use of that core is asserted separately, in [[test#Visual E2E Tests#The command-mark scrollbar paints its thumb and ticks]].
 
 ### No scrollback yields no thumb
 

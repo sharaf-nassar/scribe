@@ -55,11 +55,12 @@ pub const BATCH_WINDOW: Duration = Duration::from_millis(4);
 /// decompression and snapshot-to-ANSI conversion happen off the drain and
 /// coalescing only ever concatenates bytes.
 ///
-/// The two non-output variants are here rather than applied straight from the
-/// reader because both are *positional*: an OSC 133 mark names the row the
-/// cursor is on and a suppressed-ED-3 `ScrollBottom` names the moment the
-/// viewport must snap. The server emits each of them after the `PtyOutput`
-/// chunk that moved the cursor, and the reader forwards messages in arrival
+/// The three non-output variants are here rather than applied straight from the
+/// reader because all of them are *positional*: an OSC 133 mark names the row
+/// the cursor is on, a suppressed-ED-3 `ScrollBottom` names the moment the
+/// viewport must snap, and a `TrimScrollback` names a scrollback size measured
+/// after a particular chunk. The server emits each of them after the
+/// `PtyOutput` chunk they describe, and the reader forwards messages in arrival
 /// order, so routing them down the same FIFO is what makes them land against a
 /// grid that already holds the output they describe.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +74,9 @@ pub enum InboundEvent {
     /// The server suppressed an ED 3 for the named pane, so its viewport must
     /// snap to the live bottom the way a real ED 3 would have left it.
     ScrollBottom { session_id: SessionId },
+    /// The server trimmed the named pane's scrollback back to `kept_rows`, so
+    /// the display grid has to drop the same oldest rows.
+    TrimScrollback { session_id: SessionId, kept_rows: usize },
 }
 
 /// One operation a drained batch applies to a pane, in arrival order.
@@ -85,6 +89,9 @@ pub enum PaneOp {
     PromptMark { kind: PromptMarkKind, exit_code: Option<i32> },
     /// Snap the pane's viewport to the live bottom.
     ScrollBottom,
+    /// Drop the pane's oldest scrollback rows until `kept_rows` remain, and
+    /// shift every surviving absolute-row anchor by however many went.
+    TrimScrollback { kept_rows: usize },
 }
 
 /// A drained, per-pane-collapsed batch. A pane's consecutive output runs are
@@ -140,6 +147,10 @@ pub fn coalesce(events: impl IntoIterator<Item = InboundEvent>) -> CoalescedBatc
             InboundEvent::ScrollBottom { session_id } => {
                 open.remove(&session_id);
                 entries.push((session_id, PaneOp::ScrollBottom));
+            }
+            InboundEvent::TrimScrollback { session_id, kept_rows } => {
+                open.remove(&session_id);
+                entries.push((session_id, PaneOp::TrimScrollback { kept_rows }));
             }
         }
     }
@@ -706,7 +717,9 @@ mod tests {
                     .into_iter()
                     .filter_map(|(id, op)| match op {
                         PaneOp::Output(bytes) => Some((id, bytes)),
-                        PaneOp::PromptMark { .. } | PaneOp::ScrollBottom => None,
+                        PaneOp::PromptMark { .. }
+                        | PaneOp::ScrollBottom
+                        | PaneOp::TrimScrollback { .. } => None,
                     })
                     .collect(),
             );

@@ -81,6 +81,10 @@ use scribe_client_gpui::restore_replay::{
 use scribe_client_gpui::restore_state::{
     AiResumeMode, LaunchBinding, RestoreStore, WindowRestoreState,
 };
+use scribe_client_gpui::scrollbar::{
+    ScrollbarDrag, ScrollbarHandle, ScrollbarLayout, ScrollbarStyle, hit_test_scrollbar,
+    hit_test_thumb, offset_from_drag, offset_from_track_click,
+};
 use scribe_client_gpui::search::{
     FindOverlayColors, FindOverlayEvent, FindOverlayView, FindResults, MatchHighlightColors,
     SEARCH_RESULT_LIMIT,
@@ -152,8 +156,8 @@ use crate::{
     sync_frames::{SyncFrameQueue, drain_all_committed},
     terminal::{Content, DisplayOnlyTerminal, PaneGrids, Scroll},
     terminal_element::{
-        GridBounds, GridColors, GridFont, ImePaint, TerminalElement, cell_at, hits_jump_chip,
-        record_grid_area,
+        GridBounds, GridColors, GridFont, ImePaint, ScrollbarPaint, TerminalElement, cell_at,
+        hits_jump_chip, record_grid_area,
     },
 };
 
@@ -431,6 +435,34 @@ impl GridPalette {
     }
 }
 
+/// The window's overlay-scrollbar state.
+///
+/// Grouped rather than left as three loose view fields for the same reason
+/// [`ClipboardSurfaces`] is: the drag is only ever meaningful against one of
+/// the per-session records, and the palette is what every one of them paints
+/// with, so all three belong to each other.
+struct ScrollbarSurfaces {
+    /// Per-session fade / hover / drag state. Keyed by session rather than by
+    /// pane because the fade belongs to the scrollback being scrolled: moving a
+    /// session between panes carries its thumb with it, and a pane with no
+    /// session has nothing to scroll.
+    panes: HashMap<SessionId, ScrollbarHandle>,
+    /// The session whose thumb the pointer is dragging, if any. Held here
+    /// rather than inferred from the pointer so a drag that wanders off the hit
+    /// zone — or off the pane entirely — still resolves against the scrollbar
+    /// it started on.
+    drag: Option<SessionId>,
+    /// Theme-derived thumb and command-tick palette, rebuilt on a theme reload.
+    style: ScrollbarStyle,
+}
+
+impl ScrollbarSurfaces {
+    /// Start with no panes and no drag, painting with `style`.
+    fn new(style: ScrollbarStyle) -> Self {
+        Self { panes: HashMap::new(), drag: None, style }
+    }
+}
+
 /// Whether the pointer is currently dragging out a selection over the grid.
 ///
 /// A two-variant enum rather than a bool because the view already carries the
@@ -691,6 +723,8 @@ struct TerminalView {
     /// Where the terminal grid was painted last frame, filled in by the grid
     /// canvas so a pointer position can be lowered onto a cell.
     grid_bounds: GridBounds,
+    /// Overlay-scrollbar fade/hover state and the in-flight thumb drag.
+    scrollbars: ScrollbarSurfaces,
     /// Pixel rect of the whole grid *area* — every pane plus the dividers
     /// between them — as of the last painted frame, recorded by the measuring
     /// canvas in [`Self::render_grid`]. This is what a pane's cell count is
@@ -927,7 +961,7 @@ impl TerminalView {
         let notifications = Self::start_notifications(&shared, &config, window, cx);
         let (lifecycle_task, refresh_task, config_task) =
             Self::start_drivers(Arc::clone(&shared.generation), config.signal(), cx);
-        let (status_colors, terminal_colors) = Self::theme_palettes(&config);
+        let (status_colors, terminal_colors, scrollbar_style) = Self::theme_palettes(&config);
         let chrome = config.config().chrome;
         let opacity = clamp_opacity(config.opacity());
         let font = GridFont::from_appearance(&config.config().config.appearance);
@@ -937,11 +971,7 @@ impl TerminalView {
         let context_thresholds = terminal.ai_session.context_thresholds.clone();
         let prompt_bar_enabled = terminal.prompt_bar.enabled;
         let gate = Self::start_paste_gate(terminal.paste_confirmation, cx);
-        // The strip starts empty and is filled by the reader's first
-        // `SessionList`; `sync_tabs` pushes it into the titlebar on the next
-        // redraw so the tab row always mirrors live server state.
-        let rendered_tabs = TabSessions::new();
-        let titlebar = Self::build_titlebar(&chrome, opacity, &rendered_tabs, cx);
+        let titlebar = Self::build_titlebar(&chrome, opacity, cx);
         // One workspace region holding one pane: the shape the window has
         // before the first split, and the shape every split grows out of.
         let shell = PaneShell::new(chrome.accent, cx);
@@ -958,6 +988,7 @@ impl TerminalView {
             smart_selection,
             split_scroll: SplitScrollState::new(),
             grid_bounds: GridBounds::default(),
+            scrollbars: ScrollbarSurfaces::new(scrollbar_style),
             grid_area: GridBounds::default(),
             published_grid_area: None,
             prompt_colors: PromptBarColors::from(&chrome),
@@ -970,7 +1001,10 @@ impl TerminalView {
             titlebar,
             chrome,
             terminal_size,
-            rendered_tabs,
+            // The strip starts empty and is filled by the reader's first
+            // `SessionList`; `sync_tabs` pushes it into the titlebar on the
+            // next redraw so the tab row always mirrors live server state.
+            rendered_tabs: TabSessions::new(),
             terminal_colors,
             opacity,
             highlight_colors: MatchHighlightColors::from_chrome(&chrome),
@@ -1003,18 +1037,19 @@ impl TerminalView {
         }
     }
 
-    /// The two theme-derived palettes the window paints from: the status bar's
-    /// segment colours, and the terminal grid's background plus its resolved
-    /// per-cell palette.
+    /// The theme-derived palettes the window paints from: the status bar's
+    /// segment colours, the terminal grid's background plus its resolved
+    /// per-cell palette, and the overlay scrollbar's thumb and tick colours.
     ///
     /// Split out of [`Self::new`] so the constructor stays a list of the
-    /// window's collaborators rather than also being where two of them are
+    /// window's collaborators rather than also being where several of them are
     /// derived.
-    fn theme_palettes(config: &ConfigRuntime) -> (StatusBarColors, GridPalette) {
+    fn theme_palettes(config: &ConfigRuntime) -> (StatusBarColors, GridPalette, ScrollbarStyle) {
         let theme = &config.config().theme;
         (
             StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors),
             GridPalette::from_theme(theme),
+            ScrollbarStyle::from_theme(theme),
         )
     }
 
@@ -1184,11 +1219,10 @@ impl TerminalView {
     fn build_titlebar(
         chrome: &ChromeColors,
         opacity: f32,
-        tabs: &TabSessions,
         cx: &mut Context<Self>,
     ) -> Entity<TitlebarView> {
         let colors = TabBarColors::from_chrome(chrome, opacity);
-        let data = tabs.to_tab_data();
+        let data = TabSessions::new().to_tab_data();
         let bar = cx.new(|cx| {
             let mut bar = TitlebarView::new(colors, cx);
             bar.set_tabs(data, cx);
@@ -1233,6 +1267,7 @@ impl TerminalView {
             let theme = self.config.config().theme.clone();
             self.status_colors = StatusBarColors::from_theme(&theme.chrome, &theme.ansi_colors);
             self.terminal_colors = GridPalette::from_theme(&theme);
+            self.scrollbars.style = ScrollbarStyle::from_theme(&theme);
             self.chrome = theme.chrome;
             self.prompt_colors = PromptBarColors::from(&self.chrome);
             self.highlight_colors = MatchHighlightColors::from_chrome(&self.chrome);
@@ -1451,6 +1486,9 @@ impl TerminalView {
             return;
         };
         tracing::info!(?scroll, moved, offset, pin_rows, "terminal scrollback moved");
+        // Pulse even when the viewport did not move: a page-up that hit the top
+        // of scrollback is exactly when the user wants to see where they are.
+        self.pulse_focused_scrollbar();
         cx.notify();
     }
 
@@ -1518,6 +1556,10 @@ impl TerminalView {
         drop(grids);
         drop(marks);
         tracing::info!(action, target, moved, offset, marks = total, "prompt jump moved");
+        // The landing row is one of the scrollbar's own ticks, so revealing the
+        // overlay is what shows the jump in context: which command boundary was
+        // reached, and how much scrollback sits either side of it.
+        self.pulse_scrollbar(session_id);
         cx.notify();
     }
 
@@ -3527,6 +3569,7 @@ impl TerminalView {
             |tabs| tabs.tabs().iter().map(|tab| tab.session_id).collect(),
         );
         if !live.is_empty() {
+            self.retire_scrollbars(&live);
             let retired = self.shell.retain_sessions(&live, cx);
             for workspace_id in retired.closed_regions {
                 self.close_workspace(workspace_id);
@@ -3688,12 +3731,19 @@ impl TerminalView {
     /// what the mouse path hit-tests against. `focused` is therefore the
     /// snapshot [`Self::sync_split_scroll`] already pinned, and every other
     /// pane paints its own untouched grid.
-    fn render_panes(&self, focused: Content, ime: ImePaint, cx: &App) -> Vec<gpui::AnyElement> {
+    fn render_panes(&mut self, focused: Content, ime: ImePaint, cx: &App) -> Vec<gpui::AnyElement> {
         let viewport = self.pane_viewport();
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
             return Vec::new();
         }
         let placements = self.shell.placements(viewport, cx);
+        // Mint any missing scrollbar state before the render closure below
+        // borrows `self` immutably. The state has to outlive the element (the
+        // fade is a wall-clock animation across frames), so it lives here and
+        // the element only borrows a handle to it.
+        for session_id in placements.iter().filter_map(|placement| placement.session_id) {
+            self.scrollbars.panes.entry(session_id).or_default();
+        }
         let split = placements.len() > 1;
         let selection_spans = self.selection_spans();
         let mut ime = Some(ime);
@@ -3747,6 +3797,14 @@ impl TerminalView {
                 )
                 .with_highlights(highlights)
                 .with_selection(selection);
+                // Every pane showing a session gets its own scrollbar: each
+                // pane scrolls its own scrollback, so unlike the IME handler
+                // this is not a window-wide singleton.
+                if let Some(scrollbar) =
+                    placement.session_id.and_then(|session| self.scrollbar_paint(session))
+                {
+                    element = element.with_scrollbar(scrollbar);
+                }
                 // The input handler is a window-level singleton, so it is
                 // registered by the focused pane alone — `take` guarantees that
                 // even if the layout ever reported two focused placements.
@@ -3758,6 +3816,272 @@ impl TerminalView {
                 pane.child(element.paint()).into_any_element()
             })
             .collect()
+    }
+
+    /// Resolve a left press over the grid band.
+    ///
+    /// Three consumers in priority order. The overlay scrollbar goes first
+    /// because it is chrome painted over the cells: a click on the thumb was
+    /// never meant for the application below it, which is the order the winit
+    /// client resolved its chrome in too. A mouse-tracking application comes
+    /// next, and only when it declines does the press mean selection.
+    fn press_grid(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        if self.press_scrollbar(event.position, cx) || self.forward_mouse_press(event) {
+            return;
+        }
+        self.click_grid(event.position, cx);
+    }
+
+    /// Resolve pointer motion over the grid band.
+    ///
+    /// An in-flight thumb drag owns the pointer outright. Otherwise hover is
+    /// tracked even while an application owns the pointer — the hover widen is
+    /// what makes the thumb grabbable, and a press on it would have been
+    /// claimed by the scrollbar anyway — before the motion falls through to
+    /// mouse reporting and then to extending a selection.
+    fn move_over_grid(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.drag_scrollbar(event.position, cx) {
+            return;
+        }
+        self.update_scrollbar_hover(event.position, cx);
+        if self.forward_mouse_motion(event) {
+            return;
+        }
+        self.extend_selection(event.position, cx);
+    }
+
+    /// Resolve a left release over the grid band, ending whichever gesture the
+    /// matching press started.
+    fn release_over_grid(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.release_scrollbar(cx) || self.forward_mouse_release(event) {
+            return;
+        }
+        self.finish_selection(cx);
+    }
+
+    /// Collect everything `session_id`'s overlay scrollbar needs for one frame.
+    ///
+    /// Returns `None` when the session has no grid yet — there is no viewport
+    /// to describe, so there is nothing to draw. The marks are cloned out of
+    /// the shared store rather than borrowed because the drain writes them from
+    /// another thread and the element outlives this call.
+    fn scrollbar_paint(&self, session_id: SessionId) -> Option<ScrollbarPaint> {
+        let state = Rc::clone(self.scrollbars.panes.get(&session_id)?);
+        let metrics = self.shared.panes.lock().ok()?.scroll_metrics(session_id)?;
+        let marks = self
+            .shared
+            .prompt_marks
+            .lock()
+            .map(|marks| marks.marks(session_id).to_vec())
+            .unwrap_or_default();
+        Some(ScrollbarPaint { state, metrics, marks, style: self.scrollbars.style })
+    }
+
+    /// Reveal `session_id`'s scrollbar and re-arm its idle timer.
+    ///
+    /// Called from every path that moves a viewport — the wheel, the scroll
+    /// chords, the three mark-relative jumps, and the server's `ScrollBottom`
+    /// snap — so the overlay is the confirmation that a scroll landed, which is
+    /// the whole reason it fades in rather than being always on.
+    fn pulse_scrollbar(&mut self, session_id: SessionId) {
+        self.scrollbars.panes.entry(session_id).or_default().borrow_mut().on_scroll_action();
+    }
+
+    /// Reveal the focused pane's scrollbar, if a session is attached.
+    fn pulse_focused_scrollbar(&mut self) {
+        if let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard) {
+            self.pulse_scrollbar(session_id);
+        }
+    }
+
+    /// Advance every pane's fade animation, reporting whether any scrollbar is
+    /// still visible and therefore still owes the window a frame.
+    ///
+    /// The fade is wall-clock, not frame-count, so it is driven from the idle
+    /// tick as well as from paint: a scroll that lands on a silent pane must
+    /// still fade out on time, and nothing else would wake the window.
+    fn tick_scrollbar_fades(&mut self) -> bool {
+        let mut animating = false;
+        let offsets: HashMap<SessionId, usize> = self.shared.panes.lock().map_or_else(
+            |_| HashMap::new(),
+            |grids| {
+                self.scrollbars
+                    .panes
+                    .keys()
+                    .filter_map(|session| {
+                        Some((*session, grids.scroll_metrics(*session)?.display_offset))
+                    })
+                    .collect()
+            },
+        );
+        for (session_id, state) in &self.scrollbars.panes {
+            let display_offset = offsets.get(session_id).copied().unwrap_or(0);
+            let mut state = state.borrow_mut();
+            let before = state.opacity;
+            // `tick_fade` reports whether the scrollbar is still on screen, and
+            // the tick that finally takes it to zero reports `false` — while
+            // still owing exactly one more frame, the one that clears it.
+            // Without the opacity comparison the window would keep the last
+            // barely-visible thumb painted until something else repainted it.
+            let visible = state.tick_fade(display_offset);
+            animating |= visible || (state.opacity - before).abs() > f32::EPSILON;
+        }
+        animating
+    }
+
+    /// Idle-tick hook: advance the fades and repaint while any is still on
+    /// screen. Returning early when nothing is animating keeps a rested window
+    /// from repainting sixty times a second.
+    fn poll_scrollbar_fades(&mut self, cx: &mut Context<Self>) {
+        if self.tick_scrollbar_fades() {
+            cx.notify();
+        }
+    }
+
+    /// Drop scrollbar state for sessions that are no longer on screen.
+    ///
+    /// Keyed by session, so this is the same retirement the pane grids get: a
+    /// closed tab must not leave its fade timer (or a stale drag) behind.
+    fn retire_scrollbars(&mut self, live: &HashSet<SessionId>) {
+        self.scrollbars.panes.retain(|session_id, _| live.contains(session_id));
+        if self.scrollbars.drag.is_some_and(|session| !live.contains(&session)) {
+            self.scrollbars.drag = None;
+        }
+    }
+
+    /// The scrollbar placement for `session_id` against the last painted grid
+    /// rect, or `None` when nothing has been painted or the session has no
+    /// grid. Pointer hit-testing and drag math both resolve through this so
+    /// they can never disagree with what paint drew.
+    fn scrollbar_layout(&self, session_id: SessionId) -> Option<ScrollbarLayout> {
+        let bounds = self.grid_bounds.get()?;
+        let metrics = self.shared.panes.lock().ok()?.scroll_metrics(session_id)?;
+        Some(ScrollbarLayout {
+            pane_rect: Rect {
+                x: f32::from(bounds.left()),
+                y: f32::from(bounds.top()),
+                width: f32::from(bounds.size.width),
+                height: f32::from(bounds.size.height),
+            },
+            metrics,
+            // The GPUI client's tab strip lives in the window titlebar, so the
+            // pane reserves no strip of its own and the track is the full rect.
+            tab_bar_height: 0.0,
+        })
+    }
+
+    /// Track the pointer over the focused pane's scrollbar hit zone.
+    ///
+    /// Hover pins the overlay open and widens the thumb, which is what makes it
+    /// grabbable: the resting 6 px thumb is a hint, and the 3x hit zone plus
+    /// the widen are what turn it into a control.
+    fn update_scrollbar_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
+        else {
+            return;
+        };
+        let Some(layout) = self.scrollbar_layout(session_id) else { return };
+        let Some(state) = self.scrollbars.panes.get(&session_id) else { return };
+        let width = state.borrow().current_width(self.scrollbars.style.width);
+        let inside = hit_test_scrollbar(
+            &layout,
+            f32::from(position.x),
+            f32::from(position.y),
+            width.max(self.scrollbars.style.width),
+        );
+        let mut state = state.borrow_mut();
+        if inside == state.hover {
+            return;
+        }
+        if inside {
+            state.on_hover_enter();
+        } else {
+            state.on_hover_leave();
+        }
+        drop(state);
+        cx.notify();
+    }
+
+    /// Claim a left press that landed on the focused pane's scrollbar.
+    ///
+    /// A press on the thumb starts a drag; a press anywhere else in the hit
+    /// zone jumps the viewport to that point on the track. Returns `true` when
+    /// the press was consumed, so the caller leaves selection alone — the
+    /// scrollbar is chrome painted over the grid, and a click on it was never
+    /// meant for the cells underneath.
+    fn press_scrollbar(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
+        else {
+            return false;
+        };
+        let Some(layout) = self.scrollbar_layout(session_id) else { return false };
+        let Some(state) = self.scrollbars.panes.get(&session_id) else { return false };
+        let (x, y) = (f32::from(position.x), f32::from(position.y));
+        let width = state.borrow().current_width(self.scrollbars.style.width);
+        if !hit_test_scrollbar(&layout, x, y, width) {
+            return false;
+        }
+        if hit_test_thumb(&layout, x, y, width) {
+            let mut state = state.borrow_mut();
+            state.drag = Some(ScrollbarDrag {
+                start_mouse_y: y,
+                start_display_offset: layout.metrics.display_offset,
+            });
+            // A drag holds the overlay open by itself; clearing the timer keeps
+            // it from fading out from under the pointer mid-drag.
+            state.opacity = 1.0;
+            state.fade_start = None;
+            drop(state);
+            self.scrollbars.drag = Some(session_id);
+            cx.notify();
+            return true;
+        }
+        let target = offset_from_track_click(&layout, y, width);
+        self.scroll_to_offset(session_id, target, cx);
+        true
+    }
+
+    /// Continue an in-flight thumb drag. Returns `true` while a drag owns the
+    /// pointer, so motion never doubles as a selection extension.
+    fn drag_scrollbar(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(session_id) = self.scrollbars.drag else { return false };
+        let Some(layout) = self.scrollbar_layout(session_id) else { return true };
+        let Some(state) = self.scrollbars.panes.get(&session_id) else { return true };
+        let width = state.borrow().current_width(self.scrollbars.style.width);
+        let Some(drag) = state.borrow().drag else { return true };
+        let target = offset_from_drag(&layout, &drag, f32::from(position.y), width);
+        self.scroll_to_offset(session_id, target, cx);
+        true
+    }
+
+    /// Finish a thumb drag, re-arming the fade unless the pointer is still
+    /// hovering. Returns `true` when a drag was actually in flight.
+    fn release_scrollbar(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(session_id) = self.scrollbars.drag.take() else { return false };
+        if let Some(state) = self.scrollbars.panes.get(&session_id) {
+            state.borrow_mut().on_drag_end();
+        }
+        cx.notify();
+        true
+    }
+
+    /// Move `session_id`'s viewport to an absolute `display_offset`.
+    ///
+    /// Both scrollbar gestures land here so they share the repaint and the
+    /// split-scroll bookkeeping `scroll_terminal` does for the keyboard: a
+    /// deliberate scroll dissolves the pin exactly as `Scroll::Bottom` does.
+    fn scroll_to_offset(&mut self, session_id: SessionId, target: usize, cx: &mut Context<Self>) {
+        let Ok(mut grids) = self.shared.panes.lock() else { return };
+        let terminal = grids.grid_mut(session_id);
+        terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
+        let moved = terminal.scroll_to_offset(target);
+        drop(grids);
+        if !moved {
+            return;
+        }
+        self.pulse_scrollbar(session_id);
+        tracing::info!(%session_id, target, "scrollbar moved the viewport");
+        cx.notify();
     }
 
     /// Open the command palette, building its entry list from the live update /
@@ -5063,9 +5387,11 @@ async fn drive_window_lifecycle(view: WeakEntity<TerminalView>, app: &mut AsyncA
 
 /// Repaints the view whenever the IPC drain bumps the shared generation counter.
 ///
-/// The same 16 ms tick is the idle-wake boundary the feature-015 control hint
-/// expires on: a hint set five seconds ago must clear even on a window whose
-/// output has gone quiet, which by definition never bumps the generation.
+/// The same 16 ms tick is the idle-wake boundary two wall-clock surfaces expire
+/// on: the feature-015 control hint (a hint set five seconds ago must clear even
+/// on a window whose output has gone quiet, which by definition never bumps the
+/// generation) and the overlay scrollbar's fade, which has to run its 1.5 s idle
+/// delay and 0.3 s ramp down to nothing after the last scroll.
 async fn drive_redraws(
     view: WeakEntity<TerminalView>,
     app: &mut AsyncApp,
@@ -5076,7 +5402,11 @@ async fn drive_redraws(
         app.background_executor().timer(Duration::from_millis(16)).await;
         let current = generation.load(Ordering::Acquire);
         if current == rendered {
-            if view.update(app, TerminalView::expire_share_hint).is_err() {
+            let idle = view.update(app, |view, view_cx| {
+                view.expire_share_hint(view_cx);
+                view.poll_scrollbar_fades(view_cx);
+            });
+            if idle.is_err() {
                 return;
             }
             continue;
@@ -5305,25 +5635,16 @@ impl TerminalView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, event: &MouseDownEvent, _window, ctx| {
-                    if view.forward_mouse_press(event) {
-                        return;
-                    }
-                    view.click_grid(event.position, ctx);
+                    view.press_grid(event, ctx);
                 }),
             )
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _window, ctx| {
-                if view.forward_mouse_motion(event) {
-                    return;
-                }
-                view.extend_selection(event.position, ctx);
+                view.move_over_grid(event, ctx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|view, event: &MouseUpEvent, _window, ctx| {
-                    if view.forward_mouse_release(event) {
-                        return;
-                    }
-                    view.finish_selection(ctx);
+                    view.release_over_grid(event, ctx);
                 }),
             )
             // Middle click is the X11 primary-selection paste, and it is a
@@ -6274,7 +6595,49 @@ fn apply_pane_op(
             tracing::info!(%session, moved, "server snapped the pane to the live bottom");
             usize::from(moved)
         }
+        PaneOp::TrimScrollback { kept_rows } => apply_trim_scrollback(
+            prompt_marks,
+            session,
+            grid.trim_history(*kept_rows),
+            *kept_rows,
+            grid,
+        ),
     }
+}
+
+/// Shift a pane's absolute-row anchors past the scrollback rows the trim just
+/// dropped, returning whether the pane needs a redraw.
+///
+/// The drop count comes from the *client's* grid rather than from the server's
+/// reported history, because they are two different rings: the server names the
+/// size it kept, and only the display grid knows how many of its own oldest
+/// rows that removed. Marks anchored inside the dropped region are retired by
+/// [`PromptMarks::on_trim`] — their rows no longer exist to jump to or tick.
+fn apply_trim_scrollback(
+    prompt_marks: &Arc<Mutex<PromptMarks>>,
+    session: SessionId,
+    dropped: usize,
+    kept_rows: usize,
+    grid: &DisplayOnlyTerminal,
+) -> usize {
+    if dropped == 0 {
+        tracing::debug!(%session, kept_rows, "scrollback trim dropped no rows");
+        return 0;
+    }
+    let Ok(mut marks) = prompt_marks.lock() else {
+        tracing::warn!("prompt-mark mutex poisoned; dropping a scrollback trim");
+        return 1;
+    };
+    marks.on_trim(session, dropped);
+    tracing::info!(
+        %session,
+        dropped,
+        kept_rows,
+        history = grid.history_size(),
+        marks = marks.marks(session).len(),
+        "trimmed scrollback marks"
+    );
+    1
 }
 
 /// Anchor one OSC 133 mark against the pane grid the drain has just written to.
@@ -6860,14 +7223,13 @@ fn dispatch_server_message(
         ai @ (ServerMessage::AiStateChanged { .. }
         | ServerMessage::AiStateCleared { .. }
         | ServerMessage::PromptReceived { .. }) => on_ai_message(ctx, ai),
-        ServerMessage::TrimScrollback { session_id, history_rows } => {
-            on_trim_scrollback(ctx, registry, session_id, history_rows);
-        }
-        // OSC 133 marks and the suppressed-ED-3 snap are both positional: each
-        // describes where the cursor is *after* output the server has already
-        // sent, so they are routed as one onto the same ordered inbound channel
-        // as that output rather than applied here.
-        positional @ (ServerMessage::PromptMark { .. } | ServerMessage::ScrollBottom { .. }) => {
+        // OSC 133 marks, the suppressed-ED-3 snap and the AI scrollback trim are
+        // all positional: each describes the grid *after* output the server has
+        // already sent, so they are routed as one onto the same ordered inbound
+        // channel as that output rather than applied here.
+        positional @ (ServerMessage::PromptMark { .. }
+        | ServerMessage::ScrollBottom { .. }
+        | ServerMessage::TrimScrollback { .. }) => {
             on_positional_pane_message(ctx, positional);
         }
         // The three pane-content variants are all gated on the attached pane
@@ -7202,27 +7564,6 @@ fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage) {
     }
 }
 
-/// Shift a session's stored prompt marks past the scrollback the server just
-/// trimmed, so every anchor keeps naming the row it originally did.
-///
-/// The registry only measures the drop (the decrease from the previously
-/// reported history size); the marks it applies to live in the shared store the
-/// drain writes and the key path reads.
-fn on_trim_scrollback(
-    ctx: &ReaderCtx,
-    registry: &mut session_lifecycle::SessionRegistry,
-    session_id: SessionId,
-    history_rows: u32,
-) {
-    let dropped = registry.on_trim_scrollback(session_id, history_rows);
-    if dropped > 0
-        && let Ok(mut marks) = ctx.prompt_marks.lock()
-    {
-        marks.on_trim(session_id, dropped);
-    }
-    tracing::trace!(%session_id, dropped, "trimmed scrollback marks");
-}
-
 /// Forward one positional pane event onto the ordered inbound channel.
 ///
 /// A prompt mark's anchor row and a suppressed-ED-3 snap only mean anything
@@ -7238,6 +7579,13 @@ fn on_positional_pane_message(ctx: &ReaderCtx, message: ServerMessage) {
         ServerMessage::ScrollBottom { session_id } => {
             (session_id, InboundEvent::ScrollBottom { session_id })
         }
+        ServerMessage::TrimScrollback { session_id, history_rows } => (
+            session_id,
+            InboundEvent::TrimScrollback {
+                session_id,
+                kept_rows: usize::try_from(history_rows).unwrap_or(usize::MAX),
+            },
+        ),
         other => {
             unhandled_server_message(&other);
             return;

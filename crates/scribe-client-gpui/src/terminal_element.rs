@@ -22,6 +22,10 @@ use scribe_client_gpui::{
     opacity::{opaque_slot, scale_alpha},
     preedit::{Ime, PreeditGeometry, PreeditOverlay, PreeditState, compute_overlay},
     restore_replay::round_positive_f32_to_u16,
+    scrollbar::{
+        CommandMark, ScrollMetrics, ScrollbarHandle, ScrollbarLayout, ScrollbarQuad,
+        ScrollbarStyle, build_scrollbar_render,
+    },
     search::{MatchHighlight, MatchHighlightColors},
     selection::SelectionSpan,
     split_scroll,
@@ -260,6 +264,28 @@ pub struct ImePaint {
     pub preedit: Option<PreeditState>,
 }
 
+/// Everything one pane's overlay scrollbar needs from the frame it is drawn in.
+///
+/// The pane's pixel rect is deliberately absent: only the grid canvas knows it,
+/// and the whole point of the overlay is that it hugs the right edge of the
+/// cells rather than reserving a gutter the layout would have to subtract. The
+/// view therefore supplies the *data* (viewport metrics, the command marks the
+/// OSC 133 stream produced, the theme palette) plus the cross-frame fade state,
+/// and paint supplies the geometry.
+#[derive(Clone)]
+pub struct ScrollbarPaint {
+    /// This pane's fade / hover / drag state, owned by the view so the
+    /// animation survives the element being rebuilt every frame.
+    pub state: ScrollbarHandle,
+    /// Live viewport measurements the thumb is sized and placed from.
+    pub metrics: ScrollMetrics,
+    /// Command boundaries to tick, in absolute scrollback rows. Already
+    /// trim-shifted by the prompt-mark store, so a tick names a surviving row.
+    pub marks: Vec<CommandMark>,
+    /// Theme-derived thumb and tick colours.
+    pub style: ScrollbarStyle,
+}
+
 /// Paints the current terminal grid with fixed-width rows.
 pub struct TerminalElement {
     content: Content,
@@ -278,6 +304,10 @@ pub struct TerminalElement {
     /// pane composes, and registering two handlers would race for the platform
     /// slot.
     ime: Option<ImePaint>,
+    /// Overlay-scrollbar inputs for this frame. `None` before a session is
+    /// attached to the pane, which is the only case with no viewport to
+    /// describe.
+    scrollbar: Option<ScrollbarPaint>,
     bounds_sink: GridBounds,
 }
 
@@ -301,8 +331,20 @@ impl TerminalElement {
             highlight_colors,
             selection: Vec::new(),
             ime: None,
+            scrollbar: None,
             bounds_sink,
         }
+    }
+
+    /// Draw this pane's overlay scrollbar on top of the finished grid.
+    ///
+    /// Every pane showing a session passes one: the thumb is per-pane state
+    /// (each pane scrolls its own scrollback), unlike the IME registration
+    /// which is a window-wide singleton.
+    #[must_use]
+    pub fn with_scrollbar(mut self, scrollbar: ScrollbarPaint) -> Self {
+        self.scrollbar = Some(scrollbar);
+        self
     }
 
     /// Serve the OS input method from this pane's paint pass.
@@ -422,7 +464,50 @@ impl TerminalElement {
         };
         self.paint_vi_cursor(overlay, window);
         self.paint_split_scroll(overlay, window);
+        // Last of the grid overlays: the scrollbar floats over the cells (it
+        // reserves no gutter), so anything painted after it would sit on top of
+        // the thumb. The IME registration below draws nothing.
+        self.paint_scrollbar(bounds, window);
         self.serve_ime(overlay, window, cx);
+    }
+
+    /// Draw the pane's overlay scrollbar: the thumb plus one tick per command
+    /// boundary the OSC 133 stream reported.
+    ///
+    /// `bounds` is the grid canvas, which is exactly the pane's content area —
+    /// the GPUI client puts its tab strip in the window titlebar rather than at
+    /// the top of each pane, so the scrollbar track needs no tab-bar inset and
+    /// spans the full painted height.
+    ///
+    /// Nothing is drawn while the fade has settled to invisible or the pane has
+    /// no scrollback: an unscrolled pane must look exactly as it did before the
+    /// overlay existed.
+    fn paint_scrollbar(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+        let Some(scrollbar) = self.scrollbar.as_ref() else {
+            return;
+        };
+        let Ok(mut state) = scrollbar.state.try_borrow_mut() else {
+            return;
+        };
+        let layout = ScrollbarLayout {
+            pane_rect: Rect {
+                x: f32::from(bounds.left()),
+                y: f32::from(bounds.top()),
+                width: f32::from(bounds.size.width),
+                height: f32::from(bounds.size.height),
+            },
+            metrics: scrollbar.metrics,
+            tab_bar_height: 0.0,
+        };
+        let Some(render) =
+            build_scrollbar_render(&layout, &scrollbar.marks, &mut state, &scrollbar.style)
+        else {
+            return;
+        };
+        paint_scrollbar_quad(&render.thumb, window);
+        for tick in &render.ticks {
+            paint_scrollbar_quad(tick, window);
+        }
     }
 
     /// Register the window's IME handler for the next frame and draw the
@@ -738,6 +823,18 @@ fn content_rect(bounds: Bounds<Pixels>, rows: usize, line_height: Pixels) -> Rec
 /// Lower a [`Rect`] back onto GPUI's typed pixel bounds.
 fn to_bounds(rect: Rect) -> Bounds<Pixels> {
     Bounds::new(point(px(rect.x), px(rect.y)), size(px(rect.width), px(rect.height)))
+}
+
+/// Lower one rounded scrollbar quad onto the window.
+///
+/// The colour already carries the fade opacity folded into its alpha, and the
+/// window's `appearance.opacity` is deliberately *not* applied on top: the
+/// scrollbar is foreground chrome drawn over an already-translucent grid, so
+/// scaling it a second time would fade the overlay out of a translucent window.
+fn paint_scrollbar_quad(quad: &ScrollbarQuad, window: &mut Window) {
+    window.paint_quad(
+        fill(to_bounds(quad.rect), opaque_slot(quad.color)).corner_radii(px(quad.corner_radius)),
+    );
 }
 
 /// The grid cell a window-space pointer position falls on.
