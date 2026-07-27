@@ -14,9 +14,12 @@
 
 use std::path::PathBuf;
 
+use gpui::{Bounds, Pixels, WindowBounds, point, px, size};
 use scribe_common::app::current_state_dir;
 use scribe_common::ids::WindowId;
 use serde::{Deserialize, Serialize};
+
+use crate::restore_replay::round_positive_f32_to_u16;
 
 /// Minimum accepted window edge, in logical pixels.
 pub const MIN_WINDOW_EDGE: u32 = 40;
@@ -125,6 +128,75 @@ pub fn normalize_legacy_geometry(geom: &WindowGeometry) -> WindowGeometry {
     WindowGeometry { width, height, titlebar_normalized: true, ..geom.clone() }
 }
 
+/// Turn a live GPUI window's bounds into the geometry that gets persisted.
+///
+/// This is the GPUI half of the legacy winit `capture_window_geometry`. GPUI
+/// bounds are already logical pixels, so no scale-factor division is needed —
+/// unlike winit, which reports physical pixels. A window whose origin is not
+/// exposed (Wayland) yields `x`/`y` of `None` rather than a bogus `(0, 0)`,
+/// which is what keeps a later X11 session from restoring into the corner.
+#[must_use]
+pub fn geometry_from_bounds(
+    bounds: Bounds<Pixels>,
+    maximized: bool,
+    monitor_name: Option<String>,
+) -> WindowGeometry {
+    WindowGeometry {
+        x: Some(logical_px_to_i32(f32::from(bounds.origin.x))),
+        y: Some(logical_px_to_i32(f32::from(bounds.origin.y))),
+        width: u32::from(round_positive_f32_to_u16(f32::from(bounds.size.width))),
+        height: u32::from(round_positive_f32_to_u16(f32::from(bounds.size.height))),
+        maximized,
+        monitor_name,
+        // Anything captured from a live GPUI window is already in the new
+        // coordinate system: the custom titlebar is inside these bounds.
+        titlebar_normalized: true,
+    }
+}
+
+/// Turn persisted geometry into the [`WindowBounds`] a window is opened at.
+///
+/// This is the GPUI half of the legacy winit `apply_window_geometry`. GPUI has
+/// no post-creation "move + resize + maximize" sequence to race against the
+/// compositor: the restored geometry is handed to `open_window` up front, so a
+/// maximized window is maximized from its first frame and the pane grids sized
+/// from `fallback`-independent bounds are the ones the window actually gets.
+///
+/// `fallback` supplies the origin when the saved record has none (Wayland).
+#[must_use]
+pub fn window_bounds_for(geom: &WindowGeometry, fallback: Bounds<Pixels>) -> WindowBounds {
+    let bounds = Bounds {
+        origin: match (geom.x, geom.y) {
+            (Some(x), Some(y)) => point(px(i32_to_logical_px(x)), px(i32_to_logical_px(y))),
+            _ => fallback.origin,
+        },
+        size: size(px(u32_to_logical_px(geom.width)), px(u32_to_logical_px(geom.height))),
+    };
+    if geom.maximized { WindowBounds::Maximized(bounds) } else { WindowBounds::Windowed(bounds) }
+}
+
+/// Round a logical-pixel coordinate to the signed integer the record stores.
+///
+/// Written without a float cast (the workspace denies the pedantic cast lints)
+/// by rounding the magnitude through the shared `u16` helper and re-applying the
+/// sign; coordinates beyond ±65535 logical pixels do not occur on real displays.
+fn logical_px_to_i32(value: f32) -> i32 {
+    if !value.is_finite() {
+        return 0;
+    }
+    let magnitude = i32::from(round_positive_f32_to_u16(value.abs()));
+    if value.is_sign_negative() { -magnitude } else { magnitude }
+}
+
+fn u32_to_logical_px(value: u32) -> f32 {
+    f32::from(u16::try_from(value.min(MAX_WINDOW_EDGE)).unwrap_or(u16::MAX))
+}
+
+fn i32_to_logical_px(value: i32) -> f32 {
+    let clamped = value.clamp(i32::from(i16::MIN), i32::from(i16::MAX));
+    f32::from(i16::try_from(clamped).unwrap_or(0))
+}
+
 /// Per-window geometry persistence using one file per window.
 ///
 /// Files are stored at `$XDG_STATE_HOME/scribe/windows/<window_id>.toml`. Each
@@ -151,18 +223,31 @@ impl WindowRegistry {
     /// read or parse error.
     #[must_use]
     pub fn load(&self, window_id: WindowId) -> WindowGeometry {
-        let Some(path) = self.window_path(window_id) else {
-            return WindowGeometry::default();
-        };
+        self.load_saved(window_id).unwrap_or_default()
+    }
+
+    /// Load geometry for a specific window, or `None` when nothing usable was
+    /// persisted for it.
+    ///
+    /// The distinction matters at startup: [`Self::load`]'s default is a size
+    /// hint, not a restore, and opening a window at it would override the
+    /// grid-derived startup size for every launch that never saved geometry.
+    /// Only a real on-disk record should displace that.
+    #[must_use]
+    pub fn load_saved(&self, window_id: WindowId) -> Option<WindowGeometry> {
+        let path = self.window_path(window_id)?;
         match std::fs::read_to_string(&path) {
-            Ok(content) => toml::from_str(&content).unwrap_or_else(|e| {
-                tracing::warn!(path = %path.display(), error = %e, "window state parse error");
-                WindowGeometry::default()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => WindowGeometry::default(),
+            Ok(content) => match toml::from_str(&content) {
+                Ok(geom) => Some(geom),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "window state parse error");
+                    None
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "failed to read window state");
-                WindowGeometry::default()
+                None
             }
         }
     }
@@ -276,6 +361,52 @@ maximized = false
         assert!(!geom.titlebar_normalized);
         let normalized = normalize_legacy_geometry(&geom);
         assert_eq!(normalized.height, 700 + CUSTOM_TITLEBAR_HEIGHT);
+    }
+
+    // @lat: [[test#Window geometry compat#Live bounds round-trip through a record]]
+    #[test]
+    fn live_bounds_round_trip_through_a_record() {
+        let bounds = Bounds {
+            origin: gpui::point(px(120.0), px(64.0)),
+            size: gpui::size(px(1440.0), px(900.0)),
+        };
+        let geom = geometry_from_bounds(bounds, false, Some("dp-1".to_owned()));
+        assert_eq!((geom.x, geom.y), (Some(120), Some(64)));
+        assert_eq!((geom.width, geom.height), (1440, 900));
+        assert!(geom.titlebar_normalized, "a live capture is already in the new coordinate system");
+
+        let fallback =
+            Bounds { origin: gpui::point(px(0.0), px(0.0)), size: gpui::size(px(1.0), px(1.0)) };
+        let WindowBounds::Windowed(restored) = window_bounds_for(&geom, fallback) else {
+            panic!("a non-maximized record must reopen windowed");
+        };
+        assert_eq!(restored, bounds);
+    }
+
+    // @lat: [[test#Window geometry compat#Maximized record reopens maximized]]
+    #[test]
+    fn maximized_record_reopens_maximized() {
+        let geom = WindowGeometry { maximized: true, ..legacy_geom(1920, 1080, true) };
+        let fallback = Bounds {
+            origin: gpui::point(px(0.0), px(0.0)),
+            size: gpui::size(px(800.0), px(600.0)),
+        };
+        assert!(matches!(window_bounds_for(&geom, fallback), WindowBounds::Maximized(_)));
+    }
+
+    // @lat: [[test#Window geometry compat#Position-less record keeps the fallback origin]]
+    #[test]
+    fn position_less_record_keeps_the_fallback_origin() {
+        let geom = WindowGeometry { x: None, y: None, ..WindowGeometry::default() };
+        let fallback = Bounds {
+            origin: gpui::point(px(300.0), px(200.0)),
+            size: gpui::size(px(10.0), px(10.0)),
+        };
+        let WindowBounds::Windowed(bounds) = window_bounds_for(&geom, fallback) else {
+            panic!("a non-maximized record must reopen windowed");
+        };
+        assert_eq!(bounds.origin, fallback.origin);
+        assert_eq!(bounds.size.width, px(1200.0));
     }
 
     // @lat: [[test#Window geometry compat#Sanity range rejects extremes]]

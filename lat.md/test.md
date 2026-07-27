@@ -170,7 +170,9 @@ In every script the `scribe-test` daemon is the client stand-in: `daemon stop` i
 
 `tests/e2e/func/hot-reload.sh` covers server `--upgrade` under a live client: it snapshots a session, stops the daemon, runs [[crates/scribe-test/src/server.rs#upgrade]] (fd handoff to the new server), then reconnects and asserts the session, its background job, and its on-screen scrollback all survived the graceful handoff.
 
-`tests/e2e/func/cold-restart.sh` covers cold-restart restore fan-out plus geometry-compat restore. It opens three sessions with distinct markers, resizes one to 132x50, starts a background job, then fully cold-quits the client (`daemon stop`) while the server keeps the sessions. A fresh `daemon start` must fan out and re-attach all three panes; the script asserts each pane replayed and accepts input, the resized pane still reports 132 cols, and the background job survived the restart.
+`tests/e2e/func/cold-restart.sh` covers the **server** half of cold-restart recovery: every session, its scrollback, its terminal geometry, and its background jobs survive the client going away entirely. It opens three sessions with distinct markers, resizes one to 132x50, starts a background job, then disconnects the client (`daemon stop`) while the server keeps the sessions. A fresh `daemon start` must re-attach all three; the script asserts each replayed and accepts input, the resized session still reports 132 cols, and the background job survived.
+
+It is deliberately **not** the oracle for the client's own restore. The daemon has no window, no layout and no restore store, so it can neither write a `RestoreStore` snapshot nor replay one — a green run here says nothing about `--restore-child` fan-out or window geometry persistence. Those are asserted against the real client process by [[test#Visual E2E Tests#Cold-restart restore drives the real client]].
 
 ### Failure-Path E2E
 
@@ -415,6 +417,16 @@ Nothing is stubbed and nothing is injected. The wire tap ([[crates/scribe-test/s
 The five phases each assert a different half of the conversation. A phase-0 preamble hands the client a live pane through the same daemon-stop-and-relaunch trick [[test#Visual E2E Tests#Overlay actions run for real]] documents, asserted on the client's own `AttachSessions` frame. Phase 1 waits for a `ListWindows` and its `WindowList` answer to both appear and for the client to log the reply's shape, so a dropped reply cannot pass. Phase 2 iconifies and re-activates the window and asserts the exact `FocusChanged { gained: null, lost: <session> }` and its mirror image, then creates a second tab and asserts a report that names a gain *and* a loss. Phase 3 sends WM_DELETE_WINDOW through openbox's Alt+F4 (`xdotool windowclose` is deliberately not used — it calls `XDestroyWindow` and bypasses the protocol), asserts the client vetoed the close and painted its dialog instead of dying, and then that "Quit Scribe" put `QuitAll` on the wire, that the server broadcast `QuitRequested`, and that the process exited on it. Phase 4 relaunches, reads the window id out of the fresh `Welcome`, and asserts "Kill Window" sent `CloseWindow` naming that id, that the server answered `WindowClosed`, and that the client exited.
 
 Exiting is asserted as process death rather than as a screenshot, because the whole point of the acknowledgement is that the app goes away; a pixel check could not tell a torn-down window from a hung one.
+
+### Cold-restart restore drives the real client
+
+`tests/e2e/visual/cold-restart.sh` (`just e2e-visual-cold-restart`) is the app-level oracle for spec 016's cold-restart restore and window geometry persistence rows. Every assertion is produced by the real `scribe-client-gpui` process (see [[client#Client#GPUI Client Spike#Cold Restart Restore#Live wiring in the GPUI shell]]).
+
+It exists because neither requirement can be shown headlessly and neither can be shown by the daemon stand-in [[test#Test Harness#E2E Functional Tests#Session Lifecycle E2E]] uses. The test therefore reproduces a crash literally: the client is `SIGKILL`ed, because an orderly quit deliberately *deletes* the snapshot, and the disposable test server is then genuinely restarted, so both PTYs die with it and the relaunched client meets the empty `SessionList` that is the only condition under which a snapshot may be replayed. Server readiness is gated on the `scribe-server` process rather than on the socket file, because a stopped server leaves its socket behind and the replacement would otherwise be declared up while it was still losing the lock race.
+
+The wire tap is deliberately not interposed — it renames the socket out from under `scribe-test server stop/start`, which this test has to perform. Assertions instead read both process logs: the client's for what it claimed, replayed and requested, and the server's for the PTYs it actually spawned in answer. Because the client logs with ANSI styling on, every numeric field is read through an escape-stripping filter; a raw `grep` would silently compare against a colour-coded value and pass on garbage.
+
+Phase 0 hands the client a live pane through the same daemon-stop-and-relaunch trick [[test#Visual E2E Tests#Overlay actions run for real]] documents, then splits it so the snapshot has a real pane tree, waiting for the split pane to actually adopt a session (an un-adopted pane is pruned from the snapshot). Phase 1 asserts exactly one window snapshot on disk carrying two `[[launches]]` plus a geometry record. Phase 2 resizes the window with `xdotool` and asserts the geometry record followed it, within a few pixels of WM frame slop. Phase 3 crashes the client and cold-restarts the server. Phase 4 asserts the relaunched client claimed the snapshot, replayed two panes, sent two restored `CreateSession` frames, and that the *server* answered with two brand-new PTYs. Phase 5 asserts the window reopened at the persisted geometry, that every restored pane adopted a session, and that both panes asked for the same, less-than-full width — which is the pane tree surviving rather than one full-width pane coming back.
 
 ### Update surfaces
 
@@ -672,7 +684,7 @@ Unit tests for [[crates/scribe-client-gpui/src/drag_drop.rs#quote_path_for_shell
 
 ## Window geometry compat
 
-Unit tests for [[crates/scribe-client-gpui/src/window_state.rs#normalize_legacy_geometry]], the first-launch geometry-compat normalization proving old-client window geometry restores correctly inset under the new custom titlebar. This is the scripted assertion required by the lifecycle acceptance criteria.
+Unit tests for [[crates/scribe-client-gpui/src/window_state.rs#normalize_legacy_geometry]] and for the live-window capture/restore pair that persists geometry across restarts. Together they prove old-client geometry insets correctly under the new custom titlebar and that a GPUI window round-trips through a record.
 
 ### Legacy geometry gains titlebar inset
 
@@ -701,6 +713,22 @@ A `state.toml` written by the old client has no `titlebar_normalized` key; it de
 ### Sanity range rejects extremes
 
 [[crates/scribe-client-gpui/src/window_state.rs#geometry_size_is_sane]] rejects zero, too-small, and too-large edges and accepts the range boundaries.
+
+### Live bounds round-trip through a record
+
+A live window's `Bounds` captured by [[crates/scribe-client-gpui/src/window_state.rs#geometry_from_bounds]] and reopened through [[crates/scribe-client-gpui/src/window_state.rs#window_bounds_for]] returns the identical origin and size.
+
+The record is also already marked normalized: a capture off a GPUI window is in the new coordinate system, so a save-and-restore cycle must not inset it under the custom titlebar a second time.
+
+### Maximized record reopens maximized
+
+A record with `maximized = true` yields `WindowBounds::Maximized`, so the window is maximized from its first frame instead of being resized a frame later the way the winit client's async `set_maximized` was.
+
+### Position-less record keeps the fallback origin
+
+A record whose `x`/`y` are `None` reopens at the caller's centred fallback origin rather than at `(0, 0)`, while still taking its saved size.
+
+Wayland never exposes a window's origin, so the capture stores `None` instead of a bogus `(0, 0)`; honouring the fallback is what stops a later X11 launch from restoring into the screen corner.
 
 ## X11 focus guard
 

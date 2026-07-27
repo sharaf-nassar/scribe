@@ -8,7 +8,7 @@ mod terminal;
 mod terminal_element;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::{
         Arc, Mutex, OnceLock,
@@ -68,7 +68,12 @@ use scribe_client_gpui::prompt_bar::{
 use scribe_client_gpui::remote::RemoteConnectOutcome;
 use scribe_client_gpui::remote_chrome::{RemoteChrome, RemoteEnvSummary};
 use scribe_client_gpui::remote_handshake::{self, RemoteDialer};
-use scribe_client_gpui::restore_replay::round_positive_f32_to_u16;
+use scribe_client_gpui::restore_replay::{
+    self, ReplayLaunch, command_argv, prepare_replay, round_positive_f32_to_u16,
+};
+use scribe_client_gpui::restore_state::{
+    AiResumeMode, LaunchBinding, RestoreStore, WindowRestoreState,
+};
 use scribe_client_gpui::search::{
     FindOverlayColors, FindOverlayEvent, FindOverlayView, FindResults, MatchHighlightColors,
     SEARCH_RESULT_LIMIT,
@@ -91,6 +96,10 @@ use scribe_client_gpui::url_detect;
 use scribe_client_gpui::vi_mode::ViMotion;
 use scribe_client_gpui::window_chrome;
 use scribe_client_gpui::window_lifecycle::{ExitReason, FocusReport, WindowLifecycle};
+use scribe_client_gpui::window_state::{
+    WindowGeometry, WindowRegistry, geometry_from_bounds, geometry_size_is_sane,
+    normalize_legacy_geometry, window_bounds_for,
+};
 use scribe_client_gpui::workspace_notes::WorkspaceNotesStore;
 use scribe_client_gpui::workspace_notes_modal::{
     WorkspaceNotesModalAction, WorkspaceNotesModalColors, WorkspaceNotesModalView,
@@ -111,7 +120,7 @@ use scribe_common::{
         load_config,
     },
     framing::{read_message, write_message},
-    ids::{SessionId, WorkspaceId},
+    ids::{SessionId, WindowId, WorkspaceId},
     protocol::{
         ArchiveReason, AutomationAction, ClientMessage, ClipboardSelection, PromptMarkKind,
         ServerMessage, SessionInfo, TerminalSize, WindowInfo,
@@ -129,7 +138,7 @@ use tokio::{
 };
 
 use crate::{
-    ipc_bridge::{InboundEvent, IpcSink, PaneOp, run_drain},
+    ipc_bridge::{InboundEvent, IpcSink, PaneOp, RestoredSession, run_drain},
     pane_shell::{ClosedPane, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
     session_lifecycle::{JumpDirection, PromptMarks},
     sync_frames::{SyncFrameQueue, drain_all_committed},
@@ -284,6 +293,11 @@ struct Shared {
     tabs: Arc<Mutex<TabSessions>>,
     /// Server-connection flag driving the status bar's connection dot.
     connected: Arc<AtomicBool>,
+    /// Set by the IPC reader once the server has answered this connection's
+    /// first `ListSessions`. Cold-restart replay waits on it: only an *answered*
+    /// and empty session list proves the server lost everything, which is the
+    /// one case a persisted restore snapshot may be replayed into.
+    session_list_seen: Arc<AtomicBool>,
     /// AI state + prompt history driving the prompt bar and the tab context %.
     ai: Arc<Mutex<AiChrome>>,
     /// Server-reported terminal chrome (CWD, git branch, session context, env
@@ -364,6 +378,12 @@ const X11_FOCUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// parked, and performing the OSC 52 clipboard work it queued.
 const WINDOW_LIFECYCLE_TICK: Duration = Duration::from_millis(200);
 
+/// How long a layout or geometry change must settle before it is written to
+/// disk. A drag-resize emits a bounds change per frame and a split re-reports
+/// the tree several times while sessions arrive; debouncing collapses each burst
+/// into one write of the state the window actually came to rest in.
+const RESTORE_DEBOUNCE: Duration = Duration::from_millis(500);
+
 /// How often the client re-polls the server's window list. Mirrors the winit
 /// client's throttle: the reply only feeds the status bar's remote-control
 /// summary, so it is refreshed on a human timescale rather than per frame.
@@ -403,6 +423,153 @@ enum GridDrag {
     Idle,
     /// The left button is down; pointer motion extends the selection.
     Selecting,
+}
+
+/// What this process claimed out of the restore store before opening a window.
+///
+/// Resolved in [`main`], *before* GPUI creates the window, for two reasons. The
+/// index claim is what decides how many `--restore-child` siblings this process
+/// must fan out, and it has to happen once per process rather than once per
+/// reconnect. And the geometry of the window being restored is only known from
+/// the claimed snapshot's (pre-crash) window id, so it has to be in hand to open
+/// the window at the right bounds instead of moving it a frame later.
+struct ColdStart {
+    /// The claimed snapshot, replayed once the server's first `SessionList`
+    /// confirms it lost everything.
+    snapshot: Option<WindowRestoreState>,
+    /// The geometry persisted for the claimed snapshot's window, normalized and
+    /// range-checked.
+    geometry: Option<WindowGeometry>,
+}
+
+impl ColdStart {
+    /// Claim one restore entry, fan out siblings for the rest, and load the
+    /// claimed window's geometry.
+    fn resolve() -> Self {
+        let Some((snapshot, remaining)) = RestoreStore::new().claim_first_window() else {
+            return Self { snapshot: None, geometry: None };
+        };
+        tracing::info!(
+            window_id = %snapshot.window_id,
+            remaining,
+            launches = snapshot.launches.len(),
+            "claimed a cold-restart snapshot"
+        );
+        // A fanned-out child claims exactly one entry and must never fan out
+        // again: otherwise one crashed multi-window session would spawn windows
+        // without bound.
+        if restore_replay::is_restore_child(std::env::args()) {
+            tracing::info!("restore child — not fanning out further windows");
+        } else {
+            restore_replay::spawn_restore_children(remaining);
+        }
+        // Geometry is keyed by the PRE-CRASH window id. A true cold restart
+        // reaches a fresh server that has not named this window yet, and by the
+        // time `Welcome` does the window is already on screen.
+        let geometry = WindowRegistry::new()
+            .load_saved(snapshot.window_id)
+            .map(|geom| normalize_legacy_geometry(&geom))
+            .filter(geometry_size_is_sane);
+        Self { snapshot: Some(snapshot), geometry }
+    }
+}
+
+/// The per-window inputs resolved before GPUI builds the root view.
+///
+/// Both are decided outside the view: the terminal size by the process-wide
+/// config, the snapshot by [`ColdStart`]'s one claim against the restore index.
+struct WindowSeed {
+    /// Dimensions announced to the server for newly created sessions.
+    terminal_size: TerminalSize,
+    /// The cold-restart snapshot this window is responsible for replaying, if
+    /// this process claimed one.
+    restored: Option<WindowRestoreState>,
+}
+
+/// Classify what a `CreateSession` is launching so a cold restart relaunches
+/// the same thing.
+///
+/// An AI tab is recognised from its argv rather than from the shortcut that
+/// opened it, which is what lets a custom command that happens to invoke a
+/// provider come back as an AI launch too. A resume invocation is matched first
+/// because a resume argv also contains the provider's bare binary name.
+fn launch_binding_for(command: Option<&Vec<String>>) -> LaunchBinding {
+    let Some(argv) = command else {
+        return restore_replay::new_shell_binding(None);
+    };
+    if let Some(provider) = restore_replay::detect_ai_command(argv, true) {
+        return restore_replay::new_ai_binding(provider, AiResumeMode::Resume, None, None);
+    }
+    if let Some(provider) = restore_replay::detect_ai_command(argv, false) {
+        return restore_replay::new_ai_binding(provider, AiResumeMode::New, None, None);
+    }
+    restore_replay::new_custom_binding(argv.clone(), None)
+}
+
+/// Everything the window needs to persist its state and replay a cold restart.
+///
+/// The two halves are deliberately kept together: a restore is only useful with
+/// the geometry it was captured at, and both are cleared by the same explicit
+/// close or quit.
+struct RestoreRuntime {
+    store: RestoreStore,
+    registry: WindowRegistry,
+    /// The snapshot [`ColdStart`] claimed, held until the first `SessionList`
+    /// says whether it is needed. Taken (and dropped) either way.
+    pending: Option<WindowRestoreState>,
+    /// Per-session launch bindings — what a snapshot's `LaunchRecord`s are built
+    /// from. A session this window did not create itself (a reattach, a share
+    /// join) gets a plain shell binding, which is what a cold restart relaunches.
+    bindings: HashMap<SessionId, LaunchBinding>,
+    /// Bindings for sessions this window has asked for but not yet been given,
+    /// oldest first. `CreateSession` carries no id, so the answering
+    /// `SessionCreated` is matched by the FIFO order the single ordered writer
+    /// channel guarantees — the same rule `pending_workspaces` follows.
+    requested: VecDeque<LaunchBinding>,
+    /// This window's server-assigned id, adopted from `Welcome`. Nothing can be
+    /// persisted before it arrives: both files are keyed by it.
+    window_id: Option<WindowId>,
+    /// Geometry read off the live window by the bounds observer.
+    geometry: Option<WindowGeometry>,
+    /// The geometry already on disk, so an idle window rewrites nothing.
+    saved_geometry: Option<WindowGeometry>,
+    /// When the layout last changed, or `None` when the snapshot on disk is
+    /// current. Drives the [`RESTORE_DEBOUNCE`] flush.
+    layout_dirty_since: Option<Instant>,
+    /// When the geometry last changed, on the same debounce.
+    geometry_dirty_since: Option<Instant>,
+    /// Set once an explicit close or quit removed the persisted state, so the
+    /// tick cannot resurrect it on the way out.
+    cleared: bool,
+    /// True from the moment a replay dispatches its launches until every
+    /// restored pane has adopted one of the answers.
+    replaying: bool,
+}
+
+impl RestoreRuntime {
+    fn new(pending: Option<WindowRestoreState>) -> Self {
+        Self {
+            store: RestoreStore::new(),
+            registry: WindowRegistry::new(),
+            pending,
+            bindings: HashMap::new(),
+            requested: VecDeque::new(),
+            window_id: None,
+            geometry: None,
+            saved_geometry: None,
+            layout_dirty_since: None,
+            geometry_dirty_since: None,
+            cleared: false,
+            replaying: false,
+        }
+    }
+
+    /// Note that the persisted snapshot no longer matches the live layout.
+    fn mark_layout_dirty(&mut self) {
+        if self.layout_dirty_since.is_none() {
+            self.layout_dirty_since = Some(Instant::now());
+        }
+    }
 }
 
 /// The window's clipboard surfaces, grouped because they are always used
@@ -607,6 +774,12 @@ struct TerminalView {
     /// Held to keep the bell signal subscription alive. Registered with the
     /// window so a signal arrives with the `Window` its attention request needs.
     _bell_subscription: Subscription,
+    /// Cold-restart snapshot persistence, geometry persistence, and the replay
+    /// of whatever this process claimed at launch.
+    restore: RestoreRuntime,
+    /// Held to keep the window-bounds observer alive, which is what notices a
+    /// move or resize worth persisting.
+    _bounds_observer: Subscription,
 }
 
 impl TerminalView {
@@ -644,13 +817,61 @@ impl TerminalView {
         });
     }
 
+    /// Watch the platform window for the moves and resizes worth persisting.
+    ///
+    /// This is the GPUI equivalent of the winit client's `Moved`/`Resized`
+    /// handlers. It is not the only reader: the paint path takes the same
+    /// reading each frame, so a window that is opened and never touched still
+    /// persists the size it came up at rather than nothing at all.
+    fn start_geometry_tracking(window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        cx.observe_window_bounds(window, |view, window, ctx| view.capture_geometry(window, ctx))
+    }
+
+    /// Capture the live window's geometry into the restore runtime.
+    ///
+    /// Runs once at construction and again on every bounds change, which is the
+    /// GPUI equivalent of the winit client's `Moved`/`Resized` handlers. The
+    /// write itself is debounced by the lifecycle tick — a drag-resize would
+    /// otherwise rewrite the file once per frame.
+    fn capture_geometry(&mut self, window: &Window, cx: &App) {
+        let monitor =
+            window.display(cx).and_then(|display| display.uuid().ok()).map(|id| id.to_string());
+        let geometry = geometry_from_bounds(window.bounds(), window.is_maximized(), monitor);
+        if !geometry_size_is_sane(&geometry) || self.restore.geometry.as_ref() == Some(&geometry) {
+            return;
+        }
+        self.restore.geometry = Some(geometry);
+        if self.restore.geometry_dirty_since.is_none() {
+            self.restore.geometry_dirty_since = Some(Instant::now());
+        }
+    }
+
+    /// Start the three background pollers the window owns: the lifecycle tick,
+    /// the redraw pump driven by the IPC drain's generation counter, and the
+    /// config-reload drain.
+    ///
+    /// Each is held by the view, so dropping the view cancels all three.
+    fn start_drivers(
+        generation: Arc<AtomicU64>,
+        config_signal: ConfigChangeSignal,
+        cx: &mut Context<Self>,
+    ) -> (Task<()>, Task<()>, Task<()>) {
+        (
+            cx.spawn(async move |view, app| drive_window_lifecycle(view, app).await),
+            cx.spawn(async move |view, app| drive_redraws(view, app, generation).await),
+            cx.spawn(async move |view, app| drive_config_reloads(view, app, config_signal).await),
+        )
+    }
+
     fn new(
         shared: Shared,
         sink: IpcSink,
-        terminal_size: TerminalSize,
+        seed: WindowSeed,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let WindowSeed { terminal_size, restored } = seed;
+        let bounds_observer = Self::start_geometry_tracking(window, cx);
         let (x11_focus, x11_focus_task) = Self::start_x11_focus_guard(window, cx);
         // The focus observer is registered unconditionally: reporting focus to
         // the server is a protocol obligation on every backend, and the X11
@@ -659,17 +880,11 @@ impl TerminalView {
             .observe_window_activation(window, |view, window, ctx| view.on_activation(window, ctx));
         let (bell, bell_subscription) = Self::start_bell_gate(window, cx);
         Self::register_close_veto(window, cx);
-        let generation = Arc::clone(&shared.generation);
-        let lifecycle_task =
-            cx.spawn(async move |view, app| drive_window_lifecycle(view, app).await);
-        let refresh_task =
-            cx.spawn(async move |view, app| drive_redraws(view, app, generation).await);
         // Load the config and start the file watcher in one step so an edit
         // saved after this point reaches the window without a restart.
         let config = ConfigRuntime::start();
-        let config_signal = config.signal();
-        let config_task =
-            cx.spawn(async move |view, app| drive_config_reloads(view, app, config_signal).await);
+        let (lifecycle_task, refresh_task, config_task) =
+            Self::start_drivers(Arc::clone(&shared.generation), config.signal(), cx);
         let (status_colors, terminal_colors) = Self::theme_palettes(&config);
         let chrome = config.config().chrome;
         let opacity = clamp_opacity(config.opacity());
@@ -740,6 +955,8 @@ impl TerminalView {
             _lifecycle_task: lifecycle_task,
             _activation_observer: activation_observer,
             _bell_subscription: bell_subscription,
+            restore: RestoreRuntime::new(restored),
+            _bounds_observer: bounds_observer,
         }
     }
 
@@ -2102,9 +2319,15 @@ impl TerminalView {
             match reason {
                 ExitReason::QuitRequested => {
                     tracing::info!("quit requested by server — exiting");
+                    // A quit is deliberate, so the panes must not come back —
+                    // but the window's size and place should, which is why the
+                    // geometry is flushed here and only the snapshot cleared.
+                    self.flush_geometry_now();
+                    self.clear_restore_state(false);
                 }
                 ExitReason::WindowClosed => {
                     tracing::info!("window close acknowledged by server — exiting");
+                    self.clear_restore_state(true);
                 }
             }
             cx.quit();
@@ -2115,6 +2338,224 @@ impl TerminalView {
         self.poll_lan_approval(cx);
         self.poll_clipboard(cx);
         self.poll_remote_actions(cx);
+        self.poll_restore(cx);
+    }
+
+    // -- Cold-restart restore and window geometry persistence -----------------
+
+    /// Run the restore machinery for one tick: adopt the window id, replay a
+    /// claimed snapshot once the server has answered, and flush whichever of the
+    /// two persisted files has settled.
+    fn poll_restore(&mut self, cx: &mut Context<Self>) {
+        if self.restore.window_id.is_none() {
+            self.restore.window_id =
+                self.shared.lifecycle.lock().ok().and_then(|lifecycle| lifecycle.window_id());
+        }
+        self.sync_launch_bindings();
+        self.replay_cold_restart(cx);
+        self.flush_geometry_if_due();
+        if self.restore.layout_dirty_since.is_some_and(|at| at.elapsed() >= RESTORE_DEBOUNCE) {
+            self.flush_snapshot_now(cx);
+        }
+    }
+
+    /// Give every live session a launch binding and forget the ones that ended.
+    ///
+    /// A binding is what a snapshot's `LaunchRecord` is built from, so this is
+    /// the thing that decides what a cold restart relaunches. Sessions this
+    /// window asked for take the binding queued by the request that asked for
+    /// them, in the FIFO order the one ordered writer channel guarantees;
+    /// everything else (a reattach, a share join) falls back to a plain shell.
+    fn sync_launch_bindings(&mut self) {
+        let Ok(tabs) = self.shared.tabs.lock() else { return };
+        let live: Vec<SessionId> = tabs.tabs().iter().map(|tab| tab.session_id).collect();
+        drop(tabs);
+        for session_id in &live {
+            if self.restore.bindings.contains_key(session_id) {
+                continue;
+            }
+            let binding = self
+                .restore
+                .requested
+                .pop_front()
+                .unwrap_or_else(|| restore_replay::new_shell_binding(None));
+            self.restore.bindings.insert(*session_id, binding);
+            self.restore.mark_layout_dirty();
+        }
+        let before = self.restore.bindings.len();
+        self.restore.bindings.retain(|session_id, _| live.contains(session_id));
+        if self.restore.bindings.len() != before {
+            self.restore.mark_layout_dirty();
+        }
+    }
+
+    /// Replay the snapshot this process claimed, if the server confirms it is
+    /// needed.
+    ///
+    /// Three gates, in order. The server must have *answered* the startup
+    /// `ListSessions` — an unanswered list is not an empty one. That answer must
+    /// be empty: a server that kept this window's sessions is restored by the
+    /// ordinary reattach, and replaying on top of it would double every pane.
+    /// And the window must have painted once, because the restored panes are
+    /// sized from the measured grid area; creating them earlier would spawn
+    /// every PTY at the fallback 80x24 and leave the shell's first output
+    /// formatted for a width the pane never had.
+    fn replay_cold_restart(&mut self, cx: &mut Context<Self>) {
+        if self.restore.pending.is_none() || !self.shared.session_list_seen.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let live = self.shared.tabs.lock().map_or(0, |tabs| tabs.tabs().len());
+        if live > 0 {
+            tracing::info!(
+                live,
+                "server kept this window's sessions — dropping the cold-restart snapshot"
+            );
+            self.restore.pending = None;
+            self.restore.mark_layout_dirty();
+            return;
+        }
+        if self.grid_area.get().is_none() {
+            return;
+        }
+        let Some(snapshot) = self.restore.pending.take() else { return };
+        let rebuilt = prepare_replay(&snapshot);
+        let bindings: HashMap<PaneId, LaunchBinding> = rebuilt
+            .panes
+            .iter()
+            .map(|(pane_id, pane)| (*pane_id, pane.launch_binding.clone()))
+            .collect();
+        let launches = self.shell.adopt_restored(rebuilt, cx);
+        let viewport = self.pane_viewport();
+        let sizes: HashMap<PaneId, TerminalSize> = self
+            .shell
+            .placements(viewport, cx)
+            .into_iter()
+            .map(|placement| (placement.pane_id, self.grid_size_for(placement.rect)))
+            .collect();
+        tracing::info!(
+            window_id = %snapshot.window_id,
+            panes = launches.len(),
+            regions = self.shell.region_count(cx),
+            "replaying a cold-restart snapshot"
+        );
+        self.restore.replaying = !launches.is_empty();
+        for launch in &launches {
+            self.dispatch_replay_launch(launch, bindings.get(&launch.pane_id), &sizes);
+        }
+        self.report_workspace_tree(cx);
+        self.restore.mark_layout_dirty();
+        cx.notify();
+    }
+
+    /// Ask the server to re-create one restored pane's session.
+    fn dispatch_replay_launch(
+        &mut self,
+        launch: &ReplayLaunch,
+        binding: Option<&LaunchBinding>,
+        sizes: &HashMap<PaneId, TerminalSize>,
+    ) {
+        // The binding is queued before the request goes out so the answering
+        // `SessionCreated` re-adopts the pane's original launch id, which is
+        // what keeps the next snapshot pointing at the same env envelope.
+        if let Some(binding) = binding {
+            self.restore.requested.push_back(binding.clone());
+        }
+        let size = sizes.get(&launch.pane_id).copied().unwrap_or(self.terminal_size);
+        let result = self.sink.create_restored_session(RestoredSession {
+            workspace_id: launch.workspace_id,
+            size,
+            cwd: launch.cwd.clone(),
+            command: command_argv(&launch.command),
+            launch_id: launch.launch_id.clone(),
+        });
+        match result {
+            Ok(()) => tracing::info!(
+                pane = launch.pane_id.raw(),
+                %launch.workspace_id,
+                cols = size.cols,
+                rows = size.rows,
+                "requested a restored session"
+            ),
+            Err(error) => tracing::warn!(%error, "restored session dropped: IPC writer closed"),
+        }
+    }
+
+    /// Persist the window's geometry once the move or resize has settled.
+    fn flush_geometry_if_due(&mut self) {
+        if self.restore.geometry_dirty_since.is_some_and(|at| at.elapsed() >= RESTORE_DEBOUNCE) {
+            self.flush_geometry_now();
+        }
+    }
+
+    /// Write the window's geometry now, keyed by the id `Welcome` assigned.
+    fn flush_geometry_now(&mut self) {
+        self.restore.geometry_dirty_since = None;
+        let (Some(window_id), Some(geometry)) =
+            (self.restore.window_id, self.restore.geometry.clone())
+        else {
+            return;
+        };
+        if self.restore.saved_geometry.as_ref() == Some(&geometry) {
+            return;
+        }
+        match self.restore.registry.save(window_id, &geometry) {
+            Ok(()) => self.restore.saved_geometry = Some(geometry),
+            Err(error) => tracing::warn!(%error, "failed to persist window geometry"),
+        }
+    }
+
+    /// Write the cold-restart snapshot for this window now.
+    ///
+    /// A window with nothing replayable in it is *removed* from the store
+    /// instead: leaving a blank entry in the index would have the next cold
+    /// start claim it and replay an empty window forever.
+    fn flush_snapshot_now(&mut self, cx: &mut Context<Self>) {
+        self.restore.layout_dirty_since = None;
+        let Some(window_id) = self.restore.window_id.filter(|_| !self.restore.cleared) else {
+            return;
+        };
+        let snapshot = self.shell.restore_snapshot(window_id, &self.restore.bindings, cx);
+        if !snapshot.is_replayable() {
+            self.forget_restore_entry(window_id);
+            return;
+        }
+        // The per-window file is written before the index entry, so a failed
+        // snapshot write can never leave a dangling id in the index.
+        if let Err(error) = self.restore.store.save_window(&snapshot) {
+            tracing::warn!(%error, "failed to persist the cold-restart snapshot");
+            return;
+        }
+        if let Err(error) = self.restore.store.upsert_index(window_id) {
+            tracing::warn!(%error, "failed to update the restore index");
+        }
+    }
+
+    /// Drop this window's snapshot and index entry.
+    fn forget_restore_entry(&self, window_id: WindowId) {
+        if let Err(error) = self.restore.store.remove_from_index(window_id) {
+            tracing::warn!(%error, "failed to remove the window from the restore index");
+        }
+        self.restore.store.remove_window(window_id);
+    }
+
+    /// Clear the persisted restore state on a deliberate exit.
+    ///
+    /// An explicit quit or window close is the user saying these panes should
+    /// not come back, so the snapshot goes; only a crash (this process dying
+    /// without reaching here) leaves one behind to replay. `drop_geometry` is
+    /// set for a permanent window close, where the window itself is gone and its
+    /// size is no longer meaningful — a quit keeps it so the next launch reopens
+    /// where the user left off.
+    fn clear_restore_state(&mut self, drop_geometry: bool) {
+        self.restore.cleared = true;
+        self.restore.layout_dirty_since = None;
+        self.restore.geometry_dirty_since = None;
+        let Some(window_id) = self.restore.window_id else { return };
+        self.forget_restore_entry(window_id);
+        if drop_geometry {
+            self.restore.registry.remove(window_id);
+        }
     }
 
     /// Run every automation action the reader queued from a `RunAction`.
@@ -2210,12 +2651,17 @@ impl TerminalView {
     ///
     /// The tab appears once the server answers with `SessionCreated`, so the
     /// strip never shows a tab whose PTY failed to spawn.
-    fn create_tab(&self, command: Option<Vec<String>>) {
+    fn create_tab(&mut self, command: Option<Vec<String>>) {
         let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
         else {
             tracing::warn!("new tab ignored: no workspace is attached yet");
             return;
         };
+        // Queued before the request goes out so the answering `SessionCreated`
+        // is bound to what this tab actually launched — a plain shell, or the
+        // AI command an AI-tab shortcut asked for, which is what a cold restart
+        // has to relaunch rather than a bare login shell.
+        self.restore.requested.push_back(launch_binding_for(command.as_ref()));
         if let Err(error) =
             self.sink.create_session(workspace_id, self.focused_pane_size, None, command)
         {
@@ -2308,7 +2754,16 @@ impl TerminalView {
     fn open_new_window(&mut self, cx: &mut Context<Self>) {
         let terminal_size = self.terminal_size;
         let (shared, sink) = start_window_backend(terminal_size);
-        open_window(cx, &shared, &sink, terminal_size);
+        // A deliberately opened window starts blank. Claiming a restore entry
+        // here would reopen some *other* crashed window's panes inside it, which
+        // is why the winit client skipped restore for `--window-id` launches.
+        open_window(
+            cx,
+            &shared,
+            &sink,
+            terminal_size,
+            ColdStart { snapshot: None, geometry: None },
+        );
         tracing::info!("opened a new terminal window");
     }
 
@@ -2494,12 +2949,13 @@ impl TerminalView {
     ///
     /// The pane was queued by the split, so the reconcile pass hands it the
     /// session as soon as `SessionCreated` lands.
-    fn request_pane_session(&self) {
+    fn request_pane_session(&mut self) {
         let Some(workspace_id) = self.shared.tabs.lock().ok().and_then(|t| t.active_workspace())
         else {
             tracing::warn!("pane session ignored: no workspace is attached yet");
             return;
         };
+        self.restore.requested.push_back(launch_binding_for(None));
         if let Err(error) =
             self.sink.create_session(workspace_id, self.focused_pane_size, None, None)
         {
@@ -2559,6 +3015,10 @@ impl TerminalView {
             return;
         }
         self.last_reported_tree = Some(tree);
+        // Every layout change funnels through here, so this is also where the
+        // cold-restart snapshot learns it is stale — the same trigger the winit
+        // client debounced its own save on.
+        self.restore.mark_layout_dirty();
         tracing::info!(
             regions = self.shell.region_count(cx),
             panes = self.shell.pane_count(cx),
@@ -2577,6 +3037,22 @@ impl TerminalView {
         }
     }
 
+    /// The terminal grid a pane rect resolves to at the live font metrics.
+    ///
+    /// Shared by the per-frame republish and the cold-restart replay so a
+    /// restored PTY is created at exactly the size the pane it lands in will
+    /// report one frame later.
+    fn grid_size_for(&self, rect: Rect) -> TerminalSize {
+        let cell_width = self.font.cell_width();
+        let line_height = self.font.line_height;
+        TerminalSize {
+            cols: round_positive_f32_to_u16((rect.width / cell_width).floor()).max(1),
+            rows: round_positive_f32_to_u16((rect.height / line_height).floor()).max(1),
+            cell_width: round_positive_f32_to_u16(cell_width).max(1),
+            cell_height: round_positive_f32_to_u16(line_height).max(1),
+        }
+    }
+
     /// Tell the server (and each local grid) how big every pane now is.
     ///
     /// A `Resize` alone would leave the pane showing a grid it can no longer
@@ -2591,20 +3067,12 @@ impl TerminalView {
         if cell_width <= 0.0 || line_height <= 0.0 {
             return;
         }
-        let reported_width = round_positive_f32_to_u16(cell_width).max(1);
-        let reported_height = round_positive_f32_to_u16(line_height).max(1);
         let placements = self.shell.placements(viewport, cx);
         let live: HashSet<SessionId> =
             placements.iter().filter_map(|placement| placement.session_id).collect();
         self.pane_sizes.retain(|session, _| live.contains(session));
         for placement in placements {
-            let size = TerminalSize {
-                cols: round_positive_f32_to_u16((placement.rect.width / cell_width).floor()).max(1),
-                rows: round_positive_f32_to_u16((placement.rect.height / line_height).floor())
-                    .max(1),
-                cell_width: reported_width,
-                cell_height: reported_height,
-            };
+            let size = self.grid_size_for(placement.rect);
             if placement.focused {
                 // A new tab and a split both open into the focused pane, so the
                 // size they announce has to be that pane's, not the window's.
@@ -2680,10 +3148,48 @@ impl TerminalView {
                 changed = true;
             }
         }
+        changed |= self.fill_pending_panes(cx);
         if changed {
             self.publish_pane_sizes(cx);
             self.report_workspace_tree(cx);
         }
+    }
+
+    /// Hand every still-queued pane one of the sessions that has arrived but is
+    /// not on screen yet.
+    ///
+    /// A pane is only pending because something explicitly asked the server for
+    /// a session to put in it — a split, or a cold-restart replay. The
+    /// active-session path above adopts one such answer per pass, which is
+    /// enough for a split but not for a replay: five `CreateSession` frames come
+    /// back faster than five ticks, so four of the five panes would stay empty
+    /// and their sessions would live on as tabs with nowhere to render.
+    /// Gated on a replay being in flight, because outside one the pairing would
+    /// be wrong: a split's pending pane must get the session that split asked
+    /// for, not whichever older tab happens to have no pane. A replay starts
+    /// from a server with nothing, so every unshown session it sees is one of
+    /// its own answers.
+    fn fill_pending_panes(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.restore.replaying {
+            return false;
+        }
+        let mut changed = false;
+        loop {
+            let shown = self.shell.shown_sessions();
+            let unshown = self.shared.tabs.lock().ok().and_then(|tabs| {
+                tabs.tabs().iter().map(|tab| tab.session_id).find(|id| !shown.contains(id))
+            });
+            let Some(session_id) = unshown else { break };
+            let Some(pane) = self.shell.take_pending(cx) else { break };
+            self.adopt_session(pane, session_id);
+            self.follow_session_to_region(pane, session_id, cx);
+            changed = true;
+        }
+        if !self.shell.has_pending() {
+            tracing::info!("cold-restart replay filled every restored pane");
+            self.restore.replaying = false;
+        }
+        changed
     }
 
     /// Fold every parked `WorkspaceInfo` onto the region it names.
@@ -4448,6 +4954,7 @@ impl Render for TerminalView {
         if !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle, cx);
         }
+        self.capture_geometry(window, cx);
         self.sync_tabs(cx);
         self.sync_find_results(cx);
         self.sync_workspace_notes(cx);
@@ -4603,6 +5110,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         active_session: Arc::new(Mutex::new(None)),
         tabs: Arc::new(Mutex::new(TabSessions::new())),
         connected: Arc::new(AtomicBool::new(false)),
+        session_list_seen: Arc::new(AtomicBool::new(false)),
         ai: Arc::new(Mutex::new(AiChrome::new(
             load_config().unwrap_or_default().terminal.ai_session.ai_states,
         ))),
@@ -4652,6 +5160,10 @@ fn main() {
         return;
     }
 
+    // Claimed before the backend connects: the claim decides how many
+    // `--restore-child` siblings this process fans out, and its geometry is what
+    // the window is opened at.
+    let cold_start = ColdStart::resolve();
     let terminal_size = default_terminal_size();
     let (shared, sink) = start_window_backend(terminal_size);
 
@@ -4666,7 +5178,7 @@ fn main() {
         // screenshots stay byte-identical — under the E2E determinism path.
         let animations = load_config().map_or(true, |config| config.appearance.animations);
         AnimationSettings::resolve(animations).apply_to_app(cx);
-        open_window(cx, &shared, &sink, terminal_size);
+        open_window(cx, &shared, &sink, terminal_size, cold_start);
         cx.activate(true);
     });
 }
@@ -4707,8 +5219,31 @@ fn run_settings() {
     drop(lock_file);
 }
 
-fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink, terminal_size: TerminalSize) {
+fn open_window(
+    cx: &mut App,
+    shared: &Shared,
+    sink: &IpcSink,
+    terminal_size: TerminalSize,
+    cold_start: ColdStart,
+) {
     let bounds = Bounds::centered(None, startup_window_size(cx), cx);
+    // Restored geometry wins over the grid-derived startup size, and it is
+    // applied at creation rather than after: GPUI takes the bounds (and the
+    // maximized state) as window options, so a restored window never flashes at
+    // the default size the way the winit client's async resize did.
+    let window_bounds = cold_start
+        .geometry
+        .as_ref()
+        .map_or(WindowBounds::Windowed(bounds), |geom| window_bounds_for(geom, bounds));
+    if let Some(geom) = cold_start.geometry.as_ref() {
+        tracing::info!(
+            width = geom.width,
+            height = geom.height,
+            maximized = geom.maximized,
+            "restoring persisted window geometry"
+        );
+    }
+    let restored = cold_start.snapshot;
     let shared = shared.clone();
     let sink = sink.clone();
     // Everything between here and the root-view builder below happens inside
@@ -4718,7 +5253,7 @@ fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink, terminal_size: Ter
     let bringup_start = Instant::now();
     if let Err(error) = cx.open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_bounds: Some(window_bounds),
             // Set WM_NAME/_NET_WM_NAME to "Scribe" so the X11 visual-E2E harness
             // (`docker/entrypoint-visual.sh`) can locate the window with
             // `xdotool search --name "Scribe"` for focus and screenshot capture.
@@ -4737,7 +5272,9 @@ fn open_window(cx: &mut App, shared: &Shared, sink: &IpcSink, terminal_size: Ter
         |window, cx| {
             let bringup_ms = bringup_start.elapsed().as_secs_f64() * 1000.0;
             WINDOW_BRINGUP_MS_BITS.store(bringup_ms.to_bits(), Ordering::Release);
-            cx.new(|cx| TerminalView::new(shared, sink, terminal_size, window, cx))
+            cx.new(|cx| {
+                TerminalView::new(shared, sink, WindowSeed { terminal_size, restored }, window, cx)
+            })
         },
     ) {
         tracing::error!(%error, "failed to open GPUI window");
@@ -5054,6 +5591,7 @@ where
         ai: ctx.shared.ai,
         chrome_metadata: ctx.shared.chrome_metadata,
         tabs: ctx.shared.tabs,
+        session_list_seen: ctx.shared.session_list_seen,
         share: ctx.shared.share,
         update: ctx.shared.update,
         lifecycle: ctx.shared.lifecycle,
@@ -5346,6 +5884,9 @@ struct ReaderCtx {
     chrome_metadata: Arc<Mutex<ChromeMetadata>>,
     /// Ordered tab strip the reader rebuilds from server session traffic.
     tabs: Arc<Mutex<TabSessions>>,
+    /// Latched by the first `SessionList`; see the `session_list_seen` field of
+    /// `Shared`.
+    session_list_seen: Arc<AtomicBool>,
     /// Feature-015 share state the reader folds roster and control notices into.
     share: Arc<Mutex<ShareChrome>>,
     /// Update availability / progress the centred status-bar CTA renders from.
@@ -5902,6 +6443,10 @@ fn on_session_list(
     attached: Option<SessionId>,
 ) -> Result<(), String> {
     registry.rebuild_from_session_list(sessions);
+    // Latched before anything else folds the list in: the cold-restart replay
+    // reads this to tell "the server has nothing" from "the server has not
+    // answered yet", and only the former may replay a persisted snapshot.
+    ctx.session_list_seen.store(true, Ordering::Release);
     tracing::debug!(
         sessions = registry.len(),
         workspaces = registry.reconnect_topology().len(),

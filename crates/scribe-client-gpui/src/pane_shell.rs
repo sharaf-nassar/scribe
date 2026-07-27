@@ -23,12 +23,18 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use gpui::{App, AppContext as _, Entity};
-use scribe_client_gpui::layout::{FocusDirection, LayoutNode, PaneId, Rect, SplitDirection};
+use scribe_client_gpui::layout::{
+    FocusDirection, LayoutNode, LayoutTree, PaneId, Rect, SplitDirection,
+};
 use scribe_client_gpui::pane_tree::PaneTree;
+use scribe_client_gpui::restore_replay::{
+    PaneRestore, RebuiltWindow, ReplayLaunch, new_shell_binding, snapshot_window_restore,
+};
+use scribe_client_gpui::restore_state::{LaunchBinding, WindowRestoreState};
 use scribe_client_gpui::workspace_layout::{WindowLayout, WorkspaceSlot};
 use scribe_client_gpui::workspace_tree::WorkspaceTree;
 use scribe_common::{
-    ids::{SessionId, WorkspaceId},
+    ids::{SessionId, WindowId, WorkspaceId},
     protocol::{LayoutDirection, PaneTreeNode, WorkspaceTreeNode},
 };
 
@@ -120,6 +126,24 @@ pub struct RetiredPanes {
     pub changed: bool,
     /// Server-minted regions that collapsed because their last pane went away.
     pub closed_regions: Vec<WorkspaceId>,
+}
+
+/// The scratch layout a restore snapshot is assembled into, plus the per-pane
+/// records that go with it.
+///
+/// The two always travel together — a pane record is keyed by the id the layout
+/// minted for it — so they are one parameter rather than two.
+struct SnapshotTarget<'a> {
+    layout: &'a mut WindowLayout,
+    panes: &'a mut HashMap<PaneId, PaneRestore>,
+}
+
+/// Build the slot edit that reapplies a restored region's name and accent.
+fn apply_slot_metadata(name: Option<String>, accent: [f32; 4]) -> impl FnOnce(&mut WorkspaceSlot) {
+    move |slot| {
+        slot.name = name;
+        slot.accent_color = accent;
+    }
 }
 
 /// The window's live pane/workspace layout.
@@ -376,6 +400,11 @@ impl PaneShell {
         }
     }
 
+    /// Whether any pane is still waiting for the session it asked for.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Take the pane at the head of the pending queue, dropping panes that have
     /// been closed while their session was in flight.
     pub fn take_pending(&mut self, cx: &App) -> Option<PaneId> {
@@ -590,6 +619,154 @@ impl PaneShell {
     /// Number of workspace regions the window is split into.
     pub fn region_count(&self, cx: &App) -> usize {
         self.workspace.read(cx).layout().workspace_count()
+    }
+
+    // -- Cold-restart restore -------------------------------------------------
+
+    /// Serialise this window's live regions and panes into a cold-restart
+    /// snapshot.
+    ///
+    /// The shell keeps panes in [`PaneTree`] entities rather than in the
+    /// workspace model's tab list, while the ported snapshot format is written
+    /// against [`WindowLayout`] — so a scratch layout is filled from the live
+    /// trees (one region → one tab whose pane tree is the region's whole split,
+    /// the same shape [`Self::wire_tree`] reports to the server) and handed to
+    /// [`snapshot_window_restore`]. Panes still waiting for a session are
+    /// pruned, exactly as they are on the wire: replaying a pane whose session
+    /// never existed would recreate a launch the user never made.
+    pub fn restore_snapshot(
+        &self,
+        window_id: WindowId,
+        bindings: &HashMap<SessionId, LaunchBinding>,
+        cx: &App,
+    ) -> WindowRestoreState {
+        let workspace = self.workspace.read(cx);
+        let mut layout = WindowLayout::from_tree(&workspace.to_tree());
+        let mut panes: HashMap<PaneId, PaneRestore> = HashMap::new();
+        for workspace_id in workspace.layout().workspace_ids_in_order() {
+            if let (Some(live), Some(target)) =
+                (workspace.find_workspace(workspace_id), layout.find_workspace_mut(workspace_id))
+            {
+                target.name.clone_from(&live.name);
+                target.accent_color = live.accent_color;
+            }
+            self.snapshot_region(
+                workspace_id,
+                &mut SnapshotTarget { layout: &mut layout, panes: &mut panes },
+                bindings,
+                cx,
+            );
+        }
+        layout.set_focused_workspace(workspace.focused_workspace_id());
+        snapshot_window_restore(window_id, &layout, &panes)
+    }
+
+    /// Copy one region's pane split into the scratch layout as a single tab and
+    /// record a [`PaneRestore`] for every pane that has a session.
+    fn snapshot_region(
+        &self,
+        workspace_id: WorkspaceId,
+        target: &mut SnapshotTarget<'_>,
+        bindings: &HashMap<SessionId, LaunchBinding>,
+        cx: &App,
+    ) {
+        let SnapshotTarget { layout, panes } = target;
+        let Some(tree) = self.trees.get(&workspace_id) else { return };
+        let Some(wire) = pane_node_to_wire(tree.read(cx).tree().root(), &self.sessions) else {
+            return;
+        };
+        let Some(pairs) = layout.add_tab_with_pane_tree(workspace_id, first_session(&wire), &wire)
+        else {
+            return;
+        };
+        let focused_session =
+            self.focused.get(&workspace_id).and_then(|pane| self.sessions.get(pane)).copied();
+        let mut focused_pane = None;
+        for (session_id, pane_id) in pairs {
+            if Some(session_id) == focused_session {
+                focused_pane = Some(pane_id);
+            }
+            let launch_binding =
+                bindings.get(&session_id).cloned().unwrap_or_else(|| new_shell_binding(None));
+            panes.insert(
+                pane_id,
+                PaneRestore {
+                    session_id,
+                    workspace_id,
+                    cwd: launch_binding.fallback_cwd.clone(),
+                    launch_binding,
+                    first_prompt: None,
+                    latest_prompt: None,
+                    prompt_count: 0,
+                    last_conversation_id: None,
+                    grid: None,
+                },
+            );
+        }
+        if let (Some(pane), Some(tab)) =
+            (focused_pane, layout.active_tab_for_workspace_mut(workspace_id))
+        {
+            tab.focused_pane = pane;
+        }
+    }
+
+    /// Replace the whole shell with a window rebuilt from a cold-restart
+    /// snapshot, returning the ordered launch queue in pane order.
+    ///
+    /// Every restored pane is queued as pending, so the sessions the caller is
+    /// about to ask for land back in the panes they came from as their
+    /// `SessionCreated` answers arrive. The restored regions are marked as
+    /// server workspaces because the replay names them in its own
+    /// `CreateSession` frames, which is what registers them with the server's
+    /// workspace manager.
+    pub fn adopt_restored(
+        &mut self,
+        mut rebuilt: RebuiltWindow,
+        cx: &mut App,
+    ) -> Vec<ReplayLaunch> {
+        let topology = rebuilt.layout.to_tree(&HashMap::new());
+        let focused_workspace = rebuilt.layout.focused_workspace_id();
+        let region_ids = rebuilt.layout.workspace_ids_in_order();
+        let mut trees = HashMap::new();
+        let mut focused = HashMap::new();
+        let mut slots = Vec::new();
+        for workspace_id in &region_ids {
+            let Some(slot) = rebuilt.layout.find_workspace_mut(*workspace_id) else { continue };
+            slots.push((*workspace_id, slot.name.clone(), slot.accent_color));
+            let active = slot.active_tab;
+            let restored = slot.tabs.get_mut(active).map(|tab| {
+                (std::mem::replace(&mut tab.pane_layout, LayoutTree::new()), tab.focused_pane)
+            });
+            let (pane_layout, wanted_focus) = match restored {
+                Some((pane_layout, pane)) => (pane_layout, Some(pane)),
+                None => (LayoutTree::new(), None),
+            };
+            let tree = cx.new(|_| PaneTree::from_tree(pane_layout));
+            let focused_pane = wanted_focus
+                .filter(|pane| tree.read(cx).all_pane_ids().contains(pane))
+                .unwrap_or_else(|| tree.read(cx).initial_pane_id());
+            focused.insert(*workspace_id, focused_pane);
+            trees.insert(*workspace_id, tree);
+        }
+
+        self.workspace = cx.new(|_| WorkspaceTree::from_tree(&topology));
+        self.workspace.update(cx, |tree, ctx| {
+            for (workspace_id, name, accent) in slots {
+                tree.update_slot(workspace_id, apply_slot_metadata(name, accent), ctx);
+            }
+            tree.set_focused_workspace(focused_workspace, ctx);
+        });
+        self.trees = trees;
+        self.focused = focused;
+        self.sessions.clear();
+        self.pending = rebuilt.launches.iter().map(|launch| launch.pane_id).collect();
+        // The snapshot's regions are the ids the replay's own `CreateSession`
+        // frames name, so the server knows them from the first launch onward and
+        // nothing here is waiting on a `WorkspaceInfo` to be re-keyed.
+        self.adopted_server_workspace = true;
+        self.pending_workspaces.clear();
+        self.server_workspaces = region_ids.into_iter().collect();
+        rebuilt.launches.into_iter().collect()
     }
 
     /// The region containing `pane`, or `None` once the pane has been closed.
