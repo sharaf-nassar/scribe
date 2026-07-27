@@ -86,6 +86,30 @@ pub struct ViewportPoint {
     pub col: usize,
 }
 
+/// Where a pane's shell cursor sits, plus the viewport placement needed to
+/// resolve an absolute scrollback row back onto the painted grid.
+///
+/// Read once per frame by the IME path: `abs_row`/`col` become the composition
+/// anchor and the OS candidate window's spot, and the remaining fields are the
+/// live half of
+/// [`PreeditGeometry`](scribe_client_gpui::preedit::PreeditGeometry) the paint
+/// pass completes with its own pixel metrics.
+#[derive(Clone, Copy, Debug)]
+pub struct CursorPlacement {
+    /// The cursor's row counted from the oldest surviving scrollback line.
+    pub abs_row: usize,
+    /// The cursor's column.
+    pub col: usize,
+    /// Grid width in columns.
+    pub columns: u16,
+    /// Rows in the live screen.
+    pub screen_lines: usize,
+    /// Rows the viewport is scrolled up into scrollback (0 at the bottom).
+    pub display_offset: usize,
+    /// Absolute scrollback row of the topmost visible line.
+    pub viewport_top_abs_row: usize,
+}
+
 /// Immutable grid snapshot consumed by [`crate::terminal_element::TerminalElement`].
 #[derive(Clone, Default)]
 pub struct Content {
@@ -276,6 +300,27 @@ impl DisplayOnlyTerminal {
             screen_lines: self.term.screen_lines(),
             cursor_row: self.cursor_line(),
             cursor_col: self.term.grid().cursor.point.column.0,
+        }
+    }
+
+    /// Where this pane's shell cursor sits and how its viewport is placed, in
+    /// the absolute scrollback coordinates an IME composition anchors in.
+    ///
+    /// The preedit overlay is pinned to the line composition started on, so it
+    /// needs the cursor in the same absolute space [`Self::viewport_top_abs`]
+    /// reports; the remaining fields are what
+    /// [`crate::preedit::compute_overlay`](scribe_client_gpui::preedit::compute_overlay)
+    /// resolves that anchor back onto the visible grid with.
+    #[must_use]
+    pub fn cursor_placement(&self) -> CursorPlacement {
+        let anchor = self.prompt_anchor();
+        CursorPlacement {
+            abs_row: anchor.history.saturating_add(anchor.cursor_row),
+            col: anchor.cursor_col,
+            columns: u16::try_from(self.term.columns()).unwrap_or(u16::MAX),
+            screen_lines: anchor.screen_lines,
+            display_offset: self.display_offset(),
+            viewport_top_abs_row: self.viewport_top_abs(),
         }
     }
 

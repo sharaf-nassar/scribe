@@ -11,15 +11,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Pixels, Rgba,
-    StrikethroughStyle, TextAlign, TextRun, UnderlineStyle, Window, canvas, div, fill, point,
-    prelude::*, px, size,
+    App, Bounds, ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontFeatures,
+    FontStyle, FontWeight, Pixels, Rgba, StrikethroughStyle, TextAlign, TextRun, UnderlineStyle,
+    Window, canvas, div, fill, point, prelude::*, px, size,
 };
 use scribe_client_gpui::{
     box_drawing,
     color::{TerminalColors, linear_to_srgb_rgba},
     layout::Rect,
     opacity::{opaque_slot, scale_alpha},
+    preedit::{Ime, PreeditGeometry, PreeditOverlay, PreeditState, compute_overlay},
     restore_replay::round_positive_f32_to_u16,
     search::{MatchHighlight, MatchHighlightColors},
     selection::SelectionSpan,
@@ -27,7 +28,7 @@ use scribe_client_gpui::{
 };
 use scribe_common::config::AppearanceConfig;
 
-use crate::terminal::{Cell, Content, Flags, ViewportPoint};
+use crate::terminal::{Cell, Content, CursorPlacement, Flags, ViewportPoint};
 
 /// Smallest font size the grid will paint at, so a bad `appearance.font_size`
 /// edit (0, negative) can never collapse the grid to nothing.
@@ -220,6 +221,30 @@ pub struct GridColors {
 /// `Cell` is the whole synchronisation story.
 pub type GridBounds = Rc<std::cell::Cell<Option<Bounds<Pixels>>>>;
 
+/// Everything the focused pane's paint pass needs to serve the OS input method.
+///
+/// GPUI only accepts an input handler *during paint* and only for the frame it
+/// is registered on, so the focused pane re-registers the window's [`Ime`]
+/// entity on every frame from inside its grid canvas. Handing it the cursor
+/// cell's rect — rather than the whole grid's — is what lets
+/// [`Ime::bounds_for_range`](scribe_client_gpui::preedit::Ime) put the OS
+/// candidate list under the composition point.
+#[derive(Clone)]
+pub struct ImePaint {
+    /// The window's keyboard focus handle; GPUI drops the registration unless
+    /// this handle is the focused one.
+    pub focus_handle: FocusHandle,
+    /// The composition state machine the platform delivers marked and
+    /// committed text to.
+    pub ime: Entity<Ime>,
+    /// The focused pane's live cursor and viewport placement, or `None` before
+    /// any session is attached (there is nowhere to compose into yet).
+    pub placement: Option<CursorPlacement>,
+    /// The in-flight composition to draw, cloned out of [`Self::ime`] by the
+    /// view so paint needs no entity read.
+    pub preedit: Option<PreeditState>,
+}
+
 /// Paints the current terminal grid with fixed-width rows.
 pub struct TerminalElement {
     content: Content,
@@ -234,6 +259,10 @@ pub struct TerminalElement {
     /// Mouse-selection runs for this frame, already projected onto the visible
     /// viewport. Empty whenever the pane holds no selection.
     selection: Vec<SelectionSpan>,
+    /// IME plumbing for this frame. `None` on every unfocused pane: only one
+    /// pane composes, and registering two handlers would race for the platform
+    /// slot.
+    ime: Option<ImePaint>,
     bounds_sink: GridBounds,
 }
 
@@ -256,8 +285,20 @@ impl TerminalElement {
             highlights: Vec::new(),
             highlight_colors,
             selection: Vec::new(),
+            ime: None,
             bounds_sink,
         }
+    }
+
+    /// Serve the OS input method from this pane's paint pass.
+    ///
+    /// Only the focused pane calls this: the platform holds one input handler
+    /// per window, and the composition belongs to the pane the keystrokes are
+    /// going to.
+    #[must_use]
+    pub fn with_ime(mut self, ime: ImePaint) -> Self {
+        self.ime = Some(ime);
+        self
     }
 
     /// Highlight `highlights` as find matches on top of the resolved cells.
@@ -366,6 +407,104 @@ impl TerminalElement {
         };
         self.paint_vi_cursor(overlay, window);
         self.paint_split_scroll(overlay, window);
+        self.serve_ime(overlay, window, cx);
+    }
+
+    /// Register the window's IME handler for the next frame and draw the
+    /// in-flight composition on top of the grid.
+    ///
+    /// Registration happens unconditionally (there is no composition to wait
+    /// for — the handler is how one starts at all); the overlay only draws once
+    /// the platform has marked text and the anchor is still on screen.
+    fn serve_ime(&self, overlay: OverlayGeometry, window: &mut Window, cx: &mut App) {
+        let Some(ime) = self.ime.as_ref() else {
+            return;
+        };
+        let cursor_cell = ime
+            .placement
+            .and_then(|placement| cursor_cell_bounds(overlay, placement))
+            .unwrap_or_else(|| {
+                // No pane attached yet: hang the candidate window off the
+                // grid's first row rather than dropping the registration, so
+                // the input method still has a live target.
+                Bounds::new(overlay.bounds.origin, size(px(0.0), overlay.line_height))
+            });
+        window.handle_input(
+            &ime.focus_handle,
+            ElementInputHandler::new(cursor_cell, ime.ime.clone()),
+            cx,
+        );
+        let (Some(state), Some(placement)) = (ime.preedit.as_ref(), ime.placement) else {
+            return;
+        };
+        let geometry = PreeditGeometry {
+            grid_origin_px: [f32::from(overlay.bounds.left()), f32::from(overlay.bounds.top())],
+            cell_px: [overlay.cell_width, f32::from(overlay.line_height)],
+            columns: placement.columns,
+            screen_lines: placement.screen_lines,
+            display_offset: placement.display_offset,
+            viewport_top_abs_row: placement.viewport_top_abs_row,
+        };
+        let Some(preedit) = compute_overlay(state, geometry) else {
+            return;
+        };
+        // `accent` is the theme's foreground: the cursor slot resolves to it,
+        // and it is what the legacy renderer drew the composition and its rule
+        // with.
+        self.paint_preedit(&preedit, overlay.accent, window, cx);
+    }
+
+    /// Draw one preedit composition over the grid, in the legacy renderer's
+    /// three layers: an opaque backdrop that hides the cells underneath, the
+    /// composition glyphs, and the underline that marks the text as unconfirmed.
+    ///
+    /// The grid itself is never mutated — the composition is purely an
+    /// occlusion, so cancelling it leaves the pane exactly as it was.
+    fn paint_preedit(
+        &self,
+        overlay: &PreeditOverlay,
+        foreground: Rgba,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let PreeditOverlay { origin_px, cell_px, text, max_cells } = overlay;
+        let [cell_width, cell_height] = *cell_px;
+        if cell_width <= 0.0 || cell_height <= 0.0 {
+            return;
+        }
+        let (text, cells) = clip_preedit(text, *max_cells);
+        if cells == 0 {
+            return;
+        }
+        let origin = point(px(origin_px[0]), px(origin_px[1]));
+        let span = size(px(cell_width * f32::from(cells)), px(cell_height));
+        // Opaque on purpose even under a translucent window: the backdrop's job
+        // is to hide the cells the composition sits on, and a scaled alpha
+        // would let them read through the glyphs.
+        let background = opaque_slot(linear_to_srgb_rgba(self.colors.cells.default_bg()));
+
+        window.paint_quad(fill(Bounds::new(origin, span), background));
+        let run = TextRun {
+            len: text.len(),
+            font: self.font.font_for(Flags::empty()),
+            color: foreground.into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        // No `force_width`: the composition is not on the cell grid yet, so its
+        // glyphs keep their natural advances and the underline below is sized
+        // from the same `unicode_width` budget `clip_preedit` spent.
+        window
+            .text_system()
+            .shape_line(text.into(), px(self.font.size), &[run], None)
+            .paint(origin, px(cell_height), TextAlign::Left, None, window, cx)
+            .ok();
+        let rule = self.font.decoration_thickness();
+        window.paint_quad(fill(
+            Bounds::new(point(origin.x, origin.y + px(cell_height) - rule), size(span.width, rule)),
+            foreground,
+        ));
     }
 
     /// Recolour the cells of `row_index` that a find match covers.
@@ -511,6 +650,64 @@ const CHIP_BACKDROP_ALPHA: f32 = 0.35;
 /// Floor for the chevron's arm length, so the chip stays legible at small
 /// font sizes where the cell advance shrinks below it.
 const MIN_CHEVRON_ARM: f32 = 5.0;
+
+/// The window-space rect of the shell cursor's cell, or `None` when the cursor
+/// is not on a painted row.
+///
+/// This is the OS candidate window's anchor, so it follows the *live* cursor
+/// rather than the composition anchor: the popup should appear where the next
+/// composition will start even before one exists.
+fn cursor_cell_bounds(
+    overlay: OverlayGeometry,
+    placement: CursorPlacement,
+) -> Option<Bounds<Pixels>> {
+    if placement.display_offset > 0 {
+        return None;
+    }
+    let visible_line = placement.abs_row.checked_sub(placement.viewport_top_abs_row)?;
+    if visible_line >= placement.screen_lines {
+        return None;
+    }
+    let left = overlay.bounds.left() + px(overlay.cell_width * grid_f32(placement.col));
+    let top = overlay.bounds.top() + overlay.line_height * grid_f32(visible_line);
+    if top >= overlay.bounds.bottom() {
+        return None;
+    }
+    Some(Bounds::new(point(left, top), size(px(overlay.cell_width), overlay.line_height)))
+}
+
+/// Trim a composition to the cells left on its row, returning the drawable
+/// prefix and the number of cells it occupies.
+///
+/// Widths come from the same `unicode_width` budget
+/// [`preedit_cell_width`](scribe_client_gpui::preedit::preedit_cell_width)
+/// spends — wide CJK glyphs claim two cells, zero-width marks ride the previous
+/// base glyph, and a leading mark with no base is dropped — so the underline
+/// and the backdrop are exactly as wide as the glyphs the shaper lays down.
+fn clip_preedit(text: &str, max_cells: u16) -> (String, u16) {
+    let mut clipped = String::with_capacity(text.len());
+    let mut cells: u16 = 0;
+    for ch in text.chars() {
+        let Ok(width) = u16::try_from(unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
+        else {
+            continue;
+        };
+        if width == 0 {
+            // A combining mark rides the glyph before it; with no base glyph
+            // yet there is nothing to attach to, so it is dropped.
+            if cells > 0 {
+                clipped.push(ch);
+            }
+            continue;
+        }
+        if cells.saturating_add(width) > max_cells {
+            break;
+        }
+        clipped.push(ch);
+        cells += width;
+    }
+    (clipped, cells)
+}
 
 /// The rect the painted rows occupy, in the same f32 window space
 /// [`split_scroll`] computes its geometry in.

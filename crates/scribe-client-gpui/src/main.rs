@@ -62,6 +62,7 @@ use scribe_client_gpui::mouse_reporting::{self, MouseModes, ScrollDirection, Whe
 use scribe_client_gpui::mouse_state::{ClickKind, MouseClickState};
 use scribe_client_gpui::opacity::{clamp_opacity, opaque_slot, surface};
 use scribe_client_gpui::paste::{PasteGate, PasteGateEvent, paste_chunks};
+use scribe_client_gpui::preedit::{Ime, ImeEvent};
 use scribe_client_gpui::prompt_bar::{
     self, PromptBarColors, PromptBarData, PromptContextIndicator,
 };
@@ -144,7 +145,7 @@ use crate::{
     sync_frames::{SyncFrameQueue, drain_all_committed},
     terminal::{Content, DisplayOnlyTerminal, PaneGrids, Scroll},
     terminal_element::{
-        GridBounds, GridColors, GridFont, TerminalElement, cell_at, hits_jump_chip,
+        GridBounds, GridColors, GridFont, ImePaint, TerminalElement, cell_at, hits_jump_chip,
     },
 };
 
@@ -750,6 +751,11 @@ struct TerminalView {
     /// window id (so: X11 sessions only). Suppresses keystrokes while a
     /// compositor overlay covers the window without sending a focus event.
     x11_focus: Option<X11FocusGuard>,
+    /// IME composition state, handed to the platform by the focused pane's
+    /// paint pass. Owning it here (rather than per pane) matches the platform:
+    /// a window has exactly one input handler, and it belongs to whichever pane
+    /// currently has the keyboard.
+    ime: Entity<Ime>,
     /// Terminal-bell suppression gate. The lifecycle tick feeds it the bells the
     /// IPC reader queued plus the focus context the gate reads, and the gate
     /// decides which of them are worth an attention request.
@@ -895,7 +901,6 @@ impl TerminalView {
         let context_thresholds = terminal.ai_session.context_thresholds.clone();
         let prompt_bar_enabled = terminal.prompt_bar.enabled;
         let gate = Self::start_paste_gate(terminal.paste_confirmation, cx);
-        let prompt_colors = PromptBarColors::from(&chrome);
         // The strip starts empty and is filled by the reader's first
         // `SessionList`; `sync_tabs` pushes it into the titlebar on the next
         // redraw so the tab row always mirrors live server state.
@@ -919,7 +924,7 @@ impl TerminalView {
             grid_bounds: GridBounds::default(),
             grid_area: GridBounds::default(),
             published_grid_area: None,
-            prompt_colors,
+            prompt_colors: PromptBarColors::from(&chrome),
             context_thresholds,
             prompt_bar_enabled,
             shell,
@@ -947,6 +952,7 @@ impl TerminalView {
             pointer: PointerState::default(),
             tooltip_demo: false,
             x11_focus,
+            ime: Self::start_ime(cx),
             bell,
             last_window_list_poll: Instant::now(),
             _refresh_task: refresh_task,
@@ -987,6 +993,76 @@ impl TerminalView {
         })
         .detach();
         gate
+    }
+
+    /// Create the IME composition entity and subscribe to its commits.
+    ///
+    /// The entity is what the focused pane hands `Window::handle_input` on
+    /// every painted frame, so the OS input method (ibus/fcitx over XIM on X11,
+    /// `text-input-v3` on Wayland) finally has somewhere to deliver marked and
+    /// committed text — without it the platform drops both and the raw
+    /// keystrokes leak straight to the PTY.
+    fn start_ime(cx: &mut Context<Self>) -> Entity<Ime> {
+        let entity = cx.new(|_| Ime::new());
+        cx.subscribe(&entity, |view, _ime, event: &ImeEvent, ctx| {
+            let ImeEvent::Commit(text) = event;
+            view.commit_ime_text(text.clone(), ctx);
+        })
+        .detach();
+        entity
+    }
+
+    /// Send composed text to the focused pane.
+    ///
+    /// Committed text bypasses the level-4 byte encoder deliberately: the input
+    /// method already decided what characters the user meant, so it is written
+    /// through the ordinary `KeyInput` path as UTF-8, exactly as the winit
+    /// client's `Ime::Commit` arm did.
+    fn commit_ime_text(&mut self, text: String, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        // Only the size is logged: composed text is user input from the OS
+        // input method and must never reach a log line, the same rule the
+        // redacted `Debug` on `PreeditState` enforces.
+        tracing::info!(bytes = text.len(), "committing IME text to the focused pane");
+        if self.with_focused_grid(DisplayOnlyTerminal::clear_selection) == Some(true) {
+            tracing::debug!("IME commit dismissed the focused pane's selection");
+        }
+        self.send_key_bytes(text.into_bytes());
+        cx.notify();
+    }
+
+    /// Refresh the composition anchor from the focused pane and gather what the
+    /// paint pass needs to serve the input method this frame.
+    ///
+    /// The anchor is pushed every frame but only ever applies to the *next*
+    /// composition — an in-flight one keeps the cell it started on — so a
+    /// composition begun after the shell moved the cursor still lands on the
+    /// right line, and one already under way stays pinned while output scrolls
+    /// underneath it.
+    fn sync_ime(&mut self, cx: &mut Context<Self>) -> ImePaint {
+        let placement = self.with_focused_grid(|terminal| terminal.cursor_placement());
+        let preedit = self.ime.update(cx, |ime, _| {
+            if let Some(placement) = placement {
+                ime.set_anchor(placement.abs_row, placement.col);
+            }
+            ime.preedit().cloned()
+        });
+        ImePaint {
+            focus_handle: self.focus_handle.clone(),
+            ime: self.ime.clone(),
+            placement,
+            preedit,
+        }
+    }
+
+    /// Retire an in-flight composition, repainting when one was on screen.
+    fn clear_preedit(&mut self, cx: &mut Context<Self>) {
+        if self.ime.update(cx, |ime, _| ime.clear()) {
+            tracing::info!("retired an in-flight IME composition");
+            cx.notify();
+        }
     }
 
     /// Create the terminal-bell suppression gate and wire its signal to the
@@ -3289,7 +3365,7 @@ impl TerminalView {
     /// what the mouse path hit-tests against. `focused` is therefore the
     /// snapshot [`Self::sync_split_scroll`] already pinned, and every other
     /// pane paints its own untouched grid.
-    fn render_panes(&self, focused: Content, cx: &App) -> Vec<gpui::AnyElement> {
+    fn render_panes(&self, focused: Content, ime: ImePaint, cx: &App) -> Vec<gpui::AnyElement> {
         let viewport = self.pane_viewport();
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
             return Vec::new();
@@ -3297,6 +3373,7 @@ impl TerminalView {
         let placements = self.shell.placements(viewport, cx);
         let split = placements.len() > 1;
         let selection_spans = self.selection_spans();
+        let mut ime = Some(ime);
         let opacity = self.opacity;
         let background = surface(self.terminal_colors.background, opacity);
         let idle_border = surface(self.chrome.divider, opacity);
@@ -3338,19 +3415,24 @@ impl TerminalView {
                 // against that one pane.
                 let selection =
                     if placement.focused { selection_spans.clone() } else { Vec::new() };
-                pane.child(
-                    TerminalElement::new(
-                        content,
-                        self.font.clone(),
-                        colors,
-                        self.highlight_colors,
-                        bounds,
-                    )
-                    .with_highlights(highlights)
-                    .with_selection(selection)
-                    .paint(),
+                let mut element = TerminalElement::new(
+                    content,
+                    self.font.clone(),
+                    colors,
+                    self.highlight_colors,
+                    bounds,
                 )
-                .into_any_element()
+                .with_highlights(highlights)
+                .with_selection(selection);
+                // The input handler is a window-level singleton, so it is
+                // registered by the focused pane alone — `take` guarantees that
+                // even if the layout ever reported two focused placements.
+                if placement.focused
+                    && let Some(ime) = ime.take()
+                {
+                    element = element.with_ime(ime);
+                }
+                pane.child(element.paint()).into_any_element()
             })
             .collect()
     }
@@ -4193,6 +4275,10 @@ impl TerminalView {
         self.bell.update(cx, |controller, _| controller.set_window_focused(active));
         self.report_focus();
         if !active {
+            // A composition belongs to the window that owns the keyboard; the
+            // OS input method has already moved on, so keeping the overlay up
+            // would strand it over a pane nobody is typing into.
+            self.clear_preedit(cx);
             return;
         }
         if let Some(guard) = self.x11_focus.as_mut() {
@@ -4245,6 +4331,13 @@ impl TerminalView {
         let Some(bytes) = encode_key(event) else {
             return;
         };
+        tracing::debug!(key = %event.keystroke.key, "encoding a keystroke for the PTY");
+        // A keystroke that reaches the byte encoder was not consumed by the
+        // input method, so any composition still on screen is stale. GPUI's
+        // xkb-compose path makes this load-bearing: it marks a dead key as
+        // preedit and then delivers the composed character as an ordinary
+        // `KeyDown` without ever retracting the mark.
+        self.clear_preedit(cx);
         // Typing dismisses a selection, exactly as it does in the winit client:
         // the highlighted region describes content the shell is about to
         // overwrite, so leaving it up would highlight the wrong cells.
@@ -4822,9 +4915,9 @@ impl TerminalView {
     /// split ratios need no device-pixel measurement, and the band itself
     /// carries the right-click that opens the context menu at the cursor
     /// without disturbing the display-only elements inside it.
-    fn render_grid(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_grid(&mut self, ime: ImePaint, cx: &mut Context<Self>) -> gpui::AnyElement {
         let focused = self.sync_split_scroll();
-        let panes = self.render_panes(focused, cx);
+        let panes = self.render_panes(focused, ime, cx);
         // Measure the flex-grown grid band. Its height is whatever the chrome
         // bands leave over, which no arithmetic on the window size can predict
         // (the prompt strip comes and goes with the pane's prompts), so the
@@ -4960,7 +5053,8 @@ impl Render for TerminalView {
         self.sync_workspace_notes(cx);
         self.reconcile_panes(cx);
         self.sync_grid_geometry(cx);
-        let grid = self.render_grid(cx);
+        let ime = self.sync_ime(cx);
+        let grid = self.render_grid(ime, cx);
         let status = self
             .shared
             .status
@@ -4988,6 +5082,20 @@ impl Render for TerminalView {
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, ctx| {
+                // Claim every key the window sees, at every level below.
+                //
+                // Once an input handler is registered — which the IME wiring
+                // now does on every frame — gpui's platform layer follows an
+                // un-stopped `KeyDown` with
+                // `input_handler.replace_text_in_range(key_char)`, the "insert
+                // the typed character into the focused text field" behaviour a
+                // text editor wants. A terminal has already encoded that
+                // keystroke itself, so letting it through types every printable
+                // character twice, and turns keys consumed by vi mode or a
+                // binding into stray PTY bytes. A genuine input method never
+                // uses that path: composed text arrives through the platform's
+                // own commit callback, which propagation does not gate.
+                ctx.stop_propagation();
                 // The X11 active-window guard gates everything: while a
                 // compositor overlay owns the screen the keystroke was never
                 // meant for this window, so it reaches no consumer at all.

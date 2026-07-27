@@ -15,9 +15,15 @@
 //! view routes it through the normal `ClientMessage::KeyInput` path — no PTY
 //! bytes ever flow through this module and preedit text is never persisted.
 //!
+//! The live window registers the [`Ime`] entity with the platform on every
+//! painted frame through `Window::handle_input`, from the focused pane's paint
+//! pass, so the handler's element bounds are the cursor cell the OS candidate
+//! window anchors on.
+//!
 //! Because IME needs a real compositor (ibus/fcitx on X11, a text-input protocol
-//! on Wayland) it is verified by the manual parity procedure documented in
-//! `lat.md/client.md` under "GPUI IME Composition", not by a `#[gpui::test]`.
+//! on Wayland) it is verified by the parity procedure documented in
+//! `lat.md/client.md` under "GPUI IME Composition" and by the ibus-driven visual
+//! E2E oracle, not by a `#[gpui::test]`.
 
 use std::ops::Range;
 
@@ -322,6 +328,18 @@ impl Ime {
     pub const fn is_composing(&self) -> bool {
         self.machine.is_composing()
     }
+
+    /// Drop any in-flight composition, returning `true` if one was present.
+    ///
+    /// The window calls this on focus loss and on a keystroke that reached the
+    /// PTY byte encoder: both mean the input method is no longer the thing
+    /// producing text, so an overlay left on screen would be stale. GPUI's
+    /// xkb-compose path in particular arms a preedit for a dead key and then
+    /// delivers the composed character as an ordinary `KeyDown` without ever
+    /// retracting the mark, so nothing else would ever clear it.
+    pub fn clear(&mut self) -> bool {
+        self.machine.clear()
+    }
 }
 
 impl EntityInputHandler for Ime {
@@ -342,7 +360,13 @@ impl EntityInputHandler for Ime {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        None
+        // The terminal exposes no editable document, so there is no selection
+        // to report — but the X11 backend's candidate-window placement
+        // (`get_ime_area`) asks for a selection *first* and gives up on the
+        // rect when the answer is `None`, leaving the OS candidate list parked
+        // at the window origin. An empty selection at the composition point is
+        // what makes the popup follow the cursor cell instead.
+        Some(UTF16Selection { range: 0..0, reversed: false })
     }
 
     fn marked_text_range(
@@ -356,6 +380,7 @@ impl EntityInputHandler for Ime {
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.machine.clear() {
+            tracing::info!("IME preedit unmarked");
             cx.notify();
         }
     }
@@ -370,6 +395,9 @@ impl EntityInputHandler for Ime {
         // A committed edit: clear the composition and forward the bytes.
         let committed = self.machine.commit(text.to_owned());
         if !committed.is_empty() {
+            // Size only — the composed text itself is redacted everywhere, so
+            // the log records that a commit arrived, never what it said.
+            tracing::info!(bytes = committed.len(), "IME committed text");
             cx.emit(ImeEvent::Commit(committed));
         }
         cx.notify();
@@ -385,6 +413,10 @@ impl EntityInputHandler for Ime {
     ) {
         // A marked (in-progress) edit: update the preedit overlay in place.
         if self.machine.mark(new_text, None) {
+            // Size only, for the same reason the commit line is: this is the
+            // one place an outside observer can see that the platform reached
+            // the handler at all, which is what the IME oracle asserts on.
+            tracing::info!(bytes = new_text.len(), "IME preedit updated");
             cx.notify();
         }
     }
@@ -396,8 +428,12 @@ impl EntityInputHandler for Ime {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        // Anchor the OS candidate window at the element origin; a precise
-        // cursor-cell rect is supplied once the view pushes live geometry.
+        // `element_bounds` is the focused pane's *cursor cell* rect: the paint
+        // path builds the `ElementInputHandler` from the live grid geometry
+        // rather than from the whole grid, so the origin here already is the
+        // composition point. Zero width plus the cell height puts the platform
+        // spot (origin + size) at the cell's bottom-left corner, which is where
+        // an X11 candidate list wants to hang.
         Some(Bounds {
             origin: element_bounds.origin,
             size: gpui::size(Pixels::ZERO, element_bounds.size.height),

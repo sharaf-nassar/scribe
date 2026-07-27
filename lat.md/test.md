@@ -288,6 +288,18 @@ The probe keystroke is Ctrl+Shift+U, the client-local tooltip-demo toggle, so th
 
 The crop excludes the status bar deliberately — its sparklines resample every two seconds, so a whole-window comparison could never assert pixel identity.
 
+### IME composition over XIM
+
+`tests/e2e/visual/ime-preedit.sh` (`just e2e-visual-ime`) is the scripted oracle for the IME / preedit parity row: it proves the composition handler is actually registered on the live window.
+
+No unit test over [[crates/scribe-client-gpui/src/preedit.rs#PreeditMachine]] can show that — the module shipped complete and unreferenced, and the failure mode is silent: every key falls through to the byte encoder and the raw latin letters land in the shell.
+
+`SCRIBE_IME=1` starts a real input method before the client launches (`ibus-daemon --panel disable --xim`, plus `XMODIFIERS=@im=ibus`), because GPUI's X11 backend finds an XIM server through that variable and reads it once, when it builds its connection. The engine is `table:cangjie3`, whose composition is a fixed table lookup rather than a phonetic guess, so `h`-`q`-`i` (竹手戈) yields 我 every run. `--daemonize` is load-bearing: without it ibus watches the shell that launched it and exits before any engine registers. The rig also runs on the [[test#Visual E2E Tests#Shared-pane rig]] with a UTF-8 locale exported before the server starts, so `scribe-test` reads the very pane the client types into and bash's readline will accept multibyte input.
+
+Four phases, each asserting a different half of the wiring. Composing raises marked text in the client log — a line only the platform can produce, and only through the registered handler — and repaints the window. The server-owned PTY shows no `hqi`, which is the regression itself. Committing puts a non-ASCII character on that same PTY while the latin keys still never appear. Finally, switching to a passthrough engine and typing one key must add exactly one character: registering a handler makes GPUI follow an un-stopped `KeyDown` with `replace_text_in_range(key_char)`, so without the root listener's `stop_propagation` every printable character is typed twice.
+
+Both PTY comparisons squeeze out spaces, because 我 is double-width and the snapshot reads its trailing spacer cell back as one. Phases poll rather than sleep: a commit still has to cross the IPC socket, reach the PTY, be echoed, and return as a screen update, and selecting an ibus engine is asynchronous — keys pressed while the switch is in flight are swallowed outright.
+
 ### Window sharing and control handoff
 
 `tests/e2e/visual/share-control.sh` is the app-level oracle for the feature-015 share rows: it drives the real client against the real server and asserts both the pixels and the wire.

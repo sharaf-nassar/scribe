@@ -260,6 +260,13 @@ e2e-visual-clipboard:
 e2e-visual-bell:
     docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/bell.sh
 
+# Run the IME/preedit visual E2E. SCRIBE_IME=1 starts ibus with an XIM server
+# and exports XMODIFIERS before the client launches, so a real input method
+# owns the keyboard; the shared-pane rig is what lets `scribe-test` prove the
+# raw composition keys never reached the PTY.
+e2e-visual-ime:
+    docker run --rm --gpus all -e TEST_TIMEOUT=240 -e SCRIBE_IME=1 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/ime-preedit.sh
+
 # Full functional E2E suite: build, containerise, run all tests
 e2e: build-release docker-func
     just e2e-func func/smoke.sh

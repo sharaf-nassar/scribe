@@ -318,11 +318,23 @@ Activation is ported alongside detection: [[crates/scribe-client-gpui/src/url_de
 
 ### GPUI IME Composition
 
-The GPUI rebuild ports the winit [[client#Input#IME Composition]] preedit semantics onto GPUI's IME plumbing so composition anchors on an absolute scrollback row with an underline overlay. IME needs a real compositor, so it is a manual parity item, not a `#[gpui::test]`.
+The GPUI rebuild ports the winit [[client#Input#IME Composition]] preedit semantics onto GPUI's IME plumbing so composition anchors on an absolute scrollback row with an underline overlay.
+
+IME needs a real compositor, so it is covered by an ibus-driven E2E and a manual parity procedure rather than a `#[gpui::test]`.
 
 [[crates/scribe-client-gpui/src/preedit.rs#PreeditState]] is the verbatim data port (redacted-`Debug` composition text, optional caret hint, absolute start row + column). [[crates/scribe-client-gpui/src/preedit.rs#PreeditMachine]] is a GPUI-free state machine mirroring the winit `WindowEvent::Ime` arm: a non-empty `mark` arms/updates the composition anchored at the last `set_anchor` cell, an empty `mark` clears it, and `commit` clears and returns the committed text. The in-flight anchor stays fixed while a later `set_anchor` only affects the next composition.
 
-[[crates/scribe-client-gpui/src/preedit.rs#Ime]] wraps the machine in a `gpui::Entity` and implements `gpui::EntityInputHandler`: GPUI routes marked (composing) text through `replace_and_mark_text_in_range` and committed text through `replace_text_in_range`, which re-emits [[crates/scribe-client-gpui/src/preedit.rs#ImeEvent]] `Commit` so the view sends it through the normal `KeyInput` path. The terminal owns no editable document, so the text-query methods report an empty buffer and candidate placement follows the composition anchor.
+[[crates/scribe-client-gpui/src/preedit.rs#Ime]] wraps the machine in a `gpui::Entity` and implements `gpui::EntityInputHandler`: GPUI routes marked (composing) text through `replace_and_mark_text_in_range` and committed text through `replace_text_in_range`, which re-emits [[crates/scribe-client-gpui/src/preedit.rs#ImeEvent]] `Commit` so the view sends it through the normal `KeyInput` path. The terminal owns no editable document, so `selected_text_range` reports an empty selection at the composition point — X11 candidate placement asks for a selection before it will honour a rect, and `None` parks the popup at the window origin.
+
+#### Registering the Handler
+
+The platform only accepts an input handler *during paint* and only for the frame it is registered on, so the window has to re-offer it every frame or the OS has nowhere to deliver marked and committed text.
+
+[[crates/scribe-client-gpui/src/main.rs#TerminalView#start_ime]] creates the one `Ime` entity per window and subscribes to its commits; [[crates/scribe-client-gpui/src/main.rs#TerminalView#sync_ime]] refreshes the composition anchor from the focused pane's [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#cursor_placement]] and packs the frame's [[crates/scribe-client-gpui/src/terminal_element.rs#ImePaint]]. Only the focused pane receives it, because a window holds exactly one input handler. [[crates/scribe-client-gpui/src/terminal_element.rs#TerminalElement#serve_ime]] then calls `Window::handle_input` from inside the grid's paint pass with the *cursor cell's* rect rather than the whole grid's, which is what makes the OS candidate list hang under the composition point.
+
+Registering a handler changes what GPUI does with ordinary keys: an un-stopped `KeyDown` is followed by `replace_text_in_range(key_char)`, the "insert the typed character into the focused text field" behaviour an editor wants. A terminal has already encoded that keystroke itself, so the root key listener calls `stop_propagation` on every `KeyDown` — without it every printable character is typed twice and keys consumed by vi mode or a binding leak to the PTY as well. A real input method is unaffected: composed text arrives through the platform's own commit callback, which propagation does not gate.
+
+A composition is retired by [[crates/scribe-client-gpui/src/preedit.rs#Ime#clear]] on focus loss and on any keystroke that reached the byte encoder. The latter is load-bearing for GPUI's xkb-compose path, which marks a dead key as preedit and then delivers the composed character as an ordinary `KeyDown` without ever retracting the mark.
 
 #### Preedit Overlay Geometry
 
@@ -330,9 +342,11 @@ The GPUI rebuild ports the winit [[client#Input#IME Composition]] preedit semant
 
 The absolute [[crates/scribe-client-gpui/src/preedit.rs#PreeditState]] `start_row` minus `viewport_top_abs_row` resolves the on-screen line, so terminal scroll keeps the underline pinned to the originating line; a row above or below the visible window, a non-zero `display_offset`, or an anchor column past the right edge all yield `None`. [[crates/scribe-client-gpui/src/preedit.rs#preedit_cell_width]] sizes the underline via `unicode_width` advances (wide CJK glyphs reserve two cells, zero-width marks ride the base glyph, a leading combining mark is skipped), matching the renderer's styled-run accumulator.
 
+[[crates/scribe-client-gpui/src/terminal_element.rs#TerminalElement#paint_preedit]] draws the resolved overlay in the legacy renderer's three layers — an opaque backdrop that hides the cells underneath (opaque even under a translucent window, or they would read through the glyphs), the composition glyphs at their natural advances, and a foreground rule marking the text unconfirmed. The grid itself is never mutated, so cancelling a composition leaves the pane exactly as it was. [[crates/scribe-client-gpui/src/terminal_element.rs#clip_preedit]] trims the text to the cells left on its row against the same `unicode_width` budget, so backdrop and underline are exactly as wide as the glyphs the shaper lays down.
+
 #### IME Parity Procedure
 
-IME is verified manually on both display servers because it depends on a live input-method engine the headless test harness cannot drive. The procedure exercises compose, update, commit, cancel, and the scrollback-stable anchor.
+IME depends on a live input-method engine. `tests/e2e/visual/ime-preedit.sh` ([[test#Visual E2E Tests#IME composition over XIM]]) drives a real one in the container; the manual procedure below covers the display-server and interaction axes the rig cannot reach.
 
 1. **X11 + ibus/fcitx**: start an IME engine (`ibus-daemon -drx` or `fcitx5`), select a CJK input method, run `scribe-client-gpui` under X11, focus a pane, and type a multi-key composition (e.g. Japanese `nihongo`). Verify the underlined preedit appears at the cursor cell, updates in place as keys arrive, the OS candidate window anchors under the composition, Enter commits the selected text to the PTY (preedit clears the same frame the echo lands), and Escape cancels with no bytes sent.
 2. **Wayland**: repeat under a Wayland compositor with `text-input-v3` (e.g. GNOME/Mutter or Sway with `fcitx5`), confirming identical compose/commit/cancel behaviour and candidate placement.
