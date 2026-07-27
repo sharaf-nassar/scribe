@@ -32,6 +32,7 @@ use alacritty_terminal_gpui::{
     term::{Config, Osc52, Term, TermMode},
 };
 use scribe_client_gpui::mouse_reporting::{MotionReporting, MouseModes, MouseReportMode};
+use scribe_client_gpui::scrollbar::ScrollMetrics;
 use scribe_client_gpui::selection::{
     SelectionMode, SelectionPoint, SelectionSpan, SelectionState, viewport_spans,
 };
@@ -175,6 +176,9 @@ pub struct DisplayOnlyTerminal {
     /// grid lines, so scrolling moves the highlight with the content rather
     /// than leaving it pinned to the screen.
     selection: SelectionState,
+    /// Scrollback capacity this grid was built with, restored after a
+    /// [`Self::trim_history`] shrinks the ring to drop rows.
+    scrollback_lines: usize,
 }
 
 impl DisplayOnlyTerminal {
@@ -182,11 +186,13 @@ impl DisplayOnlyTerminal {
     pub fn new(columns: usize, lines: usize) -> Self {
         let dimensions = TerminalDimensions { columns, lines };
         let config = Config { kitty_keyboard: true, osc52: Osc52::Disabled, ..Config::default() };
+        let scrollback_lines = config.scrolling_history;
         let term = Term::new(config, &dimensions, VoidListener);
         let mut terminal = Self {
             term,
             output_processor: vte::ansi::Processor::new(),
             content: Content::default(),
+            scrollback_lines,
             split_scroll: SplitScrollEligibility::default(),
             selection: SelectionState::new(),
         };
@@ -279,6 +285,49 @@ impl DisplayOnlyTerminal {
         self.term.grid().history_size()
     }
 
+    /// Drop the oldest scrollback rows until only `kept_rows` remain, returning
+    /// how many rows actually went.
+    ///
+    /// This replicates the trim the server performs on its own `Term` when it
+    /// suppresses an AI session's ED 3: the sequence never reaches the client
+    /// (it was filtered out of the byte stream), so without this the display
+    /// grid would keep rows the server has already forgotten and every
+    /// absolute-row anchor — prompt-jump targets and scrollbar command ticks —
+    /// would drift a little further from the server's on every redraw.
+    ///
+    /// Shrinking and re-growing the ring is how alacritty exposes the drop, and
+    /// it is the same two-step the server uses, so both ends land on the same
+    /// surviving rows.
+    pub fn trim_history(&mut self, kept_rows: usize) -> usize {
+        let before = self.history_size();
+        if kept_rows >= before {
+            return 0;
+        }
+        let max_rows = self.scrollback_lines;
+        let grid = self.term.grid_mut();
+        grid.update_history(kept_rows.min(max_rows));
+        grid.update_history(max_rows);
+        let dropped = before.saturating_sub(self.history_size());
+        if dropped > 0 {
+            self.make_content();
+        }
+        dropped
+    }
+
+    /// The viewport measurements the overlay scrollbar sizes its thumb from.
+    ///
+    /// Read on the paint pass rather than cached on [`Content`]: the snapshot
+    /// is rebuilt only when visible cells change, while the thumb has to track
+    /// a scrollback that grows on every committed row.
+    #[must_use]
+    pub fn scroll_metrics(&self) -> ScrollMetrics {
+        ScrollMetrics {
+            history_size: self.history_size(),
+            screen_lines: self.term.screen_lines(),
+            display_offset: self.display_offset(),
+        }
+    }
+
     /// The absolute scrollback row the top of the viewport is showing.
     ///
     /// Absolute rows count from the oldest surviving scrollback line, which is
@@ -330,9 +379,18 @@ impl DisplayOnlyTerminal {
     /// the failure jump land here, so they cannot drift from each other or from
     /// [`Self::scroll`]'s snapshot bookkeeping.
     pub fn scroll_to_abs(&mut self, abs_pos: usize) -> bool {
-        let offset = self.display_offset();
-        let target_offset = self.history_size().saturating_sub(abs_pos);
-        let delta = grid_i32(target_offset).saturating_sub(grid_i32(offset));
+        self.scroll_to_offset(self.history_size().saturating_sub(abs_pos))
+    }
+
+    /// Scroll the viewport to an absolute `display_offset`.
+    ///
+    /// The scrollbar's click-to-jump and thumb drag both compute a target
+    /// offset directly (the track *is* the scrollback, so a Y position maps to
+    /// an offset), and routing them through here keeps them on the same
+    /// snapshot bookkeeping as [`Self::scroll`]. Returns `true` when the
+    /// viewport actually moved.
+    pub fn scroll_to_offset(&mut self, offset: usize) -> bool {
+        let delta = grid_i32(offset).saturating_sub(grid_i32(self.display_offset()));
         if delta == 0 {
             return false;
         }
@@ -637,6 +695,12 @@ impl PaneGrids {
         self.grids.get(&session_id).map(DisplayOnlyTerminal::content)
     }
 
+    /// The scrollbar viewport metrics for `session_id`, or `None` when that
+    /// session has no grid yet (nothing to scroll, so nothing to draw).
+    pub fn scroll_metrics(&self, session_id: SessionId) -> Option<ScrollMetrics> {
+        self.grids.get(&session_id).map(DisplayOnlyTerminal::scroll_metrics)
+    }
+
     /// Reshape `session_id`'s grid, creating it first when needed.
     pub fn resize(&mut self, session_id: SessionId, columns: usize, lines: usize) {
         self.grid_mut(session_id).resize(columns, lines);
@@ -665,8 +729,10 @@ impl PaneGrids {
 #[cfg(test)]
 mod tests {
     use scribe_common::config::SmartSelectionConfig;
+    use scribe_common::protocol::PromptMarkKind;
 
     use super::*;
+    use crate::session_lifecycle::{CommandMark, CommandStatus, PromptMarks};
     use crate::sync_frames::{SyncFrameQueue, drain_all_committed};
 
     /// A terminal holding `lines` numbered rows, the last one unterminated so
@@ -730,6 +796,48 @@ mod tests {
         // And jumping back down lands on the row that mark named.
         assert!(terminal.scroll_to_abs(2));
         assert_eq!(terminal.content().row_text(0).trim_end(), "l03");
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#Scrollback trim drops rows and shifts marks]]
+    #[gpui::test]
+    fn scrollback_trim_drops_rows_and_shifts_marks() {
+        let mut terminal = terminal_with_numbered_lines(20, 3, 12);
+        // Twelve lines through a three-row screen leaves nine rows of history.
+        assert_eq!(terminal.history_size(), 9);
+        let mut marks = PromptMarks::new();
+        let session = SessionId::new();
+        for row in [2usize, 6, 8] {
+            marks.record(
+                session,
+                PromptMarkKind::PromptStart,
+                None,
+                PromptAnchor { history: row, screen_lines: 3, cursor_row: 0, cursor_col: 0 },
+            );
+        }
+
+        // Trimming back to four rows drops the five oldest, and the surviving
+        // rows really are gone from the grid, not merely renumbered.
+        let dropped = terminal.trim_history(4);
+        assert_eq!(dropped, 5);
+        assert_eq!(terminal.history_size(), 4);
+        assert_eq!(terminal.scroll_metrics().history_size, 4);
+        terminal.scroll_to_abs(0);
+        assert_eq!(terminal.content().row_text(0).trim_end(), "l06");
+
+        // The two marks below the cut shift down by the drop; the one inside it
+        // (row 2 of 9, now gone) is retired, because the row it named no longer
+        // exists to jump to or tick.
+        marks.on_trim(session, dropped);
+        assert_eq!(
+            marks.marks(session),
+            [
+                CommandMark { abs_pos: 1, status: CommandStatus::Unknown },
+                CommandMark { abs_pos: 3, status: CommandStatus::Unknown },
+            ]
+        );
+
+        // A trim that keeps everything the grid already holds is a no-op.
+        assert_eq!(terminal.trim_history(9), 0);
     }
 
     // @lat: [[test#GPUI Terminal Viewport#Split-scroll pins the live rows under the scrollback]]

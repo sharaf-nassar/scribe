@@ -231,6 +231,14 @@ e2e-visual-mouse-reporting:
 e2e-visual-prompt-marks:
     docker run --rm --gpus all -e TEST_TIMEOUT=300 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/prompt-marks.sh
 
+# Run the command-mark scrollbar E2E: the overlay thumb, its success/failure
+# ticks, the shift a server scrollback trim causes, and the idle fade — all
+# asserted as pixels in the pane's right-edge strip. Needs the shared-pane rig
+# (so `scribe-test` writes the OSC 133 bytes into the very pane the client
+# paints) and a longer budget than the default 60 s for its six phases.
+e2e-visual-scrollbar:
+    docker run --rm --gpus all -e TEST_TIMEOUT=300 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/scrollbar.sh
+
 # Run the AI task-label visual E2E. It relaunches the client to adopt the
 # harness session before it can assert anything, so it needs more than the
 # default 60 s budget.

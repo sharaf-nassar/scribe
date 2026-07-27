@@ -177,7 +177,7 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `UpdateCheckResult` | release settings | scripted-E2E | `settings/server_action.rs::request_update_check`, reached from `SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
 | `ReleaseList` | release settings | scripted-E2E | `settings/server_action.rs::request_release_list`, reached from `SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
 | `PromptMark` | prompt navigation | scripted-E2E | — (missing, FU-7) — `session_lifecycle` tracks trim offsets but no marks are ingested | required |
-| `TrimScrollback` | terminal history | golden | `main.rs::run_reader` arm → `session_lifecycle::SessionRegistry::on_trim_scrollback` | required |
+| `TrimScrollback` | terminal history | visual-E2E | `main.rs::on_positional_pane_message` → `ipc_bridge::InboundEvent::TrimScrollback` → `main.rs::apply_pane_op` → `terminal.rs::DisplayOnlyTerminal::trim_history` + `main.rs::apply_trim_scrollback` (bead `.88`) | required |
 | `ScrollBottom` | terminal viewport | scripted-E2E | — (missing, FU-7) | required |
 | `EnvPreflightResult` | environment settings | scripted-E2E | `settings/server_action.rs::parse_env_preflight_response`, rendered into the Environment page's status line — settings-window row (in-app since bead .82) | required |
 | `EnvStatus` | environment status | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_env_status` → `StatusBarData.env_status` | required |
@@ -314,10 +314,13 @@ first three rows below are reachable rather than blocked.
 | Font fallback | Every terminal run uses `FontFallbacks::from_fonts` with `Symbols Nerd Font Mono`, `Symbols Nerd Font`, `Nerd Font Symbols Mono`, and `Nerd Font Symbols` before existing generic fallbacks; `Unifont Sample` remains excluded. | visual-E2E | `TerminalElement::paint_grid` → `FontVariants::new` → `GridFont::font_for` → `GridFont::fallbacks`, carried on every `TextRun` handed to `shape_line`. The chain resolves because `fonts::register_embedded_fonts` registers an embedded `Symbols Nerd Font Mono` whose cmap maps `U+006D` (see `tools/patch-nerd-symbols-font.py`), surviving gpui `f96212f` `CosmicTextSystem::load_family`'s `'m'`-glyph face eviction that silently dropped every stock symbols-only font. Live capture: `U+F09B`/`U+F121` render as the octocat/code icons, not `Unifont Sample` hex boxes | required |
 | Ligatures | `appearance.ligatures` keeps its semantics: same-style runs call `shape_line` with `Some(cell_width)` and disable `calt` only when false, without drifting later cell origins. | visual-E2E | `ConfigRuntime` → `GridFont::from_appearance` → `GridFont::features` on every run; `paint_row_text` shapes each row with `Some(cell_width)` | required |
 | Opacity | `appearance.opacity` is clamped to `0.0..=1.0`; Wayland and composited X11 repaint alpha-aware terminal and chrome backgrounds live on a transparent surface, without restart. | manual | — (unwired at the audit baseline `f56ef95`, FU-4) — bead `.56` landed afterwards (`771794d`); the cell stays a marker until `.53` re-verifies it against the running client | required |
+| Command-mark scrollbar | Each pane paints a non-reserving overlay scrollbar on its right edge with command-status ticks anchored to absolute scrollback rows, which shift when the server trims scrollback. | visual-E2E | `TerminalView::render_panes` → `TerminalView::scrollbar_paint` → `TerminalElement::with_scrollbar` → `TerminalElement::paint_scrollbar` → `scrollbar::build_scrollbar_render` (bead `.88`); pointer half via `TerminalView::press_grid` → `press_scrollbar` / `update_scrollbar_hover`; oracle `tests/e2e/visual/scrollbar.sh` | required |
 | X11 focus guard | The guard reads GPUI's `RawWindowHandle::Xcb` XID and compares it directly with `_NET_ACTIVE_WINDOW`; non-X11 backends do not enable the guard. | scripted-E2E | `main.rs::open_window` → `TerminalView::new` (FU-15) — starts the guard from the live `Window`, polls it from `drive_x11_focus_polls`, clears the debounce in `TerminalView::on_activation`, and gates the key path in `TerminalView::compositor_overlay_active`; scripted oracle `tests/e2e/visual/x11-focus-guard.sh` | required |
 
-**Reachability:** 0 of 5 rows name a live-path symbol; 3 are unwired and 2 are
-missing.
+**Reachability:** 5 of the 6 rows now name a live-path symbol — the three
+`TerminalElement::paint` rows (FU-1), the X11 focus guard (FU-15), and the
+command-mark scrollbar (bead `.88`). Opacity keeps its marker cell until `.53`
+re-verifies bead `.56` against the running client.
 
 ## Removed configuration keys
 

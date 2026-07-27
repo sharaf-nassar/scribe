@@ -86,34 +86,17 @@ pub fn snapshot_reset_bytes(snapshot: &ScreenSnapshot) -> Vec<u8> {
     bytes
 }
 
-/// How a command anchored by a prompt mark ended.
+/// The command-boundary record type, owned by the scrollbar module.
 ///
-/// Ported from the legacy client's `CommandStatus`. `Unknown` is both the
-/// initial state of an open record and the resting state of a command whose
-/// shell reported no exit code — FR-012/SC-006: an unreported exit is never a
-/// failure, so `jump_to_failure` skips it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandStatus {
-    /// Still running, or finished without a reported exit code.
-    Unknown,
-    /// OSC 133;D reported exit code 0.
-    Success,
-    /// OSC 133;D reported a non-zero exit code.
-    Failure,
-}
-
-/// A prompt / command anchor stored as an absolute scrollback row.
-///
-/// `abs_pos` is "lines since the very top of scrollback" (0 = oldest), the
-/// stable identifier a `TrimScrollback` shifts. Ported from the legacy
-/// `CommandRecord`: the anchor row is the prompt row the command started at and
-/// `status` is resolved when its `CommandEnd` mark arrives. [`PromptMarks`]
-/// populates these from the server's OSC 133 `PromptMark` messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CommandMark {
-    pub abs_pos: usize,
-    pub status: CommandStatus,
-}
+/// The store here and the overlay scrollbar are two ends of one record: the
+/// drain writes `abs_pos`/`status` from the server's OSC 133 stream and the
+/// paint pass renders each entry as a status-coloured tick, so they share the
+/// type rather than each keeping a copy that has to be converted (and kept in
+/// step) on the way to the screen. `Unknown` is both the initial state of an
+/// open record and the resting state of a command whose shell reported no exit
+/// code — FR-012/SC-006: an unreported exit is never a failure, so
+/// `jump_to_failure` skips it and the tick stays neutral.
+pub use scribe_client_gpui::scrollbar::{CommandMark, CommandStatus};
 
 /// The grid geometry a prompt mark is anchored against.
 ///
@@ -343,7 +326,6 @@ pub struct SessionRegistry {
     workspace_order: Vec<WorkspaceId>,
     workspace: HashMap<SessionId, WorkspaceId>,
     adopted_window: Option<WindowId>,
-    last_history: HashMap<SessionId, u32>,
 }
 
 impl SessionRegistry {
@@ -377,21 +359,7 @@ impl SessionRegistry {
     pub fn on_session_exited(&mut self, session_id: SessionId) -> bool {
         let existed = self.workspace.remove(&session_id).is_some();
         self.session_order.retain(|id| *id != session_id);
-        self.last_history.remove(&session_id);
         existed
-    }
-
-    /// Measure a `TrimScrollback` for `session_id`, returning how many of the
-    /// oldest scrollback rows the server dropped.
-    ///
-    /// `history_rows` is the server's post-trim scrollback size; the drop is the
-    /// decrease from the previously-reported size (0 on the first report), which
-    /// a display-only client mirrors as the number of oldest rows to shift past.
-    /// The caller feeds the result to [`PromptMarks::on_trim`], which owns the
-    /// marks the shift applies to.
-    pub fn on_trim_scrollback(&mut self, session_id: SessionId, history_rows: u32) -> usize {
-        let previous = self.last_history.insert(session_id, history_rows).unwrap_or(history_rows);
-        usize::try_from(previous.saturating_sub(history_rows)).unwrap_or(usize::MAX)
     }
 
     /// Record the window id a takeover `Hello`'s `Welcome` adopted.
@@ -735,30 +703,6 @@ mod tests {
         assert!(registry.reconnect_topology().is_empty());
         // Exiting an unknown session is a no-op.
         assert!(!registry.on_session_exited(SessionId::new()));
-    }
-
-    // @lat: [[client#GPUI Client Spike#Session Lifecycle#Registry trims marks]]
-    #[test]
-    fn registry_trim_shifts_session_marks() {
-        let mut registry = SessionRegistry::new();
-        let mut marks = PromptMarks::new();
-        let session = SessionId::new();
-        registry.on_session_created(session, WorkspaceId::new());
-        // First report establishes the baseline history with no drop.
-        assert_eq!(registry.on_trim_scrollback(session, 100), 0);
-
-        // Seed a mark, then a trim that drops 40 rows shifts it down.
-        marks.record(session, PromptMarkKind::PromptStart, None, anchor_at(50, 0));
-        let dropped = registry.on_trim_scrollback(session, 60);
-        assert_eq!(dropped, 40);
-        marks.on_trim(session, dropped);
-        assert_eq!(marks.marks(session), [mark(10)]);
-
-        // Exiting the session clears its history baseline, and the store forgets
-        // its marks alongside it.
-        assert!(registry.on_session_exited(session));
-        marks.forget(session);
-        assert!(marks.marks(session).is_empty());
     }
 
     // @lat: [[client#GPUI Client Spike#Session Lifecycle#Takeover adoption]]

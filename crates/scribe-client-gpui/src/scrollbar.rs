@@ -6,25 +6,46 @@
 //! fades in on scroll, fades out after inactivity, widens on hover, and supports
 //! click-to-jump and drag-to-scroll. Command boundaries render as coloured tick
 //! marks anchored to absolute scrollback rows, so a trim that drops the oldest
-//! rows shifts every surviving mark (see
-//! [`crate::session_lifecycle::shift_absolute_marks_after_trim`]).
+//! rows shifts every surviving mark (the binary's `session_lifecycle`
+//! prompt-mark store owns that shift and hands the ticks in as [`CommandMark`]).
 //!
 //! Ported byte-for-byte from the legacy winit client's `scrollbar.rs`. The pure
 //! logic here — [`ScrollbarState`] fade/width animation, [`compute_thumb`]
 //! geometry, hit-testing, and [`build_scrollbar_render`] thumb/tick emission —
-//! stays free of GPUI types so it is exercised by `#[gpui::test]`; the paint
-//! path lowers [`ScrollbarRender`] onto GPUI quads and the visual E2E exercises
-//! the fade/widen/tick rendering in a later bead.
+//! stays free of GPUI types so it is exercised by `#[gpui::test]`; the terminal
+//! element lowers [`ScrollbarRender`] onto GPUI quads on the live paint pass.
+//!
+//! Unlike the legacy renderer, the geometry constants here are fixed rather
+//! than config-driven: `appearance.scrollbar_width` and
+//! `appearance.scrollbar_color` are declared removed keys for the GPUI client
+//! (they were bespoke-pipeline hover-lerp inputs), so the width comes from
+//! [`SCROLLBAR_WIDTH`] and the colour from the theme's derived
+//! `chrome.scrollbar` slot via [`ScrollbarStyle::from_theme`].
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Instant;
 
+use scribe_common::theme::Theme;
+
 use crate::layout::Rect;
+
+/// Shared handle to one pane's scrollbar state.
+///
+/// The view owns the state across frames (the fade is a wall-clock animation,
+/// not a per-frame derivation) while the paint pass has to mutate it — the
+/// paint pass is what folds the hover width target in, and it is the only
+/// place the pane's real pixel rect is known. Both ends live on the GPUI
+/// thread, so a `RefCell` is the whole synchronisation story.
+pub type ScrollbarHandle = Rc<RefCell<ScrollbarState>>;
 
 /// Resolved command outcome for a scrollbar tick.
 ///
 /// The tick is a redundant secondary cue — the always-visible status-bar glyph
 /// is the authoritative accessible signal — so `Unknown` keeps the existing
 /// neutral tick colour and only `Success`/`Failure` pull theme-derived hues.
+/// `Unknown` is also the resting state of a command whose shell reported no
+/// exit code (FR-012): an unreported exit is never rendered as a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandStatus {
     /// Command outcome is not yet known (still running or unreported).
@@ -39,8 +60,10 @@ pub enum CommandStatus {
 /// scrollback row.
 ///
 /// `abs_pos` is "lines since the very top of scrollback" (0 = oldest), the
-/// stable identifier a `TrimScrollback` shifts (see
-/// [`crate::session_lifecycle::CommandMark`]); `status` selects the tick hue.
+/// stable identifier a `TrimScrollback` shifts; `status` selects the tick hue.
+/// This is the single record type for a command boundary: the binary's
+/// prompt-mark store re-exports it and populates it from the server's OSC 133
+/// `PromptMark` stream, so the ticks are the very rows the jumps land on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandMark {
     /// Absolute scrollback row the mark is anchored to.
@@ -79,6 +102,13 @@ impl CommandMarkColors {
         }
     }
 }
+
+/// Resting scrollbar thumb width in physical pixels.
+///
+/// Fixed rather than read from `appearance.scrollbar_width`: that key is a
+/// removed key for the GPUI client (it fed the bespoke pipeline's hover-lerp
+/// geometry), so it must keep deserializing harmlessly and changing nothing.
+pub const SCROLLBAR_WIDTH: f32 = 6.0;
 
 /// Minimum scrollbar thumb height in physical pixels.
 const MIN_THUMB_HEIGHT: f32 = 20.0;
@@ -375,7 +405,7 @@ pub fn compute_thumb(layout: &ScrollbarLayout, scrollbar_width: f32) -> Option<T
     })
 }
 
-/// Theme/config-derived styling for one pane's scrollbar render pass.
+/// Theme-derived styling for one pane's scrollbar render pass.
 #[derive(Debug, Clone, Copy)]
 pub struct ScrollbarStyle {
     /// Base scrollbar thumb width in physical pixels.
@@ -384,6 +414,24 @@ pub struct ScrollbarStyle {
     pub color: [f32; 4],
     /// Theme-derived success/failure colours for command-status ticks.
     pub command_mark_colors: CommandMarkColors,
+}
+
+impl ScrollbarStyle {
+    /// Resolve the whole scrollbar palette from the active theme.
+    ///
+    /// The thumb takes the theme's derived `chrome.scrollbar` slot (a
+    /// 40 %-alpha foreground tone, which doubles as the resting fade ceiling)
+    /// and the ticks take the ANSI green/red, so a theme switch — including an
+    /// accessible high-contrast one — re-colours the whole overlay with no
+    /// scrollbar-specific configuration.
+    #[must_use]
+    pub fn from_theme(theme: &Theme) -> Self {
+        Self {
+            width: SCROLLBAR_WIDTH,
+            color: theme.chrome.scrollbar,
+            command_mark_colors: CommandMarkColors::from_ansi(&theme.ansi_colors),
+        }
+    }
 }
 
 /// A single rounded quad the paint path fills for the scrollbar.
