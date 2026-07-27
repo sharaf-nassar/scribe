@@ -58,6 +58,38 @@ client needs no window bookkeeping.
   and enforces the thresholds. It attaches to the already-running server and
   **never restarts it**.
 
+## Live-mode prerequisites
+
+A `--live` run has two hard prerequisites that the rig checks before it launches
+anything, and fails on rather than working around:
+
+- **A usable `scribe-test`.** The rig seeds one detached session for the client
+  to attach to. A client that claims an empty window has no workspace, and both
+  clients then refuse to open a tab, so every workload metric would be
+  unmeasurable. Pass `--scribe-test target/release/scribe-test` when the helper
+  is not on `PATH`.
+- **Client binaries that carry the shared probe.** The probe is armed through
+  `SCRIBE_PERF_PROBE`, so the rig checks for that string inside each client
+  binary. The installed `/usr/bin/scribe-client` predates the probe and never
+  writes a report: it starts and shows a window, but every rig wait keyed off
+  the report file burns its full timeout. Point `--old-client` at
+  `target/release/scribe-client`.
+
+Both used to degrade silently, and both surfaced as `NO-BASELINE` on the three
+workload metrics — which reads as "no baselines have been captured yet" rather
+than "this run was handed inputs it cannot measure". That misdiagnosis cost two
+full gate runs during `scribe-38e.42`, so they are now fatal (bead
+`scribe-38e.97`).
+
+`--startup-only` is the one exception on the probe check. Metric 1 has a
+documented fallback to the startup-log method for a binary without the probe
+key, and such a run opens no tabs, so it needs neither the probe nor
+`scribe-test`; a probe-less binary is logged there instead of rejected.
+
+An environment that cannot host a client at all — no `DISPLAY`, no `xdotool`, no
+running server — is *not* fatal. That stays a `NOT-MEASURED` report, because it
+describes the machine rather than the run's arguments.
+
 ## Live-mode safety
 
 Every typing workload runs in a tab the rig opened itself: it sends the
@@ -108,8 +140,13 @@ tools/perf-ab-rig/run-perf-ab.sh
 # client's numbers into perf-baseline.md as it goes:
 tools/perf-ab-rig/run-perf-ab.sh --live \
   --new-client target/release/scribe-client-gpui \
-  --old-client /usr/bin/scribe-client --record-baseline
+  --old-client target/release/scribe-client \
+  --scribe-test target/release/scribe-test --record-baseline
 ```
+
+Every binary passed to a `--live` run must come from this tree; see
+[Live-mode prerequisites](#live-mode-prerequisites) for why the installed
+`/usr/bin/scribe-client` is not a usable old-client half.
 
 Workload sizing is tunable: `--samples N` (latency keystrokes),
 `--firehose-mib N`, `--tabs N`.

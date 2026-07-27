@@ -866,6 +866,16 @@ The GPUI client additionally writes the marker named by `SCRIBE_GPUI_STARTUP_TIM
 
 On the reference host `cx.open_window` alone costs 610–751 ms and the old client's own `configure_wgpu` costs 464–561 ms, so no client can paint inside 500 ms there. Measured like-for-like through the probe, the old client reaches its first frame in 3401–4682 ms against the GPUI client's 634–780 ms, of which only 24–29 ms is Scribe's own.
 
+### Live-run preflight
+
+A `--live` run checks its inputs before it launches anything and aborts with a diagnosis when they cannot produce valid numbers, because both of the ways it used to degrade surfaced as `NO-BASELINE` rather than as a missing prerequisite.
+
+Two conditions are fatal. A client binary that carries no `SCRIBE_PERF_PROBE` string was built without [[crates/scribe-common/src/perf_probe.rs#PerfProbe]] and can never write a probe report, so every rig wait keyed off that file burns its full timeout; the installed `/usr/bin/scribe-client` is exactly such a binary, which is why the gate command names `target/release/scribe-client`. An unusable `scribe-test` leaves the client with no detached session to attach to, and a client that claims an empty window has no workspace, so both clients refuse to open a tab and every typing workload is unmeasurable.
+
+Neither used to stop the run: the missing helper logged "continuing without a seeded session" and the probe-less binary was only noticed 30 s later as "client … never reached a first frame". Both then reported the input-latency, firehose and memory metrics as `NO-BASELINE`, which reads as "no baselines have been captured yet" rather than "this run was handed inputs it cannot measure" — the misdiagnosis that cost two full gate runs during `scribe-38e.42`.
+
+`--startup-only` is the deliberate exception to the probe check. Metric 1 has a documented fallback to the startup-log method for a binary predating the probe key, and such a run opens no tabs, so it needs neither the probe nor `scribe-test`; a probe-less binary is logged there instead of rejected. An environment that cannot host a client at all — no `DISPLAY`, no `xdotool`, no running server — stays non-fatal and reports `NOT-MEASURED`, because it describes the machine rather than the run's arguments.
+
 ### Driving the workloads
 
 Live mode drives both clients with `xdotool`, and three delivery details are load-bearing because getting any of them wrong makes a workload measure nothing at all rather than fail loudly.

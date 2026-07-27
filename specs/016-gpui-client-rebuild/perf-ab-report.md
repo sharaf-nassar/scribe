@@ -70,7 +70,14 @@ server, never restarts it):
 
     tools/perf-ab-rig/run-perf-ab.sh --live \
       --new-client target/release/scribe-client-gpui \
-      --old-client /usr/bin/scribe-client --record-baseline
+      --old-client target/release/scribe-client \
+      --scribe-test target/release/scribe-test --record-baseline
+
+Every binary above must come from this tree. The installed
+`/usr/bin/scribe-client` predates the shared probe and can never write a probe
+report, so a run pointed at it aborts in the preflight instead of timing out
+each workload; `scribe-test` seeds the session the client attaches to and a
+full `--live` run refuses to start without it.
 
 Both clients are instrumented by the shared runtime probe
 (`crates/scribe-common/src/perf_probe.rs`), armed by `SCRIBE_PERF_PROBE`;
