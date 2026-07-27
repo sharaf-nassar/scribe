@@ -97,22 +97,42 @@ rig reports the metric as `NO-BASELINE` rather than passing it. Running the
 rig with `--live --old-client <bin> --record-baseline` re-measures the old
 client with the same probe in the same session and writes the values back
 here. `startup_first_frame_ms` is end-to-end (see above), median of the rig's
-startup samples. The recorded 3334.415 ms is the probe method (first painted
-frame) against an old client rebuilt from this tree; the log method against the
-installed binary scored 3697 ms on the same host. The rig prefers the probe
-whenever the launched binary reports it and falls back to the log otherwise.
+startup samples. The rig prefers the probe whenever the launched binary reports
+it and falls back to the log otherwise.
 
-    perf_baseline_startup_first_frame_ms=3334.415
-    perf_baseline_input_latency_p50_ms=
-    perf_baseline_firehose_bytes_per_sec=
-    perf_baseline_memory_rss_kb=
+All four slots were captured on 2026-07-27 by the `scribe-38e.42` launch-gate
+run, from an old client **rebuilt from this tree** (`target/release/scribe-client`).
+That detail is load-bearing: the *installed* `/usr/bin/scribe-client` predates
+the shared probe, so with it the rig's `start_client` never sees a probe report
+and every workload phase gives up with "client … never reached a first frame",
+which surfaces as three `NO-BASELINE` verdicts rather than as the missing
+prerequisite it actually is. The same run also needs `--scribe-test` pointed at
+a real binary, or the rig logs "cannot seed a session for the client" and
+continues without one. The command that produced these values:
+
+    tools/perf-ab-rig/run-perf-ab.sh --live \
+      --new-client target/release/scribe-client-gpui \
+      --old-client target/release/scribe-client \
+      --scribe-test target/release/scribe-test \
+      --record-baseline
+
+    perf_baseline_startup_first_frame_ms=4571.975
+    perf_baseline_input_latency_p50_ms=0.032
+    perf_baseline_firehose_bytes_per_sec=243217.780
+    perf_baseline_memory_rss_kb=476916
 
 ## Remaining gate measurements
 
 Input echo latency, `cat` firehose throughput, and memory at ten tabs are
 captured live by the rig, not inferred from a sandboxed launch: both clients
 carry the same probe (`crates/scribe-common/src/perf_probe.rs`), so the A/B
-compares identical measurement points under an identical workload. Until the
-slots above are filled by a `--record-baseline` run, those three metrics have
-no comparison point and the gate stays `INCOMPLETE`. Scroll fps is an absolute
-target (sustained 60 fps, `< 1%` dropped) and needs no old-client baseline.
+compares identical measurement points under an identical workload. All three
+slots are now filled (see above), so the gate scores them rather than reporting
+`NO-BASELINE`. Scroll fps is an absolute target (sustained 60 fps, `< 1%`
+dropped) and needs no old-client baseline.
+
+Scroll is measured for the **new client only** — `run-perf-ab.sh` calls
+`measure_scroll "$NEW_CLIENT"` and has no old-client arm — so a scroll failure
+cannot currently be attributed between a client regression and an unreachable
+absolute target. Pointing `--new-client` at the old binary with `--out` to a
+scratch path is the way to get that comparison.
