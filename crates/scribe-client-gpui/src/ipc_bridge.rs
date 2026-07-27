@@ -228,6 +228,29 @@ impl std::fmt::Display for SinkClosed {
     }
 }
 
+/// One pane of a cold-restart snapshot, expressed as the session request that
+/// re-creates it.
+///
+/// Grouped into a value rather than passed as five parallel arguments because
+/// every field comes from the same persisted `LaunchRecord` and they are only
+/// ever meaningful together.
+#[derive(Debug, Clone)]
+pub struct RestoredSession {
+    /// The workspace region the restored pane belongs to.
+    pub workspace_id: WorkspaceId,
+    /// The grid the restored pane will occupy, so the PTY is spawned at the
+    /// size it is about to be rendered at instead of the 80×24 default.
+    pub size: TerminalSize,
+    /// The directory the saved pane was working in.
+    pub cwd: Option<PathBuf>,
+    /// The program to spawn instead of a login shell (a custom command, or a
+    /// provider resume for an AI pane).
+    pub command: Option<Vec<String>>,
+    /// The persisted `LaunchRecord.launch_id`, which the server looks the saved
+    /// environment envelope up by.
+    pub launch_id: String,
+}
+
 /// Outbound half of the bridge: the GPUI-side replacement for Zed's
 /// `write_to_pty`. Enqueues `ClientMessage::KeyInput` / `Resize` onto the shared
 /// IPC-writer channel, which is a single ordered FIFO drained by the writer
@@ -304,6 +327,26 @@ impl IpcSink {
             size: Some(size),
             command,
             env_envelope_id: None,
+        })
+    }
+
+    /// Requests the session that re-creates one pane of a cold-restart snapshot.
+    ///
+    /// Identical to [`Self::create_session`] except for `env_envelope_id`: the
+    /// persisted `LaunchRecord.launch_id` the server looks the pane's saved
+    /// environment envelope up by, so a relaunched shell comes back with the
+    /// variables it had before the crash instead of a bare login environment.
+    ///
+    /// # Errors
+    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    pub fn create_restored_session(&self, request: RestoredSession) -> Result<(), SinkClosed> {
+        self.enqueue(ClientMessage::CreateSession {
+            workspace_id: request.workspace_id,
+            split_direction: None,
+            cwd: request.cwd,
+            size: Some(request.size),
+            command: request.command,
+            env_envelope_id: Some(request.launch_id),
         })
     }
 
