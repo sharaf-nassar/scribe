@@ -51,6 +51,7 @@
 #
 # Usage:
 #   tools/perf-ab-rig/run-perf-ab.sh [--live] [--startup-only] [--scroll-only]
+#       [--latency-only]
 #       [--out PATH] [--new-client PATH] [--old-client PATH] [--baseline PATH]
 #       [--record-baseline] [--samples N] [--firehose-mib N] [--tabs N]
 #       [--scribe-test PATH]
@@ -58,7 +59,8 @@
 # --startup-only limits a --live run to metric 1 (no tabs are opened and no
 # keys are typed); metrics 2-5 report NOT-MEASURED. This is the fast loop for
 # the startup perf bead. --scroll-only is the same idea for metric 5, which is
-# the one metric measured on both clients purely to attribute a failure.
+# the one metric measured on both clients purely to attribute a failure, and
+# --latency-only for metric 2.
 #
 # A full --live run has two hard prerequisites, both checked up front and both
 # fatal rather than degraded (see `live_preflight`): the `scribe-test` helper
@@ -118,7 +120,12 @@ SCROLL_DROPPED_MAX_PCT=1       # dropped-frame ceiling
 NOISE_TOLERANCE_PCT=10
 
 # --- workload sizing ------------------------------------------------------
-LATENCY_SAMPLES=25             # keystrokes echoed per latency run
+# Keystrokes echoed per latency run. Both clients land in the 0.2-0.4 ms band,
+# where desktop jitter is a large fraction of the measurement: at the original
+# 25 the median moved by more than the 10% allowance between back-to-back runs
+# of the same binary (0.260 then 0.366 ms), enough to decide the gate by
+# itself. At 60 the medians repeat inside the allowance.
+LATENCY_SAMPLES=60
 FIREHOSE_MIB=32                # size of the file `cat`ted for throughput
 MEMORY_TABS=10                 # tab count for the memory metric
 SCROLL_SECONDS=8               # sustained scroll drive time
@@ -141,6 +148,7 @@ while [[ $# -gt 0 ]]; do
     --live) MODE="live"; shift ;;
     --startup-only) ONLY_METRIC="startup"; shift ;;
     --scroll-only) ONLY_METRIC="scroll"; shift ;;
+    --latency-only) ONLY_METRIC="latency"; shift ;;
     --out) OUT="$2"; shift 2 ;;
     --new-client) NEW_CLIENT="$2"; shift 2 ;;
     --old-client) OLD_CLIENT="$2"; shift 2 ;;
@@ -177,7 +185,7 @@ MEASURED_TABS=""
 log() { echo "[perf-ab] $*" >&2; }
 
 # Whether the named metric is scored on this run. Empty ONLY_METRIC scores all
-# five; --startup-only and --scroll-only narrow it to one.
+# five; --startup-only, --latency-only and --scroll-only narrow it to one.
 metric_enabled() {
   [[ -z "$ONLY_METRIC" || "$ONLY_METRIC" == "$1" ]]
 }
@@ -237,6 +245,11 @@ record_baseline() {
   local key="$1" value="$2"
   # Metrics that carry a diagnostic suffix (`<value>#<tabs>`) record the value.
   value="${value%%#*}"
+  # A workload that produced only its diagnostic half (`#2` from a memory run
+  # that never reached its tab count) must not blank a good committed baseline:
+  # the next run would then read NO-BASELINE and the gate would go INCOMPLETE
+  # because of one bad run rather than because nothing was ever captured.
+  [[ -n "$value" ]] || { log "no ${key} measured; leaving the committed baseline alone"; return 0; }
   [[ "$RECORD_BASELINE" -eq 1 ]] || return 0
   [[ -f "$BASELINE" ]] || return 0
   local prefix="    perf_baseline_${key}="
@@ -321,6 +334,12 @@ cleanup() {
   rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
+# Bash only runs the EXIT trap for a signal it has a handler for, so without
+# these an interrupted or `timeout`-killed run leaves its client processes and,
+# worse, the sessions it seeded and the tabs it opened behind on the server it
+# was driving. Re-raising keeps the exit status honest.
+trap 'cleanup; trap - INT; kill -INT $$' INT
+trap 'cleanup; trap - TERM; kill -TERM $$' TERM
 
 # Seed one detached session so a launched client has a workspace to attach to.
 #

@@ -879,6 +879,12 @@ fn dispatch_session_message(
 ) -> Option<ServerMessage> {
     match message {
         ServerMessage::PtyOutput { session_id, data } => {
+            // Perf gate: count drained bytes and close the echo round-trip
+            // clock here, at this client's PTY-output entry point, so the A/B
+            // against the GPUI client compares the same pipeline stage. Doing
+            // it on the UI thread instead measured the winit user-event
+            // backlog rather than the server round trip.
+            scribe_common::perf_probe::record_pty_output(session_id, data.len());
             send_event(proxy, UiEvent::PtyOutput { session_id, data });
             None
         }

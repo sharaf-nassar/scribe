@@ -980,6 +980,10 @@ The five metrics and thresholds are: startup-to-first-frame (no worse than the o
 
 The rig has two modes. `assess` (default) generates the current-state report from the committed baseline plus a static capability check without launching any GUI or touching the live server, marking every live-only metric `NOT-MEASURED`. `--live` is the launch-gate mode: it launches each target client on the same machine/session, drives every workload through `xdotool`, and enforces the thresholds; it attaches to the already-running server and never restarts it. The server it attaches to is always the isolated `scribe-dev` one — see [[test#GPUI Perf A/B Gate#Live mode never drives the stable server]].
 
+`--startup-only`, `--latency-only` and `--scroll-only` narrow a live run to one metric so a perf bead can re-measure a fix in a minute rather than paying for every workload; everything they exclude reports `NOT-MEASURED`, so a narrowed run is an iteration loop and never a gate verdict.
+
+The latency workload takes 60 samples rather than the 25 it started with. Both clients land in the 0.2–0.4 ms band once they are measured at the same pipeline stage, and there the median of 25 moved by more than the gate's own 10% allowance between back-to-back runs of the *same* binary (0.260 then 0.366 ms) — enough noise to decide the verdict by itself.
+
 The three comparative metrics are enforced with a 10% run-to-run noise allowance, which is the repeatability of these measurements on a loaded desktop rather than extra headroom. A comparative metric with no committed baseline reads `NO-BASELINE`, and the overall verdict is `INCOMPLETE` unless all five metrics are measured and inside their thresholds; a `FAIL` on any metric fails the gate and reopens the perf bead.
 
 ### Startup instrumentation
@@ -1034,7 +1038,11 @@ Four of the five metrics are only observable from inside a running client, so bo
 
 The report is a flat `key=value` file rewritten at most every 200 ms with cumulative counters plus an `uptime_ms` stamp, so the rig derives a per-workload number from before/after deltas and the client needs no window bookkeeping. The session list doubles as the rig's safety interlock: a typing workload only runs in a tab the rig opened and watched appear as focused, so it can never type into a pane that was already open.
 
-Both clients call the probe from the same three places. The GPUI client reports frames from [[crates/scribe-client-gpui/src/main.rs#TerminalView#report_perf_frame]] on render, stamps keystrokes in its key handler, and counts PTY bytes in `dispatch_server_message`; the old client reports frames from [[crates/scribe-client/src/main.rs#App#report_perf_frame]] on redraw and counts PTY bytes in `handle_stream_user_event`.
+Both clients call the probe from the same three places, and "the same" is load-bearing down to the pipeline stage. The GPUI client reports frames from [[crates/scribe-client-gpui/src/main.rs#TerminalView#report_perf_frame]] on render, stamps keystrokes in [[crates/scribe-client-gpui/src/main.rs#TerminalView#send_key_bytes]], and counts PTY bytes in `on_pane_output_message` — its IPC read task. The old client reports frames from [[crates/scribe-client/src/main.rs#App#report_perf_frame]] on redraw, stamps keystrokes alongside its `ClientCommand::KeyInput` send, and counts PTY bytes in [[crates/scribe-client/src/ipc_client.rs#dispatch_session_message]] — its IPC read task.
+
+PTY output is stamped where it enters the client, in the task that reads the frame off the socket, and never at a later stage. Stamping the two clients at different stages does not merely add a constant; it compares two different quantities. The old client used to count bytes on its UI thread, in `handle_stream_user_event`, three hops downstream of the read task: read task, `EventLoopProxy::send_event`, winit's user-event queue, then the redraw loop. Behind that unbounded queue the probe measures the UI thread's backlog rather than the server round trip, and both probe-derived comparative metrics were corrupted by it in opposite directions. The firehose scored the old client at 0.232 MiB/s against the GPUI client's 17.623 MiB/s, because 32 MiB of `cat` output reached the UI thread far slower than it reached the socket. Input latency scored the old client at 0.032 ms against the GPUI client's 0.209 ms — *faster than a bare local socketpair round trip on the same host*, which is the tell — because with a backlog standing in the queue the next `handle_stream_user_event` after a keystroke was an already-queued stale payload, so the sample timed one event-loop turn instead of a key-to-echo trip. That 6.5x "regression" (bead `scribe-38e.92`) was the measurement, not the client.
+
+The pairing is also session-scoped: [[crates/scribe-common/src/perf_probe.rs#PerfProbe#input_sent]] records which session the keystroke was routed to and [[crates/scribe-common/src/perf_probe.rs#PerfProbe#pty_output]] closes the clock only for output on that session, so a chatty background pane cannot fabricate a round trip. Bytes are still counted for every session, because the firehose metric is about total drain rate. An unmatched keystroke holds the slot for at most [[crates/scribe-common/src/perf_probe.rs#PENDING_INPUT_TTL]]; past that the next keystroke re-arms the clock, so an echo that never arrives cannot silently zero the sample count for the rest of the run.
 
 #### Frame gaps score missed 60 fps slots
 
@@ -1059,6 +1067,14 @@ With `SCRIBE_PERF_PROBE` unset every entry point must be a no-op that neither wr
 #### Counters pair input with its echo
 
 A keystroke sent while another is still unmatched must not restart the clock, so each recorded latency is an unambiguous key-to-echo pair and the byte counter accumulates independently.
+
+#### Another pane's output is not an echo
+
+Output arriving for a session other than the one the keystroke was routed to counts toward drained bytes but must leave the echo clock running, so a background pane draining output cannot fabricate a round trip far shorter than the real one.
+
+#### An echo that never comes releases the clock
+
+A keystroke whose echo never arrives must not hold the pairing slot for the rest of the run, so once it ages past the pending-input TTL the next keystroke re-arms the clock instead of going unmeasured.
 
 #### First frame latches the startup span
 

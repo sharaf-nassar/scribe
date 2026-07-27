@@ -4767,7 +4767,7 @@ impl TerminalView {
             return;
         }
         // Perf gate: start the echo round-trip clock the PTY-output path stops.
-        scribe_common::perf_probe::record_input_sent();
+        scribe_common::perf_probe::record_input_sent(session_id);
     }
 
     /// Publish this frame to the perf rig's probe, along with the tab sessions
@@ -7183,7 +7183,7 @@ fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage) {
             if is_attached(ctx, session_id) {
                 // Perf gate: count drained bytes and close the echo round-trip
                 // clock before the frame queue takes ownership of the payload.
-                scribe_common::perf_probe::record_pty_output(data.len());
+                scribe_common::perf_probe::record_pty_output(session_id, data.len());
                 forward_output(&ctx.in_tx, session_id, data);
             }
         }

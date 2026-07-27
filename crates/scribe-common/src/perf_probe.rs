@@ -45,6 +45,16 @@ const IDLE_GAP: Duration = Duration::from_millis(250);
 /// Upper bound on retained latency samples so a long run cannot grow unbounded.
 const MAX_LATENCY_SAMPLES: usize = 8192;
 
+/// How long an unmatched keystroke keeps the echo clock reserved.
+///
+/// The pairing is session-scoped, so a keystroke whose echo never arrives —
+/// a pane that died, a key the shell swallowed — would otherwise hold the slot
+/// for the rest of the run and every later keystroke would go unmeasured. Past
+/// this age the slot is simply re-armed by the next keystroke. It is an order
+/// of magnitude longer than any plausible echo and shorter than the rig's
+/// per-sample spacing, so it can never truncate a real round trip.
+const PENDING_INPUT_TTL: Duration = Duration::from_secs(1);
+
 /// Process-wide probe handle. `None` means the env var was unset at init.
 static PROBE: OnceLock<Option<PerfProbe>> = OnceLock::new();
 
@@ -54,8 +64,11 @@ struct ProbeState {
     last_frame: Option<Instant>,
     /// When the last report rewrite happened.
     last_flush: Instant,
-    /// Send time of a keystroke still awaiting its echo, if any.
-    pending_input: Option<Instant>,
+    /// The session a keystroke was routed to and when it was sent, while that
+    /// keystroke is still awaiting its echo. Scoped to the session so output
+    /// from any other pane cannot close the clock on a round trip it had
+    /// nothing to do with.
+    pending_input: Option<(SessionId, Instant)>,
     /// Round-trip samples in milliseconds, oldest first.
     latencies: Vec<f64>,
     /// Sessions the client currently renders as tabs.
@@ -171,23 +184,39 @@ impl PerfProbe {
         }
     }
 
-    /// Stamp a keystroke as awaiting its echo. A keystroke sent while another is
-    /// still unmatched is ignored so the pairing can never drift.
-    fn input_sent(&self, now: Instant) {
-        if let Ok(mut state) = self.state.lock()
-            && state.pending_input.is_none()
-        {
-            state.pending_input = Some(now);
+    /// Stamp a keystroke to `session` as awaiting its echo.
+    ///
+    /// A keystroke sent while another is still unmatched is ignored so the
+    /// pairing can never drift, unless the outstanding one has aged past
+    /// [`PENDING_INPUT_TTL`] — an echo that never came must not wedge the
+    /// metric for the rest of the run.
+    fn input_sent(&self, session: SessionId, now: Instant) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let outstanding = state
+            .pending_input
+            .is_some_and(|(_, sent)| now.saturating_duration_since(sent) < PENDING_INPUT_TTL);
+        if !outstanding {
+            state.pending_input = Some((session, now));
         }
     }
 
-    /// Account `len` bytes of PTY output and close an open echo measurement.
-    fn pty_output(&self, len: usize, now: Instant) {
+    /// Account `len` bytes of PTY output from `session` and close an open echo
+    /// measurement when it is that session's keystroke coming back.
+    ///
+    /// Bytes are counted for every session the client is draining, because the
+    /// firehose metric is about total drain rate. The latency pairing is
+    /// narrower: only output on the session the keystroke was routed to can be
+    /// its echo, so a chatty background pane cannot fabricate a round trip that
+    /// never happened.
+    fn pty_output(&self, session: SessionId, len: usize, now: Instant) {
         self.pty_bytes.fetch_add(u64::try_from(len).unwrap_or(u64::MAX), Ordering::Relaxed);
         if let Ok(mut state) = self.state.lock()
-            && let Some(sent) = state.pending_input.take()
+            && state.pending_input.is_some_and(|(pending, _)| pending == session)
+            && let Some((_, sent)) = state.pending_input.take()
         {
-            let elapsed_ms = (now - sent).as_secs_f64() * 1000.0;
+            let elapsed_ms = now.saturating_duration_since(sent).as_secs_f64() * 1000.0;
             if state.latencies.len() < MAX_LATENCY_SAMPLES {
                 state.latencies.push(elapsed_ms);
             }
@@ -370,17 +399,24 @@ pub fn record_frame() {
     }
 }
 
-/// Record that a keystroke was handed to the outbound IPC path.
-pub fn record_input_sent() {
+/// Record that a keystroke bound for `session_id` was handed to the outbound
+/// IPC path.
+pub fn record_input_sent(session_id: SessionId) {
     if let Some(probe) = probe() {
-        probe.input_sent(Instant::now());
+        probe.input_sent(session_id, Instant::now());
     }
 }
 
-/// Record `len` bytes of PTY output arriving from the server.
-pub fn record_pty_output(len: usize) {
+/// Record `len` bytes of PTY output for `session_id` arriving from the server.
+///
+/// Call this from the client's inbound IPC entry point — the task that reads
+/// the frame off the socket — and not from whatever later stage renders it.
+/// Both clients must stamp the same pipeline stage or the A/B compares two
+/// different spans; measuring one of them behind an unbounded UI queue reports
+/// that queue's backlog instead of the server round trip.
+pub fn record_pty_output(session_id: SessionId, len: usize) {
     if let Some(probe) = probe() {
-        probe.pty_output(len, Instant::now());
+        probe.pty_output(session_id, len, Instant::now());
     }
 }
 
@@ -464,8 +500,8 @@ mod tests {
         // must be no-ops rather than writing anywhere or panicking.
         init_from_env();
         record_frame();
-        record_input_sent();
-        record_pty_output(128);
+        record_input_sent(SessionId::new());
+        record_pty_output(SessionId::new(), 128);
         record_sessions(vec![SessionId::new()], None);
         assert!(probe().is_none());
     }
@@ -475,17 +511,57 @@ mod tests {
     fn counters_pair_input_with_its_echo() {
         let dir = std::env::temp_dir().join(format!("scribe-perf-probe-{}", SessionId::new()));
         let probe = PerfProbe::new(dir.clone());
+        let typed = SessionId::new();
         let start = Instant::now();
-        probe.input_sent(start);
+        probe.input_sent(typed, start);
         // A second keystroke while one is outstanding must not restart the clock.
-        probe.input_sent(start + Duration::from_millis(5));
-        probe.pty_output(64, start + Duration::from_millis(10));
-        probe.pty_output(64, start + Duration::from_millis(20));
+        probe.input_sent(typed, start + Duration::from_millis(5));
+        probe.pty_output(typed, 64, start + Duration::from_millis(10));
+        probe.pty_output(typed, 64, start + Duration::from_millis(20));
         let snapshot = probe.snapshot(start + Duration::from_millis(30));
         assert_eq!(snapshot.pty_bytes, 128);
         assert_eq!(snapshot.latency_samples, 1);
         assert_eq!(snapshot.latency_p50_ms, Some(10.0));
         drop(std::fs::remove_file(&dir));
+    }
+
+    // @lat: [[test#Test Harness#GPUI Perf A/B Gate#Runtime probe instrumentation#Another pane's output is not an echo]]
+    #[test]
+    fn another_panes_output_is_not_an_echo() {
+        let path = std::env::temp_dir().join(format!("scribe-perf-scope-{}", SessionId::new()));
+        let probe = PerfProbe::new(path.clone());
+        let typed = SessionId::new();
+        let noisy = SessionId::new();
+        let start = Instant::now();
+        probe.input_sent(typed, start);
+        // A background pane draining bytes counts toward throughput but must
+        // not close a round trip it had nothing to do with.
+        probe.pty_output(noisy, 64, start + Duration::from_micros(30));
+        probe.pty_output(typed, 64, start + Duration::from_millis(2));
+        let snapshot = probe.snapshot(start + Duration::from_millis(3));
+        assert_eq!(snapshot.pty_bytes, 128);
+        assert_eq!(snapshot.latency_samples, 1);
+        assert_eq!(snapshot.latency_p50_ms, Some(2.0));
+        drop(std::fs::remove_file(&path));
+    }
+
+    // @lat: [[test#Test Harness#GPUI Perf A/B Gate#Runtime probe instrumentation#An echo that never comes releases the clock]]
+    #[test]
+    fn an_echo_that_never_comes_releases_the_clock() {
+        let path = std::env::temp_dir().join(format!("scribe-perf-ttl-{}", SessionId::new()));
+        let probe = PerfProbe::new(path.clone());
+        let typed = SessionId::new();
+        let start = Instant::now();
+        probe.input_sent(typed, start);
+        // Nothing echoed this one. Once it ages out, the next keystroke re-arms
+        // the clock instead of going unmeasured for the rest of the run.
+        let later = start + PENDING_INPUT_TTL + Duration::from_millis(1);
+        probe.input_sent(typed, later);
+        probe.pty_output(typed, 8, later + Duration::from_millis(4));
+        let snapshot = probe.snapshot(later + Duration::from_millis(5));
+        assert_eq!(snapshot.latency_samples, 1);
+        assert_eq!(snapshot.latency_p50_ms, Some(4.0));
+        drop(std::fs::remove_file(&path));
     }
 
     // @lat: [[test#Test Harness#GPUI Perf A/B Gate#Runtime probe instrumentation#First frame latches the startup span]]

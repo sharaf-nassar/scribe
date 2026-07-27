@@ -118,11 +118,19 @@ continues without one. The command that produced these values:
       --record-baseline
 
     perf_baseline_startup_first_frame_ms=4571.975
-    perf_baseline_input_latency_p50_ms=0.032
-    perf_baseline_firehose_bytes_per_sec=243217.780
+    perf_baseline_input_latency_p50_ms=0.247
+    perf_baseline_firehose_bytes_per_sec=11154443.570
     perf_baseline_memory_rss_kb=476916
     perf_baseline_scroll_fps=41.480
     perf_baseline_scroll_dropped_pct=8.101
+
+The `input_latency_p50_ms` and `firehose_bytes_per_sec` slots were re-recorded
+later the same day by bead `scribe-38e.92`, from a full `--live
+--record-baseline` run against the isolated `scribe-dev` server. Both are
+supersessions rather than re-measurements: the values they replaced (0.032 and
+243217.780) were produced by instrumentation that stamped the old client's PTY
+output on its UI thread, and nothing the current probe reports is comparable to
+them. See the section below.
 
 The two `scroll_*` slots were added on 2026-07-27 by bead `scribe-38e.91` and
 recorded by a `--live --scroll-only --record-baseline` run against the isolated
@@ -130,6 +138,59 @@ recorded by a `--live --scroll-only --record-baseline` run against the isolated
 comparison input: they are the attribution that tells a client regression apart
 from an unreachable target, which is what the metric lacked. See the section
 below.
+
+## 2026-07-27: input latency was measuring the UI-thread backlog
+
+Metric 2 read 0.209 ms for the new client against 0.032 ms for the old one — a
+6.5x regression against a 10% allowance, and the reason bead `scribe-38e.92`
+was opened. The client was not at fault; the A/B was comparing two different
+quantities.
+
+The two clients stamped PTY output at different pipeline stages. The GPUI
+client counts it in its IPC read task, the moment the frame comes off the
+socket. The old client counted it on its UI thread in
+`handle_stream_user_event`, three hops downstream: read task,
+`EventLoopProxy::send_event`, winit's unbounded user-event queue, redraw loop.
+Behind that queue the probe reports the UI thread's backlog rather than the
+server round trip, and it corrupted both probe-derived comparative metrics in
+opposite directions.
+
+**Input latency.** With a backlog standing in the queue, the first
+`handle_stream_user_event` after a keystroke was an already-queued stale
+payload, so the sample timed one event-loop turn instead of a key-to-echo trip.
+The tell is that 0.032 ms is *faster than a bare local socketpair round trip
+measured on this host* — 0.07-0.12 ms p50 over 25 spaced samples through the
+same "unbounded channel to a writer task, reader task closes the clock" shape
+both clients use. No keystroke can reach the server, echo through a PTY and
+come back in less time than one socket hop.
+
+**Throughput.** The same backlog stretched the firehose window: 32 MiB of `cat`
+output reaches the socket far sooner than it reaches the UI thread, which is
+how the old client scored 0.232 MiB/s.
+
+Both clients now stamp PTY output where it enters the process, and the echo
+pairing is scoped to the session the keystroke was routed to, so a background
+pane's output cannot close another pane's clock. An unmatched keystroke
+releases the pairing slot after one second instead of holding it for the rest of
+the run. The sample count also moved from 25 to 60: in the 0.2-0.4 ms band the
+median of 25 moved by more than the 10% allowance between back-to-back runs of
+the *same* binary (0.260 then 0.366 ms), enough to decide the verdict by itself.
+
+Re-measured that way, on the reference host against the `scribe-dev` server,
+release builds from this tree:
+
+| Metric | New (`scribe-client-gpui`) | Old (`scribe-client`) | Verdict |
+|---|---:|---:|---|
+| Input latency p50 | 0.213 ms | 0.247 ms | PASS |
+| cat-firehose | 17.922 MiB/s | 10.638 MiB/s | PASS |
+
+Two earlier 60-sample latency-only runs agree on the direction: 0.235 against
+0.330 ms, and 0.216 against 0.359 ms. The reported regression was the
+measurement; the new client is in fact slightly faster on both metrics. Both
+absolute latencies are sub-millisecond either way, and the probe measures an
+in-process span rather than user-perceived latency, so neither number was ever
+going to be visible to a user — but the criterion is comparative, and it now
+compares like with like.
 
 ## 2026-07-27: the scroll metric was measuring the rig
 
@@ -186,6 +247,8 @@ dropped as unjustified.
 Input echo latency, `cat` firehose throughput, and memory at ten tabs are
 captured live by the rig, not inferred from a sandboxed launch: both clients
 carry the same probe (`crates/scribe-common/src/perf_probe.rs`), so the A/B
-compares identical measurement points under an identical workload. All those
+compares identical measurement points under an identical workload — identical
+down to the pipeline stage, which is what the input-latency section above had
+to fix. All those
 slots are now filled (see above), so the gate scores them rather than reporting
 `NO-BASELINE`.

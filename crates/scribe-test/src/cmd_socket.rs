@@ -124,10 +124,18 @@ pub enum DaemonResponse {
 
 /// Returns the Unix-domain socket path for the test daemon.
 ///
-/// Path: `/run/user/{uid}/scribe/test-daemon.sock`
+/// Path: `/run/user/{uid}/scribe/test-daemon.sock` for a stable build, or the
+/// `scribe-dev` runtime directory when this binary runs under that file stem.
+/// It is derived from the server socket rather than hardcoded so a harness
+/// staged onto the dev install — as the perf A/B rig stages every binary it
+/// launches — cannot end up with its control socket in one install's runtime
+/// directory and its sessions in another's.
 pub fn daemon_socket_path() -> PathBuf {
     let uid = nix::unistd::geteuid();
-    PathBuf::from(format!("/run/user/{uid}/scribe/test-daemon.sock"))
+    scribe_common::socket::server_socket_path().parent().map_or_else(
+        || PathBuf::from(format!("/run/user/{uid}/scribe/test-daemon.sock")),
+        |dir| dir.join("test-daemon.sock"),
+    )
 }
 
 // ---------------------------------------------------------------------------
