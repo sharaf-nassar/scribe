@@ -13,6 +13,7 @@ cleanup() {
     kill "${TAIL_PID:-}" 2>/dev/null || true
     kill "${TAP_PID:-}" 2>/dev/null || true
     kill "${WM_PID:-}" 2>/dev/null || true
+    pkill -f ibus-daemon 2>/dev/null || true
     if [ "$DAEMON_STARTED" -eq 1 ]; then
         scribe-test daemon stop >/dev/null 2>&1 || true
     fi
@@ -119,6 +120,41 @@ start_session_keyring() {
     export GNOME_KEYRING_CONTROL
 }
 
+# Start a real input-method engine so the IME/preedit E2E can compose text.
+#
+# `--xim` is the load-bearing flag: GPUI's X11 backend talks to an XIM server
+# (`X11rbClient` in gpui_linux), and `XMODIFIERS` is how it finds one — without
+# both, key presses never reach an input method at all and the raw letters go
+# straight to the PTY, which is exactly the unwired symptom this rig has to be
+# able to tell apart from a working composition.
+#
+# The GTK panel is disabled because it wants a tray this container has no use
+# for; preedit callbacks and commits are delivered over XIM either way, and the
+# client draws its own preedit overlay. `ibus-table-cangjie3` is the engine: a
+# table-driven CJK method whose composition is deterministic, so a fixed key
+# sequence always produces the same candidate.
+start_input_method() {
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        export $(dbus-launch)
+    fi
+    export XMODIFIERS='@im=ibus'
+    export GTK_IM_MODULE=ibus
+    export QT_IM_MODULE=ibus
+    export SCRIBE_IME_ENGINE="${SCRIBE_IME_ENGINE:-table:cangjie3}"
+    # `--daemonize` is not a convenience: without it ibus-daemon watches the
+    # shell that launched it, sees it exit, logs "The parent process died" and
+    # takes itself down before any engine can register.
+    ibus-daemon --panel disable --xim --replace --daemonize >/output/ibus.log 2>&1
+    for _ in $(seq 1 80); do
+        if ibus list-engine 2>/dev/null | grep -q "$SCRIBE_IME_ENGINE"; then
+            break
+        fi
+        sleep 0.25
+    done
+    ibus engine "$SCRIBE_IME_ENGINE" >>/output/ibus.log 2>&1 || true
+    echo "ibus engine: $(ibus engine 2>&1)" >>/output/ibus.log
+}
+
 # Interpose the recording relay on the server socket. Used by the sharing E2E to
 # inject the notices a second machine would have produced, and by the settings
 # trust E2E purely for its wire record — the settings window's one-shot server
@@ -200,6 +236,15 @@ if [ "${SCRIBE_SHARED_PANE:-0}" = "1" ]; then
     printf '\n[remote]\nsharing_mode = "free_for_all"\n' >> "$CONFIG_FILE"
 fi
 
+# The IME rig needs a UTF-8 locale inside the PTY, not just in the client:
+# bash's readline refuses multibyte input in the C locale and rings the bell
+# instead of inserting it, so committed CJK characters would never echo. The
+# server spawns that shell, so this has to be exported before it starts.
+if [ "${SCRIBE_IME:-0}" = "1" ]; then
+    export LANG="${LANG:-C.UTF-8}"
+    export LC_ALL="${LC_ALL:-C.UTF-8}"
+fi
+
 scribe-test server start
 SERVER_STARTED=1
 
@@ -222,6 +267,11 @@ case "$VISUAL_APP" in
         # VK_ICD_FILENAMES to lavapipe (software) so no GPU is required.
         # LIBGL_ALWAYS_SOFTWARE keeps any GL fallback off hardware too.
         export LIBGL_ALWAYS_SOFTWARE=1
+        # Before the client starts: XMODIFIERS is read once, when gpui's X11
+        # client builds its XIM connection.
+        if [ "${SCRIBE_IME:-0}" = "1" ]; then
+            start_input_method
+        fi
         export SCRIBE_CLIENT_LOG=/output/client.log
         # Shared-pane rig: create the session FIRST, then start the client as a
         # second participant in the daemon's window.
