@@ -15,6 +15,23 @@ than merely implemented and unit-tested. Audited at `f56ef95`.
 > against `tools/reachability-baseline.txt`, which is the authoritative,
 > ratcheted source going forward.
 
+> **The 173-row census below was bounded by the inventory, not by the
+> requirement set (amended 2026-07-27, bead `scribe-38e.94`).** This audit's
+> method statement is "every row of `parity-inventory.md` carries a verdict", so
+> a spec requirement that had never been given a row could not surface here at
+> all — and nine of them had not: mouse reporting, mouse-wheel scrolling, IME
+> composition, cold-restart restore, the command-mark scrollbar, window geometry
+> persistence, the desktop notification dispatcher, server lifecycle management,
+> and file drag-and-drop. Fix units FU-1..FU-23 accordingly contain none of
+> them. The 2026-07-24 retraction established that a green unit suite does not
+> prove reachability; this is the next layer of the same lesson, that a complete
+> reachability census does not prove parity when the census is not derived from
+> the requirements. `spec.md` now carries a requirement register and
+> `parity-inventory.md` a coverage index over it; see
+> [Requirement-derived rows](#requirement-derived-rows-amended-2026-07-27)
+> below for the verdicts the widened census produced, and FU-24..FU-28 for the
+> work it exposed.
+
 ## Why this audit exists
 
 The 016 launch gate treated a green `cargo test` as proof of parity. It is not.
@@ -351,6 +368,36 @@ load path is `ConfigRuntime::start` (`config.rs:312`) → `load_config`
 
 **Removed-key subtotals:** WIRED 9 · UNWIRED 0 · MISSING 0 · UNKNOWN 0.
 
+## Requirement-derived rows (amended 2026-07-27)
+
+The 29 rows of `parity-inventory.md`'s "Spec behaviour requirements" table did
+not exist at `f56ef95` and so carry no baseline verdict. They are censused here
+because they are the half of parity this audit's method could not see: derived
+from `spec.md`'s requirement register rather than from the legacy client's IPC
+and keybinding surface.
+
+Verdicts are measured against `main` at `c50724b`, using the same live-path
+definitions as the `f56ef95` census. Twenty-four are WIRED and are not restated
+row by row — `parity-inventory.md` names each one's live-path chain and its
+oracle. The five that are not reachable are the finding:
+
+| Requirement row | spec.md | Verdict | Evidence |
+| --- | --- | --- | --- |
+| Server-upgrade reattach | `US2-4` | MISSING | `main.rs::start_ipc_thread` awaits `run_connection` exactly once; when it returns the thread publishes a status line and exits. No redial path exists, so an `--upgrade` handoff leaves the window attached to nothing. `tests/e2e/visual/reconnect.sh` relaunches the client *process*, so it never exercised this |
+| Remote connect picker overlay | `US4-4` | MISSING | `remote::RemoteConnect` is ported and unit-tested; no GPUI view renders it. `main.rs::TerminalView::refresh_remote_peers` puts the peer count on the status strip instead. Already noted as a presentation gap in `parity-inventory.md`'s "LAN and sharing boundary", which could not cost a row while no row existed |
+| Pane dividers and drag-resize | `US3-10` | UNWIRED | `divider.rs` has no reference outside `lib.rs` and its own tests; `tools/reachability-baseline.txt` lists `unwired-module divider` |
+| AI indicator borders and tab tint | `US4-1` | UNWIRED | `ai_indicator::AiStateTracker::tab_indicator_color`, `workspace_border_color`, `tick`, `needs_animation`, `clear_stale_processing`, `note_activity`, `remember_provider`, `clear_attention_states` and `ai_indicator::pane_border_edges` have no caller outside `ai_indicator.rs`. `main.rs` reaches only `update`, `remove`, `clear_context`, `provider_for_session` and `context_for`. The module is *imported*, so the module-level ratchet counts it wired while the painted half is unreachable |
+| Workspace notes hover preview | `US4-3` | UNWIRED | `workspace_notes_preview.rs` has no reference outside `lib.rs` and its own tests; `tools/reachability-baseline.txt` lists `unwired-module workspace_notes_preview` |
+
+Two of these were invisible to *both* gates. `ai_indicator` is imported by
+`main.rs`, so the module ratchet in `tools/check-reachability.sh` scores it
+wired, and no inventory row asked whether the border ever painted. Module-level
+reachability is a floor, not a substitute for a per-requirement row — the same
+distinction the `f56ef95` census drew between a green `#[gpui::test]` and a live
+call site, one level up.
+
+**Requirement-derived subtotals:** WIRED 24 · UNWIRED 3 · MISSING 2 · UNKNOWN 0.
+
 ## Summary
 
 | Verdict | Count | Share |
@@ -367,6 +414,12 @@ Row totals by table: client messages 46, server messages 59, named input actions
 Excluding the nine removed-config-key rows (which are satisfied by *absence* of
 behaviour), the user-facing parity surface is 164 rows of which **51 are
 reachable (31%)** and **113 are not**.
+
+**These totals are a census of the inventory as it stood at `f56ef95`, not of
+the requirement set.** The inventory has since grown by the command-mark
+scrollbar row and the 29 requirement-derived rows above, to 203 rows / 194
+user-facing. `parity-inventory.md`'s roll-up is the live figure; the numbers in
+this section are the historical baseline the fix units were sequenced against.
 
 ## Prioritized fix units
 
@@ -570,6 +623,33 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
   one. All three entry points and the no-duplicate rule are asserted against the
   mapped X11 window by `tests/e2e/visual/settings-entry.sh`.
 
+### P1 — requirement-derived gaps (added 2026-07-27)
+
+These five units come from the widened census above. None was reachable by the
+`f56ef95` method, because none of their requirements had a parity row.
+
+- **FU-24 Server-upgrade reattach.** Row: `Server-upgrade reattach` (`US2-4`).
+  `start_ipc_thread` must supervise `run_connection` rather than await it once:
+  redial with backoff when the stream closes, re-send `Hello` / `ListSessions`,
+  and rebuild the topology through the existing `on_session_list` path. Highest
+  priority of the five — it is the only one that breaks the multiplexer promise
+  US2 is built on, and it fails silently on every server upgrade.
+- **FU-25 AI indicator painting.** Row: `AI indicator borders and tab tint`
+  (`US4-1`). The tracker's state half is wired and its painted half is not:
+  `tab_indicator_color`, `workspace_border_color`, `pane_border_edges`, `tick`,
+  `needs_animation` and `clear_stale_processing` need call sites on the render
+  path and the idle tick. This is a differentiating feature, and the module
+  ratchet cannot see it because `ai_indicator` is imported.
+- **FU-26 Pane dividers and drag-resize.** Row: `Pane dividers and drag-resize`
+  (`US3-10`). `divider.rs` needs a quad overlay in the pane shell and a pointer
+  path that maps a drag back to a split ratio.
+- **FU-27 Workspace notes hover preview.** Row: `Workspace notes hover preview`
+  (`US4-3`). `workspace_notes_preview.rs` needs a hover trigger and a view; the
+  notes modal it complements is already wired.
+- **FU-28 Remote connect picker overlay.** Row: `Remote connect picker overlay`
+  (`US4-4`). `remote::RemoteConnect` needs a GPUI view so the peer lists reach a
+  picker rather than a status-strip count.
+
 ### In-flight bead coverage map
 
 | Bead | Rows it covers |
@@ -660,3 +740,28 @@ The 850-test suite should not be quoted as parity evidence again. The gate
 metric should be the reachable-row count from this audit's table (currently
 51/164 user-facing rows), regenerated mechanically by the checks in §2, with an
 explicit go threshold.
+
+### 6. Derive the row set from the requirement set (added 2026-07-27)
+
+§1–§5 make every *tabulated* row prove reachability. They say nothing about
+whether the table spans the requirements, and it did not: nine spec requirements
+had no row, so no oracle scored them and the gate read 163 of 164 rows reachable
+while nine requirements were missing from the product. A reachable-row count is
+only a parity metric if the rows are the requirements.
+
+The fix, landed with this amendment:
+
+- `spec.md` carries a **requirement register** — every acceptance criterion and
+  porting obligation tagged with a stable `US<n>-<n>` / `PO-<n>` id. Numbering
+  is append-only so a row can cite an id permanently.
+- `parity-inventory.md` carries a **coverage index** mapping every register id
+  onto the row or rows that carry it, plus a `Spec behaviour requirements` table
+  holding the rows no message, keybinding or rendering row already carried.
+- `tools/check-parity-inventory.sh` fails when a register id has no carrying
+  row, when the index names a row no table contains, and when the index names an
+  id `spec.md` does not declare. Adding a requirement therefore breaks the build
+  until someone gives it a row and a verdict.
+
+The escape hatch is deliberate and narrow: tree, licensing and CI requirements
+(`US5-*`, `US6-*`) are marked `not a parity row` with the artifact that gates
+them, because no reachable client symbol can carry them.

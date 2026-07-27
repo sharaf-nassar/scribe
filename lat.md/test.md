@@ -1100,6 +1100,8 @@ The `#[gpui::test]` and golden suites in `scribe-client-gpui` are the primary co
 
 **A headless suite does not satisfy a parity row.** It proves the module behaves correctly when constructed; it says nothing about whether the running client ever constructs it. The 016 reachability audit found 113 of 164 user-facing parity rows unreachable while their suites were green, so `parity-inventory.md` now carries a mandatory "Reachable from" column and retains `gpui-test` as the row-level method only for the nine removed-configuration-key rows. Read the map below as *logic coverage*; the row's own verification method and reachable-from symbol live in the inventory and are authoritative.
 
+**Nor does a reachable row set prove parity unless the rows are the requirements.** A requirement with no row is scored by no oracle at all, which is how nine spec requirements stayed invisible through both gates until 2026-07-27. The inventory's row set is now derived from `spec.md`'s requirement register and the derivation is enforced by `tools/check-parity-inventory.sh`; see [[architecture#Build Tooling#Parity Inventory Gate#Requirement Derivation]].
+
 These suites run under `just test` (and the `Dockerfile.func` image's Rust toolchain). This section consolidates the headless coverage the `gpui-client-rebuild` epic (`scribe-38e`) accumulates, and the coverage frontier lists the parity rows whose suites unblock as their feature beads land.
 
 | Headless suite | Spec section | Parity-inventory row(s) whose logic it covers |

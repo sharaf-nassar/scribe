@@ -42,7 +42,7 @@ do not cover the failures, exactly as the 2026-07-24 retraction warned:
 | Func / lifecycle scripted E2E | every `tests/e2e/func/*.sh` in a rebuilt `scribe-test-func` image | ✅ **13 / 13 PASS, 0 FAIL** |
 | Perf A/B rig | `run-perf-ab.sh --live --record-baseline`, both clients probe-instrumented, same host and session | ❌ **FAIL** — 2 of 5 metrics (B3) |
 | Reachability ratchet | `tools/check-reachability.sh --working-tree` | ✅ **PASS** — 53/65 modules wired, 54/59 server messages handled, 36/36 layout actions handled |
-| Parity rows | all 173 rows re-verified against the source at HEAD | ⚠️ 163/164 reachable, but the artifact is stale (B4) and the denominator is incomplete (B5) |
+| Parity rows | all 173 rows re-verified against the source at HEAD | ⚠️ 163/164 reachable, but the artifact is stale (B4) and the denominator is incomplete (B5). Both since fixed: the inventory now enumerates 203 rows / 194 user-facing, of which 189 (97%) are reachable |
 | Manual rows | live driving of `scribe-dev` on `:0` | ⚠️ Opacity **PASS**; IME **FAIL** (B2) |
 
 ### Prior blockers — all four confirmed resolved
@@ -219,6 +219,26 @@ tabulated subset, not of parity.** Both artifacts must be extended to the full
 `spec.md` requirement set before the reachable-row count means what the gate
 needs it to mean.
 
+**Resolved 2026-07-27 (bead `scribe-38e.94`).** `spec.md` now carries a
+requirement register — every acceptance criterion and porting obligation tagged
+with a stable `US<n>-<n>` / `PO-<n>` id — and `parity-inventory.md` a coverage
+index over it plus a `Spec behaviour requirements` table holding the 29 rows no
+other table carried. `tools/check-parity-inventory.sh` fails when a register id
+has no carrying row, so the denominator can no longer omit a requirement
+silently. The inventory is now 203 rows / 194 user-facing.
+
+Widening the census cost five rows: **189 of 194 user-facing rows are
+reachable (97%)**, down from the tabulated-subset figure of 165 of 165.
+Server-upgrade reattach (`US2-4`) and the remote connect picker overlay
+(`US4-4`) are missing; pane dividers (`US3-10`), the AI indicator's painted half
+(`US4-1`) and the workspace-notes hover preview (`US4-3`) are unwired. They are
+filed as FU-24..FU-28 in `reachability-audit.md`. FU-24 is the serious one: the
+client never redials, so a `--upgrade` handoff strands the window — the exact
+failure US2 exists to prevent. Note also that two of the five were invisible to
+the module ratchet as well, because `ai_indicator` is imported while its
+painting half has no call site; module-level reachability is a floor, not a
+per-requirement verdict.
+
 ### B6 — The go threshold is undefined
 
 `plan.md` § "Phase H re-baseline" re-baselines the gate on reachable-row count
@@ -330,9 +350,12 @@ Re-run this gate when all of the following hold:
    workload, and input-latency p50 returns to within 10 % of the old client.
 4. **B4** — `parity-inventory.md` regenerated so its cells, footers, roll-up,
    and prose match the binary.
-5. **B5** — `parity-inventory.md` and `reachability-audit.md` extended to the
-   full `spec.md` requirement set, so the reachable-row count measures parity
-   rather than the tabulated subset.
+5. **B5** — ✅ **resolved 2026-07-27 (bead `scribe-38e.94`).**
+   `parity-inventory.md` and `reachability-audit.md` are extended to the full
+   `spec.md` requirement set, and `tools/check-parity-inventory.sh` now fails
+   when a register id has no carrying row, so the reachable-row count measures
+   parity rather than the tabulated subset. It also exposed five newly-scored
+   unreachable requirements (FU-24..FU-28), which the next run must judge.
 6. **B6** — a numeric go threshold for the reachable-row count written into
    `plan.md`.
 

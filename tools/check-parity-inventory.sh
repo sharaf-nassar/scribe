@@ -25,6 +25,9 @@ table from the marker cells and then verifies:
     keybinding table exactly the parsed `Bindings` actions
   * that every `ServerMessage` row the live reader does not handle is
     explicitly annotated as a settings-window row
+  * that every requirement id in spec.md's register is carried by a row that
+    actually exists, so the row set is derived from the requirement set rather
+    than from whichever surface happened to be tabulated
 
 Nothing here is hand-maintained, so the numbers cannot go stale while beads
 land.
@@ -183,6 +186,7 @@ my @sections = (
     { prefix => 'Server messages',               label => 'Server messages' },
     { prefix => 'Input and keybinding checklist', label => 'Input and keybinding actions' },
     { prefix => 'Rendering and window checklist', label => 'Rendering and window' },
+    { prefix => 'Spec behaviour requirements',   label => 'Spec behaviour requirements' },
     { prefix => 'Removed configuration keys',    label => 'Removed configuration keys' },
 );
 
@@ -194,6 +198,7 @@ my %declared;         # label => row count declared in the heading, if any
 my %rows;             # label => [ { name, cell } ]
 my %footer;           # label => { reachable, total, unwired, missing }
 my @rollup;           # rows of the roll-up table
+my @coverage;         # rows of the spec-requirement coverage index
 my $block_start = -1;
 
 sub cells {
@@ -213,6 +218,14 @@ sub flush_block {
 
     if ($header[0] eq 'Table') {
         @rollup = @body;
+        return;
+    }
+
+    # The coverage index maps spec.md's requirement register onto rows. It is
+    # not a parity table, so it must never be counted — but it is the link that
+    # makes the row set derived from the requirement set.
+    if ($header[0] eq 'spec.md requirement') {
+        @coverage = @body;
         return;
     }
 
@@ -391,6 +404,67 @@ if ($prose =~ /in-client figure is \*\*(\d+) of (\d+)\*\*/) {
     fail("$doc_rel: no in-client figure of the form 'in-client figure is **N of M**'");
 }
 
+# ── The coverage index must span spec.md's requirement register ─────────
+#
+# This is the check that keeps the row set derived from the requirement set.
+# Without it the inventory can be internally perfect and still omit a whole
+# requirement, which is exactly how nine spec requirements went unscored until
+# 2026-07-27: a requirement with no row is measured by no oracle.
+my $spec_rel = 'specs/016-gpui-client-rebuild/spec.md';
+my $spec = slurp("$root/$spec_rel");
+my @register = $spec =~ /^\s*- \*\*(US\d+-\d+|PO-\d+)\*\*/gm;
+if (!@register) {
+    fail("$spec_rel: no requirement register ids found; every acceptance"
+        . " criterion and porting obligation must be tagged '- **US<n>-<n>**'"
+        . " or '- **PO-<n>**'");
+}
+
+my %register_seen;
+for my $id (@register) {
+    fail("$spec_rel: requirement id '$id' is declared twice") if $register_seen{$id}++;
+}
+
+# Anything a coverage cell may legitimately point at: a row in any counted
+# table, or a table label written as `§Label`.
+my %row_name = map { $_->{name} => 1 } map { @{ $rows{$_} // [] } } map { $_->{label} } @sections;
+my %table_label = map { $_->{label} => 1 } @sections;
+
+my %covered;
+for my $row (@coverage) {
+    my ($id, $carriers) = @$row;
+    $id =~ s/^`|`$//g;
+    $carriers //= '';
+    unless ($register_seen{$id}) {
+        fail("$doc_rel: the coverage index names '$id', which is not a"
+            . " requirement id in $spec_rel");
+        next;
+    }
+    fail("$doc_rel: the coverage index lists '$id' twice") if $covered{$id}++;
+
+    # `not a parity row` is the escape hatch for tree, licensing and CI
+    # requirements, which no reachable client symbol can carry.
+    next if $carriers =~ /\bnot a parity row\b/;
+
+    my @named = $carriers =~ /`([^`]+)`/g;
+    my @labels = $carriers =~ /§([A-Za-z][A-Za-z ]*[A-Za-z])/g;
+    my @unknown = grep { !$row_name{$_} } @named;
+    my @bad_labels = grep { !$table_label{$_} } @labels;
+    fail("$doc_rel: the coverage cell for '$id' names rows that no table"
+        . " contains: @unknown")
+        if @unknown;
+    fail("$doc_rel: the coverage cell for '$id' names unknown tables:"
+        . " @bad_labels")
+        if @bad_labels;
+    fail("$doc_rel: the coverage cell for '$id' names no carrying row, table"
+        . " or 'not a parity row' reason")
+        unless @named || @labels;
+}
+
+my @uncovered = grep { !$covered{$_} } @register;
+fail("$doc_rel: $spec_rel declares requirements with no carrying row in the"
+    . " coverage index: @uncovered")
+    if @uncovered;
+
 # ── Cross-check the tables against the source they enumerate ────────────
 sub compare_sets {
     my ($label, $want, $got) = @_;
@@ -442,9 +516,10 @@ for my $row (@{ $rows{'Server messages'} // [] }) {
 
 printf
     "parity inventory: %d rows, %d reachable, %d unwired, %d missing"
-    . " (%d user-facing, %d reachable in-client)\n",
+    . " (%d user-facing, %d reachable in-client, %d spec requirements"
+    . " carried)\n",
     $grand_total, $totals{reachable}, $totals{unwired}, $totals{missing},
-    $user_rows, $in_client;
+    $user_rows, $in_client, scalar keys %covered;
 
 if (@errors) {
     print STDERR "The 016 parity inventory drifted from itself or the source in $context.\n\n";
