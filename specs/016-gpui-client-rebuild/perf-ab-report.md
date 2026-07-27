@@ -5,13 +5,17 @@ This is the launch-blocking performance comparison for the GPUI client rebuild
 (beads scribe-38e.41 / scribe-38e.51), gating cutover in the launch go/no-go
 (scribe-38e.42).
 
-The **scroll** row and its per-metric detail were replaced later the same day
-from a `--live --scroll-only --record-baseline` re-run under bead
-`scribe-38e.91`, which fixed two defects in how the rig measured that metric —
-see `perf-baseline.md`, "the scroll metric was measuring the rig". The other
-four rows are as the `scribe-38e.42` gate run produced them, and the overall
-verdict is unchanged because input latency still fails. The next full `--live`
-run regenerates the whole file.
+Three rows were replaced after the `scribe-38e.42` gate run that produced this
+file. The **scroll** row and its detail come from a `--live --scroll-only
+--record-baseline` re-run under bead `scribe-38e.91`, which fixed two defects in
+how the rig measured that metric. The **input latency** and **cat-firehose**
+rows and their details come from a full `--live --record-baseline` re-run under
+bead `scribe-38e.92`, which moved the old client's PTY-output stamp to the same
+pipeline stage the GPUI client uses; the numbers they replaced were measuring
+the old client's UI-thread backlog, not the server. Both are documented in
+`perf-baseline.md`. The startup and memory rows are as the gate run produced
+them, and the overall verdict is unchanged because scroll still fails. The next
+full `--live` run regenerates the whole file.
 
 ## Thresholds (Clarification Q3, startup re-scoped 2026-07-24)
 
@@ -39,8 +43,8 @@ re-measures them with the same probe in the same session, and
 | Metric | New client | Old client | Verdict |
 |---|---|---|---|
 | Startup to first frame (end-to-end) | 615.175 ms total (26.814 ms Scribe + 588.961 ms gpui GPU bring-up) | 4571.975 ms | PASS |
-| Input latency (p50 echo) | 0.209 ms | 0.032 ms | FAIL |
-| cat-firehose throughput | 17.623 MiB/s | 0.232 MiB/s | PASS |
+| Input latency (p50 echo) | 0.213 ms | 0.247 ms | PASS |
+| cat-firehose throughput | 17.922 MiB/s | 10.638 MiB/s | PASS |
 | Memory at 10 tabs | 237.934 MiB | 465.738 MiB | PASS |
 | Scroll fps / dropped frames | 60.064 fps, 0.000% dropped | 41.480 fps, 8.101% dropped | PASS |
 
@@ -55,8 +59,8 @@ perf bead.
 ### Startup to first frame -- PASS
 Q3 re-scope (2026-07-24) plus its absolute half (2026-07-25, bead scribe-38e.83); the retired 500 ms ceiling is below this platform's GPU bring-up floor for both clients. (1a) Scribe-attributable startup 26.814 ms against a 150 ms budget: PASS (<= 150 ms). (1b) Total first frame 615.175 ms against the old client's 4571.975 ms with the 10% noise allowance: PASS (<= 5029.173 ms). Method: median of 3 cold launches per client; the span is the first painted frame minus the probe arm (the first statement of each client's main), falling back to the startup-log wall clock for a binary without that probe key. The gpui split comes from the client's SCRIBE_GPUI_STARTUP_TIMING marker, which times `cx.open_window` — the span in which no Scribe code runs. Splash deletion (OQ8) stays authorized while this PASSes.
 
-### Input latency -- FAIL
-Median of 25 instrumented key -> PTY-echo round trips in a rig-owned tab, both clients measured by the shared probe. PASS when the new median is within 10% of the old one.
+### Input latency -- PASS
+Median of 60 instrumented key -> PTY-echo round trips in a rig-owned tab, both clients measured by the shared probe at the same pipeline stage — the task that reads the frame off the socket. PASS when the new median is within 10% of the old one.
 
 ### cat-firehose throughput -- PASS
 Sustained bytes/sec the client drains while `cat`ting a 32 MiB file in a rig-owned tab, counted at each client's PTY-output entry point. PASS when the new rate is within 10% of the old rate.

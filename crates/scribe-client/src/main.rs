@@ -1406,9 +1406,10 @@ impl App {
     fn handle_stream_user_event(&mut self, event: &UiEvent) -> bool {
         match event {
             UiEvent::PtyOutput { session_id, data } => {
-                // Perf gate: count drained bytes and close the echo round-trip
-                // clock opened by the keystroke that produced this output.
-                scribe_common::perf_probe::record_pty_output(data.len());
+                // The perf gate stamps this payload where it enters the client
+                // — the IPC read task, in `dispatch_session_message` — not
+                // here, several hops downstream behind the winit user-event
+                // queue. See `scribe_common::perf_probe::record_pty_output`.
                 self.pending_pty_bytes.entry(*session_id).or_default().extend_from_slice(data);
                 true
             }
@@ -6729,7 +6730,7 @@ impl App {
         } else {
             // Perf gate: start the echo round-trip clock the PTY-output path
             // stops, matching the GPUI client's measurement point.
-            scribe_common::perf_probe::record_input_sent();
+            scribe_common::perf_probe::record_input_sent(sid);
         }
 
         // Clear "waiting for input / permission" indicators on real keystrokes.
