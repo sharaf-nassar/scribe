@@ -46,3 +46,8 @@ jobs:
         run: |
           tools/check-reachability.sh \
             --range "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"
+
+      - name: Check the 016 parity inventory counts
+        run: |
+          tools/check-parity-inventory.sh \
+            --range "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"

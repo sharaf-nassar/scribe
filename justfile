@@ -27,6 +27,10 @@ lint-suppressions:
 reachability:
     tools/check-reachability.sh --working-tree
 
+# Re-derive the 016 launch gate's reachable-row count from parity-inventory.md.
+parity-inventory:
+    tools/check-parity-inventory.sh --working-tree
+
 # Lint (strict clippy config)
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -43,6 +47,7 @@ test:
 ready:
     just lint-suppressions
     just reachability
+    just parity-inventory
     just fmt
     just clippy
     just test

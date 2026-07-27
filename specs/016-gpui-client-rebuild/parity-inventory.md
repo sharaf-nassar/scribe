@@ -5,10 +5,21 @@ client must preserve before cutover. It is derived from the legacy client and
 `scribe-common` at the 016 planning baseline.
 
 Every row carries a **Reachable from** cell naming the live-path symbol that
-must call the feature. The cells were populated from the per-row evidence in
-[`reachability-audit.md`](reachability-audit.md) (audited at `f56ef95`). A row
+must call the feature. The cells were first populated from the per-row evidence
+in [`reachability-audit.md`](reachability-audit.md) (audited at `f56ef95`) and
+have been re-derived from the source since, as the wiring beads landed. A row
 whose cell is a `— (unwired)` / `— (missing)` marker **cannot be marked done**,
 regardless of how many tests pass.
+
+Every count in this file — the per-section footers, the roll-up table, and the
+user-facing sentence under it — is derived from those marker cells by
+`tools/check-parity-inventory.sh`, which fails when the document disagrees with
+itself or with the source. Nothing here is hand-maintained, so the launch gate
+can read the reachable-row total off this file and trust it. Run it directly:
+
+```bash
+just parity-inventory
+```
 
 ## Definition of done
 
@@ -19,7 +30,8 @@ A parity row is done only when **both** hold:
    (`main.rs::open_window` → `TerminalView::render` → `TerminalElement::paint`),
    the key path (`main.rs::handle_overlay_key` → `handle_binding` →
    `on_key_down`), outbound IPC (`ipc_bridge::IpcSink`, plus the raw sends in
-   `main.rs::run_connection`), or inbound IPC (`main.rs::run_reader`). The
+   `main.rs::run_connection`), or inbound IPC (`main.rs::run_reader` and the
+   `main.rs::dispatch_server_message` table it feeds). The
    settings window's `settings/window.rs::SettingsWindow::run_action` is a
    fifth, narrower entry point. Bead .82 gave it an in-app trigger, so it is now
    reached from the terminal window (settings chord, palette row, titlebar gear)
@@ -32,7 +44,8 @@ A parity row is done only when **both** hold:
 A green `#[gpui::test]` is necessary but never sufficient for a user-facing
 row: a headless entity test passes identically whether or not the application
 constructs the entity. That failure mode is what the reachability audit found
-across 113 of 164 user-facing rows.
+across 113 of the 164 user-facing rows that existed at `f56ef95`; the wiring
+beads have since closed all of them.
 
 ## Verification methods
 
@@ -103,8 +116,8 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `FocusChanged` | focus reporting | scripted-E2E | `main.rs::TerminalView::report_focus` → `ipc_bridge::IpcSink::focus_changed`, from the window activation observer and the pane-focus reconciliation | required |
 | `HookEvent` | hook helper ingress | scripted-E2E | `crates/scribe-hook-helper/src/main.rs::main` — out-of-client by design | required |
 | `EnvPreflight` | environment persistence | scripted-E2E | `settings/window.rs::SettingsWindow::run_action` (`action.env_preflight`) and `SettingsWindow::enable_env_persistence`, the toggle's gated ON transition — settings-window row (in-app since bead .82) | required |
-| `ClipboardPromptResponse` | OSC 52 prompt | scripted-E2E | — (unwired, FU-8) — `clipboard.rs` outside the import closure | required |
-| `ClipboardBridgeReadReply` | OSC 52 bridge | scripted-E2E | — (unwired, FU-8) — `clipboard.rs` outside the import closure | required |
+| `ClipboardPromptResponse` | OSC 52 prompt | scripted-E2E | `main.rs::TerminalView::answer_clipboard_prompt` → `clipboard::prompt_response` → `ipc_bridge::IpcSink::clipboard_answer`, from the confirmation dialog's Allow/Deny including the Esc default (FU-8) — `tests/e2e/visual/clipboard-osc52.sh` | required |
+| `ClipboardBridgeReadReply` | OSC 52 bridge | scripted-E2E | `main.rs::TerminalView::poll_clipboard` → `TerminalView::run_bridge_job` → `clipboard::read_reply` → `ipc_bridge::IpcSink::clipboard_answer`, draining the bridge's job queue on the lifecycle tick (FU-8) — `tests/e2e/visual/clipboard-osc52.sh` | required |
 | `RemoteHandshake` | tailnet connect | scripted-E2E | `main.rs::run_remote_connection` → `remote_handshake.rs::perform_remote_handshake` | required |
 | `ListRemotePeers` | remote connect picker | scripted-E2E | `main.rs::adopt_remote_surface` and `TerminalView::refresh_remote_peers` → `ipc_bridge::IpcSink::list_remote_peers` | required |
 | `GetRemoteEnv` | remote settings | scripted-E2E | `main.rs::probe_remote_env` on the startup transient socket, and `settings/window.rs::SettingsWindow::refresh_trust` → `settings/server_action.rs::request_remote_env` | required |
@@ -122,8 +135,10 @@ remain serializable and be emitted by the corresponding GPUI interaction.
 | `ControlRequest` | v3 compatibility alias; the client emits `ControlClaim` | golden | not emitted by design; its live substitute `ControlClaim` is wired through `ipc_bridge.rs::IpcSink::control_intent` | required |
 | `ControlGrant` | holder grant/deny prompt for a control request | scripted-E2E | `main.rs::TerminalView::handle_overlay_key` → `share.rs::ShareChrome::intercept_key` → `ipc_bridge.rs::IpcSink::control_intent` | required |
 
-**Reachability:** 16 of 46 rows name a live-path symbol; 14 are unwired and 16
-are missing.
+**Reachability:** 46 of 46 rows name a live-path symbol; 0 are unwired and 0
+are missing. One of them — `HookEvent` — names `scribe-hook-helper`'s `main`
+rather than a client symbol, because the hook ingress is a separate binary by
+design; it is the only out-of-client row in the whole inventory.
 
 ## Server messages (59 handled)
 
@@ -134,19 +149,25 @@ The planning note named 57 variants; the frozen source at this inventory's
 baseline contains 59. This table intentionally follows the source so neither
 additive sharing variant is omitted.
 
-The live reader `main.rs::run_reader` matches exactly twelve variants and ends
-in a `_ => {}` catch-all; two more (`UpdateCheckResult`, `ReleaseList`) are
-consumed by the settings window's synchronous request/reply helper.
-Everything else is silently discarded on the wire, so a variant absent from the
-reader is definitively unreachable — there is no ambiguity in this column.
+The live reader's dispatcher `main.rs::dispatch_server_message` names 54 of the
+59 variants and routes the rest to `main.rs::unhandled_server_message`, which
+logs the variant name and increments a process counter rather than dropping it
+silently; the `_ => {}` catch-all the audit found is gone. The five variants it
+does not name — `UpdateCheckResult`, `ReleaseList`, `EnvPreflightResult`,
+`TrustedDeviceList`, `TrustedNetworkList` — are consumed by the settings
+window's synchronous request/reply helper in `settings/server_action.rs`, and
+each of those rows says so. `tools/check-parity-inventory.sh` enforces that:
+any variant the dispatcher does not handle must either carry a marker cell or
+be annotated a settings-window row, so this column cannot claim a reader arm
+that does not exist.
 
 | Variant | Surface | Verification method | Reachable from | Status |
 | --- | --- | --- | --- | --- |
-| `PtyOutput` | terminal stream | golden | `main.rs::run_reader` arm (gated on the attached session) | required |
-| `ScreenSnapshot` | tooling snapshot | scripted-E2E | `main.rs::run_reader` arm → `session_lifecycle::snapshot_reset_bytes` | required |
-| `SessionReplay` | reconnect replay | scripted-E2E | `main.rs::run_reader` arm → `session_lifecycle::decode_replay` | required |
-| `AiStateChanged` | AI indicator | visual-E2E | `main.rs::run_reader` arm → `ai_indicator::AiStateTracker::update` | required |
-| `AiStateCleared` | AI indicator | visual-E2E | `main.rs::run_reader` arm → `AiStateTracker::remove` + `AiStateTracker::clear_context` | required |
+| `PtyOutput` | terminal stream | golden | `main.rs::dispatch_server_message` → `main.rs::on_pane_output_message` → `main.rs::forward_output` (gated on the attached session) | required |
+| `ScreenSnapshot` | tooling snapshot | scripted-E2E | `main.rs::on_pane_output_message` → `main.rs::apply_screen_snapshot` → `session_lifecycle::snapshot_reset_bytes` | required |
+| `SessionReplay` | reconnect replay | scripted-E2E | `main.rs::on_pane_output_message` → `main.rs::forward_replay` → `session_lifecycle::decode_replay` | required |
+| `AiStateChanged` | AI indicator | visual-E2E | `main.rs::on_ai_message` → `ai_indicator::AiStateTracker::update` | required |
+| `AiStateCleared` | AI indicator | visual-E2E | `main.rs::on_ai_message` → `AiStateTracker::remove` + `AiStateTracker::clear_context` | required |
 | `CwdChanged` | tab metadata | scripted-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_cwd` → `StatusBarData.cwd` | required |
 | `SessionContextChanged` | session metadata | scripted-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_context` → `SessionChrome::host_label` / `SessionChrome::tmux_label` | required |
 | `TitleChanged` | tab title | visual-E2E | `main.rs::on_chrome_message` arm → `TabSessions::set_title` | required |
@@ -154,19 +175,19 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `CodexTaskLabelCleared` | Codex tab label | visual-E2E | `main.rs::on_task_label_message` arm → `TabSessions::set_task_label` → `TabEntry::display_title` | required |
 | `TaskLabelChanged` | AI tab label | visual-E2E | `main.rs::on_task_label_message` arm → `TabSessions::set_task_label` → `TabEntry::display_title` | required |
 | `TaskLabelCleared` | AI tab label | visual-E2E | `main.rs::on_task_label_message` arm → `TabSessions::set_task_label` → `TabEntry::display_title` | required |
-| `PromptReceived` | prompt history | scripted-E2E | `main.rs::run_reader` arm → `AiChrome::record_prompt` | required |
+| `PromptReceived` | prompt history | scripted-E2E | `main.rs::on_ai_message` → `AiChrome::record_prompt` | required |
 | `WorkspaceNamed` | workspace chrome | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::name_workspace` → `StatusBarData.workspace_name` | required |
-| `SessionCreated` | pane lifecycle | scripted-E2E | `main.rs::run_reader` arm → `main.rs::open_created_tab` | required |
-| `SessionExited` | pane lifecycle | scripted-E2E | `main.rs::run_reader` arm → tab removal + `AiChrome::forget` | required |
+| `SessionCreated` | pane lifecycle | scripted-E2E | `main.rs::dispatch_server_message` arm → `session_lifecycle::SessionRegistry::on_session_created` + `main.rs::open_created_tab` | required |
+| `SessionExited` | pane lifecycle | scripted-E2E | `main.rs::dispatch_server_message` arm → `main.rs::on_session_exited` → tab removal + `AiChrome::forget` | required |
 | `Bell` | terminal bell | scripted-E2E | `main.rs::on_bell_message` queue → `main.rs::TerminalView::poll_bells` → `BellController::on_bell` → `Window::request_attention` | required |
-| `Error` | error presentation | visual-E2E | `main.rs::run_reader` arm → `main.rs::set_status` | required |
+| `Error` | error presentation | visual-E2E | `main.rs::dispatch_server_message` arm → `main.rs::on_server_error` → `main.rs::set_status` | required |
 | `GitBranch` | status/tab metadata | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_git_branch` → `StatusBarData.git_branch` | required |
-| `SessionList` | startup/reconnect | scripted-E2E | `main.rs::run_reader` arm → `main.rs::sync_tab_strip` | required |
+| `SessionList` | startup/reconnect | scripted-E2E | `main.rs::dispatch_server_message` arm → `main.rs::on_session_list` → `main.rs::sync_tab_strip` | required |
 | `WorkspaceInfo` | workspace layout | scripted-E2E | `main.rs::on_workspace_info` → `ChromeMetadata::name_workspace` + parked for `TerminalView::adopt_workspace_info` → `PaneShell::apply_workspace_info` | required |
 | `WorkspaceNotesSnapshot` | workspace notes | scripted-E2E | `main.rs::on_workspace_notes_message` → `WorkspaceNotesStore::apply_collections` → `TerminalView::sync_workspace_notes` | required |
 | `WorkspaceNotesChanged` | workspace notes | scripted-E2E | `main.rs::on_workspace_notes_message` → `WorkspaceNotesStore::apply_collection` → `TerminalView::sync_workspace_notes` | required |
 | `SearchResults` | find overlay | scripted-E2E | `main.rs::on_search_results` → `search::FindResults` → `search::FindOverlayView::adopt_results` → `terminal_element::TerminalElement::with_highlights` | required |
-| `Welcome` | registration/adoption | scripted-E2E | `main.rs::run_reader` arm → `session_lifecycle::SessionRegistry::adopt_window` | required |
+| `Welcome` | registration/adoption | scripted-E2E | `main.rs::dispatch_server_message` arm → `main.rs::on_welcome` → `session_lifecycle::SessionRegistry::adopt_window` | required |
 | `WindowClosed` | close lifecycle | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::on_window_closed` → the shell's lifecycle tick quits the app | required |
 | `WindowList` | window management | scripted-E2E | `main.rs::on_window_lifecycle_message` → `window_lifecycle::WindowLifecycle::set_windows` → `StatusBarData.remote` | required |
 | `RunAction` | remote automation | scripted-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::queue_action` → `TerminalView::poll_remote_actions` runs it on the lifecycle tick | required |
@@ -176,14 +197,14 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `UpdateProgress` | update dialog | visual-E2E | `main.rs::dispatch_server_message` arm → `update::UpdateState::on_progress` → `StatusBarData.update_progress` | required |
 | `UpdateCheckResult` | release settings | scripted-E2E | `settings/server_action.rs::request_update_check`, reached from `SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
 | `ReleaseList` | release settings | scripted-E2E | `settings/server_action.rs::request_release_list`, reached from `SettingsWindow::run_action` — settings-window row (in-app since bead .82) | required |
-| `PromptMark` | prompt navigation | scripted-E2E | — (missing, FU-7) — `session_lifecycle` tracks trim offsets but no marks are ingested | required |
+| `PromptMark` | prompt navigation | scripted-E2E | `main.rs::dispatch_server_message` → `main.rs::on_positional_pane_message` → `ipc_bridge::InboundEvent::PromptMark` → `main.rs::apply_pane_op` → `main.rs::apply_prompt_mark` → `session_lifecycle::PromptMarks::record` (FU-7) — `tests/e2e/visual/prompt-marks.sh` | required |
 | `TrimScrollback` | terminal history | visual-E2E | `main.rs::on_positional_pane_message` → `ipc_bridge::InboundEvent::TrimScrollback` → `main.rs::apply_pane_op` → `terminal.rs::DisplayOnlyTerminal::trim_history` + `main.rs::apply_trim_scrollback` (bead `.88`) | required |
-| `ScrollBottom` | terminal viewport | scripted-E2E | — (missing, FU-7) | required |
+| `ScrollBottom` | terminal viewport | scripted-E2E | `main.rs::dispatch_server_message` → `main.rs::on_positional_pane_message` → `ipc_bridge::InboundEvent::ScrollBottom` → `main.rs::apply_pane_op` → `terminal.rs::DisplayOnlyTerminal::scroll`, replaying the snap the server stripped with the ED 3 (FU-7) — `tests/e2e/visual/prompt-marks.sh` | required |
 | `EnvPreflightResult` | environment settings | scripted-E2E | `settings/server_action.rs::parse_env_preflight_response`, rendered into the Environment page's status line — settings-window row (in-app since bead .82) | required |
 | `EnvStatus` | environment status | visual-E2E | `main.rs::on_chrome_message` arm → `ChromeMetadata::set_env_status` → `StatusBarData.env_status` | required |
-| `ClipboardPromptRequest` | OSC 52 dialog | visual-E2E | — (missing, FU-8) — the `ClipboardDialog` demo is built from literals | required |
-| `ClipboardBridgeWrite` | OSC 52 bridge | scripted-E2E | — (unwired, FU-8) — handled in `clipboard.rs`, outside the import closure | required |
-| `ClipboardBridgeReadRequest` | OSC 52 bridge | scripted-E2E | — (unwired, FU-8) — handled in `clipboard.rs`, outside the import closure | required |
+| `ClipboardPromptRequest` | OSC 52 dialog | visual-E2E | `main.rs::dispatch_server_message` → `main.rs::on_clipboard_message` → `clipboard::ClipboardBridge::park_prompt` → `TerminalView::poll_clipboard` → `dialog::ClipboardDialog` raised on the lifecycle tick (FU-8) — `tests/e2e/visual/clipboard-osc52.sh` | required |
+| `ClipboardBridgeWrite` | OSC 52 bridge | scripted-E2E | `main.rs::on_clipboard_message` → `clipboard::ClipboardBridge::push_job` → `TerminalView::poll_clipboard` → `TerminalView::run_bridge_job` → `clipboard::bridge_write` under the FR-019 focus gate (FU-8) — `tests/e2e/visual/clipboard-osc52.sh` | required |
+| `ClipboardBridgeReadRequest` | OSC 52 bridge | scripted-E2E | `main.rs::on_clipboard_message` → `clipboard::ClipboardBridge::push_job` → `TerminalView::run_bridge_job` → `clipboard::read_reply`, answered on the wire by `IpcSink::clipboard_answer` (FU-8) — `tests/e2e/visual/clipboard-osc52.sh` | required |
 | `RemoteHandshakeReply` | tailnet connect | scripted-E2E | `remote_handshake.rs::perform_remote_handshake` during the preamble; `main.rs::on_remote_message` on the live reader | required |
 | `WindowTakenOver` | remote-control landing | visual-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::displace` → `lost_control.rs::lost_control_overlay` freezes the window under the reclaim banner | required |
 | `RemoteDisconnect` | remote-control landing | visual-E2E | `main.rs::on_remote_message` → `remote_chrome::RemoteChrome::sever` → the status strip's typed reason | required |
@@ -202,18 +223,21 @@ reader is definitively unreachable — there is no ambiguity in this column.
 | `ControlDenied` | requester control-denied notice | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::deny` | required |
 | `ShareEnded` | shared-viewer end landing and state cleanup | visual-E2E | `main.rs::dispatch_share_message` → `share.rs::ShareChrome::end` | required |
 
-**Reachability:** 30 of 59 rows name a live-path symbol; 11 are unwired and 18
-are missing. (Recounted from the table above after the task-label rows landed;
-the audit's original figures were 18 / 11 / 30.)
+**Reachability:** 59 of 59 rows name a live-path symbol; 0 are unwired and 0
+are missing. (The audit's original figures at `f56ef95` were 18 reachable, 11
+unwired and 30 missing.)
 
 ## Input and keybinding checklist (54 named actions)
 
 The GPUI port retains every parsed `Bindings` action from
 `crates/scribe-client/src/input.rs`. All 54 are enumerated individually below,
-because the previous per-subsystem grouping hid where they break: parsing is
-fine — `keybindings.rs::translate_key_action` maps all 54 onto a `KeyAction` —
-but `main.rs::handle_layout_action` implements nine `LayoutAction` variants and
-routes the other twenty-six to a `tracing::debug!` catch-all that swallows them.
+because the previous per-subsystem grouping hid where they break: parsing was
+never the problem — `keybindings.rs::translate_key_action` maps all 54 onto a
+`KeyAction` — the gap was dispatch, where `main.rs::handle_layout_action`
+implemented nine `LayoutAction` variants and routed the other twenty-six to a
+`tracing::debug!` catch-all that swallowed them. That catch-all is gone: the
+match is exhaustive over all 36 variants, and `tools/check-reachability.sh`
+fails the build if a new one is ever swallowed again.
 
 Every row's method is `visual-E2E`: each action must be driven through
 `xdotool` against the real window and asserted by its observable effect.
@@ -254,20 +278,20 @@ Every row's method is `visual-E2E`: each action must be driven through
 | `select_tab_8` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `SelectTab` arm → `TabSessions::select` | required |
 | `select_tab_9` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `SelectTab` arm → `TabSessions::select` | required |
 | `new_window` | Tabs and windows | visual-E2E | `main.rs::handle_layout_action` `NewWindow` arm → `open_new_window` → `start_window_backend` + `open_window` (`tests/e2e/visual/tab-window-chords.sh` phase 2) | required |
-| `copy` | Clipboard | visual-E2E | — (unwired, FU-8) — `CopySelection` hits the catch-all; `clipboard.rs`/`selection.rs` outside the import closure | required |
-| `paste` | Clipboard | visual-E2E | — (unwired, FU-8) — `PasteClipboard` hits the catch-all; `paste.rs` outside the import closure | required |
+| `copy` | Clipboard | visual-E2E | `main.rs::handle_layout_action` `CopySelection` arm → `TerminalView::copy_selection` → `TerminalView::selection_copy_text` → `TerminalView::write_clipboard` → `clipboard::ArboardClipboard` (FU-8) — `tests/e2e/visual/clipboard-osc52.sh` | required |
+| `paste` | Clipboard | visual-E2E | `main.rs::handle_layout_action` `PasteClipboard` arm → `TerminalView::paste_clipboard` → `TerminalView::request_paste` → `paste::PasteGate` → `TerminalView::deliver_paste` (FU-8) — `tests/e2e/visual/clipboard-osc52.sh`, confirmation gate in `tests/e2e/visual/paste-confirmation.sh` | required |
 | `scroll_up` | Navigation | visual-E2E | `TerminalView::scroll_terminal` (bead .59) — `tests/e2e/visual/terminal-viewport.sh` | required |
 | `scroll_down` | Navigation | visual-E2E | `TerminalView::scroll_terminal` (bead .59) | required |
 | `scroll_top` | Navigation | visual-E2E | `TerminalView::scroll_terminal` (bead .59) | required |
 | `scroll_bottom` | Navigation | visual-E2E | `TerminalView::scroll_terminal` (bead .59) — `tests/e2e/visual/terminal-viewport.sh` | required |
 | `find` | Navigation | visual-E2E | `main.rs::TerminalView::dispatch_key_action` → `TerminalView::open_find_overlay` → `search::FindOverlayView` | required |
-| `prompt_jump_up` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; no prompt marks are ingested | required |
-| `prompt_jump_down` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; no prompt marks are ingested | required |
-| `jump_to_failure` | Navigation | visual-E2E | — (unwired, FU-7) — hits the catch-all; no prompt marks are ingested | required |
+| `prompt_jump_up` | Navigation | visual-E2E | `main.rs::handle_layout_action` `PromptJumpUp` arm → `TerminalView::jump_to_prompt` → `TerminalView::jump_to_mark` → `session_lifecycle::PromptMarks::jump_target` (FU-7) — `tests/e2e/visual/prompt-marks.sh` | required |
+| `prompt_jump_down` | Navigation | visual-E2E | as `prompt_jump_up`, with `JumpDirection::Down` | required |
+| `jump_to_failure` | Navigation | visual-E2E | `main.rs::handle_layout_action` `JumpToFailure` arm → `TerminalView::jump_to_failure` → `TerminalView::jump_to_mark` → `session_lifecycle::PromptMarks::failure_target` (FU-7) — `tests/e2e/visual/prompt-marks.sh` | required |
 | `zoom_in` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (beads .59, .70) — `tests/e2e/visual/terminal-zoom.sh` | required |
 | `zoom_out` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (beads .59, .70) — `tests/e2e/visual/terminal-zoom.sh` | required |
 | `zoom_reset` | View and overlays | visual-E2E | `TerminalView::apply_zoom` (beads .59, .70) — `tests/e2e/visual/terminal-zoom.sh` | required |
-| `command_palette` | View and overlays | visual-E2E | `main.rs::handle_overlay_key` opens the overlay — **degenerate**: `CommandPaletteEvent::Execute(_)` is discarded, so no palette entry does anything; FU-12 | required |
+| `command_palette` | View and overlays | visual-E2E | `main.rs::handle_overlay_key` opens the overlay and the subscription on `CommandPaletteView` routes `CommandPaletteEvent::Execute` to `TerminalView::execute_palette_action`, so a palette row runs the same seam the winit client's automation used (FU-12) — `tests/e2e/visual/overlay-actions.sh` | required |
 | `settings` | View and overlays | visual-E2E | `main.rs::TerminalView::dispatch_key_action` → `TerminalView::open_or_focus_settings` → `settings::open_settings_window` (bead .82) — also from the palette row and the titlebar gear; `tests/e2e/visual/settings-entry.sh` | required |
 | `word_left` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |
 | `word_right` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |
@@ -277,9 +301,10 @@ Every row's method is `visual-E2E`: each action must be driven through
 | `line_start` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |
 | `line_end` | Terminal shortcuts | visual-E2E (+ golden bytes) | `keybindings.rs::translate_key_action` → `KeyAction::Terminal` → `main.rs::send_key_bytes` | required |
 
-**Reachability:** 24 of 54 actions name a live-path symbol (one of them —
-`command_palette` — degenerately); 30 are unwired. None are missing: every
-action parses and translates, so the gap is entirely dispatch.
+**Reachability:** 54 of 54 rows name a live-path symbol; 0 are unwired and 0
+are missing. The audit's figure at `f56ef95` was 24, with 30 unwired and none
+missing, because every action already parsed and translated and the whole gap
+was dispatch.
 
 `LayoutAction` variants are explicitly: `SplitVertical`, `SplitHorizontal`,
 `ClosePane`, `FocusNext`, `FocusLeft`, `FocusRight`, `FocusUp`, `FocusDown`,
@@ -289,12 +314,17 @@ action parses and translates, so the gap is entirely dispatch.
 `CloseTab`, `NextTab`, `PrevTab`, `SelectTab`, `NewWindow`, `CopySelection`,
 `PasteClipboard`, `ScrollUp`, `ScrollDown`, `ScrollTop`, `ScrollBottom`,
 `PromptJumpUp`, `PromptJumpDown`, `JumpToFailure`, `ZoomIn`, `ZoomOut`, and
-`ZoomReset` — 9 of these 35 are executed by `main.rs::handle_layout_action`;
-the remaining 26 reach the catch-all. `KeyAction` variants are `Terminal`
-(reachable via `main.rs::send_key_bytes`), `Layout` (partially, per the above),
-`OpenCommandPalette` (reachable via `main.rs::handle_overlay_key`),
-`OpenSettings` (reachable via `main.rs::TerminalView::open_or_focus_settings`),
-and `OpenFind` (reachable via `main.rs::TerminalView::open_find_overlay`).
+`ZoomReset` — all 36 are executed by `main.rs::handle_layout_action`, whose
+match is exhaustive with no catch-all arm and whose 36/36 figure
+`tools/check-reachability.sh` ratchets. The 54 rows above cover more ground
+than 36 variants because ten of them are not `LayoutAction` at all — the seven
+terminal shortcuts, `find`, `settings` and `command_palette` — while the nine
+`select_tab_N` bindings collapse onto the single index-carrying `SelectTab`.
+`KeyAction` variants are `Terminal` (reachable via `main.rs::send_key_bytes`),
+`Layout` (per the above), `OpenCommandPalette` (reachable via
+`main.rs::handle_overlay_key`), `OpenSettings` (reachable via
+`main.rs::TerminalView::open_or_focus_settings`), and `OpenFind` (reachable via
+`main.rs::TerminalView::open_find_overlay`).
 
 ## Rendering and window checklist
 
@@ -313,14 +343,15 @@ first three rows below are reachable rather than blocked.
 | Box drawing | U+2500–U+259F cells bypass text shaping and use the existing procedural alpha-mask rasterizer through a `TerminalElement` paint-quad overlay after backgrounds and before text. | visual-E2E | `main` → `open_window` → `TerminalView::render` → `TerminalElement::paint` → `TerminalElement::paint_grid` → `paint_box_drawing` → `box_drawing::mask_quads` | required |
 | Font fallback | Every terminal run uses `FontFallbacks::from_fonts` with `Symbols Nerd Font Mono`, `Symbols Nerd Font`, `Nerd Font Symbols Mono`, and `Nerd Font Symbols` before existing generic fallbacks; `Unifont Sample` remains excluded. | visual-E2E | `TerminalElement::paint_grid` → `FontVariants::new` → `GridFont::font_for` → `GridFont::fallbacks`, carried on every `TextRun` handed to `shape_line`. The chain resolves because `fonts::register_embedded_fonts` registers an embedded `Symbols Nerd Font Mono` whose cmap maps `U+006D` (see `tools/patch-nerd-symbols-font.py`), surviving gpui `f96212f` `CosmicTextSystem::load_family`'s `'m'`-glyph face eviction that silently dropped every stock symbols-only font. Live capture: `U+F09B`/`U+F121` render as the octocat/code icons, not `Unifont Sample` hex boxes | required |
 | Ligatures | `appearance.ligatures` keeps its semantics: same-style runs call `shape_line` with `Some(cell_width)` and disable `calt` only when false, without drifting later cell origins. | visual-E2E | `ConfigRuntime` → `GridFont::from_appearance` → `GridFont::features` on every run; `paint_row_text` shapes each row with `Some(cell_width)` | required |
-| Opacity | `appearance.opacity` is clamped to `0.0..=1.0`; Wayland and composited X11 repaint alpha-aware terminal and chrome backgrounds live on a transparent surface, without restart. | manual | — (unwired at the audit baseline `f56ef95`, FU-4) — bead `.56` landed afterwards (`771794d`); the cell stays a marker until `.53` re-verifies it against the running client | required |
+| Opacity | `appearance.opacity` is clamped to `0.0..=1.0`; Wayland and composited X11 repaint alpha-aware terminal and chrome backgrounds live on a transparent surface, without restart. | manual | `main.rs::open_window` opens the surface with `WindowBackgroundAppearance::Transparent`, `TerminalView::apply_opacity_change` re-clamps through `opacity::clamp_opacity` on every config reload, and `TerminalView::render` paints through `opacity::surface` / `opacity::opaque_slot` (FU-4, bead `.56`); bead `.53` pixel-confirmed live bleed-through and restart-free reload against the running client | required |
 | Command-mark scrollbar | Each pane paints a non-reserving overlay scrollbar on its right edge with command-status ticks anchored to absolute scrollback rows, which shift when the server trims scrollback. | visual-E2E | `TerminalView::render_panes` → `TerminalView::scrollbar_paint` → `TerminalElement::with_scrollbar` → `TerminalElement::paint_scrollbar` → `scrollbar::build_scrollbar_render` (bead `.88`); pointer half via `TerminalView::press_grid` → `press_scrollbar` / `update_scrollbar_hover`; oracle `tests/e2e/visual/scrollbar.sh` | required |
 | X11 focus guard | The guard reads GPUI's `RawWindowHandle::Xcb` XID and compares it directly with `_NET_ACTIVE_WINDOW`; non-X11 backends do not enable the guard. | scripted-E2E | `main.rs::open_window` → `TerminalView::new` (FU-15) — starts the guard from the live `Window`, polls it from `drive_x11_focus_polls`, clears the debounce in `TerminalView::on_activation`, and gates the key path in `TerminalView::compositor_overlay_active`; scripted oracle `tests/e2e/visual/x11-focus-guard.sh` | required |
 
-**Reachability:** 5 of the 6 rows now name a live-path symbol — the three
-`TerminalElement::paint` rows (FU-1), the X11 focus guard (FU-15), and the
-command-mark scrollbar (bead `.88`). Opacity keeps its marker cell until `.53`
-re-verifies bead `.56` against the running client.
+**Reachability:** 6 of the 6 rows name a live-path symbol; 0 are unwired and 0
+are missing — the three `TerminalElement::paint` rows (FU-1), Opacity (FU-4,
+beads `.56` and `.53`), the command-mark scrollbar (bead `.88`), and the X11
+focus guard (FU-15). The audit's figure at `f56ef95` was 0 of 5, with 3 unwired
+and 2 missing; the scrollbar row was added afterwards with bead `.88`.
 
 ## Removed configuration keys
 
@@ -347,49 +378,62 @@ which a headless load-path test genuinely covers.
 | `appearance.prompt_bar_icon_first` | Bespoke prompt-bar pipeline colour override. | Silently ignored. | gpui-test | `config.rs::ConfigRuntime::start` → `load_config` — never read; the prompt bar reads `ChromeColors` | required |
 | `appearance.prompt_bar_icon_latest` | Bespoke prompt-bar pipeline colour override. | Silently ignored. | gpui-test | `config.rs::ConfigRuntime::start` → `load_config` — never read; the prompt bar reads `ChromeColors` | required |
 
-**Reachability:** 9 of 9 rows name a live-path symbol.
+**Reachability:** 9 of 9 rows name a live-path symbol; 0 are unwired and 0 are
+missing.
 
 ## Reachability roll-up
 
-Counts are the reachability audit's, measured at `f56ef95`. They are the launch
-gate's metric — not the unit-test count.
+Counts are recomputed from the marker cells in the five tables above by
+`tools/check-parity-inventory.sh`, which fails if any number here disagrees
+with them. They are the launch gate's metric — not the unit-test count.
 
 | Table | Rows | Reachable | Unwired | Missing |
 | --- | --- | --- | --- | --- |
-| Client messages | 46 | 13 | 17 | 16 |
-| Server messages | 59 | 14 | 13 | 32 |
-| Input and keybinding actions | 54 | 24 | 30 | 0 |
-| Rendering and window | 5 | 0 | 3 | 2 |
+| Client messages | 46 | 46 | 0 | 0 |
+| Server messages | 59 | 59 | 0 | 0 |
+| Input and keybinding actions | 54 | 54 | 0 | 0 |
+| Rendering and window | 6 | 6 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **173** | **60** | **63** | **50** |
+| **Total** | **174** | **174** | **0** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **164 rows, of which 51 are
-reachable (31%)** and 113 are not.
+behaviour), the user-facing parity surface is **165 rows, of which 165 are
+reachable (100%)** and 0 are not. **1 of those 165** rows — `HookEvent`, whose
+named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
+the in-client figure is **164 of 165**.
 
+At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
+(31%), against a roll-up total of 173 rows and 60 reachable; the sixth
+rendering row (the command-mark scrollbar) was added later with bead `.88`.
 Fix units FU-1..FU-23 are defined in
-[`reachability-audit.md`](reachability-audit.md); the plan's remaining phases
-are sequenced around them, P0 first.
+[`reachability-audit.md`](reachability-audit.md); the plan's phases were
+sequenced around them, P0 first. Every fix unit that owns a row in the tables
+above has landed — that is what a zero unwired/missing column means — so the
+audit's per-FU notes are now history rather than a work queue.
 
 ## LAN and sharing boundary
 
 Feature 015 is present in `fd04540` (`feat: remote window control and
-multi-machine sharing`). The rows above follow its final client dispatch:
-`ipc_client.rs` performs the LAN handshake and maps its outcomes, `main.rs`
-renders the LAN and sharing states, and `share_view.rs` supplies the roster and
-control UI. `ControlRequest` remains a serializable protocol alias because the
-server handles it as `ControlClaim`; the client deliberately emits only the
-latter.
+multi-machine sharing`), and the rows above now name the **GPUI** client's
+dispatch, not the legacy one they were originally written against.
+`lan_dial.rs::handshake` performs the LAN handshake during the connection
+preamble and `main.rs::on_lan_message` folds its live-reader answers into
+`lan.rs::LanChrome`; `main.rs::on_remote_message` does the same for the tailnet
+family through `remote_chrome::RemoteChrome`; and
+`main.rs::dispatch_share_message` drives `share.rs::ShareChrome` for the roster
+and control UI. `ControlRequest` remains a serializable protocol alias because
+the server handles it as `ControlClaim`; the client deliberately emits only the
+latter, which is why its row names that substitute rather than a sender.
 
-That describes the *legacy* client's dispatch, which is what these rows were
-written against. The GPUI client has since caught up on all three: FU-19 put
-`share.rs` on the live path (roster, control notices, claim/grant frames,
-verified by `tests/e2e/visual/share-control.sh`), FU-17 and FU-18 wired the
-feature-014 LAN dial, approval prompt and trust settings
-(`tests/e2e/visual/lan-approval.sh`, `tests/e2e/visual/settings-trust.sh`), and
-FU-16 wired the feature-013 tailnet handshake, peer/environment probe, displaced
-banner and automation round trip
-(`tests/e2e/visual/remote-control.sh`). The only remaining gap in this family is
-the connect-picker overlay itself: `remote.rs::RemoteConnect` is ported and
-unit-tested but has no GPUI view, so the peer lists it would render surface on
-the status strip instead.
+Three fix units closed this family: FU-19 put `share.rs` on the live path
+(roster, control notices, claim/grant frames, verified by
+`tests/e2e/visual/share-control.sh`), FU-17 and FU-18 wired the feature-014 LAN
+dial, approval prompt and trust settings (`tests/e2e/visual/lan-approval.sh`,
+`tests/e2e/visual/settings-trust.sh`), and FU-16 wired the feature-013 tailnet
+handshake, peer/environment probe, displaced banner and automation round trip
+(`tests/e2e/visual/remote-control.sh`). One presentation gap remains, and it
+costs no parity row: `remote.rs::RemoteConnect` is ported and unit-tested but
+has no GPUI view, so the peer lists a connect-picker overlay would render
+surface on the status strip instead. `remote` is not among the four modules
+`tools/reachability-baseline.txt` still lists as unwired, because the peer and
+environment state it models does reach the window.
