@@ -1,393 +1,433 @@
-//! Command palette overlay state.
+//! Command palette overlay for the GPUI client rebuild.
+//!
+//! The winit client split the palette across two files: a tiny `CommandPalette`
+//! state struct (query, selection, open flag) plus a `CellInstance` painter, and
+//! the entry/action machinery in `main.rs` — the base action list, the profile
+//! rows, the conditional "update" row, and `execute_automation_action` routing.
+//! This port folds all of that into one GPUI [`CommandPaletteView`] entity: the
+//! pure entry assembly ([`base_entries`], [`profile_entries`], [`build_entries`])
+//! and query filter ([`filter_entries`]) stay testable, while the box is drawn
+//! with GPUI elements — rounded corners, a drop shadow, an input row, and
+//! hover/selected item rows — instead of hand-placed quads. Confirming a row
+//! emits its [`PaletteAction`] for the shell to route.
 
+use gpui::{Context, EventEmitter, FocusHandle, Rgba, div, prelude::*, px};
+use scribe_common::protocol::AutomationAction;
 use scribe_common::theme::ChromeColors;
-use scribe_renderer::srgb_to_linear_rgba;
-use scribe_renderer::types::CellInstance;
 
-use crate::layout::Rect;
+use crate::tab_bar::srgba;
 
-const COMMAND_PALETTE_MIN_COLS: usize = 32;
-const COMMAND_PALETTE_MAX_COLS: usize = 72;
-const COMMAND_PALETTE_MAX_ITEMS: usize = 8;
-/// Overlay layout never needs more than this many grid units, which keeps the
-/// integer-to-float conversion exact for pixel placement.
-const MAX_OVERLAY_GRID_UNITS: usize = 65_535;
-type GlyphResolver<'a> = dyn FnMut(char) -> ([f32; 2], [f32; 2]) + 'a;
+/// Maximum number of filtered rows the palette shows at once, mirroring the winit
+/// overlay's item cap.
+pub const MAX_VISIBLE_ITEMS: usize = 8;
 
-pub struct CommandPaletteBuildContext<'a> {
-    pub out: &'a mut Vec<CellInstance>,
-    pub viewport: Rect,
-    pub cell_size: (f32, f32),
-    pub chrome: &'a ChromeColors,
-    pub items: &'a [String],
-    pub resolve_glyph: &'a mut GlyphResolver<'a>,
+/// What a command-palette row does when confirmed. Most rows dispatch a shared
+/// [`AutomationAction`]; feature 013 adds a client-local action that opens the
+/// remote-connect picker without touching the wire protocol. Ported verbatim from
+/// the winit `PaletteAction`.
+#[derive(Clone, Debug)]
+pub enum PaletteAction {
+    /// Dispatch a shared automation action (the common case).
+    Automation(AutomationAction),
+    /// Open the feature-013 remote-connect picker (client-local, off-wire).
+    OpenRemoteConnect,
 }
 
-fn overlay_grid_units(units: usize) -> u16 {
-    u16::try_from(units.min(MAX_OVERLAY_GRID_UNITS)).unwrap_or(u16::MAX)
+// `AutomationAction` (frozen scribe-common) derives neither `PartialEq` nor
+// `Eq`, so compare it structurally through its derived `Debug` form — enough for
+// these value-like, string/enum-only variants and the event assertions.
+impl PartialEq for PaletteAction {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::OpenRemoteConnect, Self::OpenRemoteConnect) => true,
+            (Self::Automation(a), Self::Automation(b)) => format!("{a:?}") == format!("{b:?}"),
+            _ => false,
+        }
+    }
 }
 
-fn overlay_grid_width(cols: usize, cell_w: f32) -> f32 {
-    f32::from(overlay_grid_units(cols)) * cell_w
+impl Eq for PaletteAction {}
+
+/// A single command-palette row: its display label and the action it dispatches.
+#[derive(Clone, Debug)]
+pub struct CommandPaletteEntry {
+    /// The row label shown in the list and matched against the query.
+    pub label: String,
+    /// The action confirmed when the row is selected.
+    pub action: PaletteAction,
 }
 
-fn overlay_grid_height(rows: usize, cell_h: f32) -> f32 {
-    f32::from(overlay_grid_units(rows)) * cell_h
+impl CommandPaletteEntry {
+    /// Build an entry that dispatches a shared [`AutomationAction`].
+    #[must_use]
+    pub fn automation(label: impl Into<String>, action: AutomationAction) -> Self {
+        Self { label: label.into(), action: PaletteAction::Automation(action) }
+    }
 }
 
-fn overlay_grid_y(origin: f32, row: usize, cell_h: f32) -> f32 {
-    origin + overlay_grid_height(row, cell_h)
+/// The fixed base command-palette rows, in display order. Ported verbatim from
+/// the winit `base_command_palette_entries`, including the feature-013
+/// client-local "Connect to remote machine…" row.
+#[must_use]
+pub fn base_entries() -> Vec<CommandPaletteEntry> {
+    vec![
+        CommandPaletteEntry::automation("Open Settings", AutomationAction::OpenSettings),
+        CommandPaletteEntry::automation("Find in Scrollback", AutomationAction::OpenFind),
+        CommandPaletteEntry::automation("New Tab", AutomationAction::NewTab),
+        CommandPaletteEntry::automation("New Claude Tab", AutomationAction::NewClaudeTab),
+        CommandPaletteEntry::automation("Resume Claude Tab", AutomationAction::NewClaudeResumeTab),
+        CommandPaletteEntry::automation("New Codex Tab", AutomationAction::NewCodexTab),
+        CommandPaletteEntry::automation("Resume Codex Tab", AutomationAction::NewCodexResumeTab),
+        CommandPaletteEntry::automation("Split Pane Vertical", AutomationAction::SplitVertical),
+        CommandPaletteEntry::automation("Split Pane Horizontal", AutomationAction::SplitHorizontal),
+        CommandPaletteEntry::automation("Close Pane", AutomationAction::ClosePane),
+        CommandPaletteEntry::automation("Close Tab", AutomationAction::CloseTab),
+        CommandPaletteEntry::automation("New Window", AutomationAction::NewWindow),
+        CommandPaletteEntry {
+            label: "Connect to remote machine…".into(),
+            action: PaletteAction::OpenRemoteConnect,
+        },
+    ]
 }
 
-pub struct CommandPalette {
-    active: bool,
+/// The "Switch Profile" rows for `profile_names`, tagging the active one. Ported
+/// from the winit `profile_command_palette_entries` with the global profile
+/// lookup lifted to the caller so the assembly stays pure and testable.
+#[must_use]
+pub fn profile_entries(
+    profile_names: &[String],
+    active_profile: Option<&str>,
+) -> Vec<CommandPaletteEntry> {
+    profile_names
+        .iter()
+        .map(|name| {
+            let mut label = format!("Switch Profile: {name}");
+            if active_profile == Some(name.as_str()) {
+                label.push_str(" (active)");
+            }
+            CommandPaletteEntry::automation(
+                label,
+                AutomationAction::SwitchProfile { name: name.clone() },
+            )
+        })
+        .collect()
+}
+
+/// Assemble the full entry list: the base rows, then the conditional "Update
+/// Scribe to v{version}" row when an update is available, then the profile rows.
+/// Ported from the winit `command_palette_entries`.
+#[must_use]
+pub fn build_entries(
+    update_available: Option<&str>,
+    profile_names: &[String],
+    active_profile: Option<&str>,
+) -> Vec<CommandPaletteEntry> {
+    let mut entries = base_entries();
+    if let Some(version) = update_available {
+        entries.push(CommandPaletteEntry::automation(
+            format!("Update Scribe to v{version}"),
+            AutomationAction::OpenUpdateDialog,
+        ));
+    }
+    entries.extend(profile_entries(profile_names, active_profile));
+    entries
+}
+
+/// Filter `entries` by a case-insensitive substring match on the trimmed query.
+/// An empty query keeps every entry. Ported from the winit
+/// `refresh_command_palette_items` filter.
+#[must_use]
+pub fn filter_entries(entries: &[CommandPaletteEntry], query: &str) -> Vec<CommandPaletteEntry> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return entries.to_vec();
+    }
+    entries.iter().filter(|e| e.label.to_lowercase().contains(&needle)).cloned().collect()
+}
+
+/// Events the command palette emits for the shell to act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandPaletteEvent {
+    /// A row was confirmed; route its [`PaletteAction`].
+    Execute(PaletteAction),
+    /// The palette was dismissed (Escape or backdrop click) without a choice.
+    Dismissed,
+}
+
+/// Resolved GPUI colours for the palette box.
+#[derive(Clone, Copy)]
+pub struct CommandPaletteColors {
+    /// Box background.
+    pub bg: Rgba,
+    /// Input field background.
+    pub input_bg: Rgba,
+    /// Border / accent colour.
+    pub border: Rgba,
+    /// Header text.
+    pub header_fg: Rgba,
+    /// Query text.
+    pub query_fg: Rgba,
+    /// Placeholder text (dimmed).
+    pub placeholder_fg: Rgba,
+    /// Item text.
+    pub item_fg: Rgba,
+    /// Selected-row background.
+    pub selection_bg: Rgba,
+    /// Selected-row text.
+    pub selection_fg: Rgba,
+    /// Hovered-row background.
+    pub hover_bg: Rgba,
+}
+
+impl From<&ChromeColors> for CommandPaletteColors {
+    fn from(chrome: &ChromeColors) -> Self {
+        let mut bg = srgba(chrome.tab_bar_active_bg);
+        bg.a = 0.96;
+        let mut input_bg = srgba(chrome.status_bar_bg);
+        input_bg.a = 0.98;
+        let query_fg = srgba(chrome.status_bar_text);
+        Self {
+            bg,
+            input_bg,
+            border: srgba(chrome.accent),
+            header_fg: srgba(chrome.tab_text_active),
+            query_fg,
+            placeholder_fg: with_alpha(query_fg, query_fg.a * 0.7),
+            item_fg: srgba(chrome.tab_text_active),
+            selection_bg: {
+                let mut c = srgba(chrome.status_bar_bg);
+                c.a = 1.0;
+                c
+            },
+            selection_fg: srgba(chrome.tab_text_active),
+            hover_bg: with_alpha(srgba(chrome.tab_text), 0.10),
+        }
+    }
+}
+
+/// The command palette view: an entry list, a live query filter, a highlighted
+/// selection, and keyboard/click confirmation. Ported from the winit
+/// `CommandPalette` state plus the `main.rs` entry/routing machinery.
+pub struct CommandPaletteView {
+    colors: CommandPaletteColors,
+    /// The full, unfiltered entry list (rebuilt when the palette opens).
+    entries: Vec<CommandPaletteEntry>,
+    /// The current filter query.
     query: String,
+    /// Index of the highlighted row within the filtered list.
     selected: usize,
+    focus_handle: FocusHandle,
 }
 
-impl CommandPalette {
-    pub fn new() -> Self {
-        Self { active: false, query: String::new(), selected: 0 }
+impl EventEmitter<CommandPaletteEvent> for CommandPaletteView {}
+
+impl CommandPaletteView {
+    /// Build a palette over `entries` with an empty query.
+    pub fn new(
+        colors: CommandPaletteColors,
+        entries: Vec<CommandPaletteEntry>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self { colors, entries, query: String::new(), selected: 0, focus_handle: cx.focus_handle() }
     }
 
-    pub fn open(&mut self) {
-        self.active = true;
+    /// Replace the entry list and reset the query/selection (called on open).
+    pub fn set_entries(&mut self, entries: Vec<CommandPaletteEntry>, cx: &mut Context<Self>) {
+        self.entries = entries;
         self.query.clear();
         self.selected = 0;
+        cx.notify();
     }
 
-    pub fn close(&mut self) {
-        self.active = false;
-        self.query.clear();
-        self.selected = 0;
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
+    /// The current query string.
+    #[must_use]
     pub fn query(&self) -> &str {
         &self.query
     }
 
-    pub fn push_char(&mut self, c: char) {
-        self.query.push(c);
-        self.selected = 0;
+    /// The rows matching the current query (the visible list).
+    #[must_use]
+    pub fn filtered(&self) -> Vec<CommandPaletteEntry> {
+        filter_entries(&self.entries, &self.query)
     }
 
-    /// Append pasted text to the query, dropping control characters (newlines,
-    /// tabs) so a multi-line clipboard payload collapses into the filter string.
-    pub fn push_str(&mut self, s: &str) {
-        self.query.extend(s.chars().filter(|c| !c.is_control()));
-        self.selected = 0;
-    }
-
-    pub fn pop_char(&mut self) {
-        self.query.pop();
-        self.selected = 0;
-    }
-
-    pub fn clear_query(&mut self) {
-        self.query.clear();
-        self.selected = 0;
-    }
-
+    /// The highlighted index within the filtered list.
+    #[must_use]
     pub fn selected_index(&self) -> usize {
         self.selected
     }
 
-    pub fn clamp_selection(&mut self, count: usize) {
-        if count == 0 {
-            self.selected = 0;
-        } else if self.selected >= count {
-            self.selected = count - 1;
+    /// Append a typed character to the query and reset the selection.
+    pub fn push_char(&mut self, c: char, cx: &mut Context<Self>) {
+        self.query.push(c);
+        self.selected = 0;
+        cx.notify();
+    }
+
+    /// Append pasted text, dropping control characters so a multi-line clipboard
+    /// payload collapses into the filter string. Ported from the winit
+    /// `push_str`.
+    pub fn push_str(&mut self, s: &str, cx: &mut Context<Self>) {
+        self.query.extend(s.chars().filter(|c| !c.is_control()));
+        self.selected = 0;
+        cx.notify();
+    }
+
+    /// Remove the last query character and reset the selection.
+    pub fn pop_char(&mut self, cx: &mut Context<Self>) {
+        self.query.pop();
+        self.selected = 0;
+        cx.notify();
+    }
+
+    /// Move the selection to the next row (wrapping), within the filtered list.
+    pub fn next_item(&mut self, cx: &mut Context<Self>) {
+        let count = self.filtered().len();
+        self.selected = if count == 0 { 0 } else { (self.selected + 1) % count };
+        cx.notify();
+    }
+
+    /// Move the selection to the previous row (wrapping), within the filtered
+    /// list.
+    pub fn prev_item(&mut self, cx: &mut Context<Self>) {
+        let count = self.filtered().len();
+        self.selected = if count == 0 { 0 } else { (self.selected + count - 1) % count };
+        cx.notify();
+    }
+
+    /// Confirm the highlighted row, emitting [`CommandPaletteEvent::Execute`].
+    /// A no-op when the filtered list is empty.
+    pub fn confirm(&mut self, cx: &mut Context<Self>) {
+        let filtered = self.filtered();
+        if let Some(entry) = filtered.get(self.selected) {
+            cx.emit(CommandPaletteEvent::Execute(entry.action.clone()));
         }
     }
 
-    pub fn next_item(&mut self, count: usize) {
-        if count == 0 {
-            self.selected = 0;
-        } else {
-            self.selected = (self.selected + 1) % count;
-        }
+    /// Dismiss the palette without a choice, clearing the query and selection so
+    /// a later reopen starts fresh.
+    pub fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.query.clear();
+        self.selected = 0;
+        cx.emit(CommandPaletteEvent::Dismissed);
     }
 
-    pub fn prev_item(&mut self, count: usize) {
-        if count == 0 {
-            self.selected = 0;
-        } else {
-            self.selected = (self.selected + count - 1) % count;
-        }
-    }
-
-    pub fn build_instances(&self, ctx: CommandPaletteBuildContext<'_>) {
-        let CommandPaletteBuildContext { out, viewport, cell_size, chrome, items, resolve_glyph } =
-            ctx;
-        if !self.active {
-            return;
-        }
-
-        let colors = CommandPaletteColors::from_chrome(chrome);
-        let Some(layout) = CommandPaletteLayout::new(self, viewport, cell_size, items) else {
-            return;
-        };
-
-        let mut renderer = CommandPaletteRenderer::new(out, cell_size.0, resolve_glyph);
-        push_solid_rect(renderer.out, viewport, colors.backdrop);
-        draw_command_palette_frame(renderer.out, &layout, &colors);
-        draw_command_palette_text(&mut renderer, &layout, &colors, cell_size.1, items);
-    }
-}
-
-struct CommandPaletteLayout {
-    overlay: Rect,
-    visible_items: usize,
-    query_text: String,
-    selected: usize,
-}
-
-impl CommandPaletteLayout {
-    fn new(
-        palette: &CommandPalette,
-        viewport: Rect,
-        cell_size: (f32, f32),
-        items: &[String],
-    ) -> Option<Self> {
-        let (cell_w, cell_h) = cell_size;
-        if cell_w <= 0.0 || cell_h <= 0.0 {
-            return None;
-        }
-
-        let visible_items = items.len().min(COMMAND_PALETTE_MAX_ITEMS);
-        let query_text = if palette.query.is_empty() {
-            String::from("Type a command or profile name")
-        } else {
-            palette.query.clone()
-        };
-        let max_text_cols = items
-            .iter()
-            .take(COMMAND_PALETTE_MAX_ITEMS)
-            .map(|item| item.chars().count())
-            .chain(std::iter::once(query_text.chars().count() + 2))
-            .max()
-            .unwrap_or(COMMAND_PALETTE_MIN_COLS);
-        let overlay_cols = max_text_cols.clamp(COMMAND_PALETTE_MIN_COLS, COMMAND_PALETTE_MAX_COLS);
-        let overlay_rows = visible_items + 2;
-        let overlay_width = overlay_grid_width(overlay_cols, cell_w);
-        let overlay_height = overlay_grid_height(overlay_rows, cell_h);
-        let overlay = Rect {
-            x: viewport.x + ((viewport.width - overlay_width) / 2.0).max(0.0),
-            y: viewport.y + ((viewport.height - overlay_height) / 4.0).max(0.0),
-            width: overlay_width,
-            height: overlay_height,
-        };
-
-        Some(Self { overlay, visible_items, query_text, selected: palette.selected })
-    }
-}
-
-fn draw_command_palette_frame(
-    out: &mut Vec<CellInstance>,
-    layout: &CommandPaletteLayout,
-    colors: &CommandPaletteColors,
-) {
-    push_solid_rect(out, layout.overlay, colors.bg);
-    push_solid_rect(
-        out,
-        Rect { x: layout.overlay.x, y: layout.overlay.y, width: layout.overlay.width, height: 1.0 },
-        colors.border,
-    );
-    push_solid_rect(
-        out,
-        Rect {
-            x: layout.overlay.x,
-            y: layout.overlay.y + layout.overlay.height - 1.0,
-            width: layout.overlay.width,
-            height: 1.0,
-        },
-        colors.border,
-    );
-    push_solid_rect(
-        out,
-        Rect {
-            x: layout.overlay.x,
-            y: layout.overlay.y,
-            width: 1.0,
-            height: layout.overlay.height,
-        },
-        colors.border,
-    );
-    push_solid_rect(
-        out,
-        Rect {
-            x: layout.overlay.x + layout.overlay.width - 1.0,
-            y: layout.overlay.y,
-            width: 1.0,
-            height: layout.overlay.height,
-        },
-        colors.border,
-    );
-    push_solid_rect(
-        out,
-        Rect {
-            x: layout.overlay.x + 1.0,
-            y: layout.overlay.y + (layout.overlay.height / 2.0),
-            width: (layout.overlay.width - 2.0).max(0.0),
-            height: (layout.overlay.height / 2.0 - 1.0).max(0.0),
-        },
-        colors.input_bg,
-    );
-}
-
-fn draw_command_palette_text(
-    renderer: &mut CommandPaletteRenderer<'_>,
-    layout: &CommandPaletteLayout,
-    colors: &CommandPaletteColors,
-    cell_h: f32,
-    items: &[String],
-) {
-    let cell_w = renderer.cell_w;
-    renderer.emit_text_line(
-        "Command Palette",
-        layout.overlay.x + cell_w,
-        layout.overlay.y,
-        TextColors { fg: colors.header_fg, bg: colors.bg },
-    );
-    renderer.emit_text_line(
-        ">",
-        layout.overlay.x + cell_w,
-        layout.overlay.y + cell_h,
-        TextColors { fg: colors.border, bg: colors.input_bg },
-    );
-    renderer.emit_text_line(
-        &layout.query_text,
-        layout.overlay.x + 2.0 * cell_w,
-        layout.overlay.y + cell_h,
-        TextColors {
-            fg: if layout.query_text.is_empty() { colors.placeholder_fg } else { colors.query_fg },
-            bg: colors.input_bg,
-        },
-    );
-
-    for (index, item) in items.iter().take(COMMAND_PALETTE_MAX_ITEMS).enumerate() {
-        let row_y = overlay_grid_y(layout.overlay.y, index + 2, cell_h);
-        let selected = index == layout.selected;
+    fn render_item(
+        colors: CommandPaletteColors,
+        index: usize,
+        entry: &CommandPaletteEntry,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let fg = if selected { colors.selection_fg } else { colors.item_fg };
+        let mut row = div()
+            .id(("palette-item", index))
+            .w_full()
+            .px_3()
+            .py_1()
+            .rounded_sm()
+            .text_sm()
+            .text_color(fg)
+            .child(entry.label.clone());
         if selected {
-            push_solid_rect(
-                renderer.out,
-                Rect {
-                    x: layout.overlay.x + 1.0,
-                    y: row_y,
-                    width: (layout.overlay.width - 2.0).max(0.0),
-                    height: cell_h,
-                },
-                colors.selection_bg,
+            row = row.bg(colors.selection_bg);
+        }
+        row.hover(move |s| s.bg(colors.hover_bg))
+            .active(move |s| s.bg(colors.selection_bg))
+            .on_click(cx.listener(move |this, _, _win, ctx| {
+                this.selected = index;
+                this.confirm(ctx);
+            }))
+            .into_any_element()
+    }
+}
+
+impl Render for CommandPaletteView {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors;
+        let filtered = self.filtered();
+        let query_empty = self.query.trim().is_empty();
+
+        let mut rows = Vec::new();
+        if filtered.is_empty() {
+            rows.push(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_sm()
+                    .text_color(colors.placeholder_fg)
+                    .child("No matching commands")
+                    .into_any_element(),
             );
+        } else {
+            let selected = self.selected;
+            for (index, entry) in filtered.iter().take(MAX_VISIBLE_ITEMS).enumerate() {
+                rows.push(Self::render_item(colors, index, entry, index == selected, cx));
+            }
         }
-        renderer.emit_text_line(
-            item,
-            layout.overlay.x + cell_w,
-            row_y,
-            TextColors {
-                fg: if selected { colors.selection_fg } else { colors.item_fg },
-                bg: if selected { colors.selection_bg } else { colors.bg },
-            },
-        );
-    }
 
-    if layout.visible_items == 0 {
-        renderer.emit_text_line(
-            "No matching commands",
-            layout.overlay.x + cell_w,
-            layout.overlay.y + 2.0 * cell_h,
-            TextColors { fg: colors.placeholder_fg, bg: colors.bg },
-        );
-    }
-}
+        let query_text = if query_empty {
+            "Type a command or profile name".to_owned()
+        } else {
+            self.query.clone()
+        };
+        let query_color = if query_empty { colors.placeholder_fg } else { colors.query_fg };
 
-#[derive(Clone, Copy)]
-struct TextColors {
-    fg: [f32; 4],
-    bg: [f32; 4],
-}
-
-struct CommandPaletteRenderer<'a> {
-    out: &'a mut Vec<CellInstance>,
-    cell_w: f32,
-    resolve_glyph: &'a mut GlyphResolver<'a>,
-}
-
-impl<'a> CommandPaletteRenderer<'a> {
-    fn new(
-        out: &'a mut Vec<CellInstance>,
-        cell_w: f32,
-        resolve_glyph: &'a mut GlyphResolver<'a>,
-    ) -> Self {
-        Self { out, cell_w, resolve_glyph }
-    }
-
-    fn emit_text_line(&mut self, text: &str, start_x: f32, y: f32, colors: TextColors) {
-        for (idx, ch) in text.chars().enumerate() {
-            let (uv_min, uv_max) = (self.resolve_glyph)(ch);
-            self.out.push(CellInstance {
-                pos: [start_x + overlay_grid_width(idx, self.cell_w), y],
-                size: [0.0, 0.0],
-                uv_min,
-                uv_max,
-                fg_color: colors.fg,
-                bg_color: colors.bg,
-                corner_radius: 0.0,
-            });
-        }
-    }
-}
-
-struct CommandPaletteColors {
-    backdrop: [f32; 4],
-    bg: [f32; 4],
-    input_bg: [f32; 4],
-    border: [f32; 4],
-    header_fg: [f32; 4],
-    placeholder_fg: [f32; 4],
-    query_fg: [f32; 4],
-    item_fg: [f32; 4],
-    selection_bg: [f32; 4],
-    selection_fg: [f32; 4],
-}
-
-impl CommandPaletteColors {
-    fn from_chrome(chrome: &ChromeColors) -> Self {
-        let mut bg = srgb_to_linear_rgba(chrome.tab_bar_active_bg);
-        bg[3] = 0.94;
-
-        let mut input_bg = srgb_to_linear_rgba(chrome.status_bar_bg);
-        input_bg[3] = 0.98;
-
-        let border = srgb_to_linear_rgba(chrome.accent);
-        let header_fg = srgb_to_linear_rgba(chrome.tab_text_active);
-        let item_fg = srgb_to_linear_rgba(chrome.tab_text_active);
-        let query_fg = srgb_to_linear_rgba(chrome.status_bar_text);
-        let mut placeholder_fg = query_fg;
-        placeholder_fg[3] *= 0.7;
-        let mut active_row_bg = srgb_to_linear_rgba(chrome.status_bar_bg);
-        active_row_bg[3] = 1.0;
-        let active_text = srgb_to_linear_rgba(chrome.tab_text_active);
-
-        Self {
-            backdrop: [0.0, 0.0, 0.0, 0.18],
-            bg,
-            input_bg,
-            border,
-            header_fg,
-            placeholder_fg,
-            query_fg,
-            item_fg,
-            selection_bg: active_row_bg,
-            selection_fg: active_text,
-        }
+        // Backdrop: a click outside the box dismisses.
+        div()
+            .track_focus(&self.focus_handle)
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _win, ctx| this.dismiss(ctx)),
+            )
+            .child(
+                div()
+                    .mt(px(96.0))
+                    .w(px(520.0))
+                    .flex()
+                    .flex_col()
+                    .bg(colors.bg)
+                    .border_1()
+                    .border_color(colors.border)
+                    .rounded_lg()
+                    .shadow_lg()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+                    .child(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .text_xs()
+                            .text_color(colors.header_fg)
+                            .child("Command Palette"),
+                    )
+                    .child(
+                        div()
+                            .mx_2()
+                            .mt_1()
+                            .mb_2()
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .bg(colors.input_bg)
+                            .rounded_md()
+                            .child(div().text_sm().text_color(colors.border).child(">"))
+                            .child(div().text_sm().text_color(query_color).child(query_text)),
+                    )
+                    .child(div().pb_2().flex().flex_col().gap_0p5().children(rows)),
+            )
     }
 }
 
-fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
-    out.push(scribe_renderer::chrome::solid_quad(rect.x, rect.y, rect.width, rect.height, color));
+/// Return `color` with a replaced alpha channel.
+fn with_alpha(color: Rgba, alpha: f32) -> Rgba {
+    Rgba { a: alpha, ..color }
 }
+
+#[cfg(test)]
+mod tests;

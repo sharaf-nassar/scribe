@@ -6,14 +6,11 @@ PRIVILEGED_USER_UID="${SUDO_UID:-${PKEXEC_UID:-}}"
 if [ "$PACKAGE_NAME" = "scribe-dev" ]; then
     APP_SLUG="scribe-dev"
     CLIENT_BIN_NAME="scribe-dev"
-    SETTINGS_BIN_NAME="scribe-dev-settings"
 else
     APP_SLUG="scribe"
     CLIENT_BIN_NAME="scribe-client"
-    SETTINGS_BIN_NAME="scribe-settings"
 fi
 CLIENT_BIN_PATH="/usr/bin/${CLIENT_BIN_NAME}"
-SETTINGS_BIN_PATH="/usr/bin/${SETTINGS_BIN_NAME}"
 
 process_pids_for_binary() {
     local binary="$1"
@@ -49,7 +46,17 @@ case "$1" in
         # Use -f (full cmdline) — comm is truncated to 15 chars, breaking -x
         # for "scribe-dev-settings" (19 chars).
         process_pids_for_binary "$CLIENT_BIN_PATH" | tr '\n' ' ' > "${STATE_DIR}/upgrade-client-pids" || true
-        process_pids_for_binary "$SETTINGS_BIN_PATH" > "${STATE_DIR}/upgrade-settings-pid" || true
+
+        # dpkg replaces /usr/bin/scribe-client during unpack, before postinst
+        # can ask the new binary whether Vulkan is available. Keep an
+        # owner-private copy now so postinst can restore it if the probe fails.
+        CLIENT_STASH_PATH="${STATE_DIR}/upgrade-client-binary"
+        rm -f "${CLIENT_STASH_PATH}" "${STATE_DIR}/upgrade-client-stashed" 2>/dev/null || true
+        if [ -x "${CLIENT_BIN_PATH}" ] && cp "${CLIENT_BIN_PATH}" "${CLIENT_STASH_PATH}" 2>/dev/null; then
+            chmod 0700 "${CLIENT_STASH_PATH}" 2>/dev/null || true
+            chown "${TARGET_UID}:${TARGET_UID}" "${CLIENT_STASH_PATH}" 2>/dev/null || true
+            printf '%s\n' "${CLIENT_STASH_PATH}" > "${STATE_DIR}/upgrade-client-stashed"
+        fi
         ;;
 esac
 

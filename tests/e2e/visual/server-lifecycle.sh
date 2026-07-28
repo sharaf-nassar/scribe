@@ -67,7 +67,7 @@ wait_for_pattern() {
 wait_for_client_exit() {
     local timeout_secs="${1:-20}" started
     started=$(date +%s)
-    while pgrep -f 'scribe-client-gpui' >/dev/null 2>&1; do
+    while pgrep -f 'scribe-client' >/dev/null 2>&1; do
         [ $(("$(date +%s)" - started)) -ge "$timeout_secs" ] && return 1
         sleep 0.3
     done
@@ -84,7 +84,7 @@ find_window() {
 # ── Phase 0: tear the first client and the server down ────────────
 # The entrypoint left a client attached to a live server; both have to be gone
 # before a cold connect can be observed at all.
-pkill -f 'scribe-client-gpui' 2>/dev/null || true
+pkill -f 'scribe-client' 2>/dev/null || true
 wait_for_client_exit 20 || fail "the entrypoint's client never exited"
 scribe-test server stop >/dev/null 2>&1 || true
 for _ in $(seq 1 40); do
@@ -111,7 +111,7 @@ PY
 [ -S "$SOCKET" ] || fail "could not plant a stale socket file at $SOCKET"
 
 : >"$PHASE1_LOG"
-SCRIBE_CLIENT_LOG="$PHASE1_LOG" scribe-client-gpui >>"$PHASE1_LOG" 2>&1 &
+SCRIBE_CLIENT_LOG="$PHASE1_LOG" scribe-client >>"$PHASE1_LOG" 2>&1 &
 if ! wait_for_pattern "$PHASE1_LOG" "stale server socket at $SOCKET" 30; then
     fail "the client never diagnosed the stale socket"
 fi
@@ -127,7 +127,7 @@ fi
 echo "PHASE 1 PASS: the client named the stale socket and carried it into the status line"
 plain_log "$PHASE1_LOG" | grep -F "stale server socket" | tail -1
 
-pkill -f 'scribe-client-gpui' 2>/dev/null || true
+pkill -f 'scribe-client' 2>/dev/null || true
 wait_for_client_exit 20 || fail "the stale-socket client never exited"
 
 # ── Phase 2: autostart brings a server up and the window paints ───
@@ -164,7 +164,7 @@ PY
 
 : >"$PHASE2_LOG"
 PATH="$SHIM_DIR:$PATH" SCRIBE_CLIENT_LOG="$PHASE2_LOG" \
-    scribe-client-gpui >>"$PHASE2_LOG" 2>&1 &
+    scribe-client >>"$PHASE2_LOG" 2>&1 &
 if ! wait_for_pattern "$PHASE2_LOG" "server not running, starting scribe-server" 30; then
     fail "the client never tried to autostart a server in phase 2"
 fi

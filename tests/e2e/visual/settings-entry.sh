@@ -4,7 +4,7 @@
 # The settings window was complete for the whole rebuild and unreachable from
 # inside the terminal: `KeyAction::OpenSettings` hit a swallow arm in
 # `dispatch_key_action`, so the only way to the surface was the
-# `scribe-client-gpui --settings` CLI flag. That took every setting, and the
+# `scribe-client --settings` CLI flag. That took every setting, and the
 # update/trust actions that live on those pages, out of the running app.
 #
 # A headless test can prove the dispatcher arm exists; it cannot prove a second
@@ -39,7 +39,7 @@ CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
 # this; an unpainted or blank window would fall under it.
 SETTINGS_INK_MIN="${SETTINGS_INK_MIN:-500}"
 
-# Titlebar geometry, from crates/scribe-client-gpui/src/titlebar.rs: the band is
+# Titlebar geometry, from crates/scribe-client/src/titlebar.rs: the band is
 # TITLEBAR_HEIGHT=34 tall, and the gear is a 34px icon button sitting directly
 # left of the three 40px window controls (the equalize button next to it is
 # hidden while the window has no split). A titlebar layout change turns into a

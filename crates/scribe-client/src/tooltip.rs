@@ -1,145 +1,178 @@
-//! GPU-rendered tooltip overlay.
+//! Hover tooltip overlay for the GPUI client rebuild.
 //!
-//! Renders a small dark box with light text above or below an anchor [`Rect`].
-//! The tooltip is positioned centered horizontally on the anchor and emits
-//! [`CellInstance`] quads into the caller's buffer.
+//! The winit client painted tooltips as `CellInstance` quads (a border quad, a
+//! background quad, then glyphs) centred on an anchor rect and clamped to the
+//! viewport, plus a dedicated OSC 8 hover-tooltip that head+tail-truncated a long
+//! URI so it fit the box. This port keeps that geometry as pure, testable
+//! functions — [`clamp_tooltip_x`] (centre-on-anchor, clamp to the viewport) and
+//! [`truncate_url`] (the `head…tail` URL elision) — and lowers the paint onto a
+//! GPUI [`tooltip_element`] with rounded corners and a drop shadow instead of the
+//! hand-placed quads.
 
-use scribe_renderer::types::CellInstance;
+use gpui::{AnyElement, Rgba, div, prelude::*, px};
+use scribe_common::theme::ChromeColors;
 
 use crate::layout::Rect;
-type GlyphResolver<'a> = dyn FnMut(char) -> ([f32; 2], [f32; 2]) + 'a;
+use crate::tab_bar::srgba;
 
 /// Whether the tooltip should appear above or below its anchor rect.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TooltipPosition {
+    /// Draw the tooltip immediately above the anchor's top edge.
     Above,
+    /// Draw the tooltip immediately below the anchor's bottom edge.
     Below,
 }
 
-/// A hover target that can show a tooltip.
+/// A hover target that can show a tooltip: the display text plus the anchor
+/// rectangle it is positioned against.
+#[derive(Clone, Debug)]
 pub struct TooltipAnchor {
+    /// Text shown inside the tooltip box.
     pub text: String,
+    /// The on-screen rectangle the tooltip is centred over.
     pub rect: Rect,
 }
 
-pub struct TooltipRenderContext<'a> {
-    pub out: &'a mut Vec<CellInstance>,
-    pub text: &'a str,
-    pub anchor: Rect,
-    pub position: TooltipPosition,
-    pub bg_color: [f32; 4],
-    pub fg_color: [f32; 4],
-    pub border_color: [f32; 4],
-    pub cell_size: (f32, f32),
-    pub viewport_width: f32,
-    pub resolve_glyph: &'a mut GlyphResolver<'a>,
+/// One display-character advance, matching the fixed-width terminal cell metric.
+/// The tooltip box reserves one character of padding on each side of the text,
+/// mirroring the winit renderer's leading/trailing space glyphs.
+pub const TOOLTIP_PAD_COLS: usize = 2;
+
+/// Compute the tooltip box width in pixels for `text` at `char_width` per
+/// character, including one character of padding on each side.
+#[must_use]
+pub fn tooltip_width(text: &str, char_width: f32) -> f32 {
+    let cols = text.chars().count() + TOOLTIP_PAD_COLS;
+    u16::try_from(cols).map_or(f32::from(u16::MAX), f32::from) * char_width
 }
 
-/// Render a tooltip above or below `anchor`, emitting into `out`.
-///
-/// The tooltip has a 1-character left/right padding, a dark background, and
-/// light text. The background is drawn first (solid quad), then text glyphs.
-/// The tooltip is clamped to stay within `viewport_width`.
-pub fn render_tooltip(ctx: TooltipRenderContext<'_>) {
-    let TooltipRenderContext {
-        out,
-        text,
-        anchor,
-        position,
-        bg_color,
-        fg_color,
-        border_color,
-        cell_size,
-        viewport_width,
-        resolve_glyph,
-    } = ctx;
-    let (cell_w, cell_h) = cell_size;
-    if cell_w <= 0.0 || cell_h <= 0.0 || text.is_empty() {
-        return;
-    }
-
-    let text_chars: Vec<char> = text.chars().collect();
-    // Padding: 1 char on each side.
-    let total_cols = text_chars.len() + 2;
-
-    let tooltip_w = f32::from(u16::try_from(total_cols).unwrap_or(u16::MAX)) * cell_w;
-    let tooltip_h = cell_h;
-
-    // Center horizontally on the anchor rect, clamped to stay within the viewport.
+/// Centre a `tooltip_width`-wide box horizontally over `anchor` and clamp it to
+/// stay within `[0, viewport_width]`. Ported verbatim from the winit tooltip
+/// renderer so a tooltip anchored near the window edge slides inward instead of
+/// clipping. When the tooltip is wider than the viewport the clamp collapses to
+/// the left edge (`0.0`).
+#[must_use]
+pub fn clamp_tooltip_x(anchor: Rect, tooltip_width: f32, viewport_width: f32) -> f32 {
     let center_x = anchor.x + anchor.width / 2.0;
-    let tooltip_x = (center_x - tooltip_w / 2.0).clamp(0.0, (viewport_width - tooltip_w).max(0.0));
+    (center_x - tooltip_width / 2.0).clamp(0.0, (viewport_width - tooltip_width).max(0.0))
+}
 
-    let tooltip_y = match position {
-        TooltipPosition::Above => anchor.y - tooltip_h,
+/// Top-left `y` of a `tooltip_height`-tall box for the chosen [`TooltipPosition`]
+/// relative to `anchor`.
+#[must_use]
+pub fn tooltip_y(anchor: Rect, tooltip_height: f32, position: TooltipPosition) -> f32 {
+    match position {
+        TooltipPosition::Above => anchor.y - tooltip_height,
         TooltipPosition::Below => anchor.y + anchor.height,
-    };
-
-    // Border (1px border rendered as a slightly larger background quad).
-    let border_rect = Rect {
-        x: tooltip_x - 1.0,
-        y: tooltip_y - 1.0,
-        width: tooltip_w + 2.0,
-        height: tooltip_h + 2.0,
-    };
-    push_solid_rect(out, border_rect, border_color);
-
-    // Background.
-    let bg_rect = Rect { x: tooltip_x, y: tooltip_y, width: tooltip_w, height: tooltip_h };
-    push_solid_rect(out, bg_rect, bg_color);
-
-    // Text: leading space + chars + trailing space.
-    let mut renderer = TooltipRenderer::new(out, fg_color, bg_color, cell_w, resolve_glyph);
-    let mut col_x = tooltip_x;
-    col_x = renderer.emit_glyph(' ', col_x, tooltip_y);
-    for &ch in &text_chars {
-        col_x = renderer.emit_glyph(ch, col_x, tooltip_y);
-    }
-    renderer.emit_glyph(' ', col_x, tooltip_y);
-}
-
-struct TooltipRenderer<'a> {
-    out: &'a mut Vec<CellInstance>,
-    fg_color: [f32; 4],
-    bg_color: [f32; 4],
-    cell_w: f32,
-    resolve_glyph: &'a mut GlyphResolver<'a>,
-}
-
-impl<'a> TooltipRenderer<'a> {
-    fn new(
-        out: &'a mut Vec<CellInstance>,
-        fg_color: [f32; 4],
-        bg_color: [f32; 4],
-        cell_w: f32,
-        resolve_glyph: &'a mut GlyphResolver<'a>,
-    ) -> Self {
-        Self { out, fg_color, bg_color, cell_w, resolve_glyph }
-    }
-
-    fn emit_glyph(&mut self, ch: char, x: f32, y: f32) -> f32 {
-        let (uv_min, uv_max) = (self.resolve_glyph)(ch);
-        self.out.push(CellInstance {
-            pos: [x, y],
-            size: [0.0, 0.0],
-            uv_min,
-            uv_max,
-            fg_color: self.fg_color,
-            bg_color: self.bg_color,
-            corner_radius: 0.0,
-        });
-        x + self.cell_w
     }
 }
 
-/// Push a solid-color rectangle (no glyph) into `out`.
-fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
-    out.push(CellInstance {
-        pos: [rect.x, rect.y],
-        size: [rect.width, rect.height],
-        uv_min: [0.0, 0.0],
-        uv_max: [0.0, 0.0],
-        fg_color: color,
-        bg_color: color,
-        corner_radius: 0.0,
-    });
+/// Head+tail-truncate `uri` to at most `max_cols` display columns, inserting an
+/// `...` ellipsis in the middle so both the scheme/host head and the path tail
+/// stay visible. Ported verbatim from the winit client's `osc8_tooltip_truncate`
+/// (spec 009 FR-006): URIs at or under the budget are returned unchanged, a
+/// budget of three columns or fewer falls back to a plain head cut, and the
+/// remaining budget is split head-heavy (`div_ceil`) so an odd column favours the
+/// head. Char-based so a multibyte URI never splits mid-codepoint.
+#[must_use]
+pub fn truncate_url(uri: &str, max_cols: usize) -> String {
+    let chars: Vec<char> = uri.chars().collect();
+    if chars.len() <= max_cols {
+        return uri.to_owned();
+    }
+    if max_cols <= 3 {
+        return chars.into_iter().take(max_cols).collect();
+    }
+    let budget = max_cols.saturating_sub(3);
+    let head_chars = budget.div_ceil(2);
+    let tail_chars = budget - head_chars;
+    let mut out: String = chars.iter().take(head_chars).collect();
+    out.push_str("...");
+    out.extend(chars.iter().skip(chars.len() - tail_chars));
+    out
 }
+
+/// Resolved GPUI colours for the tooltip box, derived from the theme chrome.
+#[derive(Clone, Copy)]
+pub struct TooltipColors {
+    /// Box background.
+    pub bg: Rgba,
+    /// Text colour.
+    pub fg: Rgba,
+    /// 1px border colour.
+    pub border: Rgba,
+}
+
+impl From<&ChromeColors> for TooltipColors {
+    fn from(chrome: &ChromeColors) -> Self {
+        let mut bg = srgba(chrome.tab_bar_bg);
+        bg.a = 0.98;
+        Self {
+            bg,
+            fg: srgba(chrome.tab_text_active),
+            border: with_alpha(srgba(chrome.tab_text), 0.25),
+        }
+    }
+}
+
+/// Return `color` with a replaced alpha channel.
+fn with_alpha(color: Rgba, alpha: f32) -> Rgba {
+    Rgba { a: alpha, ..color }
+}
+
+/// Inputs for [`tooltip_element`]: the text, the anchor geometry, the theme
+/// colours, and the fixed-width cell metric the box is sized against.
+pub struct TooltipRender<'a> {
+    /// Text shown inside the box.
+    pub text: &'a str,
+    /// The on-screen rectangle the tooltip is centred over.
+    pub anchor: Rect,
+    /// Whether the box sits above or below the anchor.
+    pub position: TooltipPosition,
+    /// Window width used to clamp the box inside the viewport.
+    pub viewport_width: f32,
+    /// Resolved box colours.
+    pub colors: &'a TooltipColors,
+    /// Advance width of one display character.
+    pub char_width: f32,
+    /// Line height (box height).
+    pub line_height: f32,
+}
+
+/// Build the absolutely-positioned tooltip box for the given [`TooltipRender`].
+///
+/// The returned element is `absolute`-positioned at the clamped `(x, y)` inside a
+/// `relative` overlay layer, with rounded corners, a drop shadow, a 1px border,
+/// and single-character horizontal padding, replacing the winit border/background
+/// quad pair. `char_width` and `line_height` size the box to the fixed-width cell
+/// metric so the tooltip lines up with the terminal grid.
+#[must_use]
+pub fn tooltip_element(params: &TooltipRender<'_>) -> AnyElement {
+    let &TooltipRender { text, anchor, position, viewport_width, colors, char_width, line_height } =
+        params;
+    let width = tooltip_width(text, char_width);
+    let x = clamp_tooltip_x(anchor, width, viewport_width);
+    let y = tooltip_y(anchor, line_height, position);
+    div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(width))
+        .h(px(line_height))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(colors.bg)
+        .text_color(colors.fg)
+        .text_xs()
+        .rounded_md()
+        .border_1()
+        .border_color(colors.border)
+        .shadow_md()
+        .child(text.to_owned())
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests;

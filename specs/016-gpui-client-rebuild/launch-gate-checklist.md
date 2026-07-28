@@ -24,7 +24,7 @@ Two byte-identified GPUI binaries drove the run:
 | Candidate | SHA-256 | Use |
 | --- | --- | --- |
 | User-supplied `/usr/bin/scribe-dev` | `1b63ce9241b34fefbb7ced370af0146a276a07b5be3a1bef50bb6a768afbd4e2` | Live perf A/B, opacity, and IME on `:0` |
-| `target/release/scribe-client-gpui` after the gate fixes | `b3791f69b23b8515ed9354aded13dce16f3f3a841078e6461fd0d66bea955f75` | Rebuilt visual image and source-level quality gates |
+| `target/release/scribe-client` after the gate fixes | `b3791f69b23b8515ed9354aded13dce16f3f3a841078e6461fd0d66bea955f75` | Rebuilt visual image and source-level quality gates |
 
 The source-only delta found during this run is confined to server-upgrade
 reattachment plus E2E oracle corrections. The rebuilt source candidate drove

@@ -48,7 +48,7 @@ Verdicts are derived from a live-path call chain, traced outward from the four
 entry points of the shipped binary:
 
 - **App/render path** — `main()` → `open_window` → `TerminalView::render`
-  (`crates/scribe-client-gpui/src/main.rs:1229`, `:1045`).
+  (`crates/scribe-client/src/main.rs:1229`, `:1045`).
 - **Key path** — the `on_key_down` listener at `main.rs:1075`, which runs
   `handle_overlay_key` → `handle_binding` → `on_key_down` in that order.
 - **Outbound IPC** — `IpcSink` (`ipc_bridge.rs:186`) plus the two raw
@@ -63,14 +63,14 @@ A row is judged against these definitions:
 - **UNWIRED** — an implementation exists in the crate but nothing on a live path
   reaches it. The module is referenced only by `lib.rs`, its own file, and its
   tests; or the dispatch site swallows the value.
-- **MISSING** — no implementation exists anywhere in `crates/scribe-client-gpui`.
+- **MISSING** — no implementation exists anywhere in `crates/scribe-client`.
 - **UNKNOWN** — could not be determined; the reason is stated inline.
 
 Determination techniques, in order of authority:
 
-1. `grep -rn` for each protocol variant across `crates/scribe-client-gpui/src`,
+1. `grep -rn` for each protocol variant across `crates/scribe-client/src`,
    partitioned into live-path files, unimported library modules, and `tests.rs`.
-2. Import-closure analysis: `main.rs`'s `use scribe_client_gpui::…` list is the
+2. Import-closure analysis: `main.rs`'s `use scribe_client::…` list is the
    complete set of library modules the binary can reach, because the five
    `mod` submodules of the binary reference only `crate::terminal`,
    `crate::sync_frames`, and each other (verified by grep).
@@ -124,7 +124,7 @@ Determination techniques, in order of authority:
 | `QuitAll` | scripted-E2E | WIRED (bead .72) | `TerminalView::route_close_action` → `IpcSink::quit_all` |
 | `TriggerUpdate` | scripted-E2E | UNWIRED | `settings/server_action.rs:81` `request_trigger_update` has no caller |
 | `DismissUpdate` | gpui-test | MISSING | never constructed anywhere in the crate |
-| `CheckForUpdates` | scripted-E2E | WIRED | `settings/window.rs:161` from `action.check_for_updates` (`settings/model.rs:386`). Reached through the settings window, which bead .82 made reachable from inside the running client (settings chord, palette row, titlebar gear) as well as via `scribe-client-gpui --settings` |
+| `CheckForUpdates` | scripted-E2E | WIRED | `settings/window.rs:161` from `action.check_for_updates` (`settings/model.rs:386`). Reached through the settings window, which bead .82 made reachable from inside the running client (settings chord, palette row, titlebar gear) as well as via `scribe-client --settings` |
 | `ListReleases` | scripted-E2E | WIRED | `settings/window.rs:165` from `action.list_releases` (`settings/model.rs:387`); same settings-window reachability |
 | `ListWindows` | scripted-E2E | WIRED (bead .72) | `TerminalView::poll_window_list` → `IpcSink::list_windows` |
 | `DispatchAction` | scripted-E2E | WIRED | `IpcSink::dispatch_action`, from a viewer's window-mutating palette row |
@@ -310,7 +310,7 @@ at all.
 | Surface | Verification method | Verdict | Evidence |
 | --- | --- | --- | --- |
 | Box drawing | visual-E2E | UNWIRED | `box_drawing.rs` implements the rasterizer; its only references outside itself are `lib.rs:5` and `lib.rs:47`. No paint-quad overlay exists in `terminal_element.rs` |
-| Font fallback | gpui-test | MISSING | `FontFallbacks` and `Symbols Nerd Font` appear nowhere in `crates/scribe-client-gpui/src`. `terminal_element.rs:82` sets a bare `.font_family(...)` |
+| Font fallback | gpui-test | MISSING | `FontFallbacks` and `Symbols Nerd Font` appear nowhere in `crates/scribe-client/src`. `terminal_element.rs:82` sets a bare `.font_family(...)` |
 | Ligatures | visual-E2E | MISSING | `shape_line` and `calt` appear nowhere in the crate; `appearance.ligatures` is never read by the client |
 | Opacity | manual | UNWIRED | `apply_opacity_change` (`main.rs:384`) only emits `tracing::info!`; the root background is a hardcoded opaque `rgb(0x0010_1318)` at `main.rs:1087` and `terminal_element.rs:80`. In flight as bead .56 |
 | X11 focus guard | scripted-E2E | UNWIRED | `x11_focus.rs` exists; its only references are `lib.rs:98` and its own doc comment. Never started by `main` |
@@ -348,7 +348,7 @@ declares no `deny_unknown_fields`, so `appearance.splash` and
 `appearance.splash_duration_ms` — which have no struct field at all — are
 dropped by serde. The remaining seven deserialize into `AppearanceConfig` but
 are never read by the GPUI client: the only hits under
-`crates/scribe-client-gpui/src` are in `settings/apply.rs`, which is a
+`crates/scribe-client/src` are in `settings/apply.rs`, which is a
 config *writer*, and `prompt_bar.rs:75-77`, which reads the identically named
 fields of `scribe_common::theme::ChromeColors`, not `AppearanceConfig`. The live
 load path is `ConfigRuntime::start` (`config.rs:312`) → `load_config`
@@ -675,7 +675,7 @@ The decisive evidence in this audit came from three greps that a script can run:
   observable at runtime instead of silent.
 - Every `ClientMessage` variant marked `required` must be constructed in a file
   reachable from `main.rs`'s import closure. Compute that closure from the
-  `use scribe_client_gpui::…` list and fail on any variant built only outside it.
+  `use scribe_client::…` list and fail on any variant built only outside it.
 - Every module in `lib.rs` must either be in `main.rs`'s import closure or carry
   an explicit `#![doc = "unwired: <bead-id>"]` marker. Today 35 of 54 modules
   would need markers — that count is itself the launch-gate metric.

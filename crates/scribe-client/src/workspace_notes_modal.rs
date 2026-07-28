@@ -1,68 +1,161 @@
-//! GPU-rendered per-workspace notes modal.
+//! Per-workspace notes modal for the GPUI client rebuild.
+//!
+//! The winit client drew this modal as hand-placed `CellInstance` quads over a
+//! grid ([`workspace_notes_modal.rs`](../../scribe-client/src/workspace_notes_modal.rs)),
+//! with the active/archive/editor state machine folded into the painter. This
+//! port keeps that state machine verbatim — the [`WorkspaceNotesView`] toggle,
+//! the [`WorkspaceNotesEditMode`] editor target, the draft dirty flag, and the
+//! `\n---\n` bulk-archive splitter — while painting the surfaces with GPUI
+//! elements (rounded panel, nav buttons, note rows with per-row actions, and an
+//! input box with a caret). Clicking a control emits a
+//! [`WorkspaceNotesModalAction`]; the shell routes it and, for Save/archive,
+//! turns the current state into a frozen [`WorkspaceNotesMutation`] via
+//! [`WorkspaceNotesModalView::save_mutation`] /
+//! [`WorkspaceNotesModalView::archive_mutation`].
 
+use gpui::{Context, EventEmitter, FocusHandle, Rgba, div, prelude::*, px};
 use scribe_common::ids::WorkspaceId;
+use scribe_common::protocol::WorkspaceNotesMutation;
 use scribe_common::theme::ChromeColors;
-use scribe_renderer::srgb_to_linear_rgba;
-use scribe_renderer::types::CellInstance;
 
-use crate::layout::Rect;
-use crate::workspace_notes::WorkspaceNoteEntry;
+use crate::tab_bar::srgba;
+use crate::workspace_notes::{ArchiveReason, WorkspaceNoteEntry};
 
-type GlyphResolver<'a> = dyn FnMut(char) -> ([f32; 2], [f32; 2]) + 'a;
+/// Maximum active/archive rows shown before the list scrolls.
+pub const NOTE_LIST_ROWS: usize = 8;
 
-const MIN_MODAL_COLS: usize = 44;
-const MAX_MODAL_COLS: usize = 82;
-const MODAL_ROWS: usize = 31;
-const MAX_MODAL_GRID_UNITS: usize = 65_535;
-const PAD_COLS: usize = 3;
-const HEADER_TITLE_ROW: usize = 1;
-const NAV_ROW: usize = 3;
-const HEADER_RULE_ROW: usize = 5;
-const NOTE_LIST_TOP: usize = 7;
-const NOTE_LIST_ROWS: usize = 8;
-const ARCHIVE_ACTION_ROW: usize = 16;
-const EDITOR_LABEL_ROW: usize = 18;
-const EDITOR_INPUT_TOP: usize = 20;
-const EDITOR_ROWS: usize = 5;
-const EDITOR_CONTENT_TOP: usize = EDITOR_INPUT_TOP + 1;
-const EDITOR_CONTENT_ROWS: usize = EDITOR_ROWS - 1;
-const FOOTER_ROW: usize = 29;
-
+/// Which note list the modal is showing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceNotesView {
+    /// The active-notes list.
     Active,
+    /// The archived-notes list.
     Archive,
 }
 
+/// What the editor pane is currently editing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceNotesEditMode {
+    /// The new-note draft buffer (the default).
     Draft,
-    ActiveNote { note_id: String },
-    ArchivedNote { note_id: String },
-    ArchiveBulk { note_ids: Vec<String> },
+    /// Editing an existing active note.
+    ActiveNote {
+        /// The note being edited.
+        note_id: String,
+    },
+    /// Editing a single archived note.
+    ArchivedNote {
+        /// The archived note being edited.
+        note_id: String,
+    },
+    /// Bulk-editing every archived note, joined by `\n---\n`.
+    ArchiveBulk {
+        /// The archived note ids in join order.
+        note_ids: Vec<String>,
+    },
 }
 
-#[derive(Clone, Debug)]
+/// A control the user activated in the modal, routed by the shell.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceNotesModalAction {
+    /// Close the modal.
     Close,
+    /// Save the current editor buffer.
     Save,
+    /// Cancel the current edit and return to the draft.
     CancelEdit,
+    /// Switch to the active-notes view.
     ShowActive,
+    /// Switch to the archived-notes view.
     ShowArchive,
+    /// Begin editing the named active note.
     EditActive(String),
+    /// Begin editing the named archived note.
     EditArchived(String),
+    /// Archive the named active note as done.
     ArchiveDone(String),
+    /// Archive the named active note as removed.
     ArchiveRemoved(String),
+    /// Begin the bulk edit of every archived note.
     EditAllArchive,
 }
 
-#[derive(Clone)]
-struct HitTarget {
-    action: WorkspaceNotesModalAction,
-    rect: Rect,
+impl EventEmitter<WorkspaceNotesModalAction> for WorkspaceNotesModalView {}
+
+/// Resolved GPUI colours for the modal.
+#[derive(Clone, Copy)]
+pub struct WorkspaceNotesModalColors {
+    backdrop: Rgba,
+    modal_bg: Rgba,
+    panel_bg: Rgba,
+    row_bg: Rgba,
+    border: Rgba,
+    title_fg: Rgba,
+    body_fg: Rgba,
+    muted_fg: Rgba,
+    button_fg: Rgba,
+    button_bg: Rgba,
+    selected_fg: Rgba,
+    selected_bg: Rgba,
+    primary_fg: Rgba,
+    primary_bg: Rgba,
+    danger_fg: Rgba,
+    input_bg: Rgba,
+    caret: Rgba,
 }
 
-pub struct WorkspaceNotesModal {
+impl From<&ChromeColors> for WorkspaceNotesModalColors {
+    fn from(chrome: &ChromeColors) -> Self {
+        Self {
+            backdrop: with_alpha(srgba(chrome.tab_bar_bg), 0.46),
+            modal_bg: srgba(lighten(chrome.tab_bar_bg, 0.012)),
+            panel_bg: srgba(lighten(chrome.tab_bar_bg, 0.024)),
+            row_bg: srgba(lighten(chrome.tab_bar_bg, 0.038)),
+            border: with_alpha(srgba(chrome.tab_separator), 0.92),
+            title_fg: srgba(chrome.tab_text_active),
+            body_fg: srgba(chrome.tab_text_active),
+            muted_fg: with_alpha(srgba(chrome.tab_text), 0.68),
+            button_fg: srgba(chrome.tab_text),
+            button_bg: srgba(lighten(chrome.tab_bar_bg, 0.045)),
+            selected_fg: srgba(chrome.tab_text_active),
+            selected_bg: with_alpha(srgba(chrome.accent), 0.18),
+            primary_fg: srgba(chrome.tab_bar_bg),
+            primary_bg: with_alpha(srgba(chrome.accent), 0.84),
+            danger_fg: with_alpha(srgba(chrome.tab_text_active), 0.86),
+            input_bg: srgba(lighten(chrome.tab_bar_bg, 0.034)),
+            caret: with_alpha(srgba(chrome.accent), 0.95),
+        }
+    }
+}
+
+/// Visual weight of a modal button.
+#[derive(Clone, Copy)]
+enum ButtonTone {
+    Normal,
+    Selected,
+    Primary,
+    Danger,
+}
+
+/// The inputs describing one modal button, grouped so [`WorkspaceNotesModalView::button`]
+/// stays a two-argument call.
+struct ButtonSpec<'a> {
+    /// Stable element id disambiguating this button from its siblings.
+    id: usize,
+    /// The button's label text.
+    label: &'a str,
+    /// The button's visual weight.
+    tone: ButtonTone,
+    /// The action emitted when the button is clicked.
+    action: WorkspaceNotesModalAction,
+}
+
+/// The workspace-notes modal view.
+///
+/// Holds the ported active/archive/editor state machine plus the cached note
+/// lists and error the shell feeds it, and paints them as GPUI elements.
+pub struct WorkspaceNotesModalView {
+    colors: WorkspaceNotesModalColors,
     workspace_id: Option<WorkspaceId>,
     view: WorkspaceNotesView,
     draft_text: String,
@@ -70,25 +163,17 @@ pub struct WorkspaceNotesModal {
     edit_text: String,
     edit_mode: WorkspaceNotesEditMode,
     scroll_offset: usize,
-    hovered: Option<usize>,
-    modal_rect: Option<Rect>,
-    hit_targets: Vec<HitTarget>,
+    active_notes: Vec<WorkspaceNoteEntry>,
+    archived_notes: Vec<WorkspaceNoteEntry>,
+    error: Option<String>,
+    focus_handle: FocusHandle,
 }
 
-pub struct WorkspaceNotesModalBuildContext<'a> {
-    pub out: &'a mut Vec<CellInstance>,
-    pub workspace_rect: Rect,
-    pub cell_size: (f32, f32),
-    pub chrome: &'a ChromeColors,
-    pub active_notes: &'a [WorkspaceNoteEntry],
-    pub archived_notes: &'a [WorkspaceNoteEntry],
-    pub error: Option<&'a str>,
-    pub resolve_glyph: &'a mut GlyphResolver<'a>,
-}
-
-impl WorkspaceNotesModal {
-    pub fn new() -> Self {
+impl WorkspaceNotesModalView {
+    /// Build a closed modal.
+    pub fn new(colors: &WorkspaceNotesModalColors, cx: &mut Context<Self>) -> Self {
         Self {
+            colors: *colors,
             workspace_id: None,
             view: WorkspaceNotesView::Active,
             draft_text: String::new(),
@@ -96,13 +181,15 @@ impl WorkspaceNotesModal {
             edit_text: String::new(),
             edit_mode: WorkspaceNotesEditMode::Draft,
             scroll_offset: 0,
-            hovered: None,
-            modal_rect: None,
-            hit_targets: Vec::new(),
+            active_notes: Vec::new(),
+            archived_notes: Vec::new(),
+            error: None,
+            focus_handle: cx.focus_handle(),
         }
     }
 
-    pub fn open(&mut self, workspace_id: WorkspaceId, draft_text: String) {
+    /// Open the modal for `workspace_id`, seeded with its saved draft.
+    pub fn open(&mut self, workspace_id: WorkspaceId, draft_text: String, cx: &mut Context<Self>) {
         self.workspace_id = Some(workspace_id);
         self.view = WorkspaceNotesView::Active;
         self.draft_text = draft_text;
@@ -110,55 +197,74 @@ impl WorkspaceNotesModal {
         self.edit_text.clear();
         self.edit_mode = WorkspaceNotesEditMode::Draft;
         self.scroll_offset = 0;
-        self.hovered = None;
-        self.modal_rect = None;
-        self.hit_targets.clear();
+        self.error = None;
+        cx.notify();
     }
 
-    pub fn close(&mut self) {
+    /// Close the modal, resetting its editor state.
+    pub fn close(&mut self, cx: &mut Context<Self>) {
         self.workspace_id = None;
         self.view = WorkspaceNotesView::Active;
         self.draft_dirty = false;
         self.edit_text.clear();
         self.edit_mode = WorkspaceNotesEditMode::Draft;
         self.scroll_offset = 0;
-        self.hovered = None;
-        self.modal_rect = None;
-        self.hit_targets.clear();
+        cx.notify();
     }
 
+    /// Whether the modal is open.
+    #[must_use]
     pub const fn is_open(&self) -> bool {
         self.workspace_id.is_some()
     }
 
+    /// The workspace the modal is bound to, if open.
+    #[must_use]
     pub const fn workspace_id(&self) -> Option<WorkspaceId> {
         self.workspace_id
     }
 
+    /// The current draft text.
+    #[must_use]
     pub fn draft_text(&self) -> &str {
         &self.draft_text
     }
 
+    /// Whether the draft has unwritten edits.
+    #[must_use]
     pub const fn draft_dirty(&self) -> bool {
         self.draft_dirty
     }
 
-    pub fn replace_pristine_draft(&mut self, text: String) {
+    /// Replace the draft with a fresh server copy only when it is pristine.
+    pub fn replace_pristine_draft(&mut self, text: String, cx: &mut Context<Self>) {
         if self.edit_mode == WorkspaceNotesEditMode::Draft && !self.draft_dirty {
             self.draft_text = text;
+            cx.notify();
         }
     }
 
+    /// Clear the draft-dirty flag after a `SaveDraft` flush.
     pub fn mark_draft_synced(&mut self) {
         if self.edit_mode == WorkspaceNotesEditMode::Draft {
             self.draft_dirty = false;
         }
     }
 
-    pub fn edit_mode(&self) -> &WorkspaceNotesEditMode {
+    /// The current active/archive view.
+    #[must_use]
+    pub const fn view(&self) -> WorkspaceNotesView {
+        self.view
+    }
+
+    /// The editor's current target.
+    #[must_use]
+    pub const fn edit_mode(&self) -> &WorkspaceNotesEditMode {
         &self.edit_mode
     }
 
+    /// The buffer the editor is currently showing (draft or edit text).
+    #[must_use]
     pub fn active_text(&self) -> &str {
         match self.edit_mode {
             WorkspaceNotesEditMode::Draft => &self.draft_text,
@@ -168,6 +274,8 @@ impl WorkspaceNotesModal {
         }
     }
 
+    /// Split the bulk-edit buffer back into `(note_id, text)` updates.
+    #[must_use]
     pub fn archive_bulk_updates(&self) -> Vec<(String, String)> {
         let WorkspaceNotesEditMode::ArchiveBulk { note_ids } = &self.edit_mode else {
             return Vec::new();
@@ -182,44 +290,101 @@ impl WorkspaceNotesModal {
         updates
     }
 
-    pub fn set_view(&mut self, view: WorkspaceNotesView) {
+    /// Feed the current note lists (from the client store) to the view.
+    pub fn set_notes(
+        &mut self,
+        active_notes: Vec<WorkspaceNoteEntry>,
+        archived_notes: Vec<WorkspaceNoteEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_notes = active_notes;
+        self.archived_notes = archived_notes;
+        cx.notify();
+    }
+
+    /// Set (or clear) the server error surfaced in the footer.
+    pub fn set_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
+        self.error = error;
+        cx.notify();
+    }
+
+    /// Switch the active/archive view, cancelling any non-draft edit.
+    pub fn set_view(&mut self, view: WorkspaceNotesView, cx: &mut Context<Self>) {
         self.view = view;
         self.scroll_offset = 0;
         if !matches!(self.edit_mode, WorkspaceNotesEditMode::Draft) {
             self.cancel_edit();
         }
+        cx.notify();
     }
 
-    pub fn begin_active_edit(&mut self, note: &WorkspaceNoteEntry) {
+    /// Begin editing an active note.
+    pub fn begin_active_edit(&mut self, note: &WorkspaceNoteEntry, cx: &mut Context<Self>) {
         self.view = WorkspaceNotesView::Active;
         self.edit_text.clone_from(&note.text);
         self.edit_mode = WorkspaceNotesEditMode::ActiveNote { note_id: note.note_id.clone() };
+        cx.notify();
     }
 
-    pub fn begin_archived_edit(&mut self, note: &WorkspaceNoteEntry) {
+    /// Begin editing a single archived note.
+    pub fn begin_archived_edit(&mut self, note: &WorkspaceNoteEntry, cx: &mut Context<Self>) {
         self.view = WorkspaceNotesView::Archive;
         self.edit_text.clone_from(&note.text);
         self.edit_mode = WorkspaceNotesEditMode::ArchivedNote { note_id: note.note_id.clone() };
+        cx.notify();
     }
 
-    pub fn begin_archive_bulk_edit(&mut self, notes: &[WorkspaceNoteEntry]) {
+    /// Begin the bulk edit of every archived note.
+    pub fn begin_archive_bulk_edit(
+        &mut self,
+        notes: &[WorkspaceNoteEntry],
+        cx: &mut Context<Self>,
+    ) {
         self.view = WorkspaceNotesView::Archive;
         let note_ids = notes.iter().map(|note| note.note_id.clone()).collect();
         self.edit_text =
             notes.iter().map(|note| note.text.as_str()).collect::<Vec<_>>().join("\n---\n");
         self.edit_mode = WorkspaceNotesEditMode::ArchiveBulk { note_ids };
+        cx.notify();
     }
 
+    /// Begin editing the cached active note with `note_id`, if present. Lets the
+    /// shell route an [`WorkspaceNotesModalAction::EditActive`] without holding
+    /// its own copy of the note list.
+    pub fn begin_active_edit_by_id(&mut self, note_id: &str, cx: &mut Context<Self>) {
+        if let Some(note) = self.active_notes.iter().find(|n| n.note_id == note_id).cloned() {
+            self.begin_active_edit(&note, cx);
+        }
+    }
+
+    /// Begin editing the cached archived note with `note_id`, if present.
+    pub fn begin_archived_edit_by_id(&mut self, note_id: &str, cx: &mut Context<Self>) {
+        if let Some(note) = self.archived_notes.iter().find(|n| n.note_id == note_id).cloned() {
+            self.begin_archived_edit(&note, cx);
+        }
+    }
+
+    /// Begin the bulk edit over every cached archived note.
+    pub fn begin_archive_bulk_edit_all(&mut self, cx: &mut Context<Self>) {
+        if !self.archived_notes.is_empty() {
+            let notes = self.archived_notes.clone();
+            self.begin_archive_bulk_edit(&notes, cx);
+        }
+    }
+
+    /// Return the editor to the draft buffer.
     pub fn finish_edit(&mut self) {
         self.edit_text.clear();
         self.edit_mode = WorkspaceNotesEditMode::Draft;
     }
 
+    /// Cancel the current edit (same as [`Self::finish_edit`]).
     pub fn cancel_edit(&mut self) {
         self.finish_edit();
     }
 
-    pub fn push_char(&mut self, ch: char) {
+    /// Append `ch` to the active buffer, marking the draft dirty when editing it.
+    pub fn push_char(&mut self, ch: char, cx: &mut Context<Self>) {
         match self.edit_mode {
             WorkspaceNotesEditMode::Draft => {
                 self.draft_text.push(ch);
@@ -229,9 +394,11 @@ impl WorkspaceNotesModal {
             | WorkspaceNotesEditMode::ArchivedNote { .. }
             | WorkspaceNotesEditMode::ArchiveBulk { .. } => self.edit_text.push(ch),
         }
+        cx.notify();
     }
 
-    pub fn pop_char(&mut self) {
+    /// Delete the last char of the active buffer.
+    pub fn pop_char(&mut self, cx: &mut Context<Self>) {
         match self.edit_mode {
             WorkspaceNotesEditMode::Draft => {
                 self.draft_text.pop();
@@ -243,29 +410,15 @@ impl WorkspaceNotesModal {
                 self.edit_text.pop();
             }
         }
+        cx.notify();
     }
 
-    pub fn click(&self, x: f32, y: f32) -> Option<WorkspaceNotesModalAction> {
-        self.hit_targets
-            .iter()
-            .find(|target| target.rect.contains(x, y))
-            .map(|target| target.action.clone())
-    }
-
-    pub fn contains_point(&self, x: f32, y: f32) -> bool {
-        self.modal_rect.is_some_and(|rect| rect.contains(x, y))
-    }
-
-    pub fn update_hover(&mut self, x: f32, y: f32) -> bool {
-        let prev = self.hovered;
-        self.hovered = self.hit_targets.iter().position(|target| target.rect.contains(x, y));
-        self.hovered != prev
-    }
-
-    pub fn scroll_rows(&mut self, rows: i32, active_count: usize, archived_count: usize) -> bool {
+    /// Scroll the current note list by `rows`, returning whether the offset
+    /// moved.
+    pub fn scroll_rows(&mut self, rows: i32, cx: &mut Context<Self>) -> bool {
         let note_count = match self.view {
-            WorkspaceNotesView::Active => active_count,
-            WorkspaceNotesView::Archive => archived_count,
+            WorkspaceNotesView::Active => self.active_notes.len(),
+            WorkspaceNotesView::Archive => self.archived_notes.len(),
         };
         let max_offset = note_count.saturating_sub(NOTE_LIST_ROWS);
         let previous = self.scroll_offset;
@@ -279,568 +432,476 @@ impl WorkspaceNotesModal {
                 .scroll_offset
                 .saturating_sub(usize::try_from(rows.unsigned_abs()).unwrap_or(usize::MAX));
         }
-        self.scroll_offset != previous
-    }
-
-    pub fn build_instances(&mut self, ctx: WorkspaceNotesModalBuildContext<'_>) {
-        let WorkspaceNotesModalBuildContext {
-            out,
-            workspace_rect,
-            cell_size,
-            chrome,
-            active_notes,
-            archived_notes,
-            error,
-            resolve_glyph,
-        } = ctx;
-        let (cell_w, cell_h) = cell_size;
-        if self.workspace_id.is_none() || cell_w <= 0.0 || cell_h <= 0.0 {
-            self.modal_rect = None;
-            return;
+        let moved = self.scroll_offset != previous;
+        if moved {
+            cx.notify();
         }
-
-        let Some(layout) = ModalLayout::new(workspace_rect, cell_size) else {
-            self.modal_rect = None;
-            return;
-        };
-        let colors = ModalColors::from_chrome(chrome);
-        self.modal_rect = Some(layout.modal_rect);
-        self.hit_targets.clear();
-
-        let mut renderer = ModalRenderer { out, layout, colors, cell_size, resolve_glyph };
-        renderer.push_solid_rect(workspace_rect, colors.backdrop);
-        renderer.push_solid_rect(layout.modal_rect, colors.modal_bg);
-        renderer.draw_frame();
-        renderer.draw_rule(HEADER_RULE_ROW);
-        renderer.emit_text(
-            "Workspace notes",
-            HEADER_TITLE_ROW,
-            PAD_COLS,
-            TextStyle::new(colors.title_fg, colors.modal_bg),
-        );
-        self.render_nav(&mut renderer);
-        self.render_notes(&mut renderer, active_notes, archived_notes);
-        self.render_editor(&mut renderer, error);
+        moved
     }
 
-    fn render_nav(&mut self, renderer: &mut ModalRenderer<'_, '_>) {
-        let active_tone = if self.view == WorkspaceNotesView::Active {
-            ButtonTone::Selected
-        } else {
-            ButtonTone::Normal
-        };
-        let archive_tone = if self.view == WorkspaceNotesView::Archive {
-            ButtonTone::Selected
-        } else {
-            ButtonTone::Normal
-        };
-        let active_rect = renderer.button(NAV_ROW, PAD_COLS, " Active ", active_tone);
-        self.hit_targets
-            .push(HitTarget { action: WorkspaceNotesModalAction::ShowActive, rect: active_rect });
-        let archive_col = PAD_COLS + 10;
-        let archive_rect = renderer.button(NAV_ROW, archive_col, " Archive ", archive_tone);
-        self.hit_targets
-            .push(HitTarget { action: WorkspaceNotesModalAction::ShowArchive, rect: archive_rect });
-
-        let close_col = renderer.layout.modal_cols.saturating_sub(10);
-        let close_rect =
-            renderer.button(HEADER_TITLE_ROW, close_col, " Close ", ButtonTone::Normal);
-        self.hit_targets
-            .push(HitTarget { action: WorkspaceNotesModalAction::Close, rect: close_rect });
+    /// Map the current editor state to the [`WorkspaceNotesMutation`] a Save
+    /// should send, or `None` when the buffer is blank (matching the winit
+    /// trim guards). Ported from the winit `save_workspace_notes_modal`.
+    #[must_use]
+    pub fn save_mutation(&self) -> Option<WorkspaceNotesMutation> {
+        let workspace_id = self.workspace_id?;
+        match &self.edit_mode {
+            WorkspaceNotesEditMode::Draft => {
+                let text = self.draft_text.clone();
+                if text.trim().is_empty() {
+                    return None;
+                }
+                Some(WorkspaceNotesMutation::CreateActiveNote { workspace_id, text })
+            }
+            WorkspaceNotesEditMode::ActiveNote { note_id }
+            | WorkspaceNotesEditMode::ArchivedNote { note_id } => {
+                let text = self.edit_text.clone();
+                if text.trim().is_empty() {
+                    return None;
+                }
+                Some(WorkspaceNotesMutation::EditNote {
+                    workspace_id,
+                    note_id: note_id.clone(),
+                    text,
+                })
+            }
+            WorkspaceNotesEditMode::ArchiveBulk { .. } => {
+                let updates = self.archive_bulk_updates();
+                if updates.iter().any(|(_, text)| text.trim().is_empty()) {
+                    return None;
+                }
+                Some(WorkspaceNotesMutation::BulkEditArchived { workspace_id, updates })
+            }
+        }
     }
 
-    fn render_notes(
-        &mut self,
-        renderer: &mut ModalRenderer<'_, '_>,
-        active_notes: &[WorkspaceNoteEntry],
-        archived_notes: &[WorkspaceNoteEntry],
-    ) {
+    /// Build the `ArchiveNote` mutation for a Done/Removed control.
+    #[must_use]
+    pub fn archive_mutation(
+        &self,
+        note_id: &str,
+        reason: ArchiveReason,
+    ) -> Option<WorkspaceNotesMutation> {
+        let workspace_id = self.workspace_id?;
+        Some(WorkspaceNotesMutation::ArchiveNote {
+            workspace_id,
+            note_id: note_id.to_owned(),
+            reason,
+        })
+    }
+
+    fn button(&self, spec: ButtonSpec<'_>, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ButtonSpec { id, label, tone, action } = spec;
+        let colors = self.colors;
+        let (fg, bg) = match tone {
+            ButtonTone::Normal => (colors.button_fg, colors.button_bg),
+            ButtonTone::Selected => (colors.selected_fg, colors.selected_bg),
+            ButtonTone::Primary => (colors.primary_fg, colors.primary_bg),
+            ButtonTone::Danger => (colors.danger_fg, colors.button_bg),
+        };
+        div()
+            .id(("wn-button", id))
+            .px_2()
+            .py_0p5()
+            .rounded_sm()
+            .text_sm()
+            .text_color(fg)
+            .bg(bg)
+            .hover(move |s| s.bg(colors.selected_bg))
+            .child(label.to_owned())
+            .on_click(cx.listener(move |_, _, _win, ctx| {
+                ctx.stop_propagation();
+                ctx.emit(action.clone());
+            }))
+            .into_any_element()
+    }
+
+    fn render_note_row(
+        &self,
+        index: usize,
+        note: &WorkspaceNoteEntry,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let marker = match self.view {
+            WorkspaceNotesView::Active => "-",
+            WorkspaceNotesView::Archive => "*",
+        };
+        let summary = single_line(&note.text, 60);
+        let note_id = note.note_id.clone();
+        let mut row = div()
+            .id(("wn-note", index))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_0p5()
+            .rounded_sm()
+            .bg(colors.row_bg)
+            .child(div().text_sm().text_color(colors.muted_fg).child(marker))
+            .child(div().flex_1().text_sm().text_color(colors.body_fg).child(summary));
+        match self.view {
+            WorkspaceNotesView::Active => {
+                row = row
+                    .child(self.button(
+                        ButtonSpec {
+                            id: index * 10,
+                            label: "Edit",
+                            tone: ButtonTone::Normal,
+                            action: WorkspaceNotesModalAction::EditActive(note_id.clone()),
+                        },
+                        cx,
+                    ))
+                    .child(self.button(
+                        ButtonSpec {
+                            id: index * 10 + 1,
+                            label: "Done",
+                            tone: ButtonTone::Normal,
+                            action: WorkspaceNotesModalAction::ArchiveDone(note_id.clone()),
+                        },
+                        cx,
+                    ))
+                    .child(self.button(
+                        ButtonSpec {
+                            id: index * 10 + 2,
+                            label: "Remove",
+                            tone: ButtonTone::Danger,
+                            action: WorkspaceNotesModalAction::ArchiveRemoved(note_id),
+                        },
+                        cx,
+                    ));
+            }
+            WorkspaceNotesView::Archive => {
+                row = row.child(self.button(
+                    ButtonSpec {
+                        id: index * 10,
+                        label: "Edit",
+                        tone: ButtonTone::Normal,
+                        action: WorkspaceNotesModalAction::EditArchived(note_id),
+                    },
+                    cx,
+                ));
+            }
+        }
+        row.into_any_element()
+    }
+
+    fn render_notes(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = self.colors;
         let notes = match self.view {
-            WorkspaceNotesView::Active => active_notes,
-            WorkspaceNotesView::Archive => archived_notes,
+            WorkspaceNotesView::Active => &self.active_notes,
+            WorkspaceNotesView::Archive => &self.archived_notes,
         };
-        let list_top = NOTE_LIST_TOP;
-        let list_rows = NOTE_LIST_ROWS;
-        renderer.draw_panel(list_top, list_rows + 1, renderer.colors.panel_bg);
+        let mut list =
+            div().w_full().flex().flex_col().gap_0p5().p_2().rounded_sm().bg(colors.panel_bg);
         if notes.is_empty() {
             let empty = match self.view {
                 WorkspaceNotesView::Active => "No active notes",
                 WorkspaceNotesView::Archive => "No archived notes",
             };
-            renderer.emit_text(
-                empty,
-                list_top + 1,
-                PAD_COLS + 1,
-                TextStyle::new(renderer.colors.muted_fg, renderer.colors.panel_bg),
-            );
-        }
-
-        for (visible_idx, note) in notes.iter().skip(self.scroll_offset).take(list_rows).enumerate()
-        {
-            let row = list_top + 1 + visible_idx;
-            renderer.draw_note_row(row);
-            let marker = match self.view {
-                WorkspaceNotesView::Active => "-",
-                WorkspaceNotesView::Archive => "*",
-            };
-            let edit_col = renderer.layout.modal_cols.saturating_sub(match self.view {
-                WorkspaceNotesView::Active => 25,
-                WorkspaceNotesView::Archive => 10,
-            });
-            let summary_width = edit_col.saturating_sub(PAD_COLS + 5);
-            let summary = single_line(&note.text, summary_width);
-            renderer.emit_text(
-                marker,
-                row,
-                PAD_COLS,
-                TextStyle::new(renderer.colors.muted_fg, renderer.colors.row_bg),
-            );
-            renderer.emit_text(
-                &summary,
-                row,
-                PAD_COLS + 2,
-                TextStyle::new(renderer.colors.body_fg, renderer.colors.row_bg),
-            );
-            self.render_note_actions(renderer, note, row, edit_col);
-        }
-
-        if self.view == WorkspaceNotesView::Archive && !archived_notes.is_empty() {
-            let rect = renderer.button(
-                ARCHIVE_ACTION_ROW,
-                PAD_COLS,
-                " Edit all archived ",
-                ButtonTone::Normal,
-            );
-            self.hit_targets
-                .push(HitTarget { action: WorkspaceNotesModalAction::EditAllArchive, rect });
-        }
-    }
-
-    fn render_note_actions(
-        &mut self,
-        renderer: &mut ModalRenderer<'_, '_>,
-        note: &WorkspaceNoteEntry,
-        row: usize,
-        edit_col: usize,
-    ) {
-        let edit_rect = renderer.button(row, edit_col, " Edit ", ButtonTone::Normal);
-        match self.view {
-            WorkspaceNotesView::Active => {
-                self.hit_targets.push(HitTarget {
-                    action: WorkspaceNotesModalAction::EditActive(note.note_id.clone()),
-                    rect: edit_rect,
-                });
-                let done_rect = renderer.button(row, edit_col + 7, " Done ", ButtonTone::Normal);
-                self.hit_targets.push(HitTarget {
-                    action: WorkspaceNotesModalAction::ArchiveDone(note.note_id.clone()),
-                    rect: done_rect,
-                });
-                let remove_rect =
-                    renderer.button(row, edit_col + 14, " Remove ", ButtonTone::Danger);
-                self.hit_targets.push(HitTarget {
-                    action: WorkspaceNotesModalAction::ArchiveRemoved(note.note_id.clone()),
-                    rect: remove_rect,
-                });
-            }
-            WorkspaceNotesView::Archive => {
-                self.hit_targets.push(HitTarget {
-                    action: WorkspaceNotesModalAction::EditArchived(note.note_id.clone()),
-                    rect: edit_rect,
-                });
+            list = list.child(div().text_sm().text_color(colors.muted_fg).child(empty));
+        } else {
+            for (visible_idx, note) in
+                notes.iter().skip(self.scroll_offset).take(NOTE_LIST_ROWS).enumerate()
+            {
+                list = list.child(self.render_note_row(visible_idx, note, cx));
             }
         }
+        if self.view == WorkspaceNotesView::Archive && !self.archived_notes.is_empty() {
+            list = list.child(self.button(
+                ButtonSpec {
+                    id: 900,
+                    label: "Edit all archived",
+                    tone: ButtonTone::Normal,
+                    action: WorkspaceNotesModalAction::EditAllArchive,
+                },
+                cx,
+            ));
+        }
+        list.into_any_element()
     }
 
-    fn render_editor(&mut self, renderer: &mut ModalRenderer<'_, '_>, error: Option<&str>) {
+    fn render_editor(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = self.colors;
         let label = match self.edit_mode {
             WorkspaceNotesEditMode::Draft => "New",
             WorkspaceNotesEditMode::ActiveNote { .. } => "Edit active note",
             WorkspaceNotesEditMode::ArchivedNote { .. } => "Edit archived note",
             WorkspaceNotesEditMode::ArchiveBulk { .. } => "Edit archived notes",
         };
-        renderer.emit_text(
-            label,
-            EDITOR_LABEL_ROW,
-            PAD_COLS,
-            TextStyle::new(renderer.colors.muted_fg, renderer.colors.modal_bg),
-        );
-        renderer.draw_input_box(EDITOR_INPUT_TOP, EDITOR_ROWS);
-        let text = self.active_text().to_owned();
-        let editor_text_width = renderer.layout.modal_cols.saturating_sub(8);
-        for (idx, line) in text.lines().take(EDITOR_CONTENT_ROWS).enumerate() {
-            renderer.emit_text(
-                &single_line(line, editor_text_width),
-                EDITOR_CONTENT_TOP + idx,
-                PAD_COLS + 1,
-                TextStyle::new(renderer.colors.body_fg, renderer.colors.input_bg),
-            );
-        }
-        if text.is_empty() {
-            renderer.emit_text(
-                "Type note...",
-                EDITOR_CONTENT_TOP,
-                PAD_COLS + 2,
-                TextStyle::new(renderer.colors.muted_fg, renderer.colors.input_bg),
-            );
-        }
-        let (cursor_row, cursor_col) = editor_cursor_position(&text, editor_text_width);
-        renderer.draw_cursor(EDITOR_CONTENT_TOP + cursor_row, PAD_COLS + 1 + cursor_col);
+        let text = self.active_text();
+        let editor_body: gpui::AnyElement = if text.is_empty() {
+            div().text_sm().text_color(colors.muted_fg).child("Type note...").into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .children(
+                    text.lines()
+                        .map(|line| {
+                            div()
+                                .text_sm()
+                                .text_color(colors.body_fg)
+                                .child(line.to_owned())
+                                .into_any_element()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into_any_element()
+        };
+        // A slim caret bar mirrors the winit editor's block caret.
+        let caret = div().w(px(2.0)).h(px(14.0)).bg(colors.caret);
 
-        let save_rect = renderer.button(FOOTER_ROW, PAD_COLS, " Save ", ButtonTone::Primary);
-        self.hit_targets
-            .push(HitTarget { action: WorkspaceNotesModalAction::Save, rect: save_rect });
-        if !matches!(self.edit_mode, WorkspaceNotesEditMode::Draft) {
-            let cancel_rect =
-                renderer.button(FOOTER_ROW, PAD_COLS + 8, " Cancel ", ButtonTone::Normal);
-            self.hit_targets.push(HitTarget {
-                action: WorkspaceNotesModalAction::CancelEdit,
-                rect: cancel_rect,
-            });
-        }
-        if let Some(error) = error {
-            renderer.emit_text(
-                &single_line(error, renderer.layout.modal_cols.saturating_sub(PAD_COLS * 2)),
-                FOOTER_ROW - 2,
-                PAD_COLS,
-                TextStyle::new(renderer.colors.button_danger_fg, renderer.colors.modal_bg),
-            );
-        }
-        // FR-017: modal editor keymap is Enter saves / Ctrl+Enter newline (was
-        // the opposite before this feature). Keep this footer text in sync if
-        // the binding changes again.
-        let hint = "Enter save, Ctrl+Enter newline";
-        renderer.emit_text(
-            hint,
-            FOOTER_ROW,
-            renderer.layout.modal_cols.saturating_sub(hint.chars().count() + 4),
-            TextStyle::new(renderer.colors.muted_fg, renderer.colors.modal_bg),
-        );
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ModalLayout {
-    modal_rect: Rect,
-    modal_cols: usize,
-}
-
-impl ModalLayout {
-    fn new(workspace_rect: Rect, cell_size: (f32, f32)) -> Option<Self> {
-        let (cell_w, cell_h) = cell_size;
-        let available_cols = units_in_extent(workspace_rect.width * 0.86, cell_w);
-        if available_cols < MIN_MODAL_COLS {
-            return None;
-        }
-        let modal_cols = available_cols.min(MAX_MODAL_COLS);
-        let modal_w = grid_width(modal_cols, cell_w);
-        let modal_h = grid_height(MODAL_ROWS, cell_h);
-        Some(Self {
-            modal_rect: Rect {
-                x: workspace_rect.x + (workspace_rect.width - modal_w) / 2.0,
-                y: workspace_rect.y + (workspace_rect.height - modal_h) / 2.0,
-                width: modal_w,
-                height: modal_h,
+        let mut footer = div().flex().items_center().gap_2().child(self.button(
+            ButtonSpec {
+                id: 800,
+                label: "Save",
+                tone: ButtonTone::Primary,
+                action: WorkspaceNotesModalAction::Save,
             },
-            modal_cols,
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ModalColors {
-    backdrop: [f32; 4],
-    modal_bg: [f32; 4],
-    panel_bg: [f32; 4],
-    row_bg: [f32; 4],
-    border: [f32; 4],
-    separator: [f32; 4],
-    title_fg: [f32; 4],
-    body_fg: [f32; 4],
-    muted_fg: [f32; 4],
-    button_fg: [f32; 4],
-    button_bg: [f32; 4],
-    button_selected_fg: [f32; 4],
-    button_selected_bg: [f32; 4],
-    button_primary_fg: [f32; 4],
-    button_primary_bg: [f32; 4],
-    button_danger_fg: [f32; 4],
-    button_danger_bg: [f32; 4],
-    input_bg: [f32; 4],
-    input_border: [f32; 4],
-    cursor: [f32; 4],
-}
-
-#[derive(Clone, Copy)]
-enum ButtonTone {
-    Normal,
-    Selected,
-    Primary,
-    Danger,
-}
-
-#[derive(Clone, Copy)]
-struct TextStyle {
-    fg: [f32; 4],
-    bg: [f32; 4],
-}
-
-impl TextStyle {
-    const fn new(fg: [f32; 4], bg: [f32; 4]) -> Self {
-        Self { fg, bg }
-    }
-}
-
-impl ModalColors {
-    fn from_chrome(chrome: &ChromeColors) -> Self {
-        Self {
-            backdrop: srgb_to_linear_rgba(with_alpha(chrome.tab_bar_bg, 0.46)),
-            modal_bg: srgb_to_linear_rgba(lighten(chrome.tab_bar_bg, 0.012)),
-            panel_bg: srgb_to_linear_rgba(lighten(chrome.tab_bar_bg, 0.024)),
-            row_bg: srgb_to_linear_rgba(lighten(chrome.tab_bar_bg, 0.038)),
-            border: srgb_to_linear_rgba(with_alpha(chrome.tab_separator, 0.92)),
-            separator: srgb_to_linear_rgba(with_alpha(chrome.tab_text, 0.13)),
-            title_fg: srgb_to_linear_rgba(chrome.tab_text_active),
-            body_fg: srgb_to_linear_rgba(chrome.tab_text_active),
-            muted_fg: srgb_to_linear_rgba(with_alpha(chrome.tab_text, 0.68)),
-            button_fg: srgb_to_linear_rgba(chrome.tab_text),
-            button_bg: srgb_to_linear_rgba(lighten(chrome.tab_bar_bg, 0.045)),
-            button_selected_fg: srgb_to_linear_rgba(chrome.tab_text_active),
-            button_selected_bg: srgb_to_linear_rgba(with_alpha(chrome.accent, 0.18)),
-            button_primary_fg: srgb_to_linear_rgba(chrome.tab_bar_bg),
-            button_primary_bg: srgb_to_linear_rgba(with_alpha(chrome.accent, 0.84)),
-            button_danger_fg: srgb_to_linear_rgba(with_alpha(chrome.tab_text_active, 0.86)),
-            button_danger_bg: srgb_to_linear_rgba(lighten(chrome.tab_bar_bg, 0.055)),
-            input_bg: srgb_to_linear_rgba(lighten(chrome.tab_bar_bg, 0.034)),
-            input_border: srgb_to_linear_rgba(with_alpha(chrome.tab_separator, 0.88)),
-            cursor: srgb_to_linear_rgba(with_alpha(chrome.accent, 0.95)),
+            cx,
+        ));
+        if !matches!(self.edit_mode, WorkspaceNotesEditMode::Draft) {
+            footer = footer.child(self.button(
+                ButtonSpec {
+                    id: 801,
+                    label: "Cancel",
+                    tone: ButtonTone::Normal,
+                    action: WorkspaceNotesModalAction::CancelEdit,
+                },
+                cx,
+            ));
         }
-    }
-}
-
-struct ModalRenderer<'a, 'b> {
-    out: &'a mut Vec<CellInstance>,
-    layout: ModalLayout,
-    colors: ModalColors,
-    cell_size: (f32, f32),
-    resolve_glyph: &'a mut GlyphResolver<'b>,
-}
-
-impl ModalRenderer<'_, '_> {
-    fn push_solid_rect(&mut self, rect: Rect, color: [f32; 4]) {
-        self.out.push(CellInstance {
-            pos: [rect.x, rect.y],
-            size: [rect.width, rect.height],
-            uv_min: [0.0, 0.0],
-            uv_max: [0.0, 0.0],
-            fg_color: color,
-            bg_color: color,
-            corner_radius: 0.0,
-        });
-    }
-
-    fn draw_frame(&mut self) {
-        let rect = self.layout.modal_rect;
-        self.push_solid_rect(
-            Rect { x: rect.x, y: rect.y, width: rect.width, height: 1.0 },
-            self.colors.border,
+        footer = footer.child(
+            div()
+                .flex_1()
+                .text_xs()
+                .text_color(colors.muted_fg)
+                .child("Enter save, Ctrl+Enter newline"),
         );
-        self.push_solid_rect(
-            Rect { x: rect.x, y: rect.y + rect.height - 1.0, width: rect.width, height: 1.0 },
-            self.colors.border,
-        );
-        self.push_solid_rect(
-            Rect { x: rect.x, y: rect.y, width: 1.0, height: rect.height },
-            self.colors.border,
-        );
-        self.push_solid_rect(
-            Rect { x: rect.x + rect.width - 1.0, y: rect.y, width: 1.0, height: rect.height },
-            self.colors.border,
-        );
-    }
 
-    fn button(&mut self, row: usize, col: usize, label: &str, tone: ButtonTone) -> Rect {
-        let width_cols = label.chars().count();
-        let rect = Rect {
-            x: grid_x(self.layout.modal_rect.x, col, self.cell_size.0),
-            y: grid_y(self.layout.modal_rect.y, row, self.cell_size.1),
-            width: grid_width(width_cols, self.cell_size.0),
-            height: self.cell_size.1,
-        };
-        let (fg, bg) = match tone {
-            ButtonTone::Normal => (self.colors.button_fg, self.colors.button_bg),
-            ButtonTone::Selected => {
-                (self.colors.button_selected_fg, self.colors.button_selected_bg)
-            }
-            ButtonTone::Primary => (self.colors.button_primary_fg, self.colors.button_primary_bg),
-            ButtonTone::Danger => (self.colors.button_danger_fg, self.colors.button_danger_bg),
-        };
-        self.push_solid_rect(rect, bg);
-        self.emit_text(label, row, col, TextStyle::new(fg, bg));
-        rect
-    }
-
-    fn draw_panel(&mut self, row: usize, rows: usize, color: [f32; 4]) {
-        let rect = Rect {
-            x: grid_x(self.layout.modal_rect.x, PAD_COLS, self.cell_size.0),
-            y: grid_y(self.layout.modal_rect.y, row, self.cell_size.1),
-            width: grid_width(
-                self.layout.modal_cols.saturating_sub(PAD_COLS * 2),
-                self.cell_size.0,
-            ),
-            height: grid_height(rows, self.cell_size.1),
-        };
-        self.push_solid_rect(rect, color);
-    }
-
-    fn draw_note_row(&mut self, row: usize) {
-        let rect = Rect {
-            x: grid_x(self.layout.modal_rect.x, PAD_COLS, self.cell_size.0),
-            y: grid_y(self.layout.modal_rect.y, row, self.cell_size.1),
-            width: grid_width(
-                self.layout.modal_cols.saturating_sub(PAD_COLS * 2),
-                self.cell_size.0,
-            ),
-            height: self.cell_size.1,
-        };
-        self.push_solid_rect(rect, self.colors.row_bg);
-    }
-
-    fn draw_input_box(&mut self, row: usize, rows: usize) {
-        let rect = Rect {
-            x: grid_x(self.layout.modal_rect.x, PAD_COLS, self.cell_size.0),
-            y: grid_y(self.layout.modal_rect.y, row, self.cell_size.1),
-            width: grid_width(
-                self.layout.modal_cols.saturating_sub(PAD_COLS * 2),
-                self.cell_size.0,
-            ),
-            height: grid_height(rows, self.cell_size.1),
-        };
-        self.push_solid_rect(rect, self.colors.input_bg);
-        self.push_solid_rect(
-            Rect { x: rect.x, y: rect.y, width: rect.width, height: 1.0 },
-            self.colors.input_border,
-        );
-    }
-
-    fn draw_cursor(&mut self, row: usize, col: usize) {
-        let max_col = self.layout.modal_cols.saturating_sub(PAD_COLS + 2);
-        let rect = Rect {
-            x: grid_x(self.layout.modal_rect.x, col.min(max_col), self.cell_size.0),
-            y: grid_y(self.layout.modal_rect.y, row, self.cell_size.1),
-            width: f32::max(2.0, self.cell_size.0 / 8.0),
-            height: self.cell_size.1,
-        };
-        self.push_solid_rect(rect, self.colors.cursor);
-    }
-
-    fn draw_rule(&mut self, row: usize) {
-        let rect = Rect {
-            x: self.layout.modal_rect.x,
-            y: grid_y(self.layout.modal_rect.y, row, self.cell_size.1),
-            width: self.layout.modal_rect.width,
-            height: 1.0,
-        };
-        self.push_solid_rect(rect, self.colors.separator);
-    }
-
-    fn emit_text(&mut self, text: &str, row: usize, start_col: usize, style: TextStyle) {
-        let y = grid_y(self.layout.modal_rect.y, row, self.cell_size.1);
-        for (idx, ch) in text.chars().enumerate() {
-            let col = start_col + idx;
-            if col >= self.layout.modal_cols {
-                break;
-            }
-            let x = grid_x(self.layout.modal_rect.x, col, self.cell_size.0);
-            let (uv_min, uv_max) = (self.resolve_glyph)(ch);
-            self.out.push(CellInstance {
-                pos: [x, y],
-                size: [0.0, 0.0],
-                uv_min,
-                uv_max,
-                fg_color: style.fg,
-                bg_color: style.bg,
-                corner_radius: 0.0,
-            });
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_xs().text_color(colors.muted_fg).child(label))
+            .child(
+                div()
+                    .w_full()
+                    .min_h(px(72.0))
+                    .p_2()
+                    .rounded_sm()
+                    .bg(colors.input_bg)
+                    .flex()
+                    .items_start()
+                    .gap_1()
+                    .child(editor_body)
+                    .child(caret),
+            );
+        if let Some(error) = &self.error {
+            section = section
+                .child(div().text_xs().text_color(colors.danger_fg).child(single_line(error, 76)));
         }
+        section.child(footer).into_any_element()
+    }
+
+    fn render_nav(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let tone = |active: bool| if active { ButtonTone::Selected } else { ButtonTone::Normal };
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(self.button(
+                ButtonSpec {
+                    id: 100,
+                    label: " Active ",
+                    tone: tone(self.view == WorkspaceNotesView::Active),
+                    action: WorkspaceNotesModalAction::ShowActive,
+                },
+                cx,
+            ))
+            .child(self.button(
+                ButtonSpec {
+                    id: 101,
+                    label: " Archive ",
+                    tone: tone(self.view == WorkspaceNotesView::Archive),
+                    action: WorkspaceNotesModalAction::ShowArchive,
+                },
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(div().text_sm().text_color(self.colors.title_fg).child("Workspace notes"))
+            .child(self.button(
+                ButtonSpec {
+                    id: 102,
+                    label: " Close ",
+                    tone: ButtonTone::Normal,
+                    action: WorkspaceNotesModalAction::Close,
+                },
+                cx,
+            ))
+            .into_any_element()
     }
 }
 
+impl Render for WorkspaceNotesModalView {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors;
+        if !self.is_open() {
+            return div();
+        }
+        let header = self.render_header(cx);
+        let nav = self.render_nav(cx);
+        let notes = self.render_notes(cx);
+        let editor = self.render_editor(cx);
+
+        div()
+            .track_focus(&self.focus_handle)
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_center()
+            .items_center()
+            .bg(colors.backdrop)
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|_, _, _win, ctx| {
+                    ctx.emit(WorkspaceNotesModalAction::Close);
+                }),
+            )
+            .child(
+                div()
+                    .w(px(560.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(colors.modal_bg)
+                    .border_1()
+                    .border_color(colors.border)
+                    .rounded_lg()
+                    .shadow_lg()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+                    .child(header)
+                    .child(nav)
+                    .child(notes)
+                    .child(editor),
+            )
+    }
+}
+
+/// Flatten whitespace runs and cap at `max_chars`, appending an ellipsis when
+/// truncated.
 fn single_line(text: &str, max_chars: usize) -> String {
     let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out = flattened.chars().take(max_chars).collect::<String>();
-    let truncated = flattened.chars().count() > max_chars;
-    if truncated {
+    if flattened.chars().count() > max_chars {
         out.push_str("...");
     }
     out
 }
 
-fn editor_cursor_position(text: &str, max_cols: usize) -> (usize, usize) {
-    let mut row = 0usize;
-    let mut col = 0usize;
-    for ch in text.chars() {
-        if ch == '\n' {
-            row = row.saturating_add(1);
-            col = 0;
-        } else {
-            col = col.saturating_add(1);
+fn with_alpha(color: Rgba, alpha: f32) -> Rgba {
+    Rgba { a: alpha.clamp(0.0, 1.0), ..color }
+}
+
+fn lighten(color: [f32; 4], amount: f32) -> [f32; 4] {
+    [
+        (color[0] + amount).min(1.0),
+        (color[1] + amount).min(1.0),
+        (color[2] + amount).min(1.0),
+        color[3],
+    ]
+}
+
+/// The delay between the last draft keystroke and the coalesced `SaveDraft`
+/// flush, ported verbatim from the winit client's `WORKSPACE_NOTES_DEBOUNCE`.
+pub const WORKSPACE_NOTES_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Emitted when the debounce window elapses and the shell should flush the
+/// pending draft through a `SaveDraft` mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftDebounceEvent {
+    /// The debounce elapsed (or was forced); flush the current draft now.
+    Flush,
+}
+
+/// Coalescing timer for draft-text persistence.
+///
+/// Ports the winit client's `workspace_notes_save_pending` Instant that gated
+/// `flush_workspace_notes_if_due`: each keystroke restarts a
+/// [`WORKSPACE_NOTES_DEBOUNCE`] timer, so a burst of typing produces exactly one
+/// [`DraftDebounceEvent::Flush`] once the user pauses, rather than one write per
+/// character. Higher-priority handoff and window-close paths force an immediate
+/// flush with [`Self::flush_now`].
+pub struct DraftDebounce {
+    /// Monotonically increasing marker so a superseded timer never fires.
+    generation: u64,
+    /// The in-flight timer task; dropping it cancels the pending flush.
+    pending: Option<gpui::Task<()>>,
+}
+
+impl EventEmitter<DraftDebounceEvent> for DraftDebounce {}
+
+impl Default for DraftDebounce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DraftDebounce {
+    /// Build an idle debounce with no pending flush.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { generation: 0, pending: None }
+    }
+
+    /// Whether a flush is currently scheduled.
+    #[must_use]
+    pub const fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Record a draft edit, (re)starting the debounce window. Any previously
+    /// scheduled flush is cancelled, so continuous typing collapses to one
+    /// flush after the user pauses for [`WORKSPACE_NOTES_DEBOUNCE`].
+    pub fn mark_dirty(&mut self, cx: &mut Context<Self>) {
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        // Assigning a new task drops the previous one, cancelling its timer.
+        self.pending = Some(cx.spawn(async move |this, app| {
+            app.background_executor().timer(WORKSPACE_NOTES_DEBOUNCE).await;
+            this.update(app, |this, ecx| this.fire_if_current(generation, ecx)).ok();
+        }));
+    }
+
+    /// Emit a flush only when the timer that woke us is still the current one —
+    /// a later [`Self::mark_dirty`] supersedes an in-flight timer.
+    fn fire_if_current(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if self.generation == generation {
+            self.pending = None;
+            cx.emit(DraftDebounceEvent::Flush);
         }
     }
-    (row.min(EDITOR_CONTENT_ROWS.saturating_sub(1)), col.min(max_cols))
-}
 
-fn render_grid_units(units: usize) -> u16 {
-    u16::try_from(units.min(MAX_MODAL_GRID_UNITS)).unwrap_or(u16::MAX)
-}
-
-fn grid_x(origin: f32, col: usize, cell_w: f32) -> f32 {
-    origin + f32::from(render_grid_units(col)) * cell_w
-}
-
-fn grid_y(origin: f32, row: usize, cell_h: f32) -> f32 {
-    origin + f32::from(render_grid_units(row)) * cell_h
-}
-
-fn grid_width(cols: usize, cell_w: f32) -> f32 {
-    f32::from(render_grid_units(cols)) * cell_w
-}
-
-fn grid_height(rows: usize, cell_h: f32) -> f32 {
-    f32::from(render_grid_units(rows)) * cell_h
-}
-
-fn units_in_extent(extent: f32, unit: f32) -> usize {
-    if unit <= 0.0 || !extent.is_finite() || extent <= 0.0 {
-        return 0;
-    }
-    let mut low = 0usize;
-    let mut high = 1usize;
-    while high < MAX_MODAL_GRID_UNITS && grid_width(high, unit) <= extent {
-        low = high;
-        high = high.saturating_mul(2).min(MAX_MODAL_GRID_UNITS);
-        if high == low {
-            break;
+    /// Force an immediate flush when one is pending, cancelling the timer.
+    /// Used by the workspace-switch, overlay-handoff, and window-close paths
+    /// that must persist a draft before yielding.
+    pub fn flush_now(&mut self, cx: &mut Context<Self>) {
+        if self.pending.take().is_some() {
+            self.generation = self.generation.wrapping_add(1);
+            cx.emit(DraftDebounceEvent::Flush);
         }
     }
-    while low < high {
-        let mid = low + (high - low).saturating_add(1) / 2;
-        if grid_width(mid, unit) <= extent {
-            low = mid;
-        } else {
-            high = mid.saturating_sub(1);
-        }
-    }
-    low
 }
 
-fn with_alpha(mut color: [f32; 4], alpha: f32) -> [f32; 4] {
-    color[3] = alpha.clamp(0.0, 1.0);
-    color
-}
-
-fn lighten(mut color: [f32; 4], amount: f32) -> [f32; 4] {
-    color[0] = (color[0] + amount).min(1.0);
-    color[1] = (color[1] + amount).min(1.0);
-    color[2] = (color[2] + amount).min(1.0);
-    color
-}
+#[cfg(test)]
+mod tests;

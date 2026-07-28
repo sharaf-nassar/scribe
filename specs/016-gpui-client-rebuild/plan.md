@@ -2,7 +2,7 @@
 
 ## Architecture Approach
 
-Rebuild the client as a new crate, `crates/scribe-client-gpui`, developed
+Rebuild the client as a new crate, `crates/scribe-client`, developed
 side-by-side against the live server over the frozen IPC protocol, then cut
 over (rename binary to `scribe-client`, delete the old crate) once the
 launch gate passes. The server, protocol, `scribe-common`, `scribe-test`,
@@ -102,7 +102,7 @@ rollback for non-Vulkan cutover failures.
 
 | Component | Change |
 |---|---|
-| `crates/scribe-client-gpui` (NEW) | The rebuilt client; later renamed to `scribe-client`. |
+| `crates/scribe-client` (NEW) | The rebuilt client; later renamed to `scribe-client`. |
 | `crates/scribe-client` | Untouched during build; DELETED at cutover. |
 | `crates/scribe-renderer` | Untouched during build; DELETED at cutover. ~900 LoC of pure logic (xterm-256 palette, box-drawing rasterizer, bold→bright/DIM/sRGB color semantics) moves into the new crate first, with tests. |
 | `crates/scribe-settings` | GTK/wry webview + HTML/CSS/JS assets DELETED; config read/write/apply logic (`apply.rs`, server_action) moves into the new client's settings module. |
@@ -271,7 +271,7 @@ path.
   docker images, `[profile.dev.package.gpui] opt-level = 3` docs.
 
 **Phase A — Spikes (depend on: relicense, toolchain):**
-- **Scaffold spike: `scribe-client-gpui` crate, gpui deps pinned, one
+- **Scaffold spike: `scribe-client` crate, gpui deps pinned, one
   window, connects to live server, renders one pane's grid via cribbed
   display-only Terminal + TerminalElement.** Proves the whole bet; blocks
   all of phases B–F.

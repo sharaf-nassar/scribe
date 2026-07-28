@@ -1,31 +1,40 @@
-//! Right-click context menu overlay rendered as GPU instances.
+//! Right-click context menu overlay for the GPUI client rebuild.
+//!
+//! The winit client built the menu's item list from the right-click context
+//! (selection state, a hovered heuristic URL, an OSC 8 URI, a file path, and any
+//! smart-selection actions), painted it as `CellInstance` quads, and hit-tested
+//! clicks against cached item rects. This port keeps the pure item-assembly logic
+//! — the fixed copy/paste/select-all head, the OSC 8 "Open URL" precedence and
+//! "Copy hyperlink address" entry (spec 009 FR-003 / FR-007), the appended file
+//! and smart-selection entries — in [`build_menu_items`], and lowers the paint
+//! and hit-testing onto a GPUI [`ContextMenuView`] entity with a rounded, shadowed
+//! box, per-item hover/pressed states, and greyed-out disabled rows.
 
+use gpui::{Context, EventEmitter, FocusHandle, MouseButton, Point, Rgba, div, prelude::*, px};
+use scribe_common::config::SmartSelectionActionKind;
 use scribe_common::theme::ChromeColors;
-use scribe_renderer::srgb_to_linear_rgba;
-use scribe_renderer::types::CellInstance;
 
-use crate::layout::Rect;
+use crate::smart_selection::ResolvedSmartSelectionAction;
+use crate::tab_bar::srgba;
 
-/// Action triggered by selecting a context menu item.
-#[derive(Clone)]
+/// Action triggered by selecting a context menu item. Ported verbatim from the
+/// winit `ContextMenuAction` so the shell dispatcher keeps identical routing.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContextMenuAction {
-    /// Copy selection to clipboard.
+    /// Copy the current selection to the clipboard.
     Copy,
-    /// Paste from clipboard.
+    /// Paste from the clipboard.
     Paste,
-    /// Select all text in the pane.
+    /// Select all text in the focused pane.
     SelectAll,
-    /// Open the given heuristic-detected URL (passes through the existing
-    /// `url_detect::open_url` allowlist guard — same behaviour as today).
+    /// Open a heuristic-detected URL (routed through the existing allowlist).
     OpenUrl(String),
-    /// Open the given OSC 8 URI (spec 009 FR-003 / FR-015). Routed
-    /// through the OSC 8 scheme-allowlist gate so disallowed schemes
-    /// trigger the confirmation dialog; allowed schemes flow through the
-    /// same `url_detect::open_url` path as `OpenUrl`. Distinct from
-    /// `OpenUrl` so the dispatcher can preserve today's silent-drop
-    /// behaviour for heuristic URLs with non-allowlisted schemes.
+    /// Open an OSC 8 URI (spec 009 FR-003 / FR-015), routed through the OSC 8
+    /// scheme-allowlist gate. Distinct from [`Self::OpenUrl`] so the dispatcher
+    /// preserves today's silent-drop behaviour for non-allowlisted heuristic
+    /// schemes.
     OpenOsc8Url(String),
-    /// Open the given file path.
+    /// Open a file path.
     OpenFile(String),
     /// Run a shell command from a smart-selection action.
     RunCommand(String),
@@ -38,430 +47,314 @@ pub enum ContextMenuAction {
     /// Copy specific text to the clipboard.
     CopyText(String),
     /// Copy an OSC 8 hyperlink address verbatim to the clipboard (spec 009
-    /// FR-007). The payload is the URI carried by the cell underneath the
-    /// right-click target, surfaced as a context-menu entry distinct from
-    /// the existing selection-copy path.
+    /// FR-007).
     CopyHyperlinkAddress(String),
 }
 
+impl ContextMenuAction {
+    /// Whether this action belongs to the "open/run" group that is visually
+    /// separated from the copy/paste head by a divider. Mirrors the winit
+    /// renderer's separator gate.
+    #[must_use]
+    fn is_open_group(&self) -> bool {
+        !matches!(self, Self::Copy | Self::Paste | Self::SelectAll)
+    }
+}
+
 /// A single item in the context menu.
+#[derive(Clone, Debug)]
 pub struct MenuItem {
+    /// The row label.
     pub label: String,
+    /// The action dispatched when the row is clicked.
     pub action: ContextMenuAction,
     /// If `false`, the item is greyed out and not clickable.
     pub enabled: bool,
 }
 
-/// State for the right-click context menu overlay.
-pub struct ContextMenu {
-    /// Pixel position of the top-left corner of the menu.
-    pub x: f32,
-    pub y: f32,
-    /// Index of the currently hovered item.
-    hovered: Option<usize>,
-    /// Menu items to render and respond to.
-    pub items: Vec<MenuItem>,
-    /// Cached hit rects from the last render (viewport-pixel coords).
-    pub item_rects: Vec<Rect>,
-}
-
-pub struct ContextMenuBuildContext<'a> {
-    pub out: &'a mut Vec<CellInstance>,
-    pub viewport: Rect,
-    pub cell_size: (f32, f32),
-    pub chrome: &'a ChromeColors,
-    pub resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-}
-
+/// The right-click context that determines which menu items are shown.
+#[derive(Clone, Debug, Default)]
 pub struct ContextMenuRequest {
-    pub x: f32,
-    pub y: f32,
+    /// Whether a selection exists (enables Copy).
     pub has_selection: bool,
+    /// A heuristic-detected URL under the cursor, if any.
     pub url: Option<String>,
+    /// A file path under the cursor, if any.
     pub file_path: Option<String>,
+    /// Smart-selection action items resolved for the cursor's logical line.
     pub smart_actions: Vec<MenuItem>,
-    /// OSC 8 URI present at the right-click target cell, if any (spec 009).
-    ///
-    /// When `Some(uri)`:
-    /// - The "Open URL" item carries this URI verbatim (FR-003) instead of
-    ///   any heuristic-detected URL on the same cell.
-    /// - A new "Copy hyperlink address" item is appended (FR-007).
-    ///
-    /// When `None`, the menu retains today's heuristic-only behaviour.
+    /// An OSC 8 URI carried by the cell under the right-click target (spec 009).
+    /// When `Some`, it takes precedence over `url` for "Open URL" and appends a
+    /// "Copy hyperlink address" entry.
     pub osc8_uri: Option<String>,
 }
 
-fn menu_grid_units(units: usize) -> u16 {
-    u16::try_from(units).unwrap_or(u16::MAX)
-}
+/// Assemble the ordered menu items for a right-click [`ContextMenuRequest`].
+///
+/// Ported verbatim from the winit `ContextMenu::new` item assembly: the fixed
+/// Copy / Paste / Select All head (Copy enabled only with a selection), then the
+/// OSC-8-precedence "Open URL", the file entry, the OSC 8 "Copy hyperlink
+/// address" entry, and finally the smart-selection actions.
+#[must_use]
+pub fn build_menu_items(request: ContextMenuRequest) -> Vec<MenuItem> {
+    let ContextMenuRequest { has_selection, url, file_path, smart_actions, osc8_uri } = request;
+    let mut items = vec![
+        MenuItem { label: "Copy".into(), action: ContextMenuAction::Copy, enabled: has_selection },
+        MenuItem { label: "Paste".into(), action: ContextMenuAction::Paste, enabled: true },
+        MenuItem {
+            label: "Select All".into(),
+            action: ContextMenuAction::SelectAll,
+            enabled: true,
+        },
+    ];
 
-fn menu_grid_x(origin: f32, col: usize, cell_w: f32) -> f32 {
-    origin + f32::from(menu_grid_units(col)) * cell_w
-}
-
-fn menu_grid_y(origin: f32, row: usize, cell_h: f32) -> f32 {
-    origin + f32::from(menu_grid_units(row)) * cell_h
-}
-
-fn menu_grid_width(cols: usize, cell_w: f32) -> f32 {
-    f32::from(menu_grid_units(cols)) * cell_w
-}
-
-fn menu_grid_height(rows: usize, cell_h: f32) -> f32 {
-    f32::from(menu_grid_units(rows)) * cell_h
-}
-
-impl ContextMenu {
-    /// Build a context menu at `(x, y)`.
-    ///
-    /// Items are populated based on the current state: `has_selection`
-    /// enables Copy, `url` appends an "Open URL" item when present, and
-    /// `file_path` appends an "Open File" item when present. When
-    /// `osc8_uri` is `Some(uri)`, the URI takes precedence over the
-    /// heuristic `url` for the "Open URL" item (spec 009 FR-003) and a new
-    /// "Copy hyperlink address" item is appended after "Open File"
-    /// (FR-007).
-    pub fn new(request: ContextMenuRequest) -> Self {
-        let ContextMenuRequest { x, y, has_selection, url, file_path, smart_actions, osc8_uri } =
-            request;
-        let mut items = vec![
-            MenuItem {
-                label: String::from("Copy"),
-                action: ContextMenuAction::Copy,
-                enabled: has_selection,
-            },
-            MenuItem {
-                label: String::from("Paste"),
-                action: ContextMenuAction::Paste,
-                enabled: true,
-            },
-            MenuItem {
-                label: String::from("Select All"),
-                action: ContextMenuAction::SelectAll,
-                enabled: true,
-            },
-        ];
-
-        // FR-003 precedence: when an OSC 8 URI is present, the "Open URL"
-        // item carries that URI verbatim via the dedicated `OpenOsc8Url`
-        // variant so the dispatcher can route it through the OSC 8
-        // scheme-allowlist gate. Heuristic URLs continue to use `OpenUrl`
-        // and the existing silent-drop behaviour for non-allowlisted
-        // schemes.
-        if let Some(uri) = osc8_uri.clone() {
-            items.push(MenuItem {
-                label: String::from("Open URL"),
-                action: ContextMenuAction::OpenOsc8Url(uri),
-                enabled: true,
-            });
-        } else if let Some(url) = url {
-            items.push(MenuItem {
-                label: String::from("Open URL"),
-                action: ContextMenuAction::OpenUrl(url),
-                enabled: true,
-            });
-        }
-
-        if let Some(p) = file_path {
-            items.push(MenuItem {
-                label: String::from("Open File"),
-                action: ContextMenuAction::OpenFile(p),
-                enabled: true,
-            });
-        }
-
-        // FR-007: surface the OSC 8 URI as a dedicated copy entry, placed
-        // after "Open File" (consistent with how the existing menu appends
-        // context-dependent items).
-        if let Some(uri) = osc8_uri {
-            items.push(MenuItem {
-                label: String::from("Copy hyperlink address"),
-                action: ContextMenuAction::CopyHyperlinkAddress(uri),
-                enabled: true,
-            });
-        }
-
-        items.extend(smart_actions);
-
-        let item_count = items.len();
-        let zero_rect = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
-        Self { x, y, hovered: None, items, item_rects: vec![zero_rect; item_count] }
-    }
-
-    /// Update hover state from cursor position. Returns `true` if state changed.
-    pub fn update_hover(&mut self, x: f32, y: f32) -> bool {
-        let prev = self.hovered;
-        self.hovered = self.item_rects.iter().position(|r| r.contains(x, y));
-        self.hovered != prev
-    }
-
-    /// Return the action for the clicked item, or `None` if miss or disabled.
-    pub fn click(&self, x: f32, y: f32) -> Option<ContextMenuAction> {
-        let idx = self.item_rects.iter().position(|r| r.contains(x, y))?;
-        let item = self.items.get(idx)?;
-        if item.enabled { Some(item.action.clone()) } else { None }
-    }
-
-    /// Return `true` if `(x, y)` falls within the rendered menu bounds.
-    ///
-    /// Used to decide whether a click outside the menu should dismiss it.
-    pub fn click_is_inside(&self, x: f32, y: f32) -> bool {
-        self.item_rects.iter().any(|r| r.contains(x, y))
-    }
-
-    /// Build GPU instances for the context menu overlay.
-    ///
-    /// Appends a near-invisible click-capture backdrop (full viewport),
-    /// a dark menu box with border, and individual item rows into `out`.
-    pub fn build_instances(&mut self, context: ContextMenuBuildContext<'_>) {
-        let ContextMenuBuildContext { out, viewport, cell_size, chrome, resolve_glyph } = context;
-        let (cell_w, cell_h) = cell_size;
-        if cell_w <= 0.0 || cell_h <= 0.0 {
-            return;
-        }
-
-        let colors = MenuColors::from_chrome(chrome);
-        push_solid_rect(out, viewport, colors.backdrop);
-
-        let Some(layout) = MenuLayout::new(self, viewport, cell_size, &colors) else {
-            return;
-        };
-
-        push_solid_rect(out, layout.menu_rect, colors.menu_bg);
-        draw_menu_frame(out, &layout, colors.border);
-        self.item_rects.resize(self.items.len(), Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
-        let mut renderer =
-            MenuRenderer { out, layout: &layout, colors: &colors, cell_size, resolve_glyph };
-        renderer.render_items(self);
-    }
-}
-
-struct MenuLayout {
-    menu_rect: Rect,
-    menu_cols: usize,
-    item_rows: usize,
-    has_open_item: bool,
-}
-
-#[derive(Clone, Copy)]
-struct MenuTextLine<'a> {
-    text: &'a str,
-    row: usize,
-    start_col: usize,
-    max_cols: usize,
-    fg: [f32; 4],
-    bg: [f32; 4],
-}
-
-struct MenuRenderer<'a> {
-    out: &'a mut Vec<CellInstance>,
-    layout: &'a MenuLayout,
-    colors: &'a MenuColors,
-    cell_size: (f32, f32),
-    resolve_glyph: &'a mut dyn FnMut(char) -> ([f32; 2], [f32; 2]),
-}
-
-impl MenuRenderer<'_> {
-    fn render_items(&mut self, menu: &mut ContextMenu) {
-        let (cell_w, cell_h) = self.cell_size;
-        let mut row = 0usize;
-
-        for (idx, item) in menu.items.iter().enumerate() {
-            let is_open_item = matches!(
-                item.action,
-                ContextMenuAction::OpenUrl(_)
-                    | ContextMenuAction::OpenOsc8Url(_)
-                    | ContextMenuAction::OpenFile(_)
-                    | ContextMenuAction::RunCommand(_)
-                    | ContextMenuAction::RunCoprocess(_)
-                    | ContextMenuAction::SendText(_)
-                    | ContextMenuAction::RunCommandInWindow(_)
-                    | ContextMenuAction::CopyText(_)
-                    | ContextMenuAction::CopyHyperlinkAddress(_)
-            );
-            if is_open_item && self.layout.has_open_item {
-                let sep_y = menu_grid_y(self.layout.menu_rect.y, row, cell_h) + cell_h / 2.0;
-                push_solid_rect(
-                    self.out,
-                    Rect {
-                        x: self.layout.menu_rect.x + cell_w,
-                        y: sep_y,
-                        width: self.layout.menu_rect.width - 2.0 * cell_w,
-                        height: 1.0,
-                    },
-                    self.colors.separator,
-                );
-                row += 1;
-            }
-
-            let item_rect = Rect {
-                x: self.layout.menu_rect.x,
-                y: menu_grid_y(self.layout.menu_rect.y, row, cell_h),
-                width: self.layout.menu_rect.width,
-                height: menu_grid_height(self.layout.item_rows, cell_h),
-            };
-            let hovered = menu.hovered == Some(idx);
-            if hovered && item.enabled {
-                push_solid_rect(self.out, item_rect, self.colors.item_hover_bg);
-            }
-
-            let fg = if item.enabled { self.colors.item_fg } else { self.colors.item_disabled_fg };
-            let bg = if hovered && item.enabled {
-                self.colors.item_hover_bg
-            } else {
-                self.colors.menu_bg
-            };
-            self.emit_text_line(MenuTextLine {
-                text: &item.label,
-                row: row + 1,
-                start_col: 2,
-                max_cols: self.layout.menu_cols,
-                fg,
-                bg,
-            });
-
-            if let Some(rect) = menu.item_rects.get_mut(idx) {
-                *rect = item_rect;
-            }
-            row += self.layout.item_rows;
-        }
-    }
-
-    fn emit_text_line(&mut self, line: MenuTextLine<'_>) {
-        let (cell_w, cell_h) = self.cell_size;
-        let y = menu_grid_y(self.layout.menu_rect.y, line.row, cell_h);
-
-        for (i, ch) in line.text.chars().enumerate() {
-            let col = line.start_col + i;
-            if col >= line.max_cols {
-                break;
-            }
-            let x = menu_grid_x(self.layout.menu_rect.x, col, cell_w);
-            let (uv_min, uv_max) = (self.resolve_glyph)(ch);
-            self.out.push(CellInstance {
-                pos: [x, y],
-                size: [0.0, 0.0],
-                uv_min,
-                uv_max,
-                fg_color: line.fg,
-                bg_color: line.bg,
-                corner_radius: 0.0,
-            });
-        }
-    }
-}
-
-impl MenuLayout {
-    fn new(
-        menu: &ContextMenu,
-        viewport: Rect,
-        cell_size: (f32, f32),
-        _colors: &MenuColors,
-    ) -> Option<Self> {
-        let (cell_w, cell_h) = cell_size;
-        if menu.items.is_empty() || cell_w <= 0.0 || cell_h <= 0.0 {
-            return None;
-        }
-
-        let label_max = menu.items.iter().map(|item| item.label.len()).max().unwrap_or(0);
-        let menu_cols = label_max + 4;
-        let item_rows = 2;
-        let has_open_item = menu.items.iter().any(|item| {
-            matches!(
-                item.action,
-                ContextMenuAction::OpenUrl(_)
-                    | ContextMenuAction::OpenOsc8Url(_)
-                    | ContextMenuAction::OpenFile(_)
-                    | ContextMenuAction::CopyHyperlinkAddress(_)
-            )
+    // FR-003 precedence: an OSC 8 URI carries the "Open URL" item verbatim via
+    // the dedicated variant so the dispatcher routes it through the OSC 8
+    // scheme-allowlist gate; heuristic URLs keep the silent-drop path.
+    if let Some(uri) = osc8_uri.clone() {
+        items.push(MenuItem {
+            label: "Open URL".into(),
+            action: ContextMenuAction::OpenOsc8Url(uri),
+            enabled: true,
         });
-        let total_rows = menu.items.len() * item_rows + usize::from(has_open_item);
+    } else if let Some(url) = url {
+        items.push(MenuItem {
+            label: "Open URL".into(),
+            action: ContextMenuAction::OpenUrl(url),
+            enabled: true,
+        });
+    }
 
-        let menu_w = menu_grid_width(menu_cols, cell_w);
-        let menu_h = menu_grid_height(total_rows, cell_h);
+    if let Some(path) = file_path {
+        items.push(MenuItem {
+            label: "Open File".into(),
+            action: ContextMenuAction::OpenFile(path),
+            enabled: true,
+        });
+    }
 
-        let menu_x = menu.x.min(viewport.x + viewport.width - menu_w).max(viewport.x);
-        let menu_y = menu.y.min(viewport.y + viewport.height - menu_h).max(viewport.y);
+    // FR-007: surface the OSC 8 URI as a dedicated copy entry after "Open File".
+    if let Some(uri) = osc8_uri {
+        items.push(MenuItem {
+            label: "Copy hyperlink address".into(),
+            action: ContextMenuAction::CopyHyperlinkAddress(uri),
+            enabled: true,
+        });
+    }
 
-        Some(Self {
-            menu_rect: Rect { x: menu_x, y: menu_y, width: menu_w, height: menu_h },
-            menu_cols,
-            item_rows,
-            has_open_item,
-        })
+    items.extend(smart_actions);
+    items
+}
+
+/// Map a smart-selection action kind + parameter onto the matching context-menu
+/// action. Ported verbatim from the winit `smart_selection_context_action`.
+#[must_use]
+pub fn smart_selection_context_action(
+    kind: SmartSelectionActionKind,
+    parameter: String,
+) -> ContextMenuAction {
+    match kind {
+        SmartSelectionActionKind::OpenFile => ContextMenuAction::OpenFile(parameter),
+        SmartSelectionActionKind::OpenUrl => ContextMenuAction::OpenUrl(parameter),
+        SmartSelectionActionKind::RunCommand => ContextMenuAction::RunCommand(parameter),
+        SmartSelectionActionKind::RunCoprocess => ContextMenuAction::RunCoprocess(parameter),
+        SmartSelectionActionKind::SendText => ContextMenuAction::SendText(parameter),
+        SmartSelectionActionKind::RunCommandInWindow => {
+            ContextMenuAction::RunCommandInWindow(parameter)
+        }
+        SmartSelectionActionKind::Copy => ContextMenuAction::CopyText(parameter),
     }
 }
 
-fn draw_menu_frame(out: &mut Vec<CellInstance>, layout: &MenuLayout, border: [f32; 4]) {
-    let menu = layout.menu_rect;
-    push_solid_rect(out, Rect { x: menu.x, y: menu.y, width: menu.width, height: 1.0 }, border);
-    push_solid_rect(
-        out,
-        Rect { x: menu.x, y: menu.y + menu.height - 1.0, width: menu.width, height: 1.0 },
-        border,
-    );
-    push_solid_rect(out, Rect { x: menu.x, y: menu.y, width: 1.0, height: menu.height }, border);
-    push_solid_rect(
-        out,
-        Rect { x: menu.x + menu.width - 1.0, y: menu.y, width: 1.0, height: menu.height },
-        border,
-    );
+/// Build a menu item from a resolved smart-selection action, dropping actions
+/// whose expanded parameter is empty. Ported from the winit
+/// `smart_selection_menu_item`.
+#[must_use]
+pub fn smart_selection_menu_item(action: ResolvedSmartSelectionAction) -> Option<MenuItem> {
+    if action.parameter.is_empty() {
+        return None;
+    }
+    Some(MenuItem {
+        label: action.label,
+        action: smart_selection_context_action(action.kind, action.parameter),
+        enabled: true,
+    })
 }
 
-/// Pre-computed linear-RGB colors for context menu rendering.
-struct MenuColors {
-    backdrop: [f32; 4],
-    menu_bg: [f32; 4],
-    border: [f32; 4],
-    separator: [f32; 4],
-    item_fg: [f32; 4],
-    item_disabled_fg: [f32; 4],
-    item_hover_bg: [f32; 4],
+/// Events the context menu emits for the shell to act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextMenuEvent {
+    /// An enabled item was clicked; dispatch its action.
+    Selected(ContextMenuAction),
+    /// The menu was dismissed (Escape, or a click on the backdrop).
+    Dismissed,
 }
 
-impl MenuColors {
-    fn from_chrome(chrome: &ChromeColors) -> Self {
+/// Resolved GPUI colours for the context menu box.
+#[derive(Clone, Copy)]
+pub struct ContextMenuColors {
+    /// Menu box background.
+    pub bg: Rgba,
+    /// 1px border colour.
+    pub border: Rgba,
+    /// Divider colour between the copy head and the open/run group.
+    pub separator: Rgba,
+    /// Enabled item text.
+    pub item_fg: Rgba,
+    /// Disabled item text (greyed out).
+    pub disabled_fg: Rgba,
+    /// Hovered-row background.
+    pub hover_bg: Rgba,
+    /// Pressed-row background.
+    pub pressed_bg: Rgba,
+}
+
+impl From<&ChromeColors> for ContextMenuColors {
+    fn from(chrome: &ChromeColors) -> Self {
         Self {
-            backdrop: [0.0, 0.0, 0.0, 0.01],
-            menu_bg: srgb_to_linear_rgba(lighten(chrome.tab_bar_bg, 0.04)),
-            border: srgb_to_linear_rgba(with_alpha(chrome.tab_text, 0.20)),
-            separator: srgb_to_linear_rgba(with_alpha(chrome.tab_text, 0.12)),
-            item_fg: srgb_to_linear_rgba(chrome.tab_text_active),
-            item_disabled_fg: srgb_to_linear_rgba(with_alpha(chrome.tab_text, 0.35)),
-            item_hover_bg: srgb_to_linear_rgba(with_alpha(chrome.tab_text, 0.12)),
+            bg: lighten(srgba(chrome.tab_bar_bg), 0.04),
+            border: with_alpha(srgba(chrome.tab_text), 0.20),
+            separator: with_alpha(srgba(chrome.tab_text), 0.12),
+            item_fg: srgba(chrome.tab_text_active),
+            disabled_fg: with_alpha(srgba(chrome.tab_text), 0.35),
+            hover_bg: with_alpha(srgba(chrome.tab_text), 0.12),
+            pressed_bg: with_alpha(srgba(chrome.tab_text), 0.20),
         }
     }
 }
 
-/// Push a solid-color rectangle as a single `CellInstance`.
-fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
-    out.push(CellInstance {
-        pos: [rect.x, rect.y],
-        size: [rect.width, rect.height],
-        uv_min: [0.0, 0.0],
-        uv_max: [0.0, 0.0],
-        fg_color: color,
-        bg_color: color,
-        corner_radius: 0.0,
-    });
+/// The right-click context menu view. Positioned absolutely at the click point
+/// inside the overlay layer; clicks on enabled rows emit
+/// [`ContextMenuEvent::Selected`], Escape or a backdrop click emits
+/// [`ContextMenuEvent::Dismissed`].
+pub struct ContextMenuView {
+    colors: ContextMenuColors,
+    items: Vec<MenuItem>,
+    /// Top-left corner of the menu box, in window pixels.
+    position: Point<gpui::Pixels>,
+    focus_handle: FocusHandle,
 }
 
-/// Lighten an sRGB color by adding `amount` to each RGB channel, clamped to 1.0.
-fn lighten(color: [f32; 4], amount: f32) -> [f32; 4] {
-    [
-        (color.first().copied().unwrap_or(0.0) + amount).min(1.0),
-        (color.get(1).copied().unwrap_or(0.0) + amount).min(1.0),
-        (color.get(2).copied().unwrap_or(0.0) + amount).min(1.0),
-        color.get(3).copied().unwrap_or(1.0),
-    ]
+impl EventEmitter<ContextMenuEvent> for ContextMenuView {}
+
+impl ContextMenuView {
+    /// Build a context menu at `position` with the items assembled for `request`.
+    pub fn new(
+        colors: ContextMenuColors,
+        request: ContextMenuRequest,
+        position: Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self { colors, items: build_menu_items(request), position, focus_handle: cx.focus_handle() }
+    }
+
+    /// Borrow the assembled menu items (test/inspection surface).
+    #[must_use]
+    pub fn items(&self) -> &[MenuItem] {
+        &self.items
+    }
+
+    /// Dispatch the item at `index` if it is enabled, emitting
+    /// [`ContextMenuEvent::Selected`]. Out-of-range or disabled indices are
+    /// no-ops.
+    pub fn activate(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(item) = self.items.get(index) else { return };
+        if !item.enabled {
+            return;
+        }
+        cx.emit(ContextMenuEvent::Selected(item.action.clone()));
+    }
+
+    /// Dismiss the menu, clearing its rows and emitting
+    /// [`ContextMenuEvent::Dismissed`].
+    pub fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.items.clear();
+        cx.emit(ContextMenuEvent::Dismissed);
+    }
+
+    fn render_item(
+        colors: ContextMenuColors,
+        index: usize,
+        item: &MenuItem,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let fg = if item.enabled { colors.item_fg } else { colors.disabled_fg };
+        let mut row = div()
+            .id(("ctx-item", index))
+            .w_full()
+            .px_3()
+            .py_1()
+            .text_sm()
+            .text_color(fg)
+            .child(item.label.clone());
+        if item.enabled {
+            row = row
+                .hover(move |s| s.bg(colors.hover_bg))
+                .active(move |s| s.bg(colors.pressed_bg))
+                .on_click(cx.listener(move |this, _, _win, ctx| this.activate(index, ctx)));
+        }
+        row.into_any_element()
+    }
 }
 
-/// Return a copy of `color` with a new alpha value.
-fn with_alpha(color: [f32; 4], new_alpha: f32) -> [f32; 4] {
-    [
-        color.first().copied().unwrap_or(0.0),
-        color.get(1).copied().unwrap_or(0.0),
-        color.get(2).copied().unwrap_or(0.0),
-        new_alpha,
-    ]
+impl Render for ContextMenuView {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors;
+        let mut rows = Vec::with_capacity(self.items.len() * 2);
+        let mut prev_open_group = false;
+        let item_data: Vec<(usize, MenuItem)> = self.items.iter().cloned().enumerate().collect();
+        for (index, item) in &item_data {
+            // Insert a divider ahead of the first open/run-group entry, mirroring
+            // the winit separator between the copy head and the action group.
+            if item.action.is_open_group() && !prev_open_group {
+                rows.push(div().mx_2().my_1().h(px(1.0)).bg(colors.separator).into_any_element());
+                prev_open_group = true;
+            }
+            rows.push(Self::render_item(colors, *index, item, cx));
+        }
+
+        // Full-window backdrop: a click anywhere outside the box dismisses.
+        div()
+            .track_focus(&self.focus_handle)
+            .absolute()
+            .inset_0()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _win, ctx| this.dismiss(ctx)))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _win, ctx| this.dismiss(ctx)))
+            .child(
+                div()
+                    .absolute()
+                    .left(self.position.x)
+                    .top(self.position.y)
+                    .min_w(px(160.0))
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .bg(colors.bg)
+                    .border_1()
+                    .border_color(colors.border)
+                    .rounded_md()
+                    .shadow_lg()
+                    // Swallow clicks inside the box so they do not hit the backdrop.
+                    .on_mouse_down(MouseButton::Left, |_, _win, ctx| ctx.stop_propagation())
+                    .children(rows),
+            )
+    }
 }
+
+/// Lighten a GPUI colour by adding `amount` to each RGB channel, clamped to 1.0.
+fn lighten(color: Rgba, amount: f32) -> Rgba {
+    Rgba {
+        r: (color.r + amount).min(1.0),
+        g: (color.g + amount).min(1.0),
+        b: (color.b + amount).min(1.0),
+        a: color.a,
+    }
+}
+
+/// Return `color` with a replaced alpha channel.
+fn with_alpha(color: Rgba, alpha: f32) -> Rgba {
+    Rgba { a: alpha, ..color }
+}
+
+#[cfg(test)]
+mod tests;

@@ -1,7 +1,9 @@
-//! Mouse click counting and selection mode classification.
+//! Mouse click counting and selection mode classification for the GPUI client.
 //!
-//! Tracks single/double/triple/quad click sequences and derives the active
-//! selection granularity (cell, word, or line).  Also provides an
+//! Ported verbatim from `crates/scribe-client/src/mouse_state.rs`; the logic is
+//! platform-independent (no winit/GPUI types), so the port is byte-for-byte
+//! identical. Tracks single/double/triple/quad click sequences and derives the
+//! active selection granularity (cell, word, or line). Also provides an
 //! edge-scroll helper for autoscrolling during drag selection.
 
 use std::time::{Duration, Instant};

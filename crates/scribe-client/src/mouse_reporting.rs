@@ -1,41 +1,117 @@
-//! xterm mouse protocol encoding (SGR mode 1006 and X10).
+//! xterm mouse protocol encoding (SGR mode 1006 and X10) for the GPUI client.
+//!
+//! This is a byte-for-byte port of the winit-driven reporter in
+//! `crates/scribe-client/src/mouse_reporting.rs`, retargeted at GPUI's
+//! [`gpui::MouseButton`] / [`gpui::Modifiers`] model. It reproduces the X10 and
+//! SGR-1006 encodings, the modifier bits packed into the Cb byte, scroll-wheel
+//! reporting, held-button motion, and the mode 1000/1002/1003 motion gate with
+//! per-cell de-duplication. The golden fixtures in
+//! `tests/fixtures/gpui-client/mouse-byte-golden.json` are the correctness
+//! oracle (US1): every encoder path must stay byte-identical to the old client.
+//!
+//! Alongside the encoders it owns the pure *decisions* the live path makes
+//! around them: which DEC private modes are on ([`MouseModes`]), whether a
+//! button event belongs to the application or to the client's own selection
+//! gesture ([`MouseModes::forwards_buttons`]), how many terminal rows one wheel
+//! event is worth ([`wheel_lines`]), and which of the three wheel consumers
+//! claims it ([`wheel_action`]).
 //!
 //! All functions are pure — no side effects. Callers send the returned bytes
-//! to the PTY via `ClientCommand::KeyInput`.
+//! to the PTY via `ClientMessage::KeyInput`.
 
-use winit::event::MouseButton;
-use winit::keyboard::ModifiersState;
+use gpui::{Modifiers, MouseButton, ScrollDelta};
 
-#[derive(Clone, Copy)]
+/// The wire encoding an application has requested for mouse reports.
+///
+/// X10 is the default because it is what a terminal reports until the
+/// application selects SGR with DECSET 1006.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum MouseReportMode {
+    /// SGR 1006 (`\x1b[<Cb;Cx;Cy{M,m}`), the modern encoding.
     Sgr,
+    /// Legacy X10 (`\x1b[M<byte><byte><byte>`).
+    #[default]
     X10,
 }
 
+/// The mouse-related DEC private modes a pane's application currently has on.
+///
+/// Read off the pane's `Term` once per event and then passed by value, so every
+/// decision below stays a pure function of terminal state rather than reaching
+/// back into the grid mid-gesture.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct MouseModes {
+    /// The motion level 1000 / 1002 / 1003 selected, or `None` when the
+    /// application asked for no mouse tracking at all. The two are one field
+    /// because a motion level only means anything while tracking is on.
+    pub tracking: Option<MotionReporting>,
+    /// The wire encoding reports must use; 1006 selects SGR.
+    pub encoding: MouseReportMode,
+    /// The alternate screen buffer is showing (1049 / 47).
+    pub alt_screen: bool,
+    /// 1007: on the alternate screen, a wheel tick becomes cursor keys.
+    pub alternate_scroll: bool,
+}
+
+impl MouseModes {
+    /// How much pointer motion the application asked to hear about, which is
+    /// none at all when it tracks the mouse not at all.
+    #[must_use]
+    pub const fn motion(self) -> MotionReporting {
+        match self.tracking {
+            Some(motion) => motion,
+            None => MotionReporting::None,
+        }
+    }
+
+    /// Whether a button press / release / motion belongs to the application
+    /// rather than to the client's own selection gesture.
+    ///
+    /// Shift is the universal escape hatch every terminal offers: holding it
+    /// takes the pointer back from a mouse-tracking application so the user can
+    /// still select text inside vim or tmux.
+    #[must_use]
+    pub const fn forwards_buttons(self, shift_held: bool) -> bool {
+        self.tracking.is_some() && !shift_held
+    }
+}
+
+/// The direction of a scroll-wheel event.
 #[derive(Clone, Copy)]
 pub enum ScrollDirection {
     Up,
     Down,
 }
 
+impl ScrollDirection {
+    /// The direction a signed row delta from [`wheel_lines`] scrolls in.
+    ///
+    /// Positive rows walk backwards into the scrollback, which is what button
+    /// 64 (`Up`) means to an application.
+    #[must_use]
+    pub const fn from_rows(rows: i32) -> Self {
+        if rows > 0 { Self::Up } else { Self::Down }
+    }
+}
+
 /// Encode modifier bits into the Cb byte per xterm spec.
 ///
 /// +4 = Shift, +8 = Alt, +16 = Ctrl.
-fn modifier_bits(modifiers: ModifiersState) -> u8 {
+fn modifier_bits(modifiers: Modifiers) -> u8 {
     let mut bits: u8 = 0;
-    if modifiers.shift_key() {
+    if modifiers.shift {
         bits |= 4;
     }
-    if modifiers.alt_key() {
+    if modifiers.alt {
         bits |= 8;
     }
-    if modifiers.control_key() {
+    if modifiers.control {
         bits |= 16;
     }
     bits
 }
 
-/// Map a `MouseButton` to its xterm Cb base value.
+/// Map a [`MouseButton`] to its xterm Cb base value.
 ///
 /// Returns `None` for buttons that have no xterm encoding.
 fn button_base(button: MouseButton) -> Option<u8> {
@@ -43,7 +119,7 @@ fn button_base(button: MouseButton) -> Option<u8> {
         MouseButton::Left => Some(0),
         MouseButton::Middle => Some(1),
         MouseButton::Right => Some(2),
-        _ => None,
+        MouseButton::Navigate(_) => None,
     }
 }
 
@@ -55,7 +131,7 @@ pub fn encode_mouse_press(
     button: MouseButton,
     col: u16,
     row: u16,
-    modifiers: ModifiersState,
+    modifiers: Modifiers,
     mode: MouseReportMode,
 ) -> Vec<u8> {
     let Some(base) = button_base(button) else { return Vec::new() };
@@ -71,7 +147,7 @@ pub fn encode_mouse_release(
     button: MouseButton,
     col: u16,
     row: u16,
-    modifiers: ModifiersState,
+    modifiers: Modifiers,
     mode: MouseReportMode,
 ) -> Vec<u8> {
     let Some(base) = button_base(button) else { return Vec::new() };
@@ -92,7 +168,7 @@ pub fn encode_mouse_scroll(
     direction: ScrollDirection,
     col: u16,
     row: u16,
-    modifiers: ModifiersState,
+    modifiers: Modifiers,
     mode: MouseReportMode,
 ) -> Vec<u8> {
     let base: u8 = match direction {
@@ -111,7 +187,7 @@ pub fn encode_mouse_motion(
     col: u16,
     row: u16,
     button_held: Option<MouseButton>,
-    modifiers: ModifiersState,
+    modifiers: Modifiers,
     mode: MouseReportMode,
 ) -> Vec<u8> {
     let base = button_held.and_then(button_base).unwrap_or(0);
@@ -120,9 +196,10 @@ pub fn encode_mouse_motion(
 }
 
 /// The pointer-motion reporting level an application has requested.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum MotionReporting {
     /// Mode 1000 (click only): no motion is reported.
+    #[default]
     None,
     /// Mode 1002 (button-event): motion is reported only while a button is held.
     Drag,
@@ -150,6 +227,100 @@ pub fn should_report_mouse_motion(
         MotionReporting::None => false,
     };
     enabled && last_reported != Some(cell)
+}
+
+/// Who claims one wheel event, in the priority order xterm defines.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WheelAction {
+    /// The application tracks the mouse: encode button 64 / 65 and send it.
+    Report,
+    /// Alternate screen plus alternate scroll (1007): send cursor keys, so a
+    /// pager that never asked for mouse tracking still scrolls on the wheel.
+    CursorKeys,
+    /// Nothing claimed the tick, so it moves the client's own viewport through
+    /// the local scrollback.
+    Scrollback,
+}
+
+/// Decide what one wheel event does, given the pane's live terminal modes.
+///
+/// Mouse tracking wins outright — an application that asked for reports gets
+/// them even on the normal screen. Alternate scroll is the fallback for the
+/// alternate screen only, exactly as the winit client ordered it.
+#[must_use]
+pub const fn wheel_action(modes: MouseModes) -> WheelAction {
+    if modes.tracking.is_some() {
+        WheelAction::Report
+    } else if modes.alt_screen && modes.alternate_scroll {
+        WheelAction::CursorKeys
+    } else {
+        WheelAction::Scrollback
+    }
+}
+
+/// How many terminal rows one wheel event is worth, signed so that a positive
+/// value walks backwards into the scrollback.
+///
+/// GPUI reports a notched wheel as [`ScrollDelta::Lines`] already scaled by its
+/// three-rows-per-notch constant — the same factor the winit client multiplied
+/// in by hand — so the line form needs no scaling of its own. A trackpad's
+/// [`ScrollDelta::Pixels`] is divided by the row height instead.
+///
+/// The platform sign is "positive `y` reveals the content above", which is
+/// traditional terminal behaviour, so `natural_scroll` (off by default, per
+/// `terminal.scroll.natural_scroll`) is the branch that inverts.
+#[must_use]
+pub fn wheel_lines(delta: ScrollDelta, line_height: f32, natural_scroll: bool) -> i32 {
+    let rows = match delta {
+        ScrollDelta::Lines(lines) => round_to_i32(lines.y),
+        ScrollDelta::Pixels(pixels) => {
+            if !line_height.is_finite() || line_height <= 0.0 {
+                return 0;
+            }
+            round_to_i32(f32::from(pixels.y) / line_height)
+        }
+    };
+    if natural_scroll { -rows } else { rows }
+}
+
+/// The cursor-key burst mode 1007 wants in place of a wheel report: one CUU
+/// (`\x1b[A`) per row backwards, one CUD (`\x1b[B`) per row forwards.
+#[must_use]
+pub fn alternate_scroll_keys(rows: i32) -> Vec<u8> {
+    let sequence: &[u8] = if rows > 0 { b"\x1b[A" } else { b"\x1b[B" };
+    let count = usize::try_from(rows.unsigned_abs()).unwrap_or(usize::MAX);
+    sequence.iter().copied().cycle().take(sequence.len().saturating_mul(count)).collect()
+}
+
+/// Round a signed row count to `i32` without a float-to-int cast, which the
+/// workspace lints deny.
+///
+/// Sub-row travel rounds to zero rather than to a phantom row, which is what
+/// makes a trackpad's fine-grained pixel deltas usable at all.
+fn round_to_i32(value: f32) -> i32 {
+    let magnitude = i32::from(magnitude_units(value.abs().round()));
+    if value < 0.0 { -magnitude } else { magnitude }
+}
+
+/// The largest `u16` not exceeding `magnitude`, resolved by binary search so no
+/// float-to-int cast is needed. `magnitude` is already integer-valued at every
+/// call site, so this reproduces it exactly (clamped to `u16::MAX`, far more
+/// rows than any single wheel event can carry).
+fn magnitude_units(magnitude: f32) -> u16 {
+    if !magnitude.is_finite() || magnitude < 1.0 {
+        return 0;
+    }
+    let mut low = 0u16;
+    let mut high = u16::MAX;
+    while low < high {
+        let mid = low + (high - low).saturating_add(1) / 2;
+        if f32::from(mid) <= magnitude {
+            low = mid;
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+    low
 }
 
 fn encode_button_report(mode: MouseReportMode, cb: u8, col: u16, row: u16, press: bool) -> Vec<u8> {
@@ -183,96 +354,4 @@ fn encode_x10(cb: u8, col: u16, row: u16) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Motion encoding must combine the button base with the +32 motion bit.
-    /// Left=0 → 32, Middle=1 → 33, Right=2 → 34 (no modifiers).
-    #[test]
-    fn sgr_motion_includes_button_base_plus_motion_bit() {
-        let mods = ModifiersState::empty();
-
-        let left = encode_mouse_motion(0, 0, Some(MouseButton::Left), mods, MouseReportMode::Sgr);
-        assert_eq!(left, b"\x1b[<32;1;1M".to_vec());
-
-        let middle =
-            encode_mouse_motion(5, 9, Some(MouseButton::Middle), mods, MouseReportMode::Sgr);
-        // Cb = 1 (Middle) | 32 = 33; col/row are 1-indexed in the sequence.
-        assert_eq!(middle, b"\x1b[<33;6;10M".to_vec());
-
-        let right = encode_mouse_motion(5, 9, Some(MouseButton::Right), mods, MouseReportMode::Sgr);
-        // Cb = 2 (Right) | 32 = 34.
-        assert_eq!(right, b"\x1b[<34;6;10M".to_vec());
-    }
-
-    /// In X10 mode the Cb byte (button base + 32 motion) is offset by a further
-    /// +32 in the wire encoding: Middle → 33+32 = 65 ('A'), Right → 34+32 = 66.
-    #[test]
-    fn x10_motion_includes_button_base_plus_motion_bit() {
-        let mods = ModifiersState::empty();
-
-        let middle =
-            encode_mouse_motion(0, 0, Some(MouseButton::Middle), mods, MouseReportMode::X10);
-        // Cb = 33; wire byte = 33 + 32 = 65; coords = (0+1)+32 = 33.
-        assert_eq!(middle, vec![b'\x1b', b'[', b'M', 65, 33, 33]);
-
-        let right = encode_mouse_motion(0, 0, Some(MouseButton::Right), mods, MouseReportMode::X10);
-        // Cb = 34; wire byte = 34 + 32 = 66.
-        assert_eq!(right, vec![b'\x1b', b'[', b'M', 66, 33, 33]);
-    }
-
-    /// Motion with no button held in mode 1003 encodes the bare motion bit:
-    /// base 0 | 32 = 32, with no modifiers. Covers the mode-1003 no-button
-    /// path where `encode_mouse_motion` receives `None`.
-    #[test]
-    fn sgr_motion_without_button_uses_motion_bit_only() {
-        let motion = encode_mouse_motion(4, 7, None, ModifiersState::empty(), MouseReportMode::Sgr);
-        // Cb = 0 (no button) | 32 (motion) = 32; col/row are 1-indexed: 5,8.
-        assert_eq!(motion, b"\x1b[<32;5;8M".to_vec());
-    }
-
-    // ── should_report_mouse_motion gating semantics ─────────────────
-    //
-    // These mirror xterm / alacritty per-mode motion reporting:
-    //   mode 1000 -> any_motion=false, drag=false  (click only, no motion)
-    //   mode 1002 -> drag=true                      (motion only while held)
-    //   mode 1003 -> any_motion=true                (all motion)
-    // plus xterm's "different character cell" de-duplication guard.
-
-    /// Mode 1000 (click-only): no motion is ever reported, whether or not a
-    /// button is held.
-    #[test]
-    fn mode_1000_suppresses_motion() {
-        // Click-only mode never reports motion, with or without a button.
-        assert!(!should_report_mouse_motion(MotionReporting::None, false, (3, 4), None));
-        assert!(!should_report_mouse_motion(MotionReporting::None, true, (3, 4), None));
-    }
-
-    /// Mode 1002 (button-event / drag): motion is reported only while a button
-    /// is held.
-    #[test]
-    fn mode_1002_requires_held_button() {
-        // Drag mode but no button held -> suppressed.
-        assert!(!should_report_mouse_motion(MotionReporting::Drag, false, (3, 4), None));
-        // Drag mode with a button held, fresh cell -> reported.
-        assert!(should_report_mouse_motion(MotionReporting::Drag, true, (3, 4), None));
-    }
-
-    /// Mode 1003 (any-motion): motion is reported regardless of button state.
-    #[test]
-    fn mode_1003_reports_without_button() {
-        // Any-motion is reported regardless of button state.
-        assert!(should_report_mouse_motion(MotionReporting::Any, false, (3, 4), None));
-        assert!(should_report_mouse_motion(MotionReporting::Any, true, (3, 4), None));
-    }
-
-    /// xterm de-duplication: a motion event staying within the previously
-    /// reported cell is suppressed; moving to a different cell is reported.
-    #[test]
-    fn motion_deduplicated_within_same_cell() {
-        // Same cell as last report -> suppressed.
-        assert!(!should_report_mouse_motion(MotionReporting::Any, false, (5, 5), Some((5, 5))));
-        // Different cell -> reported.
-        assert!(should_report_mouse_motion(MotionReporting::Any, false, (6, 5), Some((5, 5))));
-    }
-}
+mod tests;

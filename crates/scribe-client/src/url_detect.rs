@@ -2,14 +2,38 @@
 //!
 //! Scans the visible terminal grid for URLs and maintains a dirty-flag cache
 //! so URL hit-testing can be performed without re-scanning every frame.
+//!
+//! Ported byte-for-byte from the legacy `scribe-client` `url_detect` module
+//! onto Zed's Alacritty fork so URL/OSC 8 detection stays identical across the
+//! GPUI cutover. The only structural change is that the two grid cell readers
+//! ([`read_cell_char`], [`read_cell_flags`]) are defined locally here instead
+//! of imported from `selection` — the selection port lands in a separate bead,
+//! and these helpers carry no state.
 
-use alacritty_terminal::Term;
-use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions as _;
-use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::cell::{Flags, Hyperlink};
+use alacritty_terminal_gpui::event::VoidListener;
+use alacritty_terminal_gpui::grid::Dimensions as _;
+use alacritty_terminal_gpui::index::{Column, Line, Point};
+use alacritty_terminal_gpui::term::Term;
+use alacritty_terminal_gpui::term::cell::{Cell, Flags, Hyperlink};
 
-use crate::selection::{read_cell_char, read_cell_flags};
+/// Read a single cell from the terminal grid.
+///
+/// The `alacritty_terminal` grid only exposes `Index`, with no fallible
+/// `.get()` alternative, so indexing is required here — matching the direct
+/// grid indexing the display snapshot path already relies on.
+fn read_cell(term: &Term<VoidListener>, line: Line, col: Column) -> &Cell {
+    &term.grid()[line][col]
+}
+
+/// Read a single cell character from the terminal grid.
+fn read_cell_char(term: &Term<VoidListener>, line: Line, col: Column) -> char {
+    read_cell(term, line, col).c
+}
+
+/// Read the flags of a single cell from the terminal grid.
+fn read_cell_flags(term: &Term<VoidListener>, line: Line, col: Column) -> Flags {
+    read_cell(term, line, col).flags
+}
 
 /// Whether a detected span is a URL or a file-system path.
 #[derive(Clone, Copy)]
@@ -1175,10 +1199,10 @@ pub fn open_uri_unguarded(uri: &str) {
 
 #[cfg(test)]
 mod tests {
-    use alacritty_terminal::Term;
-    use alacritty_terminal::event::VoidListener;
-    use alacritty_terminal::grid::Dimensions;
-    use alacritty_terminal::term::Config;
+    use alacritty_terminal_gpui::event::VoidListener;
+    use alacritty_terminal_gpui::grid::Dimensions;
+    use alacritty_terminal_gpui::term::Config;
+    use alacritty_terminal_gpui::term::Term;
     use vte::ansi::Processor;
 
     use super::{
@@ -1290,7 +1314,7 @@ mod tests {
         );
     }
 
-    // @lat: [[client#Client#URL Detection#Explicit Hyperlinks]]
+    // @lat: [[test#GPUI URL Detection#Explicit hyperlink segment geometry]]
     #[test]
     fn osc8_segments_keep_full_and_partial_middle_rows_exact() {
         let full_middle = segments_from_cells(&[

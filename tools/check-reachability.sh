@@ -11,7 +11,7 @@ Usage:
 Ratchet the GPUI client's reachability surface against a committed baseline.
 
 Reports how much of the crate the running binary can actually reach:
-  * library modules imported on the live path of `scribe-client-gpui`
+  * library modules imported on the live path of `scribe-client`
   * `ServerMessage` variants the live IPC reader acts on
   * `LayoutAction` variants the key path executes
 
@@ -121,7 +121,7 @@ use strict;
 use warnings;
 
 my $root = $ENV{SCAN_ROOT} // die "SCAN_ROOT is required\n";
-my $gpui = "$root/crates/scribe-client-gpui/src";
+my $gpui = "$root/crates/scribe-client/src";
 
 sub slurp {
     my ($path) = @_;
@@ -197,7 +197,7 @@ for my $submodule ($main_src =~ /^mod (\w+);/gm) {
 my $live = join "\n", map { slurp("$gpui/$_") } @live_files;
 my %wired;
 my $use_tree = qr/
-    scribe_client_gpui::(?<tail>(?&BRACE)|\w+)
+    scribe_client::(?<tail>(?&BRACE)|\w+)
     (?(DEFINE)(?<BRACE>\{(?:[^{}]++|(?&BRACE))*\}))
 /x;
 while ($live =~ /$use_tree/g) {

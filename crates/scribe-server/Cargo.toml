@@ -13,7 +13,7 @@ workspace = true
 name = "scribe"
 maintainer = "Scribe Team <team@scribe-terminal.dev>"
 copyright = "2026 Scribe Team"
-depends = "libgtk-4-1 (>= 4.12), libvulkan1"
+depends = "libvulkan1, mesa-vulkan-drivers, libwayland-client0, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1, libxcb-shape0, libxcb-xfixes0, libxcb-render0, libxcb-randr0"
 section = "utils"
 priority = "optional"
 extended-description = """GPU-accelerated terminal emulator with a PTY server architecture, \
@@ -27,11 +27,6 @@ assets = [
   ],
   [
     "target/release/scribe-client",
-    "usr/bin/",
-    "755",
-  ],
-  [
-    "target/release/scribe-settings",
     "usr/bin/",
     "755",
   ],
@@ -120,10 +115,8 @@ maintainer-scripts = "../../dist/debian/"
 
 [package.metadata.deb.variants.dev]
 name = "scribe-dev"
-# The dev flavor ships the GPUI client (blade/gpui) instead of the old gtk
-# client, so it drops libgtk-4-1 and depends on the GPU/windowing runtime the
-# new client links (xcb/xkbcommon) plus the vulkan/wayland stacks it dlopens.
-depends = "libvulkan1, mesa-vulkan-drivers, libwayland-client0, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1"
+# The dev flavor uses the same GPUI client runtime as stable.
+depends = "libvulkan1, mesa-vulkan-drivers, libwayland-client0, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-xkb1, libxcb-shape0, libxcb-xfixes0, libxcb-render0, libxcb-randr0"
 assets = [
   [
     "target/release/scribe-server",
@@ -131,13 +124,8 @@ assets = [
     "755",
   ],
   [
-    "target/release/scribe-client-gpui",
+    "target/release/scribe-client",
     "usr/bin/scribe-dev",
-    "755",
-  ],
-  [
-    "target/release/scribe-settings",
-    "usr/bin/scribe-dev-settings",
     "755",
   ],
   [

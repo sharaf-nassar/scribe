@@ -1,7 +1,17 @@
-//! AI state tracking and visual indicator generation.
+//! AI state tracking and pane-border indicator for the GPUI client.
 //!
-//! Maintains per-session [`AiProcessState`] and produces [`CellInstance`]
-//! quads for pane border overlays and tab-bar indicator bars.
+//! Ports the winit client's `AiStateTracker` state machine byte-for-byte: the
+//! per-session pulse envelope, the Layer-2 stale-`Processing` clear, the
+//! attention-state keystroke clear, the workspace-level priority ordering, and
+//! the decoupled context-window store. The winit client emitted the pulsing
+//! pane border as `CellInstance` quads through the legacy renderer; the GPUI
+//! rebuild keeps the same geometry pure — [`pane_border_edges`] returns the
+//! four edge [`Rect`]s and the GPUI paint path fills them with
+//! [`AiStateTracker::workspace_border_color`], mirroring [`crate::focus_border`].
+//!
+//! The tab context-% suffix banding now lives in [`crate::tab_bar`]; this module
+//! only owns the per-session context store that feeds it ([`AiStateTracker::context_for`])
+//! and the pulse-suppression predicate ([`AiStateTracker::context_suffix_suppressed`]).
 //!
 //! Colours, per-state enable flags, and auto-clear timeouts are driven by
 //! [`AiStateStylesConfig`] rather than compile-time constants.
@@ -10,14 +20,10 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
-use scribe_common::config::{
-    AiContextThresholds, AiStateEntry, AiStateStylesConfig, TerminalConfig,
-};
+use scribe_common::config::{AiStateEntry, AiStateStylesConfig, TerminalConfig};
 use scribe_common::ids::SessionId;
-use scribe_common::theme::hex_to_rgba;
-use scribe_renderer::chrome::solid_quad;
-use scribe_renderer::types::CellInstance;
 
+use crate::focus_border::border_edges;
 use crate::layout::Rect;
 
 /// Width of the animated border overlay in pixels.
@@ -40,8 +46,7 @@ const ANIMATION_WRAP_PERIOD: f32 = std::f32::consts::TAU * 100.0;
 //
 // The pulse is an *attention* affordance, not a permanent state display.
 // Decoupling its lifetime from AI-state lifetime is what lets the shared
-// 30 fps redraw loop retire when a session is stuck/idle — see
-// `pulse_is_active` and lat.md/client.md §AI Indicator#Pulse Envelope.
+// redraw loop retire when a session is stuck/idle — see `pulse_is_active`.
 
 /// How long an attention state (`IdlePrompt` / `WaitingForInput` /
 /// `PermissionPrompt`) keeps actively pulsing after it is entered before
@@ -60,9 +65,7 @@ const PROCESSING_IDLE_PULSE_SECS: f32 = 8.0;
 /// indicator is *cleared* entirely, not merely rested. A killed/crashed AI
 /// can never fire its own terminal hook and the server only supervises the
 /// shell, not the AI subprocess — so without this a dead AI shows a stale
-/// "working" colour forever. Far longer than the pulse envelope: only a
-/// genuinely-dead session is silent this long, and a wrongly-cleared one
-/// self-heals on its next hook/output. Wall-clock, evaluated lazily — see
+/// "working" colour forever. Wall-clock, evaluated lazily — see
 /// [`AiStateTracker::clear_stale_processing`].
 const STALE_PROCESSING_CLEAR: Duration = Duration::from_mins(5);
 
@@ -254,7 +257,7 @@ impl AiStateTracker {
                 // Only keep the redraw loop alive while the pulse is within
                 // its envelope. Once stale it rests statically (see
                 // `animated_color`) and contributes no animation, letting
-                // the shared 30 fps loop retire.
+                // the shared redraw loop retire.
                 requires_animation(&s.state) && self.pulse_is_active(*sid, &s.state)
             }
         })
@@ -270,44 +273,20 @@ impl AiStateTracker {
     /// to a steady alpha) and (b) lets `needs_animation` report idle so the
     /// shared redraw loop retires and GPU use drops to zero.
     ///
-    /// Inputs available to you:
-    /// - `self.animation_time` — monotonic frame clock (seconds, wrapped).
-    /// - `self.state_enter_times.get(&session_id)` — when this state was
-    ///   entered (an `AiStateChanged` edge), in `animation_time` units.
-    /// - `self.last_activity_times.get(&session_id)` — last sign of life:
-    ///   `max` of the last state edge and the last PTY-output chunk.
-    /// - Constants `ATTENTION_PULSE_SECS`, `PROCESSING_IDLE_PULSE_SECS`.
-    ///
     /// `state` is guaranteed to satisfy `requires_animation` (i.e. one of
     /// `Processing` / `IdlePrompt` / `WaitingForInput` / `PermissionPrompt`)
     /// — `Error` never reaches here.
-    ///
-    /// Recommended policy (the PTY-output + edge model you chose):
-    /// - Attention states (`IdlePrompt` / `WaitingForInput` /
-    ///   `PermissionPrompt`): the AI is blocked on the human, so further
-    ///   pulsing has no value. Pulse for `ATTENTION_PULSE_SECS` after the
-    ///   state was *entered* (`state_enter_times`), then rest. (It still
-    ///   clears instantly on keystroke via `clear_attention_states`.)
-    /// - `Processing`: pulse while *alive* — within
-    ///   `PROCESSING_IDLE_PULSE_SECS` of the last activity
-    ///   (`last_activity_times`, which a working session keeps refreshing
-    ///   via state edges and PTY output). After sustained silence, rest.
-    /// - Missing timestamp ⇒ treat as just-entered (pulse), so a freshly
-    ///   restored/reconnected state animates rather than starting stale.
-    ///
-    /// Keep it small — this is policy, not plumbing. ~8–12 lines.
     fn pulse_is_active(&self, session_id: SessionId, state: &AiState) -> bool {
         let now = self.animation_time;
-        // `.max(0.0)` mirrors the existing wrap handling in `tick` /
-        // `animated_color`: across the ~628 s `animation_time` wrap a stale
-        // delta clamps to 0, erring toward "still pulsing" for one cycle —
-        // never toward a wrongly-frozen indicator.
+        // `.max(0.0)` mirrors the wrap handling in `tick` / `animated_color`:
+        // across the ~628 s `animation_time` wrap a stale delta clamps to 0,
+        // erring toward "still pulsing" for one cycle — never toward a
+        // wrongly-frozen indicator.
         match state {
-            // Attention states block on the human; the pulse is a
-            // bounded attention grab measured from when the state was
-            // entered. After it, rest (still tracked + visible); a
-            // keystroke still clears instantly via
-            // `clear_attention_states`.
+            // Attention states block on the human; the pulse is a bounded
+            // attention grab measured from when the state was entered. After
+            // it, rest (still tracked + visible); a keystroke still clears
+            // instantly via `clear_attention_states`.
             AiState::IdlePrompt | AiState::WaitingForInput | AiState::PermissionPrompt => {
                 let entered = self.state_enter_times.get(&session_id).copied().unwrap_or(now);
                 (now - entered).max(0.0) < ATTENTION_PULSE_SECS
@@ -347,9 +326,9 @@ impl AiStateTracker {
 
     /// Whether Claude Code has been detected in this session.
     ///
-    /// Unlike [`get`], this returns `true` even after the visual indicator
-    /// has timed out or been cleared by a keystroke.  It is only reset when
-    /// the session explicitly sends `ClaudeState=inactive` or is removed.
+    /// Unlike the visible state, this returns `true` even after the visual
+    /// indicator has timed out or been cleared by a keystroke. It is only
+    /// reset when the session is removed or explicitly cleared.
     #[cfg(test)]
     pub fn has_claude_session(&self, session_id: SessionId) -> bool {
         self.detected_providers.get(&session_id) == Some(&AiProvider::ClaudeCode)
@@ -365,44 +344,22 @@ impl AiStateTracker {
     ///
     /// Reads from `last_contexts`, so the percent survives any path that
     /// prunes `states` (stale-Processing clear, attention-state keystroke
-    /// clear, Error decay).
+    /// clear, Error decay). Feeds [`crate::tab_bar::context_suffix`].
     #[must_use]
     pub fn context_for(&self, session: SessionId) -> Option<u8> {
         self.last_contexts.get(&session).copied()
     }
 
-    /// Return a colored context-% suffix to append to a tab label, or `None`
-    /// when no suffix should be drawn.
-    ///
-    /// Returns `Some((" NN%", color))` only when:
-    /// - the session has a context value at or above `thresholds.warn`, AND
-    /// - the session's AI state is NOT `PermissionPrompt` or `WaitingForInput`
-    ///   (those use the existing pulse indicators and must not compete).
-    ///
-    /// Color is derived from `thresholds.color_for(ctx)` via `hex_to_rgba` →
-    /// `srgb_to_linear_rgba`. Falls back to `fallback_color` on parse failure.
+    /// Whether the tab context-% suffix must be suppressed for `session`
+    /// because a pulsing attention state (`PermissionPrompt` /
+    /// `WaitingForInput`) owns the UX. The suffix reappears on the same
+    /// percent once that state clears or rests. This is the `pulsing`
+    /// argument for [`crate::tab_bar::context_suffix`].
     #[must_use]
-    pub fn tab_context_suffix(
-        &self,
-        session: SessionId,
-        thresholds: &AiContextThresholds,
-        fallback_color: [f32; 4],
-    ) -> Option<(String, [f32; 4])> {
-        let ctx = self.last_contexts.get(&session).copied()?;
-        if ctx < thresholds.warn {
-            return None;
-        }
-        // Suppress only while a pulsing attention state is active so the
-        // pulse owns the UX. Once the state clears or rests, the suffix
-        // becomes visible again on the same percent.
-        if let Some(ps) = self.states.get(&session)
-            && matches!(ps.state, AiState::PermissionPrompt | AiState::WaitingForInput)
-        {
-            return None;
-        }
-        let hex = thresholds.color_for(ctx);
-        let color = hex_to_rgba(hex).map_or(fallback_color, scribe_renderer::srgb_to_linear_rgba);
-        Some((format!(" {ctx}%"), color))
+    pub fn context_suffix_suppressed(&self, session: SessionId) -> bool {
+        self.states.get(&session).is_some_and(|ps| {
+            matches!(ps.state, AiState::PermissionPrompt | AiState::WaitingForInput)
+        })
     }
 
     /// Compute the tab-bar indicator colour for a session.
@@ -485,21 +442,16 @@ impl AiStateTracker {
                     let hz = pulse_hz(entry.pulse_ms);
                     pulse_alpha(self.animation_time, hz)
                 } else {
-                    // Envelope elapsed: rest at a steady, fully-visible
-                    // colour instead of freezing at a random mid-pulse
-                    // alpha. The indicator stays informative at zero GPU.
+                    // Envelope elapsed: rest at a steady, fully-visible colour
+                    // instead of freezing at a random mid-pulse alpha. The
+                    // indicator stays informative at zero GPU.
                     PULSE_ALPHA_MAX
                 }
             }
             AiState::Error => {
                 let timeout = self.config.error.timeout_secs;
                 if timeout <= 0.0 {
-                    return [
-                        base.first().copied().unwrap_or(0.0),
-                        base.get(1).copied().unwrap_or(0.0),
-                        base.get(2).copied().unwrap_or(0.0),
-                        PULSE_ALPHA_MAX,
-                    ];
+                    return [base[0], base[1], base[2], PULSE_ALPHA_MAX];
                 }
                 self.state_enter_times.get(&session_id).map_or(0.0, |&t| {
                     let elapsed = (self.animation_time - t).max(0.0);
@@ -508,23 +460,13 @@ impl AiStateTracker {
                 })
             }
         };
-        [
-            base.first().copied().unwrap_or(0.0),
-            base.get(1).copied().unwrap_or(0.0),
-            base.get(2).copied().unwrap_or(0.0),
-            alpha,
-        ]
+        [base[0], base[1], base[2], alpha]
     }
 
     /// Return the base colour for an AI state at full opacity (for tab indicators).
     fn base_color_full_alpha(&self, state: &AiState, ansi_colors: &[[f32; 4]; 16]) -> [f32; 4] {
         let c = self.entry_for(state).color.resolve(ansi_colors);
-        [
-            c.first().copied().unwrap_or(0.0),
-            c.get(1).copied().unwrap_or(0.0),
-            c.get(2).copied().unwrap_or(0.0),
-            1.0,
-        ]
+        [c[0], c[1], c[2], 1.0]
     }
 }
 
@@ -573,7 +515,7 @@ fn pulse_hz(pulse_ms: u32) -> f32 {
     if pulse_ms == 0 {
         return DEFAULT_PULSE_HZ;
     }
-    let secs = std::time::Duration::from_millis(u64::from(pulse_ms)).as_secs_f32();
+    let secs = Duration::from_millis(u64::from(pulse_ms)).as_secs_f32();
     1.0 / secs
 }
 
@@ -586,178 +528,46 @@ fn pulse_alpha(t: f32, hz: f32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Border instance generation
+// Border geometry
 // ---------------------------------------------------------------------------
 
-/// Build four thin border quads around a pane's terminal content area
-/// (excluding the tab bar).
+/// Compute the four edge rects of the AI pane-border overlay (top, bottom,
+/// left, right) around a pane's terminal content area, excluding the tab bar.
 ///
-/// Each of the four sides is rendered as one solid-colour [`CellInstance`]
-/// (no glyph: `uv_min == uv_max == [0,0]`).  The `color` comes from
-/// [`AiStateTracker::workspace_border_color`].
-pub fn build_border_instances(
-    pane_rect: Rect,
-    color: [f32; 4],
-    tab_bar_height: f32,
-) -> [CellInstance; 4] {
-    let x_pos = pane_rect.x;
-    let y_pos = pane_rect.y + tab_bar_height;
-    let width = pane_rect.width;
-    let height = pane_rect.height - tab_bar_height;
-    let border_width = BORDER_WIDTH;
-
-    let top = solid_quad(x_pos, y_pos, width, border_width, color);
-    let bottom = solid_quad(x_pos, y_pos + height - border_width, width, border_width, color);
-    let left =
-        solid_quad(x_pos, y_pos + border_width, border_width, height - 2.0 * border_width, color);
-    let right = solid_quad(
-        x_pos + width - border_width,
-        y_pos + border_width,
-        border_width,
-        height - 2.0 * border_width,
-        color,
-    );
-
-    [top, bottom, left, right]
+/// The winit client emitted these as four solid renderer quads; the GPUI paint
+/// path fills the returned rects with the colour from
+/// [`AiStateTracker::workspace_border_color`], reusing the shared
+/// [`crate::focus_border::border_edges`] corner-safe strip math.
+#[must_use]
+pub fn pane_border_edges(pane_rect: Rect, tab_bar_height: f32) -> [Rect; 4] {
+    let content = Rect {
+        x: pane_rect.x,
+        y: pane_rect.y + tab_bar_height,
+        width: pane_rect.width,
+        height: (pane_rect.height - tab_bar_height).max(0.0),
+    };
+    border_edges(content, BORDER_WIDTH)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AiStateTracker, STALE_PROCESSING_CLEAR};
+    use super::{AiStateTracker, STALE_PROCESSING_CLEAR, pane_border_edges};
+    use crate::layout::Rect;
     use scribe_common::ai_state::{AiProcessState, AiProvider, AiState};
-    use scribe_common::config::{AiContextThresholds, TerminalConfig};
+    use scribe_common::config::TerminalConfig;
     use scribe_common::ids::SessionId;
-    use scribe_common::theme::hex_to_rgba;
     use std::time::{Duration, Instant};
 
-    const TEST_FALLBACK_COLOR: [f32; 4] = [0.5, 0.5, 0.5, 1.0];
-
     const ANSI_COLORS: [[f32; 4]; 16] = [[0.25, 0.5, 0.75, 1.0]; 16];
-
-    /// Compare two `[f32; 4]` arrays by bit pattern (deterministic float equality).
-    fn colors_eq(a: [f32; 4], b: [f32; 4]) -> bool {
-        a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
-    }
 
     fn make_state_with_ctx(state: AiState, ctx: u8) -> AiProcessState {
         AiProcessState { context: Some(ctx), ..AiProcessState::new(state) }
     }
 
-    // @lat: [[client#Tab Bar#tab_context_suffix_below_warn_returns_none]]
-    #[test]
-    fn tab_context_suffix_below_warn_returns_none() {
-        let mut tracker = AiStateTracker::default();
-        let sid = SessionId::new();
-        tracker.update(sid, make_state_with_ctx(AiState::Processing, 50));
-        let thresholds = AiContextThresholds::default();
-        assert!(tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR).is_none());
-    }
+    // --- Provider gating ---------------------------------------------------
 
-    // @lat: [[client#Tab Bar#tab_context_suffix_at_warn_returns_warn_color]]
-    #[test]
-    fn tab_context_suffix_at_warn_returns_warn_color() {
-        let mut tracker = AiStateTracker::default();
-        let sid = SessionId::new();
-        tracker.update(sid, make_state_with_ctx(AiState::Processing, 70));
-        let thresholds = AiContextThresholds::default();
-        let result = tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR);
-        assert!(result.is_some(), "expected Some for ctx=70 (warn threshold)");
-        let (text, color) = result.unwrap();
-        assert_eq!(text, " 70%");
-        let expected = scribe_renderer::srgb_to_linear_rgba(hex_to_rgba("#d4a017").unwrap());
-        assert!(colors_eq(color, expected), "expected warn color");
-    }
-
-    // @lat: [[client#Tab Bar#tab_context_suffix_at_danger_returns_danger_color]]
-    #[test]
-    fn tab_context_suffix_at_danger_returns_danger_color() {
-        let mut tracker = AiStateTracker::default();
-        let sid = SessionId::new();
-        tracker.update(sid, make_state_with_ctx(AiState::Processing, 92));
-        let thresholds = AiContextThresholds::default();
-        let result = tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR);
-        assert!(result.is_some(), "expected Some for ctx=92 (danger threshold)");
-        let (text, color) = result.unwrap();
-        assert_eq!(text, " 92%");
-        let expected = scribe_renderer::srgb_to_linear_rgba(hex_to_rgba("#c83030").unwrap());
-        assert!(colors_eq(color, expected), "expected danger color");
-    }
-
-    // @lat: [[client#Tab Bar#tab_context_suffix_suppressed_when_permission_prompt]]
-    #[test]
-    fn tab_context_suffix_suppressed_when_permission_prompt() {
-        let mut tracker = AiStateTracker::default();
-        let sid = SessionId::new();
-        tracker.update(sid, make_state_with_ctx(AiState::PermissionPrompt, 85));
-        let thresholds = AiContextThresholds::default();
-        assert!(tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR).is_none());
-    }
-
-    // @lat: [[client#Tab Bar#tab_context_suffix_suppressed_when_waiting_for_input]]
-    #[test]
-    fn tab_context_suffix_suppressed_when_waiting_for_input() {
-        let mut tracker = AiStateTracker::default();
-        let sid = SessionId::new();
-        tracker.update(sid, make_state_with_ctx(AiState::WaitingForInput, 85));
-        let thresholds = AiContextThresholds::default();
-        assert!(tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR).is_none());
-    }
-
-    // @lat: [[client#Tab Bar#tab_context_suffix_present_when_processing]]
-    #[test]
-    fn tab_context_suffix_present_when_processing() {
-        let mut tracker = AiStateTracker::default();
-        let sid = SessionId::new();
-        tracker.update(sid, make_state_with_ctx(AiState::Processing, 85));
-        let thresholds = AiContextThresholds::default();
-        let result = tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR);
-        assert!(result.is_some(), "expected Some for Processing + ctx=85");
-        let (text, color) = result.unwrap();
-        assert_eq!(text, " 85%");
-        // 85 is in warn band (>= 70, < 90)
-        let expected = scribe_renderer::srgb_to_linear_rgba(hex_to_rgba("#d4a017").unwrap());
-        assert!(colors_eq(color, expected), "expected warn color for ctx=85");
-    }
-
-    // @lat: [[client#Tab Bar#tab_context_suffix_none_when_no_session]]
-    #[test]
-    fn tab_context_suffix_none_when_no_session() {
-        let tracker = AiStateTracker::default();
-        let sid = SessionId::new(); // never inserted
-        let thresholds = AiContextThresholds::default();
-        assert!(tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR).is_none());
-    }
-
-    // @lat: [[client#Tab Bar#tab_context_suffix_none_when_no_context_value]]
-    #[test]
-    fn tab_context_suffix_none_when_no_context_value() {
-        let mut tracker = AiStateTracker::default();
-        let sid = SessionId::new();
-        tracker.update(sid, AiProcessState::new(AiState::Processing)); // context = None
-        let thresholds = AiContextThresholds::default();
-        assert!(tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR).is_none());
-    }
-
-    // @lat: [[client#Tab Bar#tab_context_suffix_falls_back_on_invalid_hex]]
-    #[test]
-    fn tab_context_suffix_falls_back_on_invalid_hex() {
-        let mut tracker = AiStateTracker::default();
-        let sid = SessionId::new();
-        tracker.update(sid, make_state_with_ctx(AiState::Processing, 75));
-        let thresholds = AiContextThresholds {
-            warn_color: "not-a-color".into(),
-            ..AiContextThresholds::default()
-        };
-        let result = tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR);
-        assert!(result.is_some(), "expected Some even when hex parse fails");
-        let (_, color) = result.unwrap();
-        assert!(
-            colors_eq(color, TEST_FALLBACK_COLOR),
-            "expected fallback color when hex parse fails"
-        );
-    }
-
-    #[test]
+    // @lat: [[client#GPUI AI Indicator#Provider toggle gates the indicator]]
+    #[gpui::test]
     fn codex_indicator_respects_provider_toggle() {
         let mut tracker = AiStateTracker::default();
         let session_id = SessionId::new();
@@ -768,39 +578,35 @@ mod tests {
             },
             ..TerminalConfig::default()
         };
-
         tracker.update(
             session_id,
             AiProcessState::new_with_provider(AiProvider::CodexCode, AiState::Processing),
         );
-
         assert_eq!(tracker.tab_indicator_color(session_id, &ANSI_COLORS, &terminal), None);
     }
 
-    #[test]
+    // @lat: [[client#GPUI AI Indicator#Provider memory survives clears]]
+    #[gpui::test]
     fn codex_sessions_do_not_enable_claude_cleanup() {
         let mut tracker = AiStateTracker::default();
         let session_id = SessionId::new();
-
         tracker.update(
             session_id,
             AiProcessState::new_with_provider(AiProvider::CodexCode, AiState::Processing),
         );
-
         assert!(!tracker.has_claude_session(session_id));
     }
 
     // --- Pulse envelope (Layer 1) + stale clear (Layer 2) ------------------
 
-    // @lat: [[client#AI Indicator#processing_pulse_rests_after_idle_window]]
-    #[test]
+    // @lat: [[client#GPUI AI Indicator#Processing pulse rests after idle window]]
+    #[gpui::test]
     fn processing_pulse_rests_after_idle_window() {
         let mut tracker = AiStateTracker::default();
         let terminal = TerminalConfig::default();
         let sid = SessionId::new();
         tracker.update(sid, AiProcessState::new(AiState::Processing));
         assert!(tracker.needs_animation(&terminal), "fresh Processing must pulse");
-        // No activity for longer than the Processing idle window.
         tracker.tick(super::PROCESSING_IDLE_PULSE_SECS + 1.0);
         assert!(
             !tracker.needs_animation(&terminal),
@@ -808,8 +614,8 @@ mod tests {
         );
     }
 
-    // @lat: [[client#AI Indicator#processing_activity_rearms_pulse]]
-    #[test]
+    // @lat: [[client#GPUI AI Indicator#Activity re-arms the processing pulse]]
+    #[gpui::test]
     fn processing_activity_rearms_pulse() {
         let mut tracker = AiStateTracker::default();
         let terminal = TerminalConfig::default();
@@ -817,7 +623,6 @@ mod tests {
         tracker.update(sid, AiProcessState::new(AiState::Processing));
         tracker.tick(super::PROCESSING_IDLE_PULSE_SECS + 1.0);
         assert!(!tracker.needs_animation(&terminal), "rested before re-arm");
-        // Fresh PTY output is a liveness signal: it must re-arm the pulse.
         tracker.note_activity(sid);
         assert!(
             tracker.needs_animation(&terminal),
@@ -827,8 +632,8 @@ mod tests {
         assert!(!tracker.needs_animation(&terminal), "must rest again after renewed silence");
     }
 
-    // @lat: [[client#AI Indicator#state_edge_rearms_pulse]]
-    #[test]
+    // @lat: [[client#GPUI AI Indicator#A state edge re-arms the pulse]]
+    #[gpui::test]
     fn state_edge_rearms_pulse() {
         let mut tracker = AiStateTracker::default();
         let terminal = TerminalConfig::default();
@@ -836,7 +641,6 @@ mod tests {
         tracker.update(sid, AiProcessState::new(AiState::Processing));
         tracker.tick(super::PROCESSING_IDLE_PULSE_SECS + 1.0);
         assert!(!tracker.needs_animation(&terminal), "rested before re-arm");
-        // A repeated state edge is also a liveness signal.
         tracker.update(sid, AiProcessState::new(AiState::Processing));
         assert!(
             tracker.needs_animation(&terminal),
@@ -844,15 +648,14 @@ mod tests {
         );
     }
 
-    // @lat: [[client#AI Indicator#attention_pulse_rests_after_window]]
-    #[test]
+    // @lat: [[client#GPUI AI Indicator#Attention pulse rests after its window]]
+    #[gpui::test]
     fn attention_pulse_rests_after_window() {
         let mut tracker = AiStateTracker::default();
         let terminal = TerminalConfig::default();
         let sid = SessionId::new();
         tracker.update(sid, AiProcessState::new(AiState::WaitingForInput));
         assert!(tracker.needs_animation(&terminal), "fresh attention state must pulse");
-        // Attention pulse is bounded from entry; activity does not extend it.
         tracker.tick(super::ATTENTION_PULSE_SECS + 1.0);
         assert!(
             !tracker.needs_animation(&terminal),
@@ -860,14 +663,13 @@ mod tests {
         );
     }
 
-    // @lat: [[client#AI Indicator#stale_processing_is_cleared]]
-    #[test]
+    // @lat: [[client#GPUI AI Indicator#Stale processing is cleared]]
+    #[gpui::test]
     fn stale_processing_is_cleared() {
         let mut tracker = AiStateTracker::default();
         let terminal = TerminalConfig::default();
         let sid = SessionId::new();
         tracker.update(sid, AiProcessState::new(AiState::Processing));
-        // Simulate a dead AI: no liveness for longer than the clear window.
         tracker.last_activity_instant.insert(
             sid,
             Instant::now().checked_sub(STALE_PROCESSING_CLEAR + Duration::from_secs(1)).unwrap(),
@@ -884,8 +686,8 @@ mod tests {
         );
     }
 
-    // @lat: [[client#AI Indicator#fresh_processing_not_cleared]]
-    #[test]
+    // @lat: [[client#GPUI AI Indicator#Fresh processing is not cleared]]
+    #[gpui::test]
     fn fresh_processing_not_cleared() {
         let mut tracker = AiStateTracker::default();
         let terminal = TerminalConfig::default();
@@ -895,8 +697,8 @@ mod tests {
         assert!(tracker.needs_animation(&terminal), "fresh Processing must still be tracked");
     }
 
-    // @lat: [[client#AI Indicator#stale_attention_state_not_cleared]]
-    #[test]
+    // @lat: [[client#GPUI AI Indicator#Only processing is hard-cleared]]
+    #[gpui::test]
     fn stale_attention_state_not_cleared() {
         let mut tracker = AiStateTracker::default();
         let terminal = TerminalConfig::default();
@@ -913,8 +715,8 @@ mod tests {
         );
     }
 
-    // @lat: [[client#AI Indicator#activity_rearms_stale_processing]]
-    #[test]
+    // @lat: [[client#GPUI AI Indicator#Activity re-arms the stale-clear timer]]
+    #[gpui::test]
     fn activity_rearms_stale_processing() {
         let mut tracker = AiStateTracker::default();
         let sid = SessionId::new();
@@ -923,7 +725,6 @@ mod tests {
             sid,
             Instant::now().checked_sub(STALE_PROCESSING_CLEAR + Duration::from_secs(1)).unwrap(),
         );
-        // A sign of life before the prune runs must spare it.
         tracker.note_activity(sid);
         assert!(
             !tracker.clear_stale_processing(),
@@ -931,8 +732,50 @@ mod tests {
         );
     }
 
-    // @lat: [[client#AI Indicator#Context Survives State Clears#context_survives_stale_processing_clear]]
-    #[test]
+    // --- Priority ordering -------------------------------------------------
+
+    // @lat: [[client#GPUI AI Indicator#Workspace border takes the highest-priority state]]
+    #[gpui::test]
+    fn workspace_border_takes_highest_priority_state() {
+        let mut tracker = AiStateTracker::default();
+        let terminal = TerminalConfig::default();
+        let processing = SessionId::new();
+        let permission = SessionId::new();
+        let waiting = SessionId::new();
+        tracker.update(processing, AiProcessState::new(AiState::Processing));
+        tracker.update(waiting, AiProcessState::new(AiState::WaitingForInput));
+        tracker.update(permission, AiProcessState::new(AiState::PermissionPrompt));
+
+        // PermissionPrompt (priority 4) wins over WaitingForInput (3) and
+        // Processing (0), so the aggregated border colour is the permission
+        // entry's colour.
+        let sessions = [processing, waiting, permission];
+        let border = tracker
+            .workspace_border_color(&sessions, &ANSI_COLORS, &terminal)
+            .expect("some session drives the border");
+        let permission_only = tracker
+            .workspace_border_color(&[permission], &ANSI_COLORS, &terminal)
+            .expect("permission drives its own border");
+        assert_eq!(
+            border[0..3],
+            permission_only[0..3],
+            "the highest-priority state must own the workspace border colour"
+        );
+    }
+
+    // @lat: [[client#GPUI AI Indicator#Border colour drops decayed sessions]]
+    #[gpui::test]
+    fn workspace_border_none_without_active_sessions() {
+        let tracker = AiStateTracker::default();
+        let terminal = TerminalConfig::default();
+        let sid = SessionId::new(); // never inserted
+        assert_eq!(tracker.workspace_border_color(&[sid], &ANSI_COLORS, &terminal), None);
+    }
+
+    // --- Context store survives clears -------------------------------------
+
+    // @lat: [[client#GPUI AI Indicator#Context survives the stale-processing clear]]
+    #[gpui::test]
     fn context_survives_stale_processing_clear() {
         let mut tracker = AiStateTracker::default();
         let sid = SessionId::new();
@@ -947,51 +790,65 @@ mod tests {
             Some(85),
             "context must survive stale-state clear so percent stays visible"
         );
-        let thresholds = AiContextThresholds::default();
-        let suffix = tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR);
-        assert!(suffix.is_some(), "tab suffix must remain visible after stale clear");
-        assert_eq!(suffix.unwrap().0, " 85%");
-    }
-
-    // @lat: [[client#AI Indicator#Context Survives State Clears#context_survives_attention_keystroke_clear]]
-    #[test]
-    fn context_survives_attention_keystroke_clear() {
-        let mut tracker = AiStateTracker::default();
-        let sid = SessionId::new();
-        tracker.update(sid, make_state_with_ctx(AiState::WaitingForInput, 85));
-        tracker.clear_attention_states(sid);
-        assert_eq!(
-            tracker.context_for(sid),
-            Some(85),
-            "context must survive keystroke-driven attention clear"
+        assert!(
+            !tracker.context_suffix_suppressed(sid),
+            "with no state left, the suffix is no longer suppressed"
         );
-        let thresholds = AiContextThresholds::default();
-        let suffix = tracker.tab_context_suffix(sid, &thresholds, TEST_FALLBACK_COLOR);
-        assert!(suffix.is_some(), "tab suffix must reappear once the attention pulse is cleared");
-        assert_eq!(suffix.unwrap().0, " 85%");
     }
 
-    // @lat: [[client#AI Indicator#Context Survives State Clears#clear_context_wipes_for_conversation_change]]
-    #[test]
+    // @lat: [[client#GPUI AI Indicator#Context suffix suppressed during attention pulse]]
+    #[gpui::test]
+    fn context_suffix_suppressed_during_attention_states() {
+        let mut tracker = AiStateTracker::default();
+        let permission = SessionId::new();
+        let waiting = SessionId::new();
+        let processing = SessionId::new();
+        tracker.update(permission, make_state_with_ctx(AiState::PermissionPrompt, 85));
+        tracker.update(waiting, make_state_with_ctx(AiState::WaitingForInput, 85));
+        tracker.update(processing, make_state_with_ctx(AiState::Processing, 85));
+        assert!(tracker.context_suffix_suppressed(permission));
+        assert!(tracker.context_suffix_suppressed(waiting));
+        assert!(
+            !tracker.context_suffix_suppressed(processing),
+            "Processing does not suppress the tab context suffix"
+        );
+    }
+
+    // @lat: [[client#GPUI AI Indicator#Conversation change wipes the context]]
+    #[gpui::test]
     fn clear_context_wipes_for_conversation_change() {
         let mut tracker = AiStateTracker::default();
         let sid = SessionId::new();
         tracker.update(sid, make_state_with_ctx(AiState::Processing, 85));
         tracker.clear_context(sid);
-        assert_eq!(
-            tracker.context_for(sid),
-            None,
-            "conversation change must wipe the prior conversation's percent"
-        );
+        assert_eq!(tracker.context_for(sid), None);
     }
 
-    // @lat: [[client#AI Indicator#Context Survives State Clears#context_remove_clears_last_context]]
-    #[test]
+    // @lat: [[client#GPUI AI Indicator#Session removal drops the context]]
+    #[gpui::test]
     fn context_remove_clears_last_context() {
         let mut tracker = AiStateTracker::default();
         let sid = SessionId::new();
         tracker.update(sid, make_state_with_ctx(AiState::Processing, 85));
         tracker.remove(sid);
-        assert_eq!(tracker.context_for(sid), None, "session removal must drop stored context");
+        assert_eq!(tracker.context_for(sid), None);
+    }
+
+    // --- Border geometry ---------------------------------------------------
+
+    // @lat: [[client#GPUI AI Indicator#Pane border edges exclude the tab bar]]
+    #[gpui::test]
+    fn pane_border_edges_exclude_tab_bar() {
+        let pane = Rect { x: 10.0, y: 20.0, width: 200.0, height: 150.0 };
+        let tab_bar_height = 24.0;
+        let [top, bottom, left, right] = pane_border_edges(pane, tab_bar_height);
+        // Top strip starts below the tab bar.
+        assert!((top.y - (20.0 + 24.0)).abs() < f32::EPSILON);
+        assert!((top.width - 200.0).abs() < f32::EPSILON);
+        // Bottom strip sits at the pane's lower edge.
+        assert!((bottom.y - (20.0 + 150.0 - 2.0)).abs() < f32::EPSILON);
+        // Side strips are 2px wide and inset between top and bottom.
+        assert!((left.width - 2.0).abs() < f32::EPSILON);
+        assert!((right.x - (10.0 + 200.0 - 2.0)).abs() < f32::EPSILON);
     }
 }

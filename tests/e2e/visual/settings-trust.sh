@@ -2,7 +2,7 @@
 # Visual + scripted E2E test: the trusted-device, trusted-network, and
 # env-preflight controls of the GPUI settings window (fix unit FU-18).
 #
-# Runs the REAL settings window (`scribe-client-gpui --settings`, main.rs
+# Runs the REAL settings window (`scribe-client --settings`, main.rs
 # `run_settings`) against the REAL scribe-server, with the wire tap
 # (`scribe-test share-tap`, SCRIBE_SHARE_TAP=1) interposed on the server socket.
 # The settings window never registers a client connection — every server action

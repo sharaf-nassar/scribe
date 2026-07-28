@@ -201,7 +201,7 @@ tools/perf-ab-rig/run-perf-ab.sh
 # Launch gate: full A/B against both client binaries, recording the old
 # client's numbers into perf-baseline.md as it goes:
 tools/perf-ab-rig/run-perf-ab.sh --live \
-  --new-client target/release/scribe-client-gpui \
+  --new-client target/release/scribe-client \
   --old-client target/release/scribe-client \
   --scribe-test target/release/scribe-test --record-baseline
 ```

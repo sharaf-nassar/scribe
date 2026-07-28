@@ -87,6 +87,14 @@ deb-dev:
     cargo build --release
     cargo deb -p scribe-server --no-build --variant dev
 
+# Exercise Debian maintainer-script guards without touching a live install.
+test-install:
+    bash tests/install/postinst-regressions.sh
+
+# Run the Vulkan-less upgrade guard in a disposable Debian userspace.
+test-install-vulkan-guard:
+    docker run --rm --tmpfs /run -v "$(pwd):/repo:ro" debian:bookworm-slim bash /repo/tests/install/postinst-regressions.sh
+
 # Build and install .deb
 install: deb
     sudo dpkg -i $(find target/debian -name 'scribe_*.deb' -print -quit)

@@ -200,7 +200,7 @@ allow_attributes_without_reason = "deny"
 await_holding_lock = "deny"
 
 # Nursery (cherry-picked stable)
-# cognitive_complexity is disabled while the scribe-client-gpui rebuild is in
+# cognitive_complexity is disabled while the scribe-client rebuild is in
 # flight. Pulling the pinned gpui/alacritty client deps into the workspace
 # changes the unified feature set of shared dependencies (notably the tracing
 # logging macros), which inflates this nursery lint's per-function counts across
