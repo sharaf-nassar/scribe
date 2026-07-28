@@ -30,11 +30,10 @@ two runs existed to make scoreable: the parity go threshold. Every other oracle
 is green, including all five perf metrics and both manual rows, which have never
 all been green in the same run before.
 
-- **`just parity-gate` scores 189 of 194 user-facing rows reachable (97%)
-  against a threshold of 194 of 194 (100%).** Five `spec.md` requirements are
+- **`just parity-gate` scores 191 of 194 user-facing rows reachable (98%)
+  against a threshold of 194 of 194 (100%).** Three `spec.md` requirements are
   implemented but unreachable from the running client: server-upgrade reattach,
-  the AI indicator's painted half, pane dividers and drag-resize, the
-  workspace-notes hover preview, and the remote connect picker overlay
+  the workspace-notes hover preview, and the remote connect picker overlay
   (FU-24..FU-28). Filed this run as beads `scribe-38e.99`..`scribe-38e.103`.
 
 ## Oracle results
@@ -46,8 +45,8 @@ all been green in the same run before.
 | Func / lifecycle scripted E2E | every `tests/e2e/func/*.sh` in a rebuilt `scribe-test-func` image | ✅ **13 / 13 PASS, 0 FAIL** |
 | Perf A/B rig | `run-perf-ab.sh --live`, both clients built from this tree and probe-instrumented, same host and session, against `scribe-dev` | ✅ **PASS — all 5 of 5 metrics measured and inside budget** |
 | Reachability ratchet | `tools/check-reachability.sh --working-tree` | ✅ **PASS** — 62/66 modules wired, 54/59 server messages handled, 36/36 layout actions handled |
-| Parity drift check | `just parity-inventory` | ✅ **PASS** — 203 rows, 198 reachable, 3 unwired, 2 missing; all 48 spec register ids carried |
-| Parity go threshold | `just parity-gate` | ❌ **NO-GO** — 189 of 194 user-facing rows reachable (97%); the threshold is 194 of 194 |
+| Parity drift check | `just parity-inventory` | ✅ **PASS** — 203 rows, 200 reachable, 1 unwired, 2 missing; all 48 spec register ids carried |
+| Parity go threshold | `just parity-gate` | ❌ **NO-GO** — 191 of 194 user-facing rows reachable (98%); the threshold is 194 of 194 |
 | Manual rows | live driving on `:0` against the `scribe-dev` server | ✅ Opacity **PASS**; IME **PASS** |
 
 ### Prior blockers — all twelve confirmed resolved
@@ -69,17 +68,16 @@ all been green in the same run before.
 names each offending row:
 
 ```
-parity inventory: 203 rows, 198 reachable, 3 unwired, 2 missing
-  (194 user-facing, 188 reachable in-client, 48 spec requirements carried)
+parity inventory: 203 rows, 200 reachable, 1 unwired, 2 missing
+  (194 user-facing, 190 reachable in-client, 48 spec requirements carried)
 
-parity gate: NO-GO — 189 of 194 user-facing rows reachable (97%);
+parity gate: NO-GO — 191 of 194 user-facing rows reachable (98%);
   the threshold is 194 of 194.
 ```
 
 | Unreachable row | `spec.md` | Marker | Why it is not reachable | Bead |
 | --- | --- | --- | --- | --- |
 | Server-upgrade reattach | `US2-4` | missing | `main.rs::start_ipc_thread` awaits `run_connection` exactly once; when it returns nothing redials, so an `--upgrade` handoff leaves the window attached to nothing. `visual/reconnect.sh` relaunches the client *process* and does not cover it | `scribe-38e.99` |
-| AI indicator borders and tab tint | `US4-1` | unwired | `ai_indicator::{tab_indicator_color, workspace_border_color, pane_border_edges, tick, needs_animation, clear_stale_processing}` have no caller outside their module; AI state is tracked and never painted | `scribe-38e.100` |
 | Pane dividers and drag-resize | `US3-10` | wired | `TerminalView::render_dividers` paints `PaneShell::dividers`; the grid pointer path maps the divider drag to `PaneShell::set_pane_ratio` and republishes both grids | `scribe-38e.101` |
 | Workspace notes hover preview | `US4-3` | unwired | `workspace_notes_preview.rs` has no reference outside `lib.rs` and its own tests. The notes *modal* is wired; the hover preview is not | `scribe-38e.102` |
 | Remote connect picker overlay | `US4-4` | missing | `remote::RemoteConnect` models the picker and no GPUI view renders it; `refresh_remote_peers` surfaces a peer count on the status strip instead | `scribe-38e.103` |
@@ -175,7 +173,7 @@ Every row's own stated method was exercised this run.
 
 The six method counts sum to the inventory's 203 rows.
 
-A row's method passing is necessary but not sufficient: the five unreachable
+A row's method passing is necessary but not sufficient: the three unreachable
 rows above are carried by passing methods *and* are unreachable, which is what
 the "Reachable from" column and the go threshold exist to catch.
 

@@ -678,6 +678,8 @@ The GPUI rebuild ports the winit client's per-session AI state machine so pulsin
 
 The context-window percent is stored independently of the visible state ([[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#context_for]]) so it survives every state-pruning path; the pulse-suppression predicate ([[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#context_suffix_suppressed]]) is the `pulsing` argument for the tab suffix banding that now lives in [[crates/scribe-client-gpui/src/tab_bar.rs#context_suffix]]. The pulsing border geometry is [[crates/scribe-client-gpui/src/ai_indicator.rs#pane_border_edges]], which excludes the tab bar and reuses the shared [[crates/scribe-client-gpui/src/focus_border.rs#border_edges]] strip math; the GPUI paint path fills those rects with the aggregated colour. `AiStateChanged`/`AiStateCleared` are verified by the visual-E2E harness.
 
+[[crates/scribe-client-gpui/src/main.rs#TerminalView#sync_tabs]] supplies each tab's indicator and context suffix, while [[crates/scribe-client-gpui/src/main.rs#TerminalView#render_panes]] aggregates and paints each workspace border. The redraw and lifecycle ticks advance pulses and clear stale processing; PTY output re-arms liveness and encoded keystrokes clear attention states.
+
 ### Provider toggle gates the indicator
 
 Verifies [[crates/scribe-client-gpui/src/ai_indicator.rs#AiStateTracker#tab_indicator_color]] returns `None` for a provider disabled in `TerminalConfig`, so a toggled-off tool shows no indicator.

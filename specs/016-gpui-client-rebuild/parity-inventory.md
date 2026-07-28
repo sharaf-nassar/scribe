@@ -400,9 +400,9 @@ further requirements that are not reachable today.
 | Overlay and focus animations | `US3-6` | ≤150 ms interruptible easing | visual-E2E | `main.rs::main` and `main.rs::run_settings` → `animation::AnimationSettings::resolve` → `AnimationSettings::apply_to_app`, which installs the reduce-motion-aware durations every overlay animates against | required |
 | Custom titlebar with integrated tab bar | `US3-8` | window chrome | visual-E2E | `main.rs::TerminalView::build_titlebar` → `titlebar::TitlebarView`, rendered above the grid with `window_chrome` supplying the client-side decoration geometry — `tests/e2e/visual/titlebar.sh` | required |
 | Pane dividers and drag-resize | `US3-10` | divider paint and split resize | visual-E2E | `main.rs::TerminalView::render_dividers` → `PaneShell::dividers` → `divider::collect_dividers`; the grid pointer path claims the divider hit band, maps motion through `divider::drag_ratio`, then calls `PaneShell::set_pane_ratio` and republishes both grids — `tests/e2e/visual/pane-workspace-layout.sh` phase 5 | required |
-| Focused pane and workspace accent border | `US3-10` | focus indication | visual-E2E | `main.rs::TerminalView::render_panes` → `main.rs::pane_border` → the pane element's border colour, using the owning region's accent when focused. Note: the shared strip math in `focus_border::border_edges` is reached only from `ai_indicator::pane_border_edges`, which has no live caller — see the AI-indicator row | required |
-| AI indicator borders and tab tint | `US4-1` | pulsing borders, tab tint, stale-clear | visual-E2E | — (unwired) `ai_indicator::AiStateTracker::tab_indicator_color`, `workspace_border_color`, `tick`, `needs_animation`, `clear_stale_processing`, `note_activity`, `remember_provider`, `clear_attention_states` and `ai_indicator::pane_border_edges` have no caller outside `ai_indicator.rs`. `main.rs` reaches only `update`, `remove`, `clear_context`, `provider_for_session` and `context_for`, so AI state is tracked and never painted as a border or tab tint | required |
-| Prompt bar and tab context meter | `US4-1` | elapsed timer, context meter, dismiss/copy, `%` suffix | visual-E2E | `main.rs::TerminalView::build_prompt_model` → `prompt_bar::build_model` → `prompt_bar::render`; the tab suffix via `main.rs::TerminalView::sync_tab_context_suffix` → `tab_bar::context_suffix`, both fed by `ai_indicator::AiStateTracker::context_for` | required |
+| Focused pane and workspace accent border | `US3-10` | focus indication | visual-E2E | `main.rs::TerminalView::render_panes` → `main.rs::pane_border` → the pane element's border colour, using the owning region's accent when focused. The shared strip math in `focus_border::border_edges` also reaches the live AI border through `ai_indicator::pane_border_edges`. | required |
+| AI indicator borders and tab tint | `US4-1` | pulsing borders, tab tint, stale-clear | visual-E2E | `main.rs::on_ai_message` → `AiStateTracker::{update,remember_provider}`; `on_pane_output_message` → `note_activity`; `TerminalView::{tick_ai_animation,poll_window_lifecycle,on_key_down}` → `{tick,needs_animation,clear_stale_processing,clear_attention_states}`; `render_panes` aggregates `workspace_border_color` and paints `pane_border_edges`; `sync_tabs` feeds `tab_indicator_color` to `TitlebarView` — `tests/e2e/visual/ai-indicator.sh` | required |
+| Prompt bar and tab context meter | `US4-1` | elapsed timer, context meter, dismiss/copy, `%` suffix | visual-E2E | `main.rs::TerminalView::build_prompt_model` → `prompt_bar::build_model` → `prompt_bar::render`; the tab suffix via `main.rs::TerminalView::sync_tabs` → `tab_bar::context_suffix`, both fed by `ai_indicator::AiStateTracker::context_for` | required |
 | Workspace accent colours and badges | `US4-3` | region accents and status badges | visual-E2E | `main.rs::TerminalView::next_region_accent` → `PaneShell::split_workspace`, painted through `main.rs::pane_border`; the tmux/session/share badges via `status_bar::build_model` — `tests/e2e/visual/workspace-split.sh` | required |
 | Workspace notes hover preview | `US4-3` | hover preview over the notes affordance | visual-E2E | — (unwired) `workspace_notes_preview.rs` has no reference outside `lib.rs` and its own tests. The notes *modal* is wired (`workspace_notes_modal`), the hover preview is not. Recorded as `unwired-module workspace_notes_preview` in `tools/reachability-baseline.txt` | required |
 | Remote connect picker overlay | `US4-4` | peer picker UI | visual-E2E | — (missing) `remote::RemoteConnect` models the picker but no GPUI view renders it; `main.rs::TerminalView::refresh_remote_peers` surfaces the peer count on the status strip instead. Same gap the "LAN and sharing boundary" section records | required |
@@ -413,11 +413,10 @@ further requirements that are not reachable today.
 | Desktop notification dispatcher | `PO-9` | AI attention notifications | visual-E2E | `main.rs::TerminalView::start_notifications` → `notification_dispatcher::spawn_dispatcher` (the one D-Bus connection), gated by `notifications::NotificationCenter::on_ai_state_changed` against the live config and focus position; a reported click routes back to select the session's tab and raise the window — `tests/e2e/visual/notifications.sh` | required |
 | Server lifecycle management | `PO-10` | autostart, stale socket, staleness check | scripted-E2E | `main.rs::run_local_connection` → `server_lifecycle::connect_or_start_server`, which names a missing socket apart from a stale one and carries the diagnosis into the status line, then `server_lifecycle::connected_server_staleness` holds the connected server up against the installed binary — `tests/e2e/visual/server-lifecycle.sh` | required |
 
-**Reachability:** 25 of 29 rows name a live-path symbol; 2 are unwired and 2 are
-missing. The unwired two are the AI indicator's painted half and the
-workspace-notes hover preview; the missing two are server-upgrade reattach and
-the remote connect picker overlay. None of the original five had a row
-before 2026-07-27, so none was scored by the gate.
+**Reachability:** 26 of 29 rows name a live-path symbol; 1 is unwired and 2 are
+missing. The unwired row is the workspace-notes hover preview; the missing two
+are server-upgrade reattach and the remote connect picker overlay. None of the
+original five had a row before 2026-07-27, so none was scored by the gate.
 
 ## Removed configuration keys
 
@@ -459,20 +458,20 @@ with them. They are the launch gate's metric — not the unit-test count.
 | Server messages | 59 | 59 | 0 | 0 |
 | Input and keybinding actions | 54 | 54 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
-| Spec behaviour requirements | 29 | 25 | 2 | 2 |
+| Spec behaviour requirements | 29 | 26 | 1 | 2 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **203** | **199** | **2** | **2** |
+| **Total** | **203** | **200** | **1** | **2** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **194 rows, of which 190 are
-reachable (98%)** and 4 are not. **1 of those 194** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **194 rows, of which 191 are
+reachable (98%)** and 3 are not. **1 of those 194** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **189 of 194**.
+the in-client figure is **190 of 194**.
 
-The four remaining unreachable rows are in the spec-behaviour table and were
+The three remaining unreachable rows are in the spec-behaviour table and were
 invisible to the gate before 2026-07-27, because none had a row: server-upgrade
-reattach, the remote connect picker overlay, the AI indicator's painted half,
-and the workspace-notes hover preview.
+reattach, the remote connect picker overlay, and the workspace-notes hover
+preview.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

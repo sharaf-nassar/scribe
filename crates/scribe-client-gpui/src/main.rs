@@ -24,7 +24,7 @@ use gpui::{
     WindowHandle, WindowOptions, canvas, div, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
-use scribe_client_gpui::ai_indicator::AiStateTracker;
+use scribe_client_gpui::ai_indicator::{AiStateTracker, pane_border_edges};
 use scribe_client_gpui::animation::AnimationSettings;
 use scribe_client_gpui::bell::{BellController, BellEvent};
 use scribe_client_gpui::chrome_metadata::{ChromeMetadata, SessionChrome};
@@ -1374,13 +1374,26 @@ impl TerminalView {
     /// reconciles it on each redraw rather than being pushed to.
     fn sync_tabs(&mut self, cx: &mut Context<Self>) {
         let Ok(tabs) = self.shared.tabs.lock() else { return };
-        if *tabs == self.rendered_tabs {
-            return;
-        }
         self.rendered_tabs = tabs.clone();
         drop(tabs);
-        let data = self.rendered_tabs.to_tab_data();
-        self.titlebar.update(cx, |bar, ctx| bar.set_tabs(data, ctx));
+        let mut data = self.rendered_tabs.to_tab_data();
+        let terminal = &self.config.config().config.terminal;
+        let ansi = &self.config.config().theme.ansi_colors;
+        if let Ok(ai) = self.shared.ai.lock() {
+            for (tab, entry) in data.iter_mut().zip(self.rendered_tabs.tabs()) {
+                tab.ai_indicator = ai
+                    .tracker
+                    .tab_indicator_color(entry.session_id, ansi, terminal)
+                    .map(opaque_slot);
+                tab.context_suffix =
+                    tab_context_suffix_for(&ai.tracker, entry.session_id, &self.context_thresholds);
+            }
+        }
+        self.titlebar.update(cx, |bar, ctx| {
+            if bar.tabs() != data {
+                bar.set_tabs(data, ctx);
+            }
+        });
     }
 
     /// Run one [`LayoutAction`] intercepted from the key path.
@@ -2749,6 +2762,11 @@ impl TerminalView {
     /// thread, and the automation actions a `RunAction` queued are executed here
     /// because the entities they drive are owned by this thread too.
     fn poll_window_lifecycle(&mut self, cx: &mut Context<Self>) {
+        if let Ok(mut ai) = self.shared.ai.lock()
+            && ai.tracker.clear_stale_processing()
+        {
+            cx.notify();
+        }
         self.poll_bells(cx);
         self.poll_notifications(cx);
         self.poll_notification_clicks(cx);
@@ -2781,6 +2799,25 @@ impl TerminalView {
         self.poll_clipboard(cx);
         self.poll_remote_actions(cx);
         self.poll_restore(cx);
+    }
+
+    /// Advance an active AI pulse on the foreground redraw clock.
+    ///
+    /// The clock only asks GPUI for another frame while a visible state still
+    /// needs animation. Resting states remain painted but no longer keep a
+    /// window-wide redraw loop alive.
+    fn tick_ai_animation(&mut self, cx: &mut Context<Self>) {
+        let terminal = &self.config.config().config.terminal;
+        let animating = self.shared.ai.lock().is_ok_and(|mut ai| {
+            if !ai.tracker.needs_animation(terminal) {
+                return false;
+            }
+            ai.tracker.tick(0.016);
+            true
+        });
+        if animating {
+            cx.notify();
+        }
     }
 
     // -- Cold-restart restore and window geometry persistence -----------------
@@ -3722,6 +3759,31 @@ impl TerminalView {
         self.shared.panes.lock().ok()?.content(session_id)
     }
 
+    /// Resolve one animated AI border colour per workspace for this frame.
+    fn workspace_ai_borders(
+        &self,
+        placements: &[pane_shell::PanePlacement],
+    ) -> HashMap<WorkspaceId, gpui::Rgba> {
+        let mut sessions: HashMap<WorkspaceId, Vec<SessionId>> = HashMap::new();
+        for placement in placements {
+            if let Some(session_id) = placement.session_id {
+                sessions.entry(placement.workspace_id).or_default().push(session_id);
+            }
+        }
+        let terminal = &self.config.config().config.terminal;
+        let ansi = &self.config.config().theme.ansi_colors;
+        self.shared.ai.lock().ok().map_or_else(HashMap::new, |ai| {
+            sessions
+                .iter()
+                .filter_map(|(workspace_id, sessions)| {
+                    ai.tracker
+                        .workspace_border_color(sessions, ansi, terminal)
+                        .map(|color| (*workspace_id, opaque_slot(color)))
+                })
+                .collect()
+        })
+    }
+
     /// Lower the pane layout onto absolutely positioned grid elements.
     ///
     /// Positions are fractions of the grid area, so the split ratios the pure
@@ -3741,6 +3803,7 @@ impl TerminalView {
             return Vec::new();
         }
         let placements = self.shell.placements(viewport, cx);
+        let workspace_ai_borders = self.workspace_ai_borders(&placements);
         // Mint any missing scrollbar state before the render closure below
         // borrows `self` immutably. The state has to outlive the element (the
         // fade is a wall-clock animation across frames), so it lives here and
@@ -3779,6 +3842,7 @@ impl TerminalView {
                     pane =
                         pane.border_1().border_color(pane_border(&placement, idle_border, opacity));
                 }
+                let ai_border = workspace_ai_borders.get(&placement.workspace_id).copied();
                 // Only the focused pane publishes its painted bounds: they are
                 // what `cell_at` resolves a pointer against, and the mouse
                 // path acts on the focused pane.
@@ -3817,7 +3881,11 @@ impl TerminalView {
                 {
                     element = element.with_ime(ime);
                 }
-                pane.child(element.paint()).into_any_element()
+                let mut pane = pane.child(element.paint());
+                if let Some(color) = ai_border {
+                    pane = pane.children(ai_pane_border(placement.rect, color));
+                }
+                pane.into_any_element()
             })
             .collect()
     }
@@ -5052,6 +5120,12 @@ impl TerminalView {
             return;
         };
         tracing::debug!(key = %event.keystroke.key, "encoding a keystroke for the PTY");
+        if let Some(session_id) =
+            self.shared.active_session.lock().ok().and_then(|session| *session)
+            && let Ok(mut ai) = self.shared.ai.lock()
+        {
+            ai.tracker.clear_attention_states(session_id);
+        }
         // A keystroke that reaches the byte encoder was not consumed by the
         // input method, so any composition still on screen is stale. GPUI's
         // xkb-compose path makes this load-bearing: it marks a dead key as
@@ -5468,6 +5542,7 @@ async fn drive_redraws(
             let idle = view.update(app, |view, view_cx| {
                 view.expire_share_hint(view_cx);
                 view.poll_scrollbar_fades(view_cx);
+                view.tick_ai_animation(view_cx);
             });
             if idle.is_err() {
                 return;
@@ -5597,40 +5672,6 @@ impl TerminalView {
             )
         });
         prompt_bar::build_model(data, std::time::SystemTime::now(), indicator)
-    }
-
-    /// Push the attached pane's context-% suffix onto its tab, so the warn and
-    /// danger bands surface on the tab label as well as in the prompt bar.
-    fn sync_tab_context_suffix(&mut self, cx: &mut Context<Self>) {
-        let suffix = self.active_tab_context_suffix();
-        self.titlebar.update(cx, |bar, ctx| {
-            let mut tabs = bar.tabs().to_vec();
-            // The suffix belongs to the pane the meter was read from, which is
-            // the focused tab — not necessarily the first one now that the tab
-            // shortcuts can open and select several.
-            let Some(tab) = tabs.iter_mut().find(|tab| tab.is_active) else {
-                return;
-            };
-            if tab.context_suffix == suffix {
-                return;
-            }
-            tab.context_suffix = suffix;
-            bar.set_tabs(tabs, ctx);
-        });
-    }
-
-    /// The context-% suffix for the attached pane's tab, or `None` below the
-    /// warn band / while a pulsing attention state owns the UX.
-    fn active_tab_context_suffix(&self) -> Option<scribe_client_gpui::tab_bar::ContextSuffix> {
-        let session_id = (*self.shared.active_session.lock().ok()?)?;
-        let ai = self.shared.ai.lock().ok()?;
-        let percent = ai.tracker.context_for(session_id)?;
-        context_suffix(
-            percent,
-            self.context_thresholds.warn,
-            self.context_thresholds.danger,
-            ai.tracker.context_suffix_suppressed(session_id),
-        )
     }
 
     /// The invisible canvas that measures the grid band and republishes the
@@ -5807,7 +5848,6 @@ impl Render for TerminalView {
 
         let status_bar = self.render_status_bar(cx);
         let prompt_model = self.build_prompt_model();
-        self.sync_tab_context_suffix(cx);
         let prompt_colors = self.prompt_colors.with_opacity(self.opacity);
         let prompt_strip = prompt_model.map(|prompt| {
             prompt_bar::render(&prompt, &prompt_colors, f32::from(CELL_HEIGHT), None)
@@ -6909,7 +6949,11 @@ fn on_ai_message(ctx: &ReaderCtx, message: ServerMessage) {
                 ctx,
                 AiNotice::StateChanged { session_id, state: ai_state.state.clone() },
             );
-            update_ai_chrome(ctx, |ai| ai.tracker.update(session_id, ai_state));
+            update_ai_chrome(ctx, |ai| {
+                let provider = ai_state.provider;
+                ai.tracker.update(session_id, ai_state);
+                ai.tracker.remember_provider(session_id, provider);
+            });
         }
         ServerMessage::AiStateCleared { session_id } => {
             queue_ai_notice(ctx, AiNotice::Cleared { session_id });
@@ -7077,6 +7121,39 @@ fn pane_border(
     opacity: f32,
 ) -> gpui::Rgba {
     if placement.focused { surface(placement.accent, opacity) } else { idle }
+}
+
+/// Paintable AI border strips inset into one pane's local coordinate space.
+fn ai_pane_border(rect: Rect, color: gpui::Rgba) -> Vec<gpui::AnyElement> {
+    let local = Rect { x: 0.0, y: 0.0, width: rect.width, height: rect.height };
+    pane_border_edges(local, 0.0)
+        .into_iter()
+        .map(|edge| {
+            div()
+                .absolute()
+                .left(px(edge.x))
+                .top(px(edge.y))
+                .w(px(edge.width))
+                .h(px(edge.height))
+                .bg(color)
+                .into_any_element()
+        })
+        .collect()
+}
+
+/// Return the context suffix for one tab from its latest independent AI state.
+fn tab_context_suffix_for(
+    tracker: &AiStateTracker,
+    session_id: SessionId,
+    thresholds: &AiContextThresholds,
+) -> Option<scribe_client_gpui::tab_bar::ContextSuffix> {
+    let percent = tracker.context_for(session_id)?;
+    context_suffix(
+        percent,
+        thresholds.warn,
+        thresholds.danger,
+        tracker.context_suffix_suppressed(session_id),
+    )
 }
 
 /// Name, count, and warn about an action that was routed but has no handler.
@@ -7611,6 +7688,7 @@ fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage) {
                 // Perf gate: count drained bytes and close the echo round-trip
                 // clock before the frame queue takes ownership of the payload.
                 scribe_common::perf_probe::record_pty_output(session_id, data.len());
+                update_ai_chrome(ctx, |ai| ai.tracker.note_activity(session_id));
                 forward_output(&ctx.in_tx, session_id, data);
             }
         }
