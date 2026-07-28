@@ -1549,7 +1549,7 @@ A full UUID (with or without surrounding whitespace) parses to that `WindowId`; 
 
 ## GPUI Pane Dividers
 
-Covers the pure divider geometry in [[crates/scribe-client-gpui/src/divider.rs#collect_dividers]] and its drag-resize math — the renderer-independent core the GPUI solid-quad overlay consumes so pane resize handles behave identically to the winit client.
+Covers pure divider geometry in [[crates/scribe-client-gpui/src/divider.rs#collect_dividers]], live overlay wiring, and drag-resize math. `tests/e2e/visual/pane-workspace-layout.sh` drags the real divider and asserts both grids re-lay.
 
 ### Horizontal split divider is a centered vertical line
 

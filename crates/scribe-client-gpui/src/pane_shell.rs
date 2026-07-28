@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use gpui::{App, AppContext as _, Entity};
+use scribe_client_gpui::divider::{self, Divider};
 use scribe_client_gpui::layout::{
     FocusDirection, LayoutNode, LayoutTree, PaneId, Rect, SplitDirection,
 };
@@ -609,6 +610,32 @@ impl PaneShell {
             }
         }
         out
+    }
+
+    /// Resolve every live pane divider against the grid viewport.
+    ///
+    /// The pane trees own their ratios while this shell owns their regions, so
+    /// the running view gets both pieces here rather than reimplementing the
+    /// tree traversal beside its paint code.
+    pub fn dividers(&self, viewport: Rect, cx: &App) -> Vec<Divider> {
+        let workspace = self.workspace.read(cx);
+        workspace
+            .layout()
+            .compute_workspace_rects(viewport)
+            .into_iter()
+            .flat_map(|(workspace_id, region)| {
+                self.trees.get(&workspace_id).into_iter().flat_map(move |tree| {
+                    divider::collect_dividers(tree.read(cx).tree().root(), region)
+                })
+            })
+            .collect()
+    }
+
+    /// Set the split ratio containing `pane_id` and report whether it changed.
+    pub fn set_pane_ratio(&mut self, pane_id: PaneId, ratio: f32, cx: &mut App) -> bool {
+        let Some(workspace_id) = self.region_of(pane_id, cx) else { return false };
+        let Some(tree) = self.trees.get(&workspace_id).cloned() else { return false };
+        tree.update(cx, |pane_tree, ctx| pane_tree.set_ratio(pane_id, ratio, ctx))
     }
 
     /// Total number of live panes across every region.

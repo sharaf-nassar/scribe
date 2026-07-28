@@ -70,6 +70,10 @@ INK_DELTA_MIN="${INK_DELTA_MIN:-150}"
 # grids and draws the focus ring, which is far more than this.
 SPLIT_DIFF_MIN="${SPLIT_DIFF_MIN:-2000}"
 
+# A divider drag moves a 1px line plus pane borders; resize logs below prove
+# the two PTYs re-laid, so this lower image threshold only catches no repaint.
+DIVIDER_DIFF_MIN="${DIVIDER_DIFF_MIN:-500}"
+
 WIN_X=0
 WIN_Y=0
 WIN_W=0
@@ -314,25 +318,58 @@ if ! wait_for_log_growth "focused pane moved" "$CYCLE_BEFORE" 15; then
 fi
 echo "PHASE 4 PASS: ctrl+Tab cycled pane focus"
 
-# ── Phase 5: Ctrl+Shift+W closes the focused pane ────────────────
+# ── Phase 5: drag the visible divider and re-lay both grids ──────
+# The split from phase 1 is side by side, so its divider starts at the grid
+# midpoint. Dragging it right must change both live grids' published widths;
+# merely drawing a line or changing a client-only model cannot satisfy this.
+focus
+shot /output/05-before-divider-drag.png
+DIVIDER_RESIZES_BEFORE=$(plain_client_log | grep -cF "published a pane's grid size" || true)
+GRID_H=$(( WIN_H - TITLEBAR_H - BOTTOM_BANDS_H ))
+DIVIDER_X=$(( WIN_X + WIN_W / 2 ))
+DIVIDER_Y=$(( WIN_Y + TITLEBAR_H + GRID_H / 2 ))
+DRAG_X=$(( DIVIDER_X + WIN_W / 6 ))
+xdotool mousemove --sync "$DIVIDER_X" "$DIVIDER_Y"
+xdotool mousedown 1
+xdotool mousemove --sync "$DRAG_X" "$DIVIDER_Y"
+xdotool mouseup 1
+sleep 1.5
+focus
+shot /output/06-after-divider-drag.png
+DIVIDER_RESIZES_AFTER=$(plain_client_log | grep -cF "published a pane's grid size" || true)
+if [ "$DIVIDER_RESIZES_AFTER" -lt $(( DIVIDER_RESIZES_BEFORE + 2 )) ]; then
+    fail "PHASE 5 FAIL: divider drag did not republish both grids ($DIVIDER_RESIZES_BEFORE -> $DIVIDER_RESIZES_AFTER)"
+fi
+WIDE_GRID=$(plain_client_log | grep -cE "published a pane's grid size.*cols=(7[0-9]|8[0-9]) " || true)
+NARROW_GRID=$(plain_client_log | grep -cE "published a pane's grid size.*cols=(3[0-9]|4[0-9]) " || true)
+if [ "$WIDE_GRID" -lt 1 ] || [ "$NARROW_GRID" -lt 1 ]; then
+    fail "PHASE 5 FAIL: divider drag never produced wide and narrow grid sizes"
+fi
+DIVIDER_DIFF=$(window_diff /output/05-before-divider-drag.png /output/06-after-divider-drag.png)
+if [ "${DIVIDER_DIFF:-0}" -lt "$DIVIDER_DIFF_MIN" ]; then
+    fail "PHASE 5 FAIL: divider drag changed $DIVIDER_DIFF px (min $DIVIDER_DIFF_MIN)"
+fi
+echo "PHASE 5 PASS: dragged live divider (+$DIVIDER_DIFF px; both grids re-laid)"
+
+# ── Phase 6: Ctrl+Shift+W closes the focused pane ────────────────
 CLOSES_BEFORE=$(count_log "closed the focused pane")
 SERVER_CLOSES_BEFORE=$(count_server_log "session closed by client")
 focus
 send_keys ctrl+shift+w
 if ! wait_for_log_growth "closed the focused pane" "$CLOSES_BEFORE" 15; then
-    fail "PHASE 5 FAIL: ctrl+shift+w never reached close_pane"
+    fail "PHASE 6 FAIL: ctrl+shift+w never reached close_pane"
 fi
 # The client's line proves the layout dropped the pane; the server's proves the
 # CloseSession it sent crossed the wire and ended that pane's shell.
 if ! wait_for_server_log_growth "session closed by client" "$SERVER_CLOSES_BEFORE" 15; then
-    fail "PHASE 5 FAIL: the server never saw a CloseSession for the closed pane"
+    fail "PHASE 6 FAIL: the server never saw a CloseSession for the closed pane"
 fi
 sleep 1.0
 focus
 shot /output/05-after-close.png
-echo "PHASE 5 PASS: ctrl+shift+w closed the pane end to end (client layout, server session)"
+echo "PHASE 6 PASS: ctrl+shift+w closed the pane end to end (client layout, server session)"
 
-# ── Phase 6: Ctrl+Alt+\ splits the window into two regions ───────
+# ── Phase 7: Ctrl+Alt+\ splits the window into two regions ───────
 # The workspace layer is a different family from the pane splits above: it
 # splits the WINDOW, and each region carries its own pane tree.
 WS_SPLITS_BEFORE=$(count_log "split the window into a new workspace region")
@@ -340,30 +377,30 @@ focus
 shot /output/06-before-workspace-split.png
 send_keys ctrl+alt+backslash
 if ! wait_for_log_growth "split the window into a new workspace region" "$WS_SPLITS_BEFORE" 15; then
-    fail "PHASE 6 FAIL: ctrl+alt+backslash never reached workspace_split_vertical"
+    fail "PHASE 7 FAIL: ctrl+alt+backslash never reached workspace_split_vertical"
 fi
 sleep 1.5
 focus
 shot /output/07-after-workspace-split.png
 WS_DIFF=$(window_diff /output/06-before-workspace-split.png /output/07-after-workspace-split.png)
 if [ "${WS_DIFF:-0}" -lt "$SPLIT_DIFF_MIN" ]; then
-    fail "PHASE 6 FAIL: the workspace split changed $WS_DIFF px (min $SPLIT_DIFF_MIN)"
+    fail "PHASE 7 FAIL: the workspace split changed $WS_DIFF px (min $SPLIT_DIFF_MIN)"
 fi
 if ! plain_client_log | grep -qE 'split the window into a new workspace region.*regions=2'; then
-    fail "PHASE 6 FAIL: the window layout never reported two workspace regions"
+    fail "PHASE 7 FAIL: the window layout never reported two workspace regions"
 fi
-echo "PHASE 6 PASS: ctrl+alt+backslash split the window into two regions (+$WS_DIFF px)"
+echo "PHASE 7 PASS: ctrl+alt+backslash split the window into two regions (+$WS_DIFF px)"
 
-# ── Phase 7: Ctrl+Alt+Left moves focus between regions ───────────
+# ── Phase 8: Ctrl+Alt+Left moves focus between regions ───────────
 WS_FOCUS_BEFORE=$(count_log "focused workspace moved")
 focus
 send_keys "$WORKSPACE_FOCUS_LEFT_CHORD"
 if ! wait_for_log_growth "focused workspace moved" "$WS_FOCUS_BEFORE" 15; then
-    fail "PHASE 7 FAIL: $WORKSPACE_FOCUS_LEFT_CHORD never reached workspace_focus_left"
+    fail "PHASE 8 FAIL: $WORKSPACE_FOCUS_LEFT_CHORD never reached workspace_focus_left"
 fi
 focus
 shot /output/08-workspace-focus-left.png
-echo "PHASE 7 PASS: $WORKSPACE_FOCUS_LEFT_CHORD moved focus to the first workspace region"
+echo "PHASE 8 PASS: $WORKSPACE_FOCUS_LEFT_CHORD moved focus to the first workspace region"
 
 echo ""
 echo "PASS: visual pane-workspace-layout test"
@@ -373,7 +410,9 @@ echo "    01-before-split.png            — the window before split_vertical"
 echo "    02-after-split.png             — two panes side by side"
 echo "    03-typed-right.png             — a marker typed into the new right pane"
 echo "    04-typed-left.png              — a marker typed after focus_left"
+echo "    05-before-divider-drag.png     — the divider before drag-resize"
+echo "    06-after-divider-drag.png      — both grids after drag-resize"
 echo "    05-after-close.png             — back to one pane after close_pane"
 echo "    06-before-workspace-split.png  — the window before the workspace split"
 echo "    07-after-workspace-split.png   — two workspace regions"
-echo "    08-workspace-focus-left.png    — focus back in the first region"
+echo "    08-workspace-focus-left.png    — focus back in the first workspace region"

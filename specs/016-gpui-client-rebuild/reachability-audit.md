@@ -377,15 +377,14 @@ from `spec.md`'s requirement register rather than from the legacy client's IPC
 and keybinding surface.
 
 Verdicts are measured against `main` at `c50724b`, using the same live-path
-definitions as the `f56ef95` census. Twenty-four are WIRED and are not restated
+definitions as the `f56ef95` census. Twenty-five are WIRED and are not restated
 row by row — `parity-inventory.md` names each one's live-path chain and its
-oracle. The five that are not reachable are the finding:
+oracle. The four that are not reachable are the finding:
 
 | Requirement row | spec.md | Verdict | Evidence |
 | --- | --- | --- | --- |
 | Server-upgrade reattach | `US2-4` | MISSING | `main.rs::start_ipc_thread` awaits `run_connection` exactly once; when it returns the thread publishes a status line and exits. No redial path exists, so an `--upgrade` handoff leaves the window attached to nothing. `tests/e2e/visual/reconnect.sh` relaunches the client *process*, so it never exercised this |
 | Remote connect picker overlay | `US4-4` | MISSING | `remote::RemoteConnect` is ported and unit-tested; no GPUI view renders it. `main.rs::TerminalView::refresh_remote_peers` puts the peer count on the status strip instead. Already noted as a presentation gap in `parity-inventory.md`'s "LAN and sharing boundary", which could not cost a row while no row existed |
-| Pane dividers and drag-resize | `US3-10` | UNWIRED | `divider.rs` has no reference outside `lib.rs` and its own tests; `tools/reachability-baseline.txt` lists `unwired-module divider` |
 | AI indicator borders and tab tint | `US4-1` | UNWIRED | `ai_indicator::AiStateTracker::tab_indicator_color`, `workspace_border_color`, `tick`, `needs_animation`, `clear_stale_processing`, `note_activity`, `remember_provider`, `clear_attention_states` and `ai_indicator::pane_border_edges` have no caller outside `ai_indicator.rs`. `main.rs` reaches only `update`, `remove`, `clear_context`, `provider_for_session` and `context_for`. The module is *imported*, so the module-level ratchet counts it wired while the painted half is unreachable |
 | Workspace notes hover preview | `US4-3` | UNWIRED | `workspace_notes_preview.rs` has no reference outside `lib.rs` and its own tests; `tools/reachability-baseline.txt` lists `unwired-module workspace_notes_preview` |
 
@@ -396,7 +395,7 @@ reachability is a floor, not a substitute for a per-requirement row — the same
 distinction the `f56ef95` census drew between a green `#[gpui::test]` and a live
 call site, one level up.
 
-**Requirement-derived subtotals:** WIRED 24 · UNWIRED 3 · MISSING 2 · UNKNOWN 0.
+**Requirement-derived subtotals:** WIRED 25 · UNWIRED 2 · MISSING 2 · UNKNOWN 0.
 
 ## Summary
 
@@ -625,14 +624,14 @@ The whole of features 013/014/015 is unreachable from the GPUI client.
 
 ### P1 — requirement-derived gaps (added 2026-07-27)
 
-These five units come from the widened census above. None was reachable by the
+These four remaining units come from the widened census above. None was reachable by the
 `f56ef95` method, because none of their requirements had a parity row.
 
 - **FU-24 Server-upgrade reattach.** Row: `Server-upgrade reattach` (`US2-4`).
   `start_ipc_thread` must supervise `run_connection` rather than await it once:
   redial with backoff when the stream closes, re-send `Hello` / `ListSessions`,
   and rebuild the topology through the existing `on_session_list` path. Highest
-  priority of the five — it is the only one that breaks the multiplexer promise
+  priority of the four — it is the only one that breaks the multiplexer promise
   US2 is built on, and it fails silently on every server upgrade.
 - **FU-25 AI indicator painting.** Row: `AI indicator borders and tab tint`
   (`US4-1`). The tracker's state half is wired and its painted half is not:
@@ -640,9 +639,6 @@ These five units come from the widened census above. None was reachable by the
   `needs_animation` and `clear_stale_processing` need call sites on the render
   path and the idle tick. This is a differentiating feature, and the module
   ratchet cannot see it because `ai_indicator` is imported.
-- **FU-26 Pane dividers and drag-resize.** Row: `Pane dividers and drag-resize`
-  (`US3-10`). `divider.rs` needs a quad overlay in the pane shell and a pointer
-  path that maps a drag back to a split ratio.
 - **FU-27 Workspace notes hover preview.** Row: `Workspace notes hover preview`
   (`US4-3`). `workspace_notes_preview.rs` needs a hover trigger and a view; the
   notes modal it complements is already wired.
