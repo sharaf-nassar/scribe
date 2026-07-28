@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>Scribe</string>
     <key>CFBundleExecutable</key>
-    <string>scribe-client</string>
+    <string>scribe-client-gpui</string>
     <key>CFBundleIconFile</key>
     <string>Scribe.icns</string>
     <key>CFBundleIdentifier</key>

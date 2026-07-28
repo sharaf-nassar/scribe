@@ -85,13 +85,11 @@ The shared `release.sh` wrapper keeps release-note generation noninteractive so 
 
 `tools/release-me/release.sh` invokes Codex with CI/no-colour terminal environment and, when `setsid` is available, runs the background `codex exec` in a fresh session without a controlling terminal. This prevents Codex's `/dev/tty` colour and cursor probes from being answered into the parent script's later `read -rp` prompts.
 
-The macOS release workflow is deliberately disabled during the GPUI cutover:
-the release matrix contains Linux targets only, and the visible macOS job is
-skipped. It therefore cannot run `dist/macos/build-dmg.sh` or
-`dist/ci/sign-notarize-macos.sh`, while Linux releases remain publishable.
-The macOS GPUI port and restoration of signed, notarized DMGs are tracked by
-bead `scribe-38e.104`; until it lands, this is an intentional deferral rather
-than a red pipeline.
+The release matrix builds the GPUI client on Apple Silicon and Intel macOS
+runners. Each macOS job stages the GPUI executable with its server and
+helpers, produces a DMG, signs it, submits it for notarization, staples the
+accepted ticket, then minisigns the release artifact. Linux `.deb` releases
+continue through the same artifact and publish path.
 
 Release CI disables `Swatinem/rust-cache` caching for `~/.cargo/bin` and uses a cache prefix that excludes older bin-cached archives. This prevents restored caches from replacing the runner's `cargo` shim with unrelated binaries before the release build starts.
 
