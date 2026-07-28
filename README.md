@@ -52,7 +52,6 @@ Crash your terminal, lose every shell. Update it, same story. Scribe splits the 
 
 - Rust 1.95+
 - Linux: `libgtk-4-dev`, `libvulkan-dev`
-- macOS: Xcode Command Line Tools
 
 ### Build from source
 
@@ -75,11 +74,11 @@ just client     # launch the GPU client
 just install    # builds, packages .deb, and installs
 ```
 
-### Install on macOS
+### macOS availability
 
-```bash
-just dmg        # builds .app bundle and .dmg installer
-```
+macOS builds, DMG packaging, signing, and notarization are intentionally
+deferred during the GPUI cutover. Release CI skips them until the tracked
+macOS GPUI port is complete.
 
 ## Configuration
 
