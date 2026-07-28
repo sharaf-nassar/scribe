@@ -377,16 +377,17 @@ from `spec.md`'s requirement register rather than from the legacy client's IPC
 and keybinding surface.
 
 Verdicts are measured against `main` at `c50724b`, using the same live-path
-definitions as the `f56ef95` census. Twenty-six are WIRED and are not restated
+definitions as the `f56ef95` census. Twenty-seven are WIRED and are not restated
 row by row — `parity-inventory.md` names each one's live-path chain and its
-oracle. The three that are not reachable are the finding:
+oracle. The two that are not reachable are the finding:
 
 | Requirement row | spec.md | Verdict | Evidence |
 | --- | --- | --- | --- |
 | Server-upgrade reattach | `US2-4` | MISSING | `main.rs::start_ipc_thread` awaits `run_connection` exactly once; when it returns the thread publishes a status line and exits. No redial path exists, so an `--upgrade` handoff leaves the window attached to nothing. `tests/e2e/visual/reconnect.sh` relaunches the client *process*, so it never exercised this |
 | Remote connect picker overlay | `US4-4` | MISSING | `remote::RemoteConnect` is ported and unit-tested; no GPUI view renders it. `main.rs::TerminalView::refresh_remote_peers` puts the peer count on the status strip instead. Already noted as a presentation gap in `parity-inventory.md`'s "LAN and sharing boundary", which could not cost a row while no row existed |
 | AI indicator borders and tab tint | `US4-1` | WIRED | `main.rs::on_ai_message` updates and remembers provider state; `on_pane_output_message`, the redraw/lifecycle ticks, and the key path drive activity, animation, stale clear, and attention clear. `TerminalView::{sync_tabs,render_panes}` paint the tab indicator and workspace border through `pane_border_edges`; `tests/e2e/visual/ai-indicator.sh` drives the real hook and asserts both pixel surfaces. |
-| Workspace notes hover preview | `US4-3` | UNWIRED | `workspace_notes_preview.rs` has no reference outside `lib.rs` and its own tests; `tools/reachability-baseline.txt` lists `unwired-module workspace_notes_preview` |
+| Pane dividers and drag-resize | `US3-10` | WIRED | `TerminalView::render_dividers` paints `PaneShell::dividers`; the grid pointer path maps the divider drag to `PaneShell::set_pane_ratio` and republishes both grids. |
+| Workspace notes hover preview | `US4-3` | WIRED | The titlebar notes affordance emits `WorkspaceNotesHover`; `TerminalView::set_workspace_notes_preview` creates and renders `WorkspaceNotesPreviewView`; `tests/e2e/visual/workspace-notes.sh` hovers it and asserts the preview pixels. |
 
 Two of these were invisible to *both* gates. `ai_indicator` is imported by
 `main.rs`, so the module ratchet in `tools/check-reachability.sh` scores it
@@ -395,7 +396,7 @@ reachability is a floor, not a substitute for a per-requirement row — the same
 distinction the `f56ef95` census drew between a green `#[gpui::test]` and a live
 call site, one level up.
 
-**Requirement-derived subtotals:** WIRED 26 · UNWIRED 1 · MISSING 2 · UNKNOWN 0.
+**Requirement-derived subtotals:** WIRED 27 · UNWIRED 0 · MISSING 2 · UNKNOWN 0.
 
 ## Summary
 
@@ -639,9 +640,6 @@ These four remaining units come from the widened census above. None was reachabl
   `needs_animation` and `clear_stale_processing` need call sites on the render
   path and the idle tick. This is a differentiating feature, and the module
   ratchet cannot see it because `ai_indicator` is imported.
-- **FU-27 Workspace notes hover preview.** Row: `Workspace notes hover preview`
-  (`US4-3`). `workspace_notes_preview.rs` needs a hover trigger and a view; the
-  notes modal it complements is already wired.
 - **FU-28 Remote connect picker overlay.** Row: `Remote connect picker overlay`
   (`US4-4`). `remote::RemoteConnect` needs a GPUI view so the peer lists reach a
   picker rather than a status-strip count.

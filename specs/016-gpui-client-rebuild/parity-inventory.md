@@ -404,7 +404,7 @@ further requirements that are not reachable today.
 | AI indicator borders and tab tint | `US4-1` | pulsing borders, tab tint, stale-clear | visual-E2E | `main.rs::on_ai_message` → `AiStateTracker::{update,remember_provider}`; `on_pane_output_message` → `note_activity`; `TerminalView::{tick_ai_animation,poll_window_lifecycle,on_key_down}` → `{tick,needs_animation,clear_stale_processing,clear_attention_states}`; `render_panes` aggregates `workspace_border_color` and paints `pane_border_edges`; `sync_tabs` feeds `tab_indicator_color` to `TitlebarView` — `tests/e2e/visual/ai-indicator.sh` | required |
 | Prompt bar and tab context meter | `US4-1` | elapsed timer, context meter, dismiss/copy, `%` suffix | visual-E2E | `main.rs::TerminalView::build_prompt_model` → `prompt_bar::build_model` → `prompt_bar::render`; the tab suffix via `main.rs::TerminalView::sync_tabs` → `tab_bar::context_suffix`, both fed by `ai_indicator::AiStateTracker::context_for` | required |
 | Workspace accent colours and badges | `US4-3` | region accents and status badges | visual-E2E | `main.rs::TerminalView::next_region_accent` → `PaneShell::split_workspace`, painted through `main.rs::pane_border`; the tmux/session/share badges via `status_bar::build_model` — `tests/e2e/visual/workspace-split.sh` | required |
-| Workspace notes hover preview | `US4-3` | hover preview over the notes affordance | visual-E2E | — (unwired) `workspace_notes_preview.rs` has no reference outside `lib.rs` and its own tests. The notes *modal* is wired (`workspace_notes_modal`), the hover preview is not. Recorded as `unwired-module workspace_notes_preview` in `tools/reachability-baseline.txt` | required |
+| Workspace notes hover preview | `US4-3` | hover preview over the notes affordance | visual-E2E | `titlebar::TitlebarView` emits `WorkspaceNotesHover` from its notes affordance → `main.rs::TerminalView::set_workspace_notes_preview` creates `workspace_notes_preview::WorkspaceNotesPreviewView`, requests the server snapshot, and renders it on the live overlay layer — `tests/e2e/visual/workspace-notes.sh` | required |
 | Remote connect picker overlay | `US4-4` | peer picker UI | visual-E2E | — (missing) `remote::RemoteConnect` models the picker but no GPUI view renders it; `main.rs::TerminalView::refresh_remote_peers` surfaces the peer count on the status strip instead. Same gap the "LAN and sharing boundary" section records | required |
 | Status bar segments | `US4-5` | full segment set | visual-E2E | `main.rs::TerminalView::build_status_model` → `status_bar::build_model` → `status_bar::render`, with the CPU/mem/GPU/net sparklines fed by `sys_stats::SystemStatsCollector` — `tests/e2e/visual/window-chrome-bands.sh` | required |
 | xterm-256 palette | `PO-1` | indexed colour resolution | golden | `main.rs` builds one `color::TerminalColors` per theme, which owns `palette::ColorPalette`; `TerminalColors::resolve_color` resolves every indexed cell on the paint path. `tools/reachability-baseline.txt` lists `palette` as an unwired *module* because that ratchet counts only `main.rs`'s direct import closure — the module is reached transitively through `color` | required |
@@ -413,10 +413,9 @@ further requirements that are not reachable today.
 | Desktop notification dispatcher | `PO-9` | AI attention notifications | visual-E2E | `main.rs::TerminalView::start_notifications` → `notification_dispatcher::spawn_dispatcher` (the one D-Bus connection), gated by `notifications::NotificationCenter::on_ai_state_changed` against the live config and focus position; a reported click routes back to select the session's tab and raise the window — `tests/e2e/visual/notifications.sh` | required |
 | Server lifecycle management | `PO-10` | autostart, stale socket, staleness check | scripted-E2E | `main.rs::run_local_connection` → `server_lifecycle::connect_or_start_server`, which names a missing socket apart from a stale one and carries the diagnosis into the status line, then `server_lifecycle::connected_server_staleness` holds the connected server up against the installed binary — `tests/e2e/visual/server-lifecycle.sh` | required |
 
-**Reachability:** 26 of 29 rows name a live-path symbol; 1 is unwired and 2 are
-missing. The unwired row is the workspace-notes hover preview; the missing two
-are server-upgrade reattach and the remote connect picker overlay. None of the
-original five had a row before 2026-07-27, so none was scored by the gate.
+**Reachability:** 27 of 29 rows name a live-path symbol; 0 are unwired and 2 are
+missing: server-upgrade reattach and the remote connect picker overlay. None of
+the original five had a row before 2026-07-27, so none was scored by the gate.
 
 ## Removed configuration keys
 
@@ -458,20 +457,18 @@ with them. They are the launch gate's metric — not the unit-test count.
 | Server messages | 59 | 59 | 0 | 0 |
 | Input and keybinding actions | 54 | 54 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
-| Spec behaviour requirements | 29 | 26 | 1 | 2 |
+| Spec behaviour requirements | 29 | 27 | 0 | 2 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **203** | **200** | **1** | **2** |
+| **Total** | **203** | **201** | **0** | **2** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **194 rows, of which 191 are
-reachable (98%)** and 3 are not. **1 of those 194** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **194 rows, of which 192 are
+reachable (99%)** and 2 are not. **1 of those 194** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **190 of 194**.
+the in-client figure is **191 of 194**.
 
-The three remaining unreachable rows are in the spec-behaviour table and were
-invisible to the gate before 2026-07-27, because none had a row: server-upgrade
-reattach, the remote connect picker overlay, and the workspace-notes hover
-preview.
+The two unreachable rows are in the spec-behaviour table: server-upgrade
+reattach and the remote connect picker overlay.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth
