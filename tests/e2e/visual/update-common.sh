@@ -20,7 +20,7 @@ API_PID=""
 
 # Window size the rig drives. Both bottom bands are on screen at the default
 # window size now that it is derived from the grid plus the chrome bands (see
-# crates/scribe-client-gpui/src/window_chrome.rs); the rig still grows the
+# crates/scribe-client/src/window_chrome.rs); the rig still grows the
 # window so the status bar's left and right groups spread apart and leave the
 # centred CTA — the only band these tests diff — clear space of its own.
 WINDOW_W=1280

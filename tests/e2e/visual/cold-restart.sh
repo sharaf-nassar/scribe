@@ -9,7 +9,7 @@
 # protocol client with no window, no layout and no restore store, so a test that
 # stops and starts it proves only that the SERVER keeps sessions alive (which is
 # what tests/e2e/func/cold-restart.sh still covers). Everything asserted below
-# is produced by `scribe-client-gpui` itself.
+# is produced by `scribe-client` itself.
 #
 # A cold restart is the crash case, so the test reproduces it literally:
 #   * SIGKILL the client, so nothing on the exit path can tidy up after it —
@@ -116,7 +116,7 @@ send_keys() {
 wait_for_client_exit() {
     local timeout_secs="$1" started
     started=$(date +%s)
-    while pgrep -f 'scribe-client-gpui' >/dev/null 2>&1; do
+    while pgrep -f 'scribe-client' >/dev/null 2>&1; do
         if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
             return 1
         fi
@@ -126,7 +126,7 @@ wait_for_client_exit() {
 }
 
 launch_client() {
-    scribe-client-gpui >>"$CLIENT_LOG" 2>&1 &
+    scribe-client >>"$CLIENT_LOG" 2>&1 &
     xdotool search --sync --name "Scribe" >/dev/null 2>&1 || true
     sleep 2
 }
@@ -210,7 +210,7 @@ echo "PHASE 2 PASS: the geometry record followed the resize (${SAVED_W}x${SAVED_
 # The server is then genuinely restarted, so both PTYs die with it — that empty
 # `SessionList` is the only condition under which a snapshot may be replayed.
 PTYS_BEFORE=$(count_server_log "created new PTY session")
-pkill -KILL -f 'scribe-client-gpui' || true
+pkill -KILL -f 'scribe-client' || true
 wait_for_client_exit 15 || fail "PHASE 3: the client survived SIGKILL"
 [ -f "$RESTORE_DIR/index.toml" ] || fail "PHASE 3: the crash took the restore index with it"
 scribe-test server stop

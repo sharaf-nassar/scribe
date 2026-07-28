@@ -80,7 +80,7 @@ ignore = [
   # Owner: Scribe maintainers. Review by 2026-10-01 or when the gpui pin moves to
   # patched transitive versions.
   # The following are all pulled transitively by the pinned gpui git dependency
-  # for the scribe-client-gpui rebuild spike:
+  # for the scribe-client rebuild spike:
   "RUSTSEC-2026-0190", # anyhow — Error::downcast_mut() unsoundness (via gpui)
   "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained (build-time proc-macro)
   "RUSTSEC-2026-0097", # rand — unsoundness with a custom logger using rng()

@@ -2,49 +2,42 @@
 //!
 //! One dedicated thread owns one session-bus connection, one
 //! `org.freedesktop.Notifications` proxy, and the two signal streams
-//! (`ActionInvoked`, `NotificationClosed`) for every notification this
-//! client ever fires. State for live notifications lives in two
-//! `HashMap`s keyed by `SessionId` and the daemon-assigned notification
-//! id.
+//! (`ActionInvoked`, `NotificationClosed`) for every notification this client
+//! ever fires. Live notification state lives in [`NotifState`], keyed both by
+//! `SessionId` and the daemon-assigned notification id.
 //!
-//! Repeated state changes for the same session reuse `replaces_id` so
-//! the daemon atomically swaps the existing toast in place rather than
-//! stacking a new one — the freedesktop spec guarantees the returned
-//! id equals `replaces_id` when the prior notification still exists.
-//! Click → focus posts `UiEvent::RunAction { FocusSession }` through
-//! the winit event-loop proxy.
+//! Repeated state changes for the same session reuse `replaces_id` so the
+//! daemon atomically swaps the existing toast in place rather than stacking a
+//! new one — the freedesktop spec guarantees the returned id equals
+//! `replaces_id` when the prior notification still exists. Click → focus emits
+//! [`NotifOutput::FocusSession`] on the caller-supplied channel.
 //!
-//! Replaces the old "spawn one `std::thread` per notification, each
-//! blocking forever on `wait_for_action`" path that leaked threads and
-//! D-Bus connections under `condition = "always"` + `timeout_mode =
-//! "never"`.
+//! Replaces the old "spawn one `std::thread` per notification, each blocking
+//! forever on `wait_for_action`" path that leaked threads and D-Bus
+//! connections under `condition = "always"` + `timeout_mode = "never"`.
 
 use std::collections::HashMap;
 
 use futures_util::stream::StreamExt;
-use scribe_common::config::NotifyTimeoutMode;
 use scribe_common::ids::SessionId;
-use scribe_common::protocol::AutomationAction;
 use tokio::sync::mpsc;
-use winit::event_loop::EventLoopProxy;
 use zbus::Connection;
 use zbus::zvariant::Value;
 
-use super::{NotifReq, ShowReq};
-use crate::ipc_client::UiEvent;
+use super::{NotifOutput, NotifReq, NotifState, ShowReq, expire_timeout_millis};
 
-pub(super) fn spawn(proxy: EventLoopProxy<UiEvent>) -> mpsc::UnboundedSender<NotifReq> {
+pub(super) fn spawn(out: mpsc::UnboundedSender<NotifOutput>) -> mpsc::UnboundedSender<NotifReq> {
     let (tx, rx) = mpsc::unbounded_channel();
     let spawn_result = std::thread::Builder::new()
         .name("scribe-notif-dispatcher".to_string())
-        .spawn(move || run_thread(rx, proxy));
+        .spawn(move || run_thread(rx, out));
     if let Err(e) = spawn_result {
         tracing::warn!(error = %e, "failed to spawn notification dispatcher thread");
     }
     tx
 }
 
-fn run_thread(rx: mpsc::UnboundedReceiver<NotifReq>, proxy: EventLoopProxy<UiEvent>) {
+fn run_thread(rx: mpsc::UnboundedReceiver<NotifReq>, out: mpsc::UnboundedSender<NotifOutput>) {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -52,21 +45,20 @@ fn run_thread(rx: mpsc::UnboundedReceiver<NotifReq>, proxy: EventLoopProxy<UiEve
             return;
         }
     };
-    rt.block_on(run(rx, proxy));
+    rt.block_on(run(rx, out));
 }
 
-/// Connection-bound state. Two signal streams plus the proxy come out
+/// Connection-bound state. Two signal streams plus the output channel come out
 /// of `setup_dbus`; the rest is owned by the dispatcher loop.
 struct Dispatcher<'a> {
     dbus: NotificationsProxy<'a>,
-    proxy: EventLoopProxy<UiEvent>,
+    out: mpsc::UnboundedSender<NotifOutput>,
     app_name: &'static str,
     icon: &'static str,
-    by_id: HashMap<u32, SessionId>,
-    by_session: HashMap<SessionId, u32>,
+    state: NotifState,
 }
 
-async fn run(mut rx: mpsc::UnboundedReceiver<NotifReq>, proxy: EventLoopProxy<UiEvent>) {
+async fn run(mut rx: mpsc::UnboundedReceiver<NotifReq>, out: mpsc::UnboundedSender<NotifOutput>) {
     let Some((conn, mut invoked, mut closed)) = setup_dbus(&mut rx).await else {
         return;
     };
@@ -80,13 +72,12 @@ async fn run(mut rx: mpsc::UnboundedReceiver<NotifReq>, proxy: EventLoopProxy<Ui
     };
 
     let identity = scribe_common::app::current_identity();
-    let mut state = Dispatcher {
+    let mut dispatcher = Dispatcher {
         dbus,
-        proxy,
+        out,
         app_name: identity.window_title_name(),
         icon: identity.slug(),
-        by_id: HashMap::new(),
-        by_session: HashMap::new(),
+        state: NotifState::new(),
     };
 
     loop {
@@ -94,23 +85,23 @@ async fn run(mut rx: mpsc::UnboundedReceiver<NotifReq>, proxy: EventLoopProxy<Ui
             biased;
             req = rx.recv() => {
                 let Some(req) = req else { break };
-                if !state.handle_request(req).await { break; }
+                if !dispatcher.handle_request(req).await { break; }
             }
             sig = invoked.next() => {
                 let Some(sig) = sig else { break };
-                state.on_action_invoked(&sig);
+                dispatcher.on_action_invoked(&sig);
             }
             sig = closed.next() => {
                 let Some(sig) = sig else { break };
-                state.on_notification_closed(&sig);
+                dispatcher.on_notification_closed(&sig);
             }
         }
     }
 }
 
-/// Open the session bus and subscribe to the two notification signals.
-/// On any failure, drain the request channel so senders don't block on
-/// a closed receiver, and return `None`.
+/// Open the session bus and subscribe to the two notification signals. On any
+/// failure, drain the request channel so senders don't block on a closed
+/// receiver, and return `None`.
 async fn setup_dbus(
     rx: &mut mpsc::UnboundedReceiver<NotifReq>,
 ) -> Option<(Connection, ActionInvokedStream, NotificationClosedStream)> {
@@ -168,14 +159,8 @@ impl Dispatcher<'_> {
     }
 
     async fn show(&mut self, req: ShowReq) {
-        let replaces = self.by_session.get(&req.session_id).copied().unwrap_or(0);
-        let expire_timeout = match req.timeout_mode {
-            NotifyTimeoutMode::SystemDefault => -1,
-            NotifyTimeoutMode::Custom => {
-                i32::try_from(req.timeout_secs.saturating_mul(1000)).unwrap_or(i32::MAX)
-            }
-            NotifyTimeoutMode::Never => 0,
-        };
+        let replaces = self.state.replaces_for(req.session_id);
+        let expire_timeout = expire_timeout_millis(req.timeout_mode, req.timeout_secs);
         let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
         hints.insert("desktop-entry", self.icon.into());
         let actions = ["default", "Focus"];
@@ -193,30 +178,22 @@ impl Dispatcher<'_> {
             )
             .await;
         match result {
-            Ok(id) if id != 0 => {
-                if replaces != 0 && replaces != id {
-                    self.by_id.remove(&replaces);
-                }
-                self.by_id.insert(id, req.session_id);
-                self.by_session.insert(req.session_id, id);
-            }
+            Ok(id) if id != 0 => self.state.record_shown(req.session_id, replaces, id),
             Ok(_) => tracing::debug!("notify returned id 0"),
             Err(e) => tracing::debug!(error = %e, "notify call failed"),
         }
     }
 
     async fn close_for_session(&mut self, session_id: SessionId) {
-        let Some(id) = self.by_session.remove(&session_id) else { return };
-        self.by_id.remove(&id);
+        let Some(id) = self.state.take_session(session_id) else { return };
         self.close_id_logging_errors(id).await;
     }
 
     async fn shutdown(&mut self) {
-        for id in self.by_id.keys().copied().collect::<Vec<_>>() {
+        for id in self.state.live_ids() {
             self.close_id_logging_errors(id).await;
         }
-        self.by_id.clear();
-        self.by_session.clear();
+        self.state.clear();
     }
 
     async fn close_id_logging_errors(&self, id: u32) {
@@ -227,23 +204,15 @@ impl Dispatcher<'_> {
 
     fn on_action_invoked(&self, sig: &ActionInvoked) {
         let Ok(args) = sig.args() else { return };
-        let Some(&session_id) = self.by_id.get(&args.id) else { return };
-        if self
-            .proxy
-            .send_event(UiEvent::RunAction {
-                action: AutomationAction::FocusSession { session_id },
-            })
-            .is_err()
-        {
-            tracing::debug!("event loop closed; dropping FocusSession");
+        let Some(session_id) = self.state.session_for_id(args.id) else { return };
+        if self.out.send(NotifOutput::FocusSession { session_id }).is_err() {
+            tracing::debug!("output channel closed; dropping FocusSession");
         }
     }
 
     fn on_notification_closed(&mut self, sig: &NotificationClosed) {
         let Ok(args) = sig.args() else { return };
-        if let Some(session_id) = self.by_id.remove(&args.id) {
-            self.by_session.remove(&session_id);
-        }
+        self.state.on_closed(args.id);
     }
 }
 

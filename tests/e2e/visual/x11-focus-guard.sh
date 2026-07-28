@@ -90,7 +90,7 @@ echo "PHASE 1 PASS: active window — keystroke reached the overlay router"
 # A second client instance is the stand-in for the compositor overlay: it takes
 # _NET_ACTIVE_WINDOW, and the keystroke is still delivered straight to the first
 # window with XSendEvent, so only the guard can stop it.
-scribe-client-gpui >"$OUT/client-overlay.log" 2>&1 &
+scribe-client >"$OUT/client-overlay.log" 2>&1 &
 OVERLAY_PID=$!
 trap 'kill "$OVERLAY_PID" 2>/dev/null || true' EXIT
 for _ in $(seq 1 40); do

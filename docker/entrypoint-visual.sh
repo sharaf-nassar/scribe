@@ -233,7 +233,7 @@ if [ "${SCRIBE_SEED_TRUST:-0}" = "1" ]; then
     seed_trust_stores
 fi
 export PATH="/tests/bin:$PATH"
-export RUST_LOG="${RUST_LOG:-scribe_server=info,scribe_client_gpui=info}"
+export RUST_LOG="${RUST_LOG:-scribe_server=info,scribe_client=info}"
 
 # Persist the server's tracing output for the same reason the client's is
 # persisted below: some behaviour under test leaves no pixels behind and has no
@@ -328,7 +328,7 @@ case "$VISUAL_APP" in
         # runtime behaviour that leaves no pixels behind (e.g. the config
         # watcher's "config hot-reloaded" line) instead of guessing from a
         # screenshot diff.
-        scribe-client-gpui >"$SCRIBE_CLIENT_LOG" 2>&1 &
+        scribe-client >"$SCRIBE_CLIENT_LOG" 2>&1 &
         APP_PID=$!
         export SCRIBE_CLIENT_PID="$APP_PID"
         wait_for_window "Scribe" 15 || true
@@ -355,7 +355,7 @@ case "$VISUAL_APP" in
             start_share_tap
         fi
         export LIBGL_ALWAYS_SOFTWARE=1
-        scribe-client-gpui --settings >/output/settings.log 2>&1 &
+        scribe-client --settings >/output/settings.log 2>&1 &
         APP_PID=$!
         export SCRIBE_SETTINGS_PID="$APP_PID"
         export SCRIBE_SETTINGS_LOG=/output/settings.log
@@ -371,7 +371,7 @@ esac
 #
 # The test's stdout is inherited by every process it backgrounds. While that
 # stdout was `| tee /output/result.log`, a single orphan the script left running
-# (a relaunched `scribe-client-gpui`, say) held the write end of that pipe open,
+# (a relaunched `scribe-client`, say) held the write end of that pipe open,
 # so `tee` never saw EOF and the container hung forever AFTER the test had
 # printed PASS. `TEST_TIMEOUT` cannot break the deadlock: it governs the test
 # process, which has already exited. Writing to the log and streaming it with a
@@ -391,6 +391,6 @@ wait "$TAIL_PID" 2>/dev/null || true
 TAIL_PID=""
 
 # Reap anything the test left behind so cleanup has nothing to race with.
-pkill -f 'scribe-client-gpui' 2>/dev/null || true
+pkill -f 'scribe-client' 2>/dev/null || true
 
 exit $EXIT_CODE

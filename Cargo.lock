@@ -6891,6 +6891,41 @@ dependencies = [
 name = "scribe-client"
 version = "0.0.0-dev"
 dependencies = [
+ "alacritty_terminal 0.26.1-dev",
+ "arboard",
+ "futures-util",
+ "gpui",
+ "gpui_platform",
+ "gpui_tokio",
+ "nix 0.31.2",
+ "notify",
+ "pollster 0.4.0",
+ "raw-window-handle",
+ "regex",
+ "rmp-serde",
+ "scribe-common",
+ "scribe-server",
+ "serde",
+ "serde_json",
+ "sysinfo 0.35.2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "ttf-parser",
+ "unicode-width",
+ "vte",
+ "wgpu",
+ "x11rb",
+ "zbus 5.14.0",
+]
+
+[[package]]
+name = "scribe-client-legacy"
+version = "0.0.0-dev"
+dependencies = [
  "alacritty_terminal 0.26.0-rc1",
  "arboard",
  "bytemuck",
@@ -6920,39 +6955,6 @@ dependencies = [
  "vte",
  "wgpu",
  "winit",
- "x11rb",
- "zbus 5.14.0",
-]
-
-[[package]]
-name = "scribe-client-gpui"
-version = "0.0.0-dev"
-dependencies = [
- "alacritty_terminal 0.26.1-dev",
- "arboard",
- "futures-util",
- "gpui",
- "gpui_platform",
- "gpui_tokio",
- "nix 0.31.2",
- "notify",
- "raw-window-handle",
- "regex",
- "rmp-serde",
- "scribe-common",
- "scribe-server",
- "serde",
- "serde_json",
- "sysinfo 0.35.2",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
- "ttf-parser",
- "unicode-width",
- "vte",
  "x11rb",
  "zbus 5.14.0",
 ]

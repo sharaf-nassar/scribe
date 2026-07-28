@@ -46,9 +46,9 @@ wait_for_log() {
 # ── Phase 1: baseline — window painted with the startup config ─────
 sleep 0.8
 capture_window /output/01-config-baseline.png
-PID_BEFORE=$(pgrep -f '(^|/)scribe-client-gpui$' | head -1)
+PID_BEFORE=$(pgrep -f '(^|/)scribe-client$' | head -1)
 if [ -z "$PID_BEFORE" ]; then
-    echo "PHASE 1 FAIL: no running scribe-client-gpui process"
+    echo "PHASE 1 FAIL: no running scribe-client process"
     exit 1
 fi
 RELOADS_BEFORE=$(grep -cF "config hot-reloaded" "$CLIENT_LOG" 2>/dev/null || true)
@@ -84,7 +84,7 @@ fi
 echo "PHASE 3 PASS: config watcher reloaded the running window"
 
 # ── Phase 4: it was a reload, not a restart ────────────────────────
-PID_AFTER=$(pgrep -f '(^|/)scribe-client-gpui$' | head -1)
+PID_AFTER=$(pgrep -f '(^|/)scribe-client$' | head -1)
 if [ "$PID_AFTER" != "$PID_BEFORE" ]; then
     echo "PHASE 4 FAIL: client pid changed ($PID_BEFORE -> $PID_AFTER); it restarted"
     exit 1

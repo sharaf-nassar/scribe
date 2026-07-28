@@ -1,614 +1,364 @@
-//! GPU-rendered workspace notes hover preview.
+//! Workspace-notes hover preview for the GPUI client rebuild.
+//!
+//! The winit client painted this preview as `CellInstance` quads over a grid
+//! ([`workspace_notes_preview.rs`](../../scribe-client/src/workspace_notes_preview.rs)),
+//! returning hit rects the shell tested. This port keeps the pure sizing/wrap
+//! logic — column width from the longest note or editor line, visual-row wrap,
+//! and caret line/column geometry (FR-022) — while painting the surfaces with
+//! GPUI elements. It has two modes: a read-only list of active-note summaries
+//! with an overflow "+N more" row and a bottom-right "+" affordance (FR-001),
+//! and an inline editor (FR-002) that renders the shared draft with a caret,
+//! an optional server-error row, and a scroll indicator. Clicking the
+//! affordance, a note row, or the editor emits a
+//! [`WorkspaceNotesPreviewAction`] for the shell to route.
 
+use gpui::{Context, EventEmitter, Rgba, div, prelude::*, px};
 use scribe_common::theme::ChromeColors;
-use scribe_renderer::srgb_to_linear_rgba;
-use scribe_renderer::types::CellInstance;
 
-use crate::layout::Rect;
+use crate::tab_bar::srgba;
 use crate::workspace_notes::{AddingNoteState, WorkspaceNoteSummary};
 
-type GlyphResolver<'a> = dyn FnMut(char) -> ([f32; 2], [f32; 2]) + 'a;
+/// Maximum note rows shown before the preview stops listing (overflow becomes a
+/// "+N more" row).
+pub const MAX_PREVIEW_ROWS: usize = 12;
+/// Minimum content columns the preview sizes to.
+pub const MIN_PREVIEW_COLS: usize = 22;
+/// Maximum content columns the preview grows to.
+pub const MAX_PREVIEW_COLS: usize = 64;
+/// Horizontal padding, in cells, on each side of the preview content.
+pub const PAD_COLS: usize = 1;
+/// Leading indent (in cells) the inline editor reserves for its accent "›"
+/// prompt plus one separating space.
+pub const EDITOR_PREFIX_COLS: usize = 2;
+/// Fallback maximum editor rows when the caller passes no pane-derived cap.
+pub const MIN_EDITOR_ROWS: usize = 1;
 
-const MAX_PREVIEW_ROWS: usize = 12;
-const MIN_PREVIEW_COLS: usize = 22;
-const MAX_PREVIEW_COLS: usize = 64;
-const PAD_COLS: usize = 1;
-const MAX_GRID_UNITS: usize = 65_535;
-/// Width (in terminal cells) of the bordered "+" affordance at the bottom-right
-/// of the read-only preview. Per spec FR-001 and UX-002 the affordance is ~2 cols
-/// wide; we use 3 so the "+" glyph can sit visually centered with one cell of
-/// border padding on each side.
-const AFFORDANCE_COLS: usize = 3;
-/// Right-edge inset (in cells) between the affordance's right border and the
-/// preview's right inner border (UX-002).
-const AFFORDANCE_RIGHT_INSET: usize = 1;
-/// Minimum vertical rows the inline editor reserves (1 row of text plus an
-/// optional error row is added on demand).
-const MIN_EDITOR_ROWS: usize = 1;
-/// Maximum cells of error text rendered next to the editor row.
-const MAX_EDITOR_ERROR_CHARS: usize = 64;
-/// Leading indent (in cells) reserved by the inline editor for its accent '›'
-/// prefix glyph + one separating space. The prefix marks the row as a text-
-/// entry zone (Linear/Notion-style prompt indicator). Wrapped continuation
-/// lines inherit the same indent so the caret column aligns across rows.
-const EDITOR_PREFIX_COLS: usize = 2;
-/// Width (in pixels) of the accent bar drawn on the left edge of a hovered
-/// note row. Sits inside `PAD_COLS` of preview padding so it never overlaps
-/// the row's `- text` glyphs.
-const HOVER_ACCENT_BAR_W: f32 = 2.0;
-
-pub struct WorkspaceNotesPreviewBuildContext<'a> {
-    pub out: &'a mut Vec<CellInstance>,
-    pub anchor: Rect,
-    pub viewport: Rect,
-    pub cell_size: (f32, f32),
-    pub chrome: &'a ChromeColors,
-    pub summaries: &'a [WorkspaceNoteSummary],
-    pub total_count: usize,
-    pub hovered_note_id: Option<&'a str>,
-    /// The current workspace's inline editor state if it is in "adding note"
-    /// state (FR-002 / FR-021). When `Some`, the preview renders the editor row
-    /// in place of the "+" affordance. Taken as `&mut` so the build pass can
-    /// snap `scroll_offset_rows` to keep the caret visible using the layout's
-    /// real content-width (FR-022) — the actual `cols` is computed inside
-    /// [`PreviewLayout::new`] and isn't available to callers.
-    pub inline_editor: Option<&'a mut AddingNoteState>,
-    /// True when the pointer is currently over the "+" affordance, used to draw
-    /// its hover visual state. Ignored when `inline_editor` is `Some`.
-    pub affordance_hovered: bool,
-    /// Maximum rows the preview can grow to. Clamped to 3/4 of the focused pane
-    /// per FR-019 by the caller; passing `None` falls back to `MAX_PREVIEW_ROWS`.
-    pub max_editor_rows: Option<usize>,
-    pub resolve_glyph: &'a mut GlyphResolver<'a>,
+/// A control the user activated in the preview, routed by the shell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspaceNotesPreviewAction {
+    /// The "+" affordance was clicked — open the inline editor (FR-002).
+    OpenEditor,
+    /// A note row was clicked — archive it as done.
+    ArchiveNote(String),
+    /// The inline editor row was clicked — take focus, absorbing the click so
+    /// it never archives a note behind it (FR-011).
+    FocusEditor,
 }
 
-#[derive(Clone, Debug)]
-pub struct WorkspaceNotesPreviewInteraction {
-    pub rect: Rect,
-    pub note_targets: Vec<WorkspaceNotesPreviewNoteTarget>,
-    /// Hit-rect for the bottom-right "+" affordance (FR-001) when the preview is
-    /// in its read-only state. `None` when the preview is currently rendering the
-    /// inline editor (FR-002 hides the affordance during editing).
-    pub affordance_rect: Option<Rect>,
-    /// Hit-rect for the inline editor row when in "adding note" state. `None`
-    /// when read-only. Used to absorb clicks (FR-011) so they don't archive a
-    /// note row.
-    pub editor_rect: Option<Rect>,
+impl EventEmitter<WorkspaceNotesPreviewAction> for WorkspaceNotesPreviewView {}
+
+/// The number of content columns the preview should size to, given the longest
+/// note summary (or editor line) it must fit. Ported from the winit
+/// `PreviewLayout::new` width computation.
+#[must_use]
+pub fn preview_cols(summaries: &[WorkspaceNoteSummary], editor: Option<&AddingNoteState>) -> usize {
+    let longest = summaries
+        .iter()
+        .map(|summary| summary.text.chars().count().saturating_add(2))
+        .max()
+        .unwrap_or_else(|| "No active notes".chars().count());
+    let editor_longest = editor.map_or(0, |state| longest_visible_line_chars(&state.draft_text));
+    let longest = longest.max(editor_longest.saturating_add(EDITOR_PREFIX_COLS));
+    longest.saturating_add(PAD_COLS * 2).clamp(MIN_PREVIEW_COLS, MAX_PREVIEW_COLS)
 }
 
-#[derive(Clone, Debug)]
-pub struct WorkspaceNotesPreviewNoteTarget {
-    pub note_id: String,
-    pub rect: Rect,
+/// The editor content width (columns available for wrapped text) at a given
+/// preview column count.
+#[must_use]
+pub fn editor_content_cols(cols: usize) -> usize {
+    cols.saturating_sub(PAD_COLS * 2 + EDITOR_PREFIX_COLS).max(1)
 }
 
-pub fn build_workspace_notes_preview(
-    ctx: WorkspaceNotesPreviewBuildContext<'_>,
-) -> Option<WorkspaceNotesPreviewInteraction> {
-    let WorkspaceNotesPreviewBuildContext {
-        out,
-        anchor,
-        viewport,
-        cell_size,
-        chrome,
-        summaries,
-        total_count,
-        hovered_note_id,
-        mut inline_editor,
-        affordance_hovered,
-        max_editor_rows,
-        resolve_glyph,
-    } = ctx;
-    let (cell_w, cell_h) = cell_size;
-    if cell_w <= 0.0 || cell_h <= 0.0 {
-        return None;
+/// The number of visible editor rows for `text` wrapped at `content_cols`,
+/// clamped to `[MIN_EDITOR_ROWS, cap]`. Ported from the winit `editor_rows`
+/// computation.
+#[must_use]
+pub fn editor_rows(text: &str, content_cols: usize, cap: Option<usize>) -> usize {
+    let needed = wrapped_row_count(text, content_cols);
+    let cap = cap.unwrap_or(MAX_PREVIEW_ROWS).max(MIN_EDITOR_ROWS);
+    needed.max(MIN_EDITOR_ROWS).min(cap)
+}
+
+/// Resolved GPUI colours for the preview.
+#[derive(Clone, Copy)]
+pub struct WorkspaceNotesPreviewColors {
+    bg: Rgba,
+    border: Rgba,
+    affordance_hover_bg: Rgba,
+    text: Rgba,
+    hover_text: Rgba,
+    muted: Rgba,
+    accent: Rgba,
+    error_text: Rgba,
+}
+
+impl From<&ChromeColors> for WorkspaceNotesPreviewColors {
+    fn from(chrome: &ChromeColors) -> Self {
+        Self {
+            bg: with_alpha(srgba(lighten(chrome.tab_bar_bg, 0.018)), 0.96),
+            border: with_alpha(srgba(chrome.tab_separator), 0.92),
+            affordance_hover_bg: with_alpha(srgba(chrome.accent), 0.30),
+            text: srgba(chrome.tab_text),
+            hover_text: srgba(chrome.tab_text_active),
+            muted: with_alpha(srgba(chrome.tab_text), 0.64),
+            accent: srgba(chrome.accent),
+            error_text: with_alpha(srgba(chrome.accent), 0.92),
+        }
     }
-
-    let layout = PreviewLayout::new(&PreviewLayoutInputs {
-        anchor,
-        viewport,
-        cell_size,
-        summaries,
-        total_count,
-        inline_editor: inline_editor.as_deref(),
-        max_editor_rows,
-    });
-    // FR-022 first input: snap scroll-to-caret using the layout's actual content
-    // width and editor row budget — not an external estimate — so the caret is
-    // always brought into view regardless of how the layout clamped `cols`.
-    // EDITOR_PREFIX_COLS is subtracted so the wrap geometry matches what
-    // `draw_editor_text` actually renders to the indented text area.
-    let content_cols = layout.cols.saturating_sub(PAD_COLS * 2 + EDITOR_PREFIX_COLS).max(1);
-    if let Some(state) = inline_editor.as_deref_mut() {
-        state.clamp_scroll_to_caret(content_cols, layout.editor_rows.max(1));
-    }
-    let interaction = layout.interaction(cell_size, summaries);
-    let colors = PreviewColors::from_chrome(chrome);
-    let mut renderer = PreviewRenderer { out, layout, colors, cell_size, resolve_glyph };
-    renderer.draw_background();
-    renderer.draw_rows(summaries, total_count, hovered_note_id);
-    if let Some(state) = inline_editor.as_deref() {
-        renderer.draw_editor_row(state);
-    } else {
-        renderer.draw_affordance(affordance_hovered);
-    }
-    Some(interaction)
 }
 
-#[derive(Clone, Copy)]
-struct PreviewLayout {
-    rect: Rect,
-    cols: usize,
-    visible_note_rows: usize,
-    overflow: usize,
-    /// Row index (0-based, within the preview's grid) of the affordance row, or
-    /// the inline editor's first row when in editing mode.
-    bottom_zone_row: usize,
-    /// Total rows the editor occupies (≥ 1). Equals 0 in read-only mode.
-    editor_rows: usize,
-    /// Whether the editor surfaces a server error row directly below the input.
-    has_editor_error: bool,
-}
-
-#[derive(Clone, Copy)]
-struct EditorTextArgs<'a> {
-    state: &'a AddingNoteState,
-    wrapped: &'a [String],
-    scroll: usize,
-    editor_rows: usize,
-    start_row: usize,
-    caret_line_idx: usize,
-    content_cols: usize,
-}
-
-#[derive(Clone, Copy)]
-struct EditorScrollbarArgs {
-    editor_x: f32,
-    editor_y: f32,
-    editor_w: f32,
-    editor_h: f32,
-    total_lines: usize,
-    editor_rows: usize,
-    scroll: usize,
-}
-
-#[derive(Clone, Copy)]
-struct PreviewLayoutInputs<'a> {
-    anchor: Rect,
-    viewport: Rect,
-    cell_size: (f32, f32),
-    summaries: &'a [WorkspaceNoteSummary],
+/// The hover-preview view.
+///
+/// Holds the summaries and (optional) inline-editor buffer the shell feeds it,
+/// and paints either the read-only list plus "+" affordance or the inline
+/// editor. The pure sizing/wrap helpers ([`preview_cols`], [`editor_rows`],
+/// [`wrap_text_for_editor`]) keep the geometry testable.
+pub struct WorkspaceNotesPreviewView {
+    colors: WorkspaceNotesPreviewColors,
+    summaries: Vec<WorkspaceNoteSummary>,
     total_count: usize,
-    inline_editor: Option<&'a AddingNoteState>,
+    hovered_note_id: Option<String>,
+    inline_editor: Option<AddingNoteState>,
+    affordance_hovered: bool,
     max_editor_rows: Option<usize>,
 }
 
-impl PreviewLayout {
-    fn new(inputs: &PreviewLayoutInputs<'_>) -> Self {
-        let &PreviewLayoutInputs {
-            anchor,
-            viewport,
-            cell_size,
-            summaries,
-            total_count,
-            inline_editor,
-            max_editor_rows,
-        } = inputs;
-        let longest = summaries
-            .iter()
-            .map(|summary| summary.text.chars().count().saturating_add(2))
-            .max()
-            .unwrap_or("No active notes".chars().count());
-        let editor_longest_line =
-            inline_editor.map_or(0, |state| longest_visible_line_chars(&state.draft_text));
-        let longest = longest.max(editor_longest_line.saturating_add(EDITOR_PREFIX_COLS));
-        let cols = longest.saturating_add(PAD_COLS * 2).clamp(MIN_PREVIEW_COLS, MAX_PREVIEW_COLS);
-        let visible_note_rows =
-            if summaries.is_empty() { 0 } else { summaries.len().min(MAX_PREVIEW_ROWS) };
-        let overflow = total_count.saturating_sub(visible_note_rows);
-        let note_zone_rows =
-            if summaries.is_empty() { 1 } else { visible_note_rows + usize::from(overflow > 0) };
-
-        // Read-only layout reserves: 1 top pad + note_zone + 1 spacer + 1 affordance + 1 bottom pad
-        // Editing layout reserves:    1 top pad + note_zone + 1 spacer + editor_rows (+1 if error) + 1 bottom pad
-        let editor_rows = inline_editor.map_or(0, |state| {
-            let content_width = cols.saturating_sub(PAD_COLS * 2 + EDITOR_PREFIX_COLS).max(1);
-            let needed = wrapped_row_count(&state.draft_text, content_width);
-            let cap = max_editor_rows.unwrap_or(MAX_PREVIEW_ROWS).max(MIN_EDITOR_ROWS);
-            needed.max(MIN_EDITOR_ROWS).min(cap)
-        });
-        let has_editor_error =
-            inline_editor.and_then(|state| state.last_server_error.as_ref()).is_some();
-        let bottom_zone_extra = if inline_editor.is_some() {
-            editor_rows + usize::from(has_editor_error)
-        } else {
-            1 // affordance row
-        };
-        let total_rows = 1 /* top pad */
-            + note_zone_rows
-            + 1 /* spacer between notes and bottom zone */
-            + bottom_zone_extra
-            + 1 /* bottom pad */;
-
-        let bottom_zone_row = 1 + note_zone_rows + 1;
-
-        let width = grid_width(cols, cell_size.0);
-        let height = grid_height(total_rows, cell_size.1);
-        let x = clamp_axis(anchor.x, width, viewport.x, viewport.x + viewport.width);
-        let below_y = anchor.y + anchor.height;
-        let y = if below_y + height <= viewport.y + viewport.height {
-            below_y
-        } else {
-            (anchor.y - height).max(viewport.y)
-        };
+impl WorkspaceNotesPreviewView {
+    /// Build an empty read-only preview.
+    #[must_use]
+    pub fn new(colors: WorkspaceNotesPreviewColors) -> Self {
         Self {
-            rect: Rect { x, y, width, height },
-            cols,
-            visible_note_rows,
-            overflow,
-            bottom_zone_row,
-            editor_rows,
-            has_editor_error,
+            colors,
+            summaries: Vec::new(),
+            total_count: 0,
+            hovered_note_id: None,
+            inline_editor: None,
+            affordance_hovered: false,
+            max_editor_rows: None,
         }
     }
 
-    fn interaction(
-        &self,
-        cell_size: (f32, f32),
-        summaries: &[WorkspaceNoteSummary],
-    ) -> WorkspaceNotesPreviewInteraction {
-        let note_targets = summaries
-            .iter()
-            .take(self.visible_note_rows)
-            .enumerate()
-            .map(|(row_index, summary)| WorkspaceNotesPreviewNoteTarget {
-                note_id: summary.note_id.clone(),
-                rect: Rect {
-                    x: self.rect.x,
-                    y: self.rect.y + grid_height(row_index + 1, cell_size.1),
-                    width: self.rect.width,
-                    height: cell_size.1,
-                },
-            })
-            .collect();
-        let (affordance_rect, editor_rect) = if self.editor_rows == 0 {
-            // Read-only mode → affordance rect populated.
-            let aff_x = self.rect.x
-                + grid_width(
-                    self.cols.saturating_sub(AFFORDANCE_RIGHT_INSET + AFFORDANCE_COLS),
-                    cell_size.0,
-                );
-            let aff_y = self.rect.y + grid_height(self.bottom_zone_row, cell_size.1);
-            (
-                Some(Rect {
-                    x: aff_x,
-                    y: aff_y,
-                    width: grid_width(AFFORDANCE_COLS, cell_size.0),
-                    height: cell_size.1,
-                }),
-                None,
-            )
-        } else {
-            let ed_y = self.rect.y + grid_height(self.bottom_zone_row, cell_size.1);
-            (
-                None,
-                Some(Rect {
-                    x: self.rect.x + 1.0,
-                    y: ed_y,
-                    width: (self.rect.width - 2.0).max(0.0),
-                    height: grid_height(self.editor_rows, cell_size.1),
-                }),
-            )
-        };
-        WorkspaceNotesPreviewInteraction {
-            rect: self.rect,
-            note_targets,
-            affordance_rect,
-            editor_rect,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PreviewColors {
-    bg: [f32; 4],
-    border: [f32; 4],
-    /// Tint fill for the "+" affordance button when hovered. Note rows no
-    /// longer use a row-wide tint (see `draw_row_hover`) — only the
-    /// affordance keeps a small tinted fill so it reads as a clickable
-    /// button-shaped target.
-    affordance_hover_bg: [f32; 4],
-    text: [f32; 4],
-    hover_text: [f32; 4],
-    muted: [f32; 4],
-    accent: [f32; 4],
-    error_text: [f32; 4],
-}
-
-impl PreviewColors {
-    fn from_chrome(chrome: &ChromeColors) -> Self {
-        Self {
-            bg: srgb_to_linear_rgba(with_alpha(lighten(chrome.tab_bar_bg, 0.018), 0.96)),
-            border: srgb_to_linear_rgba(with_alpha(chrome.tab_separator, 0.92)),
-            affordance_hover_bg: srgb_to_linear_rgba(with_alpha(chrome.accent, 0.30)),
-            text: srgb_to_linear_rgba(chrome.tab_text),
-            hover_text: srgb_to_linear_rgba(chrome.tab_text_active),
-            muted: srgb_to_linear_rgba(with_alpha(chrome.tab_text, 0.64)),
-            accent: srgb_to_linear_rgba(chrome.accent),
-            error_text: srgb_to_linear_rgba(with_alpha(chrome.accent, 0.92)),
-        }
-    }
-}
-
-struct PreviewRenderer<'a, 'b> {
-    out: &'a mut Vec<CellInstance>,
-    layout: PreviewLayout,
-    colors: PreviewColors,
-    cell_size: (f32, f32),
-    resolve_glyph: &'a mut GlyphResolver<'b>,
-}
-
-impl PreviewRenderer<'_, '_> {
-    fn draw_background(&mut self) {
-        self.push_solid_rect(self.layout.rect, self.colors.bg);
-        let rect = self.layout.rect;
-        self.push_solid_rect(
-            Rect { x: rect.x, y: rect.y, width: rect.width, height: 1.0 },
-            self.colors.border,
-        );
-        self.push_solid_rect(
-            Rect { x: rect.x, y: rect.y + rect.height - 1.0, width: rect.width, height: 1.0 },
-            self.colors.border,
-        );
-        self.push_solid_rect(
-            Rect { x: rect.x, y: rect.y, width: 1.0, height: rect.height },
-            self.colors.border,
-        );
-        self.push_solid_rect(
-            Rect { x: rect.x + rect.width - 1.0, y: rect.y, width: 1.0, height: rect.height },
-            self.colors.border,
-        );
-    }
-
-    fn draw_rows(
+    /// Feed the active-note summaries and total count to the preview.
+    pub fn set_summaries(
         &mut self,
-        summaries: &[WorkspaceNoteSummary],
+        summaries: Vec<WorkspaceNoteSummary>,
         total_count: usize,
-        hovered_note_id: Option<&str>,
+        cx: &mut Context<Self>,
     ) {
-        if summaries.is_empty() {
-            self.emit_text("No active notes", 1, PAD_COLS, self.colors.muted);
-            return;
-        }
-
-        for (row_index, summary) in summaries.iter().take(self.layout.visible_note_rows).enumerate()
-        {
-            let row = row_index + 1;
-            let hovered = hovered_note_id == Some(summary.note_id.as_str());
-            if hovered {
-                self.draw_row_hover(row);
-            }
-            let text =
-                format!("- {}", single_line(&summary.text, self.content_cols().saturating_sub(2)));
-            let fg = if hovered { self.colors.hover_text } else { self.colors.text };
-            self.emit_text(&text, row, PAD_COLS, fg);
-        }
-
-        if self.layout.overflow > 0 {
-            let row = self.layout.visible_note_rows + 1;
-            let text =
-                format!("+{} more", total_count.saturating_sub(self.layout.visible_note_rows));
-            self.emit_text(&text, row, PAD_COLS, self.colors.muted);
-        }
+        self.summaries = summaries;
+        self.total_count = total_count;
+        cx.notify();
     }
 
-    fn draw_affordance(&mut self, hovered: bool) {
-        let row = self.layout.bottom_zone_row;
-        let cell_w = self.cell_size.0;
-        let cell_h = self.cell_size.1;
-        let left_col = self.layout.cols.saturating_sub(AFFORDANCE_RIGHT_INSET + AFFORDANCE_COLS);
-        let x = self.layout.rect.x + grid_width(left_col, cell_w);
-        let y = self.layout.rect.y + grid_height(row, cell_h);
-        let width = grid_width(AFFORDANCE_COLS, cell_w);
-        let height = cell_h;
-        let (bg_color, border_color, glyph_fg) = if hovered {
-            (self.colors.affordance_hover_bg, self.colors.accent, self.colors.hover_text)
+    /// Set (or clear) the inline-editor buffer, switching the preview into or
+    /// out of editing mode.
+    pub fn set_inline_editor(&mut self, editor: Option<AddingNoteState>, cx: &mut Context<Self>) {
+        self.inline_editor = editor;
+        cx.notify();
+    }
+
+    /// Set the pane-derived cap on editor rows (FR-019).
+    pub fn set_max_editor_rows(&mut self, max: Option<usize>, cx: &mut Context<Self>) {
+        self.max_editor_rows = max;
+        cx.notify();
+    }
+
+    /// Set (or clear) which note row is drawn as hovered.
+    pub fn set_hovered_note(&mut self, note_id: Option<String>, cx: &mut Context<Self>) {
+        self.hovered_note_id = note_id;
+        cx.notify();
+    }
+
+    /// Set whether the "+" affordance is drawn in its hovered state.
+    pub fn set_affordance_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.affordance_hovered = hovered;
+        cx.notify();
+    }
+
+    /// Whether the preview is currently rendering the inline editor.
+    #[must_use]
+    pub const fn is_editing(&self) -> bool {
+        self.inline_editor.is_some()
+    }
+
+    fn render_note_row(
+        &self,
+        index: usize,
+        summary: &WorkspaceNoteSummary,
+        content_cols: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let hovered = self.hovered_note_id.as_deref() == Some(summary.note_id.as_str());
+        let text = format!("- {}", single_line(&summary.text, content_cols.saturating_sub(2)));
+        let fg = if hovered { colors.hover_text } else { colors.text };
+        let note_id = summary.note_id.clone();
+        let mut row = div()
+            .id(("wn-preview-note", index))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_sm()
+            .text_color(fg);
+        if hovered {
+            // Accent bar signals the hovered row without a background tint.
+            row = row.child(div().w(px(2.0)).h(px(14.0)).bg(colors.accent));
+        }
+        row.child(div().flex_1().child(text))
+            .hover(move |s| s.text_color(colors.hover_text))
+            .on_click(cx.listener(move |this, _, _win, ctx| {
+                ctx.stop_propagation();
+                ctx.emit(WorkspaceNotesPreviewAction::ArchiveNote(note_id.clone()));
+                this.hovered_note_id = None;
+            }))
+            .into_any_element()
+    }
+
+    fn render_affordance(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = self.colors;
+        let hovered = self.affordance_hovered;
+        let (bg, border, fg) = if hovered {
+            (colors.affordance_hover_bg, colors.accent, colors.hover_text)
         } else {
-            (self.colors.bg, self.colors.border, self.colors.muted)
+            (colors.bg, colors.border, colors.muted)
         };
-        // Inner background (slightly elevated vs the preview bg so the button
-        // reads as a distinct surface).
-        self.push_solid_rect(Rect { x, y, width, height }, bg_color);
-        // Border edges (1px).
-        self.push_solid_rect(Rect { x, y, width, height: 1.0 }, border_color);
-        self.push_solid_rect(Rect { x, y: y + height - 1.0, width, height: 1.0 }, border_color);
-        self.push_solid_rect(Rect { x, y, width: 1.0, height }, border_color);
-        self.push_solid_rect(Rect { x: x + width - 1.0, y, width: 1.0, height }, border_color);
-        // Center "+" glyph in the middle column of the affordance.
-        let glyph_col = left_col + (AFFORDANCE_COLS / 2);
-        self.emit_text("+", row, glyph_col, glyph_fg);
+        div()
+            .flex()
+            .justify_end()
+            .child(
+                div()
+                    .id("wn-preview-affordance")
+                    .px_2()
+                    .rounded_sm()
+                    .bg(bg)
+                    .border_1()
+                    .border_color(border)
+                    .text_sm()
+                    .text_color(fg)
+                    .hover(move |s| s.bg(colors.affordance_hover_bg))
+                    .child("+")
+                    .on_click(cx.listener(|_, _, _win, ctx| {
+                        ctx.stop_propagation();
+                        ctx.emit(WorkspaceNotesPreviewAction::OpenEditor);
+                    })),
+            )
+            .into_any_element()
     }
 
-    fn draw_editor_row(&mut self, state: &AddingNoteState) {
-        let cell_h = self.cell_size.1;
-        let start_row = self.layout.bottom_zone_row;
-        let editor_rows = self.layout.editor_rows.max(1);
-        let editor_x = self.layout.rect.x + 1.0;
-        let editor_y = self.layout.rect.y + grid_height(start_row, cell_h);
-        let editor_w = (self.layout.rect.width - 2.0).max(0.0);
-        let editor_h = grid_height(editor_rows, cell_h);
-
-        // Underline-only treatment: a single 1px line directly below the
-        // editor's text cells (in the preview's bottom-pad row, not inside
-        // the cell). Placing it at the very last px of the editor cell would
-        // get punched through by glyph descenders since `emit_text` cells
-        // occupy a full `cell_w × cell_h` rect per the renderer's CellInstance
-        // contract (`size: [0,0]` ⇒ uniform cell size).
-        self.push_solid_rect(
-            Rect { x: editor_x, y: editor_y + editor_h, width: editor_w, height: 1.0 },
-            self.colors.border,
-        );
-
-        // Render wrapped lines.
-        let content_cols = self.editor_content_cols();
+    fn render_editor(&self, state: &AddingNoteState, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = self.colors;
+        let cols = preview_cols(&self.summaries, Some(state));
+        let content_cols = editor_content_cols(cols);
+        let rows = editor_rows(&state.draft_text, content_cols, self.max_editor_rows);
         let wrapped = wrap_text_for_editor(&state.draft_text, content_cols);
-        let total_lines = wrapped.len();
-        let scroll = state.scroll_offset_rows.min(total_lines.saturating_sub(editor_rows));
-        let caret_line_idx = caret_line_index(&state.draft_text, state.caret_byte, content_cols);
-        self.draw_editor_text(EditorTextArgs {
-            state,
-            wrapped: &wrapped,
-            scroll,
-            editor_rows,
-            start_row,
-            caret_line_idx,
-            content_cols,
-        });
+        let caret_line = caret_line_index(&state.draft_text, state.caret_byte, content_cols);
+        let scroll = state.scroll_offset_rows.min(wrapped.len().saturating_sub(rows));
 
-        // FR-022 third input: overlay scrollbar inside the editor when content
-        // exceeds the visible row budget. Static thin indicator for now; the
-        // full `ScrollbarState` fade-animation reuse is a follow-up polish.
-        if total_lines > editor_rows {
-            self.draw_editor_scrollbar(EditorScrollbarArgs {
-                editor_x,
-                editor_y,
-                editor_w,
-                editor_h,
-                total_lines,
-                editor_rows,
-                scroll,
-            });
-        }
-
-        // Optional error row below the editor.
-        let error =
-            self.layout.has_editor_error.then_some(state.last_server_error.as_deref()).flatten();
-        if let Some(err) = error {
-            let row = start_row + editor_rows;
-            let truncated: String = err.chars().take(MAX_EDITOR_ERROR_CHARS).collect();
-            self.emit_text(&truncated, row, PAD_COLS, self.colors.error_text);
-        }
-    }
-
-    fn draw_editor_text(&mut self, args: EditorTextArgs<'_>) {
-        let EditorTextArgs {
-            state,
-            wrapped,
-            scroll,
-            editor_rows,
-            start_row,
-            caret_line_idx,
-            content_cols,
-        } = args;
-        let cell_w = self.cell_size.0;
-        let cell_h = self.cell_size.1;
-        // Accent '›' prompt on the editor's first visual row only — it is a
-        // fixed prompt indicator, not a per-row bullet. Wrapped continuation
-        // rows inherit the indent (via EDITOR_PREFIX_COLS) so the caret column
-        // stays consistent across rows.
-        self.emit_text("›", start_row, PAD_COLS, self.colors.accent);
-        let text_col = PAD_COLS + EDITOR_PREFIX_COLS;
-        for visual_idx in 0..editor_rows {
+        let mut lines = Vec::new();
+        for visual_idx in 0..rows {
             let line_index = scroll + visual_idx;
             let Some(line) = wrapped.get(line_index) else { continue };
-            let row = start_row + visual_idx;
-            self.emit_text(line, row, text_col, self.colors.text);
-            if line_index != caret_line_idx {
-                continue;
+            let mut row = div().flex().items_center().text_sm().text_color(colors.text);
+            if line_index == caret_line {
+                let caret_col =
+                    caret_visible_col(&state.draft_text, state.caret_byte, content_cols);
+                let (head, tail) = split_at_char(line, caret_col);
+                row = row
+                    .child(div().child(head))
+                    .child(div().w(px(2.0)).h(px(14.0)).bg(colors.accent))
+                    .child(div().child(tail));
+            } else {
+                row = row.child(div().child(line.clone()));
             }
-            let caret_col = caret_visible_col(&state.draft_text, state.caret_byte, content_cols);
-            let caret_x = self.layout.rect.x + grid_width(text_col + caret_col, cell_w);
-            let caret_y = self.layout.rect.y + grid_height(row, cell_h);
-            self.push_solid_rect(
-                Rect { x: caret_x, y: caret_y, width: 1.5, height: cell_h },
-                self.colors.accent,
-            );
+            lines.push(row.into_any_element());
         }
-    }
 
-    fn draw_editor_scrollbar(&mut self, args: EditorScrollbarArgs) {
-        let EditorScrollbarArgs {
-            editor_x,
-            editor_y,
-            editor_w,
-            editor_h,
-            total_lines,
-            editor_rows,
-            scroll,
-        } = args;
-        let cell_h = self.cell_size.1;
-        let track_x = editor_x + editor_w - 3.0;
-        let track_w = 2.0;
-        let track_y = editor_y + 1.0;
-        let track_h = (editor_h - 2.0).max(0.0);
-        let thumb_ratio = ratio_f32(editor_rows, total_lines);
-        let thumb_h = (track_h * thumb_ratio).max(cell_h.min(track_h));
-        let max_offset = total_lines.saturating_sub(editor_rows).max(1);
-        let scroll_ratio = ratio_f32(scroll, max_offset).clamp(0.0, 1.0);
-        let thumb_y = track_y + (track_h - thumb_h) * scroll_ratio;
-        self.push_solid_rect(
-            Rect { x: track_x, y: thumb_y, width: track_w, height: thumb_h },
-            self.colors.accent,
-        );
-    }
-
-    fn content_cols(&self) -> usize {
-        self.layout.cols.saturating_sub(PAD_COLS * 2)
-    }
-
-    fn editor_content_cols(&self) -> usize {
-        self.layout.cols.saturating_sub(PAD_COLS * 2 + EDITOR_PREFIX_COLS).max(1)
-    }
-
-    fn draw_row_hover(&mut self, row: usize) {
-        let cell_h = self.cell_size.1;
-        let x = self.layout.rect.x + 1.0;
-        let y = self.layout.rect.y + grid_height(row, cell_h);
-        let width = (self.layout.rect.width - 2.0).max(0.0);
-        // Hover signal is the accent bar alone (no row tint) — the bar marks
-        // the row before the "- text" glyphs without changing the row's
-        // background, and brighter `hover_text` carries the contrast cue.
-        self.push_solid_rect(
-            Rect { x, y, width: HOVER_ACCENT_BAR_W.min(width), height: cell_h },
-            self.colors.accent,
-        );
-    }
-
-    fn push_solid_rect(&mut self, rect: Rect, color: [f32; 4]) {
-        self.out.push(CellInstance {
-            pos: [rect.x, rect.y],
-            size: [rect.width, rect.height],
-            uv_min: [0.0, 0.0],
-            uv_max: [0.0, 0.0],
-            fg_color: color,
-            bg_color: color,
-            corner_radius: 0.0,
-        });
-    }
-
-    fn emit_text(&mut self, text: &str, row: usize, start_col: usize, fg: [f32; 4]) {
-        let y = self.layout.rect.y + grid_height(row, self.cell_size.1);
-        for (idx, ch) in text.chars().enumerate() {
-            let col = start_col + idx;
-            if col >= self.layout.cols {
-                break;
-            }
-            let x = self.layout.rect.x + grid_width(col, self.cell_size.0);
-            let (uv_min, uv_max) = (self.resolve_glyph)(ch);
-            self.out.push(CellInstance {
-                pos: [x, y],
-                size: [0.0, 0.0],
-                uv_min,
-                uv_max,
-                fg_color: fg,
-                bg_color: self.colors.bg,
-                corner_radius: 0.0,
-            });
+        let mut editor = div()
+            .id("wn-preview-editor")
+            .w_full()
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_1()
+                    .child(div().text_sm().text_color(colors.accent).child("›"))
+                    .child(div().flex().flex_col().flex_1().children(lines)),
+            )
+            .on_click(cx.listener(|_, _, _win, ctx| {
+                ctx.stop_propagation();
+                ctx.emit(WorkspaceNotesPreviewAction::FocusEditor);
+            }));
+        if let Some(error) = &state.last_server_error {
+            editor = editor
+                .child(div().text_xs().text_color(colors.error_text).child(single_line(error, 64)));
         }
+        editor.into_any_element()
     }
 }
 
-fn single_line(text: &str, max_chars: usize) -> String {
+impl Render for WorkspaceNotesPreviewView {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors;
+        let cols = preview_cols(&self.summaries, self.inline_editor.as_ref());
+        let content_cols = cols.saturating_sub(PAD_COLS * 2);
+
+        let mut rows = Vec::new();
+        if self.summaries.is_empty() {
+            rows.push(
+                div()
+                    .text_sm()
+                    .text_color(colors.muted)
+                    .child("No active notes")
+                    .into_any_element(),
+            );
+        } else {
+            let visible = self.summaries.len().min(MAX_PREVIEW_ROWS);
+            let summaries: Vec<_> = self.summaries.iter().take(visible).cloned().collect();
+            for (index, summary) in summaries.iter().enumerate() {
+                rows.push(self.render_note_row(index, summary, content_cols, cx));
+            }
+            let overflow = self.total_count.saturating_sub(visible);
+            if overflow > 0 {
+                rows.push(
+                    div()
+                        .text_sm()
+                        .text_color(colors.muted)
+                        .child(format!("+{overflow} more"))
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let bottom = if let Some(state) = self.inline_editor.clone() {
+            self.render_editor(&state, cx)
+        } else {
+            self.render_affordance(cx)
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .p_1()
+            .bg(colors.bg)
+            .border_1()
+            .border_color(colors.border)
+            .rounded_sm()
+            .shadow_md()
+            .children(rows)
+            .child(bottom)
+    }
+}
+
+/// Flatten whitespace runs to single spaces, cap at `max_chars`, and append an
+/// ellipsis when truncated. Ported from the winit preview `single_line`.
+#[must_use]
+pub fn single_line(text: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut count = 0usize;
     let mut previous_was_space = false;
@@ -633,47 +383,29 @@ fn single_line(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn clamp_axis(value: f32, size: f32, min: f32, max: f32) -> f32 {
-    let max_value = (max - size).max(min);
-    value.clamp(min, max_value)
+fn split_at_char(text: &str, char_col: usize) -> (String, String) {
+    let byte = text.char_indices().nth(char_col).map_or(text.len(), |(i, _)| i);
+    (text[..byte].to_owned(), text[byte..].to_owned())
 }
 
-/// Lossless ratio of two non-negative cell counts. Both inputs are clamped to
-/// `u16::MAX` (matching the renderer's grid-unit limit) before conversion to
-/// `f32`, so the resulting division is exact. Returns 0.0 when the denominator
-/// is zero.
-fn ratio_f32(num: usize, denom: usize) -> f32 {
-    let n = u16::try_from(num.min(usize::from(u16::MAX))).unwrap_or(u16::MAX);
-    let d = u16::try_from(denom.min(usize::from(u16::MAX))).unwrap_or(u16::MAX);
-    if d == 0 { 0.0 } else { f32::from(n) / f32::from(d) }
-}
-
-fn render_grid_units(units: usize) -> u16 {
-    u16::try_from(units.min(MAX_GRID_UNITS)).unwrap_or(u16::MAX)
-}
-
-fn grid_width(cols: usize, cell_w: f32) -> f32 {
-    f32::from(render_grid_units(cols)) * cell_w
-}
-
-fn grid_height(rows: usize, cell_h: f32) -> f32 {
-    f32::from(render_grid_units(rows)) * cell_h
-}
-
-fn with_alpha(color: [f32; 4], alpha: f32) -> [f32; 4] {
-    let [red, green, blue, _] = color;
-    [red, green, blue, alpha.clamp(0.0, 1.0)]
+fn with_alpha(color: Rgba, alpha: f32) -> Rgba {
+    Rgba { a: alpha.clamp(0.0, 1.0), ..color }
 }
 
 fn lighten(color: [f32; 4], amount: f32) -> [f32; 4] {
-    let [red, green, blue, alpha] = color;
-    [(red + amount).min(1.0), (green + amount).min(1.0), (blue + amount).min(1.0), alpha]
+    [
+        (color[0] + amount).min(1.0),
+        (color[1] + amount).min(1.0),
+        (color[2] + amount).min(1.0),
+        color[3],
+    ]
 }
 
-/// Compute the visual row count needed to render `text` wrapped at `cols`
-/// content-columns. Explicit `\n` characters break to a new visual row; long
-/// lines wrap at the column boundary.
-fn wrapped_row_count(text: &str, cols: usize) -> usize {
+/// Visual row count for `text` wrapped at `cols` columns; explicit `\n` breaks a
+/// row and long lines wrap at the column boundary. Ported from the winit
+/// `wrapped_row_count`.
+#[must_use]
+pub fn wrapped_row_count(text: &str, cols: usize) -> usize {
     if cols == 0 {
         return 1;
     }
@@ -694,9 +426,10 @@ fn wrapped_row_count(text: &str, cols: usize) -> usize {
     rows
 }
 
-/// Wrap `text` into visual lines suitable for emitting one per row in the
-/// editor area. Returns at least one (possibly empty) line.
-fn wrap_text_for_editor(text: &str, cols: usize) -> Vec<String> {
+/// Wrap `text` into visual lines suitable for one-per-row rendering. Returns at
+/// least one (possibly empty) line. Ported from the winit `wrap_text_for_editor`.
+#[must_use]
+pub fn wrap_text_for_editor(text: &str, cols: usize) -> Vec<String> {
     let cols = cols.max(1);
     let mut lines: Vec<String> = vec![String::new()];
     let mut col = 0usize;
@@ -718,10 +451,10 @@ fn wrap_text_for_editor(text: &str, cols: usize) -> Vec<String> {
     lines
 }
 
-/// Longest visible-line length (in characters) inside `text`, where lines are
-/// split on explicit `\n`. Used to size the preview width when the inline
-/// editor has wider content than the read-only notes.
-fn longest_visible_line_chars(text: &str) -> usize {
+/// Longest visible-line length (chars), split on explicit `\n`. Ported from the
+/// winit `longest_visible_line_chars`.
+#[must_use]
+pub fn longest_visible_line_chars(text: &str) -> usize {
     let mut longest = 0usize;
     let mut current = 0usize;
     for ch in text.chars() {
@@ -735,9 +468,10 @@ fn longest_visible_line_chars(text: &str) -> usize {
     longest.max(current)
 }
 
-/// Visual line index (0-based among `wrap_text_for_editor` output) for the
-/// caret, given the caret's byte offset into the unwrapped text.
-fn caret_line_index(text: &str, caret_byte: usize, cols: usize) -> usize {
+/// Visual line index (0-based) for the caret at `caret_byte`. Ported from the
+/// winit `caret_line_index`.
+#[must_use]
+pub fn caret_line_index(text: &str, caret_byte: usize, cols: usize) -> usize {
     let cols = cols.max(1);
     let mut lines = 0usize;
     let mut col = 0usize;
@@ -761,8 +495,10 @@ fn caret_line_index(text: &str, caret_byte: usize, cols: usize) -> usize {
     lines
 }
 
-/// Column inside the caret's visual line (0-based).
-fn caret_visible_col(text: &str, caret_byte: usize, cols: usize) -> usize {
+/// Column (0-based) inside the caret's visual line. Ported from the winit
+/// `caret_visible_col`.
+#[must_use]
+pub fn caret_visible_col(text: &str, caret_byte: usize, cols: usize) -> usize {
     let cols = cols.max(1);
     let mut col = 0usize;
     let mut bytes = 0usize;
@@ -782,3 +518,6 @@ fn caret_visible_col(text: &str, caret_byte: usize, cols: usize) -> usize {
     }
     col
 }
+
+#[cfg(test)]
+mod tests;

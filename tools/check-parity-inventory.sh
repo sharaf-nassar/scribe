@@ -507,7 +507,7 @@ compare_sets(
     [ map { $_->{name} } @{ $rows{'Server messages'} // [] } ],
 );
 
-my $input = slurp("$root/crates/scribe-client/src/input.rs");
+my $input = slurp("$root/crates/scribe-client/src/keybindings.rs");
 my ($bindings) = $input =~ /\bpub struct Bindings\s*\{(.*?)\n\}/s;
 die "parity: could not find pub struct Bindings\n" unless defined $bindings;
 my @actions = $bindings =~ /^    pub (\w+): BindingSet,/gm;
@@ -521,7 +521,7 @@ compare_sets(
 # A `ServerMessage` the terminal window's reader does not act on is only
 # legitimately reachable through the settings window's synchronous
 # request/reply helper, and the row has to say so.
-my $main_code = strip_noise(slurp("$root/crates/scribe-client-gpui/src/main.rs"));
+my $main_code = strip_noise(slurp("$root/crates/scribe-client/src/main.rs"));
 my $reader = fn_body($main_code, 'dispatch_server_message');
 my %handled = map { $_ => 1 } ($reader =~ /ServerMessage::(\w+)/g);
 for my $row (@{ $rows{'Server messages'} // [] }) {

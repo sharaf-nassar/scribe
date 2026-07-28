@@ -226,7 +226,7 @@ assert_pixels_changed() {
 wait_for_client_exit() {
     local timeout_secs="$1" started
     started=$(date +%s)
-    while pgrep -f 'scribe-client-gpui' >/dev/null 2>&1; do
+    while pgrep -f 'scribe-client' >/dev/null 2>&1; do
         if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
             return 1
         fi
@@ -236,7 +236,7 @@ wait_for_client_exit() {
 }
 
 launch_client() {
-    scribe-client-gpui >>"$CLIENT_LOG" 2>&1 &
+    scribe-client >>"$CLIENT_LOG" 2>&1 &
     xdotool search --sync --name "Scribe" >/dev/null 2>&1 || true
     sleep 2
 }
@@ -422,9 +422,9 @@ echo "PHASE 4 PASS: DispatchAction/ActionDispatched round tripped and RunAction 
 
 # ── Phase 5: the tailnet dial preamble against the same stand-in peer ───────
 kill "${SCRIBE_CLIENT_PID:-0}" 2>/dev/null || true
-pkill -f 'scribe-client-gpui' 2>/dev/null || true
+pkill -f 'scribe-client' 2>/dev/null || true
 wait_for_client_exit 15 || fail "PHASE 5: the local client did not exit"
-SCRIBE_REMOTE_DIAL="127.0.0.1:$REMOTE_PORT" scribe-client-gpui >/output/remote-client.log 2>&1 &
+SCRIBE_REMOTE_DIAL="127.0.0.1:$REMOTE_PORT" scribe-client >/output/remote-client.log 2>&1 &
 xdotool search --sync --name "Scribe" >/dev/null 2>&1 || true
 sleep 2.0
 focus

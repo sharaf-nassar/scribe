@@ -42,7 +42,7 @@ echo "PHASE 2 PASS: client closed"
 # wedge the container for the rest of its life: TEST_TIMEOUT governs the test
 # process, not whatever that process leaves running.
 CLIENT_LOG="${SCRIBE_CLIENT_LOG:-/output/client.log}"
-scribe-client-gpui >>"$CLIENT_LOG" 2>&1 &
+scribe-client >>"$CLIENT_LOG" 2>&1 &
 RELAUNCHED_CLIENT_PID=$!
 trap 'kill "${RELAUNCHED_CLIENT_PID:-0}" 2>/dev/null || true' EXIT
 sleep 2
@@ -61,7 +61,7 @@ echo "PHASE 4 PASS: after-reconnect screenshot captured"
 # Tear the relaunched client down and wait for it to actually go, the same way
 # every other relaunching visual script ends. Leaving it running is what made
 # this test pass and then hang its container.
-# The check is on this pid, not on `pgrep scribe-client-gpui`: the client the
+# The check is on this pid, not on `pgrep scribe-client`: the client the
 # entrypoint launched survives phase 2's `windowclose` and is the entrypoint's
 # own APP_PID to reap.
 kill "$RELAUNCHED_CLIENT_PID" 2>/dev/null || true

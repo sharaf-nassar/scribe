@@ -220,11 +220,11 @@ send_keys() {
     sleep 0.5
 }
 
-# Wait for every scribe-client-gpui process to be gone.
+# Wait for every scribe-client process to be gone.
 wait_for_client_exit() {
     local timeout_secs="$1" started
     started=$(date +%s)
-    while pgrep -f 'scribe-client-gpui' >/dev/null 2>&1; do
+    while pgrep -f 'scribe-client' >/dev/null 2>&1; do
         if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
             return 1
         fi
@@ -234,7 +234,7 @@ wait_for_client_exit() {
 }
 
 launch_client() {
-    scribe-client-gpui >>"$CLIENT_LOG" 2>&1 &
+    scribe-client >>"$CLIENT_LOG" 2>&1 &
     xdotool search --sync --name "Scribe" >/dev/null 2>&1 || true
     sleep 2
 }
@@ -317,7 +317,7 @@ crop_body /output/03a-before-close.png /output/03a-body.png
 send_keys alt+F4
 sleep 1.0
 shot /output/03-close-dialog.png
-pgrep -f 'scribe-client-gpui' >/dev/null 2>&1 \
+pgrep -f 'scribe-client' >/dev/null 2>&1 \
     || fail "PHASE 3: the client closed on WM_DELETE_WINDOW instead of asking"
 # The modal dims and covers the grid, so a changed body crop is the dialog and
 # nothing else; the crop excludes the status bar, whose sparklines resample

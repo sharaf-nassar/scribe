@@ -132,7 +132,12 @@ Manual coverage lives in `specs/002-smart-selection/quickstart.md`: configure qu
 
 Offline shell harness for Debian `postinst` behavior so packaging regressions can be caught without touching the live user session.
 
-`tests/install/postinst-regressions.sh` sources only the variable and function definitions from `dist/debian/postinst` (truncating before the `SERVER_RUNTIME_GENERATION` invocation so the case-statement and trailing `exit 0` cannot terminate the harness) and exercises individual functions against fixtures. A python launcher `os.fork()`s a child that exits immediately and then sleeps to keep the orphan in zombie (`Z`) state, since bash auto-reaps its own backgrounded children. The harness currently asserts that `wait_for_pid_exit`, `stop_client_processes`, and `restart_singleton_binary` all treat a zombie PID as exited rather than blocking the post-upgrade relaunch.
+`tests/install/postinst-regressions.sh` sources only function definitions from
+`dist/debian/postinst`, then tests fixtures without a live user session. It
+checks zombie client exits and the Vulkan-less upgrade guard: a failed probe
+restores the preinst stash, leaves a running session alive, emits a warning,
+and disables relaunch. `just test-install-vulkan-guard` runs this guard in a
+disposable Debian container.
 
 ## E2E Functional Tests
 
@@ -184,19 +189,19 @@ Scripted degraded-path coverage proving the client fails loudly (never hangs) wh
 
 ## Visual E2E Tests
 
-Visual end-to-end tests run the real `scribe-client-gpui` window headlessly (`docker/Dockerfile.visual`) and assert against screenshots written to `/output`.
+Visual end-to-end tests run the real `scribe-client` window headlessly (`docker/Dockerfile.visual`) and assert against screenshots written to `/output`.
 
-`docker/entrypoint-visual.sh` starts Xvfb, an `openbox` window manager, `scribe-server`, the daemon, and the GPUI client, then runs the test script. The image also ships `scribe-hook-helper` and the entrypoint exports `SCRIBE_RUNTIME_DIR`, so a test that needs a provider event (task label, AI state, context %) drives the real hook channel instead of forging a frame. The image pins `VK_ICD_FILENAMES` to lavapipe's software Vulkan ICD (shipped in `mesa-vulkan-drivers`) so the client renders deterministically with no GPU, and sets `SCRIBE_DISABLE_ANIMATIONS=1` so consecutive frames are byte-identical. Tests drive the client through `xdotool`/`xclip` and capture frames with `scrot`. An optional `SCRIBE_EXTRA_CONFIG` env var seeds `config.toml` before the *server* starts so a test can exercise opt-in settings (e.g. `terminal.paste_confirmation`); the shared-pane rig appends to the same file, which is why both are written up front rather than one clobbering the other. `SCRIBE_VISUAL_APP=settings` swaps the client launch for `scribe-client-gpui --settings` (logged to `/output/settings.log`) so the settings window can be driven as its own app, and `SCRIBE_SEED_TRUST=1` plants a trusted network and an approved device into the server's LAN trust stores before it starts.
+`docker/entrypoint-visual.sh` starts Xvfb, an `openbox` window manager, `scribe-server`, the daemon, and the GPUI client, then runs the test script. The image also ships `scribe-hook-helper` and the entrypoint exports `SCRIBE_RUNTIME_DIR`, so a test that needs a provider event (task label, AI state, context %) drives the real hook channel instead of forging a frame. The image pins `VK_ICD_FILENAMES` to lavapipe's software Vulkan ICD (shipped in `mesa-vulkan-drivers`) so the client renders deterministically with no GPU, and sets `SCRIBE_DISABLE_ANIMATIONS=1` so consecutive frames are byte-identical. Tests drive the client through `xdotool`/`xclip` and capture frames with `scrot`. An optional `SCRIBE_EXTRA_CONFIG` env var seeds `config.toml` before the *server* starts so a test can exercise opt-in settings (e.g. `terminal.paste_confirmation`); the shared-pane rig appends to the same file, which is why both are written up front rather than one clobbering the other. `SCRIBE_VISUAL_APP=settings` swaps the client launch for `scribe-client --settings` (logged to `/output/settings.log`) so the settings window can be driven as its own app, and `SCRIBE_SEED_TRUST=1` plants a trusted network and an approved device into the server's LAN trust stores before it starts.
 
-The client's stderr is redirected to `/output/client.log` and its pid and log path are exported as `SCRIBE_CLIENT_PID` / `SCRIBE_CLIENT_LOG`, so a script can assert on runtime behaviour that leaves no pixels behind and can prove the process never restarted. `RUST_LOG` defaults to `scribe_server=info,scribe_client_gpui=info` so those client lines are actually emitted.
+The client's stderr is redirected to `/output/client.log` and its pid and log path are exported as `SCRIBE_CLIENT_PID` / `SCRIBE_CLIENT_LOG`, so a script can assert on runtime behaviour that leaves no pixels behind and can prove the process never restarted. `RUST_LOG` defaults to `scribe_server=info,scribe_client=info` so those client lines are actually emitted.
 
 The server's output is captured the same way: the entrypoint exports `SCRIBE_TEST_SERVER_LOG=/output/server.log`, which [[crates/scribe-test/src/server.rs#start]] honours when it spawns `scribe-server`, and re-exports it as `SCRIBE_SERVER_LOG` for scripts. That is how a test proves a *client-to-server* message crossed the wire — the server logs the window id it received it on — rather than trusting the client's own "I sent it" line.
 
-The test script's own output goes to `/output/result.log` by plain redirection, and the entrypoint streams that file to the container's stdout with a `tail -f` it owns and kills. It must never be a pipe: every process a test backgrounds inherits the test's stdout, so while the run was `timeout … | tee /output/result.log`, a single orphaned `scribe-client-gpui` held the write end open, `tee` never saw EOF, and the container hung forever *after* the test printed PASS — `TEST_TIMEOUT` bounds the test process, which had already exited. A file descriptor on the log blocks nothing, so an orphan can no longer wedge an unattended run, and the entrypoint reaps stray clients once the test returns. A script that relaunches the client still owns that process: `tests/e2e/visual/reconnect.sh` logs its phase-3 relaunch to `SCRIBE_CLIENT_LOG` and kills that pid before it exits, the same discipline `tab-window-chords.sh` and `pane-workspace-layout.sh` follow.
+The test script's own output goes to `/output/result.log` by plain redirection, and the entrypoint streams that file to the container's stdout with a `tail -f` it owns and kills. It must never be a pipe: every process a test backgrounds inherits the test's stdout, so while the run was `timeout … | tee /output/result.log`, a single orphaned `scribe-client` held the write end open, `tee` never saw EOF, and the container hung forever *after* the test printed PASS — `TEST_TIMEOUT` bounds the test process, which had already exited. A file descriptor on the log blocks nothing, so an orphan can no longer wedge an unattended run, and the entrypoint reaps stray clients once the test returns. A script that relaunches the client still owns that process: `tests/e2e/visual/reconnect.sh` logs its phase-3 relaunch to `SCRIBE_CLIENT_LOG` and kills that pid before it exits, the same discipline `tab-window-chords.sh` and `pane-workspace-layout.sh` follow.
 
-The GPUI client sets its X11 `WM_NAME`/`_NET_WM_NAME` to `Scribe` via [[crates/scribe-client-gpui/src/main.rs#open_window]] so `xdotool search --name "Scribe"` can locate the window for focus and capture.
+The GPUI client sets its X11 `WM_NAME`/`_NET_WM_NAME` to `Scribe` via [[crates/scribe-client/src/main.rs#open_window]] so `xdotool search --name "Scribe"` can locate the window for focus and capture.
 
-`openbox` is required, not cosmetic: [[crates/scribe-client-gpui/src/x11_focus.rs#X11FocusGuard]] runs on the client's live key path and suppresses synthetic key input whenever `_NET_ACTIVE_WINDOW` does not name the client window, and only a window manager sets that root property under Xvfb. Without a WM, `xdotool`-driven visual tests cannot type.
+`openbox` is required, not cosmetic: [[crates/scribe-client/src/x11_focus.rs#X11FocusGuard]] runs on the client's live key path and suppresses synthetic key input whenever `_NET_ACTIVE_WINDOW` does not name the client window, and only a window manager sets that root property under Xvfb. Without a WM, `xdotool`-driven visual tests cannot type.
 
 Screenshots are taken full-screen because a Vulkan surface may not be readable per-window, so any test that measures pixels must crop to the client window first. The WM title bar is a saturated light blue that on its own clears a "hundreds of colored pixels" threshold — an uncropped measurement passed for months over a completely black grid.
 
@@ -240,7 +245,7 @@ It runs on the [[test#Visual E2E Tests#Shared-pane rig]]. The script used to ope
 
 `tests/e2e/visual/settings-entry.sh` (`just e2e-visual-settings-entry`) is the app-level oracle for the `settings` parity row: it drives the running terminal window and asserts a second top-level window really maps (see [[settings#GPUI Settings Window#In-app entry points]]).
 
-The settings window was complete and unreachable for the whole rebuild — `KeyAction::OpenSettings` hit a swallow arm — so the only evidence that matters is a window on screen, which no `#[gpui::test]` can produce. Four phases drive the real client through XTEST and count windows titled "Scribe Settings", the exact title [[crates/scribe-client-gpui/src/settings/window.rs#open_settings_window]] sets. `ctrl+comma` (the `settings` binding's Linux default) must map that window and paint it; pressing it again from the terminal window must leave the count at one and log the focus line only the retained handle path writes; the palette's "Open Settings" row and the titlebar gear must reach the same handler with the same no-duplicate result.
+The settings window was complete and unreachable for the whole rebuild — `KeyAction::OpenSettings` hit a swallow arm — so the only evidence that matters is a window on screen, which no `#[gpui::test]` can produce. Four phases drive the real client through XTEST and count windows titled "Scribe Settings", the exact title [[crates/scribe-client/src/settings/window.rs#open_settings_window]] sets. `ctrl+comma` (the `settings` binding's Linux default) must map that window and paint it; pressing it again from the terminal window must leave the count at one and log the focus line only the retained handle path writes; the palette's "Open Settings" row and the titlebar gear must reach the same handler with the same no-duplicate result.
 
 Geometry comes from `xwininfo`, not `xdotool getwindowgeometry`: openbox reparents the window into a decorated frame and xdotool reports that frame's origin, so a frame-relative gear click would land in the window manager's own title bar. The gear offset is derived from the titlebar's fixed 34px band and its 34/40px buttons, so a titlebar layout change fails the phase rather than missing silently.
 
@@ -248,7 +253,7 @@ Geometry comes from `xwininfo`, not `xdotool getwindowgeometry`: openbox reparen
 
 `tests/e2e/visual/tab-window-chords.sh` is the scripted oracle for the `close_tab` and `new_window` parity rows, which were unreachable in the running client while their headless coverage stayed green.
 
-Both chords were claimed by [[crates/scribe-client-gpui/src/main.rs#TerminalView#handle_overlay_key]] before the binding dispatcher ever saw them, so only the live window can prove the fix. The script presses `ctrl+shift+q` and waits for the `closing the active tab` line that [[crates/scribe-client-gpui/src/main.rs#TerminalView#close_active_tab]] alone writes, then presses `ctrl+shift+n` and requires both the `opened a new terminal window` line and a second mapped X11 window — a log line alone would not distinguish "the action ran" from "a window actually appeared". A third phase opens the close dialog on its relocated `ctrl+shift+d` and asserts the frame really repainted, so moving the overlay off `close_tab`'s default did not strand the surface. It reuses the session-adoption preamble documented under [[test#Visual E2E Tests#Overlay actions run for real]].
+Both chords were claimed by [[crates/scribe-client/src/main.rs#TerminalView#handle_overlay_key]] before the binding dispatcher ever saw them, so only the live window can prove the fix. The script presses `ctrl+shift+q` and waits for the `closing the active tab` line that [[crates/scribe-client/src/main.rs#TerminalView#close_active_tab]] alone writes, then presses `ctrl+shift+n` and requires both the `opened a new terminal window` line and a second mapped X11 window — a log line alone would not distinguish "the action ran" from "a window actually appeared". A third phase opens the close dialog on its relocated `ctrl+shift+d` and asserts the frame really repainted, so moving the overlay off `close_tab`'s default did not strand the surface. It reuses the session-adoption preamble documented under [[test#Visual E2E Tests#Overlay actions run for real]].
 
 ### Pane and workspace layout is live
 
@@ -272,7 +277,7 @@ The inbound half is injected rather than provoked, because that is what makes it
 
 `tests/e2e/visual/workspace-notes.sh` (`just e2e-visual-workspace-notes`) is the app-level oracle for the `WorkspaceNotesGet` / `WorkspaceNotesMutate` client rows and the inbound `WorkspaceNotesSnapshot` / `WorkspaceNotesChanged` rows (see [[client#GPUI Workspace Notes#GPUI Workspace Notes IPC]]).
 
-Before opening the modal, the test hovers the real titlebar notes affordance and compares its window capture with the attached-pane baseline. The minimum pixel delta proves [[crates/scribe-client-gpui/src/main.rs#TerminalView#set_workspace_notes_preview]] reaches the visible hover-preview view, not only its unit-tested model.
+Before opening the modal, the test hovers the real titlebar notes affordance and compares its window capture with the attached-pane baseline. The minimum pixel delta proves [[crates/scribe-client/src/main.rs#TerminalView#set_workspace_notes_preview]] reaches the visible hover-preview view, not only its unit-tested model.
 
 The gap those rows had was not correctness but reality: the modal opened against a workspace id the client had just minted for itself, and both server answers fell into the reader's drop counter, so nothing the server said could ever reach the screen. Every `#[gpui::test]` over the modal passes in that world, so the [[crates/scribe-test/src/share_tap.rs#run]] wire tap (`SCRIBE_SHARE_TAP=1`) records the real socket and the record is truncated at each phase boundary. Phase 0 is the same daemon-stop-and-relaunch preamble [[test#Visual E2E Tests#Overlay actions run for real]] documents; it is also what gives the window a server-minted workspace to open notes for.
 
@@ -290,7 +295,7 @@ Asserting on the log rather than on pixels alone is deliberate: the status bar's
 
 ### X11 focus guard gates the live key path
 
-`tests/e2e/visual/x11-focus-guard.sh` is the scripted oracle for the X11 focus guard parity row: it proves the guard is started by [[crates/scribe-client-gpui/src/main.rs#TerminalView#new]] on the real window and actually gates keystrokes, which no unit test over [[crates/scribe-client-gpui/src/x11_focus.rs#ReactivationDebounce]] can show.
+`tests/e2e/visual/x11-focus-guard.sh` is the scripted oracle for the X11 focus guard parity row: it proves the guard is started by [[crates/scribe-client/src/main.rs#TerminalView#new]] on the real window and actually gates keystrokes, which no unit test over [[crates/scribe-client/src/x11_focus.rs#ReactivationDebounce]] can show.
 
 The probe keystroke is Ctrl+Shift+U, the client-local tooltip-demo toggle, so the guard's verdict is a pure pixel change inside the window and nothing can reach a PTY. The script asserts the startup line naming the guarded window id, then walks three phases: with the client active the toggle changes the tooltip crop; with a second client window holding `_NET_ACTIVE_WINDOW` the same `xdotool key --window` keystroke leaves the crop pixel-identical and adds a `suppressed keystroke` line (proving the key was delivered and dropped, not merely lost); and after re-activation the toggle lands again and the crop returns to its pre-toggle state.
 
@@ -300,7 +305,7 @@ The crop excludes the status bar deliberately — its sparklines resample every 
 
 `tests/e2e/visual/ime-preedit.sh` (`just e2e-visual-ime`) is the scripted oracle for the IME / preedit parity row: it proves the composition handler is actually registered on the live window.
 
-No unit test over [[crates/scribe-client-gpui/src/preedit.rs#PreeditMachine]] can show that — the module shipped complete and unreferenced, and the failure mode is silent: every key falls through to the byte encoder and the raw latin letters land in the shell.
+No unit test over [[crates/scribe-client/src/preedit.rs#PreeditMachine]] can show that — the module shipped complete and unreferenced, and the failure mode is silent: every key falls through to the byte encoder and the raw latin letters land in the shell.
 
 `SCRIBE_IME=1` starts a real input method before the client launches (`ibus-daemon --panel disable --xim`, plus `XMODIFIERS=@im=ibus`), because GPUI's X11 backend finds an XIM server through that variable and reads it once, when it builds its connection. The engine is `table:cangjie3`, whose composition is a fixed table lookup rather than a phonetic guess, so `h`-`q`-`i` (竹手戈) yields 我 every run. `--daemonize` is load-bearing: without it ibus watches the shell that launched it and exits before any engine registers. The rig also runs on the [[test#Visual E2E Tests#Shared-pane rig]] with a UTF-8 locale exported before the server starts, so `scribe-test` reads the very pane the client types into and bash's readline will accept multibyte input.
 
@@ -410,9 +415,9 @@ The trim phase drives the server's real AI path — arm the pane with `ScribeAiL
 
 `tests/e2e/visual/session-tooling.sh` is the app-level oracle for the `Subscribe` and `RequestSnapshot` parity rows: it drives the real client against the real server and asserts both frames on the wire at the lifecycle points that produce them.
 
-Neither message could be proven by a headless test, because the gap was reachability — the frames existed in the frozen protocol and nowhere in the client. The run therefore reuses the [[crates/scribe-test/src/share_tap.rs#run]] wire tap (`SCRIBE_SHARE_TAP=1`) purely as a recorder, truncating `/output/share-wire.jsonl` at each phase boundary so a frame found afterwards can only have come from the action that phase performed. Phase 0 is the same daemon-stop-and-relaunch preamble as `overlay-actions.sh`, which is what puts the client on the `ListSessions` → [[crates/scribe-client-gpui/src/main.rs#attach_session]] path.
+Neither message could be proven by a headless test, because the gap was reachability — the frames existed in the frozen protocol and nowhere in the client. The run therefore reuses the [[crates/scribe-test/src/share_tap.rs#run]] wire tap (`SCRIBE_SHARE_TAP=1`) purely as a recorder, truncating `/output/share-wire.jsonl` at each phase boundary so a frame found afterwards can only have come from the action that phase performed. Phase 0 is the same daemon-stop-and-relaunch preamble as `overlay-actions.sh`, which is what puts the client on the `ListSessions` → [[crates/scribe-client/src/main.rs#attach_session]] path.
 
-The `Subscribe` half asserts a client frame naming the attached session, that its record line follows the `AttachSessions` that authorises it, and that `scribe-server` logged no `Subscribe denied for unattached session`. The `RequestSnapshot` half types a marker into the pane, edits `appearance.font_size` under the running window so [[crates/scribe-client-gpui/src/main.rs#TerminalView#report_cell_metrics]] fires, then asserts the request follows its `Resize`, that the server answered with a `ScreenSnapshot` whose per-cell grid contains the marker, and that the client logged `repainted pane from server screen snapshot` with the same `cols`/`rows` the recorded frame carried — tying the repaint to that exact reply rather than to some other snapshot.
+The `Subscribe` half asserts a client frame naming the attached session, that its record line follows the `AttachSessions` that authorises it, and that `scribe-server` logged no `Subscribe denied for unattached session`. The `RequestSnapshot` half types a marker into the pane, edits `appearance.font_size` under the running window so [[crates/scribe-client/src/main.rs#TerminalView#report_cell_metrics]] fires, then asserts the request follows its `Resize`, that the server answered with a `ScreenSnapshot` whose per-cell grid contains the marker, and that the client logged `repainted pane from server screen snapshot` with the same `cols`/`rows` the recorded frame carried — tying the repaint to that exact reply rather than to some other snapshot.
 ### Terminal bell attention routing
 
 `tests/e2e/visual/bell.sh` is the app-level oracle for the `Bell` parity row: it drives a real BEL byte out of a real shell and asserts what the running client does with it (see [[client#GPUI Client Spike#Bell Routing]]).
@@ -425,7 +430,7 @@ The routed behaviour is asserted as a window property rather than as pixels. `Wi
 
 `tests/e2e/visual/lan-approval.sh` is the app-level oracle for the eleven feature-014 LAN rows: it drives the real client against the real server and asserts both the pixels and two separate wires.
 
-[[crates/scribe-client-gpui/src/lan_approval.rs#LanApprovalDialog]] passed its headless suite for months while `lan_approval.rs` was outside `main.rs`'s import closure, which is exactly the failure mode this script exists to catch — so every assertion is either a frame recorded leaving the real client or a pixel change in the real window.
+[[crates/scribe-client/src/lan_approval.rs#LanApprovalDialog]] passed its headless suite for months while `lan_approval.rs` was outside `main.rs`'s import closure, which is exactly the failure mode this script exists to catch — so every assertion is either a frame recorded leaving the real client or a pixel change in the real window.
 
 Two rigs stand in for what one machine cannot supply, and neither fakes the client or the protocol. The [[crates/scribe-test/src/share_tap.rs#run]] wire tap (`SCRIBE_SHARE_TAP=1`) relays the Unix socket, recording every frame in both directions; `LanApprovalRequest` is injected through it because the owning server only pushes one for a real unknown device. [[crates/scribe-test/src/lan_peer.rs#run]] (`scribe-test lan-peer`) stands in for the second machine's LAN listener: it borrows this machine's own device identity over `GetLanDialIdentity` and terminates a REAL mutual-TLS handshake with the same `LanTls` builder the shipped listener uses, so the `LanHello` it records is the one the client actually put on the encrypted wire. `SCRIBE_KEYRING=1` starts a session D-Bus and an unlocked gnome-keyring in the entrypoint, because the LAN device key is keyring-sealed and `scribe-server` fails closed without one — every other visual test keeps the lighter, keyring-free container.
 
@@ -437,7 +442,7 @@ Phase 1's baselines are sampled before the relaunch, because the LAN probe runs 
 
 `tests/e2e/visual/remote-control.sh` is the app-level oracle for the eleven feature-013 tailnet rows: it drives the real client against the real server and asserts both the pixels and two separate wires.
 
-[[crates/scribe-client-gpui/src/remote_handshake.rs#perform_remote_handshake]] and [[crates/scribe-client-gpui/src/lost_control.rs#LostControlState]] passed their headless suites for months while both modules sat outside `main.rs`'s import closure, which is exactly the failure mode this script exists to catch — so every assertion is either a frame recorded leaving the real client or a pixel change in the real window.
+[[crates/scribe-client/src/remote_handshake.rs#perform_remote_handshake]] and [[crates/scribe-client/src/lost_control.rs#LostControlState]] passed their headless suites for months while both modules sat outside `main.rs`'s import closure, which is exactly the failure mode this script exists to catch — so every assertion is either a frame recorded leaving the real client or a pixel change in the real window.
 
 Two rigs stand in for what one machine cannot supply. The [[crates/scribe-test/src/share_tap.rs#run]] wire tap (`SCRIBE_SHARE_TAP=1`) relays the Unix socket, recording every frame in both directions; `WindowTakenOver`, `RemoteDisconnect` and the viewer `ShareRoster` are injected through it because the owning server only produces them for a real second machine. [[crates/scribe-test/src/remote_peer.rs#run]] (`scribe-test remote-peer`) stands in for the second machine's tailnet listener — a much smaller rig than its LAN twin, because the tailnet transport is plain TCP and identity is `tailscaled`'s `WhoIs` on the owning side, so there is nothing to borrow and nothing to pin. It refuses any first frame but `RemoteHandshake`, answers the mandatory reply, and splices an accepted connection directly to the tap's upstream server socket so the GPUI client remains the tap's injection target.
 
@@ -449,7 +454,7 @@ Phase 1's baselines are sampled before the relaunch, for the same reason the LAN
 
 `tests/e2e/visual/settings-trust.sh` is the app-level oracle for the feature-014 trust rows and the env-preflight row: it drives the real settings window against the real server and asserts each control's frame on the wire.
 
-A green unit test over [[crates/scribe-client-gpui/src/settings/server_action.rs]] cannot show anything here — every one of those helpers passed its parser tests while having no caller at all. The run therefore starts the container with `SCRIBE_VISUAL_APP=settings`, which launches `scribe-client-gpui --settings` instead of the terminal window, plus `SCRIBE_SHARE_TAP=1`. The tap is mandatory rather than optional: the settings window never registers a client connection, so its one-shot transient sockets are observable only in the tap's `/output/share-wire.jsonl` record.
+A green unit test over [[crates/scribe-client/src/settings/server_action.rs]] cannot show anything here — every one of those helpers passed its parser tests while having no caller at all. The run therefore starts the container with `SCRIBE_VISUAL_APP=settings`, which launches `scribe-client --settings` instead of the terminal window, plus `SCRIBE_SHARE_TAP=1`. The tap is mandatory rather than optional: the settings window never registers a client connection, so its one-shot transient sockets are observable only in the tap's `/output/share-wire.jsonl` record.
 
 `SCRIBE_SEED_TRUST=1` plants one trusted network and one approved device into the server's `lan_trusted_networks.toml` / `lan_trusted_devices.toml` before it starts, because a single container has no second machine to approve and no fingerprintable Wi-Fi to trust — without the seed the Remove and Revoke rows would never exist to click. The documents use the real on-disk shape, whose `version` and `owner` fields the server validates on load.
 
@@ -468,7 +473,7 @@ Exiting is asserted as process death rather than as a screenshot, because the wh
 
 ### Cold-restart restore drives the real client
 
-`tests/e2e/visual/cold-restart.sh` (`just e2e-visual-cold-restart`) is the app-level oracle for spec 016's cold-restart restore and window geometry persistence rows. Every assertion is produced by the real `scribe-client-gpui` process (see [[client#Client#GPUI Client Spike#Cold Restart Restore#Live wiring in the GPUI shell]]).
+`tests/e2e/visual/cold-restart.sh` (`just e2e-visual-cold-restart`) is the app-level oracle for spec 016's cold-restart restore and window geometry persistence rows. Every assertion is produced by the real `scribe-client` process (see [[client#Client#GPUI Client Spike#Cold Restart Restore#Live wiring in the GPUI shell]]).
 
 It exists because neither requirement can be shown headlessly and neither can be shown by the daemon stand-in [[test#Test Harness#E2E Functional Tests#Session Lifecycle E2E]] uses. The test therefore reproduces a crash literally: the client is `SIGKILL`ed, because an orderly quit deliberately *deletes* the snapshot, and the disposable test server is then genuinely restarted, so both PTYs die with it and the relaunched client meets the empty `SessionList` that is the only condition under which a snapshot may be replayed. Server readiness is gated on the `scribe-server` process rather than on the socket file, because a stopped server leaves its socket behind and the replacement would otherwise be declared up while it was still losing the lock race.
 
@@ -520,25 +525,25 @@ Phase 2 fills the pane with `seq 1 40` through the shared-pane rig (`SCRIBE_SHAR
 
 ## GPUI IPC Bridge
 
-Unit tests for the GPUI client's [[client#GPUI Client Spike#IPC Bridge]] — the inbound coalescing drain and the outbound [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink]] — proving keystroke-before-output ordering and Zed-style 4 ms / 100-event coalescing over the frozen IPC protocol.
+Unit tests for the GPUI client's [[client#GPUI Client Spike#IPC Bridge]] — the inbound coalescing drain and the outbound [[crates/scribe-client/src/ipc_bridge.rs#IpcSink]] — proving keystroke-before-output ordering and Zed-style 4 ms / 100-event coalescing over the frozen IPC protocol.
 
 ### Coalesce collapses per pane
 
-[[crates/scribe-client-gpui/src/ipc_bridge.rs#coalesce]] folds an interleaved two-pane run into one buffer per pane, preserving first-seen pane order and byte order within each pane; an empty run yields an empty batch.
+[[crates/scribe-client/src/ipc_bridge.rs#coalesce]] folds an interleaved two-pane run into one buffer per pane, preserving first-seen pane order and byte order within each pane; an empty run yields an empty batch.
 
 ### Prompt marks split a pane's output run
 
-A prompt mark or a suppressed-ED-3 snap closes the pane's open output entry, so [[crates/scribe-client-gpui/src/ipc_bridge.rs#coalesce]] emits the bytes before it, then the event, then the bytes after it.
+A prompt mark or a suppressed-ED-3 snap closes the pane's open output entry, so [[crates/scribe-client/src/ipc_bridge.rs#coalesce]] emits the bytes before it, then the event, then the bytes after it.
 
 That ordering is what lets the drain anchor a mark against a grid holding exactly the output that preceded it.
 
 ### Drain coalesces firehose
 
-[[crates/scribe-client-gpui/src/ipc_bridge.rs#run_drain]] batches a 300-event two-pane firehose into at most one `write_output` per pane per 100-event batch, so the total write count stays bounded while every pane's byte stream is reconstructed in exact order.
+[[crates/scribe-client/src/ipc_bridge.rs#run_drain]] batches a 300-event two-pane firehose into at most one `write_output` per pane per 100-event batch, so the total write count stays bounded while every pane's byte stream is reconstructed in exact order.
 
 ### Keystroke before output
 
-A keystroke enqueued on the [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink]] reaches the outbound channel promptly even with a 10 000-event backlog churning through the inbound drain, because the outbound path never traverses the drain.
+A keystroke enqueued on the [[crates/scribe-client/src/ipc_bridge.rs#IpcSink]] reaches the outbound channel promptly even with a 10 000-event backlog churning through the inbound drain, because the outbound path never traverses the drain.
 
 ### Typing under firehose
 
@@ -550,15 +555,15 @@ A `Resize` enqueued on the sink before a `KeyInput` is delivered first, since th
 
 ### Sink reports closed writer
 
-`IpcSink::key_input` returns [[crates/scribe-client-gpui/src/ipc_bridge.rs#SinkClosed]] rather than panicking when the writer task has dropped its receiver.
+`IpcSink::key_input` returns [[crates/scribe-client/src/ipc_bridge.rs#SinkClosed]] rather than panicking when the writer task has dropped its receiver.
 
 ## GPUI Sync Frame Queue
 
-Unit tests for the ported [[client#GPUI Client Spike#IPC Bridge#Sync Frame Queueing]] — [[crates/scribe-client-gpui/src/sync_frames.rs#SyncFrameQueue]] sitting in front of [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#feed_output]] — proving `CSI ? 2026` commit boundaries survive IPC chunking and that expiry and catch-up match the winit client.
+Unit tests for the ported [[client#GPUI Client Spike#IPC Bridge#Sync Frame Queueing]] — [[crates/scribe-client/src/sync_frames.rs#SyncFrameQueue]] sitting in front of [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#feed_output]] — proving `CSI ? 2026` commit boundaries survive IPC chunking and that expiry and catch-up match the winit client.
 
 ### Splits committed burst across IPC boundaries
 
-A synchronized-update frame chunked across four IPC messages (BSU split mid-escape, body in two parts, ESU last) is reassembled by [[crates/scribe-client-gpui/src/sync_frames.rs#SyncFrameQueue#queue_output_frames]] into exactly one committed burst, so a single [[crates/scribe-client-gpui/src/sync_frames.rs#drain_all_committed]] hands the terminal the whole frame with its original markers intact.
+A synchronized-update frame chunked across four IPC messages (BSU split mid-escape, body in two parts, ESU last) is reassembled by [[crates/scribe-client/src/sync_frames.rs#SyncFrameQueue#queue_output_frames]] into exactly one committed burst, so a single [[crates/scribe-client/src/sync_frames.rs#drain_all_committed]] hands the terminal the whole frame with its original markers intact.
 
 ### Preserves per-commit boundaries
 
@@ -566,7 +571,7 @@ A tail frame followed by two distinct sync commits drains as three separate fram
 
 ### Presents one burst per redraw when caught up
 
-With a backlog below [[crates/scribe-client-gpui/src/sync_frames.rs#OUTPUT_FRAME_CATCH_UP_THRESHOLD]], [[crates/scribe-client-gpui/src/sync_frames.rs#drain_until_frame]] applies one committed burst then stops with [[crates/scribe-client-gpui/src/sync_frames.rs#QueueState]] `HasMore`, so light traffic animates incrementally one frame per redraw.
+With a backlog below [[crates/scribe-client/src/sync_frames.rs#OUTPUT_FRAME_CATCH_UP_THRESHOLD]], [[crates/scribe-client/src/sync_frames.rs#drain_until_frame]] applies one committed burst then stops with [[crates/scribe-client/src/sync_frames.rs#QueueState]] `HasMore`, so light traffic animates incrementally one frame per redraw.
 
 ### Drains through backlog past threshold
 
@@ -574,39 +579,39 @@ Once the queue depth exceeds the catch-up threshold, a single `drain_until_frame
 
 ### Flushes raw sync update on expiry
 
-An unterminated `CSI ? 2026 h` arms a 150 ms raw deadline via [[crates/scribe-client-gpui/src/sync_frames.rs#RAW_SYNC_TIMEOUT]]; [[crates/scribe-client-gpui/src/sync_frames.rs#SyncFrameQueue#flush_raw_timeout]] commits nothing before the deadline and, at it, appends the BSU-stripped bytes as a frame so the buffered output still reaches the terminal.
+An unterminated `CSI ? 2026 h` arms a 150 ms raw deadline via [[crates/scribe-client/src/sync_frames.rs#RAW_SYNC_TIMEOUT]]; [[crates/scribe-client/src/sync_frames.rs#SyncFrameQueue#flush_raw_timeout]] commits nothing before the deadline and, at it, appends the BSU-stripped bytes as a frame so the buffered output still reaches the terminal.
 
 ### Flushes parser sync update on expiry
 
-A committed frame that opens but never closes a synchronized update arms the VTE parser's own timeout; [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#flush_parser_sync_timeout]] commits the held bytes at the deadline and clears the parser timeout.
+A committed frame that opens but never closes a synchronized update arms the VTE parser's own timeout; [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#flush_parser_sync_timeout]] commits the held bytes at the deadline and clears the parser timeout.
 
 ### Split sync frame reaches terminal whole
 
-Driving a four-way-split synchronized frame through the queue into a real [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal]] renders the committed content, proving the queue never advances the VTE processor with a torn frame.
+Driving a four-way-split synchronized frame through the queue into a real [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal]] renders the committed content, proving the queue never advances the VTE processor with a torn frame.
 
 ## GPUI URL Detection
 
-Unit tests for the GPUI client's ported [[client#GPUI Client Spike#GPUI URL Detection Port]] scanner — [[crates/scribe-client-gpui/src/url_detect.rs#PaneUrlCache]] over Zed's Alacritty fork — proving byte-for-byte parity with the winit detector across hard-break joins and OSC 8 handling.
+Unit tests for the GPUI client's ported [[client#GPUI Client Spike#GPUI URL Detection Port]] scanner — [[crates/scribe-client/src/url_detect.rs#PaneUrlCache]] over Zed's Alacritty fork — proving byte-for-byte parity with the winit detector across hard-break joins and OSC 8 handling.
 
 ### Explicit hyperlink segment geometry
 
-[[crates/scribe-client-gpui/src/url_detect.rs#segments_from_cells]] collapses a multi-row OSC 8 run into exact per-row [[crates/scribe-client-gpui/src/url_detect.rs#RowSegment]]s, and `Osc8CellRange::contains` hit-tests a partial middle row by its own segment bounds rather than a bounding rectangle, so hover coverage stays exact.
+[[crates/scribe-client/src/url_detect.rs#segments_from_cells]] collapses a multi-row OSC 8 run into exact per-row [[crates/scribe-client/src/url_detect.rs#RowSegment]]s, and `Osc8CellRange::contains` hit-tests a partial middle row by its own segment bounds rather than a bounding rectangle, so hover coverage stays exact.
 
 ## GPUI Terminal Selection
 
-Unit tests for the ported [[client#GPUI Client Spike#GPUI Terminal Selection Port]] state — [[crates/scribe-client-gpui/src/selection.rs]] and its vi-mode wrapper — proving cell/word/line granularity, `WRAPLINE`-aware extraction, and copy-on-select over Zed's Alacritty fork.
+Unit tests for the ported [[client#GPUI Client Spike#GPUI Terminal Selection Port]] state — [[crates/scribe-client/src/selection.rs]] and its vi-mode wrapper — proving cell/word/line granularity, `WRAPLINE`-aware extraction, and copy-on-select over Zed's Alacritty fork.
 
 ### Cell selection extracts a substring
 
-[[crates/scribe-client-gpui/src/selection.rs#extract_text]] over a single-row cell range returns exactly the covered characters.
+[[crates/scribe-client/src/selection.rs#extract_text]] over a single-row cell range returns exactly the covered characters.
 
 ### Reversed cell selection normalizes
 
-A range whose start is after its end extracts the same text as the forward range, because [[crates/scribe-client-gpui/src/selection.rs#SelectionRange#normalized]] orders the endpoints first.
+A range whose start is after its end extracts the same text as the forward range, because [[crates/scribe-client/src/selection.rs#SelectionRange#normalized]] orders the endpoints first.
 
 ### Word bounds snap to word characters
 
-[[crates/scribe-client-gpui/src/selection.rs#word_bounds_at]] expands a cursor inside a token to the full word, treating `_` and other identifier punctuation as word characters.
+[[crates/scribe-client/src/selection.rs#word_bounds_at]] expands a cursor inside a token to the full word, treating `_` and other identifier punctuation as word characters.
 
 ### Word bounds on a delimiter select one cell
 
@@ -614,11 +619,11 @@ A cursor resting on a whitespace delimiter yields a single-cell word range rathe
 
 ### Line bounds span the full row
 
-[[crates/scribe-client-gpui/src/selection.rs#line_bounds_at]] returns the first through last column of the logical line for a non-wrapped row.
+[[crates/scribe-client/src/selection.rs#line_bounds_at]] returns the first through last column of the logical line for a non-wrapped row.
 
 ### WRAPLINE joins a wrapped row without a newline
 
-[[crates/scribe-client-gpui/src/selection.rs#extract_text]] joins a row that ends with the `WRAPLINE` flag to its continuation row without inserting a newline.
+[[crates/scribe-client/src/selection.rs#extract_text]] joins a row that ends with the `WRAPLINE` flag to its continuation row without inserting a newline.
 
 ### Hard line break inserts a newline
 
@@ -626,35 +631,35 @@ A selection spanning two rows separated by a hard line break (no `WRAPLINE`) is 
 
 ### Word bounds follow a wrapped line
 
-[[crates/scribe-client-gpui/src/selection.rs#word_bounds_at]] crosses a `WRAPLINE` boundary so a word split across two screen rows selects as one token.
+[[crates/scribe-client/src/selection.rs#word_bounds_at]] crosses a `WRAPLINE` boundary so a word split across two screen rows selects as one token.
 
 ### Line bounds span a wrapped logical line
 
-[[crates/scribe-client-gpui/src/selection.rs#line_bounds_at]] follows `WRAPLINE` flags to cover every screen row of a wrapped logical line.
+[[crates/scribe-client/src/selection.rs#line_bounds_at]] follows `WRAPLINE` flags to cover every screen row of a wrapped logical line.
 
 ### Contains-cell honors selection shape
 
-[[crates/scribe-client-gpui/src/selection.rs#SelectionRange#contains_cell]] includes only the partial first/last rows and every full middle row of a multi-row selection.
+[[crates/scribe-client/src/selection.rs#SelectionRange#contains_cell]] includes only the partial first/last rows and every full middle row of a multi-row selection.
 
 ### Selection state copies on select
 
-[[crates/scribe-client-gpui/src/selection.rs#SelectionState#copy_text]] returns the selected text after a cell/word/line gesture and `None` for an empty selection.
+[[crates/scribe-client/src/selection.rs#SelectionState#copy_text]] returns the selected text after a cell/word/line gesture and `None` for an empty selection.
 
 ### Word drag extends by whole words
 
-[[crates/scribe-client-gpui/src/selection.rs#SelectionState#drag_to]] in word mode extends the range by whole words from the double-click anchor to the drag point.
+[[crates/scribe-client/src/selection.rs#SelectionState#drag_to]] in word mode extends the range by whole words from the double-click anchor to the drag point.
 
 ### Pixel mapping resolves grid cells
 
-[[crates/scribe-client-gpui/src/selection.rs#pixel_to_grid]] maps a pointer pixel inside the content area to the correct grid cell and rejects pixels above the content area.
+[[crates/scribe-client/src/selection.rs#pixel_to_grid]] maps a pointer pixel inside the content area to the correct grid cell and rejects pixels above the content area.
 
 ### Vi mode toggles and moves the cursor
 
-[[crates/scribe-client-gpui/src/vi_mode.rs#toggle_vi_mode]] enters copy mode, [[crates/scribe-client-gpui/src/vi_mode.rs#vi_motion]] moves the vi cursor, and motions are no-ops while vi mode is inactive.
+[[crates/scribe-client/src/vi_mode.rs#toggle_vi_mode]] enters copy mode, [[crates/scribe-client/src/vi_mode.rs#vi_motion]] moves the vi cursor, and motions are no-ops while vi mode is inactive.
 
 ### Selection projects onto visible rows
 
-[[crates/scribe-client-gpui/src/selection.rs#viewport_spans]] turns a multi-row selection into one inclusive span per painted row: the first row starts at the anchor column, middle rows span the full width, and the last row stops at the drag column.
+[[crates/scribe-client/src/selection.rs#viewport_spans]] turns a multi-row selection into one inclusive span per painted row: the first row starts at the anchor column, middle rows span the full width, and the last row stops at the drag column.
 
 ### Scrollback selection follows the offset
 
@@ -668,11 +673,11 @@ An empty range (a plain click), a zero-row viewport, and a zero-column viewport 
 
 ## GPUI Animation Policy
 
-Unit tests for [[client#GPUI Client Spike#GPUI Animation System]] — [[crates/scribe-client-gpui/src/animation.rs#AnimationSettings]] — proving the config/override motion policy resolves correctly, transitions clamp to the 150 ms budget, and the disabled path yields a zero duration for byte-identical screenshots.
+Unit tests for [[client#GPUI Client Spike#GPUI Animation System]] — [[crates/scribe-client/src/animation.rs#AnimationSettings]] — proving the config/override motion policy resolves correctly, transitions clamp to the 150 ms budget, and the disabled path yields a zero duration for byte-identical screenshots.
 
 ### Config default enables motion
 
-With `appearance.animations` true and no environment override, [[crates/scribe-client-gpui/src/animation.rs#AnimationSettings#resolve_with_env]] leaves motion enabled.
+With `appearance.animations` true and no environment override, [[crates/scribe-client/src/animation.rs#AnimationSettings#resolve_with_env]] leaves motion enabled.
 
 ### Config false disables motion
 
@@ -688,23 +693,23 @@ A falsy, empty, or unparseable override value leaves the config bool in charge, 
 
 ### Enabled duration clamps to 150 ms
 
-[[crates/scribe-client-gpui/src/animation.rs#AnimationSettings#duration]] clamps an over-budget request to the 150 ms `MAX_TRANSITION` cap and passes a within-budget request through unchanged.
+[[crates/scribe-client/src/animation.rs#AnimationSettings#duration]] clamps an over-budget request to the 150 ms `MAX_TRANSITION` cap and passes a within-budget request through unchanged.
 
 ### Disabled duration is zero
 
-When motion is disabled, `duration` returns `Duration::ZERO` and [[crates/scribe-client-gpui/src/animation.rs#AnimationSettings#transition]] builds a zero-length animation, so GPUI paints the end state on the first frame.
+When motion is disabled, `duration` returns `Duration::ZERO` and [[crates/scribe-client/src/animation.rs#AnimationSettings#transition]] builds a zero-length animation, so GPUI paints the end state on the first frame.
 
 ## GPUI Terminal Search
 
-Unit tests for [[crates/scribe-client-gpui/src/search.rs#TerminalSearch]], the ported regex find-in-terminal state, proving whole-grid match collection and forward/backward cycling with wraparound.
+Unit tests for [[crates/scribe-client/src/search.rs#TerminalSearch]], the ported regex find-in-terminal state, proving whole-grid match collection and forward/backward cycling with wraparound.
 
 ### Cycles matches with wraparound
 
-[[crates/scribe-client-gpui/src/search.rs#TerminalSearch#select_next]] and `select_prev` advance the highlighted match in reading order and wrap at both ends of the match list.
+[[crates/scribe-client/src/search.rs#TerminalSearch#select_next]] and `select_prev` advance the highlighted match in reading order and wrap at both ends of the match list.
 
 ### Match endpoints cover the whole hit
 
-A collected [[crates/scribe-client-gpui/src/search.rs#SearchMatch]] reports inclusive start and end cells that span the entire matched run.
+A collected [[crates/scribe-client/src/search.rs#SearchMatch]] reports inclusive start and end cells that span the entire matched run.
 
 ### Empty and unmatched queries stay valid
 
@@ -712,59 +717,59 @@ An empty query, a valid regex with no matches, and an invalid regex are handled 
 
 ## GPUI Smart Selection
 
-Unit tests for [[crates/scribe-client-gpui/src/smart_selection.rs#CompiledSmartSelection]], the ported iTerm2-style regex matcher, proving precision ranking, capture-parameter expansion, and rule-compilation errors.
+Unit tests for [[crates/scribe-client/src/smart_selection.rs#CompiledSmartSelection]], the ported iTerm2-style regex matcher, proving precision ranking, capture-parameter expansion, and rule-compilation errors.
 
 ### Highest-precision rule wins
 
-[[crates/scribe-client-gpui/src/smart_selection.rs#CompiledSmartSelection#candidate_at]] returns the highest-precision rule's match when several rules overlap the cursor.
+[[crates/scribe-client/src/smart_selection.rs#CompiledSmartSelection#candidate_at]] returns the highest-precision rule's match when several rules overlap the cursor.
 
 ### Legacy capture parameters expand
 
-[[crates/scribe-client-gpui/src/smart_selection.rs#SmartSelectionCandidate#resolved_actions]] expands a legacy `\0` parameter to the full matched text and labels the action by rule and kind.
+[[crates/scribe-client/src/smart_selection.rs#SmartSelectionCandidate#resolved_actions]] expands a legacy `\0` parameter to the full matched text and labels the action by rule and kind.
 
 ### Invalid regex reports an error
 
-A rule whose regex fails to compile is recorded in [[crates/scribe-client-gpui/src/smart_selection.rs#CompiledSmartSelection]]'s `errors` rather than aborting compilation.
+A rule whose regex fails to compile is recorded in [[crates/scribe-client/src/smart_selection.rs#CompiledSmartSelection]]'s `errors` rather than aborting compilation.
 
 ## Drag-drop path insertion
 
-Unit tests for [[crates/scribe-client-gpui/src/drag_drop.rs#quote_path_for_shell]], the ported shell-aware quoting for dropped file paths, proving each shell's escaping and the trailing-space insertion payload match the legacy client byte-for-byte.
+Unit tests for [[crates/scribe-client/src/drag_drop.rs#quote_path_for_shell]], the ported shell-aware quoting for dropped file paths, proving each shell's escaping and the trailing-space insertion payload match the legacy client byte-for-byte.
 
 ### POSIX quoting escapes single quotes
 
-[[crates/scribe-client-gpui/src/drag_drop.rs#quote_posix_string]] wraps the path in single quotes and rewrites embedded quotes as `'"'"'`, leaving quote-free paths simply single-quoted.
+[[crates/scribe-client/src/drag_drop.rs#quote_posix_string]] wraps the path in single quotes and rewrites embedded quotes as `'"'"'`, leaving quote-free paths simply single-quoted.
 
 ### Fish quoting escapes backslash and quote
 
-[[crates/scribe-client-gpui/src/drag_drop.rs#quote_fish_string]] escapes backslash and single-quote with a backslash inside the single-quoted string, matching fish's quoting rules.
+[[crates/scribe-client/src/drag_drop.rs#quote_fish_string]] escapes backslash and single-quote with a backslash inside the single-quoted string, matching fish's quoting rules.
 
 ### PowerShell quoting doubles single quotes
 
-[[crates/scribe-client-gpui/src/drag_drop.rs#quote_powershell_string]] doubles each single quote inside the single-quoted string, the only escape PowerShell needs.
+[[crates/scribe-client/src/drag_drop.rs#quote_powershell_string]] doubles each single quote inside the single-quoted string, the only escape PowerShell needs.
 
 ### Nushell raw-string fencing
 
-[[crates/scribe-client-gpui/src/drag_drop.rs#quote_nushell_string]] uses a plain single-quoted string when no quote is present and otherwise emits a raw string, widening the `#` fence until it no longer collides with the path.
+[[crates/scribe-client/src/drag_drop.rs#quote_nushell_string]] uses a plain single-quoted string when no quote is present and otherwise emits a raw string, widening the `#` fence until it no longer collides with the path.
 
 ### Shell dispatch selects quoter
 
-[[crates/scribe-client-gpui/src/drag_drop.rs#quote_path_for_shell]] routes to the fish, PowerShell, or nushell quoter by shell name and falls back to POSIX quoting for anything else.
+[[crates/scribe-client/src/drag_drop.rs#quote_path_for_shell]] routes to the fish, PowerShell, or nushell quoter by shell name and falls back to POSIX quoting for anything else.
 
 ### Insertion appends trailing space
 
-[[crates/scribe-client-gpui/src/drag_drop.rs#dropped_path_insertion]] appends a single trailing space to the quoted path so the shell treats it as a complete, separated argument.
+[[crates/scribe-client/src/drag_drop.rs#dropped_path_insertion]] appends a single trailing space to the quoted path so the shell treats it as a complete, separated argument.
 
 ## Window geometry compat
 
-Unit tests for [[crates/scribe-client-gpui/src/window_state.rs#normalize_legacy_geometry]] and for the live-window capture/restore pair that persists geometry across restarts. Together they prove old-client geometry insets correctly under the new custom titlebar and that a GPUI window round-trips through a record.
+Unit tests for [[crates/scribe-client/src/window_state.rs#normalize_legacy_geometry]] and for the live-window capture/restore pair that persists geometry across restarts. Together they prove old-client geometry insets correctly under the new custom titlebar and that a GPUI window round-trips through a record.
 
 ### Legacy geometry gains titlebar inset
 
-An unnormalized legacy geometry grows in height by [[crates/scribe-client-gpui/src/window_state.rs#CUSTOM_TITLEBAR_HEIGHT]] so the terminal area below the in-window titlebar keeps its old size, while position and monitor survive unchanged.
+An unnormalized legacy geometry grows in height by [[crates/scribe-client/src/window_state.rs#CUSTOM_TITLEBAR_HEIGHT]] so the terminal area below the in-window titlebar keeps its old size, while position and monitor survive unchanged.
 
 ### Normalization is idempotent
 
-Running [[crates/scribe-client-gpui/src/window_state.rs#normalize_legacy_geometry]] a second time on already-normalized geometry returns it unchanged, so a save-and-reload never insets twice.
+Running [[crates/scribe-client/src/window_state.rs#normalize_legacy_geometry]] a second time on already-normalized geometry returns it unchanged, so a save-and-reload never insets twice.
 
 ### Maximized geometry keeps its size
 
@@ -772,11 +777,11 @@ A maximized legacy geometry keeps its stored size (the compositor overrides it o
 
 ### Out-of-range legacy size is clamped
 
-A hostile or corrupt oversized geometry is clamped into the accepted range so the restored window stays usable, satisfying [[crates/scribe-client-gpui/src/window_state.rs#geometry_size_is_sane]].
+A hostile or corrupt oversized geometry is clamped into the accepted range so the restored window stays usable, satisfying [[crates/scribe-client/src/window_state.rs#geometry_size_is_sane]].
 
 ### Default geometry is already normalized
 
-A freshly-created [[crates/scribe-client-gpui/src/window_state.rs#WindowGeometry]] is already in the new coordinate system, so normalization is a no-op on it.
+A freshly-created [[crates/scribe-client/src/window_state.rs#WindowGeometry]] is already in the new coordinate system, so normalization is a no-op on it.
 
 ### Legacy TOML lacks the normalized flag
 
@@ -784,11 +789,11 @@ A `state.toml` written by the old client has no `titlebar_normalized` key; it de
 
 ### Sanity range rejects extremes
 
-[[crates/scribe-client-gpui/src/window_state.rs#geometry_size_is_sane]] rejects zero, too-small, and too-large edges and accepts the range boundaries.
+[[crates/scribe-client/src/window_state.rs#geometry_size_is_sane]] rejects zero, too-small, and too-large edges and accepts the range boundaries.
 
 ### Live bounds round-trip through a record
 
-A live window's `Bounds` captured by [[crates/scribe-client-gpui/src/window_state.rs#geometry_from_bounds]] and reopened through [[crates/scribe-client-gpui/src/window_state.rs#window_bounds_for]] returns the identical origin and size.
+A live window's `Bounds` captured by [[crates/scribe-client/src/window_state.rs#geometry_from_bounds]] and reopened through [[crates/scribe-client/src/window_state.rs#window_bounds_for]] returns the identical origin and size.
 
 The record is also already marked normalized: a capture off a GPUI window is in the new coordinate system, so a save-and-restore cycle must not inset it under the custom titlebar a second time.
 
@@ -804,15 +809,15 @@ Wayland never exposes a window's origin, so the capture stores `None` instead of
 
 ## X11 focus guard
 
-Unit tests for [[crates/scribe-client-gpui/src/x11_focus.rs#ReactivationDebounce]], the pure reactivation state machine backing the ported X11 focus guard, proving the suppression semantics that the visual E2E exercises against the live `_NET_ACTIVE_WINDOW`.
+Unit tests for [[crates/scribe-client/src/x11_focus.rs#ReactivationDebounce]], the pure reactivation state machine backing the ported X11 focus guard, proving the suppression semantics that the visual E2E exercises against the live `_NET_ACTIVE_WINDOW`.
 
 ### Inactive window suppresses input
 
-[[crates/scribe-client-gpui/src/x11_focus.rs#ReactivationDebounce#observe]] suppresses keyboard input whenever our window is not the active window (a compositor overlay is up).
+[[crates/scribe-client/src/x11_focus.rs#ReactivationDebounce#observe]] suppresses keyboard input whenever our window is not the active window (a compositor overlay is up).
 
 ### Reactivation debounce suppresses stray keys
 
-After an inactive→active transition, `observe` keeps suppressing for [[crates/scribe-client-gpui/src/x11_focus.rs#REACTIVATION_DEBOUNCE]] so a stray keystroke that arrives as the overlay closes is caught, then resumes passing input once the window elapses.
+After an inactive→active transition, `observe` keeps suppressing for [[crates/scribe-client/src/x11_focus.rs#REACTIVATION_DEBOUNCE]] so a stray keystroke that arrives as the overlay closes is caught, then resumes passing input once the window elapses.
 
 ### Steady active window allows input
 
@@ -820,15 +825,15 @@ A window that has been continuously active is never suppressed by `observe`.
 
 ### Genuine focus event clears debounce
 
-[[crates/scribe-client-gpui/src/x11_focus.rs#ReactivationDebounce#clear]] drops the debounce on a real focus event (which overlays never send), so input flows immediately after a genuine refocus.
+[[crates/scribe-client/src/x11_focus.rs#ReactivationDebounce#clear]] drops the debounce on a real focus event (which overlays never send), so input flows immediately after a genuine refocus.
 
 ### Poll transition arms debounce
 
-[[crates/scribe-client-gpui/src/x11_focus.rs#ReactivationDebounce#note_active]] arms the debounce when the periodic poll observes the inactive→active transition, so a key seen just afterward is still suppressed.
+[[crates/scribe-client/src/x11_focus.rs#ReactivationDebounce#note_active]] arms the debounce when the periodic poll observes the inactive→active transition, so a key seen just afterward is still suppressed.
 
 ## Server lifecycle
 
-Unit tests for [[crates/scribe-client-gpui/src/server_lifecycle.rs#stale_server_reason]], the pure staleness decision behind the ported local-server refresh path, proving path drift and rebuild detection without a live socket.
+Unit tests for [[crates/scribe-client/src/server_lifecycle.rs#stale_server_reason]], the pure staleness decision behind the ported local-server refresh path, proving path drift and rebuild detection without a live socket.
 
 ### Path drift marks server stale
 
@@ -848,7 +853,7 @@ When neither the process start time nor the installed modification time is known
 
 ### Missing socket is named as no server
 
-[[crates/scribe-client-gpui/src/server_lifecycle.rs#socket_failure_reason]] reports an absent socket file as "no scribe-server is running for this user" rather than as a stale one, because nothing was left behind to clean up.
+[[crates/scribe-client/src/server_lifecycle.rs#socket_failure_reason]] reports an absent socket file as "no scribe-server is running for this user" rather than as a stale one, because nothing was left behind to clean up.
 
 ### Refused socket is named as stale
 
@@ -866,7 +871,7 @@ An in-memory `FakeClipboard` stands in for the live arboard handle so the read+w
 
 ### Write-read roundtrip on the system clipboard
 
-A payload written through [[crates/scribe-client-gpui/src/clipboard.rs#bridge_write]] to the system clipboard reads back verbatim through [[crates/scribe-client-gpui/src/clipboard.rs#bridge_read]] — the scripted OSC 52 bridge roundtrip at the unit level.
+A payload written through [[crates/scribe-client/src/clipboard.rs#bridge_write]] to the system clipboard reads back verbatim through [[crates/scribe-client/src/clipboard.rs#bridge_read]] — the scripted OSC 52 bridge roundtrip at the unit level.
 
 ### Primary and system selections stay independent
 
@@ -874,11 +879,11 @@ Writes to `ClipboardSelection::Primary` and `ClipboardSelection::Clipboard` land
 
 ### Unavailable backend reports a bridge error
 
-Both [[crates/scribe-client-gpui/src/clipboard.rs#bridge_read]] and [[crates/scribe-client-gpui/src/clipboard.rs#bridge_write]] collapse a dead backend onto `BridgeError::Unavailable` so the server maps it to an empty OSC 52 reply.
+Both [[crates/scribe-client/src/clipboard.rs#bridge_read]] and [[crates/scribe-client/src/clipboard.rs#bridge_write]] collapse a dead backend onto `BridgeError::Unavailable` so the server maps it to an empty OSC 52 reply.
 
 ### Focus gate drops only enabled unfocused writes
 
-[[crates/scribe-client-gpui/src/clipboard.rs#FocusGate#drops_write]] returns true only when `focus_gate_writes` is enabled and the window is unfocused, and false for the other three combinations.
+[[crates/scribe-client/src/clipboard.rs#FocusGate#drops_write]] returns true only when `focus_gate_writes` is enabled and the window is unfocused, and false for the other three combinations.
 
 ### Gated write is a silent no-op
 
@@ -886,47 +891,47 @@ A gated write on an unfocused window returns `Ok(())` without mutating the clipb
 
 ### Read reply wraps the payload
 
-[[crates/scribe-client-gpui/src/clipboard.rs#read_reply]] performs the host read and wraps the value in `ClientMessage::ClipboardBridgeReadReply` under the originating `request_id`.
+[[crates/scribe-client/src/clipboard.rs#read_reply]] performs the host read and wraps the value in `ClientMessage::ClipboardBridgeReadReply` under the originating `request_id`.
 
 ### Read reply forwards a bridge error
 
-When the backend is unavailable, [[crates/scribe-client-gpui/src/clipboard.rs#read_reply]] still emits a `ClipboardBridgeReadReply` carrying the `Err(BridgeError)` payload rather than dropping the request.
+When the backend is unavailable, [[crates/scribe-client/src/clipboard.rs#read_reply]] still emits a `ClipboardBridgeReadReply` carrying the `Err(BridgeError)` payload rather than dropping the request.
 
 ### Prompt response echoes id and decision
 
-[[crates/scribe-client-gpui/src/clipboard.rs#prompt_response]] builds `ClientMessage::ClipboardPromptResponse` echoing the prompt's `request_id` and the user's decision.
+[[crates/scribe-client/src/clipboard.rs#prompt_response]] builds `ClientMessage::ClipboardPromptResponse` echoing the prompt's `request_id` and the user's decision.
 
 ### Primary read skips empty content
 
-[[crates/scribe-client-gpui/src/clipboard.rs#read_primary]] returns `None` for an absent or empty primary selection so a middle-click paste is skipped, and `Some(text)` when content is present.
+[[crates/scribe-client/src/clipboard.rs#read_primary]] returns `None` for an absent or empty primary selection so a middle-click paste is skipped, and `Some(text)` when content is present.
 
 ### Primary write applies cleanup
 
-[[crates/scribe-client-gpui/src/clipboard.rs#set_primary]] runs the AI copy-cleanup transforms (dedent, unwrap) before writing to the primary selection when cleanup is enabled.
+[[crates/scribe-client/src/clipboard.rs#set_primary]] runs the AI copy-cleanup transforms (dedent, unwrap) before writing to the primary selection when cleanup is enabled.
 
 ### Primary write is verbatim when cleanup off
 
-[[crates/scribe-client-gpui/src/clipboard.rs#set_primary]] skips empty input entirely and writes the raw text unchanged when cleanup is disabled.
+[[crates/scribe-client/src/clipboard.rs#set_primary]] skips empty input entirely and writes the raw text unchanged when cleanup is disabled.
 
 ### Bridge starts ungated
 
-[[crates/scribe-client-gpui/src/clipboard.rs#ClipboardBridge]] reports no gating until [[crates/scribe-client-gpui/src/clipboard.rs#ClipboardBridge#set_gating]] adopts the `Welcome` capability bit, so a frame arriving before negotiation is refused rather than acted on.
+[[crates/scribe-client/src/clipboard.rs#ClipboardBridge]] reports no gating until [[crates/scribe-client/src/clipboard.rs#ClipboardBridge#set_gating]] adopts the `Welcome` capability bit, so a frame arriving before negotiation is refused rather than acted on.
 
 ### Parked prompt is taken once
 
-[[crates/scribe-client-gpui/src/clipboard.rs#ClipboardBridge#take_prompt]] hands the parked request to the foreground exactly once and reports `None` afterwards, so one server prompt can never raise two modals.
+[[crates/scribe-client/src/clipboard.rs#ClipboardBridge#take_prompt]] hands the parked request to the foreground exactly once and reports `None` afterwards, so one server prompt can never raise two modals.
 
 ### Bridge jobs drain in arrival order
 
-[[crates/scribe-client-gpui/src/clipboard.rs#ClipboardBridge#drain_jobs]] returns queued writes and reads in the order the reader saw them and leaves the queue empty, because OSC 52 ordering is what a PTY-side program observes.
+[[crates/scribe-client/src/clipboard.rs#ClipboardBridge#drain_jobs]] returns queued writes and reads in the order the reader saw them and leaves the queue empty, because OSC 52 ordering is what a PTY-side program observes.
 
 ### Bridge queue is bounded
 
-Pushing past [[crates/scribe-client-gpui/src/clipboard.rs#MAX_PENDING_BRIDGE_JOBS]] evicts the oldest job and reports the eviction, so an OSC 52 firehose cannot grow the queue without bound between foreground ticks.
+Pushing past [[crates/scribe-client/src/clipboard.rs#MAX_PENDING_BRIDGE_JOBS]] evicts the oldest job and reports the eviction, so an OSC 52 firehose cannot grow the queue without bound between foreground ticks.
 
 ## GPUI Paste Chunking
 
-Unit coverage for [[crates/scribe-client-gpui/src/paste.rs#paste_chunks]], the split that keeps a paste inside the server's `KeyInput` size limit while the shell still sees one bracketed-paste region.
+Unit coverage for [[crates/scribe-client/src/paste.rs#paste_chunks]], the split that keeps a paste inside the server's `KeyInput` size limit while the shell still sees one bracketed-paste region.
 
 ### Small paste is one frame
 
@@ -934,7 +939,7 @@ A paste that fits the limit becomes a single frame, wrapped in the DEC 2004 mark
 
 ### Large paste splits under the limit
 
-A paste larger than [[crates/scribe-client-gpui/src/paste.rs#MAX_KEY_INPUT_CHUNK]] splits into several frames, each within the limit, whose concatenation is the original bytes.
+A paste larger than [[crates/scribe-client/src/paste.rs#MAX_KEY_INPUT_CHUNK]] splits into several frames, each within the limit, whose concatenation is the original bytes.
 
 ### Markers ride the first and last frame
 
@@ -948,11 +953,11 @@ The zbus transport and click-to-focus wiring are verified by the manual parity c
 
 ### Timeout mode maps to expire_timeout
 
-[[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#expire_timeout_millis]] maps `SystemDefault` to `-1`, `Never` to `0`, and `Custom` to `timeout_secs * 1000` (saturating on overflow).
+[[crates/scribe-client/src/notification_dispatcher/mod.rs#expire_timeout_millis]] maps `SystemDefault` to `-1`, `Never` to `0`, and `Custom` to `timeout_secs * 1000` (saturating on overflow).
 
 ### Same session reuses replaces_id
 
-Repeated shows for one session reuse the live notification id via [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#replaces_for]] and [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#record_shown]], keeping exactly one live toast.
+Repeated shows for one session reuse the live notification id via [[crates/scribe-client/src/notification_dispatcher/mod.rs#NotifState#replaces_for]] and [[crates/scribe-client/src/notification_dispatcher/mod.rs#NotifState#record_shown]], keeping exactly one live toast.
 
 ### Expired toast reallocation drops stale mapping
 
@@ -960,15 +965,15 @@ When the daemon allocates a fresh id despite a non-zero `replaces` (the prior to
 
 ### Session close removes both mappings
 
-[[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#take_session]] returns and clears the session's id once, then `None` thereafter, leaving no dangling id.
+[[crates/scribe-client/src/notification_dispatcher/mod.rs#NotifState#take_session]] returns and clears the session's id once, then `None` thereafter, leaving no dangling id.
 
 ### Daemon closed signal clears mappings
 
-[[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#on_closed]] drops both mappings for a closed notification id and no-ops on an unknown id.
+[[crates/scribe-client/src/notification_dispatcher/mod.rs#NotifState#on_closed]] drops both mappings for a closed notification id and no-ops on an unknown id.
 
 ### Shutdown closes every live toast
 
-[[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#live_ids]] enumerates every live id for the shutdown close-all and [[crates/scribe-client-gpui/src/notification_dispatcher/mod.rs#NotifState#clear]] empties the state afterward.
+[[crates/scribe-client/src/notification_dispatcher/mod.rs#NotifState#live_ids]] enumerates every live id for the shutdown close-all and [[crates/scribe-client/src/notification_dispatcher/mod.rs#NotifState#clear]] empties the state afterward.
 
 ## GPUI Notification Gate
 
@@ -976,7 +981,7 @@ Unit coverage for the decision half of desktop notifications ([[client#GPUI Clie
 
 ### Processing to attention fires once
 
-[[crates/scribe-client-gpui/src/notifications.rs#NotificationCenter#on_ai_state_changed]] fires only on `Processing → attention`: a first observed state does not notify (nothing was processing before it) and sitting in the same attention state is not a new transition.
+[[crates/scribe-client/src/notifications.rs#NotificationCenter#on_ai_state_changed]] fires only on `Processing → attention`: a first observed state does not notify (nothing was processing before it) and sitting in the same attention state is not a new transition.
 
 ### Non-attention states never fire
 
@@ -988,15 +993,15 @@ With `enabled = false` the tracker still folds every transition in but produces 
 
 ### Focus conditions gate delivery
 
-[[crates/scribe-client-gpui/src/notifications.rs#NotificationCenter#suppresses]] reproduces the winit gate over [[crates/scribe-client-gpui/src/notifications.rs#FocusPosition]]: `when_unfocused` suppresses any focused window, `when_unfocused_or_background_tab` suppresses only the focused foreground pane, and `always` suppresses nothing.
+[[crates/scribe-client/src/notifications.rs#NotificationCenter#suppresses]] reproduces the winit gate over [[crates/scribe-client/src/notifications.rs#FocusPosition]]: `when_unfocused` suppresses any focused window, `when_unfocused_or_background_tab` suppresses only the focused foreground pane, and `always` suppresses nothing.
 
 ### Pending focus is consumed once
 
-[[crates/scribe-client-gpui/src/notifications.rs#NotificationCenter#take_pending_focus]] yields the recently notified session exactly once, and [[crates/scribe-client-gpui/src/notifications.rs#NotificationCenter#remove]] clears it so an exited session cannot be focused by a late activation.
+[[crates/scribe-client/src/notifications.rs#NotificationCenter#take_pending_focus]] yields the recently notified session exactly once, and [[crates/scribe-client/src/notifications.rs#NotificationCenter#remove]] clears it so an exited session cannot be focused by a late activation.
 
 ### State labels name the attention state
 
-[[crates/scribe-client-gpui/src/notifications.rs#state_label]] maps the three attention states onto "Ready", "Waiting for input" and "Permission required", and degrades any other state to a generic "Attention" rather than failing to build a summary.
+[[crates/scribe-client/src/notifications.rs#state_label]] maps the three attention states onto "Ready", "Waiting for input" and "Permission required", and degrades any other state to a generic "Attention" rather than failing to build a summary.
 
 ## GPUI Perf A/B Gate
 
@@ -1018,7 +1023,7 @@ Startup is gated in two parts because the platform, not the client, owns most of
 
 Both clients report the total through the shared probe's `startup_first_frame_ms`, latched by [[crates/scribe-common/src/perf_probe.rs#PerfProbe#latch_first_frame]] on the first painted frame and timed from the probe arm — the first statement of each client's `main` — so the two halves of the A/B are the same measurement rather than two different sub-spans. The rig launches each client cold, waits for that key, and kills it. A binary built before the probe carried that key (the installed old client) falls back to the startup-log method: the wall-clock delta between its first `client startup timing` line and the `init_gpu_and_terminal_done` line. That fallback stops at GPU-ready rather than first paint, so it slightly understates the old client, and the phase-scoped `total_ms` printed on that line — GPU-init only, after config load, the host-stats walk and app construction — is never compared against the GPUI marker; doing exactly that is what produced the unreproducible 190 ms "baseline" the original absolute budget was anchored to.
 
-The GPUI client additionally writes the marker named by `SCRIBE_GPUI_STARTUP_TIMING`. [[crates/scribe-client-gpui/src/main.rs#log_first_frame_timing]] latches on the first painted frame and writes `first_frame_ms`, `gpu_bringup_ms` and `scribe_startup_ms`, all timed from the `PROCESS_START` origin captured at the top of `main`. The bring-up figure comes from [[crates/scribe-client-gpui/src/main.rs#WINDOW_BRINGUP_MS_BITS]], stamped by the root-view builder that GPUI invokes at the end of `cx.open_window`; that span is wgpu adapter enumeration, device creation and surface configure, and no Scribe code runs inside it. `scribe_startup_ms` is the remainder and is what the absolute half of the gate caps.
+The GPUI client additionally writes the marker named by `SCRIBE_GPUI_STARTUP_TIMING`. [[crates/scribe-client/src/main.rs#log_first_frame_timing]] latches on the first painted frame and writes `first_frame_ms`, `gpu_bringup_ms` and `scribe_startup_ms`, all timed from the `PROCESS_START` origin captured at the top of `main`. The bring-up figure comes from [[crates/scribe-client/src/main.rs#WINDOW_BRINGUP_MS_BITS]], stamped by the root-view builder that GPUI invokes at the end of `cx.open_window`; that span is wgpu adapter enumeration, device creation and surface configure, and no Scribe code runs inside it. `scribe_startup_ms` is the remainder and is what the absolute half of the gate caps.
 
 On the reference host `cx.open_window` alone costs 610–751 ms and the old client's own `configure_wgpu` costs 464–561 ms, so no client can paint inside 500 ms there. Measured like-for-like through the probe, the old client reaches its first frame in 3401–4682 ms against the GPUI client's 634–780 ms, of which only 24–29 ms is Scribe's own.
 
@@ -1064,7 +1069,7 @@ Four of the five metrics are only observable from inside a running client, so bo
 
 The report is a flat `key=value` file rewritten at most every 200 ms with cumulative counters plus an `uptime_ms` stamp, so the rig derives a per-workload number from before/after deltas and the client needs no window bookkeeping. The session list doubles as the rig's safety interlock: a typing workload only runs in a tab the rig opened and watched appear as focused, so it can never type into a pane that was already open.
 
-Both clients call the probe from the same three places, and "the same" is load-bearing down to the pipeline stage. The GPUI client reports frames from [[crates/scribe-client-gpui/src/main.rs#TerminalView#report_perf_frame]] on render, stamps keystrokes in [[crates/scribe-client-gpui/src/main.rs#TerminalView#send_key_bytes]], and counts PTY bytes in `on_pane_output_message` — its IPC read task. The old client reports frames from [[crates/scribe-client/src/main.rs#App#report_perf_frame]] on redraw, stamps keystrokes alongside its `ClientCommand::KeyInput` send, and counts PTY bytes in [[crates/scribe-client/src/ipc_client.rs#dispatch_session_message]] — its IPC read task.
+Both clients call the probe from the same three places, and "the same" is load-bearing down to the pipeline stage. The GPUI client reports frames from [[crates/scribe-client/src/main.rs#TerminalView#report_perf_frame]] on render, stamps keystrokes in [[crates/scribe-client/src/main.rs#TerminalView#send_key_bytes]], and counts PTY bytes in `on_pane_output_message` — its IPC read task. The old client reports frames from [[crates/scribe-client-legacy/src/main.rs#App#report_perf_frame]] on redraw, stamps keystrokes alongside its `ClientCommand::KeyInput` send, and counts PTY bytes in [[crates/scribe-client-legacy/src/ipc_client.rs#dispatch_session_message]] — its IPC read task.
 
 PTY output is stamped where it enters the client, in the task that reads the frame off the socket, and never at a later stage. Stamping the two clients at different stages does not merely add a constant; it compares two different quantities. The old client used to count bytes on its UI thread, in `handle_stream_user_event`, three hops downstream of the read task: read task, `EventLoopProxy::send_event`, winit's user-event queue, then the redraw loop. Behind that unbounded queue the probe measures the UI thread's backlog rather than the server round trip, and both probe-derived comparative metrics were corrupted by it in opposite directions. The firehose scored the old client at 0.232 MiB/s against the GPUI client's 17.623 MiB/s, because 32 MiB of `cat` output reached the UI thread far slower than it reached the socket. Input latency scored the old client at 0.032 ms against the GPUI client's 0.209 ms — *faster than a bare local socketpair round trip on the same host*, which is the tell — because with a backlog standing in the queue the next `handle_stream_user_event` after a keystroke was an already-queued stale payload, so the sample timed one event-loop turn instead of a key-to-echo trip. That 6.5x "regression" (bead `scribe-38e.92`) was the measurement, not the client.
 
@@ -1108,7 +1113,7 @@ The startup metric is reported by a probe the rig reads long after launch, so th
 
 ## GPUI Client Headless Suites
 
-The `#[gpui::test]` and golden suites in `scribe-client-gpui` are the primary correctness oracle for client-internal *logic*. They need no display server, and each landed suite maps to the `parity-inventory.md` row whose logic it exercises.
+The `#[gpui::test]` and golden suites in `scribe-client` are the primary correctness oracle for client-internal *logic*. They need no display server, and each landed suite maps to the `parity-inventory.md` row whose logic it exercises.
 
 **A headless suite does not satisfy a parity row.** It proves the module behaves correctly when constructed; it says nothing about whether the running client ever constructs it. The 016 reachability audit found 113 of 164 user-facing parity rows unreachable while their suites were green, so `parity-inventory.md` now carries a mandatory "Reachable from" column and retains `gpui-test` as the row-level method only for the nine removed-configuration-key rows. Read the map below as *logic coverage*; the row's own verification method and reachable-from symbol live in the inventory and are authoritative.
 
@@ -1167,45 +1172,45 @@ Pending headless suites and the parity rows they will satisfy:
 
 ### Pane split-tree logic
 
-The pure [[crates/scribe-client-gpui/src/layout.rs#LayoutTree]] split-tree drives the "Pane layout" keybinding actions (`close_pane`, `cycle_pane`, `focus_left`/`right`/`up`/`down`) beneath the [[client#GPUI Client Spike#GPUI Layout Entities#Pane Tree Model]] entity wrapper, so its navigation and mutation logic is asserted directly without a GPUI context.
+The pure [[crates/scribe-client/src/layout.rs#LayoutTree]] split-tree drives the "Pane layout" keybinding actions (`close_pane`, `cycle_pane`, `focus_left`/`right`/`up`/`down`) beneath the [[client#GPUI Client Spike#GPUI Layout Entities#Pane Tree Model]] entity wrapper, so its navigation and mutation logic is asserted directly without a GPUI context.
 
-Over a 2x2 pane grid the suite exercises the surface the entity tests do not reach directly: [[crates/scribe-client-gpui/src/layout.rs#LayoutTree#find_pane_in_direction]] resolves a direct neighbor on all four axes and wraps to the opposite edge along the same column when none exists; [[crates/scribe-client-gpui/src/layout.rs#LayoutTree#next_pane]] cycles panes in depth-first order and wraps past the last leaf; [[crates/scribe-client-gpui/src/layout.rs#LayoutTree#swap_panes]] exchanges two leaf positions; and [[crates/scribe-client-gpui/src/layout.rs#LayoutTree#close_pane]] promotes a closed pane's sibling while refusing to remove the sole remaining leaf.
+Over a 2x2 pane grid the suite exercises the surface the entity tests do not reach directly: [[crates/scribe-client/src/layout.rs#LayoutTree#find_pane_in_direction]] resolves a direct neighbor on all four axes and wraps to the opposite edge along the same column when none exists; [[crates/scribe-client/src/layout.rs#LayoutTree#next_pane]] cycles panes in depth-first order and wraps past the last leaf; [[crates/scribe-client/src/layout.rs#LayoutTree#swap_panes]] exchanges two leaf positions; and [[crates/scribe-client/src/layout.rs#LayoutTree#close_pane]] promotes a closed pane's sibling while refusing to remove the sole remaining leaf.
 
 ### GPUI keybindings dispatch
 
-Verifies the ported [[crates/scribe-client-gpui/src/keybindings.rs#Bindings]] parser and [[crates/scribe-client-gpui/src/keybindings.rs#translate_key_action]] dispatch so no configured shortcut regresses across the GPUI cutover.
+Verifies the ported [[crates/scribe-client/src/keybindings.rs#Bindings]] parser and [[crates/scribe-client/src/keybindings.rs#translate_key_action]] dispatch so no configured shortcut regresses across the GPUI cutover.
 
-Driving each action from its default binding, the suite asserts every one of the 50+ [[crates/scribe-client-gpui/src/keybindings.rs#LayoutAction]] variants resolves to its named value, that command-palette/settings/find produce the right [[crates/scribe-client-gpui/src/keybindings.rs#KeyAction]], and that the seven terminal shortcuts emit their fixed escape sequences. It also checks combo parsing (`cmd`/`super` → platform modifier, named keys, rejected garbage), exact-modifier matching that ignores the GPUI function flag and is case-insensitive on the base character, key-down-only gating (press and repeat match, release does not), and that invalid combos are skipped without aborting the parse.
+Driving each action from its default binding, the suite asserts every one of the 50+ [[crates/scribe-client/src/keybindings.rs#LayoutAction]] variants resolves to its named value, that command-palette/settings/find produce the right [[crates/scribe-client/src/keybindings.rs#KeyAction]], and that the seven terminal shortcuts emit their fixed escape sequences. It also checks combo parsing (`cmd`/`super` → platform modifier, named keys, rejected garbage), exact-modifier matching that ignores the GPUI function flag and is case-insensitive on the base character, key-down-only gating (press and repeat match, release does not), and that invalid combos are skipped without aborting the parse.
 
-Four cases lock [[client#GPUI Overlays#Overlay Chords Yield To Bindings]], the rule that kept `close_tab` and `new_window` unreachable until it existed. Every entry in [[crates/scribe-client-gpui/src/keybindings.rs#OVERLAY_CHORDS]] must resolve to its overlay *and* match no default binding, so a future overlay chord cannot quietly land on a user action; the `close_tab` and `new_window` defaults must resolve to their `LayoutAction` and be declined by [[crates/scribe-client-gpui/src/keybindings.rs#translate_overlay_chord]]; a config that rebinds `close_tab` onto an overlay's own chord must still reach the action; and a key release matches no overlay chord.
+Four cases lock [[client#GPUI Overlays#Overlay Chords Yield To Bindings]], the rule that kept `close_tab` and `new_window` unreachable until it existed. Every entry in [[crates/scribe-client/src/keybindings.rs#OVERLAY_CHORDS]] must resolve to its overlay *and* match no default binding, so a future overlay chord cannot quietly land on a user action; the `close_tab` and `new_window` defaults must resolve to their `LayoutAction` and be declined by [[crates/scribe-client/src/keybindings.rs#translate_overlay_chord]]; a config that rebinds `close_tab` onto an overlay's own chord must still reach the action; and a key release matches no overlay chord.
 
 ### GPUI tab session strip
 
-Locks the selection rules of [[crates/scribe-client-gpui/src/tab_session.rs#TabSessions]], the ordered strip the shell's tab shortcuts and the IPC reader both mutate, so a tab's label and the attached session can never disagree.
+Locks the selection rules of [[crates/scribe-client/src/tab_session.rs#TabSessions]], the ordered strip the shell's tab shortcuts and the IPC reader both mutate, so a tab's label and the attached session can never disagree.
 
-The suite drives the shortcut side — [[crates/scribe-client-gpui/src/tab_session.rs#TabSessions#insert_active]] appends and focuses a new tab, `focus_next`/`focus_prev` wrap in both directions, `select` jumps by index and reports no change for an out-of-range or already-active position — and the server side, where [[crates/scribe-client-gpui/src/tab_session.rs#TabSessions#replace_all]] preserves the focused session across a `SessionList` rebuild (falling back to the first tab when it is gone) and `remove` clamps the cursor as tabs exit. One case guards the attach feedback loop: because the server re-announces `SessionCreated` to acknowledge every `AttachSessions`, `insert_active` must report a known session as "not added" and leave the selection untouched.
+The suite drives the shortcut side — [[crates/scribe-client/src/tab_session.rs#TabSessions#insert_active]] appends and focuses a new tab, `focus_next`/`focus_prev` wrap in both directions, `select` jumps by index and reports no change for an out-of-range or already-active position — and the server side, where [[crates/scribe-client/src/tab_session.rs#TabSessions#replace_all]] preserves the focused session across a `SessionList` rebuild (falling back to the first tab when it is gone) and `remove` clamps the cursor as tabs exit. One case guards the attach feedback loop: because the server re-announces `SessionCreated` to acknowledge every `AttachSessions`, `insert_active` must report a known session as "not added" and leave the selection untouched.
 
 ### GPUI tab task labels
 
-Locks the precedence rule behind [[crates/scribe-client-gpui/src/tab_session.rs#TabSessions#set_task_label]], the mutator the four provider task-label notices land in, so an AI tab shows its task and falls back to its shell title once the task ends.
+Locks the precedence rule behind [[crates/scribe-client/src/tab_session.rs#TabSessions#set_task_label]], the mutator the four provider task-label notices land in, so an AI tab shows its task and falls back to its shell title once the task ends.
 
-A set label outranks the title through [[crates/scribe-client-gpui/src/tab_session.rs#TabEntry#display_title]] and leaves sibling tabs untouched; a title arriving mid-task is stored but stays behind the label until it clears; a blank label is treated as a clear, so a provider cannot blank a tab down to nothing; and an identical set, a repeated clear, and an unknown session all report "no change" so the reader does not repaint for nothing.
+A set label outranks the title through [[crates/scribe-client/src/tab_session.rs#TabEntry#display_title]] and leaves sibling tabs untouched; a title arriving mid-task is stored but stays behind the label until it clears; a blank label is treated as a clear, so a provider cannot blank a tab down to nothing; and an identical set, a repeated clear, and an unknown session all report "no change" so the reader does not repaint for nothing.
 
 ### GPUI terminal chrome metadata
 
-Locks the per-session merge rules of [[crates/scribe-client-gpui/src/chrome_metadata.rs#ChromeMetadata]], the store the IPC reader fills from the terminal-chrome messages and the status bar reads once per frame.
+Locks the per-session merge rules of [[crates/scribe-client/src/chrome_metadata.rs#ChromeMetadata]], the store the IPC reader fills from the terminal-chrome messages and the status bar reads once per frame.
 
-The suite writes a CWD, branch and env status for one session and a CWD for another, then asserts the fields land independently, that a sibling pane's update never leaks across, that `set_git_branch(None)` really clears the segment (the server sends it when the CWD leaves a repository, so treating `None` as a no-op would strand a stale branch), and that [[crates/scribe-client-gpui/src/chrome_metadata.rs#ChromeMetadata#forget_session]] drops only the exited session.
+The suite writes a CWD, branch and env status for one session and a CWD for another, then asserts the fields land independently, that a sibling pane's update never leaks across, that `set_git_branch(None)` really clears the segment (the server sends it when the CWD leaves a repository, so treating `None` as a no-op would strand a stale branch), and that [[crates/scribe-client/src/chrome_metadata.rs#ChromeMetadata#forget_session]] drops only the exited session.
 
 ### GPUI terminal chrome labels
 
-Verifies that [[crates/scribe-client-gpui/src/chrome_metadata.rs#SessionChrome#host_label]] and [[crates/scribe-client-gpui/src/chrome_metadata.rs#SessionChrome#tmux_label]] lower a `SessionContext` onto the status bar the way the legacy client's `frame_status_snapshot` did.
+Verifies that [[crates/scribe-client/src/chrome_metadata.rs#SessionChrome#host_label]] and [[crates/scribe-client/src/chrome_metadata.rs#SessionChrome#tmux_label]] lower a `SessionContext` onto the status bar the way the legacy client's `frame_status_snapshot` did.
 
 A context with `remote: false` yields no host label — a local pane must keep this machine's own name — while still exposing its tmux session, a remote context yields the host, and a remote context with an empty host falls back to the local label rather than rendering a blank segment.
 
 ### GPUI workspace naming and reseed
 
-Covers [[crates/scribe-client-gpui/src/chrome_metadata.rs#ChromeMetadata#seed_from_session_list]] and [[crates/scribe-client-gpui/src/chrome_metadata.rs#ChromeMetadata#name_workspace]], the two paths that repopulate the chrome after a reattach instead of waiting for the next shell prompt.
+Covers [[crates/scribe-client/src/chrome_metadata.rs#ChromeMetadata#seed_from_session_list]] and [[crates/scribe-client/src/chrome_metadata.rs#ChromeMetadata#name_workspace]], the two paths that repopulate the chrome after a reattach instead of waiting for the next shell prompt.
 
 Seeding from an authoritative `SessionList` adopts the listed CWD and context, leaves a live branch the list omits untouched (the list is a snapshot, not a transition), prunes any session missing from it, and takes each workspace name from the batched `workspaces` entries. A rename to whitespace clears the workspace segment rather than rendering an empty one.
 
@@ -1213,31 +1218,31 @@ Seeding from an authoritative `SessionList` adopts the listed CWD and context, l
 
 Confirms a config carrying every removed appearance key deserializes without error and leaves the GPUI-consumed surface intact, satisfying the parity inventory's "Removed configuration keys" rows.
 
-The test parses the removed-keys TOML into [[crates/scribe-common/src/config.rs#ScribeConfig]], asserts the live appearance fields (font, font size, theme) parsed correctly, then resolves the full [[crates/scribe-client-gpui/src/config.rs#ClientConfig]] snapshot and checks the theme, derived chrome colors, and parsed bindings all populate — proving the removed keys are inert and never reach the paint path.
+The test parses the removed-keys TOML into [[crates/scribe-common/src/config.rs#ScribeConfig]], asserts the live appearance fields (font, font size, theme) parsed correctly, then resolves the full [[crates/scribe-client/src/config.rs#ClientConfig]] snapshot and checks the theme, derived chrome colors, and parsed bindings all populate — proving the removed keys are inert and never reach the paint path.
 
 ### Config live reload
 
 A scripted reload confirms that edits to theme, font, and keybindings reapply live without a restart, backing the `ConfigReloaded` parity row.
 
-Building a [[crates/scribe-client-gpui/src/config.rs#ClientConfig]] from an initial config and calling [[crates/scribe-client-gpui/src/config.rs#ClientConfig#reload]] with an edited config, the test asserts the returned [[crates/scribe-client-gpui/src/config.rs#ConfigReloadPlan]] flags the theme and font as changed, the resolved theme/chrome and font metrics actually updated, and the re-parsed [[crates/scribe-client-gpui/src/keybindings.rs#Bindings]] reflect the new combo. Companion cases assert an opacity-only edit is scoped to `opacity_changed` and an identical config reports no change.
+Building a [[crates/scribe-client/src/config.rs#ClientConfig]] from an initial config and calling [[crates/scribe-client/src/config.rs#ClientConfig#reload]] with an edited config, the test asserts the returned [[crates/scribe-client/src/config.rs#ConfigReloadPlan]] flags the theme and font as changed, the resolved theme/chrome and font metrics actually updated, and the re-parsed [[crates/scribe-client/src/keybindings.rs#Bindings]] reflect the new combo. Companion cases assert an opacity-only edit is scoped to `opacity_changed` and an identical config reports no change.
 
 Those cases prove the plan is computed correctly, but not that a running window ever asks for one. The child cases below cover the runtime path that closes that gap — watcher signal, foreground poll, painted font, and the outbound `ConfigReloaded` — and [[test#Visual E2E Tests#Config live reload]] drives the whole chain against a real window.
 
 #### Watcher signal collapses a burst
 
-Confirms [[crates/scribe-client-gpui/src/config.rs#ConfigChangeSignal]] turns the several `notify` events one editor save emits into exactly one reload, and reports nothing when the file is untouched.
+Confirms [[crates/scribe-client/src/config.rs#ConfigChangeSignal]] turns the several `notify` events one editor save emits into exactly one reload, and reports nothing when the file is untouched.
 
-The test polls a fresh signal (no reload due), fires three `signal()` calls to stand in for the delete/create/modify sequence a save-by-rename produces, and asserts a single [[crates/scribe-client-gpui/src/config.rs#ConfigChangeSignal#take_change]] consumes all three and the next poll is clean. This is the property that lets the foreground poll on a timer instead of waking per filesystem event without either missing a save or reloading three times per save.
+The test polls a fresh signal (no reload due), fires three `signal()` calls to stand in for the delete/create/modify sequence a save-by-rename produces, and asserts a single [[crates/scribe-client/src/config.rs#ConfigChangeSignal#take_change]] consumes all three and the next poll is clean. This is the property that lets the foreground poll on a timer instead of waking per filesystem event without either missing a save or reloading three times per save.
 
 #### Runtime applies a watcher-signalled edit
 
-Drives the full foreground path — signal, poll, reload, read back — over [[crates/scribe-client-gpui/src/config.rs#ConfigRuntime]], proving a window only reloads when the watcher fires and that every live surface swaps in one step.
+Drives the full foreground path — signal, poll, reload, read back — over [[crates/scribe-client/src/config.rs#ConfigRuntime]], proving a window only reloads when the watcher fires and that every live surface swaps in one step.
 
-Using [[crates/scribe-client-gpui/src/config.rs#ConfigRuntime#detached]] so no real config directory is touched, the test asserts an unsignalled poll does not reload, then signals and applies an edit changing theme, font, opacity, and the command-palette combo at once. It checks the plan flags all three surfaces, the resolved theme and font actually updated, [[crates/scribe-client-gpui/src/config.rs#ConfigRuntime#opacity]] carries the new value to the opacity hook, the re-parsed [[crates/scribe-client-gpui/src/config.rs#ConfigRuntime#bindings]] expose the new palette key, and the consumed signal leaves no second reload queued.
+Using [[crates/scribe-client/src/config.rs#ConfigRuntime#detached]] so no real config directory is touched, the test asserts an unsignalled poll does not reload, then signals and applies an edit changing theme, font, opacity, and the command-palette combo at once. It checks the plan flags all three surfaces, the resolved theme and font actually updated, [[crates/scribe-client/src/config.rs#ConfigRuntime#opacity]] carries the new value to the opacity hook, the re-parsed [[crates/scribe-client/src/config.rs#ConfigRuntime#bindings]] expose the new palette key, and the consumed signal leaves no second reload queued.
 
 #### Grid font tracks the live appearance config
 
-Verifies [[crates/scribe-client-gpui/src/terminal_element.rs#GridFont]] derives the grid's painted metrics from `[appearance]` so a font edit changes pixels rather than only the stored config.
+Verifies [[crates/scribe-client/src/terminal_element.rs#GridFont]] derives the grid's painted metrics from `[appearance]` so a font edit changes pixels rather than only the stored config.
 
 The test builds metrics from an edited appearance block and asserts the family, size, `line_padding`-inclusive row height, and the cell advance reported to the server all follow the config. A companion assertion drives `font_size = 0` and checks the value is clamped to the floor, so a bad edit degrades to a small grid instead of collapsing the window to nothing.
 
@@ -1245,7 +1250,7 @@ The test builds metrics from an edited appearance block and asserts the family, 
 
 Backs the `ConfigReloaded` parity row at the protocol boundary: the reload path must put the message on the wire, ordered ahead of whatever the user types next.
 
-Driving [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#config_reloaded]] followed by a `KeyInput` on the same ordered writer channel, the test asserts a `ClientMessage::ConfigReloaded` is dequeued first. Ordering is the point: the server must have re-read the config before it interprets the next keystroke, otherwise a policy edit applies a keypress late.
+Driving [[crates/scribe-client/src/ipc_bridge.rs#IpcSink#config_reloaded]] followed by a `KeyInput` on the same ordered writer channel, the test asserts a `ClientMessage::ConfigReloaded` is dequeued first. Ordering is the point: the server must have re-read the config before it interprets the next keystroke, otherwise a policy edit applies a keypress late.
 
 ### Find overlay
 
@@ -1257,13 +1262,13 @@ None of these prove the running client finds anything — the round trip they st
 
 The overlay holds no scrollback, so a query edit that does not reach the server produces a stale or empty result set; this pins that every kind of edit re-asks, and that a no-op edit does not.
 
-Typing, pasting, Backspace and Delete each emit one [[crates/scribe-client-gpui/src/search.rs#FindOverlayEvent]]`::QueryChanged` carrying the new query, while popping an already-empty query, clearing an already-empty query, and a control character emit nothing.
+Typing, pasting, Backspace and Delete each emit one [[crates/scribe-client/src/search.rs#FindOverlayEvent]]`::QueryChanged` carrying the new query, while popping an already-empty query, clearing an already-empty query, and a control character emit nothing.
 
 #### A stale reply never replaces live matches
 
 Requests go out per keystroke, so several replies can be in flight at once and the answer to an abandoned prefix must never be shown.
 
-[[crates/scribe-client-gpui/src/search.rs#FindOverlayView#adopt_results]] ignores a [[crates/scribe-client-gpui/src/search.rs#FindResults]] answering an earlier query, adopts the one answering the typed query, and adopts any given reply exactly once — so a redraw cannot reset the match the user has cycled to.
+[[crates/scribe-client/src/search.rs#FindOverlayView#adopt_results]] ignores a [[crates/scribe-client/src/search.rs#FindResults]] answering an earlier query, adopts the one answering the typed query, and adopts any given reply exactly once — so a redraw cannot reset the match the user has cycled to.
 
 #### Cycling wraps and drives the counter
 
@@ -1275,7 +1280,7 @@ The `n/m` header is the only feedback the overlay gives about where in the match
 
 The server reports absolute grid rows including negative scrollback rows, while this client paints the active viewport only; clamping an off-screen match onto a visible row would highlight text that does not match.
 
-[[crates/scribe-client-gpui/src/search.rs#visible_highlights]] drops matches above and below the viewport, clamps a span to the last painted column, marks exactly the current index, and yields nothing for a degenerate grid.
+[[crates/scribe-client/src/search.rs#visible_highlights]] drops matches above and below the viewport, clamps a span to the last painted column, marks exactly the current index, and yields nothing for a degenerate grid.
 
 #### Matches recolour the cells they cover
 
@@ -1287,7 +1292,7 @@ Applying spans to one resolved row leaves every cell outside them untouched, giv
 
 The overlay can only ask; the sink is what turns the ask into a frame, so the lowering is asserted on the outbound channel.
 
-[[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#search_request]] enqueues a `ClientMessage::SearchRequest` naming the session, the query verbatim, and the 256-match limit.
+[[crates/scribe-client/src/ipc_bridge.rs#IpcSink#search_request]] enqueues a `ClientMessage::SearchRequest` naming the session, the query verbatim, and the 256-match limit.
 
 ### Cell-accurate paint path
 
@@ -1299,19 +1304,19 @@ None of these prove the running client paints anything — a headless case passe
 
 Verifies the parser-to-paint boundary: `Content` must carry each cell's raw colour fields and SGR flags, because a snapshot of plain strings can only ever be painted in one colour.
 
-Feeding a bold-red-on-blue run, a true-colour underlined run, and a reset through [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#feed_output]], the test asserts each cell's `fg`, `bg`, and `flags` survive into the snapshot — named colours as named, a 24-bit colour as `Color::Spec`, and BOLD/UNDERLINE set only on the cells that carry them. It also checks blank cells still pad the row to terminal width, since the paint path indexes cells by grid column.
+Feeding a bold-red-on-blue run, a true-colour underlined run, and a reset through [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#feed_output]], the test asserts each cell's `fg`, `bg`, and `flags` survive into the snapshot — named colours as named, a 24-bit colour as `Color::Spec`, and BOLD/UNDERLINE set only on the cells that carry them. It also checks blank cells still pad the row to terminal width, since the paint path indexes cells by grid column.
 
 #### Box-drawing quads reproduce the mask
 
 Confirms the quad reduction the GPUI overlay depends on is lossless, because a paint path that draws rectangles instead of a texture is only correct if the rectangles are the texture.
 
-For a spread of strokes, corners, crosses, shades, and blocks, the test rasterizes [[crates/scribe-client-gpui/src/box_drawing.rs#mask_quads]] back into a flat alpha buffer and asserts it equals [[crates/scribe-client-gpui/src/box_drawing.rs#render]]'s mask pixel for pixel, with no empty, transparent, or overlapping rectangle. It also pins the full block to exactly one edge-to-edge quad — the property that keeps a screen of box drawing affordable and its tiling seamless — and checks an unhandled character still falls through to the font.
+For a spread of strokes, corners, crosses, shades, and blocks, the test rasterizes [[crates/scribe-client/src/box_drawing.rs#mask_quads]] back into a flat alpha buffer and asserts it equals [[crates/scribe-client/src/box_drawing.rs#render]]'s mask pixel for pixel, with no empty, transparent, or overlapping rectangle. It also pins the full block to exactly one edge-to-edge quad — the property that keeps a screen of box drawing affordable and its tiling seamless — and checks an unhandled character still falls through to the font.
 
 #### Ligature shaping follows appearance.ligatures
 
 Backs the Ligatures parity row at the configuration boundary: the setting must reach the `Font` the paint path actually shapes with, not merely a metrics struct.
 
-The test builds [[crates/scribe-client-gpui/src/terminal_element.rs#GridFont]] from an appearance block with ligatures on and off, asserting `calt` is left at the font default in the first case and explicitly disabled in the second, then checks the same feature travels on the run font for both plain and bold cells.
+The test builds [[crates/scribe-client/src/terminal_element.rs#GridFont]] from an appearance block with ligatures on and off, asserting `calt` is left at the font default in the first case and explicitly disabled in the second, then checks the same feature travels on the run font for both plain and bold cells.
 
 #### Every run carries the Nerd Font fallback chain
 
@@ -1323,7 +1328,7 @@ Across plain, bold, italic, and bold-italic cells the test asserts every run car
 
 Backs the other half of the Font fallback row: naming the chain is useless if GPUI's `load_family` evicts the face, so the embedded asset must keep the exact shape the eviction check and the chain resolution depend on.
 
-Parsing [[crates/scribe-client-gpui/src/fonts.rs#SYMBOLS_NERD_FONT_MONO]], the test asserts the family name is exactly `Symbols Nerd Font Mono` (the chain's first entry), that `U+006D` maps to a glyph — the property gpui `f96212f` requires to keep a face at all, added by `tools/patch-nerd-symbols-font.py` — and that the powerline and Font Awesome codepoints the visual capture relies on (`U+E0A0`, `U+E0B0`, `U+E0B2`, `U+F09B`, `U+F121`) are all covered.
+Parsing [[crates/scribe-client/src/fonts.rs#SYMBOLS_NERD_FONT_MONO]], the test asserts the family name is exactly `Symbols Nerd Font Mono` (the chain's first entry), that `U+006D` maps to a glyph — the property gpui `f96212f` requires to keep a face at all, added by `tools/patch-nerd-symbols-font.py` — and that the powerline and Font Awesome codepoints the visual capture relies on (`U+E0A0`, `U+E0B0`, `U+E0B2`, `U+F09B`, `U+F121`) are all covered.
 
 #### Box-drawing cells leave the shaped text
 
@@ -1339,13 +1344,13 @@ These cases cover the derivation only. That the running window really shows its 
 
 #### Default window size clears every chrome band
 
-Confirms [[crates/scribe-client-gpui/src/window_chrome.rs#default_window_size]] leaves the whole grid *and* [[crates/scribe-client-gpui/src/window_chrome.rs#chrome_height]] room, which the old hardcoded 960x680 did not.
+Confirms [[crates/scribe-client/src/window_chrome.rs#default_window_size]] leaves the whole grid *and* [[crates/scribe-client/src/window_chrome.rs#chrome_height]] room, which the old hardcoded 960x680 did not.
 
 At the shipped 120x36 grid and font size 14 the derived height minus the chrome must still cover 36 rows of 18.9 px and the width must cover 120 cells of 8.4 px. The test also pins the exact shipped answer, because `120 * (14.0 * 0.6)` lands a hair above 1008.0 in `f32` and a naive `ceil()` would spend a whole extra pixel on that float noise. A degenerate font metric (zero cell width, negative line height) must collapse the grid to the minimum edge rather than producing a zero-size or negative window.
 
 #### Startup size never exceeds the display
 
-Verifies [[crates/scribe-client-gpui/src/window_chrome.rs#clamp_to_display]] shrinks an oversized request to the screen, because a window taller than the display moves the status bar off the desktop instead of off the window.
+Verifies [[crates/scribe-client/src/window_chrome.rs#clamp_to_display]] shrinks an oversized request to the screen, because a window taller than the display moves the status bar off the desktop instead of off the window.
 
 A `font_size = 72` grid asks for a window far past 1920x1080 and must come back clamped to exactly that; a window that already fits must pass through untouched; and a nonsense display report must not clamp the window below the minimum edge.
 
@@ -1357,13 +1362,13 @@ These cases cover the derivation only. The composited result — an opacity edit
 
 #### Clamps configured opacity
 
-Confirms [[crates/scribe-client-gpui/src/opacity.rs#clamp_opacity]] saturates out-of-range values instead of producing an invalid colour, because the config file is never validated on load.
+Confirms [[crates/scribe-client/src/opacity.rs#clamp_opacity]] saturates out-of-range values instead of producing an invalid colour, because the config file is never validated on load.
 
 The test drives an in-range value through unchanged, checks `1.5` and `-0.2` saturate to `1.0` and `0.0`, and checks NaN falls back to fully opaque so a malformed edit degrades to a normal window rather than an invisible one.
 
 #### Backgrounds carry the opacity alpha
 
-Verifies [[crates/scribe-client-gpui/src/opacity.rs#surface]] folds the configured opacity into a theme slot's alpha and touches nothing else.
+Verifies [[crates/scribe-client/src/opacity.rs#surface]] folds the configured opacity into a theme slot's alpha and touches nothing else.
 
 Painting a theme slot at `1.0` leaves it opaque; at `0.85` only the alpha moves while the RGB channels stay at the theme's colour, so a composited desktop blends toward the backdrop instead of shifting hue. Out-of-range values saturate through the same clamp.
 
@@ -1371,35 +1376,35 @@ Painting a theme slot at `1.0` leaves it opaque; at `0.85` only the alpha moves 
 
 Checks that a colour which is already partly transparent keeps its relative translucency when opacity scales it, and that foreground slots are exempt.
 
-[[crates/scribe-client-gpui/src/opacity.rs#scale_alpha]] and [[crates/scribe-client-gpui/src/opacity.rs#scale_slot]] multiply a half-alpha colour at half opacity down to a quarter, matching the legacy renderer's per-cell background scaling, while [[crates/scribe-client-gpui/src/opacity.rs#opaque_slot]] returns a foreground colour's own alpha untouched.
+[[crates/scribe-client/src/opacity.rs#scale_alpha]] and [[crates/scribe-client/src/opacity.rs#scale_slot]] multiply a half-alpha colour at half opacity down to a quarter, matching the legacy renderer's per-cell background scaling, while [[crates/scribe-client/src/opacity.rs#opaque_slot]] returns a foreground colour's own alpha untouched.
 
 #### Chrome backgrounds scale, chrome content does not
 
-Proves [[crates/scribe-client-gpui/src/tab_bar.rs#TabBarColors#from_chrome]] makes the titlebar alpha-aware without dimming its text, satisfying the parity row's requirement that chrome backgrounds repaint alpha-aware.
+Proves [[crates/scribe-client/src/tab_bar.rs#TabBarColors#from_chrome]] makes the titlebar alpha-aware without dimming its text, satisfying the parity row's requirement that chrome backgrounds repaint alpha-aware.
 
 Building the palette at `1.0` and `0.85` from a real theme, the test asserts the bar background, active-tab background and gradient top each scale by the opacity while their RGB stays put, and that text, separator and accent alphas are identical at both values. Out-of-range opacities clamp rather than overshooting or inverting the bar.
 
 #### Status bar band scales with opacity
 
-Verifies [[crates/scribe-client-gpui/src/status_bar.rs#StatusBarColors#with_opacity]] scales only the filled band, keeping every readable element at full strength.
+Verifies [[crates/scribe-client/src/status_bar.rs#StatusBarColors#with_opacity]] scales only the filled band, keeping every readable element at full strength.
 
 The test compares a theme-derived palette against its scaled copy and asserts the background alpha follows the opacity while the text, top hairline and dimmed stat-label alphas do not, then drives `1.5` and `-0.2` through the same clamp.
 
 ### GPUI Update Surfaces
 
-Locks the transition table of [[crates/scribe-client-gpui/src/update.rs#UpdateState]] — what the server's broadcasts arm, which confirmation the CTA opens, and what the user's decision clears. See [[client#Client#GPUI Update Surfaces]].
+Locks the transition table of [[crates/scribe-client/src/update.rs#UpdateState]] — what the server's broadcasts arm, which confirmation the CTA opens, and what the user's decision clears. See [[client#Client#GPUI Update Surfaces]].
 
 These cases cover the state holder only. That the running window actually receives a real `UpdateAvailable`, paints the CTA, and puts `TriggerUpdate` / `DismissUpdate` on the wire is a whole-app property, verified by [[test#Visual E2E Tests#Update surfaces]].
 
 #### Server broadcasts arm the status bar CTA
 
-Confirms an untouched state offers nothing and that [[crates/scribe-client-gpui/src/update.rs#UpdateState#on_available]] is what arms the CTA, so a client that never heard from the server cannot invent an update.
+Confirms an untouched state offers nothing and that [[crates/scribe-client/src/update.rs#UpdateState#on_available]] is what arms the CTA, so a client that never heard from the server cannot invent an update.
 
 The test asserts the default state has no version, no progress and no confirmation, then feeds one announcement and checks the version and release URL read back and the confirmation is the install variant. It then feeds `Downloading` progress and a *second* announcement, asserting the in-flight progress survives — the winit client keeps it because the server only re-announces a version it still considers installable.
 
 #### Restart-required outranks a pending version
 
-Verifies [[crates/scribe-client-gpui/src/update.rs#UpdateState#confirmation]] raises the cold-restart modal ahead of an install offer when both apply, matching the winit `open_update_dialog` precedence.
+Verifies [[crates/scribe-client/src/update.rs#UpdateState#confirmation]] raises the cold-restart modal ahead of an install offer when both apply, matching the winit `open_update_dialog` precedence.
 
 With both an announced version and a `CompletedRestartRequired` progress state present, the resolved dialog is the restart-required kind, so the user is asked about the restart they already paid for rather than about downloading again. The test also asserts the dialog's cancel action is the secondary one, which is what makes Esc and a backdrop click safe: neither can cold-restart the machine.
 
@@ -1407,11 +1412,11 @@ With both an announced version and a `CompletedRestartRequired` progress state p
 
 Checks that both terminal decisions retire the CTA, so a confirmed or declined update cannot keep re-offering itself on every repaint.
 
-[[crates/scribe-client-gpui/src/update.rs#UpdateState#on_triggered]] clears the version and release URL but is deliberately narrower than [[crates/scribe-client-gpui/src/update.rs#UpdateState#on_dismissed]], which also drops progress: after a trigger the server's own `UpdateProgress` takes over the label, whereas after a dismissal the server suppresses the version entirely and even a stale `Failed` state must not linger.
+[[crates/scribe-client/src/update.rs#UpdateState#on_triggered]] clears the version and release URL but is deliberately narrower than [[crates/scribe-client/src/update.rs#UpdateState#on_dismissed]], which also drops progress: after a trigger the server's own `UpdateProgress` takes over the label, whereas after a dismissal the server suppresses the version entirely and even a stale `Failed` state must not linger.
 
 ### GPUI Window Lifecycle
 
-Locks the decision table of [[crates/scribe-client-gpui/src/window_lifecycle.rs#WindowLifecycle]] — when a close or quit may be sent, which acknowledgement ends the window, what a focus transition reports, and how a window list projects. See [[client#Client#GPUI Window Lifecycle]].
+Locks the decision table of [[crates/scribe-client/src/window_lifecycle.rs#WindowLifecycle]] — when a close or quit may be sent, which acknowledgement ends the window, what a focus transition reports, and how a window list projects. See [[client#Client#GPUI Window Lifecycle]].
 
 These cases cover the shared state machine only. That the running window actually emits `CloseWindow` / `QuitAll` / `ListWindows` / `FocusChanged` and acts on the server's answers is a whole-app property, verified by [[test#Visual E2E Tests#Window lifecycle over the wire]].
 
@@ -1419,11 +1424,11 @@ These cases cover the shared state machine only. That the running window actuall
 
 Confirms both shutdown requests are one-shot and that neither of them, on its own, ends the window — only the server's answer does.
 
-"Kill Window" is inert until a `Welcome` names this connection's window, because the server refuses a `CloseWindow` that names any other one. Once claimed, [[crates/scribe-client-gpui/src/window_lifecycle.rs#WindowLifecycle#begin_close_window]] and [[crates/scribe-client-gpui/src/window_lifecycle.rs#WindowLifecycle#begin_quit_all]] both refuse a second request, so a repeated Enter on the dialog cannot put a second frame on the wire. [[crates/scribe-client-gpui/src/window_lifecycle.rs#WindowLifecycle#take_exit]] stays empty until the matching acknowledgement arrives and yields the exit exactly once, and a `QuitRequested` caused by a *different* window still exits this one.
+"Kill Window" is inert until a `Welcome` names this connection's window, because the server refuses a `CloseWindow` that names any other one. Once claimed, [[crates/scribe-client/src/window_lifecycle.rs#WindowLifecycle#begin_close_window]] and [[crates/scribe-client/src/window_lifecycle.rs#WindowLifecycle#begin_quit_all]] both refuse a second request, so a repeated Enter on the dialog cannot put a second frame on the wire. [[crates/scribe-client/src/window_lifecycle.rs#WindowLifecycle#take_exit]] stays empty until the matching acknowledgement arrives and yields the exit exactly once, and a `QuitRequested` caused by a *different* window still exits this one.
 
 #### An unrelated close ack is ignored
 
-Verifies [[crates/scribe-client-gpui/src/window_lifecycle.rs#WindowLifecycle#on_window_closed]] only obeys an acknowledgement naming the window this client asked to close.
+Verifies [[crates/scribe-client/src/window_lifecycle.rs#WindowLifecycle#on_window_closed]] only obeys an acknowledgement naming the window this client asked to close.
 
 A `WindowClosed` arriving with no pending close, or naming somebody else's window while ours is still pending, must leave the window running and the pending close intact — closing a live window on another window's ack is the failure this guard exists for, and it mirrors the winit client's "ignoring unexpected `WindowClosed` ack" branch.
 
@@ -1435,39 +1440,39 @@ A window that is active but showing no pane reports nothing; focusing a pane rep
 
 #### Window list projects remote controllers
 
-Verifies [[crates/scribe-client-gpui/src/window_lifecycle.rs#WindowLifecycle#set_windows]] keeps only the windows a remote peer controls and reports whether the summary changed.
+Verifies [[crates/scribe-client/src/window_lifecycle.rs#WindowLifecycle#set_windows]] keeps only the windows a remote peer controls and reports whether the summary changed.
 
 Locally-controlled windows carry no controller and contribute nothing, so an all-local reply leaves the status-bar summary empty and returns `false` — no repaint. A reply that adds a controller changes the summary; an identical follow-up reply does not, which is what stops a 2 s poll from repainting the bar forever.
 
 ### GPUI remote connect picker
 
-Verifies the ported [[crates/scribe-client-gpui/src/remote.rs#RemoteConnect]] picker state machine — the transport-free core of the winit [[crates/scribe-client/src/remote_connect.rs#RemoteConnect]] — so the multi-machine connect flow behaves identically over the frozen IPC protocol.
+Verifies the ported [[crates/scribe-client/src/remote.rs#RemoteConnect]] picker state machine — the transport-free core of the winit [[crates/scribe-client-legacy/src/remote_connect.rs#RemoteConnect]] — so the multi-machine connect flow behaves identically over the frozen IPC protocol.
 
-The suite drives [[crates/scribe-client-gpui/src/remote.rs#RemoteConnect#set_peers]] and [[crates/scribe-client-gpui/src/remote.rs#RemoteConnect#set_lan_peers]] to assert the tailnet/LAN merge: a dual-reachable machine collapses to one LAN-preferred row with an "also Tailscale" hint, an incompatible-version LAN peer is dropped, and online peers sort before offline. It then walks the step transitions through [[crates/scribe-client-gpui/src/remote.rs#RemoteConnect#handle_key]] — a manual `host:port` entry winning over the highlighted peer, a probe dialing over the row's transport, and the window step producing `Attach`/`NewWindow` [[crates/scribe-client-gpui/src/remote.rs#RemoteConnectAction]] intents with feature-015 share occupancy. Finally it checks the typed failure copy for tailnet/LAN refusals, the awaiting-approval overlay swap, and the [[crates/scribe-client-gpui/src/remote.rs#ReconnectOverlay]] key/click actions, all read back through the flattened [[crates/scribe-client-gpui/src/remote.rs#PickerView]].
+The suite drives [[crates/scribe-client/src/remote.rs#RemoteConnect#set_peers]] and [[crates/scribe-client/src/remote.rs#RemoteConnect#set_lan_peers]] to assert the tailnet/LAN merge: a dual-reachable machine collapses to one LAN-preferred row with an "also Tailscale" hint, an incompatible-version LAN peer is dropped, and online peers sort before offline. It then walks the step transitions through [[crates/scribe-client/src/remote.rs#RemoteConnect#handle_key]] — a manual `host:port` entry winning over the highlighted peer, a probe dialing over the row's transport, and the window step producing `Attach`/`NewWindow` [[crates/scribe-client/src/remote.rs#RemoteConnectAction]] intents with feature-015 share occupancy. Finally it checks the typed failure copy for tailnet/LAN refusals, the awaiting-approval overlay swap, and the [[crates/scribe-client/src/remote.rs#ReconnectOverlay]] key/click actions, all read back through the flattened [[crates/scribe-client/src/remote.rs#PickerView]].
 
 ### GPUI remote handshake
 
-Exercises the ported dial preamble [[crates/scribe-client-gpui/src/remote_handshake.rs#perform_remote_handshake]] over an in-memory `tokio::io::duplex` pair against a scripted fake server, proving the frozen `RemoteHandshake` / `RemoteHandshakeReply` exchange maps to the right [[crates/scribe-client-gpui/src/remote.rs#RemoteConnectOutcome]].
+Exercises the ported dial preamble [[crates/scribe-client/src/remote_handshake.rs#perform_remote_handshake]] over an in-memory `tokio::io::duplex` pair against a scripted fake server, proving the frozen `RemoteHandshake` / `RemoteHandshakeReply` exchange maps to the right [[crates/scribe-client/src/remote.rs#RemoteConnectOutcome]].
 
-The scripted server reads the client's first frame, asserts it is a well-formed [[crates/scribe-common/src/protocol.rs#ClientMessage]] `RemoteHandshake` at the negotiated version, then replies: an accepted reply yields `Accepted`, a typed refusal propagates, a reason-less refusal and any non-reply frame and an EOF all merge into `ConnectionFailure`. Companion parser cases lock the [[crates/scribe-client-gpui/src/remote_handshake.rs#parse_dial_target]] grammar (`host`, `host:port`, bad-port fallback, bare IPv6 literal) and the `SCRIBE_REMOTE_WINDOW` / takeover-flag parsing without mutating process env.
+The scripted server reads the client's first frame, asserts it is a well-formed [[crates/scribe-common/src/protocol.rs#ClientMessage]] `RemoteHandshake` at the negotiated version, then replies: an accepted reply yields `Accepted`, a typed refusal propagates, a reason-less refusal and any non-reply frame and an EOF all merge into `ConnectionFailure`. Companion parser cases lock the [[crates/scribe-client/src/remote_handshake.rs#parse_dial_target]] grammar (`host`, `host:port`, bad-port fallback, bare IPv6 literal) and the `SCRIBE_REMOTE_WINDOW` / takeover-flag parsing without mutating process env.
 
 ### GPUI lost control banner
 
-Confirms the ported [[crates/scribe-client-gpui/src/lost_control.rs#LostControlState]] — the transport-agnostic displaced-client state from the winit [[crates/scribe-client/src/lost_control.rs#LostControlState]] — names the new controller and gates reclaim to Enter only.
+Confirms the ported [[crates/scribe-client/src/lost_control.rs#LostControlState]] — the transport-agnostic displaced-client state from the winit [[crates/scribe-client-legacy/src/lost_control.rs#LostControlState]] — names the new controller and gates reclaim to Enter only.
 
-The suite asserts [[crates/scribe-client-gpui/src/lost_control.rs#LostControlState#headline]] renders `Controlled by <device> (<account>)` and that reclaim fires on `Enter` while every other key stays suppressed, matching the FR-009b banner copy and one-action reclaim obligation.
+The suite asserts [[crates/scribe-client/src/lost_control.rs#LostControlState#headline]] renders `Controlled by <device> (<account>)` and that reclaim fires on `Enter` while every other key stays suppressed, matching the FR-009b banner copy and one-action reclaim obligation.
 
 ### GPUI LAN device approval
 
-Confirms the ported [[crates/scribe-client-gpui/src/lan_approval.rs#LanApprovalDialog]] state — the model half of the winit [[crates/scribe-client/src/lan_approval.rs#LanApprovalDialog]] — keeps the safe Decline-default focus and word-wraps the approval body.
+Confirms the ported [[crates/scribe-client/src/lan_approval.rs#LanApprovalDialog]] state — the model half of the winit [[crates/scribe-client-legacy/src/lan_approval.rs#LanApprovalDialog]] — keeps the safe Decline-default focus and word-wraps the approval body.
 
-The suite asserts Decline is the initial focus (so an unexpected prompt never silently grants trust), that focus cycles between the two buttons, and that [[crates/scribe-client-gpui/src/lan_approval.rs#LanApprovalDialog#body_lines]] lists the requesting device, its trusted network, and its fingerprint words wrapped within the dialog width, adding the name-collision hint only when flagged.
+The suite asserts Decline is the initial focus (so an unexpected prompt never silently grants trust), that focus cycles between the two buttons, and that [[crates/scribe-client/src/lan_approval.rs#LanApprovalDialog#body_lines]] lists the requesting device, its trusted network, and its fingerprint words wrapped within the dialog width, adding the name-collision hint only when flagged.
 
 ### GPUI LAN chrome
 
-Confirms [[crates/scribe-client-gpui/src/lan.rs#LanChrome]] — the state the IPC reader folds every feature-014 answer into and the window renders from — hands an approval prompt to the foreground exactly once and derives the right status line.
+Confirms [[crates/scribe-client/src/lan.rs#LanChrome]] — the state the IPC reader folds every feature-014 answer into and the window renders from — hands an approval prompt to the foreground exactly once and derives the right status line.
 
-The suite is the headless half of a hand-off that spans two threads, so the take-once rule is what it asserts hardest: a parked prompt is returned by the first [[crates/scribe-client-gpui/src/lan.rs#LanChrome#take_approval]] and never again, so a later tick cannot raise a duplicate modal for a `request_id` already being answered, and a second request arriving before the first is raised replaces it rather than stacking. It also asserts the derived line: nothing at all before the environment is probed (rather than a misleading "0 peers"), the dormancy note with the server's own reason when the current network cannot be fingerprinted, the online-only peer count otherwise, and that a non-idle [[crates/scribe-client-gpui/src/lan.rs#LanDialStatus]] outranks all of it.
+The suite is the headless half of a hand-off that spans two threads, so the take-once rule is what it asserts hardest: a parked prompt is returned by the first [[crates/scribe-client/src/lan.rs#LanChrome#take_approval]] and never again, so a later tick cannot raise a duplicate modal for a `request_id` already being answered, and a second request arriving before the first is raised replaces it rather than stacking. It also asserts the derived line: nothing at all before the environment is probed (rather than a misleading "0 peers"), the dormancy note with the server's own reason when the current network cannot be fingerprinted, the online-only peer count otherwise, and that a non-idle [[crates/scribe-client/src/lan.rs#LanDialStatus]] outranks all of it.
 
 #### Approval hand-off is take-once
 
@@ -1487,9 +1492,9 @@ A client waiting on — or refused by — a peer reports that instead of the loc
 
 ### GPUI remote chrome
 
-Confirms [[crates/scribe-client-gpui/src/remote_chrome.rs#RemoteChrome]] — the state the IPC reader folds every feature-013 answer into and the window renders from — derives the right status line, freezes and reclaims exactly once, and bounds its automation queue.
+Confirms [[crates/scribe-client/src/remote_chrome.rs#RemoteChrome]] — the state the IPC reader folds every feature-013 answer into and the window renders from — derives the right status line, freezes and reclaims exactly once, and bounds its automation queue.
 
-The suite is the headless half of two cross-thread hand-offs. The displacement one is asserted hardest: a window is frozen until [[crates/scribe-client-gpui/src/remote_chrome.rs#RemoteChrome#reclaim]] returns `true` exactly once, so the key path can never put a second `ControlClaim` on the wire for a banner that is already gone, and it returns `false` when nothing was displaced so an Enter on a normal window is not mistaken for a reclaim. The automation one asserts FIFO order and the overflow rule: past the bound the OLDEST request is dropped, because the newest is the one the user just typed and a wedged window must not replay a minute of stale actions. It also asserts the derived line's precedence — nothing at all before the environment is probed, the passive "not detected" note when `tailscaled` was unreachable, the online-only peer count otherwise, and displacement outranking even a severed link.
+The suite is the headless half of two cross-thread hand-offs. The displacement one is asserted hardest: a window is frozen until [[crates/scribe-client/src/remote_chrome.rs#RemoteChrome#reclaim]] returns `true` exactly once, so the key path can never put a second `ControlClaim` on the wire for a banner that is already gone, and it returns `false` when nothing was displaced so an Enter on a normal window is not mistaken for a reclaim. The automation one asserts FIFO order and the overflow rule: past the bound the OLDEST request is dropped, because the newest is the one the user just typed and a wedged window must not replay a minute of stale actions. It also asserts the derived line's precedence — nothing at all before the environment is probed, the passive "not detected" note when `tailscaled` was unreachable, the online-only peer count otherwise, and displacement outranking even a severed link.
 
 #### Status line reports the tailnet account
 
@@ -1509,7 +1514,7 @@ Queued `RunAction`s drain in arrival order, and an overflow drops the oldest rat
 
 ### GPUI LAN dial
 
-Confirms [[crates/scribe-client-gpui/src/lan_dial.rs#handshake]] — the connecting side's `LanHello` preamble and approval gate — settles on the right [[crates/scribe-client-gpui/src/remote.rs#LanConnectOutcome]] and fails closed on every malformed answer.
+Confirms [[crates/scribe-client/src/lan_dial.rs#handshake]] — the connecting side's `LanHello` preamble and approval gate — settles on the right [[crates/scribe-client/src/remote.rs#LanConnectOutcome]] and fails closed on every malformed answer.
 
 The TCP and mutual-TLS half needs a real peer and is covered by [[test#Visual E2E Tests#LAN approval and mutual-TLS dial]]; what is testable without one is the framed exchange, so these drive the preamble over an in-memory duplex. The waiting-state callback is asserted by count, because reporting it for an already-trusted device would show a "waiting for approval" state that never existed.
 
@@ -1527,11 +1532,11 @@ A refusal with no reason, a frame that is not the gate at all, and a peer that h
 
 ### GPUI window sharing
 
-Confirms the ported feature-015 sharing surfaces — [[crates/scribe-client-gpui/src/share.rs#ShareState]] and the control overlays from the winit [[crates/scribe-client/src/share_view.rs#ShareState]] — derive roster roles correctly and lower control passing onto the frozen v3 protocol.
+Confirms the ported feature-015 sharing surfaces — [[crates/scribe-client/src/share.rs#ShareState]] and the control overlays from the winit [[crates/scribe-client-legacy/src/share_view.rs#ShareState]] — derive roster roles correctly and lower control passing onto the frozen v3 protocol.
 
-The suite checks roster-derived multi/holder/label state and [[crates/scribe-client-gpui/src/share.rs#participant_label]] formatting, the [[crates/scribe-client-gpui/src/share.rs#ControlHint]] expiry window, and that a viewer's take-control and a [[crates/scribe-client-gpui/src/share.rs#ControlRequestPrompt]] answer lower through [[crates/scribe-client-gpui/src/share.rs#ControlIntent]] to `ControlClaim` / `ControlRequest` / `ControlGrant` [[crates/scribe-common/src/protocol.rs#ClientMessage]] messages.
+The suite checks roster-derived multi/holder/label state and [[crates/scribe-client/src/share.rs#participant_label]] formatting, the [[crates/scribe-client/src/share.rs#ControlHint]] expiry window, and that a viewer's take-control and a [[crates/scribe-client/src/share.rs#ControlRequestPrompt]] answer lower through [[crates/scribe-client/src/share.rs#ControlIntent]] to `ControlClaim` / `ControlRequest` / `ControlGrant` [[crates/scribe-common/src/protocol.rs#ClientMessage]] messages.
 
-The live-path aggregate [[crates/scribe-client-gpui/src/share.rs#ShareChrome]] is covered below. Its user-visible half — that the running client actually renders and sends any of this — is proven separately by [[test#Visual E2E Tests#Window sharing and control handoff]], not here.
+The live-path aggregate [[crates/scribe-client/src/share.rs#ShareChrome]] is covered below. Its user-visible half — that the running client actually renders and sends any of this — is proven separately by [[test#Visual E2E Tests#Window sharing and control handoff]], not here.
 
 #### Roster drives the presence surfaces
 
@@ -1555,13 +1560,13 @@ The `participant_id` carried by `Welcome` wins over the roster's `is_local` flag
 
 ### GPUI local share join
 
-Locks the [[crates/scribe-client-gpui/src/share_join.rs#parse_join_window]] hook that decides whether this client claims a window of its own or joins one another local process already holds — the client half of the shared-pane rig ([[test#Visual E2E Tests#Shared-pane rig]]).
+Locks the [[crates/scribe-client/src/share_join.rs#parse_join_window]] hook that decides whether this client claims a window of its own or joins one another local process already holds — the client half of the shared-pane rig ([[test#Visual E2E Tests#Shared-pane rig]]).
 
 A full UUID (with or without surrounding whitespace) parses to that `WindowId`; empty, blank, non-UUID, and the short `Display` label (`win-1234abcd`) all yield `None`, which leaves the stock `Hello { window_id: None }` handshake in place rather than failing the launch. The env read itself is not exercised — the workspace lints ban `set_var` — so the parser is called directly.
 
 ## GPUI Pane Dividers
 
-Covers pure divider geometry in [[crates/scribe-client-gpui/src/divider.rs#collect_dividers]], live overlay wiring, and drag-resize math. `tests/e2e/visual/pane-workspace-layout.sh` drags the real divider and asserts both grids re-lay.
+Covers pure divider geometry in [[crates/scribe-client/src/divider.rs#collect_dividers]], live overlay wiring, and drag-resize math. `tests/e2e/visual/pane-workspace-layout.sh` drags the real divider and asserts both grids re-lay.
 
 ### Horizontal split divider is a centered vertical line
 
@@ -1577,11 +1582,11 @@ A tree with an outer split whose second child is itself a split emits exactly on
 
 ### Hit test honors 4px tolerance
 
-[[crates/scribe-client-gpui/src/divider.rs#hit_test_divider]] matches a mouse within the [[crates/scribe-client-gpui/src/divider.rs#HIT_TOLERANCE]] 4px band around a 1px line and misses beyond it, so thin dividers stay easy to grab.
+[[crates/scribe-client/src/divider.rs#hit_test_divider]] matches a mouse within the [[crates/scribe-client/src/divider.rs#HIT_TOLERANCE]] 4px band around a 1px line and misses beyond it, so thin dividers stay easy to grab.
 
 ### Drag maps position to clamped ratio
 
-[[crates/scribe-client-gpui/src/divider.rs#start_drag]] captures the parent extent and origin, and [[crates/scribe-client-gpui/src/divider.rs#drag_ratio]] maps a drag position to a `[0.1, 0.9]`-clamped ratio so a resize can never collapse a pane.
+[[crates/scribe-client/src/divider.rs#start_drag]] captures the parent extent and origin, and [[crates/scribe-client/src/divider.rs#drag_ratio]] maps a drag position to a `[0.1, 0.9]`-clamped ratio so a resize can never collapse a pane.
 
 ### Drag on degenerate parent extent falls back to half
 
@@ -1589,15 +1594,15 @@ A drag whose captured parent extent is zero returns a neutral 0.5 ratio instead 
 
 ### Viewport insets clip vertical dividers below the tab bar
 
-[[crates/scribe-client-gpui/src/divider.rs#apply_viewport_insets]] clips a vertical divider below the tab bar and insets its top/bottom edges by the content padding when they touch the viewport boundary.
+[[crates/scribe-client/src/divider.rs#apply_viewport_insets]] clips a vertical divider below the tab bar and insets its top/bottom edges by the content padding when they touch the viewport boundary.
 
 ## GPUI Focus Borders
 
-Covers the focus-border edge geometry in [[crates/scribe-client-gpui/src/focus_border.rs#border_edges]] — the four accent strips the GPUI paint path fills for a focused pane or workspace, kept pure so the corner-overlap math is verifiable without a window.
+Covers the focus-border edge geometry in [[crates/scribe-client/src/focus_border.rs#border_edges]] — the four accent strips the GPUI paint path fills for a focused pane or workspace, kept pure so the corner-overlap math is verifiable without a window.
 
 ### Border edges frame the rect without corner overlap
 
-`border_edges` returns full-width top/bottom strips and vertically inset left/right strips at the [[crates/scribe-client-gpui/src/focus_border.rs#FOCUS_BORDER_WIDTH]] 2px width, so the four quads frame the rect without double-painting the corners.
+`border_edges` returns full-width top/bottom strips and vertically inset left/right strips at the [[crates/scribe-client/src/focus_border.rs#FOCUS_BORDER_WIDTH]] 2px width, so the four quads frame the rect without double-painting the corners.
 
 ### Border side strips clamp on tiny rects
 
@@ -1605,23 +1610,23 @@ On a rect shorter than twice the border width, the left/right strip heights clam
 
 ## GPUI Split-Scroll
 
-Covers the split-scroll live-bottom logic in [[crates/scribe-client-gpui/src/split_scroll.rs#split_scroll_eligible]] — eligibility, pin sizing, cursor-anchored translation, logical-line alignment, and viewport geometry — the AI-pane pinned-prompt behavior ported renderer-independent from the winit client.
+Covers the split-scroll live-bottom logic in [[crates/scribe-client/src/split_scroll.rs#split_scroll_eligible]] — eligibility, pin sizing, cursor-anchored translation, logical-line alignment, and viewport geometry — the AI-pane pinned-prompt behavior ported renderer-independent from the winit client.
 
 ### Eligible only for scrolled AI panes on the normal screen
 
-[[crates/scribe-client-gpui/src/split_scroll.rs#split_scroll_eligible]] activates only when the pin is enabled, the pane runs a supported AI provider, the view is scrolled up, and the pane is on the normal screen — never on the alternate screen, encoding the alt-screen exclusion.
+[[crates/scribe-client/src/split_scroll.rs#split_scroll_eligible]] activates only when the pin is enabled, the pane runs a supported AI provider, the view is scrolled up, and the pane is on the normal screen — never on the alternate screen, encoding the alt-screen exclusion.
 
 ### Pin rows fit the AI prompt block or clamp on tiny screens
 
-[[crates/scribe-client-gpui/src/split_scroll.rs#compute_pin_rows]] reserves the AI prompt block height when the screen has room and clamps to a `MIN_PIN_ROWS` floor and `screen - MIN_PIN_ROWS` ceiling on small screens so the top portion never vanishes.
+[[crates/scribe-client/src/split_scroll.rs#compute_pin_rows]] reserves the AI prompt block height when the screen has room and clamps to a `MIN_PIN_ROWS` floor and `screen - MIN_PIN_ROWS` ceiling on small screens so the top portion never vanishes.
 
 ### Cursor-anchored translation keeps the prompt visible
 
-[[crates/scribe-client-gpui/src/split_scroll.rs#live_cell_y_translation]] shifts live cells so the cursor row lands on the last screen row, keeping an AI tool's prompt visible in the pin even when it draws in the upper half, and saturating to zero when the cursor is already at or past the bottom.
+[[crates/scribe-client/src/split_scroll.rs#live_cell_y_translation]] shifts live cells so the cursor row lands on the last screen row, keeping an AI tool's prompt visible in the pin even when it draws in the upper half, and saturating to zero when the cursor is already at or past the bottom.
 
 ### Geometry stacks top divider and pinned bottom
 
-[[crates/scribe-client-gpui/src/split_scroll.rs#compute_geometry]] stacks a scrollback top portion, a 1px divider, and a pinned bottom of the requested height, docking the jump-to-bottom chip inside the top portion where [[crates/scribe-client-gpui/src/split_scroll.rs#hit_test_jump_btn]] resolves it.
+[[crates/scribe-client/src/split_scroll.rs#compute_geometry]] stacks a scrollback top portion, a 1px divider, and a pinned bottom of the requested height, docking the jump-to-bottom chip inside the top portion where [[crates/scribe-client/src/split_scroll.rs#hit_test_jump_btn]] resolves it.
 
 ### Pin height clamps to the content rect
 
@@ -1629,43 +1634,43 @@ A pin height larger than the content rect collapses the top portion to zero rath
 
 ### Pin alignment absorbs soft-wrapped logical lines
 
-[[crates/scribe-client-gpui/src/split_scroll.rs#align_pin_rows_to_logical_lines]] expands the pin upward across `WRAPLINE`-flagged rows so the split never starts mid-way through a soft-wrapped logical line, and leaves the requested rows unchanged when there is no wrap.
+[[crates/scribe-client/src/split_scroll.rs#align_pin_rows_to_logical_lines]] expands the pin upward across `WRAPLINE`-flagged rows so the split never starts mid-way through a soft-wrapped logical line, and leaves the requested rows unchanged when there is no wrap.
 
 ## GPUI Terminal Viewport
 
-Unit tests for the live client's terminal viewport — [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal]] and the pointer mapping in [[crates/scribe-client-gpui/src/terminal_element.rs#cell_at]] — proving the snapshot honours the display offset, the split-scroll pin, the vi cursor, and click-to-cell resolution.
+Unit tests for the live client's terminal viewport — [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal]] and the pointer mapping in [[crates/scribe-client/src/terminal_element.rs#cell_at]] — proving the snapshot honours the display offset, the split-scroll pin, the vi cursor, and click-to-cell resolution.
 
 These are the reachability tests for [[client#GPUI Client Spike#GPUI Terminal Viewport Wiring]]: the pure modules already had unit tests, so what is asserted here is that the *running* client's snapshot and pointer path actually consume them.
 
 ### Scrolling paints scrollback and returns to the live bottom
 
-[[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#scroll]] moves the display offset and rebuilds the snapshot from it, so a paged-up viewport paints scrollback rows; scrolling past the oldest row reports no movement, and `Scroll::Bottom` restores the live tail.
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#scroll]] moves the display offset and rebuilds the snapshot from it, so a paged-up viewport paints scrollback rows; scrolling past the oldest row reports no movement, and `Scroll::Bottom` restores the live tail.
 
 ### Prompt marks anchor and scroll in absolute rows
 
-[[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#prompt_anchor]] reports the history size, screen height, and cursor cell a mark is anchored by, [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#viewport_top_abs]] names the viewport's top row in the same absolute space, and [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#scroll_to_abs]] lands on a given row, reporting no movement when it is already there.
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#prompt_anchor]] reports the history size, screen height, and cursor cell a mark is anchored by, [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#viewport_top_abs]] names the viewport's top row in the same absolute space, and [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#scroll_to_abs]] lands on a given row, reporting no movement when it is already there.
 
 ### Scrollback trim drops rows and shifts marks
 
-[[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#trim_history]] really removes the display grid's oldest rows and reports the drop, and [[crates/scribe-client-gpui/src/session_lifecycle.rs#PromptMarks#on_trim]] applies it to the marks.
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#trim_history]] really removes the display grid's oldest rows and reports the drop, and [[crates/scribe-client/src/session_lifecycle.rs#PromptMarks#on_trim]] applies it to the marks.
 
 The surviving top row is the one after the cut rather than a renumbered original, anchors below the cut shift down, anchors inside it are retired, and a trim that keeps everything the grid already holds is a no-op.
 
 ### Split-scroll pins the live rows under the scrollback
 
-With the eligibility gate open, [[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#set_split_scroll_eligibility]] makes the snapshot's trailing rows read the live screen anchored on the shell cursor while the rows above stay at the scrolled offset; closing the gate restores one contiguous region.
+With the eligibility gate open, [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#set_split_scroll_eligibility]] makes the snapshot's trailing rows read the live screen anchored on the shell cursor while the rows above stay at the scrolled offset; closing the gate restores one contiguous region.
 
 ### Vi mode publishes a cursor the paint path can draw
 
-Toggling vi mode publishes a viewport-space cursor on the snapshot, a motion moves it a row, and leaving vi mode clears it — which is what makes the keyboard cursor visible to [[crates/scribe-client-gpui/src/terminal_element.rs#TerminalElement#paint_vi_cursor]].
+Toggling vi mode publishes a viewport-space cursor on the snapshot, a motion moves it a row, and leaving vi mode clears it — which is what makes the keyboard cursor visible to [[crates/scribe-client/src/terminal_element.rs#TerminalElement#paint_vi_cursor]].
 
 ### Smart selection resolves through the scrolled viewport
 
-[[crates/scribe-client-gpui/src/terminal.rs#DisplayOnlyTerminal#smart_selection_actions]] resolves a viewport cell against the display offset before matching, so a rule still matches text that has scrolled into history; blank space yields no actionable candidate.
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#smart_selection_actions]] resolves a viewport cell against the display offset before matching, so a rule still matches text that has scrolled into history; blank space yields no actionable candidate.
 
 ### A moved grid area asks for a republish
 
-[[crates/scribe-client-gpui/src/terminal_element.rs#record_grid_area]] reports `true` for the first measurement and for every rect that moved or resized, and `false` for an idle repaint of the same rect.
+[[crates/scribe-client/src/terminal_element.rs#record_grid_area]] reports `true` for the first measurement and for every rect that moved or resized, and `false` for an idle repaint of the same rect.
 
 That is the gate which turns a measured band into exactly one deferred republish — never none (the stale-render defect) and never one per frame (a `Resize` storm).
 
@@ -1675,71 +1680,71 @@ That is the gate which turns a measured band into exactly one deferred republish
 
 ### The jump chip is only hit while the pin is up
 
-[[crates/scribe-client-gpui/src/terminal_element.rs#hits_jump_chip]] re-derives the paint pass's split geometry and matches only points inside the docked chip, and matches nothing at all when there is no pin, so an unsplit grid passes every click through.
+[[crates/scribe-client/src/terminal_element.rs#hits_jump_chip]] re-derives the paint pass's split geometry and matches only points inside the docked chip, and matches nothing at all when there is no pin, so an unsplit grid passes every click through.
 
 ## GPUI Mouse Reporting
 
-Golden byte-capture and decision tests for [[crates/scribe-client-gpui/src/mouse_reporting.rs]] — the X10 / SGR-1006 encoders against the captured legacy fixture, and the pure gates the live pointer path consults around them.
+Golden byte-capture and decision tests for [[crates/scribe-client/src/mouse_reporting.rs]] — the X10 / SGR-1006 encoders against the captured legacy fixture, and the pure gates the live pointer path consults around them.
 
 The encoder half is the US1 correctness oracle described in [[client#Input#Mouse Reporting#GPUI Rebuild Golden Oracle]]. The decision half exists because the shell's event handlers hold no policy of their own: everything they branch on is one of the functions below, so a wrong branch is a failing unit test rather than a silent behaviour change nobody can see without a mouse.
 
 ### Wheel routing orders its three consumers
 
-[[crates/scribe-client-gpui/src/mouse_reporting.rs#wheel_action]] gives the wheel to a mouse-tracking application first, on either screen buffer, and otherwise to the client's own scrollback.
+[[crates/scribe-client/src/mouse_reporting.rs#wheel_action]] gives the wheel to a mouse-tracking application first, on either screen buffer, and otherwise to the client's own scrollback.
 
 Mode-1007 cursor keys are the fallback only on the alternate screen with alternate scroll on — the winit client's priority order exactly.
 
 ### Wheel deltas convert to signed rows
 
-[[crates/scribe-client-gpui/src/mouse_reporting.rs#wheel_lines]] passes GPUI's already-scaled `Lines` notch through as three rows and divides a trackpad's `Pixels` delta by the row height.
+[[crates/scribe-client/src/mouse_reporting.rs#wheel_lines]] passes GPUI's already-scaled `Lines` notch through as three rows and divides a trackpad's `Pixels` delta by the row height.
 
 Sub-row travel rounds to zero rather than to a phantom row, a degenerate row height drops the event entirely, and the sign inverts only when `natural_scroll` is on.
 
 ### Alternate scroll sends one cursor key per row
 
-[[crates/scribe-client-gpui/src/mouse_reporting.rs#alternate_scroll_keys]] emits one CUU per row backwards and one CUD per row forwards, and nothing at all for a zero delta, so a pager under mode 1007 scrolls by the same amount the viewport would have.
+[[crates/scribe-client/src/mouse_reporting.rs#alternate_scroll_keys]] emits one CUU per row backwards and one CUD per row forwards, and nothing at all for a zero delta, so a pager under mode 1007 scrolls by the same amount the viewport would have.
 
 ### Shift takes the pointer back from a tracking application
 
-[[crates/scribe-client-gpui/src/mouse_reporting.rs#MouseModes#forwards_buttons]] forwards a button event only while the application tracks the mouse and Shift is not held, so the universal text-selection override works inside vim and tmux and an untracking pane never forwards anything.
+[[crates/scribe-client/src/mouse_reporting.rs#MouseModes#forwards_buttons]] forwards a button event only while the application tracks the mouse and Shift is not held, so the universal text-selection override works inside vim and tmux and an untracking pane never forwards anything.
 
 ### Scroll direction follows the signed row delta
 
-[[crates/scribe-client-gpui/src/mouse_reporting.rs#ScrollDirection#from_rows]] maps a positive row delta to button 64 and a negative one to button 65, and the resulting SGR sequences match the golden fixture's, so a wired wheel is byte-identical to the winit client's.
+[[crates/scribe-client/src/mouse_reporting.rs#ScrollDirection#from_rows]] maps a positive row delta to button 64 and a negative one to button 65, and the resulting SGR sequences match the golden fixture's, so a wired wheel is byte-identical to the winit client's.
 
 ## GPUI Command Scrollbar
 
-Covers the bespoke command-mark scrollbar in [[crates/scribe-client-gpui/src/scrollbar.rs#build_scrollbar_render]] — thumb geometry, fade/hover-widen animation, click/drag scroll math, and command-status tick placement with trim-shift — the renderer-independent core the GPUI paint path lowers onto quads.
+Covers the bespoke command-mark scrollbar in [[crates/scribe-client/src/scrollbar.rs#build_scrollbar_render]] — thumb geometry, fade/hover-widen animation, click/drag scroll math, and command-status tick placement with trim-shift — the renderer-independent core the GPUI paint path lowers onto quads.
 
 The running client's use of that core is asserted separately, in [[test#Visual E2E Tests#The command-mark scrollbar paints its thumb and ticks]].
 
 ### No scrollback yields no thumb
 
-[[crates/scribe-client-gpui/src/scrollbar.rs#compute_thumb]] returns nothing and [[crates/scribe-client-gpui/src/scrollbar.rs#hit_test_scrollbar]] never matches when the pane has zero scrollback rows, so an unscrolled pane shows no overlay.
+[[crates/scribe-client/src/scrollbar.rs#compute_thumb]] returns nothing and [[crates/scribe-client/src/scrollbar.rs#hit_test_scrollbar]] never matches when the pane has zero scrollback rows, so an unscrolled pane shows no overlay.
 
 ### Thumb sizes and positions from the viewport
 
-`compute_thumb` sizes the thumb from the visible-to-total row ratio (floored at [[crates/scribe-client-gpui/src/scrollbar.rs#MIN_THUMB_HEIGHT]]) and positions it down the track from the display offset, right-aligned inside the pane with the fixed inset.
+`compute_thumb` sizes the thumb from the visible-to-total row ratio (floored at [[crates/scribe-client/src/scrollbar.rs#MIN_THUMB_HEIGHT]]) and positions it down the track from the display offset, right-aligned inside the pane with the fixed inset.
 
 ### Track click maps to a scroll offset
 
-[[crates/scribe-client-gpui/src/scrollbar.rs#offset_from_track_click]] maps a click at the track top to the oldest scrollback and a click at the bottom to the live view, with mid-track clicks landing part-way up the history.
+[[crates/scribe-client/src/scrollbar.rs#offset_from_track_click]] maps a click at the track top to the oldest scrollback and a click at the bottom to the live view, with mid-track clicks landing part-way up the history.
 
 ### Drag maps vertical delta to offset
 
-[[crates/scribe-client-gpui/src/scrollbar.rs#offset_from_drag]] converts the vertical drag delta from the captured start into a new display offset — dragging down scrolls toward the live bottom and dragging up toward the top of history.
+[[crates/scribe-client/src/scrollbar.rs#offset_from_drag]] converts the vertical drag delta from the captured start into a new display offset — dragging down scrolls toward the live bottom and dragging up toward the top of history.
 
 ### Hit zone widens the right edge threefold
 
-`hit_test_scrollbar` accepts points inside a `3x`-width band anchored to the pane's right edge (the [[crates/scribe-client-gpui/src/scrollbar.rs#HIT_ZONE_MULTIPLIER]] padding) and rejects points left of the band or above the track top.
+`hit_test_scrollbar` accepts points inside a `3x`-width band anchored to the pane's right edge (the [[crates/scribe-client/src/scrollbar.rs#HIT_ZONE_MULTIPLIER]] padding) and rejects points left of the band or above the track top.
 
 ### Thumb hit test tracks the thumb rect
 
-[[crates/scribe-client-gpui/src/scrollbar.rs#hit_test_thumb]] matches only points inside the computed thumb rectangle, so a point elsewhere on the track (for click-to-jump) is distinguished from a point on the thumb (for drag).
+[[crates/scribe-client/src/scrollbar.rs#hit_test_thumb]] matches only points inside the computed thumb rectangle, so a point elsewhere on the track (for click-to-jump) is distinguished from a point on the thumb (for drag).
 
 ### Command ticks colour by status and shift with trim
 
-`build_scrollbar_render` colours each tick by its [[crates/scribe-client-gpui/src/scrollbar.rs#CommandStatus]] — theme green for success, red for failure, neutral for unknown — orders them by `abs_pos`, and re-places them after a trim shifts positions.
+`build_scrollbar_render` colours each tick by its [[crates/scribe-client/src/scrollbar.rs#CommandStatus]] — theme green for success, red for failure, neutral for unknown — orders them by `abs_pos`, and re-places them after a trim shifts positions.
 
 ### Stale mark position clamps inside the track
 
@@ -1751,7 +1756,7 @@ A mark whose `abs_pos` is stale (larger than the post-resize history) clamps to 
 
 ### Fade idles then fades over the configured windows
 
-[[crates/scribe-client-gpui/src/scrollbar.rs#ScrollbarState#tick_fade_at]] holds full opacity through the 1.5s idle delay after a scroll, ramps opacity down across the 0.3s fade window, and settles to invisible past it.
+[[crates/scribe-client/src/scrollbar.rs#ScrollbarState#tick_fade_at]] holds full opacity through the 1.5s idle delay after a scroll, ramps opacity down across the 0.3s fade window, and settles to invisible past it.
 
 ### Hover holds opacity and widens the thumb
 
@@ -1759,19 +1764,19 @@ A mark whose `abs_pos` is stale (larger than the post-resize history) clamps to 
 
 ### Mark colours fall back without an ANSI palette
 
-[[crates/scribe-client-gpui/src/scrollbar.rs#CommandMarkColors#from_ansi]] reads the theme's ANSI green (index 2) and red (index 1) for the success/failure tick hues, so themed palettes drive the tick colours directly.
+[[crates/scribe-client/src/scrollbar.rs#CommandMarkColors#from_ansi]] reads the theme's ANSI green (index 2) and red (index 1) for the success/failure tick hues, so themed palettes drive the tick colours directly.
 
 ## GPUI Font Zoom
 
-Covers the runtime font-zoom math in [[crates/scribe-client-gpui/src/zoom.rs#ZoomState]] — the in/out/reset point delta the GPUI shell applies over the configured font size, isolated so clamping and the size floor are verifiable without a window.
+Covers the runtime font-zoom math in [[crates/scribe-client/src/zoom.rs#ZoomState]] — the in/out/reset point delta the GPUI shell applies over the configured font size, isolated so clamping and the size floor are verifiable without a window.
 
 ### Zoom steps clamp to the point range
 
-Repeated [[crates/scribe-client-gpui/src/zoom.rs#ZoomState#zoom_in]] and [[crates/scribe-client-gpui/src/zoom.rs#ZoomState#zoom_out]] calls saturate at the `+7` / `-7` point bounds rather than overflowing the level.
+Repeated [[crates/scribe-client/src/zoom.rs#ZoomState#zoom_in]] and [[crates/scribe-client/src/zoom.rs#ZoomState#zoom_out]] calls saturate at the `+7` / `-7` point bounds rather than overflowing the level.
 
 ### Reset returns to the configured size
 
-[[crates/scribe-client-gpui/src/zoom.rs#ZoomState#reset]] returns the level to zero so [[crates/scribe-client-gpui/src/zoom.rs#ZoomState#effective_font_size]] yields the unmodified configured size.
+[[crates/scribe-client/src/zoom.rs#ZoomState#reset]] returns the level to zero so [[crates/scribe-client/src/zoom.rs#ZoomState#effective_font_size]] yields the unmodified configured size.
 
 ### Effective size applies the delta and honors the floor
 
@@ -1779,15 +1784,15 @@ Repeated [[crates/scribe-client-gpui/src/zoom.rs#ZoomState#zoom_in]] and [[crate
 
 ## GPUI Status Bar
 
-Unit tests for [[crates/scribe-client-gpui/src/status_bar.rs#build_model]], the ported window-status-bar segment model, proving every parity segment (connection, command/env glyphs, sparklines, labels, remote/share surfaces, update CTA) builds with the right text and colour without a live window.
+Unit tests for [[crates/scribe-client/src/status_bar.rs#build_model]], the ported window-status-bar segment model, proving every parity segment (connection, command/env glyphs, sparklines, labels, remote/share surfaces, update CTA) builds with the right text and colour without a live window.
 
 ### Connection dot reflects connection state
 
-[[crates/scribe-client-gpui/src/status_bar.rs#build_left]] paints the connection dot with the connected (ANSI green) colour when attached and the disconnected (ANSI red) colour otherwise.
+[[crates/scribe-client/src/status_bar.rs#build_left]] paints the connection dot with the connected (ANSI green) colour when attached and the disconnected (ANSI red) colour otherwise.
 
 ### Command status glyphs distinguish outcomes
 
-[[crates/scribe-client-gpui/src/status_bar.rs#CommandStatus]] maps Success to a check, Failure to a cross, and Unknown to a dimmed `?` that is never failure-styled, while an absent status renders no glyph.
+[[crates/scribe-client/src/status_bar.rs#CommandStatus]] maps Success to a check, Failure to a cross, and Unknown to a dimmed `?` that is never failure-styled, while an absent status renders no glyph.
 
 ### Env warning fires only when degraded
 
@@ -1795,27 +1800,27 @@ The feature-006 env-capture warning glyph is emitted only for `EnvStatusState::D
 
 ### Sparkline maps percentage to block height
 
-[[crates/scribe-client-gpui/src/status_bar.rs#sparkline_char]] maps 0–100% onto the eight block glyphs, clamps non-finite input to the lowest bar, and the network variant saturates at 100 MB/s.
+[[crates/scribe-client/src/status_bar.rs#sparkline_char]] maps 0–100% onto the eight block glyphs, clamps non-finite input to the lowest bar, and the network variant saturates at 100 MB/s.
 
 ### Usage color escalates with load
 
-[[crates/scribe-client-gpui/src/status_bar.rs#usage_color]] returns green below 60%, yellow from 60–85%, and red at or above 85%.
+[[crates/scribe-client/src/status_bar.rs#usage_color]] returns green below 60%, yellow from 60–85%, and red at or above 85%.
 
 ### Network rate formats to four columns
 
-[[crates/scribe-client-gpui/src/status_bar.rs#format_bytes_rate_fixed]] renders byte rates right-aligned in exactly four columns across the B/K/M and `>1G` ranges.
+[[crates/scribe-client/src/status_bar.rs#format_bytes_rate_fixed]] renders byte rates right-aligned in exactly four columns across the B/K/M and `>1G` ranges.
 
 ### CWD shortens home to tilde
 
-[[crates/scribe-client-gpui/src/status_bar.rs#shorten_cwd]] replaces a `$HOME` prefix with `~` and leaves paths outside home untouched.
+[[crates/scribe-client/src/status_bar.rs#shorten_cwd]] replaces a `$HOME` prefix with `~` and leaves paths outside home untouched.
 
 ### Right side stitches enabled segments in order
 
-[[crates/scribe-client-gpui/src/status_bar.rs#build_right]] emits git branch, session count (singular/plural), tmux, host, and clock segments in order, each gated on its input being present.
+[[crates/scribe-client/src/status_bar.rs#build_right]] emits git branch, session count (singular/plural), tmux, host, and clock segments in order, each gated on its input being present.
 
 ### Remote control summary tallies windows per device
 
-[[crates/scribe-client-gpui/src/status_bar.rs#build_remote_control_summary]] deduplicates controllers by device in first-seen order and pluralises the per-device window count (FR-009b).
+[[crates/scribe-client/src/status_bar.rs#build_remote_control_summary]] deduplicates controllers by device in first-seen order and pluralises the per-device window count (FR-009b).
 
 ### Share presence badge names the control holder
 
@@ -1823,11 +1828,11 @@ The feature-015 presence badge reports the attached-participant count and names 
 
 ### Centered update CTA reflects progress state
 
-[[crates/scribe-client-gpui/src/status_bar.rs#build_center]] resolves the centred CTA label and clickability from the update-available version and each `UpdateProgressState`, returning nothing when no update is pending.
+[[crates/scribe-client/src/status_bar.rs#build_center]] resolves the centred CTA label and clickability from the update-available version and each `UpdateProgressState`, returning nothing when no update is pending.
 
 ### Sparklines pad short history to fixed width
 
-[[crates/scribe-client-gpui/src/status_bar.rs#build_right]] left-pads a short CPU/GPU history to the fixed eight-bar width and renders the CPU, MEM, GPU, and network groups when their config flags are on.
+[[crates/scribe-client/src/status_bar.rs#build_right]] left-pads a short CPU/GPU history to the fixed eight-bar width and renders the CPU, MEM, GPU, and network groups when their config flags are on.
 
 ## GPUI Settings Window
 
@@ -1835,14 +1840,14 @@ Unit tests for the GPUI settings window that replaces the deleted `scribe-settin
 
 ### Per-page parity checklist
 
-Every page in [[crates/scribe-client-gpui/src/settings/model.rs#page_controls]] exposes controls, and every config-backed control routes cleanly through the ported [[crates/scribe-client-gpui/src/settings/apply.rs#apply_config_key]] with the value the window reads for it, so no editable setting regresses versus `settings.html/js`.
+Every page in [[crates/scribe-client/src/settings/model.rs#page_controls]] exposes controls, and every config-backed control routes cleanly through the ported [[crates/scribe-client/src/settings/apply.rs#apply_config_key]] with the value the window reads for it, so no editable setting regresses versus `settings.html/js`.
 
 ### Keybinding coverage
 
-The keybindings page lists every action the apply path routes under `keybindings.*` (the full 50+ set), and each action's current combos read back through [[crates/scribe-client-gpui/src/settings/values.rs#keybinding_combos]] without panicking, so no shortcut silently disappears.
+The keybindings page lists every action the apply path routes under `keybindings.*` (the full 50+ set), and each action's current combos read back through [[crates/scribe-client/src/settings/values.rs#keybinding_combos]] without panicking, so no shortcut silently disappears.
 
 ### Singleton focus handoff
 
-[[crates/scribe-client-gpui/src/settings/singleton.rs#acquire_at]] makes the first launch the primary; a second launch against the same paths sends a `focus` command with the anchor and returns `AlreadyRunning`.
+[[crates/scribe-client/src/settings/singleton.rs#acquire_at]] makes the first launch the primary; a second launch against the same paths sends a `focus` command with the anchor and returns `AlreadyRunning`.
 
 The primary then accepts the handoff connection, verifies the peer UID, and reads back that exact focus command — proving the second launch focuses the running window instead of opening a duplicate.

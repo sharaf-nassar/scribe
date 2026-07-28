@@ -1,4 +1,14 @@
-//! Persisted startup restore state and runtime launch bindings.
+//! Persisted cold-restart restore state for the GPUI client.
+//!
+//! Ported byte-for-byte from the legacy client's `restore_state.rs`. The
+//! [`RestoreStore`] persists one TOML snapshot per window under
+//! `$XDG_STATE_HOME/scribe/restore/windows/<window_id>.toml` plus a shared
+//! `index.toml`, all hardened to `0700`/`0600` because launch bindings can
+//! carry prompt text and provider conversation IDs. A bootstrap lock file
+//! serialises multi-process index mutations; stale locks (>30 s) are reclaimed.
+//! [`RestoreStore::claim_first_window`] atomically claims the first replayable
+//! entry for cold-restart replay and reports how many windows remain so the
+//! caller can fan out `--restore-child` processes.
 
 use std::io::Write as _;
 #[cfg(unix)]
@@ -14,7 +24,6 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Persisted list of windows that should be reopened on the next cold start.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreIndex {
     pub version: u32,
@@ -23,7 +32,6 @@ pub struct RestoreIndex {
 }
 
 /// Persisted logical state for one client window.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowRestoreState {
     pub version: u32,
@@ -35,6 +43,9 @@ pub struct WindowRestoreState {
 }
 
 impl WindowRestoreState {
+    /// A snapshot is replayable only when it has at least one launch record and
+    /// at least one workspace with a tab; a blank window is never replayed.
+    #[must_use]
     pub fn is_replayable(&self) -> bool {
         !self.launches.is_empty()
             && self.workspaces.iter().any(|workspace| !workspace.tabs.is_empty())
@@ -42,7 +53,6 @@ impl WindowRestoreState {
 }
 
 /// Snapshot of the workspace split tree.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkspaceLayoutSnapshot {
     Leaf {
@@ -57,7 +67,6 @@ pub enum WorkspaceLayoutSnapshot {
 }
 
 /// Snapshot of one workspace and its tab stack.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
     pub workspace_id: WorkspaceId,
@@ -68,7 +77,6 @@ pub struct WorkspaceSnapshot {
 }
 
 /// Snapshot of one tab and its pane tree.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabSnapshot {
     pub focused_launch_id: String,
@@ -76,7 +84,6 @@ pub struct TabSnapshot {
 }
 
 /// Snapshot of the pane split tree within a tab.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PaneSnapshot {
     Leaf {
@@ -91,7 +98,6 @@ pub enum PaneSnapshot {
 }
 
 /// Persisted record for one launchable session.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchRecord {
     pub launch_id: String,
@@ -102,17 +108,15 @@ pub struct LaunchRecord {
     #[serde(default)]
     pub latest_prompt: Option<String>,
     /// Wall-clock time the most recent prompt was received, encoded as
-    /// Unix-epoch seconds. Used by the prompt bar's elapsed-time counter
-    /// to keep counting up across cold restarts. `None` for snapshots
-    /// written by older clients that predate this field.
+    /// Unix-epoch seconds. Used by the prompt bar's elapsed-time counter to
+    /// keep counting up across cold restarts. `None` for snapshots written by
+    /// older clients that predate this field.
     #[serde(default)]
     pub latest_prompt_at: Option<u64>,
-    /// Wall-clock time the LLM finished responding to the most recent
-    /// prompt, encoded as Unix-epoch seconds. When `Some`, the timer
-    /// stays frozen at this instant across cold restarts so the displayed
-    /// elapsed value continues to reflect response duration rather than
-    /// being recomputed from `latest_prompt_at` plus downtime. `None`
-    /// when the LLM was still processing (or in older snapshots).
+    /// Wall-clock time the LLM finished responding to the most recent prompt,
+    /// encoded as Unix-epoch seconds. When `Some`, the timer stays frozen at
+    /// this instant across cold restarts. `None` when the LLM was still
+    /// processing (or in older snapshots).
     #[serde(default)]
     pub latest_prompt_finished_at: Option<u64>,
     #[serde(default)]
@@ -120,7 +124,6 @@ pub struct LaunchRecord {
 }
 
 /// Launch type recorded for restore replay.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LaunchKind {
@@ -130,16 +133,14 @@ pub enum LaunchKind {
 }
 
 /// Whether an AI launch was newly created or resumed.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AiResumeMode {
     New,
     Resume,
 }
 
-/// Runtime binding kept on each pane so restore snapshots can refer to a
-/// stable launch ID even before replay logic exists.
-
+/// Runtime binding kept on each pane so restore snapshots can refer to a stable
+/// launch ID even before replay logic exists.
 #[derive(Debug, Clone)]
 pub struct LaunchBinding {
     pub launch_id: String,
@@ -150,6 +151,12 @@ pub struct LaunchBinding {
 /// Client-side restore store rooted under the current state directory.
 pub struct RestoreStore {
     root: Option<PathBuf>,
+}
+
+impl Default for RestoreStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(unix)]
@@ -169,6 +176,7 @@ impl Drop for RestoreIndexLock {
 
 impl RestoreStore {
     /// Create a new store rooted at `$XDG_STATE_HOME/scribe/restore`.
+    #[must_use]
     pub fn new() -> Self {
         Self { root: current_state_dir().map(|dir| dir.join("restore")) }
     }
@@ -273,11 +281,19 @@ impl RestoreStore {
     }
 
     /// Save the restore index to disk.
+    ///
+    /// # Errors
+    /// Returns [`StateError`](crate::window_state::StateError) when the state
+    /// directory is unavailable or the file cannot be written.
     pub fn save_index(&self, index: &RestoreIndex) -> Result<(), crate::window_state::StateError> {
         self.write_toml_atomic(self.index_path(), index)
     }
 
     /// Insert or refresh a window entry in the restore index.
+    ///
+    /// # Errors
+    /// Returns [`StateError`](crate::window_state::StateError) when the index
+    /// lock cannot be acquired or the index cannot be persisted.
     pub fn upsert_index(&self, window_id: WindowId) -> Result<(), crate::window_state::StateError> {
         let _lock = self.acquire_index_lock()?;
         let mut index = self.read_index_for_update()?;
@@ -289,6 +305,10 @@ impl RestoreStore {
     }
 
     /// Remove a window entry from the restore index.
+    ///
+    /// # Errors
+    /// Returns [`StateError`](crate::window_state::StateError) when the index
+    /// lock cannot be acquired or the index cannot be persisted.
     pub fn remove_from_index(
         &self,
         window_id: WindowId,
@@ -301,11 +321,16 @@ impl RestoreStore {
     }
 
     /// Load the persisted logical state for a single window.
+    #[must_use]
     pub fn load_window(&self, window_id: WindowId) -> Option<WindowRestoreState> {
         Self::read_toml(self.window_path(window_id)).ok()
     }
 
     /// Save one window's logical state to disk.
+    ///
+    /// # Errors
+    /// Returns [`StateError`](crate::window_state::StateError) when the state
+    /// directory is unavailable or the file cannot be written.
     pub fn save_window(
         &self,
         state: &WindowRestoreState,
@@ -324,11 +349,12 @@ impl RestoreStore {
         }
     }
 
-    /// Atomically claim the first valid window from the restore index for cold
-    /// restart replay.  Returns the claimed window's state and the number of
-    /// remaining unclaimed windows (so the caller can spawn additional client
-    /// processes).  Corrupted entries are skipped and removed.  The claimed
-    /// entry and its on-disk file are cleaned up.
+    /// Atomically claim the first valid window from the restore index for
+    /// cold-restart replay. Returns the claimed window's state and the number
+    /// of remaining unclaimed windows (so the caller can spawn additional
+    /// client processes). Corrupted entries are skipped and removed. The
+    /// claimed entry and its on-disk file are cleaned up.
+    #[must_use]
     pub fn claim_first_window(&self) -> Option<(WindowRestoreState, usize)> {
         let _lock = self.acquire_index_lock().ok()?;
         let mut index = self.read_index_for_update().ok()?;
@@ -353,7 +379,8 @@ impl RestoreStore {
                     remaining_valid.push(window_id);
                 }
                 None => {
-                    // File missing or corrupted — clean up and drop the stale index entry.
+                    // File missing or corrupted — clean up and drop the stale
+                    // index entry.
                     self.remove_window(window_id);
                     tracing::warn!(%window_id, "skipping unreadable restore entry");
                 }
@@ -368,6 +395,10 @@ impl RestoreStore {
     }
 
     /// Check whether a bootstrap lock file is old enough to be considered stale.
+    ///
+    /// # Errors
+    /// Returns the underlying I/O error when the lock file cannot be read for a
+    /// reason other than it being absent.
     pub fn lock_is_stale(path: &PathBuf, now_ms: u64) -> std::io::Result<bool> {
         let created_ms = match std::fs::read_to_string(path) {
             Ok(raw) => raw.trim().parse::<u64>().ok(),
@@ -474,6 +505,7 @@ fn private_temp_path(path: &Path, attempt: u32) -> PathBuf {
 }
 
 /// Current UNIX time in milliseconds.
+#[must_use]
 pub fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -481,4 +513,124 @@ pub fn unix_time_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_at(root: &Path) -> RestoreStore {
+        RestoreStore { root: Some(root.join("restore")) }
+    }
+
+    fn leaf_snapshot(window_id: WindowId, workspace_id: WorkspaceId) -> WindowRestoreState {
+        WindowRestoreState {
+            version: 1,
+            window_id,
+            focused_workspace_id: workspace_id,
+            root: WorkspaceLayoutSnapshot::Leaf { workspace_id },
+            workspaces: vec![WorkspaceSnapshot {
+                workspace_id,
+                name: Some("proj".to_owned()),
+                accent_color: [0.1, 0.2, 0.3, 1.0],
+                active_tab_index: 0,
+                tabs: vec![TabSnapshot {
+                    focused_launch_id: "launch-a".to_owned(),
+                    pane_tree: PaneSnapshot::Leaf { launch_id: "launch-a".to_owned() },
+                }],
+            }],
+            launches: vec![LaunchRecord {
+                launch_id: "launch-a".to_owned(),
+                cwd: Some(PathBuf::from("/tmp/proj")),
+                kind: LaunchKind::Shell,
+                first_prompt: None,
+                latest_prompt: None,
+                latest_prompt_at: None,
+                latest_prompt_finished_at: None,
+                prompt_count: 0,
+            }],
+        }
+    }
+
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Snapshot round-trips through disk]]
+    #[test]
+    fn snapshot_round_trips_through_disk() {
+        let dir = tempdir();
+        let store = store_at(&dir);
+        let window_id = WindowId::new();
+        let workspace_id = WorkspaceId::new();
+        let snapshot = leaf_snapshot(window_id, workspace_id);
+
+        store.save_window(&snapshot).expect("save window snapshot");
+        let loaded = store.load_window(window_id).expect("load window snapshot");
+
+        assert_eq!(loaded.window_id, window_id);
+        assert_eq!(loaded.focused_workspace_id, workspace_id);
+        assert_eq!(loaded.workspaces[0].name.as_deref(), Some("proj"));
+        assert_eq!(loaded.launches[0].launch_id, "launch-a");
+        assert!(loaded.is_replayable());
+    }
+
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Claim skips non-replayable and remaining count]]
+    #[test]
+    fn claim_first_window_skips_non_replayable_and_reports_remaining() {
+        let dir = tempdir();
+        let store = store_at(&dir);
+
+        let win_blank = WindowId::new();
+        let mut blank = leaf_snapshot(win_blank, WorkspaceId::new());
+        blank.launches.clear();
+        blank.workspaces[0].tabs.clear();
+        assert!(!blank.is_replayable());
+
+        let win_a = WindowId::new();
+        let win_b = WindowId::new();
+        let snap_a = leaf_snapshot(win_a, WorkspaceId::new());
+        let snap_b = leaf_snapshot(win_b, WorkspaceId::new());
+
+        store.save_window(&blank).expect("save blank");
+        store.save_window(&snap_a).expect("save a");
+        store.save_window(&snap_b).expect("save b");
+        store.upsert_index(win_blank).expect("index blank");
+        store.upsert_index(win_a).expect("index a");
+        store.upsert_index(win_b).expect("index b");
+
+        let (claimed, remaining) = store.claim_first_window().expect("claim first");
+        // The blank entry is dropped, the first replayable (win_a) is claimed,
+        // and win_b remains for a --restore-child fan-out.
+        assert_eq!(claimed.window_id, win_a);
+        assert_eq!(remaining, 1);
+        // The claimed window's file is removed.
+        assert!(store.load_window(win_a).is_none());
+        // The blank window's file is removed too.
+        assert!(store.load_window(win_blank).is_none());
+
+        let (claimed_b, remaining_b) = store.claim_first_window().expect("claim second");
+        assert_eq!(claimed_b.window_id, win_b);
+        assert_eq!(remaining_b, 0);
+        assert!(store.claim_first_window().is_none());
+    }
+
+    // @lat: [[client#GPUI Client Spike#Cold Restart Restore#Stale lock reclaimed]]
+    #[test]
+    fn stale_lock_is_reclaimed() {
+        let dir = tempdir();
+        let lock = dir.join("bootstrap.lock");
+        std::fs::write(&lock, "0").expect("seed lock");
+        // now_ms far past the 30 s window makes the lock stale.
+        assert!(RestoreStore::lock_is_stale(&lock, 60_000).expect("stale check"));
+        // A freshly-stamped lock is not stale.
+        std::fs::write(&lock, "59_000".replace('_', "")).expect("restamp lock");
+        assert!(!RestoreStore::lock_is_stale(&lock, 60_000).expect("fresh check"));
+    }
+
+    fn tempdir() -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "scribe-gpui-restore-{}-{}",
+            std::process::id(),
+            unix_time_ms()
+        ));
+        std::fs::create_dir_all(&base).expect("create tempdir");
+        base
+    }
 }

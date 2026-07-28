@@ -71,38 +71,70 @@ time.sleep(60)
     return 1
 }
 
-# ── wait_for_pid_exit treats a zombie as exited ──────────────────────────
-zpid=$(spawn_zombie) || exit 1
-if wait_for_pid_exit "$zpid" 5; then
-    echo "PASS: wait_for_pid_exit treats zombie PID $zpid as exited"
+if command -v python3 >/dev/null 2>&1; then
+    # ── wait_for_pid_exit treats a zombie as exited ──────────────────────
+    zpid=$(spawn_zombie) || exit 1
+    if wait_for_pid_exit "$zpid" 5; then
+        echo "PASS: wait_for_pid_exit treats zombie PID $zpid as exited"
+    else
+        echo "FAIL: wait_for_pid_exit blocked on zombie PID $zpid (kill -0 lies on zombies)"
+        failures=$((failures + 1))
+    fi
+
+    # ── stop_client_processes does not block client relaunch on a zombie ─
+    zpid=$(spawn_zombie) || exit 1
+    if stop_client_processes "$zpid" >/dev/null 2>&1; then
+        echo "PASS: stop_client_processes succeeded with zombie PID $zpid"
+    else
+        echo "FAIL: stop_client_processes returned non-zero for zombie PID $zpid"
+        failures=$((failures + 1))
+    fi
 else
-    echo "FAIL: wait_for_pid_exit blocked on zombie PID $zpid (kill -0 lies on zombies)"
-    failures=$((failures + 1))
+    echo "SKIP: zombie regressions require python3"
 fi
 
-# ── stop_client_processes does not block client relaunch on a zombie ─────
-# Reproduces the in-app update bug: a recorded client PID became a zombie
-# between preinst and postinst (gnome-shell's reaper was slow), and postinst
-# printed "Could not stop client PID ..." then skipped the relaunch.
-zpid=$(spawn_zombie) || exit 1
-if stop_client_processes "$zpid" >/dev/null 2>&1; then
-    echo "PASS: stop_client_processes succeeded with zombie PID $zpid"
-else
-    echo "FAIL: stop_client_processes returned non-zero for zombie PID $zpid"
-    failures=$((failures + 1))
-fi
+# ── Vulkan guard restores the preinst stash without touching a session ───
+probe_fixture=$(mktemp -d)
+sleep 60 &
+session_pid=$!
+LAUNCHER_PIDS+=("$session_pid")
+STATE_DIR="$probe_fixture/state"
+CLIENT_BIN_PATH="$probe_fixture/scribe-client"
+APP_DISPLAY_NAME="Scribe"
+mkdir -p "$STATE_DIR"
+cat > "$CLIENT_BIN_PATH" <<'EOF'
+#!/bin/sh
+[ "$1" = "--vulkan-probe" ] && exit 1
+exit 0
+EOF
+cat > "${STATE_DIR}/upgrade-client-binary" <<'EOF'
+#!/bin/sh
+[ "$1" = "--vulkan-probe" ] && exit 0
+exit 0
+EOF
+chmod +x "$CLIENT_BIN_PATH" "${STATE_DIR}/upgrade-client-binary"
 
-# ── restart_singleton_binary does not skip relaunch on a zombie ──────────
-# Settings relaunch shares the same zombie-aware wait as the client path.
-# Stub launch_user_binary so the test exercises only the wait/kill logic.
-launch_user_binary() { :; }
-zpid=$(spawn_zombie) || exit 1
-if restart_singleton_binary settings "$zpid" /bin/true >/dev/null 2>&1; then
-    echo "PASS: restart_singleton_binary succeeded with zombie PID $zpid"
-else
-    echo "FAIL: restart_singleton_binary returned non-zero for zombie PID $zpid"
+guard_output="$probe_fixture/guard-output"
+if probe_client_vulkan >"$guard_output" 2>&1; then
+    echo "FAIL: Vulkan guard accepted a failed probe"
     failures=$((failures + 1))
+elif [ "$CLIENT_VULKAN_READY" != "0" ]; then
+    echo "FAIL: Vulkan guard left client relaunch enabled"
+    failures=$((failures + 1))
+elif ! "$CLIENT_BIN_PATH" --vulkan-probe; then
+    echo "FAIL: Vulkan guard did not restore the stashed client"
+    failures=$((failures + 1))
+elif ! kill -0 "$session_pid" 2>/dev/null; then
+    echo "FAIL: Vulkan guard disturbed the running session fixture"
+    failures=$((failures + 1))
+elif ! grep -q 'Vulkan probe failed' "$guard_output" || \
+     ! grep -q 'Restored the previous client' "$guard_output"; then
+    echo "FAIL: Vulkan guard did not surface the restore warning"
+    failures=$((failures + 1))
+else
+    echo "PASS: Vulkan guard restored the client and left sessions alive"
 fi
+rm -rf "$probe_fixture"
 
 if [ "$failures" -gt 0 ]; then
     echo "${failures} postinst regression test(s) failed."

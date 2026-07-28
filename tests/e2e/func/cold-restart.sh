@@ -15,7 +15,7 @@ set -e
 # daemon has no window, no layout and no restore store, so it can neither write
 # a `RestoreStore` snapshot nor replay one; a green run here says nothing about
 # `--restore-child` fan-out or window geometry persistence. Those are asserted
-# against the real `scribe-client-gpui` process in
+# against the real `scribe-client` process in
 # tests/e2e/visual/cold-restart.sh (`just e2e-visual-cold-restart`), which
 # crashes the client and cold-restarts the server so the client meets the empty
 # `SessionList` a replay requires.

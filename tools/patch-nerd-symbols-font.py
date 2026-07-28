@@ -17,7 +17,7 @@ Usage:
         <input>.ttf <output>.ttf
 
 The committed asset at
-crates/scribe-client-gpui/assets/fonts/SymbolsNerdFontMono-Regular-scribe.ttf
+crates/scribe-client/assets/fonts/SymbolsNerdFontMono-Regular-scribe.ttf
 was produced from the upstream SymbolsNerdFontMono-Regular.ttf
 (https://github.com/ryanoasis/nerd-fonts, MIT licensed).
 """

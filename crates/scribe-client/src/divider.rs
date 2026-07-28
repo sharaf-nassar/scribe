@@ -1,20 +1,29 @@
-//! Pane divider rendering and drag handling.
+//! Pane divider geometry and drag-resize math.
 //!
-//! Dividers are 1px lines between adjacent panes, rendered as solid-colour
-//! quads (no glyph atlas — `uv_min == uv_max == [0,0]`).
+//! Dividers are 1px lines between adjacent panes. This module owns the pure
+//! geometry ported from the legacy client: collecting divider rects from the
+//! split tree, applying viewport padding insets, hit-testing with a 4px
+//! tolerance, and mapping a drag position back to a split ratio. The GPUI
+//! paint path (a solid-quad overlay) and the focus-border quads
+//! ([`crate::focus_border`]) consume these rects in a later bead; the logic
+//! here stays renderer-independent so it can be exercised by `#[gpui::test]`.
 
 use scribe_common::config::ContentPadding;
-use scribe_renderer::chrome::solid_quad;
-use scribe_renderer::types::CellInstance;
 
 use crate::layout::{LayoutNode, PaneId, Rect, SplitDirection};
 
 /// Divider line thickness in pixels.
-const DIVIDER_THICKNESS: f32 = 1.0;
+pub const DIVIDER_THICKNESS: f32 = 1.0;
 
-/// Hit-test tolerance: mouse within this many pixels of a divider counts
-/// as "on the divider" for drag purposes.
-const HIT_TOLERANCE: f32 = 4.0;
+/// Hit-test tolerance: a mouse within this many pixels of a divider counts as
+/// "on the divider" for drag purposes.
+pub const HIT_TOLERANCE: f32 = 4.0;
+
+/// Minimum split ratio a drag may produce (mirrors the layout tree clamp).
+const MIN_DRAG_RATIO: f32 = 0.1;
+
+/// Maximum split ratio a drag may produce (mirrors the layout tree clamp).
+const MAX_DRAG_RATIO: f32 = 0.9;
 
 /// A divider between two pane groups, positioned in pixel coordinates.
 #[derive(Debug, Clone, Copy)]
@@ -23,7 +32,9 @@ pub struct Divider {
     pub rect: Rect,
     /// The direction of the split that created this divider.
     pub direction: SplitDirection,
-    /// Pane IDs in the first subtree (used for ratio adjustment).
+    /// Parent split rect whose axis determines this divider's ratio.
+    pub parent_rect: Rect,
+    /// First leaf pane in the first subtree (used for ratio adjustment).
     pub first_pane: PaneId,
 }
 
@@ -47,12 +58,14 @@ pub fn collect_dividers(node: &LayoutNode, viewport: Rect) -> Vec<Divider> {
     out
 }
 
-/// Apply viewport padding insets to divider edges that touch the viewport boundary.
+/// Apply viewport padding insets to divider edges that touch the viewport
+/// boundary.
 ///
-/// Horizontal dividers (`SplitDirection::Vertical`) have their left/right edges inset
-/// by `padding.left`/`padding.right` when they coincide with the viewport boundary.
-/// Vertical dividers (`SplitDirection::Horizontal`) are clipped below the tab bar and
-/// have their top/bottom edges inset when they coincide with the viewport boundary.
+/// Horizontal dividers (`SplitDirection::Vertical`) have their left/right edges
+/// inset by `padding.left`/`padding.right` when they coincide with the viewport
+/// boundary. Vertical dividers (`SplitDirection::Horizontal`) are clipped below
+/// the tab bar and have their top/bottom edges inset when they coincide with
+/// the viewport boundary.
 pub fn apply_viewport_insets(
     dividers: &mut [Divider],
     viewport: Rect,
@@ -98,51 +111,16 @@ pub fn apply_viewport_insets(
     }
 }
 
-/// Hit-test: check if a mouse position hits any divider.
-///
-/// Returns the matching `Divider` if found.
+/// Hit-test: return the first divider within [`HIT_TOLERANCE`] of the mouse.
 pub fn hit_test_divider(dividers: &[Divider], mouse_x: f32, mouse_y: f32) -> Option<&Divider> {
     dividers.iter().find(|d| is_within_divider(d, mouse_x, mouse_y))
 }
 
-/// Build cell instances for all dividers.
-///
-/// Pushes a single solid-colour quad per divider into `out`. Dividers are
-/// 1px lines, so the quad covers the exact divider rect. Pushing directly
-/// into the caller's `Vec` avoids a per-call heap allocation.
-pub fn build_divider_instances(out: &mut Vec<CellInstance>, dividers: &[Divider], color: [f32; 4]) {
-    for divider in dividers {
-        build_single_divider(out, divider, color);
-    }
-}
-
-/// Build a solid accent border around all four edges of a rectangle.
-///
-/// Used for both focused pane borders and focused workspace borders.
-pub fn build_rect_border(
-    out: &mut Vec<CellInstance>,
-    rect: Rect,
-    accent_color: [f32; 4],
-    border_width: f32,
-) {
-    let t = border_width;
-    out.push(solid_quad(rect.x, rect.y, rect.width, t, accent_color));
-    out.push(solid_quad(rect.x, rect.y + rect.height - t, rect.width, t, accent_color));
-    out.push(solid_quad(rect.x, rect.y + t, t, rect.height - t * 2.0, accent_color));
-    out.push(solid_quad(
-        rect.x + rect.width - t,
-        rect.y + t,
-        t,
-        rect.height - t * 2.0,
-        accent_color,
-    ));
-}
-
-/// Create a `DividerDrag` from a divider and its parent viewport.
-pub fn start_drag(divider: &Divider, viewport: Rect) -> DividerDrag {
+/// Create a [`DividerDrag`] from a divider and its parent viewport.
+pub fn start_drag(divider: &Divider, _viewport: Rect) -> DividerDrag {
     let (parent_extent, parent_origin) = match divider.direction {
-        SplitDirection::Horizontal => (viewport.width, viewport.x),
-        SplitDirection::Vertical => (viewport.height, viewport.y),
+        SplitDirection::Horizontal => (divider.parent_rect.width, divider.parent_rect.x),
+        SplitDirection::Vertical => (divider.parent_rect.height, divider.parent_rect.y),
     };
 
     DividerDrag {
@@ -155,13 +133,14 @@ pub fn start_drag(divider: &Divider, viewport: Rect) -> DividerDrag {
 
 /// Compute a new split ratio from a drag position.
 ///
-/// `mouse_pos` is the x or y coordinate depending on direction.
+/// `mouse_pos` is the x or y coordinate depending on direction. The result is
+/// clamped to `[0.1, 0.9]` so a drag can never collapse a pane to zero.
 pub fn drag_ratio(drag: &DividerDrag, mouse_pos: f32) -> f32 {
     if drag.parent_extent <= 0.0 {
         return 0.5;
     }
     let relative = mouse_pos - drag.parent_origin;
-    (relative / drag.parent_extent).clamp(0.1, 0.9)
+    (relative / drag.parent_extent).clamp(MIN_DRAG_RATIO, MAX_DRAG_RATIO)
 }
 
 // ---------------------------------------------------------------------------
@@ -177,9 +156,9 @@ fn collect_dividers_inner(node: &LayoutNode, rect: Rect, out: &mut Vec<Divider>)
     let (r1, r2) = split_rects(rect, *direction, *ratio);
 
     // The divider sits between the two sub-rects.
-    let divider_rect = divider_rect_between(&r1, &r2, *direction);
+    let divider_rect = divider_rect_between(&r1, *direction);
     let first_pane = first_leaf_of(first);
-    out.push(Divider { rect: divider_rect, direction: *direction, first_pane });
+    out.push(Divider { rect: divider_rect, direction: *direction, parent_rect: rect, first_pane });
 
     // Recurse into children.
     collect_dividers_inner(first, r1, out);
@@ -222,8 +201,8 @@ fn split_rects(rect: Rect, direction: SplitDirection, ratio: f32) -> (Rect, Rect
     }
 }
 
-/// Compute the pixel rect of a divider between two adjacent rects.
-fn divider_rect_between(r1: &Rect, _r2: &Rect, direction: SplitDirection) -> Rect {
+/// Compute the pixel rect of a divider on the boundary of `r1`.
+fn divider_rect_between(r1: &Rect, direction: SplitDirection) -> Rect {
     let half = DIVIDER_THICKNESS / 2.0;
     match direction {
         SplitDirection::Horizontal => {
@@ -254,8 +233,157 @@ fn is_within_divider(divider: &Divider, mouse_x: f32, mouse_y: f32) -> bool {
         && mouse_y <= expanded.y + expanded.height
 }
 
-/// Build a solid-colour instance for a single divider using its actual rect.
-fn build_single_divider(instances: &mut Vec<CellInstance>, divider: &Divider, color: [f32; 4]) {
-    let r = &divider.rect;
-    instances.push(solid_quad(r.x, r.y, r.width, r.height, color));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::alloc_pane_id;
+
+    fn leaf() -> (LayoutNode, PaneId) {
+        let id = alloc_pane_id();
+        (LayoutNode::Leaf(id), id)
+    }
+
+    fn viewport() -> Rect {
+        Rect { x: 0.0, y: 0.0, width: 800.0, height: 600.0 }
+    }
+
+    // @lat: [[test#GPUI Pane Dividers#Horizontal split divider is a centered vertical line]]
+    #[test]
+    fn horizontal_split_divider_is_centered_vertical_line() {
+        let (l, lp) = leaf();
+        let (r, _) = leaf();
+        let node = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(l),
+            second: Box::new(r),
+        };
+        let dividers = collect_dividers(&node, viewport());
+        assert_eq!(dividers.len(), 1);
+        let d = dividers[0];
+        assert_eq!(d.first_pane, lp);
+        assert!((d.rect.width - DIVIDER_THICKNESS).abs() < f32::EPSILON);
+        // Centered on the 400px boundary: x = 400 - 0.5.
+        assert!((d.rect.x - 399.5).abs() < f32::EPSILON);
+        assert!((d.rect.height - 600.0).abs() < f32::EPSILON);
+    }
+
+    // @lat: [[test#GPUI Pane Dividers#Vertical split divider is a centered horizontal line]]
+    #[test]
+    fn vertical_split_divider_is_centered_horizontal_line() {
+        let (t, tp) = leaf();
+        let (b, _) = leaf();
+        let node = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            ratio: 0.25,
+            first: Box::new(t),
+            second: Box::new(b),
+        };
+        let dividers = collect_dividers(&node, viewport());
+        assert_eq!(dividers.len(), 1);
+        let d = dividers[0];
+        assert_eq!(d.first_pane, tp);
+        assert!((d.rect.height - DIVIDER_THICKNESS).abs() < f32::EPSILON);
+        // Centered on the 150px boundary: y = 150 - 0.5.
+        assert!((d.rect.y - 149.5).abs() < f32::EPSILON);
+        assert!((d.rect.width - 800.0).abs() < f32::EPSILON);
+    }
+
+    // @lat: [[test#GPUI Pane Dividers#Nested splits yield one divider per split node]]
+    #[test]
+    fn nested_splits_yield_one_divider_per_split_node() {
+        let (a, _) = leaf();
+        let (b, _) = leaf();
+        let (c, _) = leaf();
+        let inner = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(b),
+            second: Box::new(c),
+        };
+        let node = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(a),
+            second: Box::new(inner),
+        };
+        assert_eq!(collect_dividers(&node, viewport()).len(), 2);
+    }
+
+    // @lat: [[test#GPUI Pane Dividers#Hit test honors 4px tolerance]]
+    #[test]
+    fn hit_test_honors_four_pixel_tolerance() {
+        let (l, lp) = leaf();
+        let (r, _) = leaf();
+        let node = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(l),
+            second: Box::new(r),
+        };
+        let dividers = collect_dividers(&node, viewport());
+        // Divider spans x in [399.5, 400.5]; tolerance widens to [395.5, 404.5].
+        assert!(hit_test_divider(&dividers, 400.0, 300.0).is_some());
+        // 4px away from the near edge (399.5 - 3.5 = 396.0) still hits.
+        assert!(hit_test_divider(&dividers, 396.0, 300.0).is_some());
+        // 5px past the near edge (399.5 - 5 = 394.5) misses.
+        assert!(hit_test_divider(&dividers, 394.5, 300.0).is_none());
+        let hit = hit_test_divider(&dividers, 400.0, 300.0).unwrap();
+        assert_eq!(hit.first_pane, lp);
+    }
+
+    // @lat: [[test#GPUI Pane Dividers#Drag maps position to clamped ratio]]
+    #[test]
+    fn drag_maps_position_to_clamped_ratio() {
+        let (l, _) = leaf();
+        let (r, _) = leaf();
+        let node = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(l),
+            second: Box::new(r),
+        };
+        let dividers = collect_dividers(&node, viewport());
+        let drag = start_drag(&dividers[0], viewport());
+        assert!((drag.parent_extent - 800.0).abs() < f32::EPSILON);
+        // Mid-drag: 200/800 = 0.25.
+        assert!((drag_ratio(&drag, 200.0) - 0.25).abs() < f32::EPSILON);
+        // Below the clamp floor: pinned to 0.1.
+        assert!((drag_ratio(&drag, 10.0) - 0.1).abs() < f32::EPSILON);
+        // Above the clamp ceiling: pinned to 0.9.
+        assert!((drag_ratio(&drag, 790.0) - 0.9).abs() < f32::EPSILON);
+    }
+
+    // @lat: [[test#GPUI Pane Dividers#Drag on degenerate parent extent falls back to half]]
+    #[test]
+    fn drag_on_degenerate_parent_extent_falls_back_to_half() {
+        let drag = DividerDrag {
+            first_pane: alloc_pane_id(),
+            direction: SplitDirection::Horizontal,
+            parent_extent: 0.0,
+            parent_origin: 0.0,
+        };
+        assert!((drag_ratio(&drag, 123.0) - 0.5).abs() < f32::EPSILON);
+    }
+
+    // @lat: [[test#GPUI Pane Dividers#Viewport insets clip vertical dividers below the tab bar]]
+    #[test]
+    fn viewport_insets_clip_vertical_dividers_below_tab_bar() {
+        let (l, _) = leaf();
+        let (r, _) = leaf();
+        let node = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(l),
+            second: Box::new(r),
+        };
+        let mut dividers = collect_dividers(&node, viewport());
+        let padding = ContentPadding { top: 4.0, bottom: 4.0, left: 6.0, right: 6.0 };
+        apply_viewport_insets(&mut dividers, viewport(), &padding, 30.0);
+        let d = dividers[0];
+        // Clipped below the 30px tab bar, then inset by padding.top (4px).
+        assert!((d.rect.y - 34.0).abs() < f32::EPSILON);
+        // Height shrinks by the 30px clip, 4px top inset, and 4px bottom inset.
+        assert!((d.rect.height - (600.0 - 30.0 - 4.0 - 4.0)).abs() < f32::EPSILON);
+    }
 }

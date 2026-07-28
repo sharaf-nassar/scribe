@@ -1,19 +1,35 @@
-//! Text selection: grid coordinate mapping and text extraction.
+//! Terminal text selection: grid coordinate mapping, text extraction, and
+//! interactive selection state with copy-on-select.
 //!
-//! Provides types for tracking a selection range on the terminal grid,
-//! converting pixel coordinates to grid cells, and extracting selected
-//! text from the terminal emulator state.
+//! Ported from the winit client's `crates/scribe-client/src/selection.rs` onto
+//! Zed's Alacritty fork (`alacritty_terminal_gpui`). Provides types for
+//! tracking a selection range on the terminal grid, converting pixel
+//! coordinates to grid cells, extracting selected text (WRAPLINE-aware), and
+//! resolving cell/word/line granularity during a mouse drag.
 
-use alacritty_terminal::Term;
-use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions as _;
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal_gpui::Term;
+use alacritty_terminal_gpui::event::VoidListener;
+use alacritty_terminal_gpui::grid::Dimensions as _;
+use alacritty_terminal_gpui::index::{Column, Line};
+use alacritty_terminal_gpui::term::cell::{Cell, Flags};
 
 use scribe_common::config::ContentPadding;
 
 use crate::layout::Rect;
-use crate::mouse_state::SelectionMode;
+
+/// Granularity of a terminal selection.
+///
+/// Mirrors the winit client's `mouse_state::SelectionMode`; the GPUI client
+/// owns its own copy because the mouse-state module is ported in a later bead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    /// Select individual cells.
+    Cell,
+    /// Select whole words.
+    Word,
+    /// Select whole lines.
+    Line,
+}
 
 /// A position on the terminal grid, in row/column coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,12 +428,10 @@ pub fn extend_by_line(
 /// Return a reference to a single cell from the terminal grid.
 ///
 /// `alacritty_terminal`'s `Grid` and `Row` only implement the `Index` trait
-/// with no fallible `.get()` alternative, so we must use indexing here.
+/// with no fallible `.get()` alternative, so indexing is required here —
+/// matching the direct grid indexing the display snapshot path already relies
+/// on.
 fn read_cell(term: &Term<VoidListener>, line: Line, col: Column) -> &Cell {
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "alacritty_terminal grid only supports Index trait, no get() alternative"
-    )]
     &term.grid()[line][col]
 }
 
@@ -429,6 +443,62 @@ pub fn read_cell_char(term: &Term<VoidListener>, line: Line, col: Column) -> cha
 /// Read the flags of a single cell from the terminal grid.
 pub fn read_cell_flags(term: &Term<VoidListener>, line: Line, col: Column) -> Flags {
     read_cell(term, line, col).flags
+}
+
+/// One run of selected cells on a single *visible* row, ready to paint.
+///
+/// Columns are inclusive on both ends, matching the find overlay's
+/// [`crate::search::MatchHighlight`], so the paint path treats a selection run
+/// and a match run identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionSpan {
+    /// Row index into the painted viewport (0 = top row on screen).
+    pub row: usize,
+    /// First selected column, inclusive.
+    pub start_col: usize,
+    /// Last selected column, inclusive.
+    pub end_col: usize,
+}
+
+/// Project a selection onto the painted viewport as one span per visible row.
+///
+/// `range` is in absolute grid lines (0 = viewport top at offset 0, negative =
+/// scrollback), so a viewport scrolled `display_offset` rows into the
+/// scrollback shows grid line `row - display_offset` at screen row `row`. Rows
+/// outside the `rows` x `cols` viewport are dropped rather than clamped: a
+/// selection that scrolled off screen must paint nothing, not a stripe at the
+/// edge. Returns no spans for an empty selection.
+#[must_use]
+pub fn viewport_spans(
+    range: &SelectionRange,
+    display_offset: usize,
+    rows: usize,
+    cols: usize,
+) -> Vec<SelectionSpan> {
+    if range.is_empty() || rows == 0 || cols == 0 {
+        return Vec::new();
+    }
+    let (lo, hi) = range.normalized();
+    let offset = selection_grid_i32(display_offset);
+    let last_col = cols.saturating_sub(1);
+    let mut spans = Vec::new();
+    for row in lo.row..=hi.row {
+        let screen = row + offset;
+        if screen < 0 {
+            continue;
+        }
+        let Ok(screen) = usize::try_from(screen) else { continue };
+        if screen >= rows {
+            break;
+        }
+        let start_col = if row == lo.row { lo.col } else { 0 };
+        let end_col = if row == hi.row { hi.col } else { last_col };
+        if start_col > last_col {
+            continue;
+        }
+        spans.push(SelectionSpan { row: screen, start_col, end_col: end_col.min(last_col) });
+    }
+    spans
 }
 
 /// Return the previous logical neighbor for word scanning, crossing into the
@@ -508,4 +578,352 @@ fn logical_line_at(term: &Term<VoidListener>, row: i32) -> LogicalLine {
     }
 
     LogicalLine { first, last }
+}
+
+/// Interactive mouse-drag selection state with copy-on-select.
+///
+/// Tracks the active [`SelectionRange`] plus the word/line anchors captured on
+/// the initial double/triple click, so a subsequent drag extends whole words or
+/// lines rather than individual cells. [`SelectionState::copy_text`] yields the
+/// selected text for copy-on-select the moment a drag settles.
+#[derive(Debug, Clone, Default)]
+pub struct SelectionState {
+    range: Option<SelectionRange>,
+    word_anchor: Option<(SelectionPoint, SelectionPoint)>,
+    line_anchor: Option<(SelectionPoint, SelectionPoint)>,
+}
+
+impl SelectionState {
+    /// Create an empty selection state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Begin a cell-granularity selection at `point` (single click).
+    pub fn start_cell(&mut self, point: SelectionPoint) {
+        self.word_anchor = None;
+        self.line_anchor = None;
+        self.range = Some(SelectionRange::cell(point, point));
+    }
+
+    /// Begin a word-granularity selection around `point` (double click).
+    pub fn start_word(&mut self, term: &Term<VoidListener>, point: SelectionPoint) {
+        let (start, end) = word_bounds_at(term, point);
+        self.line_anchor = None;
+        self.word_anchor = Some((start, end));
+        self.range = Some(SelectionRange::word(start, end));
+    }
+
+    /// Begin a line-granularity selection over `point`'s logical line (triple
+    /// click).
+    pub fn start_line(&mut self, term: &Term<VoidListener>, point: SelectionPoint) {
+        let (start, end) = line_bounds_at(term, point.row);
+        self.word_anchor = None;
+        self.line_anchor = Some((start, end));
+        self.range = Some(SelectionRange::line(start, end));
+    }
+
+    /// Extend the active selection to `point` as the pointer drags. The
+    /// granularity matches whichever `start_*` began the gesture.
+    pub fn drag_to(&mut self, term: &Term<VoidListener>, point: SelectionPoint) {
+        let Some(range) = self.range else {
+            return;
+        };
+        self.range = Some(match range.mode {
+            SelectionMode::Cell => SelectionRange::cell(range.start, point),
+            SelectionMode::Word => {
+                let (anchor_start, anchor_end) =
+                    self.word_anchor.unwrap_or((range.start, range.end));
+                extend_by_word(term, anchor_start, anchor_end, point)
+            }
+            SelectionMode::Line => {
+                let (anchor_start, anchor_end) =
+                    self.line_anchor.unwrap_or((range.start, range.end));
+                extend_by_line(term, anchor_start, anchor_end, point)
+            }
+        });
+    }
+
+    /// The active selection range, if any.
+    pub fn range(&self) -> Option<SelectionRange> {
+        self.range
+    }
+
+    /// Extract the selected text for copy-on-select. Returns `None` when there
+    /// is no selection or the selection is empty.
+    pub fn copy_text(&self, term: &Term<VoidListener>) -> Option<String> {
+        let range = self.range?;
+        if range.is_empty() {
+            return None;
+        }
+        Some(extract_text(term, &range))
+    }
+
+    /// Clear the active selection and any drag anchors.
+    pub fn clear(&mut self) {
+        self.range = None;
+        self.word_anchor = None;
+        self.line_anchor = None;
+    }
+
+    /// Shift the active selection and anchors by `delta` grid lines, keeping the
+    /// selection pinned to content as scrollback is trimmed.
+    pub fn shift_rows(&mut self, delta: i32) {
+        if let Some(range) = self.range.as_mut() {
+            range.shift_rows(delta);
+        }
+        if let Some((start, end)) = self.word_anchor.as_mut() {
+            start.shift_row(delta);
+            end.shift_row(delta);
+        }
+        if let Some((start, end)) = self.line_anchor.as_mut() {
+            start.shift_row(delta);
+            end.shift_row(delta);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal_gpui::event::VoidListener;
+    use alacritty_terminal_gpui::grid::Dimensions;
+    use alacritty_terminal_gpui::term::{Config, Term};
+    use scribe_common::config::ContentPadding;
+    use vte::ansi::Processor;
+
+    use super::{
+        PixelToGridRequest, SelectionMode, SelectionPoint, SelectionRange, SelectionSpan,
+        SelectionState, extract_text, line_bounds_at, pixel_to_grid, viewport_spans,
+        word_bounds_at,
+    };
+    use crate::layout::Rect;
+
+    #[derive(Clone, Copy)]
+    struct TestDims {
+        cols: usize,
+        rows: usize,
+    }
+
+    impl Dimensions for TestDims {
+        fn total_lines(&self) -> usize {
+            self.rows
+        }
+
+        fn screen_lines(&self) -> usize {
+            self.rows
+        }
+
+        fn columns(&self) -> usize {
+            self.cols
+        }
+    }
+
+    fn term_with_output(cols: usize, rows: usize, output: &[u8]) -> Term<VoidListener> {
+        let mut term = Term::new(Config::default(), &TestDims { cols, rows }, VoidListener);
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, output);
+        term
+    }
+
+    fn point(row: i32, col: usize) -> SelectionPoint {
+        SelectionPoint { row, col }
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Cell selection extracts a substring]]
+    #[gpui::test]
+    fn cell_selection_extracts_substring() {
+        let term = term_with_output(20, 3, b"hello world");
+        let range = SelectionRange::cell(point(0, 0), point(0, 4));
+        assert_eq!(extract_text(&term, &range), "hello");
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Reversed cell selection normalizes]]
+    #[gpui::test]
+    fn reversed_cell_selection_normalizes() {
+        let term = term_with_output(20, 3, b"hello world");
+        let forward = SelectionRange::cell(point(0, 6), point(0, 10));
+        let reversed = SelectionRange::cell(point(0, 10), point(0, 6));
+        assert_eq!(extract_text(&term, &forward), "world");
+        assert_eq!(extract_text(&term, &reversed), "world");
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Word bounds snap to word characters]]
+    #[gpui::test]
+    fn word_bounds_snap_to_word_characters() {
+        let term = term_with_output(30, 3, b"alpha beta_gamma delta");
+        // Cursor inside "beta_gamma" (underscore is a word char).
+        let (start, end) = word_bounds_at(&term, point(0, 8));
+        assert_eq!(start, point(0, 6));
+        assert_eq!(end, point(0, 15));
+        let range = SelectionRange::word(start, end);
+        assert_eq!(extract_text(&term, &range), "beta_gamma");
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Word bounds on a delimiter select one cell]]
+    #[gpui::test]
+    fn word_bounds_on_delimiter_select_single_cell() {
+        let term = term_with_output(30, 3, b"alpha beta");
+        // Column 5 is the space delimiter.
+        let (start, end) = word_bounds_at(&term, point(0, 5));
+        assert_eq!(start, point(0, 5));
+        assert_eq!(end, point(0, 5));
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Line bounds span the full row]]
+    #[gpui::test]
+    fn line_bounds_span_full_row() {
+        let term = term_with_output(12, 3, b"hi");
+        let (start, end) = line_bounds_at(&term, 0);
+        assert_eq!(start, point(0, 0));
+        assert_eq!(end, point(0, 11));
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#WRAPLINE joins a wrapped row without a newline]]
+    #[gpui::test]
+    fn wrapline_joins_wrapped_row_without_newline() {
+        // Ten columns; twelve chars force an autowrap so row 0 ends WRAPLINE.
+        let term = term_with_output(10, 4, b"abcdefghijKL");
+        let range = SelectionRange::cell(point(0, 0), point(1, 1));
+        assert_eq!(extract_text(&term, &range), "abcdefghijKL");
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Hard line break inserts a newline]]
+    #[gpui::test]
+    fn hard_break_inserts_newline() {
+        let term = term_with_output(20, 4, b"first\r\nsecond");
+        let range = SelectionRange::cell(point(0, 0), point(1, 5));
+        assert_eq!(extract_text(&term, &range), "first\nsecond");
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Word bounds follow a wrapped line]]
+    #[gpui::test]
+    fn word_bounds_follow_wrapped_line() {
+        // "abcdefghij_word" wraps at 10 cols; the word crosses the WRAPLINE.
+        let term = term_with_output(10, 4, b"abcdefghij_word");
+        let (start, end) = word_bounds_at(&term, point(1, 2));
+        assert_eq!(start, point(0, 0));
+        assert_eq!(end, point(1, 4));
+        let range = SelectionRange::word(start, end);
+        assert_eq!(extract_text(&term, &range), "abcdefghij_word");
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Line bounds span a wrapped logical line]]
+    #[gpui::test]
+    fn line_bounds_span_wrapped_logical_line() {
+        let term = term_with_output(10, 4, b"abcdefghijKL");
+        let (start, end) = line_bounds_at(&term, 1);
+        assert_eq!(start, point(0, 0));
+        assert_eq!(end, point(1, 9));
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Contains-cell honors selection shape]]
+    #[gpui::test]
+    fn contains_cell_honors_selection_shape() {
+        let range = SelectionRange::cell(point(0, 3), point(2, 4));
+        assert!(!range.contains_cell(0, 2));
+        assert!(range.contains_cell(0, 3));
+        assert!(range.contains_cell(1, 0));
+        assert!(range.contains_cell(2, 4));
+        assert!(!range.contains_cell(2, 5));
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Selection state copies on select]]
+    #[gpui::test]
+    fn selection_state_copies_on_select() {
+        let term = term_with_output(30, 3, b"alpha beta_gamma delta");
+        let mut state = SelectionState::new();
+
+        // Cell drag.
+        state.start_cell(point(0, 0));
+        state.drag_to(&term, point(0, 4));
+        assert_eq!(state.copy_text(&term).as_deref(), Some("alpha"));
+
+        // Word double-click snaps and copies the whole word.
+        state.start_word(&term, point(0, 8));
+        assert_eq!(state.range().map(|r| r.mode), Some(SelectionMode::Word));
+        assert_eq!(state.copy_text(&term).as_deref(), Some("beta_gamma"));
+
+        // Line triple-click copies the full row.
+        state.start_line(&term, point(0, 0));
+        assert_eq!(state.range().map(|r| r.mode), Some(SelectionMode::Line));
+        assert_eq!(state.copy_text(&term).as_deref(), Some("alpha beta_gamma delta"));
+
+        // Empty selection yields nothing.
+        state.start_cell(point(0, 2));
+        assert_eq!(state.copy_text(&term), None);
+        state.clear();
+        assert_eq!(state.range(), None);
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Word drag extends by whole words]]
+    #[gpui::test]
+    fn word_drag_extends_by_whole_words() {
+        let term = term_with_output(30, 3, b"alpha beta gamma");
+        let mut state = SelectionState::new();
+        state.start_word(&term, point(0, 1)); // "alpha"
+        state.drag_to(&term, point(0, 12)); // into "gamma"
+        assert_eq!(state.copy_text(&term).as_deref(), Some("alpha beta gamma"));
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Pixel mapping resolves grid cells]]
+    #[gpui::test]
+    fn pixel_mapping_resolves_grid_cells() {
+        let padding = ContentPadding { top: 0.0, right: 0.0, bottom: 0.0, left: 0.0 };
+        let request = PixelToGridRequest {
+            x: 25.0,
+            y: 14.0,
+            pane_rect: Rect { x: 0.0, y: 0.0, width: 100.0, height: 40.0 },
+            cell_size: (10.0, 20.0),
+            tab_bar_height: 0.0,
+            prompt_bar_height: 0.0,
+            prompt_bar_at_top: false,
+            display_offset: 0,
+            padding: &padding,
+        };
+        let resolved = pixel_to_grid(request).expect("inside content area");
+        assert_eq!(resolved, point(0, 2));
+
+        // A click above the content area is rejected.
+        let mut outside = request;
+        outside.y = -5.0;
+        assert_eq!(pixel_to_grid(outside), None);
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Selection projects onto visible rows]]
+    #[test]
+    fn selection_projects_one_span_per_visible_row() {
+        // Rows 0..=2 of a 5-row, 10-column viewport at offset 0.
+        let range = SelectionRange::cell(point(0, 3), point(2, 4));
+        assert_eq!(
+            viewport_spans(&range, 0, 5, 10),
+            vec![
+                SelectionSpan { row: 0, start_col: 3, end_col: 9 },
+                SelectionSpan { row: 1, start_col: 0, end_col: 9 },
+                SelectionSpan { row: 2, start_col: 0, end_col: 4 },
+            ]
+        );
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Scrollback selection follows the offset]]
+    #[test]
+    fn scrollback_selection_moves_with_the_display_offset() {
+        // A selection two lines into the scrollback paints nothing at offset 0
+        // and lands on the top rows once the viewport is scrolled onto it.
+        let range = SelectionRange::cell(point(-2, 0), point(-2, 3));
+        assert!(viewport_spans(&range, 0, 5, 10).is_empty());
+        assert_eq!(
+            viewport_spans(&range, 2, 5, 10),
+            vec![SelectionSpan { row: 0, start_col: 0, end_col: 3 }]
+        );
+    }
+
+    // @lat: [[test#GPUI Terminal Selection#Empty selection paints nothing]]
+    #[test]
+    fn empty_selection_and_empty_viewport_paint_nothing() {
+        let empty = SelectionRange::cell(point(1, 4), point(1, 4));
+        assert!(viewport_spans(&empty, 0, 5, 10).is_empty());
+        let real = SelectionRange::cell(point(0, 0), point(0, 4));
+        assert!(viewport_spans(&real, 0, 0, 10).is_empty());
+        assert!(viewport_spans(&real, 0, 5, 0).is_empty());
+    }
 }

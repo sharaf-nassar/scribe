@@ -186,7 +186,7 @@ assert_pixels_changed() {
 wait_for_client_exit() {
     local timeout_secs="$1" started
     started=$(date +%s)
-    while pgrep -f 'scribe-client-gpui' >/dev/null 2>&1; do
+    while pgrep -f 'scribe-client' >/dev/null 2>&1; do
         if [ $(( "$(date +%s)" - started )) -ge "$timeout_secs" ]; then
             return 1
         fi
@@ -196,7 +196,7 @@ wait_for_client_exit() {
 }
 
 launch_client() {
-    scribe-client-gpui >>"$CLIENT_LOG" 2>&1 &
+    scribe-client >>"$CLIENT_LOG" 2>&1 &
     xdotool search --sync --name "Scribe" >/dev/null 2>&1 || true
     sleep 2
 }
@@ -303,10 +303,10 @@ if ! kill -0 "$LAN_PEER_PID" 2>/dev/null; then
     cat /output/lan-peer.log >&2 || true
 else
     kill "${SCRIBE_CLIENT_PID:-0}" 2>/dev/null || true
-    pkill -f 'scribe-client-gpui' 2>/dev/null || true
+    pkill -f 'scribe-client' 2>/dev/null || true
     wait_for_client_exit 15 || fail "PHASE 4: the local client did not exit"
     IDENTITY_BEFORE=$(count_client GetLanDialIdentity)
-    SCRIBE_LAN_DIAL="127.0.0.1:$LAN_PORT" scribe-client-gpui >>/output/lan-client.log 2>&1 &
+    SCRIBE_LAN_DIAL="127.0.0.1:$LAN_PORT" scribe-client >>/output/lan-client.log 2>&1 &
     xdotool search --sync --name "Scribe" >/dev/null 2>&1 || true
     sleep 2.0
     # Focus BEFORE the gate settles: the peer holds for 6 s, so the capture below

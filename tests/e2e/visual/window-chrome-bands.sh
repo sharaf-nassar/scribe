@@ -10,7 +10,7 @@
 # they were flex-shrinkable under a flex-grown grid.
 #
 # The window size is now derived (see
-# `crates/scribe-client-gpui/src/window_chrome.rs`) and every band is
+# `crates/scribe-client/src/window_chrome.rs`) and every band is
 # `flex_none`. This test measures that on the running client:
 #
 #   * the window opens at the derived size and sits entirely on the screen;

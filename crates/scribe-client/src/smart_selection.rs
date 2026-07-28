@@ -1,10 +1,16 @@
 //! Smart selection matching for click-expanded terminal ranges.
+//!
+//! Ported from the winit client's
+//! `crates/scribe-client/src/smart_selection.rs` onto Zed's Alacritty fork.
+//! Compiles the configured regex rules, matches the logical line under the
+//! cursor, and resolves iTerm2-style action parameters (legacy `\0`..`\9`
+//! captures plus the interpolated `\(matches[N])` / `\(path)` forms).
 
-use alacritty_terminal::Term;
-use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions as _;
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal_gpui::Term;
+use alacritty_terminal_gpui::event::VoidListener;
+use alacritty_terminal_gpui::grid::Dimensions as _;
+use alacritty_terminal_gpui::index::{Column, Line};
+use alacritty_terminal_gpui::term::cell::Flags;
 use regex::Regex;
 use scribe_common::config::{
     SmartSelectionAction, SmartSelectionActionKind, SmartSelectionConfig,
@@ -428,5 +434,126 @@ impl LogicalLine {
 
     fn char_index_for_byte(&self, byte_offset: usize) -> Option<usize> {
         self.byte_offsets.binary_search(&byte_offset).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal_gpui::event::VoidListener;
+    use alacritty_terminal_gpui::grid::Dimensions;
+    use alacritty_terminal_gpui::term::{Config, Term};
+    use scribe_common::config::{
+        SmartSelectionAction, SmartSelectionActionKind, SmartSelectionActivation,
+        SmartSelectionConfig, SmartSelectionParameterMode, SmartSelectionPrecision,
+        SmartSelectionRule,
+    };
+    use vte::ansi::Processor;
+
+    use super::{ActionExpansionContext, CompiledSmartSelection};
+    use crate::selection::SelectionPoint;
+
+    #[derive(Clone, Copy)]
+    struct TestDims {
+        cols: usize,
+        rows: usize,
+    }
+
+    impl Dimensions for TestDims {
+        fn total_lines(&self) -> usize {
+            self.rows
+        }
+
+        fn screen_lines(&self) -> usize {
+            self.rows
+        }
+
+        fn columns(&self) -> usize {
+            self.cols
+        }
+    }
+
+    fn term_with_output(cols: usize, rows: usize, output: &[u8]) -> Term<VoidListener> {
+        let mut term = Term::new(Config::default(), &TestDims { cols, rows }, VoidListener);
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, output);
+        term
+    }
+
+    fn email_config() -> SmartSelectionConfig {
+        SmartSelectionConfig {
+            activation: SmartSelectionActivation::QuadClick,
+            rules: vec![
+                SmartSelectionRule {
+                    id: "email".to_owned(),
+                    name: "Email".to_owned(),
+                    enabled: true,
+                    regex: r"[\w.]+@[\w.]+".to_owned(),
+                    precision: SmartSelectionPrecision::High,
+                    actions: vec![SmartSelectionAction {
+                        kind: SmartSelectionActionKind::SendText,
+                        parameter: r"mailto:\0".to_owned(),
+                        parameter_mode: SmartSelectionParameterMode::Legacy,
+                    }],
+                },
+                SmartSelectionRule {
+                    id: "word".to_owned(),
+                    name: "Word".to_owned(),
+                    enabled: true,
+                    regex: r"\w+".to_owned(),
+                    precision: SmartSelectionPrecision::Low,
+                    actions: Vec::new(),
+                },
+            ],
+        }
+    }
+
+    // @lat: [[test#GPUI Smart Selection#Highest-precision rule wins]]
+    #[gpui::test]
+    fn highest_precision_rule_wins() {
+        let compiled = CompiledSmartSelection::compile(&email_config());
+        assert!(compiled.errors.is_empty());
+
+        let term = term_with_output(40, 2, b"mail me at ada@example.com now");
+        // Cursor inside the email address (column 14).
+        let candidate =
+            compiled.candidate_at(&term, SelectionPoint { row: 0, col: 14 }).expect("match");
+        assert_eq!(candidate.text, "ada@example.com");
+        assert_eq!(candidate.rule_name, "Email");
+        assert_eq!(candidate.range_start.col, 11);
+        assert_eq!(candidate.range_end.col, 25);
+    }
+
+    // @lat: [[test#GPUI Smart Selection#Legacy capture parameters expand]]
+    #[gpui::test]
+    fn legacy_capture_parameters_expand() {
+        let compiled = CompiledSmartSelection::compile(&email_config());
+        let term = term_with_output(40, 2, b"mail me at ada@example.com now");
+        let candidate =
+            compiled.candidate_at(&term, SelectionPoint { row: 0, col: 14 }).expect("match");
+
+        let context = ActionExpansionContext { cwd: None, user: "ada", host: "host" };
+        let actions = candidate.resolved_actions(&context);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].parameter, "mailto:ada@example.com");
+        assert_eq!(actions[0].label, "Email: Send Text");
+    }
+
+    // @lat: [[test#GPUI Smart Selection#Invalid regex reports an error]]
+    #[gpui::test]
+    fn invalid_regex_reports_error() {
+        let config = SmartSelectionConfig {
+            activation: SmartSelectionActivation::QuadClick,
+            rules: vec![SmartSelectionRule {
+                id: "bad".to_owned(),
+                name: "Bad".to_owned(),
+                enabled: true,
+                regex: "(unclosed".to_owned(),
+                precision: SmartSelectionPrecision::Normal,
+                actions: Vec::new(),
+            }],
+        };
+        let compiled = CompiledSmartSelection::compile(&config);
+        assert_eq!(compiled.errors.len(), 1);
+        assert_eq!(compiled.errors[0].rule_id, "bad");
     }
 }

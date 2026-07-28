@@ -56,7 +56,7 @@ MENU_ROW_DX=60
 INK_DELTA_MIN="${INK_DELTA_MIN:-200}"
 
 # The exact text the demo "Send Text: …" row types into the focused pane
-# (DEMO_SMART_ACTION_TEXT in crates/scribe-client-gpui/src/main.rs). Asserted
+# (DEMO_SMART_ACTION_TEXT in crates/scribe-client/src/main.rs). Asserted
 # on the PTY through `scribe-test`, which the shared-pane rig keeps attached to
 # the same session the client renders.
 SEND_TEXT_ROW_PAYLOAD="scribe-context-menu"

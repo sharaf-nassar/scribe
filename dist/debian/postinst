@@ -8,20 +8,17 @@ if [ "$PACKAGE_NAME" = "scribe-dev" ]; then
     APP_SLUG="scribe-dev"
     SERVER_BIN_NAME="scribe-dev-server"
     CLIENT_BIN_NAME="scribe-dev"
-    SETTINGS_BIN_NAME="scribe-dev-settings"
     AUTO_SETUP_HOOKS=0
 else
     APP_DISPLAY_NAME="Scribe"
     APP_SLUG="scribe"
     SERVER_BIN_NAME="scribe-server"
     CLIENT_BIN_NAME="scribe-client"
-    SETTINGS_BIN_NAME="scribe-settings"
     AUTO_SETUP_HOOKS=1
 fi
 
 SERVER_BIN_PATH="/usr/bin/${SERVER_BIN_NAME}"
 CLIENT_BIN_PATH="/usr/bin/${CLIENT_BIN_NAME}"
-SETTINGS_BIN_PATH="/usr/bin/${SETTINGS_BIN_NAME}"
 SERVICE_NAME="${SERVER_BIN_NAME}"
 SHARE_DIR="/usr/share/${APP_SLUG}"
 HOT_RELOAD_READY_TIMEOUT_SECS="${HOT_RELOAD_READY_TIMEOUT_SECS:-30}"
@@ -305,6 +302,32 @@ launch_user_binary() {
     run_user_command nohup "$binary" >/dev/null 2>&1 &
 }
 
+probe_client_vulkan() {
+    local stash_path="${STATE_DIR}/upgrade-client-binary"
+
+    CLIENT_VULKAN_READY=1
+    if run_user_command "$CLIENT_BIN_PATH" --vulkan-probe; then
+        rm -f "$stash_path" "${STATE_DIR}/upgrade-client-stashed" 2>/dev/null || true
+        return 0
+    fi
+
+    CLIENT_VULKAN_READY=0
+    echo ""
+    echo "  ⚠  ${APP_DISPLAY_NAME} client Vulkan probe failed."
+    if [ -r "$stash_path" ]; then
+        if cp "$stash_path" "$CLIENT_BIN_PATH" 2>/dev/null; then
+            chmod 0755 "$CLIENT_BIN_PATH" 2>/dev/null || true
+            echo "     Restored the previous client; terminal sessions remain alive."
+        else
+            echo "     Could not restore the previous client from the preinst stash."
+        fi
+    else
+        echo "     No previous client was available to restore."
+    fi
+    echo "     Install Vulkan support, then reinstall this package before relaunching."
+    return 1
+}
+
 cold_restart_server() {
     # A detached `${SERVER_BIN_NAME} --upgrade` is not the systemd unit's main PID,
     # so `systemctl restart` alone can leave it behind holding the singleton
@@ -333,25 +356,6 @@ cold_restart_server() {
         return 0
     fi
     return 1
-}
-
-restart_singleton_binary() {
-    local label="$1"
-    local pid="$2"
-    local binary="$3"
-
-    echo "  Relaunching ${label}..."
-    kill "$pid" 2>/dev/null || true
-
-    if ! wait_for_pid_exit "$pid" 5; then
-        kill -9 "$pid" 2>/dev/null || true
-        if ! wait_for_pid_exit "$pid" 1; then
-            echo "  ✗ Could not stop ${label}; leaving the existing instance running."
-            return 1
-        fi
-    fi
-
-    launch_user_binary "$binary"
 }
 
 pid_is_zombie() {
@@ -424,6 +428,7 @@ case "$1" in
         SERVER_RUNTIME_GENERATION_FILE="${STATE_DIR}/server-runtime-generation"
 
         ensure_state_dir
+        probe_client_vulkan || true
         CONFIG_HOME="$(user_config_home || true)"
         if [ -n "$CONFIG_HOME" ]; then
             migrate_prompt_bar_config "${CONFIG_HOME}/${APP_SLUG}/config.toml" || true
@@ -595,6 +600,8 @@ case "$1" in
             CLIENT_PIDS=$(cat "${CLIENT_PIDS_FILE}" 2>/dev/null || true)
             if [ "$SERVER_RESTART_DEFERRED" = "1" ] && [ -n "$CLIENT_PIDS" ]; then
                 echo "  Skipping client relaunch until the deferred cold restart is approved."
+            elif [ "$CLIENT_VULKAN_READY" != "1" ] && [ -n "$CLIENT_PIDS" ]; then
+                echo "  Skipping client relaunch because the Vulkan probe failed."
             elif [ "$SERVER_READY" = "1" ] && [ -n "$CLIENT_PIDS" ]; then
                 # Pick first PID for hash comparison (all instances run the same binary).
                 FIRST_CLIENT_PID="${CLIENT_PIDS%% *}"
@@ -631,22 +638,8 @@ case "$1" in
                 echo "  Skipping client restart because the server restart failed."
             fi
 
-            # Relaunch settings only if the binary changed.
-            SETTINGS_PID=$(cat "${STATE_DIR}/upgrade-settings-pid" 2>/dev/null | tr -d '[:space:]' || true)
-            if [ "$SERVER_RESTART_DEFERRED" = "1" ] && [ -n "$SETTINGS_PID" ]; then
-                echo "  Skipping settings relaunch until the deferred cold restart is approved."
-            elif [ "$SERVER_READY" = "1" ] && [ -n "$SETTINGS_PID" ]; then
-                if binary_changed "$SETTINGS_PID" "$SETTINGS_BIN_PATH"; then
-                    restart_singleton_binary "settings" "$SETTINGS_PID" "$SETTINGS_BIN_PATH"
-                else
-                    echo "  Settings binary unchanged — skipping restart."
-                fi
-            elif [ "$SERVER_READY" != "1" ] && [ -n "$SETTINGS_PID" ]; then
-                echo "  Skipping settings restart because the server restart failed."
-            fi
-
             # Clean up all upgrade state files and logs.
-            rm -f "${STATE_DIR}/upgrade-client-pids" "${STATE_DIR}/upgrade-settings-pid" 2>/dev/null || true
+            rm -f "${STATE_DIR}/upgrade-client-pids" 2>/dev/null || true
             rm -f /run/user/"${TARGET_UID}"/"${APP_SLUG}"/upgrade-log.* 2>/dev/null || true
             echo ""
         else

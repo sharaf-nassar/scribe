@@ -51,7 +51,7 @@ was never restarted.
 | Client | Samples (ms) | Median |
 |---|---|---:|
 | Old (`scribe-client`, winit) | 3400.7 / 3401.8 / 3502.8 / 3598.6 / 4681.8 | 3502.8 ms |
-| New (`scribe-client-gpui`) | 633.8 / 752.1 / 760.6 / 763.0 / 780.2 | 760.6 ms |
+| New (`scribe-client`) | 633.8 / 752.1 / 760.6 / 763.0 / 780.2 | 760.6 ms |
 
 An interleaved second batch under desktop load reproduced the ratio: old
 3688 / 3919 / 5465 / 5869 ms against new 721 / 789 / 887 / 1418 ms. A later
@@ -112,7 +112,7 @@ a real binary, or the rig logs "cannot seed a session for the client" and
 continues without one. The command that produced these values:
 
     tools/perf-ab-rig/run-perf-ab.sh --live \
-      --new-client target/release/scribe-client-gpui \
+      --new-client target/release/scribe-client \
       --old-client target/release/scribe-client \
       --scribe-test target/release/scribe-test \
       --record-baseline
@@ -179,7 +179,7 @@ the *same* binary (0.260 then 0.366 ms), enough to decide the verdict by itself.
 Re-measured that way, on the reference host against the `scribe-dev` server,
 release builds from this tree:
 
-| Metric | New (`scribe-client-gpui`) | Old (`scribe-client`) | Verdict |
+| Metric | New (`scribe-client`) | Old (`scribe-client`) | Verdict |
 |---|---:|---:|---|
 | Input latency p50 | 0.213 ms | 0.247 ms | PASS |
 | cat-firehose | 17.922 MiB/s | 10.638 MiB/s | PASS |
@@ -227,7 +227,7 @@ no keys sent while the window is open) removes the rig from the loop. Measured
 that way on the reference host, release builds from this tree, against the
 `scribe-dev` server:
 
-| Run | New (`scribe-client-gpui`) | Old (`scribe-client`) |
+| Run | New (`scribe-client`) | Old (`scribe-client`) |
 |---|---|---|
 | 1 | 59.942 fps, 0.000% dropped | 50.575 fps, 5.841% dropped |
 | 2 | 59.597 fps, 0.416% dropped | 48.770 fps, 6.601% dropped |

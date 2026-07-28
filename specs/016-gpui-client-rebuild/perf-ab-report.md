@@ -69,7 +69,7 @@ Launch gate (full A/B on the same machine/session, attaches to the running
 `scribe-dev` server, never restarts it):
 
     tools/perf-ab-rig/run-perf-ab.sh --live \
-      --new-client target/release/scribe-client-gpui \
+      --new-client target/release/scribe-client \
       --old-client target/release/scribe-client \
       --scribe-test target/release/scribe-test --record-baseline
 

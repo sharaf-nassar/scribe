@@ -51,7 +51,7 @@ Crash your terminal, lose every shell. Update it, same story. Scribe splits the 
 ### Prerequisites
 
 - Rust 1.95+
-- Linux: `libgtk-4-dev`, `libvulkan-dev`
+- Linux: `libvulkan-dev`, Wayland/X11 development headers
 - macOS: Xcode Command Line Tools
 
 ### Build from source
@@ -82,6 +82,13 @@ just dmg        # builds the GPUI .app bundle and .dmg installer
 ```
 
 Release tags build signed, notarized DMGs for Apple Silicon and Intel Macs.
+
+### Upgrade rollback
+
+If a Debian upgrade needs to be rolled back for a reason other than a missing
+Vulkan runtime, reinstall a prior release with `apt install scribe=<version>`.
+Pin that version until the regression is resolved. The installer separately
+restores the previous client automatically when its Vulkan probe fails.
 
 ## Configuration
 
@@ -213,7 +220,9 @@ Every keyboard shortcut is configurable in `config.toml` under `[keybindings]`. 
 
 ### Settings UI
 
-A standalone settings window (`scribe-settings`) opens with `Ctrl+,`. Built as a webview using wry with HTML/CSS/JS. Changes are applied live without restarting. Singleton-enforced — opening settings twice focuses the existing window. Covers appearance, terminal behavior, keybindings, and workspace configuration.
+The GPUI settings window opens with `Ctrl+,` or `scribe-client --settings`.
+Changes apply live without restarting and cover appearance, terminal behavior,
+keybindings, and workspace configuration.
 
 ### URL & Path Detection
 
@@ -250,7 +259,7 @@ crates/
 ├── scribe-server     # Session/workspace management, IPC, handoff
 ├── scribe-client     # GPU client: winit + wgpu, pane layout, input
 ├── scribe-renderer   # GPU pipeline: glyph atlas, color palette, wgpu
-├── scribe-settings   # Settings webview: wry, HTML/CSS/JS assets
+├── scribe-client     # GPUI terminal and settings windows
 ├── scribe-cli        # Headless test CLI: raw stdin/stdout over IPC
 └── scribe-test       # E2E test harness with subcommands
 ```

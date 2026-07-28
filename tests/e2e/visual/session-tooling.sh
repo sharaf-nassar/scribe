@@ -4,7 +4,7 @@
 #
 # Backs the `ClientMessage::Subscribe` and `ClientMessage::RequestSnapshot`
 # parity rows. Both frames used to exist only in the frozen protocol enum — no
-# construction site anywhere in `scribe-client-gpui` — so the client could
+# construction site anywhere in `scribe-client` — so the client could
 # neither register an attached pane for the server's CWD-fallback check nor ask
 # for an authoritative screen when its own pane may have drifted.
 #
@@ -262,16 +262,16 @@ PY
 sleep 1.0
 kill "$SCRIBE_CLIENT_PID" 2>/dev/null || true
 for _ in $(seq 1 40); do
-    pgrep -f 'scribe-client-gpui' >/dev/null 2>&1 || break
+    pgrep -f 'scribe-client' >/dev/null 2>&1 || break
     sleep 0.25
 done
-if pgrep -f 'scribe-client-gpui' >/dev/null 2>&1; then
+if pgrep -f 'scribe-client' >/dev/null 2>&1; then
     fail "PHASE 0 FAIL: the original client did not exit"
 fi
 scribe-test daemon stop >/dev/null 2>&1 || true
 sleep 1.0
 reset_record
-scribe-client-gpui >>"$CLIENT_LOG" 2>&1 &
+scribe-client >>"$CLIENT_LOG" 2>&1 &
 xdotool search --sync --name "Scribe" >/dev/null 2>&1 || true
 sleep 2
 

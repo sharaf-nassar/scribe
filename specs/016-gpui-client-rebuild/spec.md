@@ -36,7 +36,7 @@ at cutover, along with all code that only existed to serve them.
 **This feature is re-scoped in place. It is not superseded by a new feature.**
 
 The 016 task list is ~87% closed, but what it completed is the **library
-port**, not the product. `crates/scribe-client-gpui` ships 54 library modules
+port**, not the product. `crates/scribe-client` ships 54 library modules
 (~35k lines) with a green workspace unit-test suite (850 tests at the gate run,
 more on current `main`); the live binary — `main.rs` plus
 `ipc_bridge`, `session_lifecycle`, `sync_frames`, `terminal`,
@@ -371,7 +371,7 @@ so regressions are caught during the rebuild, not after cutover.
   control passing, LAN dialogs). Coordinate cutover after 015 lands or
   absorb its client surfaces into parity scope (Open Question).
 - **Dev/test environment:** rebuild happens in a side-by-side binary
-  (working name `scribe-client-gpui` until cutover renames it) so the old
+  (working name `scribe-client` until cutover renames it) so the old
   client keeps working throughout; NEVER restart the user's running Scribe
   server without explicit approval.
 

@@ -14,7 +14,6 @@ use scribe_common::protocol::{LayoutDirection, PaneTreeNode, WorkspaceTreeNode};
 use crate::layout::{
     FocusDirection, LayoutNode, LayoutTree, PaneId, Rect, SplitDirection, alloc_pane_id,
 };
-use crate::selection::SelectionRange;
 
 /// Fallback accent colour for new workspaces when no theme is available.
 const FALLBACK_ACCENT: [f32; 4] = [0.0, 0.8, 0.7, 1.0];
@@ -62,7 +61,6 @@ pub struct TabState {
     pub session_id: SessionId,
     pub pane_layout: LayoutTree,
     pub focused_pane: PaneId,
-    pub selection: Option<SelectionRange>,
 }
 
 // ---------------------------------------------------------------------------
@@ -165,7 +163,7 @@ impl WindowLayout {
         let layout = LayoutTree::new();
         let focused_pane = layout.initial_pane_id();
         let pane_id = focused_pane;
-        ws.tabs.push(TabState { session_id, pane_layout: layout, focused_pane, selection: None });
+        ws.tabs.push(TabState { session_id, pane_layout: layout, focused_pane });
         ws.active_tab = ws.tabs.len().saturating_sub(1);
         Some(pane_id)
     }
@@ -186,12 +184,7 @@ impl WindowLayout {
         let first_pane_id = pairs.first().map(|&(_, pid)| pid)?;
         let layout = LayoutTree::from_root(layout_root, first_pane_id);
         let ws = self.find_workspace_mut(workspace_id)?;
-        ws.tabs.push(TabState {
-            session_id,
-            pane_layout: layout,
-            focused_pane: first_pane_id,
-            selection: None,
-        });
+        ws.tabs.push(TabState { session_id, pane_layout: layout, focused_pane: first_pane_id });
         ws.active_tab = ws.tabs.len().saturating_sub(1);
         Some(pairs)
     }

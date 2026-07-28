@@ -1,16 +1,25 @@
 //! Split-scroll: pin the live terminal bottom while scrolled up in AI panes.
 //!
 //! When the user scrolls up in a pane running a supported AI coding tool, the
-//! viewport splits into a top portion (scrollback) and a bottom portion
-//! (live terminal where the cursor/prompt is). This lets users compose
-//! prompts while reading earlier output.
+//! viewport splits into a top portion (scrollback) and a bottom portion (the
+//! live terminal where the cursor/prompt is), so prompts stay composable while
+//! reading earlier output. This module ports the pure logic from the legacy
+//! client: eligibility (AI provider + scrolled + normal screen), pin-row
+//! sizing, cursor-anchored cell translation, logical-line alignment, and the
+//! top/divider/bottom/jump-chip geometry.
+//!
+//! The GPUI shell consumes all of it: `terminal.rs` folds the eligibility and
+//! the aligned pin-row count into every content snapshot (the pinned rows are
+//! read from the live screen rather than the scrolled viewport, which is the
+//! cursor-anchored translation expressed in row space), `terminal_element.rs`
+//! paints the divider and the jump chip from [`compute_geometry`], and the
+//! shell hit-tests a click against that chip with [`hit_test_jump_btn`].
 
-use alacritty_terminal::Term;
-use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions as _;
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags;
-use scribe_renderer::types::CellInstance;
+use alacritty_terminal_gpui::event::VoidListener;
+use alacritty_terminal_gpui::grid::Dimensions as _;
+use alacritty_terminal_gpui::index::{Column, Line};
+use alacritty_terminal_gpui::term::Term;
+use alacritty_terminal_gpui::term::cell::Flags;
 
 use crate::layout::Rect;
 
@@ -19,10 +28,10 @@ const MIN_PIN_ROWS: usize = 3;
 
 /// Default rows reserved for the AI tool's prompt UI block.
 ///
-/// Claude Code and Codex both render a prompt block several rows
-/// tall — a status line, permission/help hints, the input box border, and
-/// the input row. 8 rows fits the typical block without consuming half the
-/// screen, which keeps scrollback readable in the top portion.
+/// Claude Code and Codex both render a prompt block several rows tall — a
+/// status line, permission/help hints, the input box border, and the input
+/// row. 8 rows fits the typical block without consuming half the screen, which
+/// keeps scrollback readable in the top portion.
 const AI_PROMPT_BLOCK_ROWS: usize = 8;
 
 /// Width of the jump-to-bottom button (pixels).
@@ -41,18 +50,21 @@ const JUMP_BTN_INSET_Y: f32 = 4.0;
 const DIVIDER_H: f32 = 1.0;
 
 /// Per-pane split-scroll state.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SplitScrollState {
     /// Pixel height of the live-bottom pin region (set during rendering).
     pub pin_height: f32,
 }
 
 impl SplitScrollState {
+    #[must_use]
     pub fn new() -> Self {
         Self { pin_height: 0.0 }
     }
 }
 
 /// Precomputed geometry for the split-scroll viewport.
+#[derive(Debug, Clone, Copy)]
 pub struct SplitScrollGeometry {
     /// The top portion showing scrollback.
     pub top: Rect,
@@ -64,42 +76,75 @@ pub struct SplitScrollGeometry {
     pub jump_button: Rect,
 }
 
+/// Configuration-derived split-scroll eligibility for a pane.
+///
+/// Separates the two "does the environment allow it" flags — the config toggle
+/// and whether the pane runs a supported AI provider — from the live terminal
+/// state ([`split_scroll_eligible`] adds the scrolled/normal-screen checks).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SplitScrollEligibility {
+    /// The `scroll_pin` config key is enabled.
+    pub scroll_pin_enabled: bool,
+    /// The pane runs an AI provider that opts into split-scroll.
+    pub ai_provider_enabled: bool,
+}
+
+impl SplitScrollEligibility {
+    /// Whether the config and provider both permit split-scroll.
+    #[must_use]
+    pub fn allows(self) -> bool {
+        self.scroll_pin_enabled && self.ai_provider_enabled
+    }
+}
+
+/// Whether split-scroll should be active for a pane.
+///
+/// Split-scroll only applies to an eligible AI pane that is scrolled up
+/// (`display_offset > 0`) while in the normal screen buffer — never on the
+/// alternate screen, where full-screen TUIs manage their own viewport.
+pub fn split_scroll_eligible(
+    eligibility: SplitScrollEligibility,
+    display_offset: usize,
+    alt_screen: bool,
+) -> bool {
+    eligibility.allows() && display_offset > 0 && !alt_screen
+}
+
 /// Compute the number of rows to pin at the bottom of the screen.
 ///
-/// The pin sits at the bottom of the screen and is sized to fit the AI
-/// tool's prompt UI block. The pin's *contents* are translated downward by
-/// [`live_cell_y_translation`] so the cursor lands at the last row of the
-/// pin regardless of where it actually sits in the live screen — that's
-/// what keeps the prompt visible when an AI tool draws it in the top half.
+/// The pin sits at the bottom of the screen and is sized to fit the AI tool's
+/// prompt UI block. The pin's *contents* are translated downward by
+/// [`live_cell_y_translation`] so the cursor lands at the last row of the pin
+/// regardless of where it actually sits in the live screen — that's what keeps
+/// the prompt visible when an AI tool draws it in the top half.
 pub fn compute_pin_rows(screen_lines: usize) -> usize {
     let max_rows = screen_lines.saturating_sub(MIN_PIN_ROWS).max(MIN_PIN_ROWS);
     AI_PROMPT_BLOCK_ROWS.clamp(MIN_PIN_ROWS, max_rows)
 }
 
-/// Compute the y-pixel shift to apply to live cells so the cursor row
-/// lands at the last row of the pin region.
+/// Compute the y-pixel shift to apply to live cells so the cursor row lands at
+/// the last row of the pin region.
 ///
-/// Without this shift, when the AI tool's cursor is in the upper half of
-/// the live screen, the prompt cells fall above the pin rect and get
-/// filtered out by [`filter_instances_by_y`] — hiding the prompt entirely
-/// while scrolled. With this shift, every live cell is translated so the
-/// cursor row lands on the last screen row (the bottom of the pin), and
-/// the rows naturally above the cursor stack upward into the pin from
-/// there. Rows naturally below the cursor are pushed off-screen and get
-/// filtered out instead.
+/// Without this shift, when the AI tool's cursor is in the upper half of the
+/// live screen, the prompt cells fall above the pin rect and are filtered out —
+/// hiding the prompt while scrolled. With this shift, every live cell is
+/// translated so the cursor row lands on the last screen row (the bottom of the
+/// pin), and the rows naturally above the cursor stack upward into the pin from
+/// there. Rows naturally below the cursor are pushed off-screen instead.
 pub fn live_cell_y_translation(cursor_line: usize, screen_lines: usize, cell_h: f32) -> f32 {
-    use winit::dpi::Pixel as _;
     let last_row = screen_lines.saturating_sub(1);
     let rows_to_shift = last_row.saturating_sub(cursor_line);
-    u32::try_from(rows_to_shift).unwrap_or(u32::MAX).cast::<f32>() * cell_h
+    // Screen rows never exceed u16 in practice; the lossless u16->f32 keeps the
+    // conversion free of pedantic cast-precision lints.
+    f32::from(u16::try_from(rows_to_shift).unwrap_or(u16::MAX)) * cell_h
 }
 
-/// Expand the pinned region upward so the split never starts mid-way through
-/// a soft-wrapped logical line, while still leaving room for the top portion.
+/// Expand the pinned region upward so the split never starts mid-way through a
+/// soft-wrapped logical line, while still leaving room for the top portion.
 ///
 /// In the cursor-anchored model, the pin shows the live rows
-/// `[cursor_line - pin_rows + 1, cursor_line]` translated to the bottom of
-/// the screen. The "boundary" we walk up from is therefore
+/// `[cursor_line - pin_rows + 1, cursor_line]` translated to the bottom of the
+/// screen. The "boundary" we walk up from is therefore
 /// `cursor_line - pin_rows + 1`, not `screen_lines - pin_rows`.
 pub fn align_pin_rows_to_logical_lines(
     term: &Term<VoidListener>,
@@ -169,262 +214,141 @@ pub fn compute_geometry(content_rect: Rect, pin_height: f32) -> SplitScrollGeome
     }
 }
 
-pub struct SplitScrollChromeRequest<'a> {
-    pub out: &'a mut Vec<CellInstance>,
-    pub geometry: &'a SplitScrollGeometry,
-    pub divider_color: [f32; 4],
-    pub jump_button_hovered: bool,
-    pub accent_color: [f32; 4],
-}
-
-/// Filter instances, keeping only those whose `pos[1]` (Y) falls in `[y_min, y_max)`.
-pub fn filter_instances_by_y(
-    instances: &[CellInstance],
-    y_min: f32,
-    y_max: f32,
-) -> Vec<CellInstance> {
-    instances.iter().filter(|inst| inst.pos[1] >= y_min && inst.pos[1] < y_max).copied().collect()
-}
-
-/// Render the split-scroll chrome: divider line and jump-to-bottom button.
-pub fn render_chrome(request: SplitScrollChromeRequest<'_>) {
-    let out = request.out;
-    let geo = request.geometry;
-    // Divider line.
-    push_solid_rect(out, geo.divider, request.divider_color);
-
-    let shadow_rect = inset_rect(geo.jump_button, 0.0, -1.0);
-    out.push(rounded_rect(shadow_rect, [0.0, 0.0, 0.0, 0.28], 6.0));
-
-    let frame_color = with_alpha(
-        mix_rgb(
-            request.divider_color,
-            request.accent_color,
-            if request.jump_button_hovered { 0.45 } else { 0.26 },
-        ),
-        if request.jump_button_hovered { 0.98 } else { 0.92 },
-    );
-    out.push(rounded_rect(geo.jump_button, frame_color, 6.0));
-
-    let body_rect = inset_rect(geo.jump_button, 1.0, 1.0);
-    let body_color = with_alpha(
-        mix_rgb(
-            request.divider_color,
-            [0.0, 0.0, 0.0, 1.0],
-            if request.jump_button_hovered { 0.82 } else { 0.9 },
-        ),
-        if request.jump_button_hovered { 0.98 } else { 0.94 },
-    );
-    out.push(rounded_rect(body_rect, body_color, 5.0));
-
-    let accent_strip = Rect {
-        x: body_rect.x + 2.0,
-        y: body_rect.y + 2.0,
-        width: (body_rect.width - 4.0).max(0.0),
-        height: 2.0,
-    };
-    let accent_strip_color = with_alpha(
-        mix_rgb(
-            request.accent_color,
-            [1.0, 1.0, 1.0, 1.0],
-            if request.jump_button_hovered { 0.12 } else { 0.04 },
-        ),
-        if request.jump_button_hovered { 0.78 } else { 0.52 },
-    );
-    out.push(rounded_rect(accent_strip, accent_strip_color, 1.0));
-
-    let inner_plate = Rect {
-        x: body_rect.x + 2.0,
-        y: body_rect.y + 6.0,
-        width: (body_rect.width - 4.0).max(0.0),
-        height: (body_rect.height - 8.0).max(0.0),
-    };
-    let inner_plate_color = with_alpha(
-        mix_rgb(
-            body_color,
-            request.accent_color,
-            if request.jump_button_hovered { 0.14 } else { 0.08 },
-        ),
-        if request.jump_button_hovered { 0.98 } else { 0.9 },
-    );
-    out.push(rounded_rect(inner_plate, inner_plate_color, 4.0));
-
-    let dock_rect = Rect {
-        x: geo.jump_button.x + 7.0,
-        y: geo.jump_button.y + geo.jump_button.height - 1.0,
-        width: 14.0,
-        height: 2.0,
-    };
-    let dock_color =
-        with_alpha(request.accent_color, if request.jump_button_hovered { 0.34 } else { 0.2 });
-    out.push(rounded_rect(dock_rect, dock_color, 1.0));
-
-    push_jump_arrow(out, geo.jump_button, [0.0, 0.0, 0.0, 0.32], (1.0, 1.0));
-    let icon_color = with_alpha(
-        mix_rgb(
-            request.accent_color,
-            [1.0, 1.0, 1.0, 1.0],
-            if request.jump_button_hovered { 0.7 } else { 0.54 },
-        ),
-        if request.jump_button_hovered { 0.98 } else { 0.86 },
-    );
-    push_jump_arrow(out, geo.jump_button, icon_color, (0.0, 0.0));
-}
-
 /// Hit-test the jump-to-bottom button.
 pub fn hit_test_jump_btn(geo: &SplitScrollGeometry, x: f32, y: f32) -> bool {
     geo.jump_button.contains(x, y)
 }
 
-/// Push a solid-color rectangle.
-fn push_solid_rect(out: &mut Vec<CellInstance>, rect: Rect, color: [f32; 4]) {
-    out.push(rounded_rect(rect, color, 0.0));
-}
-
-fn push_jump_arrow(out: &mut Vec<CellInstance>, button: Rect, color: [f32; 4], offset: (f32, f32)) {
-    let (offset_x, offset_y) = offset;
-    let baseline = Rect {
-        x: button.x + 9.0 + offset_x,
-        y: button.y + 17.0 + offset_y,
-        width: 10.0,
-        height: 2.0,
-    };
-    let stem = Rect {
-        x: button.x + 12.0 + offset_x,
-        y: button.y + 5.0 + offset_y,
-        width: 4.0,
-        height: 8.0,
-    };
-    let wide_chevron = Rect {
-        x: button.x + 8.0 + offset_x,
-        y: button.y + 11.0 + offset_y,
-        width: 12.0,
-        height: 2.0,
-    };
-    let middle_chevron = Rect {
-        x: button.x + 10.0 + offset_x,
-        y: button.y + 13.0 + offset_y,
-        width: 8.0,
-        height: 2.0,
-    };
-    let arrow_point = Rect {
-        x: button.x + 12.0 + offset_x,
-        y: button.y + 15.0 + offset_y,
-        width: 4.0,
-        height: 2.0,
-    };
-
-    push_solid_rect(out, baseline, color);
-    push_solid_rect(out, stem, color);
-    push_solid_rect(out, wide_chevron, color);
-    push_solid_rect(out, middle_chevron, color);
-    push_solid_rect(out, arrow_point, color);
-}
-
-fn rounded_rect(rect: Rect, color: [f32; 4], corner_radius: f32) -> CellInstance {
-    CellInstance {
-        pos: [rect.x, rect.y],
-        size: [rect.width, rect.height],
-        uv_min: [0.0, 0.0],
-        uv_max: [0.0, 0.0],
-        fg_color: color,
-        bg_color: color,
-        corner_radius,
-    }
-}
-
-fn inset_rect(rect: Rect, inset_x: f32, inset_y: f32) -> Rect {
-    Rect {
-        x: rect.x + inset_x,
-        y: rect.y + inset_y,
-        width: (rect.width - inset_x * 2.0).max(0.0),
-        height: (rect.height - inset_y * 2.0).max(0.0),
-    }
-}
-
-fn mix_rgb(a: [f32; 4], b: [f32; 4], amount: f32) -> [f32; 4] {
-    let t = amount.clamp(0.0, 1.0);
-    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, 1.0]
-}
-
-fn with_alpha(color: [f32; 4], alpha: f32) -> [f32; 4] {
-    [color[0], color[1], color[2], alpha]
-}
-
+/// Read the flags of a single cell from the terminal grid.
+///
+/// The `alacritty_terminal` grid only exposes `Index`, with no fallible
+/// `.get()` alternative, so indexing is required here — matching the direct
+/// grid indexing the display snapshot path already relies on.
 fn read_cell_flags(term: &Term<VoidListener>, line: Line, col: Column) -> Flags {
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "alacritty_terminal grid only supports Index trait, no get() alternative"
-    )]
-    {
-        term.grid()[line][col].flags
-    }
+    term.grid()[line][col].flags
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal_gpui::grid::Dimensions;
+    use alacritty_terminal_gpui::term::Config;
+    use vte::ansi::Processor;
 
-    #[test]
-    fn pin_rows_uses_ai_block_size_when_room() {
-        // Comfortable screen: AI_PROMPT_BLOCK_ROWS fits cleanly.
-        assert_eq!(compute_pin_rows(30), AI_PROMPT_BLOCK_ROWS);
+    struct TestDims {
+        cols: usize,
+        rows: usize,
     }
 
+    impl Dimensions for TestDims {
+        fn total_lines(&self) -> usize {
+            self.rows
+        }
+        fn screen_lines(&self) -> usize {
+            self.rows
+        }
+        fn columns(&self) -> usize {
+            self.cols
+        }
+    }
+
+    fn term_with_output(cols: usize, rows: usize, output: &[u8]) -> Term<VoidListener> {
+        let mut term = Term::new(Config::default(), &TestDims { cols, rows }, VoidListener);
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, output);
+        term
+    }
+
+    // @lat: [[test#GPUI Split-Scroll#Eligible only for scrolled AI panes on the normal screen]]
     #[test]
-    fn pin_rows_clamps_when_screen_is_tiny() {
+    fn eligible_only_for_scrolled_ai_panes_on_normal_screen() {
+        let both = SplitScrollEligibility { scroll_pin_enabled: true, ai_provider_enabled: true };
+        // Happy path: enabled, AI provider, scrolled, normal screen.
+        assert!(split_scroll_eligible(both, 5, false));
+        // Not scrolled: pinned bottom would equal the live view.
+        assert!(!split_scroll_eligible(both, 0, false));
+        // Alt screen: full-screen TUI owns its viewport.
+        assert!(!split_scroll_eligible(both, 5, true));
+        // Config disabled.
+        assert!(!split_scroll_eligible(
+            SplitScrollEligibility { scroll_pin_enabled: false, ai_provider_enabled: true },
+            5,
+            false,
+        ));
+        // No supported AI provider in the pane.
+        assert!(!split_scroll_eligible(
+            SplitScrollEligibility { scroll_pin_enabled: true, ai_provider_enabled: false },
+            5,
+            false,
+        ));
+    }
+
+    // @lat: [[test#GPUI Split-Scroll#Pin rows fit the AI prompt block or clamp on tiny screens]]
+    #[test]
+    fn pin_rows_fit_ai_block_or_clamp_on_tiny_screens() {
+        assert_eq!(compute_pin_rows(30), AI_PROMPT_BLOCK_ROWS);
         // Screen barely larger than MIN_PIN_ROWS: pin can't exceed
-        // screen_lines - MIN_PIN_ROWS or top portion vanishes.
+        // screen_lines - MIN_PIN_ROWS or the top portion vanishes.
         assert_eq!(compute_pin_rows(MIN_PIN_ROWS + 1), MIN_PIN_ROWS);
         assert_eq!(compute_pin_rows(0), MIN_PIN_ROWS);
-    }
-
-    #[test]
-    fn pin_rows_caps_below_screen_minus_min() {
         // 10-row screen: max = 10 - 3 = 7. AI_PROMPT_BLOCK_ROWS=8 > 7, so cap.
         assert_eq!(compute_pin_rows(10), 7);
     }
 
-    // Regression test for the prompt-hidden bug: when the cursor is in the
-    // upper half of the live screen, the translation moves the cursor row to
-    // the last row of the screen so the prompt stays visible at the bottom of
-    // the pin region instead of being filtered out.
+    // @lat: [[test#GPUI Split-Scroll#Cursor-anchored translation keeps the prompt visible]]
     #[test]
-    fn translation_moves_cursor_to_last_screen_row_when_cursor_high() {
-        // Cursor at line 5 of a 30-row screen, cell_h = 16.0.
-        // The cursor row should be shifted by (30 - 1 - 5) = 24 rows.
+    fn cursor_anchored_translation_keeps_prompt_visible() {
+        // Cursor high on a 30-row screen shifts down (30 - 1 - 5) = 24 rows.
         let shift = live_cell_y_translation(5, 30, 16.0);
-        assert!((shift - 24.0 * 16.0).abs() < f32::EPSILON, "expected 24*16 = 384.0, got {shift}");
+        assert!((shift - 24.0 * 16.0).abs() < f32::EPSILON);
+        // Cursor already on the last row: no shift.
+        assert!(live_cell_y_translation(29, 30, 16.0).abs() < f32::EPSILON);
+        // One above bottom: shift one row.
+        assert!((live_cell_y_translation(28, 30, 16.0) - 16.0).abs() < f32::EPSILON);
+        // Defensive: cursor past the last row saturates to no shift.
+        assert!(live_cell_y_translation(40, 30, 16.0).abs() < f32::EPSILON);
     }
 
+    // @lat: [[test#GPUI Split-Scroll#Geometry stacks top divider and pinned bottom]]
     #[test]
-    fn translation_is_zero_when_cursor_already_on_last_row() {
-        // Cursor on the last visible row (line 29 of 30) — no shift needed,
-        // matches the original "pin shows bottom rows of live screen" behavior.
-        let shift = live_cell_y_translation(29, 30, 16.0);
-        assert!(shift.abs() < f32::EPSILON, "expected 0.0, got {shift}");
+    fn geometry_stacks_top_divider_and_pinned_bottom() {
+        let content = Rect { x: 5.0, y: 10.0, width: 400.0, height: 300.0 };
+        let geo = compute_geometry(content, 120.0);
+        // Bottom is the requested pin height; top fills the remainder minus 1px.
+        assert!((geo.bottom.height - 120.0).abs() < f32::EPSILON);
+        assert!((geo.top.height - (300.0 - DIVIDER_H - 120.0)).abs() < f32::EPSILON);
+        // Divider sits directly below the top portion.
+        assert!((geo.divider.y - (content.y + geo.top.height)).abs() < f32::EPSILON);
+        assert!((geo.divider.height - DIVIDER_H).abs() < f32::EPSILON);
+        // Bottom sits directly below the divider.
+        assert!((geo.bottom.y - (content.y + geo.top.height + DIVIDER_H)).abs() < f32::EPSILON);
+        // Jump chip is docked inside the top portion and hit-tests there.
+        assert!(hit_test_jump_btn(&geo, geo.jump_button.x + 1.0, geo.jump_button.y + 1.0));
+        assert!(!hit_test_jump_btn(&geo, content.x, content.y));
     }
 
+    // @lat: [[test#GPUI Split-Scroll#Pin height clamps to the content rect]]
     #[test]
-    fn translation_is_one_row_for_cursor_one_above_bottom() {
-        // Cursor at line 28 of 30 → shift cells down 1 row so cursor lands
-        // at the last screen row.
-        let shift = live_cell_y_translation(28, 30, 16.0);
-        assert!((shift - 16.0).abs() < f32::EPSILON, "expected one row (16.0), got {shift}");
+    fn pin_height_clamps_to_content_rect() {
+        let content = Rect { x: 0.0, y: 0.0, width: 200.0, height: 50.0 };
+        // A pin taller than the content collapses the top portion to zero.
+        let geo = compute_geometry(content, 1000.0);
+        assert!(geo.top.height.abs() < f32::EPSILON);
+        assert!((geo.bottom.height - (50.0 - DIVIDER_H)).abs() < f32::EPSILON);
     }
 
+    // @lat: [[test#GPUI Split-Scroll#Pin alignment absorbs soft-wrapped logical lines]]
     #[test]
-    fn translation_saturates_when_cursor_below_screen() {
-        // Defensive: cursor_line >= screen_lines should not underflow. The
-        // shift should be 0 (treat cursor as already past the last row).
-        let shift = live_cell_y_translation(40, 30, 16.0);
-        assert!(shift.abs() < f32::EPSILON, "expected 0.0, got {shift}");
-    }
-
-    #[test]
-    fn translation_handles_cursor_at_top_of_screen() {
-        // Cursor at line 0 → shift = 29 rows down.
-        let shift = live_cell_y_translation(0, 30, 16.0);
-        assert!((shift - 29.0 * 16.0).abs() < f32::EPSILON, "expected 29*16 = 464.0, got {shift}");
+    fn pin_alignment_absorbs_soft_wrapped_logical_lines() {
+        // Emit a logical line long enough to soft-wrap across the 4-col grid so
+        // the row above the pin boundary carries the WRAPLINE flag.
+        let term = term_with_output(4, 12, b"abcdefghij");
+        // Cursor on the wrapped row; a 3-row pin should expand upward to keep
+        // the wrapped continuation intact.
+        let aligned = align_pin_rows_to_logical_lines(&term, 3, 2, 12);
+        assert!(aligned >= 3);
+        // A grid with no wrap keeps the requested pin rows unchanged.
+        let plain = term_with_output(80, 12, b"hello\r\nworld\r\n");
+        assert_eq!(align_pin_rows_to_logical_lines(&plain, 3, 2, 12), 3);
     }
 }

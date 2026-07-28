@@ -45,7 +45,7 @@ A parity row is done only when **both** hold:
    settings window's `settings/window.rs::SettingsWindow::run_action` is a
    fifth, narrower entry point. Bead .82 gave it an in-app trigger, so it is now
    reached from the terminal window (settings chord, palette row, titlebar gear)
-   as well as from `scribe-client-gpui --settings`; rows resting on it are
+   as well as from `scribe-client --settings`; rows resting on it are
    flagged inline as settings-window rows.
 2. **Verified against the running app.** Its verification method (below, as
    upgraded) passes while driving the real client, not a directly constructed
