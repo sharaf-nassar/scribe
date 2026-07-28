@@ -14,6 +14,12 @@ The GPUI rebuild keeps `appearance.opacity`: [[tools/gpui-window-opacity-spike/s
 The cutover crate (`crates/scribe-client`) renders a live Scribe pane over the
 frozen IPC protocol and builds against pinned gpui/alacritty revisions.
 
+## gpui-component adoption
+
+Scribe retains bespoke chrome and revisits `gpui-component` only for isolated
+new surfaces after compatibility and integration validation. The source decision
+is `specs/016-gpui-client-rebuild/gpui-component-evaluation.md`.
+
 The spike adopts Zed's display-only terminal model: [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal]] owns an alacritty `Term` plus a VTE `Processor` and holds no PTY. Server bytes enter through [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#feed_output]], which advances the processor, reports whether the frame changed visible state, and rebuilds an immutable `Content` grid snapshot. [[crates/scribe-client/src/terminal_element.rs#TerminalElement]] paints that snapshot as fixed-width GPUI rows.
 
 A background thread runs [[crates/scribe-client/src/main.rs#run_connection]]: it connects to the live server socket, splits it into read/write halves, and queues `Hello` + `ListSessions`. [[crates/scribe-client/src/main.rs#run_reader]] attaches the first live session and hands every message to [[crates/scribe-client/src/main.rs#dispatch_server_message]], which normalises `PtyOutput` / `SessionReplay` / `ScreenSnapshot` into raw output bytes (via the [[client#GPUI Client Spike#Session Lifecycle]] helpers, off the drain) and forwards them as [[crates/scribe-client/src/ipc_bridge.rs#InboundEvent]]. Each coalesced batch bumps a shared generation counter; [[crates/scribe-client/src/main.rs#drive_redraws]] polls it on the GPUI foreground and calls `notify()` so the window repaints.
