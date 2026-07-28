@@ -80,7 +80,7 @@ parity gate: NO-GO — 189 of 194 user-facing rows reachable (97%);
 | --- | --- | --- | --- | --- |
 | Server-upgrade reattach | `US2-4` | missing | `main.rs::start_ipc_thread` awaits `run_connection` exactly once; when it returns nothing redials, so an `--upgrade` handoff leaves the window attached to nothing. `visual/reconnect.sh` relaunches the client *process* and does not cover it | `scribe-38e.99` |
 | AI indicator borders and tab tint | `US4-1` | unwired | `ai_indicator::{tab_indicator_color, workspace_border_color, pane_border_edges, tick, needs_animation, clear_stale_processing}` have no caller outside their module; AI state is tracked and never painted | `scribe-38e.100` |
-| Pane dividers and drag-resize | `US3-10` | unwired | `divider.rs` is referenced only by `lib.rs` and its own tests; `main.rs` tints pane gaps with `chrome.divider` and draws no divider quads and no drag path | `scribe-38e.101` |
+| Pane dividers and drag-resize | `US3-10` | wired | `TerminalView::render_dividers` paints `PaneShell::dividers`; the grid pointer path maps the divider drag to `PaneShell::set_pane_ratio` and republishes both grids | `scribe-38e.101` |
 | Workspace notes hover preview | `US4-3` | unwired | `workspace_notes_preview.rs` has no reference outside `lib.rs` and its own tests. The notes *modal* is wired; the hover preview is not | `scribe-38e.102` |
 | Remote connect picker overlay | `US4-4` | missing | `remote::RemoteConnect` models the picker and no GPUI view renders it; `refresh_remote_peers` surfaces a peer count on the status strip instead | `scribe-38e.103` |
 

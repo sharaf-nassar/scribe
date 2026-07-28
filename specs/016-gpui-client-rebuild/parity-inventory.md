@@ -378,7 +378,7 @@ cold-restart restore, the command-mark scrollbar, window geometry persistence,
 the desktop notification dispatcher, server lifecycle management, and file
 drag-and-drop — that had never been tabulated at all. A requirement with no row
 is scored by no oracle, so the reachable-row count measured the tabulated subset
-rather than parity. Enumerating the register closed that gap and surfaced five
+rather than parity. Enumerating the register closed that gap and surfaced four
 further requirements that are not reachable today.
 
 | Requirement | spec.md | Surface | Verification method | Reachable from | Status |
@@ -399,7 +399,7 @@ further requirements that are not reachable today.
 | Overlay chrome polish | `US3-5` | rounded corners, drop shadow, hover/pressed | visual-E2E | `command_palette::CommandPaletteView::render`, `dialog::DialogView::render`, `context_menu::ContextMenuView::render` and `tooltip::tooltip_element`, each applying `.rounded_*()` + `.shadow_*()` on the live overlay layer — `tests/e2e/visual/overlays.sh`, `tests/e2e/visual/dialogs.sh` | required |
 | Overlay and focus animations | `US3-6` | ≤150 ms interruptible easing | visual-E2E | `main.rs::main` and `main.rs::run_settings` → `animation::AnimationSettings::resolve` → `AnimationSettings::apply_to_app`, which installs the reduce-motion-aware durations every overlay animates against | required |
 | Custom titlebar with integrated tab bar | `US3-8` | window chrome | visual-E2E | `main.rs::TerminalView::build_titlebar` → `titlebar::TitlebarView`, rendered above the grid with `window_chrome` supplying the client-side decoration geometry — `tests/e2e/visual/titlebar.sh` | required |
-| Pane dividers and drag-resize | `US3-10` | divider paint and split resize | visual-E2E | — (unwired) `divider.rs` has no reference anywhere outside `lib.rs` and its own tests, so neither the divider quads nor drag-resize exist in the running app; `main.rs` only tints pane gaps with `chrome.divider`. Recorded as `unwired-module divider` in `tools/reachability-baseline.txt` | required |
+| Pane dividers and drag-resize | `US3-10` | divider paint and split resize | visual-E2E | `main.rs::TerminalView::render_dividers` → `PaneShell::dividers` → `divider::collect_dividers`; the grid pointer path claims the divider hit band, maps motion through `divider::drag_ratio`, then calls `PaneShell::set_pane_ratio` and republishes both grids — `tests/e2e/visual/pane-workspace-layout.sh` phase 5 | required |
 | Focused pane and workspace accent border | `US3-10` | focus indication | visual-E2E | `main.rs::TerminalView::render_panes` → `main.rs::pane_border` → the pane element's border colour, using the owning region's accent when focused. Note: the shared strip math in `focus_border::border_edges` is reached only from `ai_indicator::pane_border_edges`, which has no live caller — see the AI-indicator row | required |
 | AI indicator borders and tab tint | `US4-1` | pulsing borders, tab tint, stale-clear | visual-E2E | — (unwired) `ai_indicator::AiStateTracker::tab_indicator_color`, `workspace_border_color`, `tick`, `needs_animation`, `clear_stale_processing`, `note_activity`, `remember_provider`, `clear_attention_states` and `ai_indicator::pane_border_edges` have no caller outside `ai_indicator.rs`. `main.rs` reaches only `update`, `remove`, `clear_context`, `provider_for_session` and `context_for`, so AI state is tracked and never painted as a border or tab tint | required |
 | Prompt bar and tab context meter | `US4-1` | elapsed timer, context meter, dismiss/copy, `%` suffix | visual-E2E | `main.rs::TerminalView::build_prompt_model` → `prompt_bar::build_model` → `prompt_bar::render`; the tab suffix via `main.rs::TerminalView::sync_tab_context_suffix` → `tab_bar::context_suffix`, both fed by `ai_indicator::AiStateTracker::context_for` | required |
@@ -413,10 +413,10 @@ further requirements that are not reachable today.
 | Desktop notification dispatcher | `PO-9` | AI attention notifications | visual-E2E | `main.rs::TerminalView::start_notifications` → `notification_dispatcher::spawn_dispatcher` (the one D-Bus connection), gated by `notifications::NotificationCenter::on_ai_state_changed` against the live config and focus position; a reported click routes back to select the session's tab and raise the window — `tests/e2e/visual/notifications.sh` | required |
 | Server lifecycle management | `PO-10` | autostart, stale socket, staleness check | scripted-E2E | `main.rs::run_local_connection` → `server_lifecycle::connect_or_start_server`, which names a missing socket apart from a stale one and carries the diagnosis into the status line, then `server_lifecycle::connected_server_staleness` holds the connected server up against the installed binary — `tests/e2e/visual/server-lifecycle.sh` | required |
 
-**Reachability:** 24 of 29 rows name a live-path symbol; 3 are unwired and 2 are
-missing. The unwired three are pane dividers, the AI indicator's painted half
-and the workspace-notes hover preview; the missing two are server-upgrade
-reattach and the remote connect picker overlay. None of the five had a row
+**Reachability:** 25 of 29 rows name a live-path symbol; 2 are unwired and 2 are
+missing. The unwired two are the AI indicator's painted half and the
+workspace-notes hover preview; the missing two are server-upgrade reattach and
+the remote connect picker overlay. None of the original five had a row
 before 2026-07-27, so none was scored by the gate.
 
 ## Removed configuration keys
@@ -459,20 +459,20 @@ with them. They are the launch gate's metric — not the unit-test count.
 | Server messages | 59 | 59 | 0 | 0 |
 | Input and keybinding actions | 54 | 54 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
-| Spec behaviour requirements | 29 | 24 | 3 | 2 |
+| Spec behaviour requirements | 29 | 25 | 2 | 2 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **203** | **198** | **3** | **2** |
+| **Total** | **203** | **199** | **2** | **2** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **194 rows, of which 189 are
-reachable (97%)** and 5 are not. **1 of those 194** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **194 rows, of which 190 are
+reachable (98%)** and 4 are not. **1 of those 194** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **188 of 194**.
+the in-client figure is **189 of 194**.
 
-The five unreachable rows are all in the spec-behaviour table and all were
-invisible to the gate before 2026-07-27, because none of them had a row:
-server-upgrade reattach, the remote connect picker overlay, pane dividers, the
-AI indicator's painted half, and the workspace-notes hover preview.
+The four remaining unreachable rows are in the spec-behaviour table and were
+invisible to the gate before 2026-07-27, because none had a row: server-upgrade
+reattach, the remote connect picker overlay, the AI indicator's painted half,
+and the workspace-notes hover preview.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth

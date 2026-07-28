@@ -32,6 +32,8 @@ pub struct Divider {
     pub rect: Rect,
     /// The direction of the split that created this divider.
     pub direction: SplitDirection,
+    /// Parent split rect whose axis determines this divider's ratio.
+    pub parent_rect: Rect,
     /// First leaf pane in the first subtree (used for ratio adjustment).
     pub first_pane: PaneId,
 }
@@ -115,10 +117,10 @@ pub fn hit_test_divider(dividers: &[Divider], mouse_x: f32, mouse_y: f32) -> Opt
 }
 
 /// Create a [`DividerDrag`] from a divider and its parent viewport.
-pub fn start_drag(divider: &Divider, viewport: Rect) -> DividerDrag {
+pub fn start_drag(divider: &Divider, _viewport: Rect) -> DividerDrag {
     let (parent_extent, parent_origin) = match divider.direction {
-        SplitDirection::Horizontal => (viewport.width, viewport.x),
-        SplitDirection::Vertical => (viewport.height, viewport.y),
+        SplitDirection::Horizontal => (divider.parent_rect.width, divider.parent_rect.x),
+        SplitDirection::Vertical => (divider.parent_rect.height, divider.parent_rect.y),
     };
 
     DividerDrag {
@@ -156,7 +158,7 @@ fn collect_dividers_inner(node: &LayoutNode, rect: Rect, out: &mut Vec<Divider>)
     // The divider sits between the two sub-rects.
     let divider_rect = divider_rect_between(&r1, *direction);
     let first_pane = first_leaf_of(first);
-    out.push(Divider { rect: divider_rect, direction: *direction, first_pane });
+    out.push(Divider { rect: divider_rect, direction: *direction, parent_rect: rect, first_pane });
 
     // Recurse into children.
     collect_dividers_inner(first, r1, out);

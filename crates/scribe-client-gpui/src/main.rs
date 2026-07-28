@@ -47,6 +47,7 @@ use scribe_client_gpui::dialog::{
     DialogEvent, DialogOutcome, DialogView, DisallowedSchemeAction, DisallowedSchemeDialog,
     PasteConfirmationAction, PasteConfirmationDialog, UpdateAction, UpdateDialogKind,
 };
+use scribe_client_gpui::divider::{self, DividerDrag};
 use scribe_client_gpui::drag_drop::dropped_path_insertion;
 use scribe_client_gpui::input::{self, KeyInput, TerminalMode};
 use scribe_client_gpui::keybindings::{
@@ -667,6 +668,8 @@ struct NotificationSurfaces {
 struct PointerState {
     clicks: MouseClickState,
     drag: GridDrag,
+    /// Divider drag captured from the grid overlay.
+    divider_drag: Option<DividerDrag>,
     /// The button currently forwarded to the application, or `None` when no
     /// forwarded press is outstanding. Mode 1002 gates drag motion on it, and
     /// the reported Cb carries this exact button rather than a hardcoded Left.
@@ -689,6 +692,7 @@ impl Default for PointerState {
         Self {
             clicks: MouseClickState::new(),
             drag: GridDrag::Idle,
+            divider_drag: None,
             report_button: None,
             report_cell: None,
         }
@@ -3818,6 +3822,59 @@ impl TerminalView {
             .collect()
     }
 
+    /// Paint each live pane divider above the grids it separates.
+    fn render_dividers(&self, cx: &App) -> Vec<gpui::AnyElement> {
+        self.shell
+            .dividers(self.pane_viewport(), cx)
+            .into_iter()
+            .map(|divider| {
+                div()
+                    .absolute()
+                    .left(px(divider.rect.x))
+                    .top(px(divider.rect.y))
+                    .w(px(divider.rect.width))
+                    .h(px(divider.rect.height))
+                    .bg(surface(self.chrome.divider, self.opacity))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// Translate a window pointer position into the grid band's local space.
+    fn grid_local_position(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
+        let bounds = self.grid_area.get()?;
+        Some((
+            f32::from(position.x) - f32::from(bounds.origin.x),
+            f32::from(position.y) - f32::from(bounds.origin.y),
+        ))
+    }
+
+    /// Start a drag when the pointer lands in a divider's hit band.
+    fn press_divider(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some((x, y)) = self.grid_local_position(position) else { return false };
+        let viewport = self.pane_viewport();
+        let dividers = self.shell.dividers(viewport, cx);
+        let Some(divider) = divider::hit_test_divider(&dividers, x, y) else {
+            return false;
+        };
+        self.pointer.divider_drag = Some(divider::start_drag(divider, viewport));
+        true
+    }
+
+    /// Apply an in-flight divider drag and republish both panes' geometry.
+    fn drag_divider(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(drag) = self.pointer.divider_drag else { return false };
+        let Some((x, y)) = self.grid_local_position(position) else { return true };
+        let mouse_pos = match drag.direction {
+            SplitDirection::Horizontal => x,
+            SplitDirection::Vertical => y,
+        };
+        if self.shell.set_pane_ratio(drag.first_pane, divider::drag_ratio(&drag, mouse_pos), cx) {
+            self.after_layout_change(cx);
+        }
+        true
+    }
+
     /// Resolve a left press over the grid band.
     ///
     /// Three consumers in priority order. The overlay scrollbar goes first
@@ -3826,7 +3883,10 @@ impl TerminalView {
     /// client resolved its chrome in too. A mouse-tracking application comes
     /// next, and only when it declines does the press mean selection.
     fn press_grid(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        if self.press_scrollbar(event.position, cx) || self.forward_mouse_press(event) {
+        if self.press_divider(event.position, cx)
+            || self.press_scrollbar(event.position, cx)
+            || self.forward_mouse_press(event)
+        {
             return;
         }
         self.click_grid(event.position, cx);
@@ -3840,7 +3900,7 @@ impl TerminalView {
     /// claimed by the scrollbar anyway — before the motion falls through to
     /// mouse reporting and then to extending a selection.
     fn move_over_grid(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if self.drag_scrollbar(event.position, cx) {
+        if self.drag_divider(event.position, cx) || self.drag_scrollbar(event.position, cx) {
             return;
         }
         self.update_scrollbar_hover(event.position, cx);
@@ -3853,7 +3913,10 @@ impl TerminalView {
     /// Resolve a left release over the grid band, ending whichever gesture the
     /// matching press started.
     fn release_over_grid(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
-        if self.release_scrollbar(cx) || self.forward_mouse_release(event) {
+        if self.pointer.divider_drag.take().is_some()
+            || self.release_scrollbar(cx)
+            || self.forward_mouse_release(event)
+        {
             return;
         }
         self.finish_selection(cx);
@@ -5616,12 +5679,14 @@ impl TerminalView {
     fn render_grid(&mut self, ime: ImePaint, cx: &mut Context<Self>) -> gpui::AnyElement {
         let focused = self.sync_split_scroll();
         let panes = self.render_panes(focused, ime, cx);
+        let dividers = self.render_dividers(cx);
         div()
             .flex_1()
             .relative()
             .bg(surface(self.terminal_colors.background, self.opacity))
             .child(self.grid_area_probe(cx))
             .children(panes)
+            .children(dividers)
             // The wheel is claimed by the application when it tracks the mouse,
             // by the alternate screen's 1007 fallback, or — the ordinary case —
             // by this client's own scrollback viewport.
