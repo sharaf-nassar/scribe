@@ -210,6 +210,12 @@ Under `SCRIBE_SHARED_PANE=1` the entrypoint instead seeds `[remote] sharing_mode
 
 The entrypoint gates on the client's own `attaching to session` line before running the test body, so a script never drives a window that is still an empty grid — a state no screenshot can distinguish from an idle pane.
 
+### Server-upgrade reattach oracle
+
+`tests/e2e/visual/server-upgrade-reattach.sh` proves the running GPUI process redials after a real `scribe-server --upgrade` handoff and reattaches its rendered session without a client relaunch.
+
+The shared-pane rig keeps the test daemon and visible GPUI window on one session. The script records initial topology and attach log counts, upgrades the live server through [[crates/scribe-test/src/server.rs#upgrade]], then requires both counts to advance while the original `SCRIBE_CLIENT_PID` and `Scribe` window remain alive. A post-handoff command confirms the preserved session still accepts output after the replacement connection completed `Hello` / `ListSessions` / `AttachSessions`.
+
 ### Color emoji renders in color
 
 `tests/e2e/visual/color-emoji.sh` proves color emoji render in color rather than as monochrome/tinted glyphs — the US3 headline parity item promoted to an automated visual check.

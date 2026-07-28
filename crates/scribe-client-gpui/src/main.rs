@@ -6134,7 +6134,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         out_tx,
         out_rx,
         in_tx,
-        in_rx,
+        in_rx: Some(in_rx),
         size: terminal_size,
     });
 
@@ -6285,7 +6285,7 @@ struct IpcThread {
     out_tx: UnboundedSender<ClientMessage>,
     out_rx: UnboundedReceiver<ClientMessage>,
     in_tx: UnboundedSender<InboundEvent>,
-    in_rx: UnboundedReceiver<InboundEvent>,
+    in_rx: Option<UnboundedReceiver<InboundEvent>>,
     size: TerminalSize,
 }
 
@@ -6302,21 +6302,77 @@ fn start_ipc_thread(ctx: IpcThread) {
                 return;
             }
         };
-        runtime.block_on(async move {
-            let status = Arc::clone(&ctx.shared.status);
-            let generation = Arc::clone(&ctx.shared.generation);
-            let connected = Arc::clone(&ctx.shared.connected);
-            if let Err(error) = run_connection(ctx).await {
-                connected.store(false, Ordering::Release);
+        runtime.block_on(async move { supervise_connection(ctx).await });
+    });
+}
+
+/// Keep a local client attached across a server handoff.
+///
+/// A hot upgrade deliberately closes every old stream after the replacement
+/// listener owns the socket. The reader therefore returns normally from the
+/// user's perspective, but it must not be the lifetime of the window's IPC
+/// thread: the next dial repeats the protocol handshake and lets `SessionList`
+/// rebuild the existing topology. LAN and tailnet dials retain their explicit
+/// one-shot failure contract, because retrying a rejected peer would leave a
+/// window indefinitely aimed at the wrong machine.
+// @lat: [[client#GPUI Client Spike#Session Lifecycle#Server upgrade reconnect]]
+async fn supervise_connection(mut ctx: IpcThread) {
+    const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(100);
+    const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+    let retry_local =
+        lan_dial::target_from_env().is_none() && remote_handshake::target_from_env().is_none();
+    let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
+    let Some(in_rx) = ctx.in_rx.take() else {
+        tracing::error!("IPC inbound receiver was already consumed");
+        set_status(
+            &ctx.shared.status,
+            &ctx.shared.generation,
+            "IPC inbound receiver unavailable".to_owned(),
+        );
+        return;
+    };
+    spawn_drain(
+        in_rx,
+        Arc::clone(&ctx.shared.panes),
+        Arc::clone(&ctx.shared.generation),
+        Arc::clone(&ctx.shared.prompt_marks),
+    );
+
+    loop {
+        match run_connection(&mut ctx).await {
+            Ok(()) => tracing::info!("server connection closed"),
+            Err(error) => {
                 // Logged as well as published: the status line is one line wide
                 // and the reason a connect failed — a stale socket, a refused
                 // autostart, a rejected dial — is the first thing anyone
                 // diagnosing a dead window needs, long after the window is gone.
                 tracing::warn!(%error, "server connection failed");
-                set_status(&status, &generation, format!("server connection failed: {error}"));
+                if !retry_local {
+                    ctx.shared.connected.store(false, Ordering::Release);
+                    set_status(
+                        &ctx.shared.status,
+                        &ctx.shared.generation,
+                        format!("server connection failed: {error}"),
+                    );
+                    return;
+                }
             }
-        });
-    });
+        }
+
+        if !retry_local {
+            return;
+        }
+
+        ctx.shared.connected.store(false, Ordering::Release);
+        set_status(
+            &ctx.shared.status,
+            &ctx.shared.generation,
+            format!("server connection lost; retrying in {} ms", reconnect_delay.as_millis()),
+        );
+        tokio::time::sleep(reconnect_delay).await;
+        reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
+    }
 }
 
 /// Establish this client's one connection and serve it until it closes.
@@ -6333,7 +6389,7 @@ fn start_ipc_thread(ctx: IpcThread) {
 /// LAN wins a double-set: it is the preferred transport for the same machine
 /// (research C3), so a peer reachable both ways is dialed over the encrypted,
 /// device-approved link rather than the tailnet.
-async fn run_connection(ctx: IpcThread) -> Result<(), String> {
+async fn run_connection(ctx: &mut IpcThread) -> Result<(), String> {
     if let Some((host, port)) = lan_dial::target_from_env() {
         return run_lan_connection(ctx, host, port).await;
     }
@@ -6352,7 +6408,7 @@ async fn run_connection(ctx: IpcThread) -> Result<(), String> {
 /// summaries before the first frame paints, and it leaves the session connection
 /// as the last socket this process opened, which is what the E2E wire tap
 /// addresses the client by.
-async fn run_local_connection(ctx: IpcThread) -> Result<(), String> {
+async fn run_local_connection(ctx: &mut IpcThread) -> Result<(), String> {
     let probes = Box::new(LocalProbes {
         lan_env: probe_lan_env().await,
         remote_env: probe_remote_env().await,
@@ -6391,7 +6447,7 @@ async fn run_local_connection(ctx: IpcThread) -> Result<(), String> {
 /// falling back to the local server would silently attach the user to the wrong
 /// machine. The typed refusal is published to the window before the process
 /// gives up, so the last thing on screen names why (UX-002).
-async fn run_remote_connection(ctx: IpcThread, host: String, port: u16) -> Result<(), String> {
+async fn run_remote_connection(ctx: &mut IpcThread, host: String, port: u16) -> Result<(), String> {
     let remote = Arc::clone(&ctx.shared.remote);
     let status = Arc::clone(&ctx.shared.status);
     let generation = Arc::clone(&ctx.shared.generation);
@@ -6455,7 +6511,7 @@ fn publish_remote_status(
 /// Every failure short of acceptance is terminal for this process: the client
 /// was launched to control that peer, so falling back to the local server would
 /// silently attach the user to the wrong machine.
-async fn run_lan_connection(ctx: IpcThread, host: String, port: u16) -> Result<(), String> {
+async fn run_lan_connection(ctx: &mut IpcThread, host: String, port: u16) -> Result<(), String> {
     let lan = Arc::clone(&ctx.shared.lan);
     let status = Arc::clone(&ctx.shared.status);
     let generation = Arc::clone(&ctx.shared.generation);
@@ -6554,9 +6610,9 @@ enum Transport {
 /// Shared by both transports so the LAN path can never drift from the local one
 /// in what it announces or which state it wires up.
 async fn serve_connection<R, W>(
-    ctx: IpcThread,
+    ctx: &mut IpcThread,
     reader: R,
-    writer: W,
+    mut writer: W,
     transport: Transport,
 ) -> Result<(), String>
 where
@@ -6580,8 +6636,12 @@ where
     if let Some(window_id) = claim_window {
         tracing::info!(%window_id, takeover, "claiming an existing window");
     }
-    ctx.out_tx
-        .send(ClientMessage::Hello {
+    // Write the connection handshake directly before draining the shared
+    // outbound queue. A reconnect may have queued UI work while no stream was
+    // alive; allowing that work ahead of `Hello` would violate the protocol.
+    write_message(
+        &mut writer,
+        &ClientMessage::Hello {
             window_id: claim_window,
             // Spec 010 C7: this client owns a host clipboard and a confirmation
             // modal, so it opts into OSC 52 gating. With the bit clear the
@@ -6589,50 +6649,57 @@ where
             // Clipboard* frame, which is what made the whole surface dead.
             clipboard_gating: true,
             takeover,
-        })
-        .map_err(|_| "writer channel closed".to_owned())?;
-    ctx.out_tx.send(ClientMessage::ListSessions).map_err(|_| "writer channel closed".to_owned())?;
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    write_message(&mut writer, &ClientMessage::ListSessions)
+        .await
+        .map_err(|error| error.to_string())?;
 
-    tokio::spawn(run_writer(writer, ctx.out_rx));
-    spawn_drain(
-        ctx.in_rx,
-        Arc::clone(&ctx.shared.panes),
-        Arc::clone(&ctx.shared.generation),
-        Arc::clone(&ctx.shared.prompt_marks),
-    );
-
-    let reader_ctx = ReaderCtx {
-        panes: ctx.shared.panes,
-        attached: ctx.shared.attached,
-        status: ctx.shared.status,
-        generation: ctx.shared.generation,
-        active_session: ctx.shared.active_session,
-        ai: ctx.shared.ai,
-        chrome_metadata: ctx.shared.chrome_metadata,
-        tabs: ctx.shared.tabs,
-        session_list_seen: ctx.shared.session_list_seen,
-        share: ctx.shared.share,
-        update: ctx.shared.update,
-        lifecycle: ctx.shared.lifecycle,
-        bells: ctx.shared.bells,
-        ai_notices: ctx.shared.ai_notices,
-        find: ctx.shared.find,
-        lan: ctx.shared.lan,
-        prompt_marks: ctx.shared.prompt_marks,
-        workspaces: ctx.shared.workspaces,
-        notes: ctx.shared.notes,
-        clipboard: ctx.shared.clipboard,
-        remote: ctx.shared.remote,
-        out_tx: ctx.out_tx,
-        in_tx: ctx.in_tx,
-        sink: ctx.sink,
-        size: ctx.size,
-    };
+    let reader_ctx = reader_ctx(ctx);
     if let Transport::Local(probes) = transport {
         adopt_lan_surface(&reader_ctx, probes.lan_env);
         adopt_remote_surface(&reader_ctx, probes.remote_env);
     }
-    run_reader(reader, reader_ctx).await
+    tokio::select! {
+        result = run_reader(reader, reader_ctx) => result,
+        result = run_writer(writer, &mut ctx.out_rx) => result,
+    }
+}
+
+/// Clone the durable per-window handles for one connection reader.
+///
+/// The supervisor keeps the channels themselves so a writer that stops during
+/// an upgrade can resume draining the same ordered queue after the redial.
+fn reader_ctx(ctx: &IpcThread) -> ReaderCtx {
+    ReaderCtx {
+        panes: Arc::clone(&ctx.shared.panes),
+        attached: Arc::clone(&ctx.shared.attached),
+        status: Arc::clone(&ctx.shared.status),
+        generation: Arc::clone(&ctx.shared.generation),
+        active_session: Arc::clone(&ctx.shared.active_session),
+        ai: Arc::clone(&ctx.shared.ai),
+        chrome_metadata: Arc::clone(&ctx.shared.chrome_metadata),
+        tabs: Arc::clone(&ctx.shared.tabs),
+        session_list_seen: Arc::clone(&ctx.shared.session_list_seen),
+        share: Arc::clone(&ctx.shared.share),
+        update: Arc::clone(&ctx.shared.update),
+        lifecycle: Arc::clone(&ctx.shared.lifecycle),
+        bells: Arc::clone(&ctx.shared.bells),
+        ai_notices: Arc::clone(&ctx.shared.ai_notices),
+        find: Arc::clone(&ctx.shared.find),
+        lan: Arc::clone(&ctx.shared.lan),
+        prompt_marks: Arc::clone(&ctx.shared.prompt_marks),
+        workspaces: Arc::clone(&ctx.shared.workspaces),
+        notes: Arc::clone(&ctx.shared.notes),
+        clipboard: Arc::clone(&ctx.shared.clipboard),
+        remote: Arc::clone(&ctx.shared.remote),
+        out_tx: ctx.out_tx.clone(),
+        in_tx: ctx.in_tx.clone(),
+        sink: ctx.sink.clone(),
+        size: ctx.size,
+    }
 }
 
 /// Ask this machine's own server for its LAN environment on a transient socket.
@@ -6702,16 +6769,19 @@ fn adopt_remote_surface(ctx: &ReaderCtx, remote_env: Option<ServerMessage>) {
 }
 
 /// Drains the IPC-writer channel to the socket in FIFO order.
-async fn run_writer<W>(mut writer: W, mut out_rx: UnboundedReceiver<ClientMessage>)
+async fn run_writer<W>(
+    mut writer: W,
+    out_rx: &mut UnboundedReceiver<ClientMessage>,
+) -> Result<(), String>
 where
     W: AsyncWriteExt + Unpin,
 {
     while let Some(message) = out_rx.recv().await {
         if let Err(error) = write_message(&mut writer, &message).await {
-            tracing::warn!(%error, "IPC writer task stopped");
-            return;
+            return Err(format!("IPC writer stopped: {error}"));
         }
     }
+    Err("IPC writer channel closed".to_owned())
 }
 
 /// Per-session synchronized-output frame queues shared between the coalescing
@@ -7583,7 +7653,7 @@ fn on_session_list(
     // reads this to tell "the server has nothing" from "the server has not
     // answered yet", and only the former may replay a persisted snapshot.
     ctx.session_list_seen.store(true, Ordering::Release);
-    tracing::debug!(
+    tracing::info!(
         sessions = registry.len(),
         workspaces = registry.reconnect_topology().len(),
         "rebuilt reconnect topology"

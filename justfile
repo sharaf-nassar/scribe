@@ -304,6 +304,12 @@ e2e-visual-drag-drop:
 e2e-visual-server-lifecycle:
     docker run --rm --gpus all -e TEST_TIMEOUT=240 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/server-lifecycle.sh
 
+# Run the live server-upgrade reattach oracle. It keeps the original GPUI
+# process alive through `scribe-server --upgrade` and asserts that it rebuilds
+# its session topology before accepting post-handoff output.
+e2e-visual-server-upgrade-reattach:
+    docker run --rm --gpus all -e TEST_TIMEOUT=180 -e SCRIBE_SHARED_PANE=1 -v ./tests/e2e:/tests -v ./test-output:/output scribe-test-visual /tests/visual/server-upgrade-reattach.sh
+
 # Run the IME/preedit visual E2E. SCRIBE_IME=1 starts ibus with an XIM server
 # and exports XMODIFIERS before the client launches, so a real input method
 # owns the keyboard; the shared-pane rig is what lets `scribe-test` prove the

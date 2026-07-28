@@ -393,7 +393,7 @@ further requirements that are not reachable today.
 | Sync-update frames (CSI ?2026) | `US1-7`, `PO-6` | tear-free output bursts | scripted-E2E | `main.rs::forward_output` → `main.rs::forward_inbound` → `main.rs::spawn_drain` → `main.rs::apply_pane_op` → `sync_frames::SyncFrameQueue`, committed by `sync_frames::drain_all_committed` and expiry-flushed by `main.rs::run_sync_expiry` → `main.rs::flush_expired_sync` | required |
 | File drag-and-drop | `US1-8` | dropped path insertion | visual-E2E | `main.rs::TerminalView::handle_dropped_paths`, registered as the window root's `ExternalPaths` drop handler → `drag_drop::dropped_path_insertion` quoted for the shell `ChromeMetadata` recorded for that session → `send_key_bytes` — `tests/e2e/visual/drag-drop.sh` | required |
 | Cold-restart restore | `US2-3` | window, workspace, tab and pane replay | visual-E2E | `main.rs::ColdStart::resolve` → `restore_state::RestoreStore::claim_first_window` plus the `--restore-child` fan-out, replayed by `main.rs::TerminalView::poll_restore` → `restore_replay::prepare_replay`; the snapshot is written back by `TerminalView::flush_snapshot_now` → `RestoreStore::save_window` / `RestoreStore::upsert_index` — `tests/e2e/visual/cold-restart.sh` | required |
-| Server-upgrade reattach | `US2-4` | zero-downtime `--upgrade` handoff | scripted-E2E | — (missing) `main.rs::start_ipc_thread` awaits `main.rs::run_connection` exactly once and, when it returns, only publishes a status line; no path redials, so a server handoff leaves the window attached to nothing. `tests/e2e/visual/reconnect.sh` relaunches the *client process* and therefore does not cover this. | required |
+| Server-upgrade reattach | `US2-4` | zero-downtime `--upgrade` handoff | scripted-E2E | `main.rs::start_ipc_thread` → `main.rs::supervise_connection` → `main.rs::run_connection`, which redials local streams with bounded backoff and writes `Hello` / `ListSessions` before resuming the shared writer; `main.rs::on_session_list` rebuilds the topology — `tests/e2e/visual/server-upgrade-reattach.sh` drives a live server upgrade without restarting the GPUI process. | required |
 | Colour emoji in the grid | `US3-1` | colour emoji glyphs | visual-E2E | `terminal_element.rs::TerminalElement::paint_grid` → `GridFont::fallbacks`, which names `Noto Color Emoji` after the Nerd Font entries on every `TextRun` handed to `shape_line` — `tests/e2e/visual/color-emoji.sh` | required |
 | Cell text decorations | `US3-4` | underline, undercurl, strikethrough | visual-E2E | `terminal_element.rs::TerminalElement::paint_grid` builds each `TextRun` with `UnderlineStyle { wavy: Flags::UNDERCURL }` from `Flags::ALL_UNDERLINES` and `StrikethroughStyle` from `Flags::STRIKEOUT`. Fidelity gap flagged: gpui's `UnderlineStyle` has no double-underline variant, so `Flags::DOUBLE_UNDERLINE` currently paints a single rule | required |
 | Overlay chrome polish | `US3-5` | rounded corners, drop shadow, hover/pressed | visual-E2E | `command_palette::CommandPaletteView::render`, `dialog::DialogView::render`, `context_menu::ContextMenuView::render` and `tooltip::tooltip_element`, each applying `.rounded_*()` + `.shadow_*()` on the live overlay layer — `tests/e2e/visual/overlays.sh`, `tests/e2e/visual/dialogs.sh` | required |
@@ -413,9 +413,9 @@ further requirements that are not reachable today.
 | Desktop notification dispatcher | `PO-9` | AI attention notifications | visual-E2E | `main.rs::TerminalView::start_notifications` → `notification_dispatcher::spawn_dispatcher` (the one D-Bus connection), gated by `notifications::NotificationCenter::on_ai_state_changed` against the live config and focus position; a reported click routes back to select the session's tab and raise the window — `tests/e2e/visual/notifications.sh` | required |
 | Server lifecycle management | `PO-10` | autostart, stale socket, staleness check | scripted-E2E | `main.rs::run_local_connection` → `server_lifecycle::connect_or_start_server`, which names a missing socket apart from a stale one and carries the diagnosis into the status line, then `server_lifecycle::connected_server_staleness` holds the connected server up against the installed binary — `tests/e2e/visual/server-lifecycle.sh` | required |
 
-**Reachability:** 27 of 29 rows name a live-path symbol; 0 are unwired and 2 are
-missing: server-upgrade reattach and the remote connect picker overlay. None of
-the original five had a row before 2026-07-27, so none was scored by the gate.
+**Reachability:** 28 of 29 rows name a live-path symbol; 0 are unwired and 1 is
+missing: the remote connect picker overlay. None of the original five had a row
+before 2026-07-27, so none was scored by the gate.
 
 ## Removed configuration keys
 
@@ -457,18 +457,18 @@ with them. They are the launch gate's metric — not the unit-test count.
 | Server messages | 59 | 59 | 0 | 0 |
 | Input and keybinding actions | 54 | 54 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
-| Spec behaviour requirements | 29 | 27 | 0 | 2 |
+| Spec behaviour requirements | 29 | 28 | 0 | 1 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **203** | **201** | **0** | **2** |
+| **Total** | **203** | **202** | **0** | **1** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **194 rows, of which 192 are
-reachable (99%)** and 2 are not. **1 of those 194** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **194 rows, of which 193 are
+reachable (99%)** and 1 are not. **1 of those 194** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **191 of 194**.
+the in-client figure is **192 of 194**.
 
-The two unreachable rows are in the spec-behaviour table: server-upgrade
-reattach and the remote connect picker overlay.
+The one unreachable row is the remote connect picker overlay in the
+spec-behaviour table.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth
