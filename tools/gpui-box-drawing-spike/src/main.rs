@@ -1,6 +1,6 @@
 //! A GPUI paint-quad overlay proof for Scribe's procedural box drawing.
 
-#[path = "../../../crates/scribe-renderer/src/box_drawing.rs"]
+#[path = "../../../crates/scribe-client/src/box_drawing.rs"]
 mod box_drawing;
 
 use gpui::{

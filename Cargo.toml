@@ -83,7 +83,7 @@ unix-ancillary = "0.1"
 x11rb = { version = "0.13", default-features = false }
 raw-window-handle = "0.6"
 
-# GPU / windowing
+# GPUI client
 gpui = { git = "https://github.com/zed-industries/zed.git", rev = "f96212f2c50f54d93712fa130d6226b1ce7d76b5", default-features = false, features = [
   "font-kit",
   "x11",
@@ -95,27 +95,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "f962
   "wayland",
 ] }
 gpui_tokio = { git = "https://github.com/zed-industries/zed.git", rev = "f96212f2c50f54d93712fa130d6226b1ce7d76b5" }
-wgpu = { version = "29.0", default-features = false, features = [
-  "vulkan",
-  "gles",
-  "metal",
-  "wgsl",
-  "std",
-] }
-winit = "0.30"
-pollster = "0.4"
-cosmic-text = { version = "0.17", features = [
-  "shape-run-cache",
-  "monospace_fallback",
-] }
-bytemuck = { version = "1", features = ["derive"] }
-png = "0.17"
-
-# Webview / settings
-wry = "0.55"
-rust-embed = "8"
-tao = "0.33"
-signal-hook = "0.3"
+# Settings and updates
 sysinfo = "0.35"
 reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
@@ -159,9 +139,7 @@ x509-parser = "0.18"
 # Workspace crates
 scribe-common = { path = "crates/scribe-common" }
 scribe-pty = { path = "crates/scribe-pty" }
-scribe-renderer = { path = "crates/scribe-renderer" }
 scribe-server = { path = "crates/scribe-server" }
-scribe-settings = { path = "crates/scribe-settings" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

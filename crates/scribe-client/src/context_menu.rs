@@ -2,7 +2,7 @@
 //!
 //! The winit client built the menu's item list from the right-click context
 //! (selection state, a hovered heuristic URL, an OSC 8 URI, a file path, and any
-//! smart-selection actions), painted it as `CellInstance` quads, and hit-tested
+//! smart-selection actions), painted it as GPU quads, and hit-tested
 //! clicks against cached item rects. This port keeps the pure item-assembly logic
 //! — the fixed copy/paste/select-all head, the OSC 8 "Open URL" precedence and
 //! "Copy hyperlink address" entry (spec 009 FR-003 / FR-007), the appended file

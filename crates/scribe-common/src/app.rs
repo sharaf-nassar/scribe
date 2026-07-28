@@ -34,7 +34,7 @@ impl AppIdentity {
     #[must_use]
     pub fn detect_from_path(path: &Path) -> Self {
         let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
-        if matches!(stem, "scribe-dev" | "scribe-dev-server" | "scribe-dev-settings")
+        if matches!(stem, "scribe-dev" | "scribe-dev-server")
             || path.ancestors().any(|ancestor| {
                 ancestor
                     .file_name()
@@ -90,14 +90,6 @@ impl AppIdentity {
         match self.flavor {
             AppFlavor::Stable => "scribe-server",
             AppFlavor::Dev => "scribe-dev-server",
-        }
-    }
-
-    #[must_use]
-    pub const fn settings_binary_name(self) -> &'static str {
-        match self.flavor {
-            AppFlavor::Stable => "scribe-settings",
-            AppFlavor::Dev => "scribe-dev-settings",
         }
     }
 

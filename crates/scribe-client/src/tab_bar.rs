@@ -1,7 +1,7 @@
 //! Pure tab-bar logic for the GPUI titlebar, ported from the legacy
 //! `scribe-client` GPU tab bar.
 //!
-//! The winit client emitted `CellInstance` quads into a shared glyph buffer; the
+//! The winit client emitted GPU quads into a shared glyph buffer; the
 //! GPUI rebuild instead renders the tab bar as `div` elements inside the custom
 //! [`crate::titlebar`]. This module keeps the display-independent pieces that
 //! survive that change — the attention-flash decay envelope, the fixed-width

@@ -1,7 +1,7 @@
 //! Command palette overlay for the GPUI client rebuild.
 //!
 //! The winit client split the palette across two files: a tiny `CommandPalette`
-//! state struct (query, selection, open flag) plus a `CellInstance` painter, and
+//! state struct (query, selection, open flag) plus a GPU painter, and
 //! the entry/action machinery in `main.rs` — the base action list, the profile
 //! rows, the conditional "update" row, and `execute_automation_action` routing.
 //! This port folds all of that into one GPUI [`CommandPaletteView`] entity: the

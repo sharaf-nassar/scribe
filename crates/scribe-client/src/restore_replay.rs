@@ -29,7 +29,7 @@ use crate::workspace_layout::WindowLayout;
 
 /// Terminal grid dimensions (columns × rows) for a pane.
 ///
-/// The legacy port lived in `scribe-renderer`, on which the GPUI client does
+/// The legacy port lived in a retired renderer, on which the GPUI client does
 /// not depend, so it is redefined here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GridSize {

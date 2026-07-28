@@ -1,6 +1,6 @@
 //! Per-pane AI prompt bar for the GPUI client.
 //!
-//! The winit client rendered the prompt bar by emitting `CellInstance` quads
+//! The winit client rendered the prompt bar by emitting GPU quads
 //! with hand-placed glyph geometry (`compute_prompt_bar_layout` and its cluster
 //! math). The GPUI rebuild keeps the **display-independent** pieces byte-for-byte
 //! — the elapsed-timer formatting and its freeze-on-AI-stop semantics, the

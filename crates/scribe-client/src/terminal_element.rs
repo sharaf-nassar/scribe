@@ -48,7 +48,7 @@ const LINE_HEIGHT_RATIO: f32 = 1.35;
 const CELL_WIDTH_RATIO: f32 = 0.6;
 
 /// The glyph fallback chain, in the order the legacy cosmic-text atlas used
-/// (`SCRIBE_COMMON_FALLBACKS` in `crates/scribe-renderer/src/atlas.rs`).
+/// (the legacy atlas's `SCRIBE_COMMON_FALLBACKS`).
 ///
 /// Nerd Font symbol families come first so a powerline or devicon codepoint
 /// resolves to the icon the user installed rather than to whatever generic
