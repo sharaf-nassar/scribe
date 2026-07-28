@@ -50,9 +50,19 @@ Crash your terminal, lose every shell. Update it, same story. Scribe splits the 
 
 ### Prerequisites
 
-- Rust 1.95+
-- Linux: `libvulkan-dev`, Wayland/X11 development headers
+- Rust 1.95.0 or newer.
+- Linux (Debian/Ubuntu):
+  ```bash
+  sudo apt install clang libfontconfig-dev libssl-dev libvulkan1 \
+    libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libzstd-dev
+  ```
+  The client needs a Vulkan ICD at runtime; `mesa-vulkan-drivers` supplies
+  Lavapipe when no hardware driver is available.
 - macOS: Xcode Command Line Tools
+
+Debug builds optimize GPUI at `opt-level = 3` so local client iteration stays
+responsive. This package-specific setting does not change optimization for
+Scribe's own debug code.
 
 ### Build from source
 
@@ -61,6 +71,9 @@ git clone https://github.com/scribe-terminal/scribe
 cd scribe
 just build-release
 ```
+
+Use `just build` for a debug build, `just check` for a quicker type check, and
+`just ready` for the formatter, lints, and workspace tests.
 
 ### Run
 
@@ -257,8 +270,6 @@ crates/
 ├── scribe-common     # Shared types: protocol, config, themes, IDs
 ├── scribe-pty        # PTY I/O, OSC interceptor, metadata parser
 ├── scribe-server     # Session/workspace management, IPC, handoff
-├── scribe-client     # GPU client: winit + wgpu, pane layout, input
-├── scribe-renderer   # GPU pipeline: glyph atlas, color palette, wgpu
 ├── scribe-client     # GPUI terminal and settings windows
 ├── scribe-cli        # Headless test CLI: raw stdin/stdout over IPC
 └── scribe-test       # E2E test harness with subcommands
