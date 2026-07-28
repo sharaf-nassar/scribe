@@ -117,13 +117,17 @@ use scribe_client_gpui::workspace_notes::WorkspaceNotesStore;
 use scribe_client_gpui::workspace_notes_modal::{
     WorkspaceNotesModalAction, WorkspaceNotesModalColors, WorkspaceNotesModalView,
 };
+use scribe_client_gpui::workspace_notes_preview::{
+    MAX_PREVIEW_ROWS, WorkspaceNotesPreviewAction, WorkspaceNotesPreviewColors,
+    WorkspaceNotesPreviewView,
+};
 use scribe_client_gpui::x11_focus::X11FocusGuard;
 use scribe_client_gpui::zoom::ZoomState;
 use scribe_client_gpui::{
     smart_selection::CompiledSmartSelection,
     tab_bar::{TabBarColors, context_suffix},
     tab_session::{TabEntry, TabSessions},
-    titlebar::{TitlebarEvent, TitlebarView},
+    titlebar::{TITLEBAR_HEIGHT, TitlebarEvent, TitlebarView},
 };
 use scribe_common::ai_state::{AiProvider, AiState};
 use scribe_common::theme::ChromeColors;
@@ -679,6 +683,14 @@ struct PointerState {
     report_cell: Option<(u16, u16)>,
 }
 
+/// The transient titlebar-hover notes surface and the cache version it shows.
+#[derive(Default)]
+struct WorkspaceNotesPreviewSurface {
+    view: Option<Entity<WorkspaceNotesPreviewView>>,
+    workspace_id: Option<WorkspaceId>,
+    adopted: u64,
+}
+
 impl ClipboardSurfaces {
     /// Open a live host clipboard handle around an already-subscribed paste
     /// gate, with no OSC 52 prompt in flight.
@@ -798,6 +810,8 @@ struct TerminalView {
     update_dialog_kind: Option<UpdateDialogKind>,
     /// The per-workspace notes modal overlay, present only while open.
     workspace_notes_modal: Option<Entity<WorkspaceNotesModalView>>,
+    /// The hover preview anchored to the titlebar's notes affordance.
+    workspace_notes_preview: WorkspaceNotesPreviewSurface,
     /// The `WorkspaceNotesStore` version the open modal is already showing, so
     /// a redraw only re-hydrates it when the reader has folded in a newer
     /// snapshot or change broadcast.
@@ -952,9 +966,8 @@ impl TerminalView {
         let WindowSeed { terminal_size, restored } = seed;
         let bounds_observer = Self::start_geometry_tracking(window, cx);
         let (x11_focus, x11_focus_task) = Self::start_x11_focus_guard(window, cx);
-        // The focus observer is registered unconditionally: reporting focus to
-        // the server is a protocol obligation on every backend, and the X11
-        // guard is only one of the two things an activation change drives.
+        // The focus observer is unconditional: the X11 guard is only one
+        // thing an activation change drives.
         let activation_observer = cx
             .observe_window_activation(window, |view, window, ctx| view.on_activation(window, ctx));
         let (bell, bell_subscription) = Self::start_bell_gate(window, cx);
@@ -963,8 +976,7 @@ impl TerminalView {
         // saved after this point reaches the window without a restart.
         let config = ConfigRuntime::start();
         let notifications = Self::start_notifications(&shared, &config, window, cx);
-        let (lifecycle_task, refresh_task, config_task) =
-            Self::start_drivers(Arc::clone(&shared.generation), config.signal(), cx);
+        let drivers = Self::start_drivers(Arc::clone(&shared.generation), config.signal(), cx);
         let (status_colors, terminal_colors, scrollbar_style) = Self::theme_palettes(&config);
         let chrome = config.config().chrome;
         let opacity = clamp_opacity(config.opacity());
@@ -1019,6 +1031,7 @@ impl TerminalView {
             dialog: None,
             update_dialog_kind: None,
             workspace_notes_modal: None,
+            workspace_notes_preview: WorkspaceNotesPreviewSurface::default(),
             workspace_notes_adopted: 0,
             pending_osc8_uri: None,
             pending_lan_approval: None,
@@ -1030,10 +1043,10 @@ impl TerminalView {
             bell,
             notifications,
             last_window_list_poll: Instant::now(),
-            _refresh_task: refresh_task,
-            _config_task: config_task,
+            _refresh_task: drivers.1,
+            _config_task: drivers.2,
             _x11_focus_task: x11_focus_task,
-            _lifecycle_task: lifecycle_task,
+            _lifecycle_task: drivers.0,
             _activation_observer: activation_observer,
             _bell_subscription: bell_subscription,
             restore: RestoreRuntime::new(restored),
@@ -1234,6 +1247,9 @@ impl TerminalView {
         });
         cx.subscribe(&bar, |this, _bar, event: &TitlebarEvent, ctx| match event {
             TitlebarEvent::OpenSettings => this.open_or_focus_settings(ctx),
+            TitlebarEvent::WorkspaceNotesHover(hovered) => {
+                this.set_workspace_notes_preview(*hovered, ctx);
+            }
             // The tab-strip and window-control events come from the same view
             // but are their own reachability rows, outside this entry point.
             // They are named rather than folded into a `_` arm so a new
@@ -4639,6 +4655,7 @@ impl TerminalView {
     /// against real notes. The reply lands on the reader thread and is folded
     /// in by [`Self::sync_workspace_notes`] on the next redraw.
     fn open_workspace_notes_modal(&mut self, cx: &mut Context<Self>) {
+        self.workspace_notes_preview = WorkspaceNotesPreviewSurface::default();
         self.command_palette = None;
         self.context_menu = None;
         let Some(workspace_id) = self.notes_workspace_id(cx) else {
@@ -4679,6 +4696,63 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Show or hide the compact notes preview bound to the focused workspace.
+    ///
+    /// The titlebar owns the hover affordance, while this shell owns the
+    /// server-backed data and the preview entity. Keeping that boundary makes
+    /// the view a normal overlay: opening the modal clears it, and every hover
+    /// begins with a fresh `WorkspaceNotesGet` instead of inventing local data.
+    fn set_workspace_notes_preview(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        if !hovered {
+            if self.workspace_notes_preview.view.take().is_some() {
+                self.workspace_notes_preview.workspace_id = None;
+                cx.notify();
+            }
+            return;
+        }
+        if self.workspace_notes_modal.is_some() || self.workspace_notes_preview.view.is_some() {
+            return;
+        }
+        let Some(workspace_id) = self.notes_workspace_id(cx) else {
+            return;
+        };
+        let (summaries, total_count, adopted) = self.shared.notes.lock().map_or_else(
+            |_| (Vec::new(), 0, 0),
+            |store| {
+                let (summaries, total_count) =
+                    store.hover_summaries(workspace_id, MAX_PREVIEW_ROWS, 56);
+                (summaries, total_count, store.version())
+            },
+        );
+        let colors = WorkspaceNotesPreviewColors::from(&self.chrome);
+        let preview = cx.new(|cx| {
+            let mut view = WorkspaceNotesPreviewView::new(colors);
+            view.set_summaries(summaries, total_count, cx);
+            view
+        });
+        cx.subscribe(&preview, move |this, _preview, action, ctx| match action {
+            WorkspaceNotesPreviewAction::OpenEditor => this.open_workspace_notes_modal(ctx),
+            WorkspaceNotesPreviewAction::ArchiveNote(note_id) => {
+                this.send_workspace_notes_mutation(
+                    scribe_common::protocol::WorkspaceNotesMutation::ArchiveNote {
+                        workspace_id,
+                        note_id: note_id.clone(),
+                        reason: ArchiveReason::Done,
+                    },
+                );
+            }
+            WorkspaceNotesPreviewAction::FocusEditor => {}
+        })
+        .detach();
+        self.workspace_notes_preview.view = Some(preview);
+        self.workspace_notes_preview.workspace_id = Some(workspace_id);
+        self.workspace_notes_preview.adopted = adopted;
+        if let Err(error) = self.sink.workspace_notes_get(vec![workspace_id]) {
+            tracing::warn!(%error, "workspace notes hover get dropped: IPC writer closed");
+        }
+        cx.notify();
+    }
+
     /// Fold the newest server notes into the open modal.
     ///
     /// Runs on every redraw for the same reason [`Self::sync_find_results`]
@@ -4689,15 +4763,14 @@ impl TerminalView {
     /// ([`WorkspaceNotesModalView::replace_pristine_draft`]), which is what
     /// keeps a late snapshot from eating typed text.
     fn sync_workspace_notes(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.workspace_notes_modal.clone() else {
-            return;
-        };
-        let Some(workspace_id) = modal.read(cx).workspace_id() else {
-            return;
-        };
-        let Ok(store) = self.shared.notes.lock() else {
-            return;
-        };
+        self.sync_workspace_notes_modal(cx);
+        self.sync_workspace_notes_preview(cx);
+    }
+
+    fn sync_workspace_notes_modal(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.workspace_notes_modal.clone() else { return };
+        let Some(workspace_id) = modal.read(cx).workspace_id() else { return };
+        let Ok(store) = self.shared.notes.lock() else { return };
         if store.version() == self.workspace_notes_adopted {
             return;
         }
@@ -4706,13 +4779,23 @@ impl TerminalView {
         let archived = store.archived_notes(workspace_id);
         let draft = store.draft_text(workspace_id);
         let error = store.last_error().map(str::to_owned);
-        drop(store);
         modal.update(cx, |view, ctx| {
             view.set_notes(active, archived, ctx);
             view.replace_pristine_draft(draft, ctx);
             view.set_error(error, ctx);
         });
-        tracing::debug!(%workspace_id, "workspace notes modal adopted a server answer");
+    }
+
+    fn sync_workspace_notes_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.workspace_notes_preview.view.clone() else { return };
+        let Some(workspace_id) = self.workspace_notes_preview.workspace_id else { return };
+        let Ok(store) = self.shared.notes.lock() else { return };
+        if store.version() == self.workspace_notes_preview.adopted {
+            return;
+        }
+        self.workspace_notes_preview.adopted = store.version();
+        let (summaries, total_count) = store.hover_summaries(workspace_id, MAX_PREVIEW_ROWS, 56);
+        preview.update(cx, |view, ctx| view.set_summaries(summaries, total_count, ctx));
     }
 
     /// Route one modal control to its side effect: state transitions update the
@@ -5823,6 +5906,17 @@ impl TerminalView {
             })
         })
     }
+
+    fn build_workspace_notes_preview_overlay(&self) -> Option<gpui::AnyElement> {
+        self.workspace_notes_preview.view.clone().map(|preview| {
+            div()
+                .absolute()
+                .top(px(TITLEBAR_HEIGHT))
+                .right(px(154.0))
+                .child(preview)
+                .into_any_element()
+        })
+    }
 }
 
 impl Render for TerminalView {
@@ -5856,6 +5950,7 @@ impl Render for TerminalView {
         let tooltip = self.build_tooltip_demo();
         let share = self.build_share_overlay();
         let displaced = self.build_lost_control_overlay(cx);
+        let notes_preview = self.build_workspace_notes_preview_overlay();
 
         let opacity = self.opacity;
         // The root itself paints nothing. Every band below fills the window
@@ -5932,6 +6027,7 @@ impl Render for TerminalView {
             .children(self.context_menu.clone())
             .children(self.dialog.clone())
             .children(self.workspace_notes_modal.clone())
+            .children(notes_preview)
             .children(share)
             .children(tooltip)
             // Last child, so the frozen banner covers every other overlay: while

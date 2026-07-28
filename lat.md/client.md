@@ -948,7 +948,7 @@ The GPUI rebuild ports the per-workspace notes modal and its hover preview as `g
 
 [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#WorkspaceNotesPreviewView]] paints the hover preview in two modes — a read-only list with a "+N more" overflow row plus a "+" affordance (FR-001), or the inline editor (FR-002) with a caret, error row, and scroll clamp. The pure sizing/wrap helpers ([[crates/scribe-client-gpui/src/workspace_notes_preview.rs#preview_cols]], [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#wrap_text_for_editor]], [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#caret_line_index]]) stay testable; clicks emit a [[crates/scribe-client-gpui/src/workspace_notes_preview.rs#WorkspaceNotesPreviewAction]].
 
-The shell wires both over the frozen protocol through [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#workspace_notes_get]] and [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#workspace_notes_mutate]]; Ctrl+Shift+M opens the modal and routes its actions.
+The shell wires both over the frozen protocol through [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#workspace_notes_get]] and [[crates/scribe-client-gpui/src/ipc_bridge.rs#IpcSink#workspace_notes_mutate]]; Ctrl+Shift+M opens the modal and routes its actions. Hovering the titlebar notes affordance emits [[crates/scribe-client-gpui/src/titlebar.rs#TitlebarEvent]]`::WorkspaceNotesHover`, which [[crates/scribe-client-gpui/src/main.rs#TerminalView#set_workspace_notes_preview]] resolves against the focused server workspace, fetches, and paints on the live overlay layer.
 
 ### GPUI Workspace Notes IPC
 

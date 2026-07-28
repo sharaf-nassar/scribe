@@ -65,6 +65,9 @@ MODAL_DIFF_MIN="${MODAL_DIFF_MIN:-3000}"
 # Differing pixels a single note row must add. One row is a marker, a summary,
 # and three buttons replacing the "No active notes" placeholder.
 ROW_DIFF_MIN="${ROW_DIFF_MIN:-200}"
+# The compact titlebar hover preview is smaller than the modal, but its border,
+# label, and affordance still change hundreds of pixels in the live window.
+PREVIEW_DIFF_MIN="${PREVIEW_DIFF_MIN:-250}"
 
 WIN_X=0
 WIN_Y=0
@@ -101,6 +104,17 @@ shot() {
     sleep 0.4
     scrot -o "$1"
     echo "captured $1"
+}
+
+hover_notes_affordance() {
+    local wid
+    wid=$(find_window)
+    [ -n "$wid" ] || fail "hover preview has no Scribe window"
+    # Notes is the 34px titlebar control immediately left of the gear; both sit
+    # before the three 40px window controls, so this stays stable across screen
+    # sizes and does not depend on a compositor's window origin.
+    xdotool mousemove --sync --window "$wid" "$((WIN_W - 171))" 17
+    sleep 0.5
 }
 
 # Lit pixels inside the client window. Rendered text is near-white on a
@@ -407,33 +421,42 @@ SERVER_WS=$(server_workspace_for_session) \
     || fail "PHASE 0 FAIL: no server SessionList entry for session $SESSION"
 echo "PHASE 0 PASS: client attached to session $SESSION in workspace $SERVER_WS (ink $BASE_INK)"
 
-# ── Phase 1: the modal opens on the SERVER's workspace ────────────
+# ── Phase 1: hovering the notes affordance paints its live preview ─
+hover_notes_affordance
+shot /output/00-notes-hover-preview.png
+PREVIEW_DIFF=$(window_diff /output/00-attached.png /output/00-notes-hover-preview.png)
+if [ "${PREVIEW_DIFF:-0}" -lt "$PREVIEW_DIFF_MIN" ]; then
+    fail "PHASE 1 FAIL: hovering notes painted only $PREVIEW_DIFF px (min $PREVIEW_DIFF_MIN)"
+fi
+echo "PHASE 1 PASS: hovering the titlebar notes affordance painted the preview (+$PREVIEW_DIFF px)"
+
+# ── Phase 2: the modal opens on the SERVER's workspace ────────────
 OPENS_BEFORE=$(count_log "opened the workspace notes modal")
 focus
 shot /output/01-before-notes-modal.png
 send_keys ctrl+shift+m
 if ! wait_for_log_growth "opened the workspace notes modal" "$OPENS_BEFORE" 15; then
-    fail "PHASE 1 FAIL: ctrl+shift+m never opened the workspace notes modal"
+    fail "PHASE 2 FAIL: ctrl+shift+m never opened the workspace notes modal"
 fi
 if ! wait_for_frame client WorkspaceNotesGet "" 20; then
-    fail "PHASE 1 FAIL: opening the modal put no WorkspaceNotesGet frame on the wire"
+    fail "PHASE 2 FAIL: opening the modal put no WorkspaceNotesGet frame on the wire"
 fi
 ASKED_WS=$(requested_notes_workspace) \
-    || fail "PHASE 1 FAIL: the recorded WorkspaceNotesGet names no single workspace"
+    || fail "PHASE 2 FAIL: the recorded WorkspaceNotesGet names no single workspace"
 if [ "$ASKED_WS" != "$SERVER_WS" ]; then
-    fail "PHASE 1 FAIL: the modal asked about workspace $ASKED_WS, but the server filed session $SESSION under $SERVER_WS — the id is still fabricated client-side"
+    fail "PHASE 2 FAIL: the modal asked about workspace $ASKED_WS, but the server filed session $SESSION under $SERVER_WS — the id is still fabricated client-side"
 fi
 if ! wait_for_frame server WorkspaceNotesSnapshot "" 20; then
-    fail "PHASE 1 FAIL: the server never answered WorkspaceNotesGet with a snapshot"
+    fail "PHASE 2 FAIL: the server never answered WorkspaceNotesGet with a snapshot"
 fi
 focus
 shot /output/02-notes-modal-open.png
 MODAL_DIFF=$(window_diff /output/01-before-notes-modal.png /output/02-notes-modal-open.png)
 if [ "${MODAL_DIFF:-0}" -lt "$MODAL_DIFF_MIN" ]; then
-    fail "PHASE 1 FAIL: the notes modal changed $MODAL_DIFF px (min $MODAL_DIFF_MIN)"
+    fail "PHASE 2 FAIL: the notes modal changed $MODAL_DIFF px (min $MODAL_DIFF_MIN)"
 fi
 EMPTY_INK=$(window_ink /output/02-notes-modal-open.png)
-echo "PHASE 1 PASS: WorkspaceNotesGet named the server's own workspace $SERVER_WS and the modal painted (+$MODAL_DIFF px, ink $EMPTY_INK)"
+echo "PHASE 2 PASS: WorkspaceNotesGet named the server's own workspace $SERVER_WS and the modal painted (+$MODAL_DIFF px, ink $EMPTY_INK)"
 
 # ── Phase 2: a typed note round-trips through the server ──────────
 CHANGES_BEFORE=$(count_log "workspace notes changed")
@@ -520,6 +543,7 @@ echo ""
 echo "PASS: visual workspace-notes test"
 echo "  Inspect screenshots in test-output/:"
 echo "    00-attached.png               — the adopted pane before any modal"
+echo "    00-notes-hover-preview.png    — titlebar notes hover preview"
 echo "    01-before-notes-modal.png     — the window with no notes modal"
 echo "    02-notes-modal-open.png       — the modal on the server's workspace, empty"
 echo "    03-note-saved.png             — the broadcast note rendered in the open modal"

@@ -30,11 +30,11 @@ two runs existed to make scoreable: the parity go threshold. Every other oracle
 is green, including all five perf metrics and both manual rows, which have never
 all been green in the same run before.
 
-- **`just parity-gate` scores 191 of 194 user-facing rows reachable (98%)
-  against a threshold of 194 of 194 (100%).** Three `spec.md` requirements are
-  implemented but unreachable from the running client: server-upgrade reattach,
-  the workspace-notes hover preview, and the remote connect picker overlay
-  (FU-24..FU-28). Filed this run as beads `scribe-38e.99`..`scribe-38e.103`.
+- **`just parity-gate` scores 192 of 194 user-facing rows reachable (99%)
+  against a threshold of 194 of 194 (100%).** Two `spec.md` requirements are
+  implemented but unreachable from the running client: server-upgrade reattach
+  and the remote connect picker overlay (FU-24 and FU-28). Filed this run as
+  beads `scribe-38e.99` and `scribe-38e.103`.
 
 ## Oracle results
 
@@ -53,7 +53,7 @@ all been green in the same run before.
 
 | Prior blocker | Status | Evidence from this run |
 | --- | --- | --- |
-| B1 — nine unreachable `spec.md` requirements (`.86`–`.90`) | ✅ RESOLVED | The ratchet moved from 53/65 to 62/66 wired modules. Each capability now has an app-level oracle that PASSes: `visual/mouse-reporting.sh` (ten phases: wheel paging, X10 and SGR-1006 reports), `visual/ime-preedit.sh`, `visual/scrollbar.sh`, `visual/cold-restart.sh`, `visual/notifications.sh`, `visual/drag-drop.sh`, `visual/server-lifecycle.sh`. `tools/reachability-baseline.txt` is down to four unwired modules, three of which are the FU-25..FU-27 rows below and one (`focus_border`) a dead duplicate |
+| B1 — nine unreachable `spec.md` requirements (`.86`–`.90`) | ✅ RESOLVED | The ratchet moved from 53/65 to 63/66 wired modules. Each capability now has an app-level oracle that PASSes: `visual/mouse-reporting.sh` (ten phases: wheel paging, X10 and SGR-1006 reports), `visual/ime-preedit.sh`, `visual/scrollbar.sh`, `visual/cold-restart.sh`, `visual/notifications.sh`, `visual/drag-drop.sh`, `visual/server-lifecycle.sh`, and `visual/workspace-notes.sh`. `tools/reachability-baseline.txt` is down to three unwired modules: FU-26's `divider` plus dead duplicates `focus_border` and `palette`; FU-25 is imported but its paint path remains unwired |
 | B2 — IME manual item FAILED | ✅ RESOLVED | Re-driven live this run and it composes — see "Manual item detail" |
 | B3 — perf FAIL on 2 of 5 (`.91`, `.92`) | ✅ RESOLVED | All five metrics PASS this run; see "Perf detail". Both failures were measurement defects, diagnosed and recorded in `perf-baseline.md` |
 | B4 — `parity-inventory.md` stale (`.93`) | ✅ RESOLVED | `just parity-inventory` PASSes: every marker cell, footer and roll-up number is re-derived from the source and agrees with it |
@@ -79,7 +79,8 @@ parity gate: NO-GO — 191 of 194 user-facing rows reachable (98%);
 | --- | --- | --- | --- | --- |
 | Server-upgrade reattach | `US2-4` | missing | `main.rs::start_ipc_thread` awaits `run_connection` exactly once; when it returns nothing redials, so an `--upgrade` handoff leaves the window attached to nothing. `visual/reconnect.sh` relaunches the client *process* and does not cover it | `scribe-38e.99` |
 | Pane dividers and drag-resize | `US3-10` | wired | `TerminalView::render_dividers` paints `PaneShell::dividers`; the grid pointer path maps the divider drag to `PaneShell::set_pane_ratio` and republishes both grids | `scribe-38e.101` |
-| Workspace notes hover preview | `US4-3` | unwired | `workspace_notes_preview.rs` has no reference outside `lib.rs` and its own tests. The notes *modal* is wired; the hover preview is not | `scribe-38e.102` |
+| AI indicator borders and tab tint | `US4-1` | wired | `TerminalView::{sync_tabs,render_panes}` paint tracker state through `tab_indicator_color`, `workspace_border_color`, and `pane_border_edges`; `tests/e2e/visual/ai-indicator.sh` asserts both surfaces | `scribe-38e.100` |
+| Workspace notes hover preview | `US4-3` | wired | The titlebar notes affordance emits `WorkspaceNotesHover`, and `TerminalView::set_workspace_notes_preview` creates and paints `WorkspaceNotesPreviewView` on the live overlay layer. `tests/e2e/visual/workspace-notes.sh` hovers the real affordance and asserts the preview changes pixels. | `scribe-38e.102` |
 | Remote connect picker overlay | `US4-4` | missing | `remote::RemoteConnect` models the picker and no GPUI view renders it; `refresh_remote_peers` surfaces a peer count on the status strip instead | `scribe-38e.103` |
 
 `FU-24` (`scribe-38e.99`) is the serious one and should be sequenced first: the
@@ -173,7 +174,7 @@ Every row's own stated method was exercised this run.
 
 The six method counts sum to the inventory's 203 rows.
 
-A row's method passing is necessary but not sufficient: the three unreachable
+A row's method passing is necessary but not sufficient: the two unreachable
 rows above are carried by passing methods *and* are unreachable, which is what
 the "Reachable from" column and the go threshold exist to catch.
 
@@ -243,4 +244,4 @@ green, and each new wiring needs an oracle that drives the running app rather
 than the module. That distinction is what the last three runs were about: green
 suites are necessary and never sufficient, and the decisive question remains
 whether a user of the running client can reach each `spec.md` requirement. For
-five of them the answer is still no.
+four of them the answer is still no.

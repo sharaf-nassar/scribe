@@ -52,6 +52,8 @@ pub enum TitlebarEvent {
     OpenSettings,
     /// The equalize icon was clicked (equalize the active tab's panes).
     Equalize,
+    /// The workspace-notes affordance gained or lost pointer hover.
+    WorkspaceNotesHover(bool),
     /// A window-control button was clicked.
     WindowControl(WindowControlKind),
 }
@@ -387,6 +389,30 @@ impl TitlebarView {
             .into_any_element()
     }
 
+    fn render_workspace_notes_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let hover_bg = self.colors.gradient_top;
+        div()
+            .id("workspace-notes")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(34.0))
+            .h_full()
+            .text_color(self.colors.text)
+            .hover(move |style| style.bg(hover_bg))
+            .child("N")
+            .on_hover(cx.listener(|_, hovered: &bool, _win, ctx| {
+                ctx.emit(TitlebarEvent::WorkspaceNotesHover(*hovered));
+            }))
+            .on_mouse_move(cx.listener(|_, _: &MouseMoveEvent, _win, ctx| {
+                ctx.emit(TitlebarEvent::WorkspaceNotesHover(true));
+            }))
+            .on_click(cx.listener(|_, _, _win, ctx| {
+                ctx.emit(TitlebarEvent::WorkspaceNotesHover(true));
+            }))
+            .into_any_element()
+    }
+
     fn render_window_control(&self, kind: WindowControlKind, cx: &mut Context<Self>) -> AnyElement {
         let (id, glyph, area, hover_bg) = match kind {
             WindowControlKind::Minimize => {
@@ -444,6 +470,7 @@ impl Render for TitlebarView {
                 ctx.emit(TitlebarEvent::OpenSettings);
             })
         });
+        let workspace_notes = self.render_workspace_notes_button(cx);
 
         div()
             .track_focus(&self.focus_handle)
@@ -459,9 +486,14 @@ impl Render for TitlebarView {
             .border_b_1()
             .border_color(self.colors.separator)
             .window_control_area(WindowControlArea::Drag)
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _win, ctx| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, ctx| {
                 if this.drag.is_some() && event.pressed_button == Some(MouseButton::Left) {
                     this.update_drag(f32::from(event.position.x), ctx);
+                }
+                let width = f32::from(window.bounds().size.width);
+                let x = f32::from(event.position.x);
+                if (width - 188.0..width - 154.0).contains(&x) {
+                    ctx.emit(TitlebarEvent::WorkspaceNotesHover(true));
                 }
             }))
             .on_mouse_up(
@@ -473,6 +505,7 @@ impl Render for TitlebarView {
             // Draggable spacer fills the gap between tabs and the right controls.
             .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
             .children(equalize)
+            .child(workspace_notes)
             .children(gear)
             .child(self.render_window_control(WindowControlKind::Minimize, cx))
             .child(self.render_window_control(WindowControlKind::Maximize, cx))
