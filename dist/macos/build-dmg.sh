@@ -45,7 +45,7 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
 fi
 
 # Verify binaries exist
-for bin in scribe-client-gpui scribe-server scribe-settings; do
+for bin in scribe-client scribe-server; do
     if [[ ! -f "${BUILD_DIR}/${bin}" ]]; then
         echo "ERROR: ${BUILD_DIR}/${bin} not found. Run 'cargo build --release' first."
         exit 1
@@ -112,9 +112,8 @@ if [[ -n "$VERSION" ]]; then
 fi
 
 # Copy app executables and helper tools.
-cp "${BUILD_DIR}/scribe-client-gpui" "${MACOS_DIR}/"
+cp "${BUILD_DIR}/scribe-client" "${MACOS_DIR}/"
 cp "${BUILD_DIR}/scribe-server"   "${MACOS_DIR}/"
-cp "${BUILD_DIR}/scribe-settings" "${MACOS_DIR}/"
 cp "${BUILD_DIR}/scribe-hook-helper" "${MACOS_DIR}/"
 
 # Copy icon

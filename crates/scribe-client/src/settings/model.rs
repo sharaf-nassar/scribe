@@ -1,6 +1,6 @@
 //! Declarative page/control model for the GPUI settings window.
 //!
-//! The old `scribe-settings` webview described its ten pages in `settings.html`
+//! The old standalone webview described its ten pages in `settings.html`
 //! and wrote every edit through a `{key, value}` message that
 //! [`crate::settings::apply::apply_settings_change`] routed to the config file.
 //! This module reproduces that page inventory as a data-driven model: each

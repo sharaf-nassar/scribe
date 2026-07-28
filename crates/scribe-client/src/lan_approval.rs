@@ -14,7 +14,7 @@
 //!
 //! This port keeps the state model — the pending request's display fields, the
 //! **Decline-default** focus, focus cycling, the activation intent, and the
-//! word-wrapped body copy — and drops the winit `CellInstance` painting and pixel
+//! word-wrapped body copy — and drops the winit GPU painting and pixel
 //! hit-testing in favour of the GPUI dialog element.
 
 /// What the owning user chose on the approval prompt.

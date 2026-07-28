@@ -1,6 +1,6 @@
 //! Per-workspace notes modal for the GPUI client rebuild.
 //!
-//! The winit client drew this modal as hand-placed `CellInstance` quads over a
+//! The winit client drew this modal as hand-placed GPU quads over a
 //! grid ([`workspace_notes_modal.rs`](../../scribe-client/src/workspace_notes_modal.rs)),
 //! with the active/archive/editor state machine folded into the painter. This
 //! port keeps that state machine verbatim — the [`WorkspaceNotesView`] toggle,

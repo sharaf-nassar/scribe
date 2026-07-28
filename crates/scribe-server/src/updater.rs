@@ -768,7 +768,6 @@ fn install_update(asset: &VerifiedAsset) -> Result<bool, ScribeError> {
             .unwrap_or(false)
     };
     let client_was_running = is_running("scribe-client");
-    let settings_was_running = is_running("scribe-settings");
 
     // Remove any stale .app.prev left by a previous failed update so the
     // upcoming rename doesn't collide with it.
@@ -821,7 +820,7 @@ fn install_update(asset: &VerifiedAsset) -> Result<bool, ScribeError> {
 
     // Compare old and new binaries to determine which components need restart.
     // If no backup existed (fresh install), treat all as changed.
-    let binaries = ["scribe-server", "scribe-client", "scribe-settings"];
+    let binaries = ["scribe-server", "scribe-client"];
     let mut changed: HashMap<&str, bool> = HashMap::new();
     for name in &binaries {
         let differs = if backup_existed {
@@ -907,31 +906,23 @@ fn install_update(asset: &VerifiedAsset) -> Result<bool, ScribeError> {
     };
 
     if !hot_reload_succeeded {
-        info!("macOS update requires a deferred cold restart; skipping client/settings relaunch");
+        info!("macOS update requires a deferred cold restart; skipping client relaunch");
         return Ok(false);
     }
 
     // Restart client binaries that changed and were running before the update.
     let macos_dir = app_bundle_path.join("Contents/MacOS");
-    for &name in &["scribe-client", "scribe-settings"] {
+    for &name in &["scribe-client"] {
         if !changed.get(name).unwrap_or(&true) {
             info!("{name} binary unchanged — skipping restart");
             continue;
         }
-        let was_running = match name {
-            "scribe-client" => client_was_running,
-            "scribe-settings" => settings_was_running,
-            _ => false,
-        };
+        let was_running = client_was_running;
         if !was_running {
             continue;
         }
         // Kill the old process (best-effort, it may not be running).
         let _ = std::process::Command::new("pkill").args(["-x", name]).status();
-        // Brief wait for singleton socket release (settings).
-        if name != "scribe-client" {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
         // Relaunch.
         let bin_path = macos_dir.join(name);
         match std::process::Command::new(&bin_path)

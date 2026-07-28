@@ -1,4 +1,4 @@
-//! Terminal cell colour semantics, ported from `scribe-renderer`.
+//! Terminal cell colour semantics, ported from the retired renderer.
 //!
 //! This module owns the pure colour logic the GPUI paint path needs: sRGB↔
 //! linear conversions, the DIM (0.67) round-trip, bold→bright promotion, the

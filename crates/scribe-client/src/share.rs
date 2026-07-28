@@ -20,7 +20,7 @@
 //! [`ControlClaim`](scribe_common::protocol::ClientMessage::ControlClaim) /
 //! [`ControlRequest`](scribe_common::protocol::ClientMessage::ControlRequest) /
 //! [`ControlGrant`](scribe_common::protocol::ClientMessage::ControlGrant)
-//! messages. This port keeps that logic and drops the winit `CellInstance`
+//! messages. This port keeps that logic and drops the winit GPU
 //! painting in favour of the GPUI overlay elements.
 //!
 //! [`ShareChrome`] is the live-path aggregate the client shell owns: the IPC

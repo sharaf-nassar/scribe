@@ -1,6 +1,6 @@
 //! Hover tooltip overlay for the GPUI client rebuild.
 //!
-//! The winit client painted tooltips as `CellInstance` quads (a border quad, a
+//! The winit client painted tooltips as GPU quads (a border quad, a
 //! background quad, then glyphs) centred on an anchor rect and clamped to the
 //! viewport, plus a dedicated OSC 8 hover-tooltip that head+tail-truncated a long
 //! URI so it fit the box. This port keeps that geometry as pure, testable

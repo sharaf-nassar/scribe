@@ -13,7 +13,7 @@
 //! remote client displaced by a reclaim — the displaced-client obligations are
 //! transport-agnostic, so the state lives here once and the app layer wires the
 //! reclaim to the transport it already speaks. This port keeps the identity /
-//! headline / reclaim-intent logic; the winit `CellInstance` painting is dropped
+//! headline / reclaim-intent logic; the winit GPU painting is dropped
 //! in favour of the GPUI banner element [`lost_control_overlay`], which the
 //! shell hangs over the whole window while [`crate::remote_chrome::RemoteChrome`]
 //! holds a displaced state.

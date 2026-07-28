@@ -1,4 +1,4 @@
-//! xterm-256 colour palette, ported verbatim from `scribe-renderer`.
+//! xterm-256 colour palette, ported verbatim from the retired renderer.
 //!
 //! The palette owns the 256-entry lookup table (standard/bright ANSI, the
 //! 6×6×6 colour cube, and the greyscale ramp), converts every entry from

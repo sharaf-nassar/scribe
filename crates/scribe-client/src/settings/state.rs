@@ -2,7 +2,7 @@
 //!
 //! Reads/writes `$XDG_STATE_HOME/scribe/settings_state.toml` containing the
 //! window geometry and an `open` flag for restart restoration. Ported from the
-//! deleted `scribe-settings` crate; the GTK-specific `SettingsWindowGeometry`
+//! deleted settings crate; the GTK-specific `SettingsWindowGeometry`
 //! type is replaced by the local [`SettingsWindowGeometry`] so this module has
 //! no GTK/wry dependency.
 

@@ -4,7 +4,7 @@
 //! per-session pulse envelope, the Layer-2 stale-`Processing` clear, the
 //! attention-state keystroke clear, the workspace-level priority ordering, and
 //! the decoupled context-window store. The winit client emitted the pulsing
-//! pane border as `CellInstance` quads through the legacy renderer; the GPUI
+//! pane border as GPU quads through the legacy renderer; the GPUI
 //! rebuild keeps the same geometry pure — [`pane_border_edges`] returns the
 //! four edge [`Rect`]s and the GPUI paint path fills them with
 //! [`AiStateTracker::workspace_border_color`], mirroring [`crate::focus_border`].

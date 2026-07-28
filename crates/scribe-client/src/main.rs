@@ -1645,7 +1645,7 @@ impl TerminalView {
     /// [`open_settings_window`], so the chord, the palette row, and the
     /// titlebar gear all land on the same surface the CLI flag opens. GPUI is
     /// multi-window in one process, so unlike the winit client — which had to
-    /// spawn the separate `scribe-settings` binary and hand focus over a Unix
+    /// spawn a separate settings binary and hand focus over a Unix
     /// socket — the window is opened here and its [`WindowHandle`] retained.
     /// That handle *is* the deduplication: a second request updates it, which
     /// fails only once the window has been closed, and a live update activates
@@ -6483,7 +6483,7 @@ fn main() -> std::process::ExitCode {
     scribe_common::perf_probe::init_from_env();
 
     // `scribe-client --settings` opens (or focuses) the settings window instead
-    // of the terminal shell. The singleton absorbs the old scribe-settings
+    // of the terminal shell. The singleton absorbs the retired settings app's
     // `settings.lock`/`settings.sock`: a second launch hands focus to the
     // running window and exits here.
     if std::env::args().skip(1).any(|arg| arg == "--settings") {

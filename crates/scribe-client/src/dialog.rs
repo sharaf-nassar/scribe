@@ -23,7 +23,7 @@
 //! paste gate additionally reuses [`crate::paste::classify_paste`] and renders
 //! the parked content in caret notation so a malicious control sequence in the
 //! preview can never drive the terminal (spec 011 FR-005). The winit
-//! `CellInstance` quad painting and pixel hit-testing are dropped in favour of
+//! GPU quad painting and pixel hit-testing are dropped in favour of
 //! GPUI flex layout and `on_click` listeners.
 
 use gpui::{Context, EventEmitter, FocusHandle, Rgba, div, prelude::*, px};

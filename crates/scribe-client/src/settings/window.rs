@@ -892,7 +892,7 @@ pub fn open_settings_window(cx: &mut App) -> Option<WindowHandle<SettingsWindow>
                 title: Some("Scribe Settings".into()),
                 ..Default::default()
             }),
-            app_id: Some("scribe-settings".to_owned()),
+            app_id: Some("scribe-client".to_owned()),
             ..Default::default()
         },
         |_, cx| cx.new(SettingsWindow::new),

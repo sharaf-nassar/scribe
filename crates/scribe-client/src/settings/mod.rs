@@ -1,4 +1,4 @@
-//! GPUI settings window: the 1:1 rebuild of the deleted `scribe-settings`
+//! GPUI settings window: the 1:1 rebuild of the deleted standalone settings
 //! GTK/wry app as a window in the client process.
 //!
 //! The webview app is gone; its feature set is reproduced here. [`apply`] and

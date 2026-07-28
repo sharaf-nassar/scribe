@@ -1,6 +1,6 @@
 //! Workspace-notes hover preview for the GPUI client rebuild.
 //!
-//! The winit client painted this preview as `CellInstance` quads over a grid
+//! The winit client painted this preview as GPU quads over a grid
 //! ([`workspace_notes_preview.rs`](../../scribe-client/src/workspace_notes_preview.rs)),
 //! returning hit rects the shell tested. This port keeps the pure sizing/wrap
 //! logic — column width from the longest note or editor line, visual-row wrap,

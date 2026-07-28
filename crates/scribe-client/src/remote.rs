@@ -6,7 +6,7 @@
 //! module is the rendering-independent core of the winit client's
 //! [`remote_connect.rs`](../../scribe-client/src/remote_connect.rs): the merge /
 //! dedup / step-transition logic and the typed [`RemoteConnectAction`] intents
-//! are ported byte-for-byte, while the winit `CellInstance` painting is dropped
+//! are ported byte-for-byte, while the winit GPU painting is dropped
 //! in favour of the flattened [`PickerView`] the GPUI chrome will consume.
 //!
 //! The picker only produces intents; the app layer turns each into a
@@ -823,7 +823,7 @@ pub struct PickerRow {
 }
 
 /// A flattened, renderer-ready snapshot of the current stage, consumed by the
-/// GPUI chrome in place of the winit client's `CellInstance` quad list.
+/// GPUI chrome in place of the winit client's GPU quad list.
 pub struct PickerView {
     pub title: String,
     pub subtitle: Option<String>,

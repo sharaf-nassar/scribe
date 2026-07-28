@@ -1,6 +1,6 @@
 //! Window-level status bar, ported from the legacy client's quad renderer.
 //!
-//! The legacy `scribe-client` built the status bar by emitting `CellInstance`
+//! The legacy client built the status bar by emitting GPU
 //! quads straight into the terminal grid buffer. The GPUI rebuild keeps the
 //! **segment model** byte-for-byte — the same connection dot, command-status
 //! glyph, env warning, workspace/CWD/git/host labels, tmux + session badges,
