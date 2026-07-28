@@ -5,6 +5,18 @@
 - Worktree directory preference: `~/.config/superpowers/worktrees/scribe/`
 - NEVER restart the Scribe server without first asking the user and receiving explicit approval. This includes `just restart-server`, `just restart-server-release`, and direct `scribe-server --upgrade` invocations; restarting is extremely disruptive to active work.
 
+## Build environment
+
+- Use Rust 1.95.0 or newer.
+- On Debian/Ubuntu, install `clang`, `libfontconfig-dev`, `libssl-dev`,
+  `libvulkan1`, `libwayland-dev`, `libx11-xcb-dev`,
+  `libxkbcommon-x11-dev`, and `libzstd-dev`. A Vulkan ICD is also required
+  to run the client; `mesa-vulkan-drivers` provides Lavapipe when needed.
+- `just build`, `just build-release`, `just check`, and `just ready` build,
+  release-build, type-check, and run the local quality gate. GPUI is compiled
+  at `opt-level = 3` in debug builds; Scribe's own debug code remains
+  unoptimized.
+
 # Post-task checklist (REQUIRED — do not skip)
 
 After EVERY task, before responding to the user:
@@ -107,12 +119,9 @@ Details about this child topic.
 The second example is invalid because `Bad Section` has no leading paragraph. `lat check` validates this rule and reports errors for missing or overly long leading paragraphs.
 
 <!-- SPECKIT START -->
-For additional context about technologies to be used, project structure,
-shell commands, and other important information, read the current plan:
-`specs/015-multi-machine-sharing/plan.md` (feature 015, branch
-`015-multi-machine-sharing`, which builds on features 013 and 014; design
-artifacts live alongside it — research.md, data-model.md, contracts/,
-quickstart.md).
+For GPUI client rebuild context, read
+`specs/016-gpui-client-rebuild/plan.md` and its adjacent specification and
+parity inventory.
 <!-- SPECKIT END -->
 
 
