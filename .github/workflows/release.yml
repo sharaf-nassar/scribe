@@ -21,14 +21,6 @@ jobs:
             runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             os: linux
-          - label: macos-arm64
-            runner: macos-14
-            target: aarch64-apple-darwin
-            os: macos
-          - label: macos-x86_64
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-            os: macos
 
     steps:
       - uses: actions/checkout@v6
@@ -70,31 +62,6 @@ jobs:
         if: matrix.os == 'linux'
         run: cargo deb -p scribe-server --no-build --target ${{ matrix.target }}
 
-      - name: Copy binaries for DMG packaging
-        if: matrix.os == 'macos'
-        run: |
-          mkdir -p target/release
-          cp target/${{ matrix.target }}/release/scribe-client   target/release/
-          cp target/${{ matrix.target }}/release/scribe-server   target/release/
-          cp target/${{ matrix.target }}/release/scribe-settings target/release/
-          cp target/${{ matrix.target }}/release/scribe-hook-helper target/release/
-
-      - name: Build DMG
-        if: matrix.os == 'macos'
-        env:
-          TAG: ${{ github.ref_name }}
-        run: bash dist/macos/build-dmg.sh --skip-build --version "${TAG#v}"
-
-      - name: Sign and notarize DMG
-        if: matrix.os == 'macos'
-        env:
-          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
-          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: bash dist/ci/sign-notarize-macos.sh
-
       - name: Install minisign
         env:
           MATRIX_OS: ${{ matrix.os }}
@@ -104,8 +71,6 @@ jobs:
             ARCH="$(uname -m)"
             curl -fsSL "https://github.com/jedisct1/minisign/releases/download/${MSIGN_VER}/minisign-${MSIGN_VER}-linux.tar.gz" \
               | sudo tar xz -C /usr/local/bin --strip-components=2 "minisign-linux/${ARCH}/minisign"
-          else
-            brew install minisign
           fi
 
       - name: Locate and sign artifact
@@ -120,9 +85,6 @@ jobs:
           if [[ "$MATRIX_OS" == "linux" ]]; then
             SRC=$(find "target/${MATRIX_TARGET}/debian" -name '*.deb' | head -1)
             DEST="scribe_${TAG}_${MATRIX_LABEL}.deb"
-          else
-            SRC="target/Scribe.dmg"
-            DEST="Scribe_${TAG}_${MATRIX_LABEL}.dmg"
           fi
           cp "$SRC" "$DEST"
           KEYFILE="$(mktemp)"
@@ -139,6 +101,15 @@ jobs:
             ${{ steps.artifact.outputs.artifact }}
             ${{ steps.artifact.outputs.sigfile }}
           if-no-files-found: error
+
+  # Deferred deliberately at GPUI cutover. See bead scribe-38e.104 before
+  # restoring DMG creation, signing, notarization, or macOS runner usage.
+  macos-packaging-deferred:
+    name: macOS packaging (deferred)
+    if: ${{ false }}
+    runs-on: macos-14
+    steps:
+      - run: echo "macOS GPUI port is tracked in scribe-38e.104"
 
   publish:
     name: Publish release
@@ -179,4 +150,4 @@ jobs:
           gh release create "$TAG" \
             --title "$TAG" \
             --notes-file /tmp/release-notes.md \
-            artifacts/*.deb artifacts/*.dmg artifacts/*.minisig
+            artifacts/*.deb artifacts/*.minisig
