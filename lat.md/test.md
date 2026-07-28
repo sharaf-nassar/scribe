@@ -314,6 +314,10 @@ Keystroke *suppression* is asserted from the client log rather than from an abse
 
 `tests/e2e/visual/ai-task-label.sh` is the app-level oracle for the four provider task-label rows (`TaskLabelChanged`, `TaskLabelCleared`, `CodexTaskLabelChanged`, `CodexTaskLabelCleared`), which the client dropped until [[client#GPUI Client Spike#Tab Strip And Key Dispatch]] routed them.
 
+### AI indicator paints provider state
+
+`tests/e2e/visual/ai-indicator.sh` posts a real provider state hook and asserts pixels in both the titlebar tab and pane-border strip. It proves the live hook-to-paint path documented in [[client#GPUI AI Indicator]].
+
 Nothing is stubbed. The image ships `scribe-hook-helper`, so the script posts a real hook event to the real `scribe-server` (the hook channel's endpoint *is* the server socket, exported as `SCRIBE_RUNTIME_DIR` by the entrypoint), the server translates and broadcasts the notice through [[crates/scribe-server/src/hook_ingress.rs#handle]], and the running client's tab strip repaints. `--provider=claude_code` drives the provider-tagged pair and `--provider=codex_code` the legacy Codex pair, because the server splits Codex back out for backward compatibility — so all four wire variants are exercised against one window.
 
 Phase 0 borrows `overlay-actions.sh`'s trick for handing the client a pane: the entrypoint's `$SESSION` belongs to the test daemon's window and is therefore hidden from the client's `ListSessions`, so the daemon is stopped and the client relaunched, after which it adopts the session through the normal attach path. `scribe-hook-helper` needs no daemon — it addresses the socket directly with the session id in its environment — so the hook channel outlives that teardown.
