@@ -298,7 +298,7 @@ echo "client window id: $WIN (own participant id $SELF, injected peer $PEER)"
 : >"$PEER_RECORD"
 scribe-test remote-peer \
     --listen "127.0.0.1:$REMOTE_PORT" \
-    --upstream "$SCRIBE_RUNTIME_DIR/server.sock" \
+    --upstream "$SCRIBE_RUNTIME_DIR/server-upstream.sock" \
     --record "$PEER_RECORD" \
     --hold-ms 300 >/output/remote-peer.log 2>&1 &
 REMOTE_PEER_PID=$!
@@ -330,6 +330,10 @@ wait_for "$PEER_RECORD" client 0 20 ListWindows \
 wait_for "$PEER_RECORD" server 0 20 WindowList \
     || fail "PHASE 1b: picker probe received no WindowList"
 shot /output/01d-picker-windows.png
+# Escape returns from the window list to peers; the second Escape closes the
+# picker so later command-palette input cannot select a probed remote window.
+send_keys Escape
+send_keys Escape
 echo "PHASE 1b PASS: picker opened, rendered a peer, and dialed its window list"
 
 # ── Phase 2: the displaced banner freezes the window ──────────────

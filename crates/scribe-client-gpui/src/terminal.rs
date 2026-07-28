@@ -237,6 +237,16 @@ impl DisplayOnlyTerminal {
         self.content.clone()
     }
 
+    /// Current viewport geometry in terminal cells.
+    ///
+    /// The IPC reconnect path uses this to reattach every visible pane at the
+    /// size it had before a server handoff, instead of temporarily expanding
+    /// split panes to the startup window dimensions.
+    #[must_use]
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.term.columns(), self.term.screen_lines())
+    }
+
     /// Reshape the display grid to `columns` x `lines`.
     ///
     /// A pane split changes how much of the window a session owns, so the
@@ -693,6 +703,12 @@ impl PaneGrids {
     /// ever reached that session's pane.
     pub fn content(&self, session_id: SessionId) -> Option<Content> {
         self.grids.get(&session_id).map(DisplayOnlyTerminal::content)
+    }
+
+    /// Current viewport geometry for `session_id`, when its grid exists.
+    #[must_use]
+    pub fn dimensions(&self, session_id: SessionId) -> Option<(usize, usize)> {
+        self.grids.get(&session_id).map(DisplayOnlyTerminal::dimensions)
     }
 
     /// The scrollbar viewport metrics for `session_id`, or `None` when that
