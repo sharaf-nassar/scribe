@@ -291,6 +291,47 @@ SELF=$(welcome_field participant_id)
 PEER=$((SELF + 1))
 echo "client window id: $WIN (own participant id $SELF, injected peer $PEER)"
 
+# ── Phase 1b: the real-window remote picker dials a selected peer ──────────
+# The local server has no tailnet inside this container, so inject one discovery
+# reply only after the palette has opened the picker. The selected address points
+# at the real TCP stand-in below: its handshake and WindowList flow are recorded.
+: >"$PEER_RECORD"
+scribe-test remote-peer \
+    --listen "127.0.0.1:$REMOTE_PORT" \
+    --upstream "$SCRIBE_RUNTIME_DIR/server.sock" \
+    --record "$PEER_RECORD" \
+    --hold-ms 300 >/output/remote-peer.log 2>&1 &
+REMOTE_PEER_PID=$!
+sleep 1.0
+kill -0 "$REMOTE_PEER_PID" 2>/dev/null || fail "PHASE 1b: the stand-in peer did not start"
+
+focus
+measure_window
+shot /output/01b-before-picker.png
+crop_body /output/01b-before-picker.png /output/01b-before-picker-body.png
+send_keys ctrl+shift+p
+type_text "Connect to remote"
+send_keys Return
+inject '{"type":"RemotePeerList","peers":[{"name":"picker-peer","addr":"127.0.0.1","online":true}]}'
+sleep 1.0
+shot /output/01c-picker-peers.png
+crop_body /output/01c-picker-peers.png /output/01c-picker-peers-body.png
+assert_pixels_changed /output/01b-before-picker-body.png /output/01c-picker-peers-body.png \
+    "PHASE 1b: remote picker with discovered peer"
+grep -q "opened remote-connect picker" "$CLIENT_LOG" \
+    || fail "PHASE 1b: palette did not open the remote picker"
+
+PICKER_DIAL_BEFORE=$(count_peer_client RemoteHandshake)
+send_keys Return
+wait_for "$PEER_RECORD" client "$PICKER_DIAL_BEFORE" 20 RemoteHandshake \
+    || fail "PHASE 1b: selecting the peer sent no RemoteHandshake"
+wait_for "$PEER_RECORD" client 0 20 ListWindows \
+    || fail "PHASE 1b: picker probe sent no ListWindows"
+wait_for "$PEER_RECORD" server 0 20 WindowList \
+    || fail "PHASE 1b: picker probe received no WindowList"
+shot /output/01d-picker-windows.png
+echo "PHASE 1b PASS: picker opened, rendered a peer, and dialed its window list"
+
 # ── Phase 2: the displaced banner freezes the window ──────────────
 # The notice is injected because the owning server only raises one for a real
 # second controller; everything after it — the banner, the input freeze, and the
@@ -375,17 +416,7 @@ sleep 1.0
 shot /output/07-run-action-tab.png
 echo "PHASE 4 PASS: DispatchAction/ActionDispatched round tripped and RunAction ran"
 
-# ── Phase 5: the tailnet dial preamble against a stand-in peer ────
-: >"$PEER_RECORD"
-scribe-test remote-peer \
-    --listen "127.0.0.1:$REMOTE_PORT" \
-    --upstream "$SCRIBE_RUNTIME_DIR/server.sock" \
-    --record "$PEER_RECORD" \
-    --hold-ms 1500 >/output/remote-peer.log 2>&1 &
-REMOTE_PEER_PID=$!
-sleep 1.5
-kill -0 "$REMOTE_PEER_PID" 2>/dev/null || fail "PHASE 5: the stand-in peer did not start"
-
+# ── Phase 5: the tailnet dial preamble against the same stand-in peer ───────
 kill "${SCRIBE_CLIENT_PID:-0}" 2>/dev/null || true
 pkill -f 'scribe-client-gpui' 2>/dev/null || true
 wait_for_client_exit 15 || fail "PHASE 5: the local client did not exit"
@@ -419,4 +450,6 @@ echo "    05-remote-disconnect.png        — the typed severance reason on the 
 echo "    06-viewer-palette.png           — a viewer's palette filtered to 'New Tab'"
 echo "    07-run-action-tab.png           — the tab an injected RunAction opened"
 echo "    08-tailnet-attached.png         — the session reached over the tailnet dial"
+echo "    01c-picker-peers.png           — the remote picker with a discovered peer"
+echo "    01d-picker-windows.png         — the selected peer's real WindowList"
 echo "  Wire records: test-output/share-wire.jsonl, test-output/remote-wire.jsonl"

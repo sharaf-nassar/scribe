@@ -91,6 +91,7 @@ pub mod prompt_bar;
 pub mod remote;
 pub mod remote_chrome;
 pub mod remote_handshake;
+pub mod remote_picker;
 pub mod restore_replay;
 pub mod restore_state;
 pub mod scrollbar;

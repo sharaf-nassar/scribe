@@ -73,9 +73,12 @@ use scribe_client_gpui::preedit::{Ime, ImeEvent};
 use scribe_client_gpui::prompt_bar::{
     self, PromptBarColors, PromptBarData, PromptContextIndicator,
 };
-use scribe_client_gpui::remote::RemoteConnectOutcome;
+use scribe_client_gpui::remote::{
+    PeerTransport, PickerKey, RemoteConnect, RemoteConnectAction, RemoteConnectOutcome,
+};
 use scribe_client_gpui::remote_chrome::{RemoteChrome, RemoteEnvSummary};
 use scribe_client_gpui::remote_handshake::{self, RemoteDialer};
+use scribe_client_gpui::remote_picker::{RemotePickerColors, remote_picker_overlay};
 use scribe_client_gpui::restore_replay::{
     self, ReplayLaunch, command_argv, prepare_replay, round_positive_f32_to_u16,
 };
@@ -795,6 +798,9 @@ struct TerminalView {
     /// The find-in-scrollback overlay, present only while open. While it is up
     /// it owns the keyboard and its match set drives the grid's highlights.
     find_overlay: Option<Entity<FindOverlayView>>,
+    /// Client-local remote-connect overlay, backed by the ported picker state
+    /// machine and fed from the reader-owned remote/LAN chrome snapshots.
+    remote_connect: RemoteConnect,
     /// Theme-derived find-match highlight colours, rebuilt on a theme reload.
     highlight_colors: MatchHighlightColors,
     /// The right-click context menu overlay, present only while open.
@@ -963,7 +969,6 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let WindowSeed { terminal_size, restored } = seed;
         let bounds_observer = Self::start_geometry_tracking(window, cx);
         let (x11_focus, x11_focus_task) = Self::start_x11_focus_guard(window, cx);
         // The focus observer is unconditional: the X11 guard is only one
@@ -972,8 +977,7 @@ impl TerminalView {
             .observe_window_activation(window, |view, window, ctx| view.on_activation(window, ctx));
         let (bell, bell_subscription) = Self::start_bell_gate(window, cx);
         Self::register_close_veto(window, cx);
-        // Load the config and start the file watcher in one step so an edit
-        // saved after this point reaches the window without a restart.
+        // Start config watching before constructing surfaces that consume it.
         let config = ConfigRuntime::start();
         let notifications = Self::start_notifications(&shared, &config, window, cx);
         let drivers = Self::start_drivers(Arc::clone(&shared.generation), config.signal(), cx);
@@ -1012,11 +1016,11 @@ impl TerminalView {
             prompt_bar_enabled,
             shell,
             pane_sizes: HashMap::new(),
-            focused_pane_size: terminal_size,
+            focused_pane_size: seed.terminal_size,
             last_reported_tree: None,
             titlebar,
             chrome,
-            terminal_size,
+            terminal_size: seed.terminal_size,
             // The strip starts empty and is filled by the reader's first
             // `SessionList`; `sync_tabs` pushes it into the titlebar on the
             // next redraw so the tab row always mirrors live server state.
@@ -1027,6 +1031,7 @@ impl TerminalView {
             settings_window: None,
             command_palette: None,
             find_overlay: None,
+            remote_connect: RemoteConnect::new(),
             context_menu: None,
             dialog: None,
             update_dialog_kind: None,
@@ -1049,7 +1054,7 @@ impl TerminalView {
             _lifecycle_task: drivers.0,
             _activation_observer: activation_observer,
             _bell_subscription: bell_subscription,
-            restore: RestoreRuntime::new(restored),
+            restore: RestoreRuntime::new(seed.restored),
             _bounds_observer: bounds_observer,
         }
     }
@@ -1678,8 +1683,17 @@ impl TerminalView {
             PaletteAction::Automation(automation) => {
                 self.execute_automation_action(automation, ActionOrigin::Local, cx);
             }
-            PaletteAction::OpenRemoteConnect => self.refresh_remote_peers(),
+            PaletteAction::OpenRemoteConnect => self.open_remote_connect(cx),
         }
+    }
+
+    /// Raise the client-local remote picker before requesting fresh peer lists.
+    fn open_remote_connect(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.remote_connect.open();
+        self.refresh_remote_peers();
+        tracing::info!("opened remote-connect picker");
+        cx.notify();
     }
 
     /// Re-request both connect-picker device lists from the local server: the
@@ -1697,6 +1711,145 @@ impl TerminalView {
         if let Err(error) = self.sink.list_lan_peers() {
             tracing::warn!(%error, "LAN peer list request dropped: IPC writer closed");
         }
+    }
+
+    /// Copy reader-owned peer snapshots into the picker while it is still on the
+    /// peer step. `RemoteConnect` ignores these updates after a target is chosen,
+    /// so a late list reply cannot replace the window list the user is reading.
+    fn sync_remote_connect(&mut self) {
+        if !self.remote_connect.is_active() {
+            return;
+        }
+        if let Ok(remote) = self.shared.remote.lock() {
+            self.remote_connect.set_peers(remote.peers().to_vec());
+        }
+        if let Ok(lan) = self.shared.lan.lock() {
+            self.remote_connect.set_lan_peers(lan.peers().to_vec());
+        }
+    }
+
+    /// Route a GPUI keystroke into the renderer-independent picker state.
+    fn handle_remote_connect_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if !self.remote_connect.is_active() {
+            return false;
+        }
+        let key = match event.keystroke.key.as_str() {
+            "escape" => PickerKey::Escape,
+            "enter" => PickerKey::Enter,
+            "up" => PickerKey::Up,
+            "down" => PickerKey::Down,
+            "tab" => PickerKey::Tab,
+            "backspace" => PickerKey::Backspace,
+            "v" if event.keystroke.modifiers.control || event.keystroke.modifiers.platform => {
+                PickerKey::Paste
+            }
+            _ => event
+                .keystroke
+                .key_char
+                .as_ref()
+                .and_then(|text| text.chars().next())
+                .map_or(PickerKey::Char('\0'), PickerKey::Char),
+        };
+        let action = self.remote_connect.handle_key(key);
+        self.apply_remote_connect_action(action, cx);
+        true
+    }
+
+    /// Execute the picker intent on the foreground thread.
+    fn apply_remote_connect_action(&mut self, action: RemoteConnectAction, cx: &mut Context<Self>) {
+        match action {
+            RemoteConnectAction::None => {}
+            RemoteConnectAction::Redraw => cx.notify(),
+            RemoteConnectAction::Close => {
+                self.remote_connect.close();
+                cx.notify();
+            }
+            RemoteConnectAction::RequestPeers => {
+                self.refresh_remote_peers();
+                cx.notify();
+            }
+            RemoteConnectAction::ProbeWindows { host, port, transport } => {
+                Self::probe_remote_windows(host, port, transport, cx);
+                cx.notify();
+            }
+            RemoteConnectAction::Attach { host, port, window_id, transport } => {
+                spawn_remote_picker_client(transport, &host, port, Some(window_id));
+                self.remote_connect.close();
+                cx.notify();
+            }
+            RemoteConnectAction::NewWindow { host, port, transport } => {
+                spawn_remote_picker_client(transport, &host, port, None);
+                self.remote_connect.close();
+                cx.notify();
+            }
+            RemoteConnectAction::PasteManual => {
+                match self.clipboard.handle.read(ClipboardSelection::Clipboard) {
+                    Ok(text) => self.remote_connect.append_manual(&text),
+                    Err(error) => tracing::debug!(?error, "remote picker paste ignored"),
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Probe a selected peer before opening a remote-control child process.
+    fn probe_remote_windows(
+        host: String,
+        port: u16,
+        transport: PeerTransport,
+        cx: &mut Context<Self>,
+    ) {
+        match transport {
+            PeerTransport::Lan => Self::probe_lan_picker_windows(host, port, cx),
+            PeerTransport::Tailnet => Self::probe_tailnet_picker_windows(host, port, cx),
+        }
+    }
+
+    /// Bridge the LAN picker probe onto Tokio while its approval notice remains
+    /// on GPUI's foreground executor.
+    fn probe_lan_picker_windows(host: String, port: u16, cx: &mut Context<Self>) {
+        let (pending_tx, mut pending_rx) = unbounded_channel();
+        let probe = gpui_tokio::Tokio::spawn(cx, async move {
+            probe_lan_picker_windows(host, port, pending_tx).await
+        });
+        cx.spawn(async move |view, app| {
+            while pending_rx.recv().await.is_some() {
+                mark_remote_picker_awaiting_approval(&view, app);
+            }
+        })
+        .detach();
+        cx.spawn(async move |view, app| {
+            let probe = match probe.await {
+                Ok(probe) => probe,
+                Err(error) => {
+                    tracing::warn!(%error, "Tokio LAN picker probe stopped unexpectedly");
+                    RemotePickerProbe::LanFailure(LanConnectOutcome::ConnectionFailure)
+                }
+            };
+            apply_remote_picker_probe(&view, app, probe);
+        })
+        .detach();
+    }
+
+    /// Bridge the tailnet picker probe onto Tokio, then apply its result on the
+    /// GPUI-owned view.
+    fn probe_tailnet_picker_windows(host: String, port: u16, cx: &mut Context<Self>) {
+        let probe =
+            gpui_tokio::Tokio::spawn(
+                cx,
+                async move { probe_tailnet_picker_windows(host, port).await },
+            );
+        cx.spawn(async move |view, app| {
+            let probe = match probe.await {
+                Ok(probe) => probe,
+                Err(error) => {
+                    tracing::warn!(%error, "Tokio tailnet picker probe stopped unexpectedly");
+                    RemotePickerProbe::TailnetFailure(RemoteConnectOutcome::ConnectionFailure)
+                }
+            };
+            apply_remote_picker_probe(&view, app, probe);
+        })
+        .detach();
     }
 
     /// Run one shared [`AutomationAction`].
@@ -5029,7 +5182,8 @@ impl TerminalView {
         }
         let overlay_free = self.dialog.is_none()
             && self.workspace_notes_modal.is_none()
-            && self.find_overlay.is_none();
+            && self.find_overlay.is_none()
+            && !self.remote_connect.is_active();
 
         // Config-driven shortcuts are matched against the live bindings, which
         // the config watcher re-parses on every reload — so a saved keybinding
@@ -5071,6 +5225,10 @@ impl TerminalView {
         // reopen the overlay through its own chord.
         if let Some(overlay) = self.find_overlay.clone() {
             Self::handle_find_overlay_key(&overlay, event, cx);
+            return true;
+        }
+
+        if self.handle_remote_connect_key(event, cx) {
             return true;
         }
 
@@ -5917,19 +6075,33 @@ impl TerminalView {
                 .into_any_element()
         })
     }
+
+    /// Build the active remote-connect picker above normal terminal chrome.
+    fn build_remote_picker_overlay(&self) -> Option<gpui::AnyElement> {
+        self.remote_connect.is_active().then(|| {
+            let colors = RemotePickerColors::from(&self.chrome);
+            remote_picker_overlay(&self.remote_connect.view(), &colors)
+        })
+    }
+
+    /// Restore focus when another surface left the terminal window unfocused.
+    fn ensure_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_handle.is_focused(window) {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
 }
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         log_first_frame_timing();
         self.report_perf_frame();
-        if !self.focus_handle.is_focused(window) {
-            window.focus(&self.focus_handle, cx);
-        }
+        self.ensure_focus(window, cx);
         self.capture_geometry(window, cx);
         self.sync_tabs(cx);
         self.sync_find_results(cx);
         self.sync_workspace_notes(cx);
+        self.sync_remote_connect();
         self.reconcile_panes(cx);
         self.sync_grid_geometry(cx);
         let ime = self.sync_ime(cx);
@@ -5939,7 +6111,6 @@ impl Render for TerminalView {
             .status
             .lock()
             .map_or_else(|_| "terminal state unavailable".to_owned(), |guard| guard.clone());
-
         let status_bar = self.render_status_bar(cx);
         let prompt_model = self.build_prompt_model();
         let prompt_colors = self.prompt_colors.with_opacity(self.opacity);
@@ -5949,9 +6120,9 @@ impl Render for TerminalView {
         });
         let tooltip = self.build_tooltip_demo();
         let share = self.build_share_overlay();
+        let remote_picker = self.build_remote_picker_overlay();
         let displaced = self.build_lost_control_overlay(cx);
         let notes_preview = self.build_workspace_notes_preview_overlay();
-
         let opacity = self.opacity;
         // The root itself paints nothing. Every band below fills the window
         // edge to edge, so leaving the root unfilled guarantees each pixel
@@ -6030,10 +6201,171 @@ impl Render for TerminalView {
             .children(notes_preview)
             .children(share)
             .children(tooltip)
+            .children(remote_picker)
             // Last child, so the frozen banner covers every other overlay: while
             // a remote controller holds this window there is nothing else to
             // interact with.
             .children(displaced)
+    }
+}
+
+/// Apply a picker result on the window thread, logging only a dropped view.
+fn update_remote_picker(
+    view: &WeakEntity<TerminalView>,
+    app: &mut AsyncApp,
+    update: impl FnOnce(&mut TerminalView, &mut Context<TerminalView>),
+) {
+    if let Err(error) = view.update(app, |this, view_cx| update(this, view_cx)) {
+        tracing::debug!(?error, "remote picker update dropped with its window");
+    }
+}
+
+/// Show the interim LAN approval state on the GPUI-owned picker.
+fn mark_remote_picker_awaiting_approval(view: &WeakEntity<TerminalView>, app: &mut AsyncApp) {
+    update_remote_picker(view, app, |this, view_cx| {
+        this.remote_connect.on_awaiting_approval();
+        view_cx.notify();
+    });
+}
+
+/// A Tokio-owned picker probe result, applied only after hopping back to the
+/// foreground thread that owns the GPUI view.
+enum RemotePickerProbe {
+    Windows { host: String, port: u16, windows: Vec<WindowInfo> },
+    TailnetFailure(RemoteConnectOutcome),
+    LanFailure(LanConnectOutcome),
+}
+
+/// Fold a completed remote-picker probe into the GPUI-owned picker state.
+fn apply_remote_picker_probe(
+    view: &WeakEntity<TerminalView>,
+    app: &mut AsyncApp,
+    probe: RemotePickerProbe,
+) {
+    update_remote_picker(view, app, |this, view_cx| {
+        match probe {
+            RemotePickerProbe::Windows { host, port, windows } => {
+                this.remote_connect.set_windows(&host, port, windows);
+            }
+            RemotePickerProbe::TailnetFailure(outcome) => {
+                this.remote_connect.on_dial_outcome(outcome);
+            }
+            RemotePickerProbe::LanFailure(outcome) => {
+                this.remote_connect.on_lan_dial_outcome(outcome);
+            }
+        }
+        view_cx.notify();
+    });
+}
+
+/// Probe the TLS-and-approval LAN path before presenting the peer's windows.
+async fn probe_lan_picker_windows(
+    host: String,
+    port: u16,
+    pending_tx: UnboundedSender<()>,
+) -> RemotePickerProbe {
+    let Ok(dialer) = LanDialer::build(host.clone(), port).await else {
+        return RemotePickerProbe::LanFailure(LanConnectOutcome::ConnectionFailure);
+    };
+    let Ok(mut stream) = dialer.connect().await else {
+        return RemotePickerProbe::LanFailure(LanConnectOutcome::ConnectionFailure);
+    };
+    let outcome = lan_dial::handshake(&mut stream, lan_dial::local_device_name(), move || {
+        _ = pending_tx.send(());
+    })
+    .await;
+    if outcome != LanConnectOutcome::Accepted {
+        return RemotePickerProbe::LanFailure(outcome);
+    }
+    let reply = async {
+        write_message(&mut stream, &ClientMessage::ListWindows).await?;
+        read_message::<ServerMessage, _>(&mut stream).await
+    }
+    .await;
+    match reply {
+        Ok(ServerMessage::WindowList { windows }) => {
+            RemotePickerProbe::Windows { host, port, windows }
+        }
+        Ok(other) => {
+            tracing::warn!(?other, "unexpected LAN picker window-probe reply");
+            RemotePickerProbe::LanFailure(LanConnectOutcome::ConnectionFailure)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "LAN picker window probe failed");
+            RemotePickerProbe::LanFailure(LanConnectOutcome::ConnectionFailure)
+        }
+    }
+}
+
+/// Probe the tailnet path before presenting the peer's windows.
+async fn probe_tailnet_picker_windows(host: String, port: u16) -> RemotePickerProbe {
+    let dialer = RemoteDialer::new(host.clone(), port);
+    let Ok(mut stream) = dialer.connect().await else {
+        return RemotePickerProbe::TailnetFailure(RemoteConnectOutcome::ConnectionFailure);
+    };
+    let outcome = remote_handshake::perform_remote_handshake(
+        &mut stream,
+        remote_handshake::local_device_name(),
+    )
+    .await;
+    if outcome != RemoteConnectOutcome::Accepted {
+        return RemotePickerProbe::TailnetFailure(outcome);
+    }
+    let reply = async {
+        write_message(&mut stream, &ClientMessage::ListWindows).await?;
+        read_message::<ServerMessage, _>(&mut stream).await
+    }
+    .await;
+    match reply {
+        Ok(ServerMessage::WindowList { windows }) => {
+            RemotePickerProbe::Windows { host, port, windows }
+        }
+        Ok(other) => {
+            tracing::warn!(?other, "unexpected remote picker window-probe reply");
+            RemotePickerProbe::TailnetFailure(RemoteConnectOutcome::ConnectionFailure)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "remote picker window probe failed");
+            RemotePickerProbe::TailnetFailure(RemoteConnectOutcome::ConnectionFailure)
+        }
+    }
+}
+
+/// Spawn the selected remote-control window with the transport markers consumed
+/// by [`run_connection`]. The picker never repurposes this local window: a
+/// remote attachment is a fresh client process with its own GPUI window.
+fn spawn_remote_picker_client(
+    transport: PeerTransport,
+    host: &str,
+    port: u16,
+    window_id: Option<WindowId>,
+) {
+    let exe =
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("scribe-client-gpui"));
+    let mut command = std::process::Command::new(&exe);
+    match transport {
+        PeerTransport::Tailnet => {
+            command.env(remote_handshake::REMOTE_DIAL_ENV, format!("{host}:{port}"));
+            command.env_remove(remote_handshake::LAN_DIAL_ENV);
+        }
+        PeerTransport::Lan => {
+            command.env(remote_handshake::LAN_DIAL_ENV, format!("{host}:{port}"));
+            command.env_remove(remote_handshake::REMOTE_DIAL_ENV);
+        }
+    }
+    if let Some(window_id) = window_id {
+        command.env(remote_handshake::REMOTE_WINDOW_ENV, window_id.to_full_string());
+    } else {
+        command.env_remove(remote_handshake::REMOTE_WINDOW_ENV);
+    }
+    command.env_remove(remote_handshake::REMOTE_TAKEOVER_ENV);
+    match command.spawn() {
+        Ok(child) => {
+            tracing::info!(pid = child.id(), %host, port, ?transport, ?window_id, "spawned remote picker client");
+        }
+        Err(error) => {
+            tracing::warn!(exe = %exe.display(), %error, "failed to spawn remote picker client");
+        }
     }
 }
 
@@ -6165,6 +6497,9 @@ fn main() {
     let (shared, sink) = start_window_backend(terminal_size);
 
     application().run(move |cx: &mut App| {
+        // Picker probes use Tokio networking while all view mutations return
+        // through GPUI tasks, so both runtimes remain on their owning threads.
+        gpui_tokio::init(cx);
         // Register the embedded Symbols Nerd Font before anything shapes a
         // line: `load_family` caches per-family lookups, so a later add could
         // never displace a cached miss for the fallback chain's first entry.
