@@ -94,6 +94,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "f962
   "x11",
   "wayland",
 ] }
+gpui_tokio = { git = "https://github.com/zed-industries/zed.git", rev = "f96212f2c50f54d93712fa130d6226b1ce7d76b5" }
 wgpu = { version = "29.0", default-features = false, features = [
   "vulkan",
   "gles",

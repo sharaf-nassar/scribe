@@ -405,7 +405,7 @@ further requirements that are not reachable today.
 | Prompt bar and tab context meter | `US4-1` | elapsed timer, context meter, dismiss/copy, `%` suffix | visual-E2E | `main.rs::TerminalView::build_prompt_model` → `prompt_bar::build_model` → `prompt_bar::render`; the tab suffix via `main.rs::TerminalView::sync_tabs` → `tab_bar::context_suffix`, both fed by `ai_indicator::AiStateTracker::context_for` | required |
 | Workspace accent colours and badges | `US4-3` | region accents and status badges | visual-E2E | `main.rs::TerminalView::next_region_accent` → `PaneShell::split_workspace`, painted through `main.rs::pane_border`; the tmux/session/share badges via `status_bar::build_model` — `tests/e2e/visual/workspace-split.sh` | required |
 | Workspace notes hover preview | `US4-3` | hover preview over the notes affordance | visual-E2E | `titlebar::TitlebarView` emits `WorkspaceNotesHover` from its notes affordance → `main.rs::TerminalView::set_workspace_notes_preview` creates `workspace_notes_preview::WorkspaceNotesPreviewView`, requests the server snapshot, and renders it on the live overlay layer — `tests/e2e/visual/workspace-notes.sh` | required |
-| Remote connect picker overlay | `US4-4` | peer picker UI | visual-E2E | — (missing) `remote::RemoteConnect` models the picker but no GPUI view renders it; `main.rs::TerminalView::refresh_remote_peers` surfaces the peer count on the status strip instead. Same gap the "LAN and sharing boundary" section records | required |
+| Remote connect picker overlay | `US4-4` | peer picker UI | visual-E2E | `main.rs::TerminalView::open_remote_connect` → `remote::RemoteConnect` → `remote_picker::remote_picker_overlay`; the picker receives fresh peer snapshots through `TerminalView::sync_remote_connect`, probes a selected tailnet peer with `RemoteHandshake` + `ListWindows`, then launches the chosen window with its dial environment — `tests/e2e/visual/remote-control.sh` | required |
 | Status bar segments | `US4-5` | full segment set | visual-E2E | `main.rs::TerminalView::build_status_model` → `status_bar::build_model` → `status_bar::render`, with the CPU/mem/GPU/net sparklines fed by `sys_stats::SystemStatsCollector` — `tests/e2e/visual/window-chrome-bands.sh` | required |
 | xterm-256 palette | `PO-1` | indexed colour resolution | golden | `main.rs` builds one `color::TerminalColors` per theme, which owns `palette::ColorPalette`; `TerminalColors::resolve_color` resolves every indexed cell on the paint path. `tools/reachability-baseline.txt` lists `palette` as an unwired *module* because that ratchet counts only `main.rs`'s direct import closure — the module is reached transitively through `color` | required |
 | Colour semantics (bold→bright, DIM, sRGB) | `PO-3` | per-cell colour resolution | golden | `terminal_element.rs::TerminalElement::paint_grid` → `color::TerminalColors::resolve_cell_colors` → `color::bold_to_bright`, `color::apply_dim`, `color::srgb_to_linear_rgba`, `color::boost_srgb_brightness` | required |
@@ -413,8 +413,8 @@ further requirements that are not reachable today.
 | Desktop notification dispatcher | `PO-9` | AI attention notifications | visual-E2E | `main.rs::TerminalView::start_notifications` → `notification_dispatcher::spawn_dispatcher` (the one D-Bus connection), gated by `notifications::NotificationCenter::on_ai_state_changed` against the live config and focus position; a reported click routes back to select the session's tab and raise the window — `tests/e2e/visual/notifications.sh` | required |
 | Server lifecycle management | `PO-10` | autostart, stale socket, staleness check | scripted-E2E | `main.rs::run_local_connection` → `server_lifecycle::connect_or_start_server`, which names a missing socket apart from a stale one and carries the diagnosis into the status line, then `server_lifecycle::connected_server_staleness` holds the connected server up against the installed binary — `tests/e2e/visual/server-lifecycle.sh` | required |
 
-**Reachability:** 28 of 29 rows name a live-path symbol; 0 are unwired and 1 is
-missing: the remote connect picker overlay. None of the original five had a row
+**Reachability:** 29 of 29 rows name a live-path symbol; 0 are unwired and 0 are
+missing. None of the original five had a row
 before 2026-07-27, so none was scored by the gate.
 
 ## Removed configuration keys
@@ -457,18 +457,15 @@ with them. They are the launch gate's metric — not the unit-test count.
 | Server messages | 59 | 59 | 0 | 0 |
 | Input and keybinding actions | 54 | 54 | 0 | 0 |
 | Rendering and window | 6 | 6 | 0 | 0 |
-| Spec behaviour requirements | 29 | 28 | 0 | 1 |
+| Spec behaviour requirements | 29 | 29 | 0 | 0 |
 | Removed configuration keys | 9 | 9 | 0 | 0 |
-| **Total** | **203** | **202** | **0** | **1** |
+| **Total** | **203** | **203** | **0** | **0** |
 
 Excluding the nine removed-configuration-key rows (satisfied by *absence* of
-behaviour), the user-facing parity surface is **194 rows, of which 193 are
-reachable (99%)** and 1 are not. **1 of those 194** rows — `HookEvent`, whose
+behaviour), the user-facing parity surface is **194 rows, of which 194 are
+reachable (100%)** and 0 are not. **1 of those 194** rows — `HookEvent`, whose
 named symbol is `scribe-hook-helper`'s `main` — is out-of-client by design, so
-the in-client figure is **192 of 194**.
-
-The one unreachable row is the remote connect picker overlay in the
-spec-behaviour table.
+the in-client figure is **193 of 194**.
 
 At the `f56ef95` audit baseline the same surface was 164 rows with 51 reachable
 (31%), against a roll-up total of 173 rows and 60 reachable; the sixth
@@ -563,9 +560,7 @@ Three fix units closed this family: FU-19 put `share.rs` on the live path
 dial, approval prompt and trust settings (`tests/e2e/visual/lan-approval.sh`,
 `tests/e2e/visual/settings-trust.sh`), and FU-16 wired the feature-013 tailnet
 handshake, peer/environment probe, displaced banner and automation round trip
-(`tests/e2e/visual/remote-control.sh`). One presentation gap remains, and it
-costs no parity row: `remote.rs::RemoteConnect` is ported and unit-tested but
-has no GPUI view, so the peer lists a connect-picker overlay would render
-surface on the status strip instead. `remote` is not among the four modules
-`tools/reachability-baseline.txt` still lists as unwired, because the peer and
-environment state it models does reach the window.
+(`tests/e2e/visual/remote-control.sh`). FU-28 now adds the GPUI presentation:
+`TerminalView::open_remote_connect` and `sync_remote_connect` feed
+`remote_picker::remote_picker_overlay`, whose selected-tailnet-peer probe is
+asserted on the stand-in peer's real TCP wire.

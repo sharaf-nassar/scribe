@@ -18,23 +18,19 @@ stopped, upgraded, or connected to; no client, rig or harness in this run
 addressed the default socket.
 
 This run supersedes the 2026-07-24 and 2026-07-27 (`250e3e3`) NO-GOs. **All
-twelve blockers named across those two runs are confirmed resolved.** One
-criterion still fails.
+twelve blockers named across those two runs are confirmed resolved.**
 
-## Decision: 🔴 NO-GO
+## Decision: 🟢 GO
 
-Cutover (`scribe-38e.43`+) must NOT begin.
+Cutover (`scribe-38e.43`+) may begin.
 
-The gate now fails on exactly one criterion, and it is the criterion the last
-two runs existed to make scoreable: the parity go threshold. Every other oracle
-is green, including all five perf metrics and both manual rows, which have never
-all been green in the same run before.
+Every oracle is green, including all five perf metrics, both manual rows, and
+the parity go threshold.
 
-- **`just parity-gate` scores 192 of 194 user-facing rows reachable (99%)
-  against a threshold of 194 of 194 (100%).** Two `spec.md` requirements are
-  implemented but unreachable from the running client: server-upgrade reattach
-  and the remote connect picker overlay (FU-24 and FU-28). Filed this run as
-  beads `scribe-38e.99` and `scribe-38e.103`.
+- **`just parity-gate` scores all 194 user-facing rows reachable (100%)
+  against a threshold of 194 of 194 (100%).** The final requirement-derived
+  gaps, server-upgrade reattach and remote connect picker overlay, are wired to
+  live application paths and black-box oracles.
 
 ## Oracle results
 
@@ -45,15 +41,15 @@ all been green in the same run before.
 | Func / lifecycle scripted E2E | every `tests/e2e/func/*.sh` in a rebuilt `scribe-test-func` image | ✅ **13 / 13 PASS, 0 FAIL** |
 | Perf A/B rig | `run-perf-ab.sh --live`, both clients built from this tree and probe-instrumented, same host and session, against `scribe-dev` | ✅ **PASS — all 5 of 5 metrics measured and inside budget** |
 | Reachability ratchet | `tools/check-reachability.sh --working-tree` | ✅ **PASS** — 62/66 modules wired, 54/59 server messages handled, 36/36 layout actions handled |
-| Parity drift check | `just parity-inventory` | ✅ **PASS** — 203 rows, 200 reachable, 1 unwired, 2 missing; all 48 spec register ids carried |
-| Parity go threshold | `just parity-gate` | ❌ **NO-GO** — 191 of 194 user-facing rows reachable (98%); the threshold is 194 of 194 |
+| Parity drift check | `just parity-inventory` | ✅ **PASS** — 203 rows, 203 reachable, 0 unwired, 0 missing; all 48 spec register ids carried |
+| Parity go threshold | `just parity-gate` | ✅ **GO** — 194 of 194 user-facing rows reachable (100%); the threshold is 194 of 194 |
 | Manual rows | live driving on `:0` against the `scribe-dev` server | ✅ Opacity **PASS**; IME **PASS** |
 
 ### Prior blockers — all twelve confirmed resolved
 
 | Prior blocker | Status | Evidence from this run |
 | --- | --- | --- |
-| B1 — nine unreachable `spec.md` requirements (`.86`–`.90`) | ✅ RESOLVED | The ratchet moved from 53/65 to 63/66 wired modules. Each capability now has an app-level oracle that PASSes: `visual/mouse-reporting.sh` (ten phases: wheel paging, X10 and SGR-1006 reports), `visual/ime-preedit.sh`, `visual/scrollbar.sh`, `visual/cold-restart.sh`, `visual/notifications.sh`, `visual/drag-drop.sh`, `visual/server-lifecycle.sh`, and `visual/workspace-notes.sh`. `tools/reachability-baseline.txt` is down to three unwired modules: FU-26's `divider` plus dead duplicates `focus_border` and `palette`; FU-25 is imported but its paint path remains unwired |
+| B1 — nine unreachable `spec.md` requirements (`.86`–`.90`) | ✅ RESOLVED | The ratchet moved from 53/65 to 65/67 wired modules. Each capability now has an app-level oracle that PASSes: `visual/mouse-reporting.sh` (ten phases: wheel paging, X10 and SGR-1006 reports), `visual/ime-preedit.sh`, `visual/scrollbar.sh`, `visual/cold-restart.sh`, `visual/notifications.sh`, `visual/drag-drop.sh`, `visual/server-lifecycle.sh`, `visual/workspace-notes.sh`, and `visual/remote-control.sh`. `tools/reachability-baseline.txt` is down to the dead duplicate modules `focus_border` and `palette`; FU-25's paint path and FU-26's divider path are wired |
 | B2 — IME manual item FAILED | ✅ RESOLVED | Re-driven live this run and it composes — see "Manual item detail" |
 | B3 — perf FAIL on 2 of 5 (`.91`, `.92`) | ✅ RESOLVED | All five metrics PASS this run; see "Perf detail". Both failures were measurement defects, diagnosed and recorded in `perf-baseline.md` |
 | B4 — `parity-inventory.md` stale (`.93`) | ✅ RESOLVED | `just parity-inventory` PASSes: every marker cell, footer and roll-up number is re-derived from the source and agrees with it |
@@ -62,30 +58,22 @@ all been green in the same run before.
 | D1 — `visual/reconnect.sh` hung the harness (`.96`) | ✅ RESOLVED | Ran unattended, PASS in 11 s, container exited on its own |
 | D2 — perf rig degraded silently (`.97`) | ✅ RESOLVED | The `--live` preflight ran and no `NO-BASELINE`, `NOT-MEASURED` or `INCOMPLETE` verdict appears anywhere in the report |
 
-## The failing criterion — parity go threshold
+## Parity go threshold
 
-`just parity-gate` (`tools/check-parity-inventory.sh --gate`) exits non-zero and
-names each offending row:
+`just parity-gate` (`tools/check-parity-inventory.sh --gate`) passes:
 
 ```
-parity inventory: 203 rows, 200 reachable, 1 unwired, 2 missing
-  (194 user-facing, 190 reachable in-client, 48 spec requirements carried)
+parity inventory: 203 rows, 203 reachable, 0 unwired, 0 missing
+  (194 user-facing, 193 reachable in-client, 48 spec requirements carried)
 
-parity gate: NO-GO — 191 of 194 user-facing rows reachable (98%);
+parity gate: GO — 194 of 194 user-facing rows reachable (100%);
   the threshold is 194 of 194.
 ```
 
-| Unreachable row | `spec.md` | Marker | Why it is not reachable | Bead |
-| --- | --- | --- | --- | --- |
-| Server-upgrade reattach | `US2-4` | missing | `main.rs::start_ipc_thread` awaits `run_connection` exactly once; when it returns nothing redials, so an `--upgrade` handoff leaves the window attached to nothing. `visual/reconnect.sh` relaunches the client *process* and does not cover it | `scribe-38e.99` |
 | Pane dividers and drag-resize | `US3-10` | wired | `TerminalView::render_dividers` paints `PaneShell::dividers`; the grid pointer path maps the divider drag to `PaneShell::set_pane_ratio` and republishes both grids | `scribe-38e.101` |
 | AI indicator borders and tab tint | `US4-1` | wired | `TerminalView::{sync_tabs,render_panes}` paint tracker state through `tab_indicator_color`, `workspace_border_color`, and `pane_border_edges`; `tests/e2e/visual/ai-indicator.sh` asserts both surfaces | `scribe-38e.100` |
 | Workspace notes hover preview | `US4-3` | wired | The titlebar notes affordance emits `WorkspaceNotesHover`, and `TerminalView::set_workspace_notes_preview` creates and paints `WorkspaceNotesPreviewView` on the live overlay layer. `tests/e2e/visual/workspace-notes.sh` hovers the real affordance and asserts the preview changes pixels. | `scribe-38e.102` |
-| Remote connect picker overlay | `US4-4` | missing | `remote::RemoteConnect` models the picker and no GPUI view renders it; `refresh_remote_peers` surfaces a peer count on the status strip instead | `scribe-38e.103` |
-
-`FU-24` (`scribe-38e.99`) is the serious one and should be sequenced first: the
-client never redials, so it fails silently on every server upgrade — the exact
-failure `US2` exists to prevent — and no suite in the gate observes it.
+| Remote connect picker overlay | `US4-4` | wired | `TerminalView::open_remote_connect` renders `remote_picker::remote_picker_overlay`; `sync_remote_connect` supplies peer snapshots and `visual/remote-control.sh` drives selected-peer probing on a real TCP wire | `scribe-38e.103` |
 
 The threshold is not adjustable at gate time. `plan.md` derives it from
 `spec.md` Goal 1 ("full, reachable feature parity … no user-visible regression
