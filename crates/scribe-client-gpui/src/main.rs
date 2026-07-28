@@ -7819,14 +7819,19 @@ where
     R: AsyncReadExt + Unpin,
 {
     let mut registry = session_lifecycle::SessionRegistry::new();
+    let mut first_session_list = true;
     loop {
         let message: ServerMessage =
             read_message(&mut reader).await.map_err(|error| error.to_string())?;
+        let is_session_list = matches!(&message, ServerMessage::SessionList { .. });
         // The focused tab is shared state: the view moves it for `next_tab` /
         // `select_tab_N`, so output gating reads it fresh on every message
         // rather than caching a local `attached`.
         let attached = ctx.active_session.lock().ok().and_then(|guard| *guard);
-        dispatch_server_message(message, &ctx, &mut registry, attached)?;
+        dispatch_server_message(message, &ctx, &mut registry, attached, first_session_list)?;
+        if is_session_list {
+            first_session_list = false;
+        }
     }
 }
 
@@ -7845,13 +7850,14 @@ fn dispatch_server_message(
     ctx: &ReaderCtx,
     registry: &mut session_lifecycle::SessionRegistry,
     attached: Option<SessionId>,
+    first_session_list: bool,
 ) -> Result<(), String> {
     match message {
         ServerMessage::Welcome { window_id, participant_id, clipboard_gating, .. } => {
             on_welcome(ctx, registry, window_id, participant_id, clipboard_gating);
         }
         ServerMessage::SessionList { sessions, workspaces, .. } => {
-            on_session_list(ctx, registry, &sessions, &workspaces, attached)?;
+            on_session_list(ctx, registry, &sessions, &workspaces, first_session_list)?;
         }
         ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
             registry.on_session_created(session_id, workspace_id);
@@ -7981,7 +7987,7 @@ fn on_session_list(
     registry: &mut session_lifecycle::SessionRegistry,
     sessions: &[SessionInfo],
     workspaces: &[scribe_common::protocol::WorkspaceListEntry],
-    attached: Option<SessionId>,
+    first_on_connection: bool,
 ) -> Result<(), String> {
     registry.rebuild_from_session_list(sessions);
     // Latched before anything else folds the list in: the cold-restart replay
@@ -7996,7 +8002,71 @@ fn on_session_list(
     update_chrome_metadata(ctx, |metadata| {
         metadata.seed_from_session_list(sessions, workspaces);
     });
+    if first_on_connection {
+        reattach_visible_sessions(ctx, sessions)?;
+    }
+    let attached = ctx.active_session.lock().ok().and_then(|guard| *guard);
     sync_tab_strip(ctx, sessions, attached)
+}
+
+/// Reattach panes retained by the live window to a replacement server stream.
+///
+/// The local `attached` set describes which sessions the window still shows,
+/// but an `AttachSessions` grant belongs to one IPC connection. A server
+/// handoff therefore needs to replay the set after the replacement connection's
+/// first `SessionList`. Dimensions come from each pane's existing display grid
+/// so split panes keep their geometry across the handoff.
+fn reattach_visible_sessions(ctx: &ReaderCtx, sessions: &[SessionInfo]) -> Result<(), String> {
+    let live: HashSet<_> = sessions.iter().map(|session| session.session_id).collect();
+    let retained = ctx.attached.lock().map_or_else(
+        |_| Vec::new(),
+        |mut attached| {
+            attached.retain(|session_id| live.contains(session_id));
+            sessions
+                .iter()
+                .map(|session| session.session_id)
+                .filter(|session_id| attached.contains(session_id))
+                .collect::<Vec<_>>()
+        },
+    );
+    if retained.is_empty() {
+        return Ok(());
+    }
+
+    let dimensions = ctx.panes.lock().map_or_else(
+        |_| vec![ctx.size; retained.len()],
+        |panes| {
+            retained
+                .iter()
+                .map(|session_id| {
+                    let Some((cols, rows)) = panes.dimensions(*session_id) else {
+                        return ctx.size;
+                    };
+                    TerminalSize {
+                        cols: u16::try_from(cols).unwrap_or(ctx.size.cols),
+                        rows: u16::try_from(rows).unwrap_or(ctx.size.rows),
+                        cell_width: ctx.size.cell_width,
+                        cell_height: ctx.size.cell_height,
+                    }
+                })
+                .collect()
+        },
+    );
+
+    tracing::info!(sessions = retained.len(), "reattaching visible sessions");
+    for session_id in &retained {
+        tracing::info!(%session_id, "attaching to session");
+    }
+    ctx.out_tx
+        .send(ClientMessage::AttachSessions {
+            session_ids: retained.clone(),
+            dimensions: dimensions.clone(),
+        })
+        .map_err(|_| "writer channel closed".to_owned())?;
+    for (session_id, size) in retained.iter().zip(dimensions) {
+        ctx.sink.resize(*session_id, size).map_err(|error| error.to_string())?;
+    }
+    ctx.sink.subscribe(retained).map_err(|error| error.to_string())
 }
 
 /// Store one `SearchResults` reply for the find overlay and the paint path.

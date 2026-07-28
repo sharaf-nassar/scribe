@@ -1,235 +1,219 @@
 # GPUI client launch gate — go/no-go checklist (scribe-38e.42)
 
-Decision date: 2026-07-27 (third run). Evaluated against `main` at `544f1a5`.
-Driven by the workspace unit/golden/gpui-test oracle, the visual-E2E and
-func/lifecycle scripted-E2E Docker suites (both images rebuilt from this tree),
-the perf A/B rig (`tools/perf-ab-rig`) in `--live` mode against the isolated
-`scribe-dev` server, the mechanical reachability ratchet
-(`tools/check-reachability.sh`), the parity drift check and go-threshold scorer
-(`just parity-inventory` / `just parity-gate`), and live manual driving of the
-new GPUI client on `:0`.
+Decision date: 2026-07-28 (fourth run).
 
-Every binary under gate was built from this tree. The manual rows were driven
-against `target/release/scribe-client-gpui` staged under the `scribe-dev`
-runtime slug — the installed `/usr/bin/scribe-dev` dates from 2026-07-23 and no
-longer matches, so it was deliberately not used. The production server
-(`/usr/bin/scribe-server`, pid 492537, started 2026-07-21) was never restarted,
-stopped, upgraded, or connected to; no client, rig or harness in this run
-addressed the default socket.
+This run evaluates the working tree based on `main` at
+`dd5b1ed62e2803beaf166b5d3e67fa6a18431da4`. The commit containing this
+artifact is the launch-gate candidate. It supersedes the three prior NO-GO
+runs.
 
-This run supersedes the 2026-07-24 and 2026-07-27 (`250e3e3`) NO-GOs. **All
-twelve blockers named across those two runs are confirmed resolved.**
+## Decision: GO
 
-## Decision: 🟢 GO
+Cutover work (`scribe-38e.43` and later) may begin.
 
-Cutover (`scribe-38e.43`+) may begin.
+Every launch-blocking oracle passes. All 194 user-facing parity rows are
+reachable, every row's declared verification method is green, all five
+performance metrics are inside budget, and both live manual rows pass.
 
-Every oracle is green, including all five perf metrics, both manual rows, and
-the parity go threshold.
+There are no launch blockers or waived failures.
 
-- **`just parity-gate` scores all 194 user-facing rows reachable (100%)
-  against a threshold of 194 of 194 (100%).** The final requirement-derived
-  gaps, server-upgrade reattach and remote connect picker overlay, are wired to
-  live application paths and black-box oracles.
+## Candidate identity
 
-## Oracle results
+Two byte-identified GPUI binaries drove the run:
 
-| Oracle | How driven | Result |
+| Candidate | SHA-256 | Use |
 | --- | --- | --- |
-| Unit / golden / `#[gpui::test]` | `cargo test --workspace --no-fail-fast` | ✅ **967 passed, 0 failed, 0 ignored** across 20 suites (947 at the prior gate) |
-| Visual E2E | every `tests/e2e/visual/*.sh` in a rebuilt `scribe-test-visual` image, each with the env its `just` recipe documents | ✅ **39 / 39 PASS, 0 FAIL** |
-| Func / lifecycle scripted E2E | every `tests/e2e/func/*.sh` in a rebuilt `scribe-test-func` image | ✅ **13 / 13 PASS, 0 FAIL** |
-| Perf A/B rig | `run-perf-ab.sh --live`, both clients built from this tree and probe-instrumented, same host and session, against `scribe-dev` | ✅ **PASS — all 5 of 5 metrics measured and inside budget** |
-| Reachability ratchet | `tools/check-reachability.sh --working-tree` | ✅ **PASS** — 62/66 modules wired, 54/59 server messages handled, 36/36 layout actions handled |
-| Parity drift check | `just parity-inventory` | ✅ **PASS** — 203 rows, 203 reachable, 0 unwired, 0 missing; all 48 spec register ids carried |
-| Parity go threshold | `just parity-gate` | ✅ **GO** — 194 of 194 user-facing rows reachable (100%); the threshold is 194 of 194 |
-| Manual rows | live driving on `:0` against the `scribe-dev` server | ✅ Opacity **PASS**; IME **PASS** |
+| User-supplied `/usr/bin/scribe-dev` | `1b63ce9241b34fefbb7ced370af0146a276a07b5be3a1bef50bb6a768afbd4e2` | Live perf A/B, opacity, and IME on `:0` |
+| `target/release/scribe-client-gpui` after the gate fixes | `b3791f69b23b8515ed9354aded13dce16f3f3a841078e6461fd0d66bea955f75` | Rebuilt visual image and source-level quality gates |
 
-### Prior blockers — all twelve confirmed resolved
+The source-only delta found during this run is confined to server-upgrade
+reattachment plus E2E oracle corrections. The rebuilt source candidate drove
+the affected black-box cases and the complete 41-case visual suite.
 
-| Prior blocker | Status | Evidence from this run |
+The stable install was not used. `/usr/bin/scribe-server` (PID `3390291`) and
+`/usr/bin/scribe-dev-server --upgrade` (PID `482730`) were never restarted,
+stopped, upgraded, or replaced.
+
+## Required checklist
+
+- [x] Workspace unit, golden, and `#[gpui::test]` suites pass.
+- [x] Every visual E2E script passes in a rebuilt image.
+- [x] Every functional/lifecycle E2E script passes in a rebuilt image.
+- [x] Mechanical reachability ratchet passes.
+- [x] Parity inventory has no drift, unwired rows, or missing requirements.
+- [x] Numeric parity launch threshold passes.
+- [x] All five live A/B performance metrics are measured and pass.
+- [x] Opacity is verified live, including hot reload and clamping.
+- [x] IME preedit and commit are verified live through a real input method.
+- [x] `lat check` passes after behavior and oracle documentation updates.
+- [x] No launch blocker remains.
+
+## Oracle summary
+
+| Oracle | Command / method | Result |
 | --- | --- | --- |
-| B1 — nine unreachable `spec.md` requirements (`.86`–`.90`) | ✅ RESOLVED | The ratchet moved from 53/65 to 65/67 wired modules. Each capability now has an app-level oracle that PASSes: `visual/mouse-reporting.sh` (ten phases: wheel paging, X10 and SGR-1006 reports), `visual/ime-preedit.sh`, `visual/scrollbar.sh`, `visual/cold-restart.sh`, `visual/notifications.sh`, `visual/drag-drop.sh`, `visual/server-lifecycle.sh`, `visual/workspace-notes.sh`, and `visual/remote-control.sh`. `tools/reachability-baseline.txt` is down to the dead duplicate modules `focus_border` and `palette`; FU-25's paint path and FU-26's divider path are wired |
-| B2 — IME manual item FAILED | ✅ RESOLVED | Re-driven live this run and it composes — see "Manual item detail" |
-| B3 — perf FAIL on 2 of 5 (`.91`, `.92`) | ✅ RESOLVED | All five metrics PASS this run; see "Perf detail". Both failures were measurement defects, diagnosed and recorded in `perf-baseline.md` |
-| B4 — `parity-inventory.md` stale (`.93`) | ✅ RESOLVED | `just parity-inventory` PASSes: every marker cell, footer and roll-up number is re-derived from the source and agrees with it |
-| B5 — parity denominator incomplete (`.94`) | ✅ RESOLVED | 48 `spec.md` register ids, every one carried by a row; the check fails when one is not |
-| B6 — no numeric go threshold (`.95`) | ✅ RESOLVED | `plan.md` § "Phase H re-baseline" → "The go threshold" states it and `just parity-gate` scores it. It is scored below, and it is what fails |
-| D1 — `visual/reconnect.sh` hung the harness (`.96`) | ✅ RESOLVED | Ran unattended, PASS in 11 s, container exited on its own |
-| D2 — perf rig degraded silently (`.97`) | ✅ RESOLVED | The `--live` preflight ran and no `NO-BASELINE`, `NOT-MEASURED` or `INCOMPLETE` verdict appears anywhere in the report |
+| Unit / golden / GPUI | `cargo test --workspace --no-fail-fast` | **PASS — 967 passed, 0 failed, 0 ignored across 20 suites** |
+| Visual E2E | all executable `tests/e2e/visual/*.sh`, with each script's documented environment | **PASS — 41/41** |
+| Functional/lifecycle E2E | all `tests/e2e/func/*.sh` | **PASS — 13/13** |
+| Perf A/B | `tools/perf-ab-rig/run-perf-ab.sh --live` | **PASS — 5/5 measured and inside budget** |
+| Reachability | `tools/check-reachability.sh --working-tree` | **PASS — 65/67 modules, 54/59 server messages, 36/36 layout actions** |
+| Parity drift | `just parity-inventory` | **PASS — 203/203 reachable, 0 unwired, 0 missing; all 48 requirement ids carried** |
+| Parity threshold | `just parity-gate` | **GO — 194/194 user-facing rows reachable (100%)** |
+| Manual | live installed GPUI client on `:0` | **PASS — opacity and IME** |
+| Documentation graph | `lat check` | **PASS** |
 
-## Parity go threshold
+## Parity threshold
 
-`just parity-gate` (`tools/check-parity-inventory.sh --gate`) passes:
+`just parity-gate` reports:
 
-```
+```text
 parity inventory: 203 rows, 203 reachable, 0 unwired, 0 missing
   (194 user-facing, 193 reachable in-client, 48 spec requirements carried)
-
-parity gate: GO — 194 of 194 user-facing rows reachable (100%);
-  the threshold is 194 of 194.
+parity gate: GO — 194 of 194 user-facing rows reachable (100%),
+  0 unwired, 0 missing
 ```
 
-| Pane dividers and drag-resize | `US3-10` | wired | `TerminalView::render_dividers` paints `PaneShell::dividers`; the grid pointer path maps the divider drag to `PaneShell::set_pane_ratio` and republishes both grids | `scribe-38e.101` |
-| AI indicator borders and tab tint | `US4-1` | wired | `TerminalView::{sync_tabs,render_panes}` paint tracker state through `tab_indicator_color`, `workspace_border_color`, and `pane_border_edges`; `tests/e2e/visual/ai-indicator.sh` asserts both surfaces | `scribe-38e.100` |
-| Workspace notes hover preview | `US4-3` | wired | The titlebar notes affordance emits `WorkspaceNotesHover`, and `TerminalView::set_workspace_notes_preview` creates and paints `WorkspaceNotesPreviewView` on the live overlay layer. `tests/e2e/visual/workspace-notes.sh` hovers the real affordance and asserts the preview changes pixels. | `scribe-38e.102` |
-| Remote connect picker overlay | `US4-4` | wired | `TerminalView::open_remote_connect` renders `remote_picker::remote_picker_overlay`; `sync_remote_connect` supplies peer snapshots and `visual/remote-control.sh` drives selected-peer probing on a real TCP wire | `scribe-38e.103` |
+The threshold is fixed at every user-facing requirement. No requirement was
+waived or descoped during gate driving.
 
-The threshold is not adjustable at gate time. `plan.md` derives it from
-`spec.md` Goal 1 ("full, reachable feature parity … no user-visible regression
-in functionality"): an unreachable user-facing row *is* a user-visible
-regression, so the only consistent bar is all of them. The only relief valve is
-descoping a requirement in `spec.md` with a recorded decision, which deletes its
-register id and its row and shrinks the denominator rather than lowering the
-bar.
+Every inventory row's own verification method ran:
 
-## Perf detail — 5 of 5 PASS
+| Method | Gate evidence |
+| --- | --- |
+| `visual-E2E` | complete 41-script visual suite |
+| `scripted-E2E` | complete 13-script functional suite plus visual scripts |
+| `visual-E2E (+ golden bytes)` | visual suite plus workspace golden tests |
+| `gpui-test` | workspace test suite |
+| `golden` | workspace test suite |
+| `manual` | live opacity row |
 
-`tools/perf-ab-rig/run-perf-ab.sh --live --new-client
-target/release/scribe-client-gpui --old-client target/release/scribe-client
---scribe-test target/release/scribe-test`, run on `:0` against the isolated
-`scribe-dev` server, which was never restarted. Full report:
+## Performance — 5/5 PASS
+
+The live rig used `/usr/bin/scribe-dev`, the current legacy release client, and
+`target/release/scribe-test`, staged under the isolated `scribe-dev` runtime
+slug. It attached to the existing dev server and never addressed the stable
+socket. Full evidence is in
 [`perf-ab-report.md`](perf-ab-report.md).
 
 | Metric | New client | Old client | Budget | Verdict |
 | --- | --- | --- | --- | --- |
-| Scribe-attributable startup | **29.612 ms** | n/a | ≤ 150 ms absolute | ✅ PASS |
-| Startup to first frame (total) | **705.488 ms** (29.6 Scribe + 677.8 gpui bring-up) | **3238.264 ms** | no worse than old, +10% allowance (≤ 3562.090 ms) | ✅ PASS |
-| Input latency (p50 echo) | **0.214 ms** | **0.248 ms** | no worse than old, +10% allowance | ✅ PASS |
-| cat-firehose throughput | **17.701 MiB/s** | **10.785 MiB/s** | no worse than old, −10% allowance | ✅ PASS |
-| Memory at 10 tabs | **276.191 MiB** | **352.367 MiB** | ≤ old + 20% | ✅ PASS |
-| Scroll fps / dropped | **59.911 fps, 0.000 % dropped** | 39.992 fps, 7.781 % dropped | 60 fps, < 1 % dropped (absolute) | ✅ PASS |
+| Scribe-attributable startup | **28.145 ms** | n/a | ≤ 150 ms | PASS |
+| Startup to first frame | **815.491 ms** | **3200.862 ms** | no worse than old, 10% allowance | PASS |
+| Input latency, p50 echo | **0.216 ms** | **0.236 ms** | no worse than old, 10% allowance | PASS |
+| Cat-firehose throughput | **17.268 MiB/s** | **11.249 MiB/s** | no worse than old, 10% allowance | PASS |
+| Memory at 10 tabs | **270.883 MiB** | **275.355 MiB** | ≤ old + 20% | PASS |
+| Scroll FPS / dropped | **59.706 FPS, 0.416%** | 38.722 FPS, 7.186% | sustained 60 FPS within allowance, <1% dropped | PASS |
 
-No metric reported `NO-BASELINE`, `NOT-MEASURED` or `INCOMPLETE`, and the rig's
-own summary line reads `overall gate verdict: PASS`. This is the first gate run
-in which that is true. Both prior failures were measurement defects rather than
-client regressions, and both are now documented in `perf-baseline.md`: input
-latency was comparing the new client's in-process read stamp against the old
-client's UI-thread backlog, and the scroll metric was reporting `xdotool`'s
-synthetic key rate (a ~47 fps ceiling) for both clients while a stale probe
-stamp inflated the measurement window. Under the unpaced in-pane writer the rig
-now uses, the new client sustains the display's full 60 Hz with zero dropped
-frames and the old client does not reach the target on the same workload.
+No metric reported `NO-BASELINE`, `NOT-MEASURED`, or `INCOMPLETE`. The rig's
+own final verdict is `PASS`.
 
-## Visual E2E detail — 39/39 PASS
+## Visual E2E — 41/41 PASS
 
-`ai-task-label`, `bell`, `clipboard-osc52`, `cold-restart`, `color-emoji`,
-`config-reload`, `dialogs`, `drag-drop`, `find-overlay`, `ime-preedit`,
-`lan-approval`, `mouse-reporting`, `notifications`, `overlay-actions`,
-`overlays`, `pane-workspace-layout`, `paste-confirmation`, `prompt-marks`,
-`reconnect`, `remote-control`, `scrollbar`, `server-lifecycle`,
+The complete suite passed after rebuilding `scribe-test-visual` from this
+working tree:
+
+`ai-indicator`, `ai-task-label`, `bell`, `clipboard-osc52`, `cold-restart`,
+`color-emoji`, `config-reload`, `dialogs`, `drag-drop`, `find-overlay`,
+`ime-preedit`, `lan-approval`, `mouse-reporting`, `notifications`,
+`overlay-actions`, `overlays`, `pane-workspace-layout`,
+`paste-confirmation`, `prompt-marks`, `reconnect`, `remote-control`,
+`scrollbar`, `server-lifecycle`, `server-upgrade-reattach`,
 `session-tooling`, `settings-entry`, `settings-trust`, `share-control`,
 `tab-window-chords`, `terminal-viewport`, `terminal-zoom`, `titlebar`,
-`update-dismiss`, `update-trigger`, `window-chrome-bands`, `window-lifecycle`,
-`window-resize`, `workspace-ipc`, `workspace-notes`, `workspace-split`,
-`x11-focus-guard`. (`update-common.sh` is a helper, not a test.)
+`update-dismiss`, `update-trigger`, `window-chrome-bands`,
+`window-lifecycle`, `window-resize`, `workspace-ipc`, `workspace-notes`,
+`workspace-split`, and `x11-focus-guard`.
 
-Seven are new since the prior gate — `cold-restart`, `drag-drop`,
-`ime-preedit`, `mouse-reporting`, `notifications`, `scrollbar` and
-`server-lifecycle` — and they are the app-level oracles that close prior
-blocker B1.
+`update-common.sh` is a helper, not a test.
 
-`reconnect` finished unattended in 11 s and its container exited on its own,
-confirming the D1 fix (`.96`). `pane-workspace-layout` must be run with the env
-its own header documents, because openbox grabs the shipped Ctrl+Alt+Left
-default; without it phase 7 fails on the harness's window manager rather than on
-the client. It has no dedicated `just` recipe, which is a trap for an unattended
-sweep — see D4.
+## Functional/lifecycle E2E — 13/13 PASS
 
-## Func / lifecycle E2E detail — 13/13 PASS
+The complete suite passed after rebuilding `scribe-test-func`:
 
 `ai-context-thresholds`, `ai-state-indicator`, `cold-restart`,
 `failure-server-down`, `failure-socket-loss`, `hot-reload`,
 `keybindings-validation`, `multi-window`, `reconnect`, `shell-integration`,
-`smoke`, `terminal-shortcuts`, `workspace-split`.
+`smoke`, `terminal-shortcuts`, and `workspace-split`.
 
-`func/cold-restart.sh` still uses the daemon as the client stand-in (prior D3),
-but the client's own restore path is now covered by `visual/cold-restart.sh`,
-which kills the client, cold-restarts the server and relaunches it.
+## Manual evidence
 
-## Parity-inventory results by verification method
+Both manual rows used the installed `/usr/bin/scribe-dev` supplied for this
+gate. Temporary XDG config/state/cache directories isolated the run; the real
+`~/.config/scribe-dev/config.toml` remained unchanged at SHA-256
+`a020141fd656c29b6bcb023b1eb66e3847179cde2b5f805fc83defe934ec83fe`.
 
-Every row's own stated method was exercised this run.
+### Opacity — PASS
 
-| Method | Rows | Oracle | Result |
-| --- | --- | --- | --- |
-| `visual-E2E` | 102 | visual Docker suite, `xdotool` and pixel assertions against the real window | ✅ 39/39 scripts PASS |
-| `scripted-E2E` | 79 | func + visual Docker scripts driving the real client and server | ✅ all driving suites green (13/13 func, 39/39 visual) |
-| `visual-E2E (+ golden bytes)` | 7 | as above, plus the retained encoder fixtures | ✅ PASS |
-| `gpui-test` | 9 | the nine removed-configuration-key rows | ✅ PASS (within the 967) |
-| `golden` | 5 | captured byte/serialization fixtures | ✅ PASS (within the 967) |
-| `manual` | 1 | Opacity, driven live against `scribe-dev` | ✅ PASS |
+A 1400×1300 magenta ImageMagick window was stacked behind the client. All
+edits hot-reloaded at the same client PID (`1951988`) and X window
+(`52428801`):
 
-The six method counts sum to the inventory's 203 rows.
-
-A row's method passing is necessary but not sufficient: the two unreachable
-rows above are carried by passing methods *and* are unreachable, which is what
-the "Reachable from" column and the go threshold exist to catch.
-
-## Manual item detail
-
-| Item | Verdict | Evidence |
+| Config value | Three body samples | Evidence |
 | --- | --- | --- |
-| Opacity | ✅ **PASS** | Driven live on `:0` against the `scribe-dev` server, with the release binary staged under the `scribe-dev` slug. A 1400×1300 magenta backdrop *window* was placed behind the client (ImageMagick `display`; the desktop root was left untouched), the client window located by PID and captured cropped to its own geometry. `opacity = 1.0` → `srgb(30,30,30)` at all three sample points; `0.85` → `srgb(35,29,35)` with 1 001 460 differing pixels; `0.5` → `srgb(86,22,86)`, monotonic in the backdrop's magenta. Clamping is correct: `1.5` → `srgb(30,30,30)` (opaque; 2 007 px apart from 1.0, cursor blink only) and `-0.2` → `srgb(255,0,255)` (fully transparent, pure backdrop). All four edits applied **at the same pid (384578) and the same X window id (52428801)**, proving reload without restart. |
-| IME | ✅ **PASS** | Driven live on `:0` per `plan.md`:223. Launched the staged client with `XMODIFIERS=@im=ibus`, echoed a marker for a clean prompt, switched the host engine with `ibus engine table:cangjie3` (confirmed active), then tapped `h`, `q`, `i` through XTEST. The client logged three `IME preedit updated` lines from `preedit.rs::replace_and_mark_text_in_range` — a method only the platform can call, and only through the handler `TerminalView::start_ime` registers — and the frame changed by 21 591 px: the capture shows the underlined preedit 我 at the cursor with the CangJie candidate list `竹手戈 (1/4)` open. `space` then produced `IME committed text bytes=3` and `committing IME text to the focused pane bytes=3`, and the pane's command line reads a single `我` with no `hqi` anywhere on it. The 2026-07-27 B2 failure does not reproduce. |
-| Dialogs | ✅ PASS | Automated: `visual/dialogs.sh` PASS. No longer a manual row. |
-| Bell | ✅ PASS | Automated: `visual/bell.sh` PASS. No longer a manual row. |
+| `1.0` | `srgb(14,14,16)` | opaque baseline |
+| `0.85` | `srgb(20,14,22)` | 710,858 pixels differ from baseline; magenta increases |
+| `0.5` | `srgb(74,10,76)` | 710,877 pixels differ from 0.85; magenta increases again |
+| `1.5` | `srgb(14,14,16)` | clamps to opaque; 1,514-pixel cursor-only difference |
+| `-0.2` | `srgb(255,0,255)` | clamps to fully transparent backdrop |
 
-The host `ibus` engine was restored to `xkb:us::eng` after the IME row by a
-shell trap that fires on failure as well as success, confirmed by `ibus engine`
-afterwards. `~/.config/scribe-dev/config.toml` was backed up before the opacity
-edits and restored byte-for-byte after them.
+The client logged each `config reload: opacity applied` value and
+`config hot-reloaded ... opacity=true`; the process and window did not restart.
 
-## Additional defects found during gate driving (not parity rows)
+### IME — PASS
 
-- **D4 — `pane-workspace-layout.sh` has no `just` recipe carrying its required
-  env.** Its header documents seeding `SCRIBE_EXTRA_CONFIG` with
-  `workspace_focus_left = "ctrl+alt+h"` and points at "the run command in `just
-  e2e-visual`", but `e2e-visual` is the generic single-script recipe and passes
-  no env. Run through it, the script fails phase 7 with `ctrl+alt+h never
-  reached workspace_focus_left` — a harness misconfiguration that reads exactly
-  like a product regression. Every other script needing non-default env has a
-  named recipe; this one should too.
-- **D5 — a stale build artifact from a deleted worktree can fail `cargo test
-  --workspace`.** The first run of the suite this gate reported three failures
-  in `scribe-client-gpui --lib`, all "read … golden fixture: NotFound". The
-  fixtures exist and are tracked; the test binary was a cached artifact whose
-  `CARGO_MANIFEST_DIR` was baked as
-  `/home/mamba/work/scribe/.worktrees/orch-scribe-38e.93/…`, a path that no
-  longer exists. `-p scribe-client-gpui --lib` alone rebuilt and passed, because
-  workspace feature unification selects a different metadata hash and therefore
-  a different cached artifact. `cargo clean -p scribe-client-gpui` followed by
-  `cargo test --workspace` gave 967/0. Not a product defect, but it is a false
-  failure that will recur for anyone running worktrees against a shared target
-  directory, and `concat!(env!("CARGO_MANIFEST_DIR"), …)` in the fixture loaders
-  is what makes it possible.
-- **D6 — the IME path depends on `XMODIFIERS` reaching the client.** With
-  `XMODIFIERS` unset the composition keys bypass the input method entirely and
-  land on the shell as literal `hqi`, with zero preedit lines in the client log
-  — byte-for-byte the 2026-07-27 B2 observation. A normal desktop session
-  exports it (the host's own `ibus-daemon` carries `XMODIFIERS=@im=ibus`), so
-  this is an artifact of launching from a bare shell rather than a client
-  defect. It is recorded because from the outside it is indistinguishable from a
-  real IME regression, and because the visual container does not export it
-  either — `visual/ime-preedit.sh` passes there because ibus registers itself as
-  the default XIM server.
+The same installed client launched with `XMODIFIERS=@im=ibus`. After a clean
+prompt marker, the host engine switched to `table:cangjie3`; XTEST sent `h`,
+`q`, `i`.
 
-## Re-gate criteria
+- Three `IME preedit updated bytes=3` events reached the GPUI input handler.
+- The live capture showed underlined preedit `我` and the CangJie candidate list
+  `竹手戈 (1/4)`.
+- Space produced `IME committed text bytes=3` and
+  `committing IME text to the focused pane bytes=3`.
+- The shell line contained one `我`; literal `hqi` did not leak.
 
-Re-run this gate when the following holds:
+The host engine was restored to `xkb:us::eng` before cleanup.
 
-1. **`just parity-gate` exits zero** — every user-facing row reachable, i.e.
-   beads `scribe-38e.99`..`scribe-38e.103` (FU-24..FU-28) each wired to a live
-   path with an oracle that drives the running app, or the corresponding
-   requirement explicitly descoped in `spec.md` with a recorded decision. Wiring
-   a module means deleting its line from `tools/reachability-baseline.txt` and
-   bumping the matching count.
+## Defects found and resolved during this run
 
-Nothing else is outstanding. The already-green evidence — 967 unit/golden/
-gpui-test assertions, 39/39 visual, 13/13 func, the reachability ratchet, the
-parity drift check, all five perf metrics, and both manual rows — must stay
-green, and each new wiring needs an oracle that drives the running app rather
-than the module. That distinction is what the last three runs were about: green
-suites are necessary and never sufficient, and the decisive question remains
-whether a user of the running client can reach each `spec.md` requirement. For
-four of them the answer is still no.
+Gate driving exposed one product defect and two oracle defects. All were fixed
+and re-exercised in isolation and in the complete suite.
+
+### Server-upgrade reattachment
+
+The GPUI client redialed and rebuilt topology after a real handoff, but its
+locally remembered pane set was treated as already attached on the replacement
+connection. Attach grants are connection-local.
+
+The reconnect path now replays every still-visible `AttachSessions` entry after
+the replacement connection's first `SessionList`, retaining each pane's exact
+grid dimensions before `Resize` and `Subscribe`. The original process then
+accepted input and painted output after the handoff.
+
+### Remote-control injection target
+
+The remote picker probe connected through `share-tap`, becoming the tap's
+newest injection target. Later synthetic takeover notices missed the GPUI
+client. The probe now splices directly to the tap's upstream server socket, and
+the test dismisses both picker stages before later command-palette input.
+
+### Upgrade oracle lifecycle
+
+The old post-upgrade assertion used the separate `scribe-test` daemon after its
+server stream had closed. The oracle now types a sentinel through the original
+GPUI window and requires a substantial body repaint after reconnect, directly
+testing the process that survived the handoff.
+
+## Safety and cleanup
+
+- No host server was restarted or upgraded.
+- Stable Scribe runtime/config/state were not used.
+- Gate-owned client and backdrop processes were terminated by exact session.
+- Host `ibus` engine is `xkb:us::eng`.
+- User `scribe-dev` config hash is unchanged.
+- Disposable Docker servers performed their own isolated lifecycle tests.
+
+## Final disposition
+
+**GO.** `scribe-38e.42` is complete. No blocker remains; `scribe-38e.43`
+(cutover) and `scribe-38e.44` (macOS packaging follow-on) may proceed.

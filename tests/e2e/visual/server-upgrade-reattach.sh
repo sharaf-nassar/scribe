@@ -40,11 +40,33 @@ wait_for_log_count "$SCRIBE_CLIENT_LOG" "rebuilt reconnect topology" \
     "$((topologies_before + 1))"
 wait_for_log_count "$SCRIBE_CLIENT_LOG" "attaching to session" "$((attaches_before + 1))"
 kill -0 "$SCRIBE_CLIENT_PID"
-xdotool search --name "Scribe" >/dev/null
 
-# A post-handoff byte reaches the same session only after the replacement
-# connection's Hello/ListSessions/AttachSessions flow has completed.
-scribe-test send "$SESSION" 'echo AFTER_SERVER_UPGRADE\n'
-scribe-test wait-output "$SESSION" "AFTER_SERVER_UPGRADE"
+# The harness daemon's own server stream closes during the handoff, so drive the
+# process this test is about: the original GPUI window. A substantial body-pixel
+# change after typing the sentinel proves its replacement connection accepts
+# input and paints the echoed command/output on the retained pane.
+wid=$(xdotool search --name "Scribe" | tail -1)
+[ -n "$wid" ]
+xdotool windowactivate --sync "$wid" 2>/dev/null \
+    || xdotool windowfocus --sync "$wid" 2>/dev/null || true
+sleep 0.8
+eval "$(xdotool getwindowgeometry --shell "$wid")"
+scrot -o /output/server-upgrade-before-input.png
+convert /output/server-upgrade-before-input.png \
+    -crop "${WIDTH}x$(( HEIGHT - 60 ))+${X}+${Y}" +repage \
+    /output/server-upgrade-before-input-body.png
+
+xdotool type --clearmodifiers --delay 30 "echo AFTER_SERVER_UPGRADE"
+xdotool key --clearmodifiers Return
+sleep 1.5
+scrot -o /output/server-upgrade-after-input.png
+convert /output/server-upgrade-after-input.png \
+    -crop "${WIDTH}x$(( HEIGHT - 60 ))+${X}+${Y}" +repage \
+    /output/server-upgrade-after-input-body.png
+changed=$(compare -metric AE \
+    /output/server-upgrade-before-input-body.png \
+    /output/server-upgrade-after-input-body.png null: 2>&1 || true)
+[ "${changed%% *}" -gt 500 ] \
+    || { echo "Post-upgrade terminal body changed only $changed pixels" >&2; exit 1; }
 
 echo "PASS: running client reattached after server upgrade"
