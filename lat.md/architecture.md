@@ -107,6 +107,19 @@ The 016 reachability audit (`specs/016-gpui-client-rebuild/reachability-audit.md
 
 `tools/check-reachability.sh` re-derives the three metrics from source — library modules against `main.rs`'s import closure, `ServerMessage` variants against [[crates/scribe-client/src/main.rs#dispatch_server_message]], and `LayoutAction` variants against [[crates/scribe-client/src/main.rs#TerminalView#handle_layout_action]] — prints them as one `reachability: …` line, and compares the unreachable sets against `tools/reachability-baseline.txt`. The check fails when the unreachable set grows *and* when a baseline entry has become reachable, so the baseline can only shrink and every wiring bead has to record its progress. It runs in pre-commit (`reachability-baseline`) and in `just reachability`, which `just ready` invokes alongside the lint-suppression guard.
 
+### GPUI Chrome Accessibility
+
+The GPUI chrome accessibility audit records the custom titlebar, status chrome,
+and settings accessibility blockers and their remediation beads.
+
+`specs/016-gpui-client-rebuild/accessibility-audit.md` separates keyboard
+operation from AccessKit semantics: [[crates/scribe-client/src/titlebar.rs#TitlebarView]]
+and [[crates/scribe-client/src/settings/window.rs#SettingsWindow]] currently
+track only root focus while their click targets lack roles, names, and state.
+The audit assigns five defects to `scribe-38e.108` through `scribe-38e.112`;
+closure requires keyboard-only and real screen-reader verification, plus a
+debug accessibility-tree check for stable unique nodes.
+
 ### Parity Inventory Gate
 
 The 016 launch gate's parity metric is a row count read off `specs/016-gpui-client-rebuild/parity-inventory.md`, so every number in that document is derived from its own tables rather than typed, and a check fails the build when the two disagree.
