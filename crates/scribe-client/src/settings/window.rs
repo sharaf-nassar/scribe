@@ -23,8 +23,9 @@
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, FocusHandle, KeyDownEvent, Rgba, TitlebarOptions, Window, WindowBounds,
-    WindowHandle, WindowOptions, div, prelude::*, px, size,
+    AccessibleAction, App, Bounds, Context, FocusHandle, KeyDownEvent, Rgba, Role, Text,
+    TitlebarOptions, Toggled, Window, WindowBounds, WindowHandle, WindowOptions, div, prelude::*,
+    px, size,
 };
 use scribe_common::config::{ScribeConfig, load_config, resolve_theme};
 use scribe_common::protocol::{PreflightError, TrustedDeviceInfo, TrustedNetworkInfo};
@@ -543,6 +544,9 @@ impl Render for SettingsWindow {
         let nav = self.render_nav(cx);
         let content = self.render_content(cx);
         div()
+            .id("settings-root")
+            .role(Role::Application)
+            .aria_label("Scribe settings")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _key_window, ctx| {
                 this.on_key_down(event, ctx);
@@ -567,6 +571,13 @@ impl SettingsWindow {
             let fg = if selected { colors.text } else { colors.dim_text };
             div()
                 .id(("settings-nav", page as usize))
+                .focusable()
+                .tab_stop(true)
+                .role(Role::Tab)
+                .aria_label(page.nav_label())
+                .aria_selected(selected)
+                .aria_position_in_set(page as usize + 1)
+                .aria_size_of_set(SettingsPage::all().len())
                 .w_full()
                 .px_3()
                 .py_2()
@@ -580,6 +591,9 @@ impl SettingsWindow {
                 .into_any_element()
         });
         div()
+            .id("settings-navigation")
+            .role(Role::TabList)
+            .aria_label("Settings sections")
             .w(px(200.0))
             // Without an explicit `flex_none`, a long content row (the LAN trust
             // notes are the worst case) raises the content pane's automatic
@@ -603,6 +617,10 @@ impl SettingsWindow {
         let mut children: Vec<gpui::AnyElement> = Vec::new();
         children.push(
             div()
+                .id("settings-page-heading")
+                .role(Role::Heading)
+                .aria_level(1)
+                .aria_label(self.page.nav_label())
                 .px_4()
                 .py_3()
                 .text_lg()
@@ -620,18 +638,23 @@ impl SettingsWindow {
         if let Some(status) = &self.status {
             children.push(
                 div()
+                    .id("settings-status")
+                    .role(Role::Status)
+                    .aria_label(status.clone())
                     .px_4()
                     .py_2()
                     .mt_2()
                     .text_sm()
                     .text_color(colors.accent)
-                    .child(status.clone())
+                    .child(Text::new_inaccessible(status.clone().into()))
                     .into_any_element(),
             );
         }
 
         div()
             .id("settings-content")
+            .role(Role::TabPanel)
+            .aria_label(self.page.nav_label())
             .flex_1()
             // A flex item's automatic minimum size is its min-content width, which
             // for a row of unwrapped text is the whole string. Pinning `min_w` to
@@ -809,13 +832,17 @@ impl SettingsWindow {
     /// A bold-ish sub-heading between the trust lists.
     fn section_heading(&self, text: &str) -> gpui::AnyElement {
         div()
+            .id(("settings-section-heading", key_hash(text)))
+            .role(Role::Heading)
+            .aria_level(2)
+            .aria_label(text.to_owned())
             .w_full()
             .px_4()
             .pt_4()
             .pb_1()
             .text_sm()
             .text_color(self.colors.accent)
-            .child(text.to_owned())
+            .child(Text::new_inaccessible(text.to_owned().into()))
             .into_any_element()
     }
 
@@ -825,6 +852,9 @@ impl SettingsWindow {
     /// and therefore the scripted E2E's click offsets — depend on the string.
     fn note_row(&self, text: &str) -> gpui::AnyElement {
         div()
+            .id(("settings-note", key_hash(text)))
+            .role(Role::Note)
+            .aria_label(text.to_owned())
             .w_full()
             .px_4()
             .py_2()
@@ -832,7 +862,7 @@ impl SettingsWindow {
             .text_color(self.colors.dim_text)
             .border_b_1()
             .border_color(self.colors.border)
-            .child(elide(text, NOTE_MAX_CHARS))
+            .child(Text::new_inaccessible(elide(text, NOTE_MAX_CHARS).into()))
             .into_any_element()
     }
 
@@ -846,8 +876,15 @@ impl SettingsWindow {
         let control = pill(button, colors.accent, colors.text)
             .id(id)
             .when(focused, |el| el.border_1().border_color(colors.text))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(format!("{button} {label}"))
             .on_click(cx.listener(move |this, _, _win, ctx| this.run_action(&action_key, ctx)));
         div()
+            .id(("settings-trust-row", key_hash(&label)))
+            .role(Role::Group)
+            .aria_label(label.clone())
             .w_full()
             .px_4()
             .py_2()
@@ -866,6 +903,9 @@ impl SettingsWindow {
         let label = row_label(&control.label, colors.text);
         let value_widget = self.render_value_widget(control, cx);
         div()
+            .id(("settings-control", key_hash(&control.key)))
+            .role(Role::Group)
+            .aria_label(control.label.clone())
             .w_full()
             .px_4()
             .py_2()
@@ -891,6 +931,11 @@ impl SettingsWindow {
                 pill(text, bg, colors.text)
                     .id(("toggle", key_hash(&control.key)))
                     .when(focused, |el| el.border_1().border_color(colors.text))
+                    .focusable()
+                    .tab_stop(true)
+                    .role(Role::Switch)
+                    .aria_label(control.label.clone())
+                    .aria_toggled(if on { Toggled::True } else { Toggled::False })
                     .on_click(cx.listener(move |this, _, _win, ctx| this.toggle(&key, ctx)))
                     .into_any_element()
             }
@@ -907,6 +952,11 @@ impl SettingsWindow {
                 pill(&display, colors.control_bg, colors.text)
                     .id(("choice", key_hash(&control.key)))
                     .when(focused, |el| el.border_1().border_color(colors.accent))
+                    .focusable()
+                    .tab_stop(true)
+                    .role(Role::Button)
+                    .aria_label(control.label.clone())
+                    .aria_value(display.clone())
                     .on_click(
                         cx.listener(move |this, _, _win, ctx| this.cycle(&key, &options, ctx)),
                     )
@@ -919,18 +969,22 @@ impl SettingsWindow {
             ControlKind::Text => {
                 let value = current_value(&self.config, &control.key);
                 let shown = value.as_str().unwrap_or("").to_owned();
-                div().text_sm().text_color(colors.dim_text).child(shown).into_any_element()
+                read_only_value(&control.key, &control.label, shown, colors.dim_text)
             }
             ControlKind::Keybinding => {
                 let combos = keybinding_combos(&self.config, &control.key);
                 let shown = if combos.is_empty() { "—".to_owned() } else { combos.join(", ") };
-                div().text_sm().text_color(colors.dim_text).child(shown).into_any_element()
+                read_only_value(&control.key, &control.label, shown, colors.dim_text)
             }
             ControlKind::Action => {
                 let key = control.key.clone();
                 pill(&control.label, colors.accent, colors.text)
                     .id(("action", key_hash(&control.key)))
                     .when(focused, |el| el.border_1().border_color(colors.text))
+                    .focusable()
+                    .tab_stop(true)
+                    .role(Role::Button)
+                    .aria_label(control.label.clone())
                     .on_click(cx.listener(move |this, _, _win, ctx| this.run_action(&key, ctx)))
                     .into_any_element()
             }
@@ -953,23 +1007,59 @@ impl SettingsWindow {
         let display = format!("{current:.*}", decimals as usize);
         let key_dec = control.key.clone();
         let key_inc = control.key.clone();
+        let key_a11y_dec = control.key.clone();
+        let key_a11y_inc = control.key.clone();
         let minus = pill("−", colors.control_bg, colors.text)
             .id(("dec", key_hash(&control.key)))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(format!("Decrease {}", control.label))
             .on_click(cx.listener(move |this, _, _win, ctx| {
                 this.step(&key_dec, (min, max), -step, ctx);
             }));
         let plus = pill("+", colors.control_bg, colors.text)
             .id(("inc", key_hash(&control.key)))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(format!("Increase {}", control.label))
             .on_click(cx.listener(move |this, _, _win, ctx| {
                 this.step(&key_inc, (min, max), step, ctx);
             }));
         div()
+            .id(("stepper", key_hash(&control.key)))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::SpinButton)
+            .aria_label(control.label.clone())
+            .aria_numeric_value(current)
+            .aria_min_numeric_value(min)
+            .aria_max_numeric_value(max)
+            .aria_numeric_value_step(step)
+            .on_a11y_action(
+                AccessibleAction::Decrement,
+                a11y_step_handler(cx.entity().downgrade(), key_a11y_dec, (min, max), -step),
+            )
+            .on_a11y_action(
+                AccessibleAction::Increment,
+                a11y_step_handler(cx.entity().downgrade(), key_a11y_inc, (min, max), step),
+            )
             .flex()
             .items_center()
             .gap_2()
             .when(focused, |el| el.border_1().border_color(colors.accent))
             .child(minus)
-            .child(div().min_w(px(56.0)).text_sm().text_color(colors.text).child(display))
+            .child(
+                div()
+                    .id(("stepper-value", key_hash(&control.key)))
+                    .role(Role::Label)
+                    .aria_label(display.clone())
+                    .min_w(px(56.0))
+                    .text_sm()
+                    .text_color(colors.text)
+                    .child(Text::new_inaccessible(display.into())),
+            )
             .child(plus)
             .into_any_element()
     }
@@ -993,7 +1083,8 @@ impl SettingsWindow {
                     .bg(srgba(rgba)),
             );
         }
-        row.child(div().text_sm().text_color(colors.dim_text).child(shown)).into_any_element()
+        row.child(read_only_value(&control.key, &control.label, shown, colors.dim_text))
+            .into_any_element()
     }
 }
 
@@ -1014,14 +1105,42 @@ fn elide(text: &str, max: usize) -> String {
 /// The left-hand label of a settings row: it takes the leftover width but never
 /// forces the row wider than the pane, so the right-aligned control stays on
 /// screen no matter how long the text is.
-fn row_label(text: &str, color: Rgba) -> gpui::Div {
+fn row_label(text: &str, color: Rgba) -> gpui::Stateful<gpui::Div> {
     div()
+        .id(("settings-label", key_hash(text)))
+        .role(Role::Label)
+        .aria_label(text.to_owned())
         .flex_1()
         .min_w(px(0.0))
         .overflow_hidden()
         .text_sm()
         .text_color(color)
-        .child(elide(text, NOTE_MAX_CHARS))
+        .child(Text::new_inaccessible(elide(text, NOTE_MAX_CHARS).into()))
+}
+
+/// A read-only current value still needs a semantic node: visual text alone is
+/// otherwise absent from AccessKit's tree.
+fn read_only_value(key: &str, label: &str, value: String, color: Rgba) -> gpui::AnyElement {
+    div()
+        .id(("settings-read-only-value", key_hash(key)))
+        .role(Role::Label)
+        .aria_label(format!("{label}: {value}"))
+        .text_sm()
+        .text_color(color)
+        .child(Text::new_inaccessible(value.into()))
+        .into_any_element()
+}
+
+/// Route an AccessKit spin-button action back into the settings entity.
+fn a11y_step_handler(
+    settings: gpui::WeakEntity<SettingsWindow>,
+    key: String,
+    bounds: (f64, f64),
+    delta: f64,
+) -> impl FnMut(Option<&gpui::accesskit::ActionData>, &mut Window, &mut App) {
+    move |_, _, app| {
+        settings.update(app, |settings, cx| settings.step(&key, bounds, delta, cx)).ok();
+    }
 }
 
 /// A small rounded, clickable chip used for toggles, choices, steppers, and
