@@ -17,7 +17,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use gpui::{Rgba, div, prelude::*, px};
+use gpui::{Rgba, Role, div, prelude::*, px};
 
 use crate::opacity::scale_slot;
 
@@ -396,8 +396,22 @@ pub fn render(
     // `flex_none` for the same reason the status bar carries it: the strip is a
     // fixed-height band stacked under the flex-grown terminal grid, and a
     // shrinkable band would be squeezed away rather than clipping the grid.
-    let mut strip =
-        div().flex().flex_col().flex_none().w_full().font_family("monospace").text_xs().relative();
+    let prompt_state = if model.latest.is_some() {
+        format!("AI prompt status: latest prompt {} received", model.count_label)
+    } else {
+        format!("AI prompt status: prompt {} received", model.count_label)
+    };
+    let mut strip = div()
+        .id("ai-prompt-status")
+        .role(Role::Status)
+        .aria_label(prompt_state)
+        .flex()
+        .flex_col()
+        .flex_none()
+        .w_full()
+        .font_family("monospace")
+        .text_xs()
+        .relative();
 
     let first_style = RowStyle {
         icon_color: colors.icon_first,

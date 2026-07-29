@@ -124,6 +124,11 @@ The audit assigns five defects to `scribe-38e.108` through `scribe-38e.112`;
 closure requires keyboard-only and real screen-reader verification, plus a
 debug accessibility-tree check for stable unique nodes.
 
+The terminal's pane strip, AI prompt strip, and window status bar each expose
+one stable AccessKit status node with a concise state label, leaving decorative
+spans anonymous. An actionable update label is a focusable button that accepts
+pointer, Enter/Space, and AccessKit Click activation through the same dialog.
+
 ### Parity Inventory Gate
 
 The 016 launch gate's parity metric is a row count read off `specs/016-gpui-client-rebuild/parity-inventory.md`, so every number in that document is derived from its own tables rather than typed, and a check fails the build when the two disagree.

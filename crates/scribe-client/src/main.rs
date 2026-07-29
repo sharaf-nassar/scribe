@@ -19,9 +19,9 @@ use std::{
 
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, Size, Subscription,
-    Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowOptions, canvas, div, prelude::*, px, relative, size,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Role, ScrollWheelEvent, Size,
+    Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowHandle, WindowOptions, canvas, div, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use scribe_client::ai_indicator::{AiStateTracker, pane_border_edges};
@@ -710,10 +710,23 @@ impl Default for PointerState {
     }
 }
 
+struct TerminalFocus {
+    root: FocusHandle,
+    /// Stable tab stop for the actionable update CTA. Keeping the handle on
+    /// the view prevents ordinary repaints from returning focus to the PTY.
+    update: FocusHandle,
+}
+
+impl TerminalFocus {
+    fn new(cx: &mut Context<TerminalView>) -> Self {
+        Self { root: cx.focus_handle(), update: cx.focus_handle().tab_stop(true) }
+    }
+}
+
 struct TerminalView {
     shared: Shared,
     sink: IpcSink,
-    focus_handle: FocusHandle,
+    focus: TerminalFocus,
     /// Live config: the resolved snapshot plus the file watcher that keeps it
     /// fresh. Held for the window's lifetime — dropping it stops the watcher.
     config: ConfigRuntime,
@@ -967,8 +980,7 @@ impl TerminalView {
     ) -> Self {
         let bounds_observer = Self::start_geometry_tracking(window, cx);
         let (x11_focus, x11_focus_task) = Self::start_x11_focus_guard(window, cx);
-        // The focus observer is unconditional: the X11 guard is only one
-        // thing an activation change drives.
+        // The focus observer is unconditional; activation drives more than the X11 guard.
         let activation_observer = cx
             .observe_window_activation(window, |view, window, ctx| view.on_activation(window, ctx));
         let (bell, bell_subscription) = Self::start_bell_gate(window, cx);
@@ -994,7 +1006,7 @@ impl TerminalView {
         Self {
             shared,
             sink,
-            focus_handle: cx.focus_handle(),
+            focus: TerminalFocus::new(cx),
             config,
             stats: SystemStatsCollector::new(),
             status_colors,
@@ -1140,7 +1152,7 @@ impl TerminalView {
             ime.preedit().cloned()
         });
         ImePaint {
-            focus_handle: self.focus_handle.clone(),
+            focus_handle: self.focus.root.clone(),
             ime: self.ime.clone(),
             placement,
             preedit,
@@ -5869,21 +5881,26 @@ impl TerminalView {
         )
     }
 
-    /// Build the status-bar band, wiring the centred update CTA's click to the
-    /// confirmation modal.
+    /// Build the status-bar band, wiring every update CTA activation path to
+    /// the confirmation modal.
     ///
     /// The palette is cached across renders, so the live opacity is folded into
     /// the filled band here rather than at theme-reload time.
     fn render_status_bar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let model = self.build_status_model();
         let colors = self.status_colors.with_opacity(self.opacity);
+        let update_view = cx.entity().downgrade();
+        let on_update = Box::new(move |_window: &mut Window, app: &mut App| {
+            if let Err(error) = update_view.update(app, TerminalView::open_update_dialog) {
+                tracing::debug!(?error, "update CTA activation dropped with its view");
+            }
+        });
         status_bar::render(
             &model,
             window_chrome::STATUS_BAR_HEIGHT,
             &colors,
-            Some(Box::new(cx.listener(|view, _event, _window, ctx| {
-                view.open_update_dialog(ctx);
-            }))),
+            Some(&self.focus.update),
+            Some(on_update),
         )
         .into_any_element()
     }
@@ -6083,10 +6100,11 @@ impl TerminalView {
 
     /// Restore focus when another surface left the terminal window unfocused.
     fn ensure_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.focus_handle.is_focused(window)
+        if !self.focus.root.is_focused(window)
             && !self.titlebar.read(cx).has_keyboard_focus(window)
+            && !self.focus.update.is_focused(window)
         {
-            window.focus(&self.focus_handle, cx);
+            window.focus(&self.focus.root, cx);
         }
     }
 
@@ -6104,6 +6122,24 @@ impl TerminalView {
             window.focus_next(cx);
         }
         true
+    }
+
+    /// Render the one concise status node for transient pane connection and
+    /// error feedback, without exposing its decorative visual container.
+    fn render_pane_status(&self, status: String) -> impl IntoElement {
+        div()
+            .id("pane-status-strip")
+            .role(Role::Status)
+            .aria_label(format!("Pane status: {status}"))
+            .flex_none()
+            .h(px(window_chrome::STATUS_STRIP_HEIGHT))
+            .px_2()
+            .flex()
+            .items_center()
+            .bg(surface(self.chrome.status_bar_bg, self.opacity))
+            .text_color(opaque_slot(self.chrome.status_bar_text))
+            .text_xs()
+            .child(status)
     }
 }
 
@@ -6144,7 +6180,7 @@ impl Render for TerminalView {
         // translucent band over a translucent root and coming out more opaque
         // than the configured value.
         div()
-            .track_focus(&self.focus_handle)
+            .track_focus(&self.focus.root)
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, win, ctx| {
                 // Claim every key the window sees, at every level below.
                 //
@@ -6194,22 +6230,11 @@ impl Render for TerminalView {
             .child(self.titlebar.clone())
             .child(grid)
             .children(prompt_strip)
-            .child(
-                // `flex_none` on every band below the grid: the grid is the one
-                // flex-grown child, so without it a window shorter than the
-                // grid's painted height would shrink the bands away instead of
-                // clipping the grid, taking the status surfaces off screen.
-                div()
-                    .flex_none()
-                    .h(px(window_chrome::STATUS_STRIP_HEIGHT))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .bg(surface(self.chrome.status_bar_bg, self.opacity))
-                    .text_color(opaque_slot(self.chrome.status_bar_text))
-                    .text_xs()
-                    .child(status),
-            )
+            // `flex_none` on every band below the grid: the grid is the one
+            // flex-grown child, so without it a window shorter than the grid's
+            // painted height would shrink the bands away instead of clipping
+            // the grid, taking the status surfaces off screen.
+            .child(self.render_pane_status(status))
             .child(status_bar)
             .children(self.command_palette.clone())
             .children(self.find_overlay.clone())
