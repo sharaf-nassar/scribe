@@ -12,5 +12,7 @@ categories = ["os::unix-apis", "network-programming"]
 [dependencies]
 libc = "0.2"
 
-[dev-dependencies]
-tempfile = "3"
+# Keep this patched crate independent from Scribe's workspace. Cargo otherwise
+# associates direct metadata checks with the enclosing workspace in nested
+# worktrees even though the root manifest excludes this path dependency.
+[workspace]
