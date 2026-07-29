@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["third_party/*"]
+exclude = ["third_party/unix-ancillary"]
 resolver = "3"
 
 [workspace.package]

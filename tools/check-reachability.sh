@@ -194,15 +194,50 @@ for my $submodule ($main_src =~ /^mod (\w+);/gm) {
     }
 }
 
-my $live = join "\n", map { slurp("$gpui/$_") } @live_files;
+my $live = strip_noise(join "\n", map { slurp("$gpui/$_") } @live_files);
 my %wired;
+my @pending;
 my $use_tree = qr/
-    scribe_client::(?<tail>(?&BRACE)|\w+)
+    scribe_client::(?<external_tail>(?&BRACE)|\w+)
     (?(DEFINE)(?<BRACE>\{(?:[^{}]++|(?&BRACE))*\}))
 /x;
 while ($live =~ /$use_tree/g) {
-    my $tail = $+{tail};
-    $wired{$_} = 1 for grep { $is_module{$_} } ($tail =~ /([a-z][a-z0-9_]*)/g);
+    my $tail = $+{external_tail};
+    for my $module (grep { $is_module{$_} } ($tail =~ /([a-z][a-z0-9_]*)/g)) {
+        next if $wired{$module};
+        $wired{$module} = 1;
+        push @pending, $module;
+    }
+}
+
+# Follow top-level library-module references from the binary's direct imports.
+# Without this closure, a production dependency such as
+# `main -> color -> palette` is incorrectly reported as an unwired module.
+my $module_path = qr/
+    (?:crate|scribe_client)::(?<module_tail>(?&BRACE)|\w+)
+    (?(DEFINE)(?<BRACE>\{(?:[^{}]++|(?&BRACE))*\}))
+/x;
+while (defined(my $module = shift @pending)) {
+    my $module_file;
+    if (-f "$gpui/$module.rs") {
+        $module_file = "$gpui/$module.rs";
+    } elsif (-f "$gpui/$module/mod.rs") {
+        $module_file = "$gpui/$module/mod.rs";
+    } else {
+        die "reachability: cannot resolve library module $module\n";
+    }
+
+    my $module_src = strip_noise(slurp($module_file));
+    while ($module_src =~ /$module_path/g) {
+        my $tail = $+{module_tail};
+        for my $dependency (
+            grep { $is_module{$_} } ($tail =~ /([a-z][a-z0-9_]*)/g)
+        ) {
+            next if $wired{$dependency};
+            $wired{$dependency} = 1;
+            push @pending, $dependency;
+        }
+    }
 }
 for my $module (@modules) {
     printf "module\t%s\t%s\n", $module, ($wired{$module} ? 'wired' : 'unwired');
