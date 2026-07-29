@@ -183,11 +183,45 @@ That same socket also accepts a `quit` command from the client and server shutdo
 
 Window geometry and open state are saved to the active flavor's state root, using `$XDG_STATE_HOME/scribe/settings_state.toml` for stable installs and `$XDG_STATE_HOME/scribe-dev/settings_state.toml` for `scribe-dev`, via .
 
-On GTK/X11, saved settings geometry is restored only when it intersects a currently connected monitor work area. Explicit open/focus requests with an anchor override saved position and clamp the settings window to the anchor monitor work area.
+The GPUI settings launch prefers 1500×1050 and enforces a 1040×720 minimum
+when the display can hold it. A saved size below that minimum is migrated to
+the preferred composition; valid saved sizes and positions clamp to the
+primary display's visible work area.
 
 ## GPUI Settings Window
 
 The GPUI rebuild reproduces the deleted `scribe-settings` webview app as a window in the client process, opened from a running terminal window or from `scribe-client --settings`.
+
+### Native Precision presentation
+
+The settings window uses a spacious Obsidian Amber native workspace so repeated configuration work scans quickly without changing the underlying feature set.
+
+[[crates/scribe-client/src/settings/window.rs#SettingsColors#resolve]] fixes the
+settings palette independently from the active terminal theme: `#161719`
+canvas, `#1e1f20` navigation, `#272829` controls, `#4f4f51` strong seams,
+`#efede8` text, `#979692` secondary text, and `#f5b83a` amber. Persistent
+surfaces stay flat; 2–4px corners, one-pixel rules, and monospace technical
+values distinguish controls without cards, shadows, or decorative chrome.
+
+The 54px custom titlebar supplies a draggable region and real native window
+actions. Below it, an independently scrollable 314px sidebar groups the eleven
+real pages under Terminal, Intelligence, Workflow, System, and Connectivity.
+Non-focusable group labels do not enter keyboard traversal; each 44px page row
+uses a normalized outline glyph and selected rows use a warm fill with a 4px
+amber seam. Inset separators and first-group top air establish group rhythm.
+
+A real AccessKit search input at the top of the content pane receives focus
+with Ctrl+K and filters page names, summaries, section names, control labels,
+and dotted keys. Matching pages remain navigable, and matching controls filter
+inside the selected page; the field is never a decorative placeholder.
+
+Content uses 46px gutters, a 32px page title, 18px summary, explicit
+"Changes apply instantly" status, 66px section headings, and 54px rows. A
+stable 438px right column aligns values: choices and read-only fields are 42px
+high, steppers are 207×38px with 48px actions, switches are 52×30px, and
+actions are 40px high. Switch tracks and warm-light knobs are fully rounded.
+
+At a numeric bound, the unavailable stepper button has no click handler or focus/tab stop and its accessible label names the reached limit. Pointer use clears keyboard-only focus styling and records the clicked target so later keyboard traversal resumes from true UI state.
 
 ### Accessibility semantics
 

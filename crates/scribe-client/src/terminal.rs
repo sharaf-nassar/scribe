@@ -42,7 +42,7 @@ use scribe_client::split_scroll::{
     split_scroll_eligible,
 };
 use scribe_client::vi_mode::{self, ViMotion};
-use vte::ansi::Color;
+use vte::ansi::{Color, CursorShape as TerminalCursorShape};
 
 use crate::session_lifecycle::PromptAnchor;
 use crate::sync_frames::{FeedOutputResult, OutputTarget};
@@ -87,6 +87,30 @@ pub struct ViewportPoint {
     pub col: usize,
 }
 
+/// Shape requested by the terminal application for the live shell cursor.
+///
+/// `Block` remains the default-config sentinel, matching the legacy renderer:
+/// an explicit beam or underline from DECSCUSR wins, while a block uses the
+/// user's `appearance.cursor_shape`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShellCursorShape {
+    /// Use the configured block/beam/underline fallback.
+    Block,
+    /// Draw a vertical beam.
+    Beam,
+    /// Draw a rule at the bottom of the cell.
+    Underline,
+}
+
+/// Shell cursor projected into the immutable viewport snapshot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ShellCursor {
+    /// Cursor cell in viewport coordinates.
+    pub point: ViewportPoint,
+    /// Shape selected by the terminal application.
+    pub shape: ShellCursorShape,
+}
+
 /// Where a pane's shell cursor sits, plus the viewport placement needed to
 /// resolve an absolute scrollback row back onto the painted grid.
 ///
@@ -123,6 +147,10 @@ pub struct Content {
     /// Where the vi / copy-mode cursor sits in this snapshot, or `None` when vi
     /// mode is off or the cursor scrolled out of the painted viewport.
     pub vi_cursor: Option<ViewportPoint>,
+    /// Focus-independent shell cursor state projected into the painted
+    /// viewport. `None` while DECTCEM hides it, vi mode owns the keyboard
+    /// cursor, or ordinary scrollback has moved the live cursor off-screen.
+    pub shell_cursor: Option<ShellCursor>,
 }
 
 /// Plain-text views of a snapshot. The paint path consumes cells directly, so
@@ -628,6 +656,44 @@ impl DisplayOnlyTerminal {
         self.content.rows = rows;
         self.content.pin_rows = pin_rows;
         self.content.vi_cursor = self.viewport_vi_cursor(top_rows, display_offset);
+        self.content.shell_cursor = self.viewport_shell_cursor(lines, columns, pin_rows);
+    }
+
+    /// Project the live shell cursor onto the viewport the snapshot just built.
+    ///
+    /// Ordinary scrollback hides the live cursor. Split-scroll is the
+    /// exception: its pinned tail is deliberately live, and `make_content`
+    /// places the shell cursor on the pin's final row.
+    fn viewport_shell_cursor(
+        &self,
+        lines: usize,
+        columns: usize,
+        pin_rows: usize,
+    ) -> Option<ShellCursor> {
+        let mode = self.term.mode();
+        if mode.contains(TermMode::VI) || !mode.contains(TermMode::SHOW_CURSOR) {
+            return None;
+        }
+        let style = self.term.cursor_style().shape;
+        let shape = match style {
+            TerminalCursorShape::Hidden => return None,
+            TerminalCursorShape::Beam => ShellCursorShape::Beam,
+            TerminalCursorShape::Underline => ShellCursorShape::Underline,
+            TerminalCursorShape::Block | TerminalCursorShape::HollowBlock => {
+                ShellCursorShape::Block
+            }
+        };
+        let row = if pin_rows > 0 {
+            lines.checked_sub(1)?
+        } else {
+            if self.display_offset() > 0 {
+                return None;
+            }
+            self.cursor_line()
+        };
+        let col = self.term.grid().cursor.point.column.0;
+        (row < lines && col < columns)
+            .then_some(ShellCursor { point: ViewportPoint { row, col }, shape })
     }
 
     /// The vi cursor in viewport coordinates, if it is on a painted scrollback
