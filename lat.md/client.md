@@ -648,6 +648,25 @@ The GPUI rebuild replaces native window decorations with a custom titlebar that 
 
 [[crates/scribe-client/src/titlebar.rs#TitlebarView]] is the `gpui::Entity` that assembles the chrome as `div` elements: a `WindowControlArea::Drag` move region, the workspace-badge pill, the tab strip (active accent underline, per-tab close button revealed on hover, AI activity dot, context-% suffix, and drag-reorder slide), the equalize and gear icons, and the min/maximize/close window controls. The titlebar, tab list, stable session-backed tabs, and every icon-only control carry a named AccessKit role; tabs report selection, and their normal click handlers also provide the accessible Click action. Each interaction mutates state and emits a [[crates/scribe-client/src/titlebar.rs#TitlebarEvent]] the shell acts on — the gear's `OpenSettings` is subscribed in [[crates/scribe-client/src/main.rs#TerminalView#build_titlebar]] and opens the settings window ([[settings#GPUI Settings Window#In-app entry points]]); [[crates/scribe-client/src/titlebar.rs#TitlebarView#update_drag]] reorders tabs live as the cursor crosses a neighbour, and the window controls drive the platform window through GPUI's `WindowControlArea` hit regions. [[crates/scribe-client/src/titlebar.rs#pane_title_pill]] builds the semi-transparent per-pane title pill the shell overlays on a split pane; [[crates/scribe-client/src/titlebar.rs#WindowControlKind]] names the three window-control buttons. The spike wires the titlebar above the terminal grid in [[crates/scribe-client/src/main.rs#TerminalView]] so the visual E2E harness (`tests/e2e/visual/titlebar.sh`) can screenshot the assembled bar and its interaction checklist.
 
+### Keyboard operation
+
+Every interactive titlebar control is a GPUI tab stop in painted order: tabs,
+their close targets, equalize when visible, workspace notes, settings, then
+minimize, maximize, and close.
+
+Tab from the terminal enters that order and
+Shift+Tab reverses it; focused controls paint the accent focus treatment so
+keyboard position remains visible without a pointer.
+
+Enter or Space activates the focused control. On a tab, Left/Right move focus
+between tabs, while Ctrl+Shift+Left/Right reorders the focused tab and retains
+focus on it; neither route reaches the PTY. Closing a focused tab preserves
+the active-tab invariant; the nearest remaining tab receives focus, while GPUI
+continues its deterministic tab-stop order. Workspace Notes opens its modal,
+settings opens its singleton window,
+equalize emits its normal titlebar event, and window controls invoke their
+native operations.
+
 ### Tab flash envelope self-decays
 
 Verifies  peaks at 1.0, eases down mid-envelope, and returns `None` at or past `TAB_FLASH_SECS` (and for negative/NaN inputs) so the flash self-clears and cannot pin the redraw loop.
