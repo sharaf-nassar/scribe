@@ -11,7 +11,7 @@
 
 use gpui::{
     AnyElement, Context, ElementId, EventEmitter, FocusHandle, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Rgba, WindowControlArea, div, prelude::*, px,
+    MouseMoveEvent, MouseUpEvent, Rgba, Role, WindowControlArea, div, prelude::*, px,
 };
 
 use crate::tab_bar::{
@@ -292,9 +292,17 @@ impl TitlebarView {
         })
     }
 
-    fn render_tab_close(index: usize, fg: Rgba, cx: &mut Context<Self>) -> AnyElement {
+    fn render_tab_close(
+        index: usize,
+        tab_id: ElementId,
+        title: &str,
+        fg: Rgba,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         div()
-            .id(("tab-close", index))
+            .id((tab_id, "close"))
+            .role(Role::Button)
+            .aria_label(format!("Close {title}"))
             .ml_1()
             .px_0p5()
             .text_color(fg)
@@ -318,13 +326,20 @@ impl TitlebarView {
             tab.ai_indicator.map(|color| div().size(px(6.0)).rounded_full().bg(color).mr_1());
         let suffix =
             tab.context_suffix.as_ref().map(|s| div().text_color(s.color).child(s.text.clone()));
-        let close = (tab.is_active || is_hovered).then(|| Self::render_tab_close(index, fg, cx));
+        let tab_id = ElementId::from(tab.accessibility_id.clone());
+        let close = (tab.is_active || is_hovered)
+            .then(|| Self::render_tab_close(index, tab_id.clone(), &tab.title, fg, cx));
         let underline = tab.is_active.then(|| {
             div().absolute().bottom_0().left_0().right_0().h(px(2.0)).bg(self.colors.accent)
         });
 
         let mut tab_el = div()
-            .id(("tab", index))
+            .id(tab_id)
+            .role(Role::Tab)
+            .aria_label(tab.title.clone())
+            .aria_selected(tab.is_active)
+            .aria_position_in_set(index + 1)
+            .aria_size_of_set(self.tabs.len())
             .relative()
             .flex()
             .items_center()
@@ -370,13 +385,16 @@ impl TitlebarView {
     fn render_icon_button(
         &self,
         id: ElementId,
-        glyph: &'static str,
+        icon: (&'static str, &'static str),
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Context<Self>) + 'static,
     ) -> AnyElement {
+        let (glyph, label) = icon;
         let hover_bg = self.colors.gradient_top;
         div()
             .id(id)
+            .role(Role::Button)
+            .aria_label(label)
             .flex()
             .items_center()
             .justify_center()
@@ -393,6 +411,8 @@ impl TitlebarView {
         let hover_bg = self.colors.gradient_top;
         div()
             .id("workspace-notes")
+            .role(Role::Button)
+            .aria_label("Show workspace notes")
             .flex()
             .items_center()
             .justify_center()
@@ -414,23 +434,34 @@ impl TitlebarView {
     }
 
     fn render_window_control(&self, kind: WindowControlKind, cx: &mut Context<Self>) -> AnyElement {
-        let (id, glyph, area, hover_bg) = match kind {
-            WindowControlKind::Minimize => {
-                ("wc-min", "\u{2013}", WindowControlArea::Min, self.colors.gradient_top)
-            }
-            WindowControlKind::Maximize => {
-                ("wc-max", "\u{25A1}", WindowControlArea::Max, self.colors.gradient_top)
-            }
+        let (id, glyph, label, area, hover_bg) = match kind {
+            WindowControlKind::Minimize => (
+                "wc-min",
+                "\u{2013}",
+                "Minimize window",
+                WindowControlArea::Min,
+                self.colors.gradient_top,
+            ),
+            WindowControlKind::Maximize => (
+                "wc-max",
+                "\u{25A1}",
+                "Maximize window",
+                WindowControlArea::Max,
+                self.colors.gradient_top,
+            ),
             // Close hovers red for the destructive affordance.
             WindowControlKind::Close => (
                 "wc-close",
                 "\u{00D7}",
+                "Close window",
                 WindowControlArea::Close,
                 Rgba { r: 0.784, g: 0.188, b: 0.188, a: 1.0 },
             ),
         };
         div()
             .id(id)
+            .role(Role::Button)
+            .aria_label(label)
             .flex()
             .items_center()
             .justify_center()
@@ -461,20 +492,32 @@ impl Render for TitlebarView {
         }
 
         let equalize = self.show_equalize.then(|| {
-            self.render_icon_button(ElementId::from("equalize"), "\u{229E}", cx, |ctx| {
-                ctx.emit(TitlebarEvent::Equalize);
-            })
+            self.render_icon_button(
+                ElementId::from("equalize"),
+                ("\u{229E}", "Equalize panes"),
+                cx,
+                |ctx| {
+                    ctx.emit(TitlebarEvent::Equalize);
+                },
+            )
         });
         let gear = self.show_gear.then(|| {
-            self.render_icon_button(ElementId::from("gear"), "\u{2699}", cx, |ctx| {
-                ctx.emit(TitlebarEvent::OpenSettings);
-            })
+            self.render_icon_button(
+                ElementId::from("gear"),
+                ("\u{2699}", "Open settings"),
+                cx,
+                |ctx| {
+                    ctx.emit(TitlebarEvent::OpenSettings);
+                },
+            )
         });
         let workspace_notes = self.render_workspace_notes_button(cx);
 
         div()
             .track_focus(&self.focus_handle)
             .id("titlebar")
+            .role(Role::TitleBar)
+            .aria_label("Scribe title bar")
             .flex()
             .items_center()
             .w_full()
@@ -501,7 +544,17 @@ impl Render for TitlebarView {
                 cx.listener(|this, _: &MouseUpEvent, _win, ctx| this.end_drag(ctx)),
             )
             .children(self.render_badge())
-            .child(div().flex().items_center().h_full().flex_none().children(tabs))
+            .child(
+                div()
+                    .id("terminal-tabs")
+                    .role(Role::TabList)
+                    .aria_label("Terminal tabs")
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .flex_none()
+                    .children(tabs),
+            )
             // Draggable spacer fills the gap between tabs and the right controls.
             .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
             .children(equalize)
@@ -515,7 +568,10 @@ impl Render for TitlebarView {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Mutex},
+    };
 
     use gpui::{AppContext as _, Entity, TestAppContext};
     use scribe_common::theme::minimal_dark;
@@ -607,5 +663,24 @@ mod tests {
         });
         bar.read_with(cx, |bar, _| assert_eq!(bar.tabs().len(), 2));
         assert!(log.lock().unwrap().is_empty());
+    }
+
+    // @lat: [[client#GPUI Titlebar#Accessibility IDs survive tab reordering]]
+    #[gpui::test]
+    fn accessibility_ids_are_unique_and_follow_reordered_tabs(cx: &mut TestAppContext) {
+        let (bar, _) = titlebar_with_tabs(3, cx);
+        let original_ids = bar.read_with(cx, |bar, _| {
+            bar.tabs().iter().map(|tab| tab.accessibility_id.clone()).collect::<Vec<_>>()
+        });
+        assert_eq!(original_ids.iter().collect::<HashSet<_>>().len(), original_ids.len());
+
+        bar.update(cx, |bar, cx| {
+            bar.begin_drag(0, 0.0, 0.0, cx);
+            bar.update_drag(super::TAB_WIDTH * 2.5, cx);
+            bar.end_drag(cx);
+        });
+        bar.read_with(cx, |bar, _| {
+            assert_eq!(bar.tabs()[2].accessibility_id, original_ids[0]);
+        });
     }
 }
