@@ -235,6 +235,7 @@ impl TabSessions {
             .enumerate()
             .map(|(index, tab)| {
                 let mut data = TabData::new(tab.display_title().to_owned());
+                data.accessibility_id = tab.session_id.to_string();
                 data.is_active = index == self.active;
                 data
             })

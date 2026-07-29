@@ -167,6 +167,9 @@ pub fn context_suffix(percent: u8, warn: u8, danger: u8, pulsing: bool) -> Optio
 /// Per-tab data the titlebar renders.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabData {
+    /// Stable identifier for the session this tab represents. It is distinct
+    /// from the mutable strip index so its AccessKit node survives reorders.
+    pub accessibility_id: String,
     /// Tab title (task label while active, otherwise the shell/process title).
     pub title: String,
     /// Whether this tab is the active/focused tab in its workspace.
@@ -185,8 +188,13 @@ impl TabData {
     /// A plain inactive tab with just a title.
     #[must_use]
     pub fn new(title: impl Into<String>) -> Self {
+        let title = title.into();
         Self {
-            title: title.into(),
+            // Production callers replace this with the server session ID.
+            // Keeping test-only tabs deterministic still makes accidental
+            // duplicate IDs apparent in the accessibility coverage.
+            accessibility_id: format!("tab-{title}"),
+            title,
             is_active: false,
             ai_indicator: None,
             context_suffix: None,
