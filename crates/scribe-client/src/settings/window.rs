@@ -23,8 +23,8 @@
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, FocusHandle, Rgba, TitlebarOptions, Window, WindowBounds, WindowHandle,
-    WindowOptions, div, prelude::*, px, size,
+    App, Bounds, Context, FocusHandle, KeyDownEvent, Rgba, TitlebarOptions, Window, WindowBounds,
+    WindowHandle, WindowOptions, div, prelude::*, px, size,
 };
 use scribe_common::config::{ScribeConfig, load_config, resolve_theme};
 use scribe_common::protocol::{PreflightError, TrustedDeviceInfo, TrustedNetworkInfo};
@@ -136,6 +136,21 @@ pub struct SettingsWindow {
     /// LAN trust state rendered by the Remote page.
     trust: TrustState,
     focus_handle: FocusHandle,
+    /// Keyboard traversal is deliberately window-local: Settings claims only
+    /// keys while its own window is focused, never terminal-window shortcuts.
+    focus_index: usize,
+    keyboard_navigation: bool,
+}
+
+/// One focus stop in the settings window's stable keyboard traversal order.
+/// The sidebar comes first, followed by actionable controls on the selected
+/// page and (on Remote) every live trust mutation row.
+// @lat: [[settings#GPUI Settings Window#Page model]]
+#[derive(Clone)]
+enum SettingsFocusTarget {
+    Page(SettingsPage),
+    Control(Control),
+    Action(String),
 }
 
 impl SettingsWindow {
@@ -150,6 +165,8 @@ impl SettingsWindow {
             status: None,
             trust: TrustState::default(),
             focus_handle: cx.focus_handle(),
+            focus_index: 0,
+            keyboard_navigation: false,
         }
     }
 
@@ -190,6 +207,134 @@ impl SettingsWindow {
             return;
         }
         cx.notify();
+    }
+
+    fn focus_targets(&self) -> Vec<SettingsFocusTarget> {
+        let mut targets =
+            SettingsPage::all().into_iter().map(SettingsFocusTarget::Page).collect::<Vec<_>>();
+        if self.page == SettingsPage::Remote {
+            targets.push(SettingsFocusTarget::Action(REFRESH_TRUST_ACTION.to_owned()));
+            targets.push(SettingsFocusTarget::Action(ADD_CURRENT_NETWORK_ACTION.to_owned()));
+            targets.extend(self.trust.networks.iter().map(|network| {
+                SettingsFocusTarget::Action(format!(
+                    "{REMOVE_TRUSTED_NETWORK_PREFIX}{}",
+                    network.id
+                ))
+            }));
+            targets.extend(self.trust.devices.iter().map(|device| {
+                SettingsFocusTarget::Action(format!(
+                    "{REVOKE_TRUSTED_DEVICE_PREFIX}{}",
+                    device.device_id_hex
+                ))
+            }));
+        }
+        targets.extend(page_controls(self.page).into_iter().filter_map(
+            |control| match control.kind {
+                ControlKind::Toggle
+                | ControlKind::Choice(_)
+                | ControlKind::Stepper { .. }
+                | ControlKind::Action => Some(SettingsFocusTarget::Control(control)),
+                ControlKind::Color | ControlKind::Text | ControlKind::Keybinding => None,
+            },
+        ));
+        targets
+    }
+
+    fn focused_target(&self) -> Option<SettingsFocusTarget> {
+        let targets = self.focus_targets();
+        targets.get(self.focus_index % targets.len().max(1)).cloned()
+    }
+
+    fn target_is_focused(&self, target: &SettingsFocusTarget) -> bool {
+        self.keyboard_navigation
+            && self.focused_target().is_some_and(|current| match (current, target) {
+                (SettingsFocusTarget::Page(a), SettingsFocusTarget::Page(b)) => a == *b,
+                (SettingsFocusTarget::Control(a), SettingsFocusTarget::Control(b)) => {
+                    a.key == b.key
+                }
+                (SettingsFocusTarget::Action(a), SettingsFocusTarget::Action(b)) => a == *b,
+                _ => false,
+            })
+    }
+
+    fn move_focus(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let count = self.focus_targets().len();
+        if count > 0 {
+            self.focus_index = if direction.is_negative() {
+                (self.focus_index + count - 1) % count
+            } else {
+                (self.focus_index + 1) % count
+            };
+            self.keyboard_navigation = true;
+            cx.notify();
+        }
+    }
+
+    fn activate_target(&mut self, target: SettingsFocusTarget, cx: &mut Context<Self>) {
+        match target {
+            SettingsFocusTarget::Page(page) => self.select_page(page, cx),
+            SettingsFocusTarget::Control(control) => match control.kind {
+                ControlKind::Toggle => self.toggle(&control.key, cx),
+                ControlKind::Choice(options) => self.cycle(&control.key, &options, cx),
+                ControlKind::Stepper { min, max, step, .. } => {
+                    self.step(&control.key, (min, max), step, cx);
+                }
+                ControlKind::Action => self.run_action(&control.key, cx),
+                ControlKind::Color | ControlKind::Text | ControlKind::Keybinding => {}
+            },
+            SettingsFocusTarget::Action(key) => self.run_action(&key, cx),
+        }
+    }
+
+    fn adjust_target(&mut self, direction: f64, cx: &mut Context<Self>) -> bool {
+        let Some(SettingsFocusTarget::Control(control)) = self.focused_target() else {
+            return false;
+        };
+        match control.kind {
+            ControlKind::Choice(options) => {
+                if direction > 0.0 {
+                    self.cycle(&control.key, &options, cx);
+                } else {
+                    self.cycle_previous(&control.key, &options, cx);
+                }
+                true
+            }
+            ControlKind::Stepper { min, max, step, .. } => {
+                self.step(&control.key, (min, max), step * direction, cx);
+                true
+            }
+            ControlKind::Toggle if direction != 0.0 => {
+                self.toggle(&control.key, cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        let handled = match event.keystroke.key.as_str() {
+            "tab" | "down" => {
+                self.move_focus(1, cx);
+                true
+            }
+            "up" => {
+                self.move_focus(-1, cx);
+                true
+            }
+            "left" => self.adjust_target(-1.0, cx),
+            "right" => self.adjust_target(1.0, cx),
+            "enter" | "space" => self.focused_target().is_some_and(|target| {
+                self.activate_target(target, cx);
+                true
+            }),
+            _ => false,
+        };
+        if handled {
+            cx.stop_propagation();
+        }
     }
 
     fn toggle(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -244,6 +389,24 @@ impl SettingsWindow {
             return;
         };
         self.commit(key, Value::String((*next).to_owned()), cx);
+    }
+
+    fn cycle_previous(
+        &mut self,
+        key: &str,
+        options: &[(&'static str, &'static str)],
+        cx: &mut Context<Self>,
+    ) {
+        if options.is_empty() {
+            return;
+        }
+        let current = current_value(&self.config, key);
+        let current_token = current.as_str().unwrap_or("");
+        let index = options.iter().position(|(value, _)| *value == current_token).unwrap_or(0);
+        let previous = (index + options.len() - 1) % options.len();
+        if let Some((value, _)) = options.get(previous) {
+            self.commit(key, Value::String((*value).to_owned()), cx);
+        }
     }
 
     fn step(&mut self, key: &str, bounds: (f64, f64), delta: f64, cx: &mut Context<Self>) {
@@ -381,6 +544,9 @@ impl Render for SettingsWindow {
         let content = self.render_content(cx);
         div()
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _key_window, ctx| {
+                this.on_key_down(event, ctx);
+            }))
             .size_full()
             .flex()
             .bg(colors.page_bg)
@@ -396,6 +562,7 @@ impl SettingsWindow {
         let active = self.page;
         let items = SettingsPage::all().into_iter().map(|page| {
             let selected = page == active;
+            let focused = self.target_is_focused(&SettingsFocusTarget::Page(page));
             let bg = if selected { colors.nav_active_bg } else { colors.nav_bg };
             let fg = if selected { colors.text } else { colors.dim_text };
             div()
@@ -406,6 +573,7 @@ impl SettingsWindow {
                 .text_sm()
                 .bg(bg)
                 .text_color(fg)
+                .when(focused, |el| el.border_l_2().border_color(colors.accent))
                 .hover(move |s| s.bg(colors.nav_active_bg))
                 .on_click(cx.listener(move |this, _, _win, ctx| this.select_page(page, ctx)))
                 .child(page.nav_label())
@@ -674,8 +842,10 @@ impl SettingsWindow {
     fn trust_row(&self, row: TrustRow, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = self.colors;
         let TrustRow { label, button, id, action_key } = row;
+        let focused = self.target_is_focused(&SettingsFocusTarget::Action(action_key.clone()));
         let control = pill(button, colors.accent, colors.text)
             .id(id)
+            .when(focused, |el| el.border_1().border_color(colors.text))
             .on_click(cx.listener(move |this, _, _win, ctx| this.run_action(&action_key, ctx)));
         div()
             .w_full()
@@ -711,6 +881,7 @@ impl SettingsWindow {
 
     fn render_value_widget(&self, control: &Control, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = self.colors;
+        let focused = self.target_is_focused(&SettingsFocusTarget::Control(control.clone()));
         match &control.kind {
             ControlKind::Toggle => {
                 let on = current_value(&self.config, &control.key).as_bool().unwrap_or(false);
@@ -719,6 +890,7 @@ impl SettingsWindow {
                 let text = if on { "On" } else { "Off" };
                 pill(text, bg, colors.text)
                     .id(("toggle", key_hash(&control.key)))
+                    .when(focused, |el| el.border_1().border_color(colors.text))
                     .on_click(cx.listener(move |this, _, _win, ctx| this.toggle(&key, ctx)))
                     .into_any_element()
             }
@@ -734,6 +906,7 @@ impl SettingsWindow {
                 let options = options.clone();
                 pill(&display, colors.control_bg, colors.text)
                     .id(("choice", key_hash(&control.key)))
+                    .when(focused, |el| el.border_1().border_color(colors.accent))
                     .on_click(
                         cx.listener(move |this, _, _win, ctx| this.cycle(&key, &options, ctx)),
                     )
@@ -757,6 +930,7 @@ impl SettingsWindow {
                 let key = control.key.clone();
                 pill(&control.label, colors.accent, colors.text)
                     .id(("action", key_hash(&control.key)))
+                    .when(focused, |el| el.border_1().border_color(colors.text))
                     .on_click(cx.listener(move |this, _, _win, ctx| this.run_action(&key, ctx)))
                     .into_any_element()
             }
@@ -773,6 +947,7 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let colors = self.colors;
+        let focused = self.target_is_focused(&SettingsFocusTarget::Control(control.clone()));
         let (min, max, step) = bounds;
         let current = current_value(&self.config, &control.key).as_f64().unwrap_or(min);
         let display = format!("{current:.*}", decimals as usize);
@@ -792,6 +967,7 @@ impl SettingsWindow {
             .flex()
             .items_center()
             .gap_2()
+            .when(focused, |el| el.border_1().border_color(colors.accent))
             .child(minus)
             .child(div().min_w(px(56.0)).text_sm().text_color(colors.text).child(display))
             .child(plus)
