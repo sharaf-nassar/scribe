@@ -1,10 +1,12 @@
 # Rendering
 
-The GPU rendering pipeline draws terminal content and UI chrome in a single instanced draw call per frame using wgpu.
+The GPUI client paints terminal cells and bespoke chrome from immutable terminal snapshots.
 
 ## Terminal Renderer
 
-The [[crates/scribe-renderer/src/lib.rs#TerminalRenderer]] orchestrates the glyph atlas, colour palette, and render pipeline. It collects cells from the alacritty_terminal display iterator, detects ligatures via a styled-run pre-pass, and builds a flat array of [[rendering#Cell Instance]] for GPU submission.
+The removed standalone renderer has been replaced by the GPUI paint path in
+`crates/scribe-client`, which preserves terminal colour, fallback, ligature,
+and box-drawing semantics without maintaining a separate wgpu pipeline.
 
 ### Ligature Detection
 
@@ -14,15 +16,15 @@ If a shaped glyph spans more than one terminal column or is a contextual alterna
 
 #### Contextual Alternate Source Char
 
-[[crates/scribe-renderer/src/lib.rs#is_contextual_alternate]] reads the glyph's source character from [[crates/scribe-renderer/src/atlas.rs#ShapedRunGlyph]]`.source_char` rather than indexing the run's `chars` vec by `col_offset`.
+ reads the glyph's source character from `.source_char` rather than indexing the run's `chars` vec by `col_offset`.
 
 `col_offset` counts wide characters as multiple grid columns while `chars` indexes them as one entry, so the two diverge after any wide character. Populating `source_char` from cosmic-text's `g.start..g.end` byte range during shaping keeps identity checks correct regardless of grid position — fixing the false-positive contextual-alternate detection that produced blank cells past emoji on the same run.
 
 #### Tab Exclusion From Run Text
 
-Tab characters are excluded from shaped run text entirely — [[crates/scribe-renderer/src/lib.rs#detect_styled_runs]] flushes the accumulator and skips the cell outright when it encounters `\t`, the same way it already skips wide-char spacer cells.
+Tab characters are excluded from shaped run text entirely —  flushes the accumulator and skips the cell outright when it encounters `\t`, the same way it already skips wide-char spacer cells.
 
-`unicode_width` gives `\t` a width of 0, so [[crates/scribe-renderer/src/lib.rs#RunAccum#matches]]'s column-matching let a tab silently attach to the end of the preceding run instead of breaking it (e.g. a run's text became `"tests\t"`). Shaping that trailing tab through cosmic-text produced an arbitrary, oversized glyph advance, and since any shaped glyph spanning more than one column is inserted into the ligature map as-is (see above), the bogus span got inserted starting at the tab's own column and ran forward into the next word's real characters, silently replacing their rendered glyphs with slices of the tab's texture. This is the mechanism behind BSD `ls`'s columnar output (which separates entries with raw tabs, not spaces) dropping the first few characters of filenames when ligatures are enabled. [[crates/scribe-renderer/src/lib.rs#TerminalRenderer#resolve_glyph_uv_raw]] and [[crates/scribe-renderer/src/lib.rs#TerminalRenderer#resolve_glyph_uv_for_collected_fields]] also treat `\t` as a blank cell (same as space and NUL) as defense in depth, independent of the run-detection fix. The fix lives entirely in `scribe-renderer`, which has no `cfg(target_os)` branches, so it applies identically on macOS and Linux.
+`unicode_width` gives `\t` a width of 0, so 's column-matching let a tab silently attach to the end of the preceding run instead of breaking it (e.g. a run's text became `"tests\t"`). Shaping that trailing tab through cosmic-text produced an arbitrary, oversized glyph advance, and since any shaped glyph spanning more than one column is inserted into the ligature map as-is (see above), the bogus span got inserted starting at the tab's own column and ran forward into the next word's real characters, silently replacing their rendered glyphs with slices of the tab's texture. This is the mechanism behind BSD `ls`'s columnar output (which separates entries with raw tabs, not spaces) dropping the first few characters of filenames when ligatures are enabled.  and  also treat `\t` as a blank cell (same as space and NUL) as defense in depth, independent of the run-detection fix. The fix lives entirely in `scribe-renderer`, which has no `cfg(target_os)` branches, so it applies identically on macOS and Linux.
 
 ### Cursor Rendering
 
@@ -36,19 +38,19 @@ The DIM flag is applied in sRGB space before conversion to match terminal conven
 
 ### Bold-Bright Colors
 
-Cells with the BOLD flag have their foreground promoted to the bright palette variant via [[crates/scribe-renderer/src/lib.rs#bold_to_bright]].
+Cells with the BOLD flag have their foreground promoted to the bright palette variant via .
 
-Basic ANSI colours 0-7 become indices 8-15, and the semantic `Foreground` becomes `BrightForeground` — a brighter variant computed by [[crates/scribe-renderer/src/lib.rs#boost_srgb_brightness]]. RGB and already-bright colours pass through unchanged.
+Basic ANSI colours 0-7 become indices 8-15, and the semantic `Foreground` becomes `BrightForeground` — a brighter variant computed by . RGB and already-bright colours pass through unchanged.
 
 ## Glyph Atlas
 
-The [[crates/scribe-renderer/src/atlas.rs#GlyphAtlas]] rasterizes glyphs via cosmic-text and caches them in a 1024x1024 RGBA8 texture.
+The  rasterizes glyphs via cosmic-text and caches them in a 1024x1024 RGBA8 texture.
 
 ### DPI Scaling
 
 Font sizes and chrome dimensions are multiplied by `window.scale_factor()` so the UI renders at the native physical resolution.
 
-The wgpu surface operates in physical pixels (e.g. 2x on Retina), so raw config values would appear at half the expected size without scaling. The client stores `scale_factor` on [[crates/scribe-client-legacy/src/main.rs#App]] and applies it to: font sizes in all four [[crates/scribe-renderer/src/atlas.rs#FontParams]] construction sites (init, config hot-reload, zoom, resize), status bar height, tab bar height and padding, scrollbar width, content padding (via [[crates/scribe-client-legacy/src/pane.rs#effective_padding]]), focus border width, and indicator height. On resize, scale-factor changes (e.g. dragging between monitors) are detected and the atlas is rebuilt.
+The wgpu surface operates in physical pixels (e.g. 2x on Retina), so raw config values would appear at half the expected size without scaling. The client stores `scale_factor` on  and applies it to: font sizes in all four  construction sites (init, config hot-reload, zoom, resize), status bar height, tab bar height and padding, scrollbar width, content padding (via ), focus border width, and indicator height. On resize, scale-factor changes (e.g. dragging between monitors) are detected and the atlas is rebuilt.
 
 ### Shelf Packing
 
@@ -72,13 +74,13 @@ Advanced shaping is used for ligatures, Basic when disabled. Mask images are exp
 
 Bold glyphs are shaped at a heavier weight than regular text, so the atlas measures a separate reference cell width per weight (`cell_size` and `bold_cell_size`) for ligature classification.
 
-[[crates/scribe-renderer/src/atlas.rs#measure_cell]] shapes an "M" at a given `weight` and records its advance; [[crates/scribe-renderer/src/atlas.rs#GlyphAtlas]] stores both the regular and bold results. Ligature classification compares each shaped glyph against the width for its own weight: [[crates/scribe-renderer/src/atlas.rs#GlyphAtlas#shape_run_uncached]] divides a glyph's advance by the matching cell width to derive its column span, and [[crates/scribe-renderer/src/atlas.rs#GlyphAtlas#fits_single_cell]] bounds a glyph's visual extent against it. Both take the glyph's [[crates/scribe-renderer/src/atlas.rs#GlyphStyle]] so the correct width is chosen. Measuring a legitimately wider bold glyph against the narrower regular-weight "M" previously made an ordinary single-cell bold glyph exceed the threshold and get misclassified as a multi-cell ligature, corrupting the ligature map and dropping the following cell's character.
+ shapes an "M" at a given `weight` and records its advance;  stores both the regular and bold results. Ligature classification compares each shaped glyph against the width for its own weight:  divides a glyph's advance by the matching cell width to derive its column span, and  bounds a glyph's visual extent against it. Both take the glyph's  so the correct width is chosen. Measuring a legitimately wider bold glyph against the narrower regular-weight "M" previously made an ordinary single-cell bold glyph exceed the threshold and get misclassified as a multi-cell ligature, corrupting the ligature map and dropping the following cell's character.
 
 ### Font Fallbacks
 
 Glyph shaping uses a Scribe-specific cosmic-text fallback list so terminal icon fonts win before generic symbol fonts.
 
-[[crates/scribe-renderer/src/atlas.rs#scribe_font_system]] rebuilds the loaded system font database with [[crates/scribe-renderer/src/atlas.rs#ScribeFontFallback]]. The fallback list prepends common Nerd Font symbol family names before the normal Unix symbol and emoji families. It also forbids `Unifont Sample`, because that font claims private-use codepoints and can render terminal icon glyphs as misleading sample symbols when no Nerd Font is installed.
+ rebuilds the loaded system font database with . The fallback list prepends common Nerd Font symbol family names before the normal Unix symbol and emoji families. It also forbids `Unifont Sample`, because that font claims private-use codepoints and can render terminal icon glyphs as misleading sample symbols when no Nerd Font is installed.
 
 If no icon font is installed, private-use icons still fall back to the primary font's missing-glyph box; Scribe does not synthesize platform logos.
 
@@ -86,7 +88,7 @@ If no icon font is installed, private-use icons still fall back to the primary f
 
 The GPUI migration preserves this ordering by attaching the same list to each glyph run through `FontFallbacks`.
 
-[[tools/gpui-font-fallback-spike/src/main.rs#verify_nerd_font_precedes_generic_symbols]] demonstrates the pinned GPUI backend preserving `Symbols Nerd Font Mono` before `Unifont Sample` for U+E0B0. The decision and US3 impact are recorded in `specs/016-gpui-client-rebuild/spikes/nerd-font-fallback-ordering.md`.
+ demonstrates the pinned GPUI backend preserving `Symbols Nerd Font Mono` before `Unifont Sample` for U+E0B0. The decision and US3 impact are recorded in `specs/016-gpui-client-rebuild/spikes/nerd-font-fallback-ordering.md`.
 
 ### UV Computation
 
@@ -96,7 +98,7 @@ This ensures the GPU quad covers exactly the same number of texels as the shader
 
 ### Procedural Box Drawing
 
-Box drawing (U+2500-U+257F) and block elements (U+2580-U+259F) are rendered procedurally via [[crates/scribe-renderer/src/box_drawing.rs#render]] instead of from the font.
+Box drawing (U+2500-U+257F) and block elements (U+2580-U+259F) are rendered procedurally via  instead of from the font.
 
 This fills cells edge-to-edge with no font-bearing gaps. Output is white foreground on transparent background; the GPU fragment shader applies colours via `mix(bg, fg, alpha)`.
 
@@ -110,19 +112,19 @@ Block elements use direct rectangle fills for halves, eighths, quarters, and sha
 
 The GPUI client renders procedural box drawing through a paint-quad overlay rather than the text system, retaining edge-to-edge coverage regardless of font availability.
 
-[[crates/scribe-renderer/src/box_drawing.rs#is_box_drawing]] selects U+2500–U+259F cells for the overlay. The GPUI port converts the same rasterizer alpha mask into foreground-coloured quads after cell backgrounds and before normal shaped text; see [[rendering#Rendering#GPUI Ported Rendering Logic#GPUI Box-Drawing Rasterizer]] for the shipped seam and `specs/016-gpui-client-rebuild/spikes/box-drawing-rendering.md` for the capability spike.
+ selects U+2500–U+259F cells for the overlay. The GPUI port converts the same rasterizer alpha mask into foreground-coloured quads after cell backgrounds and before normal shaped text; see  for the shipped seam and `specs/016-gpui-client-rebuild/spikes/box-drawing-rendering.md` for the capability spike.
 
 ## Render Pipeline
 
-The [[crates/scribe-renderer/src/pipeline.rs#TerminalPipeline]] is a wgpu render pipeline drawing instanced quads.
+The  is a wgpu render pipeline drawing instanced quads.
 
 ### Present Scheduling
 
-Before presenting a rendered frame, the client calls [[crates/scribe-client-legacy/src/main.rs#App#handle_redraw]]'s `Window::pre_present_notify()` path so winit can schedule the next `RedrawRequested` against the actual presentation cadence.
+Before presenting a rendered frame, the client calls 's `Window::pre_present_notify()` path so winit can schedule the next `RedrawRequested` against the actual presentation cadence.
 
-When panes still have queued PTY output frames, [[crates/scribe-client-legacy/src/main.rs#App#about_to_wait]] keeps the event loop in `ControlFlow::Poll` and requests another redraw so light bursts can keep animating while larger backlogs still catch up to the latest committed terminal state even if IPC user events keep arriving.
+When panes still have queued PTY output frames,  keeps the event loop in `ControlFlow::Poll` and requests another redraw so light bursts can keep animating while larger backlogs still catch up to the latest committed terminal state even if IPC user events keep arriving.
 
-[[crates/scribe-client-legacy/src/main.rs#App#drain_pane_output_until_frame]] delegates frame removal to [[crates/scribe-client-legacy/src/main.rs#App#apply_next_pane_output_frame]], which first resolves the pane and only then pops its queue. A missing pane therefore cannot consume a queued frame.
+ delegates frame removal to , which first resolves the pane and only then pops its queue. A missing pane therefore cannot consume a queued frame.
 
 ### Bind Group
 
@@ -140,7 +142,7 @@ The instance buffer starts at 10,000 entries and adjusts based on actual usage.
 
 ## Cell Instance
 
-The GPU vertex data for a single cell, defined in [[crates/scribe-renderer/src/types.rs#CellInstance]].
+The GPU vertex data for a single cell, defined in .
 
 ### Fields
 
@@ -150,7 +152,7 @@ Specifically: pixel position (`[f32; 2]`), per-instance size override (`[f32; 2]
 
 ## Colour Palette
 
-The [[crates/scribe-renderer/src/palette.rs#ColorPalette]] provides the xterm-256 colour lookup, converting all entries from sRGB to linear at construction time.
+The  provides the xterm-256 colour lookup, converting all entries from sRGB to linear at construction time.
 
 ANSI 0-15 are overridable by theme. The 6x6x6 colour cube (indices 16-231) uses intensity steps 0/95/135/175/215/255. The 24-step greyscale ramp (indices 232-255) spans values from 8 to 238 in steps of 10. Out-of-range named colours fall back to opaque magenta as an unmistakeable "missing colour" sentinel.
 
@@ -158,39 +160,39 @@ ANSI 0-15 are overridable by theme. The 6x6x6 colour cube (indices 16-231) uses 
 
 The GPUI client rebuild ports the renderer's pure colour and box-drawing logic into the `scribe-client` library crate so terminal output stays byte-for-byte identical across the cutover, independent of the wgpu pipeline.
 
-These modules are display-independent: they own no GPU resources and are exercised by byte/colour-exact unit tests that lock the legacy renderer's output. [[rendering#Rendering#GPUI Cell-Accurate Paint Path]] is the consumer that puts them on the live paint call.
+These modules are display-independent: they own no GPU resources and are exercised by byte/colour-exact unit tests that lock the legacy renderer's output.  is the consumer that puts them on the live paint call.
 
 ### GPUI Colour Palette
 
-[[crates/scribe-client/src/palette.rs#ColorPalette]] is a verbatim port of the xterm-256 palette, resolving the shared `vte::ansi::Color` values the Zed alacritty fork produces.
+ is a verbatim port of the xterm-256 palette, resolving the shared `vte::ansi::Color` values the Zed alacritty fork produces.
 
 It reproduces the standard/bright ANSI entries, the 6×6×6 colour cube, and the greyscale ramp, all linearised at construction, with theme override of entries 0-15 and the opaque-magenta sentinel for out-of-table named colours.
 
 ### GPUI Colour Semantics
 
-[[crates/scribe-client/src/color.rs#TerminalColors]] holds the theme-derived default colours plus the palette and resolves a cell's raw fg/bg fields to linear RGBA, mirroring the legacy `resolve_cell_colors_raw`.
+ holds the theme-derived default colours plus the palette and resolves a cell's raw fg/bg fields to linear RGBA, mirroring the legacy `resolve_cell_colors_raw`.
 
-It applies bold→bright promotion via [[crates/scribe-client/src/color.rs#bold_to_bright]], the DIM 0.67 sRGB round-trip via [[crates/scribe-client/src/color.rs#apply_dim]], the `BrightForeground` boost via [[crates/scribe-client/src/color.rs#boost_srgb_brightness]], and INVERSE/HIDDEN handling. Theme colours are linearised through [[crates/scribe-client/src/color.rs#srgb_to_linear_rgba]].
+It applies bold→bright promotion via , the DIM 0.67 sRGB round-trip via , the `BrightForeground` boost via , and INVERSE/HIDDEN handling. Theme colours are linearised through .
 
-GPUI's `Rgba` is already sRGB, so the paint path calls [[crates/scribe-client/src/color.rs#TerminalColors#resolve_cell_colors_srgb]], which runs the identical rules and converts the result back with [[crates/scribe-client/src/color.rs#linear_to_srgb_rgba]]. Keeping one resolver and converting at the boundary is deliberate: duplicating the bold-bright / INVERSE / HIDDEN / DIM ordering in a second colour space is exactly how the two clients would drift.
+GPUI's `Rgba` is already sRGB, so the paint path calls , which runs the identical rules and converts the result back with . Keeping one resolver and converting at the boundary is deliberate: duplicating the bold-bright / INVERSE / HIDDEN / DIM ordering in a second colour space is exactly how the two clients would drift.
 
 ### GPUI Box-Drawing Rasterizer
 
-[[crates/scribe-client/src/box_drawing.rs#render]] ports the procedural rasterizer that emits a cell-sized RGBA alpha mask for U+2500–U+259F; [[crates/scribe-client/src/box_drawing.rs#is_box_drawing]] selects those codepoints.
+ ports the procedural rasterizer that emits a cell-sized RGBA alpha mask for U+2500–U+259F;  selects those codepoints.
 
-Per the [[rendering#Glyph Atlas#GPUI Box-Drawing Overlay]] capability spike, `TerminalElement` paints this mask as a foreground-coloured quad overlay after cell backgrounds and before shaped text, keeping edge-to-edge coverage regardless of font availability.
+Per the  capability spike, `TerminalElement` paints this mask as a foreground-coloured quad overlay after cell backgrounds and before shaped text, keeping edge-to-edge coverage regardless of font availability.
 
-GPUI cannot upload a per-cell RGBA texture the way the wgpu atlas did, so [[crates/scribe-client/src/box_drawing.rs#mask_quads]] reduces the mask to the smallest set of uniform-alpha [[crates/scribe-client/src/box_drawing.rs#MaskQuad]] rectangles that reproduces it exactly — horizontal runs first, then merged vertically. That reduction is what makes the overlay affordable: a full block becomes one quad instead of one per scanline, so a screen of box drawing costs a handful of quads per cell rather than hundreds.
+GPUI cannot upload a per-cell RGBA texture the way the wgpu atlas did, so  reduces the mask to the smallest set of uniform-alpha  rectangles that reproduces it exactly — horizontal runs first, then merged vertically. That reduction is what makes the overlay affordable: a full block becomes one quad instead of one per scanline, so a screen of box drawing costs a handful of quads per cell rather than hundreds.
 
 ### GPUI Window Opacity
 
-`appearance.opacity` is a pure repaint in the GPUI client: the native surface is always alpha-capable and the configured value only scales the alpha of the backgrounds Scribe paints into it. See [[client#Client#Config Watching#GPUI Config Port#Terminal Window Reload Wiring]] for the reload seam.
+`appearance.opacity` is a pure repaint in the GPUI client: the native surface is always alpha-capable and the configured value only scales the alpha of the backgrounds Scribe paints into it. See  for the reload seam.
 
-[[crates/scribe-client/src/opacity.rs]] owns the derivation. [[crates/scribe-client/src/opacity.rs#clamp_opacity]] saturates out-of-range values into `0.0..=1.0` and maps NaN to fully opaque, so a malformed config degrades to a normal window instead of an invisible one — the config file itself is never validated on load, so every consumer clamps. [[crates/scribe-client/src/opacity.rs#surface]] and [[crates/scribe-client/src/opacity.rs#scale_slot]] fold that value into a background's alpha, while [[crates/scribe-client/src/opacity.rs#opaque_slot]] passes foreground colours through untouched. That split mirrors the legacy renderer's [[crates/scribe-client-legacy/src/main.rs#apply_opacity_to_instances]], which scaled each cell's background alpha and never its glyphs, so text stays readable over whatever the desktop shows through.
+ owns the derivation.  saturates out-of-range values into `0.0..=1.0` and maps NaN to fully opaque, so a malformed config degrades to a normal window instead of an invisible one — the config file itself is never validated on load, so every consumer clamps.  and  fold that value into a background's alpha, while  passes foreground colours through untouched. That split mirrors the legacy renderer's , which scaled each cell's background alpha and never its glyphs, so text stays readable over whatever the desktop shows through.
 
-Two rules make the result equal the configured number rather than an accumulation of it. First, the window is opened with `WindowBackgroundAppearance::Transparent` unconditionally, even at opacity 1.0: surface capability is fixed at creation, so deriving it from the startup value would force a restart to ever go translucent — the legacy client's `window_transparent` flag had exactly that wart and refused live changes ([[crates/scribe-client-legacy/src/main.rs#App#apply_opacity_change]]). At 1.0 every painted background is alpha 1.0 and the window is pixel-identical to an opaque one. Second, the root element paints nothing at all. The titlebar, terminal grid and status bands tile the window edge to edge, so each pixel carries the opacity alpha exactly once; filling the root as well would composite a translucent band over a translucent root and land at 0.98 for a configured 0.85.
+Two rules make the result equal the configured number rather than an accumulation of it. First, the window is opened with `WindowBackgroundAppearance::Transparent` unconditionally, even at opacity 1.0: surface capability is fixed at creation, so deriving it from the startup value would force a restart to ever go translucent — the legacy client's `window_transparent` flag had exactly that wart and refused live changes (). At 1.0 every painted background is alpha 1.0 and the window is pixel-identical to an opaque one. Second, the root element paints nothing at all. The titlebar, terminal grid and status bands tile the window edge to edge, so each pixel carries the opacity alpha exactly once; filling the root as well would composite a translucent band over a translucent root and land at 0.98 for a configured 0.85.
 
-The alpha-aware surfaces are the terminal grid ([[crates/scribe-client/src/terminal_element.rs#GridColors]]), the titlebar and tab bar ([[crates/scribe-client/src/tab_bar.rs#TabBarColors#from_chrome]]), the prompt bar ([[crates/scribe-client/src/prompt_bar.rs#PromptBarColors#with_opacity]]), the terminal-status strip, and the window status bar ([[crates/scribe-client/src/status_bar.rs#StatusBarColors#with_opacity]]). Their colours come from the resolved theme rather than the literals the spike hardcoded, so a `theme` edit now repaints the grid and the strip too.
+The alpha-aware surfaces are the terminal grid (), the titlebar and tab bar (), the prompt bar (), the terminal-status strip, and the window status bar (). Their colours come from the resolved theme rather than the literals the spike hardcoded, so a `theme` edit now repaints the grid and the strip too.
 
 ## GPUI Cell-Accurate Paint Path
 
@@ -204,9 +206,9 @@ The GPUI terminal grid resolves every visible property of a cell — colour, att
 
 Each row paints cell backgrounds, then the box-drawing overlay, then shaped glyph runs — the same order the legacy wgpu renderer used.
 
-Backgrounds come first so the overlay and the glyphs sit on top of them. Adjacent cells resolving to the same colour merge into one quad, and a cell whose resolved background equals the theme default paints nothing at all, so the window's own (possibly translucent) fill shows through instead of being painted over — that is what keeps [[rendering#Rendering#GPUI Ported Rendering Logic#GPUI Window Opacity]] correct per cell. Only backgrounds are scaled by `appearance.opacity`; glyphs never are.
+Backgrounds come first so the overlay and the glyphs sit on top of them. Adjacent cells resolving to the same colour merge into one quad, and a cell whose resolved background equals the theme default paints nothing at all, so the window's own (possibly translucent) fill shows through instead of being painted over — that is what keeps  correct per cell. Only backgrounds are scaled by `appearance.opacity`; glyphs never are.
 
-Box-drawing cells are then overlaid from [[crates/scribe-client/src/box_drawing.rs#mask_quads]] and replaced by a space in the shaped text, so the overlay is the only thing that draws them. The quads are rasterized in integer mask pixels and scaled onto the cell's exact fractional rect, which is what makes a stroke land precisely on the neighbouring cell's edge at any font size instead of leaving the rounding seam a whole-pixel mask would.
+Box-drawing cells are then overlaid from  and replaced by a space in the shaped text, so the overlay is the only thing that draws them. The quads are rasterized in integer mask pixels and scaled onto the cell's exact fractional rect, which is what makes a stroke land precisely on the neighbouring cell's edge at any font size instead of leaving the rounding seam a whole-pixel mask would.
 
 ### Glyph Runs
 
@@ -226,9 +228,9 @@ The list mirrors the legacy cosmic-text atlas (`SCRIBE_COMMON_FALLBACKS` in `cra
 
 Carrying the chain is necessary but not sufficient on this GPUI revision: a stock symbols-only family can never enter it, so the client embeds a patched `Symbols Nerd Font Mono` that can.
 
-`CosmicTextSystem::load_family` (gpui rev `f96212f`, `crates/gpui_wgpu/src/cosmic_text_system.rs`) drops any face whose charmap has no `'m'` glyph and calls `db_mut().remove_face` on it. Every stock `Symbols Nerd Font*` face fails that test, so each chain entry resolves to nothing and the face is evicted from the font database outright. Omitting the families does not help either: GPUI builds its `FontSystem` with cosmic-text's default `PlatformFallback` and exposes no equivalent of the legacy [[crates/scribe-renderer/src/atlas.rs#ScribeFontFallback]] `forbidden_fallback`, so automatic fallback picks `Unifont Sample` — the exact font the legacy renderer bans.
+`CosmicTextSystem::load_family` (gpui rev `f96212f`, `crates/gpui_wgpu/src/cosmic_text_system.rs`) drops any face whose charmap has no `'m'` glyph and calls `db_mut().remove_face` on it. Every stock `Symbols Nerd Font*` face fails that test, so each chain entry resolves to nothing and the face is evicted from the font database outright. Omitting the families does not help either: GPUI builds its `FontSystem` with cosmic-text's default `PlatformFallback` and exposes no equivalent of the legacy  `forbidden_fallback`, so automatic fallback picks `Unifont Sample` — the exact font the legacy renderer bans.
 
-[[crates/scribe-client/src/fonts.rs#register_embedded_fonts]] therefore registers [[crates/scribe-client/src/fonts.rs#SYMBOLS_NERD_FONT_MONO]] — the upstream binary with a `U+006D` cmap alias added by `tools/patch-nerd-symbols-font.py` — with GPUI's text system before the first frame is shaped. The face passes the `'m'` check, keeps its upstream family name so the chain resolves it, and covers the icon ranges even on hosts with no Nerd Fonts installed. The alias never leaks into visible text: the chain is only consulted for codepoints the primary font lacks, and every terminal font covers `m`.
+ therefore registers  — the upstream binary with a `U+006D` cmap alias added by `tools/patch-nerd-symbols-font.py` — with GPUI's text system before the first frame is shaped. The face passes the `'m'` check, keeps its upstream family name so the chain resolves it, and covers the icon ranges even on hosts with no Nerd Fonts installed. The alias never leaks into visible text: the chain is only consulted for codepoints the primary font lacks, and every terminal font covers `m`.
 
 Live capture on the real client confirms the chain is live: `U+F09B` and `U+F121` — absent from the primary JetBrains Mono — render as the octocat and code icons from the embedded face instead of `Unifont Sample` hex boxes, alongside the `U+E0B0`/`U+E0B2`/`U+E0A0` powerline glyphs.
 
@@ -236,12 +238,12 @@ Live capture on the real client confirms the chain is live: `U+F09B` and `U+F121
 
 `appearance.ligatures` selects the OpenType features the runs are shaped with: `FontFeatures::disable_ligatures()` (`calt` off) when false, the font's own defaults when true.
 
-The setting is read by [[crates/scribe-client/src/terminal_element.rs#GridFont#from_appearance]] on the live config-load path, and `font_params_changed` already counts it as a font metric, so saving the edit repaints the grid without a restart — the same reload seam as `font` and `font_size`. `specs/016-gpui-client-rebuild/ligatures-spike.md` records the capability spike.
+The setting is read by  on the live config-load path, and `font_params_changed` already counts it as a font metric, so saving the edit repaints the grid without a restart — the same reload seam as `font` and `font_size`. `specs/016-gpui-client-rebuild/ligatures-spike.md` records the capability spike.
 
 ## Chrome Rendering
 
-UI chrome (tab bars, status bars, dividers, dialogs) is rendered as solid or rounded quads via [[crates/scribe-renderer/src/chrome.rs#solid_quad]].
+UI chrome (tab bars, status bars, dividers, dialogs) is rendered as solid or rounded quads via .
 
 These produce `CellInstance` objects with zero UV coordinates (transparent-black atlas pixel) so the shader shows only the background colour. Rounded quads set a non-zero `corner_radius` for the shader's SDF rounding.
 
-The IME preedit overlay piggybacks on this same chrome path: [[crates/scribe-client-legacy/src/main.rs#App#apply_preedit_overlay]] emits a background-fill quad plus glyph cells plus a 1px theme-foreground underline into the chrome instance buffer above the terminal grid and below search / dialog overlays — no new wgpu pipeline or shader. See [[client#Input#IME Composition]] for the full state machine and activation gate.
+The IME preedit overlay piggybacks on this same chrome path:  emits a background-fill quad plus glyph cells plus a 1px theme-foreground underline into the chrome instance buffer above the terminal grid and below search / dialog overlays — no new wgpu pipeline or shader. See  for the full state machine and activation gate.
