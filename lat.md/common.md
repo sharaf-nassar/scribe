@@ -1,80 +1,80 @@
 # Common
 
-Shared types and utilities used by every Scribe crate: IPC [[protocol]], identity types, error definitions, screen snapshots, configuration, theme system, and socket path conventions.
+Shared types and utilities used by every Scribe crate: IPC , identity types, error definitions, screen snapshots, configuration, theme system, and socket path conventions.
 
 ## AI State
 
 Tracks supported AI coding tool lifecycles through structured hook events and typed Rust values.
 
-[[crates/scribe-common/src/ai_state.rs#AiState]] is a five-variant enum (`IdlePrompt`, `Processing`, `WaitingForInput`, `PermissionPrompt`, `Error`) shared by Claude Code and Codex. [[crates/scribe-common/src/ai_state.rs#AiProvider]] supplies stable provider IDs, binary names, task-label support, and resume arguments; [[crates/scribe-common/src/ai_state.rs#AiProcessState]] carries that provider alongside optional metadata fields (`tool`, `agent`, `model`, `context`, `conversation_id`). The [[server#Hook Channel]] produces `AiProcessState` updates for AI tool state; the [[server]] broadcasts them to connected clients.
+ is a five-variant enum (`IdlePrompt`, `Processing`, `WaitingForInput`, `PermissionPrompt`, `Error`) shared by Claude Code and Codex.  supplies stable provider IDs, binary names, task-label support, and resume arguments;  carries that provider alongside optional metadata fields (`tool`, `agent`, `model`, `context`, `conversation_id`). The  produces `AiProcessState` updates for AI tool state; the  broadcasts them to connected clients.
 
-The `context` field (`Option<u8>`) carries the AI tool's context-window fill percentage (0–100). It is populated by the Claude statusLine adapter and the Codex hook adapter via context-only `ContextChanged` hook events that the server applies as a partial patch on the live `AiProcessState`. Producers never assert state, only context. Codex reads the hook `transcript_path` and derives the percentage from that rollout's latest `last_token_usage.total_tokens` over `model_context_window`; cumulative `total_token_usage` is ignored because it is session-wide billing usage. The [[common#Configuration#AI Context Thresholds]] config controls the warn/danger band boundaries used by the prompt bar and tab-bar displays.
+The `context` field (`Option<u8>`) carries the AI tool's context-window fill percentage (0–100). It is populated by the Claude statusLine adapter and the Codex hook adapter via context-only `ContextChanged` hook events that the server applies as a partial patch on the live `AiProcessState`. Producers never assert state, only context. Codex reads the hook `transcript_path` and derives the percentage from that rollout's latest `last_token_usage.total_tokens` over `model_context_window`; cumulative `total_token_usage` is ignored because it is session-wide billing usage. The  config controls the warn/danger band boundaries used by the prompt bar and tab-bar displays.
 
-State transitions are owned by the per-provider hook adapters. Claude Code hooks report tool, notification, stop, and prompt-submit events through `dist/ai-hook-claude.sh`; Codex reports prompt, permission, tool, stop, and context events through `dist/ai-hook-codex.sh`. Each state-only event would otherwise carry `None` for `context`, `model`, `tool`, `agent`, and `conversation_id`, clobbering values set by an earlier same-provider event. [[crates/scribe-common/src/ai_state.rs#AiProcessState#merge_partial_from_previous]] carries those optional fields forward from the previously stored state when the new event leaves them unset and the provider matches, so a state-only hook firing between context refreshes does not erase the live percentage. Switching providers (e.g. Claude → Codex) skips the merge so cross-provider state does not bleed. The dedicated `ContextChanged` hook event applied by [[crates/scribe-server/src/ipc_server.rs#send_ai_context_change]] keeps the producer/state separation honest: a status-line refresh patches only the percentage and re-broadcasts the existing state, never replacing it.
+State transitions are owned by the per-provider hook adapters. Claude Code hooks report tool, notification, stop, and prompt-submit events through `dist/ai-hook-claude.sh`; Codex reports prompt, permission, tool, stop, and context events through `dist/ai-hook-codex.sh`. Each state-only event would otherwise carry `None` for `context`, `model`, `tool`, `agent`, and `conversation_id`, clobbering values set by an earlier same-provider event.  carries those optional fields forward from the previously stored state when the new event leaves them unset and the provider matches, so a state-only hook firing between context refreshes does not erase the live percentage. Switching providers (e.g. Claude → Codex) skips the merge so cross-provider state does not bleed. The dedicated `ContextChanged` hook event applied by  keeps the producer/state separation honest: a status-line refresh patches only the percentage and re-broadcasts the existing state, never replacing it.
 
 ## AI Context Chrome
 
 Single source of truth for how a context-window fill percentage is spelled on screen, shared by every surface that displays one.
 
-Two surfaces show the percentage and they disagree on both shape and gating: the per-pane prompt bar draws a segmented meter (`▰▰▱ 72%`) in every band, while the tab label appends a bare suffix (` 72%`) only from the warn band up. [[crates/scribe-common/src/ai_chrome.rs#context_meter_label]] and [[crates/scribe-common/src/ai_chrome.rs#tab_context_suffix_text]] own those two strings and the suffix's gating, so the GPUI prompt bar ([[client#GPUI Prompt Bar]]), the GPUI tab bar ([[client#GPUI Titlebar#Context suffix bands and suppression]]), and the E2E harness that asserts on them ([[test#E2E Functional Tests#AI Indicator E2E]]) cannot drift apart.
+Two surfaces show the percentage and they disagree on both shape and gating: the per-pane prompt bar draws a segmented meter (`▰▰▱ 72%`) in every band, while the tab label appends a bare suffix (` 72%`) only from the warn band up.  and  own those two strings and the suffix's gating, so the GPUI prompt bar (), the GPUI tab bar (), and the E2E harness that asserts on them () cannot drift apart.
 
-Only text is shared. Band colors stay with each surface because they resolve through different palettes — the prompt bar reads the configured [[common#Configuration#AI Context Thresholds]] hex colors while the tab bar uses its own fixed band colors.
+Only text is shared. Band colors stay with each surface because they resolve through different palettes — the prompt bar reads the configured  hex colors while the tab bar uses its own fixed band colors.
 
 ### Meter label fills and clamps
 
-Verifies [[crates/scribe-common/src/ai_chrome.rs#context_meter_label]] lights segments by `div_ceil` (any non-zero percentage fills at least one) and clamps above 100%.
+Verifies  lights segments by `div_ceil` (any non-zero percentage fills at least one) and clamps above 100%.
 
 ### Tab suffix is gated on the warn band
 
-Verifies [[crates/scribe-common/src/ai_chrome.rs#tab_context_suffix_text]] returns `None` below `warn` and while a pulsing attention state owns the UX, and the bare ` NN%` suffix otherwise.
+Verifies  returns `None` below `warn` and while a pulsing attention state owns the UX, and the bare ` NN%` suffix otherwise.
 
 ## Configuration
 
-Unified TOML config for server and client, deserialized from the active install flavor's XDG config root into [[crates/scribe-common/src/config.rs#ScribeConfig]].
+Unified TOML config for server and client, deserialized from the active install flavor's XDG config root into .
 
-Stable installs read `~/.config/scribe/config.toml`, while `scribe-dev` reads `~/.config/scribe-dev/config.toml`. `ScribeConfig` is the top-level struct with six sub-sections: `appearance`, `theme`, `terminal`, `keybindings`, `workspaces`, and `update`. The [[crates/scribe-common/src/config.rs#load_config]] function reads the file and returns `ScribeConfig::default()` if absent. Prompt-bar configs still deserialize the legacy `prompt_bar_bg` key as a compatibility alias for `prompt_bar_second_row_bg`, while Debian package installs additionally rewrite that legacy key on disk during upgrade so future launches use the exact-fill row model directly.
+Stable installs read `~/.config/scribe/config.toml`, while `scribe-dev` reads `~/.config/scribe-dev/config.toml`. `ScribeConfig` is the top-level struct with six sub-sections: `appearance`, `theme`, `terminal`, `keybindings`, `workspaces`, and `update`. The  function reads the file and returns `ScribeConfig::default()` if absent. Prompt-bar configs still deserialize the legacy `prompt_bar_bg` key as a compatibility alias for `prompt_bar_second_row_bg`, while Debian package installs additionally rewrite that legacy key on disk during upgrade so future launches use the exact-fill row model directly.
 
 ### Appearance
 
-Font family, size, weight, ligatures, line padding, cursor shape, opacity, theme name, scrollbar, focus border, tab bar dimensions, status bar height, and content padding are all in [[crates/scribe-common/src/config.rs#AppearanceConfig]].
+Font family, size, weight, ligatures, line padding, cursor shape, opacity, theme name, scrollbar, focus border, tab bar dimensions, status bar height, and content padding are all in .
 
-[[crates/scribe-common/src/config.rs#ContentPadding]] provides per-side padding (top/right/bottom/left) with a `clamped()` helper that enforces the `0.0..=50.0` range. [[crates/scribe-common/src/config.rs#CursorShape]] is a three-variant enum (`Block`, `Beam`, `Underline`).
+ provides per-side padding (top/right/bottom/left) with a `clamped()` helper that enforces the `0.0..=50.0` range.  is a three-variant enum (`Block`, `Beam`, `Underline`).
 
 ### AI Context Thresholds
 
 Two-boundary band model classifying context-window fill into Ok, Warn, and Danger, used to color the prompt-bar context indicator and tab inline % display.
 
-[[crates/scribe-common/src/config.rs#AiContextThresholds]] holds `warn` (default 70) and `danger` (default 90) as `u8` percentages, plus three hex-string color fields: `ok_color`, `warn_color`, and `danger_color`. [[crates/scribe-common/src/config.rs#ContextBand]] is a three-variant enum (`Ok`, `Warn`, `Danger`) returned by `AiContextThresholds::band(pct)`. A fill value at or above `danger` maps to `Danger`; at or above `warn` maps to `Warn`; below `warn` maps to `Ok`. Inverted configs (`warn > danger`) are normalized by treating `min(warn, danger)` as the effective warn threshold so the Warn band remains reachable.
+ holds `warn` (default 70) and `danger` (default 90) as `u8` percentages, plus three hex-string color fields: `ok_color`, `warn_color`, and `danger_color`.  is a three-variant enum (`Ok`, `Warn`, `Danger`) returned by `AiContextThresholds::band(pct)`. A fill value at or above `danger` maps to `Danger`; at or above `warn` maps to `Warn`; below `warn` maps to `Ok`. Inverted configs (`warn > danger`) are normalized by treating `min(warn, danger)` as the effective warn threshold so the Warn band remains reachable.
 
 ### AI State Colors
 
-Per-state visual config for AI indicators lives in [[crates/scribe-common/src/config.rs#AiStateStylesConfig]], which holds one [[crates/scribe-common/src/config.rs#AiStateEntry]] per `AiState` variant.
+Per-state visual config for AI indicators lives in , which holds one  per `AiState` variant.
 
-Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto-clear timeout (`timeout_secs`), and booleans for tab indicator and pane border. [[crates/scribe-common/src/config.rs#AiColor]] is a polymorphic color type that accepts either a fixed `#rrggbb` hex string or an `"ansi:N"` palette index (0–15) that adapts to the active theme at render time.
+Each `AiStateEntry` carries a color, pulse animation duration (`pulse_ms`), auto-clear timeout (`timeout_secs`), and booleans for tab indicator and pane border.  is a polymorphic color type that accepts either a fixed `#rrggbb` hex string or an `"ansi:N"` palette index (0–15) that adapts to the active theme at render time.
 
 `pulse_ms` is interpreted as a full millisecond duration across the stored `u32` range, so very slow indicator pulses are preserved instead of being clamped to 16-bit timing.
 
 ### Terminal
 
-[[crates/scribe-common/src/config.rs#TerminalConfig]] groups scrollback, copy-on-select, the enhanced keyboard-protocol opt-out, AI toggles, indicator height, shell integration, status bar stats, prompt bar, scroll pin, paste confirmation, and OSC 52 clipboard policy settings.
+ groups scrollback, copy-on-select, the enhanced keyboard-protocol opt-out, AI toggles, indicator height, shell integration, status bar stats, prompt bar, scroll pin, paste confirmation, and OSC 52 clipboard policy settings.
 
-`paste_confirmation` (bool, default `false`) gates a multi-line or control-character paste behind a confirmation dialog before it reaches the PTY, but only when the focused application has not enabled bracketed paste (spec 011); see [[client#Dialogs#Paste Confirmation Dialog]].
+`paste_confirmation` (bool, default `false`) gates a multi-line or control-character paste behind a confirmation dialog before it reaches the PTY, but only when the focused application has not enabled bracketed paste (spec 011); see .
 
-[[crates/scribe-common/src/config.rs#ClipboardPolicyConfig]] (TOML namespace `terminal.clipboard.*`) carries the OSC 52 read/write policy modes ([[crates/scribe-common/src/config.rs#ClipboardMode]] — `deny`/`allow`/`prompt`), a `max_write_bytes` cap (default 16 MiB, ceiling 512 MiB), a `focus_gate_writes` opt-in toggle, and a `burst_window_ms` reuse window. Wired into the foundational types only as of this checkpoint; the server-side gating engine and client-side prompt dialog land in the OSC 52 clipboard-gating feature work.
+ (TOML namespace `terminal.clipboard.*`) carries the OSC 52 read/write policy modes ( — `deny`/`allow`/`prompt`), a `max_write_bytes` cap (default 16 MiB, ceiling 512 MiB), a `focus_gate_writes` opt-in toggle, and a `burst_window_ms` reuse window. Wired into the foundational types only as of this checkpoint; the server-side gating engine and client-side prompt dialog land in the OSC 52 clipboard-gating feature work.
 
 `scroll_pin` (bool, default `false`) enables split-scroll in AI panes, but only while the pane is in the normal screen buffer; alternate-screen TUIs fall back to the regular live view. `preserve_ai_scrollback` (bool, default `true`) strips AI-session `CSI 3 J` scrollback clears, resets its trim epoch on prompt/attention boundaries, captures the epoch baseline after the first filtered redraw, and trims later redraw clears back to that baseline so committed transcript history survives without duplicate inline frames piling up.
 
-`ai_tab_cwd` ([[crates/scribe-common/src/config.rs#AiTabCwd]]: `pane` (default) or `project_root`) controls where a newly opened Claude/Codex AI tab starts: `pane` inherits the focused pane's CWD like a plain new tab, while `project_root` anchors to the workspace project root when the pane is inside a configured workspace root.
+`ai_tab_cwd` (: `pane` (default) or `project_root`) controls where a newly opened Claude/Codex AI tab starts: `pane` inherits the focused pane's CWD like a plain new tab, while `project_root` anchors to the workspace project root when the pane is inside a configured workspace root.
 
-Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (f32, 8–32, default 14), `prompt_bar_position` ([[crates/scribe-common/src/config.rs#PromptBarPosition]]: Top or Bottom), and optional row-surface overrides for the first row, second row, text, first icon, and latest icon.
+Prompt bar fields: `prompt_bar` (bool), `prompt_bar_font_size` (f32, 8–32, default 14), `prompt_bar_position` (: Top or Bottom), and optional row-surface overrides for the first row, second row, text, first icon, and latest icon.
 
-[[crates/scribe-common/src/config.rs#StatusBarStatsConfig]] independently toggles CPU, memory, GPU, and network display. [[crates/scribe-common/src/config.rs#ShellIntegrationConfig]] wraps a single `enabled` flag for shell prompt marks. [[crates/scribe-common/src/config.rs#TerminalConfig#ai_provider_enabled]] maps an [[crates/scribe-common/src/ai_state.rs#AiProvider]] to the matching integration toggle.
+ independently toggles CPU, memory, GPU, and network display.  wraps a single `enabled` flag for shell prompt marks.  maps an  to the matching integration toggle.
 
 ### Keybindings
 
-[[crates/scribe-common/src/config.rs#KeybindingsConfig]] exposes 50+ configurable actions across pane navigation, workspace splits, tab management, clipboard, scrolling, command-jump navigation, zoom, and terminal word-motion shortcuts, including explicit Claude Code and Codex open/resume shortcuts.
+ exposes 50+ configurable actions across pane navigation, workspace splits, tab management, clipboard, scrolling, command-jump navigation, zoom, and terminal word-motion shortcuts, including explicit Claude Code and Codex open/resume shortcuts.
 
-Each field uses [[crates/scribe-common/src/config.rs#KeyComboList]], which deserializes from either a bare TOML string (`"ctrl+shift+w"`) or an array (`["ctrl+shift+w", "ctrl+w"]`). Up to [[crates/scribe-common/src/config.rs#MAX_BINDINGS]] (5) combos per action are stored. Default bindings are platform-aware: macOS uses `cmd+`-prefixed combos where they do not collide with standard app shortcuts, with close-pane intentionally on `super+ctrl+w`, while other platforms use `ctrl+shift+`-prefixed equivalents.
+Each field uses , which deserializes from either a bare TOML string (`"ctrl+shift+w"`) or an array (`["ctrl+shift+w", "ctrl+w"]`). Up to  (5) combos per action are stored. Default bindings are platform-aware: macOS uses `cmd+`-prefixed combos where they do not collide with standard app shortcuts, with close-pane intentionally on `super+ctrl+w`, while other platforms use `ctrl+shift+`-prefixed equivalents.
 
 On macOS, config load also migrates stale legacy non-mac defaults when a saved keybindings block still looks like an older generated config, so pre-existing Linux-style defaults do not mask the platform-native shortcuts after install.
 
@@ -82,55 +82,55 @@ On macOS, config load also migrates stale legacy non-mac defaults when a saved k
 
 Named config profiles are stored separately from `config.toml` so switching profiles can atomically rewrite the active config without losing the saved variants.
 
-[[crates/scribe-common/src/profiles.rs#ProfileStore]] keeps a `BTreeMap<String, ScribeConfig>` plus the active profile name in `$XDG_CONFIG_HOME/scribe/profiles.toml` for stable installs or `$XDG_CONFIG_HOME/scribe-dev/profiles.toml` for the dev flavor. [[crates/scribe-common/src/profiles.rs#load_profile_store]], [[crates/scribe-common/src/profiles.rs#switch_profile]], [[crates/scribe-common/src/profiles.rs#export_profile]], and [[crates/scribe-common/src/profiles.rs#import_profile]] back the CLI profile commands and the client command palette's profile switcher.
+ keeps a `BTreeMap<String, ScribeConfig>` plus the active profile name in `$XDG_CONFIG_HOME/scribe/profiles.toml` for stable installs or `$XDG_CONFIG_HOME/scribe-dev/profiles.toml` for the dev flavor. , , , and  back the CLI profile commands and the client command palette's profile switcher.
 
 ### Unicode Width
 
 Unicode width is currently fixed to alacritty_terminal's default width tables, so East Asian ambiguous-width code points still use the narrow policy everywhere in Scribe.
 
-Both the server and client terminal cores inherit width from alacritty_terminal's built-in `Handler::input` logic, and the renderer's ligature run matcher mirrors that same policy via [[crates/scribe-renderer/src/lib.rs#RunAccum#matches]]. A user-selectable ambiguous-width mode is not implemented yet because it would require coordinated terminal-core and renderer changes.
+Both the server and client terminal cores inherit width from alacritty_terminal's built-in `Handler::input` logic, and the renderer's ligature run matcher mirrors that same policy via . A user-selectable ambiguous-width mode is not implemented yet because it would require coordinated terminal-core and renderer changes.
 
 ### Workspaces
 
-[[crates/scribe-common/src/config.rs#WorkspacesConfig]] holds a list of root directory paths scanned for projects and a badge color palette used to visually distinguish workspaces.
+ holds a list of root directory paths scanned for projects and a badge color palette used to visually distinguish workspaces.
 
 ### Update
 
-[[crates/scribe-common/src/config.rs#UpdateConfig]] controls auto-update behavior: `enabled` flag, `check_interval_secs` (default 86 400 s), and [[crates/scribe-common/src/config.rs#UpdateChannel]] (`Stable` or `Beta`).
+ controls auto-update behavior: `enabled` flag, `check_interval_secs` (default 86 400 s), and  (`Stable` or `Beta`).
 
 The updater is intentionally disabled for `scribe-dev` installs so test builds cannot download and install the stable package over the main app.
 
-[[crates/scribe-common/src/config.rs#ThemeConfig]] is an optional inline theme definition used when `appearance.theme == "custom"` to supply foreground, background, cursor, selection, and 16 ANSI colors directly in the config file.
+ is an optional inline theme definition used when `appearance.theme == "custom"` to supply foreground, background, cursor, selection, and 16 ANSI colors directly in the config file.
 
 ## Errors
 
 A single `thiserror`-derived enum covering all error conditions that cross crate boundaries or IPC channels.
 
-[[crates/scribe-common/src/error.rs#ScribeError]] has variants for session/workspace lookup failures, PTY spawn failure, IPC and protocol errors, config parse errors, theme parse errors, serialization/deserialization failures (with `#[from]` for `rmp_serde`), and update check/install failures.
+ has variants for session/workspace lookup failures, PTY spawn failure, IPC and protocol errors, config parse errors, theme parse errors, serialization/deserialization failures (with `#[from]` for `rmp_serde`), and update check/install failures.
 
 ## Framing
 
-Length-prefixed MessagePack framing over async streams, used for all IPC connections in the [[protocol]].
+Length-prefixed MessagePack framing over async streams, used for all IPC connections in the .
 
-The wire format is a 4-byte big-endian `u32` length followed by an `rmp_serde` payload. The `MAX_MESSAGE_SIZE` constant caps messages at 256 MiB; the cap survives from the legacy per-cell `ScreenSnapshot` era and is now headroom for `RequestSnapshot` tooling — live reattach uses zstd-compressed ANSI replays that are typically orders of magnitude smaller. [[crates/scribe-common/src/framing.rs#read_message]] and [[crates/scribe-common/src/framing.rs#write_message]] are generic async functions that work with any `AsyncReadExt`/`AsyncWriteExt` + `Unpin` stream.
+The wire format is a 4-byte big-endian `u32` length followed by an `rmp_serde` payload. The `MAX_MESSAGE_SIZE` constant caps messages at 256 MiB; the cap survives from the legacy per-cell `ScreenSnapshot` era and is now headroom for `RequestSnapshot` tooling — live reattach uses zstd-compressed ANSI replays that are typically orders of magnitude smaller.  and  are generic async functions that work with any `AsyncReadExt`/`AsyncWriteExt` + `Unpin` stream.
 
 ## Identity Types
 
 UUID-based newtype IDs generated by the `define_id!` macro, ensuring type safety across IPC boundaries.
 
-Three ID types are defined in [[crates/scribe-common/src/ids.rs]]: `SessionId` (display prefix `session-`), `WorkspaceId` (prefix `ws-`), and `WindowId` (prefix `win-`). Each implements `new()`, `as_uuid()`, `to_full_string()`, `Display` (8-char prefix), `FromStr` (parses full UUID string), `Default`, and the standard `Copy`/`Hash`/`Serialize`/`Deserialize` traits.
+Three ID types are defined in : `SessionId` (display prefix `session-`), `WorkspaceId` (prefix `ws-`), and `WindowId` (prefix `win-`). Each implements `new()`, `as_uuid()`, `to_full_string()`, `Display` (8-char prefix), `FromStr` (parses full UUID string), `Default`, and the standard `Copy`/`Hash`/`Serialize`/`Deserialize` traits.
 
 ## Screen Snapshots
 
-Serializable per-cell terminal screen state used inside the server and for `RequestSnapshot` tooling. Client reattach uses the denser [[common#Session Replay]] encoding instead.
+Serializable per-cell terminal screen state used inside the server and for `RequestSnapshot` tooling. Client reattach uses the denser  encoding instead.
 
-[[crates/scribe-common/src/screen.rs#ScreenSnapshot]] carries the full visible grid as a flat `Vec<ScreenCell>`, dimensions, cursor position and style, alternate-screen flag, the application's enabled DEC private modes as an `active_dec_modes: Vec<DecPrivateMode>` list so the reattach replay can restore them, and scrollback rows. [[crates/scribe-common/src/screen.rs#DecPrivateMode]] is a `Copy` enum (mouse reporting 1000/1002/1003, SGR/UTF-8 mouse 1006/1005, alternate scroll 1007, bracketed paste 2004, focus events 1004, app-cursor DECCKM, app-keypad DECPAM) whose [[crates/scribe-common/src/screen.rs#DecPrivateMode#set_sequence]] returns the DECSET escape that re-enables it on the receiving `Term`. [[crates/scribe-common/src/screen.rs#ScreenCell]] holds a character, foreground/background color, and cell attribute flags. [[crates/scribe-common/src/screen.rs#ScreenColor]] is a three-variant enum (`Named(u16)`, `Indexed(u8)`, `Rgb`) that uses `u16` for named colors to accommodate alacritty_terminal's extended named color indices above 255. [[crates/scribe-common/src/screen.rs#CellFlags]] includes both wide-character placeholders and `WRAPLINE` state so the ANSI encoder can preserve logical soft-wrapped lines. [[crates/scribe-common/src/screen.rs#CursorStyle]] completes the rendering model.
+ carries the full visible grid as a flat `Vec<ScreenCell>`, dimensions, cursor position and style, alternate-screen flag, the application's enabled DEC private modes as an `active_dec_modes: Vec<DecPrivateMode>` list so the reattach replay can restore them, and scrollback rows.  is a `Copy` enum (mouse reporting 1000/1002/1003, SGR/UTF-8 mouse 1006/1005, alternate scroll 1007, bracketed paste 2004, focus events 1004, app-cursor DECCKM, app-keypad DECPAM) whose  returns the DECSET escape that re-enables it on the receiving `Term`.  holds a character, foreground/background color, and cell attribute flags.  is a three-variant enum (`Named(u16)`, `Indexed(u8)`, `Rgb`) that uses `u16` for named colors to accommodate alacritty_terminal's extended named color indices above 255.  includes both wide-character placeholders and `WRAPLINE` state so the ANSI encoder can preserve logical soft-wrapped lines.  completes the rendering model.
 
 ## Session Replay
 
-[[crates/scribe-common/src/screen_replay.rs#SessionReplay]] is the unified primitive for transferring a terminal's state to a receiver that will rebuild a VTE `Term`.
+ is the unified primitive for transferring a terminal's state to a receiver that will rebuild a VTE `Term`.
 
-Carries cols/rows/scrollback-rows, cursor fields, alt-screen flag, and a zstd-compressed ANSI byte stream produced by [[crates/scribe-common/src/screen_replay.rs#snapshot_to_ansi]] and compressed by [[crates/scribe-common/src/screen_replay.rs#build_session_replay]]. Both server hot-reload handoff and server → client reattach use this same encoding — receivers decompress via [[crates/scribe-common/src/screen_replay.rs#decompress_session_replay]] and feed the bytes through `vte::ansi::Processor::advance`. Before the screen redraw, `snapshot_to_ansi` re-emits the snapshot's enabled DEC private modes (mouse reporting, SGR/UTF-8 mouse, alternate scroll, bracketed paste, focus events, app-cursor, app-keypad) as DECSET sequences, so a reattached vim/tmux/Claude-Code session keeps those modes instead of silently losing them.
+Carries cols/rows/scrollback-rows, cursor fields, alt-screen flag, and a zstd-compressed ANSI byte stream produced by  and compressed by . Both server hot-reload handoff and server → client reattach use this same encoding — receivers decompress via  and feed the bytes through `vte::ansi::Processor::advance`. Before the screen redraw, `snapshot_to_ansi` re-emits the snapshot's enabled DEC private modes (mouse reporting, SGR/UTF-8 mouse, alternate scroll, bracketed paste, focus events, app-cursor, app-keypad) as DECSET sequences, so a reattached vim/tmux/Claude-Code session keeps those modes instead of silently losing them.
 
 ## Socket Paths
 
@@ -142,13 +142,13 @@ Platform-specific socket and lock file paths for all Scribe singleton processes,
 | macOS | `~/Library/Application Support/Scribe/run/` for stable installs, `~/Library/Application Support/Scribe Dev/run/` for `scribe-dev` |
 | Other Unix | `$TMPDIR/scribe-{uid}/` for stable installs, `$TMPDIR/scribe-dev-{uid}/` for `scribe-dev` |
 
-Named sockets in the base directory: `server.sock`, `settings.sock`, and `handoff.sock`, with lock files for the long-lived singleton processes. macOS uses a stable Application Support path so Finder-launched clients and `launchctl`-started background services resolve the same socket location. Public API: [[crates/scribe-common/src/socket.rs#server_socket_path]], [[crates/scribe-common/src/socket.rs#settings_socket_path]], [[crates/scribe-common/src/socket.rs#settings_lock_path]], [[crates/scribe-common/src/socket.rs#server_lock_path]], [[crates/scribe-common/src/socket.rs#handoff_socket_path]], and [[crates/scribe-common/src/socket.rs#current_uid]].
+Named sockets in the base directory: `server.sock`, `settings.sock`, and `handoff.sock`, with lock files for the long-lived singleton processes. macOS uses a stable Application Support path so Finder-launched clients and `launchctl`-started background services resolve the same socket location. Public API: , , , , , and .
 
 ## Theme System
 
 A theme engine providing 5 built-in and 187 community presets, plus a derivation algorithm that produces chrome (UI) colors from the terminal palette.
 
-[[crates/scribe-common/src/theme.rs#Theme]] is the resolved theme struct with RGBA arrays for foreground, background, cursor, selection, 16 ANSI colors, and a [[crates/scribe-common/src/theme.rs#ChromeColors]] sub-struct. [[crates/scribe-common/src/theme.rs#ThemeColors]] is the input parameter bag passed to [[crates/scribe-common/src/theme.rs#resolve_preset]] produces a `Theme` from a preset name (case-insensitive) by checking curated presets first and falling back to the community set. [[crates/scribe-common/src/theme.rs#hex_to_rgba]] and [[crates/scribe-common/src/theme.rs#rgba_to_hex]] convert between `#rrggbb` strings and `[f32; 4]` RGBA arrays.
+ is the resolved theme struct with RGBA arrays for foreground, background, cursor, selection, 16 ANSI colors, and a  sub-struct.  is the input parameter bag passed to  produces a `Theme` from a preset name (case-insensitive) by checking curated presets first and falling back to the community set.  and  convert between `#rrggbb` strings and `[f32; 4]` RGBA arrays.
 
 RGBA-to-hex conversion rounds each clamped channel to the nearest byte, and the server reuses that same helper when it synthesizes fallback terminal colors from the configured theme.
 
@@ -162,10 +162,10 @@ These are defined in `theme.rs` as `pub(crate)` builder functions returning `The
 
 187 color schemes imported from the Tabby terminal emulator, accessible via case-insensitive kebab-case names.
 
-The presets are defined in `theme_community_presets.rs` as a static slice of `ThemeSpec` structs containing hex color strings. They are looked up at runtime and never eagerly constructed. The full name list is exposed via [[crates/scribe-common/src/theme.rs#all_preset_names]].
+The presets are defined in `theme_community_presets.rs` as a static slice of `ThemeSpec` structs containing hex color strings. They are looked up at runtime and never eagerly constructed. The full name list is exposed via .
 
 ### Chrome Color Derivation
 
-[[crates/scribe-common/src/theme.rs#ChromeColors]] is derived automatically from the terminal foreground, background, and ANSI palette — no manual chrome configuration is required.
+ is derived automatically from the terminal foreground, background, and ANSI palette — no manual chrome configuration is required.
 
 The derivation algorithm lightens the background by 6% for the tab bar, uses ANSI blue (index 4) as the accent, and applies alpha-reduced foreground tones for separators, dividers, scrollbar, and status bar text. Prompt bar colors are also derived as restrained first-row and second-row surfaces, plus muted text, first icon, and latest icon; `AppearanceConfig` can override those surfaces directly. This keeps the chrome visually coherent when a user switches themes or defines a custom palette.
