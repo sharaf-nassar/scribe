@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use gpui::{App, ClickEvent, Rgba, Window, div, prelude::*, px};
+use gpui::{App, FocusHandle, KeyDownEvent, Rgba, Role, Window, div, prelude::*, px};
 use scribe_common::config::StatusBarStatsConfig;
 use scribe_common::protocol::{ControllerInfo, EnvStatusState, UpdateProgressState};
 use scribe_common::theme::ChromeColors;
@@ -188,6 +188,9 @@ pub struct StatusBarModel {
     /// Whether the centred CTA should accept clicks (update actionable).
     pub center_clickable: bool,
     pub right: Vec<Span>,
+    /// Concise state for the one exposed status node. Decorative spans remain
+    /// anonymous so assistive technology does not announce every glyph.
+    pub accessibility_label: String,
 }
 
 /// Build the pure status-bar model from its inputs. Every segment enumerated in
@@ -197,7 +200,44 @@ pub fn build_model(data: &StatusBarData<'_>, colors: &StatusBarColors) -> Status
     let right = build_right(data, colors);
     let (center, center_clickable) = build_center(data, colors)
         .map_or((None, false), |(span, clickable)| (Some(span), clickable));
-    StatusBarModel { left, center, center_clickable, right }
+    StatusBarModel {
+        left,
+        center,
+        center_clickable,
+        right,
+        accessibility_label: accessibility_label(data),
+    }
+}
+
+/// Summarize state changes without turning decorative status-bar runs into
+/// separately announced accessibility nodes.
+fn accessibility_label(data: &StatusBarData<'_>) -> String {
+    let mut states = vec![if data.connected { "Connected" } else { "Disconnected" }.to_owned()];
+    match data.last_command_status {
+        Some(CommandStatus::Success) => states.push("Last command succeeded".to_owned()),
+        Some(CommandStatus::Failure) => states.push("Last command failed".to_owned()),
+        Some(CommandStatus::Unknown) => states.push("Last command status unknown".to_owned()),
+        None => {}
+    }
+    if matches!(data.env_status, Some(EnvStatusState::Degraded { .. })) {
+        states.push("Environment capture degraded".to_owned());
+    }
+    match data.update_progress {
+        Some(UpdateProgressState::Downloading) => states.push("Downloading update".to_owned()),
+        Some(UpdateProgressState::Verifying) => states.push("Verifying update".to_owned()),
+        Some(UpdateProgressState::Installing) => states.push("Installing update".to_owned()),
+        Some(UpdateProgressState::Completed { .. }) => states.push("Update complete".to_owned()),
+        Some(UpdateProgressState::CompletedRestartRequired { .. }) => {
+            states.push("Update complete; restart required".to_owned());
+        }
+        Some(UpdateProgressState::Failed { .. }) => states.push("Update failed".to_owned()),
+        None => {
+            if let Some(version) = data.update_available {
+                states.push(format!("Update {version} available"));
+            }
+        }
+    }
+    format!("Terminal status: {}", states.join(". "))
 }
 
 // ---------------------------------------------------------------------------
@@ -598,10 +638,8 @@ fn span_row(spans: &[Span]) -> impl IntoElement {
     )
 }
 
-/// Click listener for the centred update CTA, boxed so [`render`] can stay a
-/// plain function while the caller supplies a `cx.listener(..)` closure bound to
-/// its own view.
-pub type UpdateClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+/// Shared update callback used by pointer and AccessKit activation.
+pub type UpdateActionHandler = Box<dyn Fn(&mut Window, &mut App)>;
 
 /// Render the centred CTA, wiring the click listener when the model says the
 /// update is actionable and the caller supplied one.
@@ -613,17 +651,35 @@ fn center_cta(
     span: &Span,
     clickable: bool,
     colors: &StatusBarColors,
-    on_click: Option<UpdateClickHandler>,
+    update_focus: Option<&FocusHandle>,
+    on_update: Option<UpdateActionHandler>,
 ) -> gpui::AnyElement {
     let base = div().px_2().text_color(rgba(span.color)).child(span.text.clone());
-    match on_click.filter(|_| clickable) {
-        Some(listener) => base
-            .id("status-bar-update-cta")
-            .cursor_pointer()
-            .hover(|style| style.text_color(rgba(colors.accent)))
-            .on_click(listener)
-            .into_any_element(),
-        None => base.into_any_element(),
+    match (on_update.filter(|_| clickable), update_focus) {
+        (Some(action), Some(focus)) => base
+                .id("status-bar-update-cta")
+                .track_focus(focus)
+                .role(Role::Button)
+                .aria_label(span.text.clone())
+                .aria_description("Press Enter or Space to open the update confirmation")
+                .cursor_pointer()
+                .hover(|style| style.text_color(rgba(colors.accent)))
+                .focus_visible(|style| {
+                    style.bg(rgba(colors.accent)).text_color(rgba(colors.bg))
+                })
+                // GPUI maps Enter/Space and AccessKit Click onto `on_click`.
+                // Stop the keydown here so the terminal root cannot also
+                // encode the activation key into the focused PTY.
+                .on_key_down(|event: &KeyDownEvent, _, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        cx.stop_propagation();
+                    }
+                })
+                .on_click(move |_, window, cx| action(window, cx))
+                .into_any_element(),
+        _ => base.into_any_element(),
     }
 }
 
@@ -637,13 +693,17 @@ pub fn render(
     model: &StatusBarModel,
     height_px: f32,
     colors: &StatusBarColors,
-    on_update_click: Option<UpdateClickHandler>,
+    update_focus: Option<&FocusHandle>,
+    on_update: Option<UpdateActionHandler>,
 ) -> impl IntoElement {
     let center = model
         .center
         .as_ref()
-        .map(|span| center_cta(span, model.center_clickable, colors, on_update_click));
+        .map(|span| center_cta(span, model.center_clickable, colors, update_focus, on_update));
     div()
+        .id("terminal-status-bar")
+        .role(Role::Status)
+        .aria_label(model.accessibility_label.clone())
         .w_full()
         // A fixed-height band, never a flexible one: the shell stacks it under
         // a flex-grown terminal grid, and a shrinkable band is what lets a
