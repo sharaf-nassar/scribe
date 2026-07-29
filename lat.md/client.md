@@ -9,6 +9,8 @@ local IPC protocol. `--settings` opens the integrated settings window and
 
 The GPUI rebuild keeps `appearance.opacity`:  proves that the pinned GPUI revision opens a transparent Wayland/X11 surface and repaints root alpha live. The decision is recorded in `specs/016-gpui-client-rebuild/spikes/window-opacity-wayland-x11.md`, and  documents how the client paints it.
 
+The follow-on image-protocol decision is recorded in `specs/016-gpui-client-rebuild/spikes/terminal-image-protocols.md`: Sixel uses `icy_sixel`, Kitty control data uses a narrowed WezTerm-derived parser, and both feed one bounded placement renderer.
+
 ## GPUI Client Spike
 
 The cutover crate (`crates/scribe-client`) renders a live Scribe pane over the

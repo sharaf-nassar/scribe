@@ -366,7 +366,8 @@ checklist green):**
   Phase 0 toolchain bead.
 - US3 cosmetics that trailed cutover (if any) close here; follow-on
   register (image protocols, gpui-component adoption, macOS) filed as
-  future feature stubs, not left as TODOs.
+  future feature stubs, not left as TODOs. The image-protocol decision is
+  recorded in [`spikes/terminal-image-protocols.md`](spikes/terminal-image-protocols.md).
 
 ## Re-sequenced remaining phases (post-reachability-audit)
 
