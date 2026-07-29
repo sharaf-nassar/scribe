@@ -160,8 +160,8 @@ use crate::{
     sync_frames::{SyncFrameQueue, drain_all_committed},
     terminal::{Content, DisplayOnlyTerminal, PaneGrids, Scroll},
     terminal_element::{
-        GridBounds, GridColors, GridFont, ImePaint, ScrollbarPaint, TerminalElement, cell_at,
-        hits_jump_chip, record_grid_area,
+        CursorPaint, GridBounds, GridColors, GridFont, ImePaint, ScrollbarPaint, TerminalElement,
+        cell_at, hits_jump_chip, record_grid_area,
     },
 };
 
@@ -404,6 +404,9 @@ const X11_FOCUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// window list when it is due, raising a LAN device-approval prompt the reader
 /// parked, and performing the OSC 52 clipboard work it queued.
 const WINDOW_LIFECYCLE_TICK: Duration = Duration::from_millis(200);
+
+/// Cursor blink interval, matching the legacy client and xterm/VTE.
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 /// How long a layout or geometry change must settle before it is written to
 /// disk. A drag-resize emits a bounds change per frame and a split re-reports
@@ -715,11 +718,42 @@ struct TerminalFocus {
     /// Stable tab stop for the actionable update CTA. Keeping the handle on
     /// the view prevents ordinary repaints from returning focus to the PTY.
     update: FocusHandle,
+    cursor_blink: CursorBlink,
 }
 
 impl TerminalFocus {
-    fn new(cx: &mut Context<TerminalView>) -> Self {
-        Self { root: cx.focus_handle(), update: cx.focus_handle().tab_stop(true) }
+    fn new(window_active: bool, cx: &mut Context<TerminalView>) -> Self {
+        Self {
+            root: cx.focus_handle(),
+            update: cx.focus_handle().tab_stop(true),
+            cursor_blink: CursorBlink::new(window_active),
+        }
+    }
+}
+
+/// Window-level shell-cursor focus and blink phase.
+struct CursorBlink {
+    visible: bool,
+    window_active: bool,
+    last_toggle: Instant,
+}
+
+impl CursorBlink {
+    fn new(window_active: bool) -> Self {
+        Self { visible: true, window_active, last_toggle: Instant::now() }
+    }
+
+    /// Start a fresh visible phase after focus or keyboard activity.
+    fn show_now(&mut self) -> bool {
+        let changed = !self.visible;
+        self.visible = true;
+        self.last_toggle = Instant::now();
+        changed
+    }
+
+    fn set_window_active(&mut self, active: bool) {
+        self.window_active = active;
+        self.show_now();
     }
 }
 
@@ -1000,13 +1034,12 @@ impl TerminalView {
         let prompt_bar_enabled = terminal.prompt_bar.enabled;
         let gate = Self::start_paste_gate(terminal.paste_confirmation, cx);
         let titlebar = Self::build_titlebar(&chrome, opacity, cx);
-        // One workspace region holding one pane: the shape the window has
-        // before the first split, and the shape every split grows out of.
+        // One initial pane: the shape the window has before every later split.
         let shell = PaneShell::new(chrome.accent, cx);
         Self {
             shared,
             sink,
-            focus: TerminalFocus::new(cx),
+            focus: TerminalFocus::new(window.is_window_active(), cx),
             config,
             stats: SystemStatsCollector::new(),
             status_colors,
@@ -1337,6 +1370,10 @@ impl TerminalView {
         // to reach it or the window keeps firing on the old policy.
         let notifications = self.config.config().config.notifications.clone();
         self.notifications.center.update(cx, |center, _| center.reconfigure(notifications));
+        // A cursor setting may have changed even though it does not affect the
+        // theme/font/opacity reload plan. Start the new setting in a visible
+        // phase so a live edit cannot strand the cursor hidden.
+        self.focus.cursor_blink.show_now();
 
         // Tell the server to re-read the same file so its own live surfaces
         // (clipboard policy, env store, remote/share listeners) follow.
@@ -2998,6 +3035,26 @@ impl TerminalView {
         }
     }
 
+    /// Advance the focused cursor's 530 ms blink phase and invalidate only
+    /// when a visible edge changes.
+    fn tick_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        let enabled = self.config.config().config.appearance.cursor_blink;
+        if !enabled {
+            if self.focus.cursor_blink.show_now() {
+                cx.notify();
+            }
+            return;
+        }
+        if !self.focus.cursor_blink.window_active
+            || self.focus.cursor_blink.last_toggle.elapsed() < CURSOR_BLINK_INTERVAL
+        {
+            return;
+        }
+        self.focus.cursor_blink.visible = !self.focus.cursor_blink.visible;
+        self.focus.cursor_blink.last_toggle = Instant::now();
+        cx.notify();
+    }
+
     // -- Cold-restart restore and window geometry persistence -----------------
 
     /// Run the restore machinery for one tick: adopt the window id, replay a
@@ -3975,7 +4032,13 @@ impl TerminalView {
     /// what the mouse path hit-tests against. `focused` is therefore the
     /// snapshot [`Self::sync_split_scroll`] already pinned, and every other
     /// pane paints its own untouched grid.
-    fn render_panes(&mut self, focused: Content, ime: ImePaint, cx: &App) -> Vec<gpui::AnyElement> {
+    fn render_panes(
+        &mut self,
+        focused: Content,
+        ime: ImePaint,
+        cursor: CursorPaint,
+        cx: &App,
+    ) -> Vec<gpui::AnyElement> {
         let viewport = self.pane_viewport();
         if viewport.width <= 0.0 || viewport.height <= 0.0 {
             return Vec::new();
@@ -4043,6 +4106,9 @@ impl TerminalView {
                 )
                 .with_highlights(highlights)
                 .with_selection(selection);
+                if placement.focused {
+                    element = element.with_cursor(cursor);
+                }
                 // Every pane showing a session gets its own scrollbar: each
                 // pane scrolls its own scrollback, so unlike the IME handler
                 // this is not a window-wide singleton.
@@ -5294,6 +5360,8 @@ impl TerminalView {
     /// debounce rather than eating the keystroke that follows a real refocus.
     fn on_activation(&mut self, window: &Window, cx: &mut Context<Self>) {
         let active = window.is_window_active();
+        self.focus.cursor_blink.set_window_active(active);
+        cx.notify();
         if let Ok(mut lifecycle) = self.shared.lifecycle.lock() {
             lifecycle.set_window_active(active);
         }
@@ -5793,6 +5861,7 @@ async fn drive_redraws(
                 view.expire_share_hint(view_cx);
                 view.poll_scrollbar_fades(view_cx);
                 view.tick_ai_animation(view_cx);
+                view.tick_cursor_blink(view_cx);
             });
             if idle.is_err() {
                 return;
@@ -5800,7 +5869,13 @@ async fn drive_redraws(
             continue;
         }
         rendered = current;
-        if view.update(app, |_, view_cx| view_cx.notify()).is_err() {
+        if view
+            .update(app, |view, view_cx| {
+                view.tick_cursor_blink(view_cx);
+                view_cx.notify();
+            })
+            .is_err()
+        {
             return;
         }
     }
@@ -5974,7 +6049,13 @@ impl TerminalView {
     /// without disturbing the display-only elements inside it.
     fn render_grid(&mut self, ime: ImePaint, cx: &mut Context<Self>) -> gpui::AnyElement {
         let focused = self.sync_split_scroll();
-        let panes = self.render_panes(focused, ime, cx);
+        let appearance = &self.config.config().config.appearance;
+        let cursor = CursorPaint {
+            visible: self.focus.cursor_blink.window_active
+                && (!appearance.cursor_blink || self.focus.cursor_blink.visible),
+            shape: appearance.cursor_shape,
+        };
+        let panes = self.render_panes(focused, ime, cursor, cx);
         let dividers = self.render_dividers(cx);
         div()
             .flex_1()
@@ -6196,6 +6277,9 @@ impl Render for TerminalView {
                 // uses that path: composed text arrives through the platform's
                 // own commit callback, which propagation does not gate.
                 ctx.stop_propagation();
+                if view.focus.cursor_blink.show_now() {
+                    ctx.notify();
+                }
                 // Tab enters the titlebar order rather than reaching the PTY.
                 if Self::focus_next_titlebar_control(event, win, ctx) {
                     return;
@@ -6613,6 +6697,8 @@ fn run_settings() {
     };
 
     application().run(move |cx: &mut App| {
+        // Sidebar icons use the same embedded glyph set as the terminal grid.
+        scribe_client::fonts::register_embedded_fonts(cx);
         let animations = load_config().map_or(true, |config| config.appearance.animations);
         AnimationSettings::resolve(animations).apply_to_app(cx);
         // The handle is only useful to a caller that can be asked twice; this

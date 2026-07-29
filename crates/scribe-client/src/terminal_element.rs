@@ -30,9 +30,9 @@ use scribe_client::{
     selection::SelectionSpan,
     split_scroll,
 };
-use scribe_common::config::AppearanceConfig;
+use scribe_common::config::{AppearanceConfig, CursorShape};
 
-use crate::terminal::{Cell, Content, CursorPlacement, Flags, ViewportPoint};
+use crate::terminal::{Cell, Content, CursorPlacement, Flags, ShellCursorShape, ViewportPoint};
 
 /// Smallest font size the grid will paint at, so a bad `appearance.font_size`
 /// edit (0, negative) can never collapse the grid to nothing.
@@ -264,6 +264,17 @@ pub struct ImePaint {
     pub preedit: Option<PreeditState>,
 }
 
+/// Window-level visibility and configured fallback shape for the focused
+/// pane's shell cursor.
+#[derive(Clone, Copy)]
+pub struct CursorPaint {
+    /// Blink/focus gate for this frame.
+    pub visible: bool,
+    /// User-configured shape used unless the terminal requested a beam or
+    /// underline with DECSCUSR.
+    pub shape: CursorShape,
+}
+
 /// Everything one pane's overlay scrollbar needs from the frame it is drawn in.
 ///
 /// The pane's pixel rect is deliberately absent: only the grid canvas knows it,
@@ -304,6 +315,8 @@ pub struct TerminalElement {
     /// pane composes, and registering two handlers would race for the platform
     /// slot.
     ime: Option<ImePaint>,
+    /// Shell-cursor state for this frame. `None` on every unfocused pane.
+    cursor: Option<CursorPaint>,
     /// Overlay-scrollbar inputs for this frame. `None` before a session is
     /// attached to the pane, which is the only case with no viewport to
     /// describe.
@@ -331,6 +344,7 @@ impl TerminalElement {
             highlight_colors,
             selection: Vec::new(),
             ime: None,
+            cursor: None,
             scrollbar: None,
             bounds_sink,
         }
@@ -355,6 +369,14 @@ impl TerminalElement {
     #[must_use]
     pub fn with_ime(mut self, ime: ImePaint) -> Self {
         self.ime = Some(ime);
+        self
+    }
+
+    /// Paint the focused pane's shell cursor with this frame's focus/blink
+    /// state.
+    #[must_use]
+    pub fn with_cursor(mut self, cursor: CursorPaint) -> Self {
+        self.cursor = Some(cursor);
         self
     }
 
@@ -416,6 +438,7 @@ impl TerminalElement {
         let variants = FontVariants::new(&self.font);
         let thickness = self.font.decoration_thickness();
         let mut resolved: Vec<ResolvedCell> = Vec::new();
+        let cursor = self.painted_cursor();
 
         for (row_index, row) in self.content.rows.iter().enumerate() {
             let top = bounds.top() + line_height * grid_f32(row_index);
@@ -435,6 +458,7 @@ impl TerminalElement {
             }));
             self.apply_selection(row_index, &mut resolved);
             self.apply_highlights(row_index, default_bg, &mut resolved);
+            apply_block_cursor(cursor, row_index, default_bg, &mut resolved);
 
             paint_cell_backgrounds(&resolved, geometry, window);
             paint_box_drawing(row, &resolved, geometry, window);
@@ -461,7 +485,9 @@ impl TerminalElement {
                     .cells
                     .resolve_color(vte::ansi::Color::Named(vte::ansi::NamedColor::Cursor)),
             )),
+            cursor: opaque_slot(linear_to_srgb_rgba(self.colors.cells.cursor_color())),
         };
+        paint_line_cursor(cursor, overlay, window);
         self.paint_vi_cursor(overlay, window);
         self.paint_split_scroll(overlay, window);
         // Last of the grid overlays: the scrollbar floats over the cells (it
@@ -659,6 +685,19 @@ impl TerminalElement {
         }
     }
 
+    /// Resolve the focused frame's blink/config state with the terminal's own
+    /// cursor visibility and DECSCUSR shape.
+    fn painted_cursor(&self) -> Option<PaintedCursor> {
+        let paint = self.cursor.filter(|cursor| cursor.visible)?;
+        let shell = self.content.shell_cursor?;
+        let shape = match shell.shape {
+            ShellCursorShape::Beam => CursorShape::Beam,
+            ShellCursorShape::Underline => CursorShape::Underline,
+            ShellCursorShape::Block => paint.shape,
+        };
+        Some(PaintedCursor { point: shell.point, shape })
+    }
+
     /// Recolour one cell covered by a find match.
     fn highlight_cell(&self, cell: &mut ResolvedCell, current: bool, window_bg: Rgba) {
         if current {
@@ -679,7 +718,7 @@ impl TerminalElement {
         let Some(cursor) = self.content.vi_cursor else {
             return;
         };
-        let OverlayGeometry { bounds, cell_width, line_height, accent } = overlay;
+        let OverlayGeometry { bounds, cell_width, line_height, accent, .. } = overlay;
         let left = bounds.left() + px(cell_width * grid_f32(cursor.col));
         let top = bounds.top() + line_height * grid_f32(cursor.row);
         if top >= bounds.bottom() {
@@ -707,7 +746,7 @@ impl TerminalElement {
         if self.content.pin_rows == 0 {
             return;
         }
-        let OverlayGeometry { bounds, cell_width, line_height, accent } = overlay;
+        let OverlayGeometry { bounds, cell_width, line_height, accent, .. } = overlay;
         let geometry = split_scroll::compute_geometry(
             content_rect(bounds, self.content.rows.len(), line_height),
             f32::from(line_height) * grid_f32(self.content.pin_rows),
@@ -738,6 +777,15 @@ struct OverlayGeometry {
     cell_width: f32,
     line_height: Pixels,
     accent: Rgba,
+    cursor: Rgba,
+}
+
+/// Cursor shape and viewport address after focus, blink, config, and terminal
+/// state have all been resolved.
+#[derive(Clone, Copy)]
+struct PaintedCursor {
+    point: ViewportPoint,
+    shape: CursorShape,
 }
 
 /// Line thickness for the vi-cursor box and the jump chip's chevron.
@@ -918,6 +966,53 @@ struct ResolvedCell {
     /// (possibly translucent) fill shows through instead of being painted over.
     bg: Option<Rgba>,
     flags: Flags,
+}
+
+/// Invert the block cursor's cell before backgrounds and text are painted, so
+/// its glyph stays visible instead of being covered by a late overlay quad.
+fn apply_block_cursor(
+    cursor: Option<PaintedCursor>,
+    row_index: usize,
+    default_bg: [f32; 4],
+    resolved: &mut [ResolvedCell],
+) {
+    let Some(cursor) =
+        cursor.filter(|cursor| cursor.shape == CursorShape::Block && cursor.point.row == row_index)
+    else {
+        return;
+    };
+    let Some(cell) = resolved.get_mut(cursor.point.col) else {
+        return;
+    };
+    let foreground = cell.fg;
+    cell.fg = cell.bg.unwrap_or_else(|| opaque_slot(default_bg));
+    cell.bg = Some(foreground);
+}
+
+/// Draw beam and underline cursors after the normal cell contents. A block is
+/// already folded into its cell by [`apply_block_cursor`].
+fn paint_line_cursor(cursor: Option<PaintedCursor>, overlay: OverlayGeometry, window: &mut Window) {
+    let Some(cursor) = cursor else {
+        return;
+    };
+    let left = overlay.bounds.left() + px(overlay.cell_width * grid_f32(cursor.point.col));
+    let top = overlay.bounds.top() + overlay.line_height * grid_f32(cursor.point.row);
+    if left >= overlay.bounds.right() || top >= overlay.bounds.bottom() {
+        return;
+    }
+    let cell_width = px(overlay.cell_width);
+    let bounds = match cursor.shape {
+        CursorShape::Block => return,
+        CursorShape::Beam => Bounds::new(
+            point(left, top),
+            size(px((overlay.cell_width / 8.0).max(2.0)), overlay.line_height),
+        ),
+        CursorShape::Underline => {
+            let height = px((f32::from(overlay.line_height) / 8.0).max(2.0));
+            Bounds::new(point(left, top + overlay.line_height - height), size(cell_width, height))
+        }
+    };
+    window.paint_quad(fill(bounds, overlay.cursor));
 }
 
 /// Geometry shared by every cell of one painted frame.

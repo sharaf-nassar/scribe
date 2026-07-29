@@ -210,6 +210,16 @@ Backgrounds come first so the overlay and the glyphs sit on top of them. Adjacen
 
 Box-drawing cells are then overlaid from  and replaced by a space in the shaped text, so the overlay is the only thing that draws them. The quads are rasterized in integer mask pixels and scaled onto the cell's exact fractional rect, which is what makes a stroke land precisely on the neighbouring cell's edge at any font size instead of leaving the rounding seam a whole-pixel mask would.
 
+### Shell Cursor
+
+The focused GPUI pane paints the terminal shell cursor immediately, then alternates it on a 530 ms cadence when `appearance.cursor_blink` is enabled.
+
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#viewport_shell_cursor]] projects the parser cursor into the immutable viewport snapshot. DECTCEM, vi mode, and ordinary scrollback suppress it; split-scroll keeps it on the pinned live tail.
+
+[[crates/scribe-client/src/terminal_element.rs#TerminalElement#painted_cursor]] combines that snapshot with window focus, blink phase, and `appearance.cursor_shape`. DECSCUSR beam and underline requests win over the configured fallback; only the focused pane receives cursor paint.
+
+[[crates/scribe-client/src/main.rs#TerminalView#tick_cursor_blink]] invalidates the view at each blink edge. Focus gain, keyboard activity, and config reload restart a visible phase, while an unfocused window paints no shell cursor and schedules no blink transitions.
+
 ### Glyph Runs
 
 A whole row is shaped as one `shape_line` call with a `TextRun` per style change, and `force_width` set to the cell advance.
