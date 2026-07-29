@@ -189,6 +189,12 @@ On GTK/X11, saved settings geometry is restored only when it intersects a curren
 
 The GPUI rebuild reproduces the deleted `scribe-settings` webview app as a window in the client process, opened from a running terminal window or from `scribe-client --settings`.
 
+### Accessibility semantics
+
+[[crates/scribe-client/src/settings/window.rs#SettingsWindow]] gives settings navigation, controls, values, and feedback stable AccessKit roles and IDs.
+
+The sidebar is a selected tab list, toggles and steppers report state/value, and one status node announces preflight and trust outcomes without stale duplicates.
+
 The config-write and singleton logic stay 1:1 with the old app; only the HTML/CSS/JS surface is replaced with GPUI elements.
 
 The webview delivery is gone; its feature set lives in . The config-apply path is ported verbatim as  (routing every `{key, value}` edit through ), so the  semantics — clamps, enum parsing, keybinding routing, theme seeding — are unchanged. The one-shot server-action client is ported as  and its release/env/remote siblings.
