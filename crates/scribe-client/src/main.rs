@@ -1251,6 +1251,7 @@ impl TerminalView {
             TitlebarEvent::WorkspaceNotesHover(hovered) => {
                 this.set_workspace_notes_preview(*hovered, ctx);
             }
+            TitlebarEvent::OpenWorkspaceNotes => this.open_workspace_notes_modal(ctx),
             // The tab-strip and window-control events come from the same view
             // but are their own reachability rows, outside this entry point.
             // They are named rather than folded into a `_` arm so a new
@@ -6082,9 +6083,27 @@ impl TerminalView {
 
     /// Restore focus when another surface left the terminal window unfocused.
     fn ensure_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.focus_handle.is_focused(window) {
+        if !self.focus_handle.is_focused(window)
+            && !self.titlebar.read(cx).has_keyboard_focus(window)
+        {
             window.focus(&self.focus_handle, cx);
         }
+    }
+
+    fn focus_next_titlebar_control(
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if event.keystroke.key != "tab" {
+            return false;
+        }
+        if event.keystroke.modifiers.shift {
+            window.focus_prev(cx);
+        } else {
+            window.focus_next(cx);
+        }
+        true
     }
 }
 
@@ -6119,7 +6138,6 @@ impl Render for TerminalView {
         let remote_picker = self.build_remote_picker_overlay();
         let displaced = self.build_lost_control_overlay(cx);
         let notes_preview = self.build_workspace_notes_preview_overlay();
-        let opacity = self.opacity;
         // The root itself paints nothing. Every band below fills the window
         // edge to edge, so leaving the root unfilled guarantees each pixel
         // carries the opacity alpha exactly once instead of compositing a
@@ -6127,7 +6145,7 @@ impl Render for TerminalView {
         // than the configured value.
         div()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, ctx| {
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, win, ctx| {
                 // Claim every key the window sees, at every level below.
                 //
                 // Once an input handler is registered — which the IME wiring
@@ -6142,6 +6160,10 @@ impl Render for TerminalView {
                 // uses that path: composed text arrives through the platform's
                 // own commit callback, which propagation does not gate.
                 ctx.stop_propagation();
+                // Tab enters the titlebar order rather than reaching the PTY.
+                if Self::focus_next_titlebar_control(event, win, ctx) {
+                    return;
+                }
                 // The X11 active-window guard gates everything: while a
                 // compositor overlay owns the screen the keystroke was never
                 // meant for this window, so it reaches no consumer at all.
@@ -6183,7 +6205,7 @@ impl Render for TerminalView {
                     .px_2()
                     .flex()
                     .items_center()
-                    .bg(surface(self.chrome.status_bar_bg, opacity))
+                    .bg(surface(self.chrome.status_bar_bg, self.opacity))
                     .text_color(opaque_slot(self.chrome.status_bar_text))
                     .text_xs()
                     .child(status),
