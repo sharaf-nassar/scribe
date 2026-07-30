@@ -31,7 +31,7 @@ use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
 
 use crate::handoff::HandoffState;
 use crate::pty_guard::PtyGuard;
-use crate::shell_integration;
+use crate::shell_integration::{self, ShellKind};
 
 /// Maximum number of active PTY sessions across all clients.
 const MAX_SESSIONS: usize = 256;
@@ -358,6 +358,8 @@ impl SessionManager {
         let session_id = SessionId::new();
         self.reserve_session_slot().await?;
 
+        let shell = ResolvedShell::for_request(request.command.as_deref());
+
         // Cold-restart restore-apply (FR-005 / FR-008): if the launch names
         // an env envelope, decrypt it now and stage a per-spawn temp file
         // for the shell integration script to source. Fail-safe per FR-016:
@@ -365,12 +367,14 @@ impl SessionManager {
         // defaults instead of being blocked by the keystore.
         let restore_env_file = match request.env_envelope_id.as_deref() {
             Some(envelope_id) => {
-                prepare_restore_env_file(request.window_id, session_id, envelope_id).await
+                prepare_restore_env_file(request.window_id, session_id, envelope_id, shell.kind)
+                    .await
             }
             None => None,
         };
 
-        let launch = self.prepare_session_launch(session_id, request, restore_env_file.as_deref());
+        let launch =
+            self.prepare_session_launch(session_id, request, &shell, restore_env_file.as_deref());
         let pty = launch.spawn_pty()?;
         let managed = launch.into_managed_session(pty)?;
         self.sessions.write().await.insert(session_id, managed);
@@ -391,8 +395,10 @@ impl SessionManager {
         &self,
         session_id: SessionId,
         request: SessionLaunchRequest,
+        shell: &ResolvedShell,
         restore_env_file: Option<&std::path::Path>,
     ) -> PreparedSessionLaunch {
+        let shell_binary = shell.binary.as_str();
         let scrollback_lines = self.scrollback_lines.load(Ordering::Relaxed);
         let ai_provider_hint = command_ai_provider_hint(request.command.as_deref());
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -400,22 +406,20 @@ impl SessionManager {
         let term_config = build_term_config(scrollback_lines);
         let geometry = session_geometry(request.size);
         let term = Term::new(term_config, &geometry.dimensions, event_listener);
-        let shell_binary = shell_binary_str(request.command.as_deref());
-        let shell_name = Path::new(&shell_binary)
+        let shell_name = Path::new(shell_binary)
             .file_stem()
             .and_then(|name| name.to_str())
             .unwrap_or("shell")
             .to_owned();
-        let kind = shell_integration::detect_shell(&shell_binary);
         let integration_enabled = self.shell_integration_enabled.load(Ordering::Relaxed);
-        let integration_script = session_integration_script(&shell_binary, integration_enabled);
-        let shell =
-            build_shell(&shell_binary, request.command, kind, integration_script.as_deref());
+        let integration_script = session_integration_script(shell_binary, integration_enabled);
+        let pty_shell =
+            build_shell(shell_binary, request.command, shell.kind, integration_script.as_deref());
         let pty_options = build_pty_options(PtyOptionsBuild {
             session_id,
-            shell,
+            shell: pty_shell,
             cwd: request.cwd,
-            shell_binary: &shell_binary,
+            shell_binary,
             integration_enabled,
             restore_env_file,
         });
@@ -692,6 +696,24 @@ fn session_integration_script(shell_binary: &str, integration_enabled: bool) -> 
     shell_integration::find_scripts_dir()
         .and_then(|dir| shell_integration::integration_script_path(shell_binary, &dir))
         .and_then(|path| path.to_str().map(String::from))
+}
+
+/// The shell a launch will spawn, resolved once up front.
+///
+/// `create_session` needs the kind before it renders the cold-restart
+/// restore file — that file's syntax and extension are shell-specific —
+/// so detection cannot stay inside `prepare_session_launch`.
+struct ResolvedShell {
+    binary: String,
+    kind: ShellKind,
+}
+
+impl ResolvedShell {
+    fn for_request(command: Option<&[String]>) -> Self {
+        let binary = shell_binary_str(command);
+        let kind = shell_integration::detect_shell(&binary);
+        Self { binary, kind }
+    }
 }
 
 /// Extract the shell binary string from an optional command slice, falling
@@ -1106,6 +1128,7 @@ async fn prepare_restore_env_file(
     window_id: WindowId,
     session_id: SessionId,
     env_envelope_id: &str,
+    kind: ShellKind,
 ) -> Option<std::path::PathBuf> {
     // Feature-flag gate. Loading config off the hot path is fine here: this
     // helper only runs when the launch names an envelope (the cold-restart
@@ -1158,9 +1181,10 @@ async fn prepare_restore_env_file(
     }
 
     let pid = std::process::id();
-    let file_name = format!("{session_id}-{pid}.sh");
+    let extension = restore_env_file_extension(kind);
+    let file_name = format!("{session_id}-{pid}.{extension}");
     let path = runtime_dir.join(file_name);
-    let body = render_shell_source(&delta);
+    let body = render_restore_env_source(kind, &delta);
 
     if let Err(e) = write_private_owner_only(&path, &body).await {
         tracing::warn!(
@@ -1238,27 +1262,134 @@ async fn write_private_owner_only(path: &std::path::Path, content: &str) -> std:
     .map_err(|e| std::io::Error::other(format!("blocking panic: {e}")))?
 }
 
-/// Render a `TerminalEnvDelta` as a shell-source-compatible script.
+const RESTORE_HEADER: &str =
+    "# Scribe env restore — sourced by shell integration after rc, then unlinked.\n";
+
+/// File-name extension for the staged restore file.
 ///
-/// Uses POSIX single-quote escaping so the output is safe across bash, zsh,
-/// fish, nu, and pwsh — see `specs/006-persist-terminal-env/contracts/
-/// hook-event-additions.md`. Inside a single-quoted string, single quotes
-/// are escaped by closing the quote, inserting a backslash-quoted single
-/// quote, and reopening — the canonical bash idiom `'\''`. Newlines, tabs,
-/// spaces, slashes, and `$` are all literal inside single quotes and need
-/// no further escaping.
-fn render_shell_source(delta: &crate::env_store::delta::TerminalEnvDelta) -> String {
+/// PowerShell is the reason this varies at all: `.` on a path whose
+/// extension is not `.ps1` is resolved as a native command instead of a
+/// script, which for a non-executable POSIX file is a silent no-op rather
+/// than an error. Fish and Nushell are given honest extensions for the
+/// same reason a `.sh` would be misleading — the bodies are not POSIX.
+fn restore_env_file_extension(kind: ShellKind) -> &'static str {
+    match kind {
+        ShellKind::Fish => "fish",
+        ShellKind::Nushell => "json",
+        ShellKind::PowerShell => "ps1",
+        ShellKind::Bash | ShellKind::Zsh | ShellKind::Unknown => "sh",
+    }
+}
+
+/// Render a `TerminalEnvDelta` in the syntax the target shell actually
+/// speaks — see `specs/006-persist-terminal-env/contracts/
+/// hook-event-additions.md`.
+///
+/// Fish has no `export`/`unset`, PowerShell has neither plus a different
+/// quoting rule, and Nushell cannot `source` a runtime-computed path at
+/// all, so it gets JSON that its integration script parses and feeds to
+/// `load-env`/`hide-env`.
+fn render_restore_env_source(
+    kind: ShellKind,
+    delta: &crate::env_store::delta::TerminalEnvDelta,
+) -> String {
+    match kind {
+        ShellKind::Fish => render_fish_restore(delta),
+        ShellKind::Nushell => render_nushell_restore(delta),
+        ShellKind::PowerShell => render_powershell_restore(delta),
+        ShellKind::Bash | ShellKind::Zsh | ShellKind::Unknown => render_posix_restore(delta),
+    }
+}
+
+/// Reject names that are not `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// The delta is built from whatever the shell reported as exported, which
+/// on bash includes exported-function entries such as `BASH_FUNC_foo%%`.
+/// No shell can assign those by name, and interpolating them into a file
+/// the shell then sources would turn a variable name into executable
+/// syntax, so they are dropped instead of rendered.
+fn is_assignable_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// POSIX `export`/`unset` for bash and zsh. Inside a single-quoted string
+/// single quotes are escaped by closing the quote, inserting a
+/// backslash-quoted single quote, and reopening — the canonical `'\''`
+/// idiom. Newlines, tabs, spaces, slashes, and `$` are literal there.
+fn render_posix_restore(delta: &crate::env_store::delta::TerminalEnvDelta) -> String {
     use std::fmt::Write as _;
-    let mut out = String::new();
-    out.push_str("# Scribe env restore — sourced by shell integration after rc, then unlinked.\n");
-    for (name, value) in &delta.added {
+    let mut out = String::from(RESTORE_HEADER);
+    for (name, value) in delta.added.iter().filter(|(name, _)| is_assignable_env_name(name)) {
         let escaped = value.replace('\'', "'\\''");
         _ = writeln!(out, "export {name}='{escaped}'");
     }
-    for name in &delta.removed {
+    for name in delta.removed.iter().filter(|name| is_assignable_env_name(name)) {
         _ = writeln!(out, "unset {name}");
     }
     out
+}
+
+/// Fish `set -gx` / `set -e`. Fish single quotes recognise exactly two
+/// escapes, `\\` and `\'`; everything else — newlines included — is
+/// literal, so backslash must be doubled before quotes are escaped.
+fn render_fish_restore(delta: &crate::env_store::delta::TerminalEnvDelta) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from(RESTORE_HEADER);
+    for (name, value) in delta.added.iter().filter(|(name, _)| is_assignable_env_name(name)) {
+        let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+        _ = writeln!(out, "set -gx {name} '{escaped}'");
+    }
+    for name in delta.removed.iter().filter(|name| is_assignable_env_name(name)) {
+        _ = writeln!(out, "set -e {name}");
+    }
+    out
+}
+
+/// PowerShell env-drive assignment. A single-quoted PowerShell string is
+/// verbatim apart from `'`, which doubles; the `${env:NAME}` form is used
+/// over `$env:NAME` so a name is never re-parsed as an expression.
+fn render_powershell_restore(delta: &crate::env_store::delta::TerminalEnvDelta) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from(RESTORE_HEADER);
+    for (name, value) in delta.added.iter().filter(|(name, _)| is_assignable_env_name(name)) {
+        let escaped = value.replace('\'', "''");
+        _ = writeln!(out, "${{env:{name}}} = '{escaped}'");
+    }
+    for name in delta.removed.iter().filter(|name| is_assignable_env_name(name)) {
+        _ = writeln!(out, "Remove-Item -LiteralPath 'env:{name}' -ErrorAction SilentlyContinue");
+    }
+    out
+}
+
+/// Nushell reads the delta as JSON rather than as script.
+///
+/// `source` in nushell resolves at parse time and refuses a runtime path,
+/// so the integration script cannot dot-source anything; it used to
+/// hand-parse the POSIX file instead, which lost `'\''` sequences and any
+/// value spanning more than one line. JSON removes the parser entirely.
+fn render_nushell_restore(delta: &crate::env_store::delta::TerminalEnvDelta) -> String {
+    let filtered = crate::env_store::delta::TerminalEnvDelta {
+        added: delta
+            .added
+            .iter()
+            .filter(|(name, _)| is_assignable_env_name(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        removed: delta
+            .removed
+            .iter()
+            .filter(|name| is_assignable_env_name(name))
+            .cloned()
+            .collect(),
+    };
+    // Serializing a `BTreeMap<String, String>` + `BTreeSet<String>` cannot
+    // fail; an empty object still parses to an empty delta on the nu side.
+    serde_json::to_string(&filtered).unwrap_or_else(|_| "{}".to_owned())
 }
 
 #[cfg(test)]
@@ -1266,24 +1397,316 @@ mod tests_apply {
     use std::collections::{BTreeMap, BTreeSet};
 
     use crate::env_store::delta::TerminalEnvDelta;
+    use crate::shell_integration::ShellKind;
 
-    use super::render_shell_source;
+    use super::{render_restore_env_source, restore_env_file_extension};
 
-    #[test]
-    fn render_shell_source_quotes_values_correctly() {
+    fn sample_delta() -> TerminalEnvDelta {
         let mut added = BTreeMap::new();
         added.insert("FOO".to_owned(), "bar".to_owned());
         added.insert("PATH".to_owned(), "/a:/b".to_owned());
+        added.insert("WITH_BACKSLASH".to_owned(), r"C:\tmp\x".to_owned());
+        added.insert("WITH_MULTILINE".to_owned(), "one\ntwo".to_owned());
         added.insert("WITH_QUOTE".to_owned(), "it's value".to_owned());
         added.insert("WITH_SPACES".to_owned(), "hello world".to_owned());
         let mut removed = BTreeSet::new();
         removed.insert("STALE".to_owned());
-        let delta = TerminalEnvDelta { added, removed };
-        let s = render_shell_source(&delta);
+        TerminalEnvDelta { added, removed }
+    }
+
+    #[test]
+    fn posix_restore_quotes_values_correctly() {
+        let s = render_restore_env_source(ShellKind::Bash, &sample_delta());
         assert!(s.contains("export FOO='bar'"), "{s}");
         assert!(s.contains("export PATH='/a:/b'"), "{s}");
         assert!(s.contains("export WITH_QUOTE='it'\\''s value'"), "{s}");
         assert!(s.contains("export WITH_SPACES='hello world'"), "{s}");
+        assert!(s.contains("export WITH_MULTILINE='one\ntwo'"), "{s}");
+        assert!(s.contains(r"export WITH_BACKSLASH='C:\tmp\x'"), "{s}");
         assert!(s.contains("unset STALE"), "{s}");
+        assert_eq!(restore_env_file_extension(ShellKind::Zsh), "sh");
+    }
+
+    #[test]
+    fn fish_restore_uses_set_and_escapes_backslashes() {
+        let s = render_restore_env_source(ShellKind::Fish, &sample_delta());
+        assert!(s.contains("set -gx FOO 'bar'"), "{s}");
+        assert!(s.contains("set -gx WITH_QUOTE 'it\\'s value'"), "{s}");
+        assert!(s.contains("set -gx WITH_MULTILINE 'one\ntwo'"), "{s}");
+        assert!(s.contains(r"set -gx WITH_BACKSLASH 'C:\\tmp\\x'"), "{s}");
+        assert!(s.contains("set -e STALE"), "{s}");
+        assert!(!s.contains("export "), "fish has no export builtin: {s}");
+        assert_eq!(restore_env_file_extension(ShellKind::Fish), "fish");
+    }
+
+    #[test]
+    fn powershell_restore_uses_env_drive_and_doubles_quotes() {
+        let s = render_restore_env_source(ShellKind::PowerShell, &sample_delta());
+        assert!(s.contains("${env:FOO} = 'bar'"), "{s}");
+        assert!(s.contains("${env:WITH_QUOTE} = 'it''s value'"), "{s}");
+        assert!(s.contains("${env:WITH_MULTILINE} = 'one\ntwo'"), "{s}");
+        assert!(s.contains(r"${env:WITH_BACKSLASH} = 'C:\tmp\x'"), "{s}");
+        assert!(
+            s.contains("Remove-Item -LiteralPath 'env:STALE' -ErrorAction SilentlyContinue"),
+            "{s}"
+        );
+        assert_eq!(restore_env_file_extension(ShellKind::PowerShell), "ps1");
+    }
+
+    #[test]
+    fn nushell_restore_is_json() {
+        let s = render_restore_env_source(ShellKind::Nushell, &sample_delta());
+        let parsed: TerminalEnvDelta = serde_json::from_str(&s).expect("nu payload is JSON");
+        assert_eq!(parsed, sample_delta());
+        assert_eq!(restore_env_file_extension(ShellKind::Nushell), "json");
+    }
+
+    /// `compgen -e` reports bash's exported functions as `BASH_FUNC_x%%`,
+    /// whose value is a function body. Rendering that as an assignment
+    /// would splice shell syntax into a file the shell then sources.
+    #[test]
+    fn unassignable_names_are_dropped_from_every_dialect() {
+        let mut added = BTreeMap::new();
+        added.insert("BASH_FUNC_evil%%".to_owned(), "() { :; }".to_owned());
+        added.insert("KEEP".to_owned(), "ok".to_owned());
+        let mut removed = BTreeSet::new();
+        removed.insert("BASH_FUNC_gone%%".to_owned());
+        let delta = TerminalEnvDelta { added, removed };
+        for kind in [ShellKind::Bash, ShellKind::Fish, ShellKind::PowerShell, ShellKind::Nushell] {
+            let s = render_restore_env_source(kind, &delta);
+            assert!(!s.contains("BASH_FUNC"), "{kind:?} rendered a function export: {s}");
+            assert!(s.contains("KEEP"), "{kind:?} dropped a legitimate name: {s}");
+        }
+    }
+}
+
+/// Round-trips a rendered restore file through the real interpreter of
+/// every supported shell. String assertions alone cannot catch this
+/// finding class: pwsh dot-sourcing a POSIX `.sh` file raised no error
+/// and applied nothing, and fish silently ignored `export`.
+#[cfg(test)]
+mod tests_apply_shells {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::env_store::delta::TerminalEnvDelta;
+    use crate::shell_integration::ShellKind;
+
+    use super::{render_restore_env_source, restore_env_file_extension};
+
+    const QUOTE_VALUE: &str = "it's \"value\"";
+    const MULTI_VALUE: &str = "one\ntwo";
+    const BACKSLASH_VALUE: &str = r"C:\tmp\x";
+    const UNSET_MARKER: &str = "!unset";
+
+    fn probe_delta() -> TerminalEnvDelta {
+        let mut added = BTreeMap::new();
+        added.insert("SCRIBE_PROBE_QUOTE".to_owned(), QUOTE_VALUE.to_owned());
+        added.insert("SCRIBE_PROBE_MULTI".to_owned(), MULTI_VALUE.to_owned());
+        added.insert("SCRIBE_PROBE_BS".to_owned(), BACKSLASH_VALUE.to_owned());
+        let mut removed = BTreeSet::new();
+        removed.insert("SCRIBE_PROBE_STALE".to_owned());
+        TerminalEnvDelta { added, removed }
+    }
+
+    fn interpreter_available(binary: &str) -> bool {
+        Command::new(binary)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("scribe-restore-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// A child process inherits exported variables only, so reading the
+    /// probes back out of one proves the restore file exported rather
+    /// than merely assigned them.
+    fn write_recorder(dir: &Path) -> PathBuf {
+        let recorder = dir.join("recorder.sh");
+        std::fs::write(
+            &recorder,
+            "#!/bin/sh\nprintf '%s\\0%s\\0%s\\0%s\\0' \
+             \"${SCRIBE_PROBE_QUOTE-!unset}\" \"${SCRIBE_PROBE_MULTI-!unset}\" \
+             \"${SCRIBE_PROBE_BS-!unset}\" \"${SCRIBE_PROBE_STALE-!unset}\" > \"$1\"\n",
+        )
+        .expect("write recorder");
+        std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod recorder");
+        recorder
+    }
+
+    fn stage_restore_file(dir: &Path, kind: ShellKind, extension: &str) -> PathBuf {
+        let path = dir.join(format!("restore.{extension}"));
+        std::fs::write(&path, render_restore_env_source(kind, &probe_delta()))
+            .expect("write restore file");
+        path
+    }
+
+    /// Runs `driver` under `binary` and returns the four probe values the
+    /// recorder observed, in `[quote, multi, backslash, stale]` order.
+    /// The driver keeps a shell-appropriate extension because `pwsh -File`
+    /// refuses anything but `.ps1`.
+    fn run_driver(
+        binary: &str,
+        args: &[&str],
+        dir: &Path,
+        driver_name: &str,
+        driver: &str,
+    ) -> [String; 4] {
+        let driver_path = dir.join(driver_name);
+        std::fs::write(&driver_path, driver).expect("write driver");
+        let out = dir.join("record.bin");
+        _ = std::fs::remove_file(&out);
+
+        let result = Command::new(binary)
+            .args(args)
+            .arg(&driver_path)
+            .env_remove("SCRIBE_PROBE_QUOTE")
+            .env_remove("SCRIBE_PROBE_MULTI")
+            .env_remove("SCRIBE_PROBE_BS")
+            .env_remove("SCRIBE_PROBE_STALE")
+            .env("SCRIBE_RECORD_PATH", &out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run driver");
+        assert!(
+            result.status.success(),
+            "{binary} driver exited with {}: {}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        let raw = std::fs::read(&out).unwrap_or_default();
+        let fields: Vec<String> = raw
+            .split(|byte| *byte == 0)
+            .map(|field| String::from_utf8_lossy(field).into_owned())
+            .collect();
+        let at = |i: usize| fields.get(i).cloned().unwrap_or_default();
+        [at(0), at(1), at(2), at(3)]
+    }
+
+    fn assert_probes_restored(shell: &str, probes: &[String; 4]) {
+        assert_eq!(probes[0], QUOTE_VALUE, "{shell} lost the quote-bearing value");
+        assert_eq!(probes[1], MULTI_VALUE, "{shell} lost the multi-line value");
+        assert_eq!(probes[2], BACKSLASH_VALUE, "{shell} lost the backslash value");
+        assert_eq!(probes[3], UNSET_MARKER, "{shell} failed to erase the removed variable");
+    }
+
+    fn run_posix_case(shell: &str, kind: ShellKind, args: &[&str]) {
+        if !interpreter_available(shell) {
+            return;
+        }
+        let dir = scratch_dir(shell);
+        let recorder = write_recorder(&dir);
+        let restore = stage_restore_file(&dir, kind, restore_env_file_extension(kind));
+        let driver = format!(
+            "export SCRIBE_PROBE_STALE=preexisting\n. '{}'\n'{}' \"$SCRIBE_RECORD_PATH\"\n",
+            restore.display(),
+            recorder.display(),
+        );
+        let probes = run_driver(shell, args, &dir, "driver.sh", &driver);
+        std::fs::remove_dir_all(&dir).expect("clean scratch dir");
+        assert_probes_restored(shell, &probes);
+    }
+
+    #[test]
+    fn bash_applies_rendered_restore_file() {
+        run_posix_case("bash", ShellKind::Bash, &["--norc", "--noprofile"]);
+    }
+
+    #[test]
+    fn zsh_applies_rendered_restore_file() {
+        run_posix_case("zsh", ShellKind::Zsh, &["--no-rcs"]);
+    }
+
+    #[test]
+    fn fish_applies_rendered_restore_file() {
+        if !interpreter_available("fish") {
+            return;
+        }
+        let dir = scratch_dir("fish");
+        let recorder = write_recorder(&dir);
+        let restore = stage_restore_file(&dir, ShellKind::Fish, "fish");
+        let driver = format!(
+            "set -gx SCRIBE_PROBE_STALE preexisting\nbuiltin source '{}'\n'{}' \
+             \"$SCRIBE_RECORD_PATH\"\n",
+            restore.display(),
+            recorder.display(),
+        );
+        let probes = run_driver("fish", &["--no-config"], &dir, "driver.fish", &driver);
+        std::fs::remove_dir_all(&dir).expect("clean scratch dir");
+        assert_probes_restored("fish", &probes);
+    }
+
+    #[test]
+    fn powershell_applies_rendered_restore_file_only_with_a_ps1_extension() {
+        if !interpreter_available("pwsh") {
+            return;
+        }
+        let dir = scratch_dir("pwsh");
+        let recorder = write_recorder(&dir);
+        let restore = stage_restore_file(&dir, ShellKind::PowerShell, "ps1");
+        let driver = format!(
+            "$env:SCRIBE_PROBE_STALE = 'preexisting'\n. '{}'\n& '{}' $env:SCRIBE_RECORD_PATH\n",
+            restore.display(),
+            recorder.display(),
+        );
+        let probes = run_driver("pwsh", &["-NoProfile", "-File"], &dir, "driver.ps1", &driver);
+        assert_probes_restored("pwsh", &probes);
+
+        // Same body, wrong extension: pwsh resolves the dot-source target
+        // as a native command instead of a script and applies nothing,
+        // without raising so much as a warning.
+        let misnamed = stage_restore_file(&dir, ShellKind::PowerShell, "sh");
+        let misnamed_driver = format!(
+            "$env:SCRIBE_PROBE_STALE = 'preexisting'\ntry {{ . '{}' }} catch {{ }}\n& '{}' \
+             $env:SCRIBE_RECORD_PATH\n",
+            misnamed.display(),
+            recorder.display(),
+        );
+        let misnamed_probes =
+            run_driver("pwsh", &["-NoProfile", "-File"], &dir, "driver.ps1", &misnamed_driver);
+        std::fs::remove_dir_all(&dir).expect("clean scratch dir");
+        assert_eq!(
+            misnamed_probes[0], UNSET_MARKER,
+            "pwsh unexpectedly dot-sourced a non-.ps1 file; the per-shell extension is moot"
+        );
+    }
+
+    /// Drives the shipped `scribe.nu` applier, not a reimplementation of
+    /// it: nushell cannot `source` a runtime path, so the JSON payload
+    /// and its parser are a matched pair that has to be tested together.
+    #[test]
+    fn nushell_applies_rendered_restore_file() {
+        if !interpreter_available("nu") {
+            return;
+        }
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../dist/shell-integration/nushell/vendor/autoload/scribe.nu");
+        let dir = scratch_dir("nu");
+        let recorder = write_recorder(&dir);
+        let restore = stage_restore_file(&dir, ShellKind::Nushell, "json");
+        let driver = format!(
+            "source '{}'\n$env.SCRIBE_PROBE_STALE = 'preexisting'\n__scribe-apply-restore '{}'\n\
+             run-external '{}' $env.SCRIBE_RECORD_PATH\n",
+            script.display(),
+            restore.display(),
+            recorder.display(),
+        );
+        let probes = run_driver("nu", &["--no-config-file"], &dir, "driver.nu", &driver);
+        std::fs::remove_dir_all(&dir).expect("clean scratch dir");
+        assert_probes_restored("nu", &probes);
     }
 }
