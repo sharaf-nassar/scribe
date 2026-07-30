@@ -99,6 +99,28 @@ def atomic_write_text(path, text):
         pass
     finally:
         os.close(dir_fd)
+
+
+def read_text(path):
+    """Return the file's contents, or None when it does not exist."""
+    path = os.fspath(path)
+    if not os.path.isfile(path):
+        return None
+    with open(path) as handle:
+        return handle.read()
+
+
+def write_text_if_changed(path, text, current):
+    """Write text atomically unless it already matches `current`.
+
+    Callers pass the contents they read once at the start of the run, so
+    an install that changes nothing skips the write entirely and leaves
+    the file's mtime and inode alone.
+    """
+    if current == text:
+        return False
+    atomic_write_text(path, text)
+    return True
 PRELUDE_EOF
 )
 
@@ -107,35 +129,47 @@ scribe_python() {
     { printf '%s\n' "$PYTHON_PRELUDE"; cat; } | python3
 }
 
-# ── Step 2: Enable Codex hooks in config.toml ────────────────────────────
+# ── Step 2: Enable Codex hooks and merge Scribe hook entries ─────────────
+# config.toml and hooks.json are each read once here, transformed in
+# memory, and written at most once at the end of the run, so an install
+# that changes nothing leaves both files (mtime and inode included) alone.
 scribe_python << 'PYEOF'
+import hashlib
+import json
 import os
-from pathlib import Path
+import re
 
-config_path = Path(os.path.expanduser("~/.codex/config.toml"))
-text = config_path.read_text() if config_path.exists() else ""
+hooks_path = os.path.expanduser("~/.codex/hooks.json")
+config_path = os.path.expanduser("~/.codex/config.toml")
 
-lines = text.splitlines()
+original_config_text = read_text(config_path)
+original_hooks_text = read_text(hooks_path)
 
-features_start = None
-features_end = len(lines)
-for idx, line in enumerate(lines):
-    if line.strip() == "[features]":
-        features_start = idx
-        for next_idx in range(idx + 1, len(lines)):
-            if lines[next_idx].startswith("[") and lines[next_idx].endswith("]"):
-                features_end = next_idx
-                break
-        break
 
-if features_start is None:
-    if text and not text.endswith("\n"):
-        text += "\n"
-    if text:
-        text += "\n"
-    text += "[features]\n"
-    text += "hooks = true\n"
-else:
+def enable_hooks_feature(text):
+    """Return (text, dropped_alias) with [features].hooks = true applied."""
+    lines = text.splitlines()
+
+    features_start = None
+    features_end = len(lines)
+    for idx, line in enumerate(lines):
+        if line.strip() == "[features]":
+            features_start = idx
+            for next_idx in range(idx + 1, len(lines)):
+                if lines[next_idx].startswith("[") and lines[next_idx].endswith("]"):
+                    features_end = next_idx
+                    break
+            break
+
+    if features_start is None:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        if text:
+            text += "\n"
+        text += "[features]\n"
+        text += "hooks = true\n"
+        return text, False
+
     hooks_replaced = False
     removed_codex_hooks = False
     next_lines = lines[:features_start + 1]
@@ -154,23 +188,14 @@ else:
     text = "\n".join(lines)
     if lines:
         text += "\n"
+    return text, removed_codex_hooks
 
-atomic_write_text(config_path, text)
-print(f"  Updated {config_path}")
-print("  Enabled [features].hooks = true")
-if features_start is not None and removed_codex_hooks:
-    print("  Removed deprecated Codex hook feature alias")
-PYEOF
 
-# ── Step 3: Merge Scribe hooks into hooks.json or inline TOML ────────────
-scribe_python << 'PYEOF'
-import hashlib
-import json
-import os
-import re
-
-hooks_path = os.path.expanduser("~/.codex/hooks.json")
-config_path = os.path.expanduser("~/.codex/config.toml")
+def report(path, written):
+    if written:
+        print(f"  Updated {path}")
+    else:
+        print(f"  {path} already up to date")
 
 
 def find_scribe_install_prefix():
@@ -289,15 +314,10 @@ for event, matcher, hook_cmds in SCRIBE_HOOKS:
     scribe_by_event.setdefault(event, []).append(entry)
 
 
-def read_hooks_json():
-    if not os.path.isfile(hooks_path):
+def parse_hooks_json(text):
+    if text is None:
         return {}
-    with open(hooks_path) as f:
-        return json.load(f)
-
-
-def write_hooks_json(config):
-    atomic_write_text(hooks_path, json.dumps(config, indent=2) + "\n")
+    return json.loads(text)
 
 
 def inline_hooks_present(text):
@@ -707,9 +727,10 @@ def update_hook_trust_state(text, trust_entries):
     return append_hook_state_entries(text, trust_entries, existing_state)
 
 
-config_text = open(config_path).read() if os.path.isfile(config_path) else ""
+config_text, removed_codex_hooks = enable_hooks_feature(original_config_text or "")
+
 if inline_hooks_present(config_text):
-    hooks_json_config = read_hooks_json()
+    hooks_json_config = parse_hooks_json(original_hooks_text)
     migrated_by_event = {}
     for event, entries in hooks_json_config.get("hooks", {}).items():
         for entry in entries if isinstance(entries, list) else []:
@@ -732,15 +753,21 @@ if inline_hooks_present(config_text):
     trust_entries.extend(prior_trust_entries_for(config_path, migrated_by_event, existing_state, migrated_base_indices))
     trust_entries.extend(scribe_trust_entries_for(config_path, scribe_by_event, scribe_base_indices))
     config_text = update_hook_trust_state(config_text, trust_entries)
-    atomic_write_text(config_path, config_text)
+    config_written = write_text_if_changed(config_path, config_text, original_config_text)
 
-    if os.path.exists(hooks_path):
+    removed_hooks_json = original_hooks_text is not None
+    if removed_hooks_json:
         os.remove(hooks_path)
+
+    print("  Enabled [features].hooks = true")
+    if removed_codex_hooks:
+        print("  Removed deprecated Codex hook feature alias")
+    if removed_hooks_json:
         print(f"  Removed {hooks_path} after migrating hooks into config.toml")
-    print(f"  Updated {config_path}")
+    report(config_path, config_written)
     print("  Scribe Codex hooks routed via scribe-hook-helper IPC (inline TOML).")
 else:
-    config = read_hooks_json()
+    config = parse_hooks_json(original_hooks_text)
     hooks = config.setdefault("hooks", {})
 
     for event, scribe_entries in scribe_by_event.items():
@@ -748,18 +775,21 @@ else:
         hooks[event] = merge_event_hooks(existing, scribe_entries)
 
     config["hooks"] = hooks
-    write_hooks_json(config)
+    hooks_text = json.dumps(config, indent=2) + "\n"
+    hooks_written = write_text_if_changed(hooks_path, hooks_text, original_hooks_text)
 
-    config_text = open(config_path).read() if os.path.isfile(config_path) else ""
     existing_state = collect_hook_state(config_text)
     trust_entries = []
     trust_entries.extend(prior_trust_entries_for(hooks_path, hooks, existing_state))
     trust_entries.extend(scribe_trust_entries_for(hooks_path, hooks))
     config_text = update_hook_trust_state(config_text, trust_entries)
-    atomic_write_text(config_path, config_text)
+    config_written = write_text_if_changed(config_path, config_text, original_config_text)
 
-    print(f"  Updated {hooks_path}")
-    print(f"  Updated {config_path}")
+    print("  Enabled [features].hooks = true")
+    if removed_codex_hooks:
+        print("  Removed deprecated Codex hook feature alias")
+    report(hooks_path, hooks_written)
+    report(config_path, config_written)
     print("  Scribe Codex hooks routed via scribe-hook-helper IPC.")
 PYEOF
 

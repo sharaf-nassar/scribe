@@ -77,6 +77,28 @@ def atomic_write_text(path, text):
         pass
     finally:
         os.close(dir_fd)
+
+
+def read_text(path):
+    """Return the file's contents, or None when it does not exist."""
+    path = os.fspath(path)
+    if not os.path.isfile(path):
+        return None
+    with open(path) as handle:
+        return handle.read()
+
+
+def write_text_if_changed(path, text, current):
+    """Write text atomically unless it already matches `current`.
+
+    Callers pass the contents they read once at the start of the run, so
+    an install that changes nothing skips the write entirely and leaves
+    the file's mtime and inode alone.
+    """
+    if current == text:
+        return False
+    atomic_write_text(path, text)
+    return True
 PRELUDE_EOF
 )
 
@@ -86,6 +108,8 @@ scribe_python() {
 }
 
 # ── Step 2: Merge Scribe hooks into settings.json ──────────────────────
+# settings.json is read once, transformed in memory, and rewritten only
+# when the rendered result differs from what was read.
 # All hook commands point at ai-hook-claude.sh in the install prefix.
 # Removes legacy `printf > /dev/tty` Scribe hooks and the obsolete
 # detect-claude-question.sh Stop hook before inserting the new entries.
@@ -162,11 +186,8 @@ def merge_event_hooks(existing_entries, scribe_entries):
     return scribe_entries + kept
 
 
-if os.path.isfile(settings_path):
-    with open(settings_path) as f:
-        settings = json.load(f)
-else:
-    settings = {}
+original_settings_text = read_text(settings_path)
+settings = json.loads(original_settings_text) if original_settings_text is not None else {}
 
 hooks = settings.setdefault("hooks", {})
 
@@ -214,9 +235,11 @@ else:
         file=sys.stderr,
     )
 
-atomic_write_text(settings_path, json.dumps(settings, indent=2) + "\n")
-
-print(f"  Updated {settings_path}")
+settings_text = json.dumps(settings, indent=2) + "\n"
+if write_text_if_changed(settings_path, settings_text, original_settings_text):
+    print(f"  Updated {settings_path}")
+else:
+    print(f"  {settings_path} already up to date")
 print("  Scribe Claude Code hooks now route via scribe-hook-helper IPC.")
 PYEOF
 
