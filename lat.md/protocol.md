@@ -20,7 +20,7 @@ On Linux this is `/run/user/{uid}/scribe/server.sock` for stable installs and `/
 
 ### Security
 
-Every connection is verified by checking the peer UID via `SO_PEERCRED` on Linux or `getpeereid` on macOS. Connections from a different UID are rejected. The server enforces a maximum of 32 concurrent connections per UID.
+Every connection is verified by checking the peer UID via `SO_PEERCRED` on Linux or `getpeereid` on macOS. Connections from a different UID are rejected. Admission is then charged against per-class caps — see [[server#Server#Startup#Local Admission]].
 
 Window and session operations are further scoped after handshake: a client cannot claim an already-connected window ID, attach another window's sessions, request snapshots for unattached sessions, or close a different window.
 

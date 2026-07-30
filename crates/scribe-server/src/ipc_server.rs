@@ -72,9 +72,43 @@ const PTY_READ_BUF_SIZE: usize = 64 * 1024;
 /// 16 MiB (the frame limit) to the PTY in one shot.
 const MAX_KEY_INPUT_BYTES: usize = 4 * 1024;
 
-/// Maximum simultaneous IPC client connections. Prevents a same-UID attacker
-/// from exhausting memory/tasks by opening thousands of connections.
+/// Maximum simultaneous LONG-LIVED local IPC connections — the ones that claim a
+/// window (`Hello`, or a legacy no-`Hello` first frame). Prevents a same-UID
+/// attacker from exhausting memory/tasks by opening thousands of connections;
+/// these are also the only local connections that can grow a large output queue,
+/// so this cap still bounds the server's per-connection memory. Transient
+/// no-window connections are charged to [`MAX_TRANSIENT_CONNECTIONS`] instead
+/// (spec 017 US5-5).
 const MAX_CONNECTIONS: usize = 32;
+
+/// Maximum simultaneous TRANSIENT local connections — the one-shot no-`Hello`
+/// actions that answer at most one frame and never register a window, dominated
+/// by `scribe-hook-helper`'s `HookEvent` sends (one connection per hook firing,
+/// several per AI turn across every live shell). A SEPARATE semaphore from
+/// [`MAX_CONNECTIONS`] is the whole point (spec 017 US5-5, Q7): sharing one pool
+/// let a hook burst hold every client slot and lock new windows out of the
+/// server. Sixteen concurrent one-shot dispatches is far above the steady-state
+/// depth, and an over-cap transient is dropped rather than queued so a burst can
+/// never grow unbounded work.
+const MAX_TRANSIENT_CONNECTIONS: usize = 16;
+
+/// Admission cap on accepted local connections that have not yet sent a first
+/// frame, reserved the instant the stream is accepted — before the handler is
+/// spawned — so a flood of silent dialers cannot spawn unbounded tasks (mirrors
+/// [`REMOTE_PENDING_HANDSHAKE_CAP`]). Which established pool a connection belongs
+/// to is unknowable until its first frame arrives, so this is the only cap the
+/// accept loop can charge; it sits generously above both established pools so
+/// in-flight handshakes never starve them, and every permit is released within
+/// [`LOCAL_PRE_HELLO_TIMEOUT`] at the latest.
+const LOCAL_PENDING_CAP: usize = 64;
+
+/// How long an accepted local connection may stay silent before its first frame
+/// (spec 017 US5-5, Q7). Every local caller writes its first frame immediately
+/// after connecting, so a connection still silent after five seconds is a
+/// half-open or abandoned dialer holding a pending admission slot. Reads AFTER
+/// the first frame stay untimed — an idle window is legitimate — and remote
+/// connections keep their own [`REMOTE_IDLE_READ_TIMEOUT`].
+const LOCAL_PRE_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Maximum number of session IDs in a single `Subscribe` message. Prevents
 /// a client from holding the workspace write-lock in a tight loop.
@@ -1330,12 +1364,69 @@ async fn remove_from_session_attachment(attachment: &SessionAttachment, session_
     }
 }
 
+/// The local (Unix-socket) admission pools. Three independent semaphores so no
+/// class of connection can starve another (spec 017 US5-5): `pending` bounds
+/// accepted-but-unclassified connections, and a connection's first frame moves it
+/// into exactly one of `client` (long-lived, holds a window) or `transient`
+/// (one-shot, holds nothing) for the rest of its life.
+struct LocalAdmission {
+    pending: Arc<tokio::sync::Semaphore>,
+    client: Arc<tokio::sync::Semaphore>,
+    transient: Arc<tokio::sync::Semaphore>,
+}
+
+impl LocalAdmission {
+    fn new() -> Self {
+        Self {
+            pending: Arc::new(tokio::sync::Semaphore::new(LOCAL_PENDING_CAP)),
+            client: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            transient: Arc::new(tokio::sync::Semaphore::new(MAX_TRANSIENT_CONNECTIONS)),
+        }
+    }
+}
+
+/// Which established pool a classified local connection belongs to.
+#[derive(Clone, Copy)]
+enum LocalSlotKind {
+    /// Claims a window and lives until the client disconnects.
+    Client,
+    /// Answers at most one frame and closes, registering nothing.
+    Transient,
+}
+
+/// One local connection's admission slot: the pre-first-frame `pending` permit
+/// taken in the accept loop, exchanged exactly once for the established permit
+/// its first frame calls for. Dropped when the connection handler returns, which
+/// is what returns the slot to its pool.
+struct LocalSlot {
+    pools: Arc<LocalAdmission>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl LocalSlot {
+    /// Exchange the held pending permit for an established-pool permit. The new
+    /// permit is taken BEFORE the old one is released (the assignment drops it),
+    /// so the exchange can never transiently over-admit either pool. Returns
+    /// `false` when the target pool is full and the caller must close.
+    fn claim(&mut self, kind: LocalSlotKind) -> bool {
+        let pool = match kind {
+            LocalSlotKind::Client => &self.pools.client,
+            LocalSlotKind::Transient => &self.pools.transient,
+        };
+        let Ok(permit) = Arc::clone(pool).try_acquire_owned() else {
+            return false;
+        };
+        self.permit = permit;
+        true
+    }
+}
+
 /// Start the IPC accept loop on an already-bound listener.
 pub async fn start_ipc_server(
     listener: UnixListener,
     server: IpcServerState,
 ) -> Result<(), ScribeError> {
-    let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let admission = Arc::new(LocalAdmission::new());
 
     loop {
         match listener.accept().await {
@@ -1344,18 +1435,24 @@ pub async fn start_ipc_server(
                     continue;
                 }
 
-                let Ok(permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
-                    warn!("connection limit ({MAX_CONNECTIONS}) reached, rejecting client");
+                // Admission is two-stage (spec 017 US5-5). The accept loop can
+                // only charge the pending pool, because a connection's class is
+                // not knowable until its first frame arrives;
+                // `establish_client_window` exchanges this permit for a client or
+                // transient one, and a dialer that never sends is dropped after
+                // `LOCAL_PRE_HELLO_TIMEOUT`.
+                let Ok(permit) = Arc::clone(&admission.pending).try_acquire_owned() else {
+                    warn!("pending-connection limit ({LOCAL_PENDING_CAP}) reached, rejecting");
                     continue;
                 };
+                let slot = LocalSlot { pools: Arc::clone(&admission), permit };
 
                 info!("client connected");
                 let server = server.clone();
                 tokio::spawn(async move {
                     // `Box::pin` the connection future so it lives on the heap
                     // rather than bloating this spawned task's stack frame.
-                    Box::pin(handle_client(stream, server)).await;
-                    drop(permit);
+                    Box::pin(handle_client(stream, server, slot)).await;
                 });
             }
             Err(e) => {
@@ -3247,7 +3344,7 @@ async fn handle_lan_client(stream: TcpStream, peer_addr: SocketAddr, accept: Lan
     };
     // `serve_connection`/`finish_served_connection` emit the `lan: accepted …` and
     // `lan: disconnect …` audit lines via the `RemoteAudit::Lan` branch.
-    serve_connection(reader, writer, accept.server.clone(), Some(ctx)).await;
+    serve_connection(reader, writer, accept.server.clone(), Some(ctx), None).await;
     // Flush any final frame (e.g. the sever `RemoteDisconnect`), stop the drain
     // task, then release the sever registration + connection slot.
     shutdown_output_queue(&sink, drain_task).await;
@@ -3623,7 +3720,7 @@ async fn handle_remote_client(
                 audit: RemoteAudit::Tailnet,
                 sever: sever_rx,
             };
-            serve_connection(reader, writer, server, Some(ctx)).await;
+            serve_connection(reader, writer, server, Some(ctx), None).await;
             // Flush any final frame (e.g. the sever `RemoteDisconnect`) and stop the
             // drain task before releasing the connection slot.
             shutdown_output_queue(&sink, drain_task).await;
@@ -3919,11 +4016,15 @@ fn verify_peer_uid(stream: &tokio::net::UnixStream) -> bool {
 /// fills its queue instead of back-pressuring whichever `pty_reader_task` is
 /// fanning out to it, so the shared `Term` — and every other session — keeps
 /// running.
-async fn handle_client(stream: tokio::net::UnixStream, server: IpcServerState) {
+async fn handle_client(
+    stream: tokio::net::UnixStream,
+    server: IpcServerState,
+    mut slot: LocalSlot,
+) {
     let (reader, write_half) = tokio::io::split(stream);
     let (sink, drain_task) = spawn_output_queue(write_half, Arc::clone(&server.live_sessions));
     let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::new(sink.clone())));
-    serve_connection(reader, writer, server, None).await;
+    serve_connection(reader, writer, server, None, Some(&mut slot)).await;
     // Flush whatever is still queued, stop the drain task, close the socket.
     shutdown_output_queue(&sink, drain_task).await;
 }
@@ -3934,11 +4035,17 @@ async fn handle_client(stream: tokio::net::UnixStream, server: IpcServerState) {
 /// transient no-Hello actions off (they are local-socket only) and carries the
 /// tailnet identity for the accepted/disconnect audit lines. Local connections
 /// (`None`) behave exactly as before.
+///
+/// `local` is the mirror image: `Some` only for local Unix-socket connections,
+/// carrying the admission slot whose pending permit the first frame exchanges for
+/// a client or transient one (spec 017 US5-5). Remote connections pass `None` —
+/// their caps are charged by their own transport's accept path.
 async fn serve_connection<R>(
     mut reader: R,
     writer: SharedWriter,
     server: IpcServerState,
     remote: Option<RemoteContext>,
+    local: Option<&mut LocalSlot>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -3974,11 +4081,16 @@ async fn serve_connection<R>(
 
     let conn = ConnState { server: &server, writer: &writer, attached_ids: &attached_ids };
 
+    // Heap-allocated rather than inlined: the establish path carries the whole
+    // pre-`Hello` first-frame dispatch, and this call sits inside the long
+    // `serve_connection` future, which has to stay under the workspace's
+    // future-size budget.
     let Some(window_id) =
-        establish_client_window(&mut reader, conn, &controller, sever_rx.as_mut()).await
+        Box::pin(establish_client_window(&mut reader, conn, &controller, sever_rx.as_mut(), local))
+            .await
     else {
-        // A bare pre-Hello close, or remote access was disabled before Hello
-        // arrived (T023). No window was claimed, so just close.
+        // A bare pre-Hello close, a refused admission slot, or remote access was
+        // disabled before Hello arrived (T023). No window was claimed, so close.
         if remote_identity.is_some() {
             debug!("remote connection closed before establishing a window");
         }
@@ -4044,31 +4156,42 @@ async fn establish_client_window<R>(
     conn: ConnState<'_>,
     controller: &ControllerIdentity,
     mut sever_rx: Option<&mut tokio::sync::oneshot::Receiver<()>>,
+    mut local: Option<&mut LocalSlot>,
 ) -> Option<WindowId>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let is_remote = matches!(controller, ControllerIdentity::Remote { .. });
+    // Remote connections keep their long idle backstop; a local connection gets
+    // the tight pre-Hello bound (spec 017 US5-5) because it is still holding a
+    // pending admission permit and every local caller writes immediately.
+    let first_frame_timeout =
+        if is_remote { REMOTE_IDLE_READ_TIMEOUT } else { LOCAL_PRE_HELLO_TIMEOUT };
     loop {
         // Race each pre-Hello read against the sever signal so a disable (T023)
         // closes a remote connection even before it claims a window; the read also
-        // carries the remote idle-read timeout so an abandoned pre-Hello dialer
-        // frees its slot. Local connections pass no sever channel and never time
-        // out, so this degenerates to today's bare read.
+        // carries the pre-Hello read bound so an abandoned dialer frees its slot.
+        // Local connections pass no sever channel, so that arm never fires there.
         let first = tokio::select! {
             biased;
             () = await_sever(sever_rx.as_deref_mut()) => {
                 debug!("remote access disabled before Hello; closing");
                 return None;
             }
-            read = read_client_frame(reader, is_remote) => read,
+            read = read_client_frame(reader, Some(first_frame_timeout)) => read,
         };
         let Some(first) = first else {
-            debug!("remote connection idle before Hello; closing");
+            debug!(is_remote, "connection idle before Hello; closing");
             return None;
         };
         match first {
             Ok(ClientMessage::Hello { window_id, clipboard_gating, takeover }) => {
+                // Long-lived: exchange the pending permit for one of the 32 client
+                // slots. A full pool closes the connection, exactly as the
+                // pre-017 accept-time rejection did — minus the accept.
+                if !claim_local_slot(local.as_deref_mut(), LocalSlotKind::Client) {
+                    return None;
+                }
                 let claim = HelloClaim {
                     requested_window_id: window_id,
                     clipboard_gating,
@@ -4105,6 +4228,17 @@ where
                 return None;
             }
             Ok(msg) => {
+                // Charge the connection to the pool its first frame classifies it
+                // into BEFORE any work is dispatched, so a hook burst is bounded
+                // by its own semaphore instead of the client slots (US5-5).
+                let kind = if is_transient_first_frame(&msg) {
+                    LocalSlotKind::Transient
+                } else {
+                    LocalSlotKind::Client
+                };
+                if !claim_local_slot(local.as_deref_mut(), kind) {
+                    return None;
+                }
                 return establish_local_first_frame(
                     msg,
                     conn.server,
@@ -4125,25 +4259,73 @@ where
     }
 }
 
-/// Read the next client frame, applying the remote idle-read timeout
-/// ([`REMOTE_IDLE_READ_TIMEOUT`]) ONLY for remote (TCP) connections so an
-/// abandoned peer's scarce connection slot is reclaimed. Returns `None` when the
-/// idle timeout expires (the caller treats that as a disconnect); local
-/// Unix-socket connections (`is_remote == false`) keep today's untimed read and
-/// always return `Some`.
+/// Move a classified local connection into its established admission pool,
+/// logging a refusal. Remote connections pass `None` and are always admitted
+/// here: their caps were charged by their own transport's accept path.
+fn claim_local_slot(slot: Option<&mut LocalSlot>, kind: LocalSlotKind) -> bool {
+    let Some(slot) = slot else {
+        return true;
+    };
+    if slot.claim(kind) {
+        return true;
+    }
+    match kind {
+        LocalSlotKind::Client => {
+            warn!("connection limit ({MAX_CONNECTIONS}) reached, rejecting client");
+        }
+        LocalSlotKind::Transient => {
+            warn!("transient limit ({MAX_TRANSIENT_CONNECTIONS}) reached, dropping action");
+        }
+    }
+    false
+}
+
+/// Whether a local non-`Hello` first frame is a one-shot transient action — one
+/// that answers at most one frame, registers no window, and closes — and so
+/// belongs to the [`MAX_TRANSIENT_CONNECTIONS`] pool rather than the client pool.
+/// Exactly the arms [`establish_local_first_frame`] and
+/// [`establish_local_lan_first_frame`] answer with `None`; everything else is a
+/// legacy no-`Hello` claim (still used by `scribe-cli`) that registers a window
+/// and must hold a client slot. A transient arm added there but missed here is
+/// merely charged to the client pool — the pre-017 behavior, never a leak.
+fn is_transient_first_frame(msg: &ClientMessage) -> bool {
+    matches!(
+        msg,
+        ClientMessage::CheckForUpdates
+            | ClientMessage::ListReleases
+            | ClientMessage::TriggerUpdate
+            | ClientMessage::HookEvent(_)
+            | ClientMessage::ListRemotePeers
+            | ClientMessage::GetRemoteEnv
+            | ClientMessage::ListLanPeers
+            | ClientMessage::GetLanEnv
+            | ClientMessage::GetLanDialIdentity
+            | ClientMessage::ListTrustedNetworks
+            | ClientMessage::AddCurrentNetworkTrusted
+            | ClientMessage::RemoveTrustedNetwork { .. }
+            | ClientMessage::ListTrustedDevices
+            | ClientMessage::RevokeTrustedDevice { .. }
+    )
+}
+
+/// Read the next client frame under an optional read bound. Remote (TCP)
+/// connections carry [`REMOTE_IDLE_READ_TIMEOUT`] on every read so an abandoned
+/// peer's scarce slot is reclaimed; a local connection carries
+/// [`LOCAL_PRE_HELLO_TIMEOUT`] on its first frame only and reads untimed
+/// (`None`) afterward, since an idle window is legitimate. Returns `None` when
+/// the bound expires — the caller treats that as a disconnect.
 async fn read_client_frame<R>(
     reader: &mut R,
-    is_remote: bool,
+    idle_timeout: Option<std::time::Duration>,
 ) -> Option<Result<ClientMessage, ScribeError>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let read = read_message::<ClientMessage, _>(reader);
-    if is_remote {
-        tokio::time::timeout(REMOTE_IDLE_READ_TIMEOUT, read).await.ok()
-    } else {
-        Some(read.await)
-    }
+    let Some(limit) = idle_timeout else {
+        return Some(read.await);
+    };
+    tokio::time::timeout(limit, read).await.ok()
 }
 
 /// Handle a non-`Hello` first frame on the LOCAL Unix socket: the transient
@@ -5211,17 +5393,19 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     let is_remote = sever_rx.is_some();
+    // Post-handshake reads carry the remote idle-read timeout so a vanished
+    // peer's slot is reclaimed; local reads stay untimed (the pre-Hello bound
+    // applies only to the first frame).
+    let idle_timeout = is_remote.then_some(REMOTE_IDLE_READ_TIMEOUT);
     loop {
         // Race each client-message read against the sever signal so a disable
         // (T023) drops a remote connection out of its loop; on sever, fall through
         // to the caller's normal detach cleanup. Local connections pass no sever
-        // channel, so the sever arm never fires. The read also carries the remote
-        // idle-read timeout so a vanished peer's slot is reclaimed (local reads
-        // stay untimed).
+        // channel, so the sever arm never fires.
         let read = tokio::select! {
             biased;
             () = await_sever(sever_rx.as_mut()) => return LoopExit::Severed,
-            read = read_client_frame(reader, is_remote) => read,
+            read = read_client_frame(reader, idle_timeout) => read,
         };
         let msg: ClientMessage = match read {
             Some(Ok(msg)) => msg,
