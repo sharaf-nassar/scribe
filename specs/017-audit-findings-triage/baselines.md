@@ -1386,6 +1386,72 @@ and two per-prompt deltas — which is what proves `__scribe-emit-env-baseline`
 is reached. Expect the as-shipped count to become 1-per-session-start
 once `scribe-i79.51` lands.
 
+#### After side: spawn-time persistence gate (bead `scribe-i79.17`)
+
+US4-5. The server now exports `SCRIBE_ENV_PERSIST` at spawn and every
+integration script returns (nushell: skips its two side-effecting blocks)
+right after the restore-delta apply when it reads `0`, so the baseline
+snapshot, the `--baseline-ready` fork, the per-prompt hook registration and
+every per-prompt snapshot/diff/fork are skipped. Measured on 2026-07-30
+from the bead's worktree, same rig, methodology, throwaway `HOME` and
+60-variable environment as the before side, under the
+`.worktrees/.measure-lock` mutex. Median of 3 differenced pairs
+(N=200 minus N=40); syscall counts from one straced run at each N,
+differenced the same way.
+
+| shell | enabled ms | disabled ms | OSC-only ms | enabled spawns/execs | disabled spawns/execs | OSC-only spawns/execs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| bash 5.2.21 | 5.94 | 2.51 | 2.35 | 4 / 0 | 2 / 0 | 2 / 0 |
+| zsh 5.9 | 4.12 | 2.03 | 2.04 | 2 / 0 | 2 / 0 | 2 / 0 |
+| fish 3.7.0 | 26.02 | 11.19 | 11.21 | 9 / 9 | 6 / 6 | 6 / 6 |
+| nu 0.114.1 | 13.46 | 6.10 | 6.09 | 4 / 2 | 4 / 2 | 4 / 2 |
+| pwsh 7.6.4 | 3.26 | 2.91 | 2.49 | 0 / 0 | 0 / 0 | 0 / 0 |
+
+**The `disabled` column has landed on the `OSC-only` column**, which is
+exactly what the before side said US4-5 had to achieve. Against the
+recorded `disabled` figures the drop is bash **6.86 → 2.51 ms** and
+**4 → 2 spawns**, zsh **4.48 → 2.03 ms**, fish **25.20 → 11.19 ms**, nu
+**13.65 → 6.10 ms** (the `scribe-i79.49` "loading" row, since the
+`b90c932` nu row is nushell's own prompt under D1), and pwsh
+**3.76 → 2.91 ms** (the `scribe-i79.50` repaired row, since the
+`b90c932` pwsh row is a prompt that threw before reaching the env-delta
+call under D2).
+
+Socket connections on `SCRIBE_HOOK_SOCK` are **0 across all 8 runs of
+every disabled arm** and non-zero in every enabled arm (8 for
+bash/zsh/pwsh, 16 for fish, 24 for nu) — which is what proves the
+disabled shells skip the emit rather than merely failing to reach the
+peer. The OSC 133/7/1337 marks are unaffected: every arm produces the
+same `133;A;click_events=1` count per prompt, and prompt cycles are
+counted from that mark, which all five integrations emit exactly once per
+prompt and no shell emits natively.
+
+Fork counts only fall where the env-delta path forked in the first place.
+bash loses 2 of its 4 (`$(__scribe_diff_env …)` and the
+`< <(compgen -e)` process substitution); fish loses 3 of 9; zsh, nu and
+pwsh keep theirs because their snapshot/diff is pure in-process and the
+helper is forked only on a non-empty diff, which a no-op prompt never
+produces — the same reason the before side's `enabled` and `disabled`
+columns were equal. The saving on those three is CPU, and it is the
+larger half everywhere.
+
+The `enabled` column is re-measured here as a control and is **not**
+comparable line-for-line with `b90c932`: four Wave 1 items rewrote all
+five scripts in between, which is where fish's enabled arm moved from 6
+to 9 spawns/execs. The load-bearing comparisons are `disabled` against
+`OSC-only` in the same table and against the recorded `disabled` column.
+Load average was 12-20 from sibling agents throughout, as on the before
+side. The `.measure-lock` mutex was reclaimed after being found stale for
+5+ hours (created 20:10 by the closed `scribe-i79.15` measurement, with
+no measurement process alive).
+
+Two rig notes for the next after-side run. The prompt-mark scanner must
+carry `len(mark) - 1` bytes across reads: a 16-byte carry drops a
+`133;A;click_events=1` split over a read boundary, and because the pwsh
+arm feeds one CR per *observed* mark, one dropped mark deadlocks that arm
+until the deadline. Answer terminal queries from a separate 3-byte carry
+so a CPR reply is never sent twice.
+
 ### Result: session startup cost
 
 Time from spawn to first prompt, and process creations over the same

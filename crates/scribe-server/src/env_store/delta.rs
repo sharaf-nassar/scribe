@@ -37,6 +37,7 @@ pub const EXCLUSION_SET: &[&str] = &[
     "SCRIBE_SESSION_ID",
     "SCRIBE_HOOK_HELPER",
     "SCRIBE_RESTORE_ENV_DELTA_FILE",
+    "SCRIBE_ENV_PERSIST",
     // Terminal identification (Scribe injects fresh values)
     "TERM",
     "COLORTERM",

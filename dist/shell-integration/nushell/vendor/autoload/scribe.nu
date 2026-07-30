@@ -276,8 +276,18 @@ if $scribe_active and ('SCRIBE_RESTORE_ENV_DELTA_FILE' in $env) {
     hide-env SCRIBE_RESTORE_ENV_DELTA_FILE
 }
 
+# Spawn-time persistence gate. The server exports SCRIBE_ENV_PERSIST=0 when
+# `terminal.env_persistence.enabled` is off, and drops every EnvChanged it
+# receives in that state — so the snapshot, the O(N^2) diff and the helper
+# fork below would all be built for nothing. A bare `return` is illegal at
+# this level (see the header), so gate the side effects instead; the `def`s
+# stay inert. Absence means a server that predates the gate: keep emitting.
+let scribe_env_persist = (
+    $scribe_active and (($env.SCRIBE_ENV_PERSIST? | default '1') != '0')
+)
+
 # Per-session "last emitted" snapshot, stored as a global record.
-if $scribe_active {
+if $scribe_env_persist {
     $env.__SCRIBE_ENV_LAST = (__scribe-snapshot-env)
 }
 
@@ -331,7 +341,7 @@ def --env __scribe-emit-env-baseline [] {
     } catch { }
 }
 
-if $scribe_active {
+if $scribe_env_persist {
     __scribe-emit-env-baseline
 
     let env_delta_hooks = (__scribe-normalize-hooks ($env.config.hooks.pre_prompt? | default null))

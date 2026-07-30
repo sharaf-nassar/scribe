@@ -161,6 +161,16 @@ if ($env:SCRIBE_RESTORE_ENV_DELTA_FILE -and (Test-Path -LiteralPath $env:SCRIBE_
     Remove-Item env:SCRIBE_RESTORE_ENV_DELTA_FILE -ErrorAction SilentlyContinue
 }
 
+# Spawn-time persistence gate. The server exports SCRIBE_ENV_PERSIST=0 when
+# `terminal.env_persistence.enabled` is off, and drops every EnvChanged it
+# receives in that state — so the snapshot, the diff and the prompt wrapper
+# below would all be built for nothing. Everything past this point belongs
+# to the env-delta feature, so return rather than branch. Absence means a
+# server that predates the gate: keep emitting.
+if (($env:SCRIBE_ENV_PERSIST ?? '1') -eq '0') {
+    return
+}
+
 # Absolute path to the hook helper, injected by the server for whichever
 # install layout is live. Packaged installs never put it on PATH, so the
 # bare name is only a dev-shell fallback.
