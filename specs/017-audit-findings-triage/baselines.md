@@ -539,6 +539,40 @@ exact zeros in every run.
 The detached-sink and OSC 4 rows are unchanged by this item; they belong to the
 branch-cache and config/theme-cache work.
 
+### After side: git-branch cache and detached skip (US6-2)
+
+Measured on 2026-07-30 at worktree base `2b28bfc` (bead `scribe-i79.12`), with
+the same isolated-runtime-dir rig: two release `scribe-server` builds differing
+only in this item's diff, each run under
+`strace -f -qq -e trace=openat,openat2`, against a scratch `$HOME` that is a
+`git init` repo on branch `measure-main` with one nested directory. `.git/HEAD`
+opens are `grep -c '/\.git/HEAD"'` deltas bracketing each phase.
+
+The OSC 7 phases **alternate** between the repo root and the nested directory
+rather than repeating one value: after the last-value suppression above, a
+repeated OSC 7 costs zero walks in both builds, so only a directory that really
+changes reaches branch detection at all. Twenty alternating reports at 4 Hz
+therefore cost 30 opens uncached — ten at the root (1 each) and ten one level
+below it (2 each: the `ENOENT` probe plus the hit).
+
+| Phase | before | after |
+|---|---|---|
+| 20 alternating OSC 7, one sink attached | 30 | 30 |
+| 20 alternating OSC 7, zero sinks (detached) | 30 | **0** |
+| 20 back-to-back `ListSessions`, session parked | 20 | **1** |
+| 3 × 5 `ListSessions`, bursts 6 s apart | 15 | **2** |
+
+The attached row is the control: a session whose directory really changes still
+walks on every change, because the cache is a single-entry memo keyed on the
+directory it was taken in and an alternating CWD misses it every time. The
+detached row is the skip — an empty sink set costs zero walks, where before the
+result was computed and discarded. The `ListSessions` rows are the TTL: twenty
+reads inside one 5 s window collapse to one walk, and spacing the reads past the
+TTL brings the walks back (2 rather than 3 because the first burst still falls
+inside the window opened by the preceding phase). Every `SessionList` in both
+builds reported `git_branch = "measure-main"`, so the cache never changes the
+answer. Phases 1–3 reproduced integer-exact across two runs per build.
+
 ## Per-prompt shell hook cost
 
 Wall time and process creations charged to one no-op prompt cycle by

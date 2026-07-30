@@ -86,6 +86,10 @@ Suppression runs ahead of the registry write, the `CwdChanged` and `GitBranch` f
 
 On a CWD change that survives suppression, the server walks up from the working directory (depth limit 50) looking for `.git/HEAD`. It extracts the branch name from `ref: refs/heads/...` or returns the first 8 characters of a detached HEAD commit.
 
+The walk is memoized per session by the directory it was taken in — a `(session, cwd)` key, since the [[crates/scribe-server/src/ipc_server.rs#GitBranchCache|cache]] hangs off the live session. A CWD report that survives suppression names a different directory and therefore misses, which makes the report itself the invalidation signal; a 5 s TTL bounds how stale a cached answer can be for a session that never moves, since a `git checkout` from another terminal produces no report at all. "Not in a repository" is cached like any other answer. The metadata pipeline never holds the registry guard across the walk: it looks the entry up, releases the guard, walks, then stores. `ListSessions` shares the same cache, so a client polling the session list costs one walk per TTL window instead of one per read.
+
+Detection is skipped outright when the session's attached-sink set is empty. A detached session has nobody to render a branch, and the `SessionList` reply that precedes the next attach resolves it, so the walk would be pure waste.
+
 ### Clipboard Gating
 
 OSC 52 clipboard reads and writes from PTY-side programs flow through a per-session policy engine before reaching the host clipboard (spec 010). The in-memory `ServerClipboard` buffer is gone; the host clipboard is now the single source of truth.
