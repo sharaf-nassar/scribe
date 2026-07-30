@@ -51,6 +51,7 @@ use crate::lan::trust::{
     SharedTrustedDevices, TrustedDevicesStore, decode_device_id_hex,
 };
 use crate::releases::{ReleaseCatalog, ReleaseFetcher};
+use crate::session_exit::{CancelWaiter, SessionExitGate};
 use crate::session_manager::{
     ManagedSession, SessionLaunchRequest, SessionManager, build_term_config, snapshot_term,
 };
@@ -747,6 +748,15 @@ struct PtyReaderState {
     window_id: WindowId,
     child_pid: u32,
     pty_read: ReadHalf<scribe_pty::async_fd::AsyncPtyFd>,
+    /// Shared exit funnel (spec 017 US1-3). The reader arbitrates its own
+    /// EOF/read-error exit against explicit closes and the child-exit watcher
+    /// through this gate's CAS.
+    exit_gate: Arc<SessionExitGate>,
+    /// Cancellation arm raced against the PTY read. The master fd is
+    /// duplicated into the resize fd and the `LiveSession`'s `Pty`, so a
+    /// SIGHUP-trapping child would otherwise park this task on a `read()`
+    /// that can never EOF.
+    cancel: CancelWaiter,
     pty_write: Arc<Mutex<WriteHalf<scribe_pty::async_fd::AsyncPtyFd>>>,
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     ansi_processor: AnsiProcessor,
@@ -886,6 +896,19 @@ pub struct LiveSession {
     /// they reach `handle_clipboard_prompt_response` /
     /// `handle_clipboard_bridge_read_reply` on the owning reader task.
     pub(crate) clipboard_command_tx: tokio::sync::mpsc::UnboundedSender<ClipboardCommand>,
+    /// Shared exit funnel (spec 017 US1-3): the reader's cancellation signal,
+    /// its retained `JoinHandle`, and the CAS that elects the one path allowed
+    /// to publish `SessionExited` and unwire this session.
+    exit_gate: Arc<SessionExitGate>,
+}
+
+/// The per-session handles the exit funnel needs, cloned off a [`LiveSession`]
+/// before a close path drops it. Keeping them out of the registry means the
+/// finalizer can run after the session value is gone.
+struct SessionExitHandles {
+    exit_gate: Arc<SessionExitGate>,
+    client_writer: ClientWriter,
+    attachment: SessionAttachment,
 }
 
 pub struct AttachSessionData {
@@ -926,6 +949,16 @@ impl LiveSession {
 
     pub fn take_handoff_snapshot(&mut self) -> Option<ScreenSnapshot> {
         self.handoff_snapshot.take()
+    }
+
+    /// Clone the handles a close path needs to drive the exit funnel after the
+    /// session value itself has been dropped.
+    fn exit_handles(&self) -> SessionExitHandles {
+        SessionExitHandles {
+            exit_gate: Arc::clone(&self.exit_gate),
+            client_writer: Arc::clone(&self.client_writer),
+            attachment: Arc::clone(&self.attachment),
+        }
     }
 }
 
@@ -5633,6 +5666,7 @@ async fn start_session(
     let preserve_ai_scrollback = Arc::new(AtomicBool::new(load_preserve_ai_scrollback_setting()));
     let scrollback_lines = Arc::new(AtomicUsize::new(load_scrollback_lines_setting()));
     let ai_provider = ai_state.as_ref().map(|state| state.provider).or(ai_provider_hint);
+    let exit_gate = Arc::new(SessionExitGate::new());
 
     let live = LiveSession {
         pty_write: Arc::clone(&pty_write),
@@ -5659,44 +5693,107 @@ async fn start_session(
         env_window_id: window_id,
         env_envelope_id,
         clipboard_command_tx,
+        exit_gate: Arc::clone(&exit_gate),
     };
     runtime.live_sessions.write().await.insert(session_id, live);
-    let clipboard_policy = load_clipboard_policy_snapshot();
 
+    spawn_pty_reader(
+        PtyReaderInputs {
+            ids,
+            child_pid,
+            ai_provider,
+            cell_width,
+            cell_height,
+            pty_read,
+            pty_write,
+            term,
+            ansi_processor,
+            osc_parser,
+            event_rx,
+            clipboard_command_rx,
+            client_writer,
+            attachment,
+            preserve_ai_scrollback,
+            scrollback_lines,
+        },
+        runtime,
+        &exit_gate,
+    );
+}
+
+/// The `ManagedSession`-derived inputs a PTY reader task needs. Bundled so
+/// [`spawn_pty_reader`] owns the derived per-task state (filters, OSC 52
+/// bookkeeping, scrollback epoch) instead of inflating [`start_session`].
+struct PtyReaderInputs {
+    ids: StartSessionIds,
+    child_pid: u32,
+    ai_provider: Option<AiProvider>,
+    cell_width: u16,
+    cell_height: u16,
+    pty_read: ReadHalf<scribe_pty::async_fd::AsyncPtyFd>,
+    pty_write: Arc<Mutex<WriteHalf<scribe_pty::async_fd::AsyncPtyFd>>>,
+    term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    ansi_processor: AnsiProcessor,
+    osc_parser: VteParser,
+    event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+    clipboard_command_rx: tokio::sync::mpsc::UnboundedReceiver<ClipboardCommand>,
+    client_writer: ClientWriter,
+    attachment: SessionAttachment,
+    preserve_ai_scrollback: Arc<AtomicBool>,
+    scrollback_lines: Arc<AtomicUsize>,
+}
+
+/// Assemble the reader task's state and start it, retaining its `JoinHandle`
+/// on the session's exit gate (spec 017 US1-3) rather than discarding it, so
+/// teardown can stop and join a reader whose master fd will never EOF.
+///
+/// There is no `.await` between the caller's registry insert and the handle
+/// store, so a close can only reach the gate handle-less by racing on another
+/// worker — and that close has already cancelled the gate, so the reader ends
+/// regardless.
+fn spawn_pty_reader(
+    inputs: PtyReaderInputs,
+    runtime: SessionRuntimeContext<'_>,
+    exit_gate: &Arc<SessionExitGate>,
+) {
     let state = PtyReaderState {
-        session_id,
-        window_id,
-        child_pid,
-        pty_read,
-        pty_write,
-        term,
-        ansi_processor,
-        osc_parser,
-        event_rx,
-        client_writer,
-        attachment,
+        session_id: inputs.ids.session,
+        window_id: inputs.ids.window,
+        child_pid: inputs.child_pid,
+        pty_read: inputs.pty_read,
+        cancel: exit_gate.subscribe(),
+        exit_gate: Arc::clone(exit_gate),
+        pty_write: inputs.pty_write,
+        term: inputs.term,
+        ansi_processor: inputs.ansi_processor,
+        osc_parser: inputs.osc_parser,
+        event_rx: inputs.event_rx,
+        client_writer: inputs.client_writer,
+        attachment: inputs.attachment,
         workspace_manager: Arc::clone(runtime.workspace_manager),
         live_sessions: Arc::clone(runtime.live_sessions),
         window_shares: Arc::clone(runtime.window_shares),
-        clipboard_burst: crate::clipboard_state::ClipboardBurstState::new(clipboard_policy),
+        clipboard_burst: crate::clipboard_state::ClipboardBurstState::new(
+            load_clipboard_policy_snapshot(),
+        ),
         pending_clipboard_reads: HashMap::new(),
         pending_clipboard_prompt: None,
-        clipboard_command_rx,
+        clipboard_command_rx: inputs.clipboard_command_rx,
         osc_events: Vec::new(),
         last_proc_cwd: None,
         ed3_filter: Ed3Filter::new(),
         claude_picker_filter: ClaudePickerTruncationFilter::new(),
         lf_crlf_filter: LfCrlfFilter::new(),
-        ai_provider,
-        cell_width,
-        cell_height,
-        preserve_ai_scrollback,
-        scrollback_lines,
+        ai_provider: inputs.ai_provider,
+        cell_width: inputs.cell_width,
+        cell_height: inputs.cell_height,
+        preserve_ai_scrollback: inputs.preserve_ai_scrollback,
+        scrollback_lines: inputs.scrollback_lines,
         preserved_ai_scrollback: PreservedAiScrollback::default(),
         pending_ai_scrollback_baseline: false,
     };
 
-    tokio::spawn(pty_reader_task(state));
+    exit_gate.set_reader(tokio::spawn(pty_reader_task(state)));
 }
 
 /// Spec 010 C4: build the OSC 52 client→PTY-reader control channel.
@@ -5852,7 +5949,11 @@ fn signal_if_handoff_session(session_id: SessionId, session: &LiveSession) {
 /// Close a session and clean up. For fresh sessions the `Pty::Drop` inside
 /// `LiveSession` sends SIGHUP to the child process; for handoff-restored
 /// sessions (`pty: None`) we send SIGHUP explicitly so the child is not
-/// leaked. The PTY reader task exits naturally on EOF once the child dies.
+/// leaked. Neither guarantees an EOF — the child may ignore SIGHUP, and the
+/// master fd stays open in the reader and the resize fd regardless — so the
+/// close cancels the reader's exit gate up front and then drives the same
+/// [`finalize_session_exit`] funnel the reader would have, as a backstop for a
+/// reader that cannot reach it.
 ///
 /// Per T019, on this clean-close path we also delete the session's encrypted
 /// env envelope (`<state_dir>/restore/env/<window_id>/<launch_id>.envz`) plus
@@ -5880,12 +5981,24 @@ async fn handle_close_session(
     let envelope_coords = removed
         .as_ref()
         .and_then(|s| s.env_envelope_id.as_ref().map(|id| (s.env_window_id, id.clone())));
+    // Cloned for the same reason: the funnel runs after the session value is
+    // gone, and it is the only place allowed to emit `SessionExited`.
+    let exit_handles = removed.as_ref().map(LiveSession::exit_handles);
     if let Some(session) = &removed {
         signal_if_handoff_session(session_id, session);
     }
     // `removed` is dropped here — if `pty` is `Some`, `Pty::Drop` sends SIGHUP.
     drop(removed);
-    workspace_manager.write().await.remove_session(session_id);
+    // Cancel before anything that can await: this is what actually stops a
+    // reader whose child ignored SIGHUP, and it takes no lock.
+    if let Some(handles) = &exit_handles {
+        handles.exit_gate.cancel();
+    }
+    {
+        let mut wm = workspace_manager.write().await;
+        wm.remove_session(session_id);
+        wm.remove_session_from_window(session_id);
+    }
     attached_remove(attached_ids, session_id).await;
 
     // Best-effort envelope + DEK delete. `delete_envelope` is idempotent
@@ -5907,6 +6020,26 @@ async fn handle_close_session(
     }
 
     info!(%session_id, "session closed by client");
+
+    // Funnel last. The cancelled reader normally wins the CAS and emits
+    // `SessionExited` itself; this call is the backstop for a reader that
+    // cannot get there. It is deliberately after every teardown step, because
+    // `SessionExited` goes out on the session's sinks and can park behind a
+    // stalled participant — the close itself must not wait on that.
+    if let Some(handles) = exit_handles {
+        finalize_session_exit(
+            &handles.exit_gate,
+            SessionExitContext {
+                session_id,
+                client_writer: &handles.client_writer,
+                attachment: &handles.attachment,
+                live_sessions,
+                workspace_manager,
+            },
+            None,
+        )
+        .await;
+    }
 }
 
 /// Close a window: destroy every session it owns and remove the window from
@@ -5917,6 +6050,10 @@ async fn handle_close_session(
 /// This is the "clean close" path; the PTY-EOF / child-exit path in
 /// [`finalize_pty_reader`] deliberately preserves envelopes so they remain
 /// available for cold-restart restore.
+///
+/// Each destroyed session's reader is cancelled and funnelled through
+/// [`finalize_session_exit`] after the `WindowClosed` reply, so a child that
+/// ignores SIGHUP cannot leave a reader parked on a master fd that never EOFs.
 async fn handle_close_window(window_id: WindowId, context: &ClientDispatchContext<'_>) {
     if window_id != context.window_id {
         send_error(context.writer, &format!("cannot close another window: {window_id}")).await;
@@ -5928,10 +6065,14 @@ async fn handle_close_window(window_id: WindowId, context: &ClientDispatchContex
 
     // Destroy each session. For fresh sessions `Pty::Drop` sends SIGHUP;
     // for handoff-restored sessions (`pty: None`) we signal explicitly.
+    // Exit handles are cloned out for the post-reply teardown below, since
+    // neither signal guarantees the reader ever sees EOF.
+    let mut exit_handles = Vec::with_capacity(session_ids.len());
     {
         let mut sessions = context.server.live_sessions.write().await;
         for &sid in &session_ids {
             if let Some(session) = sessions.remove(&sid) {
+                exit_handles.push((sid, session.exit_handles()));
                 signal_if_handoff_session(sid, &session);
                 // `session` dropped here — `Pty::Drop` fires if `pty` is `Some`.
             }
@@ -5960,6 +6101,26 @@ async fn handle_close_window(window_id: WindowId, context: &ClientDispatchContex
     }
 
     send_message(context.writer, &ServerMessage::WindowClosed { window_id }).await;
+
+    // Cancel and finalize only after the reply, so the pre-existing
+    // `WindowClosed`-then-`SessionExited` order the client's exit path expects
+    // is preserved. Cancellation is what makes a SIGHUP-ignoring child's
+    // reader stop at all; the funnel is the backstop for a reader that cannot.
+    for (sid, handles) in exit_handles {
+        handles.exit_gate.cancel();
+        finalize_session_exit(
+            &handles.exit_gate,
+            SessionExitContext {
+                session_id: sid,
+                client_writer: &handles.client_writer,
+                attachment: &handles.attachment,
+                live_sessions: &context.server.live_sessions,
+                workspace_manager: &context.server.workspace_manager,
+            },
+            None,
+        )
+        .await;
+    }
 }
 
 /// Route a client `Resize` by the window's sharing mode (feature 015 T008, D3). In
@@ -7326,24 +7487,36 @@ async fn send_error(writer: &SharedWriter, message: &str) {
 async fn pty_reader_task(mut state: PtyReaderState) {
     let mut buf = vec![0u8; PTY_READ_BUF_SIZE];
 
-    loop {
+    let stop = loop {
         match next_pty_read_action(&mut state, &mut buf).await {
             PtyReadAction::Continue => {}
-            PtyReadAction::End => break,
+            PtyReadAction::End(stop) => break stop,
             PtyReadAction::Data(bytes_read) => {
-                let Some(bytes) = buf.get(..bytes_read) else { break };
+                let Some(bytes) = buf.get(..bytes_read) else { break ReaderStop::ReadError };
                 process_pty_chunk(&mut state, bytes).await;
             }
         }
-    }
+    };
 
-    finalize_pty_reader(state).await;
+    finalize_pty_reader(state, stop).await;
+}
+
+/// Why the reader loop stopped. Decides which exit path the reader takes into
+/// the session exit funnel (spec 017 US1-3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReaderStop {
+    /// The PTY master reported EOF — every slave fd is closed.
+    Eof,
+    /// The master fd errored, so no further output can arrive.
+    ReadError,
+    /// Teardown cancelled this reader; the canceller drives the funnel.
+    Cancelled,
 }
 
 enum PtyReadAction {
     Continue,
     Data(usize),
-    End,
+    End(ReaderStop),
 }
 
 async fn next_pty_read_action(state: &mut PtyReaderState, buf: &mut [u8]) -> PtyReadAction {
@@ -7353,19 +7526,25 @@ async fn next_pty_read_action(state: &mut PtyReaderState, buf: &mut [u8]) -> Pty
 
     match read_result {
         ReadResult::Data(n) => PtyReadAction::Data(n),
-        ReadResult::Eof => PtyReadAction::End,
+        ReadResult::Eof => PtyReadAction::End(ReaderStop::Eof),
+        ReadResult::Cancelled => PtyReadAction::End(ReaderStop::Cancelled),
         ReadResult::Err(e) => {
             warn!(session_id = %state.session_id, "PTY read error: {e}");
-            PtyReadAction::End
+            PtyReadAction::End(ReaderStop::ReadError)
         }
     }
 }
 
-/// Race a PTY read against the optional ANSI sync-timeout sleep and the
-/// OSC 52 [`ClipboardCommand`] channel. Returns `Some(read_result)` when
-/// the PTY produced bytes (or an error/EOF), or `None` when either the
-/// sync timeout fired or a clipboard command was consumed — both of those
-/// paths are "continue the outer loop" signals for [`next_pty_read_action`].
+/// Race a PTY read against the reader's cancellation signal, the optional ANSI
+/// sync-timeout sleep, and the OSC 52 [`ClipboardCommand`] channel. Returns
+/// `Some(read_result)` when the PTY produced bytes (or an error/EOF) or the
+/// reader was cancelled, and `None` when either the sync timeout fired or a
+/// clipboard command was consumed — both of those paths are "continue the
+/// outer loop" signals for [`next_pty_read_action`].
+///
+/// Every branch is cancel-safe (`AsyncReadExt::read`,
+/// `UnboundedReceiver::recv`, `sleep_until`, and the gate's `watch`-backed
+/// waiter), so losing a race never drops a wakeup or a byte.
 async fn select_pty_read_or_clipboard(
     state: &mut PtyReaderState,
     buf: &mut [u8],
@@ -7379,6 +7558,7 @@ async fn select_pty_read_or_clipboard(
                 maybe_capture_preserved_ai_scrollback_baseline(state).await;
                 None
             }
+            () = state.cancel.cancelled() => Some(ReadResult::Cancelled),
             result = read_pty_bytes(&mut state.pty_read, buf) => Some(result),
             cmd = state.clipboard_command_rx.recv() => {
                 handle_clipboard_command_option(state, cmd).await;
@@ -7387,6 +7567,7 @@ async fn select_pty_read_or_clipboard(
         }
     } else {
         tokio::select! {
+            () = state.cancel.cancelled() => Some(ReadResult::Cancelled),
             result = read_pty_bytes(&mut state.pty_read, buf) => Some(result),
             cmd = state.clipboard_command_rx.recv() => {
                 handle_clipboard_command_option(state, cmd).await;
@@ -7654,21 +7835,83 @@ fn trim_term_scrollback_inner(
     grid.update_history(max_rows);
 }
 
-async fn finalize_pty_reader(state: PtyReaderState) {
-    let exit_msg = ServerMessage::SessionExited { session_id: state.session_id, exit_code: None };
-    send_to_client(&state.client_writer, &exit_msg).await;
-    remove_from_session_attachment(&state.attachment, state.session_id).await;
-    state.live_sessions.write().await.remove(&state.session_id);
-    let mut workspace_manager = state.workspace_manager.write().await;
-    workspace_manager.remove_session(state.session_id);
-    workspace_manager.remove_session_from_window(state.session_id);
-    info!(session_id = %state.session_id, "PTY reader task exited");
+/// Route the reader's own exit into the session funnel (spec 017 US1-3).
+///
+/// A master EOF only proves that every slave fd closed, which a live child can
+/// do on its own, so when a child-exit watcher is armed the reader stops
+/// reading and leaves emission to it. Handoff-inherited sessions never arm a
+/// watcher and keep the EOF path with `exit_code: None`. Cancellation still
+/// calls the funnel: the canceller normally wins the CAS, but the reader is
+/// the backstop if it is torn down before the canceller gets there.
+async fn finalize_pty_reader(state: PtyReaderState, stop: ReaderStop) {
+    info!(session_id = %state.session_id, ?stop, "PTY reader task exited");
+    if stop == ReaderStop::Eof && state.exit_gate.has_watcher() {
+        debug!(
+            session_id = %state.session_id,
+            "PTY master EOF with a child-exit watcher armed — deferring session exit to it"
+        );
+        return;
+    }
+    finalize_session_exit(
+        &state.exit_gate,
+        SessionExitContext {
+            session_id: state.session_id,
+            client_writer: &state.client_writer,
+            attachment: &state.attachment,
+            live_sessions: &state.live_sessions,
+            workspace_manager: &state.workspace_manager,
+        },
+        None,
+    )
+    .await;
 }
 
-/// Result of a PTY read attempt.
+/// Everything the one-shot session finalizer touches, assembled by whichever
+/// exit path reaches the funnel. Close paths clone these off the `LiveSession`
+/// via [`LiveSession::exit_handles`] before dropping it; the reader owns them
+/// directly.
+struct SessionExitContext<'a> {
+    session_id: SessionId,
+    client_writer: &'a ClientWriter,
+    attachment: &'a SessionAttachment,
+    live_sessions: &'a LiveSessionRegistry,
+    workspace_manager: &'a Arc<RwLock<WorkspaceManager>>,
+}
+
+/// The single idempotent session-exit finalizer (spec 017 US1-3).
+///
+/// Reader EOF, reader cancellation, an explicit `CloseSession`/`CloseWindow`,
+/// and the child-exit watcher all end here. The CAS in
+/// [`SessionExitGate::claim_exit`] elects exactly one of them to publish
+/// `SessionExited` and unwire the session, so a close racing the child's own
+/// death can neither double-emit nor drop the notification. `exit_code` is
+/// `None` for every path except the watcher, which is the only observer of a
+/// real wait status.
+async fn finalize_session_exit(
+    gate: &SessionExitGate,
+    ctx: SessionExitContext<'_>,
+    exit_code: Option<i32>,
+) {
+    if !gate.claim_exit() {
+        debug!(session_id = %ctx.session_id, "session exit already finalized");
+        return;
+    }
+    let exit_msg = ServerMessage::SessionExited { session_id: ctx.session_id, exit_code };
+    send_to_client(ctx.client_writer, &exit_msg).await;
+    remove_from_session_attachment(ctx.attachment, ctx.session_id).await;
+    ctx.live_sessions.write().await.remove(&ctx.session_id);
+    let mut workspace_manager = ctx.workspace_manager.write().await;
+    workspace_manager.remove_session(ctx.session_id);
+    workspace_manager.remove_session_from_window(ctx.session_id);
+    info!(session_id = %ctx.session_id, ?exit_code, "session exit finalized");
+}
+
+/// Result of a PTY read attempt, or of the cancellation racing it.
 enum ReadResult {
     Data(usize),
     Eof,
+    /// The session's exit gate was cancelled while the read was parked.
+    Cancelled,
     Err(std::io::Error),
 }
 

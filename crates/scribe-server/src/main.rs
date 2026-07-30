@@ -36,6 +36,13 @@ use scribe_server::tailnet;
 // would recompile its many `pub` discovery/identity/TLS/trust items (unused by
 // the binary) into dead-code warnings.
 use scribe_server::lan;
+// Spec 017 US1-3: the PTY reader and the close paths in `mod ipc_server` reach
+// the per-session exit funnel through `crate::session_exit`. Re-exported from
+// the LIBRARY crate for the same reason as `tailnet`/`lan` — the gate's
+// child-exit-watcher seat is only called from the watcher that lands next, and
+// a second in-binary copy would recompile those `pub` items into dead-code
+// warnings.
+use scribe_server::session_exit;
 mod updater;
 mod workspace_manager;
 mod workspace_notes;

@@ -15,6 +15,7 @@ pub mod ipc_server;
 pub mod lan;
 pub mod macos_proc;
 pub mod releases;
+pub mod session_exit;
 pub mod session_manager;
 pub mod shell_integration;
 pub mod stop_classifier;
