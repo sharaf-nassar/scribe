@@ -1452,6 +1452,66 @@ arm feeds one CR per *observed* mark, one dropped mark deadlocks that arm
 until the deadline. Answer terminal queries from a separate 3-byte carry
 so a CPR reply is never sent twice.
 
+#### After side: linear-time fish and nu env diffs (bead `scribe-i79.18`)
+
+US4-6, diff half. fish caches the last emitted value of each variable in
+a dynamically named global (`__scribe_envm_<NAME>`), so the per-prompt
+diff is a hashed lookup per variable instead of a `contains -i` scan of
+the whole cache, and the two `seq` binaries the old index loops forked
+are gone with the loops. nushell builds its snapshot with `items`
+instead of an accumulating `reduce`/`upsert` and pairs the two snapshots
+with one `group-by` instead of `$name in $prev_names` plus
+`$prev | get $name` per variable. Measured on 2026-07-30 from the bead's
+worktree with the `scribe-i79.17` rig, methodology, throwaway `HOME` and
+60-variable environment, under the `.worktrees/.measure-lock` mutex. The
+before side is the merge base (`6077bd9`) re-run in the same session,
+because load average was 13-15 from sibling agents throughout. Median of
+3 differenced pairs (N=200 minus N=40); syscall counts from one straced
+run at each N, differenced the same way.
+
+| shell | before ms | after ms | before spawns/execs | after spawns/execs | OSC-only ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| fish 3.7.0 | 21.13 | 9.52 | 7 / 7 | 4 / 4 | 6.68 |
+| nu 0.114.1 | 13.33 | 9.15 | 4 / 2 | 4 / 2 | 6.31 |
+
+Against the `OSC-only` floor measured alongside them, the env-delta
+machinery alone costs **14.28 → 2.84 ms** per fish prompt and
+**7.12 → 2.84 ms** per nu prompt. fish also drops **3 of its 7 spawns
+and execs** — the two `seq` binaries plus the fork fish takes for one of
+them — landing on the same 4/4 as its own OSC-only arm, so nothing in
+the env-delta path forks any more. nu's 4 spawns / 2 execs are the two
+`hostname` externals in the OSC path and are unchanged, as expected.
+Socket connections on `SCRIBE_HOOK_SOCK` are identical before and after
+(16 for fish, 24 for nu across the 8 runs of each arm), which is what
+proves the same emits still happen — the saving is CPU, not dropped
+frames. nu session startup also falls **60.0 → 46.3 ms**, because the
+baseline emit no longer snapshots the environment twice.
+
+The complexity claim itself is the scaling run: the same rig with the
+environment padded to 60, 120 and 240 exported variables, 2 passes,
+`enabled` minus `OSC-only` so only the env-delta path is left.
+
+| vars | fish before | fish after | nu before | nu after |
+| ---: | ---: | ---: | ---: | ---: |
+| 60 | 15.39 ms | 2.43 ms | 8.41 ms | 3.87 ms |
+| 120 | 30.79 ms | 4.53 ms | 18.01 ms | 5.64 ms |
+| 240 | 78.18 ms | 7.31 ms | 53.40 ms | 8.67 ms |
+
+Per variable that is fish **256 → 257 → 326 µs** before and
+**40.5 → 37.8 → 30.5 µs** after; nu **140 → 150 → 222 µs** before and
+**64.5 → 47.0 → 36.1 µs** after. Both before-side curves rise with the
+variable count, both after-side curves fall toward a constant as the
+fixed per-prompt overhead amortises — which is the O(N²) → O(N) result.
+The `OSC-only` arms move only 6.3 → 8.0 ms (fish) and 5.7 → 7.2 ms (nu)
+across the same 4× sweep, so the subtraction is not hiding the growth.
+
+Quadratic growth is milder than 4× per doubling on the before side
+because at 60 variables both scripts are dominated by fixed per-variable
+interpreter work — six fish builtin invocations per variable, a record
+rebuild per variable in nu — rather than by the scan itself. That is
+also why the 60-variable win is larger than the diff asymptotics alone
+predict: the rewrite removes per-variable work as well as the scan.
+
 ### Result: session startup cost
 
 Time from spawn to first prompt, and process creations over the same

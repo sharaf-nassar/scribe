@@ -420,8 +420,9 @@ mod tests {
     /// and concatenating that is a cartesian product that collapses the
     /// accumulator, so fish dropped `--added-json` from the argv
     /// entirely and the server recorded an empty baseline. A list-valued
-    /// export (`PATH` and friends) likewise desynchronised the parallel
-    /// name/value snapshot lists and paired names with foreign values.
+    /// export (`PATH` and friends) is the other silent one: an unquoted
+    /// indirect read expands it to one element per component, so the
+    /// recorded value stops being what a child process receives.
     #[test]
     fn fish_env_payload_survives_empty_and_list_values() {
         let body = format!(
@@ -487,7 +488,9 @@ mod tests {
     /// from the name, so `set --path` and `set --unpath` are pinned
     /// alongside the real `PATH`, which is compared against what a child
     /// process actually received and then fed back through fish's own
-    /// `set -gx` restore form.
+    /// `set -gx` restore form — read straight out of the diff cache,
+    /// which doubles as a check that `__scribe_envm_PATH` holds the
+    /// joined value rather than a re-split list.
     #[test]
     fn fish_env_snapshot_joins_path_variables_like_fish_exports() {
         let body = format!(
@@ -496,8 +499,7 @@ mod tests {
              set -gx SCRIBE_PROBE_PLAIN one two\n\
              set -gx SCRIBE_PROBE_CHILD_PATH (sh -c 'printf %s \"$PATH\"')\n\
              source '{}'\n\
-             set -l idx (contains -i -- PATH $__scribe_env_snap_names)\n\
-             set -gx PATH $__scribe_env_snap_values[$idx]\n\
+             set -gx PATH $__scribe_envm_PATH\n\
              set -gx SCRIBE_PROBE_RESTORED_COUNT (count $PATH)\n\
              set -gx SCRIBE_PROBE_RESTORED_PATH (sh -c 'printf %s \"$PATH\"')\n\
              set -gx --path SCRIBE_PROBE_PATHVAR /probe/one /probe/two /probe/three\n\
@@ -553,13 +555,15 @@ mod tests {
     /// unquoted: fish drops an argument entirely when the variable is a
     /// zero-element list, which is silent rather than a parse error. The
     /// payload now rides `printf`'s arguments into the helper's stdin, so
-    /// that is where the quoting has to hold.
+    /// that is where the quoting has to hold. The baseline and the
+    /// per-prompt delta share one emit site, so there is exactly one such
+    /// line and the two payloads cannot drift apart.
     #[test]
     fn fish_payload_interpolations_are_quoted() {
         let script = std::fs::read_to_string(fish_script()).expect("read fish integration");
         let emits: Vec<&str> =
             script.lines().filter(|line| line.trim_start().starts_with("printf '{")).collect();
-        assert_eq!(emits.len(), 2, "expected the baseline and delta emits, got {emits:?}");
+        assert_eq!(emits.len(), 1, "expected the one shared payload emit, got {emits:?}");
         for line in emits {
             assert!(
                 first_unquoted_interpolation(line).is_none(),
