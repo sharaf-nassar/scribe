@@ -180,6 +180,62 @@ fn inject_nushell(env: &mut HashMap<String, String>, scripts_dir: &Path) {
     }
 }
 
+/// Keeps shells that tests spawn from reaching the developer's desktop.
+///
+/// pwsh resolves a dot-sourced non-`.ps1` path as a native command, and
+/// .NET's shell-execute fallback then hands that path to a desktop opener,
+/// so a suite that merely asserts "pwsh applies nothing" was enough to pop
+/// a terminal window on the machine running `cargo test`. Sealed children
+/// lose their session handles and resolve every opener .NET is willing to
+/// run to a no-op stub instead.
+#[cfg(test)]
+pub mod desktop_isolation {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// The programs `System.Diagnostics.Process` will exec on Unix when
+    /// `UseShellExecute` is set, in the order it tries them.
+    const DESKTOP_OPENERS: [&str; 3] = ["xdg-open", "gnome-open", "kfmclient"];
+
+    /// Scrubs the session handles a desktop opener needs, for probes that
+    /// have no scratch directory to stage stubs in.
+    pub fn scrub_desktop_env(command: &mut Command) {
+        command
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS");
+    }
+
+    /// Scrubs the session handles and puts no-op opener stubs, staged
+    /// under `scratch`, ahead of the inherited `PATH` so the shell still
+    /// finds its own tools further down.
+    pub fn seal_child(command: &mut Command, scratch: &Path) {
+        let stubs = stage_opener_stubs(scratch);
+        let path = match std::env::var_os("PATH") {
+            Some(inherited) => {
+                let mut entries = vec![stubs];
+                entries.extend(std::env::split_paths(&inherited));
+                std::env::join_paths(entries).expect("join stub PATH")
+            }
+            None => stubs.into_os_string(),
+        };
+        scrub_desktop_env(command.env("PATH", path));
+    }
+
+    fn stage_opener_stubs(scratch: &Path) -> PathBuf {
+        let bin = scratch.join("opener-stubs");
+        std::fs::create_dir_all(&bin).expect("create opener stub dir");
+        for opener in DESKTOP_OPENERS {
+            let stub = bin.join(opener);
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write opener stub");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod opener stub");
+        }
+        bin
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -187,6 +243,8 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::desktop_isolation::{scrub_desktop_env, seal_child};
 
     /// The shipped fish integration, read straight out of `dist/` so the
     /// test exercises the same bytes the installers copy.
@@ -215,7 +273,10 @@ mod tests {
     /// Returns `None` when fish is not installed; the shell scripts are
     /// only exercisable where their interpreter exists.
     fn record_fish_emits(body: &str) -> Option<Vec<Invocation>> {
-        if !Command::new("fish").arg("--version").output().is_ok_and(|out| out.status.success()) {
+        let mut probe = Command::new("fish");
+        probe.arg("--version");
+        scrub_desktop_env(&mut probe);
+        if !probe.output().is_ok_and(|out| out.status.success()) {
             return None;
         }
 
@@ -248,13 +309,14 @@ mod tests {
         )
         .expect("write driver");
 
-        let status = Command::new("fish")
+        let mut command = Command::new("fish");
+        command
             .arg("--no-config")
             .arg(&driver)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("run fish");
+            .stderr(std::process::Stdio::null());
+        seal_child(&mut command, &dir);
+        let status = command.status().expect("run fish");
         assert!(status.success(), "fish driver exited with {status}");
 
         let raw = std::fs::read(&record).unwrap_or_default();
