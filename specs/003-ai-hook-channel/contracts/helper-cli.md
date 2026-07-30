@@ -13,12 +13,44 @@ scribe-hook-helper
 
 The helper is invoked once per event. It always exits with status 0. It never writes to stdout or stderr.
 
+## Payload transport
+
+Argv carries only fixed, non-secret selectors. Every value-bearing field — prompt text, task label, assistant message, env baseline/delta — travels as a JSON document on **stdin**, selected with `--payload-stdin`:
+
+```sh
+printf '%s' "$payload" | scribe-hook-helper --provider=… --event=… --payload-stdin
+```
+
+Two reasons, both from audit findings #42–#45:
+
+- `/proc/<pid>/cmdline` is world-readable, so a prompt or an exported secret passed as `--text=`/`--added-json=` was visible to every local account for the lifetime of the process.
+- A single argument cannot exceed `MAX_ARG_STRLEN` (128 KiB on Linux). An oversized payload made `execve` fail with `E2BIG`, and because the caller ignores the exit status the whole event vanished with no diagnostic. Measured before/after numbers are in `specs/017-audit-findings-triage/baselines.md`.
+
+Accepted keys, all optional, unknown keys ignored:
+
+| Key | Replaces |
+|---|---|
+| `state` | `--state` |
+| `conversation_id` | `--conversation-id` |
+| `text` | `--text` |
+| `label` | `--label` |
+| `fill_percent` | `--fill-percent` |
+| `last_message` | `--last-message-file` |
+| `added` (object) | `--added-json` |
+| `removed` (array) | `--removed-json` |
+| `baseline_ready` (bool) | `--baseline-ready` |
+
+The document is drained before any other check, so a caller writing more than a pipe buffer never blocks on a helper that has already decided to bail. It is capped at 8 MiB (an order of magnitude above the server's 512 KiB per-terminal env cap, far below the 64 MiB IPC frame limit) and at 5 s of read time; exceeding either drops the event silently.
+
+**Dual accept.** A field the document omits falls back to its `--flag` counterpart, and the pre-transport flags stay accepted for one release. Shells that were already running when the package upgraded still hold the old integration functions in memory and go on calling the argv contract until they restart.
+
 ## Common flags
 
 | Flag | Required | Notes |
 |---|---|---|
 | `--provider=<id>` | yes | One of `AiProvider::id()` values: `claude_code`, `codex_code`. Mapped to `AiProvider` via `AiProvider::from_id` (`ai_state.rs:39`). Unknown value → exit 0 silently. |
 | `--event=<id>` | yes | Determines which `HookEventKind` variant to build. See per-event flags below. Unknown value → exit 0 silently. |
+| `--payload-stdin` | no | Read the event's value-bearing fields from the stdin JSON document instead of argv. |
 
 ## Per-event flags
 
@@ -46,7 +78,7 @@ The helper is invoked once per event. It always exits with status 0. It never wr
 | `--last-message-file` | yes | Path to a file containing the assistant's last-message text. The helper reads up to `LAST_MESSAGE_CAP_BYTES` (16 384) from it and discards the rest. File missing → exit 0 silently. |
 | `--conversation-id` | no | Same as above. |
 
-**Why a file path instead of a string arg**: the assistant's last message can be many KiB. Stdin is reserved for the hook event JSON (the AI tool writes to it; the adapter passes it through). Passing multi-KiB text via `--last-message=…` would hit `ARG_MAX` on long messages. The adapter writes the extracted text to a temp file (`mktemp`) and passes the path. The helper unlinks the file after reading (best-effort; missing-unlink is silent).
+**Superseded by the stdin transport**: the shipped adapters now send `{"last_message": …}` on stdin, so the message never lands on disk and no `mktemp` exec is spent. `--last-message-file` remains accepted for the dual-accept release; the helper still unlinks the file after reading (best-effort; missing-unlink is silent). The adapter reads the AI tool's own hook JSON off *its* stdin first, so the helper's stdin is free.
 
 ### `--event=state_cleared`
 
@@ -128,20 +160,20 @@ Each `dist/ai-hook-<provider>.sh` adapter follows this template:
 # Exit 0 unconditionally; never write to stdout/stderr.
 
 set +e
-PAYLOAD="$(python3 -c '<extract field>' 2>/dev/null)" || PAYLOAD=""
+PAYLOAD="$(python3 -c '<emit {"<field>": …} as JSON>' 2>/dev/null)" || PAYLOAD=""
 # … one or more extracts …
 
-exec /usr/share/scribe/scribe-hook-helper \
+printf '%s' "$PAYLOAD" | /usr/share/scribe/scribe-hook-helper \
     --provider=<provider_id> \
     --event=<event_id> \
-    --<field>="$PAYLOAD" \
+    --payload-stdin \
     2>/dev/null
 
 # Unreachable; exec replaces this process. But just in case:
 exit 0
 ```
 
-The `2>/dev/null` on the `exec` is a belt-and-braces guard. The Rust helper never writes to stderr in normal operation; the redirect handles the kernel's own error if `exec` itself fails (e.g. binary missing) and is one of the few cases where the helper isn't yet running.
+Events with no value-bearing field (`state_changed`, `task_label_cleared`, `context_changed`) keep the plain `exec … </dev/null` form. The `2>/dev/null` is a belt-and-braces guard. The Rust helper never writes to stderr in normal operation; the redirect handles the kernel's own error if `exec` itself fails (e.g. binary missing) and is one of the few cases where the helper isn't yet running.
 
 ## Versioning
 
@@ -158,6 +190,8 @@ The helper binary version follows the workspace version (set at build time via `
 | Missing required flag | exit 0 silently |
 | `--state` / `--fill-percent` malformed | exit 0 silently |
 | `--last-message-file` path missing | exit 0 silently |
+| `--payload-stdin` document malformed / non-UTF-8 / >8 MiB | exit 0 silently |
+| `--payload-stdin` writer wedged past 5 s | exit 0 silently |
 | Socket connect failed | exit 0 silently |
 | Socket write failed mid-frame | exit 0 silently |
 | Timeout (100 ms exceeded) | exit 0 silently |
@@ -170,4 +204,4 @@ Every failure mode produces the same observable behavior: exit 0, zero I/O on th
 
 - Unit tests in `crates/scribe-hook-helper/src/main.rs` cover: arg parsing, env-var gating, message construction. No I/O in unit tests.
 - Integration test in `crates/scribe-server/tests/hook_channel_roundtrip.rs` exec's the real helper binary (cargo bin lookup) against an in-process server.
-- Offline regression in `tests/install/ipc-hook-regressions.sh` replaces the real helper with a `/bin/sh` mock that echoes its args; asserts each adapter calls the helper with the expected flags.
+- `shell_integration.rs`'s `fish_env_payload_survives_empty_and_list_values` drives the shipped fish script under a stub helper that records both argv and stdin, asserting the payload arrives on stdin and no environment value reaches argv.

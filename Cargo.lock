@@ -6075,6 +6075,7 @@ version = "0.0.0-dev"
 dependencies = [
  "clap",
  "scribe-common",
+ "serde",
  "serde_json",
  "tokio",
 ]

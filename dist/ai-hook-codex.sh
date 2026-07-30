@@ -46,6 +46,36 @@ sys.stdout.write(v)
 ' "$1" 2>/dev/null
 }
 
+# Echo `{"<out_key>": <field>}` for the payload's `<in_key>` string field,
+# or nothing when it is absent, null, non-string, or empty.
+#
+# Value-bearing fields never become arguments: /proc/<pid>/cmdline is
+# world-readable, and a single argument is capped at MAX_ARG_STRLEN
+# (128 KiB), which turned a long prompt into a silent E2BIG. Only the two
+# fixed key names reach python's argv. This replaces an extract_field call
+# rather than adding one, so the interpreter count per event is unchanged.
+payload_field() {
+    printf '%s' "$PAYLOAD" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+v = d.get(sys.argv[1])
+if not isinstance(v, str) or not v:
+    sys.exit(0)
+sys.stdout.write(json.dumps({sys.argv[2]: v}))
+' "$1" "$2" 2>/dev/null
+}
+
+# Send one helper event with its payload document on stdin.
+emit_payload() {
+    payload="$1"
+    shift
+    printf '%s' "$payload" 2>/dev/null \
+        | "$HELPER" "$@" --payload-stdin >/dev/null 2>&1
+}
+
 case "$EVENT_NAME" in
     session_start)
         # New Codex session: clear task label, then emit idle_prompt.
@@ -67,7 +97,7 @@ case "$EVENT_NAME" in
         # task label from the prompt's first non-empty line (skipping slash
         # commands).
         SID=$(extract_field session_id)
-        PROMPT=$(extract_field prompt)
+        PROMPT_PAYLOAD=$(payload_field prompt text)
         if [ -n "$SID" ]; then
             "$HELPER" --provider=codex_code --event=state_changed \
                 --state=processing --conversation-id="$SID" \
@@ -77,18 +107,17 @@ case "$EVENT_NAME" in
                 --state=processing </dev/null >/dev/null 2>&1
         fi
 
-        if [ -n "$PROMPT" ]; then
+        if [ -n "$PROMPT_PAYLOAD" ]; then
             if [ -n "$SID" ]; then
-                "$HELPER" --provider=codex_code --event=prompt_received \
-                    --text="$PROMPT" --conversation-id="$SID" \
-                    </dev/null >/dev/null 2>&1
+                emit_payload "$PROMPT_PAYLOAD" --provider=codex_code \
+                    --event=prompt_received --conversation-id="$SID"
             else
-                "$HELPER" --provider=codex_code --event=prompt_received \
-                    --text="$PROMPT" </dev/null >/dev/null 2>&1
+                emit_payload "$PROMPT_PAYLOAD" --provider=codex_code \
+                    --event=prompt_received
             fi
         fi
 
-        LABEL=$(printf '%s' "$PAYLOAD" | python3 -c '
+        LABEL_PAYLOAD=$(printf '%s' "$PAYLOAD" | python3 -c '
 import json, re, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -109,12 +138,12 @@ normalized = "".join(ch if ch.isprintable() else " " for ch in first)
 normalized = normalized.replace(";", ",")
 normalized = re.sub(r"\s+", " ", normalized).strip()
 if normalized:
-    sys.stdout.write(normalized[:120])
-' 2>/dev/null) || LABEL=""
+    sys.stdout.write(json.dumps({"label": normalized[:120]}))
+' 2>/dev/null) || LABEL_PAYLOAD=""
 
-        if [ -n "$LABEL" ]; then
-            "$HELPER" --provider=codex_code --event=task_label_changed \
-                --label="$LABEL" </dev/null >/dev/null 2>&1
+        if [ -n "$LABEL_PAYLOAD" ]; then
+            emit_payload "$LABEL_PAYLOAD" --provider=codex_code \
+                --event=task_label_changed
         fi
         exit 0
         ;;
@@ -137,29 +166,30 @@ if normalized:
             --state=processing </dev/null >/dev/null 2>&1
         ;;
     stop)
-        # Codex Stop: classify via session_stopped + last_message file.
-        # Helper unlinks the file on success; we clean up if exec fails.
-        TMPFILE=$(mktemp 2>/dev/null) || exit 0
-        printf '%s' "$PAYLOAD" | python3 -c '
+        # Codex Stop: classify via session_stopped + last_message. The
+        # message can be many KiB and is model output the user has not seen
+        # classified yet; it streams to the helper on stdin, so it neither
+        # lands on disk (the old mktemp hand-off) nor in argv, and the
+        # mktemp exec disappears with it.
+        STOP_PAYLOAD=$(printf '%s' "$PAYLOAD" | python3 -c '
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
 except Exception:
-    sys.exit(0)
+    d = {}
 msg = d.get("last_assistant_message")
-if not isinstance(msg, str):
-    sys.exit(0)
-sys.stdout.write(msg)
-' > "$TMPFILE" 2>/dev/null
+sys.stdout.write(json.dumps({"last_message": msg if isinstance(msg, str) else ""}))
+' 2>/dev/null) || STOP_PAYLOAD=""
+        # No python3, or it died mid-write: still emit, so Stop keeps
+        # classifying exactly as it did when the temp file came back empty.
+        [ -n "$STOP_PAYLOAD" ] || STOP_PAYLOAD='{"last_message":""}'
         SID=$(extract_field session_id)
         if [ -n "$SID" ]; then
-            "$HELPER" --provider=codex_code --event=session_stopped \
-                --last-message-file="$TMPFILE" --conversation-id="$SID" \
-                </dev/null >/dev/null 2>&1 || rm -f "$TMPFILE"
+            emit_payload "$STOP_PAYLOAD" --provider=codex_code \
+                --event=session_stopped --conversation-id="$SID"
         else
-            "$HELPER" --provider=codex_code --event=session_stopped \
-                --last-message-file="$TMPFILE" \
-                </dev/null >/dev/null 2>&1 || rm -f "$TMPFILE"
+            emit_payload "$STOP_PAYLOAD" --provider=codex_code \
+                --event=session_stopped
         fi
         exit 0
         ;;

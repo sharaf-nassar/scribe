@@ -192,6 +192,11 @@ trap '__scribe_emit_ai_launch "$_"' DEBUG
 # All helper invocations fail open: stdout/stderr redirected, exit code
 # ignored. If scribe-hook-helper is missing or the env-store feature is off
 # server-side, the terminal stays fully usable.
+#
+# Both emits hand the JSON payload to the helper on stdin. argv is
+# world-readable through /proc/<pid>/cmdline and one argument cannot exceed
+# MAX_ARG_STRLEN (128 KiB), so the previous --added-json= form both exposed
+# every exported value and silently dropped large environments.
 # ---------------------------------------------------------------------------
 
 # Source restore-delta file (FR-008: applied AFTER rc has run).
@@ -340,9 +345,14 @@ __scribe_emit_env_delta() {
 		return 0
 	fi
 
-	"${SCRIBE_HOOK_HELPER:-scribe-hook-helper}" --provider=system --event=env_delta \
-		--added-json="$added" --removed-json="$removed" \
-		</dev/null >/dev/null 2>&1 || true
+	# The payload goes over stdin, never argv: /proc/<pid>/cmdline is
+	# world-readable, and a single argument is capped at MAX_ARG_STRLEN
+	# (128 KiB), which turned a large delta into a silent E2BIG.
+	# `%s` copies each argument verbatim, so backslashes and percent
+	# signs inside the JSON survive untouched.
+	printf '{"added":%s,"removed":%s}' "$added" "$removed" 2>/dev/null \
+		| "${SCRIBE_HOOK_HELPER:-scribe-hook-helper}" --provider=system \
+			--event=env_delta --payload-stdin >/dev/null 2>&1 || true
 
 	# Update the cache to the just-emitted state.
 	__scribe_env_last=()
@@ -358,9 +368,10 @@ __scribe_emit_env_baseline() {
 	__scribe_snapshot_env __scribe_env_last
 	local added
 	added=$(__scribe_build_added_json __scribe_env_last)
-	"${SCRIBE_HOOK_HELPER:-scribe-hook-helper}" --provider=system --event=env_delta \
-		--added-json="$added" --removed-json='[]' --baseline-ready \
-		</dev/null >/dev/null 2>&1 || true
+	printf '{"added":%s,"removed":[]}' "$added" 2>/dev/null \
+		| "${SCRIBE_HOOK_HELPER:-scribe-hook-helper}" --provider=system \
+			--event=env_delta --payload-stdin --baseline-ready \
+			>/dev/null 2>&1 || true
 }
 
 __scribe_emit_env_baseline

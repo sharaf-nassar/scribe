@@ -1317,6 +1317,83 @@ So ~1.0 ms of the helper's cost is process start and clap parsing and
 only ~0.15 ms is the actual IPC — the relevant number for #26 (helper
 resolution and packaging) and #42-#45 (payload transport off argv).
 
+#### After side: payload transport off argv (bead `scribe-i79.44`)
+
+Both halves of US5 measured on the shipped scripts, before side at the
+merge base and after side with the same rig. The rig replaces
+`SCRIBE_HOOK_HELPER` with a stub that copies its own
+`/proc/<pid>/cmdline` and its stdin to disk, or points it at the real
+release helper with a Unix-socket sink that records each
+length-prefixed frame. Absolute byte counts are not comparable to the
+`--added-json=` table above — that one used the 60-variable padded
+environment, this one uses the driver's throwaway `HOME` — so read the
+before/after pairs, not the magnitudes.
+
+**US5-1, no secrets in argv.** A `SCRIBE_PROBE_SECRET` export, baseline
+emit, one PTY-driven shell start each:
+
+| shell | argv payload bytes before | argv payload bytes after | stdin bytes after |
+| --- | ---: | ---: | ---: |
+| bash | 6,467 | 0 | 6,474 |
+| zsh | 6,535 | 0 | 6,542 |
+| fish | 6,441 | 0 | 6,448 |
+| nu | 7,455 | 0 | 7,324 |
+| pwsh | 6,825 | 0 | 6,833 |
+
+`secret_in_argv` is true for all five before and false for all five
+after; argv is now four or five fixed tokens (`--provider=system`,
+`--event=env_delta`, `--payload-stdin`, and `--baseline-ready` on the
+one-shot emit). The Codex `task_label_changed` emit was the adapter's
+equivalent exposure — the label is derived from the prompt's first line
+— and it moves to stdin the same way.
+
+**US5-2, no silent E2BIG loss.** Same rig with the environment padded by
+120 exports of 1,500 bytes, which puts the baseline document at ~185 KiB
+— past `MAX_ARG_STRLEN` (128 KiB) but with every individual value well
+under it, so the shell itself still execs. Frames counted at the socket
+sink, real release helper:
+
+| shell | baseline frames before | baseline frames after | frame bytes after |
+| --- | ---: | ---: | ---: |
+| bash | 0 | 1 | 189,245 |
+| zsh | 0 | 1 | 189,306 |
+| fish | 0 | 1 | 189,216 |
+| nu | 0 | 1 | 190,018 |
+| pwsh | 0 | 1 | 189,599 |
+
+Every after-side frame carries all 120 padded names and the probe
+secret. Before the change not one of the five delivered anything: the
+emit's `execve` failed with `E2BIG` and the caller discards the exit
+status by design, so the loss was completely silent. fish's small
+per-prompt delta (140 bytes) was the only thing that got through, which
+is exactly why the failure went unnoticed — the feature looked alive.
+
+The adapters fail the same way: with a 200 KiB `prompt`, the before-side
+`ai-hook-claude.sh user_prompt_submit` delivered its `state_changed`
+event and dropped `prompt_received` entirely, and `ai-hook-codex.sh` did
+the same. After, both deliver, with 200,043 bytes on stdin.
+
+**Exec composition.** Measured with the helper resolved as a sibling of
+the adapter (so `dirname` still runs), small payload:
+
+| adapter | invocation | execve before | execve after |
+| --- | --- | ---: | ---: |
+| claude | `user_prompt_submit` | 7 | 7 |
+| claude | `stop` | 7 | 6 |
+| codex | `user_prompt_submit` | 9 | 9 |
+| codex | `stop` | 7 | 6 |
+| codex | `tool_processing` | 4 | 4 |
+| codex | `session_start` | 6 | 6 |
+| codex | `permission_request` | 5 | 5 |
+
+`python3` and helper counts are unchanged everywhere: the payload
+builder replaces a field extraction rather than adding one, and the
+`printf` that feeds the pipe is a shell builtin. `stop` loses one exec
+in both adapters because the `mktemp` hand-off for
+`--last-message-file` is gone — the assistant's last message now streams
+to the helper and never touches disk. The `/usr/bin/mktemp` row in the
+Exec composition table above no longer applies.
+
 ### Measurement environment
 
 - Commit: `b90c932` (`chore(beads): record GPUI rebuild audit`).

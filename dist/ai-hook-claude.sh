@@ -52,6 +52,36 @@ sys.stdout.write(v)
 ' "$1" 2>/dev/null
 }
 
+# Echo `{"<out_key>": <field>}` for the payload's `<in_key>` string field,
+# or nothing when it is absent, null, non-string, or empty.
+#
+# Value-bearing fields never become arguments: /proc/<pid>/cmdline is
+# world-readable, and a single argument is capped at MAX_ARG_STRLEN
+# (128 KiB), which turned a long prompt into a silent E2BIG. Only the two
+# fixed key names reach python's argv. This replaces an extract_field call
+# rather than adding one, so the interpreter count per event is unchanged.
+payload_field() {
+    printf '%s' "$PAYLOAD" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+v = d.get(sys.argv[1])
+if not isinstance(v, str) or not v:
+    sys.exit(0)
+sys.stdout.write(json.dumps({sys.argv[2]: v}))
+' "$1" "$2" 2>/dev/null
+}
+
+# Send one helper event with its payload document on stdin.
+emit_payload() {
+    payload="$1"
+    shift
+    printf '%s' "$payload" 2>/dev/null \
+        | "$HELPER" "$@" --payload-stdin >/dev/null 2>&1
+}
+
 case "$EVENT_NAME" in
     permission_prompt)
         exec "$HELPER" --provider=claude_code --event=state_changed \
@@ -70,7 +100,7 @@ case "$EVENT_NAME" in
             --state=processing </dev/null >/dev/null 2>&1
         ;;
     user_prompt_submit)
-        PROMPT=$(extract_field prompt)
+        PROMPT_PAYLOAD=$(payload_field prompt text)
         SID=$(extract_field session_id)
         # Two events: state→processing, then prompt_received (if non-empty).
         if [ -n "$SID" ]; then
@@ -81,43 +111,41 @@ case "$EVENT_NAME" in
             "$HELPER" --provider=claude_code --event=state_changed \
                 --state=processing </dev/null >/dev/null 2>&1
         fi
-        if [ -n "$PROMPT" ]; then
+        if [ -n "$PROMPT_PAYLOAD" ]; then
             if [ -n "$SID" ]; then
-                "$HELPER" --provider=claude_code --event=prompt_received \
-                    --text="$PROMPT" --conversation-id="$SID" \
-                    </dev/null >/dev/null 2>&1
+                emit_payload "$PROMPT_PAYLOAD" --provider=claude_code \
+                    --event=prompt_received --conversation-id="$SID"
             else
-                "$HELPER" --provider=claude_code --event=prompt_received \
-                    --text="$PROMPT" </dev/null >/dev/null 2>&1
+                emit_payload "$PROMPT_PAYLOAD" --provider=claude_code \
+                    --event=prompt_received
             fi
         fi
         exit 0
         ;;
     stop)
-        # last_assistant_message can be many KiB — pass via temp file to
-        # avoid ARG_MAX. The helper unlinks the file after a successful
-        # read; we clean up here if the helper fails to exec.
-        TMPFILE=$(mktemp 2>/dev/null) || exit 0
-        printf '%s' "$PAYLOAD" | python3 -c '
+        # last_assistant_message can be many KiB and is model output the
+        # user has not seen classified yet. It streams to the helper on
+        # stdin, so it neither lands on disk (the old mktemp hand-off) nor
+        # in argv, and the mktemp exec disappears with it.
+        STOP_PAYLOAD=$(printf '%s' "$PAYLOAD" | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
-    sys.exit(0)
+    d = {}
 msg = d.get("last_assistant_message")
-if not isinstance(msg, str):
-    sys.exit(0)
-sys.stdout.write(msg)
-' > "$TMPFILE" 2>/dev/null
+sys.stdout.write(json.dumps({"last_message": msg if isinstance(msg, str) else ""}))
+' 2>/dev/null) || STOP_PAYLOAD=""
+        # No python3, or it died mid-write: still emit, so Stop keeps
+        # classifying exactly as it did when the temp file came back empty.
+        [ -n "$STOP_PAYLOAD" ] || STOP_PAYLOAD='{"last_message":""}'
         SID=$(extract_field session_id)
         if [ -n "$SID" ]; then
-            "$HELPER" --provider=claude_code --event=session_stopped \
-                --last-message-file="$TMPFILE" --conversation-id="$SID" \
-                </dev/null >/dev/null 2>&1 || rm -f "$TMPFILE"
+            emit_payload "$STOP_PAYLOAD" --provider=claude_code \
+                --event=session_stopped --conversation-id="$SID"
         else
-            "$HELPER" --provider=claude_code --event=session_stopped \
-                --last-message-file="$TMPFILE" \
-                </dev/null >/dev/null 2>&1 || rm -f "$TMPFILE"
+            emit_payload "$STOP_PAYLOAD" --provider=claude_code \
+                --event=session_stopped
         fi
         exit 0
         ;;
