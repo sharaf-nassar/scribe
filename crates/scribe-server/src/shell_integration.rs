@@ -384,6 +384,78 @@ mod tests {
         );
     }
 
+    /// A snapshot value is only usable as a restore value if it carries
+    /// the separator fish itself hands a child process — a colon for a
+    /// path variable, a space for every other list. The double-quoted
+    /// indirect read the snapshot uses is the only expansion form that
+    /// reproduces both, so this pins it against a rewrite to an explicit
+    /// space join, which would record `PATH` as `a b c` and restore it as
+    /// one entry that breaks command lookup. Path-ness is not derivable
+    /// from the name, so `set --path` and `set --unpath` are pinned
+    /// alongside the real `PATH`, which is compared against what a child
+    /// process actually received and then fed back through fish's own
+    /// `set -gx` restore form.
+    #[test]
+    fn fish_env_snapshot_joins_path_variables_like_fish_exports() {
+        let body = format!(
+            "set -gx --path SCRIBE_PROBE_PATHVAR /probe/one /probe/two\n\
+             set -gx --unpath SCRIBE_PROBE_FAKEPATH a b\n\
+             set -gx SCRIBE_PROBE_PLAIN one two\n\
+             set -gx SCRIBE_PROBE_CHILD_PATH (sh -c 'printf %s \"$PATH\"')\n\
+             source '{}'\n\
+             set -l idx (contains -i -- PATH $__scribe_env_snap_names)\n\
+             set -gx PATH $__scribe_env_snap_values[$idx]\n\
+             set -gx SCRIBE_PROBE_RESTORED_COUNT (count $PATH)\n\
+             set -gx SCRIBE_PROBE_RESTORED_PATH (sh -c 'printf %s \"$PATH\"')\n\
+             set -gx --path SCRIBE_PROBE_PATHVAR /probe/one /probe/two /probe/three\n\
+             emit fish_prompt\n",
+            fish_script().display(),
+        );
+        let Some(calls) = record_fish_emits(&body) else {
+            return;
+        };
+
+        let (baseline, deltas): (Vec<_>, Vec<_>) =
+            calls.iter().partition(|call| call.iter().any(|arg| arg == "--baseline-ready"));
+        assert_eq!(baseline.len(), 1, "expected one baseline emit, got {calls:?}");
+
+        let base = added_object(baseline[0]);
+        assert_eq!(
+            base.get("SCRIBE_PROBE_PATHVAR").map(String::as_str),
+            Some("/probe/one:/probe/two")
+        );
+        assert_eq!(base.get("SCRIBE_PROBE_FAKEPATH").map(String::as_str), Some("a b"));
+        assert_eq!(base.get("SCRIBE_PROBE_PLAIN").map(String::as_str), Some("one two"));
+        let child_path = base.get("SCRIBE_PROBE_CHILD_PATH").expect("child PATH probe missing");
+        assert!(child_path.contains(':'), "test PATH has nothing to join: {child_path}");
+        assert_eq!(base.get("PATH"), Some(child_path), "baseline PATH is not what a child sees");
+
+        // Restoring the recorded value the way `render_fish_restore`
+        // writes it back leaves the session with the same PATH: fish
+        // re-splits a path variable on the colon, so the list keeps its
+        // entries and the delta reports no change to PATH at all. A
+        // space-joined record instead restores as a single entry, and
+        // the driver's own `sh` lookups stop resolving.
+        assert_eq!(deltas.len(), 1, "expected one per-prompt delta emit, got {calls:?}");
+        let delta = added_object(deltas[0]);
+        assert_eq!(
+            delta.get("SCRIBE_PROBE_RESTORED_PATH"),
+            Some(child_path),
+            "restoring the recorded PATH changed what a child sees"
+        );
+        let restored_count: usize = delta
+            .get("SCRIBE_PROBE_RESTORED_COUNT")
+            .expect("restored PATH element count missing")
+            .parse()
+            .expect("element count is not a number");
+        assert!(restored_count > 1, "restored PATH collapsed to {restored_count} entry");
+        assert!(!delta.contains_key("PATH"), "PATH did not round-trip unchanged: {delta:?}");
+        assert_eq!(
+            delta.get("SCRIBE_PROBE_PATHVAR").map(String::as_str),
+            Some("/probe/one:/probe/two:/probe/three")
+        );
+    }
+
     /// Even a well-formed payload is lost if the argument is unquoted:
     /// fish drops `--added-json=$added` from the argv when `$added` is a
     /// zero-element list, which is silent rather than a parse error.
