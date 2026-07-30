@@ -34,7 +34,7 @@ New subcommand:
 ```bash
 scribe-hook-helper \
   --provider=system \
-  --event=env-delta \
+  --event=env_delta \
   --added-json='{"NAME":"value","OTHER":"value2"}' \
   --removed-json='["UNSET_NAME"]' \
   [--baseline-ready]
