@@ -191,6 +191,88 @@ The whole critical section runs under the `Term` mutex the PTY reader
 needs for `feed_term`, so at 200x50 a 10-character query holds that lock
 for ~0.5 s of the session's own output path.
 
+#### After side: search scan outside the Term lock (bead `scribe-i79.47`)
+
+Measured on 2026-07-30 at worktree base `c5a92b2`. `handle_search_request`
+now takes the snapshot under the guard, drops it, and runs
+`search_snapshot` on the owned `ScreenSnapshot`, so the scan leaves the
+critical section entirely.
+
+The measurement mutex was unavailable — a stale lock directory from
+2026-07-29 20:10 was still present and sibling Wave 1 builds kept the
+host at load 27-33 of 64 cores throughout — so absolute times here are
+not comparable to the quiet-host before side (the 120x36 snapshot costs
+27.3 ms against the before side's 10.3 ms; the 200x50 snapshot, 42.0 ms
+against 40.5 ms, does reproduce). Both variants therefore run in one
+process against the same fixture, with the `before` rows re-running the
+pre-fix body as a paired control. Five rounds per cell, medians reported.
+Both variants are asserted to produce identical match coordinates for
+every prefix, so the reordering is behaviour-preserving by construction.
+
+Uncontended split of the critical section, 10-keystroke query
+`connection`, `limit = 256`:
+
+| geometry | variant | lock hold ms (mean/median) | snapshot ms | scan ms | 10-key lock hold ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 120x36 | before (paired control) | 33.45 / 34.64 | 27.28 / 27.61 | 6.17 / 7.46 | 337.5 |
+| 120x36 | after | 26.66 / 26.78 | 26.66 / 26.78 | 6.07 / 7.35 | 276.3 |
+| 200x50 | before (paired control) | 52.13 / 54.14 | 41.95 / 42.55 | 10.18 / 11.91 | 543.8 |
+| 200x50 | after | 40.84 / 40.13 | 40.84 / 40.13 | 9.77 / 11.58 | 401.9 |
+
+The scan is gone from the hold and nothing else moved: per keystroke the
+lock hold drops 22.7% at 120x36 and 25.9% at 200x50, exactly the scan's
+share, and the scan itself costs the same off the lock as on it. A
+10-character query stops holding the `Term` for 61 ms (120x36) and
+142 ms (200x50) of what it held before.
+
+Contended rig — the claim the fix is actually about. A PTY-reader-shaped
+task feeds one full-width row through `Processor::advance` into the same
+`Arc<Mutex<Term>>` on a 1 ms cadence while the 10-keystroke query runs
+beside it on a 4-worker runtime:
+
+| geometry | variant | reader feeds | reader wait sum ms | wait max ms | wait p95 ms | query wall ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 120x36 | before (paired control) | 46 | 340.1 | 38.46 | 37.27 | 384.4 |
+| 120x36 | after | 78 | 273.5 | 29.84 | 27.87 | 385.8 |
+| 200x50 | before (paired control) | 54 | 501.4 | 58.02 | 54.13 | 563.8 |
+| 200x50 | after | 110 | 424.2 | 46.68 | 42.55 | 604.3 |
+
+The reader gets through 70% (120x36) and 104% (200x50) more feeds during
+the same query, and its worst single stall drops from a full
+snapshot-plus-scan to a snapshot. Reader wait p50 is 0.000 ms in every
+row: the mutex is uncontended except at the keystrokes, which is what
+makes the max and p95 columns readable as "one critical section".
+
+The 200x50 `after` query wall grows 563.8 → 604.3 ms, and that is the
+deliberate trade rather than a regression: `tokio::sync::Mutex` is FIFO,
+so once the searcher releases the guard between keystrokes it queues
+behind the reader it used to starve. Its own hold sum still falls
+507.6 → 434.9 ms; the extra ~170 ms is time it spends waiting instead of
+blocking the session's output path.
+
+What this item does **not** fix is the residual: the snapshot still runs
+under the lock, still allocates 27.6 MiB (120x36) or 46.0 MiB (200x50)
+per keystroke in 3 allocations, and still does so once per query edit —
+`snapshot_term` is untouched. That residual is US8-2's (150 ms client
+debounce plus one snapshot reused across edits while the overlay is
+open), and after it lands the per-query hold should be one snapshot
+rather than ten.
+
+Reproducing: same shape as the re-run recipe below. Add a throwaway
+`crates/scribe-server/src/measure_i7947.rs` and declare it from the
+bottom of `ipc_server.rs` as
+`#[cfg(test)] #[path = "measure_i7947.rs"] mod measure_i7947;`, so the
+private `search_snapshot` is reachable through `super`. It needs a
+file-level `#![allow(...)]` for `clippy::unwrap_used` and the numeric
+casts, and it writes its tables to `$MEASURE_I7947_OUT` rather than
+stdout so no print lint has to be suppressed. It holds a `Dimensions`
+fixture at `cols x rows` with `total_lines = rows + 10 000`, the
+three-SGR-run build-log generator planting the needle every 40 lines,
+and both handler bodies behind one `Variant` enum. Run it with
+`CARGO_BUILD_JOBS=12 cargo test --release -p scribe-server --lib measure_i7947 -- --test-threads=1`,
+then delete the file before committing so the lint-suppression gate stays
+clean.
+
 ### Result: inline replay build and attach fan-out
 
 `take_session_replay` runs `snapshot_term` + `build_session_replay`
