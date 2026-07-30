@@ -582,6 +582,45 @@ prompt, **2.1 ms** per zsh prompt, **17.3 ms and 2 forks/execs** per fish
 prompt, and **0 ms** on nu and pwsh only because their integrations are
 broken (D1, D2).
 
+#### After side: pwsh prompt repaired (bead `scribe-i79.50`)
+
+D2 is fixed: `__Scribe-EmitContext` no longer assigns the read-only
+`$host`, so the pwsh prompt runs to completion and every prompt now emits
+OSC 133;D, OSC 7, `1337;ScribeContext`, `1337;CodexTaskLabelCleared`,
+OSC 2 and OSC 133;A with an empty `$Error`, keeps the user's own prompt
+text, and reaches `__Scribe-EmitEnvDelta`. The row is re-measured with
+the same rig; the `b90c932` row is re-run alongside it in the same
+session so the two are directly comparable.
+
+| pwsh 7.6.4 | enabled ms | disabled ms | spawns | execs | OSC-only ms | no-integration ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| before (`b90c932`, as recorded) | 2.93 | 2.51 | 0 | 0 | 2.54 | 1.25 |
+| before (control re-run) | 2.58 | 3.02 | 0 | 0 | 2.56 | 1.02 |
+| after (repaired) | 3.70 | 3.76 | 0 | 0 | 3.05 | 1.02 |
+
+The prompt got **~1.1 ms more expensive because it now does its job** —
+the four marks the exception used to skip cost ~0.5 ms (`OSC-only` moves
+2.56 → 3.05) and reaching the env-delta call costs another ~0.65 ms
+(`enabled` − `OSC-only`). That 0.65 ms is the real pwsh figure for the
+"env-delta machinery alone" sentence above, which previously read 0 ms
+only because the prompt died first.
+
+`enabled` and `disabled` stay equal, so the finding that motivates US4-5
+now holds on pwsh for the ordinary reason (no shell-visible persistence
+gate) rather than because the prompt threw. Spawns and execs stay 0 —
+the snapshot is `[Environment]::GetEnvironmentVariables` and a no-op
+prompt yields an empty diff, so the helper is still never forked
+per-prompt. Socket connections remain 0 in every arm: D3 is unchanged, so
+even the one-shot baseline emit is rejected at clap parse.
+
+The measurement mutex was not available — sibling Wave 1 builds held the
+box at load average 12-22 throughout — which is why the control row is
+re-run rather than compared against the recorded `b90c932` row. Every
+figure is the median of two full passes of 3 differenced pairs each; the
+`OSC-only` and `no-integration` controls land within 1% and 18% of their
+recorded values respectively, so the ~1.1 ms repair cost is well outside
+the noise.
+
 ### Result: session startup cost
 
 Time from spawn to first prompt, and process creations over the same
@@ -619,7 +658,9 @@ than twice per character.
 - **nu — 0 forks.** Scribe's script never loads (D1); the figure is
   nushell's own prompt.
 - **pwsh — 0 forks.** The prompt function throws before the env-delta
-  call (D2); with that repaired the per-prompt cost is 3.95 ms.
+  call (D2); with that repaired the per-prompt cost is 3.95 ms. Repaired
+  by `scribe-i79.50` and re-measured at 3.70 ms — see the after-side
+  table above.
 
 ### Defects found while measuring
 
@@ -641,7 +682,11 @@ Wave 1 acceptance criterion unverifiable as written.
   and OSC 7, so OSC 1337 `ScribeContext`, `CodexTaskLabelCleared`, the
   OSC 2 title and OSC 133;A are never emitted, PowerShell falls back to
   its `PS>` prompt, and `__Scribe-EmitEnvDelta` (called by the wrapper
-  after the inner prompt returns) never runs.
+  after the inner prompt returns) never runs. **Fixed by
+  `scribe-i79.50`** — the local is now `$hostName`; before the fix the
+  two `ScribeContext` payloads that did escape carried
+  `host=System.Management.Automation.Internal.Host.InternalHost`, the
+  stringified automatic `$host` object.
 - **D3 — `--event=env-delta` is rejected by the helper in all five
   scripts.** `EventKind` in `crates/scribe-hook-helper/src/main.rs`
   carries `#[clap(rename_all = "snake_case")]`, so the accepted value is
@@ -749,3 +794,16 @@ code). Re-create it as follows; every number above comes from it.
    numbers by tens of percent (the syscall counts are load-independent).
 7. To reproduce the OSC-only column, copy `dist/shell-integration` and
    truncate all five scripts at their first `Env-delta capture` line.
+
+Two pwsh-specific traps, both hit while re-measuring for `scribe-i79.50`:
+
+- Do not write the N carriage returns as one burst. PSReadLine issues its
+  own `ESC[6n` between key reads and crashes ("Oops, something went
+  wrong") when it finds a queued `\r` where the CPR reply should be. Send
+  one `\r` per observed prompt marker, from the same loop that drains the
+  master fd, so the added latency is one read/scan/write turn and is
+  identical across arms.
+- `/snap/bin/pwsh` refuses to start under `strace` ("snap-confine is
+  packaged without necessary permissions ... cap_dac_override"). Drive
+  `/snap/powershell/current/opt/powershell/pwsh` directly instead — same
+  7.6.4 interpreter, no confinement wrapper.
