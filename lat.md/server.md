@@ -8,6 +8,16 @@ The server initializes in  by loading config, creating a SessionManager and Work
 
 It acquires the singleton lock via flock on `server.lock`. The main loop uses `tokio::select!` over the IPC accept loop, handoff listener, and Ctrl+C signal.
 
+### Local Admission
+
+Local-socket admission is charged in two stages against three independent semaphores, so no class of connection can starve another (spec 017 US5-5).
+
+[[crates/scribe-server/src/ipc_server.rs#start_ipc_server]] can only reserve a *pending* permit (`LOCAL_PENDING_CAP`, 64) when it accepts a stream, because a connection's class is unknowable until its first frame arrives; that permit is what bounds accepted-but-unclassified connections and the tasks they spawn. [[crates/scribe-server/src/ipc_server.rs#establish_client_window]] then exchanges it exactly once through [[crates/scribe-server/src/ipc_server.rs#LocalSlot#claim]]: a `Hello` — or a legacy no-`Hello` claim, still how `scribe-cli` connects — takes one of the 32 long-lived client slots (`MAX_CONNECTIONS`), and a one-shot transient action takes one of the 16 `MAX_TRANSIENT_CONNECTIONS` slots. The replacement permit is acquired before the pending one is released, so an exchange can never over-admit either pool. A full pool closes the connection, and the client pool logs the same "connection limit reached" refusal it always did.
+
+Splitting the pools is what makes a hook burst survivable. Hook events arrive as transient connections ([[server#Hook Channel#Ingress]]), so while they shared one 32-slot semaphore a burst could hold every client slot and lock new windows out of the server; the client pool is also the only local class whose output queue can grow large, so it still bounds per-connection memory. Which first frames count as transient is decided by [[crates/scribe-server/src/ipc_server.rs#is_transient_first_frame]] — exactly the arms that answer at most one frame and register nothing.
+
+A local first frame is read under `LOCAL_PRE_HELLO_TIMEOUT` (5 s). Every local caller writes immediately after connecting, so a still-silent connection is an abandoned or half-open dialer sitting on a pending slot; reads after the first frame stay untimed, since an idle window is legitimate. Remote transports keep their own caps and their own idle timeout — see [[server#Remote Control#Accept Path]].
+
 ### Upgrade Path
 
 When launched with `--upgrade`, the server restores handoff state and received file descriptors from the old instance instead of starting fresh.
@@ -368,7 +378,7 @@ Claude Code and Codex `UserPromptSubmit` adapters both emit `StateChanged { Proc
 
 ### Ingress
 
-The server dispatches `ClientMessage::HookEvent` on a transient connection (no `Hello`, no `Welcome`, no reply).
+The server dispatches `ClientMessage::HookEvent` on a transient connection (no `Hello`, no `Welcome`, no reply), charged to the separate 16-slot transient pool described in [[server#Startup#Local Admission]].
 
 The pattern mirrors `CheckForUpdates` / `ListReleases` at `ipc_server.rs` `establish_client_window`. `hook_ingress::handle` looks up the session in `LiveSessionRegistry`, translates the `HookEventKind` to a `MetadataEvent`, and forwards into  — the same downstream pipeline the deleted OSC parser used, unchanged.
 
@@ -572,7 +582,7 @@ The daemon is reached by a plain HTTP/1.1 request over its Unix socket on Linux,
 
 On accept the connection is registered against the 8-connection cap and given a sever channel; a refusal emits an audit line and closes the socket. An accepted connection then runs the SAME  dispatch as a local client, distinguished only by its writer being a `::Remote` (bounded queue) rather than `Local` (direct socket) and by carrying the resolved tailnet identity so the accepted and disconnect audit lines can name the peer.
 
-Admission is layered so a pre-auth peer cannot exhaust memory or slots (FR-013):  reserves a pending-handshake permit (`REMOTE_PENDING_HANDSHAKE_CAP`, 64) the instant it accepts — before spawning any handler or reading a byte, mirroring the local `MAX_CONNECTIONS` pattern — and `read_remote_preamble` caps the preamble frame at `REMOTE_PREAMBLE_MAX_BYTES` (~8 KiB, far below the shared 64 MiB frame cap) so an unauthorized peer can never force a giant allocation. The authorized-connection cap (`REMOTE_CONNECTION_CAP`, 8) is unchanged and still refuses `Busy` after authorization.
+Admission is layered so a pre-auth peer cannot exhaust memory or slots (FR-013):  reserves a pending-handshake permit (`REMOTE_PENDING_HANDSHAKE_CAP`, 64) the instant it accepts — before spawning any handler or reading a byte, the same shape the local pending pool uses ([[server#Startup#Local Admission]]) — and `read_remote_preamble` caps the preamble frame at `REMOTE_PREAMBLE_MAX_BYTES` (~8 KiB, far below the shared 64 MiB frame cap) so an unauthorized peer can never force a giant allocation. The authorized-connection cap (`REMOTE_CONNECTION_CAP`, 8) is unchanged and still refuses `Busy` after authorization.
 
 The disable race now returns a typed refusal:  is reserved BEFORE , so a connection that raced a live disable is refused `RemoteHandshakeReply { refusal: Disabled }` rather than told `accepted` and then silently dropped (FR-016). After acceptance  runs as a loop: an authorized connection may send a read-only `ListWindows` probe before its `Hello` (see ) and registers no window for it; every other non-`Hello` first frame still closes.
 
