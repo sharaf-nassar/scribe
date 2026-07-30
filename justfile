@@ -328,6 +328,7 @@ e2e-visual-ime:
 # Full functional E2E suite: build, containerise, run all tests
 e2e: build-release docker-func
     just e2e-func func/smoke.sh
+    just e2e-func func/session-exit-status.sh
     just e2e-func func/reconnect.sh
     just e2e-func func/workspace-split.sh
     just e2e-func func/shell-integration.sh

@@ -80,3 +80,21 @@ pub fn assert_exit(session_id: &str, code: i32, timeout_ms: u64) -> Result<(), T
         other => Err(TestError::InfraError(format!("unexpected response: {other:?}"))),
     }
 }
+
+/// Assert that a session's child was terminated by the expected signal.
+pub fn assert_signal(session_id: &str, signal: i32, timeout_ms: u64) -> Result<(), TestError> {
+    let id = SessionId::from_str(session_id)
+        .map_err(|e| TestError::InfraError(format!("invalid session id: {e}")))?;
+
+    let request =
+        DaemonRequest::AssertSignal { session_id: id, expected_signal: signal, timeout_ms };
+
+    let response = send_request(&request).map_err(|e| TestError::InfraError(e.to_string()))?;
+
+    match response {
+        DaemonResponse::Ok => Ok(()),
+        DaemonResponse::AssertFailed { message } => Err(TestError::TestFailure(message)),
+        DaemonResponse::Error { message } => Err(TestError::InfraError(message)),
+        other => Err(TestError::InfraError(format!("unexpected response: {other:?}"))),
+    }
+}

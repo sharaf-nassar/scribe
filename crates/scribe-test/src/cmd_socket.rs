@@ -68,6 +68,14 @@ pub enum DaemonRequest {
         expected_code: i32,
         timeout_ms: u64,
     },
+    /// Spec 017 US1-2: assert a session's child died on a specific signal,
+    /// which `AssertExit` cannot express — the wire keeps the terminating
+    /// signal in its own field rather than folding it into `exit_code`.
+    AssertSignal {
+        session_id: SessionId,
+        expected_signal: i32,
+        timeout_ms: u64,
+    },
     /// Compare the current screen against a reference snapshot (cell content,
     /// cursor position, cursor visibility).
     AssertSnapshotMatch {

@@ -44,7 +44,20 @@ const START_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 enum SessionStatus {
     Running,
-    Exited(Option<i32>),
+    Exited(ChildExit),
+}
+
+/// The wait status a `SessionExited` frame reported, plus how many such frames
+/// arrived (spec 017 US1-2).
+///
+/// The count is asserted, not just recorded: every exit path funnels through
+/// one compare-and-swap on the server, so a second frame for the same session
+/// is a real defect and the exit assertions fail on it.
+#[derive(Debug, Clone, Copy, Default)]
+struct ChildExit {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    frames: u32,
 }
 
 /// Per-session state buffered by the daemon.
@@ -425,8 +438,8 @@ async fn dispatch_session_message(
         ServerMessage::SessionCreated { session_id, workspace_id, shell_name } => {
             handle_session_created(session_id, workspace_id, &shell_name, state, notifiers).await;
         }
-        ServerMessage::SessionExited { session_id, exit_code } => {
-            handle_session_exited(session_id, exit_code, state, notifiers).await;
+        ServerMessage::SessionExited { session_id, exit_code, signal } => {
+            handle_session_exited(session_id, exit_code, signal, state, notifiers).await;
         }
         ServerMessage::SessionContextChanged { session_id, context } => {
             debug!(%session_id, ?context, "session context changed (ignored by test daemon)");
@@ -727,13 +740,18 @@ async fn handle_session_created(
 async fn handle_session_exited(
     session_id: SessionId,
     exit_code: Option<i32>,
+    signal: Option<i32>,
     state: &SharedState,
     notifiers: &Arc<WaitNotifiers>,
 ) {
-    info!(%session_id, ?exit_code, "session exited");
+    info!(%session_id, ?exit_code, ?signal, "session exited");
     let mut guard = state.lock().await;
     if let Some(session) = guard.sessions.get_mut(&session_id) {
-        session.status = SessionStatus::Exited(exit_code);
+        let frames = match session.status {
+            SessionStatus::Exited(previous) => previous.frames,
+            SessionStatus::Running => 0,
+        };
+        session.status = SessionStatus::Exited(ChildExit { exit_code, signal, frames: frames + 1 });
         drop(guard);
         notifiers.exit.notify_waiters();
     }
@@ -859,7 +877,24 @@ async fn process_request(
             handle_assert_cursor(session_id, row, col, state, server_writer).await
         }
         DaemonRequest::AssertExit { session_id, expected_code, timeout_ms } => {
-            handle_assert_exit(session_id, expected_code, timeout_ms, state, notifiers).await
+            handle_assert_exit(
+                session_id,
+                ExpectedExit::Code(expected_code),
+                timeout_ms,
+                state,
+                notifiers,
+            )
+            .await
+        }
+        DaemonRequest::AssertSignal { session_id, expected_signal, timeout_ms } => {
+            handle_assert_exit(
+                session_id,
+                ExpectedExit::Signal(expected_signal),
+                timeout_ms,
+                state,
+                notifiers,
+            )
+            .await
         }
         DaemonRequest::AssertSnapshotMatch { session_id, reference } => {
             handle_assert_snapshot_match(session_id, &reference, state, server_writer).await
@@ -1659,10 +1694,48 @@ async fn lookup_fresh_snapshot(
     if time.elapsed() < SNAPSHOT_CACHE_TTL { session.latest_snapshot.clone() } else { None }
 }
 
-/// Assert that a session exited with the expected code.
+/// What an exit assertion is waiting for: a normal exit status, or the signal
+/// that terminated the child.
+#[derive(Clone, Copy)]
+enum ExpectedExit {
+    Code(i32),
+    Signal(i32),
+}
+
+impl ExpectedExit {
+    /// Compare an observed wait status against this expectation, returning the
+    /// mismatch text when it does not hold.
+    fn mismatch(self, observed: ChildExit) -> Option<String> {
+        match self {
+            Self::Code(expected) => match (observed.exit_code, observed.signal) {
+                (Some(code), _) if code == expected => None,
+                (Some(code), _) => Some(format!("expected exit code {expected} but got {code}")),
+                (None, Some(signal)) => {
+                    Some(format!("expected exit code {expected} but child died on signal {signal}"))
+                }
+                (None, None) => {
+                    Some(format!("expected exit code {expected} but no wait status was reported"))
+                }
+            },
+            Self::Signal(expected) => match (observed.signal, observed.exit_code) {
+                (Some(signal), _) if signal == expected => None,
+                (Some(signal), _) => Some(format!("expected signal {expected} but got {signal}")),
+                (None, Some(code)) => {
+                    Some(format!("expected signal {expected} but child exited with code {code}"))
+                }
+                (None, None) => {
+                    Some(format!("expected signal {expected} but no wait status was reported"))
+                }
+            },
+        }
+    }
+}
+
+/// Assert that a session exited with the expected code or terminating signal,
+/// on exactly one `SessionExited` frame.
 async fn handle_assert_exit(
     session_id: SessionId,
-    expected_code: i32,
+    expected: ExpectedExit,
     timeout_ms: u64,
     state: &SharedState,
     notifiers: &Arc<WaitNotifiers>,
@@ -1673,18 +1746,19 @@ async fn handle_assert_exit(
     loop {
         let exit_status = check_exit_status(session_id, state).await;
         match exit_status {
-            Some(SessionStatus::Exited(code)) => {
-                return match code {
-                    Some(c) if c == expected_code => DaemonResponse::Ok,
-                    Some(c) => DaemonResponse::AssertFailed {
-                        message: format!("exit code: expected {expected_code} but got {c}"),
-                    },
-                    None => DaemonResponse::AssertFailed {
+            Some(SessionStatus::Exited(observed)) => {
+                if let Some(message) = expected.mismatch(observed) {
+                    return DaemonResponse::AssertFailed { message };
+                }
+                if observed.frames != 1 {
+                    return DaemonResponse::AssertFailed {
                         message: format!(
-                            "exit code: expected {expected_code} but session exited without code"
+                            "SessionExited fired {} times for {session_id}, expected exactly once",
+                            observed.frames
                         ),
-                    },
-                };
+                    };
+                }
+                return DaemonResponse::Ok;
             }
             Some(SessionStatus::Running) | None => {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

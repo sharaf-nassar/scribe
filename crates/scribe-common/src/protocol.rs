@@ -667,7 +667,17 @@ pub enum ServerMessage {
     },
     SessionExited {
         session_id: SessionId,
+        /// Exit status of a child that terminated normally. `None` when the
+        /// child was signalled, when the session was closed explicitly, and
+        /// for handoff-inherited sessions, whose child predates this server
+        /// process and carries no wait status it can observe.
         exit_code: Option<i32>,
+        /// Signal number that terminated the child, when it died on a signal.
+        /// Kept separate from `exit_code` rather than folded into it as a
+        /// negative value, so a status and a signal are never confusable.
+        /// Additive: older senders omit the key.
+        #[serde(default)]
+        signal: Option<i32>,
     },
     Bell {
         session_id: SessionId,

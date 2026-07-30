@@ -71,9 +71,11 @@ Blocking synchronization helpers: wait for regex output, CWD change, or terminal
 
 ## Assertions
 
-Verify screen cell content, cursor position, snapshot equality, and process exit code — returning `TestFailure` (exit 1) on mismatch.
+Verify screen cell content, cursor position, snapshot equality, and how a session's child died — returning `TestFailure` (exit 1) on mismatch.
 
  checks that a specific cell contains the expected character; on failure the daemon includes a 3×3 neighborhood context in the error message.  verifies the cursor is at the expected row/col.  loads a reference JSON snapshot and compares cell content, cursor position, and cursor visibility.  waits up to `timeout_ms` for the session to exit with the expected code.
+
+Exit assertions come in two shapes because the wire keeps a terminating signal in its own `SessionExited` field rather than folding it into `exit_code`: `assert-exit` matches the code, [[crates/scribe-test/src/assert.rs#assert_signal|assert-signal]] matches the signal number. Both also fail when more than one `SessionExited` arrived for the session — the server elects a single exit path per session through one compare-and-swap, so a second frame is a real defect rather than noise.
 
 ## Screen Capture
 
@@ -189,6 +191,8 @@ It cycles all five `AiState` variants without corrupting the grid, asserts a con
 Scripted lifecycle coverage proving the GPUI client survives detach, hot-reload, and full cold restart against a disposable test server — never the user's live server (the CLAUDE.md invariant), as the harness runs its own `scribe-test server`.
 
 In every script the `scribe-test` daemon is the client stand-in: `daemon stop` is the client going away and `daemon start` is a fresh client that must re-attach.  sends `Hello { window_id: None }` so  adopts the unconnected window-with-sessions, which is what makes every re-attach flow below possible.
+
+`tests/e2e/func/session-exit-status.sh` covers the child-exit watcher's reporting. It runs `exit 42` in one session and asserts the code arrives verbatim, then `exec`s a `sleep` over a second session's interactive shell — which ignores SIGTERM — and `kill -TERM`s the pid it printed, asserting a signal 15 termination rather than an exit code. A settle window and a re-assertion of both sessions prove no second `SessionExited` follows.
 
 `tests/e2e/func/reconnect.sh` covers plain detach/reattach: run a command, start a background job, `daemon stop`, `daemon start`, `session attach`, then assert fresh input works and the background job survived the disconnect. It also asserts the attach *replay* itself — one applied frame carrying the pre-detach marker, and a closing `replay assert-matches` proving the replayed view plus the output that followed it still equals the server's screen.
 

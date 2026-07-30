@@ -128,7 +128,9 @@ The `scribe-test` daemon implements that same receiving half rather than skippin
 
 ### Session Events
 
-`SessionCreated` confirms a new session with its workspace and shell basename. `SessionExited` reports a session's exit code. `Bell` forwards BEL characters, exactly one frame per BEL byte.
+`SessionCreated` confirms a new session with its workspace and shell basename. `SessionExited` reports how a session's child died. `Bell` forwards BEL characters, exactly one frame per BEL byte.
+
+`SessionExited` carries the wait status the server's child-exit watcher observed: `exit_code` for a normal exit, `signal` for a signal termination. They are separate additive fields rather than one overloaded number, so a `SIGKILL` is never mistaken for an exit status and an older sender that omits `signal` still decodes. Both are absent when no status could be observed — an explicit `CloseSession`/`CloseWindow`, or a handoff-inherited session whose child predates the running server process.
 
 ### Metadata
 
