@@ -6270,10 +6270,8 @@ async fn start_session(
     #[rustfmt::skip]
     let ManagedSession {
         slot, pty_fd, resize_fd, child_pid, child_pidfd, child_identity, term, ansi_processor,
-        osc_parser,
-        event_rx, shell_name, pty, handoff_snapshot, task_label, title, cwd,
-        context, ai_state, ai_provider_hint, cell_width, cell_height,
-        env_envelope_id, ..
+        osc_parser, event_rx, shell_name, pty, handoff_snapshot, task_label, title, cwd, context,
+        ai_state, ai_provider_hint, cell_width, cell_height, env_envelope_id, ..
     } = session;
     let (pty_read, pty_write) = tokio::io::split(pty_fd);
     let pty_write = Arc::new(Mutex::new(pty_write));

@@ -173,11 +173,16 @@ else
     set -g __scribe_hook_helper scribe-hook-helper
 end
 
-# Per-session "last emitted" snapshot stored as two parallel lists.
-# Fish has no associative arrays, so we use name/value lists indexed
-# in lockstep.
+# Per-session "last emitted" snapshot. Fish has no associative arrays,
+# but its own variable table is a hash, so the cache lives in
+# dynamically named globals: `__scribe_envm_<NAME>` holds the value last
+# emitted for NAME. Every lookup is then O(1), which is what keeps the
+# per-prompt diff O(N) — parallel name/value lists needed a `contains`
+# scan of the whole cache per variable, i.e. O(N^2) per prompt.
+#
+# `__scribe_env_last_names` is the list of names the map currently holds;
+# the removal sweep walks it, and the two are always updated together.
 set -g __scribe_env_last_names
-set -g __scribe_env_last_values
 
 # JSON-escape a single string for embedding in a JSON object/array
 # literal. Echoes the escaped form (no surrounding quotes). Only
@@ -212,18 +217,41 @@ function __scribe_json_escape
     printf '%s' (string sub -s 1 -e -1 -- "$s") | string collect --allow-empty
 end
 
-# Snapshot the current exported environment into two global lists:
-# __scribe_env_snap_names and __scribe_env_snap_values (parallel).
-# `set -nx` lists names of exported vars; `$$name` indirects the value.
-function __scribe_snapshot_env
-    set -g __scribe_env_snap_names
-    set -g __scribe_env_snap_values
-    for name in (set -nx)
-        # Skip empty names and scribe-internal markers.
-        switch $name
-            case '' '__scribe_*' '_SCRIBE_*'
-                continue
-        end
+# Names of the exported variables the delta tracks, in `set -nx` order.
+# Scribe's own markers are dropped, and so is any name fish cannot spell
+# as an identifier: indirect expansion stops at the first character
+# outside `[A-Za-z0-9_]`, so a `BASH_FUNC_x%%` inherited from bash reads
+# back as `%%` rather than as its value, and `set` refuses the same name
+# as a cache key outright. One `string match` call filters the whole
+# list, so the pass stays O(N) with a single builtin invocation.
+function __scribe_env_names
+    string match -r '^(?!__scribe_|_SCRIBE_)[A-Za-z0-9_]+$' -- (set -nx)
+end
+
+# Env-delta emit. One pass over the exported environment both diffs
+# against the cached map and refreshes it, then a removal sweep runs
+# only when the counts prove something is gone; the helper is skipped
+# when the diff comes out empty. Called with `--baseline` the map is
+# still empty, so the whole environment comes out as added and the emit
+# carries `--baseline-ready` even if that set is empty. Both entry
+# points share this one body, so the two payloads cannot drift apart in
+# escaping or quoting.
+#
+# Every interpolation is double-quoted so a stray zero- or multi-element
+# list can never turn a concatenation into a cartesian product that
+# drops or duplicates the payload.
+function __scribe_emit_env_delta --on-event fish_prompt
+    set -l baseline 0
+    if test "$argv[1]" = --baseline
+        set baseline 1
+    end
+
+    set -l names (__scribe_env_names)
+    set -l fresh_names
+    set -l added
+    set -l removed
+
+    for name in $names
         # Indirect read, double-quoted. A list-valued export otherwise
         # expands to one element per component and an empty export to
         # none; quoting collapses either to exactly one element. The
@@ -231,90 +259,55 @@ function __scribe_snapshot_env
         # separator: fish joins a quoted list on the variable's own
         # delimiter — a colon for a path variable, a space for anything
         # else — which is exactly what it hands a child process, so
-        # `PATH` is recorded as `a:b:c` and never as `a b c`. The two
-        # lists are indexed in lockstep, so appending anything but one
-        # value here shifts every later name onto a foreign value.
-        set -ga __scribe_env_snap_names $name
-        set -ga __scribe_env_snap_values "$$name"
-    end
-end
-
-# Build a JSON object literal `{"NAME":"value",...}` from the two
-# parallel lists $argv[1] (names) and $argv[2] (values). Fish can't
-# pass lists by reference, so we use indirect variable names.
-#
-# Every interpolation in the accumulator is double-quoted so a stray
-# zero- or multi-element list can never turn the concatenation into a
-# cartesian product that drops or duplicates the payload.
-function __scribe_build_added_json
-    set -l names_var $argv[1]
-    set -l values_var $argv[2]
-    set -l names $$names_var
-    set -l values $$values_var
-    set -l count (count $names)
-    set -l out '{'
-    set -l first 1
-    for i in (seq 1 $count)
-        set -l esc_name (__scribe_json_escape "$names[$i]")
-        set -l esc_value (__scribe_json_escape "$values[$i]")
-        if test $first -eq 1
-            set first 0
+        # `PATH` is recorded as `a:b:c` and never as `a b c`.
+        set -l value "$$name"
+        set -l key __scribe_envm_$name
+        if set -q $key
+            if test "$$key" = "$value"
+                continue
+            end
         else
-            set out "$out,"
+            set -a fresh_names $name
         end
-        set out "$out\"$esc_name\":\"$esc_value\""
+        # `--unpath` because fish makes any variable whose name ends in
+        # PATH a path variable, and the cache key inherits the tracked
+        # variable's name: without it `__scribe_envm_PATH` would re-split
+        # the recorded `a:b:c` into a list on every write.
+        set -g --unpath $key "$value"
+        set -l esc_name (__scribe_json_escape "$name")
+        set -l esc_value (__scribe_json_escape "$value")
+        set -a added "\"$esc_name\":\"$esc_value\""
     end
-    printf '%s' "$out}"
-end
 
-# Per-prompt env-delta emit. Skips the helper invocation when the diff
-# is empty.
-function __scribe_emit_env_delta --on-event fish_prompt
-    __scribe_snapshot_env
-
-    # Diff the current snapshot against the cached last-emitted. The
-    # changed pairs go to the shared builder through globals — a fish
-    # function cannot read its caller's locals — so the delta object and
-    # the baseline object cannot drift apart in escaping or quoting.
-    set -g __scribe_env_added_names
-    set -g __scribe_env_added_values
-    set -l removed '['
-    set -l first_removed 1
-    set -l now_count (count $__scribe_env_snap_names)
-    set -l last_count (count $__scribe_env_last_names)
-
-    for i in (seq 1 $now_count)
-        set -l name "$__scribe_env_snap_names[$i]"
-        set -l value "$__scribe_env_snap_values[$i]"
-        set -l prev_idx (contains -i -- $name $__scribe_env_last_names)
-        if test -n "$prev_idx"
-            and test "$__scribe_env_last_values[$prev_idx]" = "$value"
-            continue
-        end
-        set -ga __scribe_env_added_names "$name"
-        set -ga __scribe_env_added_values "$value"
-    end
-    set -l added (__scribe_build_added_json __scribe_env_added_names __scribe_env_added_values)
-
-    if test $last_count -gt 0
-        for i in (seq 1 $last_count)
-            set -l name "$__scribe_env_last_names[$i]"
-            if not contains -- $name $__scribe_env_snap_names
+    # The map holds an entry for exactly `__scribe_env_last_names`, so
+    # the names this pass found already in it — everything it saw minus
+    # the fresh ones — equals the cached count precisely when nothing
+    # was removed. An unchanged prompt therefore never walks the cached
+    # list at all, and the sweep itself tests membership in the variable
+    # table rather than scanning a list.
+    if test (math (count $names) - (count $fresh_names)) -lt (count $__scribe_env_last_names)
+        for name in $__scribe_env_last_names
+            if not set -q -x $name
                 set -l esc_name (__scribe_json_escape "$name")
-                if test $first_removed -eq 1
-                    set first_removed 0
-                else
-                    set removed "$removed,"
-                end
-                set removed "$removed\"$esc_name\""
+                set -a removed "\"$esc_name\""
+                set -e __scribe_envm_$name
             end
         end
     end
-    set removed "$removed]"
 
-    if test "$added" = '{}'
-        and test "$removed" = '[]'
+    set -g __scribe_env_last_names $names
+
+    if test $baseline -eq 0
+        and test (count $added) -eq 0
+        and test (count $removed) -eq 0
         return 0
+    end
+
+    set -l added_json (string join ',' -- $added)
+    set -l removed_json (string join ',' -- $removed)
+    set -l baseline_flag
+    if test $baseline -eq 1
+        set baseline_flag --baseline-ready
     end
 
     # The payload goes over stdin, never argv: /proc/<pid>/cmdline is
@@ -322,26 +315,11 @@ function __scribe_emit_env_delta --on-event fish_prompt
     # (128 KiB), which turned a large delta into a silent E2BIG. `%s`
     # copies each argument verbatim, so backslashes and percent signs
     # inside the JSON survive untouched.
-    printf '{"added":%s,"removed":%s}' "$added" "$removed" \
+    printf '{"added":{%s},"removed":[%s]}' "$added_json" "$removed_json" \
         | $__scribe_hook_helper --provider=system --event=env_delta \
-            --payload-stdin >/dev/null 2>&1
+            --payload-stdin $baseline_flag >/dev/null 2>&1
     or true
-
-    # Update the cache to the just-emitted state.
-    set -g __scribe_env_last_names $__scribe_env_snap_names
-    set -g __scribe_env_last_values $__scribe_env_snap_values
 end
 
 # One-shot baseline emit at the tail (post-rc + post-restore).
-function __scribe_emit_env_baseline
-    __scribe_snapshot_env
-    set -g __scribe_env_last_names $__scribe_env_snap_names
-    set -g __scribe_env_last_values $__scribe_env_snap_values
-    set -l added (__scribe_build_added_json __scribe_env_last_names __scribe_env_last_values)
-    printf '{"added":%s,"removed":[]}' "$added" \
-        | $__scribe_hook_helper --provider=system --event=env_delta \
-            --payload-stdin --baseline-ready >/dev/null 2>&1
-    or true
-end
-
-__scribe_emit_env_baseline
+__scribe_emit_env_delta --baseline

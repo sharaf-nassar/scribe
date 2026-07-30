@@ -203,14 +203,13 @@ def __scribe-env-string [value] {
     }
 }
 
-# Build a JSON object literal `{"NAME":"value",...}` from a record.
-def __scribe-build-object [rec: record] {
+# Build a JSON object literal `{"NAME":"value",...}` from a table of
+# already-stringified `{name, value}` pairs.
+def __scribe-build-object [pairs: list] {
     let entries = (
-        $rec
-        | columns
-        | each {|name|
-            let val_str = (__scribe-env-string ($rec | get $name))
-            $'"(__scribe-json-escape $name)":"(__scribe-json-escape $val_str)"'
+        $pairs
+        | each {|pair|
+            $'"(__scribe-json-escape $pair.name)":"(__scribe-json-escape $pair.value)"'
         }
     )
     $"{($entries | str join ',')}"
@@ -224,24 +223,60 @@ def __scribe-build-array [names: list<string>] {
     $"[($entries | str join ',')]"
 }
 
-# Snapshot the current $env as a record of strings. Skips scribe-
-# internal markers and the nushell-internal `config` record (which is
-# not an exported env var). `PATH` is represented as a list in
+# Snapshot the current $env as a table of `{name, value}` pairs. Skips
+# scribe-internal markers and the nushell-internal `config` record
+# (which is not an exported env var). `PATH` is represented as a list in
 # nushell; `__scribe-env-string` joins it back into the form other
 # processes see on POSIX inheritance.
+#
+# `items` walks the record once and hands each value straight to the
+# closure. The accumulating `reduce`/`upsert` this replaced rebuilt the
+# whole record per variable and read each value back out by name, so the
+# snapshot alone was O(N^2) before the diff even started.
 def __scribe-snapshot-env [] {
-    let names = ($env | columns)
-    $names
-    | reduce --fold {} {|name, acc|
+    $env
+    | items {|name, value|
         if (($name | str starts-with '_SCRIBE_') or ($name | str starts-with '__scribe_') or ($name == 'config') or ($name == 'ENV_CONVERSIONS') or ($name == '__SCRIBE_ENV_LAST')) {
-            $acc
+            null
         } else {
             # Best-effort string conversion; on any failure, treat as
             # empty rather than aborting the whole snapshot.
-            let val_str = (try { __scribe-env-string ($env | get $name) } catch { '' })
-            $acc | upsert $name $val_str
+            {name: $name, value: (try { __scribe-env-string $value } catch { '' })}
         }
     }
+    | compact
+}
+
+# Diff two snapshots into `{added: table<name, value>, removed: list}`.
+#
+# Both sides are bucketed by name in one `group-by`, which hashes, so the
+# whole diff is O(N). Testing `$name in $prev_names` and then reading
+# `$prev | get $name` per variable — nushell scans a list and a record
+# linearly for both — made this O(N^2) instead. The `side` column is what
+# tells a lone row apart: 0 means the name only exists in the previous
+# snapshot (removed), 1 that it only exists in the current one (added).
+def __scribe-diff-env [prev: list, now: list] {
+    let paired = (
+        (($prev | insert side 0) ++ ($now | insert side 1))
+        | group-by name
+    )
+    mut added = []
+    mut removed = []
+    for bucket in ($paired | items {|name, rows| {name: $name, rows: $rows} }) {
+        let rows = $bucket.rows
+        if ($rows | length) == 1 {
+            let row = ($rows | first)
+            if $row.side == 1 {
+                $added = ($added | append {name: $bucket.name, value: $row.value})
+            } else {
+                $removed = ($removed | append $bucket.name)
+            }
+        } else if ($rows | first | get value) != ($rows | last | get value) {
+            let current = ($rows | where side == 1 | first)
+            $added = ($added | append {name: $bucket.name, value: $current.value})
+        }
+    }
+    {added: $added, removed: $removed}
 }
 
 # Apply the server's restore-delta file, which nushell alone receives as
@@ -278,45 +313,27 @@ if $scribe_active and ('SCRIBE_RESTORE_ENV_DELTA_FILE' in $env) {
 
 # Spawn-time persistence gate. The server exports SCRIBE_ENV_PERSIST=0 when
 # `terminal.env_persistence.enabled` is off, and drops every EnvChanged it
-# receives in that state — so the snapshot, the O(N^2) diff and the helper
-# fork below would all be built for nothing. A bare `return` is illegal at
+# receives in that state — so the snapshot, the diff and the helper fork
+# below would all be built for nothing. A bare `return` is illegal at
 # this level (see the header), so gate the side effects instead; the `def`s
 # stay inert. Absence means a server that predates the gate: keep emitting.
 let scribe_env_persist = (
     $scribe_active and (($env.SCRIBE_ENV_PERSIST? | default '1') != '0')
 )
 
-# Per-session "last emitted" snapshot, stored as a global record.
-if $scribe_env_persist {
-    $env.__SCRIBE_ENV_LAST = (__scribe-snapshot-env)
-}
-
 # Per-prompt delta hook. Diffs the current $env against the cached
 # snapshot, emits via the resolved hook helper only on non-empty change.
 def --env __scribe-emit-env-delta [] {
     let now = (__scribe-snapshot-env)
-    let prev = ($env.__SCRIBE_ENV_LAST? | default {})
-    let now_names = ($now | columns)
-    let prev_names = ($prev | columns)
+    let prev = ($env.__SCRIBE_ENV_LAST? | default [])
+    let delta = (__scribe-diff-env $prev $now)
 
-    mut added = {}
-    for name in $now_names {
-        let cur_val = ($now | get $name)
-        let prev_val = (if ($name in $prev_names) { $prev | get $name } else { null })
-        if $prev_val == null or $prev_val != $cur_val {
-            $added = ($added | upsert $name $cur_val)
-        }
-    }
-    let removed = (
-        $prev_names | where {|name| not ($name in $now_names) }
-    )
-
-    if (($added | columns | length) == 0) and (($removed | length) == 0) {
+    if (($delta.added | is-empty) and ($delta.removed | is-empty)) {
         return
     }
 
-    let added_json = (__scribe-build-object $added)
-    let removed_json = (__scribe-build-array $removed)
+    let added_json = (__scribe-build-object $delta.added)
+    let removed_json = (__scribe-build-array $delta.removed)
     # The payload goes over stdin, never argv: /proc/<pid>/cmdline is
     # world-readable, and a single argument is capped at MAX_ARG_STRLEN
     # (128 KiB), which turned a large delta into a silent E2BIG.
