@@ -1479,3 +1479,42 @@ Two pwsh-specific traps, both hit while re-measuring for `scribe-i79.50`:
   packaged without necessary permissions ... cap_dac_override"). Drive
   `/snap/powershell/current/opt/powershell/pwsh` directly instead — same
   7.6.4 interpreter, no confinement wrapper.
+
+## AiStateChanged frames per context refresh (US5-4)
+
+Both sides measured on 2026-07-30 for bead `scribe-i79.8`, in the
+functional container (`docker/Dockerfile.func`) built from the bead's
+worktree at base `1091bd9`. There is no Wave 0 row for this one: the
+before side is the same worktree with the equality guard in
+`send_ai_context_change` stashed out, so the two images differ by that
+hunk alone.
+
+### Rig
+
+`scribe-test share-tap` is interposed on the server socket before any
+client connects (`mv server.sock server-upstream.sock`, tap listens on
+the canonical path — the arrangement `docker/entrypoint-visual.sh`
+uses), so the JSONL wire record is the frame log. The container is
+driven with `--entrypoint /bin/bash` because the stock func entrypoint
+starts the daemon before a script gets control, which is too late to
+interpose.
+
+Each phase sends one compound command into the session shell —
+`scribe-hook-helper --event=state_changed --state=processing` followed
+by five `--event=context_changed --fill-percent=NN` invocations, then
+`read -r` so the shell parks instead of printing a prompt (a returning
+OSC 133;A clears the live AI state). Counts are
+`grep -c '"type":"AiStateChanged"'` deltas on the record across a 3 s
+settle.
+
+| Phase | percentages | before | after |
+|---|---|---|---|
+| repeat | 42 42 42 42 42 | 6 | **2** |
+| distinct | 50 51 52 53 54 | 6 | 6 |
+
+Each phase's first frame is the `state_changed` event itself, so the
+refresh contribution is 5 → 1 for the repeat phase: the first refresh
+moves `context` from `None` to 42 and the four that repeat 42 produce
+no frame at all. The distinct phase is the control that pins the change
+to the equality guard — five moving percentages still cost five frames
+on both builds, so nothing but a repeat is being dropped.

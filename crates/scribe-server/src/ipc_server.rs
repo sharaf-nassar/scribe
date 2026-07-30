@@ -9941,7 +9941,7 @@ async fn merge_partial_ai_state(
 /// The refresh patches `context` on the live `AiProcessState` for the
 /// matching provider and re-broadcasts a full `AiStateChanged` so connected
 /// clients see the new percentage without the producer ever asserting a
-/// state of its own. Three drop conditions, all silent:
+/// state of its own. Four drop conditions, all silent:
 ///
 /// - The session has no live `ai_state` yet — nothing to patch. The first
 ///   real state event (Stop hook, `PreToolUse`, etc.) will establish state;
@@ -9950,6 +9950,10 @@ async fn merge_partial_ai_state(
 ///   provider context bleed (e.g. Codex's `CodexContext=NN` arriving while
 ///   the live state is Claude's) is rejected as a defensive guard.
 /// - The session is gone (closed during the await race).
+/// - The refresh repeats the percentage already on the live state. Status
+///   lines poll on a timer and re-report the same fill for as long as the
+///   context does not move, so the patch is a no-op and the frame would tell
+///   every attached client nothing it does not already hold.
 async fn send_ai_context_change(
     provider: AiProvider,
     context: u8,
@@ -9966,6 +9970,9 @@ async fn send_ai_context_change(
             return;
         };
         if ai_state.provider != provider {
+            return;
+        }
+        if ai_state.context == Some(context) {
             return;
         }
         ai_state.context = Some(context);
