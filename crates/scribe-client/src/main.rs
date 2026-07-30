@@ -7348,7 +7348,8 @@ type SyncFrameQueues = Arc<Mutex<HashMap<SessionId, SyncFrameQueue>>>;
 
 /// Spawns the coalescing drain with synchronized-frame queueing in front of
 /// `write_output`. A first task drains the inbound channel with Zed's
-/// 4 ms / 100-event coalescing ([`run_drain`]), splits each pane's bytes into
+/// 4 ms / 100-event coalescing, capped at a megabyte of payload per batch
+/// ([`run_drain`]), splits each pane's bytes into
 /// committed `CSI ? 2026` bursts via a per-session [`SyncFrameQueue`], and
 /// replays one burst per redraw so no frame tears across IPC message
 /// boundaries. A second task waits on the nearest raw-frame or parser sync

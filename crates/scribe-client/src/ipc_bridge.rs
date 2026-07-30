@@ -3,8 +3,10 @@
 //!
 //! Inbound: server output events arrive on a bounded queue
 //! ([`INBOUND_QUEUE_EVENTS`] events, [`INBOUND_QUEUE_BYTES`] of payload) and are
-//! drained with Zed-style 4 ms / 100-event coalescing. Per-pane output is
-//! collapsed so each batch runs one `write_output` and one repaint per dirty
+//! drained with Zed-style 4 ms / 100-event coalescing, itself capped at
+//! [`MAX_BATCH_BYTES`] of payload so one batch cannot stall the drain with
+//! megabytes of work. Per-pane output is collapsed so each batch runs one
+//! `write_output` and one repaint per dirty
 //! pane. A queue that reaches either bound coalesces first and only then drops,
 //! and the drain asks the server for a fresh screen per affected pane, so a
 //! client that cannot keep up costs bounded memory instead of unbounded RSS.
@@ -65,6 +67,17 @@ pub const MAX_BATCH_EVENTS: usize = 100;
 /// Maximum wall-clock time a drain batch accumulates before it is flushed.
 /// Mirrors Zed's 4 ms terminal wakeup coalescing window.
 pub const BATCH_WINDOW: Duration = Duration::from_millis(4);
+
+/// Maximum [`InboundEvent::PaneOutput`] payload folded into one drain batch.
+///
+/// The event and time bounds do not bound the work a batch costs: events carry
+/// variable-size payloads, so 100 server frames is anywhere from a few kilobytes
+/// of shell output to 6.4 MiB of `cat`, and a replay event is larger still. The
+/// batch is parsed and applied in one uninterruptible pass, so its byte size is
+/// what actually sets how long the drain stalls. An event whose own payload
+/// exceeds this cap is never rejected — it is handed to the drain alone, since
+/// splitting a pane's bytes would tear its VTE stream.
+pub const MAX_BATCH_BYTES: usize = 1024 * 1024;
 
 /// Maximum events the inbound queue buffers between the reader and the drain
 /// before the overflow policy runs.
@@ -422,10 +435,16 @@ impl Drop for InboundSender {
     }
 }
 
-/// One non-blocking look at the inbound queue.
+/// What a caller waiting on the inbound queue got, once the queue was no longer
+/// empty.
 enum InboundPoll {
+    /// The next queued event, which the caller's byte budget admitted.
     Event(InboundEvent),
-    Empty,
+    /// The next queued event is larger than the caller's remaining byte budget.
+    /// It stays queued, so it opens the following batch instead of overflowing
+    /// this one.
+    Deferred,
+    /// Every sender is gone and nothing is queued.
     Closed,
 }
 
@@ -433,27 +452,44 @@ impl InboundReceiver {
     /// Waits for the next queued event, returning `None` once the queue is
     /// drained and every sender is gone.
     pub async fn recv(&mut self) -> Option<InboundEvent> {
+        // No payload can exceed `usize::MAX`, so an unbudgeted caller only ever
+        // sees `Event` or `Closed`.
+        match self.recv_within(usize::MAX).await {
+            InboundPoll::Event(event) => Some(event),
+            InboundPoll::Deferred | InboundPoll::Closed => None,
+        }
+    }
+
+    /// Waits for the next queued event so long as its payload fits `budget`.
+    ///
+    /// The fit is decided under the same lock that pops, so an event that raced
+    /// in behind a momentarily empty queue cannot slip past a batch's byte cap:
+    /// either it fits and is taken, or it stays queued for a batch of its own.
+    async fn recv_within(&mut self, budget: usize) -> InboundPoll {
         loop {
-            match self.poll_once() {
-                InboundPoll::Event(event) => return Some(event),
-                InboundPoll::Closed => return None,
-                InboundPoll::Empty => self.shared.notify.notified().await,
+            match self.poll_once(budget) {
+                Some(poll) => return poll,
+                None => self.shared.notify.notified().await,
             }
         }
     }
 
-    /// Takes the next event without waiting. Split out of [`Self::recv`] so the
-    /// queue lock is released before the await rather than merely scoped away
-    /// from it.
-    fn poll_once(&self) -> InboundPoll {
+    /// Takes the next event without waiting, or reports why it cannot; `None`
+    /// means the queue is momentarily empty, the one outcome a caller has to
+    /// wait on. Split out of [`Self::recv_within`] so the queue lock is released
+    /// before the await rather than merely scoped away from it.
+    fn poll_once(&self, budget: usize) -> Option<InboundPoll> {
         let mut state = lock_inbound(&self.shared);
-        if let Some(event) = state.take() {
-            return InboundPoll::Event(event);
+        if let Some(head) = state.events.front() {
+            if payload_bytes(head) > budget {
+                return Some(InboundPoll::Deferred);
+            }
+            return state.take().map(InboundPoll::Event);
         }
         if state.senders == 0 {
-            return InboundPoll::Closed;
+            return Some(InboundPoll::Closed);
         }
-        InboundPoll::Empty
+        None
     }
 
     /// Events still queued behind the drain.
@@ -526,9 +562,9 @@ impl PendingResync {
     }
 }
 
-/// Drains `rx` with 4 ms / 100-event coalescing, invoking `apply` once per
-/// batch with the per-pane-collapsed output. Returns when the queue closes,
-/// flushing any final partial batch first.
+/// Drains `rx` with 4 ms / 100-event / [`MAX_BATCH_BYTES`] coalescing, invoking
+/// `apply` once per batch with the per-pane-collapsed output. Returns when the
+/// queue closes, flushing any final partial batch first.
 ///
 /// `apply` runs synchronously between awaits, so a caller may lock its terminal
 /// entities inside it without ever holding a lock across an await point. After
@@ -563,22 +599,34 @@ pub struct BatchWindow {
     pub channel_closed: bool,
 }
 
-/// Accumulates events into one 4 ms / 100-event batch window starting with
-/// `first`, so the coalescing bound is shared between [`run_drain`] and the
-/// synchronized-frame drain in `main.rs` rather than duplicated.
+/// Accumulates events into one 4 ms / 100-event / [`MAX_BATCH_BYTES`] batch
+/// window starting with `first`, so the coalescing bound is shared between
+/// [`run_drain`] and the synchronized-frame drain in `main.rs` rather than
+/// duplicated.
+///
+/// The byte bound is the one that holds under a firehose: an event stream the
+/// count bound would happily fold into one batch can carry megabytes, and the
+/// batch is applied in a single pass. `first` is always taken, so an event
+/// bigger than the whole cap becomes a batch of one rather than a rejection.
 pub async fn collect_batch(first: InboundEvent, rx: &mut InboundReceiver) -> BatchWindow {
+    let mut bytes = payload_bytes(&first);
     let mut batch = Vec::with_capacity(MAX_BATCH_EVENTS);
     batch.push(first);
     let deadline = Instant::now() + BATCH_WINDOW;
-    while batch.len() < MAX_BATCH_EVENTS {
+    while batch.len() < MAX_BATCH_EVENTS && bytes < MAX_BATCH_BYTES {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
-        match timeout(remaining, rx.recv()).await {
-            Ok(Some(event)) => batch.push(event),
-            Ok(None) => return BatchWindow { batch, channel_closed: true },
-            Err(_) => break,
+        match timeout(remaining, rx.recv_within(MAX_BATCH_BYTES - bytes)).await {
+            Ok(InboundPoll::Event(event)) => {
+                bytes += payload_bytes(&event);
+                batch.push(event);
+            }
+            Ok(InboundPoll::Closed) => return BatchWindow { batch, channel_closed: true },
+            // The next event will not fit, or the window expired: either way
+            // this batch is complete.
+            Ok(InboundPoll::Deferred) | Err(_) => break,
         }
     }
     BatchWindow { batch, channel_closed: false }
@@ -1618,6 +1666,67 @@ mod tests {
     /// bound a firehose reaches first.
     fn frame() -> Vec<u8> {
         vec![b'A'; 64 * 1024]
+    }
+
+    /// Total [`PaneOp::Output`] payload each recorded batch carried.
+    fn batch_bytes(batches: &[Vec<(SessionId, Vec<u8>)>]) -> Vec<usize> {
+        batches.iter().map(|batch| batch.iter().map(|(_, bytes)| bytes.len()).sum()).collect()
+    }
+
+    // @lat: [[test#GPUI IPC Bridge#Batch byte cap splits a drain]]
+    #[tokio::test]
+    async fn drain_splits_a_multi_megabyte_backlog_at_the_byte_cap() {
+        let pane = SessionId::new();
+        let (in_tx, in_rx) = inbound_channel();
+
+        // Forty 64 KiB frames: under both queue bounds, so nothing is dropped,
+        // and under the 100-event bound, so bytes are the only bound left.
+        let frames = 40;
+        for _ in 0..frames {
+            in_tx.send(output(pane, &frame())).unwrap();
+        }
+        drop(in_tx);
+
+        let recorded: RecordedBatches = Arc::new(Mutex::new(Vec::new()));
+        let collector = Arc::clone(&recorded);
+        let (sink, _out_rx) = idle_sink();
+        run_drain(in_rx, sink, move |batch| push_batch(&collector, batch)).await;
+
+        let sizes = batch_bytes(&recorded.lock().unwrap());
+        assert_eq!(sizes.iter().sum::<usize>(), frames * frame().len(), "the cap must not drop");
+        assert!(
+            sizes.iter().all(|&bytes| bytes <= MAX_BATCH_BYTES),
+            "batches must stay under {MAX_BATCH_BYTES} bytes, got {sizes:?}"
+        );
+        assert!(
+            sizes.len() >= 3,
+            "2.5 MiB has to split into at least three batches, got {sizes:?}"
+        );
+    }
+
+    // @lat: [[test#GPUI IPC Bridge#Oversize event drains alone]]
+    #[tokio::test]
+    async fn event_larger_than_the_byte_cap_is_drained_alone() {
+        let pane = SessionId::new();
+        let (in_tx, in_rx) = inbound_channel();
+
+        let oversize = vec![b'B'; 2 * MAX_BATCH_BYTES];
+        in_tx.send(output(pane, b"before")).unwrap();
+        in_tx.send(output(pane, &oversize)).unwrap();
+        in_tx.send(output(pane, b"after")).unwrap();
+        drop(in_tx);
+
+        let recorded: RecordedBatches = Arc::new(Mutex::new(Vec::new()));
+        let collector = Arc::clone(&recorded);
+        let (sink, _out_rx) = idle_sink();
+        run_drain(in_rx, sink, move |batch| push_batch(&collector, batch)).await;
+
+        let batches = recorded.lock().unwrap();
+        assert_eq!(
+            batch_bytes(&batches),
+            vec![b"before".len(), oversize.len(), b"after".len()],
+            "an oversize event neither merges with its neighbours nor is rejected"
+        );
     }
 
     // @lat: [[test#GPUI IPC Bridge#Inbound queue bounds a firehose]]

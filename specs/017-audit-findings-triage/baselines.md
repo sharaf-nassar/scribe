@@ -650,6 +650,45 @@ reported `git_branch = "measure-main"` for all four panes, so neither the
 deferral nor the sharing changes the answer. Row 1 reproduced integer-exact
 across two runs per build; rows 2 and 3 were run once per build.
 
+### After side: batch byte cap (US3-2)
+
+Checked on 2026-07-30 at worktree base `087a1e9` (bead `scribe-i79.3`). The item
+adds `MAX_BATCH_BYTES = 1 048 576` as a third exit condition on
+`collect_batch`, alongside the existing 100-event and 4 ms bounds; nothing else
+in the drain changed, so a workload whose batches never reach the new bound
+cannot move.
+
+| Workload | max bytes/batch at `b90c932` | share of the 1 MiB cap | batches the cap splits |
+|---|---|---|---|
+| `yes`, 15 s | 26 317 | 2.5 % | none |
+| `cat` of a 64 MiB file | 932 878 | 89.0 % | none, as measured |
+| decompressed `SessionReplay` | not measured, tens of MiB | >100 % | every one, drained alone |
+
+**Under `yes` the numbers are unchanged, and that is the expected result.** The
+before-side row is count-bounded — 100 % of batches hit `MAX_BATCH_EVENTS` at
+~8.7 KB, 40 times under the cap — so batch sizes stay at 99.98 events / 8 669
+bytes and drained-events-per-redraw stays at 99.96. The cap is a tail bound on
+the drain's worst case, not a throughput change to its common case, and a `yes`
+row that *had* moved would mean the cap was mis-sized downward.
+
+Where it binds is the shape the count bound admits without measuring: the `cat`
+row's chunks average 11.6 KiB, so a saturated queue that fills the event window
+before the 4 ms window carries 1.11 MiB, and #66's worst case —
+`PTY_READ_BUF_SIZE` × `MAX_BATCH_EVENTS` — is 6.4 MiB. Both are now ≤ 1 MiB. The
+one case the cap cannot bound by splitting is a single event larger than the cap
+itself, which is exactly the `SessionReplay` path the before-side caveats say
+went unmeasured; those are drained alone rather than rejected, because splitting
+a pane's bytes would tear its VTE stream.
+
+Evidence is two deterministic unit tests rather than a rig re-run:
+`drain_splits_a_multi_megabyte_backlog_at_the_byte_cap` drains a 2.5 MiB backlog
+of 64 KiB frames and asserts ≥ 3 batches, none over the cap, with every byte
+delivered — the same backlog is one 2 621 440-byte batch with the cap removed —
+and `event_larger_than_the_byte_cap_is_drained_alone` pins the single-event
+exception. The Xvfb rig above was not re-run: at the measured batch sizes it
+would reproduce the before-side rows by construction, and a debug-build re-run
+would not be comparable to a release before-side.
+
 ## Per-prompt shell hook cost
 
 Wall time and process creations charged to one no-op prompt cycle by
