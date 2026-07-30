@@ -5,7 +5,7 @@ use scribe_common::ids::SessionId;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::metadata::MetadataEvent;
+use crate::metadata::{MAX_TITLE_LEN, MetadataEvent, truncate_chars};
 
 type ClipboardFormatter = std::sync::Arc<dyn Fn(&str) -> String + Sync + Send + 'static>;
 type ColorFormatter = std::sync::Arc<dyn Fn(Rgb) -> String + Sync + Send + 'static>;
@@ -58,7 +58,12 @@ impl ScribeEventListener {
 impl EventListener for ScribeEventListener {
     fn send_event(&self, event: Event) {
         match event {
+            // Sole source of `MetadataEvent::TitleChanged`: the OSC interceptor
+            // runs a second parser over the same bytes and deliberately ignores
+            // OSC 0/2. `Term`'s parser joins the semicolon-separated OSC params
+            // back into one title, so `\e]2;alpha;beta\e\\` arrives here whole.
             Event::Title(title) => {
+                let title = truncate_chars(&title, MAX_TITLE_LEN);
                 self.emit(SessionEvent::Metadata(MetadataEvent::TitleChanged(title)));
             }
 
