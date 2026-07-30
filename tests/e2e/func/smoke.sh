@@ -72,4 +72,10 @@ scribe-test wait-output "$EXTRA" "extra-alive"
 scribe-test session close "$EXTRA"
 echo "PHASE 9 PASS: second session created, used, and closed"
 
+# ── Phase 10: No empty PtyOutput frames ───────────────────────────
+# Everything above ran through the server's PTY filters. A chunk a filter
+# empties must be dropped before framing, never shipped as a zero-byte frame.
+scribe-test assert-no-empty-output "$SESSION"
+echo "PHASE 10 PASS: no empty PtyOutput frames reached the client"
+
 echo "PASS: smoke test completed"

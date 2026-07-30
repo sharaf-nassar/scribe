@@ -92,6 +92,12 @@ pub enum DaemonRequest {
         expected_signal: i32,
         timeout_ms: u64,
     },
+    /// Spec 017 US6-4: assert no zero-byte `PtyOutput` frame ever arrived for a
+    /// session. Filters that swallow a whole PTY chunk must drop the frame
+    /// instead of shipping an empty one the whole pipeline still pays for.
+    AssertNoEmptyOutput {
+        session_id: SessionId,
+    },
     /// Compare the current screen against a reference snapshot (cell content,
     /// cursor position, cursor visibility).
     AssertSnapshotMatch {

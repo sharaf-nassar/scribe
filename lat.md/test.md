@@ -27,6 +27,8 @@ Per-session data buffered in : 65 KB output ring buffer, `latest_snapshot` with 
 
 `live_bytes` is separate from the ring buffer because the buffer is capped: a trimmed buffer's length cannot place a replay frame in the session's byte order, and that ordering is what the replay bookkeeping stamps each frame with.
 
+An `empty_output_frames` counter rides alongside it, incremented (and logged) whenever a zero-byte `PtyOutput` arrives. The byte counters cannot express that event — an empty frame moves neither of them — yet it is exactly the waste the server's [[server#Server#Sessions#PTY Reader Task|empty-frame send guard]] exists to prevent, so the harness records it separately and lets a test assert on it.
+
 All sessions are keyed by `SessionId` inside , which also tracks `last_workspace_id` and `last_session_created` for workspace and session-create responses, plus the `window_id` the server assigned in its `Welcome`.
 
 ### Request Handling
@@ -45,7 +47,7 @@ Request/response protocol between the CLI and daemon over a Unix socket at `/run
 
 The socket path is returned by . The helper  creates a short-lived tokio runtime, connects, sends one , and receives one .
 
-Key request variants: `CreateSession`, `AttachSession`, `CloseSession`, `Send`, `Resize`, `RequestScreenshot`, `RequestSnapshot`, `WaitOutput`, `WaitCwd`, `WaitIdle`, `AssertCell`, `AssertCursor`, `AssertExit`, `AssertSnapshotMatch`, `ReplayStatus`, `ReplayScreen`, `AssertReplayMatchesScreen`, `WindowId`, and `Shutdown`.
+Key request variants: `CreateSession`, `AttachSession`, `CloseSession`, `Send`, `Resize`, `RequestScreenshot`, `RequestSnapshot`, `WaitOutput`, `WaitCwd`, `WaitIdle`, `AssertCell`, `AssertCursor`, `AssertExit`, `AssertSnapshotMatch`, `AssertNoEmptyOutput`, `ReplayStatus`, `ReplayScreen`, `AssertReplayMatchesScreen`, `WindowId`, and `Shutdown`.
 
 Key response variants: `Ok`, `SessionCreated { session_id }`, `ScreenshotData { snapshot }`, `ReplayStatus { applied, failed, live_bytes, last }`, `WindowId { window_id }`, `AssertFailed { message }`, and `Error { message }`.
 
@@ -77,9 +79,11 @@ Blocking synchronization helpers: wait for regex output, CWD change, or terminal
 
 ## Assertions
 
-Verify screen cell content, cursor position, snapshot equality, and how a session's child died — returning `TestFailure` (exit 1) on mismatch.
+Verify screen cell content, cursor position, snapshot equality, stream shape, and how a session's child died — returning `TestFailure` (exit 1) on mismatch.
 
  checks that a specific cell contains the expected character; on failure the daemon includes a 3×3 neighborhood context in the error message.  verifies the cursor is at the expected row/col.  loads a reference JSON snapshot and compares cell content, cursor position, and cursor visibility.  waits up to `timeout_ms` for the session to exit with the expected code.
+
+[[crates/scribe-test/src/assert.rs#assert_no_empty_output|assert-no-empty-output]] is the odd one out: it asserts about the *stream* rather than the screen, failing if any zero-byte `PtyOutput` ever arrived for the session. No screen assertion can catch that frame — it changes no cell — and the smoke suite runs it last, after phases that have driven the PTY filters, so a filter that starts shipping emptied chunks is caught by an existing test rather than a dedicated one.
 
 Exit assertions come in two shapes because the wire keeps a terminating signal in its own `SessionExited` field rather than folding it into `exit_code`: `assert-exit` matches the code, [[crates/scribe-test/src/assert.rs#assert_signal|assert-signal]] matches the signal number. Both also fail when more than one `SessionExited` arrived for the session — the server elects a single exit path per session through one compare-and-swap, so a second frame is a real defect rather than noise.
 

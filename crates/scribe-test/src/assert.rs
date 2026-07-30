@@ -81,6 +81,26 @@ pub fn assert_exit(session_id: &str, code: i32, timeout_ms: u64) -> Result<(), T
     }
 }
 
+/// Assert that the daemon never received a zero-byte `PtyOutput` frame for a
+/// session. A chunk the server's filters emptied must be dropped before it is
+/// framed, not shipped as an empty frame every attached client still pays to
+/// allocate, serialize, queue, coalesce, and parse.
+pub fn assert_no_empty_output(session_id: &str) -> Result<(), TestError> {
+    let id = SessionId::from_str(session_id)
+        .map_err(|e| TestError::InfraError(format!("invalid session id: {e}")))?;
+
+    let request = DaemonRequest::AssertNoEmptyOutput { session_id: id };
+
+    let response = send_request(&request).map_err(|e| TestError::InfraError(e.to_string()))?;
+
+    match response {
+        DaemonResponse::Ok => Ok(()),
+        DaemonResponse::AssertFailed { message } => Err(TestError::TestFailure(message)),
+        DaemonResponse::Error { message } => Err(TestError::InfraError(message)),
+        other => Err(TestError::InfraError(format!("unexpected response: {other:?}"))),
+    }
+}
+
 /// Assert that a session's child was terminated by the expected signal.
 pub fn assert_signal(session_id: &str, signal: i32, timeout_ms: u64) -> Result<(), TestError> {
     let id = SessionId::from_str(session_id)
