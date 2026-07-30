@@ -339,6 +339,114 @@ a std mutex so holding it across a sink await no longer compiles.
    every 200 ms until it advances. Keep the whole script under the
    entrypoint's 30 s `timeout`.
 
+### After side: attach fan-out dedup, cap, and off-thread encode (US2-3)
+
+Checked on 2026-07-30 at worktree base `dd0c510` (bead `scribe-i79.35`). The
+item dedups an `AttachSessions` request by session id, admits at most
+`MAX_CONCURRENT_REPLAY_BUILDS = 8` replay builds process-wide, and carries the
+`Term` guard into `spawn_blocking` so the snapshot, ANSI encode and zstd pass
+leave the runtime's worker threads.
+
+The change landed two commits later, on `6cec57c`. The numbers carry over
+unchanged because all three measured components — `snapshot_term`,
+`snapshot_to_ansi` and `build_session_replay` — are byte-identical between
+`dd0c510` and that base; the intervening `461d95b` touches only the *decode*
+side of `screen_replay.rs`.
+
+Both variants were measured in one process against the same fixtures. The host
+was running sibling Wave 1 builds throughout (load average ~22 of 64 cores), so
+an absolute comparison against the quiet-host before side would not be sound;
+the `inline control` rows re-run the pre-fix body as a paired control instead.
+They reproduce the before-side fan-out table within noise, which is what makes
+the paired rows readable.
+
+#### One build: same work, same cost
+
+| geometry | ansi bytes | zstd bytes | `snapshot_term` ms | `snapshot_to_ansi` ms | `zstd` ms | total mean/median |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 120x36 before | 1 431 827 | 112 084 | 13.10 | 5.97 | 3.00 | 22.07 / 21.03 |
+| 120x36 after | 1 702 170 | 50 445 | 15.49 | 6.38 | 3.27 | 25.14 / 22.62 |
+| 200x50 before | 2 237 823 | 117 604 | 38.42 | 8.80 | 3.87 | 51.10 / 50.19 |
+| 200x50 after | 2 505 299 | 54 275 | 42.90 | 10.21 | 1.26 | 54.37 / 54.50 |
+
+The fix relocates the build, it does not make it cheaper, and the rows say so.
+The residual spread is fixture content — the after-side line generator is a
+rewrite and lands 12-19 % more encoded bytes — plus the loaded host. A
+truecolor-dense 200x50 fixture (12 467 472 ansi bytes) costs 41.41 / 42.81 /
+7.88 ms on the same three components, which is the shape the US2-2 ceiling has
+to admit.
+
+#### Fan-out, 4-worker runtime (the before side's rig)
+
+| entries | variant | wall ms | ms/entry | max in-flight | peak MiB | worst 1 ms-tick overshoot ms |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | before | 61.8 | 61.8 | 1 | — | — |
+| 1 | inline control | 64.9 | 64.9 | 1 | 56 | 1.3 |
+| 1 | capped + `spawn_blocking` | 53.5 | 53.5 | 1 | 56 | 1.1 |
+| 8 | before | 138.1 | 17.3 | — | — | — |
+| 8 | inline control | 165.1 | 20.6 | 4 | 219 | 142.6 |
+| 8 | capped + `spawn_blocking` | 122.1 | 15.3 | 8 | 434 | 1.6 |
+| 32 | before | 582.1 | 18.2 | — | — | — |
+| 32 | inline control | 595.1 | 18.6 | 4 | 222 | 563.3 |
+| 32 | capped + `spawn_blocking` | 462.5 | 14.5 | 8 | 436 | 2.5 |
+
+Wall time improves 12-21 % against the before side *despite* the cap. Four
+worker threads were the real limit on the inline path — note that its
+in-flight count never exceeds 4, because a build that never yields owns its
+worker for the duration — and moving the encode to the blocking pool buys back
+more parallelism than the cap spends.
+
+The overshoot column is the cost #18 names. A task sleeping on a 1 ms tick
+beside the fan-out runs up to 563 ms late while 32 inline builds hold the four
+workers; with the encode on the blocking pool it runs 2.5 ms late. That delay
+was being charged to every other session's I/O scheduled on those workers.
+
+#### Fan-out, default worker count (what the server actually runs)
+
+`scribe-server` builds a plain `new_multi_thread` runtime, so on this 64-thread
+host nothing throttled the inline path to four concurrent builds:
+
+| entries | variant | wall ms | ms/entry | max in-flight | peak MiB | worst 1 ms-tick overshoot ms |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 32 | inline control | 362.7 | 11.3 | 32 | 1 595 | 4.8 |
+| 32 | capped + `spawn_blocking` | 423.6 | 13.2 | 8 | 436 | 2.0 |
+
+1 595 MiB of measured transient allocation for one 32-session attach, against
+the before side's derived ~1.5 GiB — that derivation was right. The cap holds
+the peak at 436 MiB and, more to the point, makes it a constant instead of a
+function of how many sessions a LAN peer names in one message. The 17 %
+wall-time cost at 32 entries on a 64-thread host is the deliberate trade; at
+the worker counts a laptop-class host has, the capped path is still the faster
+one.
+
+Dedup is absent from these tables because it is a request-shape defect rather
+than a throughput one. Before the fix, an `AttachSessions` naming one session
+N times ran N builds against that session and re-opened its sink's buffering
+window N-1 times mid-replay, so a single small message could multiply every
+number above by any N it chose. Two deterministic unit tests carry it instead:
+`duplicate_session_ids_collapse_to_one_attach_target` pins the collapse, and
+`replay_builds_queue_behind_the_concurrency_cap` pins the admission gate by
+holding all eight slots and showing the ninth attach cannot proceed.
+
+#### Reproducing (this after side)
+
+Same shape as the search/attach re-run above. Add a throwaway
+`crates/scribe-server/src/measure_i7935.rs` and declare it from the bottom of
+`attach_flow.rs` as
+`#[cfg(test)] #[path = "measure_i7935.rs"] mod measure_i7935;`, so the private
+`REPLAY_BUILD_SLOTS` is reachable through `super`. It needs a file-level
+`#![allow(...)]` for `unsafe_code` (the counting `#[global_allocator]`) and
+`clippy::unwrap_used`; it writes its tables to a file rather than stdout, so no
+print lint has to be suppressed. The module holds a `Dimensions` fixture at
+`cols x rows` with `total_lines = rows + 10 000`, two line generators (a
+full-width three-SGR-run line reproducing the before side's ~1.1 encoded bytes
+per cell, and a dense one changing color every three cells), an in-flight
+counter around each build, and a 1 ms heartbeat task on the same runtime. Each
+fan-out cell runs three times per variant and reports medians. Run it with
+`CARGO_BUILD_JOBS=12 cargo test --release -p scribe-server --lib measure_i7935 -- --test-threads=1`,
+then delete the file before committing so the lint-suppression gate stays
+clean.
+
 ## Per-prompt metadata and client batch stats
 
 Captured at `b90c932` on 2026-07-29 (bead `scribe-i79.24`). Before-side for

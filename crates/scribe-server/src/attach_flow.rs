@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use alacritty_terminal::grid::Dimensions;
 use futures_util::future::join_all;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
 
 use scribe_common::ids::SessionId;
@@ -17,6 +17,24 @@ use crate::ipc_server::{
     send_message, set_pty_winsize,
 };
 use crate::session_manager::snapshot_term;
+
+/// How many sessions may be in the attach replay stage at once, process-wide.
+///
+/// Each in-flight build holds a whole-grid `ScreenSnapshot` plus its ANSI
+/// encoding — ~55 MiB at 200x50 with 10k scrollback — and `AttachSessions`
+/// arrives from LAN peers, so an unbounded fan-out made transient allocation a
+/// function of how many sessions one request named: 32 entries peaked at
+/// 1 595 MiB on the runtime the server actually builds. Eight holds that at
+/// 436 MiB, and because the encode moved to the blocking pool it still beats
+/// the uncapped inline path per entry at any realistic worker count (spec 017
+/// baselines, US2-3).
+const MAX_CONCURRENT_REPLAY_BUILDS: usize = 8;
+
+/// Admission control for [`MAX_CONCURRENT_REPLAY_BUILDS`]. Process-wide rather
+/// than per-request, because the exposure is the sum over every connected
+/// client, not one client's batch. Never closed, so `acquire` only ever fails
+/// in a build that has torn the runtime down under us.
+static REPLAY_BUILD_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_REPLAY_BUILDS);
 
 /// Per-session data carried through the attach pipeline.
 ///
@@ -37,6 +55,7 @@ struct AttachEntry {
     resize_fd: Arc<OwnedFd>,
     target_dims: Option<TerminalSize>,
     has_handoff_snapshot: bool,
+    exit_gate: Arc<crate::session_exit::SessionExitGate>,
 }
 
 impl From<AttachSessionData> for AttachEntry {
@@ -52,6 +71,7 @@ impl From<AttachSessionData> for AttachEntry {
             resize_fd: data.resize_fd,
             target_dims: data.target_dims,
             has_handoff_snapshot: data.has_handoff_snapshot,
+            exit_gate: data.exit_gate,
         }
     }
 }
@@ -83,16 +103,44 @@ pub async fn attach_sessions(
     .await
 }
 
+/// Collapse an `AttachSessions` request to one (session, geometry) pair per
+/// distinct id, keeping each id's first occurrence.
+///
+/// A repeated id must not fan out twice. Both entries would carry the same
+/// session's `ClientWriter`, so the second attach re-opens that sink's
+/// buffering window while the first is still building its replay — the two
+/// `finish_attach` calls then race with different snapshot cursors — and each
+/// duplicate pays for another whole-grid snapshot. Left in, replay cost is a
+/// function of the request rather than of the session count, which is the
+/// amplification the concurrency cap alone cannot bound.
+fn distinct_attach_targets(
+    session_ids: &[SessionId],
+    dimensions: &[TerminalSize],
+) -> Vec<(SessionId, Option<TerminalSize>)> {
+    let mut seen = HashSet::with_capacity(session_ids.len());
+    let mut targets = Vec::with_capacity(session_ids.len());
+
+    for (i, &session_id) in session_ids.iter().enumerate() {
+        if seen.insert(session_id) {
+            targets.push((session_id, dimensions.get(i).copied()));
+        } else {
+            warn!(%session_id, "AttachSessions: duplicate session id in one request, ignored");
+        }
+    }
+
+    targets
+}
+
 async fn prepare_attach_entries(
     session_ids: &[SessionId],
     dimensions: &[TerminalSize],
     live_sessions: &LiveSessionRegistry,
 ) -> Vec<AttachEntry> {
+    let targets = distinct_attach_targets(session_ids, dimensions);
     let mut sessions = live_sessions.write().await;
-    let mut entries = Vec::with_capacity(session_ids.len());
+    let mut entries = Vec::with_capacity(targets.len());
 
-    for (i, &session_id) in session_ids.iter().enumerate() {
-        let target_dims = dimensions.get(i).copied();
+    for (session_id, target_dims) in targets {
         if let Some(session) = sessions.get_mut(&session_id) {
             entries.push(AttachEntry::from(session.prepare_attach_data(session_id, target_dims)));
         } else {
@@ -103,15 +151,17 @@ async fn prepare_attach_entries(
     entries
 }
 
-/// Run the per-session attach replay concurrently.
+/// Run the per-session attach replay concurrently, up to
+/// [`MAX_CONCURRENT_REPLAY_BUILDS`] at a time.
 ///
 /// Each session's work (pre-snapshot resize, `SessionReplay` build, wire
-/// writes, client-writer install) is an independent future. We spawn them
-/// onto the tokio runtime so CPU-heavy steps (`snapshot_term`,
-/// `snapshot_to_ansi`, zstd compression) can use separate worker threads
-/// instead of serializing on one task. The shared IPC writer is a
-/// `tokio::sync::Mutex`, which naturally serializes the final wire writes
-/// without blocking the parallel snapshot work.
+/// writes, client-writer install) is an independent future, spawned so the
+/// sessions in a batch overlap instead of serializing on one task. The
+/// CPU-heavy steps (`snapshot_term`, `snapshot_to_ansi`, zstd compression) run
+/// on the blocking pool inside [`take_session_replay`], so they neither occupy
+/// a runtime worker nor scale their transient memory with the batch size. The
+/// shared IPC writer is a `tokio::sync::Mutex`, which naturally serializes the
+/// final wire writes without blocking the parallel snapshot work.
 async fn attach_prepared_entries(
     entries: Vec<AttachEntry>,
     writer: &SharedWriter,
@@ -126,8 +176,9 @@ async fn attach_prepared_entries(
         let attached_ids = Arc::clone(attached_ids);
         handles.push(tokio::spawn(async move {
             let session_id = entry.session_id;
-            attach_one_session(&entry, &writer, &live_sessions, &attached_ids, additive).await;
-            session_id
+            attach_one_session(&entry, &writer, &live_sessions, &attached_ids, additive)
+                .await
+                .then_some(session_id)
         }));
     }
 
@@ -135,9 +186,10 @@ async fn attach_prepared_entries(
     let mut attached = HashSet::with_capacity(joined.len());
     for result in joined {
         match result {
-            Ok(session_id) => {
+            Ok(Some(session_id)) => {
                 attached.insert(session_id);
             }
+            Ok(None) => {}
             Err(e) => warn!(error = %e, "attach task panicked"),
         }
     }
@@ -153,17 +205,41 @@ async fn attach_prepared_entries(
 /// exactly the frames that snapshot is missing. Neither the pre-fix gap (frames
 /// emitted between snapshot and install were lost) nor its naive inverse
 /// (install first and duplicate everything the snapshot also carries) survives.
+///
+/// The concurrency slot is taken *before* the sink goes in, not around the
+/// build alone: a sink that started buffering and then queued behind the cap
+/// would keep accumulating frames it must eventually shed, and a shed backlog
+/// costs a full resync replay — the cap would feed the work it exists to bound.
+/// Waiting first is free instead, because the snapshot taken after the wait
+/// already contains everything emitted during it — with the one exception the
+/// exit-gate check below covers.
+///
+/// Returns whether the session ended up attached.
 async fn attach_one_session(
     entry: &AttachEntry,
     writer: &SharedWriter,
     live_sessions: &LiveSessionRegistry,
     attached_ids: &AttachedSessionIds,
     additive: bool,
-) {
+) -> bool {
+    let Ok(_slot) = REPLAY_BUILD_SLOTS.acquire().await else {
+        warn!(session_id = %entry.session_id, "replay build admission closed; attach abandoned");
+        return false;
+    };
+    // The wait above is the one place an attach can sit while its target dies.
+    // `finalize_session_exit` claims this gate, then fans `SessionExited` out
+    // with a `None` commit — a frame no replay snapshot reproduces — and then
+    // drops the registry entry. Attaching afterwards would hand the client a
+    // pane it can never retire, so a claimed gate ends the attach instead.
+    if entry.exit_gate.is_finalized() {
+        info!(session_id = %entry.session_id, "session exited while attach queued; not attaching");
+        return false;
+    }
     begin_sink_attach(&entry.client_writer, writer, additive).await;
     let snapshot_commit = send_attach_replay(entry, writer, live_sessions).await;
     finish_sink_attach(&entry.client_writer, writer, snapshot_commit, entry.session_id);
     install_session_attachment(entry, attached_ids).await;
+    true
 }
 
 /// Resize, announce, snapshot and send the session's replay; returns the commit
@@ -238,6 +314,13 @@ async fn install_session_attachment(entry: &AttachEntry, attached_ids: &Attached
 /// read inside the same `Term` critical section as the snapshot — the single
 /// atom that lets a buffering sink tell the frames this replay already contains
 /// from the frames it is missing.
+///
+/// Everything after the registry lock runs on the blocking pool: the grid copy,
+/// the ANSI encode and the zstd pass are tens of milliseconds of pure CPU at
+/// realistic geometries, and leaving them on a runtime worker stalled every
+/// other session's I/O on that thread for the duration. The `Term` lock is
+/// still acquired asynchronously and simply carried into the blocking task, so
+/// the lock ordering and the snapshot/commit atomicity are unchanged.
 pub async fn take_session_replay(
     session_id: SessionId,
     term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
@@ -251,32 +334,33 @@ pub async fn take_session_replay(
             .and_then(crate::ipc_server::LiveSession::take_handoff_snapshot)
     };
 
-    if let Some(snapshot) = legacy_snapshot {
-        let ansi = scribe_common::screen_replay::snapshot_to_ansi(&snapshot);
-        let mut processor: vte::ansi::Processor = vte::ansi::Processor::new();
-        let mut guard = term.lock().await;
-        processor.advance(&mut *guard, &ansi);
-
-        // Trim the pseudo-scrollback the encoder's leading ED 2 pushes into
-        // history on a fresh grid; keep only the snapshot's true
-        // scrollback_rows, then restore the configured cap.
-        let scrollback_cap = guard.grid().history_size();
-        let kept = (snapshot.scrollback_rows as usize).min(scrollback_cap);
-        let grid = guard.grid_mut();
-        grid.update_history(kept);
-        grid.update_history(scrollback_cap);
-
-        let fresh = snapshot_term(&guard);
-        let commit = term_commit.get();
-        drop(guard);
-        return build_session_replay(&fresh).map(|replay| (replay, commit));
-    }
-
-    let guard = term.lock().await;
-    let snapshot = snapshot_term(&guard);
+    let mut guard = Arc::clone(term).lock_owned().await;
+    // Safe to read here rather than after the drain below: only the owning PTY
+    // reader advances the cursor, and it cannot while this guard is held.
     let commit = term_commit.get();
-    drop(guard);
-    build_session_replay(&snapshot).map(|replay| (replay, commit))
+
+    tokio::task::spawn_blocking(move || {
+        if let Some(snapshot) = legacy_snapshot {
+            let ansi = scribe_common::screen_replay::snapshot_to_ansi(&snapshot);
+            let mut processor: vte::ansi::Processor = vte::ansi::Processor::new();
+            processor.advance(&mut *guard, &ansi);
+
+            // Trim the pseudo-scrollback the encoder's leading ED 2 pushes into
+            // history on a fresh grid; keep only the snapshot's true
+            // scrollback_rows, then restore the configured cap.
+            let scrollback_cap = guard.grid().history_size();
+            let kept = (snapshot.scrollback_rows as usize).min(scrollback_cap);
+            let grid = guard.grid_mut();
+            grid.update_history(kept);
+            grid.update_history(scrollback_cap);
+        }
+
+        let snapshot = snapshot_term(&guard);
+        drop(guard);
+        build_session_replay(&snapshot).map(|replay| (replay, commit))
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("replay build task failed: {error}")))?
 }
 
 #[cfg(test)]
@@ -342,6 +426,7 @@ mod tests {
             resize_fd: Arc::new(std::fs::File::open("/dev/null").unwrap().into()),
             target_dims: None,
             has_handoff_snapshot: false,
+            exit_gate: Arc::new(crate::session_exit::SessionExitGate::new()),
         }
     }
 
@@ -402,5 +487,81 @@ mod tests {
             attach_prepared_entries(entries, &writer, &live_sessions, &attached_ids, false).await;
 
         assert_eq!(attached, expected_ids);
+    }
+
+    /// A repeated session id in one `AttachSessions` must fan out once. Two
+    /// entries would share the session's sink and each pay for a full snapshot,
+    /// making replay cost a function of the request rather than the session
+    /// count.
+    #[test]
+    fn duplicate_session_ids_collapse_to_one_attach_target() {
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let big = TerminalSize { cols: 200, rows: 50, cell_width: 0, cell_height: 0 };
+        let small = TerminalSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+
+        let targets =
+            distinct_attach_targets(&[first, second, first, first], &[big, small, small, small]);
+
+        assert_eq!(targets, vec![(first, Some(big)), (second, Some(small))]);
+    }
+
+    /// The fan-out must not start a ninth replay build while eight are in
+    /// flight: each holds a whole-grid snapshot plus its ANSI encoding, and
+    /// `AttachSessions` is reachable from LAN peers.
+    #[tokio::test]
+    async fn replay_builds_queue_behind_the_concurrency_cap() {
+        let permits = u32::try_from(MAX_CONCURRENT_REPLAY_BUILDS).unwrap();
+        let hogged = REPLAY_BUILD_SLOTS.acquire_many(permits).await.unwrap();
+
+        let live_sessions = crate::ipc_server::new_live_session_registry();
+        let session_id = SessionId::new();
+        let entries = vec![sample_entry(session_id, WorkspaceId::new())];
+
+        let (server, _client) = unix_stream_pair();
+        let (_read, write) = tokio::io::split(server);
+        let writer: SharedWriter = crate::ipc_server::test_shared_writer(write);
+        let attached_ids: AttachedSessionIds = Arc::new(Mutex::new(HashSet::new()));
+
+        let mut fan_out = tokio::spawn(async move {
+            attach_prepared_entries(entries, &writer, &live_sessions, &attached_ids, false).await
+        });
+
+        // Deterministic, not a race: with every slot held the attach cannot
+        // reach its snapshot, so this window can only expire.
+        let stalled =
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut fan_out).await;
+        assert!(stalled.is_err(), "attach ran with no replay slot available");
+
+        drop(hogged);
+        let attached = fan_out.await.unwrap();
+        assert_eq!(attached, HashSet::from([session_id]));
+    }
+
+    /// Queueing behind the cap is the one window in which an attach's target can
+    /// exit under it. `SessionExited` fans out with a `None` commit, so no
+    /// replay snapshot reproduces it; attaching anyway would install a sink on
+    /// a dead session and leave the client a pane it can never retire.
+    #[tokio::test]
+    async fn attach_skips_a_session_that_exited_while_queued() {
+        let live_sessions = crate::ipc_server::new_live_session_registry();
+        let entry = sample_entry(SessionId::new(), WorkspaceId::new());
+        let client_writer = Arc::clone(&entry.client_writer);
+        assert!(entry.exit_gate.claim_exit(), "a fresh entry's gate must start unclaimed");
+
+        let (server, _client) = unix_stream_pair();
+        let (_read, write) = tokio::io::split(server);
+        let writer: SharedWriter = crate::ipc_server::test_shared_writer(write);
+        let attached_ids: AttachedSessionIds = Arc::new(Mutex::new(HashSet::new()));
+
+        let attached =
+            attach_prepared_entries(vec![entry], &writer, &live_sessions, &attached_ids, false)
+                .await;
+
+        assert!(attached.is_empty(), "an exited session must not report as attached");
+        assert!(
+            crate::ipc_server::lock_sinks(&client_writer).is_empty(),
+            "no sink may be installed on a session that already exited"
+        );
     }
 }
