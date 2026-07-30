@@ -53,8 +53,62 @@ if [[ ! -d "$CODEX_DIR" ]]; then
     exit 0
 fi
 
+# Prelude prepended to every embedded Python step so each config write goes
+# through the same crash-safe path.
+PYTHON_PRELUDE=$(cat << 'PRELUDE_EOF'
+import os
+import stat
+import tempfile
+
+
+def atomic_write_text(path, text):
+    """Replace path's contents via a same-directory temp file and os.replace.
+
+    A crash between the write and the rename leaves the previous file
+    untouched, so an interrupted install can never truncate a config.
+    """
+    path = os.fspath(path)
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".scribe-tmp-")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except FileNotFoundError:
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+PRELUDE_EOF
+)
+
+# Reads a Python program on stdin, prepends the prelude, and runs it.
+scribe_python() {
+    { printf '%s\n' "$PYTHON_PRELUDE"; cat; } | python3
+}
+
 # ── Step 2: Enable Codex hooks in config.toml ────────────────────────────
-python3 << 'PYEOF'
+scribe_python << 'PYEOF'
 import os
 from pathlib import Path
 
@@ -101,7 +155,7 @@ else:
     if lines:
         text += "\n"
 
-config_path.write_text(text)
+atomic_write_text(config_path, text)
 print(f"  Updated {config_path}")
 print("  Enabled [features].hooks = true")
 if features_start is not None and removed_codex_hooks:
@@ -109,7 +163,7 @@ if features_start is not None and removed_codex_hooks:
 PYEOF
 
 # ── Step 3: Merge Scribe hooks into hooks.json or inline TOML ────────────
-python3 << 'PYEOF'
+scribe_python << 'PYEOF'
 import hashlib
 import json
 import os
@@ -243,11 +297,7 @@ def read_hooks_json():
 
 
 def write_hooks_json(config):
-    tmp_path = hooks_path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(config, f, indent=2)
-        f.write("\n")
-    os.replace(tmp_path, hooks_path)
+    atomic_write_text(hooks_path, json.dumps(config, indent=2) + "\n")
 
 
 def inline_hooks_present(text):
@@ -682,10 +732,7 @@ if inline_hooks_present(config_text):
     trust_entries.extend(prior_trust_entries_for(config_path, migrated_by_event, existing_state, migrated_base_indices))
     trust_entries.extend(scribe_trust_entries_for(config_path, scribe_by_event, scribe_base_indices))
     config_text = update_hook_trust_state(config_text, trust_entries)
-    tmp_path = config_path + ".tmp"
-    with open(tmp_path, "w") as f:
-        f.write(config_text)
-    os.replace(tmp_path, config_path)
+    atomic_write_text(config_path, config_text)
 
     if os.path.exists(hooks_path):
         os.remove(hooks_path)
@@ -709,10 +756,7 @@ else:
     trust_entries.extend(prior_trust_entries_for(hooks_path, hooks, existing_state))
     trust_entries.extend(scribe_trust_entries_for(hooks_path, hooks))
     config_text = update_hook_trust_state(config_text, trust_entries)
-    tmp_path = config_path + ".tmp"
-    with open(tmp_path, "w") as f:
-        f.write(config_text)
-    os.replace(tmp_path, config_path)
+    atomic_write_text(config_path, config_text)
 
     print(f"  Updated {hooks_path}")
     print(f"  Updated {config_path}")
