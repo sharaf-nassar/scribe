@@ -313,3 +313,179 @@ consequently a clean PTY-only counter.
    every server thread's `wchan`, then `kill -CONT` and poll `rchar`
    every 200 ms until it advances. Keep the whole script under the
    entrypoint's 30 s `timeout`.
+
+## Per-prompt metadata and client batch stats
+
+Captured at `b90c932` on 2026-07-29 (bead `scribe-i79.24`). Before-side for
+US6-1 (single-source title/bell), US6-2 (OSC 7 suppression + branch cache),
+US6-5 (config/theme cache for color queries), US3-2 (batch byte cap) and
+US3-3 (paced one-burst-per-redraw).
+
+### Rig
+
+Two throwaway processes built from `b90c932` in a detached worktree checkout,
+run against an isolated runtime directory so neither the live stable server nor
+the installed `scribe-dev` server is touched:
+
+```bash
+git switch --detach b90c932
+CARGO_BUILD_JOBS=12 cargo build --release -p scribe-server -p scribe-client -p scribe-test
+```
+
+Two measurement-only patches were applied to that detached checkout and
+discarded afterwards (they are not part of any commit):
+
+1. `scribe-common/src/socket.rs` — `runtime_dir()` honours
+   `SCRIBE_MEASURE_RUNTIME_DIR`, so the rig binds its own socket directory
+   instead of `/run/user/<uid>/scribe{,-dev}`. Nothing else reads the value; the
+   measured code paths are untouched.
+2. `scribe-client` — a `measure_batch` module plus four call sites
+   (`ipc_bridge::run_drain`, `sync_frames::drain_until_frame`, and the
+   `spawn_drain` closure in `main.rs`) that append one JSONL line per applied
+   drain batch when `SCRIBE_MEASURE_BATCH` names a file: raw events in the
+   batch, raw `PtyOutput` bytes in the batch, coalesced ops, committed sync
+   frames drained, and generation bumps (redraws).
+
+Environment for every run: `XDG_CONFIG_HOME`/`XDG_STATE_HOME`/`XDG_DATA_HOME`
+and `HOME` pointed at scratch directories; `HOME` is a fresh `git init` repo on
+branch `baseline-main`; config is a two-key `config.toml` selecting the built-in
+`minimal-dark` preset unless a row says otherwise. Socket paths live under
+`/tmp/claude-1000/i7924*` because `SUN_LEN` rejects longer ones.
+
+**Server-side counts.** The server ran under
+`strace -f -qq -e trace=openat,openat2 -o server.strace -s 300`, with a
+`scribe-test share-tap` relaying the only client (`scribe-test daemon`) so every
+frame in both directions landed in a JSONL record. Frame counts are
+`grep -c '"type":"<Variant>"'` deltas on that record; disk-read counts are
+`grep -c` deltas on the strace record (`/.git/HEAD"`, `/scribe/config.toml"`,
+`/scribe/themes/`). Each phase is bracketed by a 1.5 s settle so a delta is
+attributable to the phase alone; probes are driven with `scribe-test send`.
+
+**Client-side counts.** No tap and no strace (both would distort the firehose).
+An isolated server, a `scribe-test daemon` that owns the window and creates the
+session, and the real GPUI client joined additively into that window
+(`SCRIBE_JOIN_WINDOW`, with `[remote] sharing_mode = "free_for_all"`) so the
+daemon can type into the pane the client renders. Display is
+`Xvfb :99 -screen 0 1920x1080x24`; the client selected the RTX 3090 Vulkan
+adapter.
+
+### Per-prompt and per-sequence metadata frames
+
+One "prompt" is one `true` + Enter round trip through the packaged bash
+integration (`dist/shell-integration/bash/scribe.bash`), which emits OSC 133;D,
+OSC 7, two OSC 1337s, OSC 2 and OSC 133;A per cycle. `n` is the number of
+prompts or sequences in the phase; the OSC phases run their sequences inside a
+single command, so each carries exactly one extra prompt cycle whose
+contribution is visible in the neighbouring rows.
+
+| Phase | n | TitleChanged | Bell | GitBranch | CwdChanged | `.git/HEAD` opens | `config.toml` reads |
+|---|---|---|---|---|---|---|---|
+| prompt cycle, cwd = repo root | 20 | 40 (**2.00**/prompt) | 0 | 20 (1.00) | 20 (1.00) | 20 (1.00) | 0 |
+| prompt cycle, cwd 4 levels deep | 10 | 20 (2.00) | 0 | 10 (1.00) | 10 (1.00) | 50 (**5.00**) | 0 |
+| raw BEL ×10 | 10 | 2 (the prompt) | 20 (**2.00**/BEL) | 1 | 1 | 1 | 0 |
+| OSC 2, ST-terminated ×10 | 10 | 22 = 20 (**2.00**/seq) + 2 | 0 | 1 | 1 | 1 | 0 |
+| OSC 0, BEL-terminated ×10 | 10 | 22 = 20 (**2.00**/seq) + 2 | 0 | 1 | 1 | 1 | 0 |
+| OSC 7, same value ×10 | 10 | 2 (the prompt) | 0 | 11 = 10 (**1.00**/seq) + 1 | 11 (1.00) | 11 (1.00) | 0 |
+| OSC 4 probe, indices 0–255 | 256 | 2 (the prompt) | 622 | 1 | 1 | 1 | 256 (**1.00**) |
+| OSC 10 + OSC 11 queries ×10 each | 20 | 2 (the prompt) | 0 | 1 | 1 | 1 | **0** |
+
+Observations that the after-side has to reproduce as changed numbers:
+
+- **Two `TitleChanged` frames per title sequence** (US6-1), independent of the
+  terminator. A `;`-containing title produces two frames with *different*
+  payloads — `printf '\e]2;alpha;beta\e\\'` emitted `title="alpha"` followed by
+  `title="alpha;beta"`, so the pair is not even deduplicable by string equality.
+- **Two `Bell` frames per BEL byte** (US6-1). A BEL that terminates an OSC is
+  consumed as the terminator and produces none, which is why the OSC 0 row shows
+  zero bells and the OSC 4 row shows 622: those are the probe's own BEL
+  terminators plus the BELs in the server's echoed OSC 4 replies.
+- **No OSC 7 last-value suppression** (US6-2): ten identical OSC 7 values cost
+  ten `GitBranch` frames, ten `CwdChanged` frames and ten `.git/HEAD` opens.
+- **The `.git/HEAD` walk is uncached and linear in depth** (US6-2): 1 open per
+  prompt at the repo root, 5 per prompt from a directory four levels below it
+  (four `ENOENT` probes plus the hit).
+- **OSC 10/11 cost no config read**: the `Term`'s foreground/background entries
+  are populated, so only the OSC 4 palette indices miss into the config path.
+
+### Branch detection with no attached sink
+
+The session emitted OSC 7 at 4 Hz from a background script while the only client
+disconnected (`scribe-test daemon stop`), with `strace` still attached:
+
+| Sink state | `.git/HEAD` opens in a 4 s window |
+|---|---|
+| one sink attached | 15 |
+| zero sinks (detached) | 15 |
+
+Branch detection runs at full cost and the result is discarded when the sink set
+is empty — the before-side for the detached-session skip in US6-2.
+
+### Config and theme reads per OSC 4 probe
+
+An OSC 4 probe over all 256 palette indices, once with a built-in preset theme
+and once with an external theme file (`themes/baseline-external.toml`):
+
+| Theme kind | `config.toml` reads | `themes/*.toml` reads | Disk reads per color query |
+|---|---|---|---|
+| built-in preset (`minimal-dark`) | 256 | 0 | 1 |
+| external theme file | 256 | 256 | **2** |
+
+Every palette query misses the `Term` colour table and re-reads *and re-parses*
+the whole config; an external theme adds a second file read and parse. This is
+the before-side for US6-5 ("OSC 4 probe = zero disk reads warm").
+
+### Client drain batches and drained-events-per-redraw
+
+Three workloads in the same session, in the order run. "Events" are raw
+`InboundEvent`s folded into one 4 ms / 100-event batch window; "bytes" are the
+raw `PtyOutput` bytes in that batch; "frames" are committed synchronized-update
+frames popped by `drain_until_frame`; "redraws" are generation bumps.
+
+| Workload | Batches | Events/batch (mean, p50, max) | Bytes/batch (mean, p50, max) | At the 100-event cap | Frames/batch | Redraws/batch |
+|---|---|---|---|---|---|---|
+| `yes`, 15 s (110 MB) | 12 804 | 99.98, 100, 100 | 8 669, 8 227, 26 317 | **100.0 %** | 1.00 | 1.00 |
+| `cat` of a 64 MiB text file | 110 | 53.5, 64, 64 | **623 063, 679 716, 932 878** | 0 % | 1.03 | 1.03 |
+| 4 000 `CSI ?2026` frames | 44 | 88.6, 97, 100 | 2 982, 3 300, 3 564 | 45.5 % | **91.0** | 1.05 |
+
+Derived headline numbers:
+
+| Metric | `yes` | `cat` 64 MiB | sync frames |
+|---|---|---|---|
+| drained events per redraw | **99.96** | 52.09 | 84.72 |
+| committed frames per redraw | 1.00 | 1.00 | **87.07** |
+| bytes per redraw | 8 668 | 606 522 | 2 852 |
+
+- **US3-2 (batch byte cap).** Under `yes` the batch is count-bounded: every
+  batch hits `MAX_BATCH_EVENTS = 100` and carries only ~8.7 KB, because the
+  server's `PtyOutput` chunks average 87 bytes. Under `cat` the same window
+  is byte-dominated — 64 events of ~11.6 KB each, a mean of 609 KiB and a
+  maximum of 911 KiB per batch — 89 % of the 1 MiB cap the fix proposes, with no
+  bound in the code today other than `PTY_READ_BUF_SIZE` (64 KiB) × 100 =
+  6.4 MiB.
+- **US3-3 (paced one-burst-per-redraw).** The synchronized-frame workload is the
+  clearest before-side: `drain_all_committed` replays a mean of 91 committed
+  frames per batch into the grid but raises only 1.05 redraws, i.e. **87
+  committed frames are fully parsed per visible redraw** and 86 of them are
+  never shown. `OUTPUT_FRAME_CATCH_UP_THRESHOLD = 4` means even the existing
+  `drain_until_frame` collapses them, so the pacing wire-in has to change this
+  number, not just the call site.
+
+### Caveats
+
+- The client's perf probe reported `frames=1` for every run: bare `Xvfb` has no
+  window manager, so GPUI never entered a repaint cycle. The counters above are
+  drain-side (IPC thread) and are unaffected, but they are *not* end-to-end
+  paint rates, and the render thread never contended for the `panes` mutex
+  during these runs.
+- Both a `scribe-test daemon` and the GPUI client were attached during the
+  client workloads (the shared-window arrangement is what lets the harness type
+  into the rendered pane), so the server fanned every frame out twice. The
+  client still received exactly one copy of each frame.
+- `SessionReplay` sizes were not measured: the harness deliberately ignores
+  `SessionReplay` at `daemon.rs:383-387`, and teaching it to inflate replays is
+  its own Wave 1 item. The `cat` row is the largest single-batch evidence
+  available at `b90c932`.
+- Counts come from one run per phase, not a median of repeats. They are
+  integer-exact per unit (2.00 titles, 1.00 branch walks, 1.00 config reads), so
+  repeats would not move them; the batch-size distributions are the only rows
+  with run-to-run spread.
