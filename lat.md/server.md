@@ -38,6 +38,8 @@ The read is raced against a per-session cancellation signal, and the task's `Joi
 
 The gate also holds the exactly-once exit funnel. Reader EOF, a reader read error, reader cancellation, an explicit `CloseSession`/`CloseWindow`, and the child-exit watcher all call [[crates/scribe-server/src/ipc_server.rs#finalize_session_exit|one idempotent finalizer]]; a compare-and-swap on the gate elects exactly one of them to emit `SessionExited` and unwire the session from the live registry, the attachment set, and the workspace manager. A close racing the child's own death therefore neither double-emits nor drops the notification. A master EOF only proves that every slave fd closed, which a live child can do on its own, so when a child-exit watcher is armed it is the authoritative emitter and the reader's EOF path yields to it; handoff-inherited sessions arm no watcher and keep the EOF path with `exit_code: None`.
 
+The `Pty` itself is never dropped inline. `LiveSession` parks it in a [[crates/scribe-server/src/pty_guard.rs#PtyGuard|PtyGuard]], and every path that ends a session — both close handlers and the finalizer's registry removal — hands it to [[crates/scribe-server/src/pty_guard.rs#PtyGuard#teardown|teardown]], which moves the `Pty` onto the blocking pool. `Pty::Drop` still does the SIGHUP and the `waitpid`, but now off every Tokio worker and after every lock is released; `CloseWindow`, which used to run it under the global live-session write guard, collects the guards inside that guard and tears them down outside it. A child that ignores SIGHUP therefore parks one blocking-pool thread instead of a worker and the registry. Dropping a guard nobody tore down takes the same off-worker route, so a missed call site degrades to a late reap rather than a stall.
+
 For supported AI coding sessions, an  strips `\x1b[3J` before forwarding PTY output to the client and the server's Term. Prompt text, attention/error states, and inactive markers start a scrollback trim epoch; the first suppressed clear captures the baseline after replay, and later suppressed clears in that epoch trim both Terms back to it before replaying the redraw bytes. This keeps committed AI transcript history while preventing inline AI redraws from piling duplicate frames into scrollback. The old `/clear` bypass no longer exists.
 
 The server-side ANSI processor also honors VTE synchronized updates (`CSI ? 2026 h/l`). If a sync block remains open past the parser timeout, the reader task flushes the buffered bytes into the server's Term before polling again so snapshots, reconnect, and search do not lag behind buffered Codex output forever.
@@ -58,7 +60,7 @@ Terminal query callbacks share that same reader-task path. Clipboard loads, text
 
 Client disconnection clears the client writer, while PTY EOF removes that session from live and ownership state before reconnect or handoff.
 
-`CloseWindow` removes the whole window and its persisted tree. `CloseSession` and `CloseWindow` rely on `Pty::Drop` to send SIGHUP for fresh sessions, but handoff-restored sessions have `pty: None` so  sends `kill(child_pid, SIGHUP)` explicitly. Neither signal guarantees the reader ever sees EOF — the child may trap SIGHUP, and the master fd stays open in the reader and the resize fd regardless — so both close paths cancel the session's exit gate and drive the same finalizer described under [[server#Server#Sessions#PTY Reader Task|PTY Reader Task]]. `CloseWindow` does that after its `WindowClosed` reply so the pre-existing reply ordering is preserved.
+`CloseWindow` removes the whole window and its persisted tree. `CloseSession` and `CloseWindow` tear down the session's [[crates/scribe-server/src/pty_guard.rs#PtyGuard|PtyGuard]] for fresh sessions, which sends SIGHUP off-worker, but handoff-restored sessions have `pty: None` so  sends `kill(child_pid, SIGHUP)` explicitly. Neither signal guarantees the reader ever sees EOF — the child may trap SIGHUP, and the master fd stays open in the reader and the resize fd regardless — so both close paths cancel the session's exit gate and drive the same finalizer described under [[server#Server#Sessions#PTY Reader Task|PTY Reader Task]]. `CloseWindow` does that after its `WindowClosed` reply so the pre-existing reply ordering is preserved.
 
 Each live session also tracks the current client's attached-session set alongside its writer. Reattach swaps both handles together, disconnect clears both, and PTY EOF removes the session ID from that per-client set before the connection loop sees the exit. Long-lived clients therefore do not accumulate stale attachment IDs as short-lived sessions churn.
 
@@ -184,9 +186,9 @@ Alt-screen sessions carry only the visible grid in the replay; alt-grid history 
 
 ### Defuse Strategy
 
-Before the old server exits, Pty objects are wrapped in `ManuallyDrop` to prevent their Drop impl from sending SIGHUP to child processes.
+Before the old server exits, each session's [[crates/scribe-server/src/pty_guard.rs#PtyGuard|PtyGuard]] is [[crates/scribe-server/src/pty_guard.rs#PtyGuard#defuse|defused]], leaking the inner Pty through `ManuallyDrop` so its Drop impl never sends SIGHUP to the child.
 
-The new server already holds the master fds via SCM_RIGHTS. Because defused sessions have `pty: None`, close handlers use  to send SIGHUP explicitly when those sessions are later destroyed.
+Defuse is the guard's opposite of teardown: teardown exists to run `Pty::Drop` somewhere harmless, defuse exists to guarantee it never runs at all, so it consumes the guard inline rather than handing it to the blocking pool. The new server already holds the master fds via SCM_RIGHTS. Because defused sessions have `pty: None`, close handlers use  to send SIGHUP explicitly when those sessions are later destroyed.
 
 ### Size Limits
 
@@ -424,7 +426,7 @@ Clean user-initiated closes delete the on-disk envelope and its keystore DEK; no
 
 Each  stashes its `env_window_id` and optional `env_envelope_id` at create time so the close path can route the delete after the `session_to_window` mapping has been torn down. The envelope id flows from `ClientMessage::CreateSession.env_envelope_id` →  →  → `LiveSession`, and is `None` for fresh first-time creations and for handoff-restored sessions (handoff keeps env on the existing PTY across hot-reload, so no envelope is ever written for those).
 
- is the clean-close path. After removing the session from the live registry and triggering `Pty::Drop` (which SIGHUPs the child), it calls  with the stashed coordinates. The call is best-effort: `delete_envelope` is idempotent and swallows `NotFound`, so it is safe to call when the feature was off at create time (no envelope exists) or when the persist scheduler had not yet flushed a first write. Errors are logged at `warn` against `target: "scribe_server::ipc_server"` but never block the close.
+ is the clean-close path. After removing the session from the live registry and tearing down its [[crates/scribe-server/src/pty_guard.rs#PtyGuard|PtyGuard]] (which SIGHUPs and reaps the child off-worker), it calls  with the stashed coordinates. The call is best-effort: `delete_envelope` is idempotent and swallows `NotFound`, so it is safe to call when the feature was off at create time (no envelope exists) or when the persist scheduler had not yet flushed a first write. Errors are logged at `warn` against `target: "scribe_server::ipc_server"` but never block the close.
 
  sweeps the whole window via  after destroying every session it owns. Same best-effort posture — a missing per-window directory is success.
 

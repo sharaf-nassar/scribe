@@ -50,6 +50,7 @@ use crate::lan::trust::{
     APPROVAL_TIMEOUT, ApprovalOutcome, ApprovalRequest, DeviceId, PendingApprovals,
     SharedTrustedDevices, TrustedDevicesStore, decode_device_id_hex,
 };
+use crate::pty_guard::PtyGuard;
 use crate::releases::{ReleaseCatalog, ReleaseFetcher};
 use crate::session_exit::{CancelWaiter, SessionExitGate};
 use crate::session_manager::{
@@ -864,9 +865,11 @@ pub struct LiveSession {
     cell_width: u16,
     cell_height: u16,
     /// Keep the Pty alive so the child process isn't killed by SIGHUP on Drop.
-    /// `None` for sessions restored from a hot-reload handoff. Taken and leaked
-    /// by `defuse_for_handoff` during hot-reload to prevent SIGHUP.
-    pty: Option<alacritty_terminal::tty::Pty>,
+    /// `None` for sessions restored from a hot-reload handoff. Taken by the
+    /// close paths, which route the SIGHUP + `waitpid` off-worker through
+    /// [`PtyGuard::teardown`], and by `defuse_for_handoff`, which leaks it via
+    /// [`PtyGuard::defuse`] so a hot-reload never hangs up on a child.
+    pty: Option<PtyGuard>,
     /// Screen snapshot from a hot-reload handoff, sent to the first client
     /// that attaches. Taken (cleared) after first use.
     pub(crate) handoff_snapshot: Option<scribe_common::screen::ScreenSnapshot>,
@@ -952,6 +955,13 @@ impl LiveSession {
 
     pub fn take_handoff_snapshot(&mut self) -> Option<ScreenSnapshot> {
         self.handoff_snapshot.take()
+    }
+
+    /// Take the session's PTY guard so a close path can tear it down after it
+    /// has released every lock. `None` for handoff-restored sessions, which
+    /// [`signal_if_handoff_session`] hangs up on explicitly instead.
+    fn take_pty(&mut self) -> Option<PtyGuard> {
+        self.pty.take()
     }
 
     /// Clone the handles a close path needs to drive the exit funnel after the
@@ -5936,12 +5946,12 @@ async fn handle_focus_changed(
 ///
 /// After a hot-reload handoff the `pty` field is `None` because we only
 /// received the master fd via `SCM_RIGHTS`, not the original `Pty` object.
-/// Without the `Pty`, dropping the `LiveSession` does not send `SIGHUP`
+/// Without the `Pty` there is no guard to tear down, so nothing sends `SIGHUP`
 /// to the child. This helper fills that gap so `CloseSession` and
 /// `CloseWindow` can clean up handoff-restored sessions correctly.
 fn signal_if_handoff_session(session_id: SessionId, session: &LiveSession) {
     if session.pty.is_some() {
-        return; // `Pty::Drop` will send SIGHUP.
+        return; // `PtyGuard::teardown` will send SIGHUP off-worker.
     }
     let pid = session.child_pid.cast_signed();
     info!(%session_id, pid, "sending SIGHUP to handoff-restored session");
@@ -5950,10 +5960,11 @@ fn signal_if_handoff_session(session_id: SessionId, session: &LiveSession) {
     }
 }
 
-/// Close a session and clean up. For fresh sessions the `Pty::Drop` inside
-/// `LiveSession` sends SIGHUP to the child process; for handoff-restored
-/// sessions (`pty: None`) we send SIGHUP explicitly so the child is not
-/// leaked. Neither guarantees an EOF — the child may ignore SIGHUP, and the
+/// Close a session and clean up. For fresh sessions [`PtyGuard::teardown`]
+/// hands the `Pty` to the blocking pool, where its `Drop` signals and reaps
+/// the child off any worker; for handoff-restored sessions (`pty: None`) we
+/// send SIGHUP explicitly so the child is not leaked. Neither guarantees an
+/// EOF — the child may ignore SIGHUP, and the
 /// master fd stays open in the reader and the resize fd regardless — so the
 /// close cancels the reader's exit gate up front and then drives the same
 /// [`finalize_session_exit`] funnel the reader would have, as a backstop for a
@@ -5977,11 +5988,10 @@ async fn handle_close_session(
         return;
     }
 
-    let removed = live_sessions.write().await.remove(&session_id);
+    let mut removed = live_sessions.write().await.remove(&session_id);
     // Capture envelope coordinates before the session value is dropped so
     // we can fire the delete after SIGHUP cleanup. Cloned (rather than
-    // moved) to keep the existing `drop(removed)` step that triggers
-    // `Pty::Drop` for fresh sessions.
+    // moved) to keep the existing `drop(removed)` ordering.
     let envelope_coords = removed
         .as_ref()
         .and_then(|s| s.env_envelope_id.as_ref().map(|id| (s.env_window_id, id.clone())));
@@ -5991,7 +6001,11 @@ async fn handle_close_session(
     if let Some(session) = &removed {
         signal_if_handoff_session(session_id, session);
     }
-    // `removed` is dropped here — if `pty` is `Some`, `Pty::Drop` sends SIGHUP.
+    // SIGHUP + `waitpid` go to the blocking pool: a child that ignores the
+    // signal must not park the worker running this close.
+    if let Some(pty) = removed.as_mut().and_then(LiveSession::take_pty) {
+        pty.teardown();
+    }
     drop(removed);
     // Cancel before anything that can await: this is what actually stops a
     // reader whose child ignored SIGHUP, and it takes no lock.
@@ -6067,21 +6081,29 @@ async fn handle_close_window(window_id: WindowId, context: &ClientDispatchContex
     let session_ids = context.server.workspace_manager.read().await.sessions_for_window(window_id);
     info!(%window_id, count = session_ids.len(), "closing window — destroying sessions");
 
-    // Destroy each session. For fresh sessions `Pty::Drop` sends SIGHUP;
-    // for handoff-restored sessions (`pty: None`) we signal explicitly.
-    // Exit handles are cloned out for the post-reply teardown below, since
-    // neither signal guarantees the reader ever sees EOF.
+    // Destroy each session. For handoff-restored sessions (`pty: None`) we
+    // signal explicitly; fresh sessions keep their `PtyGuard`, torn down below
+    // once the registry guard is released. Exit handles are cloned out for the
+    // post-reply teardown, since neither signal guarantees the reader ever
+    // sees EOF.
     let mut exit_handles = Vec::with_capacity(session_ids.len());
+    let mut ptys = Vec::with_capacity(session_ids.len());
     {
         let mut sessions = context.server.live_sessions.write().await;
         for &sid in &session_ids {
-            if let Some(session) = sessions.remove(&sid) {
+            if let Some(mut session) = sessions.remove(&sid) {
                 exit_handles.push((sid, session.exit_handles()));
                 signal_if_handoff_session(sid, &session);
-                // `session` dropped here — `Pty::Drop` fires if `pty` is `Some`.
+                ptys.extend(session.take_pty());
             }
             attached_remove(context.attached_ids, sid).await;
         }
+    }
+    // Registry guard released — only now do we hand the children to the
+    // blocking pool, so a SIGHUP-ignoring child can neither hold the global
+    // `live_sessions` write lock nor park a Tokio worker.
+    for pty in ptys {
+        pty.teardown();
     }
 
     // Remove window and all session→window mappings.
@@ -7907,7 +7929,14 @@ async fn finalize_session_exit(
     let exit_msg = ServerMessage::SessionExited { session_id: ctx.session_id, exit_code };
     send_to_client(ctx.client_writer, &exit_msg).await;
     remove_from_session_attachment(ctx.attachment, ctx.session_id).await;
-    ctx.live_sessions.write().await.remove(&ctx.session_id);
+    // Bind the removed session: dropping it inline would run `Pty::Drop`
+    // (SIGHUP + blocking `waitpid`) while the registry write guard is still
+    // held. Teardown happens after the guard is gone, on the blocking pool.
+    let mut removed = ctx.live_sessions.write().await.remove(&ctx.session_id);
+    if let Some(pty) = removed.as_mut().and_then(LiveSession::take_pty) {
+        pty.teardown();
+    }
+    drop(removed);
     let mut workspace_manager = ctx.workspace_manager.write().await;
     workspace_manager.remove_session(ctx.session_id);
     workspace_manager.remove_session_from_window(ctx.session_id);
@@ -9422,10 +9451,11 @@ pub async fn activate_pending_sessions(
 pub async fn defuse_for_handoff(live_sessions: &LiveSessionRegistry) {
     let mut sessions = live_sessions.write().await;
     for (&session_id, session) in sessions.iter_mut() {
-        if let Some(pty) = session.pty.take() {
-            // Wrap in ManuallyDrop to prevent Pty::drop() from running.
-            // ManuallyDrop does not call the inner type's Drop on scope exit.
-            let _defused = std::mem::ManuallyDrop::new(pty);
+        if let Some(pty) = session.take_pty() {
+            // `defuse` leaks the inner `Pty` through `ManuallyDrop`, so
+            // `Pty::drop` never runs and the child keeps living under the new
+            // server, which already holds the master fd.
+            pty.defuse();
             info!(%session_id, "defused Pty to prevent SIGHUP on exit");
         }
     }

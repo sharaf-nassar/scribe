@@ -18,6 +18,7 @@ mod handoff;
 mod hook_ingress;
 mod ipc_server;
 mod macos_proc;
+mod pty_guard;
 mod releases;
 mod session_manager;
 mod shell_integration;

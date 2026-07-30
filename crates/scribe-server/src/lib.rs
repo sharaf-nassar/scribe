@@ -14,6 +14,7 @@ pub mod hook_ingress;
 pub mod ipc_server;
 pub mod lan;
 pub mod macos_proc;
+pub mod pty_guard;
 pub mod releases;
 pub mod session_exit;
 pub mod session_manager;
