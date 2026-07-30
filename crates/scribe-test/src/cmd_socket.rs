@@ -15,9 +15,25 @@ use tokio::net::UnixStream;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum DaemonRequest {
-    CreateSession,
+    /// Create a session, optionally naming the grid the PTY is spawned at.
+    ///
+    /// A real client always names one — the pane the session is about to be
+    /// rendered in — so the PTY never starts on a placeholder grid it has to be
+    /// resized off. `None` keeps the server's own 80x24 default, which is what
+    /// every pre-existing E2E script was written against.
+    CreateSession {
+        cols: Option<u16>,
+        rows: Option<u16>,
+    },
+    /// Attach to a session, optionally naming the grid to attach at.
+    ///
+    /// `None` attaches with no dimensions at all, which leaves the session's
+    /// geometry untouched; naming the grid exercises the attach flow's
+    /// pre-snapshot resize the way a real client's tab switch does.
     AttachSession {
         session_id: SessionId,
+        cols: Option<u16>,
+        rows: Option<u16>,
     },
     CloseSession {
         session_id: SessionId,

@@ -308,6 +308,17 @@ struct Shared {
     /// The session in the focused pane: what keystrokes reach and what the
     /// status bar, prompt bar, and tab-context suffix describe.
     active_session: Arc<Mutex<Option<SessionId>>>,
+    /// The focused pane's live grid, republished by [`TerminalView::publish_pane_sizes`]
+    /// whenever the measured layout or the cell metrics move.
+    ///
+    /// The IPC reader attaches on its own thread and cannot measure anything, so
+    /// it used to carry the nominal [`COLUMNS`]x[`ROWS`] startup box for the
+    /// whole life of the window. Every attach then drove the PTY to that fixed
+    /// grid before the next redraw drove it back, which is a shrink and a regrow
+    /// the foreground process sees as two `SIGWINCH`es. An attach is always
+    /// "show this session in the focused pane", so the focused pane's own grid
+    /// is the geometry it should carry.
+    focused_size: Arc<Mutex<TerminalSize>>,
     /// Ordered tab strip. The IPC reader rebuilds it from `SessionList` /
     /// `SessionCreated` / `SessionExited`; the key-dispatch path moves its
     /// selection for the `next_tab` / `prev_tab` / `select_tab_N` shortcuts.
@@ -3854,9 +3865,7 @@ impl TerminalView {
         for placement in placements {
             let size = self.grid_size_for(placement.rect);
             if placement.focused {
-                // A new tab and a split both open into the focused pane, so the
-                // size they announce has to be that pane's, not the window's.
-                self.focused_pane_size = size;
+                self.adopt_focused_pane_size(size);
             }
             let Some(session_id) = placement.session_id else { continue };
             if self.pane_sizes.get(&session_id) == Some(&size) {
@@ -3879,6 +3888,21 @@ impl TerminalView {
                 rows = size.rows,
                 "published a pane's grid size"
             );
+        }
+    }
+
+    /// Record the focused pane's grid on both sides of the window.
+    ///
+    /// A new tab and a split both open into the focused pane, so the size they
+    /// announce has to be that pane's, not the window's. The IPC reader attaches
+    /// into that same pane from its own thread and can measure nothing, so the
+    /// value is mirrored into [`Shared`] rather than kept on the view alone.
+    fn adopt_focused_pane_size(&mut self, size: TerminalSize) {
+        self.focused_pane_size = size;
+        if let Ok(mut focused) = self.shared.focused_size.lock() {
+            *focused = size;
+        } else {
+            tracing::warn!("focused-size mutex poisoned; the reader keeps the old grid");
         }
     }
 
@@ -6654,6 +6678,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         status: Arc::new(Mutex::new("connecting to Scribe server…".to_owned())),
         generation: Arc::new(AtomicU64::new(0)),
         active_session: Arc::new(Mutex::new(None)),
+        focused_size: Arc::new(Mutex::new(terminal_size)),
         tabs: Arc::new(Mutex::new(TabSessions::new())),
         connected: Arc::new(AtomicBool::new(false)),
         session_list_seen: Arc::new(AtomicBool::new(false)),
@@ -6686,7 +6711,6 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         out_rx,
         in_tx,
         in_rx: Some(in_rx),
-        size: terminal_size,
     });
 
     (shared, sink)
@@ -6876,7 +6900,6 @@ struct IpcThread {
     out_rx: OutboundReceiver,
     in_tx: InboundSender,
     in_rx: Option<InboundReceiver>,
-    size: TerminalSize,
 }
 
 fn start_ipc_thread(ctx: IpcThread) {
@@ -7294,6 +7317,7 @@ fn reader_ctx(ctx: &IpcThread) -> ReaderCtx {
         status: Arc::clone(&ctx.shared.status),
         generation: Arc::clone(&ctx.shared.generation),
         active_session: Arc::clone(&ctx.shared.active_session),
+        focused_size: Arc::clone(&ctx.shared.focused_size),
         ai: Arc::clone(&ctx.shared.ai),
         chrome_metadata: Arc::clone(&ctx.shared.chrome_metadata),
         tabs: Arc::clone(&ctx.shared.tabs),
@@ -7313,7 +7337,6 @@ fn reader_ctx(ctx: &IpcThread) -> ReaderCtx {
         out_tx: ctx.out_tx.clone(),
         in_tx: ctx.in_tx.clone(),
         sink: ctx.sink.clone(),
-        size: ctx.size,
     }
 }
 
@@ -7647,6 +7670,8 @@ struct ReaderCtx {
     status: Arc<Mutex<String>>,
     generation: Arc<AtomicU64>,
     active_session: Arc<Mutex<Option<SessionId>>>,
+    /// The focused pane's live grid; see the `focused_size` field of `Shared`.
+    focused_size: Arc<Mutex<TerminalSize>>,
     /// AI state + prompt history the chrome renders from.
     ai: Arc<Mutex<AiChrome>>,
     /// Server-reported terminal chrome the status bar renders from.
@@ -7692,7 +7717,16 @@ struct ReaderCtx {
     out_tx: OutboundSender,
     in_tx: InboundSender,
     sink: IpcSink,
-    size: TerminalSize,
+}
+
+/// The grid the reader announces when it attaches a session.
+///
+/// Reads the focused pane's live size, falling back to the nominal startup box
+/// only if the GPUI thread poisoned the lock — which is the same box the window
+/// opens at, so a poisoned lock costs at most the resize a first redraw would
+/// have published anyway.
+fn reader_attach_size(ctx: &ReaderCtx) -> TerminalSize {
+    ctx.focused_size.lock().map_or_else(|_| default_terminal_size(), |size| *size)
 }
 
 /// Park a clicked notification's session for the foreground's lifecycle tick.
@@ -8335,20 +8369,21 @@ fn reattach_visible_sessions(ctx: &ReaderCtx, sessions: &[SessionInfo]) -> Resul
         return Ok(());
     }
 
+    let focused = reader_attach_size(ctx);
     let dimensions = ctx.panes.lock().map_or_else(
-        |_| vec![ctx.size; retained.len()],
+        |_| vec![focused; retained.len()],
         |panes| {
             retained
                 .iter()
                 .map(|session_id| {
                     let Some((cols, rows)) = panes.dimensions(*session_id) else {
-                        return ctx.size;
+                        return focused;
                     };
                     TerminalSize {
-                        cols: u16::try_from(cols).unwrap_or(ctx.size.cols),
-                        rows: u16::try_from(rows).unwrap_or(ctx.size.rows),
-                        cell_width: ctx.size.cell_width,
-                        cell_height: ctx.size.cell_height,
+                        cols: u16::try_from(cols).unwrap_or(focused.cols),
+                        rows: u16::try_from(rows).unwrap_or(focused.rows),
+                        cell_width: focused.cell_width,
+                        cell_height: focused.cell_height,
                     }
                 })
                 .collect()
@@ -9090,11 +9125,16 @@ fn dispatch_share_message(message: ServerMessage, ctx: &ReaderCtx) {
     }
 }
 
-/// Add a freshly created session to the tab strip, focus it, and attach.
+/// Add a freshly created session to the tab strip, focus it, and make it stream.
 ///
 /// The server also re-announces `SessionCreated` to acknowledge every
 /// `AttachSessions`, so only a genuine insert counts as a new tab — attaching
 /// on the echo would attach in an unbounded loop.
+///
+/// Which of the two routes a genuine insert takes is decided by
+/// [`IpcSink::claim_pending_create`]: the answer to a `CreateSession` this
+/// window sent is already attached and already at the geometry the request
+/// named, so it is adopted rather than re-attached.
 fn open_created_tab(
     ctx: &ReaderCtx,
     session_id: SessionId,
@@ -9110,7 +9150,11 @@ fn open_created_tab(
     let entry = TabEntry::new(session_id, workspace_id, shell_name);
     let added = ctx.tabs.lock().is_ok_and(|mut tabs| tabs.insert_active(entry));
     if added {
-        attach_session(ctx, session_id)?;
+        if ctx.sink.claim_pending_create() {
+            adopt_created_session(ctx, session_id)?;
+        } else {
+            attach_session(ctx, session_id)?;
+        }
         set_status(&ctx.status, &ctx.generation, "opened a new tab".to_owned());
         // The tab strip is pixels only; log the insert so a scripted E2E can
         // assert that an action really produced a session round trip.
@@ -9187,23 +9231,51 @@ fn attach_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> 
     // showing a live pane" is the readiness gate the visual E2E rig waits on
     // before it drives the window; a screenshot cannot tell an unattached
     // client from an idle one.
-    tracing::info!(%session_id, "attaching to session");
+    let size = reader_attach_size(ctx);
+    tracing::info!(%session_id, cols = size.cols, rows = size.rows, "attaching to session");
     ctx.out_tx
         .send(ClientMessage::AttachSessions {
             session_ids: vec![session_id],
-            dimensions: vec![ctx.size],
+            dimensions: vec![size],
         })
         .map_err(|error| error.to_string())?;
     // Announce the client size through the sink, ahead of any KeyInput.
-    ctx.sink.resize(session_id, ctx.size).map_err(|error| error.to_string())?;
+    ctx.sink.resize(session_id, size).map_err(|error| error.to_string())?;
     ctx.sink.subscribe(vec![session_id]).map_err(|error| error.to_string())?;
+    adopt_attached_session(ctx, session_id);
+    Ok(())
+}
+
+/// Take up a session the server attached on this client's behalf.
+///
+/// A `CreateSession` is an attach: the server installs this connection's sink
+/// while it starts the session and records the id in this connection's attached
+/// set, so the answer already arrives with the pane streaming. What is left is
+/// the client's own half of the same bookkeeping plus the `Subscribe` every
+/// visible pane needs — see [`attach_session`] for why that frame has to follow
+/// the attach on the ordered channel, which a create satisfies by having *been*
+/// the attach.
+///
+/// Deliberately sends neither `AttachSessions` nor `Resize`. The attach would
+/// re-point a sink that is already this connection's and pay for a full
+/// `SessionReplay` of a terminal that has emitted nothing, whose leading ED 2
+/// can erase the shell's own startup bytes; the resize would drive the PTY off
+/// the geometry the create just spawned it at and back again.
+fn adopt_created_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> {
+    tracing::info!(%session_id, "adopting a freshly created session; already attached");
+    ctx.sink.subscribe(vec![session_id]).map_err(|error| error.to_string())?;
+    adopt_attached_session(ctx, session_id);
+    Ok(())
+}
+
+/// Record that this client now streams and types into `session_id`.
+fn adopt_attached_session(ctx: &ReaderCtx, session_id: SessionId) {
     if let Ok(mut attached) = ctx.attached.lock() {
         attached.insert(session_id);
     }
     if let Ok(mut guard) = ctx.active_session.lock() {
         *guard = Some(session_id);
     }
-    Ok(())
 }
 
 fn forward_output(in_tx: &InboundSender, session_id: SessionId, bytes: Vec<u8>) {

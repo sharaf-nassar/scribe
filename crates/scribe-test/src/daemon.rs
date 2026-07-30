@@ -846,11 +846,12 @@ async fn process_request(
     shutdown: &Arc<Notify>,
 ) -> DaemonResponse {
     match request {
-        DaemonRequest::CreateSession => {
-            handle_create_session(state, notifiers, server_writer).await
+        DaemonRequest::CreateSession { cols, rows } => {
+            handle_create_session(harness_size(cols, rows), state, notifiers, server_writer).await
         }
-        DaemonRequest::AttachSession { session_id } => {
-            handle_attach_session(session_id, state, notifiers, server_writer).await
+        DaemonRequest::AttachSession { session_id, cols, rows } => {
+            let params = AttachParams { session_id, size: harness_size(cols, rows) };
+            handle_attach_session(params, state, notifiers, server_writer).await
         }
         DaemonRequest::CloseSession { session_id } => {
             handle_close_session(session_id, server_writer).await
@@ -927,8 +928,33 @@ async fn process_request(
 // Request handlers
 // ---------------------------------------------------------------------------
 
+/// Build the `TerminalSize` a `--cols` / `--rows` pair names, or `None` when the
+/// caller named neither.
+///
+/// The cell box is 1x1 for the same reason [`handle_resize`] uses it: the
+/// harness has no font, and matching that convention is what makes a create and
+/// a later attach or resize at the same grid produce a byte-identical
+/// `TIOCSWINSZ` — which the kernel answers with no `SIGWINCH` at all, so a test
+/// can count the signals a geometry change really costs.
+fn harness_size(cols: Option<u16>, rows: Option<u16>) -> Option<TerminalSize> {
+    match (cols, rows) {
+        (Some(cols), Some(rows)) => {
+            Some(TerminalSize { cols, rows, cell_width: 1, cell_height: 1 })
+        }
+        _ => None,
+    }
+}
+
+/// Everything one `AttachSession` request names. Grouped so the handler stays
+/// under Clippy's argument threshold.
+struct AttachParams {
+    session_id: SessionId,
+    size: Option<TerminalSize>,
+}
+
 /// Create a workspace, then a session within it.
 async fn handle_create_session(
+    size: Option<TerminalSize>,
     state: &SharedState,
     notifiers: &Arc<WaitNotifiers>,
     server_writer: &Arc<Mutex<OwnedWriteHalf>>,
@@ -959,7 +985,7 @@ async fn handle_create_session(
         workspace_id,
         split_direction: None,
         cwd: None,
-        size: None,
+        size,
         command: None,
         env_envelope_id: Some(envelope_id.clone()),
     };
@@ -974,6 +1000,15 @@ async fn handle_create_session(
             message: "timed out waiting for SessionCreated".to_owned(),
         };
     };
+    // A create IS an attach — the server installed this connection's sink while
+    // starting the session — so the harness follows it with the same `Subscribe`
+    // a real client sends and deliberately with no `AttachSessions`: re-attaching
+    // would replay a terminal that has emitted nothing and drive the PTY off the
+    // grid this request just spawned it at.
+    let sub = ClientMessage::Subscribe { session_ids: vec![session_id] };
+    if let Err(e) = send_to_server(server_writer, &sub).await {
+        warn!("failed to send Subscribe after create: {e}");
+    }
     state.lock().await.envelope_ids.insert(session_id, envelope_id);
     DaemonResponse::SessionCreated { session_id }
 }
@@ -983,12 +1018,16 @@ async fn handle_create_session(
 /// Sends `AttachSessions` + `Subscribe`, waits for the server to confirm
 /// by sending `SessionCreated`, then registers the session in daemon state.
 async fn handle_attach_session(
-    session_id: SessionId,
+    params: AttachParams,
     state: &SharedState,
     notifiers: &Arc<WaitNotifiers>,
     server_writer: &Arc<Mutex<OwnedWriteHalf>>,
 ) -> DaemonResponse {
-    let msg = ClientMessage::AttachSessions { session_ids: vec![session_id], dimensions: vec![] };
+    let AttachParams { session_id, size } = params;
+    let msg = ClientMessage::AttachSessions {
+        session_ids: vec![session_id],
+        dimensions: size.into_iter().collect(),
+    };
     if let Err(e) = send_to_server(server_writer, &msg).await {
         return DaemonResponse::Error { message: format!("failed to send AttachSessions: {e}") };
     }

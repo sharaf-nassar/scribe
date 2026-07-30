@@ -41,7 +41,10 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -1004,13 +1007,17 @@ pub struct SessionLaunch {
 #[derive(Debug, Clone)]
 pub struct IpcSink {
     tx: OutboundSender,
+    /// `CreateSession` frames this window has enqueued and not yet seen
+    /// answered. Shared by every clone, because the GPUI thread mints the
+    /// request and the IPC reader consumes the answer.
+    pending_creates: Arc<AtomicUsize>,
 }
 
 impl IpcSink {
     /// Wraps the IPC-writer channel sender.
     #[must_use]
     pub fn new(tx: OutboundSender) -> Self {
-        Self { tx }
+        Self { tx, pending_creates: Arc::new(AtomicUsize::new(0)) }
     }
 
     /// Enqueues encoded key bytes for `session_id`.
@@ -1065,18 +1072,48 @@ impl IpcSink {
     /// brand-new one has an envelope to start persisting into. Sending no id
     /// is what left fresh sessions unable to ever write one.
     ///
+    /// The request is counted before it is enqueued so the reader can recognise
+    /// its answer; see [`Self::claim_pending_create`]. Counting afterwards would
+    /// race the writer task, which can put the frame on the wire and have the
+    /// answer back before this thread resumes.
+    ///
     /// # Errors
     /// Returns [`SinkError`] when the writer task has dropped its receiver, or
     /// when the bounded outbound queue is at its cap and refusing frames.
     pub fn create_session(&self, launch: SessionLaunch) -> Result<(), SinkError> {
-        self.enqueue(ClientMessage::CreateSession {
+        self.pending_creates.fetch_add(1, Ordering::Release);
+        let result = self.enqueue(ClientMessage::CreateSession {
             workspace_id: launch.workspace_id,
             split_direction: None,
             cwd: launch.cwd,
             size: Some(launch.size),
             command: launch.command,
             env_envelope_id: Some(launch.launch_id),
-        })
+        });
+        if result.is_err() {
+            self.claim_pending_create();
+        }
+        result
+    }
+
+    /// Claim the oldest unanswered [`Self::create_session`], returning whether
+    /// there was one.
+    ///
+    /// The server answers a `CreateSession` with a `SessionCreated` carrying no
+    /// echo of the request, so the two are matched by the FIFO order the single
+    /// ordered writer channel guarantees — the same rule the launch bindings
+    /// follow. A claimed answer means the session is *already* attached to this
+    /// connection: the server installed this window's sink while starting it and
+    /// spawned the PTY at the geometry the request named, so re-attaching would
+    /// only re-point a sink that is already correct, pay for a whole replay of a
+    /// terminal with nothing in it, and drive the PTY through a second grid.
+    ///
+    /// A `SessionCreated` with no claim outstanding is the server acknowledging
+    /// an `AttachSessions`, which has to keep attaching.
+    pub fn claim_pending_create(&self) -> bool {
+        self.pending_creates
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| pending.checked_sub(1))
+            .is_ok()
     }
 
     /// Attaches `session_ids` at `dimensions`, switching which sessions stream
@@ -1524,6 +1561,16 @@ mod tests {
         TerminalSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 }
     }
 
+    fn sample_launch() -> SessionLaunch {
+        SessionLaunch {
+            workspace_id: WorkspaceId::new(),
+            size: sample_size(),
+            cwd: None,
+            command: None,
+            launch_id: "launch".to_owned(),
+        }
+    }
+
     /// Builds a strictly-alternating two-pane firehose plus the expected
     /// per-pane byte streams.
     fn firehose(
@@ -1805,6 +1852,33 @@ mod tests {
 
         drop(in_tx);
         drain.await.unwrap();
+    }
+
+    // @lat: [[test#GPUI IPC Bridge#Create answers are claimed once each]]
+    #[test]
+    fn create_session_answers_are_claimed_once_each() {
+        let (out_tx, _out_rx) = outbound_channel();
+        let sink = IpcSink::new(out_tx);
+        assert!(!sink.claim_pending_create(), "no create is outstanding yet");
+
+        sink.create_session(sample_launch()).unwrap();
+        sink.create_session(sample_launch()).unwrap();
+        // A clone shares the counter: the reader holds one, the GPUI view another.
+        let reader = sink.clone();
+        assert!(reader.claim_pending_create());
+        assert!(reader.claim_pending_create());
+        assert!(!reader.claim_pending_create(), "an attach echo must not claim a create");
+    }
+
+    // @lat: [[test#GPUI IPC Bridge#Refused create leaves nothing to claim]]
+    #[test]
+    fn refused_create_leaves_nothing_to_claim() {
+        let (out_tx, out_rx) = outbound_channel();
+        let sink = IpcSink::new(out_tx);
+        drop(out_rx);
+
+        assert!(sink.create_session(sample_launch()).is_err());
+        assert!(!sink.claim_pending_create(), "a create that never went out is not outstanding");
     }
 
     // @lat: [[test#GPUI IPC Bridge#Resize before key input]]
