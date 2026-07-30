@@ -714,6 +714,55 @@ exception. The Xvfb rig above was not re-run: at the measured batch sizes it
 would reproduce the before-side rows by construction, and a debug-build re-run
 would not be comparable to a release before-side.
 
+### After side: off-lock VTE parse and O(n) splitter (US3-2, US3-4)
+
+Checked on 2026-07-30 at worktree base `6cec57c` (bead `scribe-i79.4`). Two
+independent changes, measured separately because only one of them is a
+throughput number.
+
+**US3-4, the splitter.** `SyncUpdateFrameSplitter::split_frames` no longer walks
+input a byte at a time through a `Vec::remove(0)` staging buffer; it scans to the
+next `ESC`, bulk-copies the marker-free run, and only then tries to match a
+marker. Measured in a release build with a throwaway `throughput_probe` module
+that ran the pre-change implementation and the new one back to back over the same
+buffers, on the same machine as the rows above:
+
+| Workload | Before | After | Speedup |
+|---|---|---|---|
+| `yes`-shaped 87-byte chunks (the shape the before-side row measured) | 71 MiB/s, 13.43 ns/byte | 1 223 MiB/s, 0.78 ns/byte | **17.2x** |
+| 8 KiB marker-free chunks (one coalesced batch) | 81 MiB/s, 11.78 ns/byte | 3 216 MiB/s, 0.30 ns/byte | **39.7x** |
+| `CSI ?2026` frames, marker every ~700 bytes | 71 MiB/s, 13.38 ns/byte | 596 MiB/s, 1.60 ns/byte | **8.4x** |
+
+At the before-side `yes` rate (110 MB in 15 s) the splitter alone charged the
+drain ~98 ms/s of CPU; it now charges ~5.7 ms/s. Equivalence with the old
+implementation was checked by a throwaway differential harness — 50 000
+randomized multi-message cases over an alphabet biased toward marker bytes,
+comparing emitted frames, `inside_sync`, `opened_sync_update`, the withheld
+prefix, and `flush_timed_out` output after every message — plus three unit tests
+kept in place for the restart, withheld-prefix and all-escape paths.
+
+**US3-2, the parse off the `panes` lock.** `PaneGrids` now guards only its map;
+each entry is an `Arc<PaneGrid>` whose `PaneStream` (queue + grid) and published
+`PaneFrame` projection lock separately. `resolve_batch_panes` resolves a batch's
+panes under one short registry lock and releases it before any byte is parsed,
+and every per-frame read (`pane_content`, `selection_spans`, `sync_ime`,
+`sync_split_scroll`, the three scrollbar reads) is served from the projection
+rather than the grid. The projection holds an `Arc<Content>` that
+`make_content` publishes, so republishing after a parse — and handing a snapshot
+to `TerminalElement` — copies no rows.
+
+The Xvfb rig was not re-run, for the reason its own caveat gives: *"the render
+thread never contended for the `panes` mutex during these runs"* — bare Xvfb has
+no window manager, GPUI never entered a repaint cycle, and the rig reported
+`frames=1` throughout. It cannot measure the contention this item removes, and a
+debug-build re-run would not be comparable to the release before-side either.
+The property is instead pinned by
+`a_held_pane_stream_blocks_neither_the_registry_nor_a_paint`, which holds one
+pane's stream lock — standing in for a batch mid-parse — and asserts the registry
+stays free for another pane's batch and both panes still serve a projection. A
+paint-path read that regressed to reaching through the stream would deadlock that
+test rather than fail quietly.
+
 ## Per-prompt shell hook cost
 
 Wall time and process creations charged to one no-op prompt cycle by

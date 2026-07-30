@@ -204,7 +204,7 @@ pub fn drain_all_committed<T: OutputTarget>(
 }
 
 /// Streaming splitter that preserves raw synchronized-update markers and emits
-/// one raw frame per commit, ported verbatim from
+/// one raw frame per commit, ported from
 /// `crates/scribe-pty/src/sync_update_filter.rs` so the GPUI client no longer
 /// depends on the PTY crate for frame pacing.
 ///
@@ -213,7 +213,12 @@ pub fn drain_all_committed<T: OutputTarget>(
 /// after frame pacing has been decided.
 #[derive(Debug, Default)]
 struct SyncUpdateFrameSplitter {
+    /// A marker prefix chunked off the end of an earlier message, withheld
+    /// until the bytes that complete or break it arrive. Never longer than a
+    /// marker minus one byte, and always a strict prefix of one — the scan
+    /// resolves it before touching anything else.
     pending: Vec<u8>,
+    /// Bytes accumulated toward the frame currently being assembled.
     current: Vec<u8>,
     inside_sync: bool,
     opened_sync_update: bool,
@@ -222,36 +227,51 @@ struct SyncUpdateFrameSplitter {
 /// Start/end synchronized-update escapes.
 const BSU_CSI: [u8; 8] = *b"\x1b[?2026h";
 const ESU_CSI: [u8; 8] = *b"\x1b[?2026l";
+/// The bytes both markers share; only the trailing `h`/`l` tells them apart.
+/// A marker therefore contains exactly one [`ESC`], as its first byte, which is
+/// what makes the scan below able to restart at the next `ESC` after a failed
+/// match instead of backing up one byte at a time.
+const SYNC_HEAD: [u8; 7] = *b"\x1b[?2026";
+/// The byte every marker starts with, and the only byte a match can start on.
+const ESC: u8 = 0x1b;
 
 impl SyncUpdateFrameSplitter {
     /// Preserves sync markers in `input`, returning one raw frame per completed
     /// synchronized-update commit. Bytes outside a sync block are returned
     /// immediately as a tail frame.
+    ///
+    /// Firehose output is almost entirely marker-free, so the scan jumps to the
+    /// next `ESC` and bulk-copies everything before it rather than inspecting
+    /// each byte on its own.
     fn split_frames(&mut self, input: &[u8]) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
         self.opened_sync_update = false;
 
-        for &byte in input {
-            self.pending.push(byte);
-            if !is_sync_prefix(&self.pending) {
-                self.drain_pending_non_sync();
+        let mut remaining = self.resume_pending(input, &mut frames);
+        while !remaining.is_empty() {
+            let Some(offset) = remaining.iter().position(|byte| *byte == ESC) else {
+                self.current.extend_from_slice(remaining);
+                break;
+            };
+            let (plain, candidate) = remaining.split_at(offset);
+            self.current.extend_from_slice(plain);
+
+            // `candidate` starts on `ESC`, so the match is at least one byte
+            // long and `remaining` always shrinks — the loop cannot spin.
+            let (matched, rest) = candidate.split_at(sync_match_len(candidate));
+            if matched.len() == BSU_CSI.len() {
+                self.commit_marker(matched == BSU_CSI.as_slice(), &mut frames);
+                remaining = rest;
                 continue;
             }
-
-            if self.pending == BSU_CSI {
-                self.current.extend_from_slice(&BSU_CSI);
-                self.pending.clear();
-                self.opened_sync_update = !self.inside_sync;
-                self.inside_sync = true;
-                continue;
+            if rest.is_empty() {
+                // A marker chunked across IPC messages: hold the prefix back
+                // until the bytes that complete or break it arrive.
+                self.pending.extend_from_slice(matched);
+                break;
             }
-
-            if self.pending == ESU_CSI {
-                self.current.extend_from_slice(&ESU_CSI);
-                self.pending.clear();
-                self.inside_sync = false;
-                self.push_current_frame(&mut frames);
-            }
+            self.current.extend_from_slice(matched);
+            remaining = rest;
         }
 
         if !self.inside_sync && !self.current.is_empty() {
@@ -259,6 +279,60 @@ impl SyncUpdateFrameSplitter {
         }
 
         frames
+    }
+
+    /// Resolves a marker prefix carried over from an earlier message against the
+    /// head of `input`, returning the bytes the marker-free scan resumes on.
+    ///
+    /// `pending` only ever holds a strict marker prefix, so at most the seven
+    /// bytes needed to complete one are examined here; everything past that is
+    /// left to the bulk scan.
+    fn resume_pending<'a>(&mut self, input: &'a [u8], frames: &mut Vec<Vec<u8>>) -> &'a [u8] {
+        if self.pending.is_empty() {
+            return input;
+        }
+        let carried = self.pending.len();
+        let (head, tail) = input.split_at(BSU_CSI.len().saturating_sub(carried).min(input.len()));
+        let mut buffer = [0u8; BSU_CSI.len()];
+        for (slot, byte) in buffer.iter_mut().zip(self.pending.iter().chain(head)) {
+            *slot = *byte;
+        }
+        let (probe, _) = buffer.split_at(carried + head.len());
+
+        let matched = sync_match_len(probe);
+        if matched == BSU_CSI.len() {
+            self.pending.clear();
+            self.commit_marker(probe == BSU_CSI.as_slice(), frames);
+            return tail;
+        }
+        if matched == probe.len() {
+            // Still only a prefix, and an exhausted `input` proving it.
+            self.pending.extend_from_slice(head);
+            return tail;
+        }
+        // The carried bytes never became a marker. Nothing inside the matched
+        // run can start one either (a marker's only `ESC` is its first byte),
+        // so it is emitted whole and the scan restarts on the byte that broke
+        // the match.
+        let (emitted, _) = probe.split_at(matched);
+        self.current.extend_from_slice(emitted);
+        self.pending.clear();
+        let (_, resume) = input.split_at(matched.saturating_sub(carried));
+        resume
+    }
+
+    /// Records a whole marker, opening the synchronized update or closing it
+    /// and committing the frame it accumulated.
+    fn commit_marker(&mut self, begin: bool, frames: &mut Vec<Vec<u8>>) {
+        if begin {
+            self.current.extend_from_slice(&BSU_CSI);
+            self.opened_sync_update = !self.inside_sync;
+            self.inside_sync = true;
+        } else {
+            self.current.extend_from_slice(&ESU_CSI);
+            self.inside_sync = false;
+            self.push_current_frame(frames);
+        }
     }
 
     /// Whether a synchronized update is still open.
@@ -276,10 +350,9 @@ impl SyncUpdateFrameSplitter {
     /// leading BSU marker so callers can replay buffered content without
     /// re-entering synchronized-update mode after the timeout expired.
     fn flush_timed_out(&mut self) -> Option<Vec<u8>> {
-        self.drain_pending_non_sync();
-        if !self.pending.is_empty() {
-            self.current.append(&mut self.pending);
-        }
+        // Whatever is pending is a marker prefix that never completed, so it
+        // belongs to the visible bytes rather than to a marker.
+        self.current.append(&mut self.pending);
 
         self.inside_sync = false;
 
@@ -290,12 +363,6 @@ impl SyncUpdateFrameSplitter {
         (!self.current.is_empty()).then(|| std::mem::take(&mut self.current))
     }
 
-    fn drain_pending_non_sync(&mut self) {
-        while !self.pending.is_empty() && !is_sync_prefix(&self.pending) {
-            self.current.push(self.pending.remove(0));
-        }
-    }
-
     fn push_current_frame(&mut self, frames: &mut Vec<Vec<u8>>) {
         if let Some(frame) = (!self.current.is_empty()).then(|| std::mem::take(&mut self.current)) {
             frames.push(frame);
@@ -303,8 +370,22 @@ impl SyncUpdateFrameSplitter {
     }
 }
 
-fn is_sync_prefix(bytes: &[u8]) -> bool {
-    BSU_CSI.starts_with(bytes) || ESU_CSI.starts_with(bytes)
+/// How many leading bytes of `bytes` continue a `CSI ? 2026 h/l` match, capped
+/// at the marker length and never past `bytes.len()`.
+///
+/// A full [`BSU_CSI`] length means a whole marker. Anything shorter is either a
+/// partial marker still waiting on later bytes (when it consumed all of
+/// `bytes`) or the offset at which the match broke.
+fn sync_match_len(bytes: &[u8]) -> usize {
+    let matched =
+        bytes.iter().zip(SYNC_HEAD.iter()).take_while(|(byte, head)| byte == head).count();
+    if matched < SYNC_HEAD.len() {
+        return matched;
+    }
+    match bytes.get(SYNC_HEAD.len()) {
+        Some(b'h' | b'l') => BSU_CSI.len(),
+        _ => SYNC_HEAD.len(),
+    }
 }
 
 #[cfg(test)]
@@ -372,6 +453,62 @@ mod tests {
                 b"\x1b[?2026hb\x1b[?2026l".to_vec(),
             ]
         );
+    }
+
+    // @lat: [[test#GPUI Sync Frame Queue#Restarts a broken marker match at the next escape]]
+    #[gpui::test]
+    fn broken_marker_matches_restart_at_the_next_escape() {
+        let mut queue = SyncFrameQueue::default();
+        let mut target = Recorder::default();
+
+        // Everything the scan can mistake for a marker and then have to give
+        // back: a near-miss that only differs in its final byte, a bare escape
+        // butted against another escape, and a short CSI. Every byte has to
+        // reach the terminal in order, and the real marker after them still has
+        // to commit as its own frame.
+        queue.queue_output_frames(b"\x1b[?2026Xtail\x1b\x1b[A");
+        queue.queue_output_frames(&[BSU, b"body", ESU].concat());
+        drain_all_committed(&mut queue, &mut target);
+
+        assert_eq!(
+            target.frames,
+            vec![b"\x1b[?2026Xtail\x1b\x1b[A".to_vec(), b"\x1b[?2026hbody\x1b[?2026l".to_vec(),]
+        );
+    }
+
+    // @lat: [[test#GPUI Sync Frame Queue#Releases a marker prefix that never completes]]
+    #[gpui::test]
+    fn a_withheld_prefix_that_never_completes_is_released_as_output() {
+        let mut queue = SyncFrameQueue::default();
+        let mut target = Recorder::default();
+
+        // The first message ends on what could still become a marker, so those
+        // bytes are withheld. The next message proves they were ordinary output
+        // and they have to be released ahead of the real marker behind them.
+        queue.queue_output_frames(b"before\x1b[?2");
+        queue.queue_output_frames(&[b"026", BSU, b"body", ESU].concat());
+        drain_all_committed(&mut queue, &mut target);
+
+        assert_eq!(
+            target.frames,
+            vec![b"before".to_vec(), b"\x1b[?2026\x1b[?2026hbody\x1b[?2026l".to_vec(),]
+        );
+    }
+
+    // @lat: [[test#GPUI Sync Frame Queue#Passes a run of bare escapes through intact]]
+    #[gpui::test]
+    fn a_run_of_bare_escapes_passes_through_intact() {
+        let mut queue = SyncFrameQueue::default();
+        let mut target = Recorder::default();
+
+        // Worst case for the scan: every byte restarts a match. Nothing may be
+        // swallowed, and only the trailing escape may be withheld.
+        let escapes = vec![ESC; 64];
+        queue.queue_output_frames(&escapes);
+        queue.queue_output_frames(b"x");
+        drain_all_committed(&mut queue, &mut target);
+
+        assert_eq!(target.frames.concat(), [escapes, b"x".to_vec()].concat());
     }
 
     // @lat: [[test#GPUI Sync Frame Queue#Presents one burst per redraw when caught up]]

@@ -13,12 +13,20 @@
 //! reads its anchor row — and a mark-relative jump lands on one — through the
 //! absolute-row helpers this type exposes.
 //!
-//! A window shows one grid per pane, so [`PaneGrids`] keys a
-//! [`DisplayOnlyTerminal`] per session: the coalescing drain already carries a
-//! `SessionId` with every batch, and the paint path asks for the grid belonging
-//! to the session each pane is showing.
+//! A window shows one grid per pane, so [`PaneGrids`] keys a [`PaneGrid`] per
+//! session: the coalescing drain already carries a `SessionId` with every
+//! batch, and the paint path asks for the pane belonging to the session each
+//! pane is showing.
+//!
+//! Each [`PaneGrid`] is split in two halves with opposite locking needs.
+//! [`PaneStream`] — the sync-frame queue and the grid it feeds — is held for as
+//! long as a VTE parse takes, which under a firehose is longer than a frame.
+//! [`PaneFrame`] is the projection the renderer reads, republished out of the
+//! stream after every change, so a paint never queues behind a parse and one
+//! pane's firehose never stalls another's.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use scribe_common::ids::SessionId;
@@ -45,7 +53,7 @@ use scribe_client::vi_mode::{self, ViMotion};
 use vte::ansi::{Color, CursorShape as TerminalCursorShape};
 
 use crate::session_lifecycle::PromptAnchor;
-use crate::sync_frames::{FeedOutputResult, OutputTarget};
+use crate::sync_frames::{FeedOutputResult, OutputTarget, SyncFrameQueue, drain_all_committed};
 
 /// One rendered terminal cell: its character plus the raw SGR state the paint
 /// path needs to colour and decorate it.
@@ -195,7 +203,9 @@ impl alacritty_terminal_gpui::grid::Dimensions for TerminalDimensions {
 pub struct DisplayOnlyTerminal {
     term: Term<VoidListener>,
     output_processor: vte::ansi::Processor,
-    content: Content,
+    /// Shared rather than owned so republishing the render projection after a
+    /// parse is a refcount bump instead of a copy of every painted row.
+    content: Arc<Content>,
     /// Config + AI-provider gate for split-scroll, pushed in by the shell on
     /// every frame. The live half of the decision (scrolled up, normal screen)
     /// is read off the terminal itself in [`Self::active_pin_rows`].
@@ -219,7 +229,7 @@ impl DisplayOnlyTerminal {
         let mut terminal = Self {
             term,
             output_processor: vte::ansi::Processor::new(),
-            content: Content::default(),
+            content: Arc::default(),
             scrollback_lines,
             split_scroll: SplitScrollEligibility::default(),
             selection: SelectionState::new(),
@@ -261,8 +271,8 @@ impl DisplayOnlyTerminal {
     }
 
     /// Returns the content captured after the most recent output frame.
-    pub fn content(&self) -> Content {
-        self.content.clone()
+    pub fn content(&self) -> Arc<Content> {
+        Arc::clone(&self.content)
     }
 
     /// Current viewport geometry in terminal cells.
@@ -452,7 +462,7 @@ impl DisplayOnlyTerminal {
 
     /// How many rows the split-scroll pin currently occupies (`0` when off).
     #[must_use]
-    pub const fn pin_rows(&self) -> usize {
+    pub fn pin_rows(&self) -> usize {
         self.content.pin_rows
     }
 
@@ -653,10 +663,9 @@ impl DisplayOnlyTerminal {
             rows.push(Self::read_row(&self.term, first_pin_line + grid_i32(row), columns));
         }
 
-        self.content.rows = rows;
-        self.content.pin_rows = pin_rows;
-        self.content.vi_cursor = self.viewport_vi_cursor(top_rows, display_offset);
-        self.content.shell_cursor = self.viewport_shell_cursor(lines, columns, pin_rows);
+        let vi_cursor = self.viewport_vi_cursor(top_rows, display_offset);
+        let shell_cursor = self.viewport_shell_cursor(lines, columns, pin_rows);
+        self.content = Arc::new(Content { rows, pin_rows, vi_cursor, shell_cursor });
     }
 
     /// Project the live shell cursor onto the viewport the snapshot just built.
@@ -739,18 +748,175 @@ impl OutputTarget for DisplayOnlyTerminal {
     }
 }
 
+/// A pane's mutable half: the synchronized-frame queue in front of the grid,
+/// and the grid those committed frames advance.
+///
+/// The two are locked together because they are one pipeline — a committed
+/// frame leaves the queue and enters the parser in the same step. Nothing on
+/// the paint path takes this lock: a VTE parse holds it for as long as a whole
+/// batch of firehose output takes to apply.
+pub struct PaneStream {
+    /// Committed `CSI ? 2026` bursts waiting to reach the grid.
+    pub queue: SyncFrameQueue,
+    /// The display grid those bursts advance.
+    pub terminal: DisplayOnlyTerminal,
+}
+
+impl PaneStream {
+    /// Whether either half of the pipeline is holding a synchronized update
+    /// that needs a timeout flush if its terminator never arrives.
+    #[must_use]
+    pub fn sync_armed(&self) -> bool {
+        self.sync_deadline().is_some()
+    }
+
+    /// The nearest raw-frame or parser synchronized-update deadline.
+    #[must_use]
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        match (self.terminal.parser_sync_deadline(), self.queue.raw_sync_deadline()) {
+            (Some(parser), Some(raw)) => Some(parser.min(raw)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Everything the paint pass reads off a pane, republished after every change.
+///
+/// The projection exists so the renderer never waits on a [`PaneStream`]: a
+/// firehose holds that lock for the length of a VTE parse, and a frame that had
+/// to queue behind one is a dropped frame. Every field is captured from the
+/// same grid state in one pass, so a paint can never mix a fresh grid with a
+/// stale cursor or selection.
+pub struct PaneFrame {
+    /// The grid snapshot the pane paints.
+    pub content: Arc<Content>,
+    /// Viewport measurements the overlay scrollbar sizes its thumb from.
+    pub metrics: ScrollMetrics,
+    /// The active selection projected onto the painted viewport.
+    pub selection_spans: Vec<SelectionSpan>,
+    /// Cursor placement the IME anchors a composition on.
+    pub cursor: CursorPlacement,
+    /// Viewport geometry in cells, which reconnect reattaches panes at.
+    pub dimensions: (usize, usize),
+    /// The split-scroll gate the grid was last given, so the shell can tell
+    /// whether this projection already reflects the gate it wants to push.
+    pub split_scroll: SplitScrollEligibility,
+}
+
+impl PaneFrame {
+    fn capture(terminal: &DisplayOnlyTerminal) -> Self {
+        Self {
+            content: terminal.content(),
+            metrics: terminal.scroll_metrics(),
+            selection_spans: terminal.selection_spans(),
+            cursor: terminal.cursor_placement(),
+            dimensions: terminal.dimensions(),
+            split_scroll: terminal.split_scroll,
+        }
+    }
+}
+
+/// One pane: the parse pipeline plus the render projection published from it.
+///
+/// Held behind an [`Arc`] so a caller resolves the pane under the [`PaneGrids`]
+/// lock and then works on it with that lock released — which is what keeps a
+/// VTE parse off the registry and out of every other pane's way.
+pub struct PaneGrid {
+    stream: Mutex<PaneStream>,
+    published: Mutex<Arc<PaneFrame>>,
+}
+
+impl PaneGrid {
+    fn new(columns: usize, lines: usize) -> Self {
+        let terminal = DisplayOnlyTerminal::new(columns, lines);
+        let published = Arc::new(PaneFrame::capture(&terminal));
+        Self {
+            stream: Mutex::new(PaneStream { queue: SyncFrameQueue::default(), terminal }),
+            published: Mutex::new(published),
+        }
+    }
+
+    /// Runs `edit` against the pane's parse pipeline and republishes the
+    /// projection the paint pass reads.
+    ///
+    /// Every mutation of the grid goes through here, which is what lets the
+    /// projection be republished unconditionally rather than guessing which
+    /// edits changed something paintable.
+    ///
+    /// `None` when the pane's lock is poisoned, matching how the rest of the
+    /// client degrades a poisoned pane to a no-op instead of panicking the
+    /// thread that touched it.
+    pub fn with_stream<R>(&self, edit: impl FnOnce(&mut PaneStream) -> R) -> Option<R> {
+        let Ok(mut stream) = self.stream.lock() else {
+            tracing::warn!("pane stream mutex poisoned; dropping a grid update");
+            return None;
+        };
+        let result = edit(&mut stream);
+        let frame = Arc::new(PaneFrame::capture(&stream.terminal));
+        if let Ok(mut published) = self.published.lock() {
+            *published = frame;
+        }
+        Some(result)
+    }
+
+    /// Runs `edit` against the pane's grid. Shorthand for the common
+    /// [`Self::with_stream`] that never touches the frame queue.
+    pub fn with_terminal<R>(&self, edit: impl FnOnce(&mut DisplayOnlyTerminal) -> R) -> Option<R> {
+        self.with_stream(|stream| edit(&mut stream.terminal))
+    }
+
+    /// The published render projection.
+    #[must_use]
+    pub fn frame(&self) -> Option<Arc<PaneFrame>> {
+        self.published.lock().ok().map(|published| Arc::clone(&published))
+    }
+
+    /// The nearest raw-frame or parser synchronized-update deadline.
+    ///
+    /// Read-only, so it deliberately skips the republish [`Self::with_stream`]
+    /// does: the expiry task polls this across every pane.
+    #[must_use]
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.stream.lock().ok().and_then(|stream| stream.sync_deadline())
+    }
+
+    /// Commits every synchronized update on this pane whose deadline has
+    /// passed, returning how many repaints that owes.
+    ///
+    /// The parser side goes first so a raw frame flushed in the same pass lands
+    /// after the bytes the parser was already holding, which is the order they
+    /// arrived in.
+    pub fn flush_expired_sync(&self, now: Instant) -> usize {
+        self.with_stream(|stream| {
+            let mut redraws = usize::from(stream.terminal.flush_parser_sync_timeout(now));
+            if stream.queue.flush_raw_timeout(now) {
+                let summary = drain_all_committed(&mut stream.queue, &mut stream.terminal);
+                redraws += usize::from(summary.needs_redraw);
+            }
+            redraws
+        })
+        .unwrap_or(0)
+    }
+}
+
 /// One display grid per session, so a split window paints each pane from its
 /// own terminal state instead of interleaving every pane into one grid.
 ///
 /// Grids are created lazily: the first output batch for a session mints one at
 /// the window's default geometry, and the pane layout resizes it as soon as it
 /// knows how much of the window that session owns.
+///
+/// The registry's own lock guards the map, never a parse: callers take an
+/// [`Arc<PaneGrid>`] out of it and release the registry before touching the
+/// pane. Forgetting a session therefore never waits on the batch being parsed
+/// into it — the removed handle simply outlives the map entry.
 pub struct PaneGrids {
     /// Geometry a freshly minted grid starts at, before the pane layout has
     /// published a per-pane size for its session.
     default_columns: usize,
     default_lines: usize,
-    grids: HashMap<SessionId, DisplayOnlyTerminal>,
+    grids: HashMap<SessionId, Arc<PaneGrid>>,
 }
 
 impl PaneGrids {
@@ -759,52 +925,44 @@ impl PaneGrids {
         Self { default_columns: columns, default_lines: lines, grids: HashMap::new() }
     }
 
-    /// Borrow `session_id`'s grid, creating it at the default geometry.
-    pub fn grid_mut(&mut self, session_id: SessionId) -> &mut DisplayOnlyTerminal {
+    /// Take a handle on `session_id`'s pane, creating it at the default
+    /// geometry. Release the registry lock before using the handle.
+    pub fn pane(&mut self, session_id: SessionId) -> Arc<PaneGrid> {
         let (columns, lines) = (self.default_columns, self.default_lines);
-        self.grids.entry(session_id).or_insert_with(|| DisplayOnlyTerminal::new(columns, lines))
+        Arc::clone(
+            self.grids.entry(session_id).or_insert_with(|| Arc::new(PaneGrid::new(columns, lines))),
+        )
     }
 
-    /// The most recent frame for `session_id`, or `None` when no output has
+    /// Every live pane, so a caller can walk them all with the registry lock
+    /// already released.
+    #[must_use]
+    pub fn panes(&self) -> Vec<Arc<PaneGrid>> {
+        self.grids.values().map(Arc::clone).collect()
+    }
+
+    /// The published projection for `session_id`, or `None` when no output has
     /// ever reached that session's pane.
-    pub fn content(&self, session_id: SessionId) -> Option<Content> {
-        self.grids.get(&session_id).map(DisplayOnlyTerminal::content)
+    #[must_use]
+    pub fn frame(&self, session_id: SessionId) -> Option<Arc<PaneFrame>> {
+        self.grids.get(&session_id).and_then(|pane| pane.frame())
     }
 
     /// Current viewport geometry for `session_id`, when its grid exists.
     #[must_use]
     pub fn dimensions(&self, session_id: SessionId) -> Option<(usize, usize)> {
-        self.grids.get(&session_id).map(DisplayOnlyTerminal::dimensions)
+        self.frame(session_id).map(|frame| frame.dimensions)
     }
 
     /// The scrollbar viewport metrics for `session_id`, or `None` when that
     /// session has no grid yet (nothing to scroll, so nothing to draw).
     pub fn scroll_metrics(&self, session_id: SessionId) -> Option<ScrollMetrics> {
-        self.grids.get(&session_id).map(DisplayOnlyTerminal::scroll_metrics)
-    }
-
-    /// Reshape `session_id`'s grid, creating it first when needed.
-    pub fn resize(&mut self, session_id: SessionId, columns: usize, lines: usize) {
-        self.grid_mut(session_id).resize(columns, lines);
+        self.frame(session_id).map(|frame| frame.metrics)
     }
 
     /// Drop an exited session's grid.
     pub fn forget(&mut self, session_id: SessionId) {
         self.grids.remove(&session_id);
-    }
-
-    /// The nearest open parser-side synchronized-update deadline across grids.
-    pub fn parser_sync_deadline(&self) -> Option<Instant> {
-        self.grids.values().filter_map(DisplayOnlyTerminal::parser_sync_deadline).min()
-    }
-
-    /// Commit every grid's expired parser-side synchronized update, returning
-    /// how many grids actually flushed one.
-    pub fn flush_parser_sync_timeouts(&mut self, now: Instant) -> usize {
-        self.grids
-            .values_mut()
-            .filter(|grid| grid.parser_sync_deadline().is_some())
-            .fold(0, |flushed, grid| flushed + usize::from(grid.flush_parser_sync_timeout(now)))
     }
 }
 
@@ -1008,6 +1166,33 @@ mod tests {
         assert!(summary.needs_redraw);
         assert!(terminal.visible_text().starts_with("hello world"));
         assert!(terminal.parser_sync_deadline().is_none());
+    }
+
+    // @lat: [[test#GPUI Terminal Viewport#A parse in flight blocks neither the registry nor a paint]]
+    #[gpui::test]
+    fn a_held_pane_stream_blocks_neither_the_registry_nor_a_paint() {
+        let mut grids = PaneGrids::new(20, 2);
+        let (busy, idle) = (SessionId::new(), SessionId::new());
+        let (busy_pane, idle_pane) = (grids.pane(busy), grids.pane(idle));
+        idle_pane.with_terminal(|terminal| terminal.feed_output(b"idle"));
+        busy_pane.with_terminal(|terminal| terminal.feed_output(b"before"));
+
+        // Stand in for a batch mid-parse: the busy pane's stream is held for as
+        // long as the parse would take.
+        let parsing = busy_pane.stream.lock().expect("stream lock");
+
+        // The registry itself is still free, so a batch bound for another pane
+        // — and every paint-path read, which resolves through the registry —
+        // keeps running.
+        assert!(grids.frame(idle).is_some_and(|frame| frame.content.text().starts_with("idle")));
+        idle_pane.with_terminal(|terminal| terminal.feed_output(b"!"));
+
+        // Even the busy pane still paints: the projection published before the
+        // parse started is what a frame reads, not the grid under the lock.
+        let published = grids.frame(busy).expect("busy pane projection");
+        assert!(published.content.text().starts_with("before"));
+
+        drop(parsing);
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Cell-accurate paint path#Snapshot carries per-cell colour and attributes]]

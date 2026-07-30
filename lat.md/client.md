@@ -364,6 +364,18 @@ A split window shows several live terminals at once, so  keys one  per session i
 
 The coalescing drain already carries a `SessionId` with every batch, so  advances the grid the batch names and a background pane's burst can never land in the focused pane's scrollback. `PtyOutput` / `SessionReplay` / `ScreenSnapshot` are gated on the set of attached sessions () rather than on the single focused one, because every pane streams.
 
+#### Parsing off the registry lock
+
+A VTE parse is the longest thing the client does with a lock held, so [[crates/scribe-client/src/terminal.rs#PaneGrids]] guards only its own map and every parse runs with that lock released.
+
+Each entry is a [[crates/scribe-client/src/terminal.rs#PaneGrid]] behind an `Arc`: [[crates/scribe-client/src/main.rs#resolve_batch_panes]] resolves a whole batch's panes under one short registry lock and releases it before a single byte is parsed, and [[crates/scribe-client/src/main.rs#live_panes]] does the same for the expiry sweep. Forgetting a session therefore never waits on the batch being parsed into it — the removed handle simply outlives the map entry.
+
+Each pane is split into two independently locked halves. [[crates/scribe-client/src/terminal.rs#PaneStream]] holds the sync-frame queue and the grid it feeds, because a committed frame leaves the queue and enters the parser in the same step; that lock is held for as long as a batch takes to apply. [[crates/scribe-client/src/terminal.rs#PaneFrame]] is the projection the paint pass reads — snapshot, scroll metrics, selection spans, cursor placement, geometry — republished out of the stream by [[crates/scribe-client/src/terminal.rs#PaneGrid#with_stream]] after every mutation. Every grid mutation goes through that one method, which is what lets the projection be republished unconditionally rather than guessing which edits changed something paintable.
+
+The snapshot itself is shared rather than copied: [[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#make_content]] publishes an `Arc<Content>` that the projection, the pane element and every reader hold by reference, so republishing after a parse is a refcount bump instead of a copy of every painted row.
+
+Two orderings hold the design together. Nothing on the paint path takes a pane's stream lock: a frame that had to queue behind a parse is a dropped frame. And the prompt-mark store is always taken *inside* a pane lock, the order the drain takes them in when it anchors a mark against the grid it just advanced — [[crates/scribe-client/src/main.rs#TerminalView#jump_to_mark]] follows the same order for exactly that reason, because the inversion is the one that could deadlock a jump against a firehosed pane.
+
  runs after any layout change: each pane's rect yields a cell count, which is reshaped locally through  and announced to the server as `Resize` followed by `RequestSnapshot` — the client owns no PTY and never reflows locally, so the authoritative grid has to come back from the server. Unchanged panes are skipped, so a redraw storm never becomes a `RequestSnapshot` storm.
 
 The cell count divides real pixels by the live cell box, which is why the viewport above is measured rather than derived from the font: a rect stated in the font's own cells moves its numerator and denominator together, so every font size yields the same `cols`x`rows` and a zoom step would leave the freed pixels dead while telling the server nothing new.  closes the other half of that loop — it compares the measured area against the last published size and republishes exactly once when a window resize or a chrome band moved the grid's boundaries.
