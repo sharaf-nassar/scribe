@@ -510,6 +510,35 @@ Derived headline numbers:
   repeats would not move them; the batch-size distributions are the only rows
   with run-to-run spread.
 
+### After side: OSC 7 last-value suppression (US6-2)
+
+The rig above, re-run twice on the same machine against the same worktree —
+once with the `send_metadata_event` CWD dedup reverted, once with it in place.
+The "before" column reproduces the `b90c932` numbers exactly, which is what
+makes the pair comparable.
+
+| Phase | n | GitBranch before → after | CwdChanged before → after | `.git/HEAD` opens before → after |
+|---|---|---|---|---|
+| prompt cycle, cwd = repo root | 20 | 20 → **0** | 20 → **0** | 20 → **0** |
+| OSC 7, same value ×10 | 10 | 11 → **0** | 11 → **0** | 11 → **0** |
+| prompt cycle, cwd 4 levels deep | 10 | 10 → **0** | 10 → **0** | 50 → **0** |
+| `cd` back to the repo root | 1 | 1 → 1 | 1 → 1 | 1 → 1 |
+| alternating `cd` ×10 | 10 | 9 → 8–9 | 9 → 8–9 | 14 → 12–14 |
+
+A repeated OSC 7 now costs one registry compare and nothing else: no frame, no
+`.git/HEAD` walk, no workspace-manager lock. The two `cd` rows are the control
+— a directory that really changes still emits, so the suppression is last-value
+and not a blanket rate limit. The depth-4 row is the largest win because the
+uncached walk there was 5 opens per prompt.
+
+The alternating-`cd` row is the only one with run-to-run spread: its ten `cd`s
+are driven on fixed sleeps, so one of them can land outside the phase's settle
+window and be counted against the next checkpoint. The suppressed rows are
+exact zeros in every run.
+
+The detached-sink and OSC 4 rows are unchanged by this item; they belong to the
+branch-cache and config/theme-cache work.
+
 ## Per-prompt shell hook cost
 
 Wall time and process creations charged to one no-op prompt cycle by

@@ -72,9 +72,15 @@ When the connected-client map drops to zero, the server starts a short 250 ms gr
 
 Resize updates the alacritty_terminal grid and sends `TIOCSWINSZ` via ioctl to notify the foreground process group.
 
+### CWD Change Suppression
+
+Shells emit OSC 7 from their prompt hook, so the same directory is reported on every command. The server tracks the last CWD it pushed through the metadata pipeline per session and drops a repeat before any further work.
+
+Suppression runs ahead of the registry write, the `CwdChanged` and `GitBranch` frames, the `.git/HEAD` walk and the workspace-manager write lock, so an unchanged directory costs one registry compare per prompt instead of two client frames and a filesystem walk. A report that survives the check is the invalidation signal for anything caching per-CWD state. The tracked value is per server process and is not carried in handoff state, so the first report after a hot reload still reaches clients that only saw the previous process. The `/proc` fallback and the hook channel feed the same pipeline and are deduplicated by the same check.
+
 ### Git Branch Detection
 
-On CWD change, the server walks up from the working directory (depth limit 50) looking for `.git/HEAD`. It extracts the branch name from `ref: refs/heads/...` or returns the first 8 characters of a detached HEAD commit.
+On a CWD change that survives suppression, the server walks up from the working directory (depth limit 50) looking for `.git/HEAD`. It extracts the branch name from `ref: refs/heads/...` or returns the first 8 characters of a detached HEAD commit.
 
 ### Clipboard Gating
 

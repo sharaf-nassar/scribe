@@ -835,6 +835,11 @@ pub struct LiveSession {
     task_label: Option<String>,
     /// Last-known working directory (OSC 7), persisted for reconnect.
     cwd: Option<std::path::PathBuf>,
+    /// Last CWD this server process pushed through the metadata pipeline.
+    /// Kept separate from `cwd` (which is restored from a handoff) so the
+    /// first report after a handoff still reaches clients that only ever
+    /// saw the previous process.
+    last_cwd_report: Option<std::path::PathBuf>,
     /// Last-known remote/tmux context reported by shell integration.
     context: Option<scribe_common::protocol::SessionContext>,
     /// Last-known AI process state (OSC 1337), persisted for reconnect.
@@ -5641,6 +5646,7 @@ async fn start_session(
         title: title.unwrap_or_else(|| String::from("shell")),
         task_label,
         cwd,
+        last_cwd_report: None,
         context,
         ai_state,
         ai_provider_hint,
@@ -8774,10 +8780,40 @@ async fn update_live_session(
     }
 }
 
+/// Record a CWD report and answer whether it differs from the previous one.
+///
+/// Shells emit OSC 7 from their prompt hook, so a session that never leaves
+/// its directory still reports the same path on every command. Everything
+/// downstream of this check — the registry write, the `CwdChanged` and
+/// `GitBranch` frames, the `.git/HEAD` walk, the workspace-manager write
+/// lock — is waste for such a repeat, and a report that does get through is
+/// the invalidation signal for anything caching per-CWD state.
+///
+/// A session missing from the registry has no previous value to compare
+/// against, so it is reported as changed and the caller behaves as before.
+async fn record_cwd_report(
+    session_id: SessionId,
+    cwd: &Path,
+    live_sessions: &LiveSessionRegistry,
+) -> bool {
+    let mut sessions = live_sessions.write().await;
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return true;
+    };
+    if session.last_cwd_report.as_deref() == Some(cwd) {
+        return false;
+    }
+    session.last_cwd_report = Some(cwd.to_path_buf());
+    true
+}
+
 /// Convert a `MetadataEvent` to a `ServerMessage` and send it.
 /// For `CwdChanged`, also notifies the workspace manager and sends git branch.
 /// Workspace naming always runs (even when detached) so names are ready on
 /// reconnect. Client messages are only sent when attached.
+///
+/// A `CwdChanged` repeating the session's last reported directory is dropped
+/// by [`record_cwd_report`] before any of that work happens.
 ///
 /// Exposed publicly so `hook_ingress` can feed the same pipeline.
 pub async fn send_metadata_event(
@@ -8812,6 +8848,14 @@ pub async fn send_metadata_event(
     else {
         return;
     };
+
+    // Drop a per-prompt OSC 7 that names the directory the session is
+    // already in, ahead of every consumer of the report.
+    if let Some(cwd) = cwd_for_workspace.as_deref()
+        && !record_cwd_report(session_id, cwd, live_sessions).await
+    {
+        return;
+    }
 
     merge_partial_ai_state(&mut server_msg, session_id, live_sessions).await;
 
