@@ -1469,11 +1469,25 @@ The GPUI reporter owns the *decisions* around the encoders as pure functions too
 
 ### Resize Coordination
 
-Window resize coalesces per event-loop tick rather than via a wall-clock debounce, and is flushed ahead of any input bytes so the server sees `Resize` → `KeyInput` in mpsc order.
+Pane geometry is published from the GPUI layout pass, once per frame, and every whole-pane rebuild carries the geometry it was rendered at so it can be replayed at that shape rather than at whatever size the client has meanwhile moved to.
 
-Every `WindowEvent::Resized` updates the local pane grid and sets `resize_pending`.  runs in `about_to_wait` (per-tick batching) and from the input call sites — , , and  — before any `KeyInput` is queued. The shared mpsc `Sender<ClientCommand>` preserves FIFO order, so the server processes `Resize` first; `tcsetwinsize` delivers `SIGWINCH` ahead of the bytes hitting the PTY, and bash updates `COLUMNS` before reading the next command.
+[[crates/scribe-client/src/main.rs#TerminalView#publish_pane_sizes]] measures each placement against the live cell metrics, skips the panes whose `TerminalSize` is unchanged, and for the rest does three things in order: reshapes the local display grid, sends `Resize`, and sends `RequestSnapshot`. The per-frame layout pass is the coalescing — a drag that crosses a cell boundary many times a second publishes only on the frames where the cell count actually changed, so a redraw storm never becomes a `RequestSnapshot` storm. The outbound channel is a single ordered FIFO, so the server still processes `Resize` before any `KeyInput` queued behind it and `SIGWINCH` reaches the PTY ahead of the bytes. This client owns no PTY and never reflows on its own, which is why the local reshape is paired with a request for the authoritative screen instead of standing on its own.
 
-This mirrors alacritty/ghostty/wezterm/kitty/vte — none use a wall-clock debounce; all coalesce implicitly per tick or by last-known-size dedup.
+The two sides are therefore routinely out of step for the length of one round trip: the client narrows its grid immediately, while the server debounces its own `Term` resize and answers `RequestSnapshot` from the size it still has. That gap is what makes rebuild geometry load-bearing.
+
+#### Rebuild Geometry
+
+A rebuild is state, not a delta, so it is only correct at the geometry it was rendered at — which is carried on [[crates/scribe-client/src/ipc_bridge.rs#InboundEvent]]`::PaneRebuild` and [[crates/scribe-client/src/ipc_bridge.rs#PaneOp]]`::Rebuild` alongside the bytes.
+
+[[crates/scribe-common/src/screen_replay.rs#snapshot_to_ansi]] emits every row as exactly `cols` printable characters — trailing blanks are literal spaces, with no EL or ED to absorb the difference — and ends on an absolute CUP in snapshot coordinates. Fed into a grid one column narrower, every row autowraps, the whole screen scrolls into scrollback, and the viewport is left blank with the cursor parked mid-screen; the shell's own `SIGWINCH` redraw then paints a duplicate prompt onto the wreckage.
+
+[[crates/scribe-client/src/main.rs#reshape_for_rebuild]] closes that by reshaping the pane grid to the rebuild's own `cols`/`rows` before [[crates/scribe-client/src/sync_frames.rs#present_rebuild]] hands the bytes to the parser, and no-ops when the dimensions already agree or the wire reported zero. The reshape is driven by the rebuild rather than by the layout, and only has to hold until the size the client actually asked for comes back as a rebuild of its own — which the `RequestSnapshot` already in flight guarantees. Both producers supply it: the `ScreenSnapshot` path through [[crates/scribe-client/src/main.rs#apply_screen_snapshot]] and the reattach `SessionReplay` path through [[crates/scribe-client/src/main.rs#forward_replay]]. That also covers the bounded-queue overflow resync, which repairs a dropped pane through the same `RequestSnapshot`.
+
+#### Rebuild applies at its own geometry
+
+A 120-column `ScreenSnapshot` rebuild driven through the real [[crates/scribe-client/src/ipc_bridge.rs#PaneOp]]`::Rebuild` path into a pane grid still sized 119x36 leaves the pane at 120x36 with each snapshot row on its own line.
+
+Without the reshape the grid stays 119 wide and the viewport opens on row 18 — half the snapshot has autowrapped into scrollback — which is exactly the blank-pane corruption a window drag produced roughly 25 times a second.
 
 ### IME Composition
 

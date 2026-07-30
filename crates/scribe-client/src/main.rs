@@ -7612,7 +7612,8 @@ fn resolve_batch_panes(
 /// The arms share the stream because they are ordered against each other:
 /// output advances the grid, a prompt mark reads the row the output left the
 /// cursor on, and the suppressed-ED-3 snap resets the offset the output
-/// scrolled.
+/// scrolled. A rebuild is the one arm that reshapes the grid before it writes,
+/// because it is state rather than a delta — see [`reshape_for_rebuild`].
 fn apply_pane_op(
     op: &PaneOp,
     session: SessionId,
@@ -7625,7 +7626,10 @@ fn apply_pane_op(
             queue.queue_output_frames(bytes);
             usize::from(present_next_burst(queue, grid))
         }
-        PaneOp::Rebuild(bytes) => usize::from(present_rebuild(queue, grid, bytes)),
+        PaneOp::Rebuild { bytes, cols, rows } => {
+            reshape_for_rebuild(session, grid, *cols, *rows);
+            usize::from(present_rebuild(queue, grid, bytes))
+        }
         PaneOp::PromptMark { kind, exit_code } => {
             apply_prompt_mark(prompt_marks, session, *kind, *exit_code, grid);
             0
@@ -7646,6 +7650,40 @@ fn apply_pane_op(
             grid,
         ),
     }
+}
+
+/// Reshape a pane's grid to the geometry a rebuild was rendered at, before the
+/// rebuild bytes reach the parser.
+///
+/// A rebuild is state, not a delta: the snapshot ANSI emits every row as exactly
+/// `cols` printable characters and ends on an absolute CUP in snapshot
+/// coordinates, so it only describes the server's screen when the receiving grid
+/// is that same shape. The two sides routinely disagree while a window is being
+/// dragged — the client reshapes its own grid the instant the layout moves
+/// ([`TerminalView::publish_pane_sizes`]) and asks for the authoritative screen in the
+/// same breath, while the server debounces its `Term` resize and answers from
+/// the size it still has. Replaying a one-column-too-wide rebuild into the
+/// narrower grid autowraps every row, scrolls the whole screen into scrollback,
+/// and leaves the viewport blank with the cursor parked mid-screen.
+///
+/// The reshape is therefore driven by the rebuild rather than by the layout: it
+/// only has to hold until the size the client actually asked for comes back as
+/// a rebuild of its own, which the pending `RequestSnapshot` guarantees.
+fn reshape_for_rebuild(session: SessionId, grid: &mut DisplayOnlyTerminal, cols: u16, rows: u16) {
+    let (columns, lines) = (usize::from(cols), usize::from(rows));
+    let current = grid.dimensions();
+    if columns == 0 || lines == 0 || current == (columns, lines) {
+        return;
+    }
+    tracing::info!(
+        %session,
+        from_cols = current.0,
+        from_rows = current.1,
+        to_cols = columns,
+        to_rows = lines,
+        "reshaped a pane to its rebuild's geometry"
+    );
+    grid.resize(columns, lines);
 }
 
 /// Shift a pane's absolute-row anchors past the scrollback rows the trim just
@@ -8211,9 +8249,13 @@ fn on_session_exited(
 /// out of this snapshot. That is also what makes the repaint assertable from
 /// outside the process, which the `RequestSnapshot` E2E relies on, so the
 /// applied grid's dimensions are logged alongside the session.
+///
+/// The snapshot's own `cols`/`rows` go with the bytes rather than being dropped
+/// here: they are the geometry the ANSI is valid at, and the drain reshapes the
+/// pane grid to them before replaying it.
 fn apply_screen_snapshot(ctx: &ReaderCtx, session_id: SessionId, snapshot: &ScreenSnapshot) {
     let bytes = session_lifecycle::snapshot_reset_bytes(snapshot);
-    forward_rebuild(&ctx.in_tx, session_id, bytes);
+    forward_rebuild(&ctx.in_tx, session_id, bytes, snapshot.cols, snapshot.rows);
     tracing::info!(
         %session_id,
         cols = snapshot.cols,
@@ -8237,8 +8279,9 @@ fn apply_screen_snapshot(ctx: &ReaderCtx, session_id: SessionId, snapshot: &Scre
 /// owns the writer and the drain, so a large replay decoded inline would hold
 /// back keystrokes and pane repaints for as long as zstd ran.
 async fn forward_replay(ctx: &ReaderCtx, session_id: SessionId, replay: SessionReplay) {
+    let (cols, rows) = (replay.cols, replay.rows);
     match session_lifecycle::decode_replay_off_thread(session_id, replay).await {
-        Ok(bytes) => forward_rebuild(&ctx.in_tx, session_id, bytes),
+        Ok(bytes) => forward_rebuild(&ctx.in_tx, session_id, bytes, cols, rows),
         Err(error) => {
             set_status(&ctx.status, &ctx.generation, error.to_string());
             if let Err(sink_error) = ctx.sink.request_snapshot(session_id) {
@@ -9383,15 +9426,28 @@ fn forward_output(in_tx: &InboundSender, session_id: SessionId, bytes: Vec<u8>) 
 }
 
 /// Hand the drain a whole-pane rebuild — a decoded `SessionReplay` or a
-/// `ScreenSnapshot`'s RIS-prefixed ANSI.
+/// `ScreenSnapshot`'s RIS-prefixed ANSI — together with the geometry the server
+/// rendered it at.
 ///
 /// It rides the same FIFO as output, because its position in the byte stream is
 /// exactly what makes it correct: everything the server sent before it is
 /// already folded into the state it carries. It is *not* output, though, so it
 /// enters as its own event and the drain applies it as its own burst boundary
 /// rather than concatenating it into the runs around it.
-fn forward_rebuild(in_tx: &InboundSender, session_id: SessionId, bytes: Vec<u8>) {
-    forward_inbound(in_tx, InboundEvent::PaneRebuild { session_id, bytes });
+///
+/// `cols`/`rows` travel with the bytes because a rebuild is only correct at the
+/// geometry it was rendered at, and the client's own grid has usually already
+/// moved on: [`TerminalView::publish_pane_sizes`] reshapes the local grid the moment the
+/// window changes size, while the server still answers the `RequestSnapshot`
+/// from the size its `Term` had before its own resize landed.
+fn forward_rebuild(
+    in_tx: &InboundSender,
+    session_id: SessionId,
+    bytes: Vec<u8>,
+    cols: u16,
+    rows: u16,
+) {
+    forward_inbound(in_tx, InboundEvent::PaneRebuild { session_id, bytes, cols, rows });
 }
 
 /// Hand one event to the coalescing drain, preserving arrival order.
@@ -9411,5 +9467,73 @@ fn set_status(status: &Arc<Mutex<String>>, generation: &AtomicU64, message: Stri
     if let Ok(mut status) = status.lock() {
         *status = message;
         generation.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use scribe_common::screen::{CellFlags, CursorStyle, ScreenCell, ScreenColor};
+
+    use super::*;
+
+    /// A snapshot whose rows each carry their own index, so a row that landed
+    /// on the wrong line — or scrolled off into scrollback — is visible in the
+    /// assertion rather than hidden behind identical filler.
+    fn numbered_snapshot(cols: u16, rows: u16) -> ScreenSnapshot {
+        let blank = ScreenCell {
+            c: ' ',
+            fg: ScreenColor::Named(256),
+            bg: ScreenColor::Named(257),
+            flags: CellFlags::default(),
+        };
+        let mut cells = vec![blank; usize::from(cols) * usize::from(rows)];
+        for row in 0..usize::from(rows) {
+            for (col, ch) in format!("row {row:02}").chars().enumerate() {
+                cells[row * usize::from(cols) + col].c = ch;
+            }
+        }
+        ScreenSnapshot {
+            cells,
+            cols,
+            rows,
+            cursor_col: 0,
+            cursor_row: rows.saturating_sub(1),
+            cursor_style: CursorStyle::Block,
+            cursor_visible: true,
+            alt_screen: false,
+            active_dec_modes: Vec::new(),
+            scrollback: Vec::new(),
+            scrollback_rows: 0,
+        }
+    }
+
+    // @lat: [[client#Input#Resize Coordination#Rebuild applies at its own geometry]]
+    #[gpui::test]
+    fn rebuild_replays_at_the_geometry_it_was_rendered_at(_cx: &mut gpui::TestAppContext) {
+        let session = SessionId::new();
+        // Mid-drag the two sides disagree by a column: the client has already
+        // narrowed its own grid and asked for the authoritative screen, and the
+        // server answers from the width its `Term` still has.
+        let mut grids = PaneGrids::new(119, 36);
+        let pane = grids.pane(session);
+        let snapshot = numbered_snapshot(120, 36);
+        let op = PaneOp::Rebuild {
+            bytes: session_lifecycle::snapshot_reset_bytes(&snapshot),
+            cols: snapshot.cols,
+            rows: snapshot.rows,
+        };
+        let prompt_marks = Arc::new(Mutex::new(PromptMarks::default()));
+
+        pane.with_stream(|stream| apply_pane_op(&op, session, stream, &prompt_marks))
+            .expect("pane stream applies the rebuild");
+
+        let frame = pane.frame().expect("the pane republishes its projection");
+        assert_eq!(frame.dimensions, (120, 36));
+        // Every snapshot row is on its own line: at the stale width each row
+        // autowrapped, pushing the whole screen into scrollback and leaving a
+        // blank viewport behind.
+        for row in 0..36 {
+            assert_eq!(frame.content.row_text(row).trim_end(), format!("row {row:02}"));
+        }
     }
 }
