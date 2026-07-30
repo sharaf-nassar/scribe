@@ -214,6 +214,12 @@ The oracle for the signal count is a size reporter running inside the pane — a
 
 It reuses the in-pane `trap 'winch=$((winch+1))' WINCH` oracle for the same reason the geometry script does — a mid-drag apply and its correction leave no trace in any screen snapshot. Phase 1 is what makes the test reach the code at all: `Resize` is only a viewport report in a shared mode, and the mode is snapshotted onto the share at claim time, so the script rewrites the config to `free_for_all` and restarts the disposable server *before* the harness daemon says Hello. Phase 3 then reports 16 viewports 50 ms apart — closer together than the 250 ms debounce, but a full second end to end — and fails loudly if the drag happened to fit inside one window, since nothing would have been coalesced. A per-report timer fails phase 4 with a double-digit signal count; the pre-fix binary times out there.
 
+### Resize Coalescing E2E
+
+`tests/e2e/func/resize-coalescing.sh` asserts the paced half of the direct grid-set path: a `SingleController` drag costs at most four applies per second, and it still lands on the size it stopped at.
+
+It is the `SingleController` counterpart to the shared-grid script — the default mode, so it needs no config rewrite — and reuses the same in-pane `trap 'winch=$((winch+1))' WINCH` oracle, since a drag's intermediate grids leave no trace in a snapshot that ends where the last report put it. Phase 2 reports 40 one-column steps 30 ms apart, times the drag, and derives the signal ceiling from the elapsed span rather than a constant, so a container slow enough to space the reports an interval apart fails as "cannot distinguish pacing" instead of passing vacuously. An unpaced server spends one signal per report and fails phase 3 on the verdict the pane computes for itself.
+
 ### Session Lifecycle E2E
 
 Scripted lifecycle coverage proving the GPUI client survives detach, hot-reload, and full cold restart against a disposable test server — never the user's live server (the CLAUDE.md invariant), as the harness runs its own `scribe-test server`.

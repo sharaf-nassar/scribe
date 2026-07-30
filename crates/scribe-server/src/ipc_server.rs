@@ -1117,6 +1117,72 @@ struct PtyReaderState {
     pending_ai_scrollback_baseline: bool,
 }
 
+/// Minimum spacing between two grid applies driven by one session's `Resize`
+/// stream (spec 017 US7-3) — 250 ms, so a continuous drag settles to at most
+/// four applies per second. Matches the shared-window debounce window.
+const RESIZE_APPLY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// What a `Resize` report has to do once [`ResizePacer`] has admitted it.
+enum ResizeAdmission {
+    /// Nothing has been applied inside the current window: apply now.
+    ApplyNow,
+    /// Too soon after the last apply and no timer is counting down. The caller
+    /// arms one for this delay; it applies whatever is pending when it fires.
+    Arm(std::time::Duration),
+    /// A timer is already counting down and will pick this report up.
+    Coalesced,
+}
+
+/// Rate limiter over one session's controller-driven grid applies (spec 017
+/// US7-3). A drag republishes a pane's grid every frame, and each report used to
+/// drive a full `Term` reflow plus a `TIOCSWINSZ` — so the reflows ran at event
+/// rate and the child paid a `SIGWINCH` per step. Applies now run leading-edge
+/// and then no more often than [`RESIZE_APPLY_INTERVAL`], with the newest report
+/// held as the trailing one so the drag always lands on the size it stopped at.
+#[derive(Default)]
+struct ResizePacer {
+    /// When the last apply ran; `None` until the first report, which is why an
+    /// isolated resize is never delayed.
+    last_apply: Option<std::time::Instant>,
+    /// Newest size reported since that apply, waiting on the armed timer.
+    pending: Option<TerminalSize>,
+    /// Whether a trailing-apply task is already counting down for this session.
+    armed: bool,
+}
+
+impl ResizePacer {
+    /// Admit one report and decide who applies it.
+    fn admit(&mut self, size: TerminalSize, now: std::time::Instant) -> ResizeAdmission {
+        if self.armed {
+            self.pending = Some(size);
+            return ResizeAdmission::Coalesced;
+        }
+        let waited = self.last_apply.map(|last| now.duration_since(last));
+        match waited {
+            Some(waited) if waited < RESIZE_APPLY_INTERVAL => {
+                self.pending = Some(size);
+                self.armed = true;
+                ResizeAdmission::Arm(RESIZE_APPLY_INTERVAL.saturating_sub(waited))
+            }
+            _ => {
+                self.last_apply = Some(now);
+                self.pending = None;
+                ResizeAdmission::ApplyNow
+            }
+        }
+    }
+
+    /// Disarm the trailing timer and take the size it owes an apply. `None` only
+    /// when the pending report was already consumed, which leaves the pacer idle
+    /// rather than holding a timer no report will ever mature.
+    fn take_pending(&mut self, now: std::time::Instant) -> Option<TerminalSize> {
+        self.armed = false;
+        let size = self.pending.take()?;
+        self.last_apply = Some(now);
+        Some(size)
+    }
+}
+
 /// A running session in the server-wide registry. Lives independently of
 /// any client connection — the `client_writer` is set/cleared as clients
 /// attach and detach.
@@ -1167,6 +1233,9 @@ pub struct LiveSession {
     /// Latest known terminal cell size in pixels.
     cell_width: u16,
     cell_height: u16,
+    /// Paces controller-driven grid applies for this session (spec 017 US7-3),
+    /// so a drag's report stream costs at most four reflows per second.
+    resize_pacer: ResizePacer,
     /// Keep the Pty alive so the child process isn't killed by SIGHUP on Drop.
     /// `None` for sessions restored from a hot-reload handoff. Taken by the
     /// close paths, which route the SIGHUP + `waitpid` off-worker through
@@ -6245,6 +6314,7 @@ async fn start_session(
         ai_provider_hint,
         cell_width,
         cell_height,
+        resize_pacer: ResizePacer::default(),
         pty,
         handoff_snapshot,
         preserve_ai_scrollback: Arc::clone(&preserve_ai_scrollback),
@@ -7051,7 +7121,13 @@ async fn apply_grid_to_window_sessions(
     }
 }
 
-/// Resize the terminal and PTY.
+/// Resize the terminal and PTY, paced to at most four applies per second.
+///
+/// The cell size is recorded from every report — it only feeds winsize replies
+/// and costs nothing — but the reflow itself goes through the session's
+/// [`ResizePacer`] (spec 017 US7-3), so a drag's report stream collapses into a
+/// leading apply plus one per [`RESIZE_APPLY_INTERVAL`], ending at the size the
+/// drag stopped on.
 async fn handle_resize(
     session_id: SessionId,
     size: TerminalSize,
@@ -7068,7 +7144,7 @@ async fn handle_resize(
         return;
     }
 
-    let (term, resize_fd) = {
+    let admission = {
         let mut sessions = live_sessions.write().await;
         let Some(session) = sessions.get_mut(&session_id) else {
             warn!(%session_id, "Resize for unknown session");
@@ -7076,6 +7152,50 @@ async fn handle_resize(
         };
         session.cell_width = size.cell_width.max(1);
         session.cell_height = size.cell_height.max(1);
+        session.resize_pacer.admit(size, std::time::Instant::now())
+    };
+
+    match admission {
+        ResizeAdmission::ApplyNow => apply_session_resize(session_id, size, live_sessions).await,
+        ResizeAdmission::Coalesced => {}
+        ResizeAdmission::Arm(delay) => {
+            let live_sessions = Arc::clone(live_sessions);
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                apply_trailing_resize(session_id, &live_sessions).await;
+            });
+        }
+    }
+}
+
+/// Apply whatever size a session's armed trailing timer is holding, once its
+/// window has elapsed. A session that left the registry mid-drag has nothing to
+/// apply, which is how a close cancels the timer the drag armed.
+async fn apply_trailing_resize(session_id: SessionId, live_sessions: &LiveSessionRegistry) {
+    let pending = {
+        let mut sessions = live_sessions.write().await;
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return;
+        };
+        session.resize_pacer.take_pending(std::time::Instant::now())
+    };
+    let Some(size) = pending else { return };
+    apply_session_resize(session_id, size, live_sessions).await;
+}
+
+/// Drive one session's `Term` reflow and `TIOCSWINSZ` at `size` — the work both
+/// the leading and the trailing apply do.
+async fn apply_session_resize(
+    session_id: SessionId,
+    size: TerminalSize,
+    live_sessions: &LiveSessionRegistry,
+) {
+    let (term, resize_fd) = {
+        let sessions = live_sessions.read().await;
+        let Some(session) = sessions.get(&session_id) else {
+            warn!(%session_id, "Resize for unknown session");
+            return;
+        };
         (Arc::clone(&session.term), Arc::clone(&session.resize_fd))
     };
 
@@ -11500,6 +11620,92 @@ mod tests {
         assert!(
             !await_settled_viewport_reports(&window_shares, window_id, debounce, generation).await,
             "a departed window has no grid to apply"
+        );
+    }
+
+    /// Replay a report stream through a [`ResizePacer`], standing in for the
+    /// trailing task: a timer armed at a deadline fires the moment the clock
+    /// passes it, and one final drain settles the stream. Returns the instant of
+    /// every apply and the size it carried.
+    fn pace_reports(
+        reports: &[(std::time::Instant, TerminalSize)],
+    ) -> Vec<(std::time::Instant, TerminalSize)> {
+        let mut pacer = ResizePacer::default();
+        let mut applies = Vec::new();
+        let mut deadline: Option<std::time::Instant> = None;
+        for (at, report) in reports.iter().copied() {
+            match deadline {
+                Some(due) if due <= at => {
+                    applies.extend(pacer.take_pending(due).map(|pending| (due, pending)));
+                    deadline = None;
+                }
+                _ => {}
+            }
+            match pacer.admit(report, at) {
+                ResizeAdmission::ApplyNow => applies.push((at, report)),
+                ResizeAdmission::Arm(delay) => deadline = Some(at + delay),
+                ResizeAdmission::Coalesced => {}
+            }
+        }
+        if let Some(due) = deadline {
+            applies.extend(pacer.take_pending(due).map(|pending| (due, pending)));
+        }
+        applies
+    }
+
+    /// Finding #25: a drag republished a pane's grid every frame and each report
+    /// drove its own `Term` reflow plus `TIOCSWINSZ`, so the applies ran at event
+    /// rate. The stream must now collapse to applies no closer than 250 ms apart,
+    /// and the last one must carry the size the drag stopped at.
+    #[test]
+    fn a_resize_drag_paces_applies_to_four_per_second() {
+        let base = std::time::Instant::now();
+        let reports: Vec<_> = (0..60u16)
+            .map(|step| {
+                let at = base + std::time::Duration::from_millis(u64::from(step) * 16);
+                (at, viewport(120 - step, 40))
+            })
+            .collect();
+
+        let applies = pace_reports(&reports);
+
+        assert!(
+            applies.len() < reports.len() / 4,
+            "60 reports over ~1s must not cost 60 reflows, got {}",
+            applies.len()
+        );
+        for pair in applies.windows(2) {
+            assert!(
+                pair[1].0.duration_since(pair[0].0) >= RESIZE_APPLY_INTERVAL,
+                "applies must stay at least one interval apart"
+            );
+        }
+        assert_eq!(
+            applies.last().expect("a drag applies at least once").1,
+            reports.last().expect("the drag reported at least once").1,
+            "the drag settles on the size it stopped at, not on a mid-drag one"
+        );
+    }
+
+    /// Pacing must not tax an isolated resize: the first report of a stream, and
+    /// any report a full interval after the previous apply, goes straight through.
+    #[test]
+    fn an_isolated_resize_applies_without_delay() {
+        let base = std::time::Instant::now();
+        let mut pacer = ResizePacer::default();
+
+        assert!(
+            matches!(pacer.admit(viewport(100, 30), base), ResizeAdmission::ApplyNow),
+            "nothing has been applied yet, so the first report cannot be late"
+        );
+        let settled = base + RESIZE_APPLY_INTERVAL;
+        assert!(
+            matches!(pacer.admit(viewport(90, 30), settled), ResizeAdmission::ApplyNow),
+            "a report a full interval later is a fresh resize, not part of a burst"
+        );
+        assert!(
+            pacer.take_pending(settled).is_none(),
+            "an immediate apply leaves no trailing work behind"
         );
     }
 }
