@@ -39,11 +39,15 @@ use scribe_server::tailnet;
 use scribe_server::lan;
 // Spec 017 US1-3: the PTY reader and the close paths in `mod ipc_server` reach
 // the per-session exit funnel through `crate::session_exit`. Re-exported from
-// the LIBRARY crate for the same reason as `tailnet`/`lan` — the gate's
-// child-exit-watcher seat is only called from the watcher that lands next, and
-// a second in-binary copy would recompile those `pub` items into dead-code
-// warnings.
+// the LIBRARY crate for the same reason as `tailnet`/`lan` — a second in-binary
+// copy would recompile its `pub` items into dead-code warnings.
 use scribe_server::session_exit;
+// Spec 017 US1-2: `mod session_manager` opens each child's pidfd and
+// `mod ipc_server` arms the watcher over it, both through
+// `crate::child_watch`. Re-exported for the same reason — the non-Linux build
+// never reaches the watcher itself, so an in-binary copy would report its
+// `pub` items dead there.
+use scribe_server::child_watch;
 mod updater;
 mod workspace_manager;
 mod workspace_notes;

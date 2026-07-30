@@ -125,6 +125,15 @@ pub struct ManagedSession {
     /// Duplicate PTY master fd used for safe winsize updates and handoff fd passing.
     pub resize_fd: OwnedFd,
     pub child_pid: u32,
+    /// `pidfd` for the child, opened at spawn so the child-exit watcher can
+    /// wait on the process itself instead of inferring death from master EOF
+    /// (spec 017 US1-2).
+    ///
+    /// `None` for handoff-restored sessions — their child belongs to the
+    /// previous server process and was reparented when it exited, so this
+    /// process cannot wait on it — and on platforms without `pidfd`. Those
+    /// sessions stay on the EOF path with `exit_code: None`.
+    pub child_pidfd: Option<OwnedFd>,
     pub term: Arc<Mutex<Term<ScribeEventListener>>>,
     /// ANSI processor for feeding bytes into `Term<ScribeEventListener>`.
     /// Uses `vte::ansi::Processor` which calls `Handler` methods on Term.
@@ -266,6 +275,7 @@ impl PreparedSessionLaunch {
             pty_fd,
             resize_fd,
             child_pid,
+            child_pidfd: crate::child_watch::open_child_pidfd(child_pid),
             term: Arc::new(Mutex::new(self.term)),
             ansi_processor,
             osc_parser,
@@ -504,6 +514,9 @@ impl SessionManager {
                 pty_fd,
                 resize_fd,
                 child_pid: handoff_session.child_pid,
+                // Inherited child: this process never spawned it, so it arms
+                // no child-exit watcher and keeps EOF-based exit detection.
+                child_pidfd: None,
                 term: Arc::new(Mutex::new(term)),
                 ansi_processor,
                 osc_parser,

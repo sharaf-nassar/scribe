@@ -34,12 +34,16 @@ pub struct SessionExitGate {
     /// Winner-takes-all gate for the exit funnel.
     finalized: AtomicBool,
     /// Set once a child-exit watcher owns this session's exit status. While
-    /// set, the reader yields the funnel to it on EOF: a master EOF only
-    /// proves that every slave fd closed, which a live child can do on its
-    /// own, so the watcher — not the reader — holds the authoritative status.
-    /// Handoff-inherited sessions never arm one and keep the EOF path with
-    /// `exit_code: None`.
+    /// set, the reader yields the funnel to it whenever the master stream
+    /// ends: that only proves every slave fd closed, which a live child can do
+    /// on its own, so the watcher — not the reader — holds the authoritative
+    /// status. Handoff-inherited sessions never arm one and keep that path
+    /// with `exit_code: None`.
     watcher_armed: AtomicBool,
+    /// Raised when the reader loop ends, for whatever reason. The child-exit
+    /// watcher waits on it so the PTY finishes draining before `SessionExited`
+    /// goes out, keeping a dying session's last bytes ahead of its exit frame.
+    reader_done: watch::Sender<bool>,
     /// The reader task's handle, retained so teardown can join it instead of
     /// detaching an unbounded task.
     reader: Mutex<Option<JoinHandle<()>>>,
@@ -54,10 +58,12 @@ impl Default for SessionExitGate {
 impl SessionExitGate {
     pub fn new() -> Self {
         let (cancel_tx, _cancel_rx) = watch::channel(false);
+        let (reader_done, _reader_done_rx) = watch::channel(false);
         Self {
             cancel_tx,
             finalized: AtomicBool::new(false),
             watcher_armed: AtomicBool::new(false),
+            reader_done,
             reader: Mutex::new(None),
         }
     }
@@ -102,6 +108,25 @@ impl SessionExitGate {
     /// Whether a child-exit watcher is this session's authoritative emitter.
     pub fn has_watcher(&self) -> bool {
         self.watcher_armed.load(Ordering::Acquire)
+    }
+
+    /// Announce that the reader loop has ended. Idempotent.
+    pub fn mark_reader_done(&self) {
+        self.reader_done.send_replace(true);
+    }
+
+    /// Resolve once the reader loop has ended, immediately if it already had.
+    ///
+    /// The child-exit watcher awaits this (bounded by its own timeout) before
+    /// it emits: the child's death and the reader's last read are two
+    /// independent wakeups, and emitting `SessionExited` first would retire
+    /// the pane on the client while its final output was still in flight.
+    pub async fn reader_finished(&self) {
+        let mut rx = self.reader_done.subscribe();
+        // `Err` only occurs once every sender is gone, which cannot happen
+        // while the caller holds the gate; treat it as "finished" either way
+        // rather than parking the watcher forever.
+        let _finished = rx.wait_for(|flag| *flag).await.is_ok();
     }
 
     /// Elect this caller to run the session's one-shot exit finalizer.

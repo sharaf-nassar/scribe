@@ -106,8 +106,8 @@ where
         let msg: Result<ServerMessage, ScribeError> = read_message(reader).await;
         match msg {
             Ok(ServerMessage::PtyOutput { data, .. }) => write_stdout(&data),
-            Ok(ServerMessage::SessionExited { session_id, exit_code }) => {
-                info!(%session_id, ?exit_code, "session exited");
+            Ok(ServerMessage::SessionExited { session_id, exit_code, signal }) => {
+                info!(%session_id, ?exit_code, ?signal, "session exited");
                 break;
             }
             Ok(ServerMessage::CwdChanged { session_id, cwd }) => {

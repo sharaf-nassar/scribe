@@ -40,6 +40,7 @@ use scribe_pty::event_listener::SessionEvent;
 use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
 
+use crate::child_watch::{ChildExit, ChildExitWatcher};
 use crate::handoff::HandoffSession;
 use crate::hook_ingress;
 use crate::lan::discovery::{AdvertiseConfig, LanDiscovery, LanPeerHandle, local_hostname};
@@ -5659,7 +5660,7 @@ async fn start_session(
     let StartSessionIds { session: session_id, workspace: workspace_id, window: window_id } = ids;
     #[rustfmt::skip]
     let ManagedSession {
-        pty_fd, resize_fd, child_pid, term, ansi_processor, osc_parser,
+        pty_fd, resize_fd, child_pid, child_pidfd, term, ansi_processor, osc_parser,
         event_rx, shell_name, pty, handoff_snapshot, task_label, title, cwd,
         context, ai_state, ai_provider_hint, cell_width, cell_height,
         env_envelope_id, ..
@@ -5709,7 +5710,11 @@ async fn start_session(
         clipboard_command_tx,
         exit_gate: Arc::clone(&exit_gate),
     };
+    // Cloned before the insert: the child-exit watcher outlives the registry
+    // entry and has to finalize the session after it is gone.
+    let exit_handles = live.exit_handles();
     runtime.live_sessions.write().await.insert(session_id, live);
+    spawn_child_exit_watcher(child_pidfd, child_pid, session_id, exit_handles, &runtime);
 
     spawn_pty_reader(
         PtyReaderInputs {
@@ -5808,6 +5813,72 @@ fn spawn_pty_reader(
     };
 
     exit_gate.set_reader(tokio::spawn(pty_reader_task(state)));
+}
+
+/// How long the child-exit watcher lets the PTY drain before it publishes
+/// `SessionExited` anyway.
+///
+/// The reader's read normally fails within microseconds of the child's death,
+/// so this only bites when a descendant inherited the slave fd and is holding
+/// it open — the case where the master stream may never end at all. Reporting
+/// the exit late there beats the old behavior of never reporting it.
+const CHILD_EXIT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Watch a fresh session's child and publish its real exit status
+/// (spec 017 US1-2).
+///
+/// The watcher is the session's authoritative emitter: the end of the master
+/// stream only proves every slave fd closed, so [`finalize_pty_reader`] yields
+/// the funnel to this task whenever one is armed. It still arbitrates through the same
+/// [`SessionExitGate::claim_exit`] CAS, so an explicit close that got there
+/// first simply makes this a no-op.
+///
+/// The child is peeked, never reaped — [`PtyGuard::teardown`] fired from the
+/// finalizer below is what runs the `waitpid` that clears the zombie.
+fn spawn_child_exit_watcher(
+    child_pidfd: Option<OwnedFd>,
+    child_pid: u32,
+    session_id: SessionId,
+    handles: SessionExitHandles,
+    runtime: &SessionRuntimeContext<'_>,
+) {
+    let Some(watcher) = child_pidfd.and_then(|fd| ChildExitWatcher::arm(fd, child_pid)) else {
+        return;
+    };
+    // Armed before the reader starts (this runs on the same synchronous stretch
+    // as its spawn): a child that dies immediately must not reach the reader's
+    // stream-ended path while the gate still reads as watcher-less, or the
+    // session would report an unknown status.
+    handles.exit_gate.arm_watcher();
+    let live_sessions = Arc::clone(runtime.live_sessions);
+    let workspace_manager = Arc::clone(runtime.workspace_manager);
+    tokio::spawn(async move {
+        let exit = watcher.exited().await;
+        // Let the reader finish draining first: the child's death and its last
+        // write are independent wakeups, and emitting the exit ahead of the
+        // tail output would retire the pane before the client painted it.
+        if tokio::time::timeout(CHILD_EXIT_DRAIN_GRACE, handles.exit_gate.reader_finished())
+            .await
+            .is_err()
+        {
+            debug!(
+                %session_id,
+                "PTY still open after the child exited — publishing the exit without a full drain"
+            );
+        }
+        finalize_session_exit(
+            &handles.exit_gate,
+            SessionExitContext {
+                session_id,
+                client_writer: &handles.client_writer,
+                attachment: &handles.attachment,
+                live_sessions: &live_sessions,
+                workspace_manager: &workspace_manager,
+            },
+            exit,
+        )
+        .await;
+    });
 }
 
 /// Spec 010 C4: build the OSC 52 client→PTY-reader control channel.
@@ -6054,7 +6125,7 @@ async fn handle_close_session(
                 live_sessions,
                 workspace_manager,
             },
-            None,
+            ChildExit::UNKNOWN,
         )
         .await;
     }
@@ -6143,7 +6214,7 @@ async fn handle_close_window(window_id: WindowId, context: &ClientDispatchContex
                 live_sessions: &context.server.live_sessions,
                 workspace_manager: &context.server.workspace_manager,
             },
-            None,
+            ChildExit::UNKNOWN,
         )
         .await;
     }
@@ -7564,6 +7635,20 @@ enum ReaderStop {
     Cancelled,
 }
 
+impl ReaderStop {
+    /// Whether the master stream itself ended, rather than the reader being
+    /// told to stop.
+    ///
+    /// Both variants mean the same thing here: Linux answers a read on a
+    /// master whose last slave closed with `EIO`, not a zero-length read, so
+    /// the common "the shell exited" case arrives as `ReadError`. Neither
+    /// proves the child is dead, which is why an armed child-exit watcher
+    /// owns the exit status for both.
+    const fn ends_master_stream(self) -> bool {
+        matches!(self, Self::Eof | Self::ReadError)
+    }
+}
+
 enum PtyReadAction {
     Continue,
     Data(usize),
@@ -7888,18 +7973,21 @@ fn trim_term_scrollback_inner(
 
 /// Route the reader's own exit into the session funnel (spec 017 US1-3).
 ///
-/// A master EOF only proves that every slave fd closed, which a live child can
-/// do on its own, so when a child-exit watcher is armed the reader stops
-/// reading and leaves emission to it. Handoff-inherited sessions never arm a
-/// watcher and keep the EOF path with `exit_code: None`. Cancellation still
-/// calls the funnel: the canceller normally wins the CAS, but the reader is
-/// the backstop if it is torn down before the canceller gets there.
+/// The end of the master stream only proves that every slave fd closed, which
+/// a live child can do on its own, so when a child-exit watcher is armed the
+/// reader stops reading and leaves emission to it. Handoff-inherited sessions
+/// never arm a watcher and keep that path with `exit_code: None`. Cancellation
+/// still calls the funnel: the canceller normally wins the CAS, but the reader
+/// is the backstop if it is torn down before the canceller gets there.
 async fn finalize_pty_reader(state: PtyReaderState, stop: ReaderStop) {
     info!(session_id = %state.session_id, ?stop, "PTY reader task exited");
-    if stop == ReaderStop::Eof && state.exit_gate.has_watcher() {
+    // Release the watcher's drain wait before anything else, whichever way the
+    // loop ended: it is parked on this until the PTY stops producing.
+    state.exit_gate.mark_reader_done();
+    if stop.ends_master_stream() && state.exit_gate.has_watcher() {
         debug!(
             session_id = %state.session_id,
-            "PTY master EOF with a child-exit watcher armed — deferring session exit to it"
+            "PTY master stream ended with a child-exit watcher armed — deferring session exit"
         );
         return;
     }
@@ -7912,7 +8000,7 @@ async fn finalize_pty_reader(state: PtyReaderState, stop: ReaderStop) {
             live_sessions: &state.live_sessions,
             workspace_manager: &state.workspace_manager,
         },
-        None,
+        ChildExit::UNKNOWN,
     )
     .await;
 }
@@ -7935,19 +8023,23 @@ struct SessionExitContext<'a> {
 /// and the child-exit watcher all end here. The CAS in
 /// [`SessionExitGate::claim_exit`] elects exactly one of them to publish
 /// `SessionExited` and unwire the session, so a close racing the child's own
-/// death can neither double-emit nor drop the notification. `exit_code` is
-/// `None` for every path except the watcher, which is the only observer of a
-/// real wait status.
+/// death can neither double-emit nor drop the notification. `exit` is
+/// [`ChildExit::UNKNOWN`] for every path except the watcher, which is the only
+/// observer of a real wait status.
 async fn finalize_session_exit(
     gate: &SessionExitGate,
     ctx: SessionExitContext<'_>,
-    exit_code: Option<i32>,
+    exit: ChildExit,
 ) {
     if !gate.claim_exit() {
         debug!(session_id = %ctx.session_id, "session exit already finalized");
         return;
     }
-    let exit_msg = ServerMessage::SessionExited { session_id: ctx.session_id, exit_code };
+    let exit_msg = ServerMessage::SessionExited {
+        session_id: ctx.session_id,
+        exit_code: exit.exit_code,
+        signal: exit.signal,
+    };
     send_to_client(ctx.client_writer, &exit_msg).await;
     remove_from_session_attachment(ctx.attachment, ctx.session_id).await;
     // Bind the removed session: dropping it inline would run `Pty::Drop`
@@ -7961,7 +8053,7 @@ async fn finalize_session_exit(
     let mut workspace_manager = ctx.workspace_manager.write().await;
     workspace_manager.remove_session(ctx.session_id);
     workspace_manager.remove_session_from_window(ctx.session_id);
-    info!(session_id = %ctx.session_id, ?exit_code, "session exit finalized");
+    info!(session_id = %ctx.session_id, ?exit, "session exit finalized");
 }
 
 /// Result of a PTY read attempt, or of the cancellation racing it.

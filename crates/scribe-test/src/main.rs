@@ -238,6 +238,16 @@ enum Command {
         #[arg(long, default_value_t = 5000)]
         timeout: u64,
     },
+    /// Assert that a session's child was killed by a specific signal.
+    AssertSignal {
+        /// Target session ID.
+        session_id: String,
+        /// Expected terminating signal number.
+        signal: i32,
+        /// Timeout in milliseconds.
+        #[arg(long, default_value_t = 5000)]
+        timeout: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -392,6 +402,9 @@ fn run(cli: Cli) -> Result<(), TestError> {
         }
         Command::AssertExit { session_id, code, timeout } => {
             assert::assert_exit(&session_id, code, timeout)
+        }
+        Command::AssertSignal { session_id, signal, timeout } => {
+            assert::assert_signal(&session_id, signal, timeout)
         }
         Command::ShareTap { listen, upstream, record, control } => {
             let rt =
