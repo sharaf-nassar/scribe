@@ -299,7 +299,9 @@ pub struct ScrollbarPaint {
 
 /// Paints the current terminal grid with fixed-width rows.
 pub struct TerminalElement {
-    content: Content,
+    /// Shared with the pane's published render projection, so handing a
+    /// snapshot to the paint pass copies no rows.
+    content: Arc<Content>,
     font: GridFont,
     colors: GridColors,
     /// Find-overlay match spans for this frame, already projected onto the
@@ -330,7 +332,7 @@ impl TerminalElement {
     ///
     /// `bounds_sink` receives the grid's window-space rect on every frame.
     pub fn new(
-        content: Content,
+        content: Arc<Content>,
         font: GridFont,
         colors: GridColors,
         highlight_colors: MatchHighlightColors,
@@ -1410,7 +1412,7 @@ mod tests {
         };
         let content = Content { rows: vec![vec![Cell::default(); 8]], ..Content::default() };
         TerminalElement::new(
-            content,
+            Arc::new(content),
             GridFont::default(),
             colors,
             MatchHighlightColors::from_chrome(&theme.chrome),

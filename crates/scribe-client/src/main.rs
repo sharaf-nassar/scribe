@@ -155,14 +155,14 @@ use tokio::{
 
 use crate::{
     ipc_bridge::{
-        InboundEvent, InboundReceiver, InboundSender, IpcSink, OUTBOUND_QUEUE_FRAMES,
-        OutboundReceiver, OutboundSender, PaneOp, RestoredSession, SinkError, WriteOutcome,
-        inbound_channel, outbound_channel, run_drain, write_or_tear,
+        CoalescedBatch, InboundEvent, InboundReceiver, InboundSender, IpcSink,
+        OUTBOUND_QUEUE_FRAMES, OutboundReceiver, OutboundSender, PaneOp, RestoredSession,
+        SinkError, WriteOutcome, inbound_channel, outbound_channel, run_drain, write_or_tear,
     },
     pane_shell::{ClosedPane, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
     session_lifecycle::{JumpDirection, PromptMarks},
-    sync_frames::{SyncFrameQueue, drain_all_committed},
-    terminal::{Content, DisplayOnlyTerminal, PaneGrids, Scroll},
+    sync_frames::drain_all_committed,
+    terminal::{Content, DisplayOnlyTerminal, PaneFrame, PaneGrid, PaneGrids, PaneStream, Scroll},
     terminal_element::{
         CursorPaint, GridBounds, GridColors, GridFont, ImePaint, ScrollbarPaint, TerminalElement,
         cell_at, hits_jump_chip, record_grid_area,
@@ -1181,7 +1181,12 @@ impl TerminalView {
     /// right line, and one already under way stays pinned while output scrolls
     /// underneath it.
     fn sync_ime(&mut self, cx: &mut Context<Self>) -> ImePaint {
-        let placement = self.with_focused_grid(|terminal| terminal.cursor_placement());
+        // Read off the published projection rather than the grid: this runs on
+        // every paint, and a paint must never queue behind a VTE parse.
+        let placement = self
+            .focused_session()
+            .and_then(|session_id| self.pane_frame(session_id))
+            .map(|frame| frame.cursor);
         let preedit = self.ime.update(cx, |ime, _| {
             if let Some(placement) = placement {
                 ime.set_anchor(placement.abs_row, placement.col);
@@ -1550,9 +1555,32 @@ impl TerminalView {
     /// [`Self::focus_pane_session`] and the reader's attach path re-point it
     /// on every focus move. Returns `None` when no pane is attached yet.
     fn with_focused_grid<R>(&self, edit: impl FnOnce(&mut DisplayOnlyTerminal) -> R) -> Option<R> {
-        let session_id = (*self.shared.active_session.lock().ok()?)?;
-        let mut grids = self.shared.panes.lock().ok()?;
-        Some(edit(grids.grid_mut(session_id)))
+        self.focused_pane()?.with_terminal(edit)
+    }
+
+    /// A handle on the focused pane. `None` when no pane is attached yet.
+    fn focused_pane(&self) -> Option<Arc<PaneGrid>> {
+        self.pane_for(self.focused_session()?)
+    }
+
+    /// A handle on one session's pane, taken with the registry lock released so
+    /// the caller's own work never blocks a drained batch bound for another
+    /// pane.
+    fn pane_for(&self, session_id: SessionId) -> Option<Arc<PaneGrid>> {
+        Some(self.shared.panes.lock().ok()?.pane(session_id))
+    }
+
+    /// The session the focused pane is showing.
+    fn focused_session(&self) -> Option<SessionId> {
+        *self.shared.active_session.lock().ok()?
+    }
+
+    /// The published render projection for one session's pane.
+    ///
+    /// Every per-frame read goes through here rather than through the pane's
+    /// own lock: a paint must never queue behind a VTE parse.
+    fn pane_frame(&self, session_id: SessionId) -> Option<Arc<PaneFrame>> {
+        self.shared.panes.lock().ok()?.frame(session_id)
     }
 
     /// Move the display viewport and repaint.
@@ -1619,30 +1647,38 @@ impl TerminalView {
         action: &str,
         cx: &mut Context<Self>,
     ) {
-        let Some(session_id) = self.shared.active_session.lock().ok().and_then(|guard| *guard)
-        else {
-            return;
-        };
-        let Ok(marks) = self.shared.prompt_marks.lock() else {
-            tracing::warn!("prompt-mark mutex poisoned; dropping jump");
-            return;
-        };
-        let Ok(mut grids) = self.shared.panes.lock() else { return };
-        let terminal = grids.grid_mut(session_id);
-        let viewport_top_abs = terminal.viewport_top_abs();
-        let total = marks.marks(session_id).len();
-        let Some(target) = pick(&marks, session_id, viewport_top_abs) else {
-            // FR-011: no candidate is a no-op, not a jump to the nearest thing.
-            tracing::info!(action, marks = total, viewport_top_abs, "prompt jump found no mark");
-            return;
-        };
-        // Landing on a mark is a deliberate scroll, so the pin is cleared for
-        // the same reason `scroll_terminal` clears it on `Scroll::Bottom`.
-        terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
-        let moved = terminal.scroll_to_abs(target);
-        let offset = terminal.display_offset();
-        drop(grids);
-        drop(marks);
+        let Some(session_id) = self.focused_session() else { return };
+        let Some(pane) = self.pane_for(session_id) else { return };
+        // The marks are taken *inside* the pane's lock, the order the drain
+        // takes them in when it anchors a mark against the grid it just
+        // advanced. Taking them the other way round here would be the one
+        // inversion able to deadlock a jump against a firehosed pane.
+        let jumped = pane.with_terminal(|terminal| {
+            let Ok(marks) = self.shared.prompt_marks.lock() else {
+                tracing::warn!("prompt-mark mutex poisoned; dropping jump");
+                return None;
+            };
+            let viewport_top_abs = terminal.viewport_top_abs();
+            let total = marks.marks(session_id).len();
+            let Some(target) = pick(&marks, session_id, viewport_top_abs) else {
+                // FR-011: no candidate is a no-op, not a jump to the nearest
+                // thing.
+                tracing::info!(
+                    action,
+                    marks = total,
+                    viewport_top_abs,
+                    "prompt jump found no mark"
+                );
+                return None;
+            };
+            // Landing on a mark is a deliberate scroll, so the pin is cleared
+            // for the same reason `scroll_terminal` clears it on
+            // `Scroll::Bottom`.
+            terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
+            let moved = terminal.scroll_to_abs(target);
+            Some((target, moved, terminal.display_offset(), total))
+        });
+        let Some(Some((target, moved, offset, total))) = jumped else { return };
         tracing::info!(action, target, moved, offset, marks = total, "prompt jump moved");
         // The landing row is one of the scrollbar's own ticks, so revealing the
         // overlay is what shows the jump in context: which command boundary was
@@ -2416,8 +2452,14 @@ impl TerminalView {
     }
 
     /// The focused pane's selection projected onto the painted viewport.
+    ///
+    /// Served from the published projection, so the spans and the cells they
+    /// mark come out of the same grid state and neither read waits on a parse.
     fn selection_spans(&self) -> Vec<SelectionSpan> {
-        self.with_focused_grid(|terminal| terminal.selection_spans()).unwrap_or_default()
+        self.focused_session()
+            .and_then(|session_id| self.pane_frame(session_id))
+            .map(|frame| frame.selection_spans.clone())
+            .unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------
@@ -3805,9 +3847,7 @@ impl TerminalView {
                 continue;
             }
             self.pane_sizes.insert(session_id, size);
-            if let Ok(mut grids) = self.shared.panes.lock() {
-                grids.resize(session_id, usize::from(size.cols), usize::from(size.rows));
-            }
+            self.resize_pane_grid(session_id, size);
             let result = self
                 .sink
                 .resize(session_id, size)
@@ -3824,6 +3864,18 @@ impl TerminalView {
                 "published a pane's grid size"
             );
         }
+    }
+
+    /// Reshape one pane's display grid.
+    ///
+    /// The pane is resolved out of the registry and the registry lock dropped
+    /// before the reshape, so a resize waits on at most the batch being parsed
+    /// into that one pane rather than on every pane at once.
+    fn resize_pane_grid(&self, session_id: SessionId, size: TerminalSize) {
+        let Some(pane) = self.pane_for(session_id) else { return };
+        pane.with_terminal(|terminal| {
+            terminal.resize(usize::from(size.cols), usize::from(size.rows));
+        });
     }
 
     /// Reconcile the pane layout with the sessions the server actually has.
@@ -3995,8 +4047,8 @@ impl TerminalView {
 
     /// The last painted frame of `session_id`'s grid, or `None` when nothing
     /// has ever reached that pane.
-    fn pane_content(&self, session_id: SessionId) -> Option<Content> {
-        self.shared.panes.lock().ok()?.content(session_id)
+    fn pane_content(&self, session_id: SessionId) -> Option<Arc<Content>> {
+        self.pane_frame(session_id).map(|frame| Arc::clone(&frame.content))
     }
 
     /// Resolve one animated AI border colour per workspace for this frame.
@@ -4039,7 +4091,7 @@ impl TerminalView {
     /// pane paints its own untouched grid.
     fn render_panes(
         &mut self,
-        focused: Content,
+        focused: Arc<Content>,
         ime: ImePaint,
         cursor: CursorPaint,
         cx: &App,
@@ -4451,12 +4503,12 @@ impl TerminalView {
     /// split-scroll bookkeeping `scroll_terminal` does for the keyboard: a
     /// deliberate scroll dissolves the pin exactly as `Scroll::Bottom` does.
     fn scroll_to_offset(&mut self, session_id: SessionId, target: usize, cx: &mut Context<Self>) {
-        let Ok(mut grids) = self.shared.panes.lock() else { return };
-        let terminal = grids.grid_mut(session_id);
-        terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
-        let moved = terminal.scroll_to_offset(target);
-        drop(grids);
-        if !moved {
+        let Some(pane) = self.pane_for(session_id) else { return };
+        let moved = pane.with_terminal(|terminal| {
+            terminal.set_split_scroll_eligibility(SplitScrollEligibility::default());
+            terminal.scroll_to_offset(target)
+        });
+        if moved != Some(true) {
             return;
         }
         self.pulse_scrollbar(session_id);
@@ -4658,14 +4710,22 @@ impl TerminalView {
     /// scroll position and the alternate-screen flag are terminal state, so the
     /// decision is split across the boundary: the shell hands over what it
     /// knows and reads back how many rows the pin ended up taking.
-    fn sync_split_scroll(&mut self) -> Content {
+    /// The gate is pushed into the grid only when it differs from the one the
+    /// published projection already reflects, which keeps an ordinary paint off
+    /// the pane's own lock: the toggle moves on a config edit or a focus change,
+    /// not on every frame.
+    fn sync_split_scroll(&mut self) -> Arc<Content> {
         let eligibility = self.split_scroll_eligibility();
-        let content = self
-            .with_focused_grid(|terminal| {
-                terminal.set_split_scroll_eligibility(eligibility);
-                terminal.content()
-            })
-            .unwrap_or_default();
+        let published = self.focused_session().and_then(|session_id| self.pane_frame(session_id));
+        let content = match published {
+            Some(frame) if frame.split_scroll == eligibility => Arc::clone(&frame.content),
+            _ => self
+                .with_focused_grid(|terminal| {
+                    terminal.set_split_scroll_eligibility(eligibility);
+                    terminal.content()
+                })
+                .unwrap_or_default(),
+        };
         self.split_scroll.pin_height = self.font.line_height * pin_rows_f32(content.pin_rows);
         content
     }
@@ -7342,19 +7402,19 @@ where
     }
 }
 
-/// Per-session synchronized-output frame queues shared between the coalescing
-/// drain (which enqueues committed bursts) and the expiry flusher.
-type SyncFrameQueues = Arc<Mutex<HashMap<SessionId, SyncFrameQueue>>>;
-
 /// Spawns the coalescing drain with synchronized-frame queueing in front of
 /// `write_output`. A first task drains the inbound channel with Zed's
 /// 4 ms / 100-event coalescing, capped at a megabyte of payload per batch
-/// ([`run_drain`]), splits each pane's bytes into
-/// committed `CSI ? 2026` bursts via a per-session [`SyncFrameQueue`], and
-/// replays one burst per redraw so no frame tears across IPC message
-/// boundaries. A second task waits on the nearest raw-frame or parser sync
-/// deadline and flushes a 150 ms-expired update whose terminating `CSI ? 2026 l`
-/// never arrived.
+/// ([`run_drain`]), splits each pane's bytes into committed `CSI ? 2026` bursts
+/// via that pane's [`PaneStream`], and replays one burst per redraw so no frame
+/// tears across IPC message boundaries. A second task waits on the nearest
+/// raw-frame or parser sync deadline and flushes a 150 ms-expired update whose
+/// terminating `CSI ? 2026 l` never arrived.
+///
+/// The `panes` registry lock is taken once per batch, to resolve the batch's
+/// panes into handles, and released before a single byte is parsed. Everything
+/// after that runs under the individual pane's own lock, so a firehose on one
+/// pane blocks neither the renderer nor any other pane.
 ///
 /// `sink` is the drain's own outbound handle: the inbound queue is bounded, so
 /// whatever it had to drop is repaired by a `RequestSnapshot` per affected pane
@@ -7366,10 +7426,8 @@ fn spawn_drain(
     generation: Arc<AtomicU64>,
     prompt_marks: Arc<Mutex<PromptMarks>>,
 ) {
-    let queues: SyncFrameQueues = Arc::new(Mutex::new(HashMap::new()));
     let expiry_wake = Arc::new(Notify::new());
 
-    let queue_task = Arc::clone(&queues);
     let panes_task = Arc::clone(&panes);
     let generation_task = Arc::clone(&generation);
     let wake_task = Arc::clone(&expiry_wake);
@@ -7377,18 +7435,19 @@ fn spawn_drain(
         if batch.is_empty() {
             return;
         }
+        let batch_panes = resolve_batch_panes(&panes_task, &batch);
         let mut redraws = 0usize;
         let mut sync_armed = false;
-        if let (Ok(mut session_queues), Ok(mut grids)) = (queue_task.lock(), panes_task.lock()) {
-            for (session, op) in batch.iter() {
-                // Each pane advances its own grid, so a background pane's burst
-                // can never land in the focused pane's scrollback.
-                let queue = session_queues.entry(session).or_default();
-                let grid = grids.grid_mut(session);
-                redraws += apply_pane_op(op, session, queue, grid, &prompt_marks);
-                sync_armed |= grid.parser_sync_deadline().is_some();
-                sync_armed |= queue.raw_sync_deadline().is_some();
-            }
+        for (session, op) in batch.iter() {
+            // Each pane advances its own grid, so a background pane's burst
+            // can never land in the focused pane's scrollback.
+            let Some(pane) = batch_panes.get(&session) else { continue };
+            let applied = pane.with_stream(|stream| {
+                (apply_pane_op(op, session, stream, &prompt_marks), stream.sync_armed())
+            });
+            let Some((pane_redraws, pane_sync_armed)) = applied else { continue };
+            redraws += pane_redraws;
+            sync_armed |= pane_sync_armed;
         }
         for _ in 0..redraws {
             generation_task.fetch_add(1, Ordering::Release);
@@ -7398,21 +7457,35 @@ fn spawn_drain(
         }
     }));
 
-    tokio::spawn(run_sync_expiry(queues, panes, generation, expiry_wake));
+    tokio::spawn(run_sync_expiry(panes, generation, expiry_wake));
+}
+
+/// Resolve every pane a batch names into a handle, under one short registry
+/// lock, so the parse below runs with that lock released.
+fn resolve_batch_panes(
+    panes: &Arc<Mutex<PaneGrids>>,
+    batch: &CoalescedBatch,
+) -> HashMap<SessionId, Arc<PaneGrid>> {
+    let Ok(mut grids) = panes.lock() else {
+        tracing::warn!("pane registry mutex poisoned; dropping a drained batch");
+        return HashMap::new();
+    };
+    batch.iter().map(|(session, _)| (session, grids.pane(session))).collect()
 }
 
 /// Apply one drained operation to a pane, reporting how many repaints it owes.
 ///
-/// The three arms share the grid because they are ordered against each other:
-/// output advances it, a prompt mark reads the row the output left the cursor
-/// on, and the suppressed-ED-3 snap resets the offset the output scrolled.
+/// The arms share the stream because they are ordered against each other:
+/// output advances the grid, a prompt mark reads the row the output left the
+/// cursor on, and the suppressed-ED-3 snap resets the offset the output
+/// scrolled.
 fn apply_pane_op(
     op: &PaneOp,
     session: SessionId,
-    queue: &mut SyncFrameQueue,
-    grid: &mut DisplayOnlyTerminal,
+    stream: &mut PaneStream,
     prompt_marks: &Arc<Mutex<PromptMarks>>,
 ) -> usize {
+    let PaneStream { queue, terminal: grid } = stream;
     match op {
         PaneOp::Output(bytes) => {
             queue.queue_output_frames(bytes);
@@ -7509,18 +7582,17 @@ fn apply_prompt_mark(
 /// while the inbound channel is idle. When nothing is buffering, it parks until
 /// the drain task arms a fresh deadline.
 async fn run_sync_expiry(
-    queues: SyncFrameQueues,
     panes: Arc<Mutex<PaneGrids>>,
     generation: Arc<AtomicU64>,
     wake: Arc<Notify>,
 ) {
     loop {
-        match next_sync_deadline(&queues, &panes) {
+        match next_sync_deadline(&panes) {
             None => wake.notified().await,
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 tokio::select! {
-                    () = tokio::time::sleep(remaining) => flush_expired_sync(&queues, &panes, &generation),
+                    () = tokio::time::sleep(remaining) => flush_expired_sync(&panes, &generation),
                     () = wake.notified() => {}
                 }
             }
@@ -7530,21 +7602,9 @@ async fn run_sync_expiry(
 
 /// Commits every raw-frame and parser synchronized update whose deadline has
 /// passed, bumping the redraw generation once per committed burst.
-fn flush_expired_sync(
-    queues: &SyncFrameQueues,
-    panes: &Arc<Mutex<PaneGrids>>,
-    generation: &Arc<AtomicU64>,
-) {
+fn flush_expired_sync(panes: &Arc<Mutex<PaneGrids>>, generation: &Arc<AtomicU64>) {
     let now = Instant::now();
-    let mut redraws = 0usize;
-    if let (Ok(mut session_queues), Ok(mut grids)) = (queues.lock(), panes.lock()) {
-        redraws += grids.flush_parser_sync_timeouts(now);
-        for (session, queue) in session_queues.iter_mut() {
-            let flushed = queue.flush_raw_timeout(now)
-                && drain_all_committed(queue, grids.grid_mut(*session)).needs_redraw;
-            redraws += usize::from(flushed);
-        }
-    }
+    let redraws: usize = live_panes(panes).iter().map(|pane| pane.flush_expired_sync(now)).sum();
     for _ in 0..redraws {
         generation.fetch_add(1, Ordering::Release);
     }
@@ -7552,17 +7612,14 @@ fn flush_expired_sync(
 
 /// Nearest synchronized-update deadline across every pane's raw-frame queue and
 /// every pane's parser, or `None` when nothing is buffering.
-fn next_sync_deadline(queues: &SyncFrameQueues, panes: &Arc<Mutex<PaneGrids>>) -> Option<Instant> {
-    let parser = panes.lock().ok().and_then(|grids| grids.parser_sync_deadline());
-    let raw = queues
-        .lock()
-        .ok()
-        .and_then(|queues| queues.values().filter_map(SyncFrameQueue::raw_sync_deadline).min());
-    match (parser, raw) {
-        (Some(parser), Some(raw)) => Some(parser.min(raw)),
-        (Some(only), None) | (None, Some(only)) => Some(only),
-        (None, None) => None,
-    }
+fn next_sync_deadline(panes: &Arc<Mutex<PaneGrids>>) -> Option<Instant> {
+    live_panes(panes).iter().filter_map(|pane| pane.sync_deadline()).min()
+}
+
+/// Every live pane, resolved under a short registry lock so the expiry task
+/// never holds the registry while it waits on a pane the drain is parsing into.
+fn live_panes(panes: &Arc<Mutex<PaneGrids>>) -> Vec<Arc<PaneGrid>> {
+    panes.lock().map(|grids| grids.panes()).unwrap_or_default()
 }
 
 /// Handles owned by the inbound read loop.

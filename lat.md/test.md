@@ -628,6 +628,20 @@ A synchronized-update frame chunked across four IPC messages (BSU split mid-esca
 
 A tail frame followed by two distinct sync commits drains as three separate frames, so each `CSI ? 2026` commit reaches `feed_output` as its own burst rather than being concatenated.
 
+### Restarts a broken marker match at the next escape
+
+A near-miss marker, two adjacent bare escapes and a short CSI all pass through byte for byte, and the real marker behind them still commits as its own frame.
+
+The scan restarts at the next escape rather than backing up a byte at a time, so these are the inputs that would expose a mis-placed restart.
+
+### Releases a marker prefix that never completes
+
+A message ending on a partial marker withholds those bytes; the next message proves they were ordinary output, so they are released ahead of the real marker behind them rather than being dropped or reordered.
+
+### Passes a run of bare escapes through intact
+
+Sixty-four consecutive escapes — the input that restarts the match on every byte — reach the terminal unchanged with only the trailing escape withheld, so the worst case for the scan neither swallows bytes nor grows the held prefix past a marker.
+
 ### Presents one burst per redraw when caught up
 
 With a backlog below ,  applies one committed burst then stops with  `HasMore`, so light traffic animates incrementally one frame per redraw.
@@ -1726,6 +1740,12 @@ Toggling vi mode publishes a viewport-space cursor on the snapshot, a motion mov
 ### Smart selection resolves through the scrolled viewport
 
  resolves a viewport cell against the display offset before matching, so a rule still matches text that has scrolled into history; blank space yields no actionable candidate.
+
+### A parse in flight blocks neither the registry nor a paint
+
+Holding one pane's stream lock — standing in for a batch mid-parse — leaves the registry free for another pane's batch and leaves both panes' published projections readable, including the busy pane's.
+
+This is the regression guard for the parse being off the registry lock: if a paint-path read ever reached back through the stream instead of the projection, this test would deadlock rather than fail quietly.
 
 ### A moved grid area asks for a republish
 
