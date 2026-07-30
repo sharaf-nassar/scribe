@@ -452,14 +452,14 @@ impl SessionManager {
             .unwrap_or("shell")
             .to_owned();
         let integration_enabled = self.shell_integration_enabled.load(Ordering::Relaxed);
-        let integration_script = session_integration_script(shell_binary, integration_enabled);
+        let integration_script = session_integration_script(shell.kind, integration_enabled);
         let pty_shell =
             build_shell(shell_binary, request.command, shell.kind, integration_script.as_deref());
         let pty_options = build_pty_options(PtyOptionsBuild {
             session_id,
             shell: pty_shell,
             cwd: request.cwd,
-            shell_binary,
+            shell_kind: shell.kind,
             integration_enabled,
             restore_env_file,
         });
@@ -707,7 +707,7 @@ struct PtyOptionsBuild<'a> {
     session_id: SessionId,
     shell: Option<alacritty_terminal::tty::Shell>,
     cwd: Option<std::path::PathBuf>,
-    shell_binary: &'a str,
+    shell_kind: ShellKind,
     integration_enabled: bool,
     restore_env_file: Option<&'a std::path::Path>,
 }
@@ -717,7 +717,7 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
         session_id,
         shell,
         cwd,
-        shell_binary,
+        shell_kind,
         integration_enabled,
         restore_env_file,
     } = opts;
@@ -741,7 +741,7 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
     }
 
     if integration_enabled {
-        inject_shell_integration_env(shell_binary, &mut env);
+        inject_shell_integration_env(shell_kind, &mut env);
     }
 
     // Per specs/006-persist-terminal-env/contracts/hook-event-additions.md, when
@@ -760,13 +760,13 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
     }
 }
 
-fn session_integration_script(shell_binary: &str, integration_enabled: bool) -> Option<String> {
+fn session_integration_script(kind: ShellKind, integration_enabled: bool) -> Option<String> {
     if !integration_enabled {
         return None;
     }
 
     shell_integration::find_scripts_dir()
-        .and_then(|dir| shell_integration::integration_script_path(shell_binary, &dir))
+        .and_then(|dir| shell_integration::integration_script_path(kind, &dir))
         .and_then(|path| path.to_str().map(String::from))
 }
 
@@ -774,7 +774,9 @@ fn session_integration_script(shell_binary: &str, integration_enabled: bool) -> 
 ///
 /// `create_session` needs the kind before it renders the cold-restart
 /// restore file — that file's syntax and extension are shell-specific —
-/// so detection cannot stay inside `prepare_session_launch`.
+/// so detection cannot stay inside `prepare_session_launch`. It is also the
+/// launch's only `detect_shell` call: the startup-script and integration-env
+/// paths both take this kind instead of re-deriving it from the binary path.
 struct ResolvedShell {
     binary: String,
     kind: ShellKind,
@@ -784,6 +786,9 @@ impl ResolvedShell {
     fn for_request(command: Option<&[String]>) -> Self {
         let binary = shell_binary_str(command);
         let kind = shell_integration::detect_shell(&binary);
+        if kind == ShellKind::Unknown {
+            tracing::debug!(shell = binary, "unknown shell, skipping integration env");
+        }
         Self { binary, kind }
     }
 }
@@ -901,9 +906,9 @@ fn build_shell(
 
 /// Inject shell integration environment variables when a scripts directory
 /// is available. Modifies `env` in place.
-fn inject_shell_integration_env(shell_binary: &str, env: &mut HashMap<String, String>) {
+fn inject_shell_integration_env(kind: ShellKind, env: &mut HashMap<String, String>) {
     let Some(scripts_dir) = shell_integration::find_scripts_dir() else { return };
-    let extra = shell_integration::build_env(shell_binary, &scripts_dir);
+    let extra = shell_integration::build_env(kind, &scripts_dir);
     env.extend(extra);
 }
 
