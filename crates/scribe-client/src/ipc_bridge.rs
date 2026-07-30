@@ -138,7 +138,14 @@ pub enum InboundEvent {
     /// `ScreenSnapshot`'s RIS-prefixed replay. Kept apart from
     /// [`Self::PaneOutput`] because it replaces the pane rather than advancing
     /// it, so it must never be folded into a neighbouring output run.
-    PaneRebuild { session_id: SessionId, bytes: Vec<u8> },
+    ///
+    /// `cols`/`rows` are the geometry the server rendered those bytes at.
+    /// They ride along because the bytes are only correct at that geometry:
+    /// every row is emitted as exactly `cols` printable characters and the
+    /// stream ends on an absolute CUP in snapshot coordinates, so replaying
+    /// them into a grid of a different width autowraps every row into
+    /// scrollback and leaves the viewport blank.
+    PaneRebuild { session_id: SessionId, bytes: Vec<u8>, cols: u16, rows: u16 },
     /// An OSC 133 prompt mark for the named pane. The wire message's
     /// `click_events` flag is dropped at the reader: click-to-move has no
     /// surface in this client, so carrying it here would be dead state.
@@ -158,8 +165,9 @@ pub enum PaneOp {
     Output(Vec<u8>),
     /// A whole-pane rebuild, applied as its own burst boundary: the output runs
     /// on either side of it stay separate ops, so no committed frame can span
-    /// it.
-    Rebuild(Vec<u8>),
+    /// it. `cols`/`rows` name the geometry the bytes were rendered at, which
+    /// the drain reshapes the pane grid to before replaying them.
+    Rebuild { bytes: Vec<u8>, cols: u16, rows: u16 },
     /// An OSC 133 mark to anchor against the grid as it stands after every
     /// preceding [`PaneOp::Output`] in this batch.
     PromptMark { kind: PromptMarkKind, exit_code: Option<i32> },
@@ -222,9 +230,9 @@ pub fn coalesce(events: impl IntoIterator<Item = InboundEvent>) -> CoalescedBatc
             InboundEvent::PaneOutput { session_id, bytes } => {
                 append_pane_output(&mut open, &mut entries, session_id, bytes);
             }
-            InboundEvent::PaneRebuild { session_id, bytes } => {
+            InboundEvent::PaneRebuild { session_id, bytes, cols, rows } => {
                 open.remove(&session_id);
-                entries.push((session_id, PaneOp::Rebuild(bytes)));
+                entries.push((session_id, PaneOp::Rebuild { bytes, cols, rows }));
             }
             InboundEvent::PromptMark { session_id, kind, exit_code } => {
                 open.remove(&session_id);
@@ -266,7 +274,9 @@ fn append_pane_output(
 fn rehydrate((session_id, op): (SessionId, PaneOp)) -> InboundEvent {
     match op {
         PaneOp::Output(bytes) => InboundEvent::PaneOutput { session_id, bytes },
-        PaneOp::Rebuild(bytes) => InboundEvent::PaneRebuild { session_id, bytes },
+        PaneOp::Rebuild { bytes, cols, rows } => {
+            InboundEvent::PaneRebuild { session_id, bytes, cols, rows }
+        }
         PaneOp::PromptMark { kind, exit_code } => {
             InboundEvent::PromptMark { session_id, kind, exit_code }
         }
@@ -1525,7 +1535,7 @@ mod tests {
                 batch
                     .into_iter()
                     .filter_map(|(id, op)| match op {
-                        PaneOp::Output(bytes) | PaneOp::Rebuild(bytes) => Some((id, bytes)),
+                        PaneOp::Output(bytes) | PaneOp::Rebuild { bytes, .. } => Some((id, bytes)),
                         PaneOp::PromptMark { .. }
                         | PaneOp::ScrollBottom
                         | PaneOp::TrimScrollback { .. } => None,
@@ -1673,8 +1683,12 @@ mod tests {
     #[test]
     fn coalesce_keeps_a_rebuild_out_of_the_runs_around_it() {
         let pane = SessionId::new();
-        let rebuild =
-            InboundEvent::PaneRebuild { session_id: pane, bytes: b"\x1bcreplay".to_vec() };
+        let rebuild = InboundEvent::PaneRebuild {
+            session_id: pane,
+            bytes: b"\x1bcreplay".to_vec(),
+            cols: 80,
+            rows: 24,
+        };
         let batch = coalesce([
             output(pane, b"before"),
             rebuild.clone(),
@@ -1689,7 +1703,7 @@ mod tests {
             entries,
             vec![
                 (pane, PaneOp::Output(b"before".to_vec())),
-                (pane, PaneOp::Rebuild(b"\x1bcreplay".to_vec())),
+                (pane, PaneOp::Rebuild { bytes: b"\x1bcreplay".to_vec(), cols: 80, rows: 24 }),
                 (pane, PaneOp::Output(b"aftermore".to_vec())),
             ]
         );
