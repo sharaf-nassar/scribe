@@ -7011,11 +7011,15 @@ async fn handle_search_request(
     let term = Arc::clone(&session.term);
     drop(sessions);
 
-    let matches = {
+    // Only the snapshot needs the `Term` (spec 017 US8-1). The scan is a
+    // read of owned data, and the PTY reader task needs this same mutex for
+    // every chunk it feeds, so holding it across the scan would stall the
+    // session's own output path once per keystroke.
+    let snapshot = {
         let term_guard = term.lock().await;
-        let snapshot = snapshot_term(&term_guard);
-        search_snapshot(&snapshot, &query, limit)
+        snapshot_term(&term_guard)
     };
+    let matches = search_snapshot(&snapshot, &query, limit);
 
     let msg = ServerMessage::SearchResults { session_id, query, matches };
     send_message(context.writer, &msg).await;
