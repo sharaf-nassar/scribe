@@ -30,13 +30,15 @@ This parallel execution is necessary because alacritty_terminal ignores custom O
 
 ### Intercepted Sequences
 
-OSC 0/2 (window title), OSC 7 (current working directory), OSC 1337 (`ScribeContext` shell-integration payload and `ScribeAiLaunch` AI pre-arm sentinel only — AI tool state arrives via the hook channel; see ), and BEL (0x07).
+OSC 0/2 (window title), OSC 7 (current working directory), OSC 1337 (`ScribeContext` shell-integration payload and `ScribeAiLaunch` AI pre-arm sentinel only — AI tool state arrives via the hook channel; see ).
 
 ### Passed Through
 
-All other VTE events (CSI sequences, ESC dispatch, printable characters, DCS hooks) are intentional no-ops. The interceptor only cares about metadata-bearing sequences.
+All other VTE events (CSI sequences, ESC dispatch, printable characters, DCS hooks, C0 control bytes) are intentional no-ops. The interceptor only cares about metadata-bearing OSC sequences.
 
 OSC 52 (clipboard read/write) is **out of scope** for this interceptor — it is parsed and dispatched entirely by upstream `alacritty_terminal`, which surfaces `Event::ClipboardStore` / `Event::ClipboardLoad` to the . The per-session policy engine and host clipboard bridge that gate those events live server-side; see .
+
+BEL (0x07) is out of scope for the same reason: `alacritty_terminal` executes the byte itself and surfaces it as `Event::Bell`. Both parsers see the same stream, so recognising BEL here as well produced two `MetadataEvent::Bell`s — and therefore two `Bell` frames and two client attention requests — for every bell.
 
 ## Metadata Parser
 
@@ -44,7 +46,7 @@ The  is a stateful parser that classifies OSC sequences into typed events.
 
 ### Metadata Events
 
-Metadata events cover CWD, title, provider task label, AI state, prompt text, prompt marks, and BEL updates extracted from OSC sequences and control bytes.
+Metadata events cover CWD, title, provider task label, AI state, prompt text, and prompt marks extracted from OSC sequences. `Bell` is the one variant this parser never produces: it comes from the Event Listener.
 
 ### OSC 7 — Working Directory
 
@@ -131,6 +133,8 @@ A fast path skips allocation when the input contains no `\n` byte; the only stat
 The  bridges alacritty_terminal events into a  channel for the server. It forwards metadata, clipboard operations, terminal query callbacks, bell notifications, and PTY write-back requests.
 
 Metadata events still carry title, CWD, AI-state, prompt-mark, and bell signals, but clipboard store/load, color requests, text-area-size requests, and `PtyWrite` now travel through the same channel so the server can answer OSC queries and clipboard reads without logging placeholders.
+
+`Event::Bell` is the single source of `MetadataEvent::Bell`, and therefore of the `Bell` frame the server broadcasts and the one attention request the client raises from it. The OSC interceptor deliberately ignores the byte.
 
 ### Terminal Query Replies
 

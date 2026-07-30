@@ -49,6 +49,10 @@ pub enum MetadataEvent {
     AiProviderArmed {
         provider: AiProvider,
     },
+    /// A BEL (0x07) reached the terminal. Produced only by the `Term`'s own
+    /// parser (`Event::Bell`), never by the OSC interceptor: both parsers see
+    /// the same bytes, so emitting it from both is one attention request per
+    /// BEL too many.
     Bell,
     PromptMark {
         kind: PromptMarkKind,
@@ -74,12 +78,6 @@ impl MetadataParser {
             b"1337" => Self::parse_iterm2(params),
             _ => None,
         }
-    }
-
-    /// Process a C0 control byte and return a metadata event if applicable.
-    #[must_use]
-    pub fn process_execute(byte: u8) -> Option<MetadataEvent> {
-        if byte == 0x07 { Some(MetadataEvent::Bell) } else { None }
     }
 
     fn parse_title(params: &[&[u8]]) -> Option<MetadataEvent> {

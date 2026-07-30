@@ -66,6 +66,8 @@ impl EventListener for ScribeEventListener {
                 self.emit(SessionEvent::Metadata(MetadataEvent::TitleChanged(String::new())));
             }
 
+            // Sole source of `MetadataEvent::Bell`: the OSC interceptor runs a
+            // second parser over the same bytes and deliberately ignores BEL.
             Event::Bell => {
                 self.emit(SessionEvent::Metadata(MetadataEvent::Bell));
             }
