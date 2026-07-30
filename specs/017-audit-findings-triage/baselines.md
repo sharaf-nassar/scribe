@@ -252,6 +252,31 @@ traffic moves through `recvmsg`/`sendmsg`, which do not update
 read ~0 while ~100 MB/3 s flows between them; `rchar` on the server is
 consequently a clean PTY-only counter.
 
+#### After side: per-session sink state machine (bead `scribe-i79.33`)
+
+Re-measured on the same functional container with the *collateral*
+question the baseline could not answer: does a stalled client freeze the
+OTHER sessions sharing its connection? It did, because the fan-out held
+the connection's writer mutex across the inline local socket write, so
+every session's reader queued behind the wedged one.
+
+Rig: session A runs `yes`; session B loops "print ~500 lines, then write
+a monotonic counter to a file, then sleep 50 ms", so B's progress is
+observable from outside the client. The harness daemon (the attached
+client) is SIGSTOP'd for 6 s, then continued.
+
+| phase | before (`8ea42b1`) | after |
+| --- | ---: | ---: |
+| B's heartbeat ticks during the 6 s stop | 4 | 107 |
+| B still responsive after `SIGCONT` | run wedged past the 30 s cap | yes |
+
+B advances at its natural rate throughout the stop, and both sessions
+resume immediately on `SIGCONT`: the connection's queue shed A's
+`PtyOutput` backlog and resynced it with a fresh `SessionReplay`. The
+same run also shows the reader never awaiting a local socket — the queue
+plus its drain task is now the only writer, and `AttachedSinks` moved to
+a std mutex so holding it across a sink await no longer compiles.
+
 ### Measurement environment
 
 - Commit: `b90c932` (`chore(beads): record GPUI rebuild audit`), checked

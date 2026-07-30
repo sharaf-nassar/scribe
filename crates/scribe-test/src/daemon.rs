@@ -1255,7 +1255,42 @@ async fn handle_assert_replay_matches(
     // the app's own output owns it, so visibility is not a property a replay
     // promises to reproduce.
     compare_screen_content(&replayed, &server_screen)
+        .or_else(|| compare_scrollback(&replayed, &server_screen))
         .map_or(DaemonResponse::Ok, |message| DaemonResponse::AssertFailed { message })
+}
+
+/// Compare the replayed view's scrollback against the server's.
+///
+/// The visible grid on its own cannot see output lost or duplicated during an
+/// attach: a scrolling stream anchors the visible rows to the newest lines, so
+/// both sides show the same tail no matter how many rows went missing behind
+/// it. History is where the difference lands and stays, which makes the row
+/// COUNT the sharp oracle — one lost chunk is one missing row forever, one
+/// duplicated flush is one extra row forever. The content comparison behind it
+/// catches the same defect once both sides sit at the scrollback cap, where the
+/// counts are equal but the histories are offset.
+fn compare_scrollback(current: &ScreenSnapshot, reference: &ScreenSnapshot) -> Option<String> {
+    if current.scrollback_rows != reference.scrollback_rows {
+        return Some(format!(
+            "scrollback row mismatch: replayed view has {} rows, server has {} — \
+             output was lost or duplicated between the attach snapshot and the sink install",
+            current.scrollback_rows, reference.scrollback_rows,
+        ));
+    }
+
+    let cols = usize::from(current.cols).max(1);
+    for (i, (cur, refr)) in current.scrollback.iter().zip(reference.scrollback.iter()).enumerate() {
+        if refr.c != ' ' && cur.c != refr.c {
+            let row = i / cols;
+            let col = i % cols;
+            return Some(format!(
+                "scrollback cell ({row},{col}): expected '{}' but found '{}'",
+                refr.c, cur.c
+            ));
+        }
+    }
+
+    None
 }
 
 /// Request a fresh server snapshot and read it back paired with the replayed

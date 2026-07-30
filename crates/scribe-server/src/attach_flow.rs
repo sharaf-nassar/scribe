@@ -5,7 +5,7 @@ use std::sync::Arc;
 use alacritty_terminal::grid::Dimensions;
 use futures_util::future::join_all;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use scribe_common::ids::SessionId;
 use scribe_common::protocol::{ServerMessage, TerminalSize};
@@ -13,7 +13,8 @@ use scribe_common::screen_replay::{SessionReplay, build_session_replay};
 
 use crate::ipc_server::{
     AttachSessionData, AttachedSessionIds, ClientWriter, LiveSessionRegistry, SessionAttachment,
-    SharedWriter, resize_term, send_message, set_pty_winsize,
+    SessionCommit, SharedWriter, TermCommit, begin_sink_attach, finish_sink_attach, resize_term,
+    send_message, set_pty_winsize,
 };
 use crate::session_manager::snapshot_term;
 
@@ -32,6 +33,7 @@ struct AttachEntry {
     client_writer: ClientWriter,
     attachment: SessionAttachment,
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    term_commit: SessionCommit,
     resize_fd: Arc<OwnedFd>,
     target_dims: Option<TerminalSize>,
     has_handoff_snapshot: bool,
@@ -46,6 +48,7 @@ impl From<AttachSessionData> for AttachEntry {
             client_writer: data.client_writer,
             attachment: data.attachment,
             term: data.term,
+            term_commit: data.term_commit,
             resize_fd: data.resize_fd,
             target_dims: data.target_dims,
             has_handoff_snapshot: data.has_handoff_snapshot,
@@ -141,6 +144,15 @@ async fn attach_prepared_entries(
     attached
 }
 
+/// Attach one session, losslessly.
+///
+/// The sink is installed FIRST, in the buffering state: from that moment every
+/// sink-bound frame is held in emission order against the session's commit
+/// cursor instead of going to a sink-less no-op send. The replay then snapshots
+/// the Term together with the cursor value it reflects, and the flush replays
+/// exactly the frames that snapshot is missing. Neither the pre-fix gap (frames
+/// emitted between snapshot and install were lost) nor its naive inverse
+/// (install first and duplicate everything the snapshot also carries) survives.
 async fn attach_one_session(
     entry: &AttachEntry,
     writer: &SharedWriter,
@@ -148,15 +160,22 @@ async fn attach_one_session(
     attached_ids: &AttachedSessionIds,
     additive: bool,
 ) {
-    send_attach_replay(entry, writer, live_sessions).await;
-    install_client_writer(entry, writer, attached_ids, additive).await;
+    begin_sink_attach(&entry.client_writer, writer, additive).await;
+    let snapshot_commit = send_attach_replay(entry, writer, live_sessions).await;
+    finish_sink_attach(&entry.client_writer, writer, snapshot_commit, entry.session_id);
+    install_session_attachment(entry, attached_ids).await;
 }
 
+/// Resize, announce, snapshot and send the session's replay; returns the commit
+/// cursor value the snapshot was taken at.
+///
+/// A failed replay build reports cursor 0 so the flush replays everything it
+/// buffered — the client is better served by live output than by silence.
 async fn send_attach_replay(
     entry: &AttachEntry,
     writer: &SharedWriter,
     live_sessions: &LiveSessionRegistry,
-) {
+) -> u64 {
     let session_id = entry.session_id;
 
     if let Some(size) = entry.target_dims
@@ -183,46 +202,22 @@ async fn send_attach_replay(
     )
     .await;
 
-    match take_session_replay(session_id, &entry.term, live_sessions).await {
-        Ok(replay) => {
+    match take_session_replay(session_id, &entry.term, &entry.term_commit, live_sessions).await {
+        Ok((replay, snapshot_commit)) => {
             send_message(writer, &ServerMessage::SessionReplay { session_id, replay }).await;
+            snapshot_commit
         }
         Err(error) => {
             warn!(%session_id, "build_session_replay failed: {error}");
+            0
         }
     }
 }
 
-async fn install_client_writer(
-    entry: &AttachEntry,
-    writer: &SharedWriter,
-    attached_ids: &AttachedSessionIds,
-    additive: bool,
-) {
-    let mut client_writer = entry.client_writer.lock().await;
-    if additive {
-        // Feature 015 (T012): a shared-mode participant joins — add its sink to the
-        // set without disturbing the existing participants' sinks, so live output
-        // fans out to every attached machine.
-        client_writer.attach_additive(Arc::clone(writer));
-    } else {
-        if !client_writer.is_empty() {
-            // Feature 013: an existing sink here is the EXPECTED case on a takeover
-            // (the new controller re-points each session at itself; the displaced
-            // connection can no longer detach them thanks to the ptr-eq guards in
-            // `detach_sessions` / `dispatch_message`). Just a debug breadcrumb.
-            debug!(
-                %entry.session_id,
-                "AttachSessions: re-pointing session's client writer to the attaching controller"
-            );
-        }
-        // The SingleController attach / takeover re-point replaces the attached-sink
-        // set with this single sink — byte-identical to the pre-015 `Some(writer)`.
-        client_writer.set_sole(Arc::clone(writer));
-    }
-    drop(client_writer);
+/// Point the session at the attaching connection's attached-session set, the
+/// last step of a completed attach.
+async fn install_session_attachment(entry: &AttachEntry, attached_ids: &AttachedSessionIds) {
     *entry.attachment.lock().await = Some(Arc::clone(attached_ids));
-
     info!(session_id = %entry.session_id, "session attached to new client");
 }
 
@@ -238,11 +233,17 @@ async fn install_client_writer(
 /// registry to extract the `handoff_snapshot` field; the common v5 case does
 /// not need to touch the registry at all and keeps this pipeline lock-free
 /// against other parallel attaches.
+///
+/// Returns the replay together with the commit-cursor value it was taken at,
+/// read inside the same `Term` critical section as the snapshot — the single
+/// atom that lets a buffering sink tell the frames this replay already contains
+/// from the frames it is missing.
 pub async fn take_session_replay(
     session_id: SessionId,
     term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    term_commit: &TermCommit,
     live_sessions: &LiveSessionRegistry,
-) -> std::io::Result<SessionReplay> {
+) -> std::io::Result<(SessionReplay, u64)> {
     let legacy_snapshot = {
         let mut registry = live_sessions.write().await;
         registry
@@ -266,13 +267,16 @@ pub async fn take_session_replay(
         grid.update_history(scrollback_cap);
 
         let fresh = snapshot_term(&guard);
-        return build_session_replay(&fresh);
+        let commit = term_commit.get();
+        drop(guard);
+        return build_session_replay(&fresh).map(|replay| (replay, commit));
     }
 
     let guard = term.lock().await;
     let snapshot = snapshot_term(&guard);
+    let commit = term_commit.get();
     drop(guard);
-    build_session_replay(&snapshot)
+    build_session_replay(&snapshot).map(|replay| (replay, commit))
 }
 
 #[cfg(test)]
@@ -290,7 +294,6 @@ mod tests {
     use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
     use tokio::sync::{Mutex, mpsc};
 
-    use crate::ipc_server::ClientSink;
     use crate::session_manager::build_term_config;
 
     struct TestDimensions;
@@ -330,9 +333,12 @@ mod tests {
             session_id,
             workspace_id,
             shell_name: String::from("zsh"),
-            client_writer: Arc::new(Mutex::new(crate::ipc_server::AttachedSinks::default())),
+            client_writer: Arc::new(std::sync::Mutex::new(
+                crate::ipc_server::AttachedSinks::default(),
+            )),
             attachment: Arc::new(Mutex::new(None)),
             term: Arc::new(Mutex::new(make_term(session_id))),
+            term_commit: Arc::new(TermCommit::default()),
             resize_fd: Arc::new(std::fs::File::open("/dev/null").unwrap().into()),
             target_dims: None,
             has_handoff_snapshot: false,
@@ -349,11 +355,11 @@ mod tests {
         let (server, client) = unix_stream_pair();
         let (_server_read, server_write) = tokio::io::split(server);
         let (mut client_read, _client_write) = tokio::io::split(client);
-        let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Local(Box::new(server_write))));
+        let writer: SharedWriter = crate::ipc_server::test_shared_writer(server_write);
 
         send_attach_replay(&entry, &writer, &live_sessions).await;
 
-        assert!(entry.client_writer.lock().await.is_empty());
+        assert!(crate::ipc_server::lock_sinks(&entry.client_writer).is_empty());
 
         let msg1 = read_message::<ServerMessage, _>(&mut client_read).await.unwrap();
         let ServerMessage::SessionCreated { session_id: got_id, workspace_id: got_ws, shell_name } =
@@ -389,7 +395,7 @@ mod tests {
 
         let (server, _client) = unix_stream_pair();
         let (_read, write) = tokio::io::split(server);
-        let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Local(Box::new(write))));
+        let writer: SharedWriter = crate::ipc_server::test_shared_writer(write);
         let attached_ids = Arc::new(Mutex::new(HashSet::new()));
 
         let attached =
