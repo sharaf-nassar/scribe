@@ -179,3 +179,164 @@ fn inject_nushell(env: &mut HashMap<String, String>, scripts_dir: &Path) {
         env.insert("XDG_DATA_DIRS".to_owned(), format!("{}:{existing}", scripts_dir.display()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The shipped fish integration, read straight out of `dist/` so the
+    /// test exercises the same bytes the installers copy.
+    fn fish_script() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../dist/shell-integration/fish/vendor_conf.d/scribe.fish")
+    }
+
+    /// One recorded `scribe-hook-helper` invocation, split into argv.
+    type Invocation = Vec<String>;
+
+    fn flag_values<'a>(call: &'a Invocation, flag: &str) -> Vec<&'a str> {
+        let prefix = format!("--{flag}=");
+        call.iter().filter_map(|arg| arg.strip_prefix(&prefix)).collect()
+    }
+
+    fn added_object(call: &Invocation) -> BTreeMap<String, String> {
+        let values = flag_values(call, "added-json");
+        assert_eq!(values.len(), 1, "expected exactly one --added-json argument in {call:?}");
+        serde_json::from_str(values[0]).expect("--added-json is not valid JSON")
+    }
+
+    /// Sources the fish integration under a stub hook helper that records
+    /// its argv, runs `body` afterwards, and returns every invocation.
+    ///
+    /// Returns `None` when fish is not installed; the shell scripts are
+    /// only exercisable where their interpreter exists.
+    fn record_fish_emits(body: &str) -> Option<Vec<Invocation>> {
+        if !Command::new("fish").arg("--version").output().is_ok_and(|out| out.status.success()) {
+            return None;
+        }
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("scribe-fish-env-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+
+        // NUL-separated argv per invocation, each record led by `CALL`,
+        // so values containing spaces or newlines stay intact.
+        let record = dir.join("calls.bin");
+        let recorder = dir.join("recorder.fish");
+        std::fs::write(
+            &recorder,
+            format!("#!/usr/bin/env fish\nstring join0 -- CALL $argv >> '{}'\n", record.display()),
+        )
+        .expect("write recorder");
+        std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod recorder");
+
+        let driver = dir.join("driver.fish");
+        std::fs::write(
+            &driver,
+            format!(
+                "set -gx TERM_PROGRAM Scribe\n\
+                 set -gx SCRIBE_HOOK_HELPER '{}'\n\
+                 {body}\n",
+                recorder.display(),
+            ),
+        )
+        .expect("write driver");
+
+        let status = Command::new("fish")
+            .arg("--no-config")
+            .arg(&driver)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run fish");
+        assert!(status.success(), "fish driver exited with {status}");
+
+        let raw = std::fs::read(&record).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).expect("clean scratch dir");
+
+        let mut calls: Vec<Invocation> = Vec::new();
+        for field in raw.split(|byte| *byte == 0) {
+            let field = String::from_utf8_lossy(field).into_owned();
+            if field == "CALL" {
+                calls.push(Vec::new());
+            } else if !field.is_empty() {
+                calls.last_mut().expect("record starts with CALL").push(field);
+            }
+        }
+        Some(calls)
+    }
+
+    /// An exported variable with an empty value used to wipe the whole
+    /// fish payload: `__scribe_json_escape` echoed a zero-element list,
+    /// and concatenating that is a cartesian product that collapses the
+    /// accumulator, so fish dropped `--added-json` from the argv
+    /// entirely and the server recorded an empty baseline. A list-valued
+    /// export (`PATH` and friends) likewise desynchronised the parallel
+    /// name/value snapshot lists and paired names with foreign values.
+    #[test]
+    fn fish_env_payload_survives_empty_and_list_values() {
+        let body = format!(
+            "set -gx SCRIBE_PROBE_EMPTY ''\n\
+             set -gx SCRIBE_PROBE_LIST a b c\n\
+             set -gx SCRIBE_PROBE_MULTI 'one\ntwo'\n\
+             source '{}'\n\
+             set -gx SCRIBE_PROBE_DELTA_EMPTY ''\n\
+             set -gx SCRIBE_PROBE_DELTA_VALUE changed\n\
+             set -e SCRIBE_PROBE_LIST\n\
+             emit fish_prompt\n",
+            fish_script().display(),
+        );
+        // No fish on this host: the shipped script has no interpreter to
+        // exercise, and `fish_json_arguments_are_quoted` still runs.
+        let Some(calls) = record_fish_emits(&body) else {
+            return;
+        };
+
+        let (baseline, deltas): (Vec<_>, Vec<_>) =
+            calls.iter().partition(|call| call.iter().any(|arg| arg == "--baseline-ready"));
+        assert_eq!(baseline.len(), 1, "expected one baseline emit, got {calls:?}");
+        assert_eq!(deltas.len(), 1, "expected one per-prompt delta emit, got {calls:?}");
+
+        let base = added_object(baseline[0]);
+        assert_eq!(base.get("SCRIBE_PROBE_EMPTY").map(String::as_str), Some(""));
+        assert_eq!(base.get("SCRIBE_PROBE_LIST").map(String::as_str), Some("a b c"));
+        assert_eq!(base.get("SCRIBE_PROBE_MULTI").map(String::as_str), Some("one\ntwo"));
+        assert!(base.len() > 3, "baseline should carry the whole environment, got {base:?}");
+        assert_eq!(flag_values(baseline[0], "removed-json"), vec!["[]"]);
+
+        let delta = added_object(deltas[0]);
+        assert_eq!(delta.get("SCRIBE_PROBE_DELTA_EMPTY").map(String::as_str), Some(""));
+        assert_eq!(delta.get("SCRIBE_PROBE_DELTA_VALUE").map(String::as_str), Some("changed"));
+        let removed = flag_values(deltas[0], "removed-json");
+        assert_eq!(removed.len(), 1, "expected exactly one --removed-json argument");
+        assert!(
+            removed[0].contains("\"SCRIBE_PROBE_LIST\""),
+            "erased variable missing from {}",
+            removed[0]
+        );
+    }
+
+    /// Even a well-formed payload is lost if the argument is unquoted:
+    /// fish drops `--added-json=$added` from the argv when `$added` is a
+    /// zero-element list, which is silent rather than a parse error.
+    #[test]
+    fn fish_json_arguments_are_quoted() {
+        let script = std::fs::read_to_string(fish_script()).expect("read fish integration");
+        for flag in ["--added-json=", "--removed-json="] {
+            for (idx, _) in script.match_indices(flag) {
+                let rest = &script[idx + flag.len()..];
+                assert!(
+                    !rest.starts_with('$'),
+                    "{flag} interpolates an unquoted variable; fish drops the whole argument \
+                     when the list is empty"
+                );
+            }
+        }
+    }
+}
