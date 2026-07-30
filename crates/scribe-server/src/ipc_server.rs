@@ -8114,7 +8114,7 @@ async fn next_pty_read_action(state: &mut PtyReaderState, buf: &mut [u8]) -> Pty
 /// outer loop" signals for [`next_pty_read_action`].
 ///
 /// Every branch is cancel-safe (`AsyncReadExt::read`,
-/// `UnboundedReceiver::recv`, `sleep_until`, and the gate's `watch`-backed
+/// [`next_clipboard_command`], `sleep_until`, and the gate's `watch`-backed
 /// waiter), so losing a race never drops a wakeup or a byte.
 async fn select_pty_read_or_clipboard(
     state: &mut PtyReaderState,
@@ -8131,8 +8131,8 @@ async fn select_pty_read_or_clipboard(
             }
             () = state.cancel.cancelled() => Some(ReadResult::Cancelled),
             result = read_pty_bytes(&mut state.pty_read, buf) => Some(result),
-            cmd = state.clipboard_command_rx.recv() => {
-                handle_clipboard_command_option(state, cmd).await;
+            cmd = next_clipboard_command(&mut state.clipboard_command_rx) => {
+                handle_clipboard_command(state, cmd).await;
                 None
             }
         }
@@ -8140,22 +8140,39 @@ async fn select_pty_read_or_clipboard(
         tokio::select! {
             () = state.cancel.cancelled() => Some(ReadResult::Cancelled),
             result = read_pty_bytes(&mut state.pty_read, buf) => Some(result),
-            cmd = state.clipboard_command_rx.recv() => {
-                handle_clipboard_command_option(state, cmd).await;
+            cmd = next_clipboard_command(&mut state.clipboard_command_rx) => {
+                handle_clipboard_command(state, cmd).await;
                 None
             }
         }
     }
 }
 
-/// Apply one `ClipboardCommand` (or no-op on a `None` from a closed
-/// channel). Kept separate so `next_pty_read_action` stays an `async fn`
-/// without polluting the macro selectors with `Option` destructuring.
-async fn handle_clipboard_command_option(
-    state: &mut PtyReaderState,
-    cmd: Option<ClipboardCommand>,
-) {
-    let Some(cmd) = cmd else { return };
+/// Yield the next OSC 52 [`ClipboardCommand`], parking forever once the
+/// channel closes (spec 017 US1-3).
+///
+/// The only sender is [`LiveSession::clipboard_command_tx`], so the channel
+/// closes the moment the registry entry is dropped — which happens while the
+/// reader is still running on every path that ends a session from outside it:
+/// a `CloseWindow`, whose cancel lands only after the reply, and the
+/// child-exit watcher, whose reader may hold a master that never ends because
+/// a descendant still owns the slave. `recv` on a closed receiver completes
+/// instantly and forever, which turned that arm into a hot loop burning a core
+/// per orphaned reader. Parking makes it go quiet and leaves stopping the
+/// reader to cancellation. Cancel-safe, like the `recv` it wraps: buffered
+/// commands are still drained before the close is observed.
+async fn next_clipboard_command(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClipboardCommand>,
+) -> ClipboardCommand {
+    match rx.recv().await {
+        Some(cmd) => cmd,
+        None => std::future::pending().await,
+    }
+}
+
+/// Apply one `ClipboardCommand`. Shared by the reader's `select!` arm and the
+/// between-chunks drain in [`process_metadata_events`].
+async fn handle_clipboard_command(state: &mut PtyReaderState, cmd: ClipboardCommand) {
     match cmd {
         ClipboardCommand::PromptResponse { request_id, decision } => {
             handle_clipboard_prompt_response(state, request_id, decision).await;
@@ -8483,6 +8500,16 @@ struct SessionExitContext<'a> {
 /// [`ChildExit::UNKNOWN`] for every path except the watcher, which is the only
 /// observer of a real wait status.
 ///
+/// Winning the CAS also cancels the reader, because the winner is not always a
+/// path that already did (spec 017 US1-3). Both close handlers cancel before
+/// they get here, but the child-exit watcher does not, and its session's
+/// reader can still be parked on a master that will never end — a descendant
+/// that inherited the slave fd keeps it open long after the child is gone.
+/// Left running, that reader outlives the registry entry it belongs to,
+/// feeding a `Term` and sinks nobody can reach. The watcher has already waited
+/// out its drain grace by the time it arrives, so nothing still deliverable is
+/// cut short.
+///
 /// This runs on the reader task too, so it never joins the reader; it takes
 /// the two write guards in the documented order (`live_sessions`, then
 /// `workspace_manager`) and holds neither across an `.await`. That is exactly
@@ -8496,6 +8523,7 @@ async fn finalize_session_exit(
         debug!(session_id = %ctx.session_id, "session exit already finalized");
         return;
     }
+    gate.cancel();
     let exit_msg = ServerMessage::SessionExited {
         session_id: ctx.session_id,
         exit_code: exit.exit_code,
@@ -8633,17 +8661,7 @@ async fn process_metadata_events(state: &mut PtyReaderState) {
     // returned bytes) gets drained here so the reader stays consistent
     // with `ClipboardBurstState` / `pending_clipboard_*` between chunks.
     while let Ok(cmd) = state.clipboard_command_rx.try_recv() {
-        match cmd {
-            ClipboardCommand::PromptResponse { request_id, decision } => {
-                handle_clipboard_prompt_response(state, request_id, decision).await;
-            }
-            ClipboardCommand::BridgeReadReply { request_id, payload } => {
-                handle_clipboard_bridge_read_reply(state, request_id, payload).await;
-            }
-            ClipboardCommand::RefreshPolicy { policy } => {
-                handle_clipboard_policy_refresh(state, policy);
-            }
-        }
+        handle_clipboard_command(state, cmd).await;
     }
 
     // Fallback: title changed but no OSC 7 → read /proc/pid/cwd.
@@ -10946,5 +10964,59 @@ mod tests {
             ),
             ClaimResolution::Assign { assigned, .. } if assigned != window
         ));
+    }
+
+    // @lat: [[server#Sessions#PTY Reader Task]]
+    #[tokio::test]
+    async fn closed_clipboard_channel_parks_the_reader_arm() {
+        let (tx, mut rx) = new_clipboard_command_channel();
+        tx.send(ClipboardCommand::RefreshPolicy {
+            policy: scribe_common::config::ClipboardPolicyConfig::default(),
+        })
+        .unwrap();
+        drop(tx);
+
+        // Buffered commands still arrive after the close.
+        assert!(matches!(
+            next_clipboard_command(&mut rx).await,
+            ClipboardCommand::RefreshPolicy { .. }
+        ));
+
+        let drained = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            next_clipboard_command(&mut rx),
+        )
+        .await;
+        assert!(
+            drained.is_err(),
+            "a drained, closed clipboard channel must park the select arm, not complete instantly"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalizing_a_session_exit_cancels_its_reader() {
+        let gate = SessionExitGate::new();
+        let live_sessions = new_live_session_registry();
+        let workspace_manager = Arc::new(RwLock::new(WorkspaceManager::new(Vec::new())));
+        let client_writer = initial_client_writer(None).await;
+        let attachment: SessionAttachment = Arc::new(Mutex::new(None));
+
+        finalize_session_exit(
+            &gate,
+            SessionExitContext {
+                session_id: SessionId::new(),
+                client_writer: &client_writer,
+                attachment: &attachment,
+                live_sessions: &live_sessions,
+                workspace_manager: &workspace_manager,
+            },
+            ChildExit::UNKNOWN,
+        )
+        .await;
+
+        assert!(
+            gate.is_cancelled(),
+            "the exit funnel must stop the reader, including on the watcher path where nothing else does"
+        );
     }
 }
