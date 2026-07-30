@@ -1181,6 +1181,43 @@ impl ResizePacer {
         self.last_apply = Some(now);
         Some(size)
     }
+
+    /// Drop the size an armed timer is still holding, without recording an
+    /// apply. The last client detaching calls this: a report from a gesture
+    /// that ended with the connection has no one to serve, and — the real
+    /// hazard — it would otherwise mature *after* the next client's
+    /// attach-time resize and reinstate the pre-detach grid.
+    ///
+    /// `armed` deliberately stays set: the in-flight task still owns the
+    /// disarm, and leaving it set keeps a report admitted before it fires from
+    /// arming a second, overlapping timer. That task simply finds nothing to
+    /// apply.
+    fn discard_pending(&mut self) {
+        self.pending = None;
+    }
+
+    /// Record a grid apply that bypassed the pacer — the attach-time resize and
+    /// the shared-window authoritative grid both drive `resize_term` directly.
+    ///
+    /// Dropping `pending` is what makes the newest applied size the one that
+    /// wins: a timer armed before this apply can no longer reinstate the size
+    /// it was holding. Stamping `last_apply` folds the direct apply into the
+    /// pacing window too, so the first report after it is spaced like any other
+    /// rather than costing an immediate extra reflow.
+    fn note_external_apply(&mut self, now: std::time::Instant) {
+        self.pending = None;
+        self.last_apply = Some(now);
+    }
+}
+
+/// Lock a session's [`ResizePacer`], recovering a poisoned mutex the way
+/// [`lock_sinks`] does. The pacer is three plain fields with no invariant a
+/// panicking holder can leave half-applied, and the critical sections never
+/// await, so the lock is never held across a suspension point.
+fn lock_resize_pacer(
+    pacer: &std::sync::Mutex<ResizePacer>,
+) -> std::sync::MutexGuard<'_, ResizePacer> {
+    pacer.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// A running session in the server-wide registry. Lives independently of
@@ -1235,7 +1272,11 @@ pub struct LiveSession {
     cell_height: u16,
     /// Paces controller-driven grid applies for this session (spec 017 US7-3),
     /// so a drag's report stream costs at most four reflows per second.
-    resize_pacer: ResizePacer,
+    ///
+    /// Behind its own mutex rather than reached through the registry's write
+    /// lock: detach and the unpaced direct applies both have to reach it while
+    /// holding only a shared reference to the session.
+    resize_pacer: std::sync::Mutex<ResizePacer>,
     /// Keep the Pty alive so the child process isn't killed by SIGHUP on Drop.
     /// `None` for sessions restored from a hot-reload handoff. Taken by the
     /// close paths, which route the SIGHUP + `waitpid` off-worker through
@@ -5712,6 +5753,13 @@ async fn detach_sessions(
 /// takeover keeps the new controller's sink. When the set empties (the sole legacy
 /// sink left), clear the session attachment — byte-identical to the pre-015
 /// single-slot clear.
+///
+/// Emptying the set also drops whatever size the resize pacer is holding.
+/// Nothing else cancels a timer armed mid-drag, and a session that comes back
+/// through a fresh attach comes back at the new client's geometry — letting the
+/// pre-detach report mature would overwrite that grid up to an interval later.
+/// A detach that leaves other sinks attached keeps the pending size, since the
+/// drag it belongs to is still someone's.
 async fn detach_one_session(session: &LiveSession, id: SessionId, writer: &SharedWriter) {
     let now_empty = {
         let mut client_writer = lock_sinks(&session.client_writer);
@@ -5721,6 +5769,7 @@ async fn detach_one_session(session: &LiveSession, id: SessionId, writer: &Share
         client_writer.is_empty()
     };
     if now_empty {
+        lock_resize_pacer(&session.resize_pacer).discard_pending();
         clear_session_attachment(&session.attachment).await;
     }
     info!(%id, "session detached (client disconnected)");
@@ -6345,7 +6394,7 @@ async fn start_session(
         ai_provider_hint,
         cell_width,
         cell_height,
-        resize_pacer: ResizePacer::default(),
+        resize_pacer: std::sync::Mutex::default(),
         pty,
         handoff_snapshot,
         preserve_ai_scrollback: Arc::clone(&shared.preserve_ai_scrollback),
@@ -7149,6 +7198,7 @@ async fn apply_grid_to_window_sessions(
         if let Err(e) = set_pty_winsize(resize_fd.as_ref(), size) {
             warn!(%session_id, "authoritative-grid TIOCSWINSZ failed: {e}");
         }
+        note_unpaced_resize_apply(session_id, &server.live_sessions).await;
         // The recompute is debounced, so this apply lands well after the
         // participants' own `RequestSnapshot`s were answered at the pre-reflow
         // grid; without a push they would render that stale grid forever.
@@ -7189,7 +7239,7 @@ async fn handle_resize(
         };
         session.cell_width = size.cell_width.max(1);
         session.cell_height = size.cell_height.max(1);
-        session.resize_pacer.admit(size, std::time::Instant::now())
+        lock_resize_pacer(&session.resize_pacer).admit(size, std::time::Instant::now())
     };
 
     match admission {
@@ -7209,16 +7259,37 @@ async fn handle_resize(
     }
 }
 
+/// Tell a session's [`ResizePacer`] that a grid apply just ran outside it — the
+/// attach-time resize and the shared-window authoritative grid both drive
+/// `resize_term` directly rather than through an admission.
+///
+/// Without this the pacer keeps state describing a grid that is no longer on
+/// screen: a size held from before the direct apply can still mature over it,
+/// and a `last_apply` stamp older than the direct apply lets the next report
+/// buy an immediate extra reflow.
+pub async fn note_unpaced_resize_apply(session_id: SessionId, live_sessions: &LiveSessionRegistry) {
+    let sessions = live_sessions.read().await;
+    if let Some(session) = sessions.get(&session_id) {
+        lock_resize_pacer(&session.resize_pacer).note_external_apply(std::time::Instant::now());
+    }
+}
+
 /// Apply whatever size a session's armed trailing timer is holding, once its
 /// window has elapsed. A session that left the registry mid-drag has nothing to
 /// apply, which is how a close cancels the timer the drag armed.
+///
+/// Registry presence is not on its own enough to make the held size current: a
+/// detach or a direct apply that landed after the timer was armed clears the
+/// pending size ([`ResizePacer::discard_pending`],
+/// [`ResizePacer::note_external_apply`]), so this finds nothing and the newer
+/// grid stands.
 async fn apply_trailing_resize(session_id: SessionId, live_sessions: &LiveSessionRegistry) {
     let pending = {
-        let mut sessions = live_sessions.write().await;
-        let Some(session) = sessions.get_mut(&session_id) else {
+        let sessions = live_sessions.read().await;
+        let Some(session) = sessions.get(&session_id) else {
             return;
         };
-        session.resize_pacer.take_pending(std::time::Instant::now())
+        lock_resize_pacer(&session.resize_pacer).take_pending(std::time::Instant::now())
     };
     let Some(size) = pending else { return };
     // A trailing apply is by definition deferred: the client's `RequestSnapshot`
@@ -11115,6 +11186,81 @@ mod tests {
             grid,
             Some((80, 30)),
             "the trailing apply must hand the client the grid it landed on"
+        );
+    }
+
+    /// The grid a session's `Term` currently holds, as (cols, rows).
+    async fn live_term_grid(
+        live_sessions: &LiveSessionRegistry,
+        session_id: SessionId,
+    ) -> (usize, usize) {
+        use alacritty_terminal::grid::Dimensions as _;
+        let term = {
+            let sessions = live_sessions.read().await;
+            Arc::clone(&sessions.get(&session_id).expect("session is still live").term)
+        };
+        let guard = term.lock().await;
+        (guard.grid().columns(), guard.grid().screen_lines())
+    }
+
+    /// A trailing apply used to be gated on registry presence alone, so a drag
+    /// that ended in a disconnect kept its armed timer: the next client could
+    /// attach at a different geometry and watch the pre-detach size land on top
+    /// of it up to an interval later. Detach now drops the size the timer is
+    /// holding, and the attach-time resize tells the pacer it applied, so the
+    /// stale timer finds nothing and the fresh grid stands.
+    #[tokio::test]
+    async fn a_stale_trailing_resize_never_lands_on_a_fresh_attach() {
+        let (server_sock, _client_sock) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server_sock);
+        let writer = test_shared_writer(server_write);
+
+        let (session_id, live_sessions, _slaves) = live_session_with_sink(120, 30, &writer).await;
+        let attached: AttachedSessionIds =
+            Arc::new(Mutex::new(std::iter::once(session_id).collect()));
+        let report = |cols: u16| TerminalSize { cols, rows: 30, cell_width: 8, cell_height: 16 };
+
+        // Mid-drag: a leading apply, then a report the pacer holds behind an
+        // armed trailing timer.
+        handle_resize(session_id, report(100), &live_sessions, &attached).await;
+        handle_resize(session_id, report(90), &live_sessions, &attached).await;
+        let armed_at = std::time::Instant::now();
+
+        // The dragging client disconnects with that timer still counting down.
+        let ids: HashSet<SessionId> = std::iter::once(session_id).collect();
+        detach_sessions(&live_sessions, &ids, &writer).await;
+
+        // A new client attaches at its own geometry, which the attach-time
+        // resize drives straight into the `Term`.
+        let (next_server_sock, _next_client_sock) = unix_stream_pair();
+        let (_next_read, next_write) = tokio::io::split(next_server_sock);
+        let next_writer = test_shared_writer(next_write);
+        let next_attached: AttachedSessionIds = Arc::new(Mutex::new(HashSet::new()));
+        let reattached = crate::attach_flow::attach_sessions(
+            &[session_id],
+            &[report(140)],
+            &live_sessions,
+            crate::attach_flow::AttachClientContext {
+                writer: &next_writer,
+                attached_ids: &next_attached,
+                additive: false,
+            },
+        )
+        .await;
+        assert!(reattached.contains(&session_id), "the session must come back attached");
+        assert!(
+            armed_at.elapsed() < RESIZE_APPLY_INTERVAL,
+            "the detach and reattach have to fit inside the pacing interval, or the \
+             timer this test is about has already matured on its own"
+        );
+
+        // The timer the departed drag armed finally matures.
+        apply_trailing_resize(session_id, &live_sessions).await;
+
+        assert_eq!(
+            live_term_grid(&live_sessions, session_id).await,
+            (140, 30),
+            "a pre-detach report must not reflow the grid the new client attached at"
         );
     }
 
