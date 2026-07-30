@@ -136,6 +136,13 @@ async fn handle_env_changed_dispatch(
     // parsing of a small file). Hot-reloads are observed automatically
     // because there is no in-memory caching layer in front of
     // `load_config`. Failure to load is treated as "disabled" (fail-safe).
+    //
+    // This read is the half of the disable semantic that stops persist
+    // writes immediately: the first event after the flag flips is dropped
+    // whether or not a client ever sends `ConfigReloaded`. The reload
+    // handler (`apply_env_persistence_transition`) is the state teardown
+    // that follows — it disarms an already-counting debounce and deletes
+    // the envelopes. Do not cache this behind the reload path.
     let enabled = matches!(
         scribe_common::config::load_config(),
         Ok(cfg) if cfg.terminal.env_persistence.enabled
