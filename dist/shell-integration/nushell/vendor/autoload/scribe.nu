@@ -147,6 +147,12 @@ if $scribe_active {
 #   2. Initialize the per-session "last emitted" snapshot.
 #   3. One-shot baseline emit (--baseline-ready), then register a
 #      pre_prompt hook that emits subsequent deltas.
+#
+# Both emits hand the JSON payload to the helper on stdin. argv is
+# world-readable through /proc/<pid>/cmdline and one argument cannot
+# exceed MAX_ARG_STRLEN (128 KiB), so the previous --added-json= form
+# both exposed every exported value and silently dropped large
+# environments.
 
 # JSON-escape a single string. Returns the escaped form without
 # surrounding quotes.
@@ -301,11 +307,13 @@ def --env __scribe-emit-env-delta [] {
 
     let added_json = (__scribe-build-object $added)
     let removed_json = (__scribe-build-array $removed)
-    let added_arg = $"--added-json=($added_json)"
-    let removed_arg = $"--removed-json=($removed_json)"
+    # The payload goes over stdin, never argv: /proc/<pid>/cmdline is
+    # world-readable, and a single argument is capped at MAX_ARG_STRLEN
+    # (128 KiB), which turned a large delta into a silent E2BIG.
+    let payload = $'{"added":($added_json),"removed":($removed_json)}'
     let helper = ($env.SCRIBE_HOOK_HELPER? | default "scribe-hook-helper")
     try {
-        ^$helper --provider=system --event=env_delta $added_arg $removed_arg | complete | ignore
+        $payload | ^$helper --provider=system --event=env_delta --payload-stdin | complete | ignore
     } catch { }
 
     $env.__SCRIBE_ENV_LAST = $now
@@ -316,10 +324,10 @@ def --env __scribe-emit-env-baseline [] {
     let snapshot = (__scribe-snapshot-env)
     $env.__SCRIBE_ENV_LAST = $snapshot
     let added_json = (__scribe-build-object $snapshot)
-    let added_arg = $"--added-json=($added_json)"
+    let payload = $'{"added":($added_json),"removed":[]}'
     let helper = ($env.SCRIBE_HOOK_HELPER? | default "scribe-hook-helper")
     try {
-        ^$helper --provider=system --event=env_delta $added_arg --removed-json='[]' --baseline-ready | complete | ignore
+        $payload | ^$helper --provider=system --event=env_delta --payload-stdin --baseline-ready | complete | ignore
     } catch { }
 }
 

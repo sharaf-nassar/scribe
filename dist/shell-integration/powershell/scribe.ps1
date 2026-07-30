@@ -143,6 +143,9 @@ if (Get-Command Set-PSReadLineOption -ErrorAction SilentlyContinue) {
 #   2. Initialize the per-session "last emitted" snapshot.
 #   3. One-shot baseline emit (--baseline-ready), then re-wrap the
 #      `prompt` function to emit per-prompt deltas.
+#
+# Both emits hand the JSON payload to the helper on stdin — see
+# __Scribe-SendPayload for why argv is no longer an option.
 
 # Source restore-delta file (FR-008: applied AFTER profile has run).
 if ($env:SCRIBE_RESTORE_ENV_DELTA_FILE -and (Test-Path -LiteralPath $env:SCRIBE_RESTORE_ENV_DELTA_FILE)) {
@@ -208,6 +211,22 @@ function global:__Scribe-ArrayToJson {
     return (,$Names | ConvertTo-Json -Compress -Depth 1)
 }
 
+# Hand one JSON payload document to the hook helper on stdin. argv is
+# world-readable through /proc/<pid>/cmdline and one argument cannot
+# exceed MAX_ARG_STRLEN (128 KiB), so the previous --added-json= form
+# both exposed every exported value and silently dropped large
+# environments.
+function global:__Scribe-SendPayload {
+    param([string]$Payload, [string[]]$HelperArgs)
+
+    # PowerShell encodes native-command stdin with $OutputEncoding. The
+    # session default is UTF-8, but a profile that leaves it at ASCII
+    # would rewrite every non-ASCII byte of the payload as '?'. The
+    # assignment is function-scoped and unwinds on return.
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $Payload | & $global:ScribeHookHelper @HelperArgs --payload-stdin 2>$null | Out-Null
+}
+
 function global:__Scribe-EmitEnvDelta {
     $now = __Scribe-SnapshotEnv
     $prev = $global:ScribeEnvLast
@@ -234,11 +253,10 @@ function global:__Scribe-EmitEnvDelta {
 
     $addedJson = __Scribe-HashToJson $added
     $removedJson = __Scribe-ArrayToJson $removedList.ToArray()
+    $payload = '{"added":' + $addedJson + ',"removed":' + $removedJson + '}'
 
     try {
-        & $global:ScribeHookHelper --provider=system --event=env_delta `
-            "--added-json=$addedJson" "--removed-json=$removedJson" `
-            2>$null | Out-Null
+        __Scribe-SendPayload $payload @('--provider=system', '--event=env_delta')
     } catch {
         # Helper missing or any other failure: stay silent.
     }
@@ -250,10 +268,10 @@ function global:__Scribe-EmitEnvBaseline {
     $snap = __Scribe-SnapshotEnv
     $global:ScribeEnvLast = $snap
     $addedJson = __Scribe-HashToJson $snap
+    $payload = '{"added":' + $addedJson + ',"removed":[]}'
     try {
-        & $global:ScribeHookHelper --provider=system --event=env_delta `
-            "--added-json=$addedJson" --removed-json='[]' --baseline-ready `
-            2>$null | Out-Null
+        __Scribe-SendPayload $payload @(
+            '--provider=system', '--event=env_delta', '--baseline-ready')
     } catch { }
 }
 

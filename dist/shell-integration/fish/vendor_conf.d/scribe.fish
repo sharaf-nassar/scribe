@@ -137,6 +137,12 @@ end
 #
 # Helper invocations fail open: stdout/stderr discarded, exit code
 # ignored via `or true`.
+#
+# Both emits hand the JSON payload to the helper on stdin. argv is
+# world-readable through /proc/<pid>/cmdline and one argument cannot
+# exceed MAX_ARG_STRLEN (128 KiB), so the previous --added-json= form
+# both exposed every exported value and silently dropped large
+# environments.
 
 # Source restore-delta file (FR-008: applied AFTER rc has run).
 # The file contains `set -gx NAME 'value'` / `set -e NAME` lines that
@@ -301,9 +307,14 @@ function __scribe_emit_env_delta --on-event fish_prompt
         return 0
     end
 
-    $__scribe_hook_helper --provider=system --event=env_delta \
-        --added-json="$added" --removed-json="$removed" \
-        </dev/null >/dev/null 2>&1
+    # The payload goes over stdin, never argv: /proc/<pid>/cmdline is
+    # world-readable, and a single argument is capped at MAX_ARG_STRLEN
+    # (128 KiB), which turned a large delta into a silent E2BIG. `%s`
+    # copies each argument verbatim, so backslashes and percent signs
+    # inside the JSON survive untouched.
+    printf '{"added":%s,"removed":%s}' "$added" "$removed" \
+        | $__scribe_hook_helper --provider=system --event=env_delta \
+            --payload-stdin >/dev/null 2>&1
     or true
 
     # Update the cache to the just-emitted state.
@@ -317,9 +328,9 @@ function __scribe_emit_env_baseline
     set -g __scribe_env_last_names $__scribe_env_snap_names
     set -g __scribe_env_last_values $__scribe_env_snap_values
     set -l added (__scribe_build_added_json __scribe_env_last_names __scribe_env_last_values)
-    $__scribe_hook_helper --provider=system --event=env_delta \
-        --added-json="$added" --removed-json='[]' --baseline-ready \
-        </dev/null >/dev/null 2>&1
+    printf '{"added":%s,"removed":[]}' "$added" \
+        | $__scribe_hook_helper --provider=system --event=env_delta \
+            --payload-stdin --baseline-ready >/dev/null 2>&1
     or true
 end
 

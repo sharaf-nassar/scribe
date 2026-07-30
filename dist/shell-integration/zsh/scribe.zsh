@@ -129,6 +129,11 @@ fi
 #      add-zsh-hook precmd that emits subsequent deltas.
 #
 # Helper invocations fail open: stdout/stderr discarded, exit code ignored.
+#
+# Both emits hand the JSON payload to the helper on stdin. argv is
+# world-readable through /proc/<pid>/cmdline and one argument cannot exceed
+# MAX_ARG_STRLEN (128 KiB), so the previous --added-json= form both exposed
+# every exported value and silently dropped large environments.
 
 # Source restore-delta file (FR-008: applied AFTER rc has run).
 if [[ -n "${SCRIBE_RESTORE_ENV_DELTA_FILE:-}" && -f "${SCRIBE_RESTORE_ENV_DELTA_FILE}" ]]; then
@@ -259,9 +264,11 @@ __scribe_emit_env_delta() {
 		return 0
 	fi
 
-	"${SCRIBE_HOOK_HELPER:-scribe-hook-helper}" --provider=system --event=env_delta \
-		--added-json="$added_json" --removed-json="$removed_json" \
-		</dev/null >/dev/null 2>&1 || true
+	# `%s` copies each argument verbatim, so backslashes and percent signs
+	# inside the JSON survive untouched.
+	printf '{"added":%s,"removed":%s}' "$added_json" "$removed_json" 2>/dev/null \
+		| "${SCRIBE_HOOK_HELPER:-scribe-hook-helper}" --provider=system \
+			--event=env_delta --payload-stdin >/dev/null 2>&1 || true
 
 	# Update the cache to the just-emitted state.
 	__scribe_env_last=()
@@ -275,9 +282,10 @@ __scribe_emit_env_baseline() {
 	__scribe_snapshot_env __scribe_env_last
 	local added_json
 	added_json=$(__scribe_build_added_json __scribe_env_last)
-	"${SCRIBE_HOOK_HELPER:-scribe-hook-helper}" --provider=system --event=env_delta \
-		--added-json="$added_json" --removed-json='[]' --baseline-ready \
-		</dev/null >/dev/null 2>&1 || true
+	printf '{"added":%s,"removed":[]}' "$added_json" 2>/dev/null \
+		| "${SCRIBE_HOOK_HELPER:-scribe-hook-helper}" --provider=system \
+			--event=env_delta --payload-stdin --baseline-ready \
+			>/dev/null 2>&1 || true
 }
 
 __scribe_emit_env_baseline

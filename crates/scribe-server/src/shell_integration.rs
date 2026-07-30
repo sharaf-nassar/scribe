@@ -282,22 +282,37 @@ mod tests {
             .join("../../dist/shell-integration/fish/vendor_conf.d/scribe.fish")
     }
 
-    /// One recorded `scribe-hook-helper` invocation, split into argv.
-    type Invocation = Vec<String>;
-
-    fn flag_values<'a>(call: &'a Invocation, flag: &str) -> Vec<&'a str> {
-        let prefix = format!("--{flag}=");
-        call.iter().filter_map(|arg| arg.strip_prefix(&prefix)).collect()
+    /// One recorded `scribe-hook-helper` invocation: its argv plus the
+    /// payload document it was handed on stdin.
+    #[derive(Debug)]
+    struct Invocation {
+        argv: Vec<String>,
+        stdin: String,
     }
 
-    fn added_object(call: &Invocation) -> BTreeMap<String, String> {
-        let values = flag_values(call, "added-json");
-        assert_eq!(values.len(), 1, "expected exactly one --added-json argument in {call:?}");
-        serde_json::from_str(values[0]).expect("--added-json is not valid JSON")
+    /// The `{ "added": …, "removed": … }` document the emit streams to the
+    /// helper. Payloads are no longer arguments — argv is world-readable
+    /// through `/proc/<pid>/cmdline` and one argument cannot exceed
+    /// `MAX_ARG_STRLEN`.
+    #[derive(serde::Deserialize)]
+    struct EnvPayload {
+        added: BTreeMap<String, String>,
+        removed: Vec<String>,
+    }
+
+    fn payload(call: &Invocation) -> EnvPayload {
+        assert!(
+            call.argv.iter().any(|arg| arg == "--payload-stdin"),
+            "emit must select the stdin transport, got {:?}",
+            call.argv
+        );
+        serde_json::from_str(&call.stdin)
+            .unwrap_or_else(|e| panic!("payload is not valid JSON ({e}): {:?}", call.stdin))
     }
 
     /// Sources the fish integration under a stub hook helper that records
-    /// its argv, runs `body` afterwards, and returns every invocation.
+    /// its argv and stdin, runs `body` afterwards, and returns every
+    /// invocation.
     ///
     /// Returns `None` when fish is not installed; the shell scripts are
     /// only exercisable where their interpreter exists.
@@ -314,13 +329,21 @@ mod tests {
             std::env::temp_dir().join(format!("scribe-fish-env-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create scratch dir");
 
-        // NUL-separated argv per invocation, each record led by `CALL`,
-        // so values containing spaces or newlines stay intact.
+        // NUL-separated fields per invocation: `CALL`, the argv, the
+        // `STDIN` marker, then the payload document — so values containing
+        // spaces or newlines stay intact. `string collect --allow-empty`
+        // is what keeps the payload exactly one field even when the helper
+        // was handed nothing at all.
         let record = dir.join("calls.bin");
         let recorder = dir.join("recorder.fish");
         std::fs::write(
             &recorder,
-            format!("#!/usr/bin/env fish\nstring join0 -- CALL $argv >> '{}'\n", record.display()),
+            format!(
+                "#!/usr/bin/env fish\n\
+                 set -l payload (cat | string collect --allow-empty)\n\
+                 string join0 -- CALL $argv STDIN $payload >> '{}'\n",
+                record.display(),
+            ),
         )
         .expect("write recorder");
         std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755))
@@ -351,16 +374,45 @@ mod tests {
         let raw = std::fs::read(&record).unwrap_or_default();
         std::fs::remove_dir_all(&dir).expect("clean scratch dir");
 
-        let mut calls: Vec<Invocation> = Vec::new();
-        for field in raw.split(|byte| *byte == 0) {
-            let field = String::from_utf8_lossy(field).into_owned();
-            if field == "CALL" {
-                calls.push(Vec::new());
-            } else if !field.is_empty() {
-                calls.last_mut().expect("record starts with CALL").push(field);
+        let fields: Vec<String> = raw
+            .split(|byte| *byte == 0)
+            .map(|field| String::from_utf8_lossy(field).into_owned())
+            .collect();
+        Some(parse_calls(&fields))
+    }
+
+    /// Positional parse of the recorder log: everything between `CALL` and
+    /// `STDIN` is argv, and the single field after `STDIN` is the payload.
+    /// A trailing empty field from `string join0`'s terminator is ignored.
+    fn parse_calls(fields: &[String]) -> Vec<Invocation> {
+        let mut calls = Vec::new();
+        let mut idx = 0;
+        while idx < fields.len() {
+            if fields[idx] != "CALL" {
+                idx += 1;
+                continue;
             }
+            idx += 1;
+            let start = idx;
+            while idx < fields.len() && fields[idx] != "STDIN" && fields[idx] != "CALL" {
+                idx += 1;
+            }
+            let argv = fields[start..idx].to_vec();
+            let stdin = take_stdin(fields, &mut idx);
+            calls.push(Invocation { argv, stdin });
         }
-        Some(calls)
+        calls
+    }
+
+    /// Consumes the `STDIN` marker and the one payload field behind it.
+    fn take_stdin(fields: &[String], idx: &mut usize) -> String {
+        if fields.get(*idx).map(String::as_str) != Some("STDIN") {
+            return String::new();
+        }
+        *idx += 1;
+        let payload = fields.get(*idx).cloned().unwrap_or_default();
+        *idx += 1;
+        payload
     }
 
     /// An exported variable with an empty value used to wipe the whole
@@ -384,33 +436,45 @@ mod tests {
             fish_script().display(),
         );
         // No fish on this host: the shipped script has no interpreter to
-        // exercise, and `fish_json_arguments_are_quoted` still runs.
+        // exercise, and `fish_payload_interpolations_are_quoted` still runs.
         let Some(calls) = record_fish_emits(&body) else {
             return;
         };
 
         let (baseline, deltas): (Vec<_>, Vec<_>) =
-            calls.iter().partition(|call| call.iter().any(|arg| arg == "--baseline-ready"));
+            calls.iter().partition(|call| call.argv.iter().any(|arg| arg == "--baseline-ready"));
         assert_eq!(baseline.len(), 1, "expected one baseline emit, got {calls:?}");
         assert_eq!(deltas.len(), 1, "expected one per-prompt delta emit, got {calls:?}");
 
-        let base = added_object(baseline[0]);
-        assert_eq!(base.get("SCRIBE_PROBE_EMPTY").map(String::as_str), Some(""));
-        assert_eq!(base.get("SCRIBE_PROBE_LIST").map(String::as_str), Some("a b c"));
-        assert_eq!(base.get("SCRIBE_PROBE_MULTI").map(String::as_str), Some("one\ntwo"));
-        assert!(base.len() > 3, "baseline should carry the whole environment, got {base:?}");
-        assert_eq!(flag_values(baseline[0], "removed-json"), vec!["[]"]);
+        // Nothing value-bearing may reach argv: that is the whole point of
+        // the stdin transport.
+        for call in &calls {
+            for arg in &call.argv {
+                assert!(
+                    !arg.contains("SCRIBE_PROBE"),
+                    "emit leaked an environment value into argv: {arg}"
+                );
+            }
+        }
 
-        let delta = added_object(deltas[0]);
-        assert_eq!(delta.get("SCRIBE_PROBE_DELTA_EMPTY").map(String::as_str), Some(""));
-        assert_eq!(delta.get("SCRIBE_PROBE_DELTA_VALUE").map(String::as_str), Some("changed"));
-        let removed = flag_values(deltas[0], "removed-json");
-        assert_eq!(removed.len(), 1, "expected exactly one --removed-json argument");
+        let base = payload(baseline[0]);
+        assert_eq!(base.added.get("SCRIBE_PROBE_EMPTY").map(String::as_str), Some(""));
+        assert_eq!(base.added.get("SCRIBE_PROBE_LIST").map(String::as_str), Some("a b c"));
+        assert_eq!(base.added.get("SCRIBE_PROBE_MULTI").map(String::as_str), Some("one\ntwo"));
         assert!(
-            removed[0].contains("\"SCRIBE_PROBE_LIST\""),
-            "erased variable missing from {}",
-            removed[0]
+            base.added.len() > 3,
+            "baseline should carry the whole environment, got {:?}",
+            base.added
         );
+        assert!(base.removed.is_empty(), "baseline removes nothing, got {:?}", base.removed);
+
+        let delta = payload(deltas[0]);
+        assert_eq!(delta.added.get("SCRIBE_PROBE_DELTA_EMPTY").map(String::as_str), Some(""));
+        assert_eq!(
+            delta.added.get("SCRIBE_PROBE_DELTA_VALUE").map(String::as_str),
+            Some("changed")
+        );
+        assert_eq!(delta.removed, vec!["SCRIBE_PROBE_LIST".to_owned()]);
     }
 
     /// A snapshot value is only usable as a restore value if it carries
@@ -445,10 +509,10 @@ mod tests {
         };
 
         let (baseline, deltas): (Vec<_>, Vec<_>) =
-            calls.iter().partition(|call| call.iter().any(|arg| arg == "--baseline-ready"));
+            calls.iter().partition(|call| call.argv.iter().any(|arg| arg == "--baseline-ready"));
         assert_eq!(baseline.len(), 1, "expected one baseline emit, got {calls:?}");
 
-        let base = added_object(baseline[0]);
+        let base = payload(baseline[0]).added;
         assert_eq!(
             base.get("SCRIBE_PROBE_PATHVAR").map(String::as_str),
             Some("/probe/one:/probe/two")
@@ -466,7 +530,7 @@ mod tests {
         // space-joined record instead restores as a single entry, and
         // the driver's own `sh` lookups stop resolving.
         assert_eq!(deltas.len(), 1, "expected one per-prompt delta emit, got {calls:?}");
-        let delta = added_object(deltas[0]);
+        let delta = payload(deltas[0]).added;
         assert_eq!(
             delta.get("SCRIBE_PROBE_RESTORED_PATH"),
             Some(child_path),
@@ -485,21 +549,33 @@ mod tests {
         );
     }
 
-    /// Even a well-formed payload is lost if the argument is unquoted:
-    /// fish drops `--added-json=$added` from the argv when `$added` is a
-    /// zero-element list, which is silent rather than a parse error.
+    /// Even a well-formed payload is lost if the interpolation is
+    /// unquoted: fish drops an argument entirely when the variable is a
+    /// zero-element list, which is silent rather than a parse error. The
+    /// payload now rides `printf`'s arguments into the helper's stdin, so
+    /// that is where the quoting has to hold.
     #[test]
-    fn fish_json_arguments_are_quoted() {
+    fn fish_payload_interpolations_are_quoted() {
         let script = std::fs::read_to_string(fish_script()).expect("read fish integration");
-        for flag in ["--added-json=", "--removed-json="] {
-            for (idx, _) in script.match_indices(flag) {
-                let rest = &script[idx + flag.len()..];
-                assert!(
-                    !rest.starts_with('$'),
-                    "{flag} interpolates an unquoted variable; fish drops the whole argument \
-                     when the list is empty"
-                );
-            }
+        let emits: Vec<&str> =
+            script.lines().filter(|line| line.trim_start().starts_with("printf '{")).collect();
+        assert_eq!(emits.len(), 2, "expected the baseline and delta emits, got {emits:?}");
+        for line in emits {
+            assert!(
+                first_unquoted_interpolation(line).is_none(),
+                "payload interpolates an unquoted variable; fish drops the whole \
+                 argument when the list is empty: {line}"
+            );
         }
+    }
+
+    /// Byte offset of the first `$` not immediately preceded by a double
+    /// quote, i.e. the first interpolation fish could silently drop.
+    fn first_unquoted_interpolation(line: &str) -> Option<usize> {
+        let chars: Vec<char> = line.chars().collect();
+        chars.iter().enumerate().find_map(|(idx, ch)| {
+            let prev = idx.checked_sub(1).map(|p| chars[p]);
+            (*ch == '$' && prev != Some('"')).then_some(idx)
+        })
     }
 }
