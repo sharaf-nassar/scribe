@@ -11,7 +11,6 @@ use crate::metadata::{MetadataEvent, MetadataParser};
 /// - OSC 7 — current working directory
 /// - OSC 0 / 2 — window title
 /// - OSC 1337 `ClaudeState=…` — AI process state
-/// - BEL (0x07) — terminal bell
 ///
 /// Create one per read-loop iteration, advance it with `vte::Parser::advance`,
 /// then inspect the `events` vec passed in at construction time.
@@ -38,16 +37,15 @@ impl Perform for OscInterceptor<'_> {
         }
     }
 
-    /// Called for C0/C1 control bytes. Delegates to [`MetadataParser::process_execute`]
-    /// to capture BEL (0x07).
-    fn execute(&mut self, byte: u8) {
-        if let Some(event) = MetadataParser::process_execute(byte) {
-            self.events.push(event);
-        }
-    }
-
     // All remaining Perform methods are intentional no-ops: we only care about
-    // OSC sequences and control bytes, not printable characters or CSI/DCS/ESC.
+    // OSC sequences, not printable characters, control bytes or CSI/DCS/ESC.
+    //
+    // C0 control bytes included: BEL (0x07) is dispatched by
+    // `alacritty_terminal`'s parser as `Event::Bell`, and this interceptor sees
+    // the same byte stream, so recognising it here too would emit a second
+    // `MetadataEvent::Bell` for every bell.
+
+    fn execute(&mut self, _byte: u8) {}
 
     fn print(&mut self, _c: char) {}
 

@@ -126,7 +126,7 @@ Carries cols, rows, scrollback rows, cursor position/style/visibility, alt-scree
 
 ### Session Events
 
-`SessionCreated` confirms a new session with its workspace and shell basename. `SessionExited` reports a session's exit code. `Bell` forwards BEL characters.
+`SessionCreated` confirms a new session with its workspace and shell basename. `SessionExited` reports a session's exit code. `Bell` forwards BEL characters, exactly one frame per BEL byte.
 
 ### Metadata
 

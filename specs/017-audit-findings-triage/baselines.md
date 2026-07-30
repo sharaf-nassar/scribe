@@ -407,6 +407,26 @@ Observations that the after-side has to reproduce as changed numbers:
 - **OSC 10/11 cost no config read**: the `Term`'s foreground/background entries
   are populated, so only the OSC 4 palette indices miss into the config path.
 
+#### After side: US6-1 bell half (bead `scribe-i79.10`)
+
+Measured on 2026-07-30 in the functional container (`docker/Dockerfile.func`
+built from the bead's worktree), with a `scribe-test share-tap` interposed on
+the server socket before the `scribe-test daemon` connects, so the JSONL wire
+record is the frame log. Ten `printf "\a"` prompt cycles, counted as
+`grep -c '"type":"<Variant>"'` deltas on that record:
+
+| Build | BELs | `Bell` frames | `TitleChanged` frames |
+|---|---|---|---|
+| worktree base (`5edb90e`) | 10 | 20 (2.00/BEL) | 20 (2.00/prompt) |
+| single-source Bell | 10 | **10 (1.00/BEL)** | 20 (2.00/prompt) |
+
+The base row reproduces the "raw BEL ×10" row above, and `TitleChanged` stays at
+its unfixed 2.00/prompt in both runs — the control that pins the change to the
+bell emitter alone. The client's attention request is 1:1 with the frame
+(`on_bell_message` queues one entry per `Bell`, `poll_bells` runs each queued
+entry through the gate once), so one frame per BEL is one `request_attention`
+per BEL.
+
 ### Branch detection with no attached sink
 
 The session emitted OSC 7 at 4 Hz from a background script while the only client
