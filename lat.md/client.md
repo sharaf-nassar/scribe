@@ -50,6 +50,14 @@ Both bounds are load-bearing. The event bound is the one the audit named, but ev
 
 Each dropped event records its pane, and [[crates/scribe-client/src/ipc_bridge.rs#PendingResync#settle]] turns that debt into one `RequestSnapshot` per affected pane. The request waits for the queue to reach empty, so the repaint lands on a calm queue instead of being dropped in turn; a firehose that never lets the queue drain gets the request anyway after [[crates/scribe-client/src/ipc_bridge.rs#RESYNC_MAX_DELAY]]. Nothing new goes on the wire — the client detects its own overflow and repairs only the panes it lost bytes for, which is what makes the policy per-participant in a shared session.
 
+#### Batch byte cap
+
+[[crates/scribe-client/src/ipc_bridge.rs#collect_batch]] bounds each drain batch by payload as well as by count and time, at [[crates/scribe-client/src/ipc_bridge.rs#MAX_BATCH_BYTES]].
+
+The count and time bounds do not bound the work a batch costs. A batch is parsed and applied in one uninterruptible pass, and 100 server frames is anywhere from a few kilobytes of shell output to 6.4 MiB of `cat` — the queue's own byte ceiling is four times the cap and a decompressed replay event is larger still — so bytes, not events, are what set how long a single drain stalls.
+
+The cap never rejects anything. An event whose own payload exceeds it is handed to the drain alone: splitting a pane's bytes would tear its VTE stream, and dropping them would lose output the queue already accepted. [[crates/scribe-client/src/ipc_bridge.rs#InboundReceiver#recv_within]] decides the fit under the same lock that pops, so an oversize event that raced in behind a momentarily empty queue is deferred to a batch of its own rather than absorbed into one that is already near the cap.
+
 #### Bounded outbound queue
 
 The writer channel is [[crates/scribe-client/src/ipc_bridge.rs#outbound_channel]], bounded at [[crates/scribe-client/src/ipc_bridge.rs#OUTBOUND_QUEUE_FRAMES]] frames under a deliberately different policy from the inbound one: all-or-nothing, never a per-frame drop.

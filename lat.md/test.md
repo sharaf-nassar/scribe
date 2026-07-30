@@ -556,6 +556,18 @@ That ordering is what lets the drain anchor a mark against a grid holding exactl
 
  batches a 300-event two-pane firehose into at most one `write_output` per pane per 100-event batch, so the total write count stays bounded while every pane's byte stream is reconstructed in exact order.
 
+### Batch byte cap splits a drain
+
+A 2.5 MiB backlog of 64 KiB frames — well under both the 100-event bound and the queue's own ceilings, so bytes are the only bound left — drains as at least three batches, none over [[crates/scribe-client/src/ipc_bridge.rs#MAX_BATCH_BYTES]], with every byte still delivered.
+
+Before the cap the same backlog was one 2.5 MiB batch, so the split is the assertion that proves the bound is doing the work rather than the event bound.
+
+### Oversize event drains alone
+
+An event twice the size of [[crates/scribe-client/src/ipc_bridge.rs#MAX_BATCH_BYTES]], queued between two small ones, is drained as its own batch: the small event before it is flushed first and the one after it starts the next batch.
+
+This is the half of the policy that says the cap bounds rather than rejects — an event too big for any batch still reaches the pane whole, because splitting a pane's bytes would tear its VTE stream.
+
 ### Keystroke before output
 
 A keystroke enqueued on the  reaches the outbound channel promptly even with a 10 000-event backlog churning through the inbound drain, because the outbound path never traverses the drain.
