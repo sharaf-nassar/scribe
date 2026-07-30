@@ -40,6 +40,7 @@ use scribe_pty::event_listener::SessionEvent;
 use scribe_pty::metadata::MetadataEvent;
 use scribe_pty::osc_interceptor::OscInterceptor;
 
+use crate::child_identity::{IdentityCheck, check_child_identity};
 use crate::child_watch::{ChildExit, ChildExitWatcher};
 use crate::handoff::HandoffSession;
 use crate::hook_ingress;
@@ -1042,6 +1043,10 @@ pub struct LiveSession {
     /// frames that snapshot already reflects.
     pub(crate) term_commit: SessionCommit,
     child_pid: u32,
+    /// Per-boot identity token for `child_pid` (spec 017 US7-2). Checked
+    /// before [`signal_if_handoff_session`] hangs the child up, and forwarded
+    /// to the next server on handoff.
+    child_identity: Option<crate::child_identity::ChildIdentity>,
     /// `pub(crate)` so `hook_ingress` can clone the writer when routing
     /// inbound `HookEvent`s through `send_metadata_event`.
     pub(crate) client_writer: ClientWriter,
@@ -5933,7 +5938,8 @@ async fn start_session(
     let StartSessionIds { session: session_id, workspace: workspace_id, window: window_id } = ids;
     #[rustfmt::skip]
     let ManagedSession {
-        pty_fd, resize_fd, child_pid, child_pidfd, term, ansi_processor, osc_parser,
+        pty_fd, resize_fd, child_pid, child_pidfd, child_identity, term, ansi_processor,
+        osc_parser,
         event_rx, shell_name, pty, handoff_snapshot, task_label, title, cwd,
         context, ai_state, ai_provider_hint, cell_width, cell_height,
         env_envelope_id, ..
@@ -5960,6 +5966,7 @@ async fn start_session(
         term: Arc::clone(&term),
         term_commit: Arc::clone(&term_commit),
         child_pid,
+        child_identity,
         client_writer: Arc::clone(&client_writer),
         attachment: Arc::clone(&attachment),
         workspace_id,
@@ -6297,18 +6304,42 @@ async fn handle_focus_changed(
     }
 }
 
-/// Send `SIGHUP` to the child process of a handoff-restored session.
+/// Send `SIGHUP` to the child process of a handoff-restored session, but only
+/// once the PID is proven to still name that child (spec 017 US7-2).
 ///
 /// After a hot-reload handoff the `pty` field is `None` because we only
 /// received the master fd via `SCM_RIGHTS`, not the original `Pty` object.
 /// Without the `Pty` there is no guard to tear down, so nothing sends `SIGHUP`
 /// to the child. This helper fills that gap so `CloseSession` and
 /// `CloseWindow` can clean up handoff-restored sessions correctly.
+///
+/// Those children were reparented to init when the old server exited, so init
+/// reaps them the instant they die and the PID becomes free without this
+/// process ever noticing. A bare `kill` on stored state can therefore land on
+/// whatever inherited the number. [`crate::child_identity`] rejects that by
+/// comparing the child's recorded start time against the process currently
+/// holding the PID; anything short of a match logs and signals nothing, which
+/// includes payloads from senders that predate the field. Those sessions still
+/// clean up through the reader's EOF path, per the plan's inherited-session
+/// exemption.
+///
+/// The identity read is a couple of procfs syscalls with no I/O wait, which is
+/// why it is acceptable on the `CloseWindow` path where the caller still holds
+/// the `live_sessions` write guard.
 fn signal_if_handoff_session(session_id: SessionId, session: &LiveSession) {
     if session.pty.is_some() {
         return; // `PtyGuard::teardown` will send SIGHUP off-worker.
     }
     let pid = session.child_pid.cast_signed();
+    let identity = check_child_identity(session.child_pid, session.child_identity);
+    if !identity.may_signal() {
+        if identity == IdentityCheck::Recycled {
+            warn!(%session_id, pid, "skipping SIGHUP: PID now names a different process");
+        } else {
+            info!(%session_id, pid, ?identity, "skipping SIGHUP: child identity unproven");
+        }
+        return;
+    }
     info!(%session_id, pid, "sending SIGHUP to handoff-restored session");
     if let Err(err) = kill(Pid::from_raw(pid), Signal::SIGHUP) {
         warn!(%session_id, pid, %err, "failed to send SIGHUP to child");
@@ -9828,6 +9859,7 @@ pub async fn serialize_live_for_handoff(
             session_id,
             workspace_id: live.workspace_id,
             child_pid: live.child_pid,
+            child_identity: live.child_identity,
             cols,
             rows,
             cell_width: live.cell_width,

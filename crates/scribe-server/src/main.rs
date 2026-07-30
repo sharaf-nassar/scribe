@@ -11,6 +11,7 @@ use scribe_common::error::ScribeError;
 use scribe_common::socket::server_socket_path;
 
 mod attach_flow;
+mod child_identity;
 mod clipboard_state;
 mod config;
 mod env_store;

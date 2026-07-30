@@ -134,6 +134,13 @@ pub struct ManagedSession {
     /// process cannot wait on it — and on platforms without `pidfd`. Those
     /// sessions stay on the EOF path with `exit_code: None`.
     pub child_pidfd: Option<OwnedFd>,
+    /// Per-boot identity token for `child_pid` (spec 017 US7-2), read at spawn
+    /// for fresh sessions and carried on the wire for handoff-restored ones.
+    /// Unlike `child_pidfd` this one survives the handoff, which is what lets
+    /// the successor prove an inherited PID before signalling it. `None` means
+    /// the PID cannot be proven, making the close-time SIGHUP for
+    /// handoff-restored sessions a no-op.
+    pub child_identity: Option<crate::child_identity::ChildIdentity>,
     pub term: Arc<Mutex<Term<ScribeEventListener>>>,
     /// ANSI processor for feeding bytes into `Term<ScribeEventListener>`.
     /// Uses `vte::ansi::Processor` which calls `Handler` methods on Term.
@@ -256,6 +263,10 @@ impl PreparedSessionLaunch {
         pty: alacritty_terminal::tty::Pty,
     ) -> Result<ManagedSession, ScribeError> {
         let child_pid = pty.child().id();
+        // Read the identity token now, while the child is unquestionably ours:
+        // it has just been forked and nothing has reaped it, so the PID cannot
+        // yet name anything else (spec 017 US7-2).
+        let child_identity = crate::child_identity::read_child_identity(child_pid);
         let master_file = pty.file().try_clone().map_err(|e| ScribeError::PtySpawnFailed {
             reason: format!("failed to clone PTY master fd: {e}"),
         })?;
@@ -276,6 +287,7 @@ impl PreparedSessionLaunch {
             resize_fd,
             child_pid,
             child_pidfd: crate::child_watch::open_child_pidfd(child_pid),
+            child_identity,
             term: Arc::new(Mutex::new(self.term)),
             ansi_processor,
             osc_parser,
@@ -517,6 +529,12 @@ impl SessionManager {
                 // Inherited child: this process never spawned it, so it arms
                 // no child-exit watcher and keeps EOF-based exit detection.
                 child_pidfd: None,
+                // Carried, never re-derived: re-reading the token here would
+                // certify whatever process holds the PID right now, which is
+                // exactly the assumption the check exists to reject. A sender
+                // that predates the field leaves this `None`, and the session
+                // is then exempt from the close-time SIGHUP.
+                child_identity: handoff_session.child_identity,
                 term: Arc::new(Mutex::new(term)),
                 ansi_processor,
                 osc_parser,

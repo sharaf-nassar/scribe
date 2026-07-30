@@ -67,6 +67,7 @@ fn make_v5_state(term: &Term<ScribeEventListener>) -> (HandoffState, Vec<OwnedFd
         session_id: SessionId::new(),
         workspace_id: WorkspaceId::new(),
         child_pid: std::process::id(),
+        child_identity: crate::child_identity::read_child_identity(std::process::id()),
         cols: snap.cols,
         rows: snap.rows,
         cell_width: 1,
@@ -136,6 +137,7 @@ fn make_handoff_state(n: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
             session_id: SessionId::new(),
             workspace_id: WorkspaceId::new(),
             child_pid: std::process::id(),
+            child_identity: crate::child_identity::read_child_identity(std::process::id()),
             cols: 80,
             rows: 24,
             cell_width: 1,
@@ -443,4 +445,114 @@ fn dec_private_modes_round_trip_through_ansi_into_term() {
         restored_snap.active_dec_modes.contains(&DecPrivateMode::AppKeypad),
         "round-trip lost app_keypad"
     );
+}
+
+// ── Spec 017 US7-2: child-identity wire compatibility ───────────────
+
+/// `HandoffSession` as it was shaped before the US7-2 child-identity field —
+/// what an N-1 sender puts on the wire. Named `MessagePack` encoding means the
+/// only difference that matters is the missing key.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PriorHandoffSession {
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    child_pid: u32,
+    cols: u16,
+    rows: u16,
+    cell_width: u16,
+    cell_height: u16,
+    snapshot: Option<ScreenSnapshot>,
+    session_replay: Option<scribe_common::screen_replay::SessionReplay>,
+    title: Option<String>,
+    shell_name: String,
+    task_label: Option<String>,
+    codex_task_label: Option<String>,
+    cwd: Option<std::path::PathBuf>,
+    context: Option<SessionContext>,
+    ai_state: Option<scribe_common::ai_state::AiProcessState>,
+    ai_provider_hint: Option<scribe_common::ai_state::AiProvider>,
+}
+
+#[derive(serde::Serialize)]
+struct PriorHandoffState {
+    version: u32,
+    sessions: Vec<PriorHandoffSession>,
+    workspaces: Vec<crate::handoff::HandoffWorkspace>,
+    workspace_tree: Option<scribe_common::protocol::WorkspaceTreeNode>,
+    windows: Vec<crate::handoff::HandoffWindowState>,
+}
+
+fn prior_session(child_pid: u32) -> PriorHandoffSession {
+    PriorHandoffSession {
+        session_id: SessionId::new(),
+        workspace_id: WorkspaceId::new(),
+        child_pid,
+        cols: 80,
+        rows: 24,
+        cell_width: 8,
+        cell_height: 16,
+        snapshot: None,
+        session_replay: None,
+        title: Some(String::from("editor")),
+        shell_name: String::from("zsh"),
+        task_label: None,
+        codex_task_label: None,
+        cwd: Some(std::path::PathBuf::from("/tmp")),
+        context: None,
+        ai_state: None,
+        ai_provider_hint: None,
+    }
+}
+
+/// An N-1 payload carries no identity, so the receiver must decode it and
+/// treat the child as unproven rather than reject the handoff.
+#[test]
+fn prior_version_payload_decodes_with_absent_child_identity() {
+    let state = PriorHandoffState {
+        version: 5,
+        sessions: vec![prior_session(4242)],
+        workspaces: vec![],
+        workspace_tree: None,
+        windows: vec![],
+    };
+
+    let bytes = rmp_serde::to_vec_named(&state).unwrap();
+    let decoded: HandoffState = rmp_serde::from_slice(&bytes).unwrap();
+
+    assert_eq!(decoded.version, 5);
+    let session = decoded.sessions.first().expect("one session");
+    assert_eq!(session.child_identity, None, "absent field must default to None");
+    assert_eq!(session.child_pid, 4242);
+    assert_eq!(session.title.as_deref(), Some("editor"));
+    assert_eq!(session.shell_name, "zsh");
+    assert_eq!(session.cell_width, 8);
+    assert_eq!(session.cwd.as_deref(), Some(std::path::Path::new("/tmp")));
+}
+
+/// A current-version payload round-trips the identity so the successor can
+/// prove the PID before hanging the child up.
+#[test]
+fn current_version_payload_round_trips_child_identity() {
+    let (mut state, _masters, _slaves) = make_handoff_state(1);
+    state.version = 6;
+    let recorded = crate::child_identity::read_child_identity(std::process::id());
+    state.sessions.first_mut().expect("one session").child_identity = recorded;
+
+    let bytes = rmp_serde::to_vec_named(&state).unwrap();
+    let decoded: HandoffState = rmp_serde::from_slice(&bytes).unwrap();
+
+    assert_eq!(decoded.sessions.first().expect("one session").child_identity, recorded);
+}
+
+/// The reverse direction of the same upgrade rehearsal: an N-1 receiver must
+/// ignore the key it has never heard of instead of failing the decode.
+#[test]
+fn prior_version_receiver_ignores_child_identity_key() {
+    let (mut state, _masters, _slaves) = make_handoff_state(1);
+    state.sessions.first_mut().expect("one session").child_identity = Some(987_654);
+
+    let bytes = rmp_serde::to_vec_named(&state.sessions).unwrap();
+    let decoded: Vec<PriorHandoffSession> = rmp_serde::from_slice(&bytes).unwrap();
+
+    assert_eq!(decoded.first().expect("one session").shell_name, "zsh");
 }
