@@ -871,6 +871,53 @@ stays free for another pane's batch and both panes still serve a projection. A
 paint-path read that regressed to reaching through the stream would deadlock that
 test rather than fail quietly.
 
+### After side: paced one-burst-per-redraw (US3-3)
+
+Checked on 2026-07-30 at worktree base `c5a92b2` (bead `scribe-i79.5`). The drain
+no longer empties a pane's frame queue per batch: `apply_pane_op` presents one
+committed burst through `sync_frames::present_next_burst` (which is
+`drain_until_frame`), and a new `run_frame_pacer` task presents whatever pacing
+held back, one burst per pane per 16 ms `REDRAW_INTERVAL` — the same clock
+`drive_redraws` repaints on. `SessionReplay` and `ScreenSnapshot` bytes leave the
+reader as `InboundEvent::PaneRebuild` rather than `PaneOutput`, so `coalesce`
+cannot fold them into the output runs around them and `present_rebuild` applies
+them as a burst boundary of their own.
+
+**What the before-side rows become.** The paced drain is deterministic given a
+batch's frame count and `OUTPUT_FRAME_CATCH_UP_THRESHOLD = 4`, so the three
+recorded workloads bound the change without a re-run:
+
+| Workload | Frames/batch (before) | Presented per drain pass (after) |
+|---|---|---|
+| `yes`, 15 s | 1.00 | 1 — unchanged; the queue never holds a second frame |
+| `cat` of 64 MiB | 1.03 | 1, with the 3 % remainder presented on the pacer's next tick |
+| 4 000 `CSI ?2026` frames | 91.0 | 91 — a backlog 23x the catch-up threshold still drains through in one call |
+
+`yes` is the acceptance workload, and it now reads one burst per redraw by
+construction rather than by coincidence: the queue empties because it holds
+exactly one frame, not because the drain empties it. The synchronized-frame row
+is where the 87-committed-frames-per-redraw number came from, and pacing
+deliberately does not move it: 4 000 frames in ~176 ms is ~23 kHz of committed
+frames against a 60 Hz display, the catch-up threshold exists precisely so a pane
+that far behind is caught up in one pass instead of accruing seconds of latency,
+and no pacing policy can present fewer frames than the producer emits while every
+one of them is still parsed. The remaining win on that row belongs to "skip
+invisible intermediate-frame rebuilds" (#64), which drops the *rebuild* work for
+frames the pacer passes through rather than the parse.
+
+**Not re-run.** The Xvfb rig cannot observe this property end to end, for the
+reason its own caveat gives: bare Xvfb has no window manager, GPUI never entered
+a repaint cycle, and the rig reported `frames=1` throughout. Its "redraws" column
+counts generation bumps rather than painted frames, so re-running it would only
+reproduce the derivation above. The behaviour is pinned instead by
+`a_rebuild_is_applied_as_its_own_burst` (the replay boundary, including the
+half-open synchronized update that would otherwise swallow a replay),
+`coalesce_keeps_a_rebuild_out_of_the_runs_around_it` (the ordering, across the
+overflow re-coalescing round trip), and the pre-existing
+`caught_up_pane_presents_one_burst_per_redraw` /
+`backlog_past_threshold_drains_to_latest_frame` pair, which the wire-in now
+actually exercises in production instead of leaving as dead code.
+
 ## Per-prompt shell hook cost
 
 Wall time and process creations charged to one no-op prompt cycle by

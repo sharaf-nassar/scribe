@@ -53,7 +53,9 @@ use scribe_client::vi_mode::{self, ViMotion};
 use vte::ansi::{Color, CursorShape as TerminalCursorShape};
 
 use crate::session_lifecycle::PromptAnchor;
-use crate::sync_frames::{FeedOutputResult, OutputTarget, SyncFrameQueue, drain_all_committed};
+use crate::sync_frames::{
+    FeedOutputResult, OutputTarget, SyncFrameQueue, present_next_burst as present_queued_burst,
+};
 
 /// One rendered terminal cell: its character plus the raw SGR state the paint
 /// path needs to colour and decorate it.
@@ -881,18 +883,46 @@ impl PaneGrid {
         self.stream.lock().ok().and_then(|stream| stream.sync_deadline())
     }
 
+    /// Whether committed bursts remain queued behind the pacer.
+    ///
+    /// Read-only for the same reason [`Self::sync_deadline`] is: the pacer polls
+    /// this across every pane on every frame interval, and a pane with nothing
+    /// queued must not pay for a projection republish to say so.
+    #[must_use]
+    pub fn has_queued_frames(&self) -> bool {
+        self.stream.lock().is_ok_and(|stream| stream.queue.has_frames())
+    }
+
+    /// Presents this pane's next queued burst, returning how many repaints that
+    /// owes.
+    ///
+    /// One call is one redraw's worth of output. The emptiness check runs first
+    /// so the common case — a pane the drain already caught up — costs a read
+    /// lock rather than a republished projection.
+    pub fn present_next_burst(&self) -> usize {
+        if !self.has_queued_frames() {
+            return 0;
+        }
+        self.with_stream(|stream| {
+            usize::from(present_queued_burst(&mut stream.queue, &mut stream.terminal))
+        })
+        .unwrap_or(0)
+    }
+
     /// Commits every synchronized update on this pane whose deadline has
     /// passed, returning how many repaints that owes.
     ///
     /// The parser side goes first so a raw frame flushed in the same pass lands
     /// after the bytes the parser was already holding, which is the order they
-    /// arrived in.
+    /// arrived in. The flushed frame is presented under the same pacing every
+    /// other committed burst is, so an expiry cannot jump the queue ahead of the
+    /// frames already waiting on it.
     pub fn flush_expired_sync(&self, now: Instant) -> usize {
         self.with_stream(|stream| {
             let mut redraws = usize::from(stream.terminal.flush_parser_sync_timeout(now));
             if stream.queue.flush_raw_timeout(now) {
-                let summary = drain_all_committed(&mut stream.queue, &mut stream.terminal);
-                redraws += usize::from(summary.needs_redraw);
+                redraws +=
+                    usize::from(present_queued_burst(&mut stream.queue, &mut stream.terminal));
             }
             redraws
         })

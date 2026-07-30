@@ -70,13 +70,33 @@ Tearing costs no input either: the frame the writer already took is returned by 
 
 ### Sync Frame Queueing
 
-Between the coalescing drain and `feed_output`, a per-session  preserves `CSI ? 2026` commit boundaries so a redraw never tears a frame across IPC splits, ported from the winit client's drain path.
+Between the coalescing drain and `feed_output`, a per-session [[crates/scribe-client/src/sync_frames.rs#SyncFrameQueue]] preserves `CSI ? 2026` commit boundaries so a redraw never tears a frame across IPC splits, ported from the winit client's drain path.
 
- runs the ported streaming splitter, which keeps raw markers intact and emits one committed frame per commit even when the terminating `l` is split across messages.  queues each coalesced batch, then  replays committed bursts into  one burst per redraw via ; once the backlog passes  it drains through to the latest frame so stale frames never pile up.
-
-A companion  task waits on the nearest raw-frame () or parser deadline and commits a 150 ms-expired update whose closing `l` never arrived, via  and . The drain task wakes it whenever a fresh sync update arms a deadline, and each committed burst bumps the shared redraw generation.
+[[crates/scribe-client/src/sync_frames.rs#SyncFrameQueue#queue_output_frames]] runs the ported streaming splitter, which keeps raw markers intact and emits one committed frame per commit even when the terminating `l` is split across messages. [[crates/scribe-client/src/main.rs#apply_pane_op]] queues each coalesced batch and then presents exactly one committed burst through [[crates/scribe-client/src/sync_frames.rs#present_next_burst]]; once the backlog passes [[crates/scribe-client/src/sync_frames.rs#OUTPUT_FRAME_CATCH_UP_THRESHOLD]] that single call drains through to the latest frame so stale frames never pile up.
 
 Outbound:  replaces Zed's `write_to_pty` path, enqueuing `ClientMessage::KeyInput` / `Resize` plus the session-lifecycle messages the tab shortcuts drive (`CreateSession` / `AttachSessions` / `Subscribe` / `RequestSnapshot` / `CloseSession`), the window-lifecycle frames the close dialog, the window-list poll and the focus observer raise (`CloseWindow` / `QuitAll` / `ListWindows` / `FocusChanged`), and the workspace frames the split shell raises (`CreateWorkspace` / `CloseWorkspace` / `MoveSession` / `ReportWorkspaceTree`, see ) onto the ordered IPC-writer channel drained by . The sink is independent of the inbound drain, so a keystroke is never queued behind an output firehose; because the channel is a single FIFO, a `Resize` enqueued before a `KeyInput` reaches the server first. That channel is bounded as well — see [[client#GPUI Client Spike#IPC Bridge#Bounded outbound queue]] for the all-or-nothing policy that bound runs under. The GPUI view feeds the sink from  through , which is the live entry point of the ported  rather than a table of its own.
+
+#### Paced presentation
+
+Pacing is what makes a burst a burst: the drain hands the grid one committed frame per redraw instead of emptying the pane's queue every batch.
+
+Emptying it was the de-facto behaviour, and it collapsed a whole run of committed frames into one repaint — every frame was parsed, the redraw generation was bumped once, and a `CSI ? 2026` animation was shown as its last frame only. [[crates/scribe-client/src/main.rs#run_frame_pacer]] presents what pacing holds back, one burst per pane per [[crates/scribe-client/src/main.rs#REDRAW_INTERVAL]] — the same clock [[crates/scribe-client/src/main.rs#drive_redraws]] repaints on, so "one burst per redraw" is one number rather than two that can drift apart. It parks while every pane is caught up and the drain wakes it whenever a batch leaves a burst behind, so a pane that queued more than one frame never waits on the next batch to show the rest.
+
+The pacer needs no bound of its own because the catch-up threshold already is one: a pane past it is drained through in a single pass, so a firehose is presented at the batch's own rate and only a caught-up pane is actually paced. That is also why the pacing fix is safe to make: the bursts it skips are never load-bearing for correctness, because a client that falls behind is repaired by the bounded inbound queue's `RequestSnapshot` resync rather than by replaying every intermediate frame.
+
+#### Rebuild burst boundary
+
+A whole-pane rebuild is not output and is not paced: a decoded [[protocol#Server Messages#Terminal Output#SessionReplay]] — and the RIS-prefixed ANSI of a `ScreenSnapshot` — replaces the pane rather than advancing it.
+
+It rides the inbound FIFO as its own [[crates/scribe-client/src/ipc_bridge.rs#InboundEvent]] variant, because its position in the byte stream is exactly what makes it correct: everything the server sent ahead of it is already folded into the state it carries. [[crates/scribe-client/src/ipc_bridge.rs#coalesce]] refuses to fold that variant into the output runs on either side of it, so no committed frame can span a rebuild.
+
+[[crates/scribe-client/src/sync_frames.rs#present_rebuild]] then applies it as a burst boundary. [[crates/scribe-client/src/sync_frames.rs#SyncFrameQueue#seal_frame_boundary]] commits whatever the splitter still holds — an unterminated `CSI ? 2026 h` opened by earlier output would otherwise swallow the rebuild into the frame it is buffering — everything already queued lands first in arrival order, and the rebuild itself reaches `feed_output` whole instead of being re-split into frames the server never emitted.
+
+#### Synchronized-update expiry
+
+A companion [[crates/scribe-client/src/main.rs#run_sync_expiry]] task waits on the nearest raw-frame ([[crates/scribe-client/src/sync_frames.rs#RAW_SYNC_TIMEOUT]]) or parser deadline and commits a 150 ms-expired update whose closing `l` never arrived.
+
+[[crates/scribe-client/src/terminal.rs#PaneGrid#flush_expired_sync]] runs the parser side first and then [[crates/scribe-client/src/sync_frames.rs#SyncFrameQueue#flush_raw_timeout]], and presents the flushed frame under the same pacing every other burst is, so an expiry cannot jump the queue ahead of the frames already waiting on it. The drain task wakes the expiry task whenever a fresh sync update arms a deadline, and each presented burst bumps the shared redraw generation.
 
 ### Session Lifecycle
 

@@ -574,6 +574,12 @@ A prompt mark or a suppressed-ED-3 snap closes the pane's open output entry, so 
 
 That ordering is what lets the drain anchor a mark against a grid holding exactly the output that preceded it.
 
+### Rebuilds bound the output runs around them
+
+A whole-pane rebuild between two output runs stays its own op: [[crates/scribe-client/src/ipc_bridge.rs#coalesce]] closes the run ahead of it, emits the rebuild, and starts a fresh run behind it that still coalesces normally.
+
+The op survives a round trip back through the queue's re-coalescing rehydration, so the boundary holds on the path an overflowing inbound queue takes as well as on the ordinary one.
+
 ### Drain coalesces firehose
 
  batches a 300-event two-pane firehose into at most one `write_output` per pane per 100-event batch, so the total write count stays bounded while every pane's byte stream is reconstructed in exact order.
@@ -679,6 +685,12 @@ With a backlog below ,  applies one committed burst then stops with  `HasMore`, 
 ### Drains through backlog past threshold
 
 Once the queue depth exceeds the catch-up threshold, a single `drain_until_frame` replays every backlogged burst to the latest frame and reports `Drained`, so stale frames never pile up under a firehose.
+
+### Applies a rebuild as its own burst
+
+A rebuild handed to [[crates/scribe-client/src/sync_frames.rs#present_rebuild]] behind a queued commit and a still-open `CSI ? 2026 h` reaches the target as a frame of its own, concatenated onto neither.
+
+The queued commit lands first and the half-open update is sealed and committed rather than dropped, which is the ordering a `SessionReplay` depends on: folded into a neighbouring commit it would be swallowed by a synchronized update the pane it replaces had opened.
 
 ### Flushes raw sync update on expiry
 

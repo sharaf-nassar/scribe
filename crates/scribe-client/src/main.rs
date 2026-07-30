@@ -161,7 +161,7 @@ use crate::{
     },
     pane_shell::{ClosedPane, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
     session_lifecycle::{JumpDirection, PromptMarks},
-    sync_frames::drain_all_committed,
+    sync_frames::{present_next_burst, present_rebuild},
     terminal::{Content, DisplayOnlyTerminal, PaneFrame, PaneGrid, PaneGrids, PaneStream, Scroll},
     terminal_element::{
         CursorPaint, GridBounds, GridColors, GridFont, ImePaint, ScrollbarPaint, TerminalElement,
@@ -5957,6 +5957,12 @@ async fn drive_window_lifecycle(view: WeakEntity<TerminalView>, app: &mut AsyncA
     }
 }
 
+/// The redraw pump's tick, and therefore the interval one paced burst is
+/// presented on: the drain and [`run_frame_pacer`] hand the grid one committed
+/// burst per turn of this clock, so "one burst per redraw" is a single number
+/// rather than two that can drift apart.
+const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
+
 /// Repaints the view whenever the IPC drain bumps the shared generation counter.
 ///
 /// The same 16 ms tick is the idle-wake boundary two wall-clock surfaces expire
@@ -5971,7 +5977,7 @@ async fn drive_redraws(
 ) {
     let mut rendered = generation.load(Ordering::Acquire);
     loop {
-        app.background_executor().timer(Duration::from_millis(16)).await;
+        app.background_executor().timer(REDRAW_INTERVAL).await;
         let current = generation.load(Ordering::Acquire);
         if current == rendered {
             let idle = view.update(app, |view, view_cx| {
@@ -7441,14 +7447,27 @@ where
     }
 }
 
+/// What applying one batch left behind on the panes it touched.
+struct BatchOutcome {
+    /// Repaints the batch owes the redraw generation.
+    redraws: usize,
+    /// A synchronized update is open somewhere and needs the expiry task.
+    sync_armed: bool,
+    /// A pane still has committed bursts queued, so the pacer has work.
+    frames_queued: bool,
+}
+
 /// Spawns the coalescing drain with synchronized-frame queueing in front of
 /// `write_output`. A first task drains the inbound channel with Zed's
 /// 4 ms / 100-event coalescing, capped at a megabyte of payload per batch
 /// ([`run_drain`]), splits each pane's bytes into committed `CSI ? 2026` bursts
-/// via that pane's [`PaneStream`], and replays one burst per redraw so no frame
-/// tears across IPC message boundaries. A second task waits on the nearest
-/// raw-frame or parser sync deadline and flushes a 150 ms-expired update whose
-/// terminating `CSI ? 2026 l` never arrived.
+/// via that pane's [`PaneStream`], and presents one burst per redraw so no frame
+/// tears across IPC message boundaries and no run of committed frames collapses
+/// into a single repaint. A second task waits on the nearest raw-frame or parser
+/// sync deadline and flushes a 150 ms-expired update whose terminating
+/// `CSI ? 2026 l` never arrived. A third — [`run_frame_pacer`] — presents the
+/// bursts pacing held back, because a pane whose last batch queued more than one
+/// committed frame must not wait for the next batch to show the rest.
 ///
 /// The `panes` registry lock is taken once per batch, to resolve the batch's
 /// panes into handles, and released before a single byte is parsed. Everything
@@ -7466,37 +7485,87 @@ fn spawn_drain(
     prompt_marks: Arc<Mutex<PromptMarks>>,
 ) {
     let expiry_wake = Arc::new(Notify::new());
+    let pacer_wake = Arc::new(Notify::new());
 
     let panes_task = Arc::clone(&panes);
     let generation_task = Arc::clone(&generation);
-    let wake_task = Arc::clone(&expiry_wake);
+    let expiry_task = Arc::clone(&expiry_wake);
+    let pacer_task = Arc::clone(&pacer_wake);
     tokio::spawn(run_drain(in_rx, sink, move |batch| {
-        if batch.is_empty() {
-            return;
-        }
-        let batch_panes = resolve_batch_panes(&panes_task, &batch);
-        let mut redraws = 0usize;
-        let mut sync_armed = false;
-        for (session, op) in batch.iter() {
-            // Each pane advances its own grid, so a background pane's burst
-            // can never land in the focused pane's scrollback.
-            let Some(pane) = batch_panes.get(&session) else { continue };
-            let applied = pane.with_stream(|stream| {
-                (apply_pane_op(op, session, stream, &prompt_marks), stream.sync_armed())
-            });
-            let Some((pane_redraws, pane_sync_armed)) = applied else { continue };
-            redraws += pane_redraws;
-            sync_armed |= pane_sync_armed;
-        }
-        for _ in 0..redraws {
+        let outcome = apply_batch(&batch, &panes_task, &prompt_marks);
+        for _ in 0..outcome.redraws {
             generation_task.fetch_add(1, Ordering::Release);
         }
-        if sync_armed {
-            wake_task.notify_one();
+        if outcome.sync_armed {
+            expiry_task.notify_one();
+        }
+        if outcome.frames_queued {
+            pacer_task.notify_one();
         }
     }));
 
-    tokio::spawn(run_sync_expiry(panes, generation, expiry_wake));
+    tokio::spawn(run_sync_expiry(Arc::clone(&panes), Arc::clone(&generation), expiry_wake));
+    tokio::spawn(run_frame_pacer(panes, generation, pacer_wake));
+}
+
+/// Applies one coalesced batch pane by pane, reporting what it owes the redraw
+/// generation, the expiry task, and the pacer.
+fn apply_batch(
+    batch: &CoalescedBatch,
+    panes: &Arc<Mutex<PaneGrids>>,
+    prompt_marks: &Arc<Mutex<PromptMarks>>,
+) -> BatchOutcome {
+    let mut outcome = BatchOutcome { redraws: 0, sync_armed: false, frames_queued: false };
+    if batch.is_empty() {
+        return outcome;
+    }
+    let batch_panes = resolve_batch_panes(panes, batch);
+    for (session, op) in batch.iter() {
+        // Each pane advances its own grid, so a background pane's burst can
+        // never land in the focused pane's scrollback.
+        let Some(pane) = batch_panes.get(&session) else { continue };
+        let applied = pane.with_stream(|stream| {
+            let redraws = apply_pane_op(op, session, stream, prompt_marks);
+            (redraws, stream.sync_armed(), stream.queue.has_frames())
+        });
+        let Some((redraws, sync_armed, frames_queued)) = applied else { continue };
+        outcome.redraws += redraws;
+        outcome.sync_armed |= sync_armed;
+        outcome.frames_queued |= frames_queued;
+    }
+    outcome
+}
+
+/// Presents the committed bursts pacing left queued, one per pane per redraw
+/// interval, so output that arrived faster than the screen can show it still
+/// reaches the grid instead of waiting on the next inbound batch.
+///
+/// Parks whenever every pane is caught up; the drain wakes it as soon as a batch
+/// leaves a burst behind. What it walks is bounded without a bound of its own: a
+/// pane past [`sync_frames::OUTPUT_FRAME_CATCH_UP_THRESHOLD`] is drained through
+/// in a single pass, so a firehose is presented at the batch's own rate and only
+/// a caught-up pane is actually paced.
+async fn run_frame_pacer(
+    panes: Arc<Mutex<PaneGrids>>,
+    generation: Arc<AtomicU64>,
+    wake: Arc<Notify>,
+) {
+    loop {
+        if !any_pane_has_frames(&panes) {
+            wake.notified().await;
+            continue;
+        }
+        tokio::time::sleep(REDRAW_INTERVAL).await;
+        let redraws: usize = live_panes(&panes).iter().map(|pane| pane.present_next_burst()).sum();
+        for _ in 0..redraws {
+            generation.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+/// Whether any live pane still owes the pacer a burst.
+fn any_pane_has_frames(panes: &Arc<Mutex<PaneGrids>>) -> bool {
+    live_panes(panes).iter().any(|pane| pane.has_queued_frames())
 }
 
 /// Resolve every pane a batch names into a handle, under one short registry
@@ -7528,8 +7597,9 @@ fn apply_pane_op(
     match op {
         PaneOp::Output(bytes) => {
             queue.queue_output_frames(bytes);
-            usize::from(drain_all_committed(queue, grid).needs_redraw)
+            usize::from(present_next_burst(queue, grid))
         }
+        PaneOp::Rebuild(bytes) => usize::from(present_rebuild(queue, grid, bytes)),
         PaneOp::PromptMark { kind, exit_code } => {
             apply_prompt_mark(prompt_marks, session, *kind, *exit_code, grid);
             0
@@ -8117,7 +8187,7 @@ fn on_session_exited(
 /// applied grid's dimensions are logged alongside the session.
 fn apply_screen_snapshot(ctx: &ReaderCtx, session_id: SessionId, snapshot: &ScreenSnapshot) {
     let bytes = session_lifecycle::snapshot_reset_bytes(snapshot);
-    forward_output(&ctx.in_tx, session_id, bytes);
+    forward_rebuild(&ctx.in_tx, session_id, bytes);
     tracing::info!(
         %session_id,
         cols = snapshot.cols,
@@ -8138,7 +8208,7 @@ fn apply_screen_snapshot(ctx: &ReaderCtx, session_id: SessionId, snapshot: &Scre
 /// the pre-existing behaviour.
 fn forward_replay(ctx: &ReaderCtx, session_id: SessionId, replay: &SessionReplay) {
     match session_lifecycle::decode_replay(session_id, replay) {
-        Ok(bytes) => forward_output(&ctx.in_tx, session_id, bytes),
+        Ok(bytes) => forward_rebuild(&ctx.in_tx, session_id, bytes),
         Err(error) => {
             set_status(&ctx.status, &ctx.generation, error.to_string());
             if let Err(sink_error) = ctx.sink.request_snapshot(session_id) {
@@ -9280,6 +9350,18 @@ fn adopt_attached_session(ctx: &ReaderCtx, session_id: SessionId) {
 
 fn forward_output(in_tx: &InboundSender, session_id: SessionId, bytes: Vec<u8>) {
     forward_inbound(in_tx, InboundEvent::PaneOutput { session_id, bytes });
+}
+
+/// Hand the drain a whole-pane rebuild — a decoded `SessionReplay` or a
+/// `ScreenSnapshot`'s RIS-prefixed ANSI.
+///
+/// It rides the same FIFO as output, because its position in the byte stream is
+/// exactly what makes it correct: everything the server sent before it is
+/// already folded into the state it carries. It is *not* output, though, so it
+/// enters as its own event and the drain applies it as its own burst boundary
+/// rather than concatenating it into the runs around it.
+fn forward_rebuild(in_tx: &InboundSender, session_id: SessionId, bytes: Vec<u8>) {
+    forward_inbound(in_tx, InboundEvent::PaneRebuild { session_id, bytes });
 }
 
 /// Hand one event to the coalescing drain, preserving arrival order.
