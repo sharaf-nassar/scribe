@@ -16,9 +16,12 @@
 //! it has just written output into, and the GPUI key path reads them back to
 //! resolve `prompt_jump_up` / `prompt_jump_down` / `jump_to_failure`.
 //!
-//! Decompression and snapshot-to-ANSI conversion stay pure and happen in the
-//! reader ahead of the coalescing drain (the drain only ever concatenates
-//! bytes, per the IPC-bridge contract). A corrupt `SessionReplay` yields a
+//! Decompression and snapshot-to-ANSI conversion stay pure and happen ahead of
+//! the coalescing drain (the drain only ever concatenates bytes, per the
+//! IPC-bridge contract). Replay inflation is the one step big enough to matter,
+//! so the reader awaits it on the blocking pool via
+//! [`decode_replay_off_thread`] rather than running zstd on the single-threaded
+//! IPC runtime. A corrupt `SessionReplay` yields a
 //! [`ReplayDecodeError`] the reader surfaces as pane status instead of tearing
 //! down the loop, matching the legacy graceful-skip behaviour. The topology,
 //! registry, and mark-shift helpers are pure so they can be exercised
@@ -71,6 +74,33 @@ pub fn decode_replay(
     }
     screen_replay::decompress_session_replay(replay)
         .map_err(|error| ReplayDecodeError { session_id, reason: error.to_string() })
+}
+
+/// Run [`decode_replay`] on the blocking pool instead of the reader's runtime
+/// thread.
+///
+/// The IPC thread drives a current-thread runtime, so the reader, the writer,
+/// and the coalescing drain all share one thread: inflating a multi-megabyte
+/// reattach inline stops keystrokes reaching the server and freezes every
+/// pane's repaint until zstd finishes. Awaiting the offload keeps the replay
+/// ordered against the frames around it — the reader still applies messages in
+/// arrival order — while leaving the runtime free to drive the other two tasks.
+///
+/// # Errors
+/// Returns [`ReplayDecodeError`] for everything [`decode_replay`] rejects, plus
+/// a blocking task that panicked or was cancelled; either way the caller sees
+/// one decode failure and can fall back to a snapshot request.
+pub async fn decode_replay_off_thread(
+    session_id: SessionId,
+    replay: SessionReplay,
+) -> Result<Vec<u8>, ReplayDecodeError> {
+    match tokio::task::spawn_blocking(move || decode_replay(session_id, &replay)).await {
+        Ok(decoded) => decoded,
+        Err(error) => Err(ReplayDecodeError {
+            session_id,
+            reason: format!("replay decode task failed: {error}"),
+        }),
+    }
 }
 
 /// Build the byte stream that applies a `ScreenSnapshot` to a fresh terminal.

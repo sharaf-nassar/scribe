@@ -8232,8 +8232,12 @@ fn apply_screen_snapshot(ctx: &ReaderCtx, session_id: SessionId, snapshot: &Scre
 /// decode failure into a repaint instead of a permanently stale tab; if that
 /// request cannot be enqueued the error banner is all the user gets, which is
 /// the pre-existing behaviour.
-fn forward_replay(ctx: &ReaderCtx, session_id: SessionId, replay: &SessionReplay) {
-    match session_lifecycle::decode_replay(session_id, replay) {
+///
+/// The inflate itself runs on the blocking pool: this thread's runtime also
+/// owns the writer and the drain, so a large replay decoded inline would hold
+/// back keystrokes and pane repaints for as long as zstd ran.
+async fn forward_replay(ctx: &ReaderCtx, session_id: SessionId, replay: SessionReplay) {
+    match session_lifecycle::decode_replay_off_thread(session_id, replay).await {
         Ok(bytes) => forward_rebuild(&ctx.in_tx, session_id, bytes),
         Err(error) => {
             set_status(&ctx.status, &ctx.generation, error.to_string());
@@ -8260,7 +8264,7 @@ where
         // `select_tab_N`, so output gating reads it fresh on every message
         // rather than caching a local `attached`.
         let attached = ctx.active_session.lock().ok().and_then(|guard| *guard);
-        dispatch_server_message(message, &ctx, &mut registry, attached, first_session_list)?;
+        dispatch_server_message(message, &ctx, &mut registry, attached, first_session_list).await?;
         if is_session_list {
             first_session_list = false;
         }
@@ -8277,7 +8281,7 @@ where
 /// for a background pane stays a deliberate no-op instead of being reported as
 /// an unhandled message. The terminal-chrome family is named here but handled
 /// in [`on_chrome_message`], so this stays a table of routing decisions.
-fn dispatch_server_message(
+async fn dispatch_server_message(
     message: ServerMessage,
     ctx: &ReaderCtx,
     registry: &mut session_lifecycle::SessionRegistry,
@@ -8318,7 +8322,7 @@ fn dispatch_server_message(
         // one to [`on_pane_output_message`].
         output @ (ServerMessage::PtyOutput { .. }
         | ServerMessage::SessionReplay { .. }
-        | ServerMessage::ScreenSnapshot { .. }) => on_pane_output_message(ctx, output),
+        | ServerMessage::ScreenSnapshot { .. }) => on_pane_output_message(ctx, output).await,
         // The terminal-chrome family all lands in the same two stores (the tab
         // strip's labels and the shared metadata), so it is named here and
         // routed as one to [`on_chrome_message`].
@@ -8685,7 +8689,7 @@ fn on_chrome_message(ctx: &ReaderCtx, message: ServerMessage) {
 /// Anything other than the pane-content family is a programming error in
 /// [`dispatch_server_message`]'s routing, not a protocol event, so it is
 /// counted as unhandled rather than silently dropped.
-fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage) {
+async fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage) {
     match message {
         ServerMessage::PtyOutput { session_id, data } => {
             if is_attached(ctx, session_id) {
@@ -8698,7 +8702,7 @@ fn on_pane_output_message(ctx: &ReaderCtx, message: ServerMessage) {
         }
         ServerMessage::SessionReplay { session_id, replay } => {
             if is_attached(ctx, session_id) {
-                forward_replay(ctx, session_id, &replay);
+                forward_replay(ctx, session_id, replay).await;
             }
         }
         ServerMessage::ScreenSnapshot { session_id, snapshot } => {
