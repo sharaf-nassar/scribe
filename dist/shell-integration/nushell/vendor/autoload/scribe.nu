@@ -12,8 +12,42 @@ let scribe_active = (
     and (not ($env._SCRIBE_INTEGRATION_SOURCED? | default false))
 )
 
+# Nushell found this file because the server prepended the
+# shell-integration root to `XDG_DATA_DIRS`, and autoload is over by the
+# time the script runs. Take that entry back out: left in place it is
+# inherited by every child the session spawns, and the env baseline below
+# records it as if the user had exported it, so the server would restore
+# a server-private path into later sessions on a shell that never wanted
+# it. Matched on the trailing `/shell-integration` component, the way
+# `scribe.fish` matches it — all four install layouts end the scripts
+# directory with that name.
+def --env __scribe-strip-injected-data-dirs [] {
+    if not ('XDG_DATA_DIRS' in $env) {
+        return
+    }
+    # `ENV_CONVERSIONS` can turn any variable into a list on the nushell
+    # side, so only split when the value is still the raw string a child
+    # process inherits.
+    let raw = $env.XDG_DATA_DIRS
+    let entries = if (($raw | describe) | str starts-with 'list') {
+        ($raw | each {|entry| $entry | into string })
+    } else {
+        ($raw | into string | split row (char esep))
+    }
+    let kept = ($entries | where {|entry| not ($entry | str ends-with '/shell-integration') })
+    if ($kept | length) == ($entries | length) {
+        return
+    }
+    if ($kept | is-empty) {
+        hide-env XDG_DATA_DIRS
+    } else {
+        $env.XDG_DATA_DIRS = ($kept | str join (char esep))
+    }
+}
+
 if $scribe_active {
     $env._SCRIBE_INTEGRATION_SOURCED = true
+    __scribe-strip-injected-data-dirs
 }
 
 # `char esc` was dropped from nushell's character table, and `$'...'`

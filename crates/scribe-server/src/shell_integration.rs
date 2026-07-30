@@ -282,6 +282,13 @@ mod tests {
             .join("../../dist/shell-integration/fish/vendor_conf.d/scribe.fish")
     }
 
+    /// The shipped nushell integration, read out of `dist/` for the same
+    /// reason as [`fish_script`].
+    fn nu_script() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../dist/shell-integration/nushell/vendor/autoload/scribe.nu")
+    }
+
     /// One recorded `scribe-hook-helper` invocation: its argv plus the
     /// payload document it was handed on stdin.
     #[derive(Debug)]
@@ -571,6 +578,84 @@ mod tests {
                  argument when the list is empty: {line}"
             );
         }
+    }
+
+    /// [`inject_nushell`] prepends the scripts directory to
+    /// `XDG_DATA_DIRS` so nushell autoloads `scribe.nu`; once autoload is
+    /// over the script has to take the entry back out again. Both escape
+    /// routes are asserted against the shipped script: what a child
+    /// process inherits, and what the snapshot behind the env baseline
+    /// would hand the server to persist.
+    #[test]
+    fn nu_strips_the_injected_xdg_data_dirs_entry() {
+        let mut probe = Command::new("nu");
+        probe.arg("--version");
+        scrub_desktop_env(&mut probe);
+        if !probe.output().is_ok_and(|out| out.status.success()) {
+            return;
+        }
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("scribe-nu-xdg-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+
+        // A child sees only what nushell exports, so reading the variable
+        // back out of one is the direct test of the leak.
+        let recorder = dir.join("recorder.sh");
+        std::fs::write(&recorder, "#!/bin/sh\nprintf 'child=%s' \"${XDG_DATA_DIRS-}\" > \"$1\"\n")
+            .expect("write recorder");
+        std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod recorder");
+
+        let child_seen = dir.join("child.txt");
+        let baseline_seen = dir.join("baseline.txt");
+        let driver = dir.join("driver.nu");
+        std::fs::write(
+            &driver,
+            format!(
+                "source '{}'\nrun-external '{}' '{}'\nlet seen = (__scribe-snapshot-env | where \
+                 name == 'XDG_DATA_DIRS' | get value | str join ',')\n$\"baseline=($seen)\" | save \
+                 --raw --force '{}'\n",
+                nu_script().display(),
+                recorder.display(),
+                child_seen.display(),
+                baseline_seen.display(),
+            ),
+        )
+        .expect("write driver");
+
+        let injected = dir.join("shell-integration");
+        let mut command = Command::new("nu");
+        command
+            .arg("--no-config-file")
+            .arg(&driver)
+            .env("TERM_PROGRAM", "Scribe")
+            .env("SCRIBE_SHELL_INTEGRATION", "1")
+            // The baseline emit itself is out of scope here and would fork
+            // a helper that does not exist in a test layout.
+            .env("SCRIBE_ENV_PERSIST", "0")
+            .env_remove("_SCRIBE_INTEGRATION_SOURCED")
+            .env("XDG_DATA_DIRS", format!("{}:/usr/local/share:/usr/share", injected.display()))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        seal_child(&mut command, &dir);
+        let result = command.output().expect("run nu driver");
+        assert!(
+            result.status.success(),
+            "nu driver exited with {}: {}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        let child = std::fs::read_to_string(&child_seen).expect("recorder output");
+        let baseline = std::fs::read_to_string(&baseline_seen).expect("baseline output");
+        std::fs::remove_dir_all(&dir).expect("clean scratch dir");
+        assert_eq!(child, "child=/usr/local/share:/usr/share", "nu leaked the injected entry");
+        assert_eq!(
+            baseline, "baseline=/usr/local/share:/usr/share",
+            "the env baseline would persist the injected entry"
+        );
     }
 
     /// Byte offset of the first `$` not immediately preceded by a double
