@@ -850,6 +850,9 @@ pub struct LiveSession {
     /// first report after a handoff still reaches clients that only ever
     /// saw the previous process.
     last_cwd_report: Option<std::path::PathBuf>,
+    /// Memoized `.git/HEAD` walk for the directory the session is in, shared
+    /// by the metadata pipeline and `ListSessions`.
+    git_branch_cache: GitBranchCache,
     /// Last-known remote/tmux context reported by shell integration.
     context: Option<scribe_common::protocol::SessionContext>,
     /// Last-known AI process state (OSC 1337), persisted for reconnect.
@@ -5681,6 +5684,7 @@ async fn start_session(
         task_label,
         cwd,
         last_cwd_report: None,
+        git_branch_cache: GitBranchCache::default(),
         context,
         ai_state,
         ai_provider_hint,
@@ -6540,7 +6544,7 @@ async fn handle_list_sessions(
         task_label: s.task_label.clone(),
         codex_task_label: s.task_label.clone(),
         cwd: s.cwd.clone(),
-        git_branch: s.cwd.as_deref().and_then(detect_git_branch),
+        git_branch: s.cwd.as_deref().and_then(|cwd| s.git_branch_cache.resolve(cwd)),
         ai_state: s.ai_state.clone(),
         ai_provider_hint: s.ai_state.as_ref().map(|state| state.provider).or(s.ai_provider_hint),
     };
@@ -8887,6 +8891,101 @@ pub fn detect_git_branch(cwd: &Path) -> Option<String> {
     }
 }
 
+/// How long a resolved branch stays usable for a directory the session is
+/// still sitting in. A `ListSessions` read can arrive at any time and has no
+/// invalidation signal of its own, so the TTL bounds how stale a branch
+/// switched from outside Scribe (`git checkout` in another terminal) can be.
+const GIT_BRANCH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A branch resolution and the directory it was taken in.
+struct CachedGitBranch {
+    cwd: std::path::PathBuf,
+    branch: Option<String>,
+    resolved_at: std::time::Instant,
+}
+
+/// Per-session memo of the last [`detect_git_branch`] walk, keyed on the
+/// directory it was taken in — a `(session, cwd)` key, since the cache lives
+/// on the session.
+///
+/// A CWD report that survives [`record_cwd_report`] changes the key and is
+/// therefore the invalidation signal; [`GIT_BRANCH_CACHE_TTL`] bounds staleness
+/// for a session that never moves. Interior mutability so the `ListSessions`
+/// path can refresh an expired entry while holding only a read guard on the
+/// live-session registry.
+#[derive(Default)]
+struct GitBranchCache(std::sync::Mutex<Option<CachedGitBranch>>);
+
+/// Outcome of a [`GitBranchCache`] lookup. `Hit(None)` — "cached: this
+/// directory is not in a repository" — is a real answer and must stay
+/// distinguishable from a miss.
+enum BranchLookup {
+    Hit(Option<String>),
+    Miss,
+}
+
+impl GitBranchCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<CachedGitBranch>> {
+        // The critical section is a path compare and a clone, so poisoning
+        // cannot occur in practice; recover rather than propagate if it does.
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The cached branch for `cwd`, or a miss when the entry names another
+    /// directory, has expired, or was never taken.
+    fn fresh(&self, cwd: &Path) -> BranchLookup {
+        let entry = self.lock();
+        match entry.as_ref() {
+            Some(entry)
+                if entry.cwd == cwd && entry.resolved_at.elapsed() < GIT_BRANCH_CACHE_TTL =>
+            {
+                BranchLookup::Hit(entry.branch.clone())
+            }
+            _ => BranchLookup::Miss,
+        }
+    }
+
+    fn store(&self, cwd: &Path, branch: Option<String>) {
+        *self.lock() = Some(CachedGitBranch {
+            cwd: cwd.to_path_buf(),
+            branch,
+            resolved_at: std::time::Instant::now(),
+        });
+    }
+
+    /// Resolve `cwd`'s branch, walking `.git/HEAD` only on a cache miss.
+    fn resolve(&self, cwd: &Path) -> Option<String> {
+        if let BranchLookup::Hit(branch) = self.fresh(cwd) {
+            return branch;
+        }
+        let branch = detect_git_branch(cwd);
+        self.store(cwd, branch.clone());
+        branch
+    }
+}
+
+/// Resolve a session's branch through its [`GitBranchCache`] without holding
+/// the registry guard across the filesystem walk.
+async fn resolve_session_git_branch(
+    session_id: SessionId,
+    cwd: &Path,
+    live_sessions: &LiveSessionRegistry,
+) -> Option<String> {
+    let lookup = live_sessions
+        .read()
+        .await
+        .get(&session_id)
+        .map_or(BranchLookup::Miss, |s| s.git_branch_cache.fresh(cwd));
+    if let BranchLookup::Hit(branch) = lookup {
+        return branch;
+    }
+    let branch = detect_git_branch(cwd);
+    if let Some(session) = live_sessions.read().await.get(&session_id) {
+        session.git_branch_cache.store(cwd, branch.clone());
+    }
+    branch
+}
+
 /// Carry forward optional `AiProcessState` metadata (`context`, `model`,
 /// `tool`, `agent`, `conversation_id`) from the previously-stored live
 /// session state when the incoming `AiStateChanged` left those fields as
@@ -9113,10 +9212,14 @@ pub async fn send_metadata_event(
     }
 
     if let Some(cwd) = cwd_for_workspace {
-        // Send git branch information for the new CWD.
-        let branch = detect_git_branch(&cwd);
-        let git_msg = ServerMessage::GitBranch { session_id, branch };
-        send_to_client(client_writer, &git_msg).await;
+        // Send git branch information for the new CWD. A detached session has
+        // no sink to render the branch, so the walk is pure waste — the
+        // `SessionList` reply that precedes the next attach resolves it.
+        if !client_writer.lock().await.is_empty() {
+            let branch = resolve_session_git_branch(session_id, &cwd, live_sessions).await;
+            let git_msg = ServerMessage::GitBranch { session_id, branch };
+            send_to_client(client_writer, &git_msg).await;
+        }
 
         // Always update workspace naming, even when detached.
         let named_msg = {
