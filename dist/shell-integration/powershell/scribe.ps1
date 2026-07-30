@@ -135,14 +135,17 @@ if (Get-Command Set-PSReadLineOption -ErrorAction SilentlyContinue) {
 #   1. Source the restore-delta file if the server staged one (post-
 #      profile, so user-set values from the previous session beat any
 #      profile-driven defaults). The file is dot-sourced so its
-#      `$env:NAME = 'value'` / `Remove-Item env:NAME` statements
-#      affect the current process environment.
+#      `${env:NAME} = 'value'` / `Remove-Item env:NAME` statements
+#      affect the current process environment. The server stages it
+#      with a `.ps1` extension for this shell: dot-sourcing any other
+#      extension resolves as a native command instead of a script and
+#      fails silently, applying nothing.
 #   2. Initialize the per-session "last emitted" snapshot.
 #   3. One-shot baseline emit (--baseline-ready), then re-wrap the
 #      `prompt` function to emit per-prompt deltas.
 
 # Source restore-delta file (FR-008: applied AFTER profile has run).
-if ($env:SCRIBE_RESTORE_ENV_DELTA_FILE -and (Test-Path $env:SCRIBE_RESTORE_ENV_DELTA_FILE)) {
+if ($env:SCRIBE_RESTORE_ENV_DELTA_FILE -and (Test-Path -LiteralPath $env:SCRIBE_RESTORE_ENV_DELTA_FILE)) {
     try {
         . $env:SCRIBE_RESTORE_ENV_DELTA_FILE
     } catch {
@@ -150,7 +153,7 @@ if ($env:SCRIBE_RESTORE_ENV_DELTA_FILE -and (Test-Path $env:SCRIBE_RESTORE_ENV_D
         # was unexpected.
     }
     try {
-        Remove-Item -Path $env:SCRIBE_RESTORE_ENV_DELTA_FILE -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $env:SCRIBE_RESTORE_ENV_DELTA_FILE -ErrorAction SilentlyContinue
     } catch { }
     Remove-Item env:SCRIBE_RESTORE_ENV_DELTA_FILE -ErrorAction SilentlyContinue
 }

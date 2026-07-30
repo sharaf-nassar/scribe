@@ -238,44 +238,26 @@ def __scribe-snapshot-env [] {
     }
 }
 
-# Best-effort apply of the server's POSIX-format restore-delta file.
-# Recognizes `export NAME=value`, `export NAME='value'`, `export
-# NAME="value"`, and `unset NAME` lines; ignores everything else.
+# Apply the server's restore-delta file, which nushell alone receives as
+# JSON: `source` resolves its path at parse time and rejects a runtime
+# value, so this script can never dot-source anything and has to read the
+# delta as data. The previous hand-rolled POSIX-line parser silently lost
+# the `'\''` quote idiom and every value that spanned more than one line;
+# `from json` has no such blind spots.
 def --env __scribe-apply-restore [path: string] {
-    let lines = (try { open --raw $path | lines } catch { [] })
-    mut adds = {}
-    mut removes = []
-    for line in $lines {
-        let trimmed = ($line | str trim)
-        if ($trimmed | str starts-with 'export ') {
-            let body = ($trimmed | str substring 7..)
-            let eq_idx = ($body | str index-of '=')
-            if $eq_idx > 0 {
-                let name = ($body | str substring 0..$eq_idx)
-                let raw_value = ($body | str substring ($eq_idx + 1)..)
-                # Strip a single layer of matching surrounding quotes
-                # (single or double); leave others verbatim.
-                let value = if (($raw_value | str starts-with "'") and ($raw_value | str ends-with "'") and (($raw_value | str length) >= 2)) {
-                    $raw_value | str substring 1..(-1)
-                } else if (($raw_value | str starts-with '"') and ($raw_value | str ends-with '"') and (($raw_value | str length) >= 2)) {
-                    $raw_value | str substring 1..(-1)
-                } else {
-                    $raw_value
-                }
-                $adds = ($adds | upsert $name $value)
-            }
-        } else if ($trimmed | str starts-with 'unset ') {
-            let name = ($trimmed | str substring 6.. | str trim)
-            if not ($name | is-empty) {
-                $removes = ($removes | append $name)
-            }
-        }
+    let payload = (try { open --raw $path | from json } catch { null })
+    if (($payload | is-empty) or (not ($payload | describe | str starts-with 'record'))) {
+        return
     }
-    if (($adds | columns | length) > 0) {
+    let adds = ($payload.added? | default {})
+    if (($adds | describe | str starts-with 'record') and (($adds | columns | length) > 0)) {
         load-env $adds
     }
-    for name in $removes {
-        try { hide-env $name } catch { }
+    let removes = ($payload.removed? | default [])
+    if ($removes | describe | str starts-with 'list') {
+        for name in $removes {
+            try { hide-env $name } catch { }
+        }
     }
 }
 
