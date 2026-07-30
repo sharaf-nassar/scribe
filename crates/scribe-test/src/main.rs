@@ -189,6 +189,11 @@ enum Command {
         /// Path to a reference snapshot JSON file (from `snapshot` command).
         reference: PathBuf,
     },
+    /// Assert that no zero-byte `PtyOutput` frame arrived for a session.
+    AssertNoEmptyOutput {
+        /// Target session ID.
+        session_id: String,
+    },
     /// Relay the client socket through a wire tap that records every outbound
     /// `ClientMessage` and can inject `ServerMessage`s toward the client.
     ///
@@ -415,6 +420,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::AssertSnapshotMatch { session_id, reference } => {
             assert::assert_snapshot_match(&session_id, &reference)
         }
+        Command::AssertNoEmptyOutput { session_id } => assert::assert_no_empty_output(&session_id),
         Command::AssertExit { session_id, code, timeout } => {
             assert::assert_exit(&session_id, code, timeout)
         }

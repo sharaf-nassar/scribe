@@ -88,6 +88,13 @@ struct SessionState {
     /// the frame order; this counter can, and it is what
     /// [`ReplayFrameInfo::live_bytes_before`] is stamped from.
     live_bytes: u64,
+    /// Zero-byte `PtyOutput` frames received for this session.
+    ///
+    /// Every one of them is a defect: a filtered-to-nothing chunk costs an
+    /// allocation, a serialize, a queue slot, and a coalesce pass on every
+    /// attached client while changing no cell. The count is what
+    /// `assert-no-empty-output` reads.
+    empty_output_frames: u64,
     /// What the session's replay path has delivered, and the screen rebuilt
     /// from it.
     replay: ReplayLog,
@@ -106,6 +113,7 @@ impl SessionState {
             ai_context: None,
             ai_pulsing: false,
             live_bytes: 0,
+            empty_output_frames: 0,
             replay: ReplayLog::default(),
         }
     }
@@ -571,6 +579,13 @@ async fn handle_pty_output(
 ) {
     let mut guard = state.lock().await;
     if let Some(session) = guard.sessions.get_mut(&session_id) {
+        if data.is_empty() {
+            // Recorded rather than ignored: the server drops filtered-to-nothing
+            // chunks before framing them, so an empty frame here is a
+            // regression `assert-no-empty-output` has to be able to name.
+            session.empty_output_frames = session.empty_output_frames.saturating_add(1);
+            warn!(%session_id, "received an empty PtyOutput frame");
+        }
         session.output_buffer.extend(data);
         drain_output_buffer(session_id, &mut session.output_buffer);
         session.last_output_at = Some(tokio::time::Instant::now());
@@ -883,24 +898,15 @@ async fn process_request(
             handle_assert_cursor(session_id, row, col, state, server_writer).await
         }
         DaemonRequest::AssertExit { session_id, expected_code, timeout_ms } => {
-            handle_assert_exit(
-                session_id,
-                ExpectedExit::Code(expected_code),
-                timeout_ms,
-                state,
-                notifiers,
-            )
-            .await
+            let expected = ExpectedExit::Code(expected_code);
+            handle_assert_exit(session_id, expected, timeout_ms, state, notifiers).await
         }
         DaemonRequest::AssertSignal { session_id, expected_signal, timeout_ms } => {
-            handle_assert_exit(
-                session_id,
-                ExpectedExit::Signal(expected_signal),
-                timeout_ms,
-                state,
-                notifiers,
-            )
-            .await
+            let expected = ExpectedExit::Signal(expected_signal);
+            handle_assert_exit(session_id, expected, timeout_ms, state, notifiers).await
+        }
+        DaemonRequest::AssertNoEmptyOutput { session_id } => {
+            handle_assert_no_empty_output(session_id, state).await
         }
         DaemonRequest::AssertSnapshotMatch { session_id, reference } => {
             handle_assert_snapshot_match(session_id, &reference, state, server_writer).await
@@ -1697,6 +1703,27 @@ async fn handle_assert_snapshot_match(
     }
 
     DaemonResponse::Ok
+}
+
+/// Assert that no zero-byte `PtyOutput` frame ever arrived for a session.
+///
+/// The server drops a chunk its filters emptied before framing it, so any
+/// count above zero means an empty frame travelled the whole IPC pipeline.
+async fn handle_assert_no_empty_output(
+    session_id: SessionId,
+    state: &SharedState,
+) -> DaemonResponse {
+    let guard = state.lock().await;
+    let Some(session) = guard.sessions.get(&session_id) else {
+        return DaemonResponse::Error { message: format!("unknown session: {session_id}") };
+    };
+
+    match session.empty_output_frames {
+        0 => DaemonResponse::Ok,
+        count => DaemonResponse::AssertFailed {
+            message: format!("received {count} empty PtyOutput frame(s) for session {session_id}"),
+        },
+    }
 }
 
 /// Assert that the cursor is at the expected position.

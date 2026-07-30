@@ -8839,10 +8839,21 @@ async fn read_pty_bytes(
     }
 }
 
-/// Send raw PTY output to the client (fast path). No-op when detached.
-/// `commit` is the [`TermCommit`] value this chunk reaches once the Term has
-/// consumed it.
+/// Send raw PTY output to the client (fast path). No-op when detached, and a
+/// no-op for an empty chunk. `commit` is the [`TermCommit`] value this chunk
+/// reaches once the Term has consumed it.
+///
+/// [`apply_pty_filters`] can consume a whole read — a chunk that is exactly
+/// `\x1b[3J`, or one held entirely in a filter's partial-match state — and a
+/// zero-byte frame would still be allocated, serialized, queued, coalesced,
+/// and parsed by every attached client for no visible effect. Dropping it here
+/// covers every producer, and costs the client nothing: an empty chunk leaves
+/// the commit cursor where it was, so the companion `ScrollBottom` and
+/// `TrimScrollback` frames still carry the cursor value the attach path needs.
 fn send_pty_output(client_writer: &ClientWriter, session_id: SessionId, bytes: &[u8], commit: u64) {
+    if bytes.is_empty() {
+        return;
+    }
     let msg = ServerMessage::PtyOutput { session_id, data: bytes.to_vec() };
     send_to_client(client_writer, Some(commit), &msg);
 }
@@ -10646,6 +10657,33 @@ mod tests {
         assert!(
             matches!(&first, ServerMessage::PtyOutput { data, .. } if data == b"live"),
             "the shed backlog must not reach the wire, got {first:?}"
+        );
+    }
+
+    /// A filter that swallows a whole chunk must not put a zero-byte
+    /// `PtyOutput` on the wire. The companion frame proves the drop happened at
+    /// the framing step rather than somewhere the queue would have hidden it.
+    #[tokio::test]
+    async fn empty_pty_chunk_is_never_framed() {
+        let session_id = SessionId::new();
+        let (server, client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let writer = test_shared_writer(server_write);
+        let queue = writer.lock().await.queue();
+
+        let mut sinks = AttachedSinks::default();
+        sinks.begin_attach(&writer, queue, false);
+        sinks.finish_attach(&writer, 0, session_id);
+        let client_writer: ClientWriter = Arc::new(std::sync::Mutex::new(sinks));
+
+        send_pty_output(&client_writer, session_id, b"", 10);
+        send_to_client(&client_writer, Some(10), &ServerMessage::ScrollBottom { session_id });
+
+        let first = read_message::<ServerMessage, _>(&mut client_read).await.unwrap();
+        assert!(
+            matches!(first, ServerMessage::ScrollBottom { .. }),
+            "an empty chunk must not be framed at all, got {first:?}"
         );
     }
 
