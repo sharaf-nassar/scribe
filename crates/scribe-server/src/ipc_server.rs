@@ -7144,10 +7144,16 @@ async fn apply_grid_to_window_sessions(
         let Some((term, resize_fd, cell_width, cell_height)) = handles else {
             continue;
         };
-        resize_term(&term, cols, rows).await;
+        let reflowed = resize_term(&term, cols, rows).await;
         let size = TerminalSize { cols, rows, cell_width, cell_height };
         if let Err(e) = set_pty_winsize(resize_fd.as_ref(), size) {
             warn!(%session_id, "authoritative-grid TIOCSWINSZ failed: {e}");
+        }
+        // The recompute is debounced, so this apply lands well after the
+        // participants' own `RequestSnapshot`s were answered at the pre-reflow
+        // grid; without a push they would render that stale grid forever.
+        if reflowed {
+            broadcast_post_resize_snapshot(session_id, &server.live_sessions).await;
         }
     }
 }
@@ -7187,7 +7193,11 @@ async fn handle_resize(
     };
 
     match admission {
-        ResizeAdmission::ApplyNow => apply_session_resize(session_id, size, live_sessions).await,
+        ResizeAdmission::ApplyNow => {
+            // No push: the client pairs every `Resize` with a `RequestSnapshot`,
+            // and this apply completes before that request is dispatched.
+            apply_session_resize(session_id, size, live_sessions).await;
+        }
         ResizeAdmission::Coalesced => {}
         ResizeAdmission::Arm(delay) => {
             let live_sessions = Arc::clone(live_sessions);
@@ -7211,32 +7221,88 @@ async fn apply_trailing_resize(session_id: SessionId, live_sessions: &LiveSessio
         session.resize_pacer.take_pending(std::time::Instant::now())
     };
     let Some(size) = pending else { return };
-    apply_session_resize(session_id, size, live_sessions).await;
+    // A trailing apply is by definition deferred: the client's `RequestSnapshot`
+    // for this report was answered back when the pacer was still holding it, at
+    // the pre-reflow grid. Hand the repaint back now that the grid is real.
+    if apply_session_resize(session_id, size, live_sessions).await {
+        broadcast_post_resize_snapshot(session_id, live_sessions).await;
+    }
 }
 
 /// Drive one session's `Term` reflow and `TIOCSWINSZ` at `size` — the work both
-/// the leading and the trailing apply do.
+/// the leading and the trailing apply do. Returns whether the reflow actually
+/// moved the grid, which is what tells a deferred caller it owes a repaint.
 async fn apply_session_resize(
     session_id: SessionId,
     size: TerminalSize,
     live_sessions: &LiveSessionRegistry,
-) {
+) -> bool {
     let (term, resize_fd) = {
         let sessions = live_sessions.read().await;
         let Some(session) = sessions.get(&session_id) else {
             warn!(%session_id, "Resize for unknown session");
-            return;
+            return false;
         };
         (Arc::clone(&session.term), Arc::clone(&session.resize_fd))
     };
 
     // Resize the Term state (lock + drop before any await).
-    resize_term(&term, size.cols, size.rows).await;
+    let reflowed = resize_term(&term, size.cols, size.rows).await;
 
     // Signal the PTY with TIOCSWINSZ.
     if let Err(e) = set_pty_winsize(resize_fd.as_ref(), size) {
         warn!(%session_id, "TIOCSWINSZ failed: {e}");
     }
+    reflowed
+}
+
+/// Push the grid a deferred resize just applied to every sink attached to
+/// `session_id`.
+///
+/// A client asks for the authoritative screen at the moment it reports a new
+/// pane size, but a deferred apply — the [`ResizePacer`]'s trailing edge, or the
+/// shared-window authoritative-grid debounce — reflows the `Term` long after
+/// that request was answered. The reply the client already has therefore
+/// describes a grid the server has abandoned, and since the client only asks
+/// again on its *own* next size change, a drag that ends leaves the pane
+/// permanently rendering stale geometry. Pushing the post-apply screen is what
+/// closes that window.
+///
+/// Leading applies deliberately push nothing: they land ahead of the
+/// `RequestSnapshot` that the same report carries, so that reply is already at
+/// matching geometry and a push would only duplicate it.
+async fn broadcast_post_resize_snapshot(
+    session_id: SessionId,
+    live_sessions: &LiveSessionRegistry,
+) {
+    let handles = {
+        let sessions = live_sessions.read().await;
+        sessions.get(&session_id).map(|session| {
+            (
+                Arc::clone(&session.term),
+                Arc::clone(&session.term_commit),
+                Arc::clone(&session.client_writer),
+            )
+        })
+    };
+    let Some((term, term_commit, client_writer)) = handles else { return };
+    if lock_sinks(&client_writer).is_empty() {
+        return;
+    }
+
+    // Cursor read under the `Term` lock alongside the snapshot, so a sink still
+    // awaiting its attach replay can tell whether that replay already carries
+    // this reflow.
+    let (snapshot, commit) = {
+        let term = term.lock().await;
+        (snapshot_term(&term), term_commit.get())
+    };
+    debug!(%session_id, cols = snapshot.cols, rows = snapshot.rows, "pushed post-resize snapshot");
+    send_to_client(
+        &client_writer,
+        Some(commit),
+        &ServerMessage::ScreenSnapshot { session_id, snapshot },
+    );
 }
 
 async fn handle_search_request(
@@ -7413,16 +7479,24 @@ impl alacritty_terminal::grid::Dimensions for ResizeDimensions {
     }
 }
 
-/// Lock the `Term` and apply the new dimensions.
+/// Lock the `Term` and apply the new dimensions, reporting whether the grid
+/// actually moved.
+///
+/// The deferred apply paths use that answer to decide whether they owe attached
+/// clients a repaint: a reflow that changed nothing leaves every client's own
+/// `RequestSnapshot` answer still correct, so re-pushing the screen would be a
+/// redundant full repaint (scribe-k9o).
 pub async fn resize_term(
     term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     cols: u16,
     rows: u16,
-) {
+) -> bool {
+    // Guard dropped at the end of the body — before any subsequent .await.
     let mut term_guard = term.lock().await;
+    let before = (term_guard.columns(), term_guard.screen_lines());
     let size = ResizeDimensions { cols: usize::from(cols), lines: usize::from(rows) };
     term_guard.resize(size);
-    // Guard dropped here — before any subsequent .await.
+    before != (term_guard.columns(), term_guard.screen_lines())
 }
 
 /// Set PTY window size via `TIOCSWINSZ` ioctl.
@@ -10912,6 +10986,135 @@ mod tests {
         assert!(
             matches!(first, ServerMessage::ScrollBottom { .. }),
             "an empty chunk must not be framed at all, got {first:?}"
+        );
+    }
+
+    /// Stand up one live session over a real PTY pair, with `writer`'s sink as
+    /// its sole attached client.
+    ///
+    /// The handoff-restore path is the only way to reach a `LiveSession` without
+    /// forking a child: it takes the master fd we opened here and wires the same
+    /// registry entry `start_session` builds for a spawned shell. The returned
+    /// slave fds must outlive the test — dropping one EOFs the reader task,
+    /// which unwires the session.
+    async fn live_session_with_sink(
+        cols: u16,
+        rows: u16,
+        writer: &SharedWriter,
+    ) -> (SessionId, LiveSessionRegistry, Vec<std::os::fd::OwnedFd>) {
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let session_id = SessionId::new();
+        let state = crate::handoff::HandoffState {
+            version: 5,
+            sessions: vec![crate::handoff::HandoffSession {
+                session_id,
+                workspace_id: WorkspaceId::new(),
+                child_pid: std::process::id(),
+                child_identity: None,
+                cols,
+                rows,
+                cell_width: 1,
+                cell_height: 1,
+                snapshot: None,
+                session_replay: None,
+                title: None,
+                shell_name: String::from("bash"),
+                task_label: None,
+                codex_task_label: None,
+                cwd: None,
+                context: None,
+                ai_state: None,
+                ai_provider_hint: None,
+            }],
+            workspaces: vec![],
+            workspace_tree: None,
+            windows: vec![],
+        };
+
+        let manager = SessionManager::restore_from_handoff(&state, vec![pty.master], 100).unwrap();
+        let workspaces = Arc::new(RwLock::new(WorkspaceManager::new(vec![])));
+        let live_sessions = new_live_session_registry();
+        let shares = new_window_shares();
+        activate_pending_sessions(&manager, &workspaces, &live_sessions, &shares).await;
+
+        for _ in 0..100 {
+            if live_sessions.read().await.contains_key(&session_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let queue = writer.lock().await.queue();
+        {
+            let sessions = live_sessions.read().await;
+            let session = sessions.get(&session_id).expect("session reached the live registry");
+            lock_sinks(&session.client_writer).set_sole(Arc::clone(writer), queue);
+        }
+        (session_id, live_sessions, vec![pty.slave])
+    }
+
+    /// The grid a frame repaints the pane at, or `None` for any other frame.
+    fn repainted_grid(msg: &ServerMessage) -> Option<(u16, u16)> {
+        match msg {
+            ServerMessage::ScreenSnapshot { snapshot, .. } => Some((snapshot.cols, snapshot.rows)),
+            _ => None,
+        }
+    }
+
+    /// Read frames off `client_read` until one of them repaints the pane,
+    /// returning the grid it repaints at. `None` once the socket is done.
+    async fn next_repainted_grid<R>(client_read: &mut R) -> Option<(u16, u16)>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        loop {
+            let msg = read_message::<ServerMessage, _>(client_read).await.ok()?;
+            if let Some(grid) = repainted_grid(&msg) {
+                return Some(grid);
+            }
+        }
+    }
+
+    /// [`next_repainted_grid`] under a deadline, so a server that pushes nothing
+    /// fails the assertion instead of hanging the suite.
+    async fn await_screen_snapshot<R>(client_read: &mut R) -> Option<(u16, u16)>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let deadline = std::time::Duration::from_secs(3);
+        tokio::time::timeout(deadline, next_repainted_grid(client_read)).await.unwrap_or(None)
+    }
+
+    /// A drag's reports collapse into a leading apply plus a trailing one, and
+    /// the client asks for the authoritative screen only when *it* changes size
+    /// — so the trailing apply is the last thing that touches the grid and
+    /// nobody asks about it afterwards. The server therefore owes the attached
+    /// client a `ScreenSnapshot` at the size the drag stopped on; without it the
+    /// pane renders the pre-reflow grid until the next drag.
+    // @lat: [[server#Sessions#Terminal Resize]]
+    #[tokio::test]
+    async fn a_coalesced_resize_burst_pushes_a_snapshot_at_the_size_it_settled_on() {
+        let (server_sock, client_sock) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server_sock);
+        let (mut client_read, _client_write) = tokio::io::split(client_sock);
+        let writer = test_shared_writer(server_write);
+
+        let (session_id, live_sessions, _slaves) = live_session_with_sink(120, 30, &writer).await;
+        let attached: AttachedSessionIds =
+            Arc::new(Mutex::new(std::iter::once(session_id).collect()));
+
+        let report = |cols: u16| TerminalSize { cols, rows: 30, cell_width: 8, cell_height: 16 };
+        // Leading apply, then two reports the pacer holds: only the newest of
+        // them matures, as the size the drag stopped on.
+        handle_resize(session_id, report(100), &live_sessions, &attached).await;
+        handle_resize(session_id, report(90), &live_sessions, &attached).await;
+        handle_resize(session_id, report(80), &live_sessions, &attached).await;
+
+        let grid = await_screen_snapshot(&mut client_read).await;
+        assert_eq!(
+            grid,
+            Some((80, 30)),
+            "the trailing apply must hand the client the grid it landed on"
         );
     }
 
