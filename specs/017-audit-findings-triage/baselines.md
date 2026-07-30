@@ -621,6 +621,53 @@ figure is the median of two full passes of 3 differenced pairs each; the
 recorded values respectively, so the ~1.1 ms repair cost is well outside
 the noise.
 
+#### After side: nu rows with the integration loading (bead `scribe-i79.49`)
+
+Measured on 2026-07-29 from the bead's worktree with the same rig,
+methodology, and 60-variable environment as the before side, under the
+`.worktrees/.measure-lock` mutex. The before-side nu row was nushell's
+own prompt (D1); these are the first numbers that include Scribe's
+script. Prompt cycles counted from Scribe's own OSC 133;D for the three
+integration variants and nushell's OSC 133;C for the bare-shell floor.
+
+| shell | enabled ms | disabled ms | spawns | execs | OSC-only ms | no-integration ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| nu 0.114.1 (before, D1) | 0.99 | 1.01 | 0 | 0 | 0.90 | 0.94 |
+| nu 0.114.1 (loading) | 14.30 | 13.65 | 4 | 2 | 6.23 | 0.91 |
+
+Per-pass spread was 13.7-14.7 ms enabled and 6.1-6.3 ms OSC-only; the
+syscall counts reproduced exactly across the 40- and 200-prompt runs.
+The `enabled`/`disabled` columns stay equal for the same reason as every
+other shell — there is no shell-visible persistence gate (#33, #34).
+
+The 4 spawns and 2 execs are **two `hostname` externals per prompt**, not
+the hook helper: `__scribe-pre-prompt` calls `__scribe-host-name` once
+for the OSC 7 authority and `__scribe-emit-context` calls it again for
+the 1337 `ScribeContext` payload, and nu adds an output-pump thread per
+external (`clone` counts threads). A logging shim on `PATH` confirms the
+helper is invoked once for the baseline plus once per *changed* env
+snapshot — 3 invocations over a 20-prompt loop, not 20 — so the 8.1 ms
+between `OSC-only` and `enabled` is the pure in-process snapshot and
+O(N^2) diff that #35 / `scribe-i79.18` targets, and the 5.3 ms between
+`no-integration` and `OSC-only` is the two `hostname` forks plus the OSC
+writes.
+
+Session startup rises from **23 ms / 1 spawn** to **64 ms** (OSC-only
+30 ms, bare shell 23.6 ms) — that delta is the one-shot
+`--baseline-ready` emit, which nu now actually reaches. Its
+`--added-json=` literal is **4,331 argv bytes** for the 60-variable
+environment (bash 4,953, zsh 4,909, fish 4,384, pwsh 5,942), and the two
+follow-up deltas are 94 and 91 bytes.
+
+Socket connections on `SCRIBE_HOOK_SOCK` are still **0** as shipped,
+because D3 below is unfixed and the real helper rejects
+`--event=env-delta` at clap parse. Re-running the same session with a
+`PATH` shim that rewrites the token to `--event=env_delta` yields
+**3 connections** — one `baseline_ready=true` frame carrying 98 variables
+and two per-prompt deltas — which is what proves `__scribe-emit-env-baseline`
+is reached. Expect the as-shipped count to become 1-per-session-start
+once `scribe-i79.51` lands.
+
 ### Result: session startup cost
 
 Time from spawn to first prompt, and process creations over the same
@@ -675,6 +722,15 @@ Wave 1 acceptance criterion unverifiable as written.
   that exposes a second: `(char esc)` at line 115 is no longer a known
   character name. Reproduce with a plain interactive `nu` under
   `XDG_DATA_DIRS=<scripts>:...` and `TERM_PROGRAM=Scribe`.
+  *Fixed by `scribe-i79.49`*, which also had to repair three more nu
+  0.114 incompatibilities the first two were masking: `into string` maps
+  over a list element-wise rather than joining it, so every snapshot
+  aborted on `PATH`; the JSON escaper emitted raw ESC (from the OSC
+  sequences the script appends to `PROMPT_INDICATOR`), so the server
+  rejected the whole baseline payload; and the four top-level `return`
+  guards raise *"Return used outside of custom command or closure"*,
+  which printed a red error block at startup for every nu user running
+  outside Scribe. See the after-side numbers above.
 - **D2 — `scribe.ps1` throws on every prompt.** `__Scribe-EmitContext`
   assigns `$host = __Scribe-HostName`, and `$host` is a read-only
   PowerShell automatic variable: *"Cannot overwrite variable Host because

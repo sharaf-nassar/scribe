@@ -1,18 +1,26 @@
 # Scribe shell integration — Nushell
 
-if (($env.TERM_PROGRAM? | default '') != 'Scribe') {
-    return
-}
-if (($env.SCRIBE_SHELL_INTEGRATION? | default '1') == '0') {
-    return
-}
-if ($env._SCRIBE_INTEGRATION_SOURCED? | default false) {
-    return
-}
-$env._SCRIBE_INTEGRATION_SOURCED = true
+# This file is evaluated as a script from nushell's vendor autoload
+# directory, and `return` is only legal inside a custom command or a
+# closure — a bare top-level `return` aborts with "Return used outside
+# of custom command or closure" every time a guard trips, which is
+# exactly the common case (nu started outside Scribe). Gate once here
+# and skip the side effects instead; the `def`s below are inert.
+let scribe_active = (
+    (($env.TERM_PROGRAM? | default '') == 'Scribe')
+    and (($env.SCRIBE_SHELL_INTEGRATION? | default '1') != '0')
+    and (not ($env._SCRIBE_INTEGRATION_SOURCED? | default false))
+)
 
+if $scribe_active {
+    $env._SCRIBE_INTEGRATION_SOURCED = true
+}
+
+# `char esc` was dropped from nushell's character table, and `$'...'`
+# interpolation does not process backslash escapes — the ST terminator
+# has to come from a `$"..."` string so `\\` collapses to one backslash.
 def __scribe-osc [payload: string] {
-    print -n $'((char esc))]($payload)((char esc))\\'
+    print -n $"\u{1b}]($payload)\u{1b}\\"
 }
 
 def __scribe-sanitize-context [value: string] {
@@ -23,7 +31,7 @@ def __scribe-sanitize-context [value: string] {
 }
 
 def __scribe-host-name [] {
-    (hostname | str trim | __scribe-sanitize-context)
+    (__scribe-sanitize-context (hostname | str trim))
 }
 
 def __scribe-emit-context [] {
@@ -46,7 +54,7 @@ def __scribe-emit-context [] {
     if (($env.TMUX? | default '') != '') {
         let tmux_session = (
             try {
-                tmux display-message -p '#S' | str trim | __scribe-sanitize-context
+                __scribe-sanitize-context (tmux display-message -p '#S' | str trim)
             } catch {
                 ''
             }
@@ -112,20 +120,22 @@ def __scribe-normalize-hooks [hooks] {
     }
 }
 
-let prompt_end = $'((char esc))]133;B((char esc))\\'
-$env.PROMPT_INDICATOR = $"(($env.PROMPT_INDICATOR? | default ''))($prompt_end)"
-$env.PROMPT_INDICATOR_VI_INSERT = $"(($env.PROMPT_INDICATOR_VI_INSERT? | default ''))($prompt_end)"
-$env.PROMPT_INDICATOR_VI_NORMAL = $"(($env.PROMPT_INDICATOR_VI_NORMAL? | default ''))($prompt_end)"
-$env.PROMPT_MULTILINE_INDICATOR = $"(($env.PROMPT_MULTILINE_INDICATOR? | default ''))($prompt_end)"
+if $scribe_active {
+    let prompt_end = "\u{1b}]133;B\u{1b}\\"
+    $env.PROMPT_INDICATOR = $"(($env.PROMPT_INDICATOR? | default ''))($prompt_end)"
+    $env.PROMPT_INDICATOR_VI_INSERT = $"(($env.PROMPT_INDICATOR_VI_INSERT? | default ''))($prompt_end)"
+    $env.PROMPT_INDICATOR_VI_NORMAL = $"(($env.PROMPT_INDICATOR_VI_NORMAL? | default ''))($prompt_end)"
+    $env.PROMPT_MULTILINE_INDICATOR = $"(($env.PROMPT_MULTILINE_INDICATOR? | default ''))($prompt_end)"
 
-let pre_prompt_hooks = (__scribe-normalize-hooks ($env.config.hooks.pre_prompt? | default null))
-let pre_execution_hooks = (__scribe-normalize-hooks ($env.config.hooks.pre_execution? | default null))
+    let pre_prompt_hooks = (__scribe-normalize-hooks ($env.config.hooks.pre_prompt? | default null))
+    let pre_execution_hooks = (__scribe-normalize-hooks ($env.config.hooks.pre_execution? | default null))
 
-$env.config = (
-    $env.config
-    | upsert hooks.pre_prompt ($pre_prompt_hooks | append {|| __scribe-pre-prompt })
-    | upsert hooks.pre_execution ($pre_execution_hooks | append {|| __scribe-pre-exec })
-)
+    $env.config = (
+        $env.config
+        | upsert hooks.pre_prompt ($pre_prompt_hooks | append {|| __scribe-pre-prompt })
+        | upsert hooks.pre_execution ($pre_execution_hooks | append {|| __scribe-pre-exec })
+    )
+}
 
 # ── Env-delta capture (feature 006) ──────────────────────────────
 # Three additions, in this order, per spec contract:
@@ -141,14 +151,50 @@ $env.config = (
 # JSON-escape a single string. Returns the escaped form without
 # surrounding quotes.
 def __scribe-json-escape [value: string] {
-    $value
-    | str replace --all '\' '\\'
-    | str replace --all '"' '\"'
-    | str replace --all (char bs) '\b'
-    | str replace --all (char ff) '\f'
-    | str replace --all (char nl) '\n'
-    | str replace --all (char cr) '\r'
-    | str replace --all (char tab) '\t'
+    let short = (
+        $value
+        | str replace --all '\' '\\'
+        | str replace --all '"' '\"'
+        | str replace --all "\u{08}" '\b'
+        | str replace --all "\u{0c}" '\f'
+        | str replace --all (char nl) '\n'
+        | str replace --all (char cr) '\r'
+        | str replace --all (char tab) '\t'
+    )
+    # JSON forbids raw C0 controls, and the ones without a short escape
+    # do occur here — Scribe appends OSC sequences to `PROMPT_INDICATOR`
+    # above, so the baseline snapshot carries ESC. One malformed value
+    # would make the server reject the whole payload, so spell the
+    # remainder as `\u00XX`. Guarded because the scan is per character.
+    if ($short =~ '[\x00-\x1f]') {
+        $short
+        | split chars
+        | each {|ch|
+            if ($ch =~ '[\x00-\x1f]') {
+                $"\\u00($ch | into binary | encode hex)"
+            } else {
+                $ch
+            }
+        }
+        | str join ''
+    } else {
+        $short
+    }
+}
+
+# Render one env value the way a child process sees it. Nushell hands
+# back lists for path-shaped vars (PATH, and anything in
+# `ENV_CONVERSIONS`); `into string` maps over a list element-wise rather
+# than joining, so join explicitly with the platform separator.
+def __scribe-env-string [value] {
+    let kind = ($value | describe)
+    if $kind == 'string' {
+        $value
+    } else if ($kind | str starts-with 'list') {
+        ($value | each {|item| $item | into string } | str join (char esep))
+    } else {
+        (try { $value | into string } catch { '' })
+    }
 }
 
 # Build a JSON object literal `{"NAME":"value",...}` from a record.
@@ -157,12 +203,7 @@ def __scribe-build-object [rec: record] {
         $rec
         | columns
         | each {|name|
-            let value = ($rec | get $name)
-            let val_str = (if (($value | describe) == 'string') {
-                $value
-            } else {
-                ($value | into string)
-            })
+            let val_str = (__scribe-env-string ($rec | get $name))
             $'"(__scribe-json-escape $name)":"(__scribe-json-escape $val_str)"'
         }
     )
@@ -180,8 +221,8 @@ def __scribe-build-array [names: list<string>] {
 # Snapshot the current $env as a record of strings. Skips scribe-
 # internal markers and the nushell-internal `config` record (which is
 # not an exported env var). `PATH` is represented as a list in
-# nushell — `into string` produces the joined form, which matches
-# what other processes see on POSIX inheritance.
+# nushell; `__scribe-env-string` joins it back into the form other
+# processes see on POSIX inheritance.
 def __scribe-snapshot-env [] {
     let names = ($env | columns)
     $names
@@ -189,11 +230,9 @@ def __scribe-snapshot-env [] {
         if (($name | str starts-with '_SCRIBE_') or ($name | str starts-with '__scribe_') or ($name == 'config') or ($name == 'ENV_CONVERSIONS') or ($name == '__SCRIBE_ENV_LAST')) {
             $acc
         } else {
-            let value = ($env | get $name)
-            # Nushell may surface env vars as records or lists (when
-            # `ENV_CONVERSIONS` is configured, e.g. PATH → list). Best-
-            # effort string conversion; on any failure, treat as empty.
-            let val_str = (try { $value | into string } catch { '' })
+            # Best-effort string conversion; on any failure, treat as
+            # empty rather than aborting the whole snapshot.
+            let val_str = (try { __scribe-env-string ($env | get $name) } catch { '' })
             $acc | upsert $name $val_str
         }
     }
@@ -240,7 +279,7 @@ def --env __scribe-apply-restore [path: string] {
     }
 }
 
-if ('SCRIBE_RESTORE_ENV_DELTA_FILE' in $env) {
+if $scribe_active and ('SCRIBE_RESTORE_ENV_DELTA_FILE' in $env) {
     let restore_path = $env.SCRIBE_RESTORE_ENV_DELTA_FILE
     if ($restore_path | path exists) {
         try { __scribe-apply-restore $restore_path } catch { }
@@ -250,7 +289,9 @@ if ('SCRIBE_RESTORE_ENV_DELTA_FILE' in $env) {
 }
 
 # Per-session "last emitted" snapshot, stored as a global record.
-$env.__SCRIBE_ENV_LAST = (__scribe-snapshot-env)
+if $scribe_active {
+    $env.__SCRIBE_ENV_LAST = (__scribe-snapshot-env)
+}
 
 # Per-prompt delta hook. Diffs the current $env against the cached
 # snapshot, emits via the resolved hook helper only on non-empty change.
@@ -300,10 +341,12 @@ def --env __scribe-emit-env-baseline [] {
     } catch { }
 }
 
-__scribe-emit-env-baseline
+if $scribe_active {
+    __scribe-emit-env-baseline
 
-let env_delta_hooks = (__scribe-normalize-hooks ($env.config.hooks.pre_prompt? | default null))
-$env.config = (
-    $env.config
-    | upsert hooks.pre_prompt ($env_delta_hooks | append {|| __scribe-emit-env-delta })
-)
+    let env_delta_hooks = (__scribe-normalize-hooks ($env.config.hooks.pre_prompt? | default null))
+    $env.config = (
+        $env.config
+        | upsert hooks.pre_prompt ($env_delta_hooks | append {|| __scribe-emit-env-delta })
+    )
+}
