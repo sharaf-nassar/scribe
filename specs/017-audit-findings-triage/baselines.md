@@ -1026,6 +1026,58 @@ overflow re-coalescing round trip), and the pre-existing
 `backlog_past_threshold_drains_to_latest_frame` pair, which the wire-in now
 actually exercises in production instead of leaving as dead code.
 
+### After side: skip invisible intermediate-frame rebuilds (US3-3)
+
+Checked on 2026-07-30 at worktree base `ad36bd1` (bead `scribe-i79.6`), the
+remaining half of the US3-3 row above. Advancing a committed frame and
+publishing the snapshot a redraw paints are now two steps on `OutputTarget`:
+`DisplayOnlyTerminal::advance_output` parses into the grid and only marks the
+snapshot stale, and `publish_content` rebuilds it once per drain pass. Frames
+the pacer drains through are therefore still parsed — they are what the grid is
+made of — but build no `Content` of their own under the pane lock.
+
+**Rebuilds per pass.** The count is exact and profile-independent, so it is
+derived from the frames/batch column recorded above rather than re-measured:
+
+| Workload | Frames per drain pass | `make_content` before | after |
+|---|---|---|---|
+| `yes`, 15 s | 1.00 | 1.00 | 1.00 — unchanged, nothing to skip |
+| `cat` of 64 MiB | 1.03 | 1.03 | 1.00 |
+| 4 000 `CSI ?2026` frames | 91.0 | 91.0 | **1.00** |
+| `SessionReplay` / `ScreenSnapshot` rebuild | n queued + 1 | n + 1 | **1.00** |
+
+`yes` is the acceptance workload and it is deliberately flat here: pacing
+already left it holding exactly one frame per pass, so the only rebuild it ever
+paid for is the one that paints. The synchronized-frame row is where the 87
+-committed-frames-per-redraw number came from, and it is the row this item
+collapses — 91 snapshot builds per batch become 1.
+
+**Cost of the rebuilds removed.** Measured headlessly in a debug build (the
+profile `just build` produces; Scribe's own code is unoptimized there) by
+draining a 4 000-frame backlog of one-line `CSI ?2026` commits into a real
+`DisplayOnlyTerminal`, against the same backlog fed one publish per frame:
+
+| Grid | Whole pass, publish per frame | Whole pass, publish once | Snapshot share |
+|---|---|---|---|
+| 80×24 | 365 ms | 23.4 ms | 92.7 % |
+| 200×50 | 1 975 ms | 23.9 ms | **98.8 %** |
+
+The parse is the 23-24 ms that survives in both columns; everything above it was
+snapshot construction for screens no redraw could show, and it scales with cell
+count (a 200×50 pane is 10 000 cells per rebuild, ~456 µs each here). The
+measurement harness was a throwaway test in the worktree and is not committed;
+the behaviour it demonstrated is pinned by
+`frames_the_pacer_skips_rebuild_no_content` (six drained-through frames, one
+publish; a caught-up pane, one publish per burst; an empty queue, none),
+`advancing_frames_holds_the_snapshot_until_published` (the real terminal keeps
+the published `Arc<Content>` across advances and catches up in one publish), and
+the extended `a_rebuild_is_applied_as_its_own_burst` (a rebuild boundary
+publishes once for the queue it clears plus the bytes that replace it).
+
+**Not re-run on the Xvfb rig,** for the reason the pacing entry gives: the rig
+reported `frames=1` throughout because bare Xvfb never enters a repaint cycle,
+so its drain-side counters cannot observe snapshot cost end to end.
+
 ## Per-prompt shell hook cost
 
 Wall time and process creations charged to one no-op prompt cycle by

@@ -2,7 +2,7 @@
 //! reconnect paths onto the display-only GPUI terminal.
 //!
 //! Six frozen-protocol server messages drive a pane's lifecycle after attach:
-//! `SessionReplay` (zstd-decompress the reattach ANSI, then `feed_output`),
+//! `SessionReplay` (zstd-decompress the reattach ANSI, then present it),
 //! `ScreenSnapshot` (reset the terminal, then replay the `snapshot_to_ansi`
 //! output), `TrimScrollback` (shift stored absolute prompt marks to track the
 //! dropped scrollback rows), `PromptMark` (fold one OSC 133 mark into the
@@ -50,7 +50,7 @@ impl std::fmt::Display for ReplayDecodeError {
     }
 }
 
-/// Decompress a `SessionReplay` into the ANSI byte stream fed to `feed_output`.
+/// Decompress a `SessionReplay` into the ANSI byte stream fed to the pane.
 ///
 /// Zero-dimension replays are rejected up front (the legacy client skips them),
 /// and a corrupt zstd stream is reported as a [`ReplayDecodeError`] rather than
