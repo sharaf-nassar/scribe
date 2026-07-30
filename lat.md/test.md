@@ -686,11 +686,17 @@ With a backlog below ,  applies one committed burst then stops with  `HasMore`, 
 
 Once the queue depth exceeds the catch-up threshold, a single `drain_until_frame` replays every backlogged burst to the latest frame and reports `Drained`, so stale frames never pile up under a firehose.
 
+### Rebuilds the snapshot once per presented burst
+
+A backlog past the catch-up threshold reaches the target as six advanced frames and exactly one snapshot rebuild, so the frames the pacer drains through cost a parse and nothing else, while a caught-up pane still rebuilds once per presented burst.
+
+An empty queue does not reach the target at all, so a pacer tick on an idle pane publishes nothing.
+
 ### Applies a rebuild as its own burst
 
 A rebuild handed to [[crates/scribe-client/src/sync_frames.rs#present_rebuild]] behind a queued commit and a still-open `CSI ? 2026 h` reaches the target as a frame of its own, concatenated onto neither.
 
-The queued commit lands first and the half-open update is sealed and committed rather than dropped, which is the ordering a `SessionReplay` depends on: folded into a neighbouring commit it would be swallowed by a synchronized update the pane it replaces had opened.
+The queued commit lands first and the half-open update is sealed and committed rather than dropped, which is the ordering a `SessionReplay` depends on: folded into a neighbouring commit it would be swallowed by a synchronized update the pane it replaces had opened. The whole boundary publishes one snapshot: the frames it clears out of the way are replaced by the rebuild before anything paints.
 
 ### Flushes raw sync update on expiry
 
@@ -703,6 +709,12 @@ A committed frame that opens but never closes a synchronized update arms the VTE
 ### Split sync frame reaches terminal whole
 
 Driving a four-way-split synchronized frame through the queue into a real  renders the committed content, proving the queue never advances the VTE processor with a torn frame.
+
+### Advancing a frame defers the snapshot
+
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#advance_output]] moves the grid while every reader keeps the snapshot it already holds, so a frame the pacer skips builds no viewport of its own.
+
+[[crates/scribe-client/src/terminal.rs#DisplayOnlyTerminal#publish_content]] then catches the snapshot up to everything advanced since the last one, and a second publish rebuilds nothing — the deferral is a coalesced rebuild, never a dropped one.
 
 ## GPUI URL Detection
 

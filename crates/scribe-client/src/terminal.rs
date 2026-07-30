@@ -208,6 +208,11 @@ pub struct DisplayOnlyTerminal {
     /// Shared rather than owned so republishing the render projection after a
     /// parse is a refcount bump instead of a copy of every painted row.
     content: Arc<Content>,
+    /// Whether an advance changed grid state [`Self::content`] has not been
+    /// rebuilt for yet. Set by [`Self::advance_output`] and cleared by every
+    /// rebuild, so the pacer can drain through a backlog and pay for one
+    /// snapshot instead of one per frame.
+    content_stale: bool,
     /// Config + AI-provider gate for split-scroll, pushed in by the shell on
     /// every frame. The live half of the decision (scrolled up, normal screen)
     /// is read off the terminal itself in [`Self::active_pin_rows`].
@@ -232,6 +237,7 @@ impl DisplayOnlyTerminal {
             term,
             output_processor: vte::ansi::Processor::new(),
             content: Arc::default(),
+            content_stale: false,
             scrollback_lines,
             split_scroll: SplitScrollEligibility::default(),
             selection: SelectionState::new(),
@@ -242,16 +248,47 @@ impl DisplayOnlyTerminal {
 
     /// Advances one committed frame and reports whether it changed visible
     /// state and whether a synchronized update is still buffering in the
-    /// parser. The content snapshot is rebuilt only when the bytes were not
-    /// wholly absorbed by an open synchronized update, mirroring the winit
-    /// client's `Pane::feed_output`.
-    pub fn feed_output(&mut self, bytes: &[u8]) -> FeedOutputResult {
+    /// parser. Bytes wholly absorbed by an open synchronized update change
+    /// nothing visible, mirroring the winit client's `Pane::feed_output`.
+    ///
+    /// The content snapshot is deliberately *not* rebuilt here. The pacer
+    /// presents one committed burst per redraw and drains through everything
+    /// behind it, so every frame but the last of a pass is parsed and then
+    /// overwritten before anything paints; rebuilding each one would spend the
+    /// pane lock on screens no one ever sees. [`Self::publish_content`] does it
+    /// once, for the state the burst actually leaves behind.
+    pub fn advance_output(&mut self, bytes: &[u8]) -> FeedOutputResult {
         self.output_processor.advance(&mut self.term, bytes);
         let needs_redraw = self.output_processor.sync_bytes_count() < bytes.len();
-        if needs_redraw {
-            self.make_content();
-        }
+        self.content_stale |= needs_redraw;
         FeedOutputResult { needs_redraw, sync_pending: self.parser_sync_deadline().is_some() }
+    }
+
+    /// Rebuilds the content snapshot when advances left it stale, reporting
+    /// whether it rebuilt.
+    ///
+    /// Every drain path calls this before it returns, so a snapshot read off
+    /// the pane is never behind the grid: what the pacer skips is the rebuild
+    /// per intermediate frame, never the rebuild itself.
+    pub fn publish_content(&mut self) -> bool {
+        if !self.content_stale {
+            return false;
+        }
+        self.make_content();
+        true
+    }
+
+    /// Advances one committed frame and publishes the snapshot it produced.
+    ///
+    /// The unpaced pairing of [`Self::advance_output`] and
+    /// [`Self::publish_content`], for tests that drive the grid a frame at a
+    /// time and read it back; production output goes through the drain, which
+    /// publishes once per burst instead.
+    #[cfg(test)]
+    pub fn feed_output(&mut self, bytes: &[u8]) -> FeedOutputResult {
+        let result = self.advance_output(bytes);
+        self.publish_content();
+        result
     }
 
     /// Deadline of the parser-side synchronized update, if one is open.
@@ -668,6 +705,7 @@ impl DisplayOnlyTerminal {
         let vi_cursor = self.viewport_vi_cursor(top_rows, display_offset);
         let shell_cursor = self.viewport_shell_cursor(lines, columns, pin_rows);
         self.content = Arc::new(Content { rows, pin_rows, vi_cursor, shell_cursor });
+        self.content_stale = false;
     }
 
     /// Project the live shell cursor onto the viewport the snapshot just built.
@@ -745,8 +783,12 @@ fn grid_i32(value: usize) -> i32 {
 }
 
 impl OutputTarget for DisplayOnlyTerminal {
-    fn feed_output(&mut self, bytes: &[u8]) -> FeedOutputResult {
-        DisplayOnlyTerminal::feed_output(self, bytes)
+    fn advance_output(&mut self, bytes: &[u8]) -> FeedOutputResult {
+        DisplayOnlyTerminal::advance_output(self, bytes)
+    }
+
+    fn publish_content(&mut self) {
+        DisplayOnlyTerminal::publish_content(self);
     }
 }
 
@@ -1196,6 +1238,27 @@ mod tests {
         assert!(summary.needs_redraw);
         assert!(terminal.visible_text().starts_with("hello world"));
         assert!(terminal.parser_sync_deadline().is_none());
+    }
+
+    // @lat: [[test#GPUI Sync Frame Queue#Advancing a frame defers the snapshot]]
+    #[gpui::test]
+    fn advancing_frames_holds_the_snapshot_until_published() {
+        let mut terminal = DisplayOnlyTerminal::new(20, 4);
+        terminal.feed_output(b"first");
+        let published = terminal.content();
+
+        // Two frames the pacer would drain through on its way to the third:
+        // the grid takes them, the snapshot every reader holds does not move.
+        terminal.advance_output(b"\r\nsecond");
+        terminal.advance_output(b"\r\nthird");
+        assert!(Arc::ptr_eq(&published, &terminal.content()), "no rebuild for a skipped frame");
+        assert_eq!(published.row_text(1).trim_end(), "");
+
+        // Publishing once catches the snapshot up to everything advanced since
+        // the last one, and a second publish has nothing left to rebuild.
+        assert!(terminal.publish_content());
+        assert_eq!(terminal.content().row_text(2).trim_end(), "third");
+        assert!(!terminal.publish_content(), "a current snapshot is not rebuilt again");
     }
 
     // @lat: [[test#GPUI Terminal Viewport#A parse in flight blocks neither the registry nor a paint]]

@@ -4,12 +4,17 @@
 //! CSI `?2026` synchronized-update frames must be committed to the terminal as
 //! one burst per redraw so a single logical frame never tears across IPC
 //! message boundaries. This module sits in front of
-//! [`crate::terminal::DisplayOnlyTerminal`]'s `feed_output`: coalesced server
-//! bytes are split into committed raw frames by [`SyncUpdateFrameSplitter`],
-//! queued per pane, then replayed one committed burst per redraw by
+//! [`crate::terminal::DisplayOnlyTerminal`]'s parser: coalesced server bytes are
+//! split into committed raw frames by [`SyncUpdateFrameSplitter`], queued per
+//! pane, then replayed one committed burst per redraw by
 //! [`present_next_burst`]. A 150 ms expiry timer flushes an update whose
 //! terminating `CSI ? 2026 l` never arrives, and a catch-up threshold drains
 //! through a backlog so stale frames do not pile up indefinitely.
+//!
+//! Advancing a frame and publishing the snapshot a redraw paints are separate
+//! steps on [`OutputTarget`] for that reason: a drain pass presents one burst
+//! however many frames it had to parse to get there, so the snapshot is
+//! rebuilt once per pass rather than once per frame the pacer skips.
 //!
 //! A whole-pane rebuild — a decoded `SessionReplay`, or the RIS-prefixed ANSI of
 //! a `ScreenSnapshot` — is not output in this sense: it replaces the pane rather
@@ -51,7 +56,16 @@ pub struct FeedOutputResult {
 pub trait OutputTarget {
     /// Advances the target with one committed frame and reports whether it
     /// changed visible state and whether a sync update is still open.
-    fn feed_output(&mut self, bytes: &[u8]) -> FeedOutputResult;
+    ///
+    /// Advancing deliberately leaves the target's visible snapshot behind the
+    /// state it just parsed: a pass that drains through a backlog overwrites
+    /// every frame but its last one before anything paints, so the snapshot is
+    /// rebuilt once, by [`Self::publish_content`], rather than per frame.
+    fn advance_output(&mut self, bytes: &[u8]) -> FeedOutputResult;
+
+    /// Rebuilds the visible snapshot for whatever has been advanced since the
+    /// last publish. A no-op when no advance changed visible state.
+    fn publish_content(&mut self);
 }
 
 /// Per-pane synchronized-output frame queue. Owns the streaming splitter that
@@ -178,25 +192,44 @@ pub struct DrainOutcome {
 /// crosses [`OUTPUT_FRAME_CATCH_UP_THRESHOLD`], it drains through older bursts
 /// so stale frames do not pile up. Returns `None` when the queue is empty.
 ///
+/// The snapshot is published once, for the state the whole pass leaves behind,
+/// because that is the only state a redraw can show: frames the pacer drains
+/// through are parsed for their effect on the grid, never for a screen of their
+/// own.
+///
 /// Ported from `crates/scribe-client/src/main.rs`
 /// `App::drain_pane_output_until_frame` + `App::apply_next_pane_output_frame`.
 pub fn drain_until_frame<T: OutputTarget>(
     queue: &mut SyncFrameQueue,
     target: &mut T,
 ) -> Option<DrainOutcome> {
+    let outcome = advance_until_burst(queue, target)?;
+    target.publish_content();
+    Some(outcome)
+}
+
+/// The frame-advancing half of [`drain_until_frame`], leaving the snapshot to
+/// the caller so a drain that is about to advance further does not publish a
+/// screen it is on its way to replacing.
+fn advance_until_burst<T: OutputTarget>(
+    queue: &mut SyncFrameQueue,
+    target: &mut T,
+) -> Option<DrainOutcome> {
     let mut sync_pending = false;
+    let mut needs_redraw = false;
     let catch_up_to_latest = queue.pending_output_frames.len() > OUTPUT_FRAME_CATCH_UP_THRESHOLD;
 
     loop {
         let bytes = queue.pending_output_frames.pop_front()?;
-        let feed = target.feed_output(&bytes);
+        let feed = target.advance_output(&bytes);
         let has_more = queue.has_frames();
         sync_pending |= feed.sync_pending;
+        needs_redraw |= feed.needs_redraw;
         let keep_draining = catch_up_to_latest && has_more;
 
         if !keep_draining && (feed.needs_redraw || !has_more) {
             return Some(DrainOutcome {
-                needs_redraw: feed.needs_redraw,
+                needs_redraw,
                 queue_state: QueueState::from_has_more(has_more),
                 sync_pending,
             });
@@ -225,7 +258,7 @@ pub fn present_next_burst<T: OutputTarget>(queue: &mut SyncFrameQueue, target: &
 /// A rebuild is a full state replacement, not an advance, so it is exempt from
 /// pacing on both sides. Everything the pane already had queued is committed
 /// first, in arrival order, because those bytes describe the screen the server
-/// snapshotted; the rebuild itself then reaches `feed_output` whole, bypassing
+/// snapshotted; the rebuild itself then reaches the parser whole, bypassing
 /// the splitter entirely, because it is one logical frame the server already
 /// assembled and re-splitting it could only tear it.
 #[must_use]
@@ -235,8 +268,10 @@ pub fn present_rebuild<T: OutputTarget>(
     bytes: &[u8],
 ) -> bool {
     queue.seal_frame_boundary();
-    let flushed = drain_all_committed(queue, target);
-    flushed.needs_redraw | target.feed_output(bytes).needs_redraw
+    let flushed = advance_all_committed(queue, target);
+    let rebuilt = target.advance_output(bytes).needs_redraw;
+    target.publish_content();
+    flushed.needs_redraw | rebuilt
 }
 
 /// Aggregate result of draining every queued committed frame.
@@ -249,21 +284,34 @@ pub struct DrainSummary {
 }
 
 /// Drains every queued committed frame into `target`, one committed burst per
-/// `feed_output`, so no `write_output` ever receives a torn sync frame. Ported
-/// from the drain loop in `App::flush_session_output_now`.
+/// `advance_output`, and publishes the snapshot they leave behind. Ported from
+/// the drain loop in `App::flush_session_output_now`.
 ///
 /// Deliberately *not* the pacing path: emptying the queue in one pass is what
-/// collapsed a run of committed frames into a single redraw. It survives for the
-/// one case that has to ignore pacing — clearing a pane ahead of a rebuild that
-/// is about to replace it ([`present_rebuild`]) — where holding frames back
-/// would only delay bytes the next `feed_output` overwrites anyway.
+/// collapsed a run of committed frames into a single redraw. It survives as the
+/// way tests assert what a queue hands its target across a whole backlog;
+/// production reaches the same advancing half through [`present_next_burst`],
+/// which paces, and [`present_rebuild`], which publishes only once the bytes
+/// that replace the pane have landed.
+#[cfg(test)]
 pub fn drain_all_committed<T: OutputTarget>(
+    queue: &mut SyncFrameQueue,
+    target: &mut T,
+) -> DrainSummary {
+    let summary = advance_all_committed(queue, target);
+    target.publish_content();
+    summary
+}
+
+/// The frame-advancing half of [`drain_all_committed`], for the caller that has
+/// its own bytes to advance before anything is worth publishing.
+fn advance_all_committed<T: OutputTarget>(
     queue: &mut SyncFrameQueue,
     target: &mut T,
 ) -> DrainSummary {
     let mut summary = DrainSummary::default();
     while queue.has_frames() {
-        let Some(outcome) = drain_until_frame(queue, target) else { break };
+        let Some(outcome) = advance_until_burst(queue, target) else { break };
         summary.needs_redraw |= outcome.needs_redraw;
         summary.sync_pending |= outcome.sync_pending;
     }
@@ -459,20 +507,34 @@ fn sync_match_len(bytes: &[u8]) -> usize {
 mod tests {
     use super::*;
 
-    /// Recording target: feeds and records exactly the byte frames handed to
-    /// `feed_output`, so tests can assert commit-boundary preservation without
-    /// a real VTE parser.
+    /// Recording target: records exactly the byte frames handed to
+    /// `advance_output`, plus how many of them each publish covered, so tests
+    /// can assert commit-boundary preservation and snapshot cost without a real
+    /// VTE parser.
     #[derive(Default)]
     struct Recorder {
         frames: Vec<Vec<u8>>,
+        /// Frames advanced since the last publish, standing in for the
+        /// terminal's stale-snapshot flag.
+        unpublished: usize,
+        /// One entry per snapshot rebuild: the number of frames it covered.
+        /// A publish with nothing pending rebuilds nothing and records nothing.
+        publishes: Vec<usize>,
     }
 
     impl OutputTarget for Recorder {
-        fn feed_output(&mut self, bytes: &[u8]) -> FeedOutputResult {
+        fn advance_output(&mut self, bytes: &[u8]) -> FeedOutputResult {
             self.frames.push(bytes.to_vec());
+            self.unpublished += 1;
             // A committed raw frame always carries visible content in these
             // tests, so every applied frame is redraw-worthy.
             FeedOutputResult { needs_redraw: !bytes.is_empty(), sync_pending: false }
+        }
+
+        fn publish_content(&mut self) {
+            if self.unpublished > 0 {
+                self.publishes.push(std::mem::take(&mut self.unpublished));
+            }
         }
     }
 
@@ -618,6 +680,36 @@ mod tests {
         assert!(!queue.has_frames());
     }
 
+    // @lat: [[test#GPUI Sync Frame Queue#Rebuilds the snapshot once per presented burst]]
+    #[gpui::test]
+    fn frames_the_pacer_skips_rebuild_no_content() {
+        let mut queue = SyncFrameQueue::default();
+        let mut target = Recorder::default();
+
+        // Six committed frames — past the catch-up threshold, so one pass
+        // drains through all of them and only the last is ever on screen.
+        for i in 0..6u8 {
+            queue.queue_output_frames(&[BSU, &[b'0' + i], ESU].concat());
+        }
+        let outcome = drain_until_frame(&mut queue, &mut target).expect("drained");
+
+        assert!(outcome.needs_redraw);
+        assert_eq!(target.frames.len(), 6, "every committed frame still reaches the parser");
+        assert_eq!(target.publishes, vec![6], "one snapshot for the whole pass");
+
+        // A caught-up pane is the other half: one burst per redraw is also one
+        // snapshot per redraw, so pacing never delays a screen it presented.
+        queue.queue_output_frames(&[BSU, b"a", ESU].concat());
+        queue.queue_output_frames(&[BSU, b"b", ESU].concat());
+        drain_until_frame(&mut queue, &mut target).expect("first burst");
+        drain_until_frame(&mut queue, &mut target).expect("second burst");
+        assert_eq!(target.publishes, vec![6, 1, 1]);
+
+        // An empty queue does not reach the target at all.
+        assert!(drain_until_frame(&mut queue, &mut target).is_none());
+        assert_eq!(target.publishes, vec![6, 1, 1]);
+    }
+
     // @lat: [[test#GPUI Sync Frame Queue#Applies a rebuild as its own burst]]
     #[gpui::test]
     fn a_rebuild_is_applied_as_its_own_burst() {
@@ -643,6 +735,9 @@ mod tests {
         );
         assert!(!queue.has_frames());
         assert!(queue.raw_sync_deadline().is_none(), "the sealed update owes no expiry");
+        // The boundary is one screen: the frames it clears out of the way are
+        // replaced by the rebuild before anything paints.
+        assert_eq!(target.publishes, vec![3], "one snapshot for the whole boundary");
     }
 
     // @lat: [[test#GPUI Sync Frame Queue#Flushes raw sync update on expiry]]
