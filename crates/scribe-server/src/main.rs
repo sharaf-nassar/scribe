@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -56,6 +57,15 @@ mod workspace_notes;
 #[cfg(test)]
 mod handoff_tests;
 
+/// How long process exit waits on outstanding blocking work before it
+/// abandons those threads and lets the process go.
+///
+/// Above [`pty_guard::TEARDOWN_KILL_GRACE`] so a session torn down moments
+/// before the signal still finishes its escalated reap inside the bound; this
+/// is the backstop for every other blocking call — keystore, `netdev`, the
+/// env-store writes — that could otherwise park exit indefinitely.
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Entry point. Calls `setup_env()` before spawning the tokio runtime so that
 /// `env::set_var("TERM", …)` runs while the process is still single-threaded.
 /// `env::set_var` is unsound in multi-threaded contexts (Rust 1.81+).
@@ -69,13 +79,22 @@ fn main() -> Result<(), ScribeError> {
 
     let upgrade_mode = std::env::args().nth(1).is_some_and(|a| a == "--upgrade");
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|e| ScribeError::Io { source: e })?
-        .block_on(async {
-            if upgrade_mode { run_upgrade_receiver().await } else { run_normal_server().await }
-        })
+        .map_err(|e| ScribeError::Io { source: e })?;
+
+    let result = runtime.block_on(async {
+        if upgrade_mode { run_upgrade_receiver().await } else { run_normal_server().await }
+    });
+
+    // `Runtime`'s own `Drop` waits on the blocking pool with no bound, so a
+    // single blocking call that never returns holds the process open long
+    // after `main` is done. Shut down explicitly instead: threads still busy
+    // at the deadline are left to the exit.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+
+    result
 }
 
 /// Normal server mode: start IPC server + handoff listener, run until shutdown.
