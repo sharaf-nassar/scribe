@@ -208,12 +208,16 @@ function __scribe_snapshot_env
             case '' '__scribe_*' '_SCRIBE_*'
                 continue
         end
-        # Indirect read, double-quoted. A list-valued export (PATH and
-        # friends) otherwise expands to one element per component and an
-        # empty export to none; quoting collapses either to exactly one
-        # space-joined element, which is what a child process sees. The
-        # two lists are indexed in lockstep, so appending anything but
-        # one value here shifts every later name onto a foreign value.
+        # Indirect read, double-quoted. A list-valued export otherwise
+        # expands to one element per component and an empty export to
+        # none; quoting collapses either to exactly one element. The
+        # quoted form is also the only one that reproduces the export
+        # separator: fish joins a quoted list on the variable's own
+        # delimiter — a colon for a path variable, a space for anything
+        # else — which is exactly what it hands a child process, so
+        # `PATH` is recorded as `a:b:c` and never as `a b c`. The two
+        # lists are indexed in lockstep, so appending anything but one
+        # value here shifts every later name onto a foreign value.
         set -ga __scribe_env_snap_names $name
         set -ga __scribe_env_snap_values "$$name"
     end
