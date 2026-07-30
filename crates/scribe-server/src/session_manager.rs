@@ -1704,6 +1704,7 @@ mod tests_apply_shells {
 
     use crate::env_store::delta::TerminalEnvDelta;
     use crate::shell_integration::ShellKind;
+    use crate::shell_integration::desktop_isolation::{scrub_desktop_env, seal_child};
 
     use super::{render_restore_env_source, restore_env_file_extension};
 
@@ -1723,12 +1724,10 @@ mod tests_apply_shells {
     }
 
     fn interpreter_available(binary: &str) -> bool {
-        Command::new(binary)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+        let mut command = Command::new(binary);
+        command.arg("--version").stdout(Stdio::null()).stderr(Stdio::null());
+        scrub_desktop_env(&mut command);
+        command.status().is_ok_and(|status| status.success())
     }
 
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -1779,7 +1778,8 @@ mod tests_apply_shells {
         let out = dir.join("record.bin");
         _ = std::fs::remove_file(&out);
 
-        let result = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .args(args)
             .arg(&driver_path)
             .env_remove("SCRIBE_PROBE_QUOTE")
@@ -1788,9 +1788,9 @@ mod tests_apply_shells {
             .env_remove("SCRIBE_PROBE_STALE")
             .env("SCRIBE_RECORD_PATH", &out)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("run driver");
+            .stderr(Stdio::piped());
+        seal_child(&mut command, dir);
+        let result = command.output().expect("run driver");
         assert!(
             result.status.success(),
             "{binary} driver exited with {}: {}",
@@ -1878,7 +1878,9 @@ mod tests_apply_shells {
 
         // Same body, wrong extension: pwsh resolves the dot-source target
         // as a native command instead of a script and applies nothing,
-        // without raising so much as a warning.
+        // without raising so much as a warning. Resolving it that way also
+        // reaches .NET's shell-execute fallback, so this is the case that
+        // needs `seal_child` to keep a desktop opener out of the loop.
         let misnamed = stage_restore_file(&dir, ShellKind::PowerShell, "sh");
         let misnamed_driver = format!(
             "$env:SCRIBE_PROBE_STALE = 'preexisting'\ntry {{ . '{}' }} catch {{ }}\n& '{}' \
