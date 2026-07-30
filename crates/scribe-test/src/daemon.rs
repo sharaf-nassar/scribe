@@ -14,12 +14,14 @@ use scribe_common::framing::{read_message, write_message};
 use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
 use scribe_common::protocol::{ClientMessage, ServerMessage, TerminalSize};
 use scribe_common::screen::ScreenSnapshot;
+use scribe_common::screen_replay::SessionReplay;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
-use crate::cmd_socket::{DaemonRequest, DaemonResponse, daemon_socket_path};
+use crate::cmd_socket::{DaemonRequest, DaemonResponse, ReplayFrameInfo, daemon_socket_path};
+use crate::replay::ReplayView;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -67,6 +69,15 @@ struct SessionState {
     /// (`PermissionPrompt` / `WaitingForInput`), which suppresses the tab
     /// context suffix so the pulse owns the UX.
     ai_pulsing: bool,
+    /// Total `PtyOutput` bytes received for this session, never trimmed.
+    ///
+    /// The ring buffer above is capped, so its length cannot place a replay in
+    /// the frame order; this counter can, and it is what
+    /// [`ReplayFrameInfo::live_bytes_before`] is stamped from.
+    live_bytes: u64,
+    /// What the session's replay path has delivered, and the screen rebuilt
+    /// from it.
+    replay: ReplayLog,
 }
 
 impl SessionState {
@@ -81,8 +92,28 @@ impl SessionState {
             status: SessionStatus::Running,
             ai_context: None,
             ai_pulsing: false,
+            live_bytes: 0,
+            replay: ReplayLog::default(),
         }
     }
+}
+
+/// Per-session `SessionReplay` bookkeeping plus the view rebuilt from it.
+///
+/// Replayed bytes deliberately stay out of `output_buffer`: keeping the ring
+/// buffer the raw live PTY stream is what lets an assertion distinguish "this
+/// text came back in the replay" from "this text arrived after the replay",
+/// which is the whole question the buffered-flush ordering work has to answer.
+#[derive(Debug, Default)]
+struct ReplayLog {
+    /// Frames inflated and applied, in arrival order.
+    applied: u32,
+    /// Frames that could not be inflated (zero dimensions or a corrupt blob).
+    failed: u32,
+    /// Metadata for the most recently applied frame.
+    last: Option<ReplayFrameInfo>,
+    /// Terminal holding the last replay plus every `PtyOutput` byte since.
+    view: Option<ReplayView>,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +151,7 @@ struct WaitNotifiers {
     exit: Arc<Notify>,
     workspace_info: Arc<Notify>,
     session_created: Arc<Notify>,
+    replay: Arc<Notify>,
 }
 
 impl WaitNotifiers {
@@ -130,6 +162,7 @@ impl WaitNotifiers {
             exit: Arc::new(Notify::new()),
             workspace_info: Arc::new(Notify::new()),
             session_created: Arc::new(Notify::new()),
+            replay: Arc::new(Notify::new()),
         }
     }
 }
@@ -380,12 +413,8 @@ async fn dispatch_session_message(
         ServerMessage::ScreenSnapshot { session_id, snapshot } => {
             handle_screen_snapshot(session_id, snapshot, state).await;
         }
-        ServerMessage::SessionReplay { session_id, .. } => {
-            // Attach reply uses `SessionReplay` instead of `ScreenSnapshot`.
-            // The test daemon drives assertions off the `RequestSnapshot`
-            // path (which still returns `ScreenSnapshot`), so the attach
-            // replay is intentionally ignored here.
-            debug!(%session_id, "session replay (ignored by test daemon)");
+        ServerMessage::SessionReplay { session_id, replay } => {
+            handle_session_replay(session_id, &replay, state, notifiers).await;
         }
         ServerMessage::CwdChanged { session_id, cwd } => {
             handle_cwd_changed(session_id, cwd, state, notifiers).await;
@@ -527,9 +556,72 @@ async fn handle_pty_output(
         session.output_buffer.extend(data);
         drain_output_buffer(session_id, &mut session.output_buffer);
         session.last_output_at = Some(tokio::time::Instant::now());
+        session.live_bytes = session.live_bytes.saturating_add(data.len() as u64);
+        // Keep the replayed view current so it stays comparable to the server's
+        // screen. Sessions that never received a replay have no view and pay
+        // nothing for this.
+        if let Some(view) = session.replay.view.as_mut() {
+            view.feed(data);
+        }
         drop(guard);
         notifiers.output.notify_waiters();
     }
+}
+
+/// Inflate a `SessionReplay`, apply it to the session's local terminal, and
+/// record where it landed in the session's frame order.
+///
+/// A frame that fails to inflate is counted and logged rather than fatal: a
+/// client degrades to an error banner instead of tearing down its reader, and
+/// the harness has to be able to assert on that same outcome.
+async fn handle_session_replay(
+    session_id: SessionId,
+    replay: &SessionReplay,
+    state: &SharedState,
+    notifiers: &Arc<WaitNotifiers>,
+) {
+    let mut guard = state.lock().await;
+    let Some(session) = guard.sessions.get_mut(&session_id) else {
+        warn!(%session_id, "session replay for a session the daemon does not track");
+        return;
+    };
+
+    let live_bytes_before = session.live_bytes;
+    match ReplayView::apply(session_id, replay) {
+        Ok((view, inflated_bytes)) => {
+            let index = session.replay.applied.saturating_add(1);
+            session.replay.applied = index;
+            session.replay.view = Some(view);
+            session.replay.last = Some(ReplayFrameInfo {
+                index,
+                cols: replay.cols,
+                rows: replay.rows,
+                scrollback_rows: replay.scrollback_rows,
+                cursor_row: replay.cursor_row,
+                cursor_col: replay.cursor_col,
+                alt_screen: replay.alt_screen,
+                compressed_bytes: replay.replay_zstd.len(),
+                inflated_bytes,
+                live_bytes_before,
+            });
+            info!(
+                %session_id,
+                index,
+                cols = replay.cols,
+                rows = replay.rows,
+                inflated_bytes,
+                live_bytes_before,
+                "session replay applied"
+            );
+        }
+        Err(reason) => {
+            session.replay.failed = session.replay.failed.saturating_add(1);
+            warn!(%session_id, %reason, "session replay could not be applied");
+        }
+    }
+
+    drop(guard);
+    notifiers.replay.notify_waiters();
 }
 
 /// Trim the front of the output buffer if it exceeds the capacity limit.
@@ -744,7 +836,7 @@ async fn process_request(
             handle_send(session_id, data, server_writer).await
         }
         DaemonRequest::Resize { session_id, cols, rows } => {
-            handle_resize(session_id, cols, rows, server_writer).await
+            handle_resize(session_id, cols, rows, state, server_writer).await
         }
         DaemonRequest::RequestScreenshot { session_id }
         | DaemonRequest::RequestSnapshot { session_id } => {
@@ -774,6 +866,13 @@ async fn process_request(
         }
         DaemonRequest::RequestAiChrome { session_id } => {
             handle_request_ai_chrome(session_id, state).await
+        }
+        DaemonRequest::ReplayStatus { session_id, min_frames, timeout_ms } => {
+            handle_replay_status(session_id, min_frames, timeout_ms, state, notifiers).await
+        }
+        DaemonRequest::ReplayScreen { session_id } => handle_replay_screen(session_id, state).await,
+        DaemonRequest::AssertReplayMatchesScreen { session_id } => {
+            handle_assert_replay_matches(session_id, state, server_writer).await
         }
         DaemonRequest::WindowId => handle_window_id(state).await,
         DaemonRequest::Shutdown => {
@@ -937,8 +1036,20 @@ async fn handle_resize(
     session_id: SessionId,
     cols: u16,
     rows: u16,
+    state: &SharedState,
     server_writer: &Arc<Mutex<OwnedWriteHalf>>,
 ) -> DaemonResponse {
+    // Resize the replayed view alongside the real session; a view left at the
+    // pre-resize geometry reports mismatches that belong to the harness rather
+    // than to the server.
+    {
+        let mut guard = state.lock().await;
+        if let Some(view) = guard.sessions.get_mut(&session_id).and_then(|s| s.replay.view.as_mut())
+        {
+            view.resize(cols, rows);
+        }
+    }
+
     let msg = ClientMessage::Resize {
         session_id,
         size: TerminalSize { cols, rows, cell_width: 1, cell_height: 1 },
@@ -999,6 +1110,151 @@ async fn handle_request_ai_chrome(session_id: SessionId, state: &SharedState) ->
     DaemonResponse::AiChrome {
         prompt_bar: Some(scribe_common::ai_chrome::context_meter_label(percent)),
         tab: scribe_common::ai_chrome::tab_context_suffix_text(percent, thresholds.warn, pulsing),
+    }
+}
+
+/// Report a session's replay bookkeeping, optionally waiting for frames.
+///
+/// The attach reply is applied on the reader task, so a caller that asked for
+/// an attach and immediately asked for status would race it; `min_frames`
+/// blocks on the replay notifier until the frames land or the timeout expires.
+/// A timeout is not an error here — the response still carries the observed
+/// counts, and the CLI decides whether "fewer frames than asked for" is a
+/// failure or the very thing the test asserts.
+async fn handle_replay_status(
+    session_id: SessionId,
+    min_frames: u32,
+    timeout_ms: u64,
+    state: &SharedState,
+    notifiers: &Arc<WaitNotifiers>,
+) -> DaemonResponse {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+
+    loop {
+        {
+            let guard = state.lock().await;
+            let Some(session) = guard.sessions.get(&session_id) else {
+                return DaemonResponse::Error { message: format!("unknown session: {session_id}") };
+            };
+            let log = &session.replay;
+            if log.applied >= min_frames {
+                return DaemonResponse::ReplayStatus {
+                    applied: log.applied,
+                    failed: log.failed,
+                    live_bytes: session.live_bytes,
+                    last: log.last.clone(),
+                };
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            let guard = state.lock().await;
+            let Some(session) = guard.sessions.get(&session_id) else {
+                return DaemonResponse::Error { message: format!("unknown session: {session_id}") };
+            };
+            return DaemonResponse::ReplayStatus {
+                applied: session.replay.applied,
+                failed: session.replay.failed,
+                live_bytes: session.live_bytes,
+                last: session.replay.last.clone(),
+            };
+        }
+        drop(tokio::time::timeout(remaining, notifiers.replay.notified()).await);
+    }
+}
+
+/// Return the screen rebuilt from the session's replay plus the live output
+/// that followed it.
+async fn handle_replay_screen(session_id: SessionId, state: &SharedState) -> DaemonResponse {
+    let guard = state.lock().await;
+    let Some(session) = guard.sessions.get(&session_id) else {
+        return DaemonResponse::Error { message: format!("unknown session: {session_id}") };
+    };
+    session.replay.view.as_ref().map_or_else(
+        || DaemonResponse::Error {
+            message: format!("no replay has been applied for {session_id}"),
+        },
+        |view| DaemonResponse::ScreenshotData { snapshot: Box::new(view.snapshot()) },
+    )
+}
+
+/// Compare the replayed view against the server's own screen.
+///
+/// The server's snapshot is requested fresh and read back together with the
+/// view under one lock, so the two describe the same point in the session's
+/// frame order: the reader applies output and the snapshot in arrival order, so
+/// a difference means the wire disagreed with the server's `Term` — the attach
+/// gap this assertion exists to catch. Callers still settle the session
+/// (`wait-idle`) first, since output that arrives while the request is in
+/// flight legitimately moves the view ahead.
+async fn handle_assert_replay_matches(
+    session_id: SessionId,
+    state: &SharedState,
+    server_writer: &Arc<Mutex<OwnedWriteHalf>>,
+) -> DaemonResponse {
+    {
+        let guard = state.lock().await;
+        match guard.sessions.get(&session_id) {
+            None => {
+                return DaemonResponse::Error { message: format!("unknown session: {session_id}") };
+            }
+            Some(session) if session.replay.view.is_none() => {
+                return DaemonResponse::Error {
+                    message: format!("no replay has been applied for {session_id}"),
+                };
+            }
+            Some(_) => {}
+        }
+    }
+
+    let Some((server_screen, replayed)) =
+        request_screen_pair(session_id, state, server_writer).await
+    else {
+        return DaemonResponse::Error { message: "failed to obtain snapshot".to_owned() };
+    };
+
+    // The server screen is the reference: everything it shows must be on the
+    // replayed view. Cursor *visibility* is left out on purpose — the replay
+    // encoder deliberately leaves the cursor hidden for alt-screen snapshots so
+    // the app's own output owns it, so visibility is not a property a replay
+    // promises to reproduce.
+    compare_screen_content(&replayed, &server_screen)
+        .map_or(DaemonResponse::Ok, |message| DaemonResponse::AssertFailed { message })
+}
+
+/// Request a fresh server snapshot and read it back paired with the replayed
+/// view captured under the same lock.
+async fn request_screen_pair(
+    session_id: SessionId,
+    state: &SharedState,
+    server_writer: &Arc<Mutex<OwnedWriteHalf>>,
+) -> Option<(ScreenSnapshot, ScreenSnapshot)> {
+    {
+        let mut guard = state.lock().await;
+        let session = guard.sessions.get_mut(&session_id)?;
+        session.latest_snapshot = None;
+        session.snapshot_time = None;
+    }
+
+    let msg = ClientMessage::RequestSnapshot { session_id };
+    send_to_server(server_writer, &msg).await.ok()?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        {
+            let guard = state.lock().await;
+            let session = guard.sessions.get(&session_id)?;
+            if let (Some(server_screen), Some(view)) =
+                (session.latest_snapshot.clone(), session.replay.view.as_ref())
+            {
+                return Some((server_screen, view.snapshot()));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
     }
 }
 
@@ -1253,6 +1509,41 @@ fn cell_neighborhood(snap: &ScreenSnapshot, row: u16, col: u16) -> String {
     lines.join("\n")
 }
 
+/// Compare two screens' dimensions, cell content, and cursor position,
+/// returning the first mismatch as a human-readable message.
+///
+/// Only the reference's non-space cells are compared: blank cells are padding a
+/// producer is free to spell as either a space or an empty cell.
+fn compare_screen_content(current: &ScreenSnapshot, reference: &ScreenSnapshot) -> Option<String> {
+    if current.cols != reference.cols || current.rows != reference.rows {
+        return Some(format!(
+            "snapshot size mismatch: current {}x{}, reference {}x{}",
+            current.cols, current.rows, reference.cols, reference.rows,
+        ));
+    }
+
+    for (i, (cur, refr)) in current.cells.iter().zip(reference.cells.iter()).enumerate() {
+        if refr.c != ' ' && cur.c != refr.c {
+            let cols = usize::from(current.cols).max(1);
+            let row = i / cols;
+            let col = i % cols;
+            return Some(format!(
+                "cell ({row},{col}): expected '{}' but found '{}'",
+                refr.c, cur.c
+            ));
+        }
+    }
+
+    if current.cursor_row != reference.cursor_row || current.cursor_col != reference.cursor_col {
+        return Some(format!(
+            "cursor position mismatch: current ({},{}), reference ({},{})",
+            current.cursor_row, current.cursor_col, reference.cursor_row, reference.cursor_col,
+        ));
+    }
+
+    None
+}
+
 /// Assert that the current screen matches a reference snapshot.
 ///
 /// Compares non-space cell content, cursor position, and cursor visibility.
@@ -1268,36 +1559,8 @@ async fn handle_assert_snapshot_match(
         return DaemonResponse::Error { message: "failed to obtain snapshot".to_owned() };
     };
 
-    // Dimension mismatch.
-    if current.cols != reference.cols || current.rows != reference.rows {
-        return DaemonResponse::AssertFailed {
-            message: format!(
-                "snapshot size mismatch: current {}x{}, reference {}x{}",
-                current.cols, current.rows, reference.cols, reference.rows,
-            ),
-        };
-    }
-
-    // Compare non-space cells (space cells are often padding and not meaningful).
-    for (i, (cur, refr)) in current.cells.iter().zip(reference.cells.iter()).enumerate() {
-        if refr.c != ' ' && cur.c != refr.c {
-            let cols = usize::from(current.cols);
-            let row = i / cols;
-            let col = i % cols;
-            return DaemonResponse::AssertFailed {
-                message: format!("cell ({row},{col}): expected '{}' but found '{}'", refr.c, cur.c),
-            };
-        }
-    }
-
-    // Compare cursor position.
-    if current.cursor_row != reference.cursor_row || current.cursor_col != reference.cursor_col {
-        return DaemonResponse::AssertFailed {
-            message: format!(
-                "cursor position mismatch: current ({},{}), reference ({},{})",
-                current.cursor_row, current.cursor_col, reference.cursor_row, reference.cursor_col,
-            ),
-        };
+    if let Some(message) = compare_screen_content(&current, reference) {
+        return DaemonResponse::AssertFailed { message };
     }
 
     // Compare cursor visibility.

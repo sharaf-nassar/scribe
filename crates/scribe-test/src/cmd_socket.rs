@@ -79,6 +79,27 @@ pub enum DaemonRequest {
     RequestAiChrome {
         session_id: SessionId,
     },
+    /// Ask what `SessionReplay` frames the daemon has applied for a session.
+    ///
+    /// `min_frames` blocks until that many frames have been applied — the
+    /// attach reply lands on the daemon's reader task, which otherwise races
+    /// the next CLI invocation — and `timeout_ms` bounds the wait. Asking for
+    /// zero frames returns the current state immediately, which is how a test
+    /// states that a fresh session was never sent a replay.
+    ReplayStatus {
+        session_id: SessionId,
+        min_frames: u32,
+        timeout_ms: u64,
+    },
+    /// Read back the screen the daemon rebuilt from a session's replay and the
+    /// live output that followed it.
+    ReplayScreen {
+        session_id: SessionId,
+    },
+    /// Compare the replayed view against a freshly requested server snapshot.
+    AssertReplayMatchesScreen {
+        session_id: SessionId,
+    },
     /// Ask for the `WindowId` the server assigned this daemon in its `Welcome`.
     /// The visual E2E rig passes it to a GPUI client as `SCRIBE_JOIN_WINDOW` so
     /// the client joins the daemon's window share instead of opening an empty
@@ -110,12 +131,44 @@ pub enum DaemonResponse {
     WindowId {
         window_id: WindowId,
     },
+    /// What the daemon has seen on a session's replay path: how many frames it
+    /// applied, how many failed to inflate, the running live-output byte count,
+    /// and the most recent frame.
+    ReplayStatus {
+        applied: u32,
+        failed: u32,
+        live_bytes: u64,
+        last: Option<ReplayFrameInfo>,
+    },
     AssertFailed {
         message: String,
     },
     Error {
         message: String,
     },
+}
+
+/// One applied `SessionReplay`, as the harness observed it.
+///
+/// `live_bytes_before` is what makes ordering assertable: it is the count of
+/// live `PtyOutput` bytes the daemon had received for the session when the frame
+/// arrived, so a caller can separate replayed content from output that followed
+/// the replay instead of guessing from screen state alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayFrameInfo {
+    /// 1-based arrival index within the session.
+    pub index: u32,
+    pub cols: u16,
+    pub rows: u16,
+    pub scrollback_rows: u32,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub alt_screen: bool,
+    /// zstd payload size on the wire.
+    pub compressed_bytes: usize,
+    /// ANSI byte count after inflation.
+    pub inflated_bytes: usize,
+    pub live_bytes_before: u64,
 }
 
 // ---------------------------------------------------------------------------

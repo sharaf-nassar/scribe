@@ -23,7 +23,9 @@ After connecting to scribe-server, the daemon sends `ClientMessage::Hello { wind
 
 ### Session State
 
-Per-session data buffered in : 65 KB output ring buffer, `latest_snapshot` with 100 ms TTL, `last_output_at` for idle detection, `cwd`, `title`, and `SessionStatus` (`Running` or `Exited`).
+Per-session data buffered in : 65 KB output ring buffer, `latest_snapshot` with 100 ms TTL, `last_output_at` for idle detection, `cwd`, `title`, `SessionStatus`, a never-trimmed `live_bytes` counter, and the replay log.
+
+`live_bytes` is separate from the ring buffer because the buffer is capped: a trimmed buffer's length cannot place a replay frame in the session's byte order, and that ordering is what the replay bookkeeping stamps each frame with.
 
 All sessions are keyed by `SessionId` inside , which also tracks `last_workspace_id` and `last_session_created` for workspace and session-create responses, plus the `window_id` the server assigned in its `Welcome`.
 
@@ -33,7 +35,7 @@ Each incoming connection receives one  and returns one . Wait-type requests (Wai
 
 ### Notification System
 
- holds five `Arc<Notify>` channels: `output`, `cwd`, `exit`, `workspace_info`, and `session_created`.
+ holds six `Arc<Notify>` channels: `output`, `cwd`, `exit`, `workspace_info`, `session_created`, and `replay`.
 
 The server-reader task fires the matching channel on each incoming `ServerMessage`, waking whichever wait handler is blocked on it.
 
@@ -43,9 +45,9 @@ Request/response protocol between the CLI and daemon over a Unix socket at `/run
 
 The socket path is returned by . The helper  creates a short-lived tokio runtime, connects, sends one , and receives one .
 
-Key request variants: `CreateSession`, `AttachSession`, `CloseSession`, `Send`, `Resize`, `RequestScreenshot`, `RequestSnapshot`, `WaitOutput`, `WaitCwd`, `WaitIdle`, `AssertCell`, `AssertCursor`, `AssertExit`, `AssertSnapshotMatch`, `WindowId`, and `Shutdown`.
+Key request variants: `CreateSession`, `AttachSession`, `CloseSession`, `Send`, `Resize`, `RequestScreenshot`, `RequestSnapshot`, `WaitOutput`, `WaitCwd`, `WaitIdle`, `AssertCell`, `AssertCursor`, `AssertExit`, `AssertSnapshotMatch`, `ReplayStatus`, `ReplayScreen`, `AssertReplayMatchesScreen`, `WindowId`, and `Shutdown`.
 
-Key response variants: `Ok`, `SessionCreated { session_id }`, `ScreenshotData { snapshot }`, `WindowId { window_id }`, `AssertFailed { message }`, and `Error { message }`.
+Key response variants: `Ok`, `SessionCreated { session_id }`, `ScreenshotData { snapshot }`, `ReplayStatus { applied, failed, live_bytes, last }`, `WindowId { window_id }`, `AssertFailed { message }`, and `Error { message }`.
 
 `WindowId` (surfaced as `scribe-test daemon window-id`, printed by ) exists so a second process can be pointed at the daemon's window instead of claiming one of its own — the join target the shared-pane visual rig passes to the GPUI client as `SCRIBE_JOIN_WINDOW` (). It errors rather than returning a placeholder when no `Welcome` has arrived, because joining "no window" would silently reproduce the empty-window bug it exists to prevent.
 
@@ -82,6 +84,22 @@ Capture the current terminal state as a PNG screenshot or a JSON text snapshot f
 ### PNG Rendering
 
  uses `cosmic-text` for shaping, xterm-256 ANSI palette for colours, and alpha blending for compositing. Cells are 10×20 px at 14 pt.  covers I/O and PNG encoding failures.
+
+## Replay Observation
+
+The daemon inflates every `SessionReplay`, applies it to a local terminal, and keeps that terminal fed with the session's later output, so attach-path content and ordering are assertable rather than invisible.
+
+Before this the daemon logged and dropped the frame, and assertions read `RequestSnapshot` — which the server answers from its own `Term` regardless of what it put on the wire. A replay that was late, lossy, duplicated, or never sent looked exactly like a correct one.
+
+The receiving half mirrors a real client and reuses the server's own machinery — `build_term_config`, `ScribeEventListener`, `vte::ansi::Processor`, and `snapshot_term` — so the replayed view cannot disagree with the server for reasons that live in the harness. Applying a frame inflates the zstd payload, feeds the ANSI into a fresh `Term` at the frame's geometry, then trims the blank history the replay's own `ESC [ 2J` scrolls into a fresh grid (a client reaches the same state through `TrimScrollback`). Later `PtyOutput` bytes and `Resize` requests are applied to the same terminal, so the view stays comparable to the server's screen. A frame that fails to inflate is counted and logged rather than fatal, matching the client's graceful skip.
+
+Replayed bytes deliberately stay out of the output ring buffer. Keeping that buffer the raw live PTY stream is what lets an assertion separate "this text came back in the replay" from "this text arrived after the replay"; each applied frame instead records the session's `live_bytes` count at its arrival, which is the ordering fact the buffered-flush and paced-replay work has to check.
+
+Three CLI surfaces read it back:
+
+- `scribe-test replay status <session>` prints `frames`, `failed`, `live-bytes`, and a `last-frame` line carrying geometry, cursor, alt-screen flag, compressed and inflated sizes, and the live bytes before and after the frame. `--min-frames` blocks on the `replay` notifier, because the attach reply lands on the reader task and would otherwise race the next CLI invocation; `--expect-frames 0` is how a test states that a session was never sent a replay at all.
+- `scribe-test replay screen <session>` prints the replayed screen as text, or writes it as snapshot JSON with `--json`, so scripts grep replayed content directly.
+- `scribe-test replay assert-matches <session>` requests a fresh server snapshot and compares it against the replayed view read back under the same lock — the losslessness oracle for an attach. Cursor *visibility* is excluded, because the encoder deliberately leaves the cursor hidden on alt-screen replays so the app's own output owns it. Callers settle the session with `wait-idle` first, since output arriving while the request is in flight legitimately moves the view ahead.
 
 ## Server Lifecycle
 
@@ -172,7 +190,7 @@ Scripted lifecycle coverage proving the GPUI client survives detach, hot-reload,
 
 In every script the `scribe-test` daemon is the client stand-in: `daemon stop` is the client going away and `daemon start` is a fresh client that must re-attach.  sends `Hello { window_id: None }` so  adopts the unconnected window-with-sessions, which is what makes every re-attach flow below possible.
 
-`tests/e2e/func/reconnect.sh` covers plain detach/reattach: run a command, start a background job, `daemon stop`, `daemon start`, `session attach`, then assert fresh input works and the background job survived the disconnect.
+`tests/e2e/func/reconnect.sh` covers plain detach/reattach: run a command, start a background job, `daemon stop`, `daemon start`, `session attach`, then assert fresh input works and the background job survived the disconnect. It also asserts the attach *replay* itself — one applied frame carrying the pre-detach marker, and a closing `replay assert-matches` proving the replayed view plus the output that followed it still equals the server's screen.
 
 `tests/e2e/func/hot-reload.sh` covers server `--upgrade` under a live client: it snapshots a session, stops the daemon, runs  (fd handoff to the new server), then reconnects and asserts the session, its background job, and its on-screen scrollback all survived the graceful handoff.
 
