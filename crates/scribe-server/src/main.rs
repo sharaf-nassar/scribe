@@ -275,8 +275,15 @@ async fn run_server_loop(
         // Defuse Pty objects so the old server's exit doesn't send SIGHUP to
         // child processes. alacritty_terminal::Pty::drop() explicitly calls
         // kill(child_pid, SIGHUP) — the new server already has the master fds.
+        // The readers are deliberately left running: the new server owns these
+        // children now, so nothing here may cancel a reader into the exit
+        // funnel and report their sessions dead.
         ipc_server::defuse_for_handoff(&live_sessions).await;
     } else {
+        // Stop the readers before the runtime unwinds, under the same bounded
+        // join the close paths use, so shutdown is not the one exit path that
+        // abandons a task parked on a PTY read (spec 017 US1-3).
+        ipc_server::shutdown_pty_readers(&live_sessions).await;
         // Only clean up the IPC socket if we're NOT handing off. During a
         // handoff the new server has already bound to the same socket path —
         // removing it would make the new server unreachable.

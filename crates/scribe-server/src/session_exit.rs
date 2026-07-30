@@ -15,12 +15,75 @@
 //! the reader's EOF/read error, an explicit `CloseSession`/`CloseWindow`, and
 //! the child-exit watcher — arbitrates through that CAS, so no interleaving
 //! can double-emit and none can leave the session unfinalized.
+//!
+//! # Close protocol and lock order (spec 017 US1-1)
+//!
+//! Every explicit close runs the same three steps, in this order:
+//!
+//! 1. **Take.** Under the `live_sessions` write guard — and only there —
+//!    remove the registry entry and move the session's `PtyGuard` and exit
+//!    gate out of it. Nothing inside that critical section may `.await`.
+//! 2. **Release, then unwire.** Drop the guard before anything else, and only
+//!    then take the `workspace_manager` write guard for the workspace-side
+//!    removal. The two are never held at once, and neither is held while the
+//!    child is signalled or reaped.
+//! 3. **Cancel, tear down, join.** Raise [`SessionExitGate::cancel`], hand the
+//!    `Pty` to the blocking pool via `PtyGuard::teardown`, then wait for the
+//!    reader with [`SessionExitGate::join_reader_by`], bounded by
+//!    [`READER_JOIN_TIMEOUT`]. On expiry the handle is dropped and the task is
+//!    left running, so a wedged reader delays nothing beyond the bound.
+//!
+//! The join **must** hold no lock: a reader on its way out takes the
+//! `live_sessions` and then the `workspace_manager` write guards inside the
+//! exit finalizer, so joining under either one would stall for the whole
+//! bound. It is also the last step of a close, so that stall can only ever
+//! delay the exit notification — the session is already unwired from the
+//! registry, the workspace, and the client's attached set by the time it runs.
+//!
+//! That guard pair is the server-wide lock order too — `live_sessions` before
+//! `workspace_manager`, never the reverse, and neither held across an
+//! `.await`. Paths that need a workspace read first release it before they
+//! touch the registry, so the two never overlap in the opposite direction.
+//!
+//! Process exit is deliberately outside this protocol. A handoff must not
+//! cancel readers on its way out: cancellation drives the funnel, and the
+//! funnel would publish `SessionExited` for sessions that are being handed to
+//! the incoming server alive.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
+
+/// How long a close path waits for a cancelled reader before it detaches the
+/// task and moves on (spec 017, Q7).
+///
+/// The reader normally observes cancellation on its next loop turn, so this
+/// only bites when it is wedged somewhere the cancel cannot reach — a sink
+/// whose participant stopped draining, or a `Term` lock held by a long
+/// snapshot. Detaching there is strictly better than inheriting the stall:
+/// the session is already unwired, and the task holds nothing the close needs.
+pub const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Outcome of a bounded reader join, for the caller to log.
+#[derive(Debug)]
+pub enum ReaderJoin {
+    /// The reader task ended inside the bound.
+    Joined,
+    /// No handle to join: the reader already ended and an earlier close took
+    /// it, or this close beat [`SessionExitGate::set_reader`] to the gate.
+    Absent,
+    /// The reader task panicked or was aborted.
+    Failed(tokio::task::JoinError),
+    /// The bound expired. The handle was dropped and the task left running.
+    Detached,
+    /// The join was requested from the reader task itself, which can never
+    /// complete. Refused instead of parked; the handle stays on the gate.
+    SelfJoin,
+}
 
 /// Shared exit state for one session, held by the `LiveSession` and by its PTY
 /// reader task so close paths, the reader, and the child-exit watcher all
@@ -97,6 +160,38 @@ impl SessionExitGate {
     /// handle was already taken or was never stored.
     pub fn take_reader(&self) -> Option<JoinHandle<()>> {
         self.lock_reader().take()
+    }
+
+    /// Wait for the reader task to end, giving up at `deadline`.
+    ///
+    /// Step 3 of the close protocol documented at the top of this module. The
+    /// caller must already have raised [`SessionExitGate::cancel`] — this only
+    /// waits — and must hold no lock, because the reader takes the
+    /// `live_sessions` and `workspace_manager` write guards on its way out.
+    ///
+    /// `CloseWindow` passes one deadline to every session it is closing, so a
+    /// window full of wedged readers still costs a single
+    /// [`READER_JOIN_TIMEOUT`] rather than one per pane.
+    pub async fn join_reader_by(&self, deadline: Instant) -> ReaderJoin {
+        let handle = {
+            let mut slot = self.lock_reader();
+            // A task cannot join itself: the finalizer runs on the reader too,
+            // and taking this route from there would park it until the bound
+            // expired. Leave the handle in place for the close that is
+            // actually driving the teardown.
+            if slot.as_ref().is_some_and(|handle| tokio::task::try_id() == Some(handle.id())) {
+                return ReaderJoin::SelfJoin;
+            }
+            slot.take()
+        };
+        let Some(handle) = handle else { return ReaderJoin::Absent };
+        match tokio::time::timeout_at(deadline, handle).await {
+            Ok(Ok(())) => ReaderJoin::Joined,
+            Ok(Err(err)) => ReaderJoin::Failed(err),
+            // Dropping the handle detaches; aborting instead would cut the
+            // reader mid-chunk and could strand the `Term` mutex.
+            Err(_elapsed) => ReaderJoin::Detached,
+        }
     }
 
     /// Declare that a child-exit watcher owns this session's exit status, so
