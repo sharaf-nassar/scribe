@@ -63,8 +63,17 @@ pub enum StoreError {
 ///
 /// Does NOT create the directory — call [`ensure_env_dir`] for that.
 pub fn env_dir_for(window_id: WindowId) -> Result<PathBuf, StoreError> {
+    Ok(env_root()?.join(window_id.to_full_string()))
+}
+
+/// Returns the root every per-window env dir hangs off:
+/// `<state_dir>/restore/env/`.
+///
+/// Only [`crate::env_store::gc`] walks it — every other caller addresses a
+/// single window. Does NOT create the directory.
+pub fn env_root() -> Result<PathBuf, StoreError> {
     let state = current_state_dir().ok_or(StoreError::NoStateDir)?;
-    Ok(state.join("restore").join("env").join(window_id.to_full_string()))
+    Ok(state.join("restore").join("env"))
 }
 
 /// Path to one envelope: `env_dir_for(window_id).join("<launch_id>.envz")`.

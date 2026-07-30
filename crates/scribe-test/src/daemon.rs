@@ -11,7 +11,7 @@ use std::time::Duration;
 use regex::{Regex, RegexBuilder};
 use scribe_common::error::ScribeError;
 use scribe_common::framing::{read_message, write_message};
-use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
+use scribe_common::ids::{SessionId, WindowId, WorkspaceId, new_launch_id};
 use scribe_common::protocol::{ClientMessage, ServerMessage, TerminalSize};
 use scribe_common::screen::ScreenSnapshot;
 use scribe_common::screen_replay::SessionReplay;
@@ -144,6 +144,10 @@ struct DaemonState {
     /// `scribe-test window-id` so a second local process — the visual rig's GPUI
     /// client — can join this window's share instead of claiming its own.
     window_id: Option<WindowId>,
+    /// Launch (env-envelope) id minted for each session this daemon created,
+    /// surfaced by `scribe-test session envelope-id` so an E2E script can assert
+    /// that the harness create path really names an envelope.
+    envelope_ids: HashMap<SessionId, String>,
 }
 
 impl DaemonState {
@@ -153,6 +157,7 @@ impl DaemonState {
             last_workspace_id: None,
             last_session_created: None,
             window_id: None,
+            envelope_ids: HashMap::new(),
         }
     }
 }
@@ -910,6 +915,7 @@ async fn process_request(
             handle_assert_replay_matches(session_id, state, server_writer).await
         }
         DaemonRequest::WindowId => handle_window_id(state).await,
+        DaemonRequest::EnvelopeId { session_id } => handle_envelope_id(session_id, state).await,
         DaemonRequest::Shutdown => {
             handle_shutdown(shutdown);
             DaemonResponse::Ok
@@ -945,23 +951,31 @@ async fn handle_create_session(
         let mut guard = state.lock().await;
         guard.last_session_created = None;
     }
+    // The harness mints a launch id like every other create path: without one
+    // the server has no envelope to persist the session's environment into, and
+    // an env-persistence E2E would observe nothing no matter what the shell did.
+    let envelope_id = new_launch_id();
     let msg = ClientMessage::CreateSession {
         workspace_id,
         split_direction: None,
         cwd: None,
         size: None,
         command: None,
-        env_envelope_id: None,
+        env_envelope_id: Some(envelope_id.clone()),
     };
     if let Err(e) = send_to_server(server_writer, &msg).await {
         return DaemonResponse::Error { message: format!("failed to send CreateSession: {e}") };
     }
 
     // Wait for SessionCreated response.
-    wait_for_session_created(state, notifiers, Duration::from_secs(5)).await.map_or_else(
-        || DaemonResponse::Error { message: "timed out waiting for SessionCreated".to_owned() },
-        |session_id| DaemonResponse::SessionCreated { session_id },
-    )
+    let Some(session_id) = wait_for_session_created(state, notifiers, Duration::from_secs(5)).await
+    else {
+        return DaemonResponse::Error {
+            message: "timed out waiting for SessionCreated".to_owned(),
+        };
+    };
+    state.lock().await.envelope_ids.insert(session_id, envelope_id);
+    DaemonResponse::SessionCreated { session_id }
 }
 
 /// Attach to an existing (detached) session on the server.
@@ -1832,6 +1846,18 @@ async fn handle_window_id(state: &SharedState) -> DaemonResponse {
     state.lock().await.window_id.map_or_else(
         || DaemonResponse::Error { message: "daemon has not received a Welcome yet".to_owned() },
         |window_id| DaemonResponse::WindowId { window_id },
+    )
+}
+
+/// Report the launch (env-envelope) id the daemon minted for a session it
+/// created. Attached sessions have none — the id belongs to whichever client
+/// issued the `CreateSession`.
+async fn handle_envelope_id(session_id: SessionId, state: &SharedState) -> DaemonResponse {
+    state.lock().await.envelope_ids.get(&session_id).cloned().map_or_else(
+        || DaemonResponse::Error {
+            message: format!("no envelope id recorded for session {session_id}"),
+        },
+        |envelope_id| DaemonResponse::EnvelopeId { envelope_id },
     )
 }
 

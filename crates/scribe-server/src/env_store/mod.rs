@@ -12,6 +12,7 @@
 
 pub mod delta;
 pub mod envelope;
+pub mod gc;
 pub mod keystore;
 pub mod store;
 
@@ -137,9 +138,12 @@ impl EnvStoreState {
     }
 
     /// Returns `true` if a [`StartupBaseline`] has been recorded for the
-    /// session. Used by lib-side tests today; production callers exist via
-    /// the in-method `baselines.contains_key` check on the fold path.
-    #[cfg(test)]
+    /// session.
+    ///
+    /// [`crate::hook_ingress`] reads it before minting a session's first
+    /// env-envelope id: a session with no baseline cannot fold a delta, so
+    /// there is nothing to name yet — and a handoff-restored session never
+    /// re-emits one, which is what keeps handoff free of envelopes.
     pub async fn has_baseline(&self, session: SessionId) -> bool {
         let guard = self.inner.lock().await;
         guard.baselines.contains_key(&session)

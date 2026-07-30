@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use scribe_common::ai_state::AiProvider;
 use scribe_common::config::ContentPadding;
-use scribe_common::ids::{SessionId, WindowId, WorkspaceId};
+use scribe_common::ids::{SessionId, WindowId, WorkspaceId, new_launch_id};
 use scribe_common::protocol::{LayoutDirection, PaneTreeNode, TerminalSize, WorkspaceTreeNode};
 
 use crate::layout::{LayoutNode, PaneEdges, PaneId, Rect, SplitDirection};
@@ -127,18 +127,14 @@ pub fn detect_ai_command(argv: &[String], resume: bool) -> Option<AiProvider> {
 /// Build a fresh shell launch binding with a new launch id.
 #[must_use]
 pub fn new_shell_binding(cwd: Option<PathBuf>) -> LaunchBinding {
-    LaunchBinding {
-        launch_id: SessionId::new().to_full_string(),
-        kind: LaunchKind::Shell,
-        fallback_cwd: cwd,
-    }
+    LaunchBinding { launch_id: new_launch_id(), kind: LaunchKind::Shell, fallback_cwd: cwd }
 }
 
 /// Build a fresh custom-command launch binding with a new launch id.
 #[must_use]
 pub fn new_custom_binding(argv: Vec<String>, cwd: Option<PathBuf>) -> LaunchBinding {
     LaunchBinding {
-        launch_id: SessionId::new().to_full_string(),
+        launch_id: new_launch_id(),
         kind: LaunchKind::CustomCommand { argv },
         fallback_cwd: cwd,
     }
@@ -153,7 +149,7 @@ pub fn new_ai_binding(
     conversation_id: Option<String>,
 ) -> LaunchBinding {
     LaunchBinding {
-        launch_id: SessionId::new().to_full_string(),
+        launch_id: new_launch_id(),
         kind: LaunchKind::Ai { provider, resume_mode, conversation_id },
         fallback_cwd: cwd,
     }

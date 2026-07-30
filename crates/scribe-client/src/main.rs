@@ -156,8 +156,8 @@ use tokio::{
 use crate::{
     ipc_bridge::{
         CoalescedBatch, InboundEvent, InboundReceiver, InboundSender, IpcSink,
-        OUTBOUND_QUEUE_FRAMES, OutboundReceiver, OutboundSender, PaneOp, RestoredSession,
-        SinkError, WriteOutcome, inbound_channel, outbound_channel, run_drain, write_or_tear,
+        OUTBOUND_QUEUE_FRAMES, OutboundReceiver, OutboundSender, PaneOp, SessionLaunch, SinkError,
+        WriteOutcome, inbound_channel, outbound_channel, run_drain, write_or_tear,
     },
     pane_shell::{ClosedPane, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
     session_lifecycle::{JumpDirection, PromptMarks},
@@ -3223,7 +3223,7 @@ impl TerminalView {
             self.restore.requested.push_back(binding.clone());
         }
         let size = sizes.get(&launch.pane_id).copied().unwrap_or(self.terminal_size);
-        let result = self.sink.create_restored_session(RestoredSession {
+        let result = self.sink.create_session(SessionLaunch {
             workspace_id: launch.workspace_id,
             size,
             cwd: launch.cwd.clone(),
@@ -3421,11 +3421,20 @@ impl TerminalView {
         // Queued before the request goes out so the answering `SessionCreated`
         // is bound to what this tab actually launched — a plain shell, or the
         // AI command an AI-tab shortcut asked for, which is what a cold restart
-        // has to relaunch rather than a bare login shell.
-        self.restore.requested.push_back(launch_binding_for(command.as_ref()));
-        if let Err(error) =
-            self.sink.create_session(workspace_id, self.focused_pane_size, None, command)
-        {
+        // has to relaunch rather than a bare login shell. The binding's launch
+        // id rides along as the env-envelope id so the session persists its
+        // environment under the same id the next snapshot will point at.
+        let binding = launch_binding_for(command.as_ref());
+        let launch_id = binding.launch_id.clone();
+        self.restore.requested.push_back(binding);
+        let result = self.sink.create_session(SessionLaunch {
+            workspace_id,
+            size: self.focused_pane_size,
+            cwd: None,
+            command,
+            launch_id,
+        });
+        if let Err(error) = result {
             tracing::warn!(%error, "new tab dropped: IPC writer closed");
         }
     }
@@ -3719,10 +3728,17 @@ impl TerminalView {
             tracing::warn!("pane session ignored: no workspace is attached yet");
             return;
         };
-        self.restore.requested.push_back(launch_binding_for(None));
-        if let Err(error) =
-            self.sink.create_session(workspace_id, self.focused_pane_size, None, None)
-        {
+        let binding = launch_binding_for(None);
+        let launch_id = binding.launch_id.clone();
+        self.restore.requested.push_back(binding);
+        let result = self.sink.create_session(SessionLaunch {
+            workspace_id,
+            size: self.focused_pane_size,
+            cwd: None,
+            command: None,
+            launch_id,
+        });
+        if let Err(error) = result {
             tracing::warn!(%error, "pane session dropped: IPC writer closed");
         }
     }

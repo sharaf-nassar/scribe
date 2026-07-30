@@ -57,6 +57,8 @@ Create, attach, and close terminal sessions through the daemon; each operation p
 
  sends `CreateSession` and prints the UUID.  sends `AttachSession` and prints the confirmed UUID.  sends `CloseSession` and expects `Ok`. All three are routed through .
 
+The create path mints a launch id and sends it as `env_envelope_id`, and  reports it back per session. Without that id the server has no envelope to key a session's environment by, so every harness-created session was inert and no E2E could observe env persistence at all.
+
 ## Input Simulation
 
 Send keystrokes to a session with escape sequence expansion (`\n`, `\t`, `\\`, `\xNN`).
@@ -185,6 +187,12 @@ Claude phases set `processing` plus a prompt and a context refresh of 50/72/91. 
 Seven-phase test in `tests/e2e/func/ai-state-indicator.sh` covering the state machine end of the same channel.
 
 It cycles all five `AiState` variants without corrupting the grid, asserts a context refresh of 42 reaches the AI chrome, confirms a legacy OSC 1337 payload is still consumed silently with the text on either side of it preserved, drives rapid transitions without deadlock, asserts `state_cleared` empties the chrome, and closes a session while an AI state is active.
+
+### Env Persistence Create-Path E2E
+
+`tests/e2e/func/env-persistence.sh` asserts that a harness-created session carries a launch (env-envelope) id, which is the precondition for every other env-persistence assertion.
+
+It reads the entrypoint session's id back with `scribe-test session envelope-id`, creates a second session and asserts its id is a distinct UUID (a shared constant would satisfy a bare non-empty check), and drives the second session to a prompt so the id provably belongs to a live launch rather than a bookkeeping entry. It deliberately stops short of asserting an `.envz` file: the functional container has no running secret service, so the keystore fails and the persist path degrades by design.
 
 ### Session Lifecycle E2E
 

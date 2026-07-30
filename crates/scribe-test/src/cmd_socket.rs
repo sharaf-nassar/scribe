@@ -113,6 +113,12 @@ pub enum DaemonRequest {
     /// the client joins the daemon's window share instead of opening an empty
     /// window of its own.
     WindowId,
+    /// Ask for the launch (env-envelope) id the daemon minted when it created
+    /// `session_id`. An E2E script asserts it is a real id to prove the harness
+    /// create path names an envelope the server can persist into.
+    EnvelopeId {
+        session_id: SessionId,
+    },
     Shutdown,
 }
 
@@ -138,6 +144,11 @@ pub enum DaemonResponse {
     /// when no `Welcome` has arrived yet.
     WindowId {
         window_id: WindowId,
+    },
+    /// The launch (env-envelope) id the daemon sent in the session's
+    /// `CreateSession`.
+    EnvelopeId {
+        envelope_id: String,
     },
     /// What the daemon has seen on a session's replay path: how many frames it
     /// applied, how many failed to inflate, the running live-output byte count,
