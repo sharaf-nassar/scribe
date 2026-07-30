@@ -30,6 +30,7 @@ use scribe_pty::async_fd::AsyncPtyFd;
 use scribe_pty::event_listener::{ScribeEventListener, SessionEvent};
 
 use crate::handoff::HandoffState;
+use crate::pty_guard::PtyGuard;
 use crate::shell_integration;
 
 /// Maximum number of active PTY sessions across all clients.
@@ -136,11 +137,12 @@ pub struct ManagedSession {
     /// Keep the Pty object alive so the child process is not killed by SIGHUP
     /// when Pty's Drop impl runs. The Pty owns the child process handle.
     /// Owns the child process. Moved into `SessionHandle` by the IPC server.
-    /// If dropped, sends SIGHUP to the child.
+    /// Tearing the guard down sends SIGHUP to the child and reaps it off any
+    /// Tokio worker; see [`crate::pty_guard::PtyGuard`].
     ///
     /// `None` for sessions restored from a hot-reload handoff — the child stays
     /// alive because it holds the slave fd; we only need the master fd.
-    pub pty: Option<alacritty_terminal::tty::Pty>,
+    pub pty: Option<PtyGuard>,
     /// Screen snapshot from a hot-reload handoff. Sent to the first client
     /// that attaches (then cleared) so the pre-handoff screen content is
     /// restored instead of a blank terminal.
@@ -270,7 +272,7 @@ impl PreparedSessionLaunch {
             event_rx: self.event_rx,
             workspace_id: self.workspace_id,
             shell_name: self.shell_name,
-            pty: Some(pty),
+            pty: Some(PtyGuard::new(pty)),
             handoff_snapshot: None,
             title: None,
             task_label: None,
