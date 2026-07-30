@@ -131,8 +131,15 @@ async fn run_upgrade_receiver() -> Result<(), ScribeError> {
 
     let session_manager =
         Arc::new(session_manager::SessionManager::restore_from_handoff(&state, fds, scrollback)?);
-    let live_session_ids: HashSet<_> =
-        state.sessions.iter().map(|handoff_session| handoff_session.session_id).collect();
+    // Read back from the manager rather than from the payload: the restore
+    // admits at most `MAX_SESSIONS` sessions, and a workspace tree that still
+    // named a refused one would advertise a session nothing can attach to.
+    let live_session_ids: HashSet<_> = session_manager
+        .pending_session_ids()
+        .await
+        .into_iter()
+        .map(|(session_id, _workspace_id)| session_id)
+        .collect();
     let workspace_manager =
         Arc::new(RwLock::new(workspace_manager::WorkspaceManager::restore_from_handoff(
             cfg.workspace_roots,

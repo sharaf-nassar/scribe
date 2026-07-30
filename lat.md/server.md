@@ -22,6 +22,8 @@ Each PTY session is represented by a  during creation and a LiveSession during a
 
 The SessionManager creates sessions through alacritty_terminal's PTY spawner, wrapping the master fd in an  for epoll-driven async I/O. A maximum of 256 concurrent sessions is enforced.
 
+That cap is a semaphore, not a map length. [[crates/scribe-server/src/session_manager.rs#SessionManager#create_session]] takes a [[crates/scribe-server/src/session_manager.rs#SessionSlot]] permit before it spawns the PTY, and the permit rides on the session into its LiveSession registry entry, so a slot is returned exactly when the session is dropped on a close path — the SessionManager's own map is only a staging area and its length never counted anything. Because the take is a single non-blocking `try_acquire`, a burst of concurrent creates admits exactly the number of free slots and every loser gets the typed `SessionLimitReached` variant of [[crates/scribe-common/src/error.rs#ScribeError]] immediately instead of queueing behind an unrelated session's close. Handoff-restored sessions take slots the same way, so a hot reload cannot restart the budget from zero.
+
 Environment variables are set to TERM=xterm-256color, COLORTERM=truecolor, and TERM_PROGRAM=Scribe on top of the server process environment. On Linux,  refreshes the user systemd manager's GUI session variables before starting the service so new PTY sessions inherit working clipboard/display access. Packaged user services are enabled under `graphical-session.target`, not `default.target`, so display-manager autostart waits until DISPLAY/XAUTHORITY are available.
 
 New and handoff-restored terminal cores are created with kitty keyboard protocol enabled, so alacritty_terminal can answer Codex and shell keyboard-mode probes (`CSI ? u` and related mode updates) through the normal PTY write-back path.
@@ -229,6 +231,8 @@ Reading the observed token at signal time narrows the reuse window to the gap be
 ### Size Limits
 
 Maximum handoff state size is 256 MiB. Maximum file descriptors transferred is 1024. Both sides verify peer UID, and Linux/macOS senders validate the peer process before sending sensitive state.
+
+Restore is bounded by the live-session cap as well: [[crates/scribe-server/src/session_manager.rs#SessionManager#restore_from_handoff]] admits at most 256 sessions and logs the excess, so a corrupt or hostile payload cannot start the successor already over budget even though the fd limit is four times higher.
 
 Typical v5 compressed payloads are in the low tens of megabytes even for many sessions at the default `scrollback_lines = 10_000`, since the ANSI replay + zstd combination is roughly 20-100x denser than the v4 per-cell MessagePack encoding.
 
