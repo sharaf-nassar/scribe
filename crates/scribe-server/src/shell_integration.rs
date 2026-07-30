@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use scribe_common::app::current_identity;
 use tracing::debug;
@@ -31,22 +32,51 @@ pub fn detect_shell(binary: &str) -> ShellKind {
 /// Resolve the shell integration scripts directory.
 ///
 /// Tries exe-relative paths (installed and dev builds), then standard locations.
+///
+/// A packaged hit is memoized: those scripts live inside the install and cannot
+/// move while the server runs, so every launch after the first skips the probe
+/// stats entirely. A dev-build hit is deliberately not cached — `dist/` is the
+/// tree a developer edits and re-lays-out under a running server, and caching it
+/// would pin the session to whatever layout existed at the first launch.
 pub fn find_scripts_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let exe_dir = exe.parent()?;
-    let identity = current_identity();
+    if let Some(cached) = PACKAGED_SCRIPTS_DIR.get() {
+        return Some(cached.clone());
+    }
 
+    let exe = std::env::current_exe().ok()?;
+    let (dir, layout) = resolve_scripts_dir(exe.parent()?, current_identity().share_dir_name())?;
+    match layout {
+        ScriptsLayout::Packaged => Some(PACKAGED_SCRIPTS_DIR.get_or_init(|| dir).clone()),
+        ScriptsLayout::Dev => Some(dir),
+    }
+}
+
+/// The packaged scripts directory, resolved at most once per process.
+///
+/// Left unset for dev builds and for a failed probe, both of which re-resolve.
+static PACKAGED_SCRIPTS_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Which install layout a resolved scripts directory came from.
+enum ScriptsLayout {
+    /// Shipped inside a deb or DMG install, next to the binary that found it.
+    Packaged,
+    /// A repo checkout's `dist/shell-integration`, edited between launches.
+    Dev,
+}
+
+/// Layout probe behind [`find_scripts_dir`], split out so each layout can be
+/// exercised without moving the running executable.
+fn resolve_scripts_dir(exe_dir: &Path, share_dir_name: &str) -> Option<(PathBuf, ScriptsLayout)> {
     // Installed Linux: /usr/bin/scribe-server → /usr/share/scribe/shell-integration
-    let installed =
-        exe_dir.parent()?.join("share").join(identity.share_dir_name()).join("shell-integration");
+    let installed = exe_dir.parent()?.join("share").join(share_dir_name).join("shell-integration");
     if installed.is_dir() {
-        return Some(installed);
+        return Some((installed, ScriptsLayout::Packaged));
     }
 
     // macOS bundle: Contents/MacOS/scribe-server → Contents/Resources/shell-integration
     let macos = exe_dir.parent()?.join("Resources/shell-integration");
     if macos.is_dir() {
-        return Some(macos);
+        return Some((macos, ScriptsLayout::Packaged));
     }
 
     // Dev build: walk up from exe to find the repo root (has dist/shell-integration).
@@ -54,7 +84,7 @@ pub fn find_scripts_dir() -> Option<PathBuf> {
     for _ in 0..5_u8 {
         let candidate = dir.join("dist/shell-integration");
         if candidate.is_dir() {
-            return Some(candidate);
+            return Some((candidate, ScriptsLayout::Dev));
         }
         dir = dir.parent()?;
     }
@@ -104,10 +134,12 @@ const HOOK_HELPER_BIN: &str = "scribe-hook-helper";
 
 /// Build extra environment variables for shell integration.
 ///
+/// Takes the [`ShellKind`] the launch already resolved rather than re-deriving
+/// it from the binary path.
+///
 /// Returns a `HashMap` to merge into `PtyOptions.env`.
-pub fn build_env(shell_binary: &str, scripts_dir: &Path) -> HashMap<String, String> {
+pub fn build_env(kind: ShellKind, scripts_dir: &Path) -> HashMap<String, String> {
     let mut env = HashMap::new();
-    let kind = detect_shell(shell_binary);
 
     env.insert("SCRIBE_SHELL_INTEGRATION".to_owned(), "1".to_owned());
 
@@ -116,10 +148,7 @@ pub fn build_env(shell_binary: &str, scripts_dir: &Path) -> HashMap<String, Stri
         ShellKind::Zsh => inject_zsh(&mut env, scripts_dir),
         ShellKind::Fish => inject_fish(&mut env, scripts_dir),
         ShellKind::Nushell => inject_nushell(&mut env, scripts_dir),
-        ShellKind::PowerShell => {}
-        ShellKind::Unknown => {
-            debug!(shell = shell_binary, "unknown shell, skipping integration env");
-        }
+        ShellKind::PowerShell | ShellKind::Unknown => {}
     }
 
     env
@@ -127,8 +156,8 @@ pub fn build_env(shell_binary: &str, scripts_dir: &Path) -> HashMap<String, Stri
 
 /// Resolve the integration script path for shells that require an explicit
 /// startup-file argument.
-pub fn integration_script_path(shell_binary: &str, scripts_dir: &Path) -> Option<PathBuf> {
-    let relative = match detect_shell(shell_binary) {
+pub fn integration_script_path(kind: ShellKind, scripts_dir: &Path) -> Option<PathBuf> {
+    let relative = match kind {
         ShellKind::Bash => "bash/scribe.bash",
         ShellKind::PowerShell => "powershell/scribe.ps1",
         ShellKind::Zsh | ShellKind::Fish | ShellKind::Nushell | ShellKind::Unknown => {
