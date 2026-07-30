@@ -54,7 +54,7 @@ use crate::lan::trust::{
 };
 use crate::pty_guard::PtyGuard;
 use crate::releases::{ReleaseCatalog, ReleaseFetcher};
-use crate::session_exit::{CancelWaiter, SessionExitGate};
+use crate::session_exit::{CancelWaiter, READER_JOIN_TIMEOUT, ReaderJoin, SessionExitGate};
 use crate::session_manager::{
     ManagedSession, SessionLaunchRequest, SessionManager, SessionSlot, build_term_config,
     snapshot_term,
@@ -384,6 +384,13 @@ pub type SessionAttachment = Arc<Mutex<Option<AttachedSessionIds>>>;
 
 /// Server-wide registry of all running sessions. Shared across client
 /// handlers and the handoff listener — sessions survive client disconnects.
+///
+/// **Lock order (spec 017 US1-1):** acquire this before the
+/// `workspace_manager` guard, never the other way round, and hold neither
+/// across an `.await`. A path that needs a workspace read first — `CloseWindow`
+/// resolving a window's session ids — must release it before it touches the
+/// registry, so the two never overlap in the opposite direction. The close
+/// protocol this exists for is documented in [`crate::session_exit`].
 pub type LiveSessionRegistry = Arc<RwLock<HashMap<SessionId, LiveSession>>>;
 
 /// Feature 015 (T006, D1): the single per-window share registry that replaces the
@@ -6317,6 +6324,44 @@ async fn handle_focus_changed(
     }
 }
 
+/// The wall-clock point a close path stops waiting for its readers.
+///
+/// `CloseWindow` computes this once and passes it to every session it is
+/// closing, so the bound covers the whole window rather than each pane.
+fn join_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + READER_JOIN_TIMEOUT
+}
+
+/// Step 3 of the close protocol: wait out a cancelled reader, bounded, and log
+/// whichever way it went (spec 017 US1-1, US1-3).
+///
+/// The caller must already have cancelled `gate` and must hold no lock — see
+/// [`crate::session_exit`] for why. Nothing here fails a close: a reader that
+/// outlives the bound is detached and reported, because the session is already
+/// unwired and the task holds nothing the close still needs.
+async fn join_reader_bounded(
+    session_id: SessionId,
+    gate: &SessionExitGate,
+    deadline: tokio::time::Instant,
+) {
+    match gate.join_reader_by(deadline).await {
+        ReaderJoin::Joined | ReaderJoin::Absent => {}
+        ReaderJoin::Failed(err) => {
+            warn!(%session_id, %err, "PTY reader task ended abnormally");
+        }
+        ReaderJoin::Detached => {
+            warn!(
+                %session_id,
+                bound_ms = READER_JOIN_TIMEOUT.as_millis(),
+                "PTY reader did not stop within the close bound — detaching it"
+            );
+        }
+        ReaderJoin::SelfJoin => {
+            warn!(%session_id, "reader join requested from the reader task itself — skipped");
+        }
+    }
+}
+
 /// Send `SIGHUP` to the child process of a handoff-restored session, but only
 /// once the PID is proven to still name that child (spec 017 US7-2).
 ///
@@ -6359,15 +6404,25 @@ fn signal_if_handoff_session(session_id: SessionId, session: &LiveSession) {
     }
 }
 
-/// Close a session and clean up. For fresh sessions [`PtyGuard::teardown`]
-/// hands the `Pty` to the blocking pool, where its `Drop` signals and reaps
-/// the child off any worker; for handoff-restored sessions (`pty: None`) we
-/// send SIGHUP explicitly so the child is not leaked. Neither guarantees an
-/// EOF — the child may ignore SIGHUP, and the
-/// master fd stays open in the reader and the resize fd regardless — so the
-/// close cancels the reader's exit gate up front and then drives the same
+/// Close a session and clean up, following the take-then-release-then-join
+/// protocol documented in [`crate::session_exit`] (spec 017 US1-1).
+///
+/// For fresh sessions [`PtyGuard::teardown`] hands the `Pty` to the blocking
+/// pool, where its `Drop` signals and reaps the child off any worker; for
+/// handoff-restored sessions (`pty: None`) we send SIGHUP explicitly so the
+/// child is not leaked. Neither guarantees an EOF — the child may ignore
+/// SIGHUP, and the master fd stays open in the reader and the resize fd
+/// regardless — so the close cancels the reader's exit gate, waits out the
+/// reader under the [`READER_JOIN_TIMEOUT`] bound, and then drives the same
 /// [`finalize_session_exit`] funnel the reader would have, as a backstop for a
 /// reader that cannot reach it.
+///
+/// The join comes after every unwiring step and before the funnel. It has to
+/// run with no guard held, because a reader finalizing itself takes both write
+/// locks on its way out; putting it last also means a wedged reader delays
+/// nothing but the exit notification, and in the ordinary case it lets the
+/// reader flush its final bytes ahead of `SessionExited`, since whichever path
+/// wins the funnel CAS is the one that emits.
 ///
 /// Per T019, on this clean-close path we also delete the session's encrypted
 /// env envelope (`<state_dir>/restore/env/<window_id>/<launch_id>.envz`) plus
@@ -6387,7 +6442,12 @@ async fn handle_close_session(
         return;
     }
 
+    // Step 1 — take: the registry write guard covers the removal and nothing
+    // else, and holds across no `.await`.
     let mut removed = live_sessions.write().await.remove(&session_id);
+    // Step 2 — released. Nothing below reacquires it, and the workspace guard
+    // is only taken once this one is gone.
+    //
     // Capture envelope coordinates before the session value is dropped so
     // we can fire the delete after SIGHUP cleanup. Cloned (rather than
     // moved) to keep the existing `drop(removed)` ordering.
@@ -6400,23 +6460,30 @@ async fn handle_close_session(
     if let Some(session) = &removed {
         signal_if_handoff_session(session_id, session);
     }
-    // SIGHUP + `waitpid` go to the blocking pool: a child that ignores the
-    // signal must not park the worker running this close.
-    if let Some(pty) = removed.as_mut().and_then(LiveSession::take_pty) {
-        pty.teardown();
-    }
+    let pty = removed.as_mut().and_then(LiveSession::take_pty);
     drop(removed);
-    // Cancel before anything that can await: this is what actually stops a
-    // reader whose child ignored SIGHUP, and it takes no lock.
+
+    // Step 3 — cancel, tear down, join. Cancellation is what actually stops a
+    // reader whose child ignored SIGHUP; the SIGHUP + `waitpid` behind
+    // `teardown` go to the blocking pool so the worker running this close is
+    // never parked behind the child.
     if let Some(handles) = &exit_handles {
         handles.exit_gate.cancel();
     }
+    if let Some(pty) = pty {
+        pty.teardown();
+    }
     {
+        // Second guard of the documented pair, taken only after the first is
+        // gone and released before the join below.
         let mut wm = workspace_manager.write().await;
         wm.remove_session(session_id);
         wm.remove_session_from_window(session_id);
     }
     attached_remove(attached_ids, session_id).await;
+    if let Some(handles) = &exit_handles {
+        join_reader_bounded(session_id, &handles.exit_gate, join_deadline()).await;
+    }
 
     // Best-effort envelope + DEK delete. `delete_envelope` is idempotent
     // and swallows `NotFound`, so it's safe to call when the feature was
@@ -6468,39 +6535,55 @@ async fn handle_close_session(
 /// [`finalize_pty_reader`] deliberately preserves envelopes so they remain
 /// available for cold-restart restore.
 ///
-/// Each destroyed session's reader is cancelled and funnelled through
+/// Each destroyed session's reader is cancelled, joined under the shared
+/// [`READER_JOIN_TIMEOUT`] bound, and funnelled through
 /// [`finalize_session_exit`] after the `WindowClosed` reply, so a child that
 /// ignores SIGHUP cannot leave a reader parked on a master fd that never EOFs.
+/// The take-then-release-then-join protocol is documented in
+/// [`crate::session_exit`] (spec 017 US1-1).
 async fn handle_close_window(window_id: WindowId, context: &ClientDispatchContext<'_>) {
     if window_id != context.window_id {
         send_error(context.writer, &format!("cannot close another window: {window_id}")).await;
         return;
     }
 
+    // The workspace read guard is a statement temporary: it is gone before the
+    // registry guard below, so this never inverts the documented lock order.
     let session_ids = context.server.workspace_manager.read().await.sessions_for_window(window_id);
     info!(%window_id, count = session_ids.len(), "closing window — destroying sessions");
 
-    // Destroy each session. For handoff-restored sessions (`pty: None`) we
-    // signal explicitly; fresh sessions keep their `PtyGuard`, torn down below
-    // once the registry guard is released. Exit handles are cloned out for the
-    // post-reply teardown, since neither signal guarantees the reader ever
-    // sees EOF.
-    let mut exit_handles = Vec::with_capacity(session_ids.len());
-    let mut ptys = Vec::with_capacity(session_ids.len());
+    // Step 1 — take: one registry write guard, holding nothing but the
+    // removals. The session values leave with it so the per-session work below
+    // (which includes the procfs identity read) runs with the global registry
+    // free, and so no `.await` can land inside the critical section.
+    let mut removed = Vec::with_capacity(session_ids.len());
     {
         let mut sessions = context.server.live_sessions.write().await;
-        for &sid in &session_ids {
-            if let Some(mut session) = sessions.remove(&sid) {
-                exit_handles.push((sid, session.exit_handles()));
-                signal_if_handoff_session(sid, &session);
-                ptys.extend(session.take_pty());
-            }
-            attached_remove(context.attached_ids, sid).await;
-        }
+        removed.extend(
+            session_ids
+                .iter()
+                .filter_map(|&sid| sessions.remove(&sid).map(|session| (sid, session))),
+        );
     }
-    // Registry guard released — only now do we hand the children to the
-    // blocking pool, so a SIGHUP-ignoring child can neither hold the global
-    // `live_sessions` write lock nor park a Tokio worker.
+    // Step 2 — released. For handoff-restored sessions (`pty: None`) we signal
+    // explicitly; fresh sessions keep their `PtyGuard`, torn down below. Exit
+    // handles are cloned out for the post-reply teardown, since neither signal
+    // guarantees the reader ever sees EOF.
+    let mut exit_handles = Vec::with_capacity(removed.len());
+    let mut ptys = Vec::with_capacity(removed.len());
+    for (sid, mut session) in removed {
+        exit_handles.push((sid, session.exit_handles()));
+        signal_if_handoff_session(sid, &session);
+        ptys.extend(session.take_pty());
+    }
+    // Every id the window claimed, not just the ones still live, so a session
+    // that raced out of the registry still leaves the client's attached set.
+    for &sid in &session_ids {
+        attached_remove(context.attached_ids, sid).await;
+    }
+    // Only now do we hand the children to the blocking pool, so a
+    // SIGHUP-ignoring child can neither hold the global `live_sessions` write
+    // lock nor park a Tokio worker.
     for pty in ptys {
         pty.teardown();
     }
@@ -6527,12 +6610,24 @@ async fn handle_close_window(window_id: WindowId, context: &ClientDispatchContex
 
     send_message(context.writer, &ServerMessage::WindowClosed { window_id }).await;
 
-    // Cancel and finalize only after the reply, so the pre-existing
-    // `WindowClosed`-then-`SessionExited` order the client's exit path expects
-    // is preserved. Cancellation is what makes a SIGHUP-ignoring child's
-    // reader stop at all; the funnel is the backstop for a reader that cannot.
-    for (sid, handles) in exit_handles {
+    // Step 3 — cancel, then join, then finalize, all after the reply so the
+    // pre-existing `WindowClosed`-then-`SessionExited` order the client's exit
+    // path expects is preserved. Cancellation is what makes a SIGHUP-ignoring
+    // child's reader stop at all; the funnel is the backstop for a reader that
+    // cannot get there itself.
+    //
+    // Every reader is cancelled before any is joined, and all of them share
+    // one deadline, so a window of wedged panes costs a single
+    // `READER_JOIN_TIMEOUT` rather than one per pane. No guard is held here:
+    // a reader finalizing itself takes both write locks on its way out.
+    for (_, handles) in &exit_handles {
         handles.exit_gate.cancel();
+    }
+    let deadline = join_deadline();
+    for (sid, handles) in &exit_handles {
+        join_reader_bounded(*sid, &handles.exit_gate, deadline).await;
+    }
+    for (sid, handles) in exit_handles {
         finalize_session_exit(
             &handles.exit_gate,
             SessionExitContext {
@@ -8379,6 +8474,11 @@ struct SessionExitContext<'a> {
 /// death can neither double-emit nor drop the notification. `exit` is
 /// [`ChildExit::UNKNOWN`] for every path except the watcher, which is the only
 /// observer of a real wait status.
+///
+/// This runs on the reader task too, so it never joins the reader; it takes
+/// the two write guards in the documented order (`live_sessions`, then
+/// `workspace_manager`) and holds neither across an `.await`. That is exactly
+/// why [`join_reader_bounded`] must be called with no guard held.
 async fn finalize_session_exit(
     gate: &SessionExitGate,
     ctx: SessionExitContext<'_>,
@@ -9945,6 +10045,51 @@ pub async fn activate_pending_sessions(
     }
 }
 
+/// Stop every PTY reader before the process exits (spec 017 US1-3).
+///
+/// Shutdown was otherwise the one exit path that abandoned tasks parked on a
+/// PTY read, so it runs the same cancel-then-bounded-join the close handlers
+/// use. It publishes nothing: each gate's exit CAS is claimed up front, so the
+/// funnel a cancelled reader reaches finds it taken and returns without
+/// emitting `SessionExited` or re-entering the registry. There is no socket
+/// left to notify by then, and the children stay with the `PtyGuard`s still
+/// parked on their sessions, whose `Drop` hangs them up off-worker as the
+/// registry unwinds — the pre-existing shutdown behaviour, unchanged.
+///
+/// Never call this on the handoff path; see [`defuse_for_handoff`].
+pub async fn shutdown_pty_readers(live_sessions: &LiveSessionRegistry) {
+    // Snapshot under a read guard and drop it before joining: a reader that
+    // claimed the funnel first is still entitled to the registry write lock on
+    // its way out, and the join must not be holding anything when it takes it.
+    let gates: Vec<(SessionId, Arc<SessionExitGate>)> = {
+        let sessions = live_sessions.read().await;
+        sessions.iter().map(|(&sid, session)| (sid, Arc::clone(&session.exit_gate))).collect()
+    };
+    if gates.is_empty() {
+        return;
+    }
+    info!(count = gates.len(), "stopping PTY readers for shutdown");
+    for (_, gate) in &gates {
+        let _claimed = gate.claim_exit();
+        gate.cancel();
+    }
+    // One deadline for the whole set, as in `CloseWindow`: every reader was
+    // cancelled above, so they wind down in parallel and shutdown is bounded
+    // once rather than once per session.
+    let deadline = join_deadline();
+    for (session_id, gate) in &gates {
+        join_reader_bounded(*session_id, gate, deadline).await;
+    }
+}
+
+/// Hand every live child to the incoming server on hot-reload.
+///
+/// Deliberately outside the close protocol in [`crate::session_exit`]: these
+/// sessions are not ending. Cancelling their readers would drive the exit
+/// funnel and publish `SessionExited` for panes the new server is about to
+/// keep serving, so [`shutdown_pty_readers`] must not run on this path either.
+/// These readers die with the process while the master fds live on in the new
+/// one.
 pub async fn defuse_for_handoff(live_sessions: &LiveSessionRegistry) {
     let mut sessions = live_sessions.write().await;
     for (&session_id, session) in sessions.iter_mut() {
