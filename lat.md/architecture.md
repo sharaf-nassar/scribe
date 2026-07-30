@@ -56,7 +56,7 @@ Thin CLI entry point that launches the client process.
 
 Tiny binary invoked by AI-tool hook adapter scripts and shell-integration scripts to emit one  to the server and exit 0.
 
-Reads `SCRIBE_HOOK_SOCK` and `SCRIBE_SESSION_ID` from env (both injected by Scribe into every PTY it spawns); no-ops silently when either is unset. The per-provider adapters in `dist/ai-hook-*.sh` translate AI tool hook stdin JSON into the helper's argv. The shell-integration scripts use `--event=env-delta` (with `--added-json`, `--removed-json`, and `--baseline-ready`) to feed `HookEventKind::EnvChanged` into the same channel. See  for the full pipeline and `specs/003-ai-hook-channel/` for the design docs.
+Reads `SCRIBE_HOOK_SOCK` and `SCRIBE_SESSION_ID` from env (both injected by Scribe into every PTY it spawns); no-ops silently when either is unset. The per-provider adapters in `dist/ai-hook-*.sh` translate AI tool hook stdin JSON into the helper's argv. The shell-integration scripts use `--event=env_delta` (with `--added-json`, `--removed-json`, and `--baseline-ready`) to feed `HookEventKind::EnvChanged` into the same channel. Accepted `--event` tokens are the clap `snake_case` renames of `EventKind`, and a mis-spelled one is dropped at `Cli::try_parse` with a silent exit 0 (FR-007) — no socket is ever opened — so a unit test scans every literal `--event=` and `--provider=` value under `dist/` and fails when a shipped script passes a token the helper would reject. See  for the full pipeline and `specs/003-ai-hook-channel/` for the design docs.
 
 ### scribe-test
 

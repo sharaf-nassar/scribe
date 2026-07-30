@@ -30,7 +30,7 @@ const EMIT_BUDGET: Duration = Duration::from_millis(100);
 struct Cli {
     /// AI provider id, one of `claude_code`, `codex_code`, or the
     /// synthetic `system` value used for non-AI events
-    /// (`--event=env-delta`). Unknown values cause exit 0 silently per
+    /// (`--event=env_delta`). Unknown values cause exit 0 silently per
     /// FR-014. `system` corresponds to [`AiProvider::System`] and is
     /// intentionally absent from the user-visible
     /// `AiProvider::all()` listing.
@@ -292,5 +292,86 @@ mod tests {
             HookEventKind::ContextChanged { fill_percent } => assert_eq!(fill_percent, 73),
             _ => panic!("expected ContextChanged"),
         }
+    }
+
+    /// Every literal `--flag=value` pair in the shipped scripts under
+    /// `dist/`, keyed by flag, with the file that carries it.
+    fn shipped_flag_values(flag: &str) -> Vec<(String, String)> {
+        let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist");
+        let mut files = Vec::new();
+        collect_files(&dist, &mut files);
+        assert!(!files.is_empty(), "no files found under {}", dist.display());
+
+        let needle = format!("--{flag}=");
+        let mut found = Vec::new();
+        for path in files {
+            let bytes = std::fs::read(&path).expect("read shipped script");
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let name = path.display().to_string();
+            found.extend(literal_values(&text, &needle).map(|value| (name.clone(), value)));
+        }
+        found
+    }
+
+    /// Values immediately following `needle` in `text`, up to the first
+    /// separator. Interpolated values are skipped — only literals pin the
+    /// contract.
+    fn literal_values<'a>(text: &'a str, needle: &'a str) -> impl Iterator<Item = String> + 'a {
+        text.match_indices(needle).filter_map(|(idx, _)| {
+            let value: String = text[idx + needle.len()..]
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !matches!(c, '\'' | '"' | '\\' | '`'))
+                .collect();
+            (!value.is_empty() && !value.contains('$')).then_some(value)
+        })
+    }
+
+    fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir).expect("read dist dir");
+        for entry in entries {
+            let path = entry.expect("dist dir entry").path();
+            if path.is_dir() {
+                collect_files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Pins the helper CLI contract against what the shipped scripts pass:
+    /// a script spelling that `Cli::try_parse` rejects is dropped silently
+    /// (FR-007), so the event would never reach the server.
+    #[test]
+    fn shipped_scripts_use_parseable_event_tokens() {
+        use clap::ValueEnum;
+
+        let events = shipped_flag_values("event");
+        assert!(events.len() >= 10, "expected the shipped --event literals, got {events:?}");
+        for (file, token) in &events {
+            assert!(
+                EventKind::from_str(token, false).is_ok(),
+                "{file} passes --event={token}, which the helper rejects"
+            );
+        }
+        assert!(
+            events.iter().any(|(_, token)| token == "env_delta"),
+            "shell integration's env-delta emit is missing from dist/"
+        );
+    }
+
+    #[test]
+    fn shipped_scripts_use_known_provider_ids() {
+        let providers = shipped_flag_values("provider");
+        assert!(!providers.is_empty(), "expected --provider literals under dist/");
+        for (file, id) in &providers {
+            assert!(
+                AiProvider::from_id(id).is_some(),
+                "{file} passes --provider={id}, which the helper rejects"
+            );
+        }
+        assert!(
+            providers.iter().any(|(_, id)| id == "system"),
+            "shell integration's system-provider emit is missing from dist/"
+        );
     }
 }

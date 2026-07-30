@@ -233,7 +233,7 @@ function global:__Scribe-EmitEnvDelta {
     $removedJson = __Scribe-ArrayToJson $removedList.ToArray()
 
     try {
-        & $global:ScribeHookHelper --provider=system --event=env-delta `
+        & $global:ScribeHookHelper --provider=system --event=env_delta `
             "--added-json=$addedJson" "--removed-json=$removedJson" `
             2>$null | Out-Null
     } catch {
@@ -248,7 +248,7 @@ function global:__Scribe-EmitEnvBaseline {
     $global:ScribeEnvLast = $snap
     $addedJson = __Scribe-HashToJson $snap
     try {
-        & $global:ScribeHookHelper --provider=system --event=env-delta `
+        & $global:ScribeHookHelper --provider=system --event=env_delta `
             "--added-json=$addedJson" --removed-json='[]' --baseline-ready `
             2>$null | Out-Null
     } catch { }

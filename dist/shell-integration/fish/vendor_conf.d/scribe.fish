@@ -294,7 +294,7 @@ function __scribe_emit_env_delta --on-event fish_prompt
         return 0
     end
 
-    $__scribe_hook_helper --provider=system --event=env-delta \
+    $__scribe_hook_helper --provider=system --event=env_delta \
         --added-json=$added --removed-json=$removed \
         </dev/null >/dev/null 2>&1
     or true
@@ -310,7 +310,7 @@ function __scribe_emit_env_baseline
     set -g __scribe_env_last_names $__scribe_env_snap_names
     set -g __scribe_env_last_values $__scribe_env_snap_values
     set -l added (__scribe_build_added_json __scribe_env_last_names __scribe_env_last_values)
-    $__scribe_hook_helper --provider=system --event=env-delta \
+    $__scribe_hook_helper --provider=system --event=env_delta \
         --added-json=$added --removed-json='[]' --baseline-ready \
         </dev/null >/dev/null 2>&1
     or true

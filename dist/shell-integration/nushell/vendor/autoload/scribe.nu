@@ -323,7 +323,7 @@ def --env __scribe-emit-env-delta [] {
     let removed_arg = $"--removed-json=($removed_json)"
     let helper = ($env.SCRIBE_HOOK_HELPER? | default "scribe-hook-helper")
     try {
-        ^$helper --provider=system --event=env-delta $added_arg $removed_arg | complete | ignore
+        ^$helper --provider=system --event=env_delta $added_arg $removed_arg | complete | ignore
     } catch { }
 
     $env.__SCRIBE_ENV_LAST = $now
@@ -337,7 +337,7 @@ def --env __scribe-emit-env-baseline [] {
     let added_arg = $"--added-json=($added_json)"
     let helper = ($env.SCRIBE_HOOK_HELPER? | default "scribe-hook-helper")
     try {
-        ^$helper --provider=system --event=env-delta $added_arg --removed-json='[]' --baseline-ready | complete | ignore
+        ^$helper --provider=system --event=env_delta $added_arg --removed-json='[]' --baseline-ready | complete | ignore
     } catch { }
 }
 
