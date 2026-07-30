@@ -153,6 +153,15 @@ if ($env:SCRIBE_RESTORE_ENV_DELTA_FILE -and (Test-Path $env:SCRIBE_RESTORE_ENV_D
     Remove-Item env:SCRIBE_RESTORE_ENV_DELTA_FILE -ErrorAction SilentlyContinue
 }
 
+# Absolute path to the hook helper, injected by the server for whichever
+# install layout is live. Packaged installs never put it on PATH, so the
+# bare name is only a dev-shell fallback.
+$global:ScribeHookHelper = if ($env:SCRIBE_HOOK_HELPER) {
+    $env:SCRIBE_HOOK_HELPER
+} else {
+    'scribe-hook-helper'
+}
+
 # Per-session "last emitted" snapshot as a hashtable (global so the
 # globally-scoped emit functions defined below can read and update it
 # uniformly across invocations from the wrapped `prompt` function).
@@ -222,7 +231,7 @@ function global:__Scribe-EmitEnvDelta {
     $removedJson = __Scribe-ArrayToJson $removedList.ToArray()
 
     try {
-        & scribe-hook-helper --provider=system --event=env-delta `
+        & $global:ScribeHookHelper --provider=system --event=env-delta `
             "--added-json=$addedJson" "--removed-json=$removedJson" `
             2>$null | Out-Null
     } catch {
@@ -237,7 +246,7 @@ function global:__Scribe-EmitEnvBaseline {
     $global:ScribeEnvLast = $snap
     $addedJson = __Scribe-HashToJson $snap
     try {
-        & scribe-hook-helper --provider=system --event=env-delta `
+        & $global:ScribeHookHelper --provider=system --event=env-delta `
             "--added-json=$addedJson" --removed-json='[]' --baseline-ready `
             2>$null | Out-Null
     } catch { }

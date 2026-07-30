@@ -148,6 +148,15 @@ if set -q SCRIBE_RESTORE_ENV_DELTA_FILE
     set -e SCRIBE_RESTORE_ENV_DELTA_FILE
 end
 
+# Absolute path to the hook helper, injected by the server for whichever
+# install layout is live. Packaged installs never put it on PATH, so the
+# bare name is only a dev-shell fallback.
+if set -q SCRIBE_HOOK_HELPER; and test -n "$SCRIBE_HOOK_HELPER"
+    set -g __scribe_hook_helper $SCRIBE_HOOK_HELPER
+else
+    set -g __scribe_hook_helper scribe-hook-helper
+end
+
 # Per-session "last emitted" snapshot stored as two parallel lists.
 # Fish has no associative arrays, so we use name/value lists indexed
 # in lockstep.
@@ -285,7 +294,7 @@ function __scribe_emit_env_delta --on-event fish_prompt
         return 0
     end
 
-    scribe-hook-helper --provider=system --event=env-delta \
+    $__scribe_hook_helper --provider=system --event=env-delta \
         --added-json=$added --removed-json=$removed \
         </dev/null >/dev/null 2>&1
     or true
@@ -301,7 +310,7 @@ function __scribe_emit_env_baseline
     set -g __scribe_env_last_names $__scribe_env_snap_names
     set -g __scribe_env_last_values $__scribe_env_snap_values
     set -l added (__scribe_build_added_json __scribe_env_last_names __scribe_env_last_values)
-    scribe-hook-helper --provider=system --event=env-delta \
+    $__scribe_hook_helper --provider=system --event=env-delta \
         --added-json=$added --removed-json='[]' --baseline-ready \
         </dev/null >/dev/null 2>&1
     or true
