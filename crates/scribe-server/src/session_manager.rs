@@ -623,6 +623,14 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
         ("SCRIBE_HOOK_SOCK".to_owned(), server_socket_path().to_string_lossy().into_owned()),
         ("SCRIBE_SESSION_ID".to_owned(), session_id.to_full_string()),
     ]);
+    // Packaged layouts do not put `scribe-hook-helper` on `PATH`, so hand the
+    // shells and the `ai-hook-*.sh` adapters an absolute path when we can
+    // resolve one. Injected unconditionally: AI hooks run even with shell
+    // integration disabled. Absence leaves the scripts on their PATH fallback.
+    if let Some(helper) = shell_integration::find_hook_helper() {
+        env.insert("SCRIBE_HOOK_HELPER".to_owned(), helper.to_string_lossy().into_owned());
+    }
+
     if integration_enabled {
         inject_shell_integration_env(shell_binary, &mut env);
     }

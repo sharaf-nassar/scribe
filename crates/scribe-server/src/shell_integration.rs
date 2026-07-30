@@ -62,6 +62,46 @@ pub fn find_scripts_dir() -> Option<PathBuf> {
     None
 }
 
+/// Resolve the `scribe-hook-helper` binary for the current install layout.
+///
+/// A bare PATH lookup only works for dev shells that happen to have
+/// `target/<profile>` on `PATH`; none of the packaged layouts install the
+/// helper into a PATH directory. The server therefore resolves it here and
+/// exports the absolute path as `SCRIBE_HOOK_HELPER` (see
+/// `specs/017-audit-findings-triage/spec.md` OQ5), which the shell
+/// integration scripts and the `ai-hook-*.sh` adapters both honour.
+///
+/// Covers all four layouts: DMG (`Contents/MacOS`) and dev builds
+/// (`target/<profile>`) place the helper next to the server binary; prod-deb
+/// and dev-deb place it under `/usr/share/<flavor>/`.
+pub fn find_hook_helper() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let found = resolve_hook_helper(exe.parent()?, current_identity().share_dir_name());
+    if found.is_none() {
+        debug!("scribe-hook-helper not found for this layout; falling back to PATH");
+    }
+    found
+}
+
+/// Layout probe behind [`find_hook_helper`], split out so the four packaged
+/// layouts can be exercised without moving the running executable.
+fn resolve_hook_helper(exe_dir: &Path, share_dir_name: &str) -> Option<PathBuf> {
+    // macOS bundle (Contents/MacOS/) and dev builds (target/<profile>/) both
+    // keep the helper next to the server binary.
+    let sibling = exe_dir.join(HOOK_HELPER_BIN);
+    if sibling.is_file() {
+        return Some(sibling);
+    }
+
+    // Installed Linux, both flavors: /usr/bin/scribe-server →
+    // /usr/share/{scribe,scribe-dev}/scribe-hook-helper.
+    let installed = exe_dir.parent()?.join("share").join(share_dir_name).join(HOOK_HELPER_BIN);
+    installed.is_file().then_some(installed)
+}
+
+/// File name of the hook helper binary shipped alongside the server.
+const HOOK_HELPER_BIN: &str = "scribe-hook-helper";
+
 /// Build extra environment variables for shell integration.
 ///
 /// Returns a `HashMap` to merge into `PtyOptions.env`.

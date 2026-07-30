@@ -340,7 +340,7 @@ __scribe_emit_env_delta() {
 		return 0
 	fi
 
-	scribe-hook-helper --provider=system --event=env-delta \
+	"${SCRIBE_HOOK_HELPER:-scribe-hook-helper}" --provider=system --event=env-delta \
 		--added-json="$added" --removed-json="$removed" \
 		</dev/null >/dev/null 2>&1 || true
 
@@ -358,7 +358,7 @@ __scribe_emit_env_baseline() {
 	__scribe_snapshot_env __scribe_env_last
 	local added
 	added=$(__scribe_build_added_json __scribe_env_last)
-	scribe-hook-helper --provider=system --event=env-delta \
+	"${SCRIBE_HOOK_HELPER:-scribe-hook-helper}" --provider=system --event=env-delta \
 		--added-json="$added" --removed-json='[]' --baseline-ready \
 		</dev/null >/dev/null 2>&1 || true
 }

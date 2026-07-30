@@ -253,7 +253,7 @@ if ('SCRIBE_RESTORE_ENV_DELTA_FILE' in $env) {
 $env.__SCRIBE_ENV_LAST = (__scribe-snapshot-env)
 
 # Per-prompt delta hook. Diffs the current $env against the cached
-# snapshot, emits via scribe-hook-helper only on non-empty change.
+# snapshot, emits via the resolved hook helper only on non-empty change.
 def --env __scribe-emit-env-delta [] {
     let now = (__scribe-snapshot-env)
     let prev = ($env.__SCRIBE_ENV_LAST? | default {})
@@ -280,8 +280,9 @@ def --env __scribe-emit-env-delta [] {
     let removed_json = (__scribe-build-array $removed)
     let added_arg = $"--added-json=($added_json)"
     let removed_arg = $"--removed-json=($removed_json)"
+    let helper = ($env.SCRIBE_HOOK_HELPER? | default "scribe-hook-helper")
     try {
-        ^scribe-hook-helper --provider=system --event=env-delta $added_arg $removed_arg | complete | ignore
+        ^$helper --provider=system --event=env-delta $added_arg $removed_arg | complete | ignore
     } catch { }
 
     $env.__SCRIBE_ENV_LAST = $now
@@ -293,8 +294,9 @@ def --env __scribe-emit-env-baseline [] {
     $env.__SCRIBE_ENV_LAST = $snapshot
     let added_json = (__scribe-build-object $snapshot)
     let added_arg = $"--added-json=($added_json)"
+    let helper = ($env.SCRIBE_HOOK_HELPER? | default "scribe-hook-helper")
     try {
-        ^scribe-hook-helper --provider=system --event=env-delta $added_arg --removed-json='[]' --baseline-ready | complete | ignore
+        ^$helper --provider=system --event=env-delta $added_arg --removed-json='[]' --baseline-ready | complete | ignore
     } catch { }
 }
 

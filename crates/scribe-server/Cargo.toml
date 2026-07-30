@@ -110,6 +110,16 @@ assets = [
     "usr/share/scribe/shell-integration/fish/vendor_conf.d/",
     "644",
   ],
+  [
+    "../../dist/shell-integration/nushell/vendor/autoload/scribe.nu",
+    "usr/share/scribe/shell-integration/nushell/vendor/autoload/",
+    "644",
+  ],
+  [
+    "../../dist/shell-integration/powershell/scribe.ps1",
+    "usr/share/scribe/shell-integration/powershell/",
+    "644",
+  ],
 ]
 maintainer-scripts = "../../dist/debian/"
 
@@ -206,6 +216,16 @@ assets = [
   [
     "../../dist/shell-integration/fish/vendor_conf.d/scribe.fish",
     "usr/share/scribe-dev/shell-integration/fish/vendor_conf.d/",
+    "644",
+  ],
+  [
+    "../../dist/shell-integration/nushell/vendor/autoload/scribe.nu",
+    "usr/share/scribe-dev/shell-integration/nushell/vendor/autoload/",
+    "644",
+  ],
+  [
+    "../../dist/shell-integration/powershell/scribe.ps1",
+    "usr/share/scribe-dev/shell-integration/powershell/",
     "644",
   ],
 ]

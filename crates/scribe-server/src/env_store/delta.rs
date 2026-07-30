@@ -35,6 +35,7 @@ pub const EXCLUSION_SET: &[&str] = &[
     "TERM_PROGRAM_VERSION",
     "SCRIBE_HOOK_SOCK",
     "SCRIBE_SESSION_ID",
+    "SCRIBE_HOOK_HELPER",
     "SCRIBE_RESTORE_ENV_DELTA_FILE",
     // Terminal identification (Scribe injects fresh values)
     "TERM",
