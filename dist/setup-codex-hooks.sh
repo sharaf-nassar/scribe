@@ -272,20 +272,16 @@ SCRIBE_HOOKS = [
         {"type": "command", "command": f'"{adapter}" permission_request'},
     ]),
     ("PreToolUse", None, [
-        {"type": "command", "command": f'"{adapter}" tool_processing'},
+        {"type": "command", "command": f'"{adapter}" pre_tool_use'},
     ]),
+    # One adapter invocation per Codex event: `post_tool_use` and `stop`
+    # each carry their state transition *and* the context-percent refresh,
+    # which used to be a second `context` registration on the same event.
     ("PostToolUse", None, [
-        {"type": "command", "command": f'"{adapter}" tool_processing'},
+        {"type": "command", "command": f'"{adapter}" post_tool_use', "timeout": 10},
     ]),
     ("Stop", None, [
         {"type": "command", "command": f'"{adapter}" stop', "timeout": 30},
-    ]),
-    # Context % producer also fires on PostToolUse (no matcher) and Stop.
-    ("PostToolUse", None, [
-        {"type": "command", "command": f'"{adapter}" context', "timeout": 10},
-    ]),
-    ("Stop", None, [
-        {"type": "command", "command": f'"{adapter}" context', "timeout": 10},
     ]),
 ]
 
@@ -572,6 +568,35 @@ def scribe_trust_entries_for(source_path, hooks_by_event, base_indices=None):
     return trust_entries
 
 
+def scribe_state_keys(source_path, hooks_by_event):
+    """Hook-state keys the Scribe hooks occupied *before* this run.
+
+    Consolidating Stop/PostToolUse to one adapter each changes both the
+    registered command strings and how many groups Scribe owns per event,
+    so the trusted-hash blocks from the previous layout match neither the
+    new keys nor the new hashes and would otherwise be left behind
+    forever. They are stripped by key, which is exact regardless of how
+    the old commands were spelled.
+    """
+    keys = set()
+    if not isinstance(hooks_by_event, dict):
+        return keys
+    for event in HOOK_EVENTS:
+        groups = hooks_by_event.get(event, [])
+        if not isinstance(groups, list):
+            continue
+        for group_index, entry in enumerate(groups):
+            if not isinstance(entry, dict):
+                continue
+            for hook_index, hook in enumerate(entry.get("hooks", [])):
+                if not isinstance(hook, dict):
+                    continue
+                if not command_is_scribe(hook.get("command", "")):
+                    continue
+                keys.add(f"{source_path}:{HOOK_EVENT_LABELS[event]}:{group_index}:{hook_index}")
+    return keys
+
+
 def prior_trust_entries_for(source_path, hooks_by_event, existing_state, base_indices=None):
     base_indices = base_indices or {}
     trusted_by_hash = {}
@@ -719,11 +744,11 @@ def append_hook_state_entries(text, trust_entries, existing_state):
     return text.rstrip() + "\n\n" + "\n\n".join(blocks) + "\n"
 
 
-def update_hook_trust_state(text, trust_entries):
+def update_hook_trust_state(text, trust_entries, stale_keys=None):
     existing_state = collect_hook_state(text)
     keys = {entry[0] for entry in trust_entries}
     trusted_hashes = {entry[1] for entry in trust_entries}
-    text = strip_hook_state_blocks(text, keys, trusted_hashes)
+    text = strip_hook_state_blocks(text, keys | set(stale_keys or ()), trusted_hashes)
     return append_hook_state_entries(text, trust_entries, existing_state)
 
 
@@ -737,6 +762,8 @@ if inline_hooks_present(config_text):
             if not is_scribe_hook(entry):
                 migrated_by_event.setdefault(event, []).append(entry)
 
+    stale_scribe_keys = scribe_state_keys(config_path, parse_inline_hooks(config_text))
+    stale_scribe_keys |= scribe_state_keys(hooks_path, hooks_json_config.get("hooks", {}))
     config_text = strip_scribe_inline_hooks(config_text)
     existing_state = collect_hook_state(config_text)
     existing_inline_by_event = parse_inline_hooks(config_text)
@@ -752,7 +779,7 @@ if inline_hooks_present(config_text):
     trust_entries.extend(prior_trust_entries_for(config_path, existing_inline_by_event, existing_state))
     trust_entries.extend(prior_trust_entries_for(config_path, migrated_by_event, existing_state, migrated_base_indices))
     trust_entries.extend(scribe_trust_entries_for(config_path, scribe_by_event, scribe_base_indices))
-    config_text = update_hook_trust_state(config_text, trust_entries)
+    config_text = update_hook_trust_state(config_text, trust_entries, stale_scribe_keys)
     config_written = write_text_if_changed(config_path, config_text, original_config_text)
 
     removed_hooks_json = original_hooks_text is not None
@@ -768,6 +795,7 @@ if inline_hooks_present(config_text):
     print("  Scribe Codex hooks routed via scribe-hook-helper IPC (inline TOML).")
 else:
     config = parse_hooks_json(original_hooks_text)
+    stale_scribe_keys = scribe_state_keys(hooks_path, config.get("hooks", {}))
     hooks = config.setdefault("hooks", {})
 
     for event, scribe_entries in scribe_by_event.items():
@@ -782,7 +810,7 @@ else:
     trust_entries = []
     trust_entries.extend(prior_trust_entries_for(hooks_path, hooks, existing_state))
     trust_entries.extend(scribe_trust_entries_for(hooks_path, hooks))
-    config_text = update_hook_trust_state(config_text, trust_entries)
+    config_text = update_hook_trust_state(config_text, trust_entries, stale_scribe_keys)
     config_written = write_text_if_changed(config_path, config_text, original_config_text)
 
     print("  Enabled [features].hooks = true")

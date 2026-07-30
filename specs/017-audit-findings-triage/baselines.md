@@ -142,6 +142,111 @@ costs 3 interpreter starts and 3 helper starts for one logical event.
    table — the after-side may have changed which adapters a Codex event
    fans out to).
 
+### After side: one adapter, one interpreter per Codex event (bead `scribe-i79.7`)
+
+Measured on 2026-07-30 with the reproduction rig above, against worktree
+base `208d9dc`. Three columns, because the Wave 0 numbers predate the
+payload-transport change: `b90c932` is the Wave 0 table, `208d9dc` is the
+same rig re-run on the merge base this bead branched from, and `after` is
+the consolidated adapter. `208d9dc` reproduces `b90c932` exactly except
+for `stop`, which is one exec cheaper since `ac81eff` dropped the
+`mktemp` hand-off — so the merge-base column is the honest before side
+for this change.
+
+| Codex event | adapter invocations after | execve `b90c932` | execve `208d9dc` | execve after | `python3` before → after | helper before → after |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `SessionStart` | `session_start` | 7 | 7 | **5** | 1 → 1 | 2 → 2 |
+| `UserPromptSubmit` | `user_prompt_submit` | 10 | 10 | **6** | 3 → 1 | 3 → 3 |
+| `PermissionRequest` | `permission_request` | 6 | 6 | **4** | 1 → 1 | 1 → 1 |
+| `PreToolUse` | `pre_tool_use` | 5 | 5 | **4** | 0 → 0 | 1 → 1 |
+| `PostToolUse` | `post_tool_use` | 11 | 11 | **5** | 1 → 1 | 2 → 2 |
+| `Stop` | `stop` | 14 | 13 | **5** | 3 → 1 | 2 → 2 |
+
+Every event is down to **one adapter invocation and at most one
+interpreter start**, against three interpreter starts spread over two
+invocations on `Stop` and `UserPromptSubmit` before. The socket sink
+recorded one connection per helper exec on every case in both columns, so
+each surviving emit is a real frame and none of the drop is lost events.
+
+Three things account for the difference:
+
+- **One adapter per event.** `post_tool_use` and `stop` now carry the
+  context-percent refresh that used to be a second `context`
+  registration, so `PostToolUse` and `Stop` stop paying the `sh` +
+  adapter + `dirname` + `cat` scaffolding twice.
+- **One interpreter per invocation.** A single `python3` run reads the
+  hook JSON once and prints the emit plan — one
+  `<helper-event> <json-document>` line per helper call — instead of a
+  fresh `python3 -c` per field.
+- **No `dirname`, no `cat`.** Helper resolution uses `${0%/*}`, and the
+  interpreter reads stdin directly instead of buffering it through
+  `PAYLOAD=$(cat)`. `pre_tool_use` is the one path that still spends a
+  `cat`: it needs no field of the payload, so it starts no interpreter,
+  but it must still drain the pipe Codex is blocked writing into.
+
+#### Transcript-tail memoization (#40)
+
+`context_fill` memoizes the 64 KiB tail parse in
+`$XDG_RUNTIME_DIR/scribe/codex-context.json` (falling back to
+`XDG_CACHE_HOME`, then `~/.cache`), 0600, keyed on the transcript's size
+and `st_mtime_ns` and capped at 16 entries. Counting `openat` on the
+214,595-byte fixture transcript across three consecutive `post_tool_use`
+events: **1, 0, 0**. Appending a fresh `token_count` record moves the
+emitted percentage 15 → 50 on the next event and the one after that is a
+hit again, so growth invalidates and only growth invalidates. Every tool
+call after the first in a model turn now re-derives nothing.
+
+#### Advisory wall time
+
+20 untraced iterations per event after one warm-up, real release helper
+against a live socket sink, two independent passes. The measurement mutex
+was not taken — sibling Wave 2 builds held the host at load 12-16 of 64
+throughout — so these are advisory and the exec counts above are the
+result. Per-event totals sum the invocations each side registers.
+
+| Codex event | before ms (pass 1 / 2) | after ms (pass 1 / 2) |
+| --- | ---: | ---: |
+| `SessionStart` | 26.2 / 29.7 | 29.3 / 26.1 |
+| `UserPromptSubmit` | 72.5 / 68.9 | 33.5 / 32.0 |
+| `PermissionRequest` | 24.7 / 29.0 | 24.9 / 28.1 |
+| `PreToolUse` | 5.1 / 5.6 | 3.5 / 3.7 |
+| `PostToolUse` | 32.6 / 29.9 | 29.8 / 27.0 |
+| `Stop` | 73.4 / 75.9 | 31.1 / 31.8 |
+
+`UserPromptSubmit` and `Stop` halve, which is the two redundant
+interpreter starts each was paying. The events that already ran one
+interpreter are flat inside the noise: a `python3` start is ~20 ms and
+dominates everything the consolidation removes.
+
+#### Behaviour and installer migration
+
+The rig also diffs what the helper actually receives. Every event emits
+the same helper events with the same values as `208d9dc`, with
+`conversation_id`, `text`, `label`, `last_message`, and `fill_percent`
+moved from argv into the `--payload-stdin` document; a 204,800-byte
+prompt still arrives whole (204,841 bytes on stdin). Contract checks hold
+on every path — exit 0, no stdout, no stderr — for a malformed payload, an
+empty payload, a JSON array payload, an unknown event name, no argv at
+all, a missing helper, and a transcript path outside `~/.codex/sessions`.
+With `python3` absent from `PATH` the adapter falls back to the
+field-free half of each event, delivering exactly the events the old
+per-field extractions delivered when they all failed.
+
+The installer migration was exercised old-installer-then-new-installer in
+both config shapes (`hooks.json` and inline `[[hooks.*]]` TOML), with a
+third-party `Stop` hook the user had already trusted and one Scribe hook
+flipped to `enabled = false`. After the new run, recomputing
+`command_hook_trusted_hash` over every registered hook: all six Scribe
+hooks trusted, the third-party hook still trusted at its shifted index
+(`stop:2:0` → `stop:1:0` in the `hooks.json` shape), the disabled Scribe
+hook still disabled, no hook-state block left behind. Without the
+stale-key strip the same run leaves `post_tool_use:1:0` and `stop:1:0`
+(inline: `stop:2:0`) behind carrying pre-consolidation hashes — and in
+the `hooks.json` shape the leftover `stop:1:0` block names the
+third-party hook while carrying Scribe's old `context` hash, which is the
+untrusting the plan's risk register named. A second new-installer run
+leaves `config.toml`'s inode, mtime, and size untouched.
+
 ## Search and attach lock/alloc measurements
 
 Cost of the `Term`-lock critical sections that US8 and US2 shrink:
