@@ -394,21 +394,33 @@ impl SessionManager {
 
         let shell = ResolvedShell::for_request(request.command.as_deref());
 
+        // One config read per spawn drives both the restore-apply decision
+        // and the shell-side gate var, so a launch cannot see the feature as
+        // enabled in one half and disabled in the other.
+        let env_persistence = env_persistence_enabled();
+
         // Cold-restart restore-apply (FR-005 / FR-008): if the launch names
         // an env envelope, decrypt it now and stage a per-spawn temp file
         // for the shell integration script to source. Fail-safe per FR-016:
         // any error here returns `None` so the session still spawns with rc
         // defaults instead of being blocked by the keystore.
         let restore_env_file = match request.env_envelope_id.as_deref() {
-            Some(envelope_id) => {
+            Some(envelope_id) if env_persistence => {
                 prepare_restore_env_file(request.window_id, session_id, envelope_id, shell.kind)
                     .await
             }
-            None => None,
+            _ => None,
         };
 
-        let launch =
-            self.prepare_session_launch(session_id, request, &shell, restore_env_file.as_deref());
+        let launch = self.prepare_session_launch(
+            session_id,
+            request,
+            &shell,
+            EnvLaunchContext {
+                restore_file: restore_env_file.as_deref(),
+                persistence_enabled: env_persistence,
+            },
+        );
         let pty = launch.spawn_pty()?;
         let managed = launch.into_managed_session(pty, slot)?;
         self.sessions.write().await.insert(session_id, managed);
@@ -436,7 +448,7 @@ impl SessionManager {
         session_id: SessionId,
         request: SessionLaunchRequest,
         shell: &ResolvedShell,
-        restore_env_file: Option<&std::path::Path>,
+        env: EnvLaunchContext<'_>,
     ) -> PreparedSessionLaunch {
         let shell_binary = shell.binary.as_str();
         let scrollback_lines = self.scrollback_lines.load(Ordering::Relaxed);
@@ -461,7 +473,8 @@ impl SessionManager {
             cwd: request.cwd,
             shell_kind: shell.kind,
             integration_enabled,
-            restore_env_file,
+            restore_env_file: env.restore_file,
+            env_persistence: env.persistence_enabled,
         });
 
         PreparedSessionLaunch {
@@ -700,6 +713,17 @@ fn session_geometry(size: Option<TerminalSize>) -> SessionGeometry {
     SessionGeometry { dimensions, window_size, cell_width, cell_height }
 }
 
+/// The env-persistence half of a launch, resolved from one config read.
+///
+/// `restore_file` is `Some` only when the launch named an envelope that
+/// decrypted; `persistence_enabled` is what the shells' gate var carries.
+/// The two travel together so they cannot disagree about one spawn.
+#[derive(Clone, Copy)]
+struct EnvLaunchContext<'a> {
+    restore_file: Option<&'a std::path::Path>,
+    persistence_enabled: bool,
+}
+
 /// Inputs to [`build_pty_options`]. Grouped into a struct so the call site
 /// stays under Clippy's `too_many_arguments` threshold and remains readable
 /// alongside the other prepared-launch fields.
@@ -710,6 +734,7 @@ struct PtyOptionsBuild<'a> {
     shell_kind: ShellKind,
     integration_enabled: bool,
     restore_env_file: Option<&'a std::path::Path>,
+    env_persistence: bool,
 }
 
 fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
@@ -720,6 +745,7 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
         shell_kind,
         integration_enabled,
         restore_env_file,
+        env_persistence,
     } = opts;
     let mut env = HashMap::from([
         ("TERM".to_owned(), "xterm-256color".to_owned()),
@@ -739,6 +765,15 @@ fn build_pty_options(opts: PtyOptionsBuild<'_>) -> PtyOptions {
     if let Some(helper) = shell_integration::find_hook_helper() {
         env.insert("SCRIBE_HOOK_HELPER".to_owned(), helper.to_string_lossy().into_owned());
     }
+
+    // Spawn-time persistence gate. With the feature off the server drops
+    // every `EnvChanged` at the ingress gate, so the shells' baseline
+    // snapshot, per-prompt snapshot/diff, and helper fork are pure waste;
+    // the scripts skip all of it when this reads `0`. The value is fixed at
+    // spawn because no server-to-running-shell channel exists — a live
+    // config flip binds newly started shells only, which is the documented
+    // "restart or re-init required" semantic in both directions.
+    env.insert("SCRIBE_ENV_PERSIST".to_owned(), if env_persistence { "1" } else { "0" }.to_owned());
 
     if integration_enabled {
         inject_shell_integration_env(shell_kind, &mut env);
@@ -1325,13 +1360,33 @@ mod tests {
 // PTY's process so env stays intact and no apply is needed.
 // ---------------------------------------------------------------------------
 
+/// Read `terminal.env_persistence.enabled` once for a spawn.
+///
+/// Fails safe to `false`, matching the `EnvChanged` ingress gate: a config
+/// we cannot read means every env event is dropped server-side, so neither
+/// the restore-apply nor the shells' snapshot machinery should run. Reading
+/// from disk here is fine — this is session creation, not a hot path.
+fn env_persistence_enabled() -> bool {
+    match scribe_common::config::load_config() {
+        Ok(cfg) => cfg.terminal.env_persistence.enabled,
+        Err(e) => {
+            tracing::warn!(
+                target: "scribe_server::session_manager",
+                error = ?e,
+                "load_config failed during spawn; env persistence gated off for this shell"
+            );
+            false
+        }
+    }
+}
+
 /// Decrypt the per-session env envelope, write a shell-source-compatible
 /// temp file, and return the absolute path. The shell integration script
 /// sources this path after rc has run, applies the deltas, and unlinks the
 /// file.
 ///
-/// Returns `None` (via early returns) when:
-///   * persistence is disabled in config;
+/// The caller feature-gates the call; this helper returns `None` (via early
+/// returns) when:
 ///   * no envelope exists for this launch (normal first-time session state);
 ///   * the keystore is unavailable / decrypt fails (FR-016 fail-safe);
 ///   * `XDG_RUNTIME_DIR` is unavailable; or
@@ -1345,24 +1400,6 @@ async fn prepare_restore_env_file(
     env_envelope_id: &str,
     kind: ShellKind,
 ) -> Option<std::path::PathBuf> {
-    // Feature-flag gate. Loading config off the hot path is fine here: this
-    // helper only runs when the launch names an envelope (the cold-restart
-    // path), not on every session creation.
-    let enabled = match scribe_common::config::load_config() {
-        Ok(cfg) => cfg.terminal.env_persistence.enabled,
-        Err(e) => {
-            tracing::warn!(
-                target: "scribe_server::session_manager",
-                error = ?e,
-                "load_config failed during env restore; spawning without env apply"
-            );
-            return None;
-        }
-    };
-    if !enabled {
-        return None;
-    }
-
     let delta = match crate::env_store::store::read_envelope(window_id, env_envelope_id).await {
         Ok(Some(d)) => d,
         Ok(None) => return None,

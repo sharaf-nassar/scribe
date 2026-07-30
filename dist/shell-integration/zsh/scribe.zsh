@@ -142,6 +142,16 @@ if [[ -n "${SCRIBE_RESTORE_ENV_DELTA_FILE:-}" && -f "${SCRIBE_RESTORE_ENV_DELTA_
 	unset SCRIBE_RESTORE_ENV_DELTA_FILE
 fi
 
+# Spawn-time persistence gate. The server exports SCRIBE_ENV_PERSIST=0 when
+# `terminal.env_persistence.enabled` is off, and drops every EnvChanged it
+# receives in that state — so the snapshot, the diff and the helper fork
+# below would all be built for nothing. Everything past this point belongs
+# to the env-delta feature, so return rather than branch. Absence means a
+# server that predates the gate: keep emitting.
+if [[ "${SCRIBE_ENV_PERSIST:-1}" == "0" ]]; then
+	return 0
+fi
+
 # Per-session "last emitted" snapshot (associative array, name → value).
 typeset -gA __scribe_env_last
 
