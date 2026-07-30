@@ -9,8 +9,14 @@ use crate::metadata::{MetadataEvent, MetadataParser};
 /// By feeding the same bytes through an `OscInterceptor` we can extract:
 ///
 /// - OSC 7 — current working directory
-/// - OSC 0 / 2 — window title
-/// - OSC 1337 `ClaudeState=…` — AI process state
+/// - OSC 133 — shell-integration prompt marks
+/// - OSC 1337 `ScribeContext` / `ScribeAiLaunch` — shell context, AI pre-arm
+///
+/// OSC 0 / 2 (window title) is deliberately absent: `alacritty_terminal`
+/// parses it natively and surfaces it as `Event::Title` / `Event::ResetTitle`,
+/// joining the semicolon-separated params back into one title in the process.
+/// Recognising it here too emitted a second, differently-truncated
+/// `MetadataEvent::TitleChanged` for every title sequence.
 ///
 /// Create one per read-loop iteration, advance it with `vte::Parser::advance`,
 /// then inspect the `events` vec passed in at construction time.

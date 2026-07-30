@@ -138,7 +138,7 @@ A replay's position in the stream is load-bearing: everything the server sent ah
 
 `AiStateChanged` and `AiStateCleared` report AI process state from OSC 1337. `CwdChanged` reports working directory from OSC 7.
 
-`TitleChanged` reports window title from OSC 0/2. `SessionContextChanged` reports shell-emitted remote-host and tmux metadata from OSC 1337 `ScribeContext`. `TaskLabelChanged` and `TaskLabelCleared` report provider task-label channels used for tab naming, while legacy Codex task-label messages remain accepted for compatibility. `GitBranch` reports the detected git branch for a session's CWD. `WorkspaceNamed` reports auto-detected workspace names and the project root path. `PromptReceived` carries the session ID, AI provider, and submitted prompt text for display in the prompt bar UI.
+`TitleChanged` reports window title from OSC 0/2, exactly one frame per title sequence — semicolons in the payload belong to the title, not to the frame count. `SessionContextChanged` reports shell-emitted remote-host and tmux metadata from OSC 1337 `ScribeContext`. `TaskLabelChanged` and `TaskLabelCleared` report provider task-label channels used for tab naming, while legacy Codex task-label messages remain accepted for compatibility. `GitBranch` reports the detected git branch for a session's CWD. `WorkspaceNamed` reports auto-detected workspace names and the project root path. `PromptReceived` carries the session ID, AI provider, and submitted prompt text for display in the prompt bar UI.
 
 ### Connection
 

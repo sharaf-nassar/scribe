@@ -4,7 +4,7 @@ use scribe_common::ai_state::{AiProcessState, AiProvider};
 use scribe_common::protocol::{PromptMarkKind, SessionContext};
 
 /// Maximum length for window title strings (chars). Longer titles are truncated.
-const MAX_TITLE_LEN: usize = 4096;
+pub(crate) const MAX_TITLE_LEN: usize = 4096;
 
 /// Maximum length for shell context fields (host, tmux session).
 const MAX_CONTEXT_FIELD_LEN: usize = 256;
@@ -13,6 +13,11 @@ const MAX_CONTEXT_FIELD_LEN: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataEvent {
     CwdChanged(PathBuf),
+    /// An OSC 0/2 window title reached the terminal. Produced only by the
+    /// `Term`'s own parser (`Event::Title` / `Event::ResetTitle`), never by the
+    /// OSC interceptor: both parsers see the same bytes, so emitting it from
+    /// both is one title frame and one registry write-lock per sequence too
+    /// many.
     TitleChanged(String),
     SessionContextChanged(SessionContext),
     TaskLabelChanged {
@@ -72,21 +77,11 @@ impl MetadataParser {
         let osc_number = params.first()?;
 
         match *osc_number {
-            b"0" | b"2" => Self::parse_title(params),
             b"7" => Self::parse_cwd(params),
             b"133" => Self::parse_prompt_mark(params),
             b"1337" => Self::parse_iterm2(params),
             _ => None,
         }
-    }
-
-    fn parse_title(params: &[&[u8]]) -> Option<MetadataEvent> {
-        let title_bytes = params.get(1)?;
-        let title = truncate_chars(&String::from_utf8_lossy(title_bytes), MAX_TITLE_LEN);
-        if title.trim().is_empty() {
-            return None;
-        }
-        Some(MetadataEvent::TitleChanged(title))
     }
 
     fn parse_cwd(params: &[&[u8]]) -> Option<MetadataEvent> {
@@ -229,7 +224,7 @@ fn parse_prompt_param(kv: &str, click_events: &mut bool, exit_code: &mut Option<
 }
 
 /// Truncate a string to at most `max_chars` Unicode characters.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 

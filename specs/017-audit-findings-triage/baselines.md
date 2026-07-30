@@ -642,6 +642,32 @@ bell emitter alone. The client's attention request is 1:1 with the frame
 entry through the gate once), so one frame per BEL is one `request_attention`
 per BEL.
 
+#### After side: US6-1 title half (bead `scribe-i79.9`)
+
+Measured on 2026-07-30 with the same rig as the bell half: the functional
+container (`docker/Dockerfile.func`) built from this bead's worktree, a
+`scribe-test share-tap` interposed on the server socket before the
+`scribe-test daemon` connects, and `grep -c '"type":"TitleChanged"'` deltas on
+the resulting JSONL wire record. Three phases per build, each preceded by a
+1.5 s settle: ten `true` prompt cycles through the packaged bash integration,
+then ten `printf '\e]2;alpha;beta\e\\'` (semicolon payload, ST-terminated) and
+ten `printf '\e]0;plain\a'` inside one command each, so those two phases carry
+one extra prompt cycle:
+
+| Build | prompt ×10 | OSC 2 `alpha;beta` ×10 | OSC 0 `plain` ×10 |
+|---|---|---|---|
+| worktree base (`affa334`) | 20 (2.00/prompt) | 22 = 20 (2.00/seq) + 2 | 22 = 20 (2.00/seq) + 2 |
+| single-source `TitleChanged` | **10 (1.00/prompt)** | **11 = 10 (1.00/seq) + 1** | **11 = 10 (1.00/seq) + 1** |
+
+The base rows reproduce the "prompt cycle, cwd = repo root", "OSC 2,
+ST-terminated ×10" and "OSC 0, BEL-terminated ×10" rows above, terminator
+independence included. The semicolon payload is the sharper result: the base
+run's twenty frames are ten `title="alpha"` interleaved with ten
+`title="alpha;beta"`, while the fixed run emits ten `title="alpha;beta"` and
+nothing else — the interceptor's first-param-only title is gone rather than
+deduplicated. Every `TitleChanged` frame is also one `update_live_session`
+write-lock on the live-session registry, so the same halving applies there.
+
 ### Branch detection with no attached sink
 
 The session emitted OSC 7 at 4 Hz from a background script while the only client
