@@ -566,7 +566,7 @@ A `Resize` enqueued on the sink before a `KeyInput` is delivered first, since th
 
 ### Sink reports closed writer
 
-`IpcSink::key_input` returns  rather than panicking when the writer task has dropped its receiver.
+`IpcSink::key_input` returns [[crates/scribe-client/src/ipc_bridge.rs#SinkError]]`::Closed` rather than panicking when the writer task has dropped its receiver.
 
 ### Inbound queue bounds a firehose
 
@@ -577,6 +577,24 @@ The same assertion covers the other half of the policy: the pane whose events we
 ### Overflow resyncs the dropped pane
 
 After an overflow, the drain sends exactly one `RequestSnapshot` for the dropped pane once it has caught up — the client-detected resync ([[crates/scribe-client/src/ipc_bridge.rs#PendingResync#settle]]) that keeps a bounded queue from losing screen state.
+
+### Outbound queue refuses at its cap
+
+Filling the sink to [[crates/scribe-client/src/ipc_bridge.rs#OUTBOUND_QUEUE_FRAMES]] and then pushing further keystrokes refuses every one of them with `SinkError::Refused` and raises a tear request, instead of evicting anything already queued.
+
+Draining afterwards must yield the original run byte for byte, in order, with nothing extra: that is the assertion that distinguishes this policy from the inbound one, since a single evicted `KeyInput` would hand the server a truncated command line that then runs.
+
+### Torn connection requeues its in-flight frame
+
+[[crates/scribe-client/src/ipc_bridge.rs#OutboundTear#wait]] stays parked while the queue is healthy and resolves as soon as a send is refused, which is what lets a refusal interrupt the wedged write rather than wait it out.
+
+The frame the writer already took is put back through [[crates/scribe-client/src/ipc_bridge.rs#OutboundReceiver#requeue]] and comes back out first, so tearing the connection at the cap costs no input at all.
+
+### Wedged socket tears at the cap
+
+[[crates/scribe-client/src/ipc_bridge.rs#write_or_tear]] driven against a writer whose `poll_write` is permanently `Pending` returns `Torn` once the queue fills behind it, proving the refusal cancels the wedged write instead of waiting it out.
+
+The backlog is intact afterwards and the cancelled frame requeues ahead of it, which is the end-to-end statement of the policy: a client behind a server that stopped reading redials on a bounded queue and loses no keystroke.
 
 ## GPUI Sync Frame Queue
 

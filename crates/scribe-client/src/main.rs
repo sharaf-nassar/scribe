@@ -149,14 +149,15 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{
         Notify,
-        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+        mpsc::{UnboundedSender, unbounded_channel},
     },
 };
 
 use crate::{
     ipc_bridge::{
-        InboundEvent, InboundReceiver, InboundSender, IpcSink, PaneOp, RestoredSession,
-        inbound_channel, run_drain,
+        InboundEvent, InboundReceiver, InboundSender, IpcSink, OUTBOUND_QUEUE_FRAMES,
+        OutboundReceiver, OutboundSender, PaneOp, RestoredSession, SinkError, WriteOutcome,
+        inbound_channel, outbound_channel, run_drain, write_or_tear,
     },
     pane_shell::{ClosedPane, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
     session_lifecycle::{JumpDirection, PromptMarks},
@@ -2461,7 +2462,8 @@ impl TerminalView {
         // to tell a wired encoder from an unwired one without reading the wire.
         tracing::info!(kind, bytes = %escape_report_bytes(&bytes), "mouse input forwarded");
         if let Err(error) = self.sink.key_input(session_id, bytes, false) {
-            tracing::warn!(%error, kind, "dropped mouse input: IPC writer closed");
+            tracing::warn!(%error, kind, "mouse input refused");
+            self.report_refused_input(error);
         }
     }
 
@@ -5545,11 +5547,23 @@ impl TerminalView {
         };
         self.snap_to_bottom_for_input(&bytes);
         if let Err(error) = self.sink.key_input(session_id, bytes, true) {
-            tracing::warn!(%error, "dropped keystroke: IPC writer closed");
+            tracing::warn!(%error, "keystroke refused");
+            self.report_refused_input(error);
             return;
         }
         // Perf gate: start the echo round-trip clock the PTY-output path stops.
         scribe_common::perf_probe::record_input_sent(session_id);
+    }
+
+    /// Put a refused input frame on the pane status strip.
+    ///
+    /// The bounded outbound queue refuses rather than evicts, so a refusal is a
+    /// keystroke the user typed and the server will never see. Logging it is not
+    /// enough: the status strip is a live region, so the refusal is announced as
+    /// well as painted, and the user learns the pane is deaf instead of assuming
+    /// the command they typed went through.
+    fn report_refused_input(&self, error: SinkError) {
+        set_status(&self.shared.status, &self.shared.generation, format!("input refused: {error}"));
     }
 
     /// Publish this frame to the perf rig's probe, along with the tab sessions
@@ -6585,7 +6599,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         clipboard: Arc::new(Mutex::new(ClipboardBridge::default())),
         remote: Arc::new(Mutex::new(RemoteChrome::new())),
     };
-    let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
+    let (out_tx, out_rx) = outbound_channel();
     let (in_tx, in_rx) = inbound_channel();
     let sink = IpcSink::new(out_tx.clone());
 
@@ -6782,8 +6796,8 @@ fn open_window(
 struct IpcThread {
     shared: Shared,
     sink: IpcSink,
-    out_tx: UnboundedSender<ClientMessage>,
-    out_rx: UnboundedReceiver<ClientMessage>,
+    out_tx: OutboundSender,
+    out_rx: OutboundReceiver,
     in_tx: InboundSender,
     in_rx: Option<InboundReceiver>,
     size: TerminalSize,
@@ -6805,6 +6819,14 @@ fn start_ipc_thread(ctx: IpcThread) {
         runtime.block_on(async move { supervise_connection(ctx).await });
     });
 }
+
+/// Why the writer tore a stream that had not failed on its own.
+///
+/// Named once because it is both the writer's error and the phrasing the status
+/// strip shows: the cap is only ever reached behind a server that has stopped
+/// reading, and the user needs to be told that rather than left typing into a
+/// queue that is going nowhere.
+const OUTBOUND_TEAR_REASON: &str = "outbound queue full; the server is not draining";
 
 /// Keep a local client attached across a server handoff.
 ///
@@ -6866,11 +6888,19 @@ async fn supervise_connection(mut ctx: IpcThread) {
         }
 
         ctx.shared.connected.store(false, Ordering::Release);
-        set_status(
-            &ctx.shared.status,
-            &ctx.shared.generation,
-            format!("server connection lost; retrying in {} ms", reconnect_delay.as_millis()),
-        );
+        // A queue still at its cap outranks the generic "connection lost" line:
+        // the user is typing into a window that is refusing input, and that is
+        // the fact that has to be on screen while the redial backs off.
+        let reason = if ctx.out_rx.is_refusing() {
+            format!(
+                "input refused: {OUTBOUND_TEAR_REASON} ({OUTBOUND_QUEUE_FRAMES} frames queued); \
+                 retrying in {} ms",
+                reconnect_delay.as_millis()
+            )
+        } else {
+            format!("server connection lost; retrying in {} ms", reconnect_delay.as_millis())
+        };
+        set_status(&ctx.shared.status, &ctx.shared.generation, reason);
         tokio::time::sleep(reconnect_delay).await;
         reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
     }
@@ -7158,6 +7188,14 @@ where
         .await
         .map_err(|error| error.to_string())?;
 
+    // A tear belongs to the stream it was refused on. Frames refused while no
+    // stream was alive have nothing to tear, and carrying that request into the
+    // fresh connection would tear it before it wrote a single queued frame —
+    // the queue would stay at its cap forever. The backlog itself is kept: a
+    // `CreateSession` queued before the stream died is still a session the user
+    // asked for, so the redial sends it rather than pruning it.
+    let _ = ctx.out_rx.take_tear_request();
+
     let reader_ctx = reader_ctx(ctx);
     if let Transport::Local(probes) = transport {
         adopt_lan_surface(&reader_ctx, probes.lan_env);
@@ -7269,20 +7307,39 @@ fn adopt_remote_surface(ctx: &ReaderCtx, remote_env: Option<ServerMessage>) {
     }
 }
 
-/// Drains the IPC-writer channel to the socket in FIFO order.
-async fn run_writer<W>(
-    mut writer: W,
-    out_rx: &mut UnboundedReceiver<ClientMessage>,
-) -> Result<(), String>
+/// Drains the bounded IPC-writer queue to the socket in FIFO order, tearing the
+/// connection when the queue reaches [`OUTBOUND_QUEUE_FRAMES`].
+///
+/// The frame in hand is requeued on every exit that is not a successful write,
+/// so neither a dead socket nor a deliberate tear costs the user a keystroke;
+/// the queue is never pruned across the redial either, because a `CreateSession`
+/// queued before the stream died is still a session the user asked for.
+async fn run_writer<W>(mut writer: W, out_rx: &mut OutboundReceiver) -> Result<(), String>
 where
     W: AsyncWriteExt + Unpin,
 {
-    while let Some(message) = out_rx.recv().await {
-        if let Err(error) = write_message(&mut writer, &message).await {
-            return Err(format!("IPC writer stopped: {error}"));
+    let tear = out_rx.tear_watch();
+    loop {
+        // A refusal that lands between two writes still tears this stream; the
+        // race with an in-progress write is handled inside `write_or_tear`.
+        if out_rx.take_tear_request() {
+            return Err(OUTBOUND_TEAR_REASON.to_owned());
+        }
+        let Some(message) = out_rx.recv().await else {
+            return Err("IPC writer channel closed".to_owned());
+        };
+        match write_or_tear(&mut writer, &message, &tear).await {
+            WriteOutcome::Wrote => {}
+            WriteOutcome::Failed(error) => {
+                out_rx.requeue(message);
+                return Err(format!("IPC writer stopped: {error}"));
+            }
+            WriteOutcome::Torn => {
+                out_rx.requeue(message);
+                return Err(OUTBOUND_TEAR_REASON.to_owned());
+            }
         }
     }
-    Err("IPC writer channel closed".to_owned())
 }
 
 /// Per-session synchronized-output frame queues shared between the coalescing
@@ -7558,7 +7615,7 @@ struct ReaderCtx {
     /// Feature-013 tailnet state the reader folds every remote answer onto and
     /// queues inbound automation actions in.
     remote: Arc<Mutex<RemoteChrome>>,
-    out_tx: UnboundedSender<ClientMessage>,
+    out_tx: OutboundSender,
     in_tx: InboundSender,
     sink: IpcSink,
     size: TerminalSize,
@@ -8233,7 +8290,7 @@ fn reattach_visible_sessions(ctx: &ReaderCtx, sessions: &[SessionInfo]) -> Resul
             session_ids: retained.clone(),
             dimensions: dimensions.clone(),
         })
-        .map_err(|_| "writer channel closed".to_owned())?;
+        .map_err(|error| error.to_string())?;
     for (session_id, size) in retained.iter().zip(dimensions) {
         ctx.sink.resize(*session_id, size).map_err(|error| error.to_string())?;
     }
@@ -9062,7 +9119,7 @@ fn attach_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> 
             session_ids: vec![session_id],
             dimensions: vec![ctx.size],
         })
-        .map_err(|_| "writer channel closed".to_owned())?;
+        .map_err(|error| error.to_string())?;
     // Announce the client size through the sink, ahead of any KeyInput.
     ctx.sink.resize(session_id, ctx.size).map_err(|error| error.to_string())?;
     ctx.sink.subscribe(vec![session_id]).map_err(|error| error.to_string())?;

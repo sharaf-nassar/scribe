@@ -27,7 +27,11 @@
 //! (`CreateWorkspace` / `CloseWorkspace` / `MoveSession` /
 //! `ReportWorkspaceTree`), and the feature-013 tailnet frames the startup
 //! remote probe and the automation fallback raise (`ListRemotePeers` /
-//! `DispatchAction`), onto the ordered IPC-writer channel. The
+//! `DispatchAction`), onto the ordered IPC-writer channel. That channel is
+//! bounded too ([`OUTBOUND_QUEUE_FRAMES`] frames), but under an all-or-nothing
+//! policy rather than the inbound drop-and-resync one: the frames are user
+//! input, so the cap refuses the incoming frame and tears the connection
+//! instead of evicting anything already queued. The
 //! outbound path never traverses the inbound drain, so keystrokes are never
 //! queued behind an output firehose and `Resize` is always flushed ahead of the
 //! `KeyInput` that follows.
@@ -41,6 +45,7 @@ use std::{
 
 use scribe_client::share::ControlIntent;
 use scribe_common::{
+    framing::write_message,
     ids::{SessionId, WindowId, WorkspaceId},
     protocol::{
         AutomationAction, ClientMessage, PromptMarkKind, TerminalSize, WorkspaceNotesMutation,
@@ -48,7 +53,8 @@ use scribe_common::{
     },
 };
 use tokio::{
-    sync::{Notify, mpsc::UnboundedSender},
+    io::AsyncWriteExt,
+    sync::Notify,
     time::{Instant, timeout},
 };
 
@@ -74,6 +80,17 @@ pub const INBOUND_QUEUE_EVENTS: usize = 256;
 /// emptied queue — refusing the newest frame would stall the pane rather than
 /// bound it — so the true high-water mark is this ceiling plus one frame.
 pub const INBOUND_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum frames the outbound queue buffers between the window and the IPC
+/// writer before the overflow policy runs.
+///
+/// The inbound policy cannot be reused here: outbound frames are user *input*,
+/// and evicting one queued `KeyInput` would hand the server a truncated command
+/// line that then executes. So the policy is all-or-nothing — see
+/// [`OutboundState::admit`] — and this cap is sized for the only case that can
+/// reach it, a writer wedged on a socket the server has stopped reading, rather
+/// than for a plausible typing burst.
+pub const OUTBOUND_QUEUE_FRAMES: usize = 1024;
 
 /// How long an overflow resync waits for the drain to catch up before the
 /// `RequestSnapshot` goes out anyway.
@@ -567,13 +584,337 @@ pub async fn collect_batch(first: InboundEvent, rx: &mut InboundReceiver) -> Bat
     BatchWindow { batch, channel_closed: false }
 }
 
-/// The outbound writer channel closed before a message could be enqueued.
+/// Why a frame never made it onto the outbound queue.
+///
+/// Both variants mean the same thing to a caller — the frame was *not* sent —
+/// which is the property the outbound policy is built around: a refused frame
+/// is refused loudly, never quietly swallowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SinkClosed;
+pub enum SinkError {
+    /// The IPC writer dropped its receiver, so nothing can be queued again.
+    Closed,
+    /// The queue is at [`OUTBOUND_QUEUE_FRAMES`] and refused this frame rather
+    /// than evicting one already queued.
+    Refused,
+}
 
-impl std::fmt::Display for SinkClosed {
+impl std::fmt::Display for SinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("IPC writer channel closed")
+        match self {
+            Self::Closed => f.write_str("IPC writer channel closed"),
+            Self::Refused => f.write_str("outbound queue full; the server is not draining"),
+        }
+    }
+}
+
+/// Whether a refusal is still owed a connection teardown.
+///
+/// Consumed once by the connection writer, so one refusal tears exactly the
+/// stream it happened on. Scoped per connection rather than latched: a refusal
+/// taken while no stream was alive has no connection to tear, and carrying it
+/// into the next one would livelock a client that is only trying to reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TearRequest {
+    Idle,
+    Pending,
+}
+
+/// The bounded outbound queue's contents plus the bookkeeping the tear-on-cap
+/// policy runs on.
+#[derive(Debug)]
+struct OutboundState {
+    frames: VecDeque<ClientMessage>,
+    /// True from the first refusal until the writer has pulled the backlog back
+    /// under half the cap. The hysteresis is what keeps the status strip from
+    /// alternating between refusing and clear once per frame at the boundary.
+    refusing: bool,
+    tear: TearRequest,
+    senders: usize,
+    receiver_alive: bool,
+}
+
+impl OutboundState {
+    /// Queues `message`, or refuses it once the queue is at
+    /// [`OUTBOUND_QUEUE_FRAMES`].
+    ///
+    /// Nothing already queued is ever discarded. Every outbound frame is
+    /// something the user did — a keystroke, a resize, a session they asked
+    /// for — so a per-frame drop would not merely lose a byte, it would execute
+    /// the mangled remainder. Refusing the newest frame instead keeps the
+    /// failure all-or-nothing, and the refusal is reported to the caller so it
+    /// can be shown rather than logged.
+    fn admit(&mut self, message: ClientMessage) -> Result<(), SinkError> {
+        if !self.receiver_alive {
+            return Err(SinkError::Closed);
+        }
+        if self.frames.len() >= OUTBOUND_QUEUE_FRAMES {
+            self.refusing = true;
+            self.tear = TearRequest::Pending;
+            return Err(SinkError::Refused);
+        }
+        self.frames.push_back(message);
+        Ok(())
+    }
+
+    /// Hands the writer the oldest frame, clearing the refusal once the backlog
+    /// is back under half the cap.
+    fn take(&mut self) -> Option<ClientMessage> {
+        let message = self.frames.pop_front()?;
+        if self.frames.len() * 2 <= OUTBOUND_QUEUE_FRAMES {
+            self.refusing = false;
+        }
+        Some(message)
+    }
+}
+
+/// Queue plus the two wakeups its single writer parks on: one for a queued
+/// frame, one for a refusal that has to interrupt an in-progress write.
+#[derive(Debug)]
+struct OutboundShared {
+    state: Mutex<OutboundState>,
+    ready: Notify,
+    tear: Notify,
+}
+
+/// Recovers a poisoned outbound lock for the same reason the inbound one is
+/// recovered: every critical section is a handful of field updates that cannot
+/// leave the queue half-written.
+fn lock_outbound(shared: &OutboundShared) -> MutexGuard<'_, OutboundState> {
+    shared.state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Takes the pending tear request, leaving the queue idle again.
+fn take_tear(shared: &OutboundShared) -> bool {
+    std::mem::replace(&mut lock_outbound(shared).tear, TearRequest::Idle) == TearRequest::Pending
+}
+
+/// Producer half of the bounded outbound queue, held by every [`IpcSink`] clone
+/// and by the reader's attach path.
+#[derive(Debug)]
+pub struct OutboundSender {
+    shared: Arc<OutboundShared>,
+}
+
+/// Consumer half of the bounded outbound queue, owned by the IPC thread rather
+/// than by a connection: a writer that stops during an upgrade must be able to
+/// resume draining the same ordered queue after the redial.
+#[derive(Debug)]
+pub struct OutboundReceiver {
+    shared: Arc<OutboundShared>,
+}
+
+/// Standalone view of the refusal signal, so a writer can race it against an
+/// in-progress socket write without borrowing the receiver it needs to requeue
+/// the interrupted frame into.
+#[derive(Debug)]
+pub struct OutboundTear {
+    shared: Arc<OutboundShared>,
+}
+
+/// Creates the bounded outbound queue the sink feeds and the IPC writer drains.
+#[must_use]
+pub fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
+    let shared = Arc::new(OutboundShared {
+        state: Mutex::new(OutboundState {
+            frames: VecDeque::new(),
+            refusing: false,
+            tear: TearRequest::Idle,
+            senders: 1,
+            receiver_alive: true,
+        }),
+        ready: Notify::new(),
+        tear: Notify::new(),
+    });
+    (OutboundSender { shared: Arc::clone(&shared) }, OutboundReceiver { shared })
+}
+
+impl OutboundSender {
+    /// Queues one outbound frame without blocking the caller, which is a GPUI
+    /// foreground thread and cannot wait on a socket.
+    ///
+    /// # Errors
+    /// Returns [`SinkError::Closed`] once the IPC writer has dropped its
+    /// receiver, and [`SinkError::Refused`] when the queue is at its cap.
+    pub fn send(&self, message: ClientMessage) -> Result<(), SinkError> {
+        let admitted = lock_outbound(&self.shared).admit(message);
+        match admitted {
+            Ok(()) => {
+                self.shared.ready.notify_one();
+                Ok(())
+            }
+            Err(SinkError::Refused) => {
+                // Wakes the writer out of the write that wedged the queue, so
+                // the redial happens now rather than whenever the socket
+                // eventually gives up.
+                self.shared.tear.notify_one();
+                Err(SinkError::Refused)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Clone for OutboundSender {
+    fn clone(&self) -> Self {
+        lock_outbound(&self.shared).senders += 1;
+        Self { shared: Arc::clone(&self.shared) }
+    }
+}
+
+impl Drop for OutboundSender {
+    fn drop(&mut self) {
+        let last = {
+            let mut state = lock_outbound(&self.shared);
+            state.senders = state.senders.saturating_sub(1);
+            state.senders == 0
+        };
+        // `notify_one` stores a permit when no task is parked yet, so a writer
+        // between its emptiness check and its await still observes the close.
+        if last {
+            self.shared.ready.notify_one();
+        }
+    }
+}
+
+/// One non-blocking look at the outbound queue.
+enum OutboundPoll {
+    Frame(ClientMessage),
+    Empty,
+    Closed,
+}
+
+impl OutboundReceiver {
+    /// Waits for the next queued frame, returning `None` once the queue is
+    /// drained and every sender is gone.
+    pub async fn recv(&mut self) -> Option<ClientMessage> {
+        loop {
+            match self.poll_once() {
+                OutboundPoll::Frame(message) => return Some(message),
+                OutboundPoll::Closed => return None,
+                OutboundPoll::Empty => self.shared.ready.notified().await,
+            }
+        }
+    }
+
+    /// Takes the next frame without waiting.
+    #[cfg(test)]
+    pub fn try_recv(&mut self) -> Option<ClientMessage> {
+        lock_outbound(&self.shared).take()
+    }
+
+    /// Takes the next frame without waiting, split out of [`Self::recv`] so the
+    /// queue lock is released before the await rather than merely scoped away
+    /// from it.
+    fn poll_once(&self) -> OutboundPoll {
+        let mut state = lock_outbound(&self.shared);
+        if let Some(message) = state.take() {
+            return OutboundPoll::Frame(message);
+        }
+        if state.senders == 0 {
+            return OutboundPoll::Closed;
+        }
+        OutboundPoll::Empty
+    }
+
+    /// Returns a frame the writer had already taken to the head of the queue.
+    ///
+    /// A connection that dies mid-write leaves one frame in flight, and the
+    /// tear-on-cap policy is only honest if tearing costs no input at all — so
+    /// the frame goes back rather than dying with the stream, and the next
+    /// connection writes it first. The requeue is deliberately allowed past the
+    /// cap, because the frame was counted against it once already; the real
+    /// high-water mark is therefore [`OUTBOUND_QUEUE_FRAMES`] plus one frame.
+    pub fn requeue(&mut self, message: ClientMessage) {
+        lock_outbound(&self.shared).frames.push_front(message);
+    }
+
+    /// Takes the pending tear request, if a send was refused since the last
+    /// call. Called once when a connection opens (to drop a refusal that
+    /// belonged to no stream) and once per writer iteration.
+    pub fn take_tear_request(&mut self) -> bool {
+        take_tear(&self.shared)
+    }
+
+    /// A handle the writer can await without holding a borrow on the receiver.
+    #[must_use]
+    pub fn tear_watch(&self) -> OutboundTear {
+        OutboundTear { shared: Arc::clone(&self.shared) }
+    }
+
+    /// True while the queue is at its cap and refusing input.
+    #[must_use]
+    pub fn is_refusing(&self) -> bool {
+        lock_outbound(&self.shared).refusing
+    }
+
+    /// Frames still queued behind the writer.
+    #[cfg(test)]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        lock_outbound(&self.shared).frames.len()
+    }
+}
+
+impl Drop for OutboundReceiver {
+    fn drop(&mut self) {
+        let mut state = lock_outbound(&self.shared);
+        state.receiver_alive = false;
+        state.frames.clear();
+    }
+}
+
+/// What became of the one frame the IPC writer had in hand.
+#[derive(Debug)]
+pub enum WriteOutcome {
+    /// The frame reached the socket.
+    Wrote,
+    /// The socket failed; the frame was never delivered.
+    Failed(String),
+    /// The outbound queue hit its cap while this write was in progress, so the
+    /// stream is being torn instead of waited on.
+    Torn,
+}
+
+/// Writes one frame, racing the socket against a refusal on the outbound queue.
+///
+/// A wedged write is exactly the state the cap detects — the queue can only
+/// fill behind a writer that is not draining — so the refusal has to be able to
+/// interrupt the write rather than wait it out. Cancelling mid-frame is safe
+/// because the caller drops the stream: the partial frame dies with the socket
+/// the server is no longer reading, and the redial starts a clean one. The
+/// caller owns the frame either way, so a torn or failed write requeues it
+/// instead of losing it.
+pub async fn write_or_tear<W>(
+    writer: &mut W,
+    message: &ClientMessage,
+    tear: &OutboundTear,
+) -> WriteOutcome
+where
+    W: AsyncWriteExt + Unpin,
+{
+    tokio::select! {
+        result = write_message(writer, message) => match result {
+            Ok(()) => WriteOutcome::Wrote,
+            Err(error) => WriteOutcome::Failed(error.to_string()),
+        },
+        () = tear.wait() => WriteOutcome::Torn,
+    }
+}
+
+impl OutboundTear {
+    /// Resolves once a send has been refused at the cap, consuming the request.
+    ///
+    /// The flag is what the wait is really on; the notification only wakes it.
+    /// `notify_one` stores a permit when no task is parked, so a refusal that
+    /// lands between the check and the await is still observed on the next
+    /// pass instead of stranding a full queue behind a live socket.
+    pub async fn wait(&self) {
+        loop {
+            if take_tear(&self.shared) {
+                return;
+            }
+            self.shared.tear.notified().await;
+        }
     }
 }
 
@@ -605,37 +946,41 @@ pub struct RestoredSession {
 /// IPC-writer channel, which is a single ordered FIFO drained by the writer
 /// task. Because the sink is independent of the inbound drain, keystrokes are
 /// never queued behind an output firehose; because the channel is ordered, a
-/// `Resize` enqueued before a `KeyInput` reaches the server first.
+/// `Resize` enqueued before a `KeyInput` reaches the server first. The channel
+/// is bounded at [`OUTBOUND_QUEUE_FRAMES`], so every enqueue can fail and every
+/// caller has to say so.
 #[derive(Debug, Clone)]
 pub struct IpcSink {
-    tx: UnboundedSender<ClientMessage>,
+    tx: OutboundSender,
 }
 
 impl IpcSink {
     /// Wraps the IPC-writer channel sender.
     #[must_use]
-    pub fn new(tx: UnboundedSender<ClientMessage>) -> Self {
+    pub fn new(tx: OutboundSender) -> Self {
         Self { tx }
     }
 
     /// Enqueues encoded key bytes for `session_id`.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
     pub fn key_input(
         &self,
         session_id: SessionId,
         data: Vec<u8>,
         dismisses_attention: bool,
-    ) -> Result<(), SinkClosed> {
+    ) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::KeyInput { session_id, data, dismisses_attention })
     }
 
     /// Enqueues a resize for `session_id`, ahead of any later `KeyInput`.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn resize(&self, session_id: SessionId, size: TerminalSize) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn resize(&self, session_id: SessionId, size: TerminalSize) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::Resize { session_id, size })
     }
 
@@ -648,8 +993,9 @@ impl IpcSink {
     /// which of its surfaces actually changed.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn config_reloaded(&self) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn config_reloaded(&self) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::ConfigReloaded)
     }
 
@@ -661,14 +1007,15 @@ impl IpcSink {
     /// shortcuts add to the existing workspace rather than dividing the window.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
     pub fn create_session(
         &self,
         workspace_id: WorkspaceId,
         size: TerminalSize,
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
-    ) -> Result<(), SinkClosed> {
+    ) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::CreateSession {
             workspace_id,
             split_direction: None,
@@ -687,8 +1034,9 @@ impl IpcSink {
     /// variables it had before the crash instead of a bare login environment.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn create_restored_session(&self, request: RestoredSession) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn create_restored_session(&self, request: RestoredSession) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::CreateSession {
             workspace_id: request.workspace_id,
             split_direction: None,
@@ -703,12 +1051,13 @@ impl IpcSink {
     /// `PtyOutput`. Used when a tab shortcut changes the focused tab.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
     pub fn attach_sessions(
         &self,
         session_ids: Vec<SessionId>,
         dimensions: Vec<TerminalSize>,
-    ) -> Result<(), SinkClosed> {
+    ) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::AttachSessions { session_ids, dimensions })
     }
 
@@ -723,8 +1072,9 @@ impl IpcSink {
     /// name derived from it) without waiting for the next shell prompt.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn subscribe(&self, session_ids: Vec<SessionId>) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn subscribe(&self, session_ids: Vec<SessionId>) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::Subscribe { session_ids })
     }
 
@@ -740,8 +1090,9 @@ impl IpcSink {
     /// the reader applies through `session_lifecycle::snapshot_reset_bytes`.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn request_snapshot(&self, session_id: SessionId) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn request_snapshot(&self, session_id: SessionId) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::RequestSnapshot { session_id })
     }
 
@@ -749,8 +1100,9 @@ impl IpcSink {
     /// shortcut. The tab leaves the strip once `SessionExited` arrives.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn close_session(&self, session_id: SessionId) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn close_session(&self, session_id: SessionId) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::CloseSession { session_id })
     }
 
@@ -764,13 +1116,14 @@ impl IpcSink {
     /// the query back — a stale answer is dropped rather than shown.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
     pub fn search_request(
         &self,
         session_id: SessionId,
         query: String,
         limit: u32,
-    ) -> Result<(), SinkClosed> {
+    ) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::SearchRequest { session_id, query, limit })
     }
 
@@ -778,8 +1131,9 @@ impl IpcSink {
     /// modal and hover preview can render server-owned state.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn workspace_notes_get(&self, workspace_ids: Vec<WorkspaceId>) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn workspace_notes_get(&self, workspace_ids: Vec<WorkspaceId>) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::WorkspaceNotesGet { workspace_ids })
     }
 
@@ -794,8 +1148,9 @@ impl IpcSink {
     /// No id is sent because only the server may allocate one.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn create_workspace(&self) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn create_workspace(&self) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::CreateWorkspace)
     }
 
@@ -807,8 +1162,9 @@ impl IpcSink {
     /// and closing it would be a lie about state that never existed.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn close_workspace(&self, workspace_id: WorkspaceId) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn close_workspace(&self, workspace_id: WorkspaceId) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::CloseWorkspace { workspace_id })
     }
 
@@ -821,12 +1177,13 @@ impl IpcSink {
     /// what the window shows.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
     pub fn move_session(
         &self,
         session_id: SessionId,
         target_workspace: WorkspaceId,
-    ) -> Result<(), SinkClosed> {
+    ) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::MoveSession { session_id, target_workspace })
     }
 
@@ -840,8 +1197,9 @@ impl IpcSink {
     /// every reconnect rebuilds a single flat pane.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn report_workspace_tree(&self, tree: WorkspaceTreeNode) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn report_workspace_tree(&self, tree: WorkspaceTreeNode) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::ReportWorkspaceTree { tree })
     }
 
@@ -854,8 +1212,9 @@ impl IpcSink {
     /// [`ControlIntent::into_message`].
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn control_intent(&self, intent: ControlIntent) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn control_intent(&self, intent: ControlIntent) -> Result<(), SinkError> {
         self.enqueue(intent.into_message())
     }
 
@@ -864,11 +1223,12 @@ impl IpcSink {
     /// preview from the current editor state.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
     pub fn workspace_notes_mutate(
         &self,
         mutation: WorkspaceNotesMutation,
-    ) -> Result<(), SinkClosed> {
+    ) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::WorkspaceNotesMutate { mutation })
     }
 
@@ -877,8 +1237,9 @@ impl IpcSink {
     /// user picks "Update Now" in the centred status-bar CTA's confirmation.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn trigger_update(&self) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn trigger_update(&self) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::TriggerUpdate)
     }
 
@@ -887,8 +1248,9 @@ impl IpcSink {
     /// centred status-bar CTA's confirmation.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn dismiss_update(&self) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn dismiss_update(&self) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::DismissUpdate)
     }
 
@@ -900,8 +1262,9 @@ impl IpcSink {
     /// `CloseWindow` naming any other window.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn close_window(&self, window_id: WindowId) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn close_window(&self, window_id: WindowId) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::CloseWindow { window_id })
     }
 
@@ -910,8 +1273,9 @@ impl IpcSink {
     /// — this one included — with `QuitRequested`; sessions are preserved.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn quit_all(&self) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn quit_all(&self) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::QuitAll)
     }
 
@@ -921,8 +1285,9 @@ impl IpcSink {
     /// meaningful.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn list_windows(&self) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn list_windows(&self) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::ListWindows)
     }
 
@@ -936,8 +1301,9 @@ impl IpcSink {
     /// transport, so it must ride this local session connection.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn lan_approval_decision(&self, request_id: u64, approve: bool) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn lan_approval_decision(&self, request_id: u64, approve: bool) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::LanApprovalDecision { request_id, approve })
     }
 
@@ -949,8 +1315,9 @@ impl IpcSink {
     /// `remote.lan.enabled` makes the answer meaningful.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn list_lan_peers(&self) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn list_lan_peers(&self) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::ListLanPeers)
     }
 
@@ -965,8 +1332,9 @@ impl IpcSink {
     /// path cannot become a generic escape hatch onto the wire.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn clipboard_answer(&self, message: ClientMessage) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn clipboard_answer(&self, message: ClientMessage) -> Result<(), SinkError> {
         debug_assert!(
             matches!(
                 message,
@@ -986,8 +1354,9 @@ impl IpcSink {
     /// socket and `remote.enabled` makes the answer meaningful.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
-    pub fn list_remote_peers(&self) -> Result<(), SinkClosed> {
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn list_remote_peers(&self) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::ListRemotePeers)
     }
 
@@ -1004,12 +1373,13 @@ impl IpcSink {
     /// it rather than dropped.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
     pub fn dispatch_action(
         &self,
         window_id: Option<WindowId>,
         action: AutomationAction,
-    ) -> Result<(), SinkClosed> {
+    ) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::DispatchAction { window_id, action })
     }
 
@@ -1020,17 +1390,18 @@ impl IpcSink {
     /// collapse to the same gained/lost pair before they reach the sink.
     ///
     /// # Errors
-    /// Returns [`SinkClosed`] when the writer task has dropped its receiver.
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
     pub fn focus_changed(
         &self,
         gained: Option<SessionId>,
         lost: Option<SessionId>,
-    ) -> Result<(), SinkClosed> {
+    ) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::FocusChanged { gained, lost })
     }
 
-    fn enqueue(&self, message: ClientMessage) -> Result<(), SinkClosed> {
-        self.tx.send(message).map_err(|_| SinkClosed)
+    fn enqueue(&self, message: ClientMessage) -> Result<(), SinkError> {
+        self.tx.send(message)
     }
 }
 
@@ -1040,8 +1411,6 @@ mod tests {
         sync::{Arc, Mutex},
         time::Instant,
     };
-
-    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     use super::*;
 
@@ -1070,10 +1439,48 @@ mod tests {
         }
     }
 
+    /// Fills the outbound queue to its cap, then asserts the next send past it
+    /// is refused rather than absorbed.
+    fn fill_to_cap_then_refuse(sink: &IpcSink, pane: SessionId) {
+        for _ in 0..OUTBOUND_QUEUE_FRAMES {
+            sink.key_input(pane, b"b".to_vec(), true).unwrap();
+        }
+        assert_eq!(sink.key_input(pane, b"c".to_vec(), true), Err(SinkError::Refused));
+    }
+
+    /// A socket that accepts nothing, ever — the state a server that has stopped
+    /// reading leaves the client's writer in, and the only state in which the
+    /// outbound queue can actually reach its cap.
+    struct WedgedWriter;
+
+    impl tokio::io::AsyncWrite for WedgedWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
     /// A sink whose receiver is kept alive, for drains whose resync path is not
     /// under test.
-    fn idle_sink() -> (IpcSink, UnboundedReceiver<ClientMessage>) {
-        let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
+    fn idle_sink() -> (IpcSink, OutboundReceiver) {
+        let (out_tx, out_rx) = outbound_channel();
         (IpcSink::new(out_tx), out_rx)
     }
 
@@ -1243,7 +1650,7 @@ mod tests {
     async fn inbound_overflow_requests_a_snapshot_for_the_dropped_pane() {
         let pane = SessionId::new();
         let (in_tx, in_rx) = inbound_channel();
-        let (out_tx, mut out_rx) = unbounded_channel::<ClientMessage>();
+        let (out_tx, mut out_rx) = outbound_channel();
         let sink = IpcSink::new(out_tx);
 
         let frames = INBOUND_QUEUE_BYTES / frame().len() + 8;
@@ -1258,7 +1665,7 @@ mod tests {
             ClientMessage::RequestSnapshot { session_id } => assert_eq!(session_id, pane),
             other => panic!("expected RequestSnapshot, got {other:?}"),
         }
-        assert!(out_rx.try_recv().is_err(), "one resync per overflowed pane, not one per drop");
+        assert!(out_rx.try_recv().is_none(), "one resync per overflowed pane, not one per drop");
     }
 
     // @lat: [[test#GPUI IPC Bridge#Keystroke before output]]
@@ -1266,7 +1673,7 @@ mod tests {
     async fn keystroke_reaches_server_despite_inbound_firehose() {
         let pane = SessionId::new();
         let (in_tx, in_rx) = inbound_channel();
-        let (out_tx, mut out_rx) = unbounded_channel::<ClientMessage>();
+        let (out_tx, mut out_rx) = outbound_channel();
         for _ in 0..10_000u32 {
             in_tx.send(output(pane, b"A")).unwrap();
         }
@@ -1287,7 +1694,7 @@ mod tests {
     async fn typing_under_firehose_preserves_order_without_latency_spike() {
         let pane = SessionId::new();
         let (in_tx, in_rx) = inbound_channel();
-        let (out_tx, mut out_rx) = unbounded_channel::<ClientMessage>();
+        let (out_tx, mut out_rx) = outbound_channel();
         let sink = IpcSink::new(out_tx);
         let drain = tokio::spawn(run_drain(in_rx, sink.clone(), |_| {}));
 
@@ -1311,7 +1718,7 @@ mod tests {
     #[tokio::test]
     async fn resize_is_flushed_before_following_key_input() {
         let pane = SessionId::new();
-        let (out_tx, mut out_rx) = unbounded_channel::<ClientMessage>();
+        let (out_tx, mut out_rx) = outbound_channel();
         let sink = IpcSink::new(out_tx);
 
         sink.resize(pane, sample_size()).unwrap();
@@ -1325,7 +1732,7 @@ mod tests {
     #[tokio::test]
     async fn config_reloaded_is_enqueued_on_the_ordered_writer_channel() {
         let pane = SessionId::new();
-        let (out_tx, mut out_rx) = unbounded_channel::<ClientMessage>();
+        let (out_tx, mut out_rx) = outbound_channel();
         let sink = IpcSink::new(out_tx);
 
         sink.config_reloaded().unwrap();
@@ -1341,7 +1748,7 @@ mod tests {
     #[tokio::test]
     async fn search_request_carries_the_query_and_the_result_limit() {
         let pane = SessionId::new();
-        let (out_tx, mut out_rx) = unbounded_channel::<ClientMessage>();
+        let (out_tx, mut out_rx) = outbound_channel();
         let sink = IpcSink::new(out_tx);
 
         sink.search_request(pane, "error".to_owned(), 256).unwrap();
@@ -1359,9 +1766,102 @@ mod tests {
     // @lat: [[test#GPUI IPC Bridge#Sink reports closed writer]]
     #[test]
     fn key_input_errors_when_writer_dropped() {
-        let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
+        let (out_tx, out_rx) = outbound_channel();
         drop(out_rx);
         let sink = IpcSink::new(out_tx);
-        assert_eq!(sink.key_input(SessionId::new(), b"a".to_vec(), false), Err(SinkClosed));
+        assert_eq!(sink.key_input(SessionId::new(), b"a".to_vec(), false), Err(SinkError::Closed));
+    }
+
+    // @lat: [[test#GPUI IPC Bridge#Outbound queue refuses at its cap]]
+    #[test]
+    fn outbound_queue_refuses_the_new_frame_and_keeps_every_queued_one() {
+        let pane = SessionId::new();
+        let (out_tx, mut out_rx) = outbound_channel();
+        let sink = IpcSink::new(out_tx);
+
+        for index in 0..OUTBOUND_QUEUE_FRAMES {
+            let byte = u8::try_from(index % 251).unwrap();
+            sink.key_input(pane, vec![byte], true).unwrap();
+        }
+        assert!(!out_rx.is_refusing(), "the cap itself is not an overflow");
+
+        // Every send past the cap is refused, and refused the same way: no
+        // window in which the queue quietly starts evicting instead.
+        for _ in 0..8u32 {
+            assert_eq!(sink.key_input(pane, b"z".to_vec(), true), Err(SinkError::Refused));
+        }
+        assert!(out_rx.is_refusing(), "a refusal must be visible to the window");
+        assert_eq!(out_rx.len(), OUTBOUND_QUEUE_FRAMES, "the cap must not grow past itself");
+        assert!(out_rx.take_tear_request(), "a refusal tears the connection it happened on");
+
+        // The queue still holds the original run, in order and complete: this
+        // is the property that makes the policy safe for user input.
+        for index in 0..OUTBOUND_QUEUE_FRAMES {
+            let expected = u8::try_from(index % 251).unwrap();
+            let message = out_rx.try_recv().expect("no queued frame may be dropped");
+            assert_key_input(&message, &[expected]);
+        }
+        assert!(out_rx.try_recv().is_none(), "refused frames must never be queued");
+        assert!(!out_rx.is_refusing(), "draining clears the refusal");
+    }
+
+    // @lat: [[test#GPUI IPC Bridge#Torn connection requeues its in-flight frame]]
+    #[tokio::test]
+    async fn tear_wakes_the_writer_and_the_in_flight_frame_survives_it() {
+        let pane = SessionId::new();
+        let (out_tx, mut out_rx) = outbound_channel();
+        let sink = IpcSink::new(out_tx);
+        let tear = out_rx.tear_watch();
+
+        sink.key_input(pane, b"a".to_vec(), true).unwrap();
+        let in_flight = out_rx.recv().await.expect("the writer takes the frame first");
+
+        // Nothing has overflowed yet, so the writer's tear branch stays parked.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), tear.wait()).await.is_err(),
+            "a healthy queue must never tear the connection"
+        );
+
+        fill_to_cap_then_refuse(&sink, pane);
+        tokio::time::timeout(Duration::from_millis(200), tear.wait())
+            .await
+            .expect("the refusal must interrupt the wedged write");
+
+        // The writer requeues what it was mid-write on, so the redial resends it
+        // ahead of the backlog instead of losing it with the stream.
+        out_rx.requeue(in_flight);
+        assert_key_input(&out_rx.recv().await.unwrap(), b"a");
+    }
+
+    // @lat: [[test#GPUI IPC Bridge#Wedged socket tears at the cap]]
+    #[tokio::test]
+    async fn a_write_that_never_completes_is_cancelled_by_the_cap() {
+        let pane = SessionId::new();
+        let (out_tx, mut out_rx) = outbound_channel();
+        let sink = IpcSink::new(out_tx);
+        let tear = out_rx.tear_watch();
+        let mut wedged = WedgedWriter;
+
+        sink.key_input(pane, b"a".to_vec(), true).unwrap();
+        let in_flight = out_rx.recv().await.expect("the writer takes the frame first");
+
+        // The write can never finish, which is exactly the state a server that
+        // stopped reading leaves the client in. Only the cap gets it out.
+        let filling = tokio::spawn(async move { fill_to_cap_then_refuse(&sink, pane) });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_or_tear(&mut wedged, &in_flight, &tear),
+        )
+        .await
+        .expect("the wedged write must be cancelled, not waited out");
+        assert!(matches!(outcome, WriteOutcome::Torn), "expected a tear, got {outcome:?}");
+        filling.await.unwrap();
+
+        // What the torn write was carrying goes back to the head, so the redial
+        // sends it before the backlog it was blocking.
+        out_rx.requeue(in_flight);
+        assert_key_input(&out_rx.recv().await.unwrap(), b"a");
+        assert_eq!(out_rx.len(), OUTBOUND_QUEUE_FRAMES, "the backlog survives the tear intact");
     }
 }
