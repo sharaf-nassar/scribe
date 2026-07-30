@@ -101,34 +101,97 @@ impl PreservedAiScrollback {
     }
 }
 
-/// The write side of one client connection. A local Unix-socket connection
-/// writes framed messages straight to the socket — byte-for-byte the pre-013
-/// behavior. A remote (TCP) connection instead enqueues into a bounded
-/// per-connection output queue drained by a dedicated task (feature 013 T029,
-/// research D5), so a slow tailnet link can never block the fan-out hot path
-/// (and thus never stall the server's authoritative `Term` or the other
-/// clients). Boxing the local half lets one `SharedWriter` back either a
-/// `WriteHalf<UnixStream>` or the remote enqueue handle without threading a
-/// stream-type generic through every handler.
-pub enum ClientSink {
-    /// Local Unix-socket writer: framed messages go straight to the socket via
-    /// the stream-generic `write_message`.
-    Local(Box<dyn tokio::io::AsyncWrite + Send + Unpin>),
-    /// Remote (TCP) enqueue handle into the bounded output queue.
-    Remote(RemoteSink),
+/// The write side of one client connection: the enqueue handle into that
+/// connection's bounded output queue, drained by the connection's dedicated
+/// writer task ([`output_queue_drain`]).
+///
+/// EVERY connection — local Unix socket as well as remote TCP — goes through the
+/// queue. Writing a local socket inline used to let a stopped or merely slow
+/// client back-pressure whichever `pty_reader_task` was fanning out to it, which
+/// wedges the PTY and, because the authoritative `Term` is shared, freezes every
+/// other viewer of that session with it. Enqueueing is a few `VecDeque`
+/// operations under a std mutex and never awaits, so no output path can block on
+/// a consumer.
+///
+/// The `Mutex` in [`SharedWriter`] is the connection's ownership token, not an
+/// I/O lock: its critical section is one non-blocking enqueue, never an await on
+/// the socket.
+pub struct ClientSink(OutputSink);
+
+impl ClientSink {
+    /// Wrap a connection's enqueue handle as its client sink.
+    pub(crate) fn new(sink: OutputSink) -> Self {
+        Self(sink)
+    }
+
+    /// Clone the lock-free enqueue handle so a session's attached-sink set can
+    /// fan output out without ever taking this connection's mutex (and therefore
+    /// without holding the per-session set's lock across an await).
+    pub(crate) fn queue(&self) -> OutputSink {
+        self.0.clone()
+    }
 }
 
 /// Shared writer half of a client connection.
 pub type SharedWriter = Arc<Mutex<ClientSink>>;
 
+/// Delivery state of one attached sink for one session — the buffering sink
+/// state machine that closes the attach snapshot/install gap.
+///
+/// A sink is installed **before** its replay snapshot is taken. Until the replay
+/// has been written it is `Buffering`: every sink-bound frame accumulates in
+/// emission order instead of racing the replay onto the wire. Once the replay is
+/// out, frames the snapshot already reflects are dropped, the rest are flushed in
+/// emission order, and the sink flips to `Live`.
+enum SinkState {
+    /// Frames emitted since the sink was installed, awaiting the replay.
+    Buffering(BufferedFrames),
+    /// Steady state: frames go straight into the connection's output queue.
+    Live,
+}
+
+/// Sink-bound frames held while a sink waits for its attach replay.
+#[derive(Default)]
+struct BufferedFrames {
+    frames: VecDeque<BufferedFrame>,
+    bytes: usize,
+    /// Set when the backlog outgrew [`OUTPUT_QUEUE_PTY_BYTES`] and was dropped.
+    /// The flush then asks the connection's writer task for a fresh full replay
+    /// instead of handing the client a truncated backlog.
+    overflowed: bool,
+}
+
+/// One buffered frame plus the Term-commit cursor value that decides whether the
+/// attach snapshot already contains its effect.
+struct BufferedFrame {
+    /// `Some(commit)` for frames whose effect the Term — and therefore the replay
+    /// snapshot — also carries (`PtyOutput`, `TrimScrollback`, `ScrollBottom`);
+    /// such a frame is dropped when the snapshot was taken at or after `commit`.
+    /// `None` for frames no snapshot can carry (metadata, exit, workspace
+    /// naming): those always flush.
+    commit: Option<u64>,
+    msg: ServerMessage,
+}
+
+/// One attached sink and its per-session delivery state.
+struct AttachedSink {
+    /// The connection's `SharedWriter`, kept purely as the `Arc::ptr_eq` identity
+    /// token attach/detach match on.
+    writer: SharedWriter,
+    /// Lock-free enqueue handle into that connection's output queue.
+    queue: OutputSink,
+    state: SinkState,
+}
+
 /// The set of client sinks attached to one session (feature 015 T007). Folds the
 /// pre-015 single `Option<SharedWriter>` slot into a fan-out set so N participants
 /// receive the same live output; with one attached sink — every legacy /
-/// `SingleController` flow — it is byte-identical to the old single slot. Targeted
-/// per-sink sends still address one `SharedWriter` directly via [`send_message`].
+/// `SingleController` flow — it is the old single slot plus its buffering state.
+/// Targeted per-sink sends still address one `SharedWriter` directly via
+/// [`send_message`].
 #[derive(Default)]
 pub struct AttachedSinks {
-    sinks: Vec<SharedWriter>,
+    sinks: Vec<AttachedSink>,
 }
 
 impl AttachedSinks {
@@ -137,25 +200,82 @@ impl AttachedSinks {
         self.sinks.is_empty()
     }
 
-    /// The attached sinks, in attach order, for the output fan-out.
-    pub(crate) fn sinks(&self) -> &[SharedWriter] {
-        &self.sinks
-    }
-
-    /// Replace the attached set with a single sink — the `SingleController`
-    /// attach / takeover re-point, byte-identical to the pre-015
-    /// `*slot = Some(writer)`.
-    pub(crate) fn set_sole(&mut self, writer: SharedWriter) {
+    /// Seed the set with a single `Live` sink — the creating client of a fresh
+    /// session, which has no replay to race and so needs no buffering. Reattach
+    /// goes through [`AttachedSinks::begin_attach`] instead.
+    fn set_sole(&mut self, writer: SharedWriter, queue: OutputSink) {
         self.sinks.clear();
-        self.sinks.push(writer);
+        self.sinks.push(AttachedSink { writer, queue, state: SinkState::Live });
     }
 
-    /// Add a sink to the set without disturbing the others (feature 015 T012, the
-    /// shared-mode additive attach), de-duplicated by `Arc::ptr_eq` so a re-attach
-    /// replaces rather than doubles the participant's own sink.
-    pub(crate) fn attach_additive(&mut self, writer: SharedWriter) {
-        self.sinks.retain(|w| !Arc::ptr_eq(w, &writer));
-        self.sinks.push(writer);
+    /// Install a sink that still owes an attach replay. Frames emitted from here
+    /// on are buffered against it until [`AttachedSinks::finish_attach`] runs, so
+    /// nothing emitted between the snapshot and the sink install is lost (#3).
+    ///
+    /// `additive` picks the feature-015 shared-mode join (keep the other
+    /// participants' sinks) over the `SingleController` / legacy takeover
+    /// re-point (replace the set).
+    fn begin_attach(&mut self, writer: &SharedWriter, queue: OutputSink, additive: bool) {
+        if !additive {
+            self.sinks.clear();
+        }
+        self.sinks.retain(|s| !Arc::ptr_eq(&s.writer, writer));
+        self.sinks.push(AttachedSink {
+            writer: Arc::clone(writer),
+            queue,
+            state: SinkState::Buffering(BufferedFrames::default()),
+        });
+    }
+
+    /// Release a buffering sink once its replay is on the wire: drop the frames
+    /// the snapshot at `snapshot_commit` already reflects, flush the rest in
+    /// emission order, and flip the sink to `Live`.
+    ///
+    /// A backlog that overflowed while buffering resyncs instead — the sink's
+    /// connection is marked replay-dirty for `session_id`, so its writer task
+    /// sends a fresh full replay that supersedes whatever was shed.
+    fn finish_attach(
+        &mut self,
+        writer: &SharedWriter,
+        snapshot_commit: u64,
+        session_id: SessionId,
+    ) {
+        let Some(sink) = self.sinks.iter_mut().find(|s| Arc::ptr_eq(&s.writer, writer)) else {
+            return;
+        };
+        let SinkState::Buffering(buffered) = std::mem::replace(&mut sink.state, SinkState::Live)
+        else {
+            return;
+        };
+        if buffered.overflowed {
+            sink.queue.mark_dirty(session_id);
+            return;
+        }
+        for frame in buffered.frames {
+            if frame.commit.is_some_and(|commit| commit <= snapshot_commit) {
+                continue;
+            }
+            sink.queue.enqueue(&frame.msg);
+        }
+    }
+
+    /// Fan one sink-bound frame out to every attached sink: straight into the
+    /// connection's output queue for a `Live` sink, into the pending buffer for
+    /// one still awaiting its replay.
+    ///
+    /// `commit` is the Term-commit cursor value that includes this frame's effect,
+    /// or `None` for frames a replay snapshot cannot carry. Every step is
+    /// non-blocking, which is what lets the caller hold the per-session set's lock
+    /// across the whole fan-out without ever awaiting under it.
+    fn fan_out(&mut self, commit: Option<u64>, msg: &ServerMessage) {
+        for sink in &mut self.sinks {
+            match &mut sink.state {
+                SinkState::Live => {
+                    sink.queue.enqueue(msg);
+                }
+                SinkState::Buffering(buffered) => buffered.push(commit, msg),
+            }
+        }
     }
 
     /// Detach the sink identified by `writer` (`Arc::ptr_eq`); returns whether it
@@ -164,15 +284,94 @@ impl AttachedSinks {
     /// sink.
     pub(crate) fn detach(&mut self, writer: &SharedWriter) -> bool {
         let before = self.sinks.len();
-        self.sinks.retain(|w| !Arc::ptr_eq(w, writer));
+        self.sinks.retain(|s| !Arc::ptr_eq(&s.writer, writer));
         self.sinks.len() != before
     }
 }
 
-/// The per-session set of attached client sinks. `Arc<Mutex<..>>` so the PTY
-/// reader task and the attach/detach paths share one slot; empty when the session
-/// is detached (the reader silently skips sends).
-pub type ClientWriter = Arc<Mutex<AttachedSinks>>;
+impl BufferedFrames {
+    /// Append one frame, shedding the whole backlog if it would outgrow the
+    /// per-connection output budget. Shedding is safe because the flush turns it
+    /// into a fresh full replay; keeping an unbounded buffer would not be.
+    fn push(&mut self, commit: Option<u64>, msg: &ServerMessage) {
+        if self.overflowed {
+            return;
+        }
+        let bytes = out_frame_bytes(msg);
+        if self.bytes.saturating_add(bytes) > OUTPUT_QUEUE_PTY_BYTES {
+            warn!(
+                queued_bytes = self.bytes,
+                "attach buffer overflowed while awaiting replay; resyncing the sink instead"
+            );
+            self.frames.clear();
+            self.bytes = 0;
+            self.overflowed = true;
+            return;
+        }
+        self.bytes += bytes;
+        self.frames.push_back(BufferedFrame { commit, msg: msg.clone() });
+    }
+}
+
+/// The per-session set of attached client sinks. A **std** mutex: every critical
+/// section is non-blocking bookkeeping plus a queue enqueue, so the compiler
+/// enforces that no sink send is ever awaited while the set is locked (#58).
+/// Empty when the session is detached (the reader silently skips sends).
+pub type ClientWriter = Arc<std::sync::Mutex<AttachedSinks>>;
+
+/// Lock the per-session attached-sink set.
+///
+/// The only holders do panic-free `Vec`/`VecDeque` work, so poisoning cannot
+/// occur in practice; recover rather than propagate if it somehow does.
+pub fn lock_sinks(client_writer: &ClientWriter) -> std::sync::MutexGuard<'_, AttachedSinks> {
+    client_writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Build a `SharedWriter` over `write_half`, backed by its own output queue and
+/// drain task, for tests that read the resulting frames off a socket pair.
+#[cfg(test)]
+pub fn test_shared_writer<W>(write_half: W) -> SharedWriter
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (sink, _drain) = spawn_output_queue(write_half, new_live_session_registry());
+    Arc::new(Mutex::new(ClientSink::new(sink)))
+}
+
+/// Monotonic per-session cursor over output the shared `Term` has consumed.
+///
+/// A PTY chunk advances it by its byte count; a non-byte Term mutation the client
+/// mirrors through a frame of its own (a scrollback trim) advances it by one. The
+/// counter is read and written ONLY while the session's `Term` mutex is held, so
+/// "cursor ≥ C" and "the Term reflects everything tagged ≤ C" are the same
+/// statement — which is what lets an attach snapshot decide, without a second
+/// critical section, which buffered frames it already contains.
+#[derive(Default)]
+pub struct TermCommit(AtomicU64);
+
+impl TermCommit {
+    /// Read the cursor. Everyone except the owning PTY reader must hold the
+    /// `Term` lock; the reader is the sole writer, so its own reads are exact
+    /// off-lock.
+    pub(crate) fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Advance the cursor past an applied Term mutation, returning the new value.
+    /// Call only under the `Term` lock.
+    fn advance(&self, delta: u64) -> u64 {
+        self.0.fetch_add(delta, Ordering::Relaxed).saturating_add(delta)
+    }
+}
+
+/// A byte chunk's contribution to the [`TermCommit`] cursor.
+fn chunk_len(bytes: &[u8]) -> u64 {
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+}
+
+/// Shared handle on a session's [`TermCommit`] cursor, held by the PTY reader
+/// (the sole writer) and read by the attach path under the `Term` lock.
+pub type SessionCommit = Arc<TermCommit>;
 
 /// Session IDs currently attached to a specific client connection.
 pub type AttachedSessionIds = Arc<Mutex<HashSet<SessionId>>>;
@@ -295,14 +494,14 @@ pub enum ParticipantTransport {
 
 /// Feature 015 (T006, D1): one attached machine's membership in a window share.
 /// Absorbs the per-connection state feature 013 spread across the three retired
-/// per-window maps plus the existing per-connection `RemoteSink` queue (carried on
+/// per-window maps plus the existing per-connection `OutputSink` queue (carried on
 /// `writer`).
 pub struct Participant {
     /// Stable id for this connection's lifetime; roster + control-grant target.
     pub id: ParticipantId,
     /// The connection's write sink and identity token: `Arc::ptr_eq` on this Arc
     /// is the ownership guard preserved from feature 013, and it is the fan-out
-    /// sink (`ClientSink::Local` inline, `ClientSink::Remote` via `RemoteSink`).
+    /// sink: its `ClientSink` enqueues into the connection's output queue.
     pub writer: SharedWriter,
     /// `Local` (owner) or `Remote { device, login }`, for the window-list
     /// controller field and the `WindowTakenOver` naming.
@@ -761,6 +960,10 @@ struct PtyReaderState {
     cancel: CancelWaiter,
     pty_write: Arc<Mutex<WriteHalf<scribe_pty::async_fd::AsyncPtyFd>>>,
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    /// Monotonic cursor over what `term` has consumed. Advanced in the same
+    /// `Term` critical section as every feed, so an attach can pair a snapshot
+    /// with the exact output it contains.
+    term_commit: SessionCommit,
     ansi_processor: AnsiProcessor,
     osc_parser: VteParser,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
@@ -775,7 +978,7 @@ struct PtyReaderState {
     /// `outstanding_prompt` + `policy`; the burst-reuse fields land later.
     //
     // @lat: [[server#Sessions#Clipboard Gating]]
-    clipboard_burst: crate::clipboard_state::ClipboardBurstState,
+    clipboard_burst: ClipboardBurstState,
     /// Pending OSC 52 read requests awaiting the client's
     /// `ClipboardBridgeReadReply`, keyed by the `PromptId` echoed in the
     /// bridge request. Each entry holds the formatter alacritty handed us
@@ -834,6 +1037,10 @@ pub struct LiveSession {
     resize_fd: Arc<OwnedFd>,
     pub(crate) term:
         Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    /// Monotonic cursor over what `term` has consumed — read under the `Term`
+    /// lock alongside a replay snapshot so the attach knows which buffered
+    /// frames that snapshot already reflects.
+    pub(crate) term_commit: SessionCommit,
     child_pid: u32,
     /// `pub(crate)` so `hook_ingress` can clone the writer when routing
     /// inbound `HookEvent`s through `send_metadata_event`.
@@ -925,6 +1132,7 @@ pub struct AttachSessionData {
     pub client_writer: ClientWriter,
     pub attachment: SessionAttachment,
     pub term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    pub term_commit: SessionCommit,
     pub resize_fd: Arc<OwnedFd>,
     pub target_dims: Option<TerminalSize>,
     pub has_handoff_snapshot: bool,
@@ -948,6 +1156,7 @@ impl LiveSession {
             client_writer: Arc::clone(&self.client_writer),
             attachment: Arc::clone(&self.attachment),
             term: Arc::clone(&self.term),
+            term_commit: Arc::clone(&self.term_commit),
             resize_fd: Arc::clone(&self.resize_fd),
             target_dims,
             has_handoff_snapshot: self.handoff_snapshot.is_some(),
@@ -979,7 +1188,7 @@ impl LiveSession {
 /// Closure shape produced by `alacritty_terminal` for OSC 52 read replies.
 /// Defined in [`crate::clipboard_state`] so [`crate::clipboard_state::DeferredRequest`]
 /// can hold a parked formatter while a burst-deferred read waits on a prompt.
-use crate::clipboard_state::ClipboardReplyFormatter;
+use crate::clipboard_state::{ClipboardBurstState, ClipboardReplyFormatter};
 
 /// Client→PTY-reader control message for OSC 52 prompt resolution and host
 /// clipboard bridge replies. The client dispatch task pushes one of these
@@ -1117,7 +1326,9 @@ pub async fn start_ipc_server(
                 info!("client connected");
                 let server = server.clone();
                 tokio::spawn(async move {
-                    handle_client(stream, server).await;
+                    // `Box::pin` the connection future so it lives on the heap
+                    // rather than bloating this spawned task's stack frame.
+                    Box::pin(handle_client(stream, server)).await;
                     drop(permit);
                 });
             }
@@ -1164,34 +1375,34 @@ const LAN_PENDING_HANDSHAKE_CAP: usize = 64;
 /// dialer a large heap allocation from a forged length prefix.
 const REMOTE_PREAMBLE_MAX_BYTES: u32 = 8 * 1024;
 
-/// Per-remote-connection cap on queued droppable `PtyOutput` payload bytes
+/// Per-connection cap on queued droppable `PtyOutput` payload bytes
 /// (feature 013 T029, research D5, PR-004). When the backlog would exceed this
 /// the whole `PtyOutput` queue is shed and its sessions are marked replay-dirty
 /// for a fresh full replay, so a stalled consumer's memory stays bounded without
 /// ever back-pressuring the PTY. Control/replay frames are never counted here.
-const REMOTE_OUTPUT_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+const OUTPUT_QUEUE_PTY_BYTES: usize = 4 * 1024 * 1024;
 
-/// Per-remote-connection cap on TOTAL queued bytes across every frame kind —
+/// Per-connection cap on TOTAL queued bytes across every frame kind —
 /// including the non-droppable `Keep` lane (`SessionReplay`, `SessionCreated`,
 /// `TitleChanged`, `ClipboardBridgeWrite`, …). Prevents an unbounded `Keep`
 /// backlog on a stalled link: on breach the droppable `PtyOutput` backlog is shed
 /// first, and if the queue is STILL over ceiling (a pure control-frame flood the
 /// link cannot drain) the connection is closed so its memory use stays bounded
-/// (FR-013). Sits above [`REMOTE_OUTPUT_QUEUE_BYTES`] to leave headroom for a
+/// (FR-013). Sits above [`OUTPUT_QUEUE_PTY_BYTES`] to leave headroom for a
 /// legitimate multi-session initial attach replay.
-const REMOTE_OUTPUT_QUEUE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const OUTPUT_QUEUE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
-/// Per-remote-connection cap on the number of queued frames, bounding a flood of
+/// Per-connection cap on the number of queued frames, bounding a flood of
 /// small `Keep` control frames the byte ceiling would under-count. Same
-/// shed-then-close policy as [`REMOTE_OUTPUT_QUEUE_TOTAL_BYTES`].
-const REMOTE_OUTPUT_QUEUE_MAX_FRAMES: usize = 8192;
+/// shed-then-close policy as [`OUTPUT_QUEUE_TOTAL_BYTES`].
+const OUTPUT_QUEUE_MAX_FRAMES: usize = 8192;
 
 /// Nominal byte cost charged to a queued control frame whose exact serialized
 /// size is not worth computing. The two high-volume streams are sized precisely
 /// (`PtyOutput` by payload length, `SessionReplay` by its compressed blob); every
 /// other frame is small, so a flat nominal keeps the total-byte accounting cheap
 /// while the frame-count ceiling backstops tiny-frame floods.
-const REMOTE_FRAME_NOMINAL_BYTES: usize = 256;
+const OUTPUT_FRAME_NOMINAL_BYTES: usize = 256;
 
 /// Upper bound on how long a freshly accepted remote connection may take to send
 /// its `RemoteHandshake` preamble before it is dropped, so a silent peer cannot
@@ -1286,49 +1497,50 @@ struct RemoteIdentity {
     audit: RemoteAudit,
 }
 
-// ── Feature 013 (T029): bounded per-remote-connection output queue ───────────
+// ── Bounded per-connection output queue (feature 013 T029, generalized) ──────
 //
-// A slow tailnet link must never block the fan-out hot path (research D5,
+// A stalled consumer must never block the fan-out hot path (research D5,
 // FR-013). If `send_pty_output` / `send_to_client` wrote straight to a stalled
-// TCP socket, the owning session's `pty_reader_task` would wedge on the write,
+// socket, the owning session's `pty_reader_task` would wedge on the write,
 // back-pressuring the PTY and freezing the running program — and, because the
-// authoritative `Term` is shared, stalling every other client with it. So each
-// REMOTE connection interposes this bounded queue: its `SharedWriter` only
-// enqueues (never awaits the socket), and a single drain task owns the write
-// half. When queued `PtyOutput` would exceed the cap the whole backlog is
-// dropped and its sessions are marked replay-dirty; the drain task then sends
-// each a fresh full `SessionReplay` once the link drains (catch-up-to-current,
-// the tmux `%pause`→`capture-pane` model). Local Unix-socket connections never
-// build one — they keep writing inline exactly as before (see `ClientSink` and
-// `handle_client`).
+// authoritative `Term` is shared, stalling every other client with it. So EVERY
+// connection — local Unix socket as well as remote TCP — interposes this bounded
+// queue: its `SharedWriter` only enqueues (never awaits the socket), and a single
+// drain task owns the write half. A SIGSTOP'd or merely slow local client is
+// exactly as harmless as a slow tailnet link.
+//
+// When queued `PtyOutput` would exceed the cap the whole backlog is dropped and
+// its sessions are marked replay-dirty; the drain task then sends each a fresh
+// full `SessionReplay` once the consumer drains (catch-up-to-current, the tmux
+// `%pause`→`capture-pane` model).
 
-/// Enqueue handle into a remote connection's bounded output queue. Cloneable and
+/// Enqueue handle into a connection's bounded output queue. Cloneable and
 /// cheap: every `SharedWriter` clone for the connection (the window-registry slot
 /// and each attached session's `client_writer`) holds one, all funneling into the
-/// single queue drained by [`remote_output_drain`].
+/// single queue drained by [`output_queue_drain`].
 #[derive(Clone)]
-pub struct RemoteSink(Arc<RemoteOutputShared>);
+pub struct OutputSink(Arc<OutputQueueShared>);
 
-/// Shared state between a remote connection's [`RemoteSink`] producers and its
+/// Shared state between a connection's [`OutputSink`] producers and its
 /// one drain task. The queue is guarded by a *std* mutex: every critical section
 /// is a few non-blocking `VecDeque` / `HashSet` operations and never spans an
 /// `.await`, so producers never park on the link (and the `!Send` guard makes the
 /// compiler enforce that discipline in the spawned drain task).
-struct RemoteOutputShared {
-    inner: std::sync::Mutex<RemoteQueueInner>,
+struct OutputQueueShared {
+    inner: std::sync::Mutex<OutputQueueInner>,
     /// Wakes the drain task when frames are enqueued, a session goes replay-dirty,
     /// or the connection is shutting down.
     notify: tokio::sync::Notify,
 }
 
-struct RemoteQueueInner {
+struct OutputQueueInner {
     /// Frames awaiting the link, in send order.
     frames: VecDeque<OutFrame>,
     /// Running total of queued droppable `PtyOutput` payload bytes — the quantity
-    /// the overflow cap ([`REMOTE_OUTPUT_QUEUE_BYTES`]) governs.
+    /// the overflow cap ([`OUTPUT_QUEUE_PTY_BYTES`]) governs.
     queued_pty_bytes: usize,
     /// Running total of queued bytes across EVERY frame kind (droppable and
-    /// `Keep`), governed by [`REMOTE_OUTPUT_QUEUE_TOTAL_BYTES`] so an unbounded
+    /// `Keep`), governed by [`OUTPUT_QUEUE_TOTAL_BYTES`] so an unbounded
     /// `Keep` backlog on a stalled link is bounded too, not just `PtyOutput`.
     queued_total_bytes: usize,
     /// Sessions whose `PtyOutput` backlog was dropped and that therefore owe a
@@ -1350,7 +1562,7 @@ enum OutFrame {
     Keep { bytes: usize, msg: ServerMessage },
 }
 
-impl RemoteQueueInner {
+impl OutputQueueInner {
     /// Pop the next queued frame's message in send order, decrementing both the
     /// `PtyOutput` byte total and the whole-queue byte total so the overflow caps
     /// track what is still buffered.
@@ -1369,8 +1581,8 @@ impl RemoteQueueInner {
     }
 }
 
-impl RemoteOutputShared {
-    fn lock(&self) -> std::sync::MutexGuard<'_, RemoteQueueInner> {
+impl OutputQueueShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, OutputQueueInner> {
         // The only lock holders are the enqueue path and the drain task, both
         // doing panic-free `VecDeque` / `HashSet` work, so poisoning cannot occur
         // in practice; recover rather than propagate if it somehow does.
@@ -1378,15 +1590,15 @@ impl RemoteOutputShared {
     }
 }
 
-impl RemoteSink {
+impl OutputSink {
     /// Enqueue one `ServerMessage` for the drain task. Never blocks on the link.
     ///
     /// `PtyOutput` is the sole droppable, high-volume stream: while its session is
     /// replay-dirty it is suppressed, and when the queued `PtyOutput` backlog would
-    /// exceed [`REMOTE_OUTPUT_QUEUE_BYTES`] the entire backlog is dropped and every
+    /// exceed [`OUTPUT_QUEUE_PTY_BYTES`] the entire backlog is dropped and every
     /// affected session (this one included) is marked replay-dirty. Every other
     /// message is kept in order, but the whole queue is bounded too
-    /// ([`REMOTE_OUTPUT_QUEUE_TOTAL_BYTES`] / [`REMOTE_OUTPUT_QUEUE_MAX_FRAMES`]):
+    /// ([`OUTPUT_QUEUE_TOTAL_BYTES`] / [`OUTPUT_QUEUE_MAX_FRAMES`]):
     /// on breach the droppable backlog is shed, and a queue still over ceiling is
     /// a hopelessly stalled link, so the connection is closed (bounded resource
     /// use, FR-013).
@@ -1394,7 +1606,10 @@ impl RemoteSink {
     /// The (potentially multi-MB) message clone is built BEFORE the queue lock is
     /// taken, so the std mutex is only ever held for O(1) `VecDeque`/`HashSet`
     /// bookkeeping — never for a large `memcpy`.
-    fn enqueue(&self, msg: &ServerMessage) {
+    ///
+    /// Returns `false` only when the connection is already closed — the enqueue
+    /// equivalent of the pre-queue "dead socket" write error.
+    fn enqueue(&self, msg: &ServerMessage) -> bool {
         let bytes = out_frame_bytes(msg);
         let pty_session = match msg {
             ServerMessage::PtyOutput { session_id, .. } => Some(*session_id),
@@ -1409,15 +1624,15 @@ impl RemoteSink {
 
         let mut g = self.0.lock();
         if g.closed {
-            return;
+            return false;
         }
         if let Some(session_id) = pty_session {
             if g.dirty.contains(&session_id) {
                 // A fresh replay is already pending for this session; its live
                 // output is superseded — drop it and skip the wakeup.
-                return;
+                return true;
             }
-            if g.queued_pty_bytes.saturating_add(bytes) > REMOTE_OUTPUT_QUEUE_BYTES {
+            if g.queued_pty_bytes.saturating_add(bytes) > OUTPUT_QUEUE_PTY_BYTES {
                 // Overflow: shed the whole `PtyOutput` backlog and let a fresh
                 // replay catch every affected session (this one too) back up.
                 drop_pty_backlog(&mut g);
@@ -1434,6 +1649,20 @@ impl RemoteSink {
         enforce_queue_ceiling(&mut g);
         drop(g);
         self.0.notify.notify_one();
+        true
+    }
+
+    /// Mark `session_id` replay-dirty so the drain task sends it a fresh full
+    /// `SessionReplay`. The attach path uses this when a sink's pre-replay buffer
+    /// overflowed: catching the client up to current supersedes the shed backlog.
+    fn mark_dirty(&self, session_id: SessionId) {
+        let mut g = self.0.lock();
+        if g.closed {
+            return;
+        }
+        g.dirty.insert(session_id);
+        drop(g);
+        self.0.notify.notify_one();
     }
 
     /// Mark the queue closed and wake the drain task so it flushes what remains
@@ -1448,7 +1677,7 @@ impl RemoteSink {
 /// Drop every queued `PtyOutput` frame, marking each dropped session replay-dirty
 /// so the drain task sends it a fresh full replay once the link drains. Kept
 /// (control / replay) frames retain their relative order.
-fn drop_pty_backlog(g: &mut RemoteQueueInner) {
+fn drop_pty_backlog(g: &mut OutputQueueInner) {
     let mut kept = VecDeque::with_capacity(g.frames.len());
     for frame in std::mem::take(&mut g.frames) {
         match frame {
@@ -1467,13 +1696,13 @@ fn drop_pty_backlog(g: &mut RemoteQueueInner) {
 
 /// Byte cost charged to a queued frame. The two high-volume streams are sized
 /// precisely so the total-queue cap tracks real memory; every other (small)
-/// control frame is charged a flat [`REMOTE_FRAME_NOMINAL_BYTES`], with the
+/// control frame is charged a flat [`OUTPUT_FRAME_NOMINAL_BYTES`], with the
 /// frame-count ceiling backstopping tiny-frame floods.
 fn out_frame_bytes(msg: &ServerMessage) -> usize {
     match msg {
         ServerMessage::PtyOutput { data, .. } => data.len(),
         ServerMessage::SessionReplay { replay, .. } => replay.replay_zstd.len(),
-        _ => REMOTE_FRAME_NOMINAL_BYTES,
+        _ => OUTPUT_FRAME_NOMINAL_BYTES,
     }
 }
 
@@ -1483,38 +1712,38 @@ fn out_frame_bytes(msg: &ServerMessage) -> usize {
 /// shed the droppable backlog first; if it is STILL over ceiling the link cannot
 /// keep up even with output dropped, so mark the connection closed for teardown
 /// (the client auto-reconnects to a fresh replay). A no-op on a healthy queue.
-fn enforce_queue_ceiling(g: &mut RemoteQueueInner) {
-    if g.queued_total_bytes <= REMOTE_OUTPUT_QUEUE_TOTAL_BYTES
-        && g.frames.len() <= REMOTE_OUTPUT_QUEUE_MAX_FRAMES
+fn enforce_queue_ceiling(g: &mut OutputQueueInner) {
+    if g.queued_total_bytes <= OUTPUT_QUEUE_TOTAL_BYTES && g.frames.len() <= OUTPUT_QUEUE_MAX_FRAMES
     {
         return;
     }
     drop_pty_backlog(g);
-    if g.queued_total_bytes > REMOTE_OUTPUT_QUEUE_TOTAL_BYTES
-        || g.frames.len() > REMOTE_OUTPUT_QUEUE_MAX_FRAMES
-    {
+    if g.queued_total_bytes > OUTPUT_QUEUE_TOTAL_BYTES || g.frames.len() > OUTPUT_QUEUE_MAX_FRAMES {
         warn!(
             queued_bytes = g.queued_total_bytes,
             frames = g.frames.len(),
-            "remote output queue over ceiling after shedding backlog; closing stalled connection"
+            "output queue over ceiling after shedding backlog; closing stalled connection"
         );
         g.closed = true;
     }
 }
 
-/// Build a remote connection's output queue and spawn its drain task (which owns
-/// the TCP write half). Returns the enqueue handle to install into the
-/// connection's `SharedWriter` plus the drain task's join handle, awaited
-/// (bounded) at teardown by [`shutdown_remote_output`].
-fn spawn_remote_output<W>(
+/// Build a connection's output queue and spawn its drain task (which owns the
+/// write half). Returns the enqueue handle to install into the connection's
+/// `SharedWriter` plus the drain task's join handle, awaited (bounded) at
+/// teardown by [`shutdown_output_queue`].
+///
+/// `live_sessions` is the registry the drain task rebuilds a catch-up
+/// `SessionReplay` from when a session goes replay-dirty.
+fn spawn_output_queue<W>(
     write_half: W,
-    server: IpcServerState,
-) -> (RemoteSink, tokio::task::JoinHandle<()>)
+    live_sessions: LiveSessionRegistry,
+) -> (OutputSink, tokio::task::JoinHandle<()>)
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let shared = Arc::new(RemoteOutputShared {
-        inner: std::sync::Mutex::new(RemoteQueueInner {
+    let shared = Arc::new(OutputQueueShared {
+        inner: std::sync::Mutex::new(OutputQueueInner {
             frames: VecDeque::new(),
             queued_pty_bytes: 0,
             queued_total_bytes: 0,
@@ -1523,18 +1752,43 @@ where
         }),
         notify: tokio::sync::Notify::new(),
     });
-    let drain = tokio::spawn(remote_output_drain(Arc::clone(&shared), write_half, server));
-    (RemoteSink(shared), drain)
+    let drain = tokio::spawn(output_queue_drain(Arc::clone(&shared), write_half, live_sessions));
+    (OutputSink(shared), drain)
 }
 
-/// The single writer for a remote connection: flush queued frames to the socket,
-/// then send a fresh full `SessionReplay` for any replay-dirty session, then park
+/// Write one queued frame, reporting whether the connection is still usable.
+///
+/// A frame that cannot be encoded — most plausibly a `ScreenSnapshot` of a very
+/// deep scrollback exceeding [`scribe_common::framing::MAX_MESSAGE_SIZE`] — is
+/// dropped with a log line rather than taken as a connection fault: encoding
+/// fails before any byte reaches the socket, so the stream is still intact and
+/// the next frame is fine. Only a genuine I/O error, which can leave a partial
+/// frame on the wire, tears the connection down.
+async fn write_queued_frame<W>(write_half: &mut W, msg: &ServerMessage) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match write_message(write_half, msg).await {
+        Ok(()) => true,
+        Err(ScribeError::Io { source }) => {
+            debug!("output queue write failed: {source}");
+            false
+        }
+        Err(e) => {
+            warn!("dropping unsendable frame: {e}");
+            true
+        }
+    }
+}
+
+/// The single writer for a connection: flush queued frames to the socket, then
+/// send a fresh full `SessionReplay` for any replay-dirty session, then park
 /// until more work arrives (or the connection closes). This is the ONLY task that
-/// writes the remote socket, so frame order on the wire is exactly enqueue order.
-async fn remote_output_drain<W>(
-    shared: Arc<RemoteOutputShared>,
+/// writes the socket, so frame order on the wire is exactly enqueue order.
+async fn output_queue_drain<W>(
+    shared: Arc<OutputQueueShared>,
     mut write_half: W,
-    server: IpcServerState,
+    live_sessions: LiveSessionRegistry,
 ) where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -1542,7 +1796,7 @@ async fn remote_output_drain<W>(
         // 1. Flush every queued frame, in order.
         loop {
             let Some(msg) = shared.lock().pop_message() else { break };
-            if write_message(&mut write_half, &msg).await.is_err() {
+            if !write_queued_frame(&mut write_half, &msg).await {
                 shared.lock().closed = true;
                 return;
             }
@@ -1554,7 +1808,7 @@ async fn remote_output_drain<W>(
             g.dirty.iter().copied().collect()
         };
         for session_id in dirty {
-            if !send_resync_replay(&shared, &mut write_half, &server, session_id).await {
+            if !send_resync_replay(&shared, &mut write_half, &live_sessions, session_id).await {
                 return;
             }
         }
@@ -1581,52 +1835,56 @@ async fn remote_output_drain<W>(
 /// resumes queuing immediately and lands *after* this full-state replay. Returns
 /// `false` only when the socket write failed (the drain task then stops).
 async fn send_resync_replay<W>(
-    shared: &Arc<RemoteOutputShared>,
+    shared: &Arc<OutputQueueShared>,
     write_half: &mut W,
-    server: &IpcServerState,
+    live_sessions: &LiveSessionRegistry,
     session_id: SessionId,
 ) -> bool
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let term = {
-        let sessions = server.live_sessions.read().await;
-        sessions.get(&session_id).map(|s| Arc::clone(&s.term))
+    let handles = {
+        let sessions = live_sessions.read().await;
+        sessions.get(&session_id).map(|s| (Arc::clone(&s.term), Arc::clone(&s.term_commit)))
     };
-    let Some(term) = term else {
+    let Some((term, term_commit)) = handles else {
         // Session ended while dirty; nothing to replay.
         shared.lock().dirty.remove(&session_id);
         return true;
     };
-    let replay =
-        match crate::attach_flow::take_session_replay(session_id, &term, &server.live_sessions)
-            .await
-        {
-            Ok(replay) => replay,
-            Err(e) => {
-                warn!(%session_id, "remote resync replay build failed: {e}");
-                shared.lock().dirty.remove(&session_id);
-                return true;
-            }
-        };
+    let replay = match crate::attach_flow::take_session_replay(
+        session_id,
+        &term,
+        &term_commit,
+        live_sessions,
+    )
+    .await
+    {
+        Ok((replay, _commit)) => replay,
+        Err(e) => {
+            warn!(%session_id, "resync replay build failed: {e}");
+            shared.lock().dirty.remove(&session_id);
+            return true;
+        }
+    };
     // Clear dirty after the snapshot, before the write: live `PtyOutput` resumes
     // queuing now and follows this replay (catch-up-to-current). The brief
     // snapshot→clear window drops output like the pre-013 reattach window, and this
     // full-state replay supersedes it anyway.
     shared.lock().dirty.remove(&session_id);
     let msg = ServerMessage::SessionReplay { session_id, replay };
-    if write_message(write_half, &msg).await.is_err() {
+    if !write_queued_frame(write_half, &msg).await {
         shared.lock().closed = true;
         return false;
     }
     true
 }
 
-/// Stop a remote connection's drain task at teardown, bounded so a wedged link
+/// Stop a connection's drain task at teardown, bounded so a wedged consumer
 /// cannot exceed the disable budget (FR-016). Any already-queued final frame
 /// (e.g. the sever `RemoteDisconnect`) flushes first; then the write half drops
 /// and the socket closes.
-async fn shutdown_remote_output(sink: &RemoteSink, mut drain_task: tokio::task::JoinHandle<()>) {
+async fn shutdown_output_queue(sink: &OutputSink, mut drain_task: tokio::task::JoinHandle<()>) {
     sink.shutdown();
     if tokio::time::timeout(REMOTE_SEVER_NOTICE_TIMEOUT, &mut drain_task).await.is_err() {
         drain_task.abort();
@@ -2884,7 +3142,7 @@ enum LanGate {
 /// unknown device is held pending the owning user's explicit decision, revealing
 /// NO window/session data) → exact protocol-version gate → hand the encrypted
 /// stream to the shared 013 [`serve_connection`] dispatch with a bounded
-/// `ClientSink::Remote` queue and a `Remote(device label)` controller. The
+/// bounded output queue and a `Remote(device label)` controller. The
 /// connection is registered in the LAN sever registry + `device_id` index so a
 /// per-device revoke / per-transport disable can sever just it (FR-010/FR-012). A
 /// failed TLS handshake or a malformed preamble closes bare (no channel to
@@ -2952,8 +3210,9 @@ async fn handle_lan_client(stream: TcpStream, peer_addr: SocketAddr, accept: Lan
         drop(permit);
         return;
     }
-    let (sink, drain_task) = spawn_remote_output(write_half, accept.server.clone());
-    let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Remote(sink.clone())));
+    let (sink, drain_task) =
+        spawn_output_queue(write_half, Arc::clone(&accept.server.live_sessions));
+    let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::new(sink.clone())));
     let ctx = RemoteContext {
         node_name: device_name,
         login_name: String::new(),
@@ -2965,7 +3224,7 @@ async fn handle_lan_client(stream: TcpStream, peer_addr: SocketAddr, accept: Lan
     serve_connection(reader, writer, accept.server.clone(), Some(ctx)).await;
     // Flush any final frame (e.g. the sever `RemoteDisconnect`), stop the drain
     // task, then release the sever registration + connection slot.
-    shutdown_remote_output(&sink, drain_task).await;
+    shutdown_output_queue(&sink, drain_task).await;
     accept.control.deregister_connection(Transport::Lan, conn_id).await;
     drop(permit);
 }
@@ -3328,10 +3587,10 @@ async fn handle_remote_client(
             // output queue between the fan-out hot path and this (possibly slow)
             // tailnet link. The drain task owns the TCP write half; the
             // `SharedWriter` only enqueues, so a stalled remote consumer can never
-            // block the server's authoritative `Term` or the other clients. Local
-            // Unix-socket connections write inline (see `handle_client`).
-            let (sink, drain_task) = spawn_remote_output(write_half, server.clone());
-            let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Remote(sink.clone())));
+            // block the server's authoritative `Term` or the other clients.
+            let (sink, drain_task) =
+                spawn_output_queue(write_half, Arc::clone(&server.live_sessions));
+            let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::new(sink.clone())));
             let ctx = RemoteContext {
                 node_name: identity.node_name,
                 login_name: identity.login_name,
@@ -3341,7 +3600,7 @@ async fn handle_remote_client(
             serve_connection(reader, writer, server, Some(ctx)).await;
             // Flush any final frame (e.g. the sever `RemoteDisconnect`) and stop the
             // drain task before releasing the connection slot.
-            shutdown_remote_output(&sink, drain_task).await;
+            shutdown_output_queue(&sink, drain_task).await;
             control.deregister_connection(Transport::Tailnet, conn_id).await;
             // Release the connection-cap slot once the connection is fully done.
             drop(permit);
@@ -3628,10 +3887,19 @@ fn verify_peer_uid(stream: &tokio::net::UnixStream) -> bool {
 /// Per-client connection handler for the local Unix socket. Splits the stream
 /// and drives the shared [`serve_connection`] core (`Hello`/`Welcome` handshake
 /// then message dispatch). Local connections carry no remote context.
+///
+/// The write half goes to a bounded output queue with its own drain task, the
+/// same interposition remote connections use: a SIGSTOP'd or slow local client
+/// fills its queue instead of back-pressuring whichever `pty_reader_task` is
+/// fanning out to it, so the shared `Term` — and every other session — keeps
+/// running.
 async fn handle_client(stream: tokio::net::UnixStream, server: IpcServerState) {
-    let (reader, writer) = tokio::io::split(stream);
-    let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Local(Box::new(writer))));
+    let (reader, write_half) = tokio::io::split(stream);
+    let (sink, drain_task) = spawn_output_queue(write_half, Arc::clone(&server.live_sessions));
+    let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::new(sink.clone())));
     serve_connection(reader, writer, server, None).await;
+    // Flush whatever is still queued, stop the drain task, close the socket.
+    shutdown_output_queue(&sink, drain_task).await;
 }
 
 /// Drive the post-handshake per-connection protocol over any framed stream —
@@ -5117,12 +5385,13 @@ async fn detach_sessions(
 /// sink left), clear the session attachment — byte-identical to the pre-015
 /// single-slot clear.
 async fn detach_one_session(session: &LiveSession, id: SessionId, writer: &SharedWriter) {
-    let mut client_writer = session.client_writer.lock().await;
-    if !client_writer.detach(writer) {
-        return;
-    }
-    let now_empty = client_writer.is_empty();
-    drop(client_writer);
+    let now_empty = {
+        let mut client_writer = lock_sinks(&session.client_writer);
+        if !client_writer.detach(writer) {
+            return;
+        }
+        client_writer.is_empty()
+    };
     if now_empty {
         clear_session_attachment(&session.attachment).await;
     }
@@ -5643,12 +5912,16 @@ async fn handle_create_session(
 /// Build a session's initial attached-sink set from the optional attaching client
 /// (feature 015 T007). One sink is byte-identical to the pre-015 `Some(writer)`
 /// slot; empty means the session starts detached.
-fn initial_client_writer(writer: Option<&SharedWriter>) -> ClientWriter {
+///
+/// The initial sink starts `Live`: a freshly created session has no history to
+/// replay, so there is no snapshot for its output to race.
+async fn initial_client_writer(writer: Option<&SharedWriter>) -> ClientWriter {
     let mut sinks = AttachedSinks::default();
     if let Some(writer) = writer {
-        sinks.set_sole(Arc::clone(writer));
+        let queue = writer.lock().await.queue();
+        sinks.set_sole(Arc::clone(writer), queue);
     }
-    Arc::new(Mutex::new(sinks))
+    Arc::new(std::sync::Mutex::new(sinks))
 }
 
 async fn start_session(
@@ -5665,27 +5938,27 @@ async fn start_session(
         context, ai_state, ai_provider_hint, cell_width, cell_height,
         env_envelope_id, ..
     } = session;
-    let resize_fd = Arc::new(resize_fd);
     let (pty_read, pty_write) = tokio::io::split(pty_fd);
     let pty_write = Arc::new(Mutex::new(pty_write));
 
     // Seed the session's attached-sink set with the initial client (if any) so the
     // reader task keeps running detached when empty. A single sink here is
     // byte-identical to the pre-015 `Some(writer)` slot.
-    let client_writer = initial_client_writer(initial_attachment.writer);
+    let client_writer = initial_client_writer(initial_attachment.writer).await;
+    let term_commit: SessionCommit = Arc::default();
     let attachment = Arc::new(Mutex::new(initial_attachment.attached_ids.map(Arc::clone)));
 
     let (clipboard_command_tx, clipboard_command_rx) = new_clipboard_command_channel();
 
-    let preserve_ai_scrollback = Arc::new(AtomicBool::new(load_preserve_ai_scrollback_setting()));
-    let scrollback_lines = Arc::new(AtomicUsize::new(load_scrollback_lines_setting()));
+    let (preserve_ai_scrollback, scrollback_lines) = load_shared_scrollback_state();
     let ai_provider = ai_state.as_ref().map(|state| state.provider).or(ai_provider_hint);
     let exit_gate = Arc::new(SessionExitGate::new());
 
     let live = LiveSession {
         pty_write: Arc::clone(&pty_write),
-        resize_fd,
+        resize_fd: Arc::new(resize_fd),
         term: Arc::clone(&term),
+        term_commit: Arc::clone(&term_commit),
         child_pid,
         client_writer: Arc::clone(&client_writer),
         attachment: Arc::clone(&attachment),
@@ -5726,6 +5999,7 @@ async fn start_session(
             pty_read,
             pty_write,
             term,
+            term_commit,
             ansi_processor,
             osc_parser,
             event_rx,
@@ -5752,6 +6026,7 @@ struct PtyReaderInputs {
     pty_read: ReadHalf<scribe_pty::async_fd::AsyncPtyFd>,
     pty_write: Arc<Mutex<WriteHalf<scribe_pty::async_fd::AsyncPtyFd>>>,
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    term_commit: SessionCommit,
     ansi_processor: AnsiProcessor,
     osc_parser: VteParser,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
@@ -5784,6 +6059,7 @@ fn spawn_pty_reader(
         exit_gate: Arc::clone(exit_gate),
         pty_write: inputs.pty_write,
         term: inputs.term,
+        term_commit: inputs.term_commit,
         ansi_processor: inputs.ansi_processor,
         osc_parser: inputs.osc_parser,
         event_rx: inputs.event_rx,
@@ -5792,9 +6068,7 @@ fn spawn_pty_reader(
         workspace_manager: Arc::clone(runtime.workspace_manager),
         live_sessions: Arc::clone(runtime.live_sessions),
         window_shares: Arc::clone(runtime.window_shares),
-        clipboard_burst: crate::clipboard_state::ClipboardBurstState::new(
-            load_clipboard_policy_snapshot(),
-        ),
+        clipboard_burst: ClipboardBurstState::new(load_clipboard_policy_snapshot()),
         pending_clipboard_reads: HashMap::new(),
         pending_clipboard_prompt: None,
         clipboard_command_rx: inputs.clipboard_command_rx,
@@ -5879,6 +6153,16 @@ fn spawn_child_exit_watcher(
         )
         .await;
     });
+}
+
+/// The pair of config-backed runtime flags a session and its PTY reader share:
+/// AI-scrollback preservation and the scrollback row cap. Both are swapped in
+/// place by config reloads, so both live behind an `Arc`.
+fn load_shared_scrollback_state() -> (Arc<AtomicBool>, Arc<AtomicUsize>) {
+    (
+        Arc::new(AtomicBool::new(load_preserve_ai_scrollback_setting())),
+        Arc::new(AtomicUsize::new(load_scrollback_lines_setting())),
+    )
 }
 
 /// Spec 010 C4: build the OSC 52 client→PTY-reader control channel.
@@ -7097,7 +7381,7 @@ async fn detach_writer_from_window_sessions(
     let sessions = server.live_sessions.read().await;
     for session_id in session_ids {
         if let Some(session) = sessions.get(&session_id) {
-            session.client_writer.lock().await.detach(writer);
+            lock_sinks(&session.client_writer).detach(writer);
         }
     }
 }
@@ -7230,7 +7514,7 @@ async fn handle_config_reloaded(server: &IpcServerState) {
     drop(sessions);
 
     for (client_writer, msg) in workspace_messages {
-        send_to_client(&client_writer, &msg).await;
+        send_to_client(&client_writer, None, &msg);
     }
     info!(
         scrollback_lines = new_scrollback,
@@ -7552,45 +7836,49 @@ pub async fn send_message(writer: &SharedWriter, msg: &ServerMessage) {
     let _ = try_send_message(writer, msg).await;
 }
 
+/// Hand one `ServerMessage` to a connection's bounded output queue. Never blocks
+/// on the socket: overflow is absorbed inside the queue, so this returns `false`
+/// only when the connection is already closed.
 async fn try_send_message(writer: &SharedWriter, msg: &ServerMessage) -> bool {
-    let mut w = writer.lock().await;
-    write_to_sink(&mut w, msg).await
-}
-
-/// Write (local) or enqueue (remote) one `ServerMessage` on a client sink. A
-/// local sink writes the framed message straight to its socket — unchanged
-/// pre-013 behavior. A remote sink hands it to the bounded per-connection output
-/// queue (T029), which never blocks on the link; overflow is absorbed inside the
-/// queue, so the enqueue arm always reports success. Returns `false` only on a
-/// local write error (a dead socket).
-async fn write_to_sink(sink: &mut ClientSink, msg: &ServerMessage) -> bool {
-    match sink {
-        ClientSink::Local(w) => match write_message(w, msg).await {
-            Ok(()) => true,
-            Err(e) => {
-                warn!("failed to send message to client: {e}");
-                false
-            }
-        },
-        ClientSink::Remote(remote) => {
-            remote.enqueue(msg);
-            true
-        }
-    }
+    writer.lock().await.0.enqueue(msg)
 }
 
 /// Fan a `ServerMessage` out to every sink attached to a session (feature 015 T007,
-/// D1). No-op when detached (the set is empty). Each remote sink enqueues into its
-/// bounded per-connection queue (never awaiting the socket), and the local sink
-/// writes inline — so a slow participant never blocks the PTY/output path (D5).
-/// With one attached sink (every legacy / `SingleController` flow) this is
-/// byte-identical to the pre-015 single-slot send.
-async fn send_to_client(client_writer: &ClientWriter, msg: &ServerMessage) {
-    let guard = client_writer.lock().await;
-    for writer in guard.sinks() {
-        let mut w = writer.lock().await;
-        write_to_sink(&mut w, msg).await;
-    }
+/// D1). No-op when detached (the set is empty).
+///
+/// `commit` is the [`TermCommit`] cursor value that already includes this frame's
+/// effect on the shared `Term`, or `None` for frames a replay snapshot cannot
+/// carry (metadata, exit, workspace naming). Sinks still awaiting their attach
+/// replay buffer the frame against that cursor; `Live` sinks enqueue it. Nothing
+/// here awaits, so the per-session set's lock is never held across a sink send
+/// and no participant can back-pressure the PTY path.
+fn send_to_client(client_writer: &ClientWriter, commit: Option<u64>, msg: &ServerMessage) {
+    lock_sinks(client_writer).fan_out(commit, msg);
+}
+
+/// Install an attaching connection's sink on a session in the buffering state,
+/// before its replay snapshot is taken (see [`AttachedSinks::begin_attach`]).
+///
+/// The connection's enqueue handle is resolved before the per-session set is
+/// locked, so the only `.await` here happens outside that critical section.
+pub async fn begin_sink_attach(
+    client_writer: &ClientWriter,
+    writer: &SharedWriter,
+    additive: bool,
+) {
+    let queue = writer.lock().await.queue();
+    lock_sinks(client_writer).begin_attach(writer, queue, additive);
+}
+
+/// Release a buffering sink once its replay is on the wire (see
+/// [`AttachedSinks::finish_attach`]).
+pub fn finish_sink_attach(
+    client_writer: &ClientWriter,
+    writer: &SharedWriter,
+    snapshot_commit: u64,
+    session_id: SessionId,
+) {
+    lock_sinks(client_writer).finish_attach(writer, snapshot_commit, session_id);
 }
 
 /// Send an error message to the client.
@@ -7760,29 +8048,38 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
     let suppressed_ed3 = state.ed3_filter.take_suppressed();
     let capture_baseline_after_feed =
         suppressed_ed3 && state.preserved_ai_scrollback.needs_baseline();
-    let trimmed_rows = if suppressed_ed3 { handle_suppressed_ai_ed3(state).await } else { None };
+    // The trim already ran against the Term and advanced the commit cursor past
+    // itself, so `trimmed_commit` is the cursor value an attach snapshot must be
+    // at or beyond for the trim to be redundant.
+    let trimmed = if suppressed_ed3 { handle_suppressed_ai_ed3(state).await } else { None };
 
-    if let Some(rows) = trimmed_rows {
-        send_trim_scrollback(&state.client_writer, state.session_id, rows).await;
+    if let Some((rows, trimmed_commit)) = trimmed {
+        send_trim_scrollback(&state.client_writer, state.session_id, rows, trimmed_commit);
     }
 
+    // The chunk's own cursor value: what the counter reaches once step 2 feeds it
+    // into the Term. Stamping the client-bound frames with it BEFORE the feed is
+    // safe because the reader task is the only writer of this session's cursor.
+    let chunk_commit = state.term_commit.get().saturating_add(chunk_len(effective.as_ref()));
+
     // Step 1: Fast path — forward (possibly filtered) bytes to UI client.
-    send_pty_output(&state.client_writer, state.session_id, effective.as_ref()).await;
+    send_pty_output(&state.client_writer, state.session_id, effective.as_ref(), chunk_commit);
 
     // Step 1b: If ED 3 was suppressed, tell the client to snap the
     // viewport to bottom.  A real ED 3 would have reset `display_offset`
     // to 0 inside `clear_history()`, but since we stripped the sequence,
-    // the client's Term never ran that code.
+    // the client's Term never ran that code. It rides the chunk's cursor value
+    // so a buffered attach keeps it paired with the output that provoked it.
     if suppressed_ed3 {
         let msg = ServerMessage::ScrollBottom { session_id: state.session_id };
-        send_to_client(&state.client_writer, &msg).await;
+        send_to_client(&state.client_writer, Some(chunk_commit), &msg);
     }
 
     // Step 2: State path — feed (possibly filtered) bytes into Term.
     if capture_baseline_after_feed {
         state.pending_ai_scrollback_baseline = true;
     }
-    feed_term(&state.term, &mut state.ansi_processor, effective.as_ref()).await;
+    feed_term(&state.term, &state.term_commit, &mut state.ansi_processor, effective.as_ref()).await;
     maybe_capture_preserved_ai_scrollback_baseline(state).await;
 
     // Step 2b: a prompt returning while mouse-reporting modes are still
@@ -7820,8 +8117,9 @@ async fn clear_stale_mouse_modes_at_prompt(state: &mut PtyReaderState) {
         session_id = %state.session_id,
         "prompt returned with mouse-reporting modes active; injecting DECRST"
     );
-    feed_term(&state.term, &mut state.ansi_processor, &resets).await;
-    send_pty_output(&state.client_writer, state.session_id, &resets).await;
+    let commit =
+        feed_term(&state.term, &state.term_commit, &mut state.ansi_processor, &resets).await;
+    send_pty_output(&state.client_writer, state.session_id, &resets, commit);
 }
 
 /// `true` when the chunk contains a shell `PromptStart` mark with no
@@ -7921,21 +8219,23 @@ fn apply_pty_filters<'a>(state: &mut PtyReaderState, bytes: &'a [u8]) -> Cow<'a,
     }
 }
 
-async fn handle_suppressed_ai_ed3(state: &mut PtyReaderState) -> Option<usize> {
+/// Trim this Term's duplicate AI-redraw history, returning the kept row count
+/// and the commit-cursor value the trim advanced to (so the matching
+/// `TrimScrollback` frame can be tagged with it).
+async fn handle_suppressed_ai_ed3(state: &mut PtyReaderState) -> Option<(usize, u64)> {
     let current_history = {
         let term_guard = state.term.lock().await;
         term_guard.grid().history_size()
     };
-    let trim_rows = state.preserved_ai_scrollback.trim_target(current_history);
-    if let Some(kept_rows) = trim_rows {
-        trim_term_scrollback(
-            &state.term,
-            kept_rows,
-            state.scrollback_lines.load(Ordering::Relaxed),
-        )
-        .await;
-    }
-    trim_rows
+    let kept_rows = state.preserved_ai_scrollback.trim_target(current_history)?;
+    let commit = trim_term_scrollback(
+        &state.term,
+        &state.term_commit,
+        kept_rows,
+        state.scrollback_lines.load(Ordering::Relaxed),
+    )
+    .await;
+    Some((kept_rows, commit))
 }
 
 async fn maybe_capture_preserved_ai_scrollback_baseline(state: &mut PtyReaderState) {
@@ -7951,13 +8251,22 @@ async fn maybe_capture_preserved_ai_scrollback_baseline(state: &mut PtyReaderSta
     state.pending_ai_scrollback_baseline = false;
 }
 
+/// Trim the Term's scrollback and advance the commit cursor past the trim,
+/// returning its new value.
+///
+/// A scrollback trim carries no bytes, so it ticks the cursor by one: an attach
+/// snapshot taken before the trim sits below that value and therefore still
+/// flushes the client's `TrimScrollback`, while one taken after already contains
+/// the trim and drops it.
 async fn trim_term_scrollback(
     term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    term_commit: &TermCommit,
     kept_rows: usize,
     max_rows: usize,
-) {
+) -> u64 {
     let mut term_guard = term.lock().await;
     trim_term_scrollback_inner(&mut term_guard, kept_rows, max_rows);
+    term_commit.advance(1)
 }
 
 fn trim_term_scrollback_inner(
@@ -8040,7 +8349,7 @@ async fn finalize_session_exit(
         exit_code: exit.exit_code,
         signal: exit.signal,
     };
-    send_to_client(ctx.client_writer, &exit_msg).await;
+    send_to_client(ctx.client_writer, None, &exit_msg);
     remove_from_session_attachment(ctx.attachment, ctx.session_id).await;
     // Bind the removed session: dropping it inline would run `Pty::Drop`
     // (SIGHUP + blocking `waitpid`) while the registry write guard is still
@@ -8080,33 +8389,44 @@ async fn read_pty_bytes(
 }
 
 /// Send raw PTY output to the client (fast path). No-op when detached.
-async fn send_pty_output(client_writer: &ClientWriter, session_id: SessionId, bytes: &[u8]) {
+/// `commit` is the [`TermCommit`] value this chunk reaches once the Term has
+/// consumed it.
+fn send_pty_output(client_writer: &ClientWriter, session_id: SessionId, bytes: &[u8], commit: u64) {
     let msg = ServerMessage::PtyOutput { session_id, data: bytes.to_vec() };
-    send_to_client(client_writer, &msg).await;
+    send_to_client(client_writer, Some(commit), &msg);
 }
 
-async fn send_trim_scrollback(
+/// Tell clients to trim their mirrored scrollback to `history_rows`. `commit` is
+/// the [`TermCommit`] value the matching Term-side trim advanced the cursor to.
+fn send_trim_scrollback(
     client_writer: &ClientWriter,
     session_id: SessionId,
     history_rows: usize,
+    commit: u64,
 ) {
     let msg = ServerMessage::TrimScrollback {
         session_id,
         history_rows: u32::try_from(history_rows).unwrap_or(u32::MAX),
     };
-    send_to_client(client_writer, &msg).await;
+    send_to_client(client_writer, Some(commit), &msg);
 }
 
-/// Feed bytes into the terminal emulator via the ANSI processor.
-/// The Term mutex lock is held only during `advance()` — dropped before returning.
+/// Feed bytes into the terminal emulator via the ANSI processor and advance the
+/// session's commit cursor past them, returning its new value.
+///
+/// Both happen under one `Term` lock so "the cursor reads C" and "the Term has
+/// consumed everything tagged ≤ C" can never disagree — the invariant the attach
+/// snapshot relies on to decide which buffered frames it already contains. The
+/// guard is dropped before returning, i.e. before any subsequent `.await`.
 async fn feed_term(
     term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
+    term_commit: &TermCommit,
     ansi_processor: &mut AnsiProcessor,
     bytes: &[u8],
-) {
+) -> u64 {
     let mut term_guard = term.lock().await;
     ansi_processor.advance(&mut *term_guard, bytes);
-    // Guard dropped here — before any subsequent .await.
+    term_commit.advance(chunk_len(bytes))
 }
 
 /// Flush a synchronized update after its timeout elapses.
@@ -8244,8 +8564,8 @@ async fn client_clipboard_gating(state: &PtyReaderState) -> bool {
 /// in tandem with `client_clipboard_gating` to gate OSC 52 prompt and bridge
 /// dispatch — both checks must succeed before a `ServerMessage::Clipboard*`
 /// variant goes on the wire.
-async fn session_has_attached_client(state: &PtyReaderState) -> bool {
-    !state.client_writer.lock().await.is_empty()
+fn session_has_attached_client(state: &PtyReaderState) -> bool {
+    !lock_sinks(&state.client_writer).is_empty()
 }
 
 /// Feature 015 (T030, D7/FR-013): route a session-initiated OSC 52 request to the
@@ -8306,8 +8626,7 @@ async fn handle_clipboard_store(
         return;
     }
 
-    let headless =
-        !session_has_attached_client(state).await || !client_clipboard_gating(state).await;
+    let headless = !session_has_attached_client(state) || !client_clipboard_gating(state).await;
 
     match policy.write_mode {
         ClipboardMode::Deny => {}
@@ -8426,8 +8745,7 @@ async fn handle_clipboard_load(
     // FR-013 / research decision 7: a denied or headless read short-
     // circuits to an empty OSC 52 reply so the PTY-side program does not
     // see clipboard contents.
-    let headless =
-        !session_has_attached_client(state).await || !client_clipboard_gating(state).await;
+    let headless = !session_has_attached_client(state) || !client_clipboard_gating(state).await;
 
     match policy_read {
         ClipboardMode::Deny => {
@@ -9213,7 +9531,7 @@ async fn send_ai_context_change(
         ai_state.clone()
     };
     let server_msg = ServerMessage::AiStateChanged { session_id, ai_state: updated_state };
-    send_to_client(client_writer, &server_msg).await;
+    send_to_client(client_writer, None, &server_msg);
 }
 
 /// Persist metadata from a `ServerMessage` into the live session registry.
@@ -9374,22 +9692,23 @@ pub async fn send_metadata_event(
 
     persist_session_metadata(&server_msg, session_id, live_sessions).await;
 
-    send_to_client(client_writer, &server_msg).await;
+    send_to_client(client_writer, None, &server_msg);
 
     if synthesize_ai_cleared {
         let clear_msg = ServerMessage::AiStateCleared { session_id };
         persist_session_metadata(&clear_msg, session_id, live_sessions).await;
-        send_to_client(client_writer, &clear_msg).await;
+        send_to_client(client_writer, None, &clear_msg);
     }
 
     if let Some(cwd) = cwd_for_workspace {
         // Send git branch information for the new CWD. A detached session has
         // no sink to render the branch, so the walk is pure waste — the
         // `SessionList` reply that precedes the next attach resolves it.
-        if !client_writer.lock().await.is_empty() {
+        let attached = !lock_sinks(client_writer).is_empty();
+        if attached {
             let branch = resolve_session_git_branch(session_id, &cwd, live_sessions).await;
             let git_msg = ServerMessage::GitBranch { session_id, branch };
-            send_to_client(client_writer, &git_msg).await;
+            send_to_client(client_writer, None, &git_msg);
         }
 
         // Always update workspace naming, even when detached.
@@ -9398,7 +9717,7 @@ pub async fn send_metadata_event(
             wm.on_cwd_changed(session_id, &cwd)
         };
         if let Some(msg) = named_msg {
-            send_to_client(client_writer, &msg).await;
+            send_to_client(client_writer, None, &msg);
         }
     }
 }
@@ -9670,7 +9989,7 @@ async fn forward_env_status(
     };
 
     let msg = ServerMessage::EnvStatus { session_id, state: env_status_to_wire(&internal_state) };
-    send_to_client(&client_writer, &msg).await;
+    send_to_client(&client_writer, None, &msg);
     debug!(
         target: "scribe_server::ipc_server",
         ?session_id,
@@ -9750,13 +10069,99 @@ mod tests {
         )
     }
 
+    /// Drive one buffering sink and read back what actually reached its socket.
+    async fn buffered_attach_frames(
+        emitted: &[(Option<u64>, ServerMessage)],
+        snapshot_commit: u64,
+    ) -> (AttachedSinks, SharedWriter, tokio::io::ReadHalf<tokio::net::UnixStream>) {
+        let (server, client) = unix_stream_pair();
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (client_read, _client_write) = tokio::io::split(client);
+        let writer = test_shared_writer(server_write);
+        let queue = writer.lock().await.queue();
+
+        let mut sinks = AttachedSinks::default();
+        sinks.begin_attach(&writer, queue, false);
+        for (commit, msg) in emitted {
+            sinks.fan_out(*commit, msg);
+        }
+        sinks.finish_attach(&writer, snapshot_commit, SessionId::new());
+        (sinks, writer, client_read)
+    }
+
+    fn pty_frame(session_id: SessionId, data: &str) -> ServerMessage {
+        ServerMessage::PtyOutput { session_id, data: data.as_bytes().to_vec() }
+    }
+
+    /// A buffering sink must drop exactly the frames its replay snapshot already
+    /// carries, keep every frame the snapshot cannot carry, and flush the
+    /// survivors in emission order — the whole point of the commit cursor.
+    #[tokio::test]
+    async fn buffering_sink_drops_snapshotted_frames_and_flushes_the_rest_in_order() {
+        let session_id = SessionId::new();
+        let emitted = vec![
+            (Some(10), pty_frame(session_id, "before")),
+            (Some(20), ServerMessage::TrimScrollback { session_id, history_rows: 7 }),
+            (None, ServerMessage::TitleChanged { session_id, title: String::from("t") }),
+            (Some(30), pty_frame(session_id, "after")),
+            (Some(30), ServerMessage::ScrollBottom { session_id }),
+        ];
+        let (mut sinks, _writer, mut client_read) = buffered_attach_frames(&emitted, 20).await;
+
+        // Everything at or below the snapshot's cursor is already in the replay.
+        let first = read_message::<ServerMessage, _>(&mut client_read).await.unwrap();
+        assert!(
+            matches!(first, ServerMessage::TitleChanged { .. }),
+            "untagged frames always flush, got {first:?}"
+        );
+        let second = read_message::<ServerMessage, _>(&mut client_read).await.unwrap();
+        assert!(
+            matches!(&second, ServerMessage::PtyOutput { data, .. } if data == b"after"),
+            "frames past the snapshot flush in emission order, got {second:?}"
+        );
+        let third = read_message::<ServerMessage, _>(&mut client_read).await.unwrap();
+        assert!(
+            matches!(third, ServerMessage::ScrollBottom { .. }),
+            "a bottom-snap rides its chunk's cursor, got {third:?}"
+        );
+
+        // The sink is Live now: further output goes straight through.
+        sinks.fan_out(Some(40), &pty_frame(session_id, "live"));
+        let fourth = read_message::<ServerMessage, _>(&mut client_read).await.unwrap();
+        assert!(
+            matches!(&fourth, ServerMessage::PtyOutput { data, .. } if data == b"live"),
+            "post-flush output goes straight to the queue, got {fourth:?}"
+        );
+    }
+
+    /// A pre-replay buffer that outgrows its budget must not hand the client a
+    /// truncated backlog: it sheds everything and leans on the resync replay.
+    #[tokio::test]
+    async fn overflowing_attach_buffer_sheds_its_backlog_instead_of_replaying_it() {
+        let session_id = SessionId::new();
+        let huge = "x".repeat(OUTPUT_QUEUE_PTY_BYTES / 2 + 1);
+        let emitted = vec![
+            (Some(10), pty_frame(session_id, &huge)),
+            (Some(20), pty_frame(session_id, &huge)),
+            (Some(30), pty_frame(session_id, "shed-too")),
+        ];
+        let (mut sinks, _writer, mut client_read) = buffered_attach_frames(&emitted, 0).await;
+
+        sinks.fan_out(Some(40), &pty_frame(session_id, "live"));
+        let first = read_message::<ServerMessage, _>(&mut client_read).await.unwrap();
+        assert!(
+            matches!(&first, ServerMessage::PtyOutput { data, .. } if data == b"live"),
+            "the shed backlog must not reach the wire, got {first:?}"
+        );
+    }
+
     #[tokio::test]
     async fn attach_sessions_returns_empty_when_registry_has_no_matching_sessions() {
         let live_sessions = new_live_session_registry();
 
         let (server, _client) = unix_stream_pair();
         let (_read, write) = tokio::io::split(server);
-        let writer: SharedWriter = Arc::new(Mutex::new(ClientSink::Local(Box::new(write))));
+        let writer: SharedWriter = test_shared_writer(write);
         let attached_ids: AttachedSessionIds = Arc::new(Mutex::new(HashSet::new()));
 
         let attached = crate::attach_flow::attach_sessions(
@@ -9880,7 +10285,7 @@ mod tests {
     fn test_writer() -> SharedWriter {
         let (server, _client) = unix_stream_pair();
         let (_read, write) = tokio::io::split(server);
-        Arc::new(Mutex::new(ClientSink::Local(Box::new(write))))
+        test_shared_writer(write)
     }
 
     /// One claim with its own writer — extracted so the concurrency test
@@ -10062,13 +10467,11 @@ mod tests {
 
         let (request_server, mut request_client) = unix_stream_pair();
         let (_request_read, request_write) = tokio::io::split(request_server);
-        let request_writer: SharedWriter =
-            Arc::new(Mutex::new(ClientSink::Local(Box::new(request_write))));
+        let request_writer: SharedWriter = test_shared_writer(request_write);
 
         let (target_server, mut target_client) = unix_stream_pair();
         let (_target_read, target_write) = tokio::io::split(target_server);
-        let target_writer: SharedWriter =
-            Arc::new(Mutex::new(ClientSink::Local(Box::new(target_write))));
+        let target_writer: SharedWriter = test_shared_writer(target_write);
 
         window_shares.write().await.insert(
             window_id,
@@ -10103,8 +10506,7 @@ mod tests {
 
         let (request_server, mut request_client) = unix_stream_pair();
         let (_request_read, request_write) = tokio::io::split(request_server);
-        let request_writer: SharedWriter =
-            Arc::new(Mutex::new(ClientSink::Local(Box::new(request_write))));
+        let request_writer: SharedWriter = test_shared_writer(request_write);
 
         handle_dispatch_action(
             Some(missing_window),

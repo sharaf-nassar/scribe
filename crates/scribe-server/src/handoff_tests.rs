@@ -286,13 +286,15 @@ async fn v4_legacy_handoff_snapshot_is_restored_durably() {
     }
 
     // Simulate what handle_attach_sessions does: take_session_replay.
-    let term = {
+    let (term, term_commit) = {
         let live = registry.read().await;
-        Arc::clone(&live.get(&session_id).unwrap().term)
+        let session = live.get(&session_id).unwrap();
+        (Arc::clone(&session.term), Arc::clone(&session.term_commit))
     };
-    let first = crate::attach_flow::take_session_replay(session_id, &term, &registry)
-        .await
-        .expect("first take_session_replay");
+    let (first, _) =
+        crate::attach_flow::take_session_replay(session_id, &term, &term_commit, &registry)
+            .await
+            .expect("first take_session_replay");
     assert!(first.alt_screen, "first attach should see legacy snapshot (alt_screen=true)");
     assert!(
         !first.cursor_visible,
@@ -302,9 +304,10 @@ async fn v4_legacy_handoff_snapshot_is_restored_durably() {
     // Second attach MUST see the same content — the snapshot was fed into
     // the Term durably. This is the regression guard against the
     // pre-v5 "first-attach-only" bug.
-    let second = crate::attach_flow::take_session_replay(session_id, &term, &registry)
-        .await
-        .expect("second take_session_replay");
+    let (second, _) =
+        crate::attach_flow::take_session_replay(session_id, &term, &term_commit, &registry)
+            .await
+            .expect("second take_session_replay");
     assert!(
         second.alt_screen,
         "second attach must see the durably-restored Term (alt_screen=true)"

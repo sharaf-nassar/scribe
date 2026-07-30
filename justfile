@@ -330,6 +330,7 @@ e2e: build-release docker-func
     just e2e-func func/smoke.sh
     just e2e-func func/session-exit-status.sh
     just e2e-func func/reconnect.sh
+    just e2e-func func/attach-lossless.sh
     just e2e-func func/workspace-split.sh
     just e2e-func func/shell-integration.sh
     just e2e-func func/hot-reload.sh
