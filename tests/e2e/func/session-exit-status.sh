@@ -36,13 +36,31 @@ kill -TERM "$CHILD_PID"
 scribe-test assert-signal "$SIG_SESSION" 15 --timeout 5000
 echo "PHASE 2 PASS: SIGTERM reported as signal 15, not as an exit code"
 
-# ── Phase 3: SessionExited stays exactly-once ────────────────────
-# Both assertions above already require a single frame; re-asserting after a
+# ── Phase 3: exit while a descendant still holds the slave ───────
+# Spec 017 US1-3: the background job inherits the slave fd, so the master
+# never ends and an EOF-driven exit path would miss this exit entirely. The
+# child-exit watcher waits out its drain grace and reports the shell's real
+# status regardless, then cancels the reader the master left orphaned.
+HELD_SESSION=$(scribe-test session create)
+scribe-test send "$HELD_SESSION" 'echo held-slave-ready\n'
+scribe-test wait-output "$HELD_SESSION" "held-slave-ready"
+# The subshell keeps the slave fds it inherited and ignores the SIGHUP the
+# kernel and `Pty::Drop` aim at the dying session, so it outlives the shell
+# no matter how the shell's job control is configured.
+scribe-test send "$HELD_SESSION" "(trap '' HUP; sleep 30) &\n"
+scribe-test wait-idle "$HELD_SESSION" --ms 300
+scribe-test send "$HELD_SESSION" 'exit 9\n'
+scribe-test assert-exit "$HELD_SESSION" 9 --timeout 10000
+echo "PHASE 3 PASS: exit 9 reported while a descendant still held the slave"
+
+# ── Phase 4: SessionExited stays exactly-once ────────────────────
+# Every assertion above already requires a single frame; re-asserting after a
 # settle window catches a late duplicate from a second exit path.
 sleep 1
 scribe-test assert-exit "$CODE_SESSION" 42 --timeout 1000
 scribe-test assert-signal "$SIG_SESSION" 15 --timeout 1000
-echo "PHASE 3 PASS: one SessionExited per session after settling"
+scribe-test assert-exit "$HELD_SESSION" 9 --timeout 1000
+echo "PHASE 4 PASS: one SessionExited per session after settling"
 
 rm -f "$PID_FILE"
 echo "PASS: session-exit-status test completed"
