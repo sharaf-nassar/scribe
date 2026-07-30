@@ -624,11 +624,52 @@ pub struct AuthoritativeGrid {
     pub rows: u16,
     pub cols: u16,
     pub debounce: std::time::Duration,
+    /// Monotonic id of the newest accepted viewport report. The armed timer
+    /// compares it across its sleep to tell "the reports stopped" from "another
+    /// report landed while I slept".
+    report_generation: u64,
+    /// Whether a trailing-apply timer is already counting down for this window.
+    /// Reports that land while one is armed ride it instead of arming their own.
+    apply_armed: bool,
 }
 
 impl Default for AuthoritativeGrid {
     fn default() -> Self {
-        Self { rows: 0, cols: 0, debounce: std::time::Duration::from_millis(250) }
+        Self {
+            rows: 0,
+            cols: 0,
+            debounce: std::time::Duration::from_millis(250),
+            report_generation: 0,
+            apply_armed: false,
+        }
+    }
+}
+
+impl AuthoritativeGrid {
+    /// Record one accepted viewport report and decide whether it has to arm the
+    /// trailing-apply timer. Returns the debounce window plus the generation the
+    /// armed timer must observe, or `None` when a timer is already counting down —
+    /// that timer re-reads the settled viewports, so a burst of reports drives one
+    /// apply instead of one per report (#24).
+    fn arm_trailing_apply(&mut self) -> Option<(std::time::Duration, u64)> {
+        self.report_generation = self.report_generation.wrapping_add(1);
+        if self.apply_armed {
+            return None;
+        }
+        self.apply_armed = true;
+        Some((self.debounce, self.report_generation))
+    }
+
+    /// Resolve one elapsed debounce window for the armed timer. `None` means the
+    /// reports settled — the timer disarms and applies once. `Some(generation)`
+    /// means a newer report landed during the sleep, so the timer stays armed and
+    /// waits out another window observing that generation.
+    fn settle_trailing_apply(&mut self, observed: u64) -> Option<u64> {
+        if self.report_generation == observed {
+            self.apply_armed = false;
+            return None;
+        }
+        Some(self.report_generation)
     }
 }
 
@@ -6878,26 +6919,63 @@ async fn store_participant_viewport(
     if !size.has_grid() {
         return;
     }
-    let debounce = {
-        let mut shares = server.window_shares.write().await;
-        let Some(share) = shares.get_mut(&window_id) else {
-            return;
-        };
-        let Some(participant) = share.participant_for_writer_mut(writer) else {
-            return;
-        };
-        participant.viewport = size;
-        share.grid.debounce
+    let Some((debounce, generation)) =
+        record_viewport_report(&server.window_shares, window_id, writer, size).await
+    else {
+        return;
     };
     // Coalesce reports over the debounce window before applying (D3). The min is a
     // pure function of the current viewports, so concurrent reports converge to the
-    // same settled grid and the apply's compare-and-skip avoids a flapping stream
-    // of `TIOCSWINSZ`.
+    // same settled grid, and only the report that armed this timer spawns one — a
+    // drag's worth of reports settles to a single trailing apply (#24).
     let server = server.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(debounce).await;
-        apply_authoritative_grid(&server, window_id).await;
+        if await_settled_viewport_reports(&server.window_shares, window_id, debounce, generation)
+            .await
+        {
+            apply_authoritative_grid(&server, window_id).await;
+        }
     });
+}
+
+/// Store one report on its participant and take the arming decision under a single
+/// share lock. `None` when the report is dropped (window or participant gone) or
+/// when a trailing-apply timer is already armed for this window.
+async fn record_viewport_report(
+    window_shares: &WindowShares,
+    window_id: WindowId,
+    writer: &SharedWriter,
+    size: TerminalSize,
+) -> Option<(std::time::Duration, u64)> {
+    let mut shares = window_shares.write().await;
+    let share = shares.get_mut(&window_id)?;
+    let participant = share.participant_for_writer_mut(writer)?;
+    participant.viewport = size;
+    share.grid.arm_trailing_apply()
+}
+
+/// Wait out the debounce window, restarting it for every report that lands while
+/// the timer sleeps, and report whether the window still exists once the reports
+/// settle. `false` means the share went away mid-wait and there is nothing to
+/// apply; its arming state died with it.
+async fn await_settled_viewport_reports(
+    window_shares: &WindowShares,
+    window_id: WindowId,
+    debounce: std::time::Duration,
+    armed_generation: u64,
+) -> bool {
+    let mut observed = armed_generation;
+    loop {
+        tokio::time::sleep(debounce).await;
+        let mut shares = window_shares.write().await;
+        let Some(share) = shares.get_mut(&window_id) else {
+            return false;
+        };
+        match share.grid.settle_trailing_apply(observed) {
+            Some(newer) => observed = newer,
+            None => return true,
+        }
+    }
 }
 
 /// Recompute a shared window's smallest-wins authoritative grid (feature 015 T014,
@@ -6924,6 +7002,7 @@ async fn apply_authoritative_grid(server: &IpcServerState, window_id: WindowId) 
         share.grid.cols = cols;
         (rows, cols)
     };
+    debug!(%window_id, rows = target.0, cols = target.1, "authoritative grid applied");
     apply_grid_to_window_sessions(server, window_id, target.0, target.1).await;
 }
 
@@ -11209,6 +11288,96 @@ mod tests {
         assert!(
             gate.is_cancelled(),
             "the exit funnel must stop the reader, including on the watcher path where nothing else does"
+        );
+    }
+
+    /// Build a shared-mode share holding one local participant, the shape a
+    /// viewport report needs (`SingleController` never reaches that path).
+    async fn shared_window_with_participant(writer: &SharedWriter) -> (WindowShares, WindowId) {
+        let window_shares = new_window_shares();
+        let window_id = WindowId::new();
+        window_shares.write().await.insert(
+            window_id,
+            WindowShare::new(
+                Participant::local(writer, false),
+                scribe_config::SharingMode::FreeForAll,
+                scribe_config::ControlAcquisition::FreeClaim,
+                None,
+            ),
+        );
+        (window_shares, window_id)
+    }
+
+    fn viewport(cols: u16, rows: u16) -> TerminalSize {
+        TerminalSize { cols, rows, cell_width: 8, cell_height: 16 }
+    }
+
+    /// Finding #24: a drag's worth of viewport reports used to arm one uncancelled
+    /// 250 ms timer each, so every report drove its own apply. The burst must now
+    /// arm exactly one timer, and reports landing while it sleeps must restart the
+    /// window rather than schedule a second apply.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_viewport_reports_settle_to_one_trailing_apply() {
+        let writer = test_writer();
+        let (window_shares, window_id) = shared_window_with_participant(&writer).await;
+
+        let mut armed = Vec::new();
+        for step in 0..12u16 {
+            let report = viewport(120 - step, 40);
+            armed.extend(record_viewport_report(&window_shares, window_id, &writer, report).await);
+        }
+
+        assert_eq!(armed.len(), 1, "a report burst arms exactly one trailing timer");
+        let (debounce, generation) = armed[0];
+        assert!(
+            await_settled_viewport_reports(&window_shares, window_id, debounce, generation).await,
+            "the armed timer waits out the burst and applies once"
+        );
+
+        let grid = &window_shares.read().await[&window_id].grid;
+        assert!(!grid.apply_armed, "the settled timer disarms so a later burst can rearm");
+        assert_eq!(grid.report_generation, 12, "every report is accounted for by the one timer");
+    }
+
+    /// A report that arrives after the previous burst settled must arm a fresh
+    /// timer — the debounce coalesces a burst, it does not swallow later resizes.
+    #[tokio::test(start_paused = true)]
+    async fn a_report_after_the_burst_settles_arms_a_fresh_timer() {
+        let writer = test_writer();
+        let (window_shares, window_id) = shared_window_with_participant(&writer).await;
+
+        let (debounce, generation) =
+            record_viewport_report(&window_shares, window_id, &writer, viewport(100, 30))
+                .await
+                .expect("the first report arms a timer");
+        assert!(
+            await_settled_viewport_reports(&window_shares, window_id, debounce, generation).await
+        );
+
+        assert!(
+            record_viewport_report(&window_shares, window_id, &writer, viewport(90, 30))
+                .await
+                .is_some(),
+            "a later report arms its own trailing apply"
+        );
+    }
+
+    /// A window closing mid-debounce must not drive a resize into a share that no
+    /// longer exists; the waiter reports "nothing to apply" instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_closing_mid_debounce_cancels_its_trailing_apply() {
+        let writer = test_writer();
+        let (window_shares, window_id) = shared_window_with_participant(&writer).await;
+
+        let (debounce, generation) =
+            record_viewport_report(&window_shares, window_id, &writer, viewport(100, 30))
+                .await
+                .expect("the first report arms a timer");
+        window_shares.write().await.remove(&window_id);
+
+        assert!(
+            !await_settled_viewport_reports(&window_shares, window_id, debounce, generation).await,
+            "a departed window has no grid to apply"
         );
     }
 }

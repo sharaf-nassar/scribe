@@ -204,6 +204,12 @@ It reads the entrypoint session's id back with `scribe-test session envelope-id`
 
 The oracle for the signal count is a size reporter running inside the pane — a `trap 'winch=$((winch+1))' WINCH` installed once the shell is at its prompt — read back with `echo` alongside `stty size`. It has to be in-pane because a shrink-and-regrow pair is invisible in every screen snapshot: the grid ends exactly where it started. Phase 3 re-attaches at the pane's own geometry and requires the counter to still read zero; phase 4 asserts that attach *did* send a replay, which is what keeps phase 2's `replay status --expect-frames 0` from passing vacuously, then resizes to a different grid and requires exactly one signal.
 
+### Shared-Grid Debounce E2E
+
+`tests/e2e/func/viewport-debounce.sh` asserts the trailing half of the shared-window grid debounce: a drag that outlives one debounce window costs the pane exactly one `SIGWINCH`, and it lands on the last reported size.
+
+It reuses the in-pane `trap 'winch=$((winch+1))' WINCH` oracle for the same reason the geometry script does — a mid-drag apply and its correction leave no trace in any screen snapshot. Phase 1 is what makes the test reach the code at all: `Resize` is only a viewport report in a shared mode, and the mode is snapshotted onto the share at claim time, so the script rewrites the config to `free_for_all` and restarts the disposable server *before* the harness daemon says Hello. Phase 3 then reports 16 viewports 50 ms apart — closer together than the 250 ms debounce, but a full second end to end — and fails loudly if the drag happened to fit inside one window, since nothing would have been coalesced. A per-report timer fails phase 4 with a double-digit signal count; the pre-fix binary times out there.
+
 ### Session Lifecycle E2E
 
 Scripted lifecycle coverage proving the GPUI client survives detach, hot-reload, and full cold restart against a disposable test server — never the user's live server (the CLAUDE.md invariant), as the harness runs its own `scribe-test server`.
