@@ -5,6 +5,8 @@
 //! `Term` must reproduce the same grid + scrollback cells. This is the
 //! foundation the v5 hot-reload handoff relies on.
 
+use std::fmt::Write as _;
+
 use alacritty_terminal::Term;
 use alacritty_terminal::grid::Dimensions;
 use scribe_common::ids::SessionId;
@@ -133,6 +135,50 @@ fn roundtrip_wide_chars() {
     feed_replay(&mut dst, &bytes, snap.scrollback_rows, 100);
     let snap_dst = snapshot_term(&dst);
     assert_eq!(snap.cells, snap_dst.cells);
+}
+
+#[test]
+fn roundtrip_truecolor_dense_screen() {
+    // Every cell gets its own 24-bit fg/bg, so the encoder's SGR diff never
+    // coalesces and the replay inflates to ~30 bytes per cell. The retired
+    // `cols * rows * 8` decompression bound rejected exactly this payload,
+    // which surfaced as a blank session on the far side of a handoff.
+    const COLS: usize = 120;
+    const ROWS: usize = 30;
+    const SCROLLBACK: usize = 200;
+
+    let mut src = new_term(COLS, ROWS, SCROLLBACK);
+    let mut painted = String::new();
+    for row in 0..(ROWS + SCROLLBACK) {
+        for col in 0..COLS {
+            let seed = u32::try_from(row * COLS + col).unwrap_or(u32::MAX);
+            let [r, g, b, _] = seed.to_le_bytes();
+            let ch = char::from(b'!' + u8::try_from(seed % 90).unwrap_or_default());
+            write!(painted, "\x1b[38;2;{r};{g};{b}m\x1b[48;2;{b};{r};{g}m{ch}").unwrap();
+        }
+        painted.push_str("\x1b[0m\r\n");
+    }
+    feed(&mut src, painted.as_bytes());
+
+    let snap = snapshot_term(&src);
+    assert_eq!(snap.scrollback_rows as usize, SCROLLBACK, "fixture must fill scrollback");
+
+    let replay = build_session_replay(&snap).unwrap();
+    let bytes = decompress_session_replay(&replay).unwrap();
+    assert_eq!(bytes, snapshot_to_ansi(&snap));
+
+    let retired_bound = COLS * (ROWS + snap.scrollback_rows as usize) * 8;
+    assert!(
+        bytes.len() > retired_bound,
+        "fixture must exceed the retired 8-bytes-per-cell bound: {} vs {retired_bound}",
+        bytes.len()
+    );
+
+    let mut dst = new_term(COLS, ROWS, SCROLLBACK);
+    feed_replay(&mut dst, &bytes, snap.scrollback_rows, SCROLLBACK);
+    let snap_dst = snapshot_term(&dst);
+    assert_eq!(snap.cells, snap_dst.cells, "visible grid must survive a dense replay");
+    assert_eq!(snap.scrollback, snap_dst.scrollback, "scrollback must survive a dense replay");
 }
 
 #[test]

@@ -140,6 +140,8 @@ Serializable per-cell terminal screen state used inside the server and for `Requ
 
 Carries cols/rows/scrollback-rows, cursor fields, alt-screen flag, and a zstd-compressed ANSI byte stream produced by  and compressed by . Both server hot-reload handoff and server → client reattach use this same encoding — receivers decompress via  and feed the bytes through `vte::ansi::Processor::advance`. Before the screen redraw, `snapshot_to_ansi` re-emits the snapshot's enabled DEC private modes (mouse reporting, SGR/UTF-8 mouse, alternate scroll, bracketed paste, focus events, app-cursor, app-keypad) as DECSET sequences, so a reattached vim/tmux/Claude-Code session keeps those modes instead of silently losing them.
 
+The declared cols/rows/scrollback-rows describe the grid for the receiver to rebuild; they are not a size bound on the payload. [[crates/scribe-common/src/screen_replay.rs#decompress_session_replay|decompress_session_replay]] streams the frame and enforces [[crates/scribe-common/src/screen_replay.rs#MAX_REPLAY_INFLATED_BYTES|its own 64 MiB ceiling]] instead, because both carrying paths accept payloads from an untrusted peer. See [[server#Server#Handoff#Session Replay Encoding|Session Replay Encoding]] for the reasoning.
+
 ## Socket Paths
 
 Platform-specific socket and lock file paths for all Scribe singleton processes, centralizing path conventions so every crate stays consistent.
