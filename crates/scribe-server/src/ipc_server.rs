@@ -7899,7 +7899,11 @@ async fn apply_reload_to_sessions(
 ///
 /// On `false → true`: no proactive action — `hook_ingress` already
 /// lazy-initializes per-session `env_store` machinery on the next
-/// baseline-ready `EnvChanged`. Just emit a marker log.
+/// baseline-ready `EnvChanged`. Just emit a marker log. In practice that
+/// event comes from the next *newly started* shell: a shell already
+/// running emitted its baseline while the feature was off and had it
+/// dropped at the gate, and there is no server→shell trigger to ask for
+/// another. "Restart or re-init required" is the semantic, not a gap.
 ///
 /// On `true → false`: stop every per-session persist timer (via
 /// [`EnvStoreState::drop_scheduler`]) and best-effort delete every
