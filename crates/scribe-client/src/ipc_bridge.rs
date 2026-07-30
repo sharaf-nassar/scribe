@@ -1,9 +1,14 @@
 //! Inbound coalescing drain + outbound [`IpcSink`] bridging the frozen Scribe
 //! IPC protocol to the GPUI terminal core.
 //!
-//! Inbound: server output events arrive on an mpsc channel and are drained with
-//! Zed-style 4 ms / 100-event coalescing. Per-pane output is collapsed so each
-//! batch runs one `write_output` and one repaint per dirty pane. The positional
+//! Inbound: server output events arrive on a bounded queue
+//! ([`INBOUND_QUEUE_EVENTS`] events, [`INBOUND_QUEUE_BYTES`] of payload) and are
+//! drained with Zed-style 4 ms / 100-event coalescing. Per-pane output is
+//! collapsed so each batch runs one `write_output` and one repaint per dirty
+//! pane. A queue that reaches either bound coalesces first and only then drops,
+//! and the drain asks the server for a fresh screen per affected pane, so a
+//! client that cannot keep up costs bounded memory instead of unbounded RSS.
+//! The positional
 //! events interleaved with that output — OSC 133 prompt marks and the
 //! suppressed-ED-3 viewport snap — ride the same channel so they keep their
 //! place in the pane's byte stream instead of racing it. Outbound:
@@ -27,7 +32,12 @@
 //! queued behind an output firehose and `Resize` is always flushed ahead of the
 //! `KeyInput` that follows.
 
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::Duration,
+};
 
 use scribe_client::share::ControlIntent;
 use scribe_common::{
@@ -38,7 +48,7 @@ use scribe_common::{
     },
 };
 use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    sync::{Notify, mpsc::UnboundedSender},
     time::{Instant, timeout},
 };
 
@@ -49,6 +59,30 @@ pub const MAX_BATCH_EVENTS: usize = 100;
 /// Maximum wall-clock time a drain batch accumulates before it is flushed.
 /// Mirrors Zed's 4 ms terminal wakeup coalescing window.
 pub const BATCH_WINDOW: Duration = Duration::from_millis(4);
+
+/// Maximum events the inbound queue buffers between the reader and the drain
+/// before the overflow policy runs.
+pub const INBOUND_QUEUE_EVENTS: usize = 256;
+
+/// Maximum buffered [`InboundEvent::PaneOutput`] payload the inbound queue
+/// holds.
+///
+/// The event bound alone does not bound memory: events carry variable-size
+/// payloads, and coalescing deliberately trades event count for bytes, so
+/// without this ceiling a firehose would collapse into a handful of ever-growing
+/// buffers. One event larger than the whole ceiling is still admitted onto an
+/// emptied queue — refusing the newest frame would stall the pane rather than
+/// bound it — so the true high-water mark is this ceiling plus one frame.
+pub const INBOUND_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
+/// How long an overflow resync waits for the drain to catch up before the
+/// `RequestSnapshot` goes out anyway.
+///
+/// A resync taken while the queue is still full would be stale on arrival, so
+/// the drain normally waits for an empty queue. A sustained firehose never
+/// reaches empty, and a pane must not stay silently wrong for longer than this
+/// while one lasts.
+const RESYNC_MAX_DELAY: Duration = Duration::from_secs(2);
 
 /// One inbound event handed to the drain. Every server message that mutates a
 /// pane's terminal state is normalised before it enters the channel, so replay
@@ -174,22 +208,329 @@ fn append_pane_output(
     entries.push((session_id, PaneOp::Output(bytes)));
 }
 
+/// Rebuilds the [`InboundEvent`] a coalesced entry came from. [`PaneOp`] and
+/// `InboundEvent` carry the same information, so the queue can re-coalesce its
+/// backlog through [`coalesce`] instead of growing a second ordering rule.
+fn rehydrate((session_id, op): (SessionId, PaneOp)) -> InboundEvent {
+    match op {
+        PaneOp::Output(bytes) => InboundEvent::PaneOutput { session_id, bytes },
+        PaneOp::PromptMark { kind, exit_code } => {
+            InboundEvent::PromptMark { session_id, kind, exit_code }
+        }
+        PaneOp::ScrollBottom => InboundEvent::ScrollBottom { session_id },
+        PaneOp::TrimScrollback { kept_rows } => {
+            InboundEvent::TrimScrollback { session_id, kept_rows }
+        }
+    }
+}
+
+/// Payload an event contributes to the queue's byte budget.
+fn payload_bytes(event: &InboundEvent) -> usize {
+    match event {
+        InboundEvent::PaneOutput { bytes, .. } => bytes.len(),
+        InboundEvent::PromptMark { .. }
+        | InboundEvent::ScrollBottom { .. }
+        | InboundEvent::TrimScrollback { .. } => 0,
+    }
+}
+
+/// The pane an event belongs to, which is also the pane a dropped event owes a
+/// resync to.
+fn event_session(event: &InboundEvent) -> SessionId {
+    match event {
+        InboundEvent::PaneOutput { session_id, .. }
+        | InboundEvent::PromptMark { session_id, .. }
+        | InboundEvent::ScrollBottom { session_id }
+        | InboundEvent::TrimScrollback { session_id, .. } => *session_id,
+    }
+}
+
+/// The bounded inbound queue's contents, plus the bookkeeping the overflow
+/// policy runs on.
+#[derive(Debug)]
+struct InboundState {
+    events: VecDeque<InboundEvent>,
+    /// Buffered [`InboundEvent::PaneOutput`] payload, kept in step with
+    /// `events` so the byte bound never needs a scan.
+    bytes: usize,
+    /// Panes whose queued events were dropped since the drain last looked.
+    dropped: Vec<SessionId>,
+    senders: usize,
+    receiver_alive: bool,
+    /// Set when a coalescing pass could not shrink the backlog, so the next push
+    /// does not pay for a second full pass that cannot help either. Cleared once
+    /// the drain has pulled the queue back down to half its bound.
+    coalesce_stalled: bool,
+}
+
+impl InboundState {
+    /// Queues `event`, applying the overflow policy: coalesce first, drop only
+    /// what still does not fit, and record every dropped pane so the drain can
+    /// resync it.
+    fn admit(&mut self, event: InboundEvent) {
+        let incoming = payload_bytes(&event);
+        if self.events.len() >= INBOUND_QUEUE_EVENTS && !self.coalesce_stalled {
+            let before = self.events.len();
+            self.recoalesce();
+            self.coalesce_stalled = self.events.len() >= before;
+        }
+        while self.events.len() >= INBOUND_QUEUE_EVENTS
+            || self.bytes.saturating_add(incoming) > INBOUND_QUEUE_BYTES
+        {
+            let Some(evicted) = self.events.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(payload_bytes(&evicted));
+            let session_id = event_session(&evicted);
+            if !self.dropped.contains(&session_id) {
+                self.dropped.push(session_id);
+            }
+        }
+        self.bytes = self.bytes.saturating_add(incoming);
+        self.events.push_back(event);
+    }
+
+    /// Collapses the backlog with exactly the rule the drain applies to a batch,
+    /// so queue-level coalescing can never produce an order the drain would not
+    /// have produced anyway. A pane's own events keep their order and every byte
+    /// survives; only the event count falls.
+    fn recoalesce(&mut self) {
+        let pending = std::mem::take(&mut self.events);
+        self.events = coalesce(pending).into_iter().map(rehydrate).collect();
+    }
+
+    /// Pops the oldest event for the drain.
+    fn take(&mut self) -> Option<InboundEvent> {
+        let event = self.events.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(payload_bytes(&event));
+        if self.events.len() * 2 <= INBOUND_QUEUE_EVENTS {
+            self.coalesce_stalled = false;
+        }
+        Some(event)
+    }
+}
+
+/// Queue plus the wakeup its single drain task parks on.
+#[derive(Debug)]
+struct InboundShared {
+    state: Mutex<InboundState>,
+    notify: Notify,
+}
+
+/// Recovers a poisoned inbound lock rather than tearing the pane stream down:
+/// every critical section here is a handful of field updates that cannot leave
+/// the queue half-written, so the surviving state is still coherent.
+fn lock_inbound(shared: &InboundShared) -> MutexGuard<'_, InboundState> {
+    shared.state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The drain dropped its receiver, so no further inbound event can be queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboundClosed;
+
+impl std::fmt::Display for InboundClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("inbound drain closed")
+    }
+}
+
+/// Producer half of the bounded inbound queue, held by the IPC reader.
+#[derive(Debug)]
+pub struct InboundSender {
+    shared: Arc<InboundShared>,
+}
+
+/// Consumer half of the bounded inbound queue, owned by the coalescing drain.
+#[derive(Debug)]
+pub struct InboundReceiver {
+    shared: Arc<InboundShared>,
+}
+
+/// Creates the bounded inbound queue the reader feeds and [`run_drain`] owns.
+#[must_use]
+pub fn inbound_channel() -> (InboundSender, InboundReceiver) {
+    let shared = Arc::new(InboundShared {
+        state: Mutex::new(InboundState {
+            events: VecDeque::new(),
+            bytes: 0,
+            dropped: Vec::new(),
+            senders: 1,
+            receiver_alive: true,
+            coalesce_stalled: false,
+        }),
+        notify: Notify::new(),
+    });
+    (InboundSender { shared: Arc::clone(&shared) }, InboundReceiver { shared })
+}
+
+impl InboundSender {
+    /// Queues one inbound event, never blocking the reader: a queue at either
+    /// bound coalesces and then drops rather than back-pressuring the socket,
+    /// because a stalled read would push the backlog onto the server's sink.
+    ///
+    /// # Errors
+    /// Returns [`InboundClosed`] when the drain has dropped its receiver.
+    pub fn send(&self, event: InboundEvent) -> Result<(), InboundClosed> {
+        {
+            let mut state = lock_inbound(&self.shared);
+            if !state.receiver_alive {
+                return Err(InboundClosed);
+            }
+            state.admit(event);
+        }
+        self.shared.notify.notify_one();
+        Ok(())
+    }
+}
+
+impl Clone for InboundSender {
+    fn clone(&self) -> Self {
+        lock_inbound(&self.shared).senders += 1;
+        Self { shared: Arc::clone(&self.shared) }
+    }
+}
+
+impl Drop for InboundSender {
+    fn drop(&mut self) {
+        let last = {
+            let mut state = lock_inbound(&self.shared);
+            state.senders = state.senders.saturating_sub(1);
+            state.senders == 0
+        };
+        // `notify_one` stores a permit when no task is parked yet, so a receiver
+        // between its emptiness check and its await still observes the close.
+        if last {
+            self.shared.notify.notify_one();
+        }
+    }
+}
+
+/// One non-blocking look at the inbound queue.
+enum InboundPoll {
+    Event(InboundEvent),
+    Empty,
+    Closed,
+}
+
+impl InboundReceiver {
+    /// Waits for the next queued event, returning `None` once the queue is
+    /// drained and every sender is gone.
+    pub async fn recv(&mut self) -> Option<InboundEvent> {
+        loop {
+            match self.poll_once() {
+                InboundPoll::Event(event) => return Some(event),
+                InboundPoll::Closed => return None,
+                InboundPoll::Empty => self.shared.notify.notified().await,
+            }
+        }
+    }
+
+    /// Takes the next event without waiting. Split out of [`Self::recv`] so the
+    /// queue lock is released before the await rather than merely scoped away
+    /// from it.
+    fn poll_once(&self) -> InboundPoll {
+        let mut state = lock_inbound(&self.shared);
+        if let Some(event) = state.take() {
+            return InboundPoll::Event(event);
+        }
+        if state.senders == 0 {
+            return InboundPoll::Closed;
+        }
+        InboundPoll::Empty
+    }
+
+    /// Events still queued behind the drain.
+    fn len(&self) -> usize {
+        lock_inbound(&self.shared).events.len()
+    }
+
+    /// True once the drain has caught up with the reader.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Takes the panes whose events the overflow policy dropped since the last
+    /// call.
+    fn take_dropped(&mut self) -> Vec<SessionId> {
+        std::mem::take(&mut lock_inbound(&self.shared).dropped)
+    }
+}
+
+impl Drop for InboundReceiver {
+    fn drop(&mut self) {
+        let mut state = lock_inbound(&self.shared);
+        state.receiver_alive = false;
+        state.events.clear();
+        state.bytes = 0;
+    }
+}
+
+/// Overflow resyncs the drain still owes, one entry per pane.
+#[derive(Debug, Default)]
+struct PendingResync {
+    sessions: Vec<SessionId>,
+    since: Option<Instant>,
+}
+
+impl PendingResync {
+    /// Folds in the panes the queue dropped during this batch, then asks the
+    /// server for a fresh screen once the drain has caught up — or once the
+    /// oldest debt is [`RESYNC_MAX_DELAY`] old, because a firehose that never
+    /// lets the queue reach empty must still repair the pane.
+    ///
+    /// The request is per pane rather than per connection, which is what makes
+    /// the policy correct for a shared session: each participant detects its own
+    /// overflow and repaints only the panes it actually lost bytes for.
+    fn settle(&mut self, rx: &mut InboundReceiver, sink: &IpcSink) {
+        for session_id in rx.take_dropped() {
+            if !self.sessions.contains(&session_id) {
+                self.sessions.push(session_id);
+            }
+        }
+        if self.sessions.is_empty() {
+            return;
+        }
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if !rx.is_empty() && since.elapsed() < RESYNC_MAX_DELAY {
+            return;
+        }
+        for session_id in self.sessions.drain(..) {
+            match sink.request_snapshot(session_id) {
+                Ok(()) => tracing::warn!(
+                    %session_id,
+                    "inbound queue overflowed; requested a screen snapshot resync"
+                ),
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "inbound overflow resync request dropped");
+                }
+            }
+        }
+        self.since = None;
+    }
+}
+
 /// Drains `rx` with 4 ms / 100-event coalescing, invoking `apply` once per
-/// batch with the per-pane-collapsed output. Returns when the channel closes,
+/// batch with the per-pane-collapsed output. Returns when the queue closes,
 /// flushing any final partial batch first.
 ///
 /// `apply` runs synchronously between awaits, so a caller may lock its terminal
-/// entities inside it without ever holding a lock across an await point.
-pub async fn run_drain<F>(mut rx: UnboundedReceiver<InboundEvent>, mut apply: F)
+/// entities inside it without ever holding a lock across an await point. After
+/// each batch the drain settles whatever the bounded queue dropped, sending one
+/// `RequestSnapshot` per affected pane through `sink`; because the request only
+/// goes out once the queue is empty, the repaint it triggers lands on a calm
+/// queue instead of being dropped in turn.
+pub async fn run_drain<F>(mut rx: InboundReceiver, sink: IpcSink, mut apply: F)
 where
     F: FnMut(CoalescedBatch),
 {
+    let mut resync = PendingResync::default();
     loop {
         let Some(first) = rx.recv().await else {
             return;
         };
         let BatchWindow { batch, channel_closed } = collect_batch(first, &mut rx).await;
         apply(coalesce(batch));
+        resync.settle(&mut rx, &sink);
         if channel_closed {
             return;
         }
@@ -208,10 +549,7 @@ pub struct BatchWindow {
 /// Accumulates events into one 4 ms / 100-event batch window starting with
 /// `first`, so the coalescing bound is shared between [`run_drain`] and the
 /// synchronized-frame drain in `main.rs` rather than duplicated.
-pub async fn collect_batch(
-    first: InboundEvent,
-    rx: &mut UnboundedReceiver<InboundEvent>,
-) -> BatchWindow {
+pub async fn collect_batch(first: InboundEvent, rx: &mut InboundReceiver) -> BatchWindow {
     let mut batch = Vec::with_capacity(MAX_BATCH_EVENTS);
     batch.push(first);
     let deadline = Instant::now() + BATCH_WINDOW;
@@ -703,7 +1041,7 @@ mod tests {
         time::Instant,
     };
 
-    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     use super::*;
 
@@ -726,10 +1064,17 @@ mod tests {
         }
     }
 
-    fn flood(in_tx: &UnboundedSender<InboundEvent>, pane: SessionId, count: u32) {
+    fn flood(in_tx: &InboundSender, pane: SessionId, count: u32) {
         for _ in 0..count {
             in_tx.send(output(pane, b"A")).unwrap();
         }
+    }
+
+    /// A sink whose receiver is kept alive, for drains whose resync path is not
+    /// under test.
+    fn idle_sink() -> (IpcSink, UnboundedReceiver<ClientMessage>) {
+        let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
+        (IpcSink::new(out_tx), out_rx)
     }
 
     fn output(session_id: SessionId, bytes: &[u8]) -> InboundEvent {
@@ -843,15 +1188,16 @@ mod tests {
         let second = SessionId::new();
         let (events, expected_first, expected_second) = firehose(300, first, second);
 
-        let (tx, rx) = unbounded_channel::<InboundEvent>();
+        let (tx, rx) = inbound_channel();
         for event in events {
             tx.send(event).unwrap();
         }
         drop(tx);
 
         let recorded: RecordedBatches = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&recorded);
-        run_drain(rx, move |batch| push_batch(&sink, batch)).await;
+        let collector = Arc::clone(&recorded);
+        let (sink, _out_rx) = idle_sink();
+        run_drain(rx, sink, move |batch| push_batch(&collector, batch)).await;
 
         let batches = recorded.lock().unwrap();
         // 300 events / 100-event cap = 3 batches; two panes each = at most 6 writes.
@@ -861,18 +1207,71 @@ mod tests {
         assert_eq!(reconstruct(&batches, second), expected_second);
     }
 
+    /// One server frame's worth of output, sized so the byte ceiling is the
+    /// bound a firehose reaches first.
+    fn frame() -> Vec<u8> {
+        vec![b'A'; 64 * 1024]
+    }
+
+    // @lat: [[test#GPUI IPC Bridge#Inbound queue bounds a firehose]]
+    #[test]
+    fn inbound_queue_holds_a_firehose_inside_its_event_and_byte_ceilings() {
+        let pane = SessionId::new();
+        let (in_tx, in_rx) = inbound_channel();
+
+        // Thirty-two times the byte ceiling with no drain running at all.
+        for _ in 0..2_000u32 {
+            in_tx.send(output(pane, &frame())).unwrap();
+        }
+
+        let state = lock_inbound(&in_rx.shared);
+        assert!(
+            state.events.len() <= INBOUND_QUEUE_EVENTS,
+            "queued {} events, bound is {INBOUND_QUEUE_EVENTS}",
+            state.events.len()
+        );
+        assert!(
+            state.bytes <= INBOUND_QUEUE_BYTES,
+            "queued {} bytes, bound is {INBOUND_QUEUE_BYTES}",
+            state.bytes
+        );
+        assert_eq!(state.dropped, vec![pane], "overflow must record the pane it dropped");
+    }
+
+    // @lat: [[test#GPUI IPC Bridge#Overflow resyncs the dropped pane]]
+    #[tokio::test]
+    async fn inbound_overflow_requests_a_snapshot_for_the_dropped_pane() {
+        let pane = SessionId::new();
+        let (in_tx, in_rx) = inbound_channel();
+        let (out_tx, mut out_rx) = unbounded_channel::<ClientMessage>();
+        let sink = IpcSink::new(out_tx);
+
+        let frames = INBOUND_QUEUE_BYTES / frame().len() + 8;
+        for _ in 0..frames {
+            in_tx.send(output(pane, &frame())).unwrap();
+        }
+        drop(in_tx);
+
+        run_drain(in_rx, sink, |_| {}).await;
+
+        match out_rx.recv().await.unwrap() {
+            ClientMessage::RequestSnapshot { session_id } => assert_eq!(session_id, pane),
+            other => panic!("expected RequestSnapshot, got {other:?}"),
+        }
+        assert!(out_rx.try_recv().is_err(), "one resync per overflowed pane, not one per drop");
+    }
+
     // @lat: [[test#GPUI IPC Bridge#Keystroke before output]]
     #[tokio::test]
     async fn keystroke_reaches_server_despite_inbound_firehose() {
         let pane = SessionId::new();
-        let (in_tx, in_rx) = unbounded_channel::<InboundEvent>();
+        let (in_tx, in_rx) = inbound_channel();
         let (out_tx, mut out_rx) = unbounded_channel::<ClientMessage>();
         for _ in 0..10_000u32 {
             in_tx.send(output(pane, b"A")).unwrap();
         }
-        let drain = tokio::spawn(run_drain(in_rx, |_| {}));
-
         let sink = IpcSink::new(out_tx);
+        let drain = tokio::spawn(run_drain(in_rx, sink.clone(), |_| {}));
         sink.key_input(pane, b"x".to_vec(), true).unwrap();
 
         let message =
@@ -887,10 +1286,10 @@ mod tests {
     #[tokio::test]
     async fn typing_under_firehose_preserves_order_without_latency_spike() {
         let pane = SessionId::new();
-        let (in_tx, in_rx) = unbounded_channel::<InboundEvent>();
+        let (in_tx, in_rx) = inbound_channel();
         let (out_tx, mut out_rx) = unbounded_channel::<ClientMessage>();
-        let drain = tokio::spawn(run_drain(in_rx, |_| {}));
         let sink = IpcSink::new(out_tx);
+        let drain = tokio::spawn(run_drain(in_rx, sink.clone(), |_| {}));
 
         for &key in b"echo hello\r" {
             flood(&in_tx, pane, 500);
