@@ -31,12 +31,66 @@ if [[ ! -d "$CLAUDE_DIR" ]]; then
     exit 0
 fi
 
+# Prelude prepended to every embedded Python step so each config write goes
+# through the same crash-safe path.
+PYTHON_PRELUDE=$(cat << 'PRELUDE_EOF'
+import os
+import stat
+import tempfile
+
+
+def atomic_write_text(path, text):
+    """Replace path's contents via a same-directory temp file and os.replace.
+
+    A crash between the write and the rename leaves the previous file
+    untouched, so an interrupted install can never truncate a config.
+    """
+    path = os.fspath(path)
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".scribe-tmp-")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except FileNotFoundError:
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+PRELUDE_EOF
+)
+
+# Reads a Python program on stdin, prepends the prelude, and runs it.
+scribe_python() {
+    { printf '%s\n' "$PYTHON_PRELUDE"; cat; } | python3
+}
+
 # ── Step 2: Merge Scribe hooks into settings.json ──────────────────────
 # All hook commands point at ai-hook-claude.sh in the install prefix.
 # Removes legacy `printf > /dev/tty` Scribe hooks and the obsolete
 # detect-claude-question.sh Stop hook before inserting the new entries.
 
-python3 << 'PYEOF'
+scribe_python << 'PYEOF'
 import json
 import os
 import sys
@@ -160,12 +214,7 @@ else:
         file=sys.stderr,
     )
 
-# Atomic write via tmp + rename.
-tmp_path = settings_path + ".tmp"
-with open(tmp_path, "w") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-os.replace(tmp_path, settings_path)
+atomic_write_text(settings_path, json.dumps(settings, indent=2) + "\n")
 
 print(f"  Updated {settings_path}")
 print("  Scribe Claude Code hooks now route via scribe-hook-helper IPC.")
