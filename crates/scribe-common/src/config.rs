@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -2131,7 +2132,57 @@ pub fn save_config(config: &ScribeConfig) -> Result<(), ScribeError> {
     })?;
 
     tracing::info!(?config_path, "config saved");
+    invalidate_config_snapshot();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Cached snapshot
+// ---------------------------------------------------------------------------
+
+/// A parsed config paired with the theme resolved from it.
+///
+/// Handed out behind an `Arc` by [`config_snapshot`] so callers on a hot path
+/// pay neither the disk read nor the parse.
+#[derive(Debug)]
+pub struct ConfigSnapshot {
+    pub config: ScribeConfig,
+    pub theme: Theme,
+}
+
+static CONFIG_SNAPSHOT: RwLock<Option<Arc<ConfigSnapshot>>> = RwLock::new(None);
+
+/// Return the cached config + resolved theme, loading them from disk on the
+/// first call after startup or after an invalidation.
+///
+/// Dynamic color queries (OSC 4/10/11/12) resolve one palette entry per
+/// sequence, so an uncached [`load_config`] + [`resolve_theme`] there turns a
+/// 256-index probe into 256 config reads — plus another 256 theme-file reads
+/// when the active theme lives outside the built-in presets. A load failure is
+/// not cached: the next call retries the disk so a transiently unreadable
+/// config does not pin an error for the life of the process.
+pub fn config_snapshot() -> Result<Arc<ConfigSnapshot>, ScribeError> {
+    if let Some(snapshot) = CONFIG_SNAPSHOT.read().unwrap_or_else(PoisonError::into_inner).clone() {
+        return Ok(snapshot);
+    }
+
+    let config = load_config()?;
+    let theme = resolve_theme(&config);
+    let snapshot = Arc::new(ConfigSnapshot { config, theme });
+
+    let mut cache = CONFIG_SNAPSHOT.write().unwrap_or_else(PoisonError::into_inner);
+    // A concurrent caller may have populated the cache while this one was
+    // reading from disk; keep whichever landed first so every holder of a
+    // snapshot Arc observes the same generation.
+    Ok(Arc::clone(cache.get_or_insert(snapshot)))
+}
+
+/// Drop the cached snapshot so the next [`config_snapshot`] re-reads disk.
+///
+/// Called from every path that knows the config file changed: the server's
+/// `ConfigReloaded` handler and [`save_config`].
+pub fn invalidate_config_snapshot() {
+    CONFIG_SNAPSHOT.write().unwrap_or_else(PoisonError::into_inner).take();
 }
 
 // ---------------------------------------------------------------------------

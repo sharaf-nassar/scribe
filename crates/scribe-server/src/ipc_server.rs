@@ -7076,6 +7076,10 @@ async fn handle_config_reloaded(server: &IpcServerState) {
     let live_sessions = &server.live_sessions;
     let env_store = &server.env_store;
 
+    // Drop the cached config + theme snapshot first so every reader below —
+    // and the dynamic color-query path — resolves against the new file.
+    scribe_config::invalidate_config_snapshot();
+
     let cfg = match crate::config::load_config() {
         Ok(cfg) => {
             info!("config reloaded successfully via client request");
@@ -8713,11 +8717,16 @@ async fn current_term_color(
     fallback_term_color(index).unwrap_or(alacritty_terminal::vte::ansi::Rgb { r: 0, g: 0, b: 0 })
 }
 
+/// Resolve a palette index the live `Term` has no override for against the
+/// configured theme.
+///
+/// Reads the process-wide snapshot rather than `load_config` + `resolve_theme`
+/// so a 256-index OSC 4 probe costs zero disk reads once warm; the snapshot is
+/// dropped by [`handle_config_reloaded`] whenever the file changes.
 fn fallback_term_color(index: usize) -> Option<alacritty_terminal::vte::ansi::Rgb> {
-    let config = scribe_config::load_config().ok()?;
-    let theme = scribe_config::resolve_theme(&config);
+    let snapshot = scribe_config::config_snapshot().ok()?;
 
-    theme_color_for_index(&theme, index).map(theme_color_to_rgb)
+    theme_color_for_index(&snapshot.theme, index).map(theme_color_to_rgb)
 }
 
 fn theme_color_for_index(theme: &scribe_common::theme::Theme, index: usize) -> Option<[f32; 4]> {

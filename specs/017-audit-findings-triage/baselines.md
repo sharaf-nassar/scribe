@@ -454,6 +454,40 @@ Every palette query misses the `Term` colour table and re-reads *and re-parses*
 the whole config; an external theme adds a second file read and parse. This is
 the before-side for US6-5 ("OSC 4 probe = zero disk reads warm").
 
+#### After side: US6-5 config/theme cache (bead `scribe-i79.15`)
+
+Measured on 2026-07-30 from the bead's worktree with the same rig as the before
+side: an isolated `scribe-server` under
+`strace -f -qq -e trace=openat,openat2`, scratch `HOME`/XDG roots, the
+`SCRIBE_MEASURE_RUNTIME_DIR` socket patch, and the same
+`themes/baseline-external.toml`. The probe is
+`printf '\033]4;%d;?\007' 0 1 … 255` run inside the session, repeated three
+times against one long-lived server; counts are `grep -c` deltas bracketing
+each repeat. The before column is the same probe against a build of the same
+worktree with only the cache commit reverted, so the rig is held constant.
+
+| Theme kind | Build | probe 1 | probe 2 | probe 3 |
+|---|---|---|---|---|
+| built-in preset | before | 256 config / 0 theme | 256 / 0 | 256 / 0 |
+| built-in preset | cached | **1** config / 0 theme | **0 / 0** | **0 / 0** |
+| external theme file | before | 256 config / 256 theme | 256 / 256 | 256 / 256 |
+| external theme file | cached | **1** config / **1** theme | **0 / 0** | **0 / 0** |
+
+The before rows reproduce the table above exactly (1.00 config read per query,
+2.00 disk reads per query with an external theme). Cached, the whole 256-index
+probe costs one config read and one theme read the first time the process
+answers a colour query, and zero disk reads on every probe after that — the
+US6-5 acceptance number.
+
+Invalidation was checked in the same rig with a single-index probe whose reply
+is echoed back as text. With `[appearance] theme = "swap"` and ANSI 0 set to
+`#010203`, the cold probe cost 1 theme read and answered
+`rgb:0101/0202/0303`, the warm probe cost 0 reads and answered the same.
+Rewriting ANSI 0 to `#aabbcc` and sending a real `ClientMessage::ConfigReloaded`
+made the next probe cost 1 theme read again and answer
+`rgb:aaaa/bbbb/cccc` — the cache is dropped by the reload, not stale-pinned for
+the life of the server.
+
 ### Client drain batches and drained-events-per-redraw
 
 Three workloads in the same session, in the order run. "Events" are raw
