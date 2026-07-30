@@ -568,6 +568,16 @@ A `Resize` enqueued on the sink before a `KeyInput` is delivered first, since th
 
 `IpcSink::key_input` returns  rather than panicking when the writer task has dropped its receiver.
 
+### Inbound queue bounds a firehose
+
+A pane firehosed thirty-two times past the byte ceiling with no drain running leaves at most [[crates/scribe-client/src/ipc_bridge.rs#INBOUND_QUEUE_EVENTS]] events and [[crates/scribe-client/src/ipc_bridge.rs#INBOUND_QUEUE_BYTES]] of payload buffered.
+
+The same assertion covers the other half of the policy: the pane whose events were evicted is recorded as owing a resync, because a drop the drain never hears about is a pane left silently wrong.
+
+### Overflow resyncs the dropped pane
+
+After an overflow, the drain sends exactly one `RequestSnapshot` for the dropped pane once it has caught up — the client-detected resync ([[crates/scribe-client/src/ipc_bridge.rs#PendingResync#settle]]) that keeps a bounded queue from losing screen state.
+
 ## GPUI Sync Frame Queue
 
 Unit tests for the ported  —  sitting in front of  — proving `CSI ? 2026` commit boundaries survive IPC chunking and that expiry and catch-up match the winit client.

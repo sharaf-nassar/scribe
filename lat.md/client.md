@@ -40,6 +40,16 @@ The  module carries bytes both directions over the frozen IPC protocol without a
 
 Inbound:  drains the  channel with 4 ms / 100-event coalescing.  collapses a drained run into one per-pane byte buffer in first-seen order (), which  feeds through the sync-frame queue below. Because output is normalised to bytes before it enters the channel, coalescing only ever concatenates.
 
+#### Bounded inbound queue
+
+The channel the reader feeds is [[crates/scribe-client/src/ipc_bridge.rs#inbound_channel]], bounded at [[crates/scribe-client/src/ipc_bridge.rs#INBOUND_QUEUE_EVENTS]] events and [[crates/scribe-client/src/ipc_bridge.rs#INBOUND_QUEUE_BYTES]] of buffered output.
+
+Both bounds are load-bearing. The event bound is the one the audit named, but events carry variable-size payloads and coalescing trades event count for bytes, so the byte ceiling is what actually flattens RSS under a `yes` firehose; one frame larger than the whole ceiling is still admitted onto an emptied queue, because refusing the newest frame would stall the pane rather than bound it.
+
+[[crates/scribe-client/src/ipc_bridge.rs#InboundState#admit]] never blocks the reader — a stalled socket read would only push the backlog onto the server's sink — so a queue at either bound coalesces first, through the very same [[crates/scribe-client/src/ipc_bridge.rs#coalesce]] the drain applies to a batch, and drops from the front only for what still does not fit. Reusing the drain's own rule is what guarantees the queue can never invent an order the drain would not have produced: a pane's events keep their order and every byte survives, only the event count falls.
+
+Each dropped event records its pane, and [[crates/scribe-client/src/ipc_bridge.rs#PendingResync#settle]] turns that debt into one `RequestSnapshot` per affected pane. The request waits for the queue to reach empty, so the repaint lands on a calm queue instead of being dropped in turn; a firehose that never lets the queue drain gets the request anyway after [[crates/scribe-client/src/ipc_bridge.rs#RESYNC_MAX_DELAY]]. Nothing new goes on the wire — the client detects its own overflow and repairs only the panes it lost bytes for, which is what makes the policy per-participant in a shared session.
+
 ### Sync Frame Queueing
 
 Between the coalescing drain and `feed_output`, a per-session  preserves `CSI ? 2026` commit boundaries so a redraw never tears a frame across IPC splits, ported from the winit client's drain path.
@@ -58,7 +68,7 @@ Outbound:  replaces Zed's `write_to_pty` path, enqueuing `ClientMessage::KeyInpu
 
 Every attach carries a `Subscribe` for the pane it just attached, sent through  behind the `AttachSessions` from both attach paths —  on the reader's `SessionList` / `SessionCreated` route and  on a tab switch. Order matters because  rejects a subscription for a session this connection is not attached to; the shared ordered writer channel and the server's sequential per-connection dispatch make that impossible by construction. Subscribing is what makes the server run its CWD-fallback check for the newly visible pane, so a reattached tab gets its directory (and the workspace name derived from it) without waiting for the next shell prompt.
 
- is the display-only client's resync: it owns no PTY and never replays locally, so when its pane may have drifted from the server's `Term` the only way back to a correct pane is to ask. Two live paths send it.  follows its post-font-reload `Resize` with one, because that resize raises `SIGWINCH` on the server's PTY and the client cannot derive the resulting grid itself.  sends one when a reattach replay fails to decode, turning a permanently stale tab into a repaint. The reply lands on , which feeds RIS plus the snapshot's own ANSI (visible grid *and* scrollback) through the drain, so everything on screen afterwards came out of that snapshot.
+ is the display-only client's resync: it owns no PTY and never replays locally, so when its pane may have drifted from the server's `Term` the only way back to a correct pane is to ask. Three live paths send it.  follows its post-font-reload `Resize` with one, because that resize raises `SIGWINCH` on the server's PTY and the client cannot derive the resulting grid itself.  sends one when a reattach replay fails to decode, turning a permanently stale tab into a repaint. [[crates/scribe-client/src/ipc_bridge.rs#PendingResync#settle]] sends one per pane the bounded inbound queue had to drop, which is what lets that queue bound memory without silently losing screen state. The reply lands on , which feeds RIS plus the snapshot's own ANSI (visible grid *and* scrollback) through the drain, so everything on screen afterwards came out of that snapshot.
 
 #### Replay reattach applies
 

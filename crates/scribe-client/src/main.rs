@@ -154,7 +154,10 @@ use tokio::{
 };
 
 use crate::{
-    ipc_bridge::{InboundEvent, IpcSink, PaneOp, RestoredSession, run_drain},
+    ipc_bridge::{
+        InboundEvent, InboundReceiver, InboundSender, IpcSink, PaneOp, RestoredSession,
+        inbound_channel, run_drain,
+    },
     pane_shell::{ClosedPane, PaneShell, WorkspaceInfo, WorkspaceInfoOutcome},
     session_lifecycle::{JumpDirection, PromptMarks},
     sync_frames::{SyncFrameQueue, drain_all_committed},
@@ -6583,7 +6586,7 @@ fn start_window_backend(terminal_size: TerminalSize) -> (Shared, IpcSink) {
         remote: Arc::new(Mutex::new(RemoteChrome::new())),
     };
     let (out_tx, out_rx) = unbounded_channel::<ClientMessage>();
-    let (in_tx, in_rx) = unbounded_channel::<InboundEvent>();
+    let (in_tx, in_rx) = inbound_channel();
     let sink = IpcSink::new(out_tx.clone());
 
     start_ipc_thread(IpcThread {
@@ -6781,8 +6784,8 @@ struct IpcThread {
     sink: IpcSink,
     out_tx: UnboundedSender<ClientMessage>,
     out_rx: UnboundedReceiver<ClientMessage>,
-    in_tx: UnboundedSender<InboundEvent>,
-    in_rx: Option<UnboundedReceiver<InboundEvent>>,
+    in_tx: InboundSender,
+    in_rx: Option<InboundReceiver>,
     size: TerminalSize,
 }
 
@@ -6831,6 +6834,7 @@ async fn supervise_connection(mut ctx: IpcThread) {
     };
     spawn_drain(
         in_rx,
+        ctx.sink.clone(),
         Arc::clone(&ctx.shared.panes),
         Arc::clone(&ctx.shared.generation),
         Arc::clone(&ctx.shared.prompt_marks),
@@ -7293,8 +7297,13 @@ type SyncFrameQueues = Arc<Mutex<HashMap<SessionId, SyncFrameQueue>>>;
 /// boundaries. A second task waits on the nearest raw-frame or parser sync
 /// deadline and flushes a 150 ms-expired update whose terminating `CSI ? 2026 l`
 /// never arrived.
+///
+/// `sink` is the drain's own outbound handle: the inbound queue is bounded, so
+/// whatever it had to drop is repaired by a `RequestSnapshot` per affected pane
+/// once the drain catches up.
 fn spawn_drain(
-    in_rx: UnboundedReceiver<InboundEvent>,
+    in_rx: InboundReceiver,
+    sink: IpcSink,
     panes: Arc<Mutex<PaneGrids>>,
     generation: Arc<AtomicU64>,
     prompt_marks: Arc<Mutex<PromptMarks>>,
@@ -7306,7 +7315,7 @@ fn spawn_drain(
     let panes_task = Arc::clone(&panes);
     let generation_task = Arc::clone(&generation);
     let wake_task = Arc::clone(&expiry_wake);
-    tokio::spawn(run_drain(in_rx, move |batch| {
+    tokio::spawn(run_drain(in_rx, sink, move |batch| {
         if batch.is_empty() {
             return;
         }
@@ -7550,7 +7559,7 @@ struct ReaderCtx {
     /// queues inbound automation actions in.
     remote: Arc<Mutex<RemoteChrome>>,
     out_tx: UnboundedSender<ClientMessage>,
-    in_tx: UnboundedSender<InboundEvent>,
+    in_tx: InboundSender,
     sink: IpcSink,
     size: TerminalSize,
 }
@@ -9066,7 +9075,7 @@ fn attach_session(ctx: &ReaderCtx, session_id: SessionId) -> Result<(), String> 
     Ok(())
 }
 
-fn forward_output(in_tx: &UnboundedSender<InboundEvent>, session_id: SessionId, bytes: Vec<u8>) {
+fn forward_output(in_tx: &InboundSender, session_id: SessionId, bytes: Vec<u8>) {
     forward_inbound(in_tx, InboundEvent::PaneOutput { session_id, bytes });
 }
 
@@ -9074,8 +9083,10 @@ fn forward_output(in_tx: &UnboundedSender<InboundEvent>, session_id: SessionId, 
 ///
 /// Every pane-affecting message goes through here so output and the positional
 /// events interleaved with it (prompt marks, the suppressed-ED-3 snap) cannot
-/// be reordered relative to each other.
-fn forward_inbound(in_tx: &UnboundedSender<InboundEvent>, event: InboundEvent) {
+/// be reordered relative to each other. The queue behind it is bounded and
+/// never blocks the reader: an overflow is absorbed by the drain's resync
+/// rather than by stalling the socket read.
+fn forward_inbound(in_tx: &InboundSender, event: InboundEvent) {
     if in_tx.send(event).is_err() {
         tracing::warn!("inbound drain closed; dropping pane event");
     }
