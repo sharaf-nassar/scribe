@@ -6557,7 +6557,13 @@ async fn handle_list_sessions(
     let window_session_ids = wm.sessions_for_window(window_id);
     let has_window_sessions = !window_session_ids.is_empty();
 
-    let build_info = |sid: SessionId, s: &LiveSession| SessionInfo {
+    // Branch resolution is split around the guards: probing the per-session
+    // memo is a path compare and a clone, cheap enough to do here, while a
+    // miss costs a `.git/HEAD` walk and must not run under the registry and
+    // workspace-manager read guards. Misses are collected and resolved once
+    // both guards are released.
+    let mut pending_branches: Vec<(SessionId, std::path::PathBuf)> = Vec::new();
+    let mut build_info = |sid: SessionId, s: &LiveSession| SessionInfo {
         session_id: sid,
         workspace_id: s.workspace_id,
         shell_name: s.shell_name.clone(),
@@ -6566,12 +6572,18 @@ async fn handle_list_sessions(
         task_label: s.task_label.clone(),
         codex_task_label: s.task_label.clone(),
         cwd: s.cwd.clone(),
-        git_branch: s.cwd.as_deref().and_then(|cwd| s.git_branch_cache.resolve(cwd)),
+        git_branch: s.cwd.as_deref().and_then(|cwd| match s.git_branch_cache.fresh(cwd) {
+            BranchLookup::Hit(branch) => branch,
+            BranchLookup::Miss => {
+                pending_branches.push((sid, cwd.to_path_buf()));
+                None
+            }
+        }),
         ai_state: s.ai_state.clone(),
         ai_provider_hint: s.ai_state.as_ref().map(|state| state.provider).or(s.ai_provider_hint),
     };
 
-    let infos: Vec<SessionInfo> = if has_window_sessions {
+    let mut infos: Vec<SessionInfo> = if has_window_sessions {
         // Return only this window's sessions.
         window_session_ids
             .iter()
@@ -6610,6 +6622,15 @@ async fn handle_list_sessions(
     let workspace_tree = wm.window_tree(window_id).cloned();
     drop(wm);
     drop(sessions);
+
+    if !pending_branches.is_empty() {
+        let resolved = resolve_pending_git_branches(&pending_branches, live_sessions).await;
+        for info in &mut infos {
+            if let Some(branch) = resolved.get(&info.session_id) {
+                info.git_branch.clone_from(branch);
+            }
+        }
+    }
 
     let list_msg = ServerMessage::SessionList { sessions: infos, workspace_tree, workspaces };
     send_message(writer, &list_msg).await;
@@ -8948,9 +8969,9 @@ struct CachedGitBranch {
 ///
 /// A CWD report that survives [`record_cwd_report`] changes the key and is
 /// therefore the invalidation signal; [`GIT_BRANCH_CACHE_TTL`] bounds staleness
-/// for a session that never moves. Interior mutability so the `ListSessions`
-/// path can refresh an expired entry while holding only a read guard on the
-/// live-session registry.
+/// for a session that never moves. Interior mutability so a resolved branch can
+/// be stored back while holding only a read guard on the live-session registry;
+/// no caller walks `.git/HEAD` with a registry guard held.
 #[derive(Default)]
 struct GitBranchCache(std::sync::Mutex<Option<CachedGitBranch>>);
 
@@ -8990,16 +9011,6 @@ impl GitBranchCache {
             resolved_at: std::time::Instant::now(),
         });
     }
-
-    /// Resolve `cwd`'s branch, walking `.git/HEAD` only on a cache miss.
-    fn resolve(&self, cwd: &Path) -> Option<String> {
-        if let BranchLookup::Hit(branch) = self.fresh(cwd) {
-            return branch;
-        }
-        let branch = detect_git_branch(cwd);
-        self.store(cwd, branch.clone());
-        branch
-    }
 }
 
 /// Resolve a session's branch through its [`GitBranchCache`] without holding
@@ -9022,6 +9033,36 @@ async fn resolve_session_git_branch(
         session.git_branch_cache.store(cwd, branch.clone());
     }
     branch
+}
+
+/// Resolve the branch of every session whose [`GitBranchCache`] missed during
+/// a `SessionList` build, off the registry and workspace-manager guards the
+/// caller has already released.
+///
+/// Panes are independent sessions with independent memos, so a split window
+/// sitting in one repository misses once per pane. The walk is therefore keyed
+/// on the directory rather than the session: distinct directories cost one
+/// `.git/HEAD` walk each, however many panes share them. Every pending session
+/// is then fed its answer so the next read is a hit.
+async fn resolve_pending_git_branches(
+    pending: &[(SessionId, std::path::PathBuf)],
+    live_sessions: &LiveSessionRegistry,
+) -> HashMap<SessionId, Option<String>> {
+    let mut by_cwd: HashMap<&Path, Option<String>> = HashMap::new();
+    for (_, cwd) in pending {
+        by_cwd.entry(cwd.as_path()).or_insert_with(|| detect_git_branch(cwd));
+    }
+
+    let sessions = live_sessions.read().await;
+    let mut resolved = HashMap::with_capacity(pending.len());
+    for (session_id, cwd) in pending {
+        let branch = by_cwd.get(cwd.as_path()).cloned().flatten();
+        if let Some(session) = sessions.get(session_id) {
+            session.git_branch_cache.store(cwd, branch.clone());
+        }
+        resolved.insert(*session_id, branch);
+    }
+    resolved
 }
 
 /// Carry forward optional `AiProcessState` metadata (`context`, `model`,

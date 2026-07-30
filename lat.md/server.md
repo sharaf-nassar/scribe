@@ -92,6 +92,14 @@ The walk is memoized per session by the directory it was taken in — a `(sessio
 
 Detection is skipped outright when the session's attached-sink set is empty. A detached session has nobody to render a branch, and the `SessionList` reply that precedes the next attach resolves it, so the walk would be pure waste.
 
+#### Branch Resolution in ListSessions
+
+A `SessionList` build splits branch resolution around its guards: the cache probe runs inline, and every miss is [[crates/scribe-server/src/ipc_server.rs#resolve_pending_git_branches|resolved]] once the live-session and workspace-manager read guards are released.
+
+Probing the memo is a path compare and a clone, so it stays under the guards; a miss is filesystem I/O and would otherwise block every registry and workspace writer for the length of the walk — the reply is built while holding both read guards, and the walk count scales with the number of panes in the window.
+
+Misses are keyed on the directory rather than the session for the second half of the same problem. Panes are independent sessions with independent memos, so a split window sitting in one repository misses once per pane; keying the walk on the directory collapses those into one `.git/HEAD` walk that every pane in that directory shares. Each pending session is then handed the answer and stores it in its own memo, so per-session invalidation semantics are unchanged.
+
 ### Clipboard Gating
 
 OSC 52 clipboard reads and writes from PTY-side programs flow through a per-session policy engine before reaching the host clipboard (spec 010). The in-memory `ServerClipboard` buffer is gone; the host clipboard is now the single source of truth.

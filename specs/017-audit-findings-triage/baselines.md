@@ -607,6 +607,49 @@ inside the window opened by the preceding phase). Every `SessionList` in both
 builds reported `git_branch = "measure-main"`, so the cache never changes the
 answer. Phases 1–3 reproduced integer-exact across two runs per build.
 
+### After side: ListSessions branch resolution off registry guards (US6-3)
+
+Measured on 2026-07-30 at worktree base `cb9f80e` (bead `scribe-i79.13`) with
+the same isolated-runtime-dir rig: two release `scribe-server` builds differing
+only in this item's diff, each run under
+`strace -f -qq -e trace=openat,openat2`, against a scratch `$HOME` that is a
+`git init` repo on branch `measure-main`. The "before" build is current `main`,
+so the per-session branch cache and the detached skip are already in it.
+
+The client is a throwaway binary rather than the `scribe-test` daemon, because
+the phases need several panes in one window and a `ListSessions` the harness
+cannot issue. It opens one window, creates four panes all launched in the same
+directory, drives one OSC 7 per pane (a freshly created session's
+`LiveSession.cwd` stays unset until a CWD report lands, and an unset CWD skips
+branch resolution entirely), waits past the 5 s branch-cache TTL, then issues
+`ListSessions` in the pattern each row names. `.git/HEAD` opens are
+`grep -c '/\.git/HEAD"'` deltas bracketing the reads.
+
+| Phase — 4 panes, one window | before | after |
+|---|---|---|
+| 20 back-to-back `ListSessions`, panes at repo root | 4 | **1** |
+| 5 `ListSessions` 6 s apart, panes at repo root | 20 | **5** |
+| 20 back-to-back `ListSessions`, panes 4 levels deep | 20 | **5** |
+
+Rows 1 and 2 are the per-pane multiplier. The memo is per session, so four
+panes sitting in one repository miss four times per TTL window however many
+reads arrive: 4 for a single burst, 4 × 5 for five bursts spaced past the TTL.
+Keying the walk on the directory instead collapses each of those into one walk
+the whole window shares, which is exactly the 4 → 1 and 20 → 5 seen.
+
+Row 3 separates walks from opens. At depth 4 a single walk costs 5 openats (four
+`ENOENT` probes plus the hit), so the before build's four walks are 20 opens and
+the after build's one walk is 5. The saving is whole walks, not a cheaper walk.
+
+Lock hold time is not instrumented separately: the change is structural, and the
+counted opens are the evidence for it. Every open in the "after" column happens
+after both `drop()`s, so no registry or workspace-manager reader-writer guard is
+held across any of them; in the "before" column all of them are inside the
+guarded region that builds the reply. Every `SessionList` in both builds
+reported `git_branch = "measure-main"` for all four panes, so neither the
+deferral nor the sharing changes the answer. Row 1 reproduced integer-exact
+across two runs per build; rows 2 and 3 were run once per build.
+
 ## Per-prompt shell hook cost
 
 Wall time and process creations charged to one no-op prompt cycle by
