@@ -309,11 +309,24 @@ enum ReplayAction {
 #[derive(Subcommand)]
 enum SessionAction {
     /// Create a new terminal session.
-    Create,
+    Create {
+        /// Columns the PTY is spawned at (needs `--rows`; default 80x24).
+        #[arg(long)]
+        cols: Option<u16>,
+        /// Rows the PTY is spawned at (needs `--cols`; default 80x24).
+        #[arg(long)]
+        rows: Option<u16>,
+    },
     /// Attach to an existing (detached) session.
     Attach {
         /// Session ID to attach to.
         session_id: String,
+        /// Columns to attach at (needs `--rows`; default: send no dimensions).
+        #[arg(long)]
+        cols: Option<u16>,
+        /// Rows to attach at (needs `--cols`; default: send no dimensions).
+        #[arg(long)]
+        rows: Option<u16>,
     },
     /// Close an existing terminal session.
     Close {
@@ -424,8 +437,10 @@ fn run(cli: Cli) -> Result<(), TestError> {
 /// table of one-line routes.
 fn run_session(action: SessionAction) -> Result<(), TestError> {
     match action {
-        SessionAction::Create => session::create(),
-        SessionAction::Attach { session_id } => session::attach(&session_id),
+        SessionAction::Create { cols, rows } => session::create(cols, rows),
+        SessionAction::Attach { session_id, cols, rows } => {
+            session::attach(&session_id, cols, rows)
+        }
         SessionAction::Close { session_id } => session::close(&session_id),
         SessionAction::EnvelopeId { session_id } => session::print_envelope_id(&session_id),
     }

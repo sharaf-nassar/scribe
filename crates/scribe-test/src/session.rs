@@ -9,8 +9,16 @@ use crate::cmd_socket::{DaemonRequest, DaemonResponse, send_request};
 /// Create a new terminal session via the daemon.
 ///
 /// Sends `CreateSession` and prints the resulting session UUID to stdout.
-pub fn create() -> Result<(), TestError> {
-    let response = send_request(&DaemonRequest::CreateSession)
+/// `cols`/`rows` name the grid the PTY is spawned at, the way a real client
+/// names the pane the session is about to fill; omitting them keeps the
+/// server's 80x24 default.
+///
+/// # Errors
+///
+/// Returns [`TestError::InfraError`] when the daemon is unreachable or the
+/// server refused the create.
+pub fn create(cols: Option<u16>, rows: Option<u16>) -> Result<(), TestError> {
+    let response = send_request(&DaemonRequest::CreateSession { cols, rows })
         .map_err(|e| TestError::InfraError(e.to_string()))?;
 
     match response {
@@ -82,11 +90,19 @@ pub fn print_envelope_id(session_id: &str) -> Result<(), TestError> {
 /// Attach to an existing (detached) session on the server.
 ///
 /// Sends `AttachSession` and prints the confirmed session UUID to stdout.
-pub fn attach(session_id: &str) -> Result<(), TestError> {
+/// `cols`/`rows` name the grid to attach at, which is what drives the attach
+/// flow's pre-snapshot resize; omitting them sends no dimensions and leaves the
+/// session's geometry alone.
+///
+/// # Errors
+///
+/// Returns [`TestError::InfraError`] when the session id is malformed, the
+/// daemon is unreachable, or the server denied the attach.
+pub fn attach(session_id: &str, cols: Option<u16>, rows: Option<u16>) -> Result<(), TestError> {
     let id = SessionId::from_str(session_id)
         .map_err(|e| TestError::InfraError(format!("invalid session id: {e}")))?;
 
-    let response = send_request(&DaemonRequest::AttachSession { session_id: id })
+    let response = send_request(&DaemonRequest::AttachSession { session_id: id, cols, rows })
         .map_err(|e| TestError::InfraError(e.to_string()))?;
 
     match response {

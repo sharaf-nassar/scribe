@@ -59,6 +59,10 @@ Create, attach, and close terminal sessions through the daemon; each operation p
 
 The create path mints a launch id and sends it as `env_envelope_id`, and  reports it back per session. Without that id the server has no envelope to key a session's environment by, so every harness-created session was inert and no E2E could observe env persistence at all.
 
+Both create and attach name a grid. `session create --cols N --rows N` spawns the PTY at that geometry the way a real client names the pane the session is about to fill, and `session attach <id> --cols N --rows N` drives the attach flow's pre-snapshot resize the way a tab switch does; omitting either flag keeps the older behaviour — the server's 80x24 default on create, and no dimensions at all on attach. The cell box is 1x1 on both paths, matching `session resize`, so a create and a later attach or resize at the same grid produce a byte-identical `TIOCSWINSZ`, which the kernel answers with no `SIGWINCH` at all. That is what lets a script count the signals a geometry change really costs.
+
+The create path also sends the same `Subscribe` a real client sends, and deliberately no `AttachSessions`: the server attached this connection while it started the session, so re-attaching would only replay a terminal that has emitted nothing.
+
 ## Input Simulation
 
 Send keystrokes to a session with escape sequence expansion (`\n`, `\t`, `\\`, `\xNN`).
@@ -193,6 +197,12 @@ It cycles all five `AiState` variants without corrupting the grid, asserts a con
 `tests/e2e/func/env-persistence.sh` asserts that a harness-created session carries a launch (env-envelope) id, which is the precondition for every other env-persistence assertion.
 
 It reads the entrypoint session's id back with `scribe-test session envelope-id`, creates a second session and asserts its id is a distinct UUID (a shared constant would satisfy a bare non-empty check), and drives the second session to a prompt so the id provably belongs to a live launch rather than a bookkeeping entry. It deliberately stops short of asserting an `.envz` file: the functional container has no running secret service, so the keystore fails and the persist path degrades by design.
+
+### Fresh Create Geometry E2E
+
+`tests/e2e/func/fresh-create-geometry.sh` asserts the create-is-an-attach contract: the PTY starts on the grid the create named, the create draws no `SessionReplay`, and no `SIGWINCH` is spent on a grid that did not change.
+
+The oracle for the signal count is a size reporter running inside the pane — a `trap 'winch=$((winch+1))' WINCH` installed once the shell is at its prompt — read back with `echo` alongside `stty size`. It has to be in-pane because a shrink-and-regrow pair is invisible in every screen snapshot: the grid ends exactly where it started. Phase 3 re-attaches at the pane's own geometry and requires the counter to still read zero; phase 4 asserts that attach *did* send a replay, which is what keeps phase 2's `replay status --expect-frames 0` from passing vacuously, then resizes to a different grid and requires exactly one signal.
 
 ### Session Lifecycle E2E
 
@@ -587,6 +597,18 @@ A keystroke enqueued on the  reaches the outbound channel promptly even with a 1
 ### Typing under firehose
 
 Typing a full command while flooding the inbound drain between keystrokes preserves keystroke order on the wire with no per-key latency spike, the scripted no-reorder / no-stall check the launch gate requires.
+
+### Create answers are claimed once each
+
+Two `CreateSession` frames leave two claims outstanding, a clone of the sink claims both, and a third claim reports none left.
+
+The clone matters because the reader holds one handle and the GPUI view another; the count is how a `SessionCreated` acknowledging an `AttachSessions` is told from the answer to a create.
+
+The count is what decides whether the reader adopts a session the server already attached or attaches it itself, so a claim that leaked or double-counted would either replay a fresh session or leave a reattached one unattached.
+
+### Refused create leaves nothing to claim
+
+A `create_session` refused by a closed writer leaves no claim behind, so the next `SessionCreated` — which cannot be that request's answer, because the request never went out — still takes the attach path.
 
 ### Resize before key input
 
