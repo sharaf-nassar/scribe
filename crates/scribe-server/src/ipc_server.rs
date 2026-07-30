@@ -1157,6 +1157,10 @@ pub struct AttachSessionData {
     pub resize_fd: Arc<OwnedFd>,
     pub target_dims: Option<TerminalSize>,
     pub has_handoff_snapshot: bool,
+    /// The session's exit funnel, so an attach that queued behind the replay
+    /// concurrency cap can tell whether the session it targets died while it
+    /// waited.
+    pub exit_gate: Arc<SessionExitGate>,
 }
 
 impl LiveSession {
@@ -1181,6 +1185,7 @@ impl LiveSession {
             resize_fd: Arc::clone(&self.resize_fd),
             target_dims,
             has_handoff_snapshot: self.handoff_snapshot.is_some(),
+            exit_gate: Arc::clone(&self.exit_gate),
         }
     }
 

@@ -231,6 +231,16 @@ impl SessionExitGate {
         !self.finalized.swap(true, Ordering::AcqRel)
     }
 
+    /// Whether some path has already claimed this session's exit.
+    ///
+    /// Read-only counterpart to [`SessionExitGate::claim_exit`], for callers
+    /// that must not become the finalizer but would act wrongly on a session
+    /// already on its way out. `true` is durable — the gate never reopens — so
+    /// a reader that observes it needs no further synchronisation.
+    pub fn is_finalized(&self) -> bool {
+        self.finalized.load(Ordering::Acquire)
+    }
+
     fn lock_reader(&self) -> MutexGuard<'_, Option<JoinHandle<()>>> {
         // The critical sections are a store and a take, neither of which can
         // panic, so poisoning cannot occur in practice; recover rather than
