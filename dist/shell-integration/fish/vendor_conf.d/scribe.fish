@@ -170,18 +170,30 @@ set -g __scribe_env_last_values
 # env values are extremely uncommon; if one slips through and the
 # resulting JSON fails to parse server-side, the helper exits 0
 # silently (FR-009 fail-open).
+#
+# Every stage funnels through `string collect` because fish command
+# substitution otherwise yields ZERO elements for an empty string and
+# one element PER LINE for a multi-line one. Callers concatenate the
+# result, and concatenating a zero-element list is a cartesian product
+# that collapses the whole accumulator, so the helper must always echo
+# exactly one element.
 function __scribe_json_escape
-    set -l s $argv[1]
+    # A `.` guard rides along through every stage: `string collect`
+    # trims the newline `string replace` prints after each result, which
+    # would otherwise eat a newline the value itself ended with. No
+    # escape stage rewrites a period, so dropping the final character
+    # restores the value exactly.
+    #
     # Order matters: backslash first to avoid double-escaping the
     # replacements that follow.
-    set s (string replace -a '\\' '\\\\' -- $s)
-    set s (string replace -a '"' '\\"' -- $s)
-    set s (string replace -a \b '\\b' -- $s)
-    set s (string replace -a \f '\\f' -- $s)
-    set s (string replace -a \n '\\n' -- $s)
-    set s (string replace -a \r '\\r' -- $s)
-    set s (string replace -a \t '\\t' -- $s)
-    printf '%s' $s
+    set -l s (string replace -a '\\' '\\\\' -- "$argv[1]." | string collect)
+    set s (string replace -a '"' '\\"' -- "$s" | string collect)
+    set s (string replace -a \b '\\b' -- "$s" | string collect)
+    set s (string replace -a \f '\\f' -- "$s" | string collect)
+    set s (string replace -a \n '\\n' -- "$s" | string collect)
+    set s (string replace -a \r '\\r' -- "$s" | string collect)
+    set s (string replace -a \t '\\t' -- "$s" | string collect)
+    printf '%s' (string sub -s 1 -e -1 -- "$s") | string collect --allow-empty
 end
 
 # Snapshot the current exported environment into two global lists:
@@ -196,22 +208,24 @@ function __scribe_snapshot_env
             case '' '__scribe_*' '_SCRIBE_*'
                 continue
         end
-        # Indirect read; fish lists are joined with space when expanded
-        # into a string context, so use `string join` with NUL? No —
-        # env values are strings; embed any list elements joined by
-        # space (which matches POSIX shell semantics for arrays).
-        set -l value (string collect -- $$name)
-        if test -z "$value"
-            set value ''
-        end
+        # Indirect read, double-quoted. A list-valued export (PATH and
+        # friends) otherwise expands to one element per component and an
+        # empty export to none; quoting collapses either to exactly one
+        # space-joined element, which is what a child process sees. The
+        # two lists are indexed in lockstep, so appending anything but
+        # one value here shifts every later name onto a foreign value.
         set -ga __scribe_env_snap_names $name
-        set -ga __scribe_env_snap_values $value
+        set -ga __scribe_env_snap_values "$$name"
     end
 end
 
 # Build a JSON object literal `{"NAME":"value",...}` from the two
 # parallel lists $argv[1] (names) and $argv[2] (values). Fish can't
 # pass lists by reference, so we use indirect variable names.
+#
+# Every interpolation in the accumulator is double-quoted so a stray
+# zero- or multi-element list can never turn the concatenation into a
+# cartesian product that drops or duplicates the payload.
 function __scribe_build_added_json
     set -l names_var $argv[1]
     set -l values_var $argv[2]
@@ -221,19 +235,16 @@ function __scribe_build_added_json
     set -l out '{'
     set -l first 1
     for i in (seq 1 $count)
-        set -l name $names[$i]
-        set -l value $values[$i]
-        set -l esc_name (__scribe_json_escape $name)
-        set -l esc_value (__scribe_json_escape $value)
+        set -l esc_name (__scribe_json_escape "$names[$i]")
+        set -l esc_value (__scribe_json_escape "$values[$i]")
         if test $first -eq 1
             set first 0
         else
-            set out $out','
+            set out "$out,"
         end
-        set out $out'"'$esc_name'":"'$esc_value'"'
+        set out "$out\"$esc_name\":\"$esc_value\""
     end
-    set out $out'}'
-    printf '%s' $out
+    printf '%s' "$out}"
 end
 
 # Per-prompt env-delta emit. Skips the helper invocation when the diff
@@ -241,53 +252,45 @@ end
 function __scribe_emit_env_delta --on-event fish_prompt
     __scribe_snapshot_env
 
-    # Build added (object) and removed (array) JSON literals by
-    # diffing the current snapshot against the cached last-emitted.
-    set -l added '{'
+    # Diff the current snapshot against the cached last-emitted. The
+    # changed pairs go to the shared builder through globals — a fish
+    # function cannot read its caller's locals — so the delta object and
+    # the baseline object cannot drift apart in escaping or quoting.
+    set -g __scribe_env_added_names
+    set -g __scribe_env_added_values
     set -l removed '['
-    set -l first_added 1
     set -l first_removed 1
     set -l now_count (count $__scribe_env_snap_names)
     set -l last_count (count $__scribe_env_last_names)
 
     for i in (seq 1 $now_count)
-        set -l name $__scribe_env_snap_names[$i]
-        set -l value $__scribe_env_snap_values[$i]
+        set -l name "$__scribe_env_snap_names[$i]"
+        set -l value "$__scribe_env_snap_values[$i]"
         set -l prev_idx (contains -i -- $name $__scribe_env_last_names)
-        set -l changed 1
         if test -n "$prev_idx"
-            if test "$__scribe_env_last_values[$prev_idx]" = "$value"
-                set changed 0
-            end
+            and test "$__scribe_env_last_values[$prev_idx]" = "$value"
+            continue
         end
-        if test $changed -eq 1
-            set -l esc_name (__scribe_json_escape $name)
-            set -l esc_value (__scribe_json_escape $value)
-            if test $first_added -eq 1
-                set first_added 0
-            else
-                set added $added','
-            end
-            set added $added'"'$esc_name'":"'$esc_value'"'
-        end
+        set -ga __scribe_env_added_names "$name"
+        set -ga __scribe_env_added_values "$value"
     end
-    set added $added'}'
+    set -l added (__scribe_build_added_json __scribe_env_added_names __scribe_env_added_values)
 
     if test $last_count -gt 0
         for i in (seq 1 $last_count)
-            set -l name $__scribe_env_last_names[$i]
+            set -l name "$__scribe_env_last_names[$i]"
             if not contains -- $name $__scribe_env_snap_names
-                set -l esc_name (__scribe_json_escape $name)
+                set -l esc_name (__scribe_json_escape "$name")
                 if test $first_removed -eq 1
                     set first_removed 0
                 else
-                    set removed $removed','
+                    set removed "$removed,"
                 end
-                set removed $removed'"'$esc_name'"'
+                set removed "$removed\"$esc_name\""
             end
         end
     end
-    set removed $removed']'
+    set removed "$removed]"
 
     if test "$added" = '{}'
         and test "$removed" = '[]'
@@ -295,7 +298,7 @@ function __scribe_emit_env_delta --on-event fish_prompt
     end
 
     $__scribe_hook_helper --provider=system --event=env_delta \
-        --added-json=$added --removed-json=$removed \
+        --added-json="$added" --removed-json="$removed" \
         </dev/null >/dev/null 2>&1
     or true
 
@@ -311,7 +314,7 @@ function __scribe_emit_env_baseline
     set -g __scribe_env_last_values $__scribe_env_snap_values
     set -l added (__scribe_build_added_json __scribe_env_last_names __scribe_env_last_values)
     $__scribe_hook_helper --provider=system --event=env_delta \
-        --added-json=$added --removed-json='[]' --baseline-ready \
+        --added-json="$added" --removed-json='[]' --baseline-ready \
         </dev/null >/dev/null 2>&1
     or true
 end
