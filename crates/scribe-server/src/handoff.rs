@@ -87,8 +87,13 @@ use crate::workspace_manager::WorkspaceManager;
 /// to the handoff shape — the remote/LAN listener state, the per-install device
 /// identity, and the trusted-device/-network stores are all re-derived from
 /// config and on-disk state by the receiver rather than carried on the wire (see
-/// the module docs and [`HandoffState`]) — so this stays at v6. Bump ONLY when
-/// the serialised shape actually changes.
+/// the module docs and [`HandoffState`]) — so this stays at v6.
+///
+/// Spec 017 US7-2 added [`HandoffSession::child_identity`], which also stays at
+/// v6: named encoding fills a missing `#[serde(default)]` field from either
+/// direction, and the receiver treats an absent identity as "unproven" rather
+/// than as a decode failure. Bump ONLY when the serialised shape changes in a
+/// way `#[serde(default)]` cannot absorb.
 const HANDOFF_VERSION: u32 = 6;
 
 /// Magic bytes the receiver sends to request an upgrade.
@@ -139,6 +144,16 @@ pub struct HandoffSession {
     pub session_id: SessionId,
     pub workspace_id: WorkspaceId,
     pub child_pid: u32,
+    /// Per-boot identity token for `child_pid`, captured when the child was
+    /// spawned (spec 017 US7-2). The receiver re-reads it before hanging the
+    /// child up at close time, so a recycled PID is never signalled.
+    ///
+    /// `#[serde(default)]` — absent on payloads from senders that predate the
+    /// field, and `None` on platforms that cannot report a start time. Either
+    /// way the successor cannot prove the PID is still this child, so it skips
+    /// the close-time SIGHUP and logs instead of signalling blind.
+    #[serde(default)]
+    pub child_identity: Option<crate::child_identity::ChildIdentity>,
     pub cols: u16,
     pub rows: u16,
     #[serde(default)]

@@ -188,6 +188,8 @@ The HandoffState contains per-session metadata, per-session replay payload, and 
 
 Per-session payloads include title, shell basename, remote context, provider task label, CWD, AI state (including optional provider conversation IDs used for resume behavior), and a  carrying the zstd-compressed ANSI replay for the session's visible grid plus scrollback. File descriptors are transferred one-for-one with the serialized session list.
 
+Each session also carries the child's PID and an additive `#[serde(default)]` child-identity token, so the receiver can prove the PID still names that child before hanging it up (see ). A sender that predates the field leaves it absent and the receiver treats the child as unproven.
+
 Per-workspace payloads include name, accent color, split direction, session list, and project root path. The project root is an additive `#[serde(default)]` field so handoff from older servers defaults to `None`.
 
 The per-window workspace tree rides separately in  and carries the per-leaf `active_tab_index` (also `#[serde(default)]` for cross-version compatibility — a pre-active-tab-aware sender degrades to 0, and the next client report restores the correct value). This is why focused-tab state survives `--upgrade` without a dedicated per-window state struct.
@@ -212,6 +214,12 @@ Before the old server exits, each session's [[crates/scribe-server/src/pty_guard
 
 Defuse is the guard's opposite of teardown: teardown exists to run `Pty::Drop` somewhere harmless, defuse exists to guarantee it never runs at all, so it consumes the guard inline rather than handing it to the blocking pool. The new server already holds the master fds via SCM_RIGHTS. Because defused sessions have `pty: None`, close handlers use  to send SIGHUP explicitly when those sessions are later destroyed.
 
+That explicit SIGHUP aims at a bare PID rather than at a `Pty` the server owns, so it is gated on child identity. Handoff-inherited children reparent to init when the old server exits, which means init reaps them the instant they die and the PID can be handed to a stranger without this server ever noticing.
+
+[[crates/scribe-server/src/child_identity.rs#read_child_identity|read_child_identity]] records a per-boot token for the child when it is spawned — the `starttime` field of `/proc/<pid>/stat` on Linux, the process start timestamp on macOS — and the token rides the handoff wire alongside `child_pid`. [[crates/scribe-server/src/ipc_server.rs#signal_if_handoff_session|signal_if_handoff_session]] re-reads it and compares before signalling. Anything short of a match logs and sends nothing: a recycled PID, a child that already exited, or a payload from a sender that predates the field. Those sessions still clean up through the reader's EOF path, which is the documented inherited-session exemption.
+
+Reading the observed token at signal time narrows the reuse window to the gap between that read and the `kill` rather than closing it outright. Closing it outright would need a pidfd held since the fork, and inherited children never have one — the [[crates/scribe-server/src/child_watch.rs#open_child_pidfd|child-exit watcher]] deliberately leaves `child_pidfd` at `None` for them because a different process spawned them.
+
 ### Size Limits
 
 Maximum handoff state size is 256 MiB. Maximum file descriptors transferred is 1024. Both sides verify peer UID, and Linux/macOS senders validate the peer process before sending sensitive state.
@@ -223,6 +231,8 @@ Typical v5 compressed payloads are in the low tens of megabytes even for many se
 Bump  when  changes incompatibly. Additive per-session fields that use `#[serde(default)]` stay on the current version because the wire format is named MessagePack: missing fields are filled with their defaults regardless of insertion position.
 
 Feature 013 (remote window control) added no handoff fields — the remote listener is re-derived from config by the receiver rather than carried on the wire — so it stayed at v6; see .
+
+The child-identity token added for the PID check is exactly such an additive field and also stays at v6: a receiver that has never heard of it decodes the payload and ignores the key, and a receiver that expects it fills the missing value with `None`.
 
 The sender uses `rmp_serde::to_vec_named` so `HandoffState` and `HandoffSession` serialize as MessagePack **maps** keyed by field name (since v6). Earlier versions used the default `rmp_serde::to_vec` which emitted MessagePack **arrays** — positional encoding where any field insertion in the middle of the struct silently mis-aligned every later field, breaking even "previous-version" hot-reloads despite `#[serde(default)]` annotations. Named encoding makes the invariant honest: as long as renames go through `#[serde(rename = "old_name")]` or `#[serde(alias = "old_name")]`, every additive struct change preserves backward compatibility. Cross-encoding handoff (v5 positional sender → v6 named receiver) is not supported; the client falls back to a cold restart of the stale old server.
 

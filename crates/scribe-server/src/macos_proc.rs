@@ -53,6 +53,38 @@ mod imp {
         Some(path)
     }
 
+    /// Read `pid`'s process start time as `(seconds, microseconds)`.
+    ///
+    /// Backs the cross-platform child-identity token in
+    /// [`crate::child_identity`]: the kernel never rewrites a live process's
+    /// start time, so the pair (PID, start time) survives PID reuse.
+    pub fn macos_proc_start_time(pid: i32) -> Option<(u64, u64)> {
+        use std::mem::MaybeUninit;
+        use std::os::raw::c_void;
+
+        let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+
+        let ret = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast::<c_void>(),
+                size,
+            )
+        };
+
+        // `proc_pidinfo` returns the number of bytes written; a short write
+        // means the struct was not fully populated.
+        if ret != size {
+            return None;
+        }
+
+        let info = unsafe { info.assume_init() };
+        Some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+    }
+
     pub fn macos_proc_exe_path(pid: i32) -> Option<std::path::PathBuf> {
         use std::ffi::CStr;
 
@@ -156,4 +188,4 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{macos_proc_args, macos_proc_cwd, macos_proc_exe_path};
+pub use imp::{macos_proc_args, macos_proc_cwd, macos_proc_exe_path, macos_proc_start_time};
