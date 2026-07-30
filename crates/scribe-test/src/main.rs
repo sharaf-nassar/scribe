@@ -7,6 +7,7 @@ mod ipc;
 mod lan_peer;
 mod remote_peer;
 mod render;
+mod replay;
 mod server;
 mod session;
 mod share_tap;
@@ -123,6 +124,12 @@ enum Command {
     AiChrome {
         /// Target session ID.
         session_id: String,
+    },
+    /// Inspect the `SessionReplay` frames the daemon received and the screen it
+    /// rebuilt from them.
+    Replay {
+        #[command(subcommand)]
+        action: ReplayAction,
     },
     /// Wait until output matching a regex pattern appears.
     WaitOutput {
@@ -257,6 +264,39 @@ enum DaemonAction {
 }
 
 #[derive(Subcommand)]
+enum ReplayAction {
+    /// Print how many replay frames arrived, the running live-output byte
+    /// count, and the most recent frame's geometry and position in that stream.
+    Status {
+        /// Target session ID.
+        session_id: String,
+        /// Block until at least this many frames have been applied.
+        #[arg(long, default_value_t = 0)]
+        min_frames: u32,
+        /// Fail unless exactly this many frames have been applied. Pass `0` to
+        /// assert that a session was never sent a replay.
+        #[arg(long)]
+        expect_frames: Option<u32>,
+        /// Timeout in milliseconds for `--min-frames`.
+        #[arg(long, default_value_t = 5000)]
+        timeout: u64,
+    },
+    /// Print the replayed screen as text, or write it out as snapshot JSON.
+    Screen {
+        /// Target session ID.
+        session_id: String,
+        /// Write the snapshot as JSON to this path instead of printing text.
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
+    /// Assert that the replayed screen matches the server's own screen.
+    AssertMatches {
+        /// Target session ID.
+        session_id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum SessionAction {
     /// Create a new terminal session.
     Create,
@@ -331,6 +371,7 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::Screenshot { session_id, path } => capture::screenshot(&session_id, &path),
         Command::Snapshot { session_id, path } => capture::snapshot(&session_id, &path),
         Command::AiChrome { session_id } => capture::ai_chrome(&session_id),
+        Command::Replay { action } => run_replay(action),
         Command::WaitOutput { session_id, pattern, timeout } => {
             wait::wait_output(&session_id, &pattern, timeout)
         }
@@ -361,6 +402,18 @@ fn run(cli: Cli) -> Result<(), TestError> {
         Command::LanPeer(args) => run_lan_peer(args),
         Command::RemotePeer(args) => run_remote_peer(args),
         Command::ShareInject { control, message } => run_share_inject(&control, &message),
+    }
+}
+
+/// Route a `replay` subcommand. Split out of [`run`] so the dispatcher stays a
+/// table of one-line routes.
+fn run_replay(action: ReplayAction) -> Result<(), TestError> {
+    match action {
+        ReplayAction::Status { session_id, min_frames, expect_frames, timeout } => {
+            replay::status(&session_id, min_frames, expect_frames, timeout)
+        }
+        ReplayAction::Screen { session_id, json } => replay::screen(&session_id, json.as_deref()),
+        ReplayAction::AssertMatches { session_id } => replay::assert_matches(&session_id),
     }
 }
 

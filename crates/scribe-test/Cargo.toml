@@ -17,6 +17,12 @@ scribe-common.workspace = true
 # server-owned `LanTls` builder the shipped listener uses, so the client under
 # test is never talking to a hand-rolled TLS shim.
 scribe-server.workspace = true
+# Applying a `SessionReplay` locally uses the same terminal core, event
+# listener, and VTE processor the server feeds real PTY bytes through, so the
+# harness's replayed view is not a second emulator with its own quirks.
+alacritty_terminal.workspace = true
+scribe-pty.workspace = true
+vte.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

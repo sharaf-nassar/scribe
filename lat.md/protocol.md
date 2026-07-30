@@ -122,6 +122,8 @@ Unified primitive for rebuilding a client's Term on reattach, defined in [[crate
 
 Carries cols, rows, scrollback rows, cursor position/style/visibility, alt-screen flag, and a zstd-compressed ANSI byte stream. Clients decompress and feed the bytes through their VTE processor — the same primitive the server uses for hot-reload handoff, so one encoding serves both the server-to-server and server-to-client paths.
 
+The `scribe-test` daemon implements that same receiving half rather than skipping the frame, so e2e assertions can observe replay content and its position in a session's frame order instead of inferring the attach path from `RequestSnapshot` (see [[lat.md/test#Test Harness#Replay Observation]]).
+
 `SearchResults` pairs with `SearchRequest` and returns absolute grid spans for the current query so the client can highlight and jump between matches without replaying search locally.
 
 ### Session Events
