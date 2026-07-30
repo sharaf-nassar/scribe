@@ -60,7 +60,9 @@ function global:__Scribe-HostName {
 
 function global:__Scribe-EmitContext {
     $remote = if ($env:SSH_CONNECTION -or $env:SSH_CLIENT -or $env:SSH_TTY) { 1 } else { 0 }
-    $host = __Scribe-HostName
+    # Not `$host`: that is a read-only automatic variable and assigning to
+    # it aborts the prompt before any of the marks below are written.
+    $hostName = __Scribe-HostName
     $tmuxSession = ''
 
     if ($env:TMUX -and (Get-Command tmux -ErrorAction SilentlyContinue)) {
@@ -68,8 +70,8 @@ function global:__Scribe-EmitContext {
     }
 
     $payload = "1337;ScribeContext;remote=$remote"
-    if (-not [string]::IsNullOrWhiteSpace($host)) {
-        $payload += ";host=$host"
+    if (-not [string]::IsNullOrWhiteSpace($hostName)) {
+        $payload += ";host=$hostName"
     }
     if (-not [string]::IsNullOrWhiteSpace($tmuxSession)) {
         $payload += ";tmux=$tmuxSession"
