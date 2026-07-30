@@ -56,7 +56,8 @@ use crate::pty_guard::PtyGuard;
 use crate::releases::{ReleaseCatalog, ReleaseFetcher};
 use crate::session_exit::{CancelWaiter, SessionExitGate};
 use crate::session_manager::{
-    ManagedSession, SessionLaunchRequest, SessionManager, build_term_config, snapshot_term,
+    ManagedSession, SessionLaunchRequest, SessionManager, SessionSlot, build_term_config,
+    snapshot_term,
 };
 use crate::updater::UpdaterHandle;
 use crate::workspace_manager::WorkspaceManager;
@@ -1119,6 +1120,11 @@ pub struct LiveSession {
     /// its retained `JoinHandle`, and the CAS that elects the one path allowed
     /// to publish `SessionExited` and unwire this session.
     exit_gate: Arc<SessionExitGate>,
+    /// This session's reservation against the global session cap (spec 017
+    /// US7-1), carried over from its [`ManagedSession`]. Never read — the
+    /// registry entry owning it *is* the accounting, and its `Drop` returns
+    /// the slot the moment the entry leaves the map on any close path.
+    _slot: SessionSlot,
 }
 
 /// The per-session handles the exit funnel needs, cloned off a [`LiveSession`]
@@ -5885,7 +5891,11 @@ async fn handle_create_session(
         }
     }
 
-    start_session(
+    // Heap-allocated rather than inlined: `start_session` assembles the whole
+    // `LiveSession` on its frame, and this call sits inside the long
+    // `serve_connection` future, which has to stay under the workspace's
+    // future-size budget.
+    Box::pin(start_session(
         StartSessionIds {
             session: session_id,
             workspace: request.workspace_id,
@@ -5901,7 +5911,7 @@ async fn handle_create_session(
             live_sessions: &context.server.live_sessions,
             window_shares: &context.server.window_shares,
         },
-    )
+    ))
     .await;
     attached_insert(context.attached_ids, session_id).await;
 }
@@ -5938,7 +5948,7 @@ async fn start_session(
     let StartSessionIds { session: session_id, workspace: workspace_id, window: window_id } = ids;
     #[rustfmt::skip]
     let ManagedSession {
-        pty_fd, resize_fd, child_pid, child_pidfd, child_identity, term, ansi_processor,
+        slot, pty_fd, resize_fd, child_pid, child_pidfd, child_identity, term, ansi_processor,
         osc_parser,
         event_rx, shell_name, pty, handoff_snapshot, task_label, title, cwd,
         context, ai_state, ai_provider_hint, cell_width, cell_height,
@@ -5989,6 +5999,9 @@ async fn start_session(
         env_envelope_id,
         clipboard_command_tx,
         exit_gate: Arc::clone(&exit_gate),
+        // Moved, never cloned: the registry entry is now the sole owner of the
+        // cap slot, so the slot is freed exactly when the entry is dropped.
+        _slot: slot,
     };
     // Cloned before the insert: the child-exit watcher outlives the registry
     // entry and has to finalize the session after it is gone.

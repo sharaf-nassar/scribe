@@ -33,8 +33,8 @@ use crate::handoff::HandoffState;
 use crate::pty_guard::PtyGuard;
 use crate::shell_integration::{self, ShellKind};
 
-/// Maximum number of active PTY sessions across all clients.
-const MAX_SESSIONS: usize = 256;
+/// Maximum number of live PTY sessions across all clients.
+pub const MAX_SESSIONS: usize = 256;
 
 /// Default terminal columns.
 const DEFAULT_COLS: u16 = 80;
@@ -117,10 +117,29 @@ pub fn build_term_config(scrollback_lines: usize) -> TermConfig {
     }
 }
 
+/// One reservation against the global [`MAX_SESSIONS`] budget (spec 017 US7-1).
+///
+/// The permit is taken atomically before a session's PTY is spawned and is
+/// released by this value's `Drop`, so the population the cap bounds is
+/// exactly the set of sessions that still exist — not the transient contents
+/// of any one map. The slot therefore has to travel with the session from
+/// [`SessionManager::create_session`] through [`SessionManager::take_session`]
+/// and into the live-session registry entry: dropping it any earlier hands the
+/// slot back while the session is still running and lets the next create
+/// overshoot the cap.
+pub struct SessionSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
 /// A managed PTY session with terminal emulator state.
 ///
 /// Fields are `pub` for crate-internal access (the module itself is private).
 pub struct ManagedSession {
+    /// This session's reservation against the global [`MAX_SESSIONS`] budget
+    /// (spec 017 US7-1). Acquired before the PTY is spawned and moved onward
+    /// into the live registry entry, which is what makes the cap count live
+    /// sessions; see [`SessionSlot`].
+    pub slot: SessionSlot,
     pub pty_fd: AsyncPtyFd,
     /// Duplicate PTY master fd used for safe winsize updates and handoff fd passing.
     pub resize_fd: OwnedFd,
@@ -261,6 +280,7 @@ impl PreparedSessionLaunch {
     fn into_managed_session(
         self,
         pty: alacritty_terminal::tty::Pty,
+        slot: SessionSlot,
     ) -> Result<ManagedSession, ScribeError> {
         let child_pid = pty.child().id();
         // Read the identity token now, while the child is unquestionably ours:
@@ -283,6 +303,7 @@ impl PreparedSessionLaunch {
         info!(%self.session_id, %self.workspace_id, "created new PTY session");
 
         Ok(ManagedSession {
+            slot,
             pty_fd,
             resize_fd,
             child_pid,
@@ -312,6 +333,15 @@ impl PreparedSessionLaunch {
 /// Manages all active PTY sessions.
 pub struct SessionManager {
     sessions: Arc<tokio::sync::RwLock<HashMap<SessionId, ManagedSession>>>,
+    /// Admission control for [`MAX_SESSIONS`] (spec 017 US7-1): one permit per
+    /// live session, held by the session itself for its whole lifetime.
+    ///
+    /// `sessions` is only a staging area — the IPC server takes each session
+    /// out of it moments after creation — so its length was never a count of
+    /// anything and could not enforce a cap. The semaphore is the count, and
+    /// because a permit is taken with a single non-blocking `try_acquire`, a
+    /// burst of concurrent creates admits exactly the number of free slots.
+    slots: Arc<tokio::sync::Semaphore>,
     /// Scrollback lines used when creating new sessions.
     scrollback_lines: AtomicUsize,
     /// Whether shell integration env injection is enabled.
@@ -330,6 +360,7 @@ impl SessionManager {
     pub fn with_scrollback(scrollback_lines: usize) -> Self {
         Self {
             sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_SESSIONS)),
             scrollback_lines: AtomicUsize::new(scrollback_lines),
             shell_integration_enabled: std::sync::atomic::AtomicBool::new(true),
         }
@@ -355,8 +386,11 @@ impl SessionManager {
         &self,
         request: SessionLaunchRequest,
     ) -> Result<SessionId, ScribeError> {
+        // Reserved first and held across every fallible step below: an error
+        // after this point drops `slot` and returns the reservation, so a
+        // failed spawn never leaks a slot.
+        let slot = self.reserve_session_slot()?;
         let session_id = SessionId::new();
-        self.reserve_session_slot().await?;
 
         let shell = ResolvedShell::for_request(request.command.as_deref());
 
@@ -376,19 +410,25 @@ impl SessionManager {
         let launch =
             self.prepare_session_launch(session_id, request, &shell, restore_env_file.as_deref());
         let pty = launch.spawn_pty()?;
-        let managed = launch.into_managed_session(pty)?;
+        let managed = launch.into_managed_session(pty, slot)?;
         self.sessions.write().await.insert(session_id, managed);
         Ok(session_id)
     }
 
-    async fn reserve_session_slot(&self) -> Result<(), ScribeError> {
-        let sessions = self.sessions.read().await;
-        if sessions.len() >= MAX_SESSIONS {
-            return Err(ScribeError::IpcError {
-                reason: "global session limit reached".to_owned(),
-            });
-        }
-        Ok(())
+    /// Claim one of the [`MAX_SESSIONS`] slots, or refuse immediately.
+    ///
+    /// `try_acquire_owned` makes the test and the take a single atomic step,
+    /// which is the whole point: N concurrent creates admit exactly the number
+    /// of free slots and every loser gets [`ScribeError::SessionLimitReached`]
+    /// straight away instead of parking until some unrelated session closes.
+    fn reserve_session_slot(&self) -> Result<SessionSlot, ScribeError> {
+        Arc::clone(&self.slots)
+            .try_acquire_owned()
+            .map(|permit| SessionSlot { _permit: permit })
+            .map_err(|_| {
+                tracing::warn!(max = MAX_SESSIONS, "session limit reached, refusing create");
+                ScribeError::SessionLimitReached { limit: MAX_SESSIONS }
+            })
     }
 
     fn prepare_session_launch(
@@ -459,16 +499,46 @@ impl SessionManager {
     /// Each fd in `fds` corresponds to the session at the same index in
     /// `state.sessions`. A fresh `Term` and metadata pipeline are created for
     /// each session.
+    ///
+    /// Restored sessions consume [`MAX_SESSIONS`] slots exactly like freshly
+    /// created ones (spec 017 US7-1) — otherwise a hot reload would reset the
+    /// cap to zero used and let the successor run at twice the budget. The
+    /// predecessor enforced the same cap, so an over-budget payload means a
+    /// corrupt or hostile sender: the excess is refused rather than admitted,
+    /// which also keeps a handoff peer from allocating up to `MAX_FDS`
+    /// terminals' worth of state in this process.
     pub fn restore_from_handoff(
         state: &HandoffState,
         fds: Vec<OwnedFd>,
         scrollback: usize,
     ) -> Result<Self, ScribeError> {
+        Self::restore_within_cap(state, fds, scrollback, MAX_SESSIONS)
+    }
+
+    /// [`Self::restore_from_handoff`] against an explicit slot budget. Split
+    /// out so the over-budget branch is reachable in a test without opening
+    /// `MAX_SESSIONS + 1` PTY pairs.
+    fn restore_within_cap(
+        state: &HandoffState,
+        fds: Vec<OwnedFd>,
+        scrollback: usize,
+        cap: usize,
+    ) -> Result<Self, ScribeError> {
         // shell_integration_enabled defaults to true; callers may override via
         // set_shell_integration_enabled after construction.
         let mut sessions_map = HashMap::new();
+        let slots = Arc::new(tokio::sync::Semaphore::new(cap));
 
         for (handoff_session, owned_fd) in state.sessions.iter().zip(fds) {
+            let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+                tracing::error!(
+                    offered = state.sessions.len(),
+                    max = cap,
+                    "handoff carried more sessions than the cap; refusing the excess"
+                );
+                break;
+            };
+            let slot = SessionSlot { _permit: permit };
             let cols = handoff_session.cols;
             let rows = handoff_session.rows;
 
@@ -527,6 +597,7 @@ impl SessionManager {
             // we cannot: the child already exists. Instead we make `pty` an
             // Option. See the ManagedSession struct change.
             let managed = ManagedSession {
+                slot,
                 pty_fd,
                 resize_fd,
                 child_pid: handoff_session.child_pid,
@@ -569,6 +640,7 @@ impl SessionManager {
 
         Ok(Self {
             sessions: Arc::new(tokio::sync::RwLock::new(sessions_map)),
+            slots,
             scrollback_lines: AtomicUsize::new(scrollback),
             shell_integration_enabled: std::sync::atomic::AtomicBool::new(true),
         })
@@ -999,6 +1071,144 @@ pub fn convert_cursor_style(
         alacritty_terminal::vte::ansi::CursorShape::HollowBlock => ScreenCursorStyle::HollowBlock,
         // Block, Hidden, and any future variants all map to Block.
         _ => ScreenCursorStyle::Block,
+    }
+}
+
+#[cfg(test)]
+mod tests_session_cap {
+    use std::os::fd::OwnedFd;
+    use std::sync::Arc;
+
+    use scribe_common::error::ScribeError;
+    use scribe_common::ids::{SessionId, WorkspaceId};
+
+    use super::{MAX_SESSIONS, SessionManager, SessionSlot};
+    use crate::handoff::{HandoffSession, HandoffState};
+
+    /// Build a handoff payload of `count` sessions, each backed by a real PTY
+    /// pair. The slave fds are returned so the caller keeps them open for the
+    /// duration of the test.
+    fn handoff_state(count: usize) -> (HandoffState, Vec<OwnedFd>, Vec<OwnedFd>) {
+        let mut sessions = Vec::with_capacity(count);
+        let mut masters = Vec::with_capacity(count);
+        let mut slaves = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let pty = nix::pty::openpty(None, None).expect("openpty");
+            sessions.push(HandoffSession {
+                session_id: SessionId::new(),
+                workspace_id: WorkspaceId::new(),
+                child_pid: std::process::id(),
+                child_identity: None,
+                cols: 80,
+                rows: 24,
+                cell_width: 1,
+                cell_height: 1,
+                snapshot: None,
+                session_replay: None,
+                title: None,
+                shell_name: String::from("zsh"),
+                task_label: None,
+                codex_task_label: None,
+                cwd: None,
+                context: None,
+                ai_state: None,
+                ai_provider_hint: None,
+            });
+            masters.push(pty.master);
+            slaves.push(pty.slave);
+        }
+
+        let state = HandoffState {
+            version: 5,
+            sessions,
+            workspaces: vec![],
+            workspace_tree: None,
+            windows: vec![],
+        };
+        (state, masters, slaves)
+    }
+
+    /// Park a reservation on `barrier` so every task in the storm contends for
+    /// the same instant.
+    fn spawn_reservation(
+        manager: Arc<SessionManager>,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> tokio::task::JoinHandle<Result<SessionSlot, ScribeError>> {
+        tokio::spawn(async move {
+            barrier.wait().await;
+            manager.reserve_session_slot()
+        })
+    }
+
+    fn is_cap_error(outcome: &Result<SessionSlot, ScribeError>) -> bool {
+        matches!(outcome, Err(ScribeError::SessionLimitReached { limit }) if *limit == MAX_SESSIONS)
+    }
+
+    /// The reservation storm: `2 * MAX_SESSIONS` tasks released simultaneously
+    /// must admit exactly `MAX_SESSIONS` of them, and every loser must get the
+    /// typed cap error. A check-then-act cap would instead let an arbitrary
+    /// number of them all observe "under the limit" before any of them
+    /// recorded a session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_creates_stop_exactly_at_the_session_cap() {
+        let manager = Arc::new(SessionManager::with_scrollback(100));
+        let storm = MAX_SESSIONS * 2;
+        let barrier = Arc::new(tokio::sync::Barrier::new(storm));
+
+        let tasks: Vec<_> = (0..storm)
+            .map(|_| spawn_reservation(Arc::clone(&manager), Arc::clone(&barrier)))
+            .collect();
+
+        let mut outcomes = Vec::with_capacity(storm);
+        for task in tasks {
+            outcomes.push(task.await.expect("reservation task"));
+        }
+
+        let refused = outcomes.iter().filter(|outcome| is_cap_error(outcome)).count();
+        let mut admitted: Vec<_> = outcomes.into_iter().flatten().collect();
+
+        assert_eq!(admitted.len(), MAX_SESSIONS);
+        assert_eq!(refused, storm - MAX_SESSIONS, "every refusal must be the typed cap error");
+        assert!(manager.reserve_session_slot().is_err(), "cap must stay closed while full");
+
+        // Ending one session hands its slot straight back to the next create.
+        admitted.pop();
+        manager.reserve_session_slot().expect("slot freed by the ended session");
+    }
+
+    /// Handoff-restored sessions occupy cap slots too: a successor that
+    /// restored `n` sessions may admit only `MAX_SESSIONS - n` new ones, so a
+    /// hot reload cannot silently double the live-session budget.
+    #[tokio::test]
+    async fn handoff_restored_sessions_occupy_cap_slots() {
+        const RESTORED: usize = 3;
+        let (state, masters, _slaves) = handoff_state(RESTORED);
+        let manager = SessionManager::restore_from_handoff(&state, masters, 100).unwrap();
+        assert_eq!(manager.pending_session_ids().await.len(), RESTORED);
+
+        // Bound, not discarded: a dropped `SessionSlot` returns its permit, so
+        // the remaining budget only shrinks while the reservations are held.
+        let _held: Vec<_> = (0..(MAX_SESSIONS - RESTORED))
+            .map(|_| manager.reserve_session_slot().expect("slot below the cap"))
+            .collect();
+        assert!(
+            manager.reserve_session_slot().is_err(),
+            "restored sessions must count against the cap"
+        );
+    }
+
+    /// A handoff payload claiming more sessions than the budget is truncated
+    /// rather than admitted: the predecessor enforced the same limit, so an
+    /// over-budget payload is corrupt or hostile and must not be allowed to
+    /// start the successor already above its cap.
+    #[tokio::test]
+    async fn over_cap_handoff_payload_is_truncated_at_the_cap() {
+        let (state, masters, _slaves) = handoff_state(4);
+        let manager = SessionManager::restore_within_cap(&state, masters, 100, 2).unwrap();
+
+        assert_eq!(manager.pending_session_ids().await.len(), 2);
+        assert!(manager.reserve_session_slot().is_err(), "truncated restore must fill the cap");
     }
 }
 

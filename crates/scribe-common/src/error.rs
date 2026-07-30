@@ -14,6 +14,11 @@ pub enum ScribeError {
     #[error("IPC error: {reason}")]
     IpcError { reason: String },
 
+    /// Every slot in the global live-session budget is taken; no further PTY
+    /// session can be admitted until one of the live sessions goes away.
+    #[error("session limit reached: {limit} live sessions")]
+    SessionLimitReached { limit: usize },
+
     #[error("protocol error: {reason}")]
     ProtocolError { reason: String },
 
