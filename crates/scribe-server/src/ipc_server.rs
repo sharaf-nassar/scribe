@@ -54,6 +54,7 @@ use crate::lan::trust::{
 };
 use crate::pty_guard::PtyGuard;
 use crate::releases::{ReleaseCatalog, ReleaseFetcher};
+use crate::search_cache::{SearchSnapshotCache, SessionSearchCache, SnapshotKey};
 use crate::session_exit::{CancelWaiter, READER_JOIN_TIMEOUT, ReaderJoin, SessionExitGate};
 use crate::session_manager::{
     ManagedSession, SessionLaunchRequest, SessionManager, SessionSlot, build_term_config,
@@ -1048,6 +1049,9 @@ struct PtyReaderState {
     /// `Term` critical section as every feed, so an attach can pair a snapshot
     /// with the exact output it contains.
     term_commit: SessionCommit,
+    /// The find overlay's cached scrollback snapshot, dropped by every feed
+    /// this task performs (spec 017 US8-2).
+    search_cache: SessionSearchCache,
     ansi_processor: AnsiProcessor,
     osc_parser: VteParser,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
@@ -1125,6 +1129,9 @@ pub struct LiveSession {
     /// lock alongside a replay snapshot so the attach knows which buffered
     /// frames that snapshot already reflects.
     pub(crate) term_commit: SessionCommit,
+    /// Scrollback snapshot the open find overlay's query edits are reading
+    /// (spec 017 US8-2), so a multi-keystroke query snapshots once.
+    search_cache: SessionSearchCache,
     child_pid: u32,
     /// Per-boot identity token for `child_pid` (spec 017 US7-2). Checked
     /// before [`signal_if_handoff_session`] hangs the child up, and forwarded
@@ -5344,6 +5351,7 @@ fn requires_window_control(msg: &ClientMessage) -> bool {
             | ClientMessage::CloseWindow { .. }
             | ClientMessage::FocusChanged { .. }
             | ClientMessage::SearchRequest { .. }
+            | ClientMessage::SearchClosed { .. }
     )
 }
 
@@ -5730,7 +5738,8 @@ async fn dispatch_message(msg: ClientMessage, context: &mut ClientDispatchContex
         | ClientMessage::AttachSessions { .. }
         | ClientMessage::ConfigReloaded
         | ClientMessage::FocusChanged { .. }
-        | ClientMessage::SearchRequest { .. }) => {
+        | ClientMessage::SearchRequest { .. }
+        | ClientMessage::SearchClosed { .. }) => {
             dispatch_session_message(msg, context).await;
         }
         msg @ (ClientMessage::Subscribe { .. }
@@ -5928,6 +5937,9 @@ async fn dispatch_session_message(msg: ClientMessage, context: &mut ClientDispat
         }
         ClientMessage::SearchRequest { session_id, query, limit } => {
             handle_search_request(session_id, query, limit, context).await;
+        }
+        ClientMessage::SearchClosed { session_id } => {
+            handle_search_closed(session_id, context).await;
         }
         other => debug!(?other, "ignored non-session client message in session dispatcher"),
     }
@@ -6202,6 +6214,7 @@ async fn start_session(
     // byte-identical to the pre-015 `Some(writer)` slot.
     let client_writer = initial_client_writer(initial_attachment.writer).await;
     let term_commit: SessionCommit = Arc::default();
+    let search_cache: SessionSearchCache = Arc::default();
     let attachment = Arc::new(Mutex::new(initial_attachment.attached_ids.map(Arc::clone)));
 
     let (clipboard_command_tx, clipboard_command_rx) = new_clipboard_command_channel();
@@ -6215,6 +6228,7 @@ async fn start_session(
         resize_fd: Arc::new(resize_fd),
         term: Arc::clone(&term),
         term_commit: Arc::clone(&term_commit),
+        search_cache: Arc::clone(&search_cache),
         child_pid,
         child_identity,
         client_writer: Arc::clone(&client_writer),
@@ -6260,6 +6274,7 @@ async fn start_session(
             pty_write,
             term,
             term_commit,
+            search_cache,
             ansi_processor,
             osc_parser,
             event_rx,
@@ -6287,6 +6302,7 @@ struct PtyReaderInputs {
     pty_write: Arc<Mutex<WriteHalf<scribe_pty::async_fd::AsyncPtyFd>>>,
     term: Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     term_commit: SessionCommit,
+    search_cache: SessionSearchCache,
     ansi_processor: AnsiProcessor,
     osc_parser: VteParser,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
@@ -6320,6 +6336,7 @@ fn spawn_pty_reader(
         pty_write: inputs.pty_write,
         term: inputs.term,
         term_commit: inputs.term_commit,
+        search_cache: inputs.search_cache,
         ansi_processor: inputs.ansi_processor,
         osc_parser: inputs.osc_parser,
         event_rx: inputs.event_rx,
@@ -7088,20 +7105,60 @@ async fn handle_search_request(
         return;
     };
     let term = Arc::clone(&session.term);
+    let term_commit = Arc::clone(&session.term_commit);
+    let cache = Arc::clone(&session.search_cache);
     drop(sessions);
 
     // Only the snapshot needs the `Term` (spec 017 US8-1). The scan is a
     // read of owned data, and the PTY reader task needs this same mutex for
     // every chunk it feeds, so holding it across the scan would stall the
     // session's own output path once per keystroke.
+    //
+    // The snapshot itself is taken once per query burst (spec 017 US8-2): while
+    // the grid stands still, later edits validate the cached picture under the
+    // lock and reuse it, so a 10-character query holds the `Term` for one
+    // snapshot plus nine key comparisons instead of ten snapshots.
     let snapshot = {
         let term_guard = term.lock().await;
-        snapshot_term(&term_guard)
+        let key = SnapshotKey {
+            commit: term_commit.get(),
+            cols: grid_dimension(term_guard.grid().columns()),
+            rows: grid_dimension(term_guard.grid().screen_lines()),
+            scrollback_rows: u32::try_from(term_guard.grid().history_size()).unwrap_or(u32::MAX),
+        };
+        cache.get(key).unwrap_or_else(|| {
+            let snapshot = Arc::new(snapshot_term(&term_guard));
+            cache.store(key, Arc::clone(&snapshot));
+            snapshot
+        })
     };
     let matches = search_snapshot(&snapshot, &query, limit);
 
     let msg = ServerMessage::SearchResults { session_id, query, matches };
     send_message(context.writer, &msg).await;
+}
+
+/// Narrow a grid extent to the `u16` the wire snapshot carries, saturating so an
+/// absurd geometry compares equal to itself rather than wrapping.
+fn grid_dimension(extent: usize) -> u16 {
+    u16::try_from(extent).unwrap_or(u16::MAX)
+}
+
+/// Release the scrollback snapshot cached for a session whose find overlay just
+/// closed (spec 017 US8-2).
+///
+/// Advisory: the reader drops the same entry on the session's next output, so a
+/// client that dies with its overlay open costs at most one snapshot until then.
+async fn handle_search_closed(session_id: SessionId, context: &ClientDispatchContext<'_>) {
+    if !attached_contains(context.attached_ids, session_id).await {
+        tracing::warn!(%session_id, "client sent SearchClosed for unattached session");
+        return;
+    }
+
+    let sessions = context.server.live_sessions.read().await;
+    if let Some(session) = sessions.get(&session_id) {
+        session.search_cache.invalidate();
+    }
 }
 
 fn search_snapshot(snapshot: &ScreenSnapshot, query: &str, limit: u32) -> Vec<SearchMatch> {
@@ -8514,7 +8571,14 @@ async fn process_pty_chunk(state: &mut PtyReaderState, bytes: &[u8]) {
     if capture_baseline_after_feed {
         state.pending_ai_scrollback_baseline = true;
     }
-    feed_term(&state.term, &state.term_commit, &mut state.ansi_processor, effective.as_ref()).await;
+    feed_term(
+        &state.term,
+        &state.term_commit,
+        &state.search_cache,
+        &mut state.ansi_processor,
+        effective.as_ref(),
+    )
+    .await;
     maybe_capture_preserved_ai_scrollback_baseline(state).await;
 
     // Step 2b: a prompt returning while mouse-reporting modes are still
@@ -8552,8 +8616,14 @@ async fn clear_stale_mouse_modes_at_prompt(state: &mut PtyReaderState) {
         session_id = %state.session_id,
         "prompt returned with mouse-reporting modes active; injecting DECRST"
     );
-    let commit =
-        feed_term(&state.term, &state.term_commit, &mut state.ansi_processor, &resets).await;
+    let commit = feed_term(
+        &state.term,
+        &state.term_commit,
+        &state.search_cache,
+        &mut state.ansi_processor,
+        &resets,
+    )
+    .await;
     send_pty_output(&state.client_writer, state.session_id, &resets, commit);
 }
 
@@ -8880,14 +8950,21 @@ fn send_trim_scrollback(
 /// consumed everything tagged ≤ C" can never disagree — the invariant the attach
 /// snapshot relies on to decide which buffered frames it already contains. The
 /// guard is dropped before returning, i.e. before any subsequent `.await`.
+///
+/// The find overlay's cached scrollback snapshot is dropped in the same critical
+/// section (spec 017 US8-2): these bytes are exactly the "new session output"
+/// that invalidates it, and releasing it here frees its allocation immediately
+/// instead of at whatever later keystroke would have noticed.
 async fn feed_term(
     term: &Arc<Mutex<alacritty_terminal::Term<scribe_pty::event_listener::ScribeEventListener>>>,
     term_commit: &TermCommit,
+    search_cache: &SearchSnapshotCache,
     ansi_processor: &mut AnsiProcessor,
     bytes: &[u8],
 ) -> u64 {
     let mut term_guard = term.lock().await;
     ansi_processor.advance(&mut *term_guard, bytes);
+    search_cache.invalidate();
     term_commit.advance(chunk_len(bytes))
 }
 

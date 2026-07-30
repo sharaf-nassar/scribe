@@ -273,6 +273,80 @@ and both handler bodies behind one `Variant` enum. Run it with
 then delete the file before committing so the lint-suppression gate stays
 clean.
 
+#### After side: debounce and snapshot reuse (bead `scribe-i79.48`)
+
+Measured on 2026-07-30 at worktree base `1091bd9`, the same host under the
+same sibling-build load (27-33 of 64 cores), so absolute times are again
+not comparable to the quiet-host before side and every table carries its
+own paired `before` control re-running the pre-fix body in the same
+process. Five rounds per cell, medians reported; both variants are
+asserted to produce identical match counts for every prefix.
+
+Two changes compose here. The server keeps one `ScreenSnapshot` per query
+burst, keyed on the session's `TermCommit` value plus the grid shape, and
+reuses it while the picture stands still; the client's find overlay waits
+150 ms after the last edit before asking at all, so a typed word is one
+request rather than ten.
+
+Uncontended, the whole 10-character query `connection`, `limit = 256`:
+
+| geometry | variant | lock hold ms (mean/median) | 10-key lock hold ms | 10-key wall ms | snapshots |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 120x36 | before (paired control) | 32.69 / 34.13 | 339.4 | 473.0 | 10 |
+| 120x36 | after: snapshot reuse | 3.90 / 0.00 | 38.5 | 148.8 | 1 |
+| 120x36 | after: reuse + 150 ms debounce | 36.64 / 36.26 | 36.3 | 45.5 | 1 |
+| 200x50 | before (paired control) | 60.13 / 58.73 | 578.3 | 837.7 | 10 |
+| 200x50 | after: snapshot reuse | 5.04 / 0.00 | 48.9 | 184.7 | 1 |
+| 200x50 | after: reuse + 150 ms debounce | 50.39 / 50.40 | 50.4 | 65.9 | 1 |
+
+Ten snapshots become one. The `Term` hold for the whole query drops 88.7%
+at 120x36 (339.4 → 38.5 ms) and 91.5% at 200x50 (578.3 → 48.9 ms) from
+reuse alone, and the reuse row's *median* hold is 0.00 ms because nine of
+the ten keystrokes only read the cursor and grid shape to confirm the
+cached picture — the mean is carried entirely by the one keystroke that
+snapshots. Allocation follows the snapshot count exactly: 275.6 → 27.6 MiB
+per query at 120x36 and 460.1 → 46.0 MiB at 200x50, in 3 allocations
+instead of 30.
+
+Contended rig — the same PTY-reader-shaped task feeding one full-width row
+through `Processor::advance` into the shared `Arc<Mutex<Term>>` on a 1 ms
+cadence, on a 4-worker runtime, now observed over a fixed 1200 ms window so
+a shorter burst cannot flatter itself with fewer feeds. The reader
+invalidates the cache on every feed exactly as `feed_term` does, so this is
+the case where reuse cannot help and the debounce is the whole fix:
+
+| geometry | variant | reader feeds | reader wait sum ms | wait max ms | query wall ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 120x36 | before (paired control) | 440 | 301.4 | 37.81 | 444.1 |
+| 120x36 | after: snapshot reuse | 453 | 299.3 | 32.32 | 432.3 |
+| 120x36 | after: reuse + 150 ms debounce | 585 | 26.1 | 25.80 | 33.7 |
+| 200x50 | before (paired control) | 371 | 484.1 | 53.49 | 682.3 |
+| 200x50 | after: snapshot reuse | 390 | 436.4 | 47.42 | 620.9 |
+| 200x50 | after: reuse + 150 ms debounce | 579 | 48.7 | 48.45 | 63.3 |
+
+Against a session that is actively producing output, the cache is dead
+weight — 301.4 → 299.3 ms of reader wait at 120x36 — because every feed
+drops the entry a keystroke ago stored. The debounce is what collapses the
+burst: one request instead of ten cuts the reader's total wait 11.5x
+(120x36) and 9.9x (200x50) and buys it 33% and 56% more feeds in the same
+window. Reader wait p95 is 0.00 ms in every row, as in the US8-1 rig: the
+mutex is uncontended except at the keystrokes themselves.
+
+The two halves therefore cover disjoint cases and both are needed. On an
+idle session — the ordinary find — the debounce still leaves one request
+per pause, and reuse makes every request after the first cost a key
+comparison. On a busy one the cache is always cold and the debounce is
+what keeps the searcher off the reader's back.
+
+Reproducing: the US8-1 recipe above with `measure_i7948.rs` in place of
+`measure_i7947.rs` and `$MEASURE_I7948_OUT` as the output path. Its
+`Variant::After` arm builds a `SnapshotKey` from
+`(commit, columns, screen_lines, history_size)` under the guard and calls
+`SearchSnapshotCache::get`/`store` around `snapshot_term`; the three plans
+(`before`, `after` over all ten prefixes, `after` over the settled query
+alone) stand in for the two fixes and their composition. Delete the file
+before committing.
+
 ### Result: inline replay build and attach fan-out
 
 `take_session_replay` runs `snapshot_term` + `build_session_replay`

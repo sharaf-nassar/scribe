@@ -1395,15 +1395,15 @@ Covers the pure halves of : the query/reply state machine, the viewport projecti
 
 None of these prove the running client finds anything — the round trip they stand in for is a wire property, verified end to end by `tests/e2e/visual/find-overlay.sh` (`just e2e-visual-find`), which asserts `SearchRequest` leaving the real client and `SearchResults` coming back from the real server while screenshotting the overlay and its highlights.
 
-#### Every query edit asks the server again
+#### A typed query asks the server once
 
-The overlay holds no scrollback, so a query edit that does not reach the server produces a stale or empty result set; this pins that every kind of edit re-asks, and that a no-op edit does not.
+Every request costs the server a full-scrollback scan, so the overlay debounces edits; this pins that a burst coalesces into one request for the settled text, that every kind of edit still re-asks, and that a no-op edit does not.
 
-Typing, pasting, Backspace and Delete each emit one `::QueryChanged` carrying the new query, while popping an already-empty query, clearing an already-empty query, and a control character emit nothing.
+Two edits inside one debounce window emit nothing until it elapses and then emit a single `::QueryChanged` carrying the final query. Typing, pasting, Backspace and Delete each re-ask once settled, while popping an already-empty query, clearing an already-empty query, and a control character emit nothing. Dismissing retires a scheduled request, so a closed overlay never searches on.
 
 #### A stale reply never replaces live matches
 
-Requests go out per keystroke, so several replies can be in flight at once and the answer to an abandoned prefix must never be shown.
+A pause mid-word settles the query and sends it, so several replies can be in flight at once and the answer to an abandoned prefix must never be shown.
 
  ignores a  answering an earlier query, adopts the one answering the typed query, and adopts any given reply exactly once — so a redraw cannot reset the match the user has cycled to.
 

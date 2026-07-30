@@ -1203,9 +1203,9 @@ impl IpcSink {
     ///
     /// The search runs server-side for the same reason the snapshot does: this
     /// client is display-only and holds only the visible viewport, so it cannot
-    /// match against the scrollback the user is actually searching. Sent on
-    /// every edit of the find overlay's query, which is why the reply carries
-    /// the query back — a stale answer is dropped rather than shown.
+    /// match against the scrollback the user is actually searching. Sent once
+    /// the find overlay's query settles, which is why the reply carries the
+    /// query back — a stale answer is dropped rather than shown.
     ///
     /// # Errors
     /// Returns [`SinkError`] when the writer task has dropped its receiver, or
@@ -1217,6 +1217,16 @@ impl IpcSink {
         limit: u32,
     ) -> Result<(), SinkError> {
         self.enqueue(ClientMessage::SearchRequest { session_id, query, limit })
+    }
+
+    /// Tells the server the find overlay closed, releasing the scrollback
+    /// snapshot it reused across this session's query edits (spec 017 US8-2).
+    ///
+    /// # Errors
+    /// Returns [`SinkError`] when the writer task has dropped its receiver, or
+    /// when the bounded outbound queue is at its cap and refusing frames.
+    pub fn search_closed(&self, session_id: SessionId) -> Result<(), SinkError> {
+        self.enqueue(ClientMessage::SearchClosed { session_id })
     }
 
     /// Requests the authoritative workspace notes for `workspace_ids` so the

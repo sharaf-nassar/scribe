@@ -301,11 +301,22 @@ pub fn visible_highlights(
         .collect()
 }
 
+/// How long the overlay waits after the last query edit before asking the
+/// server (spec 017 US8-2).
+///
+/// Each edit costs the server a full-scrollback scan, and at the default 10,000
+/// lines the first snapshot behind it is tens of megabytes; a typed word should
+/// buy one round trip, not one per character. 150 ms sits under the ~200 ms
+/// gap that reads as a deliberate pause, so a fluent typist never sees it and a
+/// hesitant one gets intermediate results.
+pub const FIND_QUERY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// What the find overlay asks the shell to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FindOverlayEvent {
-    /// The query text changed; the shell issues a fresh `SearchRequest` for a
-    /// non-empty query and simply stops highlighting for an empty one.
+    /// The query settled after [`FIND_QUERY_DEBOUNCE`]; the shell issues a fresh
+    /// `SearchRequest` for a non-empty query and simply stops highlighting for
+    /// an empty one.
     QueryChanged(String),
     /// The overlay was dismissed (Escape or a backdrop click).
     Dismissed,
@@ -362,6 +373,12 @@ pub struct FindOverlayView {
     /// [`FindResults::version`] of the reply last adopted, so a redraw that
     /// arrives before a new reply does not reset the highlighted index.
     adopted: u64,
+    /// Bumped by every query edit so an already-elapsed debounce timer can tell
+    /// it was superseded.
+    debounce: u64,
+    /// The scheduled request. Dropped — and therefore cancelled — whenever a
+    /// newer edit replaces it.
+    pending: Option<gpui::Task<()>>,
     focus_handle: FocusHandle,
 }
 
@@ -376,6 +393,8 @@ impl FindOverlayView {
             matches: Vec::new(),
             current: 0,
             adopted,
+            debounce: 0,
+            pending: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -488,19 +507,42 @@ impl FindOverlayView {
         self.query.clear();
         self.matches.clear();
         self.current = 0;
+        // Retire the scheduled request: a search for a query the overlay no
+        // longer shows would land after the shell released the server's cached
+        // snapshot and re-take it for nobody.
+        self.pending = None;
+        self.debounce = self.debounce.wrapping_add(1);
         cx.emit(FindOverlayEvent::Dismissed);
     }
 
-    /// Drop the stale match set and ask the shell for a fresh one.
+    /// Drop the stale match set and schedule a fresh request.
     ///
     /// Clearing first matters: the old query's highlights must not linger on
     /// screen while the new request is in flight, or the grid would contradict
-    /// the query field for a frame.
+    /// the query field for a frame. The request itself waits out
+    /// [`FIND_QUERY_DEBOUNCE`] so a typed word costs the server one
+    /// full-scrollback scan rather than one per character (spec 017 US8-2).
     fn restart_search(&mut self, cx: &mut Context<Self>) {
         self.matches.clear();
         self.current = 0;
-        cx.emit(FindOverlayEvent::QueryChanged(self.query.clone()));
+        self.debounce = self.debounce.wrapping_add(1);
+        let generation = self.debounce;
+        // Assigning a new task drops the previous one, cancelling its timer.
+        self.pending = Some(cx.spawn(async move |this, app| {
+            app.background_executor().timer(FIND_QUERY_DEBOUNCE).await;
+            this.update(app, |this, ecx| this.emit_if_current(generation, ecx)).ok();
+        }));
         cx.notify();
+    }
+
+    /// Ask the shell for results only when the timer that woke us is still the
+    /// current one — a later edit or a dismiss supersedes an in-flight timer.
+    fn emit_if_current(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if self.debounce != generation {
+            return;
+        }
+        self.pending = None;
+        cx.emit(FindOverlayEvent::QueryChanged(self.query.clone()));
     }
 
     /// The `Find  n/m` header text for the current state.
@@ -677,7 +719,8 @@ mod overlay_tests {
     use scribe_common::theme::minimal_dark;
 
     use super::{
-        FindOverlayColors, FindOverlayEvent, FindOverlayView, FindResults, visible_highlights,
+        FIND_QUERY_DEBOUNCE, FindOverlayColors, FindOverlayEvent, FindOverlayView, FindResults,
+        visible_highlights,
     };
 
     fn hit(row: i32, col_start: u16, col_end: u16) -> ServerMatch {
@@ -711,27 +754,35 @@ mod overlay_tests {
         std::mem::take(&mut *guard)
     }
 
-    // @lat: [[test#GPUI Client Headless Suites#Find overlay#Every query edit asks the server again]]
+    /// Let the debounce window elapse so a settled query reaches the shell.
+    fn settle(cx: &mut TestAppContext) {
+        cx.executor().advance_clock(FIND_QUERY_DEBOUNCE);
+        cx.run_until_parked();
+    }
+
+    // @lat: [[test#GPUI Client Headless Suites#Find overlay#A typed query asks the server once]]
     #[gpui::test]
-    fn query_edits_request_a_fresh_search(cx: &mut TestAppContext) {
+    fn query_edits_coalesce_into_one_request(cx: &mut TestAppContext) {
         let (view, log) = overlay(cx);
 
-        view.update(cx, |overlay, ctx| {
-            overlay.push_char('e', ctx);
-            overlay.push_str("rr", ctx);
-        });
-        assert_eq!(
-            drain(&log, cx),
-            vec![
-                FindOverlayEvent::QueryChanged("e".to_owned()),
-                FindOverlayEvent::QueryChanged("err".to_owned()),
-            ]
-        );
+        // Two edits inside one debounce window are one request for the final text.
+        view.update(cx, |overlay, ctx| overlay.push_char('e', ctx));
+        cx.executor().advance_clock(FIND_QUERY_DEBOUNCE / 2);
+        cx.run_until_parked();
+        view.update(cx, |overlay, ctx| overlay.push_str("rr", ctx));
+        cx.executor().advance_clock(FIND_QUERY_DEBOUNCE / 2);
+        cx.run_until_parked();
+        assert!(drain(&log, cx).is_empty(), "a restarted timer never fired mid-burst");
+
+        settle(cx);
+        assert_eq!(drain(&log, cx), vec![FindOverlayEvent::QueryChanged("err".to_owned())]);
         assert_eq!(view.read_with(cx, |o, _| o.query().to_owned()), "err");
 
-        // Backspace and Delete are query edits too, so each re-asks the server.
+        // Backspace and Delete are query edits too, so each re-asks once settled.
         view.update(cx, FindOverlayView::pop_char);
+        settle(cx);
         view.update(cx, FindOverlayView::clear_query);
+        settle(cx);
         assert_eq!(
             drain(&log, cx),
             vec![
@@ -746,7 +797,15 @@ mod overlay_tests {
             overlay.clear_query(ctx);
             overlay.push_char('\u{1b}', ctx);
         });
+        settle(cx);
         assert!(drain(&log, cx).is_empty());
+
+        // Dismissing retires the scheduled request: it would search a query the
+        // overlay no longer shows, after the shell released the server's snapshot.
+        view.update(cx, |overlay, ctx| overlay.push_str("err", ctx));
+        view.update(cx, FindOverlayView::dismiss);
+        settle(cx);
+        assert_eq!(drain(&log, cx), vec![FindOverlayEvent::Dismissed]);
     }
 
     // @lat: [[test#GPUI Client Headless Suites#Find overlay#A stale reply never replaces live matches]]

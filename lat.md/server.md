@@ -120,6 +120,16 @@ When the connected-client map drops to zero, the server starts a short 250 ms gr
 
 Resize updates the alacritty_terminal grid and sends `TIOCSWINSZ` via ioctl to notify the foreground process group.
 
+### Find Snapshot Reuse
+
+[[crates/scribe-server/src/ipc_server.rs#handle_search_request]] answers each query edit from a full [[crates/scribe-common/src/screen.rs#ScreenSnapshot]] of the session grid. That snapshot is taken once per query burst and reused, not once per keystroke (spec 017 US8-2).
+
+The snapshot is the expensive half: 27.6 MiB at 120x36 and 46.0 MiB at 200x50 with the default 10,000-line scrollback, in three allocations, taken under the same `Term` mutex the PTY reader needs for every chunk it feeds. [[crates/scribe-server/src/search_cache.rs#SearchSnapshotCache]] holds it against a [[crates/scribe-server/src/search_cache.rs#SnapshotKey]] of the session's [[crates/scribe-server/src/ipc_server.rs#TermCommit]] cursor plus the grid shape, both read under that same guard. A later edit that finds the key unchanged reuses the picture and holds the lock only for the comparison; a mismatch discards the entry and re-snapshots. The cursor covers new output and the shape covers a resize, which mutates the coordinate space matches are reported in without advancing the cursor.
+
+Two things drop the entry outright. [[crates/scribe-server/src/ipc_server.rs#feed_term]] invalidates it inside the critical section it already holds, so the bytes that made the picture stale also release its allocation instead of leaving tens of megabytes resident until the next query; an atomic `populated` flag keeps that to one relaxed load per chunk when no overlay is open. The client's `SearchClosed` does the same when the find overlay closes. Both are advisory in the same direction — the cache never serves a stale picture, because the key check is what decides, not the release.
+
+Reuse and the client's 150 ms debounce cover disjoint cases. Against an idle session the debounce still leaves one request per typing pause and reuse makes every later request cost a key comparison: a 10-character query holds the `Term` for 38.5 ms instead of 339.4 ms at 120x36. Against a session producing output the cache is always cold — every feed drops it — and the debounce is the whole fix, cutting the reader's wait 11.5x over a fixed window.
+
 ### CWD Change Suppression
 
 Shells emit OSC 7 from their prompt hook, so the same directory is reported on every command. The server tracks the last CWD it pushed through the metadata pipeline per session and drops a repeat before any further work.

@@ -42,7 +42,7 @@ Keyboard-originated `KeyInput` messages also carry a dismissal bit so the server
 
 The client chunks large pastes into multiple `KeyInput` messages to fit the 4 KiB limit, placing bracketed-paste start/end markers on the first and last chunks only.
 
-`SearchRequest` runs find-in-scrollback against the attached session's current snapshot and returns row/column spans. `ScrollRequest` asks the server for a snapshot rendered at a specific display offset without mutating the live session state.
+`SearchRequest` runs find-in-scrollback against the attached session's current snapshot and returns row/column spans; the client sends it once its query settles rather than per keystroke, and the server reuses one snapshot across a burst of them (see [[server#Sessions#Find Snapshot Reuse]]). `SearchClosed` names the session whose find overlay closed, releasing that snapshot — advisory, since the session's next output drops it anyway. `ScrollRequest` asks the server for a snapshot rendered at a specific display offset without mutating the live session state.
 
 ### Subscription
 
